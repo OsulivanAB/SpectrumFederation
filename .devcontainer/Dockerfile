@@ -13,7 +13,10 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
         python3 \
         python3-pip \
     && luarocks install luacheck \
-    && pip3 install --no-cache-dir mkdocs-material pymdown-extensions \
-    && pip3 install pyyaml yamllint yamlfmt \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python requirements with pinned versions
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
