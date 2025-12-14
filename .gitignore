@@ -29,3 +29,5 @@ releases/
 # Development tools
 .luacheckrc.local
 
+# Blizzard UI reference source (cloned by devcontainer; do NOT commit)
+BlizzardUI/

@@ -6,6 +6,7 @@
     },
     "remoteUser": "vscode",
     "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+    "postStartCommand": "bash .devcontainer/setup-blizzard-ui.sh",
     "customizations": {
         "vscode": {
             "extensions": [
