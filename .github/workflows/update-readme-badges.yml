@@ -32,6 +32,7 @@ jobs:
           python3 << 'PY'
           from pathlib import Path
           import re
+          import textwrap
 
           # ---- 1. Read and parse the TOC ----
           toc_path = Path("SpectrumFederation/SpectrumFederation.toc")
@@ -67,12 +68,13 @@ jobs:
           track_label = shields_escape(track)
           version_label = shields_escape(version)
 
-          badges_block = f"""<!-- STATUS_BADGES_START -->
+          badges_block = textwrap.dedent(f"""\
+          <!-- STATUS_BADGES_START -->
           ![WoW Version](https://img.shields.io/badge/WoW-{wow_label}-00aaff)
           ![Track](https://img.shields.io/badge/Track-{track_label}-ff8800)
           ![Addon Version](https://img.shields.io/badge/Version-{version_label}-brightgreen)
           <!-- STATUS_BADGES_END -->
-          """
+          """)
 
           readme_path = Path("README.md")
           readme = readme_path.read_text(encoding="utf-8")
@@ -115,5 +117,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git commit -am "chore: update README badges [skip ci]"
-          git push
-          
+          git push          
