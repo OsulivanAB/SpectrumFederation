@@ -30,7 +30,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
 
       - name: Update badges and version in README
         run: |
@@ -113,7 +113,9 @@ jobs:
 
       - name: Commit and push changes (if any)
         run: |
-          if git diff --quiet; then
+          git add README.md
+
+          if git diff --staged --quiet; then
             echo "No changes to commit"
             exit 0
           fi
@@ -121,5 +123,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git commit -am "chore: update README badges [skip ci]"
+          git commit -m "chore: update README badges [skip ci]"
           git push
