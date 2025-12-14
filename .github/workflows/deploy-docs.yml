@@ -33,14 +33,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements-docs.txt') }}
           restore-keys: |
             ${{ runner.os }}-pip-
 
       - name: Install MkDocs and dependencies
-        run: |
-          pip install mkdocs-material
-          pip install pymdown-extensions
+        run: pip install -r requirements-docs.txt
 
       - name: Build MkDocs site
         run: mkdocs build --strict --verbose
