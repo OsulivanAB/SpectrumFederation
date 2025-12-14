@@ -1,4 +1,4 @@
-name: Lua lint
+name: Linter
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
       - beta
 
 jobs:
-  luacheck:
+  lint:
     runs-on: ubuntu-latest
 
     env:
@@ -24,11 +24,16 @@ jobs:
       - name: Install Lua 5.1 and luacheck
         run: |
           sudo apt-get update
-          sudo apt-get install -y lua5.1 luarocks
+          sudo apt-get install -y lua5.1 luarocks python3-pip
           sudo luarocks install luacheck
+          pip3 install yamllint
 
       # Focus on syntax + basic issues; we ignore globals/unused for now
       # --only 0 = only show/fail on actual errors (syntax/invalid inline options), ignore style warnings
-      - name: Run luacheck on addon
+      - name: Run luacheck on Lua files
         run: |
           luacheck "$ADDON_NAME" --only 0
+
+      - name: Run yamllint on YAML files
+        run: |
+          yamllint -d relaxed .github/
