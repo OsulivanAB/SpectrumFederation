@@ -1,2 +1,5 @@
 std = "lua51"
-globals = {}
+globals = {
+    CreateFrame = true,
+    print = true,
+}
