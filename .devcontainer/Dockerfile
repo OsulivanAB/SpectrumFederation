@@ -10,6 +10,9 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
         lua5.1 \
         luarocks \
         openssh-client \
+        python3 \
+        python3-pip \
     && luarocks install luacheck \
+    && pip3 install --no-cache-dir mkdocs-material pymdown-extensions \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
