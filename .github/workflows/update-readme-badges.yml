@@ -1,13 +1,13 @@
 name: Update README status badges
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Validate WowUp/CurseForge packaging + version"]
+    types:
+      - completed
     branches:
-    - main
-    - beta
-    # Only run when the toc changes
-    paths:
-    - SpectrumFederation/SpectrumFederation.toc
+      - main
+      - beta
 
 permissions:
   contents: write
@@ -15,10 +15,13 @@ permissions:
 jobs:
   update-readme:
     runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
     - name: Checkout repo
       uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.workflow_run.head_branch }}
 
     - name: Update badges and version in README
       run: |
