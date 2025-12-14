@@ -122,4 +122,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git commit -am "chore: update README badges [skip ci]"
-          git push          
+          git push
