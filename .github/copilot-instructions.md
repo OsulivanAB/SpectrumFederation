@@ -26,7 +26,7 @@ It is:
 
     -   `validate-packaging.yml` -- validates zip layout + version bump
 
-    -   `luacheck.yml` -- Lua linting
+    -   `linter.yml` -- Lua and YAML linting
 
     -   `release.yml` -- auto-tagging and release packaging
 
@@ -182,22 +182,28 @@ Script: `.github/scripts/check-version-bump.sh`
 
 Copilot should not remove or weaken this check without explicit instruction.
 
-### 2\. Lua Linting (luacheck)
+### 2\. Linting (Lua and YAML)
 
-Workflow: `.github/workflows/luacheck.yml`\
-Config: `.luacheckrc`
+Workflow: `.github/workflows/linter.yml`\
+Configs: `.luacheckrc` (Lua), yamllint uses relaxed mode (YAML)
 
 -   Runs `luacheck` on the `SpectrumFederation/` directory.
 
+-   Runs `yamllint` on the `.github/` directory.
+
 -   Uses **Lua 5.1** rules.
 
--   Warnings are allowed; **errors** (syntax, invalid config) fail the build.
+-   Lua: Warnings are allowed; **errors** (syntax, invalid config) fail the build.
+
+-   YAML: Uses relaxed configuration; validates syntax and basic formatting.
 
 Guidelines for Copilot:
 
 -   Use valid Lua 5.1 syntax only (no Lua 5.3/5.4 features).
 
 -   Minimize new globals; if needed, declare WoW API globals or saved variables in `.luacheckrc` instead of disabling checks everywhere.
+
+-   Ensure YAML files in `.github/` end with a newline and have valid syntax.
 
 ### 3\. Addon Packaging (WowUp + CurseForge)
 
@@ -415,7 +421,7 @@ Pitfalls Copilot Should Avoid
 
     -   `.github/scripts/validate-addon-package.sh`
 
-    -   `.github/workflows/luacheck.yml`
+    -   `.github/workflows/linter.yml`
 
     -   `.github/workflows/validate-packaging.yml`
 
