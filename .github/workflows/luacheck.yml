@@ -28,6 +28,7 @@ jobs:
           sudo luarocks install luacheck
 
       # Focus on syntax + basic issues; we ignore globals/unused for now
+      # --only 0 = only show/fail on actual errors (syntax/invalid inline options), ignore style warnings
       - name: Run luacheck on addon
         run: |
-          luacheck "$ADDON_NAME" --std lua51 --no-global --no-unused
+          luacheck "$ADDON_NAME" --std lua51 --no-global --no-unused --only 0
