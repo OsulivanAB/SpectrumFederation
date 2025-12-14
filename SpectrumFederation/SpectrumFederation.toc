@@ -1,7 +1,7 @@
 ## Interface: 120000
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
-## Version: 0.0.3-beta
+## Version: 0.0.4-beta
 ## Notes: Addon for the Spectrum Federation guild on Garona
 
 ## Core files
