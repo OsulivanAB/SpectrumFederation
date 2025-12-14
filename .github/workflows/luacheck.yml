@@ -31,4 +31,4 @@ jobs:
       # --only 0 = only show/fail on actual errors (syntax/invalid inline options), ignore style warnings
       - name: Run luacheck on addon
         run: |
-          luacheck "$ADDON_NAME" --no-global --no-unused --only 0
+          luacheck "$ADDON_NAME" --no-unused --only 0
