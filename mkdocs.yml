@@ -33,10 +33,28 @@ theme:
   icon:
     repo: fontawesome/brands/github
 
+extra_css:
+  - stylesheets/extra.css
+
 markdown_extensions:
   - admonition
   - pymdownx.details
   - pymdownx.superfences
+  - pymdownx.blocks.admonition:
+      types:
+        - note
+        - abstract
+        - info
+        - tip
+        - success
+        - question
+        - warning
+        - failure
+        - danger
+        - bug
+        - example
+        - quote
+        - under-construction
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.inlinehilite
@@ -48,16 +66,7 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Installation:
-      - Getting Started: installation/index.md
-      - WowUp: installation/wowup.md
-      - CurseForge: installation/curseforge.md
-      - Manual Install: installation/manual.md
-  - Features: features.md
-  - Development:
-      - Contributing: development/contributing.md
-      - Architecture: development/architecture.md
-  - Changelog: changelog.md
+  - Development: development/index.md
 
 plugins:
   - search
