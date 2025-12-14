@@ -3,11 +3,11 @@ name: Update README status badges
 on:
   push:
     branches:
-      - main
-      - beta
+    - main
+    - beta
     # Only run when the toc changes
     paths:
-      - 'SpectrumFederation/SpectrumFederation.toc'
+    - SpectrumFederation/SpectrumFederation.toc
 
 permissions:
   contents: write
@@ -17,89 +17,89 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    - name: Checkout repo
+      uses: actions/checkout@v4
 
-      - name: Update badges and version in README
-        run: |
-          python3 << 'PY'
-          from pathlib import Path
-          import re
+    - name: Update badges and version in README
+      run: |
+        python3 << 'PY'
+        from pathlib import Path
+        import re
 
-          toc_path = Path("SpectrumFederation/SpectrumFederation.toc")
-          toc = toc_path.read_text(encoding="utf-8")
+        toc_path = Path("SpectrumFederation/SpectrumFederation.toc")
+        toc = toc_path.read_text(encoding="utf-8")
 
-          # Very simple parse: split on '##' chunks
-          interface_num = None
-          version = None
-          for chunk in toc.split("##"):
-            chunk = chunk.strip()
-            if chunk.lower().startswith("interface:"):
-              interface_num = int(chunk.split(":", 1)[1].strip().split()[0])
-            if chunk.lower().startswith("version:"):
-              version = chunk.split(":", 1)[1].strip().split()[0]
+        # Very simple parse: split on '##' chunks
+        interface_num = None
+        version = None
+        for chunk in toc.split("##"):
+          chunk = chunk.strip()
+          if chunk.lower().startswith("interface:"):
+            interface_num = int(chunk.split(":", 1)[1].strip().split()[0])
+          if chunk.lower().startswith("version:"):
+            version = chunk.split(":", 1)[1].strip().split()[0]
 
-          if interface_num is None or version is None:
-            raise SystemExit("Could not find Interface or Version in TOC")
+        if interface_num is None or version is None:
+          raise SystemExit("Could not find Interface or Version in TOC")
 
-          # Convert 120000 -> 12.0.0
-          major = interface_num // 10000
-          minor = (interface_num // 100) % 100
-          patch = interface_num % 100
-          wow_version = f"{major}.{minor}.{patch}"
+        # Convert 120000 -> 12.0.0
+        major = interface_num // 10000
+        minor = (interface_num // 100) % 100
+        patch = interface_num % 100
+        wow_version = f"{major}.{minor}.{patch}"
 
-          # Track from version string
-          track = "Beta" if "beta" in version.lower() else "Retail"
+        # Track from version string
+        track = "Beta" if "beta" in version.lower() else "Retail"
 
-          def shields_escape(text: str) -> str:
-            # shields static badges: space -> %20, dash -> double dash
-            return text.replace(" ", "%20").replace("-", "--")
+        def shields_escape(text: str) -> str:
+          # shields static badges: space -> %20, dash -> double dash
+          return text.replace(" ", "%20").replace("-", "--")
 
-          wow_label = shields_escape(wow_version)
-          track_label = shields_escape(track)
-          version_label = shields_escape(version)
+        wow_label = shields_escape(wow_version)
+        track_label = shields_escape(track)
+        version_label = shields_escape(version)
 
-          badges_block = (
-            "<!-- STATUS_BADGES_START -->\n"
-            f"![WoW Version](https://img.shields.io/badge/WoW-{wow_label}-00aaff)\n"
-            f"![Track](https://img.shields.io/badge/Track-{track_label}-ff8800)\n"
-            f"![Addon Version](https://img.shields.io/badge/Version-{version_label}-brightgreen)\n"
-            "<!-- STATUS_BADGES_END -->"
-          )
+        badges_block = (
+          "<!-- STATUS_BADGES_START -->\n"
+          f"![WoW Version](https://img.shields.io/badge/WoW-{wow_label}-00aaff)\n"
+          f"![Track](https://img.shields.io/badge/Track-{track_label}-ff8800)\n"
+          f"![Addon Version](https://img.shields.io/badge/Version-{version_label}-brightgreen)\n"
+          "<!-- STATUS_BADGES_END -->"
+        )
 
-          readme_path = Path("README.md")
-          readme = readme_path.read_text(encoding="utf-8")
+        readme_path = Path("README.md")
+        readme = readme_path.read_text(encoding="utf-8")
 
-          # 1) Replace or insert the badges block
-          pattern_badges = r"<!-- STATUS_BADGES_START -->.*?<!-- STATUS_BADGES_END -->"
-          if re.search(pattern_badges, readme, flags=re.S):
-            readme = re.sub(pattern_badges, badges_block, readme, flags=re.S)
+        # 1) Replace or insert the badges block
+        pattern_badges = r"<!-- STATUS_BADGES_START -->.*?<!-- STATUS_BADGES_END -->"
+        if re.search(pattern_badges, readme, flags=re.S):
+          readme = re.sub(pattern_badges, badges_block, readme, flags=re.S)
+        else:
+          # If markers are missing for some reason, inject after first line
+          lines = readme.splitlines()
+          if lines:
+            lines = [lines[0], "", badges_block, ""] + lines[1:]
+            readme = "\n".join(lines)
           else:
-            # If markers are missing for some reason, inject after first line
-            lines = readme.splitlines()
-            if lines:
-              lines = [lines[0], "", badges_block, ""] + lines[1:]
-              readme = "\n".join(lines)
-            else:
-              readme = badges_block + "\n"
+            readme = badges_block + "\n"
 
-          # 2) Update the "Current version: ..." line
-          pattern_version = r"(Current version:\s*)([^\s<]+)"
-          readme, _ = re.subn(pattern_version, r"\g<1>" + version, readme)
+        # 2) Update the "Current version: ..." line
+        pattern_version = r"(Current version:\s*)([^\s<]+)"
+        readme, _ = re.subn(pattern_version, r"\g<1>" + version, readme)
 
-          readme_path.write_text(readme, encoding="utf-8")
-          PY
+        readme_path.write_text(readme, encoding="utf-8")
+        PY
 
-      - name: Commit and push changes (if any)
-        run: |
-          if git diff --quiet; then
-            echo "No changes to commit"
-            exit 0
-          fi
+    - name: Commit and push changes (if any)
+      run: |
+        if git diff --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -am "chore: update README badges [skip ci]"
-          git push
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git commit -am "chore: update README badges [skip ci]"
+        git push
 
 

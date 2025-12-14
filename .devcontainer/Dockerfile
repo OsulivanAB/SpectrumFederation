@@ -12,6 +12,6 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
         openssh-client \
         python3-pip \
     && luarocks install luacheck \
-    && pip3 install pyyaml yamllint \
+    && pip3 install pyyaml yamllint yamlfmt \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

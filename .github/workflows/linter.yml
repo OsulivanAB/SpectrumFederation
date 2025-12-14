@@ -3,12 +3,12 @@ name: Linter
 on:
   push:
     branches:
-      - main
-      - beta
+    - main
+    - beta
   pull_request:
     branches:
-      - main
-      - beta
+    - main
+    - beta
 
 jobs:
   lint:
@@ -18,22 +18,22 @@ jobs:
       ADDON_NAME: SpectrumFederation
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Install Lua 5.1 and luacheck
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y lua5.1 luarocks python3-pip
-          sudo luarocks install luacheck
-          pip3 install yamllint
+    - name: Install Lua 5.1 and luacheck
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y lua5.1 luarocks python3-pip
+        sudo luarocks install luacheck
+        pip3 install yamllint
 
       # Focus on syntax + basic issues; we ignore globals/unused for now
       # --only 0 = only show/fail on actual errors (syntax/invalid inline options), ignore style warnings
-      - name: Run luacheck on Lua files
-        run: |
-          luacheck "$ADDON_NAME" --only 0
+    - name: Run luacheck on Lua files
+      run: |
+        luacheck "$ADDON_NAME" --only 0
 
-      - name: Run yamllint on YAML files
-        run: |
-          yamllint -d relaxed .github/
+    - name: Run yamllint on YAML files
+      run: |
+        yamllint -d relaxed .github/
