@@ -114,7 +114,7 @@ jobs:
       - name: Commit and push changes (if any)
         run: |
           git add README.md
-          
+
           if git diff --staged --quiet; then
             echo "No changes to commit"
             exit 0
@@ -125,4 +125,3 @@ jobs:
 
           git commit -m "chore: update README badges [skip ci]"
           git push
-
