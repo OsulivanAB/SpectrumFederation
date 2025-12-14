@@ -20,6 +20,10 @@ permissions:
 jobs:
   update-readme:
     runs-on: ubuntu-latest
+    # Only run if:
+    # 1. Triggered by push event (direct TOC file change), OR
+    # 2. Triggered by successful validation workflow_run
+    # This prevents badge updates based on invalid/failed states
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
 
     steps:
