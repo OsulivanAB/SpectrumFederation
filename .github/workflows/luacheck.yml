@@ -1,0 +1,33 @@
+name: Lua lint
+
+on:
+  push:
+    branches:
+      - main
+      - beta
+  pull_request:
+    branches:
+      - main
+      - beta
+
+jobs:
+  luacheck:
+    runs-on: ubuntu-latest
+
+    env:
+      ADDON_NAME: SpectrumFederation
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Lua 5.1 and luacheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.1 luarocks
+          sudo luarocks install luacheck
+
+      # Focus on syntax + basic issues; we ignore globals/unused for now
+      - name: Run luacheck on addon
+        run: |
+          luacheck "$ADDON_NAME" --std lua51 --no-global --no-unused
