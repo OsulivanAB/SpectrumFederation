@@ -1,4 +1,4 @@
-![Addon Banner](./Media/Icons/Spectrum_federation.jpg)
+![Addon Banner](./Media/Icons/SpectrumF1ederation.jpg)
 
 Addon for the Spectrum Federation guild on Garona - World of Warcraft Retail/Beta.
 
