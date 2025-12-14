@@ -18,12 +18,11 @@ if [ ! -f "$TOC_FILE" ]; then
   exit 1
 fi
 
-# Helper to extract '## Version: ...' from a toc blob
 extract_version() {
   grep -E '^## Version:' | head -n1 | sed 's/^## Version://i' | xargs || true
 }
 
-# Current branch version (PR head)
+# Current (PR branch) version
 current_version_line="$(grep -E '^## Version:' "$TOC_FILE" || true)"
 if [ -z "$current_version_line" ]; then
   echo "::error ::No '## Version:' line found in $TOC_FILE on PR branch."
@@ -51,7 +50,6 @@ echo "[check-version-bump] PR branch addon version        : $current_version"
 if [ "$current_version" = "$base_version" ]; then
   echo "::error ::Addon '## Version:' in $TOC_FILE is still '$current_version'."
   echo "          When merging into '$BASE_REF', bump the addon version (e.g. 0.0.2 or 0.0.2-beta.1)."
-  echo "          This is different from the game interface version (## Interface: $interface_value)."
   exit 1
 fi
 
