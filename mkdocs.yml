@@ -1,0 +1,63 @@
+site_name: Spectrum Federation
+site_description: World of Warcraft addon for the Spectrum Federation guild on Garona
+site_author: OsulivanAB
+site_url: https://osullivanab.github.io/SpectrumFederation/
+
+repo_name: OsulivanAB/SpectrumFederation
+repo_url: https://github.com/OsulivanAB/SpectrumFederation
+
+theme:
+  name: material
+  palette:
+    # Light mode
+    - scheme: default
+      primary: indigo
+      accent: purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # Dark mode
+    - scheme: slate
+      primary: indigo
+      accent: purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html
+
+nav:
+  - Home: index.md
+  - Installation:
+      - Getting Started: installation/index.md
+      - WowUp: installation/wowup.md
+      - CurseForge: installation/curseforge.md
+      - Manual Install: installation/manual.md
+  - Features: features.md
+  - Development:
+      - Contributing: development/contributing.md
+      - Architecture: development/architecture.md
+  - Changelog: changelog.md
+
+plugins:
+  - search
