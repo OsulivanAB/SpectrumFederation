@@ -1,0 +1,11 @@
+## Interface: 120000
+## Title: Spectrum Federation
+## Author: OsulivanAB
+## Version: 0.0.1-beta
+## Notes: Addon for the Spectrum Federation guild on Garona
+
+## Core files
+locale\enUS.lua
+modules\core.lua
+modules\ui.lua
+SpectrumFederation.lua
