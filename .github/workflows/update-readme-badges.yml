@@ -121,5 +121,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Ensure we're on the actual branch, not detached HEAD
+          git checkout ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
           git commit -am "chore: update README badges [skip ci]"
           git push
