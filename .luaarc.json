@@ -4,7 +4,6 @@
     "version": "Lua 5.1"
   },
   "workspace": {
-    // Tell LuaLS to index the cloned Blizzard UI for completions
     "library": [
       "./BlizzardUI/live/Interface",
       "./BlizzardUI/beta/Interface"
