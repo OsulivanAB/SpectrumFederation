@@ -66,7 +66,9 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Development: development/index.md
+  - Development:
+    - Getting Started: development/index.md
+    - Debugging: development/debugging.md
 
 plugins:
   - search

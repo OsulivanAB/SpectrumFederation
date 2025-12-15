@@ -4,9 +4,12 @@
 ## Version: 0.0.14-beta.1
 ## Notes: Addon for the Spectrum Federation guild on Garona
 ## IconTexture: Interface\AddOns\SpectrumFederation\Media\Icons\SpectrumFederationIcon
+## SavedVariables: SpectrumFederationDB SpectrumFederationDebugDB
 
 ## Core files
 SpectrumFederation.lua
 modules/core.lua
+modules/debug.lua
 modules/ui.lua
+modules/options.lua
 locale/enUS.lua
