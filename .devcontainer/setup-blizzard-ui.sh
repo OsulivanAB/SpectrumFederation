@@ -9,8 +9,8 @@ UI_ROOT="$ROOT/BlizzardUI"
 
 LIVE_DIR="$UI_ROOT/live"
 BETA_DIR="$UI_ROOT/beta"
-PTR_DIR="$UI_ROOT/ptr"
-PTR2_DIR="$UI_ROOT/ptr2"
+# PTR_DIR="$UI_ROOT/ptr"
+# PTR2_DIR="$UI_ROOT/ptr2"
 REPO_URL="https://github.com/Gethe/wow-ui-source.git"
 
 mkdir -p "$UI_ROOT"
@@ -33,8 +33,8 @@ clone_or_update() {
 
 clone_or_update "$LIVE_DIR" "live"
 clone_or_update "$BETA_DIR" "beta"
-clone_or_update "$PTR_DIR" "ptr"
-clone_or_update "$PTR2_DIR" "ptr2"
+# clone_or_update "$PTR_DIR" "ptr"
+# clone_or_update "$PTR2_DIR" "ptr2"
 
 
 echo -e "\033[38;2;0;136;204m[BlizzardUI] Done.\033[0m"
