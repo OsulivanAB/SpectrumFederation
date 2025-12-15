@@ -218,6 +218,6 @@ luacheck SpectrumFederation/modules/core.lua
 **Code Location**: `SpectrumFederation/` only  
 **Manifest**: `SpectrumFederation/SpectrumFederation.toc` (MUST update version)  
 **Branches**: `main` (stable) and `beta` (experimental)  
-**Version Format**: `X.Y.Z` (main) or `X.Y.Z-beta` (beta)  
+**Version Format**: `X.Y.Z` (main) or `X.Y.Z-beta.N` (beta, e.g., `0.0.13-beta.1`)  
 **Testing**: Symlink to WoW, use `/reload`, run `luacheck`  
 **Never Touch**: Release workflows (for tag management), `BlizzardUI/`  
