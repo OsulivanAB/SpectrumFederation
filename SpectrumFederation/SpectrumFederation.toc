@@ -1,7 +1,7 @@
 ## Interface: 120000
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
-## Version: 0.0.13-beta.1
+## Version: 0.0.14-beta.1
 ## Notes: Addon for the Spectrum Federation guild on Garona
 ## IconTexture: Interface\AddOns\SpectrumFederation\Media\Icons\SpectrumFederationIcon
 
