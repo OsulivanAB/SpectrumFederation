@@ -146,10 +146,8 @@ function Core:SetPoints(charKey, newTotal, actorCharKey, reason, deltaOverride)
     tierData.points[charKey].total = newTotal
     tierData.points[charKey].lastUpdated = time()
     
-    -- Create log entry
+    -- Build log entry and append via LootLog module
     local logEntry = {
-        id = tierData.nextLogId,
-        timestamp = time(),
         actor = actorCharKey,
         target = charKey,
         delta = delta,
@@ -157,9 +155,17 @@ function Core:SetPoints(charKey, newTotal, actorCharKey, reason, deltaOverride)
         reason = reason or "Unknown"
     }
     
-    -- Add to logs
-    tierData.logs[tierData.nextLogId] = logEntry
-    tierData.nextLogId = tierData.nextLogId + 1
+    -- Append to log via LootLog module
+    local success, logId = false, nil
+    if ns.LootLog then
+        success, logId = ns.LootLog:AppendEntry(logEntry)
+    end
+    
+    if not success then
+        if ns.Debug then
+            ns.Debug:Warn("POINTS_UPDATE", "Log entry was not written for %s", charKey)
+        end
+    end
     
     -- Debug logging
     if ns.Debug then

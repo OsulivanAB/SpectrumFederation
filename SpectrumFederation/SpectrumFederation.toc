@@ -10,6 +10,7 @@
 SpectrumFederation.lua
 modules/core.lua
 modules/debug.lua
+modules/lootLog.lua
 modules/ui.lua
 modules/options.lua
 locale/enUS.lua
