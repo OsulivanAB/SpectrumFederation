@@ -31,6 +31,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || github.ref_name }}
+          # Use PAT with admin permissions to bypass branch protection
+          # If PAT_TOKEN secret is not set, falls back to GITHUB_TOKEN (will fail on protected branches)
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Update badges and version in README
         run: |
@@ -125,3 +128,4 @@ jobs:
 
           git commit -m "chore: update README badges [skip ci]"
           git push
+
