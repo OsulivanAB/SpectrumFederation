@@ -83,6 +83,37 @@ jobs:
         echo "previous_version=$prev_version" >> "$GITHUB_OUTPUT"
         echo "Previous addon version (from TOC): $prev_version"
 
+    - name: Validate version matches branch
+      id: validate_branch
+      run: |
+        current="${{ steps.current_version.outputs.current_version }}"
+        branch="${{ github.ref_name }}"
+
+        echo "Current version: $current"
+        echo "Current branch: $branch"
+
+        # Check if version contains "beta"
+        if [[ "$current" == *"beta"* ]]; then
+          is_beta_version=true
+        else
+          is_beta_version=false
+        fi
+
+        # Validate branch-version consistency
+        if [ "$branch" = "main" ] && [ "$is_beta_version" = "true" ]; then
+          echo "::error::Cannot release beta version ($current) from main branch"
+          echo "::error::Beta versions must be released from the beta branch"
+          exit 1
+        fi
+
+        if [ "$branch" = "beta" ] && [ "$is_beta_version" = "false" ]; then
+          echo "::error::Cannot release non-beta version ($current) from beta branch"
+          echo "::error::Stable versions must be released from the main branch"
+          exit 1
+        fi
+
+        echo "✓ Version $current is valid for branch $branch"
+
     - name: Decide whether to release
       id: decision
       run: |
