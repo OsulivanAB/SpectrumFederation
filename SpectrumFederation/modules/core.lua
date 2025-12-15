@@ -4,6 +4,9 @@ local addonName, ns = ...
 local Core = ns.Core or {}
 ns.Core = Core
 
+-- Roster tracking table - keyed by charKey
+Core.roster = {}
+
 -- InitDatabase: Initializes the SavedVariables database structure
 -- Ensures all required tables and fields exist with proper defaults
 function Core:InitDatabase()
@@ -165,11 +168,167 @@ function Core:SetPoints(charKey, newTotal, actorCharKey, reason, deltaOverride)
     return true
 end
 
+-- RefreshRoster: Updates the in-memory roster from current group/raid
+-- Clears stale entries and populates with current group members
+function Core:RefreshRoster()
+    -- Clear existing roster
+    self.roster = {}
+    
+    local inRaid = IsInRaid()
+    local inGroup = IsInGroup()
+    
+    if not inRaid and not inGroup then
+        -- Not in any group, only track player
+        local playerKey = self:GetCharacterKey("player")
+        if playerKey then
+            local name, realm = UnitName("player")
+            local _, class = UnitClass("player")
+            
+            self.roster[playerKey] = {
+                name = name,
+                realm = realm or GetRealmName(),
+                charKey = playerKey,
+                class = class,
+                role = nil,
+                isOnline = true,
+                isInRaid = false,
+                unitId = "player"
+            }
+        end
+        
+        if ns.Debug then
+            ns.Debug:Verbose("ROSTER", "Not in group - roster contains only player")
+        end
+        return
+    end
+    
+    local numMembers = GetNumGroupMembers()
+    local groupType = inRaid and "raid" or "party"
+    
+    if ns.Debug then
+        ns.Debug:Verbose("ROSTER", "Refreshing roster: %s with %d members", groupType, numMembers)
+    end
+    
+    if inRaid then
+        -- Process raid members
+        for i = 1, numMembers do
+            local unitId = "raid" .. i
+            if UnitExists(unitId) then
+                local name, realm = UnitName(unitId)
+                local charKey = self:GetCharacterKey(unitId)
+                
+                if charKey then
+                    local _, class = UnitClass(unitId)
+                    local role = UnitGroupRolesAssigned(unitId)
+                    local isOnline = UnitIsConnected(unitId)
+                    
+                    self.roster[charKey] = {
+                        name = name,
+                        realm = realm or GetRealmName(),
+                        charKey = charKey,
+                        class = class,
+                        role = role,
+                        isOnline = isOnline,
+                        isInRaid = true,
+                        unitId = unitId
+                    }
+                end
+            end
+        end
+    else
+        -- Process party members (including player)
+        -- Add player
+        local playerKey = self:GetCharacterKey("player")
+        if playerKey then
+            local name, realm = UnitName("player")
+            local _, class = UnitClass("player")
+            local role = UnitGroupRolesAssigned("player")
+            
+            self.roster[playerKey] = {
+                name = name,
+                realm = realm or GetRealmName(),
+                charKey = playerKey,
+                class = class,
+                role = role,
+                isOnline = true,
+                isInRaid = false,
+                unitId = "player"
+            }
+        end
+        
+        -- Add party members
+        for i = 1, numMembers - 1 do
+            local unitId = "party" .. i
+            if UnitExists(unitId) then
+                local name, realm = UnitName(unitId)
+                local charKey = self:GetCharacterKey(unitId)
+                
+                if charKey then
+                    local _, class = UnitClass(unitId)
+                    local role = UnitGroupRolesAssigned(unitId)
+                    local isOnline = UnitIsConnected(unitId)
+                    
+                    self.roster[charKey] = {
+                        name = name,
+                        realm = realm or GetRealmName(),
+                        charKey = charKey,
+                        class = class,
+                        role = role,
+                        isOnline = isOnline,
+                        isInRaid = false,
+                        unitId = unitId
+                    }
+                end
+            end
+        end
+    end
+    
+    -- Count roster size for logging
+    local rosterSize = 0
+    for _ in pairs(self.roster) do
+        rosterSize = rosterSize + 1
+    end
+    
+    if ns.Debug then
+        ns.Debug:Info("ROSTER", "Roster refreshed: %d members in %s", rosterSize, groupType)
+    end
+end
+
+-- GetRoster: Returns a shallow copy of the current roster
+-- @return: Table of roster entries keyed by charKey
+function Core:GetRoster()
+    local copy = {}
+    for charKey, data in pairs(self.roster) do
+        copy[charKey] = data
+    end
+    return copy
+end
+
 -- OnPlayerLogin: Called when the player logs in
 -- This will be expanded in future phases
 function Core:OnPlayerLogin()
     -- Initialize database first
     self:InitDatabase()
+    
+    -- Create event frame for roster updates
+    if not self.rosterFrame then
+        self.rosterFrame = CreateFrame("Frame")
+        self.rosterFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+        self.rosterFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+        
+        self.rosterFrame:SetScript("OnEvent", function(frame, event, ...)
+            if event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+                Core:RefreshRoster()
+            end
+        end)
+        
+        if ns.Debug then
+            ns.Debug:Info("ROSTER", "Roster event frame initialized")
+        end
+    end
+    
+    -- Initial roster refresh
+    self:RefreshRoster()
     
     -- Log to debug system
     if ns.Debug then
