@@ -53,6 +53,94 @@ local function CreateRow(parent, index)
     row.plusButton:SetText("+")
     row.plusButton:Hide()
     
+    -- Attach click handlers
+    row.upButton:SetScript("OnClick", function(self)
+        local charKey = row.charKey
+        if not charKey or not ns.Core then
+            return
+        end
+        
+        local playerCharKey = ns.Core:GetCharacterKey("player")
+        if not playerCharKey then
+            if ns.Debug then
+                ns.Debug:Error("POINTS_BUTTON", "Could not determine player character key")
+            end
+            return
+        end
+        
+        local currentTotal = ns.Core:GetPoints(charKey)
+        local success = ns.Core:SetPoints(charKey, currentTotal + 1, playerCharKey, "Manual increase via UI", 1)
+        
+        if success then
+            if ns.Debug then
+                ns.Debug:Info("POINTS_BUTTON", "Up button clicked for %s (new total: %d)", charKey, currentTotal + 1)
+            end
+            UI:RefreshRosterList()
+        else
+            if ns.Debug then
+                ns.Debug:Error("POINTS_BUTTON", "Failed to increase points for %s", charKey)
+            end
+        end
+    end)
+    
+    row.downButton:SetScript("OnClick", function(self)
+        local charKey = row.charKey
+        if not charKey or not ns.Core then
+            return
+        end
+        
+        local playerCharKey = ns.Core:GetCharacterKey("player")
+        if not playerCharKey then
+            if ns.Debug then
+                ns.Debug:Error("POINTS_BUTTON", "Could not determine player character key")
+            end
+            return
+        end
+        
+        local currentTotal = ns.Core:GetPoints(charKey)
+        local success = ns.Core:SetPoints(charKey, currentTotal - 1, playerCharKey, "Manual decrease via UI", -1)
+        
+        if success then
+            if ns.Debug then
+                ns.Debug:Info("POINTS_BUTTON", "Down button clicked for %s (new total: %d)", charKey, currentTotal - 1)
+            end
+            UI:RefreshRosterList()
+        else
+            if ns.Debug then
+                ns.Debug:Error("POINTS_BUTTON", "Failed to decrease points for %s", charKey)
+            end
+        end
+    end)
+    
+    row.plusButton:SetScript("OnClick", function(self)
+        local charKey = row.charKey
+        if not charKey or not ns.Core then
+            return
+        end
+        
+        local playerCharKey = ns.Core:GetCharacterKey("player")
+        if not playerCharKey then
+            if ns.Debug then
+                ns.Debug:Error("POINTS_BUTTON", "Could not determine player character key")
+            end
+            return
+        end
+        
+        -- Create new entry with starting total of 0
+        local success = ns.Core:SetPoints(charKey, 0, playerCharKey, "Initial points entry via UI", 0)
+        
+        if success then
+            if ns.Debug then
+                ns.Debug:Info("POINTS_BUTTON", "Plus button clicked for %s (new entry created)", charKey)
+            end
+            UI:RefreshRosterList()
+        else
+            if ns.Debug then
+                ns.Debug:Error("POINTS_BUTTON", "Failed to create points entry for %s", charKey)
+            end
+        end
+    end)
+    
     return row
 end
 
@@ -251,4 +339,3 @@ function UI:Toggle()
         end
     end
 end
-
