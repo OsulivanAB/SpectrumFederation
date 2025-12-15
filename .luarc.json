@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/sumneko/vscode-lua/master/setting/schema.json",
+  "runtime": {
+    "version": "Lua 5.1"
+  },
+  "workspace": {
+    // Tell LuaLS to index the cloned Blizzard UI for completions
+    "library": [
+      "./BlizzardUI/live/Interface",
+      "./BlizzardUI/beta/Interface"
+    ],
+    "checkThirdParty": false
+  },
+  "diagnostics": {
+    "globals": [
+      "CreateFrame",
+      "C_Timer",
+      "SlashCmdList",
+      "Enum"
+    ]
+  }
+}
+
