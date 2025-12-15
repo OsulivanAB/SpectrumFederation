@@ -67,8 +67,9 @@ SpectrumFederation/
   - Protected: requires PR and CI checks
 
 ### Version Bumping Rules
-- **ALWAYS** bump the version in `SpectrumFederation/SpectrumFederation.toc` when making behavior changes
-- The `## Version:` field must be updated for any PR to `main` or `beta`
+- Bump the version in `SpectrumFederation/SpectrumFederation.toc` whenever making a behavioral change (i.e., any change that affects the addon's functionality or user experience).
+- Non-behavioral changes (such as documentation or comments) do not require a version bump.
+- The `## Version:` field must be updated for any PR to `main` or `beta` that includes behavioral changes.
 - CI will fail if version isn't bumped
 - Release workflow automatically creates tags based on TOC version
 
