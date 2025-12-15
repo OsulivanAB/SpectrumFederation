@@ -330,6 +330,11 @@ function Core:OnPlayerLogin()
     -- Initial roster refresh
     self:RefreshRoster()
     
+    -- Create UI frame
+    if ns.UI and ns.UI.CreateLootPointFrame then
+        ns.UI:CreateLootPointFrame()
+    end
+    
     -- Log to debug system
     if ns.Debug then
         ns.Debug:Info("PLAYER_LOGIN", "SpectrumFederation loaded")

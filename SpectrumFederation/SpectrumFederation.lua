@@ -107,3 +107,15 @@ end
 -- Register slash commands
 SLASH_SFDEBUG1 = "/sfdebug"
 SlashCmdList["SFDEBUG"] = HandleDebugCommand
+
+-- Slash command handler for /sf
+local function HandleMainCommand(msg)
+    if ns.UI and ns.UI.Toggle then
+        ns.UI:Toggle()
+    else
+        print("[Spectrum Federation] UI not initialized yet.")
+    end
+end
+
+SLASH_SF1 = "/sf"
+SlashCmdList["SF"] = HandleMainCommand
