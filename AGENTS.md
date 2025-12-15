@@ -85,7 +85,7 @@ SpectrumFederation/
 ### Critical Fields
 ```
 ## Interface: 120000        # WoW patch version (12.0.0 = 120000)
-## Version: 0.1.0-beta      # Addon version (MUST BE BUMPED)
+## Version: 0.1.0-beta.1    # Addon version (MUST BE BUMPED)
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
 ## Notes: Brief description
