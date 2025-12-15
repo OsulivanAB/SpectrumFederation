@@ -7,6 +7,9 @@ ns.Core = Core
 -- Roster tracking table - keyed by charKey
 Core.roster = {}
 
+-- Simple callback system for roster updates
+Core.callbacks = {}
+
 -- InitDatabase: Initializes the SavedVariables database structure
 -- Ensures all required tables and fields exist with proper defaults
 function Core:InitDatabase()
@@ -291,6 +294,40 @@ function Core:RefreshRoster()
     
     if ns.Debug then
         ns.Debug:Info("ROSTER", "Roster refreshed: %d members in %s", rosterSize, groupType)
+    end
+    
+    -- Fire callbacks
+    self:FireCallback("ROSTER_UPDATED")
+end
+
+-- RegisterCallback: Register a callback function for an event
+-- @param event: Event name (e.g., "ROSTER_UPDATED")
+-- @param callback: Function to call when event fires
+function Core:RegisterCallback(event, callback)
+    if not self.callbacks[event] then
+        self.callbacks[event] = {}
+    end
+    table.insert(self.callbacks[event], callback)
+    
+    if ns.Debug then
+        ns.Debug:Verbose("CALLBACK", "Registered callback for event: %s", event)
+    end
+end
+
+-- FireCallback: Fire all callbacks for an event
+-- @param event: Event name
+function Core:FireCallback(event)
+    if self.callbacks[event] then
+        for _, callback in ipairs(self.callbacks[event]) do
+            local success, err = pcall(callback)
+            if not success and ns.Debug then
+                ns.Debug:Error("CALLBACK", "Error in callback for %s: %s", event, tostring(err))
+            end
+        end
+        
+        if ns.Debug then
+            ns.Debug:Verbose("CALLBACK", "Fired %d callbacks for event: %s", #self.callbacks[event], event)
+        end
     end
 end
 
