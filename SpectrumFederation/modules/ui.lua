@@ -169,7 +169,7 @@ function UI:CreateLootPointFrame()
     
     -- Clamp to screen
     frame:SetClampedToScreen(true)
-    
+
     -- Set title
     if frame.TitleText then
         frame.TitleText:SetText("Spectrum Federation Points")
@@ -179,14 +179,14 @@ function UI:CreateLootPointFrame()
     
     -- Create scroll frame
     local scrollFrame = CreateFrame("ScrollFrame", nil, frame.Inset or frame, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", frame.Inset or frame, "TOPLEFT", 4, -8)
+    scrollFrame:SetPoint("TOPLEFT", frame.Inset or frame, "TOPLEFT", 0, -22)
     scrollFrame:SetPoint("BOTTOMRIGHT", frame.Inset or frame, "BOTTOMRIGHT", -26, 4)
     
     -- Create scroll child (content frame)
     local scrollChild = CreateFrame("Frame", nil, scrollFrame)
     scrollChild:SetSize(360, MAX_VISIBLE_ROWS * ROW_HEIGHT)
     scrollFrame:SetScrollChild(scrollChild)
-    
+
     -- Create rows
     self.rows = {}
     for i = 1, MAX_VISIBLE_ROWS do
