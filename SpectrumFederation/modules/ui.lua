@@ -157,15 +157,44 @@ function UI:CreateLootPointFrame()
     -- Set size
     frame:SetSize(400, 500)
     
-    -- Set position (center of screen initially)
-    frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    -- Restore saved position or use default
+    local savedPosition = ns.db and ns.db.ui and ns.db.ui.lootFrame and ns.db.ui.lootFrame.position
+    if savedPosition then
+        frame:ClearAllPoints()
+        frame:SetPoint(savedPosition.point, UIParent, savedPosition.relativePoint, savedPosition.xOfs, savedPosition.yOfs)
+        
+        if ns.Debug then
+            ns.Debug:Info("UI", "Restored frame position: %s (%d, %d)", savedPosition.point, savedPosition.xOfs, savedPosition.yOfs)
+        end
+    else
+        -- Set default position (center of screen)
+        frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    end
     
     -- Make it movable
     frame:SetMovable(true)
     frame:EnableMouse(true)
     frame:RegisterForDrag("LeftButton")
     frame:SetScript("OnDragStart", frame.StartMoving)
-    frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
+    frame:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        
+        -- Save the new position
+        local point, _, relativePoint, xOfs, yOfs = self:GetPoint()
+        if ns.db and ns.db.ui and ns.db.ui.lootFrame then
+            ns.db.ui.lootFrame.position = {
+                point = point,
+                relativeTo = "UIParent",
+                relativePoint = relativePoint,
+                xOfs = xOfs,
+                yOfs = yOfs
+            }
+            
+            if ns.Debug then
+                ns.Debug:Info("UI", "Saved frame position: %s (%d, %d)", point, xOfs, yOfs)
+            end
+        end
+    end)
     
     -- Clamp to screen
     frame:SetClampedToScreen(true)
@@ -198,9 +227,21 @@ function UI:CreateLootPointFrame()
     self.scrollFrame = scrollFrame
     self.scrollChild = scrollChild
     
-    -- Hook show event to refresh list
+    -- Hook show/hide events to save state and refresh list
     frame:SetScript("OnShow", function()
         UI:RefreshRosterList()
+        
+        -- Save visibility state
+        if ns.db and ns.db.ui and ns.db.ui.lootFrame then
+            ns.db.ui.lootFrame.isShown = true
+        end
+    end)
+    
+    frame:SetScript("OnHide", function()
+        -- Save visibility state
+        if ns.db and ns.db.ui and ns.db.ui.lootFrame then
+            ns.db.ui.lootFrame.isShown = false
+        end
     end)
     
     -- Register callback for roster updates
@@ -212,8 +253,17 @@ function UI:CreateLootPointFrame()
         end)
     end
     
-    -- Initially hide the frame
-    frame:Hide()
+    -- Restore visibility state or hide by default
+    local savedVisibility = ns.db and ns.db.ui and ns.db.ui.lootFrame and ns.db.ui.lootFrame.isShown
+    if savedVisibility then
+        frame:Show()
+        
+        if ns.Debug then
+            ns.Debug:Info("UI", "Restored frame visibility: shown")
+        end
+    else
+        frame:Hide()
+    end
     
     -- Debug log
     if ns.Debug then

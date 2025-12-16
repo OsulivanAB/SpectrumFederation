@@ -33,6 +33,16 @@ function Core:InitDatabase()
         ns.db.tiers = {}
     end
     
+    -- Ensure UI state structure exists
+    if not ns.db.ui then
+        ns.db.ui = {
+            lootFrame = {
+                position = nil,  -- Will store {point, relativeTo, relativePoint, xOfs, yOfs}
+                isShown = false
+            }
+        }
+    end
+    
     -- Ensure current tier data structure exists
     local currentTier = ns.db.currentTier
     if not ns.db.tiers[currentTier] then
