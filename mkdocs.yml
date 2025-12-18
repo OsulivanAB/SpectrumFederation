@@ -39,7 +39,11 @@ extra_css:
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.blocks.admonition:
       types:
         - note
@@ -66,6 +70,8 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Features:
+    - Loot Sync: loot-sync.md
   - Development:
     - Getting Started: development/index.md
     - Debugging: development/debugging.md
