@@ -175,6 +175,14 @@ function Core:SetPoints(charKey, newTotal, actorCharKey, reason, deltaOverride)
         if ns.Debug then
             ns.Debug:Warn("POINTS_UPDATE", "Log entry was not written for %s", charKey)
         end
+    else
+        -- Get the full log entry that was created for sync
+        if ns.Sync and logId then
+            local tierData = self:GetCurrentTierData()
+            if tierData and tierData.logs and tierData.logs[logId] then
+                ns.Sync:OnPointsChanged(tierData.logs[logId])
+            end
+        end
     end
     
     -- Debug logging
@@ -190,13 +198,17 @@ end
 -- RefreshRoster: Updates the in-memory roster from current group/raid
 -- Clears stale entries and populates with current group members
 function Core:RefreshRoster()
+    -- Track previous group state for sync triggering
+    local wasInGroup = self.wasInGroup or false
+    
     -- Clear existing roster
     self.roster = {}
     
     local inRaid = IsInRaid()
     local inGroup = IsInGroup()
+    local currentlyInGroup = inRaid or inGroup
     
-    if not inRaid and not inGroup then
+    if not currentlyInGroup then
         -- Not in any group, only track player
         local playerKey = self:GetCharacterKey("player")
         if playerKey then
@@ -314,12 +326,54 @@ function Core:RefreshRoster()
     
     -- Fire callbacks
     self:FireCallback("ROSTER_UPDATED")
+    
+    -- Check if we just joined a group (transition from solo to grouped)
+    if currentlyInGroup and not wasInGroup then
+        if ns.Debug then
+            ns.Debug:Info("ROSTER", "Joined group - triggering sync request")
+        end
+        
+        -- Throttle sync requests (don't spam if roster updates rapidly)
+        local now = time()
+        local lastSyncRequest = self.lastSyncRequestTime or 0
+        
+        if now - lastSyncRequest >= 5 then
+            self.lastSyncRequestTime = now
+            
+            -- Request sync from other addon users
+            if ns.Sync and ns.Sync.SendSyncRequest then
+                ns.Sync:SendSyncRequest()
+            end
+        else
+            if ns.Debug then
+                ns.Debug:Verbose("ROSTER", "Sync request throttled (last request %d seconds ago)", 
+                    now - lastSyncRequest)
+            end
+        end
+    end
+    
+    -- Update state for next call
+    self.wasInGroup = currentlyInGroup
 end
 
 -- RegisterCallback: Register a callback function for an event
 -- @param event: Event name (e.g., "ROSTER_UPDATED")
 -- @param callback: Function to call when event fires
 function Core:RegisterCallback(event, callback)
+    if not event or type(event) ~= "string" then
+        if ns.Debug then
+            ns.Debug:Error("CALLBACK", "Cannot register callback - invalid event name")
+        end
+        return
+    end
+    
+    if not callback or type(callback) ~= "function" then
+        if ns.Debug then
+            ns.Debug:Error("CALLBACK", "Cannot register callback for %s - callback is not a function", event)
+        end
+        return
+    end
+    
     if not self.callbacks[event] then
         self.callbacks[event] = {}
     end
@@ -333,11 +387,24 @@ end
 -- FireCallback: Fire all callbacks for an event
 -- @param event: Event name
 function Core:FireCallback(event)
+    if not event then
+        if ns.Debug then
+            ns.Debug:Error("CALLBACK", "Cannot fire callback - event is nil")
+        end
+        return
+    end
+    
     if self.callbacks[event] then
-        for _, callback in ipairs(self.callbacks[event]) do
-            local success, err = pcall(callback)
-            if not success and ns.Debug then
-                ns.Debug:Error("CALLBACK", "Error in callback for %s: %s", event, tostring(err))
+        for i, callback in ipairs(self.callbacks[event]) do
+            if type(callback) == "function" then
+                local success, err = pcall(callback)
+                if not success and ns.Debug then
+                    ns.Debug:Error("CALLBACK", "Error in callback #%d for %s: %s", i, event, tostring(err))
+                end
+            else
+                if ns.Debug then
+                    ns.Debug:Error("CALLBACK", "Invalid callback #%d for %s (not a function)", i, event)
+                end
             end
         end
         
@@ -355,6 +422,109 @@ function Core:GetRoster()
         copy[charKey] = data
     end
     return copy
+end
+
+-- RecalculatePointsFromLogs: Rebuild all points from log history for a tier
+-- This is the authoritative way to ensure points are correct after sync operations
+-- @param tierKey: The tier to recalculate. If nil, uses current tier
+function Core:RecalculatePointsFromLogs(tierKey)
+    -- Resolve tier key
+    local tier = tierKey
+    if not tier then
+        if ns.db and ns.db.currentTier then
+            tier = ns.db.currentTier
+        else
+            if ns.Debug then
+                ns.Debug:Error("CORE", "Cannot recalculate points - no tier specified and no current tier")
+            end
+            return
+        end
+    end
+    
+    -- Get tier data
+    if not ns.db or not ns.db.tiers then
+        if ns.Debug then
+            ns.Debug:Error("CORE", "Cannot recalculate points - database not initialized")
+        end
+        return
+    end
+    
+    local tierData = ns.db.tiers[tier]
+    if not tierData then
+        if ns.Debug then
+            ns.Debug:Warn("CORE", "Cannot recalculate points - tier %s does not exist", tier)
+        end
+        return
+    end
+    
+    if ns.Debug then
+        ns.Debug:Info("CORE", "Starting points recalculation for tier: %s", tier)
+    end
+    
+    -- Reset all points
+    tierData.points = {}
+    
+    -- Get all log entries and convert to sorted array
+    local entries = {}
+    if tierData.logs then
+        for id, entry in pairs(tierData.logs) do
+            table.insert(entries, entry)
+        end
+    end
+    
+    -- Sort by timestamp (and ID as tiebreaker)
+    table.sort(entries, function(a, b)
+        if a.timestamp == b.timestamp then
+            return a.id < b.id
+        end
+        return a.timestamp < b.timestamp
+    end)
+    
+    -- Replay all entries to rebuild points
+    local entriesProcessed = 0
+    local charactersAffected = {}
+    
+    for _, entry in ipairs(entries) do
+        -- Validate entry has target
+        if not entry.target then
+            if ns.Debug then
+                ns.Debug:Error("CORE", "Skipping malformed log entry (ID: %s) - missing target", 
+                    tostring(entry.id))
+            end
+        else
+            -- Ensure character entry exists in points
+            if not tierData.points[entry.target] then
+                tierData.points[entry.target] = {}
+            end
+            
+            -- Set total from the log entry
+            tierData.points[entry.target].total = entry.newTotal
+            tierData.points[entry.target].lastUpdated = entry.timestamp
+            
+            -- Track this character
+            charactersAffected[entry.target] = true
+            entriesProcessed = entriesProcessed + 1
+        end
+    end
+    
+    -- Count distinct characters
+    local distinctChars = 0
+    for _ in pairs(charactersAffected) do
+        distinctChars = distinctChars + 1
+    end
+    
+    if ns.Debug then
+        ns.Debug:Info("CORE", 
+            "Points recalculation complete: %d entries processed, %d characters affected, tier: %s",
+            entriesProcessed, distinctChars, tier)
+    end
+    
+    -- Fire callback/event for UI updates
+    -- For now, we'll add a simple flag that other modules can check
+    -- In future, could implement a proper callback system
+    if ns.UI and ns.UI.OnPointsRecalculated then
+        ns.UI:OnPointsRecalculated(tier)
+    end
 end
 
 -- OnPlayerLogin: Called when the player logs in

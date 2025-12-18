@@ -11,5 +11,6 @@ SpectrumFederation.lua
 modules/core.lua
 modules/debug.lua
 modules/lootLog.lua
+modules/sync.lua
 modules/ui.lua
 locale/enUS.lua

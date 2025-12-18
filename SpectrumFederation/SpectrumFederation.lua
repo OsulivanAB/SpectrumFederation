@@ -34,6 +34,7 @@ end
 -- Create event frame for addon initialization
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("PLAYER_LOGIN")
+frame:RegisterEvent("CHAT_MSG_ADDON")
 
 frame:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" then
@@ -50,9 +51,26 @@ frame:SetScript("OnEvent", function(self, event, ...)
             ns.Debug:Info("ADDON_INIT", "SpectrumFederation initializing...")
         end
         
+        -- Initialize sync module
+        if ns.Sync and ns.Sync.Initialize then
+            ns.Sync:Initialize()
+        end
+        
         -- Call Core module's login handler (to be implemented)
         if ns.Core and ns.Core.OnPlayerLogin then
             ns.Core:OnPlayerLogin()
+        end
+    elseif event == "CHAT_MSG_ADDON" then
+        -- Handle addon messages for sync
+        local prefix, message, channel, sender = ...
+        
+        -- Validate parameters before passing to sync module
+        if prefix and message and channel and sender then
+            if ns.Sync and ns.Sync.OnAddonMessage then
+                ns.Sync:OnAddonMessage(prefix, message, channel, sender)
+            end
+        elseif ns.Debug then
+            ns.Debug:Warn("ADDON_MSG", "Received CHAT_MSG_ADDON with missing parameters")
         end
     end
 end)
