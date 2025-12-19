@@ -71,6 +71,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Features:
+    - Settings UI: settings-ui.md
     - Loot Sync: loot-sync.md
   - Development:
     - Getting Started: development/index.md

@@ -39,8 +39,43 @@ function Core:InitDatabase()
             lootFrame = {
                 position = nil,  -- Will store {point, relativeTo, relativePoint, xOfs, yOfs}
                 isShown = false
+            },
+            settingsFrame = {
+                position = nil,  -- Will store {x, y}
+                isShown = false,
+                activeTab = 1
             }
         }
+    else
+        -- Ensure settingsFrame structure exists even if ui table exists
+        if not ns.db.ui.settingsFrame then
+            ns.db.ui.settingsFrame = {
+                position = nil,
+                isShown = false,
+                activeTab = 1
+            }
+        end
+        -- Ensure lootFrame structure exists
+        if not ns.db.ui.lootFrame then
+            ns.db.ui.lootFrame = {
+                position = nil,
+                isShown = false
+            }
+        end
+    end
+    
+    -- Ensure settings structure exists
+    if not ns.db.settings then
+        ns.db.settings = {
+            lootWindowEnabled = true,
+            lastSyncCoordinator = nil,
+            backdropStyle = "Default"
+        }
+    else
+        -- Ensure backdropStyle exists
+        if not ns.db.settings.backdropStyle then
+            ns.db.settings.backdropStyle = "Default"
+        end
     end
     
     -- Ensure current tier data structure exists
@@ -61,19 +96,324 @@ function Core:InitDatabase()
         ns.Debug:Info("DATABASE", "Database initialized (schema v%d, tier: %s)", 
             ns.db.schemaVersion, ns.db.currentTier)
     end
+    
+    -- Run migration if needed
+    self:MigrateSchema()
 end
 
--- GetCurrentTierData: Returns the data table for the current tier
--- @return: Tier data table containing points, logs, and nextLogId
-function Core:GetCurrentTierData()
-    if not ns.db or not ns.db.tiers or not ns.db.currentTier then
+-- MigrateSchema: Migrates database from old schema versions to current
+-- Handles conversion from tier-based system (v1) to profile-based system (v2)
+function Core:MigrateSchema()
+    if not ns.db or not ns.db.schemaVersion then
         if ns.Debug then
-            ns.Debug:Error("DATABASE", "Cannot get tier data - database not initialized")
+            ns.Debug:Error("MIGRATION", "Cannot migrate - no schema version found")
+        end
+        return
+    end
+    
+    local currentVersion = ns.db.schemaVersion
+    
+    -- Migration from v1 (tier-based) to v2 (profile-based)
+    if currentVersion < 2 then
+        if ns.Debug then
+            ns.Debug:Info("MIGRATION", "Starting migration from schema v%d to v2", currentVersion)
+        end
+        
+        -- Create new profiles structure
+        local profiles = {}
+        local allLogs = {}
+        local allPoints = {}
+        local maxLogId = 0
+        
+        -- Collect all logs and points from all tiers
+        if ns.db.tiers then
+            for tierKey, tierData in pairs(ns.db.tiers) do
+                if ns.Debug then
+                    ns.Debug:Verbose("MIGRATION", "Processing tier: %s", tierKey)
+                end
+                
+                -- Collect logs
+                if tierData.logs then
+                    for logId, logEntry in pairs(tierData.logs) do
+                        allLogs[logId] = logEntry
+                        if logId > maxLogId then
+                            maxLogId = logId
+                        end
+                    end
+                end
+                
+                -- Collect points (use most recent values if duplicates)
+                if tierData.points then
+                    for charKey, pointData in pairs(tierData.points) do
+                        if not allPoints[charKey] or 
+                           (pointData.lastUpdated and allPoints[charKey].lastUpdated and 
+                            pointData.lastUpdated > allPoints[charKey].lastUpdated) then
+                            allPoints[charKey] = pointData
+                        end
+                    end
+                end
+            end
+        end
+        
+        -- Create Default profile with all collected data
+        profiles["Default"] = {
+            points = allPoints,
+            logs = allLogs,
+            nextLogId = maxLogId + 1,
+            createdAt = time(),
+            createdBy = self:GetCharacterKey("player") or "Unknown"
+        }
+        
+        -- Replace old structure with new profile-based structure
+        ns.db.profiles = profiles
+        ns.db.activeProfile = "Default"
+        
+        -- Create/update settings structure
+        if not ns.db.settings then
+            ns.db.settings = {
+                lootWindowEnabled = true,
+                lastSyncCoordinator = nil,
+                backdropStyle = "Default"
+            }
+        else
+            -- Preserve existing settings, add new ones if missing
+            if ns.db.settings.lootWindowEnabled == nil then
+                ns.db.settings.lootWindowEnabled = true
+            end
+            if not ns.db.settings.backdropStyle then
+                ns.db.settings.backdropStyle = "Default"
+            end
+        end
+        
+        -- Delete old tier-based fields
+        ns.db.tiers = nil
+        ns.db.currentTier = nil
+        
+        -- Update schema version
+        ns.db.schemaVersion = 2
+        
+        if ns.Debug then
+            ns.Debug:Info("MIGRATION", 
+                "Migration complete: %d logs, %d characters migrated to Default profile", 
+                maxLogId, self:CountTableKeys(allPoints))
+        end
+    end
+end
+
+-- CountTableKeys: Utility function to count keys in a table
+-- @param tbl: The table to count
+-- @return: Number of keys in the table
+function Core:CountTableKeys(tbl)
+    if not tbl then return 0 end
+    local count = 0
+    for _ in pairs(tbl) do
+        count = count + 1
+    end
+    return count
+end
+
+-- ========================================================================
+-- PROFILE MANAGEMENT FUNCTIONS
+-- ========================================================================
+
+-- CreateProfile: Creates a new profile with the given name
+-- @param profileName: The name of the profile to create
+-- @param creatorCharKey: Optional character key of creator (defaults to player)
+-- @return: success (boolean), error message (string or nil)
+function Core:CreateProfile(profileName, creatorCharKey)
+    -- Validate profile name
+    if not profileName or profileName == "" then
+        if ns.Debug then
+            ns.Debug:Error("PROFILE", "Cannot create profile - name is empty")
+        end
+        return false, "Profile name cannot be empty"
+    end
+    
+    -- Check for invalid characters and length
+    if #profileName > 64 then
+        if ns.Debug then
+            ns.Debug:Error("PROFILE", "Cannot create profile - name too long (%d chars)", #profileName)
+        end
+        return false, "Profile name must be 64 characters or less"
+    end
+    
+    -- Check if profile already exists
+    if ns.db.profiles and ns.db.profiles[profileName] then
+        if ns.Debug then
+            ns.Debug:Warn("PROFILE", "Profile '%s' already exists", profileName)
+        end
+        return false, "Profile already exists"
+    end
+    
+    -- Ensure profiles table exists
+    if not ns.db.profiles then
+        ns.db.profiles = {}
+    end
+    
+    -- Get creator character key
+    local creator = creatorCharKey or self:GetCharacterKey("player") or "Unknown"
+    
+    -- Create new profile structure
+    ns.db.profiles[profileName] = {
+        points = {},
+        logs = {},
+        nextLogId = 1,
+        createdAt = time(),
+        createdBy = creator
+    }
+    
+    if ns.Debug then
+        ns.Debug:Info("PROFILE", "Created profile '%s' by %s", profileName, creator)
+    end
+    
+    return true, nil
+end
+
+-- DeleteProfile: Deletes a profile by name
+-- @param profileName: The name of the profile to delete
+-- @return: success (boolean), error message (string or nil)
+function Core:DeleteProfile(profileName)
+    if not profileName then
+        if ns.Debug then
+            ns.Debug:Error("PROFILE", "Cannot delete profile - name is nil")
+        end
+        return false, "Profile name is required"
+    end
+    
+    -- Check if profile exists
+    if not ns.db.profiles or not ns.db.profiles[profileName] then
+        if ns.Debug then
+            ns.Debug:Warn("PROFILE", "Cannot delete profile '%s' - does not exist", profileName)
+        end
+        return false, "Profile does not exist"
+    end
+    
+    -- Prevent deletion of active profile
+    if ns.db.activeProfile == profileName then
+        if ns.Debug then
+            ns.Debug:Error("PROFILE", "Cannot delete active profile '%s'", profileName)
+        end
+        return false, "Cannot delete the active profile"
+    end
+    
+    -- Prevent deletion if it's the only profile
+    local profileCount = self:CountTableKeys(ns.db.profiles)
+    if profileCount <= 1 then
+        if ns.Debug then
+            ns.Debug:Error("PROFILE", "Cannot delete '%s' - it's the only profile", profileName)
+        end
+        return false, "Cannot delete the only remaining profile"
+    end
+    
+    -- Delete the profile
+    ns.db.profiles[profileName] = nil
+    
+    if ns.Debug then
+        ns.Debug:Info("PROFILE", "Deleted profile '%s'", profileName)
+    end
+    
+    return true, nil
+end
+
+-- GetActiveProfile: Returns the currently active profile data
+-- @return: Profile data table or nil if not found
+function Core:GetActiveProfile()
+    if not ns.db or not ns.db.profiles or not ns.db.activeProfile then
+        if ns.Debug then
+            ns.Debug:Error("PROFILE", "Cannot get active profile - database not initialized")
         end
         return nil
     end
     
-    return ns.db.tiers[ns.db.currentTier]
+    local profile = ns.db.profiles[ns.db.activeProfile]
+    
+    -- Fallback to Default if active profile is missing
+    if not profile then
+        if ns.Debug then
+            ns.Debug:Warn("PROFILE", "Active profile '%s' not found, falling back to Default", 
+                ns.db.activeProfile)
+        end
+        ns.db.activeProfile = "Default"
+        
+        -- Create Default if it doesn't exist
+        if not ns.db.profiles["Default"] then
+            self:CreateProfile("Default", "System")
+        end
+        
+        profile = ns.db.profiles["Default"]
+    end
+    
+    return profile
+end
+
+-- SetActiveProfile: Sets the active profile
+-- @param profileName: The name of the profile to activate
+-- @return: success (boolean), error message (string or nil)
+function Core:SetActiveProfile(profileName)
+    if not profileName then
+        if ns.Debug then
+            ns.Debug:Error("PROFILE", "Cannot set active profile - name is nil")
+        end
+        return false, "Profile name is required"
+    end
+    
+    -- Check if profile exists, create if it doesn't
+    if not ns.db.profiles or not ns.db.profiles[profileName] then
+        if ns.Debug then
+            ns.Debug:Info("PROFILE", "Profile '%s' doesn't exist, creating it", profileName)
+        end
+        local success, err = self:CreateProfile(profileName)
+        if not success then
+            return false, err
+        end
+    end
+    
+    -- Set as active
+    ns.db.activeProfile = profileName
+    
+    if ns.Debug then
+        ns.Debug:Info("PROFILE", "Active profile set to '%s'", profileName)
+    end
+    
+    -- Fire callback for UI updates
+    self:FireCallback("PROFILE_CHANGED")
+    
+    return true, nil
+end
+
+-- GetProfileList: Returns a sorted array of all profile names
+-- @return: Array of profile name strings
+function Core:GetProfileList()
+    if not ns.db or not ns.db.profiles then
+        return {}
+    end
+    
+    local profiles = {}
+    for name in pairs(ns.db.profiles) do
+        table.insert(profiles, name)
+    end
+    
+    -- Sort alphabetically
+    table.sort(profiles)
+    
+    return profiles
+end
+
+-- GetActiveProfileName: Returns the name of the currently active profile
+-- @return: Profile name string
+function Core:GetActiveProfileName()
+    return ns.db and ns.db.activeProfile or "Default"
+end
+
+-- ========================================================================
+-- END PROFILE MANAGEMENT FUNCTIONS
+-- ========================================================================
+
+-- GetCurrentTierData: Returns the data table for the current profile (legacy compatibility)
+-- This function now wraps GetActiveProfile() for backward compatibility
+-- @return: Profile data table containing points, logs, and nextLogId
+function Core:GetCurrentTierData()
+    return self:GetActiveProfile()
 end
 
 -- GetCharacterKey: Converts a unit ID or name into a "Name-Realm" key
@@ -424,50 +764,50 @@ function Core:GetRoster()
     return copy
 end
 
--- RecalculatePointsFromLogs: Rebuild all points from log history for a tier
+-- RecalculatePointsFromLogs: Rebuild all points from log history for a profile
 -- This is the authoritative way to ensure points are correct after sync operations
--- @param tierKey: The tier to recalculate. If nil, uses current tier
-function Core:RecalculatePointsFromLogs(tierKey)
-    -- Resolve tier key
-    local tier = tierKey
-    if not tier then
-        if ns.db and ns.db.currentTier then
-            tier = ns.db.currentTier
+-- @param profileName: The profile to recalculate. If nil, uses active profile
+function Core:RecalculatePointsFromLogs(profileName)
+    -- Resolve profile name
+    local profile = profileName
+    if not profile then
+        if ns.Core then
+            profile = self:GetActiveProfileName()
         else
             if ns.Debug then
-                ns.Debug:Error("CORE", "Cannot recalculate points - no tier specified and no current tier")
+                ns.Debug:Error("CORE", "Cannot recalculate points - no profile specified and Core not available")
             end
             return
         end
     end
     
-    -- Get tier data
-    if not ns.db or not ns.db.tiers then
+    -- Get profile data
+    if not ns.db or not ns.db.profiles then
         if ns.Debug then
             ns.Debug:Error("CORE", "Cannot recalculate points - database not initialized")
         end
         return
     end
     
-    local tierData = ns.db.tiers[tier]
-    if not tierData then
+    local profileData = ns.db.profiles[profile]
+    if not profileData then
         if ns.Debug then
-            ns.Debug:Warn("CORE", "Cannot recalculate points - tier %s does not exist", tier)
+            ns.Debug:Warn("CORE", "Cannot recalculate points - profile %s does not exist", profile)
         end
         return
     end
     
     if ns.Debug then
-        ns.Debug:Info("CORE", "Starting points recalculation for tier: %s", tier)
+        ns.Debug:Info("CORE", "Starting points recalculation for profile: %s", profile)
     end
     
     -- Reset all points
-    tierData.points = {}
+    profileData.points = {}
     
     -- Get all log entries and convert to sorted array
     local entries = {}
-    if tierData.logs then
-        for id, entry in pairs(tierData.logs) do
+    if profileData.logs then
+        for id, entry in pairs(profileData.logs) do
             table.insert(entries, entry)
         end
     end
@@ -493,13 +833,13 @@ function Core:RecalculatePointsFromLogs(tierKey)
             end
         else
             -- Ensure character entry exists in points
-            if not tierData.points[entry.target] then
-                tierData.points[entry.target] = {}
+            if not profileData.points[entry.target] then
+                profileData.points[entry.target] = {}
             end
             
             -- Set total from the log entry
-            tierData.points[entry.target].total = entry.newTotal
-            tierData.points[entry.target].lastUpdated = entry.timestamp
+            profileData.points[entry.target].total = entry.newTotal
+            profileData.points[entry.target].lastUpdated = entry.timestamp
             
             -- Track this character
             charactersAffected[entry.target] = true
@@ -515,8 +855,8 @@ function Core:RecalculatePointsFromLogs(tierKey)
     
     if ns.Debug then
         ns.Debug:Info("CORE", 
-            "Points recalculation complete: %d entries processed, %d characters affected, tier: %s",
-            entriesProcessed, distinctChars, tier)
+            "Points recalculation complete: %d entries processed, %d characters affected, profile: %s",
+            entriesProcessed, distinctChars, profile)
     end
     
     -- Fire callback/event for UI updates

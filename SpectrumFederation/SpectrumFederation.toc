@@ -2,7 +2,7 @@
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
 ## Version: 0.0.14-beta.1
-## Notes: Addon for the Spectrum Federation guild on Garona
+## Notes: Addon for the Spectrum Federation guild on Garona - Now with tabbed settings UI
 ## IconTexture: Interface\AddOns\SpectrumFederation\Media\Icons\SpectrumFederationIcon
 ## SavedVariables: SpectrumFederationDB SpectrumFederationDebugDB
 
@@ -13,4 +13,5 @@ modules/debug.lua
 modules/lootLog.lua
 modules/sync.lua
 modules/ui.lua
+modules/settings.lua
 locale/enUS.lua

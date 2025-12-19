@@ -152,24 +152,27 @@ function Sync:SendSyncRequest()
         return
     end
     
-    -- Get current tier
-    local tierKey = ns.db and ns.db.currentTier or "unknown"
+    -- Get current profile
+    local profileName = "Default"
+    if ns.Core then
+        profileName = ns.Core:GetActiveProfileName()
+    end
     
     -- Get our latest timestamp
     local latestTimestamp = 0
     if ns.LootLog then
-        latestTimestamp = ns.LootLog:GetLatestTimestampForTier(tierKey)
+        latestTimestamp = ns.LootLog:GetLatestTimestampForProfile(profileName)
     end
     
     -- Build the message
-    local message = MSG_TYPE.SYNC_REQUEST .. "\t" .. tierKey .. "\t" .. tostring(latestTimestamp)
+    local message = MSG_TYPE.SYNC_REQUEST .. "\t" .. profileName .. "\t" .. tostring(latestTimestamp)
     
     -- Send the message
     C_ChatInfo.SendAddonMessage(ADDON_PREFIX, message, channel)
     
     if ns.Debug then
-        ns.Debug:Info("SYNC", "Sent sync request to %s for tier %s (our latest: %d)", 
-            channel, tierKey, latestTimestamp)
+        ns.Debug:Info("SYNC", "Sent sync request to %s for profile %s (our latest: %d)", 
+            channel, profileName, latestTimestamp)
     end
 end
 
@@ -260,9 +263,9 @@ end
 
 -- SendSyncResponse: Send log entries to a specific player in response to their sync request
 -- @param target: Character key of the requester (for WHISPER)
--- @param tierKey: The tier these entries belong to
+-- @param profileName: The profile these entries belong to
 -- @param entries: Array of log entry tables to send
-function Sync:SendSyncResponse(target, tierKey, entries)
+function Sync:SendSyncResponse(target, profileName, entries)
     if not self:IsRegistered() then
         if ns.Debug then
             ns.Debug:Verbose("SYNC", "Cannot send sync response - not registered")
@@ -270,7 +273,7 @@ function Sync:SendSyncResponse(target, tierKey, entries)
         return
     end
     
-    if not target or not tierKey or not entries then
+    if not target or not profileName or not entries then
         if ns.Debug then
             ns.Debug:Error("SYNC", "Cannot send sync response - missing required parameters")
         end
@@ -319,14 +322,14 @@ function Sync:SendSyncResponse(target, tierKey, entries)
             for _, entry in ipairs(batch) do
                 local singleSerialized = self:SerializeLogEntry(entry)
                 if singleSerialized then
-                    local singleMessage = MSG_TYPE.SYNC_RESPONSE .. "\t" .. tierKey .. "\t" .. singleSerialized
+                    local singleMessage = MSG_TYPE.SYNC_RESPONSE .. "\t" .. profileName .. "\t" .. singleSerialized
                     C_ChatInfo.SendAddonMessage(ADDON_PREFIX, singleMessage, "WHISPER", target)
                     totalSent = totalSent + 1
                 end
             end
         else
             -- Build and send the message
-            local message = MSG_TYPE.SYNC_RESPONSE .. "\t" .. tierKey .. "\t" .. serialized
+            local message = MSG_TYPE.SYNC_RESPONSE .. "\t" .. profileName .. "\t" .. serialized
             C_ChatInfo.SendAddonMessage(ADDON_PREFIX, message, "WHISPER", target)
             totalSent = totalSent + #batch
             
@@ -338,8 +341,8 @@ function Sync:SendSyncResponse(target, tierKey, entries)
     end
     
     if ns.Debug then
-        ns.Debug:Info("SYNC", "Sync response complete: sent %d entries to %s for tier %s", 
-            totalSent, target, tierKey)
+        ns.Debug:Info("SYNC", "Sync response complete: sent %d entries to %s for profile %s", 
+            totalSent, target, profileName)
     end
 end
 
@@ -446,7 +449,7 @@ end
 
 -- HandleSyncRequest: Process a sync request from another player
 -- @param sender: Character key of the requester
--- @param payload: The request payload (tierKey \t latestTimestamp)
+-- @param payload: The request payload (profileName \t latestTimestamp)
 function Sync:HandleSyncRequest(sender, payload)
     if not payload then
         if ns.Debug then
@@ -456,10 +459,10 @@ function Sync:HandleSyncRequest(sender, payload)
     end
     
     -- Parse payload
-    local tierKey, timestampStr = strsplit("\t", payload, 2)
+    local profileName, timestampStr = strsplit("\t", payload, 2)
     local latestTimestamp = tonumber(timestampStr) or 0
     
-    if not tierKey then
+    if not profileName then
         if ns.Debug then
             ns.Debug:Warn("SYNC", "Malformed sync request from %s", sender)
         end
@@ -467,19 +470,19 @@ function Sync:HandleSyncRequest(sender, payload)
     end
     
     if ns.Debug then
-        ns.Debug:Info("SYNC", "Processing sync request from %s for tier %s (their latest: %d)", 
-            sender, tierKey, latestTimestamp)
+        ns.Debug:Info("SYNC", "Processing sync request from %s for profile %s (their latest: %d)", 
+            sender, profileName, latestTimestamp)
     end
     
     -- Get entries newer than their timestamp
     local entries = {}
     if ns.LootLog then
-        entries = ns.LootLog:GetEntriesNewerThan(tierKey, latestTimestamp)
+        entries = ns.LootLog:GetEntriesNewerThan(profileName, latestTimestamp)
     end
     
     -- Send response
     if #entries > 0 then
-        self:SendSyncResponse(sender, tierKey, entries)
+        self:SendSyncResponse(sender, profileName, entries)
     else
         if ns.Debug then
             ns.Debug:Info("SYNC", "No newer entries to send to %s", sender)
@@ -489,7 +492,7 @@ end
 
 -- HandleSyncResponse: Process a sync response containing log entries
 -- @param sender: Character key of the sender
--- @param payload: The response payload (tierKey \t batchData)
+-- @param payload: The response payload (profileName \t batchData)
 function Sync:HandleSyncResponse(sender, payload)
     if not payload then
         if ns.Debug then
@@ -499,9 +502,9 @@ function Sync:HandleSyncResponse(sender, payload)
     end
     
     -- Parse payload
-    local tierKey, batchData = strsplit("\t", payload, 2)
+    local profileName, batchData = strsplit("\t", payload, 2)
     
-    if not tierKey or not batchData then
+    if not profileName or not batchData then
         if ns.Debug then
             ns.Debug:Warn("SYNC", "Malformed sync response from %s", sender)
         end
@@ -509,7 +512,7 @@ function Sync:HandleSyncResponse(sender, payload)
     end
     
     if ns.Debug then
-        ns.Debug:Info("SYNC", "Processing sync response from %s for tier %s", sender, tierKey)
+        ns.Debug:Info("SYNC", "Processing sync response from %s for profile %s", sender, profileName)
     end
     
     -- Split batch data into individual serialized entries
@@ -552,7 +555,7 @@ function Sync:HandleSyncResponse(sender, payload)
     -- If any entries were added, recalculate points
     if results.added > 0 then
         if ns.Core then
-            ns.Core:RecalculatePointsFromLogs(tierKey)
+            ns.Core:RecalculatePointsFromLogs(profileName)
         end
         
         -- Notify UI to refresh
@@ -594,9 +597,9 @@ function Sync:HandleLogEntry(sender, payload)
     end
     
     if status == "added" then
-        -- Recalculate points for this entry's tier
-        if ns.Core then
-            ns.Core:RecalculatePointsFromLogs(entry.tier)
+        -- Recalculate points for this entry's profile
+        if ns.Core and entry.profile then
+            ns.Core:RecalculatePointsFromLogs(entry.profile)
         end
         
         -- Notify UI to refresh

@@ -35,6 +35,37 @@ Addon for the Spectrum Federation guild on Garona - World of Warcraft Retail/Bet
 > **Basic TODO**   
 > Update Manual Install Installation Instructions
 
-## Version
+## Features
 
-Current version: 0.0.13-beta.1
+### Tabbed Settings Interface (`/sf`)
+- **Main Tab**: Roster overview, version info, and window style customization
+- **Loot Tab**: Complete point history with filtering, profile management, and sync controls
+- **Debug Tab**: Advanced logging with filtering and debug controls
+
+### Profile System
+- Create and manage multiple independent point pools
+- Switch between profiles instantly
+- Perfect for managing multiple raid tiers or content types
+
+### Point Tracking
+- Track DKP-style points for guild members
+- Comprehensive loot log with timestamp, character, change amount, and reason
+- Adjustable point values with up/down buttons
+- Filter logs by character or profile
+
+### Window Customization
+- 5 built-in window styles (Default, Dark, Light, Transparent, Solid)
+- Draggable windows with position memory
+- All settings persist across sessions
+
+### Debug Tools
+- Real-time debug logging with 4 levels (VERBOSE, INFO, WARN, ERROR)
+- Filter logs by level and category
+- Up to 500 log entries stored
+- Enable/disable logging on demand
+
+### Slash Commands
+- `/sf` - Open settings window
+- `/sf loot` - Toggle loot window
+- `/sf debug` - Toggle debug logging
+- `/sf help` - Show command list
