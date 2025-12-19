@@ -279,18 +279,25 @@ end
 function Settings:CreateTabContents(parentFrame)
     if not parentFrame then return end
 
-    -- Create content frames for each tab (anchored to Inset)
-    local inset = parentFrame.Inset
-    if not inset then
-        if ns.Debug then
-            ns.Debug:Error("SETTINGS", "Inset frame not found, cannot create tab contents")
+    -- Try to find the Inset frame, fall back to parentFrame if not found
+    local containerFrame = parentFrame.Inset or parentFrame
+    
+    if ns.Debug then
+        if parentFrame.Inset then
+            ns.Debug:Verbose("SETTINGS", "Using Inset frame as container")
+        else
+            ns.Debug:Warn("SETTINGS", "Inset frame not found, using parentFrame directly")
         end
-        return
     end
 
     for i = 1, NUM_TABS do
-        local contentFrame = CreateFrame("Frame", "$parent" .. TAB_NAMES[i] .. "Content", inset)
-        contentFrame:SetAllPoints(inset)
+        local contentFrame = CreateFrame("Frame", "$parent" .. TAB_NAMES[i] .. "Content", containerFrame)
+        
+        -- Anchor with explicit offsets to ensure visibility
+        contentFrame:ClearAllPoints()
+        contentFrame:SetPoint("TOPLEFT", containerFrame, "TOPLEFT", 10, -10)
+        contentFrame:SetPoint("BOTTOMRIGHT", containerFrame, "BOTTOMRIGHT", -10, 10)
+        
         contentFrame:Hide() -- Initially hide all tabs
 
         tabContents[i] = contentFrame
@@ -305,6 +312,13 @@ function Settings:CreateTabContents(parentFrame)
     Settings.lootTab = tabContents[2]
     Settings.debugTab = tabContents[3]
     
+    if ns.Debug then
+        ns.Debug:Info("SETTINGS", "Tab content frames created, preparing to populate")
+        ns.Debug:Verbose("SETTINGS", "mainTab exists: %s", tostring(Settings.mainTab ~= nil))
+        ns.Debug:Verbose("SETTINGS", "lootTab exists: %s", tostring(Settings.lootTab ~= nil))
+        ns.Debug:Verbose("SETTINGS", "debugTab exists: %s", tostring(Settings.debugTab ~= nil))
+    end
+    
     -- Populate tab contents
     self:PopulateMainTab()
     self:PopulateLootTab()
@@ -316,16 +330,25 @@ end
 ]]--
 function Settings:PopulateMainTab()
     local mainTab = self.mainTab
-    if not mainTab then return end
+    if not mainTab then
+        if ns.Debug then
+            ns.Debug:Error("SETTINGS", "mainTab is nil, cannot populate")
+        end
+        return
+    end
+    
+    if ns.Debug then
+        ns.Debug:Info("SETTINGS", "Populating Main tab...")
+    end
 
     -- Create scroll frame for roster
     local scrollFrame = CreateFrame("ScrollFrame", "$parentRosterScroll", mainTab, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", mainTab, "TOPLEFT", 10, -10)
-    scrollFrame:SetSize(560, 375) -- 15 rows * 25px height
+    scrollFrame:SetPoint("TOPLEFT", mainTab, "TOPLEFT", 5, -5)
+    scrollFrame:SetSize(520, 280) -- Reduced height to make room for settings below
     
     -- Create scroll child
     local scrollChild = CreateFrame("Frame", "$parentScrollChild", scrollFrame)
-    scrollChild:SetSize(560, 375)
+    scrollChild:SetSize(500, 280)
     scrollFrame:SetScrollChild(scrollChild)
     
     -- Store references
@@ -333,26 +356,26 @@ function Settings:PopulateMainTab()
     self.mainScrollChild = scrollChild
     self.mainRosterRows = {}
     
-    -- Create roster rows (15 visible rows)
+    -- Create roster rows (11 visible rows to fit in smaller space)
     local rowHeight = 25
-    local maxRows = 15
+    local maxRows = 11
     
     for i = 1, maxRows do
         local row = CreateFrame("Frame", "$parentRow" .. i, scrollChild)
-        row:SetSize(540, rowHeight)
+        row:SetSize(480, rowHeight)
         row:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 5, -(i-1) * rowHeight)
         
-        -- Name label (300px wide)
+        -- Name label (280px wide)
         local nameLabel = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
         nameLabel:SetPoint("LEFT", row, "LEFT", 5, 0)
-        nameLabel:SetWidth(300)
+        nameLabel:SetWidth(280)
         nameLabel:SetJustifyH("LEFT")
         row.name = nameLabel
         
-        -- Points label (100px wide)
+        -- Points label (80px wide)
         local pointsLabel = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
         pointsLabel:SetPoint("LEFT", nameLabel, "RIGHT", 10, 0)
-        pointsLabel:SetWidth(100)
+        pointsLabel:SetWidth(80)
         pointsLabel:SetJustifyH("RIGHT")
         row.points = pointsLabel
         
@@ -362,19 +385,19 @@ function Settings:PopulateMainTab()
     
     -- Add settings section below roster
     local settingsHeader = mainTab:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-    settingsHeader:SetPoint("TOPLEFT", scrollFrame, "BOTTOMLEFT", 5, -10)
+    settingsHeader:SetPoint("TOPLEFT", scrollFrame, "BOTTOMLEFT", 5, -15)
     settingsHeader:SetText("Settings")
     
     -- Add version string
     local versionText = mainTab:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-    versionText:SetPoint("TOPLEFT", settingsHeader, "BOTTOMLEFT", 10, -5)
+    versionText:SetPoint("TOPLEFT", settingsHeader, "BOTTOMLEFT", 10, -10)
     
     -- Get version from TOC metadata
     local version = C_AddOns.GetAddOnMetadata("SpectrumFederation", "Version") or "Unknown"
     versionText:SetText("Version: " .. version)
     
-    -- Add backdrop selector
-    self:CreateBackdropSelector(mainTab)
+    -- Add backdrop selector (anchor below version text)
+    self:CreateBackdropSelector(mainTab, versionText)
     
     -- Initial roster refresh
     self:RefreshMainRoster()
@@ -433,7 +456,16 @@ end
 ]]--
 function Settings:PopulateLootTab()
     local lootTab = self.lootTab
-    if not lootTab then return end
+    if not lootTab then
+        if ns.Debug then
+            ns.Debug:Error("SETTINGS", "lootTab is nil, cannot populate")
+        end
+        return
+    end
+    
+    if ns.Debug then
+        ns.Debug:Info("SETTINGS", "Populating Loot tab...")
+    end
     
     -- Initialize filter state
     self.lootFilters = {
@@ -446,26 +478,26 @@ function Settings:PopulateLootTab()
     
     -- Column headers (moved down to make room for filters)
     local headers = {"Timestamp", "Character", "Change", "Reason", "Profile"}
-    local widths = {120, 140, 60, 140, 100} -- Total: 560px
+    local widths = {100, 120, 50, 120, 90} -- Total: 480px (reduced)
     
-    local xOffset = 10
+    local xOffset = 5
     for i, headerText in ipairs(headers) do
         local header = lootTab:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-        header:SetPoint("TOPLEFT", lootTab, "TOPLEFT", xOffset, -40) -- Moved down from -10
+        header:SetPoint("TOPLEFT", lootTab, "TOPLEFT", xOffset, -38)
         header:SetText(headerText)
         header:SetWidth(widths[i])
         header:SetJustifyH("LEFT")
         xOffset = xOffset + widths[i]
     end
     
-    -- Create scroll frame for logs (moved down to make room for filters)
+    -- Create scroll frame for logs (reduced size)
     local scrollFrame = CreateFrame("ScrollFrame", "$parentLogScroll", lootTab, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", lootTab, "TOPLEFT", 10, -65) -- Moved down from -35
-    scrollFrame:SetSize(560, 330) -- Reduced height from 360 to make room for filters
+    scrollFrame:SetPoint("TOPLEFT", lootTab, "TOPLEFT", 5, -60)
+    scrollFrame:SetSize(520, 200) -- Reduced height significantly
     
     -- Create scroll child
     local scrollChild = CreateFrame("Frame", "$parentScrollChild", scrollFrame)
-    scrollChild:SetSize(560, 360)
+    scrollChild:SetSize(500, 200)
     scrollFrame:SetScrollChild(scrollChild)
     
     -- Store references
@@ -473,9 +505,9 @@ function Settings:PopulateLootTab()
     self.lootScrollChild = scrollChild
     self.logRows = {}
     
-    -- Create log rows (12 visible rows)
+    -- Create log rows (6 visible rows to fit in smaller space)
     local rowHeight = 30
-    local maxRows = 12
+    local maxRows = 6
     
     for i = 1, maxRows do
         local row = self:CreateLogRow(scrollChild, i, widths, rowHeight)
@@ -502,8 +534,8 @@ end
 ]]--
 function Settings:CreateLootLogFilters(lootTab)
     local filterFrame = CreateFrame("Frame", "$parentFilters", lootTab)
-    filterFrame:SetPoint("TOPLEFT", lootTab, "TOPLEFT", 10, -5)
-    filterFrame:SetSize(560, 30)
+    filterFrame:SetPoint("TOPLEFT", lootTab, "TOPLEFT", 5, -5)
+    filterFrame:SetSize(520, 28)
     
     -- Character filter label
     local charLabel = filterFrame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
@@ -513,7 +545,7 @@ function Settings:CreateLootLogFilters(lootTab)
     -- Character filter EditBox
     local charEdit = CreateFrame("EditBox", "$parentCharFilter", filterFrame, "InputBoxTemplate")
     charEdit:SetPoint("LEFT", charLabel, "RIGHT", 5, 0)
-    charEdit:SetSize(120, 20)
+    charEdit:SetSize(100, 20)
     charEdit:SetAutoFocus(false)
     charEdit:SetScript("OnTextChanged", function(self)
         Settings.lootFilters.character = self:GetText():lower()
@@ -576,8 +608,8 @@ end
     @param scrollFrame Frame - The log scroll frame (for positioning)
 ]]--
 function Settings:CreateProfileSection(lootTab, scrollFrame)
-    local profileHeader = lootTab:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-    profileHeader:SetPoint("TOPLEFT", scrollFrame, "BOTTOMLEFT", 0, -15)
+    local profileHeader = lootTab:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    profileHeader:SetPoint("TOPLEFT", scrollFrame, "BOTTOMLEFT", 0, -10)
     profileHeader:SetText("Profile Management")
     
     -- Profile dropdown
@@ -639,13 +671,20 @@ end
     @param lootTab Frame - The loot tab frame
 ]]--
 function Settings:CreateLootWindowSection(lootTab)
-    local lootHeader = lootTab:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-    lootHeader:SetPoint("BOTTOMLEFT", lootTab, "BOTTOMLEFT", 10, 40)
+    -- Get reference to profile section for positioning
+    local anchorPoint = self.profileSection or lootTab
+    
+    local lootHeader = lootTab:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    if self.profileSection then
+        lootHeader:SetPoint("TOPLEFT", self.profileDropdown, "BOTTOMLEFT", 15, -15)
+    else
+        lootHeader:SetPoint("TOPLEFT", lootTab, "TOPLEFT", 10, -350)
+    end
     lootHeader:SetText("Loot Window")
     
     -- Show Loot Window checkbox
     local showCheckbox = CreateFrame("CheckButton", "$parentShowLoot", lootTab, "UICheckButtonTemplate")
-    showCheckbox:SetPoint("TOPLEFT", lootHeader, "BOTTOMLEFT", 5, -5)
+    showCheckbox:SetPoint("TOPLEFT", lootHeader, "BOTTOMLEFT", 0, -5)
     showCheckbox.text = showCheckbox:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     showCheckbox.text:SetPoint("LEFT", showCheckbox, "RIGHT", 5, 0)
     showCheckbox.text:SetText("Show Loot Window")
@@ -803,14 +842,19 @@ end
 --[[
     Create backdrop selector in Main tab
     @param mainTab Frame - The main tab frame
+    @param anchorTo Frame|FontString - Element to anchor below (optional)
 ]]--
-function Settings:CreateBackdropSelector(mainTab)
-    local styleHeader = mainTab:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
-    styleHeader:SetPoint("BOTTOMLEFT", mainTab, "BOTTOMLEFT", 10, 10)
-    styleHeader:SetText("Window Style")
+function Settings:CreateBackdropSelector(mainTab, anchorTo)
+    local styleHeader = mainTab:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    if anchorTo then
+        styleHeader:SetPoint("TOPLEFT", anchorTo, "BOTTOMLEFT", 0, -15)
+    else
+        styleHeader:SetPoint("TOPLEFT", mainTab, "TOPLEFT", 10, -350)
+    end
+    styleHeader:SetText("Window Style:")
     
     local styleDropdown = CreateFrame("Frame", "$parentStyleDropdown", mainTab, "UIDropDownMenuTemplate")
-    styleDropdown:SetPoint("TOPLEFT", styleHeader, "BOTTOMLEFT", -15, -5)
+    styleDropdown:SetPoint("LEFT", styleHeader, "RIGHT", -10, -2)
     UIDropDownMenu_SetWidth(styleDropdown, 150)
     
     UIDropDownMenu_Initialize(styleDropdown, function(self, level)
@@ -852,7 +896,7 @@ end
 ]]--
 function Settings:CreateLogRow(parent, index, widths, height)
     local row = CreateFrame("Frame", "$parentRow" .. index, parent)
-    row:SetSize(560, height)
+    row:SetSize(500, height)
     row:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -(index-1) * height)
     
     local xOffset = 5
@@ -995,8 +1039,8 @@ end
 ]]--
 function Settings:CreateDebugLogFilters(debugTab)
     local filterFrame = CreateFrame("Frame", "$parentFilters", debugTab)
-    filterFrame:SetPoint("TOPLEFT", debugTab, "TOPLEFT", 10, -5)
-    filterFrame:SetSize(560, 30)
+    filterFrame:SetPoint("TOPLEFT", debugTab, "TOPLEFT", 5, -5)
+    filterFrame:SetSize(520, 28)
     
     -- Level filter label
     local levelLabel = filterFrame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
@@ -1059,7 +1103,16 @@ end
 ]]--
 function Settings:PopulateDebugTab()
     local debugTab = self.debugTab
-    if not debugTab then return end
+    if not debugTab then
+        if ns.Debug then
+            ns.Debug:Error("SETTINGS", "debugTab is nil, cannot populate")
+        end
+        return
+    end
+    
+    if ns.Debug then
+        ns.Debug:Info("SETTINGS", "Populating Debug tab...")
+    end
     
     -- Initialize filter state
     self.debugFilters = {
@@ -1070,17 +1123,17 @@ function Settings:PopulateDebugTab()
     -- Create filter controls at top
     self:CreateDebugLogFilters(debugTab)
     
-    -- Create scrolling text frame for debug logs (moved down for filters)
+    -- Create scrolling text frame for debug logs
     local scrollFrame = CreateFrame("ScrollFrame", "$parentDebugScroll", debugTab, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", debugTab, "TOPLEFT", 10, -40) -- Moved down from -10
-    scrollFrame:SetSize(560, 330) -- Reduced height from 360
+    scrollFrame:SetPoint("TOPLEFT", debugTab, "TOPLEFT", 5, -38)
+    scrollFrame:SetSize(520, 280) -- Reduced height to fit controls below
     
     -- Create EditBox (read-only, multi-line)
     local logText = CreateFrame("EditBox", "$parentLogText", scrollFrame)
     logText:SetMultiLine(true)
     logText:SetAutoFocus(false)
     logText:SetFontObject(ChatFontNormal)
-    logText:SetWidth(540)
+    logText:SetWidth(500)
     logText:SetScript("OnEscapePressed", function(self)
         self:ClearFocus()
     end)
@@ -1091,12 +1144,12 @@ function Settings:PopulateDebugTab()
     
     -- Create controls section below log viewer
     local controlFrame = CreateFrame("Frame", "$parentControls", debugTab)
-    controlFrame:SetPoint("TOPLEFT", scrollFrame, "BOTTOMLEFT", 0, -10)
-    controlFrame:SetSize(560, 60)
+    controlFrame:SetPoint("TOPLEFT", scrollFrame, "BOTTOMLEFT", 0, -8)
+    controlFrame:SetSize(520, 70)
     
     -- Enable Debug checkbox
     local enableCheckbox = CreateFrame("CheckButton", "$parentEnableDebug", controlFrame, "UICheckButtonTemplate")
-    enableCheckbox:SetPoint("TOPLEFT", controlFrame, "TOPLEFT", 5, 0)
+    enableCheckbox:SetPoint("TOPLEFT", controlFrame, "TOPLEFT", 0, 0)
     enableCheckbox.text = enableCheckbox:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     enableCheckbox.text:SetPoint("LEFT", enableCheckbox, "RIGHT", 5, 0)
     enableCheckbox.text:SetText("Enable Debug Logging")
@@ -1258,8 +1311,84 @@ function Settings:Initialize()
     -- Register StaticPopup dialogs
     self:RegisterStaticPopups()
     
+    -- Register with WoW's Interface Options (10.0+ Settings API)
+    self:RegisterWithInterfaceOptions()
+    
     if ns.Debug then
         ns.Debug:Info("SETTINGS", "Settings module initialized")
+    end
+end
+
+--[[
+    Register the settings panel with WoW's Interface Options
+    Uses the new Settings API introduced in WoW 10.0
+]]--
+function Settings:RegisterWithInterfaceOptions()
+    -- Access WoW's global Settings API (avoid collision with our module name)
+    local WoWSettings = _G.Settings
+    
+    if not WoWSettings or not WoWSettings.RegisterCanvasLayoutCategory then
+        if ns.Debug then
+            ns.Debug:Warn("SETTINGS", "WoW Settings API not available (pre-10.0 client?)")
+        end
+        return
+    end
+    
+    -- Wait for settings frame to be created
+    if not settingsFrame then
+        if ns.Debug then
+            ns.Debug:Warn("SETTINGS", "Settings frame not created yet, cannot register with Interface Options")
+        end
+        return
+    end
+    
+    -- Define optional frame functions for the Settings API
+    settingsFrame.OnCommit = function()
+        -- Called when Apply is clicked (if any settings have the Apply commit flag)
+        if ns.Debug then
+            ns.Debug:Verbose("SETTINGS", "OnCommit called")
+        end
+    end
+    
+    settingsFrame.OnDefault = function()
+        -- Called when defaults are applied
+        if ns.Debug then
+            ns.Debug:Info("SETTINGS", "OnDefault called - resetting to defaults")
+        end
+        -- Reset backdrop to default
+        if ns.db.settings then
+            ns.db.settings.backdropStyle = "Default"
+            ns.Settings:ApplyBackdropToAllFrames("Default")
+        end
+    end
+    
+    settingsFrame.OnRefresh = function()
+        -- Called when settings panel is shown
+        if ns.Debug then
+            ns.Debug:Verbose("SETTINGS", "OnRefresh called")
+        end
+        -- Refresh all displays
+        ns.Settings:RefreshMainRoster()
+        ns.Settings:RefreshLootLog()
+        ns.Settings:RefreshDebugLog()
+    end
+    
+    -- Register the category with the Settings API
+    local category, layout = WoWSettings.RegisterCanvasLayoutCategory(settingsFrame, "Spectrum Federation")
+    category.ID = "SpectrumFederation"
+    
+    -- Set custom anchoring if needed (optional)
+    -- layout:AddAnchorPoint("TOPLEFT", 0, 0)
+    -- layout:AddAnchorPoint("BOTTOMRIGHT", 0, 0)
+    
+    -- Register the category to make it appear in Interface Options
+    WoWSettings.RegisterAddOnCategory(category)
+    
+    -- Store category reference
+    self.settingsCategory = category
+    
+    if ns.Debug then
+        ns.Debug:Info("SETTINGS", "Registered with Interface Options (Settings API)")
     end
 end
 
