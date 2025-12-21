@@ -16,16 +16,10 @@ function SF:UpdateLootProfileDropdownText()
 
     local currentProfile = SF.db.activeLootProfile
     if currentProfile then
-        if SF.LootProfileDropdown then
-            SF.LootProfileDropdown.Text:SetText(currentProfile)
-        end
-
+        SF.LootProfileDropdown.Text:SetText(currentProfile)
         if SF.ProfileDeleteButton then SF.ProfileDeleteButton:Show() end
     else
-        if SF.LootProfileDropdown then
-            SF.LootProfileDropdown.Text:SetText("Select a Profile...")
-        end
-
+        SF.LootProfileDropdown.Text:SetText("Select a Profile...")
         if SF.ProfileDeleteButton then SF.ProfileDeleteButton:Hide() end
     end
 end
