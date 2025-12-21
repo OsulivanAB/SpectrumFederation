@@ -12,4 +12,8 @@ read_globals = {
   "UnitExists",
   "GetRealmName",
   "time",
+  "GameTooltip",
+  "GameTooltip_Hide",
+  "Settings",
+  "UIParent",
 }
