@@ -1,0 +1,60 @@
+---
+name: Update CHANGELOG with Copilot
+
+'on':
+  push:
+    branches:
+      - main
+      - beta
+    # Don't run on the automated changelog commits themselves
+    paths-ignore:
+      - "CHANGELOG.md"
+
+permissions:
+  contents: write
+
+jobs:
+  update-changelog:
+    runs-on: ubuntu-latest
+    # Skip if this is a bot commit to avoid infinite loops
+    if: "!contains(github.event.head_commit.message, '[skip changelog]')"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # Use PAT with admin permissions to bypass branch protection
+          # If PAT_TOKEN secret is not set, falls back to
+          # GITHUB_TOKEN (will fail on protected branches)
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0  # Full history for better diff analysis
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate changelog entry with Copilot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: python3 .github/scripts/update-changelog.py
+
+      - name: Commit and push changelog update
+        run: |
+          git add CHANGELOG.md
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit to CHANGELOG.md"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git commit -m "chore: update CHANGELOG.md for \
+          automated release [skip ci] [skip changelog]"
+          git push
