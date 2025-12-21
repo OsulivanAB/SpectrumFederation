@@ -1,6 +1,26 @@
 -- Grab the namespace
 local addonName, SF = ...
 
+-- Database Initialization
+-- TODO: Add Debug Logging
+function SF:InitializeDatabase()
+
+    -- Check if the global SavedVariable exists.
+    -- If it is nil, it means this is a fresh install or first run
+    if not SpectrumFederationDB then
+        SpectrumFederationDB = {
+            lootProfiles = {},
+            activeLootProfile = nil
+        }
+        print("|cFF00FF00" .. addonName .. "|r: Initialized new database.")
+    end
+
+    -- Create a shortcut in our namespace
+    SF.db = SpectrumFederationDB
+end
+
+
+
 -- Create an Event Frame for Addon Initialization
 local EventFrame = CreateFrame("Frame")
 
@@ -12,6 +32,9 @@ EventFrame:RegisterEvent("PLAYER_LOGIN")
 EventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" then
         
+        -- Initialize the Database
+        SF:InitializeDatabase()
+
         -- Check to make sure Settings UI function exists
         if SF.CreateSettingsUI then
             SF:CreateSettingsUI()

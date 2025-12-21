@@ -9,3 +9,4 @@
 ## Core files
 SpectrumFederation.lua
 modules/settings_ui.lua
+modules/LootProfiles.lua
