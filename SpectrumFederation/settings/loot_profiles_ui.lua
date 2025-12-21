@@ -16,20 +16,26 @@ function SF:UpdateLootProfileDropdownText()
 
     local currentProfile = SF.db.activeLootProfile
     if currentProfile then
-        SF.LootProfileDropdown.Text:SetText(currentProfile)
-        if SF.LootProfileDeleteButton then SF.LootProfileDeleteButton:Show() end
+        if SF.LootProfileDropdown then
+            SF.LootProfileDropdown.Text:SetText(currentProfile)
+        end
+
+        if SF.ProfileDeleteButton then SF.ProfileDeleteButton:Show() end
     else
-        SF.LootProfileDropdown.Text:SetText("Select a Profile...")
-        if SF.LootProfileDeleteButton then SF.LootProfileDeleteButton:Hide() end
+        if SF.LootProfileDropdown then
+            SF.LootProfileDropdown.Text:SetText("Select a Profile...")
+        end
+
+        if SF.ProfileDeleteButton then SF.ProfileDeleteButton:Hide() end
     end
 end
 
--- Creates the Loot Helper section in the settings panel
-function SF:CreateLootHelperSection(panel, anchorFrame)
+-- Creates the Loot Profile Manager section in the settings panel
+function SF:CreateLootProfilesSection(panel, anchorFrame)
     -- Subtitle with horizontal lines
     local subTitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     subTitle:SetPoint("TOP", anchorFrame, "BOTTOM", 0, -20)
-    subTitle:SetText("Loot Helper")
+    subTitle:SetText("Loot Profile Manager")
     
     local leftLine = panel:CreateTexture(nil, "ARTWORK")
     leftLine:SetColorTexture(0.5, 0.5, 0.5, 1)  -- Gray line
