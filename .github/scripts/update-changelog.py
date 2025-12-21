@@ -39,6 +39,19 @@ def main():
         sys.exit(1)
 
     print(f"Current version: {version}")
+    
+    # Determine if this is a beta version
+    is_beta = "-beta" in version
+    
+    # Determine which section to use
+    if branch_name == "beta" or is_beta:
+        section_header = "## [Unreleased - Beta]"
+        version_display = version
+    else:
+        section_header = f"## [{version}] - {current_date}"
+        version_display = version
+    
+    print(f"Using section: {section_header}")
 
     # Get git diff of recent changes
     try:
@@ -88,7 +101,7 @@ def main():
         "",
         "Based on the commit message and code changes, generate a changelog entry following this format:",
         "",
-        f"## [{version}] - {current_date}",
+        section_header,
         "",
         "### Added",
         "- List new features or capabilities added",
@@ -163,7 +176,7 @@ def main():
         if hasattr(e, 'response') and hasattr(e.response, 'text'):
             print(f"Response: {e.response.text}")
         # Fallback to basic entry
-        new_entry = f"""## [{version}] - {current_date}
+        new_entry = f"""{section_header}
 
 ### Changed
 - {commit_msg}
@@ -176,7 +189,7 @@ def main():
         lines = existing_changelog.split("\n")
         insert_index = 0
         
-        # Skip header lines and find first version entry
+        # Skip header lines and find first version entry or Unreleased section
         for i, line in enumerate(lines):
             if line.startswith("## ["):
                 insert_index = i
@@ -189,18 +202,24 @@ def main():
                     insert_index = i + 1
                     break
         
-        # Check if this version already exists
-        version_pattern = re.compile(r"^## \[" + re.escape(version) + r"\]")
-        version_exists = any(version_pattern.match(line) for line in lines)
+        # Check if this section already exists
+        if branch_name == "beta" or is_beta:
+            # Look for Unreleased - Beta section
+            section_pattern = re.compile(r"^## \[Unreleased - Beta\]")
+        else:
+            # Look for specific version
+            section_pattern = re.compile(r"^## \[" + re.escape(version) + r"\]")
         
-        if version_exists:
-            print(f"Version {version} already exists in CHANGELOG. Updating entry...")
+        section_exists = any(section_pattern.match(line) for line in lines)
+        
+        if section_exists:
+            print(f"Section {section_header} already exists in CHANGELOG. Updating entry...")
             # Find and replace the existing entry
             start_idx = None
             end_idx = None
             
             for i, line in enumerate(lines):
-                if version_pattern.match(line):
+                if section_pattern.match(line):
                     start_idx = i
                 elif start_idx is not None and line.startswith("## ["):
                     end_idx = i

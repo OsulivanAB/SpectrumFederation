@@ -43,6 +43,29 @@ jobs:
           BRANCH_NAME: ${{ github.ref_name }}
         run: python3 .github/scripts/update-changelog.py
 
+      - name: Clean up beta entries on main branch
+        if: github.ref_name == 'main'
+        run: |
+          python3 << 'EOF'
+          import re
+          from pathlib import Path
+
+          changelog_path = Path('CHANGELOG.md')
+          if changelog_path.exists():
+              content = changelog_path.read_text()
+              # Remove entire Unreleased - Beta section
+              content = re.sub(
+                  r'## \[Unreleased - Beta\].*?(?=## \[|\Z)',
+                  '',
+                  content,
+                  flags=re.DOTALL
+              )
+              # Clean up extra blank lines
+              content = re.sub(r'\n{3,}', '\n\n', content)
+              changelog_path.write_text(content)
+              print('Cleaned up beta entries from CHANGELOG')
+          EOF
+
       - name: Commit and push changelog update
         run: |
           git add CHANGELOG.md
