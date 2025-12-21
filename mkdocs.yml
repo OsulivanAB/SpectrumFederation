@@ -74,6 +74,7 @@ nav:
     - Settings UI: settings-ui.md
   - Development:
     - Getting Started: development/index.md
+    - Naming Conventions: development/naming-conventions.md
 
 plugins:
   - search
