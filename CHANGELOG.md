@@ -53,7 +53,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Settings structure properly migrates from older versions
 - UI state persistence for window positions and active tab
 
-## [0.0.14-beta.1] - 2025-12-XX
+## [0.0.14-beta.1] - Unknown
 
 ### Added
 - Profile-based system replacing tier-based system
