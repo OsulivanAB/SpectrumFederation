@@ -4,7 +4,6 @@ Update CHANGELOG.md using GitHub Copilot to analyze recent changes.
 """
 
 import os
-import json
 import re
 import subprocess
 import sys
