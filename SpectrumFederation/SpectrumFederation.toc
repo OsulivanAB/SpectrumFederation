@@ -8,10 +8,4 @@
 
 ## Core files
 SpectrumFederation.lua
-modules/core.lua
-modules/debug.lua
-modules/lootLog.lua
-modules/sync.lua
-modules/ui.lua
-modules/settings.lua
-locale/enUS.lua
+modules/settings_ui.lua
