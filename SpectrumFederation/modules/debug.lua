@@ -1,8 +1,8 @@
 local addonName, SF = ...
 
 -- Local reference to Debug module
-local Debug = ns.Debug or {}
-ns.Debug = Debug
+local Debug = SF.Debug or {}
+SF.Debug = Debug
 
 -- In-memory enabled state (synced with SavedVariables)
 Debug.enabled = false
@@ -18,8 +18,8 @@ Debug.LEVELS = {
 -- SetEnabled: Enable or disable debug logging
 function Debug:SetEnabled(enabled)
     self.enabled = enabled
-    if ns.debugDB then
-        ns.debugDB.enabled = enabled
+    if SF.debugDB then
+        SF.debugDB.enabled = enabled
     end
 end
 
@@ -53,13 +53,13 @@ function Debug:Log(level, category, message, ...)
     }
     
     -- Append to debugDB
-    if ns.debugDB and ns.debugDB.logs then
-        table.insert(ns.debugDB.logs, entry)
+    if SF.debugDB and SF.debugDB.logs then
+        table.insert(SF.debugDB.logs, entry)
         
         -- Trim old entries if above maxEntries
-        local maxEntries = ns.debugDB.maxEntries or 500
-        while #ns.debugDB.logs > maxEntries do
-            table.remove(ns.debugDB.logs, 1)
+        local maxEntries = SF.debugDB.maxEntries or 500
+        while #SF.debugDB.logs > maxEntries do
+            table.remove(SF.debugDB.logs, 1)
         end
     end
 end
@@ -90,11 +90,11 @@ end
 function Debug:GetRecentLogs(count)
     count = count or 10
     
-    if not ns.debugDB or not ns.debugDB.logs then
+    if not SF.debugDB or not SF.debugDB.logs then
         return {}
     end
     
-    local logs = ns.debugDB.logs
+    local logs = SF.debugDB.logs
     local totalLogs = #logs
     local startIndex = math.max(1, totalLogs - count + 1)
     
@@ -108,7 +108,7 @@ end
 
 -- Initialize debug state from SavedVariables
 function Debug:Initialize()
-    if ns.debugDB then
-        self.enabled = ns.debugDB.enabled or false
+    if SF.debugDB then
+        self.enabled = SF.debugDB.enabled or false
     end
 end

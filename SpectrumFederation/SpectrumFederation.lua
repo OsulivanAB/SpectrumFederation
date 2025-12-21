@@ -2,7 +2,6 @@
 local addonName, SF = ...
 
 -- Database Initialization
--- TODO: Add Debug Logging
 function SF:InitializeDatabase()
 
     -- Check if the global SavedVariable exists.
@@ -13,6 +12,9 @@ function SF:InitializeDatabase()
             activeLootProfile = nil
         }
         print("|cFF00FF00" .. addonName .. "|r: Initialized new database.")
+        if SF.Debug then SF.Debug:Info("DATABASE", "Initialized new database for fresh install") end
+    else
+        if SF.Debug then SF.Debug:Info("DATABASE", "Loaded existing database") end
     end
 
     -- Create a shortcut in our namespace
@@ -28,9 +30,24 @@ local EventFrame = CreateFrame("Frame")
 EventFrame:RegisterEvent("PLAYER_LOGIN")
 
 -- Script to run when Player Login Event fires
--- TODO: Add Debug Logging
 EventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" then
+        
+        -- Initialize DebugDB
+        if not SpectrumFederationDebugDB then
+            SpectrumFederationDebugDB = {
+                enabled = false,
+                logs = {},
+                maxEntries = 500
+            }
+        end
+        SF.debugDB = SpectrumFederationDebugDB
+        
+        -- Initialize Debug System
+        if SF.Debug then
+            SF.Debug:Initialize()
+            SF.Debug:Info("ADDON", "SpectrumFederation addon loaded")
+        end
         
         -- Initialize the Database
         SF:InitializeDatabase()

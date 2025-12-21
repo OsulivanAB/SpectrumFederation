@@ -5,11 +5,12 @@ local addonName, SF = ...
 -- Bug: When you delete a profile it does not change the dropdown text to "Select a Profile...", it still shows the old profile name until you click on the dropdown. Probably a UI refresh issue.
 function SF:UpdateLootProfileDropdownText()
 
+    if SF.Debug then SF.Debug:Verbose("UI", "Updating Loot Profile Dropdown Text") end
     print("Updating Loot Profile Dropdown Text...")
 
     -- Ensure the dropdown exists before trying to talk to it
     if not SF.LootProfileDropdown then
-        -- TODO: This should be added to the Debug Logging System
+        if SF.Debug then SF.Debug:Error("UI", "UpdateLootProfileDropdownText failed: LootProfileDropdown not found") end
         print("|cFFFF0000" .. addonName .. "|r: LootProfileDropdown not found.")
         return
     end
@@ -137,9 +138,10 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
     -- logic to delete
     deleteProfileBtn:SetScript("OnClick", function()
         if SF.db.activeLootProfile then
+            if SF.Debug then SF.Debug:Info("UI", "User clicked delete button for profile '%s'", SF.db.activeLootProfile) end
             SF:DeleteProfile(SF.db.activeLootProfile)
         else
-            -- TODO: This should be added to the Debug Logging System
+            if SF.Debug then SF.Debug:Warn("UI", "User clicked delete button but no active profile exists") end
             print("|cFFFF0000" .. addonName .. "|r: No active profile to delete.")
         end
     end)
@@ -171,10 +173,12 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
 
         -- Input Validation
         if text == "" then
+            if SF.Debug then SF.Debug:Warn("UI", "User attempted to create profile with empty name") end
             print("|cFFFF0000" .. addonName .. "|r: Profile name cannot be empty.")
             return
         end
 
+        if SF.Debug then SF.Debug:Info("UI", "User creating new profile: '%s'", text) end
         SF:CreateNewLootProfile(text)
 
         -- Clear the input box
