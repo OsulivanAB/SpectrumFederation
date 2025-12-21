@@ -4,20 +4,25 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 
 ## Project Overview
 
-**SpectrumFederation** is a WoW addon for the Spectrum Federation guild on Garona, written in **Lua 5.1** (WoW's embedded version). It tracks DKP-style points, raid participation, and loot distribution across WoW tiers.
+**SpectrumFederation** is a WoW addon for the Spectrum Federation guild on Garona, written in **Lua 5.1** (WoW's embedded version). It tracks loot profiles and provides a loot helper system for guild management.
 
 **Key Architecture:**
 - `SpectrumFederation/` - All addon code (packaged for WowUp/CurseForge)
 - `SpectrumFederation.toc` - Manifest with load order and version (MUST bump for PRs)
-- `ns` (namespace) pattern - Shared state via `local addonName, ns = ...`
-- SavedVariables - `SpectrumFederationDB` (tier data), `SpectrumFederationDebugDB` (logging)
-- Module organization: `ns.Core`, `ns.UI`, `ns.Debug`, `ns.LootLog`
+- `SF` (namespace) pattern - Shared state via `local addonName, SF = ...`
+- SavedVariables - `SpectrumFederationDB` (profiles), `SpectrumFederationDebugDB` (logging)
+- Module organization: `SF.Debug`, profile management functions
 
-**Current Modules:**
-- `core.lua` - Database initialization, roster tracking, tier management
-- `ui.lua` - Frame creation, UI components
-- `debug.lua` - Debug logging system with levels (VERBOSE/INFO/WARN/ERROR)
-- `lootLog.lua` - Audit trail for point changes
+**Current File Structure:**
+- `SpectrumFederation.lua` - Entry point, event registration, database init
+- `modules/debug.lua` - Debug logging system with levels (VERBOSE/INFO/WARN/ERROR)
+- `modules/LootProfiles.lua` - Profile CRUD operations (Create, Read, Update, Delete)
+- `modules/settings_ui.lua` - Main settings panel with banner
+- `modules/settings.lua` - Settings management
+- `modules/core.lua` - Legacy core functionality (may be deprecated)
+- `settings/loot_helper.lua` - Loot Helper UI section with profile management
+- `settings/loot_profiles_ui.lua` - Legacy file (superseded by loot_helper.lua)
+- `locale/enUS.lua` - Localization strings
 
 ## Critical Branch & Version Rules
 
@@ -46,54 +51,59 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 
 **TOC File Load Order (SpectrumFederation.toc):**
 ```
-SpectrumFederation.lua      # Entry point, event registration
-modules/core.lua            # Database, roster, tier management
-modules/debug.lua           # Debug logging system
-modules/lootLog.lua         # Point change audit log
-modules/ui.lua              # UI frames and components
-locale/enUS.lua             # Localization strings
+SpectrumFederation.lua         # Entry point, event registration, DB init
+modules/debug.lua              # Debug logging system (load early)
+modules/LootProfiles.lua       # Profile CRUD operations
+settings/loot_helper.lua       # Loot Helper UI section
+modules/settings_ui.lua        # Main settings panel frame
 ```
 
 **Adding New Files:**
-1. Create under `SpectrumFederation/modules/`
+1. Create under appropriate directory:
+   - `SpectrumFederation/modules/` for core functionality
+   - `SpectrumFederation/settings/` for UI sections
 2. Add to `.toc` after dependencies, before dependents
-3. Use namespace pattern: `local addonName, ns = ...`
-4. Create module table: `local MyModule = ns.MyModule or {}; ns.MyModule = MyModule`
+3. Use namespace pattern: `local addonName, SF = ...`
+4. For settings sections: Create a function like `SF:CreateYourSection(panel, anchorFrame)`
 
 ## Namespace & SavedVariables Pattern
 
-**Namespace Usage (`ns`):**
+**Namespace Usage (`SF`):**
 ```lua
-local addonName, ns = ...
+local addonName, SF = ...
 
--- Module organization (follow this pattern)
-ns.Core     -- Database, tier data, roster (core.lua)
-ns.UI       -- Frame creation, UI elements (ui.lua)
-ns.Debug    -- Logging system (debug.lua)
-ns.LootLog  -- Audit trail (lootLog.lua)
-ns.L        -- Localization strings (locale/enUS.lua)
+-- Direct function definitions on SF namespace
+function SF:CreateNewLootProfile(profileName)
+    -- Profile creation logic
+end
+
+function SF:SetActiveLootProfile(profileName)
+    -- Profile switching logic
+end
+
+-- Module organization for debug system
+SF.Debug     -- Logging system (debug.lua)
 
 -- SavedVariables references (set in SpectrumFederation.lua)
-ns.db       -- Points to SpectrumFederationDB
-ns.debugDB  -- Points to SpectrumFederationDebugDB
+SF.db        -- Points to SpectrumFederationDB
+SF.debugDB   -- Points to SpectrumFederationDebugDB
 ```
 
 **SavedVariables Structure:**
 ```lua
 -- SpectrumFederationDB (declared in .toc)
 {
-    schemaVersion = 1,
-    currentTier = "0.0.14",  -- Active tier version
-    tiers = {
-        ["0.0.14"] = {
-            points = {},      -- charKey -> point total
-            logs = {},        -- id -> log entry
-            nextLogId = 1
+    lootProfiles = {
+        ["ProfileName"] = {
+            name = "ProfileName",
+            owner = "PlayerName",
+            server = "RealmName",
+            admins = { "PlayerName-RealmName" },
+            created = timestamp,
+            modified = timestamp
         }
     },
-    ui = {
-        lootFrame = { position = nil, isShown = false }
-    }
+    activeLootProfile = "ProfileName"  -- Current active profile
 }
 
 -- SpectrumFederationDebugDB (debug logging)
@@ -110,54 +120,105 @@ ns.debugDB  -- Points to SpectrumFederationDebugDB
 
 **Event Handling (SpectrumFederation.lua):**
 ```lua
-local frame = CreateFrame("Frame")
-frame:RegisterEvent("PLAYER_LOGIN")
-frame:SetScript("OnEvent", function(self, event, ...)
+local EventFrame = CreateFrame("Frame")
+EventFrame:RegisterEvent("PLAYER_LOGIN")
+EventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" then
-        InitializeNamespace()  -- Set ns.db, ns.debugDB
-        ns.Debug:Initialize()
-        ns.Core:OnPlayerLogin()
+        -- Initialize DebugDB
+        if not SpectrumFederationDebugDB then
+            SpectrumFederationDebugDB = { enabled = false, logs = {}, maxEntries = 500 }
+        end
+        SF.debugDB = SpectrumFederationDebugDB
+        
+        -- Initialize Debug System
+        if SF.Debug then
+            SF.Debug:Initialize()
+            SF.Debug:Info("ADDON", "SpectrumFederation addon loaded")
+        end
+        
+        -- Initialize Database
+        SF:InitializeDatabase()
+        
+        -- Create Settings UI
+        if SF.CreateSettingsUI then
+            SF:CreateSettingsUI()
+        end
     end
 end)
 ```
 
-**Module Methods (use colon syntax):**
+**Module Pattern for Debug (debug.lua):**
 ```lua
-function Core:InitDatabase()
-    if not ns.db then ns.db = SpectrumFederationDB or {} end
-    -- Initialize with default structure
-end
+local addonName, SF = ...
+
+local Debug = SF.Debug or {}
+SF.Debug = Debug
 
 function Debug:Log(level, category, message, ...)
     if not self:IsEnabled() then return end
-    -- Log to ns.debugDB.logs
+    -- Log to SF.debugDB.logs
+end
+
+function Debug:Initialize()
+    if SF.debugDB then
+        self.enabled = SF.debugDB.enabled or false
+    end
+end
+```
+
+**Profile Functions (LootProfiles.lua):**
+```lua
+local addonName, SF = ...
+
+function SF:CreateNewLootProfile(profileName)
+    -- Validation, creation logic
+    if SF.Debug then SF.Debug:Info("PROFILES", "Created new profile '%s'", profileName) end
+end
+
+function SF:SetActiveLootProfile(profileName)
+    SF.db.activeLootProfile = profileName
+    if SF.Debug then SF.Debug:Info("PROFILES", "Set active profile to '%s'", profileName) end
+end
+
+function SF:DeleteProfile(profileName)
+    SF.db.lootProfiles[profileName] = nil
+    if SF.Debug then SF.Debug:Info("PROFILES", "Deleted profile '%s'", profileName) end
 end
 ```
 
 **Debug Logging (use everywhere):**
 ```lua
-if ns.Debug then
-    ns.Debug:Info("CATEGORY", "Message with %s", arg)
-    ns.Debug:Error("CATEGORY", "Error occurred")
-    ns.Debug:Verbose("CATEGORY", "Detailed info")
+if SF.Debug then
+    SF.Debug:Info("CATEGORY", "Message with %s", arg)
+    SF.Debug:Error("CATEGORY", "Error occurred")
+    SF.Debug:Verbose("CATEGORY", "Detailed info")
+    SF.Debug:Warn("CATEGORY", "Warning message")
 end
 ```
 
-**Localization:**
+**Settings UI Structure (settings_ui.lua + settings/loot_helper.lua):**
 ```lua
--- In locale/enUS.lua
-local L = ns.L
-L["ADDON_LOADED"] = "Spectrum Federation loaded!"
+-- Main settings panel (settings_ui.lua)
+function SF:CreateSettingsUI()
+    local panel = CreateFrame("Frame", nil, UIParent)
+    
+    -- Banner (90% width, auto-scales)
+    local banner = panel:CreateTexture(nil, "ARTWORK")
+    -- ... banner setup ...
+    
+    -- Create sections (add more as needed)
+    SF:CreateLootHelperSection(panel, banner)
+    
+    -- Register with Settings API
+    local category = Settings.RegisterCanvasLayoutCategory(panel, "Spectrum Federation")
+    Settings.RegisterAddOnCategory(category)
+end
 
--- Usage
-print(ns.L["ADDON_LOADED"])
-```
-
-**Slash Commands (SpectrumFederation.lua):**
-```lua
-SLASH_SFDEBUG1 = "/sfdebug"
-SlashCmdList["SFDEBUG"] = function(msg)
-    -- Parse msg and call ns.Debug methods
+-- Section file (settings/loot_helper.lua)
+function SF:CreateLootHelperSection(panel, anchorFrame)
+    -- Create subtitle with horizontal lines (90% width)
+    -- Create profile dropdown
+    -- Create profile management UI
 end
 ```
 
@@ -168,7 +229,14 @@ end
 2. `validate-packaging.yml` - Ensures WowUp/CurseForge zip structure
 3. `check-version-bump.sh` - Fails PR if version unchanged
 4. `release.yml` - Auto-tags and releases on version bump
-5. `deploy-docs.yml` - MkDocs to GitHub Pages
+5. `update-changelog.yml` - Auto-generates changelog using GitHub Copilot
+6. `deploy-docs.yml` - MkDocs to GitHub Pages
+
+**Changelog Workflow:**
+- **Beta branch**: Changes go to `## [Unreleased - Beta]` section
+- **Main branch**: Changes go to versioned releases (e.g., `## [0.0.15] - 2025-12-21`)
+- **Auto-cleanup**: When beta merges to main, the Unreleased - Beta section is automatically removed
+- Uses GitHub Copilot to analyze git diffs and generate changelog entries
 
 **Luacheck (.luacheckrc):**
 - Declares WoW API globals: `CreateFrame`, `C_Timer`, etc.
@@ -217,16 +285,18 @@ luacheck SpectrumFederation --only 0
 7. PR to appropriate branch
 
 **Database Changes:**
-- Always check/initialize in `Core:InitDatabase()`
-- Use `ns.Core:GetCurrentTierData()` for tier-specific data
-- Log changes with `ns.Debug:Info()`
-- Access via `ns.db` (never direct `SpectrumFederationDB`)
+- Always check/initialize in `SF:InitializeDatabase()`
+- Log changes with `SF.Debug:Info()`
+- Access via `SF.db` (never direct `SpectrumFederationDB`)
+- Profile data: `SF.db.lootProfiles[profileName]`
+- Active profile: `SF.db.activeLootProfile`
 
 **UI Components:**
-- Create frames in `modules/ui.lua`
-- Store position in `ns.db.ui` for persistence
+- Create main panel in `modules/settings_ui.lua`
+- Create UI sections in `settings/` directory
+- Store UI elements in SF namespace (e.g., `SF.LootProfileDropdown`)
 - Use `UIParent` as parent for main frames
-- Register for events with `frame:RegisterEvent()`
+- Banner scales to 90% of panel width with aspect ratio preserved
 
 ## Documentation
 
@@ -259,13 +329,13 @@ luacheck SpectrumFederation --only 0
 - ❌ Never load files before their dependencies
 
 **SavedVariables:**
-- ✅ Always access via `ns.db` and `ns.debugDB`
-- ✅ Always initialize in `Core:InitDatabase()`
-- ✅ Always use `ns.Core:GetCurrentTierData()` for tier data
+- ✅ Always access via `SF.db` and `SF.debugDB`
+- ✅ Always initialize in `SF:InitializeDatabase()`
+- ✅ Profile data stored in `SF.db.lootProfiles`
 
 **Best Practices:**
-- ✅ Use debug logging extensively: `ns.Debug:Info("CATEGORY", "message")`
-- ✅ Follow module pattern: `local Module = ns.Module or {}; ns.Module = Module`
+- ✅ Use debug logging extensively: `SF.Debug:Info("CATEGORY", "message")`
+- ✅ Follow module pattern: `local Module = SF.Module or {}; SF.Module = Module`
 - ✅ Use character keys: `"Name-Realm"` format
 - ✅ Test with `/reload` and `/console scriptErrors 1`
 - ✅ Run `luacheck` before committing
@@ -279,10 +349,14 @@ SpectrumFederation/
 ├── SpectrumFederation.lua    # Entry point, events
 ├── SpectrumFederation.toc    # MUST bump version
 ├── modules/
-│   ├── core.lua              # Database, tier data
+│   ├── core.lua              # Legacy (may be deprecated)
 │   ├── debug.lua             # Logging system
-│   ├── lootLog.lua           # Audit trail
-│   └── ui.lua                # UI components
+│   ├── LootProfiles.lua      # Profile CRUD
+│   ├── settings_ui.lua       # Main settings panel
+│   └── settings.lua          # Settings management
+├── settings/
+│   ├── loot_helper.lua       # Loot Helper section (active)
+│   └── loot_profiles_ui.lua  # Legacy (superseded)
 ├── locale/
 │   └── enUS.lua              # Localization
 └── media/                    # Icons, textures
