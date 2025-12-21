@@ -17,6 +17,6 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python requirements with pinned versions
-COPY requirements.txt /tmp/requirements.txt
+COPY .devcontainer/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt

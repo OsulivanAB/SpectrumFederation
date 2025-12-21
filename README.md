@@ -34,7 +34,3 @@ Addon for the Spectrum Federation guild on Garona - World of Warcraft Retail/Bet
 > [!NOTE]
 > **Basic TODO**   
 > Update Manual Install Installation Instructions
-
-## Version
-
-Current version: 0.0.13-beta.1

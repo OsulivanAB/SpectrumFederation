@@ -15,8 +15,45 @@
                 "GitHub.copilot",
                 "GitHub.copilot-chat",
                 "GitHub.vscode-pull-request-github",
-                "GitHub.vscode-github-actions"
-            ]
+                "GitHub.vscode-github-actions",
+                "Gruntfuggly.todo-tree"
+            ],
+            "settings": {
+                "todo-tree.regex.regex": "(//|#|<!--|;|/\\*|^|^\\s*(-|\\*|\\+)|\\{-|--|')\\s*($TAGS)",
+                "todo-tree.regex.regexCaseSensitive": false,
+                "todo-tree.filtering.excludeGlobs": [
+                    "**/*.toc",
+                    "**/*.md",
+                    "**/mkdocs.yml"
+                ],
+                "todo-tree.general.tags": [
+                    "TODO",
+                    "FIXME",
+                    "BUG",
+                    "HACK",
+                    "XXX",
+                    "NOTE"
+                ],
+                "todo-tree.highlights.defaultHighlight": {
+                    "icon": "check",
+                    "type": "text",
+                    "iconColour": "#ffff00"
+                },
+                "todo-tree.highlights.customHighlight": {
+                    "TODO": {
+                        "icon": "check",
+                        "iconColour": "#ffff00"
+                    },
+                    "FIXME": {
+                        "icon": "alert",
+                        "iconColour": "#ff0000"
+                    },
+                    "BUG": {
+                        "icon": "bug",
+                        "iconColour": "#ff0000"
+                    }
+                }
+            }
         }
     }
 }
