@@ -1,0 +1,222 @@
+name: Rollback Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to rollback (e.g., v0.0.15)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run mode (no actual changes)'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: rollback-release
+  cancel-in-progress: false
+
+jobs:
+  validate-rollback:
+    name: Validate Rollback Request
+    runs-on: ubuntu-latest
+    outputs:
+      merge_commit: ${{ steps.find_merge.outputs.merge_commit }}
+      is_promotion: ${{ steps.find_merge.outputs.is_promotion }}
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Verify release exists
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ inputs.release_tag }}" > /dev/null 2>&1; then
+            echo "✓ Release ${{ inputs.release_tag }} exists"
+          else
+            echo "::error ::Release ${{ inputs.release_tag }} not found"
+            exit 1
+          fi
+
+      - name: Find promotion merge commit
+        id: find_merge
+        run: |
+          # Look for the merge commit that created this release
+          # Promotion merges have "chore: promote beta to main" message
+          TAG="${{ inputs.release_tag }}"
+          VERSION="${TAG#v}"  # Remove 'v' prefix
+
+          # Find commits related to this version
+          MERGE_COMMIT=$(git log --all --grep="promote beta to main" --grep="update version to $VERSION" --format="%H" --max-count=1)
+
+          if [[ -z "$MERGE_COMMIT" ]]; then
+            echo "::error ::Could not find promotion merge commit for $VERSION"
+            echo "This workflow only supports rolling back beta→main promotions"
+            exit 1
+          fi
+
+          echo "merge_commit=$MERGE_COMMIT" >> $GITHUB_OUTPUT
+          echo "is_promotion=true" >> $GITHUB_OUTPUT
+          echo "Found promotion merge commit: $MERGE_COMMIT"
+
+      - name: Show what will be rolled back
+        run: |
+          MERGE_COMMIT="${{ steps.find_merge.outputs.merge_commit }}"
+
+          echo "## Rollback Plan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Release Tag**: ${{ inputs.release_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Merge Commit**: $MERGE_COMMIT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Actions to be performed:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Revert merge commit $MERGE_COMMIT" >> $GITHUB_STEP_SUMMARY
+          echo "2. Delete release ${{ inputs.release_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "3. Delete tag ${{ inputs.release_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "4. Reset main branch to pre-promotion state" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "⚠️ **DRY RUN MODE** - No changes will be made" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "🚨 **LIVE MODE** - Changes will be applied" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Commits to be reverted:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          git log --oneline -10 $MERGE_COMMIT >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  revert-merge:
+    name: Revert Promotion Merge
+    runs-on: ubuntu-latest
+    needs: validate-rollback
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Revert merge commit
+        run: |
+          MERGE_COMMIT="${{ needs.validate-rollback.outputs.merge_commit }}"
+
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "[DRY RUN] Would revert merge commit $MERGE_COMMIT"
+            git log --oneline -1 $MERGE_COMMIT
+          else
+            # Revert the merge commit (use -m 1 to specify mainline parent)
+            git revert -m 1 --no-edit $MERGE_COMMIT
+
+            # Add rollback message to commit
+            git commit --amend -m "Revert: rollback release ${{ inputs.release_tag }}" \
+              -m "This reverts the promotion merge commit $MERGE_COMMIT." \
+              -m "[rollback]"
+
+            git push origin main
+            echo "✓ Reverted merge commit $MERGE_COMMIT"
+          fi
+
+  delete-release:
+    name: Delete GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate-rollback, revert-merge]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Delete release and tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.release_tag }}"
+
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "[DRY RUN] Would delete release and tag: $TAG"
+            gh release view "$TAG" || true
+          else
+            # Delete the release
+            gh release delete "$TAG" --yes
+            echo "✓ Deleted release $TAG"
+
+            # Delete the tag
+            git push origin --delete "$TAG" || echo "Tag already deleted"
+            echo "✓ Deleted tag $TAG"
+          fi
+
+  restore-changelog:
+    name: Restore Previous Changelog
+    runs-on: ubuntu-latest
+    needs: [validate-rollback, revert-merge]
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Restore CHANGELOG.md from before promotion
+        run: |
+          MERGE_COMMIT="${{ needs.validate-rollback.outputs.merge_commit }}"
+
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "[DRY RUN] Would restore CHANGELOG.md from before merge"
+            git show $MERGE_COMMIT~1:CHANGELOG.md | head -n 20
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            # Restore CHANGELOG from parent commit
+            git checkout $MERGE_COMMIT~1 -- CHANGELOG.md
+
+            git add CHANGELOG.md
+            git commit -m "docs: restore changelog after rollback [skip ci]" || echo "No changelog changes"
+            git push origin main || echo "Nothing to push"
+
+            echo "✓ Restored CHANGELOG.md"
+          fi
+
+  summary:
+    name: Rollback Summary
+    runs-on: ubuntu-latest
+    needs: [validate-rollback, revert-merge, delete-release, restore-changelog]
+    if: always()
+
+    steps:
+      - name: Summary
+        run: |
+          echo "## Rollback Complete 🔄" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Release Tag**: ${{ inputs.release_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Merge Commit**: ${{ needs.validate-rollback.outputs.merge_commit }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Actions Completed:" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Reverted promotion merge" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Deleted GitHub release" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Deleted release tag" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Restored previous changelog" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Verify main branch state" >> $GITHUB_STEP_SUMMARY
+          echo "2. Fix issues in beta branch" >> $GITHUB_STEP_SUMMARY
+          echo "3. Re-run promotion workflow when ready" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **This was a DRY RUN - no actual changes were made**" >> $GITHUB_STEP_SUMMARY
+          fi

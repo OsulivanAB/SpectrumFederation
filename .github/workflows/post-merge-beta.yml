@@ -1,0 +1,166 @@
+name: Post-Merge Beta
+
+on:
+  push:
+    branches:
+      - beta
+    paths:
+      - 'SpectrumFederation/**'
+      - '.github/scripts/**'
+      - '.github/workflows/**'
+
+concurrency:
+  group: beta-release
+  cancel-in-progress: false  # Don't cancel in-progress releases
+
+jobs:
+  sanity-checks:
+    name: Re-run Sanity Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luarocks
+          sudo luarocks install luacheck
+          pip install yamllint ruff
+
+      - name: Run linters
+        run: python3 .github/scripts/lint_all.py
+
+      - name: Validate packaging
+        run: python3 .github/scripts/validate_packaging.py
+
+  extract-version:
+    name: Extract Version Info
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      interface: ${{ steps.blizzard.outputs.interface }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Extract version from TOC
+        id: version
+        run: |
+          VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Query Blizzard API for beta Interface version
+        id: blizzard
+        run: |
+          INTERFACE=$(python3 .github/scripts/blizzard_api.py --environment beta --output interface)
+          echo "interface=$INTERFACE" >> $GITHUB_OUTPUT
+          echo "Beta Interface version: $INTERFACE"
+
+  update-changelog:
+    name: Update Changelog
+    runs-on: ubuntu-latest
+    needs: [sanity-checks, extract-version]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Update CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: beta
+        run: python3 .github/scripts/update_changelog.py
+
+      - name: Commit changelog changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet CHANGELOG.md; then
+            echo "No changelog changes to commit"
+          else
+            git add CHANGELOG.md
+            git commit -m "docs: update changelog for ${{ needs.extract-version.outputs.version }} [skip ci]"
+            git push
+          fi
+
+  update-readme-badges:
+    name: Update README Badges
+    runs-on: ubuntu-latest
+    needs: [sanity-checks, extract-version]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Update README badges
+        run: |
+          VERSION="${{ needs.extract-version.outputs.version }}"
+          INTERFACE="${{ needs.extract-version.outputs.interface }}"
+
+          # Update version badge
+          sed -i "s|badge/Version-[^-]*-|badge/Version-${VERSION}-|g" README.md
+
+          # Update interface badge
+          sed -i "s|badge/Interface-[^-]*-|badge/Interface-${INTERFACE}-|g" README.md
+
+      - name: Commit badge changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet README.md; then
+            echo "No badge changes to commit"
+          else
+            git add README.md
+            git commit -m "docs: update badges for ${{ needs.extract-version.outputs.version }} [skip ci]"
+            git push
+          fi
+
+  publish-beta-release:
+    name: Publish Beta Release
+    runs-on: ubuntu-latest
+    needs: [sanity-checks, extract-version, update-changelog, update-readme-badges]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: beta  # Ensure we have the latest with changelog/badge updates
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Package and publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/publish_release.py "${{ needs.extract-version.outputs.version }}"

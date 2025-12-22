@@ -1,0 +1,106 @@
+name: PR Beta Validation
+
+on:
+  pull_request:
+    branches:
+      - beta
+    paths:
+      - 'SpectrumFederation/**'
+      - '.github/scripts/**'
+      - '.github/workflows/**'
+
+concurrency:
+  group: beta-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install luacheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luarocks
+          sudo luarocks install luacheck
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run unified linter
+        run: python3 .github/scripts/lint_all.py
+
+  validate-packaging:
+    name: Validate Package Structure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate addon packaging
+        run: python3 .github/scripts/validate_packaging.py
+
+  check-version-bump:
+    name: Check Version Bump
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to compare versions
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check version was bumped
+        run: python3 .github/scripts/check_version_bump.py beta
+
+  check-duplicate-beta-release:
+    name: Check for Duplicate Beta Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Extract version from TOC
+        id: version
+        run: |
+          VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Check for duplicate release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/check_duplicate_release.py "${{ steps.version.outputs.version }}"
