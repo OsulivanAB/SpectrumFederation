@@ -172,3 +172,26 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           python3 .github/scripts/publish_release.py "${{ needs.extract-version.outputs.version }}"
+
+  cleanup-merged-branch:
+    name: Cleanup Merged Branch
+    runs-on: ubuntu-latest
+    needs: [publish-beta-release]
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Delete merged branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/cleanup_merged_branch.py "${{ github.sha }}"
