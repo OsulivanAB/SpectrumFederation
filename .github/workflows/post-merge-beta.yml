@@ -125,11 +125,17 @@ jobs:
           VERSION="${{ needs.extract-version.outputs.version }}"
           INTERFACE="${{ needs.extract-version.outputs.interface }}"
 
-          # Update version badge
-          sed -i "s|badge/Version-[^-]*-|badge/Version-${VERSION}-|g" README.md
+          # Escape hyphens for shields.io (- becomes --)
+          VERSION_ESCAPED="${VERSION//-/--}"
+
+          # Update version badge (match between Version- and - at end)
+          sed -i 's|badge/Version-[^)]*-brightgreen|badge/Version-'"${VERSION_ESCAPED}"'-brightgreen|g' README.md
 
           # Update interface badge
           sed -i "s|badge/Interface-[^-]*-|badge/Interface-${INTERFACE}-|g" README.md
+
+          # Update track badge to Beta
+          sed -i 's|badge/Track-[^-]*-|badge/Track-Beta-|g' README.md
 
       - name: Commit badge changes
         run: |
