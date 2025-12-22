@@ -18,11 +18,9 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 - `modules/debug.lua` - Debug logging system with levels (VERBOSE/INFO/WARN/ERROR)
 - `modules/LootProfiles.lua` - Profile CRUD operations (Create, Read, Update, Delete)
 - `modules/settings_ui.lua` - Main settings panel with banner
-- `modules/settings.lua` - Settings management
-- `modules/core.lua` - Legacy core functionality (may be deprecated)
+- `modules/core.lua` - **REMOVED** (empty file, not loaded in TOC)
 - `settings/loot_helper.lua` - Loot Helper UI section with profile management
-- `settings/loot_profiles_ui.lua` - Legacy file (superseded by loot_helper.lua)
-- `locale/enUS.lua` - Localization strings
+- `locale/enUS.lua` - Localization strings (not yet loaded in TOC or used)
 
 ## Critical Branch & Version Rules
 
@@ -115,6 +113,8 @@ SF.debugDB   -- Points to SpectrumFederationDebugDB
 ```
 
 **Character Keys:** Always use `"Name-Realm"` format (e.g., `"Shadowbane-Garona"`)
+
+**Localization:** The `locale/enUS.lua` file exists but is not yet loaded in the TOC or used in the codebase. It uses `ns.L` namespace pattern. When implementing localization, add the file to the TOC after modules and update code to use localization strings.
 
 ## Code Patterns & Conventions
 
@@ -349,23 +349,20 @@ SpectrumFederation/
 ├── SpectrumFederation.lua    # Entry point, events
 ├── SpectrumFederation.toc    # MUST bump version
 ├── modules/
-│   ├── core.lua              # Legacy (may be deprecated)
 │   ├── debug.lua             # Logging system
 │   ├── LootProfiles.lua      # Profile CRUD
-│   ├── settings_ui.lua       # Main settings panel
-│   └── settings.lua          # Settings management
+│   └── settings_ui.lua       # Main settings panel
 ├── settings/
-│   ├── loot_helper.lua       # Loot Helper section (active)
-│   └── loot_profiles_ui.lua  # Legacy (superseded)
+│   └── loot_helper.lua       # Loot Helper section
 ├── locale/
-│   └── enUS.lua              # Localization
+│   └── enUS.lua              # Localization (not yet loaded)
 └── media/                    # Icons, textures
 ```
 
 **Key Commands:**
 - Lint: `luacheck SpectrumFederation --only 0`
 - Test: Copy to WoW, use `/reload`
-- Debug: `/sfdebug on|off|show`
+- Slash command: `/sf` (opens settings panel)
 - Docs: `mkdocs serve` (after `pip install -r requirements-docs.txt`)
 
 **Version Format:**

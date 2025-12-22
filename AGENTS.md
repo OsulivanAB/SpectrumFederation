@@ -19,10 +19,13 @@ SpectrumFederation/
 ├── SpectrumFederation.lua    # Main entry point
 ├── SpectrumFederation.toc    # Addon manifest (CRITICAL)
 ├── modules/                  # Feature modules
-│   ├── core.lua
-│   └── ui.lua
+│   ├── debug.lua             # Debug logging system
+│   ├── LootProfiles.lua      # Profile CRUD operations
+│   └── settings_ui.lua       # Main settings panel
+├── settings/                 # UI sections
+│   └── loot_helper.lua       # Loot Helper section
 └── locale/                   # Localization
-    └── enUS.lua
+    └── enUS.lua              # Not yet loaded in TOC
 ```
 
 ### Files to NEVER Edit Directly
@@ -48,7 +51,7 @@ SpectrumFederation/
 - Frame events use `RegisterEvent` / `UnregisterEvent`
 
 ### Code Style
-- Follow existing patterns in `modules/core.lua` and `modules/ui.lua`
+- Follow existing patterns in `modules/debug.lua`, `modules/LootProfiles.lua`, and `modules/settings_ui.lua`
 - Use proper indentation (spaces, not tabs)
 - Add descriptive comments for complex logic
 - Test with `/reload` in-game after changes
@@ -62,7 +65,7 @@ SpectrumFederation/
   - Protected: requires PR and CI checks
 
 - **`beta` branch** = PTR/Beta / Experimental
-  - Version format: `X.Y.Z-beta` (e.g., `0.1.0-beta.1`)
+  - Version format: `X.Y.Z-beta.N` (e.g., `0.1.0-beta.1`)
   - For Beta/PTR WoW servers
   - Protected: requires PR and CI checks
 
@@ -180,7 +183,7 @@ modules/new_feature.lua    # Your new file here
 luacheck SpectrumFederation --only 0
 
 # Check specific file
-luacheck SpectrumFederation/modules/core.lua
+luacheck SpectrumFederation/modules/debug.lua
 ```
 
 ## Best Practices
@@ -218,6 +221,7 @@ luacheck SpectrumFederation/modules/core.lua
 **Code Location**: `SpectrumFederation/` only  
 **Manifest**: `SpectrumFederation/SpectrumFederation.toc` (MUST update version)  
 **Branches**: `main` (stable) and `beta` (experimental)  
-**Version Format**: `X.Y.Z` (main) or `X.Y.Z-beta.N` (beta, e.g., `0.0.13-beta.1`)  
+**Version Format**: `X.Y.Z` (main) or `X.Y.Z-beta.N` (beta, e.g., `0.0.17-beta.1`)  
 **Testing**: Symlink to WoW, use `/reload`, run `luacheck`  
+**Slash Command**: `/sf` (opens settings panel)  
 **Never Touch**: Release workflows (for tag management), `BlizzardUI/`  
