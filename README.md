@@ -7,31 +7,41 @@
 ![Addon Version](https://img.shields.io/badge/Version-0.0.15--beta.1-brightgreen)
 <!-- STATUS_BADGES_END -->
 
+World of Warcraft addon for the Spectrum Federation guild on Garona.
 
+---
 
+## 📚 Documentation
 
-Addon for the Spectrum Federation guild on Garona - World of Warcraft Retail/Beta.
+For detailed information about our guild, addon features, and guides, visit our documentation site:
 
-> [!IMPORTANT]
-> **TODO: Update Documentation**   
-> Insert quick blurb about guild and link to discord intro message or possibly one of our recruitment sites
+**[View Full Documentation →](https://osullivanab.github.io/SpectrumFederation/)**
+
+---
 
 ## Installation
 
 ### WowUp Installation
 
-> [!NOTE]
-> **Basic TODO**   
-> Update WowUp Installation Instructions
+1. Open WowUp and go to **Get Addons**
+2. Click the **Install from URL** button
+3. Enter the following URL:
+   ```
+   https://github.com/OsulivanAB/SpectrumFederation
+   ```
+4. Click **Install**
 
-### Curse Forge Installation
+WowUp will automatically detect updates and keep the addon current.
 
-> [!NOTE]
-> **Basic TODO**   
-> Update Curse Forge Installation Instructions
+### CurseForge Installation
+
+We are not currently available on CurseForge. Please use the WowUp or Manual installation methods instead.
 
 ### Manual Installation
 
-> [!NOTE]
-> **Basic TODO**   
-> Update Manual Install Installation Instructions
+1. Download the latest release from the [Releases page](https://github.com/OsulivanAB/SpectrumFederation/releases)
+2. Extract the downloaded ZIP file
+3. Copy the `SpectrumFederation` folder to your World of Warcraft AddOns directory:
+   - **Windows**: `C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns\`
+   - **macOS**: `/Applications/World of Warcraft/_retail_/Interface/AddOns/`
+4. Restart World of Warcraft or type `/reload` in-game
