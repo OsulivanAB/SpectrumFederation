@@ -2,6 +2,12 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+
+## [Unreleased - Beta]
+
+### Fixed
+- Fix changelog workflow to use PAT_TOKEN for GitHub Models API access
+
 ## [0.0.14-beta.1] - Unknown
 
 ### Added
