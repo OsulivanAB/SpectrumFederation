@@ -85,12 +85,12 @@ def get_game_version(environment="live"):
         tuple: (version_string, interface_version) or (None, None) on error
     """
     if environment not in ENDPOINTS:
-        print(f"Error: Invalid environment '{environment}'. Use 'live' or 'beta'")
+        print(f"Error: Invalid environment '{environment}'. Use 'live' or 'beta'", file=sys.stderr)
         return None, None
     
     url = ENDPOINTS[environment]
     
-    print(f"[blizzard-api] Querying {environment} endpoint: {url}")
+    print(f"[blizzard-api] Querying {environment} endpoint: {url}", file=sys.stderr)
     
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
@@ -99,28 +99,28 @@ def get_game_version(environment="live"):
         version = parse_version_response(data)
         
         if not version:
-            print("Error: Could not parse version from Blizzard API response")
+            print("Error: Could not parse version from Blizzard API response", file=sys.stderr)
             return None, None
         
         interface = version_to_interface(version)
         
         if not interface:
-            print(f"Error: Could not convert version '{version}' to Interface format")
+            print(f"Error: Could not convert version '{version}' to Interface format", file=sys.stderr)
             return None, None
         
-        print(f"[blizzard-api] Game version: {version}")
-        print(f"[blizzard-api] Interface version: {interface}")
+        print(f"[blizzard-api] Game version: {version}", file=sys.stderr)
+        print(f"[blizzard-api] Interface version: {interface}", file=sys.stderr)
         
         return version, interface
         
     except urllib.error.HTTPError as e:
-        print(f"Error: HTTP {e.code} {e.reason} when querying Blizzard API")
+        print(f"Error: HTTP {e.code} {e.reason} when querying Blizzard API", file=sys.stderr)
         return None, None
     except urllib.error.URLError as e:
-        print(f"Error: Failed to reach Blizzard API: {e.reason}")
+        print(f"Error: Failed to reach Blizzard API: {e.reason}", file=sys.stderr)
         return None, None
     except Exception as e:
-        print(f"Error: Unexpected error querying Blizzard API: {e}")
+        print(f"Error: Unexpected error querying Blizzard API: {e}", file=sys.stderr)
         return None, None
 
 
