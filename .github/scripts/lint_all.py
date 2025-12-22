@@ -56,7 +56,7 @@ def lint_lua(addon_dir):
 def lint_yaml(workflow_dir):
     """Run yamllint on GitHub workflow files."""
     return run_command(
-        ["yamllint", "-d", "relaxed", workflow_dir],
+        ["yamllint", "-d", "relaxed", "-f", "parsable", workflow_dir],
         "yamllint (YAML linter)"
     )
 
