@@ -66,7 +66,7 @@ def main():
         if is_merge:
             # For merge commits, diff against the first parent
             base_commit = "HEAD^1"
-            print(f"Detected merge commit, comparing against first parent")
+            print("Detected merge commit, comparing against first parent")
         else:
             # For regular commits, just compare with previous commit
             base_commit = "HEAD~1"
@@ -112,7 +112,7 @@ def main():
         
     except subprocess.CalledProcessError as e:
         print(f"Error getting git diff: {e}")
-        print(f"Attempting to get diff of just the current commit")
+        print("Attempting to get diff of just the current commit")
         try:
             # Try to get just the changes in the current commit
             diff_result = subprocess.run(
