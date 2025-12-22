@@ -4,7 +4,7 @@
 <!-- STATUS_BADGES_START -->
 ![WoW Version](https://img.shields.io/badge/WoW-12.0.0-00aaff)
 ![Track](https://img.shields.io/badge/Track-Retail-ff8800)
-![Addon Version](https://img.shields.io/badge/Version-0.0.16-brightgreen)
+![Addon Version](https://img.shields.io/badge/Version-0.0.17-beta.2-brightgreen)
 <!-- STATUS_BADGES_END -->
 
 
