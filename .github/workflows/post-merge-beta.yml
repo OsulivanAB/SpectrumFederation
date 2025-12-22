@@ -125,11 +125,17 @@ jobs:
           VERSION="${{ needs.extract-version.outputs.version }}"
           INTERFACE="${{ needs.extract-version.outputs.interface }}"
 
-          # Update version badge
-          sed -i "s|badge/Version-[^-]*-|badge/Version-${VERSION}-|g" README.md
+          # Escape hyphens for shields.io (- becomes --)
+          VERSION_ESCAPED="${VERSION//-/--}"
+
+          # Update version badge (match between Version- and - at end)
+          sed -i 's|badge/Version-[^)]*-brightgreen|badge/Version-'"${VERSION_ESCAPED}"'-brightgreen|g' README.md
 
           # Update interface badge
           sed -i "s|badge/Interface-[^-]*-|badge/Interface-${INTERFACE}-|g" README.md
+
+          # Update track badge to Beta
+          sed -i 's|badge/Track-[^-]*-|badge/Track-Beta-|g' README.md
 
       - name: Commit badge changes
         run: |
@@ -166,3 +172,26 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           python3 .github/scripts/publish_release.py "${{ needs.extract-version.outputs.version }}"
+
+  cleanup-merged-branch:
+    name: Cleanup Merged Branch
+    runs-on: ubuntu-latest
+    needs: [publish-beta-release]
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Delete merged branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/cleanup_merged_branch.py "${{ github.sha }}"

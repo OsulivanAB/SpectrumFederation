@@ -222,8 +222,17 @@ jobs:
             echo "  Version: $VERSION"
             echo "  Interface: $INTERFACE"
           else
-            sed -i "s|badge/Version-[^-]*-|badge/Version-${VERSION}-|g" README.md
+            # Escape hyphens for shields.io (- becomes --)
+            VERSION_ESCAPED="${VERSION//-/--}"
+
+            # Update version badge (match between Version- and - at end)
+            sed -i 's|badge/Version-[^)]*-brightgreen|badge/Version-'"${VERSION_ESCAPED}"'-brightgreen|g' README.md
+
+            # Update interface badge
             sed -i "s|badge/Interface-[^-]*-|badge/Interface-${INTERFACE}-|g" README.md
+
+            # Update track badge to Retail
+            sed -i 's|badge/Track-[^-]*-|badge/Track-Retail-|g' README.md
           fi
 
       - name: Commit badge changes
