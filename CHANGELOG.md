@@ -3,6 +3,12 @@
 All notable changes to SpectrumFederation will be documented in this file.
 
 
+
+## [0.0.17] - 2025-12-22
+
+### Changed
+- Infrastructure and tooling updates (no addon code changes)
+
 ## [Unreleased - Beta]
 
 ### Changed
