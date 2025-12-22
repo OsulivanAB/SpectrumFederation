@@ -5,8 +5,8 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ## [Unreleased - Beta]
 
-### Fixed
-- Addressed a bug where certain UI elements failed to update after profile changes.
+### Changed
+- Updated addon version to 0.0.17-beta.5 in metadata.
 
 ## [0.0.14-beta.1] - Unknown
 
