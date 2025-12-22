@@ -47,35 +47,19 @@ Edit `SpectrumFederation/SpectrumFederation.toc` and remove the `-beta.N` suffix
 The version **must not** contain `-beta` when merging to `main`. The CI validation will fail otherwise.
 ///
 
-### Step 3: Update Changelog
-
-Review `CHANGELOG.md` and ensure the "Unreleased - Beta" section is properly versioned:
-
-**Before:**
-```markdown
-## [Unreleased - Beta]
-### Added
-- New feature X
-```
-
-**After:**
-```markdown
-## [0.0.16] - 2025-12-22
-### Added
-- New feature X
-```
-
-The automated changelog workflow will help with this, but verify it's correct.
-
-### Step 4: Commit Changes
+### Step 3: Commit Changes
 
 ```bash
-git add SpectrumFederation/SpectrumFederation.toc CHANGELOG.md
+git add SpectrumFederation/SpectrumFederation.toc
 git commit -m "chore: prepare v0.0.16 release"
 git push origin release/v0.0.X
 ```
 
-### Step 5: Open Pull Request to Main
+/// info | Changelog Automation
+The `CHANGELOG.md` is automatically updated by the GitHub Actions workflow when changes are pushed. You don't need to manually edit it.
+///
+
+### Step 4: Open Pull Request to Main
 
 1. Go to GitHub and create a new Pull Request
 2. Set **base** branch to `main`
@@ -101,14 +85,14 @@ This PR merges beta changes into main for a stable release.
 ```
 ///
 
-### Step 6: Wait for CI and Review
+### Step 5: Wait for CI and Review
 
 - All CI checks must pass (linter, version validation, packaging)
 - Request review from maintainers
 - Address any feedback or conflicts
 - Once approved, a maintainer will merge the PR
 
-### Step 7: Sync Beta After Release
+### Step 6: Sync Beta After Release
 
 After the release is merged to main, sync beta with the new stable version:
 
@@ -119,28 +103,6 @@ git push origin beta
 ```
 
 This ensures beta includes the version update from main.
-
-## Admin Fast-Track Process
-
-/// warning | Admin Only
-This process bypasses branch protection and should only be used by repository admins.
-///
-
-Admins can merge directly using git commands:
-
-```bash
-# Switch to main and merge beta
-git checkout main
-git pull origin main
-git merge origin/beta --strategy-option theirs
-
-# Resolve any conflicts (prefer beta's version)
-git add <conflicted-files>
-git commit -m "Merge beta into main: <description>"
-
-# Push directly (bypasses protection)
-git push origin main
-```
 
 ## Common Issues
 
