@@ -35,7 +35,8 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 - CI validates branch/version alignment - do NOT edit workflows to bypass this
 
 **Release Process:**
-- Tags and GitHub releases auto-created by `release.yml` workflow
+- Beta releases: Auto-created by `post-merge-beta.yml` after PR merge to beta
+- Stable releases: Manual promotion via `promote-beta-to-main.yml` workflow (admin only)
 - Never manually create or move git tags
 - Package layout validated for WowUp/CurseForge compatibility
 
@@ -222,26 +223,48 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
 end
 ```
 
-## CI/CD Workflows (DO NOT MODIFY)
+## CI/CD Workflows
 
-**Automated Checks:**
-1. `linter.yml` - Runs `luacheck` (Lua 5.1 rules) and `yamllint`
-2. `validate-packaging.yml` - Ensures WowUp/CurseForge zip structure
-3. `check-version-bump.sh` - Fails PR if version unchanged
-4. `release.yml` - Auto-tags and releases on version bump
-5. `update-changelog.yml` - Auto-generates changelog using GitHub Copilot
-6. `deploy-docs.yml` - MkDocs to GitHub Pages
+**Active Workflows:**
+1. **`linter.yml`** - Continuous linting (Lua, YAML, Python) using `.github/scripts/lint_all.py`
+2. **`pr-beta-validation.yml`** - PR validation for beta branch:
+   - Lint checks
+   - Package validation (`.github/scripts/validate_packaging.py`)
+   - Version bump check (`.github/scripts/check_version_bump.py`)
+   - Duplicate release check (`.github/scripts/check_duplicate_release.py`)
+3. **`post-merge-beta.yml`** - Automated beta releases after merge:
+   - Sanity checks
+   - Blizzard API query for beta Interface version
+   - Changelog update (`.github/scripts/update_changelog.py`)
+   - README badge update
+   - Beta release creation (`.github/scripts/publish_release.py`)
+4. **`promote-beta-to-main.yml`** - Manual promotion workflow (admin only):
+   - Merges beta → main with special CHANGELOG/README handling
+   - Removes `-beta` suffix from version
+   - Updates Interface version using Blizzard live API
+   - Updates changelog and README
+   - Deploys MkDocs documentation
+   - Creates stable release
+   - Fast-forwards beta to main
+   - Supports dry-run mode
+5. **`rollback-release.yml`** - Emergency rollback for failed promotions (admin only)
 
-**Changelog Workflow:**
+**Python Helper Scripts (`.github/scripts/`):**
+- All CI automation uses Python 3.11 scripts instead of bash
+- Scripts are self-contained and can be run locally for testing
+- See `.github/scripts/` directory for implementation details
+
+**Changelog Management:**
 - **Beta branch**: Changes go to `## [Unreleased - Beta]` section
-- **Main branch**: Changes go to versioned releases (e.g., `## [0.0.15] - 2025-12-21`)
-- **Auto-cleanup**: When beta merges to main, the Unreleased - Beta section is automatically removed
-- Uses GitHub Copilot to analyze git diffs and generate changelog entries
+- **Main branch**: Changes go to versioned releases (e.g., `## [0.0.17] - 2025-12-22`)
+- Uses GitHub Copilot API to analyze git diffs and generate entries
+- Automatic cleanup when beta promotes to main
 
-**Luacheck (.luacheckrc):**
-- Declares WoW API globals: `CreateFrame`, `C_Timer`, etc.
-- Add new WoW APIs here instead of using `-- luacheck: ignore`
-- Run locally: `luacheck SpectrumFederation --only 0`
+**Local Testing:**
+- Luacheck: `luacheck SpectrumFederation --only 0`
+- Unified linter: `python3 .github/scripts/lint_all.py`
+- Package validation: `python3 .github/scripts/validate_packaging.py`
+- Declares WoW API globals in `.luacheckrc` - add new APIs there instead of using `-- luacheck: ignore`
 
 **Packaging Requirements:**
 - Zip must contain exactly one folder: `SpectrumFederation/`

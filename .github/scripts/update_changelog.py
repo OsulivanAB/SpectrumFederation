@@ -42,13 +42,14 @@ def main():
     # Determine if this is a beta version
     is_beta = "-beta" in version
     
+    # Get current date for version sections
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    
     # Determine which section to use
     if branch_name == "beta" or is_beta:
         section_header = "## [Unreleased - Beta]"
-        version_display = version
     else:
         section_header = f"## [{version}] - {current_date}"
-        version_display = version
     
     print(f"Using section: {section_header}")
 
@@ -86,7 +87,7 @@ def main():
     existing_changelog = changelog_path.read_text(encoding="utf-8") if changelog_path.exists() else ""
 
     # Prepare prompt for GitHub Copilot
-    current_date = datetime.now().strftime("%Y-%m-%d")
+    # (current_date already defined earlier in determine_section_header)
     
     prompt_parts = [
         "You are analyzing changes to the SpectrumFederation World of Warcraft addon.",

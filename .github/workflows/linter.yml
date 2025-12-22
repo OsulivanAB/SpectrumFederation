@@ -14,26 +14,22 @@ jobs:
   lint:
     runs-on: ubuntu-latest
 
-    env:
-      ADDON_NAME: SpectrumFederation
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install Lua 5.1 and luacheck
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install linting tools
       run: |
         sudo apt-get update
-        sudo apt-get install -y lua5.1 luarocks python3-pip
+        sudo apt-get install -y lua5.1 luarocks
         sudo luarocks install luacheck
-        pip3 install yamllint
+        pip3 install yamllint ruff
 
-      # Focus on syntax + basic issues; we ignore globals/unused for now
-      # --only 0 = only show/fail on actual errors (syntax/invalid inline options), ignore style warnings
-    - name: Run luacheck on Lua files
-      run: |
-        luacheck "$ADDON_NAME" --only 0
+    - name: Run unified linter
+      run: python3 .github/scripts/lint_all.py
 
-    - name: Run yamllint on YAML files
-      run: |
-        yamllint -d relaxed .github/
