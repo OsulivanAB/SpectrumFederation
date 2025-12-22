@@ -1,0 +1,191 @@
+name: Build, Tag, and Release SpectrumFederation
+
+on:
+  push:
+    branches:
+    - main
+    - beta
+
+jobs:
+  build-tag-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      ADDON_NAME: SpectrumFederation
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Set up git identity
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Read addon version from TOC (current commit)
+      id: current_version
+      run: |
+        TOC_FILE="${ADDON_NAME}/${ADDON_NAME}.toc"
+
+        if [ ! -f "$TOC_FILE" ]; then
+          echo "TOC file not found: $TOC_FILE"
+          exit 1
+        fi
+
+        VERSION_LINE=$(grep -E '^## Version:' "$TOC_FILE" || true)
+
+        if [ -z "$VERSION_LINE" ]; then
+          echo "No '## Version:' line found in $TOC_FILE"
+          exit 1
+        fi
+
+        VERSION="${VERSION_LINE#*Version:}"
+        VERSION="$(echo "$VERSION" | xargs)"
+
+        echo "current_version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "Current addon version (from TOC): $VERSION"
+
+    - name: Read addon version from TOC (previous commit)
+      id: previous_version
+      run: |
+        TOC_FILE="${ADDON_NAME}/${ADDON_NAME}.toc"
+
+        # If there is no previous commit on this branch, skip comparison
+        if ! git rev-parse HEAD~1 >/dev/null 2>&1; then
+          echo "previous_version=" >> "$GITHUB_OUTPUT"
+          echo "No previous commit on this branch; treating as first release candidate."
+          exit 0
+        fi
+
+        prev_blob="$(git show HEAD~1:"$TOC_FILE" 2>/dev/null || true)"
+        if [ -z "$prev_blob" ]; then
+          echo "previous_version=" >> "$GITHUB_OUTPUT"
+          echo "No TOC file in previous commit; treating as first release candidate."
+          exit 0
+        fi
+
+        prev_line="$(printf '%s\n' "$prev_blob" | grep -E '^## Version:' | head -n1 || true)"
+        if [ -z "$prev_line" ]; then
+          echo "previous_version=" >> "$GITHUB_OUTPUT"
+          echo "No '## Version:' in previous commit TOC; treating as first release candidate."
+          exit 0
+        fi
+
+        prev_version="${prev_line#*Version:}"
+        prev_version="$(echo "$prev_version" | xargs)"
+
+        echo "previous_version=$prev_version" >> "$GITHUB_OUTPUT"
+        echo "Previous addon version (from TOC): $prev_version"
+
+    - name: Validate version matches branch
+      id: validate_branch
+      run: |
+        current="${{ steps.current_version.outputs.current_version }}"
+        branch="${{ github.ref_name }}"
+
+        echo "Current version: $current"
+        echo "Current branch: $branch"
+
+        # Check if version contains "beta"
+        if [[ "$current" == *"beta"* ]]; then
+          is_beta_version=true
+        else
+          is_beta_version=false
+        fi
+
+        # Validate branch-version consistency
+        if [ "$branch" = "main" ] && [ "$is_beta_version" = "true" ]; then
+          echo "::error::Cannot release beta version ($current) from main branch"
+          echo "::error::Beta versions must be released from the beta branch"
+          exit 1
+        fi
+
+        if [ "$branch" = "beta" ] && [ "$is_beta_version" = "false" ]; then
+          echo "::error::Cannot release non-beta version ($current) from beta branch"
+          echo "::error::Stable versions must be released from the main branch"
+          exit 1
+        fi
+
+        echo "✓ Version $current is valid for branch $branch"
+
+    - name: Decide whether to release
+      id: decision
+      run: |
+        current="${{ steps.current_version.outputs.current_version }}"
+        previous="${{ steps.previous_version.outputs.previous_version }}"
+
+        echo "Current version : $current"
+        echo "Previous version: ${previous:-<none>}"
+
+        if [ -n "$previous" ] && [ "$current" = "$previous" ]; then
+          echo "No version bump detected. Skipping release."
+          echo "should_release=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "Version bump detected (or first release). Proceeding with release."
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Stop if no release needed
+      if: ${{ steps.decision.outputs.should_release != 'true' }}
+      run: echo "No release required for this push."
+
+    - name: Fetch tags
+      if: ${{ steps.decision.outputs.should_release == 'true' }}
+      run: git fetch --tags
+
+    - name: Create or validate tag
+      if: ${{ steps.decision.outputs.should_release == 'true' }}
+      id: tag_step
+      run: |
+        VERSION="${{ steps.current_version.outputs.current_version }}"
+        TAG="v${VERSION}"
+
+        echo "Proposed tag: $TAG"
+
+        if git rev-parse "$TAG" >/dev/null 2>&1; then
+          existing_commit="$(git rev-parse "$TAG")"
+          echo "Tag $TAG already exists at commit $existing_commit"
+
+          if [ "$existing_commit" = "${GITHUB_SHA}" ]; then
+            echo "Tag already points to this commit; reuse it."
+          else
+            echo "::error ::Tag '$TAG' already exists and points to a different commit."
+            echo "          Best practice is to bump the addon version instead of moving tags."
+            exit 1
+          fi
+        else
+          echo "Creating new tag $TAG at $GITHUB_SHA"
+          git tag "$TAG" "$GITHUB_SHA"
+          git push origin "$TAG"
+        fi
+
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+    - name: Package addon
+      if: ${{ steps.decision.outputs.should_release == 'true' }}
+      id: package
+      run: |
+        VERSION="${{ steps.current_version.outputs.current_version }}"
+        mkdir -p build
+        ZIP_NAME="${ADDON_NAME}-${VERSION}.zip"
+        echo "Creating zip: $ZIP_NAME"
+        zip -r "build/$ZIP_NAME" "$ADDON_NAME"
+        echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+    - name: Create or update GitHub Release
+      if: ${{ steps.decision.outputs.should_release == 'true' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag_step.outputs.tag }}
+        target_commitish: ${{ github.sha }}
+        files: build/${{ steps.package.outputs.zip_name }}
+        prerelease: ${{ github.ref_name == 'beta' || contains(steps.current_version.outputs.current_version,
+          '-beta') }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

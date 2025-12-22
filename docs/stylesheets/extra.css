@@ -1,0 +1,24 @@
+/* Custom admonition types for Spectrum Federation docs */
+
+/* Under Construction admonition */
+.md-typeset .admonition.under-construction,
+.md-typeset details.under-construction {
+  border-color: rgb(255, 152, 0);
+}
+
+.md-typeset .under-construction > .admonition-title,
+.md-typeset .under-construction > summary {
+  background-color: rgba(255, 152, 0, 0.1);
+  border-color: rgb(255, 152, 0);
+}
+
+.md-typeset .under-construction > .admonition-title::before,
+.md-typeset .under-construction > summary::before {
+  background-color: rgb(255, 152, 0);
+  -webkit-mask-image: var(--md-admonition-icon--under-construction);
+  mask-image: var(--md-admonition-icon--under-construction);
+}
+
+:root {
+  --md-admonition-icon--under-construction: url('data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text x="1" y="20" font-size="20">🚧</text></svg>');
+}

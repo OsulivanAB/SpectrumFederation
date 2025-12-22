@@ -31,3 +31,16 @@ releases/
 
 # Blizzard UI reference source (cloned by devcontainer; do NOT commit)
 BlizzardUI/
+
+# MkDocs
+/site/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv

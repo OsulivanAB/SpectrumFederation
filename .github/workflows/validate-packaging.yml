@@ -1,0 +1,35 @@
+name: Validate WowUp/CurseForge packaging + version
+on:
+  push:
+    branches:
+    - main
+    - beta
+  pull_request:
+    branches:
+    - main
+    - beta
+jobs:
+  validate-packaging-and-version:
+    runs-on: ubuntu-latest
+    env:
+      ADDON_NAME: SpectrumFederation
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0     # we need history for version comparison
+    - name: Install zip tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y zip unzip
+    - name: Validate addon package (WowUp + CurseForge)
+      run: bash .github/scripts/validate-addon-package.sh
+    - name: Fetch base branch (for version comparison)
+      if: ${{ github.event_name == 'pull_request' }}
+      run: |
+        git fetch origin "${{ github.base_ref }}" --depth=1
+    - name: Ensure addon version bumped vs base branch
+      if: ${{ github.event_name == 'pull_request' }}
+      env:
+        BASE_REF: ${{ github.base_ref }}
+      run: bash .github/scripts/check-version-bump.sh
