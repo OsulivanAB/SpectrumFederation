@@ -6,7 +6,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 ## [Unreleased - Beta]
 
 ### Fixed
-- Resolved an issue causing incorrect profile synchronization under certain conditions.
+- Addressed a bug where certain UI elements failed to update after profile changes.
 
 ## [0.0.14-beta.1] - Unknown
 
