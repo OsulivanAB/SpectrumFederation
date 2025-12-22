@@ -55,27 +55,84 @@ def main():
 
     # Get git diff of recent changes
     try:
-        # Get the diff between the previous commit and current
+        # Try to get the merge base for a proper diff
+        # First, check if this is a merge commit
+        is_merge = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD^2"],
+            capture_output=True,
+            text=True
+        ).returncode == 0
+        
+        if is_merge:
+            # For merge commits, diff against the first parent
+            base_commit = "HEAD^1"
+            print("Detected merge commit, comparing against first parent")
+        else:
+            # For regular commits, just compare with previous commit
+            base_commit = "HEAD~1"
+            # Verify the base commit exists
+            verify_result = subprocess.run(
+                ["git", "rev-parse", "--verify", base_commit],
+                capture_output=True,
+                text=True
+            )
+            if verify_result.returncode != 0:
+                print(f"Warning: {base_commit} not available, trying to find merge base")
+                # Try to find merge base with main
+                merge_base_result = subprocess.run(
+                    ["git", "merge-base", "HEAD", "origin/main"],
+                    capture_output=True,
+                    text=True
+                )
+                if merge_base_result.returncode == 0:
+                    base_commit = merge_base_result.stdout.strip()
+                    print(f"Using merge base: {base_commit}")
+                else:
+                    # Last resort: just get the diff of current commit
+                    base_commit = "HEAD^"  # This will fail gracefully below
+        
+        # Get the diff
         diff_result = subprocess.run(
-            ["git", "diff", "HEAD~1", "HEAD", "--", "SpectrumFederation/"],
+            ["git", "diff", base_commit, "HEAD", "--", "SpectrumFederation/"],
             capture_output=True,
             text=True,
             check=True
         )
         git_diff = diff_result.stdout
         
-        # Get commit message
+        # Get commit message (for merge commits, get the merge message)
         commit_msg = subprocess.run(
-            ["git", "log", "-1", "--pretty=%B"],
+            ["git", "log", "-1", "--pretty=%B", "HEAD"],
             capture_output=True,
             text=True,
             check=True
         ).stdout.strip()
         
+        print(f"Got git diff ({len(git_diff)} chars) and commit message")
+        
     except subprocess.CalledProcessError as e:
         print(f"Error getting git diff: {e}")
-        git_diff = ""
-        commit_msg = ""
+        print("Attempting to get diff of just the current commit")
+        try:
+            # Try to get just the changes in the current commit
+            diff_result = subprocess.run(
+                ["git", "show", "HEAD", "--", "SpectrumFederation/"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            git_diff = diff_result.stdout
+            commit_msg = subprocess.run(
+                ["git", "log", "-1", "--pretty=%B"],
+                capture_output=True,
+                text=True,
+                check=True
+            ).stdout.strip()
+            print(f"Got git show output ({len(git_diff)} chars)")
+        except subprocess.CalledProcessError as e2:
+            print(f"Error getting git show: {e2}")
+            git_diff = ""
+            commit_msg = ""
 
     # Truncate diff if too large (keep it reasonable for API)
     max_diff_length = 15000
@@ -189,6 +246,9 @@ def main():
         # Generate a basic changelog from commit message and file changes
         print("Generating basic changelog from commit analysis...")
         
+        # Check if there were any actual addon code changes
+        has_code_changes = git_diff and len(git_diff.strip()) > 0
+        
         # Parse the diff to identify what changed
         changes = {
             "added": [],
@@ -197,18 +257,22 @@ def main():
             "removed": []
         }
         
-        # Analyze commit message for keywords
-        commit_lower = commit_msg.lower()
-        
-        # Try to categorize based on commit message
-        if any(word in commit_lower for word in ["add", "new", "create", "implement"]):
-            changes["added"].append(commit_msg)
-        elif any(word in commit_lower for word in ["fix", "bug", "issue", "resolve"]):
-            changes["fixed"].append(commit_msg)
-        elif any(word in commit_lower for word in ["remove", "delete", "deprecate"]):
-            changes["removed"].append(commit_msg)
+        if not has_code_changes:
+            # If no addon code changes, this is likely an infrastructure-only change
+            changes["changed"].append("Infrastructure and tooling updates (no addon code changes)")
         else:
-            changes["changed"].append(commit_msg)
+            # Analyze commit message for keywords
+            commit_lower = commit_msg.lower()
+            
+            # Try to categorize based on commit message
+            if any(word in commit_lower for word in ["add", "new", "create", "implement"]):
+                changes["added"].append(commit_msg)
+            elif any(word in commit_lower for word in ["fix", "bug", "issue", "resolve"]):
+                changes["fixed"].append(commit_msg)
+            elif any(word in commit_lower for word in ["remove", "delete", "deprecate"]):
+                changes["removed"].append(commit_msg)
+            else:
+                changes["changed"].append(commit_msg)
         
         # Build changelog entry
         entry_parts = [section_header, ""]
