@@ -1,0 +1,87 @@
+name: PR Main Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'SpectrumFederation/**'
+      - '.github/scripts/**'
+      - '.github/workflows/**'
+
+concurrency:
+  group: main-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install luacheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luarocks
+          sudo luarocks install luacheck
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run unified linter
+        run: python3 .github/scripts/lint_all.py
+
+  validate-packaging:
+    name: Validate Package Structure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate addon packaging
+        run: python3 .github/scripts/validate_packaging.py
+
+  check-stable-version:
+    name: Check Stable Version Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify stable version format
+        run: |
+          VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+          echo "Version in TOC: $VERSION"
+
+          if [[ "$VERSION" =~ -beta ]]; then
+            echo "::error ::Version '$VERSION' contains '-beta' suffix"
+            echo "          PRs to main must use stable version format (e.g., 0.0.17)"
+            echo "          Remove the '-beta' suffix before merging to main"
+            exit 1
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error ::Version '$VERSION' is not in stable format"
+            echo "          Expected format: X.Y.Z (e.g., 0.0.17)"
+            exit 1
+          fi
+
+          echo "✓ Version format is correct for main branch: $VERSION"
