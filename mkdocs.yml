@@ -75,6 +75,7 @@ nav:
   - Development:
     - Getting Started: development/index.md
     - Naming Conventions: development/naming-conventions.md
+    - Merging to Main: development/merging-to-main.md
 
 plugins:
   - search
