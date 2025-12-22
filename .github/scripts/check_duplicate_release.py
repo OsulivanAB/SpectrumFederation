@@ -95,7 +95,7 @@ def check_duplicate_release(version, repo):
             print(f"          Tag: {release.get('tag_name', 'N/A')}")
             print(f"          Name: {release.get('name', 'N/A')}")
             print(f"          URL: {release.get('html_url', 'N/A')}")
-            print(f"          You cannot create a beta for a version that has already been released as stable")
+            print("          You cannot create a beta for a version that has already been released as stable")
             print(f"          Bump to the next version (e.g., {increment_version(base_version)}-beta.1)")
             return True
     
