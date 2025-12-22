@@ -122,18 +122,6 @@ Error: `Version must not contain 'beta' when merging to main`
 
 **Solution:** Ensure the version in `.toc` file has the `-beta.N` suffix removed.
 
-### Missing Files After Merge
-
-If files from beta don't appear in main after merge:
-
-```bash
-# On main branch, copy missing files from beta
-git checkout main
-git checkout beta -- <missing-file-path>
-git commit -m "Add missing files from beta"
-git push origin main
-```
-
 ## Release Automation
 
 After merging to main:
