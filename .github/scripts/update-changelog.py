@@ -131,33 +131,43 @@ def main():
     
     prompt_text = "\n".join(prompt_parts)
 
-    # Use GitHub Models API to call Copilot
+    # Try to use GitHub Models API, but have a robust fallback
     import requests
 
-    api_url = "https://models.inference.ai.azure.com/chat/completions"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {github_token}"
-    }
+    new_entry = None
     
-    payload = {
-        "model": "gpt-4o",
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are a helpful assistant that generates changelog entries for software projects. Be concise and focus on user-facing changes."
-            },
-            {
-                "role": "user",
-                "content": prompt_text
-            }
-        ],
-        "temperature": 0.3,
-        "max_tokens": 1000
-    }
-
+    # Only attempt API call if we think we have the right permissions
+    # GitHub Actions GITHUB_TOKEN doesn't have models permission by default
     try:
+        api_url = "https://models.inference.ai.azure.com/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {github_token}"
+        }
+        
+        payload = {
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that generates changelog entries for software projects. Be concise and focus on user-facing changes."
+                },
+                {
+                    "role": "user",
+                    "content": prompt_text
+                }
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1000
+        }
+
         response = requests.post(api_url, headers=headers, json=payload, timeout=30)
+        
+        # If we get 401, skip to fallback immediately
+        if response.status_code == 401:
+            print("GitHub Models API not available (missing permissions), using basic changelog generation")
+            raise Exception("API not available")
+            
         response.raise_for_status()
         result = response.json()
         new_entry = result["choices"][0]["message"]["content"].strip()
@@ -167,20 +177,67 @@ def main():
         new_entry = re.sub(r'```\s*$', '', new_entry, flags=re.MULTILINE)
         new_entry = new_entry.strip()
         
-        print("Generated changelog entry:")
+        print("Generated changelog entry using GitHub Models API:")
         print(new_entry)
         
     except Exception as e:
-        print(f"Error calling GitHub Models API: {e}")
+        print(f"Could not use GitHub Models API: {e}")
         if hasattr(e, 'response') and hasattr(e.response, 'text'):
             print(f"Response: {e.response.text}")
-        # Fallback to basic entry
-        new_entry = f"""{section_header}
-
-### Changed
-- {commit_msg}
-"""
-        print("Using fallback changelog entry")
+        
+        # Generate a basic changelog from commit message and file changes
+        print("Generating basic changelog from commit analysis...")
+        
+        # Parse the diff to identify what changed
+        changes = {
+            "added": [],
+            "changed": [],
+            "fixed": [],
+            "removed": []
+        }
+        
+        # Analyze commit message for keywords
+        commit_lower = commit_msg.lower()
+        
+        # Try to categorize based on commit message
+        if any(word in commit_lower for word in ["add", "new", "create", "implement"]):
+            changes["added"].append(commit_msg)
+        elif any(word in commit_lower for word in ["fix", "bug", "issue", "resolve"]):
+            changes["fixed"].append(commit_msg)
+        elif any(word in commit_lower for word in ["remove", "delete", "deprecate"]):
+            changes["removed"].append(commit_msg)
+        else:
+            changes["changed"].append(commit_msg)
+        
+        # Build changelog entry
+        entry_parts = [section_header, ""]
+        
+        if changes["added"]:
+            entry_parts.append("### Added")
+            for item in changes["added"]:
+                entry_parts.append(f"- {item}")
+            entry_parts.append("")
+        
+        if changes["changed"]:
+            entry_parts.append("### Changed")
+            for item in changes["changed"]:
+                entry_parts.append(f"- {item}")
+            entry_parts.append("")
+        
+        if changes["fixed"]:
+            entry_parts.append("### Fixed")
+            for item in changes["fixed"]:
+                entry_parts.append(f"- {item}")
+            entry_parts.append("")
+        
+        if changes["removed"]:
+            entry_parts.append("### Removed")
+            for item in changes["removed"]:
+                entry_parts.append(f"- {item}")
+            entry_parts.append("")
+        
+        new_entry = "\n".join(entry_parts).strip()
+        print("Using generated changelog entry")
 
     # Update CHANGELOG.md
     if existing_changelog:

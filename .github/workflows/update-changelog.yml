@@ -12,6 +12,8 @@ name: Update CHANGELOG with Copilot
 
 permissions:
   contents: write
+  # Required for GitHub Models API (Copilot)
+  actions: read
 
 jobs:
   update-changelog:
@@ -39,7 +41,7 @@ jobs:
 
       - name: Generate changelog entry with Copilot
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
           BRANCH_NAME: ${{ github.ref_name }}
         run: python3 .github/scripts/update-changelog.py
 
@@ -80,4 +82,8 @@ jobs:
 
           git commit -m "chore: update CHANGELOG.md for \
           automated release [skip ci] [skip changelog]"
+          
+          # Pull with rebase in case of concurrent changes
+          git pull --rebase origin ${{ github.ref_name }} || true
+          
           git push
