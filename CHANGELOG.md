@@ -5,8 +5,8 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ## [Unreleased - Beta]
 
-### Fixed
-- Fix trailing spaces in update-changelog.yml workflow
+### Changed
+- Preparing to merge to main
 
 ## [0.0.14-beta.1] - Unknown
 
