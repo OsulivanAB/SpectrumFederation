@@ -1,19 +1,21 @@
-## Interface: 110207
+## Interface: 120001
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
-## Version: 0.0.20-beta.1
-## Notes: Addon for the Spectrum Federation guild on Garona - Now with tabbed settings UI
-=======
-## Version: 0.0.19-beta.1
+## Version: 0.1.0-beta.1
 ## Notes: Loot profile management and helper tools for guild coordination. Create and manage raid loot profiles, track distributions, and coordinate gear allocation across your guild.
 ## IconTexture: Interface\AddOns\SpectrumFederation\Media\Icons\SpectrumFederationIcon
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
 ## X-Documentation: https://osullivanab.github.io/SpectrumFederation/
-## SavedVariables: SpectrumFederationDB SpectrumFederationDebugDB
+## SavedVariables: SpectrumFederationDB, SpectrumFederationDebugDB
 
 ## Core files
+modules/Debug.lua
+modules/LootHelper/Database.lua
+modules/SlashCommands.lua
+modules/LootHelper/LootProfiles.lua
+modules/LootHelper/LootHelper.lua
+modules/LootHelper/Settings.lua
+modules/LootHelper/ui.lua
+ui/Settings.lua
+modules/Core.lua
 SpectrumFederation.lua
-modules/debug.lua
-modules/LootProfiles.lua
-settings/loot_helper.lua
-modules/settings_ui.lua

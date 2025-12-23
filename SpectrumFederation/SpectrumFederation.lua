@@ -1,28 +1,6 @@
 -- Grab the namespace
 local addonName, SF = ...
 
--- Database Initialization
-function SF:InitializeDatabase()
-
-    -- Check if the global SavedVariable exists.
-    -- If it is nil, it means this is a fresh install or first run
-    if not SpectrumFederationDB then
-        SpectrumFederationDB = {
-            lootProfiles = {},
-            activeLootProfile = nil
-        }
-        print("|cFF00FF00" .. addonName .. "|r: Initialized new database.")
-        if SF.Debug then SF.Debug:Info("DATABASE", "Initialized new database for fresh install") end
-    else
-        if SF.Debug then SF.Debug:Info("DATABASE", "Loaded existing database") end
-    end
-
-    -- Create a shortcut in our namespace
-    SF.db = SpectrumFederationDB
-end
-
-
-
 -- Create an Event Frame for Addon Initialization
 local EventFrame = CreateFrame("Frame")
 
@@ -48,34 +26,46 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.Debug:Initialize()
             SF.Debug:Info("ADDON", "SpectrumFederation addon loaded")
         end
-        
-        -- Initialize the Database
-        SF:InitializeDatabase()
 
-        -- Check to make sure Settings UI function exists
+        -- Create the Settings UI
         if SF.CreateSettingsUI then
             SF:CreateSettingsUI()
+        else
+            if SF.Debug then SF.Debug:Info("SETTINGS_UI", "No CreateSettingsUI function found") end
         end
 
         -- Send a quick message saying that Addon is Initialized
         print("|cFF00FF00" .. addonName .. "|r: Online. Type /sf to open settings.")
+
+        -- Initialize Slash Commands
+        if SF.InitializeSlashCommands then
+            SF:InitializeSlashCommands()
+        else
+            if SF.Debug then SF.Debug:Warn("SLASH", "InitializeSlashCommands function not found") end
+        end
 
         -- Unregister the Event after initialization
         self:UnregisterEvent("PLAYER_LOGIN")
     end
 end)
 
--- Register Slash Command '/sf'
-SLASH_SPECFED1 = "/sf"
-SlashCmdList["SPECFED"] = function(msg)
-    
-    if SF.SettingsCategory and SF.SettingsPanel then
-        -- Get the ID for the Settings Category 
-        local categoryID = SF.SettingsCategory:GetID()
-        -- Open the Settings to our Addon's Category
-        Settings.OpenToCategory(categoryID)
-    else
-        print("|cFF00FF00" .. addonName .. "|r: Settings UI is not available.")
+-- Create an Event Frame for Addon Loaded
+local AddonLoadedFrame = CreateFrame("Frame")
+-- Register the ADDON_LOADED Event
+AddonLoadedFrame:RegisterEvent("ADDON_LOADED")
+-- Script to run when ADDON_LOADED Event fires
+AddonLoadedFrame:SetScript("OnEvent", function(self, event, addonName)
+
+    -- Ensure the loaded addon is SpectrumFederation
+    if addonName ~= "SpectrumFederation" then return end
+
+    -- Initialize Loot Helper Database before creating UI
+    if SF.InitializeLootHelperDatabase then
+        SF:InitializeLootHelperDatabase()
     end
 
-end
+    -- Create the Loot Window
+    if SF.LootWindow and SF.LootWindow.Create then
+        SF.LootWindow:Create()
+    end
+end)
