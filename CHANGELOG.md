@@ -6,7 +6,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 ## [Unreleased - Beta]
 
 ### Fixed
-- Resolved issues in documentation build process by testing mkdocs in dry-run mode to catch errors.
+- Adjusted documentation build process to correctly check out the beta branch during dry-run mode.
 
 ## [0.0.14-beta.1] - Unknown
 
