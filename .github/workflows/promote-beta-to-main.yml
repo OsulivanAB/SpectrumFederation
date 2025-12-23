@@ -256,10 +256,10 @@ jobs:
     needs: [merge-beta-to-main, update-changelog-main, update-readme-main]
 
     steps:
-      - name: Checkout main branch
+      - name: Checkout branch
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ inputs.dry_run && 'beta' || 'main' }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -272,7 +272,7 @@ jobs:
       - name: Build documentation
         run: |
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
-            echo "[DRY RUN] Testing documentation build..."
+            echo "[DRY RUN] Testing documentation build from beta branch..."
             mkdocs build --clean --strict
             echo "[DRY RUN] Documentation build successful, but not deploying"
           else
