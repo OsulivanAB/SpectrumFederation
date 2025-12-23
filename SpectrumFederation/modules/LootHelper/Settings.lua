@@ -72,7 +72,7 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
 
     -- Enable/Disable Loot Helper Checkbox
     local enableCheckbox = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
-    enableCheckbox:SetPoint("TOPLEFT", subTitle, "BOTTOMLEFT", 0, -20)
+    enableCheckbox:SetPoint("TOPLEFT", leftLine, "BOTTOMLEFT", 0, -20)
     enableCheckbox:SetSize(24, 24)
     
     -- Checkbox Label

@@ -27,13 +27,6 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.Debug:Info("ADDON", "SpectrumFederation addon loaded")
         end
 
-        -- Initialize Loot Databases
-        if SF.InitializeLootDatabase then
-            SF:InitializeLootDatabase()
-        else
-            if SF.Debug then SF.Debug:Warn("DATABASE", "InitializeLootDatabase function not found") end
-        end
-
         -- Create the Settings UI
         if SF.CreateSettingsUI then
             SF:CreateSettingsUI()
@@ -66,5 +59,13 @@ AddonLoadedFrame:SetScript("OnEvent", function(self, event, addonName)
     -- Ensure the loaded addon is SpectrumFederation
     if addonName ~= "SpectrumFederation" then return end
 
-    SF.LootWindow:Create()
+    -- Initialize Loot Helper Database before creating UI
+    if SF.InitializeLootHelperDatabase then
+        SF:InitializeLootHelperDatabase()
+    end
+
+    -- Create the Loot Window
+    if SF.LootWindow and SF.LootWindow.Create then
+        SF.LootWindow:Create()
+    end
 end)

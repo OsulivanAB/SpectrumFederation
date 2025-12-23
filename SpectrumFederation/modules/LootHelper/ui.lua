@@ -9,12 +9,12 @@ SF.LootWindow = LootWindow
 -- @return: none
 local function SaveFrameState(frame)
 
-    if SF.lootHelperDB.windowSettings then
-        local db = SF.lootHelperDB.windowSettings
-    else
-        if SF.Debug then SF.Debug:Warn("LOOT_UI", "No lootHelperDB found to apply frame state") end
+    if not SF.lootHelperDB or not SF.lootHelperDB.windowSettings then
+        if SF.Debug then SF.Debug:Warn("LOOT_UI", "No lootHelperDB found to save frame state") end
         return
     end
+    
+    local db = SF.lootHelperDB.windowSettings
     
     -- Size
     db.width = frame:GetWidth()
@@ -39,12 +39,12 @@ end
 -- @return: none
 local function ApplyFrameState(frame)
 
-    if SF.lootHelperDB.windowSettings then
-        local db = SF.lootHelperDB.windowSettings
-    else
+    if not SF.lootHelperDB or not SF.lootHelperDB.windowSettings then
         if SF.Debug then SF.Debug:Warn("LOOT_UI", "No lootHelperDB found to apply frame state") end
         return
     end
+
+    local db = SF.lootHelperDB.windowSettings
 
     frame:ClearAllPoints()
     frame:SetPoint(
@@ -87,6 +87,13 @@ function LootWindow:SetEnabled(enabled)
     -- Update frame visuals if frame exists
     if self.frame then
         SetEnabledVisuals(self.frame, enabled)
+        
+        -- Show or hide the window based on enabled state
+        if enabled then
+            self.frame:Show()
+        else
+            self.frame:Hide()
+        end
     end
     
     -- Log the change
@@ -102,12 +109,12 @@ function LootWindow:Create()
         return self.frame
     end
 
-    if SF.lootHelperDB.windowSettings then
-        local db = SF.lootHelperDB.windowSettings
-    else
-        if SF.Debug then SF.Debug:Warn("LOOT_UI", "No lootHelperDB found to apply frame state") end
+    if not SF.lootHelperDB or not SF.lootHelperDB.windowSettings then
+        if SF.Debug then SF.Debug:Warn("LOOT_UI", "No lootHelperDB found to create frame") end
         return
     end
+
+    local db = SF.lootHelperDB.windowSettings
 
     -- Create Main Window
     local frame = CreateFrame("Frame", "SpectrumFederationLootHelperWindow", UIParent, "BackdropTemplate")
