@@ -1,28 +1,6 @@
 -- Grab the namespace
 local addonName, SF = ...
 
--- Database Initialization
-function SF:InitializeDatabase()
-
-    -- Check if the global SavedVariable exists.
-    -- If it is nil, it means this is a fresh install or first run
-    if not SpectrumFederationDB then
-        SpectrumFederationDB = {
-            lootProfiles = {},
-            activeLootProfile = nil
-        }
-        print("|cFF00FF00" .. addonName .. "|r: Initialized new database.")
-        if SF.Debug then SF.Debug:Info("DATABASE", "Initialized new database for fresh install") end
-    else
-        if SF.Debug then SF.Debug:Info("DATABASE", "Loaded existing database") end
-    end
-
-    -- Create a shortcut in our namespace
-    SF.db = SpectrumFederationDB
-end
-
-
-
 -- Create an Event Frame for Addon Initialization
 local EventFrame = CreateFrame("Frame")
 
@@ -48,13 +26,19 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.Debug:Initialize()
             SF.Debug:Info("ADDON", "SpectrumFederation addon loaded")
         end
-        
-        -- Initialize the Database
-        SF:InitializeDatabase()
 
-        -- Check to make sure Settings UI function exists
+        -- Initialize the Loot Database
+        if SF:InitializeLootDatabase() then
+            SF:InitializeLootDatabase()
+        else
+            if SF.Debug then SF.Debug:Info("DATABASE", "No InitializeLootDatabase function found") end
+        end
+
+        -- Create the Settings UI
         if SF.CreateSettingsUI then
             SF:CreateSettingsUI()
+        else
+            if SF.Debug then SF.Debug:Info("SETTINGS_UI", "No CreateSettingsUI function found") end
         end
 
         -- Send a quick message saying that Addon is Initialized
@@ -76,6 +60,7 @@ SlashCmdList["SPECFED"] = function(msg)
         Settings.OpenToCategory(categoryID)
     else
         print("|cFF00FF00" .. addonName .. "|r: Settings UI is not available.")
+        SF.Debug:Warn("SETTINGS_UI", "SettingsCategory or SettingsPanel not found")
     end
 
 end

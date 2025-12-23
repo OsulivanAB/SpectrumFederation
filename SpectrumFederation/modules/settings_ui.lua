@@ -41,7 +41,7 @@ function SF:CreateSettingsUI()
         end
     end)
 
-    -- Create sections (add more here as needed)
+    -- Create sections
     SF:CreateLootHelperSection(panel, banner)
 
     -- Register the panel in the Settings UI

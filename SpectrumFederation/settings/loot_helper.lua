@@ -15,7 +15,7 @@ function SF:UpdateLootProfileDropdownText()
         return
     end
 
-    local currentProfile = SF.db.activeLootProfile
+    local currentProfile = SF.lootDB.activeLootProfile
     if currentProfile then
         SF.LootProfileDropdown.Text:SetText(currentProfile)
         if SF.LootProfileDeleteButton then SF.LootProfileDeleteButton:Show() end
@@ -91,12 +91,12 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
 
         -- Sort the keys by modified descending
         local sortedNames = {}
-        for profileName, _ in pairs(SF.db.lootProfiles) do
+        for profileName, _ in pairs(SF.lootDB.lootProfiles) do
             table.insert(sortedNames, profileName)
         end
         table.sort(sortedNames, function(a, b)
-            local timeA = SF.db.lootProfiles[a].modified or 0
-            local timeB = SF.db.lootProfiles[b].modified or 0
+            local timeA = SF.lootDB.lootProfiles[a].modified or 0
+            local timeB = SF.lootDB.lootProfiles[b].modified or 0
             return timeA > timeB
         end)
 
@@ -137,9 +137,9 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
 
     -- logic to delete
     deleteProfileBtn:SetScript("OnClick", function()
-        if SF.db.activeLootProfile then
-            if SF.Debug then SF.Debug:Info("UI", "User clicked delete button for profile '%s'", SF.db.activeLootProfile) end
-            SF:DeleteProfile(SF.db.activeLootProfile)
+        if SF.lootDB.activeLootProfile then
+            if SF.Debug then SF.Debug:Info("UI", "User clicked delete button for profile '%s'", SF.lootDB.activeLootProfile) end
+            SF:DeleteProfile(SF.lootDB.activeLootProfile)
         else
             if SF.Debug then SF.Debug:Warn("UI", "User clicked delete button but no active profile exists") end
             print("|cFFFF0000" .. addonName .. "|r: No active profile to delete.")
