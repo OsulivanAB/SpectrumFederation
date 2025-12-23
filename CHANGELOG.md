@@ -6,7 +6,8 @@ All notable changes to SpectrumFederation will be documented in this file.
 ## [Unreleased - Beta]
 
 ### Fixed
-- Removed trailing spaces from workflow file to ensure cleaner formatting.
+- Skip branch sync verification in dry-run mode to prevent unnecessary checks.
+- Display commit count during dry-run mode for better visibility.
 
 ## [0.0.14-beta.1] - Unknown
 
