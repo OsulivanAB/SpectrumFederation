@@ -56,7 +56,6 @@ All 6 steps from the implementation plan have been completed:
 
 **New Documentation**:
 - `docs/development/workflows.md` - Comprehensive workflow guide with diagrams
-- `docs/development/github-configuration.md` - GitHub setup instructions
 - `.github/scripts/README.md` - Python scripts documentation with workflow integration
 
 **Updated Documentation**:
@@ -178,11 +177,11 @@ After verifying the new system works:
 
 1. **Remove Setup Instructions**:
    - Delete `.github/scripts/SETUP_INSTRUCTIONS.md` (temporary file)
-   - Keep permanent docs in `docs/development/github-configuration.md`
+   - Keep permanent docs in development guides
 
 2. **Clean Up Old Scripts**:
-   - Remove `.github/scripts/` directory (if empty)
-   - Verify `update_changelog.py` moved to `.github/scripts/`
+   - Remove old script directories (if empty)
+   - Verify all scripts moved to `.github/scripts/`
 
 ## Known Limitations
 
@@ -282,11 +281,10 @@ python3 .github/scripts/test_blizzard_api.py --environment live
 - `.github/scripts/publish_release.py`
 - `.github/scripts/test_blizzard_api.py`
 
-**Documentation** (4 files):
+**Documentation** (3 files):
 - `.github/scripts/README.md`
 - `.github/scripts/SETUP_INSTRUCTIONS.md` (temporary)
 - `docs/development/workflows.md`
-- `docs/development/github-configuration.md`
 
 **Workflows** (4 files):
 - `.github/workflows/pr-beta-validation.yml`
@@ -338,6 +336,5 @@ The new system is **backwards compatible** (existing workflows remain but are de
 ## References
 
 - [Workflow Guide](workflows.md) - Comprehensive workflow documentation
-- [GitHub Configuration](github-configuration.md) - Setup instructions
 
 **Note**: For Python helper script documentation, see `.github/scripts/README.md` in the repository root.
