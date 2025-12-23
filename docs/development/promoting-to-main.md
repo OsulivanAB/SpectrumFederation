@@ -228,5 +228,4 @@ Use this checklist for each promotion:
 ## Additional Resources
 
 - [CI/CD Workflows Guide](workflows.md) - Complete workflow documentation
-- [GitHub Configuration](github-configuration.md) - Admin setup guide
 - [Rollback Process](workflows.md#4-rollback-workflow-rollback-releaseyml) - How to revert a promotion

@@ -1,0 +1,230 @@
+﻿2025-12-23T00:36:38.4283281Z Current runner version: '2.330.0'
+2025-12-23T00:36:38.4317490Z ##[group]Runner Image Provisioner
+2025-12-23T00:36:38.4318259Z Hosted Compute Agent
+2025-12-23T00:36:38.4318813Z Version: 20251211.462
+2025-12-23T00:36:38.4319469Z Commit: 6cbad8c2bb55d58165063d031ccabf57e2d2db61
+2025-12-23T00:36:38.4320132Z Build Date: 2025-12-11T16:28:49Z
+2025-12-23T00:36:38.4320814Z Worker ID: {406f682b-d0a2-4bb2-a132-8bccd7b32a7a}
+2025-12-23T00:36:38.4321472Z ##[endgroup]
+2025-12-23T00:36:38.4322024Z ##[group]Operating System
+2025-12-23T00:36:38.4322912Z Ubuntu
+2025-12-23T00:36:38.4323404Z 24.04.3
+2025-12-23T00:36:38.4323871Z LTS
+2025-12-23T00:36:38.4324287Z ##[endgroup]
+2025-12-23T00:36:38.4324852Z ##[group]Runner Image
+2025-12-23T00:36:38.4325420Z Image: ubuntu-24.04
+2025-12-23T00:36:38.4325890Z Version: 20251215.174.1
+2025-12-23T00:36:38.4326938Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20251215.174/images/ubuntu/Ubuntu2404-Readme.md
+2025-12-23T00:36:38.4328458Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20251215.174
+2025-12-23T00:36:38.4329528Z ##[endgroup]
+2025-12-23T00:36:38.4330567Z ##[group]GITHUB_TOKEN Permissions
+2025-12-23T00:36:38.4332952Z Contents: read
+2025-12-23T00:36:38.4333489Z Metadata: read
+2025-12-23T00:36:38.4333985Z Pages: write
+2025-12-23T00:36:38.4334513Z ##[endgroup]
+2025-12-23T00:36:38.4336813Z Secret source: Actions
+2025-12-23T00:36:38.4337776Z Prepare workflow directory
+2025-12-23T00:36:38.4764056Z Prepare all required actions
+2025-12-23T00:36:38.4819773Z Getting action download info
+2025-12-23T00:36:38.8373928Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2025-12-23T00:36:38.9550186Z Download action repository 'actions/setup-python@v5' (SHA:a26af69be951a213d495a4c3e4e4022e16d87065)
+2025-12-23T00:36:39.1431855Z Complete job name: Merge Beta to Main
+2025-12-23T00:36:39.2197619Z ##[group]Run actions/checkout@v4
+2025-12-23T00:36:39.2198697Z with:
+2025-12-23T00:36:39.2199107Z   ref: main
+2025-12-23T00:36:39.2199521Z   fetch-depth: 0
+2025-12-23T00:36:39.2200494Z   token: ***
+2025-12-23T00:36:39.2200935Z   repository: OsulivanAB/SpectrumFederation
+2025-12-23T00:36:39.2201492Z   ssh-strict: true
+2025-12-23T00:36:39.2201903Z   ssh-user: git
+2025-12-23T00:36:39.2202514Z   persist-credentials: true
+2025-12-23T00:36:39.2202995Z   clean: true
+2025-12-23T00:36:39.2203420Z   sparse-checkout-cone-mode: true
+2025-12-23T00:36:39.2203961Z   fetch-tags: false
+2025-12-23T00:36:39.2204442Z   show-progress: true
+2025-12-23T00:36:39.2204877Z   lfs: false
+2025-12-23T00:36:39.2205270Z   submodules: false
+2025-12-23T00:36:39.2205700Z   set-safe-directory: true
+2025-12-23T00:36:39.2206459Z ##[endgroup]
+2025-12-23T00:36:39.3343006Z Syncing repository: OsulivanAB/SpectrumFederation
+2025-12-23T00:36:39.3344953Z ##[group]Getting Git version info
+2025-12-23T00:36:39.3345918Z Working directory is '/home/runner/work/SpectrumFederation/SpectrumFederation'
+2025-12-23T00:36:39.3347042Z [command]/usr/bin/git version
+2025-12-23T00:36:39.3467886Z git version 2.52.0
+2025-12-23T00:36:39.3495263Z ##[endgroup]
+2025-12-23T00:36:39.3511277Z Temporarily overriding HOME='/home/runner/work/_temp/3c865739-4310-4c25-94bb-af5ae60d34d3' before making global git config changes
+2025-12-23T00:36:39.3514248Z Adding repository directory to the temporary git global config as a safe directory
+2025-12-23T00:36:39.3525933Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/SpectrumFederation/SpectrumFederation
+2025-12-23T00:36:39.3568538Z Deleting the contents of '/home/runner/work/SpectrumFederation/SpectrumFederation'
+2025-12-23T00:36:39.3571900Z ##[group]Initializing the repository
+2025-12-23T00:36:39.3577261Z [command]/usr/bin/git init /home/runner/work/SpectrumFederation/SpectrumFederation
+2025-12-23T00:36:39.3704690Z hint: Using 'master' as the name for the initial branch. This default branch name
+2025-12-23T00:36:39.3706096Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2025-12-23T00:36:39.3707356Z hint: to use in all of your new repositories, which will suppress this warning,
+2025-12-23T00:36:39.3708128Z hint: call:
+2025-12-23T00:36:39.3708683Z hint:
+2025-12-23T00:36:39.3709211Z hint: 	git config --global init.defaultBranch <name>
+2025-12-23T00:36:39.3710135Z hint:
+2025-12-23T00:36:39.3711223Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2025-12-23T00:36:39.3712864Z hint: 'development'. The just-created branch can be renamed via this command:
+2025-12-23T00:36:39.3714379Z hint:
+2025-12-23T00:36:39.3715210Z hint: 	git branch -m <name>
+2025-12-23T00:36:39.3716145Z hint:
+2025-12-23T00:36:39.3717378Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2025-12-23T00:36:39.3719695Z Initialized empty Git repository in /home/runner/work/SpectrumFederation/SpectrumFederation/.git/
+2025-12-23T00:36:39.3725519Z [command]/usr/bin/git remote add origin https://github.com/OsulivanAB/SpectrumFederation
+2025-12-23T00:36:39.3760456Z ##[endgroup]
+2025-12-23T00:36:39.3761836Z ##[group]Disabling automatic garbage collection
+2025-12-23T00:36:39.3765673Z [command]/usr/bin/git config --local gc.auto 0
+2025-12-23T00:36:39.3794587Z ##[endgroup]
+2025-12-23T00:36:39.3796022Z ##[group]Setting up auth
+2025-12-23T00:36:39.3802018Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2025-12-23T00:36:39.3832683Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2025-12-23T00:36:39.4240079Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2025-12-23T00:36:39.4269520Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2025-12-23T00:36:39.4510296Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2025-12-23T00:36:39.4558570Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2025-12-23T00:36:39.4805756Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2025-12-23T00:36:39.4846137Z ##[endgroup]
+2025-12-23T00:36:39.4847863Z ##[group]Fetching the repository
+2025-12-23T00:36:39.4860565Z [command]/usr/bin/git -c protocol.version=2 fetch --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2025-12-23T00:36:40.1349528Z From https://github.com/OsulivanAB/SpectrumFederation
+2025-12-23T00:36:40.1352645Z  * [new branch]      beta                    -> origin/beta
+2025-12-23T00:36:40.1355568Z  * [new branch]      copilot/sub-pr-10       -> origin/copilot/sub-pr-10
+2025-12-23T00:36:40.1357426Z  * [new branch]      copilot/sub-pr-22       -> origin/copilot/sub-pr-22
+2025-12-23T00:36:40.1358697Z  * [new branch]      copilot/sub-pr-22-again -> origin/copilot/sub-pr-22-again
+2025-12-23T00:36:40.1359933Z  * [new branch]      gh-pages                -> origin/gh-pages
+2025-12-23T00:36:40.1360938Z  * [new branch]      main                    -> origin/main
+2025-12-23T00:36:40.1362513Z  * [new branch]      revert-10-feature/badges-bug-fix -> origin/revert-10-feature/badges-bug-fix
+2025-12-23T00:36:40.1364237Z  * [new branch]      v0.0.14-beta.1          -> origin/v0.0.14-beta.1
+2025-12-23T00:36:40.1365447Z  * [new branch]      v0.0.15-beta.1          -> origin/v0.0.15-beta.1
+2025-12-23T00:36:40.1366601Z  * [new branch]      v0.0.16                 -> origin/v0.0.16
+2025-12-23T00:36:40.1367711Z  * [new tag]         v0.0.10-beta            -> v0.0.10-beta
+2025-12-23T00:36:40.1368789Z  * [new tag]         v0.0.11-beta            -> v0.0.11-beta
+2025-12-23T00:36:40.1369886Z  * [new tag]         v0.0.12-beta            -> v0.0.12-beta
+2025-12-23T00:36:40.1371018Z  * [new tag]         v0.0.13-beta.1          -> v0.0.13-beta.1
+2025-12-23T00:36:40.1372831Z  * [new tag]         v0.0.15-beta.1          -> v0.0.15-beta.1
+2025-12-23T00:36:40.1373992Z  * [new tag]         v0.0.16                 -> v0.0.16
+2025-12-23T00:36:40.1375162Z  * [new tag]         v0.0.17-beta.3          -> v0.0.17-beta.3
+2025-12-23T00:36:40.1376364Z  * [new tag]         v0.0.17-beta.4          -> v0.0.17-beta.4
+2025-12-23T00:36:40.1377558Z  * [new tag]         v0.0.17-beta.5          -> v0.0.17-beta.5
+2025-12-23T00:36:40.1378734Z  * [new tag]         v0.0.2-beta             -> v0.0.2-beta
+2025-12-23T00:36:40.1379869Z  * [new tag]         v0.0.3-beta             -> v0.0.3-beta
+2025-12-23T00:36:40.1381001Z  * [new tag]         v0.0.4-beta             -> v0.0.4-beta
+2025-12-23T00:36:40.1382147Z  * [new tag]         v0.0.5-beta             -> v0.0.5-beta
+2025-12-23T00:36:40.1383520Z  * [new tag]         v0.0.6-beta             -> v0.0.6-beta
+2025-12-23T00:36:40.1384873Z  * [new tag]         v0.0.7-beta             -> v0.0.7-beta
+2025-12-23T00:36:40.1386293Z  * [new tag]         v0.0.8-beta             -> v0.0.8-beta
+2025-12-23T00:36:40.1387750Z  * [new tag]         v0.0.9-beta             -> v0.0.9-beta
+2025-12-23T00:36:40.1411491Z ##[endgroup]
+2025-12-23T00:36:40.1414633Z ##[group]Determining the checkout info
+2025-12-23T00:36:40.1418954Z [command]/usr/bin/git branch --list --remote origin/main
+2025-12-23T00:36:40.1445863Z   origin/main
+2025-12-23T00:36:40.1453051Z ##[endgroup]
+2025-12-23T00:36:40.1455604Z [command]/usr/bin/git sparse-checkout disable
+2025-12-23T00:36:40.1497703Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2025-12-23T00:36:40.1525947Z ##[group]Checking out the ref
+2025-12-23T00:36:40.1528391Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2025-12-23T00:36:40.2298173Z Switched to a new branch 'main'
+2025-12-23T00:36:40.2300653Z branch 'main' set up to track 'origin/main'.
+2025-12-23T00:36:40.2316879Z ##[endgroup]
+2025-12-23T00:36:40.2354821Z [command]/usr/bin/git log -1 --format=%H
+2025-12-23T00:36:40.2377908Z f45b5e5ac03042890cdc513b0b7a2219212dfa75
+2025-12-23T00:36:40.2595013Z ##[group]Run git config user.name "github-actions[bot]"
+2025-12-23T00:36:40.2596686Z [36;1mgit config user.name "github-actions[bot]"[0m
+2025-12-23T00:36:40.2598620Z [36;1mgit config user.email "github-actions[bot]@users.noreply.github.com"[0m
+2025-12-23T00:36:40.2638040Z shell: /usr/bin/bash -e {0}
+2025-12-23T00:36:40.2639138Z ##[endgroup]
+2025-12-23T00:36:40.2817327Z ##[group]Run git fetch origin beta:beta
+2025-12-23T00:36:40.2818607Z [36;1mgit fetch origin beta:beta[0m
+2025-12-23T00:36:40.2851842Z shell: /usr/bin/bash -e {0}
+2025-12-23T00:36:40.2852988Z ##[endgroup]
+2025-12-23T00:36:40.4530559Z From https://github.com/OsulivanAB/SpectrumFederation
+2025-12-23T00:36:40.4532940Z  * [new branch]      beta       -> beta
+2025-12-23T00:36:40.4663985Z ##[group]Run if [[ "false" == "true" ]]; then
+2025-12-23T00:36:40.4665315Z [36;1mif [[ "false" == "true" ]]; then[0m
+2025-12-23T00:36:40.4667231Z [36;1m  echo "[DRY RUN] Would merge beta into main with special handling for CHANGELOG.md and README.md"[0m
+2025-12-23T00:36:40.4669288Z [36;1m  git merge --no-commit --no-ff beta || true[0m
+2025-12-23T00:36:40.4670577Z [36;1m  git merge --abort || true[0m
+2025-12-23T00:36:40.4671638Z [36;1melse[0m
+2025-12-23T00:36:40.4673257Z [36;1m  # Merge beta into main, using 'ours' strategy for CHANGELOG.md and README.md[0m
+2025-12-23T00:36:40.4675339Z [36;1m  # This keeps main's versions, which will be regenerated by workflows[0m
+2025-12-23T00:36:40.4677040Z [36;1m  git merge -X ours --no-commit --no-ff beta[0m
+2025-12-23T00:36:40.4678478Z [36;1m  git checkout HEAD -- CHANGELOG.md README.md[0m
+2025-12-23T00:36:40.4679732Z [36;1m[0m
+2025-12-23T00:36:40.4680625Z [36;1m  # Check for conflicts in other files[0m
+2025-12-23T00:36:40.4682627Z [36;1m  if git diff --name-only --diff-filter=U | grep -v -E '(CHANGELOG\.md|README\.md)'; then[0m
+2025-12-23T00:36:40.4685089Z [36;1m    echo "::error ::Merge conflicts detected in files other than CHANGELOG.md and README.md"[0m
+2025-12-23T00:36:40.4687389Z [36;1m    echo "Please resolve conflicts manually and try again"[0m
+2025-12-23T00:36:40.4689316Z [36;1m    git merge --abort[0m
+2025-12-23T00:36:40.4690346Z [36;1m    exit 1[0m
+2025-12-23T00:36:40.4691362Z [36;1m  fi[0m
+2025-12-23T00:36:40.4692149Z [36;1m[0m
+2025-12-23T00:36:40.4693391Z [36;1m  git commit -m "chore: promote beta to main [skip ci]"[0m
+2025-12-23T00:36:40.4694724Z [36;1mfi[0m
+2025-12-23T00:36:40.4730720Z shell: /usr/bin/bash -e {0}
+2025-12-23T00:36:40.4731721Z ##[endgroup]
+2025-12-23T00:36:40.6142552Z Auto-merging CHANGELOG.md
+2025-12-23T00:36:40.6145024Z Automatic merge went well; stopped before committing as requested
+2025-12-23T00:36:40.7991394Z [main 67245db] chore: promote beta to main [skip ci]
+2025-12-23T00:36:40.8214439Z ##[group]Run actions/setup-python@v5
+2025-12-23T00:36:40.8215521Z with:
+2025-12-23T00:36:40.8216288Z   python-version: 3.11
+2025-12-23T00:36:40.8217166Z   check-latest: false
+2025-12-23T00:36:40.8218292Z   token: ***
+2025-12-23T00:36:40.8219104Z   update-environment: true
+2025-12-23T00:36:40.8220066Z   allow-prereleases: false
+2025-12-23T00:36:40.8221019Z   freethreaded: false
+2025-12-23T00:36:40.8221869Z ##[endgroup]
+2025-12-23T00:36:40.9920777Z ##[group]Installed versions
+2025-12-23T00:36:41.0040818Z Successfully set up CPython (3.11.14)
+2025-12-23T00:36:41.0044063Z ##[endgroup]
+2025-12-23T00:36:41.0174126Z ##[group]Run BETA_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+2025-12-23T00:36:41.0177534Z [36;1mBETA_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)[0m
+2025-12-23T00:36:41.0180050Z [36;1mSTABLE_VERSION=$(echo "$BETA_VERSION" | sed 's/-beta\.[0-9]*$//')[0m
+2025-12-23T00:36:41.0181436Z [36;1m[0m
+2025-12-23T00:36:41.0182519Z [36;1mecho "Beta version: $BETA_VERSION"[0m
+2025-12-23T00:36:41.0183755Z [36;1mecho "Stable version: $STABLE_VERSION"[0m
+2025-12-23T00:36:41.0185185Z [36;1mecho "stable_version=$STABLE_VERSION" >> $GITHUB_OUTPUT[0m
+2025-12-23T00:36:41.0186484Z [36;1m[0m
+2025-12-23T00:36:41.0187298Z [36;1mif [[ "false" == "true" ]]; then[0m
+2025-12-23T00:36:41.0188632Z [36;1m  echo "[DRY RUN] Would update TOC version to $STABLE_VERSION"[0m
+2025-12-23T00:36:41.0189941Z [36;1melse[0m
+2025-12-23T00:36:41.0191404Z [36;1m  sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation/SpectrumFederation.toc[0m
+2025-12-23T00:36:41.0193570Z [36;1m  git add SpectrumFederation/SpectrumFederation.toc[0m
+2025-12-23T00:36:41.0195237Z [36;1m  git commit -m "chore: update version to $STABLE_VERSION [skip ci]"[0m
+2025-12-23T00:36:41.0196619Z [36;1mfi[0m
+2025-12-23T00:36:41.0386056Z shell: /usr/bin/bash -e {0}
+2025-12-23T00:36:41.0387005Z env:
+2025-12-23T00:36:41.0387997Z   pythonLocation: /opt/hostedtoolcache/Python/3.11.14/x64
+2025-12-23T00:36:41.0389645Z   PKG_CONFIG_PATH: /opt/hostedtoolcache/Python/3.11.14/x64/lib/pkgconfig
+2025-12-23T00:36:41.0391283Z   Python_ROOT_DIR: /opt/hostedtoolcache/Python/3.11.14/x64
+2025-12-23T00:36:41.0392855Z   Python2_ROOT_DIR: /opt/hostedtoolcache/Python/3.11.14/x64
+2025-12-23T00:36:41.0394343Z   Python3_ROOT_DIR: /opt/hostedtoolcache/Python/3.11.14/x64
+2025-12-23T00:36:41.0395852Z   LD_LIBRARY_PATH: /opt/hostedtoolcache/Python/3.11.14/x64/lib
+2025-12-23T00:36:41.0397127Z ##[endgroup]
+2025-12-23T00:36:41.0579124Z Beta version: 0.0.17
+2025-12-23T00:36:41.0580642Z Stable version: 0.0.17
+2025-12-23T00:36:41.1220608Z On branch main
+2025-12-23T00:36:41.1222150Z Your branch is ahead of 'origin/main' by 11 commits.
+2025-12-23T00:36:41.1223807Z   (use "git push" to publish your local commits)
+2025-12-23T00:36:41.1225411Z 
+2025-12-23T00:36:41.1226092Z nothing to commit, working tree clean
+2025-12-23T00:36:41.1239158Z ##[error]Process completed with exit code 1.
+2025-12-23T00:36:41.1482833Z Post job cleanup.
+2025-12-23T00:36:41.2476636Z [command]/usr/bin/git version
+2025-12-23T00:36:41.2529388Z git version 2.52.0
+2025-12-23T00:36:41.2596496Z Temporarily overriding HOME='/home/runner/work/_temp/31b0d30c-3db0-4ca1-9638-decf817cf7db' before making global git config changes
+2025-12-23T00:36:41.2599930Z Adding repository directory to the temporary git global config as a safe directory
+2025-12-23T00:36:41.2604371Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/SpectrumFederation/SpectrumFederation
+2025-12-23T00:36:41.2651995Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2025-12-23T00:36:41.2693458Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2025-12-23T00:36:41.2954440Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2025-12-23T00:36:41.2978985Z http.https://github.com/.extraheader
+2025-12-23T00:36:41.2996775Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2025-12-23T00:36:41.3034323Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2025-12-23T00:36:41.3284386Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2025-12-23T00:36:41.3319810Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2025-12-23T00:36:41.3709853Z Evaluate and set job outputs
+2025-12-23T00:36:41.3718663Z Set output 'stable_version'
+2025-12-23T00:36:41.3721351Z Cleaning up orphan processes

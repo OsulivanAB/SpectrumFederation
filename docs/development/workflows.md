@@ -323,8 +323,6 @@ Both `main` and `beta` branches are protected with the following rules:
 - No force pushes
 - PAT_TOKEN bypasses protection for automated commits
 
-See [GitHub Configuration](github-configuration.md) for setup details.
-
 ---
 
 ## Secrets Configuration
@@ -339,8 +337,6 @@ Optional secrets (for future use):
 
 - **BLIZZARD_API_ID**: OAuth2 Client ID (currently unused)
 - **BLIZZARD_API_SECRET**: OAuth2 Client Secret (currently unused)
-
-See [GitHub Configuration](github-configuration.md) for detailed setup.
 
 ---
 
@@ -429,7 +425,6 @@ Potential enhancements for the workflow system:
 
 ## Additional Resources
 
-- [GitHub Configuration](github-configuration.md) - Setup guide for secrets and branch protection
 - [MkDocs Documentation](https://www.mkdocs.org/) - Documentation framework
 - [GitHub Actions Documentation](https://docs.github.com/en/actions) - Workflow syntax and features
 
