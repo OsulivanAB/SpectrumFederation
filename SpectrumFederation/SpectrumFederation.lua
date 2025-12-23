@@ -44,23 +44,14 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
         -- Send a quick message saying that Addon is Initialized
         print("|cFF00FF00" .. addonName .. "|r: Online. Type /sf to open settings.")
 
+        -- Initialize Slash Commands
+        if SF.InitializeSlashCommands then
+            SF:InitializeSlashCommands()
+        else
+            if SF.Debug then SF.Debug:Warn("SLASH", "InitializeSlashCommands function not found") end
+        end
+
         -- Unregister the Event after initialization
         self:UnregisterEvent("PLAYER_LOGIN")
     end
 end)
-
--- Register Slash Command '/sf'
-SLASH_SPECFED1 = "/sf"
-SlashCmdList["SPECFED"] = function(msg)
-    
-    if SF.SettingsCategory and SF.SettingsPanel then
-        -- Get the ID for the Settings Category 
-        local categoryID = SF.SettingsCategory:GetID()
-        -- Open the Settings to our Addon's Category
-        Settings.OpenToCategory(categoryID)
-    else
-        print("|cFF00FF00" .. addonName .. "|r: Settings UI is not available.")
-        SF.Debug:Warn("SETTINGS_UI", "SettingsCategory or SettingsPanel not found")
-    end
-
-end
