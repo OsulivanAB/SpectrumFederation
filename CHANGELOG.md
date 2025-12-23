@@ -12,7 +12,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 ## [Unreleased - Beta]
 
 ### Changed
-- Updated addon version to 0.0.18-beta.1 in the TOC file.
+- Updated addon version to 0.0.19-beta.1 in the TOC file.
+- Enhanced addon description in the TOC file to better reflect features like loot profile management and guild coordination tools.
+
+### Added
+- Added links to the project website and documentation in the TOC file.
 
 ## [0.0.14-beta.1] - Unknown
 
