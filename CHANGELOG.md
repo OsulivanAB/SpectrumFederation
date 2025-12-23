@@ -6,7 +6,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 ## [Unreleased - Beta]
 
 ### Fixed
-- Adjusted documentation build process to correctly check out the beta branch during dry-run mode.
+- Removed trailing spaces from workflow file to ensure cleaner formatting.
 
 ## [0.0.14-beta.1] - Unknown
 
