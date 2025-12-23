@@ -1,24 +1,278 @@
-/* Custom admonition types for Spectrum Federation docs */
+/* =============================================================================
+   Spectrum Federation - Theme Customization
+   WoW-inspired color palette applied to standard Material theme
+   ============================================================================= */
 
-/* Under Construction admonition */
-.md-typeset .admonition.under-construction,
-.md-typeset details.under-construction {
-  border-color: rgb(255, 152, 0);
-}
-
-.md-typeset .under-construction > .admonition-title,
-.md-typeset .under-construction > summary {
-  background-color: rgba(255, 152, 0, 0.1);
-  border-color: rgb(255, 152, 0);
-}
-
-.md-typeset .under-construction > .admonition-title::before,
-.md-typeset .under-construction > summary::before {
-  background-color: rgb(255, 152, 0);
-  -webkit-mask-image: var(--md-admonition-icon--under-construction);
-  mask-image: var(--md-admonition-icon--under-construction);
-}
+/* ============================
+   Custom Color Palette
+   ============================ */
 
 :root {
-  --md-admonition-icon--under-construction: url('data:image/svg+xml;charset=utf-8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><text x="1" y="20" font-size="20">🚧</text></svg>');
+  /* Primary purple/indigo gradient colors inspired by WoW magic */
+  --sf-primary: #6366f1;
+  --sf-primary-light: #818cf8;
+  --sf-primary-dark: #4f46e5;
+  --sf-accent: #a78bfa;
+  --sf-accent-hover: #c4b5fd;
+  
+  /* Gradient for special elements */
+  --sf-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  --sf-gradient-subtle: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%);
+}
+
+/* ============================
+   Header Customization
+   ============================ */
+
+.md-header {
+  background: var(--sf-gradient);
+  box-shadow: none !important;
+}
+
+.md-header__title {
+  font-weight: 700;
+}
+
+.md-header__button:hover {
+  opacity: 0.8;
+}
+
+/* ============================
+   Navigation Tabs - Seamless with header
+   ============================ */
+
+.md-tabs {
+  background: var(--sf-gradient);
+  box-shadow: none !important;
+  border: none !important;
+  border-top: none !important;
+  border-bottom: none !important;
+}
+
+.md-tabs__link {
+  font-weight: 600;
+  opacity: 0.8;
+  transition: opacity 0.2s;
+}
+
+.md-tabs__link:hover {
+  opacity: 1;
+}
+
+.md-tabs__link--active {
+  opacity: 1;
+  color: white;
+}
+
+/* ============================
+   Sidebar Navigation
+   ============================ */
+
+.md-nav__title {
+  background: var(--sf-gradient-subtle);
+  font-weight: 700;
+  border-radius: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.md-nav__link--active {
+  color: var(--sf-primary) !important;
+  font-weight: 600;
+}
+
+.md-nav__link:hover {
+  color: var(--sf-accent) !important;
+}
+
+/* ============================
+   Content Enhancements
+   ============================ */
+
+/* Hero heading */
+.md-typeset h1:first-of-type {
+  background: var(--sf-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  font-weight: 800;
+  font-size: 2.5rem;
+}
+
+/* Section headings with accent color */
+.md-typeset h2 {
+  color: var(--sf-primary);
+  border-bottom: 3px solid var(--sf-primary);
+  padding-bottom: 0.5rem;
+  font-weight: 700;
+}
+
+.md-typeset h3 {
+  color: var(--sf-primary-dark);
+  font-weight: 600;
+}
+
+/* Links */
+.md-typeset a {
+  color: var(--sf-accent);
+  transition: color 0.2s;
+}
+
+.md-typeset a:hover {
+  color: var(--sf-accent-hover);
+  text-decoration: underline;
+}
+
+/* ============================
+   Code Blocks
+   ============================ */
+
+.md-typeset pre > code {
+  border-left: 4px solid var(--sf-primary);
+}
+
+.md-typeset code {
+  border: 1px solid var(--sf-primary-light);
+  background-color: rgba(99, 102, 241, 0.05);
+}
+
+/* Copy button styling */
+.md-clipboard {
+  color: var(--sf-accent);
+}
+
+.md-clipboard:hover {
+  color: var(--sf-accent-hover);
+}
+
+/* ============================
+   Admonitions
+   ============================ */
+
+.md-typeset .admonition {
+  border-left-width: 4px;
+  border-radius: 0.5rem;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.md-typeset .admonition.note {
+  border-left-color: var(--sf-primary);
+}
+
+.md-typeset .admonition.note > .admonition-title {
+  background-color: rgba(99, 102, 241, 0.1);
+}
+
+.md-typeset .admonition.tip > .admonition-title {
+  background-color: rgba(16, 185, 129, 0.1);
+}
+
+.md-typeset .admonition.warning > .admonition-title {
+  background-color: rgba(245, 158, 11, 0.1);
+}
+
+/* ============================
+   Tables
+   ============================ */
+
+.md-typeset table:not([class]) {
+  border-radius: 0.5rem;
+  overflow: hidden;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.md-typeset table:not([class]) th {
+  background: var(--sf-gradient);
+  color: white;
+  font-weight: 600;
+}
+
+.md-typeset table:not([class]) tr:hover {
+  background-color: rgba(99, 102, 241, 0.05);
+}
+
+/* ============================
+   Search
+   ============================ */
+
+.md-search__form {
+  background-color: rgba(255, 255, 255, 0.15);
+  border-radius: 2rem;
+}
+
+.md-search__form:hover {
+  background-color: rgba(255, 255, 255, 0.2);
+}
+
+.md-search__input::placeholder {
+  color: rgba(255, 255, 255, 0.8);
+}
+
+/* ============================
+   Buttons & Interactive Elements
+   ============================ */
+
+.md-button {
+  background: var(--sf-gradient);
+  border: none;
+  color: white;
+  font-weight: 600;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.md-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+}
+
+.md-button--primary {
+  background: var(--sf-gradient);
+}
+
+/* ============================
+   Footer
+   ============================ */
+
+.md-footer {
+  background: linear-gradient(135deg, #4f46e5 0%, #6b21a8 100%);
+}
+
+.md-footer-meta {
+  background-color: rgba(0, 0, 0, 0.1);
+}
+
+/* ============================
+   Scrollbar (WebKit browsers)
+   ============================ */
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--sf-primary-light);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--sf-primary);
+}
+
+/* ============================
+   Smooth Transitions
+   ============================ */
+
+* {
+  transition-property: background-color, border-color, color, transform, box-shadow;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
+}
+
+/* Disable transitions on theme toggle to avoid flash */
+[data-md-color-switching] * {
+  transition: none !important;
 }
