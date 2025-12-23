@@ -1,14 +1,6 @@
 -- Grab the namespace
 local addonName, SF = ...
 
--- Helper Function to get the current player's info
-local function GetPlayerInfo()
-    local name = UnitName("player")
-    local realm = GetRealmName()
-    if SF.Debug then SF.Debug:Verbose("PROFILES", "Retrieved player info: %s-%s", name, realm) end
-    return name, realm
-end
-
 -- CREATE: Add a new profile
 function SF:CreateNewLootProfile(profileName)
 
@@ -27,7 +19,7 @@ function SF:CreateNewLootProfile(profileName)
     end
 
     -- Construct the Profile Object
-    local playerName, realmName = GetPlayerInfo()
+    local playerName, realmName = SF:GetPlayerInfo()
     local adminKey = playerName .. "-" .. realmName
 
     local newProfile = {
