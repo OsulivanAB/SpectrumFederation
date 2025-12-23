@@ -5,9 +5,8 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ## [Unreleased - Beta]
 
-### Fixed
-- Skip branch sync verification in dry-run mode to prevent unnecessary checks.
-- Display commit count during dry-run mode for better visibility.
+### Changed
+- Updated addon version to 0.0.18-beta.1 in the TOC file.
 
 ## [0.0.14-beta.1] - Unknown
 
