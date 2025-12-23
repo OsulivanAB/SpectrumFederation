@@ -15,8 +15,7 @@ modules/SlashCommands.lua
 modules/LootHelper/LootProfiles.lua
 modules/LootHelper/LootHelper.lua
 modules/LootHelper/Settings.lua
-modules/LootHelper/UserInterface.lua
+modules/LootHelper/ui.lua
 ui/Settings.lua
-ui/LootHelper.lua
 modules/Core.lua
 SpectrumFederation.lua
