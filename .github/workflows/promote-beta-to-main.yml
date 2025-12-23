@@ -340,13 +340,16 @@ jobs:
 
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
             echo "[DRY RUN] Would fast-forward beta to main"
-            git log --oneline main ^beta | head -n 10
+            COMMITS=$(git rev-list --count main..beta)
+            echo "Beta is $COMMITS commits ahead of main"
+            git log --oneline main..beta | head -n 10
           else
             git merge --ff-only main
             git push origin beta
           fi
 
       - name: Verify branches are synced
+        if: ${{ !inputs.dry_run }}
         run: |
           git fetch origin
           DIFF=$(git rev-list --count beta...main)
