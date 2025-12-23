@@ -270,8 +270,14 @@ jobs:
         run: pip install -r requirements-docs.txt
 
       - name: Build documentation
-        if: ${{ !inputs.dry_run }}
-        run: mkdocs build --clean --strict
+        run: |
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
+            echo "[DRY RUN] Testing documentation build..."
+            mkdocs build --clean --strict
+            echo "[DRY RUN] Documentation build successful, but not deploying"
+          else
+            mkdocs build --clean --strict
+          fi
 
       - name: Upload Pages artifact
         if: ${{ !inputs.dry_run }}
