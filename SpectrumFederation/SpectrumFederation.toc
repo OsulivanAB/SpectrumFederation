@@ -10,9 +10,9 @@
 
 ## Core files
 SpectrumFederation.lua
-modules/debug.lua
-modules/core.lua
-modules/slash_commands.lua
+modules/Debug.lua
+modules/Core.lua
+modules/SlashCommands.lua
 modules/LootProfiles.lua
-modules/settings_ui.lua
-settings/loot_helper.lua
+modules/SettingsUI.lua
+settings/LootHelper.lua
