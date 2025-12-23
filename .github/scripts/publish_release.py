@@ -7,9 +7,70 @@ Creates a zip file with proper structure and publishes to GitHub Releases.
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+
+def get_changelog_for_version(version):
+    """Extract changelog content for a specific version from CHANGELOG.md.
+    
+    Args:
+        version: Version string (e.g., '0.0.18' or '0.0.18-beta.1')
+        
+    Returns:
+        String containing the changelog section for this version, or None if not found.
+    """
+    changelog_path = Path("CHANGELOG.md")
+    
+    if not changelog_path.exists():
+        print("[publish-release] Warning: CHANGELOG.md not found")
+        return None
+    
+    try:
+        with open(changelog_path, "r") as f:
+            content = f.read()
+        
+        # For beta versions, try both the exact version and the [Unreleased - Beta] section
+        if "-beta" in version:
+            # First try to find exact version match
+            pattern = rf"^## \[{re.escape(version)}\].*?$"
+            match = re.search(pattern, content, re.MULTILINE)
+            
+            if not match:
+                # Fall back to [Unreleased - Beta] section
+                pattern = r"^## \[Unreleased - Beta\].*?$"
+                match = re.search(pattern, content, re.MULTILINE)
+        else:
+            # For stable releases, look for exact version
+            pattern = rf"^## \[{re.escape(version)}\].*?$"
+            match = re.search(pattern, content, re.MULTILINE)
+        
+        if not match:
+            print(f"[publish-release] Warning: No changelog entry found for version {version}")
+            return None
+        
+        # Find the start of this section
+        start_pos = match.start()
+        
+        # Find the next version header (or end of file)
+        next_section = re.search(r"^## \[", content[start_pos + len(match.group(0)):], re.MULTILINE)
+        
+        if next_section:
+            end_pos = start_pos + len(match.group(0)) + next_section.start()
+        else:
+            end_pos = len(content)
+        
+        # Extract the section (including the header)
+        changelog_section = content[start_pos:end_pos].strip()
+        
+        print(f"[publish-release] ✓ Extracted changelog for version {version}")
+        return changelog_section
+        
+    except Exception as e:
+        print(f"[publish-release] Warning: Failed to read changelog: {e}")
+        return None
 
 
 def create_addon_zip(addon_name, version):
@@ -51,11 +112,23 @@ def create_github_release(version, zip_path, repo, is_prerelease=False, dry_run=
     tag_name = f"v{version}"
     release_name = f"Release {version}"
     
-    # Determine release notes
+    # Extract changelog content for this version
+    changelog = get_changelog_for_version(version)
+    
+    # Build release notes with embedded changelog
     if "-beta" in version:
-        notes = f"Beta release {version}\n\nSee [CHANGELOG.md](https://github.com/{repo}/blob/beta/CHANGELOG.md) for details."
+        notes = f"Beta release {version}\n\n"
+        branch = "beta"
     else:
-        notes = f"Stable release {version}\n\nSee [CHANGELOG.md](https://github.com/{repo}/blob/main/CHANGELOG.md) for details."
+        notes = f"Stable release {version}\n\n"
+        branch = "main"
+    
+    # Add changelog content if available
+    if changelog:
+        notes += changelog + "\n\n"
+    
+    # Add link to full changelog
+    notes += f"[View Full Changelog](https://github.com/{repo}/blob/{branch}/CHANGELOG.md)"
     
     if dry_run:
         print("[publish-release] DRY RUN - Would create release:")
