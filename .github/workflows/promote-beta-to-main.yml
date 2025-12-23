@@ -360,26 +360,43 @@ jobs:
   summary:
     name: Promotion Summary
     runs-on: ubuntu-latest
-    needs: [merge-beta-to-main, fast-forward-beta]
+    needs: [pre-merge-validation, merge-beta-to-main, update-changelog-main, update-readme-main, deploy-docs, publish-stable-release, fast-forward-beta]
     if: always()
 
     steps:
       - name: Summary
         run: |
-          echo "## Promotion Complete 🎉" >> $GITHUB_STEP_SUMMARY
+          # Determine status emojis based on job results
+          VALIDATION_STATUS="${{ needs.pre-merge-validation.result == 'success' && '✅' || '❌' }}"
+          MERGE_STATUS="${{ needs.merge-beta-to-main.result == 'success' && '✅' || '❌' }}"
+          CHANGELOG_STATUS="${{ needs.update-changelog-main.result == 'success' && '✅' || '❌' }}"
+          README_STATUS="${{ needs.update-readme-main.result == 'success' && '✅' || '❌' }}"
+          DOCS_STATUS="${{ needs.deploy-docs.result == 'success' && '✅' || '❌' }}"
+          RELEASE_STATUS="${{ needs.publish-stable-release.result == 'success' && '✅' || '❌' }}"
+          FASTFORWARD_STATUS="${{ needs.fast-forward-beta.result == 'success' && '✅' || '❌' }}"
+          
+          # Determine overall status
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            TITLE="## Promotion Failed ❌"
+          elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            TITLE="## Promotion Cancelled ⚠️"
+          else
+            TITLE="## Promotion Complete 🎉"
+          fi
+          
+          echo "$TITLE" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Stable Version**: ${{ needs.merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
           echo "**Interface Version**: ${{ needs.merge-beta-to-main.outputs.interface }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Actions Completed:" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Merged beta → main" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Removed -beta suffix" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Updated Interface version" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Updated CHANGELOG.md" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Updated README badges" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Deployed documentation" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Published stable release" >> $GITHUB_STEP_SUMMARY
-          echo "- ✅ Fast-forwarded beta to main" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results:" >> $GITHUB_STEP_SUMMARY
+          echo "- $VALIDATION_STATUS Pre-merge validation" >> $GITHUB_STEP_SUMMARY
+          echo "- $MERGE_STATUS Merged beta → main" >> $GITHUB_STEP_SUMMARY
+          echo "- $CHANGELOG_STATUS Updated CHANGELOG.md" >> $GITHUB_STEP_SUMMARY
+          echo "- $README_STATUS Updated README badges" >> $GITHUB_STEP_SUMMARY
+          echo "- $DOCS_STATUS Deployed documentation" >> $GITHUB_STEP_SUMMARY
+          echo "- $RELEASE_STATUS Published stable release" >> $GITHUB_STEP_SUMMARY
+          echo "- $FASTFORWARD_STATUS Fast-forwarded beta to main" >> $GITHUB_STEP_SUMMARY
 
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
             echo "" >> $GITHUB_STEP_SUMMARY
