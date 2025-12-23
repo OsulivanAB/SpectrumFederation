@@ -374,7 +374,7 @@ jobs:
           DOCS_STATUS="${{ needs.deploy-docs.result == 'success' && '✅' || '❌' }}"
           RELEASE_STATUS="${{ needs.publish-stable-release.result == 'success' && '✅' || '❌' }}"
           FASTFORWARD_STATUS="${{ needs.fast-forward-beta.result == 'success' && '✅' || '❌' }}"
-          
+
           # Determine overall status
           if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
             TITLE="## Promotion Failed ❌"
@@ -383,7 +383,7 @@ jobs:
           else
             TITLE="## Promotion Complete 🎉"
           fi
-          
+
           echo "$TITLE" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Stable Version**: ${{ needs.merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
