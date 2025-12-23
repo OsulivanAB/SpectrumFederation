@@ -2,6 +2,8 @@
 local addonName, SF = ...
 
 -- CREATE: Add a new profile
+-- @param profileName: The name of the new profile to create
+-- @return: none
 function SF:CreateNewLootProfile(profileName)
 
     -- Input Validation
@@ -42,6 +44,8 @@ function SF:CreateNewLootProfile(profileName)
 end
 
 -- UPDATE: Set the active profile
+-- @param profileName: The name of the profile to set as active
+-- @return: none
 function SF:SetActiveLootProfile(profileName)
 
     -- Input Validation
@@ -66,6 +70,8 @@ function SF:SetActiveLootProfile(profileName)
 end
 
 -- DELETE: Remove a profile
+-- @param profileName: The name of the profile to delete
+-- @return: none
 function SF:DeleteProfile(profileName)
 
     if self.db.lootProfiles[profileName] then

@@ -27,11 +27,11 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.Debug:Info("ADDON", "SpectrumFederation addon loaded")
         end
 
-        -- Initialize the Loot Database
-        if SF:InitializeLootDatabase() then
+        -- Initialize Loot Databases
+        if SF.InitializeLootDatabase then
             SF:InitializeLootDatabase()
         else
-            if SF.Debug then SF.Debug:Info("DATABASE", "No InitializeLootDatabase function found") end
+            if SF.Debug then SF.Debug:Warn("DATABASE", "InitializeLootDatabase function not found") end
         end
 
         -- Create the Settings UI
@@ -54,4 +54,17 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
         -- Unregister the Event after initialization
         self:UnregisterEvent("PLAYER_LOGIN")
     end
+end)
+
+-- Create an Event Frame for Addon Loaded
+local AddonLoadedFrame = CreateFrame("Frame")
+-- Register the ADDON_LOADED Event
+AddonLoadedFrame:RegisterEvent("ADDON_LOADED")
+-- Script to run when ADDON_LOADED Event fires
+AddonLoadedFrame:SetScript("OnEvent", function(self, event, addonName)
+
+    -- Ensure the loaded addon is SpectrumFederation
+    if addonName ~= "SpectrumFederation" then return end
+
+    SF.LootWindow:Create()
 end)

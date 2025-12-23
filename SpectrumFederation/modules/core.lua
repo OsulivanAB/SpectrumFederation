@@ -9,3 +9,24 @@ function SF:GetPlayerInfo()
     if SF.Debug then SF.Debug:Verbose("PROFILES", "Retrieved player info: %s-%s", name, realm) end
     return name, realm
 end
+
+-- Database Initialization
+function SF:InitializeLootDatabase()
+
+    -- Initialize main database table if it doesn't exist
+    if not SpectrumFederationDB then
+        SpectrumFederationDB = {}
+        if SF.Debug then SF.Debug:Info("DATABASE", "Initialized main SpectrumFederationDB database") end
+    else
+        if SF.Debug then SF.Debug:Info("DATABASE", "Loaded existing SpectrumFederationDB database") end
+    end
+
+    SF.DB = SpectrumFederationDB
+
+    -- Initialize Loot Helper Database
+    if SF.InitializeLootHelperDatabase then
+        SF:InitializeLootHelperDatabase()
+    else
+        if SF.Debug then SF.Debug:Warn("DATABASE", "InitializeLootHelperDatabase function not found") end
+    end
+end

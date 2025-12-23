@@ -6,15 +6,17 @@
 ## IconTexture: Interface\AddOns\SpectrumFederation\Media\Icons\SpectrumFederationIcon
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
 ## X-Documentation: https://osullivanab.github.io/SpectrumFederation/
-## SavedVariables: SpectrumLootDB, SpectrumFederationDebugDB
+## SavedVariables: SpectrumFederationDB, SpectrumFederationDebugDB
 
 ## Core files
-SpectrumFederation.lua
 modules/Debug.lua
-modules/Core.lua
+modules/LootHelper/Database.lua
 modules/SlashCommands.lua
-modules/LootProfiles.lua
+modules/LootHelper/LootProfiles.lua
+modules/LootHelper/LootHelper.lua
+modules/LootHelper/Settings.lua
+modules/LootHelper/UserInterface.lua
 ui/Settings.lua
 ui/LootHelper.lua
-settings/LootHelper.lua
-modules/LootHelper.lua
+modules/Core.lua
+SpectrumFederation.lua
