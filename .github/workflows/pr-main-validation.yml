@@ -8,6 +8,9 @@ on:
       - 'SpectrumFederation/**'
       - '.github/scripts/**'
       - '.github/workflows/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.txt'
 
 concurrency:
   group: main-validation-${{ github.ref }}
@@ -85,3 +88,22 @@ jobs:
           fi
 
           echo "✓ Version format is correct for main branch: $VERSION"
+
+  validate-docs:
+    name: Validate Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install MkDocs dependencies
+        run: pip install -r requirements-docs.txt
+
+      - name: Validate documentation
+        run: python3 .github/scripts/validate_docs.py

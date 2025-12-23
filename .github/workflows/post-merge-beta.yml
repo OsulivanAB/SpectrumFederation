@@ -40,6 +40,12 @@ jobs:
       - name: Validate packaging
         run: python3 .github/scripts/validate_packaging.py
 
+      - name: Install MkDocs dependencies
+        run: pip install -r requirements-docs.txt
+
+      - name: Validate documentation
+        run: python3 .github/scripts/validate_docs.py
+
   extract-version:
     name: Extract Version Info
     runs-on: ubuntu-latest

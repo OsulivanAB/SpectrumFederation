@@ -48,6 +48,12 @@ jobs:
       - name: Validate packaging
         run: python3 .github/scripts/validate_packaging.py
 
+      - name: Install MkDocs dependencies
+        run: pip install -r requirements-docs.txt
+
+      - name: Validate documentation
+        run: python3 .github/scripts/validate_docs.py
+
       - name: Verify beta version format
         run: |
           VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)

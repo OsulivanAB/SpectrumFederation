@@ -8,6 +8,7 @@ repo_url: https://github.com/OsulivanAB/SpectrumFederation
 
 theme:
   name: material
+  favicon: assets/favicon.png
   palette:
     # Light mode
     - scheme: default

@@ -8,6 +8,9 @@ on:
       - 'SpectrumFederation/**'
       - '.github/scripts/**'
       - '.github/workflows/**'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements-docs.txt'
 
 concurrency:
   group: beta-validation-${{ github.ref }}
@@ -104,3 +107,22 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 .github/scripts/check_duplicate_release.py "${{ steps.version.outputs.version }}"
+
+  validate-docs:
+    name: Validate Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install MkDocs dependencies
+        run: pip install -r requirements-docs.txt
+
+      - name: Validate documentation build
+        run: python3 .github/scripts/validate_docs.py
