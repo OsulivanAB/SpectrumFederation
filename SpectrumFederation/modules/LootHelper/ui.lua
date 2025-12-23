@@ -75,6 +75,26 @@ local function SetEnabledVisuals(frame, enabled)
     frame.disabledOverlay:SetShown(not enabled)
 end
 
+-- Public method to set the enabled state of the Loot Helper
+-- @param enabled: Boolean indicating whether to enable or disable the Loot Helper
+-- @return: none
+function LootWindow:SetEnabled(enabled)
+    -- Update database
+    if SF.lootHelperDB and SF.lootHelperDB.windowSettings then
+        SF.lootHelperDB.windowSettings.enabled = enabled
+    end
+    
+    -- Update frame visuals if frame exists
+    if self.frame then
+        SetEnabledVisuals(self.frame, enabled)
+    end
+    
+    -- Log the change
+    if SF.Debug then
+        SF.Debug:Info("LOOT_HELPER", "Loot Helper %s", enabled and "enabled" or "disabled")
+    end
+end
+
 function LootWindow:Create()
 
     -- Check if frame already exists

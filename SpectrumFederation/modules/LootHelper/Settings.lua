@@ -70,11 +70,45 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
         end
     end)
 
-    -- TODO: Add Enable/Disable Loot Helper Checkbox here. Should Enable/Disable visibility of SF.LootWindow
+    -- Enable/Disable Loot Helper Checkbox
+    local enableCheckbox = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
+    enableCheckbox:SetPoint("TOPLEFT", subTitle, "BOTTOMLEFT", 0, -20)
+    enableCheckbox:SetSize(24, 24)
+    
+    -- Checkbox Label
+    local enableLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    enableLabel:SetPoint("LEFT", enableCheckbox, "RIGHT", 5, 0)
+    enableLabel:SetText("Enable Loot Helper")
+    
+    -- Initialize checkbox state from database
+    if SF.lootHelperDB and SF.lootHelperDB.windowSettings then
+        enableCheckbox:SetChecked(SF.lootHelperDB.windowSettings.enabled)
+    end
+    
+    -- OnClick handler
+    enableCheckbox:SetScript("OnClick", function(self)
+        local enabled = self:GetChecked()
+        
+        -- Update database and frame visuals
+        if SF.LootWindow and SF.LootWindow.SetEnabled then
+            SF.LootWindow:SetEnabled(enabled)
+        else
+            -- Fallback if LootWindow not yet loaded
+            if SF.lootHelperDB and SF.lootHelperDB.windowSettings then
+                SF.lootHelperDB.windowSettings.enabled = enabled
+            end
+            if SF.Debug then
+                SF.Debug:Info("LOOT_HELPER", "Loot Helper %s (window not yet created)", enabled and "enabled" or "disabled")
+            end
+        end
+        
+        -- Print feedback to user
+        print("|cFF00FF00" .. addonName .. "|r: Loot Helper " .. (enabled and "enabled" or "disabled") .. ".")
+    end)
 
     -- Label for the Dropdown
     local profileLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    profileLabel:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 10, -50)
+    profileLabel:SetPoint("TOPLEFT", enableCheckbox, "BOTTOMLEFT", 0, -20)
     profileLabel:SetText("Select Active Profile:")
 
     -- Dropdown for selecting active profile
