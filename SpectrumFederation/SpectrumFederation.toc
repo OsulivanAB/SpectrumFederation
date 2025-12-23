@@ -1,4 +1,4 @@
-## Interface: 110207
+## Interface: 120001
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
 ## Version: 0.0.19-beta.1
@@ -6,7 +6,7 @@
 ## IconTexture: Interface\AddOns\SpectrumFederation\Media\Icons\SpectrumFederationIcon
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
 ## X-Documentation: https://osullivanab.github.io/SpectrumFederation/
-## SavedVariables: SpectrumFederationDB, SpectrumLootDB, SpectrumDebugDB
+## SavedVariables: SpectrumLootDB, SpectrumFederationDebugDB
 
 ## Core files
 SpectrumFederation.lua
@@ -14,5 +14,7 @@ modules/Debug.lua
 modules/Core.lua
 modules/SlashCommands.lua
 modules/LootProfiles.lua
-modules/SettingsUI.lua
+ui/Settings.lua
+ui/LootHelper.lua
 settings/LootHelper.lua
+modules/LootHelper.lua

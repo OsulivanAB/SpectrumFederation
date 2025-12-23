@@ -2,6 +2,7 @@
 local addonName, SF = ...
 
 -- Get current player's name and realm
+-- @return: playerName (string), realmName (string)
 function SF:GetPlayerInfo()
     local name = UnitName("player")
     local realm = GetRealmName()
