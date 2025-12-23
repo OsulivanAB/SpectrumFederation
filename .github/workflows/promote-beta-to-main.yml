@@ -316,9 +316,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           if [[ "${{ inputs.dry_run }}" == "true" ]]; then
-            python3 .github/scripts/publish_release.py "${{ needs.merge-beta-to-main.outputs.stable_version }}" --dry-run
+            python3 .github/scripts/publish_release.py "${{ needs.merge-beta-to-main.outputs.stable_version }}" --interface "${{ needs.merge-beta-to-main.outputs.interface }}" --dry-run
           else
-            python3 .github/scripts/publish_release.py "${{ needs.merge-beta-to-main.outputs.stable_version }}"
+            python3 .github/scripts/publish_release.py "${{ needs.merge-beta-to-main.outputs.stable_version }}" --interface "${{ needs.merge-beta-to-main.outputs.interface }}"
           fi
 
   fast-forward-beta:

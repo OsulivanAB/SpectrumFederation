@@ -33,8 +33,6 @@ For detailed information about our guild, addon features, and guides, visit our 
    ```
 4. Click **Install**
 
-WowUp will automatically detect updates and keep the addon current.
-
 ### CurseForge Installation
 
 We are not currently available on CurseForge. Please use the WowUp or Manual installation methods instead.

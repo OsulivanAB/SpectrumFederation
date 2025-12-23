@@ -1,7 +1,10 @@
 ## Interface: 110207
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
-## Version: 0.0.19
+## Version: 0.0.20-beta.1
+## Notes: Addon for the Spectrum Federation guild on Garona - Now with tabbed settings UI
+=======
+## Version: 0.0.19-beta.1
 ## Notes: Loot profile management and helper tools for guild coordination. Create and manage raid loot profiles, track distributions, and coordinate gear allocation across your guild.
 ## IconTexture: Interface\AddOns\SpectrumFederation\Media\Icons\SpectrumFederationIcon
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
