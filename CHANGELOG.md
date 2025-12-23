@@ -5,8 +5,8 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ## [Unreleased - Beta]
 
-### Changed
-- Updated addon version to 0.0.17-beta.5 in metadata.
+### Fixed
+- Resolved issues in documentation build process by testing mkdocs in dry-run mode to catch errors.
 
 ## [0.0.14-beta.1] - Unknown
 
