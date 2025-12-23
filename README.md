@@ -17,7 +17,7 @@ World of Warcraft addon for the Spectrum Federation guild on Garona.
 
 For detailed information about our guild, addon features, and guides, visit our documentation site:
 
-**[View Full Documentation →](https://osullivanab.github.io/SpectrumFederation/)**
+**[View Full Documentation →](https://osulivanab.github.io/SpectrumFederation/)**
 
 ---
 
