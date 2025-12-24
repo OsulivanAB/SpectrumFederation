@@ -90,7 +90,7 @@ SpectrumFederation.lua               # Entry point, event registration
 
 **UIHelpers (`modules/UIHelpers.lua`):**
 - `SF:CreateTooltip(frame, title, lines)` - Attach tooltips to frames
-- `SF:CreateHorizontalLine(parent, width)` - Visual separators
+- `SF:CreateHorizontalLine(parent, width, height, r, g, b, a)` - Visual separators with customizable size and color
 - `SF:CreateSectionTitle(parent, titleText, anchorFrame, yOffset)` - Section titles with lines
 - `SF:CreateIconButton(parent, size, normalTexture, highlightTexture, pushedTexture)` - Icon buttons
 

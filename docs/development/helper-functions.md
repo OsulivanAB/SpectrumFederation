@@ -130,13 +130,18 @@ SF:CreateTooltip(myButton, "Delete Profile", {
 
 ---
 
-### SF:CreateHorizontalLine(parent, width)
+### SF:CreateHorizontalLine(parent, width, height, r, g, b, a)
 
-Creates a horizontal line texture for visual separation in UI panels.
+Creates a horizontal line texture for visual separation in UI panels with customizable size and color.
 
 **Parameters:**
 - `parent` (Frame) - The parent frame for the line
-- `width` (number) - The width of the line in pixels
+- `width` (number, optional) - The width of the line in pixels (if not provided, must be set manually with SetWidth)
+- `height` (number, optional) - The height of the line in pixels (defaults to 1)
+- `r` (number, optional) - Red color component 0-1 (defaults to 0.5)
+- `g` (number, optional) - Green color component 0-1 (defaults to 0.5)
+- `b` (number, optional) - Blue color component 0-1 (defaults to 0.5)
+- `a` (number, optional) - Alpha transparency 0-1 (defaults to 1)
 
 **Returns:** (Texture) The created line texture
 
@@ -146,9 +151,22 @@ Creates a horizontal line texture for visual separation in UI panels.
 
 **Example:**
 ```lua
+-- Simple gray line with default colors
 local line = SF:CreateHorizontalLine(panel, 600)
 line:SetPoint("TOP", title, "BOTTOM", 0, -5)
+
+-- Custom colored line (red, 2 pixels tall, 50% transparent)
+local redLine = SF:CreateHorizontalLine(panel, 500, 2, 1, 0, 0, 0.5)
+redLine:SetPoint("TOP", subtitle, "BOTTOM", 0, -10)
+
+-- Line with dynamic width (set later)
+local dynamicLine = SF:CreateHorizontalLine(panel, nil, 1, 0.7, 0.7, 0.7, 1)
+dynamicLine:SetPoint("LEFT", panel, "LEFT", 20, -50)
+dynamicLine:SetPoint("RIGHT", panel, "RIGHT", -20, -50)
 ```
+
+!!! tip "Default Colors"
+    When color parameters are omitted, the line uses a medium gray color (0.5, 0.5, 0.5) with full opacity.
 
 ---
 
