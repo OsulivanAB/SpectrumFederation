@@ -6,6 +6,7 @@ Creates a zip file with proper structure and publishes to GitHub Releases.
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -73,6 +74,45 @@ def get_changelog_for_version(version):
         return None
 
 
+def create_release_json(version, interface, addon_name, zip_filename):
+    """Create release.json for WowUp Hub compatibility.
+    
+    Args:
+        version: Version string (e.g., '0.0.19')
+        interface: WoW interface version (e.g., 110207)
+        addon_name: Name of the addon (e.g., 'SpectrumFederation')
+        zip_filename: Name of the zip file (e.g., 'SpectrumFederation-0.0.19.zip')
+        
+    Returns:
+        Path to the generated release.json file
+    """
+    build_dir = Path("build")
+    build_dir.mkdir(exist_ok=True)
+    
+    json_path = build_dir / "release.json"
+    
+    release_data = {
+        "releases": [
+            {
+                "filename": zip_filename,
+                "nolib": False,
+                "metadata": [
+                    {
+                        "flavor": "mainline",
+                        "interface": int(interface)
+                    }
+                ]
+            }
+        ]
+    }
+    
+    with open(json_path, 'w') as f:
+        json.dump(release_data, f, indent=2)
+    
+    print(f"[publish-release] ✓ Created {json_path}")
+    return json_path
+
+
 def create_addon_zip(addon_name, version):
     """Create addon zip file with proper structure."""
     build_dir = Path("build")
@@ -102,8 +142,8 @@ def create_addon_zip(addon_name, version):
         return None
 
 
-def create_github_release(version, zip_path, repo, is_prerelease=False, dry_run=False):
-    """Create GitHub release and upload asset using gh CLI."""
+def create_github_release(version, zip_path, json_path, repo, is_prerelease=False, dry_run=False):
+    """Create GitHub release and upload assets using gh CLI."""
     github_token = os.environ.get("GITHUB_TOKEN")
     if not github_token:
         print("Error: GITHUB_TOKEN environment variable not set")
@@ -135,7 +175,7 @@ def create_github_release(version, zip_path, repo, is_prerelease=False, dry_run=
         print(f"  Tag: {tag_name}")
         print(f"  Name: {release_name}")
         print(f"  Prerelease: {is_prerelease}")
-        print(f"  Asset: {zip_path}")
+        print(f"  Assets: {zip_path}, {json_path}")
         print(f"  Notes: {notes}")
         return True
     
@@ -146,6 +186,7 @@ def create_github_release(version, zip_path, repo, is_prerelease=False, dry_run=
         "gh", "release", "create",
         tag_name,
         str(zip_path),
+        str(json_path),
         "--title", release_name,
         "--notes", notes,
     ]
@@ -184,6 +225,12 @@ def main():
         help="Version to release (e.g., 0.0.15 or 0.0.15-beta.1)"
     )
     parser.add_argument(
+        "--interface",
+        type=int,
+        required=True,
+        help="WoW interface version (e.g., 110207 for 11.2.7)"
+    )
+    parser.add_argument(
         "--addon-name",
         default="SpectrumFederation",
         help="Name of the addon (default: SpectrumFederation)"
@@ -206,7 +253,19 @@ def main():
     
     print("[publish-release] Starting release process...")
     print(f"[publish-release] Version: {args.version}")
+    print(f"[publish-release] Interface: {args.interface}")
     print(f"[publish-release] Prerelease: {is_prerelease}")
+    
+    # Construct zip filename
+    zip_filename = f"{args.addon_name}-{args.version}.zip"
+    
+    # Create release.json
+    json_path = create_release_json(
+        args.version,
+        args.interface,
+        args.addon_name,
+        zip_filename
+    )
     
     # Create zip
     zip_path = create_addon_zip(args.addon_name, args.version)
@@ -217,6 +276,7 @@ def main():
     success = create_github_release(
         args.version,
         zip_path,
+        json_path,
         args.repo,
         is_prerelease=is_prerelease,
         dry_run=args.dry_run
