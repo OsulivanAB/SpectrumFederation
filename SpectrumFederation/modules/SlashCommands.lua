@@ -31,9 +31,9 @@ end
 
 -- Show help message with all registered commands
 local function ShowHelp()
-    print("|cFF00FF00" .. addonName .. " Commands:|r")
-    print("|cFFFFFF00/sf|r - Open settings panel")
-    print("|cFFFFFF00/sf help|r - Show this help message")
+    SF:PrintSuccess("Commands:")
+    SF:PrintInfo("|cFFFFFF00/sf|r - Open settings panel")
+    SF:PrintInfo("|cFFFFFF00/sf help|r - Show this help message")
     
     -- Sort commands alphabetically
     local sortedCommands = {}
@@ -47,7 +47,7 @@ local function ShowHelp()
     -- Display each command
     for _, cmd in ipairs(sortedCommands) do
         local cmdData = SF.SlashCommands[cmd]
-        print(string.format("|cFFFFFF00/sf %s|r - %s", cmd, cmdData.description))
+        SF:PrintInfo(string.format("|cFFFFFF00/sf %s|r - %s", cmd, cmdData.description))
     end
 end
 
@@ -62,7 +62,7 @@ local function SlashCommandHandler(msg)
             local categoryID = SF.SettingsCategory:GetID()
             Settings.OpenToCategory(categoryID)
         else
-            print("|cFFFF0000" .. addonName .. "|r: Settings UI is not available.")
+            SF:PrintError("Settings UI is not available.")
             if SF.Debug then SF.Debug:Warn("SLASH", "SettingsCategory or SettingsPanel not found") end
         end
         return
@@ -85,12 +85,12 @@ local function SlashCommandHandler(msg)
         -- Execute the command handler
         local success, err = pcall(cmdData.handler, args)
         if not success then
-            print("|cFFFF0000" .. addonName .. "|r: Error executing command: " .. tostring(err))
+            SF:PrintError("Error executing command: " .. tostring(err))
             if SF.Debug then SF.Debug:Error("SLASH", "Command '%s' failed: %s", command, tostring(err)) end
         end
     else
         -- Unknown command
-        print("|cFFFF0000" .. addonName .. "|r: Unknown command '" .. command .. "'. Type |cFFFFFF00/sf help|r for a list of commands.")
+        SF:PrintError("Unknown command '" .. command .. "'. Type |cFFFFFF00/sf help|r for a list of commands.")
         if SF.Debug then SF.Debug:Warn("SLASH", "Unknown command: %s", command) end
     end
 end

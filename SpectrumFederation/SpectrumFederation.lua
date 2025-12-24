@@ -35,7 +35,7 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
         end
 
         -- Send a quick message saying that Addon is Initialized
-        print("|cFF00FF00" .. addonName .. "|r: Online. Type /sf to open settings.")
+        SF:PrintSuccess("Online. Type /sf to open settings.")
 
         -- Initialize Slash Commands
         if SF.InitializeSlashCommands then

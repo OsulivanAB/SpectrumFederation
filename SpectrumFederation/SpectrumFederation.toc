@@ -12,10 +12,13 @@
 modules/Debug.lua
 modules/LootHelper/Database.lua
 modules/SlashCommands.lua
+modules/MessageHelpers.lua
+modules/UIHelpers.lua
+modules/LootHelper/MemberQuery.lua
 modules/LootHelper/LootProfiles.lua
 modules/LootHelper/LootHelper.lua
 modules/LootHelper/Settings.lua
-modules/LootHelper/ui.lua
-ui/Settings.lua
+modules/LootHelper/UI.lua
+modules/Settings.lua
 modules/Core.lua
 SpectrumFederation.lua

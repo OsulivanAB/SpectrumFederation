@@ -11,7 +11,7 @@ function SF:UpdateLootProfileDropdownText()
     -- Ensure the dropdown exists before trying to talk to it
     if not SF.LootProfileDropdown then
         if SF.Debug then SF.Debug:Error("UI", "UpdateLootProfileDropdownText failed: LootProfileDropdown not found") end
-        print("|cFFFF0000" .. addonName .. "|r: LootProfileDropdown not found.")
+        SF:PrintError("LootProfileDropdown not found.")
         return
     end
 
@@ -25,54 +25,13 @@ function SF:UpdateLootProfileDropdownText()
     end
 end
 
--- Creates the Loot Helper section in the settings panel
-function SF:CreateLootHelperSection(panel, anchorFrame)
-    -- Subtitle with horizontal lines
-    local subTitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-    subTitle:SetPoint("TOP", anchorFrame, "BOTTOM", 0, -20)
-    subTitle:SetText("Loot Helper")
-    
-    local leftLine = panel:CreateTexture(nil, "ARTWORK")
-    leftLine:SetColorTexture(0.5, 0.5, 0.5, 1)  -- Gray line
-    leftLine:SetPoint("RIGHT", subTitle, "LEFT", -10, 0)
-    leftLine:SetHeight(1)
-    
-    local rightLine = panel:CreateTexture(nil, "ARTWORK")
-    rightLine:SetColorTexture(0.5, 0.5, 0.5, 1)  -- Gray line
-    rightLine:SetPoint("LEFT", subTitle, "RIGHT", 10, 0)
-    rightLine:SetHeight(1)
-    
-    -- Function to update subtitle line widths
-    local function UpdateSubtitleLines()
-        local panelWidth = panel:GetWidth()
-        if panelWidth and panelWidth > 0 then
-            local totalWidth = panelWidth * 0.90
-            local textWidth = subTitle:GetStringWidth()
-            local lineWidth = (totalWidth - textWidth - 20) / 2  -- 20 is the total gap (10 on each side)
-            if lineWidth > 0 then
-                leftLine:SetWidth(lineWidth)
-                rightLine:SetWidth(lineWidth)
-            end
-        end
-    end
-    
-    -- Update subtitle lines when panel size changes
-    local oldOnSizeChanged = panel:GetScript("OnSizeChanged")
-    panel:SetScript("OnSizeChanged", function(self, width, height)
-        if oldOnSizeChanged then oldOnSizeChanged(self, width, height) end
-        UpdateSubtitleLines()
-    end)
-    
-    -- Initial update for subtitle lines
-    C_Timer.After(0.15, function()
-        if panel:IsShown() then
-            UpdateSubtitleLines()
-        end
-    end)
-
-    -- Enable/Disable Loot Helper Checkbox
+-- Helper function to create the enable/disable checkbox
+-- @param panel: The parent frame
+-- @param anchorFrame: The frame to anchor below
+-- @return: The created checkbox frame
+local function CreateEnableCheckbox(panel, anchorFrame)
     local enableCheckbox = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
-    enableCheckbox:SetPoint("TOPLEFT", leftLine, "BOTTOMLEFT", 0, -20)
+    enableCheckbox:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 0, -20)
     enableCheckbox:SetSize(24, 24)
     
     -- Checkbox Label
@@ -103,17 +62,25 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
         end
         
         -- Print feedback to user
-        print("|cFF00FF00" .. addonName .. "|r: Loot Helper " .. (enabled and "enabled" or "disabled") .. ".")
+        SF:PrintSuccess("Loot Helper " .. (enabled and "enabled" or "disabled") .. ".")
     end)
+    
+    return enableCheckbox
+end
 
+-- Helper function to create the profile dropdown with delete button
+-- @param panel: The parent frame
+-- @param anchorFrame: The frame to anchor below
+-- @return: The dropdown frame
+local function CreateProfileDropdown(panel, anchorFrame)
     -- Label for the Dropdown
     local profileLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    profileLabel:SetPoint("TOPLEFT", enableCheckbox, "BOTTOMLEFT", 0, -20)
+    profileLabel:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 0, -20)
     profileLabel:SetText("Select Active Profile:")
 
     -- Dropdown for selecting active profile
     local LootProfileDropdown = CreateFrame("DropdownButton", nil, panel, "WowStyle1DropdownTemplate")
-    LootProfileDropdown:SetPoint("LEFT", profileLabel, "RIGHT", 10, 0)  -- Place it to the right of the label
+    LootProfileDropdown:SetPoint("LEFT", profileLabel, "RIGHT", 10, 0)
     LootProfileDropdown:SetWidth(200)
 
     LootProfileDropdown.UpdateText = function()
@@ -152,24 +119,26 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
 
     -- Store the dropdown in our namespace for later use
     SF.LootProfileDropdown = LootProfileDropdown
+    
+    return LootProfileDropdown
+end
 
-    -- Delete Button for active profile
+-- Helper function to create the delete button for active profile
+-- @param panel: The parent frame
+-- @param dropdown: The dropdown to anchor next to
+-- @return: The delete button frame
+local function CreateDeleteButton(panel, dropdown)
     local deleteProfileBtn = CreateFrame("Button", nil, panel)
     deleteProfileBtn:SetSize(20, 20)
-    deleteProfileBtn:SetPoint("LEFT", LootProfileDropdown, "RIGHT", 5, 0)
+    deleteProfileBtn:SetPoint("LEFT", dropdown, "RIGHT", 5, 0)
 
     -- Set the icon texture
     deleteProfileBtn:SetNormalTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Up")
     deleteProfileBtn:SetHighlightTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Highlight")
     deleteProfileBtn:SetPushedTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Down")
 
-    -- Tooltip to explain what the button does
-    deleteProfileBtn:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Delete Active Profile", 1, 0, 0)   -- Red text
-        GameTooltip:Show()
-    end)
-    deleteProfileBtn:SetScript("OnLeave", GameTooltip_Hide)
+    -- Tooltip
+    SF:CreateTooltip(deleteProfileBtn, "Delete Active Profile")
 
     -- logic to delete
     deleteProfileBtn:SetScript("OnClick", function()
@@ -178,17 +147,22 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
             SF:DeleteProfile(SF.lootHelperDB.activeLootProfile)
         else
             if SF.Debug then SF.Debug:Warn("UI", "User clicked delete button but no active profile exists") end
-            print("|cFFFF0000" .. addonName .. "|r: No active profile to delete.")
+            SF:PrintError("No active profile to delete.")
         end
     end)
 
     SF.LootProfileDeleteButton = deleteProfileBtn
+    
+    return deleteProfileBtn
+end
 
-    SF:UpdateLootProfileDropdownText()
-
-    -- Create new profile section
+-- Helper function to create the profile creation section
+-- @param panel: The parent frame
+-- @param anchorFrame: The frame to anchor below
+-- @return: The label frame (for use as next anchor)
+local function CreateProfileInput(panel, anchorFrame)
     local createLootProfileLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    createLootProfileLabel:SetPoint("TOPLEFT", profileLabel, "BOTTOMLEFT", 0, -40)
+    createLootProfileLabel:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 0, -40)
     createLootProfileLabel:SetText("Create New Profile:")
 
     -- Input Box for new profile name
@@ -210,7 +184,7 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
         -- Input Validation
         if text == "" then
             if SF.Debug then SF.Debug:Warn("UI", "User attempted to create profile with empty name") end
-            print("|cFFFF0000" .. addonName .. "|r: Profile name cannot be empty.")
+            SF:PrintError("Profile name cannot be empty.")
             return
         end
 
@@ -226,10 +200,17 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
     newLootProfileInputBox:SetScript("OnEnterPressed", function()
         createLootProfileBtn:Click()
     end)
+    
+    return createLootProfileLabel
+end
 
-    -- Test Mode Toggle Button
+-- Helper function to create the test mode toggle button
+-- @param panel: The parent frame
+-- @param anchorFrame: The frame to anchor below
+-- @return: none
+local function CreateTestModeButton(panel, anchorFrame)
     local testModeBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
-    testModeBtn:SetPoint("TOPLEFT", createLootProfileLabel, "BOTTOMLEFT", 0, -60)
+    testModeBtn:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 0, -60)
     testModeBtn:SetSize(150, 30)
     
     -- Initialize button text based on current test mode state
@@ -244,19 +225,45 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
         if SF.LootWindow then
             SF.LootWindow:ToggleTestMode()
         else
-            print("|cFF00FF00" .. addonName .. "|r: Loot Helper window not yet initialized. Use '/sf loot' to create it first.")
+            SF:PrintWarning("Loot Helper window not yet initialized. Use '/sf loot' to create it first.")
         end
     end)
     
     -- Tooltip
-    testModeBtn:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Toggle Test Mode", 1, 1, 1)
-        GameTooltip:AddLine("Shows fake members instead of real group data.", nil, nil, nil, true)
-        GameTooltip:Show()
-    end)
-    testModeBtn:SetScript("OnLeave", GameTooltip_Hide)
+    SF:CreateTooltip(testModeBtn, "Toggle Test Mode", {
+        "Shows fake members instead of real group data.",
+        "Useful for testing UI without being in a raid."
+    })
     
     -- Store button reference for updates from ToggleTestMode()
     SF.LootHelperTestModeButton = testModeBtn
+end
+
+-- Creates the Loot Helper section in the settings panel
+function SF:CreateLootHelperSection(panel, anchorFrame)
+    -- Create section title with horizontal lines
+    local sectionTitle = SF:CreateSectionTitle(panel, "Loot Helper", anchorFrame, -20)
+    
+    -- Update subtitle lines when panel size changes
+    local oldOnSizeChanged = panel:GetScript("OnSizeChanged")
+    panel:SetScript("OnSizeChanged", function(self, width, height)
+        if oldOnSizeChanged then oldOnSizeChanged(self, width, height) end
+        sectionTitle.UpdateLines()
+    end)
+    
+    -- Initial update for subtitle lines
+    C_Timer.After(0.15, function()
+        if panel:IsShown() then
+            sectionTitle.UpdateLines()
+        end
+    end)
+
+    -- Create UI components using helper functions
+    local enableCheckbox = CreateEnableCheckbox(panel, sectionTitle.leftLine)
+    local dropdown = CreateProfileDropdown(panel, enableCheckbox)
+    CreateDeleteButton(panel, dropdown)
+    SF:UpdateLootProfileDropdownText()
+    
+    local createLabel = CreateProfileInput(panel, dropdown)
+    CreateTestModeButton(panel, createLabel)
 end

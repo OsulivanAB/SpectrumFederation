@@ -236,6 +236,164 @@ function LootWindow:CreateMemberRow(index)
     return row
 end
 
+-- Helper function to create the title bar for the Loot Helper window
+-- @param frame: The parent frame
+-- @return: The created title bar frame
+local function CreateTitleBar(frame)
+    local titleBar = CreateFrame("Frame", nil, frame, "BackdropTemplate")
+    titleBar:SetHeight(14)
+    titleBar:SetPoint("TOPLEFT", 6, -6)
+    titleBar:SetPoint("TOPRIGHT", -6, -6)
+    titleBar:SetBackdrop({
+        bgFile = "Interface\\DialogFrame\\UI-Tooltip-Background",
+        title = true,
+        titleSize = 16
+    })
+    titleBar:SetBackdropColor(0.12, 0.12, 0.16, 0.95)
+
+    local titleText = titleBar:CreateFontString(nil, "OVERLAY", "GameFontNormalMed1")
+    titleText:SetPoint("CENTER", titleBar, "CENTER", 0, 0)
+    titleText:SetText("Spectrum Loot Helper")
+
+    -- Close Button
+    local closeButton = CreateFrame("Button", nil, titleBar, "UIPanelCloseButton")
+    closeButton:SetSize(16, 16)
+    closeButton:SetPoint("TOPRIGHT", -3, -3)
+    closeButton:SetScript("OnClick", function()
+        frame:Hide()
+        SaveFrameState(frame)
+    end)
+
+    -- Enable Dragging
+    frame:SetMovable(true)
+    frame:EnableMouse(true)
+    titleBar:EnableMouse(true)
+    titleBar:RegisterForDrag("LeftButton")
+    titleBar:SetScript("OnDragStart", function()
+        frame:StartMoving()
+    end)
+    titleBar:SetScript("OnDragStop", function()
+        frame:StopMovingOrSizing()
+        SaveFrameState(frame)
+    end)
+
+    return titleBar
+end
+
+-- Helper function to create resize grip for the window
+-- @param frame: The parent frame
+-- @return: The created resize grip button
+local function CreateResizeGrip(frame)
+    local resizeGrip = CreateFrame("Button", nil, frame)
+    resizeGrip:SetSize(18, 18)
+    resizeGrip:SetPoint("BOTTOMRIGHT", -2, 2)
+    resizeGrip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    resizeGrip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+    resizeGrip:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+
+    resizeGrip:SetScript("OnMouseDown", function()
+        frame:StartSizing("BOTTOMRIGHT")
+    end)
+    resizeGrip:SetScript("OnMouseUp", function()
+        frame:StopMovingOrSizing()
+        SaveFrameState(frame)
+    end)
+
+    return resizeGrip
+end
+
+-- Helper function to create the disabled overlay
+-- @param frame: The parent frame
+-- @param content: The content frame to cover
+-- @return: The created overlay frame
+local function CreateDisabledOverlay(frame, content)
+    local overlay = CreateFrame("Frame", nil, frame, "BackdropTemplate")
+    overlay:SetAllPoints(content)
+    overlay:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        title = true,
+        titleSize = 16
+    })
+    overlay:SetBackdropColor(0, 0, 0, 0.35)
+    overlay:Hide()
+
+    local disabledText = overlay:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    disabledText:SetPoint("CENTER")
+    disabledText:SetText("Loot Helper Disabled")
+
+    return overlay
+end
+
+-- Helper function to setup scroll frame and row pool
+-- @param self: The LootWindow object
+-- @param content: The content frame
+-- @param constants: Table of layout constants
+-- @return: none
+local function SetupScrollFrameAndRows(self, content, constants)
+    -- Create Scroll Frame for member list
+    local scrollFrame = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
+    scrollFrame:SetPoint("TOPLEFT", content, "TOPLEFT", constants.CONTENT_PADDING, -constants.CONTENT_PADDING)
+    scrollFrame:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", -25, constants.CONTENT_PADDING)
+    
+    local scrollChild = CreateFrame("Frame", nil, scrollFrame)
+    scrollChild:SetSize(scrollFrame:GetWidth() or 1, 1)
+    scrollFrame:SetScrollChild(scrollChild)
+
+    self.memberScrollFrame = scrollFrame
+    self.memberScrollChild = scrollChild
+
+    -- Create row pool (40 rows for large raids)
+    self.memberRows = {}
+    for i = 1, 40 do
+        local row = self:CreateMemberRow(i)
+        row:SetParent(scrollChild)
+        row:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 0, -(i - 1) * constants.ROW_HEIGHT)
+        row:SetSize(scrollChild:GetWidth() or 1, constants.ROW_HEIGHT)
+        row:Hide()
+        table.insert(self.memberRows, row)
+    end
+end
+
+-- Helper function to setup event handlers for the window
+-- @param self: The LootWindow object
+-- @param frame: The window frame
+-- @return: none
+local function SetupEventHandlers(self, frame)
+    -- Throttled resize handler
+    frame.resizeTimer = nil
+    frame:SetScript("OnSizeChanged", function()
+        if frame.resizeTimer then
+            frame.resizeTimer:Cancel()
+        end
+        frame.resizeTimer = C_Timer.After(0.1, function()
+            self:PopulateContent(self.testModeActive)
+        end)
+    end)
+
+    -- Group roster update event
+    local eventFrame = CreateFrame("Frame")
+    eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+    eventFrame:SetScript("OnEvent", function(_, event)
+        if event == "GROUP_ROSTER_UPDATE" then
+            if not self.testModeActive then
+                if SF.Debug then
+                    SF.Debug:Info("LOOT_HELPER", "Group roster updated, refreshing member list")
+                end
+                self:PopulateContent(false)
+            end
+        end
+    end)
+    frame.eventFrame = eventFrame
+
+    -- Save visibility changes
+    frame:SetScript("OnShow", function()
+        SaveFrameState(frame)
+    end)
+    frame:SetScript("OnHide", function()
+        SaveFrameState(frame)
+    end)
+end
+
 -- Function to create the Loot Helper UI window
 -- @return: The created frame
 function LootWindow:Create()
@@ -269,68 +427,17 @@ function LootWindow:Create()
     })
     frame:SetBackdropColor(0.05, 0.05, 0.07, 0.95)  -- Dark background
 
-    -- Title bar (drag handle)
-    local titleBar = CreateFrame("Frame", nil, frame, "BackdropTemplate")
-    titleBar:SetHeight(14)
-    titleBar:SetPoint("TOPLEFT", 6, -6)
-    titleBar:SetPoint("TOPRIGHT", -6, -6)
-    titleBar:SetBackdrop({
-        bgFile = "Interface\\DialogFrame\\UI-Tooltip-Background",
-        title = true,
-        titleSize = 16
-    })
-    titleBar:SetBackdropColor(0.12, 0.12, 0.16, 0.95)   -- Slightly lighter for title bar
+    -- Create title bar with close button and drag functionality
+    local titleBar = CreateTitleBar(frame)
 
-    local titleText = titleBar:CreateFontString(nil, "OVERLAY", "GameFontNormalMed1")
-    titleText:SetPoint("CENTER", titleBar, "CENTER", 0, 0)
-    titleText:SetText("Spectrum Loot Helper")
-
-    -- Close Button
-    local CloseButton = CreateFrame("Button", nil, titleBar, "UIPanelCloseButton")
-    CloseButton:SetSize(16, 16)
-    CloseButton:SetPoint("TOPRIGHT", -3, -3)
-    CloseButton:SetScript("OnClick", function()
-        frame:Hide()
-        SaveFrameState(frame)
-    end)
-
-    -- Enable Dragging
-    frame:SetMovable(true)
-    frame:EnableMouse(true)
-    titleBar:EnableMouse(true)
-    titleBar:RegisterForDrag("LeftButton")
-    titleBar:SetScript("OnDragStart", function()
-        frame:StartMoving()
-    end)
-    titleBar:SetScript("OnDragStop", function()
-        frame:StopMovingOrSizing()
-        SaveFrameState(frame)
-    end)
-
-    -- Resizable
+    -- Enable resizing with grip
     frame:SetResizable(true)
-    -- Prefer SetResizeBounds if available; fallback to SetMinResize for older builds
     if frame.SetResizeBounds then
-        frame:SetResizeBounds(400, 280, 900, 700)  -- minWidth, minHeight, maxWidth, maxHeight
+        frame:SetResizeBounds(400, 280, 900, 700)
     else
         frame:SetMinResize(400, 280)
     end
-
-    -- Reesize grip (bottom-right corner)
-    local resizeGrip = CreateFrame("Button", nil, frame)
-    resizeGrip:SetSize(18, 18)
-    resizeGrip:SetPoint("BOTTOMRIGHT", -2, 2)
-    resizeGrip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
-    resizeGrip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
-    resizeGrip:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
-
-    resizeGrip:SetScript("OnMouseDown", function()
-        frame:StartSizing("BOTTOMRIGHT")
-    end)
-    resizeGrip:SetScript("OnMouseUp", function()
-        frame:StopMovingOrSizing()
-        SaveFrameState(frame)
-    end)
+    CreateResizeGrip(frame)
 
     -- Content Area
     local content = CreateFrame("Frame", nil, frame)
@@ -339,242 +446,46 @@ function LootWindow:Create()
     frame.content = content
 
     -- Layout Constants for member rows
-    local ROW_HEIGHT = 30
-    local CLASS_ICON_SIZE_PERCENT = 0.65
-    local NAME_COLUMN_WIDTH_PERCENT = 0.45
-    local POINTS_COLUMN_WIDTH = 50
-    local BUTTON_SIZE_PERCENT = 0.75
-    local BUTTON_SPACING = 4
-    local CONTENT_PADDING = 5
-    local FONT_SIZE = "GameFontNormal"  -- TODO: Make this configurable in settings
+    local constants = {
+        ROW_HEIGHT = 30,
+        CLASS_ICON_SIZE_PERCENT = 0.65,
+        NAME_COLUMN_WIDTH_PERCENT = 0.45,
+        POINTS_COLUMN_WIDTH = 50,
+        BUTTON_SIZE_PERCENT = 0.75,
+        BUTTON_SPACING = 4,
+        CONTENT_PADDING = 5,
+        FONT_SIZE = "GameFontNormal"  -- TODO: Make this configurable in settings
+    }
+
+    -- Store constants for use by other functions
+    self.ROW_HEIGHT = constants.ROW_HEIGHT
+    self.CLASS_ICON_SIZE_PERCENT = constants.CLASS_ICON_SIZE_PERCENT
+    self.NAME_COLUMN_WIDTH_PERCENT = constants.NAME_COLUMN_WIDTH_PERCENT
+    self.POINTS_COLUMN_WIDTH = constants.POINTS_COLUMN_WIDTH
+    self.BUTTON_SIZE_PERCENT = constants.BUTTON_SIZE_PERCENT
+    self.BUTTON_SPACING = constants.BUTTON_SPACING
+    self.FONT_SIZE = constants.FONT_SIZE
 
     -- Initialize test mode flag (resets on reload)
     self.testModeActive = false
 
-    -- Create Scroll Frame for member list
-    local scrollFrame = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
-    scrollFrame:SetPoint("TOPLEFT", content, "TOPLEFT", CONTENT_PADDING, -CONTENT_PADDING)
-    scrollFrame:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", -25, CONTENT_PADDING)  -- Offset for scrollbar
-    
-    local scrollChild = CreateFrame("Frame", nil, scrollFrame)
-    scrollChild:SetSize(scrollFrame:GetWidth() or 1, 1)  -- Height set dynamically by PopulateContent
-    scrollFrame:SetScrollChild(scrollChild)
+    -- Setup scroll frame and member rows
+    SetupScrollFrameAndRows(self, content, constants)
 
-    -- Store scroll frame references
-    self.memberScrollFrame = scrollFrame
-    self.memberScrollChild = scrollChild
-
-    -- Create row pool (40 rows for large raids)
-    self.memberRows = {}
-    for i = 1, 40 do
-        local row = self:CreateMemberRow(i)
-        row:SetParent(scrollChild)
-        row:SetPoint("TOPLEFT", scrollChild, "TOPLEFT", 0, -(i - 1) * ROW_HEIGHT)
-        row:SetSize(scrollChild:GetWidth() or 1, ROW_HEIGHT)
-        row:Hide()  -- Hidden by default, shown by PopulateContent
-        table.insert(self.memberRows, row)
-    end
-
-    -- Store constants for use by other functions
-    self.ROW_HEIGHT = ROW_HEIGHT
-    self.CLASS_ICON_SIZE_PERCENT = CLASS_ICON_SIZE_PERCENT
-    self.NAME_COLUMN_WIDTH_PERCENT = NAME_COLUMN_WIDTH_PERCENT
-    self.POINTS_COLUMN_WIDTH = POINTS_COLUMN_WIDTH
-    self.BUTTON_SIZE_PERCENT = BUTTON_SIZE_PERCENT
-    self.BUTTON_SPACING = BUTTON_SPACING
-    self.FONT_SIZE = FONT_SIZE
-
-    -- Throttled resize handler (prevents lag during window resizing)
-    frame.resizeTimer = nil
-    frame:SetScript("OnSizeChanged", function()
-        if frame.resizeTimer then
-            frame.resizeTimer:Cancel()
-        end
-        frame.resizeTimer = C_Timer.After(0.1, function()
-            self:PopulateContent(self.testModeActive)
-        end)
-    end)
-
-    -- Event frame for group roster updates
-    local eventFrame = CreateFrame("Frame")
-    eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
-    eventFrame:SetScript("OnEvent", function(_, event)
-        if event == "GROUP_ROSTER_UPDATE" then
-            -- Only update if not in test mode
-            if not self.testModeActive then
-                if SF.Debug then
-                    SF.Debug:Info("LOOT_HELPER", "Group roster updated, refreshing member list")
-                end
-                self:PopulateContent(false)
-            end
-        end
-    end)
-    frame.eventFrame = eventFrame
-
-    -- Disabled Overlay
-    local overlay = CreateFrame("Frame", nil, frame, "BackdropTemplate")
-    overlay:SetAllPoints(content)
-    overlay:SetBackdrop({
-        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
-        title = true,
-        titleSize = 16
-    })
-    overlay:SetBackdropColor(0, 0, 0, 0.35)  -- Semi-transparent dark overlay
-    overlay:Hide()
+    -- Create disabled overlay
+    local overlay = CreateDisabledOverlay(frame, content)
     frame.disabledOverlay = overlay
 
-    local disabledText = overlay:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    disabledText:SetPoint("CENTER")
-    disabledText:SetText("Loot Helper Disabled")
+    -- Setup event handlers
+    SetupEventHandlers(self, frame)
 
-    -- Save Visibility Changes
-    frame:SetScript("OnShow", function()
-        SaveFrameState(frame)
-    end)
-    frame:SetScript("OnHide", function()
-        SaveFrameState(frame)
-    end)
-
-    -- Apply saved state
+    -- Apply saved state and initialize
     ApplyFrameState(frame)
     SetEnabledVisuals(frame, db.enabled)
-
-    -- Initial population of member list
     self:PopulateContent(false)
 
     self.frame = frame
     return frame
-end
-
--- Local helper function to get test members
--- @return: Array of test member data
-local function GetTestMembers()
-    -- TODO: Expand test data with more varied members for thorough testing
-    local members = {
-        {name = "Tankmaster", realm = "Garona", classFilename = "WARRIOR", points = 0},
-        {name = "Holybringer", realm = "Garona", classFilename = "PALADIN", points = 0},
-        {name = "Beastlord", realm = "Stormrage", classFilename = "HUNTER", points = 0},
-        {name = "Shadowstrike", realm = "Garona", classFilename = "ROGUE", points = 0},
-        {name = "Lightweaver", realm = "Stormrage", classFilename = "PRIEST", points = 0},
-        {name = "Earthshaker", realm = "Garona", classFilename = "SHAMAN", points = 0},
-        {name = "Frostcaller", realm = "Stormrage", classFilename = "MAGE", points = 0},
-        {name = "Soulreaper", realm = "Garona", classFilename = "WARLOCK", points = 0},
-        {name = "Brewmaster", realm = "Stormrage", classFilename = "MONK", points = 0},
-        {name = "Wildheart", realm = "Garona", classFilename = "DRUID", points = 0},
-        {name = "Chaosreaver", realm = "Stormrage", classFilename = "DEMONHUNTER", points = 0},
-        {name = "Frostblade", realm = "Garona", classFilename = "DEATHKNIGHT", points = 0},
-        {name = "Dreamweaver", realm = "Stormrage", classFilename = "EVOKER", points = 0},
-        {name = "Shieldbash", realm = "Garona", classFilename = "WARRIOR", points = 0},
-        {name = "Arcanewiz", realm = "Stormrage", classFilename = "MAGE", points = 0},
-    }
-    
-    if SF.Debug then
-        SF.Debug:Info("LOOT_HELPER", "Generated %d test members", #members)
-    end
-    
-    return members
-end
-
--- Local helper function to get raid members
--- @return: Array of raid member data
-local function GetRaidMembers()
-    local members = {}
-    local numMembers = GetNumGroupMembers()
-    
-    for i = 1, numMembers do
-        local name, _, _, _, classFilename, _, _, _, _, _, _ = GetRaidRosterInfo(i)
-        if name then
-            -- GetRaidRosterInfo returns name without realm, need to get realm separately
-            local unitToken = "raid" .. i
-            local fullName = UnitName(unitToken)
-            local realm = GetRealmName()
-            
-            -- If name has a realm attached (from another server), parse it
-            if fullName and fullName:find("-") then
-                local namePart, realmPart = fullName:match("^(.+)-(.+)$")
-                if namePart and realmPart then
-                    name = namePart
-                    realm = realmPart
-                end
-            end
-            
-            table.insert(members, {
-                name = name,
-                realm = realm,
-                classFilename = classFilename,
-                points = 0  -- TODO: Load from database when points system implemented
-            })
-        end
-    end
-    
-    if SF.Debug then
-        SF.Debug:Info("LOOT_HELPER", "Found %d raid members", #members)
-    end
-    
-    return members
-end
-
--- Local helper function to get party members (including player)
--- @return: Array of party member data
-local function GetPartyMembers()
-    local members = {}
-    
-    -- Add player first
-    local playerName = UnitName("player")
-    local _, playerClass = UnitClass("player")
-    local playerRealm = GetRealmName()
-    
-    table.insert(members, {
-        name = playerName,
-        realm = playerRealm,
-        classFilename = playerClass,
-        points = 0  -- TODO: Load from database
-    })
-    
-    -- Add party members
-    local numParty = GetNumSubgroupMembers()
-    for i = 1, numParty do
-        local unitToken = "party" .. i
-        if UnitExists(unitToken) then
-            local name = UnitName(unitToken)
-            local _, classFilename = UnitClass(unitToken)
-            local realm = GetRealmName()  -- Assumes same realm for party members
-            
-            table.insert(members, {
-                name = name,
-                realm = realm,
-                classFilename = classFilename,
-                points = 0  -- TODO: Load from database
-            })
-        end
-    end
-    
-    if SF.Debug then
-        SF.Debug:Info("LOOT_HELPER", "Found %d party members (including player)", #members)
-    end
-    
-    return members
-end
-
--- Local helper function to get solo player data
--- @return: Array with single player member data
-local function GetSoloPlayer()
-    local playerName = UnitName("player")
-    local _, playerClass = UnitClass("player")
-    local playerRealm = GetRealmName()
-    
-    if SF.Debug then
-        SF.Debug:Info("LOOT_HELPER", "Solo mode: showing player only")
-    end
-    
-    return {
-        {
-            name = playerName,
-            realm = playerRealm,
-            classFilename = playerClass,
-            points = 0  -- TODO: Load from database
-        }
-    }
 end
 
 -- Local helper function to update row UI elements with member data
@@ -661,13 +572,13 @@ function LootWindow:PopulateContent(testMode)
     -- Get member data based on current context
     local members = {}
     if testMode then
-        members = GetTestMembers()
+        members = SF:GetTestMembers()
     elseif IsInRaid() then
-        members = GetRaidMembers()
+        members = SF:GetRaidMembers()
     elseif IsInGroup() then
-        members = GetPartyMembers()
+        members = SF:GetPartyMembers()
     else
-        members = GetSoloPlayer()
+        members = SF:GetSoloPlayer()
     end
     
     -- Update UI rows with member data
@@ -707,7 +618,7 @@ function LootWindow:ToggleTestMode()
     
     -- Print status message to chat
     local status = self.testModeActive and "enabled" or "disabled"
-    print(string.format("|cff00ff00Spectrum Federation:|r Loot Helper test mode %s", status))
+    SF:PrintSuccess(string.format("Loot Helper test mode %s", status))
     
     -- Log the change
     if SF.Debug then
