@@ -189,14 +189,16 @@ end)
 
 ---
 
-### SF:CreateIconButton(parent, iconPath, size)
+### SF:CreateIconButton(parent, size, normalTexture, highlightTexture, pushedTexture)
 
-Creates a square button with an icon texture.
+Creates a square button with icon textures for different states.
 
 **Parameters:**
 - `parent` (Frame) - The parent frame
-- `iconPath` (string) - Path to the icon texture (e.g., "Interface\\AddOns\\SpectrumFederation\\Media\\Icons\\Delete")
 - `size` (number) - Width and height of the button in pixels
+- `normalTexture` (string) - Path to the normal state texture (e.g., "Interface\\AddOns\\SpectrumFederation\\Media\\Icons\\Delete")
+- `highlightTexture` (string) - Path to the highlight state texture (shown on mouse hover)
+- `pushedTexture` (string, optional) - Path to the pushed state texture (defaults to normalTexture if not provided)
 
 **Returns:** (Button) The created button
 
@@ -210,8 +212,10 @@ Creates a square button with an icon texture.
 ```lua
 local deleteBtn = SF:CreateIconButton(
     panel,
+    20,
     "Interface\\AddOns\\SpectrumFederation\\Media\\Icons\\Delete",
-    20
+    "Interface\\AddOns\\SpectrumFederation\\Media\\Icons\\Delete_Highlight",
+    "Interface\\AddOns\\SpectrumFederation\\Media\\Icons\\Delete_Pushed"
 )
 deleteBtn:SetPoint("LEFT", profileDropdown, "RIGHT", 5, 0)
 deleteBtn:SetScript("OnClick", function()
@@ -536,8 +540,10 @@ function SF:CreateMyFeaturePanel(parent, anchorFrame)
     -- Create an icon button
     local actionBtn = SF:CreateIconButton(
         parent,
+        24,
         "Interface\\AddOns\\SpectrumFederation\\Media\\Icons\\Action",
-        24
+        "Interface\\AddOns\\SpectrumFederation\\Media\\Icons\\Action_Highlight",
+        "Interface\\AddOns\\SpectrumFederation\\Media\\Icons\\Action_Pushed"
     )
     actionBtn:SetPoint("TOP", sectionTitle.title, "BOTTOM", 0, -20)
     

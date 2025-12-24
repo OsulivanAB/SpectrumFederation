@@ -92,7 +92,7 @@ SpectrumFederation.lua               # Entry point, event registration
 - `SF:CreateTooltip(frame, title, lines)` - Attach tooltips to frames
 - `SF:CreateHorizontalLine(parent, width)` - Visual separators
 - `SF:CreateSectionTitle(parent, titleText, anchorFrame, yOffset)` - Section titles with lines
-- `SF:CreateIconButton(parent, iconPath, size)` - Icon buttons
+- `SF:CreateIconButton(parent, size, normalTexture, highlightTexture, pushedTexture)` - Icon buttons
 
 **MemberQuery (`modules/LootHelper/MemberQuery.lua`):**
 - `SF:GetTestMembers()` - Returns 15 test members for development
