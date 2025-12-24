@@ -102,6 +102,8 @@ function LootWindow:SetEnabled(enabled)
     end
 end
 
+-- Function to create the Loot Helper UI window
+-- @return: The created frame
 function LootWindow:Create()
 
     -- Check if frame already exists
@@ -135,7 +137,7 @@ function LootWindow:Create()
 
     -- Title bar (drag handle)
     local titleBar = CreateFrame("Frame", nil, frame, "BackdropTemplate")
-    titleBar:SetHeight(28)
+    titleBar:SetHeight(14)
     titleBar:SetPoint("TOPLEFT", 6, -6)
     titleBar:SetPoint("TOPRIGHT", -6, -6)
     titleBar:SetBackdrop({
@@ -145,13 +147,14 @@ function LootWindow:Create()
     })
     titleBar:SetBackdropColor(0.12, 0.12, 0.16, 0.95)   -- Slightly lighter for title bar
 
-    local titleText = titleBar:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    local titleText = titleBar:CreateFontString(nil, "OVERLAY", "GameFontNormalMed1")
     titleText:SetPoint("CENTER", titleBar, "CENTER", 0, 0)
     titleText:SetText("Spectrum Loot Helper")
 
     -- Close Button
     local CloseButton = CreateFrame("Button", nil, titleBar, "UIPanelCloseButton")
-    CloseButton:SetPoint("TOPRIGHT", -6, -6)
+    CloseButton:SetSize(16, 16)
+    CloseButton:SetPoint("TOPRIGHT", -3, -3)
     CloseButton:SetScript("OnClick", function()
         frame:Hide()
         SaveFrameState(frame)
@@ -174,15 +177,15 @@ function LootWindow:Create()
     frame:SetResizable(true)
     -- Prefer SetResizeBounds if available; fallback to SetMinResize for older builds
     if frame.SetResizeBounds then
-        frame:SetResizeBounds(320, 220, 900, 700)  -- minWidth, minHeight, maxWidth, maxHeight
+        frame:SetResizeBounds(240, 220, 900, 700)  -- minWidth, minHeight, maxWidth, maxHeight
     else
-        frame:SetMinResize(320, 220)
+        frame:SetMinResize(240, 220)
     end
 
     -- Reesize grip (bottom-right corner)
     local resizeGrip = CreateFrame("Button", nil, frame)
     resizeGrip:SetSize(18, 18)
-    resizeGrip:SetPoint("BOTTOMRIGHT", -6, -6)
+    resizeGrip:SetPoint("BOTTOMRIGHT", -2, 2)
     resizeGrip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
     resizeGrip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
     resizeGrip:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
@@ -231,19 +234,4 @@ function LootWindow:Create()
 
     self.frame = frame
     return frame
-end
-
--- Function to Toggle the Loot Helper UI window
-function LootWindow:Toggle()
-    if not self.frame then
-        self:Create()
-    end
-
-    if self.frame:IsShown() then
-        self.frame:Hide()
-        self.frame.disabledOverlay:Show()
-    else
-        self.frame:Show()
-        self.frame.disabledOverlay:Hide()
-    end
 end
