@@ -12,7 +12,7 @@ SF:RegisterSlashCommand("loot", function(args)
         if SF.LootWindow then
             SF.LootWindow:ToggleTestMode()
         else
-            print("|cff00ff00Spectrum Federation:|r Loot Helper not initialized")
+            SF:PrintError("Loot Helper not initialized")
         end
     else
         -- Default behavior - toggle UI
@@ -27,7 +27,7 @@ SF:RegisterSlashCommand("loot test", function(args)
     if SF.LootWindow then
         SF.LootWindow:ToggleTestMode()
     else
-        print("|cff00ff00Spectrum Federation:|r Loot Helper not initialized")
+        SF:PrintError("Loot Helper not initialized")
     end
 end, "Toggle Loot Helper test mode (shows 15 test members)")
 
