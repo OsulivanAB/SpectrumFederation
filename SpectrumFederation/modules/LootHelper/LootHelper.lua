@@ -7,7 +7,29 @@ function SF:ToggleLootHelperUI()
 end
 
 -- Register the slash command to toggle loot helper UI
-SF:RegisterSlashCommand("loot", SF:ToggleLootHelperUI(), "Toggle the Loot Helper UI window.")
+SF:RegisterSlashCommand("loot", function(args)
+    if args and args:lower() == "test" then
+        if SF.LootWindow then
+            SF.LootWindow:ToggleTestMode()
+        else
+            print("|cff00ff00Spectrum Federation:|r Loot Helper not initialized")
+        end
+    else
+        -- Default behavior - toggle UI
+        SF:ToggleLootHelperUI()
+    end
+end, "Toggle the Loot Helper UI window")
+
+-- Register the test mode subcommand for help display
+SF:RegisterSlashCommand("loot test", function(args)
+    -- This handler won't be called directly (loot handles it)
+    -- But registering it makes it show up in /sf help
+    if SF.LootWindow then
+        SF.LootWindow:ToggleTestMode()
+    else
+        print("|cff00ff00Spectrum Federation:|r Loot Helper not initialized")
+    end
+end, "Toggle Loot Helper test mode (shows 15 test members)")
 
 -- Creates a new loot helper entry in the database
 function SF:CreateLootHelperEntry(entryData)

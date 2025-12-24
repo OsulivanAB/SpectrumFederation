@@ -226,4 +226,37 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
     newLootProfileInputBox:SetScript("OnEnterPressed", function()
         createLootProfileBtn:Click()
     end)
+
+    -- Test Mode Toggle Button
+    local testModeBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    testModeBtn:SetPoint("TOPLEFT", createLootProfileLabel, "BOTTOMLEFT", 0, -60)
+    testModeBtn:SetSize(150, 30)
+    
+    -- Initialize button text based on current test mode state
+    local testModeText = "Test Mode: OFF"
+    if SF.LootWindow and SF.LootWindow.testModeActive then
+        testModeText = "Test Mode: ON"
+    end
+    testModeBtn:SetText(testModeText)
+    
+    -- OnClick handler
+    testModeBtn:SetScript("OnClick", function(self)
+        if SF.LootWindow then
+            SF.LootWindow:ToggleTestMode()
+        else
+            print("|cFF00FF00" .. addonName .. "|r: Loot Helper window not yet initialized. Use '/sf loot' to create it first.")
+        end
+    end)
+    
+    -- Tooltip
+    testModeBtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Toggle Test Mode", 1, 1, 1)
+        GameTooltip:AddLine("Shows fake members instead of real group data.", nil, nil, nil, true)
+        GameTooltip:Show()
+    end)
+    testModeBtn:SetScript("OnLeave", GameTooltip_Hide)
+    
+    -- Store button reference for updates from ToggleTestMode()
+    SF.LootHelperTestModeButton = testModeBtn
 end
