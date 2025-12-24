@@ -178,7 +178,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          python3 .github/scripts/publish_release.py "${{ needs.extract-version.outputs.version }}"
+          python3 .github/scripts/publish_release.py "${{ needs.extract-version.outputs.version }}" --interface "${{ needs.extract-version.outputs.interface }}"
 
   cleanup-merged-branch:
     name: Cleanup Merged Branch

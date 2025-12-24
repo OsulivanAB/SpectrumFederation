@@ -1,15 +1,9 @@
 -- Grab the namespace
 local addonName, SF = ...
 
--- Helper Function to get the current player's info
-local function GetPlayerInfo()
-    local name = UnitName("player")
-    local realm = GetRealmName()
-    if SF.Debug then SF.Debug:Verbose("PROFILES", "Retrieved player info: %s-%s", name, realm) end
-    return name, realm
-end
-
 -- CREATE: Add a new profile
+-- @param profileName: The name of the new profile to create
+-- @return: none
 function SF:CreateNewLootProfile(profileName)
 
     -- Input Validation
@@ -27,7 +21,7 @@ function SF:CreateNewLootProfile(profileName)
     end
 
     -- Construct the Profile Object
-    local playerName, realmName = GetPlayerInfo()
+    local playerName, realmName = SF:GetPlayerInfo()
     local adminKey = playerName .. "-" .. realmName
 
     local newProfile = {
@@ -50,6 +44,8 @@ function SF:CreateNewLootProfile(profileName)
 end
 
 -- UPDATE: Set the active profile
+-- @param profileName: The name of the profile to set as active
+-- @return: none
 function SF:SetActiveLootProfile(profileName)
 
     -- Input Validation
@@ -74,6 +70,8 @@ function SF:SetActiveLootProfile(profileName)
 end
 
 -- DELETE: Remove a profile
+-- @param profileName: The name of the profile to delete
+-- @return: none
 function SF:DeleteProfile(profileName)
 
     if self.db.lootProfiles[profileName] then

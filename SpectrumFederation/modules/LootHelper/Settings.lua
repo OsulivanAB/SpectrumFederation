@@ -15,7 +15,7 @@ function SF:UpdateLootProfileDropdownText()
         return
     end
 
-    local currentProfile = SF.db.activeLootProfile
+    local currentProfile = SF.lootHelperDB.activeLootProfile
     if currentProfile then
         SF.LootProfileDropdown.Text:SetText(currentProfile)
         if SF.LootProfileDeleteButton then SF.LootProfileDeleteButton:Show() end
@@ -70,9 +70,45 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
         end
     end)
 
+    -- Enable/Disable Loot Helper Checkbox
+    local enableCheckbox = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
+    enableCheckbox:SetPoint("TOPLEFT", leftLine, "BOTTOMLEFT", 0, -20)
+    enableCheckbox:SetSize(24, 24)
+    
+    -- Checkbox Label
+    local enableLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    enableLabel:SetPoint("LEFT", enableCheckbox, "RIGHT", 5, 0)
+    enableLabel:SetText("Enable Loot Helper")
+    
+    -- Initialize checkbox state from database
+    if SF.lootHelperDB and SF.lootHelperDB.windowSettings then
+        enableCheckbox:SetChecked(SF.lootHelperDB.windowSettings.enabled)
+    end
+    
+    -- OnClick handler
+    enableCheckbox:SetScript("OnClick", function(self)
+        local enabled = self:GetChecked()
+        
+        -- Update database and frame visuals
+        if SF.LootWindow and SF.LootWindow.SetEnabled then
+            SF.LootWindow:SetEnabled(enabled)
+        else
+            -- Fallback if LootWindow not yet loaded
+            if SF.lootHelperDB and SF.lootHelperDB.windowSettings then
+                SF.lootHelperDB.windowSettings.enabled = enabled
+            end
+            if SF.Debug then
+                SF.Debug:Info("LOOT_HELPER", "Loot Helper %s (window not yet created)", enabled and "enabled" or "disabled")
+            end
+        end
+        
+        -- Print feedback to user
+        print("|cFF00FF00" .. addonName .. "|r: Loot Helper " .. (enabled and "enabled" or "disabled") .. ".")
+    end)
+
     -- Label for the Dropdown
     local profileLabel = panel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
-    profileLabel:SetPoint("TOPLEFT", anchorFrame, "BOTTOMLEFT", 10, -50)
+    profileLabel:SetPoint("TOPLEFT", enableCheckbox, "BOTTOMLEFT", 0, -20)
     profileLabel:SetText("Select Active Profile:")
 
     -- Dropdown for selecting active profile
@@ -91,12 +127,12 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
 
         -- Sort the keys by modified descending
         local sortedNames = {}
-        for profileName, _ in pairs(SF.db.lootProfiles) do
+        for profileName, _ in pairs(SF.lootHelperDB.lootProfiles) do
             table.insert(sortedNames, profileName)
         end
         table.sort(sortedNames, function(a, b)
-            local timeA = SF.db.lootProfiles[a].modified or 0
-            local timeB = SF.db.lootProfiles[b].modified or 0
+            local timeA = SF.lootHelperDB.lootProfiles[a].modified or 0
+            local timeB = SF.lootHelperDB.lootProfiles[b].modified or 0
             return timeA > timeB
         end)
 
@@ -137,9 +173,9 @@ function SF:CreateLootHelperSection(panel, anchorFrame)
 
     -- logic to delete
     deleteProfileBtn:SetScript("OnClick", function()
-        if SF.db.activeLootProfile then
-            if SF.Debug then SF.Debug:Info("UI", "User clicked delete button for profile '%s'", SF.db.activeLootProfile) end
-            SF:DeleteProfile(SF.db.activeLootProfile)
+        if SF.lootHelperDB.activeLootProfile then
+            if SF.Debug then SF.Debug:Info("UI", "User clicked delete button for profile '%s'", SF.lootHelperDB.activeLootProfile) end
+            SF:DeleteProfile(SF.lootHelperDB.activeLootProfile)
         else
             if SF.Debug then SF.Debug:Warn("UI", "User clicked delete button but no active profile exists") end
             print("|cFFFF0000" .. addonName .. "|r: No active profile to delete.")
