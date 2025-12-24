@@ -142,11 +142,6 @@ SF.debugDB       -- Points to SpectrumFederationDebugDB
     },
     activeProfile = "ProfileName"  -- Current active profile
 }
-    modified = timestamp
-        }
-    },
-    activeLootProfile = "ProfileName"  -- Current active profile
-}
 
 -- SpectrumFederationDebugDB (debug logging)
 {
