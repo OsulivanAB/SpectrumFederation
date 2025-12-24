@@ -152,14 +152,15 @@ line:SetPoint("TOP", title, "BOTTOM", 0, -5)
 
 ---
 
-### SF:CreateSectionTitle(parent, text, yOffset)
+### SF:CreateSectionTitle(parent, titleText, anchorFrame, yOffset)
 
 Creates a section title with horizontal lines on both sides for visual hierarchy.
 
 **Parameters:**
 - `parent` (Frame) - The parent frame
-- `text` (string) - The title text
-- `yOffset` (number) - Vertical offset from the top of the parent frame
+- `titleText` (string) - The title text to display
+- `anchorFrame` (Frame) - The frame to anchor below
+- `yOffset` (number, optional) - Vertical offset from anchor (negative = below, defaults to -20)
 
 **Returns:** (table) A table containing:
     - `title` (FontString) - The title text object
@@ -175,7 +176,7 @@ Creates a section title with horizontal lines on both sides for visual hierarchy
 
 **Example:**
 ```lua
-local sectionTitle = SF:CreateSectionTitle(panel, "Loot Helper", -20)
+local sectionTitle = SF:CreateSectionTitle(panel, "Loot Helper", banner, -20)
 
 -- Update line widths when panel is resized
 panel:SetScript("OnSizeChanged", function()
