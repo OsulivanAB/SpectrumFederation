@@ -15,12 +15,19 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 
 **Current File Structure:**
 - `SpectrumFederation.lua` - Entry point, event registration, database init
-- `modules/debug.lua` - Debug logging system with levels (VERBOSE/INFO/WARN/ERROR)
-- `modules/LootProfiles.lua` - Profile CRUD operations (Create, Read, Update, Delete)
-- `modules/settings_ui.lua` - Main settings panel with banner
-- `modules/core.lua` - **REMOVED** (empty file, not loaded in TOC)
-- `settings/loot_helper.lua` - Loot Helper UI section with profile management
-- `locale/enUS.lua` - Localization strings (not yet loaded in TOC or used)
+- `modules/Debug.lua` - Debug logging system with levels (VERBOSE/INFO/WARN/ERROR)
+- `modules/Core.lua` - Core addon functionality
+- `modules/MessageHelpers.lua` - Color-coded user messaging (PrintSuccess/Error/Warning/Info)
+- `modules/UIHelpers.lua` - Reusable UI components (tooltips, lines, titles, buttons)
+- `modules/SlashCommands.lua` - Slash command registration and handling
+- `modules/Settings.lua` - Main settings panel with banner
+- `modules/LootHelper/Database.lua` - Loot Helper database initialization
+- `modules/LootHelper/LootProfiles.lua` - Profile CRUD operations
+- `modules/LootHelper/LootHelper.lua` - Core loot helper functionality
+- `modules/LootHelper/MemberQuery.lua` - Raid/party/solo member queries
+- `modules/LootHelper/Settings.lua` - Loot Helper settings UI section
+- `modules/LootHelper/UI.lua` - Loot Helper window frame
+- `locale/enUS.lua` - Localization strings (loaded in TOC, ready for use)
 
 ## Critical Branch & Version Rules
 
@@ -50,20 +57,50 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 
 **TOC File Load Order (SpectrumFederation.toc):**
 ```
-SpectrumFederation.lua         # Entry point, event registration, DB init
-modules/debug.lua              # Debug logging system (load early)
-modules/LootProfiles.lua       # Profile CRUD operations
-settings/loot_helper.lua       # Loot Helper UI section
-modules/settings_ui.lua        # Main settings panel frame
+modules/Debug.lua                    # Debug logging system (load early)
+modules/LootHelper/Database.lua      # Loot Helper database init
+modules/SlashCommands.lua            # Slash command infrastructure
+modules/MessageHelpers.lua           # User messaging helpers
+modules/UIHelpers.lua                # UI component helpers
+modules/LootHelper/MemberQuery.lua   # Member query functions
+modules/LootHelper/LootProfiles.lua  # Profile CRUD operations
+modules/LootHelper/LootHelper.lua    # Core loot helper logic
+modules/LootHelper/Settings.lua      # Loot Helper settings UI
+modules/LootHelper/UI.lua            # Loot Helper window frame
+modules/Settings.lua                 # Main settings panel
+modules/Core.lua                     # Core addon functionality
+SpectrumFederation.lua               # Entry point, event registration
 ```
 
 **Adding New Files:**
 1. Create under appropriate directory:
    - `SpectrumFederation/modules/` for core functionality
-   - `SpectrumFederation/settings/` for UI sections
+   - `SpectrumFederation/modules/LootHelper/` for Loot Helper features
 2. Add to `.toc` after dependencies, before dependents
 3. Use namespace pattern: `local addonName, SF = ...`
 4. For settings sections: Create a function like `SF:CreateYourSection(panel, anchorFrame)`
+
+## Helper Functions
+
+**MessageHelpers (`modules/MessageHelpers.lua`):**
+- `SF:PrintSuccess(message)` - Green success messages
+- `SF:PrintError(message)` - Red error messages
+- `SF:PrintWarning(message)` - Orange warning messages
+- `SF:PrintInfo(message)` - White informational messages
+
+**UIHelpers (`modules/UIHelpers.lua`):**
+- `SF:CreateTooltip(frame, title, lines)` - Attach tooltips to frames
+- `SF:CreateHorizontalLine(parent, width)` - Visual separators
+- `SF:CreateSectionTitle(parent, text, yOffset)` - Section titles with lines
+- `SF:CreateIconButton(parent, iconPath, size)` - Icon buttons
+
+**MemberQuery (`modules/LootHelper/MemberQuery.lua`):**
+- `SF:GetTestMembers()` - Returns 15 test members for development
+- `SF:GetRaidMembers()` - Query all raid members (1-40)
+- `SF:GetPartyMembers()` - Query party members (player + party1-4)
+- `SF:GetSoloPlayer()` - Return solo player info
+
+Use these helpers consistently throughout the addon for maintainability. See `docs/development/helper-functions.md` for detailed documentation with examples and WoW API references.
 
 ## Namespace & SavedVariables Pattern
 
@@ -84,22 +121,28 @@ end
 SF.Debug     -- Logging system (debug.lua)
 
 -- SavedVariables references (set in SpectrumFederation.lua)
-SF.db        -- Points to SpectrumFederationDB
-SF.debugDB   -- Points to SpectrumFederationDebugDB
+SF.lootHelperDB  -- Points to SpectrumFederationDB
+SF.debugDB       -- Points to SpectrumFederationDebugDB
 ```
 
 **SavedVariables Structure:**
 ```lua
 -- SpectrumFederationDB (declared in .toc)
 {
-    lootProfiles = {
+    profiles = {
         ["ProfileName"] = {
             name = "ProfileName",
-            owner = "PlayerName",
-            server = "RealmName",
-            admins = { "PlayerName-RealmName" },
+            owner = "PlayerName-RealmName",
             created = timestamp,
-            modified = timestamp
+            modified = timestamp,
+            members = {
+                {name = "Name", realm = "Realm", classFilename = "CLASS", points = 0}
+            }
+        }
+    },
+    activeProfile = "ProfileName"  -- Current active profile
+}
+    modified = timestamp
         }
     },
     activeLootProfile = "ProfileName"  -- Current active profile
@@ -115,7 +158,7 @@ SF.debugDB   -- Points to SpectrumFederationDebugDB
 
 **Character Keys:** Always use `"Name-Realm"` format (e.g., `"Shadowbane-Garona"`)
 
-**Localization:** The `locale/enUS.lua` file exists but is not yet loaded in the TOC or used in the codebase. It uses `ns.L` namespace pattern. When implementing localization, add the file to the TOC after modules and update code to use localization strings.
+**Localization:** Use `locale/enUS.lua` for all user-facing strings. Access via `ns.L` table. Add new strings to locale files. Existing code not using localization will be updated in future bug fix.
 
 ## Code Patterns & Conventions
 
@@ -177,14 +220,29 @@ function SF:CreateNewLootProfile(profileName)
 end
 
 function SF:SetActiveLootProfile(profileName)
-    SF.db.activeLootProfile = profileName
+    SF.lootHelperDB.activeProfile = profileName
     if SF.Debug then SF.Debug:Info("PROFILES", "Set active profile to '%s'", profileName) end
 end
 
 function SF:DeleteProfile(profileName)
-    SF.db.lootProfiles[profileName] = nil
+    SF.lootHelperDB.profiles[profileName] = nil
     if SF.Debug then SF.Debug:Info("PROFILES", "Deleted profile '%s'", profileName) end
 end
+```
+
+**Messaging (use everywhere):**
+```lua
+-- Success messages
+SF:PrintSuccess("Profile created successfully!")
+
+-- Error messages
+SF:PrintError("Profile name cannot be empty!")
+
+-- Warning messages
+SF:PrintWarning("Profile has not been used in 30 days")
+
+-- Info messages
+SF:PrintInfo("Addon loaded. Type /sf to open settings.")
 ```
 
 **Debug Logging (use everywhere):**
@@ -197,9 +255,9 @@ if SF.Debug then
 end
 ```
 
-**Settings UI Structure (settings_ui.lua + settings/loot_helper.lua):**
+**Settings UI Structure (Settings.lua + LootHelper/Settings.lua):**
 ```lua
--- Main settings panel (settings_ui.lua)
+-- Main settings panel (Settings.lua)
 function SF:CreateSettingsUI()
     local panel = CreateFrame("Frame", nil, UIParent)
     
@@ -215,7 +273,7 @@ function SF:CreateSettingsUI()
     Settings.RegisterAddOnCategory(category)
 end
 
--- Section file (settings/loot_helper.lua)
+-- Section file (LootHelper/Settings.lua)
 function SF:CreateLootHelperSection(panel, anchorFrame)
     -- Create subtitle with horizontal lines (90% width)
     -- Create profile dropdown
@@ -310,13 +368,13 @@ luacheck SpectrumFederation --only 0
 **Database Changes:**
 - Always check/initialize in `SF:InitializeDatabase()`
 - Log changes with `SF.Debug:Info()`
-- Access via `SF.db` (never direct `SpectrumFederationDB`)
-- Profile data: `SF.db.lootProfiles[profileName]`
-- Active profile: `SF.db.activeLootProfile`
+- Access via `SF.lootHelperDB` (never direct `SpectrumFederationDB`)
+- Profile data: `SF.lootHelperDB.profiles[profileName]`
+- Active profile: `SF.lootHelperDB.activeProfile`
 
 **UI Components:**
-- Create main panel in `modules/settings_ui.lua`
-- Create UI sections in `settings/` directory
+- Create main panel in `modules/Settings.lua`
+- Create UI sections in `modules/` directory
 - Store UI elements in SF namespace (e.g., `SF.LootProfileDropdown`)
 - Use `UIParent` as parent for main frames
 - Banner scales to 90% of panel width with aspect ratio preserved
@@ -352,9 +410,9 @@ luacheck SpectrumFederation --only 0
 - ❌ Never load files before their dependencies
 
 **SavedVariables:**
-- ✅ Always access via `SF.db` and `SF.debugDB`
+- ✅ Always access via `SF.lootHelperDB` and `SF.debugDB`
 - ✅ Always initialize in `SF:InitializeDatabase()`
-- ✅ Profile data stored in `SF.db.lootProfiles`
+- ✅ Profile data stored in `SF.lootHelperDB.profiles`
 
 **Best Practices:**
 - ✅ Use debug logging extensively: `SF.Debug:Info("CATEGORY", "message")`
@@ -372,13 +430,21 @@ SpectrumFederation/
 ├── SpectrumFederation.lua    # Entry point, events
 ├── SpectrumFederation.toc    # MUST bump version
 ├── modules/
-│   ├── debug.lua             # Logging system
-│   ├── LootProfiles.lua      # Profile CRUD
-│   └── settings_ui.lua       # Main settings panel
-├── settings/
-│   └── loot_helper.lua       # Loot Helper section
+│   ├── Debug.lua             # Logging system
+│   ├── Core.lua              # Core functionality
+│   ├── MessageHelpers.lua    # User messaging
+│   ├── UIHelpers.lua         # UI components
+│   ├── SlashCommands.lua     # Slash commands
+│   ├── Settings.lua          # Main settings panel
+│   └── LootHelper/
+│       ├── Database.lua      # Database init
+│       ├── LootProfiles.lua  # Profile CRUD
+│       ├── LootHelper.lua    # Core logic
+│       ├── MemberQuery.lua   # Member queries
+│       ├── Settings.lua      # Settings UI
+│       └── UI.lua            # Window frame
 ├── locale/
-│   └── enUS.lua              # Localization (not yet loaded)
+│   └── enUS.lua              # Localization
 └── media/                    # Icons, textures
 ```
 
