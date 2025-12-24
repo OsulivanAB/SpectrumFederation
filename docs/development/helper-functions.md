@@ -529,9 +529,9 @@ SF:InitializeSlashCommands()
 Here's how to combine multiple helper functions when creating a new feature panel:
 
 ```lua
-function SF:CreateMyFeaturePanel(parent)
+function SF:CreateMyFeaturePanel(parent, anchorFrame)
     -- Create section title with lines
-    local sectionTitle = SF:CreateSectionTitle(parent, "My Feature", -20)
+    local sectionTitle = SF:CreateSectionTitle(parent, "My Feature", anchorFrame, -20)
     
     -- Create an icon button
     local actionBtn = SF:CreateIconButton(
