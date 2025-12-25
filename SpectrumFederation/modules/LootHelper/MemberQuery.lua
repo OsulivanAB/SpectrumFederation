@@ -75,9 +75,9 @@ function SF:GetPartyMembers()
     local members = {}
     
     -- Add player first
-    local playerName = UnitName("player")
+    local playerName, playerRealm = UnitName("player")
+    playerRealm = playerRealm or GetRealmName()
     local _, playerClass = UnitClass("player")
-    local playerRealm = GetRealmName()
     
     table.insert(members, {
         name = playerName,
@@ -124,9 +124,9 @@ end
 -- Helper function to get solo player data
 -- @return: Array with single player member data
 function SF:GetSoloPlayer()
-    local playerName = UnitName("player")
+    local playerName, playerRealm = UnitName("player")
+    playerRealm = playerRealm or GetRealmName()
     local _, playerClass = UnitClass("player")
-    local playerRealm = GetRealmName()
     
     if SF.Debug then
         SF.Debug:Info("LOOT_HELPER", "Solo mode: showing player only")
