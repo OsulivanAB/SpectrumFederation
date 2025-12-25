@@ -12,7 +12,7 @@ The MessageHelpers module provides color-coded user messaging functions for cons
 
 ### SF:PrintSuccess(message)
 
-Prints a success message in green to the chat frame.
+Prints a success message to the chat frame with the addon prefix in green.
 
 **Parameters:**
 - `message` (string) - The message to display
