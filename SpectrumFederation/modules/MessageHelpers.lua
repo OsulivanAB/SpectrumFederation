@@ -7,13 +7,12 @@ local COLOR_ERROR = "|cFFFF0000"    -- Red
 local COLOR_WARNING = "|cFFFFA500"  -- Orange
 local COLOR_INFO = "|cFFFFFFFF"     -- White
 local COLOR_RESET = "|r"
-local ADDON_PREFIX = "|cFF00FF00Spectrum Federation:|r "
 
 -- Helper function to print a success message
 -- @param message: The message to display
 -- @return: none
 function SF:PrintSuccess(message)
-    print(ADDON_PREFIX .. message)
+    print(COLOR_SUCCESS .. addonName .. COLOR_RESET .. ": " .. message)
 end
 
 -- Helper function to print an error message
