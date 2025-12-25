@@ -91,9 +91,19 @@ function SF:GetPartyMembers()
     for i = 1, numParty do
         local unitToken = "party" .. i
         if UnitExists(unitToken) then
-            local name = UnitName(unitToken)
+            local fullName = UnitName(unitToken)
             local _, classFilename = UnitClass(unitToken)
-            local realm = GetRealmName()  -- Assumes same realm for party members
+            local name = fullName
+            local realm = GetRealmName()
+            
+            -- If name has a realm attached (from another server), parse it
+            if fullName and fullName:find("-") then
+                local namePart, realmPart = fullName:match("^(.+)-(.+)$")
+                if namePart and realmPart then
+                    name = namePart
+                    realm = realmPart
+                end
+            end
             
             table.insert(members, {
                 name = name,
