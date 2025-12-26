@@ -138,7 +138,7 @@ local function CreateDeleteButton(panel, dropdown)
     deleteProfileBtn:SetPushedTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Down")
 
     -- Tooltip
-    SF:CreateTooltip(deleteProfileBtn, "Delete Active Profile")
+    SF:CreateTooltip(deleteProfileBtn, "Delete Active Profile", nil)
 
     -- logic to delete
     deleteProfileBtn:SetScript("OnClick", function()
