@@ -80,7 +80,7 @@ body:
     attributes:
       label: Addon Debug Logs
       description: If the addon has a specific debug mode or output, paste that here.
-      placeholder: [Debug] Initialized... [Debug] Event triggered...
+      placeholder: "[Debug] Initialized... [Debug] Event triggered..."
       render: text
     validations:
       required: false
