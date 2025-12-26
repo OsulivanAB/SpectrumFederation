@@ -142,9 +142,9 @@ local function CreateDeleteButton(panel, dropdown)
 
     -- logic to delete
     deleteProfileBtn:SetScript("OnClick", function()
-        if SF.lootHelperDB.activeLootProfile then
-            if SF.Debug then SF.Debug:Info("UI", "User clicked delete button for profile '%s'", SF.lootHelperDB.activeLootProfile) end
-            SF:DeleteProfile(SF.lootHelperDB.activeLootProfile)
+        if SF.lootHelperDB.activeProfile then
+            if SF.Debug then SF.Debug:Info("UI", "User clicked delete button for profile '%s'", SF.lootHelperDB.activeProfile) end
+            SF:DeleteProfile(SF.lootHelperDB.activeProfile)
         else
             if SF.Debug then SF.Debug:Warn("UI", "User clicked delete button but no active profile exists") end
             SF:PrintError("No active profile to delete.")

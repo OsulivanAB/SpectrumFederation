@@ -56,7 +56,7 @@ function SF:SetActiveLootProfile(profileName)
     end
 
     -- Set the active profile
-    self.db.activeLootProfile = profileName
+    self.db.activeProfile = profileName
     if SF.Debug then SF.Debug:Info("PROFILES", "Set active profile to '%s'", profileName) end
     SF:PrintSuccess("Active profile set to '" .. profileName .. "'.")
 
@@ -82,8 +82,8 @@ function SF:DeleteProfile(profileName)
         SF:PrintSuccess("Profile '" .. profileName .. "' deleted successfully.")
 
         -- If the deleted profile was active, clear the active profile
-        if self.db.activeLootProfile == profileName then
-            self.db.activeLootProfile = nil
+        if self.db.activeProfile == profileName then
+            self.db.activeProfile = nil
             if SF.Debug then SF.Debug:Info("PROFILES", "Cleared active profile as it was deleted") end
             SF:PrintWarning("Active profile cleared as it was deleted.")
         end
