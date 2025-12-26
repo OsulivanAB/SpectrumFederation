@@ -14,7 +14,7 @@ function SF:CreateNewLootProfile(profileName)
     end
 
     -- Check if profile already exists
-    if self.db.lootProfiles[profileName] then
+    if SF.lootHelperDB.lootProfiles[profileName] then
         if SF.Debug then SF.Debug:Warn("PROFILES", "CreateNewLootProfile failed: Profile '%s' already exists", profileName) end
         SF:PrintError("Profile '" .. profileName .. "' already exists.")
         return
@@ -34,7 +34,7 @@ function SF:CreateNewLootProfile(profileName)
     }
 
     -- Save the new profile to the database
-    self.db.lootProfiles[profileName] = newProfile
+    SF.lootHelperDB.lootProfiles[profileName] = newProfile
     if SF.Debug then SF.Debug:Info("PROFILES", "Created new profile '%s' with owner %s", profileName, adminKey) end
     SF:PrintSuccess("Profile '" .. profileName .. "' created successfully.")
 
@@ -49,14 +49,14 @@ end
 function SF:SetActiveLootProfile(profileName)
 
     -- Input Validation
-    if not self.db.lootProfiles[profileName] then
+    if not SF.lootHelperDB.lootProfiles[profileName] then
         if SF.Debug then SF.Debug:Warn("PROFILES", "SetActiveLootProfile failed: Profile '%s' does not exist", profileName) end
         SF:PrintError("Profile '" .. profileName .. "' does not exist.")
         return
     end
 
     -- Set the active profile
-    self.db.activeProfile = profileName
+    SF.lootHelperDB.activeProfile = profileName
     if SF.Debug then SF.Debug:Info("PROFILES", "Set active profile to '%s'", profileName) end
     SF:PrintSuccess("Active profile set to '" .. profileName .. "'.")
 
@@ -74,16 +74,16 @@ end
 -- @return: none
 function SF:DeleteProfile(profileName)
 
-    if self.db.lootProfiles[profileName] then
+    if SF.lootHelperDB.lootProfiles[profileName] then
 
         -- Remove the profile from the database
-        self.db.lootProfiles[profileName] = nil
+        SF.lootHelperDB.lootProfiles[profileName] = nil
         if SF.Debug then SF.Debug:Info("PROFILES", "Deleted profile '%s'", profileName) end
         SF:PrintSuccess("Profile '" .. profileName .. "' deleted successfully.")
 
         -- If the deleted profile was active, clear the active profile
-        if self.db.activeProfile == profileName then
-            self.db.activeProfile = nil
+        if SF.lootHelperDB.activeProfile == profileName then
+            SF.lootHelperDB.activeProfile = nil
             if SF.Debug then SF.Debug:Info("PROFILES", "Cleared active profile as it was deleted") end
             SF:PrintWarning("Active profile cleared as it was deleted.")
         end
