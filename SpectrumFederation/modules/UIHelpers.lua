@@ -3,10 +3,17 @@ local addonName, SF = ...
 
 -- Helper function to create a tooltip for a button or frame
 -- @param frame: The frame to attach the tooltip to
--- @param title: The tooltip title text
+-- @param title: The tooltip title text (required)
 -- @param lines: Optional array of additional tooltip lines
 -- @return: none
 function SF:CreateTooltip(frame, title, lines)
+    if not title then
+        if SF.Debug then
+            SF.Debug:Warn("UI_HELPERS", "CreateTooltip called without a title")
+        end
+        return
+    end
+    
     frame:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText(title, 1, 1, 1)
