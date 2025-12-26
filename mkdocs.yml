@@ -75,6 +75,7 @@ nav:
     - Settings UI: settings-ui.md
   - Development:
     - Getting Started: development/index.md
+    - Helper Functions: development/helper-functions.md
     - CI/CD Workflows: development/workflows.md
     - Promoting Beta to Main: development/promoting-to-main.md
     - Naming Conventions: development/naming-conventions.md
