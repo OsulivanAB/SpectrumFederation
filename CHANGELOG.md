@@ -6,6 +6,20 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.1.1-beta.1] - Unreleased
+
+### Added
+- Introduced a debug logging system with commands to enable, disable, view, and clear logs (`/sf debug`).
+- Added a Debug Viewer UI for viewing and copying debug logs.
+- Enhanced Loot Helper module with new slash commands for toggling test mode, checking status, and force-enabling the Loot Helper UI.
+- Implemented a toggleable Loot Helper UI window with dynamic content updates and improved visibility controls.
+
+### Changed
+- Improved error and success messaging across the addon for better user feedback.
+- Updated Loot Helper database structure to support enhanced functionality.
+- Refactored profile management to use the updated database structure and provide clearer feedback during operations.
+
 ## [0.1.0] - 2025-12-24
 
 ### Changed
