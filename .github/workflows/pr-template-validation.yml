@@ -1,0 +1,26 @@
+name: PR Template Validation
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches:
+      - beta
+
+jobs:
+  validate-pr-description:
+    runs-on: ubuntu-latest
+    name: Validate PR Description
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate PR Template
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 .github/scripts/validate_pr_template.py
