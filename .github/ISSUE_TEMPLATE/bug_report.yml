@@ -1,0 +1,86 @@
+name: 🐛 Bug Report
+description: Create a report to help us improve the addon
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report! Please ensure you search existing issues first to avoid duplicates.
+
+  - type: dropdown
+    id: wow-client
+    attributes:
+      label: WoW Client Type
+      description: Which environment are you playing on?
+      options:
+        - Retail (The War Within)
+        - Cataclysm Classic
+        - Classic Era / SoD
+        - Public Test Realm (PTR)
+        - Beta
+    validations:
+      required: true
+
+  - type: input
+    id: wow-version
+    attributes:
+      label: WoW Game Version
+      description: |
+        What specific patch are you on? (e.g., 11.0.2, 4.4.0)
+        **How to find this:** It is displayed in the bottom-left corner of the character selection screen.
+      placeholder: e.g. 11.0.2
+    validations:
+      required: true
+
+  - type: input
+    id: addon-version
+    attributes:
+      label: Addon Version
+      description: |
+        Please verify the version number of THIS addon.
+        **How to find this:** Open the CurseForge/WoWUp app OR look at the `.toc` file in your AddOns folder.
+      placeholder: e.g., v1.4.2
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Describe the Bug
+      description: A clear and concise description of what the bug is.
+      placeholder: When I cast Fireball while moving, the frame disappears...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Go to '...'
+        2. Click on '....'
+        3. Scroll down to '....'
+        4. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: lua-errors
+    attributes:
+      label: Lua Errors
+      description: Please copy and paste any Lua errors (enable Lua errors in WoW settings /console scriptErrors 1).
+      render: lua
+    validations:
+      required: false
+
+  - type: textarea
+    id: debug-logs
+    attributes:
+      label: Addon Debug Logs
+      description: If the addon has a specific debug mode or output, paste that here.
+      placeholder: [Debug] Initialized... [Debug] Event triggered...
+      render: text
+    validations:
+      required: false
