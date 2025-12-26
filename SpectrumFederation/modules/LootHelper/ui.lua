@@ -71,8 +71,22 @@ end
 -- @param enabled: Boolean indicating whether the frame is enabled or disabled.
 -- @return: none
 local function SetEnabledVisuals(frame, enabled)
+    if SF.Debug then
+        SF.Debug:Info("LOOT_HELPER", "SetEnabledVisuals called with enabled=%s", tostring(enabled))
+        if frame.content then
+            SF.Debug:Info("LOOT_HELPER", "Content frame exists, before SetShown: IsShown=%s", tostring(frame.content:IsShown()))
+        else
+            SF.Debug:Error("LOOT_HELPER", "Content frame is NIL!")
+        end
+    end
+    
     frame.content:SetShown(enabled)
     frame.disabledOverlay:SetShown(not enabled)
+    
+    if SF.Debug then
+        SF.Debug:Info("LOOT_HELPER", "After SetShown: content:IsShown=%s, disabledOverlay:IsShown=%s", 
+            tostring(frame.content:IsShown()), tostring(frame.disabledOverlay:IsShown()))
+    end
 end
 
 -- Public method to set the enabled state of the Loot Helper
@@ -369,6 +383,29 @@ local function SetupEventHandlers(self, frame)
             self:PopulateContent(self.testModeActive)
         end)
     end)
+    
+    -- Update row widths when scroll frame resizes
+    if self.memberScrollFrame and self.memberRows then
+        self.memberScrollFrame:SetScript("OnSizeChanged", function(scrollFrame, width, height)
+            if SF.Debug then
+                SF.Debug:Verbose("LOOT_HELPER", "Scroll frame resized to %.0f x %.0f, updating row widths", width or 0, height or 0)
+            end
+            
+            -- Update scroll child width
+            if self.memberScrollChild then
+                self.memberScrollChild:SetWidth(width or 1)
+            end
+            
+            -- Update all row widths
+            for _, row in ipairs(self.memberRows) do
+                row:SetWidth(width or 1)
+                -- Trigger row layout update
+                if row.UpdateLayout then
+                    row:UpdateLayout()
+                end
+            end
+        end)
+    end
 
     -- Group roster update event
     local eventFrame = CreateFrame("Frame")
@@ -481,6 +518,11 @@ function LootWindow:Create()
 
     -- Apply saved state and initialize
     ApplyFrameState(frame)
+    
+    if SF.Debug then
+        SF.Debug:Info("LOOT_HELPER", "About to call SetEnabledVisuals with db.enabled=%s", tostring(db.enabled))
+    end
+    
     SetEnabledVisuals(frame, db.enabled)
     self:PopulateContent(false)
 
@@ -495,6 +537,10 @@ end
 -- @param rowHeight: Height of each row
 -- @return: none
 local function UpdateRowsWithMembers(rows, members, scrollChild, rowHeight)
+    if SF.Debug then
+        SF.Debug:Info("LOOT_HELPER", "UpdateRowsWithMembers called with %d members, %d rows available", #members, #rows)
+    end
+    
     for i, row in ipairs(rows) do
         if i <= #members then
             local member = members[i]
@@ -528,11 +574,14 @@ local function UpdateRowsWithMembers(rows, members, scrollChild, rowHeight)
             
             -- Update layout and show row
             row:UpdateLayout()
+            if SF.Debug then
+                SF.Debug:Info("LOOT_HELPER", "Showing row %d for %s-%s", i, member.name, member.realm)
+            end
             row:Show()
             
             if SF.Debug then
-                SF.Debug:Verbose("LOOT_HELPER", "Row %d: %s-%s (%s, %d points)", 
-                    i, member.name, member.realm, member.classFilename, member.points)
+                SF.Debug:Verbose("LOOT_HELPER", "Row %d: %s-%s (%s, %d points) - IsShown=%s", 
+                    i, member.name, member.realm, member.classFilename, member.points, tostring(row:IsShown()))
             end
         else
             -- Hide unused rows
@@ -555,16 +604,23 @@ end
 -- @return: none
 function LootWindow:PopulateContent(testMode)
     if SF.Debug then
-        SF.Debug:Verbose("LOOT_HELPER", "Populating member list")
-        if testMode then
-            SF.Debug:Info("LOOT_HELPER", "Test mode enabled")
+        SF.Debug:Info("LOOT_HELPER", "PopulateContent called - testMode=%s, IsInRaid=%s, IsInGroup=%s", 
+            tostring(testMode), tostring(IsInRaid()), tostring(IsInGroup()))
+        
+        -- Check content frame state
+        if self.frame and self.frame.content then
+            SF.Debug:Info("LOOT_HELPER", "Content frame state: IsShown=%s", tostring(self.frame.content:IsShown()))
+        else
+            SF.Debug:Error("LOOT_HELPER", "Frame or content missing! frame=%s, content=%s",
+                tostring(self.frame ~= nil), tostring(self.frame and self.frame.content ~= nil))
         end
     end
     
     -- Ensure frame and rows exist
     if not self.memberRows or not self.memberScrollChild then
         if SF.Debug then
-            SF.Debug:Warn("LOOT_HELPER", "PopulateContent called before frame creation")
+            SF.Debug:Error("LOOT_HELPER", "PopulateContent called before frame creation - memberRows=%s, memberScrollChild=%s",
+                tostring(self.memberRows ~= nil), tostring(self.memberScrollChild ~= nil))
         end
         return
     end
@@ -572,13 +628,21 @@ function LootWindow:PopulateContent(testMode)
     -- Get member data based on current context
     local members = {}
     if testMode then
+        if SF.Debug then SF.Debug:Info("LOOT_HELPER", "Using test members") end
         members = SF:GetTestMembers()
     elseif IsInRaid() then
+        if SF.Debug then SF.Debug:Info("LOOT_HELPER", "Querying raid members") end
         members = SF:GetRaidMembers()
     elseif IsInGroup() then
+        if SF.Debug then SF.Debug:Info("LOOT_HELPER", "Querying party members") end
         members = SF:GetPartyMembers()
     else
+        if SF.Debug then SF.Debug:Info("LOOT_HELPER", "Getting solo player") end
         members = SF:GetSoloPlayer()
+    end
+    
+    if SF.Debug then
+        SF.Debug:Info("LOOT_HELPER", "Got %d members to display", #members)
     end
     
     -- Update UI rows with member data
@@ -594,6 +658,16 @@ function LootWindow:ToggleTestMode()
     -- Create window if it doesn't exist
     if not self.frame then
         self:Create()
+    end
+    
+    -- Ensure Loot Helper is enabled (content visible)
+    if SF.lootHelperDB and SF.lootHelperDB.windowSettings then
+        if not SF.lootHelperDB.windowSettings.enabled then
+            if SF.Debug then
+                SF.Debug:Warn("LOOT_HELPER", "Test mode toggled but Loot Helper was disabled, enabling it")
+            end
+            self:SetEnabled(true)
+        end
     end
     
     -- Show window if hidden
