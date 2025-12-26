@@ -137,9 +137,9 @@ function LootWindow:CreateMemberRow(index)
     
     -- Up Arrow Button (increase priority)
     local upBtn = CreateFrame("Button", nil, row)
-    upBtn:SetNormalTexture("Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up")
-    upBtn:SetHighlightTexture("Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Highlight")
-    upBtn:SetPushedTexture("Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Down")
+    upBtn:SetNormalTexture("Interface\\ICONS\\INV_Misc_QuestionMark")
+    upBtn:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight")
+    upBtn:SetPushedTexture("Interface\\ICONS\\INV_Misc_QuestionMark")
     upBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText("Increase Points", 1, 1, 1)
@@ -156,9 +156,9 @@ function LootWindow:CreateMemberRow(index)
     
     -- Down Arrow Button (decrease priority)
     local downBtn = CreateFrame("Button", nil, row)
-    downBtn:SetNormalTexture("Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up")
-    downBtn:SetHighlightTexture("Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Highlight")
-    downBtn:SetPushedTexture("Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Down")
+    downBtn:SetNormalTexture("Interface\\ICONS\\INV_Misc_QuestionMark")
+    downBtn:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight")
+    downBtn:SetPushedTexture("Interface\\ICONS\\INV_Misc_QuestionMark")
     downBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText("Decrease Points", 1, 1, 1)
@@ -175,9 +175,9 @@ function LootWindow:CreateMemberRow(index)
     
     -- Gear Button (member settings/gear)
     local gearBtn = CreateFrame("Button", nil, row)
-    gearBtn:SetNormalTexture("Interface\\Buttons\\UI-GearButton-Up")
-    gearBtn:SetHighlightTexture("Interface\\Buttons\\UI-GearButton-Highlight")
-    gearBtn:SetPushedTexture("Interface\\Buttons\\UI-GearButton-Down")
+    gearBtn:SetNormalTexture("Interface\\ICONS\\INV_Misc_QuestionMark")
+    gearBtn:SetHighlightTexture("Interface\\Buttons\\UI-Common-MouseHilight")
+    gearBtn:SetPushedTexture("Interface\\ICONS\\INV_Misc_QuestionMark")
     gearBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText("Gear Settings", 1, 1, 1)
@@ -284,8 +284,9 @@ end
 -- @param frame: The parent frame
 -- @return: The created resize grip button
 local function CreateResizeGrip(frame)
+    local resizeGripSize = 18
     local resizeGrip = CreateFrame("Button", nil, frame)
-    resizeGrip:SetSize(18, 18)
+    resizeGrip:SetSize(resizeGripSize, resizeGripSize)
     resizeGrip:SetPoint("BOTTOMRIGHT", -2, 2)
     resizeGrip:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
     resizeGrip:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
@@ -299,7 +300,7 @@ local function CreateResizeGrip(frame)
         SaveFrameState(frame)
     end)
 
-    return resizeGrip
+    return resizeGrip, resizeGripSize
 end
 
 -- Helper function to create the disabled overlay
@@ -333,7 +334,8 @@ local function SetupScrollFrameAndRows(self, content, constants)
     -- Create Scroll Frame for member list
     local scrollFrame = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
     scrollFrame:SetPoint("TOPLEFT", content, "TOPLEFT", constants.CONTENT_PADDING, -constants.CONTENT_PADDING)
-    scrollFrame:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", -25, constants.CONTENT_PADDING)
+    -- Adjust bottom for resize grip and move scroll bar 2px left
+    scrollFrame:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", -28, constants.CONTENT_PADDING + constants.RESIZE_GRIP_SIZE)
     
     local scrollChild = CreateFrame("Frame", nil, scrollFrame)
     scrollChild:SetSize(scrollFrame:GetWidth() or 1, 1)
@@ -460,7 +462,7 @@ function LootWindow:Create()
     else
         frame:SetMinResize(400, 280)
     end
-    CreateResizeGrip(frame)
+    local resizeGrip, resizeGripSize = CreateResizeGrip(frame)
 
     -- Content Area
     local content = CreateFrame("Frame", nil, frame)
@@ -477,6 +479,7 @@ function LootWindow:Create()
         BUTTON_SIZE_PERCENT = 0.90,
         BUTTON_SPACING = 4,
         CONTENT_PADDING = 5,
+        RESIZE_GRIP_SIZE = resizeGripSize,
         FONT_SIZE = "GameFontNormal"  -- TODO: Make this configurable in settings
     }
 
