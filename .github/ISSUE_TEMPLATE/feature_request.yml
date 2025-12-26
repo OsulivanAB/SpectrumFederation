@@ -1,0 +1,44 @@
+name: ✨ Feature Request
+description: Suggest a new feature or enhancement for the addon
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please provide as much detail as possible to help us understand your request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem is this solving?
+      description: Describe the problem or pain point you're experiencing that this feature would address.
+      placeholder: Currently, I have to manually track loot distribution across multiple raids, which is time-consuming and error-prone...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you'd like
+      description: A clear and concise description of what you want to happen.
+      placeholder: I would like an automated way to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Have you considered any alternative solutions or workarounds?
+      placeholder: I've tried using other addons like...
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add any other context, screenshots, or mockups about the feature request here.
+    validations:
+      required: false

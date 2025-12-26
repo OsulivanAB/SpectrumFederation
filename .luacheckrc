@@ -7,6 +7,10 @@ read_globals = {
   "C_ChatInfo",
   "IsInGroup",
   "IsInRaid",
+  "GetNumGroupMembers",
+  "GetNumSubgroupMembers",
+  "GetRaidRosterInfo",
+  "UnitClass",
   "strsplit",
   "UnitName",
   "UnitExists",
@@ -16,4 +20,5 @@ read_globals = {
   "GameTooltip_Hide",
   "Settings",
   "UIParent",
+  "RAID_CLASS_COLORS",
 }
