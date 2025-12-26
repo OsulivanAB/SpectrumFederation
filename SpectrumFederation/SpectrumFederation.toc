@@ -1,4 +1,4 @@
-## Interface: 120001
+## Interface: 110207
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
 ## Version: 0.1.1
