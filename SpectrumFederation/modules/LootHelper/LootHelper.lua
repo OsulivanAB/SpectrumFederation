@@ -23,18 +23,14 @@ function SF:ToggleLootHelperUI()
         SF:PrintInfo("Loot Helper window hidden")
         if SF.Debug then SF.Debug:Info("LOOT_HELPER", "Window hidden") end
     else
-        if SF.Debug then 
-            SF.Debug:Info("LOOT_HELPER", "Showing window and refreshing content")
-            -- Check if content is visible
-            if SF.LootWindow.frame.content then
-                SF.Debug:Info("LOOT_HELPER", "Content frame IsShown: %s", tostring(SF.LootWindow.frame.content:IsShown()))
-            end
-        end
+        if SF.Debug then SF.Debug:Info("LOOT_HELPER", "Showing window and refreshing content") end
         
         -- Ensure Loot Helper is enabled (content visible)
         if SF.lootHelperDB and SF.lootHelperDB.windowSettings then
             if not SF.lootHelperDB.windowSettings.enabled then
-                SF.Debug:Warn("LOOT_HELPER", "Loot Helper was disabled, enabling it")
+                if SF.Debug then
+                    SF.Debug:Warn("LOOT_HELPER", "Loot Helper was disabled, enabling it")
+                end
                 SF.LootWindow:SetEnabled(true)
             end
         end
@@ -43,13 +39,7 @@ function SF:ToggleLootHelperUI()
         -- Refresh content when showing
         SF.LootWindow:PopulateContent(SF.LootWindow.testModeActive or false)
         SF:PrintInfo("Loot Helper window shown")
-        
-        if SF.Debug then 
-            SF.Debug:Info("LOOT_HELPER", "Window shown and content populated")
-            if SF.LootWindow.frame.content then
-                SF.Debug:Info("LOOT_HELPER", "After show - Content frame IsShown: %s", tostring(SF.LootWindow.frame.content:IsShown()))
-            end
-        end
+        if SF.Debug then SF.Debug:Info("LOOT_HELPER", "Window shown and content populated") end
     end
 end
 

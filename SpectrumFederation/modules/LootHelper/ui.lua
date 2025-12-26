@@ -71,22 +71,8 @@ end
 -- @param enabled: Boolean indicating whether the frame is enabled or disabled.
 -- @return: none
 local function SetEnabledVisuals(frame, enabled)
-    if SF.Debug then
-        SF.Debug:Info("LOOT_HELPER", "SetEnabledVisuals called with enabled=%s", tostring(enabled))
-        if frame.content then
-            SF.Debug:Info("LOOT_HELPER", "Content frame exists, before SetShown: IsShown=%s", tostring(frame.content:IsShown()))
-        else
-            SF.Debug:Error("LOOT_HELPER", "Content frame is NIL!")
-        end
-    end
-    
     frame.content:SetShown(enabled)
     frame.disabledOverlay:SetShown(not enabled)
-    
-    if SF.Debug then
-        SF.Debug:Info("LOOT_HELPER", "After SetShown: content:IsShown=%s, disabledOverlay:IsShown=%s", 
-            tostring(frame.content:IsShown()), tostring(frame.disabledOverlay:IsShown()))
-    end
 end
 
 -- Public method to set the enabled state of the Loot Helper
@@ -189,9 +175,9 @@ function LootWindow:CreateMemberRow(index)
     
     -- Gear Button (member settings/gear)
     local gearBtn = CreateFrame("Button", nil, row)
-    gearBtn:SetNormalTexture("Interface\\PaperDollInfoFrame\\Character-Plus")
-    gearBtn:SetHighlightTexture("Interface\\Buttons\\UI-PlusButton-Hilight")
-    gearBtn:SetPushedTexture("Interface\\PaperDollInfoFrame\\Character-Plus")
+    gearBtn:SetNormalTexture("Interface\\Buttons\\UI-GearButton-Up")
+    gearBtn:SetHighlightTexture("Interface\\Buttons\\UI-GearButton-Highlight")
+    gearBtn:SetPushedTexture("Interface\\Buttons\\UI-GearButton-Down")
     gearBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText("Gear Settings", 1, 1, 1)
@@ -488,7 +474,7 @@ function LootWindow:Create()
         CLASS_ICON_SIZE_PERCENT = 0.65,
         NAME_COLUMN_WIDTH_PERCENT = 0.45,
         POINTS_COLUMN_WIDTH = 50,
-        BUTTON_SIZE_PERCENT = 0.75,
+        BUTTON_SIZE_PERCENT = 0.90,
         BUTTON_SPACING = 4,
         CONTENT_PADDING = 5,
         FONT_SIZE = "GameFontNormal"  -- TODO: Make this configurable in settings
@@ -518,11 +504,6 @@ function LootWindow:Create()
 
     -- Apply saved state and initialize
     ApplyFrameState(frame)
-    
-    if SF.Debug then
-        SF.Debug:Info("LOOT_HELPER", "About to call SetEnabledVisuals with db.enabled=%s", tostring(db.enabled))
-    end
-    
     SetEnabledVisuals(frame, db.enabled)
     self:PopulateContent(false)
 
@@ -606,14 +587,6 @@ function LootWindow:PopulateContent(testMode)
     if SF.Debug then
         SF.Debug:Info("LOOT_HELPER", "PopulateContent called - testMode=%s, IsInRaid=%s, IsInGroup=%s", 
             tostring(testMode), tostring(IsInRaid()), tostring(IsInGroup()))
-        
-        -- Check content frame state
-        if self.frame and self.frame.content then
-            SF.Debug:Info("LOOT_HELPER", "Content frame state: IsShown=%s", tostring(self.frame.content:IsShown()))
-        else
-            SF.Debug:Error("LOOT_HELPER", "Frame or content missing! frame=%s, content=%s",
-                tostring(self.frame ~= nil), tostring(self.frame and self.frame.content ~= nil))
-        end
     end
     
     -- Ensure frame and rows exist
