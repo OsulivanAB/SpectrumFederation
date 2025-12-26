@@ -13,13 +13,6 @@
 - [ ] Documentation update
 - [ ] Other (please describe):
 
-## Related Issues
-
-<!-- Link to related issues using #issue_number -->
-
-Fixes #
-Relates to #
-
 ## Changes Made
 
 <!-- List the main changes in this PR -->
@@ -28,35 +21,29 @@ Relates to #
 - 
 - 
 
-## Testing
-
-- [ ] **I have tested these changes in-game**
-- [ ] I have run `luacheck` and addressed any warnings
-- [ ] I have tested with Lua errors enabled (`/console scriptErrors 1`)
-- [ ] I have bumped the version in `SpectrumFederation.toc`
-
-### In-Game Testing Details
-
-<!-- Describe what you tested in-game and any specific scenarios -->
-
-**Test Environment:**
-- WoW Client: <!-- Retail/Classic/PTR/Beta -->
-- Game Version: <!-- e.g., 11.0.2 -->
-- Tested Scenarios:
-  - 
-  - 
-
-## Screenshots/Videos
-
-<!-- If applicable, add screenshots or video links to demonstrate the changes -->
-
 ## Checklist
 
+- [ ] I have tested these changes in-game
 - [ ] My code follows the project's style guidelines
 - [ ] I have added/updated documentation as needed
 - [ ] I have added/updated localization strings in `locale/enUS.lua` if applicable
 - [ ] My changes generate no new warnings or errors
 - [ ] Any dependent changes have been merged and published
+- [ ] I've linked this PR to any related issues in the [repo project](https://github.com/users/OsulivanAB/projects/1).
+
+## Testing
+
+### In-Game Testing Details
+- WoW Client: <!-- Retail/Classic/PTR/Beta -->
+- Game Version: <!-- e.g., 11.0.2 -->
+
+**Additional Testing Info**
+
+<!-- Describe what you tested in-game and any specific scenarios -->
+
+## Screenshots/Videos
+
+<!-- If applicable, add screenshots or video links to demonstrate the changes -->
 
 ## Additional Notes
 
