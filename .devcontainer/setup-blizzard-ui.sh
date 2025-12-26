@@ -9,9 +9,11 @@ UI_ROOT="$ROOT/BlizzardUI"
 
 LIVE_DIR="$UI_ROOT/live"
 BETA_DIR="$UI_ROOT/beta"
+TEXTURES_DIR="$UI_ROOT/textures"
 # PTR_DIR="$UI_ROOT/ptr"
 # PTR2_DIR="$UI_ROOT/ptr2"
 REPO_URL="https://github.com/Gethe/wow-ui-source.git"
+TEXTURES_REPO_URL="git@github.com:Gethe/wow-ui-textures.git"
 
 mkdir -p "$UI_ROOT"
 
@@ -36,5 +38,15 @@ clone_or_update "$BETA_DIR" "beta"
 # clone_or_update "$PTR_DIR" "ptr"
 # clone_or_update "$PTR2_DIR" "ptr2"
 
+# Clone or update textures repository
+if [ -d "$TEXTURES_DIR/.git" ]; then
+  echo -e "\033[38;2;0;136;204m[BlizzardUI] Updating textures repository in $TEXTURES_DIR\033[0m"
+  git -C "$TEXTURES_DIR" fetch origin --depth=1
+  git -C "$TEXTURES_DIR" pull --rebase
+else
+  echo -e "\033[38;2;0;136;204m[BlizzardUI] Cloning textures repository into $TEXTURES_DIR\033[0m"
+  rm -rf "$TEXTURES_DIR"
+  git clone --depth 1 "$TEXTURES_REPO_URL" "$TEXTURES_DIR"
+fi
 
 echo -e "\033[38;2;0;136;204m[BlizzardUI] Done.\033[0m"
