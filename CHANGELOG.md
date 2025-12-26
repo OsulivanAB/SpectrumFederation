@@ -7,6 +7,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.1.1-beta.2] - Unreleased
+
+### Added
+- Introduced issue templates for bug reports and feature requests to streamline user feedback.
+
 ## [0.1.1-beta.1] - Unreleased
 
 ### Added
