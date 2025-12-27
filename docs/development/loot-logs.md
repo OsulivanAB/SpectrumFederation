@@ -273,6 +273,145 @@ local changeType = data.change
 
 **Use case**: Extracting log details, rebuilding member states, displaying log details in UI.
 
+#### GetSerializedData()
+
+Returns a serialized string representation of the log using CBOR (Concise Binary Object Representation) encoding with Base64 encoding for text transmission.
+
+```lua
+local serialized = log:GetSerializedData()
+-- Returns: Base64-encoded CBOR string or nil on failure
+```
+
+**Serialization Format**: The method creates a versioned data structure containing all log properties:
+
+```lua
+{
+    version = 1,           -- Format version for future compatibility
+    id = "...",            -- Log unique identifier
+    timestamp = 1703721234, -- Unix timestamp
+    author = "Name-Realm", -- Log creator
+    eventType = "...",     -- Event type constant
+    data = {...}          -- Event-specific data table
+}
+```
+
+**Use case**: Synchronizing logs between clients via addon communication system, storing logs in external systems, creating log backups.
+
+**Important Notes**:
+
+- Returns `nil` if serialization fails (with debug error logging)
+- Uses WoW's `C_EncodingUtil.SerializeCBOR()` and `C_EncodingUtil.EncodeBase64()` APIs
+- Includes version field for backward compatibility with future format changes
+- Compact binary format suitable for network transmission
+
+## Serialization Methods
+
+Serialization methods enable logs to be transmitted between clients for multi-user profile synchronization.
+
+### newFromSerialized(serializedData)
+
+Static constructor that creates a LootLog instance from serialized data. This is the counterpart to `GetSerializedData()` and is used to reconstruct logs received from other clients.
+
+```lua
+local serializedString = "..."  -- Received from another client
+local log = SF.LootLog.newFromSerialized(serializedString)
+
+if log then
+    -- Successfully deserialized
+    print("Received log:", log:GetEventType())
+else
+    -- Deserialization failed
+    print("Invalid log data received")
+end
+```
+
+**Parameters**:
+
+- `serializedData` (string) - Base64-encoded CBOR string from `GetSerializedData()`
+
+**Returns**:
+
+- LootLog instance with exact values from serialized data, or `nil` if deserialization failed
+
+**Validation Process**:
+
+1. Validates input is a non-empty string
+2. Decodes Base64 to binary CBOR data
+3. Deserializes CBOR to Lua table
+4. Validates format version is 1
+5. Validates all required fields are present (id, timestamp, author, eventType, data)
+6. Creates instance directly without re-validation
+
+**Important Characteristics**:
+
+- **Preserves exact data**: Uses all values from serialized data (id, timestamp, author, etc.)
+- **No validation**: Skips event type and data validation (assumes source already validated)
+- **No counter increment**: Does not increment session log counter (preserves original ID)
+- **Identical logs**: Ensures all clients have identical log entries after synchronization
+
+**Error Handling**:
+
+- Returns `nil` on any deserialization error
+- Logs warnings via `SF.Debug:Warn()` for debugging
+- Safe to use in production (won't throw errors)
+
+### Serialization Round-Trip Example
+
+Complete example showing log creation, serialization, and deserialization:
+
+```lua
+-- Client A: Create and serialize a log
+local eventType = SF.LootLogEventTypes.POINT_CHANGE
+local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+eventData.member = "Healer-Garona"
+eventData.change = SF.LootLogPointChangeTypes.INCREMENT
+
+local originalLog = SF.LootLog.new(eventType, eventData)
+if not originalLog then
+    print("Failed to create log")
+    return
+end
+
+-- Serialize for transmission
+local serialized = originalLog:GetSerializedData()
+if not serialized then
+    print("Failed to serialize log")
+    return
+end
+
+-- Simulate sending via addon communication
+-- SendAddonMessage("SpectrumFed_LogSync", serialized, "RAID")
+
+-- Client B: Receive and deserialize
+-- local serialized = ... (received from SendAddonMessage)
+local receivedLog = SF.LootLog.newFromSerialized(serialized)
+if not receivedLog then
+    print("Failed to deserialize log")
+    return
+end
+
+-- Verify logs are identical
+print("Original ID:", originalLog:GetID())
+print("Received ID:", receivedLog:GetID())
+print("IDs match:", originalLog:GetID() == receivedLog:GetID())
+
+-- Both logs will have identical properties:
+-- - Same ID (timestamp_author_eventType_counter)
+-- - Same timestamp
+-- - Same author
+-- - Same event type
+-- - Same event data
+```
+
+**Why CBOR Format?**
+
+The addon uses CBOR (Concise Binary Object Representation) for serialization because:
+
+- **WoW Standard**: WoW provides native `C_EncodingUtil.SerializeCBOR()` API
+- **Compact**: Binary format is smaller than JSON for network transmission
+- **Type-Safe**: Preserves Lua types (numbers, strings, tables) accurately
+- **Reliable**: Well-tested for addon communication in WoW
+
 ## Static Methods
 
 Static methods use **dot notation** (`.`) and can be called without an instance:

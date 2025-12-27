@@ -61,7 +61,7 @@ end
 local LootLog = {}
 LootLog.__index = LootLog
 
--- Constructor
+-- Constructor for creating a new log entry
 -- @param eventType (string) - Type of event being logged
 -- @param eventData (table) - Data specific to the event type
 -- @return LootLog instance or nil if failed
@@ -126,6 +126,70 @@ function LootLog.new(eventType, eventData)
     return instance
 end
 
+-- Constructor for creating a log entry from serialized data
+-- Used for synchronizing logs across clients
+-- @param serializedData (string) - Base64-encoded CBOR string from GetSerializedData()
+-- @return LootLog instance or nil if deserialization failed
+function LootLog.newFromSerialized(serializedData)
+    -- Validate input
+    if type(serializedData) ~= "string" or serializedData == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid serialized data provided: expected non-empty string")
+        end
+        return nil
+    end
+    
+    -- Decode Base64
+    local decodedData = C_EncodingUtil.DecodeBase64(serializedData)
+    if not decodedData then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Failed to decode Base64 data")
+        end
+        return nil
+    end
+    
+    -- Deserialize CBOR
+    local success, logData = pcall(C_EncodingUtil.DeserializeCBOR, decodedData)
+    if not success or not logData then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Failed to deserialize CBOR data: %s", tostring(logData))
+        end
+        return nil
+    end
+    
+    -- Validate version
+    if logData.version ~= 1 then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Unsupported log format version: %s (expected 1)", tostring(logData.version))
+        end
+        return nil
+    end
+    
+    -- Validate required fields
+    if not logData.id or not logData.timestamp or not logData.author or 
+       not logData.eventType or not logData.data then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Missing required fields in serialized log data")
+        end
+        return nil
+    end
+    
+    -- Create instance with exact deserialized values (no validation, no counter increment)
+    local instance = setmetatable({}, LootLog)
+    instance.id = logData.id
+    instance.timestamp = logData.timestamp
+    instance.author = logData.author
+    instance.eventType = logData.eventType
+    instance.data = logData.data
+    
+    -- Debug logging
+    if SF.Debug then
+        SF.Debug:Verbose("LOOTLOG", "Deserialized log %s: %s", instance.id, instance.eventType)
+    end
+    
+    return instance
+end
+
 -- Get a copy of the event data template for a specific event type
 -- @param eventType (string) - Event type constant
 -- @return (table) - Empty template table (copy) or nil if invalid
@@ -177,6 +241,41 @@ end
 -- @return (table) - Event data table
 function LootLog:GetEventData()
     return self.data
+end
+
+-- Getter function for serialized log data
+-- Returns a Base64-encoded CBOR string suitable for addon communication
+-- @return (string) - Serialized log data, or nil if serialization failed
+function LootLog:GetSerializedData()
+    -- Create serialization table with version for future compatibility
+    local serializationData = {
+        version = 1,
+        id = self.id,
+        timestamp = self.timestamp,
+        author = self.author,
+        eventType = self.eventType,
+        data = self.data
+    }
+    
+    -- Serialize to CBOR
+    local success, cborData = pcall(C_EncodingUtil.SerializeCBOR, serializationData)
+    if not success or not cborData then
+        if SF.Debug then
+            SF.Debug:Error("LOOTLOG", "Failed to serialize log %s to CBOR: %s", self.id, tostring(cborData))
+        end
+        return nil
+    end
+    
+    -- Encode to Base64
+    local encodedData = C_EncodingUtil.EncodeBase64(cborData)
+    if not encodedData then
+        if SF.Debug then
+            SF.Debug:Error("LOOTLOG", "Failed to encode log %s to Base64", self.id)
+        end
+        return nil
+    end
+    
+    return encodedData
 end
 
 -- ============================================================================
