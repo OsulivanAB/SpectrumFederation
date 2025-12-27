@@ -118,6 +118,7 @@ function Member:SetRole(newRole)
         if SF.Debug then
             SF.Debug:Warn("MEMBER", "Invalid role change attempted for %s: %s", self:GetFullIdentifier(), tostring(newRole))
         end
+        return false
     end
 end
 
