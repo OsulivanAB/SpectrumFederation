@@ -44,8 +44,9 @@ Member.__index = Member
 -- @param name (string) - Character name
 -- @param realm (string) - Realm name
 -- @param role (string, optional) - Member role ("admin" or "member", defaults to "member")
+-- @param class (string, optional) - WoW class name (e.g., "WARRIOR", "PALADIN"), must match SF.WOW_CLASSES keys
 -- @return Member instance
-function Member.new(name, realm, role)
+function Member.new(name, realm, role, class)
     -- Create new instance with metatable
     local instance = setmetatable({}, Member)
     
@@ -58,6 +59,16 @@ function Member.new(name, realm, role)
         instance.role = role
     else
         instance.role = MEMBER_ROLES.MEMBER
+    end
+    
+    -- Validate and set class (must exist in SF.WOW_CLASSES)
+    if class and SF.WOW_CLASSES and SF.WOW_CLASSES[class] then
+        instance.class = class
+    else
+        instance.class = nil  -- Unknown or not specified
+        if class and SF.Debug then
+            SF.Debug:Warn("MEMBER", "Invalid class '%s' provided for member %s-%s", tostring(class), name, realm)
+        end
     end
     
     instance.pointBalance = 0
@@ -143,6 +154,38 @@ end
 -- @return (string) - Full identifier
 function Member:GetFullIdentifier()
     return self.name .. "-" .. self.realm
+end
+
+-- Get the WoW class for this member
+-- @return string|nil - Class name (e.g., "WARRIOR") or nil if not set
+function Member:GetClass()
+    return self.class
+end
+
+-- Get the color code for this member's class
+-- @return table|nil - Color table with r, g, b fields (0-1 range) or nil if class not set
+function Member:GetClassColor()
+    if not self.class or not SF.WOW_CLASSES then
+        return nil
+    end
+    local classData = SF.WOW_CLASSES[self.class]
+    if classData and classData.colorCode then
+        return classData.colorCode
+    end
+    return nil
+end
+
+-- Get the texture file path for this member's class icon
+-- @return string|nil - Texture file path or nil if class not set
+function Member:GetClassTexture()
+    if not self.class or not SF.WOW_CLASSES then
+        return nil
+    end
+    local classData = SF.WOW_CLASSES[self.class]
+    if classData and classData.textureFile then
+        return classData.textureFile
+    end
+    return nil
 end
 
 -- Function to get the current point balance
