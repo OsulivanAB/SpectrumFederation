@@ -47,7 +47,8 @@ def main():
     
     # Determine which section to use
     if branch_name == "beta" or is_beta:
-        section_header = "## [Unreleased - Beta]"
+        # For beta, use the actual version number with date
+        section_header = f"## [{version}] - {current_date}"
     else:
         section_header = f"## [{version}] - {current_date}"
     
@@ -142,6 +143,32 @@ def main():
     # Read existing CHANGELOG
     changelog_path = Path("CHANGELOG.md")
     existing_changelog = changelog_path.read_text(encoding="utf-8") if changelog_path.exists() else ""
+
+    # If we're on main branch, strip all beta version entries from existing changelog
+    # This prevents beta entries from leaking into the main changelog
+    if branch_name == "main" and not is_beta and existing_changelog:
+        print("Cleaning beta entries from changelog for main branch...")
+        lines = existing_changelog.split("\n")
+        cleaned_lines = []
+        skip_section = False
+        
+        for i, line in enumerate(lines):
+            # Detect start of a beta version section
+            if re.match(r"^## \[.*-beta.*\]", line) or re.match(r"^## \[Unreleased - Beta\]", line):
+                skip_section = True
+                print(f"  Removing beta section: {line}")
+                continue
+            
+            # Detect start of a new non-beta section (stop skipping)
+            if skip_section and line.startswith("## ["):
+                skip_section = False
+            
+            # Keep lines that are not part of beta sections
+            if not skip_section:
+                cleaned_lines.append(line)
+        
+        existing_changelog = "\n".join(cleaned_lines)
+        print("Beta entries cleaned from changelog")
 
     # Prepare prompt for GitHub Copilot
     # (current_date already defined earlier in determine_section_header)
@@ -325,8 +352,8 @@ def main():
         
         # Check if this section already exists
         if branch_name == "beta" or is_beta:
-            # Look for Unreleased - Beta section
-            section_pattern = re.compile(r"^## \[Unreleased - Beta\]")
+            # Look for this specific beta version OR old "Unreleased - Beta" section
+            section_pattern = re.compile(r"^## \[(" + re.escape(version) + r"|Unreleased - Beta)\]")
         else:
             # Look for specific version
             section_pattern = re.compile(r"^## \[" + re.escape(version) + r"\]")
