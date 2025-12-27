@@ -89,6 +89,7 @@ Each Member instance has the following properties:
 | `name` | string | Character name (e.g., "Shadowbane") |
 | `realm` | string | Realm name (e.g., "Garona") |
 | `role` | string | Member role ("admin" or "member") |
+| `class` | string\|nil | WoW class name (e.g., "WARRIOR") or nil if not set |
 | `pointBalance` | number | Current loot points (can be negative) |
 | `armor` | table | Dictionary of 16 armor slots (boolean values) |
 
@@ -99,7 +100,7 @@ Each Member instance has the following properties:
 The Members class uses **dot notation** for the constructor (factory function pattern):
 
 ```lua
-local member = SF.Member.new(name, realm, role)
+local member = SF.Member.new(name, realm, role, class)
 ```
 
 **Parameters**:
@@ -107,14 +108,22 @@ local member = SF.Member.new(name, realm, role)
 - `name` (string, required) - Character name
 - `realm` (string, required) - Realm name
 - `role` (string, optional) - Member role, defaults to `"member"`
+- `class` (string, optional) - WoW class name (e.g., "WARRIOR", "PALADIN"), must match `SF.WOW_CLASSES` keys
 
 **Example**:
+
 ```lua
 -- Create a standard member
 local member = SF.Member.new("Shadowbane", "Garona")
 
 -- Create an admin
 local admin = SF.Member.new("Guildmaster", "Garona", SF.MemberRoles.ADMIN)
+
+-- Create a member with class information
+local warrior = SF.Member.new("Tanky", "Garona", SF.MemberRoles.MEMBER, "WARRIOR")
+
+-- Create an admin with class
+local paladinAdmin = SF.Member.new("Healz", "Garona", SF.MemberRoles.ADMIN, "PALADIN")
 ```
 
 ### Initial State
@@ -124,6 +133,9 @@ New members are created with:
 - Point balance: `0`
 - All armor slots: `false` (unused)
 - Role: `"member"` (unless specified)
+- Class: `nil` (unless specified and valid)
+
+**Class Validation**: If a class parameter is provided but doesn't match a key in `SF.WOW_CLASSES`, the member's class will be set to `nil` and a warning will be logged (if debug enabled).
 
 ## Instance Methods
 
@@ -136,6 +148,7 @@ member:MethodName(parameters)
 ### Identity Methods
 
 #### GetFullIdentifier()
+
 Returns the member's full character identifier in `"Name-Realm"` format.
 
 ```lua
@@ -144,6 +157,50 @@ local identifier = member:GetFullIdentifier()
 ```
 
 **Use case**: Unique keys for member dictionaries, displaying character names.
+
+#### GetClass()
+
+Returns the member's WoW class name or `nil` if not set.
+
+```lua
+local className = member:GetClass()
+-- Returns: "WARRIOR" or nil
+```
+
+**Use case**: Determine member's class for UI display, validation, or filtering.
+
+#### GetClassColor()
+
+Returns the RGB color table for the member's class, or `nil` if class is not set.
+
+```lua
+local color = member:GetClassColor()
+if color then
+    -- color.r, color.g, color.b are values from 0-1
+    print(color.r, color.g, color.b)
+end
+```
+
+**Returns**: `{r = 0.78, g = 0.61, b = 0.43}` (example for Warrior) or `nil`
+
+**Use case**: Color-coding member names in UI, setting frame background colors.
+
+#### GetClassTexture()
+
+Returns the texture file path for the member's class icon, or `nil` if class is not set.
+
+```lua
+local texturePath = member:GetClassTexture()
+-- Returns: "Interface\\Icons\\ClassIcon_Warrior" or nil
+
+if texturePath then
+    iconFrame:SetTexture(texturePath)
+end
+```
+
+**Use case**: Displaying class icons next to member names in UI.
+
+**Note**: See [WoW Classes Documentation](wow-classes.md) for complete information about class colors and textures.
 
 #### GetPointBalance()
 Returns the member's current point balance.
