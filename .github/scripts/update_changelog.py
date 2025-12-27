@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
 Update CHANGELOG.md using GitHub Copilot to analyze recent changes.
+
+This script is called by two workflows:
+1. post-merge-beta.yml - Updates beta branch changelog after merge
+2. promote-beta-to-main.yml - Updates main branch changelog during promotion
+
+Key behaviors:
+- Beta branch: Creates versioned entries like "## [0.2.0-beta.1] - 2025-12-27"
+- Main branch: Cleans ALL beta entries from changelog, creates stable version entry
+- Backward compatible: Handles legacy "## [Unreleased - Beta]" sections
 """
 
 import os
@@ -46,6 +55,8 @@ def main():
     current_date = datetime.now().strftime("%Y-%m-%d")
     
     # Determine which section to use
+    # CHANGED: Beta now uses actual version number with date instead of "Unreleased - Beta"
+    # This prevents confusion and provides proper version tracking in beta changelog
     if branch_name == "beta" or is_beta:
         # For beta, use the actual version number with date
         section_header = f"## [{version}] - {current_date}"
@@ -144,8 +155,12 @@ def main():
     changelog_path = Path("CHANGELOG.md")
     existing_changelog = changelog_path.read_text(encoding="utf-8") if changelog_path.exists() else ""
 
-    # If we're on main branch, strip all beta version entries from existing changelog
-    # This prevents beta entries from leaking into the main changelog
+    # ADDED: Clean beta entries when running on main branch
+    # This prevents beta version entries from leaking into the stable changelog
+    # Removes entries like:
+    #   - "## [0.2.0-beta.1] - 2025-12-27"
+    #   - "## [0.1.1-beta.2] - Unreleased"
+    #   - "## [Unreleased - Beta]"
     if branch_name == "main" and not is_beta and existing_changelog:
         print("Cleaning beta entries from changelog for main branch...")
         lines = existing_changelog.split("\n")
@@ -351,6 +366,7 @@ def main():
                     break
         
         # Check if this section already exists
+        # CHANGED: For beta, match both new format and legacy "Unreleased - Beta" for smooth transition
         if branch_name == "beta" or is_beta:
             # Look for this specific beta version OR old "Unreleased - Beta" section
             section_pattern = re.compile(r"^## \[(" + re.escape(version) + r"|Unreleased - Beta)\]")
