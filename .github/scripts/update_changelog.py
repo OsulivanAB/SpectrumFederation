@@ -366,8 +366,9 @@ def main():
         # CHANGED: For beta, match both new format and legacy "Unreleased - Beta" for smooth transition
         if branch_name == "beta" or is_beta:
             # Look for this specific beta version OR old "Unreleased - Beta" section
-            # Using f-string for better readability
-            section_pattern = re.compile(rf"^## \[({re.escape(version)}|Unreleased - Beta)\]")
+            # Using f-string for better readability and re.escape for safety
+            escaped_unreleased = re.escape("Unreleased - Beta")
+            section_pattern = re.compile(rf"^## \[({re.escape(version)}|{escaped_unreleased})\]")
         else:
             # Look for specific version
             section_pattern = re.compile(rf"^## \[{re.escape(version)}\]")
