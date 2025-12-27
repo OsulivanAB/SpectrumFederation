@@ -75,6 +75,9 @@ nav:
     - Settings UI: settings-ui.md
   - Development:
     - Getting Started: development/index.md
+    - Loot Profile Class: development/loot-profile-class.md
+    - Members Class: development/members-class.md
+    - Loot Logs: development/loot-logs.md
     - Helper Functions: development/helper-functions.md
     - CI/CD Workflows: development/workflows.md
     - Promoting Beta to Main: development/promoting-to-main.md

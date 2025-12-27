@@ -381,6 +381,23 @@ luacheck SpectrumFederation --only 0
 - Run locally: `pip install -r requirements-docs.txt && mkdocs serve`
 - Add feature docs in `docs/` when adding user-facing features
 
+**MkDocs Markdown Formatting:**
+- **CRITICAL**: Always add a blank line before and after bullet lists and numbered lists
+- MkDocs requires blank lines for proper list rendering (VS Code preview may not show this)
+- Example:
+  ```markdown
+  **Parameters**:
+  
+  - `param1` - Description
+  - `param2` - Description
+  
+  **Process**:
+  
+  1. First step
+  2. Second step
+  ```
+- Without blank lines, bullets will render as inline text with dashes
+
 ## Critical Rules - DO NOT VIOLATE
 
 **Version Management:**
