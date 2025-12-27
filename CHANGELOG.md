@@ -9,6 +9,16 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [Unreleased - Beta]
+
+### Added
+- Introduced a new `Member` class for managing loot profile members, including point balances and armor slot tracking.
+- Added functionality to track and toggle armor slot usage for members, allowing a single point to be spent per armor slot.
+- Implemented role management for members, with support for "admin" and "member" roles.
+- Added methods to manage member point balances, including incrementing, decrementing, and handling point debt.
+- Introduced functionality to retrieve member details, such as full identifiers, point balances, and armor slot statuses.
+
 ## [0.1.1] - 2025-12-26
 
 ### Changed
