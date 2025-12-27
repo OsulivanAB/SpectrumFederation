@@ -257,7 +257,7 @@ local isAdmin = member:IsAdmin()
 member:ToggleEquipment(SF.ArmorSlots.HEAD)
 ```
 
-**Profile Functions (LootProfiles.lua):****
+**Profile Functions (LootProfiles.lua):**
 ```lua
 local addonName, SF = ...
 
