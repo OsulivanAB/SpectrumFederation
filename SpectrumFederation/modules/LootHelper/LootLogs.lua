@@ -54,7 +54,7 @@ end
 -- @return (number) - Timestamp adjusted to profile's timezone
 local function GetProfileTimestamp()
     -- TODO: Implement timezone adjustment based on profile settings
-    return os.time()
+    return time()
 end
 
 -- Class definition
