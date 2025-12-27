@@ -84,6 +84,10 @@ function Member.new(name, realm, role)
         Trinket2 = false
     }
     
+    if SF.Debug then
+        SF.Debug:Verbose("MEMBER", "Created new member: %s (role: %s)", instance:GetFullIdentifier(), instance.role)
+    end
+    
     return instance
 end
 
@@ -102,11 +106,18 @@ Member.ARMOR_SLOTS = ARMOR_SLOTS
 function Member:SetRole(newRole)
     -- TODO: Enforce admin permissions
     if newRole == MEMBER_ROLES.ADMIN or newRole == MEMBER_ROLES.MEMBER then
+        local oldRole = self.role
         self.role = newRole
         -- TODO: Add Log Entry
+        if SF.Debug then
+            SF.Debug:Info("MEMBER", "%s role changed: %s -> %s", self:GetFullIdentifier(), oldRole, newRole)
+        end
         return true
     else
         SF:PrintError("Invalid role specified. Role not changed.")
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Invalid role change attempted for %s: %s", self:GetFullIdentifier(), tostring(newRole))
+        end
     end
 end
 
@@ -138,8 +149,12 @@ end
 -- @return none
 function Member:IncrementPoints()
     -- TODO: Enforce admin permissions
+    local oldBalance = self.pointBalance
     self.pointBalance = self.pointBalance + 1
     -- TODO: Add Log Entry
+    if SF.Debug then
+        SF.Debug:Verbose("MEMBER", "%s points incremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
+    end
 end
 
 -- Function to decrement point balance by 1
@@ -147,8 +162,15 @@ end
 -- @return none
 function Member:DecrementPoints()
     -- TODO: Enforce admin permissions
+    local oldBalance = self.pointBalance
     self.pointBalance = self.pointBalance - 1
     -- TODO: Add Log Entry
+    if SF.Debug then
+        SF.Debug:Verbose("MEMBER", "%s points decremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
+        if self.pointBalance < 0 then
+            SF.Debug:Warn("MEMBER", "%s is now in point debt: %d", self:GetFullIdentifier(), self.pointBalance)
+        end
+    end
 end
 
 -- Function to toggle equipment slot usage (for UI button clicks)
@@ -161,6 +183,9 @@ function Member:ToggleEquipment(slot)
     -- Validate slot exists in armor table
     if self.armor[slot] == nil then
         SF:PrintError("Invalid armor slot specified: " .. tostring(slot))
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Invalid armor slot '%s' for %s", tostring(slot), self:GetFullIdentifier())
+        end
         return false
     end
 
@@ -171,6 +196,9 @@ function Member:ToggleEquipment(slot)
         self.armor[slot] = false
         -- TODO: Add Log Entry
         self:IncrementPoints()
+        if SF.Debug then
+            SF.Debug:Info("MEMBER", "%s removed equipment: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
+        end
         return true
     else
         -- Slot is not used - toggle to true (member is using their ONE point for this slot)
@@ -178,6 +206,9 @@ function Member:ToggleEquipment(slot)
         self.armor[slot] = true
         -- TODO: Add Log Entry
         self:DecrementPoints()
+        if SF.Debug then
+            SF.Debug:Info("MEMBER", "%s equipped item: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
+        end
         return true
     end
 end
