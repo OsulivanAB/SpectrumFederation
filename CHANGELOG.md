@@ -13,11 +13,10 @@ All notable changes to SpectrumFederation will be documented in this file.
 ## [Unreleased - Beta]
 
 ### Added
-- Introduced a new `Member` class for managing loot profile members, including point balances and armor slot tracking.
-- Added functionality to track and toggle armor slot usage for members, allowing a single point to be spent per armor slot.
-- Implemented role management for members, with support for "admin" and "member" roles.
-- Added methods to manage member point balances, including incrementing, decrementing, and handling point debt.
-- Introduced functionality to retrieve member details, such as full identifiers, point balances, and armor slot statuses.
+- Introduced a new `LootLog` class for creating, managing, and validating loot event logs, including support for event types such as profile creation, point changes, armor changes, and role changes.
+- Added `LootLogValidators` module to validate event data for loot logs, ensuring data consistency and integrity.
+- Implemented serialization and deserialization for loot logs to enable synchronization across clients.
+- Added support for generating unique log IDs and timestamps for loot events.
 
 ## [0.1.1] - 2025-12-26
 
