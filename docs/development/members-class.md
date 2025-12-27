@@ -145,6 +145,41 @@ local identifier = member:GetFullIdentifier()
 
 **Use case**: Unique keys for member dictionaries, displaying character names.
 
+#### GetPointBalance()
+Returns the member's current point balance.
+
+```lua
+local points = member:GetPointBalance()
+-- Returns: number (e.g., 5, 0, -2)
+```
+
+**Use case**: Displaying point balance in UI, checking if member has points before operations.
+
+#### GetArmorStatuses()
+Returns the entire armor dictionary with all 16 slots and their boolean values.
+
+```lua
+local armorDict = member:GetArmorStatuses()
+-- Returns: { Head = false, Shoulder = true, ... }
+
+-- Example: Check specific slot
+if armorDict[SF.ArmorSlots.HEAD] then
+    -- Head slot is used
+end
+```
+
+**Use case**: Displaying armor slot status in UI, exporting member data, checking multiple slots.
+
+#### IsAdmin()
+Checks if the member has admin role.
+
+```lua
+local isAdmin = member:IsAdmin()
+-- Returns: true if admin, false otherwise
+```
+
+**Use case**: Permission checks, UI access control, displaying admin badges.
+
 ### Role Management
 
 #### SetRole(newRole)

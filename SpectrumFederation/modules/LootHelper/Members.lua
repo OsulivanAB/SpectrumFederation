@@ -116,6 +116,24 @@ function Member:GetFullIdentifier()
     return self.name .. "-" .. self.realm
 end
 
+-- Function to get the current point balance
+-- @return (number) - Current point balance
+function Member:GetPointBalance()
+    return self.pointBalance
+end
+
+-- Function to get all armor slot statuses
+-- @return (table) - Dictionary of armor slots with boolean values
+function Member:GetArmorStatuses()
+    return self.armor
+end
+
+-- Function to check if member is an admin
+-- @return (boolean) - True if admin, false otherwise
+function Member:IsAdmin()
+    return self.role == MEMBER_ROLES.ADMIN
+end
+
 -- Function to increment point balance by 1
 -- @return none
 function Member:IncrementPoints()
@@ -174,3 +192,4 @@ function Member:UpdateFromLootLog()
     
     -- Calculate point balance based on point log entries
 end
+
