@@ -165,8 +165,8 @@ def main():
         skip_section = False
         
         for line in lines:
-            # Detect start of a beta version section
-            if re.match(r"^## \[.*-beta.*\]", line) or re.match(r"^## \[Unreleased - Beta\]", line):
+            # Detect start of a beta version section (combined regex for performance)
+            if re.match(r"^## \[(?:.*-beta.*|Unreleased - Beta)\]", line):
                 skip_section = True
                 print(f"  Removing beta section: {line}")
                 continue
@@ -366,10 +366,11 @@ def main():
         # CHANGED: For beta, match both new format and legacy "Unreleased - Beta" for smooth transition
         if branch_name == "beta" or is_beta:
             # Look for this specific beta version OR old "Unreleased - Beta" section
-            section_pattern = re.compile(r"^## \[(" + re.escape(version) + r"|Unreleased - Beta)\]")
+            # Using f-string for better readability
+            section_pattern = re.compile(rf"^## \[({re.escape(version)}|Unreleased - Beta)\]")
         else:
             # Look for specific version
-            section_pattern = re.compile(r"^## \[" + re.escape(version) + r"\]")
+            section_pattern = re.compile(rf"^## \[{re.escape(version)}\]")
         
         section_exists = any(section_pattern.match(line) for line in lines)
         
