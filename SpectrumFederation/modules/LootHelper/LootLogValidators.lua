@@ -34,8 +34,8 @@ function LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES
         return false
     end
 
-    -- Validate change type by checking if the passed value is included in the POINT_CHANGE_TYPES constants
-    if not POINT_CHANGE_TYPES[changeType] then
+    -- Validate change type by checking if the passed value matches valid constants
+    if changeType ~= POINT_CHANGE_TYPES.INCREMENT and changeType ~= POINT_CHANGE_TYPES.DECREMENT then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Invalid point change type in log for member %s: %s", tostring(memberID), tostring(changeType))
         end
@@ -62,16 +62,24 @@ function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS)
         return false
     end
     
-    -- Validate slot by checking if the passed value is included in the SF.ArmorSlots constants
-    if not SF.ArmorSlots[slot] then
+    -- Validate slot by checking if the passed value matches any valid armor slot
+    local validSlot = false
+    for _, slotValue in pairs(SF.ArmorSlots) do
+        if slot == slotValue then
+            validSlot = true
+            break
+        end
+    end
+    
+    if not validSlot then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Invalid armor slot in log for member %s: %s", tostring(memberID), tostring(slot))
         end
         return false
     end
     
-    -- Validate action by checking if the passed value is included in the ARMOR_ACTIONS constants
-    if not ARMOR_ACTIONS[action] then
+    -- Validate action by checking if the passed value matches valid constants
+    if action ~= ARMOR_ACTIONS.USED and action ~= ARMOR_ACTIONS.AVAILABLE then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Invalid armor action in log for member %s: %s", tostring(memberID), tostring(action))
         end
@@ -96,8 +104,8 @@ function LootLogValidators.ValidateRoleChangeData(eventData)
         return false
     end
     
-    -- Validate newRole is a valid member role constant
-    if not SF.MemberRoles[newRole] then
+    -- Validate newRole is a valid member role constant value
+    if newRole ~= SF.MemberRoles.ADMIN and newRole ~= SF.MemberRoles.MEMBER then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Invalid role in log for member %s: %s", tostring(memberID), tostring(newRole))
         end
