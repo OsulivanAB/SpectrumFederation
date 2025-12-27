@@ -318,7 +318,10 @@ member:ToggleEquipment(SF.ArmorSlots.SHOULDER)
 -- Point balance: 1, Shoulder slot: true
 
 -- Accidentally award chest piece when they have no points
-member:SetPointBalance(0)
+-- First, decrement point to get to 0
+member:DecrementPoints()
+-- Point balance: 0
+
 member:ToggleEquipment(SF.ArmorSlots.CHEST)
 -- Point balance: -1 (point debt), Chest slot: true
 
