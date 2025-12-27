@@ -19,7 +19,7 @@ body:
         - Classic Era / SoD
         - Public Test Realm (PTR)
         - Beta
-    validation:
+    validations:
       required: true
 
   - type: input
@@ -30,7 +30,7 @@ body:
         What specific patch are you on? (e.g., 11.0.2, 4.4.0)
         **How to find this:** It is displayed in the bottom-left corner of the character selection screen.
       placeholder: e.g. 11.0.2
-    validation:
+    validations:
       required: true
 
   - type: input
@@ -41,7 +41,7 @@ body:
         Please verify the version number of THIS addon.
         **How to find this:** Open the CurseForge/WoWUp app OR look at the `.toc` file in your AddOns folder.
       placeholder: e.g., v1.4.2
-    validation:
+    validations:
       required: true
 
   - type: textarea
@@ -50,7 +50,7 @@ body:
       label: Describe the Bug
       description: A clear and concise description of what the bug is.
       placeholder: When I cast Fireball while moving, the frame disappears...
-    validation:
+    validations:
       required: true
 
   - type: textarea
@@ -63,7 +63,7 @@ body:
         2. Click on '....'
         3. Scroll down to '....'
         4. See error
-    validation:
+    validations:
       required: true
 
   - type: textarea
@@ -72,7 +72,7 @@ body:
       label: Lua Errors
       description: Please copy and paste any Lua errors (enable Lua errors in WoW settings /console scriptErrors 1).
       render: lua
-    validation:
+    validations:
       required: false
 
   - type: textarea
@@ -80,7 +80,7 @@ body:
     attributes:
       label: Addon Debug Logs
       description: If the addon has a specific debug mode or output, paste that here.
-      placeholder: [Debug] Initialized... [Debug] Event triggered...
+      placeholder: "[Debug] Initialized... [Debug] Event triggered..."
       render: text
-    validation:
+    validations:
       required: false
