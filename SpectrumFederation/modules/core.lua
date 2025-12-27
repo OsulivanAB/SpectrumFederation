@@ -10,6 +10,13 @@ function SF:GetPlayerInfo()
     return name, realm
 end
 
+-- Get current player's full identifier in "Name-Realm" format
+-- @return: string - The player's full identifier (e.g., "Shadowbane-Garona")
+function SF:GetPlayerFullIdentifier()
+    local name, realm = SF:GetPlayerInfo()
+    return name .. "-" .. realm
+end
+
 -- Database Initialization
 function SF:InitializeLootDatabase()
 
