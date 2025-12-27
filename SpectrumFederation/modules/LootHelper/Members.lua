@@ -194,9 +194,9 @@ function Member:ToggleEquipment(slot)
     if self.armor[slot] then
         -- Slot is marked as used - toggle to false (member hasn't used their point for this slot)
         -- This returns the point to their balance
-        self.armor[slot] = false
         -- TODO: Add Log Entry
         self:IncrementPoints()
+        self.armor[slot] = false
         if SF.Debug then
             SF.Debug:Info("MEMBER", "%s removed equipment: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
         end
@@ -204,9 +204,9 @@ function Member:ToggleEquipment(slot)
     else
         -- Slot is not used - toggle to true (member is using their ONE point for this slot)
         -- This spends a point from their balance (can result in negative/debt)
-        self.armor[slot] = true
         -- TODO: Add Log Entry
         self:DecrementPoints()
+        self.armor[slot] = true
         if SF.Debug then
             SF.Debug:Info("MEMBER", "%s equipped item: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
         end
