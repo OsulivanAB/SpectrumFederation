@@ -14,6 +14,8 @@ modules/LootHelper/Database.lua
 modules/SlashCommands.lua
 modules/MessageHelpers.lua
 modules/LootHelper/Members.lua
+modules/LootHelper/LootLogValidators.lua
+modules/LootHelper/LootLogs.lua
 modules/UIHelpers.lua
 modules/LootHelper/MemberQuery.lua
 modules/LootHelper/LootProfiles.lua
