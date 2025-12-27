@@ -168,7 +168,7 @@ end
 function Member:IncrementPoints()
     -- TODO: Enforce admin permissions
     
-    -- Create Log Entry for point decrement
+    -- Create Log Entry for point increment
     local logEventType = SF.LootLogEventTypes.POINT_CHANGE
     local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
     logEventData.member = self:GetFullIdentifier()
