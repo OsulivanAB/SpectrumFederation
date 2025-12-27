@@ -106,9 +106,26 @@ Member.ARMOR_SLOTS = ARMOR_SLOTS
 function Member:SetRole(newRole)
     -- TODO: Enforce admin permissions
     if newRole == MEMBER_ROLES.ADMIN or newRole == MEMBER_ROLES.MEMBER then
+        
+        -- Create Log Entry for role change
+        local logEventType = SF.LootLogEventTypes.ROLE_CHANGE
+        local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
+        logEventData.member = self:GetFullIdentifier()
+        logEventData.newRole = newRole
+        local logEntry = SF.LootLog.new(logEventType, logEventData)
+        if not logEntry then
+            SF:PrintError("Failed to create loot log entry for role change.")
+            if SF.Debug then
+                SF.Debug:Error("MEMBER", "Failed to create loot log entry for role change for %s", self:GetFullIdentifier())
+            end
+            return false
+        end
+
         local oldRole = self.role
         self.role = newRole
-        -- TODO: Add Log Entry
+
+        -- TODO: Add Log Entry to Loot Profile Table
+
         if SF.Debug then
             SF.Debug:Info("MEMBER", "%s role changed: %s -> %s", self:GetFullIdentifier(), oldRole, newRole)
         end
@@ -150,9 +167,26 @@ end
 -- @return none
 function Member:IncrementPoints()
     -- TODO: Enforce admin permissions
+    
+    -- Create Log Entry for point decrement
+    local logEventType = SF.LootLogEventTypes.POINT_CHANGE
+    local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
+    logEventData.member = self:GetFullIdentifier()
+    logEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+    local logEntry = SF.LootLog.new(logEventType, logEventData)
+    -- Validate logEntry creation
+    if not logEntry then
+        SF:PrintError("Failed to create loot log entry for point increment.")
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create loot log entry for point increment for %s", self:GetFullIdentifier())
+        end
+        return
+    end
+
     local oldBalance = self.pointBalance
     self.pointBalance = self.pointBalance + 1
-    -- TODO: Add Log Entry
+
+    -- TODO: Add Log Entry to Loot Profile Table
     if SF.Debug then
         SF.Debug:Verbose("MEMBER", "%s points incremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
     end
@@ -163,9 +197,27 @@ end
 -- @return none
 function Member:DecrementPoints()
     -- TODO: Enforce admin permissions
+    
+    -- Create Log Entry for point decrement
+    local logEventType = SF.LootLogEventTypes.POINT_CHANGE
+    local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
+    logEventData.member = self:GetFullIdentifier()
+    logEventData.change = SF.LootLogPointChangeTypes.DECREMENT
+    local logEntry = SF.LootLog.new(logEventType, logEventData)
+    -- Validate logEntry creation
+    if not logEntry then
+        SF:PrintError("Failed to create loot log entry for point decrement.")
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create loot log entry for point decrement for %s", self:GetFullIdentifier())
+        end
+        return
+    end
+    
     local oldBalance = self.pointBalance
     self.pointBalance = self.pointBalance - 1
-    -- TODO: Add Log Entry
+
+    -- TODO: Add Log Entry to Loot Profile Table
+    
     if SF.Debug then
         SF.Debug:Verbose("MEMBER", "%s points decremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
         if self.pointBalance < 0 then
@@ -192,21 +244,55 @@ function Member:ToggleEquipment(slot)
 
     -- Toggle the armor slot usage
     if self.armor[slot] then
-        -- Slot is marked as used - toggle to false (member hasn't used their point for this slot)
-        -- This returns the point to their balance
-        -- TODO: Add Log Entry
+        -- Slot is marked as used - toggle to false
+        
+        -- Create Log Entry for marking armor slot as available again
+        local logEventType = SF.LootLogEventTypes.ARMOR_CHANGE
+        local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
+        logEventData.member = self:GetFullIdentifier()
+        logEventData.slot = slot
+        logEventData.action = SF.LootLogArmorActions.AVAILABLE
+        local logEntry = SF.LootLog.new(logEventType, logEventData)
+
+        -- Validate logEntry creation
+        if not logEntry then
+            SF:PrintError("Failed to create loot log entry for armor slot toggle.")
+            if SF.Debug then
+                SF.Debug:Error("MEMBER", "Failed to create loot log entry for armor slot toggle for %s", self:GetFullIdentifier())
+            end
+            return false
+        end
+
         self:IncrementPoints()
         self.armor[slot] = false
+        -- TODO: Add Log Entry to Loot Profile Table
         if SF.Debug then
             SF.Debug:Info("MEMBER", "%s removed equipment: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
         end
         return true
     else
-        -- Slot is not used - toggle to true (member is using their ONE point for this slot)
-        -- This spends a point from their balance (can result in negative/debt)
-        -- TODO: Add Log Entry
+        -- Slot is currently Available - toggle to used
+        
+        -- Create Log Entry for marking armor slot as used
+        local logEventType = SF.LootLogEventTypes.ARMOR_CHANGE
+        local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
+        logEventData.member = self:GetFullIdentifier()
+        logEventData.slot = slot
+        logEventData.action = SF.LootLogArmorActions.USED
+        local logEntry = SF.LootLog.new(logEventType, logEventData)
+
+        -- Validate logEntry creation
+        if not logEntry then
+            SF:PrintError("Failed to create loot log entry for armor slot toggle.")
+            if SF.Debug then
+                SF.Debug:Error("MEMBER", "Failed to create loot log entry for armor slot toggle for %s", self:GetFullIdentifier())
+            end
+            return false
+        end
+        
         self:DecrementPoints()
         self.armor[slot] = true
+        -- TODO: Add Log Entry to Loot Profile Table
         if SF.Debug then
             SF.Debug:Info("MEMBER", "%s equipped item: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
         end
