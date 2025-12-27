@@ -11,6 +11,7 @@
 ## Core files
 modules/Debug.lua
 modules/LootHelper/Database.lua
+modules/LootHelper/Members.lua
 modules/SlashCommands.lua
 modules/MessageHelpers.lua
 modules/UIHelpers.lua
