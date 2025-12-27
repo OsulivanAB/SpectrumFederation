@@ -35,8 +35,14 @@
 ## Testing
 
 ### In-Game Testing Details
-- WoW Client: <!-- Retail/Classic/PTR/Beta -->
-- Game Version: <!-- e.g., 11.0.2 -->
+
+**WoW Client Type:**
+- [ ] Retail
+- [ ] Classic
+- [ ] PTR
+- [ ] Beta
+
+**Game Version:** <!-- e.g., 11.0.2 -->
 
 **Additional Testing Info**
 
