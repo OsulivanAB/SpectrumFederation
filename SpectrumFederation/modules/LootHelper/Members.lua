@@ -46,6 +46,7 @@ Member.__index = Member
 -- @param role (string, optional) - Member role ("admin" or "member", defaults to "member")
 -- @param class (string, optional) - WoW class name (e.g., "WARRIOR", "PALADIN"), must match SF.WOW_CLASSES keys
 -- @return Member instance
+-- TODO: Remove the ability to set role during member creation
 function Member.new(name, realm, role, class)
     -- Create new instance with metatable
     local instance = setmetatable({}, Member)
