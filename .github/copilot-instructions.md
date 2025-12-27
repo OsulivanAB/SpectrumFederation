@@ -22,6 +22,7 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 - `modules/SlashCommands.lua` - Slash command registration and handling
 - `modules/Settings.lua` - Main settings panel with banner
 - `modules/LootHelper/Database.lua` - Loot Helper database initialization
+- `modules/LootHelper/Members.lua` - Member class (OOP pattern for loot profile members)
 - `modules/LootHelper/LootProfiles.lua` - Profile CRUD operations
 - `modules/LootHelper/LootHelper.lua` - Core loot helper functionality
 - `modules/LootHelper/MemberQuery.lua` - Raid/party/solo member queries
@@ -100,7 +101,7 @@ SpectrumFederation.lua               # Entry point, event registration
 - `SF:GetPartyMembers()` - Query party members (player + party1-4)
 - `SF:GetSoloPlayer()` - Return solo player info
 
-Use these helpers consistently throughout the addon for maintainability. See `docs/development/helper-functions.md` for detailed documentation with examples and WoW API references.
+Use these helpers consistently throughout the addon for maintainability. See `docs/development/helper-functions.md` and `docs/development/members-class.md` for detailed documentation with examples and WoW API references.
 
 ## Namespace & SavedVariables Pattern
 
@@ -120,6 +121,11 @@ end
 -- Module organization for debug system
 SF.Debug     -- Logging system (debug.lua)
 
+-- Member class (Members.lua)
+SF.Member           -- Member class
+SF.MemberRoles      -- Role constants (ADMIN, MEMBER)
+SF.ArmorSlots       -- Armor slot constants (HEAD, SHOULDER, etc.)
+
 -- SavedVariables references (set in SpectrumFederation.lua)
 SF.lootHelperDB  -- Points to SpectrumFederationDB
 SF.debugDB       -- Points to SpectrumFederationDebugDB
@@ -136,7 +142,7 @@ SF.debugDB       -- Points to SpectrumFederationDebugDB
             created = timestamp,
             modified = timestamp,
             members = {
-                {name = "Name", realm = "Realm", classFilename = "CLASS", points = 0}
+                ["Name-Realm"] = Member instance  -- Dictionary of Member objects
             }
         }
     },
@@ -205,7 +211,53 @@ function Debug:Initialize()
 end
 ```
 
-**Profile Functions (LootProfiles.lua):**
+**Member Class Pattern (Members.lua):**
+```lua
+local addonName, SF = ...
+
+-- Define constants
+local MEMBER_ROLES = { ADMIN = "admin", MEMBER = "member" }
+local ARMOR_SLOTS = { HEAD = "Head", SHOULDER = "Shoulder", ... }
+
+-- Class definition
+local Member = {}
+Member.__index = Member
+
+-- Constructor: use DOT notation (factory function)
+function Member.new(name, realm, role)
+    local instance = setmetatable({}, Member)
+    -- Initialize properties
+    return instance
+end
+
+-- Instance methods: use COLON notation (auto-passes self)
+function Member:GetFullIdentifier()
+    return self.name .. "-" .. self.realm
+end
+
+function Member:ToggleEquipment(slot)
+    -- Validate, toggle, call IncrementPoints() or DecrementPoints()
+end
+
+-- Export to namespace
+SF.Member = Member
+SF.MemberRoles = MEMBER_ROLES
+SF.ArmorSlots = ARMOR_SLOTS
+```
+
+**Member Class Usage:**
+```lua
+-- Creating instances
+local member = SF.Member.new("Shadowbane", "Garona")
+
+-- Calling instance methods
+member:IncrementPoints()
+local points = member:GetPointBalance()
+local isAdmin = member:IsAdmin()
+member:ToggleEquipment(SF.ArmorSlots.HEAD)
+```
+
+**Profile Functions (LootProfiles.lua):****
 ```lua
 local addonName, SF = ...
 
