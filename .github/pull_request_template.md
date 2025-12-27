@@ -26,6 +26,7 @@
 - [ ] I have tested these changes in-game
 - [ ] My code follows the project's style guidelines
 - [ ] I have added/updated documentation as needed
+- [ ] I have added appropriate Debug Logging if necessary
 - [ ] I have added/updated localization strings in `locale/enUS.lua` if applicable
 - [ ] My changes generate no new warnings or errors
 - [ ] Any dependent changes have been merged and published
@@ -34,8 +35,14 @@
 ## Testing
 
 ### In-Game Testing Details
-- WoW Client: <!-- Retail/Classic/PTR/Beta -->
-- Game Version: <!-- e.g., 11.0.2 -->
+
+**WoW Client Type:**
+- [ ] Retail
+- [ ] Classic
+- [ ] PTR
+- [ ] Beta
+
+**Game Version:** <!-- e.g., 11.0.2 -->
 
 **Additional Testing Info**
 
