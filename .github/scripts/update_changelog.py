@@ -57,11 +57,8 @@ def main():
     # Determine which section to use
     # CHANGED: Beta now uses actual version number with date instead of "Unreleased - Beta"
     # This prevents confusion and provides proper version tracking in beta changelog
-    if branch_name == "beta" or is_beta:
-        # For beta, use the actual version number with date
-        section_header = f"## [{version}] - {current_date}"
-    else:
-        section_header = f"## [{version}] - {current_date}"
+    # Both beta and stable versions now use the same format: "## [version] - date"
+    section_header = f"## [{version}] - {current_date}"
     
     print(f"Using section: {section_header}")
 
@@ -167,7 +164,7 @@ def main():
         cleaned_lines = []
         skip_section = False
         
-        for i, line in enumerate(lines):
+        for line in lines:
             # Detect start of a beta version section
             if re.match(r"^## \[.*-beta.*\]", line) or re.match(r"^## \[Unreleased - Beta\]", line):
                 skip_section = True
