@@ -135,6 +135,12 @@ function LootProfile:GetLootLogs()
     return self._lootLogs
 end
 
+-- Get a list of admin user identifiers
+-- @return (table) - Array of admin user full identifiers "Name-Realm"
+function LootProfile:GetAdminList()
+    return self._adminUsers
+end
+
 -- ============================================================================
 -- Setter Methods
 -- ============================================================================

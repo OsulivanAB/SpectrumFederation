@@ -69,7 +69,7 @@ Each LootProfile instance has the following private properties:
 | `_owner` | string | Current owner ("Name-Realm" format) | [`GetOwner()`](#getowner) | [`SetOwner()`](#setownernewowner) |
 | `_members` | table | Array of LootProfileMember instances | [`GetMemberList()`](#getmemberlist) | [`AddMember()`](#addmembermember) |
 | `_lootLogs` | table | Array of LootLog instances (chronologically sorted) | [`GetLootLogs()`](#getlootlogs) | [`AddLootLog()`](#addlootloglootlog) |
-| `_adminUsers` | table | Array of admin user identifiers ("Name-Realm" format) | [`IsCurrentUserAdmin()`](#iscurrentuseradmin) | [`AddAdminUser()`](#addadminusermember) |
+| `_adminUsers` | table | Array of admin user identifiers ("Name-Realm" format) | [`GetAdminList()`](#getadminlist), [`IsCurrentUserAdmin()`](#iscurrentuseradmin) | [`AddAdminUser()`](#addadminusermember) |
 | `_activeProfile` | boolean | Active/inactive status | [`IsActive()`](#isactive) | [`SetActive()`](#setactiveisactive) |
 
 ## Creating Profiles
@@ -336,6 +336,30 @@ end
 ```
 
 **Usage Note**: Returns the internal `_lootLogs` array. Logs are automatically kept sorted by timestamp. Used by Member instances to rebuild state via `UpdateFromLootLog()`.
+
+#### GetAdminList()
+
+Retrieves a list of all admin user identifiers in the profile.
+
+**Returns**:
+
+- `table` - Array of admin user full identifiers ("Name-Realm" format)
+
+**Example**:
+
+```lua
+local admins = profile:GetAdminList()
+print("Profile admins:")
+for i, adminID in ipairs(admins) do
+    print(i, adminID)
+end
+-- Output:
+-- Profile admins:
+-- 1 Shadowbane-Garona
+-- 2 Guildmaster-Garona
+```
+
+**Usage Note**: Returns the internal `_adminUsers` array. This lists all users who have administrative permissions on the profile. Use with `IsCurrentUserAdmin()` to check if the active player has admin rights.
 
 #### AddMember(member)
 
