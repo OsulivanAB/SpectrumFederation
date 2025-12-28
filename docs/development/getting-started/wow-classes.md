@@ -132,7 +132,7 @@ end
 
 ## Integration with Member Class
 
-The Member class uses `SF.WOW_CLASSES` for validation and class information retrieval. See the [Member Class Documentation](members-class.md) for details on:
+The Member class uses `SF.WOW_CLASSES` for validation and class information retrieval. See the [Member Class Documentation](../loot-helper/members-class.md) for details on:
 
 - Constructor class parameter validation
 - `GetClass()` method
@@ -359,6 +359,6 @@ If class icons don't show:
 
 ## Related Documentation
 
-- [Member Class Documentation](members-class.md) - Integration with Member instances
-- [Helper Functions](helper-functions.md) - Additional UI utilities
-- [Loot Logs](loot-logs.md) - Event logging system
+- [Member Class Documentation](../loot-helper/members-class.md) - Integration with Member instances
+- [Development Overview](index.md) - Getting started with addon development
+- [Loot Logs](../loot-helper/loot-logs.md) - Event logging system

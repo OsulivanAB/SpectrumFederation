@@ -200,7 +200,7 @@ end
 
 **Use case**: Displaying class icons next to member names in UI.
 
-**Note**: See [WoW Classes Documentation](wow-classes.md) for complete information about class colors and textures.
+**Note**: See [WoW Classes Documentation](../getting-started/wow-classes.md) for complete information about class colors and textures.
 
 #### GetPointBalance()
 Returns the member's current point balance.

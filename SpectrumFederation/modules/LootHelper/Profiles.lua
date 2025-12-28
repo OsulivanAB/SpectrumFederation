@@ -89,6 +89,12 @@ function LootProfile:GetAuthor()
     return self._author
 end
 
+-- function to get owner
+-- @return (string) - Owner identifier
+function LootProfile:GetOwner()
+    return self._owner
+end
+
 -- function to get last modified timestamp by finding the most recent log entry
 -- @return (number) - Last modified timestamp or nil if no logs
 function LootProfile:GetLastModifiedTime()
@@ -121,6 +127,12 @@ function LootProfile:GetMemberList()
         table.insert(memberList, member:GetFullIdentifier())
     end
     return memberList
+end
+
+-- Get the loot logs array
+-- @return (table) - Array of LootLog instances
+function LootProfile:GetLootLogs()
+    return self._lootLogs
 end
 
 -- ============================================================================
