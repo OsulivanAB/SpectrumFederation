@@ -110,7 +110,7 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
                     else
                         logText = string.format("Last %d debug logs:\\n\\n", #logs)
                         for i, log in ipairs(logs) do
-                            local timestamp = date("%H:%M:%S", log.timestamp)
+                            local timestamp = SF:FormatTimestampForUser(log.timestamp)
                             logText = logText .. string.format("[%s] [%s] %s: %s\\n", 
                                 timestamp, log.level, log.category, log.message)
                         end

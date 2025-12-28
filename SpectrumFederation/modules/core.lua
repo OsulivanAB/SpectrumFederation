@@ -101,3 +101,36 @@ function SF:InitializeLootDatabase()
         if SF.Debug then SF.Debug:Warn("DATABASE", "InitializeLootHelperDatabase function not found") end
     end
 end
+
+-- Get the user's timezone offset from UTC in seconds
+-- @return (number) - Offset in seconds (positive = east of UTC, negative = west)
+function SF:GetUserTimezoneOffset()
+    return time() - GetServerTime()
+end
+
+-- Format UTC timestamp for display in user's local timezone
+-- @param utcTimestamp (number) - UTC Unix timestamp from GetServerTime()
+-- @return (string) - Formatted timestamp in user's local time (YYYY-MM-DD HH:MM:SS) or error message
+function SF:FormatTimestampForUser(utcTimestamp)
+    -- Validate timestamp
+    if type(utcTimestamp) ~= "number" then
+        return "Invalid timestamp"
+    end
+    
+    local userOffset = SF:GetUserTimezoneOffset()
+    return date("%Y-%m-%d %H:%M:%S", utcTimestamp + userOffset)
+end
+
+-- Format UTC timestamp for display in server's local timezone
+-- @param utcTimestamp (number) - UTC Unix timestamp from GetServerTime()
+-- @return (string) - Formatted timestamp in server's local time (YYYY-MM-DD HH:MM:SS) or error message
+function SF:FormatTimestampForServer(utcTimestamp)
+    -- Validate timestamp
+    if type(utcTimestamp) ~= "number" then
+        return "Invalid timestamp"
+    end
+    
+    local serverLocal = C_DateAndTime.GetServerTimeLocal()
+    local serverOffset = serverLocal - GetServerTime()
+    return date("%Y-%m-%d %H:%M:%S", utcTimestamp + serverOffset)
+end
