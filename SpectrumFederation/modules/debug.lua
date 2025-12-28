@@ -46,7 +46,7 @@ function Debug:Log(level, category, message, ...)
     
     -- Create log entry
     local entry = {
-        timestamp = time(),
+        timestamp = GetServerTime(),
         level = level,
         category = category,
         message = formattedMessage

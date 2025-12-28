@@ -74,15 +74,19 @@ nav:
   - Features:
     - Settings UI: settings-ui.md
   - Development:
-    - Getting Started: development/index.md
-    - Loot Profile Class: development/loot-profile-class.md
-    - Members Class: development/members-class.md
-    - Loot Logs: development/loot-logs.md
-    - WoW Classes: development/wow-classes.md
-    - Helper Functions: development/helper-functions.md
-    - CI/CD Workflows: development/workflows.md
-    - Promoting Beta to Main: development/promoting-to-main.md
-    - Naming Conventions: development/naming-conventions.md
+    - Getting Started:
+      - Overview: development/getting-started/index.md
+      - Naming Conventions: development/getting-started/naming-conventions.md
+      - Promoting Beta to Main: development/getting-started/promoting-to-main.md
+      - CI/CD Workflows: development/getting-started/workflows.md
+      - WoW Classes: development/getting-started/wow-classes.md
+      - Slash Commands: development/getting-started/slash-commands.md
+    - Loot Helper:
+      - Overview: development/loot-helper/loot-helper.md
+      - Members Class: development/loot-helper/members-class.md
+      - Loot Profile Class: development/loot-helper/loot-profile-class.md
+      - Loot Logs Class: development/loot-helper/loot-logs.md
+      - Data Syncing: development/loot-helper/loot-profile-data-syncing.md
 
 plugins:
   - search

@@ -46,7 +46,6 @@ Member.__index = Member
 -- @param role (string, optional) - Member role ("admin" or "member", defaults to "member")
 -- @param class (string, optional) - WoW class name (e.g., "WARRIOR", "PALADIN"), must match SF.WOW_CLASSES keys
 -- @return Member instance
--- TODO: Remove the ability to set role during member creation
 function Member.new(name, realm, role, class)
     -- Create new instance with metatable
     local instance = setmetatable({}, Member)
@@ -116,7 +115,22 @@ Member.ARMOR_SLOTS = ARMOR_SLOTS
 -- @param newRole (string) - Use SF.MemberRoles.ADMIN or SF.MemberRoles.MEMBER
 -- @return success (boolean) - True if role updated, false otherwise
 function Member:SetRole(newRole)
-    -- TODO: Enforce admin permissions
+
+    -- Enforce admin permissions
+    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
+        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
+            if SF.Debug then
+                SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
+            end
+            return false
+        end
+    else
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member roles")
+        end
+        return false
+    end
+    
     if newRole == MEMBER_ROLES.ADMIN or newRole == MEMBER_ROLES.MEMBER then
         
         -- Create Log Entry for role change
@@ -136,7 +150,14 @@ function Member:SetRole(newRole)
         local oldRole = self.role
         self.role = newRole
 
-        -- TODO: Add Log Entry to Loot Profile Table
+        -- Add Log Entry to Loot Profile Table
+        if SF.lootHelperDB.activeProfile.AddLootLog then
+            SF.lootHelperDB.activeProfile:AddLootLog(logEntry)
+        else
+            if SF.Debug then
+                SF.Debug:Warn("MEMBER", "Active profile does not support AddLootLog; cannot log role change")
+            end
+        end
 
         if SF.Debug then
             SF.Debug:Info("MEMBER", "%s role changed: %s -> %s", self:GetFullIdentifier(), oldRole, newRole)
@@ -208,9 +229,23 @@ function Member:IsAdmin()
 end
 
 -- Function to increment point balance by 1
--- @return none
+-- @return (boolean) - True if successful, false otherwise
 function Member:IncrementPoints()
-    -- TODO: Enforce admin permissions
+
+    -- Enforce admin permissions
+    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
+        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
+            if SF.Debug then
+                SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
+            end
+            return false
+        end
+    else
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member roles")
+        end
+        return false
+    end
     
     -- Create Log Entry for point increment
     local logEventType = SF.LootLogEventTypes.POINT_CHANGE
@@ -224,23 +259,46 @@ function Member:IncrementPoints()
         if SF.Debug then
             SF.Debug:Error("MEMBER", "Failed to create loot log entry for point increment for %s", self:GetFullIdentifier())
         end
-        return
+        return false
     end
 
     local oldBalance = self.pointBalance
     self.pointBalance = self.pointBalance + 1
 
-    -- TODO: Add Log Entry to Loot Profile Table
+    -- Add Log Entry to Loot Profile Table
+    if SF.lootHelperDB.activeProfile.AddLootLog then
+        SF.lootHelperDB.activeProfile:AddLootLog(logEntry)
+    else
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Active profile does not support AddLootLog; cannot log point increment")
+        end
+    end
+    
     if SF.Debug then
         SF.Debug:Verbose("MEMBER", "%s points incremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
     end
+    return true
 end
 
 -- Function to decrement point balance by 1
 -- Allows negative values (point debt) for edge cases like accidental gear awards
--- @return none
+-- @return (boolean) - True if successful, false otherwise
 function Member:DecrementPoints()
-    -- TODO: Enforce admin permissions
+
+    -- Enforce admin permissions
+    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
+        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
+            if SF.Debug then
+                SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
+            end
+            return false
+        end
+    else
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member roles")
+        end
+        return false
+    end
     
     -- Create Log Entry for point decrement
     local logEventType = SF.LootLogEventTypes.POINT_CHANGE
@@ -254,13 +312,20 @@ function Member:DecrementPoints()
         if SF.Debug then
             SF.Debug:Error("MEMBER", "Failed to create loot log entry for point decrement for %s", self:GetFullIdentifier())
         end
-        return
+        return false
     end
     
     local oldBalance = self.pointBalance
     self.pointBalance = self.pointBalance - 1
 
-    -- TODO: Add Log Entry to Loot Profile Table
+    -- Add Log Entry to Loot Profile Table
+    if SF.lootHelperDB.activeProfile.AddLootLog then
+        SF.lootHelperDB.activeProfile:AddLootLog(logEntry)
+    else
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Active profile does not support AddLootLog; cannot log point decrement")
+        end
+    end
     
     if SF.Debug then
         SF.Debug:Verbose("MEMBER", "%s points decremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
@@ -268,6 +333,7 @@ function Member:DecrementPoints()
             SF.Debug:Warn("MEMBER", "%s is now in point debt: %d", self:GetFullIdentifier(), self.pointBalance)
         end
     end
+    return true
 end
 
 -- Function to toggle equipment slot usage (for UI button clicks)
@@ -275,7 +341,21 @@ end
 -- @param slot (string) - Use SF.ArmorSlots constants
 -- @return (boolean) - True if successful, false otherwise
 function Member:ToggleEquipment(slot)
-    -- TODO: Enforce admin permissions
+
+    -- Enforce admin permissions
+    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
+        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
+            if SF.Debug then
+                SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
+            end
+            return false
+        end
+    else
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member roles")
+        end
+        return false
+    end
 
     -- Validate slot exists in armor table
     if self.armor[slot] == nil then
@@ -309,7 +389,16 @@ function Member:ToggleEquipment(slot)
 
         self:IncrementPoints()
         self.armor[slot] = false
-        -- TODO: Add Log Entry to Loot Profile Table
+
+        -- Add Log Entry to Loot Profile Table
+        if SF.lootHelperDB.activeProfile.AddLootLog then
+            SF.lootHelperDB.activeProfile:AddLootLog(logEntry)
+        else
+            if SF.Debug then
+                SF.Debug:Warn("MEMBER", "Active profile does not support AddLootLog; cannot log point increment")
+            end
+        end
+
         if SF.Debug then
             SF.Debug:Info("MEMBER", "%s removed equipment: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
         end
@@ -336,7 +425,16 @@ function Member:ToggleEquipment(slot)
         
         self:DecrementPoints()
         self.armor[slot] = true
-        -- TODO: Add Log Entry to Loot Profile Table
+
+        -- Add Log Entry to Loot Profile Table
+        if SF.lootHelperDB.activeProfile.AddLootLog then
+            SF.lootHelperDB.activeProfile:AddLootLog(logEntry)
+        else
+            if SF.Debug then
+                SF.Debug:Warn("MEMBER", "Active profile does not support AddLootLog; cannot log point decrement")
+            end
+        end
+        
         if SF.Debug then
             SF.Debug:Info("MEMBER", "%s equipped item: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
         end
@@ -346,12 +444,59 @@ end
 
 -- TODO: Function to update values based on Loot Logs. Need to wait till we've created the loot Logs to implement
 function Member:UpdateFromLootLog()
-    -- Filter loot logs for this member
-    -- Create variable for filtered logs to armor updates
-    -- Create variable for filtered logs to point updates
 
-    -- For each armor slot, find most recent log entry and update based on that entry. If none, set to false
-    
-    -- Calculate point balance based on point log entries
+    if not SF.lootHelperDB.activeProfile then
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "No active loot profile set when updating member from loot logs: %s", self:GetFullIdentifier())
+        end
+        return
+    end
+    if not SF.lootHelperDB.activeProfile.GetLootLogs then
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Active profile does not support GetLootLogs when updating member from loot logs: %s", self:GetFullIdentifier())
+        end
+        return
+    end
+    local logs = SF.lootHelperDB.activeProfile:GetLootLogs()
+    local filteredLogs = {}
+    for _, log in ipairs(logs) do
+        if log.eventData.member == self:GetFullIdentifier() then
+            table.insert(filteredLogs, log)
+        end
+    end
+
+    local pointBalance = 0
+    local armorStatuses = {}
+
+    -- Loop over each armor type in SF.ArmorSlots to find the most recent entry
+    -- If none found, set to false (available)
+    -- If found, set to that value
+    for slotName, _ in pairs(SF.ArmorSlots) do
+        armorStatuses[slotName] = false  -- Default to available
+        for i = #filteredLogs, 1, -1 do
+            local log = filteredLogs[i]
+            if log.eventType == SF.LootLogEventTypes.ARMOR_CHANGE and log.eventData.slot == slotName then
+                if log.eventData.action == SF.LootLogArmorActions.USED then
+                    armorStatuses[slotName] = true
+                else
+                    armorStatuses[slotName] = false
+                end
+                break  -- Found the most recent entry for this slot
+            end
+        end
+    end
+
+    -- Calculate point balance from POINT_CHANGE logs
+    pointBalance = 0
+    for _, log in ipairs(filteredLogs) do
+        if log.eventType == SF.LootLogEventTypes.POINT_CHANGE then
+            if log.eventData.change == SF.LootLogPointChangeTypes.INCREMENT then
+                pointBalance = pointBalance + 1
+            elseif log.eventData.change == SF.LootLogPointChangeTypes.DECREMENT then
+                pointBalance = pointBalance - 1
+            end
+        end
+    end
+    self.pointBalance = pointBalance
+    self.armor = armorStatuses
 end
-

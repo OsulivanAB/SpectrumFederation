@@ -50,13 +50,6 @@ local function GenerateLogID(timestamp, author, eventType, counter)
     return tostring(timestamp) .. "_" .. author .. "_" .. eventType .. "_" .. tostring(counter)
 end
 
--- Function to get the timestamp in the Loot Profile's timezone
--- @return (number) - Timestamp adjusted to profile's timezone
-local function GetProfileTimestamp()
-    -- TODO: Implement timezone adjustment based on profile settings
-    return time()
-end
-
 -- Class definition
 local LootLog = {}
 LootLog.__index = LootLog
@@ -66,7 +59,21 @@ LootLog.__index = LootLog
 -- @param eventData (table) - Data specific to the event type
 -- @return LootLog instance or nil if failed
 function LootLog.new(eventType, eventData)
-    -- TODO: Enforce admin permissions
+
+    -- Enforce admin permissions
+    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
+        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Current user is not admin; cannot create log entries")
+            end
+            return nil
+        end
+    else
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "IsCurrentUserAdmin function not found in active profile")
+        end
+        return nil
+    end
     
     -- Validate eventType is an option in EVENT_TYPES
     if not EVENT_TYPES[eventType] then
@@ -105,8 +112,7 @@ function LootLog.new(eventType, eventData)
     -- NOW create instance after all validation passes
     local instance = setmetatable({}, LootLog)
     
-    -- TODO: This timestamp should use the server time for the owner of the profile.
-    local timestamp = GetProfileTimestamp()  -- Log creation time
+    local timestamp = GetServerTime()  -- UTC timestamp from server
     local author = SF:GetPlayerFullIdentifier()  -- Author in "Name-Realm" format
     
     -- Increment counter for unique ID
