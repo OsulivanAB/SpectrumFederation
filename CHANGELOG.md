@@ -13,10 +13,17 @@ All notable changes to SpectrumFederation will be documented in this file.
 ## [Unreleased - Beta]
 
 ### Added
-- Introduced a new `LootLog` class for creating, managing, and validating loot event logs, including support for event types such as profile creation, point changes, armor changes, and role changes.
-- Added `LootLogValidators` module to validate event data for loot logs, ensuring data consistency and integrity.
-- Implemented serialization and deserialization for loot logs to enable synchronization across clients.
-- Added support for generating unique log IDs and timestamps for loot events.
+- Overhauled loot profile management system with new features for creating, managing, and activating loot profiles.
+- Added the ability to set and switch active loot profiles.
+- Implemented functionality to validate if members exist within active loot profiles.
+- Introduced new methods for adding, updating, and managing loot profiles in the database.
+
+### Changed
+- Updated timestamp formatting for debug logs to improve readability.
+- Refined loot log validation to ensure member checks are performed against the active loot profile.
+
+### Removed
+- Deprecated and removed legacy loot profile database and UI-related functions.
 
 ## [0.1.1] - 2025-12-26
 
