@@ -1,22 +1,6 @@
 -- Grab the namespace
 local addonName, SF = ...
 
--- Get current player's name and realm
--- @return: playerName (string), realmName (string)
-function SF:GetPlayerInfo()
-    local name = UnitName("player")
-    local realm = GetRealmName()
-    if SF.Debug then SF.Debug:Verbose("PROFILES", "Retrieved player info: %s-%s", name, realm) end
-    return name, realm
-end
-
--- Get current player's full identifier in "Name-Realm" format
--- @return: string - The player's full identifier (e.g., "Shadowbane-Garona")
-function SF:GetPlayerFullIdentifier()
-    local name, realm = SF:GetPlayerInfo()
-    return name .. "-" .. realm
-end
-
 -- WoW Class Information Dictionary
 -- Contains color codes (RGB 0-1 range) and texture file paths for all 13 WoW classes
 SF.WOW_CLASSES = {
@@ -73,6 +57,29 @@ SF.WOW_CLASSES = {
         textureFile = "Interface\\Icons\\ClassIcon_Evoker"
     }
 }
+
+-- Get current player's name and realm
+-- @return: playerName (string), realmName (string)
+function SF:GetPlayerInfo()
+    local name = UnitName("player")
+    local realm = GetRealmName()
+    if SF.Debug then SF.Debug:Verbose("PROFILES", "Retrieved player info: %s-%s", name, realm) end
+    return name, realm
+end
+
+-- Get current player's full identifier in "Name-Realm" format
+-- @return: string - The player's full identifier (e.g., "Shadowbane-Garona")
+function SF:GetPlayerFullIdentifier()
+    local name, realm = SF:GetPlayerInfo()
+    return name .. "-" .. realm
+end
+
+-- Get the current player's class in uppercase (e.g., "WARRIOR")
+-- @return: string - The player's class in uppercase
+function SF:GetPlayerClass()
+    local _, class = UnitClass("player")
+    return string.upper(class)
+end
 
 -- Database Initialization
 function SF:InitializeLootDatabase()

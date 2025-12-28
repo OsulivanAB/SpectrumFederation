@@ -14,8 +14,20 @@ local LootLogValidators = {}
 -- @param memberIdentifier (string) - Member full identifier "Name-Realm"
 -- @return (boolean) - True if member exists, false otherwise
 function LootLogValidators.MemberExistsInProfiles(memberIdentifier)
-    -- TODO: Implement this function to check if the member exists in any loot profile's member dictionary
-    return true
+    local activeProfile = SF.lootHelperDB.activeProfile
+    if not activeProfile then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "No active loot profile set when validating member: %s", tostring(memberIdentifier))
+        end
+        return false
+    end
+    local members = activeProfile:GetMemberList()
+    for _, memberID in ipairs(members) do
+        if memberID == memberIdentifier then
+            return true
+        end
+    end
+    return false
 end
 
 -- Function to validate the POINT_CHANGE event data
