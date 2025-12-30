@@ -1,6 +1,61 @@
 -- Grab the namespace
 local addonName, SF = ...
 
+-- TODO: Need to add a stable profileId to profile instance (perhaps author + creation timestamp? Hash to compress?)
+-- TODO: Function Return stable profileId for this profile
+-- @param none
+-- @return string profileId
+function LootProfile:GetProfileId()
+end
+
+-- TODO: Function Set profileId if it is currently nil (Do I really need this? Should be set at creation time)
+-- @param profileId string Stable profile identifier
+-- @return nil
+function LootProfile:SetProfileIdIfNil(profileId)
+end
+
+-- TODO: Function Export minimal metadta for reconstructing / creating a local profile shell.
+-- @param none
+-- @return table meta
+function LootProfile:ExportMeta()
+end
+
+-- TODO: Function Export a full snapshot payload (minus members which can be re-calculated)
+-- @param none
+-- @return table snapshot
+function LootProfile:ExportSnapshot()
+end
+
+-- TODO: Function Import a full snapshot payload into this profile (or rebuild internal collections).
+-- @param snapshot table
+-- @return nil
+function LootProfile:ImportSnapshot(snapshot)
+end
+
+-- TODO: Function Compute authorMax map for this profile based on current logs.
+-- @param none
+-- @return table authorMax
+function LootProfile:ComputeAuthorMax()
+end
+
+-- TODO: Function Merge network logs into this profile: dedupe by logId and keep sorted order.
+-- @param logTables table Array of log net tables
+-- @return boolean success
+function LootProfile:MergeNetLogs(logTables)
+end
+
+-- TODO: Function Rebuild derived state from current logs (replay).
+-- @param none
+-- @return nil
+function LootProfile:RebuildFromLogs()
+end
+
+-- TODO: Function allocate and return the next counter for a given author (used when creating new logs locally).
+-- @param author string "Name-Realm" of author
+-- @return number nextCounter
+function LootProfile:AllocateNextCounter(author)
+end
+
 -- Class definition
 local LootProfile = {}
 LootProfile.__index = LootProfile

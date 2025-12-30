@@ -17,6 +17,8 @@ modules/LootHelper/LootLogValidators.lua
 modules/LootHelper/LootLogs.lua
 modules/LootHelper/Profiles.lua
 modules/LootHelper/LootHelper.lua
+modules/LootHelper/Sync.lua
+modules/LootHelper/SyncTransport.lua
 modules/Settings.lua
 modules/Core.lua
 SpectrumFederation.lua

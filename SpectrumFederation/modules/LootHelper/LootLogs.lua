@@ -1,6 +1,21 @@
 -- Grab the namespace
 local addonName, SF = ...
 
+-- TODO: Need to Add a per-author counter variable to loot log entry
+-- TODO: Need to add a getCounter() function 
+-- TODO: Need to make sure my Log ID is stable (for example Author:Counter)
+-- TODO: Function Convert this log into a network-safe table (no metatables/functions).
+-- @param none
+-- @return table logTable
+function LootLog:ToNetTable()
+end
+
+-- TODO: Function Create a LootLog from a network-safe table.
+-- @param logTable table Network-safe table representation of a log
+-- @return Lootlog instance
+function LootLog.FromNetTable(logTable)
+end
+
 -- Simple counter for unique log IDs (resets each session)
 local logCounter = 0
 
