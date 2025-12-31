@@ -135,7 +135,7 @@ function LootLog.new(eventType, eventData, opts)
         return nil
     end
 
-    local instance = setMetatable({}, LootLog)
+    local instance = setmetatable({}, LootLog)
     instance._timestamp = timestamp
     instance._author = author
     instance._counter = counter

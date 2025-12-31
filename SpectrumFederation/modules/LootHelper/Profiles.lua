@@ -111,7 +111,7 @@ function LootProfile.new(profileName)
 
     -- Create Log Entry for profile creation
     local logEventType = SF.LootLogEventTypes.PROFILE_CREATION
-    local logEventData = SF.LootLog.GetEventDataTempalte(logEventType)
+    local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
     if not logEventData then
         if SF.Debug then
             SF.Debug("LootProfile", "Failed to get log event data template for profile creation")
