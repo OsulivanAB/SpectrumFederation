@@ -250,9 +250,9 @@ end
 -- Function to get creation time by finding the PROFILE_CREATION log
 -- @return number Creation timestamp or nil if not found
 function LootProfile:GetCreationTime()
-    for _, logEntry in ipairs(self._lootLogs) do
-        if logEntry.eventType == SF.LootLogEventTypes.PROFILE_CREATION then
-            return logEntry.timestamp
+    for _, logEntry in ipairs(self._lootLogs or {}) do
+        if logEntry:GetEventType() == SF.LootLogEventTypes.PROFILE_CREATION then
+            return logEntry:GetTimestamp()
         end
     end
     return nil
@@ -304,9 +304,10 @@ end
 -- @return number latest timestamp or nil if no logs
 function LootProfile:GetLastModifiedTime()
     local latestTime = nil
-    for _, logEntry in ipairs(self._lootLogs) do
-        if not latestTime or logEntry.timestamp > latestTime then
-            latestTime = logEntry.timestamp
+    for _, logEntry in ipairs(self._lootLogs or {}) do
+        local ts = logEntry:GetTimestamp()
+        if not latestTime or ts > latestTime then
+            latestTime = ts
         end
     end
     return latestTime
