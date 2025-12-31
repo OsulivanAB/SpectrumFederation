@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
 Update CHANGELOG.md using GitHub Copilot to analyze recent changes.
+
+This script is called by two workflows:
+1. post-merge-beta.yml - Updates beta branch changelog after merge
+2. promote-beta-to-main.yml - Updates main branch changelog during promotion
+
+Key behaviors:
+- Beta branch: Creates versioned entries like "## [0.2.0-beta.1] - 2025-12-27"
+- Main branch: Cleans ALL beta entries from changelog, creates stable version entry
+- Backward compatible: Handles legacy "## [Unreleased - Beta]" sections
 """
 
 import os
@@ -46,10 +55,10 @@ def main():
     current_date = datetime.now().strftime("%Y-%m-%d")
     
     # Determine which section to use
-    if branch_name == "beta" or is_beta:
-        section_header = "## [Unreleased - Beta]"
-    else:
-        section_header = f"## [{version}] - {current_date}"
+    # CHANGED: Beta now uses actual version number with date instead of "Unreleased - Beta"
+    # This prevents confusion and provides proper version tracking in beta changelog
+    # Both beta and stable versions now use the same format: "## [version] - date"
+    section_header = f"## [{version}] - {current_date}"
     
     print(f"Using section: {section_header}")
 
@@ -142,6 +151,36 @@ def main():
     # Read existing CHANGELOG
     changelog_path = Path("CHANGELOG.md")
     existing_changelog = changelog_path.read_text(encoding="utf-8") if changelog_path.exists() else ""
+
+    # ADDED: Clean beta entries when running on main branch
+    # This prevents beta version entries from leaking into the stable changelog
+    # Removes entries like:
+    #   - "## [0.2.0-beta.1] - 2025-12-27"
+    #   - "## [0.1.1-beta.2] - Unreleased"
+    #   - "## [Unreleased - Beta]"
+    if branch_name == "main" and not is_beta and existing_changelog:
+        print("Cleaning beta entries from changelog for main branch...")
+        lines = existing_changelog.split("\n")
+        cleaned_lines = []
+        skip_section = False
+        
+        for line in lines:
+            # Detect start of a beta version section (combined regex for performance)
+            if re.match(r"^## \[(?:.*-beta.*|Unreleased - Beta)\]", line):
+                skip_section = True
+                print(f"  Removing beta section: {line}")
+                continue
+            
+            # Detect start of a new non-beta section (stop skipping)
+            if skip_section and line.startswith("## ["):
+                skip_section = False
+            
+            # Keep lines that are not part of beta sections
+            if not skip_section:
+                cleaned_lines.append(line)
+        
+        existing_changelog = "\n".join(cleaned_lines)
+        print("Beta entries cleaned from changelog")
 
     # Prepare prompt for GitHub Copilot
     # (current_date already defined earlier in determine_section_header)
@@ -324,12 +363,15 @@ def main():
                     break
         
         # Check if this section already exists
+        # CHANGED: For beta, match both new format and legacy "Unreleased - Beta" for smooth transition
         if branch_name == "beta" or is_beta:
-            # Look for Unreleased - Beta section
-            section_pattern = re.compile(r"^## \[Unreleased - Beta\]")
+            # Look for this specific beta version OR old "Unreleased - Beta" section
+            # Using f-string for better readability and re.escape for safety
+            escaped_unreleased = re.escape("Unreleased - Beta")
+            section_pattern = re.compile(rf"^## \[({re.escape(version)}|{escaped_unreleased})\]")
         else:
             # Look for specific version
-            section_pattern = re.compile(r"^## \[" + re.escape(version) + r"\]")
+            section_pattern = re.compile(rf"^## \[{re.escape(version)}\]")
         
         section_exists = any(section_pattern.match(line) for line in lines)
         
