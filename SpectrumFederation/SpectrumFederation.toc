@@ -12,6 +12,7 @@
 modules/Debug.lua
 modules/SlashCommands.lua
 modules/MessageHelpers.lua
+modules/LootHelper/SyncProtocol.lua
 modules/LootHelper/Members.lua
 modules/LootHelper/LootLogValidators.lua
 modules/LootHelper/LootLogs.lua
