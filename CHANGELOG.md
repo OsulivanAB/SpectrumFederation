@@ -10,20 +10,10 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [Unreleased - Beta]
-
-### Added
-- Overhauled loot profile management system with new features for creating, managing, and activating loot profiles.
-- Added the ability to set and switch active loot profiles.
-- Implemented functionality to validate if members exist within active loot profiles.
-- Introduced new methods for adding, updating, and managing loot profiles in the database.
+## [0.2.0-beta.3] - 2025-12-31
 
 ### Changed
-- Updated timestamp formatting for debug logs to improve readability.
-- Refined loot log validation to ensure member checks are performed against the active loot profile.
-
-### Removed
-- Deprecated and removed legacy loot profile database and UI-related functions.
+- Merged updates from the main branch into the beta branch to synchronize features and fixes.
 
 ## [0.1.1] - 2025-12-26
 
