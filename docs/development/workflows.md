@@ -7,14 +7,18 @@ This guide explains the comprehensive CI/CD workflows for SpectrumFederation, im
 ```mermaid
 graph TB
     A[Feature Branch] -->|PR to beta| B{PR Validation}
-    B -->|Pass| C[Merge to beta]
-    C --> D[Post-Merge Beta]
-    D --> E[Beta Release]
-    E -->|Manual Promotion| F{Promote to Main}
-    F -->|Success| G[Stable Release]
-    F -->|Failure| H[Rollback]
-    H --> I[Revert to Previous State]
-    G --> J[Fast-Forward Beta]
+    B -->|Pass| C{Docs Sync}
+    C -->|Manual Trigger| D[Analyze & Create Docs PR]
+    D --> E[Review & Merge Docs]
+    E --> F[Merge to beta]
+    C -->|Skip| F
+    F --> G[Post-Merge Beta]
+    G --> H[Beta Release]
+    H -->|Manual Promotion| I{Promote to Main}
+    I -->|Success| J[Stable Release]
+    I -->|Failure| K[Rollback]
+    K --> L[Revert to Previous State]
+    J --> M[Fast-Forward Beta]
 ```
 
 ## Workflow Files
@@ -34,7 +38,46 @@ graph TB
 
 ---
 
-### 2. Post-Merge Beta (`post-merge-beta.yml`)
+### 2. Documentation Sync (`pr-beta-docs-sync.yml`)
+
+**Trigger**: Manual (`workflow_dispatch`)  
+**Purpose**: Analyze code changes and suggest documentation/copilot instruction updates
+
+**Inputs**:
+- `pr_number`: PR number to analyze (required)
+
+**Jobs**:
+1. **analyze-and-update-docs**: Analyze PR changes and create documentation updates
+   - Get PR details and verify it targets beta branch
+   - Checkout PR branch and fetch beta for comparison
+   - Analyze documentation changes using GitHub Copilot API
+   - Analyze copilot instructions changes using GitHub Copilot API
+   - Create commit with suggested changes
+   - Create new PR targeting the original PR branch
+   - Comment on original PR with link to documentation PR
+
+**Key Features**:
+- Manual trigger only (shows as required check but doesn't block until run)
+- Uses GitHub Copilot API to intelligently suggest documentation updates
+- Cross-references code changes with existing docs and copilot instructions
+- Takes into account any docs updates user already made
+- Creates separate PR for review before merging into original PR
+- Automatically comments on original PR when complete
+
+**How to Use**:
+1. Open your PR to beta branch
+2. Navigate to Actions → PR Beta Documentation Sync
+3. Click "Run workflow"
+4. Enter your PR number
+5. Review the generated documentation PR
+6. Merge the documentation PR into your feature branch
+7. Your original PR will now have updated documentation
+
+**Note**: This workflow is designed to be a **required workflow** for beta PRs but must be manually triggered when you're ready. It won't block your PR until you run it.
+
+---
+
+### 3. Post-Merge Beta (`post-merge-beta.yml`)
 
 **Trigger**: Push to `beta` branch (after PR merge)  
 **Purpose**: Automate beta release creation and documentation updates
@@ -50,7 +93,7 @@ graph TB
 
 ---
 
-### 3. Promotion Workflow (`promote-beta-to-main.yml`)
+### 4. Promotion Workflow (`promote-beta-to-main.yml`)
 
 **Trigger**: Manual (`workflow_dispatch`) - Admin only  
 **Purpose**: Promote stable beta version to main branch
@@ -78,7 +121,7 @@ graph TB
 
 ---
 
-### 4. Rollback Workflow (`rollback-release.yml`)
+### 5. Rollback Workflow (`rollback-release.yml`)
 
 **Trigger**: Manual (`workflow_dispatch`) - Admin only  
 **Purpose**: Revert a failed beta→main promotion
@@ -101,7 +144,7 @@ graph TB
 
 ---
 
-### 5. Linter (`linter.yml`)
+### 6. Linter (`linter.yml`)
 
 **Trigger**: Push/PR to `main` or `beta`  
 **Purpose**: Continuous code quality checks
@@ -114,7 +157,7 @@ graph TB
 
 ---
 
-### 6. Deploy Docs (Integrated in `promote-beta-to-main.yml`)
+### 7. Deploy Docs (Integrated in `promote-beta-to-main.yml`)
 
 **Trigger**: During stable release promotion  
 **Purpose**: Deploy MkDocs documentation to GitHub Pages
@@ -150,7 +193,16 @@ graph TB
    - Wait for PR validation to pass
    - Get code review approval
 
-4. **Merge to Beta**
+4. **Documentation Sync (Optional but Recommended)**
+   - Navigate to Actions → PR Beta Documentation Sync
+   - Click "Run workflow" and enter your PR number
+   - Wait for analysis to complete
+   - Review the generated documentation PR
+   - Make any adjustments if needed
+   - Merge the documentation PR into your feature branch
+   - Your PR now includes updated documentation
+
+5. **Merge to Beta**
    - PR is merged to `beta`
    - Post-merge workflow automatically:
      - Validates code quality
@@ -158,7 +210,7 @@ graph TB
      - Updates README badges
      - Creates beta release
 
-5. **Promote to Main** (Admin Only)
+6. **Promote to Main** (Admin Only)
    - Test beta release thoroughly
    - Navigate to Actions → Promote Beta to Main
    - Run workflow (optionally with dry-run)
@@ -372,6 +424,9 @@ graph LR
     C[.github/scripts/validate_packaging.py] --> B
     D[.github/scripts/check_version_bump.py] --> B
     E[.github/scripts/check_duplicate_release.py] --> B
+    
+    L[.github/scripts/analyze_docs_changes.py] --> M[pr-beta-docs-sync.yml]
+    N[.github/scripts/analyze_copilot_instructions.py] --> M
     
     A --> F[post-merge-beta.yml]
     C --> F

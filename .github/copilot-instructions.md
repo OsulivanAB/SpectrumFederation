@@ -285,13 +285,22 @@ end
    - Package validation (`.github/scripts/validate_packaging.py`)
    - Version bump check (`.github/scripts/check_version_bump.py`)
    - Duplicate release check (`.github/scripts/check_duplicate_release.py`)
-3. **`post-merge-beta.yml`** - Automated beta releases after merge:
+3. **`pr-beta-docs-sync.yml`** - Manual documentation sync for beta PRs:
+   - Analyzes code changes vs beta branch
+   - Uses GitHub Copilot API to suggest documentation updates
+   - Updates MkDocs documentation (`.github/scripts/analyze_docs_changes.py`)
+   - Updates copilot instructions (`.github/scripts/analyze_copilot_instructions.py`)
+   - Creates PR with suggested changes targeting the feature branch
+   - Comments on original PR with link to documentation PR
+   - **Trigger**: Manual via workflow_dispatch with PR number input
+   - **Purpose**: Keep documentation in sync with code changes before merge
+4. **`post-merge-beta.yml`** - Automated beta releases after merge:
    - Sanity checks
    - Blizzard API query for beta Interface version
    - Changelog update (`.github/scripts/update_changelog.py`)
    - README badge update
    - Beta release creation (`.github/scripts/publish_release.py`)
-4. **`promote-beta-to-main.yml`** - Manual promotion workflow (admin only):
+5. **`promote-beta-to-main.yml`** - Manual promotion workflow (admin only):
    - Merges beta → main with special CHANGELOG/README handling
    - Removes `-beta` suffix from version
    - Updates Interface version using Blizzard live API
@@ -300,7 +309,7 @@ end
    - Creates stable release
    - Fast-forwards beta to main
    - Supports dry-run mode
-5. **`rollback-release.yml`** - Emergency rollback for failed promotions (admin only)
+6. **`rollback-release.yml`** - Emergency rollback for failed promotions (admin only)
 
 **Python Helper Scripts (`.github/scripts/`):**
 - All CI automation uses Python 3.11 scripts instead of bash
