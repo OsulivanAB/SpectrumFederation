@@ -4,10 +4,12 @@ The **LootProfile class** is the primary data structure for managing loot distri
 
 **Purpose and Role**: LootProfile instances serve as containers for all loot-related data within a specific context (e.g., a raid tier, guild group, or loot council). Each profile maintains:
 
+- **Unique Identity**: Stable profile ID for tracking across renames and synchronization
 - **Member roster**: A list of [LootProfileMember](members-class.md) instances representing raid participants
 - **Event history**: An array of [LootLog](loot-logs.md) instances recording all profile activity
 - **Administrative control**: Author, owner, and admin user lists for permission management
 - **State tracking**: Active/inactive status for managing multiple concurrent profiles
+- **Counter management**: Per-author counters for preventing log collisions in multi-writer scenarios
 
 The class uses Lua's metatable-based OOP pattern to provide instance methods for profile management, member administration, and log tracking.
 
@@ -15,12 +17,13 @@ The class uses Lua's metatable-based OOP pattern to provide instance methods for
 
 Each loot profile is represented by a `LootProfile` instance that tracks:
 
-- **Identity**: Profile name (unique identifier)
+- **Identity**: Stable profile ID (generated at creation) and human-readable profile name
 - **Ownership**: Author (creator) and owner (current controller)
 - **Member Roster**: Array of LootProfileMember instances
 - **Event History**: Array of LootLog instances (append-only, chronologically sorted)
 - **Admin Control**: List of admin user identifiers
-- **State**: Active/inactive status.
+- **State**: Active/inactive status
+- **Counters**: Per-author counter map for multi-writer log collision prevention
 
 ### Data Flow
 
@@ -33,6 +36,48 @@ Loot Profiles follow a **log-driven, permission-controlled architecture**:
 5. **Synchronization** - Profiles can be shared across users (future feature)
 
 This ensures administrative control while maintaining data integrity through the log system.
+
+## Profile ID Generation
+
+Each profile is assigned a **stable, globally-unique identifier** at creation time. This ID is separate from the human-readable profile name and remains constant even if the profile is renamed.
+
+**Format**: `p_<time><random1><random2>`
+
+- Prefix: `p_` (indicates profile ID)
+- Time: 8-digit hexadecimal server timestamp
+- Random1: 8-digit hexadecimal random number (31-bit)
+- Random2: 8-digit hexadecimal random number (31-bit)
+
+**Generation Algorithm**:
+
+```lua
+local function GenerateProfileId()
+    local time = GetServerTime() or time()
+    local ran1 = math.random(0, 0x7fffffff)  -- 31-bit random
+    local ran2 = math.random(0, 0x7fffffff)  -- 31-bit random
+    return ("p_%08x%08x%08x"):format(time, ran1, ran2)
+end
+```
+
+**Example IDs**:
+
+- `p_67890abc12def345678901ab`
+- `p_6789abcd4f5e67891a2b3c4d`
+
+**Collision Resistance**:
+
+- **Time Component**: Server timestamp ensures temporal uniqueness
+- **Random Components**: 62 bits of randomness (2^62 ≈ 4.6 quintillion combinations)
+- **Combined**: Extremely low collision probability even across millions of profiles
+
+**WoW's Random Number Generator**: Modern WoW clients use `securerandom` for `math.random()`, providing cryptographically secure randomness suitable for ID generation.
+
+**Use Cases**:
+
+- Profile tracking across renames
+- Profile synchronization between users (future feature)
+- Log entry validation and integrity
+- Import/export operations
 
 ## Permission System
 
@@ -56,6 +101,69 @@ The LootProfile class implements an **admin-based permission model**:
 - Methods that modify profile data enforce admin permissions
 - Non-admin users cannot make changes (returns `false` with debug warning)
 
+## Counter System
+
+The LootProfile class implements a **per-author counter system** to prevent log entry collisions in multi-writer scenarios. This is critical for profile synchronization where multiple users can independently create log entries.
+
+**Architecture**:
+
+- **Per-Profile, Per-Author**: Each profile maintains a separate counter for each author
+- **Monotonically Increasing**: Counters only increment, never decrement
+- **Collision Prevention**: Ensures unique log identifiers within a profile
+
+**Storage Structure**:
+
+```lua
+_authorCounters = {
+    ["Shadowbane-Garona"] = 5,   -- This author has created 5 logs
+    ["Healz-Garona"] = 3,         -- This author has created 3 logs
+    ["Tanky-Garona"] = 7,         -- This author has created 7 logs
+}
+```
+
+**Usage Pattern**:
+
+1. User creates a log entry
+2. Profile allocates next counter for that author via `AllocateNextCounter()`
+3. Counter increments atomically (5 → 6)
+4. Log entry uses counter as part of its unique identifier
+5. Next log from same author gets counter 7
+
+**Why This Matters**:
+
+Without per-author counters, two users could simultaneously create logs with the same identifier, causing conflicts during synchronization. The counter ensures each author's logs are uniquely numbered within the profile.
+
+**Example Scenario**:
+
+```lua
+-- User A creates logs: counter = 1, 2, 3
+local counterA1 = profile:AllocateNextCounter("UserA-Garona")  -- 1
+local counterA2 = profile:AllocateNextCounter("UserA-Garona")  -- 2
+local counterA3 = profile:AllocateNextCounter("UserA-Garona")  -- 3
+
+-- User B creates logs independently: counter = 1, 2
+local counterB1 = profile:AllocateNextCounter("UserB-Garona")  -- 1
+local counterB2 = profile:AllocateNextCounter("UserB-Garona")  -- 2
+
+-- No collisions: UserA's logs are 1-3, UserB's logs are 1-2
+-- Combined identifier: (profileId, author, counter) is globally unique
+```
+
+**Integration with Loot Logs**:
+
+When creating a log entry, the counter is passed to the LootLog constructor:
+
+```lua
+local counter = profile:AllocateNextCounter(author)
+local logEntry = SF.LootLog.new(eventType, eventData, {
+    author = author,
+    counter = counter,
+    -- ... other options
+})
+```
+
+This creates a composite key `(profileId, author, counter)` that uniquely identifies each log entry across all profiles and authors.
+
 ## Class Structure
 
 ### Properties
@@ -64,13 +172,15 @@ Each LootProfile instance has the following private properties:
 
 | Property | Type | Description | Getter Method | Setter Method |
 |----------|------|-------------|---------------|---------------|
-| `_profileName` | string | Unique name of the profile | [`GetProfileName()`](#getprofilename) | [`SetProfileName()`](#setprofilenamenewname) |
+| `_profileId` | string | Stable unique identifier (generated at creation) | [`GetProfileId()`](#getprofileid) | [`SetProfileIdIfNil()`](#setprofileidifnilprofileid) |
+| `_profileName` | string | Human-readable name of the profile | [`GetProfileName()`](#getprofilename) | [`SetProfileName()`](#setprofilenamenewname) |
 | `_author` | string | Original creator ("Name-Realm" format) | [`GetAuthor()`](#getauthor) | N/A (immutable) |
 | `_owner` | string | Current owner ("Name-Realm" format) | [`GetOwner()`](#getowner) | [`SetOwner()`](#setownernewowner) |
 | `_members` | table | Array of LootProfileMember instances | [`GetMemberList()`](#getmemberlist) | [`AddMember()`](#addmembermember) |
 | `_lootLogs` | table | Array of LootLog instances (chronologically sorted) | [`GetLootLogs()`](#getlootlogs) | [`AddLootLog()`](#addlootloglootlog) |
-| `_adminUsers` | table | Array of admin user identifiers ("Name-Realm" format) | [`GetAdminList()`](#getadminlist), [`IsCurrentUserAdmin()`](#iscurrentuseradmin) | [`AddAdminUser()`](#addadminusermember) |
+| `_adminUsers` | table | Array of admin user identifiers ("Name-Realm" format) | [`GetAdminUsers()`](#getadminusers), [`IsCurrentUserAdmin()`](#iscurrentuseradmin) | [`AddAdminUser()`](#addadminusermember) |
 | `_activeProfile` | boolean | Active/inactive status | [`IsActive()`](#isactive) | [`SetActive()`](#setactiveisactive) |
+| `_authorCounters` | table | Per-author counter map for log collision prevention | N/A | [`AllocateNextCounter()`](#allocatenextcounterauthor) |
 
 ## Creating Profiles
 
@@ -89,9 +199,11 @@ local profile = SF.LootProfile.new(profileName)
 **Validation**:
 
 - Profile name must be a non-empty string
-- Automatically creates a profile creation log entry
+- Automatically generates a stable profile ID using server time + random numbers
+- Automatically creates a profile creation log entry with profileId embedded
 - Automatically adds the current player as author, owner, and first admin
 - Creates an initial LootProfileMember instance for the author
+- Initializes per-author counter system for log collision prevention
 
 **Example**:
 
@@ -100,12 +212,14 @@ local profile = SF.LootProfile.new(profileName)
 local raidProfile = SF.LootProfile.new("Mythic Raid Team 1")
 
 -- Profile is automatically initialized with:
+-- - Profile ID: "p_67890abc12def345678901ab" (generated)
 -- - Author: Current player
 -- - Owner: Current player
 -- - Admin users: [Current player]
 -- - Members: [Current player as admin member]
--- - Loot logs: [Profile creation event]
+-- - Loot logs: [Profile creation event with profileId embedded]
 -- - Active: false
+-- - Author counters: { ["CurrentPlayer-Realm"] = 1 }
 ```
 
 **Error Handling**:
@@ -119,11 +233,13 @@ local raidProfile = SF.LootProfile.new("Mythic Raid Team 1")
 
 New profiles are created with:
 
+- **Profile ID**: Generated stable identifier (format: `p_<time><random1><random2>`)
 - **Author/Owner**: Current player's full identifier
 - **Admin Users**: Author added to admin list
 - **Members**: Author added as first member with admin role
-- **Loot Logs**: Profile creation event logged
+- **Loot Logs**: Profile creation event logged with profileId embedded
 - **Active Status**: `false` (inactive by default)
+- **Author Counters**: Initialized with creator's first counter (1)
 
 ## Instance Methods
 
@@ -135,9 +251,54 @@ profile:MethodName(parameters)
 
 ### Identity Methods
 
+#### GetProfileId()
+
+Returns the profile's stable unique identifier.
+
+**Returns**:
+
+- `string` - Profile ID in format `p_<time><random1><random2>`
+
+**Example**:
+
+```lua
+local profileId = profile:GetProfileId()
+print("Profile ID:", profileId)  -- "p_67890abc12def345678901ab"
+```
+
+**Usage Note**: The profile ID is generated at creation and remains stable even if the profile is renamed. This is used for tracking profiles across synchronization and migrations.
+
+#### SetProfileIdIfNil(profileId)
+
+Sets the profile ID only if it is currently `nil`. Used for importing profiles or migrating from older formats that didn't have profile IDs.
+
+**Parameters**:
+
+- `profileId` (string, required) - Stable profile identifier to set
+
+**Validation**:
+
+- Only sets if `_profileId` is currently `nil`
+- Must be a non-empty string
+- Logs warning if invalid profileId provided
+- Does nothing if profile already has an ID
+
+**Example**:
+
+```lua
+-- Import profile from external source
+local importedProfile = SF.LootProfile.new("Imported Profile")
+importedProfile:SetProfileIdIfNil("p_12345678abcdef0012345678")
+
+-- Later attempts do nothing (profile already has ID)
+importedProfile:SetProfileIdIfNil("p_differentid123456789012")  -- Ignored
+```
+
+**Usage Note**: This is a one-time setter for migrations. Normal profile creation automatically generates an ID.
+
 #### GetProfileName()
 
-Returns the profile's unique name.
+Returns the profile's human-readable name.
 
 **Returns**:
 
@@ -181,6 +342,45 @@ print("Owned by:", owner)  -- "Guildmaster-Garona"
 ```
 
 **Usage Note**: The owner can be different from the author if ownership has been transferred via `SetOwner()`.
+
+### Counter Management
+
+#### AllocateNextCounter(author)
+
+Allocates and returns the next counter value for a given author. This is used for preventing log entry collisions in multi-writer scenarios where multiple users can create logs for the same profile.
+
+**Parameters**:
+
+- `author` (string, required) - Author identifier in "Name-Realm" format
+
+**Returns**:
+
+- `number` - Next counter value for this author (increments on each call)
+- `nil` - If author validation fails
+
+**Validation**:
+
+- Must be a non-empty string
+- Logs warning if invalid author provided
+
+**Example**:
+
+```lua
+-- Get current player's next counter
+local currentUser = SF:GetPlayerFullIdentifier()
+local counter1 = profile:AllocateNextCounter(currentUser)
+print("Counter:", counter1)  -- 1
+
+-- Next allocation increments
+local counter2 = profile:AllocateNextCounter(currentUser)
+print("Counter:", counter2)  -- 2
+
+-- Different authors have independent counters
+local counter3 = profile:AllocateNextCounter("OtherPlayer-Garona")
+print("Counter:", counter3)  -- 1
+```
+
+**Usage Note**: This is called internally when creating log entries. Each author maintains their own counter to prevent collisions when multiple users create logs simultaneously. The counter is per-profile, per-author, ensuring unique identifiers for all logs.
 
 ### State Management
 
@@ -337,7 +537,7 @@ end
 
 **Usage Note**: Returns the internal `_lootLogs` array. Logs are automatically kept sorted by timestamp. Used by Member instances to rebuild state via `UpdateFromLootLog()`.
 
-#### GetAdminList()
+#### GetAdminUsers()
 
 Retrieves a list of all admin user identifiers in the profile.
 
@@ -348,7 +548,7 @@ Retrieves a list of all admin user identifiers in the profile.
 **Example**:
 
 ```lua
-local admins = profile:GetAdminList()
+local admins = profile:GetAdminUsers()
 print("Profile admins:")
 for i, adminID in ipairs(admins) do
     print(i, adminID)
@@ -582,18 +782,29 @@ SF:PrintSuccess("Added 3 members to profile")
 ### Logging Profile Activity
 
 ```lua
+-- Get current user and allocate counter
+local currentUser = SF:GetPlayerFullIdentifier()
+local counter = profile:AllocateNextCounter(currentUser)
+
 -- Award points to a member
 local pointLog = SF.LootLog.new(
     SF.LootLogEventTypes.POINT_CHANGE,
     {
         member = "Tanky-Garona",
         change = SF.LootLogPointChangeTypes.INCREMENT
+    },
+    {
+        author = currentUser,
+        counter = counter
     }
 )
 
 if profile:AddLootLog(pointLog) then
     SF:PrintSuccess("Point awarded and logged")
 end
+
+-- Allocate next counter for another log
+counter = profile:AllocateNextCounter(currentUser)
 
 -- Assign gear to a member
 local armorLog = SF.LootLog.new(
@@ -602,6 +813,10 @@ local armorLog = SF.LootLog.new(
         member = "Tanky-Garona",
         slot = SF.ArmorSlots.HEAD,
         action = SF.LootLogArmorActions.USED
+    },
+    {
+        author = currentUser,
+        counter = counter
     }
 )
 
@@ -641,6 +856,7 @@ SF:PrintSuccess("Profile activated: " .. profile:GetProfileName())
 
 ```lua
 -- Get profile metadata
+local profileId = profile:GetProfileId()
 local name = profile:GetProfileName()
 local author = profile:GetAuthor()
 local created = profile:GetCreationTime()
@@ -653,6 +869,7 @@ local createdStr = SF:FormatTimestampForUser(created)
 local modifiedStr = SF:FormatTimestampForUser(modified)
 
 -- Display info
+print("Profile ID:", profileId)
 print("Profile:", name)
 print("Created by:", author, "on", createdStr)
 print("Last modified:", modifiedStr)
@@ -758,6 +975,13 @@ end
 - Create logs for all profile modifications
 - Include point awards, gear assignments, role changes
 - Use appropriate event types and data structures
+
+**Counter Allocation**:
+
+- Always allocate a counter before creating log entries
+- Call `AllocateNextCounter()` once per log entry
+- Pass counter to LootLog constructor in options table
+- Never reuse counters across different logs
 
 **Sort Order**:
 
