@@ -86,8 +86,7 @@ Each Member instance has the following properties:
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `name` | string | Character name (e.g., "Shadowbane") |
-| `realm` | string | Realm name (e.g., "Garona") |
+| `identifier` | string | Full character identifier (e.g., "Shadowbane-Garona") |
 | `role` | string | Member role ("admin" or "member") |
 | `class` | string\|nil | WoW class name (e.g., "WARRIOR") or nil if not set |
 | `pointBalance` | number | Current loot points (can be negative) |
@@ -100,13 +99,12 @@ Each Member instance has the following properties:
 The Members class uses **dot notation** for the constructor (factory function pattern):
 
 ```lua
-local member = SF.Member.new(name, realm, role, class)
+local member = SF.Member.new(identifier, role, class)
 ```
 
 **Parameters**:
 
-- `name` (string, required) - Character name
-- `realm` (string, required) - Realm name
+- `identifier` (string, required) - Full character identifier in "Name-Realm" format
 - `role` (string, optional) - Member role, defaults to `"member"`
 - `class` (string, optional) - WoW class name (e.g., "WARRIOR", "PALADIN"), must match `SF.WOW_CLASSES` keys
 
@@ -114,16 +112,16 @@ local member = SF.Member.new(name, realm, role, class)
 
 ```lua
 -- Create a standard member
-local member = SF.Member.new("Shadowbane", "Garona")
+local member = SF.Member.new("Shadowbane-Garona")
 
 -- Create an admin
-local admin = SF.Member.new("Guildmaster", "Garona", SF.MemberRoles.ADMIN)
+local admin = SF.Member.new("Guildmaster-Garona", SF.MemberRoles.ADMIN)
 
 -- Create a member with class information
-local warrior = SF.Member.new("Tanky", "Garona", SF.MemberRoles.MEMBER, "WARRIOR")
+local warrior = SF.Member.new("Tanky-Garona", SF.MemberRoles.MEMBER, "WARRIOR")
 
 -- Create an admin with class
-local paladinAdmin = SF.Member.new("Healz", "Garona", SF.MemberRoles.ADMIN, "PALADIN")
+local paladinAdmin = SF.Member.new("Healz-Garona", SF.MemberRoles.ADMIN, "PALADIN")
 ```
 
 ### Initial State
@@ -358,7 +356,7 @@ member:UpdateFromLootLog()
 
 ```lua
 -- Create a new member
-local member = SF.Member.new("Shadowbane", "Garona")
+local member = SF.Member.new("Shadowbane-Garona")
 
 -- Award initial points
 member:IncrementPoints()

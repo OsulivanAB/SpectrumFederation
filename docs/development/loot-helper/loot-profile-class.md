@@ -382,7 +382,7 @@ Adds a LootProfileMember instance to the profile's member roster.
 
 ```lua
 -- Create a new member
-local newMember = SF.LootProfileMember.new("Tanky", "Garona", SF.LootProfileMemberRoles.MEMBER, "WARRIOR")
+local newMember = SF.Member.new("Tanky-Garona", SF.MemberRoles.MEMBER, "WARRIOR")
 
 -- Add to profile
 if profile:AddMember(newMember) then
@@ -416,7 +416,7 @@ Adds a LootProfileMember instance to the profile's admin user list.
 
 ```lua
 -- Get or create member
-local member = SF.LootProfileMember.new("Healz", "Garona", SF.LootProfileMemberRoles.ADMIN, "PALADIN")
+local member = SF.Member.new("Healz-Garona", SF.MemberRoles.ADMIN, "PALADIN")
 
 -- Add as admin
 if profile:AddAdminUser(member) then
@@ -564,9 +564,9 @@ SF:PrintSuccess("Profile created: " .. profile:GetProfileName())
 
 ```lua
 -- Create members
-local tank = SF.LootProfileMember.new("Tanky", "Garona", SF.LootProfileMemberRoles.MEMBER, "WARRIOR")
-local healer = SF.LootProfileMember.new("Healz", "Garona", SF.LootProfileMemberRoles.MEMBER, "PALADIN")
-local dps = SF.LootProfileMember.new("Pewpew", "Garona", SF.LootProfileMemberRoles.MEMBER, "MAGE")
+local tank = SF.Member.new("Tanky-Garona", SF.MemberRoles.MEMBER, "WARRIOR")
+local healer = SF.Member.new("Healz-Garona", SF.MemberRoles.MEMBER, "PALADIN")
+local dps = SF.Member.new("Pewpew-Garona", SF.MemberRoles.MEMBER, "MAGE")
 
 -- Add to profile
 profile:AddMember(tank)
@@ -801,7 +801,7 @@ The `new()` constructor can return `nil` in several cases:
 
 1. **Invalid Profile Name**: Empty string or non-string type
 2. **Log Creation Failed**: LootLog.new() returned nil
-3. **Member Creation Failed**: LootProfileMember.new() returned nil
+3. **Member Creation Failed**: SF.Member.new() returned nil
 
 **Example**:
 

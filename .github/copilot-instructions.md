@@ -224,15 +224,16 @@ local Member = {}
 Member.__index = Member
 
 -- Constructor: use DOT notation (factory function)
-function Member.new(name, realm, role)
+function Member.new(identifier, role, class)
     local instance = setmetatable({}, Member)
     -- Initialize properties
+    instance.identifier = identifier or ""
     return instance
 end
 
 -- Instance methods: use COLON notation (auto-passes self)
 function Member:GetFullIdentifier()
-    return self.name .. "-" .. self.realm
+    return self.identifier
 end
 
 function Member:ToggleEquipment(slot)
@@ -248,7 +249,7 @@ SF.ArmorSlots = ARMOR_SLOTS
 **Member Class Usage:**
 ```lua
 -- Creating instances
-local member = SF.Member.new("Shadowbane", "Garona")
+local member = SF.Member.new("Shadowbane-Garona")
 
 -- Calling instance methods
 member:IncrementPoints()

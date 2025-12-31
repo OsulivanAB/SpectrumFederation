@@ -41,18 +41,16 @@ local Member = {}
 Member.__index = Member
 
 -- Constructor: Create a new member instance
--- @param name (string) - Character name
--- @param realm (string) - Realm name
+-- @param identifier (string) - Full character identifier in "Name-Realm" format
 -- @param role (string, optional) - Member role ("admin" or "member", defaults to "member")
 -- @param class (string, optional) - WoW class name (e.g., "WARRIOR", "PALADIN"), must match SF.WOW_CLASSES keys
 -- @return Member instance
-function Member.new(name, realm, role, class)
+function Member.new(identifier, role, class)
     -- Create new instance with metatable
     local instance = setmetatable({}, Member)
     
     -- Set default properties
-    instance.name = name or ""
-    instance.realm = realm or ""
+    instance.identifier = identifier or ""
     
     -- Validate and set role (default to "member")
     if role and (role == MEMBER_ROLES.ADMIN or role == MEMBER_ROLES.MEMBER) then
@@ -67,7 +65,7 @@ function Member.new(name, realm, role, class)
     else
         instance.class = nil  -- Unknown or not specified
         if class and SF.Debug then
-            SF.Debug:Warn("MEMBER", "Invalid class '%s' provided for member %s-%s", tostring(class), name, realm)
+            SF.Debug:Warn("MEMBER", "Invalid class '%s' provided for member %s", tostring(class), identifier)
         end
     end
     
@@ -172,10 +170,10 @@ function Member:SetRole(newRole)
     end
 end
 
--- Function to get Members full identifier (name-realm)
+-- Function to get Members full identifier (Name-Realm)
 -- @return (string) - Full identifier
 function Member:GetFullIdentifier()
-    return self.name .. "-" .. self.realm
+    return self.identifier
 end
 
 -- Get the WoW class for this member
