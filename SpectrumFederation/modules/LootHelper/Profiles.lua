@@ -148,14 +148,15 @@ end
 function LootProfile:ComputeAuthorMax()
     local authorMax = {}
 
-    for _, logEntry in ipairs(self._lootLogs or {}) do
-        local author = log.GetAuthor and log:GetAuthor() or logEntry._author
-        local counter = log.GetCounter and log:GetCounter() or logEntry._counter
+    for _, log in ipairs(self._lootLogs or {}) do
+        local author = log.GetAuthor and log:GetAuthor() or log._author
+        local counter = log.GetCounter and log:GetCounter() or log._counter
 
         if type(author) == "string" and type(counter) == "number" then
             local prev = authorMax[author] or 0
             if counter > prev then
                 authorMax[author] = counter
+            end
         end
     end
 
@@ -169,7 +170,7 @@ function LootProfile:ComputeAuthorCounts()
     local counts = {}
 
     for _, log in ipairs(self._lootLogs or {}) do
-        local author = log.GetAuthor and log:GetAuthor() or logEntry._author
+        local author = log.GetAuthor and log:GetAuthor() or log._author
 
         if type(author) == "string" then
             counts[author] = (counts[author] or 0) + 1
@@ -396,7 +397,7 @@ function LootProfile:_InsertLog(lootLog, opts)
     end
 
     self._logIndex[id] = true
-    table.insert(self._lootLogs, GetQuestLogSpecialItemInfo
+    table.insert(self._lootLogs, lootLog)
     
     -- Keep authorCoutners synced to max seen
     local author = lootLog:GetAuthor()
