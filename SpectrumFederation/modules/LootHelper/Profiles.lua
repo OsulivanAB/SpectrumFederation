@@ -141,6 +141,98 @@ function LootProfile.new(profileName)
     return instance
 end
 
+-- Function Compute max counter per author found in this profile's logs.
+-- This is the sync summary: { [author] = maxCounterSeen }
+-- @param none
+-- @return table authorMaxCounters
+function LootProfile:ComputeAuthorMax()
+    local authorMax = {}
+
+    for _, logEntry in ipairs(self._lootLogs or {}) do
+        local author = log.GetAuthor and log:GetAuthor() or logEntry._author
+        local counter = log.GetCounter and log:GetCounter() or logEntry._counter
+
+        if type(author) == "string" and type(counter) == "number" then
+            local prev = authorMax[author] or 0
+            if counter > prev then
+                authorMax[author] = counter
+        end
+    end
+
+    return authorMax
+end
+
+-- Function Compute number of logs per author (debug only; not used for sync decisions)
+-- @param none
+-- @return table counts { [author] = numberOfLogs }
+function LootProfile:ComputeAuthorCounts()
+    local counts = {}
+
+    for _, log in ipairs(self._lootLogs or {}) do
+        local author = log.GetAuthor and log:GetAuthor() or logEntry._author
+
+        if type(author) == "string" then
+            counts[author] = (counts[author] or 0) + 1
+        end
+    end
+
+    return counts
+end
+
+-- Function Rebuild log index and refresh max counters from the current log list
+-- @param none
+-- @return nil
+function LootProfile:RebuildLogIndex()
+    self._logIndex = {}
+    self._authorCounters = self._authorCounters or {}
+
+    for _, log in ipairs(self._lootLogs or {}) do
+        local id = log.GetID and log:GetID() or log._id
+        if type(id) == "string" and id ~= "" then
+            self._logIndex[id] = true
+        end
+
+        local author = log.GetAuthor and log:GetAuthor() or log._author
+        local counter = log.GetCounter and log:GetCounter() or log._counter
+        if type(author) == "string" and type(counter) == "number" then
+            local prev = self._authorCounters[author] or 0
+            if counter > prev then
+                self._authorCounters[author] = counter
+            end
+        end
+    end
+end
+
+-- Function Compare two logs for stable deterministic ordering
+-- Primary key: timestamp
+-- Tie-breaks: author, counter, id
+-- @param a LootLog instance A
+-- @param b LootLog instance B
+-- @return boolean true if a < b
+function LootProfile:_CompareLogs(a, b)
+    local aTime = a.GetTimestamp and a:GetTimestamp() or a._timestamp
+    local bTime = b.GetTimestamp and b:GetTimestamp() or b._timestamp
+    if aTime ~= bTime then
+        return aTime < bTime
+    end
+
+    local aAuthor = a.GetAuthor and a:GetAuthor() or a._author
+    local bAuthor = b.GetAuthor and b:GetAuthor() or b._author
+    if aAuthor ~= bAuthor then
+        return aAuthor < bAuthor
+    end
+
+    local aCounter = a.GetCounter and a:GetCounter() or a._counter
+    local bCounter = b.GetCounter and b:GetCounter() or b._counter
+    if aCounter ~= bCounter then
+        return aCounter < bCounter
+    end
+
+    local aId = a.GetID and a:GetID() or a._id
+    local bId = b.GetID and b:GetID() or b._id
+    return aId < bId
+end
+
 -- ========================================================================
 -- Getter Methods
 -- ========================================================================
@@ -263,23 +355,64 @@ end
 -- @param LootLog lootLog Instance of LootLog to add
 -- @return boolean success
 function LootProfile:AddLootLog(lootLog)
-    if not self:IsCurrentUserAdmin() then
+    return self:_InsertLog(lootLog, { requireAdmin = true })
+end
+
+-- Function Insert a log entry with dedupe + stable ordering
+-- opts.requireAdmin: if true, enforce current user admin check (local writes).
+-- @param lootLog LootLog instance to insert
+-- @param opts table|nil optional:
+--     opts.requireAdmin boolean enforce admin check (default: true)
+-- @return boolean inserted True if new, false if duplicate/invalid
+function LootProfile:_InsertLog(lootLog, opts)
+    opts = opts or {}
+
+    if getmetatable(lootLog) ~= SF.LootLog then
         if SF.Debug then
-            SF.Debug("LootProfile", "Current user is not an admin; cannot add loot log entries")
+            SF.Debug("LootProfile", "_InsertLog: Invalid LootLog instance provided:", tostring(lootLog))
         end
         return false
     end
 
-    if getmetatable(lootLog) == SF.LootLog then
-        table.insert(self._lootLogs, lootLog)
-        table.sort(self._lootLogs, function(a, b) return a:GetTimestamp() < b:GetTimestamp() end)
-        return true
-    else
+    if opts.requireAdmin and not self:IsCurrentUserAdmin() then
         if SF.Debug then
-            SF.Debug:Warn("LootProfile", "Attempted to add invalid loot log instance: %s", tostring(lootLog))
+            SF.Debug("LootProfile", "_InsertLog: Current user is not an admin; cannot add loot log entries")
         end
         return false
     end
+
+    self._lootLogs = self._lootLogs or {}
+    self._logIndex = self._logIndex or {}
+    self._authorCounters = self._authorCounters or {}
+
+    local id = lootLog:GetID()
+    if type(id) ~= "string" or id == "" then
+        return false
+    end
+
+    -- Dedupe
+    if self._logIndex[id] then
+        return false
+    end
+
+    self._logIndex[id] = true
+    table.insert(self._lootLogs, GetQuestLogSpecialItemInfo
+    
+    -- Keep authorCoutners synced to max seen
+    local author = lootLog:GetAuthor()
+    local counter = lootLog:GetCounter()
+    if type(author) == "string" and type(counter) == "number" then
+        local prev = self._authorCounters[author] or 0
+        if counter > prev then
+            self._authorCounters[author] = counter
+        end
+    end
+
+    table.sort(self._lootLogs, function(a, b)
+        return self:_CompareLogs(a, b)
+    end)
+
+    return true
 end
 
 -- Function to add a member to this profile
