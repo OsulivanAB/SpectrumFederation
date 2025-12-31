@@ -1,96 +1,88 @@
 -- Grab the namespace
 local addonName, SF = ...
 
--- TODO: Need to Add a per-author counter variable to loot log entry
--- TODO: Need to add a getCounter() function 
--- TODO: Need to make sure my Log ID is stable (for example Author:Counter)
--- TODO: Function Convert this log into a network-safe table (no metatables/functions).
--- @param none
--- @return table logTable
-function LootLog:ToNetTable()
-end
+-- ============================================================================
+-- LootLog
+-- ============================================================================
 
--- TODO: Function Create a LootLog from a network-safe table.
--- @param logTable table Network-safe table representation of a log
--- @return Lootlog instance
-function LootLog.FromNetTable(logTable)
-end
-
--- Simple counter for unique log IDs (resets each session)
-local logCounter = 0
+local LOG_FORMAT_VERSION = 2
 
 local EVENT_TYPES = {
-    PROFILE_CREATION = "PROFILE_CREATION",
-    POINT_CHANGE = "POINT_CHANGE",
-    ARMOR_CHANGE = "ARMOR_CHANGE",
-    ROLE_CHANGE = "ROLE_CHANGE"
+    PROFILE_CREATION    = "PROFILE_CREATION",
+    POINT_CHANGE        = "POINT_CHANGE",
+    ARMOR_CHANGE        = "ARMOR_CHANGE",
+    ROLE_CHANGE         = "ROLE_CHANGE"
 }
 
 local POINT_CHANGE_TYPES = {
-    INCREMENT = "INCREMENT",
-    DECREMENT = "DECREMENT"
+    INCREMENT   = "INCREMENT",
+    DECREMENT   = "DECREMENT"
 }
 
 local ARMOR_ACTIONS = {
-    USED = "USED",
-    AVAILABLE = "AVAILABLE"
+    USED        = "USED",
+    AVAILABLE   = "AVAILABLE"
 }
 
 local EVENT_DATA_TEMPLATES = {
     [EVENT_TYPES.PROFILE_CREATION] = {
-        -- No additional data needed
+        profileId = ""
     },
     [EVENT_TYPES.POINT_CHANGE] = {
-        member = "", -- Member full identifier "Name-Realm"
-        change = "" -- SF.LootLogPointChangeTypes constant
+        member = "", -- "Name-Realm"
+        change = "" -- INCREMENT/DECREMENT
     },
     [EVENT_TYPES.ARMOR_CHANGE] = {
-        member = "", -- Member full identifier "Name-Realm"
-        slot = "",   -- SF.ArmorSlots constant
-        action = ""  -- SF.LootLogArmorActions constant
+        member  = "",
+        slot    = "",
+        action  = ""
     },
     [EVENT_TYPES.ROLE_CHANGE] = {
-        member = "", -- Member full identifier "Name-Realm"
-        newRole = "" -- SF.MemberRoles constant (ADMIN or MEMBER)
+        member  = "",
+        newRole = ""
     }
 }
 
--- Local function to hash variables into an ID
--- @param timestamp (number) - Timestamp of the event
--- @param author (string) - Author of the event
--- @param eventType (string) - Type of event
--- @param counter (number) - Session-unique counter for this log
--- @return (string) - Hashed ID
-local function GenerateLogID(timestamp, author, eventType, counter)
-    return tostring(timestamp) .. "_" .. author .. "_" .. eventType .. "_" .. tostring(counter)
+-- Generates a unique log ID based on author and a counter
+-- @param author string Author of the log
+-- @param counter number Counter to ensure uniqueness
+-- @return string logID Unique log ID
+local function GenerateLogID(author, counter)
+    return ("%s:%d"):format(author, counter)
 end
 
--- Class definition
 local LootLog = {}
 LootLog.__index = LootLog
 
 -- Constructor for creating a new log entry
--- @param eventType (string) - Type of event being logged
--- @param eventData (table) - Data specific to the event type
+-- @param eventType string Type of event (from EVENT_TYPES)
+-- @param eventData table Data associated with the event
+-- @param opts table|nil optional:
+--     opts.author string override author (used for imports / special cases)
+--     opts.counter number override counter (used for imports / special cases)
+--     opts.timestamp number override timestamp (used for imports)
+--     opts.skipPermission boolean bypass admin check (used for profile creation/import)
 -- @return LootLog instance or nil if failed
-function LootLog.new(eventType, eventData)
+function LootLog.new(eventType, eventData, opts)
+    opts = opts or {}
 
-    -- Enforce admin permissions
-    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
-        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
+    -- Permission enforcement
+    if not opts.skipPermission then
+        local ap = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+        if not ap or not ap.IsCurrentUserAdmin then
             if SF.Debug then
-                SF.Debug:Warn("LOOTLOG", "Current user is not admin; cannot create log entries")
+                SF.Debug:Warn("LOOTLOG", "Active profile missing or IsCurrentUserAdmin not found; cannot create log entry")
+            end
+            return nil
+        elseif not ap:IsCurrentUserAdmin() then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Current user is not an admin; cannot create log entry")
             end
             return nil
         end
-    else
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "IsCurrentUserAdmin function not found in active profile")
-        end
-        return nil
     end
-    
-    -- Validate eventType is an option in EVENT_TYPES
+
+    -- Validate event type
     if not EVENT_TYPES[eventType] then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Invalid event type provided: %s", tostring(eventType))
@@ -98,7 +90,7 @@ function LootLog.new(eventType, eventData)
         return nil
     end
 
-    -- Validate that eventData matches expected template
+    -- Validate eventData keys
     local template = EVENT_DATA_TEMPLATES[eventType]
     for key, _ in pairs(template) do
         if eventData[key] == nil then
@@ -107,9 +99,9 @@ function LootLog.new(eventType, eventData)
             end
             return nil
         end
-    end    
+    end
 
-    -- Additional validation based on event type (BEFORE creating instance)
+    -- Additional validation based on event type
     if eventType == EVENT_TYPES.POINT_CHANGE then
         if not SF.LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES) then
             return nil
@@ -123,44 +115,52 @@ function LootLog.new(eventType, eventData)
             return nil
         end
     end
-    
-    -- NOW create instance after all validation passes
-    local instance = setmetatable({}, LootLog)
-    
-    local timestamp = GetServerTime()  -- UTC timestamp from server
-    local author = SF:GetPlayerFullIdentifier()  -- Author in "Name-Realm" format
-    
-    -- Increment counter for unique ID
-    logCounter = logCounter + 1
-    
-    instance.timestamp = timestamp
-    instance.author = author
-    instance.eventType = eventType
-    instance.data = eventData
-    instance.id = GenerateLogID(timestamp, author, eventType, logCounter)
-    
-    -- Debug logging
-    if SF.Debug then
-        SF.Debug:Verbose("LOOTLOG", "Created log %s: %s", instance.id, eventType)
+
+    local timestamp = opts.timestamp or GetServerTime()
+    local author = opts.author or SF:GetPlayerFullIdentifier()
+
+    -- Counter allocation: must be per-profile per-author to avoid collisions.
+    local counter = opts.counter
+    if type(counter) ~= "number" then
+        local ap = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+        if ap and ap.AllocateNextCounter then
+            counter = ap:AllocateNextCounter(author)
+        end
     end
-    
+
+    if type(counter) ~= "number" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "No counter available. Pass opts.counter or ensure active profile supports AllocateNextCounter().")
+        end
+        return nil
+    end
+
+    local instance = setMetatable({}, LootLog)
+    instance._timestamp = timestamp
+    instance._author = author
+    instance._counter = counter
+    instance._eventType = eventType
+    instance._data = eventData
+    instance._id = GenerateLogID(author, counter)
+
+    if SF.Debug then
+        SF.Debug:Verbose("LOOTLOG", "Created log %s: %s", instance._id, instance._eventType)
+    end
+
     return instance
 end
 
 -- Constructor for creating a log entry from serialized data
--- Used for synchronizing logs across clients
--- @param serializedData (string) - Base64-encoded CBOR string from GetSerializedData()
--- @return LootLog instance or nil if deserialization failed
+-- @param serializedData string Base64 encoded CBOR serialized log data
+-- @return LootLog instance or nil if failed
 function LootLog.newFromSerialized(serializedData)
-    -- Validate input
     if type(serializedData) ~= "string" or serializedData == "" then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Invalid serialized data provided: expected non-empty string")
         end
         return nil
     end
-    
-    -- Decode Base64
+
     local decodedData = C_EncodingUtil.DecodeBase64(serializedData)
     if not decodedData then
         if SF.Debug then
@@ -168,8 +168,7 @@ function LootLog.newFromSerialized(serializedData)
         end
         return nil
     end
-    
-    -- Deserialize CBOR
+
     local success, logData = pcall(C_EncodingUtil.DeserializeCBOR, decodedData)
     if not success or not logData then
         if SF.Debug then
@@ -177,43 +176,44 @@ function LootLog.newFromSerialized(serializedData)
         end
         return nil
     end
-    
-    -- Validate version
-    if logData.version ~= 1 then
+
+    if logData.version ~= LOG_FORMAT_VERSION then
         if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Unsupported log format version: %s (expected 1)", tostring(logData.version))
+            SF.Debug:Warn("LOOTLOG", "Unsupported log format version: %s", tostring(logData.version))
         end
         return nil
     end
-    
-    -- Validate required fields
-    if not logData.id or not logData.timestamp or not logData.author or 
-       not logData.eventType or not logData.data then
+
+    if not logData._id or not logData._timestamp or not logData._author or not logData._counter
+       or not logData._eventType or not logData._data then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Missing required fields in serialized log data")
         end
         return nil
     end
-    
-    -- Create instance with exact deserialized values (no validation, no counter increment)
+
     local instance = setmetatable({}, LootLog)
-    instance.id = logData.id
-    instance.timestamp = logData.timestamp
-    instance.author = logData.author
-    instance.eventType = logData.eventType
-    instance.data = logData.data
-    
-    -- Debug logging
-    if SF.Debug then
-        SF.Debug:Verbose("LOOTLOG", "Deserialized log %s: %s", instance.id, instance.eventType)
+    instance._id = logData._id
+    instance._timestamp = logData._timestamp
+    instance._author = logData._author
+    instance._counter = logData._counter
+    instance._eventType = logData._eventType
+    instance._data = logData._data
+
+    if SF.Debug then 
+        SF.Debug:Verbose("LOOTLOG", "Deserialized log %s: %s", instance._id, instance._eventType)
     end
-    
+
     return instance
 end
 
--- Get a copy of the event data template for a specific event type
--- @param eventType (string) - Event type constant
--- @return (table) - Empty template table (copy) or nil if invalid
+-- ============================================================================
+-- Getter Methods
+-- ============================================================================
+
+-- Functionn to get event data template for a given event type
+-- @param eventType string Type of event (from EVENT_TYPES)
+-- @return table|nil event data template or nil if unknown event type
 function LootLog.GetEventDataTemplate(eventType)
     if not EVENT_DATA_TEMPLATES[eventType] then
         if SF.Debug then
@@ -221,8 +221,7 @@ function LootLog.GetEventDataTemplate(eventType)
         end
         return nil
     end
-    
-    -- Return a copy of the template to prevent corruption
+
     local template = {}
     for key, value in pairs(EVENT_DATA_TEMPLATES[eventType]) do
         template[key] = value
@@ -230,80 +229,77 @@ function LootLog.GetEventDataTemplate(eventType)
     return template
 end
 
--- ============================================================================
--- Getter Methods
--- ============================================================================
-
--- Getter function for log ID
--- @return (string) - Unique log ID
+-- Function to get the Unique ID of this log entry
+-- @return string log ID
 function LootLog:GetID()
-    return self.id
+    return self._id
 end
 
--- Getter function for timestamp
--- @return (number) - Timestamp of log creation
+-- Function to get the timestamp of this log entry
+-- @return number timestamp
 function LootLog:GetTimestamp()
-    return self.timestamp
+    return self._timestamp
 end
 
--- Getter function for author
--- @return (string) - Author of the log in "Name-Realm" format
+-- Function to get the author of this log entry
+-- @return string author
 function LootLog:GetAuthor()
-    return self.author
+    return self._author
 end
 
--- Getter function for event type
--- @return (string) - Event type of the log
+-- Function to get the counter of this log entry
+-- @return number counter
+function LootLog:GetCounter()
+    return self._counter
+end
+
+-- Function to get the event type of this log entry
+-- @return string event type
 function LootLog:GetEventType()
-    return self.eventType
+    return self._eventType
 end
 
--- Getter function for event data
--- @return (table) - Event data table
+-- Function to get the event data of this log entry
+-- @return table event data
 function LootLog:GetEventData()
-    return self.data
+    return self._data
 end
 
--- Getter function for serialized log data
--- Returns a Base64-encoded CBOR string suitable for addon communication
--- @return (string) - Serialized log data, or nil if serialization failed
+-- Function to serialize this log entry to a Base64 encoded CBOR string
+-- @return string|nil serialized data or nil if failed
 function LootLog:GetSerializedData()
-    -- Create serialization table with version for future compatibility
     local serializationData = {
-        version = 1,
-        id = self.id,
-        timestamp = self.timestamp,
-        author = self.author,
-        eventType = self.eventType,
-        data = self.data
+        version    = LOG_FORMAT_VERSION,
+        _id         = self._id,
+        _timestamp  = self._timestamp,
+        _author     = self._author,
+        _counter    = self._counter,
+        _eventType  = self._eventType,
+        _data       = self._data
     }
-    
-    -- Serialize to CBOR
+
     local success, cborData = pcall(C_EncodingUtil.SerializeCBOR, serializationData)
     if not success or not cborData then
         if SF.Debug then
-            SF.Debug:Error("LOOTLOG", "Failed to serialize log %s to CBOR: %s", self.id, tostring(cborData))
+            SF.Debug:Warn("LOOTLOG", "Failed to serialize log %s to CBOR: %s", self._id, tostring(cborData))
         end
         return nil
     end
-    
-    -- Encode to Base64
+
     local encodedData = C_EncodingUtil.EncodeBase64(cborData)
     if not encodedData then
         if SF.Debug then
-            SF.Debug:Error("LOOTLOG", "Failed to encode log %s to Base64", self.id)
+            SF.Debug:Warn("LOOTLOG", "Failed to encode log %s to Base64", tostring(self._id))
         end
         return nil
     end
-    
+
     return encodedData
 end
 
 -- ============================================================================
 -- Export to Namespace
 -- ============================================================================
-
--- Export to namespace
 SF.LootLog = LootLog
 SF.LootLogEventTypes = EVENT_TYPES
 SF.LootLogPointChangeTypes = POINT_CHANGE_TYPES

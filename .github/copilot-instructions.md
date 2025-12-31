@@ -23,6 +23,8 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 - `modules/Settings.lua` - Main settings panel with banner
 - `modules/LootHelper/Database.lua` - Loot Helper database initialization
 - `modules/LootHelper/Members.lua` - Member class (OOP pattern for loot profile members)
+- `modules/LootHelper/LootLogValidators.lua` - Validation functions for loot logs
+- `modules/LootHelper/LootLogs.lua` - LootLog class (immutable event logging)
 - `modules/LootHelper/LootProfiles.lua` - Profile CRUD operations
 - `modules/LootHelper/LootHelper.lua` - Core loot helper functionality
 - `modules/LootHelper/MemberQuery.lua` - Raid/party/solo member queries
@@ -125,6 +127,12 @@ SF.Debug     -- Logging system (debug.lua)
 SF.Member           -- Member class
 SF.MemberRoles      -- Role constants (ADMIN, MEMBER)
 SF.ArmorSlots       -- Armor slot constants (HEAD, SHOULDER, etc.)
+
+-- LootLog class (LootLogs.lua)
+SF.LootLog                    -- LootLog class (immutable event logs)
+SF.LootLogEventTypes          -- Event type constants (PROFILE_CREATION, POINT_CHANGE, etc.)
+SF.LootLogPointChangeTypes    -- Point change types (INCREMENT, DECREMENT)
+SF.LootLogArmorActions        -- Armor actions (USED, AVAILABLE)
 
 -- SavedVariables references (set in SpectrumFederation.lua)
 SF.lootHelperDB  -- Points to SpectrumFederationDB
@@ -256,6 +264,120 @@ member:IncrementPoints()
 local points = member:GetPointBalance()
 local isAdmin = member:IsAdmin()
 member:ToggleEquipment(SF.ArmorSlots.HEAD)
+```
+
+**LootLog Class Pattern (LootLogs.lua):**
+```lua
+local addonName, SF = ...
+
+-- Define constants
+local EVENT_TYPES = { PROFILE_CREATION = "PROFILE_CREATION", POINT_CHANGE = "POINT_CHANGE", ... }
+local LOG_FORMAT_VERSION = 2
+
+-- Class definition
+local LootLog = {}
+LootLog.__index = LootLog
+
+-- Constructor: use DOT notation (factory function)
+function LootLog.new(eventType, eventData, opts)
+    -- opts: { author, counter, timestamp, skipPermission }
+    -- Permission enforcement (skip if opts.skipPermission = true)
+    -- Validation (event type, event data template, event-specific)
+    -- Counter allocation from profile or opts.counter
+    
+    local instance = setmetatable({}, LootLog)
+    instance._timestamp = timestamp      -- Private property (underscore prefix)
+    instance._author = author
+    instance._counter = counter
+    instance._eventType = eventType
+    instance._data = eventData
+    instance._id = GenerateLogID(author, counter)  -- Format: "Name-Realm:123"
+    return instance
+end
+
+-- Serialization constructor (for imports/sync)
+function LootLog.newFromSerialized(serializedData)
+    -- Deserialize CBOR/Base64, validate format version, create instance
+    return instance
+end
+
+-- Instance methods: use COLON notation (auto-passes self)
+function LootLog:GetID()
+    return self._id
+end
+
+function LootLog:GetTimestamp()
+    return self._timestamp
+end
+
+function LootLog:GetAuthor()
+    return self._author
+end
+
+function LootLog:GetCounter()
+    return self._counter
+end
+
+function LootLog:GetEventType()
+    return self._eventType
+end
+
+function LootLog:GetEventData()
+    return self._data
+end
+
+function LootLog:GetSerializedData()
+    -- Serialize to CBOR, encode Base64, return string
+    return encodedData
+end
+
+-- Static method: use DOT notation
+function LootLog.GetEventDataTemplate(eventType)
+    return templateCopy
+end
+
+-- Export to namespace
+SF.LootLog = LootLog
+SF.LootLogEventTypes = EVENT_TYPES
+SF.LootLogPointChangeTypes = POINT_CHANGE_TYPES
+SF.LootLogArmorActions = ARMOR_ACTIONS
+```
+
+**LootLog Class Usage:**
+```lua
+-- Creating logs
+local eventType = SF.LootLogEventTypes.POINT_CHANGE
+local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+eventData.member = "Healer-Garona"
+eventData.change = SF.LootLogPointChangeTypes.INCREMENT
+
+local log = SF.LootLog.new(eventType, eventData)
+if log then
+    -- Success: log created with auto-generated ID (author:counter)
+    table.insert(profile.logs, log)
+end
+
+-- Accessing log data (use getters, not direct property access)
+local id = log:GetID()             -- "Healer-Garona:1"
+local timestamp = log:GetTimestamp()
+local author = log:GetAuthor()
+local counter = log:GetCounter()
+local eventType = log:GetEventType()
+local data = log:GetEventData()
+
+-- Serialization for sync
+local serialized = log:GetSerializedData()  -- Base64-encoded CBOR
+
+-- Deserialization
+local receivedLog = SF.LootLog.newFromSerialized(serialized)
+
+-- Profile creation log (skip permission check)
+local opts = { skipPermission = true }
+local profileLog = SF.LootLog.new(
+    SF.LootLogEventTypes.PROFILE_CREATION,
+    { profileId = "MyProfile-UniqueID" },
+    opts
+)
 ```
 
 **Profile Functions (LootProfiles.lua):**
