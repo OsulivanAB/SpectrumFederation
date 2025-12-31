@@ -155,56 +155,21 @@ end
 -- @return LootLog instance or nil if failed
 function LootLog.newFromSerialized(serializedData)
     if type(serializedData) ~= "string" or serializedData == "" then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Invalid serialized data provided: expected non-empty string")
-        end
         return nil
     end
 
-    local decodedData = C_EncodingUtil.DecodeBase64(serializedData)
-    if not decodedData then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Failed to decode Base64 data")
-        end
-        return nil
+    local decoded = C_EncodingUtil.DecodeBase64(serializedData)
+    if not decoded then return nil end
+
+    local ok, t = pcall(C_EncodingUtil.DeserializeCBOR, decoded)
+    if not ok or type(t) ~= "table" then return nil end
+
+    local log, err = LootLog.FromTable(t, { allowUnknownEventType = true })
+    if not log and SF.Debug then
+        SF.Debug:Warn("LOOTLOG", "FromTable failed: %s", tostring(err))
     end
 
-    local success, logData = pcall(C_EncodingUtil.DeserializeCBOR, decodedData)
-    if not success or not logData then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Failed to deserialize CBOR data: %s", tostring(logData))
-        end
-        return nil
-    end
-
-    if logData.version ~= LOG_FORMAT_VERSION then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Unsupported log format version: %s", tostring(logData.version))
-        end
-        return nil
-    end
-
-    if not logData._id or not logData._timestamp or not logData._author or not logData._counter
-       or not logData._eventType or not logData._data then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Missing required fields in serialized log data")
-        end
-        return nil
-    end
-
-    local instance = setmetatable({}, LootLog)
-    instance._id = logData._id
-    instance._timestamp = logData._timestamp
-    instance._author = logData._author
-    instance._counter = logData._counter
-    instance._eventType = logData._eventType
-    instance._data = logData._data
-
-    if SF.Debug then 
-        SF.Debug:Verbose("LOOTLOG", "Deserialized log %s: %s", instance._id, instance._eventType)
-    end
-
-    return instance
+    return log
 end
 
 -- ============================================================================
@@ -268,8 +233,34 @@ end
 -- Function to serialize this log entry to a Base64 encoded CBOR string
 -- @return string|nil serialized data or nil if failed
 function LootLog:GetSerializedData()
-    local serializationData = {
-        version    = LOG_FORMAT_VERSION,
+    local t = self:ToTable()
+
+    local ok, cborData = pcall(C_EncodingUtil.SerializeCBOR, t)
+    if not ok or not cborData then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "SerializeCBOR failed for %s", tostring(self._id))
+        end
+        return nil
+    end
+
+    local encoded = C_EncodingUtil.EncodeBase64(cborData)
+    if not encoded then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "EncodeBase64 failed for %s", tostring(self._id))
+        end
+        return nil
+    end
+
+    return encoded
+end
+
+-- Function Convert this log to a network-safe plain table.
+-- Goal: single source of truth for wire format.
+-- @param none
+-- @return table logTable Plain table representation of the log
+function LootLog:ToTable()
+    return {
+        version     = LOG_FORMAT_VERSION,
         _id         = self._id,
         _timestamp  = self._timestamp,
         _author     = self._author,
@@ -277,24 +268,70 @@ function LootLog:GetSerializedData()
         _eventType  = self._eventType,
         _data       = self._data
     }
+end
 
-    local success, cborData = pcall(C_EncodingUtil.SerializeCBOR, serializationData)
-    if not success or not cborData then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Failed to serialize log %s to CBOR: %s", self._id, tostring(cborData))
-        end
-        return nil
+-- Function Validate a log wire table (structural validation).
+-- @param t table logTable Plain table representation of the log
+-- @param opts table|nil optional:
+--     opts.allowUnknownEventType boolean (defaul true)
+-- @return boolean ok
+-- @return string|nil errMsg
+function LootLog.ValidateTable(t, opts)
+    opts = opts or {}
+    local allowUnkown = (opts.allowUnknownEventType ~= false)
+
+    if type(t) ~= "table" then return false, "log is not a table" end
+    if type(t.version) ~= "number" then return false, "log.version must be a number" end
+    if t.version ~= LOG_FORMAT_VERSION then
+        return false, ("unsupported log version %s (expected %s)"):format(tostring(t.version), tostring(LOG_FORMAT_VERSION))
+    end
+    if type(t._id) ~= "string" or t._id == "" then return false, "log._id must be a non-empty string" end
+    if type(t._timestamp) ~= "number" then return false, "log._timestamp must be a number" end
+    if type(t._author) ~= "string" or t._author == "" then return false, "log._author must be a non-empty string" end
+    if type(t._counter) ~= "number" or t._counter < 1 or t._counter ~= math.floor(t._counter) then
+        return false, "log._counter must be a positive integer"
+    end
+    if type(t._eventType) ~= "string" or t._eventType == "" then
+        return false, "log._eventType must be a non-empty string"
+    end
+    if type(t._data) ~= "table" then return false, "log._data must be a table" end
+
+    -- Integrity check: id must match author:counter
+    local expectedId = ("%s:%d"):format(t._author, t._counter)
+    if t._id ~= expectedId then
+        return false, ("log._id mismatch (expected %s, got %s)"):format(expectedId, tostring(t._id))
     end
 
-    local encodedData = C_EncodingUtil.EncodeBase64(cborData)
-    if not encodedData then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Failed to encode log %s to Base64", tostring(self._id))
+    -- Semantic enforcement (off by default for forward compatibility)
+    if not allowUnkown then
+        if not EVENT_TYPES[t._eventType] then
+            return false, ("unknown event type %s"):format(tostring(t._eventType))
         end
-        return nil
     end
 
-    return encodedData
+    return true, nil
+end
+
+-- Function Create a LootLog instance from a wire table.
+-- @param t table logTable Plain table representation of the log
+-- @param opts table|nil optional:
+--     opts.allowUnknownEventType boolean (defaul true)
+-- @return LootLog|nil instance
+-- @return string|nil errMsg
+function LootLog.FromTable(t, opts)
+    local ok, errMsg = LootLog.ValidateTable(t, opts)
+    if not ok then return nil, errMsg end
+
+    -- Build without permission checks since this is deserialization/import
+    local instance = setmetatable({}, LootLog)
+    instance._id        = t._id
+    instance._timestamp = t._timestamp
+    instance._author    = t._author
+    instance._counter   = t._counter
+    instance._eventType = t._eventType
+    instance._data      = t._data
+
+    return instance, nil
 end
 
 -- ============================================================================

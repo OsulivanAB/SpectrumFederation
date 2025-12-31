@@ -8,6 +8,15 @@ local addonName, SF = ...
 local LootProfile = {}
 LootProfile.__index = LootProfile
 
+local PROFILE_META_VERSION = 1
+local PROFILE_SNAPSHOT_VERSION = 1
+
+local function CopyArray(arr)
+    local out = {}
+    for i = 1, #(arr or {}) do out[i] = arr[i] end
+    return out
+end
+
 -- Local helper: generate a short, very-low-collision profileId
 -- We use multiple random 31-bit chunks + server time.
 -- math.random is backed by WoW's securerandom RNG in modern clients.
@@ -444,6 +453,169 @@ function LootProfile:AddAdminUser(member)
         end
         return false
     end
+end
+
+-- ========================================================================
+-- Exports and Imports
+-- ========================================================================
+
+-- Function Export profile header/meta as a network-safe table
+function LootProfile:ExportMeta()
+    return {
+        version         = PROFILE_META_VERSION,
+        _profileId      = self._profileId,
+        _profileName    = self._profileName,
+        _author         = self._author,
+        _owner          = self._owner,
+    }
+end
+
+-- Function Export a full profile snapshot (meta + admins + logs) as a network-safe table
+-- @param none
+-- @return table snapshot
+function LootProfile:ExportSnapshot()
+    local logsOut = {}
+    for i, log in ipairs(self._lootLogs or {}) do
+        logsOut[i] = log:ToTable()
+    end
+
+    return {
+        version         = PROFILE_SNAPSHOT_VERSION,
+        meta            = self:ExportMeta(),
+        adminUsers      = CopyArray(self._adminUsers),
+        lootLogs       = logsOut,
+    }
+end
+
+-- Function Validate profile meta table (structural)
+-- @param table meta Profile meta table to validate
+-- @return boolean ok
+-- @return string|nil errMsg
+function LootProfile.ValidateMeta(meta)
+    if type(meta) ~= "table" then return false, "Meta is not a table" end
+    if meta.version  ~= PROFILE_META_VERSION then
+        return false, ("Unsupported meta version %s"):format(tostring(meta.version))
+    end
+
+    if type(meta._profileId) ~= "string" or meta._profileId == "" then return false, "Invalid or missing _profileId" end
+    if type(meta._profileName) ~= "string" or meta._profileName == "" then return false, "Invalid or missing _profileName" end
+    if type(meta._author) ~= "string" or meta._author == "" then return false, "Invalid or missing _author" end
+    if type(meta._owner) ~= "string" or meta._owner == "" then return false, "Invalid or missing _owner" end
+
+    return true, nil
+end
+
+-- Function Validate snapshot table (structural)
+-- @param table snapshot Profile snapshot table to validate
+-- @return boolean ok
+-- @return string|nil errMsg
+function LootProfile.ValidateSnapshot(snapshot)
+    if type(snapshot) ~= "table" then return false, "Snapshot is not a table" end
+    if snapshot.version ~= PROFILE_SNAPSHOT_VERSION then
+        return false, ("Unsupported snapshot version %s"):format(tostring(snapshot.version))
+    end
+
+    local ok, err = LootProfile.ValidateMeta(snapshot.meta)
+    if not ok then return false, ("Invalid meta in snapshot: %s"):format(err) end
+
+    if type(snapshot.adminUsers) ~= "table" then return false, "Invalid or missing adminUsers" end
+    for i, admin in ipairs(snapshot.adminUsers) do
+        if type(admin) ~= "string" or admin == "" then
+            return false, ("snapshot.adminUsers[%d] is invalid"):format(i)
+        end
+    end
+
+    if type(snapshot.lootLogs) ~= "table" then return false, "snapshot.logs must be a table" end
+
+    return true, nil
+end
+
+-- Function Import a snapshot into this profile instance
+-- Behavior:
+--  - If self has no profileId yet, adopt snapshot meta.
+--  - If self has a different profileId, reject.
+--  - Replace adminUsers with snapshot adminUsers (authoritative list for now)
+--  - Merge logs idempotently (dedupe by logId).
+-- @param table snapshot Profile snapshot table
+-- @param opts table|nil optional:
+--     opts.allowUnknownEventType boolean (default true)
+-- @return boolean success
+-- @return number insertedLogs Number of logs newly inserted
+-- @return string|nil errMsg
+function LootProfile:ImportSnapshot(snapshot, opts)
+    local success, err = LootProfile.ValidateSnapshot(snapshot)
+    if not success then return false, 0, err end
+
+    local meta = snapshot.meta
+
+    -- Adopt or validate identity
+    if not self._profileId then
+        self._profileId = meta._profileId
+    elseif self._profileId ~= meta._profileId then
+        return false, 0, "Snapshot profileId does not match existing profileId"
+    end
+
+    -- Update label/ownership fields (these are not the identity)
+    self._profileName   = meta._profileName
+    self._author        = meta._author
+    self._owner         = meta._owner
+
+    -- Replace admin list (later we may derive this from logs; for now keep it explicit)
+    self._adminUsers = CopyArray(snapshot.adminUsers)
+
+    -- Merge Logs
+    local inserted = self:MergeLogTables(snapshot.lootLogs, opts)
+
+    return true, inserted, nil
+end
+
+-- Function Merge a list of LootLog wire tables into this profile
+-- Dedupe by logId; stable sort at the end; update logIndex + authorCounters.
+-- @param logTables table array of LootLog wire tables
+-- @param opts table|nil passed to LootLog.FromTable/ValidateTable
+-- @return number insertedLogs Number of logs newly inserted
+function LootProfile:MergeLogTables(logTables, opts)
+    if type(logTables) ~= "table" then return 0 end
+
+    self._lootLogs = self._lootLogs or {}
+    self._logIndex = self._logIndex or {}
+    self._authorCounters = self._authorCounters or {}
+
+    local inserted = 0
+    local dirtySort = false
+
+    for _, t in ipairs(logTables) do
+        local log, err = SF.LootLog.FromTable(t, opts)
+        if log then
+            local id = log:GetID()
+            if not self._logIndex[id] then
+                self._logIndex[id] = true
+                table.insert(self._lootLogs, log)
+                inserted = inserted + 1
+                dirtySort = true
+
+                -- Keep authorCoutners synced to max seen
+                local author = log:GetAuthor()
+                local counter = log:GetCounter()
+                if type(author) == "string" and type(counter) == "number" then
+                    local prev = self._authorCounters[author] or 0
+                    if counter > prev then
+                        self._authorCounters[author] = counter
+                    end
+                end
+            end
+        else
+            if SF.Debug then
+                SF.Debug:Warn("LootProfile", "Skipping invalid log table: %s", tostring(err))
+            end
+        end
+    end
+
+    if dirtySort then
+        table.sort(self._lootLogs, function(a, b) return self:_CompareLogs(a, b) end)
+    end
+
+    return inserted
 end
 
 -- ========================================================================
