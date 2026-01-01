@@ -741,7 +741,7 @@ function Sync:BuildAdminStatus(profileId)
     end
 
     status.hasProfile = true
-    status.authorMax = self:ComputeAuthorMax() or {}
+    status.authorMax = profile:ComputeAuthorMax() or {}
     return status
 end
 
