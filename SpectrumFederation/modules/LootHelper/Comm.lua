@@ -71,17 +71,13 @@ end
 -- @return The player's full name
 local function PlayerFullName()
     if SF.GetPlayerFullIdentifier then
-        return SF.GetPlayerFullIdentifier()
+        local ok, id = pcall(function() return SF:GetPlayerFullIdentifier() end)
+        if ok and id then return id end
     end
-
-    -- Fallback; OK for early init
-    local name = UnitName("player")
-    local realm = GetRealmName()
-    if name and realm then
-        realm = realm:gsub("%s+", "")
-        return name .. "-" .. realm
-    end
-    return nil
+    local name, realm = UnitFullName("player")
+    realm = realm or GetRealmName()
+    if realm then realm = realm:gsub("%s+", "") end
+    return name and realm and (name .. "-" .. realm) or (name or "unknown")
 end
 
 -- Function to check if a prefix registration was successful
@@ -152,6 +148,9 @@ function Comm:Init(opts)
 
     self:_RegisterPrefix(self.PREFIX.CONTROL)
     self:_RegisterPrefix(self.PREFIX.BULK)
+
+    self:RegisterComm(self.PREFIX.CONTROL, "OnCommReceived")
+    self:RegisterComm(self.PREFIX.BULK, "OnCommReceived")
 
     DInfo("Comm init complete (CONTROL=%s, BULK=%s)", self.PREFIX.CONTROL, self.PREFIX.BULK)  
 end
@@ -250,7 +249,7 @@ end
 function Comm:_HandleIncoming(kind, text, distribution, sender)
     local SP = SF.SyncProtocol
     if not SP then
-        DErr("Incomming message but SF.SyncProtocol missing")
+        DError("Incomming message but SF.SyncProtocol missing")
         return
     end
 

@@ -36,10 +36,10 @@ end
 -- @return string Addon version
 local function GetAddonVersion()
     if C_AddOns and C_AddOns.GetAddOnMetadata then
-        return C_AddOns.GetAddOnMetadata(addonName, "Version") or "unkown"
+        return C_AddOns.GetAddOnMetadata(addonName, "Version") or "unknown"
     end
     if GetAddOnMetadata then
-        return GetAddonOnMetadata(addonName, "Version") or "unkown"
+        return GetAddonOnMetadata(addonName, "Version") or "unknown"
     end
     return "unknown"
 end
@@ -49,7 +49,7 @@ end
 -- @return none
 local function PrintWarning(msg)
     if SF.PrintWarning then
-        SF.PrintWarning(msg)
+        SF:PrintWarning(msg)
     else
         print(addonName .. ": WARNING: " .. msg)
     end
