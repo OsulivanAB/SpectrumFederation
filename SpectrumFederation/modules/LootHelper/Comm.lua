@@ -32,7 +32,7 @@ Comm._handlers = Comm._handlers or {
 -- @return nil
 local function DVerbose(fmt, ...)
     if SF.Debug and SF.Debug.Verbose then
-        SF.Debug:PrintDebug("LH_COMM", fmt, ...)
+        SF.Debug:Verbose("LH_COMM", fmt, ...)
     end
 end
 
@@ -42,7 +42,7 @@ end
 -- @return nil
 local function DInfo(fmt, ...)
     if SF.Debug and SF.Debug.Info then
-        SF.Debug:PrintInfo("LH_COMM", fmt, ...)
+        SF.Debug:Info("LH_COMM", fmt, ...)
     end
 end
 
@@ -52,7 +52,7 @@ end
 -- @return nil
 local function DWarn(fmt, ...)
     if SF.Debug and SF.Debug.Warn then
-        SF.Debug:PrintWarn("LH_COMM", fmt, ...)
+        SF.Debug:Warn("LH_COMM", fmt, ...)
     end
 end
 
@@ -62,7 +62,7 @@ end
 -- @return nil
 local function DError(fmt, ...)
     if SF.Debug and SF.Debug.Error then
-        SF.Debug:PrintError("LH_COMM", fmt, ...)
+        SF.Debug:Error("LH_COMM", fmt, ...)
     end
 end
 
