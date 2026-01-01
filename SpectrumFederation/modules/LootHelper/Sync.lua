@@ -67,8 +67,24 @@ Sync.state = Sync.state or {
     adminStatuses = {}, -- map: [sender] = status table
 
     -- Outstanding requests by requestId
-    requests = {}       -- map: [requestId] = requestState
+    requests = {},      -- map: [requestId] = requestState
+
+    peers = {},         -- map: [nameRealm] = peerRecord
+                        -- peerRecord example
+                        -- {
+                        --   name = "Name-Realm",
+                        --   inGroup = true/false,     -- roster truth
+                        --   online = true/false/nil,  -- roster truth (raid only)
+                        --   lastSeen = epochSeconds,  -- comm truth
+                        --   proto = 1,                -- last proto observed
+                        --   supportedMin = 1,
+                        --   supportedMax = 1,
+                        --   addonVersion = "0.2.0-beta.3",
+                        --   isAdmin = true/false/nil, -- verified admin for current session profile if we can verify
+                        -- }
 }
+
+Sync._nonceCounter = Sync._nonceCounter or 0
 
 -- ============================================================================
 -- Public API (called by LootHelper core / UI / events)
@@ -158,6 +174,8 @@ end
 -- @param opts table|nil Optional: forceStart, skipPrompt, customHelpers, ect.
 -- @return string sessionId
 function Sync:StartSession(profileId, opts)
+    local sessionId = self:_NextNonce("SES")
+    return sessionId
 end
 
 -- Function End the active session (optional broadcast).
@@ -375,6 +393,7 @@ end
 -- @param none
 -- @return string requestId
 function Sync:NewRequestId()
+    return self:_NextNonce("REQ")
 end
 
 -- Function Register an outstanding request so it can timeout / retry / be matched.
@@ -499,4 +518,144 @@ end
 -- @param fn function Callback to run after delay
 -- @return any handle Optional timer handle
 function Sync:RunAfter(delaySec, fn)
+end
+
+-- ============================================================================
+-- Helpers
+-- ============================================================================
+
+-- TODO: Maybe make this an addon-wide helper because I think we have similar functions to this elsewhere
+-- Function Return a current epoch time in seconds.
+-- @param none
+-- @return number epochSeconds
+local function Now()
+    if SF.Now then
+        return SF:Now()
+    end
+    return (GetServerTime and GetServerTime()) or time()
+end
+
+-- Function Return a unique identifier for the current player ("Name-Realm").
+-- @param none
+-- @return string playerId
+local function SelfId()
+    if SF.GetPlayerFullIdentifier then
+        local ok, id = pcall(function() return SF:GetPlayerFullIdentifier() end)
+        if ok and id then return id end
+    end
+    local name, realm = UnitFullName("player")
+    realm = realm or GetRealmName()
+    if realm then realm = realm:gsub("%s+", "") end
+    return name and realm and (name .. "-" .. realm) or (name or "unknown")
+end
+
+-- Function Generate the next nonce string for messages.
+-- @param tag string|nil Optional tag prefix (default: "N")
+-- @return string nonce
+function Sync:_NextNonce(tag)
+    self._nonceCounter = (self._nonceCounter or 0) + 1
+    tag = tag or "N"
+    return ("%s:%s:%d:%d"):format(tag, SelfId(), Now(), self._nonceCounter)
+end
+
+-- Function Get or create a peer record for the given "Name-Realm".
+-- @param nameRealm string "Name-Realm"
+-- @return table peerRecord
+function Sync:GetPeer(nameRealm)
+    if type(nameRealm) ~= "string" or nameRealm == "" then return nil end
+    self.state.peers = self.state.peers or {}
+
+    local peer = self.state.peers[nameRealm]
+    if not peer then
+        peer = {
+            name = nameRealm,
+            inGroup = false,
+            online = nil,
+            lastSeen = 0,
+            proto = nil,
+            supportedMin = nil,
+            supportedMax = nil,
+            addonVersion = nil,
+            isAdmin = nil,
+        }
+        self.state.peers[nameRealm] = peer
+    end
+    return peer
+end
+
+-- Function Update peer record's lastSeen and optional fields.
+-- @param nameRealm string "Name-Realm"
+-- @param fields table|nil Optional fields to update in peer record
+-- @return nil
+function Sync:TouchPeer(nameRealm, fields)
+    local peer = self:GetPeer(nameRealm)
+    if not peer then return end
+
+    peer.lastSeen = Now()
+    if type(fields) == "table" then
+        for k, v in pairs(fields) do
+            peer[k] = v
+        end
+    end
+end
+
+-- Function Normalize a "Name" or "Name-Realm" into "Name-Realm" format.
+-- @param name string Player name or "Name-Realm"
+-- @return string|nil Normalized "Name-Realm" or nil if invalid
+local function NormalizeNameRealm(name)
+    if not name or name == "" then return nil end
+    if name:find("-", 1, true) then
+        local n, r = strsplit("-", name, 2)
+        if r then r = r:gsub("%s+", "") end
+        return n and r and (n .. "-" .. r) or name
+    end
+    local realm = GetRealmName()
+    if realm then realm = realm:gsub("%s+", "") end
+    return realm and (name .. "-" .. realm) or name
+end
+
+-- Function Update peer records from current group/raid roster.
+-- @param none
+-- @return nil
+function Sync:UpdatePeersFromRoster()
+    self.state.peers = self.state.peers or {}
+
+    -- mark everyone "not inGroup" first; we'll re-mark those we find
+    for _, peer in pairs(self.state.peers) do
+        peer.inGroup = false
+        peer.online = nil
+    end
+
+    if IsInRaid() then
+        local n = GetNumGroupMembers() or 0
+        for i = 1, n do
+            local name, rank, subgroup, level, class, fileName, zone, online, isDead, role = GetRaidRosterInfo(i)
+            local full = NormalizeNameRealm(name)
+            if full then
+                local peer = self:GetPeer(full)
+                peer.inGroup = true
+                peer.online = online
+                peer.rank = rank
+                peer.subgroup = subgroup
+                peer.role = role
+            end
+        end
+    elseif IsInGroup() then
+        local function touchUnit(unit)
+            local n, r = UnitFullName(unit)
+            if not n then return end
+            local full = NormalizeNameRealm(r and (n .. "-" .. r) or n)
+            if full then
+                local peer = self:GetPeer(full)
+                peer.inGroup = true
+                peer.online = UnitIsConnected(unit)
+                peer.role = UnitGroupRolesAssigned(unit)
+            end
+        end
+
+        touchUnit("player")
+        for i = 1, (GetNumSubgroupMembers() or 0) do
+            touchUnit("party" .. i)
+        end
+    end
 end

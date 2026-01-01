@@ -20,6 +20,7 @@ Libs/AceComm/AceComm-3.0.lua
 modules/debug.lua
 modules/SlashCommands.lua
 modules/MessageHelpers.lua
+modules/Core.lua
 
 modules/LootHelper/SyncProtocol.lua
 modules/LootHelper/Members.lua
@@ -31,6 +32,5 @@ modules/LootHelper/Sync.lua
 modules/LootHelper/Comm.lua
 
 modules/Settings.lua
-modules/Core.lua
 
 SpectrumFederation.lua

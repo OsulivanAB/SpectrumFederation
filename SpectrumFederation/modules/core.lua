@@ -134,3 +134,10 @@ function SF:FormatTimestampForServer(utcTimestamp)
     local serverOffset = serverLocal - GetServerTime()
     return date("%Y-%m-%d %H:%M:%S", utcTimestamp + serverOffset)
 end
+
+-- Function Return a current epoch time in seconds.
+-- @param none
+-- @return number epochSeconds
+function SF:Now()
+    return (GetServerTime and GetServerTime()) or time()
+end

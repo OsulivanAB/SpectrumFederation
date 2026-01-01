@@ -28,6 +28,9 @@ local lastWarnAt = {}   -- [sender] = time
 -- @param none
 -- @return number Current unix utc timestamp
 local function Now()
+    if SF.Now then
+        return SF:Now()
+    end
     return GetServerTime and GetServerTime() or time()
 end
 
