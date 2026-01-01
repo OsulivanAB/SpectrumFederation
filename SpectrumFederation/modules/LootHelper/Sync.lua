@@ -806,7 +806,7 @@ function Sync:HandleCoordinatorAck(sender, payload)
     if type(payload) ~= "table" then return end
     if type(payload.sessionId) ~= "string" then return end
     if payload.sessionId ~= self.state.sessionId then return end
-    if type(payload.profileId) ~= "string" and self.state.profileId and payload.profileId ~= self.state.profileId then
+    if type(payload.profileId) == "string" and self.state.profileId and payload.profileId ~= self.state.profileId then
         return
     end
 
