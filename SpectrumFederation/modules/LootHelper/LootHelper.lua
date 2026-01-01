@@ -17,6 +17,11 @@ function SF:InitializeLootHelperDatabase()
     end
 
     SF.lootHelperDB = SpectrumFederationDB.lootHelper
+
+    -- Initialize Loot Helper Communications
+    if SF.LootHelperComm then
+        SF.LootHelperComm:Init()
+    end
 end
 
 -- function to set the active loot profile
