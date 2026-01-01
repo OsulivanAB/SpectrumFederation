@@ -92,6 +92,59 @@ Sync.state = Sync.state or {
 Sync._nonceCounter = Sync._nonceCounter or 0
 
 -- ============================================================================
+-- Helper Functions (Local)
+-- ============================================================================
+
+-- TODO: Maybe make this an addon-wide helper because I think we have similar functions to this elsewhere
+-- Function Return a current epoch time in seconds.
+-- @param none
+-- @return number epochSeconds
+local function Now()
+    if SF.Now then
+        return SF:Now()
+    end
+    return (GetServerTime and GetServerTime()) or time()
+end
+
+-- Function Return a unique identifier for the current player ("Name-Realm").
+-- @param none
+-- @return string playerId
+local function SelfId()
+    if SF.GetPlayerFullIdentifier then
+        local ok, id = pcall(function() return SF:GetPlayerFullIdentifier() end)
+        if ok and id then return id end
+    end
+    local name, realm = UnitFullName("player")
+    realm = realm or GetRealmName()
+    if realm then realm = realm:gsub("%s+", "") end
+    return name and realm and (name .. "-" .. realm) or (name or "unknown")
+end
+
+-- Function Normalize a "Name" or "Name-Realm" into "Name-Realm" format.
+-- @param name string Player name or "Name-Realm"
+-- @return string|nil Normalized "Name-Realm" or nil if invalid
+local function NormalizeNameRealm(name)
+    if not name or name == "" then return nil end
+    if name:find("-", 1, true) then
+        local n, r = strsplit("-", name, 2)
+        if r then r = r:gsub("%s+", "") end
+        return n and r and (n .. "-" .. r) or name
+    end
+    local realm = GetRealmName()
+    if realm then realm = realm:gsub("%s+", "") end
+    return realm and (name .. "-" .. realm) or name
+end
+
+-- Function Get current group distribution channel ("RAID", "PARTY", or nil).
+-- @param none
+-- @return string|nil distribution
+local function GetGroupDistribution()
+    if IsInRaid() then return "RAID" end
+    if IsInGroup() then return "PARTY" end
+    return nil
+end
+
+-- ============================================================================
 -- Public API (called by LootHelper core / UI / events)
 -- ============================================================================
 
@@ -854,33 +907,8 @@ function Sync:RunAfter(delaySec, fn)
 end
 
 -- ============================================================================
--- Helpers
+-- Peer Registry / Roster Helpers
 -- ============================================================================
-
--- TODO: Maybe make this an addon-wide helper because I think we have similar functions to this elsewhere
--- Function Return a current epoch time in seconds.
--- @param none
--- @return number epochSeconds
-local function Now()
-    if SF.Now then
-        return SF:Now()
-    end
-    return (GetServerTime and GetServerTime()) or time()
-end
-
--- Function Return a unique identifier for the current player ("Name-Realm").
--- @param none
--- @return string playerId
-local function SelfId()
-    if SF.GetPlayerFullIdentifier then
-        local ok, id = pcall(function() return SF:GetPlayerFullIdentifier() end)
-        if ok and id then return id end
-    end
-    local name, realm = UnitFullName("player")
-    realm = realm or GetRealmName()
-    if realm then realm = realm:gsub("%s+", "") end
-    return name and realm and (name .. "-" .. realm) or (name or "unknown")
-end
 
 -- Function Generate the next nonce string for messages.
 -- @param tag string|nil Optional tag prefix (default: "N")
@@ -932,21 +960,6 @@ function Sync:TouchPeer(nameRealm, fields)
     end
 end
 
--- Function Normalize a "Name" or "Name-Realm" into "Name-Realm" format.
--- @param name string Player name or "Name-Realm"
--- @return string|nil Normalized "Name-Realm" or nil if invalid
-local function NormalizeNameRealm(name)
-    if not name or name == "" then return nil end
-    if name:find("-", 1, true) then
-        local n, r = strsplit("-", name, 2)
-        if r then r = r:gsub("%s+", "") end
-        return n and r and (n .. "-" .. r) or name
-    end
-    local realm = GetRealmName()
-    if realm then realm = realm:gsub("%s+", "") end
-    return realm and (name .. "-" .. realm) or name
-end
-
 -- Function Update peer records from current group/raid roster.
 -- @param none
 -- @return nil
@@ -991,15 +1004,6 @@ function Sync:UpdatePeersFromRoster()
             touchUnit("party" .. i)
         end
     end
-end
-
--- Function Get current group distribution channel ("RAID", "PARTY", or nil).
--- @param none
--- @return string|nil distribution
-local function GetGroupDistribution()
-    if IsInRaid() then return "RAID" end
-    if IsInGroup() then return "PARTY" end
-    return nil
 end
 
 -- Function Get the current addon version string.
