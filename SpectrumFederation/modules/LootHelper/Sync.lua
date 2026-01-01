@@ -168,13 +168,43 @@ end
 function Sync:MaybePromptStartSession()
 end
 
--- TODO: Need to create a more stable profile ID in the profile class.
 -- Function Start a new SF Loot Helper session as coordinator (Sequence 1 -> 2).
 -- @param profileId string Stable profile id to use for this session
 -- @param opts table|nil Optional: forceStart, skipPrompt, customHelpers, ect.
 -- @return string sessionId
 function Sync:StartSession(profileId, opts)
+    opts = opts or {}
+    local dist = GetGroupDistribution()
+    if not dist then
+        if SF.PrintError then SF:PrintError("Cannot start session: not in a group/raid.") end
+        return nil
+    end
+
+    local me = SelfId()
     local sessionId = self:_NextNonce("SES")
+    local epoch = Now()
+
+    self.state.active = true
+    self.state.sessionId = sessionId
+    self.state.profileId = profileId
+    self.state.coordinator = me
+    self.state.coordEpoch = epoch
+    self.state.isCoordinator = true
+
+    self:UpdatePeersFromRoster()
+    self:TouchPeer(me, { inGroup = true, isAdmin = true })
+
+    local payload = {
+        sessionId = sessionId,
+        profileId = profileId,
+        coordinator = me,
+        coordEpoch = epoch,
+    }
+
+    if SF.LootHelperComm then
+        SF.LootHelperComm:Send("CONTROL", self.MSG.SES_START, payload, dist, nil, "ALERT")
+    end
+
     return sessionId
 end
 
@@ -243,6 +273,44 @@ end
 -- @param payload table Decoded message payload
 -- @return nil
 function Sync:HandleSessionStart(sender, payload)
+    if type(payload) ~= "table" then return end
+    if type(payload.sessionId) ~= "string" then return end
+    if type(payload.profileId) ~= "string" then return end
+    if type(payload.coordinator) ~= "string" then return end
+    if type(payload.coordEpoch) ~= "number" then return end
+
+    -- Accept rules:
+    -- - If no session active: accept
+    -- - If same sessionId: accept (reannounce)
+    -- - If different sessionId: accept only if epoch is newer
+    if self.state.active then
+        if payload.sessionId ~= self.state.sessionId then
+            if payload.coordEpoch <= (self.state.coordEpoch or 0) then
+                return
+            end
+        end
+    end
+
+    self.state.active = true
+    self.state.sessionId = payload.sessionId
+    self.state.profileId = payload.profileId
+    self.state.coordinator = payload.coordinator
+    self.state.coordEpoch = payload.coordEpoch
+    self.state.isCoordinator = (payload.coordinator == SelfId())
+
+    self:TouchPeer(sender, { proto = payload.proto, inGroup = true })
+    -- TODO: Add Jitter
+    local ack = {
+        sessionId = self.state.sessionId,
+        profileId = self.state.profileId,
+        supportedMin = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
+        supportedMax = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
+        addonVersion = (C_AddOns and C_AddOns.GetAddOnMetadata) and C_AddOns:GetAddOnMetadata(addonName, "Version") or nil,
+    }
+
+    if SF.LootHelperComm then
+        SF.LootHelperComm:Send("CONTROL", self.MSG.COORD_ACK, ack, "WHISPER", self.state.coordinator, "NORMAL")
+    end
 end
 
 -- Function Pick helper for a given player deterministically (e.g. hash(name) % #helpers).
@@ -297,6 +365,19 @@ end
 -- @param distribution string Message distribution channel ("WHISPER", "RAID", etc.)
 -- @return nil
 function Sync:OnControlMessage(sender, msgType, payload, distribution)
+    -- Update peer registry from "any message received"
+    -- Comm already validated protocol and decoded payload
+    self:TouchPeer(sender, { proto = (SF.SyncProtocol and SF.SyncProtocol.PROTO_CURRENT) or nil })
+
+    if msgType == self.MSG.SES_START then
+        return self:HandleSessionStart(sender, payload)
+    end
+
+    if msgType == self.MSG.COORD_ACK then
+        return self:HandleCoordinatorAck(sender, payload)
+    end
+
+    -- TODO: Add other control message handlers here
 end
 
 -- Function Route an incoming BULK message to the appropriate handler.
@@ -351,6 +432,24 @@ end
 -- @param payload table COORD_ACK payload
 -- @return nil
 function Sync:HandleCoordinatorAck(sender, payload)
+    if type(payload) ~= "table" then return end
+    if type(payload.sessionId) ~= "string" then return end
+    if payload.sessionId ~= self.state.sessionId then return end
+    if type(payload.profileId) ~= "string" and self.state.profileId and payload.profileId ~= self.state.profileId then
+        return
+    end
+
+    self:TouchPeer(sender, {
+        supportedMin = payload.supportedMin,
+        supportedMax = payload.supportedMax,
+        addonVersion = payload.addonVersion,
+    })
+
+    if self.state.profileId then
+        local isAdmin = self:IsSenderAuthorized(self.state.profileId, sender)
+        local peer = self:GetPeer(sender)
+        peer.isAdmin = isAdmin
+    end
 end
 
 -- Function Handle NEED_PROFILE as a helper/coordinator: respond with PROFILE_SNAPSHOT (bulk).
@@ -440,9 +539,35 @@ end
 -- @param sender string "Name-Realm" of sender
 -- @return boolean True if sender is admin of profile, false otherwise
 function Sync:IsSenderAuthorized(profileId, sender)
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then return false end
+    local admins = profile.GetAdminUsers and profile:GetAdminUsers() or nil
+    if type(admins) ~= "table" then return false end
+
+    for _, admin in ipairs(admins) do
+        if admin == sender then return true end
+    end
+    return false
 end
 
--- TODO: No Protocol check?
+-- Function Validate session-related payloads for consistency with current session state.
+-- @param payload table Must include sessionId and optionally profileId
+-- @return boolean isValid True if valid, false otherwise
+-- @return string|nil errReason If not valid, reason why
+function Sync:ValidateSessionPayload(payload)
+    if type(payload) ~= "table" then return false, "payload not table" end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return false, "missing sessionId" end
+
+    if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
+        return false, "stale/other sessionId"
+    end
+
+    if self.state.active and self.state.profileId and type(payload.profileId) == "string" and payload.profileId ~= self.state.profileId then
+        return false, "wrong profileId for this session"
+    end
+
+    return true, nil
+end
 
 -- ============================================================================
 -- Profile / Log integration helpers (high-level; class implementations can sit elsewhere)
@@ -452,6 +577,15 @@ end
 -- @param profileId string Stable profile id
 -- @return table|nil LootProfile instance or nil if not found
 function Sync:FindLocalProfileById(profileId)
+    if not SF.lootHelperDB or type(SF.lootHelperDB.profiles) ~= "table" then return nil end
+    if type(profileId) ~= "string" or profileId == "" then return nil end
+
+    for _, profile in ipairs(SF.lootHelperDB.profiles) do
+        if profile and profile.GetProfileId and profile:GetProfileId() == profileId then
+            return profile
+        end
+    end
+    return nil
 end
 
 -- Function Create a new empty local profile shell from snapshot metadata (no derived state yet).
@@ -658,4 +792,13 @@ function Sync:UpdatePeersFromRoster()
             touchUnit("party" .. i)
         end
     end
+end
+
+-- Function Get current group distribution channel ("RAID", "PARTY", or nil).
+-- @param none
+-- @return string|nil distribution
+local function GetGroupDistribution()
+    if IsInRaid() then return "RAID" end
+    if IsInGroup() then return "PARTY" end
+    return nil
 end
