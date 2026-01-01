@@ -8,7 +8,7 @@
 ## X-Documentation: https://osullivanab.github.io/SpectrumFederation/
 ## SavedVariables: SpectrumFederationDB, SpectrumFederationDebugDB
 
-## Core files
+# --- Core files ---
 
 # --- Libs ---
 Libs/LibStub/LibStub.lua
@@ -17,9 +17,10 @@ Libs/AceComm/ChatThrottleLib.lua
 Libs/AceComm/AceComm-3.0.lua
 
 # --- Modules --- 
-modules/Debug.lua
+modules/debug.lua
 modules/SlashCommands.lua
 modules/MessageHelpers.lua
+
 modules/LootHelper/SyncProtocol.lua
 modules/LootHelper/Members.lua
 modules/LootHelper/LootLogValidators.lua
@@ -27,8 +28,9 @@ modules/LootHelper/LootLogs.lua
 modules/LootHelper/Profiles.lua
 modules/LootHelper/LootHelper.lua
 modules/LootHelper/Sync.lua
-modules/LootHelper/SyncTransport.lua
 modules/LootHelper/Comm.lua
+
 modules/Settings.lua
 modules/Core.lua
+
 SpectrumFederation.lua
