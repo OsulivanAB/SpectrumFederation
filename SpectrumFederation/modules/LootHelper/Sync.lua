@@ -245,6 +245,11 @@ function Sync:StartSession(profileId, opts)
     local sessionId = self:_NextNonce("SES")
     local epoch = Now()
 
+    -- Reste state
+    self.state.adminstatuses = {}
+    self.state._adminConvergence = nil
+    self.state.handshake = nil
+
     self.state.active = true
     self.state.sessionId = sessionId
     self.state.profileId = profileId
