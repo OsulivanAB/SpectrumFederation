@@ -564,7 +564,7 @@ function Sync:HandleSessionStart(sender, payload)
         self:SendJoinStatus()
     end)
 
-    self:TouchPeer(sender, { proto = payload.proto, inGroup = true })
+    self:TouchPeer(sender, { inGroup = true })
 end
 
 -- Function Pick helper for a given player deterministically (e.g. hash(name) % #helpers).
