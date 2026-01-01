@@ -46,13 +46,16 @@ Sync.cfg = Sync.cfg or {
     adminReplyJitterMsMin = 0,
     adminReplyJitterMsMax = 500,
 
+    adminConvergenceCollectSec  = 1.5,  -- how long coordinator waits for ADMIN_STATUS
+    adminLogSyncTimeoutSec      = 4.0,  -- how long coordinator waits for AUTH_LOGS
+
     memberReplyJitterMsMin = 0,
     memberReplyJitterMsMax = 500,
 
     requestTimeoutSec = 5,
     maxRetries = 2,
 
-    handleshakeCollectSec = 3,  -- how long coordinator waits for HAVE/NEED replies
+    handshakeCollectSec = 3,  -- how long coordinator waits for HAVE/NEED replies
 }
 
 Sync.state = Sync.state or {
@@ -252,7 +255,8 @@ function Sync:StartSession(profileId, opts)
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
 
-    self:BroadcastSessionStart()
+    self:BeginAdminConvergence(sessionId, profileId)
+
     return sessionId
 end
 
@@ -286,12 +290,149 @@ end
 -- @param profileId string Current session profile id.
 -- @return nil
 function Sync:BeginAdminConvergence(sessionId, profileId)
+    if not self.state.active or not self.state.isCoordinator then return end
+
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        -- If the leader somehow doesn't have the profile, just proceed to SES_START;
+        -- the raid handshake will handle NEED_PROFILE, ect.
+        self:BroadcastSessionStart()
+        return
+    end
+
+    local adminSyncId = self:_NextNonce("AS")
+    self.state._adminConvergence = {
+        adminSyncId     = adminSyncId,
+        startedAt       = Now(),
+        deadlineAt      = Now() + (self.cfg.adminConvergenceCollectSec or 1.5),
+        expected        = {}, -- [admin] = true
+        pendingReq      = {}, -- [admin] = true
+        pendingCount    = 0,
+    }
+
+    -- Who do we ask?
+    local admins = profile:GetAdminUsers() or {}
+    local me = SelfId()
+
+    for _, admin in ipairs(admins) do
+        if admin ~= me then
+            self.state._adminConvergence.expected[admin] = true
+            if SF.LootHelperComm then
+                SF.LootHelperComm:Send("CONTROL", self.MSG.ADMIN_SYNC, {
+                    sessionId       = sessionId,
+                    profileId       = profileId,
+                    adminSyncId     = adminSyncId,
+                }, "WHISPER", admin, "NORMAL")
+            end
+        end
+    end
+
+    -- After collection window, finalize no matter what
+    local sid = sessionId
+    self:RunAfter(self.cfg.adminConvergenceCollectSec or 1.5, function()
+        if not self.state.active or not self.state.isCoordinator then return end
+        if self.state.sessionId ~= sid then return end
+        self:FinalizeAdminConvergence()
+    end)
 end
 
 -- Function Finalize admin convergence after timeouts; compute helpers and broadcast SES_START.
 -- @param none
 -- @return nil
 function Sync:FinalizeAdminConvergence()
+    if not self.state.active or not self.state.coordinator then return end
+    local conv = self.state._adminConvergence
+    if not conv then
+        self:BroadcastSessionStart()
+        return
+    end
+
+    local profileId = self.state.profileId
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        self:BroadcastSessionStart()
+        return
+    end
+
+    -- 1) compute local
+    local localMax = profile:ComputeAuthorMax() or {}
+
+    -- 2) compute target (union maxima across admin statuses)
+    local targetMax = {}
+    for author, m in pairs(localMax) do targetMax[author] = m end
+
+    for admin, st in pairs(self.state.adminStatuses or {}) do
+        if st and st.hasProfile and type(st.authorMax) == "table" then
+            for author, m in pairs(st.authorMax) do
+                if type(author) == "string" and type(m) == "number" then
+                    local prev = targetMax[author] or 0
+                    if m > prev then targetMax[author] = m end
+                end
+            end
+        end
+    end
+
+    -- 3) compute missing ranges for the coordinator
+    local missing = self:ComputeMissingLogRequests(localMax, targetMax)
+
+    -- 4) send LOG_REQs to a reasonable provider
+    conv.pendingReq = {}
+    conv.pendingCount = 0
+
+    for _, req in ipairs(missing) do
+        local author = req.author
+        local toCounter = req.toCounter
+
+        -- Provider selection:
+        -- Prefer the author themselves if they responded and claim to have up to that counter.
+        local provider = nil
+        local st = self.state.adminStatuses and self.state.adminStatuses[author]
+        if st and st.authorMax and (st.authorMax[author] or 0) >= toCounter then
+            provider = author
+        else
+            -- Otherwise, pick any admin who claims to have up to that counter.
+            for adminName, st2 in pairs(self.state.adminStatuses or {}) do
+                if st2 and st2.authorMax and (st2.authorMax[author] or 0) >= toCounter then
+                    provider = adminName
+                    break
+                end
+            end
+        end
+
+        if provider then
+            local requestId = self:NewRequestId()
+            conv.pendingReq[requestId] = true
+            conv.pendingCount = conv.pendingCount + 1
+
+            if SF.LootHelperComm then
+                SF.LootHelperComm:Send("CONTROL", self.MSG.LOG_REQ, {
+                    sessionId       = self.state.sessionId,
+                    profileId       = profileId,
+                    adminSyncId     = conv.adminSyncId,
+                    requestId       = requestId,
+                    author          = author,
+                    fromCounter     = req.fromCounter,
+                    toCounter       = req.toCounter,
+                }, "WHISPER", provider, "NORMAL")
+            end
+        end
+    end
+
+    -- If no missing logs, start the raid handshake immediately
+    if conv.pendingCount == 0 then
+        self.state._adminConvergence = nil
+        self:BroadcastSessionStart()
+        return
+    end
+
+    -- Otherwise, wait a bit for AUTH_LOGS, then proceed even if some time out
+    local sid = self.state.sessionId
+    self:RunAfter(self.cfg.adminLogSyncTimeoutSec or 4.0, function()
+        if not self.state.active or not self.state.isCoordinator then return end
+        if self.state.sessionId ~= sid then return end
+        self.state._adminConvergence = nil
+        self:BroadcastSessionStart()
+    end)
 end
 
 -- Function Choose helpers list from known admin statuses (middle-ground "helpers list" approach).
@@ -524,21 +665,14 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
     -- Comm already validated protocol and decoded payload
     self:TouchPeer(sender, { proto = (SF.SyncProtocol and SF.SyncProtocol.PROTO_CURRENT) or nil })
 
-    if msgType == self.MSG.SES_START then
-        return self:HandleSessionStart(sender, payload)
-    end
+    if msgType == self.MSG.ADMIN_SYNC then return self:HandleAdminSync(sender, payload) end
+    if msgType == self.MSG.ADMIN_STATUS then return self:HandleAdminStatus(sender, payload) end
+    if msgType == self.MSG.LOG_REQ then return self:HandleLogRequest(sender, payload) end
 
-    if msgType == self.MSG.HAVE_PROFILE then
-        return self:HandleHaveProfile(sender, payload)
-    end
-
-    if msgType == self.MSG.NEED_PROFILE then
-        return self:HandleNeedProfile(sender, payload)
-    end
-
-    if msgType == self.MSG.NEED_LOGS then
-        return self:HandleNeedLogs(sender, payload)
-    end
+    if msgType == self.MSG.SES_START then return self:HandleSessionStart(sender, payload) end
+    if msgType == self.MSG.HAVE_PROFILE then return self:HandleHaveProfile(sender, payload) end
+    if msgType == self.MSG.NEED_PROFILE then return self:HandleNeedProfile(sender, payload) end
+    if msgType == self.MSG.NEED_LOGS then return self:HandleNeedLogs(sender, payload) end
 end
 
 -- Function Route an incoming BULK message to the appropriate handler.
@@ -548,6 +682,9 @@ end
 -- @param distribution string Message distribution channel ("WHISPER", "RAID", etc.)
 -- @return nil
 function Sync:OnBulkMessage(sender, msgType, payload, distribution)
+    self:TouchPeer(sender, { proto = (SF.SyncProtocol and SF.SyncProtocol.PROTO_CURRENT) or nil })
+
+    if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
 end
 
 -- ============================================================================
@@ -559,12 +696,53 @@ end
 -- @param payload table {sessionId, profileId, ...}
 -- @return nil
 function Sync:HandleAdminSync(sender, payload)
+    if type(payload) ~= "table" then return end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return end
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if type(payload.adminSyncId) ~= "string" or payload.adminSyncId == "" then return end
+
+    -- Only respond to authorized admins (no leaking logs to non-admins)
+    if not self:IsSenderAuthorized(payload.profileId, sender) then
+        if SF.PrintWarning then
+            SF:PrintWarning(("Ignoring ADMIN_SYNC from %s for profile %s: not an admin."):format(sender, payload.profileId))
+        end
+        return
+    end
+
+    local sid = payload.sessionId
+    local pid = payload.profileId
+    local asid = payload.adminSyncId
+
+    self:RunWithJitter(self.cfg.adminReplyJitterMsMin, self.cfg.adminReplyJitterMsMax, function()
+        local status = self:BuildAdminStatus(pid)
+        status.sessionId = sid
+        status.profileId = pid
+        status.adminSyncId = asid
+
+        if SF.LootHelperComm then
+            SF.LootHelperComm:Send("CONTROL", self.MSG.ADMIN_STATUS, status, "WHISPER", sender, "NORMAL")
+        end
+    end)
 end
 
 -- Function Build an ADMIN_STATUS payload for the requested profileId.
 -- @param profileId string Profile id to build status for
 -- @return table status {sessionId, profileId, hasProfile, authorMax, hasGaps?}
 function Sync:BuildAdminStatus(profileId)
+    local status = {
+        hasProfile = false,
+        authorMax = {},
+        addonVersion = self:_GetAddonVersion(),
+    }
+
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        return status
+    end
+
+    status.hasProfile = true
+    status.authorMax = self:ComputeAuthorMax() or {}
+    return status
 end
 
 -- Function Handles ADMIN_STATUS as coordinator: record status and request missing logs if needed.
@@ -572,6 +750,33 @@ end
 -- @param payload table ADMIN_STATUS payload
 -- @return nil
 function Sync:HandleAdminStatus(sender, payload)
+    if not self.state.active or not self.state.isCoordinator then return end
+    if type(payload) ~= "table" then return end
+
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then return end
+
+    local conv = self.state._adminConvergence
+    if not conv then return end
+    if payload.adminSyncId ~= conv.adminSyncId then return end
+
+    -- Only accept status from authorized admins
+    if not self:IsSenderAuthorized(self.state.profileId, sender) then return end
+
+    self.state.adminStatuses = self.state.adminStatuses or {}
+    self.state.adminStatuses[sender] = payload
+
+    -- Early finalize if all expected responded
+    local all = true
+    for admin, _ in pairs(conv.expected) do
+        if not self.state.adminStatuses[admin] then
+            all = false
+            break
+        end
+    end
+    if all then
+        self:FinalizeAdminConvergence()
+    end
 end
 
 -- Function Handle SES_REANNOUNCE (typically after coordinator takeover).
@@ -642,6 +847,50 @@ end
 -- @param payload table {sessionId, requestId, profileId, author, fromCounter, toCounter?}
 -- @return nil
 function Sync:HandleLogRequest(sender, payload)
+    if type(payload) ~= "table" then return end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return end
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if type(payload.requestId) ~= "string" or payload.requestId == "" then return end
+    if type(payload.author) ~= "string" or payload.author == "" then return end
+    if type(payload.fromCounter) ~= "number" then return end
+    local toCounter = payload.toCounter
+    if toCounter ~= nil and type(toCounter) ~= "number" then return end
+
+    -- Only send logs to admins. Members will use the Need Logs workflow.
+    if not self:IsSenderAuthorized(payload.profileId, sender) then
+        if SF.PrintWarning then
+            SF:PrintWarning(("Ignoring LOG_REQ from %s for profile %s: not an admin."):format(sender, payload.profileId))
+        end
+        return
+    end
+
+    local profile = self:FindLocalProfileById(payload.profileId)
+    if not profile then return end
+
+    local fromC = math.max(1, math.floor(payload.fromCounter))
+    local toC = (toCounter and math.floor(toCounter)) or fromC
+
+    local out = {}
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        local author = log:GetAuthor()
+        local counter = log:GetCounter()
+        if author == payload.author and type(counter) == "number" and counter >= fromC and counter <= toC then
+            table.insert(out, log:ToTable())
+        end
+    end
+
+    local resp = {
+        sessionId   = payload.sessionId,
+        profileId   = payload.profileId,
+        adminSyncId = payload.adminSyncId,
+        requestId   = payload.requestId,
+        author      = payload.author,
+        logs        = out,
+    }
+
+    if SF.LootHelperComm then
+        SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK")
+    end
 end
 
 -- Function Record a handshake reply from a peer during the handshake collection window.
@@ -682,6 +931,29 @@ end
 -- @param payload table {sessionId, requestId, profileId, author, logs =[...]}
 -- @return nil
 function Sync:HandleAuthLogs(sender, payload)
+    if not self.state.active or not self.state.isCoordinator then return end
+    if type(payload) ~= "table" then return end
+
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then return end
+
+    local conv = self.state._adminConvergence
+    if not conv then return end
+    if payload.adminSyncId ~= conv.adminSyncId then return end
+    if type(payload.requestId) ~= "string" then return end
+    if not conv.pendingReq[payload.requestId] then return end
+
+    -- Merge (dedupe by logId happens in LootProfile:MergeLogTables)
+    self:MergeLogs(self.state.profileId, payload.logs)
+
+    -- Mark this request done
+    conv.pendingReq[payload.requestId] = nil
+    conv.pendingCount = math.max(0, (conv.pendingCount or 1) - 1)
+
+    if conv.pendingCount == 0 then
+        self.state._adminConvergence = nil
+        self:BroadcastSessionStart()
+    end
 end
 
 -- Function Handle PROFILE_SNAPSHOT; import profile + logs then rebuild derived state.
@@ -848,6 +1120,12 @@ end
 -- @param logs table Array of log tables
 -- @return boolean changed True if any new logs were added, false otherwise
 function Sync:MergeLogs(profileId, logs)
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then return false end
+    if type(logs) ~= "table" then return false end
+
+    local inserted = profile:MergeLogTables(logs, { allowUnknownEventType = true })
+    return inserted and inserted > 0
 end
 
 -- Function Rebuild derived state from logs (replay) for the given profile.
