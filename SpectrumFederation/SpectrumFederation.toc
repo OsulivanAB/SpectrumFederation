@@ -9,6 +9,14 @@
 ## SavedVariables: SpectrumFederationDB, SpectrumFederationDebugDB
 
 ## Core files
+
+# --- Libs ---
+Libs/LibStub/LibStub.lua
+Libs/CallbackHandler/CallbackHandler-1.0.lua
+Libs/AceComm/ChatThrottleLib.lua
+Libs/AceComm/AceComm-3.0.lua
+
+# --- Modules --- 
 modules/Debug.lua
 modules/SlashCommands.lua
 modules/MessageHelpers.lua
