@@ -63,6 +63,7 @@ SF.WOW_CLASSES = {
 function SF:GetPlayerInfo()
     local name = UnitName("player")
     local realm = GetRealmName()
+    if realm then realm = realm:gsub("%s+", "") end -- Remove spaces from realm name
     if SF.Debug then SF.Debug:Verbose("PROFILES", "Retrieved player info: %s-%s", name, realm) end
     return name, realm
 end
