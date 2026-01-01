@@ -142,3 +142,15 @@ end
 function SF:Now()
     return (GetServerTime and GetServerTime()) or time()
 end
+
+-- Get the addon's current version from metadata
+-- @return string version Addon version or "Unknown" if not found
+function SF:GetAddonVersion()
+    if C_AddOns and C_AddOns.GetAddOnMetadata then
+        return C_AddOns.GetAddOnMetadata(addonName, "Version") or "Unknown"
+    end
+    if GetAddOnMetadata then
+        return GetAddOnMetadata(addonName, "Version") or "Unknown"
+    end
+    return "Unknown"
+end

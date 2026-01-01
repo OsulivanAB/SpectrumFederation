@@ -38,11 +38,8 @@ end
 -- @param none
 -- @return string Addon version
 local function GetAddonVersion()
-    if C_AddOns and C_AddOns.GetAddOnMetadata then
-        return C_AddOns.GetAddOnMetadata(addonName, "Version") or "unknown"
-    end
-    if GetAddOnMetadata then
-        return GetAddonOnMetadata(addonName, "Version") or "unknown"
+    if SF.GetAddonVersion then
+        return SF:GetAddonVersion()
     end
     return "unknown"
 end

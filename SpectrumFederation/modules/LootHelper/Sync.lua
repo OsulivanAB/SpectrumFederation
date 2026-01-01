@@ -26,6 +26,9 @@ Sync.MSG = {
     SES_START       = "SES_START",
     SES_REANNOUNCE  = "SES_REANNOUNCE",
     SES_END         = "SES_END",
+    HAVE_PROFILE    = "HAVE_PROFILE",
+    NEED_PROFILE    = "NEED_PROFILE",
+    NEED_LOGS       = "NEED_LOGS",
 
     -- Live Updates (Sequence 3)
     NEW_LOG         = "NEW_LOG",
@@ -47,7 +50,9 @@ Sync.cfg = Sync.cfg or {
     memberReplyJitterMsMax = 500,
 
     requestTimeoutSec = 5,
-    maxRetries = 2
+    maxRetries = 2,
+
+    handleshakeCollectSec = 3,  -- how long coordinator waits for HAVE/NEED replies
 }
 
 Sync.state = Sync.state or {
@@ -194,17 +199,7 @@ function Sync:StartSession(profileId, opts)
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
 
-    local payload = {
-        sessionId = sessionId,
-        profileId = profileId,
-        coordinator = me,
-        coordEpoch = epoch,
-    }
-
-    if SF.LootHelperComm then
-        SF.LootHelperComm:Send("CONTROL", self.MSG.SES_START, payload, dist, nil, "ALERT")
-    end
-
+    self:BroadcastSessionStart()
     return sessionId
 end
 
@@ -256,12 +251,70 @@ end
 -- @param none
 -- @return nil
 function Sync:BroadcastSessionStart()
+    if not self.state.active or not self.state.isCoordinator then return end
+
+    local dist = GetGroupDistribution()
+    if not dist then return end
+
+    local profileId = self.state.profileId
+    self.state.authorMax = self:ComputeAuthorMax(profileId) or {}
+
+    local payload = {
+        sessionId   = self.state.sessionId,
+        profileId   = profileId,
+        coordinator = self.state.coordinator,
+        coordEpoch  = self.state.coordEpoch,
+        authorMax   = self.state.authorMax,
+    }
+
+    -- reset handshake bookkeeping
+    self.state.handshake = {
+        sessionId = self.state.sessionId,
+        startedAt = Now(),
+        deadlineAt = Now() + (self.cfg.handshakeCollectSec or 3),
+        replies = {},   -- [sender] = "HAVE_PROFILE"|"NEED_PROFILE"|"NEED_LOGS"
+    }
+
+    if SF.LootHelperComm then
+        SF.LootHelperComm:Send("CONTROL", self.MSG.SES_START, payload, dist, nil, "ALERT")
+    end
+
+    -- timeout window: after N seconds, summarize what we heard
+    local sid = self.state.sessionId
+    self:RunAfter(self.cfg.handshakeCollectSec or 3, function()
+        -- Only finalize if session unchanged and we are still coordinator
+        if not self.state.active or not self.state.isCoordinator then return end
+        if self.state.sessionId ~= sid then return end
+        self:FinalizeHandshakeWindow()
+    end)
 end
 
 -- Function Broadcast coordinator takeover message (COORD_TAKEOVER).
 -- @param none
 -- @return nil
 function Sync:BroadcastCoordinatorTakeover()
+end
+
+function Sync:FinalizeHandshakeWindow()
+    if not self.state.isCoordinator then return end
+    if not self.state.handshake then return end
+
+    self:UpdatePeersFromRoster()
+
+    local have, needProf, needLogs, noResp = 0, 0, 0, 0
+    for name, peer in pairs(self.state.peers or {}) do
+        if peer.inGroup then
+            if peer.joinStatus == "HAVE_PROFILE" then have = have + 1
+            elseif peer.joinStatus == "NEED_PROFILE" then needProf = needProf + 1
+            elseif peer.joinStatus == "NEED_LOGS" then needLogs = needLogs + 1
+            else noResp = noResp + 1 end
+        end
+    end
+
+    if SF.PrintInfo then
+        SF:PrintInfo(("Handshake complete: %d have, %d need profile, %d need logs, %d no response"):
+            format(have, needProf, needLogs, noResp))
+    end
 end
 
 -- ============================================================================
@@ -298,19 +351,21 @@ function Sync:HandleSessionStart(sender, payload)
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = (payload.coordinator == SelfId())
 
-    self:TouchPeer(sender, { proto = payload.proto, inGroup = true })
-    -- TODO: Add Jitter
-    local ack = {
-        sessionId = self.state.sessionId,
-        profileId = self.state.profileId,
-        supportedMin = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
-        supportedMax = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
-        addonVersion = (C_AddOns and C_AddOns.GetAddOnMetadata) and C_AddOns:GetAddOnMetadata(addonName, "Version") or nil,
-    }
-
-    if SF.LootHelperComm then
-        SF.LootHelperComm:Send("CONTROL", self.MSG.COORD_ACK, ack, "WHISPER", self.state.coordinator, "NORMAL")
+    if type(payload.authorMax) == "table" then
+        self.state.authorMax = payload.authorMax
+    else
+        self.state.authorMax = {}
     end
+
+    -- Reply after jitter
+    local sid = self.state.sessionId
+    self:RunWithJitter(self.cfg.memberReplyJitterMsMin, self.cfg.memberReplyJitterMsMax, function()
+        -- Ensure session didn't change during the delay
+        if not self.state.active or self.state.sessionId ~= sid then return end
+        self:SendJoinStatus()
+    end)
+
+    self:TouchPeer(sender, { proto = payload.proto, inGroup = true })
 end
 
 -- Function Pick helper for a given player deterministically (e.g. hash(name) % #helpers).
@@ -327,13 +382,60 @@ end
 function Sync:GetRequestTargets(helpers, coordinator)
 end
 
--- TODO: Currently we don't have author maxCounterSeen maps readily obtainable or stored anywhere
 -- Function Determine whether local client has the session profile and whether it's missing logs.
 -- @param profileId string Session profile id
 -- @param sessionAuthorMax table Map [author] = maxCounterSeen
 -- @return boolean hasProfile True if local has profile, false otherwise
 -- @return table missingRequests Array describing needed missing log ranges (implementation-defined)
 function Sync:AssessLocalState(profileId, sessionAuthorMax)
+end
+
+function Sync:SendJoinStatus()
+    if not self.state.active then return end
+    if not self.state.sessionId then return end
+    if not self.state.coordinator then return end
+    if self.state.isCoordinator then return end
+
+    -- Prevent duplicate replies to repeated SES_START for the same session.
+    if self.state._sentJoinStatusForSessionId == self.state.sessionId then
+        return
+    end
+    self.state._sentJoinStatusForSessionId = self.state.sessionId
+
+    local profileId = self.state.profileId
+    local payloadBase = {
+        sessionId       = self.state.sessionId,
+        profileId       = profileId,
+        supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
+        supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
+        addonVersion    = self:_GetAddonVersion(),
+    }
+
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        if SF.LootHelperComm then
+            SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, payloadBase, "WHISPER", self.state.coordinator, "NORMAL")
+        end
+        return
+    end
+
+    local localAuthorMax = profile:ComputeAuthorMax()
+    payloadBase.localAuthorMax = localAuthorMax
+
+    local remoteAuthorMax = self.state.authorMax or {}
+    local missing = self:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax)
+
+    if missing and #missing > 0 then
+        payloadBase.missing = missing
+        if SF.LootHelperComm then
+            SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, payloadBase, "WHISPER", self.state.coordinator, "NORMAL")
+        end
+        return
+    end
+
+    if SF.LootHelperComm then
+        SF.LootHelperComm:Send("CONTROL", self.MSG.HAVE_PROFILE, payloadBase, "WHISPER", self.state.coordinator, "NORMAL")
+    end
 end
 
 -- ============================================================================
@@ -373,11 +475,17 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
         return self:HandleSessionStart(sender, payload)
     end
 
-    if msgType == self.MSG.COORD_ACK then
-        return self:HandleCoordinatorAck(sender, payload)
+    if msgType == self.MSG.HAVE_PROFILE then
+        return self:HandleHaveProfile(sender, payload)
     end
 
-    -- TODO: Add other control message handlers here
+    if msgType == self.MSG.NEED_PROFILE then
+        return self:HandleNeedProfile(sender, payload)
+    end
+
+    if msgType == self.MSG.NEED_LOGS then
+        return self:HandleNeedLogs(sender, payload)
+    end
 end
 
 -- Function Route an incoming BULK message to the appropriate handler.
@@ -452,11 +560,28 @@ function Sync:HandleCoordinatorAck(sender, payload)
     end
 end
 
+-- Function Handle HAVE_PROFILE as a helper/coordinator: record that peer has profile.
+-- @param sender string "Name-Realm" of sender
+-- @param payload table {sessionId, requestId, profileId}
+-- @return nil
+function Sync:HandleHaveProfile(sender, payload)
+    self:_RecordHandshakeReply(sender, payload, "HAVE_PROFILE")
+end
+
 -- Function Handle NEED_PROFILE as a helper/coordinator: respond with PROFILE_SNAPSHOT (bulk).
 -- @param sender string "Name-Realm" of sender
 -- @param payload table {sessionId, requestId, profileId}
 -- @return nil
 function Sync:HandleNeedProfile(sender, payload)
+    self:_RecordHandshakeReply(sender, payload, "NEED_PROFILE")
+end
+
+-- Function Handle NEED_LOGS as a helper/coordinator: record that peer needs logs.
+-- @param sender string "Name-Realm" of sender
+-- @param payload table {sessionId, requestId, profileId}
+-- @return nil
+function Sync:HandleNeedLogs(sender, payload)
+    self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
 end
 
 -- Function Handle LOG_REQ as a helper/admin: respond with AUTH_LOGS (bulk).
@@ -464,6 +589,35 @@ end
 -- @param payload table {sessionId, requestId, profileId, author, fromCounter, toCounter?}
 -- @return nil
 function Sync:HandleLogRequest(sender, payload)
+end
+
+-- Function Record a handshake reply from a peer during the handshake collection window.
+-- @param sender string "Name-Realm" of sender
+-- @param payload table Handshake reply payload
+-- @param status string "HAVE_PROFILE"|"NEED_PROFILE"|"NEED_LOGS"
+-- @return nil
+function Sync:_RecordHandshakeReply(sender, payload, status)
+    if not self.state.isCoordinator then return end
+
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then return end
+
+    local peer = self:GetPeer(sender)
+    peer.joinStatus = status
+    peer.joinReportedAt = Now()
+
+    if type(payload) == "table" then
+        peer.supportedMin = payload.supportedMin
+        peer.supportedMax = payload.supportedMax
+        peer.addonVersion = payload.addonVersion
+        peer.localAuthorMax = payload.localAuthorMax
+        peer.missing = payload.missing
+    end
+
+    -- Track in handshake table too
+    if self.state.handshake and self.state.handshake.replies then
+        self.state.handshake.replies[sender] = status
+    end
 end
 
 -- ============================================================================
@@ -604,6 +758,12 @@ end
 -- @param profileId string Stable profile id
 -- @return table snapshotPayload Map [author] = maxCounterSeen
 function Sync:ComputeAuthorMax(profileId)
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then return {} end
+    if profile.ComputeAuthorMax then
+        return profile:ComputeAuthorMax()
+    end
+    return {}
 end
 
 -- Function Compute missing log ranges given local authorMax and remote authorMax (or detect gaps).
@@ -611,6 +771,23 @@ end
 -- @param remoteAuthorMax table Map [author] = maxCounterSeen
 -- @return table missingRequests Array describing needed author/range requests.
 function Sync:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax)
+    local missing = {}
+    if type(remoteAuthorMax) ~= "table" then return missing end
+    localAuthorMax = localAuthorMax or {}
+
+    for author, remoteMax in pairs(remoteAuthorMax) do
+        if type(author) == "string" and type(remoteMax) == "number" then
+            local localMax = tonumber(localAuthorMax[author]) or 0
+            if remoteMax > localMax then
+                table.insert(missing, {
+                    author = author,
+                    fromCounter = localMax + 1,
+                    toCounter = remoteMax,
+                })
+            end
+        end
+    end
+    return missing
 end
 
 -- Function Merge incoming logs (net tables) into local profile; dedupe by logId; keep chronological order.
@@ -645,6 +822,13 @@ end
 -- @param fn function Callback to run after delay
 -- @return any handle Optional timer handle
 function Sync:RunWithJitter(minMs, maxMs, fn)
+    if type(fn) ~= "function" then return nil end
+    minMs = tonumber(minMs) or 0
+    maxMs = tonumber(maxMs) or minMs
+    if maxMs < minMs then minMs, maxMs = maxMs, minMs end   -- swap if out of order
+
+    local ms = (maxMs > minMs) and math.random(minMs, maxMs) or minMs
+    return self:RunAfter(ms / 1000, fn)
 end
 
 -- Function Run a callback after a fixed delay (seconds).
@@ -652,6 +836,21 @@ end
 -- @param fn function Callback to run after delay
 -- @return any handle Optional timer handle
 function Sync:RunAfter(delaySec, fn)
+    if type(fn) ~= "function" then return nil end
+    delaySec = tonumber(delaySec) or 0
+
+    if delaySec <= 0 then
+        fn()
+        return nil
+    end
+
+    if C_Timer and C_Timer.NewTimer then
+        return C_Timer.NewTimer(delaySec, fn)
+    end
+
+    -- fallback
+    C_Timer.After(delaySec, fn)
+    return nil
 end
 
 -- ============================================================================
@@ -801,4 +1000,14 @@ local function GetGroupDistribution()
     if IsInRaid() then return "RAID" end
     if IsInGroup() then return "PARTY" end
     return nil
+end
+
+-- Function Get the current addon version string.
+-- @param none
+-- @return string version
+function Sync:_GetAddonVersion()
+    if SF.GetAddonVersion then
+        return SF:GetAddonVersion()
+    end
+    return "unknown"
 end
