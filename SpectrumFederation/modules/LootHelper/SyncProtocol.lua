@@ -250,49 +250,43 @@ end
 -- @param encoded string Encoded payload string
 -- @return table|nil payload
 -- @return string|nil errMsg
-function P.DecodePayloadTable(encoded)
-    if type(encoded) ~= "string" or encoded == "" then
-        return nil, "empty payload"
+function P.DecodePayloadTable(encoded, enc)
+  local enc = enc or P.ENC_B64CBOR
+
+  if not encoded or encoded == "" then
+    return nil, nil
+  end
+
+  if not C_EncodingUtil or not C_EncodingUtil.DecodeBase64 or not C_EncodingUtil.DeserializeCBOR then
+    return nil, "C_EncodingUtil missing required functions"
+  end
+
+  local ok, bytesOrErr = pcall(C_EncodingUtil.DecodeBase64, encoded)
+  if not ok then
+    return nil, "DecodeBase64 failed: " .. tostring(bytesOrErr)
+  end
+
+  local bytes = bytesOrErr
+
+  if enc == P.ENC_B64CBORZ then
+    if not P.CanCompress() then
+      return nil, "Compression not available (ENC_B64CBORZ)"
     end
-
-    enc = enc or P.ENC_B64CBOR
-
-    -- 1) base64 -> bytes
-    local raw = C_EncodingUtil.DecodeBase64(encoded)
-    if not raw then
-        return nil, "DecodeBase64 failed"
+    local ok2, outOrErr = pcall(C_EncodingUtil.DecompressString, P.GetDeflateMethod(), bytes)
+    if not ok2 then
+      return nil, "DecompressString failed: " .. tostring(outOrErr)
     end
+    bytes = outOrErr
+  elseif enc ~= P.ENC_B64CBOR then
+    return nil, "Unsupported encoding: " .. tostring(enc)
+  end
 
-    local cbor = raw
+  local ok3, tblOrErr = pcall(C_EncodingUtil.DeserializeCBOR, bytes)
+  if not ok3 then
+    return nil, "DeserializeCBOR failed: " .. tostring(tblOrErr)
+  end
 
-    -- 2) optional decompression
-    if enc == P.ENC_B64CBORZ then
-        if not P.CanCompress() then
-            return nil, "compression unavailable"
-        end
-
-        local method = GetDeflateMethod()
-
-        -- DecompressString can throw / error in some cases; protect with pcall.
-        -- See WoWUIBugs issue describing false "Internal decompression error"
-        -- TODO: Do we have a way to recover from the error if it happens? Re-Request or retry or something?
-        local ok2, decompressed = pcall(C_EncodingUtil.DecompressString, raw, method)
-        if not ok2 or not decompressed then
-            return nil, "DecompressString failed"
-        end
-
-        cbor = decompressed
-    elseif enc ~= P.ENC_B64CBOR then
-        return nil, "unsupported encoding"
-    end
-
-    -- 3) CBOR -> table
-    local ok3, t = pcall(C_EncodingUtil.DeserializeCBOR, cbor)
-    if not ok3 or type(t) ~= "table" then
-        return nil, "DeserializeCBOR failed"
-    end
-
-    return t, nil
+  return tblOrErr, nil
 end
 
 -- ================================================================

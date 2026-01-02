@@ -912,7 +912,7 @@ function Sync:HandleNeedLogs(sender, payload)
     if type(payload) ~= "table" then return end
     local ok = self:ValidateSessionPayload(payload)
     if not ok then return end
-    
+
     self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
 
     if not self.state.active or not self.state.isCoordinator then return end
@@ -1308,7 +1308,7 @@ function Sync:CreateProfileFromMeta(profileMeta)
     profile._members = {}
     profile._adminUsers = {}
     profile._activeProfile = false
-
+    profile._profileId = profileMeta._profileId
     profile._profileName = profileMeta._profileName or "Imported Profile"
 
     return profile

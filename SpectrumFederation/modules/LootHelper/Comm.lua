@@ -178,59 +178,43 @@ end
 -- @param prio string or nil - the AceComm priority (overrides config)
 -- @return true if sent, false on error
 function Comm:Send(kind, msgType, payload, distribution, target, prio, opts)
-    opts = opts or {}
+  opts = opts or {}
+  local SP = SF.SyncProtocol
+  if not SP then return false, "SyncProtocol missing" end
 
-    local SP = SF.SyncProtocol
-    if not SP then 
-        error("SF.SyncProtocol not loaded. Load SyncProtocol.lua before Comm.lua")
+  if kind ~= "CONTROL" and kind ~= "BULK" then
+    return false, "invalid kind: " .. tostring(kind)
+  end
+  if type(msgType) ~= "string" or msgType == "" then
+    return false, "msgType required"
+  end
+
+  -- Decide encoding
+  local enc
+  if payload == nil then
+    enc = SP.ENC_NONE
+  elseif opts.enc then
+    enc = opts.enc
+  elseif kind == "BULK" and SP.CanCompress and SP.CanCompress() then
+    enc = SP.ENC_B64CBORZ
+  else
+    enc = SP.ENC_B64CBOR
+  end
+
+  local payloadStr = ""
+  if payload ~= nil then
+    local encoded, err = SP.EncodePayloadTable(payload, enc)
+    if not encoded then
+      return false, "encode failed: " .. tostring(err)
     end
+    payloadStr = encoded
+  end
 
-    local enc
-    if opts.enc then
-        enc = opts.enc
-    else
-        -- default behavior:
-        -- CONTROL: uncompressed
-        -- BULK: compressed
-        if kind == "BULK" and SP.CanCompress() then
-            enc = SP.ENC_B64CBORZ
-        else
-            enc = SP.ENC_B64CBOR
-        end
-    end
+  local prefix = (kind == "BULK") and self.PREFIX.BULK or self.PREFIX.CONTROL
+  local envelope = SP.PackEnvelope(msgType, SP.PROTO_CURRENT, enc, payloadStr)
 
-    local prefix = (kind == "BULK") and self.PREFIX.BULK or self.PREFIX.CONTROL
-
-    local proto = SP.PROTO_CURRENT
-    local enc = SP.ENC_NONE
-    local payloadStr = ""
-
-    if payload ~= nil then
-        local encoded, err = SP.EncodePayloadTable(payload, enc)
-
-        -- Fallback: if compression chosen but unavailable, retry uncompressed
-        if not encoded and enc == SP.ENC_B64CBORZ then
-            enc = SP.ENC_B64CBOR
-            encoded, err = SP.EncodePayloadTable(payload, enc)
-        end
-
-        if not encoded then
-            DError("EncodePayloadTable failed for %s: %s", tostring(msgType), tostring(err))
-            return false
-        end
-        payloadStr = encoded
-    else
-        enc = SP.ENC_NONE
-    end
-
-    local envelope = SP.PackEnvelope(msgType, proto, enc, payloadStr)
-
-    prio = prio
-        or ((kind == "BULK") and self.cfg.bulkPrio or self.cfg.controlPrio)
-        or "NORMAL"
-
-    self:SendCommMessage(prefix, envelope, distribution, target, prio)
-    return true
+  self:SendCommMessage(prefix, envelope, distribution, target, prio or "NORMAL")
+  return true
 end
 
 -- =====================================================================
@@ -307,7 +291,14 @@ function Comm:_HandleIncoming(kind, text, distribution, sender)
     -- 4) Decode payload
     local payload = nil
     if enc ~= SP.ENC_NONE and payloadStr and payloadStr ~= "" then
-        payload, err = SP.DecodePayloadTable(payloadStr)
+        local payload, err = nil, nil
+        if payloadStr and payloadStr ~= "" and enc ~= SP.ENC_NONE then
+            payload, err = SP.DecodePayloadTable(payloadStr, enc)
+            if err then
+                DVerbose("Drop: bad payload decode from %s (%s)", sender, tostring(err))
+                return
+            end
+        end
         if not payload then
             DError("Drop: payload decode failed from %s type=%s err=%s", tostring(sender), tostring(msgType), tostring(err))
             return
@@ -331,7 +322,7 @@ function Comm:_Dispatch(kind, msgType, sender, payload, distribution, proto)
     if fn then 
         local ok, err = pcall(fn, sender, payload, distribution, proto)
         if not ok then
-            DErr("Handler error kind=%s type=%s from=%s err=%s", tostring(kind), tostring(msgType), tostring(sender), tostring(err))
+            DError("Handler error kind=%s type=%s from=%s err=%s", tostring(kind), tostring(msgType), tostring(sender), tostring(err))
         end
         return
     end
