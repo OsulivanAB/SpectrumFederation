@@ -1,6 +1,10 @@
 name: PR Beta Documentation Sync
 
 on:
+  pull_request_target:
+    branches:
+      - beta
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -14,13 +18,14 @@ permissions:
   issues: write
 
 concurrency:
-  group: docs-sync-${{ github.event.inputs.pr_number }}
+  group: docs-sync-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
   analyze-and-update-docs:
     name: Analyze Changes and Update Documentation
     runs-on: ubuntu-latest
+    environment: documentation-sync
 
     steps:
       - name: Get PR details
@@ -28,10 +33,18 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            // Determine PR number based on trigger type
+            const prNumber = context.payload.pull_request?.number || ${{ github.event.inputs.pr_number || 0 }};
+
+            if (!prNumber) {
+              core.setFailed('Could not determine PR number');
+              return;
+            }
+
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: ${{ github.event.inputs.pr_number }}
+              pull_number: prNumber
             });
 
             // Verify PR targets beta
@@ -40,6 +53,7 @@ jobs:
               return;
             }
 
+            core.setOutput('pr_number', pr.data.number);
             core.setOutput('head_ref', pr.data.head.ref);
             core.setOutput('head_sha', pr.data.head.sha);
             core.setOutput('base_ref', pr.data.base.ref);
@@ -69,7 +83,7 @@ jobs:
         id: analyze-docs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          PR_NUMBER: ${{ steps.pr-details.outputs.pr_number }}
           HEAD_REF: ${{ steps.pr-details.outputs.head_ref }}
           BASE_REF: ${{ steps.pr-details.outputs.base_ref }}
         run: |
@@ -79,7 +93,7 @@ jobs:
         id: analyze-copilot
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          PR_NUMBER: ${{ steps.pr-details.outputs.pr_number }}
           HEAD_REF: ${{ steps.pr-details.outputs.head_ref }}
           BASE_REF: ${{ steps.pr-details.outputs.base_ref }}
         run: |
@@ -106,7 +120,7 @@ jobs:
           git commit -m "docs: sync documentation and copilot instructions with code changes
 
           This commit updates documentation and copilot instructions to reflect
-          the code changes made in PR #${{ github.event.inputs.pr_number }}.
+          the code changes made in PR #${{ steps.pr-details.outputs.pr_number }}.
 
           Generated automatically by the docs-sync workflow."
 
@@ -114,7 +128,7 @@ jobs:
         if: steps.check-changes.outputs.has_changes == 'true'
         id: push-changes
         run: |
-          BRANCH_NAME="docs-sync-pr-${{ github.event.inputs.pr_number }}-$(date +%s)"
+          BRANCH_NAME="docs-sync-pr-${{ steps.pr-details.outputs.pr_number }}-$(date +%s)"
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
 
           git checkout -b "$BRANCH_NAME"
@@ -129,12 +143,12 @@ jobs:
             const { data: newPR } = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: 'docs: sync documentation for PR #${{ github.event.inputs.pr_number }}',
+              title: 'docs: sync documentation for PR #${{ steps.pr-details.outputs.pr_number }}',
               head: '${{ steps.push-changes.outputs.branch_name }}',
               base: '${{ steps.pr-details.outputs.head_ref }}',
               body: `## Documentation Sync
 
-            This PR contains suggested documentation and copilot instruction updates based on the code changes in PR #${{ github.event.inputs.pr_number }}.
+            This PR contains suggested documentation and copilot instruction updates based on the code changes in PR #${{ steps.pr-details.outputs.pr_number }}.
 
             ### What was analyzed:
             - Code changes between \`${{ steps.pr-details.outputs.head_ref }}\` and \`beta\`
@@ -146,7 +160,7 @@ jobs:
             1. Review the suggested changes
             2. Make any necessary adjustments
             3. Merge this PR into the original PR branch
-            4. The original PR #${{ github.event.inputs.pr_number }} will then include these documentation updates
+            4. The original PR #${{ steps.pr-details.outputs.pr_number }} will then include these documentation updates
 
             ---
             🤖 Generated automatically by the documentation sync workflow
@@ -164,7 +178,7 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: ${{ github.event.inputs.pr_number }},
+              issue_number: ${{ steps.pr-details.outputs.pr_number }},
               body: `## 📚 Documentation Sync Complete
 
             I've analyzed your code changes and created PR #${{ steps.create-pr.outputs.pr_number }} with suggested documentation updates.
@@ -196,7 +210,7 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: ${{ github.event.inputs.pr_number }},
+              issue_number: ${{ steps.pr-details.outputs.pr_number }},
               body: `## 📚 Documentation Sync Complete
 
             I've analyzed your code changes and determined that no documentation updates are needed! ✨
