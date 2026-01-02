@@ -1,0 +1,66 @@
+---
+name: Manage Blocked Issues
+
+'on':
+  issues:
+    types: [opened, edited, closed, reopened, deleted]
+  # Note: GitHub doesn't have direct webhooks for issue relationships
+  # changes. This workflow will run when issues are edited (which
+  # includes relationship changes) and on a schedule to catch any
+  # missed updates
+  schedule:
+    # Run every 30 minutes to catch relationship changes
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: >-
+          Issue number to check (optional, checks all if not provided)
+        required: false
+        type: string
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  manage-blocked-status:
+    name: Update Blocked Status
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Determine issue to check
+        id: issue
+        run: |
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            echo "issue_number=${{ github.event.issue.number }}" >> \
+              $GITHUB_OUTPUT
+            echo "check_single=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+               [ -n "${{ inputs.issue_number }}" ]; then
+            echo "issue_number=${{ inputs.issue_number }}" >> \
+              $GITHUB_OUTPUT
+            echo "check_single=true" >> $GITHUB_OUTPUT
+          else
+            echo "check_single=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update blocked status
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROJECT_NUMBER: 1
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.issue_number }}
+          CHECK_SINGLE: ${{ steps.issue.outputs.check_single }}
+        run: python3 .github/scripts/manage_blocked_issues.py
