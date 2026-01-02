@@ -727,6 +727,48 @@ end
 -- @param logTable table A network-safe representation of the lootLog entry
 -- @return nil
 function Sync:BroadcastNewLog(profileId, logTable)
+    if not self.state.active then return false, "no active session" end
+    if not self.state.sessionId then return false, "missing sessionId" end
+    if type(profileId) ~= "string" or profileId == "" then return false, "missing profileId" end
+    if self.state.profileId ~= profileId then return false, "wrong profile for session" end
+
+    local dist = GetGroupDistribution()
+    if not dist then return false, "not in group/raid" end
+
+    -- Only admins should be able to push live updates
+    local me = SelfId()
+    if not self:IsSenderAuthorized(profileId, me) then
+        return false, "not authorized to broadcast NEW_LOG"
+    end
+
+    -- Accept either a LootLog object or an already-serialized table
+    if type(logTable) == "table" and logTable.ToTable then
+        logTable = logTable:ToTable()
+    end
+    if type(logTable) ~= "table" then
+        return false, "logTable must be a table (or LootLog instance)"
+    end
+
+    local payload = {
+        sessionId   = self.state.sessionId,
+        profileId   = profileId,
+        log         = logTable,
+    }
+
+    if not SF.LootHelperComm then
+        return false, "LootHelperComm not available"
+    end
+
+    -- Broadcast encoding rule:
+    -- For raid-wide broadcasts, we usually don't know every peer's supportsEnc yet.
+    -- So we pick the safest encoding for now (no compression).
+    local opts = nil
+    if SF.SyncProtocol and SF.SyncProtocol.ENC_B64CBOR then
+        opts = { enc = SF.SyncProtocol.ENC_B64CBOR }
+    end
+
+    SF.LootHelperComm:Send("BULK", self.MSG.NEW_LOG, payload, dist, nil, "NORMAL", opts)
+    return true, nil
 end
 
 -- Function Handle NEW_LOG message; dedupe/apply and request gaps if needed.
