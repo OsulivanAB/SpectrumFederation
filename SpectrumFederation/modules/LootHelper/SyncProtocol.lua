@@ -272,7 +272,7 @@ function P.DecodePayloadTable(encoded, enc)
     if not P.CanCompress() then
       return nil, "Compression not available (ENC_B64CBORZ)"
     end
-    local ok2, outOrErr = pcall(C_EncodingUtil.DecompressString, P.GetDeflateMethod(), bytes)
+    local ok2, outOrErr = pcall(C_EncodingUtil.DecompressString, GetDeflateMethod(), bytes)
     if not ok2 then
       return nil, "DecompressString failed: " .. tostring(outOrErr)
     end

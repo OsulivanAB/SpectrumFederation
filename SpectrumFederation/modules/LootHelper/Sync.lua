@@ -822,13 +822,14 @@ function Sync:HandleNewLog(sender, payload)
         return
     end
 
-    -- Gap Detection
+    -- Gap Detection: Capture local max BEFORE merging
     local author = logTable._author or logTable.author
     local counter = logTable._counter or logTable.counter
 
     local localMaxBefore = nil
-    if type(author) == "string" and type(counter) == "number" then
-        localMaxBefore = (profile.ComputeAuthorMax and (profile:ComputeAuthorMax()[author])) or nil
+    if type(author) == "string" and type(counter) == "number" and profile.ComputeAuthorMax then
+        local authorMaxMap = profile:ComputeAuthorMax()
+        localMaxBefore = authorMaxMap and authorMaxMap[author] or nil
         localMaxBefore = tonumber(localMaxBefore) or nil
     end
 

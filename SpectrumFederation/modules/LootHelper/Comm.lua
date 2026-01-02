@@ -291,7 +291,7 @@ function Comm:_HandleIncoming(kind, text, distribution, sender)
     -- 4) Decode payload
     local payload = nil
     if enc ~= SP.ENC_NONE and payloadStr and payloadStr ~= "" then
-        local payload, err = nil, nil
+        local err = nil
         if payloadStr and payloadStr ~= "" and enc ~= SP.ENC_NONE then
             payload, err = SP.DecodePayloadTable(payloadStr, enc)
             if err then
