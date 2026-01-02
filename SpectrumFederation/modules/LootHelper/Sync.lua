@@ -29,6 +29,7 @@ Sync.MSG = {
     HAVE_PROFILE    = "HAVE_PROFILE",
     NEED_PROFILE    = "NEED_PROFILE",
     NEED_LOGS       = "NEED_LOGS",
+    PROFILE_SNAPSHOT= "PROFILE_SNAPSHOT",
 
     -- Live Updates (Sequence 3)
     NEW_LOG         = "NEW_LOG",
@@ -98,7 +99,6 @@ Sync._nonceCounter = Sync._nonceCounter or 0
 -- Helper Functions (Local)
 -- ============================================================================
 
--- TODO: Maybe make this an addon-wide helper because I think we have similar functions to this elsewhere
 -- Function Return a current epoch time in seconds.
 -- @param none
 -- @return number epochSeconds
@@ -690,6 +690,7 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
     self:TouchPeer(sender, { proto = (SF.SyncProtocol and SF.SyncProtocol.PROTO_CURRENT) or nil })
 
     if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
+    if msgType == self.MSG.PROFILE_SNAPSHOT then return self:HandleProfileSnapshot(sender, payload) end
 end
 
 -- ============================================================================
@@ -837,6 +838,37 @@ end
 -- @return nil
 function Sync:HandleNeedProfile(sender, payload)
     self:_RecordHandshakeReply(sender, payload, "NEED_PROFILE")
+
+    if not self.state.active or not self.state.isCoordinator then return end
+
+    -- Safety: only send to group members (prevents random whisper abuse)
+    -- This is part of the session start pipeline not the admin sync pipeline so we can restrict to group members
+    self:UpdatePeersFromRoster()
+    local peer = self:GetPeer(sender)
+    if not peer or not peer.inGroup then return end
+
+    local snapPayload = self:BuildProfileSnapshot(self.state.profileId)
+    if not snapPayload then
+        if SF.PrintWarning then
+            SF:PrintWarning(("Cannot send PROFILE_SNAPSHOT to %s: no local profile %s."):format(sender, tostring(self.state.profileId)))
+        end
+        return
+    end
+
+    -- Small jitter in case multiple people need it at once
+    self:RunWithJitter(0, 250, function()
+        if not self.state.active or not self.state.isCoordinator then return end
+        if not SF.LootHelperComm then return end
+
+        SF.LootHelperComm:Send(
+            "BULK",
+            self.MSG.PROFILE_SNAPSHOT,
+            snapPayload,
+            "WHISPER",
+            sender,
+            "BULK"
+        )
+    end)
 end
 
 -- Function Handle NEED_LOGS as a helper/coordinator: record that peer needs logs.
@@ -845,6 +877,50 @@ end
 -- @return nil
 function Sync:HandleNeedLogs(sender, payload)
     self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
+
+    if not self.state.active or not self.state.isCoordinator then return end
+
+    self:UpdatePeersFromRoster()
+    local peer = self:GetPeer(sender)
+    if not peer or not peer.inGroup then return end
+
+    if type(payload) ~= "table" or type(payload.missing) ~= "table" then return end
+
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    if not profile then return end
+
+    for _, req in ipairs(payload.missing) do
+        if type(req) == "table"
+            and type(req.author) == "string"
+            and type(req.fromCounter) == "number"
+            and type(req.toCounter) == "number"
+        then
+            local fromC = math.max(1, math.floor(req.fromCounter))    
+            local toC   = math.max(fromC, math.floor(req.toCounter))
+
+            local out = {}
+            for _, log in ipairs(profile:GetLootLogs() or {}) do
+                local author = log:GetAuthor()
+                local counter = log:GetCounter()
+                if author == req.author and type(counter) == "number" and counter >= fromC and counter <= toC then
+                    table.insert(out, log:ToTable())
+                end
+            end
+
+            local resp = {
+                sessionId   = self.state.sessionId,
+                profileId   = self.state.profileId,
+                author      = req.author,
+                fromCounter = fromC,
+                toCounter   = toC,
+                logs        = out,
+            }
+
+            if SF.LootHelperComm then
+                SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK")
+            end
+        end
+    end
 end
 
 -- Function Handle LOG_REQ as a helper/admin: respond with AUTH_LOGS (bulk).
@@ -936,28 +1012,36 @@ end
 -- @param payload table {sessionId, requestId, profileId, author, logs =[...]}
 -- @return nil
 function Sync:HandleAuthLogs(sender, payload)
-    if not self.state.active or not self.state.isCoordinator then return end
     if type(payload) ~= "table" then return end
 
     local ok = self:ValidateSessionPayload(payload)
     if not ok then return end
+    
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if type(payload.logs) ~= "table" then return end
 
-    local conv = self.state._adminConvergence
-    if not conv then return end
-    if payload.adminSyncId ~= conv.adminSyncId then return end
-    if type(payload.requestId) ~= "string" then return end
-    if not conv.pendingReq[payload.requestId] then return end
+    -- Trust policy: If you're not the coordinator, only accept logs from the coordinator
+    -- TODO: Allow Helpers as well
+    if self.state.coordinator and sender ~= self.state.coordinator and not self.state.isCoordinator then
+        return
+    end
 
-    -- Merge (dedupe by logId happens in LootProfile:MergeLogTables)
-    self:MergeLogs(self.state.profileId, payload.logs)
+    self:MergeLogs(payload.profileId, payload.logs)
 
-    -- Mark this request done
-    conv.pendingReq[payload.requestId] = nil
-    conv.pendingCount = math.max(0, (conv.pendingCount or 1) - 1)
+    -- If we are coordinator, this might be part of admin convergence
+    if self.state.isCoordinator then
+        local conv = self.state._adminConvergence
+        if conv and payload.adminSyncId == conv.adminSyncId and type(payload.requestId) == "string" then
+            if conv.pendingReq and conv.pendingReq[payload.requestId] then
+                conv.pendingReq[payload.requestId] = nil
+                conv.pendingCount = math.max(0, (conv.pendingCount or 1) - 1)
 
-    if conv.pendingCount == 0 then
-        self.state._adminConvergence = nil
-        self:BroadcastSessionStart()
+                if conv.pendingCount == 0 then
+                    self.state._adminConvergence = nil
+                    self:BroadcastSessionStart()
+                end
+            end
+        end
     end
 end
 
@@ -966,6 +1050,86 @@ end
 -- @param payload table {sessionId, requestId, profileId, profileMeta, logs=[...], adminUsers=[...], ...}
 -- @return nil
 function Sync:HandleProfileSnapshot(sender, payload)
+    if type(payload) ~= "table" then return end
+
+    -- Must be for the current session
+    local ok, err = self:ValidateSessionPayload(payload)
+    if not ok then return end
+
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if type(payload.snapshot) ~= "table" then return end
+
+    -- Trust policy (minimal): only accept snapshots from the coordinator
+    if self.state.coordinator and sender ~= self.state.coordinator then
+        if SF.PrintWarning then
+            SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not the coordinator (%s)."):format(sender, tostring(self.state.coordinator)))
+        end
+        return
+    end
+
+    -- Validate snapshot
+    if SF.LootProfile and SF.LootProfile.ValidateSnapshot then
+        local okSnap, snapErr = SF.LootProfile.ValidateSnapshot(payload.snapshot)
+        if not okSnap then
+            if SF.PrintWarning then
+                SF:PrintWarning(("PROFILE_SNAPSHOT invalid: %s"):format(snapErr or "unknown"))
+            end
+            return
+        end
+    end
+
+    -- Ensure payload.profileId matches snapshot meta profileId
+    local meta = payload.snapshot.meta
+    if not meta or type(meta._profileId) ~= "string" then return end
+    if payload.profileId ~= meta._profileId then
+        if SF.PrintWarning then
+            SF:PrintWarning(("PROFILE_SNAPSHOT mismatch: payload.profileId=%s meta._profileId=%s"):format(
+                tostring(payload.profileId), tostring(meta._profileId)))
+        end
+        return
+    end
+
+    -- Ensure DB exists
+    SF.lootHelperDB = SF.lootHelperDB or { profiles = {} }
+    SF.lootHelperDB.profiles = SF.lootHelperDB.profiles or {}
+
+    local profileId = payload.profileId
+    local profile = self:FindLocalProfileById(profileId)
+    local isNew = false
+
+    if not profile then
+        profile = self:CreateProfileFromMeta(meta)
+        if not profile then return end
+        isNew = true
+    end
+
+    -- Import snapshot (merges logs + dedup by logId)
+    local okImport, inserted, importErr = profile:ImportSnapshot(payload.snapshot { allowUnknownEventType = true })
+    if not okImport then
+        if SF.PrintWarning then
+            SF:PrintWarning(("PROFILE_SNAPSHOT import failed: %s"):format(importErr or "unknown"))
+        end
+        return
+    end
+
+    if isNew then
+        table.insert(SF.lootHelperDB.profiles, profile)
+    end
+
+    if profile.RebuildLogIndex then
+        profile:RebuildLogIndex()
+    end
+
+    if SF.SetActiveLootProfile and profile.GetProfileName then
+        -- BUG: This function should be using the Profile ID now
+        SF:SetActiveLootProfile(profile:GetProfileName())
+    end
+
+    if SF.PrintInfo then
+        SF:PrintInfo(("Imported PROFILE_SNAPSHOT %s (%d new logs)"):format(
+            profile:GetProfileName() or profileId,
+            inserted or 0))
+    end
 end
 
 -- ============================================================================
@@ -1076,12 +1240,54 @@ end
 -- @param profileMeta table Metadata about the profile (from snapshot)
 -- @return table|nil LootProfile instance or nil if failed
 function Sync:CreateProfileFromMeta(profileMeta)
+    if type(profileMeta ~= "table" then return nil end
+    if not SF.LootProfile then return nil end
+
+    -- Validate meta
+    if SF.LootProfile.ValidateMeta then
+        local ok, err = SF.LootProfile.ValidateMeta(profileMeta)
+        if not ok then
+            if SF.PrintWarning then
+                SF:PrintWarning(("CreateProfileFromMeta: invalid meta: %s"):format(err or "unknown"))
+            end
+            return nil
+        end
+    end
+
+    -- Create a blank profile object
+    local profile = setmetatable({}, SF.LootProfile)
+
+    -- Initialize tables that other code might assume exist
+    profile._lootLogs = {}
+    profile._logIndex = {}
+    profile._authorCounters = {}
+    profile._members = {}
+    profile._adminUsers = {}
+    profile._activeProfile = false
+
+    profile._profileName = profileMeta._profileName or "Imported Profile"
+
+    return profile
 end
 
 -- Function Export a full snapshot for a profile, suitable for PROFILE_SNAPSHOT message.
 -- @param profileId string Stable profile id
 -- @return table|nil Snapshot payload or nil if profile not found
 function Sync:BuildProfileSnapshot(profileId)
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then return nil end
+    if not profile.ExportSnapshot then return nil end
+    
+    local snapshot = profile:ExportSnapshot()
+
+    return {
+        sessionId   = self.state.sessionId,
+        profileId   = profileId,
+        snapshot    = snapshot,
+        sentAt      = Now(),
+        sender      = SelfId(),
+        addonVersion= self:_GetAddonVersion(),
+    }
 end
 
 -- Function Compute authorMax summary from profile's logs.
