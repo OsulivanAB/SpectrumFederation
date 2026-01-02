@@ -57,6 +57,9 @@ Sync.cfg = Sync.cfg or {
     maxRetries = 2,
 
     handshakeCollectSec = 3,  -- how long coordinator waits for HAVE/NEED replies
+
+    maxHelpers = 2,
+    preferNoGaps = true, -- prefer helpers without log gaps when choosing helpers
 }
 
 Sync.state = Sync.state or {
@@ -429,6 +432,9 @@ function Sync:FinalizeAdminConvergence()
         end
     end
 
+    -- 5) choose helpers list
+    self.state.helpers = self:ChooseHelpers(self.state.adminStatuses or {})
+
     -- If no missing logs, start the raid handshake immediately
     if conv.pendingCount == 0 then
         self.state._adminConvergence = nil
@@ -450,6 +456,61 @@ end
 -- @param adminStatuses table Map/array of admin status payloads
 -- @return table helpers Array of "Name-Realm"
 function Sync:ChooseHelpers(adminStatuses)
+    adminStatuses = adminStatuses or {}
+    local SP = SF.SyncProtocol
+    local maxHelpers = tonumber(self.cfg.maxHelpers) or 2
+    if maxHelpers < 0 then maxHelpers = 0 end
+
+    -- Update roster info so peers[] has best-known inGroup/online for raid members
+    self:UpdatePeersFromRoster()
+
+    local me SelfId()
+    local candidates = {}
+
+    for name, st in pairs(adminStatuses) do
+        if name ~= me and type(st) == "table" and st.hasProfile then
+            local peer = self:GetPeer(name) -- may exist from roster or be created
+            local score = 0
+
+            -- Prefer "clean" stores
+            if self.cfg.preferNoGaps and st.hasGaps == false then
+                score = score + 20
+            end
+
+            -- Prefer compression-capable helpers
+            local supportsZ = false
+            if type(st.supportsEnc) == "table" and SP and SP.ENC_B64CBORZ then
+                for _, enc in ipairs(st.supportsEnc) do
+                    if enc == SP.ENC_B64CBORZ then supportsZ = true break end
+                end
+            end
+            if supportsZ then score = score + 10 end
+
+            -- Prefer helpers we can "see" in roster as online/in-group
+            if peer and peer.inGroup then
+                score = score + 5
+                if peer.online == true then
+                    score = score + 50
+                end
+            end
+
+            table.insert(candidates, { name = name, score = score })
+        end
+    end
+    
+    table.sort(candidates, function(a, b)
+        if a.score == b.score then
+            return a.name < b.name
+        end
+        return a.score > b.score
+    end)
+
+    local helpers = {}
+    for i = 1, math.min(maxHelpers, #candidates) do
+        table.insert(helpers, candidates[i].name)
+    end
+
+    return helpers
 end
 
 -- Function Broadcast session start to the raid (SES_START).
@@ -470,6 +531,7 @@ function Sync:BroadcastSessionStart()
         coordinator = self.state.coordinator,
         coordEpoch  = self.state.coordEpoch,
         authorMax   = self.state.authorMax,
+        helpers     = self.state.helpers or {},
     }
 
     -- reset handshake bookkeeping
@@ -560,6 +622,12 @@ function Sync:HandleSessionStart(sender, payload)
         self.state.authorMax = payload.authorMax
     else
         self.state.authorMax = {}
+    end
+
+    if type(payload.helpers) == "table" then
+        self.state.helpers = payload.helpers
+    else
+        self.state.helpers = {}
     end
 
     -- Reply after jitter
@@ -750,7 +818,15 @@ function Sync:BuildAdminStatus(profileId)
     local status = {
         hasProfile = false,
         authorMax = {},
+        hasGaps = false,
         addonVersion = self:_GetAddonVersion(),
+
+        supportedMin = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
+        supportedMax = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
+
+        supportsEnc = (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+                            and SF.SyncProtocol.GetSupportedEncodings()
+                            or nil,
     }
 
     local profile = self:FindLocalProfileById(profileId)
@@ -760,6 +836,29 @@ function Sync:BuildAdminStatus(profileId)
 
     status.hasProfile = true
     status.authorMax = profile:ComputeAuthorMax() or {}
+
+    -- hasGaps heuristic:
+    -- If coutners are 1..max with no missing, then count(author) == max(author).
+    -- If count < max, we're missing at least one counter somewhere (gap).
+    local counts = {}
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        if log and log.GetAuthor then
+            local a = log:GetAuthor()
+            if type(a) == "string" then
+                counts[a] = (counts[a] or 0) + 1
+            end
+        end
+    end
+
+    for author, maxCounter in pairs(status.authorMax) do
+        if type(author) == "string" and type(maxCounter) == "number" then
+            if (counts[author] or 0) < maxCounter then
+                status.hasGaps = true
+                break
+            end
+        end
+    end
+
     return status
 end
 
