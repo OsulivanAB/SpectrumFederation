@@ -10,10 +10,10 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.2.0-beta.3] - 2025-12-31
+## [0.2.0-beta.3] - 2026-01-02
 
 ### Changed
-- Merged updates from the main branch into the beta branch to synchronize features and fixes.
+- Merged updates from the main branch into the beta branch to include the latest features and fixes.
 
 ## [0.1.1] - 2025-12-26
 
