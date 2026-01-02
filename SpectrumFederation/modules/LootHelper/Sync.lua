@@ -776,6 +776,107 @@ end
 -- @param payload table Decoded message payload
 -- @return nil
 function Sync:HandleNewLog(sender, payload)
+    if type(payload) ~= "table" then return end
+
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then return end
+
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if type(payload.log) ~= "table" then return end
+
+    local profileId = payload.profileId
+    local logTable = payload.log
+
+    -- If we don't have the profile yet, request snapshot
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        if not self.state.isCoordinator and self.state.coordinator and SF.LootHelperComm then
+            SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, {
+                sessionId       = self.state.sessionId,
+                profileId       = profileId,
+                supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
+                supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
+                addonVersion    = self:_GetAddonVersion(),
+                supportsEnc     = (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+                                    and SF.SyncProtocol.GetSupportedEncodings()
+                                    or nil,
+            }, "WHISPER", self.state.coordinator, "NORMAL")
+        end
+        return
+    end
+
+    -- Trust policy for live updates:
+    -- Accept from coordinator always; otherwise require sender is an admin of this profile
+    if sender ~= self.state.coordinator then
+        if not self:IsSenderAuthorized(profileId, sender) then
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(sender, profileId))
+            end
+            return
+        end
+    end
+
+    -- Duplicate protection: fast path using logId index if available
+    local logId = logTable._logId or logTable.logId
+    if logId and profile._logIndex and profile._logIndex[logId] then
+        return
+    end
+
+    -- Gap Detection
+    local author = logTable._author or logTable.author
+    local counter = logTable._counter or logTable.counter
+
+    local localMaxBefore = nil
+    if type(author) == "string" and type(counter) == "number" then
+        localMaxBefore = (profile.ComputeAuthorMax and (profile:ComputeAuthorMax()[author])) or nil
+        localMaxBefore = tonumber(localMaxBefore) or nil
+    end
+
+    -- Merge
+    local inserted = self:MergeLogs(profileId, { logTable })
+
+    if not inserted then
+        return
+    end
+
+    if profile.RebuildLogIndex then
+        profile:RebuildLogIndex()
+    end
+
+    -- If we detected a gap, request missing logs
+    if not self.state.isCoordinator and self.state.coordinator
+        and type(author) == "string" and type(counter) == "number"
+        and localMaxBefore ~= nil
+        and counter > (localMaxBefore + 1)
+    then
+        local missing = {
+            {
+                author      = author,
+                fromCounter = localMaxBefore + 1,
+                toCounter   = counter - 1,
+            }
+        }
+
+        if SF.LootHelperComm then
+            SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, {
+                sessionId       = self.state.sessionId,
+                profileId       = profileId,
+                missing         = missing,
+                supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
+                supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
+                addonVersion    = self:_GetAddonVersion(),
+                supportsEnc     = (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+                                    and SF.SyncProtocol.GetSupportedEncodings()
+                                    or nil,
+            }, "WHISPER", self.state.coordinator, "NORMAL")
+        end
+    end
+
+    -- Update UI / derived state
+    -- TODO: Does this already happen in MergeLogTables?
+    if self.RebuildProfile then
+        self:RebuildProfile(profileId)
+    end
 end
 
 -- ============================================================================
@@ -814,6 +915,7 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
 
     if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
     if msgType == self.MSG.PROFILE_SNAPSHOT then return self:HandleProfileSnapshot(sender, payload) end
+    if msgType == self.MSG.NEW_LOG then return self:HandleNewLog(sender, payload) end
 end
 
 -- ============================================================================

@@ -366,7 +366,21 @@ end
 -- @param LootLog lootLog Instance of LootLog to add
 -- @return boolean success
 function LootProfile:AddLootLog(lootLog)
-    return self:_InsertLog(lootLog, { requireAdmin = true })
+    local ok, err = self:_InsertLog(lootLog, { requireAdmin = true })
+    if ok then
+        -- If Sync is loaded, ask it to broadcast this log.
+        -- Sync will no-op unless there is an active session AND the profileId matches.
+        if SF
+            and SF.LootHelperSync
+            and SF.LootHelperSync.BroadcastNewLog
+            and self.GetProfileId
+            and lootLog
+            and lootLog.ToTable
+        then
+            SF.LootHelperSync:BroadcastNewLog(self:GetProfileId(), lootLog:ToTable())        
+        end
+    end
+    return ok, err
 end
 
 -- Function Insert a log entry with dedupe + stable ordering
