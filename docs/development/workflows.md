@@ -66,6 +66,25 @@ graph TB
 3. Moves issues to "Blocked" column if they have open blocking issues
 4. Moves issues to "Todo" column when all blockers are resolved
 
+**Flow Diagram**:
+```mermaid
+graph TB
+    A[Issue Event/Schedule] --> B{Issue in Project?}
+    B -->|No| C[Skip]
+    B -->|Yes| D{Issue Closed?}
+    D -->|Yes| C
+    D -->|No| E[Get Relationships]
+    E --> F{Has Unresolved Blockers?}
+    F -->|Yes| G{Current Status = Blocked?}
+    G -->|Yes| H[No Change]
+    G -->|No| I[Move to Blocked]
+    F -->|No| J{Current Status = Blocked?}
+    J -->|Yes| K[Move to Todo]
+    J -->|No| L{Had Blockers Before?}
+    L -->|Yes| K
+    L -->|No| H
+```
+
 **Jobs**:
 - **manage-blocked-status**: Query relationships and update project status
 
