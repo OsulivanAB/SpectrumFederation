@@ -460,15 +460,19 @@ end
    - Package validation (`.github/scripts/validate_packaging.py`)
    - Version bump check (`.github/scripts/check_version_bump.py`)
    - Duplicate release check (`.github/scripts/check_duplicate_release.py`)
-3. **`pr-beta-docs-sync.yml`** - Manual documentation sync for beta PRs:
+3. **`pr-beta-docs-sync.yml`** - Documentation sync for beta PRs:
+   - Automatically appears on PRs to beta branch
+   - Requires maintainer approval before running (via `documentation-sync` environment)
    - Analyzes code changes vs beta branch
    - Uses GitHub Copilot API to suggest documentation updates
    - Updates MkDocs documentation (`.github/scripts/analyze_docs_changes.py`)
    - Updates copilot instructions (`.github/scripts/analyze_copilot_instructions.py`)
    - Creates PR with suggested changes targeting the feature branch
    - Comments on original PR with link to documentation PR
-   - **Trigger**: Manual via workflow_dispatch with PR number input
+   - **Trigger**: Automatic on `pull_request_target` to beta (requires approval) OR manual via workflow_dispatch with PR number
+   - **Environment**: `documentation-sync` - Must be configured in repository settings with required reviewers
    - **Purpose**: Keep documentation in sync with code changes before merge
+   - **Setup**: See `.github/ENVIRONMENT_SETUP.md` for configuration instructions
 4. **`post-merge-beta.yml`** - Automated beta releases after merge:
    - Sanity checks
    - Blizzard API query for beta Interface version

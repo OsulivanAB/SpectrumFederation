@@ -8,7 +8,7 @@ This guide explains the comprehensive CI/CD workflows for SpectrumFederation, im
 graph TB
     A[Feature Branch] -->|PR to beta| B{PR Validation}
     B -->|Pass| C{Docs Sync}
-    C -->|Manual Trigger| D[Analyze & Create Docs PR]
+    C -->|Approve & Run| D[Analyze & Create Docs PR]
     D --> E[Review & Merge Docs]
     E --> F[Merge to beta]
     C -->|Skip| F
@@ -40,10 +40,15 @@ graph TB
 
 ### 2. Documentation Sync (`pr-beta-docs-sync.yml`)
 
-**Trigger**: Manual (`workflow_dispatch`)  
+**Trigger**: 
+- Automatically on pull requests to `beta` (requires approval to run)
+- Manual via `workflow_dispatch` with PR number input
+
 **Purpose**: Analyze code changes and suggest documentation/copilot instruction updates
 
-**Inputs**:
+**Environment**: `documentation-sync` (requires maintainer approval)
+
+**Inputs** (when manually triggered):
 - `pr_number`: PR number to analyze (required)
 
 **Jobs**:
@@ -57,7 +62,7 @@ graph TB
    - Comment on original PR with link to documentation PR
 
 **Key Features**:
-- Manual trigger only (shows as required check but doesn't block until run)
+- Automatically appears on beta PRs but requires maintainer approval before running
 - Uses GitHub Copilot API to intelligently suggest documentation updates
 - Cross-references code changes with existing docs and copilot instructions
 - Takes into account any docs updates user already made
@@ -65,15 +70,25 @@ graph TB
 - Automatically comments on original PR when complete
 
 **How to Use**:
-1. Open your PR to beta branch
-2. Navigate to Actions → PR Beta Documentation Sync
-3. Click "Run workflow"
-4. Enter your PR number
-5. Review the generated documentation PR
-6. Merge the documentation PR into your feature branch
-7. Your original PR will now have updated documentation
 
-**Note**: This workflow is designed to be a **required workflow** for beta PRs but must be manually triggered when you're ready. It won't block your PR until you run it.
+*Automatic Trigger (Recommended)*:
+1. Open your PR to beta branch
+2. The workflow will appear in the Actions list for your PR
+3. Click "Review pending deployments" when ready
+4. Approve the "documentation-sync" environment
+5. Wait for analysis to complete
+6. Review the generated documentation PR (if created)
+7. Merge the documentation PR into your feature branch
+8. Your original PR will now have updated documentation
+
+*Manual Trigger*:
+1. Navigate to Actions → PR Beta Documentation Sync
+2. Click "Run workflow"
+3. Enter your PR number
+4. Approve the "documentation-sync" environment
+5. Follow steps 6-8 from automatic trigger
+
+**Note**: This workflow requires approval from a maintainer before running. This ensures documentation analysis is performed intentionally and doesn't consume unnecessary resources.
 
 ---
 
@@ -194,13 +209,16 @@ graph TB
    - Get code review approval
 
 4. **Documentation Sync (Optional but Recommended)**
-   - Navigate to Actions → PR Beta Documentation Sync
-   - Click "Run workflow" and enter your PR number
+   - The workflow will automatically appear in your PR's Actions list
+   - When ready, click "Review pending deployments" 
+   - Approve the "documentation-sync" environment to trigger analysis
    - Wait for analysis to complete
-   - Review the generated documentation PR
+   - Review the generated documentation PR (if created)
    - Make any adjustments if needed
    - Merge the documentation PR into your feature branch
    - Your PR now includes updated documentation
+   
+   *Alternative*: You can also trigger manually via Actions → PR Beta Documentation Sync
 
 5. **Merge to Beta**
    - PR is merged to `beta`
