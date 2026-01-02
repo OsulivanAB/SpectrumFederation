@@ -48,6 +48,67 @@ graph TB
 
 **Jobs**:
 1. **analyze-and-update-docs**: Analyze PR changes and create documentation updates
+
+---
+
+### 3. Manage Blocked Issues (`manage-blocked-issues.yml`)
+
+**Trigger**: 
+- Issue events (opened, edited, closed, reopened, deleted)
+- Schedule (every 30 minutes)
+- Manual (`workflow_dispatch`)
+
+**Purpose**: Automatically manage issue status in GitHub Projects v2 based on blocking relationships
+
+**How It Works**:
+1. Monitors issues for changes in relationships (blocking/blocked by)
+2. Checks if an issue has unresolved "blocked by" relationships
+3. Moves issues to "Blocked" column if they have open blocking issues
+4. Moves issues to "Todo" column when all blockers are resolved
+
+**Jobs**:
+- **manage-blocked-status**: Query relationships and update project status
+
+**Inputs** (workflow_dispatch only):
+- `issue_number`: Optional issue number to check (checks all if not provided)
+
+**Example Scenarios**:
+
+| Scenario | Current Status | Blocking Issues | Action |
+|----------|---------------|-----------------|--------|
+| Issue has open blockers | Any | 1+ open | Move to "Blocked" |
+| Issue blockers resolved | Blocked | All closed | Move to "Todo" |
+| Issue has no blockers | Blocked | None | Move to "Todo" |
+| Issue has no blockers | Todo | None | No change |
+
+**Manual Trigger**:
+```bash
+# Check a specific issue
+Navigate to Actions → Manage Blocked Issues
+Enter issue number (e.g., 42)
+Run workflow
+
+# Check all issues
+Navigate to Actions → Manage Blocked Issues
+Leave issue number empty
+Run workflow
+```
+
+**Scheduled Execution**:
+- Runs every 30 minutes automatically
+- Catches relationship changes that may be missed by issue events
+- Ensures project board stays in sync
+
+**Requirements**:
+- Issues must be in GitHub Project #1 ("Spectrum Federation Addon")
+- Project must have "Status" field with "Blocked" and "Todo" options
+- Workflow requires `issues: write` permission
+
+---
+
+### 4. Documentation Sync Details (`pr-beta-docs-sync.yml`)
+
+**How It Works**:
    - Get PR details and verify it targets beta branch
    - Checkout PR branch and fetch beta for comparison
    - Analyze documentation changes using GitHub Copilot API
@@ -77,7 +138,7 @@ graph TB
 
 ---
 
-### 3. Post-Merge Beta (`post-merge-beta.yml`)
+### 5. Post-Merge Beta (`post-merge-beta.yml`)
 
 **Trigger**: Push to `beta` branch (after PR merge)  
 **Purpose**: Automate beta release creation and documentation updates
@@ -93,7 +154,7 @@ graph TB
 
 ---
 
-### 4. Promotion Workflow (`promote-beta-to-main.yml`)
+### 6. Promotion Workflow (`promote-beta-to-main.yml`)
 
 **Trigger**: Manual (`workflow_dispatch`) - Admin only  
 **Purpose**: Promote stable beta version to main branch
@@ -121,7 +182,7 @@ graph TB
 
 ---
 
-### 5. Rollback Workflow (`rollback-release.yml`)
+### 7. Rollback Workflow (`rollback-release.yml`)
 
 **Trigger**: Manual (`workflow_dispatch`) - Admin only  
 **Purpose**: Revert a failed beta→main promotion
@@ -144,7 +205,7 @@ graph TB
 
 ---
 
-### 6. Linter (`linter.yml`)
+### 8. Linter (`linter.yml`)
 
 **Trigger**: Push/PR to `main` or `beta`  
 **Purpose**: Continuous code quality checks
@@ -157,7 +218,7 @@ graph TB
 
 ---
 
-### 7. Deploy Docs (Integrated in `promote-beta-to-main.yml`)
+### 9. Deploy Docs (Integrated in `promote-beta-to-main.yml`)
 
 **Trigger**: During stable release promotion  
 **Purpose**: Deploy MkDocs documentation to GitHub Pages
@@ -427,6 +488,8 @@ graph LR
     
     L[.github/scripts/analyze_docs_changes.py] --> M[pr-beta-docs-sync.yml]
     N[.github/scripts/analyze_copilot_instructions.py] --> M
+    
+    O[.github/scripts/manage_blocked_issues.py] --> P[manage-blocked-issues.yml]
     
     A --> F[post-merge-beta.yml]
     C --> F

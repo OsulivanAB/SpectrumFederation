@@ -133,7 +133,7 @@ After workflow completes:
 
 **Problem**: After promotion, issues are discovered
 
-**Solution**: Use the [rollback workflow](workflows.md#4-rollback-workflow-rollback-releaseyml)
+**Solution**: Use the [rollback workflow](workflows.md#7-rollback-workflow-rollback-releaseyml)
 
 1. Go to **Actions** → **Rollback Release**
 2. Enter the release tag (e.g., `v0.0.17`)
@@ -228,4 +228,4 @@ Use this checklist for each promotion:
 ## Additional Resources
 
 - [CI/CD Workflows Guide](workflows.md) - Complete workflow documentation
-- [Rollback Process](workflows.md#4-rollback-workflow-rollback-releaseyml) - How to revert a promotion
+- [Rollback Process](workflows.md#7-rollback-workflow-rollback-releaseyml) - How to revert a promotion
