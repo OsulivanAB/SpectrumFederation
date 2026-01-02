@@ -464,7 +464,7 @@ function Sync:ChooseHelpers(adminStatuses)
     -- Update roster info so peers[] has best-known inGroup/online for raid members
     self:UpdatePeersFromRoster()
 
-    local me SelfId()
+    local me = SelfId()
     local candidates = {}
 
     for name, st in pairs(adminStatuses) do
