@@ -11,9 +11,66 @@ P.PROTO_CURRENT = 1
 -- Encoding constants
 P.ENC_NONE      = "NONE"
 P.ENC_B64CBOR   = "B64CBOR"
+P.ENC_B64CBORZ  = "B64CBORZ"  -- Base 64 + CBOR + zlib compression
 
 -- Special message type used for graceful fallback
 P.MSG_PROTO_NACK = "PROTO_NACK"
+
+-- ===============================================================
+-- Helpers
+-- ===============================================================
+
+-- Function to get the Deflate compression method enum
+-- @param none
+-- @return Enum.CompressionMethod.Deflate|nil
+local function GetDeflateMethod()
+    return Enum and Enum.CompressionMethod and Enum.CompressionMethod.Deflate or nil
+end
+
+-- Function to determine if compression is available
+-- @param none
+-- @return boolean True if compression is available
+function P.CanCompress()
+    return C_EncodingUtil
+        and C_EncodingUtil.CompressString
+        and C_EncodingUtil.DecompressString
+        and GetDeflateMethod() ~= nil
+end
+
+-- Function to get the list of supported encodings
+-- @param none
+-- @return table List of supported encoding strings
+function P.GetSupportedEncodings()
+    local t = { P.ENC_B64CBOR }
+    if P.CanCompress() then
+        table.insert(t, P.ENC_B64CBORZ)
+    end
+    return t
+end
+
+-- Function to check if a list contains a value
+-- @param list table List to check
+-- @param value any Value to find
+-- @return boolean True if found
+local function ListHas(list, value)
+    if type(list) ~= "table" then return false end
+    for _, v in ipairs(list) do
+        if v == value then
+            return true
+        end
+    end
+    return false
+end
+
+-- Function to pick the best bulk encoding supported by both parties
+-- @param receiverSupportedEnc table List of encoding strings supported by the receiver
+-- @return string Chosen encoding
+function P.PickBestBulkEncoding(receiverSupportedEnc)
+    if P.CanCompress() and ListHas(receiverSupportedEnc, P.ENC_B64CBORZ) then
+        return P.ENC_B64CBORZ
+    end
+    return P.ENC_B64CBOR
+end
 
 -- ================================================================
 -- Throttling (prevent spam)
@@ -121,7 +178,7 @@ function P.ParseEnvelope(text)
         return false, nil, nil, nil, nil, "protocol version is not a number"
     end
 
-    if enc ~= P.ENC_NONE and enc ~= P.ENC_B64CBOR then
+    if enc ~= P.ENC_NONE and enc ~= P.ENC_B64CBOR and enc ~= P.ENC_B64CBORZ then
         return false, nil, nil, nil, nil, "unsupported encoding"
     end
 
@@ -148,17 +205,40 @@ end
 -- @param payload table
 -- @return string|nil encoded
 -- @return string|nil errMsg
-function P.EncodePayloadTable(payload)
+function P.EncodePayloadTable(payload, enc)
     if type(payload) ~= "table" then
         return nil, "payload must be a table"
     end
 
+    enc = enc or P.ENC_B64CBOR
+
+    -- 1) table --> CBOR (binary string)
     local ok, cbor = pcall(C_EncodingUtil.SerializeCBOR, payload)
     if not ok or not cbor then
         return nil, "SerializeCBOR failed"
     end
 
-    local b64 = C_EncodingUtil.EncodeBase64(cbor)
+    local raw = cbor
+
+    -- 2) optional compression
+    if enc == P.ENC_B64CBORZ then
+        if not P.CanCompress() then
+            return nil, "compression unavailable"
+        end
+
+        local method = GetDeflateMethod()
+        local ok2, compressed = pcall(C_EncodingUtil.CompressString, cbor, method)
+        if not ok2 or not compressed then
+            return nil, "CompressString failed"
+        end
+
+        raw = compressed
+    elseif enc ~= P.ENC_B64CBOR then
+        return nil, "unsupported encoding for payload"
+    end
+
+    -- 3) bytes -> base64 (printable, safe for addon messages)
+    local b64 = C_EncodingUtil.EncodeBase64(raw)
     if not b64 then
         return nil, "EncodeBase64 failed"
     end
@@ -175,13 +255,40 @@ function P.DecodePayloadTable(encoded)
         return nil, "empty payload"
     end
 
+    enc = enc or P.ENC_B64CBOR
+
+    -- 1) base64 -> bytes
     local raw = C_EncodingUtil.DecodeBase64(encoded)
     if not raw then
         return nil, "DecodeBase64 failed"
     end
 
-    local ok, t = pcall(C_EncodingUtil.DeserializeCBOR, raw)
-    if not ok or type(t) ~= "table" then
+    local cbor = raw
+
+    -- 2) optional decompression
+    if enc == P.ENC_B64CBORZ then
+        if not P.CanCompress() then
+            return nil, "compression unavailable"
+        end
+
+        local method = GetDeflateMethod()
+
+        -- DecompressString can throw / error in some cases; protect with pcall.
+        -- See WoWUIBugs issue describing false "Internal decompression error"
+        -- TODO: Do we have a way to recover from the error if it happens? Re-Request or retry or something?
+        local ok2, decompressed = pcall(C_EncodingUtil.DecompressString, raw, method)
+        if not ok2 or not decompressed then
+            return nil, "DecompressString failed"
+        end
+
+        cbor = decompressed
+    elseif enc ~= P.ENC_B64CBOR then
+        return nil, "unsupported encoding"
+    end
+
+    -- 3) CBOR -> table
+    local ok3, t = pcall(C_EncodingUtil.DeserializeCBOR, cbor)
+    if not ok3 or type(t) ~= "table" then
         return nil, "DeserializeCBOR failed"
     end
 

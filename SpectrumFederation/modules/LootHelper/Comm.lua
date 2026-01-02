@@ -177,10 +177,26 @@ end
 -- @param target string or nil - the target player (for WHISPER)
 -- @param prio string or nil - the AceComm priority (overrides config)
 -- @return true if sent, false on error
-function Comm:Send(kind, msgType, payload, distribution, target, prio)
+function Comm:Send(kind, msgType, payload, distribution, target, prio, opts)
+    opts = opts or {}
+
     local SP = SF.SyncProtocol
     if not SP then 
         error("SF.SyncProtocol not loaded. Load SyncProtocol.lua before Comm.lua")
+    end
+
+    local enc
+    if opts.enc then
+        enc = opts.enc
+    else
+        -- default behavior:
+        -- CONTROL: uncompressed
+        -- BULK: compressed
+        if kind == "BULK" and SP.CanCompress() then
+            enc = SP.ENC_B64CBORZ
+        else
+            enc = SP.ENC_B64CBOR
+        end
     end
 
     local prefix = (kind == "BULK") and self.PREFIX.BULK or self.PREFIX.CONTROL
@@ -190,13 +206,21 @@ function Comm:Send(kind, msgType, payload, distribution, target, prio)
     local payloadStr = ""
 
     if payload ~= nil then
-        enc = SP.ENC_B64CBOR
-        local b64, err = SP.EncodePayloadTable(payload)
-        if not b64 then
+        local encoded, err = SP.EncodePayloadTable(payload, enc)
+
+        -- Fallback: if compression chosen but unavailable, retry uncompressed
+        if not encoded and enc == SP.ENC_B64CBORZ then
+            enc = SP.ENC_B64CBOR
+            encoded, err = SP.EncodePayloadTable(payload, enc)
+        end
+
+        if not encoded then
             DError("EncodePayloadTable failed for %s: %s", tostring(msgType), tostring(err))
             return false
         end
-        payloadStr = b64
+        payloadStr = encoded
+    else
+        enc = SP.ENC_NONE
     end
 
     local envelope = SP.PackEnvelope(msgType, proto, enc, payloadStr)
@@ -282,13 +306,12 @@ function Comm:_HandleIncoming(kind, text, distribution, sender)
 
     -- 4) Decode payload
     local payload = nil
-    if enc == SP.ENC_B64CBOR and payloadStr and payloadStr ~= "" then
-        local decoded, err = SP.DecodePayloadTable(payloadStr)
-        if not decoded then
-            DWarn("Drop: payload decode failed from %s type=%s err=%s", tostring(sender), tostring(msgType), tostring(err))
+    if enc ~= SP.ENC_NONE and payloadStr and payloadStr ~= "" then
+        payload, err = SP.DecodePayloadTable(payloadStr)
+        if not payload then
+            DError("Drop: payload decode failed from %s type=%s err=%s", tostring(sender), tostring(msgType), tostring(err))
             return
         end
-        payload = decoded
     end
 
     -- 5) Dispatch
