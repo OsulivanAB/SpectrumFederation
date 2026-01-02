@@ -246,7 +246,7 @@ function Sync:StartSession(profileId, opts)
     local epoch = Now()
 
     -- Reste state
-    self.state.adminstatuses = {}
+    self.state.adminStatuses = {}
     self.state._adminConvergence = nil
     self.state.handshake = nil
 
@@ -409,6 +409,11 @@ function Sync:FinalizeAdminConvergence()
             conv.pendingReq[requestId] = true
             conv.pendingCount = conv.pendingCount + 1
 
+            local mySupportsEnc =
+                (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+                and SF.SyncProtocol.GetSupportedEncodings()
+                or nil
+
             if SF.LootHelperComm then
                 SF.LootHelperComm:Send("CONTROL", self.MSG.LOG_REQ, {
                     sessionId       = self.state.sessionId,
@@ -418,6 +423,7 @@ function Sync:FinalizeAdminConvergence()
                     author          = author,
                     fromCounter     = req.fromCounter,
                     toCounter       = req.toCounter,
+                    supportsEnc     = mySupportsEnc,
                 }, "WHISPER", provider, "NORMAL")
             end
         end
@@ -589,6 +595,9 @@ end
 function Sync:AssessLocalState(profileId, sessionAuthorMax)
 end
 
+-- Function Send join status (HAVE_PROFILE, NEED_PROFILE, or NEED_LOGS) to coordinator.
+-- @param none
+-- @return nil
 function Sync:SendJoinStatus()
     if not self.state.active then return end
     if not self.state.sessionId then return end
@@ -608,6 +617,9 @@ function Sync:SendJoinStatus()
         supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
         supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
         addonVersion    = self:_GetAddonVersion(),
+        supportsEnc     = (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+                            and SF.SyncProtocol.GetSupportedEncodings()
+                            or nil,
     }
 
     local profile = self:FindLocalProfileById(profileId)
@@ -837,6 +849,10 @@ end
 -- @param payload table {sessionId, requestId, profileId}
 -- @return nil
 function Sync:HandleNeedProfile(sender, payload)
+    if type(payload) ~= "table" then return end
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then return end
+
     self:_RecordHandshakeReply(sender, payload, "NEED_PROFILE")
 
     if not self.state.active or not self.state.isCoordinator then return end
@@ -855,19 +871,36 @@ function Sync:HandleNeedProfile(sender, payload)
         return
     end
 
+    local enc = nil
+    if SF.SyncProtocol and SF.SyncProtocol.PickBestBulkEncoding then
+        enc = SF.SyncProtocol.PickBestBulkEncoding(payload and payload.supportsEnc)
+    end
+
     -- Small jitter in case multiple people need it at once
     self:RunWithJitter(0, 250, function()
         if not self.state.active or not self.state.isCoordinator then return end
         if not SF.LootHelperComm then return end
 
-        SF.LootHelperComm:Send(
-            "BULK",
-            self.MSG.PROFILE_SNAPSHOT,
-            snapPayload,
-            "WHISPER",
-            sender,
-            "BULK"
-        )
+        if enc then
+            SF.LootHelperComm:Send(
+                "BULK",
+                self.MSG.PROFILE_SNAPSHOT,
+                snapPayload,
+                "WHISPER",
+                sender,
+                "BULK",
+                { enc = enc }
+            )
+        else
+            SF.LootHelperComm:Send(
+                "BULK",
+                self.MSG.PROFILE_SNAPSHOT,
+                snapPayload,
+                "WHISPER",
+                sender,
+                "BULK"
+            )
+        end
     end)
 end
 
@@ -876,6 +909,10 @@ end
 -- @param payload table {sessionId, requestId, profileId}
 -- @return nil
 function Sync:HandleNeedLogs(sender, payload)
+    if type(payload) ~= "table" then return end
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then return end
+    
     self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
 
     if not self.state.active or not self.state.isCoordinator then return end
@@ -916,7 +953,10 @@ function Sync:HandleNeedLogs(sender, payload)
                 logs        = out,
             }
 
-            if SF.LootHelperComm then
+            if SF.SyncProtocol and SF.SyncProtocol.PickBestBulkEncoding and SF.LootHelperComm then
+                local enc = SF.SyncProtocol.PickBestBulkEncoding(payload.supportsEnc)
+                SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK", { enc = enc })
+            elseif SF.LootHelperComm then
                 SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK")
             end
         end
@@ -969,7 +1009,10 @@ function Sync:HandleLogRequest(sender, payload)
         logs        = out,
     }
 
-    if SF.LootHelperComm then
+    if SF.SyncProtocol and SF.SyncProtocol.PickBestBulkEncoding and SF.LootHelperComm then
+        local enc = SF.SyncProtocol.PickBestBulkEncoding(payload.supportsEnc)
+        SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK", { enc = enc })
+    elseif SF.LootHelperComm then
         SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK")
     end
 end
@@ -1104,7 +1147,7 @@ function Sync:HandleProfileSnapshot(sender, payload)
     end
 
     -- Import snapshot (merges logs + dedup by logId)
-    local okImport, inserted, importErr = profile:ImportSnapshot(payload.snapshot { allowUnknownEventType = true })
+    local okImport, inserted, importErr = profile:ImportSnapshot(payload.snapshot, { allowUnknownEventType = true })
     if not okImport then
         if SF.PrintWarning then
             SF:PrintWarning(("PROFILE_SNAPSHOT import failed: %s"):format(importErr or "unknown"))
@@ -1203,6 +1246,7 @@ end
 -- @return boolean isValid True if valid, false otherwise
 -- @return string|nil errReason If not valid, reason why
 function Sync:ValidateSessionPayload(payload)
+    if not self.state.active then return false, "no active session" end
     if type(payload) ~= "table" then return false, "payload not table" end
     if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return false, "missing sessionId" end
 
@@ -1240,7 +1284,7 @@ end
 -- @param profileMeta table Metadata about the profile (from snapshot)
 -- @return table|nil LootProfile instance or nil if failed
 function Sync:CreateProfileFromMeta(profileMeta)
-    if type(profileMeta ~= "table" then return nil end
+    if type(profileMeta) ~= "table" then return nil end
     if not SF.LootProfile then return nil end
 
     -- Validate meta
