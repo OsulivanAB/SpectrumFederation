@@ -252,6 +252,7 @@ function Sync:StartSession(profileId, opts)
     self.state.adminStatuses = {}
     self.state._adminConvergence = nil
     self.state.handshake = nil
+    self.state.helpers = {}
 
     self.state.active = true
     self.state.sessionId = sessionId
