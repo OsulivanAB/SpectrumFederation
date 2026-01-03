@@ -60,6 +60,16 @@ Sync.cfg = Sync.cfg or {
 
     maxHelpers = 2,
     preferNoGaps = true, -- prefer helpers without log gaps when choosing helpers
+
+    -- Request robustness
+    maxOutstandingRequests  = 64,   -- hard cap to avoid unbounded memory
+    requestBackoffMult      = 1.5,  -- exponential backoff multiplier
+    requestRetryJitterMsMin = 100, 
+    requestRetryJitterMsMax = 300,  -- TODO: Verify how this works. The admin jitter reply max is 500, so this would potentially retry the request before the admin could reply.
+
+    -- Backpressure for log bursts (coordinator -> member)
+    maxMissingRangesPerNeededLogs   = 8,    -- clamp abusive/huge requests
+    needLogsSendSpacingMs           = 50,   -- space out AUTH_LOGS sends to avoid spikes
 }
 
 Sync.state = Sync.state or {
@@ -418,18 +428,37 @@ function Sync:FinalizeAdminConvergence()
                 and SF.SyncProtocol.GetSupportedEncodings()
                 or nil
 
-            if SF.LootHelperComm then
-                SF.LootHelperComm:Send("CONTROL", self.MSG.LOG_REQ, {
-                    sessionId       = self.state.sessionId,
-                    profileId       = profileId,
-                    adminSyncId     = conv.adminSyncId,
-                    requestId       = requestId,
-                    author          = author,
-                    fromCounter     = req.fromCounter,
-                    toCounter       = req.toCounter,
-                    supportsEnc     = mySupportsEnc,
-                }, "WHISPER", provider, "NORMAL")
+            -- Build ordered provider list: selected provider first, then any other admin who can serve
+            local providers, seen = {}, {}
+            local function addProvider(p)
+                if type(p) == "string" and p ~= "" and not seen[p] then
+                    seen[p] = true
+                    table.insert(providers, p)
+                end
             end
+
+            addProvider(provider)
+            for adminName, st2 in pairs(self.state.adminStatuses or {}) do
+                if st2 and st2.authorMax and (st2.authorMax[author] or 0) >= toCounter then
+                    addProvider(adminName)
+                end
+            end
+
+            local fallback = {}
+            for i = 2, #providers do fallback[#fallback + 1] = providers[i] end
+
+            -- Register Request will immediately send attempt #1 and retry across fallback targets
+            self:RegisterRequest(requestId, "ADMIN_LOG_REQ", providers[1], {
+                sessionId       = self.state.sessionId,
+                profileId       = profileId,
+                adminSyncId     = conv.adminSyncId,
+                requestId       = requestId,
+                author          = author,
+                fromCounter     = req.fromCounter,
+                toCounter       = req.toCounter,
+                supportsEnc     = mySupportsEnc,
+                targets         = fallback,
+            })
         end
     end
 
@@ -647,6 +676,17 @@ end
 -- @param helpers table Array of "Name-Realm"
 -- @return string|nil Chosen helper "Name-Realm" or nil if no helpers
 function Sync:PickHelperForPlayer(playerName, helpers)
+    if type(playerName) ~= "string" or playerName == "" then return nil end
+    if type(helpers) ~= "table" or #helpers == 0 then return nil end
+
+    -- Stable deterministic hash function
+    local h = 0
+    for i = 1, #playerName do
+        h = (h * 33 + playerName:byte(i)) % 2147483647
+    end
+
+    local idx = (h % #helpers) + 1
+    return helpers[idx]
 end
 
 -- Function Choose the best target (helper/coordinator) for a request, with fallback ordering.
@@ -654,6 +694,43 @@ end
 -- @param coordinator string|nil Coordinator "Name-Realm"
 -- @return table targets Ordered list of targets "Name-Realm" to try
 function Sync:GetRequestTargets(helpers, coordinator)
+    local targets, seen = {}, {}
+    
+    local function add(t)
+        if type(t) == "string" and t ~= "" and not seen[t] then
+            seen[t] = true
+            table.insert(targets, t)
+        end
+    end
+
+    local me = (UnitFullName and UnitFullName("player")) and SelfId() or SelfId()
+
+    -- 1) Preferred helper for *me* (deterministic)
+    local preferred = self:PickHelperForPlayer(me, helpers or {})
+    if preferred and preferred ~= me then add(preferred) end
+
+    -- 2) Coordinator fallback
+    if type(coordinator) == "string" and coordinator ~= "" and coordinator ~= me then
+        add(coordinator)
+    end
+
+    -- 3) Remaining helpers (stable order)
+    if type(helpers) == "table" then
+        local sorted = {}
+        for _, h in ipairs(helpers) do
+            if type(h) == "string" and h ~= "" then
+                table.insert(sorted, h)
+            end
+        end
+        table.sort(sorted)
+        for _, h in ipairs(sorted) do
+            if h ~= me then
+                add(h)
+            end
+        end
+    end
+
+    return targets
 end
 
 -- Function Determine whether local client has the session profile and whether it's missing logs.
@@ -693,9 +770,10 @@ function Sync:SendJoinStatus()
 
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
-        if SF.LootHelperComm then
-            SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, payloadBase, "WHISPER", self.state.coordinator, "NORMAL")
-        end
+        local requestId = self:NewRequestId()
+        self:RegisterRequest(requestId, "NEED_PROFILE", self.state.coordinator, {
+            sessionId       = self.state.sessionId,
+        })
         return
     end
 
@@ -1116,6 +1194,10 @@ function Sync:HandleNeedProfile(sender, payload)
         return
     end
 
+    if type(payload.requestId) == "string" and payload.requestId ~= "" then
+        snapPayload.requestId = payload.requestId
+    end
+
     local enc = nil
     if SF.SyncProtocol and SF.SyncProtocol.PickBestBulkEncoding then
         enc = SF.SyncProtocol.PickBestBulkEncoding(payload and payload.supportsEnc)
@@ -1171,39 +1253,56 @@ function Sync:HandleNeedLogs(sender, payload)
     local profile = self:FindLocalProfileById(self.state.profileId)
     if not profile then return end
 
-    for _, req in ipairs(payload.missing) do
+    local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeedLogs) or 8
+    local spacingSec = (tonumber(self.cfg.needLogsSendSpacingMs) or 75) / 1000
+
+    local enc = nil
+    if SF.SyncProtocol and SF.SyncProtocol.PickBestBulkEncoding then
+        enc = SF.SyncProtocol.PickBestBulkEncoding(payload.supportsEnc)
+    end
+
+    for i, req in ipairs(payload.missing) do
+        if i > maxRanges then break end
+
         if type(req) == "table"
             and type(req.author) == "string"
             and type(req.fromCounter) == "number"
             and type(req.toCounter) == "number"
         then
-            local fromC = math.max(1, math.floor(req.fromCounter))    
+            local author = req.author
+            local fromC = math.max(1, math.floor(req.fromCounter))
             local toC   = math.max(fromC, math.floor(req.toCounter))
+            local delay = (i - 1) * spacingSec
 
-            local out = {}
-            for _, log in ipairs(profile:GetLootLogs() or {}) do
-                local author = log:GetAuthor()
-                local counter = log:GetCounter()
-                if author == req.author and type(counter) == "number" and counter >= fromC and counter <= toC then
-                    table.insert(out, log:ToTable())
+            self:RunAfter(delay, function()
+                if not self.state.active or not self.state.isCoordinator then return end
+                if not SF.LootHelperComm then return end
+
+                -- Build inside callback to spread CPU cost too
+                local out = {}
+                for _, log in ipairs(profile:GetLootLogs() or {}) do
+                    local a = log:GetAuthor()
+                    local c = log:GetCounter()
+                    if a == author and type(c) == "number" and c >= fromC and c <= toC then
+                        table.insert(out, log:ToTable())
+                    end
                 end
-            end
 
-            local resp = {
-                sessionId   = self.state.sessionId,
-                profileId   = self.state.profileId,
-                author      = req.author,
-                fromCounter = fromC,
-                toCounter   = toC,
-                logs        = out,
-            }
+                local resp = {
+                    sessionId   = self.state.sessionId,
+                    profileId   = self.state.profileId,
+                    author      = author,
+                    fromCounter = fromC,
+                    toCounter   = toC,
+                    logs        = out,
+                }
 
-            if SF.SyncProtocol and SF.SyncProtocol.PickBestBulkEncoding and SF.LootHelperComm then
-                local enc = SF.SyncProtocol.PickBestBulkEncoding(payload.supportsEnc)
-                SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK", { enc = enc })
-            elseif SF.LootHelperComm then
-                SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK")
-            end
+                if enc then
+                    SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK", { enc = enc })
+                else
+                    SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK")
+                end
+            end)
         end
     end
 end
@@ -1277,6 +1376,8 @@ function Sync:_RecordHandshakeReply(sender, payload, status)
     peer.joinStatus = status
     peer.joinReportedAt = Now()
 
+    self:SetPeerSyncState(sender, status, "handshake")
+
     if type(payload) == "table" then
         peer.supportedMin = payload.supportedMin
         peer.supportedMax = payload.supportedMax
@@ -1315,6 +1416,10 @@ function Sync:HandleAuthLogs(sender, payload)
     end
 
     self:MergeLogs(payload.profileId, payload.logs)
+
+    if type(payload.requestId) == "string" and payload.requestId ~= "" then
+        self:CompleteRequest(payload.requestId)
+    end
 
     -- If we are coordinator, this might be part of admin convergence
     if self.state.isCoordinator then
@@ -1413,6 +1518,10 @@ function Sync:HandleProfileSnapshot(sender, payload)
         SF:SetActiveLootProfile(profile:GetProfileName())
     end
 
+    if type(payload.requestId) == "string" and payload.requestId ~= "" then
+        self:CompleteRequest(payload.requestId)
+    end
+
     if SF.PrintInfo then
         SF:PrintInfo(("Imported PROFILE_SNAPSHOT %s (%d new logs)"):format(
             profile:GetProfileName() or profileId,
@@ -1431,6 +1540,226 @@ function Sync:NewRequestId()
     return self:_NextNonce("REQ")
 end
 
+-- Function Cancel and clear any existing timer on a request.
+-- @param req table Request state table
+-- @return nil
+function Sync:_CancelRequestTimer(req)
+    if not req then return end
+    local t = req.timer
+    req.timer = nil
+    if t and t.Cancel then
+        pcall(function() t:Cancel() end)    -- TODO: suually we catch the returns from pcall, I thought that was the whole point.
+    end
+end
+
+-- Function Compute the delay (in seconds) before retrying a request.
+-- @param req table Request state table
+-- @return number delaySec
+function Sync:_ComputeRequestDelaySec(req)
+    local base = tonumber(req.timeoutSec) or tonumber(self.cfg.requestTimeoutSec) or 5
+    local mult = tonumber(self.cfg.requestBackoffMult) or 1.5
+    local attempt = tonumber(req.attempt) or 1
+
+    local delay = base * (mult ^ math.max(0, attempt - 1))
+
+    local jmin = tonumber(self.cfg.requestRetryJitterMsMin) or 0        -- TODO: Why would we wait 0 ms for a jitter before retrying, that literally gives them no time to respond right?
+    local jmax = tonumber(self.cfg.requestRetryJitterMsMax) or jmin
+    if jmax < jmin then jmin, jmax = jmax, jmin end
+    if jmax > 0 then
+        local ms = (jmax > jmin) and math.random(jmin, jmax) or jmin
+        delay = delay + (ms / 1000)
+    end
+
+    return delay
+end
+
+-- Function Arm a request timer to trigger timeout handling.
+-- @param req table Request state table
+-- @return nil
+-- TODO: If a request is timing out, should we be doing a log or something?
+function Sync:_ArmRequestTimer(req)
+    self:_CancelRequestTimer(req)
+    local delay = self:_ComputeRequestDelaySec(req)
+    req.timer = self:RunAfterdelay(delay, function()
+        self:OnRequestTimeout(req.id)
+    end)
+end
+
+-- Function Normalize target list for a request (dedupe, ignore blanks).
+-- @param initialTarget string "Name-Realm" of initial target
+-- @param extraTargets table|nil Additional targets to include
+-- @return table Array of "Name-Realm" targets
+function Sync:_NormalizeTargets(initialTarget, extraTargets)
+    local out, seen = {}, {}
+    local function add(t)
+        if type(t) == "string" and t ~= "" and not seen[t] then
+            seen[t] = true
+            table.insert(out, t)
+        end
+    end
+
+    add(initialTarget)
+    if type(extraTargets) == "table" then
+        for _, t in ipairs(extraTargets) do add(t) end
+    end
+
+    return out
+end
+
+-- Function Pick the next target for a request (single target retries same, multi target walks list).
+-- @param req table Request state table
+-- @return string|nil "Name-Realm" of next target, or nil if none
+function Sync:_PickNextTargetForRequest(req)
+    if not req or type(req.targets) ~= "table" or #req.targets == 0 then
+        return nil
+    end
+
+    -- Single target: keep retrying the same peer
+    if #req.targets == 1 then
+        req.targetIdx = 1
+        return req.targets[1]
+    end
+
+    -- Multi target: walk the list once (no wrap)
+    local idx = (tonumber(req.targetIdx) or 0) + 1
+    if idx > #req.targets then return nil end
+    req.targetIdx = idx
+    return req.targets[idx]
+end
+
+-- Function Send a LOG_REQ to a target peer.
+-- @param req table Request state table
+-- @param target string "Name-Realm" of target peer
+-- @return boolean True if sent, false otherwise
+function Sync:_SendAdminLogReq(req, target)
+    if not (self.state.active and self.state.isCoordinator) then return false end
+    if not SF.LootHelperComm then return false end
+    if type(target) ~= "string" or target == "" then return false end
+
+    local meta = req and req.meta or nil
+    if type(meta) ~= "table" then return false end
+
+    local payload = {
+        sessionId   = meta.sessionId,
+        profileId   = meta.profileId,
+        adminSyncId = meta.adminSyncId,
+        requestId   = req.id,
+        author      = meta.author,
+        fromCounter = meta.fromCounter,
+        toCounter   = meta.toCounter,
+        supportsEnc = meta.supportsEnc,
+    }
+
+    return SF.LootHelperComm:Send("CONTROL", self.MSG.LOG_REQ, payload, "WHISPER", target, "NORMAL")
+end
+
+-- Function Send a NEED_PROFILE to a target peer.
+-- @param req table Request state table
+-- @param target string "Name-Realm" of target peer
+-- @return boolean True if sent, false otherwise
+function Sync:_SendNeedProfileReq(req, target)
+    if not self.state.active then return false end
+    if not SF.LootHelperComm then return false end
+    if type(target) ~= "string" or target == "" then return false end
+
+    local profileId = self.state.profileId
+    if type(profileId) ~= "string" or profileId == "" then return false end     -- TODO: Isn't this a profile request? I feel like having profileId == "" would be common in fact we'd need to take it as a parameter probably. Unless this serves a different use case. Perhaps when we learn what profile we should be in we set our self profile ID even though we don't have it?
+
+    local payload = {
+        sessionId       = self.state.sessionId,
+        profileId       = profileId,
+        requestId       = req.id,
+
+        supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
+        supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
+        addonVersion    = self:_GetAddonVersion(),
+        supportsEnc     = (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+                            and SF.SyncProtocol.GetSupportedEncodings()
+                            or nil,
+    }
+
+    return SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, payload, "WHISPER", target, "NORMAL")
+end
+
+-- Function Attempt to send a request (called initially and on timeouts).
+-- @param req table Request state table
+-- @return nil
+function Sync:_SendRequestAttempt(req)
+    if not req then return end
+
+    -- Session ended or changed -> drop
+    if not self.state.active then
+        self:_FailRequest(req, "session ended")
+        return
+    end
+    if type(req.meta) == "table" and type(req.meta.sessionId) == "string" and self.state.sessionId then
+        if req.meta.sessionId ~= self.state.sessionId then
+            self:_FailRequest(req, "stale session")
+            return
+        end
+    end
+
+    local maxAttempts = 1 + (tonumber(req.maxRetries) or tonumber(self.cfg.maxRetries) or 0)
+    if (tonumber(req.attempt) or 0) >= maxAttempts then
+        self:_FailRequest(req, "max attempts reached")
+        return
+    end
+
+    req.attempt = (tonumber(req.attempt) or 0) + 1
+
+    local target = self:_PickNextTargetForRequest(req)
+    if not target then
+        self:_FailRequest(req, "no more targets")
+        return
+    end
+
+    local ok = false
+    if req.kind == "ADMIN_LOG_REQ" then
+        ok = self:_SendAdminLogReq(req, target)
+    elseif req.kind == "NEED_PROFILE" then
+        ok = self:_SendNeedProfileReq(req, target)
+    else
+        self:_FailRequest(req, "unknown request kind: " .. tostring(req.kind))
+        return
+    end
+
+    -- Even if send fails, we still arm a timer; timeout path will retry
+    req.lastSentAt = Now()
+    req.lastTarget = target
+    self:_ArmRequestTimer(req)
+end
+
+-- Function Mark a request as failed; clean up state and handle special cases.
+-- @param req table Request state table
+-- @param reason string|nil Reason for failure
+-- @return nil
+function Sync:_FailRequest(req, reason)
+    if not req then return end
+    self:_CancelRequestTimer(req)
+    
+    if self.state.requests then
+        self.state.requests[req.id] = nil
+    end
+
+    -- If this was admin convergence, decrement pending so session can proceed.
+    if req.kind == "ADMIN_LOG_REQ" and self.state.isCoordinator then
+        local conv = self.state._adminConvergence
+        if conv and conv.pendingReq and conv.pendingReq[req.id] then
+            conv.pendingReq[req.id] = nil
+            conv.pendingCount = math.max(0, (conv.pendingCount or 1) - 1)
+
+            if conv.pendingCount == 0 then
+                self.state._adminConvergence = nil
+                self:BroadcastSessionStart()
+            end
+        end
+    end
+
+    if SF.PrintWarning then
+        SF:PrintWarning(("Request failed (%s): %s"):format(tostring(reason or "unknown"), tostring(req.id)))
+    end
+end
+
 -- Function Register an outstanding request so it can timeout / retry / be matched.
 -- @param requestId string Unique request identifier
 -- @param kind string Request kind/type (e.g. "LOG_REQ", "NEED_PROFILE", etc.)
@@ -1438,18 +1767,70 @@ end
 -- @param meta table|nil Any metadata (author ranges, etc.)
 -- @return nil
 function Sync:RegisterRequest(requestId, kind, target, meta)
+    if type(requestId) ~= "string" or requestId == "" then return false end
+    if type(kind) ~= "string" or kind == "" then return false end
+    if type(target) ~= "string" or target == "" then return false end
+
+    self.state.requests = self.state.requests or {}
+    if self.state.requests[requestId] then return false end
+
+    -- bound outstanding requests
+    local maxOut = tonumber(self.cfg.maxOutstandingRequets) or 64
+    local n = 0
+    for _ in pairs(self.state.requets) do n = n + 1 end
+    if n >= maxOut then
+        if SF.PrintWarning then
+            SF:PrintWarning(("Too many outstanding requets (%d/%d); dropping %s"):format(n, maxOut, tostring(requestId)))
+        end
+        return false
+    end
+
+    meta = (type(meta) == "table") and meta or {}
+    local targets = self:_NormalizeTargets(target, meta.extraTargets)
+
+    local req = {
+        id          = requestId,
+        kind        = kind,
+        attempt     = 0,
+        maxRetries  = tonumber(meta.maxRetries) or tonumber(self.cfg.maxRetries) or 2,
+        timeoutSec  = tonumber(meta.timeoutSec) or tonumber(self.cfg.requestTimeoutSec) or 5,
+        createdAt   = Now(),
+        lastSentAt  = nil,
+        lastTarget  = nil,
+        targets     = targets,
+        targetIdx   = 0,
+        meta        = meta,
+        timer       = nil,
+    }
+
+    self.state.requests[requestId] = req
+    self:_SendRequestAttempt(req)
+    return true
 end
 
 -- Function Mark a request as completed (cancel timers, clear state).
 -- @param requestId string
 -- @return nil
 function Sync:CompleteRequest(requestId)
+    if type(requestId) ~= "string" or requestId == "" then return false end
+    local req = self.state.requests and self.state.requests[requestId]
+    if not req then return false end
+
+    self:_CancelRequestTimer(req)
+    self.state.requests[requestId] = nil
+    return true
 end
 
 -- Function Handle request timeout; retry against alternate helper or coordinator.
 -- @param requestId string
 -- @return nil
 function Sync:OnRequestTimeout(requestId)
+    if type(requestId) ~= "string" or requestId == "" then return end
+    local req = self.state.requests and self.state.requests[requestId]
+    if not req then return end
+
+    req.timer = nil
+    self:_SendRequestAttempt(req)
 end
 
 -- ============================================================================
@@ -1716,6 +2097,9 @@ function Sync:GetPeer(nameRealm)
             supportedMax = nil,
             addonVersion = nil,
             isAdmin = nil,
+            syncState = "UNKNOWN",
+            syncStateAt = 0,
+            syncStateReason = nil,
         }
         self.state.peers[nameRealm] = peer
     end
@@ -1735,6 +2119,22 @@ function Sync:TouchPeer(nameRealm, fields)
         for k, v in pairs(fields) do
             peer[k] = v
         end
+    end
+
+    if not peer.syncState then
+        peer.syncState = "SEEN"
+        peer.syncStateAt = Now()
+    end
+end
+
+function Sync:SetPeerSyncState(nameRealm, state, reason)
+    local peer = self:GetPeer(nameRealm)
+    if not peer then return end
+
+    if peer.syncState ~= state then
+        peer.syncState = state
+        peer.syncStateAt = Now()
+        peer.syncStateReason = reason
     end
 end
 

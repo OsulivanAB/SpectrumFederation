@@ -10,6 +10,17 @@ Comm.cfg = Comm.cfg or {
     controlPrio         = "NORMAL",
     bulkPrio            = "BULK",
     logUnknownMsgType   = true,
+
+    queueEnabled        = true,
+
+    -- hard caps (bounded memory)
+    maxQueue            = 200,
+    maxPerTarget       = 50,
+
+    -- pacing
+    pumpIntervalSec         = 0.03, -- How often we try to send
+    perTargetMinIntervalSec = 0.06, -- per-target spacing
+    maxSendsPerPump         = 1,    -- keep frames cheap
 }
 
 Comm.PREFIX = Comm.PREFIX or {
@@ -21,6 +32,22 @@ Comm._handlers = Comm._handlers or {
     CONTROL = {},
     BULK    = {}
 }
+
+comm.state = Comm.state or {
+    total       = 0,
+    byKey       = {},   -- [targetKey] = {items... }
+    keys        = {},   -- round-robin list of keys
+    rr          = 0,
+    lastSent    = {},   -- [targetKey] = timestamp
+    ticker      = nil,
+}
+
+-- Function to get the current time in seconds
+-- @param none
+-- @return current time in seconds
+local function _CommNow()
+    return (GetTime and GetTime()) or time()
+end
 
 -- =====================================================================
 -- Small logging helpers (ties into debug + message helpers)
@@ -170,51 +197,164 @@ end
 
 -- Function Send a protocol-envelope message via AceComm
 -- payload: nil (no payload) or table (CBOR+Base64)
--- @param kind string - "CONTROL" or "BULK"
+-- @param channelKey string - the target channel key (for logging/tracking)
 -- @param msgType string - the message type to send
 -- @param payload table or nil - the payload data to send
 -- @param distribution string - the AceComm distribution method (e.g., "WHISPER
 -- @param target string or nil - the target player (for WHISPER)
 -- @param prio string or nil - the AceComm priority (overrides config)
 -- @return true if sent, false on error
-function Comm:Send(kind, msgType, payload, distribution, target, prio, opts)
-  opts = opts or {}
-  local SP = SF.SyncProtocol
-  if not SP then return false, "SyncProtocol missing" end
+function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opts)
+    if not self._ready then return false end
 
-  if kind ~= "CONTROL" and kind ~= "BULK" then
-    return false, "invalid kind: " .. tostring(kind)
-  end
-  if type(msgType) ~= "string" or msgType == "" then
-    return false, "msgType required"
-  end
+    local prefix = (channelKey == "BULK") and self.PREFIX.BULK or self.PREFIX.CONTROL
+    local enc = opts and opts.enc or nil
 
-  -- Decide encoding
-  local enc
-  if payload == nil then
-    enc = SP.ENC_NONE
-  elseif opts.enc then
-    enc = opts.enc
-  elseif kind == "BULK" and SP.CanCompress and SP.CanCompress() then
-    enc = SP.ENC_B64CBORZ
-  else
-    enc = SP.ENC_B64CBOR
-  end
+    local envelope = SP.PackEnvelope(msgType, payload, enc)
+    if not envelope then return false end
 
-  local payloadStr = ""
-  if payload ~= nil then
-    local encoded, err = SP.EncodePayloadTable(payload, enc)
-    if not encoded then
-      return false, "encode failed: " .. tostring(err)
+    local msg = envelope
+    prio = prio or "NORMAL"
+    local callback = opts and opts.callback or nil
+
+    -- By default: queue BULK; CONTROL sends immediately
+    local shouldQueue = (channelKey == "BULK") or (opts and opts.queue == true)
+    if shouldQueue and not (opts and opts.immediate) then
+        return self:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
     end
-    payloadStr = encoded
-  end
 
-  local prefix = (kind == "BULK") and self.PREFIX.BULK or self.PREFIX.CONTROL
-  local envelope = SP.PackEnvelope(msgType, SP.PROTO_CURRENT, enc, payloadStr)
+    self:SendCommMessage(prefix, msg, distribution, target, prio, callback)
+    return true
+end
 
-  self:SendCommMessage(prefix, envelope, distribution, target, prio or "NORMAL")
-  return true
+-- Function Generate a target key string for tracking
+-- @param distribution string - the AceComm distribution method
+-- @param target string or nil - the target player (for WHISPER)
+-- @return string - the target key
+function Comm:_TargetKey(distribution, target)
+    if distribution == "WHISPER" then
+        return "WHISPER:" .. tostring(target or "")
+    end
+    return tostring(distribution or "UNKNOWN")
+end
+
+-- Function Ensure the queue pump ticker is running
+-- @param none
+-- @return nil
+function Comm:_EnsureTicker()
+    if not self.cfg.queueEnabled then return end
+    if self.state.ticker then return end
+    if not C_Timer or not C_Timer.NewTicker then return end
+
+    local interval = tonumber(self.cfg.pumpIntervalSec) or 0.03
+    self.state.ticker = C_Timer.NewTicker(interval, function()
+        if not self._ready then return end
+        self:_PumpQueue()
+    end)
+end
+
+-- Function Enqueue a message for sending later
+-- @param prefix string - the message prefix
+-- @param msg string - the message to send
+-- @param distribution string - the AceComm distribution method
+-- @param target string or nil - the target player (for WHISPER)
+-- @param prio string - the AceComm priority
+-- @param callback function or nil - the callback function for SendCommMessage
+-- @return true if enqueued, false if dropped
+function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
+    if not self.cfg.queueEnabled then
+        self:SendCommMessage(prefix, msg, distribution, target, prio, callback)
+        return true
+    end
+
+    local st = self.state
+    local maxQ = tonumber(self.cfg.maxQueue) or 200
+    if (st.total or 0) >= maxQ then
+        if SF and SF.PrintWarning then
+            SF:PrintWarning("Comm queue full (%d/%d): dropping message"):format(st.total, maxQ)
+        end
+        return false
+    end
+
+    local key = self:_TargetKey(distribution, target)
+    local q = st.byKey[key]
+    if not q then
+        q = {}
+        st.byKey[key] = q
+        table.insert(st.keys, key)
+    end
+
+    local maxPer = tonumber(self.cfg.maxPerTarget) or 50
+    if #q >= maxPer then
+        if SF and SF.PrintWarning then
+            SF:PrintWarning("Comm per-target queue full for %s (%d/%d): dropping message"):format(tostring(key), #q, maxPer)
+        end
+        return false
+    end
+
+    table.insert(q, {
+        prefix      = prefix,
+        msg         = msg,
+        dist        = distribution,
+        target      = target,
+        prio        = prio,
+        callback    = callback,
+    })
+
+    st.total = (st.total or 0) + 1
+
+    self:_EnsureTicker()
+    return true
+end
+
+-- Function Pump the send queue, sending messages as allowed by pacing config
+-- @param none
+-- @return nil
+function Comm:_PumpQueue()
+    local st = self.state
+    if not st or not st.keys or #st.keys == 0 then
+        -- Stop ticker when idle
+        if st and st.ticker and st.ticker.Cancel then
+            pcall(function() st.ticker:Cancel() end)
+        end
+        if st then st.ticker = nil end
+        return
+    end
+
+    local now = _CommNow()
+    local maxSends = tonumber(self.cfg.maxSendsPerPump) or 1
+    local minGap = tonumber(self.cfg.perTargetMinIntervalSec) or 0.06
+    if minGap < 0 then minGap = 0 end
+
+    local sent = 0
+    local tries = 0
+
+    while sent < maxSends and tries < (#st.keys * 2) do
+        tries = tries + 1
+        st.rr = (st.rr or 0) + 1
+        if st.rr > #st.keys then
+            st.rr = 1
+        end
+
+        local key = st.keys[st.rr]
+        local q = st.byKey[key]
+
+        if not q or #q == 0 then
+            st.byKey[key] = nil
+            table.remove(st.keys, st.rr)
+            st.rr = st.rr - 1
+        else
+            local last = st.lastSent[key] or 0
+            if (now - last) >= minGap then
+                local item = table.remove(q, 1)
+                st.total = math.max(0, (st.total or 1) - 1)
+                st.lastSent[key] = now
+
+                self:SendCommMessage(item.prefix, item.msg, item.dist, item.target, item.prio, item.callback)
+                sent = sent + 1
+            end
+        end
+    end
 end
 
 -- =====================================================================
