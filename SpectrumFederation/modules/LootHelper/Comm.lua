@@ -224,9 +224,17 @@ function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opt
     local enc = (opts and opts.enc) or SP.ENC_B64CBOR
 
     local payloadStr = ""
-    if payload == nil or next(payload) == nil then
+    -- Guard: only treat payload as empty if it's nil or an empty table
+    if payload == nil then
         enc = SP.ENC_NONE
         payloadStr = ""
+    elseif type(payload) == "table" and next(payload) == nil then
+        enc = SP.ENC_NONE
+        payloadStr = ""
+    elseif type(payload) ~= "table" then
+        -- Prevent crash: payload must be nil or table
+        DError("Cannot send: payload must be nil or table, got %s", type(payload))
+        return false
     else
         local err
         payloadStr, err = SP.EncodePayloadTable(payload, enc)
@@ -378,7 +386,9 @@ function Comm:_PumpQueue()
         local q = st.byKey[key]
 
         if not q or #q == 0 then
+            -- Clean up empty queue state
             st.byKey[key] = nil
+            st.lastSent[key] = nil
             table.remove(st.keys, st.rr)
             st.rr = st.rr - 1
         else
@@ -390,6 +400,14 @@ function Comm:_PumpQueue()
 
                 self:SendCommMessage(item.prefix, item.msg, item.dist, item.target, item.prio, item.callback)
                 sent = sent + 1
+                
+                -- Eagerly clean up if queue is now empty after sending
+                if #q == 0 then
+                    st.byKey[key] = nil
+                    st.lastSent[key] = nil
+                    table.remove(st.keys, st.rr)
+                    st.rr = st.rr - 1
+                end
             end
         end
     end
@@ -449,7 +467,7 @@ end
 function Comm:_HandleIncoming(kind, text, distribution, sender)
     local SP = SF.SyncProtocol
     if not SP then
-        DError("Incomming message but SF.SyncProtocol missing")
+        DError("Incoming message but SF.SyncProtocol missing")
         return
     end
 
@@ -464,8 +482,9 @@ function Comm:_HandleIncoming(kind, text, distribution, sender)
     if msgType == SP.MSG_PROTO_NACK then
         local payload = nil
         if enc ~= SP.ENC_NONE and payloadStr and payloadStr ~= "" then
-            local decodeOk, decodeResult = pcall(SP.DecodePayloadTable, payloadStr, enc)
-            if decodeOk then
+            -- Guard: capture all pcall returns and only use payload if decode succeeded and returned a table
+            local decodeOk, decodeResult, decodeErr = pcall(SP.DecodePayloadTable, payloadStr, enc)
+            if decodeOk and type(decodeResult) == "table" then
                 payload = decodeResult
             end
         end

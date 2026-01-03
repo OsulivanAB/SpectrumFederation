@@ -674,6 +674,9 @@ function Sync:HandleSessionStart(sender, payload)
         self.state.helpers = {}
     end
 
+    -- Reset join status tracking for new session
+    self.state._sentJoinStatusForSessionId = nil
+
     -- Reply after jitter
     local sid = self.state.sessionId
     self:RunWithJitter(self.cfg.memberReplyJitterMsMin, self.cfg.memberReplyJitterMsMax, function()
@@ -717,7 +720,8 @@ function Sync:GetRequestTargets(helpers, coordinator)
         end
     end
 
-    local me = (UnitFullName and UnitFullName("player")) and SelfId() or SelfId()
+    -- Simplify: no need for redundant conditional assignment
+    local me = SelfId()
 
     -- 1) Preferred helper for *me* (deterministic)
     local preferred = self:PickHelperForPlayer(me, helpers or {})
@@ -1109,6 +1113,10 @@ function Sync:HandleAdminStatus(sender, payload)
 
     local ok = self:ValidateSessionPayload(payload)
     if not ok then return end
+
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Incoming ADMIN_STATUS from %s", sender)
+    end
 
     local conv = self.state._adminConvergence
     if not conv then return end
@@ -1850,6 +1858,10 @@ function Sync:OnRequestTimeout(requestId)
     local req = self.state.requests and self.state.requests[requestId]
     if not req then return end
 
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Request timeout: %s (attempt %d)", req.id, req.attempt or 0)
+    end
+
     req.timer = nil
     self:_SendRequestAttempt(req)
 end
@@ -2088,8 +2100,14 @@ function Sync:RunAfter(delaySec, fn)
         return C_Timer.NewTimer(delaySec, fn)
     end
 
-    -- fallback
-    C_Timer.After(delaySec, fn)
+    -- Guard: ensure C_Timer.After exists before calling
+    if C_Timer and C_Timer.After then
+        C_Timer.After(delaySec, fn)
+        return nil
+    end
+
+    -- Last resort: no timer API available, run synchronously
+    fn()
     return nil
 end
 
