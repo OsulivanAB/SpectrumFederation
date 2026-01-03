@@ -1020,7 +1020,6 @@ function Sync:SendJoinStatus()
     if self.state._sentJoinStatusForSessionId == self.state.sessionId then
         return
     end
-    self.state._sentJoinStatusForSessionId = self.state.sessionId
 
     local profileId = self.state.profileId
     local payloadBase = {
@@ -1050,6 +1049,8 @@ function Sync:SendJoinStatus()
         self:RequestMissingLogs(missing, "join-status")
         return
     end
+
+    self.state._sentJoinStatusForSessionId = self.state.sessionId
 
     if SF.LootHelperComm then
         SF.LootHelperComm:Send("CONTROL", self.MSG.HAVE_PROFILE, payloadBase, "WHISPER", self.state.coordinator, "NORMAL")
@@ -1169,8 +1170,8 @@ function Sync:HandleNewLog(sender, payload)
         return
     end
 
-    if profile.RebuildLogIndex then
-        profile:RebuildLogIndex()
+    if profile.RebuildProfile then
+        profile:RebuildProfile(profileId)
     end
 
     -- If we detected a gap, request missing logs
@@ -1824,7 +1825,15 @@ function Sync:HandleAuthLogs(sender, payload)
         end
     end
 
-    self:MergeLogs(payload.profileId, payload.logs)
+    local changed = self:MergeLogs(payload.profileId, payload.logs)
+    if changed then
+        self:RebuildProfile(payload.profileId)
+    end
+
+    local change = self:MergeLogs(payload.profileId, payload.logs)
+    if changed then
+        self:RebuildProfile(payload.profileId)
+    end
 
     if type(payload.requestId) == "string" and payload.requestId ~= "" then
         self:CompleteRequest(payload.requestId)
@@ -1942,6 +1951,8 @@ function Sync:HandleProfileSnapshot(sender, payload)
         end
     end
 
+    self:RebuildProfile(profileId)
+
     if profile.RebuildLogIndex then
         profile:RebuildLogIndex()
     end
@@ -1965,6 +1976,20 @@ function Sync:HandleProfileSnapshot(sender, payload)
             profile:GetProfileName() or profileId,
             inserted or 0))
     end
+
+    -- Rebuild derived state so UI + member state matches imported logs
+    self:RebuildProfile(profileId)
+
+    -- Now that we actually have the profile, run the normal sync assessment path:
+    -- - if missing logs, it will Request MissingLogs()
+    -- - if fully synced, it will whisper HAVE_PROFILE to coordinator
+    self:RunAfter(0, function()
+       if not self.state.active then return end
+       if self.state.sessionId ~= payload.sessionId then return end
+       if self.state.profileId ~= profileId then return end
+       if self.state.isCoordinator then return end
+       self:SendJoinStatus()
+    end)
 end
 
 -- ============================================================================
@@ -2226,6 +2251,26 @@ function Sync:_FailRequest(req, reason)
         self.state.requests[req.id] = nil
     end
 
+    -- If this was a profile bootstrap request, allow a future retry
+    if req.kind == "NEED_PROFILE" then
+        if self.state._profileReqInFlight == self.state.sessionId then
+            self.state._profileReqInFlight = nil
+        end
+        -- Also allow SendJoinStatus to re-attempt bootstrap later
+        if not self:FindLocalProfileById(self.state.profileId) then
+            self.state._sentJoinStatusForSessionId = nil
+        end
+    end
+
+    -- If this was a profile request, schedule a retry after a delay
+    if req.kind == "NEED_PROFILE" then
+        self:RunAfter(2.0, function()
+            if not self.state.active then return end
+            if self:FindLocalProfileById(self.state.profileId) then return end
+        self:RequestProfileSnapshot("retry-after-failure")
+        end)
+    end
+
     -- If this was admin convergence, decrement pending so session can proceed.
     if req.kind == "ADMIN_LOG_REQ" and self.state.isCoordinator then
         local conv = self.state._adminConvergence
@@ -2330,7 +2375,7 @@ end
 -- @param nameRealm string "Name-Realm"
 -- @return string|nil Normalized "Name-Realm", or nil if invalid input
 function Sync:_NormalizeNameRealmForCompare(nameRealm)
-    if type(nameRealm ~= "string") or nameRealm == "" then return nil end
+    if type(nameRealm) ~= "string" or nameRealm == "" then return nil end
     if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
         return SF.NameUtil.NormalizeNameRealm(nameRealm)
     end
@@ -2698,6 +2743,59 @@ end
 -- @param profileId string Stable profile id
 -- @return nil
 function Sync:RebuildProfile(profileId)
+    if type(profileId) ~= "string" or profileId == "" then
+        return false, "invalid profileId"
+    end
+
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        return false, "profile not found"
+    end
+
+    -- 1) Ensure deterministic log order
+    if type(profile._lootLogs) == "table" and type(profile._CompareLogs) == "function" then
+        table.sort(profile._lootLogs, function()
+            return profile:_CompareLogs(a, b)
+        end)
+    end
+
+    -- 2) Rebuild index + per-author max counters (critical for dedup + AllocateNextCounter)
+    if type (profile.RebuildLogIndex) == "function" then
+        profile:RebuildLogIndex()
+    else
+        -- Fallback
+        profile._logIndex = profile._logIndex or {}
+        for k in pairs(profile._logIndex) do profile._logIndex[k] = nil  end
+
+        profile._authorCounters = profile._authorCounters or {}
+        for k in pairs(profile._authorCounters) do profile._authorCounters[k] = nil  end
+
+        for _, log in ipairs(profile._lootLogs or {}) do
+            local id = (log and log.GetID and log:GetID()) or (log and log._id)
+            if type(id) == "string" and id ~= "" then
+                profile._logIndex[id] = true
+            end
+
+            local author = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
+            local counter = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
+            if type(author) == "string" and type(counter) == "number" then
+                local prev = profile._authorCounters[author] or 0
+                if counter > prev then
+                    profile._authorCounters[author] = counter
+                end
+            end
+        end
+    end
+
+    -- 3) If profile is already active, rebuild cached/UI state
+    if SF and SF.lootHelperDB and SF.lootHelperDB.activeProfileId == profileId
+        and type(SF.SetActiveProfileById) == "function" then
+            pcall(function()
+                SF:SetActiveProfileById(profileId)
+        end)
+    end
+
+    return true, nil
 end
 
 -- Function Detect whether applying a log indicates a gap in the author/counter sequence.
