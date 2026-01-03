@@ -97,10 +97,10 @@ end
 -- @param none
 -- @return The player's full name
 local function PlayerFullName()
-    if SF.GetPlayerFullIdentifier then
-        local ok, id = pcall(function() return SF:GetPlayerFullIdentifier() end)
-        if ok and id then return id end
-    end
+	if SF.NameUtil and SF.NameUtil.GetSelfId then
+		return SF.NameUtil.GetSelfId()
+	end
+	-- Fallback
     local name, realm = UnitFullName("player")
     realm = realm or GetRealmName()
     if realm then realm = realm:gsub("%s+", "") end
@@ -402,22 +402,36 @@ function Comm:OnCommReceived(prefix, text, distribution, sender)
         return
     end
 
-    if self.cfg.ignoreSelf then
-        local me = PlayerFullName()
-        if me and sender == me then
-            return
-        end
-    end
+	-- Normalize sender name
+	if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+		sender = SF.NameUtil.NormalizeNameRealm(sender)
+		if not sender then return end
+	end
 
-    local kind = self:_KindFromPrefix(prefix)
-    if not kind then
-        return
-    end
+	if self.cfg.ignoreSelf then
+		local me = PlayerFullName()
+		if me then
+			if SF.NameUtil and SF.NameUtil.SamePlayer then
+				if SF.NameUtil.SamePlayer(sender, me) then
+					return
+				end
+			else
+				if sender == me then
+					return
+				end
+			end
+		end
+	end
 
-    self:_HandleIncoming(kind, text, distribution, sender)
+	local kind = self:_KindFromPrefix(prefix)
+	if not kind then
+		return
+	end
+
+	self:_HandleIncoming(kind, text, distribution, sender)
 end
 
--- Function Internal handler for incoming messages
+-- Function Handle incoming messages
 -- @param kind The message kind ("CONTROL" or "BULK")
 -- @param text The message text (envelope)
 -- @param distribution The distribution method

@@ -71,8 +71,12 @@ end
 -- Get current player's full identifier in "Name-Realm" format
 -- @return: string - The player's full identifier (e.g., "Shadowbane-Garona")
 function SF:GetPlayerFullIdentifier()
-    local name, realm = SF:GetPlayerInfo()
-    return name .. "-" .. realm
+	if SF.NameUtil and SF.NameUtil.GetSelfId then
+		return SF.NameUtil.GetSelfId()
+	end
+	-- Fallback for early initialization
+	local name, realm = SF:GetPlayerInfo()
+	return name .. "-" .. realm
 end
 
 -- Get the current player's class in uppercase (e.g., "WARRIOR")

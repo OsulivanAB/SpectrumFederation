@@ -317,8 +317,15 @@ end
 -- @return boolean isAdmin
 function LootProfile:IsCurrentUserAdmin()
     local currentUser = SF:GetPlayerFullIdentifier()
+    if not currentUser then return false end
+    
     for _, admin in ipairs(self._adminUsers) do
-        if admin == currentUser then
+        -- Use NameUtil for case-insensitive comparison if available
+        if SF.NameUtil and SF.NameUtil.SamePlayer then
+            if SF.NameUtil.SamePlayer(admin, currentUser) then
+                return true
+            end
+        elseif admin == currentUser then
             return true
         end
     end
@@ -353,8 +360,16 @@ end
 -- @param string newOwner "Name-Realm" of new owner
 -- @return nil
 function LootProfile:SetOwner(newOwner)
-    if type(newOwner) == "string" and newOwner:match("^[^%-]+%-[^%-]+$") then
-        self._owner = newOwner
+    -- Normalize owner name using NameUtil
+    local normalized = nil
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        normalized = SF.NameUtil.NormalizeNameRealm(newOwner)
+    elseif type(newOwner) == "string" and newOwner:match("^[^%-]+%-[^%-]+$") then
+        normalized = newOwner
+    end
+    
+    if normalized then
+        self._owner = normalized
     else
         if SF.Debug then
             SF.Debug("LootProfile", "Attempted to set invalid owner: %s", tostring(newOwner))

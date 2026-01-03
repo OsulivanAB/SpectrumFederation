@@ -49,6 +49,11 @@ function Member.new(identifier, role, class)
     -- Create new instance with metatable
     local instance = setmetatable({}, Member)
     
+    -- Normalize identifier using NameUtil if available
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        identifier = SF.NameUtil.NormalizeNameRealm(identifier) or identifier
+    end
+    
     -- Set default properties
     instance.identifier = identifier or ""
     

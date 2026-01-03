@@ -18,6 +18,7 @@ Libs/AceComm/AceComm-3.0.lua
 
 # --- Modules --- 
 modules/debug.lua
+modules/NameUtil.lua
 modules/SlashCommands.lua
 modules/MessageHelpers.lua
 modules/Core.lua

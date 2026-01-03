@@ -108,10 +108,10 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
                     if #logs == 0 then
                         logText = "No debug logs available"
                     else
-                        logText = string.format("Last %d debug logs:\\n\\n", #logs)
+                        logText = string.format("Last %d debug logs:\n\n", #logs)
                         for i, log in ipairs(logs) do
                             local timestamp = SF:FormatTimestampForUser(log.timestamp)
-                            logText = logText .. string.format("[%s] [%s] %s: %s\\n", 
+                            logText = logText .. string.format("[%s] [%s] %s: %s\n", 
                                 timestamp, log.level, log.category, log.message)
                         end
                     end

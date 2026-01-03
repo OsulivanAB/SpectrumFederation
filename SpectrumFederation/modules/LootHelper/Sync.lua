@@ -126,6 +126,10 @@ end
 -- @param none
 -- @return string playerId
 local function SelfId()
+    if SF.NameUtil and SF.NameUtil.GetSelfId then
+        return SF.NameUtil.GetSelfId()
+    end
+    -- Fallback
     if SF.GetPlayerFullIdentifier then
         local ok, id = pcall(function() return SF:GetPlayerFullIdentifier() end)
         if ok and id then return id end
@@ -140,6 +144,10 @@ end
 -- @param name string Player name or "Name-Realm"
 -- @return string|nil Normalized "Name-Realm" or nil if invalid
 local function NormalizeNameRealm(name)
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        return SF.NameUtil.NormalizeNameRealm(name)
+    end
+    -- Fallback
     if not name or name == "" then return nil end
     if name:find("-", 1, true) then
         local n, r = strsplit("-", name, 2)

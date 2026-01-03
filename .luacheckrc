@@ -12,6 +12,7 @@ read_globals = {
   "GetRaidRosterInfo",
   "UnitClass",
   "strsplit",
+  "strtrim",
   "UnitName",
   "UnitExists",
   "GetRealmName",
