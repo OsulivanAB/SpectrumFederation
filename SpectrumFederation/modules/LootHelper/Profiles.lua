@@ -106,7 +106,7 @@ function LootProfile.new(profileName)
 
     -- Create member instance for author
     local class = SF:GetPlayerClass()
-    local authorMember = SF.LootProfileMember.new(instance._author, class or "UNKNOWN")
+    local authorMember = SF.Member.new(instance._author, class or "UNKNOWN")
     if not authorMember then
         if SF.Debug then
             SF.Debug("LootProfile", "Failed to create member instance for author:", instance._author)

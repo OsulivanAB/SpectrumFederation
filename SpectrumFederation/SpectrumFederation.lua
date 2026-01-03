@@ -27,6 +27,16 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.Debug:Info("ADDON", "SpectrumFederation addon loaded")
         end
 
+        -- Initialize Loot Helper Database
+        if SF.InitializeLootHelperDatabase then
+            SF:InitializeLootHelperDatabase()
+        end
+
+        -- Register Loot Helper slash commands
+        if SF.RegisterLootHelperSlashCommands then
+            SF:RegisterLootHelperSlashCommands()
+        end
+
         -- Create the Settings UI
         if SF.CreateSettingsUI then
             SF:CreateSettingsUI()
@@ -148,13 +158,11 @@ AddonLoadedFrame:SetScript("OnEvent", function(self, event, addonName)
     -- Ensure the loaded addon is SpectrumFederation
     if addonName ~= "SpectrumFederation" then return end
 
-    -- Initialize Loot Helper Database before creating UI
-    if SF.InitializeLootHelperDatabase then
-        SF:InitializeLootHelperDatabase()
-    end
-
-    -- Create the Loot Window
+    -- Create the Loot Window (UI component that requires frames)
     if SF.LootWindow and SF.LootWindow.Create then
         SF.LootWindow:Create()
     end
+    
+    -- Unregister after handling our addon
+    self:UnregisterEvent("ADDON_LOADED")
 end)

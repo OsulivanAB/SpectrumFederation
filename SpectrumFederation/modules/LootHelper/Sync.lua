@@ -1496,7 +1496,7 @@ function Sync:HandleProfileSnapshot(sender, payload)
     end
 
     -- Ensure DB exists
-    SF.lootHelperDB = SF.lootHelperDB or { profiles = {} }
+    SF.lootHelperDB = SF.lootHelperDB or { profiles = {}, activeProfileId = nil }
     SF.lootHelperDB.profiles = SF.lootHelperDB.profiles or {}
 
     local profileId = payload.profileId
@@ -1518,17 +1518,22 @@ function Sync:HandleProfileSnapshot(sender, payload)
         return
     end
 
+    -- Store new profile in canonical map (keyed by profileId)
     if isNew then
-        table.insert(SF.lootHelperDB.profiles, profile)
+        SF.lootHelperDB.profiles[profileId] = profile
+        if SF.Debug then
+            SF.Debug:Info("SYNC", "Imported new profile: %s (ID: %s)", 
+                profile:GetProfileName() or "Unknown", profileId)
+        end
     end
 
     if profile.RebuildLogIndex then
         profile:RebuildLogIndex()
     end
 
-    if SF.SetActiveLootProfile and profile.GetProfileName then
-        -- BUG: This function should be using the Profile ID now
-        SF:SetActiveLootProfile(profile:GetProfileName())
+    -- Set as active profile (use profileId now)
+    if SF.SetActiveProfileById then
+        SF:SetActiveProfileById(profileId)
     end
 
     if type(payload.requestId) == "string" and payload.requestId ~= "" then
@@ -1908,17 +1913,24 @@ end
 -- ============================================================================
 
 -- Function Find a local profile by stable profileId.
+-- Uses canonical profileId-based schema (SF.lootHelperDB.profiles[profileId]).
 -- @param profileId string Stable profile id
 -- @return table|nil LootProfile instance or nil if not found
 function Sync:FindLocalProfileById(profileId)
-    if not SF.lootHelperDB or type(SF.lootHelperDB.profiles) ~= "table" then return nil end
+    if not SF.lootHelperDB then return nil end
     if type(profileId) ~= "string" or profileId == "" then return nil end
 
-    for _, profile in ipairs(SF.lootHelperDB.profiles) do
-        if profile and profile.GetProfileId and profile:GetProfileId() == profileId then
-            return profile
+    -- Direct lookup in canonical profileId-based map (O(1))
+    if SF.lootHelperDB.profiles and type(SF.lootHelperDB.profiles) == "table" then
+        local profile = SF.lootHelperDB.profiles[profileId]
+        if profile and type(profile) == "table" and profile.GetProfileId then
+            local pid = profile:GetProfileId()
+            if pid == profileId then
+                return profile
+            end
         end
     end
+
     return nil
 end
 
