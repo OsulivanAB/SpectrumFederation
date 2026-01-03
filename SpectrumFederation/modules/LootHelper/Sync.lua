@@ -65,7 +65,7 @@ Sync.cfg = Sync.cfg or {
     maxOutstandingRequests  = 64,   -- hard cap to avoid unbounded memory
     requestBackoffMult      = 1.5,  -- exponential backoff multiplier
     requestRetryJitterMsMin = 100, 
-    requestRetryJitterMsMax = 300,  -- TODO: Verify how this works. The admin jitter reply max is 500, so this would potentially retry the request before the admin could reply.
+    requestRetryJitterMsMax = 300,  -- TODO: Verify how this works. Admin jitter reply max is 500, so retry may happen before admin replies.
 
     -- Backpressure for log bursts (coordinator -> member)
     maxMissingRangesPerNeededLogs   = 8,    -- clamp abusive/huge requests
@@ -1580,7 +1580,7 @@ end
 function Sync:_ArmRequestTimer(req)
     self:_CancelRequestTimer(req)
     local delay = self:_ComputeRequestDelaySec(req)
-    req.timer = self:RunAfterdelay(delay, function()
+    req.timer = self:RunAfter(delay, function()
         self:OnRequestTimeout(req.id)
     end)
 end
@@ -1663,7 +1663,9 @@ function Sync:_SendNeedProfileReq(req, target)
     if type(target) ~= "string" or target == "" then return false end
 
     local profileId = self.state.profileId
-    if type(profileId) ~= "string" or profileId == "" then return false end     -- TODO: Isn't this a profile request? I feel like having profileId == "" would be common in fact we'd need to take it as a parameter probably. Unless this serves a different use case. Perhaps when we learn what profile we should be in we set our self profile ID even though we don't have it?
+    -- TODO: Isn't this a profile request? Having profileId == "" might be common and need to be a parameter.
+    -- Unless this serves a different use case. Perhaps we set profileId when we learn which profile to use?
+    if type(profileId) ~= "string" or profileId == "" then return false end
 
     local payload = {
         sessionId       = self.state.sessionId,
@@ -1775,12 +1777,12 @@ function Sync:RegisterRequest(requestId, kind, target, meta)
     if self.state.requests[requestId] then return false end
 
     -- bound outstanding requests
-    local maxOut = tonumber(self.cfg.maxOutstandingRequets) or 64
+    local maxOut = tonumber(self.cfg.maxOutstandingRequests) or 64
     local n = 0
-    for _ in pairs(self.state.requets) do n = n + 1 end
+    for _ in pairs(self.state.requests) do n = n + 1 end
     if n >= maxOut then
         if SF.PrintWarning then
-            SF:PrintWarning(("Too many outstanding requets (%d/%d); dropping %s"):format(n, maxOut, tostring(requestId)))
+            SF:PrintWarning(("Too many outstanding requests (%d/%d); dropping %s"):format(n, maxOut, tostring(requestId)))
         end
         return false
     end

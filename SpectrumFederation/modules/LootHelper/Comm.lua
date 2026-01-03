@@ -33,7 +33,7 @@ Comm._handlers = Comm._handlers or {
     BULK    = {}
 }
 
-comm.state = Comm.state or {
+Comm.state = Comm.state or {
     total       = 0,
     byKey       = {},   -- [targetKey] = {items... }
     keys        = {},   -- round-robin list of keys
@@ -179,6 +179,8 @@ function Comm:Init(opts)
     self:RegisterComm(self.PREFIX.CONTROL, "OnCommReceived")
     self:RegisterComm(self.PREFIX.BULK, "OnCommReceived")
 
+    self._ready = true
+
     DInfo("Comm init complete (CONTROL=%s, BULK=%s)", self.PREFIX.CONTROL, self.PREFIX.BULK)  
 end
 
@@ -207,11 +209,34 @@ end
 function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opts)
     if not self._ready then return false end
 
-    local prefix = (channelKey == "BULK") and self.PREFIX.BULK or self.PREFIX.CONTROL
-    local enc = opts and opts.enc or nil
+    local SP = SF.SyncProtocol
+    if not SP then
+        DError("Cannot send: SF.SyncProtocol missing")
+        return false
+    end
 
-    local envelope = SP.PackEnvelope(msgType, payload, enc)
-    if not envelope then return false end
+    local prefix = (channelKey == "BULK") and self.PREFIX.BULK or self.PREFIX.CONTROL
+    local proto = SP.PROTO_CURRENT
+    local enc = opts and opts.enc or SP.ENC_NONE
+
+    local payloadStr = ""
+    if payload == nil or next(payload) == nil then
+        enc = SP.ENC_NONE
+        payloadStr = ""
+    else
+        local err
+        payloadStr, err = SP.EncodePayloadTable(payload, enc)
+        if not payloadStr then
+            DError("Payload encode failed: %s", tostring(err))
+            return false
+        end
+    end
+
+    local envelope = SP.PackEnvelope(msgType, proto, enc, payloadStr)
+    if not envelope then
+        DError("PackEnvelope failed")
+        return false
+    end
 
     local msg = envelope
     prio = prio or "NORMAL"
@@ -271,7 +296,7 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
     local maxQ = tonumber(self.cfg.maxQueue) or 200
     if (st.total or 0) >= maxQ then
         if SF and SF.PrintWarning then
-            SF:PrintWarning("Comm queue full (%d/%d): dropping message"):format(st.total, maxQ)
+            SF:PrintWarning(("Comm queue full (%d/%d): dropping message"):format(st.total, maxQ))
         end
         return false
     end
@@ -287,7 +312,7 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
     local maxPer = tonumber(self.cfg.maxPerTarget) or 50
     if #q >= maxPer then
         if SF and SF.PrintWarning then
-            SF:PrintWarning("Comm per-target queue full for %s (%d/%d): dropping message"):format(tostring(key), #q, maxPer)
+            SF:PrintWarning(("Comm per-target queue full for %s (%d/%d): dropping message"):format(tostring(key), #q, maxPer))
         end
         return false
     end
