@@ -179,6 +179,7 @@ function Comm:Init(opts)
     self:RegisterComm(self.PREFIX.CONTROL, "OnCommReceived")
     self:RegisterComm(self.PREFIX.BULK, "OnCommReceived")
 
+    -- Set ready flag after successful registration
     self._ready = true
 
     DInfo("Comm init complete (CONTROL=%s, BULK=%s)", self.PREFIX.CONTROL, self.PREFIX.BULK)  
@@ -209,15 +210,18 @@ end
 function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opts)
     if not self._ready then return false end
 
-    local SP = SF.SyncProtocol
+    local SP = SF and SF.SyncProtocol
     if not SP then
+        if SF and SF.PrintWarning then
+            SF:PrintWarning("Cannot send message: SyncProtocol not initialized")
+        end
         DError("Cannot send: SF.SyncProtocol missing")
         return false
     end
 
     local prefix = (channelKey == "BULK") and self.PREFIX.BULK or self.PREFIX.CONTROL
     local proto = SP.PROTO_CURRENT
-    local enc = opts and opts.enc or SP.ENC_NONE
+    local enc = (opts and opts.enc) or SP.ENC_B64CBOR
 
     local payloadStr = ""
     if payload == nil or next(payload) == nil then
@@ -436,8 +440,11 @@ function Comm:_HandleIncoming(kind, text, distribution, sender)
     -- 2) Always allow PROTO_NACK feedback
     if msgType == SP.MSG_PROTO_NACK then
         local payload = nil
-        if enc == SP.ENC_B64CBOR and payloadStr and payloadStr ~= "" then
-            payload = SP.DecodePayloadTable(payloadStr)
+        if enc ~= SP.ENC_NONE and payloadStr and payloadStr ~= "" then
+            local decodeOk, decodeResult = pcall(SP.DecodePayloadTable, payloadStr, enc)
+            if decodeOk then
+                payload = decodeResult
+            end
         end
         SP.OnProtoNack(sender, payload)
         return

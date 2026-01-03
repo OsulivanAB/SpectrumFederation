@@ -448,7 +448,7 @@ function Sync:FinalizeAdminConvergence()
             for i = 2, #providers do fallback[#fallback + 1] = providers[i] end
 
             -- Register Request will immediately send attempt #1 and retry across fallback targets
-            self:RegisterRequest(requestId, "ADMIN_LOG_REQ", providers[1], {
+            local ok = self:RegisterRequest(requestId, "ADMIN_LOG_REQ", providers[1], {
                 sessionId       = self.state.sessionId,
                 profileId       = profileId,
                 adminSyncId     = conv.adminSyncId,
@@ -459,6 +459,12 @@ function Sync:FinalizeAdminConvergence()
                 supportsEnc     = mySupportsEnc,
                 targets         = fallback,
             })
+
+            -- Clean up bookkeeping if RegisterRequest failed
+            if not ok then
+                conv.pendingReq[requestId] = nil
+                conv.pendingCount = math.max(0, conv.pendingCount - 1)
+            end
         end
     end
 
@@ -904,11 +910,11 @@ function Sync:HandleNewLog(sender, payload)
     local author = logTable._author or logTable.author
     local counter = logTable._counter or logTable.counter
 
-    local localMaxBefore = nil
+    local localMaxBefore = 0
     if type(author) == "string" and type(counter) == "number" and profile.ComputeAuthorMax then
         local authorMaxMap = profile:ComputeAuthorMax()
-        localMaxBefore = authorMaxMap and authorMaxMap[author] or nil
-        localMaxBefore = tonumber(localMaxBefore) or nil
+        localMaxBefore = authorMaxMap and authorMaxMap[author] or 0
+        localMaxBefore = tonumber(localMaxBefore) or 0
     end
 
     -- Merge
@@ -925,7 +931,6 @@ function Sync:HandleNewLog(sender, payload)
     -- If we detected a gap, request missing logs
     if not self.state.isCoordinator and self.state.coordinator
         and type(author) == "string" and type(counter) == "number"
-        and localMaxBefore ~= nil
         and counter > (localMaxBefore + 1)
     then
         local missing = {
@@ -1253,7 +1258,7 @@ function Sync:HandleNeedLogs(sender, payload)
     local profile = self:FindLocalProfileById(self.state.profileId)
     if not profile then return end
 
-    local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeedLogs) or 8
+    local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeedLogs or self.cfg.maxMissingRangesPerNeededLogs) or 8
     local spacingSec = (tonumber(self.cfg.needLogsSendSpacingMs) or 75) / 1000
 
     local enc = nil
@@ -1788,7 +1793,8 @@ function Sync:RegisterRequest(requestId, kind, target, meta)
     end
 
     meta = (type(meta) == "table") and meta or {}
-    local targets = self:_NormalizeTargets(target, meta.extraTargets)
+    local extra = meta.extraTargets or meta.targets
+    local targets = self:_NormalizeTargets(target, extra)
 
     local req = {
         id          = requestId,
@@ -2123,7 +2129,8 @@ function Sync:TouchPeer(nameRealm, fields)
         end
     end
 
-    if not peer.syncState then
+    -- Advance from UNKNOWN or nil to SEEN, but don't overwrite meaningful states
+    if not peer.syncState or peer.syncState == "UNKNOWN" then
         peer.syncState = "SEEN"
         peer.syncStateAt = Now()
     end
