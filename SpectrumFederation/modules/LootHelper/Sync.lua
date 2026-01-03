@@ -298,14 +298,88 @@ end
 -- @param sessionId string Current session id to take over.
 -- @param profileId string Session profile id.
 -- @param reason string|nil Why takeover happened (Raid leader change, old coord offline, ect.)
+-- @param opts table|nil Options: { rerunAdminConvergence = true/false }
 -- @return nil
-function Sync:TakeoverSession(sessionId, profileId, reason)
+function Sync:TakeoverSession(sessionId, profileId, reason, opts)
+    opts = opts or {}
+
+    local dist = GetGroupDistribution()
+    if not dist then return false end
+    if type(sessionId) ~= "string" or sessionId == "" then return false end
+    if type(profileId) ~= "string" or profileId == "" then return false end
+
+    local me = SelfId()
+    local oldEpoch = tonumber(self.state.coordEpoch) or 0
+
+    self.state.active = true
+    self.state.sessionId = sessionId
+    self.state.profileId = profileId
+    self.state.coordinator = me
+    self.state.isCoordinator = true
+
+    -- Ensure strictly increasing epoch
+    local newEpoch = Now()
+    if newEpoch <= oldEpoch then
+        newEpoch = oldEpoch + 1
+    end
+    self.state.coordEpoch = newEpoch
+
+    self:UpdatePeersFromRoster()
+    self:TouchPeer(me, { inGroup = true, isAdmin = true })
+
+    self:BroadcastCoordinatorTakeover()
+
+    if not opts.rerunAdminConvergence then
+        self:ReannounceSession()
+        return true
+    end
+
+    -- Rerun admin convergence, but finish with SES_REANNOUNCE instead of SES_START
+    self:BeginAdminConvergence(sessionId, profileId, {
+        onComplete = function()
+            self:ReannounceSession()
+        end
+    })
 end
 
 -- Function Re-announce session state to raid (typically after takeover or helper refresh).
 -- @param none
 -- @return nil
 function Sync:ReannounceSession()
+    if not self.state.active or not self.state.isCoordinator then return end
+
+    local dist = GetGroupDistribution()
+    if not dist then return end
+    if not SF.LootHelperComm then return end
+
+    local profileId = self.state.profileId
+    self.state.authorMax = self:ComputeAuthorMax(profileId) or {}
+
+    local payload = {
+        sessionId   = self.state.sessionId,
+        profileId   = profileId,
+        coordinator = self.state.coordinator,
+        coordEpoch  = self.state.coordEpoch,
+        authorMax   = self.state.authorMax,
+        helpers     = self.state.helpers or {},
+    }
+
+    -- restart handshake bookkeeping window
+    self.state.handshake = {
+        sessionId   = self.state.sessionId,
+        startedAt   = Now(),
+        deadlineAt  = Now() + (self.cfg.handshakeCollectSec or 3),
+        replies     = {},
+    }
+
+    SF.LootHelperComm:Send("CONTROL", self.MSG.SES_REANNOUNCE, payload, dist, nil, "ALERT")
+
+    local sid = self.state.sessionId
+    self:RunAfter(self.cfg.handshakeCollectSec or 3, function()
+        if not self.state.active or not self.state.isCoordinator then return end
+        if self.state.sessionId ~= sid then return end
+        self:FinalizeHandshakeWindow()
+    end)
 end
 
 -- ============================================================================
@@ -316,18 +390,25 @@ end
 -- @param sessionId string Current session id.
 -- @param profileId string Current session profile id.
 -- @return nil
-function Sync:BeginAdminConvergence(sessionId, profileId)
+function Sync:BeginAdminConvergence(sessionId, profileId, opts)
+    opts = opts or {}
     if not self.state.active or not self.state.isCoordinator then return end
 
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
-        -- If the leader somehow doesn't have the profile, just proceed to SES_START;
-        -- the raid handshake will handle NEED_PROFILE, ect.
-        self:BroadcastSessionStart()
+        -- If the leader somehow doesn't have the profile, call completion hook
+        local completionHook = opts.onComplete or function() self:BroadcastSessionStart() end
+        completionHook()
         return
     end
 
     local adminSyncId = self:_NextNonce("AS")
+    local mode = (opts.onComplete and "REANNOUNCE") or "START"
+    
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Beginning admin convergence (mode: %s, adminSyncId: %s)", mode, adminSyncId)
+    end
+
     self.state._adminConvergence = {
         adminSyncId     = adminSyncId,
         startedAt       = Now(),
@@ -335,6 +416,8 @@ function Sync:BeginAdminConvergence(sessionId, profileId)
         expected        = {}, -- [admin] = true
         pendingReq      = {}, -- [admin] = true
         pendingCount    = 0,
+        finished        = false,
+        onComplete      = opts.onComplete or function() self:BroadcastSessionStart() end,
     }
 
     -- Who do we ask?
@@ -363,6 +446,48 @@ function Sync:BeginAdminConvergence(sessionId, profileId)
     end)
 end
 
+-- Function Finish admin convergence by calling the completion hook (BroadcastSessionStart or ReannounceSession).
+-- Guards against double-finish and cleans up convergence state.
+-- @param reason string|nil Reason for finishing (e.g., "complete", "timeout", "no_missing")
+-- @return nil
+function Sync:_FinishAdminConvergence(reason)
+    local conv = self.state._adminConvergence
+    if not conv then return end
+    
+    -- Guard against double-finish
+    if conv.finished then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Admin convergence already finished, skipping duplicate finish")
+        end
+        return
+    end
+    
+    conv.finished = true
+    local onComplete = conv.onComplete
+    
+    -- Clean up convergence state
+    self.state._adminConvergence = nil
+    
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Finishing admin convergence (reason: %s)", tostring(reason or "unknown"))
+    end
+    
+    -- Call completion hook (pcall for safety)
+    if type(onComplete) == "function" then
+        local ok, err = pcall(onComplete)
+        if not ok then
+            if SF.Debug then
+                SF.Debug:Error("SYNC", "Error in admin convergence completion hook: %s", tostring(err))
+            end
+            -- Fallback to session start on error
+            self:BroadcastSessionStart()
+        end
+    else
+        -- Fallback if no valid completion hook
+        self:BroadcastSessionStart()
+    end
+end
+
 -- Function Finalize admin convergence after timeouts; compute helpers and broadcast SES_START.
 -- @param none
 -- @return nil
@@ -370,14 +495,13 @@ function Sync:FinalizeAdminConvergence()
     if not self.state.active or not self.state.coordinator then return end
     local conv = self.state._adminConvergence
     if not conv then
-        self:BroadcastSessionStart()
         return
     end
 
     local profileId = self.state.profileId
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
-        self:BroadcastSessionStart()
+        self:_FinishAdminConvergence("no_profile")
         return
     end
 
@@ -479,10 +603,9 @@ function Sync:FinalizeAdminConvergence()
     -- 5) choose helpers list
     self.state.helpers = self:ChooseHelpers(self.state.adminStatuses or {})
 
-    -- If no missing logs, start the raid handshake immediately
+    -- If no missing logs, finish convergence immediately
     if conv.pendingCount == 0 then
-        self.state._adminConvergence = nil
-        self:BroadcastSessionStart()
+        self:_FinishAdminConvergence("no_missing")
         return
     end
 
@@ -491,8 +614,7 @@ function Sync:FinalizeAdminConvergence()
     self:RunAfter(self.cfg.adminLogSyncTimeoutSec or 4.0, function()
         if not self.state.active or not self.state.isCoordinator then return end
         if self.state.sessionId ~= sid then return end
-        self.state._adminConvergence = nil
-        self:BroadcastSessionStart()
+        self:_FinishAdminConvergence("timeout")
     end)
 end
 
@@ -604,6 +726,19 @@ end
 -- @param none
 -- @return nil
 function Sync:BroadcastCoordinatorTakeover()
+    if not self.state.active or not self.state.isCoordinator then return end
+
+    local dist = GetGroupDistribution()
+    if not dist then return end
+
+    if not SF.LootHelperComm then return end
+
+    SF.LootHelperComm:Send("CONTROL", self.MSG.COORD_TAKEOVER, {
+        sessionId   = self.state.sessionId,
+        profileId   = self.state.profileId,
+        coordEpoch  = self.state.coordEpoch,
+        coordinator = self.state.coordinator,
+    }, dist, nil, "ALERT")
 end
 
 function Sync:FinalizeHandshakeWindow()
@@ -643,13 +778,27 @@ function Sync:HandleSessionStart(sender, payload)
     if type(payload.coordinator) ~= "string" then return end
     if type(payload.coordEpoch) ~= "number" then return end
 
-    -- Accept rules:
-    -- - If no session active: accept
-    -- - If same sessionId: accept (reannounce)
-    -- - If different sessionId: accept only if epoch is newer
-    if self.state.active then
+    -- Anti-spoof: sender should match claimed coordinator for session announcements
+    if not self:_SamePlayer(sender, payload.coordinator) then
+        return
+    end
+
+    local incomingEpoch = payload.coordEpoch
+    local incomingCoord = payload.coordinator
+
+    -- If we're already in a session:
+    -- - If sessionId differs, only accept strictly-newer epoch (or tie-breaker)
+    -- - If sessionId is the same, accept only if NOT older (prevents old coordinator from 'winning' later)
+    if self.state.active and self.state.sessionId then
+        local cmp = self:_CompareEpoch(incomingEpoch, incomingCoord)
+        if not cmp then return end
+
         if payload.sessionId ~= self.state.sessionId then
-            if payload.coordEpoch <= (self.state.coordEpoch or 0) then
+            if cmp ~= 1 then
+                return
+            end
+        else
+            if cmp == -1 then
                 return
             end
         end
@@ -660,7 +809,7 @@ function Sync:HandleSessionStart(sender, payload)
     self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
-    self.state.isCoordinator = (payload.coordinator == SelfId())
+    self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
 
     if type(payload.authorMax) == "table" then
         self.state.authorMax = payload.authorMax
@@ -1069,6 +1218,10 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
     if msgType == self.MSG.HAVE_PROFILE then return self:HandleHaveProfile(sender, payload) end
     if msgType == self.MSG.NEED_PROFILE then return self:HandleNeedProfile(sender, payload) end
     if msgType == self.MSG.NEED_LOGS then return self:HandleNeedLogs(sender, payload) end
+
+    if msgType == self.MSG.SES_REANNOUNCE then return self:HandleSessionReannounce(sender, payload) end
+    if msgType == self.MSG.COORD_TAKEOVER then return self:HandleCoordinatorTakeover(sender, payload) end
+    if msgType == self.MSG.COORD_ACK then return self:HandleCoordinatorAck(sender, payload) end
 end
 
 -- Function Route an incoming BULK message to the appropriate handler.
@@ -1217,6 +1370,61 @@ end
 -- @param payload table SES_REANNOUNCE payload
 -- @return nil
 function Sync:HandleSessionReannounce(sender, payload)
+    if type(payload) ~= "table" then return end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return end
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return end
+    if type(payload.coordEpoch) ~= "number" then return end
+
+    -- Anti-spoof: sender must equal the coordinator they claim to be
+    if not self:_SamePlayer(sender, payload.coordinator) then
+        return
+    end
+
+    -- If we're in a different session, require strictly newer epoch
+    if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
+        if not self:IsNewerEpoch(payload.coordEpoch, payload.coordinator) then
+            return
+        end
+    else
+        -- Same session: must not be older
+        if not self:IsControlMessageAllowed(payload, sender) then
+            return
+        end
+    end
+
+    local oldCoord = self.state.coordinator
+    local oldEpoch = self.state.coordEpoch
+
+    self.state.active = true
+    self.state.sessionId = payload.sessionId
+    self.state.profileId = payload.profileId
+    self.state.coordinator = payload.coordinator
+    self.state.coordEpoch = payload.coordEpoch
+    self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
+
+    self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
+    self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
+
+    -- If coordinator/epoch changed, allow re-sending status and refresh request targets
+    if not self:_SamePlayer(oldCoord, self.state.coordinator) or oldEpoch ~= self.state.coordEpoch then
+        self.state._sentJoinStatusForSessionId = nil
+
+        if self._RefreshOutstandingRequestTargets then
+            self:_RefreshOutstandingRequestTargets()
+        end
+    end
+
+    -- Reply after jitter (only if not coordinator)
+    if not self.state.isCoordinator then
+        local sid = self.state.sessionId
+        self:RunWithJitter(self.cfg.memberReplyJitterMsMin, self.cfg.memberReplyJitterMsMax, function ()
+            if not self.state.active or self.state.sessionId ~= sid then return end
+            self:SendJoinStatus()            
+        end)
+    end
+
+    self:TouchPeer(sender, { inGroup = true })
 end
 
 -- Function Handle COORD_TAKEOVER (Sequence 4): update coordinator if coordEpoch is newer.
@@ -1224,6 +1432,57 @@ end
 -- @param payload table {sessionId, profileId, coordEpoch, coordinator}
 -- @return nil
 function Sync:HandleCoordinatorTakeover(sender, payload)
+    if type(payload) ~= "table" then return end
+    if type(paylaod.sessionId) ~= "string" or paylaod.sessionId == "" then return end
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return end
+    if type(payload.coordEpoch) ~= "number" then return end
+
+    -- Anti-spoof: sender must equal the coordinator they claim to be
+    if not self:_SamePlayer(sender, paylaod.coordinator) then
+        return
+    end
+
+    -- If we're in a different active session, only accept if epoch is strictly newer
+    if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
+        if not self:IsNewerEpoch(payload.coordEpoch, payload.coordinator) then
+            return
+        end
+    end
+
+    -- Ignore older epochs
+    if not self:IsControlMessageAllowed(payload, sender) then
+        return
+    end
+
+    local oldCoord = self.state.coordinator
+    local oldEpoch = self.state.coordEpoch
+
+    self.state.active = true
+    self.state.sessionId = payload.sessionId
+    self.state.profileId = payload.profileId
+    self.state.coordinator = payload.coordinator
+    self.state.coordEpoch = payload.coordEpoch
+    self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
+
+    -- Allow re-sending join status to the new coordinator
+    self.state._sentJoinStatusForSessionId = nil
+
+    -- Refresh outstanding request targets so retries can reach the new coordinator
+    if self._RefreshOutstandingRequestTargets then
+        self:_RefreshOutstandingRequestTargets()
+    end
+
+    -- As a member, re-announce status after jitter so the new coordinator learns about us
+    if self.state.active and not self.state.isCoordinator then
+        local sid = self.state.sessionId
+        self:RunWithJitter(self.cfg.memberReplyJitterMsMin, self.cfg.memberReplyJitterMsMax, function()
+            if not self.state.active or self.state.sessionId ~= sid then return end
+            self:SendJoinStatus()
+        end)
+    end
+
+    self:TouchPeer(sender, { inGroup = true })
 end
 
 -- Function Handle COORD_ACK from clients/admins (optional bookkeeping).
@@ -1580,8 +1839,7 @@ function Sync:HandleAuthLogs(sender, payload)
                 conv.pendingCount = math.max(0, (conv.pendingCount or 1) - 1)
 
                 if conv.pendingCount == 0 then
-                    self.state._adminConvergence = nil
-                    self:BroadcastSessionStart()
+                    self:_FinishAdminConvergence("complete")
                 end
             end
         end
@@ -1976,8 +2234,7 @@ function Sync:_FailRequest(req, reason)
             conv.pendingCount = math.max(0, (conv.pendingCount or 1) - 1)
 
             if conv.pendingCount == 0 then
-                self.state._adminConvergence = nil
-                self:BroadcastSessionStart()
+                self:_FinishAdminConvergence("complete_after_failure")
             end
         end
     end
@@ -2069,11 +2326,92 @@ end
 -- Validation / Epoch rules
 -- ============================================================================
 
+-- Function Normalize a "Name-Realm" for comparison (remove spaces, etc.).
+-- @param nameRealm string "Name-Realm"
+-- @return string|nil Normalized "Name-Realm", or nil if invalid input
+function Sync:_NormalizeNameRealmForCompare(nameRealm)
+    if type(nameRealm ~= "string") or nameRealm == "" then return nil end
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        return SF.NameUtil.NormalizeNameRealm(nameRealm)
+    end
+    return (nameRealm:gsub("%s+", ""))
+end
+
+-- Function Compare two "Name-Realm" identifiers for equality.
+-- @param a string "Name-Realm"
+-- @param b string "Name-Realm"
+-- @return boolean True if same player, false otherwise
+function Sync:_SamePlayer(a, b)
+    if type(a) ~= "string" or type(b) ~= "string" then return false end
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+    return a == b
+end
+
+-- Function Refresh outstanding request targets based on current helpers/coordinator.
+-- @param none
+-- @return nil
+function Sync:_RefreshOutstandingRequestTargets()
+    if not self.state.requests then return end
+
+    local newTargets = self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    if type(newTargets) ~= "table" or #newTargets == 0 then return end
+
+    local function addUnique(list, t)
+        if type(t) ~= "string" or t == "" then return end
+        for _, existing in ipairs(list) do
+            if self:_SamePlayer(existing, t) then return end
+        end
+        table.insert(list, t)
+    end
+
+    for _, req in pairs(self.state.requests) do
+        if type(req) == "table" and (req.kind == "NEED_PROFILE" or req.kind == "NEED_LOGS") then
+            req.targets = req.targets or {}
+            for _, t in ipairs(newTargets) do
+                addUnique(req.targets, t)
+            end
+        end
+
+        -- If we lost coordinator status, stop admin convergence requests
+        if type(req) == "table" and req.kind == "ADMIN_LOG_REQ" and not self.state.isCoordinator then
+            self:_FailRequest(req, "no longer coordinator")
+        end
+    end
+end
+
+-- Function Compare an incoming epoch to our current epoch (tie-break if needed).
+-- @param incomingEpoch number|string Incoming epoch value
+-- @param incomingCoordinator string "Name-Realm" of incoming coordinator (for tie-break)
+-- @return number|nil 1 if incoming is newer, -1 if older, 0 if equal, nil if invalid
+function Sync:_CompareEpoch(incomingEpoch, incomingCoordinator)
+    local inc = tonumber(incomingEpoch)
+    if not inc then return nil end
+
+    local cur = tonumber(self.state.coordEpoch) or 0
+    if inc > cur then return 1 end
+    if inc < cur then return -1 end
+
+    -- tie-break on coordinator id for deterministic convergence
+    local incC = self:_NormalizeNameRealmForCompare(incomingCoordinator) or ""
+    local curC = self:_NormalizeNameRealmForCompare(self.state.coordinator) or ""
+    if incC == curC then return 0 end
+    return (incC > curC) and 1 or -1
+end
+
 -- Function Determine if an incoming control message is allowed based on coordEpoch.
 -- @param payload table Must include sessionId + coordEpoch where applicable
 -- @param sender string "Name-Realm" of sender
 -- @return boolean True if allowed, false otherwise
 function Sync:IsControlMessageAllowed(payload, sender)
+    if type(payload) ~= "table" then return true end
+    if type(payload.coordEpoch) ~= "number" then return true end
+
+    local incomingCoordinator = payload.coordinator or sender
+    local cmp = self:_CompareEpoch(payload.coordEpoch, incomingCoordinator)
+    if cmp == nil then return false end
+    return cmp >= 0
 end
 
 -- Function Determine if an epoch value is newer than our current epoch (tie-break if needed).
@@ -2081,6 +2419,7 @@ end
 -- @param incomingCoordinator string "Name-Realm" of incoming coordinator (for tie-break)
 -- @return boolean True if incoming is newer, false otherwise
 function Sync:IsNewerEpoch(incomingEpoch, incomingCoordinator)
+    return self:_CompareEpoch(incomingEpoch, incomingCoordinator) == 1
 end
 
 -- Function Validate whether sender is permitted to provide data for a profile (admin check).
