@@ -985,7 +985,9 @@ function Sync:RequestMissingLogs(missingRanges, reason)
                 count = count + 1
                 if SF.Debug then
                     SF.Debug:Verbose("SYNC", "Requesting logs for %s [%d-%d] from initial target %s (%d targets: %s)",
-                        tostring(missing.author), missing.minCounter, missing.maxCounter,
+                        tostring(range.author),
+                        tonumber(range.fromCounter) or 0,
+                        tonumber(range.toCounter) or 0,
                         tostring(targets[1]), #targets, table.concat(targets, ", "))
                 end
             end
@@ -1170,10 +1172,6 @@ function Sync:HandleNewLog(sender, payload)
         return
     end
 
-    if profile.RebuildProfile then
-        profile:RebuildProfile(profileId)
-    end
-
     -- If we detected a gap, request missing logs
     if not self.state.isCoordinator
         and type(author) == "string" and type(counter) == "number"
@@ -1190,7 +1188,6 @@ function Sync:HandleNewLog(sender, payload)
     end
 
     -- Update UI / derived state
-    -- TODO: Does this already happen in MergeLogTables?
     if self.RebuildProfile then
         self:RebuildProfile(profileId)
     end
@@ -1434,13 +1431,13 @@ end
 -- @return nil
 function Sync:HandleCoordinatorTakeover(sender, payload)
     if type(payload) ~= "table" then return end
-    if type(paylaod.sessionId) ~= "string" or paylaod.sessionId == "" then return end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return end
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return end
     if type(payload.coordEpoch) ~= "number" then return end
 
     -- Anti-spoof: sender must equal the coordinator they claim to be
-    if not self:_SamePlayer(sender, paylaod.coordinator) then
+    if not self:_SamePlayer(sender, payload.coordinator) then
         return
     end
 
@@ -1451,7 +1448,7 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
         end
     end
 
-    -- Ignore older epochs
+    -- Ignore older epochs (same-session or takeover races)
     if not self:IsControlMessageAllowed(payload, sender) then
         return
     end
@@ -1778,13 +1775,12 @@ function Sync:HandleAuthLogs(sender, payload)
 
     local ok = self:ValidateSessionPayload(payload)
     if not ok then return end
-    
+
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.logs) ~= "table" then return end
 
     -- Trust policy: accept from coordinator or helper
     if not self.state.isCoordinator then
-        -- Members must accept from coordinator OR helper
         if not self:IsTrustedDataSender(sender) then
             if SF.Debug then
                 SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not a trusted sender", tostring(sender))
@@ -1795,7 +1791,6 @@ function Sync:HandleAuthLogs(sender, payload)
             return
         end
 
-        -- Safety: sender must be in group
         if not self:IsRequesterInGroup(sender) then
             if SF.Debug then
                 SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not in group", tostring(sender))
@@ -1806,7 +1801,7 @@ function Sync:HandleAuthLogs(sender, payload)
             return
         end
 
-        -- Verify sender is authorized for this profile (admin check)
+        -- If you keep this check, member must already have the profile/admin list.
         if not self:IsSenderAuthorized(payload.profileId, sender) then
             if SF.Debug then
                 SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not an admin of profile", tostring(sender))
@@ -1817,8 +1812,8 @@ function Sync:HandleAuthLogs(sender, payload)
             return
         end
 
-        local senderRole = self.state.isCoordinator and "coordinator" or (self:IsHelper(sender) and "helper" or "unknown")
         if SF.Debug then
+            local senderRole = (sender == self.state.coordinator) and "coordinator" or (self:IsHelper(sender) and "helper" or "unknown")
             SF.Debug:Info("SYNC", "Accepting AUTH_LOGS from %s as %s (%d logs for %s [%d-%d])",
                 tostring(sender), senderRole, #payload.logs, tostring(payload.author),
                 tonumber(payload.fromCounter) or 0, tonumber(payload.toCounter) or 0)
@@ -1826,11 +1821,6 @@ function Sync:HandleAuthLogs(sender, payload)
     end
 
     local changed = self:MergeLogs(payload.profileId, payload.logs)
-    if changed then
-        self:RebuildProfile(payload.profileId)
-    end
-
-    local change = self:MergeLogs(payload.profileId, payload.logs)
     if changed then
         self:RebuildProfile(payload.profileId)
     end
@@ -1953,10 +1943,6 @@ function Sync:HandleProfileSnapshot(sender, payload)
 
     self:RebuildProfile(profileId)
 
-    if profile.RebuildLogIndex then
-        profile:RebuildLogIndex()
-    end
-
     -- Set as active profile (use profileId now)
     if SF.SetActiveProfileById then
         SF:SetActiveProfileById(profileId)
@@ -1976,9 +1962,6 @@ function Sync:HandleProfileSnapshot(sender, payload)
             profile:GetProfileName() or profileId,
             inserted or 0))
     end
-
-    -- Rebuild derived state so UI + member state matches imported logs
-    self:RebuildProfile(profileId)
 
     -- Now that we actually have the profile, run the normal sync assessment path:
     -- - if missing logs, it will Request MissingLogs()
@@ -2752,23 +2735,20 @@ function Sync:RebuildProfile(profileId)
         return false, "profile not found"
     end
 
-    -- 1) Ensure deterministic log order
+    -- 1) Ensure deterministic log order (MergeLogTables already sorts, but safe to re-sort)
     if type(profile._lootLogs) == "table" and type(profile._CompareLogs) == "function" then
-        table.sort(profile._lootLogs, function()
+        table.sort(profile._lootLogs, function(a, b)
             return profile:_CompareLogs(a, b)
         end)
     end
 
     -- 2) Rebuild index + per-author max counters (critical for dedup + AllocateNextCounter)
-    if type (profile.RebuildLogIndex) == "function" then
+    if type(profile.RebuildLogIndex) == "function" then
         profile:RebuildLogIndex()
     else
-        -- Fallback
-        profile._logIndex = profile._logIndex or {}
-        for k in pairs(profile._logIndex) do profile._logIndex[k] = nil  end
-
-        profile._authorCounters = profile._authorCounters or {}
-        for k in pairs(profile._authorCounters) do profile._authorCounters[k] = nil  end
+        -- Fallback (older profile versions)
+        profile._logIndex = {}
+        profile._authorCounters = {}
 
         for _, log in ipairs(profile._lootLogs or {}) do
             local id = (log and log.GetID and log:GetID()) or (log and log._id)
@@ -2787,11 +2767,12 @@ function Sync:RebuildProfile(profileId)
         end
     end
 
-    -- 3) If profile is already active, rebuild cached/UI state
+    -- 3) If profile is active, refresh cached/UI state (if your core uses this)
     if SF and SF.lootHelperDB and SF.lootHelperDB.activeProfileId == profileId
-        and type(SF.SetActiveProfileById) == "function" then
-            pcall(function()
-                SF:SetActiveProfileById(profileId)
+        and type(SF.SetActiveProfileById) == "function"
+    then
+        pcall(function()
+            SF:SetActiveProfileById(profileId)
         end)
     end
 
