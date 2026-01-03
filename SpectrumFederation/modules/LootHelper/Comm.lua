@@ -243,7 +243,16 @@ function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opt
     end
 
     local msg = envelope
-    prio = prio or "NORMAL"
+    
+    -- Resolve priority: use explicit prio, fall back to config based on channel
+    if not prio then
+        prio = (channelKey == "BULK") and self.cfg.bulkPrio or self.cfg.controlPrio
+    end
+    
+    DVerbose("Send: channelKey=%s type=%s prio=%s dist=%s target=%s", 
+        tostring(channelKey), tostring(msgType), tostring(prio), 
+        tostring(distribution), tostring(target or "nil"))
+    
     local callback = opts and opts.callback or nil
 
     -- By default: queue BULK; CONTROL sends immediately
