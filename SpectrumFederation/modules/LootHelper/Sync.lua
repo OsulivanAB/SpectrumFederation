@@ -676,6 +676,7 @@ function Sync:HandleSessionStart(sender, payload)
 
     -- Reset join status tracking for new session
     self.state._sentJoinStatusForSessionId = nil
+    self.state._profileReqInFlight = nil
 
     -- Reply after jitter
     local sid = self.state.sessionId
@@ -751,6 +752,104 @@ function Sync:GetRequestTargets(helpers, coordinator)
     return targets
 end
 
+-- Function Request profile snapshot from helpers (preferred) or coordinator (fallback).
+-- @param reason string Reason for request (for logging)
+-- @return boolean True if request was registered, false otherwise
+function Sync:RequestProfileSnapshot(reason)
+    if not self.state.active then return false end
+    if not self.state.sessionId then return false end
+    if type(self.state.profileId) ~= "string" or self.state.profileId == "" then return false end
+
+    -- Lightweight dedupe: don't spam profile requests for same session
+    if self.state._profileReqInFlight == self.state.sessionId then
+        return false
+    end
+
+    -- Build ordered target list: helpers first, coordinator fallback
+    local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    if not targets or #targets == 0 then
+        if SF.PrintWarning then
+            SF:PrintWarning("Cannot request profile: no targets available")
+        end
+        return false
+    end
+
+    local requestId = self:NewRequestId()
+    local ok = self:RegisterRequest(requestId, "NEED_PROFILE", targets[1], {
+        sessionId   = self.state.sessionId,
+        targets     = targets,  -- fallback list
+    })
+
+    if ok then
+        self.state._profileReqInFlight = self.state.sessionId
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Requesting profile snapshot (reason: %s) from initial target %s (%d targets total: %s)", 
+                tostring(reason), tostring(targets[1]), #targets, table.concat(targets, ", "))
+        end
+    end
+
+    return ok
+end
+
+-- Function Request missing log ranges from helpers (preferred) or coordinator (fallback).
+-- @param missingRanges table Array of {author, fromCounter, toCounter}
+-- @param reason string Reason for request (for logging)
+-- @return boolean True if any requests were registered, false otherwise
+function Sync:RequestMissingLogs(missingRanges, reason)
+    if not self.state.active then return false end
+    if not self.state.sessionId then return false end
+    if type(self.state.profileId) ~= "string" or self.state.profileId == "" then return false end
+    if type(missingRanges) ~= "table" or #missingRanges == 0 then return false end
+
+    -- Build ordered target list: helpers first, coordinator fallback
+    local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    if not targets or #targets == 0 then
+        if SF.PrintWarning then
+            SF:PrintWarning("Cannot request missing logs: no targets available")
+        end
+        return false
+    end
+
+    -- Cap to avoid spamming
+    local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeededLogs) or 8
+    local count = 0
+
+    for i, range in ipairs(missingRanges) do
+        if i > maxRanges then break end
+
+        if type(range) == "table"
+            and type(range.author) == "string"
+            and type(range.fromCounter) == "number"
+            and type(range.toCounter) == "number"
+        then
+            local requestId = self:NewRequestId()
+            local ok = self:RegisterRequest(requestId, "NEED_LOGS", targets[1], {
+                sessionId   = self.state.sessionId,
+                profileId   = self.state.profileId,
+                author      = range.author,
+                fromCounter = range.fromCounter,
+                toCounter   = range.toCounter,
+                targets     = targets,  -- fallback list
+            })
+
+            if ok then
+                count = count + 1
+                if SF.Debug then
+                    SF.Debug:Verbose("SYNC", "Requesting logs for %s [%d-%d] from initial target %s (%d targets: %s)",
+                        tostring(missing.author), missing.minCounter, missing.maxCounter,
+                        tostring(targets[1]), #targets, table.concat(targets, ", "))
+                end
+            end
+        end
+    end
+
+    if count > 0 and SF.Debug then
+        SF.Debug:Verbose("SYNC", "Requested %d missing log ranges (reason: %s)", count, tostring(reason))
+    end
+
+    return count > 0
+end
+
 -- Function Determine whether local client has the session profile and whether it's missing logs.
 -- @param profileId string Session profile id
 -- @param sessionAuthorMax table Map [author] = maxCounterSeen
@@ -788,10 +887,7 @@ function Sync:SendJoinStatus()
 
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
-        local requestId = self:NewRequestId()
-        self:RegisterRequest(requestId, "NEED_PROFILE", self.state.coordinator, {
-            sessionId       = self.state.sessionId,
-        })
+        self:RequestProfileSnapshot("join-status")
         return
     end
 
@@ -802,10 +898,7 @@ function Sync:SendJoinStatus()
     local missing = self:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax)
 
     if missing and #missing > 0 then
-        payloadBase.missing = missing
-        if SF.LootHelperComm then
-            SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, payloadBase, "WHISPER", self.state.coordinator, "NORMAL")
-        end
+        self:RequestMissingLogs(missing, "join-status")
         return
     end
 
@@ -886,17 +979,8 @@ function Sync:HandleNewLog(sender, payload)
     -- If we don't have the profile yet, request snapshot
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
-        if not self.state.isCoordinator and self.state.coordinator and SF.LootHelperComm then
-            SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, {
-                sessionId       = self.state.sessionId,
-                profileId       = profileId,
-                supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
-                supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
-                addonVersion    = self:_GetAddonVersion(),
-                supportsEnc     = (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
-                                    and SF.SyncProtocol.GetSupportedEncodings()
-                                    or nil,
-            }, "WHISPER", self.state.coordinator, "NORMAL")
+        if not self.state.isCoordinator then
+            self:RequestProfileSnapshot("new-log")
         end
         return
     end
@@ -941,7 +1025,7 @@ function Sync:HandleNewLog(sender, payload)
     end
 
     -- If we detected a gap, request missing logs
-    if not self.state.isCoordinator and self.state.coordinator
+    if not self.state.isCoordinator
         and type(author) == "string" and type(counter) == "number"
         and counter > (localMaxBefore + 1)
     then
@@ -952,20 +1036,7 @@ function Sync:HandleNewLog(sender, payload)
                 toCounter   = counter - 1,
             }
         }
-
-        if SF.LootHelperComm then
-            SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, {
-                sessionId       = self.state.sessionId,
-                profileId       = profileId,
-                missing         = missing,
-                supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
-                supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
-                addonVersion    = self:_GetAddonVersion(),
-                supportsEnc     = (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
-                                    and SF.SyncProtocol.GetSupportedEncodings()
-                                    or nil,
-            }, "WHISPER", self.state.coordinator, "NORMAL")
-        end
+        self:RequestMissingLogs(missing, "gap-repair")
     end
 
     -- Update UI / derived state
@@ -1199,13 +1270,19 @@ function Sync:HandleNeedProfile(sender, payload)
 
     self:_RecordHandshakeReply(sender, payload, "NEED_PROFILE")
 
-    if not self.state.active or not self.state.isCoordinator then return end
+    -- Serve eligibility: coordinator OR helper
+    if not self.state.active then return end
+    if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
 
     -- Safety: only send to group members (prevents random whisper abuse)
-    -- This is part of the session start pipeline not the admin sync pipeline so we can restrict to group members
     self:UpdatePeersFromRoster()
     local peer = self:GetPeer(sender)
     if not peer or not peer.inGroup then return end
+
+    local serveRole = self.state.isCoordinator and "coordinator" or "helper"
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Serving profile snapshot as %s to %s", serveRole, tostring(sender))
+    end
 
     local snapPayload = self:BuildProfileSnapshot(self.state.profileId)
     if not snapPayload then
@@ -1226,7 +1303,8 @@ function Sync:HandleNeedProfile(sender, payload)
 
     -- Small jitter in case multiple people need it at once
     self:RunWithJitter(0, 250, function()
-        if not self.state.active or not self.state.isCoordinator then return end
+        if not self.state.active then return end
+        if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
         if not SF.LootHelperComm then return end
 
         if enc then
@@ -1263,8 +1341,11 @@ function Sync:HandleNeedLogs(sender, payload)
 
     self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
 
-    if not self.state.active or not self.state.isCoordinator then return end
+    -- Serve eligibility: coordinator OR helper
+    if not self.state.active then return end
+    if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
 
+    -- Safety: only send to group members
     self:UpdatePeersFromRoster()
     local peer = self:GetPeer(sender)
     if not peer or not peer.inGroup then return end
@@ -1273,6 +1354,12 @@ function Sync:HandleNeedLogs(sender, payload)
 
     local profile = self:FindLocalProfileById(self.state.profileId)
     if not profile then return end
+
+    local serveRole = self.state.isCoordinator and "coordinator" or "helper"
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Serving missing logs as %s to %s (%d ranges requested)",
+            serveRole, tostring(sender), #payload.missing)
+    end
 
     local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeedLogs or self.cfg.maxMissingRangesPerNeededLogs) or 8
     local spacingSec = (tonumber(self.cfg.needLogsSendSpacingMs) or 75) / 1000
@@ -1296,7 +1383,8 @@ function Sync:HandleNeedLogs(sender, payload)
             local delay = (i - 1) * spacingSec
 
             self:RunAfter(delay, function()
-                if not self.state.active or not self.state.isCoordinator then return end
+                if not self.state.active then return end
+                if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
                 if not SF.LootHelperComm then return end
 
                 -- Build inside callback to spread CPU cost too
@@ -1317,6 +1405,10 @@ function Sync:HandleNeedLogs(sender, payload)
                     toCounter   = toC,
                     logs        = out,
                 }
+
+                if type(payload.requestId) == "string" and payload.requestId ~= "" then
+                    resp.requestId = payload.requestId
+                end
 
                 if enc then
                     SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK", { enc = enc })
@@ -1430,10 +1522,47 @@ function Sync:HandleAuthLogs(sender, payload)
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.logs) ~= "table" then return end
 
-    -- Trust policy: If you're not the coordinator, only accept logs from the coordinator
-    -- TODO: Allow Helpers as well
-    if self.state.coordinator and sender ~= self.state.coordinator and not self.state.isCoordinator then
-        return
+    -- Trust policy: accept from coordinator or helper
+    if not self.state.isCoordinator then
+        -- Members must accept from coordinator OR helper
+        if not self:IsTrustedDataSender(sender) then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not a trusted sender", tostring(sender))
+            end
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not a trusted sender."):format(sender))
+            end
+            return
+        end
+
+        -- Safety: sender must be in group
+        if not self:IsRequesterInGroup(sender) then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not in group", tostring(sender))
+            end
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not in group."):format(sender))
+            end
+            return
+        end
+
+        -- Verify sender is authorized for this profile (admin check)
+        if not self:IsSenderAuthorized(payload.profileId, sender) then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not an admin of profile", tostring(sender))
+            end
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not an admin of profile."):format(sender))
+            end
+            return
+        end
+
+        local senderRole = self.state.isCoordinator and "coordinator" or (self:IsHelper(sender) and "helper" or "unknown")
+        if SF.Debug then
+            SF.Debug:Info("SYNC", "Accepting AUTH_LOGS from %s as %s (%d logs for %s [%d-%d])",
+                tostring(sender), senderRole, #payload.logs, tostring(payload.author),
+                tonumber(payload.fromCounter) or 0, tonumber(payload.toCounter) or 0)
+        end
     end
 
     self:MergeLogs(payload.profileId, payload.logs)
@@ -1473,12 +1602,32 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.snapshot) ~= "table" then return end
 
-    -- Trust policy (minimal): only accept snapshots from the coordinator
-    if self.state.coordinator and sender ~= self.state.coordinator then
+    -- Trust policy: accept from coordinator or helper
+    if not self:IsTrustedDataSender(sender) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not a trusted sender", tostring(sender))
+        end
         if SF.PrintWarning then
-            SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not the coordinator (%s)."):format(sender, tostring(self.state.coordinator)))
+            SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not a trusted sender."):format(sender))
         end
         return
+    end
+
+    -- Safety: sender must be in group
+    if not self:IsRequesterInGroup(sender) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not in group", tostring(sender))
+        end
+        if SF.PrintWarning then
+            SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not in group."):format(sender))
+        end
+        return
+    end
+
+    local senderRole = self.state.isCoordinator and "coordinator" or (self:IsHelper(sender) and "helper" or "unknown")
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Accepting PROFILE_SNAPSHOT from %s as %s (profile: %s)",
+            tostring(sender), senderRole, tostring(payload.profileId))
     end
 
     -- Validate snapshot
@@ -1546,6 +1695,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
 
     if type(payload.requestId) == "string" and payload.requestId ~= "" then
         self:CompleteRequest(payload.requestId)
+    end
+
+    -- Clear profile request dedupe marker on successful import
+    if self.state._profileReqInFlight == self.state.sessionId then
+        self.state._profileReqInFlight = nil
     end
 
     if SF.PrintInfo then
@@ -1709,6 +1863,49 @@ function Sync:_SendNeedProfileReq(req, target)
     return SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, payload, "WHISPER", target, "NORMAL")
 end
 
+-- Function Send NEED_LOGS request for missing log ranges.
+-- @param req table Request state table
+-- @param target string Target "Name-Realm"
+-- @return boolean True if sent, false otherwise
+function Sync:_SendNeedLogsReq(req, target)
+    if not self.state.active then return false end
+    if not SF.LootHelperComm then return false end
+    if type(target) ~= "string" or target == "" then return false end
+
+    local meta = req.meta or {}
+    local sessionId = meta.sessionId or self.state.sessionId
+    local profileId = meta.profileId or self.state.profileId
+
+    if type(sessionId) ~= "string" or sessionId == "" then return false end
+    if type(profileId) ~= "string" or profileId == "" then return false end
+
+    local missing = {}
+    if type(meta.author) == "string" and type(meta.fromCounter) == "number" and type(meta.toCounter) == "number" then
+        table.insert(missing, {
+            author      = meta.author,
+            fromCounter = meta.fromCounter,
+            toCounter   = meta.toCounter,
+        })
+    end
+
+    if #missing == 0 then return false end
+
+    local payload = {
+        sessionId       = sessionId,
+        profileId       = profileId,
+        requestId       = req.id,
+        missing         = missing,
+        supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
+        supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
+        addonVersion    = self:_GetAddonVersion(),
+        supportsEnc     = (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+                            and SF.SyncProtocol.GetSupportedEncodings()
+                            or nil,
+    }
+
+    return SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, payload, "WHISPER", target, "NORMAL")
+end
+
 -- Function Attempt to send a request (called initially and on timeouts).
 -- @param req table Request state table
 -- @return nil
@@ -1746,6 +1943,8 @@ function Sync:_SendRequestAttempt(req)
         ok = self:_SendAdminLogReq(req, target)
     elseif req.kind == "NEED_PROFILE" then
         ok = self:_SendNeedProfileReq(req, target)
+    elseif req.kind == "NEED_LOGS" then
+        ok = self:_SendNeedLogsReq(req, target)
     else
         self:_FailRequest(req, "unknown request kind: " .. tostring(req.kind))
         return
@@ -1898,6 +2097,113 @@ function Sync:IsSenderAuthorized(profileId, sender)
         if admin == sender then return true end
     end
     return false
+end
+
+-- Function Check if a given player is a helper in the current session.
+-- @param nameRealm string Player identifier ("Name-Realm")
+-- @return boolean True if nameRealm is in helpers list, false otherwise
+function Sync:IsHelper(nameRealm)
+    if type(nameRealm) ~= "string" or nameRealm == "" then return false end
+    if not self.state.helpers or type(self.state.helpers) ~= "table" then return false end
+
+    -- Normalize input
+    local normalizedInput = nameRealm
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        normalizedInput = SF.NameUtil.NormalizeNameRealm(nameRealm)
+        if not normalizedInput then return false end
+    end
+
+    -- Check each helper in array
+    for _, helper in ipairs(self.state.helpers) do
+        local normalizedHelper = helper
+        if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+            normalizedHelper = SF.NameUtil.NormalizeNameRealm(helper)
+        end
+
+        -- Compare using SamePlayer when available, else string equality
+        if SF.NameUtil and SF.NameUtil.SamePlayer then
+            if SF.NameUtil.SamePlayer(normalizedInput, normalizedHelper) then
+                return true
+            end
+        else
+            if normalizedInput == normalizedHelper then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+-- Function Check if the local player is a helper in the current session.
+-- @param none
+-- @return boolean True if self is helper, false otherwise
+function Sync:IsSelfHelper()
+    local selfId = SelfId()
+    if not selfId then return false end
+    return self:IsHelper(selfId)
+end
+
+-- Function Check if sender is trusted to send authoritative data (coordinator or helper).
+-- @param sender string Player identifier ("Name-Realm")
+-- @return boolean True if sender is coordinator or helper, false otherwise
+function Sync:IsTrustedDataSender(sender)
+    if type(sender) ~= "string" or sender == "" then return false end
+
+    -- Normalize sender
+    local normalizedSender = sender
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        normalizedSender = SF.NameUtil.NormalizeNameRealm(sender)
+        if not normalizedSender then return false end
+    end
+
+    -- Check if sender is coordinator
+    if self.state.coordinator then
+        local normalizedCoordinator = self.state.coordinator
+        if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+            normalizedCoordinator = SF.NameUtil.NormalizeNameRealm(self.state.coordinator)
+        end
+
+        if SF.NameUtil and SF.NameUtil.SamePlayer then
+            if SF.NameUtil.SamePlayer(normalizedSender, normalizedCoordinator) then
+                return true
+            end
+        else
+            if normalizedSender == normalizedCoordinator then
+                return true
+            end
+        end
+    end
+
+    -- Check if sender is helper
+    if self:IsHelper(normalizedSender) then
+        return true
+    end
+
+    return false
+end
+
+-- Function Check if requester is in the current group roster.
+-- @param sender string Player identifier ("Name-Realm")
+-- @return boolean True if sender is in group and peer.inGroup is true, false otherwise
+function Sync:IsRequesterInGroup(sender)
+    if type(sender) ~= "string" or sender == "" then return false end
+
+    -- Normalize sender
+    local normalizedSender = sender
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        normalizedSender = SF.NameUtil.NormalizeNameRealm(sender)
+        if not normalizedSender then return false end
+    end
+
+    -- Update roster to get current group state
+    self:UpdatePeersFromRoster()
+
+    -- Get peer record
+    local peer = self:GetPeer(normalizedSender)
+    if not peer then return false end
+
+    return peer.inGroup == true
 end
 
 -- Function Validate session-related payloads for consistency with current session state.
