@@ -70,6 +70,8 @@ Sync.cfg = Sync.cfg or {
     -- Backpressure for log bursts (coordinator -> member)
     maxMissingRangesPerNeededLogs   = 8,    -- clamp abusive/huge requests
     needLogsSendSpacingMs           = 50,   -- space out AUTH_LOGS sends to avoid spikes
+
+    gapRepairCooldownSec = 2,
 }
 
 Sync.state = Sync.state or {
@@ -505,26 +507,14 @@ function Sync:FinalizeAdminConvergence()
         return
     end
 
-    -- 1) compute local
+    -- 1) compute local maxima
     local localMax = profile:ComputeAuthorMax() or {}
 
-    -- 2) compute target (union maxima across admin statuses)
-    local targetMax = {}
-    for author, m in pairs(localMax) do targetMax[author] = m end
-
-    for admin, st in pairs(self.state.adminStatuses or {}) do
-        if st and st.hasProfile and type(st.authorMax) == "table" then
-            for author, m in pairs(st.authorMax) do
-                if type(author) == "string" and type(m) == "number" then
-                    local prev = targetMax[author] or 0
-                    if m > prev then targetMax[author] = m end
-                end
-            end
-        end
-    end
+    -- 2) compute coordinator "have" as contiguous prefix
+    local localContig = self:ComputeContigAuthorMax(profileId)
 
     -- 3) compute missing ranges for the coordinator
-    local missing = self:ComputeMissingLogRequests(localMax, targetMax)
+    local missing = self:ComputeMissingLogRequests(localContig, targetMax)
 
     -- 4) send LOG_REQs to a reasonable provider
     conv.pendingReq = {}
@@ -1044,8 +1034,11 @@ function Sync:SendJoinStatus()
     local localAuthorMax = profile:ComputeAuthorMax()
     payloadBase.localAuthorMax = localAuthorMax
 
+    local localContig = self:ComputeContigAuthorMax(profileId)
     local remoteAuthorMax = self.state.authorMax or {}
-    local missing = self:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax)
+    local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax)
+
+
 
     if missing and #missing > 0 then
         self:RequestMissingLogs(missing, "join-status")
@@ -1137,59 +1130,53 @@ function Sync:HandleNewLog(sender, payload)
         return
     end
 
-    -- Trust policy for live updates:
-    -- Accept from coordinator always; otherwise require sender is an admin of this profile
-    if sender ~= self.state.coordinator then
+    -- Trust policy: accept from coordinator; otherwise require sender is an admin
+    if not self:_SamePlayer(sender, self.state.coordinator) then
         if not self:IsSenderAuthorized(profileId, sender) then
             if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(sender, profileId))
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
             end
             return
         end
     end
-
-    -- Duplicate protection: fast path using logId index if available
-    local logId = logTable._logId or logTable.logId
+    
+    -- Dedupe by logId
+    local logId = self:_ExtractLogId(logTable)
     if logId and profile._logIndex and profile._logIndex[logId] then
         return
     end
+    
+    -- Gap detection BEFORE merge
+    local hasGap, gapFrom, gapTo = self:DetectGap(profileId, logTable)
 
-    -- Gap Detection: Capture local max BEFORE merging
-    local author = logTable._author or logTable.author
-    local counter = logTable._counter or logTable.counter
-
-    local localMaxBefore = 0
-    if type(author) == "string" and type(counter) == "number" and profile.ComputeAuthorMax then
-        local authorMaxMap = profile:ComputeAuthorMax()
-        localMaxBefore = authorMaxMap and authorMaxMap[author] or 0
-        localMaxBefore = tonumber(localMaxBefore) or 0
-    end
-
-    -- Merge
+    -- Apply log
     local inserted = self:MergeLogs(profileId, { logTable })
-
     if not inserted then
         return
     end
 
+    -- Update UI / derived state
+    self:RebuildProfile(profileId)
+
     -- If we detected a gap, request missing logs
-    if not self.state.isCoordinator
-        and type(author) == "string" and type(counter) == "number"
-        and counter > (localMaxBefore + 1)
-    then
-        local missing = {
-            {
-                author      = author,
-                fromCounter = localMaxBefore + 1,
-                toCounter   = counter - 1,
-            }
-        }
-        self:RequestMissingLogs(missing, "gap-repair")
+    if hasGap and type(gapFrom) == "number" and type(gapTo) == "number" then
+        local author = (self:_ExtractAuthorCounter(logTable))
+        author = author
+        if type(author) == "string" and author ~= "" then
+            self:RequestGapRepair(profileId, author, gapFrom, gapTo, "new-log-gap")
+        end
     end
 
-    -- Update UI / derived state
-    if self.RebuildProfile then
-        self:RebuildProfile(profileId)
+    -- Keep local session authorMax fresh
+    do
+        local author, counter = self:_ExtractAuthorCounter(logTable)
+        if type(author) == "string" and type(counter) == "number" then
+            self.state.authorMax = self.state.authorMax or {}
+            local prev = tonumber(self.state.authorMax[author]) or 0
+            if counter > prev then
+                self.state.authorMax[author] = counter
+            end
+        end
     end
 end
 
@@ -2207,6 +2194,8 @@ function Sync:_SendRequestAttempt(req)
     local ok = false
     if req.kind == "ADMIN_LOG_REQ" then
         ok = self:_SendAdminLogReq(req, target)
+    elseif req.kind == "LOG_REQ" then
+        ok = self:_SendLogReq(req, target)
     elseif req.kind == "NEED_PROFILE" then
         ok = self:_SendNeedProfileReq(req, target)
     elseif req.kind == "NEED_LOGS" then
@@ -2461,7 +2450,7 @@ function Sync:IsSenderAuthorized(profileId, sender)
     if type(admins) ~= "table" then return false end
 
     for _, admin in ipairs(admins) do
-        if admin == sender then return true end
+        if self:_SamePlayer(admin, sender) then return true end
     end
     return false
 end
@@ -2779,6 +2768,98 @@ function Sync:RebuildProfile(profileId)
     return true, nil
 end
 
+-- Function Extract stable log id from net table (supports multiple field names)
+-- @param t table Log table
+-- @return string|nil logId
+function Sync:_ExtractLogId(t)
+    if type(t) ~= "table" then return nil end
+    return t._logId or t.logId or t._id or t.id
+end
+
+-- Function Extract author and counter from net table (supports multiple field names)
+-- @param t table Log table
+-- @return string|nil author
+function Sync:_ExtractAuthorCounter(t)
+    if type(t) ~= "table" then return nil, nil end
+    local author = t._author or t.author
+    local counter = t._counter or t.counter
+    if type(counter) == "string" then counter = tonumber(counter) end
+    counter = tonumber(counter)
+    if counter then counter = math.floor(counter) end
+    return author, counter
+end
+
+-- Function Compute highest contiguous counter prefix we have for an author (1..N with no gaps)
+-- @param profileId string Stable profile id
+-- @param author string Author name
+-- @return number contig Highest contiguous counter (0 if none)
+function Sync:_ComputeContigCounter(profileId, author)
+    if type(profileId) ~= "string" or profileId == "" then return 0 end
+    if type(author) ~= "string" or author == "" then return 0 end
+
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then return 0 end
+
+    local seen = {}
+
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
+        if a == author then
+            local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
+            c = tonumber(c)
+            if c then
+                c = math.floor(c)
+                if c >= 1 then
+                    seen[c] = true
+                end
+            end
+        end
+    end
+
+    local contig = 0
+    while seen[contig +1] do
+        contig = contig + 1
+    end
+    return contig
+end
+
+-- Function Compute highest contiguous counter prefix we have for all authors.
+-- @param profileId string Stable profile id
+-- @return table contig Map [author] = highest contiguous counter (0 if none)
+function Sync:ComputeContigAuthorMax(profileId)
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then return {} end
+
+    local seenByAuthor = {}
+
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
+        local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
+        c = tonumber(c)
+
+        if type(a) == "string" and a ~= "" and c and c >= 1 then
+            c = math.floor(c)
+            local set = seenByAuthor[a]
+            if not set then
+                set = {}
+                seenByAuthor[a] = set
+            end
+            set[c] = true
+        end
+    end
+
+    local contig = {}
+    for author, set in pairs(seenByAuthor) do
+        local n = 0
+        while set[n + 1] do
+            n = n + 1
+        end
+        contig[author] = n
+    end
+
+    return contig
+end
+
 -- Function Detect whether applying a log indicates a gap in the author/counter sequence.
 -- @param profileId string Stable profile id
 -- @param logTable table Must include author and counter fields
@@ -2786,6 +2867,174 @@ end
 -- @return number|nil gapFrom If hasGap, the starting counter of the gap
 -- @return number|nil gapTo If hasGap, the ending counter of the gap
 function Sync:DetectGap(profileId, logTable)
+    local author, counter = self:_ExtractAuthorCounter(logTable)
+    if type(author) ~= "string" or author == "" then return false end
+    if type(counter) ~= "number" or counter < 1 then return false end
+
+    local contig = self:_ComputeContigCounter(profileId, author)
+    if counter <= (contig + 1) then
+        return false
+    end
+
+    return true, contig + 1, counter - 1
+end
+
+-- Function Check if there is an outstanding log range request for the given profile/author/range.
+-- @param profileId string Stable profile id
+-- @param author string Author name
+-- @param fromCounter number Starting counter of range
+-- @param toCounter number Ending counter of range
+-- @return boolean True if overlapping request exists, false otherwise
+-- Returns true only if an existing request fully covers [fromCounter, toCounter]
+function Sync:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter)
+    if type(self.state) ~= "table" then return false end
+    if type(self.state.requests) ~= "table" then return false end
+    if type(profileId) ~= "string" or profileId == "" then return false end
+    if type(author) ~= "string" or author == "" then return false end
+
+    fromCounter = tonumber(fromCounter)
+    toCounter = tonumber(toCounter)
+    if not fromCounter or not toCounter then return false end
+
+    for _, req in pairs(self.state.requests) do
+        if type(req) == "table" and type(req.meta) == "table" then
+            if req.kind == "NEED_LOGS" or req.kind == "LOG_REQ" or req.kind == "ADMIN_LOG_REQ" then
+                local m = req.meta
+                if m.profileId == profileId and m.author == author then
+                    local f = tonumber(m.fromCounter)
+                    local t = tonumber(m.toCounter)
+                    if f and t then
+                        -- Suppress only if existing request fully covers new desired range
+                        if f <= fromCounter and t >= toCounter then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return false
+end
+
+-- Function send a LOG_REQ (admin-to-admin gap repair). This is like _SendAdminLogReq, but works for any admin.
+-- @param req table Request state table
+-- @param target string "Name-Realm" of target admin
+-- @return boolean True if send succeeded, false otherwise
+function Sync:_SendLogReq(req, target)
+    if not self.state.active then return false end
+    if not SF.LootHelperComm then return false end
+    if type(target) ~= "string" or target == "" then return false end
+    if type(req) ~= "table" or type(req.meta) ~= "table" then return false end
+
+    local meta = req.meta
+    local sessionId = meta.sessionId or self.state.sessionId
+    local profileId = meta.profileId or self.state.profileId
+    if type(sessionId) ~= "string" or sessionId == "" then return false end
+    if type(profileId) ~= "string" or profileId == "" then return false end
+
+    -- Only admins should send LOG_REQ (receiver enforces too, but avoid noise)
+    local me = SelfId()
+    if not self:IsSenderAuthorized(profileId, me) then return false end
+
+    local payload = {
+        sessionId   = sessionId,
+        profileId   = profileId,
+        requestId   = req.id,
+        author      = meta.author,
+        fromCounter = meta.fromCounter,
+        toCounter   = meta.toCounter,
+        supportsEnc = meta.supportsEnc,
+    }
+
+    return SF.LootHelperComm:Send(
+        "CONTROL",
+        self.MSG.LOG_REQ,
+        payload,
+        "WHISPER",
+        target,
+        "NORMAL"
+    )
+end
+
+-- Function Spam-guarded gap repair request (used by NEW_LOG handler)
+-- Chooses LOG_REQ if we're an admin; otherwise uses NEED_LOGS
+-- @param profileId string Stable profile id
+-- @param author string Author name
+-- @param gapFrom number Starting counter of gap
+-- @param gapTo number Ending counter of gap
+-- @param reason string|nil Optional reason for logging
+-- @return boolean True if request sent, false otherwise
+function Sync:RequestGapRepair(profileId, author, gapFrom, gapTo, reason)
+    if not self.state.active then return false end
+    if type(profileId) ~= "string" or profileId == "" then return false end
+    if self.state.profileId and self.state.profileId ~= profileId then return false end
+    if type(author) ~= "string" or author == "" then return false end
+
+    gapFrom = tonumber(gapFrom)
+    gapTo = tonumber(gapTo)
+    if not gapFrom or not gapTo then return false end
+    gapFrom = math.max(1, math.floor(gapFrom))
+    gapTo = math.max(1, math.floor(gapTo))
+    if gapFrom > gapTo then return false end
+
+    -- Suppress only if we already have a request that fully covers this range
+    if self:_HasOutstandingLogRangeRequest(profileId, author, gapFrom, gapTo) then
+        return false
+    end
+
+    -- Per-author cooldown
+    self.state.gapRepair = self.state.gapRepair or {}
+    local key = ("%s|%s"):format(profileId, author)
+    local now = Now()
+    local cooldown = tonumber(self.cfg.gapRepairCooldownSec) or 2
+
+    local rec = self.state.gapRepair[key]
+    if type(rec) == "table" and type(rec.lastAt) == "number" then
+        if (now - rec.lastAt) < cooldown then
+            return false
+        end
+    end
+
+    -- Choose targets (helpers first, coordinator fallback)
+    local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    if not targets or #targets == 0 then return false end
+
+    -- Prefer LOG_REQ if we are an admin; else use NEED_LOGS
+    local me = SelfId()
+    local canLogReq = self:IsSenderAuthorized(profileId, me)
+    local kind = canLogReq and "LOG_REQ" or "NEED_LOGS"
+
+    local requestId = self:NewRequestId()
+
+    local supportsEnc =
+        (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+            and SF.SyncProtocol.GetSupportedEncodings()
+            or nil
+
+    -- fallback targets (exclude the first, since RegisterRequest adds it separately)
+    local fallback = {}
+    for i = 2, #targets do fallback[#fallback + 1] = targets[i] end
+
+    local ok = self:RegisterRequest(requestId, kind, targets[1], {
+        sessionId   = self.state.sessionId,
+        profileId   = profileId,
+        author      = author,
+        fromCounter = gapFrom,
+        toCounter   = gapTo,
+        supportsEnc = supportsEnc,
+        targets     = fallback,
+    })
+
+    if ok then
+        self.state.gapRepair[key] = { lastAt = now, fromCounter = gapFrom, toCounter = gapTo }
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Gap repair requested via %s for %s: %s [%d-%d] (%s)",
+                tostring(kind), tostring(profileId), tostring(author), gapFrom, gapTo, tostring(reason or "no reason"))
+        end
+    end
+
+    return ok
 end
 
 -- ============================================================================
