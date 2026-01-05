@@ -119,6 +119,8 @@ Sync.state = Sync.state or {
         heartbeatTimerHandle    = nil,  -- So it can be stopped cleanly
         takeoverAttemptedAt     = nil,
         lastHeartbeatSentAt     = nil,
+        monitorTimerHandle      = nil,  -- ticker for admin takeover monitor
+        lastTakeoverRound       = nil,  -- last deterministic takeover "round" we attempted
     }
 }
 
@@ -345,6 +347,7 @@ function Sync:OnGroupRosterUpdate()
 
     -- Keep heartbeat sender correct based on current roster/distribution/coordinator status
     self:EnsureHeartbeatSender("OnGroupRosterUpdate")
+    self:EnsureHeartbeatMonitor("OnGroupRosterUpdate")
 end
 
 -- Function Start a new SF Loot Helper session as coordinator (Sequence 1 -> 2).
@@ -443,6 +446,12 @@ function Sync:_ResetSessionState(reason)
                 pcall(function() hb.heartbeatTimerHandle:Cancel() end)
             end
             hb.heartbeatTimerHandle = nil
+
+            if hb.monitorTimerHandle and hb.monitorTimerHandle.Cancel then
+                pcall(function() hb.monitorTimerHandle:Cancel() end)
+            end
+            hb.monitorTimerHandle = nil
+
             hb.lastHeartbeatAt = nil
             hb.lastCoordMessageAt = nil
             hb.missedHeartbeats = 0
@@ -1122,6 +1131,287 @@ function Sync:EnsureHeartbeatSender(reason)
     return false
 end
 
+-- Function Determine whether heartbeat monitor should run (member only).
+-- @param none
+-- @return boolean True if should run, false otherwise
+function Sync:_ShouldRunHeartbeatMonitor()
+    if not (self.state and self.state.active) then return false end
+    if self.state.isCoordinator then return false end
+    if not GetGroupDistribution() then return false end
+
+    if type(self.state.sessionId) ~= "string" or self.state.sessionId == "" then return false end
+    if type(self.state.profileId) ~= "string" or self.state.profileId == "" then return false end
+    if type(self.state.coordinator) ~= "string" or self.state.coordinator == "" then return false end
+    if type(self.state.coordEpoch) ~= "number" then return false end
+
+    -- Must be an authorized admin of the session profile
+    local ok = self:CanSelfCoordinate(self.state.profileId)
+    if not ok then return false end
+
+    return true
+end
+
+-- Function Determine whether heartbeat monitor is currently running.
+-- @param none
+-- @return boolean True if running, false otherwise
+function Sync:IsHeartbeatMonitorRunning()
+    local hb = self.state and self.state.heartbeat
+    return (type(hb) == "table") and (hb.monitorTimerHandle ~= nil)
+end
+
+-- Function Start heartbeat monitor (member only).
+-- @param none
+-- @return boolean True if started or already running, false otherwise
+function Sync:StopHeartbeatMonitor(reason)
+    local hb = self.state and self.state.heartbeat
+    if type(hb) ~= "table" then return end
+
+    local h = hb.monitorTimerHandle
+    hb.monitorTimerHandle = nil
+
+    if h and h.Cancel then
+        pcall(function() h:Cancel() end)
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Heartbeat monitor stopped (reason: %s)", tostring(reason or "unknown"))
+    end
+end
+
+-- Function Start heartbeat monitor (member only).
+-- @param reason string|nil Reason for starting (for logging)
+-- @return boolean True if started or already running, false otherwise
+function Sync:_ComputeTakeoverCandidates(profileId)
+    if type(profileId) ~= "string" or profileId == "" then return {} end
+
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile or not profile.GetAdminUsers then return {} end
+
+    local admins = profile:GetAdminUsers() or {}
+
+    -- map normalizedKey -> canonicalName
+    -- TODO: It'd nice to have this determined by performance or something. Whoever's system is currently best equipped.
+    local adminSet = {}
+    for _, a in ipairs(admins) do
+        if type(a) == "string" and a ~= "" then
+            local full = NormalizedNameRealm(a) or a
+            local key = self:_NormalizeNameRealmForCompare(full) or full
+            if key and key ~= "" then
+                adminSet[key] = full
+            end
+        end
+    end
+
+    self:UpdatePeersFromRoster()
+
+    local coordKey = self:_NormalizeNameRealmForCompare(self.state.coordinator) or ""
+    local candidates, seen = {}, {}
+
+    for name, peer in pairs(self.state.peers or {}) do
+        if peer and peer.inGroup then
+            if peer.online ~= false then
+                local full = NormalizeNameRealm(name) or name
+                local key = self:_NormalizeNameRealmForCompare(full) or full
+
+                if key and key ~= "" and key ~= coordKey and adminSet[key] then
+                    if not seen[key] then
+                        seen[key] = true
+                        table.insert(candidates, adminSet[key])
+                    end                    
+                end
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        local ka = self:_NormalizeNameRealmForCompare(a) or a
+        local kb = self:_NormalizeNameRealmForCompare(b) or b
+        return ka < kb
+    end)
+
+    return candidates
+end
+
+-- Function Start heartbeat monitor (member only).
+-- @param none 
+-- @return nil
+function Sync:_HeartbeatMonitorTick()
+    if not self:_ShouldRunHeartbeatMonitor() then return end
+
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+
+    local interval = tonumber(self.cfg.heartbeatIntervalSec) or 30
+    if interval < 5 then interval = 5 end
+
+    local missThreshold = tonumber(self.cfg.heartbeatMissThreshold) or 3
+    if missThreshold < 1 then missThreshold = 1 end
+
+    local grace = tonumber(self.cfg.heartbeatMissGrace) or 0
+    if grace < 0 then grace = 0 end
+
+    local lastSeen = math.max(tonumber(hb.lastheartbeatAt) or 0, tonumber(hb.lastCoordMessageAt) or 0)
+    local now = Now()
+
+    -- If we just joined via SES_START/REANNOUNCE and haven't recorded seenAt yet, baseline to now so we don't instantly "timeout"
+    if lastSeen <= 0 then
+        hb.lastCoordMessageAt = now
+        hb.missedHeartbeats = 0
+        return
+    end
+
+    local elapsed = now - lastSeen
+    hb.missedHeartbeats = math.floor(elapsed / interval)
+
+    local thresholdSec = (missThreshold * interval) + grace
+    if elapsed <= thresholdSec then
+        return
+    end
+
+    -- round=1 for (thresholdSec .. thresholdSec+interval)
+    -- round=2 for (thresholdSec+interval .. thresholdSec2*interval), etc.
+    local round = math.floor((elapsed - thresholdSec) / interval) + 1
+
+    local candidates = self:_ComputeTakeoverCandidates(self.state.profileId)
+    if not candidates or #candidates == 0 then
+        return
+    end
+
+    local idx = ((round - 1) % #candidates) + 1
+    local winner = candidates[idx]
+
+    local me = SelfId()
+    if not self:_SamePlayer(winner, me) then
+        return
+    end
+
+    -- Only attempt once per round (prevents retry spam if monitor ticks more than once/round)
+    if hb.lastTakeoverRound == round then
+        return
+    end
+    hb.lastTakeoverRound = round
+    hb.takeoverAttemptedAt = now
+
+    local sid = self.state.sessionId
+    local pid = self.state.profileId
+    local expectedCoord = self.state.coordinator
+    local expectedEpoch = self.state.coordEpoch
+    local lastSeenSnapshot = lastSeen
+
+    -- Small jitter to help avoid rare edge cases where two admins disagree on roster order
+    self:RunWithJitter(0, 500, function()
+        if not self:_ShouldRunHeartbeatMonitor() then return end
+        if self.state.sessionId ~= sid or self.state.profileId ~= pid then return end
+        if not self:_SamePlayer(self.state.coordinator, expectedCoord) then return end
+        if self.state.coordEpoch ~= expectedEpoch then return end
+
+        -- Abort if we saw coordinator activity since we decided
+        local hb2 = self.state.heartbeat or {}
+        local last2 = math.max(tonumber(hb2.lastHeartbeatAt) or 0, tonumber(hb2.lastCoordMessageAt) or 0)
+        if last2 > lastSeenSnapshot then return end
+
+        if SF.Debug then
+            SF.Debug:Info("SYNC",
+                "Heartbeat timeout takeover: round=%d/%d winner=%s (self). Taking over session %s profileId=%s",
+                tonumber(round) or 0, #candidates, tostring(me), tostring(sid), tostring(pid))
+        end
+
+        self:TakeoverSession(sid, pid, "heartbeat-timeout", { rerunAdminConvergence = true })
+    end)
+end
+
+-- Function Start heartbeat monitor (member only).
+-- @param reason string|nil Reason for starting (for logging)
+-- @return boolean True if started or already running, false otherwise
+function Sync:StartheartbeatMonitor(reason)
+    if not self:_ShouldRunHeartbeatMonitor() then
+        self:StopHeartbeatMonitor("start_denied:" .. tostring(reason or "unknown"))
+        return false
+    end
+
+    if self:IsHeartbeatMonitorRunning() then return true end
+
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+
+    local interval = tonumber(self.cfg.heartbeatIntervalSec) or 30
+    if interval < 5 then interval = 5 end
+
+    -- Check more frequently than the heartbeat interval to reduce takeover delay,
+    -- but still "round" progresses on heartbeatIntervalSec.
+    local monitorInterval = math.min(interval, math.max(5, math.floor(interval / 2)))
+
+    -- Capture identity so this monitor instance self-terminates cleanly if session change
+    local sid = self.state.sessionId
+    local epoch = tonumber(self.state.coordEpoch) or 0
+    local coord = self.state.coordinator
+    local pid = self.state.profileId
+
+    local function tick()
+        if not self:_ShouldRunHeartbeatMonitor() then
+            self:StopHeartbeatMonitor("tick_conditions_failed")
+            return
+        end
+        if self.state.sessionId ~= sid then
+            self:StopHeartbeatMonitor("tick_session_changed")
+            return
+        end
+        if (tonumber(self.state.coordEpoch) or 0) ~= epoch then
+            self:StopHeartbeatMonitor("tick_epoch_changed")
+            return
+        end
+        if self.state.coordinator ~= coord then
+            self:StopHeartbeatMonitor("tick_coordinator_changed")
+            return
+        end
+        if self.state.profileId ~= pid then
+            self:StopHeartbeatMonitor("tick_profile_changed")
+            return
+        end
+
+        self:_HeartbeatMonitorTick()
+    end
+
+    if C_Timer and C_Timer.NewTicker then
+        hb.monitorTimerHandle = C_Timer.NewTicker(monitorInterval, tick)
+    else
+        -- Fallback (rare): emulate ticker with recurring timers
+        local cancelled = false
+        local handle = {}
+        function handle:Cancel() cancelled = true end
+        hb.monitorTimerHandle = handle
+
+        local function loop()
+            if cancelled then return end
+            tick()
+            if cancelled then return end
+            self:RunAfter(monitorInterval, loop)
+        end
+
+        self:RunAfter(monitorInterval, loop)
+    end
+
+    -- Run one immediate evaluation so we don't wait a whole monitorInterval to react
+    tick()
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Heartbeat monitor started (monitorInterval=%ss, reason=%s)", tostring(monitorInterval), tostring(reason or "unknown"))
+    end
+
+    return true
+end
+
+-- Function Ensure heartbeat monitor is running or stopped as appropriate.
+-- @param reason string|nil Reason for starting/stopping (for logging)
+-- @return boolean True if running, false otherwise
+function Sync:EnsureHeartbeatMonitor(reason)
+    if self:_ShouldRunHeartbeatMonitor() then
+        return self:StartheartbeatMonitor(reason)
+    end
+    self:StopHeartbeatMonitor(reason)
+    return false
+end
+
 -- Function Broadcast coordinator takeover message (COORD_TAKEOVER).
 -- @param none
 -- @return nil
@@ -1232,6 +1522,14 @@ function Sync:HandleSessionStart(sender, payload)
     -- Reset join status tracking for new session
     self.state._sentJoinStatusForSessionId = nil
     self.state._profileReqInFlight = nil
+
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+    hb.lastCoordMessageAt = Now()
+    hb.missedHeartbeats = 0
+    hb.lastTakeoverRound = nil
+
+    self:EnsureHeartbeatMonitor("HandleSessionStart")
 
     -- Reply after jitter
     local sid = self.state.sessionId
@@ -1856,6 +2154,14 @@ function Sync:HandleSessionReannounce(sender, payload)
     self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
     self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
 
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+    hb.lastCoordMessageAt = Now()
+    hb.missedHeartbeats = 0
+    hb.lastTakeoverRound = nil
+
+    self:EnsureHeartbeatMonitor("HandleSessionReannounce")
+
     -- If coordinator/epoch changed, allow re-sending status and refresh request targets
     if not self:_SamePlayer(oldCoord, self.state.coordinator) or oldEpoch ~= self.state.coordEpoch then
         self.state._sentJoinStatusForSessionId = nil
@@ -1923,7 +2229,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     if type(payload.sentAt) == "number" then
         local last = tonumber(hb.lastHeartbeatSentAt)
         if sameStream and last and payload.sentAt < last then return end
-        hb.lastheartbeatSentAt = payload.sentAt
+        hb.lastHeartbeatSentAt = payload.sentAt
     else
         if not sameStream then
             hb.lastHeartbeatSentAt = nil
@@ -1957,6 +2263,8 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     hb.lastHeartbeatAt = Now()
     hb.lastCoordMessageAt = Now()
     hb.missedHeartbeats = 0
+
+    self:EnsureHeartbeatMonitor("HandleSessionHeartbeat")
 
     -- If coordinator/epoch/session changed, allow a re-evaluation
     if (not self:_SamePlayer(oldCoord, self.state.coordinator))
@@ -2064,6 +2372,14 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     -- Allow re-sending join status to the new coordinator
     self.state._sentJoinStatusForSessionId = nil
+
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+    hb.lastCoordMessageAt = Now()
+    hb.missedHeartbeats = 0
+    hb.lastTakeoverRound = nil
+
+    self:EnsureHeartbeatMonitor("HandleSessionStart")
 
     -- Refresh outstanding request targets so retries can reach the new coordinator
     if self._RefreshOutstandingRequestTargets then
