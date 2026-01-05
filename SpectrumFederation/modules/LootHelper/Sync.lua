@@ -197,6 +197,36 @@ local function GetGroupDistribution()
     return nil
 end
 
+-- Function Ensure that if not in a group, any active session is ended and state reset.
+-- @param context string|nil Optional context for logging.
+-- @return string|nil distribution channel if in group, nil otherwise
+function Sync:EnforceGroupSessionActive(context)
+    local dist = GetGroupDistribution()
+    if dist then return dist end
+
+    local reason = "not_in_group:" .. tostring(context or unknown)
+
+    -- Safely stop any running timers even if state.active is already false
+    self:StopHeartbeatSender(reason)
+    self:StopHeartbeatMonitor(reason)
+
+    -- Clear any session identity locally (no broadcast)
+    local hasSession =
+        (self.state ~= nil) and (
+            self.state.active
+            or self.state.sessionId
+            or self.state.profileId
+            or self.state.coordinator
+            or self.state.isCoordinator
+        )
+
+    if hasSession then
+        self:_ResetSessionState(reason)
+    end
+
+    return nil
+end
+
 -- ============================================================================
 -- Public API (called by LootHelper core / UI / events)
 -- ============================================================================
@@ -205,30 +235,88 @@ end
 -- @param cfg table|nil Optional config overrides (jitter/timeouts/retries).
 -- @return nil
 function Sync:Init(cfg)
+    if type(cfg) == "table" then
+        self:SetConfig(cfg)
+    end
+
+    self:Enable()
 end
 
 -- Function Enable syncing behavior (safe to call multiple times).
 -- @param none
 -- @return nil
 function Sync:Enable()
+    if self._enabled then
+        -- Still re-evaluate scoping + timers when calle again
+        self:UpdatePeersFromRoster()
+        self:_EnforceGroupSessionActive("Enable(reenter)")
+        self:EnsureHeartbeatSender("Enable(reenter)")
+        self:EnsureHeartbeatMonitor("Enable(reenter)")
+        return
+    end
+    self._enabled = true
+
+    -- Create a tiny event frame for the two "reliable places"
+    if not self._eventFrame then
+        local frameName = (addonName and (addonName .. "_LootHelperSyncFrame")) or nil
+        local f = CreateFrame("Frame", frameName)
+        self._eventFrame = f
+
+        f:SetScript("OnEvent", function(_, event, ...)
+            if event == "GROUP_ROSTER_UPDATE" then
+                self:OnGroupRosterUpdate()
+            elseif event == "PLAYER_ENTERING_WORLD" then
+                self:OnPlayerEnteringWorld(...)
+            end
+        end)
+    end
+
+    self._eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+    self._eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+
+    self:UpdatePeersFromRoster()
+    self:_EnforceGroupedSessionActive("Enable")
+    self:EnsureHeartbeatSender("Enable")
+    self:EnsureHeartbeatMonitor("Enable")
 end
 
 -- Function Disable syncing behavior; does not delete local data.
 -- @param none
 -- @return nil
 function Sync:Disable()
+    self._enabled = false
+
+    if self._eventFrame then
+        pcall(function() self._eventFrame:UnregisterEvent("GROUP_ROSTER_UPDATE") end)
+        pcall(function() self._eventFrame:UnregisterEvent("PLAYER_ENTERING_WORLD") end)
+    end
+
+    -- Stop timers and clear session state locally
+    self:StopHeartbeatSender("Disable")
+    self:StopHeartbeatMonitor("Disable")
+
+    if self.state and (self.state.active or self.state.sessionId) then
+        self:_ResetSessionState("Disable")
+    end
 end
 
 -- Function Update runtime config (jitter, timeouts, retry counts).
 -- @param cfg table Config fields to override.
 -- @return nil
 function Sync:SetConfig(cfg)
+    if type(cfg) ~= "table" then return end
+    self.cfg = self.cfg or {}
+    for k, v in pairs(cfg) do
+        self.cfg[k] = v
+    end
 end
 
 -- Function Return current runtime config.
 -- @param none
 -- @return table Current config.
 function Sync:GetConfig()
+    self.cfg = self.cfg or {}
+    return self.cfg
 end
 
 -- Function Returns whether an SF Loot Helper session is currently active.
