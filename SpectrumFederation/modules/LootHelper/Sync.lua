@@ -200,7 +200,7 @@ end
 -- Function Ensure that if not in a group, any active session is ended and state reset.
 -- @param context string|nil Optional context for logging.
 -- @return string|nil distribution channel if in group, nil otherwise
-function Sync:EnforceGroupSessionActive(context)
+function Sync:_EnforceGroupedSessionActive(context)
     local dist = GetGroupDistribution()
     if dist then return dist end
 
@@ -249,7 +249,7 @@ function Sync:Enable()
     if self._enabled then
         -- Still re-evaluate scoping + timers when calle again
         self:UpdatePeersFromRoster()
-        self:_EnforceGroupSessionActive("Enable(reenter)")
+        self:_EnforceGroupedSessionActive("Enable(reenter)")
         self:EnsureHeartbeatSender("Enable(reenter)")
         self:EnsureHeartbeatMonitor("Enable(reenter)")
         return
@@ -323,36 +323,48 @@ end
 -- @param none
 -- @return boolean True if active, false otherwise.
 function Sync:IsSessionActive()
+    if not (self.state and self.state.active) then return false end
+    if GetGroupDistribution() then return true end
+
+    -- If we aren't grouped, enforce invariant
+    self:_EnforceGroupedSessionActive("IsSessionActive")
+    return false
 end
 
 -- Function Returns current sessionId (or nil).
 -- @param none
 -- @return string|nil Current sessionId.
 function Sync:GetSessionId()
+    return self:IsSessionActive() and self.state.sessionId or nil
 end
 
 -- Function Returns active session profileId (or nil).
 -- @param none
 -- @return string|nil Current session profileId.
 function Sync:GetSessionProfileId()
+    return self:IsSessionActive() and self.state.profileId or nil
 end
 
 -- Function Returns current coordinator "Name-Realm" (or nil).
 -- @param none
 -- @return string|nil Current coordinator.
 function Sync:GetCoordinator()
+    return self:IsSessionActive() and self.state.coordinator or nil
 end
 
 -- Function Returns current coordinator epoch (or nil).
 -- @param none
 -- @return number|nil Current coordinator epoch.
 function Sync:GetCoordEpoch()
+    return self:IsSessionActive() and self.state.coordEpoch or nil
 end
 
 -- Function Returns helpers list (array of "Name-Realm").
 -- @param none
 -- @return table Helpers list.
 function Sync:GetHelpers()
+    if not self:IsSessionActive() then return {} end
+    return self.state.helpers or {}
 end
 
 -- Function Called when group/raid roster changes. If someone joins and a session is already started, send them the info the equivalent of SES_REANNOUNCE
@@ -361,6 +373,8 @@ end
 function Sync:OnGroupRosterUpdate()
     -- Always keep per roster fresh
     self:UpdatePeersFromRoster()
+
+    if not self:_EnforceGroupedSessionActive("OnGroupRosterUpdate") then return end
 
     -- Only the coordinator does late-join announcements
     if not(self.state and self.state.active and self.state.isCoordinator) then return end
@@ -438,13 +452,26 @@ function Sync:OnGroupRosterUpdate()
     self:EnsureHeartbeatMonitor("OnGroupRosterUpdate")
 end
 
+-- Function Called when player enters world (reload, zone change, ect.)
+-- @param none
+-- @return nil
+function Sync:OnPlayerEnteringWorld()
+    self:UpdatePeersFromRoster()
+
+    local dist = self:_EnforceGroupedSessionActive("PLAYER_ENTERING_WORLD")
+    if not dist then return end
+
+    self:EnsureHeartbeatSender("PLAYER_ENTERING-WORLD")
+    self:EnsureHeartbeatMonitor("PLAYER_ENTERING-WORLD")
+end
+
 -- Function Start a new SF Loot Helper session as coordinator (Sequence 1 -> 2).
 -- @param profileId string Stable profile id to use for this session
 -- @param opts table|nil Optional: forceStart, skipPrompt, customHelpers, ect.
 -- @return string sessionId
 function Sync:StartSession(profileId, opts)
     opts = opts or {}
-    local dist = GetGroupDistribution()
+    local dist = self:_EnforceGroupedSessionActive("StartSession")
     if not dist then
         if SF.PrintError then SF:PrintError("Cannot start session: not in a group/raid.") end
         return nil
@@ -568,7 +595,7 @@ function Sync:EndSession(reason, broadcast)
         broadcast = self.state.isCoordinator == true
     end
 
-    local dist = GetGroupDistribution()
+    local dist = self:_EnforceGroupedSessionActive("EndSession")
 
     if broadcast and self.state.isCoordinator and dist and SF.LootHelperComm then
         local payload = {
@@ -608,7 +635,7 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
         return false
     end
 
-    local dist = GetGroupDistribution()
+    local dist = self:_EnforceGroupedSessionActive("TakeoverSession")
     if not dist then return false end
     if type(sessionId) ~= "string" or sessionId == "" then return false end
     if type(profileId) ~= "string" or profileId == "" then return false end
@@ -661,7 +688,7 @@ end
 function Sync:ReannounceSession()
     if not self.state.active or not self.state.isCoordinator then return end
 
-    local dist = GetGroupDistribution()
+    local dist = self:_EnforceGroupedSessionActive("ReannounceSession")
     if not dist then return end
     if not SF.LootHelperComm then return end
 
@@ -1014,7 +1041,7 @@ end
 function Sync:BroadcastSessionStart()
     if not self.state.active or not self.state.isCoordinator then return end
 
-    local dist = GetGroupDistribution()
+    local dist = self:_EnforceGroupedSessionActive("StartSession")
     if not dist then return end
 
     local profileId = self.state.profileId
@@ -1066,7 +1093,7 @@ function Sync:BroadcastSessionHeartbeat()
     if not (self.state and self.state.active and self.state.isCoordinator) then return false end
     if not SF.LootHelperComm then return false end
 
-    local dist = GetGroupDistribution()
+    local dist = self:_EnforceGroupedSessionActive("BroadcastSessionHeartbeat")
     if not dist then return false end
 
     local sid = self.state.sessionId
@@ -1108,7 +1135,7 @@ function Sync:_ShouldRunHeartbeatSender()
     if self.state._sessionAnnounced ~= sid then return false end
 
     -- Must still be in PARTY/RAID
-    if not GetGroupDistribution() then return false end
+    if not self:_EnforceGroupedSessionActive("ShouldRunHeartbeatSender") then return false end
 
     return true
 end
@@ -1225,7 +1252,7 @@ end
 function Sync:_ShouldRunHeartbeatMonitor()
     if not (self.state and self.state.active) then return false end
     if self.state.isCoordinator then return false end
-    if not GetGroupDistribution() then return false end
+    if not self:_EnforceGroupedSessionActive("ShouldRunHeartbeatMonitor") then return false end
 
     if type(self.state.sessionId) ~= "string" or self.state.sessionId == "" then return false end
     if type(self.state.profileId) ~= "string" or self.state.profileId == "" then return false end
@@ -1506,7 +1533,7 @@ end
 function Sync:BroadcastCoordinatorTakeover()
     if not self.state.active or not self.state.isCoordinator then return end
 
-    local dist = GetGroupDistribution()
+    local dist = self:_EnforceGroupedSessionActive("BroadcastCoordinatorTakeover")
     if not dist then return end
 
     if not SF.LootHelperComm then return end
@@ -1901,7 +1928,7 @@ function Sync:BroadcastNewLog(profileId, logTable)
     if type(profileId) ~= "string" or profileId == "" then return false, "missing profileId" end
     if self.state.profileId ~= profileId then return false, "wrong profile for session" end
 
-    local dist = GetGroupDistribution()
+    local dist = self:_EnforceGroupedSessionActive("BroadcastNewLog")
     if not dist then return false, "not in group/raid" end
 
     -- Only admins should be able to push live updates
@@ -3450,7 +3477,7 @@ end
 -- @param profileId string Stable profile id
 -- @return boolean True if sender is authorized admin, false otherwise
 function Sync:CanSelfCoordinate(profileId)
-    local dist = GetGroupDistribution()
+    local dist = self:_EnforceGroupedSessionActive("CanSelfCoordinate")
     if not dist then
         return false, "Not in a group/raid"
     end
