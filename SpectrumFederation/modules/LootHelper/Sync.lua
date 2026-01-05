@@ -118,6 +118,7 @@ Sync.state = Sync.state or {
         missedHeartbeats        = 0,    -- counter
         heartbeatTimerHandle    = nil,  -- So it can be stopped cleanly
         takeoverAttemptedAt     = nil,
+        lastHeartbeatSentAt     = nil,
     }
 }
 
@@ -1910,6 +1911,24 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
     local oldSid = self.state.sessionId
+
+    -- Epoch gating won't prevent an older heartbeat with the same coordEpoch from arriving after a newer one and overwriting authorMax with smaller values.
+    -- This would get fixed next heartbeat, but proactively we can prevent it by also storing last seen sentAt and ignoring older heartbeats
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+    local sameStream =
+        (oldSid == payload.sessionId)
+        and (oldEpoch == payload.coordEpoch)
+        and self:_SamePlayer(oldCoord, payload.coordinator)
+    if type(payload.sentAt) == "number" then
+        local last = tonumber(hb.lastHeartbeatSentAt)
+        if sameStream and last and payload.sentAt < last then return end
+        hb.lastheartbeatSentAt = payload.sentAt
+    else
+        if not sameStream then
+            hb.lastHeartbeatSentAt = nil
+        end
+    end
 
     -- Apply session descriptor
     -- We want to keep this lightweight, so we will not touch handshake bookkeeping
