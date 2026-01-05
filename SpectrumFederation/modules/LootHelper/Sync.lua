@@ -568,6 +568,114 @@ function Sync:GetHelpers()
     return self.state.helpers or {}
 end
 
+-- Function Set whether session safe mode is enabled.
+-- @param enabled boolean True to enable, false to disable.
+-- @param reason string|nil Human-readable reason for change.
+-- @param setBy string|nil "Name-Realm" of who set it (defaults to self)
+-- @return boolean success, string|nil errorReason
+function Sync:SetSessionSafeModeEnabled(enabled, reason, setBy)
+    if not(self.state and self.state.active and self.state.isCoordinator) then
+        return false, "not coordinator"
+    end
+
+    -- Coordinator must be admin (defensive in case of future changes)
+    local me = SelfId()
+    if not self:IsSenderAuthorized(self.state.profileId, me) then
+        return false, "not authorized"
+    end
+
+    enabled = (enabled == true)
+
+    local sm = self:_EnsureSafeModeState()
+    if (sm.sessionEnabled == true) == enabled then
+        return true, "no_change"
+    end
+
+    sm.sessionEnabled = enabled
+    sm.sessionRev = (tonumber(sm.sessionRev) or 0) + 1
+    sm.sessionSetBy = setBy or me
+    sm.sessionSetAt = Now()
+    sm.sessionReason = reason or (enabled and "enabled" or "disabled")
+
+    self:_RecomputeSafeMode("session_set_by_coordinator:" .. tostring(reason or "manual"))
+
+    local dist = self:_EnforceGroupSessionActive("SetSessionSafeModeEnabled")
+    if dist and SF.LootHelperComm then
+        local payload = {
+            sessionId   = self.state.sessionId,
+            profileId   = self.state.profileId,
+            coordinator = self.state.coordinator,
+            coordEpoch  = self.state.coordEpoch,
+            safeMode    = self:_GetSessionSafeModePayload(),
+        }
+        SF.LootHelperComm:Send(
+            "CONTROL",
+            self.MSG.SAFE_MODE_SET,
+            payload,
+            dist,
+            "ALERT"
+        )
+    end
+
+    return true, nil
+end
+
+-- Function Request to set session safe mode (admin entrypoint).
+-- @param enabled boolean True to enable, false to disable.
+-- @param reason string|nil Human-readable reason for change.
+-- @return boolean success, string|nil errorReason
+function Sync:RequestSessionSafeMode(enabled, reason)
+    if not (self.state and self.state.active) then return false, "no active session" end
+    if type(self.state.coordinator) ~= "string" or self.state.coordinator == "" then return false, "no coordinator" end
+
+    enabled = (enabled == true)
+
+    -- If we have the profile locally, enforce admin gate locally too.
+    local me = SelfId()
+    if self:FindLocalProfileById(self.state.profileId) then
+        if not self:IsSenderAuthorized(self.state.profileId, me) then
+            return false, "not authorized"
+        end
+    end
+
+    if self.state.isCoordinator then
+        return self:SetSessionSafeModeEnabled(enabled, reason, me)
+    end
+
+    if not SF.LootHelperComm then return false, "comm not available" end
+
+    local payload = {
+        sessionId   = self.state.sessionId,
+        profileId   = self.state.profileId,
+        coordinator = self.state.coordinator,
+        coordEpoch  = self.state.coordEpoch,
+        
+        enabled     = enabled,
+        reason      = reason,
+        requestedBy = me,
+        requestedAt = Now(),
+    }
+
+    SF.LootHelperComm:Send(
+        "CONTROL",
+        self.MSG.SAFE_MODE_REQ,
+        payload,
+        "WHISPER",
+        self.state.coordinator,
+        "ALERT"
+    )
+
+    return true, nil
+end
+
+-- Function Toggle session safe mode enabled state.
+-- @param reason string|nil Human-readable reason for change.
+-- @return boolean success, string|nil errorReason
+function Sync:ToggleSessionSafeMode(reason)
+    local sm = self:_EnsureSafeModeState()
+    return self:RequestSessionSafeMode(not (sm.sessionEnabled == true), reason or "toggle")
+end
+
 -- Function Called when group/raid roster changes. If someone joins and a session is already started, send them the info the equivalent of SES_REANNOUNCE
 -- @param none
 -- @return nil
