@@ -37,6 +37,10 @@ Sync.MSG = {
 
     -- Coordinator handoff (Sequence 4)
     COORD_TAKEOVER  = "COORD_TAKEOVER",
+
+    -- Safe Mode
+    SAFE_MODE_REQ   = "SAFE_MODE_REQ",
+    SAFE_MODE_SET   = "SAFE_MODE_SET",
 }
 
 -- ============================================================================
@@ -78,6 +82,8 @@ Sync.cfg = Sync.cfg or {
     heartbeatMissThreshold          = 3,    -- how many consecutive misses before takeover logic triggers
     heartbeatGraceSec               = 10,   -- small extra buffer to reduce false positives
     catchupOnHeartbeatCooldownSec   = 10,   -- avoid re-running catchup logic every single heartbeat if it gets noisy
+
+    autoSessionSafeModeOnCombat = false,    -- coordinator entering combat auto-enables session safe-mode
 }
 
 Sync.state = Sync.state or {
@@ -167,6 +173,201 @@ local function SelfId()
     realm = realm or GetRealmName()
     if realm then realm = realm:gsub("%s+", "") end
     return name and realm and (name .. "-" .. realm) or (name or "unknown")
+end
+
+-- Function Get user sync settings from saved variables.
+-- @param none
+-- @return table settings
+function Sync:_GetUserSyncSettings()
+    SF.lootHelperDB = SF.lootHelperDB or { profiles = {}, activeProfileId = nil}
+    SF.lootHelperDB.userSettings = SF.lootHelperDB.userSettings or {}
+    SF.lootHelperDB.userSettings.sync = SF.lootHelperDB.userSettings.sync or {}
+    local s = SF.lootHelperDB.userSettings.sync
+    if s.localSafeModeEnabled == nil then s.localSafeModeEnabled = false end
+    return s
+end
+
+-- Function Returns whether local safe mode is enabled.
+function Sync:GetLocalSafeModeEnabled()
+    local s = self:_GetUserSyncSettings()
+    return s.localSafeModeEnabled == true
+end
+
+-- Function Ensure safe mode state structure is initialized.
+-- @param none
+-- @return table safeModeState
+function Sync:_EnsureSafeModeState()
+    self.state.safeMode = self.state.safeMode or {}
+    local sm = self.state.safeMode
+
+    if sm.sessionEnabled == nil then sm.sessionEnabled = false end
+    if sm.sessionRev == nil then sm.sessionRev = 0 end
+    if sm.sessionSetBy == nil then sm.sessionSetBy = nil end
+    if sm.sessionSetAt == nil then sm.sessionSetAt = nil end
+    if sm.sessionReason == nil then sm.sessionReason = nil end
+
+    if sm.localEnabled == nil then sm.localEnabled = self:GetLocalSafeModeEnabled() end
+    if sm._effective == nil then
+        sm._effective = (sm.sessionEnabled == true) or (sm.localEnabled == true)
+    end
+
+    return sm
+end
+
+-- Function Returns whether session safe mode is enabled.
+-- @param none
+-- @return boolean
+function Sync:IsLocalSafeModeEnabled()
+    local sm = self:_EnsureSafeModeState()
+    return sm.localEnabled == true
+end
+
+-- Function Returns whether session safe mode is enabled.
+-- @param none
+-- @return boolean
+function Sync:IsSessionSafeModeEnabled()
+    local sm = self:_EnsureSafeModeState()
+    return sm.sessionEnabled == true
+end
+
+-- Function Returns whether safe mode is enabled (either session or local).
+-- @param none
+-- @return boolean
+function Sync:IsSafeModeEnabled()
+    local sm = self:_EnsureSafeModeState()
+    return (sm.sessionEnabled == true) or (sm.localEnabled == true)
+end
+
+-- Function Returns whether bulk transfers are allowed (safe mode disables bulk).
+-- @param none
+-- @return boolean
+function Sync:IsBulkTransferAllowed()
+    return not self:IsSafeModeEnabled()
+end
+
+-- Function Set whether local safe mode is enabled.
+-- @param enabled boolean True to enable, false to disable.
+-- @param reason string|nil Human-readable reason for change.
+-- @return nil
+function Sync:SetLocalSafeModeEnabled(enabled, reason)
+    local s = self:_GetUserSyncSettings()
+    s.localSafeModeEnabled = (enabled == true)
+
+    local sm = self:_EnsureSafeModeState()
+    sm.localEnabled = s.localSafeModeEnabled
+
+    self:_RecomputeSafeMode("local:" .. tostring(reason or "set"))
+end
+
+-- Function Toggle local safe mode enabled state.
+-- @param reason string|nil Human-readable reason for change.
+-- @return nil
+function Sync:ToggleLocalSafeMode(reason)
+    self:SetLocalSafeModeEnabled(not self:GetLocalSafeModeEnabled(), reason or "toggle")
+end
+
+-- Function Returns whether a request kind uses bulk transfers.
+-- @param kind string Request kind.
+-- @return boolean
+function Sync:_RequestKindUsesBulk(kind)
+    return (kind == "NEED_PROFILE") -- TODO: Does profile snapshot not?
+        or (kind == "NEED_LOGS")
+        or (kind == "LOG_REQ")
+        or (kind == "ADMIN_LOG_REQ")
+end
+
+-- Function Pause all bulk transfer requests.
+-- @param reason string|nil Human-readable reason for pausing.
+-- @return nil
+function Sync:_PauseBulkRequets(reason)
+    if type(self.state.requests) ~= "table" then return end
+    for _, req in pairs(self.state.requests) do
+        if type(req) == "table" and self:_RequestKindUsesBulk(req.kind) then
+            req.paused = true
+            req.pausedReason = reason
+            self:_CancelRequestTimer(req)
+        end
+    end
+end
+
+-- Function Resume all paused requests.
+-- @param reason string|nil Human-readable reason for resuming.
+-- @return nil
+function Sync:_ResumePausedRequests(reason)
+    if type(self.state.requests) ~= "table" then return end
+    for _, req in pairs(self.state.requests) do
+        if type(req) == "table" and req.paused then
+            req.paused = nil
+            req.pausedReason = nil
+            self:_SendRequestAttempt(req)   -- This should also re-arm its timer
+        end
+    end
+end
+
+-- Function Recompute effective safe mode state and apply side-effects.
+-- @param reason string|nil Human-readable reason for recompute.
+-- @return nil
+function Sync:_RecomputeSafeMode(reason)
+    local sm = self:_EnsureSafeModeState()
+    local effective = (sm.sessionEnabled == true) or (sm.localEnabled == true)
+    if sm._effective == effective then return end
+
+    sm._effective = effective
+
+    if effective then
+        self:_PauseBulkRequests("safe_mode_on:" .. tostring(reason or "unknown"))
+    else
+        self:_ResumePausedRequests("safe_mode_off:" .. tostring(reason or "unknown"))
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Safe mode now %s (session=%s local=%s reason=%s",
+            tostring(effective),
+            tostring(sm.sessionEnabled),
+            tostring(sm.localEnabled),
+            tostring(reason or "unknown")
+        )
+    end
+end
+
+-- Function Reset session safe mode state.
+-- @param reason string|nil Human-readable reason for reset.
+-- @return nil
+function Sync:_ResetSessionSafeMode(reason)
+    local sm = self:_EnsureSafeModeState()
+    sm.sessionEnabled = false
+    sm.sessionRev = 0
+    sm.sessionSetBy = nil
+    sm.sessionSetAt = nil
+    sm.sessionReason = nil
+
+    self:_RecomputeSafeMode("session_reset:" .. tostring(reason or "unknown"))
+end
+
+-- Function Apply session safe mode state from incoming payload.
+-- @param smPayload table Incoming safe mode payload.
+-- @param reason string|nil Human-readable reason for applying.
+-- @return nil
+function Sync:_ApplySessionSafeModeFromPayload(smPayload, reason)
+    if type(smPayload) ~= "table" then return end
+    local enabled = (smPayload.enabled == true)
+    local incRev = tonumber(smPayload.rev) or 0
+
+    local sm = self:_EnsureSafeModeState()
+    local curRev = tonumber(sm.sessionRev) or 0
+    local curEnabled = (sm.sessionEnabled == true)
+
+    if incRev < curRev then return end
+
+    if incRev > curRev or enabled ~= curEnabled then
+        sm.sessionEnabled = enabled
+        sm.sessionRev = incRev
+        sm.sessionSetBy = smPayload.setBy
+        sm.sessionSetAt = smPayload.setAt
+        sm.sessionReason = smPayload.reason
+
+        self:_RecomputeSafeMode("session_apply:" .. tostring(reason or "unknown"))
+    end
 end
 
 -- Function Normalize a "Name" or "Name-Realm" into "Name-Realm" format.
