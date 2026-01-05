@@ -25,6 +25,7 @@ Sync.MSG = {
     -- Session lifecycle (Sequence 2)
     SES_START       = "SES_START",
     SES_REANNOUNCE  = "SES_REANNOUNCE",
+    SES_HEARTBEAT   = "SES_HEARTBEAT",
     SES_END         = "SES_END",
     HAVE_PROFILE    = "HAVE_PROFILE",
     NEED_PROFILE    = "NEED_PROFILE",
@@ -36,7 +37,6 @@ Sync.MSG = {
 
     -- Coordinator handoff (Sequence 4)
     COORD_TAKEOVER  = "COORD_TAKEOVER",
-    COORD_ACK       = "COORD_ACK"
 }
 
 -- ============================================================================
@@ -72,6 +72,12 @@ Sync.cfg = Sync.cfg or {
     needLogsSendSpacingMs           = 50,   -- space out AUTH_LOGS sends to avoid spikes
 
     gapRepairCooldownSec = 2,
+
+    -- Heartbeat
+    heartbeatIntervalSec            = 30,   -- how often to send heartbeat, in seconds
+    heartbeatMissThreshold          = 3,    -- how many consecutive misses before takeover logic triggers
+    heartbeatGraceSec               = 10,   -- small extra buffer to reduce false positives
+    catchupOnHeartbeatCooldownSec   = 10,   -- avoid re-running catchup logic every single heartbeat if it gets noisy
 }
 
 Sync.state = Sync.state or {
@@ -106,7 +112,25 @@ Sync.state = Sync.state or {
                         --   addonVersion = "0.2.0-beta.3",
                         --   isAdmin = true/false/nil, -- verified admin for current session profile if we can verify
                         -- }
+    heartbeat = {
+        lastHeartbeatAt         = nil,  -- when we last heard a heartbeat from the coordinator
+        lastCoordMessageAt      = nil,  -- last time we heard any message from the coordinator
+        missedHeartbeats        = 0,    -- counter
+        heartbeatTimerHandle    = nil,  -- So it can be stopped cleanly
+        takeoverAttemptedAt     = nil,
+    }
 }
+
+-- Session Heartbeat contract:
+-- {
+--     sessionId   = "string",        -- current session id
+--     profileId   = "string",        -- current session profile id
+--     coordinator = "Name-Realm", -- current coordinator
+--     coordEpoch  = number,        -- current coordinator epoch
+--     helpers     = { "Name-Realm", ... }, -- current helpers list
+--     authorMax   = { [author] = number, ... }, -- current author max counters
+--     sentAt      = number,            -- epoch seconds when sent
+-- }
 
 Sync._nonceCounter = Sync._nonceCounter or 0
 
@@ -240,16 +264,86 @@ end
 function Sync:GetHelpers()
 end
 
--- Function Called when group/raid roster changes; detects leadership changes and session conditions.
+-- Function Called when group/raid roster changes. If someone joins and a session is already started, send them the info the equivalent of SES_REANNOUNCE
 -- @param none
 -- @return nil
 function Sync:OnGroupRosterUpdate()
-end
+    -- Always keep per roster fresh
+    self:UpdatePeersFromRoster()
 
--- Function Called when the current player becomes raid leader (or gets promoted) to optionally prompt starting a session.
--- @param none
--- @return nil
-function Sync:MaybePromptStartSession()
+    -- Only the coordinator does late-join announcements
+    if not(self.state and self.state.active and self.state.isCoordinator) then return end
+    if not SF.LootHelperComm then return end
+
+    -- Don't do anything until we've actually announced the session at least once
+    if self.state._sessionAnnounced ~= self.state.sessionId then
+        return
+    end
+
+    local sid = self.state.sessionId
+    local profileId = self.state.profileId
+    if type(sid) ~= "string" or sid == "" then return end
+    if type(profileId) ~= "string" or profileId == "" then return end
+
+    local me = SelfId()
+
+    -- Build a single payload to reuse
+    self.state.authorMax = self:ComputeAuthorMax(profileId) or (self.state.authorMax or {})
+    local payload = {
+        sessionId   = sid,
+        profileId   = profileId,
+        coordinator = self.state.coordinator,
+        coordEpoch  = self.state.coordEpoch,
+        authorMax   = self.state.authorMax,
+        helpers     = self.state.helpers or {},
+    }
+
+    -- Find targets who are in-group but haven't been announced to for this sessionId
+    local targets = {}
+    for name, peer in pairs(self.state.peers or {}) do
+        if peer and peer.inGroup and name ~= me then
+            if peer._lastSessionAnnounced ~= sid then
+                if peer.online ~= false then
+                    table.insert(targets, name)
+                end
+            end
+        end
+    end
+
+    if #targets == 0 then return end
+    table.sort(targets)
+
+    -- Send with small jitter to avoid a burst if multiple join at once
+    for _, target in ipairs(targets) do
+        local dest = target -- capture safely per iteration
+        self:RunWithJitter(0, 250, function()
+            -- Ensure still the same session and we are still coordinator
+            if not (self.state.active and self.state.isCoordinator) then return end
+            if self.state.sessionId ~= sid then return end
+            if not SF.LootHelperComm then return end
+
+            local okSend = SF.LootHelperComm:Send(
+                "CONTROL",
+                self.MSG.SES_REANNOUNCE,
+                payload,
+                "WHISPER",
+                dest,
+                "ALERT"
+            )
+
+            local peer = self:GetPeer(dest)
+            if peer then
+                peer._lastSessionAnnounced = sid
+            end
+
+            if SF.Debug then
+                SF.Debug:Info("SYNC", "Late joiner announce: SES_REANNOUNCE -> %s (ok=%s)", tostring(target), tostring(okSend))
+            end
+        end)
+    end
+
+    -- Keep heartbeat sender correct based on current roster/distribution/coordinator status
+    self:EnsureHeartbeatSender("OnGroupRosterUpdate")
 end
 
 -- Function Start a new SF Loot Helper session as coordinator (Sequence 1 -> 2).
@@ -264,11 +358,17 @@ function Sync:StartSession(profileId, opts)
         return nil
     end
 
+    local ok, why = self:CanSelfCoordinate(profileId)
+    if not ok then
+        if SF.PrintError then SF:PrintError("Cannot start session: %s", tostring(why or "unknown reason")) end
+        return nil
+    end
+
     local me = SelfId()
     local sessionId = self:_NextNonce("SES")
     local epoch = Now()
 
-    -- Reste state
+    -- Reset state
     self.state.adminStatuses = {}
     self.state._adminConvergence = nil
     self.state.handshake = nil
@@ -289,11 +389,110 @@ function Sync:StartSession(profileId, opts)
     return sessionId
 end
 
+-- Function Reset all session state (called on EndSession and internal resets).
+-- @param reason string|nil Human-readable reason for reset.
+-- @return nil
+function Sync:_ResetSessionState(reason)
+    -- Cancel outstanding request timers and clear requests
+    if type(self.state.requests) == "table" then
+        for _, req in pairs(self.state.requests) do
+            self:_CancelRequestTimer(req)
+        end
+    end
+
+    self.state.requests = {}
+
+    -- Clear convergence + handshake bookkeeping
+    self.state._adminConvergence = nil
+    self.state.adminStatuses = {}
+    self.state.handshake = nil
+
+    -- Clear session identity
+    self.state.active = false
+    self.state.sessionId = nil
+    self.state.profileId = nil
+    self.state.coordinator = nil
+    self.state.coordEpoch = nil
+    self.state.isCoordinator = false
+
+    -- Clear session metadata
+    self.state.helpers = {}
+    self.state.authorMax = {}
+
+    -- Clear dedupe/flags
+    self.state._sentJoinStatusForSessionId = nil
+    self.state._profileReqInFlight = nil
+    self.state._sessionAnnounced = nil
+
+    -- Clear gap repair cooldowns
+    self.state.gapRepair = nil
+
+    -- Clear per-peer "announced" marker + joinStatus (keeps peers table but removes stale session info)
+    for _, peer in pairs(self.state.peers or {}) do
+        peer.joinStatus = nil
+        peer.joinReportedAt = nil
+        peer._lastSessionAnnounced = nil
+    end
+
+    -- Clear heartbeat state and stop any heartbeat timer/ticker
+    do
+        local hb = self.state.heartbeat
+        if type(hb) == "table" then
+            if hb.heartbeatTimerHandle and hb.heartbeatTimerHandle.Cancel then
+                pcall(function() hb.heartbeatTimerHandle:Cancel() end)
+            end
+            hb.heartbeatTimerHandle = nil
+            hb.lastHeartbeatAt = nil
+            hb.lastCoordMessageAt = nil
+            hb.missedHeartbeats = 0
+            hb.takeoverAttemptedAt = nil
+            hb.lastCatchupAt = nil
+        end
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Session state reset (reason: %s)", tostring(reason or "unknown"))
+    end
+end
+
 -- Function End the active session (optional broadcast).
 -- @param reason string|nil Human-readable reason ("raid ended", "manual", etc.)
 -- @param broadcast boolean|nil True to broadcast session end, false to skip broadcast
 -- @return nil
 function Sync:EndSession(reason, broadcast)
+    reason = reason or "ended"
+    if not self.state.active then return false end
+
+    -- Default behavior:
+    -- - Coordinator broadcasts unless explicitly disabled
+    -- - Non-coordinator just clears local state
+    if broadcast == nil then
+        broadcast = self.state.isCoordinator == true
+    end
+
+    local dist = GetGroupDistribution()
+
+    if broadcast and self.state.isCoordinator and dist and SF.LootHelperComm then
+        local payload = {
+            sessionId   = self.state.sessionId,
+            profileId   = self.state.profileId,
+            coordinator = self.state.coordinator,
+            coordEpoch  = self.state.coordEpoch,
+            reason      = reason,
+            endAt       = Now(),
+        }
+
+        SF.LootHelperComm:Send("CONTROL", self.MSG.SES_END, payload, dist, nil, "ALERT")
+    end
+
+    -- Always end locally
+    self:_ResetSessionState("local_end" .. tostring(reason))
+
+    if SF.PrintInfo then
+        SF:PrintInfo("Loot Helper session ended (%s).", tostring(reason))
+    end
+
+    return true
 end
 
 -- Function Take over an existing session after raid leader changes (Sequence 4).
@@ -305,10 +504,22 @@ end
 function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     opts = opts or {}
 
+    local ok, why = self:CanSelfCoordinate(profileId)
+    if not ok then
+        if SF.PrintError then SF:PrintError("Cannot takeover session: %s", tostring(why or "unknown reason")) end
+        return false
+    end
+
     local dist = GetGroupDistribution()
     if not dist then return false end
     if type(sessionId) ~= "string" or sessionId == "" then return false end
     if type(profileId) ~= "string" or profileId == "" then return false end
+
+    -- Clear convergence state so we don't inherit stale admin statuses / pending convergence
+    self.state.adminStatuses = {}
+    self.state._adminConvergence = nil
+    self.state.handshake = nil
+    self.state._sessionAnnounced = nil
 
     local me = SelfId()
     local oldEpoch = tonumber(self.state.coordEpoch) or 0
@@ -342,6 +553,8 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
             self:ReannounceSession()
         end
     })
+
+    return true
 end
 
 -- Function Re-announce session state to raid (typically after takeover or helper refresh).
@@ -375,6 +588,13 @@ function Sync:ReannounceSession()
     }
 
     SF.LootHelperComm:Send("CONTROL", self.MSG.SES_REANNOUNCE, payload, dist, nil, "ALERT")
+
+    -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
+    self.state._sessionAnnounced = self.state.sessionId
+    self:_MarkRosterAnnounced(self.state.sessionId)
+
+    -- Start/re-ensure coordinator heartbeat sender (ticker)
+    self:EnsureHeartbeatSender("ReannounceSession")
 
     local sid = self.state.sessionId
     self:RunAfter(self.cfg.handshakeCollectSec or 3, function()
@@ -513,10 +733,31 @@ function Sync:FinalizeAdminConvergence()
     -- 2) compute coordinator "have" as contiguous prefix
     local localContig = self:ComputeContigAuthorMax(profileId)
 
-    -- 3) compute missing ranges for the coordinator
+    -- 3) Compute targetMax = best-known maxima across local + admin statuses
+    local targetMax = {}
+    for author, maxCounter in pairs (localMax) do
+        if type(author) == "string" and type(maxCounter) == "number" then
+            targetMax[author] = maxCounter
+        end
+    end
+
+    for _, st in pairs(self.state.adminStatuses or {}) do
+        if type(st) == "table" and type(st.authorMax) == "table" then
+            for author, maxcounter in pairs(st.authorMax) do
+                if type(author) == "string" and type(maxCounter) == "number" then
+                    local prev = tonumber(targetMax[author]) or 0
+                    if maxCounter > prev then
+                        targetMax[author] = maxCounter
+                    end
+                end
+            end
+        end
+    end
+
+    -- 4) compute missing ranges for the coordinator
     local missing = self:ComputeMissingLogRequests(localContig, targetMax)
 
-    -- 4) send LOG_REQs to a reasonable provider
+    -- 5) send LOG_REQs to a reasonable provider
     conv.pendingReq = {}
     conv.pendingCount = 0
 
@@ -590,7 +831,7 @@ function Sync:FinalizeAdminConvergence()
         end
     end
 
-    -- 5) choose helpers list
+    -- 6) choose helpers list
     self.state.helpers = self:ChooseHelpers(self.state.adminStatuses or {})
 
     -- If no missing logs, finish convergence immediately
@@ -702,6 +943,13 @@ function Sync:BroadcastSessionStart()
         SF.LootHelperComm:Send("CONTROL", self.MSG.SES_START, payload, dist, nil, "ALERT")
     end
 
+    -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
+    self.state._sessionAnnounced = self.state.sessionId
+    self:_MarkRosterAnnounced(self.state.sessionId)
+
+    -- Start coordinator heartbeat sender (ticker)
+    self:EnsureHeartbeatSender("BroadcastSessionStart")
+
     -- timeout window: after N seconds, summarize what we heard
     local sid = self.state.sessionId
     self:RunAfter(self.cfg.handshakeCollectSec or 3, function()
@@ -710,6 +958,167 @@ function Sync:BroadcastSessionStart()
         if self.state.sessionId ~= sid then return end
         self:FinalizeHandshakeWindow()
     end)
+end
+
+-- Function Broadcast a lightweight session heartbeat
+-- Coordinator-only. Does NOT restart handshake bookkeeping
+-- @param none
+-- @return boolean ok True if sent, false otherwise
+function Sync:BroadcastSessionHeartbeat()
+    if not (self.state and self.state.active and self.state.isCoordinator) then return false end
+    if not SF.LootHelperComm then return false end
+
+    local dist = GetGroupDistribution()
+    if not dist then return false end
+
+    local sid = self.state.sessionId
+    local profileId = self.state.profileId
+    if type(sid) ~= "string" or sid == "" then return false end 
+    if type(profileId) ~= "string" or profileId == "" then return false end
+
+    -- Keep authorMax fresh so reconnecting clients can catch up.
+    -- Note: If performance becomes an issue, we can later switch this to reuse self.state.authorMax and only recompute periodically
+    self.state.authorMax = self:ComputeAuthorMax(profileId) or (self.state.authorMax or {})
+
+    local payload = {
+        sessionId   = sid,
+        profileId   = profileId,
+        coordinator = self.state.coordinator,
+        coordEpoch  = self.state.coordEpoch,
+        helpers     = self.state.helpers or {},
+        authorMax   = self.state.authorMax or {},
+        sentAt      = Now(),
+    }
+
+    SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, "NORMAL")
+    return true
+end
+
+-- Function Determine whether heartbeat sender should run (coordinator + active session + in group).
+-- @param none
+-- @return boolean True if should run, false otherwise
+function Sync:_ShouldRunHeartbeatSender()
+    if not (self.state and self.state.active and self.state.isCoordinator) then return false end
+    if not SF.LootHelperComm then return false end
+
+    local sid = self.state.sessionId
+    local pid = self.state.profileId
+    if type(sid) ~= "string" or sid == "" then return false end
+    if type(pid) ~= "string" or pid == "" then return false end
+
+    -- Gate: don't heartbeat during admin convergence before the session is announced
+    if self.state._sessionAnnounced ~= sid then return false end
+
+    -- Must still be in PARTY/RAID
+    if not GetGroupDistribution() then return false end
+
+    return true
+end
+
+-- Function Determine whether heartbeat sender is currently running.
+-- @param none
+-- @return boolean True if running, false otherwise
+function Sync:IsHeartbeatSenderRunning()
+    local hb = self.state and self.state.heartbeat
+    return (type(hb) == "table") and (hb.heartbeatTimerHandle ~= nil)
+end
+
+-- Function Start heartbeat sender (coordinator only).
+-- @param none
+-- @return nil
+function Sync:StopHeartbeatSender(reason)
+    local hb = self.state and self.state.heartbeat
+    if type(hb) ~= "table" then return end
+
+    local h = hb.heartbeatTimerHandle
+    hb.heartbeatTimerHandle = nil
+
+    if h and h.Cancel then
+        pcall(function() h:Cancel() end)
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Heartbeat sender stopped (reason: %s)", tostring(reason or "unknown"))
+    end
+end
+
+-- Function Start heartbeat sender (coordinator only).
+-- @param reason string|nil Reason for starting (for logging)
+-- @return boolean True if started or already running, false otherwise
+function Sync:StartHeartbeatSender(reason)
+    if not self:_ShouldRunHeartbeatSender() then
+        self:StopHeartbeatSender("start_denied:" .. tostring(reason or "unknown"))
+        return false
+    end
+
+    if self:IsHeartbeatSenderRunning() then return true end
+
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+
+    local interval = tonumber(self.cfg.heartbeatIntervalSec) or 30
+    if interval < 5 then interval = 5 end
+
+    -- Capture identity for this ticker instance
+    local sid = self.state.sessionId
+    local epoch = tonumber(self.state.coordEpoch) or 0
+
+    local function tick()
+        -- Stop quickly if anything important changed
+        if not self:_ShouldRunHeartbeatSender() then
+            self:StopHeartbeatSender("tick_conditions_failed")
+            return
+        end
+        if self.state.sessionId ~= sid then
+            self:StopHeartbeatSender("tick_session_changed")
+            return
+        end
+        if (tonumber(self.state.coordEpoch) or 0) ~= epoch then
+            self:StopHeartbeatSender("tick_epoch_changed")
+            return
+        end
+
+        self:BroadcastSessionHeartbeat()
+    end
+
+    -- Send one immediately so reconnecting players catch up faster
+    self:BroadcastSessionHeartbeat()
+
+    if C_Timer and C_Timer.NewTicker then
+        hb.heartbeatTimerHandle = C_Timer.NewTicker(interval, tick)
+    else
+        -- Fallback (rare): emulate ticker with recurring timers
+        local cancelled = false
+        local handle = {}
+        function handle:Cancel() cancelled = true end
+        hb.heartbeatTimerHandle = handle
+
+        local function loop()
+            if cancelled then return end
+            tick()
+            if cancelled then return end
+            self:RunAfter(interval, loop)
+        end
+
+        self:RunAfter(interval, loop)
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Heartbeat sender started (interval=%ss, reason=%s)", tostring(interval), tostring(reason or "unknown"))
+    end
+
+    return true
+end
+
+-- Function Ensure heartbeat sender is running or stopped as appropriate.
+-- @param reason string|nil Reason for starting/stopping (for logging)
+-- @return boolean True if running, false otherwise
+function Sync:EnsureHeartbeatSender(reason)
+    if self:_ShouldRunHeartbeatSender() then
+        return self:StartHeartbeatSender(reason)
+    end
+    self:StopHeartbeatSender(reason)
+    return false
 end
 
 -- Function Broadcast coordinator takeover message (COORD_TAKEOVER).
@@ -794,12 +1203,18 @@ function Sync:HandleSessionStart(sender, payload)
         end
     end
 
+    local wasCoordinator = (self.state.isCoordinator == true)
+
     self.state.active = true
     self.state.sessionId = payload.sessionId
     self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
+
+    if wasCoordinator and not self.state.isCoordinator then
+        self:StopHeartbeatSender("lost coordinator via SES_START")
+    end
 
     if type(payload.authorMax) == "table" then
         self.state.authorMax = payload.authorMax
@@ -826,6 +1241,39 @@ function Sync:HandleSessionStart(sender, payload)
     end)
 
     self:TouchPeer(sender, { inGroup = true })
+end
+
+-- Function Handle session end announcement (SES_END).
+-- @param sender string "Name-Realm" of sender
+-- @param payload table Decoded message payload
+-- @return nil
+function Sync:HandleSessionEnd(sender, payload)
+    if type(payload) ~= "table" then return end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return end
+
+    -- Only relevant if we are currently in that session
+    if not self.state.active or type(self.state.sessionId) ~= "string" then return end
+    if payload.sessionId ~= self.state.sessionId then return end
+
+    -- Require coordinator identity and anti-spoof
+    if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return end
+    if not self:_SamePlayer(sender, payload.coordinator) then
+        return
+    end
+
+    -- Require epoch for gating
+    if type(payload.coordEpoch) ~= "number" then return end
+    if not self:IsControlMessageAllowed(payload, sender) then
+        return        
+    end
+
+    local reason = payload.reason
+
+    self:_ResetSessionState("remote_end:" .. tostring(reason or "unknown"))
+
+    if SF.PrintInfo then
+        SF:PrintInfo("Loot Helper session ended by coordinator (%s).", tostring(reason or "no reason given"))
+    end
 end
 
 -- Function Pick helper for a given player deterministically (e.g. hash(name) % #helpers).
@@ -1161,7 +1609,6 @@ function Sync:HandleNewLog(sender, payload)
     -- If we detected a gap, request missing logs
     if hasGap and type(gapFrom) == "number" and type(gapTo) == "number" then
         local author = (self:_ExtractAuthorCounter(logTable))
-        author = author
         if type(author) == "string" and author ~= "" then
             self:RequestGapRepair(profileId, author, gapFrom, gapTo, "new-log-gap")
         end
@@ -1195,6 +1642,11 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
     -- Comm already validated protocol and decoded payload
     self:TouchPeer(sender, { proto = (SF.SyncProtocol and SF.SyncProtocol.PROTO_CURRENT) or nil })
 
+    if self.state and self.state.active and self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator) then
+        self.state.heartbeat = self.state.heartbeat or {}
+        self.state.heartbeat.lastCoordMessageAt = Now()
+    end
+
     if msgType == self.MSG.ADMIN_SYNC then return self:HandleAdminSync(sender, payload) end
     if msgType == self.MSG.ADMIN_STATUS then return self:HandleAdminStatus(sender, payload) end
     if msgType == self.MSG.LOG_REQ then return self:HandleLogRequest(sender, payload) end
@@ -1206,7 +1658,8 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
 
     if msgType == self.MSG.SES_REANNOUNCE then return self:HandleSessionReannounce(sender, payload) end
     if msgType == self.MSG.COORD_TAKEOVER then return self:HandleCoordinatorTakeover(sender, payload) end
-    if msgType == self.MSG.COORD_ACK then return self:HandleCoordinatorAck(sender, payload) end
+    if msgType == self.MSG.SES_END then return self:HandleSessionEnd(sender, payload) end
+    if msgType == self.MSG.SES_HEARTBEAT then return self:HandleSessionHeartbeat(sender, payload) end
 end
 
 -- Function Route an incoming BULK message to the appropriate handler.
@@ -1217,6 +1670,11 @@ end
 -- @return nil
 function Sync:OnBulkMessage(sender, msgType, payload, distribution)
     self:TouchPeer(sender, { proto = (SF.SyncProtocol and SF.SyncProtocol.PROTO_CURRENT) or nil })
+
+    if self.state and self.state.active and self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator) then
+        self.state.heartbeat = self.state.heartbeat or {}
+        self.state.heartbeat.lastCoordMessageAt = Now()
+    end
 
     if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
     if msgType == self.MSG.PROFILE_SNAPSHOT then return self:HandleProfileSnapshot(sender, payload) end
@@ -1288,7 +1746,7 @@ function Sync:BuildAdminStatus(profileId)
     status.authorMax = profile:ComputeAuthorMax() or {}
 
     -- hasGaps heuristic:
-    -- If coutners are 1..max with no missing, then count(author) == max(author).
+    -- If counters are 1..max with no missing, then count(author) == max(author).
     -- If count < max, we're missing at least one counter somewhere (gap).
     local counts = {}
     for _, log in ipairs(profile:GetLootLogs() or {}) do
@@ -1378,6 +1836,8 @@ function Sync:HandleSessionReannounce(sender, payload)
         end
     end
 
+    local wasCoordinator = (self.state.isCoordinator == true)
+
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
 
@@ -1387,6 +1847,10 @@ function Sync:HandleSessionReannounce(sender, payload)
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
+
+    if wasCoordinator and not self.state.isCoordinator then
+        self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
+    end
 
     self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
     self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
@@ -1410,6 +1874,129 @@ function Sync:HandleSessionReannounce(sender, payload)
     end
 
     self:TouchPeer(sender, { inGroup = true })
+end
+
+-- Function Handle SES_HEARTBEAT (keepalive)
+-- @param sender string "Name-Realm" of sender
+-- @param payload table SES_HEARTBEAT payload
+-- @return nil
+function Sync:HandleSessionHeartbeat(sender, payload)
+    if type(payload) ~= "table" then return end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return end
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return end
+    if type(payload.coordEpoch) ~= "number" then return end
+
+    -- Anti-spoof: sender must be the coordinator they claim
+    if not self:_SamePlayer(sender, payload.coordinator) then
+        return
+    end
+
+    -- Epoch gating:
+    -- - If different sessionId, accept only if strictly newer epoch
+    -- - If same sessionId (or we have none), accept if not older.
+    if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
+        if not self:IsNewerEpoch(payload.coordEpoch, payload.coordinator) then
+            return
+        end
+    else
+        if not self:IsControlMessageAllowed(payload, sender) then
+            return
+        end
+    end
+
+    local wasCoordinator = (self.state.isCoordinator == true)
+
+    local oldCoord = self.state.coordinator
+    local oldEpoch = self.state.coordEpoch
+    local oldSid = self.state.sessionId
+
+    -- Apply session descriptor
+    -- We want to keep this lightweight, so we will not touch handshake bookkeeping
+    self.state.active   = true
+    self.state.sessionId = payload.sessionId
+    self.state.profileId = payload.profileId
+    self.state.coordinator = payload.coordinator
+    self.state.coordEpoch = payload.coordEpoch
+    self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
+
+    if wasCoordinator and not self.state.isCoordinator then
+        self:StopHeartbeatSender("lost coordinator via SES_HEARTBEAT")
+    end
+
+    -- Keep helper list + authorMax current
+    if type(payload.helpers) == "table" then
+        self.state.helpers = payload.helpers
+    end
+    if type(payload.authorMax) == "table" then
+        self.state.authorMax = payload.authorMax    -- Bug: NOt sure if this is a bug, but I think we should be comparing this authormax to what we have saved to see if maybe there was something we missed.
+    end
+
+    -- Heartbeat bookkeeping
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+    hb.lastHeartbeatAt = Now()
+    hb.lastCoordMessageAt = Now()
+    hb.missedHeartbeats = 0
+
+    -- If coordinator/epoch/session changed, allow a re-evaluation
+    if (not self:_SamePlayer(oldCoord, self.state.coordinator))
+        or (oldEpoch ~= self.state.coordEpoch)
+        or (oldSid ~= self.state.sessionId)
+    then
+        -- Let join-status happen again if needed
+        self.state._sentJoinStatusForSessionId = nil
+
+        -- If you had an in-flight profile request, allow a new attempt with updated target
+        self.state._profileReqInFlight = nil
+
+        if self._RefreshOutstandingRequestTargets then
+            self:_RefreshOutstandingRequestTargets()
+        end
+    end
+
+    self:TouchPeer(sender, { inGroup = true })
+
+    -- Catch-up logic:
+    if not self.state.isCoordinator then
+        local now = Now()
+        local cooldown = tonumber(self.cfg.catchupOnHeartbeatCooldownSec) or 10
+
+        if (not hb.lastCatchupAt) or ((now - hb.lastCatchupAt) >= cooldown) then
+            hb.lastCatchupAt = now
+
+            -- If we don't have the profile, bootstrap it
+            local profile = self:FindLocalProfileById(self.state.profileId)
+            if not profile then
+                self:RequestProfileSnapshot("heartbeat")
+                return
+            end
+
+            -- If we have the profile, request missing logs (if any)
+            local localContig = self:ComputeContigAuthorMax(self.state.profileId)   -- Bug: Don't we have our Authormax values saved? recalculating our Authormax maps every 30 seconds seems intense
+            local remoteMax = self.state.authorMax or {}
+            local missing = self:ComputeMissingLogRequests(localContig, remoteMax)
+
+            -- Filter out ranges already covered by outstanding requests
+            local filtered = {}
+            for _, r in ipairs(missing or {}) do
+                if type(r) == "table" then
+                    local a = r.author
+                    local f = r.fromCounter
+                    local t = r.toCounter
+                    if type(a) == "string" and type(f) == "number" and type(t) == "number" then
+                        if not self:_HasOutstandingLogRangeRequest(self.state.profileId, a, f, t) then
+                            table.insert(filtered, r)
+                        end
+                    end
+                end
+            end
+
+            if #filtered > 0 then
+                self:RequestMissingLogs(filtered, "heartbeat-catchup")
+            end
+        end
+    end
 end
 
 -- Function Handle COORD_TAKEOVER (Sequence 4): update coordinator if coordEpoch is newer.
@@ -1440,6 +2027,8 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
         return
     end
 
+    local wasCoordinator = (self.state.isCoordinator == true)
+
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
 
@@ -1449,6 +2038,10 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
+
+    if wasCoordinator and not self.state.isCoordinator then
+        self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
+    end
 
     -- Allow re-sending join status to the new coordinator
     self.state._sentJoinStatusForSessionId = nil
@@ -1468,31 +2061,6 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     end
 
     self:TouchPeer(sender, { inGroup = true })
-end
-
--- Function Handle COORD_ACK from clients/admins (optional bookkeeping).
--- @param sender string "Name-Realm" of sender
--- @param payload table COORD_ACK payload
--- @return nil
-function Sync:HandleCoordinatorAck(sender, payload)
-    if type(payload) ~= "table" then return end
-    if type(payload.sessionId) ~= "string" then return end
-    if payload.sessionId ~= self.state.sessionId then return end
-    if type(payload.profileId) == "string" and self.state.profileId and payload.profileId ~= self.state.profileId then
-        return
-    end
-
-    self:TouchPeer(sender, {
-        supportedMin = payload.supportedMin,
-        supportedMax = payload.supportedMax,
-        addonVersion = payload.addonVersion,
-    })
-
-    if self.state.profileId then
-        local isAdmin = self:IsSenderAuthorized(self.state.profileId, sender)
-        local peer = self:GetPeer(sender)
-        peer.isAdmin = isAdmin
-    end
 end
 
 -- Function Handle HAVE_PROFILE as a helper/coordinator: record that peer has profile.
@@ -2455,6 +3023,26 @@ function Sync:IsSenderAuthorized(profileId, sender)
     return false
 end
 
+-- Function Check if the given profileId authorizes the sender as an admin.
+-- @param profileId string Stable profile id
+-- @return boolean True if sender is authorized admin, false otherwise
+function Sync:CanSelfCoordinate(profileId)
+    local dist = GetGroupDistribution()
+    if not dist then
+        return false, "Not in a group/raid"
+    end
+
+    local me = SelfId()
+    if not self:IsSenderAuthorized(profileId, me)
+    then
+        return false, "You are not an admin for the selected profile"
+    end
+
+    return true, nil
+end
+
+
+
 -- Function Check if a given player is a helper in the current session.
 -- @param nameRealm string Player identifier ("Name-Realm")
 -- @return boolean True if nameRealm is in helpers list, false otherwise
@@ -3200,6 +3788,20 @@ function Sync:UpdatePeersFromRoster()
         touchUnit("player")
         for i = 1, (GetNumSubgroupMembers() or 0) do
             touchUnit("party" .. i)
+        end
+    end
+end
+
+-- Function Mark all in-group peers as having announced for the given sessionId.
+-- @param sessionId string Session id
+-- @return nil
+function Sync:_MarkRosterAnnounced(sessionId)
+    if type(sessionId) ~= "string" or sessionId == "" then return end
+    self:UpdatePeersFromRoster()
+
+    for _, peer in pairs(self.state.peers or {}) do
+        if peer and peer.inGroup then
+            peer._lastSessionAnnounced = sessionId
         end
     end
 end
