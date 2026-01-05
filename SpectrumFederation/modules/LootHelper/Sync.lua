@@ -47,6 +47,7 @@ Sync.MSG = {
 -- Runtime State (kept in-memory; persist only what you truly need)
 -- ============================================================================
 
+-- TODO: Wire this into saved profile variables
 Sync.cfg = Sync.cfg or {
     adminReplyJitterMsMin = 0,
     adminReplyJitterMsMax = 500,
@@ -183,14 +184,44 @@ function Sync:_GetUserSyncSettings()
     SF.lootHelperDB.userSettings = SF.lootHelperDB.userSettings or {}
     SF.lootHelperDB.userSettings.sync = SF.lootHelperDB.userSettings.sync or {}
     local s = SF.lootHelperDB.userSettings.sync
-    if s.localSafeModeEnabled == nil then s.localSafeModeEnabled = false end
+    if s.autoLocalSafeModeOnCombat == nil then s.autoLocalSafeModeOnCombat = false end
     return s
 end
 
--- Function Returns whether local safe mode is enabled.
-function Sync:GetLocalSafeModeEnabled()
+-- Function Returns whether auto local safe mode on combat is enabled.
+-- @param none
+-- @return boolean
+function Sync:GetAutoLocalSafeModeOnCombatEnabled()
     local s = self:_GetUserSyncSettings()
-    return s.localSafeModeEnabled == true
+    return s.autoLocalSafeModeOnCombat == true
+end
+
+-- Function Set whether auto local safe mode on combat is enabled.
+-- @param enable boolean True to enable, false to disable.
+-- @return nil
+function Sync:SetAutoLocalSafeModeOnCombatEnabled(enable)
+    local s = self:_GetUserSyncSettings()
+    s.autoLocalSafeModeOnCombat = (enable == true)
+end
+
+-- Function Toggle auto local safe mode on combat enabled state.
+-- @param none
+-- @return nil
+function Sync:ToggleAutoLocalSafeModeOnCombat()
+    self:SetAutoLocalSafeModeOnCombatEnabled(not self:GetAutoLocalSafeModeOnCombatEnabled())
+end
+
+-- Function Reset Local (session-scoped) safe mode state. Does not touch auto combat safe mode
+-- @param reason string|nil Human-readable reason for reset.
+-- @return nil
+function Sync:_ResetLocalSafeMode(reason)
+    local sm = self:_EnsureSafeModeState()
+    sm.localEnabled = false
+    sm.localSetBy = nil
+    sm.localSetAt = nil
+    sm.localReason = reason or "reset"
+
+    self:_RecomputeSafeMode("local_reset:" .. tostring(sm.localReason))
 end
 
 -- Function Ensure safe mode state structure is initialized.
@@ -206,7 +237,12 @@ function Sync:_EnsureSafeModeState()
     if sm.sessionSetAt == nil then sm.sessionSetAt = nil end
     if sm.sessionReason == nil then sm.sessionReason = nil end
 
-    if sm.localEnabled == nil then sm.localEnabled = self:GetLocalSafeModeEnabled() end
+    -- if sm.localEnabled == nil then sm.localEnabled = self:GetLocalSafeModeEnabled() end
+    if sm.localEnabled == nil then sm.localEnabled = false end
+    if sm.localSetBy == nil then sm.localSetBy = nil end
+    if sm.localSetAt == nil then sm.localSetAt = nil end
+    if sm.localReason == nil then sm.localReason = nil end
+
     if sm._effective == nil then
         sm._effective = (sm.sessionEnabled == true) or (sm.localEnabled == true)
     end
@@ -245,18 +281,36 @@ function Sync:IsBulkTransferAllowed()
     return not self:IsSafeModeEnabled()
 end
 
+-- ===========================================================================
+-- Local Safe Mode (Session-scoped, local-only)
+-- ============================================================================
+
+-- Function Returns whether local safe mode is enabled.
+-- @param none
+-- @return boolean
+function Sync:GetLocalSafeModeEnabled()
+    local sm = self:_EnsureSafeModeState()
+    return sm.localEnabled == true
+end
+
 -- Function Set whether local safe mode is enabled.
 -- @param enabled boolean True to enable, false to disable.
 -- @param reason string|nil Human-readable reason for change.
 -- @return nil
 function Sync:SetLocalSafeModeEnabled(enabled, reason)
-    local s = self:_GetUserSyncSettings()
-    s.localSafeModeEnabled = (enabled == true)
-
+    enabled = (enabled == true)
+    
     local sm = self:_EnsureSafeModeState()
-    sm.localEnabled = s.localSafeModeEnabled
+    if (sm.localEnabled == true) == enabled then
+        return
+    end
 
-    self:_RecomputeSafeMode("local:" .. tostring(reason or "set"))
+    sm.localEnabled = enabled
+    sm.localSetBy = SelfId()
+    sm.localSetAt = Now()
+    sm.localReason = reason or (enabled and "enabled" or "disabled")
+
+    self:_RecomputeSafeMode("local_set:" .. tostring(sm.localReason))
 end
 
 -- Function Toggle local safe mode enabled state.
@@ -279,7 +333,7 @@ end
 -- Function Pause all bulk transfer requests.
 -- @param reason string|nil Human-readable reason for pausing.
 -- @return nil
-function Sync:_PauseBulkRequets(reason)
+function Sync:_PauseBulkRequests(reason)
     if type(self.state.requests) ~= "table" then return end
     for _, req in pairs(self.state.requests) do
         if type(req) == "table" and self:_RequestKindUsesBulk(req.kind) then
@@ -468,12 +522,15 @@ function Sync:Enable()
                 self:OnGroupRosterUpdate()
             elseif event == "PLAYER_ENTERING_WORLD" then
                 self:OnPlayerEnteringWorld(...)
+            elseif event == "PLAYER_REGEN_DISABLED" then    -- Entering Combat
+                self:OnPlayerRegenDisabled()
             end
         end)
     end
 
     self._eventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
     self._eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    self._eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")  -- Entering Combat
 
     self:UpdatePeersFromRoster()
     self:_EnforceGroupedSessionActive("Enable")
@@ -490,6 +547,7 @@ function Sync:Disable()
     if self._eventFrame then
         pcall(function() self._eventFrame:UnregisterEvent("GROUP_ROSTER_UPDATE") end)
         pcall(function() self._eventFrame:UnregisterEvent("PLAYER_ENTERING_WORLD") end)
+        pcall(function() self._eventFrame:UnregisterEvent("PLAYER_REGEN_DISABLED") end)
     end
 
     -- Stop timers and clear session state locally
@@ -599,7 +657,7 @@ function Sync:SetSessionSafeModeEnabled(enabled, reason, setBy)
 
     self:_RecomputeSafeMode("session_set_by_coordinator:" .. tostring(reason or "manual"))
 
-    local dist = self:_EnforceGroupSessionActive("SetSessionSafeModeEnabled")
+    local dist = self:_EnforceGroupedSessionActive("SetSessionSafeModeEnabled")
     if dist and SF.LootHelperComm then
         local payload = {
             sessionId   = self.state.sessionId,
@@ -710,6 +768,7 @@ function Sync:OnGroupRosterUpdate()
         coordEpoch  = self.state.coordEpoch,
         authorMax   = self.state.authorMax,
         helpers     = self.state.helpers or {},
+        safeMode    = self:_GetSessionSafeModePayload(),
     }
 
     -- Find targets who are in-group but haven't been announced to for this sessionId
@@ -774,6 +833,36 @@ function Sync:OnPlayerEnteringWorld()
     self:EnsureHeartbeatMonitor("PLAYER_ENTERING-WORLD")
 end
 
+-- Function Called when player enters combat.
+-- @param none
+-- @return nil
+function Sync:OnPlayerRegenDisabled()
+    -- Only meaningful if we are in an active session
+    if not (self.state and self.state.active) then return end
+
+    -- 1) USER-SCOPED auto LOCAL safe mode on combat
+    if self:GetAutoLocalSafeModeOnCombatEnabled() then
+        local sm = self:_EnsureSafeModeState()
+        if sm.localEnabled ~= true then
+            self:SetLocalSafeModeEnabled(true, "combat_auto_enable")
+        end
+    end
+
+    -- 2) PROFILE-SCOPED auto SESSION safe mode on combat (coordinator-only)
+    if not (
+        self.state
+        and self.state.active
+        and self.state.isCoordinator
+        and self.cfg
+        and self.cfg.autoSessionSafeModeOnCombat == true
+    ) then return end
+
+    local sm = self:_EnsureSafeModeState()
+    if sm.sessionEnabled == true then return end
+
+    self:SetSessionSafeModeEnabled(true, "combat_auto_enable", SelfId())
+end
+
 -- Function Start a new SF Loot Helper session as coordinator (Sequence 1 -> 2).
 -- @param profileId string Stable profile id to use for this session
 -- @param opts table|nil Optional: forceStart, skipPrompt, customHelpers, ect.
@@ -808,6 +897,9 @@ function Sync:StartSession(profileId, opts)
     self.state.coordinator = me
     self.state.coordEpoch = epoch
     self.state.isCoordinator = true
+
+    self:_ResetSessionSafeMode("StartSession")
+    self:_ResetLocalSafeMode("StartSession")
 
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
@@ -861,6 +953,10 @@ function Sync:_ResetSessionState(reason)
         peer.joinReportedAt = nil
         peer._lastSessionAnnounced = nil
     end
+
+    -- Reset session-wide safe mode and local (session-scoped) safe mode
+    self:_ResetSessionSafeMode("ResetSessionState")
+    self:_ResetLocalSafeMode("ResetSessionState")
 
     -- Clear heartbeat state and stop any heartbeat timer/ticker
     do
@@ -1011,6 +1107,7 @@ function Sync:ReannounceSession()
         coordEpoch  = self.state.coordEpoch,
         authorMax   = self.state.authorMax,
         helpers     = self.state.helpers or {},
+        safeMode    = self:_GetSessionSafeModePayload(),
     }
 
     -- restart handshake bookkeeping window
@@ -1363,6 +1460,7 @@ function Sync:BroadcastSessionStart()
         coordEpoch  = self.state.coordEpoch,
         authorMax   = self.state.authorMax,
         helpers     = self.state.helpers or {},
+        safeMode    = self:_GetSessionSafeModePayload(),
     }
 
     -- reset handshake bookkeeping
@@ -1422,6 +1520,7 @@ function Sync:BroadcastSessionHeartbeat()
         helpers     = self.state.helpers or {},
         authorMax   = self.state.authorMax or {},
         sentAt      = Now(),
+        safeMode    = self:_GetSessionSafeModePayload(),
     }
 
     SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, "NORMAL")
@@ -1919,6 +2018,7 @@ function Sync:HandleSessionStart(sender, payload)
     end
 
     local wasCoordinator = (self.state.isCoordinator == true)
+    local oldSid = self.state.sessionId
 
     self.state.active = true
     self.state.sessionId = payload.sessionId
@@ -1926,6 +2026,14 @@ function Sync:HandleSessionStart(sender, payload)
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
+
+    if oldSid and oldSid ~= payload.sessionId then
+        self:_ResetSessionState("session_changed")
+    end
+
+    if type(payload.safeMode) == "table" then
+        self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_START")
+    end
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via SES_START")
@@ -2236,6 +2344,7 @@ function Sync:BroadcastNewLog(profileId, logTable)
     if not self.state.sessionId then return false, "missing sessionId" end
     if type(profileId) ~= "string" or profileId == "" then return false, "missing profileId" end
     if self.state.profileId ~= profileId then return false, "wrong profile for session" end
+    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
 
     local dist = self:_EnforceGroupedSessionActive("BroadcastNewLog")
     if not dist then return false, "not in group/raid" end
@@ -2383,6 +2492,9 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
     if msgType == self.MSG.COORD_TAKEOVER then return self:HandleCoordinatorTakeover(sender, payload) end
     if msgType == self.MSG.SES_END then return self:HandleSessionEnd(sender, payload) end
     if msgType == self.MSG.SES_HEARTBEAT then return self:HandleSessionHeartbeat(sender, payload) end
+
+    if msgType == self.MSG.SAFE_MODE_REQ then return self:HandleSafeModeRequest(sender, payload) end
+    if msgType == self.MSG.SAFE_MODE_SET then return self:HandleSafeModeSet(sender, payload) end
 end
 
 -- Function Route an incoming BULK message to the appropriate handler.
@@ -2397,6 +2509,13 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
     if self.state and self.state.active and self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator) then
         self.state.heartbeat = self.state.heartbeat or {}
         self.state.heartbeat.lastCoordMessageAt = Now()
+    end
+
+    if self:IsSafeModeEnabled() then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Safe mode: dropping BULK %s from %s", tostring(msgType), tostring(sender))
+        end
+        return
     end
 
     if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
@@ -2560,6 +2679,7 @@ function Sync:HandleSessionReannounce(sender, payload)
     end
 
     local wasCoordinator = (self.state.isCoordinator == true)
+    local oldSid = self.state.sessionId
 
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
@@ -2570,6 +2690,14 @@ function Sync:HandleSessionReannounce(sender, payload)
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
+
+    if oldSid and oldSid ~= payload.sessionId then
+        self:_ResetSessionState("session_changed")
+    end
+
+    if type(payload.safeMode) == "table" then
+        self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_REANNOUNCE")
+    end
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
@@ -2637,10 +2765,19 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     end
 
     local wasCoordinator = (self.state.isCoordinator == true)
+    local oldSid = self.state.sessionId
 
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
     local oldSid = self.state.sessionId
+
+    if oldSid and oldSid ~= payload.sessionId then
+        self:_ResetSessionState("session_changed")
+    end
+
+    if type(payload.safeMode) == "table" then
+        self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_HEARTBEAT")
+    end
 
     -- Epoch gating won't prevent an older heartbeat with the same coordEpoch from arriving after a newer one and overwriting authorMax with smaller values.
     -- This would get fixed next heartbeat, but proactively we can prevent it by also storing last seen sentAt and ignoring older heartbeats
@@ -2835,6 +2972,9 @@ end
 -- @param payload table {sessionId, requestId, profileId}
 -- @return nil
 function Sync:HandleNeedProfile(sender, payload)
+
+    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
+
     if type(payload) ~= "table" then return end
     local ok = self:ValidateSessionPayload(payload)
     if not ok then return end
@@ -2906,6 +3046,9 @@ end
 -- @param payload table {sessionId, requestId, profileId}
 -- @return nil
 function Sync:HandleNeedLogs(sender, payload)
+
+    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
+
     if type(payload) ~= "table" then return end
     local ok = self:ValidateSessionPayload(payload)
     if not ok then return end
@@ -2996,6 +3139,9 @@ end
 -- @param payload table {sessionId, requestId, profileId, author, fromCounter, toCounter?}
 -- @return nil
 function Sync:HandleLogRequest(sender, payload)
+
+    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
+    
     if type(payload) ~= "table" then return end
     if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return end
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
@@ -3042,6 +3188,51 @@ function Sync:HandleLogRequest(sender, payload)
         SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK", { enc = enc })
     elseif SF.LootHelperComm then
         SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK")
+    end
+end
+
+-- Function Handle SAFE_MODE_REQ as coordinator: enable/disable safe mode for session.
+-- @param sender string "Name-Realm" of sender
+-- @param payload table {sessionId, profileId, enabled, reason}
+-- @return nil
+function Sync:HandleSafeModeRequest(sender, payload)
+    if not (self.state and self.state.active and self.state.isCoordinator) then return end
+    if type(payload) ~= "table" then return end
+
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then return end
+
+    if not self:IsSenderAuthorized(self.state.profileId, sender) then
+        return
+    end
+
+    self:SetSessionSafeModeEnabled(payload.enabled == true, payload.reason or "requested", sender)
+end
+
+-- Function Handle SAFE_MODE_SET as member: apply safe mode state from coordinator.
+-- @param sender string "Name-Realm" of sender
+-- @param payload table {sessionId, profileId, coordinator, coordEpoch, safeMode={enabled, setBy, reason}}
+-- @return nil
+function Sync:HandleSafeModeSet(sender, payload)
+    if type(payload) ~= "table" then return end
+
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then return end
+    
+    if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return end
+    if type(payload.coordEpoch) ~= "number" then return end
+
+    -- Anti-spoof: must come from coordinator
+    if not self:_SamePlayer(sender, payload.coordinator) then return end
+
+    -- Epoch gating
+    if not self:IsControlMessageAllowed(payload, sender) then return end
+
+    self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SAFE_MODE_SET")
+
+    if SF.PrintInfo and type(payload.safeMode) == "table" then
+        local e = payload.safeMode.enabled == true
+        SF:PrintInfo("Session safe mode %s (set by %s).", e and "ENABLED" or "DISABLED", tostring(payload.safeMode.setBy or payload.coordinator))
     end
 end
 
@@ -3490,6 +3681,7 @@ end
 -- @param req table Request state table
 -- @return nil
 function Sync:_SendRequestAttempt(req)
+    if req.paused then return end
     if not req then return end
 
     -- Session ended or changed -> drop
@@ -3633,6 +3825,16 @@ function Sync:RegisterRequest(requestId, kind, target, meta)
     }
 
     self.state.requests[requestId] = req
+
+    if self:IsSafeModeEnabled() and self:_RequestKindUsesBulk(req.kind) then
+        req.paused = true
+        req.pausedReason = "safe_mode"
+        if SF.Debug then
+            SF.Debug:Info("SYNC", "Request %s paused due to safe mode (kind=%s)", tostring(req.id), tostring(req.kind))
+        end
+        return true
+    end
+
     self:_SendRequestAttempt(req)
     return true
 end
