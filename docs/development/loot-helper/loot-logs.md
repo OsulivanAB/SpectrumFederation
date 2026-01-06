@@ -50,7 +50,7 @@ Each event type requires specific data fields:
 
 **PROFILE_CREATION**:
 
-- No additional data needed (timestamp and author are sufficient)
+- `profileId` (string) - Unique identifier of the profile being created
 
 **POINT_CHANGE**:
 
@@ -120,15 +120,18 @@ Access via:
 
 ### Properties
 
-Each LootLog instance has the following properties:
+Each LootLog instance has the following **private** properties (prefixed with `_`):
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `id` | string | Unique identifier (timestamp-author-eventType-counter) |
-| `timestamp` | number | Unix timestamp when log was created |
-| `author` | string | Who created the log (e.g., "Shadowbane-Garona") |
-| `eventType` | string | Type of event (from SF.LootLogEventTypes) |
-| `data` | table | Event-specific data (structure varies by event type) |
+| `_id` | string | Unique identifier (author:counter format) |
+| `_timestamp` | number | Unix timestamp when log was created |
+| `_author` | string | Who created the log (e.g., "Shadowbane-Garona") |
+| `_counter` | number | Per-author counter for uniqueness |
+| `_eventType` | string | Type of event (from SF.LootLogEventTypes) |
+| `_data` | table | Event-specific data (structure varies by event type) |
+
+**Important**: All properties are private and must be accessed via getter methods. Direct property access is not supported.
 
 ## Creating Logs
 
@@ -137,26 +140,38 @@ Each LootLog instance has the following properties:
 The LootLog class uses **dot notation** for the constructor (factory function pattern):
 
 ```lua
-local log = SF.LootLog.new(eventType, eventData)
+local log = SF.LootLog.new(eventType, eventData, opts)
 ```
 
 **Parameters**:
 
 - `eventType` (string, required) - Event type from `SF.LootLogEventTypes`
 - `eventData` (table, required) - Event-specific data matching the template for that event type
+- `opts` (table, optional) - Optional parameters:
+    - `author` (string) - Override author (used for imports/special cases)
+    - `counter` (number) - Override counter (used for imports/special cases)
+    - `timestamp` (number) - Override timestamp (used for imports)
+    - `skipPermission` (boolean) - Bypass admin check (used for profile creation/import)
 
 **Returns**:
 
 - `LootLog` instance if successful
 - `nil` if validation fails
 
+**Permission Enforcement**:
+
+- By default, only admins can create logs (checked via `activeProfile:IsCurrentUserAdmin()`)
+- Use `opts.skipPermission = true` to bypass this check (for profile creation or imports)
+
 **Validation**:
 
 The constructor performs extensive validation:
 
-1. Event type must be valid
-2. Event data must contain all required fields
-3. Event-specific validation (member exists, valid constants, etc.)
+1. Permission check (unless `skipPermission` is true)
+2. Event type must be valid
+3. Event data must contain all required fields
+4. Event-specific validation (member exists, valid constants, etc.)
+5. Counter allocation from active profile (or use `opts.counter` override)
 
 ### Getting Event Data Templates
 
@@ -218,10 +233,10 @@ Returns the log's unique identifier.
 
 ```lua
 local id = log:GetID()
--- Returns: "1703721234_Shadowbane-Garona_POINT_CHANGE_1"
+-- Returns: "Shadowbane-Garona:1"
 ```
 
-**ID Format**: `timestamp_author_eventType_counter`
+**ID Format**: `author:counter` (e.g., "PlayerName-RealmName:123")
 
 **Use case**: Unique keys for log storage, debugging, log deduplication.
 
@@ -246,6 +261,17 @@ local author = log:GetAuthor()
 ```
 
 **Use case**: Displaying who made changes, filtering logs by author, audit trail.
+
+#### GetCounter()
+
+Returns the per-author counter value for this log.
+
+```lua
+local counter = log:GetCounter()
+-- Returns: number (e.g., 1, 2, 3...)
+```
+
+**Use case**: Ensuring log uniqueness within author's logs, debugging log ID generation.
 
 #### GetEventType()
 
@@ -286,12 +312,13 @@ local serialized = log:GetSerializedData()
 
 ```lua
 {
-    version = 1,           -- Format version for future compatibility
-    id = "...",            -- Log unique identifier
-    timestamp = 1703721234, -- Unix timestamp
-    author = "Name-Realm", -- Log creator
-    eventType = "...",     -- Event type constant
-    data = {...}          -- Event-specific data table
+    version = 2,            -- Format version (current)
+    _id = "Name-Realm:1",   -- Log unique identifier
+    _timestamp = 1703721234, -- Unix timestamp
+    _author = "Name-Realm", -- Log creator
+    _counter = 1,           -- Per-author counter
+    _eventType = "...",     -- Event type constant
+    _data = {...}           -- Event-specific data table
 }
 ```
 
@@ -338,8 +365,8 @@ end
 1. Validates input is a non-empty string
 2. Decodes Base64 to binary CBOR data
 3. Deserializes CBOR to Lua table
-4. Validates format version is 1
-5. Validates all required fields are present (id, timestamp, author, eventType, data)
+4. Validates format version is 2 (current LOG_FORMAT_VERSION)
+5. Validates all required fields are present (_id, _timestamp, _author, _counter, _eventType, _data)
 6. Creates instance directly without re-validation
 
 **Important Characteristics**:
@@ -396,9 +423,10 @@ print("Received ID:", receivedLog:GetID())
 print("IDs match:", originalLog:GetID() == receivedLog:GetID())
 
 -- Both logs will have identical properties:
--- - Same ID (timestamp_author_eventType_counter)
+-- - Same ID (author:counter format, e.g., "Healer-Garona:1")
 -- - Same timestamp
 -- - Same author
+-- - Same counter
 -- - Same event type
 -- - Same event data
 ```
@@ -453,12 +481,15 @@ The LootLog class uses a separate validation module (`LootLogValidators.lua`) to
 ### Creating a Profile Creation Log
 
 ```lua
--- Profile creation requires no additional data
+-- Profile creation requires profileId
 local eventType = SF.LootLogEventTypes.PROFILE_CREATION
 local eventData = SF.LootLog.GetEventDataTemplate(eventType)
 
-local log = SF.LootLog.new(eventType, eventData)
--- Log records: timestamp, author (current player), event type
+eventData.profileId = "MyProfile-UniqueID"
+
+-- Skip permission check since profile might not exist yet
+local log = SF.LootLog.new(eventType, eventData, { skipPermission = true })
+-- Log records: timestamp, author (current player), event type, profileId
 ```
 
 ### Awarding Points to a Member

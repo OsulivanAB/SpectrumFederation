@@ -1,22 +1,55 @@
 ## Interface: 120001
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
-## Version: 0.2.0-beta.3
+## Version: 0.3.0-beta.1
 ## Notes: Loot profile management and helper tools for guild coordination. Create and manage raid loot profiles, track distributions, and coordinate gear allocation across your guild.
 ## IconTexture: Interface\AddOns\SpectrumFederation\Media\Icons\SpectrumFederationIcon
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
 ## X-Documentation: https://osullivanab.github.io/SpectrumFederation/
 ## SavedVariables: SpectrumFederationDB, SpectrumFederationDebugDB
 
-## Core files
-modules/Debug.lua
+# --- Core files ---
+
+# --- Libs ---
+Libs/LibStub/LibStub.lua
+Libs/CallbackHandler/CallbackHandler-1.0.lua
+Libs/AceComm/ChatThrottleLib.lua
+Libs/AceComm/AceComm-3.0.lua
+
+# --- Modules --- 
+modules/debug.lua
+modules/NameUtil.lua
 modules/SlashCommands.lua
 modules/MessageHelpers.lua
+modules/Core.lua
+
+modules/LootHelper/SyncProtocol.lua
 modules/LootHelper/Members.lua
 modules/LootHelper/LootLogValidators.lua
 modules/LootHelper/LootLogs.lua
 modules/LootHelper/Profiles.lua
 modules/LootHelper/LootHelper.lua
+modules/LootHelperSync/00_Namespace.lua
+modules/LootHelperSync/01_Constants.lua
+modules/LootHelperSync/02_State.lua
+modules/LootHelperSync/03_Metrics.lua
+modules/LootHelperSync/04_SafeMode.lua
+modules/LootHelperSync/05_Scheduling.lua
+modules/LootHelperSync/06_Peers.lua
+modules/LootHelperSync/07_Validation.lua
+modules/LootHelperSync/08_Requests.lua
+modules/LootHelperSync/09_AdminConvergence.lua
+modules/LootHelperSync/10_Handshake.lua
+modules/LootHelperSync/11_Heartbeat.lua
+modules/LootHelperSync/12_LiveUpdates.lua
+modules/LootHelperSync/13_Routing.lua
+modules/LootHelperSync/14_HandlersControl.lua
+modules/LootHelperSync/15_HandlersBulk.lua
+modules/LootHelperSync/16_ProfileIntegration.lua
+modules/LootHelperSync/17_DebugSlash.lua
+modules/LootHelperSync/18_PublicAPI.lua
+modules/LootHelper/Comm.lua
+
 modules/Settings.lua
-modules/Core.lua
+
 SpectrumFederation.lua

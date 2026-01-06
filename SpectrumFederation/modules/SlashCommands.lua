@@ -106,3 +106,164 @@ function SF:InitializeSlashCommands()
     
     if SF.Debug then SF.Debug:Info("SLASH", "Slash command system initialized") end
 end
+
+-- Register Loot Helper slash commands
+-- @return: none
+function SF:RegisterLootHelperSlashCommands()
+    
+    -- List all profiles
+    SF:RegisterSlashCommand("profiles", function()
+        if not SF.lootHelperDB or not SF.lootHelperDB.profiles then
+            SF:PrintError("No profiles found!")
+            return
+        end
+        
+        local count = 0
+        SF:PrintInfo("Available Loot Profiles:")
+        
+        for profileId, profile in pairs(SF.lootHelperDB.profiles) do
+            count = count + 1
+            local name = profile:GetProfileName() or "Unknown"
+            local isActive = (SF.lootHelperDB.activeProfileId == profileId)
+            local marker = isActive and " [ACTIVE]" or ""
+            
+            SF:PrintInfo(string.format("  %d. %s (ID: %s)%s", count, name, profileId, marker))
+        end
+        
+        if count == 0 then
+            SF:PrintWarning("No profiles found. Create one with /sf createprofile <name>")
+        end
+    end, "List all loot profiles")
+    
+    -- Get active profile info
+    SF:RegisterSlashCommand("activeprofile", function()
+        local profile = SF:GetActiveProfile()
+        
+        if not profile then
+            SF:PrintWarning("No active profile set")
+            return
+        end
+        
+        local name = profile:GetProfileName()
+        local profileId = profile:GetProfileId()
+        local author = profile:GetAuthor()
+        local owner = profile:GetOwner()
+        local created = profile:GetCreationTime()
+        local modified = profile:GetLastModifiedTime()
+        local members = profile:GetMemberList()
+        local logs = profile:GetLootLogs()
+        
+        SF:PrintInfo("Active Profile:")
+        SF:PrintInfo(string.format("  Name: %s", name))
+        SF:PrintInfo(string.format("  ID: %s", profileId))
+        SF:PrintInfo(string.format("  Author: %s", author))
+        SF:PrintInfo(string.format("  Owner: %s", owner))
+        SF:PrintInfo(string.format("  Created: %s", SF:FormatTimestampForUser(created)))
+        SF:PrintInfo(string.format("  Modified: %s", SF:FormatTimestampForUser(modified)))
+        SF:PrintInfo(string.format("  Members: %d", #members))
+        SF:PrintInfo(string.format("  Logs: %d", #logs))
+    end, "Show active profile information")
+    
+    -- Create new profile
+    SF:RegisterSlashCommand("createprofile", function(args)
+        if not args or args == "" then
+            SF:PrintError("Usage: /sf createprofile <name>")
+            return
+        end
+        
+        local profile = SF.LootProfile.new(args)
+        if not profile then
+            SF:PrintError("Failed to create profile")
+            return
+        end
+        
+        if SF:AddLootProfileToDatabase(profile) then
+            SF:PrintSuccess(string.format("Created and activated profile: %s (ID: %s)", 
+                args, profile:GetProfileId()))
+        else
+            SF:PrintError("Failed to add profile to database")
+        end
+    end, "Create a new loot profile")
+    
+    -- Switch active profile (supports both name and ID)
+    SF:RegisterSlashCommand("switchprofile", function(args)
+        if not args or args == "" then
+            SF:PrintError("Usage: /sf switchprofile <name or ID>")
+            return
+        end
+        
+        -- Try as profileId first
+        if SF.lootHelperDB.profiles[args] then
+            if SF:SetActiveProfileById(args) then
+                local profile = SF.lootHelperDB.profiles[args]
+                SF:PrintSuccess(string.format("Switched to profile: %s", profile:GetProfileName()))
+            else
+                SF:PrintError("Failed to switch profile")
+            end
+            return
+        end
+        
+        -- Try as profile name
+        local found = false
+        for profileId, profile in pairs(SF.lootHelperDB.profiles) do
+            if profile:GetProfileName() == args then
+                if SF:SetActiveProfileById(profileId) then
+                    SF:PrintSuccess(string.format("Switched to profile: %s (ID: %s)", args, profileId))
+                else
+                    SF:PrintError("Failed to switch profile")
+                end
+                found = true
+                break
+            end
+        end
+        
+        if not found then
+            SF:PrintError(string.format("Profile not found: %s", args))
+            SF:PrintInfo("Use /sf profiles to see available profiles")
+        end
+    end, "Switch active profile (by name or ID)")
+    
+    -- Delete profile
+    SF:RegisterSlashCommand("deleteprofile", function(args)
+        if not args or args == "" then
+            SF:PrintError("Usage: /sf deleteprofile <name or ID>")
+            return
+        end
+        
+        local profileToDelete = nil
+        local profileId = nil
+        
+        -- Try as profileId first
+        if SF.lootHelperDB.profiles[args] then
+            profileId = args
+            profileToDelete = SF.lootHelperDB.profiles[args]
+        else
+            -- Try as profile name
+            for pid, profile in pairs(SF.lootHelperDB.profiles) do
+                if profile:GetProfileName() == args then
+                    profileId = pid
+                    profileToDelete = profile
+                    break
+                end
+            end
+        end
+        
+        if not profileToDelete then
+            SF:PrintError(string.format("Profile not found: %s", args))
+            return
+        end
+        
+        local profileName = profileToDelete:GetProfileName()
+        
+        -- Clear if active
+        if SF.lootHelperDB.activeProfileId == profileId then
+            SF.lootHelperDB.activeProfileId = nil
+            SF:PrintWarning("Cleared active profile (deleted)")
+        end
+        
+        -- Delete
+        SF.lootHelperDB.profiles[profileId] = nil
+        SF:PrintSuccess(string.format("Deleted profile: %s (ID: %s)", profileName, profileId))
+        
+    end, "Delete a loot profile (by name or ID)")
+end

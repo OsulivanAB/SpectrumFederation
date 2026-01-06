@@ -63,6 +63,7 @@ SF.WOW_CLASSES = {
 function SF:GetPlayerInfo()
     local name = UnitName("player")
     local realm = GetRealmName()
+    if realm then realm = realm:gsub("%s+", "") end -- Remove spaces from realm name
     if SF.Debug then SF.Debug:Verbose("PROFILES", "Retrieved player info: %s-%s", name, realm) end
     return name, realm
 end
@@ -70,8 +71,12 @@ end
 -- Get current player's full identifier in "Name-Realm" format
 -- @return: string - The player's full identifier (e.g., "Shadowbane-Garona")
 function SF:GetPlayerFullIdentifier()
-    local name, realm = SF:GetPlayerInfo()
-    return name .. "-" .. realm
+	if SF.NameUtil and SF.NameUtil.GetSelfId then
+		return SF.NameUtil.GetSelfId()
+	end
+	-- Fallback for early initialization
+	local name, realm = SF:GetPlayerInfo()
+	return name .. "-" .. realm
 end
 
 -- Get the current player's class in uppercase (e.g., "WARRIOR")
@@ -133,4 +138,23 @@ function SF:FormatTimestampForServer(utcTimestamp)
     local serverLocal = C_DateAndTime.GetServerTimeLocal()
     local serverOffset = serverLocal - GetServerTime()
     return date("%Y-%m-%d %H:%M:%S", utcTimestamp + serverOffset)
+end
+
+-- Function Return a current epoch time in seconds.
+-- @param none
+-- @return number epochSeconds
+function SF:Now()
+    return (GetServerTime and GetServerTime()) or time()
+end
+
+-- Get the addon's current version from metadata
+-- @return string version Addon version or "Unknown" if not found
+function SF:GetAddonVersion()
+    if C_AddOns and C_AddOns.GetAddOnMetadata then
+        return C_AddOns.GetAddOnMetadata(addonName, "Version") or "Unknown"
+    end
+    if GetAddOnMetadata then
+        return GetAddOnMetadata(addonName, "Version") or "Unknown"
+    end
+    return "Unknown"
 end

@@ -27,6 +27,22 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.Debug:Info("ADDON", "SpectrumFederation addon loaded")
         end
 
+        -- Initialize Loot Helper Database
+        if SF.InitializeLootHelperDatabase then
+            SF:InitializeLootHelperDatabase()
+        end
+
+        -- Enable Loot Helper Sync system (registers slash commands and event handlers)
+        if SF.LootHelperSync and SF.LootHelperSync.Enable then
+            SF.LootHelperSync:Enable()
+            if SF.Debug then SF.Debug:Info("SYNC", "LootHelper Sync system enabled") end
+        end
+
+        -- Register Loot Helper slash commands
+        if SF.RegisterLootHelperSlashCommands then
+            SF:RegisterLootHelperSlashCommands()
+        end
+
         -- Create the Settings UI
         if SF.CreateSettingsUI then
             SF:CreateSettingsUI()
@@ -108,10 +124,10 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
                     if #logs == 0 then
                         logText = "No debug logs available"
                     else
-                        logText = string.format("Last %d debug logs:\\n\\n", #logs)
+                        logText = string.format("Last %d debug logs:\n\n", #logs)
                         for i, log in ipairs(logs) do
                             local timestamp = SF:FormatTimestampForUser(log.timestamp)
-                            logText = logText .. string.format("[%s] [%s] %s: %s\\n", 
+                            logText = logText .. string.format("[%s] [%s] %s: %s\n", 
                                 timestamp, log.level, log.category, log.message)
                         end
                     end
@@ -148,13 +164,11 @@ AddonLoadedFrame:SetScript("OnEvent", function(self, event, addonName)
     -- Ensure the loaded addon is SpectrumFederation
     if addonName ~= "SpectrumFederation" then return end
 
-    -- Initialize Loot Helper Database before creating UI
-    if SF.InitializeLootHelperDatabase then
-        SF:InitializeLootHelperDatabase()
-    end
-
-    -- Create the Loot Window
+    -- Create the Loot Window (UI component that requires frames)
     if SF.LootWindow and SF.LootWindow.Create then
         SF.LootWindow:Create()
     end
+    
+    -- Unregister after handling our addon
+    self:UnregisterEvent("ADDON_LOADED")
 end)
