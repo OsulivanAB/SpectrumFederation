@@ -65,7 +65,7 @@ end
 function LootProfile:AllocateNextCounter(author)
     if type(author) ~= "string" or author == "" then
         if SF.Debug then
-            SF.Debug("LootProfile", "AllocateNextCounter called with invalid author:", author)
+            SF.Debug:Warn("LootProfile", "AllocateNextCounter called with invalid author:", author)
         end
         return nil
     end
@@ -87,7 +87,7 @@ function LootProfile.new(profileName)
     -- Validate profile Name
     if type(profileName) ~= "string" or profileName == "" then
         if SF.Debug then
-            SF.Debug("LootProfile", "Invalid profile name provided: %s", tostring(profileName))
+            SF.Debug:Warn("LootProfile", "Invalid profile name provided: %s", tostring(profileName))
         end
         return nil
     end
@@ -109,7 +109,7 @@ function LootProfile.new(profileName)
     local authorMember = SF.Member.new(instance._author, class or "UNKNOWN")
     if not authorMember then
         if SF.Debug then
-            SF.Debug("LootProfile", "Failed to create member instance for author:", instance._author)
+            SF.Debug:Warn("LootProfile", "Failed to create member instance for author:", instance._author)
         end
         return nil
     end
@@ -123,7 +123,7 @@ function LootProfile.new(profileName)
     local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
     if not logEventData then
         if SF.Debug then
-            SF.Debug("LootProfile", "Failed to get log event data template for profile creation")
+            SF.Debug:Warn("LootProfile", "Failed to get log event data template for profile creation")
         end
         return nil
     end
@@ -140,7 +140,7 @@ function LootProfile.new(profileName)
 
     if not logEntry then
         if SF.Debug then
-            SF.Debug("LootProfile", "Failed to create log entry for profile creation")
+            SF.Debug:Warn("LootProfile", "Failed to create log entry for profile creation")
         end
         return nil
     end
