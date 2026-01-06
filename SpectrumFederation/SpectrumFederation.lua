@@ -32,6 +32,12 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF:InitializeLootHelperDatabase()
         end
 
+        -- Enable Loot Helper Sync system (registers slash commands and event handlers)
+        if SF.LootHelperSync and SF.LootHelperSync.Enable then
+            SF.LootHelperSync:Enable()
+            if SF.Debug then SF.Debug:Info("SYNC", "LootHelper Sync system enabled") end
+        end
+
         -- Register Loot Helper slash commands
         if SF.RegisterLootHelperSlashCommands then
             SF:RegisterLootHelperSlashCommands()
