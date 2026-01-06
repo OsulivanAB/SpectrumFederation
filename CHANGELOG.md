@@ -10,6 +10,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.3.0-beta.1] - 2026-01-06
+
+### Added
+- Implemented a new communication system using AceComm-3.0 and ChatThrottleLib to support efficient and reliable message handling between addons.
+
 ## [0.2.0-beta.3] - 2026-01-02
 
 ### Changed
