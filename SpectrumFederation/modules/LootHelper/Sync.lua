@@ -281,6 +281,221 @@ function Sync:IsBulkTransferAllowed()
     return not self:IsSafeModeEnabled()
 end
 
+-- ============================================================================
+-- Metrics
+-- ============================================================================
+
+Sync.metrics = Sync.metrics or {}
+
+-- Function Ensure metrics structure is initialized.
+-- @param none
+-- @return table metrics
+function Sync:_MetricsEnsure()
+    local M = self.metrics
+    if type(M) ~= "table" then
+        M = {}
+        self.metrics = M
+    end
+
+    if M.enabled == nil then M.enabled = true end
+    M.startedAt = M.startedAt or Now()
+
+    M.counters  = M.counters or {}  -- monotonically increasing
+    M.gauges    = M.gauges or {}    -- last-set values
+    M.stats     = M.stats or {}     -- observed values: count/sum/min/max
+
+    M.meat = M.meta or {
+        addonVersion = (self._GetAddonVersion and self:_GetAddonVersion()) or "unknown",
+    }
+
+    return M
+end
+
+-- Function Returns whether metrics collection is enabled.
+-- @param none
+-- @return boolean
+function Sync:MetricsEnabled()
+    local M = self:_MetricsEnsure()
+    return M.enabled == true
+end
+
+-- Function Set whether metrics collection is enabled.
+-- @param enabled boolean True to enable, false to disable.
+-- @return nil
+function Sync:SetMetricsEnabled(enabled)
+    local M = self:_MetricsEnsure()
+    M.enabled = (enabled == true)
+end
+
+-- Function Increment counter
+-- @param key string Counter key
+-- @param delta number|nil Increment delta (default 1)
+-- @return nil
+function Sync:_MInc(key, delta)
+    local M = self:_MetricsEnsure()
+    if not M.enabled then return end
+    if type(key) ~= "string" or key == "" then return end
+    delta = tonumber(delta) or 1
+
+    local c = M.counters
+    c[key] = (tonumber(c[key]) or 0) + delta
+end
+
+-- Function Set gauge value
+-- @param key string Gauge key
+-- @param value number Gauge value
+-- @return nil
+function Sync:_MSet(key, value)
+    local M = self:_MetricsEnsure()
+    if not M.enabled then return end
+    if type(key) ~= "string" or key == "" then return end
+    M.gauges[key] = value
+end
+
+-- Function Observe a value for statistics
+-- @param key string Statistic key
+-- @param value number Observed value
+-- @return nil
+function Sync:_MObserve(key, value)
+    local M = self:_MetricsEnsure()
+    if not M.enabled then return end
+    if type(key) ~= "string" or key == "" then return end
+    value = tonumber(value)
+    if not value then return end
+
+    local s = M.stats[key]
+    if type(s) ~= "table" then
+        s = {count = 0, sum = 0, min = nil, max = nil }
+        M.stats[key] = s
+    end
+
+    s.count = (tonumber(s.count) or 0) + 1
+    s.sum = (tonumber(s.sum) or 0) + value
+    if s.min == nil or value < s.min then s.min = value end
+    if s.max == nil or value > s.max then s.max = value end
+end
+
+-- Function Set gauge value if greater than current
+-- @param key string Gauge key
+-- @param value number Gauge value
+-- @return nil
+function Sync:_MSetMax(key, value)
+    local M = self:_MetricsEnsure()
+    if not M.enabled then return end
+    value = tonumber(value)
+    if not value then return end
+    local cur = tonumber(M.gauges[key])
+    if not cur or value > cur then
+        M.gauges[key] = value
+    end
+end
+
+-- Function Get a snapshot of current metrics.
+-- @param none
+-- @return table metricsSnapshot
+function Sync:GetMetricsSnapshot()
+    local M = self:_MetricsEnsure()
+    return M
+end
+
+-- Function Record a sent message in metrics.
+-- @param prefixKey string Message prefix key
+-- @param msgType string Message type
+-- @param distribution string Distribution channel
+-- @param target string|nil Target recipient (for WHISPER)
+-- @param okSend boolean|nil True if send was successful, false if failed
+-- @return nil
+function Sync:_MetricsRecordSend(prefixKey, msgType, distribution, target, okSend)
+    if not self:MetricsEnabled() then return end
+
+    local prefixStr = (self.PREFIX and self.PREFIX[prefixKey]) or tostring(prefixKey or "unknown")
+
+    self:_MInc("sync.msg.sent.total", 1)
+    self:_MInc("sync.msg.sent.prefixKey." .. tostring(prefixStr or "UNKNOWN"), 1)
+    self:_MInc("sync.msg.sent.prefix." .. tostring(prefixStr), 1)
+
+    if type(msgType) == "string" and msgType ~= "" then
+        self:_MInc("sync.msg.sent.type." .. msgType, 1)
+        self:_MInc("sync.msg.sent.prefixKey." .. tostring(prefixKey or "UNKNOWN") .. ".type." .. msgType, 1)
+    end
+
+    if type(distribution) == "string" and distribution ~= "" then
+        self:_MInc("sync.msg.sent.dist." .. distribution, 1)
+    end
+
+    if okSend == false then
+        self:_MInc("sync.msg.send_fail.total", 1)
+        self:_MInc("sync.msg.send_fail.prefix." .. tostring(prefixStr), 1)
+        if type(msgType) == "string" and msgType ~= "" then
+            self:_MInc("sync.msg.send_fail.type." .. msgType, 1)
+        end
+    end
+end
+
+-- Function Install hook into SF.LootHelperComm:Send to record metrics.
+-- @param none
+-- @return nil
+function Sync:_InstallMetricsSendHook()
+    if self._metricsSendHookInstalled then return end
+    if not (SF and SF.LootHelperComm and SF.LootHelperComm.Send) then return end
+
+    local comm = SF.LootHelperComm
+    if comm._sfMetricsWrapped then
+        self._metricsSendHookInstalled = true
+        return
+    end
+
+    comm._sfMetricsWrapped = true
+    comm._sfOrigSend = comm.Send
+
+    comm.Send = function(commSelf, prefixKey, msgType, payload, distribution, target, prio, opts)
+        local ok = comm._sfOrigSend(commSelf, prefixKey, msgType, payload, distribution, target, prio, opts)
+        -- Record after so we can capture ok/fail
+        Sync:_MetricsRecordSend(prefixKey, msgType, distribution, target, ok)
+        return ok
+    end
+
+    self._metricsSendHookInstalled = true
+end
+
+-- Function Update request queue gauges in metrics.
+-- @param none
+-- @return nil
+function Sync:_MetricsUpdateRequestQueueGauges()
+    if not self:MetricsEnabled() then return end
+
+    local total, paused = 0, 0
+    local byKind = {}
+
+    for _, req in pairs(self.state.requests or {}) do
+        if type(req) == "table" then
+            total = total + 1
+            if req.paused then paused = paused + 1 end
+            local k = tostring(req.kind or "UNKNOWN")
+            byKind[k] = (byKind[k] or 0) + 1
+        end
+    end
+
+    self:_MSet("sync.queue.requests.outstanding", total)
+    self:_MSet("sync.queue.requests.paused", paused)
+    self:_MSetMax("sync.queue.requests.outstanding_max", total)
+
+    -- per-kind gauges
+    for kind, n in pairs(byKind) do
+        self:_MSet("sync.queue.requests.kind." .. kind, n)
+    end
+end
+
+-- Function Observe handler CPU time in milliseconds.
+-- @param prefixKey string Message prefix key
+-- @param msgType string Message type
+-- @param ms number CPU time in milliseconds
+-- @return nil
+function Sync:_MetricsObserveHandlerMs(prefixKey, msgType, ms)
+    if not self:MetricsEnabled() then return end
+    self:_MObserve("sync.handler.cpu_ms.prefixKey." .. tostring(prefixKey) .. ".type." .. tostring(msgType or "UNKNOWN"), ms)
+end
+
 -- ===========================================================================
 -- Local Safe Mode (Session-scoped, local-only)
 -- ============================================================================
@@ -510,6 +725,8 @@ function Sync:Enable()
         return
     end
     self._enabled = true
+
+    self:_InstallMetricsSendHook()
 
     -- Create a tiny event frame for the two "reliable places"
     if not self._eventFrame then
@@ -2474,27 +2691,56 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
     -- Comm already validated protocol and decoded payload
     self:TouchPeer(sender, { proto = (SF.SyncProtocol and SF.SyncProtocol.PROTO_CURRENT) or nil })
 
+    do
+        if self:MetricsEnabled() then
+            local prefixStr = self.PREFIX and self.PREFIX.CONTROL or "CONTROL"
+            self:_MInc("sync.msg.recv.total", 1)
+            self:_MInc("sync.msg.recv.prefixKey.CONTROL", 1)
+            self:_MInc("sync.msg.recv.prefix." .. tostring(prefixStr), 1)
+            if type(msgType) == "string" and msgType ~= "" then
+                self:_MInc("sync.msg.recv.type." .. msgType, 1)
+            end
+            if type(distribution) == "string" and distribution ~= "" then
+                self:_MInc("sync.msg.recv.dist." .. distribution, 1)
+            end
+        end
+    end
+
     if self.state and self.state.active and self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator) then
         self.state.heartbeat = self.state.heartbeat or {}
         self.state.heartbeat.lastCoordMessageAt = Now()
     end
 
-    if msgType == self.MSG.ADMIN_SYNC then return self:HandleAdminSync(sender, payload) end
-    if msgType == self.MSG.ADMIN_STATUS then return self:HandleAdminStatus(sender, payload) end
-    if msgType == self.MSG.LOG_REQ then return self:HandleLogRequest(sender, payload) end
+    local t0 = debugprofilestop and debugprofilestop() or nil
 
-    if msgType == self.MSG.SES_START then return self:HandleSessionStart(sender, payload) end
-    if msgType == self.MSG.HAVE_PROFILE then return self:HandleHaveProfile(sender, payload) end
-    if msgType == self.MSG.NEED_PROFILE then return self:HandleNeedProfile(sender, payload) end
-    if msgType == self.MSG.NEED_LOGS then return self:HandleNeedLogs(sender, payload) end
+    local r1, r2
+    local function dispatch()
+        if msgType == self.MSG.ADMIN_SYNC then return self:HandleAdminSync(sender, payload) end
+        if msgType == self.MSG.ADMIN_STATUS then return self:HandleAdminStatus(sender, payload) end
+        if msgType == self.MSG.LOG_REQ then return self:HandleLogRequest(sender, payload) end
 
-    if msgType == self.MSG.SES_REANNOUNCE then return self:HandleSessionReannounce(sender, payload) end
-    if msgType == self.MSG.COORD_TAKEOVER then return self:HandleCoordinatorTakeover(sender, payload) end
-    if msgType == self.MSG.SES_END then return self:HandleSessionEnd(sender, payload) end
-    if msgType == self.MSG.SES_HEARTBEAT then return self:HandleSessionHeartbeat(sender, payload) end
+        if msgType == self.MSG.SES_START then return self:HandleSessionStart(sender, payload) end
+        if msgType == self.MSG.HAVE_PROFILE then return self:HandleHaveProfile(sender, payload) end
+        if msgType == self.MSG.NEED_PROFILE then return self:HandleNeedProfile(sender, payload) end
+        if msgType == self.MSG.NEED_LOGS then return self:HandleNeedLogs(sender, payload) end
 
-    if msgType == self.MSG.SAFE_MODE_REQ then return self:HandleSafeModeRequest(sender, payload) end
-    if msgType == self.MSG.SAFE_MODE_SET then return self:HandleSafeModeSet(sender, payload) end
+        if msgType == self.MSG.SES_REANNOUNCE then return self:HandleSessionReannounce(sender, payload) end
+        if msgType == self.MSG.COORD_TAKEOVER then return self:HandleCoordinatorTakeover(sender, payload) end
+        if msgType == self.MSG.SES_END then return self:HandleSessionEnd(sender, payload) end
+        if msgType == self.MSG.SES_HEARTBEAT then return self:HandleSessionHeartbeat(sender, payload) end
+
+        if msgType == self.MSG.SAFE_MODE_REQ then return self:HandleSafeModeRequest(sender, payload) end
+        if msgType == self.MSG.SAFE_MODE_SET then return self:HandleSafeModeSet(sender, payload) end
+    end
+
+    r1, r2 = dispatch()
+
+    if t0 then
+        local ms = debugprofilestop() - t0
+        self:_MetricsObserveHandlerMs("CONTROL", msgType, ms)
+    end
+
+    return r1, r2
 end
 
 -- Function Route an incoming BULK message to the appropriate handler.
@@ -2506,6 +2752,21 @@ end
 function Sync:OnBulkMessage(sender, msgType, payload, distribution)
     self:TouchPeer(sender, { proto = (SF.SyncProtocol and SF.SyncProtocol.PROTO_CURRENT) or nil })
 
+    do
+        if self:MetricsEnabled() then
+            local prefixStr = self.PREFIX and self.PREFIX.CONTROL or "BULK"
+            self:_MInc("sync.msg.recv.total", 1)
+            self:_MInc("sync.msg.recv.prefixKey.BULK", 1)
+            self:_MInc("sync.msg.recv.prefix." .. tostring(prefixStr), 1)
+            if type(msgType) == "string" and msgType ~= "" then
+                self:_MInc("sync.msg.recv.type." .. msgType, 1)
+            end
+            if type(distribution) == "string" and distribution ~= "" then
+                self:_MInc("sync.msg.recv.dist." .. distribution, 1)
+            end
+        end
+    end
+
     if self.state and self.state.active and self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator) then
         self.state.heartbeat = self.state.heartbeat or {}
         self.state.heartbeat.lastCoordMessageAt = Now()
@@ -2515,12 +2776,29 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Safe mode: dropping BULK %s from %s", tostring(msgType), tostring(sender))
         end
+        self:_MInc("sync.msg.drop.safe_mode.total", 1)
+        self:_MInc("sync.msg.drop.safe_mode.type." .. tostring(msgType or "UNKNOWN"), 1)
+        self:_MInc("sync.msg.drop.safe_mode.prefixKey.BULK", 1)
         return
     end
 
-    if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
-    if msgType == self.MSG.PROFILE_SNAPSHOT then return self:HandleProfileSnapshot(sender, payload) end
-    if msgType == self.MSG.NEW_LOG then return self:HandleNewLog(sender, payload) end
+    local t0 = debugprofilestop and debugprofilestop() or nil
+
+    local r1, r2
+    local function dispatch()
+        if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
+        if msgType == self.MSG.PROFILE_SNAPSHOT then return self:HandleProfileSnapshot(sender, payload) end
+        if msgType == self.MSG.NEW_LOG then return self:HandleNewLog(sender, payload) end
+    end
+
+    r1, r2 = dispatch()
+
+    if t0 then
+        local ms = debugprofilestop() - t0
+        self:_MetricsOvserveHandlerMs("BULK", msgType, ms)
+    end
+
+    return r1, r2
 end
 
 -- ============================================================================
@@ -3704,6 +3982,10 @@ function Sync:_SendRequestAttempt(req)
 
     req.attempt = (tonumber(req.attempt) or 0) + 1
 
+    self:_MInc("sync.req.send_attempt.total", 1)
+    self:_MInc("sync.req.send_attempt.kind." .. tostring(req.kind or "UNKNOWN"), 1)
+    self:_MObserve("sync.req.attempt_number.kind." .. tostring(req.kind or "UNKNOWN"), tonumber(req.attempt) or 0)
+
     local target = self:_PickNextTargetForRequest(req)
     if not target then
         self:_FailRequest(req, "no more targets")
@@ -3724,6 +4006,14 @@ function Sync:_SendRequestAttempt(req)
         return
     end
 
+    if ok then
+        self:_MInc("sync.req.send_ok.total", 1)
+        self:_MInc("sync.req.send_ok.kind." .. tostring(req.kind or "UNKNOWN"), 1)
+    else
+        self:_MInc("sync.req.send_fail.total", 1)
+        self:_MInc("sync.req.send_fail.kind." .. tostring(req.kind or "UNKNOWN"), 1)
+    end
+
     -- Even if send fails, we still arm a timer; timeout path will retry
     req.lastSentAt = Now()
     req.lastTarget = target
@@ -3741,6 +4031,11 @@ function Sync:_FailRequest(req, reason)
     if self.state.requests then
         self.state.requests[req.id] = nil
     end
+
+    self:_MInc("sync.req.failed.total", 1)
+    self:_MInc("sync.req.failed.kind." .. tostring(req.kind or "UNKNOWN"), 1)
+    self:_MInc("sync.req.failed.reason." .. tostring(reason or "UNKNOWN"), 1)
+    self:_MetricsUpdateRequestQueueGauges()
 
     -- If this was a profile bootstrap request, allow a future retry
     if req.kind == "NEED_PROFILE" then
@@ -3826,6 +4121,10 @@ function Sync:RegisterRequest(requestId, kind, target, meta)
 
     self.state.requests[requestId] = req
 
+    self:_MInc("sync.req.created.total", 1)
+    self:_MInc("sync.req.created.kind." .. tostring(kind), 1)
+    self:_MetricsUpdateRequestQueueGauges()
+
     if self:IsSafeModeEnabled() and self:_RequestKindUsesBulk(req.kind) then
         req.paused = true
         req.pausedReason = "safe_mode"
@@ -3849,6 +4148,24 @@ function Sync:CompleteRequest(requestId)
 
     self:_CancelRequestTimer(req)
     self.state.requests[requestId] = nil
+
+    self:_MInc("sync.req.completed.total", 1)
+    self:_MInc("sync.req.completed.kind." .. tostring(req.kind or "UNKNOWN"), 1)
+
+    -- RTT stats: created->complete, and lastSend->complete
+    local now = Now()
+    if type(req.createdAt) == "number" then
+        self:_MObserve("sync.req.rtt.created_to_done_sec.kind." .. tostring(req.kind or "UNKNOWN"), now - req.createdAt)
+    end
+    if type(req.lastSentAt) == "number" then
+        self:_MObserve("sync.req.rtt.lastsend_to_done_sec.kind." .. tostring(req.kind or "UNKNOWN"), now - req.lastSentAt)
+    end
+
+    -- Attempts used
+    self:_MObserve("sync.req.attempts_used.kind." .. tostring(req.kind or "UNKNOWN"), tonumber(req.attempt) or 0)
+
+    self:_MetricsUpdateRequestQueueGauges()
+
     return true
 end
 
@@ -3859,6 +4176,9 @@ function Sync:OnRequestTimeout(requestId)
     if type(requestId) ~= "string" or requestId == "" then return end
     local req = self.state.requests and self.state.requests[requestId]
     if not req then return end
+
+    self:_MInc("sync.req.timeout.total", 1)
+    self:_MInc("sync.req.timeout.kind." .. tostring(req.kind or "UNKNOWN"), 1)
 
     if SF.Debug then
         SF.Debug:Verbose("SYNC", "Request timeout: %s (attempt %d)", req.id, req.attempt or 0)
