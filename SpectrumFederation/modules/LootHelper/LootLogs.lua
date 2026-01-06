@@ -278,7 +278,7 @@ end
 -- @return string|nil errMsg
 function LootLog.ValidateTable(t, opts)
     opts = opts or {}
-    local allowUnkown = (opts.allowUnknownEventType ~= false)
+    local allowUnknown  = (opts.allowUnknownEventType ~= false)
 
     if type(t) ~= "table" then return false, "log is not a table" end
     if type(t.version) ~= "number" then return false, "log.version must be a number" end
@@ -303,7 +303,7 @@ function LootLog.ValidateTable(t, opts)
     end
 
     -- Semantic enforcement (off by default for forward compatibility)
-    if not allowUnkown then
+    if not allowUnknown  then
         if not EVENT_TYPES[t._eventType] then
             return false, ("unknown event type %s"):format(tostring(t._eventType))
         end

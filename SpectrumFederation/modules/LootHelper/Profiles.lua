@@ -50,7 +50,7 @@ function LootProfile:SetProfileIdIfNil(profileId)
 
     if type(profileId) ~= "string" or profileId == "" then
         if SF.Debug then
-            SF.Debug("LootProfile", "SetProfileIdIfNil called with invalid profileId:", profileId)
+            SF.Debug:Warn("LootProfile", "SetProfileIdIfNil called with invalid profileId:", profileId)
         end
         return
     end
@@ -438,7 +438,7 @@ function LootProfile:_InsertLog(lootLog, opts)
     self._logIndex[id] = true
     table.insert(self._lootLogs, lootLog)
     
-    -- Keep authorCoutners synced to max seen
+    -- Keep authorCounters synced to max seen
     local author = lootLog:GetAuthor()
     local counter = lootLog:GetCounter()
     if type(author) == "string" and type(counter) == "number" then
@@ -624,7 +624,7 @@ function LootProfile:MergeLogTables(logTables, opts)
                 inserted = inserted + 1
                 dirtySort = true
 
-                -- Keep authorCoutners synced to max seen
+                -- Keep authorCounters synced to max seen
                 local author = log:GetAuthor()
                 local counter = log:GetCounter()
                 if type(author) == "string" and type(counter) == "number" then
