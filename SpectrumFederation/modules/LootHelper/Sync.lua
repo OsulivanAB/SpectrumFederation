@@ -581,12 +581,32 @@ function Sync:_RecomputeSafeMode(reason)
     local effective = (sm.sessionEnabled == true) or (sm.localEnabled == true)
     if sm._effective == effective then return end
 
+    local wasEffective = sm._effective
     sm._effective = effective
 
     if effective then
         self:_PauseBulkRequests("safe_mode_on:" .. tostring(reason or "unknown"))
+        
+        -- Metrics: track transition OFF -> ON
+        if wasEffective == false then
+            self:_MInc("sync.safe_mode.on_count", 1)
+            sm._safeModeStartAt = Now()
+        end
     else
         self:_ResumePausedRequests("safe_mode_off:" .. tostring(reason or "unknown"))
+        
+        -- Metrics: track transition ON -> OFF
+        if wasEffective == true then
+            self:_MInc("sync.safe_mode.off_count", 1)
+            
+            if type(sm._safeModeStartAt) == "number" then
+                local durationSec = Now() - sm._safeModeStartAt
+                if durationSec < 0 then durationSec = 0 end
+                self:_MObserve("sync.safe_mode.duration_sec", durationSec)
+            end
+            
+            sm._safeModeStartAt = nil
+        end
     end
 
     if SF.Debug then
@@ -1741,6 +1761,10 @@ function Sync:BroadcastSessionHeartbeat()
     }
 
     SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, "NORMAL")
+    
+    -- Metrics: increment heartbeat sent counter
+    self:_MInc("sync.heartbeat.sent", 1)
+    
     return true
 end
 
@@ -2056,7 +2080,15 @@ function Sync:_HeartbeatMonitorTick()
                 tonumber(round) or 0, #candidates, tostring(me), tostring(sid), tostring(pid))
         end
 
-        self:TakeoverSession(sid, pid, "heartbeat-timeout", { rerunAdminConvergence = true })
+        -- Metrics: increment takeover attempt
+        self:_MInc("sync.heartbeat.takeover_attempt", 1)
+
+        local takeoverResult = self:TakeoverSession(sid, pid, "heartbeat-timeout", { rerunAdminConvergence = true })
+        
+        -- Metrics: increment takeover win if successful
+        if takeoverResult == true then
+            self:_MInc("sync.heartbeat.takeover_win", 1)
+        end
     end)
 end
 
@@ -3075,6 +3107,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         end
     end
 
+    -- Metrics: increment heartbeat received counter (after all validation passed)
+    self:_MInc("sync.heartbeat.recv", 1)
+
     -- Apply session descriptor
     -- We want to keep this lightweight, so we will not touch handshake bookkeeping
     self.state.active   = true
@@ -3603,9 +3638,24 @@ function Sync:HandleAuthLogs(sender, payload)
         end
     end
 
+    -- Metrics: count logs received
+    local recvLogs = (type(payload.logs) == "table") and #payload.logs or 0
+    self:_MInc("sync.merge.auth_logs.logs_received_total", recvLogs)
+
+    -- Metrics: measure merge duration
+    local t0 = debugprofilestop and debugprofilestop() or nil
     local changed = self:MergeLogs(payload.profileId, payload.logs)
+    if t0 then
+        self:_MObserve("sync.merge.auth_logs.merge_ms", debugprofilestop() - t0)
+    end
+
     if changed then
+        -- Metrics: measure rebuild duration
+        local t1 = debugprofilestop and debugprofilestop() or nil
         self:RebuildProfile(payload.profileId)
+        if t1 then
+            self:_MObserve("sync.merge.auth_logs.rebuild_ms", debugprofilestop() - t1)
+        end
     end
 
     if type(payload.requestId) == "string" and payload.requestId ~= "" then
@@ -3692,6 +3742,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
         return
     end
 
+    -- Metrics: count logs received from snapshot
+    local snapshotLogs = payload.snapshot.logs or payload.snapshot.lootLogs or payload.snapshot._lootLogs
+    local recvLogs = (type(snapshotLogs) == "table") and #snapshotLogs or 0
+    self:_MInc("sync.merge.profile_snapshot.logs_received_total", recvLogs)
+
     -- Ensure DB exists
     SF.lootHelperDB = SF.lootHelperDB or { profiles = {}, activeProfileId = nil }
     SF.lootHelperDB.profiles = SF.lootHelperDB.profiles or {}
@@ -3706,8 +3761,13 @@ function Sync:HandleProfileSnapshot(sender, payload)
         isNew = true
     end
 
-    -- Import snapshot (merges logs + dedup by logId)
+    -- Metrics: measure import duration
+    local t0 = debugprofilestop and debugprofilestop() or nil
     local okImport, inserted, importErr = profile:ImportSnapshot(payload.snapshot, { allowUnknownEventType = true })
+    if t0 then
+        self:_MObserve("sync.merge.profile_snapshot.import_ms", debugprofilestop() - t0)
+    end
+
     if not okImport then
         if SF.PrintWarning then
             SF:PrintWarning(("PROFILE_SNAPSHOT import failed: %s"):format(importErr or "unknown"))
@@ -3724,7 +3784,12 @@ function Sync:HandleProfileSnapshot(sender, payload)
         end
     end
 
+    -- Metrics: measure rebuild duration
+    local t1 = debugprofilestop and debugprofilestop() or nil
     self:RebuildProfile(profileId)
+    if t1 then
+        self:_MObserve("sync.merge.profile_snapshot.rebuild_ms", debugprofilestop() - t1)
+    end
 
     -- Set as active profile (use profileId now)
     if SF.SetActiveProfileById then
