@@ -1167,6 +1167,16 @@ end
 -- @param reason string|nil Human-readable reason for reset.
 -- @return nil
 function Sync:_ResetSessionState(reason)
+    if SF.Debug then
+        local outstandingReqCount = 0
+        if type(self.state.requests) == "table" then
+            for _ in pairs(self.state.requests) do outstandingReqCount = outstandingReqCount + 1 end
+        end
+        SF.Debug:Info("SYNC", "Resetting session state (reason=%s, hadSession=%s, sessionId=%s, coordinator=%s, outstandingRequests=%d)",
+            tostring(reason), tostring(self.state.active), tostring(self.state.sessionId),
+            tostring(self.state.coordinator), outstandingReqCount)
+    end
+
     -- Cancel outstanding request timers and clear requests
     if type(self.state.requests) == "table" then
         for _, req in pairs(self.state.requests) do
@@ -1255,6 +1265,11 @@ function Sync:EndSession(reason, broadcast)
         broadcast = self.state.isCoordinator == true
     end
 
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Ending session (reason=%s, broadcast=%s, wasCoordinator=%s)",
+            tostring(reason), tostring(broadcast), tostring(self.state.isCoordinator))
+    end
+
     local dist = self:_EnforceGroupedSessionActive("EndSession")
 
     if broadcast and self.state.isCoordinator and dist and SF.LootHelperComm then
@@ -1322,6 +1337,11 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     end
     self.state.coordEpoch = newEpoch
 
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Takeover session (sessionId=%s, profileId=%s, reason=%s, oldEpoch=%s, newEpoch=%s)",
+            tostring(sessionId), tostring(profileId), tostring(reason), tostring(oldEpoch), tostring(newEpoch))
+    end
+
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
 
@@ -1365,6 +1385,18 @@ function Sync:ReannounceSession()
         safeMode    = self:_GetSessionSafeModePayload(),
     }
 
+    if SF.Debug then
+        local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0
+        local authorMaxCount = 0
+        if type(self.state.authorMax) == "table" then
+            for _ in pairs(self.state.authorMax) do authorMaxCount = authorMaxCount + 1 end
+        end
+        local safeModeEnabled = self:IsSessionSafeModeEnabled()
+        SF.Debug:Info("SYNC", "Reannouncing session (sessionId=%s, profileId=%s, coordinator=%s, epoch=%s, helpers=%d, authorMaxAuthors=%d, safeMode=%s)",
+            tostring(self.state.sessionId), tostring(profileId), tostring(self.state.coordinator),
+            tostring(self.state.coordEpoch), helpersCount, authorMaxCount, tostring(safeModeEnabled))
+    end
+
     -- restart handshake bookkeeping window
     self.state.handshake = {
         sessionId   = self.state.sessionId,
@@ -1405,6 +1437,10 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
         -- If the leader somehow doesn't have the profile, call completion hook
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "BeginAdminConvergence: no profile found (profileId=%s), calling completion hook",
+                tostring(profileId))
+        end
         local completionHook = opts.onComplete or function() self:BroadcastSessionStart() end
         completionHook()
         return
@@ -1413,8 +1449,20 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
     local adminSyncId = self:_NextNonce("AS")
     local mode = (opts.onComplete and "REANNOUNCE") or "START"
     
+    -- Who do we ask?
+    local admins = self:_GetProfileAdminUsers(profile)
+    local me = SelfId()
+    
+    local adminList = {}
+    for _, admin in ipairs(admins) do
+        if admin ~= me then
+            table.insert(adminList, admin)
+        end
+    end
+    
     if SF.Debug then
-        SF.Debug:Info("SYNC", "Beginning admin convergence (mode: %s, adminSyncId: %s)", mode, adminSyncId)
+        SF.Debug:Info("SYNC", "Beginning admin convergence (mode=%s, adminSyncId=%s, targetAdmins=%d)",
+            tostring(mode), tostring(adminSyncId), #adminList)
     end
 
     self.state._adminConvergence = {
@@ -1436,11 +1484,15 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         if admin ~= me then
             self.state._adminConvergence.expected[admin] = true
             if SF.LootHelperComm then
-                SF.LootHelperComm:Send("CONTROL", self.MSG.ADMIN_SYNC, {
+                local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.ADMIN_SYNC, {
                     sessionId       = sessionId,
                     profileId       = profileId,
                     adminSyncId     = adminSyncId,
                 }, "WHISPER", admin, "NORMAL")
+                if SF.Debug then
+                    SF.Debug:Verbose("SYNC", "Sent ADMIN_SYNC to %s (adminSyncId=%s, ok=%s)",
+                        tostring(admin), tostring(adminSyncId), tostring(sendOk))
+                end
             end
         end
     end
@@ -1450,6 +1502,8 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
     self:RunAfter(self.cfg.adminConvergenceCollectSec or 1.5, function()
         if not self.state.active or not self.state.isCoordinator then return end
         if self.state.sessionId ~= sid then return end
+        local conv = self.state._adminConvergence
+        if not conv or conv.finished or conv.finalizeStarted then return end
         self:FinalizeAdminConvergence()
     end)
 end
@@ -1505,6 +1559,15 @@ function Sync:FinalizeAdminConvergence()
     if not conv then
         return
     end
+
+    -- Guard against duplicate finalization
+    if conv.finalizeStarted then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Admin convergence finalization already started, skipping duplicate call")
+        end
+        return
+    end
+    conv.finalizeStarted = true
 
     local profileId = self.state.profileId
     local profile = self:FindLocalProfileById(profileId)
@@ -1621,6 +1684,17 @@ function Sync:FinalizeAdminConvergence()
     -- 6) choose helpers list
     self.state.helpers = self:ChooseHelpers(self.state.adminStatuses or {})
 
+    if SF.Debug then
+        local localMaxCount = 0
+        for _ in pairs(localMax) do localMaxCount = localMaxCount + 1 end
+        local adminStatusCount = 0
+        for _ in pairs(self.state.adminStatuses or {}) do adminStatusCount = adminStatusCount + 1 end
+        local targetMaxCount = 0
+        for _ in pairs(targetMax) do targetMaxCount = targetMaxCount + 1 end
+        SF.Debug:Info("SYNC", "Finalized admin convergence (localMaxAuthors=%d, adminStatusesReceived=%d, targetMaxAuthors=%d, missingRanges=%d, pendingRequests=%d, helpersChosen=%d)",
+            localMaxCount, adminStatusCount, targetMaxCount, #missing, conv.pendingCount, #(self.state.helpers or {}))
+    end
+
     -- If no missing logs, finish convergence immediately
     if conv.pendingCount == 0 then
         self:_FinishAdminConvergence("no_missing")
@@ -1719,6 +1793,17 @@ function Sync:BroadcastSessionStart()
         safeMode    = self:_GetSessionSafeModePayload(),
     }
 
+    if SF.Debug then
+        local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0
+        local authorMaxCount = 0
+        if type(self.state.authorMax) == "table" then
+            for _ in pairs(self.state.authorMax) do authorMaxCount = authorMaxCount + 1 end
+        end
+        SF.Debug:Info("SYNC", "Broadcasting session start (sessionId=%s, profileId=%s, coordinator=%s, epoch=%s, helpers=%d, authorMaxAuthors=%d)",
+            tostring(self.state.sessionId), tostring(profileId), tostring(self.state.coordinator),
+            tostring(self.state.coordEpoch), helpersCount, authorMaxCount)
+    end
+
     -- reset handshake bookkeeping
     self.state.handshake = {
         sessionId = self.state.sessionId,
@@ -1779,7 +1864,17 @@ function Sync:BroadcastSessionHeartbeat()
         safeMode    = self:_GetSessionSafeModePayload(),
     }
 
-    SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, "NORMAL")
+    local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, "NORMAL")
+    
+    if SF.Debug then
+        local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0
+        local authorMaxCount = 0
+        if type(self.state.authorMax) == "table" then
+            for _ in pairs(self.state.authorMax) do authorMaxCount = authorMaxCount + 1 end
+        end
+        SF.Debug:Verbose("SYNC", "Heartbeat sent (sessionId=%s, profileId=%s, epoch=%s, helpers=%d, authorMaxAuthors=%d, sendOk=%s)",
+            tostring(sid), tostring(profileId), tostring(self.state.coordEpoch), helpersCount, authorMaxCount, tostring(sendOk))
+    end
     
     -- Metrics: increment heartbeat sent counter
     self:_MInc("sync.heartbeat.sent", 1)
@@ -2063,6 +2158,13 @@ function Sync:_HeartbeatMonitorTick()
     local idx = ((round - 1) % #candidates) + 1
     local winner = candidates[idx]
 
+    if SF.Debug then
+        local candidateList = table.concat(candidates, ",")
+        if #candidateList > 150 then candidateList = candidateList:sub(1, 147) .. "..." end
+        SF.Debug:Verbose("SYNC", "Heartbeat threshold exceeded (elapsed=%.1fs, threshold=%.1fs, round=%d, candidates=%d, winner=%s, me=%s)",
+            elapsed, thresholdSec, round, #candidates, tostring(winner), tostring(SelfId()))
+    end
+
     local me = SelfId()
     if not self:_SamePlayer(winner, me) then
         return
@@ -2246,6 +2348,11 @@ function Sync:FinalizeHandshakeWindow()
     if SF.PrintInfo then
         SF:PrintInfo(("Handshake complete: %d have, %d need profile, %d need logs, %d no response"):
             format(have, needProf, needLogs, noResp))
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Finalized handshake window (sessionId=%s, profileId=%s, have=%d, needProfile=%d, needLogs=%d, noResponse=%d)",
+            tostring(self.state.sessionId), tostring(self.state.profileId), have, needProf, needLogs, noResp)
     end
 end
 
@@ -2550,6 +2657,29 @@ end
 -- @return boolean hasProfile True if local has profile, false otherwise
 -- @return table missingRequests Array describing needed missing log ranges (implementation-defined)
 function Sync:AssessLocalState(profileId, sessionAuthorMax)
+    -- Return hasProfile, missingRequests table
+    if not profileId or type(sessionAuthorMax) ~= "table" then
+        return false, {}
+    end
+
+    local profile = self:_GetProfile(profileId)
+    if not profile then
+        return false, {}
+    end
+
+    -- Compute local contiguous author max
+    local localContig = self:ComputeContigAuthorMax(profileId)
+    if not localContig then
+        localContig = {}
+    end
+
+    -- Compute missing log requests
+    local missingRanges = self:ComputeMissingLogRequests(localContig, sessionAuthorMax)
+    if not missingRanges then
+        missingRanges = {}
+    end
+
+    return true, missingRanges
 end
 
 -- Function Send join status (HAVE_PROFILE, NEED_PROFILE, or NEED_LOGS) to coordinator.
@@ -2592,6 +2722,10 @@ function Sync:SendJoinStatus()
         -- Bootstrap from helpers (preferred) or coordinator (fallback)
         self:RequestProfileSnapshot("join-status")
 
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "SendJoinStatus: no local profile, requesting snapshot (statusOnly=true)", tostring(profileId))
+        end
+
         -- Also tell the coordinator our handshake status, without forcing them to serve data
         if not alreadySent("NEED_PROFILE") then
             markSent("NEED_PROFILE")
@@ -2615,6 +2749,10 @@ function Sync:SendJoinStatus()
     if missing and #missing > 0 then
         -- Fetch missing logs (helpers preferred; coordinator fallback via request retry)
         self:RequestMissingLogs(missing, "join-status")
+
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "SendJoinStatus: missing logs, requesting ranges (count=%d, statusOnly=true)", #missing)
+        end
 
         -- Also tell the coordinator our handshake status, without forcing them to serve data
         if not alreadySent("NEED_LOGS") then
@@ -2643,6 +2781,10 @@ function Sync:SendJoinStatus()
 
     if alreadySent("HAVE_PROFILE") then return end
     markSent("HAVE_PROFILE")
+
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "SendJoinStatus: fully synced, sending HAVE_PROFILE")
+    end
 
     if SF.LootHelperComm then
         SF.LootHelperComm:Send("CONTROL", self.MSG.HAVE_PROFILE, payloadBase, "WHISPER", coord, "NORMAL")
@@ -2832,6 +2974,12 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
 
         if msgType == self.MSG.SAFE_MODE_REQ then return self:HandleSafeModeRequest(sender, payload) end
         if msgType == self.MSG.SAFE_MODE_SET then return self:HandleSafeModeSet(sender, payload) end
+        
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Unknown CONTROL message type (msgType=%s, sender=%s, dist=%s)",
+                tostring(msgType), tostring(sender), tostring(distribution))
+        end
+        return nil
     end
 
     r1, r2 = dispatch()
@@ -2890,6 +3038,12 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
         if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
         if msgType == self.MSG.PROFILE_SNAPSHOT then return self:HandleProfileSnapshot(sender, payload) end
         if msgType == self.MSG.NEW_LOG then return self:HandleNewLog(sender, payload) end
+        
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Unknown BULK message type (msgType=%s, sender=%s, dist=%s)",
+                tostring(msgType), tostring(sender), tostring(distribution))
+        end
+        return nil
     end
 
     r1, r2 = dispatch()
@@ -3025,7 +3179,9 @@ function Sync:HandleAdminStatus(sender, payload)
         end
     end
     if all then
-        self:FinalizeAdminConvergence()
+        if not conv.finalizeStarted and not conv.finished then
+            self:FinalizeAdminConvergence()
+        end
     end
 end
 
@@ -3128,6 +3284,10 @@ function Sync:HandleSessionHeartbeat(sender, payload)
 
     -- Anti-spoof: sender must be the coordinator they claim
     if not self:_SamePlayer(sender, payload.coordinator) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting heartbeat: sender=%s != coordinator=%s (anti-spoof)",
+                tostring(sender), tostring(payload.coordinator))
+        end
         return
     end
 
@@ -3136,10 +3296,18 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     -- - If same sessionId (or we have none), accept if not older.
     if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
         if not self:IsNewerEpoch(payload.coordEpoch, payload.coordinator) then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting heartbeat: epoch not newer (sessionId changed, incomingEpoch=%s, currentEpoch=%s)",
+                    tostring(payload.coordEpoch), tostring(self.state.coordEpoch))
+            end
             return
         end
     else
         if not self:IsControlMessageAllowed(payload, sender) then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting heartbeat: epoch gating failed (incomingEpoch=%s, currentEpoch=%s)",
+                    tostring(payload.coordEpoch), tostring(self.state.coordEpoch))
+            end
             return
         end
     end
@@ -3168,11 +3336,25 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         and self:_SamePlayer(oldCoord, payload.coordinator)
     if type(payload.sentAt) == "number" then
         local last = tonumber(hb.lastHeartbeatSentAt)
-        if sameStream and last and payload.sentAt < last then return end
+        if sameStream and last and payload.sentAt < last then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting heartbeat: older sentAt (sentAt=%s < lastSentAt=%s)",
+                    tostring(payload.sentAt), tostring(last))
+            end
+            return
+        end
         hb.lastHeartbeatSentAt = payload.sentAt
     else
         if not sameStream then
             hb.lastHeartbeatSentAt = nil
+        end
+    end
+
+    if not sameStream then
+        if SF.Debug then
+            SF.Debug:Info("SYNC", "Heartbeat caused session/coordinator/epoch change (oldSid=%s->%s, oldCoord=%s->%s, oldEpoch=%s->%s)",
+                tostring(oldSid), tostring(payload.sessionId), tostring(oldCoord), tostring(payload.coordinator),
+                tostring(oldEpoch), tostring(payload.coordEpoch))
         end
     end
 
@@ -3356,26 +3538,55 @@ end
 -- @return nil
 function Sync:HandleNeedProfile(sender, payload)
     if type(payload) ~= "table" then return end
-    local ok = self:ValidateSessionPayload(payload)
-    if not ok then return end
+    local ok, err = self:ValidateSessionPayload(payload)
+    if not ok then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedProfile: validation failed (sender=%s, err=%s)",
+                tostring(sender), tostring(err))
+        end
+        return
+    end
 
     self:_RecordHandshakeReply(sender, payload, "NEED_PROFILE")
 
     -- Coordinator handshake visibility without forcing a data response
     if payload.statusOnly == true then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedProfile: statusOnly, not serving data (sender=%s)", tostring(sender))
+        end
         return
     end
 
-    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
+    if not self:IsBulkTransferAllowed() then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedProfile: safe mode blocks bulk transfer (sender=%s)", tostring(sender))
+        end
+        return false, "safe mode (bulk disabled)"
+    end
 
     -- Serve eligibility: coordinator OR helper
-    if not self.state.active then return end
-    if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
+    if not self.state.active then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedProfile: no active session (sender=%s)", tostring(sender))
+        end
+        return
+    end
+    if not (self.state.isCoordinator or self:IsSelfHelper()) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedProfile: not coordinator/helper (sender=%s)", tostring(sender))
+        end
+        return
+    end
 
     -- Safety: only send to group members (prevents random whisper abuse)
     self:UpdatePeersFromRoster()
     local peer = self:GetPeer(sender)
-    if not peer or not peer.inGroup then return end
+    if not peer or not peer.inGroup then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedProfile: sender not in group (sender=%s)", tostring(sender))
+        end
+        return
+    end
 
     local serveRole = self.state.isCoordinator and "coordinator" or "helper"
     if SF.Debug then
@@ -3434,26 +3645,55 @@ end
 -- @return nil
 function Sync:HandleNeedLogs(sender, payload)
     if type(payload) ~= "table" then return end
-    local ok = self:ValidateSessionPayload(payload)
-    if not ok then return end
+    local ok, err = self:ValidateSessionPayload(payload)
+    if not ok then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedLogs: validation failed (sender=%s, err=%s)",
+                tostring(sender), tostring(err))
+        end
+        return
+    end
 
     self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
 
     -- Coordinator handshake visibility without forcing a data response
     if payload.statusOnly == true then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedLogs: statusOnly, not serving data (sender=%s)", tostring(sender))
+        end
         return
     end
 
-    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
+    if not self:IsBulkTransferAllowed() then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedLogs: safe mode blocks bulk transfer (sender=%s)", tostring(sender))
+        end
+        return false, "safe mode (bulk disabled)"
+    end
 
     -- Serve eligibility: coordinator OR helper
-    if not self.state.active then return end
-    if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
+    if not self.state.active then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedLogs: no active session (sender=%s)", tostring(sender))
+        end
+        return
+    end
+    if not (self.state.isCoordinator or self:IsSelfHelper()) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedLogs: not coordinator/helper (sender=%s)", tostring(sender))
+        end
+        return
+    end
 
     -- Safety: only send to group members
     self:UpdatePeersFromRoster()
     local peer = self:GetPeer(sender)
-    if not peer or not peer.inGroup then return end
+    if not peer or not peer.inGroup then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleNeedLogs: sender not in group (sender=%s)", tostring(sender))
+        end
+        return
+    end
 
     if type(payload) ~= "table" or type(payload.missing) ~= "table" then return end
 
@@ -3462,8 +3702,9 @@ function Sync:HandleNeedLogs(sender, payload)
 
     local serveRole = self.state.isCoordinator and "coordinator" or "helper"
     if SF.Debug then
-        SF.Debug:Info("SYNC", "Serving missing logs as %s to %s (%d ranges requested)",
-            serveRole, tostring(sender), #payload.missing)
+        local rangesCount = #payload.missing
+        SF.Debug:Info("SYNC", "Serving missing logs as %s to %s (rangesRequested=%d)",
+            tostring(serveRole), tostring(sender), rangesCount)
     end
 
     local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeedLogs or self.cfg.maxMissingRangesPerNeededLogs) or 8
@@ -3536,7 +3777,12 @@ end
 -- @return nil
 function Sync:HandleLogRequest(sender, payload)
 
-    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
+    if not self:IsBulkTransferAllowed() then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleLogRequest: safe mode blocks bulk transfer (sender=%s)", tostring(sender))
+        end
+        return false, "safe mode (bulk disabled)"
+    end
     
     if type(payload) ~= "table" then return end
     if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return end
@@ -3549,6 +3795,10 @@ function Sync:HandleLogRequest(sender, payload)
 
     -- Only send logs to admins. Members will use the Need Logs workflow.
     if not self:IsSenderAuthorized(payload.profileId, sender) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleLogRequest: sender not authorized (sender=%s, profileId=%s)",
+                tostring(sender), tostring(payload.profileId))
+        end
         if SF.PrintWarning then
             SF:PrintWarning(("Ignoring LOG_REQ from %s for profile %s: not an admin."):format(sender, payload.profileId))
         end
@@ -3556,10 +3806,21 @@ function Sync:HandleLogRequest(sender, payload)
     end
 
     local profile = self:FindLocalProfileById(payload.profileId)
-    if not profile then return end
+    if not profile then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "HandleLogRequest: profile not found (sender=%s, profileId=%s)",
+                tostring(sender), tostring(payload.profileId))
+        end
+        return
+    end
 
     local fromC = math.max(1, math.floor(payload.fromCounter))
     local toC = (toCounter and math.floor(toCounter)) or fromC
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Serving logs for %s [%d-%d] to %s",
+            tostring(payload.author), fromC, toC, tostring(sender))
+    end
 
     local out = {}
     for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
@@ -3581,6 +3842,8 @@ function Sync:HandleLogRequest(sender, payload)
         adminSyncId = payload.adminSyncId,
         requestId   = payload.requestId,
         author      = payload.author,
+        fromCounter = fromC,
+        toCounter   = toC,
         logs        = out,
     }
 
@@ -3677,47 +3940,141 @@ end
 -- @param payload table {sessionId, requestId, profileId, author, logs =[...]}
 -- @return nil
 function Sync:HandleAuthLogs(sender, payload)
+    -- Basic payload validation
     if type(payload) ~= "table" then return end
 
     local ok = self:ValidateSessionPayload(payload)
-    if not ok then return end
+    if not ok then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: invalid session payload", tostring(sender))
+        end
+        return
+    end
 
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.logs) ~= "table" then return end
 
-    -- Trust policy: accept from coordinator or helper
-    if not self.state.isCoordinator then
-        if not self:IsTrustedDataSender(sender) then
+    -- Require requestId for correlation
+    if type(payload.requestId) ~= "string" or payload.requestId == "" then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: missing requestId", tostring(sender))
+        end
+        return
+    end
+
+    -- Lookup matching request
+    local req = self.state.requests and self.state.requests[payload.requestId]
+    if not req then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: no matching request for requestId %s", tostring(sender), tostring(payload.requestId))
+        end
+        return
+    end
+
+    -- Validate payload matches request metadata (for log requests)
+    if req.kind == "NEED_LOGS" or req.kind == "LOG_REQ" or req.kind == "ADMIN_LOG_REQ" then
+        if type(payload.author) ~= "string" or payload.author == "" then
             if SF.Debug then
-                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not a trusted sender", tostring(sender))
+                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: missing author field", tostring(sender))
             end
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not a trusted sender."):format(sender))
+            self:_RetryRequestSoon(req)
+            return
+        end
+        if type(payload.fromCounter) ~= "number" or type(payload.toCounter) ~= "number" then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: missing or invalid counter fields", tostring(sender))
             end
+            self:_RetryRequestSoon(req)
             return
         end
 
-        if not self:IsRequesterInGroup(sender) then
-            if SF.Debug then
-                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not in group", tostring(sender))
+        -- Validate against request meta
+        if req.meta then
+            if req.meta.profileId and req.meta.profileId ~= payload.profileId then
+                if SF.Debug then
+                    SF.Debug:Warn("SYNC", "AUTH_LOGS payload mismatch for request %s: profileId expected=%s got=%s",
+                        tostring(payload.requestId), tostring(req.meta.profileId), tostring(payload.profileId))
+                end
+                self:_RetryRequestSoon(req)
+                return
             end
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not in group."):format(sender))
+            if req.meta.author and req.meta.author ~= payload.author then
+                if SF.Debug then
+                    SF.Debug:Warn("SYNC", "AUTH_LOGS payload mismatch for request %s: author expected=%s got=%s",
+                        tostring(payload.requestId), tostring(req.meta.author), tostring(payload.author))
+                end
+                self:_RetryRequestSoon(req)
+                return
             end
-            return
+            if req.meta.fromCounter and req.meta.fromCounter ~= payload.fromCounter then
+                if SF.Debug then
+                    SF.Debug:Warn("SYNC", "AUTH_LOGS payload mismatch for request %s: fromCounter expected=%d got=%d",
+                        tostring(payload.requestId), tonumber(req.meta.fromCounter) or 0, tonumber(payload.fromCounter) or 0)
+                end
+                self:_RetryRequestSoon(req)
+                return
+            end
+            if req.meta.toCounter and req.meta.toCounter ~= payload.toCounter then
+                if SF.Debug then
+                    SF.Debug:Warn("SYNC", "AUTH_LOGS payload mismatch for request %s: toCounter expected=%d got=%d",
+                        tostring(payload.requestId), tonumber(req.meta.toCounter) or 0, tonumber(payload.toCounter) or 0)
+                end
+                self:_RetryRequestSoon(req)
+                return
+            end
         end
+    end
 
-        -- If you keep this check, member must already have the profile/admin list.
+    -- Trust validation: ALWAYS check sender is in group (both coordinator and member)
+    if not self:IsRequesterInGroup(sender) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not in group", tostring(sender))
+        end
+        if SF.PrintWarning then
+            SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not in group."):format(sender))
+        end
+        return
+    end
+
+    -- Trust validation: Path-specific checks BEFORE merge
+    if self.state.isCoordinator then
+        -- Coordinator path: require sender is authorized admin
         if not self:IsSenderAuthorized(payload.profileId, sender) then
             if SF.Debug then
-                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not an admin of profile", tostring(sender))
+                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not authorized for profile %s (coordinator path)",
+                    tostring(sender), tostring(payload.profileId))
             end
             if SF.PrintWarning then
                 SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not an admin of profile."):format(sender))
             end
             return
         end
-
+        if SF.Debug then
+            SF.Debug:Info("SYNC", "Accepting AUTH_LOGS from authorized admin %s (%d logs for %s [%d-%d])",
+                tostring(sender), #payload.logs, tostring(payload.author),
+                tonumber(payload.fromCounter) or 0, tonumber(payload.toCounter) or 0)
+        end
+    else
+        -- Member path: require sender is coordinator or helper
+        if not self:IsTrustedDataSender(sender) then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not a trusted sender (member path)", tostring(sender))
+            end
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not a trusted sender."):format(sender))
+            end
+            return
+        end
+        -- Additional check: sender must be authorized admin
+        if not self:IsSenderAuthorized(payload.profileId, sender) then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not an admin of profile (member path)", tostring(sender))
+            end
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not an admin of profile."):format(sender))
+            end
+            return
+        end
         if SF.Debug then
             local senderRole = (sender == self.state.coordinator) and "coordinator" or (self:IsHelper(sender) and "helper" or "unknown")
             SF.Debug:Info("SYNC", "Accepting AUTH_LOGS from %s as %s (%d logs for %s [%d-%d])",
@@ -3726,6 +4083,7 @@ function Sync:HandleAuthLogs(sender, payload)
         end
     end
 
+    -- All validation passed; proceed with merge
     -- Metrics: count logs received
     local recvLogs = (type(payload.logs) == "table") and #payload.logs or 0
     self:_MInc("sync.merge.auth_logs.logs_received_total", recvLogs)
@@ -3746,20 +4104,50 @@ function Sync:HandleAuthLogs(sender, payload)
         end
     end
 
-    if type(payload.requestId) == "string" and payload.requestId ~= "" then
-        self:CompleteRequest(payload.requestId)
+    -- Range satisfaction check: only complete request if requested range is satisfied
+    local requestSatisfied = false
+    if req.kind == "NEED_LOGS" or req.kind == "LOG_REQ" or req.kind == "ADMIN_LOG_REQ" then
+        if req.meta and req.meta.author and req.meta.toCounter then
+            local contig = self:_ComputeContigCounter(payload.profileId, req.meta.author)
+            if contig >= req.meta.toCounter then
+                requestSatisfied = true
+                if SF.Debug then
+                    SF.Debug:Info("SYNC", "Request %s satisfied: author=%s contig=%d >= requested=%d",
+                        tostring(payload.requestId), tostring(req.meta.author), contig, req.meta.toCounter)
+                end
+            else
+                -- Partial response: still missing logs
+                if SF.Debug then
+                    SF.Debug:Info("SYNC", "Request %s partial: author=%s contig=%d < requested=%d, will retry",
+                        tostring(payload.requestId), tostring(req.meta.author), contig, req.meta.toCounter)
+                end
+                self:_RetryRequestSoon(req)
+                return
+            end
+        else
+            -- No meta to validate against; assume satisfied
+            requestSatisfied = true
+        end
+    else
+        -- Non-log request types: assume satisfied
+        requestSatisfied = true
     end
 
-    -- If we are coordinator, this might be part of admin convergence
-    if self.state.isCoordinator then
-        local conv = self.state._adminConvergence
-        if conv and payload.adminSyncId == conv.adminSyncId and type(payload.requestId) == "string" then
-            if conv.pendingReq and conv.pendingReq[payload.requestId] then
-                conv.pendingReq[payload.requestId] = nil
-                conv.pendingCount = math.max(0, (conv.pendingCount or 1) - 1)
+    -- Complete request only if satisfied
+    if requestSatisfied then
+        self:CompleteRequest(payload.requestId)
 
-                if conv.pendingCount == 0 then
-                    self:_FinishAdminConvergence("complete")
+        -- Admin convergence: only decrement if request satisfied
+        if self.state.isCoordinator then
+            local conv = self.state._adminConvergence
+            if conv and payload.adminSyncId == conv.adminSyncId then
+                if conv.pendingReq and conv.pendingReq[payload.requestId] then
+                    conv.pendingReq[payload.requestId] = nil
+                    conv.pendingCount = math.max(0, (conv.pendingCount or 1) - 1)
+
+                    if conv.pendingCount == 0 then
+                        self:_FinishAdminConvergence("complete")
+                    end
                 end
             end
         end
@@ -3964,6 +4352,10 @@ end
 function Sync:_ArmRequestTimer(req)
     self:_CancelRequestTimer(req)
     local delay = self:_ComputeRequestDelaySec(req)
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Armed request timer (id=%s, kind=%s, attempt=%d, delaySec=%.2f)",
+            tostring(req.id), tostring(req.kind), tonumber(req.attempt) or 0, delay)
+    end
     req.timer = self:RunAfter(delay, function()
         self:OnRequestTimeout(req.id)
     end)
@@ -4147,6 +4539,16 @@ function Sync:_SendRequestAttempt(req)
         return
     end
 
+    if SF.Debug then
+        local targetsRemaining = 0
+        if type(req.targets) == "table" then
+            targetsRemaining = #req.targets - (tonumber(req.targetIdx) or 0)
+        end
+        SF.Debug:Verbose("SYNC", "Sending request attempt (id=%s, kind=%s, attempt=%d/%d, target=%s, remainingTargets=%d, paused=%s)",
+            tostring(req.id), tostring(req.kind), tonumber(req.attempt) or 0, tonumber(req.maxRetries) or 0 + 1,
+            tostring(target), targetsRemaining, tostring(req.paused or false))
+    end
+
     local ok = false
     if req.kind == "ADMIN_LOG_REQ" then
         ok = self:_SendAdminLogReq(req, target)
@@ -4169,6 +4571,11 @@ function Sync:_SendRequestAttempt(req)
         self:_MInc("sync.req.send_fail.kind." .. tostring(req.kind or "UNKNOWN"), 1)
     end
 
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Request send result (id=%s, target=%s, ok=%s)",
+            tostring(req.id), tostring(target), tostring(ok))
+    end
+
     -- Even if send fails, we still arm a timer; timeout path will retry
     req.lastSentAt = Now()
     req.lastTarget = target
@@ -4185,6 +4592,12 @@ function Sync:_FailRequest(req, reason)
     
     if self.state.requests then
         self.state.requests[req.id] = nil
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Request failed (id=%s, kind=%s, attempt=%d/%d, lastTarget=%s, reason=%s)",
+            tostring(req.id), tostring(req.kind), tonumber(req.attempt) or 0,
+            tonumber(req.maxRetries) or 0 + 1, tostring(req.lastTarget), tostring(reason))
     end
 
     self:_MInc("sync.req.failed.total", 1)
@@ -4281,6 +4694,13 @@ function Sync:RegisterRequest(requestId, kind, target, meta)
     self:_MInc("sync.req.created.kind." .. tostring(kind), 1)
     self:_MetricsUpdateRequestQueueGauges()
 
+    if SF.Debug then
+        local targetList = table.concat(targets, ",")
+        if #targetList > 100 then targetList = targetList:sub(1, 97) .. "..." end
+        SF.Debug:Verbose("SYNC", "Registered request (id=%s, kind=%s, initialTarget=%s, totalTargets=%d, sessionId=%s)",
+            tostring(requestId), tostring(kind), tostring(target), #targets, tostring(meta.sessionId or "none"))
+    end
+
     if self:IsSafeModeEnabled() and self:_RequestKindUsesBulk(req.kind) then
         req.paused = true
         req.pausedReason = "safe_mode"
@@ -4307,6 +4727,11 @@ function Sync:CompleteRequest(requestId)
 
     self:_MInc("sync.req.completed.total", 1)
     self:_MInc("sync.req.completed.kind." .. tostring(req.kind or "UNKNOWN"), 1)
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Request completed (id=%s, kind=%s, attempts=%d, lastTarget=%s)",
+            tostring(req.id), tostring(req.kind), tonumber(req.attempt) or 0, tostring(req.lastTarget))
+    end
 
     -- RTT stats: created->complete, and lastSend->complete
     local now = Now()
