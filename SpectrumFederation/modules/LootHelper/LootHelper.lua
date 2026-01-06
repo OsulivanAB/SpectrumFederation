@@ -67,7 +67,7 @@ function SF:MigrateLootHelperSchema()
     for key, profile in pairs(db.profiles) do
         if type(key) == "string" and type(profile) == "table" then
             -- ProfileId format: "p_" prefix + hex digits
-            if not key:match("^p_%%x+") and profile.GetProfileId then
+            if not key:match("^p_%x+") and profile.GetProfileId then
                 needsMigration = true
                 table.insert(legacyProfiles, profile)
             end
