@@ -401,3 +401,13 @@ function Sync:BroadcastSessionStart()
     -- Start coordinator heartbeat sender (ticker)
     self:EnsureHeartbeatSender("BroadcastSessionStart")
 
+
+    -- timeout window: after N seconds, summarize what we heard
+    local sid = self.state.sessionId
+    self:RunAfter(self.cfg.handshakeCollectSec or 3, function()
+        -- Only finalize if session unchanged and we are still coordinator
+        if not self.state.active or not self.state.isCoordinator then return end
+        if self.state.sessionId ~= sid then return end
+        self:FinalizeHandshakeWindow()
+    end)
+end

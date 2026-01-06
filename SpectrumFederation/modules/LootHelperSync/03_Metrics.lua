@@ -11,7 +11,7 @@ local Sync = SF.LootHelperSync
 -- @return number epochSeconds
 function Sync:_Now()
     if SF.Now then
-        return SF:self:_Now()
+        return SF:Now()
     end
     return (GetServerTime and GetServerTime()) or time()
 end
