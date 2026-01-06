@@ -304,7 +304,7 @@ function Sync:_MetricsEnsure()
     M.gauges    = M.gauges or {}    -- last-set values
     M.stats     = M.stats or {}     -- observed values: count/sum/min/max
 
-    M.meat = M.meta or {
+    M.meta = M.meta or {
         addonVersion = (self._GetAddonVersion and self:_GetAddonVersion()) or "unknown",
     }
 
@@ -409,9 +409,10 @@ function Sync:_MetricsRecordSend(prefixKey, msgType, distribution, target, okSen
     if not self:MetricsEnabled() then return end
 
     local prefixStr = (self.PREFIX and self.PREFIX[prefixKey]) or tostring(prefixKey or "unknown")
+    local prefixKeyStr = tostring(prefixKey or "UNKNOWN")
 
     self:_MInc("sync.msg.sent.total", 1)
-    self:_MInc("sync.msg.sent.prefixKey." .. tostring(prefixStr or "UNKNOWN"), 1)
+    self:_MInc("sync.msg.sent.prefixKey." .. prefixKeyStr, 1)
     self:_MInc("sync.msg.sent.prefix." .. tostring(prefixStr), 1)
 
     if type(msgType) == "string" and msgType ~= "" then
@@ -659,6 +660,20 @@ function Sync:_ApplySessionSafeModeFromPayload(smPayload, reason)
     end
 end
 
+-- Function Build session safe mode payload for outbound messages.
+-- @param none
+-- @return table payload {enabled, rev, setBy, setAt, reason}
+function Sync:_GetSessionSafeModePayload()
+    local sm = self:_EnsureSafeModeState()
+    return {
+        enabled = (sm.sessionEnabled == true),
+        rev     = tonumber(sm.sessionRev) or 0,
+        setBy   = sm.sessionSetBy,
+        setAt   = sm.sessionSetAt,
+        reason  = sm.sessionReason,
+    }
+end
+
 -- Function Normalize a "Name" or "Name-Realm" into "Name-Realm" format.
 -- @param name string Player name or "Name-Realm"
 -- @return string|nil Normalized "Name-Realm" or nil if invalid
@@ -694,7 +709,7 @@ function Sync:_EnforceGroupedSessionActive(context)
     local dist = GetGroupDistribution()
     if dist then return dist end
 
-    local reason = "not_in_group:" .. tostring(context or unknown)
+    local reason = "not_in_group:" .. tostring(context or "unknown")
 
     -- Safely stop any running timers even if state.active is already false
     self:StopHeartbeatSender(reason)
@@ -747,6 +762,7 @@ function Sync:Enable()
     self._enabled = true
 
     self:_InstallMetricsSendHook()
+    self:_InstallDebugSlashCommands()
 
     -- Create a tiny event frame for the two "reliable places"
     if not self._eventFrame then
@@ -908,6 +924,7 @@ function Sync:SetSessionSafeModeEnabled(enabled, reason, setBy)
             self.MSG.SAFE_MODE_SET,
             payload,
             dist,
+            nil,
             "ALERT"
         )
     end
@@ -1178,6 +1195,7 @@ function Sync:_ResetSessionState(reason)
 
     -- Clear dedupe/flags
     self.state._sentJoinStatusForSessionId = nil
+    self.state._sentJoinStatusType = nil
     self.state._profileReqInFlight = nil
     self.state._sessionAnnounced = nil
 
@@ -1411,7 +1429,7 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
     }
 
     -- Who do we ask?
-    local admins = profile:GetAdminUsers() or {}
+    local admins = self:_GetProfileAdminUsers(profile)
     local me = SelfId()
 
     for _, admin in ipairs(admins) do
@@ -1512,10 +1530,11 @@ function Sync:FinalizeAdminConvergence()
     for _, st in pairs(self.state.adminStatuses or {}) do
         if type(st) == "table" and type(st.authorMax) == "table" then
             for author, maxcounter in pairs(st.authorMax) do
-                if type(author) == "string" and type(maxCounter) == "number" then
+                maxcounter = tonumber(maxcounter)
+                if type(author) == "string" and author ~= "" and maxcounter then
                     local prev = tonumber(targetMax[author]) or 0
-                    if maxCounter > prev then
-                        targetMax[author] = maxCounter
+                    if maxcounter > prev then
+                        targetMax[author] = maxcounter
                     end
                 end
             end
@@ -1949,16 +1968,16 @@ function Sync:_ComputeTakeoverCandidates(profileId)
     if type(profileId) ~= "string" or profileId == "" then return {} end
 
     local profile = self:FindLocalProfileById(profileId)
-    if not profile or not profile.GetAdminUsers then return {} end
+    if not profile then return {} end
 
-    local admins = profile:GetAdminUsers() or {}
+    local admins = self:_GetProfileAdminUsers(profile)
 
     -- map normalizedKey -> canonicalName
     -- TODO: It'd nice to have this determined by performance or something. Whoever's system is currently best equipped.
     local adminSet = {}
     for _, a in ipairs(admins) do
         if type(a) == "string" and a ~= "" then
-            local full = NormalizedNameRealm(a) or a
+            local full = NormalizeNameRealm(a) or a
             local key = self:_NormalizeNameRealmForCompare(full) or full
             if key and key ~= "" then
                 adminSet[key] = full
@@ -2011,10 +2030,10 @@ function Sync:_HeartbeatMonitorTick()
     local missThreshold = tonumber(self.cfg.heartbeatMissThreshold) or 3
     if missThreshold < 1 then missThreshold = 1 end
 
-    local grace = tonumber(self.cfg.heartbeatMissGrace) or 0
+    local grace = tonumber(self.cfg.heartbeatGraceSec or self.cfg.heartbeatMissGrace) or 0
     if grace < 0 then grace = 0 end
 
-    local lastSeen = math.max(tonumber(hb.lastheartbeatAt) or 0, tonumber(hb.lastCoordMessageAt) or 0)
+    local lastSeen = math.max(tonumber(hb.lastHeartbeatAt) or 0, tonumber(hb.lastCoordMessageAt) or 0)
     local now = Now()
 
     -- If we just joined via SES_START/REANNOUNCE and haven't recorded seenAt yet, baseline to now so we don't instantly "timeout"
@@ -2095,7 +2114,7 @@ end
 -- Function Start heartbeat monitor (member only).
 -- @param reason string|nil Reason for starting (for logging)
 -- @return boolean True if started or already running, false otherwise
-function Sync:StartheartbeatMonitor(reason)
+function Sync:StartHeartbeatMonitor(reason)
     if not self:_ShouldRunHeartbeatMonitor() then
         self:StopHeartbeatMonitor("start_denied:" .. tostring(reason or "unknown"))
         return false
@@ -2173,12 +2192,17 @@ function Sync:StartheartbeatMonitor(reason)
     return true
 end
 
+-- Backwards-compatible alias (older call sites may use this casing)
+function Sync:StartheartbeatMonitor(reason)
+    return self:StartHeartbeatMonitor(reason)
+end
+
 -- Function Ensure heartbeat monitor is running or stopped as appropriate.
 -- @param reason string|nil Reason for starting/stopping (for logging)
 -- @return boolean True if running, false otherwise
 function Sync:EnsureHeartbeatMonitor(reason)
     if self:_ShouldRunHeartbeatMonitor() then
-        return self:StartheartbeatMonitor(reason)
+        return self:StartHeartbeatMonitor(reason)
     end
     self:StopHeartbeatMonitor(reason)
     return false
@@ -2269,16 +2293,17 @@ function Sync:HandleSessionStart(sender, payload)
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
 
+    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor
+    if oldSid and oldSid ~= payload.sessionId then
+        self:_ResetSessionState("session_changed")
+    end
+
     self.state.active = true
     self.state.sessionId = payload.sessionId
     self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
-
-    if oldSid and oldSid ~= payload.sessionId then
-        self:_ResetSessionState("session_changed")
-    end
 
     if type(payload.safeMode) == "table" then
         self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_START")
@@ -2536,14 +2561,14 @@ function Sync:SendJoinStatus()
     if not self.state.coordinator then return end
     if self.state.isCoordinator then return end
 
-    -- Prevent duplicate replies to repeated SES_START for the same session.
-    if self.state._sentJoinStatusForSessionId == self.state.sessionId then
-        return
-    end
-
+    local sid = self.state.sessionId
+    local coord = self.state.coordinator
     local profileId = self.state.profileId
+    if type(profileId) ~= "string" or profileId == "" then return end
+    if type(coord) ~= "string" or coord == "" then return end
+
     local payloadBase = {
-        sessionId       = self.state.sessionId,
+        sessionId       = sid,
         profileId       = profileId,
         supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
         supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
@@ -2553,30 +2578,74 @@ function Sync:SendJoinStatus()
                             or nil,
     }
 
+    local function alreadySent(status)
+        return (self.state._sentJoinStatusForSessionId == sid) and (self.state._sentJoinStatusType == status)
+    end
+
+    local function markSent(status)
+        self.state._sentJoinStatusForSessionId = sid
+        self.state._sentJoinStatusType = status
+    end
+
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
+        -- Bootstrap from helpers (preferred) or coordinator (fallback)
         self:RequestProfileSnapshot("join-status")
+
+        -- Also tell the coordinator our handshake status, without forcing them to serve data
+        if not alreadySent("NEED_PROFILE") then
+            markSent("NEED_PROFILE")
+            local payload = {}
+            for k, v in pairs(payloadBase) do payload[k] = v end
+            payload.statusOnly = true
+            if SF.LootHelperComm then
+                SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, payload, "WHISPER", coord, "NORMAL")
+            end
+        end
         return
     end
 
-    local localAuthorMax = profile:ComputeAuthorMax()
+    local localAuthorMax = profile:ComputeAuthorMax() or {}
     payloadBase.localAuthorMax = localAuthorMax
 
     local localContig = self:ComputeContigAuthorMax(profileId)
     local remoteAuthorMax = self.state.authorMax or {}
     local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax)
 
-
-
     if missing and #missing > 0 then
+        -- Fetch missing logs (helpers preferred; coordinator fallback via request retry)
         self:RequestMissingLogs(missing, "join-status")
+
+        -- Also tell the coordinator our handshake status, without forcing them to serve data
+        if not alreadySent("NEED_LOGS") then
+            markSent("NEED_LOGS")
+
+            local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeededLogs) or 8
+            local capped = {}
+            for i, r in ipairs(missing) do
+                if i > maxRanges then break end
+                if type(r) == "table" then
+                    capped[#capped + 1] = r
+                end
+            end
+
+            local payload = {}
+            for k, v in pairs(payloadBase) do payload[k] = v end
+            payload.missing = capped
+            payload.statusOnly = true
+
+            if SF.LootHelperComm then
+                SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, payload, "WHISPER", coord, "NORMAL")
+            end
+        end
         return
     end
 
-    self.state._sentJoinStatusForSessionId = self.state.sessionId
+    if alreadySent("HAVE_PROFILE") then return end
+    markSent("HAVE_PROFILE")
 
     if SF.LootHelperComm then
-        SF.LootHelperComm:Send("CONTROL", self.MSG.HAVE_PROFILE, payloadBase, "WHISPER", self.state.coordinator, "NORMAL")
+        SF.LootHelperComm:Send("CONTROL", self.MSG.HAVE_PROFILE, payloadBase, "WHISPER", coord, "NORMAL")
     end
 end
 
@@ -2786,7 +2855,7 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
 
     do
         if self:MetricsEnabled() then
-            local prefixStr = self.PREFIX and self.PREFIX.CONTROL or "BULK"
+            local prefixStr = self.PREFIX and self.PREFIX.BULK or "BULK"
             self:_MInc("sync.msg.recv.total", 1)
             self:_MInc("sync.msg.recv.prefixKey.BULK", 1)
             self:_MInc("sync.msg.recv.prefix." .. tostring(prefixStr), 1)
@@ -2827,7 +2896,7 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
 
     if t0 then
         local ms = debugprofilestop() - t0
-        self:_MetricsOvserveHandlerMs("BULK", msgType, ms)
+        self:_MetricsObserveHandlerMs("BULK", msgType, ms)
     end
 
     return r1, r2
@@ -2901,7 +2970,7 @@ function Sync:BuildAdminStatus(profileId)
     -- If counters are 1..max with no missing, then count(author) == max(author).
     -- If count < max, we're missing at least one counter somewhere (gap).
     local counts = {}
-    for _, log in ipairs(profile:GetLootLogs() or {}) do
+    for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
         if log and log.GetAuthor then
             local a = log:GetAuthor()
             if type(a) == "string" then
@@ -2994,16 +3063,17 @@ function Sync:HandleSessionReannounce(sender, payload)
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
 
+    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor
+    if oldSid and oldSid ~= payload.sessionId then
+        self:_ResetSessionState("session_changed")
+    end
+
     self.state.active = true
     self.state.sessionId = payload.sessionId
     self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, SelfId())
-
-    if oldSid and oldSid ~= payload.sessionId then
-        self:_ResetSessionState("session_changed")
-    end
 
     if type(payload.safeMode) == "table" then
         self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_REANNOUNCE")
@@ -3079,7 +3149,6 @@ function Sync:HandleSessionHeartbeat(sender, payload)
 
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
-    local oldSid = self.state.sessionId
 
     if oldSid and oldSid ~= payload.sessionId then
         self:_ResetSessionState("session_changed")
@@ -3147,6 +3216,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     then
         -- Let join-status happen again if needed
         self.state._sentJoinStatusForSessionId = nil
+        self.state._sentJoinStatusType = nil
 
         -- If you had an in-flight profile request, allow a new attempt with updated target
         self.state._profileReqInFlight = nil
@@ -3285,14 +3355,18 @@ end
 -- @param payload table {sessionId, requestId, profileId}
 -- @return nil
 function Sync:HandleNeedProfile(sender, payload)
-
-    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
-
     if type(payload) ~= "table" then return end
     local ok = self:ValidateSessionPayload(payload)
     if not ok then return end
 
     self:_RecordHandshakeReply(sender, payload, "NEED_PROFILE")
+
+    -- Coordinator handshake visibility without forcing a data response
+    if payload.statusOnly == true then
+        return
+    end
+
+    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
 
     -- Serve eligibility: coordinator OR helper
     if not self.state.active then return end
@@ -3359,14 +3433,18 @@ end
 -- @param payload table {sessionId, requestId, profileId}
 -- @return nil
 function Sync:HandleNeedLogs(sender, payload)
-
-    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
-
     if type(payload) ~= "table" then return end
     local ok = self:ValidateSessionPayload(payload)
     if not ok then return end
 
     self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
+
+    -- Coordinator handshake visibility without forcing a data response
+    if payload.statusOnly == true then
+        return
+    end
+
+    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
 
     -- Serve eligibility: coordinator OR helper
     if not self.state.active then return end
@@ -3416,11 +3494,16 @@ function Sync:HandleNeedLogs(sender, payload)
 
                 -- Build inside callback to spread CPU cost too
                 local out = {}
-                for _, log in ipairs(profile:GetLootLogs() or {}) do
-                    local a = log:GetAuthor()
-                    local c = log:GetCounter()
-                    if a == author and type(c) == "number" and c >= fromC and c <= toC then
-                        table.insert(out, log:ToTable())
+                for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
+                    local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
+                    local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
+                    c = tonumber(c)
+                    if a == author and c and c >= fromC and c <= toC then
+                        if log and log.ToTable then
+                            table.insert(out, log:ToTable())
+                        elseif type(log) == "table" then
+                            table.insert(out, log)
+                        end
                     end
                 end
 
@@ -3479,11 +3562,16 @@ function Sync:HandleLogRequest(sender, payload)
     local toC = (toCounter and math.floor(toCounter)) or fromC
 
     local out = {}
-    for _, log in ipairs(profile:GetLootLogs() or {}) do
-        local author = log:GetAuthor()
-        local counter = log:GetCounter()
-        if author == payload.author and type(counter) == "number" and counter >= fromC and counter <= toC then
-            table.insert(out, log:ToTable())
+    for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
+        local author = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
+        local counter = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
+        counter = tonumber(counter)
+        if author == payload.author and counter and counter >= fromC and counter <= toC then
+            if log and log.ToTable then
+                table.insert(out, log:ToTable())
+            elseif type(log) == "table" then
+                table.insert(out, log)
+            end
         end
     end
 
@@ -3714,7 +3802,9 @@ function Sync:HandleProfileSnapshot(sender, payload)
         return
     end
 
-    local senderRole = self.state.isCoordinator and "coordinator" or (self:IsHelper(sender) and "helper" or "unknown")
+    local senderRole =
+        (self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator)) and "coordinator"
+        or (self:IsHelper(sender) and "helper" or "unknown")
     if SF.Debug then
         SF.Debug:Info("SYNC", "Accepting PROFILE_SNAPSHOT from %s as %s (profile: %s)",
             tostring(sender), senderRole, tostring(payload.profileId))
@@ -4024,8 +4114,8 @@ end
 -- @param req table Request state table
 -- @return nil
 function Sync:_SendRequestAttempt(req)
-    if req.paused then return end
     if not req then return end
+    if req.paused then return end
 
     -- Session ended or changed -> drop
     if not self.state.active then
@@ -4110,6 +4200,7 @@ function Sync:_FailRequest(req, reason)
         -- Also allow SendJoinStatus to re-attempt bootstrap later
         if not self:FindLocalProfileById(self.state.profileId) then
             self.state._sentJoinStatusForSessionId = nil
+            self.state._sentJoinStatusType = nil
         end
     end
 
@@ -4360,7 +4451,7 @@ end
 function Sync:IsSenderAuthorized(profileId, sender)
     local profile = self:FindLocalProfileById(profileId)
     if not profile then return false end
-    local admins = profile.GetAdminUsers and profile:GetAdminUsers() or nil
+    local admins = self:_GetProfileAdminUsers(profile)
     if type(admins) ~= "table" then return false end
 
     for _, admin in ipairs(admins) do
@@ -4520,6 +4611,46 @@ end
 -- Profile / Log integration helpers (high-level; class implementations can sit elsewhere)
 -- ============================================================================
 
+-- Function Get admin users from profile (tolerant to different implementations).
+-- @param profile table Profile instance
+-- @return table Array of admin user names (empty if unavailable)
+function Sync:_GetProfileAdminUsers(profile)
+    if type(profile) ~= "table" then return {} end
+    
+    if type(profile.GetAdminUsers) == "function" then
+        local ok, result = pcall(profile.GetAdminUsers, profile)
+        if ok and type(result) == "table" then
+            return result
+        end
+    end
+    
+    if type(profile._adminUsers) == "table" then
+        return profile._adminUsers
+    end
+    
+    return {}
+end
+
+-- Function Get loot logs from profile (tolerant to different implementations).
+-- @param profile table Profile instance
+-- @return table Array of loot logs (empty if unavailable)
+function Sync:_GetProfileLootLogs(profile)
+    if type(profile) ~= "table" then return {} end
+    
+    if type(profile.GetLootLogs) == "function" then
+        local ok, result = pcall(profile.GetLootLogs, profile)
+        if ok and type(result) == "table" then
+            return result
+        end
+    end
+    
+    if type(profile._lootLogs) == "table" then
+        return profile._lootLogs
+    end
+    
+    return {}
+end
+
 -- Function Find a local profile by stable profileId.
 -- Uses canonical profileId-based schema (SF.lootHelperDB.profiles[profileId]).
 -- @param profileId string Stable profile id
@@ -4535,6 +4666,24 @@ function Sync:FindLocalProfileById(profileId)
             local pid = profile:GetProfileId()
             if pid == profileId then
                 return profile
+            end
+        end
+        
+        -- Fallback: iterate for legacy/alternate indexing
+        for _, p in pairs(SF.lootHelperDB.profiles) do
+            if type(p) == "table" then
+                -- Try GetProfileId method
+                if type(p.GetProfileId) == "function" then
+                    local ok, pid = pcall(p.GetProfileId, p)
+                    if ok and pid == profileId then
+                        return p
+                    end
+                end
+                
+                -- Try _profileId property
+                if p._profileId == profileId then
+                    return p
+                end
             end
         end
     end
@@ -4736,7 +4885,7 @@ function Sync:_ComputeContigCounter(profileId, author)
 
     local seen = {}
 
-    for _, log in ipairs(profile:GetLootLogs() or {}) do
+    for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
         local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
         if a == author then
             local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
@@ -4766,7 +4915,7 @@ function Sync:ComputeContigAuthorMax(profileId)
 
     local seenByAuthor = {}
 
-    for _, log in ipairs(profile:GetLootLogs() or {}) do
+    for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
         local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
         local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
         c = tonumber(c)
@@ -5160,4 +5309,385 @@ function Sync:_GetAddonVersion()
         return SF:GetAddonVersion()
     end
     return "unknown"
+end
+
+-- ============================================================================
+-- Debug Slash Commands (status / metrics / requests)
+-- Scope: debug printing only (no sync behavior changes)
+-- ============================================================================
+
+do
+    local function _Trim(s)
+        s = tostring(s or "")
+        return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+    end
+
+    local function _SafeFormat(fmt, ...)
+        if type(fmt) ~= "string" then
+            local parts = { tostring(fmt) }
+            for i = 1, select("#", ...) do
+                parts[#parts + 1] = tostring(select(i, ...))
+            end
+            return table.concat(parts, " ")
+        end
+
+        local ok, out = pcall(string.format, fmt, ...)
+        if ok and type(out) == "string" then
+            return out
+        end
+
+        local parts = { tostring(fmt) }
+        for i = 1, select("#", ...) do
+            parts[#parts + 1] = tostring(select(i, ...))
+        end
+        return table.concat(parts, " ")
+    end
+
+    local function _CountMap(t)
+        if type(t) ~= "table" then return 0 end
+        local n = 0
+        for _ in pairs(t) do n = n + 1 end
+        return n
+    end
+
+    local function _SortedKeys(t, filterLower)
+        local keys = {}
+        if type(t) ~= "table" then return keys end
+        for k in pairs(t) do
+            if type(k) == "string" then
+                if not filterLower or filterLower == "" then
+                    keys[#keys + 1] = k
+                else
+                    local kl = k:lower()
+                    if kl:find(filterLower, 1, true) then
+                        keys[#keys + 1] = k
+                    end
+                end
+            end
+        end
+        table.sort(keys)
+        return keys
+    end
+
+    local function _Join(list)
+        if type(list) ~= "table" or #list == 0 then return "none" end
+        local tmp = {}
+        for i = 1, #list do
+            tmp[#tmp + 1] = tostring(list[i])
+        end
+        return table.concat(tmp, ", ")
+    end
+
+    function Sync:_DebugPrintLine(fmt, ...)
+        local line = _SafeFormat(fmt, ...)
+
+        -- Prefer SF print helpers if available (chat colored + consistent)
+        if SF and type(SF.PrintInfo) == "function" then
+            SF:PrintInfo("%s", line)
+            return
+        end
+
+        if DEFAULT_CHAT_FRAME and type(DEFAULT_CHAT_FRAME.AddMessage) == "function" then
+            DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99SF LootHelper Sync|r " .. tostring(line))
+            return
+        end
+
+        print("SF LootHelper Sync " .. tostring(line))
+    end
+
+    function Sync:_DebugPrintStatus()
+        local st = self.state or {}
+        local dist = (type(GetGroupDistribution) == "function") and GetGroupDistribution() or nil
+
+        self:_DebugPrintLine("=== LootHelper Sync Debug ===")
+        self:_DebugPrintLine("AddonVersion=%s ProtoCurrent=%s",
+            tostring(self._GetAddonVersion and self:_GetAddonVersion() or "unknown"),
+            tostring((SF.SyncProtocol and SF.SyncProtocol.PROTO_CURRENT) or self.PROTO_VERSION or "unknown")
+        )
+
+        self:_DebugPrintLine("Self=%s Enabled=%s InGroup=%s Dist=%s",
+            tostring((type(SelfId) == "function") and SelfId() or "unknown"),
+            tostring(self._enabled == true),
+            tostring(dist ~= nil),
+            tostring(dist or "NONE")
+        )
+
+        if st and st.active then
+            self:_DebugPrintLine("SessionActive=%s SessionId=%s ProfileId=%s",
+                tostring(st.active == true),
+                tostring(st.sessionId or "nil"),
+                tostring(st.profileId or "nil")
+            )
+
+            self:_DebugPrintLine("Coordinator=%s CoordEpoch=%s IsCoordinator=%s",
+                tostring(st.coordinator or "nil"),
+                tostring(st.coordEpoch or "nil"),
+                tostring(st.isCoordinator == true)
+            )
+
+            local sm = self:_EnsureSafeModeState()
+            self:_DebugPrintLine("SafeMode effective=%s session=%s(rev=%s) local=%s",
+                tostring(sm._effective == true),
+                tostring(sm.sessionEnabled == true),
+                tostring(sm.sessionRev or 0),
+                tostring(sm.localEnabled == true)
+            )
+
+            local helpers = st.helpers or {}
+            self:_DebugPrintLine("Helpers(%d): %s", tonumber(#helpers) or 0, _Join(helpers))
+        else
+            self:_DebugPrintLine("SessionActive=false (no active session)")
+        end
+
+        local reqCount = _CountMap(st and st.requests)
+        self:_DebugPrintLine("OutstandingRequests=%d (use '/sflhsync requests' for full)", reqCount)
+
+        if reqCount > 0 and type(st.requests) == "table" then
+            local arr = {}
+            for _, req in pairs(st.requests) do
+                if type(req) == "table" then
+                    arr[#arr + 1] = req
+                end
+            end
+
+            table.sort(arr, function(a, b)
+                local ac = tonumber(a.createdAt) or 0
+                local bc = tonumber(b.createdAt) or 0
+                if ac == bc then
+                    return tostring(a.id) < tostring(b.id)
+                end
+                return ac < bc
+            end)
+
+            local maxLines = math.min(#arr, 10)
+            for i = 1, maxLines do
+                local r = arr[i]
+                local maxAttempts = 1 + (tonumber(r.maxRetries) or 0)
+                local age = (type(r.createdAt) == "number") and ((type(Now) == "function" and Now() or 0) - r.createdAt) or nil
+                if type(age) ~= "number" or age < 0 then age = 0 end
+
+                self:_DebugPrintLine(
+                    " - %s kind=%s attempt=%d/%d paused=%s age=%.1fs lastTarget=%s",
+                    tostring(r.id),
+                    tostring(r.kind or "UNKNOWN"),
+                    tonumber(r.attempt) or 0,
+                    maxAttempts,
+                    tostring(r.paused == true),
+                    tonumber(age) or 0,
+                    tostring(r.lastTarget or "nil")
+                )
+            end
+
+            if #arr > maxLines then
+                self:_DebugPrintLine(" (showing %d/%d; run '/sflhsync requests')", maxLines, #arr)
+            end
+        end
+
+        local M = (type(self.GetMetricsSnapshot) == "function") and self:GetMetricsSnapshot() or nil
+        if type(M) == "table" then
+            self:_DebugPrintLine("Metrics enabled=%s startedAt=%s (use '/sflhsync metrics [filter]')",
+                tostring(M.enabled == true),
+                tostring(M.startedAt or "nil")
+            )
+
+            local counters = M.counters or {}
+            local gauges = M.gauges or {}
+
+            local function _MetricGet(key)
+                if counters[key] ~= nil then return counters[key] end
+                if gauges[key] ~= nil then return gauges[key] end
+                return nil
+            end
+
+            local summaryKeys = {
+                "sync.msg.sent.total",
+                "sync.msg.recv.total",
+                "sync.req.created.total",
+                "sync.req.completed.total",
+                "sync.req.failed.total",
+                "sync.queue.requests.outstanding",
+                "sync.queue.requests.paused",
+                "sync.heartbeat.sent",
+                "sync.heartbeat.recv",
+                "sync.safe_mode.on_count",
+                "sync.safe_mode.off_count",
+            }
+
+            for _, k in ipairs(summaryKeys) do
+                local v = _MetricGet(k)
+                if v ~= nil then
+                    self:_DebugPrintLine(" - %s = %s", tostring(k), tostring(v))
+                end
+            end
+        else
+            self:_DebugPrintLine("Metrics unavailable (no metrics table)")
+        end
+    end
+
+    function Sync:_DebugPrintRequests()
+        local st = self.state or {}
+        local reqs = st.requests
+        local n = _CountMap(reqs)
+
+        self:_DebugPrintLine("=== LootHelper Sync Requests (%d) ===", n)
+        if n == 0 or type(reqs) ~= "table" then
+            self:_DebugPrintLine("No outstanding requests.")
+            return
+        end
+
+        local arr = {}
+        for _, req in pairs(reqs) do
+            if type(req) == "table" then
+                arr[#arr + 1] = req
+            end
+        end
+
+        table.sort(arr, function(a, b)
+            local ac = tonumber(a.createdAt) or 0
+            local bc = tonumber(b.createdAt) or 0
+            if ac == bc then
+                return tostring(a.id) < tostring(b.id)
+            end
+            return ac < bc
+        end)
+
+        local now = (type(Now) == "function") and Now() or 0
+
+        for _, r in ipairs(arr) do
+            local maxAttempts = 1 + (tonumber(r.maxRetries) or 0)
+            local age = (type(r.createdAt) == "number") and (now - r.createdAt) or nil
+            if type(age) ~= "number" or age < 0 then age = 0 end
+
+            local meta = (type(r.meta) == "table") and r.meta or {}
+            local metaBits = {}
+
+            if type(meta.profileId) == "string" then metaBits[#metaBits + 1] = "profileId=" .. meta.profileId end
+            if type(meta.sessionId) == "string" then metaBits[#metaBits + 1] = "sessionId=" .. meta.sessionId end
+            if type(meta.author) == "string" then metaBits[#metaBits + 1] = "author=" .. meta.author end
+            if meta.fromCounter ~= nil then metaBits[#metaBits + 1] = "from=" .. tostring(meta.fromCounter) end
+            if meta.toCounter ~= nil then metaBits[#metaBits + 1] = "to=" .. tostring(meta.toCounter) end
+
+            self:_DebugPrintLine(
+                "%s kind=%s attempt=%d/%d paused=%s timeoutSec=%s age=%.1fs lastSentAt=%s lastTarget=%s",
+                tostring(r.id),
+                tostring(r.kind or "UNKNOWN"),
+                tonumber(r.attempt) or 0,
+                maxAttempts,
+                tostring(r.paused == true),
+                tostring(r.timeoutSec or "nil"),
+                tonumber(age) or 0,
+                tostring(r.lastSentAt or "nil"),
+                tostring(r.lastTarget or "nil")
+            )
+
+            self:_DebugPrintLine("  targets[%d]=%s", type(r.targets) == "table" and #r.targets or 0, _Join(r.targets))
+            if #metaBits > 0 then
+                self:_DebugPrintLine("  meta: %s", table.concat(metaBits, " "))
+            end
+        end
+    end
+
+    function Sync:_DebugPrintMetrics(filter)
+        local M = (type(self.GetMetricsSnapshot) == "function") and self:GetMetricsSnapshot() or nil
+        if type(M) ~= "table" then
+            self:_DebugPrintLine("Metrics unavailable.")
+            return
+        end
+
+        local f = _Trim(filter)
+        local fl = (f ~= "" and f:lower()) or nil
+
+        self:_DebugPrintLine("=== LootHelper Sync Metrics ===")
+        self:_DebugPrintLine("enabled=%s startedAt=%s filter=%s",
+            tostring(M.enabled == true),
+            tostring(M.startedAt or "nil"),
+            tostring(f ~= "" and f or "none")
+        )
+
+        local counters = M.counters or {}
+        local gauges = M.gauges or {}
+        local stats = M.stats or {}
+
+        self:_DebugPrintLine("-- counters --")
+        for _, k in ipairs(_SortedKeys(counters, fl)) do
+            self:_DebugPrintLine("%s = %s", k, tostring(counters[k]))
+        end
+
+        self:_DebugPrintLine("-- gauges --")
+        for _, k in ipairs(_SortedKeys(gauges, fl)) do
+            self:_DebugPrintLine("%s = %s", k, tostring(gauges[k]))
+        end
+
+        self:_DebugPrintLine("-- stats --")
+        for _, k in ipairs(_SortedKeys(stats, fl)) do
+            local s = stats[k]
+            if type(s) == "table" then
+                local count = tonumber(s.count) or 0
+                local sum = tonumber(s.sum) or 0
+                local avg = (count > 0) and (sum / count) or 0
+                self:_DebugPrintLine("%s: count=%d avg=%.3f min=%s max=%s",
+                    k, count, avg,
+                    tostring(s.min),
+                    tostring(s.max)
+                )
+            end
+        end
+    end
+
+    function Sync:_HandleDebugSlash(msg)
+        msg = _Trim(msg)
+        local cmd, rest = msg:match("^(%S+)%s*(.*)$")
+        cmd = _Trim(cmd):lower()
+        rest = _Trim(rest)
+
+        if cmd == "" or cmd == "status" then
+            self:_DebugPrintStatus()
+            return
+        end
+
+        if cmd == "help" or cmd == "?" then
+            self:_DebugPrintLine("LootHelper Sync debug slash commands:")
+            self:_DebugPrintLine("  /sflhsync                -> status summary")
+            self:_DebugPrintLine("  /sflhsync status         -> status summary")
+            self:_DebugPrintLine("  /sflhsync requests|req   -> list outstanding requests")
+            self:_DebugPrintLine("  /sflhsync metrics [text] -> print metrics (optional substring filter)")
+            return
+        end
+
+        if cmd == "requests" or cmd == "req" then
+            self:_DebugPrintRequests()
+            return
+        end
+
+        if cmd == "metrics" then
+            self:_DebugPrintMetrics(rest)
+            return
+        end
+
+        -- Unknown subcommand -> show help, but keep it short
+        self:_DebugPrintLine("Unknown subcommand '%s'. Use '/sflhsync help'.", tostring(cmd))
+    end
+
+    function Sync:_InstallDebugSlashCommands()
+        if self._debugSlashInstalled then return end
+        self._debugSlashInstalled = true
+
+        if type(SlashCmdList) ~= "table" then return end
+
+        SLASH_SFLOOTHELPERSYNC1 = "/sflhsync"
+        SLASH_SFLOOTHELPERSYNC2 = "/lhsync"
+
+        SlashCmdList["SFLOOTHELPERSYNC"] = function(msg)
+            local ok, err = pcall(function()
+                Sync:_HandleDebugSlash(msg)
+            end)
+            if not ok then
+                if SF and type(SF.PrintWarning) == "function" then
+                    SF:PrintWarning("LootHelper Sync debug slash error: %s", tostring(err))
+                else
+                    print("LootHelper Sync debug slash error: " .. tostring(err))
+                end
+            end
+        end
+    end
 end
