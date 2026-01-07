@@ -146,22 +146,3 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
         self:UnregisterEvent("PLAYER_LOGIN")
     end
 end)
-
--- Create an Event Frame for Addon Loaded
-local AddonLoadedFrame = CreateFrame("Frame")
--- Register the ADDON_LOADED Event
-AddonLoadedFrame:RegisterEvent("ADDON_LOADED")
--- Script to run when ADDON_LOADED Event fires
-AddonLoadedFrame:SetScript("OnEvent", function(self, event, addonName)
-
-    -- Ensure the loaded addon is SpectrumFederation
-    if addonName ~= "SpectrumFederation" then return end
-
-    -- Create the Loot Window (UI component that requires frames)
-    if SF.LootWindow and SF.LootWindow.Create then
-        SF.LootWindow:Create()
-    end
-    
-    -- Unregister after handling our addon
-    self:UnregisterEvent("ADDON_LOADED")
-end)
