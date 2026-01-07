@@ -7,7 +7,7 @@ SF.SettingsSchema = {
     DEFAULTS = {
         version = 1,
 
-        ui = {
+        global = {
             windowStyle = "default",
             fontStyle   = "FrizQT",
             fontSize    = 12,

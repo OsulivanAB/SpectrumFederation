@@ -66,7 +66,7 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
                     end
                     
                     -- Create debug viewer window if it doesn't exist
-                    -- TODO: Need to break these into smaller functions and store them in the debug file.
+                    -- TODO: Need to organize Debug stuff
                     if not SF.DebugViewer then
                         SF.DebugViewer = CreateFrame("Frame", "SpectrumFederationDebugViewer", UIParent, "BackdropTemplate")
                         local viewer = SF.DebugViewer

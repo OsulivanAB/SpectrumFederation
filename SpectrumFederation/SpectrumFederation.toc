@@ -50,6 +50,15 @@ modules/LootHelperSync/17_DebugSlash.lua
 modules/LootHelperSync/18_PublicAPI.lua
 modules/LootHelper/Comm.lua
 
-modules/Settings.lua
+modules/Settings/Schema.lua
+modules/Settings/Store.lua
+
+modules/UI/Settings/Widgets/Section.lua
+modules/UI/Settings/PageBuilder.lua
+modules/UI/Settings/Registry.lua
+modules/UI/Settings/Pages/Main.lua
+modules/UI/Settings/Pages/LootHelper.lua
+
+modules/Init.lua
 
 SpectrumFederation.lua
