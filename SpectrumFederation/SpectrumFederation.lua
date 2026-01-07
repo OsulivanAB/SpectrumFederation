@@ -43,13 +43,6 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF:RegisterLootHelperSlashCommands()
         end
 
-        -- Create the Settings UI
-        if SF.CreateSettingsUI then
-            SF:CreateSettingsUI()
-        else
-            if SF.Debug then SF.Debug:Info("SETTINGS_UI", "No CreateSettingsUI function found") end
-        end
-
         -- Send a quick message saying that Addon is Initialized
         SF:PrintSuccess("Online. Type /sf to open settings.")
 
