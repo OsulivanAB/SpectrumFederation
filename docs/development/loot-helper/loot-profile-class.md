@@ -326,7 +326,7 @@ local author = profile:GetAuthor()
 print("Created by:", author)  -- "Shadowbane-Garona"
 ```
 
-#### GetOwner()
+#### GetOwnerId()
 
 Returns the profile's current owner identifier.
 
@@ -337,11 +337,41 @@ Returns the profile's current owner identifier.
 **Example**:
 
 ```lua
-local owner = profile:GetOwner()
+local owner = profile:GetOwnerId()
 print("Owned by:", owner)  -- "Guildmaster-Garona"
 ```
 
-**Usage Note**: The owner can be different from the author if ownership has been transferred via `SetOwner()`.
+**Usage Note**: The owner can be different from the author if ownership has been transferred via `SetOwner()`. This method was renamed from `GetOwner()` to maintain consistency with other ID-based methods.
+
+#### IsOwner(memberId)
+
+Checks if a given member ID matches the profile's owner.
+
+**Parameters**:
+
+- `memberId` (string, required) - Member identifier in "Name-Realm" format
+
+**Returns**:
+
+- `boolean` - `true` if the memberId is the owner, `false` otherwise
+
+**Example**:
+
+```lua
+local currentUser = SF:GetPlayerFullIdentifier()
+if profile:IsOwner(currentUser) then
+    print("You are the owner of this profile")
+else
+    print("You are not the owner")
+end
+
+-- Check if another member is the owner
+if profile:IsOwner("Guildmaster-Garona") then
+    print("Guildmaster is the owner")
+end
+```
+
+**Usage Note**: Uses `NameUtil` for case-insensitive, realm-aware comparison. Empty or nil member IDs return `false`.
 
 ### Counter Management
 
@@ -561,6 +591,130 @@ end
 
 **Usage Note**: Returns the internal `_adminUsers` array. This lists all users who have administrative permissions on the profile. Use with `IsCurrentUserAdmin()` to check if the active player has admin rights.
 
+#### getAdminMemberIds()
+
+Retrieves a copy of all admin member IDs in the profile.
+
+**Returns**:
+
+- `table` - Array of admin member identifiers ("Name-Realm" format)
+
+**Example**:
+
+```lua
+local adminIds = profile:getAdminMemberIds()
+print("Admin count:", #adminIds)
+for i, adminId in ipairs(adminIds) do
+    print(string.format("Admin %d: %s", i, adminId))
+end
+```
+
+**Usage Note**: Returns a copy (not a reference) of the `_adminUsers` array to prevent external modification.
+
+#### getMemberIds()
+
+Retrieves a sorted list of all member IDs in the profile.
+
+**Returns**:
+
+- `table` - Sorted array of member identifiers ("Name-Realm" format)
+
+**Example**:
+
+```lua
+local memberIds = profile:getMemberIds()
+print("Total members:", #memberIds)
+for i, memberId in ipairs(memberIds) do
+    print(string.format("%d. %s", i, memberId))
+end
+```
+
+**Usage Note**: Returns a new array containing all member IDs, sorted alphabetically. Useful for UI dropdowns and member selection lists.
+
+#### getMemberByID(id)
+
+Retrieves a member instance by their identifier.
+
+**Parameters**:
+
+- `id` (string, required) - Member identifier in "Name-Realm" format
+
+**Returns**:
+
+- `Member` - Member instance if found
+- `nil` - If member not found or invalid ID provided
+
+**Example**:
+
+```lua
+local member = profile:getMemberByID("Shadowbane-Garona")
+if member then
+    local points = member:GetPointBalance()
+    print("Member points:", points)
+else
+    print("Member not found")
+end
+```
+
+**Usage Note**: Uses `NameUtil` for normalized comparison. Also available as `GetMemberByID()` (capitalized alias).
+
+#### GetPointName()
+
+Retrieves the custom point name for this profile.
+
+**Returns**:
+
+- `string` - Point name (default: "Points")
+
+**Example**:
+
+```lua
+local pointName = profile:GetPointName()
+print("This profile uses:", pointName)  -- "DKP" or "Points"
+```
+
+**Usage Note**: Returns "Points" if no custom name is set or if the name is empty.
+
+#### GetRaidWideSafeMode()
+
+Retrieves the raid-wide safe mode setting for this profile.
+
+**Returns**:
+
+- `boolean` - `true` if raid-wide safe mode is enabled, `false` otherwise
+
+**Example**:
+
+```lua
+if profile:GetRaidWideSafeMode() then
+    print("Raid-wide safe mode is ENABLED")
+else
+    print("Raid-wide safe mode is DISABLED")
+end
+```
+
+**Usage Note**: When enabled, sync operations are paused for all raid members.
+
+#### GetRaidWideSafeModeOnCombat()
+
+Retrieves the raid-wide safe mode on combat setting for this profile.
+
+**Returns**:
+
+- `boolean` - `true` if auto-safe mode during combat is enabled, `false` otherwise
+
+**Example**:
+
+```lua
+if profile:GetRaidWideSafeModeOnCombat() then
+    print("Safe mode will auto-enable during combat")
+else
+    print("Safe mode will NOT auto-enable during combat")
+end
+```
+
+**Usage Note**: When enabled, sync operations are automatically paused when any raid member enters combat.
+
 #### AddMember(member)
 
 Adds a LootProfileMember instance to the profile's member roster.
@@ -685,6 +839,115 @@ profile:SetOwner("")                      -- Empty string
 ```
 
 **Usage Note**: Ownership transfer does not automatically grant admin permissions. Add the new owner to the admin list separately if needed.
+
+#### SetPointName(name)
+
+Sets a custom point name for this profile.
+
+**Parameters**:
+
+- `name` (string, required) - New point name
+
+**Returns**:
+
+- `boolean` - `true` if set successfully, `false` if validation or permission check fails
+- `string` (optional) - Error message if operation failed
+
+**Permission Requirements**:
+
+- Current user must be an admin
+
+**Validation**:
+
+- Name cannot be empty after trimming whitespace
+
+**Example**:
+
+```lua
+-- Set custom point name
+local ok, err = profile:SetPointName("DKP")
+if ok then
+    SF:PrintSuccess("Point name updated to DKP")
+else
+    SF:PrintError("Failed to set point name: " .. (err or "Unknown error"))
+end
+
+-- Permission check example
+local ok, err = profile:SetPointName("EP/GP")
+if not ok and err:match("admin") then
+    SF:PrintWarning("You need admin permissions to change the point name")
+end
+```
+
+**Usage Note**: The point name is displayed in the UI when showing member point balances.
+
+#### SetRaidWideSafeMode(enabled)
+
+Enables or disables raid-wide safe mode for this profile.
+
+**Parameters**:
+
+- `enabled` (boolean, required) - `true` to enable, `false` to disable
+
+**Returns**:
+
+- `boolean` - `true` if set successfully, `false` if permission check fails
+- `string` (optional) - Error message if operation failed
+
+**Permission Requirements**:
+
+- Current user must be an admin
+
+**Example**:
+
+```lua
+-- Enable raid-wide safe mode
+local ok, err = profile:SetRaidWideSafeMode(true)
+if ok then
+    SF:PrintSuccess("Raid-wide safe mode ENABLED")
+else
+    SF:PrintError("Failed to enable safe mode: " .. (err or "Unknown error"))
+end
+
+-- Disable raid-wide safe mode
+profile:SetRaidWideSafeMode(false)
+```
+
+**Usage Note**: When enabled, sync operations are paused for all raid members.
+
+#### SetRaidWideSafeModeOnCombat(enabled)
+
+Enables or disables automatic safe mode activation during combat.
+
+**Parameters**:
+
+- `enabled` (boolean, required) - `true` to enable, `false` to disable
+
+**Returns**:
+
+- `boolean` - `true` if set successfully, `false` if permission check fails
+- `string` (optional) - Error message if operation failed
+
+**Permission Requirements**:
+
+- Current user must be an admin
+
+**Example**:
+
+```lua
+-- Enable auto-safe mode during combat
+local ok, err = profile:SetRaidWideSafeModeOnCombat(true)
+if ok then
+    SF:PrintSuccess("Auto-safe mode during combat ENABLED")
+else
+    SF:PrintError("Failed to enable: " .. (err or "Unknown error"))
+end
+
+-- Disable auto-safe mode during combat
+profile:SetRaidWideSafeModeOnCombat(false)
+```
+
+**Usage Note**: When enabled, sync operations are automatically paused when any raid member enters combat and resumed when combat ends.
 
 ### Loot Log Management
 

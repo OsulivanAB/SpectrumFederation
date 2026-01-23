@@ -429,14 +429,22 @@ New Profile
 
 ### Scroll List
 
-Scrollable list of items.
+Scrollable list of items with optional remove buttons, dynamic height, and border styling.
 
 **Factory**: `Controls.CreateScrollList(parent, opts)`
 
 **Options**:
 
 - `items` (function) - Items getter `() => items[]`
-- `height` (number) - List height in pixels
+- `height` (number, optional) - Fixed list height in pixels (default: 160)
+- `maxHeight` (number, optional) - Maximum height when using auto-resize (default: same as height)
+- `resize` (boolean, optional) - Auto-resize to fit content (default: true)
+- `border` (boolean, optional) - Show border around list (default: false)
+- `borderInset` (number, optional) - Border inset padding (default: 4, only if border=true)
+- `rowHeight` (number, optional) - Height of each row (default: 20)
+- `rowSpacing` (number, optional) - Spacing between rows (default: 2)
+- `removeAtlas` (string, optional) - Atlas name for remove button icon (default: "common-icon-redx")
+- `onRemove` (function, optional) - Remove button handler `(item) => void`
 - `itemTemplate` (function) - Item renderer `(itemFrame, item, index) => void`
 - `visible` (function, optional) - Visibility
 
@@ -446,26 +454,38 @@ Scrollable list of items.
 {
     type = "scrollList",
     height = 200,
+    maxHeight = 400,
+    resize = true,
+    border = true,
+    rowHeight = 24,
+    rowSpacing = 2,
     items = function()
         return GetAdminList()
     end,
     itemTemplate = function(frame, admin, index)
         frame.text:SetText(admin.name)
         frame.text:SetTextColor(admin.classColor.r, admin.classColor.g, admin.classColor.b)
+    end,
+    onRemove = function(admin)
+        RemoveAdmin(admin)
     end
 }
 ```
 
-**Visual**:
+**Visual** (with border):
 
 ```
 ┌────────────────┐
-│ PlayerName1    │
-│ PlayerName2    │
-│ PlayerName3    │
+│ PlayerName1  X │
+│ PlayerName2  X │
+│ PlayerName3  X │
 │ ...            │
 └────────────────┘
 ```
+
+**Dynamic Height**: When `resize=true`, the list automatically adjusts its height to fit the content, respecting `maxHeight`. When content is smaller than `height`, the list shrinks. When content exceeds `maxHeight`, a scrollbar appears.
+
+**Border Styling**: When `border=true`, a subtle border is drawn around the list with configurable inset padding.
 
 ---
 

@@ -167,6 +167,17 @@ local className = member:GetClass()
 
 **Use case**: Determine member's class for UI display, validation, or filtering.
 
+#### getClass()
+
+Lowercase alias for `GetClass()` for convenience.
+
+```lua
+local className = member:getClass()
+-- Returns: "WARRIOR" or nil
+```
+
+**Use case**: Same as `GetClass()`. Use whichever naming convention fits your code style.
+
 #### GetClassColor()
 
 Returns the RGB color table for the member's class, or `nil` if class is not set.
@@ -182,6 +193,23 @@ end
 **Returns**: `{r = 0.78, g = 0.61, b = 0.43}` (example for Warrior) or `nil`
 
 **Use case**: Color-coding member names in UI, setting frame background colors.
+
+#### GetClassColorCode()
+
+Returns the hex color code string for the member's class in WoW color format.
+
+```lua
+local colorCode = member:GetClassColorCode()
+-- Returns: "|cffC79C6E" (Warrior) or "|cffffffff" (white, if class not set)
+
+-- Use in UI text
+local coloredName = colorCode .. member:GetFullIdentifier() .. "|r"
+print(coloredName)  -- Displays name in class color
+```
+
+**Returns**: `string` - Hex color code in WoW format (e.g., `"|cffC79C6E"`) or white (`"|cffffffff"`) if class not set
+
+**Use case**: Creating color-coded text strings for UI display, chat messages, or tooltips. Automatically handles cases where class is not set by returning white color.
 
 #### GetClassTexture()
 
