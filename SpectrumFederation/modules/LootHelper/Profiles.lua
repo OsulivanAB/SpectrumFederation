@@ -423,6 +423,14 @@ function LootProfile:getMemberByID(id)
     return nil
 end
 
+-- Alias for capitalized method name used by some callers
+function LootProfile:GetMemberByID(id)
+    if self.getMemberByID then
+        return self:getMemberByID(id)
+    end
+    return nil
+end
+
 -- ========================================================================
 -- Setter Methods
 -- ========================================================================

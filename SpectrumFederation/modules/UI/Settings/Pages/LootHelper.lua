@@ -33,6 +33,11 @@ end
 -- @param store table Settings store
 -- @return string|nil Active profile ID or name
 local function GetActiveProfileId(store)
+	if store and store.GetActiveLootHelperProfileId then
+		local id = store:GetActiveLootHelperProfileId()
+		if id ~= nil then return id end
+	end
+
 	local id = store:Get("lootHelper.activeProfileId")
 	if id ~= nil then return id end
 
@@ -43,18 +48,23 @@ end
 -- @param store table Settings store
 -- @return boolean,string|nil False with message until implemented
 local function HasAnyProfiles(store)
-	-- TODO: Call profiles API
-	return false, "Not implemented"
+	if store and store.HasLootHelperProfiles then
+		return store:HasLootHelperProfiles()
+	end
+	return false
 end
 
 -- Get profile dropdown options
 -- @param store table Settings store
 -- @return table Array of {value,label} options
 local function GetProfileOptions(store)
-	if store.GetLootHelperProfileOptionsSorted then
+	if store and store.GetLootHelperProfileOptions then
+		return store:GetLootHelperProfileOptions()
+	end
+	if store and store.GetLootHelperProfileOptionsSorted then
 		return store:GetLootHelperProfileOptionsSorted()
 	end
-	return {}, "Not implemented"
+	return {}
 end
 
 -- Check whether admin tools should be visible (placeholder true)
@@ -91,6 +101,44 @@ function Page:Build(panel)
 		return HasActiveProfile()
 	end
 
+	local function ToWoWHexColor(color)
+		-- Accepts either a hex color string ("|cffrrggbb") or a table {r,g,b} in 0-1 range.
+		if type(color) == "string" then
+			return color
+		end
+		if type(color) == "table" then
+			local r = tonumber(color.r or color[1] or 1) or 1
+			local g = tonumber(color.g or color[2] or 1) or 1
+			local b = tonumber(color.b or color[3] or 1) or 1
+			r = math.min(math.max(r, 0), 1)
+			g = math.min(math.max(g, 0), 1)
+			b = math.min(math.max(b, 0), 1)
+			return string.format("|cff%02x%02x%02x", r * 255, g * 255, b * 255)
+		end
+		return "|cffffffff"
+	end
+
+	local function GetMemberClassColor(member)
+		if type(member) == "table" then
+			if type(member.GetClassColorCode) == "function" then
+				return member:GetClassColorCode()
+			end
+
+			local className
+			if type(member.getClass) == "function" then
+				className = member:getClass()
+			else
+				className = member.class
+			end
+
+			if className and SF.WOW_CLASSES and SF.WOW_CLASSES[className] and SF.WOW_CLASSES[className].colorCode then
+				return ToWoWHexColor(SF.WOW_CLASSES[className].colorCode)
+			end
+		end
+
+		return "|cffffffff"
+	end
+
 	local function BuildOwnerDisplay()
 		local profile = GetActiveProfileObject(store)
 		if not profile then return "-" end
@@ -106,14 +154,18 @@ function Page:Build(panel)
 			return "-"
 		end
 
+		local name = tostring(ownerId)
+		local color = "|cffffffff"
+
 		if type(profile.getMemberByID) == "function" then
-			local m = profile:GetMemberByID(ownerId)
+			local m = profile:getMemberByID(ownerId)
 			if type(m) == "table" then
-				return m.member_name or m.name or tostring(ownerId)
+				name = m.member_name or m.name or name
+				color = GetMemberClassColor(m)
 			end
 		end
 
-		return tostring(ownerId)
+		return color .. name .. "|r"
 	end
 
 	local function BuildAdminItems()
@@ -136,18 +188,7 @@ function Page:Build(panel)
 		for _, memberId in ipairs(ids) do
 			local m = profile:getMemberByID(memberId)
 			local name = (type(m) == "table" and (m.member_name or m.name)) or tostring(memberId)
-			
-			local className
-			if type(m) == "table" then
-				className = m:getClass()
-			else
-				className = m.class
-			end
-
-			local color = "|cffffffff"
-			if className and SF.WOW_CLASSES and SF.WOW_CLASSES[className] and SF.WOW_CLASSES[className].colorCode then
-				color = SF.WOW_CLASSES[className].colorCode
-			end
+			local color = GetMemberClassColor(m)
 
 			table.insert(items, {
 				id = memberId,
@@ -172,10 +213,12 @@ function Page:Build(panel)
 		for _, memberId in ipairs(profile:getMemberIds() or {}) do
 			local m = profile:getMemberByID(memberId)
 			local name = (type(m) == "table" and (m.member_name or m.name)) or tostring(memberId)
-			table.insert(out, { value = memberId, label = name })
+			local color = GetMemberClassColor(m)
+			table.insert(out, { value = memberId, label = color .. name .. "|r", _sort = name })
 		end
 
-		table.sort(out, function(a, b) return tostring(a.label) < tostring(b.label) end)
+		table.sort(out, function(a, b) return tostring(a._sort) < tostring(b._sort) end)
+		for _, item in ipairs(out) do item._sort = nil end
 		return out
 	end
 
@@ -303,7 +346,11 @@ function Page:Build(panel)
 							return GetActiveProfileId(store)
 						end,
 						set = function(value)
-							store:Set("lootHelper.activeProfileId", value)
+							if store.SetActiveLootHelperProfileId then
+								store:SetActiveLootHelperProfileId(value)
+							else
+								store:Set("lootHelper.activeProfileId", value)
+							end
 						end,
 
 						options = function()
