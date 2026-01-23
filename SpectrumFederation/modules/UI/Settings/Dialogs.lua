@@ -1,4 +1,4 @@
--- modules/UI/Settings/PageBuilder.lua
+-- modules/UI/Settings/Dialogs.lua  
 local _, SF = ...
 
 SF.SettingsUI = SF.SettingsUI or {}
@@ -63,7 +63,7 @@ if not StaticPopupDialogs[PROMPT_KEY] then
             end
         end,
 
-        OnAccept = function(_, data)
+        OnAccept = function(self, data)
             local text = self.editBox:GetText() or ""
             if data and type(data.onAccept) == "function" then
                 data.onAccept(text)

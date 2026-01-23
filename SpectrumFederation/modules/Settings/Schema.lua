@@ -43,7 +43,7 @@ SF.SettingsSchema = {
 	-- Migration functions run when db.version < VERSION
 	-- The key is the *target* version number (migrate to that version)
 	MIGRATIONS = {
-		[3] = function()
+		[3] = function(db)
 			if type(db) ~= "table" then return end
 			if type(db.lootHelper) ~= "table" then return end
 
@@ -122,7 +122,7 @@ SF.SettingsSchema = {
 		-- v1 -> v2: move old admin.safeMode to all profiles safeMode(if it exists)
 		[2] = function(db)
 			if not db or type(db) ~= "table" then return end
-			if not db.lootHelper or type(db.lootHelper ~= "table") then return end
+			if not db.lootHelper or type(db.lootHelper) ~= "table" then return end
 
 			local lh = db.lootHelper
 			local admin = lh.admin

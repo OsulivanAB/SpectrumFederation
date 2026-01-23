@@ -127,7 +127,7 @@ function Page:Build(panel)
 			end
 
 			local color = "|cffffffff"
-			if className and SF.WOW_CLASES and SF.WOW_CLASSES[className] and SF.WOW_CLASSES[className].colorCode then
+			if className and SF.WOW_CLASSES and SF.WOW_CLASSES[className] and SF.WOW_CLASSES[className].colorCode then
 				color = SF.WOW_CLASSES[className].colorCode
 			end
 
@@ -146,7 +146,7 @@ function Page:Build(panel)
 
 	local function BuildMemberOptions()
 		local profile = GetActiveProfileObject(store)
-		if not profile or type(profile.getMemberIds ~= "function" or type(profile.getMemberByID) ~= "function") then
+		if not profile or type(profile.getMemberIds) ~= "function" or type(profile.getMemberByID) ~= "function" then
 			return {}
 		end
 
@@ -230,7 +230,7 @@ function Page:Build(panel)
 						onClick = function(ctx)
 							ctx.section:ClearMessage()
 
-							if not dialogs or not dialogs.Confrim then
+							if not dialogs or not dialogs.Confirm then
 								ctx.section:SetMessage("Dialogs.Confirm not available.", "error")
 								return
 							end
@@ -372,7 +372,7 @@ function Page:Build(panel)
 						enabled = function()
 							return ProfileActionsEnabled()
 						end,
-						OnClick = function(ctx)
+						onClick = function(ctx)
 							ctx.section:ClearMessage()
 
 							dialogs:Confirm(
@@ -414,15 +414,15 @@ function Page:Build(panel)
 						rowHeight = 20,
 						removeAtlas = "common-icon-redx",
 						getItems = function()
-							return BuildAdminItems(0)
+							return BuildAdminItems()
 						end,
 						onRemove = function(ctx, item)
-							if type(ctx.store.RemoveAdminFromActiveprofile) ~= "function" then
-								ctx.section:SetMessage("RemoveAdminFromActiveprofile() not implemented", "error")
+							if type(ctx.store.RemoveAdminFromActiveProfile) ~= "function" then
+								ctx.section:SetMessage("RemoveAdminFromActiveProfile() not implemented", "error")
 								return
 							end
 
-							local ok, err = ctx.store:RemoveAdminFromActiveprofile(item.id)
+							local ok, err = ctx.store:RemoveAdminFromActiveProfile(item.id)
 							if not ok then
 								ctx.section:SetMessage(err or "Failed to remove admin", "error")
 								return
@@ -472,7 +472,7 @@ function Page:Build(panel)
 								return
 							end
 
-							local ok, err = ctx.store:AdminToActiveProfile(memberId)
+							local ok, err = ctx.store:AddAdminToActiveProfile(memberId)
 							if not ok then
 								ctx.section:SetMessage(err or "Failed to add admin", "error")
 								return
