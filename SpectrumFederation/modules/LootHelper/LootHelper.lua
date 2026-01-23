@@ -432,8 +432,7 @@ function SF:DeleteLootHelperProfile(profileId)
 
 	-- If we deleted the active profile, pick a new one or nil
 	if db.activeProfileId == profileId then
-		db.activeProfileId = nil
-		db.activeProfile = nil
+		self:ClearActiveProfile()
 
 		-- Pick first sorted option (nice UX, minimal logic)
 		local opts = self:GetLootHelperProfileOptions()

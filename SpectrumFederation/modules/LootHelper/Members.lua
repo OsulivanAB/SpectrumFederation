@@ -68,12 +68,6 @@ function Member.new(identifier, role, class)
     
     -- Set default properties
     instance.identifier = identifier or ""
-
-    local n, r = instance.identifier:match("^(.-)%-(.-)$")
-    instance.member_name = n or instance.identifier
-    instance.name = instance.member_name
-    instance.member_realm = r or ""
-    instance.className = instance.class
     
     -- Validate and set role (default to "member")
     if role and (role == MEMBER_ROLES.ADMIN or role == MEMBER_ROLES.MEMBER) then
@@ -91,6 +85,12 @@ function Member.new(identifier, role, class)
             SF.Debug:Warn("MEMBER", "Invalid class '%s' provided for member %s", tostring(class), identifier)
         end
     end
+
+    local n, r = instance.identifier:match("^(.-)%-(.-)$")
+    instance.member_name = n or instance.identifier
+    instance.name = instance.member_name
+    instance.member_realm = r or ""
+    instance.className = instance.class
     
     instance.pointBalance = 0
     
