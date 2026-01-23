@@ -108,7 +108,7 @@ function LootProfile.new(profileName)
 
     -- Create member instance for author
     local class = SF:GetPlayerClass()
-    local authorMember = SF.Member.new(instance._author, class or "UNKNOWN")
+    local authorMember = SF.Member.new(instance._author, SF.MemberRoles.ADMIN, class or "UNKNOWN")
     if not authorMember then
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Failed to create member instance for author:", instance._author)
@@ -458,10 +458,10 @@ function LootProfile:_InsertLog(lootLog, opts)
 end
 
 -- Function to add a member to this profile
--- @param LootProfileMember member Instance of LootProfileMember to add
+-- @param Member member Instance of Member to add
 -- @return boolean success
 function LootProfile:AddMember(member)
-    if getmetatable(member) == SF.LootProfileMember then
+    if getmetatable(member) == SF.Member then
         table.insert(self._members, member)
         return true
     else
@@ -473,10 +473,10 @@ function LootProfile:AddMember(member)
 end
 
 -- Function to add an admin user to this profile
--- @param LootProfileMember member Instance of LootProfileMember to add as admin
+-- @param Member member Instance of Member to add as admin
 -- @return boolean success
 function LootProfile:AddAdminUser(member)
-    if getmetatable(member) == SF.LootProfileMember then
+    if getmetatable(member) == SF.Member then
         table.insert(self._adminUsers, member:GetFullIdentifier())
         return true
     else
