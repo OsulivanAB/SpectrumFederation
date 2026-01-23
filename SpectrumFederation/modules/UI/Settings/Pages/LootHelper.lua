@@ -11,6 +11,9 @@ local Page = {
 -- ==================================================================
 -- Helpers
 -- ==================================================================
+-- Get the active loot helper profile runtime object
+-- @param store table Settings store
+-- @return table|nil Profile object or nil if unavailable
 local function GetActiveProfileObject(store)
 	-- TODO: Implement later
 	-- Return a runtime profile object with:
@@ -23,28 +26,77 @@ local function GetActiveProfileObject(store)
 	if store and store.GetActiveLootHelperProfileObject then
 		return store:GetActiveLootHelperProfileObject()
 	end
+	if SF and SF.lootHelperDB then
+		return SF.lootHelperDB.activeProfile
+	end
 	return nil
 end
 
+-- Get the active loot helper profile ID (prefers new key, falls back to legacy)
+-- @param store table Settings store
+-- @return string|nil Active profile ID or name
 local function GetActiveProfileId(store)
+	if store and store.GetActiveLootHelperProfileId then
+		local id = store:GetActiveLootHelperProfileId()
+		if id ~= nil then return id end
+	end
+
 	local id = store:Get("lootHelper.activeProfileId")
 	if id ~= nil then return id end
+
+	if SF and SF.lootHelperDB and SF.lootHelperDB.activeProfileId then
+		return SF.lootHelperDB.activeProfileId
+	end
 
 	return store:Get("lootHelper.activeProfile")
 end
 
+-- Determine if any loot helper profiles exist (placeholder)
+-- @param store table Settings store
+-- @return boolean,string|nil False with message until implemented
 local function HasAnyProfiles(store)
-	-- TODO: Call profiles API
-	return false, "Not implemented"
+	if store and store.HasActiveLootHelperProfile then
+		if store:HasActiveLootHelperProfile() then
+			return true
+		end
+	end
+	if store and store.HasLootHelperProfiles then
+		local hasAny = store:HasLootHelperProfiles()
+		if hasAny then
+			return true
+		end
+	end
+	if store and store.GetLootHelperProfiles then
+		local profiles = store:GetLootHelperProfiles()
+		if type(profiles) == "table" and next(profiles) ~= nil then
+			return true
+		end
+	end
+	if SF and SF.lootHelperDB and type(SF.lootHelperDB.profiles) == "table" then
+		if next(SF.lootHelperDB.profiles) ~= nil then
+			return true
+		end
+	end
+	local opts = GetProfileOptions(store)
+	return type(opts) == "table" and #opts > 0
 end
 
+-- Get profile dropdown options
+-- @param store table Settings store
+-- @return table Array of {value,label} options
 local function GetProfileOptions(store)
-	if store.GetLootHelperProfileOptionsSorted then
+	if store and store.GetLootHelperProfileOptions then
+		return store:GetLootHelperProfileOptions()
+	end
+	if store and store.GetLootHelperProfileOptionsSorted then
 		return store:GetLootHelperProfileOptionsSorted()
 	end
-	return {}, "Not implemented"
+	return {}
 end
 
+-- Check whether admin tools should be visible (placeholder true)
+-- @param ctx table Context table
+-- @return boolean Always true until real check added
 local function CanShowAdminTools(ctx)
 	-- TODO: Call profiles API function to ask if current user is admin
 	return true
@@ -53,6 +105,9 @@ end
 -- ==================================================================
 -- Page Definition
 -- ==================================================================
+-- Build the Loot Helper settings page UI
+-- @param panel Frame Settings panel frame
+-- @return nil
 function Page:Build(panel)
 	if SF.Debug then
 		SF.Debug:Verbose("UI", "Building LootHelper settings page")
@@ -66,11 +121,52 @@ function Page:Build(panel)
 	panel.__sfAddAdmininSelectedId = panel.__sfAddAdmininSelectedId or nil
 
 	local function HasActiveProfile()
+		if GetActiveProfileObject(store) ~= nil then
+			return true
+		end
 		return GetActiveProfileId(store) ~= nil
 	end
 
 	local function ProfileActionsEnabled()
 		return HasActiveProfile()
+	end
+
+	local function ToWoWHexColor(color)
+		-- Accepts either a hex color string ("|cffrrggbb") or a table {r,g,b} in 0-1 range.
+		if type(color) == "string" then
+			return color
+		end
+		if type(color) == "table" then
+			local r = tonumber(color.r or color[1] or 1) or 1
+			local g = tonumber(color.g or color[2] or 1) or 1
+			local b = tonumber(color.b or color[3] or 1) or 1
+			r = math.min(math.max(r, 0), 1)
+			g = math.min(math.max(g, 0), 1)
+			b = math.min(math.max(b, 0), 1)
+			return string.format("|cff%02x%02x%02x", r * 255, g * 255, b * 255)
+		end
+		return "|cffffffff"
+	end
+
+	local function GetMemberClassColor(member)
+		if type(member) == "table" then
+			if type(member.GetClassColorCode) == "function" then
+				return member:GetClassColorCode()
+			end
+
+			local className
+			if type(member.getClass) == "function" then
+				className = member:getClass()
+			else
+				className = member.class
+			end
+
+			if className and SF.WOW_CLASSES and SF.WOW_CLASSES[className] and SF.WOW_CLASSES[className].colorCode then
+				return ToWoWHexColor(SF.WOW_CLASSES[className].colorCode)
+			end
+		end
+
+		return "|cffffffff"
 	end
 
 	local function BuildOwnerDisplay()
@@ -88,14 +184,18 @@ function Page:Build(panel)
 			return "-"
 		end
 
+		local name = tostring(ownerId)
+		local color = "|cffffffff"
+
 		if type(profile.getMemberByID) == "function" then
-			local m = profile:GetMemberByID(ownerId)
+			local m = profile:getMemberByID(ownerId)
 			if type(m) == "table" then
-				return m.member_name or m.name or tostring(ownerId)
+				name = m.member_name or m.name or name
+				color = GetMemberClassColor(m)
 			end
 		end
 
-		return tostring(ownerId)
+		return color .. name .. "|r"
 	end
 
 	local function BuildAdminItems()
@@ -118,18 +218,7 @@ function Page:Build(panel)
 		for _, memberId in ipairs(ids) do
 			local m = profile:getMemberByID(memberId)
 			local name = (type(m) == "table" and (m.member_name or m.name)) or tostring(memberId)
-			
-			local className
-			if type(m) == "table" then
-				className = m:getClass()
-			else
-				className = m.class
-			end
-
-			local color = "|cffffffff"
-			if className and SF.WOW_CLASSES and SF.WOW_CLASSES[className] and SF.WOW_CLASSES[className].colorCode then
-				color = SF.WOW_CLASSES[className].colorCode
-			end
+			local color = GetMemberClassColor(m)
 
 			table.insert(items, {
 				id = memberId,
@@ -154,10 +243,12 @@ function Page:Build(panel)
 		for _, memberId in ipairs(profile:getMemberIds() or {}) do
 			local m = profile:getMemberByID(memberId)
 			local name = (type(m) == "table" and (m.member_name or m.name)) or tostring(memberId)
-			table.insert(out, { value = memberId, label = name })
+			local color = GetMemberClassColor(m)
+			table.insert(out, { value = memberId, label = color .. name .. "|r", _sort = name })
 		end
 
-		table.sort(out, function(a, b) return tostring(a.label) < tostring(b.label) end)
+		table.sort(out, function(a, b) return tostring(a._sort) < tostring(b._sort) end)
+		for _, item in ipairs(out) do item._sort = nil end
 		return out
 	end
 
@@ -271,7 +362,7 @@ function Page:Build(panel)
 						text = "You currently have no profiles. Create one in General Section",
 						indent = "label",
 						visible = function()
-							return not HasAnyProfiles(store)
+							return not HasAnyProfiles(store) and not HasActiveProfile()
 						end
 					},
 
@@ -285,7 +376,11 @@ function Page:Build(panel)
 							return GetActiveProfileId(store)
 						end,
 						set = function(value)
-							store:Set("lootHelper.activeProfileId", value)
+							if store.SetActiveLootHelperProfileId then
+								store:SetActiveLootHelperProfileId(value)
+							else
+								store:Set("lootHelper.activeProfileId", value)
+							end
 						end,
 
 						options = function()
@@ -296,7 +391,7 @@ function Page:Build(panel)
 							return HasAnyProfiles(store)
 						end,
 
-						iconAtlas = "common-icon-trash",
+						iconAtlas = "common-icon-redx",
 						iconTooltip = "Delete Active Profile",
 						iconEnabled = function()
 							return ProfileActionsEnabled()
@@ -413,6 +508,9 @@ function Page:Build(panel)
 						height = 160,
 						rowHeight = 20,
 						removeAtlas = "common-icon-redx",
+						enabled = function()
+							return ProfileActionsEnabled()
+						end,
 						getItems = function()
 							return BuildAdminItems()
 						end,
@@ -492,14 +590,16 @@ function Page:Build(panel)
 						end,
 
 						get = function()
-							if store.GetActiveProfileSettings then
-								return store:GetActiveProfileSetting("pointName", "Points")
+							local profile = GetActiveProfileObject(store)
+							if profile and type(profile.GetPointName) == "function" then
+								return profile:GetPointName()
 							end
 							return "Points"
 						end,
 						set = function(value)
-							if store.SetActiveProfileSetting then
-								store:SetActiveProfileSetting("pointName", value)
+							local profile = GetActiveProfileObject(store)
+							if profile and type(profile.SetPointName) == "function" then
+								profile:SetPointName(value)
 							end
 						end,
 
@@ -606,6 +706,9 @@ function Page:Build(panel)
 	renderer:Build(panel, def)
 end
 
+-- Refresh the Loot Helper settings page
+-- @param panel Frame Settings panel frame
+-- @return nil
 function Page:Refresh(panel)
 	SF.SettingsUI.DefinitionRenderer:Refresh(panel)
 end

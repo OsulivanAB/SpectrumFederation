@@ -14,20 +14,39 @@ local LootLogValidators = {}
 -- @param memberIdentifier (string) - Member full identifier "Name-Realm"
 -- @return (boolean) - True if member exists, false otherwise
 function LootLogValidators.MemberExistsInProfiles(memberIdentifier)
-    local activeProfile = SF.lootHelperDB.activeProfile
-    if not activeProfile then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "No active loot profile set when validating member: %s", tostring(memberIdentifier))
-        end
-        return false
-    end
-    local members = activeProfile:GetMemberList()
-    for _, memberID in ipairs(members) do
-        if memberID == memberIdentifier then
-            return true
-        end
-    end
-    return false
+	local activeProfile = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+	if not activeProfile or not activeProfile.GetMemberList then
+		if SF.Debug then
+			SF.Debug:Warn("LOOTLOG", "No active loot profile set when validating member: %s", tostring(memberIdentifier))
+		end
+		return false
+	end
+
+	local members = activeProfile:GetMemberList()
+	if type(members) ~= "table" then return false end
+
+	-- Normalize compare if NameUtil exists
+	local function Same(a, b)
+		if SF.NameUtil and SF.NameUtil.SamePlayer then
+			return SF.NameUtil.SamePlayer(a, b)
+		end
+		return a == b
+	end
+
+	for _, member in ipairs(members) do
+		local id = member
+		if type(member) == "table" and member.GetFullIdentifier then
+			id = member:GetFullIdentifier()
+		elseif type(member) == "table" and member.identifier then
+			id = member.identifier
+		end
+
+		if type(id) == "string" and Same(id, memberIdentifier) then
+			return true
+		end
+	end
+
+	return false
 end
 
 -- Function to validate the POINT_CHANGE event data

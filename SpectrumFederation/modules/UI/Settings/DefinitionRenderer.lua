@@ -7,10 +7,17 @@ local UI = SF.SettingsUI
 UI.DefinitionRenderer = UI.DefinitionRenderer or {}
 local R = UI.DefinitionRenderer
 
+-- Get unique key for a section definition
+-- @param secDef table Section definition table
+-- @return string Section key (id or title)
 local function SectionKey(secDef)
 	return secDef.id or secDef.title
 end
 
+-- Create context object for control builders with UI references
+-- @param panel Frame The panel frame being built
+-- @param section Section The section being built into
+-- @return table Context table with panel, section, store, schema, ui, pageBuilder
 local function MakeCtx(panel, section)
 	return {
 		panel = panel,
@@ -22,6 +29,10 @@ local function MakeCtx(panel, section)
 	}
 end
 
+-- Build a settings page from definition and populate with controls
+-- @param panel Frame The panel frame to build into
+-- @param pageDef table Page definition with sections and items
+-- @return nil
 function R:Build(panel, pageDef)
 	if SF.Debug then
 		SF.Debug:Verbose("UI", "Building page definition with %d section(s)", #(pageDef.sections or {}))
@@ -196,6 +207,9 @@ function R:Build(panel, pageDef)
 	return pb
 end
 
+-- Refresh the page definition display (called when panel is reopened)
+-- @param panel Frame The panel frame to refresh
+-- @return nil
 function R:Refresh(panel)
 	local pb = panel.__sfPageBuilder
 	local pageDef = panel.__sfPageDef

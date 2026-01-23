@@ -4,7 +4,6 @@ local addonName, SF = ...
 -- Slash command registry
 SF.SlashCommands = SF.SlashCommands or {}
 
--- Register a new slash command
 -- @param command: The command keyword (e.g., "loot", "debug")
 -- @param handler: Function to execute when command is called
 -- @param description: Help text for the command
@@ -30,6 +29,7 @@ function SF:RegisterSlashCommand(command, handler, description)
 end
 
 -- Show help message with all registered commands
+-- @return nil
 local function ShowHelp()
     SF:PrintSuccess("Commands:")
     SF:PrintInfo("|cFFFFFF00/sf|r - Open settings panel")
@@ -51,7 +51,9 @@ local function ShowHelp()
     end
 end
 
--- Main slash command handler
+-- Main slash command handler for /sf
+-- @param msg string Raw message after /sf
+-- @return nil
 local function SlashCommandHandler(msg)
     -- Trim whitespace and convert to lowercase
     msg = msg:trim():lower()
@@ -95,7 +97,8 @@ local function SlashCommandHandler(msg)
     end
 end
 
--- Initialize slash commands system
+-- Initialize slash commands system and register /sf
+-- @return nil
 function SF:InitializeSlashCommands()
     -- Register the main /sf command
     SLASH_SPECFED1 = "/sf"
@@ -108,7 +111,7 @@ function SF:InitializeSlashCommands()
 end
 
 -- Register Loot Helper slash commands
--- @return: none
+-- @return nil
 function SF:RegisterLootHelperSlashCommands()
     
     -- List all profiles
@@ -147,7 +150,7 @@ function SF:RegisterLootHelperSlashCommands()
         local name = profile:GetProfileName()
         local profileId = profile:GetProfileId()
         local author = profile:GetAuthor()
-        local owner = profile:GetOwner()
+        local owner = profile:GetOwnerId()
         local created = profile:GetCreationTime()
         local modified = profile:GetLastModifiedTime()
         local members = profile:GetMemberList()
@@ -257,7 +260,7 @@ function SF:RegisterLootHelperSlashCommands()
         
         -- Clear if active
         if SF.lootHelperDB.activeProfileId == profileId then
-            SF.lootHelperDB.activeProfileId = nil
+            SF:ClearActiveProfile()
             SF:PrintWarning("Cleared active profile (deleted)")
         end
         

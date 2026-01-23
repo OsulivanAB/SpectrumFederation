@@ -14,6 +14,10 @@ local LABEL_WIDTH   = R.labelWidth or 220
 local GUTTER        = R.gutter or 16
 local CONTROL_WIDTH = R.controlWidth or 240
 
+-- Evaluate a value or thunk to a boolean with default
+-- @param v any Boolean, function returning boolean, or nil
+-- @param defaultValue boolean Default to use if v is nil or errors
+-- @return boolean Resolved boolean
 local function EvalBool(v, defaultValue)
 	if v == nil then return defaultValue end
 	if type(v) == "function" then
@@ -26,6 +30,9 @@ local function EvalBool(v, defaultValue)
 	return v and true or false
 end
 
+-- Request a layout reflow for a section or its page builder
+-- @param section table Section frame/table containing reflow methods
+-- @return nil
 local function RequestSectionReflow(section)
 	if not section then return end
 	if section.RequestReflow then
@@ -42,6 +49,12 @@ local function RequestSectionReflow(section)
 	end
 end
 
+-- Apply visibility/enabled state to a row and its widgets
+-- @param row Frame Row frame to update
+-- @param section table Section containing the row
+-- @param opts table Options with visible/enabled toggles
+-- @param widgets table|nil Array of widgets to enable/disable
+-- @return boolean visible, boolean enabled
 function Controls:_ApplyRowState(row, section, opts, widgets)
 	opts = opts or {}
 	local visible = EvalBool(opts.visible, true)
@@ -76,6 +89,9 @@ function Controls:_ApplyRowState(row, section, opts, widgets)
 	return visible, enabled
 end
 
+-- Resolve get/set functions from opts or path binding
+-- @param opts table Options containing get/set or path
+-- @return function get, function set
 local function ResolveGetSet(opts)
 	-- Either opts.get/opts.set OR opts.path
 	local get = opts.get
@@ -94,6 +110,9 @@ local function ResolveGetSet(opts)
 	return get, set
 end
 
+-- Resolve get function from opts or path binding
+-- @param opts table Options containing get or path
+-- @return function get
 local function ResolveGetOnly(opts)
 	local get = opts.get
 	if not get and opts.path then
@@ -103,6 +122,11 @@ local function ResolveGetOnly(opts)
 	return get
 end
 
+-- Create a simple icon button with highlight
+-- @param parent Frame Parent frame
+-- @param atlas string|nil Atlas name for texture
+-- @param size number|nil Size of button (width/height)
+-- @return Button The created button
 local function CreateIconButton(parent, atlas, size)
 	local btn = CreateFrame("Button", nil, parent)
 	btn:SetSize(size or 20, size or 20)
@@ -123,6 +147,11 @@ local function CreateIconButton(parent, atlas, size)
 	return btn
 end
 
+-- Attach tooltip handlers to a region
+-- @param region Region UI region to attach tooltip to
+-- @param title string|nil Tooltip title
+-- @param text string|nil Tooltip body text
+-- @return nil
 local function AttachTooltip(region, title, text)
 	if not text or text == "" then return end
 	region:EnableMouse(true)
@@ -139,6 +168,10 @@ local function AttachTooltip(region, title, text)
 	end)
 end
 
+-- Register a refresh callback on the page builder for a section
+-- @param section table Section containing __sfPageBuilder
+-- @param fn function Callback to run on refresh
+-- @return nil
 local function RegisterRefresh(section, fn)
 	local pb = section.__sfPageBuilder
 	if pb and pb.RegisterRefresh then
@@ -146,6 +179,9 @@ local function RegisterRefresh(section, fn)
 	end
 end
 
+-- Resolve get/set binding helpers (alias of ResolveGetSet)
+-- @param opts table Options containing get/set or path
+-- @return function get, function set
 local function ResolveBinding(opts)
 	local get = opts.get
 	local set = opts.set
@@ -163,6 +199,10 @@ local function ResolveBinding(opts)
 	return get, set
 end
 
+-- Initialize a row with label and control container
+-- @param row Frame Row to initialize
+-- @param opts table Options containing label and tooltip
+-- @return FontString label, Frame control
 function Controls:InitRow(row, opts)
 	-- Label (fixed column)
 	local label = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
@@ -187,6 +227,10 @@ end
 -- ---------------------------------------
 -- Checkbox
 -- ---------------------------------------
+-- Add a checkbox control row bound to settings
+-- @param section table Section to add row into
+-- @param opts table Options including label, path/get/set, tooltip, visible/enabled
+-- @return Frame The created row
 function Controls:AddCheckbox(section, opts)
 	local get, set = ResolveGetSet(opts)
 
@@ -226,6 +270,10 @@ end
 -- ---------------------------------------
 -- Button (action)
 -- ---------------------------------------
+-- Add a button control row
+-- @param section table Section to add row into
+-- @param opts table Options including label, buttonText, width, onClick, visible/enabled
+-- @return Frame The created row
 function Controls:AddButton(section, opts)
 	return section:AddRow(26, function(row)
 		local _, control = self:InitRow(row, opts)
@@ -253,6 +301,10 @@ end
 -- ---------------------------------------
 -- EditBox + Button
 -- ---------------------------------------
+-- Add an edit box with adjacent button
+-- @param section table Section to add row into
+-- @param opts table Options including label, onSubmit, buttonText, widths, visible/enabled
+-- @return Frame The created row
 function Controls:AddEditBoxWithButton(section, opts)
 	return section:AddRow(26, function(row)
 		local _, control = self:InitRow(row, opts)
@@ -297,6 +349,10 @@ end
 -- ---------------------------------------
 -- Slider
 -- ---------------------------------------
+-- Add a slider control row bound to settings
+-- @param section table Section to add row into
+-- @param opts table Options including label, min, max, step, path/get/set, visible/enabled
+-- @return Frame The created row
 function Controls:AddSlider(section, opts)
 	local get, set = ResolveGetSet(opts)
 
@@ -354,6 +410,10 @@ end
 -- ---------------------------------------
 -- Dropdown using Blizzard_Menu DropdownButton
 -- ---------------------------------------
+-- Add a dropdown control row using Blizzard dropdown template
+-- @param section table Section to add row into
+-- @param opts table Options including label, options, path/get/set, defaultText, onValueChanged
+-- @return Frame The created row
 function Controls:AddDropdown(section, opts)
 	local get, set = ResolveGetSet(opts)
 
@@ -419,6 +479,10 @@ function Controls:AddDropdown(section, opts)
 	end)
 end
 
+-- Add a read-only display row
+-- @param section table Section to add row into
+-- @param opts table Options including label, get/path, tooltip, visible/enabled
+-- @return Frame The created row
 function Controls:AddDisplay(section, opts)
 	local get = ResolveGetOnly(opts)
 
@@ -442,6 +506,10 @@ function Controls:AddDisplay(section, opts)
 	end)
 end
 
+-- Add an edit box control row bound to settings
+-- @param section table Section to add row into
+-- @param opts table Options including label, path/get/set, maxLetters, onCommit
+-- @return Frame The created row
 function Controls:AddEditBox(section, opts)
 	local get, set = ResolveGetSet(opts)
 
@@ -452,6 +520,10 @@ function Controls:AddEditBox(section, opts)
 		edit:SetAutoFocus(false)
 		edit:SetSize(opts.width or 180, 22)
 		edit:SetPoint("LEFT", control, "LEFT", 0, 0)
+		edit:SetTextColor(1, 1, 1)
+		if edit.SetHighlightColor then
+			edit:SetHighlightColor(0.25, 0.5, 1, 0.35)
+		end
 
 		if opts.maxLetters then
 			edit:SetMaxLetters(opts.maxLetters)
@@ -483,9 +555,14 @@ function Controls:AddEditBox(section, opts)
 		local function Refresh()
 			ignore = true
 			edit:SetText(tostring(get() or ""))
+			if edit.SetCursorPosition then
+				edit:SetCursorPosition(0)
+			end
 			ignore = false
 
-			self:_ApplyRowState(row, section, opts, {edit})
+			local _, enabled = self:_ApplyRowState(row, section, opts, {edit})
+			local c = enabled and 1 or 0.6
+			edit:SetTextColor(c, c, c)
 		end
 
 		Refresh()
@@ -493,6 +570,10 @@ function Controls:AddEditBox(section, opts)
 	end)
 end
 
+-- Add a dropdown with an adjacent icon button
+-- @param section table Section to add row into
+-- @param opts table Options including label, options, iconAtlas, iconTooltip, onIconClick
+-- @return Frame The created row
 function Controls:AddDropdownWithIconButton(section, opts)
 	local get, set = ResolveGetSet(opts)
 	return section:AddRow(30, function(row)
@@ -558,9 +639,20 @@ function Controls:AddDropdownWithIconButton(section, opts)
 		end)
 
 		local function Refresh()
-			self:_ApplyRowState(row, section, opts, {dropdown})
+			local options = GetOptions()
+			local hasOptions = type(options) == "table" and #options > 0
 
-			local iconEnabled = EvalBool(opts.iconEnabled, EvalBool(opts.enabled, true))
+			local _, enabled = self:_ApplyRowState(row, section, opts, {dropdown})
+			local effectiveEnabled = enabled and hasOptions
+			if dropdown.SetEnabled then
+				dropdown:SetEnabled(effectiveEnabled)
+			elseif dropdown.EnableMouse then
+				dropdown:EnableMouse(effectiveEnabled)
+			end
+			dropdown:SetAlpha(effectiveEnabled and 1 or 0.45)
+			row:SetAlpha(effectiveEnabled and 1 or 0.45)
+
+			local iconEnabled = EvalBool(opts.iconEnabled, effectiveEnabled)
 			if iconBtn.SetEnabled then
 				iconBtn:SetEnabled(iconEnabled)
 			else
@@ -592,6 +684,10 @@ end
 --   - rowHeight: Height of each row in the list (default: 20)
 --   - removeAtlas: Atlas name for the remove button icon (default: "common-icon-redx")
 -- @Return The created scroll list control
+-- Add a scrollable list control with optional remove buttons
+-- @param section table Section to add row into
+-- @param opts table Options with getItems, onRemove, sizing, and display settings
+-- @return Frame The created row
 function Controls:AddScrollList(section, opts)
 	opts = opts or {}
 
@@ -600,16 +696,57 @@ function Controls:AddScrollList(section, opts)
 		getItems = function() return {} end
 	end
 
-	local height = opts.height or 160
 	local rowHeight = opts.rowHeight or 20
-	local removeAtlas = opts.removeAtlas or "common-icon-redx"
+	local rowSpacing = opts.rowSpacing or 2
 
-	return section:AddRow(height, function(row)
+	local resize = (opts.resize ~= false)	-- Default to true
+	local border = (opts.border == true)	-- Default to false
+	local borderInset = border and (opts.borderInset or 4) or 0
+
+	local fixedHeight = opts.height or 160
+	local maxHeight = opts.maxHeight or fixedHeight
+
+	local minRowHeight = rowHeight + (borderInset * 2)
+	if fixedHeight < minRowHeight then fixedHeight = minRowHeight end
+	if maxHeight < minRowHeight then maxHeight = minRowHeight end
+
+	local initialHeight = resize and minRowHeight or fixedHeight
+
+	return section:AddRow(initialHeight, function(row)
 		local _, control = self:InitRow(row, opts)
 
-		local scroll = CreateFrame("ScrollFrame", nil, control, "UIPanelScrollFrameTemplate")
-		scroll:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
-		scroll:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", 0, 0)
+		local parent = control
+		if border then
+			local box = CreateFrame("Frame", nil, control, "BackdropTemplate")
+			box:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+			box:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", 0, 0)
+
+			if box.SetBackdrop then
+				box:SetBackdrop({
+					-- bgFile = "Interface\\Buttons\\WHITE8X8",
+					bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+					edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+					tile = true,
+					tileSize = 8,
+					edgeSize = 12,
+					insets = { 
+						left = borderInset, 
+						right = borderInset, 
+						top = borderInset, 
+						bottom = borderInset
+					 }
+				})
+				
+				box:SetBackdropColor(0, 0, 0, 0.12)	-- semi-transparent bg
+				box:SetBackdropBorderColor(0.5, 0.5, 0.5, 1) -- light grey border
+			end
+
+			parent = box
+		end
+
+		local scroll = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, 0)
+		scroll:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 0, 0)
 
 		local content = CreateFrame("Frame", nil, scroll)
 		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
@@ -630,7 +767,7 @@ function Controls:AddScrollList(section, opts)
 			fs:SetJustifyH("LEFT")
 			r.Text = fs
 
-			local remove = CreateIconButton(r, removeAtlas, 18)
+			local remove = CreateIconButton(r, opts.removeAtlas or "common-icon-redx", 18)
 			remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
 			r.Remove = remove
 
@@ -638,16 +775,37 @@ function Controls:AddScrollList(section, opts)
 			return r
 		end
 
+		local function SetScrollBarShown(show)
+			local sb = scroll.ScrollBar
+			if not sb then return 0 end
+
+			sb:SetShown(show)
+
+			if not show then
+				scroll:SetVerticalScroll(0)
+				if sb.SetValue then sb:SetValue(0) end
+				if sb.Disable then sb:Disable() end
+				return 0
+			end
+
+			if sb.Enable then sb:Enable() end
+			return sb:GetWidth() or 20
+		end
+
 		local function Refresh()
+			if row.__sfScrollListRefreshing then return end
+			row.__sfScrollListRefreshing = true
+
 			self:_ApplyRowState(row, section, opts, nil)
 
 			local items = getItems() or {}
+
 			local y = 0
 
-			local w = (control:GetWidth() or 0)
-			local sb = scroll.ScrollBar
-			local sbw = (sb and sb:GetWidth()) or 20
-			content:SetWidth(math.max(1, w - sbw - 4))
+			-- local w = (control:GetWidth() or 0)
+			-- local sb = scroll.ScrollBar
+			-- local sbw = (sb and sb:GetWidth()) or 20
+			-- content:SetWidth(math.max(1, w - sbw - 4))
 
 			for i = 1, #items do
 				local item = items[i]
@@ -668,31 +826,77 @@ function Controls:AddScrollList(section, opts)
 							opts.onRemove(item)
 						end
 					end)
+				else
+					r.Remove:SetScript("OnClick", nil)
 				end
 
 				r:Show()
-				y = y + rowHeight + 2
+				y = y + rowHeight + rowSpacing
 			end
 
 			for i = #items + 1, #rows do
 				rows[i]:Hide()
 			end
 
-			content:SetHeight(math.max(1, y))
+			local contentH = (y > 0) and (y - rowSpacing) or 0
+			content:SetHeight(math.max(1, contentH))
+
+			-- Resize behavior
+			local sbw = 0
+			if resize then
+				local maxVisible = math.max(rowHeight, maxHeight - (borderInset * 2))
+				local needVisible = math.max(rowHeight, contentH)
+
+				local showScroll = needVisible > maxVisible
+				sbw = SetScrollBarShown(showScroll)
+
+				local targetVisible = math.min(needVisible, maxVisible)
+				local targetRowH = targetVisible + (borderInset * 2)
+
+				-- Only apply if changed, then request reflow so stacking updates
+				if math.abs((row:GetHeight() or 0) - targetRowH) > 0.5 then
+					row:SetHeight(targetRowH)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+			else
+				SetScrollBarShown(true)
+
+				if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
+					row:SetHeight(fixedHeight)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+
+				local sb = scroll.ScrollBar
+				sbw = (sb and sb:GetWidth()) or 20
+			end
+
+			-- Width management
+			local w = scroll:GetWidth() or 0
+			if w > 0 then
+				content:SetWidth(math.max(1, w - sbw - 4))
+			end
+
+			row.__sfScrollListRefreshing = false
 		end
 
 		Refresh()
 		RegisterRefresh(section, Refresh)
 
-		scroll:HookScript("OnSizeChanged", function()
-			Refresh()
-		end)
+		scroll:HookScript("OnSizeChanged", Refresh)
 	end)
 end
 
 -- =======================================
 -- Help Text
 -- =======================================
+-- Add a help text row with optional indentation and dynamic height
+-- @param section table Section to add row into
+-- @param opts table Options including text, indent, padding, minHeight
+-- @return Frame The created row
 function Controls:AddHelpText(section, opts)
 	opts = opts or {}
 
@@ -720,6 +924,13 @@ function Controls:AddHelpText(section, opts)
 		fs:SetJustifyV("TOP")
 		fs:SetWordWrap(true)
 		fs:SetText(opts.text or "")
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
 
 		local function UpdateHeight()
 			-- Width is sometimes 0 during the first layout pass; try again later.

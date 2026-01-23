@@ -27,7 +27,11 @@ if not StaticPopupDialogs[KEY] then
         end,
     }
 end
-
+-- Show a confirmation dialog with accept and cancel buttons
+-- @param message string Message text to display
+-- @param acceptText string|nil Text for accept button (defaults to OKAY)
+-- @param onAccept function|nil Callback function called if user accepts
+-- @return boolean True if dialog was shown, false otherwise
 function Dialogs:Confirm(message, acceptText, onAccept)
     if SF.Debug then
         SF.Debug:Verbose("UI", "Showing confirmation dialog: %s", message)
@@ -52,7 +56,8 @@ if not StaticPopupDialogs[PROMPT_KEY] then
         editBoxWidth = 220,
 
         OnShow = function(self, data)
-            local editBox = self.editBox
+            local editBox = self.editBox or self.EditBox
+            if not editBox then return end
             editBox:SetAutoFocus(true)
 
             if data and data.defaultText then
@@ -64,7 +69,8 @@ if not StaticPopupDialogs[PROMPT_KEY] then
         end,
 
         OnAccept = function(self, data)
-            local text = self.editBox:GetText() or ""
+            local editBox = self.editBox or self.EditBox
+            local text = (editBox and editBox:GetText()) or ""
             if data and type(data.onAccept) == "function" then
                 data.onAccept(text)
             end
@@ -72,7 +78,8 @@ if not StaticPopupDialogs[PROMPT_KEY] then
 
         EditBoxOnEnterPressed = function(self, data)
             local parent = self:GetParent()
-            local text = parent.editBox:GetText() or ""
+            local editBox = (parent and (parent.editBox or parent.EditBox)) or self
+            local text = (editBox and editBox:GetText()) or ""
             if data and type(data.onAccept) == "function" then
                 data.onAccept(text)
             end
@@ -81,6 +88,12 @@ if not StaticPopupDialogs[PROMPT_KEY] then
     }
 end
 
+-- Show a prompt dialog with text input field
+-- @param message string Message text to display
+-- @param acceptText string|nil Text for accept button (defaults to OKAY)
+-- @param defaultText string|nil Default text in the input field
+-- @param onAccept function|nil Callback function(text) called if user accepts
+-- @return boolean True if dialog was shown, false otherwise
 function Dialogs:Prompt(message, acceptText, defaultText, onAccept)
     if SF.Debug then
         SF.Debug:Verbose("UI", "Showing prompt dialog: %s", message)

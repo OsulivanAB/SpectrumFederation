@@ -59,7 +59,8 @@ SF.WOW_CLASSES = {
 }
 
 -- Get current player's name and realm
--- @return: playerName (string), realmName (string)
+-- @return string playerName Current player's name
+-- @return string realmName Current player's realm with spaces stripped
 function SF:GetPlayerInfo()
     local name = UnitName("player")
     local realm = GetRealmName()
@@ -69,7 +70,7 @@ function SF:GetPlayerInfo()
 end
 
 -- Get current player's full identifier in "Name-Realm" format
--- @return: string - The player's full identifier (e.g., "Shadowbane-Garona")
+-- @return string Full identifier (e.g., "Shadowbane-Garona")
 function SF:GetPlayerFullIdentifier()
 	if SF.NameUtil and SF.NameUtil.GetSelfId then
 		return SF.NameUtil.GetSelfId()
@@ -80,13 +81,14 @@ function SF:GetPlayerFullIdentifier()
 end
 
 -- Get the current player's class in uppercase (e.g., "WARRIOR")
--- @return: string - The player's class in uppercase
+-- @return string Player class token in uppercase
 function SF:GetPlayerClass()
     local _, class = UnitClass("player")
     return string.upper(class)
 end
 
--- Database Initialization
+-- Initialize the addon databases and loot helper database
+-- @return nil
 function SF:InitializeLootDatabase()
 
     -- Initialize main database table if it doesn't exist
@@ -108,14 +110,14 @@ function SF:InitializeLootDatabase()
 end
 
 -- Get the user's timezone offset from UTC in seconds
--- @return (number) - Offset in seconds (positive = east of UTC, negative = west)
+-- @return number Offset in seconds (positive = east of UTC, negative = west)
 function SF:GetUserTimezoneOffset()
     return time() - GetServerTime()
 end
 
 -- Format UTC timestamp for display in user's local timezone
--- @param utcTimestamp (number) - UTC Unix timestamp from GetServerTime()
--- @return (string) - Formatted timestamp in user's local time (YYYY-MM-DD HH:MM:SS) or error message
+-- @param utcTimestamp number UTC Unix timestamp from GetServerTime()
+-- @return string Formatted timestamp in user's local time or error message
 function SF:FormatTimestampForUser(utcTimestamp)
     -- Validate timestamp
     if type(utcTimestamp) ~= "number" then
@@ -127,8 +129,8 @@ function SF:FormatTimestampForUser(utcTimestamp)
 end
 
 -- Format UTC timestamp for display in server's local timezone
--- @param utcTimestamp (number) - UTC Unix timestamp from GetServerTime()
--- @return (string) - Formatted timestamp in server's local time (YYYY-MM-DD HH:MM:SS) or error message
+-- @param utcTimestamp number UTC Unix timestamp from GetServerTime()
+-- @return string Formatted timestamp in server's local time or error message
 function SF:FormatTimestampForServer(utcTimestamp)
     -- Validate timestamp
     if type(utcTimestamp) ~= "number" then
@@ -140,15 +142,14 @@ function SF:FormatTimestampForServer(utcTimestamp)
     return date("%Y-%m-%d %H:%M:%S", utcTimestamp + serverOffset)
 end
 
--- Function Return a current epoch time in seconds.
--- @param none
--- @return number epochSeconds
+-- Return current epoch time in seconds
+-- @return number Current epoch seconds
 function SF:Now()
     return (GetServerTime and GetServerTime()) or time()
 end
 
 -- Get the addon's current version from metadata
--- @return string version Addon version or "Unknown" if not found
+-- @return string Addon version or "Unknown" if not found
 function SF:GetAddonVersion()
     if C_AddOns and C_AddOns.GetAddOnMetadata then
         return C_AddOns.GetAddOnMetadata(addonName, "Version") or "Unknown"

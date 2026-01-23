@@ -8,6 +8,9 @@ local Page = {
 }
 
 function Page:Build(panel)
+    -- Build the main settings page UI
+    -- @param panel Frame Settings panel frame
+    -- @return nil
     if SF.Debug then
         SF.Debug:Verbose("UI", "Building Main settings page")
     end
@@ -108,6 +111,9 @@ function Page:Build(panel)
 end
 
 function Page:Refresh(panel)
+    -- Refresh the main settings page
+    -- @param panel Frame Settings panel frame
+    -- @return nil
     SF.SettingsUI.DefinitionRenderer:Refresh(panel)
 end
 

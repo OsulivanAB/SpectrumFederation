@@ -36,6 +36,18 @@ local ARMOR_SLOTS = {
     TRINKET2 = "Trinket2"
 }
 
+-- Local helper function to convert RGB (0-1 range) to hex color code
+local function RGBToHex(r, g, b)
+	r = math.max(0, math.min(1, tonumber(r) or 1))
+	g = math.max(0, math.min(1, tonumber(g) or 1))
+	b = math.max(0, math.min(1, tonumber(b) or 1))
+	return ("|cff%02x%02x%02x"):format(
+		math.floor(r * 255 + 0.5),
+		math.floor(g * 255 + 0.5),
+		math.floor(b * 255 + 0.5)
+	)
+end
+
 -- Member class definition
 local Member = {}
 Member.__index = Member
@@ -56,6 +68,12 @@ function Member.new(identifier, role, class)
     
     -- Set default properties
     instance.identifier = identifier or ""
+
+    local n, r = instance.identifier:match("^(.-)%-(.-)$")
+    instance.member_name = n or instance.identifier
+    instance.name = instance.member_name
+    instance.member_realm = r or ""
+    instance.className = instance.class
     
     -- Validate and set role (default to "member")
     if role and (role == MEMBER_ROLES.ADMIN or role == MEMBER_ROLES.MEMBER) then
@@ -187,6 +205,12 @@ function Member:GetClass()
     return self.class
 end
 
+-- Wrapper for GetClass (lowercase alias for convenience)
+-- @return string|nil - Class name (e.g., "WARRIOR") or nil if not set
+function Member:getClass()
+	return self:GetClass()
+end
+
 -- Get the color code for this member's class
 -- @return table|nil - Color table with r, g, b fields (0-1 range) or nil if class not set
 function Member:GetClassColor()
@@ -198,6 +222,16 @@ function Member:GetClassColor()
         return classData.colorCode
     end
     return nil
+end
+
+-- Get the hex color code string for this member's class (WoW color format)
+-- @return string - Hex color code in WoW format (e.g., "|cffC79C6E") or white if class not set
+function Member:GetClassColorCode()
+	local c = self:GetClassColor()
+	if type(c) == "table" then
+		return RGBToHex(c.r, c.g, c.b)
+	end
+	return "|cffffffff"
 end
 
 -- Get the texture file path for this member's class icon

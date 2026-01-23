@@ -20,6 +20,17 @@ function SF:InitializeLootHelperDatabase()
 
     SF.lootHelperDB = SpectrumFederationDB.lootHelper
 
+    -- Restore metatables for profiles/members/logs after SavedVariables load
+    if SF.RehydrateLootHelperDB then
+        SF:RehydrateLootHelperDB()
+    end
+
+    -- Maintain legacy pointer
+    SF.lootHelperDB.activeProfile = nil
+    if SF.lootHelperDB.activeProfileId then
+        SF:SetActiveProfileById(SF.lootHelperDB.activeProfileId)
+    end
+
     -- Initialize Loot Helper Communications
     if SF.LootHelperComm then
         SF.LootHelperComm:Init()
@@ -89,21 +100,91 @@ function SF:MigrateLootHelperSchema()
     -- Replace old profiles table with new map
     db.profiles = newProfiles
     
-    -- Migrate activeProfile (pointer) to activeProfileId
+    -- Migrate activeProfile (pointer) to activeProfileId, then restore pointer
     if db.activeProfile and type(db.activeProfile) == "table" and db.activeProfile.GetProfileId then
         local profileId = db.activeProfile:GetProfileId()
         if profileId then
             db.activeProfileId = profileId
+            -- Keep pointer for backward compatibility with existing code
+            db.activeProfile = newProfiles[profileId]
             if SF.Debug then
                 SF.Debug:Info("DATABASE", "Migrated active profile: %s -> %s", 
                     db.activeProfile:GetProfileName() or "Unknown", profileId)
             end
         end
-        db.activeProfile = nil  -- Clear legacy field
+    elseif db.activeProfileId and newProfiles[db.activeProfileId] then
+        -- Restore pointer if activeProfileId exists but pointer was nil
+        db.activeProfile = newProfiles[db.activeProfileId]
+    else
+        -- Clear if neither field is valid
+        db.activeProfile = nil
+        db.activeProfileId = nil
     end
     
     if SF.Debug then SF.Debug:Info("DATABASE", "Schema migration complete: %d profiles", 
         SF:TableSize(newProfiles)) end
+end
+
+-- Rehydrate LootHelper database by restoring metatables to instances
+-- Called after loading SavedVariables to restore class methods
+-- @return: none
+function SF:RehydrateLootHelperDB()
+	local db = self.lootHelperDB
+	if not db or type(db.profiles) ~= "table" then
+		if SF.Debug then
+			SF.Debug:Verbose("DATABASE", "RehydrateLootHelperDB: No profiles to rehydrate")
+		end
+		return
+	end
+
+	local profileCount = 0
+	local memberCount = 0
+	local logCount = 0
+
+	for id, profile in pairs(db.profiles) do
+		if type(profile) == "table" then
+			profileCount = profileCount + 1
+
+			-- Restore LootProfile methods
+			if self.LootProfile and getmetatable(profile) ~= self.LootProfile then
+				setmetatable(profile, self.LootProfile)
+			end
+
+			-- Restore Member methods
+			if type(profile._members) == "table" and self.Member then
+				for i, m in ipairs(profile._members) do
+					if type(m) == "table" and getmetatable(m) ~= self.Member then
+						setmetatable(m, self.Member)
+						memberCount = memberCount + 1
+					end
+				end
+			end
+
+			-- Restore LootLog methods
+			if type(profile._lootLogs) == "table" and self.LootLog then
+				for i, log in ipairs(profile._lootLogs) do
+					if type(log) == "table" and getmetatable(log) ~= self.LootLog then
+						setmetatable(log, self.LootLog)
+						logCount = logCount + 1
+					end
+				end
+			end
+
+			-- Rebuild indexes/counters if available
+			if profile.RebuildLogIndex then
+				profile:RebuildLogIndex()
+			end
+
+			-- Ensure owner is admin if you added that helper
+			if profile._EnsureOwnerIsAdmin then
+				profile:_EnsureOwnerIsAdmin()
+			end
+		end
+	end
+
+	if SF.Debug then
+		SF.Debug:Info("DATABASE", "Rehydrated %d profiles, %d members, %d logs", profileCount, memberCount, logCount)
+	end
 end
 
 -- Helper: Count entries in a table (works for maps and arrays)
@@ -132,6 +213,7 @@ function SF:SetActiveProfileById(profileId)
         if SF.Debug then
             SF.Debug:Warn("DATABASE", "No loot profile found with ID '%s' to set as active", profileId)
         end
+        SF.lootHelperDB.activeProfile = nil
         return false
     end
 
@@ -147,8 +229,10 @@ function SF:SetActiveProfileById(profileId)
         profile:SetActive(true)
     end
 
-    -- Update pointer in database
+    -- Update BOTH canonical ID and legacy pointer
+    -- TODO: We should probably update code to only use one or the other
     SF.lootHelperDB.activeProfileId = profileId
+    SF.lootHelperDB.activeProfile = profile
 
     if SF.Debug then
         SF.Debug:Info("DATABASE", "Set loot profile '%s' (ID: %s) as active", 
@@ -158,13 +242,29 @@ function SF:SetActiveProfileById(profileId)
     return true
 end
 
+-- Clear the active loot profile (used when deleting active profile)
+-- @return nil
+function SF:ClearActiveProfile()
+    -- Deactivate all profiles
+    for _, prof in pairs(SF.lootHelperDB.profiles) do
+        if prof.SetActive then
+            prof:SetActive(false)
+        end
+    end
+    
+    -- Clear both fields
+    SF.lootHelperDB.activeProfileId = nil
+    SF.lootHelperDB.activeProfile = nil
+    
+    if SF.Debug then
+        SF.Debug:Info("DATABASE", "Cleared active profile")
+    end
+end
+
 -- Get the active loot profile
 -- @return (LootProfile|nil) - Active profile instance or nil
 function SF:GetActiveProfile()
-    local profileId = SF.lootHelperDB.activeProfileId
-    if not profileId then return nil end
-    
-    return SF.lootHelperDB.profiles[profileId]
+    return SF.lootHelperDB and SF.lootHelperDB.activeProfile or nil
 end
 
 -- Legacy function to set the active loot profile by name
@@ -227,4 +327,218 @@ function SF:AddLootProfileToDatabase(lootProfile)
     local success = self:SetActiveProfileById(profileId)
 
     return success
+end
+
+-- Get profile options for dropdown/UI selection
+-- @return (table) - Array of { value = profileId, label = profileName }
+function SF:GetLootHelperProfileOptions()
+	local out = {}
+	local db = self.lootHelperDB
+	if not db or type(db.profiles) ~= "table" then return out end
+
+	for id, profile in pairs(db.profiles) do
+		local name = id
+		if type(profile) == "table" then
+			if profile.GetProfileName then
+				name = profile:GetProfileName()
+			elseif profile._profileName then
+				name = profile._profileName
+			end
+		end
+		table.insert(out, { value = id, label = tostring(name) })
+	end
+
+	table.sort(out, function(a, b)
+		return tostring(a.label) < tostring(b.label)
+	end)
+
+	return out
+end
+
+-- Create a new loot helper profile
+-- @param profileName (string) - Name for the new profile
+-- @return (boolean, string|nil) - Success status and optional error message
+function SF:CreateLootHelperProfile(profileName)
+	profileName = tostring(profileName or ""):match("^%s*(.-)%s*$")
+	if profileName == "" then return false, "Profile name cannot be empty." end
+	if profileName:find("%.") then return false, "Profile name cannot contain '.'." end
+
+	-- Enforce unique name (per your requirement)
+	for _, prof in pairs(self.lootHelperDB.profiles or {}) do
+		local n = (prof and prof.GetProfileName and prof:GetProfileName()) or (prof and prof._profileName)
+		if n == profileName then
+			if SF.Debug then
+				SF.Debug:Warn("DATABASE", "Cannot create profile - name already exists: %s", profileName)
+			end
+			return false, "A profile with that name already exists."
+		end
+	end
+
+	if not self.LootProfile or not self.LootProfile.new then
+		if SF.Debug then
+			SF.Debug:Error("DATABASE", "LootProfile class not loaded")
+		end
+		return false, "LootProfile class not loaded."
+	end
+
+	local p = self.LootProfile.new(profileName)
+	if not p then
+		if SF.Debug then
+			SF.Debug:Error("DATABASE", "Failed to create profile instance for: %s", profileName)
+		end
+		return false, "Failed to create profile."
+	end
+
+	local ok = self:AddLootProfileToDatabase(p)
+	if not ok then
+		if SF.Debug then
+			SF.Debug:Error("DATABASE", "Failed to add profile to database: %s", profileName)
+		end
+		return false, "Failed to add profile to database."
+	end
+
+	if SF.Debug then
+		SF.Debug:Info("DATABASE", "Created new profile: %s (ID: %s)", profileName, p:GetProfileId())
+	end
+
+	return true
+end
+
+-- Delete a loot helper profile by ID
+-- @param profileId (string) - Profile ID to delete
+-- @return (boolean, string|nil) - Success status and optional error message
+function SF:DeleteLootHelperProfile(profileId)
+	if type(profileId) ~= "string" or profileId == "" then
+		if SF.Debug then
+			SF.Debug:Warn("DATABASE", "Cannot delete profile - invalid profileId: %s", tostring(profileId))
+		end
+		return false, "Invalid profile id."
+	end
+
+	local db = self.lootHelperDB
+	if not db or not db.profiles or not db.profiles[profileId] then
+		if SF.Debug then
+			SF.Debug:Warn("DATABASE", "Cannot delete profile - not found: %s", profileId)
+		end
+		return false, "Profile not found."
+	end
+
+	local profileName = db.profiles[profileId]:GetProfileName()
+	db.profiles[profileId] = nil
+
+	if SF.Debug then
+		SF.Debug:Info("DATABASE", "Deleted profile: %s (ID: %s)", profileName or "Unknown", profileId)
+	end
+
+	-- If we deleted the active profile, pick a new one or nil
+	if db.activeProfileId == profileId then
+		db.activeProfileId = nil
+		db.activeProfile = nil
+
+		-- Pick first sorted option (nice UX, minimal logic)
+		local opts = self:GetLootHelperProfileOptions()
+		if #opts > 0 then
+			self:SetActiveProfileById(opts[1].value)
+			if SF.Debug then
+				SF.Debug:Info("DATABASE", "Auto-selected new active profile: %s", opts[1].label)
+			end
+		else
+			if SF.Debug then
+				SF.Debug:Info("DATABASE", "No profiles remaining after deletion")
+			end
+		end
+	end
+
+	return true
+end
+
+-- Rename the active loot helper profile
+-- @param newName (string) - New name for the profile
+-- @return (boolean, string|nil) - Success status and optional error message
+function SF:RenameActiveLootHelperProfile(newName)
+	local p = self:GetActiveProfile()
+	if not p then
+		if SF.Debug then
+			SF.Debug:Warn("DATABASE", "Cannot rename - no active profile")
+		end
+		return false, "No active profile."
+	end
+
+	local oldName = p:GetProfileName()
+	newName = tostring(newName or ""):match("^%s*(.-)%s*$")
+	if newName == "" then return false, "Profile name cannot be empty." end
+	if newName:find("%.") then return false, "Profile name cannot contain '.'." end
+
+	-- Unique name enforcement
+	for _, prof in pairs(self.lootHelperDB.profiles or {}) do
+		if prof ~= p then
+			local n = (prof and prof.GetProfileName and prof:GetProfileName()) or (prof and prof._profileName)
+			if n == newName then
+				if SF.Debug then
+					SF.Debug:Warn("DATABASE", "Cannot rename - name already exists: %s", newName)
+				end
+				return false, "A profile with that name already exists."
+			end
+		end
+	end
+
+	if p.SetProfileName then
+		p:SetProfileName(newName)
+		if SF.Debug then
+			SF.Debug:Info("DATABASE", "Renamed profile: %s -> %s (ID: %s)", oldName, newName, p:GetProfileId())
+		end
+		return true
+	end
+
+	if SF.Debug then
+		SF.Debug:Error("DATABASE", "Cannot rename - profile missing SetProfileName method")
+	end
+	return false, "Active profile cannot be renamed (missing SetProfileName)."
+end
+
+-- Add an admin to the active loot helper profile
+-- @param memberId (string) - Member ID to add as admin
+-- @return (boolean, string|nil) - Success status and optional error message
+function SF:AddAdminToActiveLootHelperProfile(memberId)
+	local p = self:GetActiveProfile()
+	if not p then return false, "No active profile." end
+	if not p.AddAdminMemberId then return false, "Profile missing AddAdminMemberId." end
+	return p:AddAdminMemberId(memberId)
+end
+
+-- Remove an admin from the active loot helper profile
+-- @param memberId (string) - Member ID to remove from admins
+-- @return (boolean, string|nil) - Success status and optional error message
+function SF:RemoveAdminFromActiveLootHelperProfile(memberId)
+	local p = self:GetActiveProfile()
+	if not p then return false, "No active profile." end
+	if not p.RemoveAdminMemberId then return false, "Profile missing RemoveAdminMemberId." end
+	return p:RemoveAdminMemberId(memberId)
+end
+
+-- Reset all loot helper settings (dangerous operation)
+-- @return (boolean, string|nil) - Success status and optional error message
+function SF:ResetAllLootHelperSettings()
+	local db = self.lootHelperDB
+	if not db then
+		if SF.Debug then
+			SF.Debug:Error("DATABASE", "Cannot reset - LootHelper DB not initialized")
+		end
+		return false, "LootHelper DB not initialized."
+	end
+
+	local profileCount = 0
+	for _ in pairs(db.profiles or {}) do
+		profileCount = profileCount + 1
+	end
+
+	db.profiles = {}
+	db.activeProfileId = nil
+	db.activeProfile = nil
+
+	if SF.Debug then
+		SF.Debug:Info("DATABASE", "Reset all loot helper settings - cleared %d profiles", profileCount)
+	end
+
+	return true
 end
