@@ -36,20 +36,34 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 - `modules/NameUtil.lua` - Canonical name-realm normalization utilities
 - `modules/MessageHelpers.lua` - Color-coded user messaging (PrintSuccess/Error/Warning/Info)
 - `modules/SlashCommands.lua` - Slash command registration and profile management commands
-- `modules/Settings.lua` - Main settings panel with banner
+- `modules/Init.lua` - Module initialization and orchestration
 - `Libs/` - Third-party libraries (LibStub, AceComm, CallbackHandler, ChatThrottleLib)
-- `modules/LootHelper/SyncProtocol.lua` - Protocol versioning and payload encoding/decoding
-- `modules/LootHelper/Comm.lua` - Communication layer with AceComm integration
-- `modules/LootHelper/Members.lua` - Member class (OOP pattern for loot profile members)
-- `modules/LootHelper/LootLogValidators.lua` - Validation functions for loot logs
-- `modules/LootHelper/LootLogs.lua` - LootLog class (immutable event logging with counters)
-- `modules/LootHelper/Profiles.lua` - Profile CRUD with stable IDs and export/import
-- `modules/LootHelper/LootHelper.lua` - Core loot helper functionality with schema migration
+- `modules/Settings/` - Settings system with schema, store, and apply logic
+  - `Schema.lua` - Settings schema definitions
+  - `Store.lua` - Settings storage and retrieval
+  - `Apply.lua` - Apply settings changes
+- `modules/UI/Settings/` - Settings UI framework
+  - `Style.lua` - UI styling and theming
+  - `Registry.lua` - Settings page registration
+  - `PageBuilder.lua` - Page construction logic
+  - `DefinitionRenderer.lua` - Render settings from definitions
+  - `Dialogs.lua` - Dialog boxes and modals
+  - `Widgets/Section.lua` - Reusable UI section widget
+  - `Control/Controls.lua` - UI control widgets
+  - `Pages/Main.lua` - Main settings page
+  - `Pages/LootHelper.lua` - Loot Helper settings page
+- `modules/LootHelper/` - Loot helper data model and logic
+  - `SyncProtocol.lua` - Protocol versioning and payload encoding/decoding
+  - `Comm.lua` - Communication layer with AceComm integration
+  - `Members.lua` - Member class (OOP pattern for loot profile members)
+  - `LootLogValidators.lua` - Validation functions for loot logs
+  - `LootLogs.lua` - LootLog class (immutable event logging with counters)
+  - `Profiles.lua` - Profile CRUD with stable IDs and export/import
+  - `LootHelper.lua` - Core loot helper functionality with schema migration
 - `modules/LootHelperSync/` - 18 numbered modules for profile synchronization system
-  - 00_Namespace.lua through 18_PublicAPI.lua (sequentially loaded)
+  - `00_Namespace.lua` through `18_PublicAPI.lua` (sequentially loaded)
   - Handles session management, peer discovery, request queueing, safe mode
   - Admin convergence, handshake, heartbeat, live updates, bulk transfers
-- `modules/Settings.lua` - Main settings panel with banner
 
 ## Critical Branch & Version Rules
 
@@ -141,8 +155,6 @@ SpectrumFederation.lua                  # Event registration, initialization
 
 ## Helper Functions
 
-## Helper Functions
-
 **MessageHelpers (`modules/MessageHelpers.lua`):**
 - `SF:PrintSuccess(message)` - Green success messages
 - `SF:PrintError(message)` - Red error messages
@@ -179,6 +191,7 @@ SF.NameUtil  -- Name normalization (NameUtil.lua)
 SF.Member           -- Member class
 SF.MemberRoles      -- Role constants (ADMIN, MEMBER)
 SF.ArmorSlots       -- Armor slot constants (HEAD, SHOULDER, etc.)
+SF.WOW_CLASSES      -- WoW class validation constants (WARRIOR, PALADIN, etc.)
 
 -- LootLog class (LootLogs.lua)
 SF.LootLog                    -- LootLog class (immutable event logs)
@@ -299,14 +312,17 @@ local Member = {}
 Member.__index = Member
 
 -- Constructor: use DOT notation (factory function)
+-- DOT notation (.) is for static methods and constructors - no implicit self parameter
 function Member.new(identifier, role, class)
     local instance = setmetatable({}, Member)
     -- Initialize properties
     instance.identifier = identifier or ""
+    instance.class = class  -- Must match SF.WOW_CLASSES keys
     return instance
 end
 
 -- Instance methods: use COLON notation (auto-passes self)
+-- COLON notation (:) automatically passes 'self' as first parameter
 function Member:GetFullIdentifier()
     return self.identifier
 end
@@ -323,14 +339,20 @@ SF.ArmorSlots = ARMOR_SLOTS
 
 **Member Class Usage:**
 ```lua
--- Creating instances
-local member = SF.Member.new("Shadowbane-Garona")
+-- Creating instances (use DOT notation - calls static factory)
+local member = SF.Member.new("Shadowbane-Garona", SF.MemberRoles.MEMBER, "WARRIOR")
 
--- Calling instance methods
+-- Calling instance methods (use COLON notation - auto-passes self)
 member:IncrementPoints()
 local points = member:GetPointBalance()
 local isAdmin = member:IsAdmin()
 member:ToggleEquipment(SF.ArmorSlots.HEAD)
+
+-- CRITICAL: DOT vs COLON notation
+-- ❌ WRONG: SF.Member:new()  -- Can't use colon on class table itself
+-- ✅ RIGHT: SF.Member.new()  -- Use dot for constructor
+-- ❌ WRONG: member.IncrementPoints(member)  -- Verbose, error-prone
+-- ✅ RIGHT: member:IncrementPoints()  -- Colon auto-passes self
 ```
 
 **LootLog Class Pattern (LootLogs.lua):**
@@ -521,19 +543,23 @@ end
 ## CI/CD Workflows
 
 **Active Workflows:**
-1. **`linter.yml`** - Continuous linting (Lua, YAML, Python) using `.github/scripts/lint_all.py`
+1. **`linter.yml`** - Runs on every commit to any branch:
+   - Continuous linting (Lua, YAML, Python) using `.github/scripts/lint_all.py`
+   - Validates code style and syntax before any PR validation
+   - Fast feedback loop for development
 2. **`pr-beta-validation.yml`** - PR validation for beta branch:
    - Lint checks
    - Package validation (`.github/scripts/validate_packaging.py`)
    - Version bump check (`.github/scripts/check_version_bump.py`)
    - Duplicate release check (`.github/scripts/check_duplicate_release.py`)
-3. **`post-merge-beta.yml`** - Automated beta releases after merge:
+3. **`pr-main-validation.yml`** - PR validation for main branch (similar to beta validation)
+4. **`post-merge-beta.yml`** - Automated beta releases after merge:
    - Sanity checks
    - Blizzard API query for beta Interface version
    - Changelog update (`.github/scripts/update_changelog.py`)
    - README badge update
    - Beta release creation (`.github/scripts/publish_release.py`)
-4. **`promote-beta-to-main.yml`** - Manual promotion workflow (admin only):
+5. **`promote-beta-to-main.yml`** - Manual promotion workflow (admin only):
    - Merges beta → main with special CHANGELOG/README handling
    - Removes `-beta` suffix from version
    - Updates Interface version using Blizzard live API
@@ -542,7 +568,7 @@ end
    - Creates stable release
    - Fast-forwards beta to main
    - Supports dry-run mode
-5. **`rollback-release.yml`** - Emergency rollback for failed promotions (admin only)
+6. **`rollback-release.yml`** - Emergency rollback for failed promotions (admin only)
 
 **Python Helper Scripts (`.github/scripts/`):**
 - All CI automation uses Python 3.11 scripts instead of bash
@@ -572,6 +598,14 @@ end
 - Ubuntu with Lua 5.1, luacheck, luarocks pre-installed
 - Auto-generates `BlizzardUI/` (live + beta sources) for API reference
 - VS Code extensions: Lua Language Server, WoW API autocomplete, GitHub Copilot
+
+**BlizzardUI Reference Files:**
+- `BlizzardUI/live/` and `BlizzardUI/beta/` - Git-ignored, generated by dev container
+- Contains extracted WoW UI source code for API reference (read-only, DO NOT import)
+- Generated on container startup via `.devcontainer/setup-blizzard-ui.sh`
+- Use for understanding WoW API patterns, frame structures, and Blizzard's implementation
+- Example lookup: `BlizzardUI/live/Interface/FrameXML/UIParent.lua` for frame hierarchy
+- **NEVER** create runtime dependencies on these files - they're for reference only
 
 **Local Testing:**
 1. Symlink `SpectrumFederation/` to WoW's `Interface/AddOns/`
@@ -684,12 +718,30 @@ SpectrumFederation/
 ├── SpectrumFederation.lua    # Entry point, events
 ├── SpectrumFederation.toc    # MUST bump version
 ├── modules/
-│   ├── Debug.lua             # Logging system
-│   ├── Core.lua              # Core functionality
+│   ├── debug.lua             # Logging system
+│   ├── core.lua              # Core functionality
 │   ├── NameUtil.lua          # Name normalization
 │   ├── MessageHelpers.lua    # User messaging
 │   ├── SlashCommands.lua     # Slash commands
-│   ├── Settings.lua          # Main settings panel
+│   ├── Init.lua              # Module initialization
+│   ├── Settings/             # Settings system
+│   │   ├── Schema.lua        # Settings schema
+│   │   ├── Store.lua         # Settings storage
+│   │   └── Apply.lua         # Apply settings
+│   ├── UI/
+│   │   └── Settings/         # Settings UI framework
+│   │       ├── Style.lua     # UI styling
+│   │       ├── Registry.lua  # Page registration
+│   │       ├── PageBuilder.lua       # Page construction
+│   │       ├── DefinitionRenderer.lua # Render from definitions
+│   │       ├── Dialogs.lua   # Dialog boxes
+│   │       ├── Widgets/
+│   │       │   └── Section.lua  # UI section widget
+│   │       ├── Control/
+│   │       │   └── Controls.lua # UI controls
+│   │       └── Pages/
+│   │           ├── Main.lua  # Main settings page
+│   │           └── LootHelper.lua # Loot Helper page
 │   ├── LootHelper/
 │   │   ├── SyncProtocol.lua  # Protocol versioning
 │   │   ├── Comm.lua          # AceComm layer
@@ -699,8 +751,7 @@ SpectrumFederation/
 │   │   ├── Profiles.lua      # Profile CRUD
 │   │   └── LootHelper.lua    # Core logic + migration
 │   └── LootHelperSync/
-│       ├── 00_Namespace.lua through 18_PublicAPI.lua
-│       └── # Session sync system (18 files)
+│       └── 00_Namespace.lua through 18_PublicAPI.lua  # 18 files
 ├── Libs/
 │   ├── LibStub/              # Library loader
 │   ├── CallbackHandler/      # Event callbacks
