@@ -280,7 +280,7 @@ end
 
 -- Function to get the profile's owner ("Name-Realm")
 -- @return string owner
-function LootProfile:GetOwner()
+function LootProfile:GetOwnerId()
     return self._owner
 end
 
@@ -648,6 +648,69 @@ function LootProfile:MergeLogTables(logTables, opts)
     end
 
     return inserted
+end
+
+-- Function Normalize a profileId using NameUtil (if available)
+-- @param string id ProfileId to normalize
+-- @return string normalizedId
+function LootProfile:_NormalizeId(id)
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        return SF.NameUtil.NormalizeNameRealm(id) or id
+    end
+    return id
+end
+
+-- Function Compare two profileIds for equality using NameUtil (if available)
+-- @param string a ProfileId A
+-- @param string b ProfileId B
+-- @return boolean equal
+function LootProfile:_SamePlayer(a, b)
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+    return a == b
+end
+
+-- Function Ensure memberById index is built
+-- @param none
+-- @return nil
+function LootProfile:_EnsureMemberIndex()
+    if self._memberById then return end
+    self._memberById = {}
+
+    for _, m in ipairs(self._members or {}) do
+        local id = (m.GetFullIdentifier and m:GetFullIdentifier() or m.identifier)
+        if type(id) == "string" and id ~= "" then
+            self._memberById[id] = m
+        end
+    end
+end
+
+-- Function Get list of admin member IDs
+-- @return table adminMemberIds List of "Name-Realm" strings
+function LootProfile:getAdminMemberIds()
+    return CopyArray(self._adminUsers or {})
+end
+
+-- Function Get member by their ID
+-- @param string id "Name-Realm" of member
+-- @return LootProfileMember|nil member Instance or nil if not found
+function LootProfile:getMemberByID(id)
+    self:_EnsureMemberIndex()
+    id = self:_NormalizeId(id)
+    return self._memberId and self._memberById[id] or nil
+end
+
+-- Function Get list of all member IDs
+-- @return table memberIds List of "Name-Realm" strings
+function LootProfile:getMemberIds()
+    self:_EnsureMemberIndex()
+    local ids = {}
+    for id, _ in pairs(self._memberById or {}) do
+        table.insert(ids, id)
+    end
+    table.sort(ids)
+    return ids
 end
 
 -- ========================================================================
