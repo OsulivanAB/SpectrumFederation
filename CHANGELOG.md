@@ -12,6 +12,24 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.3.1-beta.21] - 2026-01-23
+
+### Added
+- Introduced functionality to create, delete, rename, and manage loot profiles directly from the UI.
+- Added support for rehydrating saved loot profile data, ensuring proper restoration of methods and metadata after reloads.
+- Implemented new dropdown options for selecting active loot profiles in the UI.
+- Added the ability to reset all Loot Helper settings and profiles.
+
+### Changed
+- Improved handling of active loot profiles by maintaining both legacy pointers and new profile ID references for compatibility.
+- Enhanced validation for member existence within active loot profiles.
+- Updated the `GetActiveProfile` function to return the active profile object directly.
+
+### Fixed
+- Resolved issues with active profile pointers not being restored correctly after schema migrations or reloads.
+- Fixed bugs related to member and loot log validation within profiles.
+
 ## [0.3.1-beta.1] - 2026-01-23
 
 ### Added
