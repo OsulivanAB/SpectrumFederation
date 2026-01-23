@@ -12,6 +12,10 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.SettingsStore:Init()
     end
 
+    if SF.SettingsApply and SF.SettingsApply.Init then
+        SF.SettingsApply:Init()
+    end
+
     if SF.SettingsUI and SF.SettingsUI.Init then
         SF.SettingsUI:Init()
     end

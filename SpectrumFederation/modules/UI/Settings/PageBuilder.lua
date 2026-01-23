@@ -1,5 +1,5 @@
--- Grab the namespace
-local addonName, SF = ...
+-- modules/UI/Settings/PageBuilder.lua
+local _, SF = ...
 
 SF.SettingsUI = SF.SettingsUI or {}
 local UI = SF.SettingsUI
@@ -8,88 +8,99 @@ local PageBuilder = {}
 PageBuilder.__index = PageBuilder
 UI.PageBuilder = PageBuilder
 
--- Layout constants
-local PAGE_PADDING_TOP       = 12
-local PAGE_PADDING_BOTTOM    = 16
-local PAGE_PADDING_X         = 16
-local SECTION_SPACING        = 18
+local Style = UI.Style or {}
+local P = Style.Page or {}
+
+local PAGE_PADDING_TOP     = P.paddingTop or 12
+local PAGE_PADDING_BOTTOM  = P.paddingBottom or 16
+local PAGE_PADDING_X       = P.paddingX or 16
+local SECTION_SPACING      = P.sectionSpacing or 18
 
 function UI:CreatePage(panel)
-    local obj = setmetatable({}, PageBuilder)
-    obj:Init(panel)
-    return obj
+	local obj = setmetatable({}, PageBuilder)
+	obj:Init(panel)
+	return obj
 end
 
 function PageBuilder:Init(panel)
-    self.panel = panel
-    self.sections = {}
+	self.panel = panel
+	self.sections = {}
+	self.refreshCallbacks = {}
 
-    -- Scroll frame
-    local scroll = CreateFrame("ScrollFrame", nil, panel, "UIPanelScrollFrameTemplate")
-    self.scrollFrame = scroll
+	local scroll = CreateFrame("ScrollFrame", nil, panel, "UIPanelScrollFrameTemplate")
+	self.scrollFrame = scroll
+	scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
+	scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", 0, 0)
 
-    -- Fill the panel; leave room for the template scroll bar
-    scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
-    scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", 0, 0)
+	local content = CreateFrame("Frame", nil, scroll)
+	self.content = content
+	content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+	content:SetHeight(1)
+	scroll:SetScrollChild(content)
 
-    -- Scroll child (content root)
-    local content = CreateFrame("Frame", nil, scroll)
-    self.content = content
-    content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
-    content:SetHeight(1)
-    scroll:SetScrollChild(content)
+	local function UpdateContentWidth()
+		local w = scroll:GetWidth() or 0
+		local sb = scroll.ScrollBar
+		local sbw = (sb and sb:GetWidth()) or 20
+		local usable = math.max(1, w - sbw - 4)
+		content:SetWidth(usable)
+	end
 
-    -- Keep content width synced to scroll frame width, minus scrollbar width
-    local function UpdateContentWidth()
-        local w = scroll:GetWidth() or 0
-        local sb = scroll.ScrollBar
-        local sbw = (sb and sb:GetWidth()) or 20
-        local usable = math.max(1, w - sbw - 4)
-        content:SetWidth(usable)
-    end
+	scroll:HookScript("OnSizeChanged", function()
+		UpdateContentWidth()
+		self:Reflow()
+	end)
 
-    scroll:HookScript("OnSizeChanged", function()
-        UpdateContentWidth()
-        self:Reflow()
-    end)
+	UpdateContentWidth()
+end
 
-    UpdateContentWidth()
+function PageBuilder:RegisterRefresh(fn)
+	table.insert(self.refreshCallbacks, fn)
+end
+
+function PageBuilder:Refresh()
+	for _, fn in ipairs(self.refreshCallbacks) do
+		pcall(fn)
+	end
 end
 
 function PageBuilder:AddSection(title)
-    local section = UI.Section:Create(self.content, title)
-
-    -- Anchor width padding and stack below previous sections
-    if #self.sections == 0 then
-        section:SetPoint("TOPLEFT", self.content, "TOPLEFT", PAGE_PADDING_X, -PAGE_PADDING_TOP)
-        section:SetPoint("TOPRIGHT", self.content, "TOPRIGHT", -PAGE_PADDING_X, -PAGE_PADDING_TOP)
-    else
-        local prev = self.sections[#self.sections]
-        section:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -SECTION_SPACING)
-        section:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -SECTION_SPACING)
-    end
-
-    table.insert(self.sections, section)
-    return section
+	local section = UI.Section:Create(self.content, title)
+	section.__sfPageBuilder = self
+	table.insert(self.sections, section)
+	return section
 end
 
 function PageBuilder:Finalize()
-    self:Reflow()
+	self:Reflow()
 end
 
--- Computes content height so the scroll frame knows how far it can scroll
 function PageBuilder:Reflow()
-    local total = PAGE_PADDING_TOP + PAGE_PADDING_BOTTOM
+	local prevShown
+	local total = PAGE_PADDING_TOP + PAGE_PADDING_BOTTOM
 
-    for i, sec in ipairs(self.sections) do
-        total = total + (sec:GetHeight() or 0)
-        if i < #self.sections then
-            total = total + SECTION_SPACING
-        end
-    end
+	for _, sec in ipairs(self.sections) do
+		sec:ClearAllPoints()
 
-    local viewH = self.scrollFrame:GetHeight() or 0
-    total = math.max(total, viewH + 1)
+		if sec:IsShown() then
+			if not prevShown then
+				sec:SetPoint("TOPLEFT", self.content, "TOPLEFT", PAGE_PADDING_X, -PAGE_PADDING_TOP)
+				sec:SetPoint("TOPRIGHT", self.content, "TOPRIGHT", -PAGE_PADDING_X, -PAGE_PADDING_TOP)
+			else
+				sec:SetPoint("TOPLEFT", prevShown, "BOTTOMLEFT", 0, -SECTION_SPACING)
+				sec:SetPoint("TOPRIGHT", prevShown, "BOTTOMRIGHT", 0, -SECTION_SPACING)
+				total = total + SECTION_SPACING
+			end
 
-    self.content:SetHeight(total)
+			total = total + (sec:GetHeight() or 0)
+			prevShown = sec
+		end
+	end
+
+	local viewH = self.scrollFrame:GetHeight() or 0
+	total = math.max(total, viewH - 1)
+
+	self.content:SetHeight(total)
 end
+
+

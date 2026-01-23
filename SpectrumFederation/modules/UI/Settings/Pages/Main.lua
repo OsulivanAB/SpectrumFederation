@@ -7,35 +7,98 @@ local Page = {
     order = 10,
 }
 
-local function AddFakeSettingRow(section, labelText, controlHint)
-    section:AddRow(24, function(row)
-        local label = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-        label:SetPoint("LEFT", row, "LEFT", 0, 0)
-        label:SetText(labelText)
-
-        local hint = row:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-        hint:SetPoint("RIGHT", row, "RIGHT", 0, 0)
-        hint:SetText(controlHint or "<control>")
-    end)
-end
-
 function Page:Build(panel)
-    local ui = SF.SettingsUI
-    local page = ui:CreatePage(panel)
-    panel.__sfPageBuilder = page
+    local schema = SF.SettingsSchema
+    local renderer = SF.SettingsUI.DefinitionRenderer
 
-    local appearance = page:AddSection("Appearance")
-    appearance:AddText("These are placeholders. Next lesson we'll replace them with real controls bound to the DB.")
-    AddFakeSettingRow(appearance, "Window Style", "(dropdown)")
-    AddFakeSettingRow(appearance, "Font Style", "(dropdown)")
-    AddFakeSettingRow(appearance, "Font Size", "(slider)")
+    local def = {
+        sections = {
+            {
+                id = "appearance",
+                title = "Appearance",
+                items = {
+                    {
+                    type = "dropdown",
+                    label = "Window Style",
+                    tooltip = "Controls the overall look of Spectrum Federation windows.",
+                    path = "global.windowStyle",
+                    options = schema.ENUMS.windowStyle,
+                    defaultText = "Select style",
+                    },
+                    {
+                        type = "help",
+                        text = "Tip: Choose a style that matches the amount of information you want on screen.",
+                        indent = "label",
+                    },                    
+                    {
+                        type = "dropdown",
+                        label = "Font Style",
+                        tooltip = "Font used in Spectrum Federation UI.",
+                        path = "global.fontStyle",
+                        options = schema.ENUMS.fontStyle,
+                        defaultText = "Select font",
+                    },
+                    {
+                        type = "help",
+                        text = "This will affect text across Spectrum Federation windows.",
+                        indent = "label",
+                    },
+                    {
+                        type = "slider",
+                        label = "Font Size",
+                        tooltip = "Size of UI text.",
+                        path = "global.fontSize",
+                        min = 8, max = 24, step = 1,
+                    },
+                },
 
-    page:Finalize()
+                reset = {
+                    label = "Reset Appearance",
+                    buttonText = "Reset",
+                    confirmText = "Reset Appearance settings to defaults?",
+                    paths = {
+                        "global.windowStyle",
+                        "global.fontStyle",
+                        "global.fontSize",},
+                    successMessage = "Appearance settings reset to defaults.",
+                },
+            },
+
+            {
+                id = "actions",
+                title = "Actions",
+                items = {
+                    {
+                        type = "button",
+                        label = "Reset All Settings",
+                        buttonText = "Reset All",
+                        width = 140,
+                        tooltip = "Resets all Spectrum Federation settings to their default values.",
+
+                        onClick = function(ctx)
+                            ctx.section:ClearMessage()
+                            ctx.ui.Dialogs:Confirm(
+                                "Reset ALL Spectrum Federation settings to defaults?",
+                                "Reset All",
+                                function()
+                                    ctx.store:ResetAll()
+                                    ctx.pageBuilder:Refresh()
+                                    ctx.pageBuilder:Reflow()
+                                    ctx.section:SetMessage("All settings have been reset to defaults.", "success")
+                                end
+                            )
+                        end,
+                    },
+                },
+            },
+        },
+    }
+
+    renderer:Build(panel, def)
 end
 
 function Page:Refresh(panel)
-    local pb = panel.__sfPageBuilder
-    if pb then pb:Reflow() end
+    SF.SettingsUI.DefinitionRenderer:Refresh(panel)
 end
 
 SF.SettingsUI:RegisterPage(Page)
