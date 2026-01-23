@@ -54,6 +54,10 @@ end
 -- Page Definition
 -- ==================================================================
 function Page:Build(panel)
+	if SF.Debug then
+		SF.Debug:Verbose("UI", "Building LootHelper settings page")
+	end
+
 	local renderer = SF.SettingsUI.DefinitionRenderer
 	local dialogs = SF.SettingsUI.Dialogs
 	local store = SF.SettingsStore

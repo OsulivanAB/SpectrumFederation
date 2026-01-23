@@ -29,6 +29,9 @@ if not StaticPopupDialogs[KEY] then
 end
 
 function Dialogs:Confirm(message, acceptText, onAccept)
+    if SF.Debug then
+        SF.Debug:Verbose("UI", "Showing confirmation dialog: %s", message)
+    end
     StaticPopupDialogs[KEY].button1 = acceptText or OKAY
     local popup = StaticPopup_Show(KEY, message, nil, onAccept)
     return popup ~= nil
@@ -79,6 +82,9 @@ if not StaticPopupDialogs[PROMPT_KEY] then
 end
 
 function Dialogs:Prompt(message, acceptText, defaultText, onAccept)
+    if SF.Debug then
+        SF.Debug:Verbose("UI", "Showing prompt dialog: %s", message)
+    end
     StaticPopupDialogs[PROMPT_KEY].button1 = acceptText or OKAY
     return StaticPopup_Show(PROMPT_KEY, message, nil, {
         defaultText = defaultText,

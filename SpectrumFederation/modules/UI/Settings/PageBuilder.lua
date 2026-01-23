@@ -23,6 +23,10 @@ function UI:CreatePage(panel)
 end
 
 function PageBuilder:Init(panel)
+	if SF.Debug then
+		SF.Debug:Verbose("UI", "Creating new settings page")
+	end
+
 	self.panel = panel
 	self.sections = {}
 	self.refreshCallbacks = {}
@@ -65,6 +69,9 @@ function PageBuilder:Refresh()
 end
 
 function PageBuilder:AddSection(title)
+	if SF.Debug then
+		SF.Debug:Verbose("UI", "Adding section '%s' to page", tostring(title))
+	end
 	local section = UI.Section:Create(self.content, title)
 	section.__sfPageBuilder = self
 	table.insert(self.sections, section)

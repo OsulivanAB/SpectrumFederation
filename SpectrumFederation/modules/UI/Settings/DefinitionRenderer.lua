@@ -23,6 +23,10 @@ local function MakeCtx(panel, section)
 end
 
 function R:Build(panel, pageDef)
+	if SF.Debug then
+		SF.Debug:Verbose("UI", "Building page definition with %d section(s)", #(pageDef.sections or {}))
+	end
+
 	local controls = UI.Controls
 	local dialogs = UI.Dialogs
 
