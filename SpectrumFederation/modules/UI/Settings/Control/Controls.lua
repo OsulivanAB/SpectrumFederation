@@ -696,16 +696,57 @@ function Controls:AddScrollList(section, opts)
 		getItems = function() return {} end
 	end
 
-	local height = opts.height or 160
 	local rowHeight = opts.rowHeight or 20
-	local removeAtlas = opts.removeAtlas or "common-icon-redx"
+	local rowSpacing = opts.rowSpacing or 2
 
-	return section:AddRow(height, function(row)
+	local resize = (opts.resize ~= false)	-- Default to true
+	local border = (opts.border == true)	-- Default to false
+	local borderInset = border and (opts.borderInset or 4) or 0
+
+	local fixedHeight = opts.height or 160
+	local maxHeight = opts.maxHeight or fixedHeight
+
+	local minRowHeight = rowHeight + (borderInset * 2)
+	if fixedHeight < minRowHeight then fixedHeight = minRowHeight end
+	if maxHeight < minRowHeight then maxHeight = minRowHeight end
+
+	local initialHeight = resize and minRowHeight or fixedHeight
+
+	return section:AddRow(initialHeight, function(row)
 		local _, control = self:InitRow(row, opts)
 
-		local scroll = CreateFrame("ScrollFrame", nil, control, "UIPanelScrollFrameTemplate")
-		scroll:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
-		scroll:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", 0, 0)
+		local parent = control
+		if border then
+			local box = CreateFrame("Frame", nil, control, "BackdropTemplate")
+			box:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+			box:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", 0, 0)
+
+			if box.SetBackdrop then
+				box:SetBackdrop({
+					-- bgFile = "Interface\\Buttons\\WHITE8X8",
+					bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+					edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+					tile = true,
+					tileSize = 8,
+					edgeSize = 12,
+					insets = { 
+						left = borderInset, 
+						right = borderInset, 
+						top = borderInset, 
+						bottom = borderInset
+					 }
+				})
+				
+				box:SetBackdropColor(0, 0, 0, 0.12)	-- semi-transparent bg
+				box:SetBackdropBorderColor(0.5, 0.5, 0.5, 1) -- light grey border
+			end
+
+			parent = box
+		end
+
+		local scroll = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, 0)
+		scroll:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 0, 0)
 
 		local content = CreateFrame("Frame", nil, scroll)
 		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
@@ -726,7 +767,7 @@ function Controls:AddScrollList(section, opts)
 			fs:SetJustifyH("LEFT")
 			r.Text = fs
 
-			local remove = CreateIconButton(r, removeAtlas, 18)
+			local remove = CreateIconButton(r, opts.removeAtlas or "common-icon-redx", 18)
 			remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
 			r.Remove = remove
 
@@ -734,16 +775,37 @@ function Controls:AddScrollList(section, opts)
 			return r
 		end
 
+		local function SetScrollBarShown(show)
+			local sb = scroll.ScrollBar
+			if not sb then return 0 end
+
+			sb:SetShown(show)
+
+			if not show then
+				scroll:SetVerticalScroll(0)
+				if sb.SetValue then sb:SetValue(0) end
+				if sb.Disable then sb:Disable() end
+				return 0
+			end
+
+			if sb.Enable then sb:Enable() end
+			return sb:GetWidth() or 20
+		end
+
 		local function Refresh()
+			if row.__sfScrollListRefreshing then return end
+			row.__sfScrollListRefreshing = true
+
 			self:_ApplyRowState(row, section, opts, nil)
 
 			local items = getItems() or {}
+
 			local y = 0
 
-			local w = (control:GetWidth() or 0)
-			local sb = scroll.ScrollBar
-			local sbw = (sb and sb:GetWidth()) or 20
-			content:SetWidth(math.max(1, w - sbw - 4))
+			-- local w = (control:GetWidth() or 0)
+			-- local sb = scroll.ScrollBar
+			-- local sbw = (sb and sb:GetWidth()) or 20
+			-- content:SetWidth(math.max(1, w - sbw - 4))
 
 			for i = 1, #items do
 				local item = items[i]
@@ -764,25 +826,67 @@ function Controls:AddScrollList(section, opts)
 							opts.onRemove(item)
 						end
 					end)
+				else
+					r.Remove:SetScript("OnClick", nil)
 				end
 
 				r:Show()
-				y = y + rowHeight + 2
+				y = y + rowHeight + rowSpacing
 			end
 
 			for i = #items + 1, #rows do
 				rows[i]:Hide()
 			end
 
-			content:SetHeight(math.max(1, y))
+			local contentH = (y > 0) and (y - rowSpacing) or 0
+			content:SetHeight(math.max(1, contentH))
+
+			-- Resize behavior
+			local sbw = 0
+			if resize then
+				local maxVisible = math.max(rowHeight, maxHeight - (borderInset * 2))
+				local needVisible = math.max(rowHeight, contentH)
+
+				local showScroll = needVisible > maxVisible
+				sbw = SetScrollBarShown(showScroll)
+
+				local targetVisible = math.min(needVisible, maxVisible)
+				local targetRowH = targetVisible + (borderInset * 2)
+
+				-- Only apply if changed, then request reflow so stacking updates
+				if math.abs((row:GetHeight() or 0) - targetRowH) > 0.5 then
+					row:SetHeight(targetRowH)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+			else
+				SetScrollBarShown(true)
+
+				if math.abs((row:GetHeight() or 0) - fixedHeight) > 0.5 then
+					row:SetHeight(fixedHeight)
+					if section.RequestReflow then
+						section:RequestReflow()
+					end
+				end
+
+				local sb = scroll.ScrollBar
+				sbw = (sb and sb:GetWidth()) or 20
+			end
+
+			-- Width management
+			local w = scroll:GetWidth() or 0
+			if w > 0 then
+				content:SetWidth(math.max(1, w - sbw - 4))
+			end
+
+			row.__sfScrollListRefreshing = false
 		end
 
 		Refresh()
 		RegisterRefresh(section, Refresh)
 
-		scroll:HookScript("OnSizeChanged", function()
-			Refresh()
-		end)
+		scroll:HookScript("OnSizeChanged", Refresh)
 	end)
 end
 
