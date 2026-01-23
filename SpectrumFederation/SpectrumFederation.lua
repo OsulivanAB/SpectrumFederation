@@ -43,13 +43,6 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF:RegisterLootHelperSlashCommands()
         end
 
-        -- Create the Settings UI
-        if SF.CreateSettingsUI then
-            SF:CreateSettingsUI()
-        else
-            if SF.Debug then SF.Debug:Info("SETTINGS_UI", "No CreateSettingsUI function found") end
-        end
-
         -- Send a quick message saying that Addon is Initialized
         SF:PrintSuccess("Online. Type /sf to open settings.")
 
@@ -73,7 +66,7 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
                     end
                     
                     -- Create debug viewer window if it doesn't exist
-                    -- TODO: Need to break these into smaller functions and store them in the debug file.
+                    -- TODO: Need to organize Debug stuff
                     if not SF.DebugViewer then
                         SF.DebugViewer = CreateFrame("Frame", "SpectrumFederationDebugViewer", UIParent, "BackdropTemplate")
                         local viewer = SF.DebugViewer
@@ -152,23 +145,4 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
         -- Unregister the Event after initialization
         self:UnregisterEvent("PLAYER_LOGIN")
     end
-end)
-
--- Create an Event Frame for Addon Loaded
-local AddonLoadedFrame = CreateFrame("Frame")
--- Register the ADDON_LOADED Event
-AddonLoadedFrame:RegisterEvent("ADDON_LOADED")
--- Script to run when ADDON_LOADED Event fires
-AddonLoadedFrame:SetScript("OnEvent", function(self, event, addonName)
-
-    -- Ensure the loaded addon is SpectrumFederation
-    if addonName ~= "SpectrumFederation" then return end
-
-    -- Create the Loot Window (UI component that requires frames)
-    if SF.LootWindow and SF.LootWindow.Create then
-        SF.LootWindow:Create()
-    end
-    
-    -- Unregister after handling our addon
-    self:UnregisterEvent("ADDON_LOADED")
 end)

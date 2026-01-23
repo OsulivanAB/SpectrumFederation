@@ -1,9 +1,9 @@
-## Interface: 120001
+## Interface: 120000
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
-## Version: 0.3.0-beta.1
+## Version: 0.3.1-beta.1
 ## Notes: Loot profile management and helper tools for guild coordination. Create and manage raid loot profiles, track distributions, and coordinate gear allocation across your guild.
-## IconTexture: Interface\AddOns\SpectrumFederation\Media\Icons\SpectrumFederationIcon
+## IconTexture: Interface\AddOns\SpectrumFederation\media\Icons\SpectrumFederationIcon
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
 ## X-Documentation: https://osullivanab.github.io/SpectrumFederation/
 ## SavedVariables: SpectrumFederationDB, SpectrumFederationDebugDB
@@ -21,7 +21,7 @@ modules/debug.lua
 modules/NameUtil.lua
 modules/SlashCommands.lua
 modules/MessageHelpers.lua
-modules/Core.lua
+modules/core.lua
 
 modules/LootHelper/SyncProtocol.lua
 modules/LootHelper/Members.lua
@@ -50,6 +50,20 @@ modules/LootHelperSync/17_DebugSlash.lua
 modules/LootHelperSync/18_PublicAPI.lua
 modules/LootHelper/Comm.lua
 
-modules/Settings.lua
+modules/Settings/Schema.lua
+modules/Settings/Store.lua
+modules/Settings/Apply.lua
+
+modules/UI/Settings/Style.lua
+modules/UI/Settings/Widgets/Section.lua
+modules/UI/Settings/PageBuilder.lua
+modules/UI/Settings/Control/Controls.lua
+modules/UI/Settings/Registry.lua
+modules/UI/Settings/Dialogs.lua
+modules/UI/Settings/DefinitionRenderer.lua
+modules/UI/Settings/Pages/Main.lua
+modules/UI/Settings/Pages/LootHelper.lua
+
+modules/Init.lua
 
 SpectrumFederation.lua

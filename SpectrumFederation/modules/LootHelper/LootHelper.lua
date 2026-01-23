@@ -1,19 +1,6 @@
 -- Grab the namespace
 local addonName, SF = ...
 
--- Canonical Schema (profileId-based):
---
--- SF.lootHelperDB = {
---     profiles = {},              -- Map: [profileId] -> LootProfile instance
---     activeProfileId = nil,      -- String: currently active profileId (not profileName)
--- }
---
--- Why profileId as key:
--- - Profiles can be renamed without breaking references
--- - Sync system already uses profileId as stable identifier
--- - Multi-writer scenarios need collision-free keys
--- - Eliminates name-based lookup ambiguity
-
 -- Database Initialization for Loot Helper Module
 -- @return: none
 function SF:InitializeLootHelperDatabase()

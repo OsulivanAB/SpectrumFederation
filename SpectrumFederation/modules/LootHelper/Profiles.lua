@@ -1,6 +1,8 @@
 -- Grab the namespace
 local addonName, SF = ...
 
+-- Note: Will need a reset profile, delete profile, create profile, rename profile, manage admins, get/set for both safe modes for UI to use
+
 -- ============================================================================
 -- Loot Profile
 -- ============================================================================
