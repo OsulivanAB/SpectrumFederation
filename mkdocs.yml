@@ -81,6 +81,13 @@ nav:
       - CI/CD Workflows: development/getting-started/workflows.md
       - WoW Classes: development/getting-started/wow-classes.md
       - Slash Commands: development/getting-started/slash-commands.md
+    - Settings UI:
+      - Overview: development/settings-ui/index.md
+      - Data Layer: development/settings-ui/data-layer.md
+      - UI Layer: development/settings-ui/ui-layer.md
+      - Controls Reference: development/settings-ui/controls.md
+      - Creating Pages: development/settings-ui/creating-pages.md
+      - Best Practices: development/settings-ui/best-practices.md
     - Loot Helper:
       - Overview: development/loot-helper/loot-helper.md
       - Members Class: development/loot-helper/members-class.md
