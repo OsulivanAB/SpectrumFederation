@@ -11,6 +11,21 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.3.1-beta.1] - 2026-01-23
+
+### Added
+- Introduced a new modular Settings UI with enhanced customization options, including support for window style, font style, and font size adjustments.
+- Added support for managing Loot Helper settings, including enabling/disabling the module, active profile selection, and safe mode configuration.
+- Implemented a new initialization system to streamline module loading and improve performance.
+
+### Changed
+- Updated file structure for better organization, including new directories for settings and UI-related modules.
+- Adjusted the interface version in the TOC file to ensure compatibility with the latest game client.
+
+### Removed
+- Deprecated the old Settings UI implementation in favor of the new modular design.
+
 ## [0.3.0-beta.1] - 2026-01-06
 
 ### Added
