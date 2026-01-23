@@ -372,7 +372,11 @@ end
 -- Function to get the point name for this profile
 -- @return string pointName
 function LootProfile:GetPointName()
-	return self._pointName or "Points"
+    local name = self._pointName
+    if name == nil or name == "" then
+        return "Points"
+    end
+    return name
 end
 
 -- Function to get the raid-wide safe mode setting

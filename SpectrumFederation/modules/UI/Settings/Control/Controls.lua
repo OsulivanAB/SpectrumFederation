@@ -520,6 +520,10 @@ function Controls:AddEditBox(section, opts)
 		edit:SetAutoFocus(false)
 		edit:SetSize(opts.width or 180, 22)
 		edit:SetPoint("LEFT", control, "LEFT", 0, 0)
+		edit:SetTextColor(1, 1, 1)
+		if edit.SetHighlightColor then
+			edit:SetHighlightColor(0.25, 0.5, 1, 0.35)
+		end
 
 		if opts.maxLetters then
 			edit:SetMaxLetters(opts.maxLetters)
@@ -551,9 +555,14 @@ function Controls:AddEditBox(section, opts)
 		local function Refresh()
 			ignore = true
 			edit:SetText(tostring(get() or ""))
+			if edit.SetCursorPosition then
+				edit:SetCursorPosition(0)
+			end
 			ignore = false
 
-			self:_ApplyRowState(row, section, opts, {edit})
+			local _, enabled = self:_ApplyRowState(row, section, opts, {edit})
+			local c = enabled and 1 or 0.6
+			edit:SetTextColor(c, c, c)
 		end
 
 		Refresh()
@@ -630,9 +639,20 @@ function Controls:AddDropdownWithIconButton(section, opts)
 		end)
 
 		local function Refresh()
-			self:_ApplyRowState(row, section, opts, {dropdown})
+			local options = GetOptions()
+			local hasOptions = type(options) == "table" and #options > 0
 
-			local iconEnabled = EvalBool(opts.iconEnabled, EvalBool(opts.enabled, true))
+			local _, enabled = self:_ApplyRowState(row, section, opts, {dropdown})
+			local effectiveEnabled = enabled and hasOptions
+			if dropdown.SetEnabled then
+				dropdown:SetEnabled(effectiveEnabled)
+			elseif dropdown.EnableMouse then
+				dropdown:EnableMouse(effectiveEnabled)
+			end
+			dropdown:SetAlpha(effectiveEnabled and 1 or 0.45)
+			row:SetAlpha(effectiveEnabled and 1 or 0.45)
+
+			local iconEnabled = EvalBool(opts.iconEnabled, effectiveEnabled)
 			if iconBtn.SetEnabled then
 				iconBtn:SetEnabled(iconEnabled)
 			else
@@ -800,6 +820,13 @@ function Controls:AddHelpText(section, opts)
 		fs:SetJustifyV("TOP")
 		fs:SetWordWrap(true)
 		fs:SetText(opts.text or "")
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
 
 		local function UpdateHeight()
 			-- Width is sometimes 0 during the first layout pass; try again later.

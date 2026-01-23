@@ -56,7 +56,8 @@ if not StaticPopupDialogs[PROMPT_KEY] then
         editBoxWidth = 220,
 
         OnShow = function(self, data)
-            local editBox = self.editBox
+            local editBox = self.editBox or self.EditBox
+            if not editBox then return end
             editBox:SetAutoFocus(true)
 
             if data and data.defaultText then
@@ -68,7 +69,8 @@ if not StaticPopupDialogs[PROMPT_KEY] then
         end,
 
         OnAccept = function(self, data)
-            local text = self.editBox:GetText() or ""
+            local editBox = self.editBox or self.EditBox
+            local text = (editBox and editBox:GetText()) or ""
             if data and type(data.onAccept) == "function" then
                 data.onAccept(text)
             end
@@ -76,7 +78,8 @@ if not StaticPopupDialogs[PROMPT_KEY] then
 
         EditBoxOnEnterPressed = function(self, data)
             local parent = self:GetParent()
-            local text = parent.editBox:GetText() or ""
+            local editBox = (parent and (parent.editBox or parent.EditBox)) or self
+            local text = (editBox and editBox:GetText()) or ""
             if data and type(data.onAccept) == "function" then
                 data.onAccept(text)
             end

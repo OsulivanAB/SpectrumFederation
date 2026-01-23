@@ -26,6 +26,9 @@ local function GetActiveProfileObject(store)
 	if store and store.GetActiveLootHelperProfileObject then
 		return store:GetActiveLootHelperProfileObject()
 	end
+	if SF and SF.lootHelperDB then
+		return SF.lootHelperDB.activeProfile
+	end
 	return nil
 end
 
@@ -41,6 +44,10 @@ local function GetActiveProfileId(store)
 	local id = store:Get("lootHelper.activeProfileId")
 	if id ~= nil then return id end
 
+	if SF and SF.lootHelperDB and SF.lootHelperDB.activeProfileId then
+		return SF.lootHelperDB.activeProfileId
+	end
+
 	return store:Get("lootHelper.activeProfile")
 end
 
@@ -48,10 +55,30 @@ end
 -- @param store table Settings store
 -- @return boolean,string|nil False with message until implemented
 local function HasAnyProfiles(store)
-	if store and store.HasLootHelperProfiles then
-		return store:HasLootHelperProfiles()
+	if store and store.HasActiveLootHelperProfile then
+		if store:HasActiveLootHelperProfile() then
+			return true
+		end
 	end
-	return false
+	if store and store.HasLootHelperProfiles then
+		local hasAny = store:HasLootHelperProfiles()
+		if hasAny then
+			return true
+		end
+	end
+	if store and store.GetLootHelperProfiles then
+		local profiles = store:GetLootHelperProfiles()
+		if type(profiles) == "table" and next(profiles) ~= nil then
+			return true
+		end
+	end
+	if SF and SF.lootHelperDB and type(SF.lootHelperDB.profiles) == "table" then
+		if next(SF.lootHelperDB.profiles) ~= nil then
+			return true
+		end
+	end
+	local opts = GetProfileOptions(store)
+	return type(opts) == "table" and #opts > 0
 end
 
 -- Get profile dropdown options
@@ -94,6 +121,9 @@ function Page:Build(panel)
 	panel.__sfAddAdmininSelectedId = panel.__sfAddAdmininSelectedId or nil
 
 	local function HasActiveProfile()
+		if GetActiveProfileObject(store) ~= nil then
+			return true
+		end
 		return GetActiveProfileId(store) ~= nil
 	end
 
@@ -332,7 +362,7 @@ function Page:Build(panel)
 						text = "You currently have no profiles. Create one in General Section",
 						indent = "label",
 						visible = function()
-							return not HasAnyProfiles(store)
+							return not HasAnyProfiles(store) and not HasActiveProfile()
 						end
 					},
 
@@ -361,7 +391,7 @@ function Page:Build(panel)
 							return HasAnyProfiles(store)
 						end,
 
-						iconAtlas = "common-icon-trash",
+						iconAtlas = "common-icon-redx",
 						iconTooltip = "Delete Active Profile",
 						iconEnabled = function()
 							return ProfileActionsEnabled()
@@ -478,6 +508,9 @@ function Page:Build(panel)
 						height = 160,
 						rowHeight = 20,
 						removeAtlas = "common-icon-redx",
+						enabled = function()
+							return ProfileActionsEnabled()
+						end,
 						getItems = function()
 							return BuildAdminItems()
 						end,
@@ -557,14 +590,16 @@ function Page:Build(panel)
 						end,
 
 						get = function()
-							if store.GetActiveProfileSettings then
-								return store:GetActiveProfileSetting("pointName", "Points")
+							local profile = GetActiveProfileObject(store)
+							if profile and type(profile.GetPointName) == "function" then
+								return profile:GetPointName()
 							end
 							return "Points"
 						end,
 						set = function(value)
-							if store.SetActiveProfileSetting then
-								store:SetActiveProfileSetting("pointName", value)
+							local profile = GetActiveProfileObject(store)
+							if profile and type(profile.SetPointName) == "function" then
+								profile:SetPointName(value)
 							end
 						end,
 
