@@ -7,7 +7,10 @@ local UI = SF.SettingsUI
 UI.pages = UI.pages or {}
 UI.pagesById = UI.pagesById or {}
 UI.categoriesByPageId = UI.categoriesByPageId or {}
-
+-- Register a new settings page to be displayed in the settings UI
+-- @param page table Page definition table with id, name, and Build function
+-- @return nil
+-- @error if page is invalid or duplicate id
 function UI:RegisterPage(page)
     assert(type(page) == "table", "RegisterPage(page): page must be a table")
     assert(type(page.id) == "string" and page.id ~= "", "Page require a string id")
@@ -26,10 +29,16 @@ function UI:RegisterPage(page)
     table.insert(self.pages, page)
 end
 
+-- Compare two pages for sorting by order property
+-- @param a table First page definition
+-- @param b table Second page definition
+-- @return boolean True if a should come before b
 local function SortPages(a, b)
     return (a.order or 1000) < (b.order or 1000)
 end
 
+-- Initialize the settings UI and register all pages with the Blizzard settings panel
+-- @return nil
 function UI:Init()
     if self.initialized then return end
     self.initialized = true
@@ -64,6 +73,9 @@ function UI:Init()
     end
 end
 
+-- Create a frame panel for a settings page with lazy-build and refresh callbacks
+-- @param page table Page definition table
+-- @return Frame The created panel frame
 function UI:_CreatePanelForPage(page)
     local panel = CreateFrame("Frame")
     panel.name = page.name
@@ -83,6 +95,9 @@ function UI:_CreatePanelForPage(page)
     return panel
 end
 
+-- Register a top-level settings page with Blizzard's settings API
+-- @param page table Page definition table
+-- @return nil
 function UI:_RegisterRootPage(page)
     local panel = self:_CreatePanelForPage(page)
 
@@ -97,6 +112,9 @@ function UI:_RegisterRootPage(page)
     page.__category = category
 end
 
+-- Register a sub-page under a parent settings page
+-- @param page table Page definition table with parentId field
+-- @return nil
 function UI:_RegisterSubPage(page)
     local parentCategory = self.categoriesByPageId[page.parentId]
     if not parentCategory then return end
@@ -111,6 +129,9 @@ function UI:_RegisterSubPage(page)
     page.__category = subcategory
 end
 
+-- Open the settings panel to a specific page
+-- @param pageId string Page ID to open to, defaults to "main"
+-- @return nil
 function UI:Open(pageId)
     if not Settings or not Settings.OpenToCategory then return end
     local page = self.pagesById[pageId] or self.pagesById["main"]

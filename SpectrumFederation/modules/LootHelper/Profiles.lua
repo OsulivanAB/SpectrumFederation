@@ -19,6 +19,27 @@ local function CopyArray(arr)
     return out
 end
 
+-- Local helper functions for member ID normalization and comparison
+-- @param string id Member full identifier "Name-Realm"
+-- @return string normalizedId
+local function NormalizeMemberId(id)
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        return SF.NameUtil.NormalizeNameRealm(id) or id
+    end
+    return id
+end
+
+-- Local helper function to compare two member IDs
+-- @param string a Member full identifier "Name-Realm"
+-- @param string b Member full identifier "Name-Realm"
+-- @return boolean equal
+local function SameMember(a, b)
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+    return a == b
+end
+
 -- Local helper: generate a short, very-low-collision profileId
 -- We use multiple random 31-bit chunks + server time.
 -- math.random is backed by WoW's securerandom RNG in modern clients.
@@ -105,10 +126,14 @@ function LootProfile.new(profileName)
     instance._adminUsers = {}
     instance._activeProfile = false
     instance._authorCounters = {}
+    instance._pointName = "Points"
+    instance._raidWideSafeMode = false
+    instance._raidWideSafeModeOnCombat = false
 
     -- Create member instance for author
     local class = SF:GetPlayerClass()
-    local authorMember = SF.Member.new(instance._author, SF.MemberRoles.ADMIN, class or "UNKNOWN")
+    local adminRole = (SF.MemberRoles and SF.MemberRoles.ADMIN) or "admin"
+    local authorMember = SF.Member.new(instance._author, adminRole, class or "UNKNOWN")
     if not authorMember then
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Failed to create member instance for author:", instance._author)
@@ -148,6 +173,8 @@ function LootProfile.new(profileName)
     end
 
     table.insert(instance._lootLogs, logEntry)
+
+    instance:_EnsureOwnerIsAdmin()
 
     return instance
 end
@@ -284,6 +311,14 @@ function LootProfile:GetOwnerId()
     return self._owner
 end
 
+-- Function to check if a given memberId is the owner of this profile
+-- @param memberId (string) - Member full identifier "Name-Realm"
+-- @return (boolean) - True if memberId is the owner, false otherwise
+function LootProfile:IsOwner(memberId)
+    if type(memberId) ~= "string" or memberId == "" then return false end
+    return SameMember(NormalizeMemberId(memberId), self._owner)
+end
+
 -- Function to get the list of members in this profile
 -- @return table members List of LootProfileMember instances
 function LootProfile:GetMemberList()
@@ -334,6 +369,60 @@ function LootProfile:IsCurrentUserAdmin()
     return false
 end
 
+-- Function to get the point name for this profile
+-- @return string pointName
+function LootProfile:GetPointName()
+	return self._pointName or "Points"
+end
+
+-- Function to get the raid-wide safe mode setting
+-- @return boolean raidWideSafeMode
+function LootProfile:GetRaidWideSafeMode()
+	return self._raidWideSafeMode and true or false
+end
+
+-- Function to get the raid-wide safe mode on combat setting
+-- @return boolean raidWideSafeModeOnCombat
+function LootProfile:GetRaidWideSafeModeOnCombat()
+	return self._raidWideSafeModeOnCombat and true or false
+end
+
+-- Function Get list of admin member IDs
+-- @return table adminMemberIds List of "Name-Realm" strings
+function LootProfile:getAdminMemberIds()
+    return CopyArray(self._adminUsers or {})
+end
+
+-- Function Get list of all member IDs
+-- @return table memberIds List of "Name-Realm" strings
+function LootProfile:getMemberIds()
+    local out = {}
+    for _, m in ipairs(self._members or {}) do
+        local id = m.GetFullIdentifier and m:GetFullIdentifier() or m.identifier
+        if type(id) == "string" and id ~= "" then
+            table.insert(out, id)
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+-- Function Get member by their ID
+-- @param string id "Name-Realm" of member
+-- @return LootProfileMember|nil member Instance or nil if not found
+function LootProfile:getMemberByID(id)
+    if type(id) ~= "string" or id == "" then return nil end
+    id = NormalizeMemberId(id)
+
+    for _, m in ipairs(self._members or {}) do
+        local mid = m.GetFullIdentifier and m:GetFullIdentifier() or m.identifier
+        if type(mid) == "string" and mid ~= "" and SameMember(id, mid) then
+            return m
+        end
+    end
+    return nil
+end
+
 -- ========================================================================
 -- Setter Methods
 -- ========================================================================
@@ -353,7 +442,7 @@ function LootProfile:SetProfileName(newName)
         self._profileName = newName
     else
         if SF.Debug then
-            SF.Debug("LootProfile", "Attempted to set invalid profile name: %s", tostring(newName))
+            SF.Debug:Warn("LootProfile", "Attempted to set invalid profile name: %s", tostring(newName))
         end
     end
 end
@@ -374,7 +463,7 @@ function LootProfile:SetOwner(newOwner)
         self._owner = normalized
     else
         if SF.Debug then
-            SF.Debug("LootProfile", "Attempted to set invalid owner: %s", tostring(newOwner))
+            SF.Debug:Warn("LootProfile", "Attempted to set invalid owner: %s", tostring(newOwner))
         end
     end
 end
@@ -461,7 +550,9 @@ end
 -- @param Member member Instance of Member to add
 -- @return boolean success
 function LootProfile:AddMember(member)
-    if getmetatable(member) == SF.Member then
+    local mt = getmetatable(member)
+    if mt == SF.Member or mt == SF.LootProfileMember then
+        self._members = self._members or {}
         table.insert(self._members, member)
         return true
     else
@@ -476,15 +567,147 @@ end
 -- @param Member member Instance of Member to add as admin
 -- @return boolean success
 function LootProfile:AddAdminUser(member)
-    if getmetatable(member) == SF.Member then
-        table.insert(self._adminUsers, member:GetFullIdentifier())
-        return true
+    local mt = getmetatable(member)
+    if mt == SF.Member or mt == SF.LootProfileMember then
+        local id = member.GetFullIdentifier and member:GetFullIdentifier() or member.identifier
+        return self:AddAdminMemberId(id)
     else
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Attempted to add invalid LootProfileMember instance as admin: %s", tostring(member))
         end
         return false
     end
+end
+
+-- Function to set the point name for this profile
+-- @param string name New point name
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetPointName(name)
+	if not self:IsCurrentUserAdmin() then
+		return false, "You must be an admin to change Point Name."
+	end
+	name = tostring(name or ""):match("^%s*(.-)%s*$")
+	if name == "" then
+		return false, "Point Name cannot be empty."
+	end
+	self._pointName = name
+	return true
+end
+
+-- Function to set the raid-wide safe mode setting
+-- @param boolean v New raid-wide safe mode value
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetRaidWideSafeMode(v)
+	if not self:IsCurrentUserAdmin() then
+		return false, "You must be an admin to change Raid-Wide Safemode."
+	end
+	self._raidWideSafeMode = v and true or false
+	return true
+end
+
+-- Function to set the raid-wide safe mode on combat setting
+-- @param boolean v New raid-wide safe mode on combat value
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetRaidWideSafeModeOnCombat(v)
+	if not self:IsCurrentUserAdmin() then
+		return false, "You must be an admin to change Raid-Wide Safemode on Combat."
+	end
+	self._raidWideSafeModeOnCombat = v and true or false
+	return true
+end
+
+-- ========================================================================
+-- Admin Management
+-- ========================================================================
+
+-- Function to check if a member ID is an admin of this profile
+-- @param string memberId "Name-Realm" of member to check
+-- @return boolean isAdmin
+function LootProfile:IsAdminMemberId(memberId)
+    if type(memberId) ~= "string" or memberId == "" then return false end
+    memberId = NormalizeMemberId(memberId)
+
+    for _, id in ipairs(self._adminUsers or {}) do
+        if SameMember(id, memberId) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Function to add an admin member ID to this profile
+-- @param string memberId "Name-Realm" of member to add as admin
+-- @return boolean success, string|nil errorMessage
+function LootProfile:AddAdminMemberId(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LootProfile", "Attempted to add invalid memberId as admin: %s", tostring(memberId))
+        end
+        return false, "Invalid member id."
+    end
+    memberId = NormalizeMemberId(memberId)
+
+    if not self:IsCurrentUserAdmin() then
+        if SF.Debug then
+            SF.Debug:Warn("LootProfile", "Current user is not an admin; cannot add admin member IDs")
+        end
+        return false, "You must be an admin to add admins."
+    end
+
+    if not self:getMemberByID(memberId) then
+        if SF.Debug then
+            SF.Debug:Warn("LootProfile", "Attempted to add non-member as admin: %s", tostring(memberId))
+        end
+        return false, "That member is not a part of this profile"
+    end
+
+    if self:IsAdminMemberId(memberId) then
+        return false, "That member is already an admin"
+    end
+
+    self._adminUsers = self._adminUsers or {}
+    table.insert(self._adminUsers, memberId)
+    return true
+end
+
+-- Function to remove an admin member ID from this profile
+-- @param string memberId "Name-Realm" of member to remove as admin
+-- @return boolean success, string|nil errorMessage
+function LootProfile:RemoveAdminMemberId(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LootProfile", "Attempted to remove invalid memberId from admins: %s", tostring(memberId))
+        end
+        return false, "Invalid member id."
+    end
+    memberId = NormalizeMemberId(memberId)
+
+    if not self:IsCurrentUserAdmin() then
+        if SF.Debug then
+            SF.Debug:Warn("LootProfile", "Current user is not an admin; cannot remove admin member IDs")
+        end
+        return false, "You must be an admin to remove admins."
+    end
+
+    if SameMember(memberId, self._owner) then
+        if SF.Debug then
+            SF.Debug:Warn("LootProfile", "Attempted to remove owner from admins: %s", tostring(memberId))
+        end
+        return false, "Cannot remove the owner from admins."
+    end
+
+    local admins = self._adminUsers or {}
+    for i = #admins, 1, -1 do
+        if SameMember(admins[i], memberId) then
+            table.remove(admins, i)
+            return true
+        end
+    end
+
+    return false, "That member is not an admin."
 end
 
 -- ========================================================================
@@ -595,6 +818,8 @@ function LootProfile:ImportSnapshot(snapshot, opts)
     -- Replace admin list (later we may derive this from logs; for now keep it explicit)
     self._adminUsers = CopyArray(snapshot.adminUsers)
 
+    self:_EnsureOwnerIsAdmin()
+
     -- Merge Logs
     local inserted = self:MergeLogTables(snapshot.lootLogs, opts)
 
@@ -650,6 +875,10 @@ function LootProfile:MergeLogTables(logTables, opts)
     return inserted
 end
 
+-- ========================================================================
+-- Private/Helper Methods
+-- ========================================================================
+
 -- Function Normalize a profileId using NameUtil (if available)
 -- @param string id ProfileId to normalize
 -- @return string normalizedId
@@ -686,31 +915,17 @@ function LootProfile:_EnsureMemberIndex()
     end
 end
 
--- Function Get list of admin member IDs
--- @return table adminMemberIds List of "Name-Realm" strings
-function LootProfile:getAdminMemberIds()
-    return CopyArray(self._adminUsers or {})
-end
-
--- Function Get member by their ID
--- @param string id "Name-Realm" of member
--- @return LootProfileMember|nil member Instance or nil if not found
-function LootProfile:getMemberByID(id)
-    self:_EnsureMemberIndex()
-    id = self:_NormalizeId(id)
-    return self._memberId and self._memberById[id] or nil
-end
-
--- Function Get list of all member IDs
--- @return table memberIds List of "Name-Realm" strings
-function LootProfile:getMemberIds()
-    self:_EnsureMemberIndex()
-    local ids = {}
-    for id, _ in pairs(self._memberById or {}) do
-        table.insert(ids, id)
+-- Function to ensure the owner is in the admin users list
+-- @param none
+-- @return nil
+function LootProfile:_EnsureOwnerIsAdmin()
+    self._adminUsers = self._adminUsers or {}
+    for _, id in ipairs(self._adminUsers) do
+        if SameMember(id, self._owner) then
+            return
+        end
     end
-    table.sort(ids)
-    return ids
+    table.insert(self._adminUsers, self._owner)
 end
 
 -- ========================================================================

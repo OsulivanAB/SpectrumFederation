@@ -4,6 +4,8 @@ local addonName, SF = ...
 SF.SettingsApply = SF.SettingsApply or {}
 local Apply = SF.SettingsApply
 
+-- Initialize the SettingsApply module and register callbacks
+-- @return nil
 function Apply:Init()
     if self.initialized then return end
     self.initialized = true
@@ -80,6 +82,11 @@ function Apply:Init()
     end
 end
 
+-- Debounce a function call with a token and delay, cancelling previous pending calls
+-- @param token string Unique token to identify the debounced function
+-- @param delay number Seconds to wait before executing
+-- @param fn function Function to execute after delay
+-- @return nil
 function Apply:Debounce(token, delay, fn)
     self._debounce = self._debounce or {}
 
@@ -98,6 +105,9 @@ function Apply:Debounce(token, delay, fn)
     end
 end
 
+-- Execute a function immediately or defer it until out of combat
+-- @param fn function Function to execute
+-- @return nil
 function Apply:RunOrDefer(fn)
     if InCombatLockdown and InCombatLockdown() then
         self._combatQueue = self._combatQueue or {}
@@ -127,6 +137,8 @@ function Apply:RunOrDefer(fn)
     fn()
 end
 
+-- Apply all current settings from store to the game
+-- @return nil
 function Apply:ApplyAll()
     if SF.Debug then
         SF.Debug:Verbose("SETTINGS", "Applying all settings")
@@ -148,6 +160,9 @@ function Apply:ApplyAll()
     })
 end
 
+-- Apply window style setting
+-- @param value string Window style value to apply
+-- @return nil
 function Apply:ApplyWindowStyle(value)
     if SF.Debug then
         SF.Debug:Verbose("SETTINGS", "Applying window style: %s", tostring(value))
@@ -155,6 +170,9 @@ function Apply:ApplyWindowStyle(value)
     -- TODO: implement
 end
 
+-- Apply font style setting
+-- @param value string Font style value to apply
+-- @return nil
 function Apply:ApplyFontStyle(value)
     if SF.Debug then
         SF.Debug:Verbose("SETTINGS", "Applying font style: %s", tostring(value))
@@ -162,6 +180,9 @@ function Apply:ApplyFontStyle(value)
     -- TODO: implement
 end
 
+-- Apply font size setting
+-- @param value number Font size value to apply
+-- @return nil
 function Apply:ApplyFontSize(value)
     if SF.Debug then
         SF.Debug:Verbose("SETTINGS", "Applying font size: %s", tostring(value))
@@ -169,6 +190,9 @@ function Apply:ApplyFontSize(value)
     -- TODO: implement
 end
 
+-- Apply loot helper enabled/disabled state
+-- @param enabled boolean Whether loot helper is enabled
+-- @return nil
 function Apply:ApplyLootHelperEnabled(enabled)
     if SF.Debug then
         SF.Debug:Info("SETTINGS", "LootHelper enabled: %s", tostring(enabled))
@@ -176,6 +200,10 @@ function Apply:ApplyLootHelperEnabled(enabled)
     -- TODO: implement
 end
 
+-- Apply active profile change
+-- @param newProfile string|nil Name of new active profile
+-- @param oldProfile string|nil Name of previous active profile
+-- @return nil
 function Apply:ApplyActiveProfileChange(newProfile, oldProfile)
     if SF.Debug then
         SF.Debug:Info("SETTINGS", "Active profile changed from '%s' to '%s'", tostring(oldProfile), tostring(newProfile))
@@ -183,6 +211,11 @@ function Apply:ApplyActiveProfileChange(newProfile, oldProfile)
     -- TODO: implement
 end
 
+-- Apply safe mode change for a profile
+-- @param newValue boolean New safe mode state
+-- @param oldValue boolean Previous safe mode state
+-- @param ctx table Context table with profileName and key fields
+-- @return nil
 function Apply:ApplySafeMode(newValue, oldValue, ctx)
     -- ctx.profileName tells you which profile this change applies to
     -- Example: if SF.LootHelper and SF.LootHelper.SetSafeMode then SF.LootHelper:SetSafeMode(ctx.profileName, enabled) end
