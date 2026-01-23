@@ -11,6 +11,9 @@ local Page = {
 -- ==================================================================
 -- Helpers
 -- ==================================================================
+-- Get the active loot helper profile runtime object
+-- @param store table Settings store
+-- @return table|nil Profile object or nil if unavailable
 local function GetActiveProfileObject(store)
 	-- TODO: Implement later
 	-- Return a runtime profile object with:
@@ -26,6 +29,9 @@ local function GetActiveProfileObject(store)
 	return nil
 end
 
+-- Get the active loot helper profile ID (prefers new key, falls back to legacy)
+-- @param store table Settings store
+-- @return string|nil Active profile ID or name
 local function GetActiveProfileId(store)
 	local id = store:Get("lootHelper.activeProfileId")
 	if id ~= nil then return id end
@@ -33,11 +39,17 @@ local function GetActiveProfileId(store)
 	return store:Get("lootHelper.activeProfile")
 end
 
+-- Determine if any loot helper profiles exist (placeholder)
+-- @param store table Settings store
+-- @return boolean,string|nil False with message until implemented
 local function HasAnyProfiles(store)
 	-- TODO: Call profiles API
 	return false, "Not implemented"
 end
 
+-- Get profile dropdown options
+-- @param store table Settings store
+-- @return table Array of {value,label} options
 local function GetProfileOptions(store)
 	if store.GetLootHelperProfileOptionsSorted then
 		return store:GetLootHelperProfileOptionsSorted()
@@ -45,6 +57,9 @@ local function GetProfileOptions(store)
 	return {}, "Not implemented"
 end
 
+-- Check whether admin tools should be visible (placeholder true)
+-- @param ctx table Context table
+-- @return boolean Always true until real check added
 local function CanShowAdminTools(ctx)
 	-- TODO: Call profiles API function to ask if current user is admin
 	return true
@@ -53,6 +68,9 @@ end
 -- ==================================================================
 -- Page Definition
 -- ==================================================================
+-- Build the Loot Helper settings page UI
+-- @param panel Frame Settings panel frame
+-- @return nil
 function Page:Build(panel)
 	if SF.Debug then
 		SF.Debug:Verbose("UI", "Building LootHelper settings page")
@@ -606,6 +624,9 @@ function Page:Build(panel)
 	renderer:Build(panel, def)
 end
 
+-- Refresh the Loot Helper settings page
+-- @param panel Frame Settings panel frame
+-- @return nil
 function Page:Refresh(panel)
 	SF.SettingsUI.DefinitionRenderer:Refresh(panel)
 end

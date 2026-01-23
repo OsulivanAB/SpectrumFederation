@@ -36,6 +36,10 @@ local function ApplyMixin(obj, mixin)
 end
 local Mix = _G.Mixin or ApplyMixin
 
+-- Create a new Section frame widget
+-- @param parent Frame Parent frame to attach section to
+-- @param title string|nil Section title text
+-- @return Frame Section frame with mixin methods
 function UI.Section:Create(parent, title)
 	local frame = CreateFrame("Frame", nil, parent)
 	Mix(frame, SectionMixin)
@@ -43,6 +47,9 @@ function UI.Section:Create(parent, title)
 	return frame
 end
 
+-- Initialize the section frame layout and header
+-- @param title string|nil Section title text
+-- @return nil
 function SectionMixin:Init(title)
 	self.title = title or ""
 	self._rows = {}
@@ -118,12 +125,19 @@ function SectionMixin:Init(title)
 	self:ReflowRows()
 end
 
+-- Set the section title text
+-- @param title string|nil New title text
+-- @return nil
 function SectionMixin:SetTitle(title)
 	self.title = title or ""
 	self.HeaderLabel:SetText(self.title)
 end
 
 -- Adds a full-width row frame stacked vertically inside Content
+-- Add a content row to the section
+-- @param height number Row height in pixels
+-- @param buildFn function|nil Optional builder to populate the row
+-- @return Frame The created row frame
 function SectionMixin:AddRow(height, buildFn)
 	local row = CreateFrame("Frame", nil, self.Content)
 	row:SetHeight(height)
@@ -140,10 +154,16 @@ function SectionMixin:AddRow(height, buildFn)
 	return row
 end
 
+-- Add an empty spacer row
+-- @param height number Spacer height in pixels
+-- @return Frame The created spacer row
 function SectionMixin:AddSpacer(height)
 	return self:AddRow(height, nil)
 end
 
+-- Add a text row with GameFontHighlightSmall
+-- @param text string|nil Text to display
+-- @return Frame The created text row
 function SectionMixin:AddText(text)
 	return self:AddRow(18, function(row)
 		local fs = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -167,6 +187,8 @@ local function MessageColor(kind)
 	end
 end
 
+-- Internal: recalc message row height based on content width/text
+-- @return nil
 function SectionMixin:_UpdateMessageHeight()
 	-- Compute a reasonable height for wrapped text
 	local width = (self.Content:GetWidth() or 0) - (MSG_PAD_X * 2)
@@ -179,6 +201,10 @@ function SectionMixin:_UpdateMessageHeight()
 	self.MessageRow:SetHeight(howH)
 end
 
+-- Show a message row with colored text
+-- @param text string Message to display
+-- @param kind string|nil Kind of message (error|success|warn|info)
+-- @return nil
 function SectionMixin:SetMessage(text, kind)
 	text = tostring(text or "")
 	if text == "" then
@@ -195,6 +221,8 @@ function SectionMixin:SetMessage(text, kind)
 	self:_NotifyPageReflow()
 end
 
+-- Clear and hide the message row
+-- @return nil
 function SectionMixin:ClearMessage()
 	if not self.MessageRow:IsShown() then return end
 	self.MessageText:SetText("")
@@ -205,6 +233,8 @@ function SectionMixin:ClearMessage()
 end
 
 -- -------- Layout --------
+-- Reflow row positions and content height
+-- @return nil
 function SectionMixin:ReflowRows()
 	local contentHeight = 0
 	local prev
@@ -244,6 +274,8 @@ function SectionMixin:ReflowRows()
 	self:_UpdateHeight()
 end
 
+-- Internal: recalc section frame height based on content
+-- @return nil
 function SectionMixin:_UpdateHeight()
 	local contentHeight = self.Content:GetHeight() or 0
 	local total =
@@ -255,6 +287,8 @@ function SectionMixin:_UpdateHeight()
 	self:SetHeight(total)
 end
 
+-- Notify owning PageBuilder to reflow layout
+-- @return nil
 function SectionMixin:_NotifyPageReflow()
 	local pb = self.__sfPageBuilder
 	if pb and pb.Reflow then
@@ -263,6 +297,8 @@ function SectionMixin:_NotifyPageReflow()
 	end
 end
 
+-- Schedule a deferred reflow to coalesce multiple requests
+-- @return nil
 function SectionMixin:RequestReflow()
 	-- Coalesce multiple requests into a single next-frame reflow
 	if self.__sfReflowScheduled then return end
