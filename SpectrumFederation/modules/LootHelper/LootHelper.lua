@@ -130,10 +130,21 @@ end
 -- @return: none
 function SF:RehydrateLootHelperDB()
 	local db = self.lootHelperDB
-	if not db or type(db.profiles) ~= "table" then return end
+	if not db or type(db.profiles) ~= "table" then
+		if SF.Debug then
+			SF.Debug:Verbose("DATABASE", "RehydrateLootHelperDB: No profiles to rehydrate")
+		end
+		return
+	end
+
+	local profileCount = 0
+	local memberCount = 0
+	local logCount = 0
 
 	for id, profile in pairs(db.profiles) do
 		if type(profile) == "table" then
+			profileCount = profileCount + 1
+
 			-- Restore LootProfile methods
 			if self.LootProfile and getmetatable(profile) ~= self.LootProfile then
 				setmetatable(profile, self.LootProfile)
@@ -144,6 +155,7 @@ function SF:RehydrateLootHelperDB()
 				for i, m in ipairs(profile._members) do
 					if type(m) == "table" and getmetatable(m) ~= self.Member then
 						setmetatable(m, self.Member)
+						memberCount = memberCount + 1
 					end
 				end
 			end
@@ -153,6 +165,7 @@ function SF:RehydrateLootHelperDB()
 				for i, log in ipairs(profile._lootLogs) do
 					if type(log) == "table" and getmetatable(log) ~= self.LootLog then
 						setmetatable(log, self.LootLog)
+						logCount = logCount + 1
 					end
 				end
 			end
@@ -167,6 +180,10 @@ function SF:RehydrateLootHelperDB()
 				profile:_EnsureOwnerIsAdmin()
 			end
 		end
+	end
+
+	if SF.Debug then
+		SF.Debug:Info("DATABASE", "Rehydrated %d profiles, %d members, %d logs", profileCount, memberCount, logCount)
 	end
 end
 
@@ -350,22 +367,38 @@ function SF:CreateLootHelperProfile(profileName)
 	for _, prof in pairs(self.lootHelperDB.profiles or {}) do
 		local n = (prof and prof.GetProfileName and prof:GetProfileName()) or (prof and prof._profileName)
 		if n == profileName then
+			if SF.Debug then
+				SF.Debug:Warn("DATABASE", "Cannot create profile - name already exists: %s", profileName)
+			end
 			return false, "A profile with that name already exists."
 		end
 	end
 
 	if not self.LootProfile or not self.LootProfile.new then
+		if SF.Debug then
+			SF.Debug:Error("DATABASE", "LootProfile class not loaded")
+		end
 		return false, "LootProfile class not loaded."
 	end
 
 	local p = self.LootProfile.new(profileName)
 	if not p then
+		if SF.Debug then
+			SF.Debug:Error("DATABASE", "Failed to create profile instance for: %s", profileName)
+		end
 		return false, "Failed to create profile."
 	end
 
 	local ok = self:AddLootProfileToDatabase(p)
 	if not ok then
+		if SF.Debug then
+			SF.Debug:Error("DATABASE", "Failed to add profile to database: %s", profileName)
+		end
 		return false, "Failed to add profile to database."
+	end
+
+	if SF.Debug then
+		SF.Debug:Info("DATABASE", "Created new profile: %s (ID: %s)", profileName, p:GetProfileId())
 	end
 
 	return true
@@ -376,15 +409,26 @@ end
 -- @return (boolean, string|nil) - Success status and optional error message
 function SF:DeleteLootHelperProfile(profileId)
 	if type(profileId) ~= "string" or profileId == "" then
+		if SF.Debug then
+			SF.Debug:Warn("DATABASE", "Cannot delete profile - invalid profileId: %s", tostring(profileId))
+		end
 		return false, "Invalid profile id."
 	end
 
 	local db = self.lootHelperDB
 	if not db or not db.profiles or not db.profiles[profileId] then
+		if SF.Debug then
+			SF.Debug:Warn("DATABASE", "Cannot delete profile - not found: %s", profileId)
+		end
 		return false, "Profile not found."
 	end
 
+	local profileName = db.profiles[profileId]:GetProfileName()
 	db.profiles[profileId] = nil
+
+	if SF.Debug then
+		SF.Debug:Info("DATABASE", "Deleted profile: %s (ID: %s)", profileName or "Unknown", profileId)
+	end
 
 	-- If we deleted the active profile, pick a new one or nil
 	if db.activeProfileId == profileId then
@@ -395,6 +439,13 @@ function SF:DeleteLootHelperProfile(profileId)
 		local opts = self:GetLootHelperProfileOptions()
 		if #opts > 0 then
 			self:SetActiveProfileById(opts[1].value)
+			if SF.Debug then
+				SF.Debug:Info("DATABASE", "Auto-selected new active profile: %s", opts[1].label)
+			end
+		else
+			if SF.Debug then
+				SF.Debug:Info("DATABASE", "No profiles remaining after deletion")
+			end
 		end
 	end
 
@@ -406,8 +457,14 @@ end
 -- @return (boolean, string|nil) - Success status and optional error message
 function SF:RenameActiveLootHelperProfile(newName)
 	local p = self:GetActiveProfile()
-	if not p then return false, "No active profile." end
+	if not p then
+		if SF.Debug then
+			SF.Debug:Warn("DATABASE", "Cannot rename - no active profile")
+		end
+		return false, "No active profile."
+	end
 
+	local oldName = p:GetProfileName()
 	newName = tostring(newName or ""):match("^%s*(.-)%s*$")
 	if newName == "" then return false, "Profile name cannot be empty." end
 	if newName:find("%.") then return false, "Profile name cannot contain '.'." end
@@ -417,6 +474,9 @@ function SF:RenameActiveLootHelperProfile(newName)
 		if prof ~= p then
 			local n = (prof and prof.GetProfileName and prof:GetProfileName()) or (prof and prof._profileName)
 			if n == newName then
+				if SF.Debug then
+					SF.Debug:Warn("DATABASE", "Cannot rename - name already exists: %s", newName)
+				end
 				return false, "A profile with that name already exists."
 			end
 		end
@@ -424,9 +484,15 @@ function SF:RenameActiveLootHelperProfile(newName)
 
 	if p.SetProfileName then
 		p:SetProfileName(newName)
+		if SF.Debug then
+			SF.Debug:Info("DATABASE", "Renamed profile: %s -> %s (ID: %s)", oldName, newName, p:GetProfileId())
+		end
 		return true
 	end
 
+	if SF.Debug then
+		SF.Debug:Error("DATABASE", "Cannot rename - profile missing SetProfileName method")
+	end
 	return false, "Active profile cannot be renamed (missing SetProfileName)."
 end
 
@@ -454,11 +520,25 @@ end
 -- @return (boolean, string|nil) - Success status and optional error message
 function SF:ResetAllLootHelperSettings()
 	local db = self.lootHelperDB
-	if not db then return false, "LootHelper DB not initialized." end
+	if not db then
+		if SF.Debug then
+			SF.Debug:Error("DATABASE", "Cannot reset - LootHelper DB not initialized")
+		end
+		return false, "LootHelper DB not initialized."
+	end
+
+	local profileCount = 0
+	for _ in pairs(db.profiles or {}) do
+		profileCount = profileCount + 1
+	end
 
 	db.profiles = {}
 	db.activeProfileId = nil
 	db.activeProfile = nil
+
+	if SF.Debug then
+		SF.Debug:Info("DATABASE", "Reset all loot helper settings - cleared %d profiles", profileCount)
+	end
 
 	return true
 end
