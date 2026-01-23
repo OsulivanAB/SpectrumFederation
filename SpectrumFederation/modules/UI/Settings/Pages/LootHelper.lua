@@ -174,7 +174,7 @@ function Page:Build(panel)
 						type = "checkbox",
 						label = "Enable LootHelper",
 						tooltip = "Enable or disable LootHelper on this character/client.",
-						path = "lootHelper.enable"
+						path = "lootHelper.enabled"
 					},
 					{
 						type = "checkbox",
