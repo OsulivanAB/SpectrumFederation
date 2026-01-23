@@ -89,17 +89,25 @@ function SF:MigrateLootHelperSchema()
     -- Replace old profiles table with new map
     db.profiles = newProfiles
     
-    -- Migrate activeProfile (pointer) to activeProfileId
+    -- Migrate activeProfile (pointer) to activeProfileId, then restore pointer
     if db.activeProfile and type(db.activeProfile) == "table" and db.activeProfile.GetProfileId then
         local profileId = db.activeProfile:GetProfileId()
         if profileId then
             db.activeProfileId = profileId
+            -- Keep pointer for backward compatibility with existing code
+            db.activeProfile = newProfiles[profileId]
             if SF.Debug then
                 SF.Debug:Info("DATABASE", "Migrated active profile: %s -> %s", 
                     db.activeProfile:GetProfileName() or "Unknown", profileId)
             end
         end
-        db.activeProfile = nil  -- Clear legacy field
+    elseif db.activeProfileId and newProfiles[db.activeProfileId] then
+        -- Restore pointer if activeProfileId exists but pointer was nil
+        db.activeProfile = newProfiles[db.activeProfileId]
+    else
+        -- Clear if neither field is valid
+        db.activeProfile = nil
+        db.activeProfileId = nil
     end
     
     if SF.Debug then SF.Debug:Info("DATABASE", "Schema migration complete: %d profiles", 
@@ -147,8 +155,9 @@ function SF:SetActiveProfileById(profileId)
         profile:SetActive(true)
     end
 
-    -- Update pointer in database
+    -- Update BOTH canonical ID and legacy pointer
     SF.lootHelperDB.activeProfileId = profileId
+    SF.lootHelperDB.activeProfile = profile
 
     if SF.Debug then
         SF.Debug:Info("DATABASE", "Set loot profile '%s' (ID: %s) as active", 
@@ -156,6 +165,25 @@ function SF:SetActiveProfileById(profileId)
     end
 
     return true
+end
+
+-- Clear the active loot profile (used when deleting active profile)
+-- @return nil
+function SF:ClearActiveProfile()
+    -- Deactivate all profiles
+    for _, prof in pairs(SF.lootHelperDB.profiles) do
+        if prof.SetActive then
+            prof:SetActive(false)
+        end
+    end
+    
+    -- Clear both fields
+    SF.lootHelperDB.activeProfileId = nil
+    SF.lootHelperDB.activeProfile = nil
+    
+    if SF.Debug then
+        SF.Debug:Info("DATABASE", "Cleared active profile")
+    end
 end
 
 -- Get the active loot profile

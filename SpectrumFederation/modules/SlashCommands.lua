@@ -257,7 +257,7 @@ function SF:RegisterLootHelperSlashCommands()
         
         -- Clear if active
         if SF.lootHelperDB.activeProfileId == profileId then
-            SF.lootHelperDB.activeProfileId = nil
+            SF:ClearActiveProfile()
             SF:PrintWarning("Cleared active profile (deleted)")
         end
         
