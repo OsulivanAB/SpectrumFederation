@@ -175,7 +175,7 @@ Each LootProfile instance has the following private properties:
 | `_profileId` | string | Stable unique identifier (generated at creation) | [`GetProfileId()`](#getprofileid) | [`SetProfileIdIfNil()`](#setprofileidifnilprofileid) |
 | `_profileName` | string | Human-readable name of the profile | [`GetProfileName()`](#getprofilename) | [`SetProfileName()`](#setprofilenamenewname) |
 | `_author` | string | Original creator ("Name-Realm" format) | [`GetAuthor()`](#getauthor) | N/A (immutable) |
-| `_owner` | string | Current owner ("Name-Realm" format) | [`GetOwner()`](#getowner) | [`SetOwner()`](#setownernewowner) |
+| `_owner` | string | Current owner ("Name-Realm" format) | [`GetOwnerId()`](#getownerid) | [`SetOwner()`](#setownernewowner) |
 | `_members` | table | Array of LootProfileMember instances | [`GetMemberList()`](#getmemberlist) | [`AddMember()`](#addmembermember) |
 | `_lootLogs` | table | Array of LootLog instances (chronologically sorted) | [`GetLootLogs()`](#getlootlogs) | [`AddLootLog()`](#addlootloglootlog) |
 | `_adminUsers` | table | Array of admin user identifiers ("Name-Realm" format) | [`GetAdminUsers()`](#getadminusers), [`IsCurrentUserAdmin()`](#iscurrentuseradmin) | [`AddAdminUser()`](#addadminusermember) |
