@@ -8,6 +8,10 @@ local Page = {
 }
 
 function Page:Build(panel)
+    if SF.Debug then
+        SF.Debug:Verbose("UI", "Building Main settings page")
+    end
+
     local schema = SF.SettingsSchema
     local renderer = SF.SettingsUI.DefinitionRenderer
 
@@ -76,11 +80,17 @@ function Page:Build(panel)
                         tooltip = "Resets all Spectrum Federation settings to their default values.",
 
                         onClick = function(ctx)
+                            if SF.Debug then
+                                SF.Debug:Info("UI", "Reset All Settings button clicked")
+                            end
                             ctx.section:ClearMessage()
                             ctx.ui.Dialogs:Confirm(
                                 "Reset ALL Spectrum Federation settings to defaults?",
                                 "Reset All",
                                 function()
+                                    if SF.Debug then
+                                        SF.Debug:Info("UI", "User confirmed reset all settings")
+                                    end
                                     ctx.store:ResetAll()
                                     ctx.pageBuilder:Refresh()
                                     ctx.pageBuilder:Reflow()

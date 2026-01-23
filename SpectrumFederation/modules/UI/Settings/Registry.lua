@@ -18,6 +18,10 @@ function UI:RegisterPage(page)
         error(("Duplicate settings page id: %s"):format(page.id))
     end
 
+    if SF.Debug then
+        SF.Debug:Verbose("UI", "Registering settings page: %s", page.name)
+    end
+
     self.pagesById[page.id] = page
     table.insert(self.pages, page)
 end
@@ -30,7 +34,14 @@ function UI:Init()
     if self.initialized then return end
     self.initialized = true
 
+    if SF.Debug then
+        SF.Debug:Info("UI", "Initializing Settings UI")
+    end
+
     if not Settings or not Settings.RegisterCanvasLayoutCategory then
+        if SF.Debug then
+            SF.Debug:Warn("UI", "Settings API not available, cannot initialize UI")
+        end
         return
     end
 
@@ -46,6 +57,10 @@ function UI:Init()
         if page.parentId then
             self:_RegisterSubPage(page)
         end
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("UI", "Settings UI initialized with %d page(s)", #self.pages)
     end
 end
 
@@ -96,11 +111,14 @@ function UI:_RegisterSubPage(page)
     page.__category = subcategory
 end
 
--- NOTE: Opening subcategories directly may not work reliably
 function UI:Open(pageId)
     if not Settings or not Settings.OpenToCategory then return end
     local page = self.pagesById[pageId] or self.pagesById["main"]
     if not page or not page.__category then return end
+
+    if SF.Debug then
+        SF.Debug:Info("UI", "Opening settings page: %s", tostring(pageId))
+    end
 
     Settings.OpenToCategory(page.__category)
 end

@@ -89,17 +89,27 @@ function Store:_RunMigrations(schema)
 	local target = (schema and schema.VERSION) or 1
 
 	local current = tonumber(self.db.version) or 1
+	if SF.Debug then
+		SF.Debug:Info("SETTINGS", "Running migrations from v%d to v%d", current, target)
+	end
+
 	while current < target do
 		local nextVersion = current + 1
 		local fn = migrations[nextVersion]
 
 		if type(fn) == "function" then
+			if SF.Debug then
+				SF.Debug:Verbose("SETTINGS", "Executing migration to v%d", nextVersion)
+			end
 			local ok, err = pcall(fn, self.db)
 			if not ok then
-				if SF.Debug and SF.Debug.Print then
-					SF.Debug:Print("Settings migration to v" .. tostring(nextVersion) .. " failed: " .. tostring(err))
+				if SF.Debug then
+					SF.Debug:Error("SETTINGS", "Migration to v%d failed: %s", nextVersion, tostring(err))
 				end
 				return
+			end
+			if SF.Debug then
+				SF.Debug:Info("SETTINGS", "Successfully migrated to v%d", nextVersion)
 			end
 		end
 
@@ -109,6 +119,10 @@ function Store:_RunMigrations(schema)
 end
 
 function Store:Init()
+	if SF.Debug then
+		SF.Debug:Info("SETTINGS", "Initializing SettingsStore")
+	end
+
 	local schema = SF.SettingsSchema
 	local defaults = (schema and schema.DEFAULTS) or {}
 
@@ -122,8 +136,14 @@ function Store:Init()
 	-- - If DB is empty, treat as fresh install at the latest schema
 	if tonumber(self.db.version) == nil then
 		if next(self.db) ~= nil then
+			if SF.Debug then
+				SF.Debug:Info("SETTINGS", "Existing database found, assuming v1")
+			end
 			self.db.version = 1
 		else
+			if SF.Debug then
+				SF.Debug:Info("SETTINGS", "Fresh database, setting to v%d", targetVersion)
+			end
 			self.db.version = targetVersion			
 		end		
 	end
@@ -143,6 +163,10 @@ function Store:Init()
 
 	-- Stamp final version
 	self.db.version = math.max(tonumber(self.db.version) or 1, targetVersion)
+
+	if SF.Debug then
+		SF.Debug:Info("SETTINGS", "SettingsStore initialized at v%d", self.db.version)
+	end
 end
 
 -- ----------------------------
@@ -156,6 +180,9 @@ function Store:Get(path)
 end
 
 function Store:Set(path, value)
+	if SF.Debug then
+		SF.Debug:Verbose("SETTINGS", "Setting '%s' to value", path)
+	end
 	local parent, key = ResolvePath(self.db, path, true)
 	local old = parent[key]
 	parent[key] = value
@@ -198,11 +225,18 @@ end
 function Store:SetActiveProfile(name)
 	local profiles = self:GetProfiles()
 	if not profiles[name] then
+		if SF.Debug then
+			SF.Debug:Warn("SETTINGS", "Attempted to set non-existent profile '%s' as active", name)
+		end
 		return false, "Profile does not exist."
 	end
 
 	local old = self.db.lootHelper.activeProfile
 	self.db.lootHelper.activeProfile = name
+
+	if SF.Debug then
+		SF.Debug:Info("SETTINGS", "Active profile changed from '%s' to '%s'", tostring(old), tostring(name))
+	end
 
 	-- Fire a callback so UI can refresh dependent controls if it wants
 	self:_Fire("lootHelper.activeProfile", name, old)
@@ -211,17 +245,29 @@ end
 
 function Store:CreateProfile(name)
 	local ok, err = IsValidProfileName(name)
-	if not ok then return false, err end
+	if not ok then
+		if SF.Debug then
+			SF.Debug:Warn("SETTINGS", "Invalid profile name '%s': %s", name, err)
+		end
+		return false, err
+	end
 	name = Trim(name)
 
 	local profiles = self:GetProfiles()
 	if profiles[name] then
+		if SF.Debug then
+			SF.Debug:Warn("SETTINGS", "Attempted to create profile '%s' but it already exists", name)
+		end
 		return false, "A profile with that name already exists."
 	end
 
 	-- Copy template shape from Default (safe + consistent)
 	local template = SF.SettingsSchema.DEFAULTS.lootHelper.profiles.Default
 	profiles[name] = DeepCopy(template)
+
+	if SF.Debug then
+		SF.Debug:Info("SETTINGS", "Created new profile '%s'", name)
+	end
 
 	-- Auto-select new profile
 	self:SetActiveProfile(name)
@@ -346,6 +392,10 @@ function Store:ResetActiveProfileKeys(keys)
 end
 
 function Store:ResetAll()
+	if SF.Debug then
+		SF.Debug:Warn("SETTINGS", "Resetting all settings to defaults")
+	end
+
 	local defaults = SF.SettingsSchema and SF.SettingsSchema.DEFAULTS
 	if not defaults then return false, "No defaults available" end
 
@@ -357,6 +407,10 @@ function Store:ResetAll()
 	-- Re-apply defaults
 	MergeDefaults(self.db, DeepCopy(defaults))
 	self:_EnsureActiveProfile()
+
+	if SF.Debug then
+		SF.Debug:Info("SETTINGS", "All settings reset to defaults")
+	end
 
 	-- Fire a single reset signal; Apply module can re-apply everything
 	self:_Fire("sf.reset", true, false)
@@ -398,6 +452,9 @@ end
 
 function Store:SetActiveLootHelperProfileId(profileId)
 	if profileId == nil then
+		if SF.Debug then
+			SF.Debug:Info("SETTINGS", "Clearing active LootHelper profile")
+		end
 		local old = self.db.lootHelper.activeProfileId
 		self.db.lootHelper.activeProfileId = nil
 		self:_Fire("lootHelper.activeProfileId", nil, old)
@@ -405,16 +462,27 @@ function Store:SetActiveLootHelperProfileId(profileId)
 	end
 
 	if type(profileId) ~= "string" then
+		if SF.Debug then
+			SF.Debug:Warn("SETTINGS", "Invalid profile id type: %s", type(profileId))
+		end
 		return false, "Invalid profile id."
 	end
 
 	local profiles = self:GetLootHelperProfiles()
 	if not profiles[profileId] then
+		if SF.Debug then
+			SF.Debug:Warn("SETTINGS", "Attempted to set non-existent LootHelper profile '%s' as active", profileId)
+		end
 		return false, "Profile does not exist."
 	end
 
 	local old = self.db.lootHelper.activeProfileId
 	self.db.lootHelper.activeProfileId = profileId
+
+	if SF.Debug then
+		SF.Debug:Info("SETTINGS", "Active LootHelper profile changed from '%s' to '%s'", tostring(old), tostring(profileId))
+	end
+
 	self:_Fire("lootHelper.activeProfileId", profileId, old)
 
 	return true

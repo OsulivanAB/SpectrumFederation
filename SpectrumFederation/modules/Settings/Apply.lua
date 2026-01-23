@@ -8,6 +8,10 @@ function Apply:Init()
     if self.initialized then return end
     self.initialized = true
 
+    if SF.Debug then
+        SF.Debug:Info("SETTINGS", "Initializing SettingsApply module")
+    end
+
     local store = SF.SettingsStore
     if not store or not store.RegisterCallback then return end
 
@@ -70,6 +74,10 @@ function Apply:Init()
 
     -- Apply current values once at startup
     self:ApplyAll()
+
+    if SF.Debug then
+        SF.Debug:Info("SETTINGS", "SettingsApply module initialized and settings applied")
+    end
 end
 
 function Apply:Debounce(token, delay, fn)
@@ -120,6 +128,10 @@ function Apply:RunOrDefer(fn)
 end
 
 function Apply:ApplyAll()
+    if SF.Debug then
+        SF.Debug:Verbose("SETTINGS", "Applying all settings")
+    end
+
     local store = SF.SettingsStore
     if not store then return end
 
@@ -137,27 +149,46 @@ function Apply:ApplyAll()
 end
 
 function Apply:ApplyWindowStyle(value)
+    if SF.Debug then
+        SF.Debug:Verbose("SETTINGS", "Applying window style: %s", tostring(value))
+    end
     -- TODO: implement
 end
 
 function Apply:ApplyFontStyle(value)
+    if SF.Debug then
+        SF.Debug:Verbose("SETTINGS", "Applying font style: %s", tostring(value))
+    end
     -- TODO: implement
 end
 
 function Apply:ApplyFontSize(value)
+    if SF.Debug then
+        SF.Debug:Verbose("SETTINGS", "Applying font size: %s", tostring(value))
+    end
     -- TODO: implement
 end
 
 function Apply:ApplyLootHelperEnabled(enabled)
+    if SF.Debug then
+        SF.Debug:Info("SETTINGS", "LootHelper enabled: %s", tostring(enabled))
+    end
     -- TODO: implement
 end
 
 function Apply:ApplyActiveProfileChange(newProfile, oldProfile)
+    if SF.Debug then
+        SF.Debug:Info("SETTINGS", "Active profile changed from '%s' to '%s'", tostring(oldProfile), tostring(newProfile))
+    end
     -- TODO: implement
 end
 
 function Apply:ApplySafeMode(newValue, oldValue, ctx)
     -- ctx.profileName tells you which profile this change applies to
     -- Example: if SF.LootHelper and SF.LootHelper.SetSafeMode then SF.LootHelper:SetSafeMode(ctx.profileName, enabled) end
+    if SF.Debug then
+        SF.Debug:Info("SETTINGS", "Safe mode changed for profile '%s': %s -> %s", 
+            tostring(ctx and ctx.profileName), tostring(oldValue), tostring(newValue))
+    end
     -- TODO: implement
 end
