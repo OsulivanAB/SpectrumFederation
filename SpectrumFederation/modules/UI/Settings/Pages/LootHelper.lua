@@ -347,6 +347,24 @@ function Page:Build(panel)
 							)
 						end,
 					},
+					{
+						type = "checkbox",
+						label = "Show Loot Window outside of Raid",
+						tooltip = "When enabled, the Loot Helper window may appear even if you are not in a raid.",
+						path = "lootHelper.showWindowOutsideRaid",
+					},
+					{
+						type = "checkbox",
+						label = "Lock Loot Window",
+						tooltip = "When enabled, the Loot Helper window cannot be moved or resized.",
+						path = "lootHelper.lockLootWindow",
+					},
+					{
+						type = "checkbox",
+						label = "Show Members not in raid",
+						tooltip = "When disabled, profile members who are not currently in your raid will be hidden in the Loot Helper window.",
+						path = "lootHelper.showMembersNotInRaid",
+					},
 				},
 			},
 
