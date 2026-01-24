@@ -148,6 +148,7 @@ function Controller:_HookSettingsStore()
         end
 
         if path == "lootHelper.lockLootWindow" then
+            self:ApplyLockState()
             return
         end
     end)
@@ -162,6 +163,46 @@ function Controller:_HookProfileChanges()
             self:OnActiveProfileChanged(profileId)
         end)
     end
+end
+
+function Controller:_HookProfileMutators()
+    if self._hookedProfileMutators then return end
+
+    local LP = SF.LootProfile
+    if type(LP) ~= "table" then
+        if C_Timer and C_Timer.After then
+            C_Timer.After(0, function()
+                if self and self._inited then
+                    self:_HookProfileMutators()
+                end
+            end)
+        end
+        return
+    end
+
+    local ctrl = self
+
+    local function HookMethod(methodName)
+        if type(LP[methodName]) ~= "function" then return end
+
+        hooksecurefunc(LP, methodName, function(profileSelf, ...)
+            ctrl:_OnProfileMutated(profileSelf, HookMethod)
+        end)
+    end
+
+    HookMethod("SetProfileName")
+    HookMethod("SetPointName")
+
+    self._hookedProfileMutators = true
+end
+
+function Controller:_OnProfileMutated(profileSelf, source)
+    local active = SF.GetActiveProfile and SF:GetActiveProfile() or nil
+    if not active or active ~= profileSelf then
+        return
+    end
+
+    self:RefreshTitle()
 end
 
 function Controller:OnActiveProfileChanged(profileId)
@@ -193,9 +234,12 @@ function Controller:Init()
     self:_InitEvents()
     self:_HookSettingsStore()
     self:_HookProfileChanges()
+    self:_HookProfileMutators()
 
     -- self:RefreshTitle()
     self:ApplyStyle()
+
+    self:ApplyLockState()
 
     if C_Timer and C_Timer.After then
         C_Timer.After(0, function()
@@ -223,15 +267,26 @@ end
 -- Refresh the title bar information
 function Controller:RefreshTitle()
     local profileName = "No Active Profile"
+
     if SF.GetActiveProfile then
         local p = SF:GetActiveProfile()
-        if p and p.GetProfileName then
-            profileName = p:GetProfileName()
+        if p then
+           local profName = (p.GetProfileName and p:GetProfileName()) or "Unnamed Profile"
+
+           local pointsName = "Points"
+           if p.GetPointName then
+            local v = p:GetPointName()
+            v = tostring(v or ""):match("^%s*(.-)%s*$")  -- trim
+            if v ~= "" then
+                pointsName = v
+            end
+           end
+           titleText = ("%s - %s"):format(profName, pointsName)
         end
     end
 
     if LH.Window then
-        LH.Window:SetProfileName(profileName)
+        LH.Window:SetProfileName(titleText)
 
         -- TODO: session system later (always false for now)
         LH.Window:SetSessionActive(false)
@@ -264,4 +319,19 @@ end
 function Controller:ShowDebug()
     self:Init()
     self:EvaluateVisibility("ShowDebug")
+end
+
+function Controller:ApplyLockState()
+    local locked = false
+
+    if SF.SettingsStore and SF.SettingsStore.Get then
+        locked = SF.SettingsStore:Get("lootHelper.lockLootWindow") and true or false
+    else
+        local db = SF.lootHelperDB or (SpectrumFederationDB and SpectrumFederationDB.lootHelper)
+        locked = db and db.lockLootWindow and true or false
+    end
+
+    if LH.Window and LH.Window.SetLocked then
+        LH.Window:SetLocked(locked)
+    end
 end

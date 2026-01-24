@@ -30,5 +30,10 @@ LH.Constants = LH.constants or {
 
     -- Title bar visuals
     LOGO_SIZE = 18,
-    ICON_BUTTON_SIZE = 18
+    ICON_BUTTON_SIZE = 18,
+
+    -- Resize Handle
+    RESIZE_HANDLE_SIZE = 16,
+    RESIZE_HANDLE_GAP = 6,
+    SCROLLBAR_GAP = 6
 }
