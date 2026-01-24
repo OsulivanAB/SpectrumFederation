@@ -102,6 +102,18 @@ function Controller:_InitEvents()
     ef:RegisterEvent("GROUP_ROSTER_UPDATE")
 end
 
+function Controller:OnEvent(event, ...)
+    if event == "PLAYER_ENTERING_WORLD" then
+        self:EvaluateVisibility("Event:PLAYER_ENTERING_WORLD")
+        return
+    end
+
+    if event == "GROUP_ROSTER_UPDATE" then
+        self:EvaluateVisibility("Event:GROUP_ROSTER_UPDATE")
+        return
+    end
+end
+
 -- ===================================================
 -- Hooks: Settings + active profile
 -- ===================================================

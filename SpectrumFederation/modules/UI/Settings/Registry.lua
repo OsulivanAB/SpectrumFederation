@@ -110,6 +110,10 @@ function UI:_RegisterRootPage(page)
     self.categoriesByPageId[page.id] = category
     page.__panel = panel
     page.__category = category
+
+    if SF.SettingsUI and SF.SettingsUI.RegisterPageCategory then
+        SF.SettingsUI:RegisterPageCategory(page.id, category)
+    end
 end
 
 -- Register a sub-page under a parent settings page
@@ -127,6 +131,10 @@ function UI:_RegisterSubPage(page)
     self.categoriesByPageId[page.id] = subcategory
     page.__panel = panel
     page.__category = subcategory
+
+    if SF.SettingsUI and SF.SettingsUI.RegisterPageCategory then
+        SF.SettingsUI:RegisterPageCategory(page.id, subcategory)
+    end
 end
 
 -- Open the settings panel to a specific page
