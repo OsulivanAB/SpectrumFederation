@@ -286,7 +286,7 @@ function Page:Build(panel)
 				items = {
 					{
 						type = "scrollableText",
-						label = "Logs",
+						label = "",
 						height = 300,
 						get = function()
 							return BuildLogText()

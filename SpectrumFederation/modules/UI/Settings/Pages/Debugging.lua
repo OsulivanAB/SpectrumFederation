@@ -217,8 +217,13 @@ function Page:Build(panel)
 				title = "Debug Logs",
 				items = {
 					{
+						type = "help",
+						text = "Use Ctrl+A to select all, Ctrl+C to copy",
+						indent = "label",
+					},
+					{
 						type = "scrollableText",
-						label = "Logs (Ctrl+A to select all, Ctrl+C to copy)",
+						label = "",
 						height = 300,
 						get = function()
 							return GetDebugLogsText()
