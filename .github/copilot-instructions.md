@@ -35,42 +35,11 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 - `main` - Stable releases (version: `X.Y.Z`)
 - `beta` - Beta/PTR releases (version: `X.Y.Z-beta.N`)
 
-**⚠️ VERSION BUMPING (CI FAILS WITHOUT) - ABSOLUTELY MANDATORY ⚠️**
-
-**EVERY Copilot agent MUST bump the version** when making ANY behavioral changes:
-
-**Location**: `SpectrumFederation/SpectrumFederation.toc` - Field: `## Version:`
-
-**When to bump** (ALWAYS for these):
-- Adding new features or functionality
-- Modifying existing behavior or logic
-- Fixing bugs that change code behavior
-- Updating UI elements or interfaces
-- Changing database schema or data structures
-- Modifying API interactions or integrations
-- Adding, removing, or modifying Lua files
-- Changing workflow logic or CI/CD behavior
-
-**When NOT to bump** (ONLY for these):
-- Documentation-only changes (README, docs/, comments)
-- Updating `.gitignore` or metadata files
-- Formatting/style changes (no behavior change)
-- Fixing typos in comments (unless user-facing)
-
-**Process**:
-1. Check current version: `grep "^## Version:" SpectrumFederation/SpectrumFederation.toc`
-2. Increment appropriately:
-   - **Patch** (Z): Bug fixes, minor changes (e.g., `0.3.1-beta.21` → `0.3.1-beta.22`)
-   - **Minor** (Y): New features (e.g., `0.3.1-beta.1` → `0.4.0-beta.1`)
-   - **Major** (X): Breaking changes (e.g., `0.3.1-beta.1` → `1.0.0-beta.1`)
-3. Update the `## Version:` line in the TOC file
-4. Verify with `git diff SpectrumFederation/SpectrumFederation.toc`
-
-**Enforcement**:
+**Version Bumping (CI FAILS WITHOUT):**
+- Every behavioral change to `main` or `beta` MUST bump `## Version:` in `SpectrumFederation.toc`
 - Beta versions can ONLY be released from `beta` branch
 - Stable versions can ONLY be released from `main` branch
 - CI validates branch/version alignment - do NOT edit workflows to bypass this
-- **CI will FAIL** if version is not bumped for behavioral changes
 
 **Release Process:**
 - Beta releases: Auto-created by `post-merge-beta.yml` after PR merge to beta
@@ -383,37 +352,15 @@ end
 5. Test slash commands: `/sfdebug on`, `/sfdebug show`
 
 **Before Submitting PR:**
+```bash
+# Lint code
+luacheck SpectrumFederation --only 0
 
-**CRITICAL CHECKLIST** (do in this order):
+# Bump version in SpectrumFederation.toc
+## Version: 0.0.15-beta.1  # (or next appropriate version)
 
-1. **⚠️ BUMP VERSION (if behavioral change)** ⚠️
-   ```bash
-   # Check current version
-   grep "^## Version:" SpectrumFederation/SpectrumFederation.toc
-   
-   # Edit SpectrumFederation/SpectrumFederation.toc
-   ## Version: 0.3.1-beta.22  # Increment appropriately
-   
-   # Verify the change
-   git diff SpectrumFederation/SpectrumFederation.toc
-   ```
-
-2. **Lint code**
-   ```bash
-   luacheck SpectrumFederation --only 0
-   ```
-
-3. **Test in-game**
-   ```bash
-   # Launch WoW and use /reload to test changes
-   # Enable Lua errors: /console scriptErrors 1
-   ```
-
-4. **Verify all changes**
-   ```bash
-   git status
-   git diff
-   ```
+# Test in-game with /reload
+```
 
 ## Common Tasks
 
@@ -449,12 +396,8 @@ end
 
 ## Critical Rules - DO NOT VIOLATE
 
-**⚠️ Version Management (HIGHEST PRIORITY):**
-- ❌ **NEVER** skip version bump in `.toc` for behavioral changes
-- ❌ **NEVER** forget to check and update `SpectrumFederation/SpectrumFederation.toc`
-- ❌ **NEVER** submit a PR with code changes without bumping version
-- ✅ **ALWAYS** bump version BEFORE committing code changes
-- ✅ **ALWAYS** verify version was bumped: `git diff SpectrumFederation/SpectrumFederation.toc`
+**Version Management:**
+- ❌ Never skip version bump in `.toc` for behavioral changes
 - ❌ Never release beta versions from `main` branch
 - ❌ Never release stable versions from `beta` branch
 - ❌ Never edit workflow files to bypass version checks
@@ -526,84 +469,7 @@ SpectrumFederation/
 **Resources:**
 - WoW API Docs: [https://wowpedia.fandom.com/wiki/World_of_Warcraft_API](https://wowpedia.fandom.com/wiki/World_of_Warcraft_API)
 - BlizzardUI Reference: `BlizzardUI/live/` or `BlizzardUI/beta/` (local only)
-- GitHub Agent Instructions: `.github/agents/instructions.md` (for GitHub Copilot agents)
-- Workflow Documentation: `docs/development/workflows.md`
-
----
-
-## Maintaining These Instructions
-
-**GitHub Copilot agents are responsible for keeping instruction files up-to-date.**
-
-### When to Update Instructions
-
-**Update BOTH `.github/copilot-instructions.md` AND `.github/agents/instructions.md` when:**
-
-1. **Significant codebase changes**:
-   - New architectural patterns introduced
-   - Major refactoring changes
-   - New module organization
-   - Changed file structure
-
-2. **New workflows or automation**:
-   - Added CI/CD requirements
-   - New validation scripts
-   - Modified release process
-   - Changed branch strategy
-
-3. **Project structure changes**:
-   - New directories added
-   - File organization updated
-   - Load order changes
-   - New dependencies
-
-4. **Critical rule changes**:
-   - Version bumping requirements modified
-   - New mandatory checks added
-   - Breaking change patterns
-   - Security requirements
-
-### How to Update Instructions
-
-**Process**:
-1. Identify what changed in the codebase
-2. Update `.github/copilot-instructions.md` with detailed examples
-3. Update `.github/agents/instructions.md` with concise rules
-4. Keep critical rules synchronized between both files
-5. Test instructions with example scenarios
-6. Include updates in your PR
-
-**Synchronized sections** (must match in both files):
-- Version bumping rules
-- Branch strategy
-- TOC file management
-- File structure guidelines
-- CI/CD enforcement
-
-**File-specific content**:
-- `.github/copilot-instructions.md`: Detailed examples, code patterns, comprehensive guidance
-- `.github/agents/instructions.md`: Concise rules, critical requirements, quick reference
-
-### Review Checklist
-
-Before finalizing changes, verify:
-- [ ] Version bumping rules are clear and emphasized
-- [ ] New patterns are documented with examples
-- [ ] Critical rules are in BOTH instruction files
-- [ ] File structure examples are current
-- [ ] Workflow documentation is referenced
-- [ ] Examples use actual code from the repository
-- [ ] Deprecated patterns are removed or marked as deprecated
-
-### Instruction Maintenance
-
-Treat instruction files as **first-class documentation**:
-- Update them in the same PR as code changes
-- Review for accuracy when patterns change
-- Keep examples up-to-date with current code
-- Remove outdated information promptly
-- Ensure consistency across all instruction files
-
+- Extended guidance: `AGENTS.md`
 
 
 
