@@ -321,10 +321,10 @@ function SettingsWindow:CreateWindow()
     divider:SetColorTexture(unpack(C.DIVIDER))
     
     -- Right content panel (with scroll frame)
-    -- Anchor to close button to avoid overlap with scrollbar
+    -- Position below close button to avoid scrollbar overlap
     local contentPanel = CreateFrame("Frame", nil, frame)
     contentPanel:SetPoint("TOPLEFT", divider, "TOPRIGHT", C.CONTENT_PADDING, 0)
-    contentPanel:SetPoint("TOPRIGHT", closeBtn, "BOTTOMRIGHT", 0, 0)
+    contentPanel:SetPoint("TOP", closeBtn, "BOTTOM", 0, 0)
     contentPanel:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -C.PADDING, C.PADDING)
     
     -- Content host (will contain page panels)
