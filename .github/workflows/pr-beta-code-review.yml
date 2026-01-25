@@ -1,3 +1,29 @@
+# PR Beta Code Review Workflow
+#
+# Purpose: Provide code review guidance for adding debugging statements to Lua code changes
+#          in pull requests to the beta branch.
+#
+# Trigger: Pull requests to beta branch that modify Lua files in SpectrumFederation/**
+#
+# Approval: Requires manual approval via the 'beta-code-review' environment
+#           Configure in Settings → Environments → beta-code-review
+#
+# Process:
+#   1. Detects changed Lua files in the PR
+#   2. Generates a diff of the code changes
+#   3. Creates a detailed review prompt for adding SF.Debug logging
+#   4. Posts a PR comment with review instructions and context
+#   5. Skips execution if no Lua files were changed
+#
+# Review Focus:
+#   - Add debug logging only where genuinely useful (entry points, errors, state changes)
+#   - Use appropriate log levels (VERBOSE, INFO, WARN, ERROR)
+#   - Follow existing SF.Debug patterns from modules/debug.lua
+#   - Avoid trivial logging (getters, setters, simple property access)
+#
+# Note: This workflow does NOT automatically modify code. It provides guidance for
+#       developers to manually add debugging where appropriate during code review.
+
 name: PR Beta Code Review
 
 on:
