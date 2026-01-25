@@ -259,6 +259,13 @@ python3 .github/scripts/validate_packaging.py
 - Version already released
 - Bump version again to create new release
 
+**PR Retargeted from Main to Beta**:
+- If you accidentally opened a PR to `main` instead of `beta`, you can retarget it
+- Close the original PR and open a new one targeting `beta`, OR
+- Use GitHub's "Edit" button to change the base branch
+- The main validation workflow will automatically detect the change and pass gracefully
+- The beta validation workflow will then run for the new target
+
 ---
 
 ### Post-Merge Beta Fails

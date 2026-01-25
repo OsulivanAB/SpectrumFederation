@@ -71,11 +71,42 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 - `main` - Stable releases (version: `X.Y.Z`)
 - `beta` - Beta/PTR releases (version: `X.Y.Z-beta.N`)
 
-**Version Bumping (CI FAILS WITHOUT):**
-- Every behavioral change to `main` or `beta` MUST bump `## Version:` in `SpectrumFederation.toc`
+**⚠️ VERSION BUMPING (CI FAILS WITHOUT) - ABSOLUTELY MANDATORY ⚠️**
+
+**EVERY Copilot agent MUST bump the version** when making ANY behavioral changes:
+
+**Location**: `SpectrumFederation/SpectrumFederation.toc` - Field: `## Version:`
+
+**When to bump** (ALWAYS for these):
+- Adding new features or functionality
+- Modifying existing behavior or logic
+- Fixing bugs that change code behavior
+- Updating UI elements or interfaces
+- Changing database schema or data structures
+- Modifying API interactions or integrations
+- Adding, removing, or modifying Lua files
+- Changing workflow logic or CI/CD behavior
+
+**When NOT to bump** (ONLY for these):
+- Documentation-only changes (README, docs/, comments)
+- Updating `.gitignore` or metadata files
+- Formatting/style changes (no behavior change)
+- Fixing typos in comments (unless user-facing)
+
+**Process**:
+1. Check current version: `grep "^## Version:" SpectrumFederation/SpectrumFederation.toc`
+2. Increment appropriately:
+   - **Patch** (Z): Bug fixes, minor changes (e.g., `0.3.1-beta.21` → `0.3.1-beta.22`)
+   - **Minor** (Y): New features (e.g., `0.3.1-beta.1` → `0.4.0-beta.1`)
+   - **Major** (X): Breaking changes (e.g., `0.3.1-beta.1` → `1.0.0-beta.1`)
+3. Update the `## Version:` line in the TOC file
+4. Verify with `git diff SpectrumFederation/SpectrumFederation.toc`
+
+**Enforcement**:
 - Beta versions can ONLY be released from `beta` branch
 - Stable versions can ONLY be released from `main` branch
 - CI validates branch/version alignment - do NOT edit workflows to bypass this
+- **CI will FAIL** if version is not bumped for behavioral changes
 
 **Release Process:**
 - Beta releases: Auto-created by `post-merge-beta.yml` after PR merge to beta
@@ -615,15 +646,37 @@ end
 5. Test slash commands: `/sfdebug on`, `/sfdebug show`
 
 **Before Submitting PR:**
-```bash
-# Lint code
-luacheck SpectrumFederation --only 0
 
-# Bump version in SpectrumFederation.toc
-## Version: 0.0.15-beta.1  # (or next appropriate version)
+**CRITICAL CHECKLIST** (do in this order):
 
-# Test in-game with /reload
-```
+1. **⚠️ BUMP VERSION (if behavioral change)** ⚠️
+   ```bash
+   # Check current version
+   grep "^## Version:" SpectrumFederation/SpectrumFederation.toc
+   
+   # Edit SpectrumFederation/SpectrumFederation.toc
+   ## Version: 0.3.1-beta.22  # Increment appropriately
+   
+   # Verify the change
+   git diff SpectrumFederation/SpectrumFederation.toc
+   ```
+
+2. **Lint code**
+   ```bash
+   luacheck SpectrumFederation --only 0
+   ```
+
+3. **Test in-game**
+   ```bash
+   # Launch WoW and use /reload to test changes
+   # Enable Lua errors: /console scriptErrors 1
+   ```
+
+4. **Verify all changes**
+   ```bash
+   git status
+   git diff
+   ```
 
 ## Common Tasks
 
@@ -676,8 +729,12 @@ luacheck SpectrumFederation --only 0
 
 ## Critical Rules - DO NOT VIOLATE
 
-**Version Management:**
-- ❌ Never skip version bump in `.toc` for behavioral changes
+**⚠️ Version Management (HIGHEST PRIORITY):**
+- ❌ **NEVER** skip version bump in `.toc` for behavioral changes
+- ❌ **NEVER** forget to check and update `SpectrumFederation/SpectrumFederation.toc`
+- ❌ **NEVER** submit a PR with code changes without bumping version
+- ✅ **ALWAYS** bump version BEFORE committing code changes
+- ✅ **ALWAYS** verify version was bumped: `git diff SpectrumFederation/SpectrumFederation.toc`
 - ❌ Never release beta versions from `main` branch
 - ❌ Never release stable versions from `beta` branch
 - ❌ Never edit workflow files to bypass version checks
