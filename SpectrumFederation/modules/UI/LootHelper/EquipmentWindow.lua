@@ -8,16 +8,27 @@ LH.EquipmentWindow = LH.EquipmentWindow or {}
 local EquipmentWindow = LH.EquipmentWindow
 
 -- Constants
-local WINDOW_WIDTH = 280
-local WINDOW_MIN_HEIGHT = 200
-local WINDOW_MAX_HEIGHT = 600
-local WINDOW_HEIGHT_RATIO = 0.5  -- 50% of main window height
 local TITLE_HEIGHT = 28
 local PADDING = 10
 local ICON_SIZE = 32
 local ICON_SPACING = 4
+local COL_SPACING = ICON_SIZE  -- Spacer between columns (size of an icon)
 local NUM_ROWS = 9
 local NUM_COLS = 2
+
+-- Calculate window dimensions based on content
+-- Width: left padding + icon + spacing + col spacer + icon + spacing + right padding
+local CONTENT_WIDTH = ICON_SIZE * NUM_COLS + COL_SPACING + (PADDING * 2)
+local WINDOW_WIDTH = CONTENT_WIDTH + 12 + 12  -- Add backdrop insets (left 4 + right 4) + frame border padding (6 + 6)
+
+-- Height: title bar + padding + icons + spacing + padding
+local CONTENT_HEIGHT = (ICON_SIZE * NUM_ROWS) + (ICON_SPACING * (NUM_ROWS - 1))
+local WINDOW_HEIGHT = TITLE_HEIGHT + 6 + PADDING + CONTENT_HEIGHT + PADDING  -- 6 is top gap after title
+
+-- Min/max height constraints (for dynamic sizing if needed)
+local WINDOW_MIN_HEIGHT = WINDOW_HEIGHT
+local WINDOW_MAX_HEIGHT = WINDOW_HEIGHT
+local WINDOW_HEIGHT_RATIO = 0.5  -- 50% of main window height (used in ShowForMember)
 
 -- Slot definitions with paperdoll textures
 -- Left column slots
@@ -85,7 +96,7 @@ function EquipmentWindow:Create()
     end
 
     local frame = CreateFrame("Frame", "SF_EquipmentWindow", UIParent, "BackdropTemplate")
-    frame:SetSize(WINDOW_WIDTH, 400)  -- Initial height, will be adjusted
+    frame:SetSize(WINDOW_WIDTH, WINDOW_HEIGHT)
     frame:SetClampedToScreen(true)
     frame:SetFrameStrata("MEDIUM")
     frame:SetFrameLevel(100)  -- Above main window
@@ -184,17 +195,19 @@ function EquipmentWindow:_CreateGearGrid(content)
         icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)  -- Crop edges
         btn.Icon = icon
 
-        -- Highlight
+        -- Hover highlight (shown on mouseover)
         local hl = btn:CreateTexture(nil, "HIGHLIGHT")
         hl:SetAllPoints(btn)
-        hl:SetColorTexture(1, 1, 1, 0.15)
+        hl:SetColorTexture(1, 1, 1, 0.3)  -- Brighter white highlight for hover
 
-        -- Border for highlighting (shown when equipped)
-        local border = btn:CreateTexture(nil, "BORDER")
-        border:SetAllPoints(btn)
-        border:SetColorTexture(0, 1, 0, 0.4)
-        border:Hide()
-        btn.Border = border
+        -- "Used" overlay (golden glow, shown when slot is used)
+        local overlay = btn:CreateTexture(nil, "OVERLAY")
+        overlay:SetAllPoints(btn)
+        overlay:SetTexture("Interface\\Buttons\\UI-ActionButton-Border")
+        overlay:SetBlendMode("ADD")
+        overlay:SetVertexColor(1, 0.8, 0, 0.8)  -- Golden glow
+        overlay:Hide()
+        btn.UsedOverlay = overlay
 
         return btn
     end
@@ -208,8 +221,8 @@ function EquipmentWindow:_CreateGearGrid(content)
         end
     end
 
-    -- Create right column
-    local colGap = ICON_SIZE + ICON_SPACING * 2
+    -- Create right column with spacer
+    local colGap = ICON_SIZE + COL_SPACING
     for i = 1, NUM_ROWS do
         local y = (i - 1) * (ICON_SIZE + ICON_SPACING)
         local btn = CreateSlotButton(content, RIGHT_SLOTS[i], colGap, y)
@@ -249,15 +262,11 @@ function EquipmentWindow:ShowForMember(mainFrame, rowModel, memberObj, canAdmin)
     self._frame:Show()
 end
 
--- Update the position and height based on main window
+-- Update the position based on main window
 function EquipmentWindow:_UpdatePosition()
     if not self._frame or not self._mainFrame then return end
 
-    local mainHeight = self._mainFrame:GetHeight() or 400
-    local desiredHeight = math.floor(mainHeight * WINDOW_HEIGHT_RATIO)
-    desiredHeight = math.max(WINDOW_MIN_HEIGHT, math.min(WINDOW_MAX_HEIGHT, desiredHeight))
-
-    self._frame:SetHeight(desiredHeight)
+    -- Fixed size window, just update position to stay anchored
     self._frame:ClearAllPoints()
     self._frame:SetPoint("TOPLEFT", self._mainFrame, "TOPRIGHT", 8, 0)
 end
@@ -315,15 +324,19 @@ function EquipmentWindow:Refresh()
             local used = armor[slotKey] == true
 
             if used then
-                -- Highlighted: full color, show border
+                -- Used: full color, show golden overlay
                 btn.Icon:SetDesaturated(false)
                 btn.Icon:SetVertexColor(1, 1, 1, 1)
-                btn.Border:Show()
+                if btn.UsedOverlay then
+                    btn.UsedOverlay:Show()
+                end
             else
-                -- Greyed: desaturated, grey tone, hide border
+                -- Not used: desaturated, grey tone, hide overlay
                 btn.Icon:SetDesaturated(true)
                 btn.Icon:SetVertexColor(0.6, 0.6, 0.6, 0.8)
-                btn.Border:Hide()
+                if btn.UsedOverlay then
+                    btn.UsedOverlay:Hide()
+                end
             end
 
             -- Set click handler
