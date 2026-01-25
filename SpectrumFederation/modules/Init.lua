@@ -33,6 +33,14 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.SettingsUI:Init()
     end
 
+    -- Initialize Standalone Settings Window (if Blizzard Settings is disabled)
+    if SF.SettingsWindow and SF.SettingsWindow.Init then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing Standalone Settings Window")
+        end
+        SF.SettingsWindow:Init()
+    end
+
     if SF.Debug then
         SF.Debug:Info("INIT", "All modules initialized successfully")
     end
