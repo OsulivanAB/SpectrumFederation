@@ -18,7 +18,7 @@ local C = {
     PADDING = 12,
     
     -- Navigation elements
-    BANNER_HEIGHT = 84,
+    BANNER_HEIGHT = 54,  -- Maintains 4:1 aspect ratio for 512x128 banner texture
     VERSION_HEIGHT = 16,
     NAV_BUTTON_HEIGHT = 28,
     NAV_BUTTON_GAP = 6,
