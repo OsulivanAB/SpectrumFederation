@@ -478,14 +478,10 @@ function Controller:OnAddRaidNonMember(model)
 
     local ok = profile:AddMember(member)
     if ok then
-        -- Notify data changed
-        if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
-            SF.LootHelperEvents:NotifyDataChanged("UI:AddMember", { memberId = memberId })
-        end
-
         if SF.Debug then
             SF.Debug:Info("LH_WINDOW", "Added member to profile: %s", tostring(memberId))
         end
+        -- Note: AddMember hook will also fire LP:AddMember event
     else
         if SF.Debug then
             SF.Debug:Warn("LH_WINDOW", "Failed to add member to profile: %s", tostring(memberId))
