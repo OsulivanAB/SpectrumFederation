@@ -1,0 +1,382 @@
+name: PR Enhancement with Copilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull Request number to enhance'
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  enhance-pr:
+    name: Enhance PR with Debug Logging and Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get PR information
+        id: pr_info
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ inputs.pr_number }}
+            });
+
+            core.setOutput('pr_branch', pr.data.head.ref);
+            core.setOutput('pr_base', pr.data.base.ref);
+            core.setOutput('pr_title', pr.data.title);
+            core.setOutput('pr_author', pr.data.user.login);
+
+            return pr.data;
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr_info.outputs.pr_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y luarocks
+          sudo luarocks install luacheck
+          pip install yamllint ruff
+
+      - name: Get PR files
+        id: pr_files
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const files = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ inputs.pr_number }}
+            });
+
+            const luaFiles = files.data
+              .filter(f => f.filename.endsWith('.lua') && f.status !== 'removed')
+              .map(f => f.filename);
+
+            const docFiles = files.data
+              .filter(f => f.filename.startsWith('docs/') && f.filename.endsWith('.md'))
+              .map(f => f.filename);
+
+            core.setOutput('lua_files', JSON.stringify(luaFiles));
+            core.setOutput('doc_files', JSON.stringify(docFiles));
+            core.setOutput('has_lua_files', luaFiles.length > 0);
+            core.setOutput('has_doc_files', docFiles.length > 0);
+
+            return { luaFiles, docFiles };
+
+      - name: Create enhancement branch
+        run: |
+          ENHANCEMENT_BRANCH="enhance-pr-${{ inputs.pr_number }}-$(date +%s)"
+          git checkout -b "$ENHANCEMENT_BRANCH"
+          echo "ENHANCEMENT_BRANCH=$ENHANCEMENT_BRANCH" >> $GITHUB_ENV
+
+      - name: Create enhancement instructions file
+        run: |
+          cat > copilot_instructions.md << 'EOF'
+          # PR Enhancement Instructions
+
+          You are reviewing a Pull Request for a World of Warcraft addon written in Lua 5.1.
+
+          ## TASK 1 - ADD DEBUG LOGGING (REALISTIC APPROACH)
+
+          Review the PR changes and add debug logging ONLY where it would be genuinely useful:
+
+          - Function entry/exit points for complex functions
+          - Error conditions and validation failures
+          - State changes in important operations
+          - Key decision points in control flow
+
+          DO NOT add debug logging for:
+
+          - Simple getters/setters
+          - Trivial utility functions
+          - Every single line of code
+
+          Use this format for debug logging:
+
+          ```lua
+          if SF.Debug then
+              SF.Debug:Info("CATEGORY", "message with %s", arg)
+          end
+          ```
+
+          Available debug methods: Info(), Error(), Warn(), Verbose()
+
+          Use appropriate categories like: "LOOT_HELPER", "PROFILES", "SYNC", "UI", etc.
+
+          ## TASK 2 - UPDATE MKDOCS DOCUMENTATION
+
+          Review if PR changes require documentation updates in docs/ folder.
+
+          Only update docs if:
+
+          - New user-facing features are added
+          - Significant changes to existing features
+          - New developer APIs or patterns
+
+          DO NOT update docs for:
+
+          - Internal refactoring
+          - Minor bug fixes
+          - Trivial changes
+
+          ## TASK 3 - ADD FUNCTION DOCUMENTATION
+
+          For any NEW or significantly MODIFIED functions, ensure they have Lua documentation:
+
+          ```lua
+          -- Brief description of what the function does
+          -- @param paramName type Description
+          -- @param anotherParam type Description
+          -- @return returnType Description
+          ```
+
+          Example:
+
+          ```lua
+          -- Normalizes a player name to "Name-Realm" format
+          -- @param name string Player name (with or without realm)
+          -- @param defaultRealm string Realm to use if not in name
+          -- @return string Normalized "Name-Realm" identifier
+          function NormalizeNameRealm(name, defaultRealm)
+          ```
+
+          ## IMPORTANT GUIDELINES
+
+          - Be realistic and pragmatic - quality over quantity
+          - Don't add things just to add things
+          - Focus on what genuinely improves code maintainability
+          - Follow existing code patterns in the repository
+          - Preserve existing code style and formatting
+
+          Now analyze the files and make appropriate enhancements.
+          EOF
+
+      - name: Get PR diff for analysis
+        id: pr_diff
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const diff = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ inputs.pr_number }},
+              mediaType: {
+                format: 'diff'
+              }
+            });
+
+            const fs = require('fs');
+            fs.writeFileSync('pr_diff.patch', diff.data);
+
+            core.summary.addHeading('PR Enhancement Analysis');
+            core.summary.addRaw('Analyzing PR #${{ inputs.pr_number }}');
+            await core.summary.write();
+
+      - name: Manual enhancement guidance
+        run: |
+          echo "================================================"
+          echo "PR ENHANCEMENT GUIDANCE"
+          echo "================================================"
+          echo ""
+          echo "This workflow has prepared PR #${{ inputs.pr_number }} for enhancement"
+          echo ""
+          echo "FILES TO REVIEW:"
+          echo "${{ steps.pr_files.outputs.lua_files }}" | jq -r '.[]' 2>/dev/null || echo "No Lua files"
+          echo ""
+          echo "ENHANCEMENT TASKS:"
+          echo ""
+          echo "1. DEBUG LOGGING:"
+          echo "   - Add SF.Debug:Info() for important operations"
+          echo "   - Add SF.Debug:Error() for error conditions"
+          echo "   - Add SF.Debug:Warn() for warnings"
+          echo "   - Use appropriate categories"
+          echo ""
+          echo "2. DOCUMENTATION:"
+          echo "   - Update docs/ if user-facing changes exist"
+          echo "   - Follow MkDocs format with blank lines before/after lists"
+          echo "   - Update navigation in mkdocs.yml if needed"
+          echo ""
+          echo "3. FUNCTION DOCS:"
+          echo "   - Add Lua doc comments to new/modified functions"
+          echo "   - Format: -- Description, -- @param, -- @return"
+          echo ""
+          echo "See copilot_instructions.md for detailed guidelines"
+          echo "================================================"
+
+      - name: Apply enhancements with GitHub Copilot CLI
+        id: apply_enhancements
+        continue-on-error: true
+        run: |
+          # This step would integrate with GitHub Copilot CLI or API
+          # For now, we'll create a placeholder that documents what needs to be done
+
+          echo "=== COPILOT INTEGRATION POINT ==="
+          echo ""
+          echo "To integrate with GitHub Copilot:"
+          echo "1. Use GitHub Copilot CLI to analyze pr_diff.patch"
+          echo "2. Review copilot_instructions.md for enhancement criteria"
+          echo "3. Apply enhancements to the checked out code"
+          echo "4. Commit changes if any modifications are made"
+          echo ""
+          echo "Manual enhancement is recommended until Copilot API is integrated"
+          echo ""
+
+          # Manual enhancement markers
+          if [ -f "pr_diff.patch" ]; then
+            echo "PR diff available for analysis"
+          fi
+
+      - name: Check for manual changes
+        id: check_changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Check if there are any uncommitted changes
+          if [[ -n $(git status --porcelain) ]]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+
+            # Show what changed
+            echo "Changes detected:"
+            git status --short
+
+            # Add and commit
+            git add .
+            git commit -m "enhance: Add debug logging and documentation for PR #${{ inputs.pr_number }}
+
+          - Added realistic debug logging where appropriate
+          - Updated documentation for user-facing changes
+          - Added Lua function documentation comments
+
+          Related to PR #${{ inputs.pr_number }}"
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes detected - enhancements may need to be applied manually"
+          fi
+
+      - name: Run linters on changes
+        if: steps.check_changes.outputs.has_changes == 'true'
+        continue-on-error: true
+        run: |
+          echo "Running linters to validate enhancements..."
+          python3 .github/scripts/lint_all.py || echo "⚠️ Linting issues detected - please review manually"
+
+      - name: Push enhancement branch
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          git push origin "$ENHANCEMENT_BRANCH"
+
+      - name: Create enhancement PR
+        if: steps.check_changes.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+            const prBranch = '${{ steps.pr_info.outputs.pr_branch }}';
+            const prTitle = '${{ steps.pr_info.outputs.pr_title }}';
+            const enhancementBranch = process.env.ENHANCEMENT_BRANCH;
+
+            const { data: newPR } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Enhancement] Add debug logging and docs for PR #${prNumber}`,
+              head: enhancementBranch,
+              base: prBranch,
+              body: `## PR Enhancement
+
+            This PR enhances #${prNumber} ("${prTitle}") with:
+
+            ### ✨ Enhancements Applied
+
+            - 🐛 **Debug Logging**: Added realistic debug logging where appropriate
+            - 📚 **Documentation**: Updated MkDocs documentation for user-facing changes
+            - 📝 **Function Docs**: Added/updated Lua documentation comments
+
+            ### 🎯 Review Guidelines
+
+            Please review these enhancements and:
+
+            - ✅ Verify debug logging is helpful and not excessive
+            - ✅ Confirm documentation changes are accurate
+            - ✅ Check that function documentation is complete
+            - ❌ Remove any unnecessary additions
+
+            ### 🔗 Related
+
+            - Original PR: #${prNumber}
+            - Enhancement requested via workflow_dispatch
+
+            ### ⚠️ Important
+
+            This PR should be merged into the branch from PR #${prNumber}, not into main/beta directly.
+
+            ---
+            *Generated by PR Enhancement workflow*
+            `
+            });
+
+            core.notice(`Created enhancement PR #${newPR.number} targeting PR #${prNumber}`);
+
+            core.summary.addHeading('Enhancement PR Created');
+            core.summary.addLink(`PR #${newPR.number}`, newPR.html_url);
+            core.summary.addRaw(`\n\nTargeting: ${prBranch}`);
+            await core.summary.write();
+
+      - name: No changes - Manual enhancement required
+        if: steps.check_changes.outputs.has_changes == 'false'
+        run: |
+          echo "================================================"
+          echo "⚠️ MANUAL ENHANCEMENT REQUIRED"
+          echo "================================================"
+          echo ""
+          echo "No automated changes were applied."
+          echo ""
+          echo "To enhance PR #${{ inputs.pr_number }} manually:"
+          echo ""
+          echo "1. Check out the PR branch:"
+          echo "   git checkout ${{ steps.pr_info.outputs.pr_branch }}"
+          echo ""
+          echo "2. Create an enhancement branch:"
+          echo "   git checkout -b enhance-pr-${{ inputs.pr_number }}"
+          echo ""
+          echo "3. Review the changes in PR #${{ inputs.pr_number }}"
+          echo ""
+          echo "4. Apply enhancements following copilot_instructions.md"
+          echo ""
+          echo "5. Commit and push your changes"
+          echo ""
+          echo "6. Create a PR targeting: ${{ steps.pr_info.outputs.pr_branch }}"
+          echo ""
+          echo "================================================"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: enhancement-artifacts
+          path: |
+            copilot_instructions.md
+            pr_diff.patch
+          retention-days: 7
