@@ -16,19 +16,10 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ## [0.4.0-beta.7] - 2026-01-25
 
-### Added
-- Introduced a new Loot Helper window for managing loot profiles and raid distributions.
-- Added slash command `/sf loot` to enable the Loot Helper module and display the Loot Helper window.
-- Implemented settings for the Loot Helper, including options to show the window outside raids, lock the loot window, and display members not in the raid.
-- Added event-driven updates for loot profiles and member changes to ensure real-time synchronization.
-- Introduced resizeable Loot Helper window with customizable layout and default placement.
-
-### Changed
-- Improved initialization of the Loot Helper database with additional settings for better customization.
-- Enhanced member handling by ensuring consistent property initialization for identifiers, roles, and classes.
-
 ### Fixed
-- Resolved issues where member properties such as names and realms were not being set correctly during initialization.
+- Corrected inconsistencies in variable naming for settings storage, ensuring proper retrieval of configuration values.
+- Fixed an issue where the Loot Helper window lock setting was not being read or applied correctly.
+- Resolved minor layout and state-saving bugs in the Loot Helper window.
 
 ## [0.3.1-beta.21] - 2026-01-23
 
