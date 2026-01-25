@@ -10,7 +10,7 @@ local Model = LH.RosterModel
 local function NormalizeNameRealm(id)
     if type(id) ~= "string" then return nil end
     if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
-        local norm = SF.NameUtil:NormalizeNameRealm(id)
+        local norm = SF.NameUtil.NormalizeNameRealm(id)
         return norm or id
     end
     return id
