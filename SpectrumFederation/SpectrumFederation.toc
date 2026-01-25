@@ -73,6 +73,7 @@ modules/UI/LootHelper/Style.lua
 modules/UI/LootHelper/Window.lua
 modules/UI/LootHelper/RosterModel.lua
 modules/UI/LootHelper/RosterView.lua
+modules/UI/LootHelper/EquipmentWindow.lua
 modules/UI/LootHelper/Controller.lua
 
 modules/Init.lua

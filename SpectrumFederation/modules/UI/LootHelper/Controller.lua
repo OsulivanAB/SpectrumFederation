@@ -78,6 +78,10 @@ function Controller:EvaluateVisibility(reason)
     else
         if f:IsShown() then
             f:Hide()
+            -- Also hide equipment window when main window hides
+            if LH.EquipmentWindow and LH.EquipmentWindow.Hide then
+                LH.EquipmentWindow:Hide()
+            end
         end
     end
 
@@ -402,7 +406,139 @@ function Controller:_BindLootHelperEvents()
 
     E:Register("DATA_CHANGED", function(owner, eventName, reason, payload)
         owner:RequestRefresh("DATA_CHANGED:" .. tostring(reason))
+        
+        -- Also refresh equipment window if visible
+        if LH.EquipmentWindow and LH.EquipmentWindow.IsShown and LH.EquipmentWindow:IsShown() then
+            if LH.EquipmentWindow.Refresh then
+                LH.EquipmentWindow:Refresh()
+            end
+        end
     end, self)
 
     self._boundLHEvents = true
+end
+
+-- ===================================================
+-- Action Handlers
+-- ===================================================
+
+-- Handle adding a raid non-member to the active profile
+function Controller:OnAddRaidNonMember(model)
+    if not model or not model.memberId then
+        if SF.Debug then
+            SF.Debug:Warn("LH_WINDOW", "OnAddRaidNonMember: Invalid model provided")
+        end
+        return
+    end
+
+    -- Get active profile
+    local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
+    if not profile then
+        if SF.Debug then
+            SF.Debug:Warn("LH_WINDOW", "OnAddRaidNonMember: No active profile")
+        end
+        return
+    end
+
+    -- Check admin permissions
+    if profile.IsCurrentUserAdmin and not profile:IsCurrentUserAdmin() then
+        if SF.Debug then
+            SF.Debug:Warn("LH_WINDOW", "OnAddRaidNonMember: User is not admin")
+        end
+        return
+    end
+
+    -- Create member instance
+    local memberId = model.memberId
+    local className = model.class or "UNKNOWN"
+
+    -- Use existing Member.new constructor
+    if not SF.Member or not SF.Member.new then
+        if SF.Debug then
+            SF.Debug:Error("LH_WINDOW", "OnAddRaidNonMember: SF.Member.new not available")
+        end
+        return
+    end
+
+    local member = SF.Member.new(memberId, SF.MemberRoles.MEMBER, className)
+    if not member then
+        if SF.Debug then
+            SF.Debug:Error("LH_WINDOW", "OnAddRaidNonMember: Failed to create member instance for %s", tostring(memberId))
+        end
+        return
+    end
+
+    -- Add member to profile
+    if not profile.AddMember then
+        if SF.Debug then
+            SF.Debug:Error("LH_WINDOW", "OnAddRaidNonMember: Profile does not support AddMember")
+        end
+        return
+    end
+
+    local ok = profile:AddMember(member)
+    if ok then
+        if SF.Debug then
+            SF.Debug:Info("LH_WINDOW", "Added member to profile: %s", tostring(memberId))
+        end
+        -- Note: AddMember hook will also fire LP:AddMember event
+    else
+        if SF.Debug then
+            SF.Debug:Warn("LH_WINDOW", "Failed to add member to profile: %s", tostring(memberId))
+        end
+    end
+end
+
+-- Handle equipment button click
+function Controller:OnEquipmentClicked(model)
+    if not model or model.type ~= "PROFILE_MEMBER" then
+        if SF.Debug then
+            SF.Debug:Warn("LH_WINDOW", "OnEquipmentClicked: Invalid model or not a profile member")
+        end
+        return
+    end
+
+    -- Get active profile
+    local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
+    if not profile then
+        if SF.Debug then
+            SF.Debug:Warn("LH_WINDOW", "OnEquipmentClicked: No active profile")
+        end
+        return
+    end
+
+    -- Get member object
+    local memberObj = model.member
+    if not memberObj and model.memberId then
+        -- Try to get member from profile
+        if profile.getMemberByID then
+            memberObj = profile:getMemberByID(model.memberId)
+        elseif profile.GetMemberByID then
+            memberObj = profile:GetMemberByID(model.memberId)
+        end
+    end
+
+    if not memberObj then
+        if SF.Debug then
+            SF.Debug:Warn("LH_WINDOW", "OnEquipmentClicked: Could not find member object for %s", tostring(model.memberId))
+        end
+        return
+    end
+
+    -- Check admin permissions
+    local canAdmin = false
+    if profile.IsCurrentUserAdmin then
+        canAdmin = profile:IsCurrentUserAdmin() and true or false
+    end
+
+    -- Create equipment window if needed
+    if LH.EquipmentWindow and LH.EquipmentWindow.Create then
+        LH.EquipmentWindow:Create()
+    end
+
+    -- Show equipment window
+    if LH.EquipmentWindow and LH.EquipmentWindow.ShowForMember then
+        local mainFrame = self:GetFrame()
+        LH.EquipmentWindow:ShowForMember(mainFrame, model, memberObj, canAdmin)
+    end
 end

@@ -130,7 +130,17 @@ local function GetClassColor(className)
 	return 1, 1, 1
 end
 
-local function TryGetSpecIcon(unit)
+local function TryGetSpecIcon(unit, memberId)
+    -- If no unit but memberId is provided, check if it's the player
+    if not unit and memberId then
+        if SF.NameUtil and SF.NameUtil.GetSelfId then
+            local selfId = SF.NameUtil.GetSelfId()
+            if selfId and SF.NameUtil.SamePlayer and SF.NameUtil.SamePlayer(memberId, selfId) then
+                unit = "player"
+            end
+        end
+    end
+
     if not unit then return nil end
 
     if UnitIsUnit(unit, "player") and GetSpecialization and GetSpecializationInfo then
@@ -367,10 +377,12 @@ function View:_LayoutButtons(r, model)
 			Place(r.BtnPlus)
 		end
 	else
-		if model.canAdmin then
-			r.BtnHelmet:Show()
-			Place(r.BtnHelmet)
+		-- For PROFILE_MEMBER rows: helmet is visible for everyone
+		r.BtnHelmet:Show()
+		Place(r.BtnHelmet)
 
+		-- Up/Down buttons are admin-only
+		if model.canAdmin then
 			r.BtnDown:Show()
 			Place(r.BtnDown)
 
@@ -419,29 +431,32 @@ function View:_BindRowActions(r, model)
     r.BtnPlus:SetScript("OnClick", nil)
 
     -- Profile member actions
-    if model.type == "PROFILE_MEMBER" and model.canAdmin and model.member then
-        r.BtnUp:SetScript("OnClick", function()
-            if model.member.IncrementPoints then
-                pcall(function() model.member:IncrementPoints() end)
-            end
-            if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
-                SF.LootHelperEvents:NotifyDataChanged("UI:IncrementPoints", { memberId = model.memberId })
-            end
-        end)
+    if model.type == "PROFILE_MEMBER" then
+        -- Up/Down buttons (admin only)
+        if model.canAdmin and model.member then
+            r.BtnUp:SetScript("OnClick", function()
+                if model.member.IncrementPoints then
+                    pcall(function() model.member:IncrementPoints() end)
+                end
+                if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
+                    SF.LootHelperEvents:NotifyDataChanged("UI:IncrementPoints", { memberId = model.memberId })
+                end
+            end)
+            
+            r.BtnDown:SetScript("OnClick", function()
+                if model.member.DecrementPoints then
+                    pcall(function() model.member:DecrementPoints() end)
+                end
+                if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
+                    SF.LootHelperEvents:NotifyDataChanged("UI:DecrementPoints", { memberId = model.memberId })
+                end
+            end)
+        end
         
-        r.BtnDown:SetScript("OnClick", function()
-            if model.member.DecrementPoints then
-                pcall(function() model.member:DecrementPoints() end)
-            end
-            if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
-                SF.LootHelperEvents:NotifyDataChanged("UI:DecrementPoints", { memberId = model.memberId })
-            end
-        end)
-        
+        -- Helmet button (visible for everyone)
         r.BtnHelmet:SetScript("OnClick", function()
-            -- TODO: implement helmet functionality later
-            if SF.Debug and SF.Debug.Info then
-                SF.Debug:Info("LH_WINDOW", "Helmet clicked for %s (TODO)", tostring(model.memberId))
+            if self.controller and self.controller.OnEquipmentClicked then
+                self.controller:OnEquipmentClicked(model)
             end
         end)
     end
@@ -449,9 +464,8 @@ function View:_BindRowActions(r, model)
     -- Raid non-member action
     if model.type == "RAID_NONMEMBER" and model.canAdmin then
         r.BtnPlus:SetScript("OnClick", function()
-            -- TODO: add member to active profile later
-            if SF.Debug and SF.Debug.Info then
-                SF.Debug:Info("LH_WINDOW", "Add member clicked for %s (TODO)", tostring(model.memberId))
+            if self.controller and self.controller.OnAddRaidNonMember then
+                self.controller:OnAddRaidNonMember(model)
             end
         end)
     end
@@ -492,8 +506,8 @@ function View:Render(models, meta)
         r:SetPoint("TOPLEFT", self.child, "TOPLEFT", 0, -y)
         r:SetPoint("TOPRIGHT", self.child, "TOPRIGHT", 0, -y)
 
-        -- Icon: spec icon when available, else class
-        local icon = TryGetSpecIcon(model.unit) or GetClassIcon(model.class)
+        -- Icon: spec icon when available (pass memberId for player detection when not in raid), else class
+        local icon = TryGetSpecIcon(model.unit, model.memberId) or GetClassIcon(model.class)
         r.Icon:SetTexture(icon)
 
         -- Name
