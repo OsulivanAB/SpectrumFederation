@@ -212,15 +212,16 @@ function EquipmentWindow:_CreateGearGrid(content)
         hl:SetColorTexture(1, 1, 1, 0.3)  -- Brighter white highlight for hover
 
         -- "Used" overlay (golden border, shown when slot is used)
-        -- Create a border effect by layering a colored square slightly larger than the icon
         local overlay = btn:CreateTexture(nil, "OVERLAY")
-        overlay:SetTexture("Interface\\Buttons\\WHITE8X8")  -- Simple white texture
-        overlay:SetVertexColor(1, 0.84, 0, 1)  -- Golden color
         
-        -- Make it slightly larger than the button to create border effect
-        local borderWidth = 2
-        overlay:SetPoint("TOPLEFT", btn, "TOPLEFT", -borderWidth, borderWidth)
-        overlay:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", borderWidth, -borderWidth)
+        -- Border offset - adjust this value to change border appearance
+        local borderOffset = 2
+        overlay:SetPoint("TOPLEFT", btn, "TOPLEFT", -borderOffset, borderOffset)
+        overlay:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", borderOffset, -borderOffset)
+        
+        overlay:SetTexture("Interface\\Buttons\\UI-ActionButton-Border")
+        overlay:SetBlendMode("ADD")
+        overlay:SetVertexColor(1, 0.8, 0, 0.8)  -- Golden glow
         overlay:Hide()
         btn.UsedOverlay = overlay
 
