@@ -130,7 +130,17 @@ local function GetClassColor(className)
 	return 1, 1, 1
 end
 
-local function TryGetSpecIcon(unit)
+local function TryGetSpecIcon(unit, memberId)
+    -- If no unit but memberId is provided, check if it's the player
+    if not unit and memberId then
+        if SF.NameUtil and SF.NameUtil.GetSelfId then
+            local selfId = SF.NameUtil.GetSelfId()
+            if selfId and SF.NameUtil.SamePlayer and SF.NameUtil.SamePlayer(memberId, selfId) then
+                unit = "player"
+            end
+        end
+    end
+
     if not unit then return nil end
 
     if UnitIsUnit(unit, "player") and GetSpecialization and GetSpecializationInfo then
@@ -496,8 +506,8 @@ function View:Render(models, meta)
         r:SetPoint("TOPLEFT", self.child, "TOPLEFT", 0, -y)
         r:SetPoint("TOPRIGHT", self.child, "TOPRIGHT", 0, -y)
 
-        -- Icon: spec icon when available, else class
-        local icon = TryGetSpecIcon(model.unit) or GetClassIcon(model.class)
+        -- Icon: spec icon when available (pass memberId for player detection when not in raid), else class
+        local icon = TryGetSpecIcon(model.unit, model.memberId) or GetClassIcon(model.class)
         r.Icon:SetTexture(icon)
 
         -- Name
