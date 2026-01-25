@@ -74,6 +74,7 @@ function Controller:EvaluateVisibility(reason)
         if not f:IsShown() then
             f:Show()
         end
+        self:RequestRefresh("Shown")
     else
         if f:IsShown() then
             f:Hide()
@@ -151,6 +152,11 @@ function Controller:_HookSettingsStore()
             self:ApplyLockState()
             return
         end
+
+        if path == "lootHelper.showMembersNotInRaid" then
+            self:RequestRefresh("SettingsChanged:" .. path)
+            return
+        end
     end)
 end
 
@@ -220,7 +226,12 @@ function Controller:Init()
     self._inited = true
 
     local frame = LH.Window:Create()
-    -- frame:Hide()
+    self:_InitRosterView(frame)
+    local events = SF.LootHelperEvents
+    if events and events.InitDataHooks then
+        events:InitDataHooks()
+    end
+    self:_BindLootHelperEvents()
 
     -- Wire title bar buttons
     frame.OnGearClicked = function()
@@ -334,4 +345,64 @@ function Controller:ApplyLockState()
     if LH.Window and LH.Window.SetLocked then
         LH.Window:SetLocked(locked)
     end
+end
+
+function Controller:_InitRosterView(frame)
+    if self._rosterView then return end
+    if not (LH.RosterView and LH.RosterView.new) then return end
+    if not frame or not frame.Content then return end
+
+    -- Hide any old placeholder
+    if frame.Content.Placeholder then
+        frame.Content.Placeholder:Hide()
+    end
+
+    self._rosterView = LH.RosterView.new(frame.Content, self)
+    frame.Content.RosterView = self._rosterView -- so Style.lua can reach it
+end
+
+function Controller:RefreshRoster()
+    local f = self:GetFrame()
+    if not f then return end
+
+    -- Don't do heavy work if hidden
+    if not f:IsShown() then return end
+
+    local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
+    local rows, meta = LH.RosterModel:Build(profile)
+
+    if self._rosterView then
+        self._rosterView:Render(rows, meta)
+    end
+end
+
+function Controller:RequestRefresh(reason)
+    if self._refreshScheduled then return end
+    self._refreshScheduled = true
+
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, function()
+            self._refreshScheduled = false
+            self:RefreshTitle()
+            self:ApplyStyle()
+            self:RefreshRoster()
+        end)
+    else
+        self._refreshScheduled = false
+        self:RefreshTitle()
+        self:ApplyStyle()
+        self:RefreshRoster()
+    end
+end
+
+function Controller:_BindLootHelperEvents()
+    if self._boundLHEvents then return end
+    local E = SF.LootHelperEvents
+    if not E or not E.Register then return end
+
+    E:Register("DATA_CHANGED", function(owner, eventName, reason, payload)
+        owner:RequestRefresh("DATA_CHANGED:" .. tostring(reason))
+    end, self)
+
+    self._boundLHEvents = true
 end

@@ -62,6 +62,10 @@ function Style:Apply(frame)
         frame.Content.Placeholder:SetFont(fontPath, fontSize, "")
     end
 
+    if frame.Content and frame.Content.RosterView and frame.Content.RosterView.ApplyStyle then
+        frame.Content.RosterView:ApplyStyle(fontPath, fontSize)
+    end
+
     -- WindowStyle hook
     frame.__sfWindowStyle = GetGlobalSetting("windowStyle", "Default")
     -- TODO: implement real skins for Default/Compact/Minimal
