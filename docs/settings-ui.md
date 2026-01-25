@@ -16,6 +16,7 @@ The Settings UI provides a modern, declarative framework for managing addon conf
 - Read-only displays, help text, spacers
 - Composite controls (dropdown + icon button, editbox + button)
 - Scrollable lists with custom item templates
+- Scrollable text boxes for logs and large content
 
 **Smart State Management**
 
@@ -93,11 +94,11 @@ The Settings UI system is organized into two main layers:
 
 **DefinitionRenderer** - Converts declarative page definitions into UI controls
 
-**Controls** - 13+ control types with automatic state binding
+**Controls** - 14+ control types with automatic state binding
 
 **Dialogs** - Modal confirmation and prompt dialogs
 
-**Pages** - Declarative page definitions (Main, LootHelper)
+**Pages** - Declarative page definitions (Main, LootHelper, LootLogs, Debugging)
 
 ## Documentation
 
@@ -171,6 +172,24 @@ LootHelper system configuration:
 - Admin management (view admins, add/remove)
 - Member management (view members)
 - Raid-wide safe mode toggle
+
+### Loot Logs
+
+View and filter loot profile logs:
+
+- Filter by log type (PROFILE_CREATION, POINT_CHANGE, ARMOR_CHANGE, ROLE_CHANGE)
+- Filter by author (who created the log)
+- Filter by member (who was affected by the log)
+- Scrollable log display with timestamps and details
+
+### Debugging
+
+Debug logging controls and viewer:
+
+- Start/Stop debugging
+- Filter by log level (VERBOSE, INFO, WARN, ERROR)
+- Scrollable log viewer with copyable text
+- Clear logs functionality
 
 /// note | Work in Progress
 The Settings UI is functional but some features are still under development:

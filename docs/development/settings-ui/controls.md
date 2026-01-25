@@ -1,6 +1,6 @@
 # Settings UI Controls
 
-The Controls module provides 13+ control types for building settings pages. Each control auto-saves changes and integrates with the Store system.
+The Controls module provides 14+ control types for building settings pages. Each control auto-saves changes and integrates with the Store system.
 
 ## Control Types Reference
 
@@ -735,6 +735,57 @@ Enable debug logging:
 [SETTINGS:CONTROLS] Checkbox 'global.featureEnabled' changed: true → false
 [SETTINGS:CONTROLS] Dropdown refreshed with 3 items
 ```
+
+---
+
+### Scrollable Text
+
+Multi-line, read-only text display with scrolling (useful for logs or large text content).
+
+**Factory**: `Controls.AddScrollableText(section, opts)`
+
+**Options**:
+
+- `label` (string) - Display label
+- `height` (number, optional) - Height in pixels (default: 200)
+- `get` (function) - Function returning text to display `() => string`
+- `tooltip` (string, optional) - Hover tooltip
+- `enabled` (function, optional) - Enable state
+- `visible` (function, optional) - Visibility
+
+**Example**:
+
+```lua
+{
+    type = "scrollableText",
+    label = "Debug Logs",
+    height = 300,
+    get = function()
+        return GetFormattedLogs()
+    end,
+    tooltip = "View recent debug messages"
+}
+```
+
+**Visual**:
+
+```
+Debug Logs: [scrollable window]
+┌─────────────────────────────┐
+│ [2024-01-25] INFO: Started │
+│ [2024-01-25] WARN: Memory  │
+│ [2024-01-25] ERROR: Failed │
+│                             │
+└─────────────────────────────┘
+```
+
+**Features**:
+
+- Multiline text display
+- Scrollable content area
+- Copyable text (Ctrl+A, Ctrl+C)
+- Auto-refresh on page refresh
+- Read-only mode
 
 ## Next Steps
 
