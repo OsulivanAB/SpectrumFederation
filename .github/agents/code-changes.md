@@ -8,9 +8,25 @@ Instructions for agents making code changes to SpectrumFederation addon.
 
 1. Open `SpectrumFederation/SpectrumFederation.toc`
 2. Find: `## Version: X.Y.Z-beta.N` (or `X.Y.Z` for main branch)
-3. Update to: Next version number
-   - Beta branch: `0.4.0-beta.7` → `0.4.0-beta.8`
-   - Main branch: `0.4.0` → `0.4.1` (patch) or `0.5.0` (minor) or `1.0.0` (major)
+3. Update to: Next version number following Semantic Versioning rules:
+
+   **For Beta branch:**
+   - Always increment beta number: `0.4.0-beta.7` → `0.4.0-beta.8`
+   
+   **For Main branch (use Semantic Versioning):**
+   - **PATCH** (`X.Y.Z` → `X.Y.Z+1`): Bug fixes, documentation, small tweaks
+     - Example: `0.4.0` → `0.4.1`
+   - **MINOR** (`X.Y.Z` → `X.Y+1.0`): New features, backward compatible changes
+     - Example: `0.4.0` → `0.5.0`
+   - **MAJOR** (`X.Y.Z` → `X+1.0.0`): Breaking changes, incompatible changes
+     - Example: `0.4.0` → `1.0.0`
+   
+   **Quick decision guide:**
+   - Small fix or tweak? → Use PATCH
+   - Adding new feature? → Use MINOR
+   - Breaking existing functionality? → Use MAJOR
+   - Beta branch? → Increment beta number
+
 4. Save and stage this change
 
 **If you skip this step, CI will fail and your PR will be rejected.**
@@ -69,6 +85,12 @@ git diff SpectrumFederation/SpectrumFederation.toc
 # +## Version: 0.4.0-beta.8
 ```
 
+**Verify you chose the correct version bump:**
+- Bug fix or small change? Should be PATCH (e.g., `0.4.0` → `0.4.1`)
+- New feature? Should be MINOR (e.g., `0.4.0` → `0.5.0`)
+- Breaking change? Should be MAJOR (e.g., `0.4.0` → `1.0.0`)
+- Beta branch? Should increment beta number (e.g., `0.4.0-beta.7` → `0.4.0-beta.8`)
+
 ### 7. Commit
 ```bash
 git add SpectrumFederation/SpectrumFederation.toc
@@ -109,6 +131,7 @@ SF:PrintInfo("Information message")
 ## Checklist Before Committing
 
 - [ ] **CRITICAL**: Version bumped in `SpectrumFederation/SpectrumFederation.toc`
+- [ ] **CRITICAL**: Version bump follows semantic versioning rules (see below)
 - [ ] Code follows Lua 5.1 restrictions
 - [ ] Uses namespace pattern correctly
 - [ ] Has debug logging for important operations
@@ -116,6 +139,115 @@ SF:PrintInfo("Information message")
 - [ ] Passes `luacheck SpectrumFederation --only 0`
 - [ ] Tested in-game (if possible)
 - [ ] Git diff shows version change in `.toc` file
+
+## Semantic Versioning Guide
+
+**SpectrumFederation follows [Semantic Versioning 2.0.0](https://semver.org/)** for stable releases.
+
+### Version Format: `MAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH-beta.N`
+
+**When to use each version bump:**
+
+### PATCH Version (`X.Y.Z` → `X.Y.Z+1`)
+Increment for **backward-compatible bug fixes** and minor changes:
+
+✅ **Use PATCH for:**
+- Bug fixes that don't change functionality
+- Typo corrections
+- Performance improvements with no API changes
+- Internal refactoring (no external behavior change)
+- Documentation updates (if shipped with code)
+- Dependency updates (patch-level only)
+
+❌ **Don't use PATCH for:**
+- New features (even small ones)
+- New slash commands
+- UI changes users will notice
+
+**Examples:**
+- Fixed loot log validation error → `0.4.0` → `0.4.1`
+- Performance optimization in sync protocol → `1.2.3` → `1.2.4`
+- Fix crash when profile has no members → `0.5.0` → `0.5.1`
+
+### MINOR Version (`X.Y.Z` → `X.Y+1.0`)
+Increment for **new features** that are **backward-compatible**:
+
+✅ **Use MINOR for:**
+- New features or functionality
+- New slash commands
+- New UI windows or panels
+- New settings or configuration options
+- Deprecating features (marking for future removal, but still working)
+- New profile types or loot log event types
+- Adding new optional API methods
+- Dependency updates (minor-level)
+
+❌ **Don't use MINOR for:**
+- Breaking changes to existing features
+- Removing commands or features
+- Incompatible database changes
+
+**Examples:**
+- Add new `/sf export` command → `0.4.0` → `0.5.0`
+- New standalone settings window → `0.4.0` → `0.5.0`
+- Add new "raid history" feature → `1.2.3` → `1.3.0`
+- New LootLog event type (backward compatible) → `0.8.0` → `0.9.0`
+
+### MAJOR Version (`X.Y.Z` → `X+1.0.0`)
+Increment for **incompatible or breaking changes**:
+
+✅ **Use MAJOR for:**
+- Breaking API changes
+- Removing features, commands, or UI elements
+- Incompatible database schema changes
+- Changes requiring user action (data migration, reset)
+- WoW expansion updates (11.x.x → 12.0.0)
+- Major refactoring changing user workflows
+- Removing deprecated features
+
+❌ **Don't use MAJOR for:**
+- Bug fixes (even critical ones)
+- New features that don't break existing ones
+- Internal changes users don't see
+
+**Examples:**
+- Remove old `/sf lootprofile` command → `0.9.0` → `1.0.0`
+- Incompatible profile format change → `1.5.0` → `2.0.0`
+- WoW expansion 12.0 update → `1.9.0` → `2.0.0`
+- Complete sync protocol rewrite (incompatible) → `3.2.0` → `4.0.0`
+
+### Beta Versions (`X.Y.Z-beta.N`)
+For beta branch only:
+
+✅ **Always increment beta number:**
+- `0.4.0-beta.7` → `0.4.0-beta.8`
+- `0.4.0-beta.99` → `0.4.0-beta.100`
+
+The beta base version (`0.4.0`) is determined by the release manager and stays constant until promoted to main.
+
+### Quick Decision Tree
+
+```
+Is this for beta branch? → YES → Increment beta number (N+1)
+                        ↓ NO
+Does it break existing functionality? → YES → MAJOR (X+1.0.0)
+                                     ↓ NO
+Does it add new features? → YES → MINOR (X.Y+1.0)
+                         ↓ NO
+Is it a bug fix or small change? → YES → PATCH (X.Y.Z+1)
+```
+
+### Examples by Change Type
+
+| Change Description | Version Bump | Example |
+|-------------------|--------------|---------|
+| Fix crash when clicking loot button | PATCH | `0.4.1` → `0.4.2` |
+| Add new settings window | MINOR | `0.4.0` → `0.5.0` |
+| Remove old database format | MAJOR | `0.9.5` → `1.0.0` |
+| Optimize sync performance | PATCH | `1.2.3` → `1.2.4` |
+| New `/sf export` command | MINOR | `0.8.0` → `0.9.0` |
+| Update for WoW patch 12.0 | MAJOR | `2.3.0` → `3.0.0` |
+| Beta iteration | Beta +1 | `0.4.0-beta.7` → `0.4.0-beta.8` |
 
 ## Version Bump Verification
 
