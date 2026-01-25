@@ -215,7 +215,7 @@ function EquipmentWindow:_CreateGearGrid(content)
         local overlay = btn:CreateTexture(nil, "OVERLAY")
         
         -- Border offset - adjust this value to change border appearance
-        local borderOffset = 2
+        local borderOffset = 10
         overlay:SetPoint("TOPLEFT", btn, "TOPLEFT", -borderOffset, borderOffset)
         overlay:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", borderOffset, -borderOffset)
         
