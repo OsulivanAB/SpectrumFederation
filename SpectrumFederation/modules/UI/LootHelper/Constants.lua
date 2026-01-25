@@ -4,7 +4,7 @@ local addonName, SF = ...
 SF.LootHelperWindow = SF.LootHelperWindow or {}
 local LH = SF.LootHelperWindow
 
-LH.Constants = LH.constants or {
+LH.Constants = LH.Constants or {
     FRAME_NAME = "SpectrumFederationLootHelperWindow",
 
     -- Layout

@@ -118,8 +118,6 @@ function Window:SaveState()
     self:ClampSizeToBounds()
 
     local w, h = f:GetSize()
-
-    local w, h = f:GetSize()
     local point, _, relPoint, x, y = f:GetPoint(1)
 
     st.width = Round(w)
@@ -135,12 +133,12 @@ function Window:SaveState()
 end
 
 function Window:_ReadLockSetting()
-    if SF.SettingStore and SF.SettingsStore.Get then
-        return SF.SettingsStore:Get("lootHelper.lockLootWindow") and true or false
-    end
+    if SF.SettingsStore and SF.SettingsStore.Get then  
+        return SF.SettingsStore:Get("lootHelper.lockLootWindow") and true or false  
+    end  
 
-    local db = SF.lootHelperDB or (SpectrumFederationDB and SpectrumFederationDB.lootHelper)
-    return db and db.lockWindow and true or false
+    local db = SF.lootHelperDB or (SpectrumFederationDB and SpectrumFederationDB.lootHelper)  
+    return db and db.lockLootWindow and true or false  
 end
 
 function Window:SetLocked(locked)

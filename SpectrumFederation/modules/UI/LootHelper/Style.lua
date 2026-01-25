@@ -18,8 +18,8 @@ local FONT_MAP = {
 -- @param fallback any Fallback value if setting is not found
 -- @return any Setting value or fallback
 local function GetGlobalSetting(key, fallback)
-    -- Prefer SettingStore if available
-    if SF.SettingStore and SF.SettingStore.Get then
+    -- Prefer SettingsStore if available
+    if SF.SettingsStore and SF.SettingsStore.Get then
         local v = SF.SettingsStore:Get("global." .. key)
         if v ~= nil then return v end
     end

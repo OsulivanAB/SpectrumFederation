@@ -22,8 +22,8 @@ local function ShortName(id)
 end
 
 local function GetSetting(path, fallback)
-    if SF.SettingStore and SF.SettingStore.Get then
-        local v = SF.SettingStore:Get(path)
+    if SF.SettingsStore and SF.SettingsStore.Get then
+        local v = SF.SettingsStore:Get(path)
         if v ~= nil then return v end
     end
     local db = SF.lootHelperDB or (SpectrumFederationDB and SpectrumFederationDB.lootHelper) or nil

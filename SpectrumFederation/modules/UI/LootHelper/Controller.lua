@@ -281,7 +281,7 @@ end
 
 -- Refresh the title bar information
 function Controller:RefreshTitle()
-    local profileName = "No Active Profile"
+    local titleText = "No Active Profile"
 
     if SF.GetActiveProfile then
         local p = SF:GetActiveProfile()
