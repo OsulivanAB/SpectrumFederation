@@ -44,7 +44,9 @@ local function FormatDebugLogsText(logs)
 	table.insert(lines, string.format("Showing %d log(s):\n", #logs))
 	
 	for _, log in ipairs(logs) do
-		local timestamp = SF:FormatTimestampForUser and SF:FormatTimestampForUser(log.timestamp) or tostring(log.timestamp)
+		local timestamp = type(SF.FormatTimestampForUser) == "function" 
+			and SF:FormatTimestampForUser(log.timestamp) 
+			or tostring(log.timestamp)
 		table.insert(lines, string.format("[%s] [%s] %s: %s", 
 			timestamp, log.level, log.category, log.message))
 	end

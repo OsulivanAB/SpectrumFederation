@@ -97,7 +97,9 @@ local function FormatLogEntry(log)
 	local eventType = log:GetEventType() or "Unknown"
 	local data = log:GetEventData() or {}
 	
-	local timeStr = SF:FormatTimestampForUser and SF:FormatTimestampForUser(timestamp) or tostring(timestamp)
+	local timeStr = type(SF.FormatTimestampForUser) == "function" 
+		and SF:FormatTimestampForUser(timestamp) 
+		or tostring(timestamp)
 	
 	local details = ""
 	if eventType == "POINT_CHANGE" then
@@ -137,15 +139,11 @@ function Page:Build(panel)
 		
 		for _, log in ipairs(logs) do
 			-- Safety check: ensure log is a valid object with required methods
-			if type(log) ~= "table" or 
-			   type(log.GetEventType) ~= "function" or
-			   type(log.GetAuthor) ~= "function" or
-			   type(log.GetTimestamp) ~= "function" then
-				if SF.Debug then
-					SF.Debug:Warn("LOOTLOGS", "Skipping malformed log entry")
-				end
-				-- Skip this log entry
-			else
+			if type(log) == "table" and 
+			   type(log.GetEventType) == "function" and
+			   type(log.GetAuthor) == "function" and
+			   type(log.GetTimestamp) == "function" then
+				
 				local include = true
 				
 				-- Filter by event type
@@ -169,15 +167,19 @@ function Page:Build(panel)
 				if include then
 					table.insert(filtered, log)
 				end
+			else
+				-- Skip malformed log entry
+				if SF.Debug then
+					SF.Debug:Warn("LOOTLOGS", "Skipping malformed log entry")
+				end
 			end
 		end
 		
 		-- Sort by timestamp (newest first)
 		table.sort(filtered, function(a, b)
-			if type(a.GetTimestamp) == "function" and type(b.GetTimestamp) == "function" then
-				return a:GetTimestamp() > b:GetTimestamp()
-			end
-			return false
+			local aTime = type(a.GetTimestamp) == "function" and a:GetTimestamp() or 0
+			local bTime = type(b.GetTimestamp) == "function" and b:GetTimestamp() or 0
+			return aTime > bTime
 		end)
 		
 		return filtered

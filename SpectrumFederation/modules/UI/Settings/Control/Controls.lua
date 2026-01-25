@@ -995,7 +995,8 @@ function Controls:AddScrollableText(section, opts)
 		editBox:SetAutoFocus(false)
 		editBox:SetTextColor(1, 1, 1)
 		
-		-- Make it read-only (still allows selection and copying)
+		-- Make it read-only but still allow text selection and copying
+		-- SetEnabled(false) prevents editing, EnableMouse/Keyboard allow selection
 		editBox:SetEnabled(false)
 		editBox:EnableMouse(true)
 		editBox:EnableKeyboard(true)
