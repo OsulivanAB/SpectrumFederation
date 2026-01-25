@@ -35,6 +35,16 @@ local C = {
     NAV_SELECTED_BG = {1, 1, 1, 0.08},
     NAV_HOVER_BG = {1, 1, 1, 0.04},
     
+    -- Backdrop settings
+    BACKDROP = {
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true,
+        tileSize = 16,
+        edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 }
+    },
+    
     -- Texture paths
     BANNER_TEXTURE = "Interface\\AddOns\\SpectrumFederation\\media\\Textures\\SpectrumFederationBanner.tga",
 }
@@ -277,14 +287,7 @@ function SettingsWindow:CreateWindow()
     frame:Hide()
     
     -- Backdrop
-    frame:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
-        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-        tile = true,
-        tileSize = 16,
-        edgeSize = 16,
-        insets = { left = 4, right = 4, top = 4, bottom = 4 }
-    })
+    frame:SetBackdrop(C.BACKDROP)
     frame:SetBackdropColor(unpack(C.BG))
     frame:SetBackdropBorderColor(unpack(C.BORDER))
     
