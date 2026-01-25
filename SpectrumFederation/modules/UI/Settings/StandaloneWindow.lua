@@ -26,6 +26,7 @@ local C = {
     
     -- Content area
     CONTENT_PADDING = 12,
+    CONTENT_TOP_OFFSET = 8,  -- Extra space at top to avoid close button overlap
     DIVIDER_WIDTH = 1,
     
     -- Colors (RGBA, 0-1 range)
@@ -322,7 +323,7 @@ function SettingsWindow:CreateWindow()
     
     -- Right content panel (with scroll frame)
     local contentPanel = CreateFrame("Frame", nil, frame)
-    contentPanel:SetPoint("TOPLEFT", divider, "TOPRIGHT", C.CONTENT_PADDING, 0)
+    contentPanel:SetPoint("TOPLEFT", divider, "TOPRIGHT", C.CONTENT_PADDING, -C.CONTENT_TOP_OFFSET)
     contentPanel:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -C.PADDING, C.PADDING)
     
     -- Content host (will contain page panels)
