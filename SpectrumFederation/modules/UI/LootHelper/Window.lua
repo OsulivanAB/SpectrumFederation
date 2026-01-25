@@ -94,6 +94,10 @@ function Window:LoadState()
      f:ClearAllPoints()
      f:SetPoint(point, UIParent, relativePoint, x, y)
 
+     if SF.Debug then
+         SF.Debug:Verbose("LH_WINDOW", "LoadState: size=%dx%d, position=%s->%s at (%d,%d)", w, h, point, relativePoint, x, y)
+     end
+
      -- Ensure safe after layout settles
      if C_Timer and C_Timer.After then
          C_Timer.After(0, function()
@@ -124,6 +128,10 @@ function Window:SaveState()
     st.relativePoint = relPoint or C.DEFAULT_RELATIVE_POINT
     st.x = Round(x)
     st.y = Round(y)
+
+    if SF.Debug then
+        SF.Debug:Verbose("LH_WINDOW", "SaveState: size=%dx%d, position=%s->%s at (%d,%d)", st.width, st.height, st.point, st.relativePoint, st.x, st.y)
+    end
 end
 
 function Window:_ReadLockSetting()
@@ -141,6 +149,10 @@ function Window:SetLocked(locked)
 
     locked = locked and true or false
     f.__sfLocked = locked
+
+    if SF.Debug then
+        SF.Debug:Info("LH_WINDOW", "SetLocked: locked=%s", tostring(locked))
+    end
 
     -- Dragging (title bar)
     if f.Title then
@@ -245,6 +257,10 @@ end
 function Window:Create()
     if self._frame then
         return self._frame
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("LH_WINDOW", "Creating main window frame")
     end
 
     local frame = CreateFrame("Frame", C.FRAME_NAME, UIParent, "BackdropTemplate")

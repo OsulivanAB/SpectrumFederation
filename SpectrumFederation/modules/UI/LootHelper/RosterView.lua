@@ -441,6 +441,9 @@ function View:_BindRowActions(r, model)
                 if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
                     SF.LootHelperEvents:NotifyDataChanged("UI:IncrementPoints", { memberId = model.memberId })
                 end
+                if SF.Debug then
+                    SF.Debug:Info("LH_ROSTER_VIEW", "IncrementPoints: %s", tostring(model.memberId))
+                end
             end)
             
             r.BtnDown:SetScript("OnClick", function()
@@ -450,6 +453,9 @@ function View:_BindRowActions(r, model)
                 if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
                     SF.LootHelperEvents:NotifyDataChanged("UI:DecrementPoints", { memberId = model.memberId })
                 end
+                if SF.Debug then
+                    SF.Debug:Info("LH_ROSTER_VIEW", "DecrementPoints: %s", tostring(model.memberId))
+                end
             end)
         end
         
@@ -457,6 +463,9 @@ function View:_BindRowActions(r, model)
         r.BtnHelmet:SetScript("OnClick", function()
             if self.controller and self.controller.OnEquipmentClicked then
                 self.controller:OnEquipmentClicked(model)
+            end
+            if SF.Debug then
+                SF.Debug:Info("LH_ROSTER_VIEW", "EquipmentClicked: %s", tostring(model.memberId))
             end
         end)
     end
@@ -467,12 +476,19 @@ function View:_BindRowActions(r, model)
             if self.controller and self.controller.OnAddRaidNonMember then
                 self.controller:OnAddRaidNonMember(model)
             end
+            if SF.Debug then
+                SF.Debug:Info("LH_ROSTER_VIEW", "AddRaidNonMember: %s", tostring(model.memberId))
+            end
         end)
     end
 end
 
 function View:Render(models, meta)
     meta = meta or {}
+
+    if SF.Debug then
+        SF.Debug:Verbose("LH_ROSTER_VIEW", "Render: Rendering %d rows", models and #models or 0)
+    end
 
     -- Empty state
     if not models or #models == 0 then
