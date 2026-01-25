@@ -375,6 +375,34 @@ Optional secrets (for future use):
 
 ---
 
+## Environment Configuration
+
+### Setting Up `beta-code-review` Environment
+
+The PR Beta Code Review workflow requires a GitHub environment for manual approval:
+
+1. Navigate to **Settings** → **Environments** in your repository
+2. Click **New environment**
+3. Name it: `beta-code-review`
+4. Configure environment protection rules:
+   - ✅ **Required reviewers**: Add reviewers who should approve code review sessions
+   - ⚠️ Recommended: Add at least one admin or senior developer
+5. Click **Save protection rules**
+
+**What this does**:
+- When a PR to beta is opened with Lua changes, the code review workflow triggers
+- Workflow execution pauses until a reviewer approves it
+- Once approved, the workflow analyzes changes and posts review guidance
+- This prevents automatic execution and ensures intentional code reviews
+
+**Testing the Environment**:
+1. Create a test PR to beta with a small Lua file change
+2. Observe the workflow waiting for approval in the Actions tab
+3. Approve the workflow run
+4. Verify review comment is posted to the PR
+
+---
+
 ## Testing Workflows
 
 ### Dry-Run Mode
