@@ -1,7 +1,7 @@
 ## Interface: 120000
 ## Title: Spectrum Federation
 ## Author: OsulivanAB
-## Version: 0.3.1-beta.21
+## Version: 0.4.0-beta.7
 ## Notes: Loot profile management and helper tools for guild coordination. Create and manage raid loot profiles, track distributions, and coordinate gear allocation across your guild.
 ## IconTexture: Interface\AddOns\SpectrumFederation\media\Icons\SpectrumFederationIcon
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
@@ -28,6 +28,7 @@ modules/LootHelper/Members.lua
 modules/LootHelper/LootLogValidators.lua
 modules/LootHelper/LootLogs.lua
 modules/LootHelper/Profiles.lua
+modules/LootHelper/Events.lua
 modules/LootHelper/LootHelper.lua
 modules/LootHelperSync/00_Namespace.lua
 modules/LootHelperSync/01_Constants.lua
@@ -54,15 +55,26 @@ modules/Settings/Schema.lua
 modules/Settings/Store.lua
 modules/Settings/Apply.lua
 
+
+
 modules/UI/Settings/Style.lua
 modules/UI/Settings/Widgets/Section.lua
 modules/UI/Settings/PageBuilder.lua
 modules/UI/Settings/Control/Controls.lua
+modules/UI/Settings/OpenToPage.lua
 modules/UI/Settings/Registry.lua
 modules/UI/Settings/Dialogs.lua
 modules/UI/Settings/DefinitionRenderer.lua
 modules/UI/Settings/Pages/Main.lua
 modules/UI/Settings/Pages/LootHelper.lua
+
+modules/UI/LootHelper/Constants.lua
+modules/UI/LootHelper/Style.lua
+modules/UI/LootHelper/Window.lua
+modules/UI/LootHelper/RosterModel.lua
+modules/UI/LootHelper/RosterView.lua
+modules/UI/LootHelper/EquipmentWindow.lua
+modules/UI/LootHelper/Controller.lua
 
 modules/Init.lua
 

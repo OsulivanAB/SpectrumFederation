@@ -723,7 +723,6 @@ function Controls:AddScrollList(section, opts)
 
 			if box.SetBackdrop then
 				box:SetBackdrop({
-					-- bgFile = "Interface\\Buttons\\WHITE8X8",
 					bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
 					edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
 					tile = true,
@@ -801,11 +800,6 @@ function Controls:AddScrollList(section, opts)
 			local items = getItems() or {}
 
 			local y = 0
-
-			-- local w = (control:GetWidth() or 0)
-			-- local sb = scroll.ScrollBar
-			-- local sbw = (sb and sb:GetWidth()) or 20
-			-- content:SetWidth(math.max(1, w - sbw - 4))
 
 			for i = 1, #items do
 				local item = items[i]

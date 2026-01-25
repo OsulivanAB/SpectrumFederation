@@ -269,4 +269,64 @@ function SF:RegisterLootHelperSlashCommands()
         SF:PrintSuccess(string.format("Deleted profile: %s (ID: %s)", profileName, profileId))
         
     end, "Delete a loot profile (by name or ID)")
+
+    SF:RegisterSlashCommand("loot", function()
+        local store = SF.SettingsStore
+
+        local alreadyEnabled = false
+        if store and store.Get then
+            alreadyEnabled = store:Get("lootHelper.enabled") and true or false
+        elseif SF.lootHelperDB then
+            alreadyEnabled = SF.lootHelperDB.enabled and true or false
+        end
+
+        if alreadyEnabled then
+            if SF.PrintInfo then
+                SF:PrintInfo("Loot Helper is already enabled.")
+            else
+                print("SpectrumFederation: Loot Helper is already enabled.")
+            end
+        else
+            if store and store.Set then
+                store:Set("lootHelper.enabled", true)
+            else
+                SpectrumFederationDB = SpectrumFederationDB or {}
+                SpectrumFederationDB.lootHelper = SpectrumFederationDB.lootHelper or {}
+                SpectrumFederationDB.lootHelper.enabled = true
+            end
+
+            if SF.PrintSuccess then
+                SF:PrintSuccess("Loot Helper enabled.")
+            else
+                print("SpectrumFederation: Loot Helper enabled.")
+            end
+        end
+
+        local c = SF.LootHelperWindow and SF.LootHelperWindow.Controller
+        if c and c.Init then
+            c:Init()
+        end
+        if c and c.EvaluateVisibility then
+            c:EvaluateVisibility("Slash:/sf loot")
+
+            if c.ShouldBeVisible then
+                local ok, why = c:ShouldBeVisible()
+                if not ok then
+                    if why == "no_active_profile" then
+                        if SF.PrintWarning then
+                            SF:PrintWarning("Cannot show Loot Helper window: No active profile set.")
+                        else
+                            print("SpectrumFederation: Cannot show Loot Helper window: No active profile set.")
+                        end
+                    elseif why == "not_in_raid" then
+                        if SF.PrintWarning then
+                            SF:PrintWarning("Cannot show Loot Helper window: You are not in a raid.")
+                        else
+                            print("SpectrumFederation: Cannot show Loot Helper window: You are not in a raid.")
+                        end
+                    end
+                end
+            end
+        end
+    end, "Enable Loot Helper")
 end

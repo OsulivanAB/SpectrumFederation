@@ -7,6 +7,13 @@ function SF:InitializeLootHelperDatabase()
     -- Initialize loot helper settings in main database if not present
     if not SpectrumFederationDB.lootHelper then
         SpectrumFederationDB.lootHelper = {
+			enabled = false,
+			showWindowOutsideRaid = false,
+			lockLootWindow = false,
+			showMembersNotInRaid = false,
+
+			window = {},
+
             profiles = {},              -- Map: profileId -> LootProfile
             activeProfileId = nil       -- Active profile's stable ID
         }
@@ -16,6 +23,16 @@ function SF:InitializeLootHelperDatabase()
         
         -- Migration: Detect and convert legacy schema (no-op if already clean)
         SF:MigrateLootHelperSchema()
+
+		local lh = SpectrumFederationDB.lootHelper
+		if lh.enabled == nil then lh.enabled = false end
+		if lh.showWindowOutsideRaid == nil then lh.showWindowOutsideRaid = false end
+		if lh.lockLootWindow == nil then lh.lockLootWindow = false end
+		if lh.showMembersNotInRaid == nil then lh.showMembersNotInRaid = false end
+
+		if type(lh.window) ~= "table" then
+			lh.window = {}
+		end
     end
 
     SF.lootHelperDB = SpectrumFederationDB.lootHelper
@@ -35,6 +52,11 @@ function SF:InitializeLootHelperDatabase()
     if SF.LootHelperComm then
         SF.LootHelperComm:Init()
     end
+
+	-- Loot Helper Window
+	if SF.LootHelperWindow and SF.LootHelperWindow.Controller and SF.LootHelperWindow.Controller.Init then
+		SF.LootHelperWindow.Controller:Init()
+	end
 end
 
 -- Migrate legacy schema to profileId-based canonical schema
@@ -432,8 +454,7 @@ function SF:DeleteLootHelperProfile(profileId)
 
 	-- If we deleted the active profile, pick a new one or nil
 	if db.activeProfileId == profileId then
-		db.activeProfileId = nil
-		db.activeProfile = nil
+		self:ClearActiveProfile()
 
 		-- Pick first sorted option (nice UX, minimal logic)
 		local opts = self:GetLootHelperProfileOptions()
