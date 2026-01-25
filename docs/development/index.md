@@ -284,6 +284,7 @@ python3 .github/scripts/blizzard_api.py --environment live
 - [CI/CD Workflows](workflows.md) - Automated builds and releases
 - [Promoting to Main](promoting-to-main.md) - How to release stable versions
 - [Naming Conventions](naming-conventions.md) - Code style guidelines
+- [Copilot Instructions](https://github.com/OsulivanAB/SpectrumFederation/blob/beta/.github/copilot-instructions.md) - AI coding agent guidance
 - [WoW API Docs](https://wowpedia.fandom.com/wiki/World_of_Warcraft_API) - Official API reference
 
 ## Getting Help

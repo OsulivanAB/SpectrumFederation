@@ -469,7 +469,7 @@ SpectrumFederation/
 **Resources:**
 - WoW API Docs: [https://wowpedia.fandom.com/wiki/World_of_Warcraft_API](https://wowpedia.fandom.com/wiki/World_of_Warcraft_API)
 - BlizzardUI Reference: `BlizzardUI/live/` or `BlizzardUI/beta/` (local only)
-- Extended guidance: `AGENTS.md`
+- Full Documentation: [https://osulivanab.github.io/SpectrumFederation/](https://osulivanab.github.io/SpectrumFederation/)
 
 
 
