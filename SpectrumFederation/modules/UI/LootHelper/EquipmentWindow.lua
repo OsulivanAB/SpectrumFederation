@@ -67,7 +67,18 @@ local function GetClassIcon(className)
 end
 
 -- Helper function to get spec icon
-local function TryGetSpecIcon(unit)
+-- Supports both raid units and the player when not in raid
+local function TryGetSpecIcon(unit, memberId)
+    -- If no unit but memberId is provided, check if it's the player
+    if not unit and memberId then
+        if SF.NameUtil and SF.NameUtil.GetSelfId then
+            local selfId = SF.NameUtil.GetSelfId()
+            if selfId and SF.NameUtil.SamePlayer and SF.NameUtil.SamePlayer(memberId, selfId) then
+                unit = "player"
+            end
+        end
+    end
+
     if not unit then return nil end
 
     if UnitIsUnit(unit, "player") and GetSpecialization and GetSpecializationInfo then
@@ -291,8 +302,8 @@ function EquipmentWindow:SetMember(rowModel, memberObj, canAdmin)
     self._memberObj = memberObj
     self._canAdmin = canAdmin
 
-    -- Update title icon
-    local icon = TryGetSpecIcon(rowModel.unit) or GetClassIcon(rowModel.class)
+    -- Update title icon (pass both unit and memberId for player detection when not in raid)
+    local icon = TryGetSpecIcon(rowModel.unit, rowModel.memberId) or GetClassIcon(rowModel.class)
     self._frame.Title.Icon:SetTexture(icon)
 
     -- Update title text
