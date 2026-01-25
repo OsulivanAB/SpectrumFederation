@@ -4,6 +4,11 @@ local addonName, SF = ...
 SF.SettingsUI = SF.SettingsUI or {}
 local UI = SF.SettingsUI
 
+-- Feature flag: Set to false to disable Blizzard Settings registration
+-- When false, the addon will not appear in WoW Settings > AddOns
+-- Pages still register internally for use in standalone window
+UI.ENABLE_BLIZZARD_SETTINGS = false
+
 UI.pages = UI.pages or {}
 UI.pagesById = UI.pagesById or {}
 UI.categoriesByPageId = UI.categoriesByPageId or {}
@@ -45,6 +50,14 @@ function UI:Init()
 
     if SF.Debug then
         SF.Debug:Info("UI", "Initializing Settings UI")
+    end
+
+    -- Skip Blizzard registration if disabled (using standalone window instead)
+    if not self.ENABLE_BLIZZARD_SETTINGS then
+        if SF.Debug then
+            SF.Debug:Info("UI", "Blizzard Settings registration disabled, using standalone window")
+        end
+        return
     end
 
     if not Settings or not Settings.RegisterCanvasLayoutCategory then

@@ -100,11 +100,50 @@ This is your **FIRST TASK** before or immediately after making any code changes:
 - Stable versions can ONLY be released from `main` branch
 - CI validates branch/version alignment - do NOT edit workflows to bypass this
 
+**Semantic Versioning (SemVer) Rules:**
+
+For **Beta branch** (`beta`):
+- **Always increment the beta number**: `0.4.0-beta.7` → `0.4.0-beta.8`
+- Beta number resets when the base version is promoted to main
+
+For **Main branch** (`main`), follow standard Semantic Versioning:
+
+**PATCH** version (`X.Y.Z` → `X.Y.Z+1`) - Bug fixes and tiny changes:
+- Bug fixes that don't change functionality
+- Documentation updates (if significant)
+- Internal refactoring with no external changes
+- Performance improvements
+- Dependency updates (patch versions)
+- Examples: `0.4.0` → `0.4.1`, `1.2.3` → `1.2.4`
+
+**MINOR** version (`X.Y.Z` → `X.Y+1.0`) - New features, backward compatible:
+- New features or functionality
+- New slash commands
+- New UI elements or windows
+- New settings or configuration options
+- Deprecating features (but not removing them)
+- Dependency updates (minor versions)
+- Examples: `0.4.0` → `0.5.0`, `1.2.3` → `1.3.0`
+
+**MAJOR** version (`X.Y.Z` → `X+1.0.0`) - Breaking changes:
+- Breaking API changes
+- Removing features or commands
+- Major refactoring that changes how users interact with the addon
+- Incompatible database schema changes
+- WoW expansion updates (e.g., 11.0.0 → 12.0.0 for new expansion)
+- Examples: `0.4.0` → `1.0.0`, `1.2.3` → `2.0.0`
+
+**When in doubt:**
+- Small fix/tweak → **PATCH**
+- New feature → **MINOR**
+- Breaking change → **MAJOR**
+- Beta branch → **Beta number +1**
+
 **Version Format Examples:**
 - Beta: `0.4.0-beta.7` → `0.4.0-beta.8` (increment beta number)
-- Stable: `0.4.0` → `0.4.1` (increment patch for bug fixes)
-- Stable: `0.4.0` → `0.5.0` (increment minor for new features)
-- Stable: `0.4.0` → `1.0.0` (increment major for breaking changes)
+- Patch: `0.4.0` → `0.4.1` (bug fixes, small changes)
+- Minor: `0.4.0` → `0.5.0` (new features, backward compatible)
+- Major: `0.4.0` → `1.0.0` (breaking changes)
 
 **Release Process:**
 - Beta releases: Auto-created by `post-merge-beta.yml` after PR merge to beta
