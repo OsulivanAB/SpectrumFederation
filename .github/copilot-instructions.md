@@ -2,6 +2,27 @@
 
 AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 
+## ⚠️ CRITICAL: Version Bumping is MANDATORY ⚠️
+
+**EVERY PR with code, feature, or behavioral changes MUST bump the version in `SpectrumFederation/SpectrumFederation.toc`**
+
+This is your **FIRST TASK** before or immediately after making any code changes:
+
+1. **Open `SpectrumFederation/SpectrumFederation.toc`**
+2. **Find the line:** `## Version: X.Y.Z` or `## Version: X.Y.Z-beta.N`
+3. **Update it** based on the target branch:
+   - **Beta branch PRs**: Increment the beta number (e.g., `0.4.0-beta.7` → `0.4.0-beta.8`)
+   - **Main branch PRs**: Increment patch/minor/major version (e.g., `0.4.0` → `0.4.1`)
+4. **Save the file**
+
+**Why this matters:**
+- CI will FAIL your PR if version is not bumped
+- Version changes trigger automated releases
+- Helps track what changed between releases
+- Required for WoW addon distribution (WowUp/CurseForge)
+
+**No exceptions:** Even small changes require version bumps. If you forget, your PR will fail CI validation.
+
 ## Project Overview
 
 **SpectrumFederation** is a WoW addon for the Spectrum Federation guild on Garona, written in **Lua 5.1** (WoW's embedded version). It tracks loot profiles and provides a loot helper system for guild management.
@@ -72,10 +93,18 @@ AI coding agent guidance for the **SpectrumFederation** World of Warcraft addon.
 - `beta` - Beta/PTR releases (version: `X.Y.Z-beta.N`)
 
 **Version Bumping (CI FAILS WITHOUT):**
-- Every behavioral change to `main` or `beta` MUST bump `## Version:` in `SpectrumFederation.toc`
+- **MANDATORY**: Every behavioral change to `main` or `beta` MUST bump `## Version:` in `SpectrumFederation.toc`
+- **FIRST STEP**: Before or immediately after making code changes, bump the version number
+- **CI VALIDATION**: The `check-version-bump` job compares your version to the base branch and FAILS if unchanged
 - Beta versions can ONLY be released from `beta` branch
 - Stable versions can ONLY be released from `main` branch
 - CI validates branch/version alignment - do NOT edit workflows to bypass this
+
+**Version Format Examples:**
+- Beta: `0.4.0-beta.7` → `0.4.0-beta.8` (increment beta number)
+- Stable: `0.4.0` → `0.4.1` (increment patch for bug fixes)
+- Stable: `0.4.0` → `0.5.0` (increment minor for new features)
+- Stable: `0.4.0` → `1.0.0` (increment major for breaking changes)
 
 **Release Process:**
 - Beta releases: Auto-created by `post-merge-beta.yml` after PR merge to beta
@@ -614,27 +643,38 @@ end
 4. Enable Lua errors: `/console scriptErrors 1`
 5. Test slash commands: `/sfdebug on`, `/sfdebug show`
 
-**Before Submitting PR:**
+**Before Submitting PR (CHECKLIST - DO NOT SKIP):**
 ```bash
-# Lint code
+# 1. BUMP VERSION FIRST (MANDATORY - CI WILL FAIL IF SKIPPED)
+# Edit SpectrumFederation/SpectrumFederation.toc
+# Find: ## Version: 0.4.0-beta.7
+# Change to: ## Version: 0.4.0-beta.8  (for beta branch)
+# Or: ## Version: 0.4.1  (for main branch)
+
+# 2. Lint code
 luacheck SpectrumFederation --only 0
 
-# Bump version in SpectrumFederation.toc
-## Version: 0.0.15-beta.1  # (or next appropriate version)
-
-# Test in-game with /reload
+# 3. Test in-game with /reload
 ```
+
+**Version Bump Reminder:**
+If you get a CI failure with message: "Addon '## Version:' in SpectrumFederation/SpectrumFederation.toc is still 'X.Y.Z'", you forgot to bump the version. Go back and update it!
 
 ## Common Tasks
 
 **Adding a Feature:**
 1. Create feature branch from `beta` (experimental) or `main` (stable)
-2. Add Lua file in `SpectrumFederation/modules/`
-3. Update `.toc` file load order
-4. Use namespace pattern and debug logging
-5. Bump version in `.toc`
+2. **IMMEDIATELY bump version in `SpectrumFederation/SpectrumFederation.toc`** (CI requirement)
+3. Add Lua file in `SpectrumFederation/modules/`
+4. Update `.toc` file load order (after the file entry, before dependents)
+5. Use namespace pattern and debug logging
 6. Test in-game, run `luacheck`
-7. PR to appropriate branch
+7. **Verify version was bumped** before creating PR
+8. PR to appropriate branch
+
+**Version Bump Examples for Features:**
+- Beta branch: `0.4.0-beta.7` → `0.4.0-beta.8`
+- Main branch: `0.4.0` → `0.5.0` (minor version for new features)
 
 **Database Changes:**
 - Always check/initialize in `SF:InitializeDatabase()`
@@ -677,11 +717,14 @@ luacheck SpectrumFederation --only 0
 ## Critical Rules - DO NOT VIOLATE
 
 **Version Management:**
-- ❌ Never skip version bump in `.toc` for behavioral changes
-- ❌ Never release beta versions from `main` branch
-- ❌ Never release stable versions from `beta` branch
-- ❌ Never edit workflow files to bypass version checks
-- ❌ Never manually create or move git tags
+- ❌ **NEVER** skip version bump in `.toc` for ANY code/feature/behavioral changes
+- ❌ **NEVER** release beta versions from `main` branch
+- ❌ **NEVER** release stable versions from `beta` branch
+- ❌ **NEVER** edit workflow files to bypass version checks
+- ❌ **NEVER** manually create or move git tags
+- ✅ **ALWAYS** bump version as your FIRST task when making changes
+- ✅ **ALWAYS** verify version bump before committing
+- ✅ **ALWAYS** check that version format matches target branch (beta suffix for beta, no suffix for main)
 
 **Code Location:**
 - ❌ Never place addon code outside `SpectrumFederation/`
@@ -703,12 +746,14 @@ luacheck SpectrumFederation --only 0
 - ✅ Profile data stored in `SF.lootHelperDB.profiles`
 
 **Best Practices:**
+- ✅ **FIRST PRIORITY**: Bump version in `SpectrumFederation/SpectrumFederation.toc` before making changes
 - ✅ Use debug logging extensively: `SF.Debug:Info("CATEGORY", "message")`
 - ✅ Follow module pattern: `local Module = SF.Module or {}; SF.Module = Module`
 - ✅ Use character keys: `"Name-Realm"` format
 - ✅ Test with `/reload` and `/console scriptErrors 1`
 - ✅ Run `luacheck` before committing
 - ✅ Add localization strings to `locale/enUS.lua`
+- ✅ **FINAL CHECK**: Verify version was bumped before creating PR
 
 ## Quick Reference
 
