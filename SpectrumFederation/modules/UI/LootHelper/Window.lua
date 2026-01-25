@@ -181,7 +181,7 @@ function Window:SetLocked(locked)
         self:_ApplyResizeBounds(f)
     end
 
-    self:UpdateScrollInsets()
+    self:RequestScrollInsetsUpdate()
 end
 
 -- Attach a tooltip to a region
@@ -426,6 +426,10 @@ function Window:Create()
     local RIGHT_GAP = 6
     content.Scroll = scroll
 
+    scroll:HookScript("OnScrollRangeChanged", function()
+        Window:RequestScrollInsetsUpdate()
+    end)
+
     local child = CreateFrame("Frame", nil, scroll)
     child:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
     child:SetSize(1, 1)
@@ -464,16 +468,11 @@ function Window:Create()
     frame.ResizeHandle = resize
 
     -- Apply scroll layout now + once more next frame
-    self:UpdateScrollInsets()
-    if C_Timer and C_Timer.After then
-        C_Timer.After(0, function()
-            self:UpdateScrollInsets()
-        end)
-    end
+    self:RequestScrollInsetsUpdate()
 
     -- Re-apply when window resizes
     frame:HookScript("OnSizeChanged", function()
-        Window:UpdateScrollInsets()
+        Window:RequestScrollInsetsUpdate()
     end)
 
     -- Store and apply initial sytling
@@ -540,28 +539,78 @@ end
 
 
 
+function Window:RequestScrollInsetsUpdate()
+	local f = self._frame
+	if not f then return end
+
+	if f.__sfScrollInsetsScheduled then return end
+	f.__sfScrollInsetsScheduled = true
+
+	local function Run()
+		local f2 = self._frame
+		if not f2 then return end
+		f2.__sfScrollInsetsScheduled = false
+		self:UpdateScrollInsets()
+	end
+
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0, Run)
+	else
+		Run()
+	end
+end
+
 function Window:UpdateScrollInsets()
-    local f = self._frame
-    if not f or not f.Content or not f.Content.Scroll then return end
+	local f = self._frame
+	if not f or not f.Content or not f.Content.Scroll then return end
 
-    local content = f.Content
-    local scroll = content.Scroll
+	local content = f.Content
+	local scroll = content.Scroll
+	local sb = scroll.ScrollBar
 
-    -- Reserve space for the scrollbar
-    local sb = scroll.ScrollBar
-    local sbw = (sb and sb:GetWidth()) or 0
-    if sbw < 16 then sbw = 20 end
+	-- Determine whether scrolling is actually needed
+	local range = 0
+	if scroll.GetVerticalScrollRange then
+		range = scroll:GetVerticalScrollRange() or 0
+	end
+	local needScroll = range > 0.5
 
-    local rightInset = sbw + (C.SCROLLBAR_GAP or 6)
+	-- Show/hide scrollbar based on need
+	if sb then
+		sb:SetShown(needScroll)
+	end
 
-    -- Reserve space for the resize handle corner when unlocked
-    local bottomInset = 0
-    if f.ResizeHandle and f.ResizeHandle:IsShown() then
-        local h = f.ResizeHandle:GetHeight() or (C.RESIZE_HANDLE_SIZE or 16)
-        bottomInset = h + (C.RESIZE_HANDLE_GAP or 6)
-    end
+	-- If scrollbar is hidden, keep scroll position at top
+	if not needScroll and scroll.SetVerticalScroll then
+		scroll:SetVerticalScroll(0)
+	end
 
-    scroll:ClearAllPoints()
-    scroll:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
-    scroll:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", -rightInset, bottomInset)
+	-- Reserve right inset ONLY if scrollbar is shown
+	local rightInset = 0
+	if needScroll and sb then
+		local sbw = (sb:GetWidth() or 0)
+		if sbw < 16 then sbw = 20 end
+		rightInset = sbw + (C.SCROLLBAR_GAP or 6)
+	end
+
+	-- Reserve bottom inset if resize handle is shown (unlocked)
+	local bottomInset = 0
+	if f.ResizeHandle and f.ResizeHandle:IsShown() then
+		local h = f.ResizeHandle:GetHeight() or (C.RESIZE_HANDLE_SIZE or 16)
+		bottomInset = h + (C.RESIZE_HANDLE_GAP or 6)
+	end
+
+	-- Apply anchors
+	scroll:ClearAllPoints()
+	scroll:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+	scroll:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", -rightInset, bottomInset)
+
+	-- Clamp scroll offset if content shrank while scrolled
+	if scroll.GetVerticalScroll and scroll.SetVerticalScroll and scroll.GetVerticalScrollRange then
+		local cur = scroll:GetVerticalScroll() or 0
+		local maxRange = scroll:GetVerticalScrollRange() or 0
+		if cur > maxRange then
+			scroll:SetVerticalScroll(maxRange)
+		end
+	end
 end

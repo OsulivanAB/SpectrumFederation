@@ -475,6 +475,9 @@ function View:Render(models, meta)
             self.emptyText:Hide()
             self.child:SetHeight(1)
         end
+        if LH.Window and LH.Window.RequestScrollInsetsUpdate then
+            LH.Window:RequestScrollInsetsUpdate()
+        end
         return
     end
 
@@ -512,4 +515,7 @@ function View:Render(models, meta)
 
     if y > 0 then y = y - ROW_SPACING end
     self.child:SetHeight(math.max(1, y))
+    if LH.Window and LH.Window.RequestScrollInsetsUpdate then
+        LH.Window:RequestScrollInsetsUpdate()
+    end
 end
