@@ -159,7 +159,27 @@ graph TB
 
 ---
 
-### 6. Linter (`linter.yml`)
+### 6. PR Main Validation (`pr-main-validation.yml`)
+
+**Trigger**: Pull requests to `main` branch  
+**Purpose**: Validate code quality and version format before merging to main
+
+**Jobs**:
+- **lint**: Run luacheck (Lua), yamllint (YAML), ruff (Python)
+- **validate-packaging**: Verify WoW addon structure
+- **check-stable-version**: Ensure version is in stable format (no `-beta` suffix)
+  - **Smart Retargeting**: If PR is retargeted to a different branch (e.g., beta), this check automatically passes
+- **validate-docs**: Build and validate MkDocs documentation
+
+**Required For Merge**: All jobs must pass
+
+**Special Features**:
+- **Automatic Retargeting Handling**: If a PR is accidentally opened to `main` and then retargeted to `beta`, the check-stable-version job will detect this and pass gracefully instead of failing
+- Uses `github.base_ref` to verify the PR's current target branch
+
+---
+
+### 7. Linter (`linter.yml`)
 
 **Trigger**: Push/PR to `main` or `beta`  
 **Purpose**: Continuous code quality checks
@@ -172,7 +192,7 @@ graph TB
 
 ---
 
-### 7. Deploy Docs (Integrated in `promote-beta-to-main.yml`)
+### 8. Deploy Docs (Integrated in `promote-beta-to-main.yml`)
 
 **Trigger**: During stable release promotion  
 **Purpose**: Deploy MkDocs documentation to GitHub Pages
@@ -328,6 +348,13 @@ python3 .github/scripts/validate_packaging.py
 **Duplicate Beta Release**:
 - Version already released
 - Bump version again to create new release
+
+**PR Retargeted from Main to Beta**:
+- If you accidentally opened a PR to `main` instead of `beta`, you can retarget it
+- Close the original PR and open a new one targeting `beta`, OR
+- Use GitHub's "Edit" button to change the base branch
+- The main validation workflow will automatically detect the change and pass gracefully
+- The beta validation workflow will then run for the new target
 
 ---
 
