@@ -136,34 +136,48 @@ function Page:Build(panel)
 		local filtered = {}
 		
 		for _, log in ipairs(logs) do
-			local include = true
-			
-			-- Filter by event type
-			if panel.__sfSelectedEventType and log:GetEventType() ~= panel.__sfSelectedEventType then
-				include = false
-			end
-			
-			-- Filter by author
-			if panel.__sfSelectedAuthor and log:GetAuthor() ~= panel.__sfSelectedAuthor then
-				include = false
-			end
-			
-			-- Filter by member
-			if panel.__sfSelectedMember then
-				local data = log:GetEventData()
-				if not data or data.member ~= panel.__sfSelectedMember then
+			-- Safety check: ensure log is a valid object with required methods
+			if type(log) ~= "table" or 
+			   type(log.GetEventType) ~= "function" or
+			   type(log.GetAuthor) ~= "function" or
+			   type(log.GetTimestamp) ~= "function" then
+				if SF.Debug then
+					SF.Debug:Warn("LOOTLOGS", "Skipping malformed log entry")
+				end
+				-- Skip this log entry
+			else
+				local include = true
+				
+				-- Filter by event type
+				if panel.__sfSelectedEventType and log:GetEventType() ~= panel.__sfSelectedEventType then
 					include = false
 				end
-			end
-			
-			if include then
-				table.insert(filtered, log)
+				
+				-- Filter by author
+				if panel.__sfSelectedAuthor and log:GetAuthor() ~= panel.__sfSelectedAuthor then
+					include = false
+				end
+				
+				-- Filter by member
+				if panel.__sfSelectedMember then
+					local data = type(log.GetEventData) == "function" and log:GetEventData()
+					if not data or data.member ~= panel.__sfSelectedMember then
+						include = false
+					end
+				end
+				
+				if include then
+					table.insert(filtered, log)
+				end
 			end
 		end
 		
 		-- Sort by timestamp (newest first)
 		table.sort(filtered, function(a, b)
-			return a:GetTimestamp() > b:GetTimestamp()
+			if type(a.GetTimestamp) == "function" and type(b.GetTimestamp) == "function" then
+				return a:GetTimestamp() > b:GetTimestamp()
+			end
+			return false
 		end)
 		
 		return filtered

@@ -994,6 +994,12 @@ function Controls:AddScrollableText(section, opts)
 		editBox:SetWidth(CONTROL_WIDTH - 24)
 		editBox:SetAutoFocus(false)
 		editBox:SetTextColor(1, 1, 1)
+		
+		-- Make it read-only (still allows selection and copying)
+		editBox:SetEnabled(false)
+		editBox:EnableMouse(true)
+		editBox:EnableKeyboard(true)
+		
 		editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 		
 		scrollFrame:SetScrollChild(editBox)
