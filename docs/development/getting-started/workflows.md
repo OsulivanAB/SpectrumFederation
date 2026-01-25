@@ -7,6 +7,9 @@ This guide explains the comprehensive CI/CD workflows for SpectrumFederation, im
 ```mermaid
 graph TB
     A[Feature Branch] -->|PR to beta| B{PR Validation}
+    A -->|PR to beta with Lua changes| B1{Code Review Workflow}
+    B1 -->|Manual Approval| B2[Review Guidance Posted]
+    B2 --> B
     B -->|Pass| C[Merge to beta]
     C --> D[Post-Merge Beta]
     D --> E[Beta Release]
@@ -114,7 +117,39 @@ graph TB
 
 ---
 
-### 6. Deploy Docs (Integrated in `promote-beta-to-main.yml`)
+### 6. PR Beta Code Review (`pr-beta-code-review.yml`)
+
+**Trigger**: Pull requests to `beta` branch (only for Lua files in `SpectrumFederation/**`)
+**Purpose**: Provide code review guidance for adding debugging statements
+
+**Environment**: `beta-code-review` (requires manual approval)
+
+**Jobs**:
+- **code-review-approval**: Analyzes changed Lua files and provides debugging guidance
+  - Detects changed Lua files in PR
+  - Generates diff of code changes
+  - Creates detailed review prompt for adding `SF.Debug` logging
+  - Posts PR comment with review instructions
+  - Skips if no Lua files changed
+
+**Manual Approval Required**: This workflow uses a GitHub environment named `beta-code-review` which requires manual approval before execution. Configure this in repository Settings → Environments.
+
+**Review Focus**:
+- Add debug logging only where genuinely useful (entry points, error conditions, state transitions)
+- Use appropriate log levels (VERBOSE, INFO, WARN, ERROR)
+- Follow existing `SF.Debug` patterns
+- Avoid trivial logging (getters, setters, simple property access)
+
+**Usage**:
+1. Create PR to beta branch with Lua changes
+2. Workflow triggers and waits for approval
+3. Approve workflow run in Actions tab
+4. Workflow analyzes changes and posts review guidance
+5. Use guidance to manually add debugging where appropriate
+
+---
+
+### 7. Deploy Docs (Integrated in `promote-beta-to-main.yml`)
 
 **Trigger**: During stable release promotion  
 **Purpose**: Deploy MkDocs documentation to GitHub Pages
