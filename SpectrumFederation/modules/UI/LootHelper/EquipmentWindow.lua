@@ -213,10 +213,7 @@ function EquipmentWindow:_CreateGearGrid(content)
 
         -- "Used" overlay (golden border, shown when slot is used)
         local overlay = btn:CreateTexture(nil, "OVERLAY")
-        -- Size as border - slightly larger than icon to create border effect
-        local borderSize = 2
-        overlay:SetPoint("TOPLEFT", btn, "TOPLEFT", -borderSize, borderSize)
-        overlay:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", borderSize, -borderSize)
+        overlay:SetAllPoints(btn)  -- Same size as button, anchored to all corners
         overlay:SetTexture("Interface\\Buttons\\UI-ActionButton-Border")
         overlay:SetBlendMode("ADD")
         overlay:SetVertexColor(1, 0.8, 0, 0.8)  -- Golden glow
