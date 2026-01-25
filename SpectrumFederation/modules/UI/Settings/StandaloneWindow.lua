@@ -34,6 +34,7 @@ local C = {
     DIVIDER = {1, 1, 1, 0.08},
     NAV_SELECTED_BG = {1, 1, 1, 0.08},
     NAV_HOVER_BG = {1, 1, 1, 0.04},
+    NAV_TRANSPARENT_BG = {0, 0, 0, 0},
     
     -- Backdrop settings
     BACKDROP = {
@@ -69,7 +70,7 @@ SettingsWindow.currentPageId = nil
 -- @return string Version string (e.g., "0.4.0-beta.7")
 local function GetVersionString()
     local version = "Unknown"
-    if SF.GetAddonVersion then
+    if SF and SF.GetAddonVersion then
         version = SF:GetAddonVersion()
     elseif C_AddOns and C_AddOns.GetAddOnMetadata then
         version = C_AddOns.GetAddOnMetadata(addonName, "Version") or "Unknown"
@@ -117,7 +118,7 @@ local function CreateNavButton(parent, label, pageId)
     -- Background highlight
     btn.bg = btn:CreateTexture(nil, "BACKGROUND")
     btn.bg:SetAllPoints()
-    btn.bg:SetColorTexture(0, 0, 0, 0)
+    btn.bg:SetColorTexture(unpack(C.NAV_TRANSPARENT_BG))
     
     -- Label text
     btn.text = btn:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -134,7 +135,7 @@ local function CreateNavButton(parent, label, pageId)
     
     btn:SetScript("OnLeave", function(self)
         if SettingsWindow.currentPageId ~= pageId then
-            self.bg:SetColorTexture(0, 0, 0, 0)
+            self.bg:SetColorTexture(unpack(C.NAV_TRANSPARENT_BG))
         end
     end)
     
@@ -188,7 +189,7 @@ function SettingsWindow:UpdateNavButtonStates(selectedPageId)
             btn.bg:SetColorTexture(unpack(C.NAV_SELECTED_BG))
             btn.text:SetTextColor(1, 1, 1, 1)
         else
-            btn.bg:SetColorTexture(0, 0, 0, 0)
+            btn.bg:SetColorTexture(unpack(C.NAV_TRANSPARENT_BG))
             btn.text:SetTextColor(0.8, 0.8, 0.8, 1)
         end
     end
