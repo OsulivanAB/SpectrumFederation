@@ -9,21 +9,21 @@ local EquipmentWindow = LH.EquipmentWindow
 
 -- Constants
 local TITLE_HEIGHT = 28
-local PADDING = 10
+local PADDING = 8  -- Reduced from 10 to minimize extra space
 local ICON_SIZE = 32
 local ICON_SPACING = 4
-local COL_SPACING = ICON_SIZE  -- Spacer between columns (size of an icon)
+local COL_SPACING = ICON_SIZE * 2  -- Double icon size for spacer between columns
 local NUM_ROWS = 9
 local NUM_COLS = 2
 
 -- Calculate window dimensions based on content
--- Width: left padding + icon + spacing + col spacer + icon + spacing + right padding
+-- Width: left padding + icon + col spacer + icon + right padding
 local CONTENT_WIDTH = ICON_SIZE * NUM_COLS + COL_SPACING + (PADDING * 2)
-local WINDOW_WIDTH = CONTENT_WIDTH + 12 + 12  -- Add backdrop insets (left 4 + right 4) + frame border padding (6 + 6)
+local WINDOW_WIDTH = CONTENT_WIDTH + 8  -- Minimal backdrop insets
 
--- Height: title bar + padding + icons + spacing + padding
+-- Height: title bar + top gap + padding + icons + spacing + padding
 local CONTENT_HEIGHT = (ICON_SIZE * NUM_ROWS) + (ICON_SPACING * (NUM_ROWS - 1))
-local WINDOW_HEIGHT = TITLE_HEIGHT + 6 + PADDING + CONTENT_HEIGHT + PADDING  -- 6 is top gap after title
+local WINDOW_HEIGHT = TITLE_HEIGHT + 6 + PADDING + CONTENT_HEIGHT + PADDING
 
 -- Min/max height constraints (for dynamic sizing if needed)
 local WINDOW_MIN_HEIGHT = WINDOW_HEIGHT
@@ -36,7 +36,7 @@ local LEFT_SLOTS = {
     { key = "Head",      texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head" },
     { key = "Neck",      texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck" },
     { key = "Shoulder",  texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Shoulder" },
-    { key = "Back",      texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Back" },
+    { key = "Back",      texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Chest" },  -- Using Chest icon as Back doesn't exist
     { key = "Chest",     texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Chest" },
     { key = nil,         texture = nil },  -- EMPTY (shirt placeholder)
     { key = nil,         texture = nil },  -- EMPTY (tabard placeholder)
@@ -211,9 +211,12 @@ function EquipmentWindow:_CreateGearGrid(content)
         hl:SetAllPoints(btn)
         hl:SetColorTexture(1, 1, 1, 0.3)  -- Brighter white highlight for hover
 
-        -- "Used" overlay (golden glow, shown when slot is used)
+        -- "Used" overlay (golden border, shown when slot is used)
         local overlay = btn:CreateTexture(nil, "OVERLAY")
-        overlay:SetAllPoints(btn)
+        -- Size as border - slightly larger than icon to create border effect
+        local borderSize = 2
+        overlay:SetPoint("TOPLEFT", btn, "TOPLEFT", -borderSize, borderSize)
+        overlay:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", borderSize, -borderSize)
         overlay:SetTexture("Interface\\Buttons\\UI-ActionButton-Border")
         overlay:SetBlendMode("ADD")
         overlay:SetVertexColor(1, 0.8, 0, 0.8)  -- Golden glow
@@ -249,6 +252,13 @@ end
 function EquipmentWindow:ShowForMember(mainFrame, rowModel, memberObj, canAdmin)
     self:Create()
 
+    -- Check if we're already showing this member - if so, toggle off
+    if self:IsShown() and self._rowModel and self._rowModel.memberId == rowModel.memberId then
+        self:Hide()
+        return
+    end
+
+    -- If showing different member, continue to show new member
     self._mainFrame = mainFrame
     self._rowModel = rowModel
     self._memberObj = memberObj
