@@ -69,22 +69,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Check if PR targets main branch
-        id: check-target
-        run: |
-          BASE_REF="${{ github.base_ref }}"
-          echo "PR base branch: $BASE_REF"
-
-          if [[ "$BASE_REF" != "main" ]]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-            echo "⚠️ PR is not targeting main branch (targets: $BASE_REF)"
-            echo "   Skipping main-specific validation checks"
-          else
-            echo "skip=false" >> $GITHUB_OUTPUT
-          fi
-
       - name: Verify stable version format
-        if: steps.check-target.outputs.skip != 'true'
         run: |
           VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
           echo "Version in TOC: $VERSION"
