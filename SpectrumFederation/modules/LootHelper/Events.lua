@@ -15,11 +15,19 @@ function E:Register(eventName, fn, owner)
 
     self._listeners[eventName] = self._listeners[eventName] or {}
     table.insert(self._listeners[eventName], { owner = owner, fn = fn })
+
+    if SF.Debug then
+        SF.Debug:Verbose("LH_EVENTS", "Registered listener for event: %s", tostring(eventName))
+    end
 end
 
 function E:Fire(eventName, ...)
     local list = self._listeners[eventName]
     if not list then return end
+
+    if SF.Debug then
+        SF.Debug:Verbose("LH_EVENTS", "Firing event: %s (%d listeners)", tostring(eventName), #list)
+    end
 
     for i = 1, #list do
         local cb = list[i]
@@ -101,6 +109,10 @@ end
 
 function E:InitDataHooks()
     if self._initHookTicker then return end
+
+    if SF.Debug then
+        SF.Debug:Info("LH_EVENTS", "Initializing data hooks for LootProfile and Member")
+    end
 
     local tries = 0
     local function Try()

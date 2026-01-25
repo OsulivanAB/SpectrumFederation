@@ -203,7 +203,14 @@ function Model:Build(profile)
 
     if not profile then
         meta.emptyText = "No active profile.\nCreate or select a LootHelper profile in settings."
+        if SF.Debug then
+            SF.Debug:Verbose("LH_ROSTER", "Build: No profile provided")
+        end
         return rows, meta
+    end
+
+    if SF.Debug then
+        SF.Debug:Verbose("LH_ROSTER", "Build: Building roster for profile")
     end
 
     -- settings
@@ -264,6 +271,11 @@ function Model:Build(profile)
     table.sort(rows, function(a, b)
         return (a.sortKey or "") < (b.sortKey or "")
     end)
+
+    if SF.Debug then
+        SF.Debug:Verbose("LH_ROSTER", "Build: Generated %d rows (%d profile members, %d raid non-members)", 
+            #rows, #profMembers, #rows - #profMembers)
+    end
 
     if #rows == 0 then
         if not IsInRaid() and not showMembersNotInRaid then

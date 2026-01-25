@@ -106,6 +106,10 @@ function EquipmentWindow:Create()
         return self._frame
     end
 
+    if SF.Debug then
+        SF.Debug:Info("LH_EQUIPMENT", "Creating equipment window frame")
+    end
+
     local frame = CreateFrame("Frame", "SF_EquipmentWindow", UIParent, "BackdropTemplate")
     frame:SetSize(WINDOW_WIDTH, WINDOW_HEIGHT)
     frame:SetClampedToScreen(true)
@@ -254,8 +258,16 @@ end
 function EquipmentWindow:ShowForMember(mainFrame, rowModel, memberObj, canAdmin)
     self:Create()
 
+    if SF.Debug then
+        SF.Debug:Info("LH_EQUIPMENT", "ShowForMember: member=%s, canAdmin=%s", 
+            tostring(rowModel and rowModel.memberId), tostring(canAdmin))
+    end
+
     -- Check if we're already showing this member - if so, toggle off
     if self:IsShown() and self._rowModel and self._rowModel.memberId == rowModel.memberId then
+        if SF.Debug then
+            SF.Debug:Verbose("LH_EQUIPMENT", "ShowForMember: Toggling off (same member)")
+        end
         self:Hide()
         return
     end
@@ -380,6 +392,11 @@ end
 function EquipmentWindow:_OnSlotClicked(slotKey)
     if not self._memberObj or not self._canAdmin then return end
     if not slotKey then return end
+
+    if SF.Debug then
+        SF.Debug:Info("LH_EQUIPMENT", "ToggleSlot: member=%s, slot=%s", 
+            tostring(self._rowModel and self._rowModel.memberId), tostring(slotKey))
+    end
 
     -- Call member toggle
     if self._memberObj.ToggleEquipment then
