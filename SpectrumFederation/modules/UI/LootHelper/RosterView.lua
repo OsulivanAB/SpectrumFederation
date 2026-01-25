@@ -438,9 +438,7 @@ function View:_BindRowActions(r, model)
                 if model.member.IncrementPoints then
                     pcall(function() model.member:IncrementPoints() end)
                 end
-                if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
-                    SF.LootHelperEvents:NotifyDataChanged("UI:IncrementPoints", { memberId = model.memberId })
-                end
+                -- DATA_CHANGED event is automatically fired via Events.lua hook
                 if SF.Debug then
                     SF.Debug:Info("LH_ROSTER_VIEW", "IncrementPoints: %s", tostring(model.memberId))
                 end
@@ -450,9 +448,7 @@ function View:_BindRowActions(r, model)
                 if model.member.DecrementPoints then
                     pcall(function() model.member:DecrementPoints() end)
                 end
-                if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
-                    SF.LootHelperEvents:NotifyDataChanged("UI:DecrementPoints", { memberId = model.memberId })
-                end
+                -- DATA_CHANGED event is automatically fired via Events.lua hook
                 if SF.Debug then
                     SF.Debug:Info("LH_ROSTER_VIEW", "DecrementPoints: %s", tostring(model.memberId))
                 end

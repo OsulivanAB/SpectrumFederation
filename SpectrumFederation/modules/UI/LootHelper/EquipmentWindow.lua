@@ -405,14 +405,7 @@ function EquipmentWindow:_OnSlotClicked(slotKey)
         end)
 
         if ok then
-            -- Fire event to notify system
-            if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
-                SF.LootHelperEvents:NotifyDataChanged("UI:ToggleEquipment", {
-                    memberId = self._rowModel.memberId,
-                    slot = slotKey
-                })
-            end
-
+            -- DATA_CHANGED event is automatically fired via Events.lua hook
             -- Refresh immediately
             self:Refresh()
         end
