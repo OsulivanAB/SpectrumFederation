@@ -969,4 +969,47 @@ function Controls:AddHelpText(section, opts)
 	end)
 end
 
+-- Add a scrollable text box (read-only, multiline, copyable)
+-- @param section table Section to add row into
+-- @param opts table Options including label, height, get
+-- @return Frame The created row
+function Controls:AddScrollableText(section, opts)
+	opts = opts or {}
+	local get = opts.get or function() return "" end
+	local height = opts.height or 200
+	
+	return section:AddRow(height + 4, function(row)
+		local label, control = self:InitRow(row, opts)
+		
+		-- Create scroll frame
+		local scrollFrame = CreateFrame("ScrollFrame", nil, control, "UIPanelScrollFrameTemplate")
+		scrollFrame:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+		scrollFrame:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", -4, 0)
+		scrollFrame:SetSize(CONTROL_WIDTH, height)
+		
+		-- Create edit box (multiline, read-only)
+		local editBox = CreateFrame("EditBox", nil, scrollFrame)
+		editBox:SetMultiLine(true)
+		editBox:SetFontObject(ChatFontNormal)
+		editBox:SetWidth(CONTROL_WIDTH - 24)
+		editBox:SetAutoFocus(false)
+		editBox:SetTextColor(1, 1, 1)
+		editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+		
+		scrollFrame:SetScrollChild(editBox)
+		
+		local function Refresh()
+			local text = get()
+			editBox:SetText(tostring(text or ""))
+			editBox:HighlightText(0, 0)
+			editBox:SetCursorPosition(0)
+			
+			self:_ApplyRowState(row, section, opts)
+		end
+		
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
 

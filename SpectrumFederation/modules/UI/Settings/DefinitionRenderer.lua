@@ -150,6 +150,9 @@ function R:Build(panel, pageDef)
 					end
 				end
 				controls:AddEditBoxWithButton(sec, opts)
+
+			elseif t == "scrollableText" then
+				controls:AddScrollableText(sec, item)
 			end
 		end
 
