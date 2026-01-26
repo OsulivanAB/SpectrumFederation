@@ -39,7 +39,9 @@ function PageBuilder:Init(panel)
 	local scroll = CreateFrame("ScrollFrame", nil, panel, "UIPanelScrollFrameTemplate")
 	self.scrollFrame = scroll
 	scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
-	scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", 0, 0)
+	-- Subtract scrollbar width from right edge to keep scrollbar visible
+	local SCROLLBAR_WIDTH = 24  -- Standard WoW scrollbar width
+	scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -SCROLLBAR_WIDTH, 0)
 
 	local content = CreateFrame("Frame", nil, scroll)
 	self.content = content
