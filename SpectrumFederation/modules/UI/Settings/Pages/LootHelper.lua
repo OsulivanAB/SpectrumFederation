@@ -102,6 +102,12 @@ local function CanShowAdminTools(ctx)
 	return true
 end
 
+-- Check if a session is currently active
+-- @return boolean True if session is active, false otherwise
+local function IsSessionActive()
+	return SF.LootHelperSync and SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive()
+end
+
 -- ==================================================================
 -- Page Definition
 -- ==================================================================
@@ -681,7 +687,7 @@ function Page:Build(panel)
 						label = "Session Control",
 						buttonText = function()
 							-- Dynamic button text based on session state
-							if SF.LootHelperSync and SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive() then
+							if IsSessionActive() then
 								return "End Session"
 							else
 								return "Start Session"
@@ -696,20 +702,13 @@ function Page:Build(panel)
 							ctx.section:ClearMessage()
 
 							-- Check if sync system is available
-							if not SF.LootHelperSync then
+							if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then
 								ctx.section:SetMessage("Loot Helper Sync system not available", "error")
 								return
 							end
 
-							local isActive = SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive()
-
-							if isActive then
+							if IsSessionActive() then
 								-- End the session
-								if not SF.LootHelperSync.EndSession then
-									ctx.section:SetMessage("EndSession not available", "error")
-									return
-								end
-
 								local ok = SF.LootHelperSync:EndSession("manual")
 								if ok then
 									ctx.section:SetMessage("Session ended successfully", "success")
@@ -718,11 +717,6 @@ function Page:Build(panel)
 								end
 							else
 								-- Start a new session
-								if not SF.LootHelperSync.StartSession then
-									ctx.section:SetMessage("StartSession not available", "error")
-									return
-								end
-
 								-- Get the active profile ID
 								local profileId = GetActiveProfileId(ctx.store)
 								if not profileId then
