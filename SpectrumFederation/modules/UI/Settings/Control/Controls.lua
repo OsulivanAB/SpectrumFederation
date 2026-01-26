@@ -1019,25 +1019,33 @@ function Controls:AddScrollableText(section, opts)
 		editBox:SetAutoFocus(false)
 		editBox:SetTextColor(1, 1, 1)
 		
-		-- Make it read-only but still allow text selection and copying
-		-- SetEnabled(false) prevents editing, EnableMouse/Keyboard allow selection
-		editBox:SetEnabled(false)
+		-- Make it read-only by preventing text changes
+		-- Keep EditBox enabled so users can select and copy text
 		editBox:EnableMouse(true)
 		editBox:EnableKeyboard(true)
 		
+		-- Store the current text to prevent modifications
+		local currentText = ""
+		
+		-- Block all text input to make it read-only
+		editBox:SetScript("OnChar", function() editBox:SetText(currentText) editBox:HighlightText(0, 0) end)
+		editBox:SetScript("OnTextChanged", function(self, userInput)
+			if userInput then
+				-- User tried to type - revert to stored text
+				editBox:SetText(currentText)
+				editBox:HighlightText(0, 0)
+			end
+		end)
 		editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
 		
 		scrollFrame:SetScrollChild(editBox)
 		
 		local function Refresh()
-			-- Temporarily enable to allow text update
-			editBox:SetEnabled(true)
 			local text = get()
-			editBox:SetText(tostring(text or ""))
+			currentText = tostring(text or "")
+			editBox:SetText(currentText)
 			editBox:HighlightText(0, 0)
 			editBox:SetCursorPosition(0)
-			-- Disable again to make read-only
-			editBox:SetEnabled(false)
 			
 			self:_ApplyRowState(row, section, opts)
 		end
