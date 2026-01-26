@@ -195,10 +195,6 @@ function Page:Build(panel)
 						set = function(value)
 							panel.__sfLogLevels.VERBOSE = value
 						end,
-						onValueChanged = function(ctx)
-							ctx.pageBuilder:Refresh()
-							ctx.pageBuilder:Reflow()
-						end,
 					},
 					
 					{
@@ -210,10 +206,6 @@ function Page:Build(panel)
 						end,
 						set = function(value)
 							panel.__sfLogLevels.INFO = value
-						end,
-						onValueChanged = function(ctx)
-							ctx.pageBuilder:Refresh()
-							ctx.pageBuilder:Reflow()
 						end,
 					},
 					
@@ -227,10 +219,6 @@ function Page:Build(panel)
 						set = function(value)
 							panel.__sfLogLevels.WARN = value
 						end,
-						onValueChanged = function(ctx)
-							ctx.pageBuilder:Refresh()
-							ctx.pageBuilder:Reflow()
-						end,
 					},
 					
 					{
@@ -242,10 +230,6 @@ function Page:Build(panel)
 						end,
 						set = function(value)
 							panel.__sfLogLevels.ERROR = value
-						end,
-						onValueChanged = function(ctx)
-							ctx.pageBuilder:Refresh()
-							ctx.pageBuilder:Reflow()
 						end,
 					},
 				},
