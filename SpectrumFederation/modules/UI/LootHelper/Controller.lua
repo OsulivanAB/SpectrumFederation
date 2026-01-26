@@ -311,7 +311,7 @@ end
 -- Handle OpenSettings action
 function Controller:OpenSettings()
     if SF.SettingsUI and SF.SettingsUI.OpenToPage then
-        SF.SettingsUI:OpenToPage("loothelper")
+        SF.SettingsUI:OpenToPage("lootHelper")
         return
     end
 
