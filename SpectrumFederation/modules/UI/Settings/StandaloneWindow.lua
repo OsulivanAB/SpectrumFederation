@@ -365,6 +365,9 @@ function SettingsWindow:Init()
     self:AddNavPage("main", "Home")
     self:AddNavSpacer()
     self:AddNavPage("lootHelper", "Loot Helper")
+    self:AddNavPage("lootLogs", "Loot Logs")
+    self:AddNavSpacer()
+    self:AddNavPage("debugging", "Debugging")
     
     -- Create the window frame
     self:CreateWindow()
@@ -384,6 +387,23 @@ function SettingsWindow:Show()
     
     -- Select the first page if none selected
     if not self.currentPageId then
+        self:SelectTab("main")
+    end
+end
+
+-- Show the settings window and open to a specific page
+-- @param pageId string The page ID to open to
+function SettingsWindow:ShowPage(pageId)
+    if not self.frame then
+        self:Init()
+    end
+    
+    self.frame:Show()
+    
+    -- Select the specified page
+    if pageId and self.navButtons[pageId] then
+        self:SelectTab(pageId)
+    elseif not self.currentPageId then
         self:SelectTab("main")
     end
 end
