@@ -84,13 +84,24 @@ local function GetEventTypeOptions()
 	return options
 end
 
--- Format a log entry for display
+-- Format a log entry for display with color coding
 -- @param log LootLog Log entry
 -- @return string Formatted log text
 local function FormatLogEntry(log)
 	if type(log.GetTimestamp) ~= "function" then
 		return "Invalid log entry"
 	end
+	
+	-- Define colors
+	local EVENT_TYPE_COLORS = {
+		PROFILE_CREATION = "|cff00ff00",  -- Green
+		POINT_CHANGE     = "|cff00ccff",  -- Cyan
+		ARMOR_CHANGE     = "|cffffa500",  -- Orange
+		ROLE_CHANGE      = "|cffff00ff",  -- Magenta
+	}
+	local TIMESTAMP_COLOR = "|cffffffff"  -- White
+	local AUTHOR_COLOR = "|cffffff00"     -- Yellow
+	local RESET = "|r"
 	
 	local timestamp = log:GetTimestamp()
 	local author = log:GetAuthor() or "Unknown"
@@ -100,6 +111,8 @@ local function FormatLogEntry(log)
 	local timeStr = type(SF.FormatTimestampForUser) == "function" 
 		and SF:FormatTimestampForUser(timestamp) 
 		or tostring(timestamp)
+	
+	local eventTypeColor = EVENT_TYPE_COLORS[eventType] or "|cffffffff"
 	
 	local details = ""
 	if eventType == "POINT_CHANGE" then
@@ -113,7 +126,11 @@ local function FormatLogEntry(log)
 		details = string.format("Profile ID: %s", data.profileId or "?")
 	end
 	
-	return string.format("[%s] %s by %s - %s", timeStr, eventType, author, details)
+	return string.format("%s[%s]%s %s%s%s by %s%s%s - %s", 
+		TIMESTAMP_COLOR, timeStr, RESET,
+		eventTypeColor, eventType, RESET,
+		AUTHOR_COLOR, author, RESET,
+		details)
 end
 
 -- ==================================================================

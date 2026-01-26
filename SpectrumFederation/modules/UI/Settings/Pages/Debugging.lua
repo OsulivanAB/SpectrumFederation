@@ -32,13 +32,24 @@ local function GetFilteredDebugLogs(enabledLevels)
 	return filtered
 end
 
--- Format debug logs as copyable text
+-- Format debug logs as copyable text with color coding
 -- @param logs table Array of log entries
 -- @return string Formatted log text
 local function FormatDebugLogsText(logs)
 	if #logs == 0 then
 		return "No debug logs available.\n\nEnable debugging and perform actions to see logs here."
 	end
+	
+	-- Define colors for log levels
+	local LEVEL_COLORS = {
+		VERBOSE = "|cff888888",  -- Gray
+		INFO    = "|cff00ccff",  -- Cyan
+		WARN    = "|cffffa500",  -- Orange
+		ERROR   = "|cffff0000",  -- Red
+	}
+	local TIMESTAMP_COLOR = "|cffffffff"  -- White
+	local CATEGORY_COLOR = "|cffffff00"   -- Yellow
+	local RESET = "|r"
 	
 	local lines = {}
 	table.insert(lines, string.format("Showing %d log(s):\n", #logs))
@@ -47,8 +58,14 @@ local function FormatDebugLogsText(logs)
 		local timestamp = type(SF.FormatTimestampForUser) == "function" 
 			and SF:FormatTimestampForUser(log.timestamp) 
 			or tostring(log.timestamp)
-		table.insert(lines, string.format("[%s] [%s] %s: %s", 
-			timestamp, log.level, log.category, log.message))
+		
+		local levelColor = LEVEL_COLORS[log.level] or "|cffffffff"
+		
+		table.insert(lines, string.format("%s[%s]%s %s[%s]%s %s%s:%s %s", 
+			TIMESTAMP_COLOR, timestamp, RESET,
+			levelColor, log.level, RESET,
+			CATEGORY_COLOR, log.category, RESET,
+			log.message))
 	end
 	
 	return table.concat(lines, "\n")
