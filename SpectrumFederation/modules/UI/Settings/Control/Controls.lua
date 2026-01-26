@@ -1026,14 +1026,24 @@ function Controls:AddScrollableText(section, opts)
 		
 		-- Store the current text to prevent modifications
 		local currentText = ""
+		local isUpdating = false  -- Prevent recursion
 		
-		-- Block all text input to make it read-only
-		editBox:SetScript("OnChar", function() editBox:SetText(currentText) editBox:HighlightText(0, 0) end)
-		editBox:SetScript("OnTextChanged", function(self, userInput)
-			if userInput then
-				-- User tried to type - revert to stored text
+		-- Helper to revert text changes
+		local function RevertText()
+			if not isUpdating then
+				isUpdating = true
 				editBox:SetText(currentText)
 				editBox:HighlightText(0, 0)
+				isUpdating = false
+			end
+		end
+		
+		-- Block all text input to make it read-only
+		editBox:SetScript("OnChar", function() RevertText() end)
+		editBox:SetScript("OnTextChanged", function(self, userInput)
+			if userInput and not isUpdating then
+				-- User tried to type - revert to stored text
+				RevertText()
 			end
 		end)
 		editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
@@ -1041,11 +1051,13 @@ function Controls:AddScrollableText(section, opts)
 		scrollFrame:SetScrollChild(editBox)
 		
 		local function Refresh()
+			isUpdating = true
 			local text = get()
 			currentText = tostring(text or "")
 			editBox:SetText(currentText)
 			editBox:HighlightText(0, 0)
 			editBox:SetCursorPosition(0)
+			isUpdating = false
 			
 			self:_ApplyRowState(row, section, opts)
 		end
