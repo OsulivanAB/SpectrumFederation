@@ -14,7 +14,7 @@ local C = {
     HEIGHT = 540,
     
     -- Layout
-    NAV_WIDTH = 240,
+    NAV_WIDTH = 180,
     PADDING = 12,
     
     -- Navigation elements
