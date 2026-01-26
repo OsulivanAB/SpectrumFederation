@@ -977,21 +977,35 @@ function Controls:AddScrollableText(section, opts)
 	opts = opts or {}
 	local get = opts.get or function() return "" end
 	local height = opts.height or 200
+	local hasLabel = opts.label and opts.label ~= ""
 	
 	return section:AddRow(height + 4, function(row)
-		local label, control = self:InitRow(row, opts)
+		local scrollFrame, editBox
 		
-		-- Create scroll frame
-		local scrollFrame = CreateFrame("ScrollFrame", nil, control, "UIPanelScrollFrameTemplate")
-		scrollFrame:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
-		scrollFrame:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", -4, 0)
-		scrollFrame:SetSize(CONTROL_WIDTH, height)
+		if hasLabel then
+			-- Normal layout with label
+			local label, control = self:InitRow(row, opts)
+			
+			scrollFrame = CreateFrame("ScrollFrame", nil, control, "UIPanelScrollFrameTemplate")
+			scrollFrame:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+			scrollFrame:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", -4, 0)
+			
+			editBox = CreateFrame("EditBox", nil, scrollFrame)
+			editBox:SetWidth(CONTROL_WIDTH - 24)
+		else
+			-- Full-width layout without label
+			scrollFrame = CreateFrame("ScrollFrame", nil, row, "UIPanelScrollFrameTemplate")
+			scrollFrame:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+			scrollFrame:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -4, 0)
+			
+			editBox = CreateFrame("EditBox", nil, scrollFrame)
+			-- Use full row width minus scrollbar
+			editBox:SetWidth(scrollFrame:GetWidth() - 24)
+		end
 		
-		-- Create edit box (multiline, read-only)
-		local editBox = CreateFrame("EditBox", nil, scrollFrame)
+		-- Common edit box setup
 		editBox:SetMultiLine(true)
 		editBox:SetFontObject(ChatFontNormal)
-		editBox:SetWidth(CONTROL_WIDTH - 24)
 		editBox:SetAutoFocus(false)
 		editBox:SetTextColor(1, 1, 1)
 		
