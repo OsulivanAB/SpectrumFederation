@@ -322,7 +322,14 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         self.state.helpers = payload.helpers
     end
     if type(payload.authorMax) == "table" then
-        self.state.authorMax = payload.authorMax    -- Bug: NOt sure if this is a bug, but I think we should be comparing this authormax to what we have saved to see if maybe there was something we missed.
+        -- Merge authorMax with max() to preserve local progress from NEW_LOG messages
+        self.state.authorMax = self.state.authorMax or {}
+        for author, remoteMax in pairs(payload.authorMax) do
+            if type(author) == "string" and type(remoteMax) == "number" then
+                local localMax = tonumber(self.state.authorMax[author]) or 0
+                self.state.authorMax[author] = math.max(localMax, remoteMax)
+            end
+        end
     end
 
     -- Heartbeat bookkeeping
