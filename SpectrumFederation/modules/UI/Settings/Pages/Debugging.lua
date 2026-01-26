@@ -40,6 +40,23 @@ local function FormatDebugLogsText(logs)
 		return "No debug logs available.\n\nEnable debugging and perform actions to see logs here."
 	end
 	
+	-- Helper function to convert RGB color table to WoW hex color
+	local function ToWoWHexColor(color)
+		if type(color) == "string" then
+			return color
+		end
+		if type(color) == "table" then
+			local r = tonumber(color.r or color[1] or 1) or 1
+			local g = tonumber(color.g or color[2] or 1) or 1
+			local b = tonumber(color.b or color[3] or 1) or 1
+			r = math.min(math.max(r, 0), 1)
+			g = math.min(math.max(g, 0), 1)
+			b = math.min(math.max(b, 0), 1)
+			return string.format("|cff%02x%02x%02x", r * 255, g * 255, b * 255)
+		end
+		return "|cffffffff"
+	end
+	
 	-- Define colors for log levels
 	local LEVEL_COLORS = {
 		VERBOSE = "|cff888888",  -- Gray
@@ -179,6 +196,7 @@ function Page:Build(panel)
 						end,
 						onValueChanged = function(ctx)
 							ctx.pageBuilder:Refresh()
+							ctx.pageBuilder:Reflow()
 						end,
 					},
 					
@@ -194,6 +212,7 @@ function Page:Build(panel)
 						end,
 						onValueChanged = function(ctx)
 							ctx.pageBuilder:Refresh()
+							ctx.pageBuilder:Reflow()
 						end,
 					},
 					
@@ -209,6 +228,7 @@ function Page:Build(panel)
 						end,
 						onValueChanged = function(ctx)
 							ctx.pageBuilder:Refresh()
+							ctx.pageBuilder:Reflow()
 						end,
 					},
 					
@@ -224,6 +244,7 @@ function Page:Build(panel)
 						end,
 						onValueChanged = function(ctx)
 							ctx.pageBuilder:Refresh()
+							ctx.pageBuilder:Reflow()
 						end,
 					},
 				},

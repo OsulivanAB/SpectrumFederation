@@ -92,6 +92,41 @@ local function FormatLogEntry(log)
 		return "Invalid log entry"
 	end
 	
+	-- Helper function to convert RGB color table to WoW hex color
+	local function ToWoWHexColor(color)
+		if type(color) == "string" then
+			return color
+		end
+		if type(color) == "table" then
+			local r = tonumber(color.r or color[1] or 1) or 1
+			local g = tonumber(color.g or color[2] or 1) or 1
+			local b = tonumber(color.b or color[3] or 1) or 1
+			r = math.min(math.max(r, 0), 1)
+			g = math.min(math.max(g, 0), 1)
+			b = math.min(math.max(b, 0), 1)
+			return string.format("|cff%02x%02x%02x", r * 255, g * 255, b * 255)
+		end
+		return "|cffffffff"
+	end
+	
+	-- Get class color for a player name
+	local function GetPlayerClassColor(playerName)
+		if not playerName or playerName == "Unknown" or playerName == "?" then
+			return "|cffffffff"  -- White for unknown
+		end
+		
+		-- Try to get member from active profile
+		local profile = SF:GetActiveProfile()
+		if profile and type(profile.GetMemberByID) == "function" then
+			local member = profile:GetMemberByID(playerName)
+			if member and member.class and SF.WOW_CLASSES and SF.WOW_CLASSES[member.class] then
+				return ToWoWHexColor(SF.WOW_CLASSES[member.class].colorCode)
+			end
+		end
+		
+		return "|cffffff00"  -- Yellow as fallback
+	end
+	
 	-- Define colors
 	local EVENT_TYPE_COLORS = {
 		PROFILE_CREATION = "|cff00ff00",  -- Green
@@ -100,7 +135,6 @@ local function FormatLogEntry(log)
 		ROLE_CHANGE      = "|cffff00ff",  -- Magenta
 	}
 	local TIMESTAMP_COLOR = "|cffffffff"  -- White
-	local AUTHOR_COLOR = "|cffffff00"     -- Yellow
 	local RESET = "|r"
 	
 	local timestamp = log:GetTimestamp()
@@ -113,15 +147,21 @@ local function FormatLogEntry(log)
 		or tostring(timestamp)
 	
 	local eventTypeColor = EVENT_TYPE_COLORS[eventType] or "|cffffffff"
+	local authorColor = GetPlayerClassColor(author)
 	
 	local details = ""
 	if eventType == "POINT_CHANGE" then
-		details = string.format("Member: %s, Change: %s", data.member or "?", data.change or "?")
+		local memberColor = GetPlayerClassColor(data.member)
+		details = string.format("Member: %s%s%s, Change: %s", 
+			memberColor, data.member or "?", RESET, data.change or "?")
 	elseif eventType == "ARMOR_CHANGE" then
-		details = string.format("Member: %s, Slot: %s, Action: %s", 
-			data.member or "?", data.slot or "?", data.action or "?")
+		local memberColor = GetPlayerClassColor(data.member)
+		details = string.format("Member: %s%s%s, Slot: %s, Action: %s", 
+			memberColor, data.member or "?", RESET, data.slot or "?", data.action or "?")
 	elseif eventType == "ROLE_CHANGE" then
-		details = string.format("Member: %s, New Role: %s", data.member or "?", data.newRole or "?")
+		local memberColor = GetPlayerClassColor(data.member)
+		details = string.format("Member: %s%s%s, New Role: %s", 
+			memberColor, data.member or "?", RESET, data.newRole or "?")
 	elseif eventType == "PROFILE_CREATION" then
 		details = string.format("Profile ID: %s", data.profileId or "?")
 	end
@@ -129,7 +169,7 @@ local function FormatLogEntry(log)
 	return string.format("%s[%s]%s %s%s%s by %s%s%s - %s", 
 		TIMESTAMP_COLOR, timeStr, RESET,
 		eventTypeColor, eventType, RESET,
-		AUTHOR_COLOR, author, RESET,
+		authorColor, author, RESET,
 		details)
 end
 
