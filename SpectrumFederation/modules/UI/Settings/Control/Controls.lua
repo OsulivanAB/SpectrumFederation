@@ -999,13 +999,16 @@ function Controls:AddScrollableText(section, opts)
 			scrollFrame:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -4, 0)
 			
 			editBox = CreateFrame("EditBox", nil, scrollFrame)
-			-- Set initial width, will be updated on first size change
-			editBox:SetWidth(400)
+			-- Set initial width (fallback before OnSizeChanged fires)
+			local INITIAL_WIDTH = 400
+			editBox:SetWidth(INITIAL_WIDTH)
 			
 			-- Update width when scrollFrame gets its actual size
+			-- Subtract 24px for scrollbar width
+			local SCROLLBAR_WIDTH = 24
 			scrollFrame:SetScript("OnSizeChanged", function(self, width)
-				if width and width > 24 then
-					editBox:SetWidth(width - 24)
+				if width and width > SCROLLBAR_WIDTH then
+					editBox:SetWidth(width - SCROLLBAR_WIDTH)
 				end
 			end)
 		end
