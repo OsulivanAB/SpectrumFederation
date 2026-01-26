@@ -281,7 +281,13 @@ function Controls:AddButton(section, opts)
 		local btn = CreateFrame("Button", nil, control, "UIPanelButtonTemplate")
 		btn:SetPoint("LEFT", control, "LEFT", 0, 0)
 		btn:SetSize(opts.width or 140, 22)
-		btn:SetText(opts.buttonText or "Button")
+		
+		-- Support dynamic button text (function or string)
+		local function GetButtonText()
+			local text = (type(opts.buttonText) == "function") and opts.buttonText() or opts.buttonText
+			return text or "Button"
+		end
+		btn:SetText(GetButtonText())
 
 		btn:SetScript("OnClick", function()
 			if not btn:IsEnabled() then return end
@@ -291,6 +297,8 @@ function Controls:AddButton(section, opts)
 		end)
 
 		local function Refresh()
+			-- Update button text on refresh
+			btn:SetText(GetButtonText())
 			self:_ApplyRowState(row, section, opts, {btn})
 		end
 		Refresh()

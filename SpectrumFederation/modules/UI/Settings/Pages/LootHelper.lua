@@ -102,6 +102,12 @@ local function CanShowAdminTools(ctx)
 	return true
 end
 
+-- Check if a session is currently active
+-- @return boolean True if session is active, false otherwise
+local function IsSessionActive()
+	return SF.LootHelperSync and SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive()
+end
+
 -- ==================================================================
 -- Page Definition
 -- ==================================================================
@@ -673,6 +679,61 @@ function Page:Build(panel)
 						end,
 						onClick = function(ctx)
 							ctx.section:SetMessage("Stub: Trigger Raid-Wide Sync (implement later).", "warn")
+						end,
+					},
+
+					{
+						type = "button",
+						label = "Session Control",
+						buttonText = function()
+							-- Dynamic button text based on session state
+							if IsSessionActive() then
+								return "End Session"
+							else
+								return "Start Session"
+							end
+						end,
+						width = 120,
+						tooltip = "Start or end a Loot Helper sync session",
+						enabled = function()
+							return ProfileActionsEnabled()
+						end,
+						onClick = function(ctx)
+							ctx.section:ClearMessage()
+
+							-- Check if sync system is available
+							if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then
+								ctx.section:SetMessage("Loot Helper Sync system not available", "error")
+								return
+							end
+
+							if IsSessionActive() then
+								-- End the session
+								local ok = SF.LootHelperSync:EndSession("manual")
+								if ok then
+									ctx.section:SetMessage("Session ended successfully", "success")
+								else
+									ctx.section:SetMessage("Failed to end session", "error")
+								end
+							else
+								-- Start a new session
+								-- Get the active profile ID
+								local profileId = GetActiveProfileId(ctx.store)
+								if not profileId then
+									ctx.section:SetMessage("No active profile selected", "error")
+									return
+								end
+
+								local sessionId = SF.LootHelperSync:StartSession(profileId)
+								if sessionId then
+									ctx.section:SetMessage("Session started successfully", "success")
+								else
+									ctx.section:SetMessage("Failed to start session (not in a group/raid?)", "error")
+								end
+							end
+
+							-- Refresh the UI to update button text
+							ctx.pageBuilder:Refresh()
 						end,
 					},
 
