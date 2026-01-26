@@ -677,6 +677,73 @@ function Page:Build(panel)
 					},
 
 					{
+						type = "button",
+						label = "Session Control",
+						buttonText = function()
+							-- Dynamic button text based on session state
+							if SF.LootHelperSync and SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive() then
+								return "End Session"
+							else
+								return "Start Session"
+							end
+						end,
+						width = 120,
+						tooltip = "Start or end a Loot Helper sync session",
+						enabled = function()
+							return ProfileActionsEnabled()
+						end,
+						onClick = function(ctx)
+							ctx.section:ClearMessage()
+
+							-- Check if sync system is available
+							if not SF.LootHelperSync then
+								ctx.section:SetMessage("Loot Helper Sync system not available", "error")
+								return
+							end
+
+							local isActive = SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive()
+
+							if isActive then
+								-- End the session
+								if not SF.LootHelperSync.EndSession then
+									ctx.section:SetMessage("EndSession not available", "error")
+									return
+								end
+
+								local ok = SF.LootHelperSync:EndSession("manual")
+								if ok then
+									ctx.section:SetMessage("Session ended successfully", "success")
+								else
+									ctx.section:SetMessage("Failed to end session", "error")
+								end
+							else
+								-- Start a new session
+								if not SF.LootHelperSync.StartSession then
+									ctx.section:SetMessage("StartSession not available", "error")
+									return
+								end
+
+								-- Get the active profile ID
+								local profileId = GetActiveProfileId(ctx.store)
+								if not profileId then
+									ctx.section:SetMessage("No active profile selected", "error")
+									return
+								end
+
+								local sessionId = SF.LootHelperSync:StartSession(profileId)
+								if sessionId then
+									ctx.section:SetMessage("Session started successfully", "success")
+								else
+									ctx.section:SetMessage("Failed to start session (not in a group/raid?)", "error")
+								end
+							end
+
+							-- Refresh the UI to update button text
+							ctx.pageBuilder:Refresh()
+						end,
+					},
+
+					{
 						type = "checkbox",
 						label = "Enable Raid-Wide Safemode",
 						-- Bug: Should not be a persistent setting
