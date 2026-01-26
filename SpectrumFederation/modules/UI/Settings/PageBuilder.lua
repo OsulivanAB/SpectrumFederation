@@ -38,12 +38,13 @@ function PageBuilder:Init(panel)
 
 	local scroll = CreateFrame("ScrollFrame", nil, panel, "UIPanelScrollFrameTemplate")
 	self.scrollFrame = scroll
+	
+	-- Position scrollFrame to fill the panel, accounting for scrollbar
+	-- The scrollbar is part of the ScrollFrame but overlays the right edge
+	-- Inset from right by scrollbar width to keep it visible
+	local SCROLLBAR_INSET = 24  -- Standard WoW scrollbar width
 	scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
-	-- Subtract scrollbar width from right edge to keep scrollbar visible
-	-- Add small bottom padding for proper spacing
-	local SCROLLBAR_WIDTH = 24  -- Standard WoW scrollbar width
-	local BOTTOM_PADDING = 4    -- Small padding at bottom
-	scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -SCROLLBAR_WIDTH, BOTTOM_PADDING)
+	scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -SCROLLBAR_INSET, 0)
 
 	local content = CreateFrame("Frame", nil, scroll)
 	self.content = content
