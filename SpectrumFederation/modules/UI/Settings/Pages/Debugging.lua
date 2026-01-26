@@ -24,7 +24,8 @@ local function GetFilteredDebugLogs(enabledLevels)
 	local filtered = {}
 	
 	for _, log in ipairs(logs) do
-		if enabledLevels[log.level] then
+		-- Explicitly check if level is enabled (true), not just if key exists
+		if enabledLevels[log.level] == true then
 			table.insert(filtered, log)
 		end
 	end
