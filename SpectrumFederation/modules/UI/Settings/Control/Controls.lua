@@ -284,11 +284,8 @@ function Controls:AddButton(section, opts)
 		
 		-- Support dynamic button text (function or string)
 		local function GetButtonText()
-			if type(opts.buttonText) == "function" then
-				return opts.buttonText() or "Button"
-			else
-				return opts.buttonText or "Button"
-			end
+			local text = (type(opts.buttonText) == "function") and opts.buttonText() or opts.buttonText
+			return text or "Button"
 		end
 		btn:SetText(GetButtonText())
 
