@@ -28,8 +28,8 @@ Sync.cfg = Sync.cfg or {
     -- Request robustness
     maxOutstandingRequests  = 64,   -- hard cap to avoid unbounded memory
     requestBackoffMult      = 1.5,  -- exponential backoff multiplier
-    requestRetryJitterMsMin = 100, 
-    requestRetryJitterMsMax = 300,  -- TODO: Verify how this works. Admin jitter reply max is 500, so retry may happen before admin replies.
+    requestRetryJitterMsMin = 600,  -- Must be > adminReplyJitterMsMax (500ms) to prevent premature timeouts
+    requestRetryJitterMsMax = 1000, -- Increased to allow admin replies to complete before retry
 
     -- Backpressure for log bursts (coordinator -> member)
     maxMissingRangesPerNeededLogs   = 8,    -- clamp abusive/huge requests
