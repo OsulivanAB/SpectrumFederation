@@ -40,8 +40,10 @@ function PageBuilder:Init(panel)
 	self.scrollFrame = scroll
 	scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
 	-- Subtract scrollbar width from right edge to keep scrollbar visible
+	-- Add small bottom padding for proper spacing
 	local SCROLLBAR_WIDTH = 24  -- Standard WoW scrollbar width
-	scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -SCROLLBAR_WIDTH, 0)
+	local BOTTOM_PADDING = 4    -- Small padding at bottom
+	scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -SCROLLBAR_WIDTH, BOTTOM_PADDING)
 
 	local content = CreateFrame("Frame", nil, scroll)
 	self.content = content
