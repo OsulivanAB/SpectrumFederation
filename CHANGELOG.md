@@ -14,6 +14,21 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.4.0-beta.8] - 2026-01-26
+
+### Added
+- Introduced a revamped standalone settings window with improved navigation and usability.
+- Added a new "Debugging" page in the settings window for easier access to debug logs.
+- Implemented a scrollable, read-only text box for displaying and copying debug logs.
+
+### Changed
+- Updated the `/sf` command to toggle the new standalone settings window instead of the Blizzard settings panel.
+- Modified the Loot Helper settings to open in the standalone settings window when accessed.
+
+### Removed
+- Deprecated the old debug log viewer window in favor of the new "Debugging" page in the settings window.
+
 ## [0.4.0-beta.7] - 2026-01-25
 
 ### Fixed
