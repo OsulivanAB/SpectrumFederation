@@ -84,7 +84,15 @@ function R:Build(panel, pageDef)
 				controls:AddSlider(sec, item)
 
 			elseif t == "dropdown" then
-				controls:AddDropdown(sec, item)
+				local opts = item
+				if type(opts.onValueChanged) == "function" then
+					local fn = opts.onValueChanged
+					opts = CopyTable(opts)
+					opts.onValueChanged = function(value)
+						return fn(MakeCtx(panel, sec), value)
+					end
+				end
+				controls:AddDropdown(sec, opts)
 
 			elseif t == "display" then
 				controls:AddDisplay(sec, item)
