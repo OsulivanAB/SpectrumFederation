@@ -32,7 +32,7 @@ end
 -- @return nil
 local function ShowHelp()
     SF:PrintSuccess("Commands:")
-    SF:PrintInfo("|cFFFFFF00/sf|r - Open settings panel")
+    SF:PrintInfo("|cFFFFFF00/sf|r - Toggle settings window")
     SF:PrintInfo("|cFFFFFF00/sf help|r - Show this help message")
     
     -- Sort commands alphabetically
@@ -60,12 +60,12 @@ local function SlashCommandHandler(msg)
     
     -- Empty command or no arguments - open settings
     if msg == "" then
-        if SF.SettingsCategory and SF.SettingsPanel then
-            local categoryID = SF.SettingsCategory:GetID()
-            Settings.OpenToCategory(categoryID)
+        -- Toggle standalone settings window
+        if SF.SettingsWindow and SF.SettingsWindow.Toggle then
+            SF.SettingsWindow:Toggle()
         else
-            SF:PrintError("Settings UI is not available.")
-            if SF.Debug then SF.Debug:Warn("SLASH", "SettingsCategory or SettingsPanel not found") end
+            SF:PrintError("Settings Window is not available.")
+            if SF.Debug then SF.Debug:Warn("SLASH", "SettingsWindow not found") end
         end
         return
     end

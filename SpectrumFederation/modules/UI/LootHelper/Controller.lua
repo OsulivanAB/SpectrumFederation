@@ -310,8 +310,9 @@ end
 
 -- Handle OpenSettings action
 function Controller:OpenSettings()
-    if SF.SettingsUI and SF.SettingsUI.OpenToPage then
-        SF.SettingsUI:OpenToPage("loothelper")
+    -- Use standalone settings window (Blizzard Settings API is disabled)
+    if SF.SettingsWindow and SF.SettingsWindow.ShowPage then
+        SF.SettingsWindow:ShowPage("lootHelper")
         return
     end
 

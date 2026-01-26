@@ -969,4 +969,102 @@ function Controls:AddHelpText(section, opts)
 	end)
 end
 
+-- Add a scrollable text box (read-only, multiline, copyable)
+-- @param section table Section to add row into
+-- @param opts table Options including label, height, get
+-- @return Frame The created row
+function Controls:AddScrollableText(section, opts)
+	opts = opts or {}
+	local get = opts.get or function() return "" end
+	local height = opts.height or 200
+	local hasLabel = opts.label and opts.label ~= ""
+	
+	return section:AddRow(height + 4, function(row)
+		local scrollFrame, editBox
+		
+		if hasLabel then
+			-- Normal layout with label
+			local label, control = self:InitRow(row, opts)
+			
+			scrollFrame = CreateFrame("ScrollFrame", nil, control, "UIPanelScrollFrameTemplate")
+			scrollFrame:SetPoint("TOPLEFT", control, "TOPLEFT", 0, 0)
+			scrollFrame:SetPoint("BOTTOMRIGHT", control, "BOTTOMRIGHT", -4, 0)
+			
+			editBox = CreateFrame("EditBox", nil, scrollFrame)
+			editBox:SetWidth(CONTROL_WIDTH - 24)
+		else
+			-- Full-width layout without label
+			scrollFrame = CreateFrame("ScrollFrame", nil, row, "UIPanelScrollFrameTemplate")
+			scrollFrame:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+			scrollFrame:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", -4, 0)
+			
+			editBox = CreateFrame("EditBox", nil, scrollFrame)
+			-- Set initial width (fallback before OnSizeChanged fires)
+			local INITIAL_WIDTH = 400
+			editBox:SetWidth(INITIAL_WIDTH)
+			
+			-- Update width when scrollFrame gets its actual size
+			-- Subtract 24px for scrollbar width
+			local SCROLLBAR_WIDTH = 24
+			scrollFrame:SetScript("OnSizeChanged", function(self, width)
+				if width and width > SCROLLBAR_WIDTH then
+					editBox:SetWidth(width - SCROLLBAR_WIDTH)
+				end
+			end)
+		end
+		
+		-- Common edit box setup
+		editBox:SetMultiLine(true)
+		editBox:SetFontObject(ChatFontNormal)
+		editBox:SetAutoFocus(false)
+		editBox:SetTextColor(1, 1, 1)
+		
+		-- Make it read-only by preventing text changes
+		-- Keep EditBox enabled so users can select and copy text
+		editBox:EnableMouse(true)
+		editBox:EnableKeyboard(true)
+		
+		-- Store the current text to prevent modifications
+		local currentText = ""
+		local isUpdating = false  -- Prevent recursion
+		
+		-- Helper to revert text changes
+		local function RevertText()
+			if not isUpdating then
+				isUpdating = true
+				editBox:SetText(currentText)
+				editBox:HighlightText(0, 0)
+				isUpdating = false
+			end
+		end
+		
+		-- Block all text input to make it read-only
+		editBox:SetScript("OnChar", function() RevertText() end)
+		editBox:SetScript("OnTextChanged", function(self, userInput)
+			if userInput and not isUpdating then
+				-- User tried to type - revert to stored text
+				RevertText()
+			end
+		end)
+		editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+		
+		scrollFrame:SetScrollChild(editBox)
+		
+		local function Refresh()
+			isUpdating = true
+			local text = get()
+			currentText = tostring(text or "")
+			editBox:SetText(currentText)
+			editBox:HighlightText(0, 0)
+			editBox:SetCursorPosition(0)
+			isUpdating = false
+			
+			self:_ApplyRowState(row, section, opts)
+		end
+		
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
 
