@@ -1030,10 +1030,14 @@ function Controls:AddScrollableText(section, opts)
 		scrollFrame:SetScrollChild(editBox)
 		
 		local function Refresh()
+			-- Temporarily enable to allow text update
+			editBox:SetEnabled(true)
 			local text = get()
 			editBox:SetText(tostring(text or ""))
 			editBox:HighlightText(0, 0)
 			editBox:SetCursorPosition(0)
+			-- Disable again to make read-only
+			editBox:SetEnabled(false)
 			
 			self:_ApplyRowState(row, section, opts)
 		end
