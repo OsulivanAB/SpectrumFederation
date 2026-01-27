@@ -17,6 +17,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.4.0-beta.1] - 2026-01-27
+
+### Removed
+- Removed unused audit file.
+
 ## [0.4.0] - 2026-01-27
 
 ### Changed
