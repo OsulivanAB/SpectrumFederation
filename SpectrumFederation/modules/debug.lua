@@ -15,7 +15,9 @@ Debug.LEVELS = {
     ERROR = "ERROR"
 }
 
--- SetEnabled: Enable or disable debug logging
+-- Enable or disable debug logging
+-- @param enabled boolean Whether debug logging should be enabled
+-- @return nil
 function Debug:SetEnabled(enabled)
     self.enabled = enabled
     if SF.debugDB then
@@ -23,7 +25,8 @@ function Debug:SetEnabled(enabled)
     end
 end
 
--- IsEnabled: Check if debug logging is enabled
+-- Check if debug logging is currently enabled
+-- @return boolean True if enabled
 function Debug:IsEnabled()
     return self.enabled
 end
@@ -46,7 +49,7 @@ function Debug:Log(level, category, message, ...)
     
     -- Create log entry
     local entry = {
-        timestamp = time(),
+        timestamp = GetServerTime(),
         level = level,
         category = category,
         message = formattedMessage
@@ -64,22 +67,34 @@ function Debug:Log(level, category, message, ...)
     end
 end
 
--- Helper method: Log verbose message
+-- Log a verbose-level message
+-- @param category string Log category
+-- @param message string Format string
+-- @param ... any Format arguments
 function Debug:Verbose(category, message, ...)
     self:Log(self.LEVELS.VERBOSE, category, message, ...)
 end
 
--- Helper method: Log info message
+-- Log an info-level message
+-- @param category string Log category
+-- @param message string Format string
+-- @param ... any Format arguments
 function Debug:Info(category, message, ...)
     self:Log(self.LEVELS.INFO, category, message, ...)
 end
 
--- Helper method: Log warning message
+-- Log a warning-level message
+-- @param category string Log category
+-- @param message string Format string
+-- @param ... any Format arguments
 function Debug:Warn(category, message, ...)
     self:Log(self.LEVELS.WARN, category, message, ...)
 end
 
--- Helper method: Log error message
+-- Log an error-level message
+-- @param category string Log category
+-- @param message string Format string
+-- @param ... any Format arguments
 function Debug:Error(category, message, ...)
     self:Log(self.LEVELS.ERROR, category, message, ...)
 end
@@ -107,6 +122,7 @@ function Debug:GetRecentLogs(count)
 end
 
 -- Initialize debug state from SavedVariables
+-- @return nil
 function Debug:Initialize()
     if SF.debugDB then
         self.enabled = SF.debugDB.enabled or false

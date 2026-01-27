@@ -342,8 +342,8 @@ jobs:
       - name: Fast-forward beta to main
         run: |
           git fetch origin main:main
-          git merge --ff-only main
-          echo "✓ Beta fast-forwarded to main"
+          git rebase main
+          echo "✓ Beta rebased on main"
 
       - name: Push fast-forwarded beta
         if: ${{ !inputs.dry_run }}

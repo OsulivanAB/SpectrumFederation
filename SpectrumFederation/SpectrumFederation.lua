@@ -27,11 +27,20 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.Debug:Info("ADDON", "SpectrumFederation addon loaded")
         end
 
-        -- Create the Settings UI
-        if SF.CreateSettingsUI then
-            SF:CreateSettingsUI()
-        else
-            if SF.Debug then SF.Debug:Info("SETTINGS_UI", "No CreateSettingsUI function found") end
+        -- Initialize Loot Helper Database
+        if SF.InitializeLootHelperDatabase then
+            SF:InitializeLootHelperDatabase()
+        end
+
+        -- Enable Loot Helper Sync system (registers slash commands and event handlers)
+        if SF.LootHelperSync and SF.LootHelperSync.Enable then
+            SF.LootHelperSync:Enable()
+            if SF.Debug then SF.Debug:Info("SYNC", "LootHelper Sync system enabled") end
+        end
+
+        -- Register Loot Helper slash commands
+        if SF.RegisterLootHelperSlashCommands then
+            SF:RegisterLootHelperSlashCommands()
         end
 
         -- Send a quick message saying that Addon is Initialized
@@ -52,74 +61,12 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
                     SF.Debug:SetEnabled(false)
                     SF:PrintInfo("Debug logging disabled")
                 elseif args == "show" or args == "logs" or args == "" then
-                    if not SF.Debug:IsEnabled() then
-                        SF:PrintWarning("Debug logging is currently disabled. Enable it with '/sf debug on'")
-                    end
-                    
-                    -- Create debug viewer window if it doesn't exist
-                    -- TODO: Need to break these into smaller functions and store them in the debug file.
-                    if not SF.DebugViewer then
-                        SF.DebugViewer = CreateFrame("Frame", "SpectrumFederationDebugViewer", UIParent, "BackdropTemplate")
-                        local viewer = SF.DebugViewer
-                        
-                        viewer:SetSize(600, 400)
-                        viewer:SetPoint("CENTER")
-                        viewer:SetBackdrop({
-                            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-                            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-                            tile = true, tileSize = 32, edgeSize = 32,
-                            insets = { left = 8, right = 8, top = 8, bottom = 8 }
-                        })
-                        viewer:SetBackdropColor(0, 0, 0, 0.9)
-                        viewer:EnableMouse(true)
-                        viewer:SetMovable(true)
-                        viewer:RegisterForDrag("LeftButton")
-                        viewer:SetScript("OnDragStart", viewer.StartMoving)
-                        viewer:SetScript("OnDragStop", viewer.StopMovingOrSizing)
-                        
-                        -- Title
-                        local title = viewer:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-                        title:SetPoint("TOP", 0, -16)
-                        title:SetText("Debug Logs (Ctrl+A to select all, Ctrl+C to copy)")
-                        
-                        -- Close button
-                        local closeBtn = CreateFrame("Button", nil, viewer, "UIPanelCloseButton")
-                        closeBtn:SetPoint("TOPRIGHT", -5, -5)
-                        
-                        -- Scroll frame
-                        local scrollFrame = CreateFrame("ScrollFrame", nil, viewer, "UIPanelScrollFrameTemplate")
-                        scrollFrame:SetPoint("TOPLEFT", 16, -40)
-                        scrollFrame:SetPoint("BOTTOMRIGHT", -32, 16)
-                        
-                        -- Edit box
-                        local editBox = CreateFrame("EditBox", nil, scrollFrame)
-                        editBox:SetMultiLine(true)
-                        editBox:SetFontObject(ChatFontNormal)
-                        editBox:SetWidth(scrollFrame:GetWidth())
-                        editBox:SetAutoFocus(false)
-                        editBox:SetScript("OnEscapePressed", function() viewer:Hide() end)
-                        scrollFrame:SetScrollChild(editBox)
-                        viewer.editBox = editBox
-                    end
-                    
-                    -- Get logs and format them
-                    local logs = SF.Debug:GetRecentLogs(100)
-                    local logText = ""
-                    if #logs == 0 then
-                        logText = "No debug logs available"
+                    -- Open the settings window to the Debugging page
+                    if SF.SettingsWindow and SF.SettingsWindow.ShowPage then
+                        SF.SettingsWindow:ShowPage("debugging")
                     else
-                        logText = string.format("Last %d debug logs:\\n\\n", #logs)
-                        for i, log in ipairs(logs) do
-                            local timestamp = date("%H:%M:%S", log.timestamp)
-                            logText = logText .. string.format("[%s] [%s] %s: %s\\n", 
-                                timestamp, log.level, log.category, log.message)
-                        end
+                        SF:PrintError("Settings Window is not available.")
                     end
-                    
-                    SF.DebugViewer.editBox:SetText(logText)
-                    SF.DebugViewer.editBox:HighlightText()
-                    SF.DebugViewer:Show()
-                    
                 elseif args == "clear" then
                     if SF.debugDB and SF.debugDB.logs then
                         SF.debugDB.logs = {}
@@ -135,26 +82,5 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
 
         -- Unregister the Event after initialization
         self:UnregisterEvent("PLAYER_LOGIN")
-    end
-end)
-
--- Create an Event Frame for Addon Loaded
-local AddonLoadedFrame = CreateFrame("Frame")
--- Register the ADDON_LOADED Event
-AddonLoadedFrame:RegisterEvent("ADDON_LOADED")
--- Script to run when ADDON_LOADED Event fires
-AddonLoadedFrame:SetScript("OnEvent", function(self, event, addonName)
-
-    -- Ensure the loaded addon is SpectrumFederation
-    if addonName ~= "SpectrumFederation" then return end
-
-    -- Initialize Loot Helper Database before creating UI
-    if SF.InitializeLootHelperDatabase then
-        SF:InitializeLootHelperDatabase()
-    end
-
-    -- Create the Loot Window
-    if SF.LootWindow and SF.LootWindow.Create then
-        SF.LootWindow:Create()
     end
 end)
