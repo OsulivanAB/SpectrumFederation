@@ -3,6 +3,7 @@ enable-nolib-creation: no
 
 move-folders:
   SpectrumFederation/SpectrumFederation: SpectrumFederation
+  SpectrumFederation/SpectrumFederation.toc: SpectrumFederation.toc
 
 # Ignore everything at repo root except the SpectrumFederation/ folder
 ignore:
