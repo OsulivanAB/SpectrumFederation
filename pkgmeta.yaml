@@ -1,24 +1,32 @@
 package-as: SpectrumFederation
 enable-nolib-creation: no
+
+move-folders:
+  SpectrumFederation/SpectrumFederation: SpectrumFederation
+
+# Ignore everything at repo root except the SpectrumFederation/ folder
 ignore:
-  - .devcontainer
   - .github
+  - .devcontainer
   - .previews
-  - assets
-  - docs
-  - .editorconfig
-  - .gitattributes
+  - .git
   - .gitignore
+  - .gitattributes
+  - .editorconfig
   - .luaarc.json
   - .luacheckrc
-  - mkdocs.yml
+  - .vscode
+  - BlizzardUI
+  - build
+  - docs
+  - site
+  - assets
   - requirements-docs.txt
+  - mkdocs.yml
+  - pkgmeta.yaml
+  - README.md
+  - CHANGELOG.md
+  - LICENSE
+
 manual-changelog: CHANGELOG.md
 license-output: LICENSE
-move-folders:
-    SpectrumFederation/SpectrumFederation.toc: SpectrumFederation.toc
-    SpectrumFederation/SpectrumFederation.lua: SpectrumFederation.lua
-    SpectrumFederation/modules: modules
-    SpectrumFederation/media: media
-    SpectrumFederation/locale: locale
-    SpectrumFederation/Libs: Libs
