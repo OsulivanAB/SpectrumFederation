@@ -25,10 +25,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.4.3-beta.1] - 2026-01-27
+
+## [0.4.3] - 2026-01-27
 
 ### Changed
-- Updated addon version to 0.4.3-beta.1 in metadata.
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.4.2] - 2026-01-27
 
