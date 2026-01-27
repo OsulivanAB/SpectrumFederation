@@ -2,8 +2,13 @@ package-as: SpectrumFederation
 enable-nolib-creation: no
 
 move-folders:
-  SpectrumFederation/SpectrumFederation: SpectrumFederation
+  # SpectrumFederation/SpectrumFederation: SpectrumFederation
   SpectrumFederation/SpectrumFederation.toc: SpectrumFederation.toc
+  SpectrumFederation/SpectrumFederation.lua: SpectrumFederation.lua
+  SpectrumFederation/modules: modules
+  SpectrumFederation/media: media
+  SpectrumFederation/locale: locale
+  SpectrumFederation/Libs: Libs
 
 # Ignore everything at repo root except the SpectrumFederation/ folder
 ignore:
