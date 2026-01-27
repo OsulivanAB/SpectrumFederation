@@ -16,19 +16,10 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.4.0-beta.9] - 2026-01-26
+## [0.4.0-beta.9] - 2026-01-27
 
 ### Added
-- Introduced a "Session Control" button in the Loot Helper settings to start or end sync sessions dynamically.
-- Added dynamic button text updates based on session state (e.g., "Start Session" or "End Session").
-- Displayed success or error messages for session start/end actions in the UI.
-
-### Changed
-- Adjusted request retry timing to improve sync reliability, ensuring retries occur after admin replies.
-- Enhanced button functionality to support dynamic text updates based on provided functions or strings.
-
-### Fixed
-- Resolved an issue with merging session data (`authorMax`) to ensure local progress is preserved during sync.
+- Added the Spectrum Federation icon for improved visual identity.
 
 ## [0.4.0-beta.8] - 2026-01-26
 
