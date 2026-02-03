@@ -402,6 +402,15 @@ function Sync:StartSession(profileId, opts)
         return nil
     end
 
+    -- Validate coordinator has profile loaded locally before starting session
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        if SF.PrintError then
+            SF:PrintError("Cannot start session: profile not loaded locally")
+        end
+        return nil
+    end
+
     local me = self:_SelfId()
     local sessionId = self:_NextNonce("SES")
     local epoch = self:_Now()
