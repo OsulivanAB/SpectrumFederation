@@ -283,7 +283,7 @@ function SF:RegisterLootHelperSlashCommands()
             end
             
             -- Get the active profile ID
-            local profileId = SF.lootHelperDB and SF.lootHelperDB.activeProfileId or nil
+            local profileId = SF.lootHelperDB and SF.lootHelperDB.activeProfileId
             if not profileId then
                 SF:PrintError("No active profile selected. Use /sf switchprofile <name> or /sf createprofile <name>")
                 return
