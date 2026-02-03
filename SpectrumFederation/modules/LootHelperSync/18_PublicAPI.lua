@@ -103,7 +103,7 @@ end
 -- @return boolean True if active, false otherwise.
 function Sync:IsSessionActive()
     if not (self.state and self.state.active) then return false end
-    if GetGroupDistribution() then return true end
+    if self:GetGroupDistribution() then return true end
 
     -- If we aren't grouped, enforce invariant
     self:_EnforceGroupedSessionActive("IsSessionActive")
