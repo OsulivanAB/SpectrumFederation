@@ -548,6 +548,14 @@ function Sync:HandleNeedProfile(sender, payload)
         end
         return
     end
+    
+    -- Verify we're still authorized for this profile (Issue #9 fix)
+    if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Not authorized to serve profile (no longer admin)")
+        end
+        return
+    end
 
     -- Safety: only send to group members (prevents random whisper abuse)
     self:UpdatePeersFromRoster()
