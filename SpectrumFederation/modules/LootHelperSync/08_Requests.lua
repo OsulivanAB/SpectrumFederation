@@ -467,7 +467,7 @@ function Sync:OnRequestTimeout(requestId)
     self:_SendRequestAttempt(req)
 end
 
--- Function Retry a request soon after receiving a bad/partial response.
+-- Function: Retry a request soon after receiving a bad/partial response.
 -- Similar to OnRequestTimeout but with shorter delay and no attempt increment.
 -- @param req table Request state table
 -- @return nil
@@ -476,7 +476,8 @@ function Sync:_RetryRequestSoon(req)
     
     self:_CancelRequestTimer(req)
     
-    -- Use a shorter retry delay (e.g., 1-2 seconds) instead of full timeout
+    -- Use a shorter retry delay instead of full timeout
+    -- Default 1.5s (configurable via cfg.requestRetryShortSec)
     local shortDelay = (tonumber(self.cfg.requestRetryShortSec) or 1.5)
     
     if SF.Debug then
