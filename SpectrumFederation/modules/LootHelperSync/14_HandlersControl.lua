@@ -133,6 +133,21 @@ function Sync:HandleAdminStatus(sender, payload)
 
     self.state.adminStatuses = self.state.adminStatuses or {}
     self.state.adminStatuses[sender] = payload
+    
+    -- Issue #10 Rec 3: Progressive convergence - update authorMax with late responses
+    if conv.finalizeStarted and payload.authorMax then
+        -- Merge late admin's authorMax into session authorMax
+        for author, maxCounter in pairs(payload.authorMax) do
+            local current = self.state.authorMax[author] or 0
+            if type(maxCounter) == "number" and maxCounter > current then
+                self.state.authorMax[author] = maxCounter
+                if SF.Debug then
+                    SF.Debug:Info("SYNC", "Late ADMIN_STATUS from %s: updated authorMax[%s] from %d to %d",
+                        tostring(sender), tostring(author), current, maxCounter)
+                end
+            end
+        end
+    end
 
     -- Early finalize if all expected responded
     local all = true

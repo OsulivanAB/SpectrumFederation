@@ -145,13 +145,25 @@ function Sync:FinalizeAdminConvergence()
         end
         return
     end
+    
+    -- Mark convergence as finalized (Issue #10 Rec 3: allows progressive updates)
     conv.finalizeStarted = true
+    conv.finalizedAt = self:_Now()
 
     local profileId = self.state.profileId
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
         self:_FinishAdminConvergence("no_profile")
         return
+    end
+    
+    if SF.Debug then
+        local statusCount = 0
+        if type(self.state.adminStatuses) == "table" then
+            for _ in pairs(self.state.adminStatuses) do statusCount = statusCount + 1 end
+        end
+        SF.Debug:Info("SYNC", "Finalizing admin convergence (received %d statuses, continuing to accept late responses)",
+            statusCount)
     end
 
     -- 1) compute local maxima
