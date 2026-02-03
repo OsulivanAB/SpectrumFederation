@@ -533,6 +533,14 @@ end
 function Sync:EndSession(reason, broadcast)
     reason = reason or "ended"
     if not self.state.active then return false end
+    
+    -- Only coordinator should explicitly end session
+    if not self.state.isCoordinator then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Non-coordinator attempted to end session")
+        end
+        return false
+    end
 
     -- Default behavior:
     -- - Coordinator broadcasts unless explicitly disabled
