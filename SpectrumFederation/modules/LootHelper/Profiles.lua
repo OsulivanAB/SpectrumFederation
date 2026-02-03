@@ -495,7 +495,12 @@ function LootProfile:AddLootLog(lootLog)
             and lootLog
             and lootLog.ToTable
         then
-            SF.LootHelperSync:BroadcastNewLog(self:GetProfileId(), lootLog:ToTable())        
+            local broadcastOk, broadcastErr = SF.LootHelperSync:BroadcastNewLog(self:GetProfileId(), lootLog:ToTable())
+            if not broadcastOk then
+                if SF.PrintWarning then
+                    SF:PrintWarning("Failed to broadcast change: " .. tostring(broadcastErr or "unknown error"))
+                end
+            end
         end
     end
     return ok, err
