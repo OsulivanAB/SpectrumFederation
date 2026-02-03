@@ -34,7 +34,7 @@ local function GetGroupDistribution()
     return nil
 end
 
--- Function Get current group distribution channel (module-level accessor).
+-- Function Gets the current group distribution channel (module-level accessor).
 -- @param none
 -- @return string|nil distribution ("RAID", "PARTY", or nil)
 function Sync:GetGroupDistribution()
