@@ -124,7 +124,7 @@ function Page:Build(panel)
 	local store = SF.SettingsStore
 
 	-- UI state(not persisted): selected member to add as admin
-	panel.__sfAddAdmininSelectedId = panel.__sfAddAdmininSelectedId or nil
+	panel.__sfAddAdminSelectedId = panel.__sfAddAdminSelectedId or nil
 
 	local function HasActiveProfile()
 		if GetActiveProfileObject(store) ~= nil then
@@ -581,9 +581,17 @@ function Page:Build(panel)
 						end,
 
 						onIconClick = function(ctx)
+							if SF.Debug then
+								SF.Debug:Info("UI", "Add Admin button clicked")
+							end
+							
 							ctx.section:ClearMessage()
 
 							local memberId = panel.__sfAddAdminSelectedId
+							if SF.Debug then
+								SF.Debug:Info("UI", "Selected memberId: %s", tostring(memberId))
+							end
+							
 							if not memberId then
 								ctx.section:SetMessage("Select a member first.", "error")
 								return
@@ -594,7 +602,16 @@ function Page:Build(panel)
 								return
 							end
 
+							if SF.Debug then
+								SF.Debug:Info("UI", "Calling AddAdminToActiveProfile with memberId: %s", tostring(memberId))
+							end
+							
 							local ok, err = ctx.store:AddAdminToActiveProfile(memberId)
+							
+							if SF.Debug then
+								SF.Debug:Info("UI", "AddAdminToActiveProfile returned: ok=%s, err=%s", tostring(ok), tostring(err))
+							end
+							
 							if not ok then
 								ctx.section:SetMessage(err or "Failed to add admin", "error")
 								return

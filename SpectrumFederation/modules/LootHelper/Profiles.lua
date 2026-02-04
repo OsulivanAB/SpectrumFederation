@@ -659,6 +659,10 @@ end
 -- @param string memberId "Name-Realm" of member to add as admin
 -- @return boolean success, string|nil errorMessage
 function LootProfile:AddAdminMemberId(memberId)
+    if SF.Debug then
+        SF.Debug:Info("LootProfile", "AddAdminMemberId called with memberId: %s", tostring(memberId))
+    end
+    
     if type(memberId) ~= "string" or memberId == "" then
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Attempted to add invalid memberId as admin: %s", tostring(memberId))
@@ -666,6 +670,10 @@ function LootProfile:AddAdminMemberId(memberId)
         return false, "Invalid member id."
     end
     memberId = NormalizeMemberId(memberId)
+    
+    if SF.Debug then
+        SF.Debug:Info("LootProfile", "Normalized memberId: %s", tostring(memberId))
+    end
 
     if not self:IsCurrentUserAdmin() then
         if SF.Debug then
@@ -682,11 +690,19 @@ function LootProfile:AddAdminMemberId(memberId)
     end
 
     if self:IsAdminMemberId(memberId) then
+        if SF.Debug then
+            SF.Debug:Info("LootProfile", "Member is already an admin: %s", tostring(memberId))
+        end
         return false, "That member is already an admin"
     end
 
     self._adminUsers = self._adminUsers or {}
     table.insert(self._adminUsers, memberId)
+    
+    if SF.Debug then
+        SF.Debug:Info("LootProfile", "Successfully added admin: %s", tostring(memberId))
+    end
+    
     return true
 end
 

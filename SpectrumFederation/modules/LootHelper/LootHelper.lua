@@ -521,10 +521,30 @@ end
 -- @param memberId (string) - Member ID to add as admin
 -- @return (boolean, string|nil) - Success status and optional error message
 function SF:AddAdminToActiveLootHelperProfile(memberId)
+	if SF.Debug then
+		SF.Debug:Info("LOOTHELPER", "AddAdminToActiveLootHelperProfile called with memberId: %s", tostring(memberId))
+	end
+	
 	local p = self:GetActiveProfile()
-	if not p then return false, "No active profile." end
-	if not p.AddAdminMemberId then return false, "Profile missing AddAdminMemberId." end
-	return p:AddAdminMemberId(memberId)
+	if not p then 
+		if SF.Debug then
+			SF.Debug:Warn("LOOTHELPER", "No active profile")
+		end
+		return false, "No active profile." 
+	end
+	
+	if not p.AddAdminMemberId then 
+		if SF.Debug then
+			SF.Debug:Warn("LOOTHELPER", "Profile missing AddAdminMemberId method")
+		end
+		return false, "Profile missing AddAdminMemberId." 
+	end
+	
+	local ok, err = p:AddAdminMemberId(memberId)
+	if SF.Debug then
+		SF.Debug:Info("LOOTHELPER", "AddAdminMemberId returned: ok=%s, err=%s", tostring(ok), tostring(err))
+	end
+	return ok, err
 end
 
 -- Remove an admin from the active loot helper profile
