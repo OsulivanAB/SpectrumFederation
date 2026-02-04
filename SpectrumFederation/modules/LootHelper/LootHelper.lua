@@ -505,6 +505,20 @@ function SF:RenameActiveLootHelperProfile(newName)
 
 	if p.SetProfileName then
 		p:SetProfileName(newName)
+		
+		-- Create log entry for profile name change
+		if SF.LootLog then
+			local eventType = SF.LootLogEventTypes.PROFILE_NAME_CHANGE
+			local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+			eventData.oldName = oldName
+			eventData.newName = newName
+			
+			local logEntry = SF.LootLog.new(eventType, eventData)
+			if logEntry and p.AddLootLog then
+				p:AddLootLog(logEntry)
+			end
+		end
+		
 		if SF.Debug then
 			SF.Debug:Info("DATABASE", "Renamed profile: %s -> %s (ID: %s)", oldName, newName, p:GetProfileId())
 		end

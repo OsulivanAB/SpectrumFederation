@@ -608,7 +608,23 @@ function LootProfile:SetPointName(name)
 	if name == "" then
 		return false, "Point Name cannot be empty."
 	end
+	
+	local oldName = self._pointName or "Points"
 	self._pointName = name
+	
+	-- Create log entry for point name change
+	if SF.LootLog then
+		local eventType = SF.LootLogEventTypes.POINT_NAME_CHANGE
+		local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+		eventData.oldName = oldName
+		eventData.newName = name
+		
+		local logEntry = SF.LootLog.new(eventType, eventData)
+		if logEntry and self.AddLootLog then
+			self:AddLootLog(logEntry)
+		end
+	end
+	
 	return true
 end
 
@@ -620,7 +636,22 @@ function LootProfile:SetRaidWideSafeMode(v)
 	if not self:IsCurrentUserAdmin() then
 		return false, "You must be an admin to change Raid-Wide Safemode."
 	end
-	self._raidWideSafeMode = v and true or false
+	
+	local enabled = v and true or false
+	self._raidWideSafeMode = enabled
+	
+	-- Create log entry for safemode change
+	if SF.LootLog then
+		local eventType = SF.LootLogEventTypes.SAFEMODE_CHANGE
+		local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+		eventData.enabled = enabled
+		
+		local logEntry = SF.LootLog.new(eventType, eventData)
+		if logEntry and self.AddLootLog then
+			self:AddLootLog(logEntry)
+		end
+	end
+	
 	return true
 end
 
@@ -632,7 +663,22 @@ function LootProfile:SetRaidWideSafeModeOnCombat(v)
 	if not self:IsCurrentUserAdmin() then
 		return false, "You must be an admin to change Raid-Wide Safemode on Combat."
 	end
-	self._raidWideSafeModeOnCombat = v and true or false
+	
+	local enabled = v and true or false
+	self._raidWideSafeModeOnCombat = enabled
+	
+	-- Create log entry for safemode on combat change
+	if SF.LootLog then
+		local eventType = SF.LootLogEventTypes.SAFEMODE_ON_COMBAT_CHANGE
+		local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+		eventData.enabled = enabled
+		
+		local logEntry = SF.LootLog.new(eventType, eventData)
+		if logEntry and self.AddLootLog then
+			self:AddLootLog(logEntry)
+		end
+	end
+	
 	return true
 end
 
@@ -699,6 +745,18 @@ function LootProfile:AddAdminMemberId(memberId)
     self._adminUsers = self._adminUsers or {}
     table.insert(self._adminUsers, memberId)
     
+    -- Create log entry for admin added
+    if SF.LootLog then
+        local eventType = SF.LootLogEventTypes.ADMIN_ADDED
+        local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+        eventData.member = memberId
+        
+        local logEntry = SF.LootLog.new(eventType, eventData)
+        if logEntry and self.AddLootLog then
+            self:AddLootLog(logEntry)
+        end
+    end
+    
     if SF.Debug then
         SF.Debug:Info("LootProfile", "Successfully added admin: %s", tostring(memberId))
     end
@@ -736,6 +794,19 @@ function LootProfile:RemoveAdminMemberId(memberId)
     for i = #admins, 1, -1 do
         if SameMember(admins[i], memberId) then
             table.remove(admins, i)
+            
+            -- Create log entry for admin removed
+            if SF.LootLog then
+                local eventType = SF.LootLogEventTypes.ADMIN_REMOVED
+                local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+                eventData.member = memberId
+                
+                local logEntry = SF.LootLog.new(eventType, eventData)
+                if logEntry and self.AddLootLog then
+                    self:AddLootLog(logEntry)
+                end
+            end
+            
             return true
         end
     end

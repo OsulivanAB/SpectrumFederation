@@ -146,5 +146,123 @@ function LootLogValidators.ValidateRoleChangeData(eventData)
     return true
 end
 
+-- Function to validate the POINT_NAME_CHANGE event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidatePointNameChangeData(eventData)
+    local oldName = eventData.oldName
+    local newName = eventData.newName
+    
+    -- Both names must be non-empty strings
+    if type(oldName) ~= "string" or oldName == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid oldName in POINT_NAME_CHANGE: %s", tostring(oldName))
+        end
+        return false
+    end
+    
+    if type(newName) ~= "string" or newName == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid newName in POINT_NAME_CHANGE: %s", tostring(newName))
+        end
+        return false
+    end
+    
+    return true
+end
+
+-- Function to validate the PROFILE_NAME_CHANGE event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateProfileNameChangeData(eventData)
+    local oldName = eventData.oldName
+    local newName = eventData.newName
+    
+    -- Both names must be non-empty strings
+    if type(oldName) ~= "string" or oldName == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid oldName in PROFILE_NAME_CHANGE: %s", tostring(oldName))
+        end
+        return false
+    end
+    
+    if type(newName) ~= "string" or newName == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid newName in PROFILE_NAME_CHANGE: %s", tostring(newName))
+        end
+        return false
+    end
+    
+    return true
+end
+
+-- Function to validate the SAFEMODE_CHANGE event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateSafemodeChangeData(eventData)
+    local enabled = eventData.enabled
+    
+    -- Must be a boolean
+    if type(enabled) ~= "boolean" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid enabled value in SAFEMODE_CHANGE: %s", tostring(enabled))
+        end
+        return false
+    end
+    
+    return true
+end
+
+-- Function to validate the SAFEMODE_ON_COMBAT_CHANGE event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateSafemodeOnCombatChangeData(eventData)
+    local enabled = eventData.enabled
+    
+    -- Must be a boolean
+    if type(enabled) ~= "boolean" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid enabled value in SAFEMODE_ON_COMBAT_CHANGE: %s", tostring(enabled))
+        end
+        return false
+    end
+    
+    return true
+end
+
+-- Function to validate the ADMIN_ADDED event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateAdminAddedData(eventData)
+    local memberID = eventData.member
+    
+    -- Validate member exists in profiles
+    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Admin added log references non-existent member: %s", tostring(memberID))
+        end
+        return false
+    end
+    
+    return true
+end
+
+-- Function to validate the ADMIN_REMOVED event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateAdminRemovedData(eventData)
+    local memberID = eventData.member
+    
+    -- Validate member exists in profiles
+    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Admin removed log references non-existent member: %s", tostring(memberID))
+        end
+        return false
+    end
+    
+    return true
+end
+
 -- Export to namespace
 SF.LootLogValidators = LootLogValidators
