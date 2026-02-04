@@ -614,10 +614,16 @@ function Controls:AddDropdownWithIconButton(section, opts)
 			return get() == value
 		end
 
+		local Refresh  -- Forward declaration
+
 		local function SetSelected(value)
 			set(value)
 			if opts.onValueChanged then
 				opts.onValueChanged(value)
+			end
+			-- Trigger refresh to update icon button enabled state
+			if Refresh then
+				Refresh()
 			end
 		end
 
@@ -652,7 +658,7 @@ function Controls:AddDropdownWithIconButton(section, opts)
 			end
 		end)
 
-		local function Refresh()
+		Refresh = function()  -- Define Refresh function
 			local options = GetOptions()
 			local hasOptions = type(options) == "table" and #options > 0
 
