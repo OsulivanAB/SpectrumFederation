@@ -8,10 +8,16 @@ local addonName, SF = ...
 local LOG_FORMAT_VERSION = 2
 
 local EVENT_TYPES = {
-    PROFILE_CREATION    = "PROFILE_CREATION",
-    POINT_CHANGE        = "POINT_CHANGE",
-    ARMOR_CHANGE        = "ARMOR_CHANGE",
-    ROLE_CHANGE         = "ROLE_CHANGE"
+    PROFILE_CREATION            = "PROFILE_CREATION",
+    POINT_CHANGE                = "POINT_CHANGE",
+    ARMOR_CHANGE                = "ARMOR_CHANGE",
+    ROLE_CHANGE                 = "ROLE_CHANGE",
+    POINT_NAME_CHANGE           = "POINT_NAME_CHANGE",
+    PROFILE_NAME_CHANGE         = "PROFILE_NAME_CHANGE",
+    SAFEMODE_CHANGE             = "SAFEMODE_CHANGE",
+    SAFEMODE_ON_COMBAT_CHANGE   = "SAFEMODE_ON_COMBAT_CHANGE",
+    ADMIN_ADDED                 = "ADMIN_ADDED",
+    ADMIN_REMOVED               = "ADMIN_REMOVED"
 }
 
 local POINT_CHANGE_TYPES = {
@@ -40,6 +46,26 @@ local EVENT_DATA_TEMPLATES = {
     [EVENT_TYPES.ROLE_CHANGE] = {
         member  = "",
         newRole = ""
+    },
+    [EVENT_TYPES.POINT_NAME_CHANGE] = {
+        oldName = "",
+        newName = ""
+    },
+    [EVENT_TYPES.PROFILE_NAME_CHANGE] = {
+        oldName = "",
+        newName = ""
+    },
+    [EVENT_TYPES.SAFEMODE_CHANGE] = {
+        enabled = false -- true or false
+    },
+    [EVENT_TYPES.SAFEMODE_ON_COMBAT_CHANGE] = {
+        enabled = false -- true or false
+    },
+    [EVENT_TYPES.ADMIN_ADDED] = {
+        member = "" -- "Name-Realm"
+    },
+    [EVENT_TYPES.ADMIN_REMOVED] = {
+        member = "" -- "Name-Realm"
     }
 }
 
@@ -112,6 +138,30 @@ function LootLog.new(eventType, eventData, opts)
         end
     elseif eventType == EVENT_TYPES.ROLE_CHANGE then
         if not SF.LootLogValidators.ValidateRoleChangeData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.POINT_NAME_CHANGE then
+        if not SF.LootLogValidators.ValidatePointNameChangeData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.PROFILE_NAME_CHANGE then
+        if not SF.LootLogValidators.ValidateProfileNameChangeData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.SAFEMODE_CHANGE then
+        if not SF.LootLogValidators.ValidateSafemodeChangeData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.SAFEMODE_ON_COMBAT_CHANGE then
+        if not SF.LootLogValidators.ValidateSafemodeOnCombatChangeData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.ADMIN_ADDED then
+        if not SF.LootLogValidators.ValidateAdminAddedData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.ADMIN_REMOVED then
+        if not SF.LootLogValidators.ValidateAdminRemovedData(eventData) then
             return nil
         end
     end

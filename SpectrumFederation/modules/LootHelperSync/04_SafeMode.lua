@@ -34,6 +34,13 @@ local function GetGroupDistribution()
     return nil
 end
 
+-- Function Gets the current group distribution channel (module-level accessor).
+-- @param none
+-- @return string|nil distribution ("RAID", "PARTY", or nil)
+function Sync:GetGroupDistribution()
+    return GetGroupDistribution()
+end
+
 -- ===========================================================================
 -- Local Safe Mode (Session-scoped, local-only)
 -- ============================================================================

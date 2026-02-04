@@ -84,7 +84,7 @@ do
 
     function Sync:_DebugPrintStatus()
         local st = self.state or {}
-        local dist = (type(GetGroupDistribution) == "function") and GetGroupDistribution() or nil
+        local dist = (type(self.GetGroupDistribution) == "function") and self:GetGroupDistribution() or nil
 
         self:_DebugPrintLine("=== LootHelper Sync Debug ===")
         self:_DebugPrintLine("AddonVersion=%s ProtoCurrent=%s",

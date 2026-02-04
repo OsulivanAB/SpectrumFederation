@@ -270,7 +270,54 @@ function SF:RegisterLootHelperSlashCommands()
         
     end, "Delete a loot profile (by name or ID)")
 
-    SF:RegisterSlashCommand("loot", function()
+    SF:RegisterSlashCommand("loot", function(args)
+        -- Parse subcommands
+        args = args:trim():lower()
+        
+        -- Handle "session start" subcommand
+        if args == "session start" then
+            -- Check if sync system is available
+            if not (SF.LootHelperSync and SF.LootHelperSync.StartSession) then
+                SF:PrintError("Loot Helper Sync system not available")
+                return
+            end
+            
+            -- Get the active profile ID
+            local profileId = SF.lootHelperDB and SF.lootHelperDB.activeProfileId
+            if not profileId then
+                SF:PrintError("No active profile selected. Use /sf switchprofile <name> or /sf createprofile <name>")
+                return
+            end
+            
+            -- Start the session
+            local sessionId = SF.LootHelperSync:StartSession(profileId)
+            if sessionId then
+                SF:PrintSuccess("Session started successfully")
+            else
+                SF:PrintError("Failed to start session (not in a group/raid?)")
+            end
+            return
+        end
+        
+        -- Handle "session end" subcommand
+        if args == "session end" then
+            -- Check if sync system is available
+            if not (SF.LootHelperSync and SF.LootHelperSync.EndSession) then
+                SF:PrintError("Loot Helper Sync system not available")
+                return
+            end
+            
+            -- End the session
+            local ok = SF.LootHelperSync:EndSession("manual")
+            if ok then
+                SF:PrintSuccess("Session ended successfully")
+            else
+                SF:PrintError("Failed to end session (no active session?)")
+            end
+            return
+        end
+        
+        -- Default behavior: enable loot helper (when no subcommand or just "loot")
         local store = SF.SettingsStore
 
         local alreadyEnabled = false
@@ -328,5 +375,5 @@ function SF:RegisterLootHelperSlashCommands()
                 end
             end
         end
-    end, "Enable Loot Helper")
+    end, "Enable Loot Helper or manage sessions (/sf loot session start|end)")
 end

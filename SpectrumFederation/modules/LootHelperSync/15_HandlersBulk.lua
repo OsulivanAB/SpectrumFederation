@@ -155,6 +155,39 @@ function Sync:HandleAuthLogs(sender, payload)
     -- Metrics: count logs received
     local recvLogs = (type(payload.logs) == "table") and #payload.logs or 0
     self:_MInc("sync.merge.auth_logs.logs_received_total", recvLogs)
+    
+    -- Rec 4: Verify received logs match requested range before merge
+    if req.kind == "NEED_LOGS" or req.kind == "LOG_REQ" or req.kind == "ADMIN_LOG_REQ" then
+        if req.meta and req.meta.author and req.meta.fromCounter and req.meta.toCounter then
+            local requestedAuthor = req.meta.author
+            local requestedFrom = req.meta.fromCounter
+            local requestedTo = req.meta.toCounter
+            
+            -- Verify all received logs are for the correct author and within requested range
+            for _, logTable in ipairs(payload.logs) do
+                local logAuthor = logTable._author or logTable.author
+                local logCounter = logTable._counter or logTable.counter
+                
+                if logAuthor ~= requestedAuthor then
+                    if SF.Debug then
+                        SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log author %s doesn't match requested %s",
+                            tostring(logAuthor), tostring(requestedAuthor))
+                    end
+                    self:_RetryRequestSoon(req)
+                    return
+                end
+                
+                if type(logCounter) == "number" and (logCounter < requestedFrom or logCounter > requestedTo) then
+                    if SF.Debug then
+                        SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log counter %d outside requested range [%d-%d]",
+                            logCounter, requestedFrom, requestedTo)
+                    end
+                    self:_RetryRequestSoon(req)
+                    return
+                end
+            end
+        end
+    end
 
     -- Metrics: measure merge duration
     local t0 = debugprofilestop and debugprofilestop() or nil
@@ -184,11 +217,16 @@ function Sync:HandleAuthLogs(sender, payload)
                         tostring(payload.requestId), tostring(req.meta.author), contig, req.meta.toCounter)
                 end
             else
-                -- Partial response: still missing logs
+                -- Partial response: adjust request to only ask for missing range (Rec 2)
+                -- Update fromCounter to contig+1 to avoid requesting already-merged logs
                 if SF.Debug then
-                    SF.Debug:Info("SYNC", "Request %s partial: author=%s contig=%d < requested=%d, will retry",
+                    SF.Debug:Info("SYNC", "Request %s partial: author=%s contig=%d < requested=%d, adjusting retry range",
                         tostring(payload.requestId), tostring(req.meta.author), contig, req.meta.toCounter)
                 end
+                
+                -- Update request metadata to request only remaining logs
+                req.meta.fromCounter = contig + 1
+                
                 self:_RetryRequestSoon(req)
                 return
             end

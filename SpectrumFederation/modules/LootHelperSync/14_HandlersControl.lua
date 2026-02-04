@@ -63,23 +63,44 @@ function Sync:BuildAdminStatus(profileId)
     status.hasProfile = true
     status.authorMax = profile:ComputeAuthorMax() or {}
 
-    -- hasGaps heuristic:
-    -- If counters are 1..max with no missing, then count(author) == max(author).
-    -- If count < max, we're missing at least one counter somewhere (gap).
+    -- hasGaps heuristic: Check for non-contiguous sequences
+    -- Instead of just counting, verify that counters 1..max all exist for each author
     local counts = {}
+    local logsByAuthor = {}  -- [author] = { [counter] = true }
+    
     for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
-        if log and log.GetAuthor then
+        if log and log.GetAuthor and log.GetCounter then
             local a = log:GetAuthor()
-            if type(a) == "string" then
+            local c = log:GetCounter()
+            if type(a) == "string" and type(c) == "number" then
                 counts[a] = (counts[a] or 0) + 1
+                logsByAuthor[a] = logsByAuthor[a] or {}
+                logsByAuthor[a][c] = true
             end
         end
     end
 
+    -- Check for gaps: verify counters 1..max are all present
     for author, maxCounter in pairs(status.authorMax) do
         if type(author) == "string" and type(maxCounter) == "number" then
+            -- First check if count matches max (quick check for obvious gaps)
             if (counts[author] or 0) < maxCounter then
                 status.hasGaps = true
+                break
+            end
+            
+            -- Then verify contiguity: check that all counters from 1 to max exist
+            local authorLogs = logsByAuthor[author]
+            if authorLogs then
+                for i = 1, maxCounter do
+                    if not authorLogs[i] then
+                        status.hasGaps = true
+                        break
+                    end
+                end
+            end
+            
+            if status.hasGaps then
                 break
             end
         end
@@ -112,6 +133,21 @@ function Sync:HandleAdminStatus(sender, payload)
 
     self.state.adminStatuses = self.state.adminStatuses or {}
     self.state.adminStatuses[sender] = payload
+    
+    -- Issue #10 Rec 3: Progressive convergence - update authorMax with late responses
+    if conv.finalizeStarted and payload.authorMax then
+        -- Merge late admin's authorMax into session authorMax
+        for author, maxCounter in pairs(payload.authorMax) do
+            local current = self.state.authorMax[author] or 0
+            if type(maxCounter) == "number" and maxCounter > current then
+                self.state.authorMax[author] = maxCounter
+                if SF.Debug then
+                    SF.Debug:Info("SYNC", "Late ADMIN_STATUS from %s: updated authorMax[%s] from %d to %d",
+                        tostring(sender), tostring(author), current, maxCounter)
+                end
+            end
+        end
+    end
 
     -- Early finalize if all expected responded
     local all = true
@@ -524,6 +560,14 @@ function Sync:HandleNeedProfile(sender, payload)
     if not (self.state.isCoordinator or self:IsSelfHelper()) then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedProfile: not coordinator/helper (sender=%s)", tostring(sender))
+        end
+        return
+    end
+    
+    -- Verify we're still authorized for this profile (Issue #9 fix)
+    if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Not authorized to serve profile (no longer admin)")
         end
         return
     end

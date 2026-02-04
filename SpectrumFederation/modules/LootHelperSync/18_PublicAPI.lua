@@ -103,7 +103,7 @@ end
 -- @return boolean True if active, false otherwise.
 function Sync:IsSessionActive()
     if not (self.state and self.state.active) then return false end
-    if GetGroupDistribution() then return true end
+    if self:GetGroupDistribution() then return true end
 
     -- If we aren't grouped, enforce invariant
     self:_EnforceGroupedSessionActive("IsSessionActive")
@@ -402,6 +402,15 @@ function Sync:StartSession(profileId, opts)
         return nil
     end
 
+    -- Validate coordinator has profile loaded locally before starting session
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        if SF.PrintError then
+            SF:PrintError("Cannot start session: profile not loaded locally")
+        end
+        return nil
+    end
+
     local me = self:_SelfId()
     local sessionId = self:_NextNonce("SES")
     local epoch = self:_Now()
@@ -524,6 +533,14 @@ end
 function Sync:EndSession(reason, broadcast)
     reason = reason or "ended"
     if not self.state.active then return false end
+    
+    -- Only coordinator should explicitly end session
+    if not self.state.isCoordinator then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Non-coordinator attempted to end session")
+        end
+        return false
+    end
 
     -- Default behavior:
     -- - Coordinator broadcasts unless explicitly disabled

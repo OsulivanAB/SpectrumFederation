@@ -664,8 +664,20 @@ end
 -- @return boolean True on success, false on failure
 -- @return string|nil Error message if failed
 function Store:AddAdminToActiveProfile(memberId)
+	if SF.Debug then
+		SF.Debug:Info("STORE", "AddAdminToActiveProfile called with memberId: %s", tostring(memberId))
+	end
+	
 	if SF.AddAdminToActiveLootHelperProfile then
-		return SF:AddAdminToActiveLootHelperProfile(memberId)
+		local ok, err = SF:AddAdminToActiveLootHelperProfile(memberId)
+		if SF.Debug then
+			SF.Debug:Info("STORE", "AddAdminToActiveLootHelperProfile returned: ok=%s, err=%s", tostring(ok), tostring(err))
+		end
+		return ok, err
+	end
+	
+	if SF.Debug then
+		SF.Debug:Warn("STORE", "AddAdminToActiveLootHelperProfile not implemented")
 	end
 	return false, "AddAdminToActiveLootHelperProfile not implemented"
 end
