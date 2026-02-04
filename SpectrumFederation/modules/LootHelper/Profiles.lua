@@ -451,7 +451,21 @@ end
 -- @return nil
 function LootProfile:SetProfileName(newName)
     if type(newName) == "string" and newName ~= "" then
+        local oldName = self._profileName
         self._profileName = newName
+        
+        -- Create log entry for profile name change
+        if SF.LootLog and oldName and oldName ~= newName then
+            local eventType = SF.LootLogEventTypes.PROFILE_NAME_CHANGE
+            local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+            eventData.oldName = oldName
+            eventData.newName = newName
+            
+            local logEntry = SF.LootLog.new(eventType, eventData)
+            if logEntry and self.AddLootLog then
+                self:AddLootLog(logEntry)
+            end
+        end
     else
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Attempted to set invalid profile name: %s", tostring(newName))
