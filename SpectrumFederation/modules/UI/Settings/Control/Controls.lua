@@ -639,6 +639,12 @@ function Controls:AddDropdownWithIconButton(section, opts)
 
 		dropdown:SetupMenu(Generator)
 
+		-- Add custom IsEnabled method to track enabled state
+		iconBtn._enabled = true
+		iconBtn.IsEnabled = function(self)
+			return self._enabled
+		end
+
 		iconBtn:SetScript("OnClick", function()
 			if iconBtn.IsEnabled and not iconBtn:IsEnabled() then return end
 			if opts.onIconClick then
@@ -661,11 +667,10 @@ function Controls:AddDropdownWithIconButton(section, opts)
 			row:SetAlpha(effectiveEnabled and 1 or 0.45)
 
 			local iconEnabled = EvalBool(opts.iconEnabled, effectiveEnabled)
-			if iconBtn.SetEnabled then
-				iconBtn:SetEnabled(iconEnabled)
-			else
-				iconBtn:EnableMouse(iconEnabled)
-			end
+			-- Store enabled state in custom property
+			iconBtn._enabled = iconEnabled
+			-- Always keep mouse enabled so clicks can be detected
+			iconBtn:EnableMouse(true)
 			iconBtn:SetAlpha(iconEnabled and 1 or 0.45)
 
 			if dropdown.GenerateMenu then
