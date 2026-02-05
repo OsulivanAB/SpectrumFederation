@@ -451,7 +451,21 @@ end
 -- @return nil
 function LootProfile:SetProfileName(newName)
     if type(newName) == "string" and newName ~= "" then
+        local oldName = self._profileName
         self._profileName = newName
+        
+        -- Create log entry for profile name change
+        if SF.LootLog and oldName and oldName ~= newName then
+            local eventType = SF.LootLogEventTypes.PROFILE_NAME_CHANGE
+            local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+            eventData.oldName = oldName
+            eventData.newName = newName
+            
+            local logEntry = SF.LootLog.new(eventType, eventData)
+            if logEntry and self.AddLootLog then
+                self:AddLootLog(logEntry)
+            end
+        end
     else
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Attempted to set invalid profile name: %s", tostring(newName))
@@ -495,7 +509,12 @@ function LootProfile:AddLootLog(lootLog)
             and lootLog
             and lootLog.ToTable
         then
-            SF.LootHelperSync:BroadcastNewLog(self:GetProfileId(), lootLog:ToTable())        
+            local broadcastOk, broadcastErr = SF.LootHelperSync:BroadcastNewLog(self:GetProfileId(), lootLog:ToTable())
+            if not broadcastOk then
+                if SF.PrintWarning then
+                    SF:PrintWarning("Failed to broadcast change: " .. tostring(broadcastErr or "unknown error"))
+                end
+            end
         end
     end
     return ok, err
@@ -603,7 +622,23 @@ function LootProfile:SetPointName(name)
 	if name == "" then
 		return false, "Point Name cannot be empty."
 	end
+	
+	local oldName = self._pointName or "Points"
 	self._pointName = name
+	
+	-- Create log entry for point name change
+	if SF.LootLog then
+		local eventType = SF.LootLogEventTypes.POINT_NAME_CHANGE
+		local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+		eventData.oldName = oldName
+		eventData.newName = name
+		
+		local logEntry = SF.LootLog.new(eventType, eventData)
+		if logEntry and self.AddLootLog then
+			self:AddLootLog(logEntry)
+		end
+	end
+	
 	return true
 end
 
@@ -615,7 +650,22 @@ function LootProfile:SetRaidWideSafeMode(v)
 	if not self:IsCurrentUserAdmin() then
 		return false, "You must be an admin to change Raid-Wide Safemode."
 	end
-	self._raidWideSafeMode = v and true or false
+	
+	local enabled = v and true or false
+	self._raidWideSafeMode = enabled
+	
+	-- Create log entry for safemode change
+	if SF.LootLog then
+		local eventType = SF.LootLogEventTypes.SAFEMODE_CHANGE
+		local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+		eventData.enabled = enabled
+		
+		local logEntry = SF.LootLog.new(eventType, eventData)
+		if logEntry and self.AddLootLog then
+			self:AddLootLog(logEntry)
+		end
+	end
+	
 	return true
 end
 
@@ -627,7 +677,22 @@ function LootProfile:SetRaidWideSafeModeOnCombat(v)
 	if not self:IsCurrentUserAdmin() then
 		return false, "You must be an admin to change Raid-Wide Safemode on Combat."
 	end
-	self._raidWideSafeModeOnCombat = v and true or false
+	
+	local enabled = v and true or false
+	self._raidWideSafeModeOnCombat = enabled
+	
+	-- Create log entry for safemode on combat change
+	if SF.LootLog then
+		local eventType = SF.LootLogEventTypes.SAFEMODE_ON_COMBAT_CHANGE
+		local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+		eventData.enabled = enabled
+		
+		local logEntry = SF.LootLog.new(eventType, eventData)
+		if logEntry and self.AddLootLog then
+			self:AddLootLog(logEntry)
+		end
+	end
+	
 	return true
 end
 
@@ -654,6 +719,10 @@ end
 -- @param string memberId "Name-Realm" of member to add as admin
 -- @return boolean success, string|nil errorMessage
 function LootProfile:AddAdminMemberId(memberId)
+    if SF.Debug then
+        SF.Debug:Info("LootProfile", "AddAdminMemberId called with memberId: %s", tostring(memberId))
+    end
+    
     if type(memberId) ~= "string" or memberId == "" then
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Attempted to add invalid memberId as admin: %s", tostring(memberId))
@@ -661,6 +730,10 @@ function LootProfile:AddAdminMemberId(memberId)
         return false, "Invalid member id."
     end
     memberId = NormalizeMemberId(memberId)
+    
+    if SF.Debug then
+        SF.Debug:Info("LootProfile", "Normalized memberId: %s", tostring(memberId))
+    end
 
     if not self:IsCurrentUserAdmin() then
         if SF.Debug then
@@ -677,11 +750,31 @@ function LootProfile:AddAdminMemberId(memberId)
     end
 
     if self:IsAdminMemberId(memberId) then
+        if SF.Debug then
+            SF.Debug:Info("LootProfile", "Member is already an admin: %s", tostring(memberId))
+        end
         return false, "That member is already an admin"
     end
 
     self._adminUsers = self._adminUsers or {}
     table.insert(self._adminUsers, memberId)
+    
+    -- Create log entry for admin added
+    if SF.LootLog then
+        local eventType = SF.LootLogEventTypes.ADMIN_ADDED
+        local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+        eventData.member = memberId
+        
+        local logEntry = SF.LootLog.new(eventType, eventData)
+        if logEntry and self.AddLootLog then
+            self:AddLootLog(logEntry)
+        end
+    end
+    
+    if SF.Debug then
+        SF.Debug:Info("LootProfile", "Successfully added admin: %s", tostring(memberId))
+    end
+    
     return true
 end
 
@@ -715,6 +808,19 @@ function LootProfile:RemoveAdminMemberId(memberId)
     for i = #admins, 1, -1 do
         if SameMember(admins[i], memberId) then
             table.remove(admins, i)
+            
+            -- Create log entry for admin removed
+            if SF.LootLog then
+                local eventType = SF.LootLogEventTypes.ADMIN_REMOVED
+                local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+                eventData.member = memberId
+                
+                local logEntry = SF.LootLog.new(eventType, eventData)
+                if logEntry and self.AddLootLog then
+                    self:AddLootLog(logEntry)
+                end
+            end
+            
             return true
         end
     end

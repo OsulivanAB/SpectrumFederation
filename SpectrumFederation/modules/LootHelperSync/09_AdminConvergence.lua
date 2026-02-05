@@ -145,13 +145,25 @@ function Sync:FinalizeAdminConvergence()
         end
         return
     end
+    
+    -- Mark convergence as finalized (Issue #10 Rec 3: allows progressive updates)
     conv.finalizeStarted = true
+    conv.finalizedAt = self:_Now()
 
     local profileId = self.state.profileId
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
         self:_FinishAdminConvergence("no_profile")
         return
+    end
+    
+    if SF.Debug then
+        local statusCount = 0
+        if type(self.state.adminStatuses) == "table" then
+            for _ in pairs(self.state.adminStatuses) do statusCount = statusCount + 1 end
+        end
+        SF.Debug:Info("SYNC", "Finalizing admin convergence (received %d statuses, continuing to accept late responses)",
+            statusCount)
     end
 
     -- 1) compute local maxima
@@ -360,6 +372,11 @@ function Sync:BroadcastSessionStart()
 
     local profileId = self.state.profileId
     self.state.authorMax = self:ComputeAuthorMax(profileId) or {}
+    
+    -- Store chosen helpers for later activation
+    local chosenHelpers = self.state.helpers or {}
+    -- Temporarily clear helpers list so members don't route to helpers immediately
+    self.state.helpers = {}
 
     local payload = {
         sessionId   = self.state.sessionId,
@@ -367,12 +384,12 @@ function Sync:BroadcastSessionStart()
         coordinator = self.state.coordinator,
         coordEpoch  = self.state.coordEpoch,
         authorMax   = self.state.authorMax,
-        helpers     = self.state.helpers or {},
+        helpers     = chosenHelpers,  -- Broadcast includes helpers for members to know about
         safeMode    = self:_GetSessionSafeModePayload(),
     }
 
     if SF.Debug then
-        local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0
+        local helpersCount = type(chosenHelpers) == "table" and #chosenHelpers or 0
         local authorMaxCount = 0
         if type(self.state.authorMax) == "table" then
             for _ in pairs(self.state.authorMax) do authorMaxCount = authorMaxCount + 1 end
@@ -388,6 +405,7 @@ function Sync:BroadcastSessionStart()
         startedAt = self:_Now(),
         deadlineAt = self:_Now() + (self.cfg.handshakeCollectSec or 3),
         replies = {},   -- [sender] = "HAVE_PROFILE"|"NEED_PROFILE"|"NEED_LOGS"
+        helpersReady = {},  -- Track which helpers have received SES_START
     }
 
     if SF.LootHelperComm then
@@ -401,9 +419,22 @@ function Sync:BroadcastSessionStart()
     -- Start coordinator heartbeat sender (ticker)
     self:EnsureHeartbeatSender("BroadcastSessionStart")
 
+    -- Helper preparation phase: Wait 1 second for helpers to receive SES_START before activating them
+    -- This prevents members from requesting profiles from helpers who haven't received session yet
+    local sid = self.state.sessionId
+    self:RunAfter(1.0, function()
+        if not self.state.active or not self.state.isCoordinator then return end
+        if self.state.sessionId ~= sid then return end
+        
+        -- Now activate helpers - members can route requests to them
+        self.state.helpers = chosenHelpers
+        
+        if SF.Debug then
+            SF.Debug:Info("SYNC", "Helper preparation phase complete, helpers now active (count=%d)", #chosenHelpers)
+        end
+    end)
 
     -- timeout window: after N seconds, summarize what we heard
-    local sid = self.state.sessionId
     self:RunAfter(self.cfg.handshakeCollectSec or 3, function()
         -- Only finalize if session unchanged and we are still coordinator
         if not self.state.active or not self.state.isCoordinator then return end

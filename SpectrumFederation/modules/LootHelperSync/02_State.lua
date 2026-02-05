@@ -11,7 +11,7 @@ Sync.cfg = Sync.cfg or {
     adminReplyJitterMsMin = 0,
     adminReplyJitterMsMax = 500,
 
-    adminConvergenceCollectSec  = 1.5,  -- how long coordinator waits for ADMIN_STATUS
+    adminConvergenceCollectSec  = 3.0,  -- Increased from 1.5 to 3.0 for large profiles (Issue #10)
     adminLogSyncTimeoutSec      = 4.0,  -- how long coordinator waits for AUTH_LOGS
 
     memberReplyJitterMsMin = 0,

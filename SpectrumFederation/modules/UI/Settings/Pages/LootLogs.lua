@@ -129,10 +129,16 @@ local function FormatLogEntry(log)
 	
 	-- Define colors
 	local EVENT_TYPE_COLORS = {
-		PROFILE_CREATION = "|cff00ff00",  -- Green
-		POINT_CHANGE     = "|cff00ccff",  -- Cyan
-		ARMOR_CHANGE     = "|cffffa500",  -- Orange
-		ROLE_CHANGE      = "|cffff00ff",  -- Magenta
+		PROFILE_CREATION           = "|cff00ff00",  -- Green
+		POINT_CHANGE               = "|cff00ccff",  -- Cyan
+		ARMOR_CHANGE               = "|cffffa500",  -- Orange
+		ROLE_CHANGE                = "|cffff00ff",  -- Magenta
+		POINT_NAME_CHANGE          = "|cffffcc00",  -- Gold
+		PROFILE_NAME_CHANGE        = "|cff00ff00",  -- Green
+		SAFEMODE_CHANGE            = "|cffff6600",  -- Red-Orange
+		SAFEMODE_ON_COMBAT_CHANGE  = "|cffff6600",  -- Red-Orange
+		ADMIN_ADDED                = "|cff66ff66",  -- Light Green
+		ADMIN_REMOVED              = "|cffff6666",  -- Light Red
 	}
 	local TIMESTAMP_COLOR = "|cffffffff"  -- White
 	local RESET = "|r"
@@ -164,6 +170,26 @@ local function FormatLogEntry(log)
 			memberColor, data.member or "?", RESET, data.newRole or "?")
 	elseif eventType == "PROFILE_CREATION" then
 		details = string.format("Profile ID: %s", data.profileId or "?")
+	elseif eventType == "POINT_NAME_CHANGE" then
+		details = string.format("Changed from '%s' to '%s'", 
+			data.oldName or "?", data.newName or "?")
+	elseif eventType == "PROFILE_NAME_CHANGE" then
+		details = string.format("Renamed from '%s' to '%s'", 
+			data.oldName or "?", data.newName or "?")
+	elseif eventType == "SAFEMODE_CHANGE" then
+		local status = data.enabled and "Enabled" or "Disabled"
+		details = string.format("Raid-wide Safemode: %s", status)
+	elseif eventType == "SAFEMODE_ON_COMBAT_CHANGE" then
+		local status = data.enabled and "Enabled" or "Disabled"
+		details = string.format("Safemode on Combat: %s", status)
+	elseif eventType == "ADMIN_ADDED" then
+		local memberColor = GetPlayerClassColor(data.member)
+		details = string.format("Added %s%s%s as admin", 
+			memberColor, data.member or "?", RESET)
+	elseif eventType == "ADMIN_REMOVED" then
+		local memberColor = GetPlayerClassColor(data.member)
+		details = string.format("Removed %s%s%s from admins", 
+			memberColor, data.member or "?", RESET)
 	end
 	
 	return string.format("%s[%s]%s %s%s%s by %s%s%s - %s", 
