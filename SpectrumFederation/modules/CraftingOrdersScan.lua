@@ -59,11 +59,13 @@ local function IsFeatureEnabled()
 end
 
 -- Get the Crafting Orders host frame (the main frame we'll attach our button to)
--- @return Frame|nil The Crafting Orders page frame, or nil if not found
+-- Based on /fstack: ProfessionsFrame.OrdersPage.BrowseFrame is where SearchButton lives
+-- @return Frame|nil The BrowseFrame, or nil if not found
 local function GetCraftingOrdersHostFrame()
 	if not ProfessionsFrame then return nil end
 	if not ProfessionsFrame.OrdersPage then return nil end
-	return ProfessionsFrame.OrdersPage
+	if not ProfessionsFrame.OrdersPage.BrowseFrame then return nil end
+	return ProfessionsFrame.OrdersPage.BrowseFrame
 end
 
 -- Check if we're currently viewing the Crafting Orders page
@@ -78,14 +80,24 @@ local function IsOnCraftingOrdersPage()
 		return false
 	end
 	
-	local ordersPage = GetCraftingOrdersHostFrame()
-	if not ordersPage then
+	if not ProfessionsFrame.OrdersPage then
 		SF.Debug:Verbose(CATEGORY, "IsOnCraftingOrdersPage: OrdersPage not found")
 		return false
 	end
 	
-	local isShown = ordersPage:IsShown()
-	SF.Debug:Verbose(CATEGORY, "IsOnCraftingOrdersPage: OrdersPage isShown=%s", tostring(isShown))
+	if not ProfessionsFrame.OrdersPage:IsShown() then
+		SF.Debug:Verbose(CATEGORY, "IsOnCraftingOrdersPage: OrdersPage not shown")
+		return false
+	end
+	
+	-- Check if BrowseFrame exists and is shown (this is where SearchButton lives)
+	if not ProfessionsFrame.OrdersPage.BrowseFrame then
+		SF.Debug:Verbose(CATEGORY, "IsOnCraftingOrdersPage: BrowseFrame not found")
+		return false
+	end
+	
+	local isShown = ProfessionsFrame.OrdersPage.BrowseFrame:IsShown()
+	SF.Debug:Verbose(CATEGORY, "IsOnCraftingOrdersPage: BrowseFrame isShown=%s", tostring(isShown))
 	return isShown
 end
 
@@ -520,17 +532,34 @@ end
 local function AttachButton()
 	if scanButton then
 		-- Already attached
+		SF.Debug:Verbose(CATEGORY, "Button already attached, skipping")
 		return
 	end
 
-	local hostFrame = GetCraftingOrdersHostFrame()
-	if not hostFrame then
-		SF.Debug:Verbose(CATEGORY, "Cannot attach button: host frame not found")
+	-- Based on /fstack, the hierarchy is:
+	-- ProfessionsFrame.OrdersPage.BrowseFrame.SearchButton
+	if not ProfessionsFrame then
+		SF.Debug:Verbose(CATEGORY, "Cannot attach button: ProfessionsFrame not found")
 		return
 	end
+	
+	if not ProfessionsFrame.OrdersPage then
+		SF.Debug:Verbose(CATEGORY, "Cannot attach button: OrdersPage not found")
+		return
+	end
+	
+	if not ProfessionsFrame.OrdersPage.BrowseFrame then
+		SF.Debug:Verbose(CATEGORY, "Cannot attach button: BrowseFrame not found")
+		return
+	end
+	
+	local browseFrame = ProfessionsFrame.OrdersPage.BrowseFrame
+	local searchButton = browseFrame.SearchButton
+	
+	SF.Debug:Info(CATEGORY, "Found BrowseFrame, SearchButton exists: %s", tostring(searchButton ~= nil))
 
-	-- Create button
-	local btn = CreateFrame("Button", nil, hostFrame, "UIPanelButtonTemplate")
+	-- Create button parented to BrowseFrame
+	local btn = CreateFrame("Button", nil, browseFrame, "UIPanelButtonTemplate")
 	btn:SetSize(80, 22)
 	btn:SetText(BUTTON_TEXT_SCAN)
 	
@@ -538,14 +567,15 @@ local function AttachButton()
 	btn:SetFrameStrata("HIGH")
 	btn:SetFrameLevel(1000) -- Very high level to be on top
 
-	-- Try to anchor near search area; fallback to safe top-right
-	local searchBox = hostFrame.SearchBox
-	if searchBox then
-		btn:SetPoint("LEFT", searchBox, "RIGHT", 8, 0)
-		SF.Debug:Info(CATEGORY, "Button attached next to SearchBox")
+	-- Anchor relative to SearchButton if it exists
+	if searchButton then
+		-- Position to the right of the SearchButton
+		btn:SetPoint("LEFT", searchButton, "RIGHT", 8, 0)
+		SF.Debug:Info(CATEGORY, "Button attached next to SearchButton")
 	else
-		btn:SetPoint("TOPRIGHT", hostFrame, "TOPRIGHT", -10, -10)
-		SF.Debug:Info(CATEGORY, "Button attached to top-right (SearchBox not found)")
+		-- Fallback: top-right of BrowseFrame
+		btn:SetPoint("TOPRIGHT", browseFrame, "TOPRIGHT", -10, -10)
+		SF.Debug:Info(CATEGORY, "Button attached to top-right (SearchButton not found)")
 	end
 
 	btn:SetScript("OnClick", function()
@@ -556,6 +586,8 @@ local function AttachButton()
 
 	-- Initial state
 	UpdateButtonEnabled()
+	
+	SF.Debug:Info(CATEGORY, "Scan All button successfully created and attached!")
 end
 
 -- Remove the scan button
