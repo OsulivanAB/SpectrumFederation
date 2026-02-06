@@ -637,6 +637,11 @@ function COS:Init()
 		store:RegisterCallback("global.enable_cross_expansion_crafting_orders_scan_button", function(newValue)
 			SF.Debug:Info(CATEGORY, "Setting toggled: %s", tostring(newValue))
 			
+			-- Provide helpful user feedback
+			if newValue then
+				SF:PrintSuccess("Crafting Orders scan button enabled. Open Professions → Crafting Orders to see the 'Scan All' button.")
+			end
+			
 			-- Abort scan if turning off mid-scan
 			if not newValue and scanState and scanState.running then
 				AbortScan("Feature disabled via settings")
