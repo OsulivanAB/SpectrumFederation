@@ -717,6 +717,15 @@ function COS:Init()
 	initialized = true
 
 	SF.Debug:Info(CATEGORY, "CraftingOrdersScan module initialized")
+	
+	-- CRITICAL FIX: Check if Blizzard_Professions is already loaded
+	-- If the user opened professions before we initialized, ADDON_LOADED won't fire
+	if IsAddOnLoaded("Blizzard_Professions") then
+		SF.Debug:Info(CATEGORY, "Blizzard_Professions already loaded, setting up hooks immediately")
+		OnAddonLoaded("Blizzard_Professions")
+	else
+		SF.Debug:Info(CATEGORY, "Blizzard_Professions not loaded yet, will set up hooks on ADDON_LOADED")
+	end
 end
 
 -- Expose the initialization function for external use
