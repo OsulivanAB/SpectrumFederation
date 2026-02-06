@@ -2,6 +2,10 @@
 
 These notes apply when changing files under `SpectrumFederation/`.
 
+## Branch policy reminder
+- Copilot PRs must target `beta` (work branches start from `beta`).
+- `main` is release-only.
+
 ## Scope control (prevent creep)
 - Keep PRs **small and targeted**. Do not refactor unrelated systems “while you’re here.”
 - Do not add new third‑party libraries unless explicitly requested.
