@@ -537,3 +537,49 @@ function Member:UpdateFromLootLog()
     self.pointBalance = pointBalance
     self.armor = armorStatuses
 end
+
+-- ========================================================================
+-- Serialization (Export/Import for sync)
+-- ========================================================================
+
+-- Function Export member data to a network-safe table
+-- @return table memberData
+function Member:ToTable()
+    local armorCopy = {}
+    for k, v in pairs(self.armor or {}) do
+        armorCopy[k] = v
+    end
+    
+    return {
+        identifier = self.identifier,
+        role = self.role,
+        class = self.class,
+        pointBalance = self.pointBalance,
+        armor = armorCopy,
+    }
+end
+
+-- Function Create a Member instance from a network table
+-- @param table t Member data table
+-- @return Member|nil member instance or nil if invalid
+function Member.FromTable(t)
+    if type(t) ~= "table" then return nil end
+    if type(t.identifier) ~= "string" or t.identifier == "" then return nil end
+    
+    local m = Member.new(t.identifier, t.role, t.class)
+    if not m then return nil end
+    
+    -- Set point balance
+    m.pointBalance = tonumber(t.pointBalance) or 0
+    
+    -- Set armor statuses
+    if type(t.armor) == "table" then
+        for k, v in pairs(t.armor) do
+            if m.armor[k] ~= nil then
+                m.armor[k] = v and true or false
+            end
+        end
+    end
+    
+    return m
+end
