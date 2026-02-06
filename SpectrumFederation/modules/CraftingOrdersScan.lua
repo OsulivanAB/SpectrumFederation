@@ -517,6 +517,10 @@ local function AttachButton()
 	local btn = CreateFrame("Button", nil, hostFrame, "UIPanelButtonTemplate")
 	btn:SetSize(80, 22)
 	btn:SetText(BUTTON_TEXT_SCAN)
+	
+	-- Ensure button is visible (not hidden behind other UI)
+	btn:SetFrameStrata("HIGH")
+	btn:SetFrameLevel(1000) -- Very high level to be on top
 
 	-- Try to anchor near search area; fallback to safe top-right
 	local searchBox = hostFrame.SearchBox
@@ -581,23 +585,40 @@ local function OnAddonLoaded(loadedAddonName)
 	if loadedAddonName == "Blizzard_Professions" then
 		SF.Debug:Info(CATEGORY, "Blizzard_Professions loaded, setting up hooks and refreshing button state")
 		
+		-- Check if ProfessionsFrame exists
+		if not ProfessionsFrame then
+			SF.Debug:Warn(CATEGORY, "ProfessionsFrame does NOT exist yet after Blizzard_Professions loaded")
+			SF.Debug:Info(CATEGORY, "Will attempt hook setup when user opens professions")
+			-- Frame will be created when user first opens professions
+			-- We'll catch it with the periodic check below
+			return
+		end
+		
+		SF.Debug:Info(CATEGORY, "ProfessionsFrame EXISTS, proceeding with hook setup")
+		
 		-- Set up hooks if they weren't set up during init
-		if ProfessionsFrame then
-			-- Hook the main frame
-			if not ProfessionsFrame.__sfCraftingOrdersHooked then
-				hooksecurefunc(ProfessionsFrame, "Show", OnUIVisibilityChanged)
-				hooksecurefunc(ProfessionsFrame, "Hide", OnUIVisibilityChanged)
-				ProfessionsFrame.__sfCraftingOrdersHooked = true
-				SF.Debug:Verbose(CATEGORY, "Hooked ProfessionsFrame Show/Hide after addon load")
-			end
-			
-			-- Hook OrdersPage if it exists
-			if ProfessionsFrame.OrdersPage and not ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked then
+		-- Hook the main frame
+		if not ProfessionsFrame.__sfCraftingOrdersHooked then
+			hooksecurefunc(ProfessionsFrame, "Show", OnUIVisibilityChanged)
+			hooksecurefunc(ProfessionsFrame, "Hide", OnUIVisibilityChanged)
+			ProfessionsFrame.__sfCraftingOrdersHooked = true
+			SF.Debug:Verbose(CATEGORY, "Hooked ProfessionsFrame Show/Hide after addon load")
+		else
+			SF.Debug:Verbose(CATEGORY, "ProfessionsFrame already hooked, skipping")
+		end
+		
+		-- Hook OrdersPage if it exists
+		if ProfessionsFrame.OrdersPage then
+			if not ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked then
 				hooksecurefunc(ProfessionsFrame.OrdersPage, "Show", OnUIVisibilityChanged)
 				hooksecurefunc(ProfessionsFrame.OrdersPage, "Hide", OnUIVisibilityChanged)
 				ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked = true
 				SF.Debug:Verbose(CATEGORY, "Hooked OrdersPage Show/Hide after addon load")
+			else
+				SF.Debug:Verbose(CATEGORY, "OrdersPage already hooked, skipping")
 			end
+		else
+			SF.Debug:Warn(CATEGORY, "OrdersPage does NOT exist yet")
 		end
 		
 		-- Force a button state refresh in case the UI is already open
@@ -726,6 +747,29 @@ function COS:Init()
 	else
 		SF.Debug:Info(CATEGORY, "Blizzard_Professions not loaded yet, will set up hooks on ADDON_LOADED")
 	end
+	
+	-- FALLBACK: Periodically check if professions UI is open and try to attach button
+	-- This handles the case where frames are created lazily
+	local function TryAttachIfNeeded()
+		if not IsFeatureEnabled() then
+			return
+		end
+		
+		-- Try to set up hooks if ProfessionsFrame now exists but isn't hooked yet
+		if ProfessionsFrame and not ProfessionsFrame.__sfCraftingOrdersHooked then
+			SF.Debug:Info(CATEGORY, "ProfessionsFrame detected via periodic check, setting up hooks now")
+			OnAddonLoaded("Blizzard_Professions")
+		end
+		
+		-- If we're on the crafting orders page but button isn't attached, try now
+		if IsOnCraftingOrdersPage() and not scanButton then
+			SF.Debug:Info(CATEGORY, "On Crafting Orders page but no button, attempting attach via periodic check")
+			AttachButton()
+		end
+	end
+	
+	-- Check every 2 seconds (lightweight check)
+	C_Timer.NewTicker(2, TryAttachIfNeeded)
 end
 
 -- Expose the initialization function for external use
