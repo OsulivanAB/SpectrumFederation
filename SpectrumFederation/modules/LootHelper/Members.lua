@@ -545,6 +545,7 @@ end
 -- Function Export member data to a network-safe table
 -- @return table memberData
 function Member:ToTable()
+    -- Note: We manually copy armor table instead of using CopyArray since it's a dictionary, not an array
     local armorCopy = {}
     for k, v in pairs(self.armor or {}) do
         armorCopy[k] = v
@@ -577,6 +578,11 @@ function Member.FromTable(t)
         for k, v in pairs(t.armor) do
             if m.armor[k] ~= nil then
                 m.armor[k] = v and true or false
+            else
+                -- Warn about unknown armor slot keys from network data (possible schema mismatch)
+                if SF.Debug then
+                    SF.Debug:Warn("MEMBER", "Unknown armor slot '%s' in FromTable for %s (ignoring)", tostring(k), tostring(m.identifier))
+                end
             end
         end
     end

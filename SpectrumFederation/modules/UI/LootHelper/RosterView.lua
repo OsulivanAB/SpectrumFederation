@@ -378,7 +378,7 @@ function View:_LayoutButtons(r, model)
 			Place(r.BtnPlus)
 		end
 	else
-		-- For PROFILE_MEMBER rows: helmet is visible for everyone
+		-- For PROFILE_MEMBER rows: helmet is visible and enabled for everyone (opens equipment window)
 		r.BtnHelmet:Show()
 		r.BtnHelmet:Enable()
 		Place(r.BtnHelmet)
