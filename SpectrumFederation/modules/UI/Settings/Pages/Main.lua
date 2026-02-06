@@ -27,7 +27,7 @@ function Page:Build(panel)
                     {
                         type = "checkbox",
                         label = "Enable cross-expansion Crafting Orders scan button",
-                        tooltip = "When enabled, adds a 'Scan All' button to the Crafessions Crafting Orders UI to scan all expansion skill lines.",
+                        tooltip = "When enabled, adds a 'Scan All' button to the Professions Crafting Orders UI to scan all expansion skill lines.",
                         path = "global.enable_cross_expansion_crafting_orders_scan_button",
                     },
                 },
