@@ -130,7 +130,7 @@ def create_addon_zip(addon_name, version):
     # Create zip using subprocess for consistency with validation
     try:
         subprocess.run(
-            ["zip", "-r", str(zip_path), addon_name, "-x", "*.git*"],
+            ["zip", "-r", str(zip_path), addon_name, "-x", "*.git*", "*/AGENTS.md"],
             check=True,
             capture_output=True
         )

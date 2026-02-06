@@ -20,6 +20,9 @@
                 "charliermarsh.ruff"
             ],
             "settings": {
+                "github.copilot.chat.codeGeneration.useInstructionFiles": true,
+                "chat.useAgentsMdFile": true,
+                "chat.useNestedAgentsMdFiles": true,
                 "todo-tree.regex.regex": "(//|#|<!--|;|/\\*|^|^\\s*(-|\\*|\\+)|\\{-|--|')\\s*($TAGS)",
                 "todo-tree.regex.regexCaseSensitive": false,
                 "todo-tree.filtering.excludeGlobs": [
