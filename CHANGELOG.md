@@ -29,10 +29,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.1-beta.1] - 2026-02-06
 
-### Added
-- New developer documentation for contributing to the addon, including guidelines for adding settings, debugging, and localization.
+## [0.5.1] - 2026-02-06
+
+### Changed
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.5.2] - 2026-02-05
 
