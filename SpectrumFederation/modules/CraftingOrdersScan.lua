@@ -34,6 +34,22 @@ local eventFrame = CreateFrame("Frame")
 -- Helpers
 -- ============================================================================
 
+-- Safe wrapper for IsAddOnLoaded that handles both old and new WoW API
+-- @param addonName string Name of the addon to check
+-- @return boolean True if addon is loaded, false otherwise
+local function IsAddOnLoadedSafe(addonName)
+	-- Modern API (Retail 10.0+)
+	if C_AddOns and C_AddOns.IsAddOnLoaded then
+		return C_AddOns.IsAddOnLoaded(addonName)
+	end
+	-- Legacy API (Classic/older retail)
+	if IsAddOnLoaded then
+		return IsAddOnLoaded(addonName)
+	end
+	-- Fallback: assume not loaded if API not available
+	return false
+end
+
 -- Check if the feature is enabled via settings
 -- @return boolean True if enabled, false otherwise
 local function IsFeatureEnabled()
@@ -741,7 +757,7 @@ function COS:Init()
 	
 	-- CRITICAL FIX: Check if Blizzard_Professions is already loaded
 	-- If the user opened professions before we initialized, ADDON_LOADED won't fire
-	if IsAddOnLoaded("Blizzard_Professions") then
+	if IsAddOnLoadedSafe("Blizzard_Professions") then
 		SF.Debug:Info(CATEGORY, "Blizzard_Professions already loaded, setting up hooks immediately")
 		OnAddonLoaded("Blizzard_Professions")
 	else
