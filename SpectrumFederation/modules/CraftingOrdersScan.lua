@@ -53,13 +53,24 @@ end
 -- Check if we're currently viewing the Crafting Orders page
 -- @return boolean True if on Crafting Orders page, false otherwise
 local function IsOnCraftingOrdersPage()
-	if not ProfessionsFrame then return false end
-	if not ProfessionsFrame:IsShown() then return false end
+	if not ProfessionsFrame then
+		SF.Debug:Verbose(CATEGORY, "IsOnCraftingOrdersPage: ProfessionsFrame not found")
+		return false
+	end
+	if not ProfessionsFrame:IsShown() then
+		SF.Debug:Verbose(CATEGORY, "IsOnCraftingOrdersPage: ProfessionsFrame not shown")
+		return false
+	end
 	
 	local ordersPage = GetCraftingOrdersHostFrame()
-	if not ordersPage then return false end
+	if not ordersPage then
+		SF.Debug:Verbose(CATEGORY, "IsOnCraftingOrdersPage: OrdersPage not found")
+		return false
+	end
 	
-	return ordersPage:IsShown()
+	local isShown = ordersPage:IsShown()
+	SF.Debug:Verbose(CATEGORY, "IsOnCraftingOrdersPage: OrdersPage isShown=%s", tostring(isShown))
+	return isShown
 end
 
 -- Build list of child skill line IDs for the current profession
@@ -545,9 +556,18 @@ local function RefreshButtonState()
 	local enabled = IsFeatureEnabled()
 	local onPage = IsOnCraftingOrdersPage()
 
+	SF.Debug:Verbose(CATEGORY, "RefreshButtonState: enabled=%s, onPage=%s", tostring(enabled), tostring(onPage))
+
 	if enabled and onPage then
+		SF.Debug:Info(CATEGORY, "Conditions met, attempting to attach button")
 		AttachButton()
 	else
+		if not enabled then
+			SF.Debug:Verbose(CATEGORY, "Button hidden: feature not enabled")
+		end
+		if not onPage then
+			SF.Debug:Verbose(CATEGORY, "Button hidden: not on Crafting Orders page")
+		end
 		RemoveButton()
 	end
 end
@@ -559,7 +579,28 @@ end
 -- Handle ADDON_LOADED event
 local function OnAddonLoaded(loadedAddonName)
 	if loadedAddonName == "Blizzard_Professions" then
-		SF.Debug:Verbose(CATEGORY, "Blizzard_Professions loaded")
+		SF.Debug:Info(CATEGORY, "Blizzard_Professions loaded, setting up hooks and refreshing button state")
+		
+		-- Set up hooks if they weren't set up during init
+		if ProfessionsFrame then
+			-- Hook the main frame
+			if not ProfessionsFrame.__sfCraftingOrdersHooked then
+				hooksecurefunc(ProfessionsFrame, "Show", OnUIVisibilityChanged)
+				hooksecurefunc(ProfessionsFrame, "Hide", OnUIVisibilityChanged)
+				ProfessionsFrame.__sfCraftingOrdersHooked = true
+				SF.Debug:Verbose(CATEGORY, "Hooked ProfessionsFrame Show/Hide after addon load")
+			end
+			
+			-- Hook OrdersPage if it exists
+			if ProfessionsFrame.OrdersPage and not ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked then
+				hooksecurefunc(ProfessionsFrame.OrdersPage, "Show", OnUIVisibilityChanged)
+				hooksecurefunc(ProfessionsFrame.OrdersPage, "Hide", OnUIVisibilityChanged)
+				ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked = true
+				SF.Debug:Verbose(CATEGORY, "Hooked OrdersPage Show/Hide after addon load")
+			end
+		end
+		
+		-- Force a button state refresh in case the UI is already open
 		RefreshButtonState()
 	end
 end
@@ -619,16 +660,38 @@ function COS:Init()
 	end)
 
 	-- Hook into ProfessionsFrame to detect page changes
-	if ProfessionsFrame then
-		-- Try to hook the show/hide events
-		hooksecurefunc(ProfessionsFrame, "Show", OnUIVisibilityChanged)
-		hooksecurefunc(ProfessionsFrame, "Hide", OnUIVisibilityChanged)
+	-- Use a delayed hook setup to handle late-loaded UI
+	local function SetupProfessionsHooks()
+		if not ProfessionsFrame then
+			SF.Debug:Verbose(CATEGORY, "ProfessionsFrame not available yet for hooks")
+			return false
+		end
+		
+		-- Hook the main frame if not already hooked
+		if not ProfessionsFrame.__sfCraftingOrdersHooked then
+			hooksecurefunc(ProfessionsFrame, "Show", OnUIVisibilityChanged)
+			hooksecurefunc(ProfessionsFrame, "Hide", OnUIVisibilityChanged)
+			ProfessionsFrame.__sfCraftingOrdersHooked = true
+			SF.Debug:Verbose(CATEGORY, "Hooked ProfessionsFrame Show/Hide")
+		end
 		
 		-- If OrdersPage exists, hook it too
-		if ProfessionsFrame.OrdersPage then
+		if ProfessionsFrame.OrdersPage and not ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked then
 			hooksecurefunc(ProfessionsFrame.OrdersPage, "Show", OnUIVisibilityChanged)
 			hooksecurefunc(ProfessionsFrame.OrdersPage, "Hide", OnUIVisibilityChanged)
+			ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked = true
+			SF.Debug:Verbose(CATEGORY, "Hooked OrdersPage Show/Hide")
 		end
+		
+		return true
+	end
+	
+	-- Try to set up hooks immediately
+	local hooksSetup = SetupProfessionsHooks()
+	
+	-- If hooks didn't set up, we'll try again when Blizzard_Professions loads
+	if not hooksSetup then
+		SF.Debug:Info(CATEGORY, "Will set up ProfessionsFrame hooks when Blizzard_Professions loads")
 	end
 
 	-- Register callback for settings changes
