@@ -653,16 +653,16 @@ local function OnAddonLoaded(loadedAddonName)
 		SF.Debug:Info(CATEGORY, "ProfessionsFrame EXISTS, proceeding with hook setup")
 		
 		-- Set up hooks if they weren't set up during init
-		-- Hook the main frame
+		-- Hook the main frame - use HookScript for OnShow/OnHide (not hooksecurefunc)
 		if not ProfessionsFrame.__sfCraftingOrdersHooked then
 			local success, err = pcall(function()
-				hooksecurefunc(ProfessionsFrame, "Show", OnUIVisibilityChanged)
-				hooksecurefunc(ProfessionsFrame, "Hide", OnUIVisibilityChanged)
+				ProfessionsFrame:HookScript("OnShow", OnUIVisibilityChanged)
+				ProfessionsFrame:HookScript("OnHide", OnUIVisibilityChanged)
 			end)
 			
 			if success then
 				ProfessionsFrame.__sfCraftingOrdersHooked = true
-				SF.Debug:Verbose(CATEGORY, "Hooked ProfessionsFrame Show/Hide after addon load")
+				SF.Debug:Verbose(CATEGORY, "Hooked ProfessionsFrame OnShow/OnHide after addon load")
 			else
 				SF.Debug:Error(CATEGORY, "Failed to hook ProfessionsFrame: %s", tostring(err))
 			end
@@ -674,13 +674,13 @@ local function OnAddonLoaded(loadedAddonName)
 		if ProfessionsFrame.OrdersPage then
 			if not ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked then
 				local success, err = pcall(function()
-					hooksecurefunc(ProfessionsFrame.OrdersPage, "Show", OnUIVisibilityChanged)
-					hooksecurefunc(ProfessionsFrame.OrdersPage, "Hide", OnUIVisibilityChanged)
+					ProfessionsFrame.OrdersPage:HookScript("OnShow", OnUIVisibilityChanged)
+					ProfessionsFrame.OrdersPage:HookScript("OnHide", OnUIVisibilityChanged)
 				end)
 				
 				if success then
 					ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked = true
-					SF.Debug:Verbose(CATEGORY, "Hooked OrdersPage Show/Hide after addon load")
+					SF.Debug:Verbose(CATEGORY, "Hooked OrdersPage OnShow/OnHide after addon load")
 				else
 					SF.Debug:Error(CATEGORY, "Failed to hook OrdersPage: %s", tostring(err))
 				end
