@@ -27,6 +27,7 @@ ignore:
   - README.md
   - CHANGELOG.md
   - LICENSE
+  - SpectrumFederation/AGENTS.md
 
 manual-changelog: CHANGELOG.md
 license-output: LICENSE
