@@ -655,10 +655,17 @@ local function OnAddonLoaded(loadedAddonName)
 		-- Set up hooks if they weren't set up during init
 		-- Hook the main frame
 		if not ProfessionsFrame.__sfCraftingOrdersHooked then
-			hooksecurefunc(ProfessionsFrame, "Show", OnUIVisibilityChanged)
-			hooksecurefunc(ProfessionsFrame, "Hide", OnUIVisibilityChanged)
-			ProfessionsFrame.__sfCraftingOrdersHooked = true
-			SF.Debug:Verbose(CATEGORY, "Hooked ProfessionsFrame Show/Hide after addon load")
+			local success, err = pcall(function()
+				hooksecurefunc(ProfessionsFrame, "Show", OnUIVisibilityChanged)
+				hooksecurefunc(ProfessionsFrame, "Hide", OnUIVisibilityChanged)
+			end)
+			
+			if success then
+				ProfessionsFrame.__sfCraftingOrdersHooked = true
+				SF.Debug:Verbose(CATEGORY, "Hooked ProfessionsFrame Show/Hide after addon load")
+			else
+				SF.Debug:Error(CATEGORY, "Failed to hook ProfessionsFrame: %s", tostring(err))
+			end
 		else
 			SF.Debug:Verbose(CATEGORY, "ProfessionsFrame already hooked, skipping")
 		end
@@ -666,10 +673,17 @@ local function OnAddonLoaded(loadedAddonName)
 		-- Hook OrdersPage if it exists
 		if ProfessionsFrame.OrdersPage then
 			if not ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked then
-				hooksecurefunc(ProfessionsFrame.OrdersPage, "Show", OnUIVisibilityChanged)
-				hooksecurefunc(ProfessionsFrame.OrdersPage, "Hide", OnUIVisibilityChanged)
-				ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked = true
-				SF.Debug:Verbose(CATEGORY, "Hooked OrdersPage Show/Hide after addon load")
+				local success, err = pcall(function()
+					hooksecurefunc(ProfessionsFrame.OrdersPage, "Show", OnUIVisibilityChanged)
+					hooksecurefunc(ProfessionsFrame.OrdersPage, "Hide", OnUIVisibilityChanged)
+				end)
+				
+				if success then
+					ProfessionsFrame.OrdersPage.__sfCraftingOrdersHooked = true
+					SF.Debug:Verbose(CATEGORY, "Hooked OrdersPage Show/Hide after addon load")
+				else
+					SF.Debug:Error(CATEGORY, "Failed to hook OrdersPage: %s", tostring(err))
+				end
 			else
 				SF.Debug:Verbose(CATEGORY, "OrdersPage already hooked, skipping")
 			end
@@ -836,89 +850,131 @@ end
 -- Diagnostic function to help troubleshoot button visibility issues
 -- Can be called via /run SF.CraftingOrdersScan:Diagnose()
 function COS:Diagnose()
-	print("=== Crafting Orders Scan Button Diagnostic ===")
-	print(" ")
+	local function safePrint(...)
+		local success, err = pcall(print, ...)
+		if not success then
+			-- Fallback if even print fails
+			DEFAULT_CHAT_FRAME:AddMessage(table.concat({...}, " "))
+		end
+	end
+	
+	safePrint("=== Crafting Orders Scan Button Diagnostic ===")
+	safePrint(" ")
 	
 	-- Check module initialization
-	print("1. Module Status:")
-	print("   - Initialized: " .. tostring(initialized))
-	print("   - Button exists: " .. tostring(scanButton ~= nil))
-	if scanButton then
-		print("   - Button visible: " .. tostring(scanButton:IsShown()))
-		print("   - Button parent: " .. tostring(scanButton:GetParent():GetName() or "unnamed"))
+	safePrint("1. Module Status:")
+	local success, result = pcall(function()
+		safePrint("   - Initialized: " .. tostring(initialized))
+		safePrint("   - Button exists: " .. tostring(scanButton ~= nil))
+		if scanButton then
+			safePrint("   - Button visible: " .. tostring(scanButton:IsShown()))
+			local parent = scanButton:GetParent()
+			safePrint("   - Button parent: " .. tostring(parent and parent:GetName() or "unnamed"))
+		end
+	end)
+	if not success then
+		safePrint("   ERROR in Module Status: " .. tostring(result))
 	end
-	print(" ")
+	safePrint(" ")
 	
 	-- Check setting
-	print("2. Setting Status:")
-	local enabled = IsFeatureEnabled()
-	print("   - Feature enabled: " .. tostring(enabled))
-	if SF.SettingsStore then
-		local value = SF.SettingsStore:Get("global.enable_cross_expansion_crafting_orders_scan_button")
-		print("   - Raw setting value: " .. tostring(value))
+	safePrint("2. Setting Status:")
+	success, result = pcall(function()
+		local enabled = IsFeatureEnabled()
+		safePrint("   - Feature enabled: " .. tostring(enabled))
+		if SF.SettingsStore then
+			local value = SF.SettingsStore:Get("global.enable_cross_expansion_crafting_orders_scan_button")
+			safePrint("   - Raw setting value: " .. tostring(value))
+		end
+	end)
+	if not success then
+		safePrint("   ERROR in Setting Status: " .. tostring(result))
 	end
-	print(" ")
+	safePrint(" ")
 	
 	-- Check frame hierarchy
-	print("3. Frame Hierarchy:")
-	print("   - ProfessionsFrame exists: " .. tostring(ProfessionsFrame ~= nil))
-	if ProfessionsFrame then
-		print("   - ProfessionsFrame shown: " .. tostring(ProfessionsFrame:IsShown()))
-		print("   - ProfessionsFrame hooked: " .. tostring(ProfessionsFrame.__sfCraftingOrdersHooked or false))
-		
-		print("   - OrdersPage exists: " .. tostring(ProfessionsFrame.OrdersPage ~= nil))
-		if ProfessionsFrame.OrdersPage then
-			print("   - OrdersPage shown: " .. tostring(ProfessionsFrame.OrdersPage:IsShown()))
+	safePrint("3. Frame Hierarchy:")
+	success, result = pcall(function()
+		safePrint("   - ProfessionsFrame exists: " .. tostring(ProfessionsFrame ~= nil))
+		if ProfessionsFrame then
+			safePrint("   - ProfessionsFrame shown: " .. tostring(ProfessionsFrame:IsShown()))
+			safePrint("   - ProfessionsFrame hooked: " .. tostring(ProfessionsFrame.__sfCraftingOrdersHooked or false))
 			
-			print("   - BrowseFrame exists: " .. tostring(ProfessionsFrame.OrdersPage.BrowseFrame ~= nil))
-			if ProfessionsFrame.OrdersPage.BrowseFrame then
-				local bf = ProfessionsFrame.OrdersPage.BrowseFrame
-				print("   - BrowseFrame shown: " .. tostring(bf:IsShown()))
-				print("   - BrowseFrame hooked: " .. tostring(bf.__sfCraftingOrdersHooked or false))
-				print("   - SearchButton exists: " .. tostring(bf.SearchButton ~= nil))
-				if bf.SearchButton then
-					print("   - SearchButton shown: " .. tostring(bf.SearchButton:IsShown()))
+			safePrint("   - OrdersPage exists: " .. tostring(ProfessionsFrame.OrdersPage ~= nil))
+			if ProfessionsFrame.OrdersPage then
+				safePrint("   - OrdersPage shown: " .. tostring(ProfessionsFrame.OrdersPage:IsShown()))
+				
+				safePrint("   - BrowseFrame exists: " .. tostring(ProfessionsFrame.OrdersPage.BrowseFrame ~= nil))
+				if ProfessionsFrame.OrdersPage.BrowseFrame then
+					local bf = ProfessionsFrame.OrdersPage.BrowseFrame
+					safePrint("   - BrowseFrame shown: " .. tostring(bf:IsShown()))
+					safePrint("   - BrowseFrame hooked: " .. tostring(bf.__sfCraftingOrdersHooked or false))
+					safePrint("   - SearchButton exists: " .. tostring(bf.SearchButton ~= nil))
+					if bf.SearchButton then
+						safePrint("   - SearchButton shown: " .. tostring(bf.SearchButton:IsShown()))
+					end
 				end
 			end
 		end
+	end)
+	if not success then
+		safePrint("   ERROR in Frame Hierarchy: " .. tostring(result))
 	end
-	print(" ")
+	safePrint(" ")
 	
 	-- Check if on Crafting Orders page
-	print("4. Page Detection:")
-	local onPage = IsOnCraftingOrdersPage()
-	print("   - IsOnCraftingOrdersPage: " .. tostring(onPage))
-	print(" ")
+	safePrint("4. Page Detection:")
+	success, result = pcall(function()
+		local onPage = IsOnCraftingOrdersPage()
+		safePrint("   - IsOnCraftingOrdersPage: " .. tostring(onPage))
+	end)
+	if not success then
+		safePrint("   ERROR in Page Detection: " .. tostring(result))
+	end
+	safePrint(" ")
 	
 	-- Check addon loaded status
-	print("5. Addon Status:")
-	local loaded = IsAddOnLoadedSafe("Blizzard_Professions")
-	print("   - Blizzard_Professions loaded: " .. tostring(loaded))
-	print(" ")
+	safePrint("5. Addon Status:")
+	success, result = pcall(function()
+		local loaded = IsAddOnLoadedSafe("Blizzard_Professions")
+		safePrint("   - Blizzard_Professions loaded: " .. tostring(loaded))
+	end)
+	if not success then
+		safePrint("   ERROR in Addon Status: " .. tostring(result))
+	end
+	safePrint(" ")
 	
 	-- Attempt to attach button
-	print("6. Attempting Button Attachment:")
-	if not enabled then
-		print("   ❌ Cannot attach: Feature not enabled in settings")
-		print("   → Enable via /sf settings")
-	elseif not onPage then
-		print("   ❌ Cannot attach: Not on Crafting Orders page")
-		print("   → Open Professions → Crafting Orders (Browse tab)")
-	elseif scanButton then
-		print("   ℹ️  Button already exists")
-		print("   → If you don't see it, it may be hidden or positioned incorrectly")
-	else
-		print("   → Attempting to attach button now...")
-		AttachButton()
-		if scanButton then
-			print("   ✓ Button attached successfully!")
+	safePrint("6. Attempting Button Attachment:")
+	success, result = pcall(function()
+		local enabled = IsFeatureEnabled()
+		local onPage = IsOnCraftingOrdersPage()
+		
+		if not enabled then
+			safePrint("   ❌ Cannot attach: Feature not enabled in settings")
+			safePrint("   → Enable via /sf settings")
+		elseif not onPage then
+			safePrint("   ❌ Cannot attach: Not on Crafting Orders page")
+			safePrint("   → Open Professions → Crafting Orders (Browse tab)")
+		elseif scanButton then
+			safePrint("   ℹ️  Button already exists")
+			safePrint("   → If you don't see it, it may be hidden or positioned incorrectly")
 		else
-			print("   ❌ Button attachment failed (check debug logs)")
+			safePrint("   → Attempting to attach button now...")
+			AttachButton()
+			if scanButton then
+				safePrint("   ✓ Button attached successfully!")
+			else
+				safePrint("   ❌ Button attachment failed (check debug logs)")
+			end
 		end
+	end)
+	if not success then
+		safePrint("   ERROR in Button Attachment: " .. tostring(result))
 	end
-	print(" ")
-	print("=== End Diagnostic ===")
-	print("Run '/sf debug show' to see detailed logs")
+	safePrint(" ")
+	safePrint("=== End Diagnostic ===")
+	safePrint("Run '/sf debug show' to see detailed logs")
 end
 
 -- Force button attachment (for troubleshooting)
