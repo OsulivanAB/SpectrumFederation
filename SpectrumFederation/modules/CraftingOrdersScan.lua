@@ -563,15 +563,23 @@ local function AttachButton()
 	btn:SetSize(80, 22)
 	btn:SetText(BUTTON_TEXT_SCAN)
 	
-	-- Ensure button is visible (not hidden behind other UI)
-	btn:SetFrameStrata("HIGH")
-	btn:SetFrameLevel(1000) -- Very high level to be on top
+	-- Make button VERY visible for troubleshooting
+	btn:SetFrameStrata("DIALOG") -- Even higher than HIGH
+	btn:SetFrameLevel(10000) -- Extremely high level
+	
+	-- Add a distinctive color to make it obvious (temporary for debugging)
+	-- This will make it stand out so we can verify it's being created
+	if not btn.background then
+		btn.background = btn:CreateTexture(nil, "BACKGROUND")
+		btn.background:SetAllPoints()
+		btn.background:SetColorTexture(0.2, 0.6, 1.0, 0.3) -- Light blue tint
+	end
 
 	-- Anchor relative to SearchButton if it exists
 	if searchButton then
-		-- Position to the right of the SearchButton
-		btn:SetPoint("LEFT", searchButton, "RIGHT", 8, 0)
-		SF.Debug:Info(CATEGORY, "Button attached next to SearchButton")
+		-- Position to the right of the SearchButton with extra spacing
+		btn:SetPoint("LEFT", searchButton, "RIGHT", 15, 0)
+		SF.Debug:Info(CATEGORY, "Button attached next to SearchButton with 15px spacing")
 	else
 		-- Fallback: top-right of BrowseFrame
 		btn:SetPoint("TOPRIGHT", browseFrame, "TOPRIGHT", -10, -10)
@@ -823,4 +831,115 @@ end
 -- Expose the initialization function for external use
 function COS:RefreshEnabledState()
 	RefreshButtonState()
+end
+
+-- Diagnostic function to help troubleshoot button visibility issues
+-- Can be called via /run SF.CraftingOrdersScan:Diagnose()
+function COS:Diagnose()
+	print("=== Crafting Orders Scan Button Diagnostic ===")
+	print(" ")
+	
+	-- Check module initialization
+	print("1. Module Status:")
+	print("   - Initialized: " .. tostring(initialized))
+	print("   - Button exists: " .. tostring(scanButton ~= nil))
+	if scanButton then
+		print("   - Button visible: " .. tostring(scanButton:IsShown()))
+		print("   - Button parent: " .. tostring(scanButton:GetParent():GetName() or "unnamed"))
+	end
+	print(" ")
+	
+	-- Check setting
+	print("2. Setting Status:")
+	local enabled = IsFeatureEnabled()
+	print("   - Feature enabled: " .. tostring(enabled))
+	if SF.SettingsStore then
+		local value = SF.SettingsStore:Get("global.enable_cross_expansion_crafting_orders_scan_button")
+		print("   - Raw setting value: " .. tostring(value))
+	end
+	print(" ")
+	
+	-- Check frame hierarchy
+	print("3. Frame Hierarchy:")
+	print("   - ProfessionsFrame exists: " .. tostring(ProfessionsFrame ~= nil))
+	if ProfessionsFrame then
+		print("   - ProfessionsFrame shown: " .. tostring(ProfessionsFrame:IsShown()))
+		print("   - ProfessionsFrame hooked: " .. tostring(ProfessionsFrame.__sfCraftingOrdersHooked or false))
+		
+		print("   - OrdersPage exists: " .. tostring(ProfessionsFrame.OrdersPage ~= nil))
+		if ProfessionsFrame.OrdersPage then
+			print("   - OrdersPage shown: " .. tostring(ProfessionsFrame.OrdersPage:IsShown()))
+			
+			print("   - BrowseFrame exists: " .. tostring(ProfessionsFrame.OrdersPage.BrowseFrame ~= nil))
+			if ProfessionsFrame.OrdersPage.BrowseFrame then
+				local bf = ProfessionsFrame.OrdersPage.BrowseFrame
+				print("   - BrowseFrame shown: " .. tostring(bf:IsShown()))
+				print("   - BrowseFrame hooked: " .. tostring(bf.__sfCraftingOrdersHooked or false))
+				print("   - SearchButton exists: " .. tostring(bf.SearchButton ~= nil))
+				if bf.SearchButton then
+					print("   - SearchButton shown: " .. tostring(bf.SearchButton:IsShown()))
+				end
+			end
+		end
+	end
+	print(" ")
+	
+	-- Check if on Crafting Orders page
+	print("4. Page Detection:")
+	local onPage = IsOnCraftingOrdersPage()
+	print("   - IsOnCraftingOrdersPage: " .. tostring(onPage))
+	print(" ")
+	
+	-- Check addon loaded status
+	print("5. Addon Status:")
+	local loaded = IsAddOnLoadedSafe("Blizzard_Professions")
+	print("   - Blizzard_Professions loaded: " .. tostring(loaded))
+	print(" ")
+	
+	-- Attempt to attach button
+	print("6. Attempting Button Attachment:")
+	if not enabled then
+		print("   ❌ Cannot attach: Feature not enabled in settings")
+		print("   → Enable via /sf settings")
+	elseif not onPage then
+		print("   ❌ Cannot attach: Not on Crafting Orders page")
+		print("   → Open Professions → Crafting Orders (Browse tab)")
+	elseif scanButton then
+		print("   ℹ️  Button already exists")
+		print("   → If you don't see it, it may be hidden or positioned incorrectly")
+	else
+		print("   → Attempting to attach button now...")
+		AttachButton()
+		if scanButton then
+			print("   ✓ Button attached successfully!")
+		else
+			print("   ❌ Button attachment failed (check debug logs)")
+		end
+	end
+	print(" ")
+	print("=== End Diagnostic ===")
+	print("Run '/sf debug show' to see detailed logs")
+end
+
+-- Force button attachment (for troubleshooting)
+-- Can be called via /run SF.CraftingOrdersScan:ForceAttach()
+function COS:ForceAttach()
+	print("Forcing button attachment...")
+	
+	-- Remove existing button if any
+	if scanButton then
+		print("Removing existing button...")
+		RemoveButton()
+	end
+	
+	-- Attempt to attach
+	AttachButton()
+	
+	if scanButton then
+		print("✓ Button attached successfully!")
+		print("Button should be visible next to the Search button.")
+	else
+		print("❌ Button attachment failed!")
+		print("Run SF.CraftingOrdersScan:Diagnose() for details")
+	end
 end
