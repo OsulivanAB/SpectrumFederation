@@ -33,7 +33,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 ## [0.5.1] - 2026-02-06
 
 ### Changed
-- Infrastructure and tooling updates (no addon code changes)
+- Updated documentation in `AGENTS.md` with branch policy reminders.
 
 ## [0.5.2] - 2026-02-05
 
