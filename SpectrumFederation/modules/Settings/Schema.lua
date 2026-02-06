@@ -11,6 +11,7 @@ SF.SettingsSchema = {
 			windowStyle = "Default",
 			fontStyle   = "Friz Quadrata",
 			fontSize    = 12,
+			enable_cross_expansion_crafting_orders_scan_button = false,
 		},
 
 		lootHelper = {

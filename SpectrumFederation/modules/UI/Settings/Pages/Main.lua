@@ -21,6 +21,19 @@ function Page:Build(panel)
     local def = {
         sections = {
             {
+                id = "general",
+                title = "General",
+                items = {
+                    {
+                        type = "checkbox",
+                        label = "Enable cross-expansion Crafting Orders scan button",
+                        tooltip = "When enabled, adds a 'Scan All' button to the Crafessions Crafting Orders UI to scan all expansion skill lines.",
+                        path = "global.enable_cross_expansion_crafting_orders_scan_button",
+                    },
+                },
+            },
+
+            {
                 id = "appearance",
                 title = "Appearance",
                 items = {

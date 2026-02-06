@@ -41,6 +41,14 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.SettingsWindow:Init()
     end
 
+    -- Initialize CraftingOrdersScan module
+    if SF.CraftingOrdersScan and SF.CraftingOrdersScan.Init then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing CraftingOrdersScan")
+        end
+        SF.CraftingOrdersScan:Init()
+    end
+
     if SF.Debug then
         SF.Debug:Info("INIT", "All modules initialized successfully")
     end
