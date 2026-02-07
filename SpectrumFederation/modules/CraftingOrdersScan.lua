@@ -187,23 +187,34 @@ end
 -- @return table|nil Initialized state, or nil on error
 -- @return string|nil Error message if failed
 local function InitializeScanState()
+	SF.Debug:Verbose(CATEGORY, "InitializeScanState: Checking if profession is open...")
+	
 	-- Verify profession is open
 	local tradeSkillLineID = C_TradeSkillUI.GetTradeSkillLine()
 	if not tradeSkillLineID then
+		SF.Debug:Error(CATEGORY, "InitializeScanState: No profession is currently open")
 		return nil, "No profession is currently open"
 	end
+	
+	SF.Debug:Verbose(CATEGORY, "InitializeScanState: tradeSkillLineID=%d", tradeSkillLineID)
 
 	-- Get current child skill line to restore later
 	local originalChildSkillLineID = C_TradeSkillUI.GetProfessionChildSkillLineID()
+	SF.Debug:Verbose(CATEGORY, "InitializeScanState: originalChildSkillLineID=%s", tostring(originalChildSkillLineID))
 
 	-- Build expansion list
+	SF.Debug:Verbose(CATEGORY, "InitializeScanState: Building child skill line list...")
 	local childSkillLineIDs, err = BuildChildSkillLineIDsForCurrentProfession()
 	if not childSkillLineIDs then
+		SF.Debug:Error(CATEGORY, "InitializeScanState: Failed to build child skill lines: %s", tostring(err))
 		return nil, err
 	end
+	SF.Debug:Verbose(CATEGORY, "InitializeScanState: Found %d child skill lines", #childSkillLineIDs)
 
 	-- Build order types list
+	SF.Debug:Verbose(CATEGORY, "InitializeScanState: Building order types list...")
 	local orderTypes = BuildOrderTypeList()
+	SF.Debug:Verbose(CATEGORY, "InitializeScanState: %d order types", #orderTypes)
 
 	-- Get profession name for logging
 	local profInfo = C_TradeSkillUI.GetProfessionInfoBySkillLineID(tradeSkillLineID)
@@ -240,6 +251,7 @@ local function InitializeScanState()
 		end
 	end
 
+	SF.Debug:Info(CATEGORY, "InitializeScanState: Successfully initialized scan state")
 	return state, nil
 end
 
@@ -344,12 +356,16 @@ end
 
 -- Request the next page in the scan sequence
 local function RequestNext()
+	SF.Debug:Verbose(CATEGORY, "RequestNext() called")
+	
 	if not scanState or not scanState.running then
+		SF.Debug:Warn(CATEGORY, "RequestNext(): scan state not running")
 		return
 	end
 
 	-- Check if we're done
 	if scanState.skillIdx > #scanState.childSkillLineIDs then
+		SF.Debug:Info(CATEGORY, "RequestNext(): All skill lines complete, finishing scan")
 		FinishScan()
 		return
 	end
@@ -359,6 +375,7 @@ local function RequestNext()
 	-- Check if done with current skill line
 	if scanState.orderIdx > #scanState.orderTypes then
 		-- Move to next skill line
+		SF.Debug:Verbose(CATEGORY, "RequestNext(): Moving to next skill line")
 		scanState.skillIdx = scanState.skillIdx + 1
 		scanState.orderIdx = 1
 		scanState.offset = 0
@@ -369,11 +386,13 @@ local function RequestNext()
 	local orderType = scanState.orderTypes[scanState.orderIdx]
 
 	-- Switch to the appropriate child skill line
+	SF.Debug:Verbose(CATEGORY, "RequestNext(): Setting child skill line to %d", skillLineID)
 	pcall(C_TradeSkillUI.SetProfessionChildSkillLineID, skillLineID)
 
 	-- Get profession enum for request
 	local childProfInfo = C_TradeSkillUI.GetChildProfessionInfo()
 	if not childProfInfo or not childProfInfo.profession then
+		SF.Debug:Error(CATEGORY, "RequestNext(): Could not get child profession info for skill line %d", skillLineID)
 		AbortScan("Could not get child profession info for skill line " .. tostring(skillLineID))
 		return
 	end
@@ -475,21 +494,38 @@ local function RequestNext()
 	}
 
 	-- Make request
-	C_CraftingOrders.RequestCrafterOrders(request)
+	SF.Debug:Info(CATEGORY, "Calling C_CraftingOrders.RequestCrafterOrders() with orderType=%d, profession=%d, offset=%d",
+		orderType, professionEnum, scanState.offset)
+	
+	local success, err = pcall(C_CraftingOrders.RequestCrafterOrders, request)
+	if not success then
+		SF.Debug:Error(CATEGORY, "RequestCrafterOrders() failed: %s", tostring(err))
+		AbortScan("RequestCrafterOrders failed: " .. tostring(err))
+		return
+	end
+	
+	SF.Debug:Verbose(CATEGORY, "RequestCrafterOrders() called successfully, waiting for callback...")
 end
 
 -- Start a new scan
 local function StartScan()
+	SF.Debug:Info(CATEGORY, "StartScan() called - button was clicked")
+	
 	-- Prevent multiple scans
 	if scanState and scanState.running then
 		SF:PrintInfo("A scan is already in progress")
+		SF.Debug:Warn(CATEGORY, "Scan already running, ignoring request")
 		return
 	end
 
+	SF:PrintInfo("Starting crafting orders scan...")
+	SF.Debug:Info(CATEGORY, "Initializing scan state...")
+	
 	-- Initialize scan state
 	local state, err = InitializeScanState()
 	if not state then
 		SF:PrintError("Cannot start scan: " .. tostring(err))
+		SF.Debug:Error(CATEGORY, "InitializeScanState failed: %s", tostring(err))
 		return
 	end
 
@@ -506,6 +542,7 @@ local function StartScan()
 	end
 
 	-- Start scan
+	SF.Debug:Info(CATEGORY, "Calling RequestNext() to begin scan...")
 	RequestNext()
 end
 
