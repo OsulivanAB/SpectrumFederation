@@ -302,6 +302,15 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if SF.Debug then
         SF.Debug:Info("SYNC", "Accepting PROFILE_SNAPSHOT from %s as %s (profile: %s)",
             tostring(sender), senderRole, tostring(payload.profileId))
+        
+        -- Debug: log incoming snapshot summary
+        local snap = payload.snapshot
+        local numMembers = (snap and snap.members and #snap.members) or 0
+        local numLogs = (snap and snap.lootLogs and #snap.lootLogs) or 0
+        local numAdmins = (snap and snap.adminUsers and #snap.adminUsers) or 0
+        local pointName = (snap and snap.pointName) or "Points"
+        SF.Debug:Info("SYNC_PROFILE", "Receiving snapshot: %d members, %d logs, %d admins, pointName=%s",
+            numMembers, numLogs, numAdmins, pointName)
     end
 
     -- Validate snapshot
@@ -365,6 +374,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
         if SF.Debug then
             SF.Debug:Info("SYNC", "Imported new profile: %s (ID: %s)", 
                 profile:GetProfileName() or "Unknown", profileId)
+        end
+    else
+        if SF.Debug then
+            SF.Debug:Info("SYNC_PROFILE", "Updated existing profile: %s (ID: %s, %d new logs)", 
+                profile:GetProfileName() or "Unknown", profileId, inserted or 0)
         end
     end
 
