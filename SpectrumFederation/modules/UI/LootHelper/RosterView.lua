@@ -374,19 +374,23 @@ function View:_LayoutButtons(r, model)
 	if model.type == "RAID_NONMEMBER" then
 		if model.canAdmin then
 			r.BtnPlus:Show()
+			r.BtnPlus:Enable()
 			Place(r.BtnPlus)
 		end
 	else
-		-- For PROFILE_MEMBER rows: helmet is visible for everyone
+		-- For PROFILE_MEMBER rows: helmet is visible and enabled for everyone (opens equipment window)
 		r.BtnHelmet:Show()
+		r.BtnHelmet:Enable()
 		Place(r.BtnHelmet)
 
-		-- Up/Down buttons are admin-only
+		-- Up/Down buttons are admin-only (hide for non-admins)
 		if model.canAdmin then
 			r.BtnDown:Show()
+			r.BtnDown:Enable()
 			Place(r.BtnDown)
 
 			r.BtnUp:Show()
+			r.BtnUp:Enable()
 			Place(r.BtnUp)
 		end
 	end

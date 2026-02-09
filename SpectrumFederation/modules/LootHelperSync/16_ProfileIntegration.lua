@@ -126,6 +126,16 @@ function Sync:BuildProfileSnapshot(profileId)
     if not profile.ExportSnapshot then return nil end
     
     local snapshot = profile:ExportSnapshot()
+    
+    -- Debug: log snapshot summary
+    if SF.Debug then
+        local numMembers = (snapshot and snapshot.members and #snapshot.members) or 0
+        local numLogs = (snapshot and snapshot.lootLogs and #snapshot.lootLogs) or 0
+        local numAdmins = (snapshot and snapshot.adminUsers and #snapshot.adminUsers) or 0
+        local pointName = (snapshot and snapshot.pointName) or "Points"
+        SF.Debug:Info("SYNC_PROFILE", "Built snapshot for %s: %d members, %d logs, %d admins, pointName=%s",
+            tostring(profileId), numMembers, numLogs, numAdmins, pointName)
+    end
 
     return {
         sessionId   = self.state.sessionId,

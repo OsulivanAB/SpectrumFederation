@@ -2,12 +2,6 @@ name: Promote Beta to Main
 
 on:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: 'Dry run mode (no actual changes)'
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -19,8 +13,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  pre-merge-validation:
-    name: Pre-Merge Validation
+  # ==========================================
+  # Phase 1: Dry Run (validation only, no pushes)
+  # ==========================================
+  dry-run-pre-merge-validation:
+    name: "[DRY RUN] Pre-Merge Validation"
     runs-on: ubuntu-latest
 
     steps:
@@ -67,10 +64,10 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
         id: beta_version
 
-  merge-beta-to-main:
-    name: Merge Beta to Main
+  dry-run-merge-beta-to-main:
+    name: "[DRY RUN] Merge Beta to Main"
     runs-on: ubuntu-latest
-    needs: pre-merge-validation
+    needs: dry-run-pre-merge-validation
     outputs:
       stable_version: ${{ steps.remove_beta.outputs.stable_version }}
       interface: ${{ steps.blizzard.outputs.interface }}
@@ -160,11 +157,349 @@ jobs:
           git commit -m "chore: update Interface to $INTERFACE [skip ci]" || echo "No Interface changes"
 
       - name: Push changes to main
-        if: ${{ !inputs.dry_run }}
+        if: false  # Dry run - skip push
+        run: git push origin main
+
+  dry-run-update-changelog-main:
+    name: "[DRY RUN] Update Changelog for Main"
+    runs-on: ubuntu-latest
+    needs: dry-run-merge-beta-to-main
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Update CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: main
+        run: |
+          python3 .github/scripts/update_changelog.py
+
+      - name: Commit changelog changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet CHANGELOG.md; then
+            echo "No changelog changes to commit"
+          else
+            git add CHANGELOG.md
+            git commit -m "docs: update changelog for ${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }} [skip ci]"
+          fi
+
+      - name: Push changelog to main
+        if: false  # Dry run - skip push
+        run: |
+          git pull --rebase origin main
+          git push
+
+  dry-run-update-readme-main:
+    name: "[DRY RUN] Update README for Main"
+    runs-on: ubuntu-latest
+    needs: [dry-run-merge-beta-to-main, dry-run-update-changelog-main]
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Update README badges
+        run: |
+          VERSION="${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}"
+          INTERFACE="${{ needs.dry-run-merge-beta-to-main.outputs.interface }}"
+
+          echo "Updating README badges:"
+          echo "  Version: $VERSION"
+          echo "  Interface: $INTERFACE"
+
+          # Escape hyphens for shields.io (- becomes --)
+          VERSION_ESCAPED="${VERSION//-/--}"
+
+          # Update version badge (match between Version- and - at end)
+          sed -i 's|badge/Version-[^)]*-brightgreen|badge/Version-'"${VERSION_ESCAPED}"'-brightgreen|g' README.md
+
+          # Update interface badge
+          sed -i "s|badge/Interface-[^-]*-|badge/Interface-${INTERFACE}-|g" README.md
+
+          # Update track badge to Retail
+          sed -i 's|badge/Track-[^-]*-|badge/Track-Retail-|g' README.md
+
+      - name: Commit badge changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet README.md; then
+            echo "No badge changes to commit"
+          else
+            git add README.md
+            git commit -m "docs: update badges for ${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }} [skip ci]"
+          fi
+
+      - name: Push README to main
+        if: false  # Dry run - skip push
+        run: |
+          git pull --rebase origin main
+          git push
+
+  dry-run-deploy-docs:
+    name: "[DRY RUN] Deploy Documentation"
+    runs-on: ubuntu-latest
+    needs: [dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main]
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: beta  # Dry run always uses beta
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install MkDocs dependencies
+        run: pip install -r requirements-docs.txt
+
+      - name: Build documentation
+        run: |
+          echo "Building documentation from beta branch (dry run)..."
+          mkdocs build --clean --strict
+          echo "Documentation build successful"
+
+      - name: Upload Pages artifact
+        if: false  # Dry run - skip upload
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: Deploy to GitHub Pages
+        if: false  # Dry run - skip deployment
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  dry-run-publish-stable-release:
+    name: "[DRY RUN] Publish Stable Release"
+    runs-on: ubuntu-latest
+    needs: [dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main, dry-run-deploy-docs]
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Package and publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/publish_release.py "${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}" --interface "${{ needs.dry-run-merge-beta-to-main.outputs.interface }}" --dry-run
+
+  dry-run-fast-forward-beta:
+    name: "[DRY RUN] Fast-Forward Beta to Main"
+    runs-on: ubuntu-latest
+    needs: [dry-run-merge-beta-to-main, dry-run-publish-stable-release]
+
+    steps:
+      - name: Checkout beta branch
+        uses: actions/checkout@v4
+        with:
+          ref: beta
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fast-forward beta to main
+        run: |
+          git fetch origin main:main
+          git rebase main
+          echo "✓ Beta rebased on main"
+
+      - name: Push fast-forwarded beta
+        if: false  # Dry run - skip push
+        run: git push origin beta
+
+      - name: Verify branches are synced
+        if: false  # Dry run - skip verification
+        run: |
+          git fetch origin
+          DIFF=$(git rev-list --count beta...main)
+
+          if [[ $DIFF -ne 0 ]]; then
+            echo "::warning ::Branches are not fully synced (diff: $DIFF commits)"
+          else
+            echo "✓ Beta and main branches are fully synced"
+          fi
+
+  dry-run-summary:
+    name: "[DRY RUN] Promotion Summary"
+    runs-on: ubuntu-latest
+    needs: [dry-run-pre-merge-validation, dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main, dry-run-deploy-docs, dry-run-publish-stable-release, dry-run-fast-forward-beta]
+    if: always()
+
+    steps:
+      - name: Summary
+        run: |
+          # Determine status emojis based on job results
+          VALIDATION_STATUS="${{ needs.dry-run-pre-merge-validation.result == 'success' && '✅' || '❌' }}"
+          MERGE_STATUS="${{ needs.dry-run-merge-beta-to-main.result == 'success' && '✅' || '❌' }}"
+          CHANGELOG_STATUS="${{ needs.dry-run-update-changelog-main.result == 'success' && '✅' || '❌' }}"
+          README_STATUS="${{ needs.dry-run-update-readme-main.result == 'success' && '✅' || '❌' }}"
+          DOCS_STATUS="${{ needs.dry-run-deploy-docs.result == 'success' && '✅' || '❌' }}"
+          RELEASE_STATUS="${{ needs.dry-run-publish-stable-release.result == 'success' && '✅' || '❌' }}"
+          FASTFORWARD_STATUS="${{ needs.dry-run-fast-forward-beta.result == 'success' && '✅' || '❌' }}"
+
+          # Determine overall status
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            TITLE="## [DRY RUN] Promotion Failed ❌"
+          elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            TITLE="## [DRY RUN] Promotion Cancelled ⚠️"
+          else
+            TITLE="## [DRY RUN] Promotion Validation Complete ✅"
+          fi
+
+          echo "$TITLE" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Stable Version**: ${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Interface Version**: ${{ needs.dry-run-merge-beta-to-main.outputs.interface }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results:" >> $GITHUB_STEP_SUMMARY
+          echo "- $VALIDATION_STATUS Pre-merge validation" >> $GITHUB_STEP_SUMMARY
+          echo "- $MERGE_STATUS Merged beta → main" >> $GITHUB_STEP_SUMMARY
+          echo "- $CHANGELOG_STATUS Updated CHANGELOG.md" >> $GITHUB_STEP_SUMMARY
+          echo "- $README_STATUS Updated README badges" >> $GITHUB_STEP_SUMMARY
+          echo "- $DOCS_STATUS Deployed documentation" >> $GITHUB_STEP_SUMMARY
+          echo "- $RELEASE_STATUS Published stable release" >> $GITHUB_STEP_SUMMARY
+          echo "- $FASTFORWARD_STATUS Fast-forwarded beta to main" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **This was a DRY RUN - all operations executed locally but no changes were pushed**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **If validation passed, the actual promotion will now proceed automatically**" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================
+  # Phase 2: Actual Promotion (only if dry run succeeds)
+  # ==========================================
+  merge-beta-to-main:
+    name: "Merge Beta to Main"
+    runs-on: ubuntu-latest
+    needs: [dry-run-summary, dry-run-merge-beta-to-main]
+    if: needs.dry-run-merge-beta-to-main.result == 'success'
+    outputs:
+      stable_version: ${{ steps.remove_beta.outputs.stable_version }}
+      interface: ${{ steps.blizzard.outputs.interface }}
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch beta branch
+        run: git fetch origin beta:beta
+
+      - name: Merge beta into main
+        run: |
+          # Merge beta into main, using 'ours' strategy for CHANGELOG.md and README.md
+          # This keeps main's versions, which will be regenerated by workflows
+          git merge -X ours --no-commit --no-ff beta
+
+          # Explicitly use beta's CHANGELOG.md, README.md, and TOC file
+          # TOC must come from beta to preserve the -beta suffix in version
+          git checkout beta -- CHANGELOG.md README.md SpectrumFederation/SpectrumFederation.toc
+
+          # Check for conflicts in other files
+          if git diff --name-only --diff-filter=U | grep -v -E '(CHANGELOG\.md|README\.md|SpectrumFederation\.toc)'; then
+            echo "::error ::Merge conflicts detected in files other than CHANGELOG.md, README.md, and .toc"
+            echo "Please resolve conflicts manually and try again"
+            git merge --abort
+            exit 1
+          fi
+
+          git commit -m "chore: promote beta to main [skip ci]"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate merged TOC version
+        run: |
+          MERGED_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+          echo "Merged TOC version: $MERGED_VERSION"
+
+          if [[ ! "$MERGED_VERSION" =~ -beta\. ]]; then
+            echo "::error ::Merged TOC version '$MERGED_VERSION' does not contain -beta suffix"
+            echo "This indicates the merge did not use beta's TOC file correctly"
+            exit 1
+          fi
+
+          echo "✓ Merged version contains -beta suffix as expected"
+
+      - name: Remove -beta suffix from version
+        id: remove_beta
+        run: |
+          BETA_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+          STABLE_VERSION=$(echo "$BETA_VERSION" | sed 's/-beta\.[0-9]*$//')
+
+          echo "Beta version: $BETA_VERSION"
+          echo "Stable version: $STABLE_VERSION"
+          echo "stable_version=$STABLE_VERSION" >> $GITHUB_OUTPUT
+
+          sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation/SpectrumFederation.toc
+          git add SpectrumFederation/SpectrumFederation.toc
+          git commit -m "chore: update version to $STABLE_VERSION [skip ci]"
+
+      - name: Query Blizzard API for live Interface version
+        id: blizzard
+        run: |
+          INTERFACE=$(python3 .github/scripts/blizzard_api.py --environment live --output interface)
+          echo "interface=$INTERFACE" >> $GITHUB_OUTPUT
+          echo "Live Interface version: $INTERFACE"
+
+      - name: Update Interface version in TOC
+        run: |
+          INTERFACE="${{ steps.blizzard.outputs.interface }}"
+          echo "Updating Interface to: $INTERFACE"
+
+          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation/SpectrumFederation.toc
+          git add SpectrumFederation/SpectrumFederation.toc
+          git commit -m "chore: update Interface to $INTERFACE [skip ci]" || echo "No Interface changes"
+
+      - name: Push changes to main
         run: git push origin main
 
   update-changelog-main:
-    name: Update Changelog for Main
+    name: "Update Changelog for Main"
     runs-on: ubuntu-latest
     needs: merge-beta-to-main
 
@@ -203,13 +538,12 @@ jobs:
           fi
 
       - name: Push changelog to main
-        if: ${{ !inputs.dry_run }}
         run: |
           git pull --rebase origin main
           git push
 
   update-readme-main:
-    name: Update README for Main
+    name: "Update README for Main"
     runs-on: ubuntu-latest
     needs: [merge-beta-to-main, update-changelog-main]
 
@@ -254,13 +588,12 @@ jobs:
           fi
 
       - name: Push README to main
-        if: ${{ !inputs.dry_run }}
         run: |
           git pull --rebase origin main
           git push
 
   deploy-docs:
-    name: Deploy Documentation
+    name: "Deploy Documentation"
     runs-on: ubuntu-latest
     needs: [merge-beta-to-main, update-changelog-main, update-readme-main]
 
@@ -268,7 +601,7 @@ jobs:
       - name: Checkout branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.dry_run && 'beta' || 'main' }}
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -280,23 +613,21 @@ jobs:
 
       - name: Build documentation
         run: |
-          echo "Building documentation from ${{ inputs.dry_run && 'beta' || 'main' }} branch..."
+          echo "Building documentation from main branch..."
           mkdocs build --clean --strict
           echo "Documentation build successful"
 
       - name: Upload Pages artifact
-        if: ${{ !inputs.dry_run }}
         uses: actions/upload-pages-artifact@v3
         with:
           path: site/
 
       - name: Deploy to GitHub Pages
-        if: ${{ !inputs.dry_run }}
         id: deployment
         uses: actions/deploy-pages@v4
 
   publish-stable-release:
-    name: Publish Stable Release
+    name: "Publish Stable Release"
     runs-on: ubuntu-latest
     needs: [merge-beta-to-main, update-changelog-main, update-readme-main, deploy-docs]
 
@@ -315,14 +646,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
-          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
-            python3 .github/scripts/publish_release.py "${{ needs.merge-beta-to-main.outputs.stable_version }}" --interface "${{ needs.merge-beta-to-main.outputs.interface }}" --dry-run
-          else
-            python3 .github/scripts/publish_release.py "${{ needs.merge-beta-to-main.outputs.stable_version }}" --interface "${{ needs.merge-beta-to-main.outputs.interface }}"
-          fi
+          python3 .github/scripts/publish_release.py "${{ needs.merge-beta-to-main.outputs.stable_version }}" --interface "${{ needs.merge-beta-to-main.outputs.interface }}"
 
   fast-forward-beta:
-    name: Fast-Forward Beta to Main
+    name: "Fast-Forward Beta to Main"
     runs-on: ubuntu-latest
     needs: [merge-beta-to-main, publish-stable-release]
 
@@ -346,11 +673,9 @@ jobs:
           echo "✓ Beta rebased on main"
 
       - name: Push fast-forwarded beta
-        if: ${{ !inputs.dry_run }}
         run: git push origin beta
 
       - name: Verify branches are synced
-        if: ${{ !inputs.dry_run }}
         run: |
           git fetch origin
           DIFF=$(git rev-list --count beta...main)
@@ -361,17 +686,16 @@ jobs:
             echo "✓ Beta and main branches are fully synced"
           fi
 
-  summary:
-    name: Promotion Summary
+  final-summary:
+    name: "Final Promotion Summary"
     runs-on: ubuntu-latest
-    needs: [pre-merge-validation, merge-beta-to-main, update-changelog-main, update-readme-main, deploy-docs, publish-stable-release, fast-forward-beta]
+    needs: [merge-beta-to-main, update-changelog-main, update-readme-main, deploy-docs, publish-stable-release, fast-forward-beta]
     if: always()
 
     steps:
       - name: Summary
         run: |
           # Determine status emojis based on job results
-          VALIDATION_STATUS="${{ needs.pre-merge-validation.result == 'success' && '✅' || '❌' }}"
           MERGE_STATUS="${{ needs.merge-beta-to-main.result == 'success' && '✅' || '❌' }}"
           CHANGELOG_STATUS="${{ needs.update-changelog-main.result == 'success' && '✅' || '❌' }}"
           README_STATUS="${{ needs.update-readme-main.result == 'success' && '✅' || '❌' }}"
@@ -394,15 +718,9 @@ jobs:
           echo "**Interface Version**: ${{ needs.merge-beta-to-main.outputs.interface }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Job Results:" >> $GITHUB_STEP_SUMMARY
-          echo "- $VALIDATION_STATUS Pre-merge validation" >> $GITHUB_STEP_SUMMARY
           echo "- $MERGE_STATUS Merged beta → main" >> $GITHUB_STEP_SUMMARY
           echo "- $CHANGELOG_STATUS Updated CHANGELOG.md" >> $GITHUB_STEP_SUMMARY
           echo "- $README_STATUS Updated README badges" >> $GITHUB_STEP_SUMMARY
           echo "- $DOCS_STATUS Deployed documentation" >> $GITHUB_STEP_SUMMARY
           echo "- $RELEASE_STATUS Published stable release" >> $GITHUB_STEP_SUMMARY
           echo "- $FASTFORWARD_STATUS Fast-forwarded beta to main" >> $GITHUB_STEP_SUMMARY
-
-          if [[ "${{ inputs.dry_run }}" == "true" ]]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "⚠️ **This was a DRY RUN - all operations executed locally but no changes were pushed**" >> $GITHUB_STEP_SUMMARY
-          fi

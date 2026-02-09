@@ -773,6 +773,8 @@ function LootProfile:AddAdminMemberId(memberId)
     
     if SF.Debug then
         SF.Debug:Info("LootProfile", "Successfully added admin: %s", tostring(memberId))
+        SF.Debug:Info("ADMIN_STATUS", "User %s granted admin in profile %s", 
+            tostring(memberId), tostring(self._profileName))
     end
     
     return true
@@ -821,6 +823,12 @@ function LootProfile:RemoveAdminMemberId(memberId)
                 end
             end
             
+            if SF.Debug then
+                SF.Debug:Info("LootProfile", "Removed admin: %s", tostring(memberId))
+                SF.Debug:Info("ADMIN_STATUS", "User %s admin revoked in profile %s", 
+                    tostring(memberId), tostring(self._profileName))
+            end
+            
             return true
         end
     end
@@ -843,7 +851,7 @@ function LootProfile:ExportMeta()
     }
 end
 
--- Function Export a full profile snapshot (meta + admins + logs) as a network-safe table
+-- Function Export a full profile snapshot (meta + admins + logs + members + settings) as a network-safe table
 -- @param none
 -- @return table snapshot
 function LootProfile:ExportSnapshot()
@@ -851,12 +859,21 @@ function LootProfile:ExportSnapshot()
     for i, log in ipairs(self._lootLogs or {}) do
         logsOut[i] = log:ToTable()
     end
+    
+    local membersOut = {}
+    for i, member in ipairs(self._members or {}) do
+        if member and type(member.ToTable) == "function" then
+            membersOut[i] = member:ToTable()
+        end
+    end
 
     return {
         version         = PROFILE_SNAPSHOT_VERSION,
         meta            = self:ExportMeta(),
         adminUsers      = CopyArray(self._adminUsers),
-        lootLogs       = logsOut,
+        lootLogs        = logsOut,
+        members         = membersOut,
+        pointName       = self._pointName or "Points",
     }
 end
 
@@ -899,6 +916,16 @@ function LootProfile.ValidateSnapshot(snapshot)
     end
 
     if type(snapshot.lootLogs) ~= "table" then return false, "snapshot.logs must be a table" end
+    
+    -- Validate optional members array (new in this version)
+    if snapshot.members ~= nil then
+        if type(snapshot.members) ~= "table" then return false, "snapshot.members must be a table or nil" end
+    end
+    
+    -- Validate optional pointName (new in this version)
+    if snapshot.pointName ~= nil then
+        if type(snapshot.pointName) ~= "string" then return false, "snapshot.pointName must be a string or nil" end
+    end
 
     return true, nil
 end
@@ -908,6 +935,8 @@ end
 --  - If self has no profileId yet, adopt snapshot meta.
 --  - If self has a different profileId, reject.
 --  - Replace adminUsers with snapshot adminUsers (authoritative list for now)
+--  - Replace members with snapshot members (if provided)
+--  - Replace pointName with snapshot pointName (if provided)
 --  - Merge logs idempotently (dedupe by logId).
 -- @param table snapshot Profile snapshot table
 -- @param opts table|nil optional:
@@ -937,6 +966,35 @@ function LootProfile:ImportSnapshot(snapshot, opts)
     self._adminUsers = CopyArray(snapshot.adminUsers)
 
     self:_EnsureOwnerIsAdmin()
+    
+    -- Import members (if provided in snapshot)
+    if type(snapshot.members) == "table" then
+        self._members = {}
+        for _, memberData in ipairs(snapshot.members) do
+            if type(memberData) == "table" then
+                local m = nil
+                if SF.Member and type(SF.Member.FromTable) == "function" then
+                    m = SF.Member.FromTable(memberData)
+                end
+                if m then
+                    table.insert(self._members, m)
+                end
+            end
+        end
+        
+        if SF.Debug then
+            SF.Debug:Info("LootProfile", "Imported %d members from snapshot", #self._members)
+        end
+    end
+    
+    -- Import pointName (if provided in snapshot)
+    if type(snapshot.pointName) == "string" then
+        self._pointName = snapshot.pointName
+        
+        if SF.Debug then
+            SF.Debug:Info("LootProfile", "Imported pointName: %s", self._pointName)
+        end
+    end
 
     -- Merge Logs
     local inserted = self:MergeLogTables(snapshot.lootLogs, opts)

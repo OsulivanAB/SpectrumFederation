@@ -9,6 +9,11 @@ These instructions guide GitHub Copilot coding agent and VS Code Agent Mode for 
 - **Do not bypass CI:** never change workflows/checks to “make it green.”
 - **WoW Lua only:** Lua 5.1 sandbox (no `io`, `os`, Lua 5.2+ features).
 
+## Branch policy (Copilot + agents)
+- **All Copilot coding agent work MUST start from `beta` and open a PR targeting `beta`.**
+- Do not open PRs to `main`. `main` is release-only.
+- When starting an agent task (Agents tab/panel or “Assign to Copilot”), **select `beta` as the base branch**.
+
 ## Project layout (where things go)
 - Runtime addon code is under `SpectrumFederation/` (this is what gets packaged).
 - Load order matters. **Any new Lua file must be added to** `SpectrumFederation/SpectrumFederation.toc` in dependency order.
