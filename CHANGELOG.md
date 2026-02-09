@@ -31,17 +31,10 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.3-beta.1] - 2026-02-08
-
-### Added
-- Support for syncing member data and profile settings, including point name, via snapshots.
-- Debug logs now provide detailed summaries of profile snapshots during sync operations.
+## [0.5.3-beta.1] - 2026-02-09
 
 ### Changed
-- Admin-only UI elements in the roster view are now gated properly and enabled/disabled based on permissions.
-
-### Fixed
-- Resolved incomplete profile sync issues, ensuring member data and settings are correctly imported and exported.
+- Updated release workflow to always perform a dry-run before promoting beta to main.
 
 ## [0.5.1] - 2026-02-06
 
