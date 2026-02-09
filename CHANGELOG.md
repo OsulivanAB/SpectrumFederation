@@ -31,10 +31,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.3-beta.1] - 2026-02-09
+
+## [0.5.3] - 2026-02-09
 
 ### Changed
-- Updated release workflow to always perform a dry-run before promoting beta to main.
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.5.1] - 2026-02-06
 
