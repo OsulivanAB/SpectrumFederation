@@ -34,15 +34,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.4-beta.1] - 2026-02-11
 
-### Fixed
-- Corrected version format in `.toc` file to prevent beta promotion failures.
-
-## [0.5.4-beta-1] - 2026-02-11
+## [0.5.4] - 2026-02-11
 
 ### Changed
-- Updated addon interface version to 120001 for compatibility with the latest World of Warcraft patch.
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.5.3] - 2026-02-09
 
