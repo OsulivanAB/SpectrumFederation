@@ -182,9 +182,10 @@ function SF:RehydrateLootHelperDB()
 					elseif type(m._identifier) == "string" and m._identifier ~= "" then
 						return m._identifier
 					else
-						-- No valid identifier - log warning and return nil
+						-- No valid identifier - log warning with member details
 						if SF.Debug then
-							SF.Debug:Warn("DATABASE", "Member has no valid identifier, skipping")
+							SF.Debug:Warn("DATABASE", "Member has no valid identifier, skipping (type=%s, has_id=%s, has__id=%s)",
+								type(m), tostring(m.identifier ~= nil), tostring(m._identifier ~= nil))
 						end
 						return nil
 					end
@@ -214,8 +215,15 @@ function SF:RehydrateLootHelperDB()
 						local memberId = GetMemberId(m)
 						if memberId then
 							arrayProcessed[memberId] = true
+							if SF.Debug then
+								SF.Debug:Verbose("DATABASE", "Array member[%d]: %s", i, memberId)
+							end
 						end
 					end
+				end
+				
+				if SF.Debug and memberCount > 0 then
+					SF.Debug:Info("DATABASE", "Processed %d members via array iteration (ipairs)", memberCount)
 				end
 				
 				-- Fallback: if we found fewer members via ipairs than total keys, there are map entries
@@ -224,14 +232,17 @@ function SF:RehydrateLootHelperDB()
 					if SF.Debug then
 						SF.Debug:Warn("DATABASE", "Profile %s has members stored as map (not array), migrating...",
 							tostring(profile._profileName or profile._profileId))
+						SF.Debug:Warn("DATABASE", "Migration triggered: arrayCount=%d, memberCount=%d, totalKeys=%d",
+							arrayCount, memberCount, totalKeys)
 					end
 					
 					-- Build array from all entries using pairs (includes both array and map entries)
 					local memberArray = {}
 					local processed = {}
+					local mapOnlyCount = 0
 					
 					-- Process all entries (both array indices and string keys)
-					for _, m in pairs(profile._members) do
+					for k, m in pairs(profile._members) do
 						if type(m) == "table" then
 							local memberId = GetMemberId(m)
 							
@@ -242,9 +253,23 @@ function SF:RehydrateLootHelperDB()
 								end
 								table.insert(memberArray, m)
 								processed[memberId] = true
-								-- Only increment if this is a new member (not already counted via ipairs)
-								if not arrayProcessed[memberId] then
+								
+								-- Track whether this is a new map-only member
+								local isMapOnly = not arrayProcessed[memberId]
+								if isMapOnly then
 									memberCount = memberCount + 1
+									mapOnlyCount = mapOnlyCount + 1
+									if SF.Debug then
+										SF.Debug:Info("DATABASE", "Map-only member found (key=%s): %s", tostring(k), memberId)
+									end
+								end
+							elseif not memberId then
+								if SF.Debug then
+									SF.Debug:Warn("DATABASE", "Skipping member with invalid ID at key: %s", tostring(k))
+								end
+							else
+								if SF.Debug then
+									SF.Debug:Verbose("DATABASE", "Duplicate member skipped (key=%s): %s", tostring(k), memberId)
 								end
 							end
 						end
@@ -254,7 +279,8 @@ function SF:RehydrateLootHelperDB()
 					profile._members = memberArray
 					
 					if SF.Debug then
-						SF.Debug:Info("DATABASE", "Migrated to array format, total %d members", #memberArray)
+						SF.Debug:Info("DATABASE", "Migration complete: %d total members (%d from array, %d from map-only)",
+							#memberArray, memberCount - mapOnlyCount, mapOnlyCount)
 					end
 				end
 			end
