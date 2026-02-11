@@ -174,10 +174,113 @@ function SF:RehydrateLootHelperDB()
 
 			-- Restore Member methods
 			if type(profile._members) == "table" and self.Member then
+				-- Helper function to extract member ID for deduplication
+				-- Returns nil if no valid identifier found (member will be skipped)
+				local function GetMemberId(m)
+					if type(m.identifier) == "string" and m.identifier ~= "" then
+						return m.identifier
+					elseif type(m._identifier) == "string" and m._identifier ~= "" then
+						return m._identifier
+					else
+						-- No valid identifier - log warning with member details
+						if SF.Debug then
+							SF.Debug:Warn("DATABASE", "Member has no valid identifier, skipping (type=%s, has_identifier=%s, has__identifier=%s)",
+								type(m), tostring(m.identifier ~= nil), tostring(m._identifier ~= nil))
+						end
+						return nil
+					end
+				end
+				
+				-- Debug: check what type of structure _members is
+				local arrayCount = #profile._members
+				local totalKeys = 0
+				for _ in pairs(profile._members) do
+					totalKeys = totalKeys + 1
+				end
+				
+				if SF.Debug and totalKeys > 0 then
+					SF.Debug:Verbose("DATABASE", "Profile %s _members structure: arrayLen=%d, totalKeys=%d",
+						tostring(profile._profileName or profile._profileId), arrayCount, totalKeys)
+				end
+				
+				-- Try array iteration first (normal case)
+				local arrayProcessed = {}
 				for i, m in ipairs(profile._members) do
-					if type(m) == "table" and getmetatable(m) ~= self.Member then
-						setmetatable(m, self.Member)
-						memberCount = memberCount + 1
+					if type(m) == "table" then
+						if getmetatable(m) ~= self.Member then
+							setmetatable(m, self.Member)
+							memberCount = memberCount + 1
+						end
+						-- Track which members were found in array (using member ID)
+						local memberId = GetMemberId(m)
+						if memberId then
+							arrayProcessed[memberId] = true
+							if SF.Debug then
+								SF.Debug:Verbose("DATABASE", "Array member[%d]: %s", i, memberId)
+							end
+						end
+					end
+				end
+				
+				if SF.Debug and memberCount > 0 then
+					SF.Debug:Info("DATABASE", "Processed %d members via array iteration (ipairs)", memberCount)
+				end
+				
+				-- Fallback: if we found fewer members via ipairs than total keys, there are map entries
+				-- This handles legacy data that might have been stored as a map
+				if memberCount < totalKeys then
+					if SF.Debug then
+						SF.Debug:Warn("DATABASE", "Profile %s has members stored as map (not array), migrating...",
+							tostring(profile._profileName or profile._profileId))
+						SF.Debug:Warn("DATABASE", "Migration triggered: arrayCount=%d, memberCount=%d, totalKeys=%d",
+							arrayCount, memberCount, totalKeys)
+					end
+					
+					-- Build array from all entries using pairs (includes both array and map entries)
+					local memberArray = {}
+					local processed = {}
+					local mapOnlyCount = 0
+					
+					-- Process all entries (both array indices and string keys)
+					for k, m in pairs(profile._members) do
+						if type(m) == "table" then
+							local memberId = GetMemberId(m)
+							
+							-- Only process if we have a valid ID and haven't seen this member yet
+							if memberId and not processed[memberId] then
+								if getmetatable(m) ~= self.Member then
+									setmetatable(m, self.Member)
+								end
+								table.insert(memberArray, m)
+								processed[memberId] = true
+								
+								-- Track whether this is a new map-only member
+								local isMapOnly = not arrayProcessed[memberId]
+								if isMapOnly then
+									memberCount = memberCount + 1
+									mapOnlyCount = mapOnlyCount + 1
+									if SF.Debug then
+										SF.Debug:Info("DATABASE", "Map-only member found (key=%s): %s", tostring(k), memberId)
+									end
+								end
+							elseif not memberId then
+								if SF.Debug then
+									SF.Debug:Warn("DATABASE", "Skipping member with invalid ID at key: %s", tostring(k))
+								end
+							else
+								if SF.Debug then
+									SF.Debug:Verbose("DATABASE", "Duplicate member skipped (key=%s): %s", tostring(k), memberId)
+								end
+							end
+						end
+					end
+					
+					-- Replace with cleaned array
+					profile._members = memberArray
+					
+					if SF.Debug then
+						SF.Debug:Info("DATABASE", "Migration complete: %d total members (%d from array, %d from map-only)",
+							#memberArray, memberCount - mapOnlyCount, mapOnlyCount)
 					end
 				end
 			end
