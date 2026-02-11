@@ -419,7 +419,7 @@ jobs:
     steps:
       - name: Log phase transition
         run: |
-          echo "::notice ::🚀 DRY RUN PASSED - Starting actual promotion to main"
+          echo "::notice::🚀 DRY RUN PASSED - Starting actual promotion to main"
           echo "## 🚀 Actual Promotion Phase Started" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "The dry run validation passed successfully. Now performing the actual promotion..." >> $GITHUB_STEP_SUMMARY
@@ -653,7 +653,7 @@ jobs:
     steps:
       - name: Log release creation
         run: |
-          echo "::notice ::📦 Creating stable release v${{ needs.merge-beta-to-main.outputs.stable_version }}"
+          echo "::notice::📦 Creating stable release v${{ needs.merge-beta-to-main.outputs.stable_version }}"
           echo "## 📦 Creating Stable GitHub Release" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Version:** ${{ needs.merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
@@ -678,7 +678,7 @@ jobs:
 
       - name: Confirm release published
         run: |
-          echo "::notice ::✅ Release v${{ needs.merge-beta-to-main.outputs.stable_version }} published successfully"
+          echo "::notice::✅ Release v${{ needs.merge-beta-to-main.outputs.stable_version }} published successfully"
           echo "## ✅ Release Published" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Stable release **v${{ needs.merge-beta-to-main.outputs.stable_version }}** has been created and published." >> $GITHUB_STEP_SUMMARY
