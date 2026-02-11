@@ -205,12 +205,17 @@ function SF:RehydrateLootHelperDB()
 				-- Try array iteration first (normal case)
 				local arrayProcessed = {}
 				for i, m in ipairs(profile._members) do
-					if type(m) == "table" and getmetatable(m) ~= self.Member then
-						setmetatable(m, self.Member)
-						memberCount = memberCount + 1
+					if type(m) == "table" then
+						if getmetatable(m) ~= self.Member then
+							setmetatable(m, self.Member)
+							memberCount = memberCount + 1
+						end
+						-- Track which members were found in array (using member ID)
+						local memberId = GetMemberId(m)
+						if memberId then
+							arrayProcessed[memberId] = true
+						end
 					end
-					-- Track which members were found in array
-					arrayProcessed[m] = true
 				end
 				
 				-- Fallback: if we found fewer members via ipairs than total keys, there are map entries
@@ -238,7 +243,7 @@ function SF:RehydrateLootHelperDB()
 								table.insert(memberArray, m)
 								processed[memberId] = true
 								-- Only increment if this is a new member (not already counted via ipairs)
-								if not arrayProcessed[m] then
+								if not arrayProcessed[memberId] then
 									memberCount = memberCount + 1
 								end
 							end
