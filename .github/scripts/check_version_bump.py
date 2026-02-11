@@ -21,6 +21,41 @@ def extract_version(toc_content):
     return None
 
 
+def validate_version_format(version, base_ref):
+    """
+    Validate version format for the target branch.
+    
+    Args:
+        version: Version string to validate
+        base_ref: Target branch name (e.g., 'beta', 'main')
+    
+    Returns:
+        tuple: (is_valid, error_message)
+    """
+    if base_ref == "beta":
+        # Beta versions must follow format: X.Y.Z-beta.N
+        # Examples: 0.5.4-beta.1, 1.0.0-beta.2
+        beta_pattern = re.compile(r'^\d+\.\d+\.\d+-beta\.\d+$')
+        if not beta_pattern.match(version):
+            return False, (
+                f"Beta version '{version}' does not match required format 'X.Y.Z-beta.N'\n"
+                f"          Examples: 0.5.4-beta.1, 1.0.0-beta.2\n"
+                f"          Note: Use a period (.) before the beta number, not a hyphen (-)"
+            )
+    elif base_ref == "main":
+        # Main versions must be stable: X.Y.Z
+        # Examples: 0.5.4, 1.0.0
+        stable_pattern = re.compile(r'^\d+\.\d+\.\d+$')
+        if not stable_pattern.match(version):
+            return False, (
+                f"Main branch version '{version}' must be stable format 'X.Y.Z'\n"
+                f"          Examples: 0.5.4, 1.0.0\n"
+                f"          Remove any -beta suffix before merging to main"
+            )
+    
+    return True, None
+
+
 def get_current_version(addon_name):
     """Get version from current TOC file."""
     toc_path = Path(addon_name) / f"{addon_name}.toc"
@@ -98,6 +133,13 @@ def main():
     
     print(f"[check-version-bump] Base ({args.base_ref}) addon version : {base_version}")
     print(f"[check-version-bump] PR branch addon version        : {current_version}")
+    
+    # Validate version format for target branch
+    is_valid, error_msg = validate_version_format(current_version, args.base_ref)
+    if not is_valid:
+        print(f"::error ::Invalid version format in {args.addon_name}/{args.addon_name}.toc")
+        print(f"          {error_msg}")
+        sys.exit(1)
     
     # Compare versions
     if current_version == base_version:
