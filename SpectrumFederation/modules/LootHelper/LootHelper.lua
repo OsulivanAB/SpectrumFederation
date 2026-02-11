@@ -175,10 +175,19 @@ function SF:RehydrateLootHelperDB()
 			-- Restore Member methods
 			if type(profile._members) == "table" and self.Member then
 				-- Helper function to extract member ID for deduplication
+				-- Returns nil if no valid identifier found (member will be skipped)
 				local function GetMemberId(m)
-					return (type(m.identifier) == "string" and m.identifier) 
-						or (type(m._identifier) == "string" and m._identifier)
-						or tostring(m)
+					if type(m.identifier) == "string" and m.identifier ~= "" then
+						return m.identifier
+					elseif type(m._identifier) == "string" and m._identifier ~= "" then
+						return m._identifier
+					else
+						-- No valid identifier - log warning and return nil
+						if SF.Debug then
+							SF.Debug:Warn("DATABASE", "Member has no valid identifier, skipping")
+						end
+						return nil
+					end
 				end
 				
 				-- Debug: check what type of structure _members is
@@ -194,11 +203,14 @@ function SF:RehydrateLootHelperDB()
 				end
 				
 				-- Try array iteration first (normal case)
+				local arrayProcessed = {}
 				for i, m in ipairs(profile._members) do
 					if type(m) == "table" and getmetatable(m) ~= self.Member then
 						setmetatable(m, self.Member)
 						memberCount = memberCount + 1
 					end
+					-- Track which members were found in array
+					arrayProcessed[m] = true
 				end
 				
 				-- Fallback: if we found fewer members via ipairs than total keys, there are map entries
@@ -218,14 +230,15 @@ function SF:RehydrateLootHelperDB()
 						if type(m) == "table" then
 							local memberId = GetMemberId(m)
 							
-							if not processed[memberId] then
+							-- Only process if we have a valid ID and haven't seen this member yet
+							if memberId and not processed[memberId] then
 								if getmetatable(m) ~= self.Member then
 									setmetatable(m, self.Member)
 								end
 								table.insert(memberArray, m)
 								processed[memberId] = true
 								-- Only increment if this is a new member (not already counted via ipairs)
-								if type(k) == "string" then
+								if not arrayProcessed[m] then
 									memberCount = memberCount + 1
 								end
 							end
