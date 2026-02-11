@@ -184,7 +184,7 @@ function SF:RehydrateLootHelperDB()
 					else
 						-- No valid identifier - log warning with member details
 						if SF.Debug then
-							SF.Debug:Warn("DATABASE", "Member has no valid identifier, skipping (type=%s, has_id=%s, has__id=%s)",
+							SF.Debug:Warn("DATABASE", "Member has no valid identifier, skipping (type=%s, has_identifier=%s, has__identifier=%s)",
 								type(m), tostring(m.identifier ~= nil), tostring(m._identifier ~= nil))
 						end
 						return nil
