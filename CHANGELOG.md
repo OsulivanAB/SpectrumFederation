@@ -33,6 +33,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.4-beta.1] - 2026-02-11
+
+### Fixed
+- Corrected version format in `.toc` file to prevent beta promotion failures.
+
 ## [0.5.4-beta-1] - 2026-02-11
 
 ### Changed
