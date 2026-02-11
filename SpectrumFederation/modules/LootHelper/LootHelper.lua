@@ -174,10 +174,51 @@ function SF:RehydrateLootHelperDB()
 
 			-- Restore Member methods
 			if type(profile._members) == "table" and self.Member then
+				-- Debug: check what type of structure _members is
+				local arrayCount = #profile._members
+				local totalKeys = 0
+				for _ in pairs(profile._members) do
+					totalKeys = totalKeys + 1
+				end
+				
+				if SF.Debug and totalKeys > 0 then
+					SF.Debug:Verbose("DATABASE", "Profile %s _members structure: arrayLen=%d, totalKeys=%d",
+						tostring(profile._profileName or profile._profileId), arrayCount, totalKeys)
+				end
+				
+				-- Try array iteration first (normal case)
 				for i, m in ipairs(profile._members) do
 					if type(m) == "table" and getmetatable(m) ~= self.Member then
 						setmetatable(m, self.Member)
 						memberCount = memberCount + 1
+					end
+				end
+				
+				-- Fallback: if array was empty but map has entries, handle map format
+				-- This handles legacy data that might have been stored as a map
+				if memberCount == 0 and totalKeys > 0 then
+					if SF.Debug then
+						SF.Debug:Warn("DATABASE", "Profile %s has members stored as map (not array), migrating...",
+							tostring(profile._profileName or profile._profileId))
+					end
+					
+					-- Convert map to array
+					local memberArray = {}
+					for k, m in pairs(profile._members) do
+						if type(m) == "table" and type(k) == "string" then
+							if getmetatable(m) ~= self.Member then
+								setmetatable(m, self.Member)
+							end
+							table.insert(memberArray, m)
+							memberCount = memberCount + 1
+						end
+					end
+					
+					-- Replace map with array
+					profile._members = memberArray
+					
+					if SF.Debug then
+						SF.Debug:Info("DATABASE", "Migrated %d members from map to array format", memberCount)
 					end
 				end
 			end
