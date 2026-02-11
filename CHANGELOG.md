@@ -36,11 +36,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.5-beta.1] - 2026-02-11
 
-### Fixed
-- Resolved an issue where member data could fail to rehydrate, causing synchronization problems.
-- Improved diagnostic logging for database rehydration to aid in debugging.
+## [0.5.5] - 2026-02-11
+
+### Changed
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.5.4] - 2026-02-11
 
