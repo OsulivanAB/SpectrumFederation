@@ -231,7 +231,7 @@ function SF:RehydrateLootHelperDB()
 					local processed = {}
 					
 					-- Process all entries (both array indices and string keys)
-					for k, m in pairs(profile._members) do
+					for _, m in pairs(profile._members) do
 						if type(m) == "table" then
 							local memberId = GetMemberId(m)
 							
