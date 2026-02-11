@@ -194,18 +194,27 @@ function SF:RehydrateLootHelperDB()
 					end
 				end
 				
-				-- Fallback: if array was empty but map has entries, handle map format
+				-- Fallback: if we found fewer members via ipairs than total keys, there are map entries
 				-- This handles legacy data that might have been stored as a map
-				if memberCount == 0 and totalKeys > 0 then
+				if memberCount < totalKeys then
 					if SF.Debug then
 						SF.Debug:Warn("DATABASE", "Profile %s has members stored as map (not array), migrating...",
 							tostring(profile._profileName or profile._profileId))
 					end
 					
-					-- Convert map to array
+					-- Build array from all entries (including any already processed)
 					local memberArray = {}
+					local processed = {}
+					
+					-- First, preserve any array entries we already found
+					for i, m in ipairs(profile._members) do
+						table.insert(memberArray, m)
+						processed[m] = true
+					end
+					
+					-- Then add any map entries
 					for k, m in pairs(profile._members) do
-						if type(m) == "table" and type(k) == "string" then
+						if type(m) == "table" and type(k) == "string" and not processed[m] then
 							if getmetatable(m) ~= self.Member then
 								setmetatable(m, self.Member)
 							end
@@ -214,11 +223,11 @@ function SF:RehydrateLootHelperDB()
 						end
 					end
 					
-					-- Replace map with array
+					-- Replace with cleaned array
 					profile._members = memberArray
 					
 					if SF.Debug then
-						SF.Debug:Info("DATABASE", "Migrated %d members from map to array format", memberCount)
+						SF.Debug:Info("DATABASE", "Migrated to array format, total %d members", #memberArray)
 					end
 				end
 			end
