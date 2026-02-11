@@ -174,6 +174,13 @@ function SF:RehydrateLootHelperDB()
 
 			-- Restore Member methods
 			if type(profile._members) == "table" and self.Member then
+				-- Helper function to extract member ID for deduplication
+				local function GetMemberId(m)
+					return (type(m.identifier) == "string" and m.identifier) 
+						or (type(m._identifier) == "string" and m._identifier)
+						or tostring(m)
+				end
+				
 				-- Debug: check what type of structure _members is
 				local arrayCount = #profile._members
 				local totalKeys = 0
@@ -202,26 +209,14 @@ function SF:RehydrateLootHelperDB()
 							tostring(profile._profileName or profile._profileId))
 					end
 					
-					-- Build array from all entries (including any already processed)
+					-- Build array from all entries using pairs (includes both array and map entries)
 					local memberArray = {}
 					local processed = {}
 					
-					-- First, preserve any array entries we already found
-					for i, m in ipairs(profile._members) do
-						table.insert(memberArray, m)
-						-- Use member identifier as key for deduplication
-						local memberId = (type(m.identifier) == "string" and m.identifier) 
-							or (type(m._identifier) == "string" and m._identifier)
-							or tostring(m)
-						processed[memberId] = true
-					end
-					
-					-- Then add any map entries that aren't already in the array
+					-- Process all entries (both array indices and string keys)
 					for k, m in pairs(profile._members) do
 						if type(m) == "table" then
-							local memberId = (type(m.identifier) == "string" and m.identifier) 
-								or (type(m._identifier) == "string" and m._identifier)
-								or tostring(m)
+							local memberId = GetMemberId(m)
 							
 							if not processed[memberId] then
 								if getmetatable(m) ~= self.Member then
@@ -229,7 +224,10 @@ function SF:RehydrateLootHelperDB()
 								end
 								table.insert(memberArray, m)
 								processed[memberId] = true
-								memberCount = memberCount + 1
+								-- Only increment if this is a new member (not already counted via ipairs)
+								if type(k) == "string" then
+									memberCount = memberCount + 1
+								end
 							end
 						end
 					end
