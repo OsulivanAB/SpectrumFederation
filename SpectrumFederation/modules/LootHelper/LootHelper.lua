@@ -209,17 +209,28 @@ function SF:RehydrateLootHelperDB()
 					-- First, preserve any array entries we already found
 					for i, m in ipairs(profile._members) do
 						table.insert(memberArray, m)
-						processed[m] = true
+						-- Use member identifier as key for deduplication
+						local memberId = (type(m.identifier) == "string" and m.identifier) 
+							or (type(m._identifier) == "string" and m._identifier)
+							or tostring(m)
+						processed[memberId] = true
 					end
 					
-					-- Then add any map entries
+					-- Then add any map entries that aren't already in the array
 					for k, m in pairs(profile._members) do
-						if type(m) == "table" and type(k) == "string" and not processed[m] then
-							if getmetatable(m) ~= self.Member then
-								setmetatable(m, self.Member)
+						if type(m) == "table" then
+							local memberId = (type(m.identifier) == "string" and m.identifier) 
+								or (type(m._identifier) == "string" and m._identifier)
+								or tostring(m)
+							
+							if not processed[memberId] then
+								if getmetatable(m) ~= self.Member then
+									setmetatable(m, self.Member)
+								end
+								table.insert(memberArray, m)
+								processed[memberId] = true
+								memberCount = memberCount + 1
 							end
-							table.insert(memberArray, m)
-							memberCount = memberCount + 1
 						end
 					end
 					
