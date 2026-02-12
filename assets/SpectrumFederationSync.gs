@@ -20,7 +20,7 @@
  */
 
 // The name of the sheet tab to update (e.g., "Sheet1", "Loot Tracker", etc.)
-// TODO: Update this to match your sheet tab name
+// TODO: Update this to match your sheet tab name (will be created if it doesn't exist)
 const SHEET_NAME = "Sheet1";
 
 // WoW class colors (hex format)

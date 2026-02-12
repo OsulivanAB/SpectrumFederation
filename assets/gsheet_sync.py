@@ -329,7 +329,7 @@ def main():
     
     print("SpectrumFederation → Google Sheets Sync (Simple)")
     print("=" * 60)
-    print(f"File: {args.file_path}")
+    print(f"File: {lua_file}")
     print(f"API: {args.api_url}")
     print("=" * 60)
     
