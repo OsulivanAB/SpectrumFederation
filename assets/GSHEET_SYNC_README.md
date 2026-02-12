@@ -20,7 +20,7 @@ A simple, no-configuration-required solution for syncing your SpectrumFederation
 2. Click **Extensions** → **Apps Script**
 3. **Delete** any default code in the editor
 4. **Copy and paste** the entire contents of `SpectrumFederationSync.gs` (in this folder)
-5. **Edit line 17** to set your sheet tab name:
+5. **Edit line 23** to set your sheet tab name:
    ```javascript
    const SHEET_NAME = "Sheet1";  // Change to your sheet name
    ```
@@ -162,7 +162,7 @@ This is normal for personal Apps Script projects.
 
 ### Change Sheet Name
 
-Edit line 17 in `SpectrumFederationSync.gs`:
+Edit line 23 in `SpectrumFederationSync.gs`:
 ```javascript
 const SHEET_NAME = "MyCustomSheetName";
 ```
