@@ -267,7 +267,7 @@ class FileWatcher:
     """Simple file watcher using modification time."""
     
     def __init__(self, file_path, callback):
-        self.file_path = Path(file_path)
+        self.file_path = Path(file_path).resolve()  # Resolve to absolute path
         self.callback = callback
         self.last_mtime = 0
         self.running = False
@@ -322,9 +322,9 @@ def main():
     args = parser.parse_args()
     
     # Validate file exists
-    lua_file = Path(args.file_path)
+    lua_file = Path(args.file_path).resolve()  # Resolve to absolute path
     if not lua_file.exists():
-        print(f"Error: File not found: {args.file_path}")
+        print(f"Error: File not found: {lua_file}")
         sys.exit(1)
     
     print("SpectrumFederation → Google Sheets Sync (Simple)")
