@@ -292,8 +292,10 @@ def get_sheet_name_from_gid(service, spreadsheet_id, gid):
         for sheet in sheets:
             if str(sheet['properties']['sheetId']) == str(gid):
                 return sheet['properties']['title']
-    except Exception:
-        pass
+    except HttpError as e:
+        print(f"Warning: Could not retrieve sheet name (using 'Sheet1'): {e.status_code} {e.error_details}")
+    except Exception as e:
+        print(f"Warning: Could not retrieve sheet name (using 'Sheet1'): {e}")
     
     return 'Sheet1'
 
@@ -307,6 +309,11 @@ def authenticate_google_sheets():
     # Check for existing token
     if token_path.exists():
         creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        # Ensure token file has restrictive permissions (owner read/write only)
+        try:
+            os.chmod(token_path, 0o600)
+        except (OSError, AttributeError):
+            pass  # Windows or permission issues
     
     # If no valid credentials, authenticate
     if not creds or not creds.valid:
@@ -332,9 +339,13 @@ def authenticate_google_sheets():
                 str(credentials_path), SCOPES)
             creds = flow.run_local_server(port=0)
         
-        # Save credentials
+        # Save credentials with restrictive permissions
         with open(token_path, 'w') as token:
             token.write(creds.to_json())
+        try:
+            os.chmod(token_path, 0o600)
+        except (OSError, AttributeError):
+            pass  # Windows or permission issues
     
     return creds
 
@@ -385,8 +396,11 @@ def update_google_sheet(service, spreadsheet_id, sheet_name, profile):
             spreadsheetId=spreadsheet_id,
             range=range_name
         ).execute()
-    except HttpError:
-        pass  # Sheet might be empty
+    except HttpError as e:
+        # 404 or similar - sheet might be empty or range doesn't exist yet
+        if e.status_code not in (404, 400):
+            print(f"Warning: Error clearing sheet: {e.status_code}")
+        pass
     
     # Write data
     body = {'values': data_rows}
@@ -608,12 +622,9 @@ def main():
     
     signal.signal(signal.SIGINT, signal_handler)
     
-    # Keep running
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        signal_handler(None, None)
+    # Keep running (signal handler will catch Ctrl+C)
+    while True:
+        time.sleep(1)
 
 
 if __name__ == '__main__':
