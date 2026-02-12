@@ -108,8 +108,9 @@ function updateSheet(data) {
     sheet = ss.insertSheet(SHEET_NAME);
   }
   
-  // Clear existing content
+  // Clear all data and formatting (blank canvas)
   sheet.clear();
+  sheet.clearFormats();
   
   const pointName = data.pointName || "Points";
   const equipmentSlots = data.equipmentSlots || [];
@@ -135,13 +136,26 @@ function updateSheet(data) {
   }
   
   // Apply formatting
-  applyFormatting(sheet, members, headers.length);
+  applyFormatting(sheet, members, headers.length, rows.length);
+  
+  // Remove unnecessary rows and columns
+  cleanupSheet(sheet, rows.length, headers.length);
 }
 
 /**
  * Apply formatting to the sheet
  */
-function applyFormatting(sheet, members, numColumns) {
+function applyFormatting(sheet, members, numColumns, numRows) {
+  // Set all columns to 100 pixels width
+  for (let i = 1; i <= numColumns; i++) {
+    sheet.setColumnWidth(i, 100);
+  }
+  
+  // Center all cells horizontally and vertically
+  const allDataRange = sheet.getRange(1, 1, numRows, numColumns);
+  allDataRange.setHorizontalAlignment('center')
+              .setVerticalAlignment('middle');
+  
   // Header row formatting: Arial 10, bold, white text, dark gray background
   const headerRange = sheet.getRange(1, 1, 1, numColumns);
   headerRange.setBackground('#434343')
@@ -173,10 +187,23 @@ function applyFormatting(sheet, members, numColumns) {
              .setFontFamily('Arial')
              .setFontSize(10)
              .setFontWeight('normal');
+}
+
+/**
+ * Remove unnecessary rows and columns from the sheet
+ */
+function cleanupSheet(sheet, numRows, numColumns) {
+  const maxRows = sheet.getMaxRows();
+  const maxColumns = sheet.getMaxColumns();
   
-  // Auto-resize columns for better display
-  for (let i = 1; i <= numColumns; i++) {
-    sheet.autoResizeColumn(i);
+  // Delete extra rows if there are any
+  if (maxRows > numRows) {
+    sheet.deleteRows(numRows + 1, maxRows - numRows);
+  }
+  
+  // Delete extra columns if there are any
+  if (maxColumns > numColumns) {
+    sheet.deleteColumns(numColumns + 1, maxColumns - numColumns);
   }
 }
 
