@@ -130,15 +130,17 @@ def parse_lua_table(content, start_pos=0):
                 try:
                     key_num = int(key)
                     if key_num != array_index:
+                        # Non-sequential index detected - convert to dict
                         is_array = False
-                        # Convert array elements to dict entries
+                        # Move existing array elements to dict with their indices as keys
                         for idx, val in enumerate(array_result, 1):
                             result[str(idx)] = val
                         array_result = []
-                        # Keep current key for storing this element
+                        # Keep key as-is (string) for storing current element in dict
                     else:
+                        # Sequential index - continue as array
                         array_index += 1
-                        # For sequential indices, clear key to use array storage
+                        # Set key=None so element goes into array_result
                         key = None
                 except ValueError:
                     is_array = False
@@ -400,7 +402,7 @@ def update_google_sheet(service, spreadsheet_id, sheet_name, profile):
         
         data_rows.append(row)
     
-    # Clear existing data
+    # Clear existing data (ignore 404/400 if sheet/range doesn't exist yet)
     range_name = f"{sheet_name}!A1:Z1000"
     try:
         service.spreadsheets().values().clear(
@@ -408,10 +410,10 @@ def update_google_sheet(service, spreadsheet_id, sheet_name, profile):
             range=range_name
         ).execute()
     except HttpError as e:
-        # 404 or similar - sheet might be empty or range doesn't exist yet
+        # 404 or 400 means sheet/range doesn't exist yet, which is fine
+        # Other errors might indicate permission or authentication issues
         if e.resp.status not in (404, 400):
             print(f"Warning: Error clearing sheet: {e.resp.status} - {e.reason}")
-        pass
     
     # Write data
     body = {'values': data_rows}
