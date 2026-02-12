@@ -1,0 +1,8 @@
+# Requirements for Google Sheets Sync Script
+# Install with: pip install -r gsheet_sync_requirements.txt
+
+google-auth>=2.0.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.0.0
+watchdog>=3.0.0
