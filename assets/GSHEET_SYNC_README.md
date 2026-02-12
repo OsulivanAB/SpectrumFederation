@@ -6,11 +6,12 @@ A simple, no-configuration-required solution for syncing your SpectrumFederation
 
 ## Features
 
-- ✅ **Zero Configuration**: No API keys, no credentials files, no OAuth setup
+- ✅ **Simple Configuration**: Edit variables at the top of the file - no command-line arguments
+- ✅ **Zero Setup**: No API keys, no credentials files, no OAuth setup
 - ✅ **Standard Library Only**: No external Python dependencies to install
 - ✅ **Real-time Sync**: Watches your saved variables file and auto-updates
 - ✅ **Professional Formatting**: Class colors, equipment status, point tracking
-- ✅ **Drop-in Ready**: Just deploy the script and go
+- ✅ **Drop-in Ready**: Just configure and run
 
 ## Quick Start
 
@@ -35,28 +36,39 @@ A simple, no-configuration-required solution for syncing your SpectrumFederation
 
 **Important**: If you update the Apps Script later, you need to create a **New deployment** (not update the existing one) for changes to take effect.
 
-### Step 2: Run the Python Script
+### Step 2: Configure and Run the Python Script
 
 **No installation required!** Uses only Python's standard library.
 
-```bash
-python3 gsheet_sync.py <path_to_lua_file> <web_app_url>
+1. **Edit the configuration** in `gsheet_sync.py`:
+   - Open the file in a text editor
+   - Find the configuration section near the top (around line 35)
+   - Set `LUA_FILE_PATH` to your saved variables file location
+   - Set `API_URL` to your Google Apps Script Web App URL
+   - Optionally set `TEST_MODE = True` for a test run
+
+2. **Run the script**:
+   ```bash
+   python3 gsheet_sync.py
+   ```
+
+**Configuration Example:**
+
+```python
+# Path to your SpectrumFederation.lua saved variables file
+LUA_FILE_PATH = r"C:\Program Files (x86)\World of Warcraft\_retail_\WTF\Account\ACCOUNT123\SavedVariables\SpectrumFederation.lua"
+
+# Your Google Apps Script Web App URL (from deployment)
+API_URL = "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec"
+
+# Test mode: Set to True to run once and exit (no file watching)
+TEST_MODE = False
 ```
 
-**Example (Windows):**
-```bash
-python3 gsheet_sync.py "C:\Program Files (x86)\World of Warcraft\_retail_\WTF\Account\ACCOUNT123\SavedVariables\SpectrumFederation.lua" "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec"
-```
-
-**Example (Mac):**
-```bash
-python3 gsheet_sync.py "/Applications/World of Warcraft/_retail_/WTF/Account/ACCOUNT123/SavedVariables/SpectrumFederation.lua" "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec"
-```
-
-**Example (Linux):**
-```bash
-python3 gsheet_sync.py "~/WoW/_retail_/WTF/Account/ACCOUNT123/SavedVariables/SpectrumFederation.lua" "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec"
-```
+**Platform-specific paths:**
+- **Windows**: `r"C:\Program Files (x86)\World of Warcraft\_retail_\WTF\Account\ACCOUNT123\SavedVariables\SpectrumFederation.lua"`
+- **Mac**: `"/Applications/World of Warcraft/_retail_/WTF/Account/ACCOUNT123/SavedVariables/SpectrumFederation.lua"`
+- **Linux**: `"/home/user/WoW/_retail_/WTF/Account/ACCOUNT123/SavedVariables/SpectrumFederation.lua"`
 
 ### Step 3: Verify It Works
 
@@ -80,11 +92,18 @@ In the Apps Script editor:
 
 ### Test the Python Script
 
-Run with `--test` flag to do one sync and exit:
+Set `TEST_MODE = True` in the configuration to do one sync and exit:
 
-```bash
-python3 gsheet_sync.py <lua_file> <api_url> --test
+```python
+TEST_MODE = True  # Run once and exit
 ```
+
+Then run:
+```bash
+python3 gsheet_sync.py
+```
+
+After testing, set it back to `False` for continuous monitoring.
 
 ## Output Format
 
@@ -171,10 +190,11 @@ Then create a **new deployment** for the change to take effect.
 
 ### Multiple Profiles
 
-Run separate instances of the Python script with different API URLs:
-- Deploy the Apps Script once per sheet
-- Each deployment gets its own URL
-- Run one Python instance per profile/sheet
+To sync multiple profiles to different sheets:
+1. Deploy the Apps Script multiple times (once per sheet)
+2. Each deployment gets its own URL
+3. Create multiple copies of `gsheet_sync.py` with different configurations
+4. Run each instance separately
 
 ### Scheduling
 

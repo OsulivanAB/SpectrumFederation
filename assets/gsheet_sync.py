@@ -13,13 +13,15 @@ Requirements:
 - No external dependencies (uses only standard library)
 
 Usage:
-    python3 gsheet_sync.py <lua_file_path> <apps_script_url>
+    1. Edit the configuration variables below
+    2. Run: python3 gsheet_sync.py
 
-Example:
-    python3 gsheet_sync.py SpectrumFederation.lua https://script.google.com/macros/s/ABC123/exec
+Configuration:
+    - Set LUA_FILE_PATH to your saved variables file location
+    - Set API_URL to your Google Apps Script web app URL
+    - Optionally set TEST_MODE to True for a single test run
 """
 
-import argparse
 import json
 import re
 import signal
@@ -28,6 +30,29 @@ import time
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+
+# ============================================================================
+# CONFIGURATION - Edit these values for your setup
+# ============================================================================
+
+# Path to your SpectrumFederation.lua saved variables file
+# Examples:
+#   Windows: r"C:\Program Files (x86)\World of Warcraft\_retail_\WTF\Account\ACCOUNT123\SavedVariables\SpectrumFederation.lua"
+#   Mac:     "/Applications/World of Warcraft/_retail_/WTF/Account/ACCOUNT123/SavedVariables/SpectrumFederation.lua"
+#   Linux:   "/home/user/WoW/_retail_/WTF/Account/ACCOUNT123/SavedVariables/SpectrumFederation.lua"
+LUA_FILE_PATH = ""
+
+# Your Google Apps Script Web App URL (from deployment)
+# Example: "https://script.google.com/macros/s/ABC123xyz/exec"
+API_URL = ""
+
+# Test mode: Set to True to run once and exit (no file watching)
+# Set to False for continuous monitoring and automatic updates
+TEST_MODE = False
+
+# ============================================================================
+# DO NOT EDIT BELOW THIS LINE
+# ============================================================================
 
 # Equipment slot order
 EQUIPMENT_SLOTS = [
@@ -303,42 +328,36 @@ class FileWatcher:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Sync SpectrumFederation data to Google Sheets (via Apps Script)'
-    )
-    parser.add_argument(
-        'file_path',
-        help='Path to the SpectrumFederation.lua saved variables file'
-    )
-    parser.add_argument(
-        'api_url',
-        help='Google Apps Script Web App URL (from deployment)'
-    )
-    parser.add_argument(
-        '--test',
-        action='store_true',
-        help='Test API connection and exit (no file watching)'
-    )
+    # Validate configuration
+    if not LUA_FILE_PATH:
+        print("Error: LUA_FILE_PATH is not configured")
+        print("Please edit the configuration section at the top of this file")
+        sys.exit(1)
     
-    args = parser.parse_args()
+    if not API_URL:
+        print("Error: API_URL is not configured")
+        print("Please edit the configuration section at the top of this file")
+        sys.exit(1)
     
     # Validate file exists
-    lua_file = Path(args.file_path).resolve()  # Resolve to absolute path
+    lua_file = Path(LUA_FILE_PATH).resolve()  # Resolve to absolute path
     if not lua_file.exists():
         print(f"Error: File not found: {lua_file}")
+        print("Please check the LUA_FILE_PATH configuration")
         sys.exit(1)
     
     print("SpectrumFederation → Google Sheets Sync (Simple)")
     print("=" * 60)
     print(f"File: {lua_file}")
-    print(f"API: {args.api_url}")
+    print(f"API: {API_URL}")
+    print(f"Test Mode: {TEST_MODE}")
     print("=" * 60)
     
     def update_sheet():
         """Parse file and send to API."""
         try:
             # Parse Lua file
-            data = parse_lua_file(args.file_path)
+            data = parse_lua_file(LUA_FILE_PATH)
             
             # Get active profile
             profile = get_active_profile(data)
@@ -351,7 +370,7 @@ def main():
             print(f"Members: {len(api_data['members'])}")
             
             # Send to API
-            result = send_to_api(args.api_url, api_data)
+            result = send_to_api(API_URL, api_data)
             print(f"✓ {result.get('message', 'Success')}")
             
         except Exception as e:
@@ -362,7 +381,7 @@ def main():
     update_sheet()
     
     # Test mode - exit after first update
-    if args.test:
+    if TEST_MODE:
         print("\nTest mode - exiting")
         return
     
