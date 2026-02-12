@@ -310,7 +310,7 @@ function Window:Create()
     local close = CreateFrame("Button", nil, title, "UIPanelCloseButton")
     close:SetPoint("RIGHT", title, "RIGHT", -4, 0)
     close:SetSize(20, 20)
-    AttachTooltip(close, "Close", "Disables LootHelper")
+    AttachTooltip(close, "Close", "In raid: Disables LootHelper\nOut of raid: Hides window until you join raid")
 
     -- Gear button
     local gear = CreateIconButton(title, "Interface\\Buttons\\UI-OptionsButton", C.ICON_BUTTON_SIZE)
