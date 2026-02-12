@@ -293,7 +293,7 @@ def get_sheet_name_from_gid(service, spreadsheet_id, gid):
             if str(sheet['properties']['sheetId']) == str(gid):
                 return sheet['properties']['title']
     except HttpError as e:
-        print(f"Warning: Could not retrieve sheet name (using 'Sheet1'): {e.status_code} {e.error_details}")
+        print(f"Warning: Could not retrieve sheet name (using 'Sheet1'): {e.resp.status} - {e.reason}")
     except Exception as e:
         print(f"Warning: Could not retrieve sheet name (using 'Sheet1'): {e}")
     
@@ -398,8 +398,9 @@ def update_google_sheet(service, spreadsheet_id, sheet_name, profile):
         ).execute()
     except HttpError as e:
         # 404 or similar - sheet might be empty or range doesn't exist yet
-        if e.status_code not in (404, 400):
-            print(f"Warning: Error clearing sheet: {e.status_code}")
+        status = e.resp.status if hasattr(e.resp, 'status') else 0
+        if status not in (404, 400):
+            print(f"Warning: Error clearing sheet: {status} - {e.reason}")
         pass
     
     # Write data
