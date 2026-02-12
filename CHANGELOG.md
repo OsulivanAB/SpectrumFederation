@@ -37,6 +37,13 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.7-beta.1] - 2026-02-12
+
+### Changed
+- Updated settings menu to open to the "Loot Helper" tab by default.
+- Removed the "General Settings" page from the settings menu.
+
 ## [0.5.5] - 2026-02-11
 
 ### Changed
