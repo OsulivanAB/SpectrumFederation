@@ -223,9 +223,12 @@ function R:Build(panel, pageDef)
 	pb:Finalize()
 
 	-- Register Store callbacks for auto-refresh when settings change externally
+	-- Note: Callbacks are not unregistered to match existing pattern (see Apply.lua).
+	-- Each panel registers its own callbacks; multiple panels watching the same path
+	-- will each receive notifications and refresh independently.
 	if SF.SettingsStore and SF.SettingsStore.RegisterCallback then
 		for path, _ in pairs(panel.__sfWatchedPaths or {}) do
-			SF.SettingsStore:RegisterCallback(path, function(newValue, oldValue, changedPath)
+			SF.SettingsStore:RegisterCallback(path, function(_newValue, _oldValue, changedPath)
 				-- Refresh the page builder when any watched setting changes
 				if pb and pb.Refresh then
 					if SF.Debug then
