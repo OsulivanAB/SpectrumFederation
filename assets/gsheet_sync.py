@@ -267,7 +267,8 @@ class FileWatcher:
     """Simple file watcher using modification time."""
     
     def __init__(self, file_path, callback):
-        self.file_path = Path(file_path).resolve()  # Resolve to absolute path
+        # Accept either string path or resolved Path object
+        self.file_path = file_path if isinstance(file_path, Path) else Path(file_path).resolve()
         self.callback = callback
         self.last_mtime = 0
         self.running = False
@@ -367,7 +368,7 @@ def main():
     
     # Set up file watching
     print("\n[Watching for changes]")
-    watcher = FileWatcher(args.file_path, update_sheet)
+    watcher = FileWatcher(lua_file, update_sheet)  # Pass already-resolved path
     
     def signal_handler(sig, frame):
         print("\n\nShutting down...")
