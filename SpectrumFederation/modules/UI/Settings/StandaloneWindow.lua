@@ -362,8 +362,6 @@ function SettingsWindow:Init()
     
     -- Define navigation structure
     self:AddNavSpacer()
-    self:AddNavPage("main", "Home")
-    self:AddNavSpacer()
     self:AddNavPage("lootHelper", "Loot Helper")
     self:AddNavPage("lootLogs", "Loot Logs")
     self:AddNavSpacer()
@@ -387,7 +385,7 @@ function SettingsWindow:Show()
     
     -- Select the first page if none selected
     if not self.currentPageId then
-        self:SelectTab("main")
+        self:SelectTab("lootHelper")
     end
 end
 
@@ -404,7 +402,7 @@ function SettingsWindow:ShowPage(pageId)
     if pageId and self.navButtons[pageId] then
         self:SelectTab(pageId)
     elseif not self.currentPageId then
-        self:SelectTab("main")
+        self:SelectTab("lootHelper")
     end
 end
 

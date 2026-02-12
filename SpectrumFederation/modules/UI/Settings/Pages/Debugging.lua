@@ -3,7 +3,6 @@ local _, SF = ...
 
 local Page = {
 	id = "debugging",
-	parentId = "main",
 	name = "Debugging",
 	order = 40,
 }
