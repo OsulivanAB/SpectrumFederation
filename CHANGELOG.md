@@ -38,6 +38,14 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [0.5.7-beta.2] - 2026-02-12
+
+### Added
+- Restored the "General" settings page with UI customization options (window style, font style, font size).
+
+### Changed
+- Settings menu now opens to the "General" tab by default.
+
 ## [0.5.7-beta.1] - 2026-02-12
 
 ### Changed
