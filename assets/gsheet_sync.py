@@ -131,7 +131,8 @@ def parse_lua_table(content, start_pos=0):
                     key_num = int(key)
                     if key_num != array_index:
                         is_array = False
-                    array_index = key_num
+                    else:
+                        array_index += 1
                 except ValueError:
                     is_array = False
         else:
