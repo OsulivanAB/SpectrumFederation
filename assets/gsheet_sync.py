@@ -131,10 +131,21 @@ def parse_lua_table(content, start_pos=0):
                     key_num = int(key)
                     if key_num != array_index:
                         is_array = False
+                        # Convert array elements to dict entries
+                        for idx, val in enumerate(array_result, 1):
+                            result[str(idx)] = val
+                        array_result = []
+                        # Keep current key for storing this element
                     else:
                         array_index += 1
+                        # For sequential indices, clear key to use array storage
+                        key = None
                 except ValueError:
                     is_array = False
+                    # Convert array elements to dict entries
+                    for idx, val in enumerate(array_result, 1):
+                        result[str(idx)] = val
+                    array_result = []
         else:
             # For array elements without explicit index
             key = None
@@ -398,9 +409,8 @@ def update_google_sheet(service, spreadsheet_id, sheet_name, profile):
         ).execute()
     except HttpError as e:
         # 404 or similar - sheet might be empty or range doesn't exist yet
-        status = e.resp.status if hasattr(e.resp, 'status') else 0
-        if status not in (404, 400):
-            print(f"Warning: Error clearing sheet: {status} - {e.reason}")
+        if e.resp.status not in (404, 400):
+            print(f"Warning: Error clearing sheet: {e.resp.status} - {e.reason}")
         pass
     
     # Write data
