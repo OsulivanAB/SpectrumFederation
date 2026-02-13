@@ -91,7 +91,7 @@ function Style:ApplyWindowStyle(frame)
             tile = true,
             tileSize = 8,
             edgeSize = 10,
-            insets = { left = 3, right = 3, top = 3, bottom = 3},
+            insets = { left = 3, right = 3, top = 3, bottom = 3 }
         })
         frame:SetBackdropColor(0, 0, 0, 0.65)
         frame:SetBackdropBorderColor(0.55, 0.55, 0.55, 0.7)
@@ -109,7 +109,7 @@ function Style:ApplyWindowStyle(frame)
             tile = true,
             tileSize = 8,
             edgeSize = 1,
-            insets = { left = 1, right = 1, top = 1, bottom = 1},
+            insets = { left = 1, right = 1, top = 1, bottom = 1 }
         })
         frame:SetBackdropColor(0, 0, 0, 0.50)
         frame:SetBackdropBorderColor(0.3, 0.3, 0.3, 0.5)
@@ -127,7 +127,7 @@ function Style:ApplyWindowStyle(frame)
             tile = true,
             tileSize = 8,
             edgeSize = 12,
-            insets = { left = 4, right = 4, top = 4, bottom = 4},
+            insets = { left = 4, right = 4, top = 4, bottom = 4 }
         })
         frame:SetBackdropColor(0, 0, 0, 0.60)
         frame:SetBackdropBorderColor(0.65, 0.65, 0.65, 0.65)
