@@ -6,6 +6,7 @@ SF.EnchantmentCheck = SF.EnchantmentCheck or {}
 local EC = SF.EnchantmentCheck
 
 -- Equipment slot IDs that can be enchanted or have sockets
+-- Head slot is included for gem socket checking but not enchantment checking
 local CHECKABLE_SLOTS = {
     [1] = "Head",
     [2] = "Neck",
@@ -61,18 +62,22 @@ local function CheckUnitGear(unit)
         if itemLink then
             -- Check for enchantments on enchantable slots
             -- Item link format: |cffffffff|Hitem:itemId:enchantId:gem1:gem2:gem3:...
+            -- Note: This assumes well-formed Blizzard item links
             if ENCHANTABLE_SLOTS[slotId] then
                 -- Extract enchant ID (4th field in item link) - use %d* to handle empty/missing enchant IDs
                 local enchantId = string.match(itemLink, '^|c%x+|Hitem:%d+:(%d*)')
                 
                 -- Check if item can be enchanted (quality and item level check)
+                -- GetItemInfo may return nil if item data isn't cached yet
                 local _, _, itemQuality, itemLevel = GetItemInfo(itemLink)
-                local canBeEnchanted = itemQuality and itemQuality >= 2 and itemLevel and itemLevel >= 1
-                
-                -- Only flag as missing if item can be enchanted but has no enchant
-                if canBeEnchanted and (not enchantId or enchantId == "" or enchantId == "0") then
-                    table.insert(missing.enchantments, slotName)
-                    hasMissing = true
+                if itemQuality and itemLevel then
+                    local canBeEnchanted = itemQuality >= 2 and itemLevel >= 1
+                    
+                    -- Only flag as missing if item can be enchanted but has no enchant
+                    if canBeEnchanted and (not enchantId or enchantId == "" or enchantId == "0") then
+                        table.insert(missing.enchantments, slotName)
+                        hasMissing = true
+                    end
                 end
             end
             

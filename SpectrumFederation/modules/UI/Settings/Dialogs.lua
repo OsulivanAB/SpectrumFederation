@@ -21,6 +21,7 @@ if not StaticPopupDialogs[KEY] then
         preferredIndex = 3,
 
         OnAccept = function(_, data)
+            -- Support both old function format and new table format for backward compatibility
             if type(data) == "function" then
                 data()
             elseif type(data) == "table" and type(data.onAccept) == "function" then
@@ -39,7 +40,7 @@ end
 -- @param message string Message text to display
 -- @param acceptText string|nil Text for accept button (defaults to OKAY)
 -- @param onAccept function|nil Callback function called if user accepts
--- @param onCancel function|nil Callback function called if user cancels
+-- @param onCancel function|nil Callback function called if user cancels (optional)
 -- @return boolean True if dialog was shown, false otherwise
 function Dialogs:Confirm(message, acceptText, onAccept, onCancel)
     if SF.Debug then
@@ -47,13 +48,15 @@ function Dialogs:Confirm(message, acceptText, onAccept, onCancel)
     end
     StaticPopupDialogs[KEY].button1 = acceptText or OKAY
     
-    -- Store the cancel callback in the data if provided
-    local data = onAccept
+    -- Use table structure if onCancel is provided, otherwise maintain backward compatibility
+    local data
     if onCancel then
         data = {
             onAccept = onAccept,
             onCancel = onCancel
         }
+    else
+        data = onAccept  -- Backward compatible: pass function directly
     end
     
     local popup = StaticPopup_Show(KEY, message, nil, data)
