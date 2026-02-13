@@ -195,7 +195,7 @@ function EC:AwardPreparednessPoints(missingData, inspectorName)
             
             -- If member is NOT in the missing list, they're fully prepared
             if not missingData[fullName] then
-                local member = profile:GetMemberByIdentifier(fullName)
+                local member = profile:GetMemberByID(fullName)
                 if member then
                     -- Increment their points
                     member:IncrementPoints()
