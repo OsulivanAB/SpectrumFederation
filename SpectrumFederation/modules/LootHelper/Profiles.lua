@@ -512,7 +512,7 @@ function LootProfile:AddLootLog(lootLog)
             local broadcastOk, broadcastErr = SF.LootHelperSync:BroadcastNewLog(self:GetProfileId(), lootLog:ToTable())
             if not broadcastOk then
                 if SF.PrintWarning then
-                    SF:PrintWarning("Failed to broadcast change: " .. tostring(broadcastErr or "unknown error"))
+                    SF:PrintWarning("Change saved locally but not synced to raid: " .. tostring(broadcastErr or "unknown error"))
                 end
             end
         end
