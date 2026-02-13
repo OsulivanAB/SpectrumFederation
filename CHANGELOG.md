@@ -38,6 +38,18 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.7-beta.2] - 2026-02-13
+
+### Added
+- Auto-refresh functionality for settings UI when external changes are detected.
+
+### Changed
+- Context-aware behavior for the close button in the Loot Helper window:
+  - In raid: Disables Loot Helper completely.
+  - Out of raid: Hides the window outside raids only.
+- Updated tooltip for the close button to reflect new behavior.
+
 ## [0.5.7-beta.1] - 2026-02-12
 
 ### Changed
