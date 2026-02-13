@@ -338,7 +338,7 @@ function Sync:_FailRequest(req, reason)
     end
 
     if SF.PrintWarning then
-        local guidance = "Sync will keep retrying as session updates arrive."
+        local guidance = "Synchronization request did not complete."
         if req.kind == "NEED_PROFILE" then
             guidance = "Profile sync is still in progress; keep raid session active and it will retry automatically."
         elseif req.kind == "NEED_LOGS" then
