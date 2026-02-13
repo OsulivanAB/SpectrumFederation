@@ -66,7 +66,7 @@ function LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES
     end
 
     -- Validate change type by checking if the passed value matches valid constants
-    if changeType ~= POINT_CHANGE_TYPES.INCREMENT and changeType ~= POINT_CHANGE_TYPES.DECREMENT then
+    if changeType ~= POINT_CHANGE_TYPES.INCREMENT and changeType ~= POINT_CHANGE_TYPES.DECREMENT and changeType ~= POINT_CHANGE_TYPES.PREPARED then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Invalid point change type in log for member %s: %s", tostring(memberID), tostring(changeType))
         end

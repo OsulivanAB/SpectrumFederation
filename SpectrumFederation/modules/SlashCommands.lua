@@ -376,4 +376,49 @@ function SF:RegisterLootHelperSlashCommands()
             end
         end
     end, "Enable Loot Helper or manage sessions (/sf loot session start|end)")
+    
+    -- Check for missing enchantments and gems
+    SF:RegisterSlashCommand("enchantcheck", function()
+        -- Check admin permissions
+        local profile = SF:GetActiveProfile()
+        if not profile then
+            SF:PrintError("No active profile set. Create or switch to a profile first.")
+            return
+        end
+        
+        if not profile:IsCurrentUserAdmin() then
+            SF:PrintError("You must be an admin to run enchantment checks")
+            return
+        end
+        
+        -- Check if in raid
+        if not IsInRaid() then
+            SF:PrintError("You must be in a raid to run enchantment checks")
+            return
+        end
+        
+        -- Show dialog asking if this is pre-raid or raid has started
+        if not (SF.SettingsUI and SF.SettingsUI.Dialogs and SF.EnchantmentCheck) then
+            SF:PrintError("Enchantment check system not available")
+            return
+        end
+        
+        SF.SettingsUI.Dialogs:Confirm(
+            "Has the raid already started?\n\nClick OK if raid has started (will assign points).\nClick Cancel if this is a pre-raid check (will whisper players).",
+            "Raid Started",
+            function()
+                -- Raid has started - assign points
+                SF.EnchantmentCheck:RunEnchantmentCheck(true)
+            end
+        )
+        
+        -- Store the cancel handler temporarily
+        local oldOnCancel = StaticPopupDialogs["SF_SETTINGS_CONFIRM"].OnCancel
+        StaticPopupDialogs["SF_SETTINGS_CONFIRM"].OnCancel = function(self, data)
+            -- Pre-raid check - whisper players
+            SF.EnchantmentCheck:RunEnchantmentCheck(false)
+            -- Restore original handler
+            StaticPopupDialogs["SF_SETTINGS_CONFIRM"].OnCancel = oldOnCancel
+        end
+    end, "Check raid members for missing enchantments and gems (admin only)")
 end
