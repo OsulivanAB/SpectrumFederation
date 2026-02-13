@@ -5,6 +5,9 @@ local addonName, SF = ...
 SF.EnchantmentCheck = SF.EnchantmentCheck or {}
 local EC = SF.EnchantmentCheck
 
+-- Minimum item quality required for enchantments (2 = Uncommon)
+local MIN_ENCHANTABLE_QUALITY = 2
+
 -- Equipment slot IDs that can be enchanted or have sockets
 -- Head slot is included for gem socket checking but not enchantment checking
 local CHECKABLE_SLOTS = {
@@ -71,7 +74,7 @@ local function CheckUnitGear(unit)
                 -- GetItemInfo may return nil if item data isn't cached yet
                 local _, _, itemQuality, itemLevel = GetItemInfo(itemLink)
                 if itemQuality and itemLevel then
-                    local canBeEnchanted = itemQuality >= 2 and itemLevel >= 1
+                    local canBeEnchanted = itemQuality >= MIN_ENCHANTABLE_QUALITY and itemLevel >= 1
                     
                     -- Only flag as missing if item can be enchanted but has no enchant
                     if canBeEnchanted and (not enchantId or enchantId == "" or enchantId == "0") then
@@ -257,4 +260,3 @@ function EC:RunEnchantmentCheck(raidStarted)
         self:WhisperMissingPlayers(missingData)
     end
 end
-
