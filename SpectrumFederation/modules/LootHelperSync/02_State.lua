@@ -24,6 +24,7 @@ Sync.cfg = Sync.cfg or {
 
     maxHelpers = 2,
     preferNoGaps = true, -- prefer helpers without log gaps when choosing helpers
+    helperWarmupSec = 2, -- for a short window after session descriptor updates, prefer coordinator first for bootstrap requests
 
     -- Request robustness
     maxOutstandingRequests  = 64,   -- hard cap to avoid unbounded memory

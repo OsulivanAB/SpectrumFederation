@@ -57,6 +57,7 @@ function Sync:HandleSessionStart(sender, payload)
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
+    self.state._sessionDescriptorAt = self:_Now()
 
     if type(payload.safeMode) == "table" then
         self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_START")
@@ -168,14 +169,25 @@ function Sync:GetRequestTargets(helpers, coordinator)
 
     -- Simplify: no need for redundant conditional assignment
     local me = self:_SelfId()
+    local warmupSec = tonumber(self.cfg.helperWarmupSec) or 0
+    local preferCoordinatorFirst = false
+    if warmupSec > 0 and type(self.state._sessionDescriptorAt) == "number" then
+        preferCoordinatorFirst = (self:_Now() - self.state._sessionDescriptorAt) <= warmupSec
+    end
 
-    -- 1) Preferred helper for *me* (deterministic)
-    local preferred = self:PickHelperForPlayer(me, helpers or {})
-    if preferred and preferred ~= me then add(preferred) end
+    if preferCoordinatorFirst then
+        if type(coordinator) == "string" and coordinator ~= "" and coordinator ~= me then
+            add(coordinator)
+        end
+    else
+        -- 1) Preferred helper for *me* (deterministic)
+        local preferred = self:PickHelperForPlayer(me, helpers or {})
+        if preferred and preferred ~= me then add(preferred) end
 
-    -- 2) Coordinator fallback
-    if type(coordinator) == "string" and coordinator ~= "" and coordinator ~= me then
-        add(coordinator)
+        -- 2) Coordinator fallback
+        if type(coordinator) == "string" and coordinator ~= "" and coordinator ~= me then
+            add(coordinator)
+        end
     end
 
     -- 3) Remaining helpers (stable order)
@@ -436,4 +448,3 @@ function Sync:SendJoinStatus()
         SF.LootHelperComm:Send("CONTROL", self.MSG.HAVE_PROFILE, payloadBase, "WHISPER", coord, "NORMAL")
     end
 end
-

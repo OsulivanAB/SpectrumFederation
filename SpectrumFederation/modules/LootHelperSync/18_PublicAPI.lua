@@ -484,6 +484,7 @@ function Sync:_ResetSessionState(reason)
     self.state._sentJoinStatusType = nil
     self.state._profileReqInFlight = nil
     self.state._sessionAnnounced = nil
+    self.state._sessionDescriptorAt = nil
 
     -- Clear gap repair cooldowns
     self.state.gapRepair = nil
@@ -705,4 +706,3 @@ function Sync:ReannounceSession()
         self:FinalizeHandshakeWindow()
     end)
 end
-
