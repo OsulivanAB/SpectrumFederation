@@ -9,9 +9,9 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ### Fixed
 - Window Style setting now properly applies visual changes to the Loot Helper window:
-  - **Default**: Standard WoW tooltip-style borders with moderate transparency
-  - **Compact**: Thinner borders and reduced spacing for a cleaner look
-  - **Minimal**: Very thin borders with higher transparency for minimal visual footprint
+  - **Default**: Standard WoW tooltip-style borders with moderate transparency.
+  - **Compact**: Thinner borders and reduced spacing for a cleaner look.
+  - **Minimal**: Very thin borders with higher transparency for minimal visual footprint.
 
 ### Changed
 - Settings menu now opens to the "General" tab by default.
