@@ -30,7 +30,6 @@ local CHECKABLE_SLOTS = {
 -- Slots that typically have enchantments in WoW
 local ENCHANTABLE_SLOTS = {
     [2] = true,   -- Neck
-    [3] = true,   -- Shoulder
     [5] = true,   -- Chest
     [7] = true,   -- Legs
     [8] = true,   -- Feet
