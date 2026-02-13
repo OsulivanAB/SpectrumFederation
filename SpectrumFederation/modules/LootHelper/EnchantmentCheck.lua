@@ -62,8 +62,8 @@ local function CheckUnitGear(unit)
             -- Check for enchantments on enchantable slots
             -- Item link format: |cffffffff|Hitem:itemId:enchantId:gem1:gem2:gem3:...
             if ENCHANTABLE_SLOTS[slotId] then
-                -- Extract enchant ID (4th field in item link)
-                local enchantId = string.match(itemLink, '^|c%x+|Hitem:%d+:(%d+)')
+                -- Extract enchant ID (4th field in item link) - use %d* to handle empty/missing enchant IDs
+                local enchantId = string.match(itemLink, '^|c%x+|Hitem:%d+:(%d*)')
                 
                 -- Check if item can be enchanted (quality and item level check)
                 local _, _, itemQuality, itemLevel = GetItemInfo(itemLink)
@@ -230,8 +230,10 @@ function EC:WhisperMissingPlayers(missingData)
         end
         
         if #issues > 0 then
+            -- Extract character name without realm for whisper
+            local nameOnly = playerName:match('^([^-]+)') or playerName
             local message = "Please prepare your gear - you have " .. table.concat(issues, " and ")
-            SendChatMessage(message, "WHISPER", nil, playerName)
+            SendChatMessage(message, "WHISPER", nil, nameOnly)
         end
     end
     
