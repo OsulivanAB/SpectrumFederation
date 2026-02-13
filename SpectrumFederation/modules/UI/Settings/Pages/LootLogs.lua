@@ -157,8 +157,13 @@ local function FormatLogEntry(log)
 	local details = ""
 	if eventType == "POINT_CHANGE" then
 		local memberColor = GetPlayerClassColor(data.member)
+		local changeText = data.change or "?"
+		-- Special display for PREPARED change type
+		if changeText == "PREPARED" then
+			changeText = "came to raid prepared"
+		end
 		details = string.format("Member: %s%s%s, Change: %s", 
-			memberColor, data.member or "?", RESET, data.change or "?")
+			memberColor, data.member or "?", RESET, changeText)
 	elseif eventType == "ARMOR_CHANGE" then
 		local memberColor = GetPlayerClassColor(data.member)
 		details = string.format("Member: %s%s%s, Slot: %s, Action: %s", 
