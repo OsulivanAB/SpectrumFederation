@@ -25,7 +25,6 @@ local CHECKABLE_SLOTS = {
 
 -- Slots that typically have enchantments in WoW
 local ENCHANTABLE_SLOTS = {
-    [1] = true,   -- Head (not always, but check)
     [2] = true,   -- Neck
     [3] = true,   -- Shoulder
     [5] = true,   -- Chest
@@ -61,13 +60,17 @@ local function CheckUnitGear(unit)
         
         if itemLink then
             -- Check for enchantments on enchantable slots
-            -- In WoW, we check the item's tooltip for enchantment info
+            -- Item link format: |cffffffff|Hitem:itemId:enchantId:gem1:gem2:gem3:...
             if ENCHANTABLE_SLOTS[slotId] then
-                -- Use GetItemInfo to check for enchantments
-                -- Enchanted items will have enchant IDs in the link
-                local hasEnchant = string.match(itemLink, ":(%d+):") ~= "0"
+                -- Extract enchant ID (4th field in item link)
+                local enchantId = string.match(itemLink, '^|c%x+|Hitem:%d+:(%d+)')
                 
-                if not hasEnchant then
+                -- Check if item can be enchanted (quality and item level check)
+                local _, _, itemQuality, itemLevel = GetItemInfo(itemLink)
+                local canBeEnchanted = itemQuality and itemQuality >= 2 and itemLevel and itemLevel >= 1
+                
+                -- Only flag as missing if item can be enchanted but has no enchant
+                if canBeEnchanted and (not enchantId or enchantId == "" or enchantId == "0") then
                     table.insert(missing.enchantments, slotName)
                     hasMissing = true
                 end

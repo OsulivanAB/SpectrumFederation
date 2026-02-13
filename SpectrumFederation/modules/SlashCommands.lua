@@ -409,16 +409,11 @@ function SF:RegisterLootHelperSlashCommands()
             function()
                 -- Raid has started - assign points
                 SF.EnchantmentCheck:RunEnchantmentCheck(true)
+            end,
+            function()
+                -- Pre-raid check - whisper players
+                SF.EnchantmentCheck:RunEnchantmentCheck(false)
             end
         )
-        
-        -- Store the cancel handler temporarily
-        local oldOnCancel = StaticPopupDialogs["SF_SETTINGS_CONFIRM"].OnCancel
-        StaticPopupDialogs["SF_SETTINGS_CONFIRM"].OnCancel = function(self, data)
-            -- Pre-raid check - whisper players
-            SF.EnchantmentCheck:RunEnchantmentCheck(false)
-            -- Restore original handler
-            StaticPopupDialogs["SF_SETTINGS_CONFIRM"].OnCancel = oldOnCancel
-        end
     end, "Check raid members for missing enchantments and gems (admin only)")
 end

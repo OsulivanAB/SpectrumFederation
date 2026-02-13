@@ -23,6 +23,14 @@ if not StaticPopupDialogs[KEY] then
         OnAccept = function(_, data)
             if type(data) == "function" then
                 data()
+            elseif type(data) == "table" and type(data.onAccept) == "function" then
+                data.onAccept()
+            end
+        end,
+        
+        OnCancel = function(_, data)
+            if type(data) == "table" and type(data.onCancel) == "function" then
+                data.onCancel()
             end
         end,
     }
@@ -31,13 +39,24 @@ end
 -- @param message string Message text to display
 -- @param acceptText string|nil Text for accept button (defaults to OKAY)
 -- @param onAccept function|nil Callback function called if user accepts
+-- @param onCancel function|nil Callback function called if user cancels
 -- @return boolean True if dialog was shown, false otherwise
-function Dialogs:Confirm(message, acceptText, onAccept)
+function Dialogs:Confirm(message, acceptText, onAccept, onCancel)
     if SF.Debug then
         SF.Debug:Verbose("UI", "Showing confirmation dialog: %s", message)
     end
     StaticPopupDialogs[KEY].button1 = acceptText or OKAY
-    local popup = StaticPopup_Show(KEY, message, nil, onAccept)
+    
+    -- Store the cancel callback in the data if provided
+    local data = onAccept
+    if onCancel then
+        data = {
+            onAccept = onAccept,
+            onCancel = onCancel
+        }
+    end
+    
+    local popup = StaticPopup_Show(KEY, message, nil, data)
     return popup ~= nil
 end
 
