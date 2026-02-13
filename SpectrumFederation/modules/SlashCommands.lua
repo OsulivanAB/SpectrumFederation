@@ -404,7 +404,7 @@ function SF:RegisterLootHelperSlashCommands()
         end
         
         SF.SettingsUI.Dialogs:Confirm(
-            "Has the raid already started?\n\nClick OK if raid has started (will assign points).\nClick Cancel if this is a pre-raid check (will whisper players).",
+            "Has the raid already started?\n\nClick 'Raid Started' if raid has started (will assign points).\nClick 'Pre-Raid Check' if this is a pre-raid check (will whisper players).",
             "Raid Started",
             function()
                 -- Raid has started - assign points
@@ -413,7 +413,8 @@ function SF:RegisterLootHelperSlashCommands()
             function()
                 -- Pre-raid check - whisper players
                 SF.EnchantmentCheck:RunEnchantmentCheck(false)
-            end
+            end,
+            "Pre-Raid Check"
         )
     end, "Check raid members for missing enchantments and gems (admin only)")
 end

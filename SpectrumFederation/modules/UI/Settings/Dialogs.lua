@@ -41,12 +41,14 @@ end
 -- @param acceptText string|nil Text for accept button (defaults to OKAY)
 -- @param onAccept function|nil Callback function called if user accepts
 -- @param onCancel function|nil Callback function called if user cancels (optional)
+-- @param cancelText string|nil Text for cancel button (defaults to CANCEL) (optional)
 -- @return boolean True if dialog was shown, false otherwise
-function Dialogs:Confirm(message, acceptText, onAccept, onCancel)
+function Dialogs:Confirm(message, acceptText, onAccept, onCancel, cancelText)
     if SF.Debug then
         SF.Debug:Verbose("UI", "Showing confirmation dialog: %s", message)
     end
     StaticPopupDialogs[KEY].button1 = acceptText or OKAY
+    StaticPopupDialogs[KEY].button2 = cancelText or CANCEL
     
     -- Use table structure if onCancel is provided, otherwise maintain backward compatibility
     local data

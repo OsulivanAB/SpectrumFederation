@@ -84,15 +84,22 @@ local function CheckUnitGear(unit)
                 end
             end
             
-            -- Check for empty gem sockets using GetItemStats
-            local stats = GetItemStats(itemLink)
-            if stats then
-                for statName, _ in pairs(stats) do
-                    if statName:find("EMPTY_SOCKET") then
-                        table.insert(missing.gems, slotName)
-                        hasMissing = true
+            -- Check for empty gem sockets using C_Item API
+            local numSockets = C_Item.GetItemNumSockets(itemLink)
+            if numSockets and numSockets > 0 then
+                -- Check each socket to see if it has a gem
+                local hasEmptySocket = false
+                for socketIndex = 1, numSockets do
+                    local gemInfo = C_Item.GetItemGem(itemLink, socketIndex)
+                    if not gemInfo then
+                        hasEmptySocket = true
                         break
                     end
+                end
+                
+                if hasEmptySocket then
+                    table.insert(missing.gems, slotName)
+                    hasMissing = true
                 end
             end
         end
