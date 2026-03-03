@@ -26,17 +26,28 @@ def parse_pr_body(body):
     return type_section, checklist_section
 
 
-def count_checkboxes(section):
+def count_checkboxes(section, optional_phrases=None):
     """Count total and checked checkboxes in a section."""
     if not section:
         return 0, 0
-    
-    # Match checked boxes: - [x] or - [X]
-    checked = len(re.findall(r'-\s*\[[xX]\]', section))
-    
-    # Match all boxes: - [ ] or - [x] or - [X]
-    total = len(re.findall(r'-\s*\[[\sxX]\]', section))
-    
+
+    optional_phrases = optional_phrases or []
+    checkbox_pattern = re.compile(r'-\s*\[([\sxX])\]\s*(.+)')
+
+    total = 0
+    checked = 0
+
+    for match in checkbox_pattern.finditer(section):
+        state = match.group(1)
+        label = match.group(2).strip().lower()
+
+        if any(phrase in label for phrase in optional_phrases):
+            continue
+
+        total += 1
+        if state.lower() == 'x':
+            checked += 1
+
     return total, checked
 
 
@@ -73,7 +84,8 @@ def main():
     if not checklist_section:
         errors.append("Missing '## Checklist' section")
     else:
-        total_checklist, checked_checklist = count_checkboxes(checklist_section)
+        optional_items = ["linked this pr to any related issues"]
+        total_checklist, checked_checklist = count_checkboxes(checklist_section, optional_items)
         print(f"✓ Found 'Checklist' section with {total_checklist} items")
         
         if total_checklist == 0:

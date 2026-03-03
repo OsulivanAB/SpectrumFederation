@@ -21,6 +21,17 @@ For detailed information about our guild, addon features, and guides, visit our 
 
 ---
 
+## Automation: Interface Sync & Packaging
+
+- Workflow: `.github/workflows/wow-interface-sync.yml` runs every 30 minutes (or manually via **workflow_dispatch**) to align `SpectrumFederation/SpectrumFederation.toc`.
+- Endpoint mapping: fetches live retail version from `https://us.patch.battle.net:1119/wow/versions` (authenticated with `BLIZZARD_API_ID`/`BLIZZARD_API_SECRET` → OAuth token) and converts `Major.Minor.Patch` into the WoW Interface number `MajorMinorPatch` (e.g., `12.0.1.x` → `120001`).
+- Version rules: supports semver (`X.Y.Z` or `X.Y.Z-beta.N`) and integer build numbers; main always gets a patch (+1) bump, and beta keeps its lead by applying the pre-update offset to the new main version. If beta ends up equal to main, beta packaging is skipped.
+- Target fields: `## Interface` and `## Version` in `SpectrumFederation/SpectrumFederation.toc` are the authoritative sources the workflow edits.
+- Packaging: when a branch is updated, it runs `python3 .github/scripts/publish_release.py <version> --interface <interface> --dry-run` inside that branch to produce zip + `release.json` artifacts; beta artifacts are uploaded only when beta stays ahead of main.
+- Secrets required: `BLIZZARD_API_ID`, `BLIZZARD_API_SECRET`, and `PAT` (used for checkouts/pushes through branch protection and passed as `GITHUB_TOKEN` to packaging).
+
+---
+
 ## Installation
 
 ### WowUp Installation
