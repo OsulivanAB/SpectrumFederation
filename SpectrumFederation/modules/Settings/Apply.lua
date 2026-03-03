@@ -167,7 +167,11 @@ function Apply:ApplyWindowStyle(value)
     if SF.Debug then
         SF.Debug:Verbose("SETTINGS", "Applying window style: %s", tostring(value))
     end
-    -- TODO: implement
+    
+    -- Trigger LootHelper window style update if the controller exists
+    if SF.LootHelperController and SF.LootHelperController.ApplyStyle then
+        SF.LootHelperController:ApplyStyle()
+    end
 end
 
 -- Apply font style setting

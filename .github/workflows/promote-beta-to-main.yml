@@ -335,12 +335,12 @@ jobs:
       - name: Fast-forward beta to main
         run: |
           git fetch origin main:main
-          git rebase main
-          echo "✓ Beta rebased on main"
+          git reset --hard main
+          echo "✓ Beta fast-forwarded to main"
 
       - name: Push fast-forwarded beta
         if: false  # Dry run - skip push
-        run: git push origin beta
+        run: git push --force-with-lease origin beta
 
       - name: Verify branches are synced
         if: false  # Dry run - skip verification
@@ -707,11 +707,11 @@ jobs:
       - name: Fast-forward beta to main
         run: |
           git fetch origin main:main
-          git rebase main
-          echo "✓ Beta rebased on main"
+          git reset --hard main
+          echo "✓ Beta fast-forwarded to main"
 
       - name: Push fast-forwarded beta
-        run: git push origin beta
+        run: git push --force-with-lease origin beta
 
       - name: Verify branches are synced
         run: |

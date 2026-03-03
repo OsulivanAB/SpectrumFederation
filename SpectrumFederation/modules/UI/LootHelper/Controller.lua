@@ -321,11 +321,25 @@ function Controller:OpenSettings()
 end
 
 function Controller:OnCloseClicked()
-    if SF.SettingsStore and SF.SettingsStore.Set then
-        SF.SettingsStore:Set("lootHelper.enabled", false)
+    -- Check if user is in raid
+    local inRaid = IsInRaid()
+    
+    if inRaid then
+        -- In raid: disable lootHelper.enabled (won't show in or out of raid)
+        if SF.SettingsStore and SF.SettingsStore.Set then
+            SF.SettingsStore:Set("lootHelper.enabled", false)
+        else
+            local db = GetLootDB()
+            if db then db.enabled = false end
+        end
     else
-        local db = GetLootDB()
-        if db then db.enabled = false end
+        -- Not in raid: disable showWindowOutsideRaid (will still show when in raid)
+        if SF.SettingsStore and SF.SettingsStore.Set then
+            SF.SettingsStore:Set("lootHelper.showWindowOutsideRaid", false)
+        else
+            local db = GetLootDB()
+            if db then db.showWindowOutsideRaid = false end
+        end
     end
 
     self:EvaluateVisibility("CloseClicked")

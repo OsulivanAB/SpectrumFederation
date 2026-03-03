@@ -151,11 +151,11 @@ function UI:_RegisterSubPage(page)
 end
 
 -- Open the settings panel to a specific page
--- @param pageId string Page ID to open to, defaults to "main"
+-- @param pageId string Page ID to open to, defaults to "general"
 -- @return nil
 function UI:Open(pageId)
     if not Settings or not Settings.OpenToCategory then return end
-    local page = self.pagesById[pageId] or self.pagesById["main"]
+    local page = self.pagesById[pageId] or self.pagesById["general"]
     if not page or not page.__category then return end
 
     if SF.Debug then

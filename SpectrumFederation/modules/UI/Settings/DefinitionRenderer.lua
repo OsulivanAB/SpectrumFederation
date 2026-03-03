@@ -45,6 +45,7 @@ function R:Build(panel, pageDef)
 	panel.__sfPageBuilder = pb
 	panel.__sfPageDef = pageDef
 	panel.__sfSections = {}
+	panel.__sfWatchedPaths = {}
 
 	for _, secDef in ipairs(pageDef.sections or {}) do
 		local sec = pb:AddSection(secDef.title or "")
@@ -67,6 +68,11 @@ function R:Build(panel, pageDef)
 		for _, item in ipairs(secDef.items or {}) do
 			local t = item.type
 			local ctx = MakeCtx(panel, sec)
+
+			-- Track paths for auto-refresh on external changes
+			if item.path and type(item.path) == "string" then
+				panel.__sfWatchedPaths[item.path] = true
+			end
 
 			if t == "text" then
 				sec:AddText(item.text)
@@ -215,6 +221,25 @@ function R:Build(panel, pageDef)
 	end
 
 	pb:Finalize()
+
+	-- Register Store callbacks for auto-refresh when settings change externally
+	-- Note: Callbacks are not unregistered to match existing pattern (see Apply.lua).
+	-- Each panel registers its own callbacks; multiple panels watching the same path
+	-- will each receive notifications and refresh independently.
+	if SF.SettingsStore and SF.SettingsStore.RegisterCallback then
+		for path, _ in pairs(panel.__sfWatchedPaths or {}) do
+			SF.SettingsStore:RegisterCallback(path, function(_newValue, _oldValue, changedPath)
+				-- Refresh the page builder when any watched setting changes
+				if pb and pb.Refresh then
+					if SF.Debug then
+						SF.Debug:Verbose("UI", "Auto-refreshing page due to setting change: %s", tostring(changedPath))
+					end
+					pb:Refresh()
+				end
+			end)
+		end
+	end
+
 	return pb
 end
 

@@ -1,0 +1,90 @@
+name: WoW Interface Sync
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wow-interface-sync
+  cancel-in-progress: true
+
+env:
+  ADDON_NAME: SpectrumFederation
+  TOC_PATH: SpectrumFederation/SpectrumFederation.toc
+
+jobs:
+  sync-interface:
+    name: Sync Interface and Versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+          path: main
+
+      - name: Checkout beta branch
+        uses: actions/checkout@v4
+        with:
+          ref: beta
+          fetch-depth: 0
+          token: ${{ secrets.PAT }}
+          path: beta
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sync Interface and versions
+        id: sync
+        working-directory: main
+        env:
+          BLIZZARD_API_ID: ${{ secrets.BLIZZARD_API_ID }}
+          BLIZZARD_API_SECRET: ${{ secrets.BLIZZARD_API_SECRET }}
+        run: |
+          python3 .github/scripts/wow_interface_sync.py \
+            --toc-path "${TOC_PATH}" \
+            --main-path "${GITHUB_WORKSPACE}/main" \
+            --beta-path "${GITHUB_WORKSPACE}/beta"
+
+      - name: Package main artifact
+        if: steps.sync.outputs.main_updated == 'true'
+        working-directory: main
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: |
+          python3 .github/scripts/publish_release.py "${{ steps.sync.outputs.main_version }}" --interface "${{ steps.sync.outputs.interface }}" --dry-run
+
+      - name: Upload main artifact
+        if: steps.sync.outputs.main_updated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpectrumFederation-main-${{ steps.sync.outputs.main_version }}
+          path: |
+            main/build/SpectrumFederation-${{ steps.sync.outputs.main_version }}.zip
+            main/build/release.json
+
+      - name: Package beta artifact (only if beta stays ahead)
+        if: steps.sync.outputs.beta_updated == 'true' && steps.sync.outputs.beta_build == 'true'
+        working-directory: beta
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: |
+          python3 .github/scripts/publish_release.py "${{ steps.sync.outputs.beta_version }}" --interface "${{ steps.sync.outputs.interface }}" --dry-run
+
+      - name: Upload beta artifact
+        if: steps.sync.outputs.beta_updated == 'true' && steps.sync.outputs.beta_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpectrumFederation-beta-${{ steps.sync.outputs.beta_version }}
+          path: |
+            beta/build/SpectrumFederation-${{ steps.sync.outputs.beta_version }}.zip
+            beta/build/release.json
