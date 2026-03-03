@@ -2,6 +2,12 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+
+## [0.5.7-beta.4] - 2026-03-03
+
+### Changed
+- Updated addon version to 0.5.7-beta.4 in preparation for compatibility with the latest World of Warcraft version.
+
 ## [0.5.7-beta.3] - 2026-02-13
 
 ### Added
