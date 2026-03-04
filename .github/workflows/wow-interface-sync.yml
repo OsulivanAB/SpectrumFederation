@@ -27,7 +27,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.PAT_TOKEN }}
           path: main
 
       - name: Checkout beta branch
@@ -35,7 +35,7 @@ jobs:
         with:
           ref: beta
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.PAT_TOKEN }}
           path: beta
 
       - name: Set up Python
@@ -59,7 +59,7 @@ jobs:
         if: steps.sync.outputs.main_updated == 'true'
         working-directory: main
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           python3 .github/scripts/publish_release.py "${{ steps.sync.outputs.main_version }}" --interface "${{ steps.sync.outputs.interface }}" --dry-run
 
@@ -76,7 +76,7 @@ jobs:
         if: steps.sync.outputs.beta_updated == 'true' && steps.sync.outputs.beta_build == 'true'
         working-directory: beta
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           python3 .github/scripts/publish_release.py "${{ steps.sync.outputs.beta_version }}" --interface "${{ steps.sync.outputs.interface }}" --dry-run
 
