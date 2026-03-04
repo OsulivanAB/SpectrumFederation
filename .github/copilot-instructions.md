@@ -3,9 +3,13 @@
 These instructions guide GitHub Copilot coding agent and VS Code Agent Mode for this repo.
 
 ## Non‑negotiables
-- **Version bump is mandatory:** Any PR that changes addon behavior, code, UI, settings, packaging, or SavedVariables **MUST** bump `## Version:` in `SpectrumFederation/SpectrumFederation.toc`.
-  - **beta branch:** increment `-beta.N` (e.g., `0.4.0-beta.7` → `0.4.0-beta.8`)
-  - **main branch:** bump SemVer (patch/minor/major as appropriate)
+- **Version bump is mandatory — do this FIRST, every time:**
+  - Any PR that changes addon behavior, code, UI, settings, packaging, or SavedVariables **MUST** bump `## Version:` in `SpectrumFederation/SpectrumFederation.toc` **before finalizing**.
+  - **Every PR on the beta branch** (including documentation or `.github/` only changes) must ensure the TOC version has a valid `-beta.N` suffix. If it does not, fix it as part of your PR.
+  - **beta branch:** the version **MUST** always end in `-beta.N`. Increment N by 1 (e.g., `0.4.0-beta.7` → `0.4.0-beta.8`). A plain SemVer like `0.4.0` is **never** valid on the beta branch.
+  - **main branch:** bump SemVer (patch/minor/major as appropriate); drop the `-beta.N` suffix.
+  - **Check the TOC file early** — read `SpectrumFederation/SpectrumFederation.toc` at the start of every task, note the current version, and include the bumped version in your first commit.
+  - Forgetting the version bump is a blocker; do not submit a PR without it.
 - **Do not bypass CI:** never change workflows/checks to “make it green.”
 - **WoW Lua only:** Lua 5.1 sandbox (no `io`, `os`, Lua 5.2+ features).
 
