@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from base64 import b64encode
 from pathlib import Path
 from urllib import error, parse, request
@@ -21,6 +22,8 @@ from urllib import error, parse, request
 PATCH_ENDPOINTS = {
     "live": "https://us.patch.battle.net:1119/wow/versions",
 }
+
+RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class VersionInfo:
@@ -35,6 +38,29 @@ class VersionInfo:
         self.integer = integer
 
 
+def urlopen_with_retry(req, timeout=15, max_attempts=3):
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return request.urlopen(req, timeout=timeout)
+        except error.HTTPError as exc:
+            retryable = exc.code in RETRYABLE_HTTP_STATUS_CODES
+            if not retryable or attempt == max_attempts:
+                raise
+            print(
+                f"[sync] HTTP {exc.code} from Blizzard API (attempt {attempt}/{max_attempts}); retrying...",
+                file=sys.stderr,
+            )
+        except (error.URLError, TimeoutError):
+            if attempt == max_attempts:
+                raise
+            print(
+                f"[sync] Network error from Blizzard API (attempt {attempt}/{max_attempts}); retrying...",
+                file=sys.stderr,
+            )
+
+        time.sleep(attempt)
+
+
 def fetch_access_token(client_id, client_secret, region="us"):
     url = "https://oauth.battle.net/token"
     data = parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8")
@@ -42,12 +68,17 @@ def fetch_access_token(client_id, client_secret, region="us"):
 
     req = request.Request(url, data=data, headers={"Authorization": f"Basic {auth_header}"})
 
-    with request.urlopen(req, timeout=15) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-        token = payload.get("access_token")
-        if not token:
-            raise RuntimeError("access_token missing in Blizzard OAuth response")
-        return token
+    try:
+        with urlopen_with_retry(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+            token = payload.get("access_token")
+            if not token:
+                raise RuntimeError("access_token missing in Blizzard OAuth response")
+            return token
+    except error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} from Blizzard OAuth endpoint") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"Failed to reach Blizzard OAuth endpoint: {exc.reason}") from exc
 
 
 def parse_version_response(response_text):
@@ -78,7 +109,7 @@ def fetch_live_interface(client_id, client_secret):
     req = request.Request(url, headers={"Authorization": f"Bearer {token}"})
 
     try:
-        with request.urlopen(req, timeout=15) as resp:
+        with urlopen_with_retry(req, timeout=15) as resp:
             payload = resp.read().decode("utf-8")
     except error.HTTPError as exc:  # pragma: no cover - network errors are runtime concerns
         raise RuntimeError(f"HTTP {exc.code} from Blizzard version endpoint") from exc
