@@ -24,6 +24,7 @@ PATCH_ENDPOINTS = {
 }
 
 RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_BACKOFF_SECONDS = 8
 
 
 class VersionInfo:
@@ -39,6 +40,25 @@ class VersionInfo:
 
 
 def urlopen_with_retry(req, timeout=15, max_attempts=3):
+    """Open a URL with bounded retries for transient Blizzard API failures.
+
+    Args:
+        req: urllib request object or URL string accepted by urllib.request.urlopen.
+        timeout: Request timeout in seconds.
+        max_attempts: Total number of attempts before raising the last error.
+
+    Returns:
+        The HTTP response object from urllib.request.urlopen.
+
+    Retry behavior:
+        Uses exponential backoff (1s, 2s, 4s...) capped by MAX_BACKOFF_SECONDS.
+        Retries HTTP status codes 429, 500, 502, 503, and 504.
+
+    Raises:
+        urllib.error.HTTPError: For non-retryable status codes or after retries are exhausted.
+        urllib.error.URLError: For network failures after retries are exhausted.
+        TimeoutError: For timeout failures after retries are exhausted.
+    """
     for attempt in range(1, max_attempts + 1):
         try:
             return request.urlopen(req, timeout=timeout)
@@ -58,7 +78,9 @@ def urlopen_with_retry(req, timeout=15, max_attempts=3):
                 file=sys.stderr,
             )
 
-        time.sleep(attempt)
+        if attempt < max_attempts:
+            backoff_seconds = min(2 ** (attempt - 1), MAX_BACKOFF_SECONDS)
+            time.sleep(backoff_seconds)
 
 
 def fetch_access_token(client_id, client_secret, region="us"):
