@@ -5,6 +5,7 @@ These instructions guide GitHub Copilot coding agent and VS Code Agent Mode for 
 ## Non‑negotiables
 - **Version bump is mandatory — do this FIRST, every time:**
   - Any PR that changes addon behavior, code, UI, settings, packaging, or SavedVariables **MUST** bump `## Version:` in `SpectrumFederation/SpectrumFederation.toc` **before finalizing**.
+  - **Every PR on the beta branch** (including documentation or `.github/` only changes) must ensure the TOC version has a valid `-beta.N` suffix. If it does not, fix it as part of your PR.
   - **beta branch:** the version **MUST** always end in `-beta.N`. Increment N by 1 (e.g., `0.4.0-beta.7` → `0.4.0-beta.8`). A plain SemVer like `0.4.0` is **never** valid on the beta branch.
   - **main branch:** bump SemVer (patch/minor/major as appropriate); drop the `-beta.N` suffix.
   - **Check the TOC file early** — read `SpectrumFederation/SpectrumFederation.toc` at the start of every task, note the current version, and include the bumped version in your first commit.

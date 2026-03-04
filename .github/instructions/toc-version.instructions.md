@@ -1,10 +1,12 @@
 ---
-applyTo: "SpectrumFederation/**/*"
+applyTo: "SpectrumFederation/**/*,.github/**/*"
 ---
 
 # TOC Version Bump — Required on Every Change
 
 **Any change to files under `SpectrumFederation/` MUST be accompanied by a version bump in `SpectrumFederation/SpectrumFederation.toc`.**
+
+**Even if your PR only touches `.github/` files** (e.g. workflows, scripts, instruction files), you must still verify that the TOC version is valid for the current branch — and fix it if it is not.
 
 ## How to bump
 
@@ -24,6 +26,8 @@ This applies whenever you modify **any** file inside `SpectrumFederation/`, incl
 - Lua source files (`.lua`)
 - The TOC file itself (adding new files, changing metadata)
 - Media or other assets bundled with the addon
+
+Additionally, even for PRs that **only** change `.github/` files (workflows, scripts, instruction files, etc.), you must **verify** that the TOC version format is valid for the branch you are on (see rules above), and correct it if not.
 
 ## Do this early
 
