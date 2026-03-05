@@ -67,7 +67,7 @@ def test_http_get_retries_then_succeeds(monkeypatch):
     monkeypatch.setattr(wow.time, "sleep", lambda _: None)
     monkeypatch.setattr(wow.random, "uniform", lambda _a, _b: 0.0)
 
-    payload = wow.http_get_with_retries("https://example.invalid", timeout=30, attempts=6, base_sleep=1, max_sleep=20)
+    payload = wow.http_get_with_retries("https://example.com", timeout=30, attempts=6, base_sleep=1, max_sleep=20)
 
     assert payload == "ok"
     assert calls["count"] == 3

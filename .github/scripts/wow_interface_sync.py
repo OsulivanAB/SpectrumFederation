@@ -66,7 +66,8 @@ def http_get_with_retries(url, *, headers=None, timeout=30, attempts=3, base_sle
                 return resp.read().decode("utf-8")
         except error.HTTPError as exc:
             last_error = exc
-            if exc.code not in (408, 429) and exc.code < 500:
+            retryable_http = exc.code in (408, 429) or exc.code >= 500
+            if not retryable_http:
                 break
         except (error.URLError, TimeoutError, ConnectionError) as exc:
             last_error = exc
@@ -125,8 +126,7 @@ def _resolve_patch_server(region):
         max_sleep=20,
     )
     game_version = parse_version_response(payload, region=region)
-    interface_int = _validate_interface(version_to_interface(game_version))
-    return game_version, interface_int
+    return game_version, _validate_interface(version_to_interface(game_version))
 
 
 def _resolve_wowhead():
@@ -309,7 +309,7 @@ def main():
         return 0
 
     if not args.main_path or not args.beta_path:
-        parser.error("--main-path and --beta-path are required unless --dry-run is used without paths")
+        parser.error("--main-path and --beta-path are required when not using --dry-run resolver-only mode")
 
     main_toc = Path(args.main_path) / args.toc_path
     beta_toc = Path(args.beta_path) / args.toc_path
