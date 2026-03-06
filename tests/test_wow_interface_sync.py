@@ -12,6 +12,7 @@ SPEC = importlib.util.spec_from_file_location("wow_interface_sync", MODULE_PATH)
 wow = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(wow)
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
 class DummyResponse:
@@ -29,12 +30,7 @@ class DummyResponse:
 
 
 def test_parse_patch_versions_payload_and_map_interface():
-    payload = "\n".join(
-        [
-            "eu|wow|something|something|something|11.2.5.63906|cdn|buildcfg",
-            "us|wow|something|something|something|12.0.1.63091|cdn|buildcfg",
-        ]
-    )
+    payload = (FIXTURES_DIR / "blizzard_versions_sample.txt").read_text(encoding="utf-8")
 
     version = wow.parse_version_response(payload, region="us")
     interface = wow.version_to_interface(version)
@@ -43,14 +39,14 @@ def test_parse_patch_versions_payload_and_map_interface():
     assert interface == 120001
 
 
-def test_parse_wowhead_interface_from_html():
-    html = """
-    <section>
-      <h3>World of Warcraft Live Interface</h3>
-      <p>Current live interface: 120001</p>
-    </section>
-    """
-    assert wow.parse_wowhead_interface_response(html) == 120001
+def test_parse_https_fallback_versions():
+    blizztrack_html = (FIXTURES_DIR / "blizztrack_versions_sample.html").read_text(encoding="utf-8")
+    blizzmeta_html = (FIXTURES_DIR / "blizzmeta_versions_sample.html").read_text(encoding="utf-8")
+    blizztrack_card_html = (FIXTURES_DIR / "blizztrack_live_card_sample.html").read_text(encoding="utf-8")
+
+    assert wow.parse_live_version_from_text(blizztrack_html, source_name="BlizzTrack") == "12.0.1.63091"
+    assert wow.parse_live_version_from_text(blizzmeta_html, source_name="BlizzMeta") == "12.0.1.63091"
+    assert wow.parse_live_version_from_text(blizztrack_card_html, source_name="BlizzTrack") == "12.0.1.66263"
 
 
 def test_http_get_retries_then_succeeds(monkeypatch):
@@ -73,19 +69,68 @@ def test_http_get_retries_then_succeeds(monkeypatch):
     assert calls["count"] == 3
 
 
-def test_override_env_var_wins(monkeypatch):
+def test_manual_override_used_after_network_failure(monkeypatch):
     monkeypatch.setenv("LIVE_INTERFACE_OVERRIDE", "120001")
     monkeypatch.setattr(
         wow,
         "_resolve_patch_server",
-        lambda _region: pytest.fail("patch server strategy should not run when override is set"),
+        lambda _region: (_ for _ in ()).throw(RuntimeError("patch down")),
     )
     monkeypatch.setattr(
         wow,
-        "_resolve_wowhead",
-        lambda: pytest.fail("wowhead strategy should not run when override is set"),
+        "_resolve_https_fallback",
+        lambda: (_ for _ in ()).throw(RuntimeError("https fallback down")),
     )
 
-    version, interface = wow.resolve_live_interface("us")
+    version, interface, strategy = wow.resolve_live_interface("us")
     assert version is None
     assert interface == 120001
+    assert strategy == "manual_override"
+
+
+def test_invalid_manual_override_fails_loudly(monkeypatch):
+    monkeypatch.setenv("LIVE_INTERFACE_OVERRIDE", "abc123")
+    monkeypatch.setattr(
+        wow,
+        "_resolve_patch_server",
+        lambda _region: (_ for _ in ()).throw(RuntimeError("patch down")),
+    )
+    monkeypatch.setattr(
+        wow,
+        "_resolve_https_fallback",
+        lambda: (_ for _ in ()).throw(RuntimeError("fallback down")),
+    )
+
+    with pytest.raises(RuntimeError, match="LIVE_INTERFACE_OVERRIDE"):
+        wow.resolve_live_interface("us")
+
+
+def test_compute_updated_versions_preserves_beta_offset():
+    main_version = wow.parse_version("0.5.10")
+    beta_version = wow.parse_version("0.5.10-beta.2")
+
+    new_main, new_beta, beta_ahead = wow.compute_updated_versions(main_version, beta_version, main_update_needed=True)
+
+    assert new_main.raw == "0.5.11"
+    assert new_beta.raw == "0.5.11-beta.2"
+    assert beta_ahead is False
+
+
+def test_write_output_appends_expected_keys(tmp_path, monkeypatch):
+    output_file = tmp_path / "outputs.txt"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output_file))
+
+    wow.write_output("main_updated", "true")
+    wow.write_output("beta_updated", "false")
+    wow.write_output("interface", "120001")
+
+    content = output_file.read_text(encoding="utf-8")
+    assert "main_updated=true" in content
+    assert "beta_updated=false" in content
+    assert "interface=120001" in content
+
+
+def test_no_network_requires_override(monkeypatch):
+    monkeypatch.delenv("LIVE_INTERFACE_OVERRIDE", raising=False)
+    with pytest.raises(RuntimeError, match="--no-network"):
+        wow.resolve_live_interface("us", allow_network=False)

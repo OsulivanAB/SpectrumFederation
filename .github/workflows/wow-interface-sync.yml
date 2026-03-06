@@ -43,17 +43,59 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Python test dependency
+        run: pip install pytest
+
+      - name: Run wow interface sync tests
+        run: python -m pytest -q
+
+      - name: Deterministic resolver smoke test (no network)
+        # "main" is the checkout path created by the first actions/checkout step.
+        working-directory: main
+        run: |
+          LIVE_INTERFACE_OVERRIDE=120001 \
+          python3 .github/scripts/wow_interface_sync.py --dry-run --region us --no-network
+
       - name: Sync Interface and versions
         id: sync
         working-directory: main
-        env:
-          BLIZZARD_API_ID: ${{ secrets.BLIZZARD_API_ID }}
-          BLIZZARD_API_SECRET: ${{ secrets.BLIZZARD_API_SECRET }}
         run: |
           python3 .github/scripts/wow_interface_sync.py \
             --toc-path "${TOC_PATH}" \
             --main-path "${GITHUB_WORKSPACE}/main" \
             --beta-path "${GITHUB_WORKSPACE}/beta"
+
+      - name: Commit and push main TOC updates
+        if: steps.sync.outputs.main_updated == 'true'
+        working-directory: main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Keep this guard to avoid failing if sync outputs are stale or branch diverged.
+          if git diff --quiet -- "${TOC_PATH}"; then
+            echo "No main TOC changes to commit"
+          else
+            git add "${TOC_PATH}"
+            git commit -m "chore: sync Interface ${{ steps.sync.outputs.interface }} and version ${{ steps.sync.outputs.main_version }} [skip ci]"
+            git push origin main
+          fi
+
+      - name: Commit and push beta TOC updates
+        if: steps.sync.outputs.beta_updated == 'true'
+        working-directory: beta
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Keep this guard to avoid failing if sync outputs are stale or branch diverged.
+          if git diff --quiet -- "${TOC_PATH}"; then
+            echo "No beta TOC changes to commit"
+          else
+            git add "${TOC_PATH}"
+            git commit -m "chore: sync Interface ${{ steps.sync.outputs.interface }} and version ${{ steps.sync.outputs.beta_version }} [skip ci]"
+            git push origin beta
+          fi
 
       - name: Package main artifact
         if: steps.sync.outputs.main_updated == 'true'
