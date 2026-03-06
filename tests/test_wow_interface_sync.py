@@ -42,9 +42,11 @@ def test_parse_patch_versions_payload_and_map_interface():
 def test_parse_https_fallback_versions():
     blizztrack_html = (FIXTURES_DIR / "blizztrack_versions_sample.html").read_text(encoding="utf-8")
     blizzmeta_html = (FIXTURES_DIR / "blizzmeta_versions_sample.html").read_text(encoding="utf-8")
+    blizztrack_card_html = (FIXTURES_DIR / "blizztrack_live_card_sample.html").read_text(encoding="utf-8")
 
     assert wow.parse_live_version_from_text(blizztrack_html, source_name="BlizzTrack") == "12.0.1.63091"
     assert wow.parse_live_version_from_text(blizzmeta_html, source_name="BlizzMeta") == "12.0.1.63091"
+    assert wow.parse_live_version_from_text(blizztrack_card_html, source_name="BlizzTrack") == "12.0.1.66263"
 
 
 def test_http_get_retries_then_succeeds(monkeypatch):

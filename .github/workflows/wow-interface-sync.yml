@@ -43,12 +43,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Python test dependency
+        run: pip install pytest
+
+      - name: Run wow interface sync tests
+        run: python -m pytest -q tests/test_wow_interface_sync.py
+
+      - name: Deterministic resolver smoke test (no network)
+        working-directory: main
+        run: |
+          LIVE_INTERFACE_OVERRIDE=120001 \
+          python3 .github/scripts/wow_interface_sync.py --dry-run --region us --no-network
+
       - name: Sync Interface and versions
         id: sync
         working-directory: main
-        env:
-          BLIZZARD_API_ID: ${{ secrets.BLIZZARD_API_ID }}
-          BLIZZARD_API_SECRET: ${{ secrets.BLIZZARD_API_SECRET }}
         run: |
           python3 .github/scripts/wow_interface_sync.py \
             --toc-path "${TOC_PATH}" \

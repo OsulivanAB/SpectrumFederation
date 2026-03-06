@@ -106,6 +106,13 @@ def _is_plausible_game_version(version):
     return 1 <= major <= 20 and 0 <= minor <= 99 and 0 <= patch <= 99 and build > 0
 
 
+def _contains_any_token(text, tokens):
+    for token in tokens:
+        if re.search(rf"\b{re.escape(token)}\b", text):
+            return True
+    return False
+
+
 def version_to_interface(version):
     parts = version.split(".")
     if len(parts) < 3:
@@ -122,6 +129,23 @@ def _version_tuple(version):
 
 def parse_live_version_from_text(payload_text, source_name):
     version_pattern = r"\b(\d+\.\d+\.\d+\.\d+)\b"
+    marker_candidates = []
+
+    for match in re.finditer(version_pattern, payload_text):
+        version = match.group(1)
+        if not _is_plausible_game_version(version):
+            continue
+
+        leading = payload_text[max(0, match.start() - 120): match.start()].lower()
+        trailing = payload_text[match.end(): match.end() + 320].lower()
+        trailing_text = re.sub(r"<[^>]+>", " ", trailing)
+        marker_context = f"{leading} {trailing_text}"
+        if re.search(r"\bversion\s*name\b", marker_context) and not _contains_any_token(marker_context, NON_RETAIL_TOKENS):
+            marker_candidates.append(version)
+
+    if marker_candidates:
+        return max(marker_candidates, key=_version_tuple)
+
     candidates = []
 
     for match in re.finditer(version_pattern, payload_text):
@@ -136,6 +160,7 @@ def parse_live_version_from_text(payload_text, source_name):
 
         line_context = payload_text[line_start:line_end].lower()
         context = payload_text[max(0, match.start() - 80): match.end() + 80].lower()
+        text_context = re.sub(r"<[^>]+>", "\n", payload_text[max(0, match.start() - 240): match.end() + 240]).lower()
         score = 0
         if "retail" in line_context:
             score += 3
@@ -143,9 +168,11 @@ def parse_live_version_from_text(payload_text, source_name):
             score += 3
         if "mainline" in line_context:
             score += 1
-        if any(token in line_context for token in NON_RETAIL_TOKENS):
+        if "version name" in text_context:
+            score += 2
+        if _contains_any_token(line_context, NON_RETAIL_TOKENS):
             score -= 8
-        elif any(token in context for token in NON_RETAIL_TOKENS):
+        elif _contains_any_token(context, NON_RETAIL_TOKENS) or _contains_any_token(text_context, NON_RETAIL_TOKENS):
             score -= 4
         candidates.append((score, _version_tuple(version), version))
 
@@ -153,7 +180,7 @@ def parse_live_version_from_text(payload_text, source_name):
         raise RuntimeError(f"Could not find any plausible game versions in {source_name} response")
 
     best_score, _, best_version = max(candidates, key=lambda item: (item[0], item[1]))
-    if best_score < 1:
+    if best_score < 0:
         raise RuntimeError(f"Could not confidently identify LIVE retail version from {source_name} response")
 
     return best_version
