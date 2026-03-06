@@ -47,9 +47,10 @@ jobs:
         run: pip install pytest
 
       - name: Run wow interface sync tests
-        run: python -m pytest -q tests/test_wow_interface_sync.py
+        run: python -m pytest -q
 
       - name: Deterministic resolver smoke test (no network)
+        # "main" is the checkout path created by the first actions/checkout step.
         working-directory: main
         run: |
           LIVE_INTERFACE_OVERRIDE=120001 \

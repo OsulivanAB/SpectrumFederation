@@ -25,6 +25,14 @@ INTERFACE_MIN = 100000
 INTERFACE_MAX = 999999
 USER_AGENT = "SpectrumFederation-WoWInterfaceSync/1.0 (+https://github.com/OsulivanAB/SpectrumFederation)"
 NON_RETAIL_TOKENS = ("ptr", "classic", "wrath", "cata", "mop", "sod", "season of discovery")
+# Window before/after a version match when checking for nearby "Version Name" marker cards.
+MARKER_CONTEXT_LEADING_CHARS = 120
+MARKER_CONTEXT_TRAILING_CHARS = 320
+# Small window for immediate textual hints near the exact version token.
+NEARBY_CONTEXT_CHARS = 80
+# Larger window to evaluate surrounding HTML/text for fallback scoring signals.
+SCORING_CONTEXT_CHARS = 240
+NON_RETAIL_PATTERN = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(token) for token in NON_RETAIL_TOKENS))
 
 
 class VersionInfo:
@@ -107,10 +115,21 @@ def _is_plausible_game_version(version):
 
 
 def _contains_any_token(text, tokens):
+    if tokens == NON_RETAIL_TOKENS:
+        return bool(NON_RETAIL_PATTERN.search(text))
+
     for token in tokens:
         if re.search(rf"\b{re.escape(token)}\b", text):
             return True
     return False
+
+
+def _iter_plausible_versions(payload_text):
+    version_pattern = r"\b(\d+\.\d+\.\d+\.\d+)\b"
+    for match in re.finditer(version_pattern, payload_text):
+        version = match.group(1)
+        if _is_plausible_game_version(version):
+            yield match, version
 
 
 def version_to_interface(version):
@@ -128,16 +147,11 @@ def _version_tuple(version):
 
 
 def parse_live_version_from_text(payload_text, source_name):
-    version_pattern = r"\b(\d+\.\d+\.\d+\.\d+)\b"
     marker_candidates = []
 
-    for match in re.finditer(version_pattern, payload_text):
-        version = match.group(1)
-        if not _is_plausible_game_version(version):
-            continue
-
-        leading = payload_text[max(0, match.start() - 120): match.start()].lower()
-        trailing = payload_text[match.end(): match.end() + 320].lower()
+    for match, version in _iter_plausible_versions(payload_text):
+        leading = payload_text[max(0, match.start() - MARKER_CONTEXT_LEADING_CHARS): match.start()].lower()
+        trailing = payload_text[match.end(): match.end() + MARKER_CONTEXT_TRAILING_CHARS].lower()
         trailing_text = re.sub(r"<[^>]+>", " ", trailing)
         marker_context = f"{leading} {trailing_text}"
         if re.search(r"\bversion\s*name\b", marker_context) and not _contains_any_token(marker_context, NON_RETAIL_TOKENS):
@@ -148,19 +162,19 @@ def parse_live_version_from_text(payload_text, source_name):
 
     candidates = []
 
-    for match in re.finditer(version_pattern, payload_text):
-        version = match.group(1)
-        if not _is_plausible_game_version(version):
-            continue
-
+    for match, version in _iter_plausible_versions(payload_text):
         line_start = payload_text.rfind("\n", 0, match.start()) + 1
         line_end = payload_text.find("\n", match.end())
         if line_end == -1:
             line_end = len(payload_text)
 
         line_context = payload_text[line_start:line_end].lower()
-        context = payload_text[max(0, match.start() - 80): match.end() + 80].lower()
-        text_context = re.sub(r"<[^>]+>", "\n", payload_text[max(0, match.start() - 240): match.end() + 240]).lower()
+        context = payload_text[max(0, match.start() - NEARBY_CONTEXT_CHARS): match.end() + NEARBY_CONTEXT_CHARS].lower()
+        text_context = re.sub(
+            r"<[^>]+>",
+            "\n",
+            payload_text[max(0, match.start() - SCORING_CONTEXT_CHARS): match.end() + SCORING_CONTEXT_CHARS],
+        ).lower()
         score = 0
         if "retail" in line_context:
             score += 3
@@ -180,6 +194,8 @@ def parse_live_version_from_text(payload_text, source_name):
         raise RuntimeError(f"Could not find any plausible game versions in {source_name} response")
 
     best_score, _, best_version = max(candidates, key=lambda item: (item[0], item[1]))
+    # Score 0 is accepted because some fallback pages expose clean "Version Name"
+    # cards without explicit "live/retail" text near each version token.
     if best_score < 0:
         raise RuntimeError(f"Could not confidently identify LIVE retail version from {source_name} response")
 
