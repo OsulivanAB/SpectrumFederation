@@ -9,6 +9,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.10-beta.1] - 2026-03-06
+
+### Added
+- Improved live interface resolution with multi-strategy fallback and retry mechanisms to enhance reliability.
+
 ## [0.5.9] - 2026-03-05
 
 ### Changed
