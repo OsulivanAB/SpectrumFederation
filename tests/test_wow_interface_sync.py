@@ -67,7 +67,7 @@ def test_http_get_retries_then_succeeds(monkeypatch):
     assert calls["count"] == 3
 
 
-def test_manual_override_is_used_after_network_failures(monkeypatch):
+def test_manual_override_used_after_network_failure(monkeypatch):
     monkeypatch.setenv("LIVE_INTERFACE_OVERRIDE", "120001")
     monkeypatch.setattr(
         wow,

@@ -62,6 +62,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Keep this guard to avoid failing if sync outputs are stale or branch diverged.
           if git diff --quiet -- "${TOC_PATH}"; then
             echo "No main TOC changes to commit"
           else
@@ -77,6 +78,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Keep this guard to avoid failing if sync outputs are stale or branch diverged.
           if git diff --quiet -- "${TOC_PATH}"; then
             echo "No beta TOC changes to commit"
           else

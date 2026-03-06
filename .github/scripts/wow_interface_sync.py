@@ -24,6 +24,7 @@ BLIZZMETA_VERSIONS_URL = "https://www.blizzmeta.com/view/wow?type=versions"
 INTERFACE_MIN = 100000
 INTERFACE_MAX = 999999
 USER_AGENT = "SpectrumFederation-WoWInterfaceSync/1.0 (+https://github.com/OsulivanAB/SpectrumFederation)"
+NON_RETAIL_TOKENS = ("ptr", "classic", "wrath", "cata", "mop", "sod", "season of discovery")
 
 
 class VersionInfo:
@@ -142,9 +143,9 @@ def parse_live_version_from_text(payload_text, source_name):
             score += 3
         if "mainline" in line_context:
             score += 1
-        if any(token in line_context for token in ("ptr", "classic", "wrath", "cata", "mop", "sod", "season of discovery")):
+        if any(token in line_context for token in NON_RETAIL_TOKENS):
             score -= 8
-        elif any(token in context for token in ("ptr", "classic", "wrath", "cata", "mop", "sod", "season of discovery")):
+        elif any(token in context for token in NON_RETAIL_TOKENS):
             score -= 4
         candidates.append((score, _version_tuple(version), version))
 
@@ -372,6 +373,7 @@ def write_output(key, value):
 
 
 def compute_updated_versions(main_version, beta_version, main_update_needed):
+    """Return updated main/beta versions while preserving beta's relative offset."""
     new_main_version = bump_main_version(main_version) if main_update_needed else main_version
     main_value_new = version_value(new_main_version)
     offset = version_value(beta_version) - version_value(main_version)
