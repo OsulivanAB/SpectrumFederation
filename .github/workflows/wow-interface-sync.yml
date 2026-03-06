@@ -55,6 +55,36 @@ jobs:
             --main-path "${GITHUB_WORKSPACE}/main" \
             --beta-path "${GITHUB_WORKSPACE}/beta"
 
+      - name: Commit and push main TOC updates
+        if: steps.sync.outputs.main_updated == 'true'
+        working-directory: main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- "${TOC_PATH}"; then
+            echo "No main TOC changes to commit"
+          else
+            git add "${TOC_PATH}"
+            git commit -m "chore: sync Interface ${{ steps.sync.outputs.interface }} and version ${{ steps.sync.outputs.main_version }} [skip ci]"
+            git push origin main
+          fi
+
+      - name: Commit and push beta TOC updates
+        if: steps.sync.outputs.beta_updated == 'true'
+        working-directory: beta
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- "${TOC_PATH}"; then
+            echo "No beta TOC changes to commit"
+          else
+            git add "${TOC_PATH}"
+            git commit -m "chore: sync Interface ${{ steps.sync.outputs.interface }} and version ${{ steps.sync.outputs.beta_version }} [skip ci]"
+            git push origin beta
+          fi
+
       - name: Package main artifact
         if: steps.sync.outputs.main_updated == 'true'
         working-directory: main

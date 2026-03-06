@@ -2,9 +2,9 @@
 """
 Synchronize WoW Interface and addon versions on main and beta branches.
 
-Fetches the latest live game Interface value from Blizzard using client
-credentials, bumps main, preserves beta's lead over main, commits, and pushes.
-Designed to be called from CI with two checked-out worktrees (main and beta).
+Resolves the live game interface, computes target TOC updates for main/beta,
+and applies local file changes while emitting GitHub Actions outputs.
+Commit/push side effects are optional and disabled by default.
 """
 
 import argparse
@@ -19,7 +19,8 @@ from urllib import error, request
 
 
 PATCH_VERSIONS_URL_TEMPLATE = "https://{region}.patch.battle.net:1119/wow/versions"
-WOWHEAD_LIVE_URL = "https://www.wowhead.com/"
+BLIZZTRACK_VERSIONS_URL = "https://blizztrack.com/view/wow?type=versions"
+BLIZZMETA_VERSIONS_URL = "https://www.blizzmeta.com/view/wow?type=versions"
 INTERFACE_MIN = 100000
 INTERFACE_MAX = 999999
 USER_AGENT = "SpectrumFederation-WoWInterfaceSync/1.0 (+https://github.com/OsulivanAB/SpectrumFederation)"
@@ -95,6 +96,15 @@ def parse_version_response(response_text, region="us"):
     raise RuntimeError("Could not parse game version from Blizzard response")
 
 
+def _is_plausible_game_version(version):
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)\.(\d+)", version)
+    if not match:
+        return False
+
+    major, minor, patch, build = (int(piece) for piece in match.groups())
+    return 1 <= major <= 20 and 0 <= minor <= 99 and 0 <= patch <= 99 and build > 0
+
+
 def version_to_interface(version):
     parts = version.split(".")
     if len(parts) < 3:
@@ -104,17 +114,48 @@ def version_to_interface(version):
     return int(f"{major}{minor:02d}{patch:02d}")
 
 
-def parse_wowhead_interface_response(html):
-    patterns = [
-        r"(?is)\b(?:live|retail)?\s*interface\b[^0-9]{0,40}(?P<iface>\d{6})\b",
-        r'(?is)"interface"\s*:\s*"?(?P<iface>\d{6})"?',
-    ]
-    for pattern in patterns:
-        for match in re.finditer(pattern, html):
-            interface_int = int(match.group("iface"))
-            if _is_plausible_interface(interface_int):
-                return interface_int
-    raise RuntimeError("Could not parse interface from Wowhead HTML")
+def _version_tuple(version):
+    major, minor, patch, build = version.split(".")
+    return int(major), int(minor), int(patch), int(build)
+
+
+def parse_live_version_from_text(payload_text, source_name):
+    version_pattern = r"\b(\d+\.\d+\.\d+\.\d+)\b"
+    candidates = []
+
+    for match in re.finditer(version_pattern, payload_text):
+        version = match.group(1)
+        if not _is_plausible_game_version(version):
+            continue
+
+        line_start = payload_text.rfind("\n", 0, match.start()) + 1
+        line_end = payload_text.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(payload_text)
+
+        line_context = payload_text[line_start:line_end].lower()
+        context = payload_text[max(0, match.start() - 80): match.end() + 80].lower()
+        score = 0
+        if "retail" in line_context:
+            score += 3
+        if "live" in line_context:
+            score += 3
+        if "mainline" in line_context:
+            score += 1
+        if any(token in line_context for token in ("ptr", "classic", "wrath", "cata", "mop", "sod", "season of discovery")):
+            score -= 8
+        elif any(token in context for token in ("ptr", "classic", "wrath", "cata", "mop", "sod", "season of discovery")):
+            score -= 4
+        candidates.append((score, _version_tuple(version), version))
+
+    if not candidates:
+        raise RuntimeError(f"Could not find any plausible game versions in {source_name} response")
+
+    best_score, _, best_version = max(candidates, key=lambda item: (item[0], item[1]))
+    if best_score < 1:
+        raise RuntimeError(f"Could not confidently identify LIVE retail version from {source_name} response")
+
+    return best_version
 
 
 def _resolve_patch_server(region):
@@ -129,42 +170,88 @@ def _resolve_patch_server(region):
     return game_version, _validate_interface(version_to_interface(game_version))
 
 
-def _resolve_wowhead():
-    payload = http_get_with_retries(
-        WOWHEAD_LIVE_URL,
-        timeout=30,
-        attempts=3,
-        base_sleep=1,
-        max_sleep=20,
-    )
-    return None, _validate_interface(parse_wowhead_interface_response(payload))
+def _resolve_https_fallback():
+    failures = []
+    sources = [
+        ("BlizzTrack", BLIZZTRACK_VERSIONS_URL, "https_blizztrack"),
+        ("BlizzMeta", BLIZZMETA_VERSIONS_URL, "https_blizzmeta"),
+    ]
+
+    for source_name, source_url, strategy_name in sources:
+        try:
+            payload = http_get_with_retries(
+                source_url,
+                timeout=30,
+                attempts=3,
+                base_sleep=1,
+                max_sleep=20,
+            )
+            game_version = parse_live_version_from_text(payload, source_name=source_name)
+            interface_int = _validate_interface(version_to_interface(game_version))
+            print(f"[resolver] Strategy B ({source_name} HTTPS fallback) succeeded")
+            return game_version, interface_int, strategy_name
+        except Exception as exc:
+            failures.append(f"{source_name}: {exc}")
+            print(f"[resolver] Strategy B ({source_name} HTTPS fallback) failed: {exc}")
+
+    raise RuntimeError("; ".join(failures))
 
 
-def resolve_live_interface(region):
+def _resolve_manual_override():
+    override = os.environ.get("LIVE_INTERFACE_OVERRIDE")
+    if not override:
+        raise RuntimeError("LIVE_INTERFACE_OVERRIDE is not set")
+
+    try:
+        interface_int = _validate_interface(override)
+    except ValueError as exc:
+        raise RuntimeError("LIVE_INTERFACE_OVERRIDE must be an integer") from exc
+    except RuntimeError as exc:
+        raise RuntimeError(f"LIVE_INTERFACE_OVERRIDE invalid: {exc}") from exc
+
+    print("[resolver] Strategy C (manual override) succeeded")
+    return None, interface_int
+
+
+def resolve_live_interface(region, allow_network=True):
     override = os.environ.get("LIVE_INTERFACE_OVERRIDE")
     if override:
-        return None, _validate_interface(override)
+        print("[resolver] LIVE_INTERFACE_OVERRIDE detected; will be used if network strategies fail")
 
     failures = []
 
-    try:
-        game_version, interface_int = _resolve_patch_server(region)
-        print(f"[resolver] Strategy A (patch server) succeeded for region '{region}'")
-        return game_version, interface_int
-    except Exception as exc:
-        failures.append(f"Strategy A (patch server): {exc}")
-        print(f"[resolver] Strategy A (patch server) failed: {exc}")
+    if allow_network:
+        try:
+            game_version, interface_int = _resolve_patch_server(region)
+            print(f"[resolver] Strategy A (patch server) succeeded for region '{region}'")
+            return game_version, interface_int, "patch_server"
+        except Exception as exc:
+            failures.append(f"Strategy A (patch server): {exc}")
+            print(f"[resolver] Strategy A (patch server) failed: {exc}")
+
+        try:
+            game_version, interface_int, strategy_name = _resolve_https_fallback()
+            return game_version, interface_int, strategy_name
+        except Exception as exc:
+            failures.append(f"Strategy B (HTTPS fallback): {exc}")
+            print(f"[resolver] Strategy B (HTTPS fallback) failed: {exc}")
+    else:
+        failures.append("Strategy A (patch server): skipped (--no-network)")
+        failures.append("Strategy B (HTTPS fallback): skipped (--no-network)")
 
     try:
-        game_version, interface_int = _resolve_wowhead()
-        print("[resolver] Strategy B (Wowhead scrape) succeeded")
-        return game_version, interface_int
+        game_version, interface_int = _resolve_manual_override()
+        return game_version, interface_int, "manual_override"
     except Exception as exc:
-        failures.append(f"Strategy B (Wowhead scrape): {exc}")
-        print(f"[resolver] Strategy B (Wowhead scrape) failed: {exc}")
+        failures.append(f"Strategy C (manual override): {exc}")
+        print(f"[resolver] Strategy C (manual override) failed: {exc}")
 
     failure_text = "; ".join(failures)
-    raise RuntimeError(f"Unable to resolve live interface. {failure_text}")
+    raise RuntimeError(
+        "Unable to resolve live interface using Strategy A (patch server), "
+        "Strategy B (HTTPS fallback), or Strategy C (manual override). "
+        f"Failures: {failure_text}"
+    )
 
 
 def parse_version(raw):
@@ -284,6 +371,16 @@ def write_output(key, value):
         print(line)
 
 
+def compute_updated_versions(main_version, beta_version, main_update_needed):
+    new_main_version = bump_main_version(main_version) if main_update_needed else main_version
+    main_value_new = version_value(new_main_version)
+    offset = version_value(beta_version) - version_value(main_version)
+    beta_value_new = main_value_new + offset
+    new_beta_version = decode_value(beta_value_new, beta_version)
+    beta_ahead = version_value(new_beta_version) > version_value(new_main_version)
+    return new_main_version, new_beta_version, beta_ahead
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync WoW Interface and addon versions across branches")
     parser.add_argument("--toc-path", default="SpectrumFederation/SpectrumFederation.toc", help="Path to TOC file")
@@ -294,15 +391,24 @@ def main():
     parser.add_argument("--addon-name", default="SpectrumFederation", help="Addon name for logging")
     parser.add_argument("--region", default="us", help="Patch region to query (default: us)")
     parser.add_argument("--dry-run", action="store_true", help="Resolve interface and print actions without committing")
+    parser.add_argument("--no-network", action="store_true", help="Skip network strategies and only allow manual override")
+    parser.add_argument(
+        "--commit-and-push",
+        action="store_true",
+        help="Commit and push TOC changes directly from this script (disabled by default)",
+    )
     args = parser.parse_args()
 
-    game_version, target_interface_int = resolve_live_interface(args.region)
+    game_version, target_interface_int, resolver_strategy = resolve_live_interface(args.region, allow_network=not args.no_network)
     target_interface = str(target_interface_int)
+    print(f"[sync] Resolver strategy: {resolver_strategy}")
     if game_version:
         print(f"[sync] Live game version: {game_version}")
     else:
         print("[sync] Live game version: unknown (resolved without game version source)")
     print(f"[sync] Target Interface: {target_interface}")
+    write_output("resolver_strategy", resolver_strategy)
+    write_output("game_version", game_version or "")
 
     if args.dry_run and (not args.main_path or not args.beta_path):
         print("[sync][dry-run] Resolver check complete; no repository updates performed")
@@ -324,8 +430,6 @@ def main():
         raise RuntimeError("Main and beta use different version formats; cannot preserve offset safely")
 
     write_output("interface", target_interface)
-    write_output("main_version", main_version_raw)
-    write_output("beta_version", beta_version_raw)
 
     main_update_needed = main_interface != target_interface
     beta_update_needed = beta_interface != target_interface
@@ -335,52 +439,53 @@ def main():
         write_output("main_updated", "false")
         write_output("beta_updated", "false")
         write_output("beta_build", "false")
+        write_output("main_version", main_version_raw)
+        write_output("beta_version", beta_version_raw)
         return 0
+
+    new_main_version, new_beta_version, beta_ahead = compute_updated_versions(
+        main_version,
+        beta_version,
+        main_update_needed,
+    )
 
     if args.dry_run:
-        new_main_version = bump_main_version(main_version) if main_update_needed else main_version
-        main_value_new = version_value(new_main_version)
-        offset = version_value(beta_version) - version_value(main_version)
-        beta_value_new = main_value_new + offset
-        new_beta_version = decode_value(beta_value_new, beta_version)
         print(f"[sync][dry-run] Main: {main_version.raw} -> {new_main_version.raw}")
         print(f"[sync][dry-run] Beta: {beta_version.raw} -> {new_beta_version.raw} (offset preserved)")
+        print(f"[sync][dry-run] Main TOC change needed: {main_update_needed}")
+        print(f"[sync][dry-run] Beta TOC change needed: {beta_update_needed}")
+        print(f"[sync][dry-run] Beta build required: {beta_ahead}")
+        write_output("main_updated", "true" if main_update_needed else "false")
+        write_output("beta_updated", "true" if beta_update_needed else "false")
+        write_output("beta_build", "true" if beta_ahead else "false")
+        write_output("main_version", new_main_version.raw)
+        write_output("beta_version", new_beta_version.raw)
         print("[sync][dry-run] No changes were committed")
         return 0
-
-    git_config(args.main_path)
-    git_config(args.beta_path)
-
-    new_main_version = bump_main_version(main_version) if main_update_needed else main_version
-    main_value_new = version_value(new_main_version)
-    offset = version_value(beta_version) - version_value(main_version)
-    beta_value_new = main_value_new + offset
-    new_beta_version = decode_value(beta_value_new, beta_version)
 
     print(f"[sync] Main: {main_version.raw} -> {new_main_version.raw}")
     print(f"[sync] Beta: {beta_version.raw} -> {new_beta_version.raw} (offset preserved)")
 
-    main_changed = update_toc(main_toc, target_interface, new_main_version.raw)
-    beta_changed = update_toc(beta_toc, target_interface, new_beta_version.raw)
+    main_changed = update_toc(main_toc, target_interface, new_main_version.raw) if main_update_needed else False
+    beta_changed = update_toc(beta_toc, target_interface, new_beta_version.raw) if beta_update_needed else False
 
-    main_committed = False
-    beta_committed = False
+    if args.commit_and_push:
+        git_config(args.main_path)
+        git_config(args.beta_path)
+        if main_changed:
+            message = f"chore: bump Interface to {target_interface} and version to {new_main_version.raw}"
+            git_commit_and_push(args.main_path, args.main_branch, main_toc, message)
+        if beta_changed:
+            message = f"chore: bump Interface to {target_interface} and version to {new_beta_version.raw}"
+            git_commit_and_push(args.beta_path, args.beta_branch, beta_toc, message)
+    else:
+        print("[sync] Commit/push disabled (default). Workflow should handle branch mutations.")
 
-    if main_changed:
-        message = f"chore: bump Interface to {target_interface} and version to {new_main_version.raw}"
-        main_committed = git_commit_and_push(args.main_path, args.main_branch, main_toc, message)
-
-    if beta_changed:
-        message = f"chore: bump Interface to {target_interface} and version to {new_beta_version.raw}"
-        beta_committed = git_commit_and_push(args.beta_path, args.beta_branch, beta_toc, message)
-
-    write_output("main_updated", "true" if main_committed else "false")
-    write_output("beta_updated", "true" if beta_committed else "false")
+    write_output("main_updated", "true" if main_changed else "false")
+    write_output("beta_updated", "true" if beta_changed else "false")
     write_output("main_version", new_main_version.raw)
     write_output("beta_version", new_beta_version.raw)
 
-    # Determine whether beta is ahead after the sync
-    beta_ahead = version_value(new_beta_version) > version_value(new_main_version)
     write_output("beta_build", "true" if beta_ahead else "false")
 
     print(f"[sync] Beta build required: {beta_ahead}")
