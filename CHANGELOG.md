@@ -11,6 +11,13 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.11-beta.1] - 2026-03-06
+
+### Fixed
+- Improved synchronization of the WoW interface resolver to prevent inconsistencies.
+- Made workflow validation deterministic to ensure reliable addon behavior.
+
 ## [0.5.10] - 2026-03-06
 
 ### Changed
