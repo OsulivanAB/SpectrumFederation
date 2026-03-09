@@ -466,7 +466,14 @@ function Sync:OnRequestTimeout(requestId)
     self:_MInc("sync.req.timeout.kind." .. tostring(req.kind or "UNKNOWN"), 1)
 
     if SF.Debug then
-        SF.Debug:Verbose("SYNC", "Request timeout: %s (attempt %d)", req.id, req.attempt or 0)
+        local targets = {}
+        if type(req.targets) == "table" then
+            for _, t in ipairs(req.targets) do table.insert(targets, t) end
+        end
+        SF.Debug:Warn("SYNC", "Request timeout (id=%s, kind=%s, attempt=%d/%d, lastTarget=%s, targets=%s)",
+            tostring(req.id), tostring(req.kind), tonumber(req.attempt) or 0,
+            (tonumber(req.maxRetries) or tonumber(self.cfg.maxRetries) or 0) + 1,
+            tostring(req.lastTarget), (#targets > 0) and table.concat(targets, ",") or "none")
     end
 
     req.timer = nil
