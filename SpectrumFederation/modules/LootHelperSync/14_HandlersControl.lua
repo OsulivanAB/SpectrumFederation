@@ -209,6 +209,7 @@ function Sync:HandleSessionReannounce(sender, payload)
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
+    self.state._sessionDescriptorAt = self:_Now()
 
     if type(payload.safeMode) == "table" then
         self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_REANNOUNCE")
@@ -348,6 +349,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
+    if not sameStream then
+        self.state._sessionDescriptorAt = self:_Now()
+    end
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via SES_HEARTBEAT")
@@ -924,4 +928,3 @@ function Sync:_RecordHandshakeReply(sender, payload, status)
         self.state.handshake.replies[sender] = status
     end
 end
-
