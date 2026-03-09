@@ -13,6 +13,11 @@ function Sync:HandleAdminSync(sender, payload)
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.adminSyncId) ~= "string" or payload.adminSyncId == "" then return end
 
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "ADMIN_SYNC received from %s (sessionId=%s, profileId=%s, adminSyncId=%s)",
+            tostring(sender), tostring(payload.sessionId), tostring(payload.profileId), tostring(payload.adminSyncId))
+    end
+
     -- Only respond to authorized admins (no leaking logs to non-admins)
     if not self:IsSenderAuthorized(payload.profileId, sender) then
         if SF.PrintWarning then
@@ -30,6 +35,13 @@ function Sync:HandleAdminSync(sender, payload)
         status.sessionId = sid
         status.profileId = pid
         status.adminSyncId = asid
+
+        if SF.Debug then
+            local maxAuthors = 0
+            for _ in pairs(status.authorMax or {}) do maxAuthors = maxAuthors + 1 end
+            SF.Debug:Verbose("SYNC", "Sending ADMIN_STATUS to %s (hasProfile=%s, hasGaps=%s, authors=%d)",
+                tostring(sender), tostring(status.hasProfile), tostring(status.hasGaps), maxAuthors)
+        end
 
         if SF.LootHelperComm then
             SF.LootHelperComm:Send("CONTROL", self.MSG.ADMIN_STATUS, status, "WHISPER", sender, "NORMAL")
@@ -151,6 +163,13 @@ function Sync:HandleAdminStatus(sender, payload)
     self.state.adminStatuses = self.state.adminStatuses or {}
     local normalizedSender = self:_NormalizeNameRealmForCompare(sender) or sender
     self.state.adminStatuses[normalizedSender] = payload
+
+    if SF.Debug then
+        local authorCount = 0
+        for _ in pairs(payload.authorMax or {}) do authorCount = authorCount + 1 end
+        SF.Debug:Info("SYNC", "ADMIN_STATUS accepted from %s (hasProfile=%s, hasGaps=%s, authors=%d)",
+            tostring(sender), tostring(payload.hasProfile), tostring(payload.hasGaps), authorCount)
+    end
     
     -- Issue #10 Rec 3: Progressive convergence - update authorMax with late responses
     if conv.finalizeStarted and payload.authorMax then

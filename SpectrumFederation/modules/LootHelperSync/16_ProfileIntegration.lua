@@ -622,6 +622,9 @@ function Sync:RequestGapRepair(profileId, author, gapFrom, gapTo, reason)
 
     -- Suppress only if we already have a request that fully covers this range
     if self:_HasOutstandingLogRangeRequest(profileId, author, gapFrom, gapTo) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Gap repair suppressed (outstanding request covers %s [%d-%d])", tostring(author), gapFrom, gapTo)
+        end
         return false
     end
 
@@ -634,6 +637,10 @@ function Sync:RequestGapRepair(profileId, author, gapFrom, gapTo, reason)
     local rec = self.state.gapRepair[key]
     if type(rec) == "table" and type(rec.lastAt) == "number" then
         if (now - rec.lastAt) < cooldown then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Gap repair suppressed (cooldown active for %s, lastAt=%.2f, now=%.2f, cooldown=%.2f)",
+                    tostring(author), rec.lastAt, now, cooldown)
+            end
             return false
         end
     end

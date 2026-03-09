@@ -26,7 +26,7 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
 
     local adminSyncId = self:_NextNonce("AS")
     local mode = (opts.onComplete and "REANNOUNCE") or "START"
-
+    
     local function normalize(name)
         return self:_NormalizeNameRealmForCompare(name) or name
     end
@@ -40,6 +40,12 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         if admin ~= me then
             table.insert(adminList, admin)
         end
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Admin convergence begin (mode=%s, adminSyncId=%s, deadline=%.2fs, targets=%s)",
+            tostring(mode), tostring(adminSyncId), (self.cfg.adminConvergenceCollectSec or 1.5),
+            (#adminList > 0) and table.concat(adminList, ",") or "none")
     end
     
     if SF.Debug then

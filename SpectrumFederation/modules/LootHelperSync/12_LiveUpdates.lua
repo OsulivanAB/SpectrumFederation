@@ -8,19 +8,26 @@ local Sync = SF.LootHelperSync
 -- @param logTable table A network-safe representation of the lootLog entry
 -- @return nil
 function Sync:BroadcastNewLog(profileId, logTable)
-    if not self.state.active then return false, "no active session" end
-    if not self.state.sessionId then return false, "missing sessionId" end
-    if type(profileId) ~= "string" or profileId == "" then return false, "missing profileId" end
-    if self.state.profileId ~= profileId then return false, "wrong profile for session" end
-    if not self:IsBulkTransferAllowed() then return false, "safe mode (bulk disabled)" end
+    local function fail(reason)
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "BroadcastNewLog blocked: %s", tostring(reason))
+        end
+        return false, reason
+    end
+
+    if not self.state.active then return fail("no active session") end
+    if not self.state.sessionId then return fail("missing sessionId") end
+    if type(profileId) ~= "string" or profileId == "" then return fail("missing profileId") end
+    if self.state.profileId ~= profileId then return fail("wrong profile for session") end
+    if not self:IsBulkTransferAllowed() then return fail("safe mode (bulk disabled)") end
 
     local dist = self:_EnforceGroupedSessionActive("BroadcastNewLog")
-    if not dist then return false, "not in group/raid" end
+    if not dist then return fail("not in group/raid") end
 
     -- Only admins should be able to push live updates
     local me = self:_SelfId()
     if not self:IsSenderAuthorized(profileId, me) then
-        return false, "not authorized to broadcast NEW_LOG"
+        return fail("not authorized to broadcast NEW_LOG")
     end
 
     -- Accept either a LootLog object or an already-serialized table
@@ -28,7 +35,7 @@ function Sync:BroadcastNewLog(profileId, logTable)
         logTable = logTable:ToTable()
     end
     if type(logTable) ~= "table" then
-        return false, "logTable must be a table (or LootLog instance)"
+        return fail("logTable must be a table (or LootLog instance)")
     end
 
     local payload = {
@@ -38,7 +45,7 @@ function Sync:BroadcastNewLog(profileId, logTable)
     }
 
     if not SF.LootHelperComm then
-        return false, "LootHelperComm not available"
+        return fail("LootHelperComm not available")
     end
 
     -- Broadcast encoding rule:
@@ -96,6 +103,9 @@ function Sync:HandleNewLog(sender, payload)
     -- Dedupe by logId
     local logId = self:_ExtractLogId(logTable)
     if logId and profile._logIndex and profile._logIndex[logId] then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Ignoring NEW_LOG duplicate (id=%s, sender=%s)", tostring(logId), tostring(sender))
+        end
         return
     end
     
@@ -115,8 +125,14 @@ function Sync:HandleNewLog(sender, payload)
     if hasGap and type(gapFrom) == "number" and type(gapTo) == "number" then
         local author = (self:_ExtractAuthorCounter(logTable))
         if type(author) == "string" and author ~= "" then
+            if SF.Debug then
+                SF.Debug:Info("SYNC", "Gap detected on NEW_LOG (author=%s, gap=%d-%d, logId=%s); requesting repair",
+                    tostring(author), gapFrom, gapTo, tostring(logId))
+            end
             self:RequestGapRepair(profileId, author, gapFrom, gapTo, "new-log-gap")
         end
+    elseif SF.Debug then
+        SF.Debug:Verbose("SYNC", "Applied NEW_LOG without gap (id=%s, author=%s)", tostring(logId), tostring(self:_ExtractAuthorCounter(logTable)))
     end
 
     -- Keep local session authorMax fresh
