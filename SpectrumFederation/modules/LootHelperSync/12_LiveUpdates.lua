@@ -60,8 +60,13 @@ end
 function Sync:HandleNewLog(sender, payload)
     if type(payload) ~= "table" then return end
 
-    local ok = self:ValidateSessionPayload(payload)
-    if not ok then return end
+    local ok, err = self:ValidateSessionPayload(payload)
+    if not ok then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting NEW_LOG from %s: invalid session payload (%s)", tostring(sender), tostring(err or "unknown"))
+        end
+        return
+    end
 
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.log) ~= "table" then return end
@@ -126,4 +131,3 @@ function Sync:HandleNewLog(sender, payload)
         end
     end
 end
-

@@ -11,10 +11,10 @@ function Sync:HandleAuthLogs(sender, payload)
     -- Basic payload validation
     if type(payload) ~= "table" then return end
 
-    local ok = self:ValidateSessionPayload(payload)
+    local ok, err = self:ValidateSessionPayload(payload)
     if not ok then
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: invalid session payload", tostring(sender))
+            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: invalid session payload (%s)", tostring(sender), tostring(err or "unknown"))
         end
         return
     end
@@ -269,7 +269,12 @@ function Sync:HandleProfileSnapshot(sender, payload)
 
     -- Must be for the current session
     local ok, err = self:ValidateSessionPayload(payload)
-    if not ok then return end
+    if not ok then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: %s", tostring(sender), tostring(err or "unknown"))
+        end
+        return
+    end
 
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.snapshot) ~= "table" then return end
@@ -420,4 +425,3 @@ function Sync:HandleProfileSnapshot(sender, payload)
        self:SendJoinStatus()
     end)
 end
-

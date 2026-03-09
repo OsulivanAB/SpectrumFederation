@@ -2,6 +2,42 @@ local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+local function _NormalizeMemberId(id)
+    if type(id) ~= "string" or id == "" then return nil end
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        return SF.NameUtil.NormalizeNameRealm(id)
+    end
+    return id
+end
+
+local function _BuildEmptyArmor()
+    local armor = {}
+    if SF.ArmorSlots then
+        for _, slotName in pairs(SF.ArmorSlots) do
+            armor[slotName] = false
+        end
+    end
+    return armor
+end
+
+local function _ResetMemberState(member)
+    if not member then return end
+    member.pointBalance = 0
+    member.armor = _BuildEmptyArmor()
+    if not member.role and SF.MemberRoles then
+        member.role = SF.MemberRoles.MEMBER
+    end
+end
+
+local function _MemberId(member)
+    if type(member) ~= "table" then return nil end
+    local id =
+        (member.GetFullIdentifier and member:GetFullIdentifier())
+        or member.identifier
+        or member.id
+    return _NormalizeMemberId(id)
+end
+
 
 -- Function Get admin users from profile (tolerant to different implementations).
 -- @param profile table Profile instance
@@ -241,13 +277,134 @@ function Sync:RebuildProfile(profileId)
         end
     end
 
-    -- 3) If profile is active, refresh cached/UI state (if your core uses this)
+    -- 3) Rebuild member/admin derived state from logs (authoritative source of truth)
+    local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
+
+    local existingMembers = {}
+    if type(profile._members) == "table" then
+        for _, m in ipairs(profile._members) do
+            local mid = _MemberId(m)
+            if mid then
+                existingMembers[mid] = m
+                _ResetMemberState(m)
+            end
+        end
+    end
+
+    -- Seed admins from existing list to avoid dropping explicit grants not yet logged
+    local adminSet = {}
+    if type(profile._adminUsers) == "table" then
+        for _, admin in ipairs(profile._adminUsers) do
+            local norm = _NormalizeMemberId(admin)
+            if norm then adminSet[norm] = true end
+        end
+    end
+
+    local createdMembers = 0
+    local function ensureMember(id)
+        local norm = _NormalizeMemberId(id)
+        if not norm then return nil end
+
+        if not existingMembers[norm] then
+            if SF.Member and SF.Member.new then
+                local m = SF.Member.new(norm)
+                _ResetMemberState(m)
+                existingMembers[norm] = m
+                createdMembers = createdMembers + 1
+            end
+        end
+
+        return existingMembers[norm]
+    end
+
+    for _, log in ipairs(logs) do
+        local eventType = (log.GetEventType and log:GetEventType()) or log._eventType
+        local data = (log.GetEventData and log:GetEventData()) or log._data
+
+        if type(eventType) == "string" and type(data) == "table" then
+            if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.POINT_CHANGE) then
+                local member = ensureMember(data.member)
+                if member and data.change == SF.LootLogPointChangeTypes.INCREMENT then
+                    member.pointBalance = (member.pointBalance or 0) + 1
+                elseif member and data.change == SF.LootLogPointChangeTypes.DECREMENT then
+                    member.pointBalance = (member.pointBalance or 0) - 1
+                end
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ARMOR_CHANGE) then
+                local member = ensureMember(data.member)
+                if member and data.slot then
+                    member.armor = member.armor or _BuildEmptyArmor()
+                    if data.action == SF.LootLogArmorActions.USED then
+                        member.armor[data.slot] = true
+                    elseif data.action == SF.LootLogArmorActions.AVAILABLE then
+                        member.armor[data.slot] = false
+                    end
+                end
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ROLE_CHANGE) then
+                local member = ensureMember(data.member)
+                if member and data.newRole then
+                    member.role = data.newRole
+                    if data.newRole == SF.MemberRoles.ADMIN then
+                        adminSet[_MemberId(member) or data.member] = true
+                    elseif data.newRole == SF.MemberRoles.MEMBER then
+                        adminSet[_MemberId(member) or data.member] = nil
+                    end
+                end
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ADMIN_ADDED) then
+                local member = ensureMember(data.member)
+                adminSet[_MemberId(member) or _NormalizeMemberId(data.member) or data.member] = true
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ADMIN_REMOVED) then
+                local norm = _NormalizeMemberId(data.member) or data.member
+                adminSet[norm] = nil
+            end
+        end
+    end
+
+    -- Commit rebuilt members/admins
+    profile._members = {}
+    for id, member in pairs(existingMembers) do
+        table.insert(profile._members, member)
+    end
+    table.sort(profile._members, function(a, b)
+        return (_MemberId(a) or "") < (_MemberId(b) or "")
+    end)
+
+    profile._adminUsers = {}
+    for adminId in pairs(adminSet) do
+        table.insert(profile._adminUsers, adminId)
+    end
+    table.sort(profile._adminUsers)
+
+    if SF.MemberRoles then
+        for _, member in ipairs(profile._members) do
+            local mid = _MemberId(member)
+            if mid and adminSet[mid] then
+                member.role = SF.MemberRoles.ADMIN
+            else
+                member.role = SF.MemberRoles.MEMBER
+            end
+        end
+    end
+
+    if profile._EnsureOwnerIsAdmin then
+        profile:_EnsureOwnerIsAdmin()
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC_PROFILE", "Rebuilt profile state from logs (profileId=%s, members=%d, admins=%d, created=%d)",
+            tostring(profileId), #profile._members, #profile._adminUsers, createdMembers)
+    end
+
+    -- 4) If profile is active, refresh cached/UI state (if your core uses this)
     if SF and SF.lootHelperDB and SF.lootHelperDB.activeProfileId == profileId
         and type(SF.SetActiveProfileById) == "function"
     then
         pcall(function()
             SF:SetActiveProfileById(profileId)
         end)
+    end
+
+    if SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
+        SF.LootHelperEvents:NotifyDataChanged("SYNC:REBUILD", { profileId = profileId })
     end
 
     return true, nil
@@ -521,4 +678,3 @@ function Sync:RequestGapRepair(profileId, author, gapFrom, gapTo, reason)
 
     return ok
 end
-

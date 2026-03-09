@@ -117,8 +117,13 @@ function Sync:HandleAdminStatus(sender, payload)
     if not self.state.active or not self.state.isCoordinator then return end
     if type(payload) ~= "table" then return end
 
-    local ok = self:ValidateSessionPayload(payload)
-    if not ok then return end
+    local ok, err = self:ValidateSessionPayload(payload)
+    if not ok then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Ignoring ADMIN_STATUS from %s: %s", tostring(sender), tostring(err or "unknown"))
+        end
+        return
+    end
 
     if SF.Debug then
         SF.Debug:Verbose("SYNC", "Incoming ADMIN_STATUS from %s", sender)
@@ -126,13 +131,26 @@ function Sync:HandleAdminStatus(sender, payload)
 
     local conv = self.state._adminConvergence
     if not conv then return end
-    if payload.adminSyncId ~= conv.adminSyncId then return end
+    if payload.adminSyncId ~= conv.adminSyncId then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Ignoring ADMIN_STATUS from %s: adminSyncId mismatch (expected=%s got=%s)",
+                tostring(sender), tostring(conv.adminSyncId), tostring(payload.adminSyncId))
+        end
+        return
+    end
 
     -- Only accept status from authorized admins
-    if not self:IsSenderAuthorized(self.state.profileId, sender) then return end
+    if not self:IsSenderAuthorized(self.state.profileId, sender) then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Ignoring ADMIN_STATUS from %s: sender not authorized for profile %s",
+                tostring(sender), tostring(self.state.profileId))
+        end
+        return
+    end
 
     self.state.adminStatuses = self.state.adminStatuses or {}
-    self.state.adminStatuses[sender] = payload
+    local normalizedSender = self:_NormalizeNameRealmForCompare(sender) or sender
+    self.state.adminStatuses[normalizedSender] = payload
     
     -- Issue #10 Rec 3: Progressive convergence - update authorMax with late responses
     if conv.finalizeStarted and payload.authorMax then
