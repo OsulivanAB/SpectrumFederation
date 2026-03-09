@@ -2,6 +2,18 @@ local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+local function GetMemberById(profile, memberId)
+    if not profile or type(memberId) ~= "string" or memberId == "" then
+        return nil
+    end
+    if profile.getMemberByID then
+        return profile:getMemberByID(memberId)
+    elseif profile.GetMemberByID then
+        return profile:GetMemberByID(memberId)
+    end
+    return nil
+end
+
 
 -- Function Called when a local admin creates a new log entry; broadcasts NEW_LOG to raid.
 -- @param profileId string Current session profile id
@@ -80,6 +92,14 @@ function Sync:HandleNewLog(sender, payload)
 
     local profileId = payload.profileId
     local logTable = payload.log
+    local eventData = logTable._data or logTable.data or {}
+    local memberId = eventData.member
+    local profileBefore = self:FindLocalProfileById(profileId)
+    local oldPoints = 0
+    if profileBefore and type(memberId) == "string" and memberId ~= "" then
+        local beforeMember = GetMemberById(profileBefore, memberId)
+        oldPoints = (beforeMember and tonumber(beforeMember.pointBalance)) or 0
+    end
 
     -- If we don't have the profile yet, request snapshot
     local profile = self:FindLocalProfileById(profileId)
@@ -119,7 +139,17 @@ function Sync:HandleNewLog(sender, payload)
     end
 
     -- Update UI / derived state
-    self:RebuildProfile(profileId)
+    self:RebuildProfile(profileId, "live_update")
+    self:LogSessionPointsSummary(profileId, "live_update")
+
+    if SF.Debug then
+        local profileAfter = self:FindLocalProfileById(profileId)
+        local memberAfter = GetMemberById(profileAfter, memberId)
+        local newPoints = (memberAfter and tonumber(memberAfter.pointBalance)) or 0
+        SF.Debug:Info("SYNC_POINTS", "Apply log (path=live_update member=%s old=%d delta=%d new=%d eventType=%s logId=%s)",
+            tostring(memberId), oldPoints, (tonumber(newPoints) or 0) - oldPoints, tonumber(newPoints) or 0,
+            tostring(logTable._eventType or logTable.eventType), tostring(logId))
+    end
 
     -- If we detected a gap, request missing logs
     if hasGap and type(gapFrom) == "number" and type(gapTo) == "number" then

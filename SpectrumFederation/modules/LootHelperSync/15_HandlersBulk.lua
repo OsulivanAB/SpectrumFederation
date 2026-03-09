@@ -199,7 +199,7 @@ function Sync:HandleAuthLogs(sender, payload)
     if changed then
         -- Metrics: measure rebuild duration
         local t1 = debugprofilestop and debugprofilestop() or nil
-        self:RebuildProfile(payload.profileId)
+        self:RebuildProfile(payload.profileId, "auth_logs")
         if t1 then
             self:_MObserve("sync.merge.auth_logs.rebuild_ms", debugprofilestop() - t1)
         end
@@ -389,7 +389,8 @@ function Sync:HandleProfileSnapshot(sender, payload)
 
     -- Metrics: measure rebuild duration
     local t1 = debugprofilestop and debugprofilestop() or nil
-    self:RebuildProfile(profileId)
+    self:RebuildProfile(profileId, "profile_snapshot")
+    self:LogSessionPointsSummary(profileId, "profile_snapshot_import")
     if t1 then
         self:_MObserve("sync.merge.profile_snapshot.rebuild_ms", debugprofilestop() - t1)
     end
