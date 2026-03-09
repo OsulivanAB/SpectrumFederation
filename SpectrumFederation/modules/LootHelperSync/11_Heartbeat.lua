@@ -79,6 +79,19 @@ function Sync:HandleSessionStart(sender, payload)
         self.state.helpers = {}
     end
 
+    -- Rebuild immediately when we already have the profile to avoid stale point/member UI.
+    local profile = self:FindLocalProfileById(payload.profileId)
+    if profile then
+        self:RebuildProfile(payload.profileId, "session_start_member")
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC_SESSION", "Session start (role=%s sessionId=%s profileId=%s coordinator=%s pointsSource=derived_logs)",
+            self.state.isCoordinator and "coordinator" or "member",
+            tostring(payload.sessionId), tostring(payload.profileId), tostring(payload.coordinator))
+    end
+    self:LogSessionPointsSummary(payload.profileId, "session_start_received")
+
     -- Reset join status tracking for new session
     self.state._sentJoinStatusForSessionId = nil
     self.state._profileReqInFlight = nil

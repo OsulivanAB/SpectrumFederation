@@ -80,6 +80,19 @@ function Sync:HandleNewLog(sender, payload)
 
     local profileId = payload.profileId
     local logTable = payload.log
+    local eventData = logTable._data or logTable.data or {}
+    local memberId = eventData.member
+    local profileBefore = self:FindLocalProfileById(profileId)
+    local oldPoints = 0
+    if profileBefore and type(memberId) == "string" and memberId ~= "" then
+        local beforeMember = nil
+        if profileBefore.getMemberByID then
+            beforeMember = profileBefore:getMemberByID(memberId)
+        elseif profileBefore.GetMemberByID then
+            beforeMember = profileBefore:GetMemberByID(memberId)
+        end
+        oldPoints = (beforeMember and tonumber(beforeMember.pointBalance)) or 0
+    end
 
     -- If we don't have the profile yet, request snapshot
     local profile = self:FindLocalProfileById(profileId)
@@ -119,7 +132,24 @@ function Sync:HandleNewLog(sender, payload)
     end
 
     -- Update UI / derived state
-    self:RebuildProfile(profileId)
+    self:RebuildProfile(profileId, "live_update")
+    self:LogSessionPointsSummary(profileId, "live_update")
+
+    if SF.Debug then
+        local profileAfter = self:FindLocalProfileById(profileId)
+        local memberAfter = nil
+        if profileAfter then
+            if profileAfter.getMemberByID then
+                memberAfter = profileAfter:getMemberByID(memberId)
+            elseif profileAfter.GetMemberByID then
+                memberAfter = profileAfter:GetMemberByID(memberId)
+            end
+        end
+        local newPoints = (memberAfter and tonumber(memberAfter.pointBalance)) or 0
+        SF.Debug:Info("SYNC_POINTS", "Apply log (path=live_update member=%s old=%d delta=%d new=%d eventType=%s logId=%s)",
+            tostring(memberId), oldPoints, (tonumber(newPoints) or 0) - oldPoints, tonumber(newPoints) or 0,
+            tostring(logTable._eventType or logTable.eventType), tostring(logId))
+    end
 
     -- If we detected a gap, request missing logs
     if hasGap and type(gapFrom) == "number" and type(gapTo) == "number" then

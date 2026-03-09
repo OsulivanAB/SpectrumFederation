@@ -6,6 +6,7 @@ local LH = SF.LootHelperWindow
 
 LH.RosterModel = LH.RosterModel or {}
 local Model = LH.RosterModel
+Model._classByMemberId = Model._classByMemberId or {}
 
 local function NormalizeNameRealm(id)
     if type(id) ~= "string" then return nil end
@@ -117,7 +118,7 @@ local function CollectProfileMembers(profile)
 		if not id or not m then return end
 
 		local class = (m.GetClass and m:GetClass()) or m.class or m.className
-		class = class and string.upper(class) or "UNKNOWN"
+		class = class and string.upper(class):gsub("[%s%-%_]", "") or "UNKNOWN"
 
 		table.insert(members, { id = id, member = m, class = class })
 		memberSet[id] = true
@@ -223,6 +224,11 @@ function Model:Build(profile)
     end
 
     local raidById = BuildRaidMap()
+    for id, info in pairs(raidById) do
+        if id and info and info.class and info.class ~= "UNKNOWN" then
+            self._classByMemberId[id] = info.class
+        end
+    end
     local profMembers, profSet = CollectProfileMembers(profile)
 
     -- Profile members
@@ -234,12 +240,21 @@ function Model:Build(profile)
         if showMembersNotInRaid or inRaid then
             local m = entry.member
             local points = (m and m.GetPointBalance and m:GetPointBalance()) or m.pointBalance or 0
+            local resolvedClass = (raidInfo and raidInfo.class) or entry.class or self._classByMemberId[id] or "UNKNOWN"
+            if resolvedClass == "UNKNOWN" and SF.Debug then
+                SF.Debug:Warn("LH_ICON", "Unable to resolve class metadata (member=%s classRaw=%s inRaid=%s)",
+                    tostring(id), tostring(entry.class), tostring(inRaid))
+            end
+            if m and resolvedClass ~= "UNKNOWN" and m.class ~= resolvedClass then
+                m.class = resolvedClass
+                m.className = resolvedClass
+            end
 
             table.insert(rows, {
                 type = "PROFILE_MEMBER",
                 memberId = id,
                 displayName = ShortName(id),
-                class = (raidInfo and raidInfo.class) or entry.class,
+                class = resolvedClass,
                 unit = raidInfo and raidInfo.unit or nil,
                 points = tonumber(points) or 0,
                 member = m,

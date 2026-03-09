@@ -42,6 +42,17 @@ local NO_CROP     = false -- special: full texture (0..1)
 -- Default crop that makes WoW inventory-style icons look crisp
 local DEFAULT_ICON_CROP = 0.07
 
+local function NormalizeClassToken(className)
+    if type(className) ~= "string" or className == "" then
+        return nil
+    end
+    local normalized = className:upper():gsub("[%s%-%_]", "")
+    if normalized == "" then
+        return nil
+    end
+    return normalized
+end
+
 local function ApplyIconCrop(tex, opts)
 	opts = opts or {}
 
@@ -114,16 +125,16 @@ local function CreateSmallIconButton(parent, texturePath, size, opts)
 end
 
 local function GetClassIcon(className)
-    className = className and string.upper(className) or "UNKNOWN"
-    if SF.WOW_CLASSES and SF.WOW_CLASSES[className] and SF.WOW_CLASSES[className].textureFile then
-        return SF.WOW_CLASSES[className].textureFile
+    local normalized = NormalizeClassToken(className)
+    if normalized and SF.WOW_CLASSES and SF.WOW_CLASSES[normalized] and SF.WOW_CLASSES[normalized].textureFile then
+        return SF.WOW_CLASSES[normalized].textureFile
     end
     return "Interface\\Icons\\INV_Misc_QuestionMark"
 end
 
 local function GetClassColor(className)
-	className = className and string.upper(className) or "UNKNOWN"
-	local c = SF.WOW_CLASSES and SF.WOW_CLASSES[className] and SF.WOW_CLASSES[className].colorCode
+	local normalized = NormalizeClassToken(className)
+	local c = normalized and SF.WOW_CLASSES and SF.WOW_CLASSES[normalized] and SF.WOW_CLASSES[normalized].colorCode
 	if c then
 		return c.r or 1, c.g or 1, c.b or 1
 	end
@@ -523,8 +534,19 @@ function View:Render(models, meta)
         r:SetPoint("TOPRIGHT", self.child, "TOPRIGHT", 0, -y)
 
         -- Icon: spec icon when available (pass memberId for player detection when not in raid), else class
-        local icon = TryGetSpecIcon(model.unit, model.memberId) or GetClassIcon(model.class)
+        local specIcon = TryGetSpecIcon(model.unit, model.memberId)
+        local classIcon = GetClassIcon(model.class)
+        local icon = specIcon or classIcon
         r.Icon:SetTexture(icon)
+        if SF.Debug then
+            local path = specIcon and "spec" or ((classIcon ~= "Interface\\Icons\\INV_Misc_QuestionMark") and "class" or "fallback")
+            SF.Debug:Verbose("LH_ICON", "Render row icon (member=%s path=%s classRaw=%s unit=%s guid=%s)",
+                tostring(model.memberId), path, tostring(model.class), tostring(model.unit), tostring(model.guid))
+            if path == "fallback" then
+                SF.Debug:Warn("LH_ICON", "Missing/invalid class metadata for icon fallback (member=%s classRaw=%s)",
+                    tostring(model.memberId), tostring(model.class))
+            end
+        end
 
         -- Name
         r.Name:SetText(model.displayName or "")
