@@ -16,6 +16,14 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.14-beta.1] - 2026-03-09
+
+### Changed
+- Improved handling of class icons with a fallback mechanism for unknown or invalid class tokens.
+- Enhanced loot helper synchronization to ensure deterministic point rebuilds during session starts and sync operations.
+- Updated member point tracking to provide detailed logs for point changes and session summaries, improving debugging and transparency.
+
 ## [0.5.13] - 2026-03-09
 
 ### Changed
