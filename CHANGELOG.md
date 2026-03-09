@@ -13,6 +13,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.12-beta.1] - 2026-03-09
+
+### Removed
+- Removed the WoW Interface Sync workflow.
+
 ## [0.5.11] - 2026-03-06
 
 ### Changed

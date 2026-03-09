@@ -338,7 +338,13 @@ function Sync:_FailRequest(req, reason)
     end
 
     if SF.PrintWarning then
-        SF:PrintWarning(("Request failed (%s): %s"):format(tostring(reason or "unknown"), tostring(req.id)))
+        local guidance = "Synchronization request did not complete."
+        if req.kind == "NEED_PROFILE" then
+            guidance = "Profile sync is still in progress; keep raid session active and it will retry automatically."
+        elseif req.kind == "NEED_LOGS" then
+            guidance = "Log sync is still in progress; totals may be temporarily incomplete."
+        end
+        SF:PrintWarning(("Sync request failed (%s). %s"):format(tostring(reason or "unknown"), guidance))
     end
 end
 
@@ -489,4 +495,3 @@ function Sync:_RetryRequestSoon(req)
         self:OnRequestTimeout(req.id)
     end)
 end
-
