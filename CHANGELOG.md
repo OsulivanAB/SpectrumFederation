@@ -16,10 +16,8 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ## [0.5.12-beta.1] - 2026-03-09
 
-### Changed
-- Improved synchronization messaging for better clarity when sync operations are partial or fail.
-- Added a short warmup period to prioritize the raid coordinator for initial synchronization requests.
-- Enhanced handling of session state updates to ensure smoother transitions during raid coordination.
+### Removed
+- Removed the WoW Interface Sync workflow.
 
 ## [0.5.11] - 2026-03-06
 
