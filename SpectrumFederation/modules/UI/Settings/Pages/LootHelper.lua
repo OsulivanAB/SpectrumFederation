@@ -107,6 +107,47 @@ local function IsSessionActive()
 	return SF.LootHelperSync and SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive()
 end
 
+local function IsAdmin()
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.IsCurrentUserAdmin then
+		local ok, res = pcall(profile.IsCurrentUserAdmin, profile)
+		if ok then
+			return res and true or false
+		end
+	end
+	return false
+end
+
+local function GetRaidCheckConfig()
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.GetRaidCheckConfig then
+		return profile:GetRaidCheckConfig()
+	end
+	return nil
+end
+
+local function IsRaidCheckSlotEnabled(slotKey)
+	local cfg = GetRaidCheckConfig()
+	if cfg and cfg.slots then
+		return cfg.slots[slotKey] and true or false
+	end
+	return false
+end
+
+local function SetRaidCheckSlot(slotKey, value)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckSlotEnabled then
+		profile:SetRaidCheckSlotEnabled(slotKey, value and true or false)
+	end
+end
+
+local function SetRaidCheckWhispers(mode, value)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckWhispers then
+		profile:SetRaidCheckWhispers(mode, value and true or false)
+	end
+end
+
 -- ==================================================================
 -- Page Definition
 -- ==================================================================
@@ -771,32 +812,202 @@ function Page:Build(panel)
 							if store.SetActiveProfileSetting then
 								store:SetActiveProfileSetting("raidWideSafeMode", value and true or false)
 							end
-						end,
-					},
+							end,
+						},
 
-					{
-						type = "checkbox",
-						label = "Enable Raid-Wide Safemode on Combat",
-						tooltip = "Profile-level persistent setting.",
-						enabled = function()
-							return ProfileActionsEnabled()
-						end,
-						get = function()
-							if store.GetActiveProfileSetting then
-								return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false)
-							end
-							return false
-						end,
-						set = function(value)
-							if store.SetActiveProfileSetting then
-								store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false)
-							end
-						end,
+						{
+							type = "checkbox",
+							label = "Enable Raid-Wide Safemode on Combat",
+							tooltip = "Profile-level persistent setting.",
+							enabled = function()
+								return ProfileActionsEnabled()
+							end,
+							get = function()
+								if store.GetActiveProfileSetting then
+									return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false)
+								end
+								return false
+							end,
+							set = function(value)
+								if store.SetActiveProfileSetting then
+									store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false)
+								end
+							end,
+						},
+
+						{ type = "spacer", height = 12 },
+						{ type = "text", text = "Raid Check Settings" },
+
+						{
+							type = "button",
+							label = "Start Pre-Raid Check",
+							buttonText = "Start Pre-Raid Check",
+							width = 180,
+							enabled = function()
+								return ProfileActionsEnabled() and IsAdmin()
+							end,
+							onClick = function(ctx)
+								if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then
+									SF.RaidCheck:RunPreRaidCheck()
+									ctx.section:SetMessage("Pre-Raid Check started.", "info")
+								else
+									ctx.section:SetMessage("Raid Check is not available.", "error")
+								end
+							end,
+						},
+
+						{
+							type = "button",
+							label = "Start Raid Check",
+							buttonText = "Start Raid Check",
+							width = 180,
+							enabled = function()
+								return ProfileActionsEnabled() and IsAdmin()
+							end,
+							onClick = function(ctx)
+								if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then
+									SF.RaidCheck:RunRaidCheck()
+									ctx.section:SetMessage("Raid Check started.", "info")
+								else
+									ctx.section:SetMessage("Raid Check is not available.", "error")
+								end
+							end,
+						},
+
+						{
+							type = "checkbox",
+							label = "Enable Whispers During Pre-Raid Check",
+							tooltip = "When enabled, whisper players who are missing required enchants or gems during a Pre-Raid Check.",
+							enabled = function()
+								return ProfileActionsEnabled() and IsAdmin()
+							end,
+							get = function()
+								local cfg = GetRaidCheckConfig()
+								return cfg and cfg.enableWhispersPreRaid or false
+							end,
+							set = function(value)
+								SetRaidCheckWhispers("pre", value)
+							end,
+						},
+
+						{
+							type = "checkbox",
+							label = "Enable Whispers During Raid Check",
+							tooltip = "When enabled, whisper players their Raid Check result. Missing players should be told what they are missing. Fully prepared players should be told they received a point.",
+							enabled = function()
+								return ProfileActionsEnabled() and IsAdmin()
+							end,
+							get = function()
+								local cfg = GetRaidCheckConfig()
+								return cfg and cfg.enableWhispersRaid or false
+							end,
+							set = function(value)
+								SetRaidCheckWhispers("raid", value)
+							end,
+						},
+
+						{
+							type = "checkbox",
+							label = "Head",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("head") end,
+							set = function(value) SetRaidCheckSlot("head", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Neck",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("neck") end,
+							set = function(value) SetRaidCheckSlot("neck", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Shoulders",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("shoulders") end,
+							set = function(value) SetRaidCheckSlot("shoulders", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Back",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("back") end,
+							set = function(value) SetRaidCheckSlot("back", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Chest",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("chest") end,
+							set = function(value) SetRaidCheckSlot("chest", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Wrist",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("wrist") end,
+							set = function(value) SetRaidCheckSlot("wrist", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Gloves",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("hands") end,
+							set = function(value) SetRaidCheckSlot("hands", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Belt",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("belt") end,
+							set = function(value) SetRaidCheckSlot("belt", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Legs",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("legs") end,
+							set = function(value) SetRaidCheckSlot("legs", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Boots",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("boots") end,
+							set = function(value) SetRaidCheckSlot("boots", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Rings",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("rings") end,
+							set = function(value) SetRaidCheckSlot("rings", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Trinkets",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("trinkets") end,
+							set = function(value) SetRaidCheckSlot("trinkets", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Main Hand",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("mainHand") end,
+							set = function(value) SetRaidCheckSlot("mainHand", value) end,
+						},
+						{
+							type = "checkbox",
+							label = "Off Hand",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							get = function() return IsRaidCheckSlotEnabled("offHand") end,
+							set = function(value) SetRaidCheckSlot("offHand", value) end,
+						},
 					},
 				},
 			},
-		},
-	}
+		}
 
 	renderer:Build(panel, def)
 end

@@ -266,13 +266,35 @@ function SF:RegisterLootHelperSlashCommands()
         
         -- Delete
         SF.lootHelperDB.profiles[profileId] = nil
-        SF:PrintSuccess(string.format("Deleted profile: %s (ID: %s)", profileName, profileId))
-        
-    end, "Delete a loot profile (by name or ID)")
+	        SF:PrintSuccess(string.format("Deleted profile: %s (ID: %s)", profileName, profileId))
+	        
+	    end, "Delete a loot profile (by name or ID)")
 
-    SF:RegisterSlashCommand("loot", function(args)
-        -- Parse subcommands
-        args = args:trim():lower()
+    -- Raid Check command
+    SF:RegisterSlashCommand("raidcheck", function(args)
+        args = (args or ""):trim():lower()
+        if args == "pre" or args == "pre-raid" or args == "preraid" then
+            if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then
+                SF.RaidCheck:RunPreRaidCheck()
+            else
+                SF:PrintError("Raid Check module not available.")
+            end
+            return
+        elseif args == "raid" or args == "start" or args == "" then
+            if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then
+                SF.RaidCheck:RunRaidCheck()
+            else
+                SF:PrintError("Raid Check module not available.")
+            end
+            return
+        end
+
+        SF:PrintInfo("Usage: /sf raidcheck pre|raid")
+    end, "Run a Raid Check (pre|raid)")
+	
+	    SF:RegisterSlashCommand("loot", function(args)
+	        -- Parse subcommands
+	        args = args:trim():lower()
         
         -- Handle "session start" subcommand
         if args == "session start" then

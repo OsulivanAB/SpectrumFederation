@@ -181,23 +181,29 @@ function Sync:CreateProfileFromMeta(profileMeta)
     profile._logIndex = {}
     profile._authorCounters = {}
     profile._members = {}
-    profile._adminUsers = {}
-    profile._activeProfile = false
-    profile._profileId = profileMeta._profileId
-    profile._profileName = profileMeta._profileName or "Imported Profile"
+	profile._adminUsers = {}
+	profile._activeProfile = false
+	profile._profileId = profileMeta._profileId
+	profile._profileName = profileMeta._profileName or "Imported Profile"
+	if profile._EnsureRaidCheckConfig then
+		profile:_EnsureRaidCheckConfig()
+	end
 
-    return profile
+	return profile
 end
 
 -- Function Export a full snapshot for a profile, suitable for PROFILE_SNAPSHOT message.
 -- @param profileId string Stable profile id
 -- @return table|nil Snapshot payload or nil if profile not found
 function Sync:BuildProfileSnapshot(profileId)
-    local profile = self:FindLocalProfileById(profileId)
-    if not profile then return nil end
-    if not profile.ExportSnapshot then return nil end
-    
-    local snapshot = profile:ExportSnapshot()
+	local profile = self:FindLocalProfileById(profileId)
+	if not profile then return nil end
+	if not profile.ExportSnapshot then return nil end
+	if profile._EnsureRaidCheckConfig then
+		profile:_EnsureRaidCheckConfig()
+	end
+	
+	local snapshot = profile:ExportSnapshot()
     
     -- Debug: log snapshot summary
     if SF.Debug then
@@ -276,16 +282,20 @@ function Sync:RebuildProfile(profileId, reason)
         return false, "invalid profileId"
     end
 
-    local profile = self:FindLocalProfileById(profileId)
-    if not profile then
-        return false, "profile not found"
-    end
+	local profile = self:FindLocalProfileById(profileId)
+	if not profile then
+		return false, "profile not found"
+	end
 
-    local rebuildReason = tostring(reason or "unknown")
-    local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
-    if SF.Debug then
-        SF.Debug:Info("SYNC_PROFILE", "Rebuild start (profileId=%s, reason=%s, logs=%d)",
-            tostring(profileId), rebuildReason, #logs)
+	if profile._EnsureRaidCheckConfig then
+		profile:_EnsureRaidCheckConfig()
+	end
+
+	local rebuildReason = tostring(reason or "unknown")
+	local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
+	if SF.Debug then
+		SF.Debug:Info("SYNC_PROFILE", "Rebuild start (profileId=%s, reason=%s, logs=%d)",
+			tostring(profileId), rebuildReason, #logs)
     end
 
     -- 1) Ensure deterministic log order (MergeLogTables already sorts, but safe to re-sort)
