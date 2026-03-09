@@ -1,0 +1,2 @@
+eu|wow|something|something|something|11.2.5.63906|cdn|buildcfg
+us|wow|something|something|something|12.0.1.63091|cdn|buildcfg

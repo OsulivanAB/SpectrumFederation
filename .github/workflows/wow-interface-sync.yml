@@ -1,0 +1,132 @@
+name: WoW Interface Sync
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wow-interface-sync
+  cancel-in-progress: true
+
+env:
+  ADDON_NAME: SpectrumFederation
+  TOC_PATH: SpectrumFederation/SpectrumFederation.toc
+
+jobs:
+  sync-interface:
+    name: Sync Interface and Versions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+          path: main
+
+      - name: Checkout beta branch
+        uses: actions/checkout@v4
+        with:
+          ref: beta
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+          path: beta
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python test dependency
+        run: pip install pytest
+
+      - name: Run wow interface sync tests
+        run: python -m pytest -q
+
+      - name: Deterministic resolver smoke test (no network)
+        # "main" is the checkout path created by the first actions/checkout step.
+        working-directory: main
+        run: |
+          LIVE_INTERFACE_OVERRIDE=120001 \
+          python3 .github/scripts/wow_interface_sync.py --dry-run --region us --no-network
+
+      - name: Sync Interface and versions
+        id: sync
+        working-directory: main
+        run: |
+          python3 .github/scripts/wow_interface_sync.py \
+            --toc-path "${TOC_PATH}" \
+            --main-path "${GITHUB_WORKSPACE}/main" \
+            --beta-path "${GITHUB_WORKSPACE}/beta"
+
+      - name: Commit and push main TOC updates
+        if: steps.sync.outputs.main_updated == 'true'
+        working-directory: main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Keep this guard to avoid failing if sync outputs are stale or branch diverged.
+          if git diff --quiet -- "${TOC_PATH}"; then
+            echo "No main TOC changes to commit"
+          else
+            git add "${TOC_PATH}"
+            git commit -m "chore: sync Interface ${{ steps.sync.outputs.interface }} and version ${{ steps.sync.outputs.main_version }} [skip ci]"
+            git push origin main
+          fi
+
+      - name: Commit and push beta TOC updates
+        if: steps.sync.outputs.beta_updated == 'true'
+        working-directory: beta
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Keep this guard to avoid failing if sync outputs are stale or branch diverged.
+          if git diff --quiet -- "${TOC_PATH}"; then
+            echo "No beta TOC changes to commit"
+          else
+            git add "${TOC_PATH}"
+            git commit -m "chore: sync Interface ${{ steps.sync.outputs.interface }} and version ${{ steps.sync.outputs.beta_version }} [skip ci]"
+            git push origin beta
+          fi
+
+      - name: Package main artifact
+        if: steps.sync.outputs.main_updated == 'true'
+        working-directory: main
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          python3 .github/scripts/publish_release.py "${{ steps.sync.outputs.main_version }}" --interface "${{ steps.sync.outputs.interface }}" --dry-run
+
+      - name: Upload main artifact
+        if: steps.sync.outputs.main_updated == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpectrumFederation-main-${{ steps.sync.outputs.main_version }}
+          path: |
+            main/build/SpectrumFederation-${{ steps.sync.outputs.main_version }}.zip
+            main/build/release.json
+
+      - name: Package beta artifact (only if beta stays ahead)
+        if: steps.sync.outputs.beta_updated == 'true' && steps.sync.outputs.beta_build == 'true'
+        working-directory: beta
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          python3 .github/scripts/publish_release.py "${{ steps.sync.outputs.beta_version }}" --interface "${{ steps.sync.outputs.interface }}" --dry-run
+
+      - name: Upload beta artifact
+        if: steps.sync.outputs.beta_updated == 'true' && steps.sync.outputs.beta_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpectrumFederation-beta-${{ steps.sync.outputs.beta_version }}
+          path: |
+            beta/build/SpectrumFederation-${{ steps.sync.outputs.beta_version }}.zip
+            beta/build/release.json

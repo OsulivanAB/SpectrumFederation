@@ -2,36 +2,41 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [0.5.7-beta.3] - 2026-02-13
 
-### Added
-- Restored the "General" settings page with UI customization options (window style, font style, font size).
 
-### Fixed
-- Window Style setting now properly applies visual changes to the Loot Helper window:
-  - **Default**: Standard WoW tooltip-style borders with moderate transparency.
-  - **Compact**: Thinner borders and reduced spacing for a cleaner look.
-  - **Minimal**: Very thin borders with higher transparency for minimal visual footprint.
 
-### Changed
-- Settings menu now opens to the "General" tab by default.
 
-## [0.5.7-beta.2] - 2026-02-13
 
-### Added
-- Auto-refresh functionality for settings UI when external changes are detected.
+
+
+
+
+
+
+## [0.5.11] - 2026-03-06
 
 ### Changed
-- Context-aware behavior for the close button in the Loot Helper window:
-  - In raid: Disables Loot Helper completely.
-  - Out of raid: Hides the window outside raids only.
-- Updated tooltip for the close button to reflect new behavior.
+- Infrastructure and tooling updates (no addon code changes)
 
-## [0.5.7-beta.1] - 2026-02-12
+## [0.5.10] - 2026-03-06
 
 ### Changed
-- Updated settings menu to open to the "Loot Helper" tab by default.
-- Removed the "General Settings" page from the settings menu.
+- Infrastructure and tooling updates (no addon code changes)
+
+## [0.5.9] - 2026-03-05
+
+### Changed
+- Infrastructure and tooling updates (no addon code changes)
+
+## [0.5.8] - 2026-03-04
+
+### Changed
+- Infrastructure and tooling updates (no addon code changes)
+
+## [0.5.7] - 2026-03-03
+
+### Changed
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.5.5] - 2026-02-11
 
