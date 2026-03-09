@@ -27,6 +27,10 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
     local adminSyncId = self:_NextNonce("AS")
     local mode = (opts.onComplete and "REANNOUNCE") or "START"
     
+    local function normalize(name)
+        return self:_NormalizeNameRealmForCompare(name) or name
+    end
+
     -- Who do we ask?
     local admins = self:_GetProfileAdminUsers(profile)
     local me = self:_SelfId()
@@ -36,6 +40,12 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         if admin ~= me then
             table.insert(adminList, admin)
         end
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Admin convergence begin (mode=%s, adminSyncId=%s, deadline=%.2fs, targets=%s)",
+            tostring(mode), tostring(adminSyncId), (self.cfg.adminConvergenceCollectSec or 1.5),
+            (#adminList > 0) and table.concat(adminList, ",") or "none")
     end
     
     if SF.Debug then
@@ -48,6 +58,7 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         startedAt       = self:_Now(),
         deadlineAt      = self:_Now() + (self.cfg.adminConvergenceCollectSec or 1.5),
         expected        = {}, -- [admin] = true
+        expectedRaw     = {}, -- [normalizedAdmin] = canonical name
         pendingReq      = {}, -- [admin] = true
         pendingCount    = 0,
         finished        = false,
@@ -60,7 +71,11 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
 
     for _, admin in ipairs(admins) do
         if admin ~= me then
-            self.state._adminConvergence.expected[admin] = true
+            local norm = normalize(admin)
+            if norm then
+                self.state._adminConvergence.expected[norm] = true
+                self.state._adminConvergence.expectedRaw[norm] = admin
+            end
             if SF.LootHelperComm then
                 local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.ADMIN_SYNC, {
                     sessionId       = sessionId,
@@ -109,7 +124,20 @@ function Sync:_FinishAdminConvergence(reason)
     self.state._adminConvergence = nil
     
     if SF.Debug then
-        SF.Debug:Info("SYNC", "Finishing admin convergence (reason: %s)", tostring(reason or "unknown"))
+        local missing = {}
+        for adminKey in pairs(conv.expected or {}) do
+            if not (self.state.adminStatuses and self.state.adminStatuses[adminKey]) then
+                local raw = conv.expectedRaw and conv.expectedRaw[adminKey] or adminKey
+                table.insert(missing, raw)
+            end
+        end
+        local pendingReq = 0
+        if type(conv.pendingReq) == "table" then
+            for _ in pairs(conv.pendingReq) do pendingReq = pendingReq + 1 end
+        end
+        SF.Debug:Info("SYNC", "Finishing admin convergence (reason: %s, missingStatuses=%d, pendingRequests=%d)%s",
+            tostring(reason or "unknown"), #missing, pendingReq,
+            (#missing > 0) and (" missing={" .. table.concat(missing, ",") .. "}") or "")
     end
     
     -- Call completion hook (pcall for safety)

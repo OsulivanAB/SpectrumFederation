@@ -474,7 +474,7 @@ function Comm:_HandleIncoming(kind, text, distribution, sender)
     -- 1) Parse Envelope
     local ok, msgType, proto, enc, payloadStr, parseErr = SP.ParseEnvelope(text)
     if not ok then
-        DVerbose("Drop: bad envelope from %s (%s)", tostring(sender), tostring(parseErr))
+        DWarn("Drop: bad envelope from %s (%s)", tostring(sender), tostring(parseErr))
         return
     end
 
@@ -499,6 +499,7 @@ function Comm:_HandleIncoming(kind, text, distribution, sender)
         if nackEnvelope then
             self:SendCommMessage(self.PREFIX.CONTROL, nackEnvelope, "WHISPER", sender, self.cfg.nackPrio or "ALERT")
         end
+        DWarn("Drop: unsupported proto from %s (proto=%s msgType=%s)", tostring(sender), tostring(proto), tostring(msgType))
         return
     end
 
@@ -509,7 +510,7 @@ function Comm:_HandleIncoming(kind, text, distribution, sender)
         if payloadStr and payloadStr ~= "" and enc ~= SP.ENC_NONE then
             payload, err = SP.DecodePayloadTable(payloadStr, enc)
             if err then
-                DVerbose("Drop: bad payload decode from %s (%s)", sender, tostring(err))
+                DWarn("Drop: bad payload decode from %s (%s)", tostring(sender), tostring(err))
                 return
             end
         end
