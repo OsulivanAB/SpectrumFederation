@@ -2,6 +2,18 @@ local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+local function GetMemberById(profile, memberId)
+    if not profile or type(memberId) ~= "string" or memberId == "" then
+        return nil
+    end
+    if profile.getMemberByID then
+        return profile:getMemberByID(memberId)
+    elseif profile.GetMemberByID then
+        return profile:GetMemberByID(memberId)
+    end
+    return nil
+end
+
 
 -- Function Called when a local admin creates a new log entry; broadcasts NEW_LOG to raid.
 -- @param profileId string Current session profile id
@@ -85,12 +97,7 @@ function Sync:HandleNewLog(sender, payload)
     local profileBefore = self:FindLocalProfileById(profileId)
     local oldPoints = 0
     if profileBefore and type(memberId) == "string" and memberId ~= "" then
-        local beforeMember = nil
-        if profileBefore.getMemberByID then
-            beforeMember = profileBefore:getMemberByID(memberId)
-        elseif profileBefore.GetMemberByID then
-            beforeMember = profileBefore:GetMemberByID(memberId)
-        end
+        local beforeMember = GetMemberById(profileBefore, memberId)
         oldPoints = (beforeMember and tonumber(beforeMember.pointBalance)) or 0
     end
 
@@ -137,14 +144,7 @@ function Sync:HandleNewLog(sender, payload)
 
     if SF.Debug then
         local profileAfter = self:FindLocalProfileById(profileId)
-        local memberAfter = nil
-        if profileAfter then
-            if profileAfter.getMemberByID then
-                memberAfter = profileAfter:getMemberByID(memberId)
-            elseif profileAfter.GetMemberByID then
-                memberAfter = profileAfter:GetMemberByID(memberId)
-            end
-        end
+        local memberAfter = GetMemberById(profileAfter, memberId)
         local newPoints = (memberAfter and tonumber(memberAfter.pointBalance)) or 0
         SF.Debug:Info("SYNC_POINTS", "Apply log (path=live_update member=%s old=%d delta=%d new=%d eventType=%s logId=%s)",
             tostring(memberId), oldPoints, (tonumber(newPoints) or 0) - oldPoints, tonumber(newPoints) or 0,

@@ -61,6 +61,8 @@ local function _BuildPointsSummary(profile)
     for _, row in ipairs(sortable) do
         local s = ("%s=%d"):format(row.id, row.points)
         for i = 1, #s do
+            -- Lightweight deterministic rolling checksum (djb2-inspired variant):
+            -- multiplier 33 keeps low cost, modulo 2^31-1 keeps value bounded.
             checksum = (checksum * 33 + s:byte(i)) % 2147483647
         end
     end
@@ -371,8 +373,8 @@ function Sync:RebuildProfile(profileId, reason)
                 end
                 if member and SF.Debug then
                     local newPoints = tonumber(member.pointBalance) or 0
-                    SF.Debug:Verbose("SYNC_POINTS", "Apply log (path=replay:%s member=%s old=%d delta=%d new=%d change=%s)",
-                        rebuildReason, tostring(_MemberId(member) or data.member), oldPoints or 0, newPoints - (oldPoints or 0),
+                    SF.Debug:Verbose("SYNC_POINTS", "Apply log (path=replay reason=%s member=%s old=%d delta=%d new=%d change=%s)",
+                        rebuildReason, tostring(_MemberId(member) or data.member), oldPoints or 0, newPoints - oldPoints,
                         newPoints, tostring(data.change))
                 end
             elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ARMOR_CHANGE) then

@@ -59,6 +59,8 @@ local function NormalizeClassToken(class)
     return normalized
 end
 
+local SYNC_REBUILD_NOTE = "state will be reconciled from logs via sync rebuild"
+
 -- Member class definition
 local Member = {}
 Member.__index = Member
@@ -314,8 +316,9 @@ function Member:IncrementPoints()
     local oldBalance = self.pointBalance
     self.pointBalance = self.pointBalance + 1
     if SF.Debug then
-        SF.Debug:Info("SYNC_POINTS", "Increment action (mode=apply_delta member=%s old=%d delta=1 new=%d)",
-            self:GetFullIdentifier(), oldBalance, self.pointBalance)
+        local delta = self.pointBalance - oldBalance
+        SF.Debug:Info("SYNC_POINTS", "Increment action (mode=apply_delta member=%s old=%d delta=%d new=%d)",
+            self:GetFullIdentifier(), oldBalance, delta, self.pointBalance)
     end
 
     -- Add Log Entry to Loot Profile Table
@@ -330,7 +333,7 @@ function Member:IncrementPoints()
     if SF.Debug then
         SF.Debug:Verbose("MEMBER", "%s points incremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
         SF.Debug:Verbose("SYNC_POINTS", "Increment action (mode=recompute_on_sync member=%s note=%s)",
-            self:GetFullIdentifier(), "state will be reconciled from logs via sync rebuild")
+            self:GetFullIdentifier(), SYNC_REBUILD_NOTE)
     end
     return true
 end
