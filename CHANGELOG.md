@@ -15,15 +15,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.13-beta.1] - 2026-03-09
 
-### Fixed
-- Loot Helper admin sync response tracking, member reconciliation from logs, and live point propagation; added targeted diagnostics.
-
-## [0.5.13-beta.2] - 2026-03-09
+## [0.5.13] - 2026-03-09
 
 ### Changed
-- Enhanced debug visibility for Loot Helper, including improved diagnostics for admin syncs, request timeouts, live log handling, and gap detection.
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.5.12] - 2026-03-09
 
