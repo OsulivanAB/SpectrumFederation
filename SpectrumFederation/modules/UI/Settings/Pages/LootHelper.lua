@@ -835,7 +835,7 @@ function Page:Build(panel)
 						{ type = "spacer", height = 12 },
 						{ type = "heading", text = "Raid Check Settings" },
 
-						{ type = "heading", text = "Raid Checks..." },
+						{ type = "text", text = "Raid Checks..." },
 						{
 							type = "buttonRow",
 							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
@@ -895,7 +895,7 @@ function Page:Build(panel)
 							},
 						},
 
-							{ type = "heading", text = "Enchants to look for" },
+							{ type = "text", text = "Enchants to look for" },
 							{
 								type = "checkboxGrid",
 								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
