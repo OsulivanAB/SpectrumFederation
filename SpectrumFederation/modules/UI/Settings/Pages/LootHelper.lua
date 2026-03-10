@@ -794,7 +794,7 @@ function Page:Build(panel)
 						end,
 					},
 
-					{ type = "heading", text = "Enable Raid Wide Safe Mode" },
+					{ type = "text", text = "Enable Raid Wide Safe Mode" },
 					{
 						type = "checkboxGrid",
 						enabled = function() return ProfileActionsEnabled() end,

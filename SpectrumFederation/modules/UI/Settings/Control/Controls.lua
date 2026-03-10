@@ -185,9 +185,11 @@ end
 function Controls:AddButtonRow(section, opts)
 	return section:AddRow(26, function(row)
 		local btns = {}
+		local defs = {}
 		for i = 1, 2 do
 			local def = opts[i]
 			if def then
+				defs[#defs + 1] = def
 				local btn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
 				btn:SetSize(def.width or 140, def.height or 22)
 				if i == 1 then
@@ -195,7 +197,14 @@ function Controls:AddButtonRow(section, opts)
 				else
 					btn:SetPoint("LEFT", row, "LEFT", (def.offsetX or 200), 0)
 				end
-				btn:SetText(def.text or "")
+				local function ApplyText()
+					if type(def.text) == "function" then
+						btn:SetText(def.text() or "")
+					else
+						btn:SetText(def.text or "")
+					end
+				end
+				ApplyText()
 				if def.onClick then
 					btn:SetScript("OnClick", function()
 						if btn:IsEnabled() then
@@ -203,17 +212,88 @@ function Controls:AddButtonRow(section, opts)
 						end
 					end)
 				end
-				table.insert(btns, btn)
+				btns[#btns + 1] = btn
+				btn.ApplyText = ApplyText
 			end
 		end
 
 		local function Refresh()
 			local enabled = EvalBool(opts.enabled, true)
-			for _, b in ipairs(btns) do
+			for idx, b in ipairs(btns) do
 				if b.SetEnabled then b:SetEnabled(enabled) end
 				b:SetAlpha(enabled and 1 or 0.45)
+				local def = defs[idx]
+				if def and b.ApplyText then
+					b:ApplyText()
+				end
 			end
 			self:_ApplyRowState(row, section, opts, btns)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
+-- ---------------------------------------
+-- Checkbox Row (multi-column)
+-- ---------------------------------------
+-- Add a single row with multiple checkboxes laid out horizontally
+-- @param section table Section to add row into
+-- @param opts table Options including items (array of entries with label/get/set), spacing, visible/enabled
+-- @return Frame The created row
+function Controls:AddCheckboxRow(section, opts)
+	local items = opts.items or {}
+	local spacing = opts.spacing or 140
+
+	return section:AddRow(opts.height or 26, function(row)
+		local checkboxes = {}
+
+		local function BuildCheckbox(idx, def)
+			if not def then return nil end
+			local cb = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
+			if idx == 1 then
+				cb:SetPoint("LEFT", row, "LEFT", 0, 0)
+			else
+				cb:SetPoint("LEFT", checkboxes[idx - 1] or row, "LEFT", spacing, 0)
+			end
+
+			if cb.Text then
+				cb.Text:SetText("")
+				cb.Text:Hide()
+			end
+
+			local label = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			label:SetPoint("LEFT", cb, "RIGHT", 4, 0)
+			label:SetText(def.label or "")
+
+			if def.tooltip then
+				AttachTooltip(label, def.label, def.tooltip)
+			end
+
+			cb:SetScript("OnClick", function(selfBtn)
+				if not selfBtn:IsEnabled() then return end
+				if def.set then
+					def.set(selfBtn:GetChecked() and true or false)
+				end
+			end)
+
+			checkboxes[idx] = cb
+			return cb
+		end
+
+		for idx, def in ipairs(items) do
+			BuildCheckbox(idx, def)
+		end
+
+		local function Refresh()
+			for idx, def in ipairs(items) do
+				local cb = checkboxes[idx]
+				if cb and def.get then
+					cb:SetChecked(def.get() and true or false)
+				end
+			end
+			Controls:_ApplyRowState(row, section, opts, checkboxes)
 		end
 
 		Refresh()

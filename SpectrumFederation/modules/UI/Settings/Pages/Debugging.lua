@@ -129,115 +129,98 @@ function Page:Build(panel)
 							end
 						end,
 					},
-					
+
 					{
-						type = "button",
-						label = "Start Debugging",
-						buttonText = "Start",
-						width = 100,
+						type = "buttonRow",
 						enabled = function()
-							return SF.Debug and not SF.Debug:IsEnabled()
+							return SF.Debug ~= nil
 						end,
-						onClick = function(ctx)
-							if SF.Debug then
-								SF.Debug:SetEnabled(true)
-								SF:PrintSuccess("Debug logging enabled")
-								ctx.pageBuilder:Refresh()
-							end
-						end,
+						{
+							text = function()
+								if SF.Debug and SF.Debug:IsEnabled() then
+									return "Stop Debugging"
+								end
+								return "Start Debugging"
+							end,
+							width = 150,
+							onClick = function(ctx)
+								if not SF.Debug then return end
+								if SF.Debug:IsEnabled() then
+									SF.Debug:SetEnabled(false)
+									SF:PrintInfo("Debug logging disabled")
+								else
+									SF.Debug:SetEnabled(true)
+									SF:PrintSuccess("Debug logging enabled")
+								end
+								if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+									ctx.pageBuilder:Refresh()
+								end
+							end,
+						},
+						{
+							text = "Clear Logs",
+							width = 150,
+							onClick = function(ctx)
+								if SF.debugDB and SF.debugDB.logs then
+									SF.debugDB.logs = {}
+									SF:PrintSuccess("Debug logs cleared")
+									if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+										ctx.pageBuilder:Refresh()
+									end
+								end
+							end,
+						},
 					},
-					
+
+					{ type = "text", text = "------- Log Level Filters ---------" },
 					{
-						type = "button",
-						label = "Stop Debugging",
-						buttonText = "Stop",
-						width = 100,
-						enabled = function()
-							return SF.Debug and SF.Debug:IsEnabled()
-						end,
-						onClick = function(ctx)
-							if SF.Debug then
-								SF.Debug:SetEnabled(false)
-								SF:PrintInfo("Debug logging disabled")
-								ctx.pageBuilder:Refresh()
-							end
-						end,
+						type = "checkboxRow",
+						spacing = 150,
+						items = {
+							{
+								label = "Verbose",
+								tooltip = "Display verbose-level debug messages",
+								get = function()
+									return panel.__sfLogLevels.VERBOSE
+								end,
+								set = function(value)
+									panel.__sfLogLevels.VERBOSE = value
+								end,
+							},
+							{
+								label = "Info",
+								tooltip = "Display info-level debug messages",
+								get = function()
+									return panel.__sfLogLevels.INFO
+								end,
+								set = function(value)
+									panel.__sfLogLevels.INFO = value
+								end,
+							},
+							{
+								label = "Warn",
+								tooltip = "Display warning-level debug messages",
+								get = function()
+									return panel.__sfLogLevels.WARN
+								end,
+								set = function(value)
+									panel.__sfLogLevels.WARN = value
+								end,
+							},
+							{
+								label = "Error",
+								tooltip = "Display error-level debug messages",
+								get = function()
+									return panel.__sfLogLevels.ERROR
+								end,
+								set = function(value)
+									panel.__sfLogLevels.ERROR = value
+								end,
+							},
+						},
 					},
-					
-					{
-						type = "button",
-						label = "Clear Logs",
-						buttonText = "Clear",
-						width = 100,
-						onClick = function(ctx)
-							if SF.debugDB and SF.debugDB.logs then
-								SF.debugDB.logs = {}
-								SF:PrintSuccess("Debug logs cleared")
-								ctx.pageBuilder:Refresh()
-							end
-						end,
-					},
-				},
-			},
-			
-			{
-				id = "filters",
-				title = "Log Level Filters",
-				items = {
-					{
-						type = "checkbox",
-						label = "Show VERBOSE",
-						tooltip = "Display verbose-level debug messages",
-						get = function()
-							return panel.__sfLogLevels.VERBOSE
-						end,
-						set = function(value)
-							panel.__sfLogLevels.VERBOSE = value
-						end,
-					},
-					
-					{
-						type = "checkbox",
-						label = "Show INFO",
-						tooltip = "Display info-level debug messages",
-						get = function()
-							return panel.__sfLogLevels.INFO
-						end,
-						set = function(value)
-							panel.__sfLogLevels.INFO = value
-						end,
-					},
-					
-					{
-						type = "checkbox",
-						label = "Show WARN",
-						tooltip = "Display warning-level debug messages",
-						get = function()
-							return panel.__sfLogLevels.WARN
-						end,
-						set = function(value)
-							panel.__sfLogLevels.WARN = value
-						end,
-					},
-					
-					{
-						type = "checkbox",
-						label = "Show ERROR",
-						tooltip = "Display error-level debug messages",
-						get = function()
-							return panel.__sfLogLevels.ERROR
-						end,
-						set = function(value)
-							panel.__sfLogLevels.ERROR = value
-						end,
-					},
-				},
-			},
-			
-			{
-				id = "logs",
-				title = "Debug Logs",
-				items = {
+
+					{ type = "text", text = "------- Debug Logs ---------" },
 					{
 						type = "help",
 						text = "Use Ctrl+A to select all, Ctrl+C to copy",
