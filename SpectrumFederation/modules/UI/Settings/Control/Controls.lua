@@ -179,6 +179,128 @@ local function RegisterRefresh(section, fn)
 	end
 end
 
+-- ---------------------------------------
+-- Button Row (two buttons)
+-- ---------------------------------------
+function Controls:AddButtonRow(section, opts)
+	return section:AddRow(26, function(row)
+		local btns = {}
+		local defs = {}
+		for i = 1, 2 do
+			local def = opts[i]
+			if def then
+				defs[#defs + 1] = def
+				local btn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+				btn:SetSize(def.width or 140, def.height or 22)
+				if i == 1 then
+					btn:SetPoint("LEFT", row, "LEFT", 0, 0)
+				else
+					btn:SetPoint("LEFT", row, "LEFT", (def.offsetX or 200), 0)
+				end
+				local function ApplyText()
+					if type(def.text) == "function" then
+						btn:SetText(def.text() or "")
+					else
+						btn:SetText(def.text or "")
+					end
+				end
+				ApplyText()
+				if def.onClick then
+					btn:SetScript("OnClick", function()
+						if btn:IsEnabled() then
+							def.onClick(btn)
+						end
+					end)
+				end
+				btns[#btns + 1] = btn
+				btn.ApplyText = ApplyText
+			end
+		end
+
+		local function Refresh()
+			local enabled = EvalBool(opts.enabled, true)
+			for idx, b in ipairs(btns) do
+				if b.SetEnabled then b:SetEnabled(enabled) end
+				b:SetAlpha(enabled and 1 or 0.45)
+				local def = defs[idx]
+				if def and b.ApplyText then
+					b:ApplyText()
+				end
+			end
+			self:_ApplyRowState(row, section, opts, btns)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
+-- ---------------------------------------
+-- Checkbox Row (multi-column)
+-- ---------------------------------------
+-- Add a single row with multiple checkboxes laid out horizontally
+-- @param section table Section to add row into
+-- @param opts table Options including items (array of entries with label/get/set), spacing, visible/enabled
+-- @return Frame The created row
+function Controls:AddCheckboxRow(section, opts)
+	local items = opts.items or {}
+	local spacing = opts.spacing or 140
+
+	return section:AddRow(opts.height or 26, function(row)
+		local checkboxes = {}
+
+		local function BuildCheckbox(idx, def)
+			if not def then return nil end
+			local cb = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
+			if idx == 1 then
+				cb:SetPoint("LEFT", row, "LEFT", 0, 0)
+			else
+				cb:SetPoint("LEFT", checkboxes[idx - 1] or row, "LEFT", spacing, 0)
+			end
+
+			if cb.Text then
+				cb.Text:SetText("")
+				cb.Text:Hide()
+			end
+
+			local label = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			label:SetPoint("LEFT", cb, "RIGHT", 4, 0)
+			label:SetText(def.label or "")
+
+			if def.tooltip then
+				AttachTooltip(label, def.label, def.tooltip)
+			end
+
+			cb:SetScript("OnClick", function(selfBtn)
+				if not selfBtn:IsEnabled() then return end
+				if def.set then
+					def.set(selfBtn:GetChecked() and true or false)
+				end
+			end)
+
+			checkboxes[idx] = cb
+			return cb
+		end
+
+		for idx, def in ipairs(items) do
+			BuildCheckbox(idx, def)
+		end
+
+		local function Refresh()
+			for idx, def in ipairs(items) do
+				local cb = checkboxes[idx]
+				if cb and def.get then
+					cb:SetChecked(def.get() and true or false)
+				end
+			end
+			Controls:_ApplyRowState(row, section, opts, checkboxes)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
 -- Resolve get/set binding helpers (alias of ResolveGetSet)
 -- @param opts table Options containing get/set or path
 -- @return function get, function set
@@ -262,6 +384,90 @@ function Controls:AddCheckbox(section, opts)
 		row:SetScript("OnMouseDown", function()
 			if cb:IsEnabled() then
 				cb:Click()
+			end
+		end)
+	end)
+end
+
+-- ---------------------------------------
+-- Checkbox Grid (2 columns per row)
+-- ---------------------------------------
+-- Add a two-cell checkbox row for compact layouts
+-- @param section table Section to add row into
+-- @param opts table Options including items (array of up to 2 entries with label/get/set), visible/enabled
+-- @return Frame The created row
+function Controls:AddCheckboxGrid(section, opts)
+	local items = opts.items or {}
+
+	return section:AddRow(opts.height or 26, function(row)
+		local cells = {}
+		for i = 1, 2 do
+			local cell = CreateFrame("Frame", nil, row)
+			cells[i] = cell
+			if i == 1 then
+				cell:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+				cell:SetPoint("BOTTOM", row, "BOTTOM", 0, 0)
+				cell:SetPoint("RIGHT", row, "CENTER", -6, 0)
+			else
+				cell:SetPoint("TOPLEFT", row, "CENTER", 6, 0)
+				cell:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+			end
+		end
+
+		local checkboxes = {}
+
+		local function BuildCell(idx, def)
+			if not def then return end
+			local cell = cells[idx]
+			local cb = CreateFrame("CheckButton", nil, cell, "UICheckButtonTemplate")
+			cb:SetPoint("LEFT", cell, "LEFT", 0, 0)
+
+			if cb.Text then
+				cb.Text:SetText("")
+				cb.Text:Hide()
+			end
+
+			local label = cell:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			label:SetPoint("LEFT", cb, "RIGHT", 4, 0)
+			label:SetText(def.label or "")
+
+			if def.tooltip then
+				AttachTooltip(cell, def.label, def.tooltip)
+			end
+
+			cb:SetScript("OnClick", function(selfBtn)
+				if not selfBtn:IsEnabled() then return end
+				if def.set then
+					def.set(selfBtn:GetChecked() and true or false)
+				end
+			end)
+
+			checkboxes[#checkboxes + 1] = cb
+			return cb
+		end
+
+		local cb1 = BuildCell(1, items[1])
+		local cb2 = BuildCell(2, items[2])
+
+		local function Refresh()
+			if cb1 and items[1] and items[1].get then
+				cb1:SetChecked(items[1].get() and true or false)
+			end
+			if cb2 and items[2] and items[2].get then
+				cb2:SetChecked(items[2].get() and true or false)
+			end
+			self:_ApplyRowState(row, section, opts, checkboxes)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+
+		row:EnableMouse(true)
+		row:SetScript("OnMouseDown", function()
+			if cb1 and cb1:IsMouseOver() and cb1:IsEnabled() then
+				cb1:Click()
+			elseif cb2 and cb2:IsMouseOver() and cb2:IsEnabled() then
+				cb2:Click()
 			end
 		end)
 	end)
@@ -1085,5 +1291,3 @@ function Controls:AddScrollableText(section, opts)
 		RegisterRefresh(section, Refresh)
 	end)
 end
-
-

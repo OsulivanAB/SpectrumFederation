@@ -157,8 +157,18 @@ local function FormatLogEntry(log)
 	local details = ""
 	if eventType == "POINT_CHANGE" then
 		local memberColor = GetPlayerClassColor(data.member)
-		details = string.format("Member: %s%s%s, Change: %s", 
-			memberColor, data.member or "?", RESET, data.change or "?")
+		local isRaidCheck = (data and data.reason == "RAID_CHECK") or (author == "Raid Check")
+
+		if isRaidCheck and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
+			details = string.format("Member: %s%s%s, Action: Raid Check prepared (+1)", 
+				memberColor, data.member or "?", RESET)
+		elseif isRaidCheck then
+			details = string.format("Member: %s%s%s, Action: Raid Check change (%s)", 
+				memberColor, data.member or "?", RESET, data.change or "?")
+		else
+			details = string.format("Member: %s%s%s, Change: %s", 
+				memberColor, data.member or "?", RESET, data.change or "?")
+		end
 	elseif eventType == "ARMOR_CHANGE" then
 		local memberColor = GetPlayerClassColor(data.member)
 		details = string.format("Member: %s%s%s, Slot: %s, Action: %s", 

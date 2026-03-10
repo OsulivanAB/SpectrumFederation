@@ -172,6 +172,10 @@ function SF:RehydrateLootHelperDB()
 				setmetatable(profile, self.LootProfile)
 			end
 
+			if type(profile._EnsureRaidCheckConfig) == "function" then
+				profile:_EnsureRaidCheckConfig()
+			end
+
 			-- Restore Member methods
 			if type(profile._members) == "table" and self.Member then
 				-- Helper function to extract member ID for deduplication

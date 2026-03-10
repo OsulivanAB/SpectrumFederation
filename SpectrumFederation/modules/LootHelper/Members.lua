@@ -281,12 +281,12 @@ end
 
 -- Function to increment point balance by 1
 -- @return (boolean) - True if successful, false otherwise
-function Member:IncrementPoints()
+function Member:IncrementPoints(opts)
 
-    -- Enforce admin permissions
-    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
-        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
-            if SF.Debug then
+	-- Enforce admin permissions
+	if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
+		if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
+			if SF.Debug then
                 SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
             end
             return false
@@ -299,11 +299,22 @@ function Member:IncrementPoints()
     end
     
     -- Create Log Entry for point increment
-    local logEventType = SF.LootLogEventTypes.POINT_CHANGE
-    local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
-    logEventData.member = self:GetFullIdentifier()
-    logEventData.change = SF.LootLogPointChangeTypes.INCREMENT
-    local logEntry = SF.LootLog.new(logEventType, logEventData)
+	local logEventType = SF.LootLogEventTypes.POINT_CHANGE
+	local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
+	logEventData.member = self:GetFullIdentifier()
+	logEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+	if opts and opts.reason then
+		logEventData.reason = opts.reason
+	end
+
+	local logOpts = {}
+	if opts and opts.logAuthor then
+		logOpts.author = opts.logAuthor
+	end
+	if opts and opts.timestamp then
+		logOpts.timestamp = opts.timestamp
+	end
+	local logEntry = SF.LootLog.new(logEventType, logEventData, logOpts)
     -- Validate logEntry creation
     if not logEntry then
         SF:PrintError("Failed to create loot log entry for point increment.")
