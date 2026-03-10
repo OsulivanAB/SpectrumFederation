@@ -157,6 +157,24 @@ function R:Build(panel, pageDef)
 				end
 				controls:AddButton(sec, opts)
 
+			elseif t == "buttonRow" then
+				local opts = item
+				if type(opts[1]) == "table" and type(opts[1].onClick) == "function" then
+					local fn = opts[1].onClick
+					opts[1] = CopyTable(opts[1])
+					opts[1].onClick = function(btn)
+						return fn(ctx, btn)
+					end
+				end
+				if type(opts[2]) == "table" and type(opts[2].onClick) == "function" then
+					local fn = opts[2].onClick
+					opts[2] = CopyTable(opts[2])
+					opts[2].onClick = function(btn)
+						return fn(ctx, btn)
+					end
+				end
+				controls:AddButtonRow(sec, opts)
+
 			elseif t == "editboxButton" then
 				local opts = item
 				if type(opts.onSubmit) == "function" then

@@ -838,40 +838,34 @@ function Page:Build(panel)
 						{ type = "spacer", height = 12 },
 						{ type = "text", text = "Raid Check Settings" },
 
+						{ type = "text", text = "Raid Checks..." },
 						{
-							type = "button",
-							label = "Start Pre-Raid Check",
-							buttonText = "Start Pre-Raid Check",
-							width = 180,
-							enabled = function()
-								return ProfileActionsEnabled() and IsAdmin()
-							end,
-							onClick = function(ctx)
-								if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then
-									SF.RaidCheck:RunPreRaidCheck()
-									ctx.section:SetMessage("Pre-Raid Check started.", "info")
-								else
-									ctx.section:SetMessage("Raid Check is not available.", "error")
-								end
-							end,
-						},
-
-						{
-							type = "button",
-							label = "Start Raid Check",
-							buttonText = "Start Raid Check",
-							width = 180,
-							enabled = function()
-								return ProfileActionsEnabled() and IsAdmin()
-							end,
-							onClick = function(ctx)
-								if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then
-									SF.RaidCheck:RunRaidCheck()
-									ctx.section:SetMessage("Raid Check started.", "info")
-								else
-									ctx.section:SetMessage("Raid Check is not available.", "error")
-								end
-							end,
+							type = "buttonRow",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							{
+								text = "Pre-Raid Check",
+								width = 180,
+								onClick = function(ctx)
+									if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then
+										SF.RaidCheck:RunPreRaidCheck()
+										ctx.section:SetMessage("Pre-Raid Check started.", "info")
+									else
+										ctx.section:SetMessage("Raid Check is not available.", "error")
+									end
+								end,
+							},
+							{
+								text = "Raid Check",
+								width = 180,
+								onClick = function(ctx)
+									if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then
+										SF.RaidCheck:RunRaidCheck()
+										ctx.section:SetMessage("Raid Check started.", "info")
+									else
+										ctx.section:SetMessage("Raid Check is not available.", "error")
+									end
+								end,
+							},
 						},
 
 						{ type = "text", text = "Enable Whispers During..." },

@@ -13,28 +13,28 @@ local COLOR_RESET = "|r"
 -- @param message: The message to display
 -- @return: none
 function SF:PrintSuccess(message)
-    print(COLOR_SUCCESS .. addonName .. COLOR_RESET .. ": " .. message)
+    print(string.format("%s%s%s: %s%s%s", COLOR_PREFIX, addonName, COLOR_RESET, COLOR_SUCCESS, message, COLOR_RESET))
 end
 
 -- Helper function to print an error message
 -- @param message: The error message to display
 -- @return: none
 function SF:PrintError(message)
-    print(COLOR_ERROR .. addonName .. COLOR_RESET .. ": " .. message)
+    print(string.format("%s%s%s: %s%s%s", COLOR_PREFIX, addonName, COLOR_RESET, COLOR_ERROR, message, COLOR_RESET))
 end
 
 -- Helper function to print a warning message
 -- @param message: The warning message to display
 -- @return: none
 function SF:PrintWarning(message)
-    print(COLOR_WARNING .. addonName .. COLOR_RESET .. ": " .. message)
+    print(string.format("%s%s%s: %s%s%s", COLOR_PREFIX, addonName, COLOR_RESET, COLOR_WARNING, message, COLOR_RESET))
 end
 
 -- Helper function to print an info message
 -- @param message: The info message to display
 -- @return: none
 function SF:PrintInfo(message)
-    print(COLOR_INFO .. addonName .. COLOR_RESET .. ": " .. message)
+    print(string.format("%s%s%s: %s%s%s", COLOR_PREFIX, addonName, COLOR_RESET, COLOR_INFO, message, COLOR_RESET))
 end
 
 -- Helper function to print a system-style message with colored prefix

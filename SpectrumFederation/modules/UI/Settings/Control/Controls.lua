@@ -168,6 +168,48 @@ local function AttachTooltip(region, title, text)
 	end)
 end
 
+-- ---------------------------------------
+-- Button Row (two buttons)
+-- ---------------------------------------
+function Controls:AddButtonRow(section, opts)
+	return section:AddRow(26, function(row)
+		local btns = {}
+		for i = 1, 2 do
+			local def = opts[i]
+			if def then
+				local btn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+				btn:SetSize(def.width or 140, def.height or 22)
+				if i == 1 then
+					btn:SetPoint("LEFT", row, "LEFT", 0, 0)
+				else
+					btn:SetPoint("LEFT", row, "LEFT", (def.offsetX or 180), 0)
+				end
+				btn:SetText(def.text or "")
+				if def.onClick then
+					btn:SetScript("OnClick", function()
+						if btn:IsEnabled() then
+							def.onClick(btn)
+						end
+					end)
+				end
+				table.insert(btns, btn)
+			end
+		end
+
+		local function Refresh()
+			local enabled = EvalBool(opts.enabled, true)
+			for _, b in ipairs(btns) do
+				if b.SetEnabled then b:SetEnabled(enabled) end
+				b:SetAlpha(enabled and 1 or 0.45)
+			end
+			self:_ApplyRowState(row, section, opts, btns)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
 -- Register a refresh callback on the page builder for a section
 -- @param section table Section containing __sfPageBuilder
 -- @param fn function Callback to run on refresh
@@ -1169,4 +1211,3 @@ function Controls:AddScrollableText(section, opts)
 		RegisterRefresh(section, Refresh)
 	end)
 end
-
