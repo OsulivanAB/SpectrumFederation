@@ -171,8 +171,13 @@ function Page:Build(panel)
 							end,
 						},
 					},
+				},
+			},
 
-					{ type = "text", text = "------- Log Level Filters ---------" },
+			{
+				id = "filters",
+				title = "Log Level Filters",
+				items = {
 					{
 						type = "checkboxRow",
 						spacing = 150,
@@ -219,8 +224,13 @@ function Page:Build(panel)
 							},
 						},
 					},
+				},
+			},
 
-					{ type = "text", text = "------- Debug Logs ---------" },
+			{
+				id = "logs",
+				title = "Debug Logs",
+				items = {
 					{
 						type = "help",
 						text = "Use Ctrl+A to select all, Ctrl+C to copy",
