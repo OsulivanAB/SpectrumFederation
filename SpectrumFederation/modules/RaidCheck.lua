@@ -282,6 +282,12 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	local missing = EvaluateUnit(unitInfo.unit, cfg)
 	local whisper = ShouldWhisper(mode, cfg)
 	local whisperTarget = unitInfo.id or unitInfo.short
+	local result = {
+		name = unitInfo.short,
+		id = unitInfo.id,
+		missing = nil,
+		whisperedMissing = false,
+	}
 
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
@@ -289,16 +295,18 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 
 		if whisper then
 			WhisperMissing(whisperTarget, pointName, list, mode)
+			result.whisperedMissing = true
 		end
 
-		return
+		result.missing = list
+		return result
 	end
 
 	if mode == "raid" then
 		local member = FindMember(profile, unitInfo.id)
 		if not member then
 			SF:PrintWarning(("Skipping point award for %s (not in active profile)."):format(unitInfo.short))
-			return
+			return result
 		end
 
 		local awarded = AwardPrepared(profile, member, pointName)
@@ -306,32 +314,75 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 			WhisperPrepared(whisperTarget, pointName)
 		end
 	end
+
+	return result
 end
 
 function RC:RunPreRaidCheck()
 	local profile, cfg = ValidateCanRun("pre")
 	if not profile then return end
 
+	SF:PrintInfo("[Pre-Raid Check] Initiated.")
+
+	local summaryMissing = {}
+
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
 		if info.id then
-			RunForUnit(info, profile, cfg, "pre", GetPointName(profile))
+			local res = RunForUnit(info, profile, cfg, "pre", GetPointName(profile))
+			if res then
+				if res.whisperedMissing then
+					SF:PrintInfo(string.format("[Pre-Raid Check] Whispered %s about missing enchants/gems.", res.name))
+				end
+				if res.missing then
+					table.insert(summaryMissing, res)
+				end
+			end
 		end
 	end
+
+	if not ShouldWhisper("pre", cfg) and #summaryMissing > 0 then
+		SF:PrintWarning("[Pre-Raid Check] Players missing enchants/gems:")
+		for _, entry in ipairs(summaryMissing) do
+			SF:PrintWarning(string.format("  %s - %s", entry.name, entry.missing))
+		end
+	end
+
+	SF:PrintSuccess("[Pre-Raid Check] Complete.")
 end
 
 function RC:RunRaidCheck()
 	local profile, cfg = ValidateCanRun("raid")
 	if not profile then return end
 
+	SF:PrintInfo("[Raid Check] Initiated.")
+
 	local pointName = GetPointName(profile)
+	local summaryMissing = {}
 
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
 		if info.id then
-			RunForUnit(info, profile, cfg, "raid", pointName)
+			local res = RunForUnit(info, profile, cfg, "raid", pointName)
+			if res then
+				if res.whisperedMissing then
+					SF:PrintInfo(string.format("[Raid Check] Whispered %s about missing enchants/gems.", res.name))
+				end
+				if res.missing then
+					table.insert(summaryMissing, res)
+				end
+			end
 		end
 	end
+
+	if not ShouldWhisper("raid", cfg) and #summaryMissing > 0 then
+		SF:PrintWarning("[Raid Check] Players missing enchants/gems:")
+		for _, entry in ipairs(summaryMissing) do
+			SF:PrintWarning(string.format("  %s - %s", entry.name, entry.missing))
+		end
+	end
+
+	SF:PrintSuccess("[Raid Check] Complete.")
 end
 
 function RC:Run(mode)
