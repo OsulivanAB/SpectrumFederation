@@ -268,6 +268,90 @@ function Controls:AddCheckbox(section, opts)
 end
 
 -- ---------------------------------------
+-- Checkbox Grid (2 columns per row)
+-- ---------------------------------------
+-- Add a two-cell checkbox row for compact layouts
+-- @param section table Section to add row into
+-- @param opts table Options including items (array of up to 2 entries with label/get/set), visible/enabled
+-- @return Frame The created row
+function Controls:AddCheckboxGrid(section, opts)
+	local items = opts.items or {}
+
+	return section:AddRow(opts.height or 26, function(row)
+		local cells = {}
+		for i = 1, 2 do
+			local cell = CreateFrame("Frame", nil, row)
+			cells[i] = cell
+			if i == 1 then
+				cell:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+				cell:SetPoint("BOTTOM", row, "BOTTOM", 0, 0)
+				cell:SetPoint("RIGHT", row, "CENTER", -6, 0)
+			else
+				cell:SetPoint("TOPLEFT", row, "CENTER", 6, 0)
+				cell:SetPoint("BOTTOMRIGHT", row, "BOTTOMRIGHT", 0, 0)
+			end
+		end
+
+		local checkboxes = {}
+
+		local function BuildCell(idx, def)
+			if not def then return end
+			local cell = cells[idx]
+			local cb = CreateFrame("CheckButton", nil, cell, "UICheckButtonTemplate")
+			cb:SetPoint("LEFT", cell, "LEFT", 0, 0)
+
+			if cb.Text then
+				cb.Text:SetText("")
+				cb.Text:Hide()
+			end
+
+			local label = cell:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			label:SetPoint("LEFT", cb, "RIGHT", 4, 0)
+			label:SetText(def.label or "")
+
+			if def.tooltip then
+				AttachTooltip(cell, def.label, def.tooltip)
+			end
+
+			cb:SetScript("OnClick", function(selfBtn)
+				if not selfBtn:IsEnabled() then return end
+				if def.set then
+					def.set(selfBtn:GetChecked() and true or false)
+				end
+			end)
+
+			checkboxes[#checkboxes + 1] = cb
+			return cb
+		end
+
+		local cb1 = BuildCell(1, items[1])
+		local cb2 = BuildCell(2, items[2])
+
+		local function Refresh()
+			if cb1 and items[1] and items[1].get then
+				cb1:SetChecked(items[1].get() and true or false)
+			end
+			if cb2 and items[2] and items[2].get then
+				cb2:SetChecked(items[2].get() and true or false)
+			end
+			self:_ApplyRowState(row, section, opts, checkboxes)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+
+		row:EnableMouse(true)
+		row:SetScript("OnMouseDown", function()
+			if cb1 and cb1:IsMouseOver() and cb1:IsEnabled() then
+				cb1:Click()
+			elseif cb2 and cb2:IsMouseOver() and cb2:IsEnabled() then
+				cb2:Click()
+			end
+		end)
+	end)
+end
+
+-- ---------------------------------------
 -- Button (action)
 -- ---------------------------------------
 -- Add a button control row
@@ -1085,5 +1169,4 @@ function Controls:AddScrollableText(section, opts)
 		RegisterRefresh(section, Refresh)
 	end)
 end
-
 

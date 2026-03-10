@@ -86,6 +86,9 @@ function R:Build(panel, pageDef)
 			elseif t == "checkbox" then
 				controls:AddCheckbox(sec, item)
 
+			elseif t == "checkboxGrid" then
+				controls:AddCheckboxGrid(sec, item)
+
 			elseif t == "slider" then
 				controls:AddSlider(sec, item)
 
