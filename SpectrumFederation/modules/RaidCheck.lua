@@ -192,22 +192,12 @@ local function ValidateCanRun(mode)
 		return nil
 	end
 
-	if not IsInGroup() then
-		SF:PrintError("You must be in a party or raid to run a raid check.")
-		return nil
-	end
-
 	if not profile.GetRaidCheckConfig then
 		SF:PrintError("Raid Check settings are unavailable for the active profile.")
 		return nil
 	end
 
 	local cfg = profile:GetRaidCheckConfig()
-	if not AnySlotEnabled(cfg) then
-		SF:PrintWarning("Enable at least one slot in Raid Check settings before running a check.")
-		return nil
-	end
-
 	if mode ~= "pre" and mode ~= "raid" then
 		SF:PrintError("Invalid Raid Check mode.")
 		return nil
