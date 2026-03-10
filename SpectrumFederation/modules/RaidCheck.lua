@@ -298,10 +298,12 @@ end
 		missing = nil,
 		whisperedMissing = false,
 	}
-
-	if #missing > 0 then
-		local list = FormatMissingList(missing)
-		SF:PrintWarning(("%s Missing: %s"):format(unitInfo.short, list))
+		
+		if #missing > 0 then
+			local list = FormatMissingList(missing)
+			if not (mode == "pre" and not whisper) then
+				SF:PrintWarning(("%s Missing: %s"):format(unitInfo.short, list))
+			end
 
 		if whisper then
 			WhisperMissing(whisperTarget, pointName, list, mode)
