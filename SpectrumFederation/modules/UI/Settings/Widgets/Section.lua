@@ -165,11 +165,12 @@ end
 -- @param text string|nil Text to display
 -- @return Frame The created text row
 function SectionMixin:AddText(text)
-	return self:AddRow(18, function(row)
-		local fs = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+	return self:AddRow(22, function(row)
+		local fs = row:CreateFontString(nil, "ARTWORK", "GameFontNormal")
 		fs:SetPoint("LEFT", row, "LEFT", 0, 0)
 		fs:SetPoint("RIGHT", row, "RIGHT", 0, 0)
 		fs:SetJustifyH("LEFT")
+		fs:SetTextColor(0.82, 0.90, 1.0)
 		fs:SetText(text or "")
 	end)
 end

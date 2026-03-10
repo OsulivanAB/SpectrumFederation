@@ -6,6 +6,7 @@ local COLOR_SUCCESS = "|cFF00FF00"  -- Green
 local COLOR_ERROR = "|cFFFF0000"    -- Red
 local COLOR_WARNING = "|cFFFFA500"  -- Orange
 local COLOR_INFO = "|cFFFFFFFF"     -- White
+local COLOR_PREFIX = "|cFF40C7FF"   -- Accent blue
 local COLOR_RESET = "|r"
 
 -- Helper function to print a success message
@@ -34,4 +35,12 @@ end
 -- @return: none
 function SF:PrintInfo(message)
     print(COLOR_INFO .. addonName .. COLOR_RESET .. ": " .. message)
+end
+
+-- Helper function to print a system-style message with colored prefix
+-- @param message: The message to display in white
+-- @return: none
+function SF:SystemMessage(message)
+    if not message or message == "" then return end
+    print(string.format("%sSpectrum Federation:%s %s%s%s", COLOR_PREFIX, COLOR_RESET, COLOR_INFO, message, COLOR_RESET))
 end

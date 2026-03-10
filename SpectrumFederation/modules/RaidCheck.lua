@@ -2,7 +2,7 @@
 local addonName, SF = ...
 
 -- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
--- luacheck: globals GetInventoryItemLink GetItemInfoInstant GetItemStats GetItemGem GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName GetRealmName
+-- luacheck: globals GetInventoryItemLink GetItemInfoInstant GetItemStats GetItemGem GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName GetRealmName C_Item
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -49,10 +49,30 @@ local function HasEnchant(link)
 	return enchantId and enchantId ~= "" and enchantId ~= "0"
 end
 
+local function GetItemStatsSafe(link)
+	if type(link) ~= "string" then return nil end
+
+	if GetItemStats then
+		local ok, stats = pcall(GetItemStats, link)
+		if ok and type(stats) == "table" then
+			return stats
+		end
+	end
+
+	if C_Item and C_Item.GetItemStats then
+		local ok, stats = pcall(C_Item.GetItemStats, link)
+		if ok and type(stats) == "table" then
+			return stats
+		end
+	end
+
+	return nil
+end
+
 local function HasMissingGems(link)
 	if type(link) ~= "string" then return false end
 
-	local stats = GetItemStats(link) or {}
+	local stats = GetItemStatsSafe(link) or {}
 	local sockets = 0
 	for stat, value in pairs(stats) do
 		if type(stat) == "string" and stat:match("^EMPTY_SOCKET") then
@@ -268,7 +288,7 @@ local function ShouldWhisper(mode, cfg)
 	return cfg.enableWhispersRaid
 end
 
-local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
+	local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	local missing = EvaluateUnit(unitInfo.unit, cfg)
 	local whisper = ShouldWhisper(mode, cfg)
 	local whisperTarget = unitInfo.id or unitInfo.short
@@ -308,11 +328,15 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	return result
 end
 
-function RC:RunPreRaidCheck()
-	local profile, cfg = ValidateCanRun("pre")
-	if not profile then return end
-
-	SF:PrintInfo("[Pre-Raid Check] Initiated.")
+	function RC:RunPreRaidCheck()
+		local profile, cfg = ValidateCanRun("pre")
+		if not profile then return end
+	
+		if SF.SystemMessage then
+			SF:SystemMessage("Pre-Raid Check started.")
+		else
+			SF:PrintInfo("[Pre-Raid Check] Initiated.")
+		end
 
 	local summaryMissing = {}
 
@@ -341,11 +365,15 @@ function RC:RunPreRaidCheck()
 	SF:PrintSuccess("[Pre-Raid Check] Complete.")
 end
 
-function RC:RunRaidCheck()
-	local profile, cfg = ValidateCanRun("raid")
-	if not profile then return end
-
-	SF:PrintInfo("[Raid Check] Initiated.")
+	function RC:RunRaidCheck()
+		local profile, cfg = ValidateCanRun("raid")
+		if not profile then return end
+	
+		if SF.SystemMessage then
+			SF:SystemMessage("Raid Check started.")
+		else
+			SF:PrintInfo("[Raid Check] Initiated.")
+		end
 
 	local pointName = GetPointName(profile)
 	local summaryMissing = {}
