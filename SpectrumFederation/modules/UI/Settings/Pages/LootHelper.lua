@@ -874,36 +874,34 @@ function Page:Build(panel)
 							end,
 						},
 
+						{ type = "text", text = "Enable Whispers During..." },
 						{
-							type = "checkbox",
-							label = "Enable Whispers During Pre-Raid Check",
-							tooltip = "When enabled, whisper players who are missing required enchants or gems during a Pre-Raid Check.",
-							enabled = function()
-								return ProfileActionsEnabled() and IsAdmin()
-							end,
-							get = function()
-								local cfg = GetRaidCheckConfig()
-								return cfg and cfg.enableWhispersPreRaid or false
-							end,
-							set = function(value)
-								SetRaidCheckWhispers("pre", value)
-							end,
-						},
-
-						{
-							type = "checkbox",
-							label = "Enable Whispers During Raid Check",
-							tooltip = "When enabled, whisper players their Raid Check result. Missing players should be told what they are missing. Fully prepared players should be told they received a point.",
-							enabled = function()
-								return ProfileActionsEnabled() and IsAdmin()
-							end,
-							get = function()
-								local cfg = GetRaidCheckConfig()
-								return cfg and cfg.enableWhispersRaid or false
-							end,
-							set = function(value)
-								SetRaidCheckWhispers("raid", value)
-							end,
+							type = "checkboxGrid",
+							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							items = {
+								{
+									label = "Pre-Raid Check",
+									tooltip = "When enabled, whisper players who are missing required enchants or gems during a Pre-Raid Check.",
+									get = function()
+										local cfg = GetRaidCheckConfig()
+										return cfg and cfg.enableWhispersPreRaid or false
+									end,
+									set = function(value)
+										SetRaidCheckWhispers("pre", value)
+									end,
+								},
+								{
+									label = "Raid Check",
+									tooltip = "When enabled, whisper players their Raid Check result. Missing players should be told what they are missing. Fully prepared players should be told they received a point.",
+									get = function()
+										local cfg = GetRaidCheckConfig()
+										return cfg and cfg.enableWhispersRaid or false
+									end,
+									set = function(value)
+										SetRaidCheckWhispers("raid", value)
+									end,
+								},
+							},
 						},
 
 							{
