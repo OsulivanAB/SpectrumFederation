@@ -794,51 +794,48 @@ function Page:Build(panel)
 						end,
 					},
 
+					{ type = "heading", text = "Enable Raid Wide Safe Mode" },
 					{
-						type = "checkbox",
-						label = "Enable Raid-Wide Safemode",
-						-- Bug: Should not be a persistent setting
-						tooltip = "Profile-level persistent setting.",
-						enabled = function()
-							return ProfileActionsEnabled()
-						end,
-						get = function()
-							if store.GetActiveProfileSetting then
-								return store:GetActiveProfileSetting("raidWideSafeMode", false)
-							end
-							return false
-						end,
-						set = function(value)
-							if store.SetActiveProfileSetting then
-								store:SetActiveProfileSetting("raidWideSafeMode", value and true or false)
-							end
-							end,
+						type = "checkboxGrid",
+						enabled = function() return ProfileActionsEnabled() end,
+						items = {
+							{
+								label = "Only in-combat",
+								tooltip = "Enable raid-wide safemode only during combat.",
+								get = function()
+									if store.GetActiveProfileSetting then
+										return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false)
+									end
+									return false
+								end,
+								set = function(value)
+									if store.SetActiveProfileSetting then
+										store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false)
+									end
+								end,
+							},
+							{
+								label = "All the Time",
+								tooltip = "Keep raid-wide safemode active at all times.",
+								get = function()
+									if store.GetActiveProfileSetting then
+										return store:GetActiveProfileSetting("raidWideSafeMode", false)
+									end
+									return false
+								end,
+								set = function(value)
+									if store.SetActiveProfileSetting then
+										store:SetActiveProfileSetting("raidWideSafeMode", value and true or false)
+									end
+								end,
+							},
 						},
-
-						{
-							type = "checkbox",
-							label = "Enable Raid-Wide Safemode on Combat",
-							tooltip = "Profile-level persistent setting.",
-							enabled = function()
-								return ProfileActionsEnabled()
-							end,
-							get = function()
-								if store.GetActiveProfileSetting then
-									return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false)
-								end
-								return false
-							end,
-							set = function(value)
-								if store.SetActiveProfileSetting then
-									store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false)
-								end
-							end,
-						},
+					},
 
 						{ type = "spacer", height = 12 },
-						{ type = "text", text = "Raid Check Settings" },
+						{ type = "heading", text = "Raid Check Settings" },
 
-						{ type = "text", text = "Raid Checks..." },
+						{ type = "heading", text = "Raid Checks..." },
 						{
 							type = "buttonRow",
 							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
@@ -898,6 +895,7 @@ function Page:Build(panel)
 							},
 						},
 
+							{ type = "heading", text = "Enchants to look for" },
 							{
 								type = "checkboxGrid",
 								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,

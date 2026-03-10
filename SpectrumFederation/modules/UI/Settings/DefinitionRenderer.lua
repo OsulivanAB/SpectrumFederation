@@ -77,6 +77,9 @@ function R:Build(panel, pageDef)
 			if t == "text" then
 				sec:AddText(item.text)
 
+			elseif t == "heading" then
+				sec:AddHeading(item.text)
+
 			elseif t == "spacer" then
 				sec:AddSpacer(item.height or 8)
 

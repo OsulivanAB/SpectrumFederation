@@ -182,7 +182,7 @@ function Controls:AddButtonRow(section, opts)
 				if i == 1 then
 					btn:SetPoint("LEFT", row, "LEFT", 0, 0)
 				else
-					btn:SetPoint("LEFT", row, "LEFT", (def.offsetX or 180), 0)
+					btn:SetPoint("LEFT", row, "LEFT", (def.offsetX or 200), 0)
 				end
 				btn:SetText(def.text or "")
 				if def.onClick then
