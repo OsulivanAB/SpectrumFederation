@@ -168,6 +168,17 @@ local function AttachTooltip(region, title, text)
 	end)
 end
 
+-- Register a refresh callback on the page builder for a section
+-- @param section table Section containing __sfPageBuilder
+-- @param fn function Callback to run on refresh
+-- @return nil
+local function RegisterRefresh(section, fn)
+	local pb = section.__sfPageBuilder
+	if pb and pb.RegisterRefresh then
+		pb:RegisterRefresh(fn)
+	end
+end
+
 -- ---------------------------------------
 -- Button Row (two buttons)
 -- ---------------------------------------
@@ -208,17 +219,6 @@ function Controls:AddButtonRow(section, opts)
 		Refresh()
 		RegisterRefresh(section, Refresh)
 	end)
-end
-
--- Register a refresh callback on the page builder for a section
--- @param section table Section containing __sfPageBuilder
--- @param fn function Callback to run on refresh
--- @return nil
-local function RegisterRefresh(section, fn)
-	local pb = section.__sfPageBuilder
-	if pb and pb.RegisterRefresh then
-		pb:RegisterRefresh(fn)
-	end
 end
 
 -- Resolve get/set binding helpers (alias of ResolveGetSet)
