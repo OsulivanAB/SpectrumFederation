@@ -56,6 +56,46 @@ def validate_version_format(version, base_ref):
     return True, None
 
 
+def parse_version_parts(version):
+    """
+    Parse a version string into numeric components.
+    
+    Supports stable (X.Y.Z) and beta (X.Y.Z-beta.N) versions.
+    Returns a dict with major/minor/patch/beta (beta=None for stable).
+    """
+    match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-beta\.(\d+))?$", version)
+    if not match:
+        return None
+    
+    major, minor, patch, beta = match.groups()
+    return {
+        "major": int(major),
+        "minor": int(minor),
+        "patch": int(patch),
+        "beta": int(beta) if beta is not None else None,
+    }
+
+
+def compare_versions(lhs, rhs):
+    """
+    Compare two parsed version dicts.
+    
+    Stable versions are treated as beta=0 so that X.Y.Z-beta.1 > X.Y.Z.
+    Returns 1 if lhs > rhs, -1 if lhs < rhs, 0 if equal.
+    """
+    for key in ("major", "minor", "patch"):
+        if lhs[key] != rhs[key]:
+            return 1 if lhs[key] > rhs[key] else -1
+    
+    lhs_beta = lhs["beta"] if lhs["beta"] is not None else 0
+    rhs_beta = rhs["beta"] if rhs["beta"] is not None else 0
+    
+    if lhs_beta == rhs_beta:
+        return 0
+    
+    return 1 if lhs_beta > rhs_beta else -1
+
+
 def get_current_version(addon_name):
     """Get version from current TOC file."""
     toc_path = Path(addon_name) / f"{addon_name}.toc"
@@ -141,11 +181,32 @@ def main():
         print(f"          {error_msg}")
         sys.exit(1)
     
-    # Compare versions
-    if current_version == base_version:
-        print(f"::error ::Addon '## Version:' in {args.addon_name}/{args.addon_name}.toc is still '{current_version}'")
-        print(f"          When merging into '{args.base_ref}', bump the addon version (e.g., 0.0.2 or 0.0.2-beta.1)")
+    current_parts = parse_version_parts(current_version)
+    base_parts = parse_version_parts(base_version) if base_version else None
+    main_version = get_base_version(args.addon_name, "main") if args.base_ref == "beta" else None
+    main_parts = parse_version_parts(main_version) if main_version else None
+    
+    if not current_parts:
+        print(f"::error ::Unable to parse current version '{current_version}'")
         sys.exit(1)
+    
+    if base_parts:
+        cmp_base = compare_versions(current_parts, base_parts)
+        if cmp_base <= 0:
+            print(f"::error ::Addon version must be ahead of the base '{args.base_ref}' branch")
+            print(f"          Base {args.base_ref} version: {base_version}")
+            print(f"          Current version:             {current_version}")
+            print("          Increase the beta suffix or bump patch/minor/major as needed.")
+            sys.exit(1)
+    
+    if main_parts:
+        cmp_main = compare_versions(current_parts, main_parts)
+        if cmp_main <= 0:
+            print("::error ::Beta branch versions must stay ahead of main.")
+            print(f"          Main version:    {main_version}")
+            print(f"          Current version: {current_version}")
+            print("          Match or exceed main's X.Y.Z, and if X.Y.Z is the same, bump the -beta.N suffix.")
+            sys.exit(1)
     
     print("[check-version-bump] ✅ Addon version has been bumped")
     return 0

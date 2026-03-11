@@ -77,6 +77,9 @@ function R:Build(panel, pageDef)
 			if t == "text" then
 				sec:AddText(item.text)
 
+			elseif t == "heading" then
+				sec:AddHeading(item.text)
+
 			elseif t == "spacer" then
 				sec:AddSpacer(item.height or 8)
 
@@ -85,6 +88,12 @@ function R:Build(panel, pageDef)
 
 			elseif t == "checkbox" then
 				controls:AddCheckbox(sec, item)
+
+			elseif t == "checkboxGrid" then
+				controls:AddCheckboxGrid(sec, item)
+
+			elseif t == "checkboxRow" then
+				controls:AddCheckboxRow(sec, item)
 
 			elseif t == "slider" then
 				controls:AddSlider(sec, item)
@@ -153,6 +162,19 @@ function R:Build(panel, pageDef)
 					end
 				end
 				controls:AddButton(sec, opts)
+
+			elseif t == "buttonRow" then
+				local opts = CopyTable(item)
+				for i = 1, 2 do
+					if type(opts[i]) == "table" and type(opts[i].onClick) == "function" then
+						local fn = opts[i].onClick
+						opts[i] = CopyTable(opts[i])
+						opts[i].onClick = function(btn)
+							return fn(ctx, btn)
+						end
+					end
+				end
+				controls:AddButtonRow(sec, opts)
 
 			elseif t == "editboxButton" then
 				local opts = item

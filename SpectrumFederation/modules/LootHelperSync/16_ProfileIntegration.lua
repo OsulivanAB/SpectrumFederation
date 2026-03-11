@@ -38,6 +38,42 @@ local function _MemberId(member)
     return _NormalizeMemberId(id)
 end
 
+local function _BuildPointsSummary(profile)
+    local members = (type(profile) == "table" and type(profile._members) == "table") and profile._members or {}
+    local count, sum = 0, 0
+    local checksum = 0
+    local sortable = {}
+
+    for _, member in ipairs(members) do
+        local id = _MemberId(member)
+        if id then
+            local points = tonumber(member.pointBalance) or 0
+            count = count + 1
+            sum = sum + points
+            table.insert(sortable, { id = id, points = points })
+        end
+    end
+
+    table.sort(sortable, function(a, b)
+        return a.id < b.id
+    end)
+
+    for _, row in ipairs(sortable) do
+        local s = ("%s=%d"):format(row.id, row.points)
+        for i = 1, #s do
+            -- Lightweight deterministic rolling checksum (djb2-inspired variant):
+            -- multiplier 33 keeps low cost, modulo 2^31-1 keeps value bounded.
+            checksum = (checksum * 33 + s:byte(i)) % 2147483647
+        end
+    end
+
+    return {
+        count = count,
+        sum = sum,
+        checksum = checksum,
+    }
+end
+
 
 -- Function Get admin users from profile (tolerant to different implementations).
 -- @param profile table Profile instance
@@ -145,23 +181,29 @@ function Sync:CreateProfileFromMeta(profileMeta)
     profile._logIndex = {}
     profile._authorCounters = {}
     profile._members = {}
-    profile._adminUsers = {}
-    profile._activeProfile = false
-    profile._profileId = profileMeta._profileId
-    profile._profileName = profileMeta._profileName or "Imported Profile"
+	profile._adminUsers = {}
+	profile._activeProfile = false
+	profile._profileId = profileMeta._profileId
+	profile._profileName = profileMeta._profileName or "Imported Profile"
+	if profile._EnsureRaidCheckConfig then
+		profile:_EnsureRaidCheckConfig()
+	end
 
-    return profile
+	return profile
 end
 
 -- Function Export a full snapshot for a profile, suitable for PROFILE_SNAPSHOT message.
 -- @param profileId string Stable profile id
 -- @return table|nil Snapshot payload or nil if profile not found
 function Sync:BuildProfileSnapshot(profileId)
-    local profile = self:FindLocalProfileById(profileId)
-    if not profile then return nil end
-    if not profile.ExportSnapshot then return nil end
-    
-    local snapshot = profile:ExportSnapshot()
+	local profile = self:FindLocalProfileById(profileId)
+	if not profile then return nil end
+	if not profile.ExportSnapshot then return nil end
+	if profile._EnsureRaidCheckConfig then
+		profile:_EnsureRaidCheckConfig()
+	end
+	
+	local snapshot = profile:ExportSnapshot()
     
     -- Debug: log snapshot summary
     if SF.Debug then
@@ -235,14 +277,25 @@ end
 -- Function Rebuild derived state from logs (replay) for the given profile.
 -- @param profileId string Stable profile id
 -- @return nil
-function Sync:RebuildProfile(profileId)
+function Sync:RebuildProfile(profileId, reason)
     if type(profileId) ~= "string" or profileId == "" then
         return false, "invalid profileId"
     end
 
-    local profile = self:FindLocalProfileById(profileId)
-    if not profile then
-        return false, "profile not found"
+	local profile = self:FindLocalProfileById(profileId)
+	if not profile then
+		return false, "profile not found"
+	end
+
+	if profile._EnsureRaidCheckConfig then
+		profile:_EnsureRaidCheckConfig()
+	end
+
+	local rebuildReason = tostring(reason or "unknown")
+	local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
+	if SF.Debug then
+		SF.Debug:Info("SYNC_PROFILE", "Rebuild start (profileId=%s, reason=%s, logs=%d)",
+			tostring(profileId), rebuildReason, #logs)
     end
 
     -- 1) Ensure deterministic log order (MergeLogTables already sorts, but safe to re-sort)
@@ -278,8 +331,6 @@ function Sync:RebuildProfile(profileId)
     end
 
     -- 3) Rebuild member/admin derived state from logs (authoritative source of truth)
-    local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
-
     local existingMembers = {}
     if type(profile._members) == "table" then
         for _, m in ipairs(profile._members) do
@@ -324,10 +375,17 @@ function Sync:RebuildProfile(profileId)
         if type(eventType) == "string" and type(data) == "table" then
             if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.POINT_CHANGE) then
                 local member = ensureMember(data.member)
+                local oldPoints = member and (tonumber(member.pointBalance) or 0) or nil
                 if member and data.change == SF.LootLogPointChangeTypes.INCREMENT then
                     member.pointBalance = (member.pointBalance or 0) + 1
                 elseif member and data.change == SF.LootLogPointChangeTypes.DECREMENT then
                     member.pointBalance = (member.pointBalance or 0) - 1
+                end
+                if member and SF.Debug then
+                    local newPoints = tonumber(member.pointBalance) or 0
+                    SF.Debug:Verbose("SYNC_POINTS", "Apply log (path=replay reason=%s member=%s old=%d delta=%d new=%d change=%s)",
+                        rebuildReason, tostring(_MemberId(member) or data.member), oldPoints or 0, newPoints - oldPoints,
+                        newPoints, tostring(data.change))
                 end
             elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ARMOR_CHANGE) then
                 local member = ensureMember(data.member)
@@ -390,8 +448,10 @@ function Sync:RebuildProfile(profileId)
     end
 
     if SF.Debug then
-        SF.Debug:Info("SYNC_PROFILE", "Rebuilt profile state from logs (profileId=%s, members=%d, admins=%d, created=%d)",
-            tostring(profileId), #profile._members, #profile._adminUsers, createdMembers)
+        local summary = _BuildPointsSummary(profile)
+        SF.Debug:Info("SYNC_PROFILE", "Rebuild done (profileId=%s, reason=%s, members=%d, admins=%d, created=%d, pointsMembers=%d, pointsSum=%d, pointsChecksum=%d)",
+            tostring(profileId), rebuildReason, #profile._members, #profile._adminUsers, createdMembers,
+            summary.count, summary.sum, summary.checksum)
     end
 
     -- 4) If profile is active, refresh cached/UI state (if your core uses this)
@@ -408,6 +468,19 @@ function Sync:RebuildProfile(profileId)
     end
 
     return true, nil
+end
+
+-- Function Emit a concise member-point summary for session lifecycle logs.
+-- @param profileId string Stable profile id
+-- @param context string Path/context label for diagnostics
+-- @return nil
+function Sync:LogSessionPointsSummary(profileId, context)
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile or not SF.Debug then return end
+
+    local summary = _BuildPointsSummary(profile)
+    SF.Debug:Info("SYNC_SESSION", "Session state (%s): profileId=%s pointsSource=derived_logs members=%d pointsSum=%d pointsChecksum=%d",
+        tostring(context or "unknown"), tostring(profileId), summary.count, summary.sum, summary.checksum)
 end
 
 -- Function Extract stable log id from net table (supports multiple field names)

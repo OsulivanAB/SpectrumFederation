@@ -13,6 +13,72 @@ LootProfile.__index = LootProfile
 local PROFILE_META_VERSION = 1
 local PROFILE_SNAPSHOT_VERSION = 1
 
+local function CopyTableShallow(src)
+	if type(src) ~= "table" then return {} end
+	local dst = {}
+	for k, v in pairs(src) do
+		dst[k] = v
+	end
+	return dst
+end
+
+local RAID_CHECK_SLOT_DEFAULTS = {
+	head = true,
+	neck = true,
+	shoulders = true,
+	back = true,
+	chest = true,
+	wrist = true,
+	hands = true,
+	belt = true,
+	legs = true,
+	boots = true,
+	rings = true,
+	trinkets = true,
+	mainHand = true,
+	offHand = true,
+}
+
+local RAID_CHECK_DEFAULTS = {
+	enableWhispersPreRaid = false,
+	enableWhispersRaid = false,
+	slots = RAID_CHECK_SLOT_DEFAULTS,
+}
+
+local function CopyRaidCheckDefaults()
+	return {
+		enableWhispersPreRaid = RAID_CHECK_DEFAULTS.enableWhispersPreRaid,
+		enableWhispersRaid = RAID_CHECK_DEFAULTS.enableWhispersRaid,
+		slots = CopyTableShallow(RAID_CHECK_DEFAULTS.slots),
+	}
+end
+
+local function NormalizeSlotKey(key)
+	if type(key) ~= "string" then return nil end
+	return key
+end
+
+function LootProfile:_EnsureRaidCheckConfig()
+	if type(self._raidCheckConfig) ~= "table" then
+		self._raidCheckConfig = CopyRaidCheckDefaults()
+	end
+
+	local cfg = self._raidCheckConfig
+
+	if type(cfg.slots) ~= "table" then
+		cfg.slots = CopyTableShallow(RAID_CHECK_DEFAULTS.slots)
+	end
+
+	for slotKey, defaultEnabled in pairs(RAID_CHECK_SLOT_DEFAULTS) do
+		if cfg.slots[slotKey] == nil then
+			cfg.slots[slotKey] = defaultEnabled
+		end
+	end
+
+	cfg.enableWhispersPreRaid = cfg.enableWhispersPreRaid and true or false
+	cfg.enableWhispersRaid = cfg.enableWhispersRaid and true or false
+end
+
 local function CopyArray(arr)
     local out = {}
     for i = 1, #(arr or {}) do out[i] = arr[i] end
@@ -129,6 +195,7 @@ function LootProfile.new(profileName)
     instance._pointName = "Points"
     instance._raidWideSafeMode = false
     instance._raidWideSafeModeOnCombat = false
+    instance._raidCheckConfig = CopyRaidCheckDefaults()
 
     -- Create member instance for author
     local class = SF:GetPlayerClass()
@@ -389,6 +456,74 @@ end
 -- @return boolean raidWideSafeModeOnCombat
 function LootProfile:GetRaidWideSafeModeOnCombat()
 	return self._raidWideSafeModeOnCombat and true or false
+end
+
+-- Function get Raid Check configuration (copy)
+-- @return table raidCheckConfig
+function LootProfile:GetRaidCheckConfig()
+	self:_EnsureRaidCheckConfig()
+
+	return {
+		enableWhispersPreRaid = self._raidCheckConfig.enableWhispersPreRaid and true or false,
+		enableWhispersRaid = self._raidCheckConfig.enableWhispersRaid and true or false,
+		slots = CopyTableShallow(self._raidCheckConfig.slots),
+	}
+end
+
+-- Function check if a Raid Check slot is enabled
+-- @param string slotKey
+-- @return boolean enabled
+function LootProfile:IsRaidCheckSlotEnabled(slotKey)
+	self:_EnsureRaidCheckConfig()
+	slotKey = NormalizeSlotKey(slotKey)
+	if not slotKey then return false end
+	return self._raidCheckConfig.slots[slotKey] and true or false
+end
+
+-- Function toggle Raid Check slot expectation
+-- @param string slotKey
+-- @param boolean enabled
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetRaidCheckSlotEnabled(slotKey, enabled)
+	self:_EnsureRaidCheckConfig()
+	slotKey = NormalizeSlotKey(slotKey)
+	if not slotKey then
+		return false, "Invalid slot key."
+	end
+
+	if self._raidCheckConfig.slots[slotKey] == nil then
+		return false, "Unknown slot key."
+	end
+
+	if not self:IsCurrentUserAdmin() then
+		return false, "You must be an admin to change Raid Check settings."
+	end
+
+	self._raidCheckConfig.slots[slotKey] = enabled and true or false
+	return true, nil
+end
+
+-- Function toggle Raid Check whisper settings
+-- @param string mode "pre" or "raid"
+-- @param boolean enabled
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetRaidCheckWhispers(mode, enabled)
+	self:_EnsureRaidCheckConfig()
+	if not self:IsCurrentUserAdmin() then
+		return false, "You must be an admin to change Raid Check settings."
+	end
+
+	if mode == "pre" then
+		self._raidCheckConfig.enableWhispersPreRaid = enabled and true or false
+	elseif mode == "raid" then
+		self._raidCheckConfig.enableWhispersRaid = enabled and true or false
+	else
+		return false, "Invalid whisper mode."
+	end
+
+	return true, nil
 end
 
 -- Function Get list of admin member IDs
@@ -870,11 +1005,12 @@ function LootProfile:ExportSnapshot()
     return {
         version         = PROFILE_SNAPSHOT_VERSION,
         meta            = self:ExportMeta(),
-        adminUsers      = CopyArray(self._adminUsers),
-        lootLogs        = logsOut,
-        members         = membersOut,
-        pointName       = self._pointName or "Points",
-    }
+		adminUsers      = CopyArray(self._adminUsers),
+		lootLogs        = logsOut,
+		members         = membersOut,
+		pointName       = self._pointName or "Points",
+		raidCheck       = self:GetRaidCheckConfig(),
+	}
 end
 
 -- Function Validate profile meta table (structural)
@@ -922,12 +1058,21 @@ function LootProfile.ValidateSnapshot(snapshot)
         if type(snapshot.members) ~= "table" then return false, "snapshot.members must be a table or nil" end
     end
     
-    -- Validate optional pointName (new in this version)
-    if snapshot.pointName ~= nil then
-        if type(snapshot.pointName) ~= "string" then return false, "snapshot.pointName must be a string or nil" end
-    end
+	-- Validate optional pointName (new in this version)
+	if snapshot.pointName ~= nil then
+		if type(snapshot.pointName) ~= "string" then return false, "snapshot.pointName must be a string or nil" end
+	end
 
-    return true, nil
+	-- Validate optional raidCheck config
+	if snapshot.raidCheck ~= nil then
+		if type(snapshot.raidCheck) ~= "table" then return false, "snapshot.raidCheck must be a table or nil" end
+
+		if snapshot.raidCheck.slots ~= nil and type(snapshot.raidCheck.slots) ~= "table" then
+			return false, "snapshot.raidCheck.slots must be a table when provided"
+		end
+	end
+
+	return true, nil
 end
 
 -- Function Import a snapshot into this profile instance
@@ -987,19 +1132,40 @@ function LootProfile:ImportSnapshot(snapshot, opts)
         end
     end
     
-    -- Import pointName (if provided in snapshot)
-    if type(snapshot.pointName) == "string" then
-        self._pointName = snapshot.pointName
-        
-        if SF.Debug then
-            SF.Debug:Info("LootProfile", "Imported pointName: %s", self._pointName)
-        end
-    end
+	-- Import pointName (if provided in snapshot)
+	if type(snapshot.pointName) == "string" then
+		self._pointName = snapshot.pointName
+		
+		if SF.Debug then
+			SF.Debug:Info("LootProfile", "Imported pointName: %s", self._pointName)
+		end
+	end
 
-    -- Merge Logs
-    local inserted = self:MergeLogTables(snapshot.lootLogs, opts)
+	-- Import raid check settings (if provided)
+	if type(snapshot.raidCheck) == "table" then
+		self._raidCheckConfig = CopyRaidCheckDefaults()
 
-    return true, inserted, nil
+		if snapshot.raidCheck.enableWhispersPreRaid ~= nil then
+			self._raidCheckConfig.enableWhispersPreRaid = snapshot.raidCheck.enableWhispersPreRaid and true or false
+		end
+		if snapshot.raidCheck.enableWhispersRaid ~= nil then
+			self._raidCheckConfig.enableWhispersRaid = snapshot.raidCheck.enableWhispersRaid and true or false
+		end
+		if type(snapshot.raidCheck.slots) == "table" then
+			for slotKey, enabled in pairs(snapshot.raidCheck.slots) do
+				if RAID_CHECK_SLOT_DEFAULTS[slotKey] ~= nil then
+					self._raidCheckConfig.slots[slotKey] = enabled and true or false
+				end
+			end
+		end
+	end
+
+	self:_EnsureRaidCheckConfig()
+
+	-- Merge Logs
+	local inserted = self:MergeLogTables(snapshot.lootLogs, opts)
+
+	return true, inserted, nil
 end
 
 -- Function Merge a list of LootLog wire tables into this profile

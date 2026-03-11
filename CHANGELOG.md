@@ -16,6 +16,27 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+
+## [0.5.14-beta.16] - 2026-03-10
+
+### Added
+- Introduced a Raid Check feature to manage pre-raid and raid settings, including slot expectations and whisper notifications.
+- Added support for configuring and toggling Raid Check settings, such as enabling/disabling specific gear slots and whisper modes.
+- Included Raid Check configurations in profile snapshots for better synchronization.
+
+### Changed
+- Enhanced member point tracking with additional options for logging reasons, authors, and timestamps for point changes.
+- Improved profile import/export to include Raid Check configurations.
+- Updated profile synchronization to ensure Raid Check settings are preserved during sync and rebuild operations.
+
+## [0.5.14-beta.1] - 2026-03-09
+
+### Changed
+- Improved handling of class icons with a fallback mechanism for unknown or invalid class tokens.
+- Enhanced loot helper synchronization to ensure deterministic point rebuilds during session starts and sync operations.
+- Updated member point tracking to provide detailed logs for point changes and session summaries, improving debugging and transparency.
+
 ## [0.5.13] - 2026-03-09
 
 ### Changed

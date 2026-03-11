@@ -88,31 +88,9 @@ def check_duplicate_release(version, repo):
             print(f"          URL: {release.get('html_url', 'N/A')}")
             print("          Bump the version in the TOC file to create a new release")
             return True
-        
-        # Check 2: If we're creating a beta, check if stable version already exists
-        if suffix and suffix.startswith("beta") and base_version == release_base and release_suffix is None:
-            print(f"::error ::Cannot create beta version '{version}' - stable release '{release_tag}' already exists")
-            print(f"          Tag: {release.get('tag_name', 'N/A')}")
-            print(f"          Name: {release.get('name', 'N/A')}")
-            print(f"          URL: {release.get('html_url', 'N/A')}")
-            print("          You cannot create a beta for a version that has already been released as stable")
-            print(f"          Bump to the next version (e.g., {increment_version(base_version)}-beta.1)")
-            return True
     
     print(f"[check-duplicate-release] ✓ No existing release found for version {version}")
     return False
-
-
-def increment_version(version_string):
-    """Increment the patch version (X.Y.Z -> X.Y.Z+1)."""
-    parts = version_string.split(".")
-    if len(parts) == 3:
-        try:
-            parts[2] = str(int(parts[2]) + 1)
-            return ".".join(parts)
-        except ValueError:
-            pass
-    return version_string
 
 
 def main():

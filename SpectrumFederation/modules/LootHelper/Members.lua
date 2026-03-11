@@ -48,6 +48,19 @@ local function RGBToHex(r, g, b)
 	)
 end
 
+local function NormalizeClassToken(class)
+    if type(class) ~= "string" or class == "" then
+        return nil
+    end
+    local normalized = class:upper():gsub("[%s%-%_]", "")
+    if normalized == "" then
+        return nil
+    end
+    return normalized
+end
+
+local SYNC_REBUILD_NOTE = "state will be reconciled from logs via sync rebuild"
+
 -- Member class definition
 local Member = {}
 Member.__index = Member
@@ -77,8 +90,9 @@ function Member.new(identifier, role, class)
     end
     
     -- Validate and set class (must exist in SF.WOW_CLASSES)
-    if class and SF.WOW_CLASSES and SF.WOW_CLASSES[class] then
-        instance.class = class
+    local normalizedClass = NormalizeClassToken(class)
+    if normalizedClass and SF.WOW_CLASSES and SF.WOW_CLASSES[normalizedClass] then
+        instance.class = normalizedClass
     else
         instance.class = nil  -- Unknown or not specified
         if class and SF.Debug then
@@ -267,12 +281,12 @@ end
 
 -- Function to increment point balance by 1
 -- @return (boolean) - True if successful, false otherwise
-function Member:IncrementPoints()
+function Member:IncrementPoints(opts)
 
-    -- Enforce admin permissions
-    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
-        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
-            if SF.Debug then
+	-- Enforce admin permissions
+	if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
+		if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
+			if SF.Debug then
                 SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
             end
             return false
@@ -285,11 +299,22 @@ function Member:IncrementPoints()
     end
     
     -- Create Log Entry for point increment
-    local logEventType = SF.LootLogEventTypes.POINT_CHANGE
-    local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
-    logEventData.member = self:GetFullIdentifier()
-    logEventData.change = SF.LootLogPointChangeTypes.INCREMENT
-    local logEntry = SF.LootLog.new(logEventType, logEventData)
+	local logEventType = SF.LootLogEventTypes.POINT_CHANGE
+	local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
+	logEventData.member = self:GetFullIdentifier()
+	logEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+	if opts and opts.reason then
+		logEventData.reason = opts.reason
+	end
+
+	local logOpts = {}
+	if opts and opts.logAuthor then
+		logOpts.author = opts.logAuthor
+	end
+	if opts and opts.timestamp then
+		logOpts.timestamp = opts.timestamp
+	end
+	local logEntry = SF.LootLog.new(logEventType, logEventData, logOpts)
     -- Validate logEntry creation
     if not logEntry then
         SF:PrintError("Failed to create loot log entry for point increment.")
@@ -301,6 +326,11 @@ function Member:IncrementPoints()
 
     local oldBalance = self.pointBalance
     self.pointBalance = self.pointBalance + 1
+    if SF.Debug then
+        local delta = self.pointBalance - oldBalance
+        SF.Debug:Info("SYNC_POINTS", "Increment action (mode=apply_delta member=%s old=%d delta=%d new=%d)",
+            self:GetFullIdentifier(), oldBalance, delta, self.pointBalance)
+    end
 
     -- Add Log Entry to Loot Profile Table
     if SF.lootHelperDB.activeProfile.AddLootLog then
@@ -313,6 +343,8 @@ function Member:IncrementPoints()
     
     if SF.Debug then
         SF.Debug:Verbose("MEMBER", "%s points incremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
+        SF.Debug:Verbose("SYNC_POINTS", "Increment action (mode=recompute_on_sync member=%s note=%s)",
+            self:GetFullIdentifier(), SYNC_REBUILD_NOTE)
     end
     return true
 end
@@ -567,7 +599,8 @@ function Member.FromTable(t)
     if type(t) ~= "table" then return nil end
     if type(t.identifier) ~= "string" or t.identifier == "" then return nil end
     
-    local m = Member.new(t.identifier, t.role, t.class)
+    local incomingClass = t.class or t.className
+    local m = Member.new(t.identifier, t.role, incomingClass)
     if not m then return nil end
     
     -- Set point balance

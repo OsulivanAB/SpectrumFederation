@@ -431,8 +431,17 @@ function Sync:StartSession(profileId, opts)
     self:_ResetSessionSafeMode("StartSession")
     self:_ResetLocalSafeMode("StartSession")
 
+    -- Canonicalize derived member state before announcing session.
+    self:RebuildProfile(profileId, "session_start_coordinator")
+
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC_SESSION", "Session start (role=coordinator sessionId=%s profileId=%s coordinator=%s pointsSource=derived_logs)",
+            tostring(sessionId), tostring(profileId), tostring(me))
+    end
+    self:LogSessionPointsSummary(profileId, "coordinator_start")
 
     self:BeginAdminConvergence(sessionId, profileId)
 
