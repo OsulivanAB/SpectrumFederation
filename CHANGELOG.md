@@ -20,6 +20,14 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.15-beta.3] - 2026-03-16
+
+### Changed
+- Unified "Main Hand" and "Weapon" settings under a single "Weapon" toggle in Raid Check configuration.
+- Improved enchant validation for weapons, including main-hand, off-hand, and two-handed weapons.
+- Updated Raid Check logic to better handle off-hand items and non-weapon off-hand equipment.
+
 ## [0.5.15-beta-1] - 2026-03-16
 
 ### Changed

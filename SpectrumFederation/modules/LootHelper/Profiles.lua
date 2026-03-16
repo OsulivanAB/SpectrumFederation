@@ -35,7 +35,7 @@ local RAID_CHECK_SLOT_DEFAULTS = {
 	boots = true,
 	rings = true,
 	trinkets = true,
-	mainHand = true,
+	weapon = true,
 	offHand = true,
 }
 
@@ -55,6 +55,9 @@ end
 
 local function NormalizeSlotKey(key)
 	if type(key) ~= "string" then return nil end
+	if key == "mainHand" then
+		return "weapon"
+	end
 	return key
 end
 
@@ -67,6 +70,13 @@ function LootProfile:_EnsureRaidCheckConfig()
 
 	if type(cfg.slots) ~= "table" then
 		cfg.slots = CopyTableShallow(RAID_CHECK_DEFAULTS.slots)
+	end
+
+	if cfg.slots.mainHand ~= nil then
+		if cfg.slots.weapon == nil then
+			cfg.slots.weapon = not not cfg.slots.mainHand
+		end
+		cfg.slots.mainHand = nil
 	end
 
 	for slotKey, defaultEnabled in pairs(RAID_CHECK_SLOT_DEFAULTS) do
@@ -1153,8 +1163,9 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		end
 		if type(snapshot.raidCheck.slots) == "table" then
 			for slotKey, enabled in pairs(snapshot.raidCheck.slots) do
-				if RAID_CHECK_SLOT_DEFAULTS[slotKey] ~= nil then
-					self._raidCheckConfig.slots[slotKey] = enabled and true or false
+				local normalizedSlotKey = NormalizeSlotKey(slotKey)
+				if normalizedSlotKey and RAID_CHECK_SLOT_DEFAULTS[normalizedSlotKey] ~= nil then
+					self._raidCheckConfig.slots[normalizedSlotKey] = enabled and true or false
 				end
 			end
 		end
