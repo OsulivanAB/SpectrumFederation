@@ -948,7 +948,7 @@ function Page:Build(panel)
 								type = "checkboxGrid",
 								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
 								items = {
-									{ label = "Main Hand", get = function() return IsRaidCheckSlotEnabled("mainHand") end, set = function(v) SetRaidCheckSlot("mainHand", v) end },
+									{ label = "Weapon", get = function() return IsRaidCheckSlotEnabled("weapon") end, set = function(v) SetRaidCheckSlot("weapon", v) end },
 									{ label = "Off Hand", get = function() return IsRaidCheckSlotEnabled("offHand") end, set = function(v) SetRaidCheckSlot("offHand", v) end },
 								},
 							},
