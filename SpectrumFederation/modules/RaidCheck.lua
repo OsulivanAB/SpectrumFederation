@@ -49,6 +49,15 @@ local function HasEnchant(link)
 	return enchantId and enchantId ~= "" and enchantId ~= "0"
 end
 
+local function GetItemEquipLocation(link)
+	if type(link) ~= "string" then return nil end
+	local _, _, _, equipLoc = GetItemInfoInstant(link)
+	if type(equipLoc) == "string" and equipLoc ~= "" then
+		return equipLoc
+	end
+	return nil
+end
+
 local function GetItemStatsSafe(link)
 	if type(link) ~= "string" then return nil end
 
@@ -95,9 +104,30 @@ local function HasMissingGems(link)
 end
 
 local function IsTwoHandWeapon(link)
-	if type(link) ~= "string" then return false end
-	local _, _, _, _, _, _, _, _, equipLoc = GetItemInfoInstant(link)
-	return equipLoc == "INVTYPE_2HWEAPON"
+	return GetItemEquipLocation(link) == "INVTYPE_2HWEAPON"
+end
+
+local function CanReceiveWeaponEnchant(link)
+	local equipLoc = GetItemEquipLocation(link)
+	return equipLoc == "INVTYPE_WEAPON"
+		or equipLoc == "INVTYPE_WEAPONMAINHAND"
+		or equipLoc == "INVTYPE_WEAPONOFFHAND"
+		or equipLoc == "INVTYPE_2HWEAPON"
+end
+
+local function ShouldCheckEnchant(slotDef, link)
+	if slotDef ~= SLOT_DEFS.offHand then
+		return true
+	end
+
+	if CanReceiveWeaponEnchant(link) then
+		return true
+	end
+
+	-- Held-in-offhand items and shields do not use weapon enchants.
+	-- If item metadata is unavailable for an equipped offhand, skip the enchant
+	-- warning to avoid false positives until the client can resolve the item.
+	return false
 end
 
 local function CollectUnits()
@@ -150,7 +180,7 @@ local function BuildMissingForSlot(unit, slotDef, idx, mainHandLink)
 	end
 
 	local missing = {}
-	if not HasEnchant(link) then
+	if ShouldCheckEnchant(slotDef, link) and not HasEnchant(link) then
 		table.insert(missing, label .. " Enchant")
 	end
 
