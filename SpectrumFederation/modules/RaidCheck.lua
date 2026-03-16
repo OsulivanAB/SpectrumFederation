@@ -104,11 +104,14 @@ local function HasMissingGems(link)
 end
 
 local function IsTwoHandWeapon(link)
+	if type(link) ~= "string" then return false end
 	return GetItemEquipLocation(link) == "INVTYPE_2HWEAPON"
 end
 
 local function CanReceiveWeaponEnchant(link)
+	if type(link) ~= "string" then return false end
 	local equipLoc = GetItemEquipLocation(link)
+	if not equipLoc then return false end
 	return equipLoc == "INVTYPE_WEAPON"
 		or equipLoc == "INVTYPE_WEAPONMAINHAND"
 		or equipLoc == "INVTYPE_WEAPONOFFHAND"

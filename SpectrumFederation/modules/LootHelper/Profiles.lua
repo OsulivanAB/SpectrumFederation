@@ -72,10 +72,12 @@ function LootProfile:_EnsureRaidCheckConfig()
 		cfg.slots = CopyTableShallow(RAID_CHECK_DEFAULTS.slots)
 	end
 
-	if cfg.slots.weapon == nil and cfg.slots.mainHand ~= nil then
-		cfg.slots.weapon = cfg.slots.mainHand and true or false
+	if cfg.slots.mainHand ~= nil then
+		if cfg.slots.weapon == nil then
+			cfg.slots.weapon = cfg.slots.mainHand and true or false
+		end
+		cfg.slots.mainHand = nil
 	end
-	cfg.slots.mainHand = nil
 
 	for slotKey, defaultEnabled in pairs(RAID_CHECK_SLOT_DEFAULTS) do
 		if cfg.slots[slotKey] == nil then
