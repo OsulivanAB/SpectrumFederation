@@ -57,6 +57,7 @@ SF.SettingsSchema = {
 				if type(cursorTracer.trailLengthSeconds) == "number" then
 					trailLength = cursorTracer.trailLengthSeconds
 				elseif type(cursorTracer.length) == "number" then
+					-- Legacy length stored the number of 15ms trail samples, so convert it to seconds.
 					trailLength = cursorTracer.length * 0.015
 				end
 			end
