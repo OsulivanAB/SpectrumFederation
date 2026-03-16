@@ -18,10 +18,7 @@ function Page:Build(panel)
 
 	local renderer = SF.SettingsUI.DefinitionRenderer
 	local store = SF.SettingsStore
-	local cursorTracer = SF.CursorTracer or {
-		MIN_LENGTH = 6,
-		MAX_LENGTH = 24,
-	}
+	local cursorTracer = SF.CursorTracer
 	local function CursorTracerEnabled()
 		return store:Get("global.cursorTracer.enabled")
 	end
@@ -74,34 +71,19 @@ function Page:Build(panel)
 			},
 			{
 				id = "cursorTracer",
-				title = "Cursor Tracer",
-				intro = "Add a cosmetic trail behind your mouse cursor using built-in game textures.",
+				title = "Rainbow Cursor Trail",
+				intro = "Add a smooth rainbow trail behind your mouse cursor.",
 				items = {
 					{
 						type = "checkbox",
-						label = "Enable Cursor Tracer",
-						tooltip = "Show a cosmetic trail that follows your cursor.",
+						label = "Enable Rainbow Cursor Trail",
+						tooltip = "Show a smooth rainbow trail that follows your cursor.",
 						path = "global.cursorTracer.enabled",
-					},
-					{
-						type = "dropdown",
-						label = "Tracer Texture",
-						tooltip = "Choose which built-in texture is used for the cursor trail.",
-						path = "global.cursorTracer.texture",
-						options = function()
-							if SF.CursorTracer and SF.CursorTracer.GetTextureOptions then
-								return SF.CursorTracer:GetTextureOptions()
-							end
-
-							return {}
-						end,
-						visible = CursorTracerEnabled,
-						enabled = CursorTracerEnabled,
 					},
 					{
 						type = "slider",
 						label = "Trail Length",
-						tooltip = "Adjust how many trail segments follow the cursor.",
+						tooltip = "Adjust how long the rainbow trail remains visible behind the cursor.",
 						path = "global.cursorTracer.length",
 						min = cursorTracer.MIN_LENGTH,
 						max = cursorTracer.MAX_LENGTH,

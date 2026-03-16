@@ -13,7 +13,6 @@ SF.SettingsSchema = {
 			fontSize    = 12,
 			cursorTracer = {
 				enabled = false,
-				texture = "spark",
 				length = 12,
 			},
 		},
@@ -157,4 +156,3 @@ SF.SettingsSchema = {
 		end,
 	},
 }
-

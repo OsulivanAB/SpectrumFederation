@@ -22,6 +22,13 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [0.5.15-beta.9] - 2026-03-16
+
+### Changed
+- Simplified the cursor trail feature into a single smooth rainbow trail effect.
+- Removed texture customization from the General settings UI and kept a conditional trail length control.
+- Updated the cursor trail toggle label to "Enable Rainbow Cursor Trail".
+
 ## [0.5.15-beta.7] - 2026-03-16
 
 ### Added

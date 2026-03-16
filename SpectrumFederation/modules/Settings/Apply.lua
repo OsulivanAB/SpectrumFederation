@@ -52,7 +52,6 @@ function Apply:Init()
     end
 
     store:RegisterCallback("global.cursorTracer.enabled", QueueCursorTracerApply)
-    store:RegisterCallback("global.cursorTracer.texture", QueueCursorTracerApply)
     store:RegisterCallback("global.cursorTracer.length", QueueCursorTracerApply)
 
     store:RegisterCallback("lootHelper.enabled", function(newValue)
@@ -183,22 +182,19 @@ function Apply:ApplyCursorTracer()
     end
 
     local enabled = store:Get("global.cursorTracer.enabled")
-    local texture = store:Get("global.cursorTracer.texture")
     local length = store:Get("global.cursorTracer.length")
 
     if SF.Debug then
         SF.Debug:Verbose(
             "SETTINGS",
-            "Applying cursor tracer settings: enabled=%s, texture=%s, length=%s",
+            "Applying cursor tracer settings: enabled=%s, length=%s",
             tostring(enabled),
-            tostring(texture),
             tostring(length)
         )
     end
 
     SF.CursorTracer:ApplySettings({
         enabled = enabled,
-        texture = texture,
         length = length,
     })
 end
