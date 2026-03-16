@@ -530,6 +530,8 @@ function Window:Create()
     local minimize = CreateGlyphButton(title, C.ICON_BUTTON_SIZE)
     minimize:SetPoint("RIGHT", close, "LEFT", -6, 0)
     title.Minimize = minimize
+    minimize.__sfTooltipTitle = "Minimize"
+    minimize.__sfTooltipText = "Collapse the Loot Helper window to its title bar"
     gear:SetPoint("RIGHT", minimize, "LEFT", -6, 0)
     AttachTooltip(minimize, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
 
