@@ -43,16 +43,14 @@ function Apply:Init()
     end)
 
     local function QueueCursorTracerApply()
-        local delay = (SF.CursorTracer and SF.CursorTracer.SAMPLE_INTERVAL) or 0.03
-        self:Debounce("cursorTracer", delay, function()
+        self:Debounce("cursorTracer", 0.03, function()
             self:RunOrDefer(function()
                 self:ApplyCursorTracer()
             end)
         end)
     end
 
-    store:RegisterCallback("global.cursorTracer.enabled", QueueCursorTracerApply)
-    store:RegisterCallback("global.cursorTracer.length", QueueCursorTracerApply)
+    store:RegisterCallback("global.cursorTracer.trailLength", QueueCursorTracerApply)
 
     store:RegisterCallback("lootHelper.enabled", function(newValue)
         self:Debounce("lootHelperEnabled", 0.1, function()
@@ -177,26 +175,22 @@ end
 -- @return nil
 function Apply:ApplyCursorTracer()
     local store = SF.SettingsStore
-    if not store or not SF.CursorTracer or not SF.CursorTracer.ApplySettings then
+    if not store or not SF.CursorTracer or not SF.CursorTracer.SetTrailLength then
         return
     end
 
-    local enabled = store:Get("global.cursorTracer.enabled")
-    local length = store:Get("global.cursorTracer.length")
+    local trailLength = store:Get("global.cursorTracer.trailLength")
 
     if SF.Debug then
         SF.Debug:Verbose(
             "SETTINGS",
-            "Applying cursor tracer settings: enabled=%s, length=%s",
-            tostring(enabled),
-            tostring(length)
+            "Applying cursor tracer settings: trailLength=%s",
+            tostring(trailLength)
         )
     end
 
-    SF.CursorTracer:ApplySettings({
-        enabled = enabled,
-        length = length,
-    })
+    SF.CursorTracer:SetTrailLength(trailLength)
+    SF.CursorTracer:RefreshTrail()
 end
 
 -- Apply window style setting

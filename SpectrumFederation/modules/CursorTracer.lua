@@ -3,38 +3,37 @@ local addonName, SF = ...
 SF.CursorTracer = SF.CursorTracer or {}
 local CursorTracer = SF.CursorTracer
 
-CursorTracer.DEFAULT_LENGTH = 12
-CursorTracer.MIN_LENGTH = 6
-CursorTracer.MAX_LENGTH = 24
-CursorTracer.MAX_BLOBS = 96
-CursorTracer.SAMPLE_INTERVAL = 0.015
-CursorTracer.BLOB_TEXTURE = "Interface\\Cooldown\\ping4"
-CursorTracer.BLOB_ALPHA = 0.36
-CursorTracer.BLOB_BASE_SIZE = 20
-CursorTracer.BLOB_SPACING_FACTOR = 0.32
-CursorTracer.MIN_BLOB_SCALE = 0.7
-CursorTracer.BLOB_SCALE_RANGE = 0.4
-CursorTracer.HUE_SHIFT_SPEED = 0.18
-CursorTracer.COLOR_SATURATION = 0.55
+CursorTracer.MIN_TRAIL_LENGTH = 0.05
+CursorTracer.MAX_TRAIL_LENGTH = 2.0
+CursorTracer.DEFAULT_TRAIL_LENGTH = 0.18
+CursorTracer.UPDATE_INTERVAL = 0.015
+CursorTracer.DORMANT_INTERVAL = 0.05
+CursorTracer.HITCH_THRESHOLD = 0.2
+CursorTracer.MAX_DOTS = 128
+CursorTracer.DOT_SPACING = 7
+CursorTracer.DOT_TEXTURE = "Interface\\Cooldown\\ping4"
+CursorTracer.DOT_BLEND_MODE = "ADD"
+CursorTracer.DOT_BASE_SIZE = 18
+CursorTracer.DOT_MIN_SCALE = 0.35
+CursorTracer.DOT_ALPHA = 0.34
+CursorTracer.DISTANCE_FADE = 0.82
+CursorTracer.COLOR_SATURATION = 0.58
 CursorTracer.COLOR_VALUE = 0.92
-CursorTracer.MOVE_THRESHOLD_SQ = 4
+CursorTracer.RAINBOW_SPEED = 0.22
+CursorTracer.PHASE_COUNT = 18
+CursorTracer.MIN_MOVE_THRESHOLD_SQ = 1
+CursorTracer.OFFSET_X = 0
+CursorTracer.OFFSET_Y = 0
 
-local function ClampLength(value)
-	value = tonumber(value) or CursorTracer.DEFAULT_LENGTH
-	value = math.floor(value + 0.5)
-
-	if value < CursorTracer.MIN_LENGTH then
-		return CursorTracer.MIN_LENGTH
+local function ClampTrailLength(value)
+	value = tonumber(value) or CursorTracer.DEFAULT_TRAIL_LENGTH
+	if value < CursorTracer.MIN_TRAIL_LENGTH then
+		return CursorTracer.MIN_TRAIL_LENGTH
 	end
-	if value > CursorTracer.MAX_LENGTH then
-		return CursorTracer.MAX_LENGTH
+	if value > CursorTracer.MAX_TRAIL_LENGTH then
+		return CursorTracer.MAX_TRAIL_LENGTH
 	end
-
 	return value
-end
-
-local function GetLifeSpan(length)
-	return math.max((tonumber(length) or CursorTracer.DEFAULT_LENGTH) * CursorTracer.SAMPLE_INTERVAL, CursorTracer.SAMPLE_INTERVAL)
 end
 
 local function HSVToRGB(h, s, v)
@@ -68,12 +67,18 @@ function CursorTracer:Init()
 	if self.initialized then return end
 	self.initialized = true
 
-	self.enabled = false
-	self.length = self.DEFAULT_LENGTH
-	self.points = {}
+	self.trailLength = self.DEFAULT_TRAIL_LENGTH
 	self.elapsed = 0
+	self.head = 0
+	self.count = 0
+	self.sequence = 0
+	self.remainingToNextDot = self.DOT_SPACING
+	self.lastCursorX = nil
+	self.lastCursorY = nil
+	self.dormant = true
 
 	self:EnsureFrame()
+	self:Start()
 	self:HideAll()
 end
 
@@ -82,73 +87,44 @@ function CursorTracer:EnsureFrame()
 
 	local frame = CreateFrame("Frame", nil, UIParent)
 	frame:SetAllPoints(UIParent)
-	frame:SetFrameStrata("HIGH")
+	frame:SetFrameStrata("TOOLTIP")
 	frame:EnableMouse(false)
-	frame:Hide()
 
 	self.frame = frame
 	self.textures = {}
+	self.dots = {}
 	self.onUpdate = function(_, elapsed)
 		self:OnUpdate(elapsed)
 	end
 
-	for index = 1, self.MAX_BLOBS do
+	for index = 1, self.MAX_DOTS do
 		local texture = frame:CreateTexture(nil, "OVERLAY")
-		texture:SetTexture(self.BLOB_TEXTURE)
-		texture:SetBlendMode("ADD")
+		texture:SetTexture(self.DOT_TEXTURE)
+		texture:SetBlendMode(self.DOT_BLEND_MODE)
 		texture:Hide()
 		self.textures[index] = texture
-	end
-end
-
-function CursorTracer:ApplySettings(settings)
-	self:Init()
-	settings = settings or {}
-
-	self.length = ClampLength(settings.length)
-
-	if settings.enabled then
-		self:SetEnabled(true)
-	else
-		self:SetEnabled(false)
-	end
-
-	if self.enabled then
-		self:Refresh()
-	end
-end
-
-function CursorTracer:SetEnabled(enabled)
-	self:Init()
-	enabled = not not enabled
-
-	if self.enabled == enabled then return end
-
-	self.enabled = enabled
-	if enabled then
-		self:Start()
-	else
-		self:Stop()
+		self.dots[index] = {
+			x = 0,
+			y = 0,
+			time = 0,
+			sequence = 0,
+		}
 	end
 end
 
 function CursorTracer:Start()
 	if not self.frame then return end
-
-	self.elapsed = 0
-	self.frame:Show()
 	self.frame:SetScript("OnUpdate", self.onUpdate)
 end
 
-function CursorTracer:Stop()
-	if self.frame then
-		self.frame:SetScript("OnUpdate", nil)
-		self.frame:Hide()
-	end
+function CursorTracer:SetTrailLength(seconds)
+	self:Init()
+	self.trailLength = ClampTrailLength(seconds)
+end
 
-	self.elapsed = 0
-	self.points = {}
-	self:HideAll()
+function CursorTracer:GetTrailLength()
+	self:Init()
+	return self.trailLength
 end
 
 function CursorTracer:HideAll()
@@ -157,130 +133,140 @@ function CursorTracer:HideAll()
 	end
 end
 
-function CursorTracer:CaptureCursorPoint(age)
-	local scale = UIParent:GetEffectiveScale()
-	if not scale or scale == 0 then return end
-
-	local x, y = GetCursorPosition()
-	x = x / scale
-	y = y / scale
-
-	local points = self.points
-	local lastPoint = points[1]
-
-	if lastPoint then
-		local dx = x - lastPoint.x
-		local dy = y - lastPoint.y
-		-- Ignore movement smaller than 2px so the trail stays smooth without oversampling.
-		if (dx * dx) + (dy * dy) < self.MOVE_THRESHOLD_SQ then
-			return
-		end
-	end
-
-	table.insert(points, 1, {
-		x = x,
-		y = y,
-		age = age or 0,
-	})
-
-	while #points > (self.length + 1) do
-		table.remove(points)
-	end
+function CursorTracer:ResetTrail()
+	self.head = 0
+	self.count = 0
+	self.sequence = 0
+	self.remainingToNextDot = self.DOT_SPACING
+	self:HideAll()
 end
 
-function CursorTracer:AgePoints(delta)
-	local points = self.points
-	local lifeSpan = GetLifeSpan(self.length)
+function CursorTracer:RefreshTrail(now)
+	self:Init()
 
-	for index = #points, 1, -1 do
-		local point = points[index]
-		point.age = (point.age or 0) + delta
+	now = now or (GetTime and GetTime()) or 0
 
-		if index > (self.length + 1) or point.age >= lifeSpan then
-			table.remove(points, index)
-		end
-	end
-end
+	local visible = 0
+	local timePhase = now * self.RAINBOW_SPEED
 
-function CursorTracer:Refresh()
-	if not self.enabled then
-		self:HideAll()
-		return
-	end
+	for offset = 0, (self.count or 0) - 1 do
+		local slot = ((self.head - offset - 1) % self.MAX_DOTS) + 1
+		local dot = self.dots[slot]
+		local age = now - (dot.time or 0)
 
-	local points = self.points
-	local lifeSpan = GetLifeSpan(self.length)
-	local timeOffset = (GetTime and (GetTime() * self.HUE_SHIFT_SPEED)) or 0
-	local textureIndex = 1
+		if age <= self.trailLength then
+			local texture = self.textures[visible + 1]
+			local ageProgress = 1 - (age / self.trailLength)
+			local distanceProgress = 1 - (offset / math.max(self.count - 1, 1))
+			local visibility = ageProgress * (self.DISTANCE_FADE + ((1 - self.DISTANCE_FADE) * distanceProgress))
+			local scale = self.DOT_MIN_SCALE + ((1 - self.DOT_MIN_SCALE) * visibility)
+			local hue = timePhase + ((dot.sequence or 0) / self.PHASE_COUNT)
+			local r, g, b = HSVToRGB(hue, self.COLOR_SATURATION, self.COLOR_VALUE)
 
-	for index = 1, math.min(#points - 1, self.length) do
-		local startPoint = points[index]
-		local endPoint = points[index + 1]
-		local dx = endPoint.x - startPoint.x
-		local dy = endPoint.y - startPoint.y
-		local distanceSq = (dx * dx) + (dy * dy)
-
-		if distanceSq > 0 then
-			local distance = math.sqrt(distanceSq)
-			local startProgress = 1 - math.min((startPoint.age or 0) / lifeSpan, 1)
-			local endProgress = 1 - math.min((endPoint.age or 0) / lifeSpan, 1)
-			local startSize = self.BLOB_BASE_SIZE * (self.MIN_BLOB_SCALE + (startProgress * self.BLOB_SCALE_RANGE))
-			local endSize = self.BLOB_BASE_SIZE * (self.MIN_BLOB_SCALE + (endProgress * self.BLOB_SCALE_RANGE))
-			local spacing = math.max(math.min(startSize, endSize) * self.BLOB_SPACING_FACTOR, 2)
-			local steps = math.max(1, math.ceil(distance / spacing))
-
-			for step = 0, steps do
-				if textureIndex > self.MAX_BLOBS then
-					break
-				end
-
-				local texture = self.textures[textureIndex]
-				local t = step / steps
-				local progress = startProgress + ((endProgress - startProgress) * t)
-				local scale = self.MIN_BLOB_SCALE + (progress * self.BLOB_SCALE_RANGE)
-				local size = self.BLOB_BASE_SIZE * scale
-				local hue = timeOffset + ((index - 1 + t) / math.max(self.length, 1))
-				local r, g, b = HSVToRGB(hue, self.COLOR_SATURATION, self.COLOR_VALUE)
-
-				texture:ClearAllPoints()
-				texture:SetPoint(
-					"CENTER",
-					self.frame,
-					"BOTTOMLEFT",
-					startPoint.x + (dx * t),
-					startPoint.y + (dy * t)
-				)
-				texture:SetSize(size, size)
-				texture:SetRotation(0)
-				texture:SetVertexColor(r, g, b)
-				texture:SetAlpha(self.BLOB_ALPHA * progress)
-				texture:Show()
-				textureIndex = textureIndex + 1
-			end
-
-			if textureIndex > self.MAX_BLOBS then
-				break
-			end
+			texture:ClearAllPoints()
+			texture:SetPoint("CENTER", self.frame, "BOTTOMLEFT", dot.x + self.OFFSET_X, dot.y + self.OFFSET_Y)
+			texture:SetSize(self.DOT_BASE_SIZE * scale, self.DOT_BASE_SIZE * scale)
+			texture:SetVertexColor(r, g, b)
+			texture:SetAlpha(self.DOT_ALPHA * visibility)
+			texture:Show()
+			visible = visible + 1
 		end
 	end
 
-	for index = textureIndex, self.MAX_BLOBS do
+	for index = visible + 1, self.MAX_DOTS do
 		self.textures[index]:Hide()
 	end
+
+	self.dormant = visible == 0
+end
+
+function CursorTracer:PushDot(x, y, now)
+	self.head = (self.head % self.MAX_DOTS) + 1
+	self.count = math.min(self.count + 1, self.MAX_DOTS)
+	self.sequence = self.sequence + 1
+
+	local dot = self.dots[self.head]
+	dot.x = x
+	dot.y = y
+	dot.time = now
+	dot.sequence = self.sequence
+end
+
+function CursorTracer:EmitInterpolatedDots(startX, startY, endX, endY, now)
+	local dx = endX - startX
+	local dy = endY - startY
+	local distanceSq = (dx * dx) + (dy * dy)
+
+	if distanceSq < self.MIN_MOVE_THRESHOLD_SQ then
+		return false
+	end
+
+	local distance = math.sqrt(distanceSq)
+	local consumed = 0
+	local emitted = false
+
+	while (distance - consumed) >= self.remainingToNextDot do
+		consumed = consumed + self.remainingToNextDot
+		local t = consumed / distance
+		self:PushDot(startX + (dx * t), startY + (dy * t), now)
+		self.remainingToNextDot = self.DOT_SPACING
+		emitted = true
+	end
+
+	self.remainingToNextDot = self.remainingToNextDot - (distance - consumed)
+	if self.remainingToNextDot <= 0 then
+		self.remainingToNextDot = self.DOT_SPACING
+	end
+
+	return emitted
 end
 
 function CursorTracer:OnUpdate(elapsed)
-	if not self.enabled then return end
+	self:Init()
 
-	self.elapsed = self.elapsed + (elapsed or 0)
-	if self.elapsed < self.SAMPLE_INTERVAL then
+	elapsed = elapsed or 0
+	if elapsed >= self.HITCH_THRESHOLD then
+		self.elapsed = 0
+		self:ResetTrail()
+		self.lastCursorX = nil
+		self.lastCursorY = nil
+		self.dormant = true
+		return
+	end
+
+	self.elapsed = self.elapsed + elapsed
+	local targetInterval = self.dormant and self.DORMANT_INTERVAL or self.UPDATE_INTERVAL
+	if self.elapsed < targetInterval then
 		return
 	end
 
 	local delta = self.elapsed
 	self.elapsed = 0
 
-	self:AgePoints(delta)
-	self:CaptureCursorPoint(0)
-	self:Refresh()
+	local scale = UIParent:GetEffectiveScale()
+	if not scale or scale == 0 then return end
+
+	local rawX, rawY = GetCursorPosition()
+	local x = rawX / scale
+	local y = rawY / scale
+	local now = (GetTime and GetTime()) or 0
+
+	if not self.lastCursorX or not self.lastCursorY then
+		self.lastCursorX = x
+		self.lastCursorY = y
+		self:RefreshTrail(now)
+		return
+	end
+
+	local moved = self:EmitInterpolatedDots(self.lastCursorX, self.lastCursorY, x, y, now)
+	self.lastCursorX = x
+	self.lastCursorY = y
+
+	if moved then
+		self.dormant = false
+	elseif delta >= self.trailLength and self.count == 0 then
+		self.dormant = true
+	end
+
+	self:RefreshTrail(now)
 end

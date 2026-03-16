@@ -2,18 +2,17 @@
 local addonName, SF = ...
 
 SF.SettingsSchema = {
-	VERSION = 3,
+	VERSION = 4,
 
 	DEFAULTS = {
-		version = 3,
+		version = 4,
 
 		global = {
 			windowStyle = "Default",
 			fontStyle   = "Friz Quadrata",
 			fontSize    = 12,
 			cursorTracer = {
-				enabled = false,
-				length = 12,
+				trailLength = 0.18,
 			},
 		},
 
@@ -47,6 +46,25 @@ SF.SettingsSchema = {
 	-- Migration functions run when db.version < VERSION
 	-- The key is the *target* version number (migrate to that version)
 	MIGRATIONS = {
+		[4] = function(db)
+			if type(db) ~= "table" then return end
+			if type(db.global) ~= "table" then return end
+			if type(db.global.cursorTracer) ~= "table" then return end
+
+			local cursorTracer = db.global.cursorTracer
+			local trailLength = cursorTracer.trailLength
+			if type(trailLength) ~= "number" then
+				if type(cursorTracer.trailLengthSeconds) == "number" then
+					trailLength = cursorTracer.trailLengthSeconds
+				elseif type(cursorTracer.length) == "number" then
+					trailLength = cursorTracer.length * 0.015
+				end
+			end
+
+			db.global.cursorTracer = {
+				trailLength = trailLength or 0.18,
+			}
+		end,
 		[3] = function(db)
 			if type(db) ~= "table" then return end
 			if type(db.lootHelper) ~= "table" then return end

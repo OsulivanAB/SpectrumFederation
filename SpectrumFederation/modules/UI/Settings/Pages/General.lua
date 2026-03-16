@@ -17,11 +17,7 @@ function Page:Build(panel)
 	end
 
 	local renderer = SF.SettingsUI.DefinitionRenderer
-	local store = SF.SettingsStore
 	local cursorTracer = SF.CursorTracer
-	local function CursorTracerEnabled()
-		return store:Get("global.cursorTracer.enabled")
-	end
 
 	local def = {
 		sections = {
@@ -75,21 +71,14 @@ function Page:Build(panel)
 				intro = "Add a smooth rainbow trail behind your mouse cursor.",
 				items = {
 					{
-						type = "checkbox",
-						label = "Enable Rainbow Cursor Trail",
-						tooltip = "Show a smooth rainbow trail that follows your cursor.",
-						path = "global.cursorTracer.enabled",
-					},
-					{
 						type = "slider",
-						label = "Trail Length",
+						label = "Trail Length (seconds)",
 						tooltip = "Adjust how long the rainbow trail remains visible behind the cursor.",
-						path = "global.cursorTracer.length",
-						min = cursorTracer.MIN_LENGTH,
-						max = cursorTracer.MAX_LENGTH,
-						step = 1,
-						visible = CursorTracerEnabled,
-						enabled = CursorTracerEnabled,
+						path = "global.cursorTracer.trailLength",
+						min = cursorTracer.MIN_TRAIL_LENGTH,
+						max = cursorTracer.MAX_TRAIL_LENGTH,
+						step = 0.01,
+						valueFormat = "%.2f",
 					},
 				},
 			},

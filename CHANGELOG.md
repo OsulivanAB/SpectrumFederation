@@ -22,6 +22,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [0.5.15-beta.11] - 2026-03-16
+
+### Changed
+- Reworked the rainbow cursor trail around a fixed pooled/ring-buffer style renderer with interpolated spacing and stall protection.
+- Simplified the cursor trail settings to a single trail-length-in-seconds control while keeping the rainbow trail always on.
+
 ## [0.5.15-beta.10] - 2026-03-16
 
 ### Changed
