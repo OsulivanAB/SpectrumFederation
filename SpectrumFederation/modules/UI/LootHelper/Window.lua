@@ -108,7 +108,7 @@ function Window:_ApplyMinimizedState()
         f:SetSize(w, C.MINIMIZED_HEIGHT)
     else
         local w = Clamp(st.width or f:GetWidth() or C.DEFAULT_WIDTH, C.MIN_WIDTH, C.MAX_WIDTH)
-        local h = Clamp(st.height or f:GetHeight() or C.DEFAULT_HEIGHT, C.MIN_HEIGHT, C.MAX_HEIGHT)
+        local h = Clamp(st.expandedHeight or st.height or f:GetHeight() or C.DEFAULT_HEIGHT, C.MIN_HEIGHT, C.MAX_HEIGHT)
         f:SetSize(w, h)
     end
 
@@ -193,9 +193,12 @@ function Window:SaveState()
 
     st.width = Round(w)
     if f.__sfMinimized then
-        st.height = Round(Clamp(st.height or C.DEFAULT_HEIGHT, C.MIN_HEIGHT, C.MAX_HEIGHT))
+        local expandedHeight = st.expandedHeight or st.height or C.DEFAULT_HEIGHT
+        st.height = Round(Clamp(expandedHeight, C.MIN_HEIGHT, C.MAX_HEIGHT))
+        st.expandedHeight = st.height
     else
         st.height = Round(Clamp(h, C.MIN_HEIGHT, C.MAX_HEIGHT))
+        st.expandedHeight = st.height
     end
     st.minimized = f.__sfMinimized and true or false
     st.point = point or C.DEFAULT_POINT
@@ -224,6 +227,7 @@ function Window:SetMinimized(minimized)
         local w, h = f:GetSize()
         st.width = Round(Clamp(w, C.MIN_WIDTH, C.MAX_WIDTH))
         st.height = Round(Clamp(h, C.MIN_HEIGHT, C.MAX_HEIGHT))
+        st.expandedHeight = st.height
     end
 
     f.__sfMinimized = minimized
@@ -397,14 +401,14 @@ local function CreateGlyphButton(parent, size)
         label:SetTextColor(0.92, 0.92, 0.92)
     end
 
-    btn:HookScript("OnMouseDown", function(self, button)
-        if button ~= "LeftButton" then return end
+    btn:HookScript("OnMouseDown", function(self, mouseButton)
+        if mouseButton ~= "LeftButton" then return end
         self.__sfPushed = true
         UpdateVisual()
     end)
 
-    btn:HookScript("OnMouseUp", function(self, button)
-        if button ~= "LeftButton" then return end
+    btn:HookScript("OnMouseUp", function(self, mouseButton)
+        if mouseButton ~= "LeftButton" then return end
         self.__sfPushed = false
         UpdateVisual()
     end)
