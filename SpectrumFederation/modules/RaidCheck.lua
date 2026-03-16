@@ -148,7 +148,7 @@ local function GetRaidCheckSlotConfigKey(slotKey, link)
 	return slotKey
 end
 
-local function IsRaidCheckSlotEnabled(cfg, slotKey, link)
+local function IsSlotEnabledInConfig(cfg, slotKey, link)
 	if not cfg or type(cfg.slots) ~= "table" then
 		return false
 	end
@@ -203,13 +203,15 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
 			return {}
 		end
-		if not IsRaidCheckSlotEnabled(cfg, slotKey, nil) then
+		-- An empty offhand still follows the physical offhand slot toggle because
+		-- there is no equipped item to classify as a weapon or non-weapon.
+		if not IsSlotEnabledInConfig(cfg, slotKey, nil) then
 			return {}
 		end
 		return { label .. " Item" }
 	end
 
-	if not IsRaidCheckSlotEnabled(cfg, slotKey, link) then
+	if not IsSlotEnabledInConfig(cfg, slotKey, link) then
 		return {}
 	end
 
