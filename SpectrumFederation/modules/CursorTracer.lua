@@ -10,17 +10,21 @@ CursorTracer.UPDATE_INTERVAL = 0.015
 CursorTracer.DORMANT_INTERVAL = 0.05
 CursorTracer.HITCH_THRESHOLD = 0.2
 CursorTracer.MAX_DOTS = 128
-CursorTracer.DOT_SPACING = 7
-CursorTracer.DOT_TEXTURE = "Interface\\Cooldown\\ping4"
+CursorTracer.DOT_SPACING = 4
+CursorTracer.DOT_ATLAS = "VignetteKill"
+CursorTracer.DOT_TEXTURE = "Interface\\Cooldown\\star4"
+CursorTracer.HEAD_ATLAS = "VignetteKill"
+CursorTracer.HEAD_TEXTURE = "Interface\\Cooldown\\star4"
 CursorTracer.DOT_BLEND_MODE = "ADD"
-CursorTracer.DOT_BASE_SIZE = 18
-CursorTracer.DOT_MIN_SCALE = 0.35
-CursorTracer.DOT_ALPHA = 0.34
-CursorTracer.DISTANCE_FADE = 0.82
-CursorTracer.COLOR_SATURATION = 0.58
-CursorTracer.COLOR_VALUE = 0.92
-CursorTracer.RAINBOW_SPEED = 0.22
-CursorTracer.PHASE_COUNT = 18
+CursorTracer.DOT_BASE_SIZE = 20
+CursorTracer.HEAD_SIZE = 24
+CursorTracer.DOT_MIN_SCALE = 0.68
+CursorTracer.DOT_ALPHA = 0.56
+CursorTracer.HEAD_ALPHA = 0.9
+CursorTracer.DISTANCE_FADE = 0.92
+CursorTracer.COLOR_SATURATION = 0.92
+CursorTracer.COLOR_VALUE = 1.0
+CursorTracer.RAINBOW_CYCLE_DISTANCE = 72
 CursorTracer.MIN_MOVE_THRESHOLD_SQ = 1
 CursorTracer.OFFSET_X = 0
 CursorTracer.OFFSET_Y = 0
@@ -63,6 +67,18 @@ local function HSVToRGB(h, s, v)
 	return v, p, q
 end
 
+local function AtlasExists(atlas)
+	return atlas and C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(atlas)
+end
+
+local function ApplyTextureVisual(texture, atlas, fallbackTexture)
+	if AtlasExists(atlas) and texture.SetAtlas then
+		texture:SetAtlas(atlas, false)
+	else
+		texture:SetTexture(fallbackTexture)
+	end
+end
+
 function CursorTracer:Init()
 	if self.initialized then return end
 	self.initialized = true
@@ -71,10 +87,11 @@ function CursorTracer:Init()
 	self.elapsed = 0
 	self.head = 0
 	self.count = 0
-	self.sequence = 0
 	self.remainingToNextDot = self.DOT_SPACING
+	self.cursorDistance = 0
 	self.lastCursorX = nil
 	self.lastCursorY = nil
+	self.lastMotionTime = 0
 	self.dormant = true
 
 	self:EnsureFrame()
@@ -99,7 +116,7 @@ function CursorTracer:EnsureFrame()
 
 	for index = 1, self.MAX_DOTS do
 		local texture = frame:CreateTexture(nil, "OVERLAY")
-		texture:SetTexture(self.DOT_TEXTURE)
+		ApplyTextureVisual(texture, self.DOT_ATLAS, self.DOT_TEXTURE)
 		texture:SetBlendMode(self.DOT_BLEND_MODE)
 		texture:Hide()
 		self.textures[index] = texture
@@ -107,9 +124,14 @@ function CursorTracer:EnsureFrame()
 			x = 0,
 			y = 0,
 			time = 0,
-			sequence = 0,
+			distance = 0,
 		}
 	end
+
+	self.headTexture = frame:CreateTexture(nil, "OVERLAY")
+	ApplyTextureVisual(self.headTexture, self.HEAD_ATLAS, self.HEAD_TEXTURE)
+	self.headTexture:SetBlendMode(self.DOT_BLEND_MODE)
+	self.headTexture:Hide()
 end
 
 function CursorTracer:Start()
@@ -131,94 +153,111 @@ function CursorTracer:HideAll()
 	for _, texture in ipairs(self.textures or {}) do
 		texture:Hide()
 	end
+	if self.headTexture then
+		self.headTexture:Hide()
+	end
 end
 
 function CursorTracer:ResetTrail()
 	self.head = 0
 	self.count = 0
-	self.sequence = 0
 	self.remainingToNextDot = self.DOT_SPACING
+	self.cursorDistance = 0
+	self.lastMotionTime = 0
 	self:HideAll()
+end
+
+function CursorTracer:PushDot(x, y, now, distance)
+	self.head = (self.head % self.MAX_DOTS) + 1
+	self.count = math.min(self.count + 1, self.MAX_DOTS)
+
+	local dot = self.dots[self.head]
+	dot.x = x
+	dot.y = y
+	dot.time = now
+	dot.distance = distance or 0
 end
 
 function CursorTracer:RefreshTrail(now)
 	self:Init()
-
 	now = now or (GetTime and GetTime()) or 0
 
 	local visible = 0
-	local timePhase = now * self.RAINBOW_SPEED
+	local headVisible = false
 
 	for offset = 0, (self.count or 0) - 1 do
 		local slot = ((self.head - offset - 1) % self.MAX_DOTS) + 1
 		local dot = self.dots[slot]
 		local age = now - (dot.time or 0)
 
-		if age <= self.trailLength then
-			local texture = self.textures[visible + 1]
-			local ageProgress = 1 - (age / self.trailLength)
-			local distanceProgress = 1 - (offset / math.max(self.count - 1, 1))
-			local visibility = ageProgress * (self.DISTANCE_FADE + ((1 - self.DISTANCE_FADE) * distanceProgress))
-			local scale = self.DOT_MIN_SCALE + ((1 - self.DOT_MIN_SCALE) * visibility)
-			local hue = timePhase + ((dot.sequence or 0) / self.PHASE_COUNT)
-			local r, g, b = HSVToRGB(hue, self.COLOR_SATURATION, self.COLOR_VALUE)
-
-			texture:ClearAllPoints()
-			texture:SetPoint("CENTER", self.frame, "BOTTOMLEFT", dot.x + self.OFFSET_X, dot.y + self.OFFSET_Y)
-			texture:SetSize(self.DOT_BASE_SIZE * scale, self.DOT_BASE_SIZE * scale)
-			texture:SetVertexColor(r, g, b)
-			texture:SetAlpha(self.DOT_ALPHA * visibility)
-			texture:Show()
-			visible = visible + 1
+		if age > self.trailLength then
+			break
 		end
+
+		local texture = self.textures[visible + 1]
+		local ageProgress = 1 - (age / self.trailLength)
+		local distanceProgress = 1 - (offset / math.max(self.count - 1, 1))
+		local visibility = ageProgress * (self.DISTANCE_FADE + ((1 - self.DISTANCE_FADE) * distanceProgress))
+		local scale = self.DOT_MIN_SCALE + ((1 - self.DOT_MIN_SCALE) * visibility)
+		local hue = (dot.distance or 0) / self.RAINBOW_CYCLE_DISTANCE
+		local r, g, b = HSVToRGB(hue, self.COLOR_SATURATION, self.COLOR_VALUE)
+
+		texture:ClearAllPoints()
+		texture:SetPoint("CENTER", self.frame, "BOTTOMLEFT", dot.x + self.OFFSET_X, dot.y + self.OFFSET_Y)
+		texture:SetSize(self.DOT_BASE_SIZE * scale, self.DOT_BASE_SIZE * scale)
+		texture:SetVertexColor(r, g, b)
+		texture:SetAlpha(self.DOT_ALPHA * visibility)
+		texture:Show()
+		visible = visible + 1
 	end
 
 	for index = visible + 1, self.MAX_DOTS do
 		self.textures[index]:Hide()
 	end
 
-	self.dormant = visible == 0
+	if self.headTexture and self.lastCursorX and self.lastCursorY and (visible > 0 or (now - (self.lastMotionTime or 0)) <= self.trailLength) then
+		local r, g, b = HSVToRGB(self.cursorDistance / self.RAINBOW_CYCLE_DISTANCE, self.COLOR_SATURATION, self.COLOR_VALUE)
+		self.headTexture:ClearAllPoints()
+		self.headTexture:SetPoint("CENTER", self.frame, "BOTTOMLEFT", self.lastCursorX + self.OFFSET_X, self.lastCursorY + self.OFFSET_Y)
+		self.headTexture:SetSize(self.HEAD_SIZE, self.HEAD_SIZE)
+		self.headTexture:SetVertexColor(r, g, b)
+		self.headTexture:SetAlpha(self.HEAD_ALPHA)
+		self.headTexture:Show()
+		headVisible = true
+	else
+		self.headTexture:Hide()
+	end
+
+	self.dormant = (visible == 0) and not headVisible
 end
 
-function CursorTracer:PushDot(x, y, now)
-	self.head = (self.head % self.MAX_DOTS) + 1
-	self.count = math.min(self.count + 1, self.MAX_DOTS)
-	self.sequence = self.sequence + 1
-
-	local dot = self.dots[self.head]
-	dot.x = x
-	dot.y = y
-	dot.time = now
-	dot.sequence = self.sequence
-end
-
-function CursorTracer:EmitInterpolatedDots(startX, startY, endX, endY, now)
+function CursorTracer:EmitInterpolatedDots(startX, startY, endX, endY, now, startDistance)
 	local dx = endX - startX
 	local dy = endY - startY
 	local distanceSq = (dx * dx) + (dy * dy)
 
 	if distanceSq < self.MIN_MOVE_THRESHOLD_SQ then
-		return false
+		return false, startDistance
 	end
 
-	local distance = math.sqrt(distanceSq)
+	local traveled = math.sqrt(distanceSq)
 	local consumed = 0
 	local emitted = false
 
-	while (distance - consumed) >= self.remainingToNextDot do
+	while (traveled - consumed) >= self.remainingToNextDot do
 		consumed = consumed + self.remainingToNextDot
-		local t = consumed / distance
-		self:PushDot(startX + (dx * t), startY + (dy * t), now)
+		local t = consumed / traveled
+		self:PushDot(startX + (dx * t), startY + (dy * t), now, startDistance + consumed)
 		self.remainingToNextDot = self.DOT_SPACING
 		emitted = true
 	end
 
-	self.remainingToNextDot = self.remainingToNextDot - (distance - consumed)
+	self.remainingToNextDot = self.remainingToNextDot - (traveled - consumed)
 	if self.remainingToNextDot <= 0 then
 		self.remainingToNextDot = self.DOT_SPACING
 	end
 
-	return emitted
+	return emitted, startDistance + traveled
 end
 
 function CursorTracer:OnUpdate(elapsed)
@@ -240,7 +279,6 @@ function CursorTracer:OnUpdate(elapsed)
 		return
 	end
 
-	local delta = self.elapsed
 	self.elapsed = 0
 
 	local scale = UIParent:GetEffectiveScale()
@@ -258,14 +296,14 @@ function CursorTracer:OnUpdate(elapsed)
 		return
 	end
 
-	local moved = self:EmitInterpolatedDots(self.lastCursorX, self.lastCursorY, x, y, now)
+	local moved, newCursorDistance = self:EmitInterpolatedDots(self.lastCursorX, self.lastCursorY, x, y, now, self.cursorDistance)
+	self.cursorDistance = newCursorDistance or self.cursorDistance
 	self.lastCursorX = x
 	self.lastCursorY = y
 
 	if moved then
+		self.lastMotionTime = now
 		self.dormant = false
-	elseif delta >= self.trailLength and self.count == 0 then
-		self.dormant = true
 	end
 
 	self:RefreshTrail(now)

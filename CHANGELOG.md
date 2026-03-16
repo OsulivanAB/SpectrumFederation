@@ -22,6 +22,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [0.5.15-beta.12] - 2026-03-16
+
+### Changed
+- Refined the cursor trail visuals to use a filled/glow ribbon style with a dedicated cursor head and distance-locked rainbow coloring.
+
 ## [0.5.15-beta.11] - 2026-03-16
 
 ### Changed
