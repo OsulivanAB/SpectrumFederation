@@ -344,17 +344,85 @@ local function CreateIconButton(parent, atlasOrTexture, size)
 end
 
 local function CreateGlyphButton(parent, size)
-    local btn = CreateFrame("Button", nil, parent)
+    local btn = CreateFrame("Button", nil, parent, "BackdropTemplate")
     btn:SetSize(size or 20, size or 20)
+    btn:SetBackdrop({
+        bgFile = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        tile = true,
+        tileSize = 8,
+        edgeSize = 1,
+        insets = { left = 1, right = 1, top = 1, bottom = 1 },
+    })
 
-    local label = btn:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    local label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     label:SetPoint("CENTER", btn, "CENTER", 0, 0)
+    label:SetShadowOffset(1, -1)
+    label:SetShadowColor(0, 0, 0, 0.8)
     btn.Label = label
 
     local hl = btn:CreateTexture(nil, "HIGHLIGHT")
     hl:SetAllPoints(btn)
-    hl:SetColorTexture(1, 1, 1, 0.18)
+    hl:SetColorTexture(1, 1, 1, 0.10)
     btn.Highlight = hl
+
+    local function UpdateVisual()
+        local isEnabled = btn:IsEnabled()
+        local isPushed = btn.__sfPushed and true or false
+        local isHovered = btn.__sfHovered and true or false
+
+        if not isEnabled then
+            btn:SetBackdropColor(0.08, 0.08, 0.08, 0.35)
+            btn:SetBackdropBorderColor(0.30, 0.30, 0.30, 0.50)
+            label:SetTextColor(0.55, 0.55, 0.55)
+            return
+        end
+
+        if isPushed then
+            btn:SetBackdropColor(0.24, 0.24, 0.24, 0.95)
+            btn:SetBackdropBorderColor(0.95, 0.82, 0.18, 0.95)
+            label:SetTextColor(1.0, 0.95, 0.65)
+            return
+        end
+
+        if isHovered then
+            btn:SetBackdropColor(0.18, 0.18, 0.18, 0.92)
+            btn:SetBackdropBorderColor(0.85, 0.85, 0.85, 0.90)
+            label:SetTextColor(1, 1, 1)
+            return
+        end
+
+        btn:SetBackdropColor(0.12, 0.12, 0.12, 0.88)
+        btn:SetBackdropBorderColor(0.58, 0.58, 0.58, 0.80)
+        label:SetTextColor(0.92, 0.92, 0.92)
+    end
+
+    btn:HookScript("OnMouseDown", function(self, button)
+        if button ~= "LeftButton" then return end
+        self.__sfPushed = true
+        UpdateVisual()
+    end)
+
+    btn:HookScript("OnMouseUp", function(self, button)
+        if button ~= "LeftButton" then return end
+        self.__sfPushed = false
+        UpdateVisual()
+    end)
+
+    btn:HookScript("OnEnter", function(self)
+        self.__sfHovered = true
+        UpdateVisual()
+    end)
+
+    btn:HookScript("OnLeave", function(self)
+        self.__sfHovered = false
+        self.__sfPushed = false
+        UpdateVisual()
+    end)
+
+    btn:HookScript("OnEnable", UpdateVisual)
+    btn:HookScript("OnDisable", UpdateVisual)
+    UpdateVisual()
 
     return btn
 end
@@ -427,17 +495,17 @@ function Window:Create()
     AttachTooltip(gear, "Settings", "Open Loot Helper Settings")
 
     -- Minimize/restore button
-    local minimize = CreateGlyphButton(title, C.ICON_BUTTON_SIZE)
+    local minimize = CreateGlyphButton(title, 20)
     minimize:SetPoint("RIGHT", close, "LEFT", -6, 0)
     title.Minimize = minimize
     gear:SetPoint("RIGHT", minimize, "LEFT", -6, 0)
-    minimize:SetScript("OnEnter", function(self)
+    minimize:HookScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText(self.__sfTooltipTitle or "", 1, 1, 1)
         GameTooltip:AddLine(self.__sfTooltipText or "", nil, nil, nil, true)
         GameTooltip:Show()
     end)
-    minimize:SetScript("OnLeave", function()
+    minimize:HookScript("OnLeave", function()
         GameTooltip:Hide()
     end)
 
