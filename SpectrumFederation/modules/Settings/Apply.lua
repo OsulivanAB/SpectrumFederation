@@ -43,7 +43,8 @@ function Apply:Init()
     end)
 
     local function QueueCursorTracerApply()
-        self:Debounce("cursorTracer", 0.03, function()
+        local delay = (SF.CursorTracer and SF.CursorTracer.SAMPLE_INTERVAL) or 0.03
+        self:Debounce("cursorTracer", delay, function()
             self:RunOrDefer(function()
                 self:ApplyCursorTracer()
             end)
@@ -181,7 +182,7 @@ function Apply:ApplyCursorTracer()
         return
     end
 
-    local enabled = store:Get("global.cursorTracer.enabled") and true or false
+    local enabled = store:Get("global.cursorTracer.enabled")
     local texture = store:Get("global.cursorTracer.texture")
     local length = store:Get("global.cursorTracer.length")
 

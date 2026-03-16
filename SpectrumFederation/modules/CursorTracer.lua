@@ -8,6 +8,9 @@ CursorTracer.DEFAULT_LENGTH = 12
 CursorTracer.MIN_LENGTH = 6
 CursorTracer.MAX_LENGTH = 24
 CursorTracer.SAMPLE_INTERVAL = 0.03
+CursorTracer.MIN_SEGMENT_SCALE = 0.65
+CursorTracer.SEGMENT_SCALE_RANGE = 0.35
+-- Ignore tiny cursor jitter; 4 = 2px squared.
 CursorTracer.MOVE_THRESHOLD_SQ = 4
 CursorTracer.MAX_SEGMENTS = 24
 
@@ -126,7 +129,7 @@ function CursorTracer:ApplyTexture()
 		texture:SetTexture(info.path)
 		texture:SetSize(info.width, info.height)
 		texture:SetBlendMode(info.blendMode or "BLEND")
-		texture:SetVertexColor(info.r or 1, info.g or 1, info.b or 1, 1)
+		texture:SetVertexColor(info.r or 1, info.g or 1, info.b or 1, info.alpha or 0.85)
 	end
 end
 
@@ -151,7 +154,7 @@ end
 
 function CursorTracer:SetEnabled(enabled)
 	self:Init()
-	enabled = enabled and true or false
+	enabled = not not enabled
 
 	if self.enabled == enabled then return end
 
@@ -216,7 +219,7 @@ function CursorTracer:CaptureCursorPoint(age)
 	})
 
 	while #points > self.length do
-		points[#points] = nil
+		table.remove(points)
 	end
 end
 
@@ -249,7 +252,7 @@ function CursorTracer:Refresh()
 
 		if point and index <= self.length then
 			local progress = 1 - math.min((point.age or 0) / lifeSpan, 1)
-			local scale = 0.65 + (progress * 0.35)
+			local scale = self.MIN_SEGMENT_SCALE + (progress * self.SEGMENT_SCALE_RANGE)
 
 			texture:ClearAllPoints()
 			texture:SetPoint("CENTER", self.frame, "BOTTOMLEFT", point.x, point.y)

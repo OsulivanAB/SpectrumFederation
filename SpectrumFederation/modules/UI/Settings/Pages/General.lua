@@ -18,8 +18,12 @@ function Page:Build(panel)
 
 	local renderer = SF.SettingsUI.DefinitionRenderer
 	local store = SF.SettingsStore
+	local cursorTracer = SF.CursorTracer or {
+		MIN_LENGTH = 6,
+		MAX_LENGTH = 24,
+	}
 	local function CursorTracerEnabled()
-		return store:Get("global.cursorTracer.enabled") and true or false
+		return store:Get("global.cursorTracer.enabled")
 	end
 
 	local def = {
@@ -99,8 +103,8 @@ function Page:Build(panel)
 						label = "Trail Length",
 						tooltip = "Adjust how many trail segments follow the cursor.",
 						path = "global.cursorTracer.length",
-						min = SF.CursorTracer and SF.CursorTracer.MIN_LENGTH or 6,
-						max = SF.CursorTracer and SF.CursorTracer.MAX_LENGTH or 24,
+						min = cursorTracer.MIN_LENGTH,
+						max = cursorTracer.MAX_LENGTH,
 						step = 1,
 						visible = CursorTracerEnabled,
 						enabled = CursorTracerEnabled,
