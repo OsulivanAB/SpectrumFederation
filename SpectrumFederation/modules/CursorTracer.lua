@@ -6,17 +6,18 @@ local CursorTracer = SF.CursorTracer
 CursorTracer.DEFAULT_LENGTH = 12
 CursorTracer.MIN_LENGTH = 6
 CursorTracer.MAX_LENGTH = 24
-CursorTracer.MAX_SEGMENTS = 24
+CursorTracer.MAX_BLOBS = 96
 CursorTracer.SAMPLE_INTERVAL = 0.015
-CursorTracer.LINE_TEXTURE = "Interface\\Buttons\\WHITE8X8"
-CursorTracer.LINE_THICKNESS = 10
-CursorTracer.LINE_ALPHA = 0.9
-CursorTracer.MIN_SEGMENT_SCALE = 0.55
-CursorTracer.SEGMENT_SCALE_RANGE = 0.45
+CursorTracer.BLOB_TEXTURE = "Interface\\Cooldown\\ping4"
+CursorTracer.BLOB_ALPHA = 0.36
+CursorTracer.BLOB_BASE_SIZE = 20
+CursorTracer.BLOB_SPACING_FACTOR = 0.32
+CursorTracer.MIN_BLOB_SCALE = 0.7
+CursorTracer.BLOB_SCALE_RANGE = 0.4
 CursorTracer.HUE_SHIFT_SPEED = 0.18
+CursorTracer.COLOR_SATURATION = 0.55
+CursorTracer.COLOR_VALUE = 0.92
 CursorTracer.MOVE_THRESHOLD_SQ = 4
-
-local PI = math.pi
 
 local function ClampLength(value)
 	value = tonumber(value) or CursorTracer.DEFAULT_LENGTH
@@ -34,21 +35,6 @@ end
 
 local function GetLifeSpan(length)
 	return math.max((tonumber(length) or CursorTracer.DEFAULT_LENGTH) * CursorTracer.SAMPLE_INTERVAL, CursorTracer.SAMPLE_INTERVAL)
-end
-
-local function GetAngle(dx, dy)
-	if dx == 0 then
-		if dy >= 0 then
-			return PI * 0.5
-		end
-		return -PI * 0.5
-	end
-
-	local angle = math.atan(dy / dx)
-	if dx < 0 then
-		angle = angle + PI
-	end
-	return angle
 end
 
 local function HSVToRGB(h, s, v)
@@ -106,9 +92,9 @@ function CursorTracer:EnsureFrame()
 		self:OnUpdate(elapsed)
 	end
 
-	for index = 1, self.MAX_SEGMENTS do
+	for index = 1, self.MAX_BLOBS do
 		local texture = frame:CreateTexture(nil, "OVERLAY")
-		texture:SetTexture(self.LINE_TEXTURE)
+		texture:SetTexture(self.BLOB_TEXTURE)
 		texture:SetBlendMode("ADD")
 		texture:Hide()
 		self.textures[index] = texture
@@ -225,44 +211,61 @@ function CursorTracer:Refresh()
 	local points = self.points
 	local lifeSpan = GetLifeSpan(self.length)
 	local timeOffset = (GetTime and (GetTime() * self.HUE_SHIFT_SPEED)) or 0
+	local textureIndex = 1
 
-	for index = 1, self.MAX_SEGMENTS do
-		local texture = self.textures[index]
+	for index = 1, math.min(#points - 1, self.length) do
 		local startPoint = points[index]
 		local endPoint = points[index + 1]
+		local dx = endPoint.x - startPoint.x
+		local dy = endPoint.y - startPoint.y
+		local distanceSq = (dx * dx) + (dy * dy)
 
-		if startPoint and endPoint and index <= self.length then
-			local dx = startPoint.x - endPoint.x
-			local dy = startPoint.y - endPoint.y
-			local distanceSq = (dx * dx) + (dy * dy)
+		if distanceSq > 0 then
+			local distance = math.sqrt(distanceSq)
+			local startProgress = 1 - math.min((startPoint.age or 0) / lifeSpan, 1)
+			local endProgress = 1 - math.min((endPoint.age or 0) / lifeSpan, 1)
+			local startSize = self.BLOB_BASE_SIZE * (self.MIN_BLOB_SCALE + (startProgress * self.BLOB_SCALE_RANGE))
+			local endSize = self.BLOB_BASE_SIZE * (self.MIN_BLOB_SCALE + (endProgress * self.BLOB_SCALE_RANGE))
+			local spacing = math.max(math.min(startSize, endSize) * self.BLOB_SPACING_FACTOR, 2)
+			local steps = math.max(1, math.ceil(distance / spacing))
 
-			if distanceSq > 0 then
-				local distance = math.sqrt(distanceSq)
-				local progress = 1 - math.min((((startPoint.age or 0) + (endPoint.age or 0)) * 0.5) / lifeSpan, 1)
-				local scale = self.MIN_SEGMENT_SCALE + (progress * self.SEGMENT_SCALE_RANGE)
-				local thickness = self.LINE_THICKNESS * scale
-				local hue = timeOffset + ((index - 1) / math.max(self.length, 1))
-				local r, g, b = HSVToRGB(hue, 0.85, 1)
+			for step = 0, steps do
+				if textureIndex > self.MAX_BLOBS then
+					break
+				end
+
+				local texture = self.textures[textureIndex]
+				local t = step / steps
+				local progress = startProgress + ((endProgress - startProgress) * t)
+				local scale = self.MIN_BLOB_SCALE + (progress * self.BLOB_SCALE_RANGE)
+				local size = self.BLOB_BASE_SIZE * scale
+				local hue = timeOffset + ((index - 1 + t) / math.max(self.length, 1))
+				local r, g, b = HSVToRGB(hue, self.COLOR_SATURATION, self.COLOR_VALUE)
 
 				texture:ClearAllPoints()
 				texture:SetPoint(
 					"CENTER",
 					self.frame,
 					"BOTTOMLEFT",
-					(startPoint.x + endPoint.x) * 0.5,
-					(startPoint.y + endPoint.y) * 0.5
+					startPoint.x + (dx * t),
+					startPoint.y + (dy * t)
 				)
-				texture:SetSize(distance + thickness, thickness)
-				texture:SetRotation(GetAngle(dx, dy))
+				texture:SetSize(size, size)
+				texture:SetRotation(0)
 				texture:SetVertexColor(r, g, b)
-				texture:SetAlpha(self.LINE_ALPHA * progress)
+				texture:SetAlpha(self.BLOB_ALPHA * progress)
 				texture:Show()
-			else
-				texture:Hide()
+				textureIndex = textureIndex + 1
 			end
-		else
-			texture:Hide()
+
+			if textureIndex > self.MAX_BLOBS then
+				break
+			end
 		end
+	end
+
+	for index = textureIndex, self.MAX_BLOBS do
+		self.textures[index]:Hide()
 	end
 end
 

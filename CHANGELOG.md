@@ -22,6 +22,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [0.5.15-beta.10] - 2026-03-16
+
+### Changed
+- Softened the rainbow cursor trail to reduce visible segment edges and lower overall color intensity.
+- Switched the trail rendering toward overlapping circular blobs so it reads more like a continuous flowing stream.
+
 ## [0.5.15-beta.9] - 2026-03-16
 
 ### Changed
