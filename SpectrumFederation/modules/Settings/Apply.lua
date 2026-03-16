@@ -42,6 +42,18 @@ function Apply:Init()
         end)
     end)
 
+    local function QueueCursorTracerApply()
+        self:Debounce("cursorTracer", 0.03, function()
+            self:RunOrDefer(function()
+                self:ApplyCursorTracer()
+            end)
+        end)
+    end
+
+    store:RegisterCallback("global.cursorTracer.enabled", QueueCursorTracerApply)
+    store:RegisterCallback("global.cursorTracer.texture", QueueCursorTracerApply)
+    store:RegisterCallback("global.cursorTracer.length", QueueCursorTracerApply)
+
     store:RegisterCallback("lootHelper.enabled", function(newValue)
         self:Debounce("lootHelperEnabled", 0.1, function()
             self:RunOrDefer(function()
@@ -150,6 +162,7 @@ function Apply:ApplyAll()
     self:ApplyWindowStyle(store:Get("global.windowStyle"))
     self:ApplyFontStyle(store:Get("global.fontStyle"))
     self:ApplyFontSize(store:Get("global.fontSize"))
+    self:ApplyCursorTracer()
 
     self:ApplyLootHelperEnabled(store:Get("lootHelper.enabled"))
     self:ApplyActiveProfileChange(store:Get("lootHelper.activeProfile"), nil)
@@ -157,6 +170,35 @@ function Apply:ApplyAll()
     self:ApplySafeMode(store:GetActiveProfileSetting("safeMode", false), nil, {
         profileName = store:GetActiveProfileName(),
         key = "safeMode",
+    })
+end
+
+-- Apply cursor tracer settings
+-- @return nil
+function Apply:ApplyCursorTracer()
+    local store = SF.SettingsStore
+    if not store or not SF.CursorTracer or not SF.CursorTracer.ApplySettings then
+        return
+    end
+
+    local enabled = store:Get("global.cursorTracer.enabled") and true or false
+    local texture = store:Get("global.cursorTracer.texture")
+    local length = store:Get("global.cursorTracer.length")
+
+    if SF.Debug then
+        SF.Debug:Verbose(
+            "SETTINGS",
+            "Applying cursor tracer settings: enabled=%s, texture=%s, length=%s",
+            tostring(enabled),
+            tostring(texture),
+            tostring(length)
+        )
+    end
+
+    SF.CursorTracer:ApplySettings({
+        enabled = enabled,
+        texture = texture,
+        length = length,
     })
 end
 

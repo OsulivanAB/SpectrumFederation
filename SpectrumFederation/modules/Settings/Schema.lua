@@ -11,6 +11,11 @@ SF.SettingsSchema = {
 			windowStyle = "Default",
 			fontStyle   = "Friz Quadrata",
 			fontSize    = 12,
+			cursorTracer = {
+				enabled = false,
+				texture = "spark",
+				length = 12,
+			},
 		},
 
 		lootHelper = {
@@ -152,5 +157,4 @@ SF.SettingsSchema = {
 		end,
 	},
 }
-
 
