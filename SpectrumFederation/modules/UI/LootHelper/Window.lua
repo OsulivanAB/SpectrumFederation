@@ -363,7 +363,7 @@ local function CreateGlyphButton(parent, size)
 
     local hl = btn:CreateTexture(nil, "HIGHLIGHT")
     hl:SetAllPoints(btn)
-    hl:SetColorTexture(1, 1, 1, 0.10)
+    hl:SetColorTexture(1, 1, 1, 0.18)
     btn.Highlight = hl
 
     local function UpdateVisual()
