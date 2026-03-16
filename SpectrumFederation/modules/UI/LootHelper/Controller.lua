@@ -246,10 +246,6 @@ function Controller:Init()
         self:OnMinimizeClicked()
     end
 
-    frame.OnCloseClicked = function()
-        self:OnCloseClicked()
-    end
-
     self:_InitEvents()
     self:_HookSettingsStore()
     self:_HookProfileChanges()
@@ -322,31 +318,6 @@ function Controller:OpenSettings()
 
     -- Fallback Message
     print("SpectrumFederation: Open Settings → AddOns → Spectrum Federation Settings → Loot Helper Settings")
-end
-
-function Controller:OnCloseClicked()
-    -- Check if user is in raid
-    local inRaid = IsInRaid()
-    
-    if inRaid then
-        -- In raid: disable lootHelper.enabled (won't show in or out of raid)
-        if SF.SettingsStore and SF.SettingsStore.Set then
-            SF.SettingsStore:Set("lootHelper.enabled", false)
-        else
-            local db = GetLootDB()
-            if db then db.enabled = false end
-        end
-    else
-        -- Not in raid: disable showWindowOutsideRaid (will still show when in raid)
-        if SF.SettingsStore and SF.SettingsStore.Set then
-            SF.SettingsStore:Set("lootHelper.showWindowOutsideRaid", false)
-        else
-            local db = GetLootDB()
-            if db then db.showWindowOutsideRaid = false end
-        end
-    end
-
-    self:EvaluateVisibility("CloseClicked")
 end
 
 function Controller:OnMinimizeClicked()
