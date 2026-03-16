@@ -21,6 +21,7 @@ LH.Constants = LH.Constants or {
     -- Default size
     DEFAULT_WIDTH = 480,
     DEFAULT_HEIGHT = 520,
+    MINIMIZED_HEIGHT = 40,
     
     -- Guardrails
     MIN_WIDTH = 320,

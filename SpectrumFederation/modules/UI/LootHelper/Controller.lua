@@ -242,6 +242,10 @@ function Controller:Init()
         self:OpenSettings()
     end
 
+    frame.OnMinimizeClicked = function()
+        self:OnMinimizeClicked()
+    end
+
     frame.OnCloseClicked = function()
         self:OnCloseClicked()
     end
@@ -343,6 +347,12 @@ function Controller:OnCloseClicked()
     end
 
     self:EvaluateVisibility("CloseClicked")
+end
+
+function Controller:OnMinimizeClicked()
+    if LH.Window and LH.Window.ToggleMinimized then
+        LH.Window:ToggleMinimized()
+    end
 end
 
 -- TODO: Temporary to verify skeleton exists

@@ -53,8 +53,77 @@ function Window:ClampSizeToBounds()
 
     local w, h = f:GetSize()
     w = Clamp(w, C.MIN_WIDTH, C.MAX_WIDTH)
-    h = Clamp(h, C.MIN_HEIGHT, C.MAX_HEIGHT)
+    if f.__sfMinimized then
+        h = C.MINIMIZED_HEIGHT
+    else
+        h = Clamp(h, C.MIN_HEIGHT, C.MAX_HEIGHT)
+    end
     f:SetSize(w, h)
+end
+
+function Window:_UpdateResizeHandleState()
+    local f = self._frame
+    if not f then return end
+
+    local canResize = not f.__sfLocked and not f.__sfMinimized
+
+    if f.ResizeHandle then
+        f.ResizeHandle:SetShown(canResize)
+        f.ResizeHandle:EnableMouse(canResize)
+    end
+
+    if canResize then
+        self:_ApplyResizeBounds(f)
+    else
+        f:SetResizable(false)
+    end
+end
+
+function Window:_UpdateMinimizeButtonState()
+    local f = self._frame
+    if not f or not f.Title or not f.Title.Minimize then return end
+
+    local btn = f.Title.Minimize
+    local minimized = f.__sfMinimized and true or false
+
+    if btn.Label then
+        btn.Label:SetText(minimized and "+" or "-")
+    end
+
+    btn.__sfTooltipTitle = minimized and "Restore" or "Minimize"
+    btn.__sfTooltipText = minimized
+        and "Restore the Loot Helper window to its full size"
+        or "Collapse the Loot Helper window to its title bar"
+end
+
+function Window:_ApplyMinimizedState()
+    local f = self._frame
+    if not f then return end
+
+    local st = self:_GetWindowStateTable()
+    local minimized = f.__sfMinimized and true or false
+
+    if minimized then
+        local w = Clamp(st.width or f:GetWidth() or C.DEFAULT_WIDTH, C.MIN_WIDTH, C.MAX_WIDTH)
+        f:SetSize(w, C.MINIMIZED_HEIGHT)
+    else
+        local w = Clamp(st.width or f:GetWidth() or C.DEFAULT_WIDTH, C.MIN_WIDTH, C.MAX_WIDTH)
+        local h = Clamp(st.height or f:GetHeight() or C.DEFAULT_HEIGHT, C.MIN_HEIGHT, C.MAX_HEIGHT)
+        f:SetSize(w, h)
+    end
+
+    if f.Content then
+        f.Content:SetShown(not minimized)
+    end
+
+    self:_UpdateResizeHandleState()
+    self:_UpdateMinimizeButtonState()
+    self:RequestScrollInsetsUpdate()
+end
+
+function Window:IsMinimized()
+    local f = self._frame
+    return f and f.__sfMinimized and true or false
 end
 
 function Window:EnsureOnScreen()
@@ -80,23 +149,25 @@ function Window:LoadState()
     if not f then return end
      local st = self:_GetWindowStateTable()
 
-     -- Size
-     local w = Clamp(st.width or C.DEFAULT_WIDTH, C.MIN_WIDTH, C.MAX_WIDTH)
-     local h = Clamp(st.height or C.DEFAULT_HEIGHT, C.MIN_HEIGHT, C.MAX_HEIGHT)
-     f:SetSize(w, h)
+      -- Size
+      local w = Clamp(st.width or C.DEFAULT_WIDTH, C.MIN_WIDTH, C.MAX_WIDTH)
+      local h = Clamp(st.height or C.DEFAULT_HEIGHT, C.MIN_HEIGHT, C.MAX_HEIGHT)
+      f:SetSize(w, h)
+      f.__sfMinimized = st.minimized and true or false
 
-     -- Position
-     local point = st.point or C.DEFAULT_POINT
+      -- Position
+      local point = st.point or C.DEFAULT_POINT
      local relativePoint = st.relativePoint or C.DEFAULT_RELATIVE_POINT
      local x = tonumber(st.x) or C.DEFAULT_X
      local y = tonumber(st.y) or C.DEFAULT_Y
 
-     f:ClearAllPoints()
-     f:SetPoint(point, UIParent, relativePoint, x, y)
+      f:ClearAllPoints()
+      f:SetPoint(point, UIParent, relativePoint, x, y)
+      self:_ApplyMinimizedState()
 
-     if SF.Debug then
-         SF.Debug:Verbose("LH_WINDOW", "LoadState: size=%dx%d, position=%s->%s at (%d,%d)", w, h, point, relativePoint, x, y)
-     end
+      if SF.Debug then
+          SF.Debug:Verbose("LH_WINDOW", "LoadState: size=%dx%d, minimized=%s, position=%s->%s at (%d,%d)", w, h, tostring(f.__sfMinimized), point, relativePoint, x, y)
+      end
 
      -- Ensure safe after layout settles
      if C_Timer and C_Timer.After then
@@ -121,15 +192,49 @@ function Window:SaveState()
     local point, _, relPoint, x, y = f:GetPoint(1)
 
     st.width = Round(w)
-    st.height = Round(h)
+    if f.__sfMinimized then
+        st.height = Round(Clamp(st.height or C.DEFAULT_HEIGHT, C.MIN_HEIGHT, C.MAX_HEIGHT))
+    else
+        st.height = Round(Clamp(h, C.MIN_HEIGHT, C.MAX_HEIGHT))
+    end
+    st.minimized = f.__sfMinimized and true or false
     st.point = point or C.DEFAULT_POINT
     st.relativePoint = relPoint or C.DEFAULT_RELATIVE_POINT
     st.x = Round(x)
     st.y = Round(y)
 
     if SF.Debug then
-        SF.Debug:Verbose("LH_WINDOW", "SaveState: size=%dx%d, position=%s->%s at (%d,%d)", st.width, st.height, st.point, st.relativePoint, st.x, st.y)
+        SF.Debug:Verbose("LH_WINDOW", "SaveState: size=%dx%d, minimized=%s, position=%s->%s at (%d,%d)", st.width, st.height, tostring(st.minimized), st.point, st.relativePoint, st.x, st.y)
     end
+end
+
+function Window:SetMinimized(minimized)
+    local f = self._frame
+    if not f then return end
+
+    minimized = minimized and true or false
+    if f.__sfMinimized == minimized then
+        self:_ApplyMinimizedState()
+        return
+    end
+
+    local st = self:_GetWindowStateTable()
+
+    if minimized then
+        local w, h = f:GetSize()
+        st.width = Round(Clamp(w, C.MIN_WIDTH, C.MAX_WIDTH))
+        st.height = Round(Clamp(h, C.MIN_HEIGHT, C.MAX_HEIGHT))
+    end
+
+    f.__sfMinimized = minimized
+    st.minimized = minimized
+
+    self:_ApplyMinimizedState()
+    self:SaveState()
+end
+
+function Window:ToggleMinimized()
+    self:SetMinimized(not self:IsMinimized())
 end
 
 function Window:_ReadLockSetting()
@@ -178,19 +283,7 @@ function Window:SetLocked(locked)
         end
     end
 
-    -- Resizing (bottom-right handle)
-    if f.ResizeHandle then
-        f.ResizeHandle:SetShown(not locked)
-        f.ResizeHandle:EnableMouse(not locked)
-    end
-
-    -- Frame resizable toggle
-    if locked then
-        f:SetResizable(false)
-    else
-        self:_ApplyResizeBounds(f)
-    end
-
+    self:_UpdateResizeHandleState()
     self:RequestScrollInsetsUpdate()
 end
 
@@ -241,6 +334,22 @@ local function CreateIconButton(parent, atlasOrTexture, size)
     end
 
     ApplyIcon(atlasOrTexture)
+
+    local hl = btn:CreateTexture(nil, "HIGHLIGHT")
+    hl:SetAllPoints(btn)
+    hl:SetColorTexture(1, 1, 1, 0.18)
+    btn.Highlight = hl
+
+    return btn
+end
+
+local function CreateGlyphButton(parent, size)
+    local btn = CreateFrame("Button", nil, parent)
+    btn:SetSize(size or 20, size or 20)
+
+    local label = btn:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    label:SetPoint("CENTER", btn, "CENTER", 0, 0)
+    btn.Label = label
 
     local hl = btn:CreateTexture(nil, "HIGHLIGHT")
     hl:SetAllPoints(btn)
@@ -314,9 +423,23 @@ function Window:Create()
 
     -- Gear button
     local gear = CreateIconButton(title, "Interface\\Buttons\\UI-OptionsButton", C.ICON_BUTTON_SIZE)
-    gear:SetPoint("RIGHT", close, "LEFT", -6, 0)
     title.Gear = gear
     AttachTooltip(gear, "Settings", "Open Loot Helper Settings")
+
+    -- Minimize/restore button
+    local minimize = CreateGlyphButton(title, C.ICON_BUTTON_SIZE)
+    minimize:SetPoint("RIGHT", close, "LEFT", -6, 0)
+    title.Minimize = minimize
+    gear:SetPoint("RIGHT", minimize, "LEFT", -6, 0)
+    minimize:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText(self.__sfTooltipTitle or "", 1, 1, 1)
+        GameTooltip:AddLine(self.__sfTooltipText or "", nil, nil, nil, true)
+        GameTooltip:Show()
+    end)
+    minimize:SetScript("OnLeave", function()
+        GameTooltip:Hide()
+    end)
 
     -- Profile Name
     -- TODO: Maybe update this to point name?
@@ -418,6 +541,9 @@ function Window:Create()
     -- Button handlers (Controller assigns callbacks)
     gear:SetScript("OnClick", function()
         if frame.OnGearClicked then frame:OnGearClicked() end
+    end)
+    minimize:SetScript("OnClick", function()
+        if frame.OnMinimizeClicked then frame:OnMinimizeClicked() end
     end)
     close:SetScript("OnClick", function()
         if frame.OnCloseClicked then frame:OnCloseClicked() end
@@ -581,6 +707,16 @@ function Window:UpdateScrollInsets()
 	local content = f.Content
 	local scroll = content.Scroll
 	local sb = scroll.ScrollBar
+
+    if f.__sfMinimized then
+        if sb then
+            sb:Hide()
+        end
+        if scroll.SetVerticalScroll then
+            scroll:SetVerticalScroll(0)
+        end
+        return
+    end
 
 	-- Determine whether scrolling is actually needed
 	local range = 0
