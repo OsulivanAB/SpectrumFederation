@@ -547,9 +547,6 @@ function Window:Create()
     minimize:SetScript("OnClick", function()
         if frame.OnMinimizeClicked then frame:OnMinimizeClicked() end
     end)
-    close:SetScript("OnClick", function()
-        if frame.OnCloseClicked then frame:OnCloseClicked() end
-    end)
     
     -- =====================================================
     -- Content Area
