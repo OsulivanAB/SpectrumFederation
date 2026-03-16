@@ -323,14 +323,14 @@ local TITLE_BUTTON_BACKDROP = {
 }
 
 local TITLE_BUTTON_COLORS = {
-    disabledBackground = { 0.08, 0.08, 0.08, 0.35 },
-    disabledBorder = { 0.30, 0.30, 0.30, 0.50 },
-    normalBackground = { 0.12, 0.12, 0.12, 0.88 },
-    normalBorder = { 0.58, 0.58, 0.58, 0.80 },
-    hoverBackground = { 0.18, 0.18, 0.18, 0.92 },
-    hoverBorder = { 0.85, 0.85, 0.85, 0.90 },
-    pressedBackground = { 0.24, 0.24, 0.24, 0.95 },
-    pressedBorder = { 0.95, 0.82, 0.18, 0.95 },
+    disabledBackground = { 0.18, 0.05, 0.05, 0.35 },
+    disabledBorder = { 0.35, 0.16, 0.16, 0.55 },
+    normalBackground = { 0.50, 0.07, 0.07, 0.95 },
+    normalBorder = { 0.90, 0.72, 0.24, 0.95 },
+    hoverBackground = { 0.66, 0.10, 0.10, 0.98 },
+    hoverBorder = { 1.00, 0.82, 0.34, 0.98 },
+    pressedBackground = { 0.40, 0.05, 0.05, 0.98 },
+    pressedBorder = { 0.88, 0.62, 0.18, 0.98 },
 }
 
 local function ApplyBackdropColor(frame, color)
@@ -372,11 +372,13 @@ local function CreateTitleBarButton(parent, size)
 
         if btn.Label then
             if not isEnabled then
-                btn.Label:SetTextColor(0.55, 0.55, 0.55)
+                btn.Label:SetTextColor(0.62, 0.48, 0.20)
             elseif isPushed then
-                btn.Label:SetTextColor(1.0, 0.95, 0.65)
+                btn.Label:SetTextColor(0.98, 0.88, 0.42)
+            elseif isHovered then
+                btn.Label:SetTextColor(1.0, 0.92, 0.48)
             else
-                btn.Label:SetTextColor(0.92, 0.92, 0.92)
+                btn.Label:SetTextColor(0.94, 0.84, 0.34)
             end
         end
     end
@@ -412,17 +414,16 @@ local function CreateTitleBarButton(parent, size)
     return btn
 end
 
--- Create an icon button with title bar chrome
+-- Create a simple icon button with highlight effect
 -- atlasOrTexture can be either:
 --   * an atlas name (preferred when valid)
 --   * a texture file path (fallback)
-local function CreateIconButton(parent, atlasOrTexture, size, inset)
-    local btn = CreateTitleBarButton(parent, size)
-    inset = inset or 2
+local function CreateIconButton(parent, atlasOrTexture, size)
+    local btn = CreateFrame("Button", nil, parent)
+    btn:SetSize(size or 20, size or 20)
 
     local icon = btn:CreateTexture(nil, "ARTWORK")
-    icon:SetPoint("TOPLEFT", btn, "TOPLEFT", inset, -inset)
-    icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -inset, inset)
+    icon:SetAllPoints(btn)
     btn.Icon = icon
 
     local function ApplyIcon(value)
@@ -441,6 +442,12 @@ local function CreateIconButton(parent, atlasOrTexture, size, inset)
     end
 
     ApplyIcon(atlasOrTexture)
+
+    local hl = btn:CreateTexture(nil, "HIGHLIGHT")
+    hl:SetAllPoints(btn)
+    hl:SetColorTexture(1, 1, 1, 0.18)
+    btn.Highlight = hl
+
     return btn
 end
 
@@ -516,13 +523,13 @@ function Window:Create()
     title.Logo = logo
 
     -- Close button
-    local close = CreateIconButton(title, "common-icon-redx", C.ICON_BUTTON_SIZE, 3)
+    local close = CreateIconButton(title, "common-icon-redx", C.ICON_BUTTON_SIZE)
     close:SetPoint("RIGHT", title, "RIGHT", -4, 0)
     AttachTooltip(close, "Close", "In raid: Disables LootHelper completely\nOut of raid: Hides window outside raids only")
     title.Close = close
 
     -- Gear button
-    local gear = CreateIconButton(title, "Interface\\Buttons\\UI-OptionsButton", C.ICON_BUTTON_SIZE, 2)
+    local gear = CreateIconButton(title, "Interface\\Buttons\\UI-OptionsButton", C.ICON_BUTTON_SIZE)
     title.Gear = gear
     AttachTooltip(gear, "Settings", "Open Loot Helper Settings")
 
