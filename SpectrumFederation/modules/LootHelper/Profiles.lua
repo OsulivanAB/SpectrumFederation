@@ -74,7 +74,7 @@ function LootProfile:_EnsureRaidCheckConfig()
 
 	if cfg.slots.mainHand ~= nil then
 		if cfg.slots.weapon == nil then
-			cfg.slots.weapon = cfg.slots.mainHand and true or false
+			cfg.slots.weapon = not not cfg.slots.mainHand
 		end
 		cfg.slots.mainHand = nil
 	end
