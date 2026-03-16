@@ -21,6 +21,18 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.15-beta.7] - 2026-03-16
+
+### Added
+- Introduced a minimize button for the Loot Helper window, allowing users to collapse it to the title bar.
+- Added tooltips for the minimize button with context-specific descriptions.
+
+### Changed
+- Refined the styling and behavior of the Loot Helper title bar buttons.
+- Updated window resizing logic to account for minimized state.
+- Improved tooltip handling for interactive UI elements in the Loot Helper.
+
 ## [0.5.15-beta.3] - 2026-03-16
 
 ### Changed
