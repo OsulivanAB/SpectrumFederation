@@ -86,8 +86,11 @@ function Window:_UpdateMinimizeButtonState()
     local btn = f.Title.Minimize
     local minimized = f.__sfMinimized and true or false
 
-    if btn.Label then
-        btn.Label:SetText(minimized and "+" or "-")
+    if btn:GetNormalTexture() then
+        btn:GetNormalTexture():SetAtlas(minimized and "ui-questtrackerbutton-secondary-expand" or "ui-questtrackerbutton-secondary-collapse", true)
+    end
+    if btn:GetPushedTexture() then
+        btn:GetPushedTexture():SetAtlas(minimized and "ui-questtrackerbutton-secondary-expand-pressed" or "ui-questtrackerbutton-secondary-collapse-pressed", true)
     end
 
     btn.__sfTooltipTitle = minimized and "Restore" or "Minimize"
@@ -313,107 +316,6 @@ local function AttachTooltip(region, title, text)
     end)
 end
 
-local TITLE_BUTTON_BACKDROP = {
-    bgFile = "Interface\\Buttons\\WHITE8X8",
-    edgeFile = "Interface\\Buttons\\WHITE8X8",
-    tile = true,
-    tileSize = 8,
-    edgeSize = 1,
-    insets = { left = 1, right = 1, top = 1, bottom = 1 },
-}
-
-local TITLE_BUTTON_COLORS = {
-    disabledBackground = { 0.18, 0.05, 0.05, 0.35 },
-    disabledBorder = { 0.35, 0.16, 0.16, 0.55 },
-    normalBackground = { 0.50, 0.07, 0.07, 0.95 },
-    normalBorder = { 0.90, 0.72, 0.24, 0.95 },
-    hoverBackground = { 0.66, 0.10, 0.10, 0.98 },
-    hoverBorder = { 1.00, 0.82, 0.34, 0.98 },
-    pressedBackground = { 0.40, 0.05, 0.05, 0.98 },
-    pressedBorder = { 0.88, 0.62, 0.18, 0.98 },
-}
-
-local function ApplyBackdropColor(frame, color)
-    frame:SetBackdropColor(color[1], color[2], color[3], color[4])
-end
-
-local function ApplyBackdropBorderColor(frame, color)
-    frame:SetBackdropBorderColor(color[1], color[2], color[3], color[4])
-end
-
-local function CreateTitleBarButton(parent, size)
-    local btn = CreateFrame("Button", nil, parent, "BackdropTemplate")
-    btn:SetSize(size or 20, size or 20)
-    btn:SetBackdrop(TITLE_BUTTON_BACKDROP)
-
-    local hl = btn:CreateTexture(nil, "HIGHLIGHT")
-    hl:SetAllPoints(btn)
-    hl:SetColorTexture(1, 1, 1, 0.18)
-    btn.Highlight = hl
-
-    local function UpdateVisual()
-        local isEnabled = btn:IsEnabled()
-        local isPushed = btn.__sfPushed and true or false
-        local isHovered = btn.__sfHovered and true or false
-
-        if not isEnabled then
-            ApplyBackdropColor(btn, TITLE_BUTTON_COLORS.disabledBackground)
-            ApplyBackdropBorderColor(btn, TITLE_BUTTON_COLORS.disabledBorder)
-        elseif isPushed then
-            ApplyBackdropColor(btn, TITLE_BUTTON_COLORS.pressedBackground)
-            ApplyBackdropBorderColor(btn, TITLE_BUTTON_COLORS.pressedBorder)
-        elseif isHovered then
-            ApplyBackdropColor(btn, TITLE_BUTTON_COLORS.hoverBackground)
-            ApplyBackdropBorderColor(btn, TITLE_BUTTON_COLORS.hoverBorder)
-        else
-            ApplyBackdropColor(btn, TITLE_BUTTON_COLORS.normalBackground)
-            ApplyBackdropBorderColor(btn, TITLE_BUTTON_COLORS.normalBorder)
-        end
-
-        if btn.Label then
-            if not isEnabled then
-                btn.Label:SetTextColor(0.62, 0.48, 0.20)
-            elseif isPushed then
-                btn.Label:SetTextColor(0.98, 0.88, 0.42)
-            elseif isHovered then
-                btn.Label:SetTextColor(1.0, 0.92, 0.48)
-            else
-                btn.Label:SetTextColor(0.94, 0.84, 0.34)
-            end
-        end
-    end
-
-    btn:HookScript("OnMouseDown", function(self, mouseButton)
-        if mouseButton ~= "LeftButton" then return end
-        self.__sfPushed = true
-        UpdateVisual()
-    end)
-
-    btn:HookScript("OnMouseUp", function(self, mouseButton)
-        if mouseButton ~= "LeftButton" then return end
-        self.__sfPushed = false
-        UpdateVisual()
-    end)
-
-    btn:HookScript("OnEnter", function(self)
-        self.__sfHovered = true
-        UpdateVisual()
-    end)
-
-    btn:HookScript("OnLeave", function(self)
-        self.__sfHovered = false
-        self.__sfPushed = false
-        UpdateVisual()
-    end)
-
-    btn:HookScript("OnEnable", UpdateVisual)
-    btn:HookScript("OnDisable", UpdateVisual)
-    btn.__sfUpdateVisual = UpdateVisual
-    UpdateVisual()
-
-    return btn
-end
-
 -- Create a simple icon button with highlight effect
 -- atlasOrTexture can be either:
 --   * an atlas name (preferred when valid)
@@ -451,17 +353,22 @@ local function CreateIconButton(parent, atlasOrTexture, size)
     return btn
 end
 
-local function CreateGlyphButton(parent, size)
-    local btn = CreateTitleBarButton(parent, size)
+local function CreateObjectiveTrackerToggleButton(parent)
+    local btn = CreateFrame("Button", nil, parent)
+    btn:SetSize(16, 16)
 
-    local label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    label:SetPoint("CENTER", btn, "CENTER", 0, 0)
-    label:SetShadowOffset(1, -1)
-    label:SetShadowColor(0, 0, 0, 0.8)
-    btn.Label = label
-    if btn.__sfUpdateVisual then
-        btn.__sfUpdateVisual()
-    end
+    local normal = btn:CreateTexture(nil, "ARTWORK")
+    normal:SetAtlas("ui-questtrackerbutton-secondary-collapse", true)
+    btn:SetNormalTexture(normal)
+
+    local pushed = btn:CreateTexture(nil, "ARTWORK")
+    pushed:SetAtlas("ui-questtrackerbutton-secondary-collapse-pressed", true)
+    btn:SetPushedTexture(pushed)
+
+    local highlight = btn:CreateTexture(nil, "HIGHLIGHT")
+    highlight:SetAtlas("ui-questtrackerbutton-yellow-highlight", true)
+    highlight:SetBlendMode("ADD")
+    btn:SetHighlightTexture(highlight)
 
     return btn
 end
@@ -522,20 +429,14 @@ function Window:Create()
     logo:SetTexture("Interface\\AddOns\\SpectrumFederation\\media\\Icons\\SpectrumFederationIcon.tga")
     title.Logo = logo
 
-    -- Close button
-    local close = CreateIconButton(title, "common-icon-redx", C.ICON_BUTTON_SIZE)
-    close:SetPoint("RIGHT", title, "RIGHT", -4, 0)
-    AttachTooltip(close, "Close", "In raid: Disables LootHelper completely\nOut of raid: Hides window outside raids only")
-    title.Close = close
-
     -- Gear button
     local gear = CreateIconButton(title, "Interface\\Buttons\\UI-OptionsButton", C.ICON_BUTTON_SIZE)
     title.Gear = gear
     AttachTooltip(gear, "Settings", "Open Loot Helper Settings")
 
     -- Minimize/restore button
-    local minimize = CreateGlyphButton(title, C.ICON_BUTTON_SIZE)
-    minimize:SetPoint("RIGHT", close, "LEFT", -6, 0)
+    local minimize = CreateObjectiveTrackerToggleButton(title)
+    minimize:SetPoint("RIGHT", title, "RIGHT", -4, 0)
     title.Minimize = minimize
     minimize.__sfTooltipTitle = "Minimize"
     minimize.__sfTooltipText = "Collapse the Loot Helper window to its title bar"
