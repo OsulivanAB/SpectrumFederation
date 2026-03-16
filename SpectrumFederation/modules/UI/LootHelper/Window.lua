@@ -296,74 +296,55 @@ end
 -- @param title string Tooltip title
 -- @param text string Tooltip text
 local function AttachTooltip(region, title, text)
-    if not text or text == "" then return end
     region:EnableMouse(true)
-    region:SetScript("OnEnter", function(self)
+    region:HookScript("OnEnter", function(self)
+        local resolvedTitle = type(title) == "function" and title(self) or title
+        local resolvedText = type(text) == "function" and text(self) or text
+        if not resolvedText or resolvedText == "" then return end
+
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText(title or "", 1, 1, 1)
-        GameTooltip:AddLine(text, nil, nil, nil, true)
+        GameTooltip:SetText(resolvedTitle or "", 1, 1, 1)
+        GameTooltip:AddLine(resolvedText, nil, nil, nil, true)
         GameTooltip:Show()
     end)
 
-    region:SetScript("OnLeave", function()
+    region:HookScript("OnLeave", function()
         GameTooltip:Hide()
     end)
 end
 
--- Create an icon button with highlight effect
--- atlasOrTexture can be either:
---   * an atlas name (preferred when valid)
---   * a texture file path (fallback)
-local function CreateIconButton(parent, atlasOrTexture, size)
-    local btn = CreateFrame("Button", nil, parent)
-    btn:SetSize(size or 20, size or 20)
+local TITLE_BUTTON_BACKDROP = {
+    bgFile = "Interface\\Buttons\\WHITE8X8",
+    edgeFile = "Interface\\Buttons\\WHITE8X8",
+    tile = true,
+    tileSize = 8,
+    edgeSize = 1,
+    insets = { left = 1, right = 1, top = 1, bottom = 1 },
+}
 
-    local icon = btn:CreateTexture(nil, "ARTWORK")
-    icon:SetAllPoints(btn)
-    btn.Icon = icon
+local TITLE_BUTTON_COLORS = {
+    disabledBackground = { 0.08, 0.08, 0.08, 0.35 },
+    disabledBorder = { 0.30, 0.30, 0.30, 0.50 },
+    normalBackground = { 0.12, 0.12, 0.12, 0.88 },
+    normalBorder = { 0.58, 0.58, 0.58, 0.80 },
+    hoverBackground = { 0.18, 0.18, 0.18, 0.92 },
+    hoverBorder = { 0.85, 0.85, 0.85, 0.90 },
+    pressedBackground = { 0.24, 0.24, 0.24, 0.95 },
+    pressedBorder = { 0.95, 0.82, 0.18, 0.95 },
+}
 
-    local function ApplyIcon(value)
-        if type(value) ~= "string" or value == "" then return end
-
-        -- If it's a valid atlas, use it
-        if C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(value) then
-            icon:SetAtlas(value, true)
-            icon:SetTexCoord(0, 1, 0, 1)
-            return
-        end
-
-        -- Otherwise treat it as a texture path
-        icon:SetTexture(value)
-        icon:SetTexCoord(0, 1, 0, 1)
-    end
-
-    ApplyIcon(atlasOrTexture)
-
-    local hl = btn:CreateTexture(nil, "HIGHLIGHT")
-    hl:SetAllPoints(btn)
-    hl:SetColorTexture(1, 1, 1, 0.18)
-    btn.Highlight = hl
-
-    return btn
+local function ApplyBackdropColor(frame, color)
+    frame:SetBackdropColor(color[1], color[2], color[3], color[4])
 end
 
-local function CreateGlyphButton(parent, size)
+local function ApplyBackdropBorderColor(frame, color)
+    frame:SetBackdropBorderColor(color[1], color[2], color[3], color[4])
+end
+
+local function CreateTitleBarButton(parent, size)
     local btn = CreateFrame("Button", nil, parent, "BackdropTemplate")
     btn:SetSize(size or 20, size or 20)
-    btn:SetBackdrop({
-        bgFile = "Interface\\Buttons\\WHITE8X8",
-        edgeFile = "Interface\\Buttons\\WHITE8X8",
-        tile = true,
-        tileSize = 8,
-        edgeSize = 1,
-        insets = { left = 1, right = 1, top = 1, bottom = 1 },
-    })
-
-    local label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    label:SetPoint("CENTER", btn, "CENTER", 0, 0)
-    label:SetShadowOffset(1, -1)
-    label:SetShadowColor(0, 0, 0, 0.8)
-    btn.Label = label
+    btn:SetBackdrop(TITLE_BUTTON_BACKDROP)
 
     local hl = btn:CreateTexture(nil, "HIGHLIGHT")
     hl:SetAllPoints(btn)
@@ -376,29 +357,28 @@ local function CreateGlyphButton(parent, size)
         local isHovered = btn.__sfHovered and true or false
 
         if not isEnabled then
-            btn:SetBackdropColor(0.08, 0.08, 0.08, 0.35)
-            btn:SetBackdropBorderColor(0.30, 0.30, 0.30, 0.50)
-            label:SetTextColor(0.55, 0.55, 0.55)
-            return
+            ApplyBackdropColor(btn, TITLE_BUTTON_COLORS.disabledBackground)
+            ApplyBackdropBorderColor(btn, TITLE_BUTTON_COLORS.disabledBorder)
+        elseif isPushed then
+            ApplyBackdropColor(btn, TITLE_BUTTON_COLORS.pressedBackground)
+            ApplyBackdropBorderColor(btn, TITLE_BUTTON_COLORS.pressedBorder)
+        elseif isHovered then
+            ApplyBackdropColor(btn, TITLE_BUTTON_COLORS.hoverBackground)
+            ApplyBackdropBorderColor(btn, TITLE_BUTTON_COLORS.hoverBorder)
+        else
+            ApplyBackdropColor(btn, TITLE_BUTTON_COLORS.normalBackground)
+            ApplyBackdropBorderColor(btn, TITLE_BUTTON_COLORS.normalBorder)
         end
 
-        if isPushed then
-            btn:SetBackdropColor(0.24, 0.24, 0.24, 0.95)
-            btn:SetBackdropBorderColor(0.95, 0.82, 0.18, 0.95)
-            label:SetTextColor(1.0, 0.95, 0.65)
-            return
+        if btn.Label then
+            if not isEnabled then
+                btn.Label:SetTextColor(0.55, 0.55, 0.55)
+            elseif isPushed then
+                btn.Label:SetTextColor(1.0, 0.95, 0.65)
+            else
+                btn.Label:SetTextColor(0.92, 0.92, 0.92)
+            end
         end
-
-        if isHovered then
-            btn:SetBackdropColor(0.18, 0.18, 0.18, 0.92)
-            btn:SetBackdropBorderColor(0.85, 0.85, 0.85, 0.90)
-            label:SetTextColor(1, 1, 1)
-            return
-        end
-
-        btn:SetBackdropColor(0.12, 0.12, 0.12, 0.88)
-        btn:SetBackdropBorderColor(0.58, 0.58, 0.58, 0.80)
-        label:SetTextColor(0.92, 0.92, 0.92)
     end
 
     btn:HookScript("OnMouseDown", function(self, mouseButton)
@@ -426,7 +406,55 @@ local function CreateGlyphButton(parent, size)
 
     btn:HookScript("OnEnable", UpdateVisual)
     btn:HookScript("OnDisable", UpdateVisual)
+    btn.__sfUpdateVisual = UpdateVisual
     UpdateVisual()
+
+    return btn
+end
+
+-- Create an icon button with title bar chrome
+-- atlasOrTexture can be either:
+--   * an atlas name (preferred when valid)
+--   * a texture file path (fallback)
+local function CreateIconButton(parent, atlasOrTexture, size, inset)
+    local btn = CreateTitleBarButton(parent, size)
+    inset = inset or 2
+
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    icon:SetPoint("TOPLEFT", btn, "TOPLEFT", inset, -inset)
+    icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -inset, inset)
+    btn.Icon = icon
+
+    local function ApplyIcon(value)
+        if type(value) ~= "string" or value == "" then return end
+
+        -- If it's a valid atlas, use it
+        if C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(value) then
+            icon:SetAtlas(value, true)
+            icon:SetTexCoord(0, 1, 0, 1)
+            return
+        end
+
+        -- Otherwise treat it as a texture path
+        icon:SetTexture(value)
+        icon:SetTexCoord(0, 1, 0, 1)
+    end
+
+    ApplyIcon(atlasOrTexture)
+    return btn
+end
+
+local function CreateGlyphButton(parent, size)
+    local btn = CreateTitleBarButton(parent, size)
+
+    local label = btn:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    label:SetPoint("CENTER", btn, "CENTER", 0, 0)
+    label:SetShadowOffset(1, -1)
+    label:SetShadowColor(0, 0, 0, 0.8)
+    btn.Label = label
+    if btn.__sfUpdateVisual then
+        btn.__sfUpdateVisual()
+    end
 
     return btn
 end
@@ -488,30 +516,22 @@ function Window:Create()
     title.Logo = logo
 
     -- Close button
-    local close = CreateFrame("Button", nil, title, "UIPanelCloseButton")
+    local close = CreateIconButton(title, "common-icon-redx", C.ICON_BUTTON_SIZE, 3)
     close:SetPoint("RIGHT", title, "RIGHT", -4, 0)
-    close:SetSize(20, 20)
     AttachTooltip(close, "Close", "In raid: Disables LootHelper completely\nOut of raid: Hides window outside raids only")
+    title.Close = close
 
     -- Gear button
-    local gear = CreateIconButton(title, "Interface\\Buttons\\UI-OptionsButton", C.ICON_BUTTON_SIZE)
+    local gear = CreateIconButton(title, "Interface\\Buttons\\UI-OptionsButton", C.ICON_BUTTON_SIZE, 2)
     title.Gear = gear
     AttachTooltip(gear, "Settings", "Open Loot Helper Settings")
 
     -- Minimize/restore button
-    local minimize = CreateGlyphButton(title, 20)
+    local minimize = CreateGlyphButton(title, C.ICON_BUTTON_SIZE)
     minimize:SetPoint("RIGHT", close, "LEFT", -6, 0)
     title.Minimize = minimize
     gear:SetPoint("RIGHT", minimize, "LEFT", -6, 0)
-    minimize:HookScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText(self.__sfTooltipTitle or "", 1, 1, 1)
-        GameTooltip:AddLine(self.__sfTooltipText or "", nil, nil, nil, true)
-        GameTooltip:Show()
-    end)
-    minimize:HookScript("OnLeave", function()
-        GameTooltip:Hide()
-    end)
+    AttachTooltip(minimize, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
 
     -- Profile Name
     -- TODO: Maybe update this to point name?
