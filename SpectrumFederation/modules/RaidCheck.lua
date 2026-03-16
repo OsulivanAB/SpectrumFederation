@@ -130,6 +130,27 @@ local function ShouldCheckEnchant(slotDef, link)
 	return false
 end
 
+local function GetRaidCheckSlotConfigKey(slotKey, link)
+	if slotKey == "mainHand" then
+		return "weapon"
+	end
+
+	if slotKey == "offHand" and link and CanReceiveWeaponEnchant(link) then
+		return "weapon"
+	end
+
+	return slotKey
+end
+
+local function IsRaidCheckSlotEnabled(cfg, slotKey, link)
+	if not cfg or type(cfg.slots) ~= "table" then
+		return false
+	end
+
+	local configKey = GetRaidCheckSlotConfigKey(slotKey, link)
+	return cfg.slots[configKey] and true or false
+end
+
 local function CollectUnits()
 	local units = {}
 
@@ -165,7 +186,7 @@ local function AnySlotEnabled(cfg)
 	return false
 end
 
-local function BuildMissingForSlot(unit, slotDef, idx, mainHandLink)
+local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cfg)
 	local link = GetInventoryItemLink(unit, slotDef.slots[idx])
 	local label = slotDef.label
 	if #slotDef.slots > 1 then
@@ -176,7 +197,14 @@ local function BuildMissingForSlot(unit, slotDef, idx, mainHandLink)
 		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
 			return {}
 		end
+		if not IsRaidCheckSlotEnabled(cfg, slotKey, nil) then
+			return {}
+		end
 		return { label .. " Item" }
+	end
+
+	if not IsRaidCheckSlotEnabled(cfg, slotKey, link) then
+		return {}
 	end
 
 	local missing = {}
@@ -196,12 +224,10 @@ local function EvaluateUnit(unit, cfg)
 	local missing = {}
 
 	for slotKey, slotDef in pairs(SLOT_DEFS) do
-		if cfg.slots[slotKey] then
-			for idx = 1, #slotDef.slots do
-				local slotMissing = BuildMissingForSlot(unit, slotDef, idx, mainHandLink)
-				for _, m in ipairs(slotMissing) do
-					table.insert(missing, m)
-				end
+		for idx = 1, #slotDef.slots do
+			local slotMissing = BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cfg)
+			for _, m in ipairs(slotMissing) do
+				table.insert(missing, m)
 			end
 		end
 	end
