@@ -49,6 +49,15 @@ local function HasEnchant(link)
 	return enchantId and enchantId ~= "" and enchantId ~= "0"
 end
 
+local function GetItemEquipLocation(link)
+	if type(link) ~= "string" then return nil end
+	local _, _, _, equipLoc = GetItemInfoInstant(link)
+	if type(equipLoc) == "string" and equipLoc ~= "" then
+		return equipLoc
+	end
+	return nil
+end
+
 local function GetItemStatsSafe(link)
 	if type(link) ~= "string" then return nil end
 
@@ -96,8 +105,57 @@ end
 
 local function IsTwoHandWeapon(link)
 	if type(link) ~= "string" then return false end
-	local _, _, _, _, _, _, _, _, equipLoc = GetItemInfoInstant(link)
-	return equipLoc == "INVTYPE_2HWEAPON"
+	return GetItemEquipLocation(link) == "INVTYPE_2HWEAPON"
+end
+
+local function CanReceiveWeaponEnchant(link)
+	if type(link) ~= "string" then return false end
+	local equipLoc = GetItemEquipLocation(link)
+	if not equipLoc then return false end
+	return equipLoc == "INVTYPE_WEAPON"
+		or equipLoc == "INVTYPE_WEAPONMAINHAND"
+		or equipLoc == "INVTYPE_WEAPONOFFHAND"
+		or equipLoc == "INVTYPE_2HWEAPON"
+end
+
+local function ShouldCheckEnchant(slotDef, link)
+	if slotDef ~= SLOT_DEFS.offHand then
+		return true
+	end
+
+	if CanReceiveWeaponEnchant(link) then
+		return true
+	end
+
+	-- Held-in-offhand items and shields do not use weapon enchants.
+	-- If item metadata is unavailable for an equipped offhand, skip the enchant
+	-- warning to avoid false positives until the client can resolve the item.
+	return false
+end
+
+local function GetRaidCheckSlotConfigKey(slotKey, link)
+	-- Raid Check evaluates physical equipment slots, but the settings model
+	-- now exposes a logical "weapon" toggle that covers main-hand weapons and
+	-- offhand weapons alike. Empty offhands and non-weapon offhands keep using
+	-- the physical offhand toggle because there is no weapon item to classify.
+	if slotKey == "mainHand" then
+		return "weapon"
+	end
+
+	if slotKey == "offHand" and link and CanReceiveWeaponEnchant(link) then
+		return "weapon"
+	end
+
+	return slotKey
+end
+
+local function IsSlotEnabledInConfig(cfg, slotKey, link)
+	if not cfg or type(cfg.slots) ~= "table" then
+		return false
+	end
+
+	local configKey = GetRaidCheckSlotConfigKey(slotKey, link)
+	return cfg.slots[configKey] and true or false
 end
 
 local function CollectUnits()
@@ -135,7 +193,7 @@ local function AnySlotEnabled(cfg)
 	return false
 end
 
-local function BuildMissingForSlot(unit, slotDef, idx, mainHandLink)
+local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cfg)
 	local link = GetInventoryItemLink(unit, slotDef.slots[idx])
 	local label = slotDef.label
 	if #slotDef.slots > 1 then
@@ -146,11 +204,21 @@ local function BuildMissingForSlot(unit, slotDef, idx, mainHandLink)
 		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
 			return {}
 		end
+		-- Empty slots use their physical slot toggle. For offhand specifically,
+		-- that means an empty offhand follows the offHand setting because there is
+		-- no equipped item to classify as a weapon or non-weapon.
+		if not IsSlotEnabledInConfig(cfg, slotKey, nil) then
+			return {}
+		end
 		return { label .. " Item" }
 	end
 
+	if not IsSlotEnabledInConfig(cfg, slotKey, link) then
+		return {}
+	end
+
 	local missing = {}
-	if not HasEnchant(link) then
+	if ShouldCheckEnchant(slotDef, link) and not HasEnchant(link) then
 		table.insert(missing, label .. " Enchant")
 	end
 
@@ -166,12 +234,10 @@ local function EvaluateUnit(unit, cfg)
 	local missing = {}
 
 	for slotKey, slotDef in pairs(SLOT_DEFS) do
-		if cfg.slots[slotKey] then
-			for idx = 1, #slotDef.slots do
-				local slotMissing = BuildMissingForSlot(unit, slotDef, idx, mainHandLink)
-				for _, m in ipairs(slotMissing) do
-					table.insert(missing, m)
-				end
+		for idx = 1, #slotDef.slots do
+			local slotMissing = BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cfg)
+			for _, m in ipairs(slotMissing) do
+				table.insert(missing, m)
 			end
 		end
 	end

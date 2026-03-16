@@ -3,8 +3,8 @@
 
 <!-- STATUS_BADGES_START -->
 ![WoW Version](https://img.shields.io/badge/WoW-12.0.0-00aaff)
-![Track](https://img.shields.io/badge/Track-Retail-ff8800)
-![Addon Version](https://img.shields.io/badge/Version-0.5.14-brightgreen)
+![Track](https://img.shields.io/badge/Track-Beta-ff8800)
+![Addon Version](https://img.shields.io/badge/Version-0.5.15--beta.7-brightgreen)
 <!-- STATUS_BADGES_END -->
 
 
@@ -46,23 +46,23 @@ For detailed information about our guild, addon features, and guides, visit our 
 
 ### WowUp Installation
 
-1. Open WowUp and go to **Get Addons**
-2. Click the **Install from URL** button
-3. Enter the following URL:
-   ```
-   https://github.com/OsulivanAB/SpectrumFederation
-   ```
-4. Click **Install**
+- Open WowUp, go to **Get Addons**, search for "Spectrum Federation", and install directly.
+- Alternatively, use the Install from URL option and paste:
+  ```
+  https://github.com/OsulivanAB/SpectrumFederation
+  ```
 
 ### CurseForge Installation
 
-We are not currently available on CurseForge. Please use the WowUp or Manual installation methods instead.
+- Spectrum Federation is available on CurseForge — search for "Spectrum Federation" in the CurseForge client or visit:
+  https://www.curseforge.com/wow/addons/spectrum-federation
+- Use the CurseForge client or the website to download/install the addon.
 
 ### Manual Installation
 
 1. Download the latest release from the [Releases page](https://github.com/OsulivanAB/SpectrumFederation/releases)
 2. Extract the downloaded ZIP file
-3. Copy the `SpectrumFederation` folder to your World of Warcraft AddOns directory:
-   - **Windows**: `C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns\`
-   - **macOS**: `/Applications/World of Warcraft/_retail_/Interface/AddOns/`
+3. Copy the SpectrumFederation folder to your World of Warcraft AddOns directory:
+  - **Windows**: C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns\
+  - **macOS**: /Applications/World of Warcraft/_retail_/Interface/AddOns/
 4. Restart World of Warcraft or type `/reload` in-game
