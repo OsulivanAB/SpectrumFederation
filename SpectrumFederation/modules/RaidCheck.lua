@@ -134,6 +134,9 @@ local function ShouldCheckEnchant(slotDef, link)
 end
 
 local function GetRaidCheckSlotConfigKey(slotKey, link)
+	-- Raid Check evaluates physical equipment slots, but the settings model
+	-- now exposes a logical "weapon" toggle that covers main-hand weapons and
+	-- offhand weapons alike.
 	if slotKey == "mainHand" then
 		return "weapon"
 	end
