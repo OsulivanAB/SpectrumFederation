@@ -136,7 +136,8 @@ end
 local function GetRaidCheckSlotConfigKey(slotKey, link)
 	-- Raid Check evaluates physical equipment slots, but the settings model
 	-- now exposes a logical "weapon" toggle that covers main-hand weapons and
-	-- offhand weapons alike.
+	-- offhand weapons alike. Empty offhands and non-weapon offhands keep using
+	-- the physical offhand toggle because there is no weapon item to classify.
 	if slotKey == "mainHand" then
 		return "weapon"
 	end
@@ -203,8 +204,9 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
 			return {}
 		end
-		-- An empty offhand still follows the physical offhand slot toggle because
-		-- there is no equipped item to classify as a weapon or non-weapon.
+		-- Empty slots use their physical slot toggle. For offhand specifically,
+		-- that means an empty offhand follows the offHand setting because there is
+		-- no equipped item to classify as a weapon or non-weapon.
 		if not IsSlotEnabledInConfig(cfg, slotKey, nil) then
 			return {}
 		end
