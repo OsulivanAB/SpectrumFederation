@@ -242,8 +242,8 @@ function Controller:Init()
         self:OpenSettings()
     end
 
-    frame.OnCloseClicked = function()
-        self:OnCloseClicked()
+    frame.OnMinimizeClicked = function()
+        self:OnMinimizeClicked()
     end
 
     self:_InitEvents()
@@ -320,29 +320,10 @@ function Controller:OpenSettings()
     print("SpectrumFederation: Open Settings → AddOns → Spectrum Federation Settings → Loot Helper Settings")
 end
 
-function Controller:OnCloseClicked()
-    -- Check if user is in raid
-    local inRaid = IsInRaid()
-    
-    if inRaid then
-        -- In raid: disable lootHelper.enabled (won't show in or out of raid)
-        if SF.SettingsStore and SF.SettingsStore.Set then
-            SF.SettingsStore:Set("lootHelper.enabled", false)
-        else
-            local db = GetLootDB()
-            if db then db.enabled = false end
-        end
-    else
-        -- Not in raid: disable showWindowOutsideRaid (will still show when in raid)
-        if SF.SettingsStore and SF.SettingsStore.Set then
-            SF.SettingsStore:Set("lootHelper.showWindowOutsideRaid", false)
-        else
-            local db = GetLootDB()
-            if db then db.showWindowOutsideRaid = false end
-        end
+function Controller:OnMinimizeClicked()
+    if LH.Window and LH.Window.ToggleMinimized then
+        LH.Window:ToggleMinimized()
     end
-
-    self:EvaluateVisibility("CloseClicked")
 end
 
 -- TODO: Temporary to verify skeleton exists
