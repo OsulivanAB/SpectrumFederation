@@ -22,6 +22,13 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.15-beta.8] - 2026-03-17
+
+### Changed
+- Updated addon metadata to version 0.5.15-beta.8.
+- Ensured compatibility with Node.js 24 for workflow actions (no addon functionality changes).
+
 ## [0.5.15-beta.7] - 2026-03-16
 
 ### Added
