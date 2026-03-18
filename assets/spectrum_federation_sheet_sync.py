@@ -532,7 +532,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
         config_path,
     )
     poll_interval_seconds = float(
-        get_setting_value(args.poll_interval_seconds, "POLL_INTERVAL_SECONDS", config_data, "poll_interval_seconds", 1.0)
+        get_setting_value(args.poll_interval_seconds, "POLL_INTERVAL_SECONDS", config_data, "poll_interval_seconds", 10.0)
     )
     debounce_seconds = float(
         get_setting_value(args.debounce_seconds, "DEBOUNCE_SECONDS", config_data, "debounce_seconds", 1.5)
@@ -789,7 +789,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--endpoint-url", help="Google Apps Script web app URL.")
     parser.add_argument("--shared-secret", help="Shared secret that must match the Apps Script configuration.")
     parser.add_argument("--saved-variables-path", help="Explicit path to SpectrumFederation.lua. Use this if auto-discovery is not correct.")
-    parser.add_argument("--poll-interval-seconds", type=float, help="How often to check the file for changes. Default: 1.0")
+    parser.add_argument("--poll-interval-seconds", type=float, help="How often to check the file for changes. Default: 10.0")
     parser.add_argument("--debounce-seconds", type=float, help="How long to wait after a file change before syncing. Default: 1.5")
     parser.add_argument("--http-timeout-seconds", type=float, help="HTTP timeout for Apps Script requests. Default: 30")
     parser.add_argument("--retry-attempts", type=int, help="How many times to retry a failed HTTP request. Default: 3")

@@ -210,7 +210,7 @@ Create a file named `spectrum_federation_sheet_sync.json` next to the Python scr
   "endpoint_url": "https://script.google.com/macros/s/REPLACE_WITH_YOUR_DEPLOYMENT_ID/exec",
   "shared_secret": "replace-this-with-a-long-random-secret",
   "saved_variables_path": "",
-  "poll_interval_seconds": 1.0,
+  "poll_interval_seconds": 10.0,
   "debounce_seconds": 1.5,
   "http_timeout_seconds": 30,
   "retry_attempts": 3
@@ -222,7 +222,7 @@ Configuration notes:
 - `endpoint_url`: the deployed Apps Script web app URL.
 - `shared_secret`: must exactly match the Apps Script `SHARED_SECRET`.
 - `saved_variables_path`: optional. Leave it empty to use auto-discovery.
-- `poll_interval_seconds`: how often the script checks the file.
+- `poll_interval_seconds`: how often the script checks the file. The default is 10 seconds.
 - `debounce_seconds`: how long the script waits after a change before syncing.
 - `http_timeout_seconds`: request timeout for the web call.
 - `retry_attempts`: retry count for temporary network failures.
