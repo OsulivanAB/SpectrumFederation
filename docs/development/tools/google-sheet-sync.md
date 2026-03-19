@@ -17,6 +17,10 @@ The repo includes this runtime file:
 
 - [Download spectrum_federation_sheet_sync.py](https://raw.githubusercontent.com/OsulivanAB/SpectrumFederation/beta/assets/spectrum_federation_sheet_sync.py): the standalone Python sync utility.
 
+It also includes this optional convenience file:
+
+- [Download spectrum_federation_sheet_sync.example.json](https://raw.githubusercontent.com/OsulivanAB/SpectrumFederation/beta/assets/spectrum_federation_sheet_sync.example.json): a starter config file you can rename to `spectrum_federation_sheet_sync.json`.
+
 You can run the utility directly from this repo, or copy the `.py` file to any folder on your own machine.
 
 ## Requirements
@@ -203,7 +207,9 @@ You can configure the utility with either:
 
 ### Recommended: JSON Config File
 
-Create a file named `spectrum_federation_sheet_sync.json` next to the Python script and paste this JSON into it.
+Download `spectrum_federation_sheet_sync.example.json`, rename it to `spectrum_federation_sheet_sync.json`, and place it next to the Python script.
+
+If you prefer, you can also create the file manually and paste in this JSON:
 
 ```json
 {
