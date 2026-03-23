@@ -107,6 +107,10 @@ local function IsAddOnLoadedSafe(addOnName)
         return C_AddOns.IsAddOnLoaded(addOnName)
     end
 
+    if SF and SF.Debug and SF.Debug.Warn then
+        SF.Debug:Warn("SPELLBOOK_PINGS", "C_AddOns.IsAddOnLoaded unavailable while checking %s", tostring(addOnName))
+    end
+
     return false
 end
 
@@ -162,13 +166,13 @@ function SpellBookPingButtons:EnsureMacro(data)
 
     local numAccountMacros, numCharacterMacros = GetNumMacros()
     if numAccountMacros >= MAX_ACCOUNT_MACROS and numCharacterMacros >= MAX_CHARACTER_MACROS then
-        return nil, false, false, false, "No available macro slots for SpellBook ping macros."
+        return nil, false, false, false, "Both account and character macro slots are full. Delete an unused macro to create this SpellBook ping macro."
     end
 
     isCharacterMacro = numAccountMacros >= MAX_ACCOUNT_MACROS
     index = CreateMacro(data.macroName, MACRO_ICON, data.macroBody, isCharacterMacro)
     if not index then
-        return nil, false, false, false, "Failed to create the requested ping macro."
+        return nil, false, false, false, string.format("Failed to create the '%s' macro.", data.macroName)
     end
 
     return index, true, false, isCharacterMacro, nil
