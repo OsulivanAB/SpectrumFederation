@@ -12,6 +12,7 @@ local PING_ATLASES = {
 	"ping_chat_warning",
 	"ping_chat_nonthreat",
 }
+local ATLAS_INFO_CACHE = {}
 
 local function IsAddOnLoadedSafe(addOnName)
 	if C_AddOns and C_AddOns.IsAddOnLoaded then
@@ -22,10 +23,18 @@ local function IsAddOnLoadedSafe(addOnName)
 end
 
 local function HasAtlasInfo(asset)
-	return type(asset) == "string"
-		and C_Texture
-		and C_Texture.GetAtlasInfo
-		and C_Texture.GetAtlasInfo(asset) ~= nil
+	if type(asset) ~= "string" or not C_Texture or not C_Texture.GetAtlasInfo then
+		return false
+	end
+
+	local cached = ATLAS_INFO_CACHE[asset]
+	if cached ~= nil then
+		return cached
+	end
+
+	cached = C_Texture.GetAtlasInfo(asset) ~= nil
+	ATLAS_INFO_CACHE[asset] = cached
+	return cached
 end
 
 local function ShouldShowPingIcons(provider)
@@ -80,7 +89,10 @@ function SpellBookPingButtons:PatchIconDataProvider(provider)
 		end
 
 		if ShouldShowPingIcons(selfProvider) then
-			return PING_ATLASES[index - baseCount]
+			local offset = index - baseCount
+			if offset >= 1 and offset <= #PING_ATLASES then
+				return PING_ATLASES[offset]
+			end
 		end
 
 		return originalGetIconByIndex(selfProvider, index)
@@ -158,7 +170,12 @@ function SpellBookPingButtons:InstallMacroHooks()
 	end
 
 	if MacroFrame and MacroFrame.RefreshIconDataProvider then
-		self:PatchIconDataProvider(MacroFrame:RefreshIconDataProvider())
+		local provider = MacroFrame:RefreshIconDataProvider()
+		if provider then
+			self:PatchIconDataProvider(provider)
+		else
+			self:Debug("Warn", "MacroFrame returned no icon data provider during ping icon hook install")
+		end
 	end
 
 	self.macroHooksInstalled = true
