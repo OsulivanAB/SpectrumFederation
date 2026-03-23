@@ -24,7 +24,7 @@ For detailed information about our guild, addon features, and guides, visit our 
 - Open `/sf`, go to the **General** page, and use the **Ping Macros** section.
 - Each button creates or updates one macro for a Blizzard ping type, using `/ping 1` through `/ping 5` so the ping lands at your cursor location when you use the macro.
 - If your cursor is free when you click a button, the refreshed macro is picked up immediately so you can drag it onto an action bar.
-- The SpellBook panel uses Blizzard ping atlas icons, but the created macros fall back to the default question-mark macro icon because macro APIs do not consume atlas names directly.
+- The created macros use the default question-mark macro icon because macro APIs do not consume Blizzard atlas names directly.
 
 ---
 
