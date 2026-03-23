@@ -23,7 +23,7 @@ local function CreatePingButton(id, text)
 				return
 			end
 
-			local _ok, message, kind = SF.SpellBookPingButtons:RunPingMacroActionById(id)
+			local _, message, kind = SF.SpellBookPingButtons:RunPingMacroActionById(id)
 			ctx.section:SetMessage(message or "Ping macro action completed.", kind or "info")
 		end,
 	}
