@@ -64,6 +64,20 @@ local function GetGeneralCategoryEnum()
     return nil
 end
 
+local function FindPingDefinitionById(id)
+    if not id then
+        return nil
+    end
+
+    for _, data in ipairs(PING_DEFINITIONS) do
+        if data.id == id then
+            return data
+        end
+    end
+
+    return nil
+end
+
 local function IsGeneralCategoryActive(spellBookFrame)
     if not spellBookFrame or not spellBookFrame.GetActiveCategoryMixin then
         return false
@@ -167,6 +181,10 @@ function SpellBookPingButtons:HideTooltip()
     GameTooltip:Hide()
 end
 
+function SpellBookPingButtons:GetPingDefinitions()
+    return PING_DEFINITIONS
+end
+
 function SpellBookPingButtons:EnsureMacro(data)
     local updated = false
     local isCharacterMacro = false
@@ -206,21 +224,24 @@ function SpellBookPingButtons:PickupMacroIfPossible(index)
     return true
 end
 
-function SpellBookPingButtons:HandleButtonClick(button)
+function SpellBookPingButtons:RunPingMacroAction(data)
     if InCombatLockdown() then
-        SF:PrintWarning("SpellBook ping macros cannot be created or updated during combat.")
-        return
+        local message = "Ping macros cannot be created or updated during combat."
+        SF:PrintWarning(message)
+        return false, message, "warn"
     end
 
-    local data = button and button.SFData
     if not data then
-        return
+        local message = "Ping macro data is unavailable."
+        SF:PrintError(message)
+        return false, message, "error"
     end
 
     local index, created, updated, isCharacterMacro, err = self:EnsureMacro(data)
     if not index then
-        SF:PrintError(err or string.format("Unable to create %s.", data.label))
-        return
+        local message = err or string.format("Unable to create %s.", data.label)
+        SF:PrintError(message)
+        return false, message, "error"
     end
 
     local pickedUp = self:PickupMacroIfPossible(index)
@@ -234,12 +255,35 @@ function SpellBookPingButtons:HandleButtonClick(button)
     local message = string.format("%s %s (%s macro).", actionText, data.label, scopeText)
 
     if pickedUp then
-        SF:PrintSuccess(message .. " It is now on your cursor.")
+        message = message .. " It is now on your cursor."
+        SF:PrintSuccess(message)
     else
-        SF:PrintInfo(message .. " Your cursor was already occupied, so it was not picked up.")
+        message = message .. " Your cursor was already occupied, so it was not picked up."
+        SF:PrintInfo(message)
     end
 
     self:Debug("Info", "%s macro handled via SpellBook button", data.id)
+    return true, message, pickedUp and "success" or "info"
+end
+
+function SpellBookPingButtons:RunPingMacroActionById(id)
+    local data = FindPingDefinitionById(id)
+    if not data then
+        local message = string.format("Unknown ping macro action '%s'.", tostring(id))
+        SF:PrintError(message)
+        return false, message, "error"
+    end
+
+    return self:RunPingMacroAction(data)
+end
+
+function SpellBookPingButtons:HandleButtonClick(button)
+    local data = button and button.SFData
+    if not data then
+        return
+    end
+
+    self:RunPingMacroAction(data)
 end
 
 function SpellBookPingButtons:CreateButton(parent, data, index)
