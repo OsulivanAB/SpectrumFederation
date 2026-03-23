@@ -10,8 +10,9 @@ local PANEL_HEIGHT = 86
 local BUTTON_WIDTH = 56
 local BUTTON_HEIGHT = 52
 local BUTTON_SPACING = 4
-local MACRO_ICON = QUESTION_MARK_ICON or [[INTERFACE\ICONS\INV_MISC_QUESTIONMARK]]
+local MACRO_ICON = QUESTION_MARK_ICON or [[Interface/Icons/INV_Misc_QuestionMark]]
 
+-- Macro names must stay within WoW's 16-character macro name limit.
 local PING_DEFINITIONS = {
     {
         id = "attack",
@@ -136,19 +137,19 @@ function SpellBookPingButtons:HideTooltip()
 end
 
 function SpellBookPingButtons:EnsureMacro(data)
-    local index = nil
     local updated = false
     local isCharacterMacro = false
 
+    local index
     index, isCharacterMacro = FindMacroByName(data.macroName)
     if index then
-        local currentName, currentIcon, currentBody = GetMacroInfo(index)
-        updated = currentName ~= data.macroName or currentIcon ~= MACRO_ICON or currentBody ~= data.macroBody
+        local _, currentIcon, currentBody = GetMacroInfo(index)
+        updated = currentIcon ~= MACRO_ICON or currentBody ~= data.macroBody
         if updated then
             EditMacro(index, data.macroName, MACRO_ICON, data.macroBody)
         end
 
-        return index, false, updated, isCharacterMacro
+        return index, false, updated, isCharacterMacro, nil
     end
 
     local numAccountMacros, numCharacterMacros = GetNumMacros()
@@ -162,7 +163,7 @@ function SpellBookPingButtons:EnsureMacro(data)
         return nil, false, false, false, "Failed to create the requested ping macro."
     end
 
-    return index, true, false, isCharacterMacro
+    return index, true, false, isCharacterMacro, nil
 end
 
 function SpellBookPingButtons:PickupMacroIfPossible(index)
@@ -193,7 +194,12 @@ function SpellBookPingButtons:HandleButtonClick(button)
 
     local pickedUp = self:PickupMacroIfPossible(index)
     local scopeText = isCharacterMacro and "character" or "account"
-    local actionText = created and "Created" or (updated and "Updated" or "Prepared")
+    local actionText = "Prepared"
+    if created then
+        actionText = "Created"
+    elseif updated then
+        actionText = "Updated"
+    end
     local message = string.format("%s %s (%s macro).", actionText, data.label, scopeText)
 
     if pickedUp then
@@ -369,7 +375,7 @@ function SpellBookPingButtons:SetupSpellBookHooks()
     self.spellBookFrame = PlayerSpellsFrame.SpellBookFrame
 
     hooksecurefunc(SpellBookFrameMixin, "OnShow", function(frame)
-        SpellBookPingButtons:Refresh(frame)
+        self:Refresh(frame)
     end)
 
     hooksecurefunc(SpellBookFrameMixin, "OnHide", function(frame)
@@ -379,16 +385,16 @@ function SpellBookPingButtons:SetupSpellBookHooks()
     end)
 
     hooksecurefunc(SpellBookFrameMixin, "OnActiveCategoryChanged", function(frame)
-        SpellBookPingButtons:Refresh(frame)
+        self:Refresh(frame)
     end)
 
     hooksecurefunc(SpellBookFrameMixin, "ResizeSearchBox", function(frame)
-        SpellBookPingButtons:Refresh(frame)
+        self:Refresh(frame)
     end)
 
     if self.spellBookFrame.SearchBox then
         self.spellBookFrame.SearchBox:HookScript("OnTextChanged", function()
-            SpellBookPingButtons:Refresh(SpellBookPingButtons.spellBookFrame)
+            self:Refresh(self.spellBookFrame)
         end)
     end
 
