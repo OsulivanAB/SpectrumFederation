@@ -43,6 +43,10 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF:RegisterLootHelperSlashCommands()
         end
 
+        if SF.SpellBookPingButtons and SF.SpellBookPingButtons.Initialize then
+            SF.SpellBookPingButtons:Initialize()
+        end
+
         -- Send a quick message saying that Addon is Initialized
         SF:PrintSuccess("Online. Type /sf to open settings.")
 

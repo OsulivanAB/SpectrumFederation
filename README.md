@@ -19,6 +19,13 @@ For detailed information about our guild, addon features, and guides, visit our 
 
 **[View Full Documentation →](https://osulivanab.github.io/SpectrumFederation/)**
 
+### SpellBook Ping Macros
+
+- Open the SpellBook and switch to the **General** tab to find the addon-owned **Ping Macros** panel just below the spell search box.
+- Each button creates or updates one macro for a Blizzard ping type, using `/ping 1` through `/ping 5` so the ping lands at your cursor location when you use the macro.
+- If your cursor is free when you click a button, the refreshed macro is picked up immediately so you can drag it onto an action bar.
+- The SpellBook panel uses Blizzard ping atlas icons, but the created macros fall back to the default question-mark macro icon because macro APIs do not consume atlas names directly.
+
 ---
 
 ## Automation: Interface Sync & Packaging
