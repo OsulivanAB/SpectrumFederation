@@ -56,6 +56,14 @@ local PING_DEFINITIONS = {
     },
 }
 
+local function GetGeneralCategoryEnum()
+    if PlayerSpellsUtil and PlayerSpellsUtil.SpellBookCategories then
+        return PlayerSpellsUtil.SpellBookCategories.General
+    end
+
+    return nil
+end
+
 local function IsGeneralCategoryActive(spellBookFrame)
     if not spellBookFrame or not spellBookFrame.GetActiveCategoryMixin then
         return false
@@ -70,12 +78,23 @@ local function IsGeneralCategoryActive(spellBookFrame)
         return false
     end
 
+    local generalCategoryEnum = GetGeneralCategoryEnum()
+    if spellBookFrame.IsCategoryActive and generalCategoryEnum ~= nil then
+        return spellBookFrame:IsCategoryActive(generalCategoryEnum)
+    end
+
     local activeCategoryMixin = spellBookFrame:GetActiveCategoryMixin()
-    if not activeCategoryMixin or not activeCategoryMixin.GetCategoryEnum or not PlayerSpellsUtil then
+    if not activeCategoryMixin or not activeCategoryMixin.GetCategoryEnum then
         return false
     end
 
-    return activeCategoryMixin:GetCategoryEnum() == PlayerSpellsUtil.SpellBookCategories.General
+    local activeCategoryEnum = activeCategoryMixin:GetCategoryEnum()
+    if generalCategoryEnum ~= nil then
+        return activeCategoryEnum == generalCategoryEnum
+    end
+
+    local activeCategoryName = activeCategoryMixin.GetName and activeCategoryMixin:GetName() or activeCategoryMixin.displayName
+    return activeCategoryName == GENERAL_SPELLS
 end
 
 local function FindMacroByName(name)
@@ -377,11 +396,12 @@ end
 
 function SpellBookPingButtons:SetupSpellBookHooks()
     if self.hooksInstalled then
-        return
+        return true
     end
 
     if not PlayerSpellsFrame or not PlayerSpellsFrame.SpellBookFrame or not SpellBookFrameMixin then
-        return
+        self:Debug("Warn", "SpellBook frame not ready when installing ping hooks")
+        return false
     end
 
     self.spellBookFrame = PlayerSpellsFrame.SpellBookFrame
@@ -412,15 +432,17 @@ function SpellBookPingButtons:SetupSpellBookHooks()
 
     self.hooksInstalled = true
     self:Debug("Info", "Installed SpellBook ping macro hooks")
+    return true
 end
 
 function SpellBookPingButtons:OnEvent(event, ...)
     if event == "ADDON_LOADED" then
         local loadedAddonName = ...
         if loadedAddonName == BLIZZARD_PLAYER_SPELLS then
-            self.eventFrame:UnregisterEvent("ADDON_LOADED")
-            self:SetupSpellBookHooks()
-            self:Refresh(self.spellBookFrame)
+            if self:SetupSpellBookHooks() then
+                self.eventFrame:UnregisterEvent("ADDON_LOADED")
+                self:Refresh(self.spellBookFrame)
+            end
         end
     elseif event == "PLAYER_REGEN_DISABLED" then
         self:HandleCombatStateChange(true)
@@ -443,8 +465,11 @@ function SpellBookPingButtons:Initialize()
     self.eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 
     if IsAddOnLoadedSafe(BLIZZARD_PLAYER_SPELLS) then
-        self:SetupSpellBookHooks()
-        self:Refresh(self.spellBookFrame)
+        if self:SetupSpellBookHooks() then
+            self:Refresh(self.spellBookFrame)
+        else
+            self.eventFrame:RegisterEvent("ADDON_LOADED")
+        end
     else
         self.eventFrame:RegisterEvent("ADDON_LOADED")
     end
