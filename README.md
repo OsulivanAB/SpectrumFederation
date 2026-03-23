@@ -4,7 +4,7 @@
 <!-- STATUS_BADGES_START -->
 ![WoW Version](https://img.shields.io/badge/WoW-12.0.0-00aaff)
 ![Track](https://img.shields.io/badge/Track-Beta-ff8800)
-![Addon Version](https://img.shields.io/badge/Version-0.5.15--beta.6-brightgreen)
+![Addon Version](https://img.shields.io/badge/Version-0.5.15--beta.7-brightgreen)
 <!-- STATUS_BADGES_END -->
 
 
@@ -18,15 +18,6 @@ World of Warcraft addon for the Spectrum Federation guild on Garona.
 For detailed information about our guild, addon features, and guides, visit our documentation site:
 
 **[View Full Documentation →](https://osulivanab.github.io/SpectrumFederation/)**
-
-### Ping Macros
-
-- Open `/sf`, go to the **General** page, and use the **Ping Macros** section.
-- Each button creates or updates one macro for a Blizzard ping type, using `/ping 1` through `/ping 5` so the ping lands at your cursor location when you use the macro.
-- If your cursor is free when you click a button, the refreshed macro is picked up immediately so you can drag it onto an action bar.
-- The created macros use the default question-mark macro icon because macro APIs do not consume Blizzard atlas names directly.
-
----
 
 ## Automation: Interface Sync & Packaging
 

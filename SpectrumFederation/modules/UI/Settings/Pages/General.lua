@@ -7,44 +7,6 @@ local Page = {
 	order = 10,
 }
 
-local function PingActionsAvailable()
-	return SF.SpellBookPingButtons and SF.SpellBookPingButtons.RunPingMacroActionById ~= nil
-end
-
-local function CreatePingButton(id, text)
-	return {
-		text = text,
-		width = 170,
-		onClick = function(ctx)
-			ctx.section:ClearMessage()
-
-			if not PingActionsAvailable() then
-				ctx.section:SetMessage("Ping macro actions are not available.", "error")
-				return
-			end
-
-			local _, message, kind = SF.SpellBookPingButtons:RunPingMacroActionById(id)
-			ctx.section:SetMessage(message or "Ping macro action completed.", kind or "info")
-		end,
-	}
-end
-
-local function CreatePingButtonRow(leftId, leftText, rightId, rightText)
-	local row = {
-		type = "buttonRow",
-		enabled = function()
-			return PingActionsAvailable()
-		end,
-		CreatePingButton(leftId, leftText),
-	}
-
-	if rightId and rightText then
-		row[2] = CreatePingButton(rightId, rightText)
-	end
-
-	return row
-end
-
 -- ==================================================================
 -- Page Definition
 -- ==================================================================
@@ -101,19 +63,6 @@ function Page:Build(panel)
 						step = 1,
 						valueFormat = "%d",
 					},
-				},
-			},
-			{
-				id = "pingMacros",
-				title = "Ping Macros",
-				items = {
-					{
-						type = "help",
-						text = "Create or refresh Blizzard ping macros from settings. If your cursor is free, the macro is picked up immediately so you can drag it onto an action bar.",
-					},
-					CreatePingButtonRow("attack", "Attack", "assist", "Assist"),
-					CreatePingButtonRow("onmyway", "On My Way", "warning", "Warning"),
-					CreatePingButtonRow("nonthreat", "Non-Threat"),
 				},
 			},
 		},
