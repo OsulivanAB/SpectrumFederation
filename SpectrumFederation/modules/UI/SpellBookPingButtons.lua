@@ -169,15 +169,6 @@ function SpellBookPingButtons:InstallMacroHooks()
 		return provider
 	end
 
-	if MacroFrame and MacroFrame.RefreshIconDataProvider then
-		local provider = MacroFrame:RefreshIconDataProvider()
-		if provider then
-			self:PatchIconDataProvider(provider)
-		else
-			self:Debug("Warn", "MacroFrame returned no icon data provider during ping icon hook install")
-		end
-	end
-
 	self.macroHooksInstalled = true
 	self:Debug("Info", "Installed Macro UI ping icon hooks")
 	return true

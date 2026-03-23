@@ -19,6 +19,8 @@ For detailed information about our guild, addon features, and guides, visit our 
 
 **[View Full Documentation →](https://osulivanab.github.io/SpectrumFederation/)**
 
+---
+
 ## Automation: Interface Sync & Packaging
 
 - Workflow: `.github/workflows/wow-interface-sync.yml` runs every 30 minutes (or manually via **workflow_dispatch**) to align `SpectrumFederation/SpectrumFederation.toc`.
