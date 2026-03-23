@@ -17,6 +17,10 @@ The repo includes this runtime file:
 
 - [Download spectrum_federation_sheet_sync.py](https://raw.githubusercontent.com/OsulivanAB/SpectrumFederation/beta/assets/spectrum_federation_sheet_sync.py): the standalone Python sync utility.
 
+It also includes this optional convenience file:
+
+- [Download spectrum_federation_sheet_sync.example.json](https://raw.githubusercontent.com/OsulivanAB/SpectrumFederation/beta/assets/spectrum_federation_sheet_sync.example.json): a starter config file you can rename to `spectrum_federation_sheet_sync.json`.
+
 You can run the utility directly from this repo, or copy the `.py` file to any folder on your own machine.
 
 ## Requirements
@@ -39,18 +43,22 @@ You can run the utility directly from this repo, or copy the `.py` file to any f
 Edit these values before you deploy:
 
 - `SHEET_NAME`: the tab name that will be rewritten on every sync.
-- `SHARED_SECRET`: a secret string that must match the Python utility config.
+- `SHARED_SECRET_PROPERTY_NAME`: the Script Property key that stores your secret value.
+- `COLUMN_WIDTH`: fixed width to apply to every column on each sync.
 - `FREEZE_HEADER_ROW`: set to `true` to keep the header row frozen.
 - `AUTO_RESIZE_COLUMNS`: set to `true` if you want Google Sheets to resize columns after each update.
+
+Do not hardcode your real shared secret in the Apps Script source. Store it in Apps Script Script Properties instead.
 
 ### Copy/Paste Apps Script Code
 
 ```javascript
 const CONFIG = {
   SHEET_NAME: 'Spectrum Federation Sync',
-  SHARED_SECRET: 'replace-this-with-the-same-secret-you-use-in-the-python-script',
+  SHARED_SECRET_PROPERTY_NAME: 'SF_SHARED_SECRET',
+  COLUMN_WIDTH: 100,
   FREEZE_HEADER_ROW: true,
-  AUTO_RESIZE_COLUMNS: true,
+  AUTO_RESIZE_COLUMNS: false,
   HEADER_BACKGROUND: '#434343',
   HEADER_FONT_COLOR: '#FFFFFF',
   PLAYER_BACKGROUND: '#434343',
@@ -67,7 +75,8 @@ function doPost(e) {
     }
 
     const requestBody = JSON.parse(e.postData.contents);
-    if (!requestBody || requestBody.secret !== CONFIG.SHARED_SECRET) {
+    const expectedSecret = getSharedSecret_();
+    if (!requestBody || requestBody.secret !== expectedSecret) {
       return jsonResponse_({ ok: false, error: 'Shared secret mismatch.' });
     }
 
@@ -86,6 +95,21 @@ function doPost(e) {
   } catch (error) {
     return jsonResponse_({ ok: false, error: error.message, stack: error.stack });
   }
+}
+
+function getSharedSecret_() {
+  const secret = PropertiesService
+    .getScriptProperties()
+    .getProperty(CONFIG.SHARED_SECRET_PROPERTY_NAME);
+
+  if (!secret) {
+    throw new Error(
+      'Missing Script Property ' + CONFIG.SHARED_SECRET_PROPERTY_NAME + '. ' +
+      'Set it in Project Settings -> Script properties before deploying.'
+    );
+  }
+
+  return secret;
 }
 
 function validatePayload_(payload) {
@@ -120,6 +144,10 @@ function rewriteSheet_(sheet, payload) {
 
   if (CONFIG.FREEZE_HEADER_ROW) {
     sheet.setFrozenRows(1);
+  }
+
+  if (CONFIG.COLUMN_WIDTH) {
+    sheet.setColumnWidths(1, columnCount, CONFIG.COLUMN_WIDTH);
   }
 
   formatHeader_(sheet, columnCount);
@@ -185,6 +213,14 @@ function jsonResponse_(payload) {
 
 ## Step 2: Deploy the Apps Script as a Web App
 
+Before you deploy, set the shared secret in Apps Script:
+
+1. Open `Project Settings` in the Apps Script editor.
+2. Find `Script properties`.
+3. Add a property named `SF_SHARED_SECRET`.
+4. Paste in your real shared secret value.
+5. Save the property.
+
 1. Click `Deploy` -> `New deployment`.
 2. Choose `Web app`.
 3. Set `Execute as` to your account.
@@ -203,7 +239,9 @@ You can configure the utility with either:
 
 ### Recommended: JSON Config File
 
-Create a file named `spectrum_federation_sheet_sync.json` next to the Python script and paste this JSON into it.
+Download `spectrum_federation_sheet_sync.example.json`, rename it to `spectrum_federation_sheet_sync.json`, and place it next to the Python script.
+
+If you prefer, you can also create the file manually and paste in this JSON:
 
 ```json
 {
@@ -220,7 +258,7 @@ Create a file named `spectrum_federation_sheet_sync.json` next to the Python scr
 Configuration notes:
 
 - `endpoint_url`: the deployed Apps Script web app URL.
-- `shared_secret`: must exactly match the Apps Script `SHARED_SECRET`.
+- `shared_secret`: must exactly match the value stored in the Apps Script Script Property `SF_SHARED_SECRET`.
 - `saved_variables_path`: optional. Leave it empty to use auto-discovery.
 - `poll_interval_seconds`: how often the script checks the file. The default is 10 seconds.
 - `debounce_seconds`: how long the script waits after a change before syncing.
