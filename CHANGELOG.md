@@ -25,6 +25,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.15-beta.2] - 2026-03-23
+
+### Changed
+- Updated addon version to `0.5.15-beta.2` in the `.toc` file.
+
 ## [0.5.15-beta.1] - 2026-03-18
 
 ### Added
