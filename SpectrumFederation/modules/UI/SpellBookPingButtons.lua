@@ -435,13 +435,21 @@ function SpellBookPingButtons:SetupSpellBookHooks()
     return true
 end
 
+function SpellBookPingButtons:TrySetupSpellBookHooksAndRefresh()
+    if not self:SetupSpellBookHooks() then
+        return false
+    end
+
+    self:Refresh(self.spellBookFrame)
+    return true
+end
+
 function SpellBookPingButtons:OnEvent(event, ...)
     if event == "ADDON_LOADED" then
         local loadedAddonName = ...
         if loadedAddonName == BLIZZARD_PLAYER_SPELLS then
-            if self:SetupSpellBookHooks() then
+            if self:TrySetupSpellBookHooksAndRefresh() then
                 self.eventFrame:UnregisterEvent("ADDON_LOADED")
-                self:Refresh(self.spellBookFrame)
             end
         end
     elseif event == "PLAYER_REGEN_DISABLED" then
@@ -464,11 +472,7 @@ function SpellBookPingButtons:Initialize()
     self.eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
     self.eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 
-    local shouldWaitForPlayerSpells = true
-    if IsAddOnLoadedSafe(BLIZZARD_PLAYER_SPELLS) and self:SetupSpellBookHooks() then
-        shouldWaitForPlayerSpells = false
-        self:Refresh(self.spellBookFrame)
-    end
+    local shouldWaitForPlayerSpells = not (IsAddOnLoadedSafe(BLIZZARD_PLAYER_SPELLS) and self:TrySetupSpellBookHooksAndRefresh())
 
     if shouldWaitForPlayerSpells then
         self.eventFrame:RegisterEvent("ADDON_LOADED")
