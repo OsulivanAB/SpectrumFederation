@@ -102,6 +102,14 @@ local function SetButtonEnabled(button, enabled)
     button:SetAlpha(enabled and 1 or 0.45)
 end
 
+local function IsAddOnLoadedSafe(addOnName)
+    if C_AddOns and C_AddOns.IsAddOnLoaded then
+        return C_AddOns.IsAddOnLoaded(addOnName)
+    end
+
+    return false
+end
+
 function SpellBookPingButtons:Debug(level, message, ...)
     if not SF.Debug or not SF.Debug[level] then
         return
@@ -430,7 +438,7 @@ function SpellBookPingButtons:Initialize()
     self.eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
     self.eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 
-    if IsAddOnLoaded(BLIZZARD_PLAYER_SPELLS) then
+    if IsAddOnLoadedSafe(BLIZZARD_PLAYER_SPELLS) then
         self:SetupSpellBookHooks()
         self:Refresh(self.spellBookFrame)
     else
