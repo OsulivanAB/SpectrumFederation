@@ -26,6 +26,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.16-beta.1] - 2026-03-25
+
+### Fixed
+- Resolved an issue causing a nil global error during the LootHelper sync handshake process.
+
 ## [0.5.15-beta.2] - 2026-03-23
 
 ### Changed
