@@ -27,6 +27,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.16-beta.2] - 2026-03-25
+
+### Fixed
+- Empty sockets are now reported independently of raid check enchant toggles, ensuring more accurate gear assessments.
+
 ## [0.5.16-beta.1] - 2026-03-25
 
 ### Fixed
