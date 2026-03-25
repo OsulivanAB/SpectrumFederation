@@ -94,6 +94,9 @@ nav:
       - Loot Profile Class: development/loot-helper/loot-profile-class.md
       - Loot Logs Class: development/loot-helper/loot-logs.md
       - Data Syncing: development/loot-helper/loot-profile-data-syncing.md
+    - Tools:
+      - Overview: development/tools/index.md
+      - Google Sheet Sync: development/tools/google-sheet-sync.md
 
 plugins:
   - search

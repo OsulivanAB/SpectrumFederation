@@ -24,6 +24,30 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+
+
+
+## [0.5.16-beta.2] - 2026-03-25
+
+### Fixed
+- Empty sockets are now reported independently of raid check enchant toggles, ensuring more accurate gear assessments.
+
+## [0.5.16-beta.1] - 2026-03-25
+
+### Fixed
+- Resolved an issue causing a nil global error during the LootHelper sync handshake process.
+
+## [0.5.15-beta.2] - 2026-03-23
+
+### Changed
+- Updated addon version to `0.5.15-beta.2` in the `.toc` file.
+
+## [0.5.15-beta.1] - 2026-03-18
+
+### Added
+- Support for syncing saved variables to Google Sheets for improved data management and sharing.
+
 ## [0.5.15] - 2026-03-17
 
 ### Changed

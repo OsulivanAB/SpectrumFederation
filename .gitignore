@@ -48,3 +48,6 @@ venv/
 ENV/
 .ruff_cache/
 .venv
+
+# Local personal config for the sheet sync utility
+assets/spectrum_federation_sheet_sync.json
