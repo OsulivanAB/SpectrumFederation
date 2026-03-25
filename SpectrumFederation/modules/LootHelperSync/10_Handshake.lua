@@ -2,7 +2,7 @@ local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
--- Function Normalize a "Name" or "Name-Realm" into "Name-Realm" format.
+-- Function to normalize a "Name" or "Name-Realm" into "Name-Realm" format.
 -- @param name string Player name or "Name-Realm"
 -- @return string|nil Normalized "Name-Realm" or nil if invalid
 local function NormalizeNameRealm(name)
