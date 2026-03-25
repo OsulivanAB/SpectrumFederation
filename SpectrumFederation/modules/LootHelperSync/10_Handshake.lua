@@ -2,6 +2,24 @@ local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+-- Function to normalize a "Name" or "Name-Realm" into "Name-Realm" format.
+-- @param name string Player name or "Name-Realm"
+-- @return string|nil Normalized "Name-Realm" or nil if invalid
+local function NormalizeNameRealm(name)
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        return SF.NameUtil.NormalizeNameRealm(name)
+    end
+    if not name or name == "" then return nil end
+    if name:find("-", 1, true) then
+        local n, r = strsplit("-", name, 2)
+        if r then r = r:gsub("%s+", "") end
+        return n and r and (n .. "-" .. r) or name
+    end
+    local realm = GetRealmName()
+    if realm then realm = realm:gsub("%s+", "") end
+    return realm and (name .. "-" .. realm) or name
+end
+
 
 -- Function Broadcast a lightweight session heartbeat
 -- Coordinator-only. Does NOT restart handshake bookkeeping
@@ -525,4 +543,3 @@ function Sync:FinalizeHandshakeWindow()
             tostring(self.state.sessionId), tostring(self.state.profileId), have, needProf, needLogs, noResp)
     end
 end
-
