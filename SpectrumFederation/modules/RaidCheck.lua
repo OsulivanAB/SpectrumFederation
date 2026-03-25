@@ -213,12 +213,8 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 		return { label .. " Item" }
 	end
 
-	if not IsSlotEnabledInConfig(cfg, slotKey, link) then
-		return {}
-	end
-
 	local missing = {}
-	if ShouldCheckEnchant(slotDef, link) and not HasEnchant(link) then
+	if IsSlotEnabledInConfig(cfg, slotKey, link) and ShouldCheckEnchant(slotDef, link) and not HasEnchant(link) then
 		table.insert(missing, label .. " Enchant")
 	end
 
