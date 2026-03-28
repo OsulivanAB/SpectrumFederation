@@ -306,6 +306,7 @@ function Page:Build(panel)
 			{
 				id = "general",
 				title = "General Settings",
+				tooltip = "Character-level Loot Helper settings and global actions such as creating or resetting profiles.",
 				items = {
 					{
 						type = "checkbox",
@@ -420,6 +421,7 @@ function Page:Build(panel)
 			{
 				id = "profile",
 				title = "Profile Settings",
+				tooltip = "Settings and actions for the currently active Loot Helper profile, including membership and scoring rules.",
 				items = {
 					{
 						type = "help",
@@ -564,6 +566,7 @@ function Page:Build(panel)
 			{
 				id = "admin",
 				title = "Admin Settings",
+				tooltip = "Administrative tools for sync control, raid safemode, and raid check behavior for the active profile.",
 				condition = CanShowAdminTools,
 				items = {
 					{

@@ -86,11 +86,16 @@ end
 -- Add a new section to the page
 -- @param title string Section title/header
 -- @return Section The created section object
-function PageBuilder:AddSection(title)
+
+function PageBuilder:AddSection(titleOrOptions)
+	local title = titleOrOptions
+	if type(titleOrOptions) == "table" then
+		title = titleOrOptions.title
+	end
 	if SF.Debug then
 		SF.Debug:Verbose("UI", "Adding section '%s' to page", tostring(title))
 	end
-	local section = UI.Section:Create(self.content, title)
+	local section = UI.Section:Create(self.content, titleOrOptions)
 	section.__sfPageBuilder = self
 	table.insert(self.sections, section)
 	return section

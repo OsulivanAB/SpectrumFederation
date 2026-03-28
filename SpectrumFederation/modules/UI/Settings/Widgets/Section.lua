@@ -14,6 +14,9 @@ local HEADER_HEIGHT          = S.headerHeight or 22
 local LINE_THICKNESS         = S.lineThickness or 1
 local LINE_ALPHA             = S.lineAlpha or 0.28
 local TITLE_GAP              = S.titleGap or 10
+local INFO_BUTTON_SIZE       = S.infoButtonSize or 14
+local INFO_BUTTON_GAP        = S.infoButtonGap or 2
+local INFO_BUTTON_OFFSET_Y   = S.infoButtonOffsetY or 4
 
 local CONTENT_INSET_X        = S.contentInsetX or 12
 local CONTENT_PADDING_TOP    = S.paddingTop or 10
@@ -36,22 +39,60 @@ local function ApplyMixin(obj, mixin)
 end
 local Mix = _G.Mixin or ApplyMixin
 
+local function NormalizeSectionOptions(titleOrOptions, tooltipText)
+	if type(titleOrOptions) == "table" then
+		return {
+			title = titleOrOptions.title,
+			tooltip = titleOrOptions.tooltip,
+		}
+	end
+
+	return {
+		title = titleOrOptions,
+		tooltip = tooltipText,
+	}
+end
+
+local function SetTooltipHandlers(region, title, text)
+	if not region then return end
+
+	if not text or text == "" then
+		region:SetScript("OnEnter", nil)
+		region:SetScript("OnLeave", nil)
+		return
+	end
+
+	region:EnableMouse(true)
+	region:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText(title or "", 1, 1, 1)
+		GameTooltip:AddLine(text, nil, nil, nil, true)
+		GameTooltip:Show()
+	end)
+	region:SetScript("OnLeave", function()
+		GameTooltip:Hide()
+	end)
+end
+
 -- Create a new Section frame widget
 -- @param parent Frame Parent frame to attach section to
 -- @param title string|nil Section title text
 -- @return Frame Section frame with mixin methods
-function UI.Section:Create(parent, title)
+function UI.Section:Create(parent, titleOrOptions, tooltipText)
+	local options = NormalizeSectionOptions(titleOrOptions, tooltipText)
 	local frame = CreateFrame("Frame", nil, parent)
 	Mix(frame, SectionMixin)
-	frame:Init(title)
+	frame:Init(options)
 	return frame
 end
 
 -- Initialize the section frame layout and header
 -- @param title string|nil Section title text
 -- @return nil
-function SectionMixin:Init(title)
-	self.title = title or ""
+function SectionMixin:Init(titleOrOptions)
+	local options = NormalizeSectionOptions(titleOrOptions)
+	self.title = options.title or ""
+	self.tooltipText = options.tooltip or ""
 	self._rows = {}
 	self._contentHeight = 0
 
@@ -62,11 +103,38 @@ function SectionMixin:Init(title)
 	header:SetPoint("TOPRIGHT", self, "TOPRIGHT", 0, 0)
 	header:SetHeight(HEADER_HEIGHT)
 
-	-- Header label (centered)
+	local titleContainer = CreateFrame("Frame", nil, header)
+	self.HeaderTitleContainer = titleContainer
+	titleContainer:SetPoint("CENTER", header, "CENTER", 0, 0)
+	titleContainer:SetHeight(HEADER_HEIGHT)
+	titleContainer:SetWidth(1)
+
+	-- Header label and info icon container
 	local label = header:CreateFontString(nil, "ARTWORK", "GameFontNormal")
 	self.HeaderLabel = label
-	label:SetPoint("CENTER", header, "CENTER", 0, 0)
+	label:SetPoint("LEFT", titleContainer, "LEFT", 0, 0)
+	label:SetJustifyH("LEFT")
 	label:SetText(self.title)
+
+	local infoButton = CreateFrame("Button", nil, titleContainer)
+	self.HeaderInfoButton = infoButton
+	infoButton:SetSize(INFO_BUTTON_SIZE, INFO_BUTTON_SIZE)
+	infoButton:SetPoint("TOPLEFT", label, "TOPRIGHT", INFO_BUTTON_GAP, INFO_BUTTON_OFFSET_Y)
+	infoButton:SetHitRectInsets(-4, -4, -4, -4)
+	infoButton:Hide()
+
+	local icon = infoButton:CreateTexture(nil, "ARTWORK")
+	self.HeaderInfoIcon = icon
+	icon:SetAllPoints(infoButton)
+	icon:SetTexture("Interface\\Common\\help-i")
+	icon:SetVertexColor(1, 0.82, 0.18, 0.95)
+
+	local highlight = infoButton:CreateTexture(nil, "HIGHLIGHT")
+	self.HeaderInfoHighlight = highlight
+	highlight:SetAllPoints(infoButton)
+	highlight:SetTexture("Interface\\Common\\help-i")
+	highlight:SetBlendMode("ADD")
+	highlight:SetVertexColor(1, 1, 1, 0.35)
 
 	-- Left line segment
 	local leftLine = header:CreateTexture(nil, "ARTWORK")
@@ -74,14 +142,14 @@ function SectionMixin:Init(title)
 	leftLine:SetColorTexture(1, 1, 1, LINE_ALPHA)
 	leftLine:SetHeight(LINE_THICKNESS)
 	leftLine:SetPoint("LEFT", header, "LEFT", 0, 0)
-	leftLine:SetPoint("RIGHT", label, "LEFT", -TITLE_GAP, 0)
+	leftLine:SetPoint("RIGHT", titleContainer, "LEFT", -TITLE_GAP, 0)
 
 	-- Right line segment
 	local rightLine = header:CreateTexture(nil, "ARTWORK")
 	self.RightLine = rightLine
 	rightLine:SetColorTexture(1, 1, 1, LINE_ALPHA)
 	rightLine:SetHeight(LINE_THICKNESS)
-	rightLine:SetPoint("LEFT", label, "RIGHT", TITLE_GAP, 0)
+	rightLine:SetPoint("LEFT", titleContainer, "RIGHT", TITLE_GAP, 0)
 	rightLine:SetPoint("RIGHT", header, "RIGHT", 0, 0)
 
 	-- Content container
@@ -121,8 +189,26 @@ function SectionMixin:Init(title)
 			self:_NotifyPageReflow()
 		end
 	end)
+
+	self:_UpdateHeaderLayout()
 	
 	self:ReflowRows()
+end
+
+function SectionMixin:_UpdateHeaderLayout()
+	local titleWidth = math.max(1, self.HeaderLabel:GetStringWidth() or 0)
+	local hasTooltip = self.tooltipText and self.tooltipText ~= ""
+	local buttonWidth = 0
+
+	if hasTooltip then
+		self.HeaderInfoButton:Show()
+		buttonWidth = INFO_BUTTON_SIZE + INFO_BUTTON_GAP
+	else
+		self.HeaderInfoButton:Hide()
+	end
+
+	self.HeaderTitleContainer:SetWidth(titleWidth + buttonWidth)
+	SetTooltipHandlers(self.HeaderInfoButton, self.title, self.tooltipText)
 end
 
 -- Set the section title text
@@ -131,6 +217,15 @@ end
 function SectionMixin:SetTitle(title)
 	self.title = title or ""
 	self.HeaderLabel:SetText(self.title)
+	self:_UpdateHeaderLayout()
+end
+
+-- Set the section header tooltip text
+-- @param text string|nil Tooltip text shown from header info icon
+-- @return nil
+function SectionMixin:SetTooltipText(text)
+	self.tooltipText = text or ""
+	self:_UpdateHeaderLayout()
 end
 
 -- Adds a full-width row frame stacked vertically inside Content

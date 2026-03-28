@@ -48,7 +48,10 @@ function R:Build(panel, pageDef)
 	panel.__sfWatchedPaths = {}
 
 	for _, secDef in ipairs(pageDef.sections or {}) do
-		local sec = pb:AddSection(secDef.title or "")
+		local sec = pb:AddSection({
+			title = secDef.title or "",
+			tooltip = secDef.tooltip,
+		})
 		sec.__sfPageBuilder = pb
 
 		local key = SectionKey(secDef)

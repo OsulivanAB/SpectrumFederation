@@ -17,6 +17,9 @@ UI.Style = {
         lineThickness = 1,
         lineAlpha = 0.28,
         titleGap = 10,
+        infoButtonSize = 14,
+        infoButtonGap = 2,
+        infoButtonOffsetY = 4,
 
         contentInsetX = 12,
         paddingTop = 10,
