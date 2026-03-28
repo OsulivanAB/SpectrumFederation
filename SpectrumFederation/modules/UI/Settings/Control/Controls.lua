@@ -234,6 +234,26 @@ local function EnsureCheckboxRowHeight(section, row, checkbox)
 	end
 end
 
+local function ScheduleCheckboxGridHeight(section, row, checkboxes)
+	if not row or row.__sfCheckboxGridHeightScheduled then return end
+	row.__sfCheckboxGridHeightScheduled = true
+
+	local function Update()
+		row.__sfCheckboxGridHeightScheduled = false
+		for _, checkbox in ipairs(checkboxes or {}) do
+			if checkbox then
+				EnsureCheckboxRowHeight(section, row, checkbox)
+			end
+		end
+	end
+
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0, Update)
+	else
+		Update()
+	end
+end
+
 -- ---------------------------------------
 -- Button Row (two buttons)
 -- ---------------------------------------
@@ -293,6 +313,122 @@ function Controls:AddButtonRow(section, opts)
 		RegisterRefresh(section, Refresh)
 	end)
 end
+
+	function Controls:AddInlineControls(section, opts)
+		opts = opts or {}
+		local items = opts.items or {}
+		local spacing = opts.spacing or 10
+
+		return section:AddRow(opts.height or 30, function(row)
+			local widgets = {}
+
+			local function BuildDropdown(parent, def, previous)
+				local dropdown = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
+				dropdown:SetWidth(def.width or 180)
+				dropdown:SetDefaultText(def.defaultText or "Select...")
+
+				if previous then
+					dropdown:SetPoint("LEFT", previous, "RIGHT", spacing, 0)
+				else
+					dropdown:SetPoint("LEFT", parent, "LEFT", 0, 0)
+				end
+
+				local function GetOptions()
+					local value = def.options
+					if type(value) == "function" then
+						return value()
+					end
+					return value or {}
+				end
+
+				local function IsSelected(value)
+					return def.get and def.get() == value
+				end
+
+				local function SetSelected(value)
+					if def.set then
+						def.set(value)
+					end
+					if def.onValueChanged then
+						def.onValueChanged(value)
+					end
+				end
+
+				dropdown:SetupMenu(function(owner, rootDescription)
+					for _, option in ipairs(GetOptions()) do
+						local value
+						local label
+
+						if type(option) == "table" then
+							value = option.value
+							label = option.label
+						else
+							value = option
+							label = tostring(option)
+						end
+
+						if value ~= nil then
+							rootDescription:CreateRadio(tostring(label or value), IsSelected, SetSelected, value)
+						end
+					end
+				end)
+
+				if def.tooltip then
+					AttachTooltip(dropdown, def.defaultText or "", def.tooltip, def.adminOnly or opts.adminOnly)
+				end
+
+				widgets[#widgets + 1] = dropdown
+				return dropdown
+			end
+
+			local function BuildButton(parent, def, previous)
+				local button = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+				button:SetSize(def.width or 100, def.height or 22)
+				button:SetText(def.buttonText or def.text or "Button")
+
+				if previous then
+					button:SetPoint("LEFT", previous, "RIGHT", spacing, 0)
+				else
+					button:SetPoint("LEFT", parent, "LEFT", 0, 0)
+				end
+
+				button:SetScript("OnClick", function()
+					if button.IsEnabled and not button:IsEnabled() then return end
+					if def.onClick then
+						def.onClick(button)
+					end
+				end)
+
+				if def.tooltip then
+					AttachTooltip(button, def.buttonText or def.text or "", def.tooltip, def.adminOnly or opts.adminOnly)
+				end
+
+				widgets[#widgets + 1] = button
+				return button
+			end
+
+			local previous
+			for _, def in ipairs(items) do
+				if def.type == "dropdown" then
+					previous = BuildDropdown(row, def, previous)
+				elseif def.type == "button" then
+					previous = BuildButton(row, def, previous)
+				end
+			end
+
+			local function Refresh()
+				self:_ApplyRowState(row, section, opts, widgets)
+				for _, widget in ipairs(widgets) do
+					if widget.GenerateMenu then
+						widget:GenerateMenu()
+					end
+				end
+			end
+
+			Refresh()
+			RegisterRefresh(section, Refresh)
+		end)
+	end
 
 -- ---------------------------------------
 -- Checkbox Row (multi-column)
@@ -531,6 +667,7 @@ function Controls:AddCheckboxGrid(section, opts)
 			if cb2 and items[2] and items[2].get then
 				cb2:SetChecked(items[2].get() and true or false)
 			end
+			ScheduleCheckboxGridHeight(section, row, checkboxes)
 			self:_ApplyRowState(row, section, rowOpts, checkboxes)
 		end
 
@@ -1189,6 +1326,223 @@ function Controls:AddScrollList(section, opts)
 
 		scroll:HookScript("OnSizeChanged", Refresh)
 	end)
+end
+
+function Controls:AddLogTable(section, opts)
+	opts = opts or {}
+
+	local getRows = opts.getRows
+	if type(getRows) ~= "function" then
+		getRows = function() return {} end
+	end
+
+	local columns = opts.columns or {}
+	local rowHeight = opts.rowHeight or 22
+	local rowSpacing = opts.rowSpacing or 1
+	local headerHeight = opts.headerHeight or 24
+	local columnGap = opts.columnGap or 8
+	local minHeight = opts.minHeight or opts.height or 260
+
+	return section:AddRow(minHeight, function(row)
+		local container = CreateFrame("Frame", nil, row)
+		container:SetAllPoints(row)
+
+		local tableArea = CreateFrame("Frame", nil, container)
+		tableArea:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
+		tableArea:SetPoint("TOPRIGHT", container, "TOPRIGHT", 0, 0)
+		tableArea:SetHeight(headerHeight)
+
+		local header = CreateFrame("Frame", nil, tableArea)
+		header:SetAllPoints(tableArea)
+
+		local headerBg = header:CreateTexture(nil, "BACKGROUND")
+		headerBg:SetAllPoints(header)
+		headerBg:SetColorTexture(1, 1, 1, 0.08)
+
+		local scroll = CreateFrame("ScrollFrame", nil, container, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -4)
+		scroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, 0)
+
+		local content = CreateFrame("Frame", nil, scroll)
+		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+		content:SetHeight(1)
+		scroll:SetScrollChild(content)
+
+		local emptyText = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
+		emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
+		emptyText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -8, -8)
+		emptyText:SetJustifyH("LEFT")
+		emptyText:SetText(opts.emptyText or "No logs found matching the selected filters.")
+		emptyText:Hide()
+
+		local headerCells = {}
+		for index, column in ipairs(columns) do
+			local cell = CreateFrame("Frame", nil, header)
+			local label = cell:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+			label:SetPoint("LEFT", cell, "LEFT", 4, 0)
+			label:SetPoint("RIGHT", cell, "RIGHT", -4, 0)
+			label:SetJustifyH(column.justifyH or "LEFT")
+			label:SetText(column.label or "")
+			if label.SetWordWrap then
+				label:SetWordWrap(false)
+			end
+			headerCells[index] = cell
+			cell.Text = label
+		end
+
+		local rows = {}
+
+		local function LayoutCells(parent, cells, availableWidth)
+			local fixedWidth = 0
+			local flexibleColumns = 0
+			for _, column in ipairs(columns) do
+				if column.width then
+					fixedWidth = fixedWidth + column.width
+				else
+					flexibleColumns = flexibleColumns + 1
+				end
+			end
+
+			local totalGap = math.max(0, (#columns - 1) * columnGap)
+			local flexibleWidth = 0
+			if flexibleColumns > 0 then
+				flexibleWidth = math.floor(math.max(1, availableWidth - fixedWidth - totalGap) / flexibleColumns)
+			end
+
+			local xOffset = 0
+			for index, column in ipairs(columns) do
+				local width = column.width or flexibleWidth
+				local cell = cells[index]
+				if cell then
+					cell:ClearAllPoints()
+					cell:SetPoint("TOPLEFT", parent, "TOPLEFT", xOffset, 0)
+					cell:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", xOffset, 0)
+					cell:SetWidth(width)
+				end
+				xOffset = xOffset + width + columnGap
+			end
+		end
+
+		local function EnsureRow(index)
+			if rows[index] then
+				return rows[index]
+			end
+
+			local dataRow = CreateFrame("Button", nil, content)
+			dataRow:SetHeight(rowHeight)
+			dataRow:EnableMouse(true)
+
+			local hover = dataRow:CreateTexture(nil, "BACKGROUND")
+			hover:SetAllPoints(dataRow)
+			hover:SetColorTexture(1, 1, 1, 0.10)
+			hover:Hide()
+			dataRow.Hover = hover
+
+			dataRow:SetScript("OnEnter", function(self)
+				self.Hover:Show()
+			end)
+			dataRow:SetScript("OnLeave", function(self)
+				self.Hover:Hide()
+			end)
+
+			dataRow.Cells = {}
+			for columnIndex, column in ipairs(columns) do
+				local cell = CreateFrame("Frame", nil, dataRow)
+				local text = cell:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+				text:SetPoint("LEFT", cell, "LEFT", 4, 0)
+				text:SetPoint("RIGHT", cell, "RIGHT", -4, 0)
+				text:SetJustifyH(column.justifyH or "LEFT")
+				if text.SetWordWrap then
+					text:SetWordWrap(false)
+				end
+				if text.SetMaxLines then
+					text:SetMaxLines(1)
+				end
+				cell.Text = text
+				dataRow.Cells[columnIndex] = cell
+			end
+
+			rows[index] = dataRow
+			return dataRow
+		end
+
+		local function SetScrollBarShown(show)
+			local scrollBar = scroll.ScrollBar
+			if not scrollBar then return 0 end
+
+			scrollBar:SetShown(show)
+			if not show then
+				scroll:SetVerticalScroll(0)
+				if scrollBar.SetValue then
+					scrollBar:SetValue(0)
+				end
+				if scrollBar.Disable then
+					scrollBar:Disable()
+				end
+				return 0
+			end
+
+			if scrollBar.Enable then
+				scrollBar:Enable()
+			end
+			return scrollBar:GetWidth() or 20
+		end
+
+		local function Refresh()
+			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
+			local dataRows = getRows() or {}
+			local yOffset = 0
+
+			for index, rowData in ipairs(dataRows) do
+				local dataRow = EnsureRow(index)
+				dataRow:ClearAllPoints()
+				dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
+				dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
+				dataRow:SetAlpha(enabled and 1 or 0.45)
+
+				for columnIndex, column in ipairs(columns) do
+					local value = rowData[column.key]
+					dataRow.Cells[columnIndex].Text:SetText(value or "")
+				end
+
+				dataRow:Show()
+				yOffset = yOffset + rowHeight + rowSpacing
+			end
+
+			for index = #dataRows + 1, #rows do
+				rows[index]:Hide()
+			end
+
+			local contentHeight = (#dataRows > 0) and (yOffset - rowSpacing) or 1
+			content:SetHeight(math.max(1, contentHeight))
+			emptyText:SetShown(#dataRows == 0)
+
+			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+			local showScrollbar = contentHeight > visibleHeight
+			local scrollBarWidth = SetScrollBarShown(showScrollbar)
+
+			tableArea:ClearAllPoints()
+			tableArea:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
+			tableArea:SetPoint("TOPRIGHT", container, "TOPRIGHT", -(showScrollbar and (scrollBarWidth + 4) or 0), 0)
+			tableArea:SetHeight(headerHeight)
+
+			local availableWidth = math.max(1, tableArea:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
+			content:SetWidth(availableWidth)
+
+			LayoutCells(header, headerCells, availableWidth)
+			for index = 1, #dataRows do
+				local dataRow = rows[index]
+				if dataRow and dataRow:IsShown() then
+					LayoutCells(dataRow, dataRow.Cells, availableWidth)
+				end
+			end
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+		row:HookScript("OnSizeChanged", Refresh)
+		scroll:HookScript("OnSizeChanged", Refresh)
+	end, { fillHeight = opts.fillHeight })
 end
 
 -- =======================================

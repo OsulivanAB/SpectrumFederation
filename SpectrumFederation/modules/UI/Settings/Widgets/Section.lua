@@ -95,6 +95,7 @@ function SectionMixin:Init(titleOrOptions)
 	self.tooltipText = options.tooltip or ""
 	self._rows = {}
 	self._contentHeight = 0
+	self.__sfAssignedHeight = nil
 
 	-- Header frame
 	local header = CreateFrame("Frame", nil, self)
@@ -244,9 +245,11 @@ end
 -- @param height number Row height in pixels
 -- @param buildFn function|nil Optional builder to populate the row
 -- @return Frame The created row frame
-function SectionMixin:AddRow(height, buildFn)
+function SectionMixin:AddRow(height, buildFn, opts)
 	local row = CreateFrame("Frame", nil, self.Content)
 	row:SetHeight(height)
+	row.__sfBaseHeight = height
+	row.__sfFillHeight = opts and opts.fillHeight and true or false
 
 	table.insert(self._rows, row)
 
@@ -354,38 +357,60 @@ end
 -- Reflow row positions and content height
 -- @return nil
 function SectionMixin:ReflowRows()
-	local contentHeight = 0
-	local prev
+	local visibleRows = {}
+	local fillRows = {}
 
-	-- Postition message (if shown)
 	if self.MessageRow:IsShown() then
-		self.MessageRow:ClearAllPoints()
-		self.MessageRow:SetPoint("TOPLEFT", self.Content, "TOPLEFT", 0, 0)
-		self.MessageRow:SetPoint("TOPRIGHT", self.Content, "TOPRIGHT", 0, 0)
-
-		prev = self.MessageRow
-		contentHeight = contentHeight + (self.MessageRow:GetHeight() or 0)
-	else
-		prev = nil
+		table.insert(visibleRows, self.MessageRow)
 	end
 
-	-- Stack visible rows
 	for _, row in ipairs(self._rows) do
 		row:ClearAllPoints()
-
 		if row:IsShown() then
-			if prev then
-				row:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -ROW_SPACING)
-				row:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -ROW_SPACING)
-				contentHeight = contentHeight + ROW_SPACING + (row:GetHeight() or 0)
-			else
-				-- First visible row: anchor to content top
-				row:SetPoint("TOPLEFT", self.Content, "TOPLEFT", 0, 0)
-				row:SetPoint("TOPRIGHT", self.Content, "TOPRIGHT", 0, 0)
-				contentHeight = contentHeight + (row:GetHeight() or 0)
+			table.insert(visibleRows, row)
+			if row.__sfFillHeight then
+				table.insert(fillRows, row)
 			end
-			prev = row
 		end
+	end
+
+	local baseContentHeight = 0
+	for index, row in ipairs(visibleRows) do
+		if index > 1 then
+			baseContentHeight = baseContentHeight + ROW_SPACING
+		end
+		baseContentHeight = baseContentHeight + (row:GetHeight() or 0)
+	end
+
+	if #fillRows > 0 then
+		local targetContentHeight = nil
+		if self.__sfAssignedHeight then
+			targetContentHeight = math.max(1, self.__sfAssignedHeight - HEADER_HEIGHT - CONTENT_PADDING_TOP - CONTENT_PADDING_BOTTOM)
+		end
+
+		local extra = targetContentHeight and math.max(0, targetContentHeight - baseContentHeight) or 0
+		local extraPerRow = extra / #fillRows
+
+		for _, row in ipairs(fillRows) do
+			local baseHeight = row.__sfBaseHeight or row:GetHeight() or 0
+			row:SetHeight(baseHeight + extraPerRow)
+		end
+	end
+
+	local contentHeight = 0
+	local prev
+	for index, row in ipairs(visibleRows) do
+		if index > 1 then
+			row:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -ROW_SPACING)
+			row:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -ROW_SPACING)
+			contentHeight = contentHeight + ROW_SPACING
+		else
+			row:SetPoint("TOPLEFT", self.Content, "TOPLEFT", 0, 0)
+			row:SetPoint("TOPRIGHT", self.Content, "TOPRIGHT", 0, 0)
+		end
+
+		contentHeight = contentHeight + (row:GetHeight() or 0)
+		prev = row
 	end
 
 	self.Content:SetHeight(math.max(1, contentHeight))
@@ -413,6 +438,29 @@ function SectionMixin:_NotifyPageReflow()
 		pb:Reflow()
 		
 	end
+end
+
+function SectionMixin:SetAssignedHeight(height)
+	local newHeight = tonumber(height)
+	if not newHeight or newHeight <= 0 then
+		return
+	end
+
+	if self.__sfAssignedHeight and math.abs(self.__sfAssignedHeight - newHeight) <= 0.5 then
+		return
+	end
+
+	self.__sfAssignedHeight = newHeight
+	self:ReflowRows()
+end
+
+function SectionMixin:ClearAssignedHeight()
+	if not self.__sfAssignedHeight then
+		return
+	end
+
+	self.__sfAssignedHeight = nil
+	self:ReflowRows()
 end
 
 -- Schedule a deferred reflow to coalesce multiple requests

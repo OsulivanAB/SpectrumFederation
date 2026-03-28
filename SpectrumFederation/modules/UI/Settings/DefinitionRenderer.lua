@@ -64,6 +64,7 @@ function R:Build(panel, pageDef)
 		})
 		sec.__sfPageBuilder = pb
 		sec.__sfAdminPredicate = MakeAdminPredicate(panel, sec, pageDef)
+		sec.__sfFillHeight = secDef.fillHeight and true or false
 
 		local key = SectionKey(secDef)
 		panel.__sfSections[key] = sec
@@ -122,6 +123,9 @@ function R:Build(panel, pageDef)
 					end
 				end
 				controls:AddDropdown(sec, opts)
+
+			elseif t == "inlineControls" then
+				controls:AddInlineControls(sec, item)
 
 			elseif t == "display" then
 				controls:AddDisplay(sec, item)
@@ -203,6 +207,9 @@ function R:Build(panel, pageDef)
 
 			elseif t == "scrollableText" then
 				controls:AddScrollableText(sec, item)
+
+			elseif t == "logTable" then
+				controls:AddLogTable(sec, item)
 			end
 		end
 

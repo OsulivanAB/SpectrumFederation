@@ -78,6 +78,11 @@ local function GetVersionString()
     return "Retail " .. version
 end
 
+local function GetPageLayout(pageId)
+    local page = pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId]
+    return page and page.layout or nil
+end
+
 -- ============================================================
 -- Navigation Item Registry
 -- ============================================================
@@ -220,6 +225,7 @@ function SettingsWindow:GetOrCreatePagePanel(pageId)
     local panel = CreateFrame("Frame", nil, self.contentHost)
     panel:SetAllPoints(self.contentHost)
     panel:Hide()
+    panel.__sfPageLayout = page.layout or {}
     
     -- Build the page UI into this panel (lazy build)
     if type(page.Build) == "function" then
@@ -235,6 +241,18 @@ function SettingsWindow:GetOrCreatePagePanel(pageId)
     return panel
 end
 
+function SettingsWindow:ApplyPageLayout(pageId)
+    if not self.frame then return end
+
+    local layout = GetPageLayout(pageId) or {}
+    local width = layout.windowWidth or C.WIDTH
+    local height = layout.windowHeight or C.HEIGHT
+
+    if math.abs((self.frame:GetWidth() or 0) - width) > 0.5 or math.abs((self.frame:GetHeight() or 0) - height) > 0.5 then
+        self.frame:SetSize(width, height)
+    end
+end
+
 -- Select and display a tab by page ID
 -- @param pageId string The page ID to select
 function SettingsWindow:SelectTab(pageId)
@@ -248,6 +266,8 @@ function SettingsWindow:SelectTab(pageId)
     if self.currentPageId and self.pagePanels[self.currentPageId] then
         self.pagePanels[self.currentPageId]:Hide()
     end
+
+    self:ApplyPageLayout(pageId)
     
     -- Get or create the new page panel
     local panel = self:GetOrCreatePagePanel(pageId)
