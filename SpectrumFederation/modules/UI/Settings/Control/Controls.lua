@@ -179,6 +179,17 @@ local function RegisterRefresh(section, fn)
 	end
 end
 
+local function EnsureCheckboxRowHeight(section, row, checkbox)
+	if not row or not checkbox then return end
+
+	local checkboxHeight = checkbox:GetHeight() or 0
+	local minHeight = math.max(row:GetHeight() or 0, checkboxHeight + 2)
+	if minHeight > (row:GetHeight() or 0) then
+		row:SetHeight(minHeight)
+		RequestSectionReflow(section)
+	end
+end
+
 -- ---------------------------------------
 -- Button Row (two buttons)
 -- ---------------------------------------
@@ -278,6 +289,8 @@ function Controls:AddCheckboxRow(section, opts)
 				end
 			end)
 
+			EnsureCheckboxRowHeight(section, row, cb)
+
 			checkboxes[idx] = cb
 			return cb
 		end
@@ -372,6 +385,8 @@ function Controls:AddCheckbox(section, opts)
 			set(selfBtn:GetChecked() and true or false)
 		end)
 
+		EnsureCheckboxRowHeight(section, row, cb)
+
 		local function Refresh()
 			cb:SetChecked(get() and true or false)
 			self:_ApplyRowState(row, section, opts, {cb})
@@ -441,6 +456,8 @@ function Controls:AddCheckboxGrid(section, opts)
 					def.set(selfBtn:GetChecked() and true or false)
 				end
 			end)
+
+			EnsureCheckboxRowHeight(section, row, cb)
 
 			checkboxes[#checkboxes + 1] = cb
 			return cb

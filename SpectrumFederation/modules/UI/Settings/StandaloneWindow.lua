@@ -10,8 +10,8 @@ local addonName, SF = ...
 local C = {
     -- Frame
     FRAME_NAME = "SF_SettingsWindow",
-    WIDTH = 860,
-    HEIGHT = 540,
+    WIDTH = 900,
+    HEIGHT = 900,
     
     -- Layout
     NAV_WIDTH = 180,

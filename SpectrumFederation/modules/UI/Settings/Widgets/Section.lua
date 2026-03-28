@@ -119,7 +119,7 @@ function SectionMixin:Init(titleOrOptions)
 	local infoButton = CreateFrame("Button", nil, titleContainer)
 	self.HeaderInfoButton = infoButton
 	infoButton:SetSize(INFO_BUTTON_SIZE, INFO_BUTTON_SIZE)
-	infoButton:SetPoint("TOPLEFT", label, "TOPRIGHT", INFO_BUTTON_GAP, INFO_BUTTON_OFFSET_Y)
+	infoButton:SetPoint("LEFT", label, "RIGHT", INFO_BUTTON_GAP, INFO_BUTTON_OFFSET_Y)
 	infoButton:SetHitRectInsets(-4, -4, -4, -4)
 	infoButton:Hide()
 
@@ -199,15 +199,26 @@ function SectionMixin:_UpdateHeaderLayout()
 	local titleWidth = math.max(1, self.HeaderLabel:GetStringWidth() or 0)
 	local hasTooltip = self.tooltipText and self.tooltipText ~= ""
 	local buttonWidth = 0
+	local rightAnchor = self.HeaderLabel
 
 	if hasTooltip then
 		self.HeaderInfoButton:Show()
 		buttonWidth = INFO_BUTTON_SIZE + INFO_BUTTON_GAP
+		rightAnchor = self.HeaderInfoButton
 	else
 		self.HeaderInfoButton:Hide()
 	end
 
 	self.HeaderTitleContainer:SetWidth(titleWidth + buttonWidth)
+
+	self.LeftLine:ClearAllPoints()
+	self.LeftLine:SetPoint("LEFT", self.Header, "LEFT", 0, 0)
+	self.LeftLine:SetPoint("RIGHT", self.HeaderLabel, "LEFT", -TITLE_GAP, 0)
+
+	self.RightLine:ClearAllPoints()
+	self.RightLine:SetPoint("LEFT", rightAnchor, "RIGHT", TITLE_GAP, 0)
+	self.RightLine:SetPoint("RIGHT", self.Header, "RIGHT", 0, 0)
+
 	SetTooltipHandlers(self.HeaderInfoButton, self.title, self.tooltipText)
 end
 
