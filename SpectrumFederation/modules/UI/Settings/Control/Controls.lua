@@ -13,6 +13,7 @@ local R = Style.Row or {}
 local LABEL_WIDTH   = R.labelWidth or 220
 local GUTTER        = R.gutter or 16
 local CONTROL_WIDTH = R.controlWidth or 240
+local ADMIN_ONLY_SUFFIX = "|cffff4040(Admin Only)|r"
 
 -- Evaluate a value or thunk to a boolean with default
 -- @param v any Boolean, function returning boolean, or nil
@@ -49,6 +50,49 @@ local function RequestSectionReflow(section)
 	end
 end
 
+local function IsAdminForSection(section)
+	local predicate = section and section.__sfAdminPredicate
+	if type(predicate) ~= "function" then
+		return true
+	end
+
+	local ok, result = pcall(predicate)
+	if not ok then
+		return true
+	end
+
+	return result and true or false
+end
+
+local function EvalEnabled(section, opts)
+	opts = opts or {}
+	local enabled = EvalBool(opts.enabled, true)
+	if opts.adminOnly then
+		enabled = enabled and IsAdminForSection(section)
+	end
+	return enabled
+end
+
+local function FormatTooltipTitle(title, adminOnly)
+	title = title or ""
+	if not adminOnly then
+		return title
+	end
+	if title ~= "" then
+		return string.format("%s %s", title, ADMIN_ONLY_SUFFIX)
+	end
+	return ADMIN_ONLY_SUFFIX
+end
+
+local function HasAdminOnlyItems(items)
+	for _, item in ipairs(items or {}) do
+		if type(item) == "table" and item.adminOnly then
+			return true
+		end
+	end
+	return false
+end
+
 -- Apply visibility/enabled state to a row and its widgets
 -- @param row Frame Row frame to update
 -- @param section table Section containing the row
@@ -58,7 +102,7 @@ end
 function Controls:_ApplyRowState(row, section, opts, widgets)
 	opts = opts or {}
 	local visible = EvalBool(opts.visible, true)
-	local enabled = EvalBool(opts.enabled, true)
+	local enabled = EvalEnabled(section, opts)
 
 	local wasShown = row:IsShown()
 	if visible ~= wasShown then
@@ -152,13 +196,13 @@ end
 -- @param title string|nil Tooltip title
 -- @param text string|nil Tooltip body text
 -- @return nil
-local function AttachTooltip(region, title, text)
+local function AttachTooltip(region, title, text, adminOnly)
 	if not text or text == "" then return end
 	region:EnableMouse(true)
 
 	region:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		GameTooltip:SetText(title or "", 1, 1, 1)
+		GameTooltip:SetText(FormatTooltipTitle(title, adminOnly), 1, 1, 1)
 		GameTooltip:AddLine(text, nil, nil, nil, true)
 		GameTooltip:Show()
 	end)
@@ -197,6 +241,11 @@ function Controls:AddButtonRow(section, opts)
 	return section:AddRow(26, function(row)
 		local btns = {}
 		local defs = {}
+		local rowOpts = opts
+		if not opts.adminOnly and HasAdminOnlyItems(opts) then
+			rowOpts = CopyTable(opts)
+			rowOpts.adminOnly = true
+		end
 		for i = 1, 2 do
 			local def = opts[i]
 			if def then
@@ -229,7 +278,7 @@ function Controls:AddButtonRow(section, opts)
 		end
 
 		local function Refresh()
-			local enabled = EvalBool(opts.enabled, true)
+			local _, enabled = self:_ApplyRowState(row, section, rowOpts, nil)
 			for idx, b in ipairs(btns) do
 				if b.SetEnabled then b:SetEnabled(enabled) end
 				b:SetAlpha(enabled and 1 or 0.45)
@@ -238,7 +287,6 @@ function Controls:AddButtonRow(section, opts)
 					b:ApplyText()
 				end
 			end
-			self:_ApplyRowState(row, section, opts, btns)
 		end
 
 		Refresh()
@@ -256,6 +304,11 @@ end
 function Controls:AddCheckboxRow(section, opts)
 	local items = opts.items or {}
 	local spacing = opts.spacing or 140
+	local rowOpts = opts
+	if not opts.adminOnly and HasAdminOnlyItems(items) then
+		rowOpts = CopyTable(opts)
+		rowOpts.adminOnly = true
+	end
 
 	return section:AddRow(opts.height or 26, function(row)
 		local checkboxes = {}
@@ -279,7 +332,7 @@ function Controls:AddCheckboxRow(section, opts)
 			label:SetText(def.label or "")
 
 			if def.tooltip then
-				AttachTooltip(label, def.label, def.tooltip)
+				AttachTooltip(label, def.label, def.tooltip, def.adminOnly or rowOpts.adminOnly)
 			end
 
 			cb:SetScript("OnClick", function(selfBtn)
@@ -306,7 +359,7 @@ function Controls:AddCheckboxRow(section, opts)
 					cb:SetChecked(def.get() and true or false)
 				end
 			end
-			Controls:_ApplyRowState(row, section, opts, checkboxes)
+			Controls:_ApplyRowState(row, section, rowOpts, checkboxes)
 		end
 
 		Refresh()
@@ -355,7 +408,7 @@ function Controls:InitRow(row, opts)
 	control:SetPoint("TOP", row, "TOP", 0, 0)
 	control:SetPoint("BOTTOM", row, "BOTTOM", 0, 0)
 
-	AttachTooltip(row, opts.label, opts.tooltip)
+	AttachTooltip(row, opts.label, opts.tooltip, opts.adminOnly)
 	return label, control
 end
 
@@ -413,6 +466,11 @@ end
 -- @return Frame The created row
 function Controls:AddCheckboxGrid(section, opts)
 	local items = opts.items or {}
+	local rowOpts = opts
+	if not opts.adminOnly and HasAdminOnlyItems(items) then
+		rowOpts = CopyTable(opts)
+		rowOpts.adminOnly = true
+	end
 
 	return section:AddRow(opts.height or 26, function(row)
 		local cells = {}
@@ -447,7 +505,7 @@ function Controls:AddCheckboxGrid(section, opts)
 			label:SetText(def.label or "")
 
 			if def.tooltip then
-				AttachTooltip(cell, def.label, def.tooltip)
+				AttachTooltip(cell, def.label, def.tooltip, def.adminOnly or rowOpts.adminOnly)
 			end
 
 			cb:SetScript("OnClick", function(selfBtn)
@@ -473,7 +531,7 @@ function Controls:AddCheckboxGrid(section, opts)
 			if cb2 and items[2] and items[2].get then
 				cb2:SetChecked(items[2].get() and true or false)
 			end
-			self:_ApplyRowState(row, section, opts, checkboxes)
+			self:_ApplyRowState(row, section, rowOpts, checkboxes)
 		end
 
 		Refresh()
@@ -821,8 +879,9 @@ function Controls:AddDropdownWithIconButton(section, opts)
 		local iconBtn = CreateIconButton(control, opts.iconAtlas or "common-icon-trash", iconSize)
 		iconBtn:SetPoint("LEFT", dropdown, "RIGHT", gap, 0)
 
-		if opts.iconTooltip then
-			AttachTooltip(iconBtn, opts.label or "", opts.iconTooltip)
+		local iconTooltip = opts.iconTooltip or opts.iconToolTip
+		if iconTooltip then
+			AttachTooltip(iconBtn, opts.label or "", iconTooltip, opts.adminOnly)
 		end
 
 		local function GetOptions()
@@ -1037,7 +1096,7 @@ function Controls:AddScrollList(section, opts)
 			if row.__sfScrollListRefreshing then return end
 			row.__sfScrollListRefreshing = true
 
-			self:_ApplyRowState(row, section, opts, nil)
+			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
 
 			local items = getItems() or {}
 
@@ -1055,14 +1114,20 @@ function Controls:AddScrollList(section, opts)
 
 				local canRemove = item.canRemove and true or false
 				r.Remove:SetShown(canRemove)
+				r:SetAlpha(enabled and 1 or 0.45)
 
 				if canRemove then
+					local removeEnabled = enabled
+					r.Remove:EnableMouse(true)
+					r.Remove:SetAlpha(removeEnabled and 1 or 0.45)
 					r.Remove:SetScript("OnClick", function()
+						if not removeEnabled then return end
 						if opts.onRemove then
 							opts.onRemove(item)
 						end
 					end)
 				else
+					r.Remove:SetAlpha(0.45)
 					r.Remove:SetScript("OnClick", nil)
 				end
 
@@ -1162,7 +1227,7 @@ function Controls:AddHelpText(section, opts)
 		fs:SetText(opts.text or "")
 
 		local function Refresh()
-			self:_ApplyRowState(row, section, opts)
+			self:_ApplyRowState(row, section, opts, {editBox, scrollFrame})
 		end
 
 		Refresh()

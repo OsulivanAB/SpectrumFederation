@@ -93,12 +93,13 @@ local function GetProfileOptions(store)
 	return {}
 end
 
--- Check whether admin tools should be visible (placeholder true)
+-- Check whether admin tools should be visible
 -- @param ctx table Context table
--- @return boolean Always true until real check added
+-- @return boolean True when a profile exists or is active
 local function CanShowAdminTools(ctx)
-	-- TODO: Call profiles API function to ask if current user is admin
-	return true
+	local store = (type(ctx) == "table" and ctx.store) or SF.SettingsStore
+	if not store then return false end
+	return GetActiveProfileObject(store) ~= nil or GetActiveProfileId(store) ~= nil
 end
 
 -- Check if a session is currently active
@@ -299,6 +300,9 @@ function Page:Build(panel)
 	end
 
 	local def = {
+		isAdmin = function()
+			return IsAdmin()
+		end,
 		sections = {
 			-- ==========================================================
 			-- 1) General Settings (User-Level Settings)
@@ -316,6 +320,24 @@ function Page:Build(panel)
 					},
 					{
 						type = "checkbox",
+						label = "Lock Loot Window",
+						tooltip = "When enabled, the Loot Helper window cannot be moved or resized.",
+						path = "lootHelper.lockLootWindow",
+					},
+					{
+						type = "checkbox",
+						label = "Show Members not in raid",
+						tooltip = "When disabled, profile members who are not currently in your raid will be hidden in the Loot Helper window.",
+						path = "lootHelper.showMembersNotInRaid",
+					},
+					{
+						type = "checkbox",
+						label = "Show Loot Window outside of Raid",
+						tooltip = "When enabled, the Loot Helper window may appear even if you are not in a raid.",
+						path = "lootHelper.showWindowOutsideRaid",
+					},
+					{
+						type = "checkbox",
 						label = "Enable Local Safemode",
 						tooltip = "Local-only safemode. Independent from raid-wide safemode.",
 						path = "lootHelper.localSafeMode",
@@ -328,35 +350,6 @@ function Page:Build(panel)
 					},
 					
 					{ type = "spacer", height = 10 },
-
-					{
-						type = "editboxButton",
-						label = "Create Profile",
-						hint = "Profile name",
-						buttonText = "Create",
-						buttonWidth = 90,
-						editWidth = 170,
-						tooltip = "Creates a new profile. Will automatically set it to active.",
-
-						onSubmit = function(ctx, text, editBox)
-							ctx.section:ClearMessage()
-
-							if type(ctx.store.CreateLootHelperProfile) ~= "function" then
-								ctx.section:SetMessage("CreateLootHelperProfile() not implemented", "error")
-								return
-							end
-
-							local ok, err = ctx.store:CreateLootHelperProfile(text)
-							if not ok then
-								ctx.section:SetMessage(err or "Failed to create profile", "error")
-								return
-							end
-
-							editBox:SetText("")
-							ctx.section:SetMessage("Profile created.", "success")
-							ctx.pageBuilder:Refresh()
-						end,
-					},
 
 					{
 						type = "button",
@@ -393,24 +386,6 @@ function Page:Build(panel)
 								end
 							)
 						end,
-					},
-					{
-						type = "checkbox",
-						label = "Show Loot Window outside of Raid",
-						tooltip = "When enabled, the Loot Helper window may appear even if you are not in a raid.",
-						path = "lootHelper.showWindowOutsideRaid",
-					},
-					{
-						type = "checkbox",
-						label = "Lock Loot Window",
-						tooltip = "When enabled, the Loot Helper window cannot be moved or resized.",
-						path = "lootHelper.lockLootWindow",
-					},
-					{
-						type = "checkbox",
-						label = "Show Members not in raid",
-						tooltip = "When disabled, profile members who are not currently in your raid will be hidden in the Loot Helper window.",
-						path = "lootHelper.showMembersNotInRaid",
 					},
 				},
 			},
@@ -572,6 +547,7 @@ function Page:Build(panel)
 					{
 						type = "scrollList",
 						label = "Admins",
+						adminOnly = true,
 						height = 160,
 						rowHeight = 20,
 						removeAtlas = "common-icon-redx",
@@ -599,8 +575,39 @@ function Page:Build(panel)
 					},
 
 					{
+						type = "editboxButton",
+						label = "Create Profile",
+						adminOnly = true,
+						hint = "Profile name",
+						buttonText = "Create",
+						buttonWidth = 90,
+						editWidth = 170,
+						tooltip = "Creates a new profile. Will automatically set it to active.",
+
+						onSubmit = function(ctx, text, editBox)
+							ctx.section:ClearMessage()
+
+							if type(ctx.store.CreateLootHelperProfile) ~= "function" then
+								ctx.section:SetMessage("CreateLootHelperProfile() not implemented", "error")
+								return
+							end
+
+							local ok, err = ctx.store:CreateLootHelperProfile(text)
+							if not ok then
+								ctx.section:SetMessage(err or "Failed to create profile", "error")
+								return
+							end
+
+							editBox:SetText("")
+							ctx.section:SetMessage("Profile created.", "success")
+							ctx.pageBuilder:Refresh()
+						end,
+					},
+
+					{
 						type = "dropdownIconButton",
 						label = "Add Admin",
+						adminOnly = true,
 						defaultText = "Select member",
 						options = function()
 							return BuildMemberOptions()
@@ -668,6 +675,7 @@ function Page:Build(panel)
 					{
 						type = "editbox",
 						label = "Point Name",
+						adminOnly = true,
 						tooltip = "Editable per profile. Default is 'Points'.",
 						enabled = function()
 							return ProfileActionsEnabled()
@@ -693,6 +701,7 @@ function Page:Build(panel)
 					{
 						type = "button",
 						label = "Rename Profile",
+						adminOnly = true,
 						buttonText = "Rename",
 						width = 120,
 						enabled = function()
@@ -732,6 +741,7 @@ function Page:Build(panel)
 					{
 						type = "button",
 						label = "Trigger Raid-Wide Sync",
+						adminOnly = true,
 						buttonText = "Sync",
 						width = 120,
 						enabled = function()
@@ -745,6 +755,7 @@ function Page:Build(panel)
 					{
 						type = "button",
 						label = "Session Control",
+						adminOnly = true,
 						buttonText = function()
 							-- Dynamic button text based on session state
 							if IsSessionActive() then
@@ -800,6 +811,7 @@ function Page:Build(panel)
 					{ type = "text", text = "Enable Raid Wide Safe Mode" },
 					{
 						type = "checkboxGrid",
+						adminOnly = true,
 						enabled = function() return ProfileActionsEnabled() end,
 						items = {
 							{
@@ -841,7 +853,8 @@ function Page:Build(panel)
 						{ type = "text", text = "Raid Checks..." },
 						{
 							type = "buttonRow",
-							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							adminOnly = true,
+							enabled = function() return ProfileActionsEnabled() end,
 							{
 								text = "Pre-Raid Check",
 								width = 180,
@@ -871,7 +884,8 @@ function Page:Build(panel)
 						{ type = "text", text = "Enable Whispers During..." },
 						{
 							type = "checkboxGrid",
-							enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+							adminOnly = true,
+							enabled = function() return ProfileActionsEnabled() end,
 							items = {
 								{
 									label = "Pre-Raid Check",
@@ -901,7 +915,8 @@ function Page:Build(panel)
 							{ type = "text", text = "Enchants to look for" },
 							{
 								type = "checkboxGrid",
-								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+								adminOnly = true,
+								enabled = function() return ProfileActionsEnabled() end,
 								items = {
 									{ label = "Head", get = function() return IsRaidCheckSlotEnabled("head") end, set = function(v) SetRaidCheckSlot("head", v) end },
 									{ label = "Gloves", get = function() return IsRaidCheckSlotEnabled("hands") end, set = function(v) SetRaidCheckSlot("hands", v) end },
@@ -909,7 +924,8 @@ function Page:Build(panel)
 							},
 							{
 								type = "checkboxGrid",
-								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+								adminOnly = true,
+								enabled = function() return ProfileActionsEnabled() end,
 								items = {
 									{ label = "Neck", get = function() return IsRaidCheckSlotEnabled("neck") end, set = function(v) SetRaidCheckSlot("neck", v) end },
 									{ label = "Belt", get = function() return IsRaidCheckSlotEnabled("belt") end, set = function(v) SetRaidCheckSlot("belt", v) end },
@@ -917,7 +933,8 @@ function Page:Build(panel)
 							},
 							{
 								type = "checkboxGrid",
-								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+								adminOnly = true,
+								enabled = function() return ProfileActionsEnabled() end,
 								items = {
 									{ label = "Shoulders", get = function() return IsRaidCheckSlotEnabled("shoulders") end, set = function(v) SetRaidCheckSlot("shoulders", v) end },
 									{ label = "Legs", get = function() return IsRaidCheckSlotEnabled("legs") end, set = function(v) SetRaidCheckSlot("legs", v) end },
@@ -925,7 +942,8 @@ function Page:Build(panel)
 							},
 							{
 								type = "checkboxGrid",
-								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+								adminOnly = true,
+								enabled = function() return ProfileActionsEnabled() end,
 								items = {
 									{ label = "Back", get = function() return IsRaidCheckSlotEnabled("back") end, set = function(v) SetRaidCheckSlot("back", v) end },
 									{ label = "Boots", get = function() return IsRaidCheckSlotEnabled("boots") end, set = function(v) SetRaidCheckSlot("boots", v) end },
@@ -933,7 +951,8 @@ function Page:Build(panel)
 							},
 							{
 								type = "checkboxGrid",
-								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+								adminOnly = true,
+								enabled = function() return ProfileActionsEnabled() end,
 								items = {
 									{ label = "Chest", get = function() return IsRaidCheckSlotEnabled("chest") end, set = function(v) SetRaidCheckSlot("chest", v) end },
 									{ label = "Rings", get = function() return IsRaidCheckSlotEnabled("rings") end, set = function(v) SetRaidCheckSlot("rings", v) end },
@@ -941,7 +960,8 @@ function Page:Build(panel)
 							},
 							{
 								type = "checkboxGrid",
-								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+								adminOnly = true,
+								enabled = function() return ProfileActionsEnabled() end,
 								items = {
 									{ label = "Wrist", get = function() return IsRaidCheckSlotEnabled("wrist") end, set = function(v) SetRaidCheckSlot("wrist", v) end },
 									{ label = "Trinkets", get = function() return IsRaidCheckSlotEnabled("trinkets") end, set = function(v) SetRaidCheckSlot("trinkets", v) end },
@@ -949,7 +969,8 @@ function Page:Build(panel)
 							},
 							{
 								type = "checkboxGrid",
-								enabled = function() return ProfileActionsEnabled() and IsAdmin() end,
+								adminOnly = true,
+								enabled = function() return ProfileActionsEnabled() end,
 								items = {
 									{ label = "Weapon", get = function() return IsRaidCheckSlotEnabled("weapon") end, set = function(v) SetRaidCheckSlot("weapon", v) end },
 									{ label = "Off Hand", get = function() return IsRaidCheckSlotEnabled("offHand") end, set = function(v) SetRaidCheckSlot("offHand", v) end },

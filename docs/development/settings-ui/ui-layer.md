@@ -227,6 +227,7 @@ DefinitionRenderer:Render(parent, controlDefinitions)
     label = "Enable Feature",    -- Display label
     path = "global.enabled",     -- Store path for auto-binding
     tooltip = "Enables the feature",
+    adminOnly = true,             -- Optional UI-only admin gating
     help = "Additional help text",
     
     -- OR custom binding
@@ -238,6 +239,8 @@ DefinitionRenderer:Render(parent, controlDefinitions)
     enabled = function() return CanChange() end
 }
 ```
+
+Section `condition` controls section visibility. Use item-level `adminOnly = true` when a setting should remain visible to all users but become greyed out and non-interactable for non-admins.
 
 ### State Binding
 

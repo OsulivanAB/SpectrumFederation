@@ -29,6 +29,16 @@ local function MakeCtx(panel, section)
 	}
 end
 
+local function MakeAdminPredicate(panel, section, pageDef)
+	if type(pageDef.isAdmin) ~= "function" then
+		return nil
+	end
+
+	return function()
+		return pageDef.isAdmin(MakeCtx(panel, section))
+	end
+end
+
 -- Build a settings page from definition and populate with controls
 -- @param panel Frame The panel frame to build into
 -- @param pageDef table Page definition with sections and items
@@ -53,6 +63,7 @@ function R:Build(panel, pageDef)
 			tooltip = secDef.tooltip,
 		})
 		sec.__sfPageBuilder = pb
+		sec.__sfAdminPredicate = MakeAdminPredicate(panel, sec, pageDef)
 
 		local key = SectionKey(secDef)
 		panel.__sfSections[key] = sec
