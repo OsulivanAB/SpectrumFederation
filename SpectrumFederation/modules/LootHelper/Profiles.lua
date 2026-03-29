@@ -42,6 +42,8 @@ local RAID_CHECK_SLOT_DEFAULTS = {
 local RAID_CHECK_DEFAULTS = {
 	enableWhispersPreRaid = false,
 	enableWhispersRaid = false,
+    checkGemsInSockets = true,
+    requireMetaGem = false,
 	slots = RAID_CHECK_SLOT_DEFAULTS,
 }
 
@@ -49,6 +51,8 @@ local function CopyRaidCheckDefaults()
 	return {
 		enableWhispersPreRaid = RAID_CHECK_DEFAULTS.enableWhispersPreRaid,
 		enableWhispersRaid = RAID_CHECK_DEFAULTS.enableWhispersRaid,
+        checkGemsInSockets = RAID_CHECK_DEFAULTS.checkGemsInSockets,
+        requireMetaGem = RAID_CHECK_DEFAULTS.requireMetaGem,
 		slots = CopyTableShallow(RAID_CHECK_DEFAULTS.slots),
 	}
 end
@@ -87,6 +91,8 @@ function LootProfile:_EnsureRaidCheckConfig()
 
 	cfg.enableWhispersPreRaid = cfg.enableWhispersPreRaid and true or false
 	cfg.enableWhispersRaid = cfg.enableWhispersRaid and true or false
+    cfg.checkGemsInSockets = cfg.checkGemsInSockets ~= false
+    cfg.requireMetaGem = cfg.requireMetaGem and true or false
 end
 
 local function CopyArray(arr)
@@ -476,6 +482,8 @@ function LootProfile:GetRaidCheckConfig()
 	return {
 		enableWhispersPreRaid = self._raidCheckConfig.enableWhispersPreRaid and true or false,
 		enableWhispersRaid = self._raidCheckConfig.enableWhispersRaid and true or false,
+        checkGemsInSockets = self._raidCheckConfig.checkGemsInSockets ~= false,
+        requireMetaGem = self._raidCheckConfig.requireMetaGem and true or false,
 		slots = CopyTableShallow(self._raidCheckConfig.slots),
 	}
 end
@@ -534,6 +542,34 @@ function LootProfile:SetRaidCheckWhispers(mode, enabled)
 	end
 
 	return true, nil
+end
+
+-- Function toggle gem socket validation during Raid Check
+-- @param boolean enabled
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetRaidCheckGemSocketsEnabled(enabled)
+    self:_EnsureRaidCheckConfig()
+    if not self:IsCurrentUserAdmin() then
+        return false, "You must be an admin to change Raid Check settings."
+    end
+
+    self._raidCheckConfig.checkGemsInSockets = enabled and true or false
+    return true, nil
+end
+
+-- Function toggle meta gem requirement during Raid Check
+-- @param boolean enabled
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetRaidCheckMetaGemRequired(enabled)
+    self:_EnsureRaidCheckConfig()
+    if not self:IsCurrentUserAdmin() then
+        return false, "You must be an admin to change Raid Check settings."
+    end
+
+    self._raidCheckConfig.requireMetaGem = enabled and true or false
+    return true, nil
 end
 
 -- Function Get list of admin member IDs
@@ -1161,6 +1197,12 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		if snapshot.raidCheck.enableWhispersRaid ~= nil then
 			self._raidCheckConfig.enableWhispersRaid = snapshot.raidCheck.enableWhispersRaid and true or false
 		end
+        if snapshot.raidCheck.checkGemsInSockets ~= nil then
+            self._raidCheckConfig.checkGemsInSockets = snapshot.raidCheck.checkGemsInSockets and true or false
+        end
+        if snapshot.raidCheck.requireMetaGem ~= nil then
+            self._raidCheckConfig.requireMetaGem = snapshot.raidCheck.requireMetaGem and true or false
+        end
 		if type(snapshot.raidCheck.slots) == "table" then
 			for slotKey, enabled in pairs(snapshot.raidCheck.slots) do
 				local normalizedSlotKey = NormalizeSlotKey(slotKey)

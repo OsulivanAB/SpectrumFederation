@@ -2,12 +2,14 @@
 local addonName, SF = ...
 
 -- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
--- luacheck: globals GetInventoryItemLink GetItemInfoInstant GetItemStats GetItemGem GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName C_Item
+-- luacheck: globals GetInventoryItemLink GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName C_Item
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
 
 local RAID_CHECK_REASON = "RAID_CHECK"
+local META_GEM_QUALITY = 4
+local MAX_GEM_SOCKETS_TO_SCAN = 8
 local SLOT_DEFS = {
 	head = { label = "Head", slots = { INVSLOT_HEAD } },
 	neck = { label = "Neck", slots = { INVSLOT_NECK } },
@@ -130,6 +132,48 @@ local function HasMissingGems(link)
 	return filled < sockets
 end
 
+local function IsEpicQualityLink(link)
+	if type(link) ~= "string" then return false end
+	local colorCode = link:match("|c(%x%x%x%x%x%x%x%x)|H")
+	return colorCode ~= nil and colorCode:lower() == "ffa335ee"
+end
+
+local function IsMetaGemSocketed(gemName, gemLink)
+	if IsEpicQualityLink(gemLink) or IsEpicQualityLink(gemName) then
+		return true
+	end
+
+	if GetItemInfo and (gemLink or gemName) then
+		local _, itemLink, quality = GetItemInfo(gemLink or gemName)
+		if quality == META_GEM_QUALITY then
+			return true
+		end
+		if IsEpicQualityLink(itemLink) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function HasEquippedMetaGem(unit)
+	for _, slotDef in pairs(SLOT_DEFS) do
+		for idx = 1, #slotDef.slots do
+			local link = GetInventoryItemLink(unit, slotDef.slots[idx])
+			if type(link) == "string" then
+				for gemIndex = 1, MAX_GEM_SOCKETS_TO_SCAN do
+					local gemName, gemLink = GetItemGem(link, gemIndex)
+					if IsMetaGemSocketed(gemName, gemLink) then
+						return true
+					end
+				end
+			end
+		end
+	end
+
+	return false
+end
+
 local function IsTwoHandWeapon(link)
 	if type(link) ~= "string" then return false end
 	return GetItemEquipLocation(link) == "INVTYPE_2HWEAPON"
@@ -245,7 +289,7 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 		table.insert(missing, label .. " Enchant")
 	end
 
-	if HasMissingGems(link) then
+	if cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
 		table.insert(missing, label .. " Gem")
 	end
 
@@ -263,6 +307,10 @@ local function EvaluateUnit(unit, cfg)
 				table.insert(missing, m)
 			end
 		end
+	end
+
+	if cfg and cfg.requireMetaGem and not HasEquippedMetaGem(unit) then
+		table.insert(missing, "Meta Gem")
 	end
 
 	return missing

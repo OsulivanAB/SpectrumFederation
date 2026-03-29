@@ -135,10 +135,40 @@ local function IsRaidCheckSlotEnabled(slotKey)
 	return false
 end
 
+local function IsRaidCheckGemSocketsEnabled()
+	local cfg = GetRaidCheckConfig()
+	if cfg ~= nil then
+		return cfg.checkGemsInSockets ~= false
+	end
+	return true
+end
+
+local function IsRaidCheckMetaGemRequired()
+	local cfg = GetRaidCheckConfig()
+	if cfg ~= nil then
+		return cfg.requireMetaGem and true or false
+	end
+	return false
+end
+
 local function SetRaidCheckSlot(slotKey, value)
 	local profile = GetActiveProfileObject(SF.SettingsStore)
 	if profile and profile.SetRaidCheckSlotEnabled then
 		profile:SetRaidCheckSlotEnabled(slotKey, value and true or false)
+	end
+end
+
+local function SetRaidCheckGemSockets(value)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckGemSocketsEnabled then
+		profile:SetRaidCheckGemSocketsEnabled(value and true or false)
+	end
+end
+
+local function SetRaidCheckMetaGemRequired(value)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckMetaGemRequired then
+		profile:SetRaidCheckMetaGemRequired(value and true or false)
 	end
 end
 
@@ -491,6 +521,7 @@ function Page:Build(panel)
 						adminOnly = true,
 						buttonText = "Rename",
 						width = 120,
+						tooltip = "Rename the active Loot Helper profile for everyone using it.",
 						enabled = function()
 							return ProfileActionsEnabled()
 						end,
@@ -556,8 +587,9 @@ function Page:Build(panel)
 						label = "Manually Sync My Data",
 						buttonText = "Sync",
 						width = 120,
+						tooltip = "Send your current Loot Helper data to the active session. Requires an active Loot Helper session.",
 						enabled = function()
-							return ProfileActionsEnabled()
+							return ProfileActionsEnabled() and IsSessionActive()
 						end,
 						onClick = function(ctx)
 							-- TODO: Trigger a manual sync of current user's data
@@ -570,7 +602,7 @@ function Page:Build(panel)
 						label = "Reset Current Profile",
 						buttonText = "Reset",
 						width = 120,
-						-- TODO: Add tooltip
+						tooltip = "Reset the active Loot Helper profile back to its default settings.",
 						enabled = function()
 							return ProfileActionsEnabled()
 						end,
@@ -601,6 +633,26 @@ function Page:Build(panel)
 
 					{ type = "spacer", height = 12 },
 					{ type = "heading", text = "Raid Check Profile Settings" },
+					{ type = "text", text = "Requirements to look for" },
+					{
+						type = "checkboxGrid",
+						adminOnly = true,
+						enabled = function() return ProfileActionsEnabled() end,
+						items = {
+							{
+								label = "Gem in Sockets",
+								tooltip = "When enabled, raid checks require equipped items with gem sockets to have gems inserted.",
+								get = function() return IsRaidCheckGemSocketsEnabled() end,
+								set = function(v) SetRaidCheckGemSockets(v) end,
+							},
+							{
+								label = "At Least One Meta Gem",
+								tooltip = "When enabled, raid checks require at least one purple-quality meta gem to be socketed in any equipped item.",
+								get = function() return IsRaidCheckMetaGemRequired() end,
+								set = function(v) SetRaidCheckMetaGemRequired(v) end,
+							},
+						},
+					},
 					{ type = "text", text = "Enchants to look for" },
 					{
 						type = "checkboxGrid",
