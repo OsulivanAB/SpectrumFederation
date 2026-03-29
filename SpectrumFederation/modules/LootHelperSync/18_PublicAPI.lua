@@ -146,6 +146,77 @@ function Sync:GetHelpers()
     return self.state.helpers or {}
 end
 
+-- Function Request a fresh member sync check with the current session coordinator.
+-- Reuses the normal join-status comparison flow so profile snapshots and missing logs
+-- are requested only when needed, and can also report that data is already in sync.
+-- @param reason string|nil Human-readable reason for the request.
+-- @return boolean success, string statusOrReason
+function Sync:RequestManualSync(reason)
+    if not self:IsSessionActive() then
+        return false, "no active session"
+    end
+
+    if type(self.state.coordinator) ~= "string" or self.state.coordinator == "" then
+        return false, "no coordinator"
+    end
+
+    if self.state.isCoordinator then
+        return false, "is coordinator"
+    end
+
+    local profileId = self.state.profileId
+    if type(profileId) ~= "string" or profileId == "" then
+        return false, "no profile"
+    end
+
+    local outcome = "already_synced"
+    local profile = self:FindLocalProfileById(profileId)
+
+    if not profile then
+        if self.state._profileReqInFlight == self.state.sessionId then
+            outcome = "profile_sync_in_progress"
+        else
+            outcome = "profile_sync_requested"
+        end
+    else
+        local localContig = self:ComputeContigAuthorMax(profileId)
+        local remoteAuthorMax = self.state.authorMax or {}
+        local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax) or {}
+
+        if #missing > 0 then
+            local hasNewRequests = false
+            for _, range in ipairs(missing) do
+                if type(range) == "table" then
+                    local author = range.author
+                    local fromCounter = range.fromCounter
+                    local toCounter = range.toCounter
+                    if type(author) == "string"
+                        and type(fromCounter) == "number"
+                        and type(toCounter) == "number"
+                        and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter)
+                    then
+                        hasNewRequests = true
+                        break
+                    end
+                end
+            end
+
+            outcome = hasNewRequests and "log_sync_requested" or "log_sync_in_progress"
+        end
+    end
+
+    self.state._sentJoinStatusForSessionId = nil
+    self.state._sentJoinStatusType = nil
+    self:SendJoinStatus()
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Manual sync requested with coordinator (profileId=%s, outcome=%s, reason=%s)",
+            tostring(profileId), tostring(outcome), tostring(reason or "manual_sync"))
+    end
+
+    return true, outcome
+end
+
 -- Function Set whether session safe mode is enabled.
 -- @param enabled boolean True to enable, false to disable.
 -- @param reason string|nil Human-readable reason for change.

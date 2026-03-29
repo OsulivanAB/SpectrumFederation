@@ -488,7 +488,6 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					end,
 					maxLetters = 24,
 				},
-				{ type = "button", label = "Manually Sync My Data", buttonText = "Sync", width = 120, tooltip = "Planned action: send your current character's Loot Helper data to the active session. Requires an active session. This button is not implemented yet.", enabled = function() return ProfileActionsEnabled() and IsSessionActive() end, onClick = function(ctx) ctx.section:SetMessage("Stub: Manually Sync My Data (implement later).", "warn") end },
 				{
 					type = "button",
 					label = "Reset Current Profile",

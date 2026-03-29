@@ -66,8 +66,16 @@ function PageBuilder:Init(panel)
 	self.scrollFrame = scroll
 	
 	local SCROLLBAR_INSET = 24
+	local SCROLLBAR_RIGHT_OFFSET = -2
+	local SCROLLBAR_BUTTON_CLEARANCE = 8
 	scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
 	scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -SCROLLBAR_INSET, 0)
+
+	if scroll.ScrollBar then
+		scroll.ScrollBar:ClearAllPoints()
+		scroll.ScrollBar:SetPoint("TOPRIGHT", panel, "TOPRIGHT", SCROLLBAR_RIGHT_OFFSET, -(16 + SCROLLBAR_BUTTON_CLEARANCE))
+		scroll.ScrollBar:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", SCROLLBAR_RIGHT_OFFSET, 16 + SCROLLBAR_BUTTON_CLEARANCE)
+	end
 
 	local content = CreateFrame("Frame", nil, scroll)
 	self.content = content
