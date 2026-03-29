@@ -278,13 +278,14 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			local color = GetMemberClassColor(member)
 			table.insert(items, {
 				id = memberId,
+				name = name,
 				text = color .. name .. "|r",
 				canRemove = (ownerId ~= nil) and (memberId ~= ownerId) or false,
 			})
 		end
 
 		table.sort(items, function(a, b)
-			return tostring(a.text) < tostring(b.text)
+			return tostring(a.name) < tostring(b.name)
 		end)
 		return items
 	end
@@ -295,12 +296,21 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			return {}
 		end
 
+		local adminById = {}
+		if type(profile.getAdminMemberIds) == "function" then
+			for _, memberId in ipairs(profile:getAdminMemberIds() or {}) do
+				adminById[memberId] = true
+			end
+		end
+
 		local out = {}
 		for _, memberId in ipairs(profile:getMemberIds() or {}) do
+			if not adminById[memberId] then
 			local member = profile:getMemberByID(memberId)
 			local name = (type(member) == "table" and (member.member_name or member.name)) or tostring(memberId)
 			local color = GetMemberClassColor(member)
 			table.insert(out, { value = memberId, label = color .. name .. "|r", _sort = name })
+			end
 		end
 
 		table.sort(out, function(a, b)
@@ -418,6 +428,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 						)
 					end,
 				},
+				{ type = "editboxButton", label = "Create Profile", hint = "Profile name", buttonText = "Create", buttonWidth = 90, editWidth = 170, tooltip = "Creates a new profile. Will automatically set it to active.", onSubmit = function(ctx, text, editBox) ctx.section:ClearMessage() if type(ctx.store.CreateLootHelperProfile) ~= "function" then ctx.section:SetMessage("CreateLootHelperProfile() not implemented", "error") return end local ok, err = ctx.store:CreateLootHelperProfile(text) if not ok then ctx.section:SetMessage(err or "Failed to create profile", "error") return end editBox:SetText("") ctx.section:SetMessage("Profile created.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "display", label = "Profile Owner", get = function() return BuildOwnerDisplay() end, visible = function() return HasActiveProfile() end },
 				{
 					type = "button",
@@ -545,8 +556,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			tooltip = "Administrative tools for managing profile ownership, profile creation, and admin membership.",
 			condition = CanShowAdminTools,
 			items = {
-				{ type = "scrollList", label = "Admins", adminOnly = true, height = 160, rowHeight = 20, removeAtlas = "common-icon-redx", enabled = function() return ProfileActionsEnabled() end, getItems = function() return BuildAdminItems() end, onRemove = function(ctx, item) if type(ctx.store.RemoveAdminFromActiveProfile) ~= "function" then ctx.section:SetMessage("RemoveAdminFromActiveProfile() not implemented", "error") return end local ok, err = ctx.store:RemoveAdminFromActiveProfile(item.id) if not ok then ctx.section:SetMessage(err or "Failed to remove admin", "error") return end ctx.section:SetMessage("Admin removed.", "success") ctx.pageBuilder:Refresh() end },
-				{ type = "editboxButton", label = "Create Profile", adminOnly = true, hint = "Profile name", buttonText = "Create", buttonWidth = 90, editWidth = 170, tooltip = "Creates a new profile. Will automatically set it to active.", onSubmit = function(ctx, text, editBox) ctx.section:ClearMessage() if type(ctx.store.CreateLootHelperProfile) ~= "function" then ctx.section:SetMessage("CreateLootHelperProfile() not implemented", "error") return end local ok, err = ctx.store:CreateLootHelperProfile(text) if not ok then ctx.section:SetMessage(err or "Failed to create profile", "error") return end editBox:SetText("") ctx.section:SetMessage("Profile created.", "success") ctx.pageBuilder:Refresh() end },
+				{ type = "scrollList", label = "Admins", adminOnly = true, height = 160, rowHeight = 20, removeAtlas = "common-icon-redx", compactColumns = true, removeColumnGap = 6, enabled = function() return ProfileActionsEnabled() end, getItems = function() return BuildAdminItems() end, onRemove = function(ctx, item) if type(ctx.store.RemoveAdminFromActiveProfile) ~= "function" then ctx.section:SetMessage("RemoveAdminFromActiveProfile() not implemented", "error") return end local ok, err = ctx.store:RemoveAdminFromActiveProfile(item.id) if not ok then ctx.section:SetMessage(err or "Failed to remove admin", "error") return end ctx.section:SetMessage("Admin removed.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "dropdownIconButton", label = "Add Admin", adminOnly = true, defaultText = "Select member", options = function() return BuildMemberOptions() end, get = function() return panel.__sfAddAdminSelectedId end, set = function(value) panel.__sfAddAdminSelectedId = value end, enabled = function() return ProfileActionsEnabled() end, iconAtlas = "common-icon-plus", iconToolTip = "Add selected member as admin", iconEnabled = function() return ProfileActionsEnabled() and panel.__sfAddAdminSelectedId ~= nil end, onIconClick = function(ctx) if SF.Debug then SF.Debug:Info("UI", "Add Admin button clicked") end ctx.section:ClearMessage() local memberId = panel.__sfAddAdminSelectedId if SF.Debug then SF.Debug:Info("UI", "Selected memberId: %s", tostring(memberId)) end if not memberId then ctx.section:SetMessage("Select a member first.", "error") return end if type(ctx.store.AddAdminToActiveProfile) ~= "function" then ctx.section:SetMessage("AddAdminToActiveProfile() not implemented", "error") return end if SF.Debug then SF.Debug:Info("UI", "Calling AddAdminToActiveProfile with memberId: %s", tostring(memberId)) end local ok, err = ctx.store:AddAdminToActiveProfile(memberId) if SF.Debug then SF.Debug:Info("UI", "AddAdminToActiveProfile returned: ok=%s, err=%s", tostring(ok), tostring(err)) end if not ok then ctx.section:SetMessage(err or "Failed to add admin", "error") return end ctx.section:SetMessage("Admin added.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "button", label = "Trigger Raid-Wide Sync", adminOnly = true, buttonText = "Sync", width = 120, enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:SetMessage("Stub: Trigger Raid-Wide Sync (implement later).", "warn") end },
 			},

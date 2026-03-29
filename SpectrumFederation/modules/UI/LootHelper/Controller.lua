@@ -35,6 +35,26 @@ local function HasActiveProfile()
     return db.activeProfileId ~= nil and db.profiles and db.profiles[db.activeProfileId] ~= nil
 end
 
+local function IsSessionActive()
+    return SF.LootHelperSync and SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive()
+end
+
+local function GetActiveProfileId()
+    if SF.SettingsStore and SF.SettingsStore.GetActiveLootHelperProfileId then
+        local profileId = SF.SettingsStore:GetActiveLootHelperProfileId()
+        if profileId ~= nil then
+            return profileId
+        end
+    end
+
+    local db = GetLootDB()
+    if db and db.activeProfileId then
+        return db.activeProfileId
+    end
+
+    return nil
+end
+
 -- ===================================================================
 -- Core
 -- ===================================================================
@@ -206,6 +226,36 @@ function Controller:_HookProfileMutators()
     self._hookedProfileMutators = true
 end
 
+function Controller:_HookSessionMutators()
+    if self._hookedSessionMutators then return end
+
+    local sync = SF.LootHelperSync
+    if type(sync) ~= "table" then
+        if C_Timer and C_Timer.After then
+            C_Timer.After(0, function()
+                if self and self._inited then
+                    self:_HookSessionMutators()
+                end
+            end)
+        end
+        return
+    end
+
+    if type(sync.StartSession) == "function" then
+        hooksecurefunc(sync, "StartSession", function()
+            self:RequestRefresh("SessionStarted")
+        end)
+    end
+
+    if type(sync.EndSession) == "function" then
+        hooksecurefunc(sync, "EndSession", function()
+            self:RequestRefresh("SessionEnded")
+        end)
+    end
+
+    self._hookedSessionMutators = true
+end
+
 function Controller:_OnProfileMutated(profileSelf, source)
     local active = SF.GetActiveProfile and SF:GetActiveProfile() or nil
     if not active or active ~= profileSelf then
@@ -242,6 +292,10 @@ function Controller:Init()
         self:OpenSettings()
     end
 
+    frame.OnPlayClicked = function()
+        self:OnPlayClicked()
+    end
+
     frame.OnMinimizeClicked = function()
         self:OnMinimizeClicked()
     end
@@ -250,6 +304,7 @@ function Controller:Init()
     self:_HookSettingsStore()
     self:_HookProfileChanges()
     self:_HookProfileMutators()
+    self:_HookSessionMutators()
 
     -- self:RefreshTitle()
     self:ApplyStyle()
@@ -281,30 +336,33 @@ end
 
 -- Refresh the title bar information
 function Controller:RefreshTitle()
-    local titleText = "No Active Profile"
+    local primaryTitle = "Points"
+    local pointName = ""
+    local canAdmin = false
 
     if SF.GetActiveProfile then
         local p = SF:GetActiveProfile()
         if p then
-           local profName = (p.GetProfileName and p:GetProfileName()) or "Unnamed Profile"
+           if p.IsCurrentUserAdmin then
+            canAdmin = p:IsCurrentUserAdmin() and true or false
+           end
 
-           local pointsName = "Points"
+           primaryTitle = "Points"
            if p.GetPointName then
             local v = p:GetPointName()
             v = tostring(v or ""):match("^%s*(.-)%s*$")  -- trim
             if v ~= "" then
-                pointsName = v
+                primaryTitle = v
             end
            end
-           titleText = ("%s - %s"):format(profName, pointsName)
         end
     end
 
     if LH.Window then
-        LH.Window:SetProfileName(titleText)
-
-        -- TODO: session system later (always false for now)
-        LH.Window:SetSessionActive(false)
+        LH.Window:SetProfileName(primaryTitle)
+        LH.Window:SetPointName(pointName)
+        LH.Window:SetPlayButtonVisible(canAdmin)
+        LH.Window:SetSessionActive(IsSessionActive())
     end
 end
 
@@ -324,6 +382,60 @@ function Controller:OnMinimizeClicked()
     if LH.Window and LH.Window.ToggleMinimized then
         LH.Window:ToggleMinimized()
     end
+end
+
+function Controller:OnPlayClicked()
+    if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then
+        if SF.PrintError then
+            SF:PrintError("Loot Helper Sync system not available")
+        end
+        return
+    end
+
+    local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+
+    local function Confirm(message, acceptText, onAccept)
+        if dialogs and dialogs.Confirm then
+            dialogs:Confirm(message, acceptText, onAccept)
+            return
+        end
+        onAccept()
+    end
+
+    if IsSessionActive() then
+        Confirm("Stop the active Loot Helper session?", "Stop Session", function()
+            local ok = SF.LootHelperSync:EndSession("manual")
+            if SF.PrintSuccess and SF.PrintError then
+                if ok then
+                    SF:PrintSuccess("Session ended successfully")
+                else
+                    SF:PrintError("Failed to end session (no active session?)")
+                end
+            end
+            self:RequestRefresh("PlayButtonEndSession")
+        end)
+        return
+    end
+
+    local profileId = GetActiveProfileId()
+    if not profileId then
+        if SF.PrintError then
+            SF:PrintError("No active profile selected. Use /sf switchprofile <name> or /sf createprofile <name>")
+        end
+        return
+    end
+
+    Confirm("Start a Loot Helper session for the active profile?", "Start Session", function()
+        local sessionId = SF.LootHelperSync:StartSession(profileId)
+        if SF.PrintSuccess and SF.PrintError then
+            if sessionId then
+                SF:PrintSuccess("Session started successfully")
+            else
+                SF:PrintError("Failed to start session (not in a group/raid?)")
+            end
+        end
+        self:RequestRefresh("PlayButtonStartSession")
+    end)
 end
 
 -- TODO: Temporary to verify skeleton exists

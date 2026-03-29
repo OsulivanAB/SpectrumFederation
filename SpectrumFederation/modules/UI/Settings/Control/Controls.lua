@@ -1136,6 +1136,10 @@ function Controls:AddScrollList(section, opts)
 
 	local rowHeight = opts.rowHeight or 20
 	local rowSpacing = opts.rowSpacing or 2
+	local compactColumns = opts.compactColumns and true or false
+	local removeColumnGap = opts.removeColumnGap or 4
+	local removeButtonSize = opts.removeButtonSize or 18
+	local compactTextPadding = opts.compactTextPadding or 10
 
 	local resize = (opts.resize ~= false)	-- Default to true
 	local border = (opts.border == true)	-- Default to false
@@ -1199,12 +1203,11 @@ function Controls:AddScrollList(section, opts)
 			r:SetHeight(rowHeight)
 
 			local fs = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-			fs:SetPoint("LEFT", r, "LEFT", 0, 0	)
-			fs:SetPoint("RIGHT", r, "RIGHT", -24, 0)
+			fs:SetPoint("LEFT", r, "LEFT", 0, 0)
 			fs:SetJustifyH("LEFT")
 			r.Text = fs
 
-			local remove = CreateIconButton(r, opts.removeAtlas or "common-icon-redx", 18)
+			local remove = CreateIconButton(r, opts.removeAtlas or "common-icon-redx", removeButtonSize)
 			remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
 			r.Remove = remove
 
@@ -1238,6 +1241,8 @@ function Controls:AddScrollList(section, opts)
 			local items = getItems() or {}
 
 			local y = 0
+			local maxTextWidth = 0
+			local availableWidth = (content:GetWidth() or scroll:GetWidth() or 0)
 
 			for i = 1, #items do
 				local item = items[i]
@@ -1248,6 +1253,23 @@ function Controls:AddScrollList(section, opts)
 				r:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -y)
 
 				r.Text:SetText(item.text or "")
+				maxTextWidth = math.max(maxTextWidth, r.Text:GetStringWidth() or 0)
+				r:Show()
+				y = y + rowHeight + rowSpacing
+			end
+
+			local compactTextWidth = maxTextWidth + compactTextPadding
+			if compactColumns and availableWidth > 0 then
+				compactTextWidth = math.min(compactTextWidth, math.max(1, availableWidth - removeButtonSize - removeColumnGap))
+			end
+
+			y = 0
+			for i = 1, #items do
+				local item = items[i]
+				local r = rows[i]
+
+				r.Text:ClearAllPoints()
+				r.Remove:ClearAllPoints()
 
 				local canRemove = item.canRemove and true or false
 				r.Remove:SetShown(canRemove)
@@ -1268,7 +1290,16 @@ function Controls:AddScrollList(section, opts)
 					r.Remove:SetScript("OnClick", nil)
 				end
 
-				r:Show()
+				if compactColumns and availableWidth > 0 then
+					r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
+					r.Text:SetWidth(compactTextWidth)
+					r.Remove:SetPoint("LEFT", r.Text, "RIGHT", removeColumnGap, 0)
+				else
+					r.Text:SetPoint("LEFT", r, "LEFT", 0, 0)
+					r.Text:SetPoint("RIGHT", r, "RIGHT", -24, 0)
+					r.Remove:SetPoint("RIGHT", r, "RIGHT", 0, 0)
+				end
+
 				y = y + rowHeight + rowSpacing
 			end
 

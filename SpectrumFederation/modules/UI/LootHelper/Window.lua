@@ -5,6 +5,9 @@ SF.LootHelperWindow = SF.LootHelperWindow or {}
 local LH = SF.LootHelperWindow
 local C = LH.Constants
 
+local PLAY_BUTTON_ICON = "Interface\\Buttons\\UI-SpellbookIcon-NextPage-Up"
+local STOP_BUTTON_ICON = "Interface\\Buttons\\UI-GroupLoot-Pass-Up"
+
 LH.Window = LH.Window or {}
 local Window = LH.Window
 
@@ -344,6 +347,7 @@ local function CreateIconButton(parent, atlasOrTexture, size)
     end
 
     ApplyIcon(atlasOrTexture)
+    btn.SetIcon = ApplyIcon
 
     local hl = btn:CreateTexture(nil, "HIGHLIGHT")
     hl:SetAllPoints(btn)
@@ -434,6 +438,13 @@ function Window:Create()
     title.Gear = gear
     AttachTooltip(gear, "Settings", "Open Loot Helper Settings")
 
+    -- Play button
+    local play = CreateIconButton(title, PLAY_BUTTON_ICON, C.ICON_BUTTON_SIZE)
+    title.Play = play
+    play.__sfTooltipTitle = "Start Session"
+    play.__sfTooltipText = "Start Session"
+    AttachTooltip(play, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
+
     -- Minimize/restore button
     local minimize = CreateObjectiveTrackerToggleButton(title)
     minimize:SetPoint("RIGHT", title, "RIGHT", -4, 0)
@@ -441,69 +452,66 @@ function Window:Create()
     minimize.__sfTooltipTitle = "Minimize"
     minimize.__sfTooltipText = "Collapse the Loot Helper window to its title bar"
     gear:SetPoint("RIGHT", minimize, "LEFT", -6, 0)
+    play:SetPoint("RIGHT", gear, "LEFT", -6, 0)
     AttachTooltip(minimize, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
 
     -- Profile Name
-    -- TODO: Maybe update this to point name?
     local profileName = title:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-    -- profileName:SetPoint("LEFT", logo, "RIGHT", 8, 0)
-    -- profileName:SetPoint("RIGHT", gear, "LEFT", -140, 0)
     profileName:SetJustifyH("LEFT")
     profileName:SetText("No Active Profile")
     profileName:SetWordWrap(false)
     profileName:SetMaxLines(1)
     title.ProfileName = profileName
 
-    -- Session indicator
-    local session = title:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-    -- session:SetPoint("LEFT", profileName, "RIGHT", 10, 0)
-    -- session:SetPoint("RIGHT", gear, "LEFT", -10, 0)
-    session:SetJustifyH("CENTER")
-    session:SetWordWrap(false)
-    session:SetMaxLines(1)
-    session:SetText("No Active Session")    -- TODO: Determine if session is active or not
-    session:SetTextColor(1, 0.2, 0.2)
-    title.Session = session
+    -- Point name
+    local pointName = title:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
+    pointName:SetJustifyH("CENTER")
+    pointName:SetWordWrap(false)
+    pointName:SetMaxLines(1)
+    pointName:SetText("")
+    pointName:SetTextColor(0.82, 0.82, 0.82)
+    title.PointName = pointName
     
     local TITLE_LEFT_PAD = 8    -- between logo and title text
-    local TITLE_RIGHT_PAD = 10  -- between title/session and gear button
-    local TITLE_GAP = 10    -- gap between title text and session text
-    local SESSION_EXTRA = 6   -- slight padding so session doesn't feel cramped
+    local TITLE_RIGHT_PAD = 10  -- between title text and play button
+    local TITLE_GAP = 10    -- gap between title text and point name text
+    local POINT_NAME_EXTRA = 6   -- slight padding so point name doesn't feel cramped
 
     local function UpdateTitleLayout()
         -- Need actual geometry for this to work reliably
         local logoR = logo:GetRight()
-        local gearL = gear:GetLeft()
-        if not logoR or not gearL then return end
+        local actionAnchor = play:IsShown() and play or gear
+        local actionL = actionAnchor:GetLeft()
+        if not logoR or not actionL then return end
 
         local leftX = logoR + TITLE_LEFT_PAD
-        local rightX = gearL - TITLE_RIGHT_PAD
+        local rightX = actionL - TITLE_RIGHT_PAD
         local totalW = rightX - leftX
         if totalW < 80 then return end
 
         -- Measure string widths (true text size)
         local titleW = profileName:GetStringWidth() or 0
-        local sessionW = session:GetStringWidth() or 0
-        local wantSessionW = sessionW + SESSION_EXTRA
+        local pointW = pointName:GetStringWidth() or 0
+        local wantPointW = pointW + POINT_NAME_EXTRA
 
-        -- Show session ONLY if both strings can fit side-by-side without forcing truncation
-        local canShowSession = (titleW + TITLE_GAP + wantSessionW) <= totalW
+        -- Show point name only if both strings fit side-by-side without forcing truncation.
+        local canShowPointName = pointW > 0 and (titleW + TITLE_GAP + wantPointW) <= totalW
 
         -- Reset anchors
         profileName:ClearAllPoints()
-        session:ClearAllPoints()
+        pointName:ClearAllPoints()
 
         profileName:SetPoint("LEFT", logo, "RIGHT", TITLE_LEFT_PAD, 0)
 
-        if canShowSession then
-            session:Show()
-            session:SetWidth(wantSessionW)
-            session:SetPoint("RIGHT", gear, "LEFT", -TITLE_RIGHT_PAD, 0)
+        if canShowPointName then
+            pointName:Show()
+            pointName:SetWidth(wantPointW)
+            pointName:SetPoint("RIGHT", actionAnchor, "LEFT", -TITLE_RIGHT_PAD, 0)
 
-            profileName:SetPoint("RIGHT", session, "LEFT", -TITLE_GAP, 0)
+            profileName:SetPoint("RIGHT", pointName, "LEFT", -TITLE_GAP, 0)
         else
-            session:Hide()
-            profileName:SetPoint("RIGHT", gear, "LEFT", -TITLE_RIGHT_PAD, 0)
+            pointName:Hide()
+            profileName:SetPoint("RIGHT", actionAnchor, "LEFT", -TITLE_RIGHT_PAD, 0)
         end
     end
 
@@ -533,7 +541,7 @@ function Window:Create()
         end
     end)
 
-    -- Initial visibility check for session text
+    -- Initial visibility check for header text
     if C_Timer and C_Timer.After then
         C_Timer.After(0, UpdateTitleLayout)   -- Delay to allow layout to settle
     else
@@ -541,6 +549,9 @@ function Window:Create()
     end
 
     -- Button handlers (Controller assigns callbacks)
+    play:SetScript("OnClick", function()
+        if frame.OnPlayClicked then frame:OnPlayClicked() end
+    end)
     gear:SetScript("OnClick", function()
         if frame.OnGearClicked then frame:OnGearClicked() end
     end)
@@ -654,18 +665,13 @@ function Window:SetProfileName(name)
     end
 end
 
-function Window:SetSessionActive(isActive)
+function Window:SetPointName(name)
     local f = self._frame
-    if not f or not f.Title or not f.Title.Session then return end
+    if not f or not f.Title or not f.Title.PointName then return end
 
-    -- TODO: real session logic later
-    if isActive then
-        f.Title.Session:SetText("Session Active")
-        f.Title.Session:SetTextColor(0.2, 1, 0.2)
-    else
-        f.Title.Session:SetText("No Active Session")
-        f.Title.Session:SetTextColor(1, 0.2, 0.2)
-    end
+    local text = tostring(name or "")
+    text = text:match("^%s*(.-)%s*$") or ""
+    f.Title.PointName:SetText(text)
 
     if f.Title and f.Title.UpdateTitleLayout then
         if C_Timer and C_Timer.After then
@@ -673,6 +679,40 @@ function Window:SetSessionActive(isActive)
         else
             f.Title.UpdateTitleLayout()
         end        
+    end
+end
+
+function Window:SetPlayButtonVisible(isVisible)
+    local f = self._frame
+    if not f or not f.Title or not f.Title.Play then return end
+
+    isVisible = isVisible and true or false
+    f.Title.Play:SetShown(isVisible)
+    f.Title.Play:EnableMouse(isVisible)
+
+    if f.Title and f.Title.UpdateTitleLayout then
+        if C_Timer and C_Timer.After then
+            C_Timer.After(0, f.Title.UpdateTitleLayout)
+        else
+            f.Title.UpdateTitleLayout()
+        end
+    end
+end
+
+function Window:SetSessionActive(isActive)
+    local f = self._frame
+    if not f or not f.Title or not f.Title.Play or not f.Title.Play.Icon then return end
+
+    if isActive then
+        f.Title.Play:SetIcon(STOP_BUTTON_ICON)
+        f.Title.Play.Icon:SetVertexColor(0.30, 1.00, 0.30, 1)
+        f.Title.Play.__sfTooltipTitle = "Stop Session"
+        f.Title.Play.__sfTooltipText = "Stop Session"
+    else
+        f.Title.Play:SetIcon(PLAY_BUTTON_ICON)
+        f.Title.Play.Icon:SetVertexColor(1, 1, 1, 1)
+        f.Title.Play.__sfTooltipTitle = "Start Session"
+        f.Title.Play.__sfTooltipText = "Start Session"
     end
 end
 
