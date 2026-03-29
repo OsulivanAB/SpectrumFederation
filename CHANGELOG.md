@@ -29,6 +29,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.17-beta.1] - 2026-03-28
+
+### Added
+- Raid check now colors missing-player names by their class for improved readability.
+
 ## [0.5.16] - 2026-03-25
 
 ### Changed
