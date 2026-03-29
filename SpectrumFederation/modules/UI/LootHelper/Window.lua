@@ -98,8 +98,8 @@ function Window:_UpdateMinimizeButtonState()
 
     btn.__sfTooltipTitle = minimized and "Restore" or "Minimize"
     btn.__sfTooltipText = minimized
-        and "Restore the Loot Helper window to its full size"
-        or "Collapse the Loot Helper window to its title bar"
+        and "Restore the Loot Helper window to its full size."
+        or "Collapse the Loot Helper window to its title bar."
 end
 
 function Window:_ApplyMinimizedState()
@@ -436,13 +436,13 @@ function Window:Create()
     -- Gear button
     local gear = CreateIconButton(title, "Interface\\Buttons\\UI-OptionsButton", C.ICON_BUTTON_SIZE)
     title.Gear = gear
-    AttachTooltip(gear, "Settings", "Open Loot Helper Settings")
+    AttachTooltip(gear, "Settings", "Open the Loot Helper settings window.")
 
     -- Play button
     local play = CreateIconButton(title, PLAY_BUTTON_ICON, C.ICON_BUTTON_SIZE)
     title.Play = play
     play.__sfTooltipTitle = "Start Session"
-    play.__sfTooltipText = "Start Session"
+    play.__sfTooltipText = "Start a Loot Helper session for the active profile."
     AttachTooltip(play, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
 
     -- Minimize/restore button
@@ -450,7 +450,7 @@ function Window:Create()
     minimize:SetPoint("RIGHT", title, "RIGHT", -4, 0)
     title.Minimize = minimize
     minimize.__sfTooltipTitle = "Minimize"
-    minimize.__sfTooltipText = "Collapse the Loot Helper window to its title bar"
+    minimize.__sfTooltipText = "Collapse the Loot Helper window to its title bar."
     gear:SetPoint("RIGHT", minimize, "LEFT", -6, 0)
     play:SetPoint("RIGHT", gear, "LEFT", -6, 0)
     AttachTooltip(minimize, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
@@ -707,12 +707,12 @@ function Window:SetSessionActive(isActive)
         f.Title.Play:SetIcon(STOP_BUTTON_ICON)
         f.Title.Play.Icon:SetVertexColor(0.30, 1.00, 0.30, 1)
         f.Title.Play.__sfTooltipTitle = "Stop Session"
-        f.Title.Play.__sfTooltipText = "Stop Session"
+        f.Title.Play.__sfTooltipText = "End the current Loot Helper session."
     else
         f.Title.Play:SetIcon(PLAY_BUTTON_ICON)
         f.Title.Play.Icon:SetVertexColor(1, 1, 1, 1)
         f.Title.Play.__sfTooltipTitle = "Start Session"
-        f.Title.Play.__sfTooltipText = "Start Session"
+        f.Title.Play.__sfTooltipText = "Start a Loot Helper session for the active profile."
     end
 end
 

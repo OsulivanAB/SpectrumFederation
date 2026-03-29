@@ -326,21 +326,21 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		general = {
 			id = "general",
 			title = "General Settings",
-			tooltip = "Character-level Loot Helper settings and global actions such as creating or resetting profiles.",
+			tooltip = "Character-level Loot Helper options for this client, plus global actions such as a full reset.",
 			items = {
-				{ type = "checkbox", label = "Enable LootHelper", tooltip = "Enable or disable LootHelper on this character/client.", path = "lootHelper.enabled" },
-				{ type = "checkbox", label = "Lock Loot Window", tooltip = "When enabled, the Loot Helper window cannot be moved or resized.", path = "lootHelper.lockLootWindow" },
-				{ type = "checkbox", label = "Show Members not in raid", tooltip = "When disabled, profile members who are not currently in your raid will be hidden in the Loot Helper window.", path = "lootHelper.showMembersNotInRaid" },
-				{ type = "checkbox", label = "Show Loot Window outside of Raid", tooltip = "When enabled, the Loot Helper window may appear even if you are not in a raid.", path = "lootHelper.showWindowOutsideRaid" },
-				{ type = "checkbox", label = "Enable Local Safemode", tooltip = "Local-only safemode. Independent from raid-wide safemode.", path = "lootHelper.localSafeMode" },
-				{ type = "checkbox", label = "Enable Local Safemode on Combat", tooltip = "Local-only: enable safemode automatically when entering combat.", path = "lootHelper.localSafeModeOnCombat" },
+				{ type = "checkbox", label = "Enable LootHelper", tooltip = "Turn Loot Helper on or off for this character. When it is off, the Loot Helper window and related features stay disabled on this client.", path = "lootHelper.enabled" },
+				{ type = "checkbox", label = "Lock Loot Window", tooltip = "Prevent the Loot Helper window from being moved or resized.", path = "lootHelper.lockLootWindow" },
+				{ type = "checkbox", label = "Show Members not in raid", tooltip = "Show profile members even when they are not currently in your raid. Turn this off to focus only on people who are present.", path = "lootHelper.showMembersNotInRaid" },
+				{ type = "checkbox", label = "Show Loot Window outside of Raid", tooltip = "Allow the Loot Helper window to appear even when you are not currently in a raid.", path = "lootHelper.showWindowOutsideRaid" },
+				{ type = "checkbox", label = "Enable Local Safemode", tooltip = "Pause bulk sync and profile transfer work on your client. Use this if you want to avoid large data updates locally; it does not affect other players.", path = "lootHelper.localSafeMode" },
+				{ type = "checkbox", label = "Enable Local Safemode on Combat", tooltip = "Automatically turn on local safemode when you enter combat so bulk sync and profile transfers pause on your client.", path = "lootHelper.localSafeModeOnCombat" },
 				{ type = "spacer", height = 10 },
 				{
 					type = "button",
 					label = "Reset All LootHelper Settings",
 					buttonText = "Reset All",
 					width = 140,
-					tooltip = "Resets ALL LootHelper settings and deletes ALL profiles.",
+					tooltip = "Delete every Loot Helper profile and reset every Loot Helper setting saved on this client.",
 					onClick = function(ctx)
 						ctx.section:ClearMessage()
 						if not dialogs or not dialogs.Confirm then
@@ -374,13 +374,13 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		profile = {
 			id = "profile",
 			title = "Profile Settings",
-			tooltip = "Settings and actions for the currently active Loot Helper profile, including membership, scoring rules, and raid check enchant requirements.",
+			tooltip = "Manage the active Loot Helper profile: choose it, rename it, adjust point settings, and configure raid check requirements.",
 			items = {
 				{ type = "help", text = "You currently have no profiles. Create one in General Section", indent = "label", visible = function() return not HasAnyProfiles(store) and not HasActiveProfile() end },
 				{
 					type = "dropdownIconButton",
 					label = "Active Profile",
-					tooltip = "Select the active profile (stored by ID)",
+					tooltip = "Choose which Loot Helper profile this character is currently viewing and editing.",
 					defaultText = "Select profile",
 					get = function() return GetActiveProfileId(store) end,
 					set = function(value)
@@ -393,7 +393,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					options = function() return GetProfileOptions(store) end,
 					enabled = function() return HasAnyProfiles(store) end,
 					iconAtlas = "common-icon-redx",
-					iconTooltip = "Delete Active Profile",
+					iconTooltip = "Delete the currently active profile",
 					iconEnabled = function() return ProfileActionsEnabled() end,
 					onValueChanged = function(ctx)
 						ctx.section:ClearMessage()
@@ -428,7 +428,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 						)
 					end,
 				},
-				{ type = "editboxButton", label = "Create Profile", hint = "Profile name", buttonText = "Create", buttonWidth = 90, editWidth = 170, tooltip = "Creates a new profile. Will automatically set it to active.", onSubmit = function(ctx, text, editBox) ctx.section:ClearMessage() if type(ctx.store.CreateLootHelperProfile) ~= "function" then ctx.section:SetMessage("CreateLootHelperProfile() not implemented", "error") return end local ok, err = ctx.store:CreateLootHelperProfile(text) if not ok then ctx.section:SetMessage(err or "Failed to create profile", "error") return end editBox:SetText("") ctx.section:SetMessage("Profile created.", "success") ctx.pageBuilder:Refresh() end },
+				{ type = "editboxButton", label = "Create Profile", hint = "Profile name", buttonText = "Create", buttonWidth = 90, editWidth = 170, tooltip = "Create a new Loot Helper profile and make it the active profile immediately.", onSubmit = function(ctx, text, editBox) ctx.section:ClearMessage() if type(ctx.store.CreateLootHelperProfile) ~= "function" then ctx.section:SetMessage("CreateLootHelperProfile() not implemented", "error") return end local ok, err = ctx.store:CreateLootHelperProfile(text) if not ok then ctx.section:SetMessage(err or "Failed to create profile", "error") return end editBox:SetText("") ctx.section:SetMessage("Profile created.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "display", label = "Profile Owner", get = function() return BuildOwnerDisplay() end, visible = function() return HasActiveProfile() end },
 				{
 					type = "button",
@@ -436,7 +436,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					adminOnly = true,
 					buttonText = "Rename",
 					width = 120,
-					tooltip = "Rename the active Loot Helper profile for everyone using it.",
+					tooltip = "Change the name of the active Loot Helper profile for everyone who uses it.",
 					enabled = function() return ProfileActionsEnabled() end,
 					onClick = function(ctx)
 						local currentName = "(active profile)"
@@ -471,7 +471,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					type = "editbox",
 					label = "Point Name",
 					adminOnly = true,
-					tooltip = "Editable per profile. Default is 'Points'.",
+					tooltip = "Rename the point currency used by this profile. This changes labels like 'Points' in the Loot Helper window and related messages.",
 					enabled = function() return ProfileActionsEnabled() end,
 					get = function()
 						local profile = GetActiveProfileObject(store)
@@ -488,13 +488,13 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					end,
 					maxLetters = 24,
 				},
-				{ type = "button", label = "Manually Sync My Data", buttonText = "Sync", width = 120, tooltip = "Send your current Loot Helper data to the active session. Requires an active Loot Helper session.", enabled = function() return ProfileActionsEnabled() and IsSessionActive() end, onClick = function(ctx) ctx.section:SetMessage("Stub: Manually Sync My Data (implement later).", "warn") end },
+				{ type = "button", label = "Manually Sync My Data", buttonText = "Sync", width = 120, tooltip = "Planned action: send your current character's Loot Helper data to the active session. Requires an active session. This button is not implemented yet.", enabled = function() return ProfileActionsEnabled() and IsSessionActive() end, onClick = function(ctx) ctx.section:SetMessage("Stub: Manually Sync My Data (implement later).", "warn") end },
 				{
 					type = "button",
 					label = "Reset Current Profile",
 					buttonText = "Reset",
 					width = 120,
-					tooltip = "Reset the active Loot Helper profile back to its default settings.",
+					tooltip = "Reset the active profile back to its default settings without deleting the profile itself.",
 					enabled = function() return ProfileActionsEnabled() end,
 					onClick = function(ctx)
 						ctx.section:ClearMessage()
@@ -522,7 +522,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "spacer", height = 12 },
 				{ type = "heading", text = "Raid Check Profile Settings" },
 				{ type = "text", text = "Requirements to look for" },
-				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Gem in Sockets", tooltip = "When enabled, raid checks require equipped items with gem sockets to have gems inserted.", get = function() return IsRaidCheckGemSocketsEnabled() end, set = function(v) SetRaidCheckGemSockets(v) end }, { label = "At Least One Meta Gem", tooltip = "When enabled, raid checks require at least one purple-quality meta gem to be socketed in any equipped item.", get = function() return IsRaidCheckMetaGemRequired() end, set = function(v) SetRaidCheckMetaGemRequired(v) end } } },
+				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Gem in Sockets", tooltip = "Require socketed gear to have gems inserted during raid checks.", get = function() return IsRaidCheckGemSocketsEnabled() end, set = function(v) SetRaidCheckGemSockets(v) end }, { label = "At Least One Meta Gem", tooltip = "Require at least one meta gem to be equipped in a valid socket during raid checks.", get = function() return IsRaidCheckMetaGemRequired() end, set = function(v) SetRaidCheckMetaGemRequired(v) end } } },
 				{ type = "text", text = "Enchants to look for" },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Head", get = function() return IsRaidCheckSlotEnabled("head") end, set = function(v) SetRaidCheckSlot("head", v) end }, { label = "Gloves", get = function() return IsRaidCheckSlotEnabled("hands") end, set = function(v) SetRaidCheckSlot("hands", v) end } } },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Neck", get = function() return IsRaidCheckSlotEnabled("neck") end, set = function(v) SetRaidCheckSlot("neck", v) end }, { label = "Belt", get = function() return IsRaidCheckSlotEnabled("belt") end, set = function(v) SetRaidCheckSlot("belt", v) end } } },
@@ -536,29 +536,29 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		session = {
 			id = "session",
 			title = "Session Settings",
-			tooltip = "Session-level controls for raid-wide sync, safemode, and raid check execution for the active profile.",
+			tooltip = "Manage the live Loot Helper session for this profile, including session start and stop, raid-wide safemode, and raid check behavior.",
 			condition = CanShowAdminTools,
 			items = {
-				{ type = "button", label = "Session Control", adminOnly = true, buttonText = function() if IsSessionActive() then return "End Session" end return "Start Session" end, width = 120, tooltip = "Start or end a Loot Helper sync session", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then ctx.section:SetMessage("Loot Helper Sync system not available", "error") return end if IsSessionActive() then local ok = SF.LootHelperSync:EndSession("manual") if ok then ctx.section:SetMessage("Session ended successfully", "success") else ctx.section:SetMessage("Failed to end session", "error") end else local profileId = GetActiveProfileId(ctx.store) if not profileId then ctx.section:SetMessage("No active profile selected", "error") return end local sessionId = SF.LootHelperSync:StartSession(profileId) if sessionId then ctx.section:SetMessage("Session started successfully", "success") else ctx.section:SetMessage("Failed to start session (not in a group/raid?)", "error") end end ctx.pageBuilder:Refresh() end },
+				{ type = "button", label = "Session Control", adminOnly = true, buttonText = function() if IsSessionActive() then return "End Session" end return "Start Session" end, width = 120, tooltip = "Start a Loot Helper session for the active profile, or end the current one if a session is already running.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then ctx.section:SetMessage("Loot Helper Sync system not available", "error") return end if IsSessionActive() then local ok = SF.LootHelperSync:EndSession("manual") if ok then ctx.section:SetMessage("Session ended successfully", "success") else ctx.section:SetMessage("Failed to end session", "error") end else local profileId = GetActiveProfileId(ctx.store) if not profileId then ctx.section:SetMessage("No active profile selected", "error") return end local sessionId = SF.LootHelperSync:StartSession(profileId) if sessionId then ctx.section:SetMessage("Session started successfully", "success") else ctx.section:SetMessage("Failed to start session (not in a group/raid?)", "error") end end ctx.pageBuilder:Refresh() end },
 				{ type = "text", text = "Enable Raid Wide Safe Mode" },
-				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Only in-combat", tooltip = "Enable raid-wide safemode only during combat.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false) end return false end, set = function(value) if store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false) end end }, { label = "All the Time", tooltip = "Keep raid-wide safemode active at all times.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeMode", false) end return false end, set = function(value) if store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeMode", value and true or false) end end } } },
+				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Only in-combat", tooltip = "Automatically enable raid-wide safemode during combat. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false) end return false end, set = function(value) if store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false) end end }, { label = "All the Time", tooltip = "Keep raid-wide safemode enabled for the full session. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeMode", false) end return false end, set = function(value) if store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeMode", value and true or false) end end } } },
 				{ type = "spacer", height = 12 },
 				{ type = "heading", text = "Raid Check Settings" },
 				{ type = "text", text = "Raid Checks..." },
 				{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then SF.RaidCheck:RunPreRaidCheck() ctx.section:SetMessage("Pre-Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then SF.RaidCheck:RunRaidCheck() ctx.section:SetMessage("Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end } },
 				{ type = "text", text = "Enable Whispers During..." },
-				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "When enabled, whisper players who are missing required enchants or gems during a Pre-Raid Check.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) end }, { label = "Raid Check", tooltip = "When enabled, whisper players their Raid Check result. Missing players should be told what they are missing. Fully prepared players should be told they received a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) end } } },
+				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing required enchants or gems.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) end } } },
 			},
 		},
 		admin = {
 			id = "admin",
 			title = "Admin Settings",
-			tooltip = "Administrative tools for managing profile ownership, profile creation, and admin membership.",
+			tooltip = "Manage who can administer the active profile and use admin-only session tools.",
 			condition = CanShowAdminTools,
 			items = {
 				{ type = "scrollList", label = "Admins", adminOnly = true, height = 160, rowHeight = 20, removeAtlas = "common-icon-redx", compactColumns = true, removeColumnGap = 6, enabled = function() return ProfileActionsEnabled() end, getItems = function() return BuildAdminItems() end, onRemove = function(ctx, item) if type(ctx.store.RemoveAdminFromActiveProfile) ~= "function" then ctx.section:SetMessage("RemoveAdminFromActiveProfile() not implemented", "error") return end local ok, err = ctx.store:RemoveAdminFromActiveProfile(item.id) if not ok then ctx.section:SetMessage(err or "Failed to remove admin", "error") return end ctx.section:SetMessage("Admin removed.", "success") ctx.pageBuilder:Refresh() end },
-				{ type = "dropdownIconButton", label = "Add Admin", adminOnly = true, defaultText = "Select member", options = function() return BuildMemberOptions() end, get = function() return panel.__sfAddAdminSelectedId end, set = function(value) panel.__sfAddAdminSelectedId = value end, enabled = function() return ProfileActionsEnabled() end, iconAtlas = "common-icon-plus", iconToolTip = "Add selected member as admin", iconEnabled = function() return ProfileActionsEnabled() and panel.__sfAddAdminSelectedId ~= nil end, onIconClick = function(ctx) if SF.Debug then SF.Debug:Info("UI", "Add Admin button clicked") end ctx.section:ClearMessage() local memberId = panel.__sfAddAdminSelectedId if SF.Debug then SF.Debug:Info("UI", "Selected memberId: %s", tostring(memberId)) end if not memberId then ctx.section:SetMessage("Select a member first.", "error") return end if type(ctx.store.AddAdminToActiveProfile) ~= "function" then ctx.section:SetMessage("AddAdminToActiveProfile() not implemented", "error") return end if SF.Debug then SF.Debug:Info("UI", "Calling AddAdminToActiveProfile with memberId: %s", tostring(memberId)) end local ok, err = ctx.store:AddAdminToActiveProfile(memberId) if SF.Debug then SF.Debug:Info("UI", "AddAdminToActiveProfile returned: ok=%s, err=%s", tostring(ok), tostring(err)) end if not ok then ctx.section:SetMessage(err or "Failed to add admin", "error") return end ctx.section:SetMessage("Admin added.", "success") ctx.pageBuilder:Refresh() end },
-				{ type = "button", label = "Trigger Raid-Wide Sync", adminOnly = true, buttonText = "Sync", width = 120, enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:SetMessage("Stub: Trigger Raid-Wide Sync (implement later).", "warn") end },
+				{ type = "dropdownIconButton", label = "Add Admin", adminOnly = true, defaultText = "Select member", options = function() return BuildMemberOptions() end, get = function() return panel.__sfAddAdminSelectedId end, set = function(value) panel.__sfAddAdminSelectedId = value end, enabled = function() return ProfileActionsEnabled() end, iconAtlas = "common-icon-plus", iconToolTip = "Add the selected member as an admin for the active profile", iconEnabled = function() return ProfileActionsEnabled() and panel.__sfAddAdminSelectedId ~= nil end, onIconClick = function(ctx) if SF.Debug then SF.Debug:Info("UI", "Add Admin button clicked") end ctx.section:ClearMessage() local memberId = panel.__sfAddAdminSelectedId if SF.Debug then SF.Debug:Info("UI", "Selected memberId: %s", tostring(memberId)) end if not memberId then ctx.section:SetMessage("Select a member first.", "error") return end if type(ctx.store.AddAdminToActiveProfile) ~= "function" then ctx.section:SetMessage("AddAdminToActiveProfile() not implemented", "error") return end if SF.Debug then SF.Debug:Info("UI", "Calling AddAdminToActiveProfile with memberId: %s", tostring(memberId)) end local ok, err = ctx.store:AddAdminToActiveProfile(memberId) if SF.Debug then SF.Debug:Info("UI", "AddAdminToActiveProfile returned: ok=%s, err=%s", tostring(ok), tostring(err)) end if not ok then ctx.section:SetMessage(err or "Failed to add admin", "error") return end ctx.section:SetMessage("Admin added.", "success") ctx.pageBuilder:Refresh() end },
+				{ type = "button", label = "Trigger Raid-Wide Sync", adminOnly = true, buttonText = "Sync", width = 120, tooltip = "Planned admin action: ask everyone in the active session to resend their Loot Helper data. This button is not implemented yet.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:SetMessage("Stub: Trigger Raid-Wide Sync (implement later).", "warn") end },
 			},
 		},
 	}

@@ -82,7 +82,7 @@ local function GetEventTypeOptions()
 	
 	local options = {}
 	for _, eventType in pairs(SF.LootLogEventTypes) do
-		table.insert(options, { value = eventType, label = eventType })
+		table.insert(options, { value = eventType, label = GetEventTypeLabel(eventType) })
 	end
 	
 	table.sort(options, function(a, b) return a.label < b.label end)
@@ -159,6 +159,26 @@ local function ColorizeName(name)
 	return string.format("%s%s%s", GetPlayerClassColor(name), name, reset)
 end
 
+local function FormatLabel(value)
+	local text = tostring(value or "")
+	if text == "" then
+		return ""
+	end
+
+	text = text:gsub("_", " "):lower()
+	text = text:gsub("(%a)([%w']*)", function(first, rest)
+		return string.upper(first) .. rest
+	end)
+	return text
+end
+
+local function GetArmorSlotLabel(slot)
+	if slot == nil or slot == "" then
+		return "Armor Spot"
+	end
+	return FormatLabel(slot) .. " Armor Spot"
+end
+
 local function BuildActionText(eventType, data, author)
 	data = data or {}
 
@@ -167,11 +187,24 @@ local function BuildActionText(eventType, data, author)
 		if isRaidCheck and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
 			return "Raid Check prepared (+1)"
 		elseif isRaidCheck then
-			return string.format("Raid Check change (%s)", tostring(data.change or "?"))
+			return string.format("Raid Check change (%s)", FormatLabel(data.change or "?"))
 		end
-		return tostring(data.change or "?")
+
+		if data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
+			return "Points Increased"
+		elseif data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
+			return "Points Decreased"
+		end
+
+		return FormatLabel(data.change or "?")
 	elseif eventType == "ARMOR_CHANGE" then
-		return tostring(data.action or "")
+		local slotLabel = GetArmorSlotLabel(data.slot)
+		if data.action == (SF.LootLogArmorActions and SF.LootLogArmorActions.USED) then
+			return slotLabel .. " Used"
+		elseif data.action == (SF.LootLogArmorActions and SF.LootLogArmorActions.AVAILABLE) then
+			return slotLabel .. " Available"
+		end
+		return slotLabel .. " " .. FormatLabel(data.action or "")
 	elseif eventType == "ROLE_CHANGE" then
 		return string.format("Role -> %s", tostring(data.newRole or "?"))
 	elseif eventType == "PROFILE_CREATION" then
@@ -214,7 +247,6 @@ local function BuildLogRow(log)
 		changeType = string.format("%s%s%s", eventColor, GetEventTypeLabel(eventType), reset),
 		author = ColorizeName(author),
 		member = ColorizeName(data.member),
-		slot = data.slot or "",
 		action = BuildActionText(eventType, data, author),
 		item = "",
 	}
@@ -305,7 +337,7 @@ function Page:Build(panel)
 			{
 				id = "logs",
 				title = "Loot Logs",
-				tooltip = "Audit trail for Loot Helper profile changes, session actions, and admin updates.",
+				tooltip = "Review a history of Loot Helper changes, including profile edits, session events, point adjustments, and admin actions.",
 				fillHeight = true,
 				items = {
 					{
@@ -314,7 +346,7 @@ function Page:Build(panel)
 						items = {
 							{
 								type = "dropdown",
-								tooltip = "Filter logs by event type",
+								tooltip = "Show only log entries for a specific kind of event, such as point changes or profile updates.",
 								defaultText = "All Types",
 								width = 190,
 								options = function()
@@ -334,7 +366,7 @@ function Page:Build(panel)
 							},
 							{
 								type = "dropdown",
-								tooltip = "Filter logs by author (who created the log)",
+								tooltip = "Show only log entries created by a specific player.",
 								defaultText = "All Authors",
 								width = 190,
 								options = function()
@@ -354,7 +386,7 @@ function Page:Build(panel)
 							},
 							{
 								type = "dropdown",
-								tooltip = "Filter logs by member name when the event includes a member",
+								tooltip = "Show only log entries about a specific member when the event includes one.",
 								defaultText = "All Members",
 								width = 190,
 								options = function()
@@ -375,7 +407,7 @@ function Page:Build(panel)
 							{
 								type = "button",
 								buttonText = "Clear",
-								tooltip = "Clear all Loot Log filters",
+								tooltip = "Clear every active Loot Log filter and show the full history again.",
 								width = 100,
 								onClick = function()
 									panel.__sfSelectedEventType = nil
@@ -397,9 +429,8 @@ function Page:Build(panel)
 							{ key = "date", label = "Date", width = 170 },
 							{ key = "changeType", label = "Type of Change", width = 170 },
 							{ key = "member", label = "Member", width = 135 },
-							{ key = "slot", label = "Slot", width = 90 },
 							{ key = "action", label = "Action", width = 240 },
-							{ key = "item", label = "Item", width = 120 },
+							{ key = "item", label = "Item", width = 210 },
 							{ key = "author", label = "Author" },
 						},
 						emptyText = "No logs found matching the selected filters.\n\nCreate a profile and perform actions to see logs here.",
