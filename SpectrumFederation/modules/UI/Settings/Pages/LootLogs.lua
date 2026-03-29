@@ -13,6 +13,8 @@ local Page = {
 	},
 }
 
+local GetEventTypeLabel
+
 -- ==================================================================
 -- Helpers
 -- ==================================================================
@@ -147,7 +149,7 @@ local EVENT_TYPE_LABELS = {
 	ADMIN_REMOVED = "Admin Removed",
 }
 
-local function GetEventTypeLabel(eventType)
+function GetEventTypeLabel(eventType)
 	return EVENT_TYPE_LABELS[eventType] or tostring(eventType or "Unknown")
 end
 
