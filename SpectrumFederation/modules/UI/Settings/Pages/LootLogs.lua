@@ -3,8 +3,10 @@ local _, SF = ...
 
 local Page = {
 	id = "lootLogs",
+	parentId = "lootHelper",
 	name = "Loot Logs",
-	order = 30,
+	navLabel = "Loot Logs",
+	order = 24,
 	layout = {
 		windowWidth = 1350,
 		disablePageScroll = true,
