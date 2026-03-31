@@ -31,25 +31,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.18-beta.28] - 2026-03-31
 
-### Added
-- New raid check options to validate gem sockets and require meta gems.
-- Slash command to manually trigger a Loot Helper sync with the session coordinator.
-- Functionality to detect missing meta gems during raid checks.
-- Enhanced logging for missing logs during synchronization.
+## [0.5.18] - 2026-03-31
 
 ### Changed
-- Improved handling of missing logs during synchronization to filter out invalid requests.
-- Updated raid check logic to include gem validation based on new configuration options.
-
-### Fixed
-- Addressed an issue where invalid log ranges could cause unnecessary synchronization requests.
-
-## [0.5.17-beta.1] - 2026-03-28
-
-### Added
-- Raid check now colors missing-player names by their class for improved readability.
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.5.16] - 2026-03-25
 
