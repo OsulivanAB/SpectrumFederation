@@ -24,11 +24,9 @@ Registers a new slash command with the addon.
 
 **Example**:
 
-```lua
-SF:RegisterSlashCommand("example", function(args)
-    SF:PrintInfo("Example command executed with args: " .. args)
-end, "An example command")
-```
+    SF:RegisterSlashCommand("example", function(args)
+        SF:PrintInfo("Example command executed with args: " .. args)
+    end, "An example command")
 
 #### `SF:InitializeSlashCommands()`
 
@@ -50,9 +48,7 @@ Opens the addon settings panel.
 
 **Example**:
 
-```
-/sf
-```
+    /sf
 
 ### Help System
 
@@ -62,9 +58,7 @@ Displays a list of all registered commands with their descriptions.
 
 **Example**:
 
-```
-/sf help
-```
+    /sf help
 
 **Output**:
 
@@ -87,12 +81,10 @@ Controls the debug logging system. The debug system tracks internal addon operat
 
 **Examples**:
 
-```
-/sf debug on          # Enable debug logging
-/sf debug show        # View logs in a window
-/sf debug clear       # Clear all logs
-/sf debug off         # Disable debug logging
-```
+    /sf debug on          # Enable debug logging
+    /sf debug show        # View logs in a window
+    /sf debug clear       # Clear all logs
+    /sf debug off         # Disable debug logging
 
 **Debug Viewer**:
 
@@ -115,9 +107,7 @@ The debug viewer displays the last 100 log entries in a scrollable window:
 
 All slash commands follow this structure:
 
-```
-/sf <command> [arguments]
-```
+    /sf <command> [arguments]
 
 **Parsing**:
 
@@ -139,31 +129,25 @@ To add a new slash command in your module:
 
 **Step 1**: Create your command handler function:
 
-```lua
-local function MyCommandHandler(args)
-    -- Process arguments
-    if args == "" then
-        SF:PrintInfo("No arguments provided")
-        return
+    local function MyCommandHandler(args)
+        -- Process arguments
+        if args == "" then
+            SF:PrintInfo("No arguments provided")
+            return
+        end
+
+        -- Your command logic here
+        SF:PrintSuccess("Command executed successfully!")
     end
-    
-    -- Your command logic here
-    SF:PrintSuccess("Command executed successfully!")
-end
-```
 
 **Step 2**: Register the command during initialization:
 
-```lua
--- In ADDON_LOADED or PLAYER_LOGIN event
-SF:RegisterSlashCommand("mycommand", MyCommandHandler, "Description of my command")
-```
+    -- In ADDON_LOADED or PLAYER_LOGIN event
+    SF:RegisterSlashCommand("mycommand", MyCommandHandler, "Description of my command")
 
 **Step 3**: Your command is now available:
 
-```
-/sf mycommand some arguments
-```
+    /sf mycommand some arguments
 
 ## Best Practices
 
@@ -202,14 +186,12 @@ SF:RegisterSlashCommand("mycommand", MyCommandHandler, "Description of my comman
 
 Commands are stored in `SF.SlashCommands` as a table:
 
-```lua
-SF.SlashCommands = {
-    ["command"] = {
-        handler = function,
-        description = "Command description"
+    SF.SlashCommands = {
+        ["command"] = {
+            handler = function,
+            description = "Command description"
+        }
     }
-}
-```
 
 **Internal Implementation**:
 

@@ -2,6 +2,16 @@
 
 The Controls module provides 14+ control types for building settings pages. Each control auto-saves changes and integrates with the Store system.
 
+## Shared State Options
+
+Most interactive controls support these common options:
+
+- `visible` (function or boolean, optional) - Controls whether the row is shown.
+- `enabled` (function or boolean, optional) - Controls whether the row is interactable.
+- `adminOnly` (boolean, optional) - Keeps the row visible but greys it out and disables interaction for non-admin users. When the control already has a tooltip, the tooltip title is suffixed with a red `(Admin Only)` marker.
+
+`adminOnly` is UI-only. Runtime write protection still belongs in the underlying store, profile, or feature function.
+
 ## Control Types Reference
 
 ### Checkbox

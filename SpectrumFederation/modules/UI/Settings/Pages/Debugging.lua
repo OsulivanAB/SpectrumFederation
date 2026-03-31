@@ -184,7 +184,7 @@ function Page:Build(panel)
 						items = {
 							{
 								label = "Verbose",
-								tooltip = "Display verbose-level debug messages",
+								tooltip = "Show the most detailed debug messages. Useful for troubleshooting, but it can be noisy.",
 								get = function()
 									return panel.__sfLogLevels.VERBOSE
 								end,
@@ -194,7 +194,7 @@ function Page:Build(panel)
 							},
 							{
 								label = "Info",
-								tooltip = "Display info-level debug messages",
+								tooltip = "Show general informational debug messages about what the addon is doing.",
 								get = function()
 									return panel.__sfLogLevels.INFO
 								end,
@@ -204,7 +204,7 @@ function Page:Build(panel)
 							},
 							{
 								label = "Warn",
-								tooltip = "Display warning-level debug messages",
+								tooltip = "Show warning messages for recoverable problems or unexpected states.",
 								get = function()
 									return panel.__sfLogLevels.WARN
 								end,
@@ -214,7 +214,7 @@ function Page:Build(panel)
 							},
 							{
 								label = "Error",
-								tooltip = "Display error-level debug messages",
+								tooltip = "Show error messages when something fails or cannot be completed.",
 								get = function()
 									return panel.__sfLogLevels.ERROR
 								end,

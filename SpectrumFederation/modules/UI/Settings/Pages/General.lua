@@ -28,7 +28,7 @@ function Page:Build(panel)
 					{
 						type = "dropdown",
 						label = "Window Style",
-						tooltip = "Choose the visual style for addon windows",
+						tooltip = "Choose the visual theme used by Spectrum Federation windows.",
 						path = "global.windowStyle",
 						options = function()
 							local opts = {}
@@ -42,7 +42,7 @@ function Page:Build(panel)
 					{
 						type = "dropdown",
 						label = "Font Style",
-						tooltip = "Choose the font style for addon text",
+						tooltip = "Choose the font family used in Spectrum Federation windows and settings.",
 						path = "global.fontStyle",
 						options = function()
 							local opts = {}
@@ -56,7 +56,7 @@ function Page:Build(panel)
 					{
 						type = "slider",
 						label = "Font Size",
-						tooltip = "Adjust the font size for addon text",
+						tooltip = "Adjust the size of text shown in Spectrum Federation windows and settings.",
 						path = "global.fontSize",
 						min = 8,
 						max = 20,
