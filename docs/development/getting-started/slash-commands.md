@@ -50,7 +50,7 @@ Opens the addon settings panel.
 
 **Example**:
 
-```
+```text
 /sf
 ```
 
@@ -62,7 +62,7 @@ Displays a list of all registered commands with their descriptions.
 
 **Example**:
 
-```
+```text
 /sf help
 ```
 
@@ -87,7 +87,7 @@ Controls the debug logging system. The debug system tracks internal addon operat
 
 **Examples**:
 
-```
+```text
 /sf debug on          # Enable debug logging
 /sf debug show        # View logs in a window
 /sf debug clear       # Clear all logs
@@ -115,7 +115,7 @@ The debug viewer displays the last 100 log entries in a scrollable window:
 
 All slash commands follow this structure:
 
-```
+```text
 /sf <command> [arguments]
 ```
 
@@ -161,7 +161,7 @@ SF:RegisterSlashCommand("mycommand", MyCommandHandler, "Description of my comman
 
 **Step 3**: Your command is now available:
 
-```
+```text
 /sf mycommand some arguments
 ```
 
