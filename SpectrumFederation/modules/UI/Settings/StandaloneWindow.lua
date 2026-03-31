@@ -10,8 +10,8 @@ local addonName, SF = ...
 local C = {
     -- Frame
     FRAME_NAME = "SF_SettingsWindow",
-    WIDTH = 860,
-    HEIGHT = 540,
+    WIDTH = 900,
+    HEIGHT = 900,
     
     -- Layout
     NAV_WIDTH = 180,
@@ -62,6 +62,10 @@ SettingsWindow.navButtons = {}
 SettingsWindow.pagePanels = {}
 SettingsWindow.currentPageId = nil
 
+local function SortPages(a, b)
+    return (a.order or 1000) < (b.order or 1000)
+end
+
 -- ============================================================
 -- Helper Functions
 -- ============================================================
@@ -76,6 +80,11 @@ local function GetVersionString()
         version = C_AddOns.GetAddOnMetadata(addonName, "Version") or "Unknown"
     end
     return "Retail " .. version
+end
+
+local function GetPageLayout(pageId)
+    local page = pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId]
+    return page and page.layout or nil
 end
 
 -- ============================================================
@@ -102,6 +111,63 @@ function SettingsWindow:AddNavPage(pageId, label)
     })
 end
 
+local function GetRootPageId(pageId)
+    local page = pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId]
+    while page and page.parentId do
+        page = SF.SettingsUI.pagesById[page.parentId]
+    end
+    return page and page.id or pageId
+end
+
+local function ResolveSelectablePageId(pageId)
+    local page = pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId]
+    if page and page.defaultChildId and SF.SettingsUI.pagesById[page.defaultChildId] then
+        return page.defaultChildId
+    end
+    return pageId
+end
+
+function SettingsWindow:BuildNavItemsFromRegistry()
+    self.navItems = {}
+
+    local roots = {}
+    local childrenByParent = {}
+    for _, page in ipairs(SF.SettingsUI.pages or {}) do
+        if page.parentId then
+            childrenByParent[page.parentId] = childrenByParent[page.parentId] or {}
+            table.insert(childrenByParent[page.parentId], page)
+        else
+            table.insert(roots, page)
+        end
+    end
+
+    table.sort(roots, SortPages)
+    for _, children in pairs(childrenByParent) do
+        table.sort(children, SortPages)
+    end
+
+    self:AddNavSpacer()
+    for _, page in ipairs(roots) do
+        table.insert(self.navItems, {
+            type = "page",
+            id = page.id,
+            label = page.navLabel or page.name,
+            depth = 0,
+            parentId = nil,
+        })
+
+        for _, childPage in ipairs(childrenByParent[page.id] or {}) do
+            table.insert(self.navItems, {
+                type = "page",
+                id = childPage.id,
+                label = childPage.navLabel or childPage.name,
+                depth = 1,
+                parentId = page.id,
+            })
+        end
+    end
+end
+
 -- ============================================================
 -- Navigation UI Creation
 -- ============================================================
@@ -111,7 +177,7 @@ end
 -- @param label string Button label
 -- @param pageId string Page ID this button links to
 -- @return Button The created button
-local function CreateNavButton(parent, label, pageId)
+local function CreateNavButton(parent, label, pageId, depth)
     local btn = CreateFrame("Button", nil, parent)
     btn:SetSize(C.NAV_WIDTH - C.PADDING * 2, C.NAV_BUTTON_HEIGHT)
     
@@ -122,7 +188,7 @@ local function CreateNavButton(parent, label, pageId)
     
     -- Label text
     btn.text = btn:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    btn.text:SetPoint("LEFT", btn, "LEFT", 8, 0)
+    btn.text:SetPoint("LEFT", btn, "LEFT", 8 + ((depth or 0) * 14), 0)
     btn.text:SetText(label)
     btn.text:SetJustifyH("LEFT")
     
@@ -145,7 +211,44 @@ local function CreateNavButton(parent, label, pageId)
     end)
     
     btn.pageId = pageId
+    btn.depth = depth or 0
     return btn
+end
+
+function SettingsWindow:UpdateNavLayout()
+    if not self.navPanel then return end
+
+    local activeRootId = GetRootPageId(self.currentPageId)
+    local yOffset = -C.PADDING
+
+    if self.navBanner then
+        self.navBanner:SetPoint("TOP", self.navPanel, "TOP", 0, yOffset)
+        yOffset = yOffset - C.BANNER_HEIGHT - 4
+    end
+
+    if self.navVersionText then
+        self.navVersionText:SetPoint("TOP", self.navPanel, "TOP", 0, yOffset)
+        yOffset = yOffset - C.VERSION_HEIGHT
+    end
+
+    for _, item in ipairs(self.navItems) do
+        if item.type == "spacer" then
+            yOffset = yOffset - item.height
+        elseif item.type == "page" then
+            local btn = self.navButtons[item.id]
+            if btn then
+                local isVisible = not item.parentId or item.parentId == activeRootId
+                if isVisible then
+                    btn:Show()
+                    btn:ClearAllPoints()
+                    btn:SetPoint("TOP", self.navPanel, "TOP", 0, yOffset)
+                    yOffset = yOffset - C.NAV_BUTTON_HEIGHT - C.NAV_BUTTON_GAP
+                else
+                    btn:Hide()
+                end
+            end
+        end
+    end
 end
 
 -- Build the navigation panel UI
@@ -158,6 +261,7 @@ function SettingsWindow:BuildNavPanel(navPanel)
     banner:SetPoint("TOP", navPanel, "TOP", 0, yOffset)
     banner:SetSize(C.NAV_WIDTH - C.PADDING * 2, C.BANNER_HEIGHT)
     banner:SetTexture(C.BANNER_TEXTURE)
+    self.navBanner = banner
     yOffset = yOffset - C.BANNER_HEIGHT - 4
     
     -- Version text
@@ -165,6 +269,7 @@ function SettingsWindow:BuildNavPanel(navPanel)
     versionText:SetPoint("TOP", navPanel, "TOP", 0, yOffset)
     versionText:SetText(GetVersionString())
     versionText:SetTextColor(0.7, 0.7, 0.7, 1)
+    self.navVersionText = versionText
     yOffset = yOffset - C.VERSION_HEIGHT
     
     -- Build navigation items
@@ -172,13 +277,15 @@ function SettingsWindow:BuildNavPanel(navPanel)
         if item.type == "spacer" then
             yOffset = yOffset - item.height
         elseif item.type == "page" then
-            local btn = CreateNavButton(navPanel, item.label, item.id)
+            local btn = CreateNavButton(navPanel, item.label, item.id, item.depth)
             btn:SetPoint("TOP", navPanel, "TOP", 0, yOffset)
             yOffset = yOffset - C.NAV_BUTTON_HEIGHT - C.NAV_BUTTON_GAP
             
             self.navButtons[item.id] = btn
         end
     end
+
+    self:UpdateNavLayout()
 end
 
 -- Update navigation button states to reflect selected tab
@@ -193,6 +300,8 @@ function SettingsWindow:UpdateNavButtonStates(selectedPageId)
             btn.text:SetTextColor(0.8, 0.8, 0.8, 1)
         end
     end
+
+    self:UpdateNavLayout()
 end
 
 -- ============================================================
@@ -220,6 +329,7 @@ function SettingsWindow:GetOrCreatePagePanel(pageId)
     local panel = CreateFrame("Frame", nil, self.contentHost)
     panel:SetAllPoints(self.contentHost)
     panel:Hide()
+    panel.__sfPageLayout = page.layout or {}
     
     -- Build the page UI into this panel (lazy build)
     if type(page.Build) == "function" then
@@ -235,10 +345,24 @@ function SettingsWindow:GetOrCreatePagePanel(pageId)
     return panel
 end
 
+function SettingsWindow:ApplyPageLayout(pageId)
+    if not self.frame then return end
+
+    local layout = GetPageLayout(pageId) or {}
+    local width = layout.windowWidth or C.WIDTH
+    local height = layout.windowHeight or C.HEIGHT
+
+    if math.abs((self.frame:GetWidth() or 0) - width) > 0.5 or math.abs((self.frame:GetHeight() or 0) - height) > 0.5 then
+        self.frame:SetSize(width, height)
+    end
+end
+
 -- Select and display a tab by page ID
 -- @param pageId string The page ID to select
 function SettingsWindow:SelectTab(pageId)
     if not pageId then return end
+
+    pageId = ResolveSelectablePageId(pageId)
     
     if SF.Debug then
         SF.Debug:Verbose("UI", "Selecting tab: %s", pageId)
@@ -248,6 +372,8 @@ function SettingsWindow:SelectTab(pageId)
     if self.currentPageId and self.pagePanels[self.currentPageId] then
         self.pagePanels[self.currentPageId]:Hide()
     end
+
+    self:ApplyPageLayout(pageId)
     
     -- Get or create the new page panel
     local panel = self:GetOrCreatePagePanel(pageId)
@@ -360,13 +486,7 @@ function SettingsWindow:Init()
         SF.Debug:Info("UI", "Initializing Standalone Settings Window")
     end
     
-    -- Define navigation structure
-    self:AddNavSpacer()
-    self:AddNavPage("general", "General")
-    self:AddNavPage("lootHelper", "Loot Helper")
-    self:AddNavPage("lootLogs", "Loot Logs")
-    self:AddNavSpacer()
-    self:AddNavPage("debugging", "Debugging")
+    self:BuildNavItemsFromRegistry()
     
     -- Create the window frame
     self:CreateWindow()

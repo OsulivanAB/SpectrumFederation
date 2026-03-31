@@ -33,18 +33,49 @@ function PageBuilder:Init(panel)
 	end
 
 	self.panel = panel
+	self.layout = panel.__sfPageLayout or {}
 	self.sections = {}
 	self.refreshCallbacks = {}
+
+	if self.layout.disablePageScroll then
+		local host = CreateFrame("Frame", nil, panel)
+		self.scrollFrame = host
+		host:SetAllPoints(panel)
+
+		local content = CreateFrame("Frame", nil, host)
+		self.content = content
+		content:SetPoint("TOPLEFT", host, "TOPLEFT", 0, 0)
+		content:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, 0)
+		content:SetHeight(1)
+
+		local function UpdateContentWidth()
+			local w = host:GetWidth() or 0
+			content:SetWidth(math.max(1, w))
+		end
+
+		host:HookScript("OnSizeChanged", function()
+			UpdateContentWidth()
+			self:Reflow()
+		end)
+
+		UpdateContentWidth()
+		return
+	end
 
 	local scroll = CreateFrame("ScrollFrame", nil, panel, "UIPanelScrollFrameTemplate")
 	self.scrollFrame = scroll
 	
-	-- Position scrollFrame to fill the panel, accounting for scrollbar
-	-- The scrollbar is part of the ScrollFrame but overlays the right edge
-	-- Inset from right by scrollbar width to keep it visible
-	local SCROLLBAR_INSET = 24  -- Standard WoW scrollbar width
+	local SCROLLBAR_INSET = 24
+	local SCROLLBAR_RIGHT_OFFSET = -2
+	local SCROLLBAR_BUTTON_CLEARANCE = 8
 	scroll:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, 0)
 	scroll:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -SCROLLBAR_INSET, 0)
+
+	if scroll.ScrollBar then
+		scroll.ScrollBar:ClearAllPoints()
+		scroll.ScrollBar:SetPoint("TOPRIGHT", panel, "TOPRIGHT", SCROLLBAR_RIGHT_OFFSET, -(16 + SCROLLBAR_BUTTON_CLEARANCE))
+		scroll.ScrollBar:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", SCROLLBAR_RIGHT_OFFSET, 16 + SCROLLBAR_BUTTON_CLEARANCE)
+	end
 
 	local content = CreateFrame("Frame", nil, scroll)
 	self.content = content
@@ -86,11 +117,16 @@ end
 -- Add a new section to the page
 -- @param title string Section title/header
 -- @return Section The created section object
-function PageBuilder:AddSection(title)
+
+function PageBuilder:AddSection(titleOrOptions)
+	local title = titleOrOptions
+	if type(titleOrOptions) == "table" then
+		title = titleOrOptions.title
+	end
 	if SF.Debug then
 		SF.Debug:Verbose("UI", "Adding section '%s' to page", tostring(title))
 	end
-	local section = UI.Section:Create(self.content, title)
+	local section = UI.Section:Create(self.content, titleOrOptions)
 	section.__sfPageBuilder = self
 	table.insert(self.sections, section)
 	return section
@@ -105,8 +141,42 @@ end
 -- Reflow section layout based on visibility and sizing
 -- @return nil
 function PageBuilder:Reflow()
+	local visibleSections = {}
+	local fillSections = {}
+
+	for _, sec in ipairs(self.sections) do
+		if sec.ClearAssignedHeight then
+			sec:ClearAssignedHeight()
+		end
+		if sec:IsShown() then
+			table.insert(visibleSections, sec)
+			if sec.__sfFillHeight then
+				table.insert(fillSections, sec)
+			end
+		end
+	end
+
+	local naturalTotal = PAGE_PADDING_TOP + PAGE_PADDING_BOTTOM
+	for index, sec in ipairs(visibleSections) do
+		if index > 1 then
+			naturalTotal = naturalTotal + SECTION_SPACING
+		end
+		naturalTotal = naturalTotal + (sec:GetHeight() or 0)
+	end
+
 	local prevShown
 	local total = PAGE_PADDING_TOP + PAGE_PADDING_BOTTOM
+	local viewH = self.scrollFrame:GetHeight() or 0
+	local extra = math.max(0, (viewH - 1) - naturalTotal)
+
+	if #fillSections > 0 and extra > 0 then
+		local extraPerSection = extra / #fillSections
+		for _, sec in ipairs(fillSections) do
+			if sec.SetAssignedHeight then
+				sec:SetAssignedHeight((sec:GetHeight() or 0) + extraPerSection)
+			end
+		end
+	end
 
 	for _, sec in ipairs(self.sections) do
 		sec:ClearAllPoints()
@@ -126,7 +196,6 @@ function PageBuilder:Reflow()
 		end
 	end
 
-	local viewH = self.scrollFrame:GetHeight() or 0
 	total = math.max(total, viewH - 1)
 
 	self.content:SetHeight(total)

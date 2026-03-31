@@ -3,9 +3,17 @@ local _, SF = ...
 
 local Page = {
 	id = "lootLogs",
+	parentId = "lootHelper",
 	name = "Loot Logs",
-	order = 30,
+	navLabel = "Loot Logs",
+	order = 24,
+	layout = {
+		windowWidth = 1350,
+		disablePageScroll = true,
+	},
 }
+
+local GetEventTypeLabel
 
 -- ==================================================================
 -- Helpers
@@ -76,136 +84,174 @@ local function GetEventTypeOptions()
 	
 	local options = {}
 	for _, eventType in pairs(SF.LootLogEventTypes) do
-		table.insert(options, { value = eventType, label = eventType })
+		table.insert(options, { value = eventType, label = GetEventTypeLabel(eventType) })
 	end
 	
 	table.sort(options, function(a, b) return a.label < b.label end)
 	return options
 end
 
--- Format a log entry for display with color coding
--- @param log LootLog Log entry
--- @return string Formatted log text
-local function FormatLogEntry(log)
-	if type(log.GetTimestamp) ~= "function" then
-		return "Invalid log entry"
+local function ToWoWHexColor(color)
+	if type(color) == "string" then
+		return color
 	end
-	
-	-- Helper function to convert RGB color table to WoW hex color
-	local function ToWoWHexColor(color)
-		if type(color) == "string" then
-			return color
-		end
-		if type(color) == "table" then
-			local r = tonumber(color.r or color[1] or 1) or 1
-			local g = tonumber(color.g or color[2] or 1) or 1
-			local b = tonumber(color.b or color[3] or 1) or 1
-			r = math.min(math.max(r, 0), 1)
-			g = math.min(math.max(g, 0), 1)
-			b = math.min(math.max(b, 0), 1)
-			return string.format("|cff%02x%02x%02x", r * 255, g * 255, b * 255)
-		end
+	if type(color) == "table" then
+		local r = tonumber(color.r or color[1] or 1) or 1
+		local g = tonumber(color.g or color[2] or 1) or 1
+		local b = tonumber(color.b or color[3] or 1) or 1
+		r = math.min(math.max(r, 0), 1)
+		g = math.min(math.max(g, 0), 1)
+		b = math.min(math.max(b, 0), 1)
+		return string.format("|cff%02x%02x%02x", r * 255, g * 255, b * 255)
+	end
+	return "|cffffffff"
+end
+
+local function GetPlayerClassColor(playerName)
+	if not playerName or playerName == "Unknown" or playerName == "?" then
 		return "|cffffffff"
 	end
-	
-	-- Get class color for a player name
-	local function GetPlayerClassColor(playerName)
-		if not playerName or playerName == "Unknown" or playerName == "?" then
-			return "|cffffffff"  -- White for unknown
+
+	local profile = SF:GetActiveProfile()
+	if profile and type(profile.GetMemberByID) == "function" then
+		local member = profile:GetMemberByID(playerName)
+		if member and member.class and SF.WOW_CLASSES and SF.WOW_CLASSES[member.class] then
+			return ToWoWHexColor(SF.WOW_CLASSES[member.class].colorCode)
 		end
-		
-		-- Try to get member from active profile
-		local profile = SF:GetActiveProfile()
-		if profile and type(profile.GetMemberByID) == "function" then
-			local member = profile:GetMemberByID(playerName)
-			if member and member.class and SF.WOW_CLASSES and SF.WOW_CLASSES[member.class] then
-				return ToWoWHexColor(SF.WOW_CLASSES[member.class].colorCode)
-			end
-		end
-		
-		return "|cffffff00"  -- Yellow as fallback
 	end
-	
-	-- Define colors
-	local EVENT_TYPE_COLORS = {
-		PROFILE_CREATION           = "|cff00ff00",  -- Green
-		POINT_CHANGE               = "|cff00ccff",  -- Cyan
-		ARMOR_CHANGE               = "|cffffa500",  -- Orange
-		ROLE_CHANGE                = "|cffff00ff",  -- Magenta
-		POINT_NAME_CHANGE          = "|cffffcc00",  -- Gold
-		PROFILE_NAME_CHANGE        = "|cff00ff00",  -- Green
-		SAFEMODE_CHANGE            = "|cffff6600",  -- Red-Orange
-		SAFEMODE_ON_COMBAT_CHANGE  = "|cffff6600",  -- Red-Orange
-		ADMIN_ADDED                = "|cff66ff66",  -- Light Green
-		ADMIN_REMOVED              = "|cffff6666",  -- Light Red
-	}
-	local TIMESTAMP_COLOR = "|cffffffff"  -- White
-	local RESET = "|r"
-	
+
+	return "|cffffff00"
+end
+
+local EVENT_TYPE_COLORS = {
+	PROFILE_CREATION = "|cff00ff00",
+	POINT_CHANGE = "|cff00ccff",
+	ARMOR_CHANGE = "|cffffa500",
+	ROLE_CHANGE = "|cffff00ff",
+	POINT_NAME_CHANGE = "|cffffcc00",
+	PROFILE_NAME_CHANGE = "|cff00ff00",
+	SAFEMODE_CHANGE = "|cffff6600",
+	SAFEMODE_ON_COMBAT_CHANGE = "|cffff6600",
+	ADMIN_ADDED = "|cff66ff66",
+	ADMIN_REMOVED = "|cffff6666",
+}
+
+local EVENT_TYPE_LABELS = {
+	PROFILE_CREATION = "Profile Creation",
+	POINT_CHANGE = "Point Change",
+	ARMOR_CHANGE = "Armor Change",
+	ROLE_CHANGE = "Role Change",
+	POINT_NAME_CHANGE = "Point Name Change",
+	PROFILE_NAME_CHANGE = "Profile Name Change",
+	SAFEMODE_CHANGE = "Raid Safe Mode",
+	SAFEMODE_ON_COMBAT_CHANGE = "Combat Safe Mode",
+	ADMIN_ADDED = "Admin Added",
+	ADMIN_REMOVED = "Admin Removed",
+}
+
+function GetEventTypeLabel(eventType)
+	return EVENT_TYPE_LABELS[eventType] or tostring(eventType or "Unknown")
+end
+
+local function ColorizeName(name)
+	if not name or name == "" then
+		return ""
+	end
+	local reset = "|r"
+	return string.format("%s%s%s", GetPlayerClassColor(name), name, reset)
+end
+
+local function FormatLabel(value)
+	local text = tostring(value or "")
+	if text == "" then
+		return ""
+	end
+
+	text = text:gsub("_", " "):lower()
+	text = text:gsub("(%a)([%w']*)", function(first, rest)
+		return string.upper(first) .. rest
+	end)
+	return text
+end
+
+local function GetArmorSlotLabel(slot)
+	if slot == nil or slot == "" then
+		return "Armor Spot"
+	end
+	return FormatLabel(slot) .. " Armor Spot"
+end
+
+local function BuildActionText(eventType, data, author)
+	data = data or {}
+
+	if eventType == "POINT_CHANGE" then
+		local isRaidCheck = (data.reason == "RAID_CHECK") or (author == "Raid Check")
+		if isRaidCheck and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
+			return "Raid Check prepared (+1)"
+		elseif isRaidCheck then
+			return string.format("Raid Check change (%s)", FormatLabel(data.change or "?"))
+		end
+
+		if data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
+			return "Points Increased"
+		elseif data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
+			return "Points Decreased"
+		end
+
+		return FormatLabel(data.change or "?")
+	elseif eventType == "ARMOR_CHANGE" then
+		local slotLabel = GetArmorSlotLabel(data.slot)
+		if data.action == (SF.LootLogArmorActions and SF.LootLogArmorActions.USED) then
+			return slotLabel .. " Used"
+		elseif data.action == (SF.LootLogArmorActions and SF.LootLogArmorActions.AVAILABLE) then
+			return slotLabel .. " Available"
+		end
+		return slotLabel .. " " .. FormatLabel(data.action or "")
+	elseif eventType == "ROLE_CHANGE" then
+		return string.format("Role -> %s", tostring(data.newRole or "?"))
+	elseif eventType == "PROFILE_CREATION" then
+		return string.format("Created profile %s", tostring(data.profileId or "?"))
+	elseif eventType == "POINT_NAME_CHANGE" then
+		return string.format("%s -> %s", tostring(data.oldName or "?"), tostring(data.newName or "?"))
+	elseif eventType == "PROFILE_NAME_CHANGE" then
+		return string.format("%s -> %s", tostring(data.oldName or "?"), tostring(data.newName or "?"))
+	elseif eventType == "SAFEMODE_CHANGE" then
+		return data.enabled and "Enabled" or "Disabled"
+	elseif eventType == "SAFEMODE_ON_COMBAT_CHANGE" then
+		return data.enabled and "Enabled" or "Disabled"
+	elseif eventType == "ADMIN_ADDED" then
+		return "Added as admin"
+	elseif eventType == "ADMIN_REMOVED" then
+		return "Removed from admins"
+	end
+
+	return ""
+end
+
+local function BuildLogRow(log)
+	if type(log) ~= "table" or type(log.GetTimestamp) ~= "function" then
+		return nil
+	end
+
 	local timestamp = log:GetTimestamp()
 	local author = log:GetAuthor() or "Unknown"
 	local eventType = log:GetEventType() or "Unknown"
-	local data = log:GetEventData() or {}
-	
-	local timeStr = type(SF.FormatTimestampForUser) == "function" 
-		and SF:FormatTimestampForUser(timestamp) 
-		or tostring(timestamp)
-	
-	local eventTypeColor = EVENT_TYPE_COLORS[eventType] or "|cffffffff"
-	local authorColor = GetPlayerClassColor(author)
-	
-	local details = ""
-	if eventType == "POINT_CHANGE" then
-		local memberColor = GetPlayerClassColor(data.member)
-		local isRaidCheck = (data and data.reason == "RAID_CHECK") or (author == "Raid Check")
+	local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
+	local eventColor = EVENT_TYPE_COLORS[eventType] or "|cffffffff"
+	local reset = "|r"
 
-		if isRaidCheck and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
-			details = string.format("Member: %s%s%s, Action: Raid Check prepared (+1)", 
-				memberColor, data.member or "?", RESET)
-		elseif isRaidCheck then
-			details = string.format("Member: %s%s%s, Action: Raid Check change (%s)", 
-				memberColor, data.member or "?", RESET, data.change or "?")
-		else
-			details = string.format("Member: %s%s%s, Change: %s", 
-				memberColor, data.member or "?", RESET, data.change or "?")
-		end
-	elseif eventType == "ARMOR_CHANGE" then
-		local memberColor = GetPlayerClassColor(data.member)
-		details = string.format("Member: %s%s%s, Slot: %s, Action: %s", 
-			memberColor, data.member or "?", RESET, data.slot or "?", data.action or "?")
-	elseif eventType == "ROLE_CHANGE" then
-		local memberColor = GetPlayerClassColor(data.member)
-		details = string.format("Member: %s%s%s, New Role: %s", 
-			memberColor, data.member or "?", RESET, data.newRole or "?")
-	elseif eventType == "PROFILE_CREATION" then
-		details = string.format("Profile ID: %s", data.profileId or "?")
-	elseif eventType == "POINT_NAME_CHANGE" then
-		details = string.format("Changed from '%s' to '%s'", 
-			data.oldName or "?", data.newName or "?")
-	elseif eventType == "PROFILE_NAME_CHANGE" then
-		details = string.format("Renamed from '%s' to '%s'", 
-			data.oldName or "?", data.newName or "?")
-	elseif eventType == "SAFEMODE_CHANGE" then
-		local status = data.enabled and "Enabled" or "Disabled"
-		details = string.format("Raid-wide Safemode: %s", status)
-	elseif eventType == "SAFEMODE_ON_COMBAT_CHANGE" then
-		local status = data.enabled and "Enabled" or "Disabled"
-		details = string.format("Safemode on Combat: %s", status)
-	elseif eventType == "ADMIN_ADDED" then
-		local memberColor = GetPlayerClassColor(data.member)
-		details = string.format("Added %s%s%s as admin", 
-			memberColor, data.member or "?", RESET)
-	elseif eventType == "ADMIN_REMOVED" then
-		local memberColor = GetPlayerClassColor(data.member)
-		details = string.format("Removed %s%s%s from admins", 
-			memberColor, data.member or "?", RESET)
-	end
-	
-	return string.format("%s[%s]%s %s%s%s by %s%s%s - %s", 
-		TIMESTAMP_COLOR, timeStr, RESET,
-		eventTypeColor, eventType, RESET,
-		authorColor, author, RESET,
-		details)
+	local dateText = type(SF.FormatTimestampForUser) == "function"
+		and SF:FormatTimestampForUser(timestamp)
+		or tostring(timestamp)
+
+	return {
+		date = dateText,
+		changeType = string.format("%s%s%s", eventColor, GetEventTypeLabel(eventType), reset),
+		author = ColorizeName(author),
+		member = ColorizeName(data.member),
+		action = BuildActionText(eventType, data, author),
+		item = "",
+	}
 end
 
 -- ==================================================================
@@ -277,111 +323,121 @@ function Page:Build(panel)
 		return filtered
 	end
 
-	local function BuildLogText()
-		local logs = GetFilteredLogs()
-		
-		if #logs == 0 then
-			return "No logs found matching the selected filters.\n\nCreate a profile and perform actions to see logs here."
+	local function BuildLogRows()
+		local rows = {}
+		for _, log in ipairs(GetFilteredLogs()) do
+			local row = BuildLogRow(log)
+			if row then
+				table.insert(rows, row)
+			end
 		end
-		
-		local lines = {}
-		table.insert(lines, string.format("Showing %d log(s):\n", #logs))
-		
-		for i, log in ipairs(logs) do
-			table.insert(lines, FormatLogEntry(log))
-		end
-		
-		return table.concat(lines, "\n")
+		return rows
 	end
 
 	local def = {
 		sections = {
 			{
-				id = "filters",
-				title = "Filters",
-				items = {
-					{
-						type = "dropdown",
-						label = "Log Type",
-						tooltip = "Filter logs by event type",
-						defaultText = "All Types",
-						options = function()
-							return GetEventTypeOptions()
-						end,
-						get = function()
-							return panel.__sfSelectedEventType
-						end,
-						set = function(value)
-							panel.__sfSelectedEventType = value
-						end,
-						onValueChanged = function(ctx)
-							ctx.pageBuilder:Refresh()
-						end,
-					},
-					
-					{
-						type = "dropdown",
-						label = "Author",
-						tooltip = "Filter logs by author (who created the log)",
-						defaultText = "All Authors",
-						options = function()
-							return GetUniqueAuthors(GetAllLogs())
-						end,
-						get = function()
-							return panel.__sfSelectedAuthor
-						end,
-						set = function(value)
-							panel.__sfSelectedAuthor = value
-						end,
-						onValueChanged = function(ctx)
-							ctx.pageBuilder:Refresh()
-						end,
-					},
-					
-					{
-						type = "dropdown",
-						label = "Member",
-						tooltip = "Filter logs by member name (may not apply to all log types)",
-						defaultText = "All Members",
-						options = function()
-							return GetUniqueMembers(GetAllLogs())
-						end,
-						get = function()
-							return panel.__sfSelectedMember
-						end,
-						set = function(value)
-							panel.__sfSelectedMember = value
-						end,
-						onValueChanged = function(ctx)
-							ctx.pageBuilder:Refresh()
-						end,
-					},
-					
-					{
-						type = "button",
-						label = "Clear Filters",
-						buttonText = "Clear",
-						width = 100,
-						onClick = function(ctx)
-							panel.__sfSelectedEventType = nil
-							panel.__sfSelectedAuthor = nil
-							panel.__sfSelectedMember = nil
-							ctx.pageBuilder:Refresh()
-						end,
-					},
-				},
-			},
-			
-			{
 				id = "logs",
-				title = "Log Entries",
+				title = "Loot Logs",
+				tooltip = "Review a history of Loot Helper changes, including profile edits, session events, point adjustments, and admin actions.",
+				fillHeight = true,
 				items = {
 					{
-						type = "scrollableText",
-						label = "",
-						height = 300,
-						get = function()
-							return BuildLogText()
+						type = "inlineControls",
+						spacing = 10,
+						items = {
+							{
+								type = "dropdown",
+								tooltip = "Show only log entries for a specific kind of event, such as point changes or profile updates.",
+								defaultText = "All Types",
+								width = 190,
+								options = function()
+									return GetEventTypeOptions()
+								end,
+								get = function()
+									return panel.__sfSelectedEventType
+								end,
+								set = function(value)
+									panel.__sfSelectedEventType = value
+								end,
+								onValueChanged = function()
+									if panel.__sfPageBuilder then
+										panel.__sfPageBuilder:Refresh()
+									end
+								end,
+							},
+							{
+								type = "dropdown",
+								tooltip = "Show only log entries created by a specific player.",
+								defaultText = "All Authors",
+								width = 190,
+								options = function()
+									return GetUniqueAuthors(GetAllLogs())
+								end,
+								get = function()
+									return panel.__sfSelectedAuthor
+								end,
+								set = function(value)
+									panel.__sfSelectedAuthor = value
+								end,
+								onValueChanged = function()
+									if panel.__sfPageBuilder then
+										panel.__sfPageBuilder:Refresh()
+									end
+								end,
+							},
+							{
+								type = "dropdown",
+								tooltip = "Show only log entries about a specific member when the event includes one.",
+								defaultText = "All Members",
+								width = 190,
+								options = function()
+									return GetUniqueMembers(GetAllLogs())
+								end,
+								get = function()
+									return panel.__sfSelectedMember
+								end,
+								set = function(value)
+									panel.__sfSelectedMember = value
+								end,
+								onValueChanged = function()
+									if panel.__sfPageBuilder then
+										panel.__sfPageBuilder:Refresh()
+									end
+								end,
+							},
+							{
+								type = "button",
+								buttonText = "Clear",
+								tooltip = "Clear every active Loot Log filter and show the full history again.",
+								width = 100,
+								onClick = function()
+									panel.__sfSelectedEventType = nil
+									panel.__sfSelectedAuthor = nil
+									panel.__sfSelectedMember = nil
+									if panel.__sfPageBuilder then
+										panel.__sfPageBuilder:Refresh()
+									end
+								end,
+							},
+						},
+					},
+					{
+						type = "logTable",
+						fillHeight = true,
+						minHeight = 320,
+						rowHeight = 22,
+						columns = {
+							{ key = "date", label = "Date", width = 170 },
+							{ key = "changeType", label = "Type of Change", width = 170 },
+							{ key = "member", label = "Member", width = 135 },
+							{ key = "action", label = "Action", width = 240 },
+							{ key = "item", label = "Item", width = 210 },
+							{ key = "author", label = "Author" },
+						},
+						emptyText = "No logs found matching the selected filters.\n\nCreate a profile and perform actions to see logs here.",
+						getRows = function()
+							return BuildLogRows()
 						end,
 					},
 				},

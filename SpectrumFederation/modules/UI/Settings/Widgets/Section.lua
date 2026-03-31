@@ -14,6 +14,9 @@ local HEADER_HEIGHT          = S.headerHeight or 22
 local LINE_THICKNESS         = S.lineThickness or 1
 local LINE_ALPHA             = S.lineAlpha or 0.28
 local TITLE_GAP              = S.titleGap or 10
+local INFO_BUTTON_SIZE       = S.infoButtonSize or 14
+local INFO_BUTTON_GAP        = S.infoButtonGap or 2
+local INFO_BUTTON_OFFSET_Y   = S.infoButtonOffsetY or 4
 
 local CONTENT_INSET_X        = S.contentInsetX or 12
 local CONTENT_PADDING_TOP    = S.paddingTop or 10
@@ -36,24 +39,65 @@ local function ApplyMixin(obj, mixin)
 end
 local Mix = _G.Mixin or ApplyMixin
 
+local function NormalizeSectionOptions(titleOrOptions, tooltipText)
+	if type(titleOrOptions) == "table" then
+		return {
+			title = titleOrOptions.title,
+			tooltip = titleOrOptions.tooltip,
+		}
+	end
+
+	return {
+		title = titleOrOptions,
+		tooltip = tooltipText,
+	}
+end
+
+local function SetTooltipHandlers(region, title, text)
+	if not region then return end
+
+	if not text or text == "" then
+		GameTooltip:Hide()
+		region:EnableMouse(false)
+		region:SetScript("OnEnter", nil)
+		region:SetScript("OnLeave", nil)
+		return
+	end
+
+	region:EnableMouse(true)
+	region:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText(title or "", 1, 1, 1)
+		GameTooltip:AddLine(text, nil, nil, nil, true)
+		GameTooltip:Show()
+	end)
+	region:SetScript("OnLeave", function()
+		GameTooltip:Hide()
+	end)
+end
+
 -- Create a new Section frame widget
 -- @param parent Frame Parent frame to attach section to
 -- @param title string|nil Section title text
 -- @return Frame Section frame with mixin methods
-function UI.Section:Create(parent, title)
+function UI.Section:Create(parent, titleOrOptions, tooltipText)
+	local options = NormalizeSectionOptions(titleOrOptions, tooltipText)
 	local frame = CreateFrame("Frame", nil, parent)
 	Mix(frame, SectionMixin)
-	frame:Init(title)
+	frame:Init(options)
 	return frame
 end
 
 -- Initialize the section frame layout and header
 -- @param title string|nil Section title text
 -- @return nil
-function SectionMixin:Init(title)
-	self.title = title or ""
+function SectionMixin:Init(titleOrOptions)
+	local options = NormalizeSectionOptions(titleOrOptions)
+	self.title = options.title or ""
+	self.tooltipText = options.tooltip or ""
 	self._rows = {}
 	self._contentHeight = 0
+	self.__sfAssignedHeight = nil
 
 	-- Header frame
 	local header = CreateFrame("Frame", nil, self)
@@ -62,11 +106,38 @@ function SectionMixin:Init(title)
 	header:SetPoint("TOPRIGHT", self, "TOPRIGHT", 0, 0)
 	header:SetHeight(HEADER_HEIGHT)
 
-	-- Header label (centered)
+	local titleContainer = CreateFrame("Frame", nil, header)
+	self.HeaderTitleContainer = titleContainer
+	titleContainer:SetPoint("CENTER", header, "CENTER", 0, 0)
+	titleContainer:SetHeight(HEADER_HEIGHT)
+	titleContainer:SetWidth(1)
+
+	-- Header label and info icon container
 	local label = header:CreateFontString(nil, "ARTWORK", "GameFontNormal")
 	self.HeaderLabel = label
-	label:SetPoint("CENTER", header, "CENTER", 0, 0)
+	label:SetPoint("LEFT", titleContainer, "LEFT", 0, 0)
+	label:SetJustifyH("LEFT")
 	label:SetText(self.title)
+
+	local infoButton = CreateFrame("Button", nil, titleContainer)
+	self.HeaderInfoButton = infoButton
+	infoButton:SetSize(INFO_BUTTON_SIZE, INFO_BUTTON_SIZE)
+	infoButton:SetPoint("LEFT", label, "RIGHT", INFO_BUTTON_GAP, INFO_BUTTON_OFFSET_Y)
+	infoButton:SetHitRectInsets(-4, -4, -4, -4)
+	infoButton:Hide()
+
+	local icon = infoButton:CreateTexture(nil, "ARTWORK")
+	self.HeaderInfoIcon = icon
+	icon:SetAllPoints(infoButton)
+	icon:SetTexture("Interface\\Common\\help-i")
+	icon:SetVertexColor(1, 0.82, 0.18, 0.95)
+
+	local highlight = infoButton:CreateTexture(nil, "HIGHLIGHT")
+	self.HeaderInfoHighlight = highlight
+	highlight:SetAllPoints(infoButton)
+	highlight:SetTexture("Interface\\Common\\help-i")
+	highlight:SetBlendMode("ADD")
+	highlight:SetVertexColor(1, 1, 1, 0.35)
 
 	-- Left line segment
 	local leftLine = header:CreateTexture(nil, "ARTWORK")
@@ -74,14 +145,14 @@ function SectionMixin:Init(title)
 	leftLine:SetColorTexture(1, 1, 1, LINE_ALPHA)
 	leftLine:SetHeight(LINE_THICKNESS)
 	leftLine:SetPoint("LEFT", header, "LEFT", 0, 0)
-	leftLine:SetPoint("RIGHT", label, "LEFT", -TITLE_GAP, 0)
+	leftLine:SetPoint("RIGHT", titleContainer, "LEFT", -TITLE_GAP, 0)
 
 	-- Right line segment
 	local rightLine = header:CreateTexture(nil, "ARTWORK")
 	self.RightLine = rightLine
 	rightLine:SetColorTexture(1, 1, 1, LINE_ALPHA)
 	rightLine:SetHeight(LINE_THICKNESS)
-	rightLine:SetPoint("LEFT", label, "RIGHT", TITLE_GAP, 0)
+	rightLine:SetPoint("LEFT", titleContainer, "RIGHT", TITLE_GAP, 0)
 	rightLine:SetPoint("RIGHT", header, "RIGHT", 0, 0)
 
 	-- Content container
@@ -121,8 +192,38 @@ function SectionMixin:Init(title)
 			self:_NotifyPageReflow()
 		end
 	end)
+
+	self:_UpdateHeaderLayout()
 	
 	self:ReflowRows()
+end
+
+function SectionMixin:_UpdateHeaderLayout()
+	local titleWidth = math.max(1, self.HeaderLabel:GetStringWidth() or 0)
+	local hasTooltip = self.tooltipText and self.tooltipText ~= ""
+	local buttonWidth = 0
+	local rightAnchor = self.HeaderLabel
+
+	if hasTooltip then
+		self.HeaderInfoButton:Show()
+		buttonWidth = INFO_BUTTON_SIZE + INFO_BUTTON_GAP
+		rightAnchor = self.HeaderInfoButton
+	else
+		GameTooltip:Hide()
+		self.HeaderInfoButton:Hide()
+	end
+
+	self.HeaderTitleContainer:SetWidth(titleWidth + buttonWidth)
+
+	self.LeftLine:ClearAllPoints()
+	self.LeftLine:SetPoint("LEFT", self.Header, "LEFT", 0, 0)
+	self.LeftLine:SetPoint("RIGHT", self.HeaderLabel, "LEFT", -TITLE_GAP, 0)
+
+	self.RightLine:ClearAllPoints()
+	self.RightLine:SetPoint("LEFT", rightAnchor, "RIGHT", TITLE_GAP, 0)
+	self.RightLine:SetPoint("RIGHT", self.Header, "RIGHT", 0, 0)
+
+	SetTooltipHandlers(self.HeaderInfoButton, self.title, self.tooltipText)
 end
 
 -- Set the section title text
@@ -131,6 +232,15 @@ end
 function SectionMixin:SetTitle(title)
 	self.title = title or ""
 	self.HeaderLabel:SetText(self.title)
+	self:_UpdateHeaderLayout()
+end
+
+-- Set the section header tooltip text
+-- @param text string|nil Tooltip text shown from header info icon
+-- @return nil
+function SectionMixin:SetTooltipText(text)
+	self.tooltipText = text or ""
+	self:_UpdateHeaderLayout()
 end
 
 -- Adds a full-width row frame stacked vertically inside Content
@@ -138,9 +248,11 @@ end
 -- @param height number Row height in pixels
 -- @param buildFn function|nil Optional builder to populate the row
 -- @return Frame The created row frame
-function SectionMixin:AddRow(height, buildFn)
+function SectionMixin:AddRow(height, buildFn, opts)
 	local row = CreateFrame("Frame", nil, self.Content)
 	row:SetHeight(height)
+	row.__sfBaseHeight = height
+	row.__sfFillHeight = opts and opts.fillHeight and true or false
 
 	table.insert(self._rows, row)
 
@@ -248,38 +360,60 @@ end
 -- Reflow row positions and content height
 -- @return nil
 function SectionMixin:ReflowRows()
-	local contentHeight = 0
-	local prev
+	local visibleRows = {}
+	local fillRows = {}
 
-	-- Postition message (if shown)
 	if self.MessageRow:IsShown() then
-		self.MessageRow:ClearAllPoints()
-		self.MessageRow:SetPoint("TOPLEFT", self.Content, "TOPLEFT", 0, 0)
-		self.MessageRow:SetPoint("TOPRIGHT", self.Content, "TOPRIGHT", 0, 0)
-
-		prev = self.MessageRow
-		contentHeight = contentHeight + (self.MessageRow:GetHeight() or 0)
-	else
-		prev = nil
+		table.insert(visibleRows, self.MessageRow)
 	end
 
-	-- Stack visible rows
 	for _, row in ipairs(self._rows) do
 		row:ClearAllPoints()
-
 		if row:IsShown() then
-			if prev then
-				row:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -ROW_SPACING)
-				row:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -ROW_SPACING)
-				contentHeight = contentHeight + ROW_SPACING + (row:GetHeight() or 0)
-			else
-				-- First visible row: anchor to content top
-				row:SetPoint("TOPLEFT", self.Content, "TOPLEFT", 0, 0)
-				row:SetPoint("TOPRIGHT", self.Content, "TOPRIGHT", 0, 0)
-				contentHeight = contentHeight + (row:GetHeight() or 0)
+			table.insert(visibleRows, row)
+			if row.__sfFillHeight then
+				table.insert(fillRows, row)
 			end
-			prev = row
 		end
+	end
+
+	local baseContentHeight = 0
+	for index, row in ipairs(visibleRows) do
+		if index > 1 then
+			baseContentHeight = baseContentHeight + ROW_SPACING
+		end
+		baseContentHeight = baseContentHeight + (row:GetHeight() or 0)
+	end
+
+	if #fillRows > 0 then
+		local targetContentHeight = nil
+		if self.__sfAssignedHeight then
+			targetContentHeight = math.max(1, self.__sfAssignedHeight - HEADER_HEIGHT - CONTENT_PADDING_TOP - CONTENT_PADDING_BOTTOM)
+		end
+
+		local extra = targetContentHeight and math.max(0, targetContentHeight - baseContentHeight) or 0
+		local extraPerRow = extra / #fillRows
+
+		for _, row in ipairs(fillRows) do
+			local baseHeight = row.__sfBaseHeight or row:GetHeight() or 0
+			row:SetHeight(baseHeight + extraPerRow)
+		end
+	end
+
+	local contentHeight = 0
+	local prev
+	for index, row in ipairs(visibleRows) do
+		if index > 1 then
+			row:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -ROW_SPACING)
+			row:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -ROW_SPACING)
+			contentHeight = contentHeight + ROW_SPACING
+		else
+			row:SetPoint("TOPLEFT", self.Content, "TOPLEFT", 0, 0)
+			row:SetPoint("TOPRIGHT", self.Content, "TOPRIGHT", 0, 0)
+		end
+
+		contentHeight = contentHeight + (row:GetHeight() or 0)
+		prev = row
 	end
 
 	self.Content:SetHeight(math.max(1, contentHeight))
@@ -307,6 +441,29 @@ function SectionMixin:_NotifyPageReflow()
 		pb:Reflow()
 		
 	end
+end
+
+function SectionMixin:SetAssignedHeight(height)
+	local newHeight = tonumber(height)
+	if not newHeight or newHeight <= 0 then
+		return
+	end
+
+	if self.__sfAssignedHeight and math.abs(self.__sfAssignedHeight - newHeight) <= 0.5 then
+		return
+	end
+
+	self.__sfAssignedHeight = newHeight
+	self:ReflowRows()
+end
+
+function SectionMixin:ClearAssignedHeight()
+	if not self.__sfAssignedHeight then
+		return
+	end
+
+	self.__sfAssignedHeight = nil
+	self:ReflowRows()
 end
 
 -- Schedule a deferred reflow to coalesce multiple requests

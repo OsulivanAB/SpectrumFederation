@@ -113,6 +113,40 @@ end
 -- Register Loot Helper slash commands
 -- @return nil
 function SF:RegisterLootHelperSlashCommands()
+    local function RunManualLootSync(reason)
+        if not (SF.LootHelperSync and SF.LootHelperSync.RequestManualSync) then
+            SF:PrintError("Loot Helper Sync system not available")
+            return
+        end
+
+        local ok, status = SF.LootHelperSync:RequestManualSync(reason or "slash_manual_sync")
+        if not ok then
+            if status == "is coordinator" then
+                SF:PrintInfo("You are the session coordinator, so your local profile already defines the session state.")
+            elseif status == "no active session" then
+                SF:PrintError("No active Loot Helper session.")
+            elseif status == "no coordinator" then
+                SF:PrintError("No session coordinator is available.")
+            elseif status == "no profile" then
+                SF:PrintError("The active session does not have a valid profile selected.")
+            else
+                SF:PrintError(tostring(status or "Manual sync failed."))
+            end
+            return
+        end
+
+        if status == "profile_sync_requested" then
+            SF:PrintSuccess("Profile sync requested. The session coordinator or a helper will compare your state and send any missing profile data.")
+        elseif status == "profile_sync_in_progress" then
+            SF:PrintInfo("A profile sync is already in progress.")
+        elseif status == "log_sync_requested" then
+            SF:PrintSuccess("Sync check requested. Missing logs will be compared with the session and synchronized as needed.")
+        elseif status == "log_sync_in_progress" then
+            SF:PrintInfo("A log sync is already in progress.")
+        else
+            SF:PrintSuccess("Your local Loot Helper data already matches the current session.")
+        end
+    end
     
     -- List all profiles
     SF:RegisterSlashCommand("profiles", function()
@@ -295,6 +329,11 @@ function SF:RegisterLootHelperSlashCommands()
 	    SF:RegisterSlashCommand("loot", function(args)
 	        -- Parse subcommands
 	        args = args:trim():lower()
+
+        if args == "sync" then
+            RunManualLootSync("slash_loot_sync")
+            return
+        end
         
         -- Handle "session start" subcommand
         if args == "session start" then
@@ -397,5 +436,5 @@ function SF:RegisterLootHelperSlashCommands()
                 end
             end
         end
-    end, "Enable Loot Helper or manage sessions (/sf loot session start|end)")
+        end, "Enable Loot Helper or manage sessions (/sf loot session start|end|sync)")
 end

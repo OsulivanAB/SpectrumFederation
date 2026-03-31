@@ -418,11 +418,29 @@ function Sync:SendJoinStatus()
     local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax)
 
     if missing and #missing > 0 then
-        -- Fetch missing logs (helpers preferred; coordinator fallback via request retry)
-        self:RequestMissingLogs(missing, "join-status")
+        local filtered = {}
+        for _, range in ipairs(missing) do
+            if type(range) == "table" then
+                local author = range.author
+                local fromCounter = range.fromCounter
+                local toCounter = range.toCounter
+                if type(author) == "string"
+                    and type(fromCounter) == "number"
+                    and type(toCounter) == "number"
+                    and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter)
+                then
+                    table.insert(filtered, range)
+                end
+            end
+        end
+
+        if #filtered > 0 then
+            -- Fetch missing logs (helpers preferred; coordinator fallback via request retry)
+            self:RequestMissingLogs(filtered, "join-status")
+        end
 
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "SendJoinStatus: missing logs, requesting ranges (count=%d, statusOnly=true)", #missing)
+            SF.Debug:Verbose("SYNC", "SendJoinStatus: missing logs detected (count=%d, requested=%d, statusOnly=true)", #missing, #filtered)
         end
 
         -- Also tell the coordinator our handshake status, without forcing them to serve data
