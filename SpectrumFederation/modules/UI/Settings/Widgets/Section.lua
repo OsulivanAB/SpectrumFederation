@@ -57,6 +57,8 @@ local function SetTooltipHandlers(region, title, text)
 	if not region then return end
 
 	if not text or text == "" then
+		GameTooltip:Hide()
+		region:EnableMouse(false)
 		region:SetScript("OnEnter", nil)
 		region:SetScript("OnLeave", nil)
 		return
@@ -207,6 +209,7 @@ function SectionMixin:_UpdateHeaderLayout()
 		buttonWidth = INFO_BUTTON_SIZE + INFO_BUTTON_GAP
 		rightAnchor = self.HeaderInfoButton
 	else
+		GameTooltip:Hide()
 		self.HeaderInfoButton:Hide()
 	end
 
