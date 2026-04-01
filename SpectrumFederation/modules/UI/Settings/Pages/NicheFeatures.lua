@@ -3,7 +3,7 @@ local _, SF = ...
 local Page = {
 	id = "nicheFeatures",
 	name = "Niche Features",
-	order = 15,
+	order = 50,
 }
 
 local function GetCurrentSpecID()
@@ -55,8 +55,8 @@ local function BuildSpecCheckboxes(store)
 				end,
 				set = function(value)
 					store:SetPressAndHoldCastingBySpec(specID, value and true or false)
-					if SF.SettingsApply and SF.SettingsApply.ApplyPressAndHoldCastingForCurrentSpec and GetCurrentSpecID() == specID then
-						SF.SettingsApply:ApplyPressAndHoldCastingForCurrentSpec()
+					if SF.SettingsApply and SF.SettingsApply.QueuePressAndHoldCastingApply and GetCurrentSpecID() == specID then
+						SF.SettingsApply:QueuePressAndHoldCastingApply()
 					end
 				end,
 			})
