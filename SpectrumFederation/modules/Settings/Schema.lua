@@ -25,6 +25,10 @@ SF.SettingsSchema = {
 		},
 	},
 
+	CHARACTER_DEFAULTS = {
+		pressAndHoldCastingBySpec = {},
+	},
+
 	-- Default *settings* for a profile
 	-- These are the fields we can safely "reset" without nuking membership/admins
 	-- Bug: Probably don't need these, Resetting profile settings should be done in the profile class and all these are stored there too.
@@ -152,5 +156,4 @@ SF.SettingsSchema = {
 		end,
 	},
 }
-
 
