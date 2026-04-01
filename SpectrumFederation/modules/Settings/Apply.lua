@@ -21,13 +21,37 @@ local function GetCurrentSpecializationInfo()
 end
 
 local function GetPressAndHoldCastingCVarEnabled()
+    if C_CVar and C_CVar.GetCVarBool then
+        return C_CVar.GetCVarBool(PRESS_AND_HOLD_CVAR) and true or false
+    end
     if GetCVarBool then
         return GetCVarBool(PRESS_AND_HOLD_CVAR) and true or false
+    end
+    if C_CVar and C_CVar.GetCVar then
+        return tostring(C_CVar.GetCVar(PRESS_AND_HOLD_CVAR)) == "1"
     end
     if GetCVar then
         return tostring(GetCVar(PRESS_AND_HOLD_CVAR)) == "1"
     end
     return false
+end
+
+local function SetPressAndHoldCastingCVar(value)
+    if C_CVar and C_CVar.SetCVar then
+        C_CVar.SetCVar(PRESS_AND_HOLD_CVAR, value)
+        return true
+    end
+
+    if SetCVar then
+        SetCVar(PRESS_AND_HOLD_CVAR, value)
+        return true
+    end
+
+    return false
+end
+
+local function GetPressAndHoldCastingCVarValue()
+    return GetPressAndHoldCastingCVarEnabled() and "1" or "0"
 end
 
 -- Initialize the SettingsApply module and register callbacks
@@ -181,7 +205,7 @@ function Apply:ApplyAll()
 
     self:ApplyLootHelperEnabled(store:Get("lootHelper.enabled"))
     self:ApplyActiveProfileChange(store:Get("lootHelper.activeProfile"), nil)
-    self:ApplyPressAndHoldCastingForCurrentSpec()
+    self:QueuePressAndHoldCastingApply()
 
     self:ApplySafeMode(store:GetActiveProfileSetting("safeMode", false), nil, {
         profileName = store:GetActiveProfileName(),
@@ -198,7 +222,9 @@ function Apply:InitEventHandling()
     self._eventFrame = frame
 
     frame:RegisterEvent("PLAYER_LOGIN")
+    frame:RegisterEvent("PLAYER_ENTERING_WORLD")
     frame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+    frame:RegisterEvent("ACTIVE_TALENT_GROUP_CHANGED")
     frame:SetScript("OnEvent", function(_, event, ...)
         self:OnEvent(event, ...)
     end)
@@ -214,9 +240,20 @@ function Apply:OnEvent(event, ...)
         if SF.SettingsStore and SF.SettingsStore.EnsurePressAndHoldCastingDefaultsForPlayer then
             SF.SettingsStore:EnsurePressAndHoldCastingDefaultsForPlayer(currentValue)
         end
-        self:RunOrDefer(function()
-            self:ApplyPressAndHoldCastingForCurrentSpec()
-        end)
+        self:QueuePressAndHoldCastingApply()
+        return
+    end
+
+    if event == "PLAYER_ENTERING_WORLD" then
+        local initialLogin, isReloadingUi = ...
+        if initialLogin or isReloadingUi then
+            self:QueuePressAndHoldCastingApply()
+        end
+        return
+    end
+
+    if event == "ACTIVE_TALENT_GROUP_CHANGED" then
+        self:QueuePressAndHoldCastingApply()
         return
     end
 
@@ -226,10 +263,18 @@ function Apply:OnEvent(event, ...)
             return
         end
 
+        self:QueuePressAndHoldCastingApply()
+    end
+end
+
+-- Queue a deferred apply so specialization APIs have time to settle
+-- @return nil
+function Apply:QueuePressAndHoldCastingApply()
+    self:Debounce("pressAndHoldCastingSpec", 0.1, function()
         self:RunOrDefer(function()
             self:ApplyPressAndHoldCastingForCurrentSpec()
         end)
-    end
+    end)
 end
 
 -- Apply window style setting
@@ -313,13 +358,27 @@ function Apply:ApplyPressAndHoldCastingForCurrentSpec()
         return
     end
 
+    local enabled = self:EnsurePressAndHoldCastingSettingForSpec(specID)
+
+    self:ApplyPressAndHoldCastingForSpec(specID, enabled, specName)
+end
+
+-- Ensure a specialization has a saved Press and Hold Casting value
+-- @param specID number Specialization ID
+-- @return boolean Saved or initialized Press and Hold Casting value
+function Apply:EnsurePressAndHoldCastingSettingForSpec(specID)
+    local store = SF.SettingsStore
+    if not store or not specID then
+        return false
+    end
+
     local enabled = store:GetPressAndHoldCastingBySpec(specID)
     if enabled == nil then
         enabled = GetPressAndHoldCastingCVarEnabled()
         store:SetPressAndHoldCastingBySpec(specID, enabled)
     end
 
-    self:ApplyPressAndHoldCastingForSpec(specID, enabled, specName)
+    return enabled and true or false
 end
 
 -- Apply Press and Hold Casting for a specific specialization
@@ -328,12 +387,14 @@ end
 -- @param specName string|nil Specialization display name
 -- @return nil
 function Apply:ApplyPressAndHoldCastingForSpec(specID, enabled, specName)
-    if not specID or enabled == nil or not SetCVar then
+    if not specID or enabled == nil then
         return
     end
 
     local value = enabled and "1" or "0"
-    if GetCVar and tostring(GetCVar(PRESS_AND_HOLD_CVAR)) == value then
+    local currentValue = GetPressAndHoldCastingCVarValue()
+
+    if currentValue == value then
         return
     end
 
@@ -348,5 +409,5 @@ function Apply:ApplyPressAndHoldCastingForSpec(specID, enabled, specName)
         )
     end
 
-    SetCVar(PRESS_AND_HOLD_CVAR, value)
+    SetPressAndHoldCastingCVar(value)
 end

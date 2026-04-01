@@ -246,6 +246,8 @@ function Store:SetCharacter(path, value)
 	local parent, key = ResolvePath(self.charDb, path, true)
 	local old = parent[key]
 	parent[key] = value
+	-- Character-scoped callbacks use a "character." prefix so they stay distinct
+	-- from account-scoped paths passed to Store:RegisterCallback.
 	self:_Fire("character." .. tostring(path), value, old)
 end
 
