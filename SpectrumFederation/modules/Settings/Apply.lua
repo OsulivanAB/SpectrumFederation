@@ -38,15 +38,24 @@ end
 
 local function SetPressAndHoldCastingCVar(value)
     if C_CVar and C_CVar.SetCVar then
+        if SF.Debug then
+            SF.Debug:Verbose("SETTINGS", "Setting %s=%s via C_CVar.SetCVar", PRESS_AND_HOLD_CVAR, tostring(value))
+        end
         C_CVar.SetCVar(PRESS_AND_HOLD_CVAR, value)
         return true
     end
 
     if SetCVar then
+        if SF.Debug then
+            SF.Debug:Verbose("SETTINGS", "Setting %s=%s via SetCVar", PRESS_AND_HOLD_CVAR, tostring(value))
+        end
         SetCVar(PRESS_AND_HOLD_CVAR, value)
         return true
     end
 
+    if SF.Debug then
+        SF.Debug:Warn("SETTINGS", "Unable to set %s because no CVar setter is available", PRESS_AND_HOLD_CVAR)
+    end
     return false
 end
 
@@ -235,6 +244,24 @@ end
 -- @param ... any Event payload
 -- @return nil
 function Apply:OnEvent(event, ...)
+    if SF.Debug then
+        if event == "PLAYER_ENTERING_WORLD" then
+            local initialLogin, isReloadingUi = ...
+            SF.Debug:Info(
+                "SETTINGS",
+                "Received event %s (initialLogin=%s, isReloadingUi=%s)",
+                event,
+                tostring(initialLogin),
+                tostring(isReloadingUi)
+            )
+        elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
+            local unit = ...
+            SF.Debug:Info("SETTINGS", "Received event %s (unit=%s)", event, tostring(unit))
+        else
+            SF.Debug:Info("SETTINGS", "Received event %s", event)
+        end
+    end
+
     if event == "PLAYER_LOGIN" then
         local currentValue = GetPressAndHoldCastingCVarEnabled()
         if SF.SettingsStore and SF.SettingsStore.EnsurePressAndHoldCastingDefaultsForPlayer then
@@ -270,6 +297,9 @@ end
 -- Queue a deferred apply so specialization APIs have time to settle
 -- @return nil
 function Apply:QueuePressAndHoldCastingApply()
+    if SF.Debug then
+        SF.Debug:Verbose("SETTINGS", "Queueing Press and Hold Casting apply for current specialization")
+    end
     self:Debounce("pressAndHoldCastingSpec", 0.1, function()
         self:RunOrDefer(function()
             self:ApplyPressAndHoldCastingForCurrentSpec()
@@ -351,14 +381,34 @@ end
 -- @return nil
 function Apply:ApplyPressAndHoldCastingForCurrentSpec()
     local store = SF.SettingsStore
-    if not store then return end
+    if not store then
+        if SF.Debug then
+            SF.Debug:Warn("SETTINGS", "Skipping Press and Hold Casting apply because SettingsStore is unavailable")
+        end
+        return
+    end
 
     local specID, specName = GetCurrentSpecializationInfo()
     if not specID then
+        if SF.Debug then
+            SF.Debug:Warn("SETTINGS", "Skipping Press and Hold Casting apply because no active specialization was found")
+        end
         return
     end
 
     local enabled = self:EnsurePressAndHoldCastingSettingForSpec(specID)
+
+    if SF.Debug then
+        SF.Debug:Info(
+            "SETTINGS",
+            "Applying Press and Hold Casting for active spec '%s' (%s) with saved enabled=%s and current %s=%s",
+            tostring(specName),
+            tostring(specID),
+            tostring(enabled),
+            PRESS_AND_HOLD_CVAR,
+            GetPressAndHoldCastingCVarValue()
+        )
+    end
 
     self:ApplyPressAndHoldCastingForSpec(specID, enabled, specName)
 end
@@ -376,6 +426,17 @@ function Apply:EnsurePressAndHoldCastingSettingForSpec(specID)
     if enabled == nil then
         enabled = GetPressAndHoldCastingCVarEnabled()
         store:SetPressAndHoldCastingBySpec(specID, enabled)
+        if SF.Debug then
+            SF.Debug:Info(
+                "SETTINGS",
+                "Initialized saved Press and Hold Casting value for spec %s from current %s=%s",
+                tostring(specID),
+                PRESS_AND_HOLD_CVAR,
+                tostring(enabled)
+            )
+        end
+    elseif SF.Debug then
+        SF.Debug:Verbose("SETTINGS", "Loaded saved Press and Hold Casting value for spec %s: %s", tostring(specID), tostring(enabled))
     end
 
     return enabled and true or false
@@ -395,6 +456,16 @@ function Apply:ApplyPressAndHoldCastingForSpec(specID, enabled, specName)
     local currentValue = GetPressAndHoldCastingCVarValue()
 
     if currentValue == value then
+        if SF.Debug then
+            SF.Debug:Info(
+                "SETTINGS",
+                "No Press and Hold Casting change needed for spec '%s' (%s); %s is already %s",
+                tostring(specName),
+                tostring(specID),
+                PRESS_AND_HOLD_CVAR,
+                value
+            )
+        end
         return
     end
 
@@ -409,5 +480,31 @@ function Apply:ApplyPressAndHoldCastingForSpec(specID, enabled, specName)
         )
     end
 
-    SetPressAndHoldCastingCVar(value)
+    local didSet = SetPressAndHoldCastingCVar(value)
+    local updatedValue = GetPressAndHoldCastingCVarValue()
+
+    if SF.Debug then
+        SF.Debug:Info(
+            "SETTINGS",
+            "Finished applying %s for spec '%s' (%s): setterCalled=%s, requested=%s, observed=%s",
+            PRESS_AND_HOLD_CVAR,
+            tostring(specName),
+            tostring(specID),
+            tostring(didSet),
+            value,
+            updatedValue
+        )
+    end
+
+    if didSet and updatedValue ~= value and SF.Debug then
+        SF.Debug:Warn(
+            "SETTINGS",
+            "Observed %s=%s after applying requested value %s for spec '%s' (%s)",
+            PRESS_AND_HOLD_CVAR,
+            updatedValue,
+            value,
+            tostring(specName),
+            tostring(specID)
+        )
+    end
 end
