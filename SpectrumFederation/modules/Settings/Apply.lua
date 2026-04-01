@@ -4,7 +4,7 @@ local addonName, SF = ...
 SF.SettingsApply = SF.SettingsApply or {}
 local Apply = SF.SettingsApply
 
-local PRESS_AND_HOLD_CVAR = "ActionButtonUseKeyDown"
+local PRESS_AND_HOLD_CVAR = "ActionButtonUseKeyHeldSpell"
 
 local function GetCurrentSpecializationInfo()
     if not GetSpecialization or not GetSpecializationInfo then
