@@ -241,7 +241,7 @@ end
 -- @return nil
 function Store:SetCharacter(path, value)
 	if SF.Debug then
-		SF.Debug:Verbose("SETTINGS", "Setting character '%s' to value", path)
+		SF.Debug:Verbose("SETTINGS", "Setting character '%s' to %s", path, tostring(value))
 	end
 	local parent, key = ResolvePath(self.charDb, path, true)
 	local old = parent[key]
