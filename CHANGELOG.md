@@ -32,6 +32,17 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.18-beta.5] - 2026-04-02
+
+### Added
+- Introduced per-specialization settings for Press and Hold Casting, allowing customization based on active specialization.
+- Added a new "Niche Features" tab in the settings menu for managing advanced features like Press and Hold Casting.
+- Support for character-specific saved variables to store specialization-specific settings.
+
+### Changed
+- Press and Hold Casting settings now dynamically apply based on the player's active specialization.
+
 ## [0.5.18] - 2026-03-31
 
 ### Changed
