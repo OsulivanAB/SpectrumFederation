@@ -150,9 +150,13 @@ function Store:Init()
 
 	local schema = SF.SettingsSchema
 	local defaults = (schema and schema.DEFAULTS) or {}
+	local characterDefaults = (schema and schema.CHARACTER_DEFAULTS) or {}
 
 	SpectrumFederationDB = SpectrumFederationDB or {}
 	self.db = SpectrumFederationDB
+
+	SpectrumFederationCharDB = SpectrumFederationCharDB or {}
+	self.charDb = SpectrumFederationCharDB
 
 	local targetVersion = (schema and schema.VERSION) or 1
 
@@ -180,6 +184,7 @@ function Store:Init()
 
 	-- Apply defaults without overwriting player values
 	MergeDefaults(self.db, DeepCopy(defaults))
+	MergeDefaults(self.charDb, DeepCopy(characterDefaults))
 
 	-- Future: migrations
 	self.db.version = self.db.version or (schema and schema.VERSION) or 1
@@ -219,6 +224,70 @@ function Store:Set(path, value)
 	local old = parent[key]
 	parent[key] = value
 	self:_Fire(path, value, old)
+end
+
+-- Retrieve a character-specific setting value by dot-path notation
+-- @param path string Dot-path like "pressAndHoldCastingBySpec.71"
+-- @return any Setting value, or nil if path does not exist
+function Store:GetCharacter(path)
+	local parent, key = ResolvePath(self.charDb, path, false)
+	if not parent then return nil end
+	return parent[key]
+end
+
+-- Set a character-specific setting value by dot-path notation and trigger callbacks
+-- @param path string Dot-path like "pressAndHoldCastingBySpec.71"
+-- @param value any The value to set
+-- @return nil
+function Store:SetCharacter(path, value)
+	if SF.Debug then
+		SF.Debug:Verbose("SETTINGS", "Setting character '%s' to %s", path, tostring(value))
+	end
+	local parent, key = ResolvePath(self.charDb, path, true)
+	local old = parent[key]
+	parent[key] = value
+	-- Character-scoped callbacks use a "character." prefix so they stay distinct
+	-- from account-scoped paths passed to Store:RegisterCallback.
+	self:_Fire("character." .. tostring(path), value, old)
+end
+
+-- Get the saved Press and Hold Casting setting for a specialization
+-- @param specID number|string Specialization ID
+-- @return boolean|nil Saved setting value, or nil if not set
+function Store:GetPressAndHoldCastingBySpec(specID)
+	if specID == nil then return nil end
+	return self:GetCharacter("pressAndHoldCastingBySpec." .. tostring(specID))
+end
+
+-- Set the saved Press and Hold Casting setting for a specialization
+-- @param specID number|string Specialization ID
+-- @param enabled boolean Whether Press and Hold Casting should be enabled
+-- @return nil
+function Store:SetPressAndHoldCastingBySpec(specID, enabled)
+	if specID == nil then return end
+	self:SetCharacter("pressAndHoldCastingBySpec." .. tostring(specID), enabled and true or false)
+end
+
+-- Ensure all player specializations have a saved Press and Hold Casting value
+-- @param defaultEnabled boolean Default setting used for any missing specs
+-- @return nil
+function Store:EnsurePressAndHoldCastingDefaultsForPlayer(defaultEnabled)
+	if not UnitClass or not GetNumSpecializationsForClassID or not GetSpecializationInfoForClassID then
+		return
+	end
+
+	local _, _, classID = UnitClass("player")
+	if not classID then return end
+
+	local specCount = GetNumSpecializationsForClassID(classID)
+	if not specCount or specCount < 1 then return end
+
+	for specIndex = 1, specCount do
+		local specID = GetSpecializationInfoForClassID(classID, specIndex)
+		if specID and self:GetPressAndHoldCastingBySpec(specID) == nil then
+			self:SetPressAndHoldCastingBySpec(specID, defaultEnabled and true or false)
+		end
+	end
 end
 
 -- Register a callback to be called when a setting at path changes
@@ -488,15 +557,20 @@ function Store:ResetAll()
 	end
 
 	local defaults = SF.SettingsSchema and SF.SettingsSchema.DEFAULTS
+	local characterDefaults = SF.SettingsSchema and SF.SettingsSchema.CHARACTER_DEFAULTS
 	if not defaults then return false, "No defaults available" end
 
 	-- Clear current DB but keep the same table reference
 	for k in pairs(self.db) do
 		self.db[k] = nil
 	end
+	for k in pairs(self.charDb or {}) do
+		self.charDb[k] = nil
+	end
 
 	-- Re-apply defaults
 	MergeDefaults(self.db, DeepCopy(defaults))
+	MergeDefaults(self.charDb, DeepCopy(characterDefaults or {}))
 	self:_EnsureActiveProfile()
 
 	if SF.Debug then
