@@ -645,6 +645,8 @@ function RC:_ProcessInspectQueue()
 			NotifyInspect(unit)
 			if C_Timer and C_Timer.After then
 				C_Timer.After(INSPECT_REQUEST_TIMEOUT_SECONDS, function()
+					-- The active-request guard in _HandleInspectTimeout ignores stale callbacks
+					-- once INSPECT_READY advances the queue or a newer request replaces this one.
 					if SF and SF.RaidCheck and SF.RaidCheck._HandleInspectTimeout then
 						SF.RaidCheck:_HandleInspectTimeout(item.key, now)
 					end
@@ -1086,9 +1088,15 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 		whisperedMissing = false,
 	}
 
-	if not (inspectState and inspectState.isKnown and inspectState.slotsByInventory) then
+	if type(inspectState) ~= "table" then
+		result.inspectPending = "Unavailable"
+		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, tostring(result.inspectPending)))
+		return result
+	end
+
+	if not (inspectState.isKnown and inspectState.slotsByInventory) then
 		result.inspectPending = inspectState and (inspectState.label or inspectState.status) or "Loading"
-		SF:PrintInfo(("%s Inspect pending: %s."):format(result.displayName, tostring(result.inspectPending)))
+		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, tostring(result.inspectPending)))
 		return result
 	end
 

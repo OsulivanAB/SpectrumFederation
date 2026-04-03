@@ -703,6 +703,7 @@ local function BuildAuditPage(panel)
 					local cell = dataRow.Cells[columnIndex]
 					local texture = slotData and slotData.texture or GetAuditSlotPlaceholderTexture(column.key)
 					local hasItem = slotData and slotData.link
+					local shouldShowOverlay = slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems)
 
 					cell._rowData = rowData
 					cell._slotData = slotData or {
@@ -717,7 +718,7 @@ local function BuildAuditPage(panel)
 						cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
 					end
 
-					SetAuditMissingOverlay(cell.MissingOverlay, slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems))
+					SetAuditMissingOverlay(cell.MissingOverlay, shouldShowOverlay)
 					cell:Show()
 				end
 
