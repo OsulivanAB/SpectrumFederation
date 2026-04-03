@@ -1,8 +1,11 @@
 -- Grab the namespace
 local addonName, SF = ...
 
--- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
--- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName C_Item CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance UnitGUID UnitExists UnitIsUnit GetTime
+-- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET
+-- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
+-- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem C_Item
+-- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
+-- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -276,6 +279,20 @@ local function IsSelfUnit(unit)
 	return false
 end
 
+local function IsUnitInInspectRange(unit)
+	if CheckInteractDistance then
+		return CheckInteractDistance(unit, 1) ~= false
+	end
+	return true
+end
+
+local function CanInspectUnitNow(unit)
+	return unit
+		and UnitExists and UnitExists(unit)
+		and CanInspect and CanInspect(unit)
+		and IsUnitInInspectRange(unit)
+end
+
 local function CollectUnits()
 	local units = {}
 
@@ -487,6 +504,8 @@ function RC:_HandleInspectTimeout(key, requestedAt)
 	entry.status = "timeout"
 	entry.failCount = failCount
 	entry.lastAttemptAt = requestedAt
+	-- Use a short linear backoff so repeated failures do not hammer NotifyInspect,
+	-- while still recovering quickly once the player becomes inspectable again.
 	entry.nextRetryAt = now + math.min(INSPECT_RETRY_MAX_SECONDS, INSPECT_RETRY_BASE_SECONDS * failCount)
 	self:_StoreInspectCacheEntry(entry, active.aliases)
 
@@ -531,6 +550,8 @@ function RC:_HandleInspectReady(guid)
 		entry.status = "timeout"
 		entry.failCount = (entry.failCount or 0) + 1
 		entry.lastAttemptAt = active.requestedAt
+		-- Use a short linear backoff so repeated failures do not hammer NotifyInspect,
+		-- while still recovering quickly once the player becomes inspectable again.
 		entry.nextRetryAt = now + math.min(INSPECT_RETRY_MAX_SECONDS, INSPECT_RETRY_BASE_SECONDS * entry.failCount)
 	end
 
@@ -557,7 +578,7 @@ function RC:_ProcessInspectQueue()
 		end
 
 		local unit = item and FindUnitByGuidOrId(item.guid, item.id) or nil
-		if unit and UnitExists and UnitExists(unit) and CanInspect and CanInspect(unit) and (not CheckInteractDistance or CheckInteractDistance(unit, 1) ~= false) then
+		if CanInspectUnitNow(unit) then
 			local now = GetTime and GetTime() or 0
 			state.active = {
 				key = item.key,
@@ -590,10 +611,7 @@ function RC:_QueueInspectForUnit(unit, info, cacheEntry)
 		return
 	end
 
-	if not (UnitExists and UnitExists(unit) and CanInspect and CanInspect(unit)) then
-		return
-	end
-	if CheckInteractDistance and CheckInteractDistance(unit, 1) == false then
+	if not CanInspectUnitNow(unit) then
 		return
 	end
 
@@ -767,8 +785,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
-	local inRange = not CheckInteractDistance or CheckInteractDistance(unit, 1) ~= false
-	local canInspectNow = UnitExists and UnitExists(unit) and CanInspect and CanInspect(unit) and inRange
+	local inRange = IsUnitInInspectRange(unit)
+	local canInspectNow = CanInspectUnitNow(unit)
 	local state = self:_GetInspectState()
 	local activeKey = state.active and state.active.key or nil
 	local key = aliases[1] or aliases[2]
