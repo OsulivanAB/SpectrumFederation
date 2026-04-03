@@ -230,12 +230,13 @@ end
 local AUDIT_MIN_NAME_COLUMN_WIDTH = 120
 local AUDIT_PREFERRED_NAME_COLUMN_WIDTH = 150
 local AUDIT_NAME_PADDING = 8
-local AUDIT_ICON_SIZE = 20
+local AUDIT_ICON_SIZE = 40
 local AUDIT_COLUMN_GAP = 6
-local AUDIT_ROW_HEIGHT = 26
+local AUDIT_ROW_HEIGHT = 46
 local AUDIT_ROW_SPACING = 2
 local AUDIT_HEADER_HEIGHT = 24
 local AUDIT_MIN_TABLE_HEIGHT = 260
+local AUDIT_HORIZONTAL_SCROLL_HEIGHT = 20
 local AUDIT_SLOT_PLACEHOLDERS = {
 	head = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head",
 	neck = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck",
@@ -419,6 +420,22 @@ local function SetScrollBarShown(scroll, shown)
 	return 0
 end
 
+local function SetAuditHorizontalScrollShown(slider, shown)
+	if not slider then
+		return 0
+	end
+
+	slider:SetShown(shown)
+	if shown then
+		return AUDIT_HORIZONTAL_SCROLL_HEIGHT
+	end
+
+	if slider.SetValue then
+		slider:SetValue(0)
+	end
+	return 0
+end
+
 local function GetAuditNameColumnWidth(availableWidth, slotCount)
 	local totalIconWidth = slotCount * AUDIT_ICON_SIZE
 	local totalGap = slotCount * AUDIT_COLUMN_GAP
@@ -464,23 +481,39 @@ local function BuildAuditPage(panel)
 		local container = CreateFrame("Frame", nil, row)
 		container:SetAllPoints(row)
 
-		local header = CreateFrame("Frame", nil, container)
-		header:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
-		header:SetPoint("TOPRIGHT", container, "TOPRIGHT", 0, 0)
-		header:SetHeight(AUDIT_HEADER_HEIGHT)
+		local headerViewport = CreateFrame("Frame", nil, container)
+		headerViewport:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
+		headerViewport:SetPoint("TOPRIGHT", container, "TOPRIGHT", 0, 0)
+		headerViewport:SetHeight(AUDIT_HEADER_HEIGHT)
+		headerViewport:SetClipsChildren(true)
 
-		local headerBg = header:CreateTexture(nil, "BACKGROUND")
-		headerBg:SetAllPoints(header)
+		local headerBg = headerViewport:CreateTexture(nil, "BACKGROUND")
+		headerBg:SetAllPoints(headerViewport)
 		headerBg:SetColorTexture(1, 1, 1, 0.08)
 
+		local header = CreateFrame("Frame", nil, headerViewport)
+		header:SetPoint("TOPLEFT", headerViewport, "TOPLEFT", 0, 0)
+		header:SetHeight(AUDIT_HEADER_HEIGHT)
+
 		local scroll = CreateFrame("ScrollFrame", nil, container, "UIPanelScrollFrameTemplate")
-		scroll:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -4)
+		scroll:SetPoint("TOPLEFT", headerViewport, "BOTTOMLEFT", 0, -4)
 		scroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, 0)
 
 		local content = CreateFrame("Frame", nil, scroll)
 		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
 		content:SetHeight(1)
 		scroll:SetScrollChild(content)
+
+		local horizontalScroll = CreateFrame("Slider", nil, container, "OptionsSliderTemplate")
+		horizontalScroll:SetPoint("BOTTOMLEFT", container, "BOTTOMLEFT", 16, 0)
+		horizontalScroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", -16, 0)
+		horizontalScroll:SetHeight(AUDIT_HORIZONTAL_SCROLL_HEIGHT)
+		horizontalScroll:SetObeyStepOnDrag(true)
+		horizontalScroll:SetValueStep(1)
+		horizontalScroll.Low:Hide()
+		horizontalScroll.High:Hide()
+		horizontalScroll.Text:Hide()
+		horizontalScroll:Hide()
 
 		local emptyText = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
 		emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
@@ -636,18 +669,55 @@ local function BuildAuditPage(panel)
 			content:SetHeight(math.max(1, contentHeight))
 			emptyText:SetShown(#dataRows == 0)
 
-			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
-			local showScrollbar = contentHeight > visibleHeight
-			local scrollBarWidth = SetScrollBarShown(scroll, showScrollbar)
+			local scrollBarWidth = 0
+			local horizontalScrollHeight = 0
+			local availableWidth = 1
+			local usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, headerCells, availableWidth)
+			for _ = 1, 2 do
+				scroll:ClearAllPoints()
+				scroll:SetPoint("TOPLEFT", headerViewport, "BOTTOMLEFT", 0, -4)
+				scroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, horizontalScrollHeight)
 
+				local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+				local showVerticalScroll = contentHeight > visibleHeight
+				scrollBarWidth = SetScrollBarShown(scroll, showVerticalScroll)
+
+				headerViewport:ClearAllPoints()
+				headerViewport:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
+				headerViewport:SetPoint("TOPRIGHT", container, "TOPRIGHT", -(showVerticalScroll and (scrollBarWidth + 4) or 0), 0)
+				headerViewport:SetHeight(AUDIT_HEADER_HEIGHT)
+
+				availableWidth = math.max(1, headerViewport:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
+				usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, headerCells, availableWidth)
+				horizontalScrollHeight =
+					SetAuditHorizontalScrollShown(horizontalScroll, usedWidth > availableWidth)
+			end
+
+			scroll:ClearAllPoints()
+			scroll:SetPoint("TOPLEFT", headerViewport, "BOTTOMLEFT", 0, -4)
+			scroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, horizontalScrollHeight)
+			content:SetWidth(math.max(usedWidth, availableWidth))
+			header:SetWidth(math.max(usedWidth, availableWidth))
+
+			local maxHorizontalOffset = math.max(0, usedWidth - availableWidth)
+			horizontalScroll:SetMinMaxValues(0, maxHorizontalOffset)
+			local currentHorizontalOffset = horizontalScroll:GetValue() or 0
+			if currentHorizontalOffset > maxHorizontalOffset then
+				currentHorizontalOffset = maxHorizontalOffset
+				horizontalScroll:SetValue(currentHorizontalOffset)
+			end
+
+			scroll:SetHorizontalScroll(currentHorizontalOffset)
 			header:ClearAllPoints()
-			header:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
-			header:SetPoint("TOPRIGHT", container, "TOPRIGHT", -(showScrollbar and (scrollBarWidth + 4) or 0), 0)
+			header:SetPoint("TOPLEFT", headerViewport, "TOPLEFT", -currentHorizontalOffset, 0)
 			header:SetHeight(AUDIT_HEADER_HEIGHT)
 
-			local availableWidth = math.max(1, header:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
-			local usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, headerCells, availableWidth)
-			content:SetWidth(math.max(usedWidth, availableWidth))
+			horizontalScroll:SetScript("OnValueChanged", function(_, value)
+				scroll:SetHorizontalScroll(value)
+				header:ClearAllPoints()
+				header:SetPoint("TOPLEFT", headerViewport, "TOPLEFT", -value, 0)
+				header:SetHeight(AUDIT_HEADER_HEIGHT)
+			end)
 
 			nameHeaderText:SetWidth(math.max(1, nameWidth - AUDIT_NAME_PADDING))
 			for _, dataRow in ipairs(rows) do
