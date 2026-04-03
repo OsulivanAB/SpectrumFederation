@@ -314,6 +314,28 @@ local function HideAuditTooltip()
 	GameTooltip:Hide()
 end
 
+local function GetAuditInspectStatusColor(status)
+	if status == "out_of_range" then
+		return "|cffff9f40"
+	end
+	if status == "stale" or status == "refreshing" or status == "retrying" then
+		return "|cffffff00"
+	end
+	if status == "loading" then
+		return "|cff9cd6ff"
+	end
+	return "|cffb8b8b8"
+end
+
+local function FormatAuditRowName(rowData)
+	local name = (rowData and (rowData.displayName or rowData.name)) or "?"
+	local label = rowData and rowData.inspectLabel or nil
+	if not label or label == "" then
+		return name
+	end
+	return string.format("%s %s(%s)|r", name, GetAuditInspectStatusColor(rowData.inspectStatus), label)
+end
+
 local function ShowAuditCellTooltip(self)
 	local slotData = self and self._slotData
 	local rowData = self and self._rowData
@@ -331,6 +353,16 @@ local function ShowAuditCellTooltip(self)
 
 	if rowData and rowData.displayName then
 		GameTooltip:AddLine(rowData.displayName, 0.75, 0.82, 1, true)
+	end
+
+	if rowData and rowData.inspectMessage then
+		GameTooltip:AddLine(rowData.inspectMessage, 0.9, 0.82, 0.35, true)
+	end
+
+	if slotData.known == false then
+		GameTooltip:AddLine("Raid Check will evaluate this slot after inspect data is available.", 0.75, 0.75, 0.75, true)
+		GameTooltip:Show()
+		return
 	end
 
 	if not slotData.link then
@@ -357,6 +389,10 @@ local function ShowAuditCellTooltip(self)
 
 	if slotData.missingItem then
 		GameTooltip:AddLine("Raid Check will flag this slot as missing gear.", 1, 0.35, 0.35, true)
+	end
+
+	if slotData.stale then
+		GameTooltip:AddLine("This row is showing cached inspect data while a fresh snapshot loads.", 0.95, 0.9, 0.5, true)
 	end
 
 	GameTooltip:Show()
@@ -632,7 +668,7 @@ local function BuildAuditPage(panel)
 				dataRow:ClearAllPoints()
 				dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
 				dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
-				dataRow.Name:SetText(rowData.displayName or rowData.name or "?")
+				dataRow.Name:SetText(FormatAuditRowName(rowData))
 				dataRow:Show()
 
 				for columnIndex, column in ipairs(columns) do
@@ -654,7 +690,7 @@ local function BuildAuditPage(panel)
 						cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
 					end
 
-					SetAuditMissingOverlay(cell.MissingOverlay, slotData and slotData.missingEnchant)
+					SetAuditMissingOverlay(cell.MissingOverlay, slotData and slotData.known and slotData.missingEnchant)
 					cell:Show()
 				end
 
@@ -725,6 +761,19 @@ local function BuildAuditPage(panel)
 					LayoutRowWidgets(dataRow, dataRow.Name, dataRow.Cells, availableWidth)
 				end
 			end
+		end
+
+		if SF.RaidCheck and SF.RaidCheck.RegisterTroubleshootingListener then
+			if panel.__sfAuditListenerKey and SF.RaidCheck.UnregisterTroubleshootingListener then
+				SF.RaidCheck:UnregisterTroubleshootingListener(panel.__sfAuditListenerKey)
+			end
+			panel.__sfAuditListenerKey = panel
+			SF.RaidCheck:RegisterTroubleshootingListener(panel.__sfAuditListenerKey, function()
+				if panel.__sfPageBuilder then
+					panel.__sfPageBuilder:Refresh()
+					panel.__sfPageBuilder:Reflow()
+				end
+			end)
 		end
 
 		pageBuilder:RegisterRefresh(RefreshAuditTable)

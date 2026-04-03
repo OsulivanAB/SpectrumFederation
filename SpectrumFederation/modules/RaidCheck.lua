@@ -2,7 +2,7 @@
 local addonName, SF = ...
 
 -- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
--- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName C_Item
+-- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName C_Item CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance UnitGUID UnitExists UnitIsUnit GetTime
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -10,6 +10,10 @@ local RC = SF.RaidCheck
 local RAID_CHECK_REASON = "RAID_CHECK"
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
+local INSPECT_CACHE_TTL_SECONDS = 30
+local INSPECT_RETRY_BASE_SECONDS = 2
+local INSPECT_RETRY_MAX_SECONDS = 10
+local INSPECT_REQUEST_TIMEOUT_SECONDS = 1.5
 local SLOT_DEFS = {
 	head = { label = "Head", slots = { INVSLOT_HEAD } },
 	neck = { label = "Neck", slots = { INVSLOT_NECK } },
@@ -256,6 +260,22 @@ local function IsSlotEnabledInConfig(cfg, slotKey, link)
 	return cfg.slots[configKey] and true or false
 end
 
+local function IsSelfUnit(unit)
+	if not unit then
+		return false
+	end
+
+	if unit == "player" then
+		return true
+	end
+
+	if UnitExists and UnitIsUnit and UnitExists(unit) then
+		return UnitIsUnit(unit, "player") and true or false
+	end
+
+	return false
+end
+
 local function CollectUnits()
 	local units = {}
 
@@ -277,6 +297,329 @@ end
 
 local function GetProfile()
 	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
+end
+
+local function FindUnitByGuidOrId(guid, id)
+	for _, unit in ipairs(CollectUnits()) do
+		if guid and UnitGUID and UnitGUID(unit) == guid then
+			return unit
+		end
+	end
+
+	if id then
+		for _, unit in ipairs(CollectUnits()) do
+			local name, realm = UnitFullName(unit)
+			if NormalizeNameRealm(name, realm) == id then
+				return unit
+			end
+		end
+	end
+
+	return nil
+end
+
+local function CaptureTroubleshootingInventory(unit)
+	local slotsByInventory = {}
+	local sawAnyData = false
+
+	for _, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+		local inventorySlot = column and column.inventorySlot
+		if inventorySlot and not slotsByInventory[inventorySlot] then
+			local link = GetInventoryItemLink(unit, inventorySlot)
+			local texture = GetInventoryItemTexture and GetInventoryItemTexture(unit, inventorySlot) or nil
+			slotsByInventory[inventorySlot] = {
+				link = link,
+				texture = texture,
+			}
+			if link or texture then
+				sawAnyData = true
+			end
+		end
+	end
+
+	return {
+		slotsByInventory = slotsByInventory,
+		sawAnyData = sawAnyData,
+	}
+end
+
+function RC:_GetInspectState()
+	self._inspectState = self._inspectState or {
+		cache = {},
+		queue = {},
+		queued = {},
+		listeners = {},
+		active = nil,
+	}
+	return self._inspectState
+end
+
+function RC:_StoreInspectCacheEntry(entry, aliases)
+	if type(entry) ~= "table" then
+		return
+	end
+
+	local state = self:_GetInspectState()
+	entry.aliases = aliases or entry.aliases or {}
+	for _, key in ipairs(entry.aliases) do
+		if key then
+			state.cache[key] = entry
+		end
+	end
+end
+
+function RC:_GetInspectCacheEntryByAliases(aliases)
+	local state = self:_GetInspectState()
+	for _, key in ipairs(aliases or {}) do
+		if key and state.cache[key] then
+			return state.cache[key]
+		end
+	end
+	return nil
+end
+
+function RC:_GetInspectAliases(unit, info)
+	local aliases = {}
+	local guid = UnitGUID and UnitGUID(unit) or nil
+	local id = info and info.id or nil
+
+	if not id and unit and UnitFullName then
+		local name, realm = UnitFullName(unit)
+		id = NormalizeNameRealm(name, realm)
+	end
+
+	if guid and guid ~= "" then
+		aliases[#aliases + 1] = guid
+	end
+	if id and id ~= "" then
+		aliases[#aliases + 1] = id
+	end
+
+	return aliases, guid, id
+end
+
+function RC:_NotifyTroubleshootingListeners()
+	local state = self:_GetInspectState()
+	for _, callback in pairs(state.listeners) do
+		pcall(callback)
+	end
+end
+
+function RC:RegisterTroubleshootingListener(key, callback)
+	if not key or type(callback) ~= "function" then
+		return
+	end
+
+	local state = self:_GetInspectState()
+	state.listeners[key] = callback
+end
+
+function RC:UnregisterTroubleshootingListener(key)
+	if not key then
+		return
+	end
+
+	local state = self:_GetInspectState()
+	state.listeners[key] = nil
+end
+
+function RC:_InvalidateInspectAliases(aliases)
+	local state = self:_GetInspectState()
+	for _, key in ipairs(aliases or {}) do
+		if key then
+			state.cache[key] = nil
+			state.queued[key] = nil
+		end
+	end
+end
+
+function RC:_InvalidateInspectUnit(unit)
+	if not unit or unit == "player" then
+		return
+	end
+
+	local aliases = self:_GetInspectAliases(unit)
+	self:_InvalidateInspectAliases(aliases)
+	self:_NotifyTroubleshootingListeners()
+end
+
+function RC:EnsureInspectSupport()
+	if self._inspectFrame then
+		return
+	end
+
+	local frame = CreateFrame("Frame")
+	self._inspectFrame = frame
+	frame:RegisterEvent("INSPECT_READY")
+	frame:RegisterEvent("GROUP_ROSTER_UPDATE")
+	frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+	frame:RegisterEvent("UNIT_INVENTORY_CHANGED")
+	frame:SetScript("OnEvent", function(_, event, arg1)
+		if event == "INSPECT_READY" then
+			self:_HandleInspectReady(arg1)
+		elseif event == "UNIT_INVENTORY_CHANGED" then
+			self:_InvalidateInspectUnit(arg1)
+		elseif event == "PLAYER_ENTERING_WORLD" then
+			local state = self:_GetInspectState()
+			state.cache = {}
+			state.queue = {}
+			state.queued = {}
+			state.active = nil
+			self:_NotifyTroubleshootingListeners()
+		elseif event == "GROUP_ROSTER_UPDATE" then
+			self:_NotifyTroubleshootingListeners()
+			self:_ProcessInspectQueue()
+		end
+	end)
+end
+
+function RC:_HandleInspectTimeout(key, requestedAt)
+	local state = self:_GetInspectState()
+	local active = state.active
+	if not active or active.key ~= key or active.requestedAt ~= requestedAt then
+		return
+	end
+
+	local now = GetTime and GetTime() or 0
+	local entry = self:_GetInspectCacheEntryByAliases(active.aliases) or {}
+	local failCount = (entry.failCount or 0) + 1
+
+	entry.status = "timeout"
+	entry.failCount = failCount
+	entry.lastAttemptAt = requestedAt
+	entry.nextRetryAt = now + math.min(INSPECT_RETRY_MAX_SECONDS, INSPECT_RETRY_BASE_SECONDS * failCount)
+	self:_StoreInspectCacheEntry(entry, active.aliases)
+
+	state.active = nil
+	if ClearInspectPlayer then
+		pcall(ClearInspectPlayer)
+	end
+
+	self:_NotifyTroubleshootingListeners()
+	self:_ProcessInspectQueue()
+end
+
+function RC:_HandleInspectReady(guid)
+	local state = self:_GetInspectState()
+	local active = state.active
+	if not active then
+		return
+	end
+	if guid and active.guid and guid ~= active.guid then
+		return
+	end
+
+	local unit = FindUnitByGuidOrId(guid or active.guid, active.id)
+	if not unit and active.unit and UnitExists and UnitExists(active.unit) then
+		unit = active.unit
+	end
+
+	local entry = self:_GetInspectCacheEntryByAliases(active.aliases) or {}
+	local now = GetTime and GetTime() or 0
+	local captured = unit and CaptureTroubleshootingInventory(unit) or nil
+
+	if captured and captured.sawAnyData then
+		entry.guid = guid or active.guid
+		entry.id = active.id
+		entry.status = "ready"
+		entry.failCount = 0
+		entry.lastAttemptAt = active.requestedAt
+		entry.nextRetryAt = nil
+		entry.updatedAt = now
+		entry.slotsByInventory = captured.slotsByInventory
+	else
+		entry.status = "timeout"
+		entry.failCount = (entry.failCount or 0) + 1
+		entry.lastAttemptAt = active.requestedAt
+		entry.nextRetryAt = now + math.min(INSPECT_RETRY_MAX_SECONDS, INSPECT_RETRY_BASE_SECONDS * entry.failCount)
+	end
+
+	self:_StoreInspectCacheEntry(entry, active.aliases)
+	state.active = nil
+	if ClearInspectPlayer then
+		pcall(ClearInspectPlayer)
+	end
+
+	self:_NotifyTroubleshootingListeners()
+	self:_ProcessInspectQueue()
+end
+
+function RC:_ProcessInspectQueue()
+	local state = self:_GetInspectState()
+	if state.active then
+		return
+	end
+
+	while #state.queue > 0 do
+		local item = table.remove(state.queue, 1)
+		if item and item.key then
+			state.queued[item.key] = nil
+		end
+
+		local unit = item and FindUnitByGuidOrId(item.guid, item.id) or nil
+		if unit and UnitExists and UnitExists(unit) and CanInspect and CanInspect(unit) and (not CheckInteractDistance or CheckInteractDistance(unit, 1) ~= false) then
+			local now = GetTime and GetTime() or 0
+			state.active = {
+				key = item.key,
+				guid = item.guid or (UnitGUID and UnitGUID(unit)) or nil,
+				id = item.id,
+				aliases = item.aliases,
+				unit = unit,
+				requestedAt = now,
+			}
+
+			local entry = self:_GetInspectCacheEntryByAliases(item.aliases) or {}
+			entry.lastAttemptAt = now
+			self:_StoreInspectCacheEntry(entry, item.aliases)
+
+			NotifyInspect(unit)
+			if C_Timer and C_Timer.After then
+				C_Timer.After(INSPECT_REQUEST_TIMEOUT_SECONDS, function()
+					if SF and SF.RaidCheck and SF.RaidCheck._HandleInspectTimeout then
+						SF.RaidCheck:_HandleInspectTimeout(item.key, now)
+					end
+				end)
+			end
+			return
+		end
+	end
+end
+
+function RC:_QueueInspectForUnit(unit, info, cacheEntry)
+	if not unit or IsSelfUnit(unit) then
+		return
+	end
+
+	if not (UnitExists and UnitExists(unit) and CanInspect and CanInspect(unit)) then
+		return
+	end
+	if CheckInteractDistance and CheckInteractDistance(unit, 1) == false then
+		return
+	end
+
+	local state = self:_GetInspectState()
+	local aliases, guid, id = self:_GetInspectAliases(unit, info)
+	local key = guid or id
+	local now = GetTime and GetTime() or 0
+
+	if not key or (cacheEntry and cacheEntry.nextRetryAt and cacheEntry.nextRetryAt > now) then
+		return
+	end
+	if state.active and state.active.key == key then
+		return
+	end
+	if state.queued[key] then
+		return
+	end
+
+	state.queued[key] = true
+	table.insert(state.queue, {
+		key = key,
+		guid = guid,
+		id = id,
+		aliases = aliases,
+	})
+	self:_ProcessInspectQueue()
 end
 
 local function IsCurrentUserAdmin(profile)
@@ -343,18 +686,19 @@ local function EvaluateUnit(unit, cfg)
 	return missing
 end
 
-local function BuildTroubleshootingSlot(unit, column, mainHandLink, cfg)
+local function BuildTroubleshootingSlot(column, mainHandLink, cfg, sourceSlot, inspectState)
 	local inventorySlot = column and column.inventorySlot
 	local slotKey = column and column.key
-	local link = inventorySlot and GetInventoryItemLink(unit, inventorySlot) or nil
+	local isKnown = inspectState and inspectState.isKnown and true or false
+	local link = sourceSlot and sourceSlot.link or nil
 	local configEnabled = IsSlotEnabledInConfig(cfg, slotKey, link)
-	local twoHandExempt = (slotKey == "offHand") and (not link) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
-	local shouldCheckEnchant = link and configEnabled and ShouldCheckTroubleshootingEnchant(slotKey, link) or false
-	local hasEnchant = link and HasEnchant(link) or false
+	local twoHandExempt = isKnown and (slotKey == "offHand") and (not link) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
+	local shouldCheckEnchant = isKnown and link and configEnabled and ShouldCheckTroubleshootingEnchant(slotKey, link) or false
+	local hasEnchant = isKnown and link and HasEnchant(link) or false
 	local missingEnchant = shouldCheckEnchant and not hasEnchant
-	local missingGems = link and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
-	local missingItem = (not link) and configEnabled and not twoHandExempt
-	local skippedEnchant = link and configEnabled and not shouldCheckEnchant
+	local missingGems = isKnown and link and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
+	local missingItem = isKnown and (not link) and configEnabled and not twoHandExempt
+	local skippedEnchant = isKnown and link and configEnabled and not shouldCheckEnchant
 
 	return {
 		key = slotKey,
@@ -363,26 +707,125 @@ local function BuildTroubleshootingSlot(unit, column, mainHandLink, cfg)
 		inventorySlot = inventorySlot,
 		configKey = GetRaidCheckSlotConfigKey(slotKey, link),
 		configEnabled = configEnabled and true or false,
+		known = isKnown and true or false,
 		link = link,
-		texture = (inventorySlot and GetInventoryItemTexture and GetInventoryItemTexture(unit, inventorySlot)) or nil,
+		texture = sourceSlot and sourceSlot.texture or nil,
 		expectedEnchant = shouldCheckEnchant and true or false,
 		hasEnchant = hasEnchant and true or false,
 		missingEnchant = missingEnchant and true or false,
 		missingGems = missingGems and true or false,
 		missingItem = missingItem and true or false,
 		skippedEnchant = skippedEnchant and true or false,
+		inspectStatus = inspectState and inspectState.status or "ready",
+		inspectMessage = inspectState and inspectState.message or nil,
+		stale = inspectState and inspectState.stale and true or false,
 	}
 end
 
-local function BuildTroubleshootingSlots(unit, cfg)
-	local mainHandLink = GetInventoryItemLink(unit, INVSLOT_MAINHAND)
+local function BuildTroubleshootingSlots(inspectState, cfg)
 	local slots = {}
+	local mainHandLink = nil
+
+	if inspectState and inspectState.isKnown and inspectState.slotsByInventory and inspectState.slotsByInventory[INVSLOT_MAINHAND] then
+		mainHandLink = inspectState.slotsByInventory[INVSLOT_MAINHAND].link
+	end
 
 	for index, column in ipairs(TROUBLESHOOTING_COLUMNS) do
-		slots[index] = BuildTroubleshootingSlot(unit, column, mainHandLink, cfg)
+		local sourceSlot = inspectState and inspectState.slotsByInventory and inspectState.slotsByInventory[column.inventorySlot] or nil
+		slots[index] = BuildTroubleshootingSlot(column, mainHandLink, cfg, sourceSlot, inspectState)
 	end
 
 	return slots
+end
+
+function RC:_GetTroubleshootingInspectState(unit, info)
+	self:EnsureInspectSupport()
+
+	if IsSelfUnit(unit) then
+		local captured = CaptureTroubleshootingInventory(unit)
+		return {
+			status = "ready",
+			isKnown = true,
+			slotsByInventory = captured.slotsByInventory,
+			message = nil,
+			label = nil,
+			stale = false,
+		}
+	end
+
+	local aliases = self:_GetInspectAliases(unit, info)
+	local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+	local now = GetTime and GetTime() or 0
+	local hasFreshData = cacheEntry and cacheEntry.updatedAt and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
+
+	if hasFreshData and cacheEntry.slotsByInventory then
+		return {
+			status = "ready",
+			isKnown = true,
+			slotsByInventory = cacheEntry.slotsByInventory,
+			entry = cacheEntry,
+		}
+	end
+
+	local inRange = not CheckInteractDistance or CheckInteractDistance(unit, 1) ~= false
+	local canInspectNow = UnitExists and UnitExists(unit) and CanInspect and CanInspect(unit) and inRange
+	local state = self:_GetInspectState()
+	local activeKey = state.active and state.active.key or nil
+	local key = aliases[1] or aliases[2]
+
+	if canInspectNow then
+		self:_QueueInspectForUnit(unit, info, cacheEntry)
+	end
+
+	if cacheEntry and cacheEntry.slotsByInventory then
+		return {
+			status = (activeKey == key) and "refreshing" or "stale",
+			label = (activeKey == key) and "Refreshing" or "Stale",
+			message = "Showing cached inspect data while a fresh snapshot loads.",
+			isKnown = true,
+			slotsByInventory = cacheEntry.slotsByInventory,
+			entry = cacheEntry,
+			stale = true,
+		}
+	end
+
+	if cacheEntry and cacheEntry.nextRetryAt and cacheEntry.nextRetryAt > now then
+		return {
+			status = "retrying",
+			label = "Retrying",
+			message = "Last inspect attempt timed out. Raid Check will retry shortly.",
+			isKnown = false,
+			stale = false,
+		}
+	end
+
+	if activeKey == key or canInspectNow then
+		return {
+			status = "loading",
+			label = "Loading",
+			message = "Inspect data is loading for this player.",
+			isKnown = false,
+			stale = false,
+		}
+	end
+
+	if not inRange then
+		return {
+			status = "out_of_range",
+			label = "Out of range",
+			message = "Move closer to inspect this player.",
+			isKnown = false,
+			stale = false,
+		}
+	end
+
+	return {
+		status = "unavailable",
+		label = "Unavailable",
+		message = "This player cannot be inspected right now.",
+		isKnown = false,
+		stale = false,
+	}
 end
 
 local function SendWhisper(target, message)
@@ -638,6 +1081,7 @@ function RC:GetTroubleshootingColumns()
 end
 
 function RC:GetTroubleshootingSnapshot()
+	self:EnsureInspectSupport()
 	local profile = GetProfile()
 	local cfg = profile and profile.GetRaidCheckConfig and profile:GetRaidCheckConfig() or nil
 	local rows = {}
@@ -645,12 +1089,16 @@ function RC:GetTroubleshootingSnapshot()
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
 		if info.id then
+			local inspectState = self:_GetTroubleshootingInspectState(unit, info)
 			rows[#rows + 1] = {
 				unit = unit,
 				id = info.id,
 				name = info.short,
 				displayName = info.displayName or info.short,
-				slots = BuildTroubleshootingSlots(unit, cfg),
+				inspectStatus = inspectState and inspectState.status or "ready",
+				inspectLabel = inspectState and inspectState.label or nil,
+				inspectMessage = inspectState and inspectState.message or nil,
+				slots = BuildTroubleshootingSlots(inspectState, cfg),
 			}
 		end
 	end
