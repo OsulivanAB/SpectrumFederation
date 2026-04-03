@@ -229,6 +229,7 @@ end
 
 local AUDIT_MIN_NAME_COLUMN_WIDTH = 120
 local AUDIT_PREFERRED_NAME_COLUMN_WIDTH = 150
+local AUDIT_NAME_PADDING = 8
 local AUDIT_ICON_SIZE = 20
 local AUDIT_COLUMN_GAP = 6
 local AUDIT_ROW_HEIGHT = 26
@@ -418,6 +419,16 @@ local function SetScrollBarShown(scroll, shown)
 	return 0
 end
 
+local function GetAuditNameColumnWidth(availableWidth, slotCount)
+	local totalIconWidth = slotCount * AUDIT_ICON_SIZE
+	local totalGap = slotCount * AUDIT_COLUMN_GAP
+	local availableNameWidth = availableWidth - totalIconWidth - totalGap
+	return math.max(
+		AUDIT_MIN_NAME_COLUMN_WIDTH,
+		math.min(AUDIT_PREFERRED_NAME_COLUMN_WIDTH, availableNameWidth)
+	)
+end
+
 local function BuildAuditPage(panel)
 	local pageBuilder = SF.SettingsUI:CreatePage(panel)
 	panel.__sfPageBuilder = pageBuilder
@@ -548,11 +559,7 @@ local function BuildAuditPage(panel)
 			local slotCount = #slotWidgets
 			local totalIconWidth = slotCount * AUDIT_ICON_SIZE
 			local totalGap = slotCount * AUDIT_COLUMN_GAP
-			local availableNameWidth = availableWidth - totalIconWidth - totalGap
-			local nameWidth = math.max(
-				AUDIT_MIN_NAME_COLUMN_WIDTH,
-				math.min(AUDIT_PREFERRED_NAME_COLUMN_WIDTH, availableNameWidth)
-			)
+			local nameWidth = GetAuditNameColumnWidth(availableWidth, slotCount)
 			local usedWidth = nameWidth + totalIconWidth + totalGap
 			local xOffset = 0
 
@@ -563,7 +570,7 @@ local function BuildAuditPage(panel)
 				nameWidget:SetWidth(nameWidth)
 			else
 				nameWidget:SetPoint("LEFT", parent, "LEFT", 4, 0)
-				nameWidget:SetWidth(math.max(1, nameWidth - 8))
+				nameWidget:SetWidth(math.max(1, nameWidth - AUDIT_NAME_PADDING))
 			end
 
 			xOffset = nameWidth + AUDIT_COLUMN_GAP
@@ -642,7 +649,7 @@ local function BuildAuditPage(panel)
 			local usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, headerCells, availableWidth)
 			content:SetWidth(math.max(usedWidth, availableWidth))
 
-			nameHeaderText:SetWidth(math.max(1, nameWidth - 8))
+			nameHeaderText:SetWidth(math.max(1, nameWidth - AUDIT_NAME_PADDING))
 			for _, dataRow in ipairs(rows) do
 				if dataRow:IsShown() then
 					LayoutRowWidgets(dataRow, dataRow.Name, dataRow.Cells, availableWidth)
