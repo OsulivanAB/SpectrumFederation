@@ -18,6 +18,7 @@ SF.SettingsSchema = {
 			enabled = true,
 			localSafeMode = false,
 			localSafeModeOnCombat = false,
+			raidCheckAuditAutoRefresh = false,
 
 			-- Profile system
 			activeProfileId = nil,
@@ -156,4 +157,3 @@ SF.SettingsSchema = {
 		end,
 	},
 }
-

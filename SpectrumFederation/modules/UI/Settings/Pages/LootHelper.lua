@@ -138,6 +138,14 @@ local function GetRaidCheckConfig()
 	return nil
 end
 
+local function IsAuditAutoRefreshEnabled()
+	local store = SF.SettingsStore
+	if not store or not store.Get then
+		return false
+	end
+	return store:Get("lootHelper.raidCheckAuditAutoRefresh") and true or false
+end
+
 local function IsRaidCheckSlotEnabled(slotKey)
 	local cfg = GetRaidCheckConfig()
 	if cfg and cfg.slots then
@@ -494,15 +502,33 @@ local function BuildAuditPage(panel)
 	})
 
 	introSection:AddText("This table shows the same live item links Raid Check is currently evaluating. A red pulse means that slot has a missing required enchant or an empty gem socket.")
+	controls:AddCheckbox(introSection, {
+		label = "Enable Auto Refresh",
+		tooltip = "Automatically refresh this audit table as inspect results update. Leave this off to refresh only when you ask for it.",
+		get = IsAuditAutoRefreshEnabled,
+		set = function(value)
+			if SF.SettingsStore and SF.SettingsStore.Set then
+				SF.SettingsStore:Set("lootHelper.raidCheckAuditAutoRefresh", value and true or false)
+			end
+			if panel.__sfPageBuilder then
+				panel.__sfPageBuilder:Refresh()
+			end
+		end,
+	})
 	controls:AddButton(introSection, {
 		label = "Refresh Snapshot",
 		buttonText = "Refresh",
 		width = 120,
 		onClick = function()
+			if SF.RaidCheck and SF.RaidCheck.RequestTroubleshootingRefresh then
+				SF.RaidCheck:RequestTroubleshootingRefresh()
+			end
 			if panel.__sfPageBuilder then
 				panel.__sfPageBuilder:Refresh()
-				panel.__sfPageBuilder:Reflow()
 			end
+		end,
+		visible = function()
+			return not IsAuditAutoRefreshEnabled()
 		end,
 	})
 
@@ -820,7 +846,9 @@ local function BuildAuditPage(panel)
 			end
 			panel.__sfAuditListenerKey = panel
 			SF.RaidCheck:RegisterTroubleshootingListener(panel.__sfAuditListenerKey, function()
-				RefreshAuditTable()
+				if IsAuditAutoRefreshEnabled() then
+					RefreshAuditTable()
+				end
 			end)
 		end
 

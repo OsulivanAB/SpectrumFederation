@@ -691,6 +691,26 @@ function RC:_QueueInspectForUnit(unit, info, cacheEntry)
 	self:_ProcessInspectQueue()
 end
 
+function RC:RequestTroubleshootingRefresh()
+	self:EnsureInspectSupport()
+
+	for _, unit in ipairs(CollectUnits()) do
+		local info = BuildUnitInfo(unit)
+		if info.id then
+			local aliases = self:_GetInspectAliases(unit, info)
+			local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+			if type(cacheEntry) == "table" then
+				cacheEntry.updatedAt = nil
+				cacheEntry.nextRetryAt = nil
+				self:_StoreInspectCacheEntry(cacheEntry, aliases)
+			end
+			self:_QueueInspectForUnit(unit, info, cacheEntry)
+		end
+	end
+
+	self:_NotifyTroubleshootingListeners()
+end
+
 local function IsCurrentUserAdmin(profile)
 	return profile and profile.IsCurrentUserAdmin and profile:IsCurrentUserAdmin()
 end
@@ -1135,6 +1155,8 @@ end
 	function RC:RunPreRaidCheck()
 		local profile, cfg = ValidateCanRun("pre")
 		if not profile then return end
+
+		self:RequestTroubleshootingRefresh()
 	
 		if SF.SystemMessage then
 			SF:SystemMessage("Pre-Raid Check started.")
@@ -1182,6 +1204,8 @@ end
 	function RC:RunRaidCheck()
 		local profile, cfg = ValidateCanRun("raid")
 		if not profile then return end
+
+		self:RequestTroubleshootingRefresh()
 	
 		if SF.SystemMessage then
 			SF:SystemMessage("Raid Check started.")
