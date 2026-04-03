@@ -1090,13 +1090,13 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 
 	if type(inspectState) ~= "table" then
 		result.inspectPending = "Unavailable"
-		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, tostring(result.inspectPending)))
+		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, result.inspectPending))
 		return result
 	end
 
 	if not (inspectState.isKnown and inspectState.slotsByInventory) then
 		result.inspectPending = inspectState and (inspectState.label or inspectState.status) or "Loading"
-		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, tostring(result.inspectPending)))
+		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, result.inspectPending))
 		return result
 	end
 
