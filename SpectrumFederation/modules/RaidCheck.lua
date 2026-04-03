@@ -3,7 +3,7 @@ local addonName, SF = ...
 
 -- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET
 -- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
--- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem C_Item
+-- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetDetailedItemLevelInfo C_Item
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime
 
@@ -158,6 +158,26 @@ local function HasMissingGems(link)
 	return filled < sockets
 end
 
+local function GetDetailedItemLevelSafe(link)
+	if type(link) ~= "string" then return nil end
+
+	if GetDetailedItemLevelInfo then
+		local ok, itemLevel = pcall(GetDetailedItemLevelInfo, link)
+		if ok and tonumber(itemLevel) then
+			return tonumber(itemLevel)
+		end
+	end
+
+	if C_Item and C_Item.GetDetailedItemLevelInfo then
+		local ok, itemLevel = pcall(C_Item.GetDetailedItemLevelInfo, link)
+		if ok and tonumber(itemLevel) then
+			return tonumber(itemLevel)
+		end
+	end
+
+	return nil
+end
+
 local function IsEpicQualityLink(link)
 	if type(link) ~= "string" then return false end
 	local colorCode = link:match("|c(%x%x%x%x%x%x%x%x)|H")
@@ -293,6 +313,31 @@ local function CanInspectUnitNow(unit)
 		and IsUnitInInspectRange(unit)
 end
 
+local function GetSnapshotSlotLink(slotsByInventory, inventorySlot)
+	local slotData = slotsByInventory and slotsByInventory[inventorySlot]
+	return slotData and slotData.link or nil
+end
+
+local function CalculateAverageItemLevel(slotsByInventory)
+	local total = 0
+	local count = 0
+
+	for _, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+		local slotData = slotsByInventory and slotsByInventory[column.inventorySlot]
+		local itemLevel = slotData and slotData.itemLevel or nil
+		if itemLevel and itemLevel > 0 then
+			total = total + itemLevel
+			count = count + 1
+		end
+	end
+
+	if count == 0 then
+		return nil
+	end
+
+	return total / count
+end
+
 local function CollectUnits()
 	local units = {}
 
@@ -344,9 +389,11 @@ local function CaptureTroubleshootingInventory(unit)
 		if inventorySlot and not slotsByInventory[inventorySlot] then
 			local link = GetInventoryItemLink(unit, inventorySlot)
 			local texture = GetInventoryItemTexture and GetInventoryItemTexture(unit, inventorySlot) or nil
+			local itemLevel = GetDetailedItemLevelSafe(link)
 			slotsByInventory[inventorySlot] = {
 				link = link,
 				texture = texture,
+				itemLevel = itemLevel,
 			}
 			if link or texture then
 				sawAnyData = true
@@ -355,6 +402,7 @@ local function CaptureTroubleshootingInventory(unit)
 	end
 
 	return {
+		averageItemLevel = CalculateAverageItemLevel(slotsByInventory),
 		slotsByInventory = slotsByInventory,
 		sawAnyData = sawAnyData,
 	}
@@ -545,6 +593,7 @@ function RC:_HandleInspectReady(guid)
 		entry.lastAttemptAt = active.requestedAt
 		entry.nextRetryAt = nil
 		entry.updatedAt = now
+		entry.averageItemLevel = captured.averageItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
 	else
 		entry.status = "timeout"
@@ -684,24 +733,76 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 	return missing
 end
 
-local function EvaluateUnit(unit, cfg)
-	local mainHandLink = GetInventoryItemLink(unit, INVSLOT_MAINHAND)
-	local missing = {}
+local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, idx, mainHandLink, cfg)
+	local link = GetSnapshotSlotLink(slotsByInventory, slotDef.slots[idx])
+	local label = slotDef.label
+	if #slotDef.slots > 1 then
+		label = string.format("%s %d", label, idx)
+	end
 
-	for slotKey, slotDef in pairs(SLOT_DEFS) do
+	if not link then
+		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
+			return {}
+		end
+		if not IsSlotEnabledInConfig(cfg, slotKey, nil) then
+			return {}
+		end
+		return { label .. " Item" }
+	end
+
+	local missing = {}
+	if IsSlotEnabledInConfig(cfg, slotKey, link) and ShouldCheckEnchant(slotDef, link) and not HasEnchant(link) then
+		table.insert(missing, label .. " Enchant")
+	end
+
+	if cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
+		table.insert(missing, label .. " Gem")
+	end
+
+	return missing
+end
+
+local function HasEquippedMetaGemInSnapshot(slotsByInventory)
+	for _, slotDef in pairs(SLOT_DEFS) do
 		for idx = 1, #slotDef.slots do
-			local slotMissing = BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cfg)
-			for _, m in ipairs(slotMissing) do
-				table.insert(missing, m)
+			local link = GetSnapshotSlotLink(slotsByInventory, slotDef.slots[idx])
+			if type(link) == "string" then
+				for gemIndex = 1, MAX_GEM_SOCKETS_TO_SCAN do
+					local gemName, gemLink = GetItemGem(link, gemIndex)
+					if IsMetaGemSocketed(gemName, gemLink) then
+						return true
+					end
+				end
 			end
 		end
 	end
 
-	if cfg and cfg.requireMetaGem and not HasEquippedMetaGem(unit) then
+	return false
+end
+
+local function EvaluateSnapshot(slotsByInventory, cfg)
+	local mainHandLink = GetSnapshotSlotLink(slotsByInventory, INVSLOT_MAINHAND)
+	local missing = {}
+
+	for slotKey, slotDef in pairs(SLOT_DEFS) do
+		for idx = 1, #slotDef.slots do
+			local slotMissing = BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, idx, mainHandLink, cfg)
+			for _, entry in ipairs(slotMissing) do
+				table.insert(missing, entry)
+			end
+		end
+	end
+
+	if cfg and cfg.requireMetaGem and not HasEquippedMetaGemInSnapshot(slotsByInventory) then
 		table.insert(missing, "Meta Gem")
 	end
 
 	return missing
+end
+
+local function EvaluateUnit(unit, cfg)
+	local captured = CaptureTroubleshootingInventory(unit)
+	return EvaluateSnapshot(captured.slotsByInventory, cfg)
 end
 
 local function BuildTroubleshootingSlot(column, mainHandLink, cfg, sourceSlot, inspectState)
@@ -764,6 +865,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		return {
 			status = "ready",
 			isKnown = true,
+			averageItemLevel = captured.averageItemLevel,
 			slotsByInventory = captured.slotsByInventory,
 			message = nil,
 			label = nil,
@@ -780,6 +882,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		return {
 			status = "ready",
 			isKnown = true,
+			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
 		}
@@ -801,6 +904,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			label = (activeKey == key) and "Refreshing" or "Stale",
 			message = "Showing cached inspect data while a fresh snapshot loads.",
 			isKnown = true,
+			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
 			stale = true,
@@ -950,6 +1054,18 @@ local function BuildUnitInfo(unit)
 	}
 end
 
+local function FormatAverageItemLevel(value)
+	if not value or value <= 0 then
+		return nil
+	end
+
+	local rounded = math.floor((value * 10) + 0.5) / 10
+	if math.abs(rounded - math.floor(rounded + 0.5)) < 0.05 then
+		return tostring(math.floor(rounded + 0.5))
+	end
+	return string.format("%.1f", rounded)
+end
+
 local function ShouldWhisper(mode, cfg)
 	if mode == "pre" then
 		return cfg.enableWhispersPreRaid
@@ -957,8 +1073,8 @@ local function ShouldWhisper(mode, cfg)
 	return cfg.enableWhispersRaid
 end
 
-	local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
-	local missing = EvaluateUnit(unitInfo.unit, cfg)
+local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
+	local inspectState = RC:_GetTroubleshootingInspectState(unitInfo.unit, unitInfo)
 	local whisper = ShouldWhisper(mode, cfg)
 	local whisperTarget = unitInfo.id or unitInfo.short
 	local result = {
@@ -966,24 +1082,31 @@ end
 		displayName = unitInfo.displayName or unitInfo.short,
 		id = unitInfo.id,
 		missing = nil,
+		inspectPending = nil,
 		whisperedMissing = false,
 	}
-		
-		if #missing > 0 then
-			local list = FormatMissingList(missing)
-			local suffix = ""
-			if whisper and mode == "pre" then
+
+	if not (inspectState and inspectState.isKnown and inspectState.slotsByInventory) then
+		result.inspectPending = inspectState and (inspectState.label or inspectState.status) or "Loading"
+		SF:PrintInfo(("%s Inspect pending: %s."):format(result.displayName, tostring(result.inspectPending)))
+		return result
+	end
+
+	local missing = EvaluateSnapshot(inspectState.slotsByInventory, cfg)
+	if #missing > 0 then
+		local list = FormatMissingList(missing)
+		local suffix = ""
+		if whisper then
+			WhisperMissing(whisperTarget, pointName, list, mode)
+			result.whisperedMissing = true
+			if mode == "pre" then
 				suffix = " (whispered)"
 			end
-			SF:PrintWarning(("%s Missing: %s%s"):format(result.displayName, list, suffix))
-			
-			if whisper then
-				WhisperMissing(whisperTarget, pointName, list, mode)
-			end
-			
-			result.missing = list
-			return result
 		end
+		SF:PrintWarning(("%s Missing: %s%s"):format(result.displayName, list, suffix))
+		result.missing = list
+		return result
+	end
 
 	if mode == "raid" then
 		local member = FindMember(profile, unitInfo.id)
@@ -1012,6 +1135,7 @@ end
 		end
 
 	local summaryMissing = {}
+	local summaryPending = {}
 
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
@@ -1023,6 +1147,8 @@ end
 				end
 				if res.missing then
 					table.insert(summaryMissing, res)
+				elseif res.inspectPending then
+					table.insert(summaryPending, res)
 				end
 			end
 		end
@@ -1032,6 +1158,13 @@ end
 		SF:PrintWarning("[Pre-Raid Check] Players missing enchants/gems:")
 		for _, entry in ipairs(summaryMissing) do
 			SF:PrintWarning(string.format("  %s - %s", entry.displayName or entry.name, entry.missing))
+		end
+	end
+
+	if #summaryPending > 0 then
+		SF:PrintInfo("[Pre-Raid Check] Players still waiting on inspect data:")
+		for _, entry in ipairs(summaryPending) do
+			SF:PrintInfo(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectPending))
 		end
 	end
 
@@ -1050,6 +1183,7 @@ end
 
 	local pointName = GetPointName(profile)
 	local summaryMissing = {}
+	local summaryPending = {}
 
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
@@ -1061,6 +1195,8 @@ end
 				end
 				if res.missing then
 					table.insert(summaryMissing, res)
+				elseif res.inspectPending then
+					table.insert(summaryPending, res)
 				end
 			end
 		end
@@ -1070,6 +1206,13 @@ end
 		SF:PrintWarning("[Raid Check] Players missing enchants/gems:")
 		for _, entry in ipairs(summaryMissing) do
 			SF:PrintWarning(string.format("  %s - %s", entry.displayName or entry.name, entry.missing))
+		end
+	end
+
+	if #summaryPending > 0 then
+		SF:PrintInfo("[Raid Check] Players still waiting on inspect data:")
+		for _, entry in ipairs(summaryPending) do
+			SF:PrintInfo(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectPending))
 		end
 	end
 
@@ -1113,6 +1256,8 @@ function RC:GetTroubleshootingSnapshot()
 				id = info.id,
 				name = info.short,
 				displayName = info.displayName or info.short,
+				itemLevel = inspectState and inspectState.averageItemLevel or nil,
+				itemLevelText = FormatAverageItemLevel(inspectState and inspectState.averageItemLevel or nil),
 				inspectStatus = inspectState and inspectState.status or "ready",
 				inspectLabel = inspectState and inspectState.label or nil,
 				inspectMessage = inspectState and inspectState.message or nil,

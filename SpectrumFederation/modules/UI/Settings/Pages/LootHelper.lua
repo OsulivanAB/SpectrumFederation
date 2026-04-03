@@ -230,6 +230,7 @@ end
 local AUDIT_MIN_NAME_COLUMN_WIDTH = 120
 local AUDIT_PREFERRED_NAME_COLUMN_WIDTH = 150
 local AUDIT_NAME_PADDING = 8
+local AUDIT_ILVL_COLUMN_WIDTH = 52
 local AUDIT_ICON_SIZE = 40
 local AUDIT_COLUMN_GAP = 6
 local AUDIT_ROW_HEIGHT = 46
@@ -474,8 +475,8 @@ end
 
 local function GetAuditNameColumnWidth(availableWidth, slotCount)
 	local totalIconWidth = slotCount * AUDIT_ICON_SIZE
-	local totalGap = slotCount * AUDIT_COLUMN_GAP
-	local availableNameWidth = availableWidth - totalIconWidth - totalGap
+	local totalGap = (slotCount + 1) * AUDIT_COLUMN_GAP
+	local availableNameWidth = availableWidth - totalIconWidth - totalGap - AUDIT_ILVL_COLUMN_WIDTH
 	return math.max(
 		AUDIT_MIN_NAME_COLUMN_WIDTH,
 		math.min(AUDIT_PREFERRED_NAME_COLUMN_WIDTH, availableNameWidth)
@@ -492,7 +493,7 @@ local function BuildAuditPage(panel)
 		tooltip = "Inspect the exact equipment snapshot that Raid Check currently sees for each visible group member.",
 	})
 
-	introSection:AddText("This table shows the same live item links Raid Check is currently evaluating. A red pulse means that slot is configured to require an enchant, but none was detected.")
+	introSection:AddText("This table shows the same live item links Raid Check is currently evaluating. A red pulse means that slot has a missing required enchant or an empty gem socket.")
 	controls:AddButton(introSection, {
 		label = "Refresh Snapshot",
 		buttonText = "Refresh",
@@ -565,6 +566,12 @@ local function BuildAuditPage(panel)
 		nameHeaderText:SetJustifyH("LEFT")
 		nameHeaderText:SetText("Member")
 
+		local itemLevelHeader = CreateFrame("Frame", nil, header)
+		local itemLevelHeaderText = itemLevelHeader:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+		itemLevelHeaderText:SetPoint("CENTER", itemLevelHeader, "CENTER", 0, 0)
+		itemLevelHeaderText:SetJustifyH("CENTER")
+		itemLevelHeaderText:SetText("iLvl")
+
 		local headerCells = {}
 		for index, column in ipairs(columns) do
 			local cell = CreateFrame("Frame", nil, header)
@@ -615,6 +622,10 @@ local function BuildAuditPage(panel)
 			end
 			dataRow.Name = name
 
+			local itemLevel = dataRow:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+			itemLevel:SetJustifyH("CENTER")
+			dataRow.ItemLevel = itemLevel
+
 			dataRow.Cells = {}
 			for columnIndex = 1, #columns do
 				dataRow.Cells[columnIndex] = CreateAuditCell(dataRow)
@@ -624,12 +635,12 @@ local function BuildAuditPage(panel)
 			return dataRow
 		end
 
-		local function LayoutRowWidgets(parent, nameWidget, slotWidgets, availableWidth)
+		local function LayoutRowWidgets(parent, nameWidget, itemLevelWidget, slotWidgets, availableWidth)
 			local slotCount = #slotWidgets
 			local totalIconWidth = slotCount * AUDIT_ICON_SIZE
-			local totalGap = slotCount * AUDIT_COLUMN_GAP
+			local totalGap = (slotCount + 1) * AUDIT_COLUMN_GAP
 			local nameWidth = GetAuditNameColumnWidth(availableWidth, slotCount)
-			local usedWidth = nameWidth + totalIconWidth + totalGap
+			local usedWidth = nameWidth + AUDIT_ILVL_COLUMN_WIDTH + totalIconWidth + totalGap
 			local xOffset = 0
 
 			nameWidget:ClearAllPoints()
@@ -642,7 +653,17 @@ local function BuildAuditPage(panel)
 				nameWidget:SetWidth(math.max(1, nameWidth - AUDIT_NAME_PADDING))
 			end
 
-			xOffset = nameWidth + AUDIT_COLUMN_GAP
+			itemLevelWidget:ClearAllPoints()
+			if itemLevelWidget.GetObjectType and itemLevelWidget:GetObjectType() == "Frame" then
+				itemLevelWidget:SetPoint("TOPLEFT", parent, "TOPLEFT", nameWidth + AUDIT_COLUMN_GAP, 0)
+				itemLevelWidget:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", nameWidth + AUDIT_COLUMN_GAP, 0)
+				itemLevelWidget:SetWidth(AUDIT_ILVL_COLUMN_WIDTH)
+			else
+				itemLevelWidget:SetPoint("CENTER", parent, "LEFT", nameWidth + AUDIT_COLUMN_GAP + (AUDIT_ILVL_COLUMN_WIDTH / 2), 0)
+				itemLevelWidget:SetWidth(AUDIT_ILVL_COLUMN_WIDTH)
+			end
+
+			xOffset = nameWidth + AUDIT_COLUMN_GAP + AUDIT_ILVL_COLUMN_WIDTH + AUDIT_COLUMN_GAP
 			for _, widget in ipairs(slotWidgets) do
 				widget:ClearAllPoints()
 				widget:SetPoint("LEFT", parent, "LEFT", xOffset, 0)
@@ -669,6 +690,12 @@ local function BuildAuditPage(panel)
 				dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
 				dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
 				dataRow.Name:SetText(FormatAuditRowName(rowData))
+				dataRow.ItemLevel:SetText(rowData.itemLevelText or "--")
+				if rowData.itemLevelText then
+					dataRow.ItemLevel:SetTextColor(1, 0.82, 0.2, 1)
+				else
+					dataRow.ItemLevel:SetTextColor(0.65, 0.65, 0.65, 1)
+				end
 				dataRow:Show()
 
 				for columnIndex, column in ipairs(columns) do
@@ -690,7 +717,7 @@ local function BuildAuditPage(panel)
 						cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
 					end
 
-					SetAuditMissingOverlay(cell.MissingOverlay, slotData and slotData.known and slotData.missingEnchant)
+					SetAuditMissingOverlay(cell.MissingOverlay, slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems))
 					cell:Show()
 				end
 
@@ -708,7 +735,7 @@ local function BuildAuditPage(panel)
 			local scrollBarWidth = 0
 			local horizontalScrollHeight = 0
 			local availableWidth = 1
-			local usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, headerCells, availableWidth)
+			local usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, itemLevelHeader, headerCells, availableWidth)
 			for _ = 1, 2 do
 				scroll:ClearAllPoints()
 				scroll:SetPoint("TOPLEFT", headerViewport, "BOTTOMLEFT", 0, -4)
@@ -724,7 +751,7 @@ local function BuildAuditPage(panel)
 				headerViewport:SetHeight(AUDIT_HEADER_HEIGHT)
 
 				availableWidth = math.max(1, headerViewport:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
-				usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, headerCells, availableWidth)
+				usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, itemLevelHeader, headerCells, availableWidth)
 				horizontalScrollHeight =
 					SetAuditHorizontalScrollShown(horizontalScroll, usedWidth > availableWidth)
 			end
@@ -756,9 +783,10 @@ local function BuildAuditPage(panel)
 			end)
 
 			nameHeaderText:SetWidth(math.max(1, nameWidth - AUDIT_NAME_PADDING))
+			itemLevelHeader:SetWidth(AUDIT_ILVL_COLUMN_WIDTH)
 			for _, dataRow in ipairs(rows) do
 				if dataRow:IsShown() then
-					LayoutRowWidgets(dataRow, dataRow.Name, dataRow.Cells, availableWidth)
+					LayoutRowWidgets(dataRow, dataRow.Name, dataRow.ItemLevel, dataRow.Cells, availableWidth)
 				end
 			end
 		end
