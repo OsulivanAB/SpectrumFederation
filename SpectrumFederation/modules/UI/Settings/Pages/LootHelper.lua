@@ -227,7 +227,8 @@ local function GetMemberClassColor(member)
 	return "|cffffffff"
 end
 
-local AUDIT_MIN_NAME_COLUMN_WIDTH = 150
+local AUDIT_MIN_NAME_COLUMN_WIDTH = 120
+local AUDIT_PREFERRED_NAME_COLUMN_WIDTH = 150
 local AUDIT_ICON_SIZE = 20
 local AUDIT_COLUMN_GAP = 6
 local AUDIT_ROW_HEIGHT = 26
@@ -547,7 +548,11 @@ local function BuildAuditPage(panel)
 			local slotCount = #slotWidgets
 			local totalIconWidth = slotCount * AUDIT_ICON_SIZE
 			local totalGap = slotCount * AUDIT_COLUMN_GAP
-			local nameWidth = math.max(AUDIT_MIN_NAME_COLUMN_WIDTH, availableWidth - totalIconWidth - totalGap)
+			local availableNameWidth = availableWidth - totalIconWidth - totalGap
+			local nameWidth = math.max(
+				AUDIT_MIN_NAME_COLUMN_WIDTH,
+				math.min(AUDIT_PREFERRED_NAME_COLUMN_WIDTH, availableNameWidth)
+			)
 			local usedWidth = nameWidth + totalIconWidth + totalGap
 			local xOffset = 0
 
