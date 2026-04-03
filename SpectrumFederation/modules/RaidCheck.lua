@@ -2,7 +2,7 @@
 local addonName, SF = ...
 
 -- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
--- luacheck: globals GetInventoryItemLink GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName C_Item
+-- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName C_Item
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -25,6 +25,25 @@ local SLOT_DEFS = {
 	trinkets = { label = "Trinket", slots = { INVSLOT_TRINKET1, INVSLOT_TRINKET2 } },
 	mainHand = { label = "Main Hand", slots = { INVSLOT_MAINHAND } },
 	offHand = { label = "Off Hand", slots = { INVSLOT_OFFHAND } },
+}
+
+local TROUBLESHOOTING_COLUMNS = {
+	{ key = "head", label = "Head", shortLabel = "Hd", inventorySlot = INVSLOT_HEAD },
+	{ key = "neck", label = "Neck", shortLabel = "Nk", inventorySlot = INVSLOT_NECK },
+	{ key = "shoulders", label = "Shoulders", shortLabel = "Sh", inventorySlot = INVSLOT_SHOULDER },
+	{ key = "back", label = "Back", shortLabel = "Bk", inventorySlot = INVSLOT_BACK },
+	{ key = "chest", label = "Chest", shortLabel = "Ch", inventorySlot = INVSLOT_CHEST },
+	{ key = "wrist", label = "Wrist", shortLabel = "Wr", inventorySlot = INVSLOT_WRIST },
+	{ key = "hands", label = "Gloves", shortLabel = "Gl", inventorySlot = INVSLOT_HAND },
+	{ key = "belt", label = "Belt", shortLabel = "Bt", inventorySlot = INVSLOT_WAIST },
+	{ key = "legs", label = "Legs", shortLabel = "Lg", inventorySlot = INVSLOT_LEGS },
+	{ key = "boots", label = "Boots", shortLabel = "Ft", inventorySlot = INVSLOT_FEET },
+	{ key = "rings", label = "Ring 1", shortLabel = "R1", inventorySlot = INVSLOT_FINGER1 },
+	{ key = "rings", label = "Ring 2", shortLabel = "R2", inventorySlot = INVSLOT_FINGER2 },
+	{ key = "trinkets", label = "Trinket 1", shortLabel = "T1", inventorySlot = INVSLOT_TRINKET1 },
+	{ key = "trinkets", label = "Trinket 2", shortLabel = "T2", inventorySlot = INVSLOT_TRINKET2 },
+	{ key = "mainHand", label = "Weapon", shortLabel = "MH", inventorySlot = INVSLOT_MAINHAND },
+	{ key = "offHand", label = "Off Hand", shortLabel = "OH", inventorySlot = INVSLOT_OFFHAND },
 }
 
 local function NormalizeNameRealm(name, realm)
@@ -204,6 +223,14 @@ local function ShouldCheckEnchant(slotDef, link)
 	return false
 end
 
+local function ShouldCheckTroubleshootingEnchant(slotKey, link)
+	if slotKey == "offHand" then
+		return ShouldCheckEnchant(SLOT_DEFS.offHand, link)
+	end
+
+	return true
+end
+
 local function GetRaidCheckSlotConfigKey(slotKey, link)
 	-- Raid Check evaluates physical equipment slots, but the settings model
 	-- now exposes a logical "weapon" toggle that covers main-hand weapons and
@@ -314,6 +341,48 @@ local function EvaluateUnit(unit, cfg)
 	end
 
 	return missing
+end
+
+local function BuildTroubleshootingSlot(unit, column, mainHandLink, cfg)
+	local inventorySlot = column and column.inventorySlot
+	local slotKey = column and column.key
+	local link = inventorySlot and GetInventoryItemLink(unit, inventorySlot) or nil
+	local configEnabled = IsSlotEnabledInConfig(cfg, slotKey, link)
+	local twoHandExempt = (slotKey == "offHand") and (not link) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
+	local shouldCheckEnchant = link and configEnabled and ShouldCheckTroubleshootingEnchant(slotKey, link) or false
+	local hasEnchant = link and HasEnchant(link) or false
+	local missingEnchant = shouldCheckEnchant and not hasEnchant
+	local missingGems = link and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
+	local missingItem = (not link) and configEnabled and not twoHandExempt
+	local skippedEnchant = link and configEnabled and not shouldCheckEnchant
+
+	return {
+		key = slotKey,
+		label = column and column.label or tostring(slotKey or "Slot"),
+		shortLabel = column and column.shortLabel or tostring(slotKey or "Slot"),
+		inventorySlot = inventorySlot,
+		configKey = GetRaidCheckSlotConfigKey(slotKey, link),
+		configEnabled = configEnabled and true or false,
+		link = link,
+		texture = (inventorySlot and GetInventoryItemTexture and GetInventoryItemTexture(unit, inventorySlot)) or nil,
+		expectedEnchant = shouldCheckEnchant and true or false,
+		hasEnchant = hasEnchant and true or false,
+		missingEnchant = missingEnchant and true or false,
+		missingGems = missingGems and true or false,
+		missingItem = missingItem and true or false,
+		skippedEnchant = skippedEnchant and true or false,
+	}
+end
+
+local function BuildTroubleshootingSlots(unit, cfg)
+	local mainHandLink = GetInventoryItemLink(unit, INVSLOT_MAINHAND)
+	local slots = {}
+
+	for index, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+		slots[index] = BuildTroubleshootingSlot(unit, column, mainHandLink, cfg)
+	end
+
+	return slots
 end
 
 local function SendWhisper(target, message)
@@ -551,4 +620,44 @@ function RC:Run(mode)
 		return self:RunPreRaidCheck()
 	end
 	return self:RunRaidCheck()
+end
+
+function RC:GetTroubleshootingColumns()
+	local columns = {}
+
+	for index, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+		columns[index] = {
+			key = column.key,
+			label = column.label,
+			shortLabel = column.shortLabel,
+			inventorySlot = column.inventorySlot,
+		}
+	end
+
+	return columns
+end
+
+function RC:GetTroubleshootingSnapshot()
+	local profile = GetProfile()
+	local cfg = profile and profile.GetRaidCheckConfig and profile:GetRaidCheckConfig() or nil
+	local rows = {}
+
+	for _, unit in ipairs(CollectUnits()) do
+		local info = BuildUnitInfo(unit)
+		if info.id then
+			rows[#rows + 1] = {
+				unit = unit,
+				id = info.id,
+				name = info.short,
+				displayName = info.displayName or info.short,
+				slots = BuildTroubleshootingSlots(unit, cfg),
+			}
+		end
+	end
+
+	return {
+		hasActiveProfile = profile ~= nil,
+		columns = self:GetTroubleshootingColumns(),
+		rows = rows,
+	}
 end

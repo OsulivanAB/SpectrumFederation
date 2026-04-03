@@ -33,6 +33,18 @@ local SessionPage = {
 	order = 22,
 }
 
+local AuditPage = {
+	id = "lootHelperAudit",
+	parentId = "lootHelper",
+	name = "Raid Check Audit",
+	navLabel = "Audit",
+	order = 22.5,
+	layout = {
+		windowWidth = 1280,
+		disablePageScroll = true,
+	},
+}
+
 local AdminPage = {
 	id = "lootHelperAdmin",
 	parentId = "lootHelper",
@@ -213,6 +225,432 @@ local function GetMemberClassColor(member)
 	end
 
 	return "|cffffffff"
+end
+
+local AUDIT_MIN_NAME_COLUMN_WIDTH = 150
+local AUDIT_ICON_SIZE = 20
+local AUDIT_COLUMN_GAP = 6
+local AUDIT_ROW_HEIGHT = 26
+local AUDIT_ROW_SPACING = 2
+local AUDIT_HEADER_HEIGHT = 24
+local AUDIT_MIN_TABLE_HEIGHT = 260
+local AUDIT_SLOT_PLACEHOLDERS = {
+	head = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head",
+	neck = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck",
+	shoulders = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Shoulder",
+	back = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Chest",
+	chest = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Chest",
+	wrist = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Wrists",
+	hands = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Hands",
+	belt = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Waist",
+	legs = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Legs",
+	boots = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Feet",
+	rings = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Finger",
+	trinkets = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Trinket",
+	mainHand = "Interface\\PaperDoll\\UI-PaperDoll-Slot-MainHand",
+	offHand = "Interface\\PaperDoll\\UI-PaperDoll-Slot-SecondaryHand",
+}
+
+local function GetAuditSlotPlaceholderTexture(slotKey)
+	return AUDIT_SLOT_PLACEHOLDERS[slotKey] or "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+local function EnsureAuditPulse(texture)
+	if texture.__sfPulse then
+		return texture.__sfPulse
+	end
+
+	local pulse = texture:CreateAnimationGroup()
+	pulse:SetLooping("REPEAT")
+
+	local fadeIn = pulse:CreateAnimation("Alpha")
+	fadeIn:SetOrder(1)
+	fadeIn:SetFromAlpha(0.16)
+	fadeIn:SetToAlpha(0.34)
+	fadeIn:SetDuration(0.8)
+
+	local fadeOut = pulse:CreateAnimation("Alpha")
+	fadeOut:SetOrder(2)
+	fadeOut:SetFromAlpha(0.34)
+	fadeOut:SetToAlpha(0.16)
+	fadeOut:SetDuration(0.8)
+
+	texture.__sfPulse = pulse
+	return pulse
+end
+
+local function SetAuditMissingOverlay(texture, enabled)
+	local pulse = EnsureAuditPulse(texture)
+	if enabled then
+		texture:SetAlpha(0.16)
+		texture:Show()
+		if not pulse:IsPlaying() then
+			pulse:Play()
+		end
+		return
+	end
+
+	if pulse:IsPlaying() then
+		pulse:Stop()
+	end
+	texture:Hide()
+end
+
+local function ShowAuditHeaderTooltip(self)
+	if not self or not self._auditTooltipText or self._auditTooltipText == "" then
+		return
+	end
+
+	GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+	GameTooltip:SetText(self._auditTooltipTitle or "", 1, 1, 1)
+	GameTooltip:AddLine(self._auditTooltipText, nil, nil, nil, true)
+	GameTooltip:Show()
+end
+
+local function HideAuditTooltip()
+	GameTooltip:Hide()
+end
+
+local function ShowAuditCellTooltip(self)
+	local slotData = self and self._slotData
+	local rowData = self and self._rowData
+	if not slotData then
+		return
+	end
+
+	GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+
+	if slotData.link then
+		GameTooltip:SetHyperlink(slotData.link)
+	else
+		GameTooltip:SetText(slotData.label or "Item Slot", 1, 1, 1)
+	end
+
+	if rowData and rowData.displayName then
+		GameTooltip:AddLine(rowData.displayName, 0.75, 0.82, 1, true)
+	end
+
+	if not slotData.link then
+		GameTooltip:AddLine("No item equipped.", 0.8, 0.8, 0.8, true)
+	end
+
+	if slotData.configEnabled then
+		if slotData.missingEnchant then
+			GameTooltip:AddLine("Missing required enchant.", 1, 0.25, 0.25, true)
+		elseif slotData.expectedEnchant then
+			GameTooltip:AddLine("Required enchant detected.", 0.3, 1, 0.3, true)
+		elseif slotData.skippedEnchant then
+			GameTooltip:AddLine("Enchant check skipped for this off-hand item type.", 0.75, 0.75, 0.75, true)
+		else
+			GameTooltip:AddLine("Raid Check is tracking this slot.", 0.75, 0.82, 1, true)
+		end
+	else
+		GameTooltip:AddLine("Enchant checks are disabled for this slot in the active profile.", 0.75, 0.75, 0.75, true)
+	end
+
+	if slotData.missingGems then
+		GameTooltip:AddLine("Missing gem sockets detected.", 1, 0.65, 0.2, true)
+	end
+
+	if slotData.missingItem then
+		GameTooltip:AddLine("Raid Check will flag this slot as missing gear.", 1, 0.35, 0.35, true)
+	end
+
+	GameTooltip:Show()
+end
+
+local function CreateAuditCell(parent)
+	local button = CreateFrame("Button", nil, parent)
+	button:SetSize(AUDIT_ICON_SIZE, AUDIT_ICON_SIZE)
+	button:EnableMouse(true)
+
+	local bg = button:CreateTexture(nil, "BACKGROUND")
+	bg:SetAllPoints(button)
+	bg:SetColorTexture(0, 0, 0, 0.35)
+
+	local icon = button:CreateTexture(nil, "ARTWORK")
+	icon:SetAllPoints(button)
+	icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
+	button.Icon = icon
+
+	local border = button:CreateTexture(nil, "BORDER")
+	border:SetAllPoints(button)
+	border:SetColorTexture(1, 1, 1, 0.08)
+
+	local overlay = button:CreateTexture(nil, "OVERLAY")
+	overlay:SetAllPoints(button)
+	overlay:SetColorTexture(1, 0, 0, 0.16)
+	overlay:Hide()
+	button.MissingOverlay = overlay
+
+	local highlight = button:CreateTexture(nil, "HIGHLIGHT")
+	highlight:SetAllPoints(button)
+	highlight:SetColorTexture(1, 1, 1, 0.10)
+
+	button:SetScript("OnEnter", ShowAuditCellTooltip)
+	button:SetScript("OnLeave", HideAuditTooltip)
+
+	return button
+end
+
+local function SetScrollBarShown(scroll, shown)
+	local scrollBar = scroll and scroll.ScrollBar
+	if not scrollBar then
+		return 0
+	end
+
+	scrollBar:SetShown(shown)
+	if shown then
+		if scrollBar.Enable then
+			scrollBar:Enable()
+		end
+		return scrollBar:GetWidth() or 20
+	end
+
+	scroll:SetVerticalScroll(0)
+	if scrollBar.SetValue then
+		scrollBar:SetValue(0)
+	end
+	if scrollBar.Disable then
+		scrollBar:Disable()
+	end
+	return 0
+end
+
+local function BuildAuditPage(panel)
+	local pageBuilder = SF.SettingsUI:CreatePage(panel)
+	panel.__sfPageBuilder = pageBuilder
+
+	local controls = SF.SettingsUI.Controls
+	local introSection = pageBuilder:AddSection({
+		title = "Raid Check Audit",
+		tooltip = "Inspect the exact equipment snapshot that Raid Check currently sees for each visible group member.",
+	})
+
+	introSection:AddText("This table shows the same live item links Raid Check is currently evaluating. A red pulse means that slot is configured to require an enchant, but none was detected.")
+	controls:AddButton(introSection, {
+		label = "Refresh Snapshot",
+		buttonText = "Refresh",
+		width = 120,
+		onClick = function()
+			if panel.__sfPageBuilder then
+				panel.__sfPageBuilder:Refresh()
+				panel.__sfPageBuilder:Reflow()
+			end
+		end,
+	})
+
+	local tableSection = pageBuilder:AddSection({
+		title = "Current Group Equipment",
+		tooltip = "One row per visible group member, with one column per equipment slot.",
+	})
+	tableSection.__sfFillHeight = true
+
+	local columns = (SF.RaidCheck and SF.RaidCheck.GetTroubleshootingColumns and SF.RaidCheck:GetTroubleshootingColumns()) or {}
+
+	tableSection:AddRow(AUDIT_MIN_TABLE_HEIGHT, function(row)
+		local container = CreateFrame("Frame", nil, row)
+		container:SetAllPoints(row)
+
+		local header = CreateFrame("Frame", nil, container)
+		header:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
+		header:SetPoint("TOPRIGHT", container, "TOPRIGHT", 0, 0)
+		header:SetHeight(AUDIT_HEADER_HEIGHT)
+
+		local headerBg = header:CreateTexture(nil, "BACKGROUND")
+		headerBg:SetAllPoints(header)
+		headerBg:SetColorTexture(1, 1, 1, 0.08)
+
+		local scroll = CreateFrame("ScrollFrame", nil, container, "UIPanelScrollFrameTemplate")
+		scroll:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -4)
+		scroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, 0)
+
+		local content = CreateFrame("Frame", nil, scroll)
+		content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+		content:SetHeight(1)
+		scroll:SetScrollChild(content)
+
+		local emptyText = content:CreateFontString(nil, "ARTWORK", "GameFontDisable")
+		emptyText:SetPoint("TOPLEFT", content, "TOPLEFT", 8, -8)
+		emptyText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -8, -8)
+		emptyText:SetJustifyH("LEFT")
+		emptyText:SetText("No visible group members found.")
+		emptyText:Hide()
+
+		local nameHeader = CreateFrame("Frame", nil, header)
+		local nameHeaderText = nameHeader:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+		nameHeaderText:SetPoint("LEFT", nameHeader, "LEFT", 4, 0)
+		nameHeaderText:SetPoint("RIGHT", nameHeader, "RIGHT", -4, 0)
+		nameHeaderText:SetJustifyH("LEFT")
+		nameHeaderText:SetText("Member")
+
+		local headerCells = {}
+		for index, column in ipairs(columns) do
+			local cell = CreateFrame("Frame", nil, header)
+			local text = cell:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+			text:SetPoint("CENTER", cell, "CENTER", 0, 0)
+			text:SetJustifyH("CENTER")
+			text:SetText(column.shortLabel or column.label or "?")
+			cell.Text = text
+			cell._auditTooltipTitle = column.label or "Slot"
+			cell._auditTooltipText = string.format("%s slot", column.label or "Item")
+			cell:EnableMouse(true)
+			cell:SetScript("OnEnter", ShowAuditHeaderTooltip)
+			cell:SetScript("OnLeave", HideAuditTooltip)
+			headerCells[index] = cell
+		end
+
+		local rows = {}
+
+		local function EnsureRow(index)
+			if rows[index] then
+				return rows[index]
+			end
+
+			local dataRow = CreateFrame("Frame", nil, content)
+			dataRow:SetHeight(AUDIT_ROW_HEIGHT)
+
+			local hover = dataRow:CreateTexture(nil, "BACKGROUND")
+			hover:SetAllPoints(dataRow)
+			hover:SetColorTexture(1, 1, 1, 0.06)
+			hover:Hide()
+			dataRow.Hover = hover
+
+			dataRow:SetScript("OnEnter", function(self)
+				self.Hover:Show()
+			end)
+			dataRow:SetScript("OnLeave", function(self)
+				self.Hover:Hide()
+			end)
+
+			local name = dataRow:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+			name:SetPoint("LEFT", dataRow, "LEFT", 4, 0)
+			name:SetJustifyH("LEFT")
+			if name.SetWordWrap then
+				name:SetWordWrap(false)
+			end
+			if name.SetMaxLines then
+				name:SetMaxLines(1)
+			end
+			dataRow.Name = name
+
+			dataRow.Cells = {}
+			for columnIndex = 1, #columns do
+				dataRow.Cells[columnIndex] = CreateAuditCell(dataRow)
+			end
+
+			rows[index] = dataRow
+			return dataRow
+		end
+
+		local function LayoutRowWidgets(parent, nameWidget, slotWidgets, availableWidth)
+			local slotCount = #slotWidgets
+			local totalIconWidth = slotCount * AUDIT_ICON_SIZE
+			local totalGap = slotCount * AUDIT_COLUMN_GAP
+			local nameWidth = math.max(AUDIT_MIN_NAME_COLUMN_WIDTH, availableWidth - totalIconWidth - totalGap)
+			local usedWidth = nameWidth + totalIconWidth + totalGap
+			local xOffset = 0
+
+			nameWidget:ClearAllPoints()
+			if nameWidget.GetObjectType and nameWidget:GetObjectType() == "Frame" then
+				nameWidget:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, 0)
+				nameWidget:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", 0, 0)
+				nameWidget:SetWidth(nameWidth)
+			else
+				nameWidget:SetPoint("LEFT", parent, "LEFT", 4, 0)
+				nameWidget:SetWidth(math.max(1, nameWidth - 8))
+			end
+
+			xOffset = nameWidth + AUDIT_COLUMN_GAP
+			for _, widget in ipairs(slotWidgets) do
+				widget:ClearAllPoints()
+				widget:SetPoint("LEFT", parent, "LEFT", xOffset, 0)
+				xOffset = xOffset + AUDIT_ICON_SIZE + AUDIT_COLUMN_GAP
+			end
+
+			return usedWidth, nameWidth
+		end
+
+		local function RefreshAuditTable()
+			local snapshot = (SF.RaidCheck and SF.RaidCheck.GetTroubleshootingSnapshot and SF.RaidCheck:GetTroubleshootingSnapshot()) or { rows = {}, columns = columns, hasActiveProfile = false }
+			local dataRows = snapshot.rows or {}
+
+			if snapshot.hasActiveProfile then
+				tableSection:ClearMessage()
+			else
+				tableSection:SetMessage("Select an active Loot Helper profile to apply raid check expectations.", "warn")
+			end
+
+			local yOffset = 0
+			for index, rowData in ipairs(dataRows) do
+				local dataRow = EnsureRow(index)
+				dataRow:ClearAllPoints()
+				dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
+				dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
+				dataRow.Name:SetText(rowData.displayName or rowData.name or "?")
+				dataRow:Show()
+
+				for columnIndex, column in ipairs(columns) do
+					local slotData = rowData.slots and rowData.slots[columnIndex] or nil
+					local cell = dataRow.Cells[columnIndex]
+					local texture = slotData and slotData.texture or GetAuditSlotPlaceholderTexture(column.key)
+					local hasItem = slotData and slotData.link
+
+					cell._rowData = rowData
+					cell._slotData = slotData or {
+						label = column.label or "Slot",
+						configEnabled = false,
+					}
+					cell.Icon:SetTexture(texture)
+					cell.Icon:SetDesaturated(not hasItem)
+					if hasItem then
+						cell.Icon:SetVertexColor(1, 1, 1, 1)
+					else
+						cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
+					end
+
+					SetAuditMissingOverlay(cell.MissingOverlay, slotData and slotData.missingEnchant)
+					cell:Show()
+				end
+
+				yOffset = yOffset + AUDIT_ROW_HEIGHT + AUDIT_ROW_SPACING
+			end
+
+			for index = #dataRows + 1, #rows do
+				rows[index]:Hide()
+			end
+
+			local contentHeight = (#dataRows > 0) and (yOffset - AUDIT_ROW_SPACING) or 1
+			content:SetHeight(math.max(1, contentHeight))
+			emptyText:SetShown(#dataRows == 0)
+
+			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+			local showScrollbar = contentHeight > visibleHeight
+			local scrollBarWidth = SetScrollBarShown(scroll, showScrollbar)
+
+			header:ClearAllPoints()
+			header:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
+			header:SetPoint("TOPRIGHT", container, "TOPRIGHT", -(showScrollbar and (scrollBarWidth + 4) or 0), 0)
+			header:SetHeight(AUDIT_HEADER_HEIGHT)
+
+			local availableWidth = math.max(1, header:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
+			local usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, headerCells, availableWidth)
+			content:SetWidth(math.max(usedWidth, availableWidth))
+
+			nameHeaderText:SetWidth(math.max(1, nameWidth - 8))
+			for _, dataRow in ipairs(rows) do
+				if dataRow:IsShown() then
+					LayoutRowWidgets(dataRow, dataRow.Name, dataRow.Cells, availableWidth)
+				end
+			end
+		end
+
+		pageBuilder:RegisterRefresh(RefreshAuditTable)
+		RefreshAuditTable()
+		scroll:HookScript("OnSizeChanged", RefreshAuditTable)
+	end, { fillHeight = true })
+
+	pageBuilder:Finalize()
 end
 
 local function BuildLootHelperDefinition(panel, sectionIds)
@@ -622,6 +1060,18 @@ function SessionPage:Refresh(panel)
 	RefreshPage(panel)
 end
 
+function AuditPage:Build(panel)
+	BuildAuditPage(panel)
+end
+
+function AuditPage:Refresh(panel)
+	local pageBuilder = panel.__sfPageBuilder
+	if pageBuilder then
+		pageBuilder:Refresh()
+		pageBuilder:Reflow()
+	end
+end
+
 function AdminPage:Build(panel)
 	BuildPage(panel, self.id, { "admin" })
 end
@@ -634,4 +1084,5 @@ SF.SettingsUI:RegisterPage(RootPage)
 SF.SettingsUI:RegisterPage(GeneralPage)
 SF.SettingsUI:RegisterPage(ProfilePage)
 SF.SettingsUI:RegisterPage(SessionPage)
+SF.SettingsUI:RegisterPage(AuditPage)
 SF.SettingsUI:RegisterPage(AdminPage)
