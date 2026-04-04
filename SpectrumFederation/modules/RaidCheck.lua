@@ -34,6 +34,11 @@ local SLOT_DEFS = {
 	offHand = { label = "Off Hand", slots = { INVSLOT_OFFHAND } },
 }
 
+local function CalculateInspectRetryDelay(failCount)
+	local attempts = math.max(1, tonumber(failCount) or 1)
+	return math.min(INSPECT_RETRY_MAX_SECONDS, INSPECT_RETRY_BASE_SECONDS * attempts)
+end
+
 local TROUBLESHOOTING_COLUMNS = {
 	{ key = "head", label = "Head", shortLabel = "Hd", inventorySlot = INVSLOT_HEAD },
 	{ key = "neck", label = "Neck", shortLabel = "Nk", inventorySlot = INVSLOT_NECK },
@@ -552,9 +557,10 @@ function RC:_HandleInspectTimeout(key, requestedAt)
 	entry.status = "timeout"
 	entry.failCount = failCount
 	entry.lastAttemptAt = requestedAt
-	-- Use a short linear backoff so repeated failures do not hammer NotifyInspect,
-	-- while still recovering quickly once the player becomes inspectable again.
-	entry.nextRetryAt = now + math.min(INSPECT_RETRY_MAX_SECONDS, INSPECT_RETRY_BASE_SECONDS * failCount)
+	-- Use a short capped linear backoff so repeated failures do not hammer
+	-- NotifyInspect, while still recovering quickly once the player becomes
+	-- inspectable again.
+	entry.nextRetryAt = now + CalculateInspectRetryDelay(failCount)
 	self:_StoreInspectCacheEntry(entry, active.aliases)
 
 	state.active = nil
@@ -599,9 +605,10 @@ function RC:_HandleInspectReady(guid)
 		entry.status = "timeout"
 		entry.failCount = (entry.failCount or 0) + 1
 		entry.lastAttemptAt = active.requestedAt
-		-- Use a short linear backoff so repeated failures do not hammer NotifyInspect,
-		-- while still recovering quickly once the player becomes inspectable again.
-		entry.nextRetryAt = now + math.min(INSPECT_RETRY_MAX_SECONDS, INSPECT_RETRY_BASE_SECONDS * entry.failCount)
+		-- Use a short capped linear backoff so repeated failures do not hammer
+		-- NotifyInspect, while still recovering quickly once the player becomes
+		-- inspectable again.
+		entry.nextRetryAt = now + CalculateInspectRetryDelay(entry.failCount)
 	end
 
 	self:_StoreInspectCacheEntry(entry, active.aliases)

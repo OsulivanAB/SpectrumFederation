@@ -33,14 +33,17 @@ local SessionPage = {
 	order = 22,
 }
 
-local AuditPage = {
-	id = "lootHelperAudit",
+local EQUIPMENT_PAGE_WINDOW_WIDTH = 1280
+local EQUIPMENT_REFRESH_DEBOUNCE_SECONDS = 0.15
+
+local EquipmentPage = {
+	id = "lootHelperEquipment",
 	parentId = "lootHelper",
-	name = "Raid Check Audit",
-	navLabel = "Audit",
+	name = "Raid Check Equipment",
+	navLabel = "Equipment",
 	order = 22.5,
 	layout = {
-		windowWidth = 1280,
+		windowWidth = EQUIPMENT_PAGE_WINDOW_WIDTH,
 		disablePageScroll = true,
 	},
 }
@@ -138,7 +141,7 @@ local function GetRaidCheckConfig()
 	return nil
 end
 
-local function IsAuditAutoRefreshEnabled()
+local function IsEquipmentAutoRefreshEnabled()
 	local store = SF.SettingsStore
 	if not store or not store.Get then
 		return false
@@ -491,13 +494,13 @@ local function GetAuditNameColumnWidth(availableWidth, slotCount)
 	)
 end
 
-local function BuildAuditPage(panel)
+local function BuildEquipmentPage(panel)
 	local pageBuilder = SF.SettingsUI:CreatePage(panel)
 	panel.__sfPageBuilder = pageBuilder
 
 	local controls = SF.SettingsUI.Controls
 	local introSection = pageBuilder:AddSection({
-		title = "Raid Check Audit",
+		title = "Raid Check Equipment",
 		tooltip = "Inspect the exact equipment snapshot that Raid Check currently sees for each visible group member.",
 	})
 
@@ -505,7 +508,7 @@ local function BuildAuditPage(panel)
 	controls:AddCheckbox(introSection, {
 		label = "Enable Auto Refresh",
 		tooltip = "Automatically refresh this audit table as inspect results update. Leave this off to refresh only when you ask for it.",
-		get = IsAuditAutoRefreshEnabled,
+		get = IsEquipmentAutoRefreshEnabled,
 		set = function(value)
 			if SF.SettingsStore and SF.SettingsStore.Set then
 				SF.SettingsStore:Set("lootHelper.raidCheckAuditAutoRefresh", value and true or false)
@@ -528,7 +531,7 @@ local function BuildAuditPage(panel)
 			end
 		end,
 		visible = function()
-			return not IsAuditAutoRefreshEnabled()
+			return not IsEquipmentAutoRefreshEnabled()
 		end,
 	})
 
@@ -701,6 +704,30 @@ local function BuildAuditPage(panel)
 
 		local isRefreshingAuditTable = false
 		local pendingAuditTableRefresh = false
+		local refreshAuditTableLaterPending = false
+
+		local function ApplyHorizontalScrollOffset(value)
+			scroll:SetHorizontalScroll(value)
+			header:ClearAllPoints()
+			header:SetPoint("TOPLEFT", headerViewport, "TOPLEFT", -value, 0)
+			header:SetHeight(AUDIT_HEADER_HEIGHT)
+		end
+
+		local function ScheduleRefreshAuditTable()
+			if refreshAuditTableLaterPending then
+				return
+			end
+			refreshAuditTableLaterPending = true
+			if C_Timer and C_Timer.After then
+				C_Timer.After(EQUIPMENT_REFRESH_DEBOUNCE_SECONDS, function()
+					refreshAuditTableLaterPending = false
+					RefreshAuditTable()
+				end)
+				return
+			end
+			refreshAuditTableLaterPending = false
+			RefreshAuditTable()
+		end
 
 		local function RefreshAuditTable()
 			if isRefreshingAuditTable then
@@ -807,17 +834,7 @@ local function BuildAuditPage(panel)
 					horizontalScroll:SetValue(currentHorizontalOffset)
 				end
 
-				scroll:SetHorizontalScroll(currentHorizontalOffset)
-				header:ClearAllPoints()
-				header:SetPoint("TOPLEFT", headerViewport, "TOPLEFT", -currentHorizontalOffset, 0)
-				header:SetHeight(AUDIT_HEADER_HEIGHT)
-
-				horizontalScroll:SetScript("OnValueChanged", function(_, value)
-					scroll:SetHorizontalScroll(value)
-					header:ClearAllPoints()
-					header:SetPoint("TOPLEFT", headerViewport, "TOPLEFT", -value, 0)
-					header:SetHeight(AUDIT_HEADER_HEIGHT)
-				end)
+				ApplyHorizontalScrollOffset(currentHorizontalOffset)
 
 				nameHeaderText:SetWidth(math.max(1, nameWidth - AUDIT_NAME_PADDING))
 				itemLevelHeader:SetWidth(AUDIT_ILVL_COLUMN_WIDTH)
@@ -835,26 +852,36 @@ local function BuildAuditPage(panel)
 			end
 			if not ok then
 				if SF.Debug then
-					SF.Debug:Error("UI", "Raid Check audit refresh failed: %s", tostring(err or "unknown error"))
+					SF.Debug:Error("UI", "Raid Check equipment refresh failed: %s", tostring(err or "unknown error"))
 				end
 			end
 		end
 
+		if not horizontalScroll.__sfEquipmentOnValueChangedHooked then
+			horizontalScroll.__sfEquipmentOnValueChangedHooked = true
+			horizontalScroll:SetScript("OnValueChanged", function(_, value)
+				ApplyHorizontalScrollOffset(value)
+			end)
+		end
+
 		if SF.RaidCheck and SF.RaidCheck.RegisterTroubleshootingListener then
-			if panel.__sfAuditListenerKey and SF.RaidCheck.UnregisterTroubleshootingListener then
-				SF.RaidCheck:UnregisterTroubleshootingListener(panel.__sfAuditListenerKey)
+			if panel.__sfEquipmentListenerKey and SF.RaidCheck.UnregisterTroubleshootingListener then
+				SF.RaidCheck:UnregisterTroubleshootingListener(panel.__sfEquipmentListenerKey)
 			end
-			panel.__sfAuditListenerKey = panel
-			SF.RaidCheck:RegisterTroubleshootingListener(panel.__sfAuditListenerKey, function()
-				if IsAuditAutoRefreshEnabled() then
-					RefreshAuditTable()
+			panel.__sfEquipmentListenerKey = panel
+			SF.RaidCheck:RegisterTroubleshootingListener(panel.__sfEquipmentListenerKey, function()
+				if IsEquipmentAutoRefreshEnabled() then
+					ScheduleRefreshAuditTable()
 				end
 			end)
 		end
 
 		pageBuilder:RegisterRefresh(RefreshAuditTable)
 		RefreshAuditTable()
-		scroll:HookScript("OnSizeChanged", RefreshAuditTable)
+		if not scroll.__sfEquipmentSizeRefreshHooked then
+			scroll.__sfEquipmentSizeRefreshHooked = true
+			scroll:HookScript("OnSizeChanged", ScheduleRefreshAuditTable)
+		end
 	end, { fillHeight = true })
 
 	pageBuilder:Finalize()
@@ -1267,11 +1294,11 @@ function SessionPage:Refresh(panel)
 	RefreshPage(panel)
 end
 
-function AuditPage:Build(panel)
-	BuildAuditPage(panel)
+function EquipmentPage:Build(panel)
+	BuildEquipmentPage(panel)
 end
 
-function AuditPage:Refresh(panel)
+function EquipmentPage:Refresh(panel)
 	local pageBuilder = panel.__sfPageBuilder
 	if pageBuilder then
 		pageBuilder:Refresh()
@@ -1291,5 +1318,5 @@ SF.SettingsUI:RegisterPage(RootPage)
 SF.SettingsUI:RegisterPage(GeneralPage)
 SF.SettingsUI:RegisterPage(ProfilePage)
 SF.SettingsUI:RegisterPage(SessionPage)
-SF.SettingsUI:RegisterPage(AuditPage)
+SF.SettingsUI:RegisterPage(EquipmentPage)
 SF.SettingsUI:RegisterPage(AdminPage)
