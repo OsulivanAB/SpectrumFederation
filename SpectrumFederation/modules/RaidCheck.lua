@@ -531,10 +531,16 @@ function RC:EnsureInspectSupport()
 			self:_InvalidateInspectUnit(arg1)
 		elseif event == "PLAYER_ENTERING_WORLD" then
 			local state = self:_GetInspectState()
-			state.cache = {}
+			-- Preserve cached inspect snapshots across zoning so the Equipment
+			-- page can still show the last known remote gear until a fresh
+			-- inspect becomes possible again. Intentionally do not clear
+			-- state.cache here.
 			state.queue = {}
 			state.queued = {}
 			state.active = nil
+			if ClearInspectPlayer then
+				pcall(ClearInspectPlayer)
+			end
 			self:_NotifyTroubleshootingListeners()
 		elseif event == "GROUP_ROSTER_UPDATE" then
 			self:_NotifyTroubleshootingListeners()
