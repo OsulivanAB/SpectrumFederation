@@ -533,8 +533,8 @@ function RC:EnsureInspectSupport()
 			local state = self:_GetInspectState()
 			-- Preserve cached inspect snapshots across zoning so the Equipment
 			-- page can still show the last known remote gear until a fresh
-			-- inspect becomes possible again. Intentionally do not clear
-			-- state.cache here.
+			-- inspect becomes possible again. Leave state.cache intact, but
+			-- clear queue-related state before resuming normal inspect flow.
 			state.queue = {}
 			state.queued = {}
 			state.active = nil
@@ -1315,5 +1315,31 @@ function RC:GetTroubleshootingSnapshot()
 		hasActiveProfile = profile ~= nil,
 		columns = self:GetTroubleshootingColumns(),
 		rows = rows,
+	}
+end
+
+function RC:GetTroubleshootingSlotsForUnit(unit, cfg)
+	if not unit or not UnitExists or not UnitExists(unit) then
+		return nil
+	end
+
+	self:EnsureInspectSupport()
+	if cfg == nil then
+		local profile = GetProfile()
+		cfg = profile and profile.GetRaidCheckConfig and profile:GetRaidCheckConfig() or nil
+	end
+
+	local info = BuildUnitInfo(unit)
+	local inspectState = self:_GetTroubleshootingInspectState(unit, info)
+	if type(inspectState) ~= "table" then
+		return nil
+	end
+
+	return {
+		status = inspectState.status,
+		label = inspectState.label,
+		message = inspectState.message,
+		stale = inspectState.stale and true or false,
+		slots = BuildTroubleshootingSlots(inspectState, cfg),
 	}
 end

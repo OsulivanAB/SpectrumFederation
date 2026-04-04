@@ -1,6 +1,9 @@
 -- modules/UI/LootHelper/EquipmentWindow.lua
 local addonName, SF = ...
 
+-- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET
+-- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
+
 SF.LootHelperWindow = SF.LootHelperWindow or {}
 local LH = SF.LootHelperWindow
 
@@ -57,6 +60,25 @@ local RIGHT_SLOTS = {
     { key = "OffHand",   texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-SecondaryHand" },
 }
 
+local SLOT_KEY_TO_INVENTORY = {
+    Head = INVSLOT_HEAD,
+    Neck = INVSLOT_NECK,
+    Shoulder = INVSLOT_SHOULDER,
+    Back = INVSLOT_BACK,
+    Chest = INVSLOT_CHEST,
+    Bracers = INVSLOT_WRIST,
+    Hands = INVSLOT_HAND,
+    Belt = INVSLOT_WAIST,
+    Pants = INVSLOT_LEGS,
+    Boots = INVSLOT_FEET,
+    Ring1 = INVSLOT_FINGER1,
+    Ring2 = INVSLOT_FINGER2,
+    Trinket1 = INVSLOT_TRINKET1,
+    Trinket2 = INVSLOT_TRINKET2,
+    Weapon = INVSLOT_MAINHAND,
+    OffHand = INVSLOT_OFFHAND,
+}
+
 -- Helper function to get class icon
 local function GetClassIcon(className)
     className = className and string.upper(className) or "UNKNOWN"
@@ -97,6 +119,30 @@ local function TryGetSpecIcon(unit, memberId)
         end
     end
 
+    return nil
+end
+
+local function ResolveDisplayUnit(rowModel)
+    if rowModel and rowModel.unit then
+        return rowModel.unit
+    end
+
+    local memberId = rowModel and rowModel.memberId or nil
+    if memberId and SF.NameUtil and SF.NameUtil.GetSelfId and SF.NameUtil.SamePlayer then
+        local selfId = SF.NameUtil.GetSelfId()
+        if selfId and SF.NameUtil.SamePlayer(memberId, selfId) then
+            return "player"
+        end
+    end
+
+    return nil
+end
+
+local function GetActiveRaidCheckConfig()
+    local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
+    if profile and profile.GetRaidCheckConfig then
+        return profile:GetRaidCheckConfig()
+    end
     return nil
 end
 
@@ -229,6 +275,12 @@ function EquipmentWindow:_CreateGearGrid(content)
         overlay:Hide()
         btn.UsedOverlay = overlay
 
+        local issueOverlay = btn:CreateTexture(nil, "OVERLAY")
+        issueOverlay:SetAllPoints(btn)
+        issueOverlay:SetColorTexture(1, 0, 0, 0.16)
+        issueOverlay:Hide()
+        btn.IssueOverlay = issueOverlay
+
         return btn
     end
 
@@ -325,9 +377,10 @@ function EquipmentWindow:SetMember(rowModel, memberObj, canAdmin)
     self._rowModel = rowModel
     self._memberObj = memberObj
     self._canAdmin = canAdmin
+    self._unit = ResolveDisplayUnit(rowModel)
 
     -- Update title icon (pass both unit and memberId for player detection when not in raid)
-    local icon = TryGetSpecIcon(rowModel.unit, rowModel.memberId) or GetClassIcon(rowModel.class)
+    local icon = TryGetSpecIcon(self._unit, rowModel.memberId) or GetClassIcon(rowModel.class)
     self._frame.Title.Icon:SetTexture(icon)
 
     -- Update title text
@@ -336,6 +389,29 @@ function EquipmentWindow:SetMember(rowModel, memberObj, canAdmin)
 
     -- Refresh armor state
     self:Refresh()
+end
+
+function EquipmentWindow:_GetEquipmentIssuesByInventorySlot()
+    local unit = self._unit
+    if not unit or not SF.RaidCheck or not SF.RaidCheck.GetTroubleshootingSlotsForUnit then
+        return nil
+    end
+
+    local cfg = GetActiveRaidCheckConfig()
+    if not cfg then
+        return nil
+    end
+
+    local snapshot = SF.RaidCheck:GetTroubleshootingSlotsForUnit(unit, cfg)
+    local issuesByInventory = {}
+
+    for _, slot in ipairs(snapshot and snapshot.slots or {}) do
+        if slot and slot.inventorySlot then
+            issuesByInventory[slot.inventorySlot] = (slot.missingEnchant or slot.missingGems or slot.missingItem) and true or false
+        end
+    end
+
+    return issuesByInventory
 end
 
 -- Refresh armor state display
@@ -352,6 +428,7 @@ function EquipmentWindow:Refresh()
 
     if not armor then return end
 
+    local issuesByInventory = self:_GetEquipmentIssuesByInventorySlot()
     local buttons = self._frame.Content.SlotButtons or {}
     for _, btn in ipairs(buttons) do
         local slotKey = btn.slotKey
@@ -371,6 +448,15 @@ function EquipmentWindow:Refresh()
                 btn.Icon:SetVertexColor(0.6, 0.6, 0.6, 0.8)
                 if btn.UsedOverlay then
                     btn.UsedOverlay:Hide()
+                end
+            end
+
+            if btn.IssueOverlay then
+                local inventorySlot = SLOT_KEY_TO_INVENTORY[slotKey]
+                if inventorySlot and issuesByInventory and issuesByInventory[inventorySlot] then
+                    btn.IssueOverlay:Show()
+                else
+                    btn.IssueOverlay:Hide()
                 end
             end
 
