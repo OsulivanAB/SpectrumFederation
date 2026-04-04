@@ -35,6 +35,9 @@ local SessionPage = {
 
 local EQUIPMENT_PAGE_WINDOW_WIDTH = 1280
 local EQUIPMENT_REFRESH_DEBOUNCE_SECONDS = 0.15
+local EQUIPMENT_MANUAL_REFRESH_WINDOW_SECONDS = 1.5
+local EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_COUNT = 3
+local EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_DELAY_SECONDS = 0.2
 
 local EquipmentPage = {
 	id = "lootHelperEquipment",
@@ -251,6 +254,9 @@ local AUDIT_MIN_TABLE_HEIGHT = 260
 local AUDIT_HORIZONTAL_SCROLL_HEIGHT = 20
 local AUDIT_MISSING_OVERLAY_MIN_ALPHA = 0.30
 local AUDIT_MISSING_OVERLAY_MAX_ALPHA = 0.50
+local AUDIT_ISSUE_ICON_RED = 0.82
+local AUDIT_ISSUE_ICON_GREEN = 0.45
+local AUDIT_ISSUE_ICON_BLUE = 0.45
 local AUDIT_SLOT_PLACEHOLDERS = {
 	head = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head",
 	neck = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck",
@@ -311,6 +317,33 @@ local function SetAuditMissingOverlay(texture, enabled)
 		pulse:Stop()
 	end
 	texture:Hide()
+end
+
+local function SetAuditIssueBorder(texture, enabled)
+	if not texture then
+		return
+	end
+	texture:SetShown(enabled and true or false)
+end
+
+local function SetAuditIssueBadge(texture, enabled)
+	if not texture then
+		return
+	end
+	texture:SetShown(enabled and true or false)
+end
+
+local function GetAuditDebugItemToken(link)
+	if type(link) ~= "string" or link == "" then
+		return "nil"
+	end
+
+	local itemId = string.match(link, "item:(%d+)")
+	if itemId and itemId ~= "" then
+		return string.format("item:%s", itemId)
+	end
+
+	return "link"
 end
 
 local function ShowAuditHeaderTooltip(self)
@@ -436,6 +469,43 @@ local function CreateAuditCell(parent)
 	overlay:Hide()
 	button.MissingOverlay = overlay
 
+	local issueBorder = CreateFrame("Frame", nil, button)
+	issueBorder:SetAllPoints(button)
+	issueBorder:Hide()
+	issueBorder:SetFrameLevel((button:GetFrameLevel() or 0) + 5)
+	button.IssueBorder = issueBorder
+
+	local borderTop = issueBorder:CreateTexture(nil, "OVERLAY")
+	borderTop:SetPoint("TOPLEFT", issueBorder, "TOPLEFT", 0, 0)
+	borderTop:SetPoint("TOPRIGHT", issueBorder, "TOPRIGHT", 0, 0)
+	borderTop:SetHeight(2)
+	borderTop:SetColorTexture(1, 0.15, 0.15, 0.95)
+
+	local borderBottom = issueBorder:CreateTexture(nil, "OVERLAY")
+	borderBottom:SetPoint("BOTTOMLEFT", issueBorder, "BOTTOMLEFT", 0, 0)
+	borderBottom:SetPoint("BOTTOMRIGHT", issueBorder, "BOTTOMRIGHT", 0, 0)
+	borderBottom:SetHeight(2)
+	borderBottom:SetColorTexture(1, 0.15, 0.15, 0.95)
+
+	local borderLeft = issueBorder:CreateTexture(nil, "OVERLAY")
+	borderLeft:SetPoint("TOPLEFT", issueBorder, "TOPLEFT", 0, 0)
+	borderLeft:SetPoint("BOTTOMLEFT", issueBorder, "BOTTOMLEFT", 0, 0)
+	borderLeft:SetWidth(2)
+	borderLeft:SetColorTexture(1, 0.15, 0.15, 0.95)
+
+	local borderRight = issueBorder:CreateTexture(nil, "OVERLAY")
+	borderRight:SetPoint("TOPRIGHT", issueBorder, "TOPRIGHT", 0, 0)
+	borderRight:SetPoint("BOTTOMRIGHT", issueBorder, "BOTTOMRIGHT", 0, 0)
+	borderRight:SetWidth(2)
+	borderRight:SetColorTexture(1, 0.15, 0.15, 0.95)
+
+	local issueBadge = button:CreateTexture(nil, "OVERLAY", nil, 4)
+	issueBadge:SetSize(10, 10)
+	issueBadge:SetPoint("TOPRIGHT", button, "TOPRIGHT", 1, 1)
+	issueBadge:SetColorTexture(1, 0.12, 0.12, 1)
+	issueBadge:Hide()
+	button.IssueBadge = issueBadge
+
 	local highlight = button:CreateTexture(nil, "HIGHLIGHT")
 	highlight:SetAllPoints(button)
 	highlight:SetColorTexture(1, 1, 1, 0.10)
@@ -499,6 +569,42 @@ end
 local function BuildEquipmentPage(panel)
 	local pageBuilder = SF.SettingsUI:CreatePage(panel)
 	panel.__sfPageBuilder = pageBuilder
+	local manualRefreshUntil = 0
+	local RefreshAuditTable
+	local ScheduleRefreshAuditTable
+
+	local function ReflowEquipmentPage()
+		if pageBuilder and pageBuilder.Reflow then
+			pageBuilder:Reflow()
+		end
+	end
+
+	local function RequestEquipmentPageRedraw(reason)
+		if SF.Debug then
+			SF.Debug:Info("UI", "Raid Check Equipment redraw requested (%s)", tostring(reason or "unknown"))
+		end
+		if pageBuilder and pageBuilder.Refresh then
+			pageBuilder:Refresh()
+		end
+		ReflowEquipmentPage()
+	end
+
+	local function ScheduleManualRefreshFollowUps(reason)
+		if not (C_Timer and C_Timer.After) then
+			RequestEquipmentPageRedraw(reason)
+			return
+		end
+
+		for attempt = 1, EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_COUNT do
+			C_Timer.After(EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_DELAY_SECONDS * attempt, function()
+				local now = GetTime and GetTime() or 0
+				if now > manualRefreshUntil then
+					return
+				end
+				RequestEquipmentPageRedraw(string.format("%s #%d", tostring(reason or "manual refresh"), attempt))
+			end)
+		end
+	end
 
 	local controls = SF.SettingsUI.Controls
 	local introSection = pageBuilder:AddSection({
@@ -525,12 +631,15 @@ local function BuildEquipmentPage(panel)
 		buttonText = "Refresh",
 		width = 120,
 		onClick = function()
+			manualRefreshUntil = (GetTime and GetTime() or 0) + EQUIPMENT_MANUAL_REFRESH_WINDOW_SECONDS
+			if SF.Debug then
+				SF.Debug:Info("UI", "Refresh Snapshot clicked; manual refresh window open for %.1f seconds", EQUIPMENT_MANUAL_REFRESH_WINDOW_SECONDS)
+			end
 			if SF.RaidCheck and SF.RaidCheck.RequestTroubleshootingRefresh then
 				SF.RaidCheck:RequestTroubleshootingRefresh()
 			end
-			if panel.__sfPageBuilder then
-				panel.__sfPageBuilder:Refresh()
-			end
+			RequestEquipmentPageRedraw("manual refresh button")
+			ScheduleManualRefreshFollowUps("manual refresh follow-up")
 		end,
 		visible = function()
 			return not IsEquipmentAutoRefreshEnabled()
@@ -715,7 +824,7 @@ local function BuildEquipmentPage(panel)
 			header:SetHeight(AUDIT_HEADER_HEIGHT)
 		end
 
-		local function ScheduleRefreshAuditTable()
+		ScheduleRefreshAuditTable = function()
 			if refreshAuditTableLaterPending then
 				return
 			end
@@ -731,7 +840,7 @@ local function BuildEquipmentPage(panel)
 			RefreshAuditTable()
 		end
 
-		local function RefreshAuditTable()
+		RefreshAuditTable = function()
 			if isRefreshingAuditTable then
 				pendingAuditTableRefresh = true
 				return
@@ -741,6 +850,9 @@ local function BuildEquipmentPage(panel)
 			local ok, err = pcall(function()
 				local snapshot = (SF.RaidCheck and SF.RaidCheck.GetTroubleshootingSnapshot and SF.RaidCheck:GetTroubleshootingSnapshot()) or { rows = {}, columns = columns, hasActiveProfile = false }
 				local dataRows = snapshot.rows or {}
+				if SF.Debug then
+					SF.Debug:Info("UI", "Refreshing Raid Check Equipment table with %d row(s)", #dataRows)
+				end
 
 				if snapshot.hasActiveProfile then
 					tableSection:ClearMessage()
@@ -768,7 +880,7 @@ local function BuildEquipmentPage(panel)
 						local cell = dataRow.Cells[columnIndex]
 						local texture = slotData and slotData.texture or GetAuditSlotPlaceholderTexture(column.key)
 						local hasItem = slotData and slotData.link
-						local shouldShowOverlay = slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems)
+						local shouldShowOverlay = slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems or slotData.missingItem)
 
 						cell._rowData = rowData
 						cell._slotData = slotData or {
@@ -778,12 +890,35 @@ local function BuildEquipmentPage(panel)
 						cell.Icon:SetTexture(texture)
 						cell.Icon:SetDesaturated(not hasItem)
 						if hasItem then
-							cell.Icon:SetVertexColor(1, 1, 1, 1)
+							if shouldShowOverlay then
+								cell.Icon:SetVertexColor(AUDIT_ISSUE_ICON_RED, AUDIT_ISSUE_ICON_GREEN, AUDIT_ISSUE_ICON_BLUE, 1)
+							else
+								cell.Icon:SetVertexColor(1, 1, 1, 1)
+							end
 						else
-							cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
+							if shouldShowOverlay then
+								cell.Icon:SetVertexColor(0.75, 0.35, 0.35, 0.95)
+							else
+								cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
+							end
 						end
 
 						SetAuditMissingOverlay(cell.MissingOverlay, shouldShowOverlay)
+						SetAuditIssueBorder(cell.IssueBorder, shouldShowOverlay)
+						SetAuditIssueBadge(cell.IssueBadge, shouldShowOverlay)
+						if SF.Debug and slotData and slotData.known then
+							SF.Debug:Verbose(
+								"UI",
+								"Raid Check Equipment cell %s/%s issue=%s enchant=%s gems=%s item=%s link=%s",
+								tostring(rowData.id or rowData.name or "?"),
+								tostring(column.key or "?"),
+								tostring(shouldShowOverlay and true or false),
+								tostring(slotData.missingEnchant and true or false),
+								tostring(slotData.missingGems and true or false),
+								tostring(slotData.missingItem and true or false),
+								GetAuditDebugItemToken(slotData.link)
+							)
+						end
 						cell:Show()
 					end
 
@@ -857,6 +992,7 @@ local function BuildEquipmentPage(panel)
 					SF.Debug:Error("UI", "Raid Check equipment refresh failed: %s", tostring(err or "unknown error"))
 				end
 			end
+			ReflowEquipmentPage()
 		end
 
 		if not horizontalScroll.__sfEquipmentOnValueChangedHooked then
@@ -872,7 +1008,11 @@ local function BuildEquipmentPage(panel)
 			end
 			panel.__sfEquipmentListenerKey = panel
 			SF.RaidCheck:RegisterTroubleshootingListener(panel.__sfEquipmentListenerKey, function()
-				if IsEquipmentAutoRefreshEnabled() then
+				local now = GetTime and GetTime() or 0
+				if IsEquipmentAutoRefreshEnabled() or now <= manualRefreshUntil then
+					if SF.Debug then
+						SF.Debug:Verbose("UI", "Raid Check Equipment listener scheduling refresh (auto=%s manualWindow=%s)", tostring(IsEquipmentAutoRefreshEnabled()), tostring(now <= manualRefreshUntil))
+					end
 					ScheduleRefreshAuditTable()
 				end
 			end)
