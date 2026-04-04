@@ -27,6 +27,7 @@ local WINDOW_WIDTH = CONTENT_WIDTH + 8  -- Minimal backdrop insets
 -- Height: title bar + top gap + padding + icons + spacing + padding
 local CONTENT_HEIGHT = (ICON_SIZE * NUM_ROWS) + (ICON_SPACING * (NUM_ROWS - 1))
 local WINDOW_HEIGHT = TITLE_HEIGHT + 6 + PADDING + CONTENT_HEIGHT + PADDING
+local ISSUE_OVERLAY_ALPHA = 0.30
 
 -- Min/max height constraints (for dynamic sizing if needed)
 local WINDOW_MIN_HEIGHT = WINDOW_HEIGHT
@@ -277,7 +278,7 @@ function EquipmentWindow:_CreateGearGrid(content)
 
         local issueOverlay = btn:CreateTexture(nil, "OVERLAY")
         issueOverlay:SetAllPoints(btn)
-        issueOverlay:SetColorTexture(1, 0, 0, 0.16)
+        issueOverlay:SetColorTexture(1, 0, 0, ISSUE_OVERLAY_ALPHA)
         issueOverlay:Hide()
         btn.IssueOverlay = issueOverlay
 

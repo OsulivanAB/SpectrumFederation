@@ -249,6 +249,8 @@ local AUDIT_ROW_SPACING = 2
 local AUDIT_HEADER_HEIGHT = 24
 local AUDIT_MIN_TABLE_HEIGHT = 260
 local AUDIT_HORIZONTAL_SCROLL_HEIGHT = 20
+local AUDIT_MISSING_OVERLAY_MIN_ALPHA = 0.30
+local AUDIT_MISSING_OVERLAY_MAX_ALPHA = 0.50
 local AUDIT_SLOT_PLACEHOLDERS = {
 	head = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head",
 	neck = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck",
@@ -280,14 +282,14 @@ local function EnsureAuditPulse(texture)
 
 	local fadeIn = pulse:CreateAnimation("Alpha")
 	fadeIn:SetOrder(1)
-	fadeIn:SetFromAlpha(0.16)
-	fadeIn:SetToAlpha(0.34)
+	fadeIn:SetFromAlpha(AUDIT_MISSING_OVERLAY_MIN_ALPHA)
+	fadeIn:SetToAlpha(AUDIT_MISSING_OVERLAY_MAX_ALPHA)
 	fadeIn:SetDuration(0.8)
 
 	local fadeOut = pulse:CreateAnimation("Alpha")
 	fadeOut:SetOrder(2)
-	fadeOut:SetFromAlpha(0.34)
-	fadeOut:SetToAlpha(0.16)
+	fadeOut:SetFromAlpha(AUDIT_MISSING_OVERLAY_MAX_ALPHA)
+	fadeOut:SetToAlpha(AUDIT_MISSING_OVERLAY_MIN_ALPHA)
 	fadeOut:SetDuration(0.8)
 
 	texture.__sfPulse = pulse
@@ -297,7 +299,7 @@ end
 local function SetAuditMissingOverlay(texture, enabled)
 	local pulse = EnsureAuditPulse(texture)
 	if enabled then
-		texture:SetAlpha(0.16)
+		texture:SetAlpha(AUDIT_MISSING_OVERLAY_MIN_ALPHA)
 		texture:Show()
 		if not pulse:IsPlaying() then
 			pulse:Play()
@@ -430,7 +432,7 @@ local function CreateAuditCell(parent)
 
 	local overlay = button:CreateTexture(nil, "OVERLAY")
 	overlay:SetAllPoints(button)
-	overlay:SetColorTexture(1, 0, 0, 0.16)
+	overlay:SetColorTexture(1, 0, 0, AUDIT_MISSING_OVERLAY_MIN_ALPHA)
 	overlay:Hide()
 	button.MissingOverlay = overlay
 
