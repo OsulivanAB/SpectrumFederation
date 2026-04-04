@@ -35,9 +35,10 @@ local SessionPage = {
 
 local EQUIPMENT_PAGE_WINDOW_WIDTH = 1280
 local EQUIPMENT_REFRESH_DEBOUNCE_SECONDS = 0.15
-local EQUIPMENT_MANUAL_REFRESH_WINDOW_SECONDS = 1.5
-local EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_COUNT = 3
-local EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_DELAY_SECONDS = 0.2
+local EQUIPMENT_MANUAL_REFRESH_WINDOW_SECONDS = 4.0
+local EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_COUNT = 8
+local EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_DELAY_SECONDS = 0.25
+local EQUIPMENT_MANUAL_REFRESH_INITIAL_DELAY_SECONDS = 0.05
 
 local EquipmentPage = {
 	id = "lootHelperEquipment",
@@ -252,11 +253,10 @@ local AUDIT_ROW_SPACING = 2
 local AUDIT_HEADER_HEIGHT = 24
 local AUDIT_MIN_TABLE_HEIGHT = 260
 local AUDIT_HORIZONTAL_SCROLL_HEIGHT = 20
-local AUDIT_MISSING_OVERLAY_MIN_ALPHA = 0.30
-local AUDIT_MISSING_OVERLAY_MAX_ALPHA = 0.50
-local AUDIT_ISSUE_ICON_RED = 0.82
-local AUDIT_ISSUE_ICON_GREEN = 0.45
-local AUDIT_ISSUE_ICON_BLUE = 0.45
+-- Keep the pulse visible without fully obscuring the item icon.
+local AUDIT_MISSING_OVERLAY_MIN_ALPHA = 0.18
+local AUDIT_MISSING_OVERLAY_MAX_ALPHA = 0.72
+local AUDIT_PULSE_DURATION_SECONDS = 0.6
 local AUDIT_SLOT_PLACEHOLDERS = {
 	head = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head",
 	neck = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck",
@@ -290,13 +290,13 @@ local function EnsureAuditPulse(texture)
 	fadeIn:SetOrder(1)
 	fadeIn:SetFromAlpha(AUDIT_MISSING_OVERLAY_MIN_ALPHA)
 	fadeIn:SetToAlpha(AUDIT_MISSING_OVERLAY_MAX_ALPHA)
-	fadeIn:SetDuration(0.8)
+	fadeIn:SetDuration(AUDIT_PULSE_DURATION_SECONDS)
 
 	local fadeOut = pulse:CreateAnimation("Alpha")
 	fadeOut:SetOrder(2)
 	fadeOut:SetFromAlpha(AUDIT_MISSING_OVERLAY_MAX_ALPHA)
 	fadeOut:SetToAlpha(AUDIT_MISSING_OVERLAY_MIN_ALPHA)
-	fadeOut:SetDuration(0.8)
+	fadeOut:SetDuration(AUDIT_PULSE_DURATION_SECONDS)
 
 	texture.__sfPulse = pulse
 	return pulse
@@ -317,20 +317,6 @@ local function SetAuditMissingOverlay(texture, enabled)
 		pulse:Stop()
 	end
 	texture:Hide()
-end
-
-local function SetAuditIssueBorder(texture, enabled)
-	if not texture then
-		return
-	end
-	texture:SetShown(enabled and true or false)
-end
-
-local function SetAuditIssueBadge(texture, enabled)
-	if not texture then
-		return
-	end
-	texture:SetShown(enabled and true or false)
 end
 
 local function GetAuditDebugItemToken(link)
@@ -469,43 +455,6 @@ local function CreateAuditCell(parent)
 	overlay:Hide()
 	button.MissingOverlay = overlay
 
-	local issueBorder = CreateFrame("Frame", nil, button)
-	issueBorder:SetAllPoints(button)
-	issueBorder:Hide()
-	issueBorder:SetFrameLevel((button:GetFrameLevel() or 0) + 5)
-	button.IssueBorder = issueBorder
-
-	local borderTop = issueBorder:CreateTexture(nil, "OVERLAY")
-	borderTop:SetPoint("TOPLEFT", issueBorder, "TOPLEFT", 0, 0)
-	borderTop:SetPoint("TOPRIGHT", issueBorder, "TOPRIGHT", 0, 0)
-	borderTop:SetHeight(2)
-	borderTop:SetColorTexture(1, 0.15, 0.15, 0.95)
-
-	local borderBottom = issueBorder:CreateTexture(nil, "OVERLAY")
-	borderBottom:SetPoint("BOTTOMLEFT", issueBorder, "BOTTOMLEFT", 0, 0)
-	borderBottom:SetPoint("BOTTOMRIGHT", issueBorder, "BOTTOMRIGHT", 0, 0)
-	borderBottom:SetHeight(2)
-	borderBottom:SetColorTexture(1, 0.15, 0.15, 0.95)
-
-	local borderLeft = issueBorder:CreateTexture(nil, "OVERLAY")
-	borderLeft:SetPoint("TOPLEFT", issueBorder, "TOPLEFT", 0, 0)
-	borderLeft:SetPoint("BOTTOMLEFT", issueBorder, "BOTTOMLEFT", 0, 0)
-	borderLeft:SetWidth(2)
-	borderLeft:SetColorTexture(1, 0.15, 0.15, 0.95)
-
-	local borderRight = issueBorder:CreateTexture(nil, "OVERLAY")
-	borderRight:SetPoint("TOPRIGHT", issueBorder, "TOPRIGHT", 0, 0)
-	borderRight:SetPoint("BOTTOMRIGHT", issueBorder, "BOTTOMRIGHT", 0, 0)
-	borderRight:SetWidth(2)
-	borderRight:SetColorTexture(1, 0.15, 0.15, 0.95)
-
-	local issueBadge = button:CreateTexture(nil, "OVERLAY", nil, 4)
-	issueBadge:SetSize(10, 10)
-	issueBadge:SetPoint("TOPRIGHT", button, "TOPRIGHT", 1, 1)
-	issueBadge:SetColorTexture(1, 0.12, 0.12, 1)
-	issueBadge:Hide()
-	button.IssueBadge = issueBadge
-
 	local highlight = button:CreateTexture(nil, "HIGHLIGHT")
 	highlight:SetAllPoints(button)
 	highlight:SetColorTexture(1, 1, 1, 0.10)
@@ -583,7 +532,9 @@ local function BuildEquipmentPage(panel)
 		if SF.Debug then
 			SF.Debug:Info("UI", "Raid Check Equipment redraw requested (%s)", tostring(reason or "unknown"))
 		end
-		if pageBuilder and pageBuilder.Refresh then
+		if ScheduleRefreshAuditTable then
+			ScheduleRefreshAuditTable()
+		elseif pageBuilder and pageBuilder.Refresh then
 			pageBuilder:Refresh()
 		end
 		ReflowEquipmentPage()
@@ -638,7 +589,13 @@ local function BuildEquipmentPage(panel)
 			if SF.RaidCheck and SF.RaidCheck.RequestTroubleshootingRefresh then
 				SF.RaidCheck:RequestTroubleshootingRefresh()
 			end
-			RequestEquipmentPageRedraw("manual refresh button")
+			if C_Timer and C_Timer.After then
+				C_Timer.After(EQUIPMENT_MANUAL_REFRESH_INITIAL_DELAY_SECONDS, function()
+					RequestEquipmentPageRedraw("manual refresh button")
+				end)
+			else
+				RequestEquipmentPageRedraw("manual refresh button")
+			end
 			ScheduleManualRefreshFollowUps("manual refresh follow-up")
 		end,
 		visible = function()
@@ -890,22 +847,12 @@ local function BuildEquipmentPage(panel)
 						cell.Icon:SetTexture(texture)
 						cell.Icon:SetDesaturated(not hasItem)
 						if hasItem then
-							if shouldShowOverlay then
-								cell.Icon:SetVertexColor(AUDIT_ISSUE_ICON_RED, AUDIT_ISSUE_ICON_GREEN, AUDIT_ISSUE_ICON_BLUE, 1)
-							else
-								cell.Icon:SetVertexColor(1, 1, 1, 1)
-							end
+							cell.Icon:SetVertexColor(1, 1, 1, 1)
 						else
-							if shouldShowOverlay then
-								cell.Icon:SetVertexColor(0.75, 0.35, 0.35, 0.95)
-							else
-								cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
-							end
+							cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
 						end
 
 						SetAuditMissingOverlay(cell.MissingOverlay, shouldShowOverlay)
-						SetAuditIssueBorder(cell.IssueBorder, shouldShowOverlay)
-						SetAuditIssueBadge(cell.IssueBadge, shouldShowOverlay)
 						if SF.Debug and slotData and slotData.known then
 							SF.Debug:Verbose(
 								"UI",

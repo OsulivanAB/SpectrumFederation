@@ -504,7 +504,15 @@ function RC:_InvalidateInspectAliases(aliases)
 end
 
 function RC:_InvalidateInspectUnit(unit)
-	if not unit or unit == "player" then
+	if not unit then
+		return
+	end
+
+	if unit == "player" then
+		if SF.Debug then
+			SF.Debug:Verbose("RAID_CHECK", "Player inventory changed; notifying troubleshooting listeners")
+		end
+		self:_NotifyTroubleshootingListeners()
 		return
 	end
 
