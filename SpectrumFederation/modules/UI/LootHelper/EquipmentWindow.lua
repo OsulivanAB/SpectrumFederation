@@ -27,7 +27,9 @@ local WINDOW_WIDTH = CONTENT_WIDTH + 8  -- Minimal backdrop insets
 -- Height: title bar + top gap + padding + icons + spacing + padding
 local CONTENT_HEIGHT = (ICON_SIZE * NUM_ROWS) + (ICON_SPACING * (NUM_ROWS - 1))
 local WINDOW_HEIGHT = TITLE_HEIGHT + 6 + PADDING + CONTENT_HEIGHT + PADDING
-local ISSUE_OVERLAY_ALPHA = 0.30
+local ISSUE_OVERLAY_MIN_ALPHA = 0
+local ISSUE_OVERLAY_MAX_ALPHA = 0.30
+local ISSUE_OVERLAY_PULSE_DURATION_SECONDS = 0.6
 
 -- Min/max height constraints (for dynamic sizing if needed)
 local WINDOW_MIN_HEIGHT = WINDOW_HEIGHT
@@ -145,6 +147,51 @@ local function GetActiveRaidCheckConfig()
         return profile:GetRaidCheckConfig()
     end
     return nil
+end
+
+local function EnsureIssueOverlayPulse(texture)
+    if texture.__sfPulse then
+        return texture.__sfPulse
+    end
+
+    local pulse = texture:CreateAnimationGroup()
+    pulse:SetLooping("REPEAT")
+
+    local fadeIn = pulse:CreateAnimation("Alpha")
+    fadeIn:SetOrder(1)
+    fadeIn:SetFromAlpha(ISSUE_OVERLAY_MIN_ALPHA)
+    fadeIn:SetToAlpha(ISSUE_OVERLAY_MAX_ALPHA)
+    fadeIn:SetDuration(ISSUE_OVERLAY_PULSE_DURATION_SECONDS)
+
+    local fadeOut = pulse:CreateAnimation("Alpha")
+    fadeOut:SetOrder(2)
+    fadeOut:SetFromAlpha(ISSUE_OVERLAY_MAX_ALPHA)
+    fadeOut:SetToAlpha(ISSUE_OVERLAY_MIN_ALPHA)
+    fadeOut:SetDuration(ISSUE_OVERLAY_PULSE_DURATION_SECONDS)
+
+    texture.__sfPulse = pulse
+    return pulse
+end
+
+local function SetIssueOverlayShown(texture, shown)
+    if not texture then
+        return
+    end
+
+    local pulse = EnsureIssueOverlayPulse(texture)
+    if shown then
+        texture:SetAlpha(ISSUE_OVERLAY_MIN_ALPHA)
+        texture:Show()
+        if not pulse:IsPlaying() then
+            pulse:Play()
+        end
+        return
+    end
+
+    if pulse:IsPlaying() then
+        pulse:Stop()
+    end
+    texture:Hide()
 end
 
 -- Create the equipment window frame
@@ -277,8 +324,8 @@ function EquipmentWindow:_CreateGearGrid(content)
         btn.UsedOverlay = overlay
 
         local issueOverlay = btn:CreateTexture(nil, "OVERLAY")
-        issueOverlay:SetAllPoints(btn)
-        issueOverlay:SetColorTexture(1, 0, 0, ISSUE_OVERLAY_ALPHA)
+        issueOverlay:SetAllPoints(icon)
+        issueOverlay:SetColorTexture(1, 0, 0, ISSUE_OVERLAY_MAX_ALPHA)
         issueOverlay:Hide()
         btn.IssueOverlay = issueOverlay
 
@@ -455,9 +502,9 @@ function EquipmentWindow:Refresh()
             if btn.IssueOverlay then
                 local inventorySlot = SLOT_KEY_TO_INVENTORY[slotKey]
                 if inventorySlot and issuesByInventory and issuesByInventory[inventorySlot] then
-                    btn.IssueOverlay:Show()
+                    SetIssueOverlayShown(btn.IssueOverlay, true)
                 else
-                    btn.IssueOverlay:Hide()
+                    SetIssueOverlayShown(btn.IssueOverlay, false)
                 end
             end
 

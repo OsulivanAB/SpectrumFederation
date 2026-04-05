@@ -253,8 +253,8 @@ local AUDIT_ROW_SPACING = 2
 local AUDIT_HEADER_HEIGHT = 24
 local AUDIT_MIN_TABLE_HEIGHT = 260
 local AUDIT_HORIZONTAL_SCROLL_HEIGHT = 20
--- Keep the pulse visible without fully obscuring the item icon.
-local AUDIT_MISSING_OVERLAY_MIN_ALPHA = 0.18
+-- Fade fully out so the pulse is unmistakable without obscuring the icon at peak.
+local AUDIT_MISSING_OVERLAY_MIN_ALPHA = 0
 local AUDIT_MISSING_OVERLAY_MAX_ALPHA = 0.72
 local AUDIT_PULSE_DURATION_SECONDS = 0.6
 local AUDIT_SLOT_PLACEHOLDERS = {
@@ -450,7 +450,7 @@ local function CreateAuditCell(parent)
 	border:SetColorTexture(1, 1, 1, 0.08)
 
 	local overlay = button:CreateTexture(nil, "OVERLAY")
-	overlay:SetAllPoints(button)
+	overlay:SetAllPoints(icon)
 	overlay:SetColorTexture(1, 0, 0, AUDIT_MISSING_OVERLAY_MIN_ALPHA)
 	overlay:Hide()
 	button.MissingOverlay = overlay
