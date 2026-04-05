@@ -197,6 +197,10 @@ end
 
 local function SetIssueOverlayToVisibleIconArea(texture, parent)
     local inset = math.floor((ICON_SIZE * ISSUE_OVERLAY_CROP_RATIO) + 0.5)
+    if inset > 0 then
+        -- Expand by one pixel so the overlay better matches the visible icon without restoring the border artifact.
+        inset = inset - 1
+    end
     texture:ClearAllPoints()
     texture:SetPoint("TOPLEFT", parent, "TOPLEFT", inset, -inset)
     texture:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -inset, inset)
