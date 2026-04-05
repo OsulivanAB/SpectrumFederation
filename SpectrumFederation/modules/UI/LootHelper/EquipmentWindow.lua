@@ -29,7 +29,8 @@ local CONTENT_HEIGHT = (ICON_SIZE * NUM_ROWS) + (ICON_SPACING * (NUM_ROWS - 1))
 local WINDOW_HEIGHT = TITLE_HEIGHT + 6 + PADDING + CONTENT_HEIGHT + PADDING
 local ISSUE_OVERLAY_MIN_ALPHA = 0
 local ISSUE_OVERLAY_MAX_ALPHA = 0.30
-local ISSUE_OVERLAY_PULSE_DURATION_SECONDS = 0.6
+local ISSUE_OVERLAY_PULSE_DURATION_SECONDS = 1.5
+local ISSUE_OVERLAY_CROP_RATIO = 0.07
 
 -- Min/max height constraints (for dynamic sizing if needed)
 local WINDOW_MIN_HEIGHT = WINDOW_HEIGHT
@@ -194,6 +195,13 @@ local function SetIssueOverlayShown(texture, shown)
     texture:Hide()
 end
 
+local function SetIssueOverlayToVisibleIconArea(texture, parent)
+    local inset = math.floor((ICON_SIZE * ISSUE_OVERLAY_CROP_RATIO) + 0.5)
+    texture:ClearAllPoints()
+    texture:SetPoint("TOPLEFT", parent, "TOPLEFT", inset, -inset)
+    texture:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -inset, inset)
+end
+
 -- Create the equipment window frame
 function EquipmentWindow:Create()
     if self._frame then
@@ -324,8 +332,8 @@ function EquipmentWindow:_CreateGearGrid(content)
         btn.UsedOverlay = overlay
 
         local issueOverlay = btn:CreateTexture(nil, "OVERLAY")
-        issueOverlay:SetAllPoints(icon)
-        issueOverlay:SetColorTexture(1, 0, 0, ISSUE_OVERLAY_MAX_ALPHA)
+        SetIssueOverlayToVisibleIconArea(issueOverlay, icon)
+        issueOverlay:SetColorTexture(1, 0, 0, 1)
         issueOverlay:Hide()
         btn.IssueOverlay = issueOverlay
 

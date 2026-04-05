@@ -256,7 +256,8 @@ local AUDIT_HORIZONTAL_SCROLL_HEIGHT = 20
 -- Fade fully out so the pulse is unmistakable without obscuring the icon at peak.
 local AUDIT_MISSING_OVERLAY_MIN_ALPHA = 0
 local AUDIT_MISSING_OVERLAY_MAX_ALPHA = 0.72
-local AUDIT_PULSE_DURATION_SECONDS = 0.6
+local AUDIT_PULSE_DURATION_SECONDS = 1.5
+local AUDIT_ICON_CROP_RATIO = 0.07
 local AUDIT_SLOT_PLACEHOLDERS = {
 	head = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head",
 	neck = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck",
@@ -300,6 +301,13 @@ local function EnsureAuditPulse(texture)
 
 	texture.__sfPulse = pulse
 	return pulse
+end
+
+local function SetOverlayToVisibleIconArea(texture, parent, iconSize)
+	local inset = math.floor((iconSize * AUDIT_ICON_CROP_RATIO) + 0.5)
+	texture:ClearAllPoints()
+	texture:SetPoint("TOPLEFT", parent, "TOPLEFT", inset, -inset)
+	texture:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -inset, inset)
 end
 
 local function SetAuditMissingOverlay(texture, enabled)
@@ -450,8 +458,8 @@ local function CreateAuditCell(parent)
 	border:SetColorTexture(1, 1, 1, 0.08)
 
 	local overlay = button:CreateTexture(nil, "OVERLAY")
-	overlay:SetAllPoints(icon)
-	overlay:SetColorTexture(1, 0, 0, AUDIT_MISSING_OVERLAY_MIN_ALPHA)
+	SetOverlayToVisibleIconArea(overlay, icon, AUDIT_ICON_SIZE)
+	overlay:SetColorTexture(1, 0, 0, 1)
 	overlay:Hide()
 	button.MissingOverlay = overlay
 
