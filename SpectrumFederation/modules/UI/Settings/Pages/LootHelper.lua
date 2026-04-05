@@ -257,7 +257,6 @@ local AUDIT_HORIZONTAL_SCROLL_HEIGHT = 20
 local AUDIT_MISSING_OVERLAY_MIN_ALPHA = 0
 local AUDIT_MISSING_OVERLAY_MAX_ALPHA = 0.72
 local AUDIT_PULSE_DURATION_SECONDS = 1.5
-local AUDIT_ICON_CROP_RATIO = 0.07
 local AUDIT_SLOT_PLACEHOLDERS = {
 	head = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head",
 	neck = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck",
@@ -303,15 +302,9 @@ local function EnsureAuditPulse(texture)
 	return pulse
 end
 
-local function SetOverlayToVisibleIconArea(texture, parent, iconSize)
-	local inset = math.floor((iconSize * AUDIT_ICON_CROP_RATIO) + 0.5)
-	if inset > 0 then
-		-- Expand by one pixel so the overlay better matches the visible icon without restoring the border artifact.
-		inset = inset - 1
-	end
+local function SetOverlayToVisibleIconArea(texture, parent)
 	texture:ClearAllPoints()
-	texture:SetPoint("TOPLEFT", parent, "TOPLEFT", inset, -inset)
-	texture:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -inset, inset)
+	texture:SetAllPoints(parent)
 end
 
 local function SetAuditMissingOverlay(texture, enabled)
@@ -457,12 +450,8 @@ local function CreateAuditCell(parent)
 	icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
 	button.Icon = icon
 
-	local border = button:CreateTexture(nil, "BORDER")
-	border:SetAllPoints(button)
-	border:SetColorTexture(1, 1, 1, 0.08)
-
 	local overlay = button:CreateTexture(nil, "OVERLAY")
-	SetOverlayToVisibleIconArea(overlay, icon, AUDIT_ICON_SIZE)
+	SetOverlayToVisibleIconArea(overlay, icon)
 	overlay:SetColorTexture(1, 0, 0, 1)
 	overlay:Hide()
 	button.MissingOverlay = overlay
@@ -572,10 +561,9 @@ local function BuildEquipmentPage(panel)
 	local controls = SF.SettingsUI.Controls
 	local introSection = pageBuilder:AddSection({
 		title = "Raid Check Equipment",
-		tooltip = "Inspect the exact equipment snapshot that Raid Check currently sees for each visible group member.",
+		tooltip = "Shows the equipment snapshot Raid Check uses for the audit.",
 	})
 
-	introSection:AddText("This table shows the same live item links Raid Check is currently evaluating. A red pulse means that slot has a missing required enchant or an empty gem socket.")
 	controls:AddCheckbox(introSection, {
 		label = "Enable Auto Refresh",
 		tooltip = "Automatically refresh this audit table as inspect results update. Leave this off to refresh only when you ask for it.",
@@ -617,7 +605,7 @@ local function BuildEquipmentPage(panel)
 
 	local tableSection = pageBuilder:AddSection({
 		title = "Current Group Equipment",
-		tooltip = "One row per visible group member, with one column per equipment slot.",
+		tooltip = "Shows the last seen gear in each slot for every visible raid member. Slots pulse red when gear, required enchants, or gems are missing.",
 	})
 	tableSection.__sfFillHeight = true
 

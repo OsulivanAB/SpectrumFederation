@@ -304,6 +304,13 @@ local function IsSelfUnit(unit)
 	return false
 end
 
+local function GetTroubleshootingCaptureUnit(unit)
+	if IsSelfUnit(unit) then
+		return "player"
+	end
+	return unit
+end
+
 local function IsUnitInInspectRange(unit)
 	if CheckInteractDistance then
 		return CheckInteractDistance(unit, 1) ~= false
@@ -386,6 +393,7 @@ local function FindUnitByGuidOrId(guid, id)
 end
 
 local function CaptureTroubleshootingInventory(unit)
+	unit = GetTroubleshootingCaptureUnit(unit)
 	local slotsByInventory = {}
 	local sawAnyData = false
 
@@ -508,7 +516,7 @@ function RC:_InvalidateInspectUnit(unit)
 		return
 	end
 
-	if unit == "player" then
+	if IsSelfUnit(unit) then
 		if SF.Debug then
 			SF.Debug:Verbose("RAID_CHECK", "Player inventory changed; notifying troubleshooting listeners")
 		end
