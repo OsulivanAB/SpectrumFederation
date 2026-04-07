@@ -664,9 +664,9 @@ function RC:_HandleInspectTimeout(key, requestedAt)
 	entry.failCount = failCount
 	entry.lastAttemptAt = requestedAt
 	-- Use a short capped linear backoff so repeated failures do not hammer
-		-- NotifyInspect, while still recovering quickly once the player becomes
-		-- inspectable again. The delay scales from INSPECT_RETRY_BASE_SECONDS up
-		-- to INSPECT_RETRY_MAX_SECONDS.
+	-- NotifyInspect, while still recovering quickly once the player becomes
+	-- inspectable again. The delay scales from INSPECT_RETRY_BASE_SECONDS up
+	-- to INSPECT_RETRY_MAX_SECONDS.
 	entry.nextRetryAt = now + CalculateInspectRetryDelay(failCount)
 	self:_StoreInspectCacheEntry(entry, active.aliases)
 
@@ -714,9 +714,9 @@ function RC:_HandleInspectReady(guid)
 		entry.failCount = (entry.failCount or 0) + 1
 		entry.lastAttemptAt = active.requestedAt
 		-- Use a short capped linear backoff so repeated failures do not hammer
-	-- NotifyInspect, while still recovering quickly once the player becomes
-	-- inspectable again. The delay scales from INSPECT_RETRY_BASE_SECONDS up
-	-- to INSPECT_RETRY_MAX_SECONDS.
+		-- NotifyInspect, while still recovering quickly once the player becomes
+		-- inspectable again. The delay scales from INSPECT_RETRY_BASE_SECONDS up
+		-- to INSPECT_RETRY_MAX_SECONDS.
 		entry.nextRetryAt = now + CalculateInspectRetryDelay(entry.failCount)
 	end
 
