@@ -1,6 +1,9 @@
 -- modules/UI/LootHelper/EquipmentWindow.lua
 local addonName, SF = ...
 
+-- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET
+-- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
+
 SF.LootHelperWindow = SF.LootHelperWindow or {}
 local LH = SF.LootHelperWindow
 
@@ -24,6 +27,10 @@ local WINDOW_WIDTH = CONTENT_WIDTH + 8  -- Minimal backdrop insets
 -- Height: title bar + top gap + padding + icons + spacing + padding
 local CONTENT_HEIGHT = (ICON_SIZE * NUM_ROWS) + (ICON_SPACING * (NUM_ROWS - 1))
 local WINDOW_HEIGHT = TITLE_HEIGHT + 6 + PADDING + CONTENT_HEIGHT + PADDING
+local ISSUE_OVERLAY_MIN_ALPHA = 0
+local ISSUE_OVERLAY_MAX_ALPHA = 0.30
+local ISSUE_OVERLAY_PULSE_DURATION_SECONDS = 1.5
+local ISSUE_OVERLAY_CROP_RATIO = 0.07
 
 -- Min/max height constraints (for dynamic sizing if needed)
 local WINDOW_MIN_HEIGHT = WINDOW_HEIGHT
@@ -55,6 +62,25 @@ local RIGHT_SLOTS = {
     { key = "Trinket1",  texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Trinket" },
     { key = "Trinket2",  texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Trinket" },
     { key = "OffHand",   texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-SecondaryHand" },
+}
+
+local SLOT_KEY_TO_INVENTORY = {
+    Head = INVSLOT_HEAD,
+    Neck = INVSLOT_NECK,
+    Shoulder = INVSLOT_SHOULDER,
+    Back = INVSLOT_BACK,
+    Chest = INVSLOT_CHEST,
+    Bracers = INVSLOT_WRIST,
+    Hands = INVSLOT_HAND,
+    Belt = INVSLOT_WAIST,
+    Pants = INVSLOT_LEGS,
+    Boots = INVSLOT_FEET,
+    Ring1 = INVSLOT_FINGER1,
+    Ring2 = INVSLOT_FINGER2,
+    Trinket1 = INVSLOT_TRINKET1,
+    Trinket2 = INVSLOT_TRINKET2,
+    Weapon = INVSLOT_MAINHAND,
+    OffHand = INVSLOT_OFFHAND,
 }
 
 -- Helper function to get class icon
@@ -98,6 +124,86 @@ local function TryGetSpecIcon(unit, memberId)
     end
 
     return nil
+end
+
+local function ResolveDisplayUnit(rowModel)
+    if rowModel and rowModel.unit then
+        return rowModel.unit
+    end
+
+    local memberId = rowModel and rowModel.memberId or nil
+    if memberId and SF.NameUtil and SF.NameUtil.GetSelfId and SF.NameUtil.SamePlayer then
+        local selfId = SF.NameUtil.GetSelfId()
+        if selfId and SF.NameUtil.SamePlayer(memberId, selfId) then
+            return "player"
+        end
+    end
+
+    return nil
+end
+
+local function GetActiveRaidCheckConfig()
+    local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
+    if profile and profile.GetRaidCheckConfig then
+        return profile:GetRaidCheckConfig()
+    end
+    return nil
+end
+
+local function EnsureIssueOverlayPulse(texture)
+    if texture.__sfPulse then
+        return texture.__sfPulse
+    end
+
+    local pulse = texture:CreateAnimationGroup()
+    pulse:SetLooping("REPEAT")
+
+    local fadeIn = pulse:CreateAnimation("Alpha")
+    fadeIn:SetOrder(1)
+    fadeIn:SetFromAlpha(ISSUE_OVERLAY_MIN_ALPHA)
+    fadeIn:SetToAlpha(ISSUE_OVERLAY_MAX_ALPHA)
+    fadeIn:SetDuration(ISSUE_OVERLAY_PULSE_DURATION_SECONDS)
+
+    local fadeOut = pulse:CreateAnimation("Alpha")
+    fadeOut:SetOrder(2)
+    fadeOut:SetFromAlpha(ISSUE_OVERLAY_MAX_ALPHA)
+    fadeOut:SetToAlpha(ISSUE_OVERLAY_MIN_ALPHA)
+    fadeOut:SetDuration(ISSUE_OVERLAY_PULSE_DURATION_SECONDS)
+
+    texture.__sfPulse = pulse
+    return pulse
+end
+
+local function SetIssueOverlayShown(texture, shown)
+    if not texture then
+        return
+    end
+
+    local pulse = EnsureIssueOverlayPulse(texture)
+    if shown then
+        texture:SetAlpha(ISSUE_OVERLAY_MIN_ALPHA)
+        texture:Show()
+        if not pulse:IsPlaying() then
+            pulse:Play()
+        end
+        return
+    end
+
+    if pulse:IsPlaying() then
+        pulse:Stop()
+    end
+    texture:Hide()
+end
+
+local function SetIssueOverlayToVisibleIconArea(texture, parent)
+    local inset = math.floor((ICON_SIZE * ISSUE_OVERLAY_CROP_RATIO) + 0.5)
+    if inset > 0 then
+        -- Expand by one pixel so the overlay better matches the visible icon without restoring the border artifact.
+        inset = inset - 1
+    end
+    texture:ClearAllPoints()
+    texture:SetPoint("TOPLEFT", parent, "TOPLEFT", inset, -inset)
+    texture:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -inset, inset)
 end
 
 -- Create the equipment window frame
@@ -229,6 +335,12 @@ function EquipmentWindow:_CreateGearGrid(content)
         overlay:Hide()
         btn.UsedOverlay = overlay
 
+        local issueOverlay = btn:CreateTexture(nil, "OVERLAY")
+        SetIssueOverlayToVisibleIconArea(issueOverlay, icon)
+        issueOverlay:SetColorTexture(1, 0, 0, 1)
+        issueOverlay:Hide()
+        btn.IssueOverlay = issueOverlay
+
         return btn
     end
 
@@ -325,9 +437,10 @@ function EquipmentWindow:SetMember(rowModel, memberObj, canAdmin)
     self._rowModel = rowModel
     self._memberObj = memberObj
     self._canAdmin = canAdmin
+    self._unit = ResolveDisplayUnit(rowModel)
 
     -- Update title icon (pass both unit and memberId for player detection when not in raid)
-    local icon = TryGetSpecIcon(rowModel.unit, rowModel.memberId) or GetClassIcon(rowModel.class)
+    local icon = TryGetSpecIcon(self._unit, rowModel.memberId) or GetClassIcon(rowModel.class)
     self._frame.Title.Icon:SetTexture(icon)
 
     -- Update title text
@@ -336,6 +449,29 @@ function EquipmentWindow:SetMember(rowModel, memberObj, canAdmin)
 
     -- Refresh armor state
     self:Refresh()
+end
+
+function EquipmentWindow:_GetEquipmentIssuesByInventorySlot()
+    local unit = self._unit
+    if not unit or not SF.RaidCheck or not SF.RaidCheck.GetTroubleshootingSlotsForUnit then
+        return nil
+    end
+
+    local cfg = GetActiveRaidCheckConfig()
+    if not cfg then
+        return nil
+    end
+
+    local snapshot = SF.RaidCheck:GetTroubleshootingSlotsForUnit(unit, cfg)
+    local issuesByInventory = {}
+
+    for _, slot in ipairs(snapshot and snapshot.slots or {}) do
+        if slot and slot.inventorySlot then
+            issuesByInventory[slot.inventorySlot] = (slot.missingEnchant or slot.missingGems or slot.missingItem) and true or false
+        end
+    end
+
+    return issuesByInventory
 end
 
 -- Refresh armor state display
@@ -352,6 +488,7 @@ function EquipmentWindow:Refresh()
 
     if not armor then return end
 
+    local issuesByInventory = self:_GetEquipmentIssuesByInventorySlot()
     local buttons = self._frame.Content.SlotButtons or {}
     for _, btn in ipairs(buttons) do
         local slotKey = btn.slotKey
@@ -371,6 +508,15 @@ function EquipmentWindow:Refresh()
                 btn.Icon:SetVertexColor(0.6, 0.6, 0.6, 0.8)
                 if btn.UsedOverlay then
                     btn.UsedOverlay:Hide()
+                end
+            end
+
+            if btn.IssueOverlay then
+                local inventorySlot = SLOT_KEY_TO_INVENTORY[slotKey]
+                if inventorySlot and issuesByInventory and issuesByInventory[inventorySlot] then
+                    SetIssueOverlayShown(btn.IssueOverlay, true)
+                else
+                    SetIssueOverlayShown(btn.IssueOverlay, false)
                 end
             end
 

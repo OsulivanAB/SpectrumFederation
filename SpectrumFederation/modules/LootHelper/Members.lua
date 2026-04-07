@@ -351,8 +351,10 @@ end
 
 -- Function to decrement point balance by 1
 -- Allows negative values (point debt) for edge cases like accidental gear awards
+-- @param metadata table|nil Optional log metadata
 -- @return (boolean) - True if successful, false otherwise
-function Member:DecrementPoints()
+function Member:DecrementPoints(metadata)
+    metadata = metadata or {}
 
     -- Enforce admin permissions
     if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
@@ -374,6 +376,18 @@ function Member:DecrementPoints()
     local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
     logEventData.member = self:GetFullIdentifier()
     logEventData.change = SF.LootLogPointChangeTypes.DECREMENT
+    if metadata.reason ~= nil then
+        logEventData.reason = tostring(metadata.reason)
+    end
+    if metadata.source ~= nil then
+        logEventData.source = tostring(metadata.source)
+    end
+    if metadata.rollType ~= nil then
+        logEventData.rollType = tostring(metadata.rollType)
+    end
+    if metadata.itemLink ~= nil then
+        logEventData.itemLink = tostring(metadata.itemLink)
+    end
     local logEntry = SF.LootLog.new(logEventType, logEventData)
     -- Validate logEntry creation
     if not logEntry then
