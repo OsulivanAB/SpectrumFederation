@@ -1386,55 +1386,6 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					end,
 					maxLetters = 24,
 				},
-				{ type = "spacer", height = 12 },
-				{ type = "heading", text = "RC Loot Council (v1)" },
-				{
-					type = "checkbox",
-					label = "Enable RC Loot Council",
-					adminOnly = true,
-					tooltip = "Listen for RC Loot Council award announcements and decrement points when the configured roll type wins an item.",
-					enabled = function() return ProfileActionsEnabled() end,
-					get = function()
-						local profile = GetActiveProfileObject(store)
-						if profile and type(profile.GetRCLootCouncilEnabled) == "function" then
-							return profile:GetRCLootCouncilEnabled()
-						end
-						return false
-					end,
-					set = function(value)
-						local profile = GetActiveProfileObject(store)
-						if profile and type(profile.SetRCLootCouncilEnabled) == "function" then
-							profile:SetRCLootCouncilEnabled(value and true or false)
-						end
-					end,
-				},
-				{
-					type = "editbox",
-					label = "RC Roll Type",
-					adminOnly = true,
-					tooltip = "Exact RC Loot Council award reason to listen for, such as Minor Upgrade or Main Spec.",
-					enabled = function()
-						local profile = GetActiveProfileObject(store)
-						return ProfileActionsEnabled()
-							and profile
-							and type(profile.GetRCLootCouncilEnabled) == "function"
-							and profile:GetRCLootCouncilEnabled()
-					end,
-					get = function()
-						local profile = GetActiveProfileObject(store)
-						if profile and type(profile.GetRCLootCouncilRollType) == "function" then
-							return profile:GetRCLootCouncilRollType()
-						end
-						return ""
-					end,
-					set = function(value)
-						local profile = GetActiveProfileObject(store)
-						if profile and type(profile.SetRCLootCouncilRollType) == "function" then
-							profile:SetRCLootCouncilRollType(value)
-						end
-					end,
-					maxLetters = 48,
-				},
 				{
 					type = "button",
 					label = "Reset Current Profile",
@@ -1503,6 +1454,56 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			tooltip = "Manage who can administer the active profile and use admin-only session tools.",
 			condition = CanShowAdminTools,
 			items = {
+				{ type = "heading", text = "RC Loot Council" },
+				{
+					type = "checkbox",
+					label = "Enable RC Loot Council",
+					adminOnly = true,
+					tooltip = "Listen for RC Loot Council award announcements and decrement points when the configured roll type wins an item.",
+					enabled = function() return ProfileActionsEnabled() end,
+					get = function()
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.GetRCLootCouncilEnabled) == "function" then
+							return profile:GetRCLootCouncilEnabled()
+						end
+						return false
+					end,
+					set = function(value)
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.SetRCLootCouncilEnabled) == "function" then
+							profile:SetRCLootCouncilEnabled(value and true or false)
+						end
+					end,
+				},
+				{
+					type = "editbox",
+					label = "RC Roll Type",
+					adminOnly = true,
+					tooltip = "Exact RC Loot Council award reason to listen for, such as Minor Upgrade or Main Spec.",
+					visible = function()
+						local profile = GetActiveProfileObject(store)
+						return ProfileActionsEnabled()
+							and profile
+							and type(profile.GetRCLootCouncilEnabled) == "function"
+							and profile:GetRCLootCouncilEnabled()
+					end,
+					enabled = function() return ProfileActionsEnabled() end,
+					get = function()
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.GetRCLootCouncilRollType) == "function" then
+							return profile:GetRCLootCouncilRollType()
+						end
+						return ""
+					end,
+					set = function(value)
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.SetRCLootCouncilRollType) == "function" then
+							profile:SetRCLootCouncilRollType(value)
+						end
+					end,
+					maxLetters = 48,
+				},
+				{ type = "spacer", height = 12 },
 				{ type = "scrollList", label = "Admins", adminOnly = true, height = 160, rowHeight = 20, removeAtlas = "common-icon-redx", compactColumns = true, removeColumnGap = 6, enabled = function() return ProfileActionsEnabled() end, getItems = function() return BuildAdminItems() end, onRemove = function(ctx, item) if type(ctx.store.RemoveAdminFromActiveProfile) ~= "function" then ctx.section:SetMessage("RemoveAdminFromActiveProfile() not implemented", "error") return end local ok, err = ctx.store:RemoveAdminFromActiveProfile(item.id) if not ok then ctx.section:SetMessage(err or "Failed to remove admin", "error") return end ctx.section:SetMessage("Admin removed.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "dropdownIconButton", label = "Add Admin", adminOnly = true, defaultText = "Select member", options = function() return BuildMemberOptions() end, get = function() return panel.__sfAddAdminSelectedId end, set = function(value) panel.__sfAddAdminSelectedId = value end, enabled = function() return ProfileActionsEnabled() end, iconAtlas = "common-icon-plus", iconToolTip = "Add the selected member as an admin for the active profile", iconEnabled = function() return ProfileActionsEnabled() and panel.__sfAddAdminSelectedId ~= nil end, onIconClick = function(ctx) if SF.Debug then SF.Debug:Info("UI", "Add Admin button clicked") end ctx.section:ClearMessage() local memberId = panel.__sfAddAdminSelectedId if SF.Debug then SF.Debug:Info("UI", "Selected memberId: %s", tostring(memberId)) end if not memberId then ctx.section:SetMessage("Select a member first.", "error") return end if type(ctx.store.AddAdminToActiveProfile) ~= "function" then ctx.section:SetMessage("AddAdminToActiveProfile() not implemented", "error") return end if SF.Debug then SF.Debug:Info("UI", "Calling AddAdminToActiveProfile with memberId: %s", tostring(memberId)) end local ok, err = ctx.store:AddAdminToActiveProfile(memberId) if SF.Debug then SF.Debug:Info("UI", "AddAdminToActiveProfile returned: ok=%s, err=%s", tostring(ok), tostring(err)) end if not ok then ctx.section:SetMessage(err or "Failed to add admin", "error") return end ctx.section:SetMessage("Admin added.", "success") ctx.pageBuilder:Refresh() end },
 			},
