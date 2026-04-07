@@ -34,6 +34,21 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.18-beta.35] - 2026-04-07
+
+### Added
+- Introduced handling for RC Loot Council award conflicts, including detection of ambiguous or unmatched winners and corresponding admin warnings.
+- Added functionality to synchronize RC Loot Council warnings with other admins in the guild.
+- Implemented retry logic for fetching item information during RC Loot Council award processing.
+- Added support for mapping item equip locations to specific armor slots for better award handling.
+
+### Changed
+- Enhanced logic for matching winners to profile members, including improved handling of short names and ambiguous matches.
+
+### Fixed
+- Resolved issues with processing RC Loot Council award messages when item information is delayed or incomplete.
+
 ## [0.5.18-beta.30] - 2026-04-07
 
 ### Added
