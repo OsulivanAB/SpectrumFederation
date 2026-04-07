@@ -375,6 +375,8 @@ local function BuildTroubleshootingConfigSignature(cfg)
 	return table.concat(parts, ";")
 end
 
+-- Forward-declared so early troubleshooting refresh helpers can safely call it
+-- before the later shared row-building helpers are defined.
 local BuildUnitInfo
 
 local function CollectUnits()
