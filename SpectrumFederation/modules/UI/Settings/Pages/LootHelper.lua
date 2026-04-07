@@ -523,13 +523,26 @@ local function BuildEquipmentPage(panel)
 	local RefreshAuditTable
 	local ScheduleRefreshAuditTable
 
+	local function IsEquipmentPageActive()
+		if not panel then
+			return false
+		end
+		if panel.IsVisible then
+			return panel:IsVisible() and true or false
+		end
+		return panel.IsShown and panel:IsShown() and true or false
+	end
+
 	local function ReflowEquipmentPage()
-		if pageBuilder and pageBuilder.Reflow then
+		if IsEquipmentPageActive() and pageBuilder and pageBuilder.Reflow then
 			pageBuilder:Reflow()
 		end
 	end
 
 	local function RequestEquipmentPageRedraw(reason)
+		if not IsEquipmentPageActive() then
+			return
+		end
 		if SF.Debug then
 			SF.Debug:Info("UI", "Raid Check Equipment redraw requested (%s)", tostring(reason or "unknown"))
 		end
@@ -538,7 +551,6 @@ local function BuildEquipmentPage(panel)
 		elseif pageBuilder and pageBuilder.Refresh then
 			pageBuilder:Refresh()
 		end
-		ReflowEquipmentPage()
 	end
 
 	local function ScheduleManualRefreshFollowUps(reason)
@@ -789,15 +801,24 @@ local function BuildEquipmentPage(panel)
 			if C_Timer and C_Timer.After then
 				C_Timer.After(EQUIPMENT_REFRESH_DEBOUNCE_SECONDS, function()
 					refreshAuditTableLaterPending = false
+					if not IsEquipmentPageActive() then
+						return
+					end
 					RefreshAuditTable()
 				end)
 				return
 			end
 			refreshAuditTableLaterPending = false
+			if not IsEquipmentPageActive() then
+				return
+			end
 			RefreshAuditTable()
 		end
 
 		RefreshAuditTable = function()
+			if not IsEquipmentPageActive() then
+				return
+			end
 			if isRefreshingAuditTable then
 				pendingAuditTableRefresh = true
 				return
@@ -956,7 +977,7 @@ local function BuildEquipmentPage(panel)
 			panel.__sfEquipmentListenerKey = panel
 			SF.RaidCheck:RegisterTroubleshootingListener(panel.__sfEquipmentListenerKey, function()
 				local now = GetTime and GetTime() or 0
-				if IsEquipmentAutoRefreshEnabled() or now <= manualRefreshUntil then
+				if IsEquipmentPageActive() and (IsEquipmentAutoRefreshEnabled() or now <= manualRefreshUntil) then
 					if SF.Debug then
 						SF.Debug:Verbose("UI", "Raid Check Equipment listener scheduling refresh (auto=%s manualWindow=%s)", tostring(IsEquipmentAutoRefreshEnabled()), tostring(now <= manualRefreshUntil))
 					end
