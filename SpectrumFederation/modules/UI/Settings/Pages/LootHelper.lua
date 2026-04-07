@@ -840,7 +840,7 @@ local function BuildEquipmentPage(panel)
 		local isRefreshingAuditTable = false
 		local pendingAuditTableRefresh = false
 		local refreshAuditTableLaterPending = false
-		local lastRenderedSnapshotVersion = nil
+		local lastRenderedSnapshotVersion = -1
 		local lastLayoutState = nil
 
 		local function ApplyHorizontalScrollOffset(value)
