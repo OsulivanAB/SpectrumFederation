@@ -1270,6 +1270,55 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					end,
 					maxLetters = 24,
 				},
+				{ type = "spacer", height = 12 },
+				{ type = "heading", text = "RC Loot Council (v1)" },
+				{
+					type = "checkbox",
+					label = "Enable RC Loot Council",
+					adminOnly = true,
+					tooltip = "Listen for RC Loot Council award announcements and decrement points when the configured roll type wins an item.",
+					enabled = function() return ProfileActionsEnabled() end,
+					get = function()
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.GetRCLootCouncilEnabled) == "function" then
+							return profile:GetRCLootCouncilEnabled()
+						end
+						return false
+					end,
+					set = function(value)
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.SetRCLootCouncilEnabled) == "function" then
+							profile:SetRCLootCouncilEnabled(value and true or false)
+						end
+					end,
+				},
+				{
+					type = "editbox",
+					label = "RC Roll Type",
+					adminOnly = true,
+					tooltip = "Exact RC Loot Council award reason to listen for, such as Minor Upgrade or Main Spec.",
+					enabled = function()
+						local profile = GetActiveProfileObject(store)
+						return ProfileActionsEnabled()
+							and profile
+							and type(profile.GetRCLootCouncilEnabled) == "function"
+							and profile:GetRCLootCouncilEnabled()
+					end,
+					get = function()
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.GetRCLootCouncilRollType) == "function" then
+							return profile:GetRCLootCouncilRollType()
+						end
+						return ""
+					end,
+					set = function(value)
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.SetRCLootCouncilRollType) == "function" then
+							profile:SetRCLootCouncilRollType(value)
+						end
+					end,
+					maxLetters = 48,
+				},
 				{
 					type = "button",
 					label = "Reset Current Profile",

@@ -1,6 +1,190 @@
 -- Grab the namespace
 local addonName, SF = ...
 
+local RC_AWARD_EVENT_WINDOW_SECONDS = 5
+local RC_AWARD_CHAT_EVENTS = {
+    "CHAT_MSG_RAID",
+    "CHAT_MSG_RAID_LEADER",
+    "CHAT_MSG_PARTY",
+    "CHAT_MSG_PARTY_LEADER",
+    "CHAT_MSG_INSTANCE_CHAT",
+    "CHAT_MSG_INSTANCE_CHAT_LEADER",
+    "CHAT_MSG_GUILD",
+    "CHAT_MSG_OFFICER",
+    "CHAT_MSG_SAY",
+    "CHAT_MSG_YELL",
+}
+
+local function TrimText(value)
+    return tostring(value or ""):match("^%s*(.-)%s*$")
+end
+
+local function NormalizeRCLootCouncilAwardReason(reasonText)
+    local reason = TrimText(reasonText)
+    reason = reason:gsub("[!%.%s]+$", "")
+    return reason
+end
+
+local function ExtractRCAwardItemLink(message)
+    if type(message) ~= "string" or message == "" then
+        return nil
+    end
+
+    return message:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+end
+
+local function FindProfileMemberIdByName(profile, winnerName)
+    winnerName = TrimText(winnerName)
+    local getMemberIds = profile.GetMemberIds or profile.getMemberIds
+    if winnerName == "" or type(profile) ~= "table" or type(getMemberIds) ~= "function" then
+        return nil
+    end
+
+    local normalizedWinner = SF.NameUtil and SF.NameUtil.NormalizeNameRealm and SF.NameUtil.NormalizeNameRealm(winnerName) or winnerName
+    for _, memberId in ipairs(getMemberIds(profile) or {}) do
+        if SF.NameUtil and SF.NameUtil.SamePlayer and normalizedWinner and SF.NameUtil.SamePlayer(memberId, normalizedWinner) then
+            return memberId
+        end
+    end
+
+    local winnerShort = winnerName:match("^([^%-]+)")
+    if not winnerShort then
+        return nil
+    end
+    winnerShort = winnerShort:lower()
+
+    local matchedId = nil
+    for _, memberId in ipairs(getMemberIds(profile) or {}) do
+        local shortName = tostring(memberId):match("^([^%-]+)")
+        if shortName and shortName:lower() == winnerShort then
+            if matchedId then
+                return nil
+            end
+            matchedId = memberId
+        end
+    end
+
+    return matchedId
+end
+
+local function ParseRCAwardMessage(message)
+    local itemLink = ExtractRCAwardItemLink(message)
+    if not itemLink then
+        return nil
+    end
+
+    local awardPrefix = " was awarded with "
+    local prefixStart = message:find(awardPrefix, 1, true)
+    local itemStart, itemEnd = message:find(itemLink, 1, true)
+    if not prefixStart or not itemStart or prefixStart >= itemStart then
+        return nil
+    end
+
+    local winnerName = TrimText(message:sub(1, prefixStart - 1))
+    local afterItem = message:sub(itemEnd + 1)
+    local reasonPos = afterItem:find(" for ", 1, true)
+    if not reasonPos then
+        return nil
+    end
+
+    local reasonText = NormalizeRCLootCouncilAwardReason(afterItem:sub(reasonPos + 5))
+    if winnerName == "" or reasonText == "" then
+        return nil
+    end
+
+    return {
+        winnerName = winnerName,
+        itemLink = itemLink,
+        reasonText = reasonText,
+    }
+end
+
+function SF:HandleRCLootCouncilAwardMessage(message, chatEvent)
+    if not self.lootHelperDB or not self.lootHelperDB.enabled then
+        return
+    end
+
+    local profile = self:GetActiveProfile()
+    if not profile or type(profile.GetRCLootCouncilEnabled) ~= "function" or not profile:GetRCLootCouncilEnabled() then
+        return
+    end
+
+    if not profile.IsCurrentUserAdmin or not profile:IsCurrentUserAdmin() then
+        return
+    end
+
+    local rollType = type(profile.GetRCLootCouncilRollType) == "function" and profile:GetRCLootCouncilRollType() or ""
+    if rollType == "" then
+        return
+    end
+
+    local parsed = ParseRCAwardMessage(message)
+    if not parsed then
+        return
+    end
+
+    if NormalizeRCLootCouncilAwardReason(parsed.reasonText):lower() ~= rollType:lower() then
+        return
+    end
+
+    local memberId = FindProfileMemberIdByName(profile, parsed.winnerName)
+    if not memberId then
+        if SF.Debug then
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award with unmatched winner '%s'", tostring(parsed.winnerName))
+        end
+        return
+    end
+
+    self._rcLootCouncilRecentAwards = self._rcLootCouncilRecentAwards or {}
+    local now = GetTime and GetTime() or 0
+    local signature = table.concat({ tostring(memberId), tostring(parsed.itemLink), tostring(rollType) }, "\031")
+    local lastSeen = self._rcLootCouncilRecentAwards[signature]
+    if lastSeen and (now - lastSeen) < RC_AWARD_EVENT_WINDOW_SECONDS then
+        return
+    end
+    self._rcLootCouncilRecentAwards[signature] = now
+
+    local getMemberByID = profile.GetMemberByID or profile.getMemberByID
+    local member = getMemberByID and getMemberByID(profile, memberId) or nil
+    if not member or type(member.DecrementPoints) ~= "function" then
+        return
+    end
+
+    local ok = member:DecrementPoints({
+        reason = "RC_LOOT_COUNCIL",
+        source = "RCLootCouncil",
+        rollType = rollType,
+        itemLink = parsed.itemLink,
+    })
+
+    if ok and SF.Debug then
+        SF.Debug:Info(
+            "RC_LOOT_COUNCIL",
+            "Processed RC award from %s for %s (%s)",
+            tostring(chatEvent or "unknown"),
+            tostring(memberId),
+            tostring(parsed.itemLink)
+        )
+    end
+end
+
+function SF:InitRCLootCouncilListener()
+    if self._rcLootCouncilFrame then
+        return
+    end
+
+    local frame = CreateFrame("Frame")
+    self._rcLootCouncilFrame = frame
+
+    for _, eventName in ipairs(RC_AWARD_CHAT_EVENTS) do
+        frame:RegisterEvent(eventName)
+    end
+
+    frame:SetScript("OnEvent", function(_, event, message)
+        self:HandleRCLootCouncilAwardMessage(message, event)
+    end)
+end
+
 -- Database Initialization for Loot Helper Module
 -- @return: none
 function SF:InitializeLootHelperDatabase()
@@ -57,6 +241,8 @@ function SF:InitializeLootHelperDatabase()
 	if SF.LootHelperWindow and SF.LootHelperWindow.Controller and SF.LootHelperWindow.Controller.Init then
 		SF.LootHelperWindow.Controller:Init()
 	end
+
+    SF:InitRCLootCouncilListener()
 end
 
 -- Migrate legacy schema to profileId-based canonical schema

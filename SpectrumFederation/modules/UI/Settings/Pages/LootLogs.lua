@@ -186,10 +186,15 @@ local function BuildActionText(eventType, data, author)
 
 	if eventType == "POINT_CHANGE" then
 		local isRaidCheck = (data.reason == "RAID_CHECK") or (author == "Raid Check")
+		local isRCLootCouncil = (data.reason == "RC_LOOT_COUNCIL") or (data.source == "RCLootCouncil")
 		if isRaidCheck and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
 			return "Raid Check prepared (+1)"
 		elseif isRaidCheck then
 			return string.format("Raid Check change (%s)", FormatLabel(data.change or "?"))
+		elseif isRCLootCouncil and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
+			return string.format("RC Loot Council (%s)", tostring(data.rollType or "Award"))
+		elseif isRCLootCouncil then
+			return "RC Loot Council"
 		end
 
 		if data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
@@ -250,7 +255,7 @@ local function BuildLogRow(log)
 		author = ColorizeName(author),
 		member = ColorizeName(data.member),
 		action = BuildActionText(eventType, data, author),
-		item = "",
+		item = tostring(data.itemLink or data.itemName or ""),
 	}
 end
 

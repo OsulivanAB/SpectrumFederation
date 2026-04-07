@@ -47,6 +47,11 @@ local RAID_CHECK_DEFAULTS = {
 	slots = RAID_CHECK_SLOT_DEFAULTS,
 }
 
+local RC_LOOT_COUNCIL_DEFAULTS = {
+	enabled = false,
+	rollType = "",
+}
+
 local function CopyRaidCheckDefaults()
 	return {
 		enableWhispersPreRaid = RAID_CHECK_DEFAULTS.enableWhispersPreRaid,
@@ -92,7 +97,20 @@ function LootProfile:_EnsureRaidCheckConfig()
 	cfg.enableWhispersPreRaid = cfg.enableWhispersPreRaid and true or false
 	cfg.enableWhispersRaid = cfg.enableWhispersRaid and true or false
     cfg.checkGemsInSockets = cfg.checkGemsInSockets ~= false
-    cfg.requireMetaGem = cfg.requireMetaGem and true or false
+	cfg.requireMetaGem = cfg.requireMetaGem and true or false
+end
+
+function LootProfile:_EnsureRCLootCouncilConfig()
+	if type(self._rcLootCouncilConfig) ~= "table" then
+		self._rcLootCouncilConfig = {
+			enabled = RC_LOOT_COUNCIL_DEFAULTS.enabled,
+			rollType = RC_LOOT_COUNCIL_DEFAULTS.rollType,
+		}
+	end
+
+	local cfg = self._rcLootCouncilConfig
+	cfg.enabled = cfg.enabled and true or false
+	cfg.rollType = tostring(cfg.rollType or ""):match("^%s*(.-)%s*$")
 end
 
 local function CopyArray(arr)
@@ -212,6 +230,10 @@ function LootProfile.new(profileName)
     instance._raidWideSafeMode = false
     instance._raidWideSafeModeOnCombat = false
     instance._raidCheckConfig = CopyRaidCheckDefaults()
+    instance._rcLootCouncilConfig = {
+		enabled = RC_LOOT_COUNCIL_DEFAULTS.enabled,
+		rollType = RC_LOOT_COUNCIL_DEFAULTS.rollType,
+	}
 
     -- Create member instance for author
     local class = SF:GetPlayerClass()
@@ -488,6 +510,16 @@ function LootProfile:GetRaidCheckConfig()
 	}
 end
 
+function LootProfile:GetRCLootCouncilEnabled()
+	self:_EnsureRCLootCouncilConfig()
+	return self._rcLootCouncilConfig.enabled and true or false
+end
+
+function LootProfile:GetRCLootCouncilRollType()
+	self:_EnsureRCLootCouncilConfig()
+	return self._rcLootCouncilConfig.rollType or ""
+end
+
 -- Function check if a Raid Check slot is enabled
 -- @param string slotKey
 -- @return boolean enabled
@@ -572,6 +604,27 @@ function LootProfile:SetRaidCheckMetaGemRequired(enabled)
     return true, nil
 end
 
+function LootProfile:SetRCLootCouncilEnabled(enabled)
+	self:_EnsureRCLootCouncilConfig()
+	if not self:IsCurrentUserAdmin() then
+		return false, "You must be an admin to change RC Loot Council settings."
+	end
+
+	self._rcLootCouncilConfig.enabled = enabled and true or false
+	return true, nil
+end
+
+function LootProfile:SetRCLootCouncilRollType(rollType)
+	self:_EnsureRCLootCouncilConfig()
+	if not self:IsCurrentUserAdmin() then
+		return false, "You must be an admin to change RC Loot Council settings."
+	end
+
+	rollType = tostring(rollType or ""):match("^%s*(.-)%s*$")
+	self._rcLootCouncilConfig.rollType = rollType
+	return true, nil
+end
+
 -- Function Get list of admin member IDs
 -- @return table adminMemberIds List of "Name-Realm" strings
 function LootProfile:getAdminMemberIds()
@@ -590,6 +643,13 @@ function LootProfile:getMemberIds()
     end
     table.sort(out)
     return out
+end
+
+function LootProfile:GetMemberIds()
+	if self.getMemberIds then
+		return self:getMemberIds()
+	end
+	return {}
 end
 
 -- Function Get member by their ID
@@ -1048,7 +1108,7 @@ function LootProfile:ExportSnapshot()
         end
     end
 
-    return {
+	return {
         version         = PROFILE_SNAPSHOT_VERSION,
         meta            = self:ExportMeta(),
 		adminUsers      = CopyArray(self._adminUsers),
@@ -1056,6 +1116,10 @@ function LootProfile:ExportSnapshot()
 		members         = membersOut,
 		pointName       = self._pointName or "Points",
 		raidCheck       = self:GetRaidCheckConfig(),
+		rcLootCouncil   = {
+			enabled = self:GetRCLootCouncilEnabled(),
+			rollType = self:GetRCLootCouncilRollType(),
+		},
 	}
 end
 
@@ -1115,6 +1179,13 @@ function LootProfile.ValidateSnapshot(snapshot)
 
 		if snapshot.raidCheck.slots ~= nil and type(snapshot.raidCheck.slots) ~= "table" then
 			return false, "snapshot.raidCheck.slots must be a table when provided"
+		end
+	end
+
+	if snapshot.rcLootCouncil ~= nil then
+		if type(snapshot.rcLootCouncil) ~= "table" then return false, "snapshot.rcLootCouncil must be a table or nil" end
+		if snapshot.rcLootCouncil.rollType ~= nil and type(snapshot.rcLootCouncil.rollType) ~= "string" then
+			return false, "snapshot.rcLootCouncil.rollType must be a string when provided"
 		end
 	end
 
@@ -1214,6 +1285,18 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	end
 
 	self:_EnsureRaidCheckConfig()
+
+	if type(snapshot.rcLootCouncil) == "table" then
+		self:_EnsureRCLootCouncilConfig()
+		if snapshot.rcLootCouncil.enabled ~= nil then
+			self._rcLootCouncilConfig.enabled = snapshot.rcLootCouncil.enabled and true or false
+		end
+		if snapshot.rcLootCouncil.rollType ~= nil then
+			self._rcLootCouncilConfig.rollType = tostring(snapshot.rcLootCouncil.rollType or ""):match("^%s*(.-)%s*$")
+		end
+	end
+
+	self:_EnsureRCLootCouncilConfig()
 
 	-- Merge Logs
 	local inserted = self:MergeLogTables(snapshot.lootLogs, opts)
