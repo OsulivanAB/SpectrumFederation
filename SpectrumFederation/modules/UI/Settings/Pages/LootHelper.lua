@@ -1023,8 +1023,6 @@ local function BuildEquipmentPage(panel)
 						knownSlotCount = knownSlotCount + rowKnownCount
 						issueSlotCount = issueSlotCount + rowIssueCount
 						dataRow.__sfSignature = rowSignature
-					elseif SF.Debug then
-						SF.Debug:Verbose("UI", "Raid Check Equipment row unchanged for %s", tostring(rowData.id or rowData.name or "?"))
 					end
 					dataRow:Show()
 				end
