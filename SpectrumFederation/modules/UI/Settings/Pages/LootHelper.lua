@@ -342,6 +342,8 @@ local function BuildAuditSlotSignature(slotData)
 		return "nil"
 	end
 
+	-- Keep the signature compact so the Equipment page can cheaply detect
+	-- whether a specific rendered cell actually changed.
 	return table.concat({
 		tostring(slotData.key or slotData.label or "?"),
 		GetAuditDebugItemToken(slotData.link),
@@ -364,6 +366,8 @@ local function BuildAuditRowSignature(rowData)
 		return "nil"
 	end
 
+	-- The row signature lets the page skip rebuilding unchanged rows while
+	-- still reacting immediately to slot, ilvl, or inspect-status changes.
 	local parts = {
 		tostring(rowData.id or rowData.name or "?"),
 		tostring(rowData.displayName or rowData.name or "?"),
@@ -1085,9 +1089,11 @@ local function BuildEquipmentPage(panel)
 			panel.__sfEquipmentListenerKey = panel
 			SF.RaidCheck:RegisterTroubleshootingListener(panel.__sfEquipmentListenerKey, function()
 				local now = GetTime and GetTime() or 0
-				if IsEquipmentPageActive() and (IsEquipmentAutoRefreshEnabled() or now <= manualRefreshUntil) then
+				local autoRefreshEnabled = IsEquipmentAutoRefreshEnabled()
+				local manualWindowActive = now <= manualRefreshUntil
+				if IsEquipmentPageActive() and (autoRefreshEnabled or manualWindowActive) then
 					if SF.Debug then
-						SF.Debug:Verbose("UI", "Raid Check Equipment listener scheduling refresh (auto=%s manualWindow=%s)", tostring(IsEquipmentAutoRefreshEnabled()), tostring(now <= manualRefreshUntil))
+						SF.Debug:Verbose("UI", "Raid Check Equipment listener scheduling refresh (auto=%s manualWindow=%s)", tostring(autoRefreshEnabled), tostring(manualWindowActive))
 					end
 					ScheduleRefreshAuditTable()
 				end

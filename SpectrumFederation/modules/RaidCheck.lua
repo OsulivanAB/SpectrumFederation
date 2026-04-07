@@ -350,6 +350,8 @@ local function CalculateAverageItemLevel(slotsByInventory)
 	return total / count
 end
 
+-- Collapse the raid check config into a stable cache key so prepared slot
+-- results can be reused until the profile settings actually change.
 local function BuildTroubleshootingConfigSignature(cfg)
 	if type(cfg) ~= "table" then
 		return "none"
@@ -481,6 +483,9 @@ function RC:_GetLocalTroubleshootingSnapshot()
 		return state.localSnapshot
 	end
 
+	-- Cache the player snapshot until gear, profile state, or a manual refresh
+	-- invalidates it. This avoids repeating full live inventory scans on every
+	-- Equipment page redraw.
 	local captured = CaptureTroubleshootingInventory("player")
 	state.localSnapshot = {
 		averageItemLevel = captured.averageItemLevel,
@@ -732,6 +737,8 @@ function RC:_ProcessInspectQueue()
 
 	while state.queueHead <= #state.queue do
 		local item = state.queue[state.queueHead]
+		-- Keep the numeric keys dense until the queue drains so `#state.queue`
+		-- continues to reflect the tail correctly while we advance queueHead.
 		state.queue[state.queueHead] = false
 		state.queueHead = state.queueHead + 1
 		if item and item.key then
@@ -756,11 +763,12 @@ function RC:_ProcessInspectQueue()
 
 			NotifyInspect(unit)
 			if C_Timer and C_Timer.After then
+				local handleInspectTimeout = self._HandleInspectTimeout
 				C_Timer.After(INSPECT_REQUEST_TIMEOUT_SECONDS, function()
 					-- The active-request guard in _HandleInspectTimeout ignores stale callbacks
 					-- once INSPECT_READY advances the queue or a newer request replaces this one.
-					if SF and SF.RaidCheck and SF.RaidCheck._HandleInspectTimeout then
-						SF.RaidCheck:_HandleInspectTimeout(item.key, now)
+					if handleInspectTimeout then
+						handleInspectTimeout(self, item.key, now)
 					end
 				end)
 			end
@@ -941,11 +949,6 @@ local function EvaluateSnapshot(slotsByInventory, cfg)
 	return missing
 end
 
-local function EvaluateUnit(unit, cfg)
-	local captured = CaptureTroubleshootingInventory(unit)
-	return EvaluateSnapshot(captured.slotsByInventory, cfg)
-end
-
 local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlot, isKnown)
 	local inventorySlot = column and column.inventorySlot
 	local slotKey = column and column.key
@@ -1005,6 +1008,8 @@ local function BuildTroubleshootingSlots(inspectState, cfg)
 	end
 
 	if cacheHolder and isKnown then
+		-- Remote inspect snapshots and the cached local-player snapshot can both
+		-- reuse slot audit results until their source data or profile settings change.
 		cacheHolder.preparedSlotsByConfig = cacheHolder.preparedSlotsByConfig or {}
 		cachedBaseSlots = cacheHolder.preparedSlotsByConfig[configSignature]
 		if not cachedBaseSlots then
