@@ -2,6 +2,8 @@
 local addonName, SF = ...
 
 local RC_AWARD_EVENT_WINDOW_SECONDS = 5
+local RC_LOOT_COUNCIL_AUTHOR = "RC Loot Council"
+local RC_LOOT_COUNCIL_SOURCE = "RCLootCouncil"
 local RC_AWARD_CHAT_EVENTS = {
     "CHAT_MSG_RAID",
     "CHAT_MSG_RAID_LEADER",
@@ -13,6 +15,32 @@ local RC_AWARD_CHAT_EVENTS = {
     "CHAT_MSG_OFFICER",
     "CHAT_MSG_SAY",
     "CHAT_MSG_YELL",
+}
+
+local RC_EQUIP_LOC_TO_ARMOR_SLOTS = {
+    INVTYPE_HEAD = { "Head" },
+    INVTYPE_NECK = { "Neck" },
+    INVTYPE_SHOULDER = { "Shoulder" },
+    INVTYPE_CLOAK = { "Back" },
+    INVTYPE_CHEST = { "Chest" },
+    INVTYPE_ROBE = { "Chest" },
+    INVTYPE_WRIST = { "Bracers" },
+    INVTYPE_HAND = { "Hands" },
+    INVTYPE_WAIST = { "Belt" },
+    INVTYPE_LEGS = { "Pants" },
+    INVTYPE_FEET = { "Boots" },
+    INVTYPE_FINGER = { "Ring1", "Ring2" },
+    INVTYPE_TRINKET = { "Trinket1", "Trinket2" },
+    INVTYPE_SHIELD = { "OffHand" },
+    INVTYPE_HOLDABLE = { "OffHand" },
+    INVTYPE_WEAPONOFFHAND = { "OffHand" },
+    INVTYPE_WEAPON = { "Weapon", "OffHand" },
+    INVTYPE_WEAPONMAINHAND = { "Weapon" },
+    INVTYPE_2HWEAPON = { "Weapon" },
+    INVTYPE_RANGED = { "Weapon" },
+    INVTYPE_RANGEDRIGHT = { "Weapon" },
+    INVTYPE_THROWN = { "Weapon" },
+    INVTYPE_RELIC = { "OffHand" },
 }
 
 local function TrimText(value)
@@ -99,73 +127,191 @@ local function ParseRCAwardMessage(message)
     }
 end
 
-function SF:HandleRCLootCouncilAwardMessage(message, chatEvent)
+local function ResolveRCLootCouncilAwardSlots(itemLink)
+    if type(itemLink) ~= "string" or itemLink == "" or type(GetItemInfoInstant) ~= "function" then
+        return nil, nil
+    end
+
+    local _, _, _, equipLoc = GetItemInfoInstant(itemLink)
+    local slots = equipLoc and RC_EQUIP_LOC_TO_ARMOR_SLOTS[equipLoc] or nil
+    return slots, equipLoc
+end
+
+local function SelectAvailableAwardSlot(member, slotCandidates)
+    if type(member) ~= "table" or type(slotCandidates) ~= "table" then
+        return nil
+    end
+
+    local armor = type(member.GetArmorStatuses) == "function" and member:GetArmorStatuses() or member.armor
+    if type(armor) ~= "table" then
+        return nil
+    end
+
+    for _, slotName in ipairs(slotCandidates) do
+        if armor[slotName] == false then
+            return slotName
+        end
+    end
+
+    return nil
+end
+
+local function BuildRCLootCouncilAwardPayloadFromInternalMessage(session, winnerName, itemLink, rollType, status)
+    winnerName = TrimText(winnerName)
+    rollType = NormalizeRCLootCouncilAwardReason(rollType)
+    if winnerName == "" or type(itemLink) ~= "string" or itemLink == "" or rollType == "" then
+        return nil
+    end
+
+    return {
+        session = session,
+        winnerName = winnerName,
+        itemLink = itemLink,
+        rollType = rollType,
+        sourceType = "internal",
+        status = status,
+    }
+end
+
+local function BuildRCLootCouncilAwardPayloadFromChatMessage(message, chatEvent)
+    local parsed = ParseRCAwardMessage(message)
+    if not parsed then
+        return nil
+    end
+
+    return {
+        winnerName = parsed.winnerName,
+        itemLink = parsed.itemLink,
+        rollType = parsed.reasonText,
+        sourceType = "chat",
+        chatEvent = chatEvent,
+    }
+end
+
+function SF:ProcessRCLootCouncilAward(payload)
+    if type(payload) ~= "table" then
+        return false
+    end
+
     if not self.lootHelperDB or not self.lootHelperDB.enabled then
-        return
+        return false
     end
 
     local profile = self:GetActiveProfile()
     if not profile or type(profile.GetRCLootCouncilEnabled) ~= "function" or not profile:GetRCLootCouncilEnabled() then
-        return
+        return false
     end
 
     if not profile.IsCurrentUserAdmin or not profile:IsCurrentUserAdmin() then
-        return
+        return false
     end
 
-    local rollType = type(profile.GetRCLootCouncilRollType) == "function" and profile:GetRCLootCouncilRollType() or ""
-    if rollType == "" then
-        return
+    local configuredRollType = type(profile.GetRCLootCouncilRollType) == "function" and profile:GetRCLootCouncilRollType() or ""
+    configuredRollType = NormalizeRCLootCouncilAwardReason(configuredRollType)
+    if configuredRollType == "" then
+        return false
     end
 
-    local parsed = ParseRCAwardMessage(message)
-    if not parsed then
-        return
+    local payloadRollType = NormalizeRCLootCouncilAwardReason(payload.rollType)
+    if payloadRollType:lower() ~= configuredRollType:lower() then
+        return false
     end
 
-    if NormalizeRCLootCouncilAwardReason(parsed.reasonText):lower() ~= rollType:lower() then
-        return
-    end
-
-    local memberId = FindProfileMemberIdByName(profile, parsed.winnerName)
+    local memberId = FindProfileMemberIdByName(profile, payload.winnerName)
     if not memberId then
         if SF.Debug then
-            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award with unmatched winner '%s'", tostring(parsed.winnerName))
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award with unmatched winner '%s'", tostring(payload.winnerName))
         end
-        return
+        return false
     end
 
     self._rcLootCouncilRecentAwards = self._rcLootCouncilRecentAwards or {}
     local now = GetTime and GetTime() or 0
-    local signature = table.concat({ tostring(memberId), tostring(parsed.itemLink), tostring(rollType) }, "\031")
+    local signature = table.concat({ tostring(memberId), tostring(payload.itemLink), tostring(configuredRollType) }, "\031")
     local lastSeen = self._rcLootCouncilRecentAwards[signature]
     if lastSeen and (now - lastSeen) < RC_AWARD_EVENT_WINDOW_SECONDS then
-        return
+        return false
     end
-    self._rcLootCouncilRecentAwards[signature] = now
 
     local getMemberByID = profile.GetMemberByID or profile.getMemberByID
     local member = getMemberByID and getMemberByID(profile, memberId) or nil
-    if not member or type(member.DecrementPoints) ~= "function" then
-        return
+    if not member or type(member.ApplyAwardedItem) ~= "function" then
+        return false
     end
 
-    local ok = member:DecrementPoints({
+    local slotCandidates, equipLoc = ResolveRCLootCouncilAwardSlots(payload.itemLink)
+    local slotName = SelectAvailableAwardSlot(member, slotCandidates)
+    if not slotName then
+        -- TODO: Use the actual equipped slot if a future RCMLAwardSuccess payload exposes it.
+        if SF.Debug then
+            SF.Debug:Warn(
+                "RC_LOOT_COUNCIL",
+                "Unable to resolve an available slot for %s (equipLoc=%s, item=%s)",
+                tostring(memberId),
+                tostring(equipLoc),
+                tostring(payload.itemLink)
+            )
+        end
+        return false
+    end
+
+    local ok = member:ApplyAwardedItem(slotName, {
+        logAuthor = RC_LOOT_COUNCIL_AUTHOR,
         reason = "RC_LOOT_COUNCIL",
-        source = "RCLootCouncil",
-        rollType = rollType,
-        itemLink = parsed.itemLink,
+        source = RC_LOOT_COUNCIL_SOURCE,
+        rollType = configuredRollType,
+        itemLink = payload.itemLink,
     })
 
-    if ok and SF.Debug then
-        SF.Debug:Info(
-            "RC_LOOT_COUNCIL",
-            "Processed RC award from %s for %s (%s)",
-            tostring(chatEvent or "unknown"),
-            tostring(memberId),
-            tostring(parsed.itemLink)
-        )
+    if ok then
+        self._rcLootCouncilRecentAwards[signature] = now
+        if SF.Debug then
+            SF.Debug:Info(
+                "RC_LOOT_COUNCIL",
+                "Processed RC award via %s for %s (%s -> %s)",
+                tostring(payload.sourceType or "unknown"),
+                tostring(memberId),
+                tostring(payload.itemLink),
+                tostring(slotName)
+            )
+        end
     end
+
+    return ok
+end
+
+function SF:HandleRCLootCouncilAwardMessage(message, chatEvent)
+    -- TODO: Support custom RC awardText templates in the chat fallback path.
+    local payload = BuildRCLootCouncilAwardPayloadFromChatMessage(message, chatEvent)
+    if payload then
+        self:ProcessRCLootCouncilAward(payload)
+    end
+end
+
+function SF:TryHookRCLootCouncilIntegration()
+    if self._rcLootCouncilHooked then
+        return true
+    end
+
+    local rcLootCouncil = _G and _G.RCLootCouncil
+    if type(rcLootCouncil) ~= "table" or type(rcLootCouncil.SendMessage) ~= "function" then
+        return false
+    end
+
+    hooksecurefunc(rcLootCouncil, "SendMessage", function(_, messageName, ...)
+        if messageName ~= "RCMLAwardSuccess" then
+            return
+        end
+
+        local session, winner, status, itemLink, responseText = ...
+        local payload = BuildRCLootCouncilAwardPayloadFromInternalMessage(session, winner, itemLink, responseText, status)
+        if payload then
+            self:ProcessRCLootCouncilAward(payload)
+        end
+    end)
+
+    self._rcLootCouncilHooked = true
+    return true
 end
 
 function SF:InitRCLootCouncilListener()
@@ -179,10 +325,22 @@ function SF:InitRCLootCouncilListener()
     for _, eventName in ipairs(RC_AWARD_CHAT_EVENTS) do
         frame:RegisterEvent(eventName)
     end
+    frame:RegisterEvent("ADDON_LOADED")
 
-    frame:SetScript("OnEvent", function(_, event, message)
+    frame:SetScript("OnEvent", function(_, event, ...)
+        if event == "ADDON_LOADED" then
+            local loadedAddon = ...
+            if loadedAddon == "RCLootCouncil" then
+                self:TryHookRCLootCouncilIntegration()
+            end
+            return
+        end
+
+        local message = ...
         self:HandleRCLootCouncilAwardMessage(message, event)
     end)
+
+    self:TryHookRCLootCouncilIntegration()
 end
 
 -- Database Initialization for Loot Helper Module
