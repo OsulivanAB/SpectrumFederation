@@ -2,6 +2,8 @@
 local addonName, SF = ...
 
 local RC_AWARD_EVENT_WINDOW_SECONDS = 5
+local RC_AWARD_ITEMINFO_RETRY_DELAY_SECONDS = 1
+local RC_AWARD_ITEMINFO_MAX_RETRIES = 2
 local RC_LOOT_COUNCIL_AUTHOR = "RC Loot Council"
 local RC_LOOT_COUNCIL_SOURCE = "RCLootCouncil"
 local RC_AWARD_CHAT_EVENTS = {
@@ -138,12 +140,47 @@ end
 
 local function ResolveRCLootCouncilAwardSlots(itemLink)
     if type(itemLink) ~= "string" or itemLink == "" or type(GetItemInfoInstant) ~= "function" then
-        return nil, nil
+        return nil, nil, false
     end
 
     local _, _, _, equipLoc = GetItemInfoInstant(itemLink)
+    if not equipLoc then
+        if type(GetItemInfo) == "function" then
+            GetItemInfo(itemLink)
+        end
+        return nil, nil, true
+    end
+
     local slots = equipLoc and RC_EQUIP_LOC_TO_ARMOR_SLOTS[equipLoc] or nil
-    return slots, equipLoc
+    return slots, equipLoc, false
+end
+
+local function ClonePayload(payload)
+    local copy = {}
+    for key, value in pairs(payload or {}) do
+        copy[key] = value
+    end
+    return copy
+end
+
+local function ScheduleRCLootCouncilAwardRetry(self, payload)
+    if not (C_Timer and C_Timer.After) then
+        return false
+    end
+
+    local retryCount = tonumber(payload.retryCount) or 0
+    if retryCount >= RC_AWARD_ITEMINFO_MAX_RETRIES then
+        return false
+    end
+
+    local retryPayload = ClonePayload(payload)
+    retryPayload.retryCount = retryCount + 1
+
+    C_Timer.After(RC_AWARD_ITEMINFO_RETRY_DELAY_SECONDS, function()
+        self:ProcessRCLootCouncilAward(retryPayload)
+    end)
+
+    return true
 end
 
 local function SelectAvailableAwardSlot(member, slotCandidates)
@@ -295,7 +332,22 @@ function SF:ProcessRCLootCouncilAward(payload)
         return false
     end
 
-    local slotCandidates, equipLoc = ResolveRCLootCouncilAwardSlots(payload.itemLink)
+    local slotCandidates, equipLoc, itemInfoPending = ResolveRCLootCouncilAwardSlots(payload.itemLink)
+    if itemInfoPending then
+        local retryScheduled = ScheduleRCLootCouncilAwardRetry(self, payload)
+        if SF.Debug then
+            SF.Debug:Warn(
+                "RC_LOOT_COUNCIL",
+                "Item info not ready for %s; retryScheduled=%s retryCount=%s item=%s",
+                tostring(memberId),
+                tostring(retryScheduled),
+                tostring((tonumber(payload.retryCount) or 0) + (retryScheduled and 1 or 0)),
+                tostring(payload.itemLink)
+            )
+        end
+        return false
+    end
+
     if SF.Debug then
         SF.Debug:Verbose(
             "RC_LOOT_COUNCIL",
