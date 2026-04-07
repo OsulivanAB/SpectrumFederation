@@ -587,7 +587,7 @@ local function BuildEquipmentPage(panel)
 			return
 		end
 		if SF.Debug then
-			SF.Debug:Info("UI", "Raid Check Equipment redraw requested (%s)", tostring(reason or "unknown"))
+			SF.Debug:Verbose("UI", "Raid Check Equipment redraw requested (%s)", tostring(reason or "unknown"))
 		end
 		if RefreshAuditTable then
 			RefreshAuditTable()
@@ -997,7 +997,7 @@ local function BuildEquipmentPage(panel)
 				local snapshotChanged = snapshotVersion ~= lastRenderedSnapshotVersion
 				local forceLayout = type(options) == "table" and options.forceLayout and true or false
 				if SF.Debug then
-					SF.Debug:Info(
+					SF.Debug:Verbose(
 						"UI",
 						"Refreshing Raid Check Equipment table with %d row(s), version=%s changed=%s forceLayout=%s",
 						#dataRows,
