@@ -41,6 +41,7 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
         if msgType == self.MSG.ADMIN_SYNC then return self:HandleAdminSync(sender, payload) end
         if msgType == self.MSG.ADMIN_STATUS then return self:HandleAdminStatus(sender, payload) end
         if msgType == self.MSG.LOG_REQ then return self:HandleLogRequest(sender, payload) end
+        if msgType == self.MSG.RC_AWARD_WARNING then return self:HandleRCAwardWarning(sender, payload) end
 
         if msgType == self.MSG.SES_START then return self:HandleSessionStart(sender, payload) end
         if msgType == self.MSG.HAVE_PROFILE then return self:HandleHaveProfile(sender, payload) end
@@ -135,4 +136,3 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
 
     return r1, r2
 end
-

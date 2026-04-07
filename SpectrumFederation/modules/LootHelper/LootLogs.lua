@@ -42,6 +42,10 @@ local EVENT_DATA_TEMPLATES = {
         member  = "",
         slot    = "",
         action  = ""
+        -- @field source string|nil Integration name
+        -- @field reason string|nil Machine-readable reason
+        -- @field rollType string|nil Upstream response text
+        -- @field itemLink string|nil WoW item link
     },
     [EVENT_TYPES.ROLE_CHANGE] = {
         member  = "",

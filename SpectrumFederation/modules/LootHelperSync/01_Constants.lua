@@ -32,6 +32,7 @@ Sync.MSG = {
 
     -- Live Updates (Sequence 3)
     NEW_LOG         = "NEW_LOG",
+    RC_AWARD_WARNING= "RC_AWARD_WARNING",
 
     -- Coordinator handoff (Sequence 4)
     COORD_TAKEOVER  = "COORD_TAKEOVER",

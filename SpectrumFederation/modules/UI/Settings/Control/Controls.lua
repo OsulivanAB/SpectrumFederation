@@ -571,7 +571,11 @@ function Controls:AddCheckbox(section, opts)
 
 		cb:SetScript("OnClick", function(selfBtn)
 			if not selfBtn:IsEnabled() then return end
-			set(selfBtn:GetChecked() and true or false)
+			local value = selfBtn:GetChecked() and true or false
+			set(value)
+			if opts.onValueChanged then
+				opts.onValueChanged(value)
+			end
 		end)
 
 		EnsureCheckboxRowHeight(section, row, cb)
