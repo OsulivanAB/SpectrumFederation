@@ -539,10 +539,16 @@ function RC:EnsureInspectSupport()
 	frame:RegisterEvent("INSPECT_READY")
 	frame:RegisterEvent("GROUP_ROSTER_UPDATE")
 	frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+	frame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 	frame:RegisterEvent("UNIT_INVENTORY_CHANGED")
 	frame:SetScript("OnEvent", function(_, event, arg1)
 		if event == "INSPECT_READY" then
 			self:_HandleInspectReady(arg1)
+		elseif event == "PLAYER_EQUIPMENT_CHANGED" then
+			if SF.Debug then
+				SF.Debug:Verbose("RAID_CHECK", "PLAYER_EQUIPMENT_CHANGED fired for slot %s; notifying troubleshooting listeners", tostring(arg1))
+			end
+			self:_InvalidateInspectUnit("player")
 		elseif event == "UNIT_INVENTORY_CHANGED" then
 			self:_InvalidateInspectUnit(arg1)
 		elseif event == "PLAYER_ENTERING_WORLD" then

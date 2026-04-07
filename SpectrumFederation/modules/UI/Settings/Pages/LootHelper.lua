@@ -565,7 +565,13 @@ local function BuildEquipmentPage(panel)
 			C_Timer.After(EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_DELAY_SECONDS * attempt, function()
 				local now = GetTime and GetTime() or 0
 				if now > manualRefreshUntil then
+					if SF.Debug then
+						SF.Debug:Verbose("UI", "Skipping manual refresh follow-up %d; refresh window expired", attempt)
+					end
 					return
+				end
+				if SF.Debug then
+					SF.Debug:Verbose("UI", "Running manual refresh follow-up %d", attempt)
 				end
 				RequestEquipmentPageRedraw(string.format("%s #%d", tostring(reason or "manual refresh"), attempt))
 			end)
@@ -600,11 +606,15 @@ local function BuildEquipmentPage(panel)
 			if SF.Debug then
 				SF.Debug:Info("UI", "Refresh Snapshot clicked; manual refresh window open for %.1f seconds", EQUIPMENT_MANUAL_REFRESH_WINDOW_SECONDS)
 			end
+			RequestEquipmentPageRedraw("manual refresh button immediate")
 			if SF.RaidCheck and SF.RaidCheck.RequestTroubleshootingRefresh then
 				SF.RaidCheck:RequestTroubleshootingRefresh()
 			end
 			if C_Timer and C_Timer.After then
 				C_Timer.After(EQUIPMENT_MANUAL_REFRESH_INITIAL_DELAY_SECONDS, function()
+					if SF.Debug then
+						SF.Debug:Verbose("UI", "Running delayed manual refresh redraw after %.2f seconds", EQUIPMENT_MANUAL_REFRESH_INITIAL_DELAY_SECONDS)
+					end
 					RequestEquipmentPageRedraw("manual refresh button")
 				end)
 			else
