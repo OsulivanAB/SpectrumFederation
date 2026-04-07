@@ -665,7 +665,8 @@ function RC:_HandleInspectTimeout(key, requestedAt)
 	entry.lastAttemptAt = requestedAt
 	-- Use a short capped linear backoff so repeated failures do not hammer
 	-- NotifyInspect, while still recovering quickly once the player becomes
-	-- inspectable again.
+	-- inspectable again. The delay scales from INSPECT_RETRY_BASE_SECONDS up
+	-- to INSPECT_RETRY_MAX_SECONDS.
 	entry.nextRetryAt = now + CalculateInspectRetryDelay(failCount)
 	self:_StoreInspectCacheEntry(entry, active.aliases)
 
@@ -713,8 +714,9 @@ function RC:_HandleInspectReady(guid)
 		entry.failCount = (entry.failCount or 0) + 1
 		entry.lastAttemptAt = active.requestedAt
 		-- Use a short capped linear backoff so repeated failures do not hammer
-		-- NotifyInspect, while still recovering quickly once the player becomes
-		-- inspectable again.
+	-- NotifyInspect, while still recovering quickly once the player becomes
+	-- inspectable again. The delay scales from INSPECT_RETRY_BASE_SECONDS up
+	-- to INSPECT_RETRY_MAX_SECONDS.
 		entry.nextRetryAt = now + CalculateInspectRetryDelay(entry.failCount)
 	end
 
@@ -763,12 +765,11 @@ function RC:_ProcessInspectQueue()
 
 			NotifyInspect(unit)
 			if C_Timer and C_Timer.After then
-				local handleInspectTimeout = self._HandleInspectTimeout
 				C_Timer.After(INSPECT_REQUEST_TIMEOUT_SECONDS, function()
 					-- The active-request guard in _HandleInspectTimeout ignores stale callbacks
 					-- once INSPECT_READY advances the queue or a newer request replaces this one.
-					if handleInspectTimeout then
-						handleInspectTimeout(self, item.key, now)
+					if self and self._HandleInspectTimeout then
+						self:_HandleInspectTimeout(item.key, now)
 					end
 				end)
 			end

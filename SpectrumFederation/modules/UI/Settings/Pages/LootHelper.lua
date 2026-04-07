@@ -766,11 +766,11 @@ local function BuildEquipmentPage(panel)
 			local dataRow = CreateFrame("Frame", nil, content)
 			dataRow:SetHeight(AUDIT_ROW_HEIGHT)
 
-			local hover = dataRow:CreateTexture(nil, "BACKGROUND")
-			hover:SetAllPoints(dataRow)
-			hover:SetColorTexture(1, 1, 1, 0.06)
-			hover:Hide()
-			dataRow.Hover = hover
+			local hoverHighlight = dataRow:CreateTexture(nil, "BACKGROUND")
+			hoverHighlight:SetAllPoints(dataRow)
+			hoverHighlight:SetColorTexture(1, 1, 1, 0.06)
+			hoverHighlight:Hide()
+			dataRow.Hover = hoverHighlight
 
 			dataRow:SetScript("OnEnter", function(self)
 				self.Hover:Show()
