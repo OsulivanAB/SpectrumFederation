@@ -127,6 +127,15 @@ local function ParseRCAwardMessage(message)
     }
 end
 
+local function IsPotentialRCAwardMessage(message)
+    if type(message) ~= "string" or message == "" then
+        return false
+    end
+
+    return message:find(" was awarded with ", 1, true) ~= nil
+        and message:find(" for ", 1, true) ~= nil
+end
+
 local function ResolveRCLootCouncilAwardSlots(itemLink)
     if type(itemLink) ~= "string" or itemLink == "" or type(GetItemInfoInstant) ~= "function" then
         return nil, nil
@@ -190,30 +199,65 @@ end
 
 function SF:ProcessRCLootCouncilAward(payload)
     if type(payload) ~= "table" then
+        if SF.Debug then
+            SF.Debug:Warn("RC_LOOT_COUNCIL", "Ignored RC award payload with invalid type: %s", type(payload))
+        end
         return false
     end
 
+    if SF.Debug then
+        SF.Debug:Verbose(
+            "RC_LOOT_COUNCIL",
+            "Processing RC award payload source=%s winner=%s item=%s rollType=%s status=%s",
+            tostring(payload.sourceType or "unknown"),
+            tostring(payload.winnerName),
+            tostring(payload.itemLink),
+            tostring(payload.rollType),
+            tostring(payload.status)
+        )
+    end
+
     if not self.lootHelperDB or not self.lootHelperDB.enabled then
+        if SF.Debug then
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award because Loot Helper is disabled")
+        end
         return false
     end
 
     local profile = self:GetActiveProfile()
     if not profile or type(profile.GetRCLootCouncilEnabled) ~= "function" or not profile:GetRCLootCouncilEnabled() then
+        if SF.Debug then
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award because RC Loot Council sync is disabled for the active profile")
+        end
         return false
     end
 
     if not profile.IsCurrentUserAdmin or not profile:IsCurrentUserAdmin() then
+        if SF.Debug then
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award because current user is not an admin for the active profile")
+        end
         return false
     end
 
     local configuredRollType = type(profile.GetRCLootCouncilRollType) == "function" and profile:GetRCLootCouncilRollType() or ""
     configuredRollType = NormalizeRCLootCouncilAwardReason(configuredRollType)
     if configuredRollType == "" then
+        if SF.Debug then
+            SF.Debug:Warn("RC_LOOT_COUNCIL", "Ignoring RC award because no RC roll type is configured")
+        end
         return false
     end
 
     local payloadRollType = NormalizeRCLootCouncilAwardReason(payload.rollType)
     if payloadRollType:lower() ~= configuredRollType:lower() then
+        if SF.Debug then
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Ignoring RC award because payload roll type '%s' does not match configured '%s'",
+                tostring(payloadRollType),
+                tostring(configuredRollType)
+            )
+        end
         return false
     end
 
@@ -230,16 +274,37 @@ function SF:ProcessRCLootCouncilAward(payload)
     local signature = table.concat({ tostring(memberId), tostring(payload.itemLink), tostring(configuredRollType) }, "\031")
     local lastSeen = self._rcLootCouncilRecentAwards[signature]
     if lastSeen and (now - lastSeen) < RC_AWARD_EVENT_WINDOW_SECONDS then
+        if SF.Debug then
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Suppressing duplicate RC award for %s item=%s rollType=%s",
+                tostring(memberId),
+                tostring(payload.itemLink),
+                tostring(configuredRollType)
+            )
+        end
         return false
     end
 
     local getMemberByID = profile.GetMemberByID or profile.getMemberByID
     local member = getMemberByID and getMemberByID(profile, memberId) or nil
     if not member or type(member.ApplyAwardedItem) ~= "function" then
+        if SF.Debug then
+            SF.Debug:Warn("RC_LOOT_COUNCIL", "Unable to apply RC award because member object is unavailable for %s", tostring(memberId))
+        end
         return false
     end
 
     local slotCandidates, equipLoc = ResolveRCLootCouncilAwardSlots(payload.itemLink)
+    if SF.Debug then
+        SF.Debug:Verbose(
+            "RC_LOOT_COUNCIL",
+            "Resolved RC item %s to equipLoc=%s slotCandidates=%s",
+            tostring(payload.itemLink),
+            tostring(equipLoc),
+            slotCandidates and table.concat(slotCandidates, ",") or "nil"
+        )
+    end
     local slotName = SelectAvailableAwardSlot(member, slotCandidates)
     if not slotName then
         -- TODO: Use the actual equipped slot if a future RCMLAwardSuccess payload exposes it.
@@ -275,6 +340,14 @@ function SF:ProcessRCLootCouncilAward(payload)
                 tostring(slotName)
             )
         end
+    elseif SF.Debug then
+        SF.Debug:Warn(
+            "RC_LOOT_COUNCIL",
+            "Member award application failed for %s (%s -> %s)",
+            tostring(memberId),
+            tostring(payload.itemLink),
+            tostring(slotName)
+        )
     end
 
     return ok
@@ -284,7 +357,24 @@ function SF:HandleRCLootCouncilAwardMessage(message, chatEvent)
     -- TODO: Support custom RC awardText templates in the chat fallback path.
     local payload = BuildRCLootCouncilAwardPayloadFromChatMessage(message, chatEvent)
     if payload then
+        if SF.Debug then
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Parsed RC award from chat event=%s winner=%s item=%s rollType=%s",
+                tostring(chatEvent),
+                tostring(payload.winnerName),
+                tostring(payload.itemLink),
+                tostring(payload.rollType)
+            )
+        end
         self:ProcessRCLootCouncilAward(payload)
+    elseif SF.Debug and IsPotentialRCAwardMessage(message) then
+        SF.Debug:Verbose(
+            "RC_LOOT_COUNCIL",
+            "Saw possible RC award chat message but could not parse it from %s: %s",
+            tostring(chatEvent),
+            tostring(message)
+        )
     end
 end
 
@@ -295,6 +385,9 @@ function SF:TryHookRCLootCouncilIntegration()
 
     local rcLootCouncil = _G and _G.RCLootCouncil
     if type(rcLootCouncil) ~= "table" or type(rcLootCouncil.SendMessage) ~= "function" then
+        if SF.Debug then
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "RCLootCouncil SendMessage hook not available yet")
+        end
         return false
     end
 
@@ -304,13 +397,36 @@ function SF:TryHookRCLootCouncilIntegration()
         end
 
         local session, winner, status, itemLink, responseText = ...
+        if SF.Debug then
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Received RCMLAwardSuccess session=%s winner=%s status=%s item=%s response=%s",
+                tostring(session),
+                tostring(winner),
+                tostring(status),
+                tostring(itemLink),
+                tostring(responseText)
+            )
+        end
         local payload = BuildRCLootCouncilAwardPayloadFromInternalMessage(session, winner, itemLink, responseText, status)
         if payload then
             self:ProcessRCLootCouncilAward(payload)
+        elseif SF.Debug then
+            SF.Debug:Warn(
+                "RC_LOOT_COUNCIL",
+                "Failed to build RC internal payload session=%s winner=%s item=%s response=%s",
+                tostring(session),
+                tostring(winner),
+                tostring(itemLink),
+                tostring(responseText)
+            )
         end
     end)
 
     self._rcLootCouncilHooked = true
+    if SF.Debug then
+        SF.Debug:Info("RC_LOOT_COUNCIL", "Hooked into RCLootCouncil SendMessage")
+    end
     return true
 end
 
@@ -331,6 +447,9 @@ function SF:InitRCLootCouncilListener()
         if event == "ADDON_LOADED" then
             local loadedAddon = ...
             if loadedAddon == "RCLootCouncil" then
+                if SF.Debug then
+                    SF.Debug:Info("RC_LOOT_COUNCIL", "Detected RCLootCouncil addon load")
+                end
                 self:TryHookRCLootCouncilIntegration()
             end
             return
@@ -341,6 +460,9 @@ function SF:InitRCLootCouncilListener()
     end)
 
     self:TryHookRCLootCouncilIntegration()
+    if SF.Debug then
+        SF.Debug:Info("RC_LOOT_COUNCIL", "Initialized RC Loot Council listeners")
+    end
 end
 
 -- Database Initialization for Loot Helper Module
