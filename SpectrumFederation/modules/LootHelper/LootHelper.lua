@@ -6,6 +6,8 @@ local RC_AWARD_ITEMINFO_RETRY_DELAY_SECONDS = 1
 local RC_AWARD_ITEMINFO_MAX_RETRIES = 2
 local RC_LOOT_COUNCIL_AUTHOR = "RC Loot Council"
 local RC_LOOT_COUNCIL_SOURCE = "RCLootCouncil"
+local RC_LOOT_COUNCIL_REASON = "RC_LOOT_COUNCIL"
+local RC_LOOT_COUNCIL_CONFLICT_REASON = "RC_LOOT_COUNCIL_SLOT_CONFLICT"
 local RC_AWARD_CHAT_EVENTS = {
     "CHAT_MSG_RAID",
     "CHAT_MSG_RAID_LEADER",
@@ -73,28 +75,32 @@ local function FindProfileMemberIdByName(profile, winnerName)
     local normalizedWinner = SF.NameUtil and SF.NameUtil.NormalizeNameRealm and SF.NameUtil.NormalizeNameRealm(winnerName) or winnerName
     for _, memberId in ipairs(getMemberIds(profile) or {}) do
         if SF.NameUtil and SF.NameUtil.SamePlayer and normalizedWinner and SF.NameUtil.SamePlayer(memberId, normalizedWinner) then
-            return memberId
+            return memberId, "exact", nil
         end
     end
 
     local winnerShort = winnerName:match("^([^%-]+)")
     if not winnerShort then
-        return nil
+        return nil, "not_found", nil
     end
     winnerShort = winnerShort:lower()
 
-    local matchedId = nil
+    local matches = {}
     for _, memberId in ipairs(getMemberIds(profile) or {}) do
         local shortName = tostring(memberId):match("^([^%-]+)")
         if shortName and shortName:lower() == winnerShort then
-            if matchedId then
-                return nil
-            end
-            matchedId = memberId
+            table.insert(matches, memberId)
         end
     end
 
-    return matchedId
+    if #matches == 1 then
+        return matches[1], "short_name", matches
+    end
+    if #matches > 1 then
+        return nil, "ambiguous_short_name", matches
+    end
+
+    return nil, "not_found", matches
 end
 
 local function ParseRCAwardMessage(message)
@@ -203,6 +209,89 @@ local function SelectAvailableAwardSlot(member, slotCandidates)
     return nil
 end
 
+local function JoinStringList(values)
+    if type(values) ~= "table" then
+        return ""
+    end
+
+    local items = {}
+    for _, value in ipairs(values) do
+        local text = TrimText(value)
+        if text ~= "" then
+            table.insert(items, text)
+        end
+    end
+
+    return table.concat(items, ", ")
+end
+
+local function RememberRecentWarning(cache, warningId, now)
+    if type(warningId) ~= "string" or warningId == "" then
+        return false
+    end
+
+    cache[warningId] = cache[warningId] or 0
+    if cache[warningId] > 0 and (now - cache[warningId]) < RC_AWARD_EVENT_WINDOW_SECONDS then
+        return true
+    end
+
+    cache[warningId] = now
+    return false
+end
+
+local function BroadcastRCLootCouncilAdminWarning(profile, payload)
+    if type(profile) ~= "table" or type(payload) ~= "table" then
+        return 0
+    end
+    if not (SF.LootHelperComm and SF.LootHelperSync and SF.LootHelperSync.MSG and SF.LootHelperSync.MSG.RC_AWARD_WARNING) then
+        return 0
+    end
+
+    local getAdminMemberIds = profile.GetAdminMemberIds or profile.getAdminMemberIds
+    local getProfileId = profile.GetProfileId or profile.getProfileId
+    if type(getAdminMemberIds) ~= "function" or type(getProfileId) ~= "function" then
+        return 0
+    end
+
+    local profileId = getProfileId(profile)
+    local adminIds = getAdminMemberIds(profile) or {}
+    if type(profileId) ~= "string" or profileId == "" then
+        return 0
+    end
+
+    local selfId = SF.NameUtil and SF.NameUtil.GetSelfId and SF.NameUtil.GetSelfId() or nil
+    local sentCount = 0
+    local warningPayload = ClonePayload(payload)
+    warningPayload.profileId = profileId
+
+    for _, adminId in ipairs(adminIds) do
+        if type(adminId) == "string" and adminId ~= "" then
+            local isSelf = false
+            if selfId and SF.NameUtil and SF.NameUtil.SamePlayer then
+                isSelf = SF.NameUtil.SamePlayer(adminId, selfId)
+            else
+                isSelf = adminId == selfId
+            end
+
+            if not isSelf then
+                local ok = SF.LootHelperComm:Send(
+                    "CONTROL",
+                    SF.LootHelperSync.MSG.RC_AWARD_WARNING,
+                    warningPayload,
+                    "WHISPER",
+                    adminId,
+                    "NORMAL"
+                )
+                if ok then
+                    sentCount = sentCount + 1
+                end
+            end
+        end
+    end
+
+    return sentCount
+end
+
 local function BuildRCLootCouncilAwardPayloadFromInternalMessage(session, winnerName, itemLink, rollType, status)
     winnerName = TrimText(winnerName)
     rollType = NormalizeRCLootCouncilAwardReason(rollType)
@@ -299,16 +388,45 @@ function SF:ProcessRCLootCouncilAward(payload)
         return false
     end
 
-    local memberId = FindProfileMemberIdByName(profile, payload.winnerName)
+    local now = GetTime and GetTime() or 0
+    local memberId, matchKind, matchCandidates = FindProfileMemberIdByName(profile, payload.winnerName)
     if not memberId then
+        if matchKind == "ambiguous_short_name" then
+            local warningId = table.concat({
+                tostring(payload.winnerName),
+                tostring(payload.itemLink),
+                tostring(configuredRollType),
+                "ambiguous_short_name",
+            }, "\031")
+            self._rcLootCouncilRecentWarnings = self._rcLootCouncilRecentWarnings or {}
+            if not RememberRecentWarning(self._rcLootCouncilRecentWarnings, warningId, now) then
+                local matchesText = JoinStringList(matchCandidates)
+                local warningMessage = string.format(
+                    "RC award for %s (%s) is ambiguous. Matching members: %s. Resolve it manually.",
+                    tostring(payload.winnerName),
+                    tostring(payload.itemLink),
+                    matchesText ~= "" and matchesText or "multiple short-name matches"
+                )
+                SF:PrintWarning(warningMessage)
+                BroadcastRCLootCouncilAdminWarning(profile, {
+                    warningId = warningId,
+                    message = warningMessage,
+                })
+            end
+        end
         if SF.Debug then
-            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award with unmatched winner '%s'", tostring(payload.winnerName))
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Ignoring RC award with unmatched winner '%s' (matchKind=%s matches=%s)",
+                tostring(payload.winnerName),
+                tostring(matchKind),
+                JoinStringList(matchCandidates)
+            )
         end
         return false
     end
 
     self._rcLootCouncilRecentAwards = self._rcLootCouncilRecentAwards or {}
-    local now = GetTime and GetTime() or 0
     local signature = table.concat({ tostring(memberId), tostring(payload.itemLink), tostring(configuredRollType) }, "\031")
     local lastSeen = self._rcLootCouncilRecentAwards[signature]
     if lastSeen and (now - lastSeen) < RC_AWARD_EVENT_WINDOW_SECONDS then
@@ -360,8 +478,63 @@ function SF:ProcessRCLootCouncilAward(payload)
     end
     local slotName = SelectAvailableAwardSlot(member, slotCandidates)
     if not slotName then
-        -- TODO: When RC exposes the actual equipped slot, use it here instead of guessing the
-        -- first open candidate for multi-slot items like rings, trinkets, or one-hand weapons.
+        if type(slotCandidates) == "table" and #slotCandidates > 0 then
+            local candidateText = JoinStringList(slotCandidates)
+            local warningId = table.concat({
+                tostring(memberId),
+                tostring(payload.itemLink),
+                tostring(configuredRollType),
+                "slot_conflict",
+            }, "\031")
+            local ok = member:DecrementPoints({
+                logAuthor = RC_LOOT_COUNCIL_AUTHOR,
+                reason = RC_LOOT_COUNCIL_CONFLICT_REASON,
+                source = RC_LOOT_COUNCIL_SOURCE,
+                rollType = configuredRollType,
+                itemLink = payload.itemLink,
+                conflictSlots = candidateText,
+                winnerName = payload.winnerName,
+            })
+
+            if ok then
+                local warningMessage = string.format(
+                    "RC award conflict for %s: %s awarded %s, but candidate slots [%s] are already used. Points were decremented; resolve the slot manually.",
+                    tostring(memberId),
+                    tostring(payload.winnerName),
+                    tostring(payload.itemLink),
+                    candidateText
+                )
+                self._rcLootCouncilRecentAwards[signature] = now
+                SF:PrintWarning(warningMessage)
+                local sentCount = BroadcastRCLootCouncilAdminWarning(profile, {
+                    warningId = warningId,
+                    message = warningMessage,
+                })
+                if SF.Debug then
+                    SF.Debug:Warn(
+                        "RC_LOOT_COUNCIL",
+                        "Processed RC award conflict for %s (equipLoc=%s, item=%s, candidates=%s, warningsSent=%d)",
+                        tostring(memberId),
+                        tostring(equipLoc),
+                        tostring(payload.itemLink),
+                        candidateText,
+                        sentCount
+                    )
+                end
+            elseif SF.Debug then
+                SF.Debug:Warn(
+                    "RC_LOOT_COUNCIL",
+                    "Failed to record RC award conflict for %s (equipLoc=%s, item=%s, candidates=%s)",
+                    tostring(memberId),
+                    tostring(equipLoc),
+                    tostring(payload.itemLink),
+                    candidateText
+                )
+            end
+
+            return ok
+        end
+
         if SF.Debug then
             SF.Debug:Warn(
                 "RC_LOOT_COUNCIL",
@@ -376,7 +549,7 @@ function SF:ProcessRCLootCouncilAward(payload)
 
     local ok = member:ApplyAwardedItem(slotName, {
         logAuthor = RC_LOOT_COUNCIL_AUTHOR,
-        reason = "RC_LOOT_COUNCIL",
+        reason = RC_LOOT_COUNCIL_REASON,
         source = RC_LOOT_COUNCIL_SOURCE,
         rollType = configuredRollType,
         itemLink = payload.itemLink,
