@@ -546,7 +546,7 @@ function RC:EnsureInspectSupport()
 			self:_HandleInspectReady(arg1)
 		elseif event == "PLAYER_EQUIPMENT_CHANGED" then
 			if SF.Debug then
-				SF.Debug:Verbose("RAID_CHECK", "PLAYER_EQUIPMENT_CHANGED fired for slot %s; notifying troubleshooting listeners", tostring(arg1))
+				SF.Debug:Verbose("RAID_CHECK", "PLAYER_EQUIPMENT_CHANGED fired for slot %s; invalidating player inventory state and notifying troubleshooting listeners", tostring(arg1))
 			end
 			self:_InvalidateInspectUnit("player")
 		elseif event == "UNIT_INVENTORY_CHANGED" then
