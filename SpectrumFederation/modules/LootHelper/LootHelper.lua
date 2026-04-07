@@ -165,22 +165,23 @@ end
 
 local function ScheduleRCLootCouncilAwardRetry(self, payload)
     if not (C_Timer and C_Timer.After) then
-        return false
+        return false, tonumber(payload.retryCount) or 0
     end
 
     local retryCount = tonumber(payload.retryCount) or 0
     if retryCount >= RC_AWARD_ITEMINFO_MAX_RETRIES then
-        return false
+        return false, retryCount
     end
 
     local retryPayload = ClonePayload(payload)
-    retryPayload.retryCount = retryCount + 1
+    local nextRetryCount = retryCount + 1
+    retryPayload.retryCount = nextRetryCount
 
     C_Timer.After(RC_AWARD_ITEMINFO_RETRY_DELAY_SECONDS, function()
         self:ProcessRCLootCouncilAward(retryPayload)
     end)
 
-    return true
+    return true, nextRetryCount
 end
 
 local function SelectAvailableAwardSlot(member, slotCandidates)
@@ -334,14 +335,14 @@ function SF:ProcessRCLootCouncilAward(payload)
 
     local slotCandidates, equipLoc, itemInfoPending = ResolveRCLootCouncilAwardSlots(payload.itemLink)
     if itemInfoPending then
-        local retryScheduled = ScheduleRCLootCouncilAwardRetry(self, payload)
+        local retryScheduled, retryCount = ScheduleRCLootCouncilAwardRetry(self, payload)
         if SF.Debug then
             SF.Debug:Warn(
                 "RC_LOOT_COUNCIL",
                 "Item info not ready for %s; retryScheduled=%s retryCount=%s item=%s",
                 tostring(memberId),
                 tostring(retryScheduled),
-                tostring((tonumber(payload.retryCount) or 0) + (retryScheduled and 1 or 0)),
+                tostring(retryCount),
                 tostring(payload.itemLink)
             )
         end
@@ -359,7 +360,8 @@ function SF:ProcessRCLootCouncilAward(payload)
     end
     local slotName = SelectAvailableAwardSlot(member, slotCandidates)
     if not slotName then
-        -- TODO: Use the actual equipped slot if a future RCMLAwardSuccess payload exposes it.
+        -- TODO: When RC exposes the actual equipped slot, use it here instead of guessing the
+        -- first open candidate for multi-slot items like rings, trinkets, or one-hand weapons.
         if SF.Debug then
             SF.Debug:Warn(
                 "RC_LOOT_COUNCIL",
