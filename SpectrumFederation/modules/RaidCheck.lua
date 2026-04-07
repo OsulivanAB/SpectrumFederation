@@ -375,6 +375,8 @@ local function BuildTroubleshootingConfigSignature(cfg)
 	return table.concat(parts, ";")
 end
 
+local BuildUnitInfo
+
 local function CollectUnits()
 	local units = {}
 
@@ -1233,7 +1235,7 @@ local function GetPointName(profile)
 	return "Points"
 end
 
-local function BuildUnitInfo(unit)
+BuildUnitInfo = function(unit)
 	local name, realm = UnitFullName(unit)
 	local id = NormalizeNameRealm(name, realm)
 	local short = ShortName(id)
