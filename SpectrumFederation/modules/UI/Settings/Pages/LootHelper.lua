@@ -337,6 +337,49 @@ local function GetAuditDebugItemToken(link)
 	return "link"
 end
 
+local function BuildAuditSlotSignature(slotData)
+	if type(slotData) ~= "table" then
+		return "nil"
+	end
+
+	return table.concat({
+		tostring(slotData.key or slotData.label or "?"),
+		GetAuditDebugItemToken(slotData.link),
+		tostring(slotData.texture or "nil"),
+		slotData.known and "k1" or "k0",
+		slotData.configEnabled and "c1" or "c0",
+		slotData.expectedEnchant and "e1" or "e0",
+		slotData.hasEnchant and "h1" or "h0",
+		slotData.missingEnchant and "me1" or "me0",
+		slotData.missingGems and "mg1" or "mg0",
+		slotData.missingItem and "mi1" or "mi0",
+		slotData.skippedEnchant and "se1" or "se0",
+		slotData.stale and "s1" or "s0",
+		tostring(slotData.inspectStatus or "ready"),
+	}, "|")
+end
+
+local function BuildAuditRowSignature(rowData)
+	if type(rowData) ~= "table" then
+		return "nil"
+	end
+
+	local parts = {
+		tostring(rowData.id or rowData.name or "?"),
+		tostring(rowData.displayName or rowData.name or "?"),
+		tostring(rowData.itemLevelText or "--"),
+		tostring(rowData.inspectStatus or "ready"),
+		tostring(rowData.inspectLabel or ""),
+		tostring(rowData.inspectMessage or ""),
+	}
+
+	for _, slotData in ipairs(rowData.slots or {}) do
+		parts[#parts + 1] = BuildAuditSlotSignature(slotData)
+	end
+
+	return table.concat(parts, "||")
+end
+
 local function ShowAuditHeaderTooltip(self)
 	if not self or not self._auditTooltipText or self._auditTooltipText == "" then
 		return
@@ -797,6 +840,8 @@ local function BuildEquipmentPage(panel)
 		local isRefreshingAuditTable = false
 		local pendingAuditTableRefresh = false
 		local refreshAuditTableLaterPending = false
+		local lastRenderedSnapshotVersion = nil
+		local lastLayoutState = nil
 
 		local function ApplyHorizontalScrollOffset(value)
 			scroll:SetHorizontalScroll(value)
@@ -805,7 +850,115 @@ local function BuildEquipmentPage(panel)
 			header:SetHeight(AUDIT_HEADER_HEIGHT)
 		end
 
-		ScheduleRefreshAuditTable = function()
+		local function UpdateAuditRowData(dataRow, rowData)
+			dataRow.Name:SetText(FormatAuditRowName(rowData))
+			dataRow.ItemLevel:SetText(rowData.itemLevelText or "--")
+			if rowData.itemLevelText then
+				dataRow.ItemLevel:SetTextColor(1, 0.82, 0.2, 1)
+			else
+				dataRow.ItemLevel:SetTextColor(0.65, 0.65, 0.65, 1)
+			end
+
+			local knownCount = 0
+			local issueCount = 0
+			for columnIndex, column in ipairs(columns) do
+				local slotData = rowData.slots and rowData.slots[columnIndex] or nil
+				local cell = dataRow.Cells[columnIndex]
+				local texture = slotData and slotData.texture or GetAuditSlotPlaceholderTexture(column.key)
+				local hasItem = slotData and slotData.link
+				local shouldShowOverlay = slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems or slotData.missingItem)
+
+				cell._rowData = rowData
+				cell._slotData = slotData or {
+					label = column.label or "Slot",
+					configEnabled = false,
+				}
+				cell.Icon:SetTexture(texture)
+				cell.Icon:SetDesaturated(not hasItem)
+				if hasItem then
+					cell.Icon:SetVertexColor(1, 1, 1, 1)
+				else
+					cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
+				end
+
+				SetAuditMissingOverlay(cell.MissingOverlay, shouldShowOverlay)
+				if slotData and slotData.known then
+					knownCount = knownCount + 1
+				end
+				if shouldShowOverlay then
+					issueCount = issueCount + 1
+				end
+				cell:Show()
+			end
+
+			return knownCount, issueCount
+		end
+
+		local function ApplyAuditTableLayout(rowCount, contentHeight, forceLayout)
+			local containerWidth = math.floor((container:GetWidth() or 0) + 0.5)
+			local containerHeight = math.floor((container:GetHeight() or 0) + 0.5)
+			local nextLayoutState = string.format("%d:%d:%d:%d:%d", rowCount, #columns, containerWidth, containerHeight, contentHeight)
+			if not forceLayout and lastLayoutState == nextLayoutState then
+				return false
+			end
+
+			local scrollBarWidth = 0
+			local horizontalScrollHeight = 0
+			local availableWidth = 1
+			local usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, itemLevelHeader, headerCells, availableWidth)
+			for _ = 1, 2 do
+				scroll:ClearAllPoints()
+				scroll:SetPoint("TOPLEFT", headerViewport, "BOTTOMLEFT", 0, -4)
+				scroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, horizontalScrollHeight)
+
+				local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+				local showVerticalScroll = contentHeight > visibleHeight
+				scrollBarWidth = SetScrollBarShown(scroll, showVerticalScroll)
+
+				headerViewport:ClearAllPoints()
+				headerViewport:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
+				headerViewport:SetPoint("TOPRIGHT", container, "TOPRIGHT", -(showVerticalScroll and (scrollBarWidth + 4) or 0), 0)
+				headerViewport:SetHeight(AUDIT_HEADER_HEIGHT)
+
+				availableWidth = math.max(1, headerViewport:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
+				usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, itemLevelHeader, headerCells, availableWidth)
+				horizontalScrollHeight = SetAuditHorizontalScrollShown(horizontalScroll, usedWidth > availableWidth)
+			end
+
+			scroll:ClearAllPoints()
+			scroll:SetPoint("TOPLEFT", headerViewport, "BOTTOMLEFT", 0, -4)
+			scroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, horizontalScrollHeight)
+			content:SetWidth(math.max(usedWidth, availableWidth))
+			header:SetWidth(math.max(usedWidth, availableWidth))
+
+			local maxHorizontalOffset = math.max(0, usedWidth - availableWidth)
+			horizontalScroll:SetMinMaxValues(0, maxHorizontalOffset)
+			local currentHorizontalOffset = horizontalScroll:GetValue() or 0
+			if currentHorizontalOffset > maxHorizontalOffset then
+				currentHorizontalOffset = maxHorizontalOffset
+				horizontalScroll:SetValue(currentHorizontalOffset)
+			end
+
+			ApplyHorizontalScrollOffset(currentHorizontalOffset)
+
+			nameHeaderText:SetWidth(math.max(1, nameWidth - AUDIT_NAME_PADDING))
+			itemLevelHeader:SetWidth(AUDIT_ILVL_COLUMN_WIDTH)
+			for index = 1, rowCount do
+				local dataRow = rows[index]
+				if dataRow and dataRow:IsShown() then
+					local yOffset = (index - 1) * (AUDIT_ROW_HEIGHT + AUDIT_ROW_SPACING)
+					dataRow:ClearAllPoints()
+					dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
+					dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
+					LayoutRowWidgets(dataRow, dataRow.Name, dataRow.ItemLevel, dataRow.Cells, availableWidth)
+				end
+			end
+
+			lastLayoutState = nextLayoutState
+			return true
+		end
+
+		ScheduleRefreshAuditTable = function(forceLayout)
 			if refreshAuditTableLaterPending then
 				return
 			end
@@ -816,7 +969,7 @@ local function BuildEquipmentPage(panel)
 					if not IsEquipmentPageActive() then
 						return
 					end
-					RefreshAuditTable()
+					RefreshAuditTable(forceLayout and { forceLayout = true } or nil)
 				end)
 				return
 			end
@@ -824,10 +977,10 @@ local function BuildEquipmentPage(panel)
 			if not IsEquipmentPageActive() then
 				return
 			end
-			RefreshAuditTable()
+			RefreshAuditTable(forceLayout and { forceLayout = true } or nil)
 		end
 
-		RefreshAuditTable = function()
+		RefreshAuditTable = function(options)
 			if not IsEquipmentPageActive() then
 				return
 			end
@@ -838,10 +991,20 @@ local function BuildEquipmentPage(panel)
 
 			isRefreshingAuditTable = true
 			local ok, err = pcall(function()
-				local snapshot = (SF.RaidCheck and SF.RaidCheck.GetTroubleshootingSnapshot and SF.RaidCheck:GetTroubleshootingSnapshot()) or { rows = {}, columns = columns, hasActiveProfile = false }
+				local snapshot = (SF.RaidCheck and SF.RaidCheck.GetTroubleshootingSnapshot and SF.RaidCheck:GetTroubleshootingSnapshot()) or { rows = {}, columns = columns, hasActiveProfile = false, version = 0 }
 				local dataRows = snapshot.rows or {}
+				local snapshotVersion = snapshot.version or 0
+				local snapshotChanged = snapshotVersion ~= lastRenderedSnapshotVersion
+				local forceLayout = type(options) == "table" and options.forceLayout and true or false
 				if SF.Debug then
-					SF.Debug:Info("UI", "Refreshing Raid Check Equipment table with %d row(s)", #dataRows)
+					SF.Debug:Info(
+						"UI",
+						"Refreshing Raid Check Equipment table with %d row(s), version=%s changed=%s forceLayout=%s",
+						#dataRows,
+						tostring(snapshotVersion),
+						tostring(snapshotChanged),
+						tostring(forceLayout)
+					)
 				end
 
 				if snapshot.hasActiveProfile then
@@ -850,115 +1013,51 @@ local function BuildEquipmentPage(panel)
 					tableSection:SetMessage("Select an active Loot Helper profile to apply raid check expectations.", "warn")
 				end
 
-				local yOffset = 0
+				local knownSlotCount = 0
+				local issueSlotCount = 0
 				for index, rowData in ipairs(dataRows) do
 					local dataRow = EnsureRow(index)
-					dataRow:ClearAllPoints()
-					dataRow:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -yOffset)
-					dataRow:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -yOffset)
-					dataRow.Name:SetText(FormatAuditRowName(rowData))
-					dataRow.ItemLevel:SetText(rowData.itemLevelText or "--")
-					if rowData.itemLevelText then
-						dataRow.ItemLevel:SetTextColor(1, 0.82, 0.2, 1)
-					else
-						dataRow.ItemLevel:SetTextColor(0.65, 0.65, 0.65, 1)
+					local rowSignature = BuildAuditRowSignature(rowData)
+					if snapshotChanged or dataRow.__sfSignature ~= rowSignature then
+						local rowKnownCount, rowIssueCount = UpdateAuditRowData(dataRow, rowData)
+						knownSlotCount = knownSlotCount + rowKnownCount
+						issueSlotCount = issueSlotCount + rowIssueCount
+						dataRow.__sfSignature = rowSignature
+					elseif SF.Debug then
+						SF.Debug:Verbose("UI", "Raid Check Equipment row unchanged for %s", tostring(rowData.id or rowData.name or "?"))
 					end
 					dataRow:Show()
-
-					for columnIndex, column in ipairs(columns) do
-						local slotData = rowData.slots and rowData.slots[columnIndex] or nil
-						local cell = dataRow.Cells[columnIndex]
-						local texture = slotData and slotData.texture or GetAuditSlotPlaceholderTexture(column.key)
-						local hasItem = slotData and slotData.link
-						local shouldShowOverlay = slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems or slotData.missingItem)
-
-						cell._rowData = rowData
-						cell._slotData = slotData or {
-							label = column.label or "Slot",
-							configEnabled = false,
-						}
-						cell.Icon:SetTexture(texture)
-						cell.Icon:SetDesaturated(not hasItem)
-						if hasItem then
-							cell.Icon:SetVertexColor(1, 1, 1, 1)
-						else
-							cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
-						end
-
-						SetAuditMissingOverlay(cell.MissingOverlay, shouldShowOverlay)
-						if SF.Debug and slotData and slotData.known then
-							SF.Debug:Verbose(
-								"UI",
-								"Raid Check Equipment cell %s/%s issue=%s enchant=%s gems=%s item=%s link=%s",
-								tostring(rowData.id or rowData.name or "?"),
-								tostring(column.key or "?"),
-								tostring(shouldShowOverlay and true or false),
-								tostring(slotData.missingEnchant and true or false),
-								tostring(slotData.missingGems and true or false),
-								tostring(slotData.missingItem and true or false),
-								GetAuditDebugItemToken(slotData.link)
-							)
-						end
-						cell:Show()
-					end
-
-					yOffset = yOffset + AUDIT_ROW_HEIGHT + AUDIT_ROW_SPACING
 				end
 
 				for index = #dataRows + 1, #rows do
+					rows[index].__sfSignature = nil
 					rows[index]:Hide()
 				end
 
-				local contentHeight = (#dataRows > 0) and (yOffset - AUDIT_ROW_SPACING) or 1
+				local contentHeight = (#dataRows > 0) and (((#dataRows - 1) * (AUDIT_ROW_HEIGHT + AUDIT_ROW_SPACING)) + AUDIT_ROW_HEIGHT) or 1
 				content:SetHeight(math.max(1, contentHeight))
 				emptyText:SetShown(#dataRows == 0)
 
-				local scrollBarWidth = 0
-				local horizontalScrollHeight = 0
-				local availableWidth = 1
-				local usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, itemLevelHeader, headerCells, availableWidth)
-				for _ = 1, 2 do
-					scroll:ClearAllPoints()
-					scroll:SetPoint("TOPLEFT", headerViewport, "BOTTOMLEFT", 0, -4)
-					scroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, horizontalScrollHeight)
-
-					local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
-					local showVerticalScroll = contentHeight > visibleHeight
-					scrollBarWidth = SetScrollBarShown(scroll, showVerticalScroll)
-
-					headerViewport:ClearAllPoints()
-					headerViewport:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
-					headerViewport:SetPoint("TOPRIGHT", container, "TOPRIGHT", -(showVerticalScroll and (scrollBarWidth + 4) or 0), 0)
-					headerViewport:SetHeight(AUDIT_HEADER_HEIGHT)
-
-					availableWidth = math.max(1, headerViewport:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
-					usedWidth, nameWidth = LayoutRowWidgets(header, nameHeader, itemLevelHeader, headerCells, availableWidth)
-					horizontalScrollHeight =
-						SetAuditHorizontalScrollShown(horizontalScroll, usedWidth > availableWidth)
+				local layoutChanged = ApplyAuditTableLayout(#dataRows, contentHeight, forceLayout)
+				if snapshotChanged then
+					lastRenderedSnapshotVersion = snapshotVersion
 				end
 
-				scroll:ClearAllPoints()
-				scroll:SetPoint("TOPLEFT", headerViewport, "BOTTOMLEFT", 0, -4)
-				scroll:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", 0, horizontalScrollHeight)
-				content:SetWidth(math.max(usedWidth, availableWidth))
-				header:SetWidth(math.max(usedWidth, availableWidth))
-
-				local maxHorizontalOffset = math.max(0, usedWidth - availableWidth)
-				horizontalScroll:SetMinMaxValues(0, maxHorizontalOffset)
-				local currentHorizontalOffset = horizontalScroll:GetValue() or 0
-				if currentHorizontalOffset > maxHorizontalOffset then
-					currentHorizontalOffset = maxHorizontalOffset
-					horizontalScroll:SetValue(currentHorizontalOffset)
+				if SF.Debug and snapshotChanged then
+					SF.Debug:Verbose(
+						"UI",
+						"Raid Check Equipment summary: rows=%d knownSlots=%d issueSlots=%d layoutChanged=%s",
+						#dataRows,
+						knownSlotCount,
+						issueSlotCount,
+						tostring(layoutChanged)
+					)
+				elseif SF.Debug and not snapshotChanged and not layoutChanged then
+					SF.Debug:Verbose("UI", "Skipping redundant Raid Check Equipment redraw; snapshot version unchanged")
 				end
 
-				ApplyHorizontalScrollOffset(currentHorizontalOffset)
-
-				nameHeaderText:SetWidth(math.max(1, nameWidth - AUDIT_NAME_PADDING))
-				itemLevelHeader:SetWidth(AUDIT_ILVL_COLUMN_WIDTH)
-				for _, dataRow in ipairs(rows) do
-					if dataRow:IsShown() then
-						LayoutRowWidgets(dataRow, dataRow.Name, dataRow.ItemLevel, dataRow.Cells, availableWidth)
-					end
+				if layoutChanged then
+					ReflowEquipmentPage()
 				end
 			end)
 
@@ -972,7 +1071,6 @@ local function BuildEquipmentPage(panel)
 					SF.Debug:Error("UI", "Raid Check equipment refresh failed: %s", tostring(err or "unknown error"))
 				end
 			end
-			ReflowEquipmentPage()
 		end
 
 		if not horizontalScroll.__sfEquipmentOnValueChangedHooked then
@@ -1002,7 +1100,9 @@ local function BuildEquipmentPage(panel)
 		RefreshAuditTable()
 		if not scroll.__sfEquipmentSizeRefreshHooked then
 			scroll.__sfEquipmentSizeRefreshHooked = true
-			scroll:HookScript("OnSizeChanged", ScheduleRefreshAuditTable)
+			scroll:HookScript("OnSizeChanged", function()
+				ScheduleRefreshAuditTable(true)
+			end)
 		end
 	end, { fillHeight = true })
 

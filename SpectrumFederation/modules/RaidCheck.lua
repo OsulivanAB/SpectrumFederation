@@ -350,6 +350,29 @@ local function CalculateAverageItemLevel(slotsByInventory)
 	return total / count
 end
 
+local function BuildTroubleshootingConfigSignature(cfg)
+	if type(cfg) ~= "table" then
+		return "none"
+	end
+
+	local parts = {
+		(cfg.checkGemsInSockets ~= false) and "g1" or "g0",
+		(cfg.requireMetaGem and true or false) and "m1" or "m0",
+	}
+	local slotKeys = {}
+
+	for key in pairs(cfg.slots or {}) do
+		slotKeys[#slotKeys + 1] = tostring(key)
+	end
+
+	table.sort(slotKeys)
+	for _, key in ipairs(slotKeys) do
+		parts[#parts + 1] = string.format("%s=%d", key, cfg.slots[key] and 1 or 0)
+	end
+
+	return table.concat(parts, ";")
+end
+
 local function CollectUnits()
 	local units = {}
 
@@ -425,11 +448,47 @@ function RC:_GetInspectState()
 	self._inspectState = self._inspectState or {
 		cache = {},
 		queue = {},
+		queueHead = 1,
 		queued = {},
 		listeners = {},
 		active = nil,
+		localSnapshot = nil,
+		snapshotVersion = 0,
+		lastNotifiedVersion = -1,
 	}
 	return self._inspectState
+end
+
+function RC:_MarkTroubleshootingDirty()
+	local state = self:_GetInspectState()
+	state.snapshotVersion = (state.snapshotVersion or 0) + 1
+	return state.snapshotVersion
+end
+
+function RC:GetTroubleshootingVersion()
+	local state = self:_GetInspectState()
+	return state.snapshotVersion or 0
+end
+
+function RC:_InvalidateLocalTroubleshootingSnapshot()
+	local state = self:_GetInspectState()
+	state.localSnapshot = nil
+end
+
+function RC:_GetLocalTroubleshootingSnapshot()
+	local state = self:_GetInspectState()
+	if state.localSnapshot then
+		return state.localSnapshot
+	end
+
+	local captured = CaptureTroubleshootingInventory("player")
+	state.localSnapshot = {
+		averageItemLevel = captured.averageItemLevel,
+		slotsByInventory = captured.slotsByInventory,
+		sawAnyData = captured.sawAnyData,
+		preparedSlotsByConfig = {},
+	}
+	return state.localSnapshot
 end
 
 function RC:_StoreInspectCacheEntry(entry, aliases)
@@ -476,11 +535,18 @@ function RC:_GetInspectAliases(unit, info)
 	return aliases, guid, id
 end
 
-function RC:_NotifyTroubleshootingListeners()
+function RC:_NotifyTroubleshootingListeners(force)
 	local state = self:_GetInspectState()
-	for _, callback in pairs(state.listeners) do
-		pcall(callback)
+	local version = state.snapshotVersion or 0
+	if not force and state.lastNotifiedVersion == version then
+		return version
 	end
+
+	state.lastNotifiedVersion = version
+	for _, callback in pairs(state.listeners) do
+		pcall(callback, version)
+	end
+	return version
 end
 
 function RC:RegisterTroubleshootingListener(key, callback)
@@ -517,6 +583,8 @@ function RC:_InvalidateInspectUnit(unit)
 	end
 
 	if IsSelfUnit(unit) then
+		self:_InvalidateLocalTroubleshootingSnapshot()
+		self:_MarkTroubleshootingDirty()
 		if SF.Debug then
 			SF.Debug:Verbose("RAID_CHECK", "Player inventory changed; notifying troubleshooting listeners")
 		end
@@ -526,6 +594,7 @@ function RC:_InvalidateInspectUnit(unit)
 
 	local aliases = self:_GetInspectAliases(unit)
 	self:_InvalidateInspectAliases(aliases)
+	self:_MarkTroubleshootingDirty()
 	self:_NotifyTroubleshootingListeners()
 end
 
@@ -558,13 +627,17 @@ function RC:EnsureInspectSupport()
 			-- inspect becomes possible again. Leave state.cache intact, but
 			-- clear queue-related state before resuming normal inspect flow.
 			state.queue = {}
+			state.queueHead = 1
 			state.queued = {}
 			state.active = nil
+			self:_InvalidateLocalTroubleshootingSnapshot()
+			self:_MarkTroubleshootingDirty()
 			if ClearInspectPlayer then
 				pcall(ClearInspectPlayer)
 			end
 			self:_NotifyTroubleshootingListeners()
 		elseif event == "GROUP_ROSTER_UPDATE" then
+			self:_MarkTroubleshootingDirty()
 			self:_NotifyTroubleshootingListeners()
 			self:_ProcessInspectQueue()
 		end
@@ -596,6 +669,7 @@ function RC:_HandleInspectTimeout(key, requestedAt)
 		pcall(ClearInspectPlayer)
 	end
 
+	self:_MarkTroubleshootingDirty()
 	self:_NotifyTroubleshootingListeners()
 	self:_ProcessInspectQueue()
 end
@@ -645,6 +719,7 @@ function RC:_HandleInspectReady(guid)
 		pcall(ClearInspectPlayer)
 	end
 
+	self:_MarkTroubleshootingDirty()
 	self:_NotifyTroubleshootingListeners()
 	self:_ProcessInspectQueue()
 end
@@ -655,8 +730,10 @@ function RC:_ProcessInspectQueue()
 		return
 	end
 
-	while #state.queue > 0 do
-		local item = table.remove(state.queue, 1)
+	while state.queueHead <= #state.queue do
+		local item = state.queue[state.queueHead]
+		state.queue[state.queueHead] = false
+		state.queueHead = state.queueHead + 1
 		if item and item.key then
 			state.queued[item.key] = nil
 		end
@@ -689,6 +766,11 @@ function RC:_ProcessInspectQueue()
 			end
 			return
 		end
+	end
+
+	if state.queueHead > #state.queue then
+		state.queue = {}
+		state.queueHead = 1
 	end
 end
 
@@ -728,6 +810,7 @@ end
 
 function RC:RequestTroubleshootingRefresh()
 	self:EnsureInspectSupport()
+	self:_InvalidateLocalTroubleshootingSnapshot()
 
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
@@ -743,6 +826,7 @@ function RC:RequestTroubleshootingRefresh()
 		end
 	end
 
+	self:_MarkTroubleshootingDirty()
 	self:_NotifyTroubleshootingListeners()
 end
 
@@ -862,10 +946,9 @@ local function EvaluateUnit(unit, cfg)
 	return EvaluateSnapshot(captured.slotsByInventory, cfg)
 end
 
-local function BuildTroubleshootingSlot(column, mainHandLink, cfg, sourceSlot, inspectState)
+local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlot, isKnown)
 	local inventorySlot = column and column.inventorySlot
 	local slotKey = column and column.key
-	local isKnown = inspectState and inspectState.isKnown and true or false
 	local link = sourceSlot and sourceSlot.link or nil
 	local configEnabled = IsSlotEnabledInConfig(cfg, slotKey, link)
 	local twoHandExempt = isKnown and (slotKey == "offHand") and (not link) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
@@ -892,23 +975,65 @@ local function BuildTroubleshootingSlot(column, mainHandLink, cfg, sourceSlot, i
 		missingGems = missingGems and true or false,
 		missingItem = missingItem and true or false,
 		skippedEnchant = skippedEnchant and true or false,
-		inspectStatus = inspectState and inspectState.status or "ready",
-		inspectMessage = inspectState and inspectState.message or nil,
-		stale = inspectState and inspectState.stale and true or false,
 	}
 end
 
+local function BuildTroubleshootingSlot(column, mainHandLink, cfg, sourceSlot, inspectState)
+	local slot = BuildTroubleshootingSlotBase(
+		column,
+		mainHandLink,
+		cfg,
+		sourceSlot,
+		inspectState and inspectState.isKnown and true or false
+	)
+	slot.inspectStatus = inspectState and inspectState.status or "ready"
+	slot.inspectMessage = inspectState and inspectState.message or nil
+	slot.stale = inspectState and inspectState.stale and true or false
+	return slot
+end
+
 local function BuildTroubleshootingSlots(inspectState, cfg)
+	local isKnown = inspectState and inspectState.isKnown and inspectState.slotsByInventory
+	local cacheHolder = inspectState and inspectState.cacheHolder or nil
+	local configSignature = BuildTroubleshootingConfigSignature(cfg)
+	local cachedBaseSlots = nil
 	local slots = {}
 	local mainHandLink = nil
 
-	if inspectState and inspectState.isKnown and inspectState.slotsByInventory and inspectState.slotsByInventory[INVSLOT_MAINHAND] then
+	if isKnown and inspectState.slotsByInventory[INVSLOT_MAINHAND] then
 		mainHandLink = inspectState.slotsByInventory[INVSLOT_MAINHAND].link
 	end
 
+	if cacheHolder and isKnown then
+		cacheHolder.preparedSlotsByConfig = cacheHolder.preparedSlotsByConfig or {}
+		cachedBaseSlots = cacheHolder.preparedSlotsByConfig[configSignature]
+		if not cachedBaseSlots then
+			cachedBaseSlots = {}
+			for index, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+				local sourceSlot = inspectState.slotsByInventory[column.inventorySlot]
+				cachedBaseSlots[index] = BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlot, true)
+			end
+			cacheHolder.preparedSlotsByConfig[configSignature] = cachedBaseSlots
+		end
+	end
+
 	for index, column in ipairs(TROUBLESHOOTING_COLUMNS) do
-		local sourceSlot = inspectState and inspectState.slotsByInventory and inspectState.slotsByInventory[column.inventorySlot] or nil
-		slots[index] = BuildTroubleshootingSlot(column, mainHandLink, cfg, sourceSlot, inspectState)
+		if cachedBaseSlots then
+			local cached = cachedBaseSlots[index]
+			local slot = {}
+			if cached then
+				for key, value in pairs(cached) do
+					slot[key] = value
+				end
+			end
+			slot.inspectStatus = inspectState and inspectState.status or "ready"
+			slot.inspectMessage = inspectState and inspectState.message or nil
+			slot.stale = inspectState and inspectState.stale and true or false
+			slots[index] = slot
+		else
+			local sourceSlot = inspectState and inspectState.slotsByInventory and inspectState.slotsByInventory[column.inventorySlot] or nil
+			slots[index] = BuildTroubleshootingSlot(column, mainHandLink, cfg, sourceSlot, inspectState)
+		end
 	end
 
 	return slots
@@ -918,7 +1043,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	self:EnsureInspectSupport()
 
 	if IsSelfUnit(unit) then
-		local captured = CaptureTroubleshootingInventory(unit)
+		local captured = self:_GetLocalTroubleshootingSnapshot()
 		return {
 			status = "ready",
 			isKnown = true,
@@ -927,6 +1052,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			message = nil,
 			label = nil,
 			stale = false,
+			cacheHolder = captured,
 		}
 	end
 
@@ -942,6 +1068,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
+			cacheHolder = cacheEntry,
 		}
 	end
 
@@ -965,6 +1092,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
 			stale = true,
+			cacheHolder = cacheEntry,
 		}
 	end
 
@@ -1335,6 +1463,7 @@ function RC:GetTroubleshootingSnapshot()
 
 	return {
 		hasActiveProfile = profile ~= nil,
+		version = self:GetTroubleshootingVersion(),
 		columns = self:GetTroubleshootingColumns(),
 		rows = rows,
 	}
