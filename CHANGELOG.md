@@ -33,6 +33,16 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.18-beta.30] - 2026-04-07
+
+### Added
+- Introduced support for RCLootCouncil integration, allowing automated point adjustments based on loot council awards.
+- Added new configuration options to enable RCLootCouncil integration and specify roll types.
+
+### Changed
+- Optimized Raid Check Equipment snapshot refresh path for improved performance and reliability.
+
 ## [0.5.18-beta.5] - 2026-04-02
 
 ### Added
