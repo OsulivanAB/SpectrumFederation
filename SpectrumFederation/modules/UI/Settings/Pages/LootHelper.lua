@@ -546,7 +546,9 @@ local function BuildEquipmentPage(panel)
 		if SF.Debug then
 			SF.Debug:Info("UI", "Raid Check Equipment redraw requested (%s)", tostring(reason or "unknown"))
 		end
-		if ScheduleRefreshAuditTable then
+		if RefreshAuditTable then
+			RefreshAuditTable()
+		elseif ScheduleRefreshAuditTable then
 			ScheduleRefreshAuditTable()
 		elseif pageBuilder and pageBuilder.Refresh then
 			pageBuilder:Refresh()
