@@ -81,8 +81,7 @@ local function ExtractRCAwardItemLink(message)
         return nil
     end
 
-    local normalizedMessage = message:gsub("||", "|")
-    return normalizedMessage:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+    return message:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
 end
 
 local function FindProfileMemberIdByName(profile, winnerName)
@@ -124,20 +123,25 @@ local function FindProfileMemberIdByName(profile, winnerName)
 end
 
 local function ParseRCAwardMessage(message)
-    local itemLink = ExtractRCAwardItemLink(message)
+    if type(message) ~= "string" or message == "" then
+        return nil
+    end
+
+    local normalizedMessage = message:gsub("||", "|")
+    local itemLink = ExtractRCAwardItemLink(normalizedMessage)
     if not itemLink then
         return nil
     end
 
     local awardPrefix = " was awarded with "
-    local prefixStart = message:find(awardPrefix, 1, true)
-    local itemStart, itemEnd = message:find(itemLink, 1, true)
+    local prefixStart = normalizedMessage:find(awardPrefix, 1, true)
+    local itemStart, itemEnd = normalizedMessage:find(itemLink, 1, true)
     if not prefixStart or not itemStart or prefixStart >= itemStart then
         return nil
     end
 
-    local winnerName = TrimText(message:sub(1, prefixStart - 1))
-    local afterItem = message:sub(itemEnd + 1)
+    local winnerName = TrimText(normalizedMessage:sub(1, prefixStart - 1))
+    local afterItem = normalizedMessage:sub(itemEnd + 1)
     local reasonPos = afterItem:find(" for ", 1, true)
     if not reasonPos then
         return nil
