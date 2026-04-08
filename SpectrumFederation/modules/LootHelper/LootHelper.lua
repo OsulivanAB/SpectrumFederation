@@ -868,6 +868,9 @@ function SF:RehydrateLootHelperDB()
 			if type(profile._EnsureRaidCheckConfig) == "function" then
 				profile:_EnsureRaidCheckConfig()
 			end
+			if type(profile._EnsureRaidCheckEquipmentSnapshots) == "function" then
+				profile:_EnsureRaidCheckEquipmentSnapshots()
+			end
 
 			-- Restore Member methods
 			if type(profile._members) == "table" and self.Member then

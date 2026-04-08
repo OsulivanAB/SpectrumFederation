@@ -113,10 +113,42 @@ function LootProfile:_EnsureRCLootCouncilConfig()
 	cfg.rollType = tostring(cfg.rollType or ""):match("^%s*(.-)%s*$")
 end
 
+function LootProfile:_EnsureRaidCheckEquipmentSnapshots()
+	if type(self._raidCheckEquipmentSnapshots) ~= "table" then
+		self._raidCheckEquipmentSnapshots = {}
+	end
+end
+
 local function CopyArray(arr)
     local out = {}
     for i = 1, #(arr or {}) do out[i] = arr[i] end
     return out
+end
+
+local function CopyRaidCheckEquipmentSlots(slotsByInventory)
+	local copy = {}
+	for inventorySlot, slotData in pairs(slotsByInventory or {}) do
+		if type(slotData) == "table" then
+			copy[inventorySlot] = {
+				link = type(slotData.link) == "string" and slotData.link or nil,
+				texture = slotData.texture,
+				itemLevel = tonumber(slotData.itemLevel) or nil,
+			}
+		end
+	end
+	return copy
+end
+
+local function CopyRaidCheckEquipmentSnapshot(snapshot)
+	if type(snapshot) ~= "table" then
+		return nil
+	end
+
+	return {
+		capturedAt = tonumber(snapshot.capturedAt) or nil,
+		averageItemLevel = tonumber(snapshot.averageItemLevel) or nil,
+		slotsByInventory = CopyRaidCheckEquipmentSlots(snapshot.slotsByInventory),
+	}
 end
 
 -- Local helper functions for member ID normalization and comparison
@@ -230,6 +262,7 @@ function LootProfile.new(profileName)
     instance._raidWideSafeMode = false
     instance._raidWideSafeModeOnCombat = false
     instance._raidCheckConfig = CopyRaidCheckDefaults()
+    instance._raidCheckEquipmentSnapshots = {}
     instance._rcLootCouncilConfig = {
 		enabled = RC_LOOT_COUNCIL_DEFAULTS.enabled,
 		rollType = RC_LOOT_COUNCIL_DEFAULTS.rollType,
@@ -518,6 +551,58 @@ end
 function LootProfile:GetRCLootCouncilRollType()
 	self:_EnsureRCLootCouncilConfig()
 	return self._rcLootCouncilConfig.rollType or ""
+end
+
+function LootProfile:GetRaidCheckEquipmentSnapshot(memberId)
+	self:_EnsureRaidCheckEquipmentSnapshots()
+	if type(memberId) ~= "string" or memberId == "" then
+		return nil
+	end
+
+	memberId = NormalizeMemberId(memberId)
+	if not self:GetMemberByID(memberId) then
+		return nil
+	end
+	local snapshot = self._raidCheckEquipmentSnapshots[memberId]
+	if type(snapshot) ~= "table" then
+		return nil
+	end
+
+	snapshot.preparedSlotsByConfig = snapshot.preparedSlotsByConfig or {}
+	return snapshot
+end
+
+function LootProfile:GetRaidCheckEquipmentSnapshotIds()
+	self:_EnsureRaidCheckEquipmentSnapshots()
+	local ids = {}
+	for memberId, snapshot in pairs(self._raidCheckEquipmentSnapshots) do
+		if type(memberId) == "string" and memberId ~= "" and type(snapshot) == "table" and self:GetMemberByID(memberId) then
+			table.insert(ids, memberId)
+		end
+	end
+	table.sort(ids)
+	return ids
+end
+
+function LootProfile:SetRaidCheckEquipmentSnapshot(memberId, snapshot)
+	self:_EnsureRaidCheckEquipmentSnapshots()
+	if type(memberId) ~= "string" or memberId == "" or type(snapshot) ~= "table" then
+		return false
+	end
+
+	memberId = NormalizeMemberId(memberId)
+	if not self:GetMemberByID(memberId) then
+		return false
+	end
+
+	local snapshotCopy = CopyRaidCheckEquipmentSnapshot(snapshot)
+	if not snapshotCopy then
+		return false
+	end
+
+	snapshotCopy.preparedSlotsByConfig = {}
+	self._raidCheckEquipmentSnapshots[memberId] = snapshotCopy
+	return true
 end
 
 -- Function check if a Raid Check slot is enabled
@@ -1108,12 +1193,22 @@ function LootProfile:ExportSnapshot()
         end
     end
 
+	self:_EnsureRaidCheckEquipmentSnapshots()
+	local equipmentSnapshotsOut = {}
+	for memberId, snapshot in pairs(self._raidCheckEquipmentSnapshots) do
+		local snapshotCopy = CopyRaidCheckEquipmentSnapshot(snapshot)
+		if type(memberId) == "string" and memberId ~= "" and snapshotCopy then
+			equipmentSnapshotsOut[memberId] = snapshotCopy
+		end
+	end
+
 	return {
         version         = PROFILE_SNAPSHOT_VERSION,
         meta            = self:ExportMeta(),
 		adminUsers      = CopyArray(self._adminUsers),
 		lootLogs        = logsOut,
 		members         = membersOut,
+		equipmentSnapshots = equipmentSnapshotsOut,
 		pointName       = self._pointName or "Points",
 		raidCheck       = self:GetRaidCheckConfig(),
 		rcLootCouncil   = {
@@ -1167,6 +1262,29 @@ function LootProfile.ValidateSnapshot(snapshot)
     if snapshot.members ~= nil then
         if type(snapshot.members) ~= "table" then return false, "snapshot.members must be a table or nil" end
     end
+
+	if snapshot.equipmentSnapshots ~= nil then
+		if type(snapshot.equipmentSnapshots) ~= "table" then
+			return false, "snapshot.equipmentSnapshots must be a table or nil"
+		end
+		for memberId, equipmentSnapshot in pairs(snapshot.equipmentSnapshots) do
+			if type(memberId) ~= "string" or memberId == "" then
+				return false, "snapshot.equipmentSnapshots contains an invalid member id"
+			end
+			if type(equipmentSnapshot) ~= "table" then
+				return false, "snapshot.equipmentSnapshots contains an invalid snapshot"
+			end
+			if equipmentSnapshot.capturedAt ~= nil and type(equipmentSnapshot.capturedAt) ~= "number" then
+				return false, "snapshot.equipmentSnapshots.capturedAt must be a number when provided"
+			end
+			if equipmentSnapshot.averageItemLevel ~= nil and type(equipmentSnapshot.averageItemLevel) ~= "number" then
+				return false, "snapshot.equipmentSnapshots.averageItemLevel must be a number when provided"
+			end
+			if type(equipmentSnapshot.slotsByInventory) ~= "table" then
+				return false, "snapshot.equipmentSnapshots.slotsByInventory must be a table"
+			end
+		end
+	end
     
 	-- Validate optional pointName (new in this version)
 	if snapshot.pointName ~= nil then
@@ -1248,6 +1366,17 @@ function LootProfile:ImportSnapshot(snapshot, opts)
             SF.Debug:Info("LootProfile", "Imported %d members from snapshot", #self._members)
         end
     end
+
+	self._raidCheckEquipmentSnapshots = {}
+	if type(snapshot.equipmentSnapshots) == "table" then
+		for memberId, equipmentSnapshot in pairs(snapshot.equipmentSnapshots) do
+			local snapshotCopy = CopyRaidCheckEquipmentSnapshot(equipmentSnapshot)
+			if type(memberId) == "string" and memberId ~= "" and snapshotCopy then
+				snapshotCopy.preparedSlotsByConfig = {}
+				self._raidCheckEquipmentSnapshots[NormalizeMemberId(memberId)] = snapshotCopy
+			end
+		end
+	end
     
 	-- Import pointName (if provided in snapshot)
 	if type(snapshot.pointName) == "string" then

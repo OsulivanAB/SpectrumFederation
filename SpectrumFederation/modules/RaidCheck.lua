@@ -5,7 +5,7 @@ local addonName, SF = ...
 -- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
 -- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetDetailedItemLevelInfo C_Item
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
--- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime InCombatLockdown
+-- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -95,6 +95,20 @@ local function ColorizeUnitName(unit, name)
 
 	local _, classToken = UnitClass(unit)
 	local classData = classToken and SF.WOW_CLASSES and SF.WOW_CLASSES[classToken]
+	if classData and classData.colorCode then
+		return string.format("%s%s|r", ToWoWHexColor(classData.colorCode), name)
+	end
+
+	return name
+end
+
+local function ColorizeProfileMemberName(profile, memberId, name)
+	if not profile or type(profile.GetMemberByID) ~= "function" or not name or name == "" then
+		return name or "Unknown"
+	end
+
+	local member = profile:GetMemberByID(memberId)
+	local classData = member and member.class and SF.WOW_CLASSES and SF.WOW_CLASSES[member.class]
 	if classData and classData.colorCode then
 		return string.format("%s%s|r", ToWoWHexColor(classData.colorCode), name)
 	end
@@ -416,6 +430,61 @@ local function GetProfile()
 	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
 end
 
+local function PersistProfileEquipmentSnapshot(memberId, captured)
+	local profile = GetProfile()
+	if not profile or type(profile.SetRaidCheckEquipmentSnapshot) ~= "function" then
+		return false
+	end
+	if type(memberId) ~= "string" or memberId == "" or type(captured) ~= "table" or type(captured.slotsByInventory) ~= "table" then
+		return false
+	end
+
+	return profile:SetRaidCheckEquipmentSnapshot(memberId, {
+		capturedAt = GetServerTime and GetServerTime() or nil,
+		averageItemLevel = captured.averageItemLevel,
+		slotsByInventory = captured.slotsByInventory,
+	})
+end
+
+local function GetProfileEquipmentSnapshot(memberId)
+	local profile = GetProfile()
+	if not profile or type(profile.GetRaidCheckEquipmentSnapshot) ~= "function" then
+		return nil
+	end
+	if type(memberId) ~= "string" or memberId == "" then
+		return nil
+	end
+	return profile:GetRaidCheckEquipmentSnapshot(memberId)
+end
+
+local function BuildSavedSnapshotMessage(snapshot, whileRefreshing)
+	local baseMessage = whileRefreshing
+		and "Showing the saved profile snapshot while a fresh inspect loads."
+		or "Showing the last saved profile snapshot for this member."
+	local capturedAt = snapshot and snapshot.capturedAt or nil
+	if type(capturedAt) ~= "number" or capturedAt <= 0 then
+		return baseMessage
+	end
+
+	local now = GetServerTime and GetServerTime() or nil
+	if type(now) ~= "number" or now < capturedAt then
+		return baseMessage
+	end
+
+	local ageSeconds = math.max(0, now - capturedAt)
+	if ageSeconds < 60 then
+		return baseMessage .. " Last seen less than a minute ago."
+	end
+	if ageSeconds < 3600 then
+		return string.format("%s Last seen %dm ago.", baseMessage, math.floor(ageSeconds / 60))
+	end
+	if ageSeconds < 86400 then
+		return string.format("%s Last seen %dh ago.", baseMessage, math.floor(ageSeconds / 3600))
+	end
+
+	return string.format("%s Last seen %dd ago.", baseMessage, math.floor(ageSeconds / 86400))
+end
+
 local function FindUnitByGuidOrId(guid, id)
 	for _, unit in ipairs(CollectUnits()) do
 		if guid and UnitGUID and UnitGUID(unit) == guid then
@@ -512,7 +581,11 @@ function RC:_GetLocalTroubleshootingSnapshot()
 		slotsByInventory = captured.slotsByInventory,
 		sawAnyData = captured.sawAnyData,
 		preparedSlotsByConfig = {},
+		capturedAt = GetServerTime and GetServerTime() or nil,
 	}
+	if captured.sawAnyData then
+		PersistProfileEquipmentSnapshot(SF:GetPlayerFullIdentifier(), captured)
+	end
 	return state.localSnapshot
 end
 
@@ -837,6 +910,7 @@ function RC:_HandleInspectReady(guid)
 		entry.updatedAt = now
 		entry.averageItemLevel = captured.averageItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
+		PersistProfileEquipmentSnapshot(active.id, captured)
 	else
 		entry.status = "timeout"
 		entry.failCount = (entry.failCount or 0) + 1
@@ -1175,6 +1249,7 @@ end
 
 function RC:_GetTroubleshootingInspectState(unit, info)
 	self:EnsureInspectSupport()
+	local memberId = info and info.id or nil
 
 	if IsSelfUnit(unit) then
 		local captured = self:_GetLocalTroubleshootingSnapshot()
@@ -1192,6 +1267,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 
 	local aliases = self:_GetInspectAliases(unit, info)
 	local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+	local profileSnapshot = GetProfileEquipmentSnapshot(memberId)
 	local now = GetTime and GetTime() or 0
 	local hasFreshData = cacheEntry and cacheEntry.updatedAt and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
 
@@ -1206,7 +1282,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
-	local inRange = IsUnitInInspectRange(unit)
+	local inRange = unit and IsUnitInInspectRange(unit) or false
 	local canInspectNow = CanInspectUnitNow(unit)
 	local pausedForCombat = IsInspectPausedForCombat()
 	local state = self:_GetInspectState()
@@ -1240,6 +1316,42 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			entry = cacheEntry,
 			stale = true,
 			cacheHolder = cacheEntry,
+		}
+	end
+
+	if profileSnapshot and profileSnapshot.slotsByInventory then
+		local status = "saved"
+		local label = "Saved"
+		local message = BuildSavedSnapshotMessage(profileSnapshot, false)
+
+		if pausedForCombat and unit then
+			status = "paused"
+			label = "Paused"
+			message = "Showing the saved profile snapshot until combat ends."
+		elseif activeKey == key then
+			status = "refreshing"
+			label = "Refreshing"
+			message = BuildSavedSnapshotMessage(profileSnapshot, true)
+		elseif canInspectNow then
+			status = "loading"
+			label = "Loading"
+			message = BuildSavedSnapshotMessage(profileSnapshot, true)
+		elseif unit and not inRange then
+			status = "out_of_range"
+			label = "Out of range"
+			message = "Showing the saved profile snapshot. Move closer to refresh this player."
+		end
+
+		return {
+			status = status,
+			label = label,
+			message = message,
+			isKnown = true,
+			averageItemLevel = profileSnapshot.averageItemLevel,
+			slotsByInventory = profileSnapshot.slotsByInventory,
+			entry = profileSnapshot,
+			stale = true,
+			cacheHolder = profileSnapshot,
 		}
 	end
 
@@ -1394,6 +1506,40 @@ BuildUnitInfo = function(unit)
 		short = short,
 		displayName = ColorizeUnitName(unit, short),
 	}
+end
+
+local function BuildProfileMemberInfo(profile, memberId)
+	local short = ShortName(memberId)
+	return {
+		unit = nil,
+		id = memberId,
+		short = short,
+		displayName = ColorizeProfileMemberName(profile, memberId, short),
+	}
+end
+
+local function CollectTroubleshootingUnitsAndMembers(profile)
+	local items = {}
+	local seen = {}
+
+	for _, unit in ipairs(CollectUnits()) do
+		local info = BuildUnitInfo(unit)
+		if info.id and not seen[info.id] then
+			seen[info.id] = true
+			items[#items + 1] = info
+		end
+	end
+
+	if not IsInRaid() and not IsInGroup() and profile and type(profile.GetRaidCheckEquipmentSnapshotIds) == "function" then
+		for _, memberId in ipairs(profile:GetRaidCheckEquipmentSnapshotIds() or {}) do
+			if memberId and not seen[memberId] then
+				seen[memberId] = true
+				items[#items + 1] = BuildProfileMemberInfo(profile, memberId)
+			end
+		end
+	end
+
+	return items
 end
 
 local function FormatAverageItemLevel(value)
@@ -1599,12 +1745,11 @@ function RC:GetTroubleshootingSnapshot()
 	local cfg = profile and profile.GetRaidCheckConfig and profile:GetRaidCheckConfig() or nil
 	local rows = {}
 
-	for _, unit in ipairs(CollectUnits()) do
-		local info = BuildUnitInfo(unit)
+	for _, info in ipairs(CollectTroubleshootingUnitsAndMembers(profile)) do
 		if info.id then
-			local inspectState = self:_GetTroubleshootingInspectState(unit, info)
+			local inspectState = self:_GetTroubleshootingInspectState(info.unit, info)
 			rows[#rows + 1] = {
-				unit = unit,
+				unit = info.unit,
 				id = info.id,
 				name = info.short,
 				displayName = info.displayName or info.short,
