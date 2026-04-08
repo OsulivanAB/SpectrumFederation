@@ -181,6 +181,32 @@ local function GetArmorSlotLabel(slot)
 	return FormatLabel(slot) .. " Armor Spot"
 end
 
+local function FormatItemCellText(data)
+	data = data or {}
+
+	local itemName = tostring(data.itemName or "")
+	if itemName ~= "" then
+		return itemName
+	end
+
+	local itemLink = tostring(data.itemLink or "")
+	if itemLink == "" then
+		return ""
+	end
+
+	local colorCode, linkLabel = itemLink:match("^(|c%x%x%x%x%x%x%x%x)|Hitem:.-|h(%[.-%])|h|r$")
+	if colorCode and linkLabel then
+		return colorCode .. linkLabel .. "|r"
+	end
+
+	linkLabel = itemLink:match("|h(%[.-%])|h")
+	if linkLabel then
+		return linkLabel
+	end
+
+	return itemLink
+end
+
 local function BuildActionText(eventType, data, author)
 	data = data or {}
 
@@ -255,7 +281,7 @@ local function BuildLogRow(log)
 		author = ColorizeName(author),
 		member = ColorizeName(data.member),
 		action = BuildActionText(eventType, data, author),
-		item = tostring(data.itemLink or data.itemName or ""),
+		item = FormatItemCellText(data),
 	}
 end
 
