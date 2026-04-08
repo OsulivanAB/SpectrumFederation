@@ -472,6 +472,7 @@ function RC:_GetInspectState()
 		queued = {},
 		listeners = {},
 		active = nil,
+		inspectPausedForCombat = false,
 		localSnapshot = nil,
 		snapshotVersion = 0,
 		lastNotifiedVersion = -1,
