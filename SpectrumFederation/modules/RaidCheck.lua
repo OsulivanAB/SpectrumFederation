@@ -624,10 +624,9 @@ end
 
 function RC:_PrimeBackgroundInspectQueue()
 	if not HasActiveLootHelperSession() or IsInspectPausedForCombat() then
-		return false
+		return
 	end
 
-	local queuedAny = false
 	local now = GetTime and GetTime() or 0
 
 	for _, unit in ipairs(CollectUnits()) do
@@ -641,22 +640,11 @@ function RC:_PrimeBackgroundInspectQueue()
 					and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
 
 				if not hasFreshData then
-					local state = self:_GetInspectState()
-					local key = aliases[1] or aliases[2]
-					local wasActive = state.active and state.active.key == key
-					local wasQueued = key and state.queued[key] or false
-
 					self:_QueueInspectForUnit(unit, info, cacheEntry)
-
-					if (key and state.queued[key] and not wasQueued) or (state.active and not wasActive) then
-						queuedAny = true
-					end
 				end
 			end
 		end
 	end
-
-	return queuedAny
 end
 
 function RC:_RunBackgroundInspectPass()
@@ -671,20 +659,17 @@ function RC:_StartBackgroundInspectMonitor()
 
 	state.backgroundMonitorStarted = true
 
-	local function Tick()
+	local function BackgroundInspectTick()
 		if not self._inspectFrame then
-			local currentState = self._GetInspectState and self:_GetInspectState() or nil
-			if currentState then
-				currentState.backgroundMonitorStarted = false
-			end
+			self:_GetInspectState().backgroundMonitorStarted = false
 			return
 		end
 
 		self:_RunBackgroundInspectPass()
-		C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, Tick)
+		C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, BackgroundInspectTick)
 	end
 
-	C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, Tick)
+	C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, BackgroundInspectTick)
 end
 
 function RC:_PauseInspectForCombat()
