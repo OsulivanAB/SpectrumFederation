@@ -5,7 +5,7 @@ local addonName, SF = ...
 -- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
 -- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetDetailedItemLevelInfo C_Item
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
--- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime
+-- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime InCombatLockdown
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -17,6 +17,7 @@ local INSPECT_CACHE_TTL_SECONDS = 30
 local INSPECT_RETRY_BASE_SECONDS = 2
 local INSPECT_RETRY_MAX_SECONDS = 10
 local INSPECT_REQUEST_TIMEOUT_SECONDS = 1.5
+local BACKGROUND_INSPECT_POLL_SECONDS = 5
 local SLOT_DEFS = {
 	head = { label = "Head", slots = { INVSLOT_HEAD } },
 	neck = { label = "Neck", slots = { INVSLOT_NECK } },
@@ -318,9 +319,21 @@ local function IsUnitInInspectRange(unit)
 	return true
 end
 
+local function IsInspectPausedForCombat()
+	return InCombatLockdown and InCombatLockdown() or false
+end
+
+local function HasActiveLootHelperSession()
+	return SF.LootHelperSync
+		and SF.LootHelperSync.IsSessionActive
+		and SF.LootHelperSync:IsSessionActive()
+		or false
+end
+
 local function CanInspectUnitNow(unit)
 	return unit
 		and UnitExists and UnitExists(unit)
+		and not IsInspectPausedForCombat()
 		and CanInspect and CanInspect(unit)
 		and IsUnitInInspectRange(unit)
 end
@@ -461,6 +474,7 @@ function RC:_GetInspectState()
 		localSnapshot = nil,
 		snapshotVersion = 0,
 		lastNotifiedVersion = -1,
+		backgroundMonitorStarted = false,
 	}
 	return self._inspectState
 end
@@ -607,6 +621,111 @@ function RC:_InvalidateInspectUnit(unit)
 	self:_NotifyTroubleshootingListeners()
 end
 
+function RC:_PrimeBackgroundInspectQueue()
+	if not HasActiveLootHelperSession() or IsInspectPausedForCombat() then
+		return false
+	end
+
+	local queuedAny = false
+	local now = GetTime and GetTime() or 0
+
+	for _, unit in ipairs(CollectUnits()) do
+		if not IsSelfUnit(unit) then
+			local info = BuildUnitInfo(unit)
+			if info.id then
+				local aliases = self:_GetInspectAliases(unit, info)
+				local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+				local hasFreshData = cacheEntry
+					and cacheEntry.updatedAt
+					and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
+
+				if not hasFreshData then
+					local state = self:_GetInspectState()
+					local key = aliases[1] or aliases[2]
+					local wasActive = state.active and state.active.key == key
+					local wasQueued = key and state.queued[key] or false
+
+					self:_QueueInspectForUnit(unit, info, cacheEntry)
+
+					if (key and state.queued[key] and not wasQueued) or (state.active and not wasActive) then
+						queuedAny = true
+					end
+				end
+			end
+		end
+	end
+
+	return queuedAny
+end
+
+function RC:_RunBackgroundInspectPass()
+	self:_PrimeBackgroundInspectQueue()
+end
+
+function RC:_StartBackgroundInspectMonitor()
+	local state = self:_GetInspectState()
+	if state.backgroundMonitorStarted or not (C_Timer and C_Timer.After) then
+		return
+	end
+
+	state.backgroundMonitorStarted = true
+
+	local function Tick()
+		if not self or not self._RunBackgroundInspectPass then
+			return
+		end
+
+		self:_RunBackgroundInspectPass()
+		C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, Tick)
+	end
+
+	C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, Tick)
+end
+
+function RC:_PauseInspectForCombat()
+	local state = self:_GetInspectState()
+	if state.inspectPausedForCombat then
+		return
+	end
+
+	state.inspectPausedForCombat = true
+
+	if state.active then
+		local active = state.active
+		state.active = nil
+
+		if active.key and not state.queued[active.key] then
+			state.queued[active.key] = true
+			table.insert(state.queue, math.max(1, state.queueHead), {
+				key = active.key,
+				guid = active.guid,
+				id = active.id,
+				aliases = active.aliases,
+			})
+		end
+
+		if ClearInspectPlayer then
+			pcall(ClearInspectPlayer)
+		end
+	end
+
+	self:_MarkTroubleshootingDirty()
+	self:_NotifyTroubleshootingListeners()
+end
+
+function RC:_ResumeInspectAfterCombat()
+	local state = self:_GetInspectState()
+	if not state.inspectPausedForCombat then
+		return
+	end
+
+	state.inspectPausedForCombat = false
+	self:_ProcessInspectQueue()
+	self:_RunBackgroundInspectPass()
+	self:_MarkTroubleshootingDirty()
+	self:_NotifyTroubleshootingListeners()
+end
+
 function RC:EnsureInspectSupport()
 	if self._inspectFrame then
 		return
@@ -617,11 +736,17 @@ function RC:EnsureInspectSupport()
 	frame:RegisterEvent("INSPECT_READY")
 	frame:RegisterEvent("GROUP_ROSTER_UPDATE")
 	frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+	frame:RegisterEvent("PLAYER_REGEN_DISABLED")
+	frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 	frame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 	frame:RegisterEvent("UNIT_INVENTORY_CHANGED")
 	frame:SetScript("OnEvent", function(_, event, arg1)
 		if event == "INSPECT_READY" then
 			self:_HandleInspectReady(arg1)
+		elseif event == "PLAYER_REGEN_DISABLED" then
+			self:_PauseInspectForCombat()
+		elseif event == "PLAYER_REGEN_ENABLED" then
+			self:_ResumeInspectAfterCombat()
 		elseif event == "PLAYER_EQUIPMENT_CHANGED" then
 			if SF.Debug then
 				SF.Debug:Verbose("RAID_CHECK", "PLAYER_EQUIPMENT_CHANGED fired for slot %s; invalidating player inventory state and notifying troubleshooting listeners", tostring(arg1))
@@ -645,12 +770,19 @@ function RC:EnsureInspectSupport()
 				pcall(ClearInspectPlayer)
 			end
 			self:_NotifyTroubleshootingListeners()
+			self:_RunBackgroundInspectPass()
 		elseif event == "GROUP_ROSTER_UPDATE" then
 			self:_MarkTroubleshootingDirty()
 			self:_NotifyTroubleshootingListeners()
 			self:_ProcessInspectQueue()
+			self:_RunBackgroundInspectPass()
 		end
 	end)
+
+	if IsInspectPausedForCombat() then
+		self:_PauseInspectForCombat()
+	end
+	self:_StartBackgroundInspectMonitor()
 end
 
 function RC:_HandleInspectTimeout(key, requestedAt)
@@ -737,7 +869,7 @@ end
 
 function RC:_ProcessInspectQueue()
 	local state = self:_GetInspectState()
-	if state.active then
+	if state.active or state.inspectPausedForCombat then
 		return
 	end
 
@@ -1084,6 +1216,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 
 	local inRange = IsUnitInInspectRange(unit)
 	local canInspectNow = CanInspectUnitNow(unit)
+	local pausedForCombat = IsInspectPausedForCombat()
 	local state = self:_GetInspectState()
 	local activeKey = state.active and state.active.key or nil
 	local key = aliases[1] or aliases[2]
@@ -1094,9 +1227,11 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 
 	if cacheEntry and cacheEntry.slotsByInventory then
 		return {
-			status = (activeKey == key) and "refreshing" or "stale",
-			label = (activeKey == key) and "Refreshing" or "Stale",
-			message = "Showing cached inspect data while a fresh snapshot loads.",
+			status = pausedForCombat and "stale" or ((activeKey == key) and "refreshing" or "stale"),
+			label = pausedForCombat and "Paused" or ((activeKey == key) and "Refreshing" or "Stale"),
+			message = pausedForCombat
+				and "Showing cached inspect data until combat ends."
+				or "Showing cached inspect data while a fresh snapshot loads.",
 			isKnown = true,
 			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
@@ -1111,6 +1246,16 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			status = "retrying",
 			label = "Retrying",
 			message = "Last inspect attempt timed out. Raid Check will retry shortly.",
+			isKnown = false,
+			stale = false,
+		}
+	end
+
+	if pausedForCombat then
+		return {
+			status = "paused",
+			label = "Paused",
+			message = "Inspect is paused during combat and will resume afterwards.",
 			isKnown = false,
 			stale = false,
 		}
@@ -1504,3 +1649,5 @@ function RC:GetTroubleshootingSlotsForUnit(unit, cfg)
 		slots = BuildTroubleshootingSlots(inspectState, cfg),
 	}
 end
+
+RC:EnsureInspectSupport()
