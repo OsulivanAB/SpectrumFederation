@@ -57,12 +57,32 @@ local function NormalizeRCLootCouncilAwardReason(reasonText)
     return reason
 end
 
+local function NormalizeRCAwardItemLink(itemLink)
+    if type(itemLink) ~= "string" or itemLink == "" then
+        return nil
+    end
+
+    local normalized = TrimText(itemLink):gsub("||", "|")
+    local decoratedLink = normalized:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+    if decoratedLink and decoratedLink ~= "" then
+        return decoratedLink
+    end
+
+    local plainLink = normalized:match("(|Hitem:.-|h%[.-%]|h)")
+    if plainLink and plainLink ~= "" then
+        return plainLink
+    end
+
+    return normalized ~= "" and normalized or nil
+end
+
 local function ExtractRCAwardItemLink(message)
     if type(message) ~= "string" or message == "" then
         return nil
     end
 
-    return message:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+    local normalizedMessage = message:gsub("||", "|")
+    return normalizedMessage:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
 end
 
 local function FindProfileMemberIdByName(profile, winnerName)
@@ -331,6 +351,8 @@ function SF:ProcessRCLootCouncilAward(payload)
         end
         return false
     end
+
+    payload.itemLink = NormalizeRCAwardItemLink(payload.itemLink)
 
     if SF.Debug then
         SF.Debug:Verbose(
