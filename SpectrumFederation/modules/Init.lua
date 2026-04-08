@@ -41,6 +41,13 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.SettingsWindow:Init()
     end
 
+    if SF.RaidCheck and SF.RaidCheck.EnsureInspectSupport then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing Raid Check inspect support")
+        end
+        SF.RaidCheck:EnsureInspectSupport()
+    end
+
     if SF.Debug then
         SF.Debug:Info("INIT", "All modules initialized successfully")
     end

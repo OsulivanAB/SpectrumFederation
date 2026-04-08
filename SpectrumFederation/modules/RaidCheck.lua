@@ -325,7 +325,7 @@ end
 
 local function HasActiveLootHelperSession()
 	return SF.LootHelperSync
-		and SF.LootHelperSync.IsSessionActive
+		and type(SF.LootHelperSync.IsSessionActive) == "function"
 		and SF.LootHelperSync:IsSessionActive()
 		or false
 end
@@ -671,7 +671,11 @@ function RC:_StartBackgroundInspectMonitor()
 	state.backgroundMonitorStarted = true
 
 	local function Tick()
-		if not self or not self._RunBackgroundInspectPass then
+		if not self or not self._inspectFrame or not self._RunBackgroundInspectPass then
+			local currentState = self and self._GetInspectState and self:_GetInspectState() or nil
+			if currentState then
+				currentState.backgroundMonitorStarted = false
+			end
 			return
 		end
 
@@ -696,7 +700,8 @@ function RC:_PauseInspectForCombat()
 
 		if active.key and not state.queued[active.key] then
 			state.queued[active.key] = true
-			table.insert(state.queue, math.max(1, state.queueHead), {
+			local insertAt = state.queueHead
+			table.insert(state.queue, insertAt, {
 				key = active.key,
 				guid = active.guid,
 				id = active.id,
@@ -1649,5 +1654,3 @@ function RC:GetTroubleshootingSlotsForUnit(unit, cfg)
 		slots = BuildTroubleshootingSlots(inspectState, cfg),
 	}
 end
-
-RC:EnsureInspectSupport()
