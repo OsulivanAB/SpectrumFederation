@@ -320,14 +320,15 @@ local function IsUnitInInspectRange(unit)
 end
 
 local function IsInspectPausedForCombat()
-	return InCombatLockdown and InCombatLockdown() or false
+	return InCombatLockdown()
 end
 
 local function HasActiveLootHelperSession()
-	return SF.LootHelperSync
-		and type(SF.LootHelperSync.IsSessionActive) == "function"
-		and SF.LootHelperSync:IsSessionActive()
-		or false
+	if not SF.LootHelperSync or type(SF.LootHelperSync.IsSessionActive) ~= "function" then
+		return false
+	end
+
+	return SF.LootHelperSync:IsSessionActive() and true or false
 end
 
 local function CanInspectUnitNow(unit)
@@ -671,7 +672,7 @@ function RC:_StartBackgroundInspectMonitor()
 	state.backgroundMonitorStarted = true
 
 	local function Tick()
-		if not self or not self._inspectFrame or not self._RunBackgroundInspectPass then
+		if not self or not self._inspectFrame then
 			local currentState = self and self._GetInspectState and self:_GetInspectState() or nil
 			if currentState then
 				currentState.backgroundMonitorStarted = false
@@ -785,7 +786,7 @@ function RC:EnsureInspectSupport()
 	end)
 
 	if IsInspectPausedForCombat() then
-		self:_PauseInspectForCombat()
+		self:_GetInspectState().inspectPausedForCombat = true
 	end
 	self:_StartBackgroundInspectMonitor()
 end
