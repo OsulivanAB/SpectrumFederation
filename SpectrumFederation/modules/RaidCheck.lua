@@ -328,7 +328,7 @@ local function HasActiveLootHelperSession()
 		return false
 	end
 
-	return SF.LootHelperSync:IsSessionActive() and true or false
+	return SF.LootHelperSync:IsSessionActive()
 end
 
 local function CanInspectUnitNow(unit)
@@ -672,8 +672,8 @@ function RC:_StartBackgroundInspectMonitor()
 	state.backgroundMonitorStarted = true
 
 	local function Tick()
-		if not self or not self._inspectFrame then
-			local currentState = self and self._GetInspectState and self:_GetInspectState() or nil
+		if not self._inspectFrame then
+			local currentState = self._GetInspectState and self:_GetInspectState() or nil
 			if currentState then
 				currentState.backgroundMonitorStarted = false
 			end
@@ -1232,12 +1232,22 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	end
 
 	if cacheEntry and cacheEntry.slotsByInventory then
+		local status = "stale"
+		local label = "Stale"
+		local message = "Showing cached inspect data while a fresh snapshot loads."
+
+		if pausedForCombat then
+			label = "Paused"
+			message = "Showing cached inspect data until combat ends."
+		elseif activeKey == key then
+			status = "refreshing"
+			label = "Refreshing"
+		end
+
 		return {
-			status = pausedForCombat and "stale" or ((activeKey == key) and "refreshing" or "stale"),
-			label = pausedForCombat and "Paused" or ((activeKey == key) and "Refreshing" or "Stale"),
-			message = pausedForCombat
-				and "Showing cached inspect data until combat ends."
-				or "Showing cached inspect data while a fresh snapshot loads.",
+			status = status,
+			label = label,
+			message = message,
 			isKnown = true,
 			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
