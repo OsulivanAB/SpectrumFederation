@@ -327,6 +327,14 @@ local function GetTroubleshootingCaptureUnit(unit)
 end
 
 local function IsUnitInInspectRange(unit)
+	if not unit then
+		return false
+	end
+
+	if InCombatLockdown and InCombatLockdown() then
+		return false
+	end
+
 	if CheckInteractDistance then
 		return CheckInteractDistance(unit, 1) ~= false
 	end
@@ -1282,9 +1290,9 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
-	local inRange = unit and IsUnitInInspectRange(unit) or false
-	local canInspectNow = CanInspectUnitNow(unit)
 	local pausedForCombat = IsInspectPausedForCombat()
+	local inRange = (not pausedForCombat) and IsUnitInInspectRange(unit) or false
+	local canInspectNow = CanInspectUnitNow(unit)
 	local state = self:_GetInspectState()
 	local activeKey = state.active and state.active.key or nil
 	local key = aliases[1] or aliases[2]
