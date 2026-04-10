@@ -217,6 +217,7 @@ end
 IsRCLootCouncilLog = function(data)
 	data = data or {}
 	return data.reason == "RC_LOOT_COUNCIL"
+		or data.reason == "RC_LOOT_COUNCIL_REASSIGN"
 		or data.reason == "RC_LOOT_COUNCIL_SLOT_CONFLICT"
 		or data.source == "RCLootCouncil"
 end
