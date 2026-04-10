@@ -331,18 +331,17 @@ local function IsUnitInInspectRange(unit)
 		return false
 	end
 
-	if InCombatLockdown and InCombatLockdown() then
-		return false
-	end
-
 	if CheckInteractDistance then
+		if InCombatLockdown and InCombatLockdown() then
+			return false
+		end
 		return CheckInteractDistance(unit, 1) ~= false
 	end
 	return true
 end
 
 local function IsInspectPausedForCombat()
-	return InCombatLockdown()
+	return InCombatLockdown and InCombatLockdown() or false
 end
 
 local function HasActiveLootHelperSession()
@@ -1291,7 +1290,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	end
 
 	local pausedForCombat = IsInspectPausedForCombat()
-	local inRange = (not pausedForCombat) and IsUnitInInspectRange(unit) or false
+	local inRange = pausedForCombat and false or IsUnitInInspectRange(unit)
 	local canInspectNow = CanInspectUnitNow(unit)
 	local state = self:_GetInspectState()
 	local activeKey = state.active and state.active.key or nil
