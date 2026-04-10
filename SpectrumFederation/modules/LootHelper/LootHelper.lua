@@ -59,6 +59,7 @@ local function NormalizeRCLootCouncilAwardReason(reasonText)
     return reason
 end
 
+-- WoW chat escapes literal pipes as double pipes, so normalize before parsing links/items.
 local function NormalizeRCAwardMessageText(value)
     return type(value) == "string" and value:gsub("||", "|") or value
 end
@@ -334,6 +335,8 @@ local function ForgetRecentAwardSignature(cache, signature)
 end
 
 local function IsChatRollTypeMismatch(payload, payloadRollType, configuredRollType)
+    payloadRollType = tostring(payloadRollType or "")
+    configuredRollType = tostring(configuredRollType or "")
     return payload.sourceType == "chat"
         and payloadRollType ~= ""
         and payloadRollType:lower() ~= configuredRollType:lower()
