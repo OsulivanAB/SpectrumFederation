@@ -530,6 +530,10 @@ function Member:ApplyAwardedItem(slot, metadata)
     return true
 end
 
+-- Function to clear a previously-awarded item from a slot and refund the point.
+-- @param slot (string) - Use SF.ArmorSlots constants
+-- @param metadata table|nil Optional log metadata
+-- @return (boolean) - True if successful, false otherwise
 function Member:ClearAwardedItem(slot, metadata)
     metadata = metadata or {}
 

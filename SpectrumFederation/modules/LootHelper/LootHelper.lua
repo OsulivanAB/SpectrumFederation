@@ -9,6 +9,7 @@ local RC_LOOT_COUNCIL_SOURCE = "RCLootCouncil"
 local RC_LOOT_COUNCIL_REASON = "RC_LOOT_COUNCIL"
 local RC_LOOT_COUNCIL_REASSIGN_REASON = "RC_LOOT_COUNCIL_REASSIGN"
 local RC_LOOT_COUNCIL_CONFLICT_REASON = "RC_LOOT_COUNCIL_SLOT_CONFLICT"
+local RC_CHANGE_AWARD_PREFIX = "change award"
 local RC_AWARD_CHAT_EVENTS = {
     "CHAT_MSG_RAID",
     "CHAT_MSG_RAID_LEADER",
@@ -58,12 +59,16 @@ local function NormalizeRCLootCouncilAwardReason(reasonText)
     return reason
 end
 
+local function NormalizeRCAwardMessageText(value)
+    return type(value) == "string" and value:gsub("||", "|") or value
+end
+
 local function NormalizeRCAwardItemLink(itemLink)
     if type(itemLink) ~= "string" or itemLink == "" then
         return nil
     end
 
-    local normalized = TrimText(itemLink):gsub("||", "|")
+    local normalized = TrimText(NormalizeRCAwardMessageText(itemLink))
     local decoratedLink = normalized:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
     if decoratedLink and decoratedLink ~= "" then
         return decoratedLink
@@ -185,7 +190,7 @@ local function ParseRCAwardMessage(message)
         return nil
     end
 
-    local normalizedMessage = message:gsub("||", "|")
+    local normalizedMessage = NormalizeRCAwardMessageText(message)
     local prefixLabel, messageBody = ExtractRCAwardMessagePrefix(normalizedMessage)
     local itemReference, itemReferenceType = ExtractRCAwardItemReference(messageBody)
     if not itemReference then
@@ -218,7 +223,7 @@ local function ParseRCAwardMessage(message)
         itemReferenceType = itemReferenceType,
         reasonText = reasonText,
         prefixLabel = prefixLabel,
-        isChangeAward = type(prefixLabel) == "string" and prefixLabel:lower() == "change award",
+        isChangeAward = type(prefixLabel) == "string" and prefixLabel:lower() == RC_CHANGE_AWARD_PREFIX,
     }
 end
 
@@ -326,6 +331,12 @@ local function ForgetRecentAwardSignature(cache, signature)
     end
 
     cache[signature] = nil
+end
+
+local function IsChatRollTypeMismatch(payload, payloadRollType, configuredRollType)
+    return payload.sourceType == "chat"
+        and payloadRollType ~= ""
+        and payloadRollType:lower() ~= configuredRollType:lower()
 end
 
 local function JoinStringList(values)
@@ -512,7 +523,7 @@ function SF:ProcessRCLootCouncilAward(payload)
         end
         return false
     end
-    if payload.sourceType == "chat" and payloadRollType ~= "" and payloadRollType:lower() ~= configuredRollType:lower() and SF.Debug then
+    if IsChatRollTypeMismatch(payload, payloadRollType, configuredRollType) and SF.Debug then
         SF.Debug:Verbose(
             "RC_LOOT_COUNCIL",
             "Accepting chat RC award with unmatched raw roll type '%s'; using configured '%s' instead",
