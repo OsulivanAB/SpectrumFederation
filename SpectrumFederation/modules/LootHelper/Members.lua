@@ -530,6 +530,106 @@ function Member:ApplyAwardedItem(slot, metadata)
     return true
 end
 
+function Member:ClearAwardedItem(slot, metadata)
+    metadata = metadata or {}
+
+    if not CanCurrentUserEditActiveProfile() then
+        return false
+    end
+
+    if self.armor[slot] == nil then
+        SF:PrintError("Invalid armor slot specified: " .. tostring(slot))
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Invalid clear-award slot '%s' for %s", tostring(slot), self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    if self.armor[slot] ~= true then
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Clear-award slot '%s' is not used for %s", tostring(slot), self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    local armorLogEventType = SF.LootLogEventTypes.ARMOR_CHANGE
+    local armorLogEventData = SF.LootLog.GetEventDataTemplate(armorLogEventType)
+    armorLogEventData.member = self:GetFullIdentifier()
+    armorLogEventData.slot = slot
+    armorLogEventData.action = SF.LootLogArmorActions.AVAILABLE
+    if metadata.reason ~= nil then
+        armorLogEventData.reason = tostring(metadata.reason)
+    end
+    if metadata.source ~= nil then
+        armorLogEventData.source = tostring(metadata.source)
+    end
+    if metadata.rollType ~= nil then
+        armorLogEventData.rollType = tostring(metadata.rollType)
+    end
+    if metadata.itemLink ~= nil then
+        armorLogEventData.itemLink = tostring(metadata.itemLink)
+    end
+
+    local logOpts = {}
+    if metadata.logAuthor ~= nil then
+        logOpts.author = tostring(metadata.logAuthor)
+    end
+    if metadata.timestamp ~= nil then
+        logOpts.timestamp = metadata.timestamp
+    end
+
+    local armorLogEntry = SF.LootLog.new(armorLogEventType, armorLogEventData, logOpts)
+    if not armorLogEntry then
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create armor clear log for %s", self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
+    local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
+    pointLogEventData.member = self:GetFullIdentifier()
+    pointLogEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+    if metadata.reason ~= nil then
+        pointLogEventData.reason = tostring(metadata.reason)
+    end
+    if metadata.source ~= nil then
+        pointLogEventData.source = tostring(metadata.source)
+    end
+    if metadata.rollType ~= nil then
+        pointLogEventData.rollType = tostring(metadata.rollType)
+    end
+    if metadata.itemLink ~= nil then
+        pointLogEventData.itemLink = tostring(metadata.itemLink)
+    end
+
+    local pointLogEntry = SF.LootLog.new(pointLogEventType, pointLogEventData, logOpts)
+    if not pointLogEntry then
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create point clear log for %s", self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    self.armor[slot] = false
+    self.pointBalance = self.pointBalance + 1
+
+    AddLootLogToActiveProfile(armorLogEntry)
+    AddLootLogToActiveProfile(pointLogEntry)
+
+    if SF.Debug then
+        SF.Debug:Info(
+            "MEMBER",
+            "Cleared awarded item for %s: slot=%s points=%d",
+            self:GetFullIdentifier(),
+            tostring(slot),
+            self.pointBalance
+        )
+    end
+
+    return true
+end
+
 -- Function to toggle equipment slot usage (for UI button clicks)
 -- Each armor slot can only be used ONCE per member (one point per slot maximum)
 -- @param slot (string) - Use SF.ArmorSlots constants
