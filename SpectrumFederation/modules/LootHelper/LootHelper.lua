@@ -334,7 +334,7 @@ local function ForgetRecentAwardSignature(cache, signature)
     cache[signature] = nil
 end
 
-local function IsChatRollTypeMismatch(payload, rawPayloadRollType, rawConfiguredRollType)
+local function HasChatRollTypeMismatch(payload, rawPayloadRollType, rawConfiguredRollType)
     local payloadRollType = tostring(rawPayloadRollType or "")
     local configuredRollType = tostring(rawConfiguredRollType or "")
     return payload.sourceType == "chat"
@@ -526,7 +526,7 @@ function SF:ProcessRCLootCouncilAward(payload)
         end
         return false
     end
-    if IsChatRollTypeMismatch(payload, payloadRollType, configuredRollType) and SF.Debug then
+    if HasChatRollTypeMismatch(payload, payloadRollType, configuredRollType) and SF.Debug then
         SF.Debug:Verbose(
             "RC_LOOT_COUNCIL",
             "Accepting chat RC award with unmatched raw roll type '%s'; using configured '%s' instead",
