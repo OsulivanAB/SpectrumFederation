@@ -334,9 +334,9 @@ local function ForgetRecentAwardSignature(cache, signature)
     cache[signature] = nil
 end
 
-local function IsChatRollTypeMismatch(payload, payloadRollType, configuredRollType)
-    payloadRollType = tostring(payloadRollType or "")
-    configuredRollType = tostring(configuredRollType or "")
+local function IsChatRollTypeMismatch(payload, rawPayloadRollType, rawConfiguredRollType)
+    local payloadRollType = tostring(rawPayloadRollType or "")
+    local configuredRollType = tostring(rawConfiguredRollType or "")
     return payload.sourceType == "chat"
         and payloadRollType ~= ""
         and payloadRollType:lower() ~= configuredRollType:lower()
@@ -574,7 +574,10 @@ function SF:ProcessRCLootCouncilAward(payload)
     end
 
     self._rcLootCouncilRecentAwards = self._rcLootCouncilRecentAwards or {}
-    local itemKey = payload.itemKey or BuildRCAwardItemKey(payload.itemLink) or tostring(payload.itemLink)
+    local itemKey = payload.itemKey
+    if not itemKey then
+        itemKey = BuildRCAwardItemKey(payload.itemLink) or tostring(payload.itemLink)
+    end
     local signature = table.concat({ tostring(memberId), tostring(itemKey), tostring(configuredRollType) }, "\031")
     local lastSeen = self._rcLootCouncilRecentAwards[signature]
     if lastSeen and (now - lastSeen) < RC_AWARD_EVENT_WINDOW_SECONDS then
