@@ -56,6 +56,7 @@ end
 function LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES)
     local memberID = eventData.member
     local changeType = eventData.change
+    local amount = eventData.amount
 
     -- Validate member exists in profiles
     if not LootLogValidators.MemberExistsInProfiles(memberID) then
@@ -71,6 +72,16 @@ function LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES
             SF.Debug:Warn("LOOTLOG", "Invalid point change type in log for member %s: %s", tostring(memberID), tostring(changeType))
         end
         return false
+    end
+
+    if amount ~= nil then
+        amount = tonumber(amount)
+        if not amount or amount <= 0 then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid point change amount in log for member %s: %s", tostring(memberID), tostring(eventData.amount))
+            end
+            return false
+        end
     end
 
     return true

@@ -7,7 +7,9 @@ local RC_AWARD_ITEMINFO_MAX_RETRIES = 2
 local RC_LOOT_COUNCIL_AUTHOR = "RC Loot Council"
 local RC_LOOT_COUNCIL_SOURCE = "RCLootCouncil"
 local RC_LOOT_COUNCIL_REASON = "RC_LOOT_COUNCIL"
+local RC_LOOT_COUNCIL_REASSIGN_REASON = "RC_LOOT_COUNCIL_REASSIGN"
 local RC_LOOT_COUNCIL_CONFLICT_REASON = "RC_LOOT_COUNCIL_SLOT_CONFLICT"
+local RC_CHANGE_AWARD_PREFIX = "change award"
 local RC_AWARD_CHAT_EVENTS = {
     "CHAT_MSG_RAID",
     "CHAT_MSG_RAID_LEADER",
@@ -57,12 +59,113 @@ local function NormalizeRCLootCouncilAwardReason(reasonText)
     return reason
 end
 
+-- WoW chat escapes literal pipes as double pipes, so normalize before parsing links/items.
+local function NormalizeRCAwardMessageText(value)
+    return type(value) == "string" and value:gsub("||", "|") or value
+end
+
+local function NormalizeRCAwardItemLink(itemLink)
+    if type(itemLink) ~= "string" or itemLink == "" then
+        return nil
+    end
+
+    local normalized = TrimText(NormalizeRCAwardMessageText(itemLink))
+    local decoratedLink = normalized:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+    if decoratedLink and decoratedLink ~= "" then
+        return decoratedLink
+    end
+
+    local plainLink = normalized:match("(|Hitem:.-|h%[.-%]|h)")
+    if plainLink and plainLink ~= "" then
+        return plainLink
+    end
+
+    return normalized ~= "" and normalized or nil
+end
+
+local function NormalizeRCAwardItemName(itemName)
+    itemName = TrimText(itemName)
+    local bracketed = itemName:match("^%[(.-)%]$")
+    if bracketed and bracketed ~= "" then
+        itemName = bracketed
+    end
+    return itemName
+end
+
 local function ExtractRCAwardItemLink(message)
     if type(message) ~= "string" or message == "" then
         return nil
     end
 
     return message:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+end
+
+local function ExtractRCAwardItemReference(message)
+    local itemLink = ExtractRCAwardItemLink(message)
+    if itemLink then
+        return NormalizeRCAwardItemLink(itemLink), "link"
+    end
+
+    local bracketedName = type(message) == "string" and message:match("(%b[])") or nil
+    if bracketedName then
+        local normalizedName = NormalizeRCAwardItemName(bracketedName)
+        if normalizedName ~= "" then
+            return normalizedName, "name"
+        end
+    end
+
+    return nil, nil
+end
+
+local function ExtractRCAwardMessagePrefix(message)
+    if type(message) ~= "string" then
+        return nil, message
+    end
+
+    local prefix, remainder = message:match("^(%b())%s*(.*)$")
+    if prefix and remainder and remainder ~= "" then
+        return TrimText(prefix:sub(2, -2)), remainder
+    end
+
+    return nil, message
+end
+
+local function BuildRCAwardItemKey(itemReference)
+    if type(itemReference) ~= "string" or itemReference == "" then
+        return nil
+    end
+
+    local itemString = itemReference:match("|H(item:[^|]+)|h")
+    if itemString and itemString ~= "" then
+        return itemString
+    end
+
+    local normalizedName = NormalizeRCAwardItemName(itemReference)
+    if normalizedName == "" then
+        return nil
+    end
+
+    return normalizedName:lower()
+end
+
+local function BuildRCAwardDeduplicationKey(itemReference)
+    if type(itemReference) ~= "string" or itemReference == "" then
+        return nil
+    end
+
+    local itemIdText = itemReference:match("|Hitem:(%d+):") or itemReference:match("^item:(%d+):")
+    if not itemIdText and type(GetItemInfoInstant) == "function" then
+        local itemId = GetItemInfoInstant(itemReference)
+        if tonumber(itemId) and tonumber(itemId) > 0 then
+            itemIdText = tostring(itemId)
+        end
+    end
+
+    if itemIdText and itemIdText ~= "" then
+        return "itemid:" .. itemIdText
+    end
+
+    return BuildRCAwardItemKey(itemReference)
 end
 
 local function FindProfileMemberIdByName(profile, winnerName)
@@ -104,20 +207,26 @@ local function FindProfileMemberIdByName(profile, winnerName)
 end
 
 local function ParseRCAwardMessage(message)
-    local itemLink = ExtractRCAwardItemLink(message)
-    if not itemLink then
+    if type(message) ~= "string" or message == "" then
+        return nil
+    end
+
+    local normalizedMessage = NormalizeRCAwardMessageText(message)
+    local prefixLabel, messageBody = ExtractRCAwardMessagePrefix(normalizedMessage)
+    local itemReference, itemReferenceType = ExtractRCAwardItemReference(messageBody)
+    if not itemReference then
         return nil
     end
 
     local awardPrefix = " was awarded with "
-    local prefixStart = message:find(awardPrefix, 1, true)
-    local itemStart, itemEnd = message:find(itemLink, 1, true)
+    local prefixStart = messageBody:find(awardPrefix, 1, true)
+    local itemStart, itemEnd = messageBody:find(itemReference, 1, true)
     if not prefixStart or not itemStart or prefixStart >= itemStart then
         return nil
     end
 
-    local winnerName = TrimText(message:sub(1, prefixStart - 1))
-    local afterItem = message:sub(itemEnd + 1)
+    local winnerName = TrimText(messageBody:sub(1, prefixStart - 1))
+    local afterItem = messageBody:sub(itemEnd + 1)
     local reasonPos = afterItem:find(" for ", 1, true)
     if not reasonPos then
         return nil
@@ -130,8 +239,12 @@ local function ParseRCAwardMessage(message)
 
     return {
         winnerName = winnerName,
-        itemLink = itemLink,
+        itemLink = itemReference,
+        itemKey = BuildRCAwardItemKey(itemReference),
+        itemReferenceType = itemReferenceType,
         reasonText = reasonText,
+        prefixLabel = prefixLabel,
+        isChangeAward = type(prefixLabel) == "string" and prefixLabel:lower() == RC_CHANGE_AWARD_PREFIX,
     }
 end
 
@@ -145,20 +258,44 @@ local function IsPotentialRCAwardMessage(message)
 end
 
 local function ResolveRCLootCouncilAwardSlots(itemLink)
-    if type(itemLink) ~= "string" or itemLink == "" or type(GetItemInfoInstant) ~= "function" then
-        return nil, nil, false
+    if type(itemLink) ~= "string" or itemLink == "" then
+        return nil, nil, false, itemLink
     end
 
-    local _, _, _, equipLoc = GetItemInfoInstant(itemLink)
-    if not equipLoc then
-        if type(GetItemInfo) == "function" then
-            GetItemInfo(itemLink)
+    local itemReference = itemLink
+    local normalizedName = nil
+    if not itemReference:find("|Hitem:", 1, true) then
+        normalizedName = NormalizeRCAwardItemName(itemReference)
+        itemReference = normalizedName
+    end
+
+    local resolvedItemLink = itemReference
+    local equipLoc = nil
+
+    if type(GetItemInfoInstant) == "function" then
+        local _, _, _, instantEquipLoc = GetItemInfoInstant(itemReference)
+        equipLoc = instantEquipLoc
+    end
+
+    if (not equipLoc or equipLoc == "") and type(GetItemInfo) == "function" then
+        local _, itemLinkFromInfo, _, _, _, _, _, _, itemEquipLoc = GetItemInfo(itemReference)
+        if itemLinkFromInfo and itemLinkFromInfo ~= "" then
+            resolvedItemLink = itemLinkFromInfo
+        elseif normalizedName and normalizedName ~= "" then
+            resolvedItemLink = normalizedName
         end
-        return nil, nil, true
+        equipLoc = itemEquipLoc or equipLoc
+    end
+
+    if not equipLoc or equipLoc == "" then
+        if type(GetItemInfo) == "function" then
+            GetItemInfo(itemReference)
+        end
+        return nil, nil, true, resolvedItemLink
     end
 
     local slots = equipLoc and RC_EQUIP_LOC_TO_ARMOR_SLOTS[equipLoc] or nil
-    return slots, equipLoc, false
+    return slots, equipLoc, false, resolvedItemLink
 end
 
 local function ClonePayload(payload)
@@ -207,6 +344,14 @@ local function SelectAvailableAwardSlot(member, slotCandidates)
     end
 
     return nil
+end
+
+local function ForgetRecentAwardSignature(cache, signature)
+    if type(cache) ~= "table" or type(signature) ~= "string" or signature == "" then
+        return
+    end
+
+    cache[signature] = nil
 end
 
 local function JoinStringList(values)
@@ -318,7 +463,11 @@ local function BuildRCLootCouncilAwardPayloadFromChatMessage(message, chatEvent)
     return {
         winnerName = parsed.winnerName,
         itemLink = parsed.itemLink,
+        itemKey = parsed.itemKey,
+        itemReferenceType = parsed.itemReferenceType,
         rollType = parsed.reasonText,
+        prefixLabel = parsed.prefixLabel,
+        isChangeAward = parsed.isChangeAward,
         sourceType = "chat",
         chatEvent = chatEvent,
     }
@@ -331,6 +480,8 @@ function SF:ProcessRCLootCouncilAward(payload)
         end
         return false
     end
+
+    payload.itemLink = NormalizeRCAwardItemLink(payload.itemLink)
 
     if SF.Debug then
         SF.Debug:Verbose(
@@ -376,7 +527,7 @@ function SF:ProcessRCLootCouncilAward(payload)
     end
 
     local payloadRollType = NormalizeRCLootCouncilAwardReason(payload.rollType)
-    if payloadRollType:lower() ~= configuredRollType:lower() then
+    if payloadRollType == "" or payloadRollType:lower() ~= configuredRollType:lower() then
         if SF.Debug then
             SF.Debug:Verbose(
                 "RC_LOOT_COUNCIL",
@@ -427,7 +578,12 @@ function SF:ProcessRCLootCouncilAward(payload)
     end
 
     self._rcLootCouncilRecentAwards = self._rcLootCouncilRecentAwards or {}
-    local signature = table.concat({ tostring(memberId), tostring(payload.itemLink), tostring(configuredRollType) }, "\031")
+    local itemKey = payload.itemKey
+    if not itemKey then
+        itemKey = BuildRCAwardItemKey(payload.itemLink) or tostring(payload.itemLink)
+    end
+    local deduplicationKey = BuildRCAwardDeduplicationKey(payload.itemLink) or itemKey
+    local signature = table.concat({ tostring(memberId), tostring(deduplicationKey), tostring(configuredRollType) }, "\031")
     local lastSeen = self._rcLootCouncilRecentAwards[signature]
     if lastSeen and (now - lastSeen) < RC_AWARD_EVENT_WINDOW_SECONDS then
         if SF.Debug then
@@ -451,7 +607,13 @@ function SF:ProcessRCLootCouncilAward(payload)
         return false
     end
 
-    local slotCandidates, equipLoc, itemInfoPending = ResolveRCLootCouncilAwardSlots(payload.itemLink)
+    local slotCandidates, equipLoc, itemInfoPending, resolvedItemLink = ResolveRCLootCouncilAwardSlots(payload.itemLink)
+    if resolvedItemLink and resolvedItemLink ~= "" then
+        payload.itemLink = resolvedItemLink
+        itemKey = BuildRCAwardItemKey(resolvedItemLink) or itemKey
+        deduplicationKey = BuildRCAwardDeduplicationKey(resolvedItemLink) or deduplicationKey
+        signature = table.concat({ tostring(memberId), tostring(deduplicationKey), tostring(configuredRollType) }, "\031")
+    end
     if itemInfoPending then
         local retryScheduled, retryCount = ScheduleRCLootCouncilAwardRetry(self, payload)
         if SF.Debug then
@@ -465,6 +627,49 @@ function SF:ProcessRCLootCouncilAward(payload)
             )
         end
         return false
+    end
+
+    self._rcLootCouncilItemAssignments = self._rcLootCouncilItemAssignments or {}
+    local priorAssignment = payload.isChangeAward and itemKey and self._rcLootCouncilItemAssignments[itemKey] or nil
+    if priorAssignment and priorAssignment.memberId ~= memberId then
+        local priorMember = getMemberByID and getMemberByID(profile, priorAssignment.memberId) or nil
+        if not priorMember or type(priorMember.ClearAwardedItem) ~= "function" then
+            if SF.Debug then
+                SF.Debug:Warn(
+                    "RC_LOOT_COUNCIL",
+                    "Unable to clear previous RC assignment for item=%s member=%s slot=%s",
+                    tostring(payload.itemLink),
+                    tostring(priorAssignment.memberId),
+                    tostring(priorAssignment.slotName)
+                )
+            end
+            return false
+        end
+
+        local cleared = priorMember:ClearAwardedItem(priorAssignment.slotName, {
+            logAuthor = RC_LOOT_COUNCIL_AUTHOR,
+            reason = RC_LOOT_COUNCIL_REASSIGN_REASON,
+            source = RC_LOOT_COUNCIL_SOURCE,
+            rollType = configuredRollType,
+            itemLink = payload.itemLink,
+        })
+        if not cleared then
+            if SF.Debug then
+                SF.Debug:Warn(
+                    "RC_LOOT_COUNCIL",
+                    "Failed to clear previous RC assignment for item=%s member=%s slot=%s",
+                    tostring(payload.itemLink),
+                    tostring(priorAssignment.memberId),
+                    tostring(priorAssignment.slotName)
+                )
+            end
+            return false
+        end
+
+        ForgetRecentAwardSignature(
+            self._rcLootCouncilRecentAwards,
+            table.concat({ tostring(priorAssignment.memberId), tostring(deduplicationKey), tostring(configuredRollType) }, "\031")
+        )
     end
 
     if SF.Debug then
@@ -557,6 +762,13 @@ function SF:ProcessRCLootCouncilAward(payload)
 
     if ok then
         self._rcLootCouncilRecentAwards[signature] = now
+        if itemKey then
+            self._rcLootCouncilItemAssignments[itemKey] = {
+                memberId = memberId,
+                slotName = slotName,
+                assignedAt = now,
+            }
+        end
         if SF.Debug then
             SF.Debug:Info(
                 "RC_LOOT_COUNCIL",
@@ -867,6 +1079,9 @@ function SF:RehydrateLootHelperDB()
 
 			if type(profile._EnsureRaidCheckConfig) == "function" then
 				profile:_EnsureRaidCheckConfig()
+			end
+			if type(profile._EnsureRaidCheckEquipmentSnapshots) == "function" then
+				profile:_EnsureRaidCheckEquipmentSnapshots()
 			end
 
 			-- Restore Member methods

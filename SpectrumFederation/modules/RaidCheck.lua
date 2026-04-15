@@ -5,18 +5,20 @@ local addonName, SF = ...
 -- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
 -- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetDetailedItemLevelInfo C_Item
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
--- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime
+-- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
 
 local RAID_CHECK_REASON = "RAID_CHECK"
+local RAID_CHECK_POINT_AWARD = 0.5
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
 local INSPECT_CACHE_TTL_SECONDS = 30
 local INSPECT_RETRY_BASE_SECONDS = 2
 local INSPECT_RETRY_MAX_SECONDS = 10
 local INSPECT_REQUEST_TIMEOUT_SECONDS = 1.5
+local BACKGROUND_INSPECT_POLL_SECONDS = 5
 local SLOT_DEFS = {
 	head = { label = "Head", slots = { INVSLOT_HEAD } },
 	neck = { label = "Neck", slots = { INVSLOT_NECK } },
@@ -94,6 +96,20 @@ local function ColorizeUnitName(unit, name)
 
 	local _, classToken = UnitClass(unit)
 	local classData = classToken and SF.WOW_CLASSES and SF.WOW_CLASSES[classToken]
+	if classData and classData.colorCode then
+		return string.format("%s%s|r", ToWoWHexColor(classData.colorCode), name)
+	end
+
+	return name
+end
+
+local function ColorizeProfileMemberName(profile, memberId, name)
+	if not profile or type(profile.GetMemberByID) ~= "function" or not name or name == "" then
+		return name or "Unknown"
+	end
+
+	local member = profile:GetMemberByID(memberId)
+	local classData = member and member.class and SF.WOW_CLASSES and SF.WOW_CLASSES[member.class]
 	if classData and classData.colorCode then
 		return string.format("%s%s|r", ToWoWHexColor(classData.colorCode), name)
 	end
@@ -312,15 +328,35 @@ local function GetTroubleshootingCaptureUnit(unit)
 end
 
 local function IsUnitInInspectRange(unit)
+	if not unit then
+		return false
+	end
+
 	if CheckInteractDistance then
+		if InCombatLockdown and InCombatLockdown() then
+			return false
+		end
 		return CheckInteractDistance(unit, 1) ~= false
 	end
 	return true
 end
 
+local function IsInspectPausedForCombat()
+	return InCombatLockdown and InCombatLockdown() or false
+end
+
+local function HasActiveLootHelperSession()
+	if not SF.LootHelperSync or type(SF.LootHelperSync.IsSessionActive) ~= "function" then
+		return false
+	end
+
+	return SF.LootHelperSync:IsSessionActive()
+end
+
 local function CanInspectUnitNow(unit)
 	return unit
 		and UnitExists and UnitExists(unit)
+		and not IsInspectPausedForCombat()
 		and CanInspect and CanInspect(unit)
 		and IsUnitInInspectRange(unit)
 end
@@ -402,6 +438,61 @@ local function GetProfile()
 	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
 end
 
+local function PersistProfileEquipmentSnapshot(memberId, captured)
+	local profile = GetProfile()
+	if not profile or type(profile.SetRaidCheckEquipmentSnapshot) ~= "function" then
+		return false
+	end
+	if type(memberId) ~= "string" or memberId == "" or type(captured) ~= "table" or type(captured.slotsByInventory) ~= "table" then
+		return false
+	end
+
+	return profile:SetRaidCheckEquipmentSnapshot(memberId, {
+		capturedAt = GetServerTime and GetServerTime() or nil,
+		averageItemLevel = captured.averageItemLevel,
+		slotsByInventory = captured.slotsByInventory,
+	})
+end
+
+local function GetProfileEquipmentSnapshot(memberId)
+	local profile = GetProfile()
+	if not profile or type(profile.GetRaidCheckEquipmentSnapshot) ~= "function" then
+		return nil
+	end
+	if type(memberId) ~= "string" or memberId == "" then
+		return nil
+	end
+	return profile:GetRaidCheckEquipmentSnapshot(memberId)
+end
+
+local function BuildSavedSnapshotMessage(snapshot, whileRefreshing)
+	local baseMessage = whileRefreshing
+		and "Showing the saved profile snapshot while a fresh inspect loads."
+		or "Showing the last saved profile snapshot for this member."
+	local capturedAt = snapshot and snapshot.capturedAt or nil
+	if type(capturedAt) ~= "number" or capturedAt <= 0 then
+		return baseMessage
+	end
+
+	local now = GetServerTime and GetServerTime() or nil
+	if type(now) ~= "number" or now < capturedAt then
+		return baseMessage
+	end
+
+	local ageSeconds = math.max(0, now - capturedAt)
+	if ageSeconds < 60 then
+		return baseMessage .. " Last seen less than a minute ago."
+	end
+	if ageSeconds < 3600 then
+		return string.format("%s Last seen %dm ago.", baseMessage, math.floor(ageSeconds / 60))
+	end
+	if ageSeconds < 86400 then
+		return string.format("%s Last seen %dh ago.", baseMessage, math.floor(ageSeconds / 3600))
+	end
+
+	return string.format("%s Last seen %dd ago.", baseMessage, math.floor(ageSeconds / 86400))
+end
+
 local function FindUnitByGuidOrId(guid, id)
 	for _, unit in ipairs(CollectUnits()) do
 		if guid and UnitGUID and UnitGUID(unit) == guid then
@@ -458,9 +549,11 @@ function RC:_GetInspectState()
 		queued = {},
 		listeners = {},
 		active = nil,
+		inspectPausedForCombat = false,
 		localSnapshot = nil,
 		snapshotVersion = 0,
 		lastNotifiedVersion = -1,
+		backgroundMonitorStarted = false,
 	}
 	return self._inspectState
 end
@@ -496,7 +589,11 @@ function RC:_GetLocalTroubleshootingSnapshot()
 		slotsByInventory = captured.slotsByInventory,
 		sawAnyData = captured.sawAnyData,
 		preparedSlotsByConfig = {},
+		capturedAt = GetServerTime and GetServerTime() or nil,
 	}
+	if captured.sawAnyData then
+		PersistProfileEquipmentSnapshot(SF:GetPlayerFullIdentifier(), captured)
+	end
 	return state.localSnapshot
 end
 
@@ -607,6 +704,101 @@ function RC:_InvalidateInspectUnit(unit)
 	self:_NotifyTroubleshootingListeners()
 end
 
+function RC:_PrimeBackgroundInspectQueue()
+	if not HasActiveLootHelperSession() or IsInspectPausedForCombat() then
+		return
+	end
+
+	local now = GetTime and GetTime() or 0
+
+	for _, unit in ipairs(CollectUnits()) do
+		if not IsSelfUnit(unit) then
+			local info = BuildUnitInfo(unit)
+			if info.id then
+				local aliases = self:_GetInspectAliases(unit, info)
+				local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+				local hasFreshData = cacheEntry
+					and cacheEntry.updatedAt
+					and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
+
+				if not hasFreshData then
+					self:_QueueInspectForUnit(unit, info, cacheEntry)
+				end
+			end
+		end
+	end
+end
+
+function RC:_RunBackgroundInspectPass()
+	self:_PrimeBackgroundInspectQueue()
+end
+
+function RC:_StartBackgroundInspectMonitor()
+	local state = self:_GetInspectState()
+	if state.backgroundMonitorStarted or not (C_Timer and C_Timer.After) then
+		return
+	end
+
+	state.backgroundMonitorStarted = true
+
+	local function BackgroundInspectTick()
+		if not self._inspectFrame then
+			self:_GetInspectState().backgroundMonitorStarted = false
+			return
+		end
+
+		self:_RunBackgroundInspectPass()
+		C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, BackgroundInspectTick)
+	end
+
+	C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, BackgroundInspectTick)
+end
+
+function RC:_PauseInspectForCombat()
+	local state = self:_GetInspectState()
+	if state.inspectPausedForCombat then
+		return
+	end
+
+	state.inspectPausedForCombat = true
+
+	if state.active then
+		local active = state.active
+		state.active = nil
+
+		if active.key and not state.queued[active.key] then
+			state.queued[active.key] = true
+			local insertAt = state.queueHead
+			table.insert(state.queue, insertAt, {
+				key = active.key,
+				guid = active.guid,
+				id = active.id,
+				aliases = active.aliases,
+			})
+		end
+
+		if ClearInspectPlayer then
+			pcall(ClearInspectPlayer)
+		end
+	end
+
+	self:_MarkTroubleshootingDirty()
+	self:_NotifyTroubleshootingListeners()
+end
+
+function RC:_ResumeInspectAfterCombat()
+	local state = self:_GetInspectState()
+	if not state.inspectPausedForCombat then
+		return
+	end
+
+	state.inspectPausedForCombat = false
+	self:_ProcessInspectQueue()
+	self:_RunBackgroundInspectPass()
+	self:_MarkTroubleshootingDirty()
+	self:_NotifyTroubleshootingListeners()
+end
+
 function RC:EnsureInspectSupport()
 	if self._inspectFrame then
 		return
@@ -617,11 +809,17 @@ function RC:EnsureInspectSupport()
 	frame:RegisterEvent("INSPECT_READY")
 	frame:RegisterEvent("GROUP_ROSTER_UPDATE")
 	frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+	frame:RegisterEvent("PLAYER_REGEN_DISABLED")
+	frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 	frame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 	frame:RegisterEvent("UNIT_INVENTORY_CHANGED")
 	frame:SetScript("OnEvent", function(_, event, arg1)
 		if event == "INSPECT_READY" then
 			self:_HandleInspectReady(arg1)
+		elseif event == "PLAYER_REGEN_DISABLED" then
+			self:_PauseInspectForCombat()
+		elseif event == "PLAYER_REGEN_ENABLED" then
+			self:_ResumeInspectAfterCombat()
 		elseif event == "PLAYER_EQUIPMENT_CHANGED" then
 			if SF.Debug then
 				SF.Debug:Verbose("RAID_CHECK", "PLAYER_EQUIPMENT_CHANGED fired for slot %s; invalidating player inventory state and notifying troubleshooting listeners", tostring(arg1))
@@ -645,12 +843,19 @@ function RC:EnsureInspectSupport()
 				pcall(ClearInspectPlayer)
 			end
 			self:_NotifyTroubleshootingListeners()
+			self:_RunBackgroundInspectPass()
 		elseif event == "GROUP_ROSTER_UPDATE" then
 			self:_MarkTroubleshootingDirty()
 			self:_NotifyTroubleshootingListeners()
 			self:_ProcessInspectQueue()
+			self:_RunBackgroundInspectPass()
 		end
 	end)
+
+	if IsInspectPausedForCombat() then
+		self:_GetInspectState().inspectPausedForCombat = true
+	end
+	self:_StartBackgroundInspectMonitor()
 end
 
 function RC:_HandleInspectTimeout(key, requestedAt)
@@ -713,6 +918,7 @@ function RC:_HandleInspectReady(guid)
 		entry.updatedAt = now
 		entry.averageItemLevel = captured.averageItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
+		PersistProfileEquipmentSnapshot(active.id, captured)
 	else
 		entry.status = "timeout"
 		entry.failCount = (entry.failCount or 0) + 1
@@ -737,7 +943,7 @@ end
 
 function RC:_ProcessInspectQueue()
 	local state = self:_GetInspectState()
-	if state.active then
+	if state.active or state.inspectPausedForCombat then
 		return
 	end
 
@@ -1051,6 +1257,7 @@ end
 
 function RC:_GetTroubleshootingInspectState(unit, info)
 	self:EnsureInspectSupport()
+	local memberId = info and info.id or nil
 
 	if IsSelfUnit(unit) then
 		local captured = self:_GetLocalTroubleshootingSnapshot()
@@ -1068,6 +1275,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 
 	local aliases = self:_GetInspectAliases(unit, info)
 	local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+	local profileSnapshot = GetProfileEquipmentSnapshot(memberId)
 	local now = GetTime and GetTime() or 0
 	local hasFreshData = cacheEntry and cacheEntry.updatedAt and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
 
@@ -1082,7 +1290,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
-	local inRange = IsUnitInInspectRange(unit)
+	local pausedForCombat = IsInspectPausedForCombat()
+	local inRange = pausedForCombat and false or IsUnitInInspectRange(unit)
 	local canInspectNow = CanInspectUnitNow(unit)
 	local state = self:_GetInspectState()
 	local activeKey = state.active and state.active.key or nil
@@ -1093,10 +1302,22 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	end
 
 	if cacheEntry and cacheEntry.slotsByInventory then
+		local status = "stale"
+		local label = "Stale"
+		local message = "Showing cached inspect data while a fresh snapshot loads."
+
+		if pausedForCombat then
+			label = "Paused"
+			message = "Showing cached inspect data until combat ends."
+		elseif activeKey == key then
+			status = "refreshing"
+			label = "Refreshing"
+		end
+
 		return {
-			status = (activeKey == key) and "refreshing" or "stale",
-			label = (activeKey == key) and "Refreshing" or "Stale",
-			message = "Showing cached inspect data while a fresh snapshot loads.",
+			status = status,
+			label = label,
+			message = message,
 			isKnown = true,
 			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
@@ -1106,11 +1327,57 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
+	if profileSnapshot and profileSnapshot.slotsByInventory then
+		local status = "saved"
+		local label = "Saved"
+		local message = BuildSavedSnapshotMessage(profileSnapshot, false)
+
+		if pausedForCombat and unit then
+			status = "paused"
+			label = "Paused"
+			message = "Showing the saved profile snapshot until combat ends."
+		elseif activeKey == key then
+			status = "refreshing"
+			label = "Refreshing"
+			message = BuildSavedSnapshotMessage(profileSnapshot, true)
+		elseif canInspectNow then
+			status = "loading"
+			label = "Loading"
+			message = BuildSavedSnapshotMessage(profileSnapshot, true)
+		elseif unit and not inRange then
+			status = "out_of_range"
+			label = "Out of range"
+			message = "Showing the saved profile snapshot. Move closer to refresh this player."
+		end
+
+		return {
+			status = status,
+			label = label,
+			message = message,
+			isKnown = true,
+			averageItemLevel = profileSnapshot.averageItemLevel,
+			slotsByInventory = profileSnapshot.slotsByInventory,
+			entry = profileSnapshot,
+			stale = true,
+			cacheHolder = profileSnapshot,
+		}
+	end
+
 	if cacheEntry and cacheEntry.nextRetryAt and cacheEntry.nextRetryAt > now then
 		return {
 			status = "retrying",
 			label = "Retrying",
 			message = "Last inspect attempt timed out. Raid Check will retry shortly.",
+			isKnown = false,
+			stale = false,
+		}
+	end
+
+	if pausedForCombat then
+		return {
+			status = "paused",
+			label = "Paused",
+			message = "Inspect is paused during combat and will resume afterwards.",
 			isKnown = false,
 			stale = false,
 		}
@@ -1196,12 +1463,24 @@ local function FormatMissingList(missing)
 	return table.concat(missing, ", ")
 end
 
+local function FormatPointAmount(amount)
+	amount = tonumber(amount) or 0
+	if amount == math.floor(amount) then
+		return tostring(amount)
+	end
+
+	local text = string.format("%.2f", amount)
+	text = text:gsub("0+$", ""):gsub("%.$", "")
+	return text
+end
+
 local function AwardPrepared(profile, member, pointName)
 	if not member or not member.IncrementPoints then
 		return false
 	end
 
 	local ok = member:IncrementPoints({
+		amount = RAID_CHECK_POINT_AWARD,
 		logAuthor = "Raid Check",
 		reason = RAID_CHECK_REASON,
 	})
@@ -1212,14 +1491,14 @@ local function AwardPrepared(profile, member, pointName)
 
 	if SF.Debug then
 		local identifier = (member and member.GetFullIdentifier and member:GetFullIdentifier()) or "?"
-		SF.Debug:Info("RAID_CHECK", "Awarded raid check point to %s", tostring(identifier))
+		SF.Debug:Info("RAID_CHECK", "Awarded %s raid check points to %s", FormatPointAmount(RAID_CHECK_POINT_AWARD), tostring(identifier))
 	end
 
 	return true
 end
 
 local function WhisperPrepared(target, pointName)
-	SendWhisper(target, ("Spectrum Federation: You've been awarded 1 %s. Thanks for showing up prepared and on time!"):format(pointName))
+	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(RAID_CHECK_POINT_AWARD), pointName))
 end
 
 local function WhisperMissing(target, pointName, list, mode)
@@ -1247,6 +1526,40 @@ BuildUnitInfo = function(unit)
 		short = short,
 		displayName = ColorizeUnitName(unit, short),
 	}
+end
+
+local function BuildProfileMemberInfo(profile, memberId)
+	local short = ShortName(memberId)
+	return {
+		unit = nil,
+		id = memberId,
+		short = short,
+		displayName = ColorizeProfileMemberName(profile, memberId, short),
+	}
+end
+
+local function CollectTroubleshootingUnitsAndMembers(profile)
+	local items = {}
+	local seen = {}
+
+	for _, unit in ipairs(CollectUnits()) do
+		local info = BuildUnitInfo(unit)
+		if info.id and not seen[info.id] then
+			seen[info.id] = true
+			items[#items + 1] = info
+		end
+	end
+
+	if not IsInRaid() and not IsInGroup() and profile and type(profile.GetRaidCheckEquipmentSnapshotIds) == "function" then
+		for _, memberId in ipairs(profile:GetRaidCheckEquipmentSnapshotIds() or {}) do
+			if memberId and not seen[memberId] then
+				seen[memberId] = true
+				items[#items + 1] = BuildProfileMemberInfo(profile, memberId)
+			end
+		end
+	end
+
+	return items
 end
 
 local function FormatAverageItemLevel(value)
@@ -1452,12 +1765,11 @@ function RC:GetTroubleshootingSnapshot()
 	local cfg = profile and profile.GetRaidCheckConfig and profile:GetRaidCheckConfig() or nil
 	local rows = {}
 
-	for _, unit in ipairs(CollectUnits()) do
-		local info = BuildUnitInfo(unit)
+	for _, info in ipairs(CollectTroubleshootingUnitsAndMembers(profile)) do
 		if info.id then
-			local inspectState = self:_GetTroubleshootingInspectState(unit, info)
+			local inspectState = self:_GetTroubleshootingInspectState(info.unit, info)
 			rows[#rows + 1] = {
-				unit = unit,
+				unit = info.unit,
 				id = info.id,
 				name = info.short,
 				displayName = info.displayName or info.short,

@@ -146,8 +146,8 @@ function Sync:HandleNewLog(sender, payload)
         local profileAfter = self:FindLocalProfileById(profileId)
         local memberAfter = GetMemberById(profileAfter, memberId)
         local newPoints = (memberAfter and tonumber(memberAfter.pointBalance)) or 0
-        SF.Debug:Info("SYNC_POINTS", "Apply log (path=live_update member=%s old=%d delta=%d new=%d eventType=%s logId=%s)",
-            tostring(memberId), oldPoints, (tonumber(newPoints) or 0) - oldPoints, tonumber(newPoints) or 0,
+        SF.Debug:Info("SYNC_POINTS", "Apply log (path=live_update member=%s old=%s delta=%s new=%s eventType=%s logId=%s)",
+            tostring(memberId), tostring(oldPoints), tostring((tonumber(newPoints) or 0) - oldPoints), tostring(tonumber(newPoints) or 0),
             tostring(logTable._eventType or logTable.eventType), tostring(logId))
     end
 

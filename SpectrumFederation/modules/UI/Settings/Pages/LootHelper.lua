@@ -403,7 +403,7 @@ local function GetAuditInspectStatusColor(status)
 	if status == "out_of_range" then
 		return "|cffff9f40"
 	end
-	if status == "stale" or status == "refreshing" or status == "retrying" then
+	if status == "stale" or status == "refreshing" or status == "retrying" or status == "saved" then
 		return "|cffffff00"
 	end
 	if status == "loading" then

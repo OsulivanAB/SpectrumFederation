@@ -376,16 +376,17 @@ function Sync:RebuildProfile(profileId, reason)
             if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.POINT_CHANGE) then
                 local member = ensureMember(data.member)
                 local oldPoints = member and (tonumber(member.pointBalance) or 0) or nil
+                local amount = (SF.LootLog and SF.LootLog.GetPointChangeAmount and SF.LootLog.GetPointChangeAmount(data)) or 1
                 if member and data.change == SF.LootLogPointChangeTypes.INCREMENT then
-                    member.pointBalance = (member.pointBalance or 0) + 1
+                    member.pointBalance = (member.pointBalance or 0) + amount
                 elseif member and data.change == SF.LootLogPointChangeTypes.DECREMENT then
-                    member.pointBalance = (member.pointBalance or 0) - 1
+                    member.pointBalance = (member.pointBalance or 0) - amount
                 end
                 if member and SF.Debug then
                     local newPoints = tonumber(member.pointBalance) or 0
-                    SF.Debug:Verbose("SYNC_POINTS", "Apply log (path=replay reason=%s member=%s old=%d delta=%d new=%d change=%s)",
-                        rebuildReason, tostring(_MemberId(member) or data.member), oldPoints or 0, newPoints - oldPoints,
-                        newPoints, tostring(data.change))
+                    SF.Debug:Verbose("SYNC_POINTS", "Apply log (path=replay reason=%s member=%s old=%s delta=%s new=%s change=%s)",
+                        rebuildReason, tostring(_MemberId(member) or data.member), tostring(oldPoints or 0), tostring(newPoints - oldPoints),
+                        tostring(newPoints), tostring(data.change))
                 end
             elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ARMOR_CHANGE) then
                 local member = ensureMember(data.member)
