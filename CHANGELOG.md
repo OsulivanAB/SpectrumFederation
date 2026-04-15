@@ -36,6 +36,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.18-beta.49] - 2026-04-15
+
+### Fixed
+- Corrected an issue with stable release publishing during the promote-beta-to-main process.
+
 ## [0.5.18-beta.48] - 2026-04-15
 
 ### Added
