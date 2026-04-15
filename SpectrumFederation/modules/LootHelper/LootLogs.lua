@@ -6,6 +6,7 @@ local addonName, SF = ...
 -- ============================================================================
 
 local LOG_FORMAT_VERSION = 2
+local DEFAULT_POINT_CHANGE_AMOUNT = 1
 
 local EVENT_TYPES = {
     PROFILE_CREATION            = "PROFILE_CREATION",
@@ -250,7 +251,7 @@ end
 
 function LootLog.GetPointChangeAmount(eventData)
     if type(eventData) ~= "table" then
-        return 1
+        return DEFAULT_POINT_CHANGE_AMOUNT
     end
 
     local amount = tonumber(eventData.amount)
@@ -258,7 +259,7 @@ function LootLog.GetPointChangeAmount(eventData)
         return amount
     end
 
-    return 1
+    return DEFAULT_POINT_CHANGE_AMOUNT
 end
 
 -- Function to get the Unique ID of this log entry

@@ -15,6 +15,7 @@ local MEMBER_ROLES = {
     ADMIN = "admin",
     MEMBER = "member"
 }
+local EQUIPMENT_AWARD_POINT_COST = 1
 
 -- Define all armor slot names (for type safety and easy reference)
 local ARMOR_SLOTS = {
@@ -496,7 +497,7 @@ function Member:ApplyAwardedItem(slot, metadata)
 
     local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
     local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
-    local pointAmount = 1
+    local pointAmount = EQUIPMENT_AWARD_POINT_COST
     pointLogEventData.member = self:GetFullIdentifier()
     pointLogEventData.change = SF.LootLogPointChangeTypes.DECREMENT
     pointLogEventData.amount = pointAmount
@@ -603,7 +604,7 @@ function Member:ClearAwardedItem(slot, metadata)
 
     local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
     local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
-    local pointAmount = 1
+    local pointAmount = EQUIPMENT_AWARD_POINT_COST
     pointLogEventData.member = self:GetFullIdentifier()
     pointLogEventData.change = SF.LootLogPointChangeTypes.INCREMENT
     pointLogEventData.amount = pointAmount

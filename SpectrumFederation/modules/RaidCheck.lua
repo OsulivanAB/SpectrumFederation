@@ -1463,6 +1463,17 @@ local function FormatMissingList(missing)
 	return table.concat(missing, ", ")
 end
 
+local function FormatPointAmount(amount)
+	amount = tonumber(amount) or 0
+	if amount == math.floor(amount) then
+		return tostring(amount)
+	end
+
+	local text = string.format("%.2f", amount)
+	text = text:gsub("0+$", ""):gsub("%.$", "")
+	return text
+end
+
 local function AwardPrepared(profile, member, pointName)
 	if not member or not member.IncrementPoints then
 		return false
@@ -1480,14 +1491,14 @@ local function AwardPrepared(profile, member, pointName)
 
 	if SF.Debug then
 		local identifier = (member and member.GetFullIdentifier and member:GetFullIdentifier()) or "?"
-		SF.Debug:Info("RAID_CHECK", "Awarded %s raid check points to %s", tostring(RAID_CHECK_POINT_AWARD), tostring(identifier))
+		SF.Debug:Info("RAID_CHECK", "Awarded %s raid check points to %s", FormatPointAmount(RAID_CHECK_POINT_AWARD), tostring(identifier))
 	end
 
 	return true
 end
 
 local function WhisperPrepared(target, pointName)
-	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(tostring(RAID_CHECK_POINT_AWARD), pointName))
+	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(RAID_CHECK_POINT_AWARD), pointName))
 end
 
 local function WhisperMissing(target, pointName, list, mode)
