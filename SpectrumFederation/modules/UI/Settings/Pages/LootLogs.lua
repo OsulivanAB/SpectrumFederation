@@ -179,6 +179,17 @@ local function FormatLabel(value)
 	return text
 end
 
+local function FormatPointAmount(amount)
+	amount = tonumber(amount) or 1
+	if amount == math.floor(amount) then
+		return tostring(amount)
+	end
+
+	local text = string.format("%.2f", amount)
+	text = text:gsub("0+$", ""):gsub("%.$", "")
+	return text
+end
+
 local function GetArmorSlotLabel(slot)
 	if slot == nil or slot == "" then
 		return "Armor Spot"
@@ -235,8 +246,9 @@ local function BuildActionText(eventType, data, author)
 	if eventType == "POINT_CHANGE" then
 		local isRaidCheck = (data.reason == "RAID_CHECK") or (author == "Raid Check")
 		local isRCLootCouncil = (data.reason == "RC_LOOT_COUNCIL") or (data.source == "RCLootCouncil")
+		local amount = (SF.LootLog and SF.LootLog.GetPointChangeAmount and SF.LootLog.GetPointChangeAmount(data)) or 1
 		if isRaidCheck and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
-			return "Raid Check prepared (+1)"
+			return string.format("Raid Check prepared (+%s)", FormatPointAmount(amount))
 		elseif isRaidCheck then
 			return string.format("Raid Check change (%s)", FormatLabel(data.change or "?"))
 		elseif isRCLootCouncil and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
@@ -246,9 +258,9 @@ local function BuildActionText(eventType, data, author)
 		end
 
 		if data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
-			return "Points Increased"
+			return string.format("Points Increased (+%s)", FormatPointAmount(amount))
 		elseif data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
-			return "Points Decreased"
+			return string.format("Points Decreased (-%s)", FormatPointAmount(amount))
 		end
 
 		return FormatLabel(data.change or "?")

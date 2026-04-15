@@ -11,6 +11,7 @@ SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
 
 local RAID_CHECK_REASON = "RAID_CHECK"
+local RAID_CHECK_POINT_AWARD = 0.5
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
 local INSPECT_CACHE_TTL_SECONDS = 30
@@ -1468,6 +1469,7 @@ local function AwardPrepared(profile, member, pointName)
 	end
 
 	local ok = member:IncrementPoints({
+		amount = RAID_CHECK_POINT_AWARD,
 		logAuthor = "Raid Check",
 		reason = RAID_CHECK_REASON,
 	})
@@ -1478,14 +1480,14 @@ local function AwardPrepared(profile, member, pointName)
 
 	if SF.Debug then
 		local identifier = (member and member.GetFullIdentifier and member:GetFullIdentifier()) or "?"
-		SF.Debug:Info("RAID_CHECK", "Awarded raid check point to %s", tostring(identifier))
+		SF.Debug:Info("RAID_CHECK", "Awarded %s raid check points to %s", tostring(RAID_CHECK_POINT_AWARD), tostring(identifier))
 	end
 
 	return true
 end
 
 local function WhisperPrepared(target, pointName)
-	SendWhisper(target, ("Spectrum Federation: You've been awarded 1 %s. Thanks for showing up prepared and on time!"):format(pointName))
+	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(tostring(RAID_CHECK_POINT_AWARD), pointName))
 end
 
 local function WhisperMissing(target, pointName, list, mode)

@@ -248,6 +248,19 @@ function LootLog.GetEventDataTemplate(eventType)
     return template
 end
 
+function LootLog.GetPointChangeAmount(eventData)
+    if type(eventData) ~= "table" then
+        return 1
+    end
+
+    local amount = tonumber(eventData.amount)
+    if amount and amount > 0 then
+        return amount
+    end
+
+    return 1
+end
+
 -- Function to get the Unique ID of this log entry
 -- @return string log ID
 function LootLog:GetID()

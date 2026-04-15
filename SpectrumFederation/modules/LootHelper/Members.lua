@@ -330,6 +330,9 @@ function Member:IncrementPoints(opts)
 	local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
 	logEventData.member = self:GetFullIdentifier()
 	logEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+    if opts and opts.amount ~= nil then
+        logEventData.amount = tonumber(opts.amount) or 1
+    end
 	if opts and opts.reason then
 		logEventData.reason = opts.reason
 	end
@@ -351,19 +354,20 @@ function Member:IncrementPoints(opts)
         return false
     end
 
+    local amount = SF.LootLog.GetPointChangeAmount(logEventData)
     local oldBalance = self.pointBalance
-    self.pointBalance = self.pointBalance + 1
+    self.pointBalance = self.pointBalance + amount
     if SF.Debug then
         local delta = self.pointBalance - oldBalance
-        SF.Debug:Info("SYNC_POINTS", "Increment action (mode=apply_delta member=%s old=%d delta=%d new=%d)",
-            self:GetFullIdentifier(), oldBalance, delta, self.pointBalance)
+        SF.Debug:Info("SYNC_POINTS", "Increment action (mode=apply_delta member=%s old=%s delta=%s new=%s)",
+            self:GetFullIdentifier(), tostring(oldBalance), tostring(delta), tostring(self.pointBalance))
     end
 
     -- Add Log Entry to Loot Profile Table
     AddLootLogToActiveProfile(logEntry)
     
     if SF.Debug then
-        SF.Debug:Verbose("MEMBER", "%s points incremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
+        SF.Debug:Verbose("MEMBER", "%s points incremented: %s -> %s", self:GetFullIdentifier(), tostring(oldBalance), tostring(self.pointBalance))
         SF.Debug:Verbose("SYNC_POINTS", "Increment action (mode=recompute_on_sync member=%s note=%s)",
             self:GetFullIdentifier(), SYNC_REBUILD_NOTE)
     end
@@ -386,6 +390,9 @@ function Member:DecrementPoints(metadata)
     local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
     logEventData.member = self:GetFullIdentifier()
     logEventData.change = SF.LootLogPointChangeTypes.DECREMENT
+    if metadata.amount ~= nil then
+        logEventData.amount = tonumber(metadata.amount) or 1
+    end
     if metadata.reason ~= nil then
         logEventData.reason = tostring(metadata.reason)
     end
@@ -415,16 +422,17 @@ function Member:DecrementPoints(metadata)
         return false
     end
     
+    local amount = SF.LootLog.GetPointChangeAmount(logEventData)
     local oldBalance = self.pointBalance
-    self.pointBalance = self.pointBalance - 1
+    self.pointBalance = self.pointBalance - amount
 
     -- Add Log Entry to Loot Profile Table
     AddLootLogToActiveProfile(logEntry)
     
     if SF.Debug then
-        SF.Debug:Verbose("MEMBER", "%s points decremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
+        SF.Debug:Verbose("MEMBER", "%s points decremented: %s -> %s", self:GetFullIdentifier(), tostring(oldBalance), tostring(self.pointBalance))
         if self.pointBalance < 0 then
-            SF.Debug:Warn("MEMBER", "%s is now in point debt: %d", self:GetFullIdentifier(), self.pointBalance)
+            SF.Debug:Warn("MEMBER", "%s is now in point debt: %s", self:GetFullIdentifier(), tostring(self.pointBalance))
         end
     end
     return true
@@ -520,10 +528,10 @@ function Member:ApplyAwardedItem(slot, metadata)
     if SF.Debug then
         SF.Debug:Info(
             "MEMBER",
-            "Applied awarded item for %s: slot=%s points=%d",
+            "Applied awarded item for %s: slot=%s points=%s",
             self:GetFullIdentifier(),
             tostring(slot),
-            self.pointBalance
+            tostring(self.pointBalance)
         )
     end
 
@@ -625,10 +633,10 @@ function Member:ClearAwardedItem(slot, metadata)
     if SF.Debug then
         SF.Debug:Info(
             "MEMBER",
-            "Cleared awarded item for %s: slot=%s points=%d",
+            "Cleared awarded item for %s: slot=%s points=%s",
             self:GetFullIdentifier(),
             tostring(slot),
-            self.pointBalance
+            tostring(self.pointBalance)
         )
     end
 
@@ -789,10 +797,11 @@ function Member:UpdateFromLootLog()
     pointBalance = 0
     for _, log in ipairs(filteredLogs) do
         if log.eventType == SF.LootLogEventTypes.POINT_CHANGE then
+            local amount = SF.LootLog.GetPointChangeAmount(log.eventData)
             if log.eventData.change == SF.LootLogPointChangeTypes.INCREMENT then
-                pointBalance = pointBalance + 1
+                pointBalance = pointBalance + amount
             elseif log.eventData.change == SF.LootLogPointChangeTypes.DECREMENT then
-                pointBalance = pointBalance - 1
+                pointBalance = pointBalance - amount
             end
         end
     end
