@@ -496,8 +496,10 @@ function Member:ApplyAwardedItem(slot, metadata)
 
     local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
     local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
+    local pointAmount = 1
     pointLogEventData.member = self:GetFullIdentifier()
     pointLogEventData.change = SF.LootLogPointChangeTypes.DECREMENT
+    pointLogEventData.amount = pointAmount
     if metadata.reason ~= nil then
         pointLogEventData.reason = tostring(metadata.reason)
     end
@@ -520,7 +522,7 @@ function Member:ApplyAwardedItem(slot, metadata)
     end
 
     self.armor[slot] = true
-    self.pointBalance = self.pointBalance - 1
+    self.pointBalance = self.pointBalance - pointAmount
 
     AddLootLogToActiveProfile(armorLogEntry)
     AddLootLogToActiveProfile(pointLogEntry)
@@ -601,8 +603,10 @@ function Member:ClearAwardedItem(slot, metadata)
 
     local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
     local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
+    local pointAmount = 1
     pointLogEventData.member = self:GetFullIdentifier()
     pointLogEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+    pointLogEventData.amount = pointAmount
     if metadata.reason ~= nil then
         pointLogEventData.reason = tostring(metadata.reason)
     end
@@ -625,7 +629,7 @@ function Member:ClearAwardedItem(slot, metadata)
     end
 
     self.armor[slot] = false
-    self.pointBalance = self.pointBalance + 1
+    self.pointBalance = self.pointBalance + pointAmount
 
     AddLootLogToActiveProfile(armorLogEntry)
     AddLootLogToActiveProfile(pointLogEntry)
