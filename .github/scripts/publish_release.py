@@ -143,16 +143,14 @@ def create_addon_zip(addon_name, version):
         return None
 
 
-def mask_secrets(text, secrets):
-    """Mask known secrets in subprocess output."""
+def sanitize_output(text):
+    """Redact token-like values from subprocess output."""
     if not text:
         return text
 
-    masked = text
-    for secret in secrets:
-        if secret:
-            masked = masked.replace(secret, "***")
-    return masked
+    sanitized = re.sub(r"(authorization:\s*(?:token|bearer|basic)\s+)\S+", r"\1***", text, flags=re.IGNORECASE)
+    sanitized = re.sub(r"\b(gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b", "***", sanitized)
+    return sanitized
 
 
 def format_command(cmd):
@@ -160,7 +158,7 @@ def format_command(cmd):
     return shlex.join(str(part) for part in cmd)
 
 
-def log_command_failure(prefix, error, secrets):
+def log_command_failure(prefix, error):
     """Log a subprocess failure with masked stdout/stderr."""
     print(f"::error ::{prefix} (exit code {error.returncode})")
 
@@ -169,11 +167,11 @@ def log_command_failure(prefix, error, secrets):
 
     if error.stdout:
         print("[publish-release] stdout:")
-        print(mask_secrets(error.stdout.strip(), secrets))
+        print(sanitize_output(error.stdout.strip()))
 
     if error.stderr:
         print("[publish-release] stderr:", file=sys.stderr)
-        print(mask_secrets(error.stderr.strip(), secrets), file=sys.stderr)
+        print(sanitize_output(error.stderr.strip()), file=sys.stderr)
 
 
 def build_release_notes(version, repo):
@@ -205,7 +203,7 @@ def write_release_notes(notes):
     return notes_path
 
 
-def release_exists(tag_name, env, secrets):
+def release_exists(tag_name, env):
     """Return True when the GitHub release already exists."""
     try:
         subprocess.run(
@@ -219,18 +217,17 @@ def release_exists(tag_name, env, secrets):
     except subprocess.CalledProcessError as error:
         stderr = (error.stderr or "").lower()
         stdout = (error.stdout or "").lower()
-        if "release not found" in stderr or "release not found" in stdout or "404" in stderr:
+        if "release not found" in stderr or "release not found" in stdout or "404" in stderr or "404" in stdout:
             return False
 
         log_command_failure(
             f"Failed to check whether GitHub release {tag_name} exists",
             error,
-            secrets,
         )
         raise
 
 
-def update_github_release(tag_name, release_name, notes_path, zip_path, json_path, is_prerelease, env, secrets):
+def update_github_release(tag_name, release_name, notes_path, zip_path, json_path, is_prerelease, env):
     """Update an existing GitHub release and replace assets."""
     print(f"[publish-release] Release {tag_name} already exists; updating it instead")
 
@@ -270,7 +267,7 @@ def update_github_release(tag_name, release_name, notes_path, zip_path, json_pat
         print("[publish-release] ✓ Release updated successfully")
         return True
     except subprocess.CalledProcessError as error:
-        log_command_failure("Failed to update GitHub release", error, secrets)
+        log_command_failure("Failed to update GitHub release", error)
         return False
 
 
@@ -287,7 +284,6 @@ def create_github_release(version, zip_path, json_path, repo, is_prerelease=Fals
     notes = build_release_notes(version, repo)
     notes_path = write_release_notes(notes)
     gh_env = {**os.environ, "GH_TOKEN": github_token}
-    secrets = [github_token]
 
     if dry_run:
         print("[publish-release] DRY RUN - Would create release:")
@@ -314,7 +310,7 @@ def create_github_release(version, zip_path, json_path, repo, is_prerelease=Fals
         cmd.append("--prerelease")
 
     try:
-        if release_exists(tag_name, gh_env, secrets):
+        if release_exists(tag_name, gh_env):
             return update_github_release(
                 tag_name,
                 release_name,
@@ -323,7 +319,6 @@ def create_github_release(version, zip_path, json_path, repo, is_prerelease=Fals
                 json_path,
                 is_prerelease,
                 gh_env,
-                secrets,
             )
 
         result = subprocess.run(
@@ -340,7 +335,7 @@ def create_github_release(version, zip_path, json_path, repo, is_prerelease=Fals
 
         return True
     except subprocess.CalledProcessError as error:
-        log_command_failure("Failed to create GitHub release", error, secrets)
+        log_command_failure("Failed to create GitHub release", error)
         return False
     except FileNotFoundError as error:
         print(f"::error ::Failed to invoke GitHub CLI: {error}")
