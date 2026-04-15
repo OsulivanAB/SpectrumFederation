@@ -1,6 +1,909 @@
 -- Grab the namespace
 local addonName, SF = ...
 
+local RC_AWARD_EVENT_WINDOW_SECONDS = 5
+local RC_AWARD_ITEMINFO_RETRY_DELAY_SECONDS = 1
+local RC_AWARD_ITEMINFO_MAX_RETRIES = 2
+local RC_LOOT_COUNCIL_AUTHOR = "RC Loot Council"
+local RC_LOOT_COUNCIL_SOURCE = "RCLootCouncil"
+local RC_LOOT_COUNCIL_REASON = "RC_LOOT_COUNCIL"
+local RC_LOOT_COUNCIL_REASSIGN_REASON = "RC_LOOT_COUNCIL_REASSIGN"
+local RC_LOOT_COUNCIL_CONFLICT_REASON = "RC_LOOT_COUNCIL_SLOT_CONFLICT"
+local RC_CHANGE_AWARD_PREFIX = "change award"
+local RC_AWARD_CHAT_EVENTS = {
+    "CHAT_MSG_RAID",
+    "CHAT_MSG_RAID_LEADER",
+    "CHAT_MSG_PARTY",
+    "CHAT_MSG_PARTY_LEADER",
+    "CHAT_MSG_INSTANCE_CHAT",
+    "CHAT_MSG_INSTANCE_CHAT_LEADER",
+    "CHAT_MSG_GUILD",
+    "CHAT_MSG_OFFICER",
+    "CHAT_MSG_SAY",
+    "CHAT_MSG_YELL",
+}
+
+local RC_EQUIP_LOC_TO_ARMOR_SLOTS = {
+    INVTYPE_HEAD = { "Head" },
+    INVTYPE_NECK = { "Neck" },
+    INVTYPE_SHOULDER = { "Shoulder" },
+    INVTYPE_CLOAK = { "Back" },
+    INVTYPE_CHEST = { "Chest" },
+    INVTYPE_ROBE = { "Chest" },
+    INVTYPE_WRIST = { "Bracers" },
+    INVTYPE_HAND = { "Hands" },
+    INVTYPE_WAIST = { "Belt" },
+    INVTYPE_LEGS = { "Pants" },
+    INVTYPE_FEET = { "Boots" },
+    INVTYPE_FINGER = { "Ring1", "Ring2" },
+    INVTYPE_TRINKET = { "Trinket1", "Trinket2" },
+    INVTYPE_SHIELD = { "OffHand" },
+    INVTYPE_HOLDABLE = { "OffHand" },
+    INVTYPE_WEAPONOFFHAND = { "OffHand" },
+    INVTYPE_WEAPON = { "Weapon", "OffHand" },
+    INVTYPE_WEAPONMAINHAND = { "Weapon" },
+    INVTYPE_2HWEAPON = { "Weapon" },
+    INVTYPE_RANGED = { "Weapon" },
+    INVTYPE_RANGEDRIGHT = { "Weapon" },
+    INVTYPE_THROWN = { "Weapon" },
+    INVTYPE_RELIC = { "OffHand" },
+}
+
+local function TrimText(value)
+    return tostring(value or ""):match("^%s*(.-)%s*$")
+end
+
+local function NormalizeRCLootCouncilAwardReason(reasonText)
+    local reason = TrimText(reasonText)
+    reason = reason:gsub("[!%.%s]+$", "")
+    return reason
+end
+
+-- WoW chat escapes literal pipes as double pipes, so normalize before parsing links/items.
+local function NormalizeRCAwardMessageText(value)
+    return type(value) == "string" and value:gsub("||", "|") or value
+end
+
+local function NormalizeRCAwardItemLink(itemLink)
+    if type(itemLink) ~= "string" or itemLink == "" then
+        return nil
+    end
+
+    local normalized = TrimText(NormalizeRCAwardMessageText(itemLink))
+    local decoratedLink = normalized:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+    if decoratedLink and decoratedLink ~= "" then
+        return decoratedLink
+    end
+
+    local plainLink = normalized:match("(|Hitem:.-|h%[.-%]|h)")
+    if plainLink and plainLink ~= "" then
+        return plainLink
+    end
+
+    return normalized ~= "" and normalized or nil
+end
+
+local function NormalizeRCAwardItemName(itemName)
+    itemName = TrimText(itemName)
+    local bracketed = itemName:match("^%[(.-)%]$")
+    if bracketed and bracketed ~= "" then
+        itemName = bracketed
+    end
+    return itemName
+end
+
+local function ExtractRCAwardItemLink(message)
+    if type(message) ~= "string" or message == "" then
+        return nil
+    end
+
+    return message:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+end
+
+local function ExtractRCAwardItemReference(message)
+    local itemLink = ExtractRCAwardItemLink(message)
+    if itemLink then
+        return NormalizeRCAwardItemLink(itemLink), "link"
+    end
+
+    local bracketedName = type(message) == "string" and message:match("(%b[])") or nil
+    if bracketedName then
+        local normalizedName = NormalizeRCAwardItemName(bracketedName)
+        if normalizedName ~= "" then
+            return normalizedName, "name"
+        end
+    end
+
+    return nil, nil
+end
+
+local function ExtractRCAwardMessagePrefix(message)
+    if type(message) ~= "string" then
+        return nil, message
+    end
+
+    local prefix, remainder = message:match("^(%b())%s*(.*)$")
+    if prefix and remainder and remainder ~= "" then
+        return TrimText(prefix:sub(2, -2)), remainder
+    end
+
+    return nil, message
+end
+
+local function BuildRCAwardItemKey(itemReference)
+    if type(itemReference) ~= "string" or itemReference == "" then
+        return nil
+    end
+
+    local itemString = itemReference:match("|H(item:[^|]+)|h")
+    if itemString and itemString ~= "" then
+        return itemString
+    end
+
+    local normalizedName = NormalizeRCAwardItemName(itemReference)
+    if normalizedName == "" then
+        return nil
+    end
+
+    return normalizedName:lower()
+end
+
+local function BuildRCAwardDeduplicationKey(itemReference)
+    if type(itemReference) ~= "string" or itemReference == "" then
+        return nil
+    end
+
+    local itemIdText = itemReference:match("|Hitem:(%d+):") or itemReference:match("^item:(%d+):")
+    if not itemIdText and type(GetItemInfoInstant) == "function" then
+        local itemId = GetItemInfoInstant(itemReference)
+        if tonumber(itemId) and tonumber(itemId) > 0 then
+            itemIdText = tostring(itemId)
+        end
+    end
+
+    if itemIdText and itemIdText ~= "" then
+        return "itemid:" .. itemIdText
+    end
+
+    return BuildRCAwardItemKey(itemReference)
+end
+
+local function FindProfileMemberIdByName(profile, winnerName)
+    winnerName = TrimText(winnerName)
+    local getMemberIds = profile.GetMemberIds or profile.getMemberIds
+    if winnerName == "" or type(profile) ~= "table" or type(getMemberIds) ~= "function" then
+        return nil
+    end
+
+    local normalizedWinner = SF.NameUtil and SF.NameUtil.NormalizeNameRealm and SF.NameUtil.NormalizeNameRealm(winnerName) or winnerName
+    for _, memberId in ipairs(getMemberIds(profile) or {}) do
+        if SF.NameUtil and SF.NameUtil.SamePlayer and normalizedWinner and SF.NameUtil.SamePlayer(memberId, normalizedWinner) then
+            return memberId, "exact", nil
+        end
+    end
+
+    local winnerShort = winnerName:match("^([^%-]+)")
+    if not winnerShort then
+        return nil, "not_found", nil
+    end
+    winnerShort = winnerShort:lower()
+
+    local matches = {}
+    for _, memberId in ipairs(getMemberIds(profile) or {}) do
+        local shortName = tostring(memberId):match("^([^%-]+)")
+        if shortName and shortName:lower() == winnerShort then
+            table.insert(matches, memberId)
+        end
+    end
+
+    if #matches == 1 then
+        return matches[1], "short_name", matches
+    end
+    if #matches > 1 then
+        return nil, "ambiguous_short_name", matches
+    end
+
+    return nil, "not_found", matches
+end
+
+local function ParseRCAwardMessage(message)
+    if type(message) ~= "string" or message == "" then
+        return nil
+    end
+
+    local normalizedMessage = NormalizeRCAwardMessageText(message)
+    local prefixLabel, messageBody = ExtractRCAwardMessagePrefix(normalizedMessage)
+    local itemReference, itemReferenceType = ExtractRCAwardItemReference(messageBody)
+    if not itemReference then
+        return nil
+    end
+
+    local awardPrefix = " was awarded with "
+    local prefixStart = messageBody:find(awardPrefix, 1, true)
+    local itemStart, itemEnd = messageBody:find(itemReference, 1, true)
+    if not prefixStart or not itemStart or prefixStart >= itemStart then
+        return nil
+    end
+
+    local winnerName = TrimText(messageBody:sub(1, prefixStart - 1))
+    local afterItem = messageBody:sub(itemEnd + 1)
+    local reasonPos = afterItem:find(" for ", 1, true)
+    if not reasonPos then
+        return nil
+    end
+
+    local reasonText = NormalizeRCLootCouncilAwardReason(afterItem:sub(reasonPos + 5))
+    if winnerName == "" or reasonText == "" then
+        return nil
+    end
+
+    return {
+        winnerName = winnerName,
+        itemLink = itemReference,
+        itemKey = BuildRCAwardItemKey(itemReference),
+        itemReferenceType = itemReferenceType,
+        reasonText = reasonText,
+        prefixLabel = prefixLabel,
+        isChangeAward = type(prefixLabel) == "string" and prefixLabel:lower() == RC_CHANGE_AWARD_PREFIX,
+    }
+end
+
+local function IsPotentialRCAwardMessage(message)
+    if type(message) ~= "string" or message == "" then
+        return false
+    end
+
+    return message:find(" was awarded with ", 1, true) ~= nil
+        and message:find(" for ", 1, true) ~= nil
+end
+
+local function ResolveRCLootCouncilAwardSlots(itemLink)
+    if type(itemLink) ~= "string" or itemLink == "" then
+        return nil, nil, false, itemLink
+    end
+
+    local itemReference = itemLink
+    local normalizedName = nil
+    if not itemReference:find("|Hitem:", 1, true) then
+        normalizedName = NormalizeRCAwardItemName(itemReference)
+        itemReference = normalizedName
+    end
+
+    local resolvedItemLink = itemReference
+    local equipLoc = nil
+
+    if type(GetItemInfoInstant) == "function" then
+        local _, _, _, instantEquipLoc = GetItemInfoInstant(itemReference)
+        equipLoc = instantEquipLoc
+    end
+
+    if (not equipLoc or equipLoc == "") and type(GetItemInfo) == "function" then
+        local _, itemLinkFromInfo, _, _, _, _, _, _, itemEquipLoc = GetItemInfo(itemReference)
+        if itemLinkFromInfo and itemLinkFromInfo ~= "" then
+            resolvedItemLink = itemLinkFromInfo
+        elseif normalizedName and normalizedName ~= "" then
+            resolvedItemLink = normalizedName
+        end
+        equipLoc = itemEquipLoc or equipLoc
+    end
+
+    if not equipLoc or equipLoc == "" then
+        if type(GetItemInfo) == "function" then
+            GetItemInfo(itemReference)
+        end
+        return nil, nil, true, resolvedItemLink
+    end
+
+    local slots = equipLoc and RC_EQUIP_LOC_TO_ARMOR_SLOTS[equipLoc] or nil
+    return slots, equipLoc, false, resolvedItemLink
+end
+
+local function ClonePayload(payload)
+    local copy = {}
+    for key, value in pairs(payload or {}) do
+        copy[key] = value
+    end
+    return copy
+end
+
+local function ScheduleRCLootCouncilAwardRetry(self, payload)
+    if not (C_Timer and C_Timer.After) then
+        return false, tonumber(payload.retryCount) or 0
+    end
+
+    local retryCount = tonumber(payload.retryCount) or 0
+    if retryCount >= RC_AWARD_ITEMINFO_MAX_RETRIES then
+        return false, retryCount
+    end
+
+    local retryPayload = ClonePayload(payload)
+    local nextRetryCount = retryCount + 1
+    retryPayload.retryCount = nextRetryCount
+
+    C_Timer.After(RC_AWARD_ITEMINFO_RETRY_DELAY_SECONDS, function()
+        self:ProcessRCLootCouncilAward(retryPayload)
+    end)
+
+    return true, nextRetryCount
+end
+
+local function SelectAvailableAwardSlot(member, slotCandidates)
+    if type(member) ~= "table" or type(slotCandidates) ~= "table" then
+        return nil
+    end
+
+    local armor = type(member.GetArmorStatuses) == "function" and member:GetArmorStatuses() or member.armor
+    if type(armor) ~= "table" then
+        return nil
+    end
+
+    for _, slotName in ipairs(slotCandidates) do
+        if armor[slotName] == false then
+            return slotName
+        end
+    end
+
+    return nil
+end
+
+local function ForgetRecentAwardSignature(cache, signature)
+    if type(cache) ~= "table" or type(signature) ~= "string" or signature == "" then
+        return
+    end
+
+    cache[signature] = nil
+end
+
+local function JoinStringList(values)
+    if type(values) ~= "table" then
+        return ""
+    end
+
+    local items = {}
+    for _, value in ipairs(values) do
+        local text = TrimText(value)
+        if text ~= "" then
+            table.insert(items, text)
+        end
+    end
+
+    return table.concat(items, ", ")
+end
+
+local function RememberRecentWarning(cache, warningId, now)
+    if type(warningId) ~= "string" or warningId == "" then
+        return false
+    end
+
+    cache[warningId] = cache[warningId] or 0
+    if cache[warningId] > 0 and (now - cache[warningId]) < RC_AWARD_EVENT_WINDOW_SECONDS then
+        return true
+    end
+
+    cache[warningId] = now
+    return false
+end
+
+local function BroadcastRCLootCouncilAdminWarning(profile, payload)
+    if type(profile) ~= "table" or type(payload) ~= "table" then
+        return 0
+    end
+    if not (SF.LootHelperComm and SF.LootHelperSync and SF.LootHelperSync.MSG and SF.LootHelperSync.MSG.RC_AWARD_WARNING) then
+        return 0
+    end
+
+    local getAdminMemberIds = profile.GetAdminMemberIds or profile.getAdminMemberIds
+    local getProfileId = profile.GetProfileId or profile.getProfileId
+    if type(getAdminMemberIds) ~= "function" or type(getProfileId) ~= "function" then
+        return 0
+    end
+
+    local profileId = getProfileId(profile)
+    local adminIds = getAdminMemberIds(profile) or {}
+    if type(profileId) ~= "string" or profileId == "" then
+        return 0
+    end
+
+    local selfId = SF.NameUtil and SF.NameUtil.GetSelfId and SF.NameUtil.GetSelfId() or nil
+    local sentCount = 0
+    local warningPayload = ClonePayload(payload)
+    warningPayload.profileId = profileId
+
+    for _, adminId in ipairs(adminIds) do
+        if type(adminId) == "string" and adminId ~= "" then
+            local isSelf = false
+            if selfId and SF.NameUtil and SF.NameUtil.SamePlayer then
+                isSelf = SF.NameUtil.SamePlayer(adminId, selfId)
+            else
+                isSelf = adminId == selfId
+            end
+
+            if not isSelf then
+                local ok = SF.LootHelperComm:Send(
+                    "CONTROL",
+                    SF.LootHelperSync.MSG.RC_AWARD_WARNING,
+                    warningPayload,
+                    "WHISPER",
+                    adminId,
+                    "NORMAL"
+                )
+                if ok then
+                    sentCount = sentCount + 1
+                end
+            end
+        end
+    end
+
+    return sentCount
+end
+
+local function BuildRCLootCouncilAwardPayloadFromInternalMessage(session, winnerName, itemLink, rollType, status)
+    winnerName = TrimText(winnerName)
+    rollType = NormalizeRCLootCouncilAwardReason(rollType)
+    if winnerName == "" or type(itemLink) ~= "string" or itemLink == "" or rollType == "" then
+        return nil
+    end
+
+    return {
+        session = session,
+        winnerName = winnerName,
+        itemLink = itemLink,
+        rollType = rollType,
+        sourceType = "internal",
+        status = status,
+    }
+end
+
+local function BuildRCLootCouncilAwardPayloadFromChatMessage(message, chatEvent)
+    local parsed = ParseRCAwardMessage(message)
+    if not parsed then
+        return nil
+    end
+
+    return {
+        winnerName = parsed.winnerName,
+        itemLink = parsed.itemLink,
+        itemKey = parsed.itemKey,
+        itemReferenceType = parsed.itemReferenceType,
+        rollType = parsed.reasonText,
+        prefixLabel = parsed.prefixLabel,
+        isChangeAward = parsed.isChangeAward,
+        sourceType = "chat",
+        chatEvent = chatEvent,
+    }
+end
+
+function SF:ProcessRCLootCouncilAward(payload)
+    if type(payload) ~= "table" then
+        if SF.Debug then
+            SF.Debug:Warn("RC_LOOT_COUNCIL", "Ignored RC award payload with invalid type: %s", type(payload))
+        end
+        return false
+    end
+
+    payload.itemLink = NormalizeRCAwardItemLink(payload.itemLink)
+
+    if SF.Debug then
+        SF.Debug:Verbose(
+            "RC_LOOT_COUNCIL",
+            "Processing RC award payload source=%s winner=%s item=%s rollType=%s status=%s",
+            tostring(payload.sourceType or "unknown"),
+            tostring(payload.winnerName),
+            tostring(payload.itemLink),
+            tostring(payload.rollType),
+            tostring(payload.status)
+        )
+    end
+
+    if not self.lootHelperDB or not self.lootHelperDB.enabled then
+        if SF.Debug then
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award because Loot Helper is disabled")
+        end
+        return false
+    end
+
+    local profile = self:GetActiveProfile()
+    if not profile or type(profile.GetRCLootCouncilEnabled) ~= "function" or not profile:GetRCLootCouncilEnabled() then
+        if SF.Debug then
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award because RC Loot Council sync is disabled for the active profile")
+        end
+        return false
+    end
+
+    if not profile.IsCurrentUserAdmin or not profile:IsCurrentUserAdmin() then
+        if SF.Debug then
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "Ignoring RC award because current user is not an admin for the active profile")
+        end
+        return false
+    end
+
+    local configuredRollType = type(profile.GetRCLootCouncilRollType) == "function" and profile:GetRCLootCouncilRollType() or ""
+    configuredRollType = NormalizeRCLootCouncilAwardReason(configuredRollType)
+    if configuredRollType == "" then
+        if SF.Debug then
+            SF.Debug:Warn("RC_LOOT_COUNCIL", "Ignoring RC award because no RC roll type is configured")
+        end
+        return false
+    end
+
+    local payloadRollType = NormalizeRCLootCouncilAwardReason(payload.rollType)
+    if payloadRollType == "" or payloadRollType:lower() ~= configuredRollType:lower() then
+        if SF.Debug then
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Ignoring RC award because payload roll type '%s' does not match configured '%s'",
+                tostring(payloadRollType),
+                tostring(configuredRollType)
+            )
+        end
+        return false
+    end
+
+    local now = GetTime and GetTime() or 0
+    local memberId, matchKind, matchCandidates = FindProfileMemberIdByName(profile, payload.winnerName)
+    if not memberId then
+        if matchKind == "ambiguous_short_name" then
+            local warningId = table.concat({
+                tostring(payload.winnerName),
+                tostring(payload.itemLink),
+                tostring(configuredRollType),
+                "ambiguous_short_name",
+            }, "\031")
+            self._rcLootCouncilRecentWarnings = self._rcLootCouncilRecentWarnings or {}
+            if not RememberRecentWarning(self._rcLootCouncilRecentWarnings, warningId, now) then
+                local matchesText = JoinStringList(matchCandidates)
+                local warningMessage = string.format(
+                    "RC award for %s (%s) is ambiguous. Matching members: %s. Resolve it manually.",
+                    tostring(payload.winnerName),
+                    tostring(payload.itemLink),
+                    matchesText ~= "" and matchesText or "multiple short-name matches"
+                )
+                SF:PrintWarning(warningMessage)
+                BroadcastRCLootCouncilAdminWarning(profile, {
+                    warningId = warningId,
+                    message = warningMessage,
+                })
+            end
+        end
+        if SF.Debug then
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Ignoring RC award with unmatched winner '%s' (matchKind=%s matches=%s)",
+                tostring(payload.winnerName),
+                tostring(matchKind),
+                JoinStringList(matchCandidates)
+            )
+        end
+        return false
+    end
+
+    self._rcLootCouncilRecentAwards = self._rcLootCouncilRecentAwards or {}
+    local itemKey = payload.itemKey
+    if not itemKey then
+        itemKey = BuildRCAwardItemKey(payload.itemLink) or tostring(payload.itemLink)
+    end
+    local deduplicationKey = BuildRCAwardDeduplicationKey(payload.itemLink) or itemKey
+    local signature = table.concat({ tostring(memberId), tostring(deduplicationKey), tostring(configuredRollType) }, "\031")
+    local lastSeen = self._rcLootCouncilRecentAwards[signature]
+    if lastSeen and (now - lastSeen) < RC_AWARD_EVENT_WINDOW_SECONDS then
+        if SF.Debug then
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Suppressing duplicate RC award for %s item=%s rollType=%s",
+                tostring(memberId),
+                tostring(payload.itemLink),
+                tostring(configuredRollType)
+            )
+        end
+        return false
+    end
+
+    local getMemberByID = profile.GetMemberByID or profile.getMemberByID
+    local member = getMemberByID and getMemberByID(profile, memberId) or nil
+    if not member or type(member.ApplyAwardedItem) ~= "function" then
+        if SF.Debug then
+            SF.Debug:Warn("RC_LOOT_COUNCIL", "Unable to apply RC award because member object is unavailable for %s", tostring(memberId))
+        end
+        return false
+    end
+
+    local slotCandidates, equipLoc, itemInfoPending, resolvedItemLink = ResolveRCLootCouncilAwardSlots(payload.itemLink)
+    if resolvedItemLink and resolvedItemLink ~= "" then
+        payload.itemLink = resolvedItemLink
+        itemKey = BuildRCAwardItemKey(resolvedItemLink) or itemKey
+        deduplicationKey = BuildRCAwardDeduplicationKey(resolvedItemLink) or deduplicationKey
+        signature = table.concat({ tostring(memberId), tostring(deduplicationKey), tostring(configuredRollType) }, "\031")
+    end
+    if itemInfoPending then
+        local retryScheduled, retryCount = ScheduleRCLootCouncilAwardRetry(self, payload)
+        if SF.Debug then
+            SF.Debug:Warn(
+                "RC_LOOT_COUNCIL",
+                "Item info not ready for %s; retryScheduled=%s retryCount=%s item=%s",
+                tostring(memberId),
+                tostring(retryScheduled),
+                tostring(retryCount),
+                tostring(payload.itemLink)
+            )
+        end
+        return false
+    end
+
+    self._rcLootCouncilItemAssignments = self._rcLootCouncilItemAssignments or {}
+    local priorAssignment = payload.isChangeAward and itemKey and self._rcLootCouncilItemAssignments[itemKey] or nil
+    if priorAssignment and priorAssignment.memberId ~= memberId then
+        local priorMember = getMemberByID and getMemberByID(profile, priorAssignment.memberId) or nil
+        if not priorMember or type(priorMember.ClearAwardedItem) ~= "function" then
+            if SF.Debug then
+                SF.Debug:Warn(
+                    "RC_LOOT_COUNCIL",
+                    "Unable to clear previous RC assignment for item=%s member=%s slot=%s",
+                    tostring(payload.itemLink),
+                    tostring(priorAssignment.memberId),
+                    tostring(priorAssignment.slotName)
+                )
+            end
+            return false
+        end
+
+        local cleared = priorMember:ClearAwardedItem(priorAssignment.slotName, {
+            logAuthor = RC_LOOT_COUNCIL_AUTHOR,
+            reason = RC_LOOT_COUNCIL_REASSIGN_REASON,
+            source = RC_LOOT_COUNCIL_SOURCE,
+            rollType = configuredRollType,
+            itemLink = payload.itemLink,
+        })
+        if not cleared then
+            if SF.Debug then
+                SF.Debug:Warn(
+                    "RC_LOOT_COUNCIL",
+                    "Failed to clear previous RC assignment for item=%s member=%s slot=%s",
+                    tostring(payload.itemLink),
+                    tostring(priorAssignment.memberId),
+                    tostring(priorAssignment.slotName)
+                )
+            end
+            return false
+        end
+
+        ForgetRecentAwardSignature(
+            self._rcLootCouncilRecentAwards,
+            table.concat({ tostring(priorAssignment.memberId), tostring(deduplicationKey), tostring(configuredRollType) }, "\031")
+        )
+    end
+
+    if SF.Debug then
+        SF.Debug:Verbose(
+            "RC_LOOT_COUNCIL",
+            "Resolved RC item %s to equipLoc=%s slotCandidates=%s",
+            tostring(payload.itemLink),
+            tostring(equipLoc),
+            slotCandidates and table.concat(slotCandidates, ",") or "nil"
+        )
+    end
+    local slotName = SelectAvailableAwardSlot(member, slotCandidates)
+    if not slotName then
+        if type(slotCandidates) == "table" and #slotCandidates > 0 then
+            local candidateText = JoinStringList(slotCandidates)
+            local warningId = table.concat({
+                tostring(memberId),
+                tostring(payload.itemLink),
+                tostring(configuredRollType),
+                "slot_conflict",
+            }, "\031")
+            local ok = member:DecrementPoints({
+                logAuthor = RC_LOOT_COUNCIL_AUTHOR,
+                reason = RC_LOOT_COUNCIL_CONFLICT_REASON,
+                source = RC_LOOT_COUNCIL_SOURCE,
+                rollType = configuredRollType,
+                itemLink = payload.itemLink,
+                conflictSlots = candidateText,
+                winnerName = payload.winnerName,
+            })
+
+            if ok then
+                local warningMessage = string.format(
+                    "RC award conflict for %s: %s awarded %s, but candidate slots [%s] are already used. Points were decremented; resolve the slot manually.",
+                    tostring(memberId),
+                    tostring(payload.winnerName),
+                    tostring(payload.itemLink),
+                    candidateText
+                )
+                self._rcLootCouncilRecentAwards[signature] = now
+                SF:PrintWarning(warningMessage)
+                local sentCount = BroadcastRCLootCouncilAdminWarning(profile, {
+                    warningId = warningId,
+                    message = warningMessage,
+                })
+                if SF.Debug then
+                    SF.Debug:Warn(
+                        "RC_LOOT_COUNCIL",
+                        "Processed RC award conflict for %s (equipLoc=%s, item=%s, candidates=%s, warningsSent=%d)",
+                        tostring(memberId),
+                        tostring(equipLoc),
+                        tostring(payload.itemLink),
+                        candidateText,
+                        sentCount
+                    )
+                end
+            elseif SF.Debug then
+                SF.Debug:Warn(
+                    "RC_LOOT_COUNCIL",
+                    "Failed to record RC award conflict for %s (equipLoc=%s, item=%s, candidates=%s)",
+                    tostring(memberId),
+                    tostring(equipLoc),
+                    tostring(payload.itemLink),
+                    candidateText
+                )
+            end
+
+            return ok
+        end
+
+        if SF.Debug then
+            SF.Debug:Warn(
+                "RC_LOOT_COUNCIL",
+                "Unable to resolve an available slot for %s (equipLoc=%s, item=%s)",
+                tostring(memberId),
+                tostring(equipLoc),
+                tostring(payload.itemLink)
+            )
+        end
+        return false
+    end
+
+    local ok = member:ApplyAwardedItem(slotName, {
+        logAuthor = RC_LOOT_COUNCIL_AUTHOR,
+        reason = RC_LOOT_COUNCIL_REASON,
+        source = RC_LOOT_COUNCIL_SOURCE,
+        rollType = configuredRollType,
+        itemLink = payload.itemLink,
+    })
+
+    if ok then
+        self._rcLootCouncilRecentAwards[signature] = now
+        if itemKey then
+            self._rcLootCouncilItemAssignments[itemKey] = {
+                memberId = memberId,
+                slotName = slotName,
+                assignedAt = now,
+            }
+        end
+        if SF.Debug then
+            SF.Debug:Info(
+                "RC_LOOT_COUNCIL",
+                "Processed RC award via %s for %s (%s -> %s)",
+                tostring(payload.sourceType or "unknown"),
+                tostring(memberId),
+                tostring(payload.itemLink),
+                tostring(slotName)
+            )
+        end
+    elseif SF.Debug then
+        SF.Debug:Warn(
+            "RC_LOOT_COUNCIL",
+            "Member award application failed for %s (%s -> %s)",
+            tostring(memberId),
+            tostring(payload.itemLink),
+            tostring(slotName)
+        )
+    end
+
+    return ok
+end
+
+function SF:HandleRCLootCouncilAwardMessage(message, chatEvent)
+    -- TODO: Support custom RC awardText templates in the chat fallback path.
+    local payload = BuildRCLootCouncilAwardPayloadFromChatMessage(message, chatEvent)
+    if payload then
+        if SF.Debug then
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Parsed RC award from chat event=%s winner=%s item=%s rollType=%s",
+                tostring(chatEvent),
+                tostring(payload.winnerName),
+                tostring(payload.itemLink),
+                tostring(payload.rollType)
+            )
+        end
+        self:ProcessRCLootCouncilAward(payload)
+    elseif SF.Debug and IsPotentialRCAwardMessage(message) then
+        SF.Debug:Verbose(
+            "RC_LOOT_COUNCIL",
+            "Saw possible RC award chat message but could not parse it from %s: %s",
+            tostring(chatEvent),
+            tostring(message)
+        )
+    end
+end
+
+function SF:TryHookRCLootCouncilIntegration()
+    if self._rcLootCouncilHooked then
+        return true
+    end
+
+    local rcLootCouncil = _G and _G.RCLootCouncil
+    if type(rcLootCouncil) ~= "table" or type(rcLootCouncil.SendMessage) ~= "function" then
+        if SF.Debug then
+            SF.Debug:Verbose("RC_LOOT_COUNCIL", "RCLootCouncil SendMessage hook not available yet")
+        end
+        return false
+    end
+
+    hooksecurefunc(rcLootCouncil, "SendMessage", function(_, messageName, ...)
+        if messageName ~= "RCMLAwardSuccess" then
+            return
+        end
+
+        local session, winner, status, itemLink, responseText = ...
+        if SF.Debug then
+            SF.Debug:Verbose(
+                "RC_LOOT_COUNCIL",
+                "Received RCMLAwardSuccess session=%s winner=%s status=%s item=%s response=%s",
+                tostring(session),
+                tostring(winner),
+                tostring(status),
+                tostring(itemLink),
+                tostring(responseText)
+            )
+        end
+        local payload = BuildRCLootCouncilAwardPayloadFromInternalMessage(session, winner, itemLink, responseText, status)
+        if payload then
+            self:ProcessRCLootCouncilAward(payload)
+        elseif SF.Debug then
+            SF.Debug:Warn(
+                "RC_LOOT_COUNCIL",
+                "Failed to build RC internal payload session=%s winner=%s item=%s response=%s",
+                tostring(session),
+                tostring(winner),
+                tostring(itemLink),
+                tostring(responseText)
+            )
+        end
+    end)
+
+    self._rcLootCouncilHooked = true
+    if SF.Debug then
+        SF.Debug:Info("RC_LOOT_COUNCIL", "Hooked into RCLootCouncil SendMessage")
+    end
+    return true
+end
+
+function SF:InitRCLootCouncilListener()
+    if self._rcLootCouncilFrame then
+        return
+    end
+
+    local frame = CreateFrame("Frame")
+    self._rcLootCouncilFrame = frame
+
+    for _, eventName in ipairs(RC_AWARD_CHAT_EVENTS) do
+        frame:RegisterEvent(eventName)
+    end
+    frame:RegisterEvent("ADDON_LOADED")
+
+    frame:SetScript("OnEvent", function(_, event, ...)
+        if event == "ADDON_LOADED" then
+            local loadedAddon = ...
+            if loadedAddon == "RCLootCouncil" then
+                if SF.Debug then
+                    SF.Debug:Info("RC_LOOT_COUNCIL", "Detected RCLootCouncil addon load")
+                end
+                self:TryHookRCLootCouncilIntegration()
+            end
+            return
+        end
+
+        local message = ...
+        self:HandleRCLootCouncilAwardMessage(message, event)
+    end)
+
+    self:TryHookRCLootCouncilIntegration()
+    if SF.Debug then
+        SF.Debug:Info("RC_LOOT_COUNCIL", "Initialized RC Loot Council listeners")
+    end
+end
+
 -- Database Initialization for Loot Helper Module
 -- @return: none
 function SF:InitializeLootHelperDatabase()
@@ -57,6 +960,8 @@ function SF:InitializeLootHelperDatabase()
 	if SF.LootHelperWindow and SF.LootHelperWindow.Controller and SF.LootHelperWindow.Controller.Init then
 		SF.LootHelperWindow.Controller:Init()
 	end
+
+    SF:InitRCLootCouncilListener()
 end
 
 -- Migrate legacy schema to profileId-based canonical schema
@@ -174,6 +1079,9 @@ function SF:RehydrateLootHelperDB()
 
 			if type(profile._EnsureRaidCheckConfig) == "function" then
 				profile:_EnsureRaidCheckConfig()
+			end
+			if type(profile._EnsureRaidCheckEquipmentSnapshots) == "function" then
+				profile:_EnsureRaidCheckEquipmentSnapshots()
 			end
 
 			-- Restore Member methods

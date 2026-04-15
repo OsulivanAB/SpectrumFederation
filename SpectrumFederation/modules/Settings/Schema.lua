@@ -18,11 +18,16 @@ SF.SettingsSchema = {
 			enabled = true,
 			localSafeMode = false,
 			localSafeModeOnCombat = false,
+			raidCheckAuditAutoRefresh = false,
 
 			-- Profile system
 			activeProfileId = nil,
 			profiles = {},
 		},
+	},
+
+	CHARACTER_DEFAULTS = {
+		pressAndHoldCastingBySpec = {},
 	},
 
 	-- Default *settings* for a profile
@@ -152,5 +157,3 @@ SF.SettingsSchema = {
 		end,
 	},
 }
-
-

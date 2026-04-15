@@ -15,6 +15,7 @@ local MEMBER_ROLES = {
     ADMIN = "admin",
     MEMBER = "member"
 }
+local EQUIPMENT_AWARD_POINT_COST = 1
 
 -- Define all armor slot names (for type safety and easy reference)
 local ARMOR_SLOTS = {
@@ -60,6 +61,45 @@ local function NormalizeClassToken(class)
 end
 
 local SYNC_REBUILD_NOTE = "state will be reconciled from logs via sync rebuild"
+
+local function CanCurrentUserEditActiveProfile()
+    local activeProfile = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+    if not activeProfile then
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "No active profile is available for member mutation")
+        end
+        return false
+    end
+
+    if type(activeProfile.IsCurrentUserAdmin) ~= "function" then
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member state")
+        end
+        return false
+    end
+
+    if not activeProfile:IsCurrentUserAdmin() then
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member state")
+        end
+        return false
+    end
+
+    return true
+end
+
+local function AddLootLogToActiveProfile(logEntry)
+    local activeProfile = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+    if activeProfile and type(activeProfile.AddLootLog) == "function" then
+        activeProfile:AddLootLog(logEntry)
+        return true
+    end
+
+    if SF.Debug then
+        SF.Debug:Warn("MEMBER", "Active profile does not support AddLootLog; cannot persist member mutation log")
+    end
+    return false
+end
 
 -- Member class definition
 local Member = {}
@@ -282,19 +322,7 @@ end
 -- Function to increment point balance by 1
 -- @return (boolean) - True if successful, false otherwise
 function Member:IncrementPoints(opts)
-
-	-- Enforce admin permissions
-	if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
-		if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
-			if SF.Debug then
-                SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
-            end
-            return false
-        end
-    else
-        if SF.Debug then
-            SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member roles")
-        end
+    if not CanCurrentUserEditActiveProfile() then
         return false
     end
     
@@ -303,6 +331,9 @@ function Member:IncrementPoints(opts)
 	local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
 	logEventData.member = self:GetFullIdentifier()
 	logEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+    if opts and opts.amount ~= nil then
+        logEventData.amount = tonumber(opts.amount) or 1
+    end
 	if opts and opts.reason then
 		logEventData.reason = opts.reason
 	end
@@ -324,25 +355,20 @@ function Member:IncrementPoints(opts)
         return false
     end
 
+    local amount = SF.LootLog.GetPointChangeAmount(logEventData)
     local oldBalance = self.pointBalance
-    self.pointBalance = self.pointBalance + 1
+    self.pointBalance = self.pointBalance + amount
     if SF.Debug then
         local delta = self.pointBalance - oldBalance
-        SF.Debug:Info("SYNC_POINTS", "Increment action (mode=apply_delta member=%s old=%d delta=%d new=%d)",
-            self:GetFullIdentifier(), oldBalance, delta, self.pointBalance)
+        SF.Debug:Info("SYNC_POINTS", "Increment action (mode=apply_delta member=%s old=%s delta=%s new=%s)",
+            self:GetFullIdentifier(), tostring(oldBalance), tostring(delta), tostring(self.pointBalance))
     end
 
     -- Add Log Entry to Loot Profile Table
-    if SF.lootHelperDB.activeProfile.AddLootLog then
-        SF.lootHelperDB.activeProfile:AddLootLog(logEntry)
-    else
-        if SF.Debug then
-            SF.Debug:Warn("MEMBER", "Active profile does not support AddLootLog; cannot log point increment")
-        end
-    end
+    AddLootLogToActiveProfile(logEntry)
     
     if SF.Debug then
-        SF.Debug:Verbose("MEMBER", "%s points incremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
+        SF.Debug:Verbose("MEMBER", "%s points incremented: %s -> %s", self:GetFullIdentifier(), tostring(oldBalance), tostring(self.pointBalance))
         SF.Debug:Verbose("SYNC_POINTS", "Increment action (mode=recompute_on_sync member=%s note=%s)",
             self:GetFullIdentifier(), SYNC_REBUILD_NOTE)
     end
@@ -351,21 +377,12 @@ end
 
 -- Function to decrement point balance by 1
 -- Allows negative values (point debt) for edge cases like accidental gear awards
+-- @param metadata table|nil Optional log metadata
 -- @return (boolean) - True if successful, false otherwise
-function Member:DecrementPoints()
+function Member:DecrementPoints(metadata)
+    metadata = metadata or {}
 
-    -- Enforce admin permissions
-    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
-        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
-            if SF.Debug then
-                SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
-            end
-            return false
-        end
-    else
-        if SF.Debug then
-            SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member roles")
-        end
+    if not CanCurrentUserEditActiveProfile() then
         return false
     end
     
@@ -374,7 +391,29 @@ function Member:DecrementPoints()
     local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
     logEventData.member = self:GetFullIdentifier()
     logEventData.change = SF.LootLogPointChangeTypes.DECREMENT
-    local logEntry = SF.LootLog.new(logEventType, logEventData)
+    if metadata.amount ~= nil then
+        logEventData.amount = tonumber(metadata.amount) or 1
+    end
+    if metadata.reason ~= nil then
+        logEventData.reason = tostring(metadata.reason)
+    end
+    if metadata.source ~= nil then
+        logEventData.source = tostring(metadata.source)
+    end
+    if metadata.rollType ~= nil then
+        logEventData.rollType = tostring(metadata.rollType)
+    end
+    if metadata.itemLink ~= nil then
+        logEventData.itemLink = tostring(metadata.itemLink)
+    end
+    local logOpts = {}
+    if metadata.logAuthor ~= nil then
+        logOpts.author = tostring(metadata.logAuthor)
+    end
+    if metadata.timestamp ~= nil then
+        logOpts.timestamp = metadata.timestamp
+    end
+    local logEntry = SF.LootLog.new(logEventType, logEventData, logOpts)
     -- Validate logEntry creation
     if not logEntry then
         SF:PrintError("Failed to create loot log entry for point decrement.")
@@ -384,24 +423,228 @@ function Member:DecrementPoints()
         return false
     end
     
+    local amount = SF.LootLog.GetPointChangeAmount(logEventData)
     local oldBalance = self.pointBalance
-    self.pointBalance = self.pointBalance - 1
+    self.pointBalance = self.pointBalance - amount
 
     -- Add Log Entry to Loot Profile Table
-    if SF.lootHelperDB.activeProfile.AddLootLog then
-        SF.lootHelperDB.activeProfile:AddLootLog(logEntry)
-    else
-        if SF.Debug then
-            SF.Debug:Warn("MEMBER", "Active profile does not support AddLootLog; cannot log point decrement")
-        end
-    end
+    AddLootLogToActiveProfile(logEntry)
     
     if SF.Debug then
-        SF.Debug:Verbose("MEMBER", "%s points decremented: %d -> %d", self:GetFullIdentifier(), oldBalance, self.pointBalance)
+        SF.Debug:Verbose("MEMBER", "%s points decremented: %s -> %s", self:GetFullIdentifier(), tostring(oldBalance), tostring(self.pointBalance))
         if self.pointBalance < 0 then
-            SF.Debug:Warn("MEMBER", "%s is now in point debt: %d", self:GetFullIdentifier(), self.pointBalance)
+            SF.Debug:Warn("MEMBER", "%s is now in point debt: %s", self:GetFullIdentifier(), tostring(self.pointBalance))
         end
     end
+    return true
+end
+
+function Member:ApplyAwardedItem(slot, metadata)
+    metadata = metadata or {}
+
+    if not CanCurrentUserEditActiveProfile() then
+        return false
+    end
+
+    if self.armor[slot] == nil then
+        SF:PrintError("Invalid armor slot specified: " .. tostring(slot))
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Invalid award slot '%s' for %s", tostring(slot), self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    if self.armor[slot] == true then
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Award slot '%s' is already used for %s", tostring(slot), self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    local armorLogEventType = SF.LootLogEventTypes.ARMOR_CHANGE
+    local armorLogEventData = SF.LootLog.GetEventDataTemplate(armorLogEventType)
+    armorLogEventData.member = self:GetFullIdentifier()
+    armorLogEventData.slot = slot
+    armorLogEventData.action = SF.LootLogArmorActions.USED
+    if metadata.reason ~= nil then
+        armorLogEventData.reason = tostring(metadata.reason)
+    end
+    if metadata.source ~= nil then
+        armorLogEventData.source = tostring(metadata.source)
+    end
+    if metadata.rollType ~= nil then
+        armorLogEventData.rollType = tostring(metadata.rollType)
+    end
+    if metadata.itemLink ~= nil then
+        armorLogEventData.itemLink = tostring(metadata.itemLink)
+    end
+
+    local logOpts = {}
+    if metadata.logAuthor ~= nil then
+        logOpts.author = tostring(metadata.logAuthor)
+    end
+    if metadata.timestamp ~= nil then
+        logOpts.timestamp = metadata.timestamp
+    end
+
+    local armorLogEntry = SF.LootLog.new(armorLogEventType, armorLogEventData, logOpts)
+    if not armorLogEntry then
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create armor log for awarded item for %s", self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
+    local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
+    local pointAmount = EQUIPMENT_AWARD_POINT_COST
+    pointLogEventData.member = self:GetFullIdentifier()
+    pointLogEventData.change = SF.LootLogPointChangeTypes.DECREMENT
+    pointLogEventData.amount = pointAmount
+    if metadata.reason ~= nil then
+        pointLogEventData.reason = tostring(metadata.reason)
+    end
+    if metadata.source ~= nil then
+        pointLogEventData.source = tostring(metadata.source)
+    end
+    if metadata.rollType ~= nil then
+        pointLogEventData.rollType = tostring(metadata.rollType)
+    end
+    if metadata.itemLink ~= nil then
+        pointLogEventData.itemLink = tostring(metadata.itemLink)
+    end
+
+    local pointLogEntry = SF.LootLog.new(pointLogEventType, pointLogEventData, logOpts)
+    if not pointLogEntry then
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create point log for awarded item for %s", self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    self.armor[slot] = true
+    self.pointBalance = self.pointBalance - pointAmount
+
+    AddLootLogToActiveProfile(armorLogEntry)
+    AddLootLogToActiveProfile(pointLogEntry)
+
+    if SF.Debug then
+        SF.Debug:Info(
+            "MEMBER",
+            "Applied awarded item for %s: slot=%s points=%s",
+            self:GetFullIdentifier(),
+            tostring(slot),
+            tostring(self.pointBalance)
+        )
+    end
+
+    return true
+end
+
+-- Function to clear a previously-awarded item from a slot and refund the point.
+-- Used by RC Loot Council reassignment handling when an award moves from one member to another.
+-- @param slot (string) - Use SF.ArmorSlots constants
+-- @param metadata table|nil Optional log metadata
+-- @return (boolean) - True if successful, false otherwise
+function Member:ClearAwardedItem(slot, metadata)
+    metadata = metadata or {}
+
+    if not CanCurrentUserEditActiveProfile() then
+        return false
+    end
+
+    if self.armor[slot] == nil then
+        SF:PrintError("Invalid armor slot specified: " .. tostring(slot))
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Invalid clear-award slot '%s' for %s", tostring(slot), self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    if self.armor[slot] ~= true then
+        if SF.Debug then
+            SF.Debug:Warn("MEMBER", "Clear-award slot '%s' is not used for %s", tostring(slot), self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    local armorLogEventType = SF.LootLogEventTypes.ARMOR_CHANGE
+    local armorLogEventData = SF.LootLog.GetEventDataTemplate(armorLogEventType)
+    armorLogEventData.member = self:GetFullIdentifier()
+    armorLogEventData.slot = slot
+    armorLogEventData.action = SF.LootLogArmorActions.AVAILABLE
+    if metadata.reason ~= nil then
+        armorLogEventData.reason = tostring(metadata.reason)
+    end
+    if metadata.source ~= nil then
+        armorLogEventData.source = tostring(metadata.source)
+    end
+    if metadata.rollType ~= nil then
+        armorLogEventData.rollType = tostring(metadata.rollType)
+    end
+    if metadata.itemLink ~= nil then
+        armorLogEventData.itemLink = tostring(metadata.itemLink)
+    end
+
+    local logOpts = {}
+    if metadata.logAuthor ~= nil then
+        logOpts.author = tostring(metadata.logAuthor)
+    end
+    if metadata.timestamp ~= nil then
+        logOpts.timestamp = metadata.timestamp
+    end
+
+    local armorLogEntry = SF.LootLog.new(armorLogEventType, armorLogEventData, logOpts)
+    if not armorLogEntry then
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create armor clear log for %s", self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
+    local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
+    local pointAmount = EQUIPMENT_AWARD_POINT_COST
+    pointLogEventData.member = self:GetFullIdentifier()
+    pointLogEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+    pointLogEventData.amount = pointAmount
+    if metadata.reason ~= nil then
+        pointLogEventData.reason = tostring(metadata.reason)
+    end
+    if metadata.source ~= nil then
+        pointLogEventData.source = tostring(metadata.source)
+    end
+    if metadata.rollType ~= nil then
+        pointLogEventData.rollType = tostring(metadata.rollType)
+    end
+    if metadata.itemLink ~= nil then
+        pointLogEventData.itemLink = tostring(metadata.itemLink)
+    end
+
+    local pointLogEntry = SF.LootLog.new(pointLogEventType, pointLogEventData, logOpts)
+    if not pointLogEntry then
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create point clear log for %s", self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    self.armor[slot] = false
+    self.pointBalance = self.pointBalance + pointAmount
+
+    AddLootLogToActiveProfile(armorLogEntry)
+    AddLootLogToActiveProfile(pointLogEntry)
+
+    if SF.Debug then
+        SF.Debug:Info(
+            "MEMBER",
+            "Cleared awarded item for %s: slot=%s points=%s",
+            self:GetFullIdentifier(),
+            tostring(slot),
+            tostring(self.pointBalance)
+        )
+    end
+
     return true
 end
 
@@ -559,10 +802,11 @@ function Member:UpdateFromLootLog()
     pointBalance = 0
     for _, log in ipairs(filteredLogs) do
         if log.eventType == SF.LootLogEventTypes.POINT_CHANGE then
+            local amount = SF.LootLog.GetPointChangeAmount(log.eventData)
             if log.eventData.change == SF.LootLogPointChangeTypes.INCREMENT then
-                pointBalance = pointBalance + 1
+                pointBalance = pointBalance + amount
             elseif log.eventData.change == SF.LootLogPointChangeTypes.DECREMENT then
-                pointBalance = pointBalance - 1
+                pointBalance = pointBalance - amount
             end
         end
     end

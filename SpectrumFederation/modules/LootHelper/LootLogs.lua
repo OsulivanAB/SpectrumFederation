@@ -6,6 +6,7 @@ local addonName, SF = ...
 -- ============================================================================
 
 local LOG_FORMAT_VERSION = 2
+local DEFAULT_POINT_CHANGE_AMOUNT = 1
 
 local EVENT_TYPES = {
     PROFILE_CREATION            = "PROFILE_CREATION",
@@ -42,6 +43,10 @@ local EVENT_DATA_TEMPLATES = {
         member  = "",
         slot    = "",
         action  = ""
+        -- @field source string|nil Integration name
+        -- @field reason string|nil Machine-readable reason
+        -- @field rollType string|nil Upstream response text
+        -- @field itemLink string|nil WoW item link
     },
     [EVENT_TYPES.ROLE_CHANGE] = {
         member  = "",
@@ -242,6 +247,19 @@ function LootLog.GetEventDataTemplate(eventType)
         template[key] = value
     end
     return template
+end
+
+function LootLog.GetPointChangeAmount(eventData)
+    if type(eventData) ~= "table" then
+        return DEFAULT_POINT_CHANGE_AMOUNT
+    end
+
+    local amount = tonumber(eventData.amount)
+    if amount and amount > 0 then
+        return amount
+    end
+
+    return DEFAULT_POINT_CHANGE_AMOUNT
 end
 
 -- Function to get the Unique ID of this log entry

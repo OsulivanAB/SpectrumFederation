@@ -38,10 +38,16 @@ Run the unified linter:
 python3 .github/scripts/lint_all.py
 ```
 
+## Pull request descriptions
+- **Always use the repository PR template** at `.github/pull_request_template.md` when creating or updating a PR description.
+- Preserve the template's section headings, order, checklist items, and prompts; do not replace the template with a custom format.
+- Fill out every section **to the best of your ability** using the information available from the task, code changes, validation, and testing performed.
+- If a section does not apply or you do not have the information, keep the template section and state that clearly instead of omitting it.
+- When a tool asks for a PR title/description, first read the template and then format the response to match it.
+
 ## Optional local references
 A Blizzard UI source mirror may exist at:
 - BlizzardUI/live/
 - BlizzardUI/beta/
 
 Treat these as optional reference material (guard against missing paths).
-

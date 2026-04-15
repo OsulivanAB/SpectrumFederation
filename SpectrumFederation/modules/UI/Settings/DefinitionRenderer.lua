@@ -102,7 +102,15 @@ function R:Build(panel, pageDef)
 				controls:AddHelpText(sec, item)
 
 			elseif t == "checkbox" then
-				controls:AddCheckbox(sec, item)
+				local opts = item
+				if type(opts.onValueChanged) == "function" then
+					local fn = opts.onValueChanged
+					opts = CopyTable(opts)
+					opts.onValueChanged = function(value)
+						return fn(MakeCtx(panel, sec), value)
+					end
+				end
+				controls:AddCheckbox(sec, opts)
 
 			elseif t == "checkboxGrid" then
 				controls:AddCheckboxGrid(sec, item)

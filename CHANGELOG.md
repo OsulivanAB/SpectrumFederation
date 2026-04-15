@@ -32,6 +32,53 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+
+
+
+## [0.5.18-beta.48] - 2026-04-15
+
+### Added
+- Introduced fallback parsing for RC Loot Council award messages to handle various item link formats and improve compatibility.
+- Added support for detecting and resolving reassigned RC Loot Council awards, including clearing previous assignments and updating records.
+
+### Fixed
+- Resolved an issue causing combat taint during Raid Check inspections.
+- Fixed errors in parsing RC Loot Council award chat messages with escaped characters or incomplete item information.
+
+## [0.5.18-beta.35] - 2026-04-07
+
+### Added
+- Introduced handling for RC Loot Council award conflicts, including detection of ambiguous or unmatched winners and corresponding admin warnings.
+- Added functionality to synchronize RC Loot Council warnings with other admins in the guild.
+- Implemented retry logic for fetching item information during RC Loot Council award processing.
+- Added support for mapping item equip locations to specific armor slots for better award handling.
+
+### Changed
+- Enhanced logic for matching winners to profile members, including improved handling of short names and ambiguous matches.
+
+### Fixed
+- Resolved issues with processing RC Loot Council award messages when item information is delayed or incomplete.
+
+## [0.5.18-beta.30] - 2026-04-07
+
+### Added
+- Introduced support for RCLootCouncil integration, allowing automated point adjustments based on loot council awards.
+- Added new configuration options to enable RCLootCouncil integration and specify roll types.
+
+### Changed
+- Optimized Raid Check Equipment snapshot refresh path for improved performance and reliability.
+
+## [0.5.18-beta.5] - 2026-04-02
+
+### Added
+- Introduced per-specialization settings for Press and Hold Casting, allowing customization based on active specialization.
+- Added a new "Niche Features" tab in the settings menu for managing advanced features like Press and Hold Casting.
+- Support for character-specific saved variables to store specialization-specific settings.
+
+### Changed
+- Press and Hold Casting settings now dynamically apply based on the player's active specialization.
+
 ## [0.5.18] - 2026-03-31
 
 ### Changed
