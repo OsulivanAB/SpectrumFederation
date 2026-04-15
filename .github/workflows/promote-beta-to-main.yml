@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -311,6 +311,7 @@ jobs:
       - name: Package and publish release
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           python3 .github/scripts/publish_release.py "${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}" --interface "${{ needs.dry-run-merge-beta-to-main.outputs.interface }}" --dry-run
 
@@ -673,6 +674,7 @@ jobs:
       - name: Package and publish release
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
           python3 .github/scripts/publish_release.py "${{ needs.merge-beta-to-main.outputs.stable_version }}" --interface "${{ needs.merge-beta-to-main.outputs.interface }}"
 
