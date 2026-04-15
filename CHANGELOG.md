@@ -35,6 +35,17 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.18-beta.48] - 2026-04-15
+
+### Added
+- Introduced fallback parsing for RC Loot Council award messages to handle various item link formats and improve compatibility.
+- Added support for detecting and resolving reassigned RC Loot Council awards, including clearing previous assignments and updating records.
+
+### Fixed
+- Resolved an issue causing combat taint during Raid Check inspections.
+- Fixed errors in parsing RC Loot Council award chat messages with escaped characters or incomplete item information.
+
 ## [0.5.18-beta.35] - 2026-04-07
 
 ### Added
