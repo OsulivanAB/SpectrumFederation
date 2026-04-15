@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -142,77 +143,207 @@ def create_addon_zip(addon_name, version):
         return None
 
 
-def create_github_release(version, zip_path, json_path, repo, is_prerelease=False, dry_run=False):
-    """Create GitHub release and upload assets using gh CLI."""
-    github_token = os.environ.get("GITHUB_TOKEN")
-    if not github_token:
-        print("Error: GITHUB_TOKEN environment variable not set")
-        return False
-    
-    tag_name = f"v{version}"
-    release_name = f"Release {version}"
-    
-    # Extract changelog content for this version
+def mask_secrets(text, secrets):
+    """Mask known secrets in subprocess output."""
+    if not text:
+        return text
+
+    masked = text
+    for secret in secrets:
+        if secret:
+            masked = masked.replace(secret, "***")
+    return masked
+
+
+def format_command(cmd):
+    """Format a subprocess command for logging."""
+    return shlex.join(str(part) for part in cmd)
+
+
+def log_command_failure(prefix, error, secrets):
+    """Log a subprocess failure with masked stdout/stderr."""
+    print(f"::error ::{prefix} (exit code {error.returncode})")
+
+    if error.cmd:
+        print(f"[publish-release] Command: {format_command(error.cmd)}")
+
+    if error.stdout:
+        print("[publish-release] stdout:")
+        print(mask_secrets(error.stdout.strip(), secrets))
+
+    if error.stderr:
+        print("[publish-release] stderr:", file=sys.stderr)
+        print(mask_secrets(error.stderr.strip(), secrets), file=sys.stderr)
+
+
+def build_release_notes(version, repo):
+    """Build release notes for a version."""
     changelog = get_changelog_for_version(version)
-    
-    # Build release notes with embedded changelog
+
     if "-beta" in version:
         notes = f"Beta release {version}\n\n"
         branch = "beta"
     else:
         notes = f"Stable release {version}\n\n"
         branch = "main"
-    
-    # Add changelog content if available
+
     if changelog:
         notes += changelog + "\n\n"
-    
-    # Add link to full changelog
+
     notes += f"[View Full Changelog](https://github.com/{repo}/blob/{branch}/CHANGELOG.md)"
-    
+    return notes
+
+
+def write_release_notes(notes):
+    """Write release notes to a file for gh --notes-file."""
+    build_dir = Path("build")
+    build_dir.mkdir(exist_ok=True)
+
+    notes_path = build_dir / "release-notes.md"
+    notes_path.write_text(notes, encoding="utf-8")
+    print(f"[publish-release] ✓ Wrote release notes to {notes_path}")
+    return notes_path
+
+
+def release_exists(tag_name, env, secrets):
+    """Return True when the GitHub release already exists."""
+    try:
+        subprocess.run(
+            ["gh", "release", "view", tag_name],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return True
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or "").lower()
+        stdout = (error.stdout or "").lower()
+        if "release not found" in stderr or "release not found" in stdout or "404" in stderr:
+            return False
+
+        log_command_failure(
+            f"Failed to check whether GitHub release {tag_name} exists",
+            error,
+            secrets,
+        )
+        raise
+
+
+def update_github_release(tag_name, release_name, notes_path, zip_path, json_path, is_prerelease, env, secrets):
+    """Update an existing GitHub release and replace assets."""
+    print(f"[publish-release] Release {tag_name} already exists; updating it instead")
+
+    edit_cmd = [
+        "gh", "release", "edit",
+        tag_name,
+        "--title", release_name,
+        "--notes-file", str(notes_path),
+    ]
+
+    if is_prerelease:
+        edit_cmd.append("--prerelease")
+
+    upload_cmd = [
+        "gh", "release", "upload",
+        tag_name,
+        str(zip_path),
+        str(json_path),
+        "--clobber",
+    ]
+
+    try:
+        subprocess.run(
+            edit_cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        subprocess.run(
+            upload_cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        print("[publish-release] ✓ Release updated successfully")
+        return True
+    except subprocess.CalledProcessError as error:
+        log_command_failure("Failed to update GitHub release", error, secrets)
+        return False
+
+
+def create_github_release(version, zip_path, json_path, repo, is_prerelease=False, dry_run=False):
+    """Create GitHub release and upload assets using gh CLI."""
+    github_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not github_token:
+        print("Error: GH_TOKEN or GITHUB_TOKEN environment variable not set")
+        return False
+
+    tag_name = f"v{version}"
+    release_name = f"Release {version}"
+
+    notes = build_release_notes(version, repo)
+    notes_path = write_release_notes(notes)
+    gh_env = {**os.environ, "GH_TOKEN": github_token}
+    secrets = [github_token]
+
     if dry_run:
         print("[publish-release] DRY RUN - Would create release:")
         print(f"  Tag: {tag_name}")
         print(f"  Name: {release_name}")
         print(f"  Prerelease: {is_prerelease}")
         print(f"  Assets: {zip_path}, {json_path}")
+        print(f"  Notes file: {notes_path}")
         print(f"  Notes: {notes}")
         return True
-    
+
     print(f"[publish-release] Creating GitHub release: {tag_name}")
-    
-    # Build gh CLI command
+
     cmd = [
         "gh", "release", "create",
         tag_name,
         str(zip_path),
         str(json_path),
         "--title", release_name,
-        "--notes", notes,
+        "--notes-file", str(notes_path),
     ]
-    
+
     if is_prerelease:
         cmd.append("--prerelease")
-    
+
     try:
+        if release_exists(tag_name, gh_env, secrets):
+            return update_github_release(
+                tag_name,
+                release_name,
+                notes_path,
+                zip_path,
+                json_path,
+                is_prerelease,
+                gh_env,
+                secrets,
+            )
+
         result = subprocess.run(
             cmd,
             check=True,
             capture_output=True,
             text=True,
-            env={**os.environ, "GH_TOKEN": github_token}
+            env=gh_env
         )
-        
+
         print("[publish-release] ✓ Release created successfully")
         if result.stdout:
             print(result.stdout)
-        
+
         return True
-        
-    except subprocess.CalledProcessError as e:
-        print(f"::error ::Failed to create GitHub release: {e}")
-        if e.stderr:
-            print(e.stderr, file=sys.stderr)
+    except subprocess.CalledProcessError as error:
+        log_command_failure("Failed to create GitHub release", error, secrets)
+        return False
+    except FileNotFoundError as error:
+        print(f"::error ::Failed to invoke GitHub CLI: {error}")
         return False
 
 
