@@ -13,7 +13,8 @@ local ROW_SPACING = 2
 local ICON_SIZE = 20
 local BTN_SIZE = 20
 local BTN_GAP = 3
-local POINTS_WIDTH = 18
+local POINTS_WIDTH = 32
+local MANUAL_POINT_STEP = 0.5
 
 -- Cropping presets you can tweak quickly:
 local CROP_ICON   = 0.07  -- great for Interface\Icons\
@@ -139,6 +140,17 @@ local function GetClassColor(className)
 		return c.r or 1, c.g or 1, c.b or 1
 	end
 	return 1, 1, 1
+end
+
+local function FormatPointAmount(amount)
+	amount = tonumber(amount) or 0
+	if amount == math.floor(amount) then
+		return tostring(amount)
+	end
+
+	local text = string.format("%.2f", amount)
+	text = text:gsub("0+$", ""):gsub("%.$", "")
+	return text
 end
 
 local function TryGetSpecIcon(unit, memberId)
@@ -375,7 +387,7 @@ function View:_LayoutButtons(r, model)
 	-- Points: only for profile members
 	if model.type == "PROFILE_MEMBER" then
 		r.Points:Show()
-		r.Points:SetText(tostring(model.points or 0))
+		r.Points:SetText(FormatPointAmount(model.points or 0))
 	else
 		r.Points:Hide()
 		r.Points:SetText("")
@@ -451,7 +463,11 @@ function View:_BindRowActions(r, model)
         if model.canAdmin and model.member then
             r.BtnUp:SetScript("OnClick", function()
                 if model.member.IncrementPoints then
-                    pcall(function() model.member:IncrementPoints() end)
+                    pcall(function()
+                        model.member:IncrementPoints({
+                            amount = MANUAL_POINT_STEP,
+                        })
+                    end)
                 end
                 -- DATA_CHANGED event is automatically fired via Events.lua hook
                 if SF.Debug then
@@ -461,7 +477,11 @@ function View:_BindRowActions(r, model)
             
             r.BtnDown:SetScript("OnClick", function()
                 if model.member.DecrementPoints then
-                    pcall(function() model.member:DecrementPoints() end)
+                    pcall(function()
+                        model.member:DecrementPoints({
+                            amount = MANUAL_POINT_STEP,
+                        })
+                    end)
                 end
                 -- DATA_CHANGED event is automatically fired via Events.lua hook
                 if SF.Debug then
