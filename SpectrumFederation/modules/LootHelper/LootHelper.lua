@@ -334,14 +334,6 @@ local function ForgetRecentAwardSignature(cache, signature)
     cache[signature] = nil
 end
 
-local function HasChatRollTypeMismatch(payload, rawPayloadRollType, rawConfiguredRollType)
-    local payloadRollType = tostring(rawPayloadRollType or "")
-    local configuredRollType = tostring(rawConfiguredRollType or "")
-    return payload.sourceType == "chat"
-        and payloadRollType ~= ""
-        and payloadRollType:lower() ~= configuredRollType:lower()
-end
-
 local function JoinStringList(values)
     if type(values) ~= "table" then
         return ""
@@ -515,7 +507,7 @@ function SF:ProcessRCLootCouncilAward(payload)
     end
 
     local payloadRollType = NormalizeRCLootCouncilAwardReason(payload.rollType)
-    if payload.sourceType ~= "chat" and payloadRollType:lower() ~= configuredRollType:lower() then
+    if payloadRollType == "" or payloadRollType:lower() ~= configuredRollType:lower() then
         if SF.Debug then
             SF.Debug:Verbose(
                 "RC_LOOT_COUNCIL",
@@ -525,14 +517,6 @@ function SF:ProcessRCLootCouncilAward(payload)
             )
         end
         return false
-    end
-    if HasChatRollTypeMismatch(payload, payloadRollType, configuredRollType) and SF.Debug then
-        SF.Debug:Verbose(
-            "RC_LOOT_COUNCIL",
-            "Accepting chat RC award with unmatched raw roll type '%s'; using configured '%s' instead",
-            tostring(payloadRollType),
-            tostring(configuredRollType)
-        )
     end
 
     local now = GetTime and GetTime() or 0
