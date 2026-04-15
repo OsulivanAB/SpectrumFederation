@@ -148,6 +148,26 @@ local function BuildRCAwardItemKey(itemReference)
     return normalizedName:lower()
 end
 
+local function BuildRCAwardDeduplicationKey(itemReference)
+    if type(itemReference) ~= "string" or itemReference == "" then
+        return nil
+    end
+
+    local itemIdText = itemReference:match("|Hitem:(%d+):") or itemReference:match("^item:(%d+):")
+    if not itemIdText and type(GetItemInfoInstant) == "function" then
+        local itemId = GetItemInfoInstant(itemReference)
+        if tonumber(itemId) and tonumber(itemId) > 0 then
+            itemIdText = tostring(itemId)
+        end
+    end
+
+    if itemIdText and itemIdText ~= "" then
+        return "itemid:" .. itemIdText
+    end
+
+    return BuildRCAwardItemKey(itemReference)
+end
+
 local function FindProfileMemberIdByName(profile, winnerName)
     winnerName = TrimText(winnerName)
     local getMemberIds = profile.GetMemberIds or profile.getMemberIds
@@ -562,7 +582,8 @@ function SF:ProcessRCLootCouncilAward(payload)
     if not itemKey then
         itemKey = BuildRCAwardItemKey(payload.itemLink) or tostring(payload.itemLink)
     end
-    local signature = table.concat({ tostring(memberId), tostring(itemKey), tostring(configuredRollType) }, "\031")
+    local deduplicationKey = BuildRCAwardDeduplicationKey(payload.itemLink) or itemKey
+    local signature = table.concat({ tostring(memberId), tostring(deduplicationKey), tostring(configuredRollType) }, "\031")
     local lastSeen = self._rcLootCouncilRecentAwards[signature]
     if lastSeen and (now - lastSeen) < RC_AWARD_EVENT_WINDOW_SECONDS then
         if SF.Debug then
@@ -590,7 +611,8 @@ function SF:ProcessRCLootCouncilAward(payload)
     if resolvedItemLink and resolvedItemLink ~= "" then
         payload.itemLink = resolvedItemLink
         itemKey = BuildRCAwardItemKey(resolvedItemLink) or itemKey
-        signature = table.concat({ tostring(memberId), tostring(itemKey), tostring(configuredRollType) }, "\031")
+        deduplicationKey = BuildRCAwardDeduplicationKey(resolvedItemLink) or deduplicationKey
+        signature = table.concat({ tostring(memberId), tostring(deduplicationKey), tostring(configuredRollType) }, "\031")
     end
     if itemInfoPending then
         local retryScheduled, retryCount = ScheduleRCLootCouncilAwardRetry(self, payload)
@@ -646,7 +668,7 @@ function SF:ProcessRCLootCouncilAward(payload)
 
         ForgetRecentAwardSignature(
             self._rcLootCouncilRecentAwards,
-            table.concat({ tostring(priorAssignment.memberId), tostring(itemKey), tostring(configuredRollType) }, "\031")
+            table.concat({ tostring(priorAssignment.memberId), tostring(deduplicationKey), tostring(configuredRollType) }, "\031")
         )
     end
 
