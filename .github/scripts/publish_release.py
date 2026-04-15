@@ -217,7 +217,8 @@ def release_exists(tag_name, env):
     except subprocess.CalledProcessError as error:
         stderr = (error.stderr or "").lower()
         stdout = (error.stdout or "").lower()
-        if "release not found" in stderr or "release not found" in stdout or "404" in stderr or "404" in stdout:
+        combined_output = f"{stdout}\n{stderr}"
+        if "release not found" in combined_output or "404" in combined_output:
             return False
 
         log_command_failure(
@@ -273,6 +274,7 @@ def update_github_release(tag_name, release_name, notes_path, zip_path, json_pat
 
 def create_github_release(version, zip_path, json_path, repo, is_prerelease=False, dry_run=False):
     """Create GitHub release and upload assets using gh CLI."""
+    # Support both workflow GH_TOKEN usage and local/manual GITHUB_TOKEN usage.
     github_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not github_token:
         print("Error: GH_TOKEN or GITHUB_TOKEN environment variable not set")
