@@ -37,6 +37,15 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.18-beta.1] - 2026-04-16
+
+### Changed
+- Updated addon version metadata to `0.5.18-beta.1`.
+
+### Removed
+- Removed the automation section from the README.
+
 ## [0.5.18] - 2026-04-15
 
 ### Changed
