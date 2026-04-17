@@ -704,7 +704,7 @@ function SF:ProcessRCLootCouncilAward(payload)
         })
 
         if ok then
-            local warningMessage = nil
+            local warningMessage
             if hasCandidateSlots then
                 warningMessage = string.format(
                     "RC award conflict for %s: %s awarded %s, but candidate slots [%s] are already used. Points were decremented; resolve the slot manually.",
