@@ -3,12 +3,13 @@ local addonName, SF = ...
 
 local RC_AWARD_EVENT_WINDOW_SECONDS = 5
 local RC_AWARD_ITEMINFO_RETRY_DELAY_SECONDS = 1
-local RC_AWARD_ITEMINFO_MAX_RETRIES = 2
+local RC_AWARD_ITEMINFO_MAX_RETRIES = 5
 local RC_LOOT_COUNCIL_AUTHOR = "RC Loot Council"
 local RC_LOOT_COUNCIL_SOURCE = "RCLootCouncil"
 local RC_LOOT_COUNCIL_REASON = "RC_LOOT_COUNCIL"
 local RC_LOOT_COUNCIL_REASSIGN_REASON = "RC_LOOT_COUNCIL_REASSIGN"
 local RC_LOOT_COUNCIL_CONFLICT_REASON = "RC_LOOT_COUNCIL_SLOT_CONFLICT"
+local RC_LOOT_COUNCIL_UNRESOLVED_REASON = "RC_LOOT_COUNCIL_SLOT_UNRESOLVED"
 local RC_CHANGE_AWARD_PREFIX = "change award"
 local RC_AWARD_CHAT_EVENTS = {
     "CHAT_MSG_RAID",
@@ -683,73 +684,73 @@ function SF:ProcessRCLootCouncilAward(payload)
     end
     local slotName = SelectAvailableAwardSlot(member, slotCandidates)
     if not slotName then
-        if type(slotCandidates) == "table" and #slotCandidates > 0 then
-            local candidateText = JoinStringList(slotCandidates)
-            local warningId = table.concat({
-                tostring(memberId),
-                tostring(payload.itemLink),
-                tostring(configuredRollType),
-                "slot_conflict",
-            }, "\031")
-            local ok = member:DecrementPoints({
-                logAuthor = RC_LOOT_COUNCIL_AUTHOR,
-                reason = RC_LOOT_COUNCIL_CONFLICT_REASON,
-                source = RC_LOOT_COUNCIL_SOURCE,
-                rollType = configuredRollType,
-                itemLink = payload.itemLink,
-                conflictSlots = candidateText,
-                winnerName = payload.winnerName,
-            })
+        local hasCandidateSlots = type(slotCandidates) == "table" and #slotCandidates > 0
+        local candidateText = hasCandidateSlots and JoinStringList(slotCandidates) or ""
+        local warningSuffix = hasCandidateSlots and "slot_conflict" or "slot_unresolved"
+        local warningId = table.concat({
+            tostring(memberId),
+            tostring(payload.itemLink),
+            tostring(configuredRollType),
+            warningSuffix,
+        }, "\031")
+        local ok = member:DecrementPoints({
+            logAuthor = RC_LOOT_COUNCIL_AUTHOR,
+            reason = hasCandidateSlots and RC_LOOT_COUNCIL_CONFLICT_REASON or RC_LOOT_COUNCIL_UNRESOLVED_REASON,
+            source = RC_LOOT_COUNCIL_SOURCE,
+            rollType = configuredRollType,
+            itemLink = payload.itemLink,
+            conflictSlots = candidateText,
+            winnerName = payload.winnerName,
+        })
 
-            if ok then
-                local warningMessage = string.format(
+        if ok then
+            local warningMessage = nil
+            if hasCandidateSlots then
+                warningMessage = string.format(
                     "RC award conflict for %s: %s awarded %s, but candidate slots [%s] are already used. Points were decremented; resolve the slot manually.",
                     tostring(memberId),
                     tostring(payload.winnerName),
                     tostring(payload.itemLink),
                     candidateText
                 )
-                self._rcLootCouncilRecentAwards[signature] = now
-                SF:PrintWarning(warningMessage)
-                local sentCount = BroadcastRCLootCouncilAdminWarning(profile, {
-                    warningId = warningId,
-                    message = warningMessage,
-                })
-                if SF.Debug then
-                    SF.Debug:Warn(
-                        "RC_LOOT_COUNCIL",
-                        "Processed RC award conflict for %s (equipLoc=%s, item=%s, candidates=%s, warningsSent=%d)",
-                        tostring(memberId),
-                        tostring(equipLoc),
-                        tostring(payload.itemLink),
-                        candidateText,
-                        sentCount
-                    )
-                end
-            elseif SF.Debug then
-                SF.Debug:Warn(
-                    "RC_LOOT_COUNCIL",
-                    "Failed to record RC award conflict for %s (equipLoc=%s, item=%s, candidates=%s)",
+            else
+                warningMessage = string.format(
+                    "RC award for %s: %s awarded %s, but Spectrum Federation could not determine the matching equipment slot. Points were decremented; resolve the slot manually.",
                     tostring(memberId),
-                    tostring(equipLoc),
-                    tostring(payload.itemLink),
-                    candidateText
+                    tostring(payload.winnerName),
+                    tostring(payload.itemLink)
                 )
             end
 
-            return ok
-        end
-
-        if SF.Debug then
+            self._rcLootCouncilRecentAwards[signature] = now
+            SF:PrintWarning(warningMessage)
+            local sentCount = BroadcastRCLootCouncilAdminWarning(profile, {
+                warningId = warningId,
+                message = warningMessage,
+            })
+            if SF.Debug then
+                SF.Debug:Warn(
+                    "RC_LOOT_COUNCIL",
+                    "Processed RC award without automatic slot assignment for %s (equipLoc=%s, item=%s, candidates=%s, warningsSent=%d)",
+                    tostring(memberId),
+                    tostring(equipLoc),
+                    tostring(payload.itemLink),
+                    hasCandidateSlots and candidateText or "nil",
+                    sentCount
+                )
+            end
+        elseif SF.Debug then
             SF.Debug:Warn(
                 "RC_LOOT_COUNCIL",
-                "Unable to resolve an available slot for %s (equipLoc=%s, item=%s)",
+                "Failed to record RC award without automatic slot assignment for %s (equipLoc=%s, item=%s, candidates=%s)",
                 tostring(memberId),
                 tostring(equipLoc),
-                tostring(payload.itemLink)
+                tostring(payload.itemLink),
+                hasCandidateSlots and candidateText or "nil"
             )
         end
-        return false
+
+        return ok
     end
 
     local ok = member:ApplyAwardedItem(slotName, {
