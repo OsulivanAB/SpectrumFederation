@@ -1,0 +1,16 @@
+---
+description: Validation expectations and beta-first release constraints
+alwaysApply: true
+---
+
+# Validation And Release
+
+- Choose validation by changed area instead of guessing:
+  - addon Lua, TOC, workflows, or CI scripts -> `python3 .github/scripts/lint_all.py`
+  - packaging or release behavior -> `python3 .github/scripts/validate_packaging.py`
+  - docs, `README.md`, or `mkdocs.yml` -> `python3 .github/scripts/validate_docs.py`
+  - `wow_interface_sync.py` or parser fixtures/tests -> `python -m pytest tests/test_wow_interface_sync.py`
+- Normal development targets `beta`; `main` is for promotion and release workflows.
+- Do not weaken CI to make checks pass.
+- Keep the job name in `.github/workflows/copilot-setup-steps.yml` exactly `copilot-setup-steps`.
+- Treat `SpectrumFederation/SpectrumFederation.toc` as the authoritative source for addon version, interface value, and load order whenever a task touches addon packaging or release/version logic.

@@ -1,0 +1,13 @@
+---
+description: Constraints for CI automation, docs, and supporting Python code
+globs: ".github/**,docs/**,README.md,mkdocs.yml,tests/**,.devcontainer/**"
+alwaysApply: false
+---
+
+# Automation And Docs
+
+- Keep CI/helper scripts dependency-light; match existing patterns built around the standard library, `pathlib`, and `subprocess.run`.
+- Only edit workflows when the task requires it, and keep actions pinned to stable major versions.
+- Keep docs and README commands aligned with real scripts and workflows; avoid reintroducing stale workflow names.
+- Use `requirements-docs.txt` and `mkdocs.yml` as the source of truth for docs build behavior.
+- When changing `wow_interface_sync.py`, its fixtures, or parser behavior, update or run `tests/test_wow_interface_sync.py`.
