@@ -1,0 +1,15 @@
+---
+description: WoW addon runtime constraints and common implementation paths
+globs: "SpectrumFederation/**"
+alwaysApply: false
+---
+
+# Addon Runtime
+
+- Target WoW Lua 5.1 only; avoid Lua 5.2+ features plus `io`, `os`, sockets, or external process assumptions.
+- Follow the repo namespace pattern: `local addonName, SF = ...`; attach addon APIs to `SF` and avoid globals.
+- Any new packaged Lua file must be added to `SpectrumFederation/SpectrumFederation.toc` in load order.
+- For settings work, start with `modules/Settings/Schema.lua`, `modules/Settings/Store.lua`, `modules/Settings/Apply.lua`, and `modules/UI/Settings/`.
+- Prefer `SF.Debug` for diagnostics and `SF:PrintSuccess/Error/Warning/Info` for user-visible messages.
+- Guard protected UI changes with `InCombatLockdown()` when relevant and prefer `hooksecurefunc` over replacing Blizzard functions.
+- Check `locale/enUS.lua` before introducing new user-facing strings.
