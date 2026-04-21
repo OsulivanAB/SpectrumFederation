@@ -12,7 +12,6 @@ local Page = {
 		disablePageScroll = true,
 	},
 }
-
 local GetEventTypeLabel
 
 -- ==================================================================

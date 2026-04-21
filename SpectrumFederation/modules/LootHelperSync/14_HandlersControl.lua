@@ -1,6 +1,7 @@
 local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
+
 -- Function Handle ADMIN_SYNC as a recipient admin: respond with ADMIN_STATUS after jitter.
 -- @param sender string Coordinator who requested sync
 -- @param payload table {sessionId, profileId, ...}
