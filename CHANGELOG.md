@@ -38,12 +38,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.18-beta.1] - 2026-04-21
-
-### Changed
-- Updated interface compatibility to include patch `12.0.5`.
-
-## [0.5.18] - 2026-04-15
+## [0.5.18] - 2026-04-21
 
 ### Changed
 - Infrastructure and tooling updates (no addon code changes)
