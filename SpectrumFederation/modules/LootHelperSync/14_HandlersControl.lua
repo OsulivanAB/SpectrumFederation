@@ -1,9 +1,6 @@
 local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
-local RC_AWARD_WARNING_WINDOW_SECONDS = 5
-
-
 -- Function Handle ADMIN_SYNC as a recipient admin: respond with ADMIN_STATUS after jitter.
 -- @param sender string Coordinator who requested sync
 -- @param payload table {sessionId, profileId, ...}
@@ -199,50 +196,6 @@ function Sync:HandleAdminStatus(sender, payload)
         if not conv.finalizeStarted and not conv.finished then
             self:FinalizeAdminConvergence()
         end
-    end
-end
-
--- Function Handle an RC Loot Council warning whisper and display it to authorized admins.
--- @param sender string "Name-Realm" of sender admin
--- @param payload table { profileId, warningId, message }
--- @return nil
-function Sync:HandleRCAwardWarning(sender, payload)
-    if type(payload) ~= "table" then return end
-
-    local profileId = tostring(payload.profileId or "")
-    local warningId = tostring(payload.warningId or "")
-    local message = tostring(payload.message or "")
-    if profileId == "" or message == "" then return end
-
-    if not self:FindLocalProfileById(profileId) then
-        if SF.Debug then
-            SF.Debug:Warn("SYNC", "Ignoring RC_AWARD_WARNING from %s: unknown profile %s",
-                tostring(sender), tostring(profileId))
-        end
-        return
-    end
-
-    if not self:IsSenderAuthorized(profileId, sender) then
-        if SF.Debug then
-            SF.Debug:Warn("SYNC", "Ignoring RC_AWARD_WARNING from %s: sender not authorized for profile %s",
-                tostring(sender), tostring(profileId))
-        end
-        return
-    end
-
-    self.state = self.state or {}
-    self.state.rcAwardWarnings = self.state.rcAwardWarnings or {}
-    if warningId ~= "" then
-        local now = GetTime and GetTime() or 0
-        local lastSeen = self.state.rcAwardWarnings[warningId]
-        if lastSeen and (now - lastSeen) < RC_AWARD_WARNING_WINDOW_SECONDS then
-            return
-        end
-        self.state.rcAwardWarnings[warningId] = now
-    end
-
-    if SF.PrintWarning then
-        SF:PrintWarning(message)
     end
 end
 

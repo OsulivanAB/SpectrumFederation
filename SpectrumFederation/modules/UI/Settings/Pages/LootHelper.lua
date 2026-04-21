@@ -1446,59 +1446,6 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then SF.RaidCheck:RunPreRaidCheck() ctx.section:SetMessage("Pre-Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then SF.RaidCheck:RunRaidCheck() ctx.section:SetMessage("Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end } },
 				{ type = "text", text = "Enable Whispers During..." },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing required enchants or gems.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) end } } },
-				{ type = "spacer", height = 12 },
-				{ type = "heading", text = "RC Loot Council" },
-				{
-					type = "checkbox",
-					label = "Enable RC Loot Council",
-					adminOnly = true,
-					tooltip = "Listen for RC Loot Council award announcements and decrement points when the configured roll type wins an item.",
-					enabled = function() return ProfileActionsEnabled() end,
-					get = function()
-						local profile = GetActiveProfileObject(store)
-						if profile and type(profile.GetRCLootCouncilEnabled) == "function" then
-							return profile:GetRCLootCouncilEnabled()
-						end
-						return false
-					end,
-					set = function(value)
-						local profile = GetActiveProfileObject(store)
-						if profile and type(profile.SetRCLootCouncilEnabled) == "function" then
-							profile:SetRCLootCouncilEnabled(value and true or false)
-						end
-					end,
-					onValueChanged = function(ctx)
-						ctx.pageBuilder:Refresh()
-					end,
-				},
-				{
-					type = "editbox",
-					label = "RC Roll Type",
-					adminOnly = true,
-					tooltip = "Exact RC Loot Council award reason to listen for, such as Minor Upgrade or Main Spec.",
-					visible = function()
-						local profile = GetActiveProfileObject(store)
-						return ProfileActionsEnabled()
-							and profile
-							and type(profile.GetRCLootCouncilEnabled) == "function"
-							and profile:GetRCLootCouncilEnabled()
-					end,
-					enabled = function() return ProfileActionsEnabled() end,
-					get = function()
-						local profile = GetActiveProfileObject(store)
-						if profile and type(profile.GetRCLootCouncilRollType) == "function" then
-							return profile:GetRCLootCouncilRollType()
-						end
-						return ""
-					end,
-					set = function(value)
-						local profile = GetActiveProfileObject(store)
-						if profile and type(profile.SetRCLootCouncilRollType) == "function" then
-							profile:SetRCLootCouncilRollType(value)
-						end
-					end,
-					maxLetters = 48,
-				},
 			},
 		},
 		admin = {

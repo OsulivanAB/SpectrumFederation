@@ -47,11 +47,6 @@ local RAID_CHECK_DEFAULTS = {
 	slots = RAID_CHECK_SLOT_DEFAULTS,
 }
 
-local RC_LOOT_COUNCIL_DEFAULTS = {
-	enabled = false,
-	rollType = "",
-}
-
 local function CopyRaidCheckDefaults()
 	return {
 		enableWhispersPreRaid = RAID_CHECK_DEFAULTS.enableWhispersPreRaid,
@@ -98,19 +93,6 @@ function LootProfile:_EnsureRaidCheckConfig()
 	cfg.enableWhispersRaid = cfg.enableWhispersRaid and true or false
     cfg.checkGemsInSockets = cfg.checkGemsInSockets ~= false
 	cfg.requireMetaGem = cfg.requireMetaGem and true or false
-end
-
-function LootProfile:_EnsureRCLootCouncilConfig()
-	if type(self._rcLootCouncilConfig) ~= "table" then
-		self._rcLootCouncilConfig = {
-			enabled = RC_LOOT_COUNCIL_DEFAULTS.enabled,
-			rollType = RC_LOOT_COUNCIL_DEFAULTS.rollType,
-		}
-	end
-
-	local cfg = self._rcLootCouncilConfig
-	cfg.enabled = cfg.enabled and true or false
-	cfg.rollType = tostring(cfg.rollType or ""):match("^%s*(.-)%s*$")
 end
 
 function LootProfile:_EnsureRaidCheckEquipmentSnapshots()
@@ -263,11 +245,6 @@ function LootProfile.new(profileName)
     instance._raidWideSafeModeOnCombat = false
     instance._raidCheckConfig = CopyRaidCheckDefaults()
     instance._raidCheckEquipmentSnapshots = {}
-    instance._rcLootCouncilConfig = {
-		enabled = RC_LOOT_COUNCIL_DEFAULTS.enabled,
-		rollType = RC_LOOT_COUNCIL_DEFAULTS.rollType,
-	}
-
     -- Create member instance for author
     local class = SF:GetPlayerClass()
     local adminRole = (SF.MemberRoles and SF.MemberRoles.ADMIN) or "admin"
@@ -543,16 +520,6 @@ function LootProfile:GetRaidCheckConfig()
 	}
 end
 
-function LootProfile:GetRCLootCouncilEnabled()
-	self:_EnsureRCLootCouncilConfig()
-	return self._rcLootCouncilConfig.enabled and true or false
-end
-
-function LootProfile:GetRCLootCouncilRollType()
-	self:_EnsureRCLootCouncilConfig()
-	return self._rcLootCouncilConfig.rollType or ""
-end
-
 function LootProfile:GetRaidCheckEquipmentSnapshot(memberId)
 	self:_EnsureRaidCheckEquipmentSnapshots()
 	if type(memberId) ~= "string" or memberId == "" then
@@ -687,27 +654,6 @@ function LootProfile:SetRaidCheckMetaGemRequired(enabled)
 
     self._raidCheckConfig.requireMetaGem = enabled and true or false
     return true, nil
-end
-
-function LootProfile:SetRCLootCouncilEnabled(enabled)
-	self:_EnsureRCLootCouncilConfig()
-	if not self:IsCurrentUserAdmin() then
-		return false, "You must be an admin to change RC Loot Council settings."
-	end
-
-	self._rcLootCouncilConfig.enabled = enabled and true or false
-	return true, nil
-end
-
-function LootProfile:SetRCLootCouncilRollType(rollType)
-	self:_EnsureRCLootCouncilConfig()
-	if not self:IsCurrentUserAdmin() then
-		return false, "You must be an admin to change RC Loot Council settings."
-	end
-
-	rollType = tostring(rollType or ""):match("^%s*(.-)%s*$")
-	self._rcLootCouncilConfig.rollType = rollType
-	return true, nil
 end
 
 -- Function Get list of admin member IDs
@@ -1211,10 +1157,6 @@ function LootProfile:ExportSnapshot()
 		equipmentSnapshots = equipmentSnapshotsOut,
 		pointName       = self._pointName or "Points",
 		raidCheck       = self:GetRaidCheckConfig(),
-		rcLootCouncil   = {
-			enabled = self:GetRCLootCouncilEnabled(),
-			rollType = self:GetRCLootCouncilRollType(),
-		},
 	}
 end
 
@@ -1414,18 +1356,6 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	end
 
 	self:_EnsureRaidCheckConfig()
-
-	if type(snapshot.rcLootCouncil) == "table" then
-		self:_EnsureRCLootCouncilConfig()
-		if snapshot.rcLootCouncil.enabled ~= nil then
-			self._rcLootCouncilConfig.enabled = snapshot.rcLootCouncil.enabled and true or false
-		end
-		if snapshot.rcLootCouncil.rollType ~= nil then
-			self._rcLootCouncilConfig.rollType = tostring(snapshot.rcLootCouncil.rollType or ""):match("^%s*(.-)%s*$")
-		end
-	end
-
-	self:_EnsureRCLootCouncilConfig()
 
 	-- Merge Logs
 	local inserted = self:MergeLogTables(snapshot.lootLogs, opts)
