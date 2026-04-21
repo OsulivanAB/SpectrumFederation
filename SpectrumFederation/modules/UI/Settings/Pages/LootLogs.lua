@@ -334,8 +334,10 @@ function Page:Build(panel)
 					include = false
 				end
 				
+				local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
+
 				-- Filter by author
-					local displayAuthor = GetDisplayAuthor(log:GetAuthor(), data)
+				local displayAuthor = GetDisplayAuthor(log:GetAuthor())
 				if panel.__sfSelectedAuthor and displayAuthor ~= panel.__sfSelectedAuthor then
 					include = false
 				end
