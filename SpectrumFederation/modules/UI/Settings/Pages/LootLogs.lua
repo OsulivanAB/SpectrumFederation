@@ -219,10 +219,6 @@ local function FormatItemCellText(data)
 	return itemLink
 end
 
-local function GetDisplayAuthor(author)
-	return author
-end
-
 local function BuildActionText(eventType, data, author)
 	data = data or {}
 
@@ -280,7 +276,7 @@ local function BuildLogRow(log)
 	local rawAuthor = log:GetAuthor() or "Unknown"
 	local eventType = log:GetEventType() or "Unknown"
 	local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
-	local author = GetDisplayAuthor(rawAuthor, data)
+	local author = rawAuthor
 	local eventColor = EVENT_TYPE_COLORS[eventType] or "|cffffffff"
 	local reset = "|r"
 
@@ -333,16 +329,14 @@ function Page:Build(panel)
 					include = false
 				end
 				
-				local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
-
 				-- Filter by author
-				local displayAuthor = GetDisplayAuthor(log:GetAuthor())
-				if panel.__sfSelectedAuthor and displayAuthor ~= panel.__sfSelectedAuthor then
+				if panel.__sfSelectedAuthor and log:GetAuthor() ~= panel.__sfSelectedAuthor then
 					include = false
 				end
 				
 				-- Filter by member
 				if panel.__sfSelectedMember then
+					local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
 					if not data or data.member ~= panel.__sfSelectedMember then
 						include = false
 					end
