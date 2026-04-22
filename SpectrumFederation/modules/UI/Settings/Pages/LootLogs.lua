@@ -12,9 +12,7 @@ local Page = {
 		disablePageScroll = true,
 	},
 }
-
 local GetEventTypeLabel
-local IsRCLootCouncilLog
 
 -- ==================================================================
 -- Helpers
@@ -37,11 +35,7 @@ local function GetUniqueAuthors(logs)
 	local authorsSet = {}
 	for _, log in ipairs(logs) do
 		if type(log.GetAuthor) == "function" then
-			local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
 			local author = log:GetAuthor()
-			if IsRCLootCouncilLog(data) then
-				author = "RC Loot Council"
-			end
 			if author then
 				authorsSet[author] = true
 			end
@@ -225,36 +219,16 @@ local function FormatItemCellText(data)
 	return itemLink
 end
 
-IsRCLootCouncilLog = function(data)
-	data = data or {}
-	return data.reason == "RC_LOOT_COUNCIL"
-		or data.reason == "RC_LOOT_COUNCIL_REASSIGN"
-		or data.reason == "RC_LOOT_COUNCIL_SLOT_CONFLICT"
-		or data.source == "RCLootCouncil"
-end
-
-local function GetDisplayAuthor(author, data)
-	if IsRCLootCouncilLog(data) then
-		return "RC Loot Council"
-	end
-	return author
-end
-
 local function BuildActionText(eventType, data, author)
 	data = data or {}
 
 	if eventType == "POINT_CHANGE" then
 		local isRaidCheck = (data.reason == "RAID_CHECK") or (author == "Raid Check")
-		local isRCLootCouncil = (data.reason == "RC_LOOT_COUNCIL") or (data.source == "RCLootCouncil")
 		local amount = (SF.LootLog and SF.LootLog.GetPointChangeAmount and SF.LootLog.GetPointChangeAmount(data)) or 1
 		if isRaidCheck and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
 			return string.format("Raid Check prepared (+%s)", FormatPointAmount(amount))
 		elseif isRaidCheck then
 			return string.format("Raid Check change (%s)", FormatLabel(data.change or "?"))
-		elseif isRCLootCouncil and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
-			return string.format("RC Loot Council (%s)", tostring(data.rollType or "Award"))
-		elseif isRCLootCouncil then
-			return "RC Loot Council"
 		end
 
 		if data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
@@ -302,7 +276,7 @@ local function BuildLogRow(log)
 	local rawAuthor = log:GetAuthor() or "Unknown"
 	local eventType = log:GetEventType() or "Unknown"
 	local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
-	local author = GetDisplayAuthor(rawAuthor, data)
+	local author = rawAuthor
 	local eventColor = EVENT_TYPE_COLORS[eventType] or "|cffffffff"
 	local reset = "|r"
 
@@ -356,14 +330,13 @@ function Page:Build(panel)
 				end
 				
 				-- Filter by author
-				local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
-				local displayAuthor = GetDisplayAuthor(log:GetAuthor(), data)
-				if panel.__sfSelectedAuthor and displayAuthor ~= panel.__sfSelectedAuthor then
+				if panel.__sfSelectedAuthor and log:GetAuthor() ~= panel.__sfSelectedAuthor then
 					include = false
 				end
 				
 				-- Filter by member
 				if panel.__sfSelectedMember then
+					local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
 					if not data or data.member ~= panel.__sfSelectedMember then
 						include = false
 					end

@@ -542,7 +542,7 @@ function Member:ApplyAwardedItem(slot, metadata)
 end
 
 -- Function to clear a previously-awarded item from a slot and refund the point.
--- Used by RC Loot Council reassignment handling when an award moves from one member to another.
+-- Used by award reassignment handling when an item moves from one member to another.
 -- @param slot (string) - Use SF.ArmorSlots constants
 -- @param metadata table|nil Optional log metadata
 -- @return (boolean) - True if successful, false otherwise
