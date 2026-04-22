@@ -228,6 +228,45 @@ function Sync:FinalizeAdminConvergence()
     -- 5) send LOG_REQs to a reasonable provider
     conv.pendingReq = {}
     conv.pendingCount = 0
+    local mySupportsEnc =
+        (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+        and SF.SyncProtocol.GetSupportedEncodings()
+        or nil
+
+    local function registerAdminLogReq(providerList, author, fromCounter, toCounter, integrityRepair)
+        if type(providerList) ~= "table" or #providerList == 0 then
+            return false
+        end
+
+        local requestId = self:NewRequestId()
+        conv.pendingReq[requestId] = true
+        conv.pendingCount = conv.pendingCount + 1
+
+        local fallback = {}
+        for i = 2, #providerList do
+            fallback[#fallback + 1] = providerList[i]
+        end
+
+        local ok = self:RegisterRequest(requestId, "ADMIN_LOG_REQ", providerList[1], {
+            sessionId       = self.state.sessionId,
+            profileId       = profileId,
+            adminSyncId     = conv.adminSyncId,
+            requestId       = requestId,
+            author          = author,
+            fromCounter     = fromCounter,
+            toCounter       = toCounter,
+            supportsEnc     = mySupportsEnc,
+            targets         = fallback,
+            integrityRepair = integrityRepair == true,
+        })
+
+        if not ok then
+            conv.pendingReq[requestId] = nil
+            conv.pendingCount = math.max(0, conv.pendingCount - 1)
+        end
+
+        return ok
+    end
 
     for _, req in ipairs(missing) do
         local author = req.author
@@ -250,15 +289,6 @@ function Sync:FinalizeAdminConvergence()
         end
 
         if provider then
-            local requestId = self:NewRequestId()
-            conv.pendingReq[requestId] = true
-            conv.pendingCount = conv.pendingCount + 1
-
-            local mySupportsEnc =
-                (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
-                and SF.SyncProtocol.GetSupportedEncodings()
-                or nil
-
             -- Build ordered provider list: selected provider first, then any other admin who can serve
             local providers, seen = {}, {}
             local function addProvider(p)
@@ -275,26 +305,20 @@ function Sync:FinalizeAdminConvergence()
                 end
             end
 
-            local fallback = {}
-            for i = 2, #providers do fallback[#fallback + 1] = providers[i] end
+            registerAdminLogReq(providers, author, req.fromCounter, req.toCounter, false)
+        end
+    end
 
-            -- Register Request will immediately send attempt #1 and retry across fallback targets
-            local ok = self:RegisterRequest(requestId, "ADMIN_LOG_REQ", providers[1], {
-                sessionId       = self.state.sessionId,
-                profileId       = profileId,
-                adminSyncId     = conv.adminSyncId,
-                requestId       = requestId,
-                author          = author,
-                fromCounter     = req.fromCounter,
-                toCounter       = req.toCounter,
-                supportsEnc     = mySupportsEnc,
-                targets         = fallback,
-            })
-
-            -- Clean up bookkeeping if RegisterRequest failed
-            if not ok then
-                conv.pendingReq[requestId] = nil
-                conv.pendingCount = math.max(0, conv.pendingCount - 1)
+    local integritySeen = {}
+    for adminName, st in pairs(self.state.adminStatuses or {}) do
+        if type(st) == "table" and type(st.authorWindowSummary) == "table" then
+            local ranges = self:ComputeWindowMismatchRequests(profileId, st.authorWindowSummary, localContig)
+            for _, range in ipairs(ranges) do
+                local key = ("%s|%s|%d|%d"):format(tostring(adminName), tostring(range.author), tonumber(range.fromCounter) or 0, tonumber(range.toCounter) or 0)
+                if not integritySeen[key] then
+                    integritySeen[key] = true
+                    registerAdminLogReq({ adminName }, range.author, range.fromCounter, range.toCounter, true)
+                end
             end
         end
     end
@@ -400,6 +424,7 @@ function Sync:BroadcastSessionStart()
 
     local profileId = self.state.profileId
     self.state.authorMax = self:ComputeAuthorMax(profileId) or {}
+    self.state.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or {}
     
     -- Store chosen helpers for later activation
     local chosenHelpers = self.state.helpers or {}
@@ -412,6 +437,7 @@ function Sync:BroadcastSessionStart()
         coordinator = self.state.coordinator,
         coordEpoch  = self.state.coordEpoch,
         authorMax   = self.state.authorMax,
+        authorWindowSummary = self.state.authorWindowSummary,
         helpers     = chosenHelpers,  -- Broadcast includes helpers for members to know about
         safeMode    = self:_GetSessionSafeModePayload(),
     }

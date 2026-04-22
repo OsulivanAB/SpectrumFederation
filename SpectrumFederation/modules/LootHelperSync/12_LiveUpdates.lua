@@ -123,6 +123,32 @@ function Sync:HandleNewLog(sender, payload)
     -- Dedupe by logId
     local logId = self:_ExtractLogId(logTable)
     if logId and profile._logIndex and profile._logIndex[logId] then
+        local incomingFingerprint = logTable._fingerprint
+        if type(incomingFingerprint) ~= "number" and SF.LootLog and SF.LootLog.ComputeFingerprintFromTable then
+            incomingFingerprint = SF.LootLog.ComputeFingerprintFromTable(logTable)
+        end
+        local localFingerprint = profile.GetLogFingerprintById and profile:GetLogFingerprintById(logId) or nil
+
+        if incomingFingerprint ~= nil and localFingerprint ~= nil and incomingFingerprint ~= localFingerprint then
+            local author, counter = self:_ExtractAuthorCounter(logTable)
+            local target = self.state.isCoordinator and sender or self.state.coordinator
+            if type(author) == "string" and type(counter) == "number" then
+                self:RequestIntegrityRepairRanges(profileId, {
+                    {
+                        author = author,
+                        fromCounter = counter,
+                        toCounter = counter,
+                        mode = "integrity",
+                    }
+                }, "new-log-mismatch", target)
+            end
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "NEW_LOG fingerprint mismatch detected (id=%s, sender=%s, local=%s, remote=%s)",
+                    tostring(logId), tostring(sender), tostring(localFingerprint), tostring(incomingFingerprint))
+            end
+            return
+        end
+
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Ignoring NEW_LOG duplicate (id=%s, sender=%s)", tostring(logId), tostring(sender))
         end

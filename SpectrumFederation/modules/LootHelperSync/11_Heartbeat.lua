@@ -72,6 +72,11 @@ function Sync:HandleSessionStart(sender, payload)
     else
         self.state.authorMax = {}
     end
+    if type(payload.authorWindowSummary) == "table" then
+        self.state.authorWindowSummary = payload.authorWindowSummary
+    else
+        self.state.authorWindowSummary = {}
+    end
 
     if type(payload.helpers) == "table" then
         self.state.helpers = payload.helpers
@@ -377,7 +382,14 @@ function Sync:SendJoinStatus()
         supportsEnc     = (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
                             and SF.SyncProtocol.GetSupportedEncodings()
                             or nil,
+        localWindowSummary = self:ComputeAuthorWindowSummary(profileId),
     }
+    local pendingMutation = self.state._pendingMutationAdvertisement
+    if type(pendingMutation) == "table" and pendingMutation.profileId == profileId then
+        payloadBase.integrityHint = "mutation"
+        payloadBase.mutationRanges = pendingMutation.ranges
+        payloadBase.mutationReason = pendingMutation.reason
+    end
 
     local function alreadySent(status)
         return (self.state._sentJoinStatusForSessionId == sid) and (self.state._sentJoinStatusType == status)
@@ -416,6 +428,7 @@ function Sync:SendJoinStatus()
     local localContig = self:ComputeContigAuthorMax(profileId)
     local remoteAuthorMax = self.state.authorMax or {}
     local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax)
+    local integrityRanges = self:ComputeWindowMismatchRequests(profileId, self.state.authorWindowSummary or {}, localContig)
 
     if missing and #missing > 0 then
         local filtered = {}
@@ -465,6 +478,33 @@ function Sync:SendJoinStatus()
                 SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, payload, "WHISPER", coord, "NORMAL")
             end
         end
+        if type(pendingMutation) == "table" and pendingMutation.profileId == profileId then
+            self.state._pendingMutationAdvertisement = nil
+        end
+        return
+    end
+
+    if integrityRanges and #integrityRanges > 0 then
+        self:RequestIntegrityRepairRanges(profileId, integrityRanges, "join-status")
+
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "SendJoinStatus: integrity repair requested (count=%d)", #integrityRanges)
+        end
+
+        if not alreadySent("NEED_LOGS") then
+            markSent("NEED_LOGS")
+            local payload = {}
+            for k, v in pairs(payloadBase) do payload[k] = v end
+            payload.missing = integrityRanges
+            payload.statusOnly = true
+
+            if SF.LootHelperComm then
+                SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, payload, "WHISPER", coord, "NORMAL")
+            end
+        end
+        if type(pendingMutation) == "table" and pendingMutation.profileId == profileId then
+            self.state._pendingMutationAdvertisement = nil
+        end
         return
     end
 
@@ -477,5 +517,9 @@ function Sync:SendJoinStatus()
 
     if SF.LootHelperComm then
         SF.LootHelperComm:Send("CONTROL", self.MSG.HAVE_PROFILE, payloadBase, "WHISPER", coord, "NORMAL")
+    end
+
+    if type(pendingMutation) == "table" and pendingMutation.profileId == profileId then
+        self.state._pendingMutationAdvertisement = nil
     end
 end

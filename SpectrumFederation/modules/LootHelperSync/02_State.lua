@@ -35,6 +35,7 @@ Sync.cfg = Sync.cfg or {
     -- Backpressure for log bursts (coordinator -> member)
     maxMissingRangesPerNeededLogs   = 8,    -- clamp abusive/huge requests
     needLogsSendSpacingMs           = 50,   -- space out AUTH_LOGS sends to avoid spikes
+    integrityWindowSize             = 25,   -- author counter window size used for cached integrity summaries
 
     gapRepairCooldownSec = 2,
 
@@ -57,6 +58,7 @@ Sync.state = Sync.state or {
 
     helpers     = {},   -- array of "Name-Realm"
     authorMax   = {},   -- map: [author] = maxCounterSeen
+    authorWindowSummary = {}, -- map: [author] = { {fromCounter,toCounter,count,checksum,maxCounter}, ... }
 
     isCoordinator = false,
 

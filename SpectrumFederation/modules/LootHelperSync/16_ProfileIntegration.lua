@@ -179,6 +179,12 @@ function Sync:CreateProfileFromMeta(profileMeta)
     -- Initialize tables that other code might assume exist
     profile._lootLogs = {}
     profile._logIndex = {}
+    profile._logById = {}
+    profile._logPositionIndex = {}
+    profile._logFingerprintIndex = {}
+    profile._authorWindowSummary = {}
+    profile._authorWindowSummaryDirty = true
+    profile._authorWindowSummarySize = nil
     profile._authorCounters = {}
     profile._members = {}
 	profile._adminUsers = {}
@@ -190,6 +196,79 @@ function Sync:CreateProfileFromMeta(profileMeta)
 	end
 
 	return profile
+end
+
+function Sync:GetIntegrityWindowSize()
+    local size = tonumber(self.cfg and self.cfg.integrityWindowSize) or 25
+    size = math.floor(size)
+    if size < 1 then
+        size = 25
+    end
+    return size
+end
+
+function Sync:ComputeAuthorWindowSummary(profileId)
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then return {} end
+    if profile.ComputeAuthorWindowSummary then
+        return profile:ComputeAuthorWindowSummary(self:GetIntegrityWindowSize())
+    end
+    return {}
+end
+
+function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localContig)
+    local mismatches = {}
+    if type(remoteSummary) ~= "table" then return mismatches end
+
+    local localSummary = self:ComputeAuthorWindowSummary(profileId)
+    localContig = localContig or self:ComputeContigAuthorMax(profileId)
+
+    local localByAuthor = {}
+    for author, windows in pairs(localSummary or {}) do
+        if type(windows) == "table" then
+            local indexed = {}
+            for _, row in ipairs(windows) do
+                if type(row) == "table" and type(row.fromCounter) == "number" then
+                    indexed[row.fromCounter] = row
+                end
+            end
+            localByAuthor[author] = indexed
+        end
+    end
+
+    for author, windows in pairs(remoteSummary) do
+        if type(author) == "string" and type(windows) == "table" then
+            local authorContig = tonumber(localContig and localContig[author]) or 0
+            local indexed = localByAuthor[author] or {}
+            for _, remoteWindow in ipairs(windows) do
+                if type(remoteWindow) == "table"
+                    and type(remoteWindow.fromCounter) == "number"
+                    and type(remoteWindow.toCounter) == "number"
+                    and authorContig >= remoteWindow.toCounter
+                then
+                    local localWindow = indexed[remoteWindow.fromCounter]
+                    local localCount = localWindow and tonumber(localWindow.count) or 0
+                    local localChecksum = localWindow and tonumber(localWindow.checksum) or nil
+                    local remoteCount = tonumber(remoteWindow.count) or 0
+                    local remoteChecksum = tonumber(remoteWindow.checksum) or nil
+
+                    if (not localWindow)
+                        or localCount ~= remoteCount
+                        or localChecksum ~= remoteChecksum
+                    then
+                        mismatches[#mismatches + 1] = {
+                            author = author,
+                            fromCounter = remoteWindow.fromCounter,
+                            toCounter = remoteWindow.toCounter,
+                            mode = "integrity",
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    return mismatches
 end
 
 -- Function Export a full snapshot for a profile, suitable for PROFILE_SNAPSHOT message.
@@ -265,13 +344,16 @@ end
 -- @param profileId string Stable profile id
 -- @param logs table Array of log tables
 -- @return boolean changed True if any new logs were added, false otherwise
-function Sync:MergeLogs(profileId, logs)
+function Sync:MergeLogs(profileId, logs, opts)
     local profile = self:FindLocalProfileById(profileId)
     if not profile then return false end
     if type(logs) ~= "table" then return false end
 
-    local inserted = profile:MergeLogTables(logs, { allowUnknownEventType = true })
-    return inserted and inserted > 0
+    opts = opts or {}
+    opts.allowUnknownEventType = true
+
+    local inserted, details = profile:MergeLogTables(logs, opts)
+    return inserted and inserted > 0, details or { inserted = inserted or 0, replaced = 0, mismatchCount = 0, mismatches = {} }
 end
 
 -- Function Rebuild derived state from logs (replay) for the given profile.
@@ -758,4 +840,78 @@ function Sync:RequestGapRepair(profileId, author, gapFrom, gapTo, reason)
     end
 
     return ok
+end
+
+function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredTarget)
+    if not self.state.active then return false end
+    if type(profileId) ~= "string" or profileId == "" then return false end
+    if self.state.profileId and self.state.profileId ~= profileId then return false end
+    if type(ranges) ~= "table" or #ranges == 0 then return false end
+
+    local targets = nil
+    if type(preferredTarget) == "string" and preferredTarget ~= "" then
+        targets = { preferredTarget }
+    elseif self.state.isCoordinator then
+        return false
+    else
+        local coord = self.state.coordinator
+        if type(coord) ~= "string" or coord == "" then
+            return false
+        end
+        targets = { coord }
+    end
+
+    local supportsEnc =
+        (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
+            and SF.SyncProtocol.GetSupportedEncodings()
+            or nil
+
+    local count = 0
+    for _, range in ipairs(ranges) do
+        if type(range) == "table"
+            and type(range.author) == "string"
+            and type(range.fromCounter) == "number"
+            and type(range.toCounter) == "number"
+            and not self:_HasOutstandingLogRangeRequest(profileId, range.author, range.fromCounter, range.toCounter)
+        then
+            local fallback = {}
+            for i = 2, #targets do
+                fallback[#fallback + 1] = targets[i]
+            end
+
+            local requestId = self:NewRequestId()
+            local kind = (self.state.isCoordinator or self:CanSelfCoordinate(profileId)) and "LOG_REQ" or "NEED_LOGS"
+            local ok = self:RegisterRequest(requestId, kind, targets[1], {
+                sessionId = self.state.sessionId,
+                profileId = profileId,
+                author = range.author,
+                fromCounter = range.fromCounter,
+                toCounter = range.toCounter,
+                supportsEnc = supportsEnc,
+                targets = fallback,
+                integrityRepair = true,
+                reason = reason,
+            })
+            if ok then
+                count = count + 1
+            end
+        end
+    end
+
+    if count > 0 and SF.Debug then
+        SF.Debug:Info("SYNC", "Requested %d integrity repair ranges for profile %s (%s)",
+            count, tostring(profileId), tostring(reason or "unknown"))
+    end
+
+    return count > 0
+end
+
+function Sync:AdvertiseProfileMutation(profileId, ranges, reason)
+    if type(profileId) ~= "string" or profileId == "" then return false end
+    self.state._pendingMutationAdvertisement = {
+        profileId = profileId,
+        ranges = type(ranges) == "table" and ranges or {},
+        reason = reason,
+    }
+    return true
 end
