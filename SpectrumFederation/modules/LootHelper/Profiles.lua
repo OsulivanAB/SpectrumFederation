@@ -857,6 +857,7 @@ function LootProfile:AddMember(member)
     if mt == SF.Member or mt == SF.LootProfileMember then
         self._members = self._members or {}
         table.insert(self._members, member)
+        self._memberById = nil
         return true
     else
         if SF.Debug then
@@ -864,6 +865,31 @@ function LootProfile:AddMember(member)
         end
         return false
     end
+end
+
+function LootProfile:RemoveMemberById(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        return false
+    end
+
+    memberId = NormalizeMemberId(memberId)
+    local members = self._members or {}
+    local removed = false
+
+    for i = #members, 1, -1 do
+        local member = members[i]
+        local existingId = member and ((member.GetFullIdentifier and member:GetFullIdentifier()) or member.identifier)
+        if type(existingId) == "string" and SameMember(existingId, memberId) then
+            table.remove(members, i)
+            removed = true
+        end
+    end
+
+    if removed then
+        self._memberById = nil
+    end
+
+    return removed
 end
 
 -- Function to add an admin user to this profile
@@ -1106,6 +1132,107 @@ function LootProfile:RemoveAdminMemberId(memberId)
     end
 
     return false, "That member is not an admin."
+end
+
+function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
+    if type(sourceMemberId) ~= "string" or sourceMemberId == "" then
+        return false, "Select a source character."
+    end
+    if type(targetMemberId) ~= "string" or targetMemberId == "" then
+        return false, "Select a target character."
+    end
+    if not self:IsCurrentUserAdmin() then
+        return false, "You must be an admin to transfer points."
+    end
+
+    sourceMemberId = NormalizeMemberId(sourceMemberId)
+    targetMemberId = NormalizeMemberId(targetMemberId)
+
+    if SameMember(sourceMemberId, targetMemberId) then
+        return false, "Source and target must be different characters."
+    end
+
+    if not self:getMemberByID(sourceMemberId) then
+        return false, "The source character is not part of this profile."
+    end
+
+    if not self:getMemberByID(targetMemberId) then
+        return false, "The target character is not part of this profile."
+    end
+
+    local logsUpdated = 0
+    for _, log in ipairs(self._lootLogs or {}) do
+        local eventData = (log.GetEventData and log:GetEventData()) or log._data
+        if type(eventData) == "table" and type(eventData.member) == "string" and SameMember(eventData.member, sourceMemberId) then
+            eventData.member = targetMemberId
+            logsUpdated = logsUpdated + 1
+        end
+    end
+
+    if type(self._adminUsers) ~= "table" then
+        self._adminUsers = {}
+    end
+
+    local sourceWasAdmin = false
+    local targetIsAdmin = false
+    for i = #self._adminUsers, 1, -1 do
+        local adminId = self._adminUsers[i]
+        if type(adminId) == "string" then
+            if SameMember(adminId, targetMemberId) then
+                targetIsAdmin = true
+            end
+            if SameMember(adminId, sourceMemberId) then
+                sourceWasAdmin = true
+                table.remove(self._adminUsers, i)
+            end
+        end
+    end
+    if sourceWasAdmin and not targetIsAdmin then
+        table.insert(self._adminUsers, targetMemberId)
+    end
+
+    if SameMember(self._owner, sourceMemberId) then
+        self._owner = targetMemberId
+    end
+    if SameMember(self._author, sourceMemberId) then
+        self._author = targetMemberId
+    end
+
+    self:_EnsureRaidCheckEquipmentSnapshots()
+    self._raidCheckEquipmentSnapshots[sourceMemberId] = nil
+
+    self:RemoveMemberById(sourceMemberId)
+    self._memberById = nil
+
+    local rebuildOk = false
+    local rebuildErr = nil
+    if SF.LootHelperSync and SF.LootHelperSync.RebuildProfile and self.GetProfileId then
+        rebuildOk, rebuildErr = SF.LootHelperSync:RebuildProfile(self:GetProfileId(), "member_history_transfer")
+    elseif self.RebuildLogIndex then
+        self:RebuildLogIndex()
+        rebuildOk = true
+    end
+
+    if not rebuildOk then
+        return false, rebuildErr or "Failed to rebuild profile after transferring points."
+    end
+
+    if self._EnsureOwnerIsAdmin then
+        self:_EnsureOwnerIsAdmin()
+    end
+
+    if SF.Debug then
+        SF.Debug:Info(
+            "LootProfile",
+            "Transferred member history from %s to %s in profile %s (%d log references updated)",
+            tostring(sourceMemberId),
+            tostring(targetMemberId),
+            tostring(self._profileName),
+            logsUpdated
+        )
+    end
+
+    return true, nil
 end
 
 -- ========================================================================
