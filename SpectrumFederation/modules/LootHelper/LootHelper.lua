@@ -278,15 +278,24 @@ function SF:InitializeLootHelperBattleNetAccountTracking()
 
     local frame = CreateFrame("Frame")
     self._lootHelperBattleNetAccountFrame = frame
+    local function RegisterOptionalEvent(eventName)
+        local ok, err = pcall(function()
+            frame:RegisterEvent(eventName)
+        end)
+
+        if not ok and SF.Debug then
+            SF.Debug:Warn("DATABASE", "Skipping unsupported event %s for loot helper Battle.net account tracking: %s", tostring(eventName), tostring(err))
+        end
+    end
 
     frame:RegisterEvent("PLAYER_ENTERING_WORLD")
     frame:RegisterEvent("GROUP_ROSTER_UPDATE")
-    frame:RegisterEvent("BN_CONNECTED")
-    frame:RegisterEvent("BN_FRIEND_INFO_CHANGED")
-    frame:RegisterEvent("BN_FRIEND_ACCOUNT_ONLINE")
-    frame:RegisterEvent("BN_FRIEND_ACCOUNT_OFFLINE")
-    frame:RegisterEvent("BN_FRIEND_TOON_ONLINE")
-    frame:RegisterEvent("BN_FRIEND_TOON_OFFLINE")
+    RegisterOptionalEvent("BN_CONNECTED")
+    RegisterOptionalEvent("BN_FRIEND_INFO_CHANGED")
+    RegisterOptionalEvent("BN_FRIEND_ACCOUNT_ONLINE")
+    RegisterOptionalEvent("BN_FRIEND_ACCOUNT_OFFLINE")
+    RegisterOptionalEvent("BN_FRIEND_TOON_ONLINE")
+    RegisterOptionalEvent("BN_FRIEND_TOON_OFFLINE")
 
     frame:SetScript("OnEvent", function()
         local populatedMembers = SF:PopulateLootHelperBattleNetAccounts()
