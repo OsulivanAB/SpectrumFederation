@@ -1,7 +1,192 @@
 -- Grab the namespace
 local addonName, SF = ...
 
-local LOOT_HELPER_SCHEMA_VERSION = 2
+local LOOT_HELPER_SCHEMA_VERSION = 3
+
+local function NormalizeBattleNetAccount(value)
+    if type(value) ~= "string" then
+        return ""
+    end
+
+    return value
+end
+
+local function NormalizeMemberIdentifier(name, realm)
+    if type(name) ~= "string" or name == "" then
+        return nil
+    end
+
+    if SF.NameUtil and type(SF.NameUtil.NormalizeNameRealm) == "function" then
+        return SF.NameUtil.NormalizeNameRealm(name, realm)
+    end
+
+    if type(realm) ~= "string" or realm == "" then
+        realm = GetRealmName()
+    end
+
+    if type(realm) == "string" then
+        realm = realm:gsub("%s+", "")
+    end
+
+    if type(realm) ~= "string" or realm == "" then
+        return nil
+    end
+
+    return name .. "-" .. realm
+end
+
+local function SameMember(a, b)
+    if SF.NameUtil and type(SF.NameUtil.SamePlayer) == "function" then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+
+    return a == b
+end
+
+local function GetBattleNetAccountFromAccountInfo(accountInfo)
+    if type(accountInfo) ~= "table" then
+        return ""
+    end
+
+    if type(accountInfo.battleTag) == "string" and accountInfo.battleTag ~= "" then
+        return accountInfo.battleTag
+    end
+
+    if type(accountInfo.accountName) == "string" and accountInfo.accountName ~= "" then
+        return accountInfo.accountName
+    end
+
+    return ""
+end
+
+local function IsCurrentWoWProject(gameAccountInfo)
+    if type(gameAccountInfo) ~= "table" then
+        return false
+    end
+
+    if WOW_PROJECT_ID == nil or gameAccountInfo.wowProjectID == nil then
+        return true
+    end
+
+    return gameAccountInfo.wowProjectID == WOW_PROJECT_ID
+end
+
+local function GetUnitMemberIdentifier(unit)
+    if not UnitExists or not UnitExists(unit) then
+        return nil
+    end
+
+    local name, realm = UnitFullName(unit)
+    if type(name) ~= "string" or name == "" then
+        name = UnitName(unit)
+    end
+
+    return NormalizeMemberIdentifier(name, realm)
+end
+
+local function ResolveBattleNetAccountFromGroup(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        return ""
+    end
+
+    if not (C_BattleNet and C_BattleNet.GetAccountInfoByGUID and UnitGUID) then
+        return ""
+    end
+
+    local resolvedAccount = ""
+
+    local function TryUnit(unit)
+        if resolvedAccount ~= "" then
+            return
+        end
+
+        local unitMemberId = GetUnitMemberIdentifier(unit)
+        if not unitMemberId or not SameMember(unitMemberId, memberId) then
+            return
+        end
+
+        local guid = UnitGUID(unit)
+        if type(guid) ~= "string" or guid == "" then
+            return
+        end
+
+        resolvedAccount = NormalizeBattleNetAccount(GetBattleNetAccountFromAccountInfo(C_BattleNet.GetAccountInfoByGUID(guid)))
+    end
+
+    if IsInRaid and IsInRaid() then
+        local raidCount = (GetNumGroupMembers and GetNumGroupMembers()) or 0
+        for i = 1, raidCount do
+            TryUnit("raid" .. i)
+            if resolvedAccount ~= "" then
+                return resolvedAccount
+            end
+        end
+        return resolvedAccount
+    end
+
+    TryUnit("player")
+    if resolvedAccount ~= "" then
+        return resolvedAccount
+    end
+
+    for i = 1, 4 do
+        TryUnit("party" .. i)
+        if resolvedAccount ~= "" then
+            return resolvedAccount
+        end
+    end
+
+    return resolvedAccount
+end
+
+local function ResolveBattleNetAccountFromFriends(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        return ""
+    end
+
+    if not (BNGetNumFriends and C_BattleNet and C_BattleNet.GetFriendAccountInfo) then
+        return ""
+    end
+
+    local numFriends = BNGetNumFriends() or 0
+    for i = 1, numFriends do
+        local accountInfo = C_BattleNet.GetFriendAccountInfo(i)
+        local gameAccountInfo = accountInfo and accountInfo.gameAccountInfo
+        if IsCurrentWoWProject(gameAccountInfo) then
+            local friendMemberId = NormalizeMemberIdentifier(gameAccountInfo.characterName, gameAccountInfo.realmName)
+            if friendMemberId and SameMember(friendMemberId, memberId) then
+                local battleNetAccount = NormalizeBattleNetAccount(GetBattleNetAccountFromAccountInfo(accountInfo))
+                if battleNetAccount ~= "" then
+                    return battleNetAccount
+                end
+            end
+        end
+    end
+
+    return ""
+end
+
+local function PopulateBattleNetAccountsInDatabase(db)
+    local populatedMembers = 0
+
+    if type(db) ~= "table" then
+        return populatedMembers
+    end
+
+    for _, profile in pairs(db.profiles or {}) do
+        if type(profile) == "table" and type(profile._members) == "table" then
+            for _, member in pairs(profile._members) do
+                if type(member) == "table" and SF.Member and type(SF.Member.TryPopulateMissingBattleNetAccount) == "function" then
+                    if SF.Member.TryPopulateMissingBattleNetAccount(member) then
+                        populatedMembers = populatedMembers + 1
+                    end
+                end
+            end
+        end
+    end
+
+    return populatedMembers
+end
 
 local function HasLootHelperData(db)
     if type(db) ~= "table" then
@@ -49,6 +234,67 @@ local function MigrateMembersBattleNetAccount(db)
     end
 end
 
+local function MigratePopulateBattleNetAccountValues(db)
+    local populatedMembers = PopulateBattleNetAccountsInDatabase(db)
+
+    if SF.Debug then
+        SF.Debug:Info("DATABASE", "Loot helper migration v3 complete: populated battleNetAccount for %d member(s)", populatedMembers)
+    end
+end
+
+function SF:ResolveBattleNetAccountForMemberId(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        return ""
+    end
+
+    local normalizedMemberId = NormalizeMemberIdentifier(memberId)
+    if not normalizedMemberId then
+        return ""
+    end
+
+    local groupAccount = ResolveBattleNetAccountFromGroup(normalizedMemberId)
+    if groupAccount ~= "" then
+        return groupAccount
+    end
+
+    return ResolveBattleNetAccountFromFriends(normalizedMemberId)
+end
+
+function SF:PopulateLootHelperBattleNetAccounts()
+    local populatedMembers = PopulateBattleNetAccountsInDatabase(SpectrumFederationDB and SpectrumFederationDB.lootHelper)
+
+    if populatedMembers > 0 and SF.Debug then
+        SF.Debug:Info("DATABASE", "Populated battleNetAccount for %d loot helper member(s)", populatedMembers)
+    end
+
+    return populatedMembers
+end
+
+function SF:InitializeLootHelperBattleNetAccountTracking()
+    if self._lootHelperBattleNetAccountFrame then
+        return
+    end
+
+    local frame = CreateFrame("Frame")
+    self._lootHelperBattleNetAccountFrame = frame
+
+    frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    frame:RegisterEvent("GROUP_ROSTER_UPDATE")
+    frame:RegisterEvent("BN_CONNECTED")
+    frame:RegisterEvent("BN_FRIEND_INFO_CHANGED")
+    frame:RegisterEvent("BN_FRIEND_ACCOUNT_ONLINE")
+    frame:RegisterEvent("BN_FRIEND_ACCOUNT_OFFLINE")
+    frame:RegisterEvent("BN_FRIEND_TOON_ONLINE")
+    frame:RegisterEvent("BN_FRIEND_TOON_OFFLINE")
+
+    frame:SetScript("OnEvent", function()
+        local populatedMembers = SF:PopulateLootHelperBattleNetAccounts()
+        if populatedMembers > 0 and SF.LootHelperEvents and type(SF.LootHelperEvents.NotifyDataChanged) == "function" then
+            SF.LootHelperEvents:NotifyDataChanged("LH:BattleNetAccountRefresh", { populatedMembers = populatedMembers })
+        end
+    end)
+end
+
 -- Run loot helper schema migrations to bring saved data to the current version
 -- @param db (table) - Loot helper database table to migrate
 -- @return none
@@ -59,6 +305,7 @@ function SF:RunLootHelperSchemaMigrations(db)
 
     local migrations = {
         [2] = MigrateMembersBattleNetAccount,
+        [3] = MigratePopulateBattleNetAccountValues,
     }
 
     local currentVersion = InferLootHelperSchemaVersion(db)
@@ -133,6 +380,9 @@ function SF:InitializeLootHelperDatabase()
 	if SF.LootHelperWindow and SF.LootHelperWindow.Controller and SF.LootHelperWindow.Controller.Init then
 		SF.LootHelperWindow.Controller:Init()
 	end
+
+    SF:InitializeLootHelperBattleNetAccountTracking()
+    SF:PopulateLootHelperBattleNetAccounts()
 
 end
 

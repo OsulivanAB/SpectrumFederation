@@ -69,6 +69,18 @@ local function NormalizeBattleNetAccount(value)
     return value
 end
 
+local function ResolveBattleNetAccount(identifier)
+    if type(identifier) ~= "string" or identifier == "" then
+        return DEFAULT_BATTLENET_ACCOUNT
+    end
+
+    if type(SF.ResolveBattleNetAccountForMemberId) == "function" then
+        return NormalizeBattleNetAccount(SF:ResolveBattleNetAccountForMemberId(identifier))
+    end
+
+    return DEFAULT_BATTLENET_ACCOUNT
+end
+
 local SYNC_REBUILD_NOTE = "state will be reconciled from logs via sync rebuild"
 
 local function CanCurrentUserEditActiveProfile()
@@ -155,7 +167,12 @@ function Member.new(identifier, role, class, battleNetAccount)
     instance.name = instance.member_name
     instance.member_realm = r or ""
     instance.className = instance.class
-    instance.battleNetAccount = NormalizeBattleNetAccount(battleNetAccount)
+
+    local normalizedBattleNetAccount = NormalizeBattleNetAccount(battleNetAccount)
+    if normalizedBattleNetAccount == DEFAULT_BATTLENET_ACCOUNT then
+        normalizedBattleNetAccount = ResolveBattleNetAccount(instance.identifier)
+    end
+    instance.battleNetAccount = normalizedBattleNetAccount
     
     instance.pointBalance = 0
     
@@ -262,6 +279,43 @@ end
 -- @return (string) - Full identifier
 function Member:GetFullIdentifier()
     return self.identifier
+end
+
+-- Get the stored Battle.net account identifier for this member
+-- @return string - Battle.net account identifier or empty string if unavailable
+function Member:GetBattleNetAccount()
+    return NormalizeBattleNetAccount(self.battleNetAccount)
+end
+
+-- Best-effort populate of a member's Battle.net account identifier when missing
+-- @param memberData table Member instance or serialized member table
+-- @return boolean populated True when a missing value was resolved and stored
+function Member.TryPopulateMissingBattleNetAccount(memberData)
+    if type(memberData) ~= "table" then
+        return false
+    end
+
+    local currentValue = NormalizeBattleNetAccount(memberData.battleNetAccount)
+    if currentValue ~= DEFAULT_BATTLENET_ACCOUNT then
+        memberData.battleNetAccount = currentValue
+        return false
+    end
+
+    local identifier = memberData.identifier
+    if type(identifier) ~= "string" and type(memberData.GetFullIdentifier) == "function" then
+        identifier = memberData:GetFullIdentifier()
+    end
+
+    local resolvedValue = ResolveBattleNetAccount(identifier)
+    memberData.battleNetAccount = resolvedValue
+
+    return resolvedValue ~= DEFAULT_BATTLENET_ACCOUNT
+end
+
+-- Best-effort refresh of this member's Battle.net account identifier when missing
+-- @return boolean populated True when a missing value was resolved and stored
+function Member:PopulateBattleNetAccountIfMissing()
+    return Member.TryPopulateMissingBattleNetAccount(self)
 end
 
 -- Get the WoW class for this member
