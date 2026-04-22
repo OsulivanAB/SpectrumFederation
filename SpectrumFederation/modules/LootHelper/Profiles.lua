@@ -867,6 +867,9 @@ function LootProfile:AddMember(member)
     end
 end
 
+-- Function to remove a member from this profile by member ID
+-- @param string memberId "Name-Realm" of member to remove
+-- @return boolean removed True if a member was removed, false otherwise
 function LootProfile:RemoveMemberById(memberId)
     if type(memberId) ~= "string" or memberId == "" then
         return false
@@ -1134,6 +1137,13 @@ function LootProfile:RemoveAdminMemberId(memberId)
     return false, "That member is not an admin."
 end
 
+-- Function to transfer all source-member history to an existing target member
+-- Rewrites member-linked log references, updates admin/owner state, removes the source
+-- member from the profile, and rebuilds derived profile state.
+-- @param string sourceMemberId "Name-Realm" of member to transfer history from
+-- @param string targetMemberId "Name-Realm" of member to transfer history to
+-- @return boolean success
+-- @return string|nil errorMessage
 function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
     if type(sourceMemberId) ~= "string" or sourceMemberId == "" then
         return false, "Select a source character."

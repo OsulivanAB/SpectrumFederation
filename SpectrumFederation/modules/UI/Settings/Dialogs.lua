@@ -298,6 +298,13 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
     }
 end
 
+-- Show a member-transfer dialog with source/target dropdowns
+-- @param message string Message text to display
+-- @param acceptText string|nil Text for accept button (defaults to ACCEPT)
+-- @param sourceOptions table|nil Dropdown options for the source member
+-- @param targetOptions table|nil Dropdown options for the target member
+-- @param onAccept function|nil Callback function(sourceMemberId, targetMemberId) called if user accepts
+-- @return boolean True if dialog was shown, false otherwise
 function Dialogs:TransferMemberHistory(message, acceptText, sourceOptions, targetOptions, onAccept)
     if SF.Debug then
         SF.Debug:Verbose("UI", "Showing transfer dialog: %s", message)
