@@ -3,21 +3,22 @@ local addonName, SF = ...
 
 local LOOT_HELPER_SCHEMA_VERSION = 3
 
-local function NormalizeBattleNetAccount(value)
-    if type(value) ~= "string" then
-        return ""
-    end
+local NormalizeBattleNetAccount = SF.NormalizeBattleNetAccount
 
-    return value
-end
-
-local function NormalizeMemberIdentifier(name, realm)
-    if type(name) ~= "string" or name == "" then
+local function NormalizeMemberIdentifier(nameOrIdentifier, realm)
+    if type(nameOrIdentifier) ~= "string" or nameOrIdentifier == "" then
         return nil
     end
 
     if SF.NameUtil and type(SF.NameUtil.NormalizeNameRealm) == "function" then
-        return SF.NameUtil.NormalizeNameRealm(name, realm)
+        return SF.NameUtil.NormalizeNameRealm(nameOrIdentifier, realm)
+    end
+
+    local name = nameOrIdentifier
+    if (type(realm) ~= "string" or realm == "") and nameOrIdentifier:find("-", 1, true) then
+        local hyphenPos = nameOrIdentifier:find("-", 1, true)
+        name = strtrim(nameOrIdentifier:sub(1, hyphenPos - 1))
+        realm = strtrim(nameOrIdentifier:sub(hyphenPos + 1))
     end
 
     if type(realm) ~= "string" or realm == "" then

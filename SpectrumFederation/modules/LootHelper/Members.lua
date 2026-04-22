@@ -69,13 +69,15 @@ local function NormalizeBattleNetAccount(value)
     return value
 end
 
+SF.NormalizeBattleNetAccount = NormalizeBattleNetAccount
+
 local function ResolveBattleNetAccount(identifier)
     if type(identifier) ~= "string" or identifier == "" then
         return DEFAULT_BATTLENET_ACCOUNT
     end
 
     if type(SF.ResolveBattleNetAccountForMemberId) == "function" then
-        return NormalizeBattleNetAccount(SF:ResolveBattleNetAccountForMemberId(identifier))
+        return SF:ResolveBattleNetAccountForMemberId(identifier)
     end
 
     return DEFAULT_BATTLENET_ACCOUNT
@@ -302,7 +304,7 @@ function Member.TryPopulateMissingBattleNetAccount(memberData)
     end
 
     local identifier = memberData.identifier
-    if type(identifier) ~= "string" and type(memberData.GetFullIdentifier) == "function" then
+    if (type(identifier) ~= "string" or identifier == "") and type(memberData.GetFullIdentifier) == "function" then
         identifier = memberData:GetFullIdentifier()
     end
 
