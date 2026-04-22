@@ -39,10 +39,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.19-beta.1] - 2026-04-22
 
-### Removed
-- RC Loot Council integration, including related features and functionality.
+## [0.5.19] - 2026-04-22
+
+### Changed
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.5.18] - 2026-04-21
 
