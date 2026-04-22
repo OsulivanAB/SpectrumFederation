@@ -292,7 +292,7 @@ end
 -- Best-effort populate of a member's Battle.net account identifier when missing
 -- @param memberData table Member instance or serialized member table
 -- @return boolean populated True when a missing value was resolved and stored
-function Member.TryPopulateMissingBattleNetAccount(memberData)
+function Member.PopulateMissingBattleNetAccount(memberData)
     if type(memberData) ~= "table" then
         return false
     end
@@ -317,7 +317,7 @@ end
 -- Best-effort refresh of this member's Battle.net account identifier when missing
 -- @return boolean populated True when a missing value was resolved and stored
 function Member:PopulateBattleNetAccountIfMissing()
-    return Member.TryPopulateMissingBattleNetAccount(self)
+    return Member.PopulateMissingBattleNetAccount(self)
 end
 
 -- Get the WoW class for this member

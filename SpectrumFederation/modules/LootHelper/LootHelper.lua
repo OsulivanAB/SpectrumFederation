@@ -177,8 +177,8 @@ local function PopulateBattleNetAccountsInDatabase(db)
     for _, profile in pairs(db.profiles or {}) do
         if type(profile) == "table" and type(profile._members) == "table" then
             for _, member in pairs(profile._members) do
-                if type(member) == "table" and SF.Member and type(SF.Member.TryPopulateMissingBattleNetAccount) == "function" then
-                    if SF.Member.TryPopulateMissingBattleNetAccount(member) then
+                if type(member) == "table" and SF.Member and type(SF.Member.PopulateMissingBattleNetAccount) == "function" then
+                    if SF.Member.PopulateMissingBattleNetAccount(member) then
                         populatedMembers = populatedMembers + 1
                     end
                 end
@@ -214,7 +214,7 @@ local function InferLootHelperSchemaVersion(db)
     return LOOT_HELPER_SCHEMA_VERSION
 end
 
-local function MigrateMembersBattleNetAccount(db)
+local function MigrateMembersBattleNetAccounts(db)
     local membersMissingBattleNetAccount = 0
 
     for _, profile in pairs((db and db.profiles) or {}) do
@@ -231,7 +231,7 @@ local function MigrateMembersBattleNetAccount(db)
     end
 
     if SF.Debug then
-        SF.Debug:Info("DATABASE", "Loot helper migration v2 complete: %d member(s) were missing battleNetAccount", membersMissingBattleNetAccount)
+        SF.Debug:Info("DATABASE", "Loot helper migration v2 applied battleNetAccount defaults for %d member(s) that were missing the field", membersMissingBattleNetAccount)
     end
 end
 
@@ -305,7 +305,7 @@ function SF:RunLootHelperSchemaMigrations(db)
     end
 
     local migrations = {
-        [2] = MigrateMembersBattleNetAccount,
+        [2] = MigrateMembersBattleNetAccounts,
         [3] = MigratePopulateBattleNetAccountValues,
     }
 
@@ -329,13 +329,13 @@ function SF:InitializeLootHelperDatabase()
     -- Initialize loot helper settings in main database if not present
     if not SpectrumFederationDB.lootHelper then
         SpectrumFederationDB.lootHelper = {
-			schemaVersion = LOOT_HELPER_SCHEMA_VERSION,
-			enabled = false,
-			showWindowOutsideRaid = false,
-			lockLootWindow = false,
-			showMembersNotInRaid = false,
+            schemaVersion = LOOT_HELPER_SCHEMA_VERSION,
+            enabled = false,
+            showWindowOutsideRaid = false,
+            lockLootWindow = false,
+            showMembersNotInRaid = false,
 
-			window = {},
+            window = {},
 
             profiles = {},              -- Map: profileId -> LootProfile
             activeProfileId = nil       -- Active profile's stable ID
