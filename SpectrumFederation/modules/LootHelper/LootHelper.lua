@@ -1,12 +1,87 @@
 -- Grab the namespace
 local addonName, SF = ...
 
+local LOOT_HELPER_SCHEMA_VERSION = 2
+
+local function HasLootHelperData(db)
+    if type(db) ~= "table" then
+        return false
+    end
+
+    for _ in pairs(db) do
+        return true
+    end
+
+    return false
+end
+
+local function InferLootHelperSchemaVersion(db)
+    local current = tonumber(db and db.schemaVersion)
+    if current then
+        return current
+    end
+
+    if HasLootHelperData(db) then
+        return 1
+    end
+
+    return LOOT_HELPER_SCHEMA_VERSION
+end
+
+local function MigrateMembersBattleNetAccount(db)
+    local membersMissingBattleNetAccount = 0
+
+    for _, profile in pairs((db and db.profiles) or {}) do
+        if type(profile) == "table" and type(profile._members) == "table" then
+            for _, member in pairs(profile._members) do
+                if type(member) == "table" and SF.Member and type(SF.Member.ApplyDefaults) == "function" then
+                    if member.battleNetAccount == nil then
+                        membersMissingBattleNetAccount = membersMissingBattleNetAccount + 1
+                    end
+                    SF.Member.ApplyDefaults(member)
+                end
+            end
+        end
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("DATABASE", "Loot helper migration v2 complete: %d member(s) were missing battleNetAccount", membersMissingBattleNetAccount)
+    end
+end
+
+-- Run loot helper schema migrations to bring saved data to the current version
+-- @param db (table) - Loot helper database table to migrate
+-- @return none
+function SF:RunLootHelperSchemaMigrations(db)
+    if type(db) ~= "table" then
+        return
+    end
+
+    local migrations = {
+        [2] = MigrateMembersBattleNetAccount,
+    }
+
+    local currentVersion = InferLootHelperSchemaVersion(db)
+
+    while currentVersion < LOOT_HELPER_SCHEMA_VERSION do
+        local nextVersion = currentVersion + 1
+        local migration = migrations[nextVersion]
+        if migration then
+            migration(db)
+        end
+        currentVersion = nextVersion
+    end
+
+    db.schemaVersion = LOOT_HELPER_SCHEMA_VERSION
+end
+
 -- Database Initialization for Loot Helper Module
 -- @return: none
 function SF:InitializeLootHelperDatabase()
     -- Initialize loot helper settings in main database if not present
     if not SpectrumFederationDB.lootHelper then
         SpectrumFederationDB.lootHelper = {
+			schemaVersion = LOOT_HELPER_SCHEMA_VERSION,
 			enabled = false,
 			showWindowOutsideRaid = false,
 			lockLootWindow = false,
@@ -23,16 +98,17 @@ function SF:InitializeLootHelperDatabase()
         
         -- Migration: Detect and convert legacy schema (no-op if already clean)
         SF:MigrateLootHelperSchema()
+        SF:RunLootHelperSchemaMigrations(SpectrumFederationDB.lootHelper)
 
-		local lh = SpectrumFederationDB.lootHelper
-		if lh.enabled == nil then lh.enabled = false end
-		if lh.showWindowOutsideRaid == nil then lh.showWindowOutsideRaid = false end
-		if lh.lockLootWindow == nil then lh.lockLootWindow = false end
-		if lh.showMembersNotInRaid == nil then lh.showMembersNotInRaid = false end
+        local lh = SpectrumFederationDB.lootHelper
+        if lh.enabled == nil then lh.enabled = false end
+        if lh.showWindowOutsideRaid == nil then lh.showWindowOutsideRaid = false end
+        if lh.lockLootWindow == nil then lh.lockLootWindow = false end
+        if lh.showMembersNotInRaid == nil then lh.showMembersNotInRaid = false end
 
-		if type(lh.window) ~= "table" then
-			lh.window = {}
-		end
+        if type(lh.window) ~= "table" then
+            lh.window = {}
+        end
     end
 
     SF.lootHelperDB = SpectrumFederationDB.lootHelper
@@ -219,6 +295,9 @@ function SF:RehydrateLootHelperDB()
 							setmetatable(m, self.Member)
 							memberCount = memberCount + 1
 						end
+						if type(self.Member.ApplyDefaults) == "function" then
+							self.Member.ApplyDefaults(m)
+						end
 						-- Track which members were found in array (using member ID)
 						local memberId = GetMemberId(m)
 						if memberId then
@@ -258,6 +337,9 @@ function SF:RehydrateLootHelperDB()
 							if memberId and not processed[memberId] then
 								if getmetatable(m) ~= self.Member then
 									setmetatable(m, self.Member)
+								end
+								if type(self.Member.ApplyDefaults) == "function" then
+									self.Member.ApplyDefaults(m)
 								end
 								table.insert(memberArray, m)
 								processed[memberId] = true

@@ -16,6 +16,7 @@ local MEMBER_ROLES = {
     MEMBER = "member"
 }
 local EQUIPMENT_AWARD_POINT_COST = 1
+local DEFAULT_BATTLENET_ACCOUNT = ""
 
 -- Define all armor slot names (for type safety and easy reference)
 local ARMOR_SLOTS = {
@@ -58,6 +59,14 @@ local function NormalizeClassToken(class)
         return nil
     end
     return normalized
+end
+
+local function NormalizeBattleNetAccount(value)
+    if type(value) ~= "string" then
+        return DEFAULT_BATTLENET_ACCOUNT
+    end
+
+    return value
 end
 
 local SYNC_REBUILD_NOTE = "state will be reconciled from logs via sync rebuild"
@@ -109,8 +118,9 @@ Member.__index = Member
 -- @param identifier (string) - Full character identifier in "Name-Realm" format
 -- @param role (string, optional) - Member role ("admin" or "member", defaults to "member")
 -- @param class (string, optional) - WoW class name (e.g., "WARRIOR", "PALADIN"), must match SF.WOW_CLASSES keys
+-- @param battleNetAccount (string, optional) - Battle.net account identifier for the member
 -- @return Member instance
-function Member.new(identifier, role, class)
+function Member.new(identifier, role, class, battleNetAccount)
     -- Create new instance with metatable
     local instance = setmetatable({}, Member)
     
@@ -145,6 +155,7 @@ function Member.new(identifier, role, class)
     instance.name = instance.member_name
     instance.member_realm = r or ""
     instance.className = instance.class
+    instance.battleNetAccount = NormalizeBattleNetAccount(battleNetAccount)
     
     instance.pointBalance = 0
     
@@ -831,6 +842,7 @@ function Member:ToTable()
         identifier = self.identifier,
         role = self.role,
         class = self.class,
+        battleNetAccount = NormalizeBattleNetAccount(self.battleNetAccount),
         pointBalance = self.pointBalance,
         armor = armorCopy,
     }
@@ -844,7 +856,7 @@ function Member.FromTable(t)
     if type(t.identifier) ~= "string" or t.identifier == "" then return nil end
     
     local incomingClass = t.class or t.className
-    local m = Member.new(t.identifier, t.role, incomingClass)
+    local m = Member.new(t.identifier, t.role, incomingClass, t.battleNetAccount)
     if not m then return nil end
     
     -- Set point balance
@@ -865,4 +877,15 @@ function Member.FromTable(t)
     end
     
     return m
+end
+
+-- Normalizes member data fields to ensure required defaults exist
+-- @param memberData (table) - Member data table to normalize in-place
+-- @return none
+function Member.ApplyDefaults(memberData)
+    if type(memberData) ~= "table" then
+        return
+    end
+
+    memberData.battleNetAccount = NormalizeBattleNetAccount(memberData.battleNetAccount)
 end
