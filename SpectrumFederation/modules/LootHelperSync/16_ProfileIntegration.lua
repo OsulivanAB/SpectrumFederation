@@ -801,52 +801,37 @@ function Sync:RequestGapRepair(profileId, author, gapFrom, gapTo, reason)
         end
     end
 
-    -- Choose targets (helpers first, coordinator fallback)
-    local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator)
-    if not targets or #targets == 0 then return false end
-
-    -- Prefer LOG_REQ if we are an admin; else use NEED_LOGS
-    local me = self:_SelfId()
-    local canLogReq = self:IsSenderAuthorized(profileId, me)
-    local kind = canLogReq and "LOG_REQ" or "NEED_LOGS"
-
-    local requestId = self:NewRequestId()
-
-    local supportsEnc =
-        (SF.SyncProtocol and SF.SyncProtocol.GetSupportedEncodings)
-            and SF.SyncProtocol.GetSupportedEncodings()
-            or nil
-
-    -- fallback targets (exclude the first, since RegisterRequest adds it separately)
-    local fallback = {}
-    for i = 2, #targets do fallback[#fallback + 1] = targets[i] end
-
-    local ok = self:RegisterRequest(requestId, kind, targets[1], {
-        sessionId   = self.state.sessionId,
-        profileId   = profileId,
-        author      = author,
-        fromCounter = gapFrom,
-        toCounter   = gapTo,
-        supportsEnc = supportsEnc,
-        targets     = fallback,
+    local ok = self:QueueRepairRanges(profileId, {
+        {
+            author = author,
+            fromCounter = gapFrom,
+            toCounter = gapTo,
+            mode = "missing",
+        }
+    }, {
+        mode = "missing",
+        reason = reason or "gap-repair",
+        expedite = true,
     })
 
     if ok then
         self.state.gapRepair[key] = { lastAt = now, fromCounter = gapFrom, toCounter = gapTo }
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Gap repair requested via %s for %s: %s [%d-%d] (%s)",
-                tostring(kind), tostring(profileId), tostring(author), gapFrom, gapTo, tostring(reason or "no reason"))
+            SF.Debug:Verbose("SYNC", "Gap repair queued for %s: %s [%d-%d] (%s)",
+                tostring(profileId), tostring(author), gapFrom, gapTo, tostring(reason or "no reason"))
         end
     end
 
     return ok
 end
 
-function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredTarget)
+function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredTarget, opts)
     if not self.state.active then return false end
     if type(profileId) ~= "string" or profileId == "" then return false end
     if self.state.profileId and self.state.profileId ~= profileId then return false end
     if type(ranges) ~= "table" or #ranges == 0 then return false end
+
+    opts = type(opts) == "table" and opts or {}
 
     local targets = nil
     if type(preferredTarget) == "string" and preferredTarget ~= "" then
@@ -891,6 +876,9 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
                 targets = fallback,
                 integrityRepair = true,
                 reason = reason,
+                preferredTarget = preferredTarget,
+                backgroundRepair = opts.backgroundRepair == true,
+                queueAttempts = tonumber(opts.queueAttempts) or 0,
             })
             if ok then
                 count = count + 1

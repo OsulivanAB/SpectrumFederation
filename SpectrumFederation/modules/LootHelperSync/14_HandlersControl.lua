@@ -422,6 +422,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     hb.missedHeartbeats = 0
 
     self:EnsureHeartbeatMonitor("HandleSessionHeartbeat")
+    self:EnsureRepairConvergence("HandleSessionHeartbeat")
 
     -- If coordinator/epoch/session changed, allow a re-evaluation
     if (not self:_SamePlayer(oldCoord, self.state.coordinator))
@@ -441,6 +442,34 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     end
 
     self:TouchPeer(sender, { inGroup = true })
+
+    if not self.state.isCoordinator and payload.integrityHint == "mutation" then
+        local advertisedRanges = {}
+        for _, range in ipairs(payload.mutationRanges or {}) do
+            if type(range) == "table"
+                and type(range.author) == "string"
+                and type(range.fromCounter) == "number"
+                and type(range.toCounter) == "number"
+            then
+                advertisedRanges[#advertisedRanges + 1] = {
+                    author = range.author,
+                    fromCounter = range.fromCounter,
+                    toCounter = range.toCounter,
+                    mode = "integrity",
+                    preferredTarget = sender,
+                }
+            end
+        end
+
+        if #advertisedRanges > 0 then
+            self:QueueRepairRanges(self.state.profileId, advertisedRanges, {
+                mode = "integrity",
+                reason = payload.mutationReason or "heartbeat-mutation",
+                preferredTarget = sender,
+                expedite = true,
+            })
+        end
+    end
 
     -- Catch-up logic:
     if not self.state.isCoordinator then
@@ -483,10 +512,17 @@ function Sync:HandleSessionHeartbeat(sender, payload)
             end
 
             if #filtered > 0 then
-                self:RequestMissingLogs(filtered, "heartbeat-catchup")
+                self:QueueRepairRanges(self.state.profileId, filtered, {
+                    mode = "missing",
+                    reason = "heartbeat-catchup",
+                })
             end
             if integrityRanges and #integrityRanges > 0 then
-                self:RequestIntegrityRepairRanges(self.state.profileId, integrityRanges, "heartbeat-integrity")
+                self:QueueRepairRanges(self.state.profileId, integrityRanges, {
+                    mode = "integrity",
+                    reason = "heartbeat-integrity",
+                    preferredTarget = sender,
+                })
             end
         end
     end
@@ -589,7 +625,12 @@ function Sync:_HandlePeerIntegrityAdvertisement(sender, payload)
     end
 
     if #ranges > 0 then
-        self:RequestIntegrityRepairRanges(payload.profileId, ranges, payload.mutationReason or "peer-mutation", sender)
+        self:QueueRepairRanges(payload.profileId, ranges, {
+            mode = "integrity",
+            reason = payload.mutationReason or "peer-mutation",
+            preferredTarget = sender,
+            expedite = true,
+        })
     end
 end
 

@@ -133,14 +133,20 @@ function Sync:HandleNewLog(sender, payload)
             local author, counter = self:_ExtractAuthorCounter(logTable)
             local target = self.state.isCoordinator and sender or self.state.coordinator
             if type(author) == "string" and type(counter) == "number" then
-                self:RequestIntegrityRepairRanges(profileId, {
+                self:QueueRepairRanges(profileId, {
                     {
                         author = author,
                         fromCounter = counter,
                         toCounter = counter,
                         mode = "integrity",
+                        preferredTarget = target,
                     }
-                }, "new-log-mismatch", target)
+                }, {
+                    mode = "integrity",
+                    reason = "new-log-mismatch",
+                    preferredTarget = target,
+                    expedite = true,
+                })
             end
             if SF.Debug then
                 SF.Debug:Warn("SYNC", "NEW_LOG fingerprint mismatch detected (id=%s, sender=%s, local=%s, remote=%s)",

@@ -39,6 +39,13 @@ Sync.cfg = Sync.cfg or {
 
     gapRepairCooldownSec = 2,
 
+    convergenceIntervalSec          = 8,    -- low-frequency background drain for queued repair work
+    convergenceBatchSize            = 2,    -- max queued repair ranges to dispatch per convergence tick
+    convergenceKickDelaySec         = 0.25, -- short delay for event-driven repair acceleration
+    convergenceRetryBaseSec         = 12,   -- base backoff when queued repair dispatch fails
+    convergenceRetryMaxSec          = 90,   -- cap queued repair backoff to avoid runaway delays
+    maxQueuedRepairRanges           = 96,   -- hard cap for in-memory queued repair work
+
     -- Heartbeat
     heartbeatIntervalSec            = 30,   -- how often to send heartbeat, in seconds
     heartbeatMissThreshold          = 3,    -- how many consecutive misses before takeover logic triggers
@@ -90,7 +97,16 @@ Sync.state = Sync.state or {
         lastHeartbeatSentAt     = nil,
         monitorTimerHandle      = nil,  -- ticker for admin takeover monitor
         lastTakeoverRound       = nil,  -- last deterministic takeover "round" we attempted
-    }
+    },
+    repairQueue = {
+        order = {},            -- stable queue order of repair keys
+        items = {},            -- map: [repairKey] = repairEntry
+    },
+    convergence = {
+        tickerHandle = nil,    -- background convergence ticker
+        kickHandle = nil,      -- short one-shot acceleration timer
+        lastDrainAt = nil,
+    },
 }
 
 -- Session Heartbeat contract:

@@ -269,12 +269,15 @@ end
 -- Function Request missing log ranges from helpers (preferred) or coordinator (fallback).
 -- @param missingRanges table Array of {author, fromCounter, toCounter}
 -- @param reason string Reason for request (for logging)
+-- @param opts table|nil Optional metadata for queued/background dispatch
 -- @return boolean True if any requests were registered, false otherwise
-function Sync:RequestMissingLogs(missingRanges, reason)
+function Sync:RequestMissingLogs(missingRanges, reason, opts)
     if not self.state.active then return false end
     if not self.state.sessionId then return false end
     if type(self.state.profileId) ~= "string" or self.state.profileId == "" then return false end
     if type(missingRanges) ~= "table" or #missingRanges == 0 then return false end
+
+    opts = type(opts) == "table" and opts or {}
 
     -- Build ordered target list: helpers first, coordinator fallback
     local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator)
@@ -305,6 +308,9 @@ function Sync:RequestMissingLogs(missingRanges, reason)
                 fromCounter = range.fromCounter,
                 toCounter   = range.toCounter,
                 targets     = targets,  -- fallback list
+                backgroundRepair = opts.backgroundRepair == true,
+                queueAttempts = tonumber(opts.queueAttempts) or 0,
+                reason = reason,
             })
 
             if ok then
