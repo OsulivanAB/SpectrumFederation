@@ -203,7 +203,32 @@ local function LayoutTransferPopup(popup)
         popup.button2:SetPoint("TOPLEFT", popup.validationText, "BOTTOM", 6, -14)
     end
 
-    popup:SetHeight(280)
+    local textHeight = (popup.text and popup.text:GetStringHeight()) or 0
+    local sourceLabelHeight = (popup.sourceLabel and popup.sourceLabel:GetStringHeight()) or 0
+    local sourceDropdownHeight = (popup.sourceDropdown and popup.sourceDropdown:GetHeight()) or 0
+    local targetLabelHeight = (popup.targetLabel and popup.targetLabel:GetStringHeight()) or 0
+    local targetDropdownHeight = (popup.targetDropdown and popup.targetDropdown:GetHeight()) or 0
+    local validationHeight = (popup.validationText and popup.validationText:GetStringHeight()) or 0
+    local buttonHeight = 0
+
+    if popup.button1 then
+        buttonHeight = math.max(buttonHeight, popup.button1:GetHeight() or 0)
+    end
+    if popup.button2 then
+        buttonHeight = math.max(buttonHeight, popup.button2:GetHeight() or 0)
+    end
+
+    popup:SetHeight(math.max(
+        240,
+        22 + textHeight +
+        14 + sourceLabelHeight +
+        4 + sourceDropdownHeight +
+        10 + targetLabelHeight +
+        4 + targetDropdownHeight +
+        10 + validationHeight +
+        14 + buttonHeight +
+        24
+    ))
 end
 
 local function SetupTransferDropdown(dropdown, options, getValue, setValue)
@@ -280,6 +305,8 @@ local function UpdateTransferPopupState(popup)
     if popup.targetDropdown and popup.targetDropdown.SetDefaultText then
         popup.targetDropdown:SetDefaultText(FindOptionLabel(data.targetOptions, targetMemberId) or "Select member")
     end
+
+    LayoutTransferPopup(popup)
 end
 
 if not StaticPopupDialogs[TRANSFER_KEY] then
