@@ -366,6 +366,14 @@ local function GetSnapshotSlotLink(slotsByInventory, inventorySlot)
 	return slotData and slotData.link or nil
 end
 
+local function SnapshotSlotHasItem(slotsByInventory, inventorySlot)
+	local slotData = slotsByInventory and slotsByInventory[inventorySlot]
+	if type(slotData) ~= "table" then
+		return false
+	end
+	return (slotData.hasItem or slotData.link or slotData.texture) and true or false
+end
+
 local function CalculateAverageItemLevel(slotsByInventory)
 	local total = 0
 	local count = 0
@@ -523,12 +531,14 @@ local function CaptureTroubleshootingInventory(unit)
 			local link = GetInventoryItemLink(unit, inventorySlot)
 			local texture = GetInventoryItemTexture and GetInventoryItemTexture(unit, inventorySlot) or nil
 			local itemLevel = GetDetailedItemLevelSafe(link)
+			local hasItem = (link or texture) and true or false
 			slotsByInventory[inventorySlot] = {
 				link = link,
+				hasItem = hasItem,
 				texture = texture,
 				itemLevel = itemLevel,
 			}
-			if link or texture then
+			if hasItem then
 				sawAnyData = true
 			end
 		end
@@ -1094,13 +1104,15 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 end
 
 local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, idx, mainHandLink, cfg)
-	local link = GetSnapshotSlotLink(slotsByInventory, slotDef.slots[idx])
+	local inventorySlot = slotDef.slots[idx]
+	local link = GetSnapshotSlotLink(slotsByInventory, inventorySlot)
+	local hasItem = SnapshotSlotHasItem(slotsByInventory, inventorySlot)
 	local label = slotDef.label
 	if #slotDef.slots > 1 then
 		label = string.format("%s %d", label, idx)
 	end
 
-	if not link then
+	if not hasItem then
 		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
 			return {}
 		end
@@ -1108,6 +1120,10 @@ local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, i
 			return {}
 		end
 		return { label .. " Item" }
+	end
+
+	if not link then
+		return {}
 	end
 
 	local missing = {}
@@ -1164,13 +1180,14 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 	local inventorySlot = column and column.inventorySlot
 	local slotKey = column and column.key
 	local link = sourceSlot and sourceSlot.link or nil
+	local hasItem = sourceSlot and (sourceSlot.hasItem or sourceSlot.link or sourceSlot.texture) and true or false
 	local configEnabled = IsSlotEnabledInConfig(cfg, slotKey, link)
 	local twoHandExempt = isKnown and (slotKey == "offHand") and (not link) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
 	local shouldCheckEnchant = isKnown and link and configEnabled and ShouldCheckTroubleshootingEnchant(slotKey, link) or false
 	local hasEnchant = isKnown and link and HasEnchant(link) or false
 	local missingEnchant = shouldCheckEnchant and not hasEnchant
 	local missingGems = isKnown and link and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
-	local missingItem = isKnown and (not link) and configEnabled and not twoHandExempt
+	local missingItem = isKnown and (not hasItem) and configEnabled and not twoHandExempt
 	local skippedEnchant = isKnown and link and configEnabled and not shouldCheckEnchant
 
 	return {
@@ -1182,6 +1199,7 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 		configEnabled = configEnabled and true or false,
 		known = isKnown and true or false,
 		link = link,
+		hasItem = hasItem,
 		texture = sourceSlot and sourceSlot.texture or nil,
 		expectedEnchant = shouldCheckEnchant and true or false,
 		hasEnchant = hasEnchant and true or false,

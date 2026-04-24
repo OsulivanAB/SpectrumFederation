@@ -348,6 +348,7 @@ local function BuildAuditSlotSignature(slotData)
 		tostring(slotData.key or slotData.label or "?"),
 		GetAuditDebugItemToken(slotData.link),
 		tostring(slotData.texture or "nil"),
+		slotData.hasItem and "i1" or "i0",
 		slotData.known and "k1" or "k0",
 		slotData.configEnabled and "c1" or "c0",
 		slotData.expectedEnchant and "e1" or "e0",
@@ -450,7 +451,9 @@ local function ShowAuditCellTooltip(self)
 		return
 	end
 
-	if not slotData.link then
+	if slotData.hasItem and not slotData.link then
+		GameTooltip:AddLine("Item is equipped, but full item details are still loading.", 0.8, 0.8, 0.8, true)
+	elseif not slotData.hasItem and not slotData.link then
 		GameTooltip:AddLine("No item equipped.", 0.8, 0.8, 0.8, true)
 	end
 
@@ -869,7 +872,7 @@ local function BuildEquipmentPage(panel)
 				local slotData = rowData.slots and rowData.slots[columnIndex] or nil
 				local cell = dataRow.Cells[columnIndex]
 				local texture = slotData and slotData.texture or GetAuditSlotPlaceholderTexture(column.key)
-				local hasItem = slotData and slotData.link
+				local hasItem = slotData and (slotData.hasItem or slotData.link)
 				local shouldShowOverlay = slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems or slotData.missingItem)
 
 				cell._rowData = rowData
