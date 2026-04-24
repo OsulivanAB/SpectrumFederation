@@ -348,6 +348,7 @@ local function BuildAuditSlotSignature(slotData)
 		tostring(slotData.key or slotData.label or "?"),
 		GetAuditDebugItemToken(slotData.link),
 		tostring(slotData.texture or "nil"),
+		-- i = hasItem (slot presence confirmed even if the item link is still loading)
 		slotData.hasItem and "i1" or "i0",
 		slotData.known and "k1" or "k0",
 		slotData.configEnabled and "c1" or "c0",

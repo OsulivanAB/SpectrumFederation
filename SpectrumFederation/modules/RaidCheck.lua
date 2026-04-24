@@ -371,7 +371,7 @@ local function SnapshotSlotHasItem(slotsByInventory, inventorySlot)
 	if type(slotData) ~= "table" then
 		return false
 	end
-	return slotData.hasItem and true or false
+	return not not slotData.hasItem
 end
 
 local function CalculateAverageItemLevel(slotsByInventory)
@@ -1180,7 +1180,7 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 	local inventorySlot = column and column.inventorySlot
 	local slotKey = column and column.key
 	local link = sourceSlot and sourceSlot.link or nil
-	local hasItem = sourceSlot and sourceSlot.hasItem and true or false
+	local hasItem = not not (sourceSlot and sourceSlot.hasItem)
 	local configEnabled = IsSlotEnabledInConfig(cfg, slotKey, link)
 	local twoHandExempt = isKnown and (slotKey == "offHand") and (not link) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
 	local shouldCheckEnchant = isKnown and link and configEnabled and ShouldCheckTroubleshootingEnchant(slotKey, link) or false
