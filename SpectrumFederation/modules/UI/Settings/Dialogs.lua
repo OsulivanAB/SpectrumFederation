@@ -193,14 +193,21 @@ local function LayoutTransferPopup(popup)
         popup.validationText:SetPoint("RIGHT", popup, "RIGHT", -sideInset, 0)
     end
 
-    if popup.button1 then
-        popup.button1:ClearAllPoints()
-        popup.button1:SetPoint("TOPRIGHT", popup.validationText, "BOTTOM", -6, -14)
+    local buttonAnchor = popup.validationText
+    local buttonAnchorOffsetY = -14
+    if popup.validationText and popup.validationText:GetText() == "" then
+        buttonAnchor = popup.targetDropdown
+        buttonAnchorOffsetY = -24
     end
 
-    if popup.button2 then
+    if popup.button1 and buttonAnchor then
+        popup.button1:ClearAllPoints()
+        popup.button1:SetPoint("TOPRIGHT", buttonAnchor, "BOTTOM", -6, buttonAnchorOffsetY)
+    end
+
+    if popup.button2 and buttonAnchor then
         popup.button2:ClearAllPoints()
-        popup.button2:SetPoint("TOPLEFT", popup.validationText, "BOTTOM", 6, -14)
+        popup.button2:SetPoint("TOPLEFT", buttonAnchor, "BOTTOM", 6, buttonAnchorOffsetY)
     end
 
     local textHeight = (popup.text and popup.text:GetStringHeight()) or 0
