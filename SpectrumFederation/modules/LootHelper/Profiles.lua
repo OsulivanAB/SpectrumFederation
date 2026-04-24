@@ -113,7 +113,7 @@ local function CopyRaidCheckEquipmentSlots(slotsByInventory)
 		if type(slotData) == "table" then
 			copy[inventorySlot] = {
 				link = type(slotData.link) == "string" and slotData.link or nil,
-				hasItem = slotData.hasItem and true or false,
+				hasItem = (slotData.hasItem or slotData.link or slotData.texture) and true or false,
 				texture = slotData.texture,
 				itemLevel = tonumber(slotData.itemLevel) or nil,
 			}

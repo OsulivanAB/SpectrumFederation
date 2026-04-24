@@ -872,7 +872,7 @@ local function BuildEquipmentPage(panel)
 				local slotData = rowData.slots and rowData.slots[columnIndex] or nil
 				local cell = dataRow.Cells[columnIndex]
 				local texture = slotData and slotData.texture or GetAuditSlotPlaceholderTexture(column.key)
-				local hasItem = slotData and (slotData.hasItem or slotData.link)
+				local hasItem = slotData and slotData.hasItem
 				local shouldShowOverlay = slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems or slotData.missingItem)
 
 				cell._rowData = rowData
