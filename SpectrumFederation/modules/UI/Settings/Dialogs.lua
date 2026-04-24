@@ -135,30 +135,75 @@ local function EnsureTransferPopupWidgets(popup)
     popup:SetWidth(420)
 
     popup.sourceLabel = popup:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    popup.sourceLabel:SetPoint("TOPLEFT", popup, "TOPLEFT", 18, -44)
     popup.sourceLabel:SetText("Transfer points from")
 
     popup.sourceDropdown = CreateFrame("DropdownButton", nil, popup, "WowStyle1DropdownTemplate")
-    popup.sourceDropdown:SetPoint("TOPLEFT", popup.sourceLabel, "BOTTOMLEFT", 0, -4)
-    popup.sourceDropdown:SetWidth(240)
     popup.sourceDropdown:SetDefaultText("Select member")
 
     popup.targetLabel = popup:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    popup.targetLabel:SetPoint("TOPLEFT", popup.sourceDropdown, "BOTTOMLEFT", 0, -16)
     popup.targetLabel:SetText("Transfer points to")
 
     popup.targetDropdown = CreateFrame("DropdownButton", nil, popup, "WowStyle1DropdownTemplate")
-    popup.targetDropdown:SetPoint("TOPLEFT", popup.targetLabel, "BOTTOMLEFT", 0, -4)
-    popup.targetDropdown:SetWidth(240)
     popup.targetDropdown:SetDefaultText("Select member")
 
     popup.validationText = popup:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    popup.validationText:SetPoint("TOPLEFT", popup.targetDropdown, "BOTTOMLEFT", 0, -12)
-    popup.validationText:SetPoint("RIGHT", popup, "RIGHT", -18, 0)
     popup.validationText:SetJustifyH("LEFT")
     popup.validationText:SetJustifyV("TOP")
 
     popup.__sfTransferWidgetsReady = true
+end
+
+local function LayoutTransferPopup(popup)
+    local sideInset = 18
+    local contentWidth = popup:GetWidth() - (sideInset * 2)
+
+    if popup.text then
+        popup.text:ClearAllPoints()
+        popup.text:SetPoint("TOPLEFT", popup, "TOPLEFT", sideInset, -22)
+        popup.text:SetPoint("TOPRIGHT", popup, "TOPRIGHT", -sideInset, -22)
+        popup.text:SetWidth(contentWidth)
+        popup.text:SetJustifyH("CENTER")
+    end
+
+    if popup.sourceLabel then
+        popup.sourceLabel:ClearAllPoints()
+        popup.sourceLabel:SetPoint("TOPLEFT", popup.text, "BOTTOMLEFT", 0, -14)
+    end
+
+    if popup.sourceDropdown then
+        popup.sourceDropdown:ClearAllPoints()
+        popup.sourceDropdown:SetPoint("TOPLEFT", popup.sourceLabel, "BOTTOMLEFT", 0, -4)
+        popup.sourceDropdown:SetWidth(contentWidth)
+    end
+
+    if popup.targetLabel then
+        popup.targetLabel:ClearAllPoints()
+        popup.targetLabel:SetPoint("TOPLEFT", popup.sourceDropdown, "BOTTOMLEFT", 0, -10)
+    end
+
+    if popup.targetDropdown then
+        popup.targetDropdown:ClearAllPoints()
+        popup.targetDropdown:SetPoint("TOPLEFT", popup.targetLabel, "BOTTOMLEFT", 0, -4)
+        popup.targetDropdown:SetWidth(contentWidth)
+    end
+
+    if popup.validationText then
+        popup.validationText:ClearAllPoints()
+        popup.validationText:SetPoint("TOPLEFT", popup.targetDropdown, "BOTTOMLEFT", 0, -10)
+        popup.validationText:SetPoint("RIGHT", popup, "RIGHT", -sideInset, 0)
+    end
+
+    if popup.button1 then
+        popup.button1:ClearAllPoints()
+        popup.button1:SetPoint("TOPRIGHT", popup.validationText, "BOTTOM", -6, -14)
+    end
+
+    if popup.button2 and popup.button1 then
+        popup.button2:ClearAllPoints()
+        popup.button2:SetPoint("LEFT", popup.button1, "RIGHT", 12, 0)
+    end
+
+    popup:SetHeight(280)
 end
 
 local function SetupTransferDropdown(dropdown, options, getValue, setValue)
@@ -250,9 +295,9 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         OnShow = function(self, data)
             EnsureTransferPopupWidgets(self)
 
-            self:SetHeight(238)
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
+            LayoutTransferPopup(self)
 
             SetupTransferDropdown(
                 self.sourceDropdown,
