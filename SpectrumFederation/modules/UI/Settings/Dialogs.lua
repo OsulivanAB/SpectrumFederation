@@ -198,9 +198,9 @@ local function LayoutTransferPopup(popup)
         popup.button1:SetPoint("TOPRIGHT", popup.validationText, "BOTTOM", -6, -14)
     end
 
-    if popup.button2 and popup.button1 then
+    if popup.button2 then
         popup.button2:ClearAllPoints()
-        popup.button2:SetPoint("LEFT", popup.button1, "RIGHT", 12, 0)
+        popup.button2:SetPoint("TOPLEFT", popup.validationText, "BOTTOM", 6, -14)
     end
 
     popup:SetHeight(280)
