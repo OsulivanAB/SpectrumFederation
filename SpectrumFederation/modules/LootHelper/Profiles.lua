@@ -115,7 +115,7 @@ local function CopyRaidCheckEquipmentSlots(slotsByInventory)
 				link = type(slotData.link) == "string" and slotData.link or nil,
 				-- Older saved snapshots may not have hasItem yet; derive it while copying
 				-- so downstream Raid Check consumers can rely on a normalized boolean.
-				hasItem = (slotData.hasItem or slotData.link or slotData.texture) and true or false,
+				hasItem = not not (slotData.hasItem or slotData.link or slotData.texture),
 				texture = slotData.texture,
 				itemLevel = tonumber(slotData.itemLevel) or nil,
 			}

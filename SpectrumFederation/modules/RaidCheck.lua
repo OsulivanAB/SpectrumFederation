@@ -371,7 +371,7 @@ local function SnapshotSlotHasItem(slotsByInventory, inventorySlot)
 	if type(slotData) ~= "table" then
 		return false
 	end
-	return not not slotData.hasItem
+	return slotData.hasItem
 end
 
 local function CalculateAverageItemLevel(slotsByInventory)
