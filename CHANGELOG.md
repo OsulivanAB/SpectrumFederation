@@ -40,6 +40,19 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.4] - 2026-04-25
+
+### Added
+- Introduced the ability to transfer member history between members in the active loot profile.
+- Implemented a new deterministic fingerprinting system for loot logs to ensure data integrity.
+- Added functionality to compute and validate log fingerprints for improved synchronization and consistency.
+- Introduced an integrity summary feature for loot logs, enabling better tracking and validation of log data.
+
+### Changed
+- Enhanced loot profile management with new methods for log indexing and integrity tracking.
+- Improved internal handling of loot logs, including fingerprint indexing and position tracking.
+
 ## [0.5.19] - 2026-04-22
 
 ### Changed
