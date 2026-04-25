@@ -15,6 +15,7 @@ local RAID_CHECK_POINT_AWARD = 0.5
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
 local INSPECT_CACHE_TTL_SECONDS = 30
+local EQUIPMENT_SNAPSHOT_MAX_AGE_SECONDS = 24 * 60 * 60
 local INSPECT_RETRY_BASE_SECONDS = 2
 local INSPECT_RETRY_MAX_SECONDS = 10
 local INSPECT_REQUEST_TIMEOUT_SECONDS = 1.5
@@ -465,32 +466,23 @@ local function GetProfileEquipmentSnapshot(memberId)
 	return profile:GetRaidCheckEquipmentSnapshot(memberId)
 end
 
-local function BuildSavedSnapshotMessage(snapshot, whileRefreshing)
-	local baseMessage = whileRefreshing
-		and "Showing the saved profile snapshot while a fresh inspect loads."
-		or "Showing the last saved profile snapshot for this member."
+local function GetEquipmentSnapshotAgeSeconds(snapshot)
 	local capturedAt = snapshot and snapshot.capturedAt or nil
 	if type(capturedAt) ~= "number" or capturedAt <= 0 then
-		return baseMessage
+		return nil
 	end
 
 	local now = GetServerTime and GetServerTime() or nil
 	if type(now) ~= "number" or now < capturedAt then
-		return baseMessage
+		return nil
 	end
 
-	local ageSeconds = math.max(0, now - capturedAt)
-	if ageSeconds < 60 then
-		return baseMessage .. " Last seen less than a minute ago."
-	end
-	if ageSeconds < 3600 then
-		return string.format("%s Last seen %dm ago.", baseMessage, math.floor(ageSeconds / 60))
-	end
-	if ageSeconds < 86400 then
-		return string.format("%s Last seen %dh ago.", baseMessage, math.floor(ageSeconds / 3600))
-	end
+	return math.max(0, now - capturedAt)
+end
 
-	return string.format("%s Last seen %dd ago.", baseMessage, math.floor(ageSeconds / 86400))
+local function IsEquipmentSnapshotFresh(snapshot)
+	local ageSeconds = GetEquipmentSnapshotAgeSeconds(snapshot)
+	return type(ageSeconds) == "number" and ageSeconds <= EQUIPMENT_SNAPSHOT_MAX_AGE_SECONDS
 end
 
 local function FindUnitByGuidOrId(guid, id)
@@ -916,6 +908,7 @@ function RC:_HandleInspectReady(guid)
 		entry.lastAttemptAt = active.requestedAt
 		entry.nextRetryAt = nil
 		entry.updatedAt = now
+		entry.capturedAt = GetServerTime and GetServerTime() or nil
 		entry.averageItemLevel = captured.averageItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
 		PersistProfileEquipmentSnapshot(active.id, captured)
@@ -1278,6 +1271,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	local profileSnapshot = GetProfileEquipmentSnapshot(memberId)
 	local now = GetTime and GetTime() or 0
 	local hasFreshData = cacheEntry and cacheEntry.updatedAt and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
+	local hasFreshCachedSnapshot = cacheEntry and cacheEntry.slotsByInventory and IsEquipmentSnapshotFresh(cacheEntry)
+	local hasFreshProfileSnapshot = profileSnapshot and profileSnapshot.slotsByInventory and IsEquipmentSnapshotFresh(profileSnapshot)
 
 	if hasFreshData and cacheEntry.slotsByInventory then
 		return {
@@ -1301,64 +1296,30 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		self:_QueueInspectForUnit(unit, info, cacheEntry)
 	end
 
-	if cacheEntry and cacheEntry.slotsByInventory then
-		local status = "stale"
-		local label = "Stale"
-		local message = "Showing cached inspect data while a fresh snapshot loads."
-
-		if pausedForCombat then
-			label = "Paused"
-			message = "Showing cached inspect data until combat ends."
-		elseif activeKey == key then
-			status = "refreshing"
-			label = "Refreshing"
-		end
-
+	if hasFreshCachedSnapshot then
 		return {
-			status = status,
-			label = label,
-			message = message,
+			status = "ready",
+			label = nil,
+			message = nil,
 			isKnown = true,
 			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
-			stale = true,
+			stale = false,
 			cacheHolder = cacheEntry,
 		}
 	end
 
-	if profileSnapshot and profileSnapshot.slotsByInventory then
-		local status = "saved"
-		local label = "Saved"
-		local message = BuildSavedSnapshotMessage(profileSnapshot, false)
-
-		if pausedForCombat and unit then
-			status = "paused"
-			label = "Paused"
-			message = "Showing the saved profile snapshot until combat ends."
-		elseif activeKey == key then
-			status = "refreshing"
-			label = "Refreshing"
-			message = BuildSavedSnapshotMessage(profileSnapshot, true)
-		elseif canInspectNow then
-			status = "loading"
-			label = "Loading"
-			message = BuildSavedSnapshotMessage(profileSnapshot, true)
-		elseif unit and not inRange then
-			status = "out_of_range"
-			label = "Out of range"
-			message = "Showing the saved profile snapshot. Move closer to refresh this player."
-		end
-
+	if hasFreshProfileSnapshot then
 		return {
-			status = status,
-			label = label,
-			message = message,
+			status = "ready",
+			label = nil,
+			message = nil,
 			isKnown = true,
 			averageItemLevel = profileSnapshot.averageItemLevel,
 			slotsByInventory = profileSnapshot.slotsByInventory,
 			entry = profileSnapshot,
-			stale = true,
+			stale = false,
 			cacheHolder = profileSnapshot,
 		}
 	end
