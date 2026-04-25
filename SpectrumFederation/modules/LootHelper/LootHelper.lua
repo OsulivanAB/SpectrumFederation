@@ -669,6 +669,17 @@ function SF:RemoveAdminFromActiveLootHelperProfile(memberId)
 	return p:RemoveAdminMemberId(memberId)
 end
 
+-- Transfer all member history from one member to another in the active profile
+-- @param sourceMemberId (string) - Member ID to transfer history from
+-- @param targetMemberId (string) - Member ID to transfer history to
+-- @return (boolean, string|nil) - Success status and optional error message
+function SF:TransferMemberHistoryInActiveLootHelperProfile(sourceMemberId, targetMemberId)
+	local p = self:GetActiveProfile()
+	if not p then return false, "No active profile." end
+	if not p.TransferMemberHistory then return false, "Profile missing TransferMemberHistory." end
+	return p:TransferMemberHistory(sourceMemberId, targetMemberId)
+end
+
 -- Reset all loot helper settings (dangerous operation)
 -- @return (boolean, string|nil) - Success status and optional error message
 function SF:ResetAllLootHelperSettings()

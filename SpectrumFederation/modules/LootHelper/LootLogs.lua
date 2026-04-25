@@ -7,6 +7,7 @@ local addonName, SF = ...
 
 local LOG_FORMAT_VERSION = 2
 local DEFAULT_POINT_CHANGE_AMOUNT = 1
+local FINGERPRINT_MODULO = 2147483647
 
 local EVENT_TYPES = {
     PROFILE_CREATION            = "PROFILE_CREATION",
@@ -80,6 +81,56 @@ local EVENT_DATA_TEMPLATES = {
 -- @return string logID Unique log ID
 local function GenerateLogID(author, counter)
     return ("%s:%d"):format(author, counter)
+end
+
+local function _FingerprintAppend(checksum, text)
+    text = tostring(text or "")
+    for i = 1, #text do
+        checksum = (checksum * 33 + text:byte(i)) % FINGERPRINT_MODULO
+    end
+    return checksum
+end
+
+local function _FingerprintValue(checksum, value)
+    local valueType = type(value)
+    checksum = _FingerprintAppend(checksum, valueType)
+
+    if valueType == "table" then
+        local keys = {}
+        for key in pairs(value) do
+            keys[#keys + 1] = key
+        end
+        table.sort(keys, function(a, b)
+            return tostring(a) < tostring(b)
+        end)
+
+        for _, key in ipairs(keys) do
+            checksum = _FingerprintAppend(checksum, key)
+            checksum = _FingerprintValue(checksum, value[key])
+        end
+        return checksum
+    end
+
+    if valueType == "boolean" then
+        return _FingerprintAppend(checksum, value and "true" or "false")
+    end
+
+    return _FingerprintAppend(checksum, value)
+end
+
+local function ComputeFingerprintFromFields(timestamp, author, counter, eventType, eventData)
+    local checksum = 5381
+    checksum = _FingerprintAppend(checksum, "timestamp")
+    checksum = _FingerprintValue(checksum, tonumber(timestamp) or 0)
+    checksum = _FingerprintAppend(checksum, "author")
+    checksum = _FingerprintValue(checksum, author or "")
+    checksum = _FingerprintAppend(checksum, "counter")
+    checksum = _FingerprintValue(checksum, tonumber(counter) or 0)
+    checksum = _FingerprintAppend(checksum, "eventType")
+    checksum = _FingerprintValue(checksum, eventType or "")
+    checksum = _FingerprintAppend(checksum, "data")
+    checksum = _FingerprintValue(checksum, eventData or {})
+    return checksum
 end
 
 local LootLog = {}
@@ -197,6 +248,7 @@ function LootLog.new(eventType, eventData, opts)
     instance._eventType = eventType
     instance._data = eventData
     instance._id = GenerateLogID(author, counter)
+    instance._fingerprint = ComputeFingerprintFromFields(timestamp, author, counter, eventType, eventData)
 
     if SF.Debug then
         SF.Debug:Verbose("LOOTLOG", "Created log %s: %s", instance._id, instance._eventType)
@@ -286,6 +338,21 @@ function LootLog:GetCounter()
     return self._counter
 end
 
+-- Function to get the deterministic content fingerprint of this log entry
+-- @return number fingerprint
+function LootLog:GetFingerprint()
+    if type(self._fingerprint) ~= "number" then
+        self._fingerprint = ComputeFingerprintFromFields(
+            self._timestamp,
+            self._author,
+            self._counter,
+            self._eventType,
+            self._data
+        )
+    end
+    return self._fingerprint
+end
+
 -- Function to get the event type of this log entry
 -- @return string event type
 function LootLog:GetEventType()
@@ -334,7 +401,8 @@ function LootLog:ToTable()
         _author     = self._author,
         _counter    = self._counter,
         _eventType  = self._eventType,
-        _data       = self._data
+        _data       = self._data,
+        _fingerprint= self:GetFingerprint(),
     }
 end
 
@@ -370,6 +438,19 @@ function LootLog.ValidateTable(t, opts)
         return false, ("log._id mismatch (expected %s, got %s)"):format(expectedId, tostring(t._id))
     end
 
+    local computedFingerprint = ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, t._data)
+    if t._fingerprint ~= nil then
+        if type(t._fingerprint) ~= "number" then
+            return false, "log._fingerprint must be a number when provided"
+        end
+        if t._fingerprint ~= computedFingerprint then
+            return false, ("log._fingerprint mismatch (expected %s, got %s)"):format(
+                tostring(computedFingerprint),
+                tostring(t._fingerprint)
+            )
+        end
+    end
+
     -- Semantic enforcement (off by default for forward compatibility)
     if not allowUnknown  then
         if not EVENT_TYPES[t._eventType] then
@@ -398,8 +479,20 @@ function LootLog.FromTable(t, opts)
     instance._counter   = t._counter
     instance._eventType = t._eventType
     instance._data      = t._data
+    instance._fingerprint = t._fingerprint or ComputeFingerprintFromFields(
+        t._timestamp,
+        t._author,
+        t._counter,
+        t._eventType,
+        t._data
+    )
 
     return instance, nil
+end
+
+function LootLog.ComputeFingerprintFromTable(t)
+    if type(t) ~= "table" then return nil end
+    return ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, t._data)
 end
 
 -- ============================================================================

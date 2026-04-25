@@ -558,6 +558,7 @@ function Sync:_ResetSessionState(reason)
     -- Clear session metadata
     self.state.helpers = {}
     self.state.authorMax = {}
+    self.state.authorWindowSummary = {}
 
     -- Clear dedupe/flags
     self.state._sentJoinStatusForSessionId = nil
@@ -568,6 +569,13 @@ function Sync:_ResetSessionState(reason)
 
     -- Clear gap repair cooldowns
     self.state.gapRepair = nil
+    self.state._pendingMutationAdvertisement = nil
+    self.state.repairQueue = { order = {}, items = {} }
+
+    if self.StopRepairConvergence then
+        self:StopRepairConvergence("ResetSessionState")
+    end
+    self.state.convergence = { tickerHandle = nil, kickHandle = nil, lastDrainAt = nil }
 
     -- Clear per-peer "announced" marker + joinStatus (keeps peers table but removes stale session info)
     for _, peer in pairs(self.state.peers or {}) do

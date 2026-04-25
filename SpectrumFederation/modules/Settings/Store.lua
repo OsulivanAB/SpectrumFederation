@@ -767,6 +767,18 @@ function Store:RemoveAdminFromActiveProfile(memberId)
 	return false, "RemoveAdminFromActiveLootHelperProfile not implemented"
 end
 
+-- Transfer all member history from one active profile member to another
+-- @param sourceMemberId string Member ID to transfer history from
+-- @param targetMemberId string Member ID to transfer history to
+-- @return boolean True on success, false on failure
+-- @return string|nil Error message if failed
+function Store:TransferMemberHistoryInActiveProfile(sourceMemberId, targetMemberId)
+	if SF.TransferMemberHistoryInActiveLootHelperProfile then
+		return SF:TransferMemberHistoryInActiveLootHelperProfile(sourceMemberId, targetMemberId)
+	end
+	return false, "TransferMemberHistoryInActiveLootHelperProfile not implemented"
+end
+
 -- Rename the active loot helper profile by delegating to SF namespace
 -- @param newName string New name for the profile
 -- @return boolean True on success, false on failure

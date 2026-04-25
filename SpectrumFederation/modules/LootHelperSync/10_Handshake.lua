@@ -40,6 +40,7 @@ function Sync:BroadcastSessionHeartbeat()
     -- Keep authorMax fresh so reconnecting clients can catch up.
     -- Note: If performance becomes an issue, we can later switch this to reuse self.state.authorMax and only recompute periodically
     self.state.authorMax = self:ComputeAuthorMax(profileId) or (self.state.authorMax or {})
+    self.state.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or (self.state.authorWindowSummary or {})
 
     local payload = {
         sessionId   = sid,
@@ -48,6 +49,7 @@ function Sync:BroadcastSessionHeartbeat()
         coordEpoch  = self.state.coordEpoch,
         helpers     = self.state.helpers or {},
         authorMax   = self.state.authorMax or {},
+        authorWindowSummary = self.state.authorWindowSummary or {},
         sentAt      = self:_Now(),
         safeMode    = self:_GetSessionSafeModePayload(),
     }

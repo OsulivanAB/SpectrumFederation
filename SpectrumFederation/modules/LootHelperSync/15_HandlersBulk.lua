@@ -191,17 +191,38 @@ function Sync:HandleAuthLogs(sender, payload)
 
     -- Metrics: measure merge duration
     local t0 = debugprofilestop and debugprofilestop() or nil
-    local changed = self:MergeLogs(payload.profileId, payload.logs)
+    local allowReplaceExisting = (req.meta and req.meta.integrityRepair == true)
+        and (
+            (self.state.isCoordinator and self:IsSenderAuthorized(payload.profileId, sender))
+            or self:_SamePlayer(sender, self.state.coordinator)
+        )
+    local changed, mergeDetails = self:MergeLogs(payload.profileId, payload.logs, {
+        allowReplaceExisting = allowReplaceExisting,
+    })
     if t0 then
         self:_MObserve("sync.merge.auth_logs.merge_ms", debugprofilestop() - t0)
     end
 
-    if changed then
+    if mergeDetails and mergeDetails.mismatchCount and mergeDetails.mismatchCount > 0 and SF.Debug then
+        SF.Debug:Warn("SYNC", "AUTH_LOGS merge saw %d fingerprint mismatches for request %s (allowReplace=%s)",
+            mergeDetails.mismatchCount, tostring(payload.requestId), tostring(allowReplaceExisting))
+    end
+
+    if changed or (mergeDetails and (mergeDetails.replaced or 0) > 0) then
         -- Metrics: measure rebuild duration
         local t1 = debugprofilestop and debugprofilestop() or nil
         self:RebuildProfile(payload.profileId, "auth_logs")
         if t1 then
             self:_MObserve("sync.merge.auth_logs.rebuild_ms", debugprofilestop() - t1)
+        end
+
+        if self.state.isCoordinator
+            and payload.profileId == self.state.profileId
+            and req.meta
+            and req.meta.integrityRepair == true
+        then
+            self.state.authorWindowSummary = self:ComputeAuthorWindowSummary(payload.profileId)
+            self:BroadcastSessionHeartbeat()
         end
     end
 
@@ -361,7 +382,10 @@ function Sync:HandleProfileSnapshot(sender, payload)
 
     -- Metrics: measure import duration
     local t0 = debugprofilestop and debugprofilestop() or nil
-    local okImport, inserted, importErr = profile:ImportSnapshot(payload.snapshot, { allowUnknownEventType = true })
+    local okImport, inserted, importErr = profile:ImportSnapshot(payload.snapshot, {
+        allowUnknownEventType = true,
+        allowReplaceExisting = true,
+    })
     if t0 then
         self:_MObserve("sync.merge.profile_snapshot.import_ms", debugprofilestop() - t0)
     end
