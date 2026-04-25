@@ -1583,8 +1583,9 @@ local function ShouldWhisper(mode, cfg)
 end
 
 local function GetPreRaidWhisperSessionKey()
-	if SF.LootHelperSync and type(SF.LootHelperSync.GetSessionId) == "function" then
-		local sessionId = SF.LootHelperSync:GetSessionId()
+	local sync = SF.LootHelperSync
+	if sync and type(sync.GetSessionId) == "function" then
+		local sessionId = sync.GetSessionId(sync)
 		if type(sessionId) == "string" and sessionId ~= "" then
 			return "loot:" .. sessionId
 		end
@@ -1676,7 +1677,10 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
-		local alreadyWhispered = mode == "pre" and RC:HasSentPreRaidWhisper(result.id or whisperTarget)
+		local alreadyWhispered = false
+		if mode == "pre" then
+			alreadyWhispered = RC:HasSentPreRaidWhisper(result.id or whisperTarget)
+		end
 		if whisper and not alreadyWhispered then
 			WhisperMissing(whisperTarget, pointName, list, mode)
 			result.whisperedMissing = true
