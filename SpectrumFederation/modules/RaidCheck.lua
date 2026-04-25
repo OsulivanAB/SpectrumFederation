@@ -478,7 +478,7 @@ local function GetEquipmentSnapshotAgeSeconds(snapshot)
 	end
 
 	local updatedAt = snapshot and snapshot.updatedAt or nil
-	if type(updatedAt) ~= "number" or updatedAt < 0 then
+	if type(updatedAt) ~= "number" or updatedAt <= 0 then
 		return nil
 	end
 
@@ -492,7 +492,7 @@ end
 
 local function IsEquipmentSnapshotFresh(snapshot)
 	local ageSeconds = GetEquipmentSnapshotAgeSeconds(snapshot)
-	return type(ageSeconds) == "number" and ageSeconds <= EQUIPMENT_SNAPSHOT_MAX_AGE_SECONDS
+	return ageSeconds ~= nil and ageSeconds <= EQUIPMENT_SNAPSHOT_MAX_AGE_SECONDS
 end
 
 local function FindUnitByGuidOrId(guid, id)
