@@ -468,16 +468,26 @@ end
 
 local function GetEquipmentSnapshotAgeSeconds(snapshot)
 	local capturedAt = snapshot and snapshot.capturedAt or nil
-	if type(capturedAt) ~= "number" or capturedAt <= 0 then
+	if type(capturedAt) == "number" and capturedAt > 0 then
+		local now = GetServerTime and GetServerTime() or nil
+		if type(now) ~= "number" or now < capturedAt then
+			return nil
+		end
+
+		return math.max(0, now - capturedAt)
+	end
+
+	local updatedAt = snapshot and snapshot.updatedAt or nil
+	if type(updatedAt) ~= "number" or updatedAt < 0 then
 		return nil
 	end
 
-	local now = GetServerTime and GetServerTime() or nil
-	if type(now) ~= "number" or now < capturedAt then
+	local now = GetTime and GetTime() or nil
+	if type(now) ~= "number" or now < updatedAt then
 		return nil
 	end
 
-	return math.max(0, now - capturedAt)
+	return math.max(0, now - updatedAt)
 end
 
 local function IsEquipmentSnapshotFresh(snapshot)
