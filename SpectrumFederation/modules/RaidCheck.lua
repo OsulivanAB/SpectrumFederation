@@ -1598,6 +1598,8 @@ local function HasEquipmentData(slotsByInventory)
 		return false
 	end
 
+	-- Count any populated slot metadata as usable inspect data so raid checks do
+	-- not treat an empty placeholder snapshot as a real equipment capture.
 	for _, slotData in pairs(slotsByInventory) do
 		if type(slotData) == "table" and (slotData.link or slotData.texture or tonumber(slotData.itemLevel)) then
 			return true
@@ -1674,15 +1676,15 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
-		local preRaidWhisperAlreadySent = mode == "pre" and RC:HasSentPreRaidWhisper(result.id or whisperTarget)
-		if whisper and not preRaidWhisperAlreadySent then
+		local alreadyWhispered = mode == "pre" and RC:HasSentPreRaidWhisper(result.id or whisperTarget)
+		if whisper and not alreadyWhispered then
 			WhisperMissing(whisperTarget, pointName, list, mode)
 			result.whisperedMissing = true
 			if mode == "pre" then
 				RC:MarkPreRaidWhisperSent(result.id or whisperTarget)
 				suffix = " (whispered)"
 			end
-		elseif whisper and preRaidWhisperAlreadySent and mode == "pre" then
+		elseif whisper and alreadyWhispered and mode == "pre" then
 			suffix = " (already whispered this session)"
 		end
 		SF:PrintWarning(("%s Missing: %s%s"):format(result.displayName, list, suffix))
