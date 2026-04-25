@@ -1585,7 +1585,7 @@ end
 local function GetPreRaidWhisperSessionKey()
 	local sync = SF.LootHelperSync
 	if sync and type(sync.GetSessionId) == "function" then
-		local sessionId = sync.GetSessionId(sync)
+		local sessionId = sync:GetSessionId()
 		if type(sessionId) == "string" and sessionId ~= "" then
 			return "loot:" .. sessionId
 		end
@@ -1602,8 +1602,9 @@ local function HasEquipmentData(slotsByInventory)
 	-- Count any populated slot metadata as usable inspect data so raid checks do
 	-- not treat an empty placeholder snapshot as a real equipment capture.
 	for _, slotData in pairs(slotsByInventory) do
-		local itemLevel = type(slotData) == "table" and tonumber(slotData.itemLevel) or nil
-		if type(slotData) == "table" and (slotData.link or slotData.texture or itemLevel ~= nil) then
+		local isSlotData = type(slotData) == "table"
+		local itemLevel = isSlotData and tonumber(slotData.itemLevel) or nil
+		if isSlotData and (slotData.link or slotData.texture or itemLevel ~= nil) then
 			return true
 		end
 	end
@@ -1678,16 +1679,16 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
-		local memberKey = result.id or whisperTarget
+		local memberIdentifier = result.id or whisperTarget
 		local alreadyWhispered = false
 		if mode == "pre" then
-			alreadyWhispered = RC:HasSentPreRaidWhisper(memberKey)
+			alreadyWhispered = RC:HasSentPreRaidWhisper(memberIdentifier)
 		end
 		if whisper and not alreadyWhispered then
 			WhisperMissing(whisperTarget, pointName, list, mode)
 			result.whisperedMissing = true
 			if mode == "pre" then
-				RC:MarkPreRaidWhisperSent(memberKey)
+				RC:MarkPreRaidWhisperSent(memberIdentifier)
 				suffix = " (whispered)"
 			end
 		elseif whisper and alreadyWhispered and mode == "pre" then
