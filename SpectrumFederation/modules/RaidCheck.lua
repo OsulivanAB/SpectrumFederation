@@ -1602,7 +1602,8 @@ local function HasEquipmentData(slotsByInventory)
 	-- Count any populated slot metadata as usable inspect data so raid checks do
 	-- not treat an empty placeholder snapshot as a real equipment capture.
 	for _, slotData in pairs(slotsByInventory) do
-		if type(slotData) == "table" and (slotData.link or slotData.texture or tonumber(slotData.itemLevel)) then
+		local itemLevel = type(slotData) == "table" and tonumber(slotData.itemLevel) or nil
+		if type(slotData) == "table" and (slotData.link or slotData.texture or itemLevel ~= nil) then
 			return true
 		end
 	end
@@ -1677,15 +1678,16 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
+		local memberKey = result.id or whisperTarget
 		local alreadyWhispered = false
 		if mode == "pre" then
-			alreadyWhispered = RC:HasSentPreRaidWhisper(result.id or whisperTarget)
+			alreadyWhispered = RC:HasSentPreRaidWhisper(memberKey)
 		end
 		if whisper and not alreadyWhispered then
 			WhisperMissing(whisperTarget, pointName, list, mode)
 			result.whisperedMissing = true
 			if mode == "pre" then
-				RC:MarkPreRaidWhisperSent(result.id or whisperTarget)
+				RC:MarkPreRaidWhisperSent(memberKey)
 				suffix = " (whispered)"
 			end
 		elseif whisper and alreadyWhispered and mode == "pre" then
