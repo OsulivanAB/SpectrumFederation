@@ -439,11 +439,11 @@ function Page:Build(panel)
 						minHeight = 320,
 						rowHeight = 22,
 						columns = {
-							{ key = "date", label = "Date", width = 170 },
-							{ key = "changeType", label = "Type of Change", width = 170 },
-							{ key = "member", label = "Member", width = 135 },
-							{ key = "action", label = "Action", width = 460 },
-							{ key = "author", label = "Author" },
+							{ key = "date", label = "Date", width = 155 },
+							{ key = "changeType", label = "Type of Change", width = 180 },
+							{ key = "member", label = "Member", width = 150 },
+							{ key = "action", label = "Action" },
+							{ key = "author", label = "Author", width = 165 },
 						},
 						emptyText = "No logs found matching the selected filters.\n\nCreate a profile and perform actions to see logs here.",
 						getRows = function()
