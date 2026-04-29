@@ -42,6 +42,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.6] - 2026-04-29
+
+### Fixed
+- Restored Loot Helper session state after using the `/reload` command to prevent loss of session data.
+
 ## [0.5.20-beta.5] - 2026-04-29
 
 ### Removed
