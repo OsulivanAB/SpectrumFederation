@@ -2,6 +2,133 @@ local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+local function GetLootHelperDB()
+    return SF.lootHelperDB or (SpectrumFederationDB and SpectrumFederationDB.lootHelper) or nil
+end
+
+local function CopyStringArray(values)
+    local copied = {}
+    if type(values) ~= "table" then
+        return copied
+    end
+
+    for i = 1, #values do
+        if type(values[i]) == "string" then
+            copied[#copied + 1] = values[i]
+        end
+    end
+
+    return copied
+end
+
+local function RequestLootWindowRefresh(reason)
+    local controller = SF.LootHelperWindow and SF.LootHelperWindow.Controller
+    if controller and type(controller.RequestRefresh) == "function" then
+        controller:RequestRefresh(reason or "SyncSessionStateChanged")
+    end
+end
+
+function Sync:_PersistSessionState(reason)
+    local db = GetLootHelperDB()
+    if not db then return end
+
+    if type(db.syncSession) ~= "table" then
+        db.syncSession = {}
+    end
+
+    local persisted = db.syncSession
+    if not (self.state and self.state.active) then
+        persisted.active = false
+        persisted.sessionId = nil
+        persisted.profileId = nil
+        persisted.coordinator = nil
+        persisted.coordEpoch = nil
+        persisted.helpers = nil
+        return
+    end
+
+    persisted.active = true
+    persisted.sessionId = self.state.sessionId
+    persisted.profileId = self.state.profileId
+    persisted.coordinator = self.state.coordinator
+    persisted.coordEpoch = tonumber(self.state.coordEpoch)
+    persisted.helpers = CopyStringArray(self.state.helpers)
+
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Persisted active session state (reason=%s, sessionId=%s, profileId=%s, coordinator=%s)",
+            tostring(reason), tostring(persisted.sessionId), tostring(persisted.profileId), tostring(persisted.coordinator))
+    end
+end
+
+function Sync:_ClearPersistedSessionState(reason)
+    local db = GetLootHelperDB()
+    if not db then return end
+
+    db.syncSession = {}
+
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Cleared persisted session state (reason=%s)", tostring(reason))
+    end
+end
+
+function Sync:TryRestorePersistedSession(reason)
+    if self.state and self.state.active then
+        return false
+    end
+
+    if not self:GetGroupDistribution() then
+        return false
+    end
+
+    local db = GetLootHelperDB()
+    local persisted = db and db.syncSession or nil
+    if type(persisted) ~= "table" or persisted.active ~= true then
+        return false
+    end
+
+    if type(persisted.sessionId) ~= "string" or persisted.sessionId == ""
+        or type(persisted.profileId) ~= "string" or persisted.profileId == ""
+        or type(persisted.coordinator) ~= "string" or persisted.coordinator == ""
+        or type(persisted.coordEpoch) ~= "number"
+    then
+        self:_ClearPersistedSessionState("invalid_persisted_state")
+        return false
+    end
+
+    self.state.active = true
+    self.state.sessionId = persisted.sessionId
+    self.state.profileId = persisted.profileId
+    self.state.coordinator = persisted.coordinator
+    self.state.coordEpoch = persisted.coordEpoch
+    self.state.isCoordinator = self:_SamePlayer(persisted.coordinator, self:_SelfId())
+    self.state.helpers = CopyStringArray(persisted.helpers)
+    self.state.authorMax = self.state.authorMax or {}
+    self.state.authorWindowSummary = self.state.authorWindowSummary or {}
+    self.state._sessionDescriptorAt = self:_Now()
+
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+    hb.lastHeartbeatAt = self:_Now()
+    hb.lastCoordMessageAt = self:_Now()
+    hb.missedHeartbeats = 0
+    hb.lastTakeoverRound = nil
+
+    self._restoredSessionNeedsReannounce = (self.state.isCoordinator == true)
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Restored persisted session state (reason=%s, sessionId=%s, profileId=%s, coordinator=%s, isCoordinator=%s)",
+            tostring(reason), tostring(self.state.sessionId), tostring(self.state.profileId),
+            tostring(self.state.coordinator), tostring(self.state.isCoordinator))
+    end
+
+    if not self.state.isCoordinator then
+        self:EnsureHeartbeatMonitor("RestorePersistedSession")
+    end
+
+    RequestLootWindowRefresh("RestorePersistedSession")
+    return true
+end
+
 
 -- Function Initialize sync system (state + transport + event wiring).
 -- @param cfg table|nil Optional config overrides (jitter/timeouts/retries).
@@ -53,6 +180,7 @@ function Sync:Enable()
     self._eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")  -- Entering Combat
 
     self:UpdatePeersFromRoster()
+    self:TryRestorePersistedSession("Enable")
     self:_EnforceGroupedSessionActive("Enable")
     self:EnsureHeartbeatSender("Enable")
     self:EnsureHeartbeatMonitor("Enable")
@@ -332,8 +460,14 @@ end
 function Sync:OnGroupRosterUpdate()
     -- Always keep per roster fresh
     self:UpdatePeersFromRoster()
+    self:TryRestorePersistedSession("OnGroupRosterUpdate")
 
     if not self:_EnforceGroupedSessionActive("OnGroupRosterUpdate") then return end
+
+    if self._restoredSessionNeedsReannounce and self.state and self.state.active and self.state.isCoordinator then
+        self._restoredSessionNeedsReannounce = false
+        self:ReannounceSession()
+    end
 
     -- Only the coordinator does late-join announcements
     if not(self.state and self.state.active and self.state.isCoordinator) then return end
@@ -417,9 +551,15 @@ end
 -- @return nil
 function Sync:OnPlayerEnteringWorld()
     self:UpdatePeersFromRoster()
+    self:TryRestorePersistedSession("PLAYER_ENTERING_WORLD")
 
     local dist = self:_EnforceGroupedSessionActive("PLAYER_ENTERING_WORLD")
     if not dist then return end
+
+    if self._restoredSessionNeedsReannounce and self.state and self.state.active and self.state.isCoordinator then
+        self._restoredSessionNeedsReannounce = false
+        self:ReannounceSession()
+    end
 
     self:EnsureHeartbeatSender("PLAYER_ENTERING-WORLD")
     self:EnsureHeartbeatMonitor("PLAYER_ENTERING-WORLD")
@@ -498,6 +638,7 @@ function Sync:StartSession(profileId, opts)
     self.state.coordinator = me
     self.state.coordEpoch = epoch
     self.state.isCoordinator = true
+    self:_PersistSessionState("StartSession")
 
     self:_ResetSessionSafeMode("StartSession")
     self:_ResetLocalSafeMode("StartSession")
@@ -554,6 +695,7 @@ function Sync:_ResetSessionState(reason)
     self.state.coordinator = nil
     self.state.coordEpoch = nil
     self.state.isCoordinator = false
+    self._restoredSessionNeedsReannounce = false
 
     -- Clear session metadata
     self.state.helpers = {}
@@ -613,6 +755,8 @@ function Sync:_ResetSessionState(reason)
     if SF.Debug then
         SF.Debug:Info("SYNC", "Session state reset (reason: %s)", tostring(reason or "unknown"))
     end
+
+    self:_ClearPersistedSessionState(reason or "ResetSessionState")
 end
 
 -- Function End the active session (optional broadcast).
@@ -709,6 +853,7 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
         newEpoch = oldEpoch + 1
     end
     self.state.coordEpoch = newEpoch
+    self:_PersistSessionState("TakeoverSession")
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Takeover session (sessionId=%s, profileId=%s, reason=%s, oldEpoch=%s, newEpoch=%s)",
@@ -769,6 +914,8 @@ function Sync:ReannounceSession()
             tostring(self.state.sessionId), tostring(profileId), tostring(self.state.coordinator),
             tostring(self.state.coordEpoch), helpersCount, authorMaxCount, tostring(safeModeEnabled))
     end
+
+    self:_PersistSessionState("ReannounceSession")
 
     -- restart handshake bookkeeping window
     self.state.handshake = {

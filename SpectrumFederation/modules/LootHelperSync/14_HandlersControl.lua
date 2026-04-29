@@ -248,6 +248,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
     self.state._sessionDescriptorAt = self:_Now()
+    if self._PersistSessionState then
+        self:_PersistSessionState("HandleSessionReannounce")
+    end
 
     if type(payload.safeMode) == "table" then
         self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_REANNOUNCE")
@@ -390,6 +393,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
     if not sameStream then
         self.state._sessionDescriptorAt = self:_Now()
+    end
+    if self._PersistSessionState then
+        self:_PersistSessionState("HandleSessionHeartbeat")
     end
 
     if wasCoordinator and not self.state.isCoordinator then

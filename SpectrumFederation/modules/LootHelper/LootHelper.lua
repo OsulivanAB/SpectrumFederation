@@ -13,6 +13,7 @@ function SF:InitializeLootHelperDatabase()
 			showMembersNotInRaid = false,
 
 			window = {},
+            syncSession = {},
 
             profiles = {},              -- Map: profileId -> LootProfile
             activeProfileId = nil       -- Active profile's stable ID
@@ -32,6 +33,9 @@ function SF:InitializeLootHelperDatabase()
 
 		if type(lh.window) ~= "table" then
 			lh.window = {}
+		end
+		if type(lh.syncSession) ~= "table" then
+			lh.syncSession = {}
 		end
     end
 
