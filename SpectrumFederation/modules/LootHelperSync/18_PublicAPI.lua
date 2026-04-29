@@ -77,7 +77,7 @@ function Sync:TryRestorePersistedSession(reason)
         self.state = {}
     end
 
-    if self.state and self.state.active then
+    if self.state.active then
         return false
     end
 
@@ -101,7 +101,8 @@ function Sync:TryRestorePersistedSession(reason)
     end
 
     -- Reset non-persisted session bookkeeping so restored sessions resume from a clean baseline.
-    -- Admin convergence is rebuilt from fresh coordinator traffic after restore, not from SavedVariables.
+    -- Admin convergence is rebuilt from fresh coordinator traffic after restore, and members fall back
+    -- to the normal heartbeat monitor until that traffic arrives.
     self.state.adminStatuses = {}
     self.state._adminConvergence = nil
     self.state.handshake = nil
@@ -127,6 +128,7 @@ function Sync:TryRestorePersistedSession(reason)
     hb.missedHeartbeats = 0
     hb.lastTakeoverRound = nil
 
+    -- One-shot marker so restored coordinators re-announce exactly once when world/group events settle.
     self.state._restoredSessionNeedsReannounce = self.state.isCoordinator
 
     if SF.Debug then
