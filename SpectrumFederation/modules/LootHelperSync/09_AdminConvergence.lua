@@ -482,6 +482,7 @@ function Sync:BroadcastSessionStart()
         
         -- Now activate helpers - members can route requests to them
         self.state.helpers = chosenHelpers
+        self:_PersistSessionState("BroadcastSessionStart:HelpersReady")
         
         if SF.Debug then
             SF.Debug:Info("SYNC", "Helper preparation phase complete, helpers now active (count=%d)", #chosenHelpers)
