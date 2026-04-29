@@ -1302,17 +1302,25 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		self:_QueueInspectForUnit(unit, info, cacheEntry)
 	end
 
+	local isQueued = key and state.queued and state.queued[key] and true or false
+
 	if cacheEntry and cacheEntry.slotsByInventory then
-		local status = "stale"
-		local label = "Stale"
-		local message = "Showing cached inspect data while a fresh snapshot loads."
+		local status = "cached"
+		local label = "Cached"
+		local message = "Showing cached inspect data."
 
 		if pausedForCombat then
+			status = "paused"
 			label = "Paused"
 			message = "Showing cached inspect data until combat ends."
-		elseif activeKey == key then
+		elseif activeKey == key or isQueued then
 			status = "refreshing"
 			label = "Refreshing"
+			message = "Showing cached inspect data while a fresh snapshot loads."
+		elseif unit and not inRange then
+			status = "out_of_range"
+			label = "Out of range"
+			message = "Showing cached inspect data. Move closer to refresh this player."
 		end
 
 		return {
@@ -1323,7 +1331,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
-			stale = true,
+			stale = false,
 			cacheHolder = cacheEntry,
 		}
 	end
@@ -1337,13 +1345,9 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			status = "paused"
 			label = "Paused"
 			message = "Showing the saved profile snapshot until combat ends."
-		elseif activeKey == key then
+		elseif activeKey == key or isQueued then
 			status = "refreshing"
 			label = "Refreshing"
-			message = BuildSavedSnapshotMessage(profileSnapshot, true)
-		elseif canInspectNow then
-			status = "loading"
-			label = "Loading"
 			message = BuildSavedSnapshotMessage(profileSnapshot, true)
 		elseif unit and not inRange then
 			status = "out_of_range"
@@ -1359,7 +1363,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			averageItemLevel = profileSnapshot.averageItemLevel,
 			slotsByInventory = profileSnapshot.slotsByInventory,
 			entry = profileSnapshot,
-			stale = true,
+			stale = false,
 			cacheHolder = profileSnapshot,
 		}
 	end
