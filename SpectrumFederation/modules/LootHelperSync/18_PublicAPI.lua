@@ -2,6 +2,7 @@ local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+-- Return the initialized Loot Helper saved-variable table, or nil before DB setup completes.
 local function GetLootHelperDB()
     return (SpectrumFederationDB and SpectrumFederationDB.lootHelper) or SF.lootHelperDB
 end
@@ -96,6 +97,7 @@ function Sync:TryRestorePersistedSession(reason)
     end
 
     -- Reset non-persisted session bookkeeping so restored sessions resume from a clean baseline.
+    -- Admin convergence is rebuilt from fresh coordinator traffic after restore, not from SavedVariables.
     self.state.adminStatuses = {}
     self.state._adminConvergence = nil
     self.state.handshake = nil
