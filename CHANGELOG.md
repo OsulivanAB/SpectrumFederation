@@ -41,6 +41,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.5] - 2026-04-29
+
+### Removed
+- Removed the "Item" column from the Loot Logs settings page to simplify the log display.
+
 ## [0.5.20-beta.4] - 2026-04-25
 
 ### Added
