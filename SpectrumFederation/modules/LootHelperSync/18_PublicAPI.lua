@@ -81,7 +81,7 @@ function Sync:TryRestorePersistedSession(reason)
     end
 
     local db = GetLootHelperDB()
-    local persisted = db and db.syncSession or nil
+    local persisted = db and db.syncSession
     if type(persisted) ~= "table" or persisted.active ~= true then
         return false
     end
@@ -561,8 +561,8 @@ function Sync:OnPlayerEnteringWorld()
         self:ReannounceSession()
     end
 
-    self:EnsureHeartbeatSender("PLAYER_ENTERING-WORLD")
-    self:EnsureHeartbeatMonitor("PLAYER_ENTERING-WORLD")
+    self:EnsureHeartbeatSender("PLAYER_ENTERING_WORLD")
+    self:EnsureHeartbeatMonitor("PLAYER_ENTERING_WORLD")
 end
 
 -- Function Called when player enters combat.
