@@ -1669,6 +1669,12 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 		return result
 	end
 
+	if inspectState.stale then
+		result.inspectPending = inspectState.label or inspectState.status or "Stale"
+		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, result.inspectPending))
+		return result
+	end
+
 	if not (inspectState.isKnown and HasEquipmentData(inspectState.slotsByInventory)) then
 		result.inspectPending = inspectState and (inspectState.label or inspectState.status) or "Loading"
 		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, result.inspectPending))
