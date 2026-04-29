@@ -1322,6 +1322,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	local state = self:_GetInspectState()
 	local activeKey = state.active and state.active.key or nil
 	local key = aliases[1] or aliases[2]
+	local isInspectActiveOrReady = activeKey == key or canInspectNow
 
 	if canInspectNow then
 		self:_QueueInspectForUnit(unit, info, cacheEntry)
@@ -1336,7 +1337,10 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			status = "paused"
 			label = "Paused"
 			message = "Showing cached inspect data until combat ends."
-		elseif activeKey == key or canInspectNow then
+		elseif isInspectActiveOrReady then
+			-- Once an inspect can start (or is already active for this member),
+			-- keep showing the cached snapshot as stale/refreshing instead of
+			-- dropping back to an out-of-range style status.
 			status = "refreshing"
 			label = "Refreshing"
 		elseif not inRange then
@@ -1410,7 +1414,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
-	if activeKey == key or canInspectNow then
+	if isInspectActiveOrReady then
 		return {
 			status = "loading",
 			label = "Loading",
