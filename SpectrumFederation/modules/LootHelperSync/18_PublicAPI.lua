@@ -73,6 +73,10 @@ function Sync:_ClearPersistedSessionState(reason)
 end
 
 function Sync:TryRestorePersistedSession(reason)
+    if type(self.state) ~= "table" then
+        self.state = {}
+    end
+
     if self.state and self.state.active then
         return false
     end
@@ -123,7 +127,7 @@ function Sync:TryRestorePersistedSession(reason)
     hb.missedHeartbeats = 0
     hb.lastTakeoverRound = nil
 
-    self._restoredSessionNeedsReannounce = self.state.isCoordinator
+    self.state._restoredSessionNeedsReannounce = self.state.isCoordinator
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Restored persisted session state (reason=%s, sessionId=%s, profileId=%s, coordinator=%s, isCoordinator=%s)",
@@ -140,11 +144,11 @@ function Sync:TryRestorePersistedSession(reason)
 end
 
 function Sync:_ReannounceRestoredSessionIfNeeded()
-    if not (self._restoredSessionNeedsReannounce and self.state and self.state.active and self.state.isCoordinator) then
+    if not (self.state and self.state._restoredSessionNeedsReannounce and self.state.active and self.state.isCoordinator) then
         return
     end
 
-    self._restoredSessionNeedsReannounce = false
+    self.state._restoredSessionNeedsReannounce = false
     self:ReannounceSession()
 end
 
@@ -708,7 +712,7 @@ function Sync:_ResetSessionState(reason)
     self.state.coordinator = nil
     self.state.coordEpoch = nil
     self.state.isCoordinator = false
-    self._restoredSessionNeedsReannounce = false
+    self.state._restoredSessionNeedsReannounce = false
 
     -- Clear session metadata
     self.state.helpers = {}
