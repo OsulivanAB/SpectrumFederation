@@ -1302,7 +1302,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		self:_QueueInspectForUnit(unit, info, cacheEntry)
 	end
 
-	local isQueued = key and state.queued and state.queued[key] and true or false
+	local isQueued = not not (key and state.queued and state.queued[key])
 
 	if cacheEntry and cacheEntry.slotsByInventory then
 		local status = "cached"
@@ -1669,12 +1669,6 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 
 	if type(inspectState) ~= "table" then
 		result.inspectPending = "Unavailable"
-		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, result.inspectPending))
-		return result
-	end
-
-	if inspectState.stale then
-		result.inspectPending = inspectState.label or inspectState.status or "Waiting for fresh data"
 		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, result.inspectPending))
 		return result
 	end
