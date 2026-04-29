@@ -13,7 +13,7 @@ function SF:InitializeLootHelperDatabase()
 			showMembersNotInRaid = false,
 
 			window = {},
-            syncSession = {},
+            syncSession = {}, -- Active session snapshot persisted across /reload
 
             profiles = {},              -- Map: profileId -> LootProfile
             activeProfileId = nil       -- Active profile's stable ID

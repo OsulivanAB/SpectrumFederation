@@ -3,7 +3,7 @@ SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
 local function GetLootHelperDB()
-    return SF.lootHelperDB or (SpectrumFederationDB and SpectrumFederationDB.lootHelper) or nil
+    return (SpectrumFederationDB and SpectrumFederationDB.lootHelper) or SF.lootHelperDB
 end
 
 local function CopyStringArray(values)
@@ -95,6 +95,10 @@ function Sync:TryRestorePersistedSession(reason)
         return false
     end
 
+    -- Reset non-persisted session bookkeeping so restored sessions resume from a clean baseline.
+    self.state.adminStatuses = {}
+    self.state._adminConvergence = nil
+    self.state.handshake = nil
     self.state.active = true
     self.state.sessionId = persisted.sessionId
     self.state.profileId = persisted.profileId
@@ -102,18 +106,22 @@ function Sync:TryRestorePersistedSession(reason)
     self.state.coordEpoch = persisted.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(persisted.coordinator, self:_SelfId())
     self.state.helpers = CopyStringArray(persisted.helpers)
-    self.state.authorMax = self.state.authorMax or {}
-    self.state.authorWindowSummary = self.state.authorWindowSummary or {}
+    self.state.authorMax = {}
+    self.state.authorWindowSummary = {}
+    self.state._sentJoinStatusForSessionId = nil
+    self.state._sentJoinStatusType = nil
+    self.state._profileReqInFlight = nil
+    self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = self:_Now()
 
-    self.state.heartbeat = self.state.heartbeat or {}
+    self.state.heartbeat = {}
     local hb = self.state.heartbeat
     hb.lastHeartbeatAt = self:_Now()
     hb.lastCoordMessageAt = self:_Now()
     hb.missedHeartbeats = 0
     hb.lastTakeoverRound = nil
 
-    self._restoredSessionNeedsReannounce = (self.state.isCoordinator == true)
+    self._restoredSessionNeedsReannounce = self.state.isCoordinator
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Restored persisted session state (reason=%s, sessionId=%s, profileId=%s, coordinator=%s, isCoordinator=%s)",
@@ -127,6 +135,15 @@ function Sync:TryRestorePersistedSession(reason)
 
     RequestLootWindowRefresh("RestorePersistedSession")
     return true
+end
+
+function Sync:_ReannounceRestoredSessionIfNeeded()
+    if not (self._restoredSessionNeedsReannounce and self.state and self.state.active and self.state.isCoordinator) then
+        return
+    end
+
+    self._restoredSessionNeedsReannounce = false
+    self:ReannounceSession()
 end
 
 
@@ -464,10 +481,7 @@ function Sync:OnGroupRosterUpdate()
 
     if not self:_EnforceGroupedSessionActive("OnGroupRosterUpdate") then return end
 
-    if self._restoredSessionNeedsReannounce and self.state and self.state.active and self.state.isCoordinator then
-        self._restoredSessionNeedsReannounce = false
-        self:ReannounceSession()
-    end
+    self:_ReannounceRestoredSessionIfNeeded()
 
     -- Only the coordinator does late-join announcements
     if not(self.state and self.state.active and self.state.isCoordinator) then return end
@@ -556,10 +570,7 @@ function Sync:OnPlayerEnteringWorld()
     local dist = self:_EnforceGroupedSessionActive("PLAYER_ENTERING_WORLD")
     if not dist then return end
 
-    if self._restoredSessionNeedsReannounce and self.state and self.state.active and self.state.isCoordinator then
-        self._restoredSessionNeedsReannounce = false
-        self:ReannounceSession()
-    end
+    self:_ReannounceRestoredSessionIfNeeded()
 
     self:EnsureHeartbeatSender("PLAYER_ENTERING_WORLD")
     self:EnsureHeartbeatMonitor("PLAYER_ENTERING_WORLD")
