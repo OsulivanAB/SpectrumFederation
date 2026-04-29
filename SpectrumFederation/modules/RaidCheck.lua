@@ -14,7 +14,7 @@ local RAID_CHECK_REASON = "RAID_CHECK"
 local RAID_CHECK_POINT_AWARD = 0.5
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
-local INSPECT_CACHE_TTL_SECONDS = 30
+local INSPECT_CACHE_TTL_SECONDS = 30 -- Background recheck cadence for live inspect data.
 local EQUIPMENT_SNAPSHOT_MAX_AGE_SECONDS = 24 * 60 * 60
 local INSPECT_RETRY_BASE_SECONDS = 2
 local INSPECT_RETRY_MAX_SECONDS = 10
@@ -1322,27 +1322,26 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	local state = self:_GetInspectState()
 	local activeKey = state.active and state.active.key or nil
 	local key = aliases[1] or aliases[2]
-	local isInspectActiveOrReady = activeKey == key or canInspectNow
+	local isInspectActive = activeKey == key
+	local hasInspectActivity = isInspectActive or canInspectNow
 
 	if canInspectNow then
 		self:_QueueInspectForUnit(unit, info, cacheEntry)
 	end
 
 	if hasFreshCachedSnapshot then
-		local status = "stale"
-		local label = "Stale"
-		local message = "Showing cached inspect data while a fresh snapshot loads."
+		local status = "ready"
+		local label = nil
+		local message = nil
 
 		if pausedForCombat then
 			status = "paused"
 			label = "Paused"
 			message = "Showing cached inspect data until combat ends."
-		elseif isInspectActiveOrReady then
-			-- Once an inspect can start (or is already active for this member),
-			-- keep showing the cached snapshot as stale/refreshing instead of
-			-- dropping back to an out-of-range style status.
+		elseif isInspectActive then
 			status = "refreshing"
 			label = "Refreshing"
+			message = "Showing cached inspect data while a fresh snapshot loads."
 		elseif not inRange then
 			message = "Showing cached inspect data. Move closer to refresh this player."
 		end
@@ -1355,7 +1354,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
-			stale = true,
+			stale = false,
 			cacheHolder = cacheEntry,
 		}
 	end
@@ -1414,7 +1413,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
-	if isInspectActiveOrReady then
+	if hasInspectActivity then
 		return {
 			status = "loading",
 			label = "Loading",
