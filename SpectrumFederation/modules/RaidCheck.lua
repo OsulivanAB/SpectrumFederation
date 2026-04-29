@@ -1670,7 +1670,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	end
 
 	if inspectState.stale then
-		result.inspectPending = inspectState.label or inspectState.status or "Stale"
+		result.inspectPending = inspectState.label or inspectState.status or "Waiting for fresh data"
 		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, result.inspectPending))
 		return result
 	end
@@ -1685,16 +1685,16 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
-		local memberIdentifier = result.id or whisperTarget
+		local whisperDedupeKey = result.id or whisperTarget
 		local alreadyWhispered = false
 		if mode == "pre" then
-			alreadyWhispered = RC:HasSentPreRaidWhisper(memberIdentifier)
+			alreadyWhispered = RC:HasSentPreRaidWhisper(whisperDedupeKey)
 		end
 		if whisper and not alreadyWhispered then
 			WhisperMissing(whisperTarget, pointName, list, mode)
 			result.whisperedMissing = true
 			if mode == "pre" then
-				RC:MarkPreRaidWhisperSent(memberIdentifier)
+				RC:MarkPreRaidWhisperSent(whisperDedupeKey)
 				suffix = " (whispered)"
 			end
 		elseif whisper and alreadyWhispered and mode == "pre" then
