@@ -314,8 +314,12 @@ local function IsSelfUnit(unit)
 		return true
 	end
 
-	if UnitExists and UnitIsUnit and UnitExists(unit) then
-		return UnitIsUnit(unit, "player") and true or false
+	if UnitGUID then
+		local playerGUID = UnitGUID("player")
+		local unitGUID = UnitGUID(unit)
+		if playerGUID and unitGUID and unitGUID == playerGUID then
+			return true
+		end
 	end
 
 	return false
