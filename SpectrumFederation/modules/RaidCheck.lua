@@ -1328,12 +1328,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	local activeKey = state.active and state.active.key or nil
 	local key = aliases[1] or aliases[2]
 	local isInspectActive = activeKey == key
-<<<<<<< HEAD
 	local isQueued = not not (key and state.queued and state.queued[key])
 	local hasInspectActivity = isInspectActive or isQueued or canInspectNow
-=======
-	local hasInspectActivity = isInspectActive or canInspectNow
->>>>>>> origin/beta
 
 	if canInspectNow then
 		self:_QueueInspectForUnit(unit, info, cacheEntry)
