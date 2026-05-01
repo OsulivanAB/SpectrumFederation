@@ -15,6 +15,7 @@ local RAID_CHECK_POINT_AWARD = 0.5
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
 local INSPECT_CACHE_TTL_SECONDS = 30
+local PROFILE_SNAPSHOT_MAX_AUDIT_AGE_SECONDS = 86400
 local INSPECT_RETRY_BASE_SECONDS = 2
 local INSPECT_RETRY_MAX_SECONDS = 10
 local INSPECT_REQUEST_TIMEOUT_SECONDS = 1.5
@@ -491,6 +492,20 @@ local function BuildSavedSnapshotMessage(snapshot, whileRefreshing)
 	end
 
 	return string.format("%s Last seen %dd ago.", baseMessage, math.floor(ageSeconds / 86400))
+end
+
+local function IsProfileSnapshotUsableForAudit(snapshot)
+	local capturedAt = snapshot and snapshot.capturedAt or nil
+	if type(capturedAt) ~= "number" or capturedAt <= 0 then
+		return false
+	end
+
+	local now = GetServerTime and GetServerTime() or nil
+	if type(now) ~= "number" or now < capturedAt then
+		return false
+	end
+
+	return (now - capturedAt) <= PROFILE_SNAPSHOT_MAX_AUDIT_AGE_SECONDS
 end
 
 local function FindUnitByGuidOrId(guid, id)
@@ -1336,7 +1351,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
-	if profileSnapshot and profileSnapshot.slotsByInventory then
+	if profileSnapshot and profileSnapshot.slotsByInventory and IsProfileSnapshotUsableForAudit(profileSnapshot) then
 		local status = "saved"
 		local label = "Saved"
 		local message = BuildSavedSnapshotMessage(profileSnapshot, false)
