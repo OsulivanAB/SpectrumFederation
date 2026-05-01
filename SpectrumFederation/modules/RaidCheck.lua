@@ -578,6 +578,7 @@ function RC:_GetInspectState()
 		active = nil,
 		inspectPausedForCombat = false,
 		localSnapshot = nil,
+		preRaidWhispers = nil,
 		snapshotVersion = 0,
 		lastNotifiedVersion = -1,
 		backgroundMonitorStarted = false,
@@ -1327,7 +1328,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	local activeKey = state.active and state.active.key or nil
 	local key = aliases[1] or aliases[2]
 	local isInspectActive = activeKey == key
-	local hasInspectActivity = isInspectActive or canInspectNow
+	local isQueued = not not (key and state.queued and state.queued[key])
+	local hasInspectActivity = isInspectActive or isQueued or canInspectNow
 
 	if canInspectNow then
 		self:_QueueInspectForUnit(unit, info, cacheEntry)
@@ -1342,7 +1344,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			status = "paused"
 			label = "Paused"
 			message = "Showing cached inspect data until combat ends."
-		elseif isInspectActive then
+		elseif isInspectActive or isQueued then
 			status = "refreshing"
 			label = "Refreshing"
 			message = "Showing cached inspect data while a fresh snapshot loads."
@@ -1372,11 +1374,11 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			status = "paused"
 			label = "Paused"
 			message = "Showing the saved profile snapshot until combat ends."
-		elseif activeKey == key then
+		elseif isInspectActive then
 			status = "refreshing"
 			label = "Refreshing"
 			message = BuildSavedSnapshotMessage(profileSnapshot, true)
-		elseif canInspectNow then
+		elseif isQueued or canInspectNow then
 			status = "loading"
 			label = "Loading"
 			message = BuildSavedSnapshotMessage(profileSnapshot, true)
@@ -1615,6 +1617,74 @@ local function ShouldWhisper(mode, cfg)
 	return cfg.enableWhispersRaid
 end
 
+local function GetPreRaidWhisperSessionKey()
+	local sync = SF.LootHelperSync
+	if sync and type(sync.GetSessionId) == "function" then
+		local sessionId = sync:GetSessionId()
+		if type(sessionId) == "string" and sessionId ~= "" then
+			return "loot:" .. sessionId
+		end
+	end
+
+	return "runtime"
+end
+
+local function HasEquipmentData(slotsByInventory)
+	if type(slotsByInventory) ~= "table" then
+		return false
+	end
+
+	-- Count any populated slot metadata as usable inspect data so raid checks do
+	-- not treat an empty placeholder snapshot as a real equipment capture.
+	for _, slotData in pairs(slotsByInventory) do
+		local isSlotData = type(slotData) == "table"
+		local itemLevel = isSlotData and tonumber(slotData.itemLevel) or nil
+		if isSlotData and (slotData.link or slotData.texture or itemLevel ~= nil) then
+			return true
+		end
+	end
+
+	return false
+end
+
+function RC:_GetPreRaidWhisperTracker()
+	local state = self:_GetInspectState()
+	local tracker = state.preRaidWhispers
+	if type(tracker) ~= "table" then
+		tracker = {
+			sessionKey = nil,
+			sent = {},
+		}
+		state.preRaidWhispers = tracker
+	end
+
+	local sessionKey = GetPreRaidWhisperSessionKey()
+	if tracker.sessionKey ~= sessionKey then
+		tracker.sessionKey = sessionKey
+		tracker.sent = {}
+	end
+
+	return tracker
+end
+
+function RC:HasSentPreRaidWhisper(memberId)
+	if type(memberId) ~= "string" or memberId == "" then
+		return false
+	end
+
+	local tracker = self:_GetPreRaidWhisperTracker()
+	return tracker.sent[memberId] == true
+end
+
+function RC:MarkPreRaidWhisperSent(memberId)
+	if type(memberId) ~= "string" or memberId == "" then
+		return
+	end
+
+	local tracker = self:_GetPreRaidWhisperTracker()
+	tracker.sent[memberId] = true
+end
+
 local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	local inspectState = RC:_GetTroubleshootingInspectState(unitInfo.unit, unitInfo)
 	local whisper = ShouldWhisper(mode, cfg)
@@ -1634,7 +1704,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 		return result
 	end
 
-	if not (inspectState.isKnown and inspectState.slotsByInventory) then
+	if not (inspectState.isKnown and HasEquipmentData(inspectState.slotsByInventory)) then
 		result.inspectPending = inspectState and (inspectState.label or inspectState.status) or "Loading"
 		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, result.inspectPending))
 		return result
@@ -1644,12 +1714,20 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
-		if whisper then
+		local whisperDedupeKey = result.id or whisperTarget
+		local alreadyWhispered = false
+		if mode == "pre" then
+			alreadyWhispered = RC:HasSentPreRaidWhisper(whisperDedupeKey)
+		end
+		if whisper and not alreadyWhispered then
 			WhisperMissing(whisperTarget, pointName, list, mode)
 			result.whisperedMissing = true
 			if mode == "pre" then
+				RC:MarkPreRaidWhisperSent(whisperDedupeKey)
 				suffix = " (whispered)"
 			end
+		elseif whisper and alreadyWhispered and mode == "pre" then
+			suffix = " (already whispered this session)"
 		end
 		SF:PrintWarning(("%s Missing: %s%s"):format(result.displayName, list, suffix))
 		result.missing = list
