@@ -58,6 +58,7 @@ function Sync:HandleSessionStart(sender, payload)
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
     self.state._sessionDescriptorAt = self:_Now()
+    self:_PersistSessionState("HandleSessionStart")
 
     if type(payload.safeMode) == "table" then
         self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_START")

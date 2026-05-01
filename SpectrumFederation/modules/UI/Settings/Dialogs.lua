@@ -106,6 +106,8 @@ function Dialogs:Prompt(message, acceptText, defaultText, onAccept)
 end
 
 local TRANSFER_KEY = "SF_SETTINGS_MEMBER_TRANSFER"
+local TRANSFER_CONTENT_WIDTH = 360
+local transferPopupContent
 
 local function SameMember(a, b)
     if SF.NameUtil and SF.NameUtil.SamePlayer then
@@ -127,115 +129,74 @@ local function FindOptionLabel(options, value)
     return nil
 end
 
-local function EnsureTransferPopupWidgets(popup)
-    if popup.__sfTransferWidgetsReady then
+local function EnsureTransferPopupContent()
+    if transferPopupContent then
+        return transferPopupContent
+    end
+
+    local content = CreateFrame("Frame", nil, UIParent)
+    content:SetSize(TRANSFER_CONTENT_WIDTH, 1)
+    content:Hide()
+
+    content.sourceLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    content.sourceLabel:SetText("Transfer points from")
+
+    content.sourceDropdown = CreateFrame("DropdownButton", nil, content, "WowStyle1DropdownTemplate")
+    content.sourceDropdown:SetDefaultText("Select member")
+
+    content.targetLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+    content.targetLabel:SetText("Transfer points to")
+
+    content.targetDropdown = CreateFrame("DropdownButton", nil, content, "WowStyle1DropdownTemplate")
+    content.targetDropdown:SetDefaultText("Select member")
+
+    content.validationText = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    content.validationText:SetJustifyH("LEFT")
+    content.validationText:SetJustifyV("TOP")
+    content.validationText:SetWidth(TRANSFER_CONTENT_WIDTH)
+
+    transferPopupContent = content
+    return content
+end
+
+local function LayoutTransferPopupContent(content)
+    if not content then
         return
     end
 
-    popup:SetWidth(420)
+    content.sourceLabel:ClearAllPoints()
+    content.sourceLabel:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
 
-    popup.sourceLabel = popup:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    popup.sourceLabel:SetText("Transfer points from")
+    content.sourceDropdown:ClearAllPoints()
+    content.sourceDropdown:SetPoint("TOPLEFT", content.sourceLabel, "BOTTOMLEFT", 0, -4)
+    content.sourceDropdown:SetWidth(TRANSFER_CONTENT_WIDTH)
 
-    popup.sourceDropdown = CreateFrame("DropdownButton", nil, popup, "WowStyle1DropdownTemplate")
-    popup.sourceDropdown:SetDefaultText("Select member")
+    content.targetLabel:ClearAllPoints()
+    content.targetLabel:SetPoint("TOPLEFT", content.sourceDropdown, "BOTTOMLEFT", 0, -10)
 
-    popup.targetLabel = popup:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    popup.targetLabel:SetText("Transfer points to")
+    content.targetDropdown:ClearAllPoints()
+    content.targetDropdown:SetPoint("TOPLEFT", content.targetLabel, "BOTTOMLEFT", 0, -4)
+    content.targetDropdown:SetWidth(TRANSFER_CONTENT_WIDTH)
 
-    popup.targetDropdown = CreateFrame("DropdownButton", nil, popup, "WowStyle1DropdownTemplate")
-    popup.targetDropdown:SetDefaultText("Select member")
+    content.validationText:ClearAllPoints()
+    content.validationText:SetPoint("TOPLEFT", content.targetDropdown, "BOTTOMLEFT", 0, -10)
 
-    popup.validationText = popup:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    popup.validationText:SetJustifyH("LEFT")
-    popup.validationText:SetJustifyV("TOP")
-
-    popup.__sfTransferWidgetsReady = true
-end
-
-local function LayoutTransferPopup(popup)
-    local sideInset = 18
-    local contentWidth = popup:GetWidth() - (sideInset * 2)
-
-    if popup.text then
-        popup.text:ClearAllPoints()
-        popup.text:SetPoint("TOPLEFT", popup, "TOPLEFT", sideInset, -22)
-        popup.text:SetPoint("TOPRIGHT", popup, "TOPRIGHT", -sideInset, -22)
-        popup.text:SetWidth(contentWidth)
-        popup.text:SetJustifyH("CENTER")
+    local sourceLabelHeight = content.sourceLabel:GetStringHeight() or 0
+    local sourceDropdownHeight = content.sourceDropdown:GetHeight() or 0
+    local targetLabelHeight = content.targetLabel:GetStringHeight() or 0
+    local targetDropdownHeight = content.targetDropdown:GetHeight() or 0
+    local validationHeight = 0
+    if content.validationText:GetText() ~= "" then
+        validationHeight = content.validationText:GetStringHeight() or 0
     end
 
-    if popup.sourceLabel then
-        popup.sourceLabel:ClearAllPoints()
-        popup.sourceLabel:SetPoint("TOPLEFT", popup.text, "BOTTOMLEFT", 0, -14)
-    end
-
-    if popup.sourceDropdown then
-        popup.sourceDropdown:ClearAllPoints()
-        popup.sourceDropdown:SetPoint("TOPLEFT", popup.sourceLabel, "BOTTOMLEFT", 0, -4)
-        popup.sourceDropdown:SetWidth(contentWidth)
-    end
-
-    if popup.targetLabel then
-        popup.targetLabel:ClearAllPoints()
-        popup.targetLabel:SetPoint("TOPLEFT", popup.sourceDropdown, "BOTTOMLEFT", 0, -10)
-    end
-
-    if popup.targetDropdown then
-        popup.targetDropdown:ClearAllPoints()
-        popup.targetDropdown:SetPoint("TOPLEFT", popup.targetLabel, "BOTTOMLEFT", 0, -4)
-        popup.targetDropdown:SetWidth(contentWidth)
-    end
-
-    if popup.validationText then
-        popup.validationText:ClearAllPoints()
-        popup.validationText:SetPoint("TOPLEFT", popup.targetDropdown, "BOTTOMLEFT", 0, -10)
-        popup.validationText:SetPoint("RIGHT", popup, "RIGHT", -sideInset, 0)
-    end
-
-    local buttonAnchor = popup.validationText
-    local buttonAnchorOffsetY = -14
-    if popup.validationText and popup.validationText:GetText() == "" then
-        buttonAnchor = popup.targetDropdown
-        buttonAnchorOffsetY = -24
-    end
-
-    if popup.button1 and buttonAnchor then
-        popup.button1:ClearAllPoints()
-        popup.button1:SetPoint("TOPRIGHT", buttonAnchor, "BOTTOM", -6, buttonAnchorOffsetY)
-    end
-
-    if popup.button2 and buttonAnchor then
-        popup.button2:ClearAllPoints()
-        popup.button2:SetPoint("TOPLEFT", buttonAnchor, "BOTTOM", 6, buttonAnchorOffsetY)
-    end
-
-    local textHeight = (popup.text and popup.text:GetStringHeight()) or 0
-    local sourceLabelHeight = (popup.sourceLabel and popup.sourceLabel:GetStringHeight()) or 0
-    local sourceDropdownHeight = (popup.sourceDropdown and popup.sourceDropdown:GetHeight()) or 0
-    local targetLabelHeight = (popup.targetLabel and popup.targetLabel:GetStringHeight()) or 0
-    local targetDropdownHeight = (popup.targetDropdown and popup.targetDropdown:GetHeight()) or 0
-    local validationHeight = (popup.validationText and popup.validationText:GetStringHeight()) or 0
-    local buttonHeight = 0
-
-    if popup.button1 then
-        buttonHeight = math.max(buttonHeight, popup.button1:GetHeight() or 0)
-    end
-    if popup.button2 then
-        buttonHeight = math.max(buttonHeight, popup.button2:GetHeight() or 0)
-    end
-
-    popup:SetHeight(math.max(
-        240,
-        22 + textHeight +
-        14 + sourceLabelHeight +
+    content:SetHeight(
+        sourceLabelHeight +
         4 + sourceDropdownHeight +
         10 + targetLabelHeight +
         4 + targetDropdownHeight +
-        10 + validationHeight +
-        14 + buttonHeight +
-        24
-    ))
+        10 + validationHeight
+    )
 end
 
 local function SetupTransferDropdown(dropdown, options, getValue, setValue)
@@ -273,10 +234,12 @@ local function SetupTransferDropdown(dropdown, options, getValue, setValue)
     end
 end
 
-local function UpdateTransferPopupState(popup)
-    local data = popup.data or {}
-    local sourceMemberId = popup.__sfSourceMemberId
-    local targetMemberId = popup.__sfTargetMemberId
+local function UpdateTransferPopupState(dialog)
+    local data = dialog.data or {}
+    local sourceMemberId = dialog.__sfSourceMemberId
+    local targetMemberId = dialog.__sfTargetMemberId
+    local content = dialog.insertedFrame or EnsureTransferPopupContent()
+    local button1 = dialog.GetButton1 and dialog:GetButton1() or dialog.button1
 
     local valid = true
     local message = ""
@@ -289,31 +252,34 @@ local function UpdateTransferPopupState(popup)
         message = "Source and target must be different characters."
     end
 
-    if popup.button1 then
+    if button1 then
         if valid then
-            popup.button1:Enable()
+            button1:Enable()
         else
-            popup.button1:Disable()
+            button1:Disable()
         end
     end
 
-    if popup.validationText then
-        popup.validationText:SetText(message)
+    if content.validationText then
+        content.validationText:SetText(message)
         if valid then
-            popup.validationText:SetTextColor(0.65, 0.65, 0.65)
+            content.validationText:SetTextColor(0.65, 0.65, 0.65)
         else
-            popup.validationText:SetTextColor(1, 0.2, 0.2)
+            content.validationText:SetTextColor(1, 0.2, 0.2)
         end
     end
 
-    if popup.sourceDropdown and popup.sourceDropdown.SetDefaultText then
-        popup.sourceDropdown:SetDefaultText(FindOptionLabel(data.sourceOptions, sourceMemberId) or "Select member")
+    if content.sourceDropdown and content.sourceDropdown.SetDefaultText then
+        content.sourceDropdown:SetDefaultText(FindOptionLabel(data.sourceOptions, sourceMemberId) or "Select member")
     end
-    if popup.targetDropdown and popup.targetDropdown.SetDefaultText then
-        popup.targetDropdown:SetDefaultText(FindOptionLabel(data.targetOptions, targetMemberId) or "Select member")
+    if content.targetDropdown and content.targetDropdown.SetDefaultText then
+        content.targetDropdown:SetDefaultText(FindOptionLabel(data.targetOptions, targetMemberId) or "Select member")
     end
 
-    LayoutTransferPopup(popup)
+    LayoutTransferPopupContent(content)
+    if dialog.Resize then
+        dialog:Resize()
+    end
 end
 
 if not StaticPopupDialogs[TRANSFER_KEY] then
@@ -327,14 +293,15 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         preferredIndex = 3,
 
         OnShow = function(self, data)
-            EnsureTransferPopupWidgets(self)
+            local content = self.insertedFrame or EnsureTransferPopupContent()
+            content:Show()
 
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
-            LayoutTransferPopup(self)
+            LayoutTransferPopupContent(content)
 
             SetupTransferDropdown(
-                self.sourceDropdown,
+                content.sourceDropdown,
                 data and data.sourceOptions or {},
                 function()
                     return self.__sfSourceMemberId
@@ -346,7 +313,7 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
             )
 
             SetupTransferDropdown(
-                self.targetDropdown,
+                content.targetDropdown,
                 data and data.targetOptions or {},
                 function()
                     return self.__sfTargetMemberId
@@ -370,8 +337,17 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         OnHide = function(self)
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
-            if self.validationText then
-                self.validationText:SetText("")
+            if self.insertedFrame and self.insertedFrame.validationText then
+                self.insertedFrame.validationText:SetText("")
+            end
+            if self.insertedFrame and self.insertedFrame.sourceDropdown and self.insertedFrame.sourceDropdown.SetDefaultText then
+                self.insertedFrame.sourceDropdown:SetDefaultText("Select member")
+            end
+            if self.insertedFrame and self.insertedFrame.targetDropdown and self.insertedFrame.targetDropdown.SetDefaultText then
+                self.insertedFrame.targetDropdown:SetDefaultText("Select member")
+            end
+            if self.insertedFrame then
+                LayoutTransferPopupContent(self.insertedFrame)
             end
         end,
     }
@@ -390,9 +366,10 @@ function Dialogs:TransferMemberHistory(message, acceptText, sourceOptions, targe
     end
 
     StaticPopupDialogs[TRANSFER_KEY].button1 = acceptText or ACCEPT
+    local content = EnsureTransferPopupContent()
     return StaticPopup_Show(TRANSFER_KEY, message, nil, {
         sourceOptions = sourceOptions or {},
         targetOptions = targetOptions or {},
         onAccept = onAccept,
-    }) ~= nil
+    }, content) ~= nil
 end

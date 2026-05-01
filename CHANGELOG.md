@@ -42,6 +42,23 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+
+## [0.5.20-beta.8] - 2026-05-01
+
+### Added
+- Equipment tab snapshots now persist for 24 hours, allowing users to view saved data even after extended periods.
+- Expired equipment snapshots are automatically blanked to ensure outdated data is not displayed.
+
+### Changed
+- Improved handling of cached equipment data to prioritize freshness and display appropriate messages for stale or out-of-range snapshots.
+- Enhanced UI layout for member transfer dialogs, including better validation and dropdown positioning.
+
+## [0.5.20-beta.6] - 2026-04-29
+
+### Fixed
+- Restored Loot Helper session state after using the `/reload` command to prevent loss of session data.
+
 ## [0.5.20-beta.5] - 2026-04-29
 
 ### Removed

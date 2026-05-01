@@ -414,6 +414,10 @@ end
 
 local function FormatAuditRowName(rowData)
 	local name = (rowData and (rowData.displayName or rowData.name)) or "?"
+	local status = rowData and rowData.inspectStatus
+	if status == "saved" or status == "paused" then
+		return name
+	end
 	local label = rowData and rowData.inspectLabel or nil
 	if not label or label == "" then
 		return name
