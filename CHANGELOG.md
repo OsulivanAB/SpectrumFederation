@@ -44,6 +44,16 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.9] - 2026-05-01
+
+### Added
+- Implemented tracking to deduplicate pre-raid check whispers, ensuring each member receives only one whisper per session.
+
+### Changed
+- Improved handling of equipment data during pre-raid checks to better identify valid equipment snapshots.
+- Enhanced messaging for pre-raid checks to indicate when a member has already been whispered during the current session.
+
 ## [0.5.20-beta.8] - 2026-05-01
 
 ### Added
