@@ -14,7 +14,8 @@ local RAID_CHECK_REASON = "RAID_CHECK"
 local RAID_CHECK_POINT_AWARD = 0.5
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
-local INSPECT_CACHE_TTL_SECONDS = 30
+local INSPECT_CACHE_TTL_SECONDS = 30 -- Background recheck cadence for live inspect data.
+local EQUIPMENT_SNAPSHOT_MAX_AGE_SECONDS = 24 * 60 * 60
 local INSPECT_RETRY_BASE_SECONDS = 2
 local INSPECT_RETRY_MAX_SECONDS = 10
 local INSPECT_REQUEST_TIMEOUT_SECONDS = 1.5
@@ -313,8 +314,12 @@ local function IsSelfUnit(unit)
 		return true
 	end
 
-	if UnitExists and UnitIsUnit and UnitExists(unit) then
-		return UnitIsUnit(unit, "player") and true or false
+	if UnitGUID then
+		local playerGUID = UnitGUID("player")
+		local unitGUID = UnitGUID(unit)
+		if playerGUID and unitGUID and unitGUID == playerGUID then
+			return true
+		end
 	end
 
 	return false
@@ -465,21 +470,43 @@ local function GetProfileEquipmentSnapshot(memberId)
 	return profile:GetRaidCheckEquipmentSnapshot(memberId)
 end
 
+local function GetEquipmentSnapshotAgeSeconds(snapshot)
+	local capturedAt = snapshot and snapshot.capturedAt or nil
+	if type(capturedAt) == "number" and capturedAt > 0 then
+		local now = GetServerTime and GetServerTime() or nil
+		if type(now) ~= "number" or now < capturedAt then
+			return nil
+		end
+
+		return math.max(0, now - capturedAt)
+	end
+
+	local updatedAt = snapshot and snapshot.updatedAt or nil
+	if type(updatedAt) ~= "number" or updatedAt <= 0 then
+		return nil
+	end
+
+	local now = GetTime and GetTime() or nil
+	if type(now) ~= "number" or now < updatedAt then
+		return nil
+	end
+
+	return math.max(0, now - updatedAt)
+end
+
+local function IsEquipmentSnapshotFresh(snapshot)
+	local ageSeconds = GetEquipmentSnapshotAgeSeconds(snapshot)
+	return ageSeconds ~= nil and ageSeconds <= EQUIPMENT_SNAPSHOT_MAX_AGE_SECONDS
+end
+
 local function BuildSavedSnapshotMessage(snapshot, whileRefreshing)
 	local baseMessage = whileRefreshing
 		and "Showing the saved profile snapshot while a fresh inspect loads."
 		or "Showing the last saved profile snapshot for this member."
-	local capturedAt = snapshot and snapshot.capturedAt or nil
-	if type(capturedAt) ~= "number" or capturedAt <= 0 then
+	local ageSeconds = GetEquipmentSnapshotAgeSeconds(snapshot)
+	if ageSeconds == nil then
 		return baseMessage
 	end
-
-	local now = GetServerTime and GetServerTime() or nil
-	if type(now) ~= "number" or now < capturedAt then
-		return baseMessage
-	end
-
-	local ageSeconds = math.max(0, now - capturedAt)
 	if ageSeconds < 60 then
 		return baseMessage .. " Last seen less than a minute ago."
 	end
@@ -551,6 +578,7 @@ function RC:_GetInspectState()
 		active = nil,
 		inspectPausedForCombat = false,
 		localSnapshot = nil,
+		preRaidWhispers = nil,
 		snapshotVersion = 0,
 		lastNotifiedVersion = -1,
 		backgroundMonitorStarted = false,
@@ -916,6 +944,7 @@ function RC:_HandleInspectReady(guid)
 		entry.lastAttemptAt = active.requestedAt
 		entry.nextRetryAt = nil
 		entry.updatedAt = now
+		entry.capturedAt = GetServerTime and GetServerTime() or nil
 		entry.averageItemLevel = captured.averageItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
 		PersistProfileEquipmentSnapshot(active.id, captured)
@@ -1278,6 +1307,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	local profileSnapshot = GetProfileEquipmentSnapshot(memberId)
 	local now = GetTime and GetTime() or 0
 	local hasFreshData = cacheEntry and cacheEntry.updatedAt and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
+	local hasFreshCachedSnapshot = cacheEntry and cacheEntry.slotsByInventory and IsEquipmentSnapshotFresh(cacheEntry)
+	local hasFreshProfileSnapshot = profileSnapshot and profileSnapshot.slotsByInventory and IsEquipmentSnapshotFresh(profileSnapshot)
 
 	if hasFreshData and cacheEntry.slotsByInventory then
 		return {
@@ -1296,22 +1327,29 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	local state = self:_GetInspectState()
 	local activeKey = state.active and state.active.key or nil
 	local key = aliases[1] or aliases[2]
+	local isInspectActive = activeKey == key
+	local isQueued = not not (key and state.queued and state.queued[key])
+	local hasInspectActivity = isInspectActive or isQueued or canInspectNow
 
 	if canInspectNow then
 		self:_QueueInspectForUnit(unit, info, cacheEntry)
 	end
 
-	if cacheEntry and cacheEntry.slotsByInventory then
-		local status = "stale"
-		local label = "Stale"
-		local message = "Showing cached inspect data while a fresh snapshot loads."
+	if hasFreshCachedSnapshot then
+		local status = "ready"
+		local label = nil
+		local message = nil
 
 		if pausedForCombat then
+			status = "paused"
 			label = "Paused"
 			message = "Showing cached inspect data until combat ends."
-		elseif activeKey == key then
+		elseif isInspectActive or isQueued then
 			status = "refreshing"
 			label = "Refreshing"
+			message = "Showing cached inspect data while a fresh snapshot loads."
+		elseif not inRange then
+			message = "Showing cached inspect data. Move closer to refresh this player."
 		end
 
 		return {
@@ -1322,32 +1360,30 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			averageItemLevel = cacheEntry.averageItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
-			stale = true,
+			stale = false,
 			cacheHolder = cacheEntry,
 		}
 	end
 
-	if profileSnapshot and profileSnapshot.slotsByInventory then
+	if hasFreshProfileSnapshot then
 		local status = "saved"
 		local label = "Saved"
 		local message = BuildSavedSnapshotMessage(profileSnapshot, false)
 
-		if pausedForCombat and unit then
+		if pausedForCombat then
 			status = "paused"
 			label = "Paused"
 			message = "Showing the saved profile snapshot until combat ends."
-		elseif activeKey == key then
+		elseif isInspectActive then
 			status = "refreshing"
 			label = "Refreshing"
 			message = BuildSavedSnapshotMessage(profileSnapshot, true)
-		elseif canInspectNow then
+		elseif isQueued or canInspectNow then
 			status = "loading"
 			label = "Loading"
 			message = BuildSavedSnapshotMessage(profileSnapshot, true)
-		elseif unit and not inRange then
-			status = "out_of_range"
-			label = "Out of range"
-			message = "Showing the saved profile snapshot. Move closer to refresh this player."
+		elseif not inRange then
+			message = BuildSavedSnapshotMessage(profileSnapshot, false) .. " Move closer to refresh this player."
 		end
 
 		return {
@@ -1383,7 +1419,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
-	if activeKey == key or canInspectNow then
+	if hasInspectActivity then
 		return {
 			status = "loading",
 			label = "Loading",
@@ -1581,6 +1617,74 @@ local function ShouldWhisper(mode, cfg)
 	return cfg.enableWhispersRaid
 end
 
+local function GetPreRaidWhisperSessionKey()
+	local sync = SF.LootHelperSync
+	if sync and type(sync.GetSessionId) == "function" then
+		local sessionId = sync:GetSessionId()
+		if type(sessionId) == "string" and sessionId ~= "" then
+			return "loot:" .. sessionId
+		end
+	end
+
+	return "runtime"
+end
+
+local function HasEquipmentData(slotsByInventory)
+	if type(slotsByInventory) ~= "table" then
+		return false
+	end
+
+	-- Count any populated slot metadata as usable inspect data so raid checks do
+	-- not treat an empty placeholder snapshot as a real equipment capture.
+	for _, slotData in pairs(slotsByInventory) do
+		local isSlotData = type(slotData) == "table"
+		local itemLevel = isSlotData and tonumber(slotData.itemLevel) or nil
+		if isSlotData and (slotData.link or slotData.texture or itemLevel ~= nil) then
+			return true
+		end
+	end
+
+	return false
+end
+
+function RC:_GetPreRaidWhisperTracker()
+	local state = self:_GetInspectState()
+	local tracker = state.preRaidWhispers
+	if type(tracker) ~= "table" then
+		tracker = {
+			sessionKey = nil,
+			sent = {},
+		}
+		state.preRaidWhispers = tracker
+	end
+
+	local sessionKey = GetPreRaidWhisperSessionKey()
+	if tracker.sessionKey ~= sessionKey then
+		tracker.sessionKey = sessionKey
+		tracker.sent = {}
+	end
+
+	return tracker
+end
+
+function RC:HasSentPreRaidWhisper(memberId)
+	if type(memberId) ~= "string" or memberId == "" then
+		return false
+	end
+
+	local tracker = self:_GetPreRaidWhisperTracker()
+	return tracker.sent[memberId] == true
+end
+
+function RC:MarkPreRaidWhisperSent(memberId)
+	if type(memberId) ~= "string" or memberId == "" then
+		return
+	end
+
+	local tracker = self:_GetPreRaidWhisperTracker()
+	tracker.sent[memberId] = true
+end
+
 local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	local inspectState = RC:_GetTroubleshootingInspectState(unitInfo.unit, unitInfo)
 	local whisper = ShouldWhisper(mode, cfg)
@@ -1600,7 +1704,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 		return result
 	end
 
-	if not (inspectState.isKnown and inspectState.slotsByInventory) then
+	if not (inspectState.isKnown and HasEquipmentData(inspectState.slotsByInventory)) then
 		result.inspectPending = inspectState and (inspectState.label or inspectState.status) or "Loading"
 		SF:PrintInfo(("%s Inspect pending: %s"):format(result.displayName, result.inspectPending))
 		return result
@@ -1610,12 +1714,20 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
-		if whisper then
+		local whisperDedupeKey = result.id or whisperTarget
+		local alreadyWhispered = false
+		if mode == "pre" then
+			alreadyWhispered = RC:HasSentPreRaidWhisper(whisperDedupeKey)
+		end
+		if whisper and not alreadyWhispered then
 			WhisperMissing(whisperTarget, pointName, list, mode)
 			result.whisperedMissing = true
 			if mode == "pre" then
+				RC:MarkPreRaidWhisperSent(whisperDedupeKey)
 				suffix = " (whispered)"
 			end
+		elseif whisper and alreadyWhispered and mode == "pre" then
+			suffix = " (already whispered this session)"
 		end
 		SF:PrintWarning(("%s Missing: %s%s"):format(result.displayName, list, suffix))
 		result.missing = list

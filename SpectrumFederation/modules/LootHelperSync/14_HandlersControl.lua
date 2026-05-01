@@ -55,6 +55,7 @@ function Sync:BuildAdminStatus(profileId)
     local status = {
         hasProfile = false,
         authorMax = {},
+        authorWindowSummary = {},
         hasGaps = false,
         addonVersion = self:_GetAddonVersion(),
 
@@ -73,6 +74,7 @@ function Sync:BuildAdminStatus(profileId)
 
     status.hasProfile = true
     status.authorMax = profile:ComputeAuthorMax() or {}
+    status.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or {}
 
     -- hasGaps heuristic: Check for non-contiguous sequences
     -- Instead of just counting, verify that counters 1..max all exist for each author
@@ -246,6 +248,7 @@ function Sync:HandleSessionReannounce(sender, payload)
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
     self.state._sessionDescriptorAt = self:_Now()
+    self:_PersistSessionState("HandleSessionReannounce")
 
     if type(payload.safeMode) == "table" then
         self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SES_REANNOUNCE")
@@ -256,6 +259,7 @@ function Sync:HandleSessionReannounce(sender, payload)
     end
 
     self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
+    self.state.authorWindowSummary = (type(payload.authorWindowSummary) == "table") and payload.authorWindowSummary or {}
     self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
 
     self.state.heartbeat = self.state.heartbeat or {}
@@ -387,6 +391,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
     if not sameStream then
         self.state._sessionDescriptorAt = self:_Now()
+        self:_PersistSessionState("HandleSessionHeartbeat")
     end
 
     if wasCoordinator and not self.state.isCoordinator then
@@ -407,6 +412,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
             end
         end
     end
+    if type(payload.authorWindowSummary) == "table" then
+        self.state.authorWindowSummary = payload.authorWindowSummary
+    end
 
     -- Heartbeat bookkeeping
     self.state.heartbeat = self.state.heartbeat or {}
@@ -416,6 +424,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     hb.missedHeartbeats = 0
 
     self:EnsureHeartbeatMonitor("HandleSessionHeartbeat")
+    self:EnsureRepairConvergence("HandleSessionHeartbeat")
 
     -- If coordinator/epoch/session changed, allow a re-evaluation
     if (not self:_SamePlayer(oldCoord, self.state.coordinator))
@@ -436,6 +445,34 @@ function Sync:HandleSessionHeartbeat(sender, payload)
 
     self:TouchPeer(sender, { inGroup = true })
 
+    if not self.state.isCoordinator and payload.integrityHint == "mutation" then
+        local advertisedRanges = {}
+        for _, range in ipairs(payload.mutationRanges or {}) do
+            if type(range) == "table"
+                and type(range.author) == "string"
+                and type(range.fromCounter) == "number"
+                and type(range.toCounter) == "number"
+            then
+                advertisedRanges[#advertisedRanges + 1] = {
+                    author = range.author,
+                    fromCounter = range.fromCounter,
+                    toCounter = range.toCounter,
+                    mode = "integrity",
+                    preferredTarget = sender,
+                }
+            end
+        end
+
+        if #advertisedRanges > 0 then
+            self:QueueRepairRanges(self.state.profileId, advertisedRanges, {
+                mode = "integrity",
+                reason = payload.mutationReason or "heartbeat-mutation",
+                preferredTarget = sender,
+                expedite = true,
+            })
+        end
+    end
+
     -- Catch-up logic:
     if not self.state.isCoordinator then
         local now = self:_Now()
@@ -455,6 +492,11 @@ function Sync:HandleSessionHeartbeat(sender, payload)
             local localContig = self:ComputeContigAuthorMax(self.state.profileId)   -- Bug: Don't we have our Authormax values saved? recalculating our Authormax maps every 30 seconds seems intense
             local remoteMax = self.state.authorMax or {}
             local missing = self:ComputeMissingLogRequests(localContig, remoteMax)
+            local integrityRanges = self:ComputeWindowMismatchRequests(
+                self.state.profileId,
+                self.state.authorWindowSummary or {},
+                localContig
+            )
 
             -- Filter out ranges already covered by outstanding requests
             local filtered = {}
@@ -472,7 +514,17 @@ function Sync:HandleSessionHeartbeat(sender, payload)
             end
 
             if #filtered > 0 then
-                self:RequestMissingLogs(filtered, "heartbeat-catchup")
+                self:QueueRepairRanges(self.state.profileId, filtered, {
+                    mode = "missing",
+                    reason = "heartbeat-catchup",
+                })
+            end
+            if integrityRanges and #integrityRanges > 0 then
+                self:QueueRepairRanges(self.state.profileId, integrityRanges, {
+                    mode = "integrity",
+                    reason = "heartbeat-integrity",
+                    preferredTarget = sender,
+                })
             end
         end
     end
@@ -550,12 +602,47 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     self:TouchPeer(sender, { inGroup = true })
 end
 
+function Sync:_HandlePeerIntegrityAdvertisement(sender, payload)
+    if not self.state.active or not self.state.isCoordinator then return end
+    if type(payload) ~= "table" then return end
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if payload.profileId ~= self.state.profileId then return end
+    if payload.integrityHint ~= "mutation" then return end
+    if not self:IsSenderAuthorized(payload.profileId, sender) then return end
+
+    local ranges = {}
+    for _, range in ipairs(payload.mutationRanges or {}) do
+        if type(range) == "table"
+            and type(range.author) == "string"
+            and type(range.fromCounter) == "number"
+            and type(range.toCounter) == "number"
+        then
+            ranges[#ranges + 1] = {
+                author = range.author,
+                fromCounter = range.fromCounter,
+                toCounter = range.toCounter,
+                mode = "integrity",
+            }
+        end
+    end
+
+    if #ranges > 0 then
+        self:QueueRepairRanges(payload.profileId, ranges, {
+            mode = "integrity",
+            reason = payload.mutationReason or "peer-mutation",
+            preferredTarget = sender,
+            expedite = true,
+        })
+    end
+end
+
 -- Function Handle HAVE_PROFILE as a helper/coordinator: record that peer has profile.
 -- @param sender string "Name-Realm" of sender
 -- @param payload table {sessionId, requestId, profileId}
 -- @return nil
 function Sync:HandleHaveProfile(sender, payload)
     self:_RecordHandshakeReply(sender, payload, "HAVE_PROFILE")
+    self:_HandlePeerIntegrityAdvertisement(sender, payload)
 end
 
 -- Function Handle NEED_PROFILE as a helper/coordinator: respond with PROFILE_SNAPSHOT (bulk).
@@ -574,6 +661,7 @@ function Sync:HandleNeedProfile(sender, payload)
     end
 
     self:_RecordHandshakeReply(sender, payload, "NEED_PROFILE")
+    self:_HandlePeerIntegrityAdvertisement(sender, payload)
 
     -- Coordinator handshake visibility without forcing a data response
     if payload.statusOnly == true then
@@ -689,6 +777,7 @@ function Sync:HandleNeedLogs(sender, payload)
     end
 
     self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
+    self:_HandlePeerIntegrityAdvertisement(sender, payload)
 
     -- Coordinator handshake visibility without forcing a data response
     if payload.statusOnly == true then

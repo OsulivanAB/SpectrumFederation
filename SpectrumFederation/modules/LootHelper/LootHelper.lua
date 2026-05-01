@@ -13,6 +13,7 @@ function SF:InitializeLootHelperDatabase()
 			showMembersNotInRaid = false,
 
 			window = {},
+            syncSession = {}, -- Active session snapshot persisted across /reload
 
             profiles = {},              -- Map: profileId -> LootProfile
             activeProfileId = nil       -- Active profile's stable ID
@@ -32,6 +33,9 @@ function SF:InitializeLootHelperDatabase()
 
 		if type(lh.window) ~= "table" then
 			lh.window = {}
+		end
+		if type(lh.syncSession) ~= "table" then
+			lh.syncSession = {}
 		end
     end
 
@@ -667,6 +671,17 @@ function SF:RemoveAdminFromActiveLootHelperProfile(memberId)
 	if not p then return false, "No active profile." end
 	if not p.RemoveAdminMemberId then return false, "Profile missing RemoveAdminMemberId." end
 	return p:RemoveAdminMemberId(memberId)
+end
+
+-- Transfer all member history from one member to another in the active profile
+-- @param sourceMemberId (string) - Member ID to transfer history from
+-- @param targetMemberId (string) - Member ID to transfer history to
+-- @return (boolean, string|nil) - Success status and optional error message
+function SF:TransferMemberHistoryInActiveLootHelperProfile(sourceMemberId, targetMemberId)
+	local p = self:GetActiveProfile()
+	if not p then return false, "No active profile." end
+	if not p.TransferMemberHistory then return false, "Profile missing TransferMemberHistory." end
+	return p:TransferMemberHistory(sourceMemberId, targetMemberId)
 end
 
 -- Reset all loot helper settings (dangerous operation)

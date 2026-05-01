@@ -40,6 +40,52 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+
+
+
+
+## [0.5.20-beta.9] - 2026-05-01
+
+### Added
+- Implemented tracking to deduplicate pre-raid check whispers, ensuring each member receives only one whisper per session.
+
+### Changed
+- Improved handling of equipment data during pre-raid checks to better identify valid equipment snapshots.
+- Enhanced messaging for pre-raid checks to indicate when a member has already been whispered during the current session.
+
+## [0.5.20-beta.8] - 2026-05-01
+
+### Added
+- Equipment tab snapshots now persist for 24 hours, allowing users to view saved data even after extended periods.
+- Expired equipment snapshots are automatically blanked to ensure outdated data is not displayed.
+
+### Changed
+- Improved handling of cached equipment data to prioritize freshness and display appropriate messages for stale or out-of-range snapshots.
+- Enhanced UI layout for member transfer dialogs, including better validation and dropdown positioning.
+
+## [0.5.20-beta.6] - 2026-04-29
+
+### Fixed
+- Restored Loot Helper session state after using the `/reload` command to prevent loss of session data.
+
+## [0.5.20-beta.5] - 2026-04-29
+
+### Removed
+- Removed the "Item" column from the Loot Logs settings page to simplify the log display.
+
+## [0.5.20-beta.4] - 2026-04-25
+
+### Added
+- Introduced the ability to transfer member history between members in the active loot profile.
+- Implemented a new deterministic fingerprinting system for loot logs to ensure data integrity.
+- Added functionality to compute and validate log fingerprints for improved synchronization and consistency.
+- Introduced an integrity summary feature for loot logs, enabling better tracking and validation of log data.
+
+### Changed
+- Enhanced loot profile management with new methods for log indexing and integrity tracking.
+- Improved internal handling of loot logs, including fingerprint indexing and position tracking.
+
 ## [0.5.19] - 2026-04-22
 
 ### Changed

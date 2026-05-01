@@ -324,6 +324,43 @@ function Sync:_FailRequest(req, reason)
         end)
     end
 
+    local requeued = false
+    if req.meta
+        and req.meta.backgroundRepair == true
+        and type(req.meta.profileId) == "string"
+        and req.meta.profileId ~= ""
+        and type(req.meta.author) == "string"
+        and req.meta.author ~= ""
+        and type(req.meta.fromCounter) == "number"
+        and type(req.meta.toCounter) == "number"
+        and self.QueueRepairRanges
+    then
+        local nextQueueAttempts = math.max(0, tonumber(req.meta.queueAttempts) or 0) + 1
+        requeued = self:QueueRepairRanges(req.meta.profileId, {
+            {
+                author = req.meta.author,
+                fromCounter = req.meta.fromCounter,
+                toCounter = req.meta.toCounter,
+                mode = req.meta.integrityRepair == true and "integrity" or "missing",
+                preferredTarget = req.meta.preferredTarget or req.lastTarget,
+            }
+        }, {
+            mode = req.meta.integrityRepair == true and "integrity" or "missing",
+            reason = req.meta.reason or reason or "background-retry",
+            preferredTarget = req.meta.preferredTarget or req.lastTarget,
+            delaySec = self:_ComputeQueuedRepairBackoffSec(nextQueueAttempts),
+            queueAttempts = nextQueueAttempts,
+        })
+
+        if requeued and SF.Debug then
+            SF.Debug:Info("SYNC", "Re-queued background repair after request failure (profileId=%s author=%s range=%d-%d mode=%s reason=%s)",
+                tostring(req.meta.profileId), tostring(req.meta.author),
+                tonumber(req.meta.fromCounter) or 0, tonumber(req.meta.toCounter) or 0,
+                tostring(req.meta.integrityRepair == true and "integrity" or "missing"),
+                tostring(reason or "unknown"))
+        end
+    end
+
     -- If this was admin convergence, decrement pending so session can proceed.
     if req.kind == "ADMIN_LOG_REQ" and self.state.isCoordinator then
         local conv = self.state._adminConvergence
@@ -337,7 +374,7 @@ function Sync:_FailRequest(req, reason)
         end
     end
 
-    if SF.PrintWarning then
+    if SF.PrintWarning and req.meta and req.meta.backgroundRepair ~= true and not requeued then
         local guidance = "Synchronization request did not complete."
         if req.kind == "NEED_PROFILE" then
             guidance = "Profile sync is still in progress; keep raid session active and it will retry automatically."

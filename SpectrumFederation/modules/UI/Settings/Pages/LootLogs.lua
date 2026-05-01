@@ -191,34 +191,6 @@ local function GetArmorSlotLabel(slot)
 	return FormatLabel(slot) .. " Armor Spot"
 end
 
-local function FormatItemCellText(data)
-	data = data or {}
-
-	local itemName = tostring(data.itemName or "")
-	if itemName ~= "" then
-		return itemName
-	end
-
-	local itemLink = tostring(data.itemLink or "")
-	if itemLink == "" then
-		return ""
-	end
-
-	itemLink = itemLink:gsub("||", "|")
-
-	local colorCode, linkLabel = itemLink:match("^(|c%x%x%x%x%x%x%x%x)|Hitem:.-|h(%[.-%])|h|r$")
-	if colorCode and linkLabel then
-		return colorCode .. linkLabel .. "|r"
-	end
-
-	linkLabel = itemLink:match("|h(%[.-%])|h")
-	if linkLabel then
-		return linkLabel
-	end
-
-	return itemLink
-end
-
 local function BuildActionText(eventType, data, author)
 	data = data or {}
 
@@ -290,7 +262,6 @@ local function BuildLogRow(log)
 		author = ColorizeName(author),
 		member = ColorizeName(data.member),
 		action = BuildActionText(eventType, data, author),
-		item = FormatItemCellText(data),
 	}
 end
 
@@ -468,12 +439,11 @@ function Page:Build(panel)
 						minHeight = 320,
 						rowHeight = 22,
 						columns = {
-							{ key = "date", label = "Date", width = 170 },
-							{ key = "changeType", label = "Type of Change", width = 170 },
-							{ key = "member", label = "Member", width = 135 },
-							{ key = "action", label = "Action", width = 240 },
-							{ key = "item", label = "Item", width = 210 },
-							{ key = "author", label = "Author" },
+							{ key = "date", label = "Date", width = 155 },
+							{ key = "changeType", label = "Type of Change", width = 180 },
+							{ key = "member", label = "Member", width = 150 },
+							{ key = "action", label = "Action" },
+							{ key = "author", label = "Author", width = 165 },
 						},
 						emptyText = "No logs found matching the selected filters.\n\nCreate a profile and perform actions to see logs here.",
 						getRows = function()

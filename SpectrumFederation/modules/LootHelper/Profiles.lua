@@ -166,6 +166,27 @@ local function GenerateProfileId()
     return ("p_%08x%08x%08x"):format(time, ran1, ran2)
 end
 
+local function _GetIntegrityWindowSize()
+    local cfg = SF.LootHelperSync and SF.LootHelperSync.cfg
+    local size = tonumber(cfg and cfg.integrityWindowSize) or 25
+    size = math.floor(size)
+    if size < 1 then
+        size = 25
+    end
+    return size
+end
+
+local function _FingerprintRollup(rows)
+    local checksum = 5381
+    table.sort(rows)
+    for _, row in ipairs(rows) do
+        for i = 1, #row do
+            checksum = (checksum * 33 + row:byte(i)) % 2147483647
+        end
+    end
+    return checksum
+end
+
 -- ========================================================================
 -- Identity + Counters (FOUNDATION)
 -- ========================================================================
@@ -213,6 +234,139 @@ function LootProfile:AllocateNextCounter(author)
     return nextCounter
 end
 
+function LootProfile:_MarkIntegritySummaryDirty()
+    self._authorWindowSummaryDirty = true
+end
+
+function LootProfile:_RefreshLogPositionIndex()
+    self._logPositionIndex = {}
+    for i, log in ipairs(self._lootLogs or {}) do
+        local id = log.GetID and log:GetID() or log._id
+        if type(id) == "string" and id ~= "" then
+            self._logPositionIndex[id] = i
+        end
+    end
+end
+
+function LootProfile:GetLogFingerprintById(logId)
+    if type(logId) ~= "string" or logId == "" then return nil end
+    self._logFingerprintIndex = self._logFingerprintIndex or {}
+    return self._logFingerprintIndex[logId]
+end
+
+function LootProfile:GetLogById(logId)
+    if type(logId) ~= "string" or logId == "" then return nil end
+    self._logById = self._logById or {}
+    return self._logById[logId]
+end
+
+function LootProfile:ComputeAuthorWindowSummary(windowSize)
+    windowSize = tonumber(windowSize) or _GetIntegrityWindowSize()
+    windowSize = math.max(1, math.floor(windowSize))
+
+    if not self._authorWindowSummaryDirty
+        and self._authorWindowSummarySize == windowSize
+        and type(self._authorWindowSummary) == "table"
+    then
+        return self._authorWindowSummary
+    end
+
+    local buckets = {}
+    for _, log in ipairs(self._lootLogs or {}) do
+        local author = log.GetAuthor and log:GetAuthor() or log._author
+        local counter = log.GetCounter and log:GetCounter() or log._counter
+        local id = log.GetID and log:GetID() or log._id
+        local fingerprint = (log.GetFingerprint and log:GetFingerprint()) or log._fingerprint
+
+        if type(author) == "string"
+            and author ~= ""
+            and type(counter) == "number"
+            and counter >= 1
+            and type(id) == "string"
+            and id ~= ""
+        then
+            counter = math.floor(counter)
+            local bucketIndex = math.floor((counter - 1) / windowSize)
+            local authorBuckets = buckets[author]
+            if not authorBuckets then
+                authorBuckets = {}
+                buckets[author] = authorBuckets
+            end
+
+            local bucket = authorBuckets[bucketIndex]
+            if not bucket then
+                local fromCounter = (bucketIndex * windowSize) + 1
+                bucket = {
+                    author = author,
+                    fromCounter = fromCounter,
+                    toCounter = fromCounter + windowSize - 1,
+                    count = 0,
+                    maxCounter = 0,
+                    _rows = {},
+                }
+                authorBuckets[bucketIndex] = bucket
+            end
+
+            bucket.count = bucket.count + 1
+            if counter > bucket.maxCounter then
+                bucket.maxCounter = counter
+            end
+            bucket._rows[#bucket._rows + 1] = ("%s=%s"):format(id, tostring(fingerprint or 0))
+        end
+    end
+
+    local summary = {}
+    for author, authorBuckets in pairs(buckets) do
+        local rows = {}
+        for _, bucket in pairs(authorBuckets) do
+            bucket.checksum = _FingerprintRollup(bucket._rows)
+            bucket._rows = nil
+            rows[#rows + 1] = bucket
+        end
+        table.sort(rows, function(a, b)
+            return a.fromCounter < b.fromCounter
+        end)
+        summary[author] = rows
+    end
+
+    self._authorWindowSummary = summary
+    self._authorWindowSummaryDirty = false
+    self._authorWindowSummarySize = windowSize
+    return summary
+end
+
+function LootProfile:_ReplaceLogById(logId, replacementLog)
+    if type(logId) ~= "string" or logId == "" then return false end
+    if getmetatable(replacementLog) ~= SF.LootLog then return false end
+
+    self._logPositionIndex = self._logPositionIndex or {}
+    local idx = self._logPositionIndex[logId]
+
+    if type(idx) ~= "number" or idx < 1 or idx > #(self._lootLogs or {}) then
+        for i, log in ipairs(self._lootLogs or {}) do
+            local existingId = log.GetID and log:GetID() or log._id
+            if existingId == logId then
+                idx = i
+                break
+            end
+        end
+    end
+
+    if type(idx) ~= "number" then
+        return false
+    end
+
+    self._lootLogs[idx] = replacementLog
+    self._logIndex = self._logIndex or {}
+    self._logById = self._logById or {}
+    self._logFingerprintIndex = self._logFingerprintIndex or {}
+    self._logIndex[logId] = true
+    self._logById[logId] = replacementLog
+    self._logFingerprintIndex[logId] = replacementLog:GetFingerprint()
+    self:_MarkIntegritySummaryDirty()
+    return true
+end
+
 -- ========================================================================
 -- Constructor
 -- ========================================================================
@@ -236,6 +390,13 @@ function LootProfile.new(profileName)
     instance._author = SF:GetPlayerFullIdentifier() -- "Name-Realm" of creator
     instance._owner = instance._author -- Initially owned by creator
     instance._lootLogs = {}
+    instance._logIndex = {}
+    instance._logById = {}
+    instance._logPositionIndex = {}
+    instance._logFingerprintIndex = {}
+    instance._authorWindowSummary = {}
+    instance._authorWindowSummaryDirty = true
+    instance._authorWindowSummarySize = nil
     instance._members = {}
     instance._adminUsers = {}
     instance._activeProfile = false
@@ -338,12 +499,18 @@ end
 -- @return nil
 function LootProfile:RebuildLogIndex()
     self._logIndex = {}
-    self._authorCounters = self._authorCounters or {}
+    self._logById = {}
+    self._logPositionIndex = {}
+    self._logFingerprintIndex = {}
+    self._authorCounters = {}
 
-    for _, log in ipairs(self._lootLogs or {}) do
+    for i, log in ipairs(self._lootLogs or {}) do
         local id = log.GetID and log:GetID() or log._id
         if type(id) == "string" and id ~= "" then
             self._logIndex[id] = true
+            self._logById[id] = log
+            self._logPositionIndex[id] = i
+            self._logFingerprintIndex[id] = (log.GetFingerprint and log:GetFingerprint()) or log._fingerprint
         end
 
         local author = log.GetAuthor and log:GetAuthor() or log._author
@@ -355,6 +522,8 @@ function LootProfile:RebuildLogIndex()
             end
         end
     end
+
+    self:_MarkIntegritySummaryDirty()
 end
 
 -- Function Compare two logs for stable deterministic ordering
@@ -817,6 +986,9 @@ function LootProfile:_InsertLog(lootLog, opts)
 
     self._lootLogs = self._lootLogs or {}
     self._logIndex = self._logIndex or {}
+    self._logById = self._logById or {}
+    self._logPositionIndex = self._logPositionIndex or {}
+    self._logFingerprintIndex = self._logFingerprintIndex or {}
     self._authorCounters = self._authorCounters or {}
 
     local id = lootLog:GetID()
@@ -830,6 +1002,8 @@ function LootProfile:_InsertLog(lootLog, opts)
     end
 
     self._logIndex[id] = true
+    self._logById[id] = lootLog
+    self._logFingerprintIndex[id] = lootLog:GetFingerprint()
     table.insert(self._lootLogs, lootLog)
     
     -- Keep authorCounters synced to max seen
@@ -845,6 +1019,8 @@ function LootProfile:_InsertLog(lootLog, opts)
     table.sort(self._lootLogs, function(a, b)
         return self:_CompareLogs(a, b)
     end)
+    self:_RefreshLogPositionIndex()
+    self:_MarkIntegritySummaryDirty()
 
     return true
 end
@@ -857,6 +1033,7 @@ function LootProfile:AddMember(member)
     if mt == SF.Member or mt == SF.LootProfileMember then
         self._members = self._members or {}
         table.insert(self._members, member)
+        self._memberById = nil
         return true
     else
         if SF.Debug then
@@ -864,6 +1041,34 @@ function LootProfile:AddMember(member)
         end
         return false
     end
+end
+
+-- Function to remove a member from this profile by member ID
+-- @param string memberId "Name-Realm" of member to remove
+-- @return boolean removed True if a member was removed, false otherwise
+function LootProfile:RemoveMemberById(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        return false
+    end
+
+    memberId = NormalizeMemberId(memberId)
+    local members = self._members or {}
+    local removed = false
+
+    for i = #members, 1, -1 do
+        local member = members[i]
+        local existingId = member and ((member.GetFullIdentifier and member:GetFullIdentifier()) or member.identifier)
+        if type(existingId) == "string" and SameMember(existingId, memberId) then
+            table.remove(members, i)
+            removed = true
+        end
+    end
+
+    if removed then
+        self._memberById = nil
+    end
+
+    return removed
 end
 
 -- Function to add an admin user to this profile
@@ -1106,6 +1311,155 @@ function LootProfile:RemoveAdminMemberId(memberId)
     end
 
     return false, "That member is not an admin."
+end
+
+-- Function to transfer all source-member history to an existing target member
+-- Rewrites member-linked log references, updates admin/owner state, removes the source
+-- member from the profile, and rebuilds derived profile state.
+-- @param string sourceMemberId "Name-Realm" of member to transfer history from
+-- @param string targetMemberId "Name-Realm" of member to transfer history to
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
+    if type(sourceMemberId) ~= "string" or sourceMemberId == "" then
+        return false, "Select a source character."
+    end
+    if type(targetMemberId) ~= "string" or targetMemberId == "" then
+        return false, "Select a target character."
+    end
+    if not self:IsCurrentUserAdmin() then
+        return false, "You must be an admin to transfer points."
+    end
+
+    sourceMemberId = NormalizeMemberId(sourceMemberId)
+    targetMemberId = NormalizeMemberId(targetMemberId)
+
+    if SameMember(sourceMemberId, targetMemberId) then
+        return false, "Source and target must be different characters."
+    end
+
+    if not self:getMemberByID(sourceMemberId) then
+        return false, "The source character is not part of this profile."
+    end
+
+    if not self:getMemberByID(targetMemberId) then
+        return false, "The target character is not part of this profile."
+    end
+
+    local logsUpdated = 0
+    local affectedRangesByAuthor = {}
+    for _, log in ipairs(self._lootLogs or {}) do
+        local eventData = (log.GetEventData and log:GetEventData()) or log._data
+        if type(eventData) == "table" and type(eventData.member) == "string" and SameMember(eventData.member, sourceMemberId) then
+            eventData.member = targetMemberId
+            logsUpdated = logsUpdated + 1
+
+            local author = log.GetAuthor and log:GetAuthor() or log._author
+            local counter = log.GetCounter and log:GetCounter() or log._counter
+            if type(author) == "string" and type(counter) == "number" then
+                local range = affectedRangesByAuthor[author]
+                if not range then
+                    range = {
+                        author = author,
+                        fromCounter = counter,
+                        toCounter = counter,
+                    }
+                    affectedRangesByAuthor[author] = range
+                else
+                    if counter < range.fromCounter then
+                        range.fromCounter = counter
+                    end
+                    if counter > range.toCounter then
+                        range.toCounter = counter
+                    end
+                end
+            end
+        end
+    end
+
+    if type(self._adminUsers) ~= "table" then
+        self._adminUsers = {}
+    end
+
+    local sourceWasAdmin = false
+    local targetIsAdmin = false
+    for i = #self._adminUsers, 1, -1 do
+        local adminId = self._adminUsers[i]
+        if type(adminId) == "string" then
+            if SameMember(adminId, targetMemberId) then
+                targetIsAdmin = true
+            end
+            if SameMember(adminId, sourceMemberId) then
+                sourceWasAdmin = true
+                table.remove(self._adminUsers, i)
+            end
+        end
+    end
+    if sourceWasAdmin and not targetIsAdmin then
+        table.insert(self._adminUsers, targetMemberId)
+    end
+
+    if SameMember(self._owner, sourceMemberId) then
+        self._owner = targetMemberId
+    end
+    if SameMember(self._author, sourceMemberId) then
+        self._author = targetMemberId
+    end
+
+    self:_EnsureRaidCheckEquipmentSnapshots()
+    self._raidCheckEquipmentSnapshots[sourceMemberId] = nil
+
+    self:RemoveMemberById(sourceMemberId)
+    self._memberById = nil
+
+    local rebuildOk = false
+    local rebuildErr = nil
+    if SF.LootHelperSync and SF.LootHelperSync.RebuildProfile and self.GetProfileId then
+        rebuildOk, rebuildErr = SF.LootHelperSync:RebuildProfile(self:GetProfileId(), "member_history_transfer")
+    elseif self.RebuildLogIndex then
+        self:RebuildLogIndex()
+        rebuildOk = true
+    end
+
+    if not rebuildOk then
+        return false, rebuildErr or "Failed to rebuild profile after transferring points."
+    end
+
+    if self._EnsureOwnerIsAdmin then
+        self:_EnsureOwnerIsAdmin()
+    end
+
+    if SF.LootHelperSync and SF.LootHelperSync.AdvertiseProfileMutation and self.GetProfileId then
+        local affectedRanges = {}
+        for _, range in pairs(affectedRangesByAuthor) do
+            affectedRanges[#affectedRanges + 1] = range
+        end
+        SF.LootHelperSync:AdvertiseProfileMutation(self:GetProfileId(), affectedRanges, "member_history_transfer")
+
+        if SF.LootHelperSync.state and SF.LootHelperSync.state.active and SF.LootHelperSync.state.profileId == self:GetProfileId() then
+            SF.LootHelperSync.state._sentJoinStatusForSessionId = nil
+            SF.LootHelperSync.state._sentJoinStatusType = nil
+            if SF.LootHelperSync.state.isCoordinator and SF.LootHelperSync.BroadcastSessionHeartbeat then
+                SF.LootHelperSync.state.authorWindowSummary = SF.LootHelperSync:ComputeAuthorWindowSummary(self:GetProfileId())
+                SF.LootHelperSync:BroadcastSessionHeartbeat()
+            elseif SF.LootHelperSync.SendJoinStatus then
+                SF.LootHelperSync:SendJoinStatus()
+            end
+        end
+    end
+
+    if SF.Debug then
+        SF.Debug:Info(
+            "LootProfile",
+            "Transferred member history from %s to %s in profile %s (%d log references updated)",
+            tostring(sourceMemberId),
+            tostring(targetMemberId),
+            tostring(self._profileName),
+            logsUpdated
+        )
+    end
+
+    return true, nil
 end
 
 -- ========================================================================
@@ -1371,19 +1725,28 @@ end
 function LootProfile:MergeLogTables(logTables, opts)
     if type(logTables) ~= "table" then return 0 end
 
+    opts = opts or {}
     self._lootLogs = self._lootLogs or {}
     self._logIndex = self._logIndex or {}
+    self._logById = self._logById or {}
+    self._logPositionIndex = self._logPositionIndex or {}
+    self._logFingerprintIndex = self._logFingerprintIndex or {}
     self._authorCounters = self._authorCounters or {}
 
     local inserted = 0
+    local replaced = 0
     local dirtySort = false
+    local mismatches = {}
 
     for _, t in ipairs(logTables) do
         local log, err = SF.LootLog.FromTable(t, opts)
         if log then
             local id = log:GetID()
+            local incomingFingerprint = log:GetFingerprint()
             if not self._logIndex[id] then
                 self._logIndex[id] = true
+                self._logById[id] = log
+                self._logFingerprintIndex[id] = incomingFingerprint
                 table.insert(self._lootLogs, log)
                 inserted = inserted + 1
                 dirtySort = true
@@ -1397,6 +1760,22 @@ function LootProfile:MergeLogTables(logTables, opts)
                         self._authorCounters[author] = counter
                     end
                 end
+            else
+                local existingFingerprint = self._logFingerprintIndex[id]
+                if existingFingerprint ~= incomingFingerprint then
+                    mismatches[#mismatches + 1] = {
+                        id = id,
+                        author = log:GetAuthor(),
+                        counter = log:GetCounter(),
+                        localFingerprint = existingFingerprint,
+                        remoteFingerprint = incomingFingerprint,
+                    }
+
+                    if opts.allowReplaceExisting and self:_ReplaceLogById(id, log) then
+                        replaced = replaced + 1
+                        dirtySort = true
+                    end
+                end
             end
         else
             if SF.Debug then
@@ -1407,9 +1786,16 @@ function LootProfile:MergeLogTables(logTables, opts)
 
     if dirtySort then
         table.sort(self._lootLogs, function(a, b) return self:_CompareLogs(a, b) end)
+        self:_RefreshLogPositionIndex()
+        self:_MarkIntegritySummaryDirty()
     end
 
-    return inserted
+    return inserted, {
+        inserted = inserted,
+        replaced = replaced,
+        mismatchCount = #mismatches,
+        mismatches = mismatches,
+    }
 end
 
 -- ========================================================================

@@ -414,6 +414,10 @@ end
 
 local function FormatAuditRowName(rowData)
 	local name = (rowData and (rowData.displayName or rowData.name)) or "?"
+	local status = rowData and rowData.inspectStatus
+	if status == "saved" or status == "paused" then
+		return name
+	end
 	local label = rowData and rowData.inspectLabel or nil
 	if not label or label == "" then
 		return name
@@ -1188,7 +1192,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		return items
 	end
 
-	local function BuildMemberOptions()
+	local function BuildSelectableMemberOptions(includeAdmins)
 		local profile = GetActiveProfileObject(store)
 		if not profile or type(profile.getMemberIds) ~= "function" or type(profile.getMemberByID) ~= "function" then
 			return {}
@@ -1203,11 +1207,11 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 
 		local out = {}
 		for _, memberId in ipairs(profile:getMemberIds() or {}) do
-			if not adminById[memberId] then
-			local member = profile:getMemberByID(memberId)
-			local name = (type(member) == "table" and (member.member_name or member.name)) or tostring(memberId)
-			local color = GetMemberClassColor(member)
-			table.insert(out, { value = memberId, label = color .. name .. "|r", _sort = name })
+			if includeAdmins or not adminById[memberId] then
+				local member = profile:getMemberByID(memberId)
+				local name = (type(member) == "table" and (member.member_name or member.name)) or tostring(memberId)
+				local color = GetMemberClassColor(member)
+				table.insert(out, { value = memberId, label = color .. name .. "|r", _sort = name })
 			end
 		end
 
@@ -1218,6 +1222,14 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			item._sort = nil
 		end
 		return out
+	end
+
+	local function BuildMemberOptions()
+		return BuildSelectableMemberOptions(false)
+	end
+
+	local function BuildAllMemberOptions()
+		return BuildSelectableMemberOptions(true)
 	end
 
 	local sectionsById = {
@@ -1456,6 +1468,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			items = {
 				{ type = "scrollList", label = "Admins", adminOnly = true, height = 160, rowHeight = 20, removeAtlas = "common-icon-redx", compactColumns = true, removeColumnGap = 6, enabled = function() return ProfileActionsEnabled() end, getItems = function() return BuildAdminItems() end, onRemove = function(ctx, item) if type(ctx.store.RemoveAdminFromActiveProfile) ~= "function" then ctx.section:SetMessage("RemoveAdminFromActiveProfile() not implemented", "error") return end local ok, err = ctx.store:RemoveAdminFromActiveProfile(item.id) if not ok then ctx.section:SetMessage(err or "Failed to remove admin", "error") return end ctx.section:SetMessage("Admin removed.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "dropdownIconButton", label = "Add Admin", adminOnly = true, defaultText = "Select member", options = function() return BuildMemberOptions() end, get = function() return panel.__sfAddAdminSelectedId end, set = function(value) panel.__sfAddAdminSelectedId = value end, enabled = function() return ProfileActionsEnabled() end, iconAtlas = "common-icon-plus", iconToolTip = "Add the selected member as an admin for the active profile", iconEnabled = function() return ProfileActionsEnabled() and panel.__sfAddAdminSelectedId ~= nil end, onIconClick = function(ctx) if SF.Debug then SF.Debug:Info("UI", "Add Admin button clicked") end ctx.section:ClearMessage() local memberId = panel.__sfAddAdminSelectedId if SF.Debug then SF.Debug:Info("UI", "Selected memberId: %s", tostring(memberId)) end if not memberId then ctx.section:SetMessage("Select a member first.", "error") return end if type(ctx.store.AddAdminToActiveProfile) ~= "function" then ctx.section:SetMessage("AddAdminToActiveProfile() not implemented", "error") return end if SF.Debug then SF.Debug:Info("UI", "Calling AddAdminToActiveProfile with memberId: %s", tostring(memberId)) end local ok, err = ctx.store:AddAdminToActiveProfile(memberId) if SF.Debug then SF.Debug:Info("UI", "AddAdminToActiveProfile returned: ok=%s, err=%s", tostring(ok), tostring(err)) end if not ok then ctx.section:SetMessage(err or "Failed to add admin", "error") return end ctx.section:SetMessage("Admin added.", "success") ctx.pageBuilder:Refresh() end },
+				{ type = "button", label = "Transfer Points / Main Swap", adminOnly = true, buttonText = "Main Swap", width = 140, tooltip = "Transfer all point and member-history references from one existing profile member to another existing profile member, then remove the old character from the profile.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if type(ctx.store.TransferMemberHistoryInActiveProfile) ~= "function" then ctx.section:SetMessage("TransferMemberHistoryInActiveProfile() not implemented", "error") return end local memberOptions = BuildAllMemberOptions() if #memberOptions < 2 then ctx.section:SetMessage("Add at least two profile members before using Main Swap.", "error") return end dialogs:TransferMemberHistory("Transfer all point history from one profile member to another, then remove the old character from this profile?", "Transfer", memberOptions, memberOptions, function(sourceMemberId, targetMemberId) local ok, err = ctx.store:TransferMemberHistoryInActiveProfile(sourceMemberId, targetMemberId) if not ok then ctx.section:SetMessage(err or "Main Swap failed", "error") return end ctx.section:SetMessage("Main Swap completed.", "success") ctx.pageBuilder:Refresh() end) end },
 			},
 		},
 	}
