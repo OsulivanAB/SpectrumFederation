@@ -52,6 +52,12 @@ Sync.cfg = Sync.cfg or {
     heartbeatGraceSec               = 10,   -- small extra buffer to reduce false positives
     catchupOnHeartbeatCooldownSec   = 10,   -- avoid re-running catchup logic every single heartbeat if it gets noisy
 
+    -- Active profile audit
+    activeProfileAuditIntervalSec   = 90,  -- how often helpers audit one peer's active profile during session
+    activeProfileAuditJitterMsMin   = 250,
+    activeProfileAuditJitterMsMax   = 1000,
+    activeProfileAuditTtlSec        = 180, -- suppress repeat audits of same target for a short window
+
     autoSessionSafeModeOnCombat = false,    -- coordinator entering combat auto-enables session safe-mode
 }
 
@@ -106,6 +112,11 @@ Sync.state = Sync.state or {
         tickerHandle = nil,    -- background convergence ticker
         kickHandle = nil,      -- short one-shot acceleration timer
         lastDrainAt = nil,
+    },
+
+    audit = {
+        nextAuditAt = nil,
+        lastTargetAt = {}, -- map: [nameRealm] = epochSeconds
     },
 }
 

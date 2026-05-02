@@ -426,6 +426,8 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     self:EnsureHeartbeatMonitor("HandleSessionHeartbeat")
     self:EnsureRepairConvergence("HandleSessionHeartbeat")
 
+    self:_MaybeRunActiveProfileAudit("heartbeat")
+
     -- If coordinator/epoch/session changed, allow a re-evaluation
     if (not self:_SamePlayer(oldCoord, self.state.coordinator))
         or (oldEpoch ~= self.state.coordEpoch)
@@ -527,6 +529,79 @@ function Sync:HandleSessionHeartbeat(sender, payload)
                 })
             end
         end
+    end
+end
+
+-- Function Handle AUDIT_PROFILE (helper -> coordinator): verify a target peer is on the correct active profile.
+-- Helper does the (distributed) selection work; coordinator performs a lightweight verification + targeted nudge.
+-- @param sender string Helper name-realm
+-- @param payload table {sessionId, profileId, coordinator, coordEpoch, target, helper, sentAt}
+function Sync:HandleAuditProfile(sender, payload)
+    if type(payload) ~= "table" then return end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return end
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
+    if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return end
+    if type(payload.coordEpoch) ~= "number" then return end
+    if type(payload.target) ~= "string" or payload.target == "" then return end
+
+    if not self.state or not self.state.active then return end
+    if payload.sessionId ~= self.state.sessionId then return end
+    if payload.profileId ~= self.state.profileId then return end
+    if not self.state.isCoordinator then
+        return
+    end
+
+    -- Anti-spoof: ensure sender is the helper they claim, and coordinator identity matches our view.
+    if type(payload.helper) == "string" and payload.helper ~= "" then
+        if not self:_SamePlayer(sender, payload.helper) then
+            return
+        end
+    end
+    if not self:_SamePlayer(self.state.coordinator, payload.coordinator) then
+        return
+    end
+    if not self:IsControlMessageAllowed(payload, sender) then
+        return
+    end
+
+    self:UpdatePeersFromRoster()
+    local peer = self.state.peers and self.state.peers[payload.target] or nil
+    if not (peer and peer.inGroup) then
+        return
+    end
+
+    local status = peer.syncState
+    if status == "HAVE_PROFILE" then
+        return
+    end
+
+    -- If they've never announced / we haven't heard from them yet, don't spam.
+    if status == "UNKNOWN" or status == "SEEN" or status == nil then
+        return
+    end
+
+    -- Targeted nudge: ask them to refresh their join status (which includes NEED_PROFILE/NEED_LOGS logic).
+    -- We re-use SES_REANNOUNCE since it's already routed/validated and triggers SendJoinStatus on members.
+    local dist = "WHISPER"
+    local reannounce = {
+        sessionId = self.state.sessionId,
+        profileId = self.state.profileId,
+        coordinator = self.state.coordinator,
+        coordEpoch = self.state.coordEpoch,
+        helpers = self.state.helpers,
+        authorMax = self.state.authorMax,
+        authorWindowSummary = self.state.authorWindowSummary,
+        sentAt = self:_Now(),
+        auditHint = true,
+    }
+
+    if SF.LootHelperComm then
+        SF.LootHelperComm:Send("CONTROL", self.MSG.SES_REANNOUNCE, reannounce, dist, payload.target, "NORMAL")
+    end
+
+    if SF.Debug then
+        SF.Debug:Info("SYNC_AUDIT", "AUDIT_PROFILE nudge sent to %s (syncState=%s, helper=%s)",
+            tostring(payload.target), tostring(status), tostring(sender))
     end
 end
 

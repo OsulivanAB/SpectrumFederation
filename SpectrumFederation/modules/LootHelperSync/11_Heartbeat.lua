@@ -110,6 +110,11 @@ function Sync:HandleSessionStart(sender, payload)
 
     self:EnsureHeartbeatMonitor("HandleSessionStart")
 
+    -- Reset audit schedule for new session
+    self.state.audit = self.state.audit or { nextAuditAt = nil, lastTargetAt = {} }
+    self.state.audit.nextAuditAt = nil
+    self.state.audit.lastTargetAt = {}
+
     -- Reply after jitter
     local sid = self.state.sessionId
     self:RunWithJitter(self.cfg.memberReplyJitterMsMin, self.cfg.memberReplyJitterMsMax, function()
@@ -119,6 +124,106 @@ function Sync:HandleSessionStart(sender, payload)
     end)
 
     self:TouchPeer(sender, { inGroup = true })
+end
+
+local function _AuditFeatureEnabled(self)
+    local interval = tonumber(self.cfg and self.cfg.activeProfileAuditIntervalSec) or 0
+    return interval > 0
+end
+
+local function _AuditInterval(self)
+    local interval = tonumber(self.cfg and self.cfg.activeProfileAuditIntervalSec) or 0
+    interval = math.floor(interval)
+    if interval < 15 then
+        interval = 15
+    end
+    return interval
+end
+
+local function _EnsureAuditState(self)
+    self.state.audit = self.state.audit or {}
+    self.state.audit.lastTargetAt = self.state.audit.lastTargetAt or {}
+end
+
+local function _PickAuditTarget(self)
+    if not self.state or not self.state.active then return nil end
+    if type(self.state.profileId) ~= "string" or self.state.profileId == "" then return nil end
+    if type(self.state.helpers) ~= "table" or #self.state.helpers == 0 then return nil end
+
+    self:UpdatePeersFromRoster()
+
+    local me = self:_SelfId()
+    local ttl = tonumber(self.cfg and self.cfg.activeProfileAuditTtlSec) or 180
+    ttl = math.max(30, math.floor(ttl))
+
+    local candidates = {}
+    for name, peer in pairs(self.state.peers or {}) do
+        if type(name) == "string" and name ~= "" and peer and peer.inGroup and name ~= me then
+            local helper = self:PickHelperForPlayer(name, self.state.helpers)
+            if helper and self:_SamePlayer(helper, me) then
+                local last = tonumber(self.state.audit.lastTargetAt[name]) or 0
+                if (self:_Now() - last) >= ttl then
+                    table.insert(candidates, name)
+                end
+            end
+        end
+    end
+
+    if #candidates == 0 then return nil end
+    table.sort(candidates)
+    local idx = (math.random(1, #candidates))
+    return candidates[idx]
+end
+
+function Sync:_MaybeRunActiveProfileAudit(reason)
+    if not _AuditFeatureEnabled(self) then return end
+    if not self.state or not self.state.active then return end
+    if self.state.isCoordinator then return end
+
+    _EnsureAuditState(self)
+
+    local now = self:_Now()
+    local nextAt = tonumber(self.state.audit.nextAuditAt) or 0
+    if nextAt > now then
+        return
+    end
+
+    self.state.audit.nextAuditAt = now + _AuditInterval(self)
+
+    local target = _PickAuditTarget(self)
+    if not target then
+        return
+    end
+
+    self.state.audit.lastTargetAt[target] = now
+
+    local coord = self.state.coordinator
+    if type(coord) ~= "string" or coord == "" then return end
+
+    local payload = {
+        sessionId = self.state.sessionId,
+        profileId = self.state.profileId,
+        coordinator = coord,
+        coordEpoch = self.state.coordEpoch,
+        target = target,
+        helper = self:_SelfId(),
+        reason = reason,
+        sentAt = now,
+    }
+
+    local jitterMin = tonumber(self.cfg and self.cfg.activeProfileAuditJitterMsMin) or 0
+    local jitterMax = tonumber(self.cfg and self.cfg.activeProfileAuditJitterMsMax) or 0
+    self:RunWithJitter(jitterMin, jitterMax, function()
+        if not self.state or not self.state.active then return end
+        if self.state.sessionId ~= payload.sessionId then return end
+        if SF.LootHelperComm then
+            SF.LootHelperComm:Send("CONTROL", self.MSG.AUDIT_PROFILE, payload, "WHISPER", coord, "NORMAL")
+        end
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC_AUDIT", "Sent AUDIT_PROFILE for %s to coordinator %s (reason=%s)",
+                tostring(target), tostring(coord), tostring(reason or "unknown"))
+        end
+    end)
 end
 
 -- Function Handle session end announcement (SES_END).

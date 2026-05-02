@@ -39,4 +39,7 @@ Sync.MSG = {
     -- Safe Mode
     SAFE_MODE_REQ   = "SAFE_MODE_REQ",
     SAFE_MODE_SET   = "SAFE_MODE_SET",
+
+    -- Active Profile Audit
+    AUDIT_PROFILE   = "AUDIT_PROFILE",
 }

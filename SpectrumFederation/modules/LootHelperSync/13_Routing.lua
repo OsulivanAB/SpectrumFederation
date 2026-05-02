@@ -52,6 +52,8 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
         if msgType == self.MSG.SES_END then return self:HandleSessionEnd(sender, payload) end
         if msgType == self.MSG.SES_HEARTBEAT then return self:HandleSessionHeartbeat(sender, payload) end
 
+        if msgType == self.MSG.AUDIT_PROFILE then return self:HandleAuditProfile(sender, payload) end
+
         if msgType == self.MSG.SAFE_MODE_REQ then return self:HandleSafeModeRequest(sender, payload) end
         if msgType == self.MSG.SAFE_MODE_SET then return self:HandleSafeModeSet(sender, payload) end
         
