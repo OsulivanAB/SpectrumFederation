@@ -107,6 +107,11 @@ end
 
 local TRANSFER_KEY = "SF_SETTINGS_MEMBER_TRANSFER"
 local TRANSFER_CONTENT_WIDTH = 360
+local TRANSFER_CONTENT_INITIAL_HEIGHT = 1
+-- Anchor inserted transfer controls under the popup text with StaticPopup-style padding.
+local TRANSFER_CONTENT_TOP_OFFSET = -12
+local TRANSFER_CONTENT_FALLBACK_X = 24
+local TRANSFER_CONTENT_FALLBACK_Y = -44
 
 local function SameMember(a, b)
     if SF.NameUtil and SF.NameUtil.SamePlayer then
@@ -129,12 +134,16 @@ local function FindOptionLabel(options, value)
 end
 
 local function EnsureTransferPopupContent(dialog)
-    if dialog and dialog.__sfTransferContent then
-        return dialog.__sfTransferContent
+    if not dialog then
+        return nil
+    end
+
+    if dialog._sfTransferContent then
+        return dialog._sfTransferContent
     end
 
     local content = CreateFrame("Frame", nil, dialog)
-    content:SetSize(TRANSFER_CONTENT_WIDTH, 1)
+    content:SetSize(TRANSFER_CONTENT_WIDTH, TRANSFER_CONTENT_INITIAL_HEIGHT)
     content:Hide()
 
     content.sourceLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
@@ -154,9 +163,7 @@ local function EnsureTransferPopupContent(dialog)
     content.validationText:SetJustifyV("TOP")
     content.validationText:SetWidth(TRANSFER_CONTENT_WIDTH)
 
-    if dialog then
-        dialog.__sfTransferContent = content
-    end
+    dialog._sfTransferContent = content
     return content
 end
 
@@ -240,6 +247,9 @@ local function UpdateTransferPopupState(dialog)
     local sourceMemberId = dialog.__sfSourceMemberId
     local targetMemberId = dialog.__sfTargetMemberId
     local content = EnsureTransferPopupContent(dialog)
+    if not content then
+        return
+    end
     local button1 = dialog.GetButton1 and dialog:GetButton1() or dialog.button1
 
     local valid = true
@@ -299,9 +309,10 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
             content:Show()
             content:ClearAllPoints()
             if textRegion then
-                content:SetPoint("TOPLEFT", textRegion, "BOTTOMLEFT", 0, -12)
+                content:SetPoint("TOPLEFT", textRegion, "BOTTOMLEFT", 0, TRANSFER_CONTENT_TOP_OFFSET)
             else
-                content:SetPoint("TOPLEFT", self, "TOPLEFT", 24, -44)
+                -- Fallback for popup variants that briefly return nil for Text during OnShow (seen on some GameDialog skins).
+                content:SetPoint("TOPLEFT", self, "TOPLEFT", TRANSFER_CONTENT_FALLBACK_X, TRANSFER_CONTENT_FALLBACK_Y)
             end
 
             self.__sfSourceMemberId = nil
@@ -345,7 +356,7 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         OnHide = function(self)
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
-            local content = self.__sfTransferContent
+            local content = self._sfTransferContent
             if content and content.validationText then
                 content.validationText:SetText("")
             end
@@ -357,7 +368,6 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
             end
             if content then
                 LayoutTransferPopupContent(content)
-                content:Hide()
             end
         end,
     }
