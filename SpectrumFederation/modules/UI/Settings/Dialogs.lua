@@ -107,7 +107,6 @@ end
 
 local TRANSFER_KEY = "SF_SETTINGS_MEMBER_TRANSFER"
 local TRANSFER_CONTENT_WIDTH = 360
-local transferPopupContent
 
 local function SameMember(a, b)
     if SF.NameUtil and SF.NameUtil.SamePlayer then
@@ -129,12 +128,12 @@ local function FindOptionLabel(options, value)
     return nil
 end
 
-local function EnsureTransferPopupContent()
-    if transferPopupContent then
-        return transferPopupContent
+local function EnsureTransferPopupContent(dialog)
+    if dialog and dialog.__sfTransferContent then
+        return dialog.__sfTransferContent
     end
 
-    local content = CreateFrame("Frame", nil, UIParent)
+    local content = CreateFrame("Frame", nil, dialog)
     content:SetSize(TRANSFER_CONTENT_WIDTH, 1)
     content:Hide()
 
@@ -155,7 +154,9 @@ local function EnsureTransferPopupContent()
     content.validationText:SetJustifyV("TOP")
     content.validationText:SetWidth(TRANSFER_CONTENT_WIDTH)
 
-    transferPopupContent = content
+    if dialog then
+        dialog.__sfTransferContent = content
+    end
     return content
 end
 
@@ -238,7 +239,7 @@ local function UpdateTransferPopupState(dialog)
     local data = dialog.data or {}
     local sourceMemberId = dialog.__sfSourceMemberId
     local targetMemberId = dialog.__sfTargetMemberId
-    local content = dialog.insertedFrame or EnsureTransferPopupContent()
+    local content = EnsureTransferPopupContent(dialog)
     local button1 = dialog.GetButton1 and dialog:GetButton1() or dialog.button1
 
     local valid = true
@@ -293,8 +294,15 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         preferredIndex = 3,
 
         OnShow = function(self, data)
-            local content = self.insertedFrame or EnsureTransferPopupContent()
+            local content = EnsureTransferPopupContent(self)
+            local textRegion = self.Text or self.text
             content:Show()
+            content:ClearAllPoints()
+            if textRegion then
+                content:SetPoint("TOPLEFT", textRegion, "BOTTOMLEFT", 0, -12)
+            else
+                content:SetPoint("TOPLEFT", self, "TOPLEFT", 24, -44)
+            end
 
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
@@ -337,17 +345,19 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         OnHide = function(self)
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
-            if self.insertedFrame and self.insertedFrame.validationText then
-                self.insertedFrame.validationText:SetText("")
+            local content = self.__sfTransferContent
+            if content and content.validationText then
+                content.validationText:SetText("")
             end
-            if self.insertedFrame and self.insertedFrame.sourceDropdown and self.insertedFrame.sourceDropdown.SetDefaultText then
-                self.insertedFrame.sourceDropdown:SetDefaultText("Select member")
+            if content and content.sourceDropdown and content.sourceDropdown.SetDefaultText then
+                content.sourceDropdown:SetDefaultText("Select member")
             end
-            if self.insertedFrame and self.insertedFrame.targetDropdown and self.insertedFrame.targetDropdown.SetDefaultText then
-                self.insertedFrame.targetDropdown:SetDefaultText("Select member")
+            if content and content.targetDropdown and content.targetDropdown.SetDefaultText then
+                content.targetDropdown:SetDefaultText("Select member")
             end
-            if self.insertedFrame then
-                LayoutTransferPopupContent(self.insertedFrame)
+            if content then
+                LayoutTransferPopupContent(content)
+                content:Hide()
             end
         end,
     }
@@ -366,10 +376,9 @@ function Dialogs:TransferMemberHistory(message, acceptText, sourceOptions, targe
     end
 
     StaticPopupDialogs[TRANSFER_KEY].button1 = acceptText or ACCEPT
-    local content = EnsureTransferPopupContent()
     return StaticPopup_Show(TRANSFER_KEY, message, nil, {
         sourceOptions = sourceOptions or {},
         targetOptions = targetOptions or {},
         onAccept = onAccept,
-    }, content) ~= nil
+    }) ~= nil
 end
