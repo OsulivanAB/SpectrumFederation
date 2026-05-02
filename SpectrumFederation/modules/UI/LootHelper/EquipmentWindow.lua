@@ -159,9 +159,6 @@ local function SetIssueOverlayShown(texture, shown)
         return
     end
 
-    if texture.__sfPulse and texture.__sfPulse:IsPlaying() then
-        texture.__sfPulse:Stop()
-    end
     texture:Hide()
 end
 
