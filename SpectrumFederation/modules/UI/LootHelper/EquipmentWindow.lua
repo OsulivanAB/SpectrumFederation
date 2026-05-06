@@ -455,7 +455,6 @@ function EquipmentWindow:Refresh()
 
     if not armor then return end
 
-    local issuesByInventory = self:_GetEquipmentIssuesByInventorySlot()
     local buttons = self._frame.Content.SlotButtons or {}
     for _, btn in ipairs(buttons) do
         local slotKey = btn.slotKey
@@ -479,12 +478,7 @@ function EquipmentWindow:Refresh()
             end
 
             if btn.IssueOverlay then
-                local inventorySlot = SLOT_KEY_TO_INVENTORY[slotKey]
-                if inventorySlot and issuesByInventory and issuesByInventory[inventorySlot] then
-                    SetIssueOverlayShown(btn.IssueOverlay, true)
-                else
-                    SetIssueOverlayShown(btn.IssueOverlay, false)
-                end
+                SetIssueOverlayShown(btn.IssueOverlay, false)
             end
 
             -- Set click handler
