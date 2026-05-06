@@ -1674,7 +1674,7 @@ local function HasBeenWhisperedToday(member, mode)
 		return false
 	end
 
-	return whisperDay == date("%Y-%m-%d")
+	return whisperDay == date("%Y-%m-%d", time())
 end
 
 local function HasEquipmentData(slotsByInventory)
