@@ -50,8 +50,9 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ## [0.5.20-beta.16] - 2026-05-06
 
-### Changed
-- Resolved latest reported merge conflicts in CHANGELOG/README/TOC/RaidCheck and reconciled version metadata for this stacked PR.
+### Fixed
+- Resolved dropdown and anchor positioning issues in the Main Swap transfer dialog.
+- Fixed errors related to transfer dialog content initialization and layout updates.
 
 ## [0.5.20-beta.15] - 2026-05-06
 
