@@ -49,6 +49,13 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.18] - 2026-05-06
+
+### Fixed
+- Addressed layout warping issues in the Transfer Points dialog by refining content width and alignment.
+- Improved initialization and positioning of transfer controls to ensure consistent behavior across dialog variants.
+
 ## [0.5.20-beta.17] - 2026-05-06
 
 ### Fixed
