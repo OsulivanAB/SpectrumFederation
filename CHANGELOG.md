@@ -48,6 +48,26 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [0.5.20-beta.16] - 2026-05-06
+
+### Changed
+- Resolved latest reported merge conflicts in CHANGELOG/README/TOC/RaidCheck and reconciled version metadata for this stacked PR.
+
+## [0.5.20-beta.15] - 2026-05-06
+
+### Changed
+- Resolved another stacked-PR merge pass against `beta` and reconciled TOC/README/CHANGELOG version metadata.
+
+## [0.5.20-beta.14] - 2026-05-06
+
+### Changed
+- Resolved latest stacked-PR merge conflicts against `beta` in TOC/readme/changelog and RaidCheck content.
+
+## [0.5.20-beta.13] - 2026-05-06
+
+### Changed
+- Resolved stacked-PR merge conflicts against `beta` in RaidCheck and changelog content.
+
 ## [0.5.20-beta.12] - 2026-05-06
 
 ### Changed

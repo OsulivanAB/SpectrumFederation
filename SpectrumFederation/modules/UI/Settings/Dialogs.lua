@@ -107,7 +107,11 @@ end
 
 local TRANSFER_KEY = "SF_SETTINGS_MEMBER_TRANSFER"
 local TRANSFER_CONTENT_WIDTH = 360
-local transferPopupContent
+local TRANSFER_CONTENT_INITIAL_HEIGHT = 1
+-- Anchor inserted transfer controls under the popup text with StaticPopup-style padding.
+local TRANSFER_CONTENT_TOP_OFFSET = -12
+local TRANSFER_CONTENT_FALLBACK_X = 24
+local TRANSFER_CONTENT_FALLBACK_Y = -44
 
 local function SameMember(a, b)
     if SF.NameUtil and SF.NameUtil.SamePlayer then
@@ -129,13 +133,17 @@ local function FindOptionLabel(options, value)
     return nil
 end
 
-local function EnsureTransferPopupContent()
-    if transferPopupContent then
-        return transferPopupContent
+local function EnsureTransferPopupContent(dialog)
+    if not dialog then
+        return nil
     end
 
-    local content = CreateFrame("Frame", nil, UIParent)
-    content:SetSize(TRANSFER_CONTENT_WIDTH, 1)
+    if dialog._sfTransferContent then
+        return dialog._sfTransferContent
+    end
+
+    local content = CreateFrame("Frame", nil, dialog)
+    content:SetSize(TRANSFER_CONTENT_WIDTH, TRANSFER_CONTENT_INITIAL_HEIGHT)
     content:Hide()
 
     content.sourceLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
@@ -155,7 +163,7 @@ local function EnsureTransferPopupContent()
     content.validationText:SetJustifyV("TOP")
     content.validationText:SetWidth(TRANSFER_CONTENT_WIDTH)
 
-    transferPopupContent = content
+    dialog._sfTransferContent = content
     return content
 end
 
@@ -238,7 +246,10 @@ local function UpdateTransferPopupState(dialog)
     local data = dialog.data or {}
     local sourceMemberId = dialog.__sfSourceMemberId
     local targetMemberId = dialog.__sfTargetMemberId
-    local content = dialog.insertedFrame or EnsureTransferPopupContent()
+    local content = EnsureTransferPopupContent(dialog)
+    if not content then
+        return
+    end
     local button1 = dialog.GetButton1 and dialog:GetButton1() or dialog.button1
 
     local valid = true
@@ -293,8 +304,16 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         preferredIndex = 3,
 
         OnShow = function(self, data)
-            local content = self.insertedFrame or EnsureTransferPopupContent()
+            local content = EnsureTransferPopupContent(self)
+            local textRegion = self.Text or self.text
             content:Show()
+            content:ClearAllPoints()
+            if textRegion then
+                content:SetPoint("TOPLEFT", textRegion, "BOTTOMLEFT", 0, TRANSFER_CONTENT_TOP_OFFSET)
+            else
+                -- Fallback for popup variants that briefly return nil for Text during OnShow (seen on some GameDialog skins).
+                content:SetPoint("TOPLEFT", self, "TOPLEFT", TRANSFER_CONTENT_FALLBACK_X, TRANSFER_CONTENT_FALLBACK_Y)
+            end
 
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
@@ -337,17 +356,18 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         OnHide = function(self)
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
-            if self.insertedFrame and self.insertedFrame.validationText then
-                self.insertedFrame.validationText:SetText("")
+            local content = self._sfTransferContent
+            if content and content.validationText then
+                content.validationText:SetText("")
             end
-            if self.insertedFrame and self.insertedFrame.sourceDropdown and self.insertedFrame.sourceDropdown.SetDefaultText then
-                self.insertedFrame.sourceDropdown:SetDefaultText("Select member")
+            if content and content.sourceDropdown and content.sourceDropdown.SetDefaultText then
+                content.sourceDropdown:SetDefaultText("Select member")
             end
-            if self.insertedFrame and self.insertedFrame.targetDropdown and self.insertedFrame.targetDropdown.SetDefaultText then
-                self.insertedFrame.targetDropdown:SetDefaultText("Select member")
+            if content and content.targetDropdown and content.targetDropdown.SetDefaultText then
+                content.targetDropdown:SetDefaultText("Select member")
             end
-            if self.insertedFrame then
-                LayoutTransferPopupContent(self.insertedFrame)
+            if content then
+                LayoutTransferPopupContent(content)
             end
         end,
     }
@@ -366,10 +386,9 @@ function Dialogs:TransferMemberHistory(message, acceptText, sourceOptions, targe
     end
 
     StaticPopupDialogs[TRANSFER_KEY].button1 = acceptText or ACCEPT
-    local content = EnsureTransferPopupContent()
     return StaticPopup_Show(TRANSFER_KEY, message, nil, {
         sourceOptions = sourceOptions or {},
         targetOptions = targetOptions or {},
         onAccept = onAccept,
-    }, content) ~= nil
+    }) ~= nil
 end

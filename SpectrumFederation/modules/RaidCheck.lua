@@ -1674,7 +1674,9 @@ local function HasBeenWhisperedToday(member, mode)
 		return false
 	end
 
-	return whisperDay == date("%Y-%m-%d")
+
+	local currentDay = GetWhisperDayKey(time())
+	return whisperDay == currentDay
 end
 
 local function HasEquipmentData(slotsByInventory)
@@ -1699,7 +1701,10 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	local inspectState = RC:_GetTroubleshootingInspectState(unitInfo.unit, unitInfo)
 	local whisper = ShouldWhisper(mode, cfg)
 	local whisperTarget = unitInfo.id or unitInfo.short
-	local member = FindMember(profile, unitInfo.id)
+	local member = nil
+	if whisper or mode == "raid" then
+		member = FindMember(profile, unitInfo.id)
+	end
 	local result = {
 		name = unitInfo.short,
 		displayName = unitInfo.displayName or unitInfo.short,

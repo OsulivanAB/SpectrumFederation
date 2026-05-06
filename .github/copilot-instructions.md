@@ -40,6 +40,7 @@ python3 .github/scripts/lint_all.py
 
 ## Pull request descriptions
 - **Always use the repository PR template** at `.github/pull_request_template.md` when creating or updating a PR description.
+- At the start of each task, read `.github/pull_request_template.md` and draft PR updates against that structure from the beginning.
 - Preserve the template's section headings, order, checklist items, and prompts; do not replace the template with a custom format.
 - Copy the template structure into the PR body and fill it in; do **not** submit only a summary, only a checklist, or any alternate layout.
 - Do **not** wrap the PR title or PR description in custom XML/HTML tags such as `<pr_title>` or `<pr_description>`.
