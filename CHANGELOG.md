@@ -47,6 +47,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [0.5.20-beta.14] - 2026-05-06
+
+### Changed
+- Resolved latest stacked-PR merge conflicts against `beta` in TOC/readme/changelog and RaidCheck content.
+
 ## [0.5.20-beta.13] - 2026-05-06
 
 ### Changed
