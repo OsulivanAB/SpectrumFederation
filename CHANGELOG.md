@@ -47,6 +47,15 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [0.5.20-beta.12] - 2026-05-06
+
+### Changed
+- Pre-Raid and Raid Check missing-item whispers are now deduplicated per member per day to reduce redundant notifications.
+
+## [0.5.20-beta.11] - 2026-05-06
+
+### Fixed
+- Missing-enchant overlays in the Loot Helper equipment popup no longer pulse and now display as a static red highlight.
 ## [0.5.20-beta.10] - 2026-05-03
 
 ### Removed
