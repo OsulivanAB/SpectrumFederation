@@ -487,8 +487,6 @@ function EquipmentWindow:Refresh()
     end
 
     if not armor then return end
-
-    local issuesByInventory = self:_GetEquipmentIssuesByInventorySlot()
     local buttons = self._frame.Content.SlotButtons or {}
     for _, btn in ipairs(buttons) do
         local slotKey = btn.slotKey
@@ -512,12 +510,9 @@ function EquipmentWindow:Refresh()
             end
 
             if btn.IssueOverlay then
-                local inventorySlot = SLOT_KEY_TO_INVENTORY[slotKey]
-                if inventorySlot and issuesByInventory and issuesByInventory[inventorySlot] then
-                    SetIssueOverlayShown(btn.IssueOverlay, true)
-                else
-                    SetIssueOverlayShown(btn.IssueOverlay, false)
-                end
+                -- This panel is for loot-roll usage only; do not surface RaidCheck troubleshooting
+                -- (missing enchants/gems/items) here.
+                SetIssueOverlayShown(btn.IssueOverlay, false)
             end
 
             -- Set click handler
