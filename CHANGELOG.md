@@ -48,6 +48,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.17] - 2026-05-06
+
+### Fixed
+- Resolved an issue where unequipped gear items were incorrectly highlighted in red in the Loot Helper equipment window.
+
 ## [0.5.20-beta.16] - 2026-05-06
 
 ### Fixed
