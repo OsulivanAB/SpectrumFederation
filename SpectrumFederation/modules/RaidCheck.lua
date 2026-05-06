@@ -1674,7 +1674,7 @@ local function HasBeenWhisperedToday(member, mode)
 		return false
 	end
 
-	local currentDay = date("%Y-%m-%d", time())
+	local currentDay = GetWhisperDayKey(time())
 	return whisperDay == currentDay
 end
 
