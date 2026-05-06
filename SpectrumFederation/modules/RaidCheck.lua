@@ -578,7 +578,6 @@ function RC:_GetInspectState()
 		active = nil,
 		inspectPausedForCombat = false,
 		localSnapshot = nil,
-		preRaidWhispers = nil,
 		snapshotVersion = 0,
 		lastNotifiedVersion = -1,
 		backgroundMonitorStarted = false,
@@ -1617,16 +1616,67 @@ local function ShouldWhisper(mode, cfg)
 	return cfg.enableWhispersRaid
 end
 
-local function GetPreRaidWhisperSessionKey()
-	local sync = SF.LootHelperSync
-	if sync and type(sync.GetSessionId) == "function" then
-		local sessionId = sync:GetSessionId()
-		if type(sessionId) == "string" and sessionId ~= "" then
-			return "loot:" .. sessionId
-		end
+local function GetWhisperDayKey(timestamp)
+	local value = tonumber(timestamp)
+	if not value then
+		return nil
+	end
+	return date("%Y-%m-%d", value)
+end
+
+local function GetMostRecentWhisperTimestamp(member, mode)
+	if type(member) ~= "table" then
+		return nil
 	end
 
-	return "runtime"
+	if mode == "pre" then
+		if type(member.GetMostRecentPreRaidCheckWhisper) == "function" then
+			return tonumber(member:GetMostRecentPreRaidCheckWhisper()) or nil
+		end
+		return tonumber(member.most_recent_pre_raid_check_whisper) or nil
+	end
+
+	if type(member.GetMostRecentRaidCheckWhisper) == "function" then
+		return tonumber(member:GetMostRecentRaidCheckWhisper()) or nil
+	end
+	return tonumber(member.most_recent_raid_check_whisper) or nil
+end
+
+local function MarkWhisperSent(member, mode, timestamp)
+	if type(member) ~= "table" then
+		return
+	end
+
+	if mode == "pre" then
+		if type(member.MarkPreRaidCheckWhisperSent) == "function" then
+			member:MarkPreRaidCheckWhisperSent(timestamp)
+		else
+			member.most_recent_pre_raid_check_whisper = tonumber(timestamp) or time()
+		end
+		return
+	end
+
+	if type(member.MarkRaidCheckWhisperSent) == "function" then
+		member:MarkRaidCheckWhisperSent(timestamp)
+	else
+		member.most_recent_raid_check_whisper = tonumber(timestamp) or time()
+	end
+end
+
+local function HasBeenWhisperedToday(member, mode)
+	local timestamp = GetMostRecentWhisperTimestamp(member, mode)
+	if not timestamp then
+		return false
+	end
+
+	local whisperDay = GetWhisperDayKey(timestamp)
+	if not whisperDay then
+		return false
+	end
+
+
+	local currentDay = GetWhisperDayKey(time())
+	return whisperDay == currentDay
 end
 
 local function HasEquipmentData(slotsByInventory)
@@ -1647,48 +1697,14 @@ local function HasEquipmentData(slotsByInventory)
 	return false
 end
 
-function RC:_GetPreRaidWhisperTracker()
-	local state = self:_GetInspectState()
-	local tracker = state.preRaidWhispers
-	if type(tracker) ~= "table" then
-		tracker = {
-			sessionKey = nil,
-			sent = {},
-		}
-		state.preRaidWhispers = tracker
-	end
-
-	local sessionKey = GetPreRaidWhisperSessionKey()
-	if tracker.sessionKey ~= sessionKey then
-		tracker.sessionKey = sessionKey
-		tracker.sent = {}
-	end
-
-	return tracker
-end
-
-function RC:HasSentPreRaidWhisper(memberId)
-	if type(memberId) ~= "string" or memberId == "" then
-		return false
-	end
-
-	local tracker = self:_GetPreRaidWhisperTracker()
-	return tracker.sent[memberId] == true
-end
-
-function RC:MarkPreRaidWhisperSent(memberId)
-	if type(memberId) ~= "string" or memberId == "" then
-		return
-	end
-
-	local tracker = self:_GetPreRaidWhisperTracker()
-	tracker.sent[memberId] = true
-end
-
 local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	local inspectState = RC:_GetTroubleshootingInspectState(unitInfo.unit, unitInfo)
 	local whisper = ShouldWhisper(mode, cfg)
 	local whisperTarget = unitInfo.id or unitInfo.short
+	local member = nil
+	if whisper or mode == "raid" then
+		member = FindMember(profile, unitInfo.id)
+	end
 	local result = {
 		name = unitInfo.short,
 		displayName = unitInfo.displayName or unitInfo.short,
@@ -1714,20 +1730,14 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
-		local whisperDedupeKey = result.id or whisperTarget
-		local alreadyWhispered = false
-		if mode == "pre" then
-			alreadyWhispered = RC:HasSentPreRaidWhisper(whisperDedupeKey)
-		end
+		local alreadyWhispered = HasBeenWhisperedToday(member, mode)
 		if whisper and not alreadyWhispered then
 			WhisperMissing(whisperTarget, pointName, list, mode)
 			result.whisperedMissing = true
-			if mode == "pre" then
-				RC:MarkPreRaidWhisperSent(whisperDedupeKey)
-				suffix = " (whispered)"
-			end
-		elseif whisper and alreadyWhispered and mode == "pre" then
-			suffix = " (already whispered this session)"
+			MarkWhisperSent(member, mode, time())
+			suffix = " (whispered)"
+		elseif whisper and alreadyWhispered then
+			suffix = " (already whispered today)"
 		end
 		SF:PrintWarning(("%s Missing: %s%s"):format(result.displayName, list, suffix))
 		result.missing = list
@@ -1735,7 +1745,6 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	end
 
 	if mode == "raid" then
-		local member = FindMember(profile, unitInfo.id)
 		if not member then
 			SF:PrintWarning(("Skipping point award for %s (not in active profile)."):format(unitInfo.short))
 			return result

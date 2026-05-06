@@ -46,6 +46,57 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+
+
+
+## [0.5.20-beta.18] - 2026-05-06
+
+### Fixed
+- Addressed layout warping issues in the Transfer Points dialog by refining content width and alignment.
+- Improved initialization and positioning of transfer controls to ensure consistent behavior across dialog variants.
+
+## [0.5.20-beta.17] - 2026-05-06
+
+### Fixed
+- Resolved an issue where unequipped gear items were incorrectly highlighted in red in the Loot Helper equipment window.
+
+## [0.5.20-beta.16] - 2026-05-06
+
+### Fixed
+- Resolved dropdown and anchor positioning issues in the Main Swap transfer dialog.
+- Fixed errors related to transfer dialog content initialization and layout updates.
+
+## [0.5.20-beta.15] - 2026-05-06
+
+### Changed
+- Resolved another stacked-PR merge pass against `beta` and reconciled TOC/README/CHANGELOG version metadata.
+
+## [0.5.20-beta.14] - 2026-05-06
+
+### Changed
+- Resolved latest stacked-PR merge conflicts against `beta` in TOC/readme/changelog and RaidCheck content.
+
+## [0.5.20-beta.13] - 2026-05-06
+
+### Changed
+- Resolved stacked-PR merge conflicts against `beta` in RaidCheck and changelog content.
+
+## [0.5.20-beta.12] - 2026-05-06
+
+### Changed
+- Pre-Raid and Raid Check missing-item whispers are now deduplicated per member per day to reduce redundant notifications.
+
+## [0.5.20-beta.11] - 2026-05-06
+
+### Fixed
+- Missing-enchant overlays in the Loot Helper equipment popup no longer pulse and now display as a static red highlight.
+
+## [0.5.20-beta.10] - 2026-05-03
+
+### Removed
+- Automatic point adjustments for equipping or unequipping raid gear slots.
+
 ## [0.5.20] - 2026-05-01
 
 ### Changed

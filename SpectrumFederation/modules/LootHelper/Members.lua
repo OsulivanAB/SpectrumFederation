@@ -147,6 +147,8 @@ function Member.new(identifier, role, class)
     instance.className = instance.class
     
     instance.pointBalance = 0
+    instance.most_recent_pre_raid_check_whisper = nil
+    instance.most_recent_raid_check_whisper = nil
     
     -- Initialize armor dictionary with all slots
     -- Each slot tracks whether the member has used their ONE point for that armor piece
@@ -305,6 +307,22 @@ end
 -- @return (number) - Current point balance
 function Member:GetPointBalance()
     return self.pointBalance
+end
+
+function Member:GetMostRecentPreRaidCheckWhisper()
+    return tonumber(self.most_recent_pre_raid_check_whisper) or nil
+end
+
+function Member:GetMostRecentRaidCheckWhisper()
+    return tonumber(self.most_recent_raid_check_whisper) or nil
+end
+
+function Member:MarkPreRaidCheckWhisperSent(timestamp)
+    self.most_recent_pre_raid_check_whisper = tonumber(timestamp) or time()
+end
+
+function Member:MarkRaidCheckWhisperSent(timestamp)
+    self.most_recent_raid_check_whisper = tonumber(timestamp) or time()
 end
 
 -- Function to get all armor slot statuses
@@ -699,7 +717,6 @@ function Member:ToggleEquipment(slot)
             return false
         end
 
-        self:IncrementPoints()
         self.armor[slot] = false
 
         -- Add Log Entry to Loot Profile Table
@@ -712,7 +729,7 @@ function Member:ToggleEquipment(slot)
         end
 
         if SF.Debug then
-            SF.Debug:Info("MEMBER", "%s removed equipment: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
+            SF.Debug:Info("MEMBER", "%s removed equipment: %s", self:GetFullIdentifier(), slot)
         end
         return true
     else
@@ -735,7 +752,6 @@ function Member:ToggleEquipment(slot)
             return false
         end
         
-        self:DecrementPoints()
         self.armor[slot] = true
 
         -- Add Log Entry to Loot Profile Table
@@ -748,7 +764,7 @@ function Member:ToggleEquipment(slot)
         end
         
         if SF.Debug then
-            SF.Debug:Info("MEMBER", "%s equipped item: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
+            SF.Debug:Info("MEMBER", "%s equipped item: %s", self:GetFullIdentifier(), slot)
         end
         return true
     end
@@ -833,6 +849,8 @@ function Member:ToTable()
         class = self.class,
         pointBalance = self.pointBalance,
         armor = armorCopy,
+        most_recent_pre_raid_check_whisper = tonumber(self.most_recent_pre_raid_check_whisper) or nil,
+        most_recent_raid_check_whisper = tonumber(self.most_recent_raid_check_whisper) or nil,
     }
 end
 
@@ -849,6 +867,8 @@ function Member.FromTable(t)
     
     -- Set point balance
     m.pointBalance = tonumber(t.pointBalance) or 0
+    m.most_recent_pre_raid_check_whisper = tonumber(t.most_recent_pre_raid_check_whisper) or nil
+    m.most_recent_raid_check_whisper = tonumber(t.most_recent_raid_check_whisper) or nil
     
     -- Set armor statuses
     if type(t.armor) == "table" then

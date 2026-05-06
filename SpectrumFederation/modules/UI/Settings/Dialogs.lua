@@ -106,8 +106,10 @@ function Dialogs:Prompt(message, acceptText, defaultText, onAccept)
 end
 
 local TRANSFER_KEY = "SF_SETTINGS_MEMBER_TRANSFER"
-local TRANSFER_CONTENT_WIDTH = 360
-local transferPopupContent
+-- Keep inserted content close to the default StaticPopup text width (290) so the dialog doesn't expand/warp.
+local TRANSFER_CONTENT_WIDTH = 290
+local TRANSFER_CONTENT_INITIAL_HEIGHT = 1
+local TRANSFER_CONTENT_INSET_X = 8
 
 local function SameMember(a, b)
     if SF.NameUtil and SF.NameUtil.SamePlayer then
@@ -129,14 +131,16 @@ local function FindOptionLabel(options, value)
     return nil
 end
 
-local function EnsureTransferPopupContent()
-    if transferPopupContent then
-        return transferPopupContent
+local function EnsureTransferPopupContent(content)
+    if not content then
+        return nil
     end
 
-    local content = CreateFrame("Frame", nil, UIParent)
-    content:SetSize(TRANSFER_CONTENT_WIDTH, 1)
-    content:Hide()
+    if content._sfTransferContentInitialized then
+        return content
+    end
+
+    content:SetSize(TRANSFER_CONTENT_WIDTH, TRANSFER_CONTENT_INITIAL_HEIGHT)
 
     content.sourceLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
     content.sourceLabel:SetText("Transfer points from")
@@ -153,9 +157,8 @@ local function EnsureTransferPopupContent()
     content.validationText = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     content.validationText:SetJustifyH("LEFT")
     content.validationText:SetJustifyV("TOP")
-    content.validationText:SetWidth(TRANSFER_CONTENT_WIDTH)
 
-    transferPopupContent = content
+    content._sfTransferContentInitialized = true
     return content
 end
 
@@ -164,22 +167,27 @@ local function LayoutTransferPopupContent(content)
         return
     end
 
+    local contentWidth = content:GetWidth() or TRANSFER_CONTENT_WIDTH
+    local insetX = TRANSFER_CONTENT_INSET_X
+    local innerWidth = math.max(1, contentWidth - (insetX * 2))
+
     content.sourceLabel:ClearAllPoints()
-    content.sourceLabel:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+    content.sourceLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, 0)
 
     content.sourceDropdown:ClearAllPoints()
     content.sourceDropdown:SetPoint("TOPLEFT", content.sourceLabel, "BOTTOMLEFT", 0, -4)
-    content.sourceDropdown:SetWidth(TRANSFER_CONTENT_WIDTH)
+    content.sourceDropdown:SetWidth(innerWidth)
 
     content.targetLabel:ClearAllPoints()
     content.targetLabel:SetPoint("TOPLEFT", content.sourceDropdown, "BOTTOMLEFT", 0, -10)
 
     content.targetDropdown:ClearAllPoints()
     content.targetDropdown:SetPoint("TOPLEFT", content.targetLabel, "BOTTOMLEFT", 0, -4)
-    content.targetDropdown:SetWidth(TRANSFER_CONTENT_WIDTH)
+    content.targetDropdown:SetWidth(innerWidth)
 
     content.validationText:ClearAllPoints()
     content.validationText:SetPoint("TOPLEFT", content.targetDropdown, "BOTTOMLEFT", 0, -10)
+    content.validationText:SetWidth(innerWidth)
 
     local sourceLabelHeight = content.sourceLabel:GetStringHeight() or 0
     local sourceDropdownHeight = content.sourceDropdown:GetHeight() or 0
@@ -238,7 +246,10 @@ local function UpdateTransferPopupState(dialog)
     local data = dialog.data or {}
     local sourceMemberId = dialog.__sfSourceMemberId
     local targetMemberId = dialog.__sfTargetMemberId
-    local content = dialog.insertedFrame or EnsureTransferPopupContent()
+    local content = EnsureTransferPopupContent(dialog.insertedFrame)
+    if not content then
+        return
+    end
     local button1 = dialog.GetButton1 and dialog:GetButton1() or dialog.button1
 
     local valid = true
@@ -293,8 +304,10 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         preferredIndex = 3,
 
         OnShow = function(self, data)
-            local content = self.insertedFrame or EnsureTransferPopupContent()
-            content:Show()
+            local content = EnsureTransferPopupContent(self.insertedFrame)
+            if not content then
+                return
+            end
 
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
@@ -337,17 +350,18 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
         OnHide = function(self)
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
-            if self.insertedFrame and self.insertedFrame.validationText then
-                self.insertedFrame.validationText:SetText("")
+            local content = self.insertedFrame
+            if content and content.validationText then
+                content.validationText:SetText("")
             end
-            if self.insertedFrame and self.insertedFrame.sourceDropdown and self.insertedFrame.sourceDropdown.SetDefaultText then
-                self.insertedFrame.sourceDropdown:SetDefaultText("Select member")
+            if content and content.sourceDropdown and content.sourceDropdown.SetDefaultText then
+                content.sourceDropdown:SetDefaultText("Select member")
             end
-            if self.insertedFrame and self.insertedFrame.targetDropdown and self.insertedFrame.targetDropdown.SetDefaultText then
-                self.insertedFrame.targetDropdown:SetDefaultText("Select member")
+            if content and content.targetDropdown and content.targetDropdown.SetDefaultText then
+                content.targetDropdown:SetDefaultText("Select member")
             end
-            if self.insertedFrame then
-                LayoutTransferPopupContent(self.insertedFrame)
+            if content then
+                LayoutTransferPopupContent(content)
             end
         end,
     }
@@ -366,10 +380,18 @@ function Dialogs:TransferMemberHistory(message, acceptText, sourceOptions, targe
     end
 
     StaticPopupDialogs[TRANSFER_KEY].button1 = acceptText or ACCEPT
-    local content = EnsureTransferPopupContent()
+
+    if not self._sfTransferInsertedFrame then
+        self._sfTransferInsertedFrame = CreateFrame("Frame", nil, UIParent)
+    end
+
+    local insertedFrame = EnsureTransferPopupContent(self._sfTransferInsertedFrame)
+    insertedFrame:Show()
+    LayoutTransferPopupContent(insertedFrame)
+
     return StaticPopup_Show(TRANSFER_KEY, message, nil, {
         sourceOptions = sourceOptions or {},
         targetOptions = targetOptions or {},
         onAccept = onAccept,
-    }, content) ~= nil
+    }, insertedFrame) ~= nil
 end
