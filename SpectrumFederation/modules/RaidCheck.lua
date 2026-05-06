@@ -1675,10 +1675,6 @@ local function HasBeenWhisperedToday(member, mode)
 	end
 
 	local currentDay = date("%Y-%m-%d", time())
-	if not currentDay then
-		return false
-	end
-
 	return whisperDay == currentDay
 end
 
@@ -1704,7 +1700,10 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 	local inspectState = RC:_GetTroubleshootingInspectState(unitInfo.unit, unitInfo)
 	local whisper = ShouldWhisper(mode, cfg)
 	local whisperTarget = unitInfo.id or unitInfo.short
-	local member = FindMember(profile, unitInfo.id)
+	local member = nil
+	if whisper or mode == "raid" then
+		member = FindMember(profile, unitInfo.id)
+	end
 	local result = {
 		name = unitInfo.short,
 		displayName = unitInfo.displayName or unitInfo.short,
