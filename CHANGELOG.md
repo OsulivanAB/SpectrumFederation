@@ -47,6 +47,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
 ## [0.5.20-beta.16] - 2026-05-06
 
 ### Changed
@@ -76,6 +77,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ### Fixed
 - Missing-enchant overlays in the Loot Helper equipment popup no longer pulse and now display as a static red highlight.
+
 ## [0.5.20-beta.10] - 2026-05-03
 
 ### Removed
