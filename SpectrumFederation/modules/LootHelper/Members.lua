@@ -717,7 +717,6 @@ function Member:ToggleEquipment(slot)
             return false
         end
 
-        self:IncrementPoints()
         self.armor[slot] = false
 
         -- Add Log Entry to Loot Profile Table
@@ -730,7 +729,7 @@ function Member:ToggleEquipment(slot)
         end
 
         if SF.Debug then
-            SF.Debug:Info("MEMBER", "%s removed equipment: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
+            SF.Debug:Info("MEMBER", "%s removed equipment: %s", self:GetFullIdentifier(), slot)
         end
         return true
     else
@@ -753,7 +752,6 @@ function Member:ToggleEquipment(slot)
             return false
         end
         
-        self:DecrementPoints()
         self.armor[slot] = true
 
         -- Add Log Entry to Loot Profile Table
@@ -766,7 +764,7 @@ function Member:ToggleEquipment(slot)
         end
         
         if SF.Debug then
-            SF.Debug:Info("MEMBER", "%s equipped item: %s (points: %d)", self:GetFullIdentifier(), slot, self.pointBalance)
+            SF.Debug:Info("MEMBER", "%s equipped item: %s", self:GetFullIdentifier(), slot)
         end
         return true
     end

@@ -46,6 +46,17 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.11] - 2026-05-06
+
+### Fixed
+- Missing-enchant overlays in the Loot Helper equipment popup no longer pulse and now display as a static red highlight.
+
+## [0.5.20-beta.10] - 2026-05-03
+
+### Removed
+- Automatic point adjustments for equipping or unequipping raid gear slots.
+
 ## [0.5.20] - 2026-05-01
 
 ### Changed
