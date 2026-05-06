@@ -1674,7 +1674,12 @@ local function HasBeenWhisperedToday(member, mode)
 		return false
 	end
 
-	return whisperDay == date("%Y-%m-%d", time())
+	local currentDay = date("%Y-%m-%d", time())
+	if not currentDay then
+		return false
+	end
+
+	return whisperDay == currentDay
 end
 
 local function HasEquipmentData(slotsByInventory)
