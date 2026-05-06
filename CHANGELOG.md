@@ -47,6 +47,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [0.5.20-beta.15] - 2026-05-06
+
+### Changed
+- Resolved another stacked-PR merge pass against `beta` and reconciled TOC/README/CHANGELOG version metadata.
+
 ## [0.5.20-beta.14] - 2026-05-06
 
 ### Changed
