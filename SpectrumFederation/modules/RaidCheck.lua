@@ -7,6 +7,7 @@ local addonName, SF = ...
 -- luacheck: globals GetInventoryItemID
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
+-- luacheck: globals InspectFrame InspectUnit hooksecurefunc
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -21,6 +22,7 @@ local INSPECT_RETRY_BASE_SECONDS = 2
 local INSPECT_RETRY_MAX_SECONDS = 10
 local INSPECT_REQUEST_TIMEOUT_SECONDS = 1.5
 local BACKGROUND_INSPECT_POLL_SECONDS = 5
+local MANUAL_INSPECT_PAUSE_SECONDS = 2
 local SLOT_DEFS = {
 	head = { label = "Head", slots = { INVSLOT_HEAD } },
 	neck = { label = "Neck", slots = { INVSLOT_NECK } },
@@ -351,6 +353,10 @@ local function IsInspectPausedForCombat()
 	return InCombatLockdown and InCombatLockdown() or false
 end
 
+local function IsInspectFrameShown()
+	return InspectFrame and InspectFrame.IsShown and InspectFrame:IsShown() or false
+end
+
 local function HasActiveLootHelperSession()
 	if not SF.LootHelperSync or type(SF.LootHelperSync.IsSessionActive) ~= "function" then
 		return false
@@ -638,12 +644,92 @@ function RC:_GetInspectState()
 		listeners = {},
 		active = nil,
 		inspectPausedForCombat = false,
+		manualInspectPauseUntil = nil,
 		localSnapshot = nil,
 		snapshotVersion = 0,
 		lastNotifiedVersion = -1,
 		backgroundMonitorStarted = false,
 	}
 	return self._inspectState
+end
+
+function RC:_IsInspectPausedForManual(now)
+	local state = self:_GetInspectState()
+	now = now or (GetTime and GetTime() or 0)
+	return IsInspectFrameShown() or (state.manualInspectPauseUntil and state.manualInspectPauseUntil > now) or false
+end
+
+function RC:_PauseInspectForManualInspect(reason)
+	local state = self:_GetInspectState()
+	local now = GetTime and GetTime() or 0
+	local pauseUntil = now + MANUAL_INSPECT_PAUSE_SECONDS
+	if not state.manualInspectPauseUntil or state.manualInspectPauseUntil < pauseUntil then
+		state.manualInspectPauseUntil = pauseUntil
+	end
+
+	if state.active then
+		local active = state.active
+		state.active = nil
+
+		if active.key and not state.queued[active.key] then
+			state.queued[active.key] = true
+			local insertAt = state.queueHead
+			table.insert(state.queue, insertAt, {
+				key = active.key,
+				guid = active.guid,
+				id = active.id,
+				aliases = active.aliases,
+			})
+		end
+	end
+
+	if ClearInspectPlayer then
+		pcall(ClearInspectPlayer)
+	end
+
+	if SF.Debug then
+		SF.Debug:Verbose("RAID_CHECK", "Pausing background inspect for manual inspect (%s)", tostring(reason or "unknown"))
+	end
+
+	self:_MarkTroubleshootingDirty()
+	self:_NotifyTroubleshootingListeners()
+
+	if C_Timer and C_Timer.After then
+		local expectedUntil = state.manualInspectPauseUntil
+		C_Timer.After(MANUAL_INSPECT_PAUSE_SECONDS, function()
+			if not self or not self._inspectFrame then
+				return
+			end
+			local stillPaused = self:_IsInspectPausedForManual()
+			local currentUntil = self:_GetInspectState().manualInspectPauseUntil
+			if stillPaused or (currentUntil and expectedUntil and currentUntil > expectedUntil) then
+				return
+			end
+			self:_ResumeInspectAfterManualInspect("pause window elapsed")
+		end)
+	end
+end
+
+function RC:_ResumeInspectAfterManualInspect(reason)
+	if self:_IsInspectPausedForManual() then
+		return
+	end
+
+	local state = self:_GetInspectState()
+	if not state.manualInspectPauseUntil then
+		return
+	end
+
+	state.manualInspectPauseUntil = nil
+
+	if SF.Debug then
+		SF.Debug:Verbose("RAID_CHECK", "Resuming background inspect after manual inspect (%s)", tostring(reason or "unknown"))
+	end
+
+	self:_ProcessInspectQueue()
+	self:_RunBackgroundInspectPass()
+	self:_MarkTroubleshootingDirty()
+	self:_NotifyTroubleshootingListeners()
 end
 
 function RC:_MarkTroubleshootingDirty()
@@ -793,7 +879,7 @@ function RC:_InvalidateInspectUnit(unit)
 end
 
 function RC:_PrimeBackgroundInspectQueue()
-	if not HasActiveLootHelperSession() or IsInspectPausedForCombat() then
+	if not HasActiveLootHelperSession() or IsInspectPausedForCombat() or self:_IsInspectPausedForManual() then
 		return
 	end
 
@@ -894,6 +980,7 @@ function RC:EnsureInspectSupport()
 
 	local frame = CreateFrame("Frame")
 	self._inspectFrame = frame
+	frame:RegisterEvent("ADDON_LOADED")
 	frame:RegisterEvent("INSPECT_READY")
 	frame:RegisterEvent("GROUP_ROSTER_UPDATE")
 	frame:RegisterEvent("PLAYER_ENTERING_WORLD")
@@ -902,7 +989,11 @@ function RC:EnsureInspectSupport()
 	frame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 	frame:RegisterEvent("UNIT_INVENTORY_CHANGED")
 	frame:SetScript("OnEvent", function(_, event, arg1)
-		if event == "INSPECT_READY" then
+		if event == "ADDON_LOADED" then
+			if arg1 == "Blizzard_InspectUI" then
+				self:_HookInspectUI()
+			end
+		elseif event == "INSPECT_READY" then
 			self:_HandleInspectReady(arg1)
 		elseif event == "PLAYER_REGEN_DISABLED" then
 			self:_PauseInspectForCombat()
@@ -943,7 +1034,35 @@ function RC:EnsureInspectSupport()
 	if IsInspectPausedForCombat() then
 		self:_GetInspectState().inspectPausedForCombat = true
 	end
+	self:_HookInspectUI()
 	self:_StartBackgroundInspectMonitor()
+end
+
+function RC:_HookInspectUI()
+	if not self._inspectUnitHookInstalled and hooksecurefunc and type(InspectUnit) == "function" then
+		self._inspectUnitHookInstalled = true
+		hooksecurefunc("InspectUnit", function()
+			if RC and RC._PauseInspectForManualInspect then
+				RC:_PauseInspectForManualInspect("InspectUnit")
+			end
+		end)
+	end
+
+	if InspectFrame and InspectFrame.HookScript and not InspectFrame.__sfRaidCheckHooked then
+		InspectFrame.__sfRaidCheckHooked = true
+
+		InspectFrame:HookScript("OnShow", function()
+			if RC and RC._PauseInspectForManualInspect then
+				RC:_PauseInspectForManualInspect("InspectFrame shown")
+			end
+		end)
+
+		InspectFrame:HookScript("OnHide", function()
+			if RC and RC._ResumeInspectAfterManualInspect then
+				RC:_ResumeInspectAfterManualInspect("InspectFrame hidden")
+			end
+		end)
+	end
 end
 
 function RC:_HandleInspectTimeout(key, requestedAt)
@@ -1065,7 +1184,7 @@ end
 
 function RC:_ProcessInspectQueue()
 	local state = self:_GetInspectState()
-	if state.active or state.inspectPausedForCombat then
+	if state.active or state.inspectPausedForCombat or self:_IsInspectPausedForManual() then
 		return
 	end
 
@@ -1425,6 +1544,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	end
 
 	local pausedForCombat = IsInspectPausedForCombat()
+	local pausedForManual = self:_IsInspectPausedForManual()
 	local inRange = pausedForCombat and false or IsUnitInInspectRange(unit)
 	local canInspectNow = CanInspectUnitNow(unit)
 	local state = self:_GetInspectState()
@@ -1434,7 +1554,7 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 	local isQueued = not not (key and state.queued and state.queued[key])
 	local hasInspectActivity = isInspectActive or isQueued or canInspectNow
 
-	if canInspectNow then
+	if canInspectNow and not pausedForManual then
 		self:_QueueInspectForUnit(unit, info, cacheEntry)
 	end
 
@@ -1447,6 +1567,10 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			status = "paused"
 			label = "Paused"
 			message = "Showing cached inspect data until combat ends."
+		elseif pausedForManual then
+			status = "paused"
+			label = "Paused"
+			message = "Showing cached inspect data while the Inspect window is open."
 		elseif isInspectActive or isQueued then
 			status = "refreshing"
 			label = "Refreshing"
@@ -1477,6 +1601,10 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			status = "paused"
 			label = "Paused"
 			message = "Showing the saved profile snapshot until combat ends."
+		elseif pausedForManual then
+			status = "paused"
+			label = "Paused"
+			message = "Showing the saved profile snapshot while the Inspect window is open."
 		elseif isInspectActive then
 			status = "refreshing"
 			label = "Refreshing"
@@ -1517,6 +1645,16 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			status = "paused",
 			label = "Paused",
 			message = "Inspect is paused during combat and will resume afterwards.",
+			isKnown = false,
+			stale = false,
+		}
+	end
+
+	if pausedForManual then
+		return {
+			status = "paused",
+			label = "Paused",
+			message = "Inspect is paused while the Inspect window is open.",
 			isKnown = false,
 			stale = false,
 		}
