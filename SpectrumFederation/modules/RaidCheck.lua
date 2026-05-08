@@ -383,6 +383,9 @@ local function SlotHasAnyItemData(slotData)
 	if itemId and itemId > 0 then
 		return true
 	end
+	if slotData.texture then
+		return true
+	end
 	return slotData.hasItem and true or false
 end
 
@@ -1284,7 +1287,7 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 	local slotKey = column and column.key
 	local link = sourceSlot and sourceSlot.link or nil
 	local itemId = sourceSlot and sourceSlot.itemId or nil
-	local hasItem = sourceSlot and (sourceSlot.hasItem or link or itemId) and true or false
+	local hasItem = sourceSlot and (sourceSlot.hasItem or link or itemId or sourceSlot.texture) and true or false
 	local configEnabled = IsSlotEnabledInConfig(cfg, slotKey, link)
 	if not configEnabled and slotKey == "offHand" and hasItem and not link and cfg and type(cfg.slots) == "table" then
 		-- If we can tell something is equipped in the offhand, but item metadata
