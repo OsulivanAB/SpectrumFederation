@@ -4,6 +4,7 @@ local addonName, SF = ...
 -- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET
 -- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
 -- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetDetailedItemLevelInfo C_Item
+-- luacheck: globals GetInventoryItemID
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
 
@@ -371,6 +372,30 @@ local function GetSnapshotSlotLink(slotsByInventory, inventorySlot)
 	return slotData and slotData.link or nil
 end
 
+local function SlotHasAnyItemData(slotData)
+	if type(slotData) ~= "table" then
+		return false
+	end
+	if slotData.link then
+		return true
+	end
+	local itemId = tonumber(slotData.itemId)
+	if itemId and itemId > 0 then
+		return true
+	end
+	return slotData.hasItem and true or false
+end
+
+local function NormalizeSlotData(slotData)
+	if type(slotData) ~= "table" then
+		return slotData
+	end
+	if slotData.hasItem == nil then
+		slotData.hasItem = SlotHasAnyItemData(slotData)
+	end
+	return slotData
+end
+
 local function CalculateAverageItemLevel(slotsByInventory)
 	local total = 0
 	local count = 0
@@ -389,6 +414,29 @@ local function CalculateAverageItemLevel(slotsByInventory)
 	end
 
 	return total / count
+end
+
+local function RecalculateCapturedSummary(captured)
+	if type(captured) ~= "table" then
+		return captured
+	end
+	if type(captured.slotsByInventory) ~= "table" then
+		captured.sawAnyData = false
+		captured.averageItemLevel = nil
+		return captured
+	end
+
+	local sawAnyData = false
+	for _, slotData in pairs(captured.slotsByInventory) do
+		NormalizeSlotData(slotData)
+		if SlotHasAnyItemData(slotData) or slotData.texture then
+			sawAnyData = true
+		end
+	end
+
+	captured.sawAnyData = sawAnyData
+	captured.averageItemLevel = CalculateAverageItemLevel(captured.slotsByInventory)
+	return captured
 end
 
 -- Collapse the raid check config into a stable cache key so prepared slot
@@ -548,14 +596,24 @@ local function CaptureTroubleshootingInventory(unit)
 		local inventorySlot = column and column.inventorySlot
 		if inventorySlot and not slotsByInventory[inventorySlot] then
 			local link = GetInventoryItemLink(unit, inventorySlot)
+			local itemId = GetInventoryItemID and GetInventoryItemID(unit, inventorySlot) or nil
 			local texture = GetInventoryItemTexture and GetInventoryItemTexture(unit, inventorySlot) or nil
+			if not texture and itemId and C_Item and C_Item.GetItemIconByID then
+				local ok, icon = pcall(C_Item.GetItemIconByID, itemId)
+				if ok then
+					texture = icon
+				end
+			end
 			local itemLevel = GetDetailedItemLevelSafe(link)
-			slotsByInventory[inventorySlot] = {
+			local slotData = {
 				link = link,
+				itemId = itemId,
 				texture = texture,
 				itemLevel = itemLevel,
 			}
-			if link or texture then
+			slotData.hasItem = SlotHasAnyItemData(slotData)
+			slotsByInventory[inventorySlot] = slotData
+			if slotData.hasItem or texture then
 				sawAnyData = true
 			end
 		end
@@ -935,6 +993,39 @@ function RC:_HandleInspectReady(guid)
 	local now = GetTime and GetTime() or 0
 	local captured = unit and CaptureTroubleshootingInventory(unit) or nil
 
+	if captured and type(captured.slotsByInventory) == "table" then
+		-- Occasionally, inspect responses return partial inventory data (certain
+		-- slots missing link/texture temporarily). Prefer the new snapshot where
+		-- it has real data, but do not overwrite a previously-known slot with a
+		-- completely blank result.
+		local fallbackSlots = entry and entry.slotsByInventory or nil
+		if type(fallbackSlots) == "table" then
+			for inventorySlot, fallbackSlot in pairs(fallbackSlots) do
+				if type(inventorySlot) == "number" and type(fallbackSlot) == "table" then
+					local nextSlot = captured.slotsByInventory[inventorySlot]
+					local hasNext = SlotHasAnyItemData(nextSlot) or (type(nextSlot) == "table" and nextSlot.texture) or false
+					local hasFallback = SlotHasAnyItemData(fallbackSlot) or fallbackSlot.texture or false
+					if (not hasNext) and hasFallback then
+						local copy = {}
+						for key, value in pairs(fallbackSlot) do
+							copy[key] = value
+						end
+						NormalizeSlotData(copy)
+						captured.slotsByInventory[inventorySlot] = copy
+					else
+						NormalizeSlotData(nextSlot)
+					end
+				end
+			end
+		else
+			for _, slotData in pairs(captured.slotsByInventory) do
+				NormalizeSlotData(slotData)
+			end
+		end
+
+		RecalculateCapturedSummary(captured)
+	end
+
 	if captured and captured.sawAnyData then
 		entry.guid = guid or active.guid
 		entry.id = active.id
@@ -1192,13 +1283,21 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 	local inventorySlot = column and column.inventorySlot
 	local slotKey = column and column.key
 	local link = sourceSlot and sourceSlot.link or nil
+	local itemId = sourceSlot and sourceSlot.itemId or nil
+	local hasItem = sourceSlot and (sourceSlot.hasItem or link or itemId) and true or false
 	local configEnabled = IsSlotEnabledInConfig(cfg, slotKey, link)
-	local twoHandExempt = isKnown and (slotKey == "offHand") and (not link) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
+	if not configEnabled and slotKey == "offHand" and hasItem and not link and cfg and type(cfg.slots) == "table" then
+		-- If we can tell something is equipped in the offhand, but item metadata
+		-- isn't available yet, treat the slot as tracked if either the physical
+		-- offhand toggle or the logical weapon toggle is enabled.
+		configEnabled = (cfg.slots.offHand or cfg.slots.weapon) and true or false
+	end
+	local twoHandExempt = isKnown and (slotKey == "offHand") and (not hasItem) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
 	local shouldCheckEnchant = isKnown and link and configEnabled and ShouldCheckTroubleshootingEnchant(slotKey, link) or false
 	local hasEnchant = isKnown and link and HasEnchant(link) or false
 	local missingEnchant = shouldCheckEnchant and not hasEnchant
 	local missingGems = isKnown and link and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
-	local missingItem = isKnown and (not link) and configEnabled and not twoHandExempt
+	local missingItem = isKnown and (not hasItem) and configEnabled and not twoHandExempt
 	local skippedEnchant = isKnown and link and configEnabled and not shouldCheckEnchant
 
 	return {
@@ -1210,6 +1309,8 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 		configEnabled = configEnabled and true or false,
 		known = isKnown and true or false,
 		link = link,
+		itemId = itemId,
+		hasItem = hasItem,
 		texture = sourceSlot and sourceSlot.texture or nil,
 		expectedEnchant = shouldCheckEnchant and true or false,
 		hasEnchant = hasEnchant and true or false,

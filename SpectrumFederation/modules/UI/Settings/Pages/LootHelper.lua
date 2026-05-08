@@ -432,6 +432,8 @@ local function ShowAuditCellTooltip(self)
 		return
 	end
 
+	local hasItem = (slotData.hasItem or slotData.link or slotData.itemId) and true or false
+
 	GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
 
 	if slotData.link then
@@ -454,8 +456,10 @@ local function ShowAuditCellTooltip(self)
 		return
 	end
 
-	if not slotData.link then
+	if not hasItem then
 		GameTooltip:AddLine("No item equipped.", 0.8, 0.8, 0.8, true)
+	elseif not slotData.link then
+		GameTooltip:AddLine("Item data is still loading for this slot.", 0.75, 0.75, 0.75, true)
 	end
 
 	if slotData.configEnabled then
@@ -865,29 +869,29 @@ local function BuildEquipmentPage(panel)
 				dataRow.ItemLevel:SetTextColor(1, 0.82, 0.2, 1)
 			else
 				dataRow.ItemLevel:SetTextColor(0.65, 0.65, 0.65, 1)
+		end
+
+		local knownCount = 0
+		local issueCount = 0
+		for columnIndex, column in ipairs(columns) do
+			local slotData = rowData.slots and rowData.slots[columnIndex] or nil
+			local cell = dataRow.Cells[columnIndex]
+			local texture = slotData and slotData.texture or GetAuditSlotPlaceholderTexture(column.key)
+			local hasItem = (slotData and (slotData.hasItem or slotData.link or slotData.itemId)) and true or false
+			local shouldShowOverlay = slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems or slotData.missingItem)
+
+			cell._rowData = rowData
+			cell._slotData = slotData or {
+				label = column.label or "Slot",
+				configEnabled = false,
+			}
+			cell.Icon:SetTexture(texture)
+			cell.Icon:SetDesaturated(not hasItem)
+			if hasItem then
+				cell.Icon:SetVertexColor(1, 1, 1, 1)
+			else
+				cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
 			end
-
-			local knownCount = 0
-			local issueCount = 0
-			for columnIndex, column in ipairs(columns) do
-				local slotData = rowData.slots and rowData.slots[columnIndex] or nil
-				local cell = dataRow.Cells[columnIndex]
-				local texture = slotData and slotData.texture or GetAuditSlotPlaceholderTexture(column.key)
-				local hasItem = slotData and slotData.link
-				local shouldShowOverlay = slotData and slotData.known and (slotData.missingEnchant or slotData.missingGems or slotData.missingItem)
-
-				cell._rowData = rowData
-				cell._slotData = slotData or {
-					label = column.label or "Slot",
-					configEnabled = false,
-				}
-				cell.Icon:SetTexture(texture)
-				cell.Icon:SetDesaturated(not hasItem)
-				if hasItem then
-					cell.Icon:SetVertexColor(1, 1, 1, 1)
-				else
-					cell.Icon:SetVertexColor(0.55, 0.55, 0.55, 0.85)
-				end
 
 				SetAuditMissingOverlay(cell.MissingOverlay, shouldShowOverlay)
 				if slotData and slotData.known then
