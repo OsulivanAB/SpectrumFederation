@@ -588,6 +588,17 @@ local function BuildEquipmentPage(panel)
 		return panel.IsShown and panel:IsShown() and true or false
 	end
 
+	local function UpdateBackgroundInspect(reason)
+		if not (SF.RaidCheck and SF.RaidCheck.SetBackgroundInspectEnabled) then
+			return
+		end
+
+		local now = GetTime and GetTime() or 0
+		local manualWindowActive = now <= manualRefreshUntil
+		local enabled = IsEquipmentPageActive() and (IsEquipmentAutoRefreshEnabled() or manualWindowActive) and true or false
+		SF.RaidCheck:SetBackgroundInspectEnabled(enabled, reason or "equipment page")
+	end
+
 	local function ReflowEquipmentPage()
 		if IsEquipmentPageActive() and pageBuilder and pageBuilder.Reflow then
 			pageBuilder:Reflow()
@@ -650,6 +661,7 @@ local function BuildEquipmentPage(panel)
 			if panel.__sfPageBuilder then
 				panel.__sfPageBuilder:Refresh()
 			end
+			UpdateBackgroundInspect("auto refresh toggle")
 		end,
 	})
 	controls:AddButton(introSection, {
@@ -661,6 +673,7 @@ local function BuildEquipmentPage(panel)
 			if SF.Debug then
 				SF.Debug:Info("UI", "Refresh Snapshot clicked; manual refresh window open for %.1f seconds", EQUIPMENT_MANUAL_REFRESH_WINDOW_SECONDS)
 			end
+			UpdateBackgroundInspect("manual refresh window started")
 			RequestEquipmentPageRedraw("manual refresh button immediate")
 			if SF.RaidCheck and SF.RaidCheck.RequestTroubleshootingRefresh then
 				SF.RaidCheck:RequestTroubleshootingRefresh()
@@ -676,6 +689,12 @@ local function BuildEquipmentPage(panel)
 				RequestEquipmentPageRedraw("manual refresh button")
 			end
 			ScheduleManualRefreshFollowUps("manual refresh follow-up")
+
+			if C_Timer and C_Timer.After then
+				C_Timer.After(EQUIPMENT_MANUAL_REFRESH_WINDOW_SECONDS, function()
+					UpdateBackgroundInspect("manual refresh window ended")
+				end)
+			end
 		end,
 		visible = function()
 			return not IsEquipmentAutoRefreshEnabled()
@@ -1119,6 +1138,18 @@ local function BuildEquipmentPage(panel)
 	end, { fillHeight = true })
 
 	pageBuilder:Finalize()
+
+	if panel and panel.HookScript and not panel.__sfRaidCheckBackgroundInspectHooked then
+		panel.__sfRaidCheckBackgroundInspectHooked = true
+		panel:HookScript("OnShow", function()
+			UpdateBackgroundInspect("equipment page shown")
+		end)
+		panel:HookScript("OnHide", function()
+			UpdateBackgroundInspect("equipment page hidden")
+		end)
+	end
+
+	UpdateBackgroundInspect("equipment page initialized")
 end
 
 local function BuildLootHelperDefinition(panel, sectionIds)

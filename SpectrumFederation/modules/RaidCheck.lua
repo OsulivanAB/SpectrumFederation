@@ -649,9 +649,31 @@ function RC:_GetInspectState()
 		localSnapshot = nil,
 		snapshotVersion = 0,
 		lastNotifiedVersion = -1,
+		backgroundInspectEnabled = false,
 		backgroundMonitorStarted = false,
 	}
 	return self._inspectState
+end
+
+function RC:SetBackgroundInspectEnabled(enabled, reason)
+	self:EnsureInspectSupport()
+
+	local state = self:_GetInspectState()
+	enabled = enabled and true or false
+	if state.backgroundInspectEnabled == enabled then
+		return
+	end
+
+	state.backgroundInspectEnabled = enabled
+
+	if SF.Debug then
+		SF.Debug:Info("RAID_CHECK", "Background inspect %s (%s)", enabled and "enabled" or "disabled", tostring(reason or "unknown"))
+	end
+
+	if enabled then
+		self:_StartBackgroundInspectMonitor()
+		self:_RunBackgroundInspectPass()
+	end
 end
 
 function RC:_IsInspectPausedForManual(now)
@@ -906,6 +928,11 @@ function RC:_InvalidateInspectUnit(unit)
 end
 
 function RC:_PrimeBackgroundInspectQueue()
+	local state = self:_GetInspectState()
+	if not state.backgroundInspectEnabled then
+		return
+	end
+
 	if not HasActiveLootHelperSession() or IsInspectPausedForCombat() or self:_IsInspectPausedForManual() then
 		return
 	end
@@ -936,7 +963,7 @@ end
 
 function RC:_StartBackgroundInspectMonitor()
 	local state = self:_GetInspectState()
-	if state.backgroundMonitorStarted or not (C_Timer and C_Timer.After) then
+	if not state.backgroundInspectEnabled or state.backgroundMonitorStarted or not (C_Timer and C_Timer.After) then
 		return
 	end
 
@@ -944,6 +971,11 @@ function RC:_StartBackgroundInspectMonitor()
 
 	local function BackgroundInspectTick()
 		if not self._inspectFrame then
+			self:_GetInspectState().backgroundMonitorStarted = false
+			return
+		end
+
+		if not self:_GetInspectState().backgroundInspectEnabled then
 			self:_GetInspectState().backgroundMonitorStarted = false
 			return
 		end
