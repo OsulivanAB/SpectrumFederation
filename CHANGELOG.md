@@ -50,6 +50,14 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.19] - 2026-05-08
+
+### Fixed
+- Resolved issue where equipment slots incorrectly displayed as empty when items were equipped but data was still loading.
+- Improved handling of partial inventory data during inspection to prevent overwriting valid item information with blank results.
+- Enhanced tooltip messaging for equipment slots to clarify when item data is still loading.
+
 ## [0.5.20] - 2026-05-06
 
 ### Changed
