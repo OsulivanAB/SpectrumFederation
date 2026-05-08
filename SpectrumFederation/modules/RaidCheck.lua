@@ -22,7 +22,8 @@ local INSPECT_RETRY_BASE_SECONDS = 2
 local INSPECT_RETRY_MAX_SECONDS = 10
 local INSPECT_REQUEST_TIMEOUT_SECONDS = 1.5
 local BACKGROUND_INSPECT_POLL_SECONDS = 5
-local MANUAL_INSPECT_PAUSE_SECONDS = 2
+local MANUAL_INSPECT_INTENT_PAUSE_SECONDS = 30
+local MANUAL_INSPECT_POST_HIDE_PAUSE_SECONDS = 2
 local SLOT_DEFS = {
 	head = { label = "Head", slots = { INVSLOT_HEAD } },
 	neck = { label = "Neck", slots = { INVSLOT_NECK } },
@@ -662,7 +663,7 @@ end
 function RC:_PauseInspectForManualInspect(reason)
 	local state = self:_GetInspectState()
 	local now = GetTime and GetTime() or 0
-	local pauseUntil = now + MANUAL_INSPECT_PAUSE_SECONDS
+	local pauseUntil = now + MANUAL_INSPECT_INTENT_PAUSE_SECONDS
 	if not state.manualInspectPauseUntil or state.manualInspectPauseUntil < pauseUntil then
 		state.manualInspectPauseUntil = pauseUntil
 	end
@@ -683,10 +684,6 @@ function RC:_PauseInspectForManualInspect(reason)
 		end
 	end
 
-	if ClearInspectPlayer then
-		pcall(ClearInspectPlayer)
-	end
-
 	if SF.Debug then
 		SF.Debug:Verbose("RAID_CHECK", "Pausing background inspect for manual inspect (%s)", tostring(reason or "unknown"))
 	end
@@ -696,7 +693,7 @@ function RC:_PauseInspectForManualInspect(reason)
 
 	if C_Timer and C_Timer.After then
 		local expectedUntil = state.manualInspectPauseUntil
-		C_Timer.After(MANUAL_INSPECT_PAUSE_SECONDS, function()
+		C_Timer.After(math.max(0.1, expectedUntil - now), function()
 			if not self or not self._inspectFrame then
 				return
 			end
@@ -707,6 +704,36 @@ function RC:_PauseInspectForManualInspect(reason)
 			end
 			self:_ResumeInspectAfterManualInspect("pause window elapsed")
 		end)
+	end
+end
+
+function RC:_OnInspectFrameHidden()
+	local state = self:_GetInspectState()
+	if not state.manualInspectPauseUntil then
+		return
+	end
+
+	local now = GetTime and GetTime() or 0
+	local pauseUntil = now + MANUAL_INSPECT_POST_HIDE_PAUSE_SECONDS
+	if state.manualInspectPauseUntil > pauseUntil then
+		state.manualInspectPauseUntil = pauseUntil
+	end
+
+	if C_Timer and C_Timer.After then
+		local expectedUntil = state.manualInspectPauseUntil
+		C_Timer.After(math.max(0.1, expectedUntil - now), function()
+			if not self or not self._inspectFrame then
+				return
+			end
+			local stillPaused = self:_IsInspectPausedForManual()
+			local currentUntil = self:_GetInspectState().manualInspectPauseUntil
+			if stillPaused or (currentUntil and expectedUntil and currentUntil > expectedUntil) then
+				return
+			end
+			self:_ResumeInspectAfterManualInspect("InspectFrame hidden")
+		end)
+	else
+		self:_ResumeInspectAfterManualInspect("InspectFrame hidden")
 	end
 end
 
@@ -1058,8 +1085,8 @@ function RC:_HookInspectUI()
 		end)
 
 		InspectFrame:HookScript("OnHide", function()
-			if RC and RC._ResumeInspectAfterManualInspect then
-				RC:_ResumeInspectAfterManualInspect("InspectFrame hidden")
+			if RC and RC._OnInspectFrameHidden then
+				RC:_OnInspectFrameHidden()
 			end
 		end)
 	end
