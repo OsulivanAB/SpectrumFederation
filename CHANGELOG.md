@@ -52,6 +52,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.23] - 2026-05-13
+
+### Fixed
+- Resolved an issue where gem sockets were incorrectly flagged as missing when gem data was not yet cached.
+
 ## [0.5.20-beta.22] - 2026-05-13
 
 ### Added
