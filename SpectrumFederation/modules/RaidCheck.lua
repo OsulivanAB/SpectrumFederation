@@ -159,6 +159,20 @@ local function GetItemStatsSafe(link)
 	return nil
 end
 
+local function IsGemPresentInSocket(link, i)
+	-- C_Item.GetItemGemID reads the gem's item ID directly from the item link
+	-- without requiring the gem's data to be loaded in item sparse.
+	-- GetItemGem (C_Item.GetItemGem) may return nil for a filled socket when the
+	-- gem's item data has not yet been cached, causing false missing-gem reports.
+	if C_Item and C_Item.GetItemGemID then
+		local ok, gemID = pcall(C_Item.GetItemGemID, link, i)
+		if ok then
+			return type(gemID) == "number" and gemID ~= 0
+		end
+	end
+	return GetItemGem and GetItemGem(link, i) ~= nil or false
+end
+
 local function HasMissingGems(link)
 	if type(link) ~= "string" then return false end
 
@@ -176,7 +190,7 @@ local function HasMissingGems(link)
 
 	local filled = 0
 	for i = 1, sockets do
-		if GetItemGem(link, i) then
+		if IsGemPresentInSocket(link, i) then
 			filled = filled + 1
 		end
 	end
