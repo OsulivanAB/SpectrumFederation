@@ -170,7 +170,7 @@ local function IsGemPresentInSocket(link, i)
 			return type(gemID) == "number" and gemID ~= 0
 		end
 	end
-	return GetItemGem and GetItemGem(link, i) ~= nil or false
+	return (GetItemGem ~= nil) and (GetItemGem(link, i) ~= nil) or false
 end
 
 local function HasMissingGems(link)
