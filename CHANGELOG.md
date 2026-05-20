@@ -50,6 +50,31 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+
+
+## [0.5.20-beta.23] - 2026-05-13
+
+### Fixed
+- Resolved an issue where gem sockets were incorrectly flagged as missing when gem data was not yet cached.
+
+## [0.5.20-beta.22] - 2026-05-13
+
+### Added
+- Introduced a mechanism to pause and resume background inspection when the Inspect window is open or during manual inspection.
+- Added new settings to enable or disable background inspection based on equipment page activity.
+
+### Fixed
+- Resolved an issue where the inspect functionality would fail in raids when auto-scan was enabled.
+- Improved handling of manual inspection to prevent conflicts with background inspection processes.
+
+## [0.5.20-beta.19] - 2026-05-08
+
+### Fixed
+- Resolved issue where equipment slots incorrectly displayed as empty when items were equipped but data was still loading.
+- Improved handling of partial inventory data during inspection to prevent overwriting valid item information with blank results.
+- Enhanced tooltip messaging for equipment slots to clarify when item data is still loading.
+
 ## [0.5.20] - 2026-05-06
 
 ### Changed
