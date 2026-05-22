@@ -177,10 +177,28 @@ local function IsRaidCheckMetaGemRequired()
 	return false
 end
 
+local function GetRaidCheckPointsAwardPerCheck()
+	local cfg = GetRaidCheckConfig()
+	if cfg ~= nil then
+		local amount = tonumber(cfg.pointsAwardPerRaidCheck)
+		if amount ~= nil then
+			return amount
+		end
+	end
+	return 0.5
+end
+
 local function SetRaidCheckSlot(slotKey, value)
 	local profile = GetActiveProfileObject(SF.SettingsStore)
 	if profile and profile.SetRaidCheckSlotEnabled then
 		profile:SetRaidCheckSlotEnabled(slotKey, value and true or false)
+	end
+end
+
+local function SetRaidCheckPointsAwardPerCheck(value)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckPointsAwardPerCheck then
+		profile:SetRaidCheckPointsAwardPerCheck(tonumber(value) or 0.5)
 	end
 end
 
@@ -1465,6 +1483,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				},
 				{ type = "spacer", height = 12 },
 				{ type = "heading", text = "Raid Check Profile Settings" },
+				{ type = "slider", label = "Points Per Raid Check", adminOnly = true, min = 0, max = 1, step = 0.5, tooltip = "Set how many points each prepared player earns when running a Raid Check.", enabled = function() return ProfileActionsEnabled() end, get = function() return GetRaidCheckPointsAwardPerCheck() end, set = function(v) SetRaidCheckPointsAwardPerCheck(v) end },
 				{ type = "text", text = "Requirements to look for" },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Gem in Sockets", tooltip = "Require socketed gear to have gems inserted during raid checks.", get = function() return IsRaidCheckGemSocketsEnabled() end, set = function(v) SetRaidCheckGemSockets(v) end }, { label = "At Least One Meta Gem", tooltip = "Require at least one meta gem to be equipped in a valid socket during raid checks.", get = function() return IsRaidCheckMetaGemRequired() end, set = function(v) SetRaidCheckMetaGemRequired(v) end } } },
 				{ type = "text", text = "Enchants to look for" },
