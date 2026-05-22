@@ -53,6 +53,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.1] - 2026-05-22
+
+### Added
+- Admin-configurable "Points Per Raid Check" setting, allowing customization of point awards for prepared players during raid checks.
+
 ## [0.5.20] - 2026-05-20
 
 ### Changed
