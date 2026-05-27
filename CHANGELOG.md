@@ -55,6 +55,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.21-beta.1] - 2026-05-27
+
+### Fixed
+- Improved positioning of equipment slots in the Loot Helper screen for better clarity and usability. Updated layout to a four-column grid with adjusted spacing for a more intuitive arrangement of gear slots.
+
 ## [0.5.20-beta.21] - 2026-05-27
 
 ### Added
