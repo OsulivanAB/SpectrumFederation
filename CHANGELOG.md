@@ -54,6 +54,13 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.20-beta.21] - 2026-05-27
+
+### Added
+- New option to enable or disable whispers to prepared players when they earn a point during a Raid Check.
+- Checkbox in the Raid Check settings to toggle whispers for prepared players who earn points.
+
 ## [0.5.20-beta.1] - 2026-05-22
 
 ### Added
