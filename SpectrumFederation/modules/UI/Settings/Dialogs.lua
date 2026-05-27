@@ -119,6 +119,9 @@ local RAIDCHECK_WHISPER_SAVE_LABEL = (type(SAVE) == "string" and SAVE) or "Save"
 local RAIDCHECK_WHISPER_BOX_INSET = 4
 local RAIDCHECK_WHISPER_SCROLLBAR_WIDTH = 24
 local RAIDCHECK_WHISPER_TEXTBOX_HEIGHT = 64
+local RAIDCHECK_WHISPER_SCROLL_RIGHT_GAP = 6
+local RAIDCHECK_WHISPER_MIN_WIDTH = 360
+local RAIDCHECK_WHISPER_MIN_HEIGHT = 420
 
 local RAIDCHECK_WHISPER_BOX_BACKDROP = {
 	bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -139,7 +142,13 @@ local function CreateTextBox(parent)
 
 	local scroll = CreateFrame("ScrollFrame", nil, box, "UIPanelScrollFrameTemplate")
 	scroll:SetPoint("TOPLEFT", box, "TOPLEFT", RAIDCHECK_WHISPER_BOX_INSET, -RAIDCHECK_WHISPER_BOX_INSET)
-	scroll:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", -RAIDCHECK_WHISPER_BOX_INSET, RAIDCHECK_WHISPER_BOX_INSET)
+	scroll:SetPoint(
+		"BOTTOMRIGHT",
+		box,
+		"BOTTOMRIGHT",
+		-(RAIDCHECK_WHISPER_BOX_INSET + RAIDCHECK_WHISPER_SCROLL_RIGHT_GAP),
+		RAIDCHECK_WHISPER_BOX_INSET
+	)
 
 	local editBox = CreateFrame("EditBox", nil, scroll)
 	editBox:SetPoint("TOPLEFT")
@@ -189,7 +198,7 @@ local function EnsureRaidCheckWhisperPopupContent(content)
 	content.instructions:SetJustifyV("TOP")
 	content.instructions:SetWordWrap(true)
 	content.instructions:SetText(
-		"Customize the whispers sent during Pre-Raid and Raid Check.\n\n" ..
+		"Customize whispers for Raid Check and Pre-Raid Check.\n\n" ..
 			"Variables:\n" ..
 			"  {missing_list}  - List of missing enchants/gems\n" ..
 			"  {point_name}    - The profile point name\n" ..
@@ -225,6 +234,7 @@ local function LayoutRaidCheckWhisperPopupContent(content)
 	local contentWidth = content:GetWidth() or RAIDCHECK_WHISPER_CONTENT_WIDTH
 	local insetX = RAIDCHECK_WHISPER_CONTENT_INSET_X
 	local innerWidth = math.max(1, contentWidth - (insetX * 2))
+	local boxHeight = content.__sfTextBoxHeight or RAIDCHECK_WHISPER_TEXTBOX_HEIGHT
 
 	content.instructions:ClearAllPoints()
 	content.instructions:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, 0)
@@ -239,8 +249,8 @@ local function LayoutRaidCheckWhisperPopupContent(content)
 
 	content.preMissingBox:ClearAllPoints()
 	content.preMissingBox:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
-	content.preMissingBox:SetSize(innerWidth, RAIDCHECK_WHISPER_TEXTBOX_HEIGHT)
-	y = y - RAIDCHECK_WHISPER_TEXTBOX_HEIGHT - 10
+	content.preMissingBox:SetSize(innerWidth, boxHeight)
+	y = y - boxHeight - 10
 
 	content.raidMissingLabel:ClearAllPoints()
 	content.raidMissingLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
@@ -248,8 +258,8 @@ local function LayoutRaidCheckWhisperPopupContent(content)
 
 	content.raidMissingBox:ClearAllPoints()
 	content.raidMissingBox:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
-	content.raidMissingBox:SetSize(innerWidth, RAIDCHECK_WHISPER_TEXTBOX_HEIGHT)
-	y = y - RAIDCHECK_WHISPER_TEXTBOX_HEIGHT - 10
+	content.raidMissingBox:SetSize(innerWidth, boxHeight)
+	y = y - boxHeight - 10
 
 	content.raidPreparedLabel:ClearAllPoints()
 	content.raidPreparedLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
@@ -257,15 +267,83 @@ local function LayoutRaidCheckWhisperPopupContent(content)
 
 	content.raidPreparedBox:ClearAllPoints()
 	content.raidPreparedBox:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
-	content.raidPreparedBox:SetSize(innerWidth, RAIDCHECK_WHISPER_TEXTBOX_HEIGHT)
-	y = y - RAIDCHECK_WHISPER_TEXTBOX_HEIGHT
+	content.raidPreparedBox:SetSize(innerWidth, boxHeight)
+	y = y - boxHeight
 
 	content:SetHeight(math.max(1, -y))
 end
 
+local function UpdateRaidCheckWhisperDialogLayout(dialog)
+	if not dialog then
+		return
+	end
+
+	local content = EnsureRaidCheckWhisperPopupContent(dialog.insertedFrame)
+	if not content then
+		return
+	end
+
+	local dialogWidth = dialog:GetWidth() or 0
+	local availableWidth = dialogWidth - 70
+	if availableWidth < RAIDCHECK_WHISPER_CONTENT_WIDTH then
+		availableWidth = RAIDCHECK_WHISPER_CONTENT_WIDTH
+	end
+	content:SetWidth(availableWidth)
+
+	local dialogHeight = dialog:GetHeight() or 0
+	local approxNonContent = 210
+	local availableHeight = dialogHeight - approxNonContent
+	local desiredBoxHeight = math.floor(availableHeight / 3)
+	desiredBoxHeight = math.max(RAIDCHECK_WHISPER_TEXTBOX_HEIGHT, desiredBoxHeight)
+	desiredBoxHeight = math.min(160, desiredBoxHeight)
+	content.__sfTextBoxHeight = desiredBoxHeight
+
+	LayoutRaidCheckWhisperPopupContent(content)
+
+	if content.preMissingUpdateSize then content.preMissingUpdateSize() end
+	if content.raidMissingUpdateSize then content.raidMissingUpdateSize() end
+	if content.raidPreparedUpdateSize then content.raidPreparedUpdateSize() end
+end
+
+local function EnsureRaidCheckWhisperDialogInteractions(dialog)
+	if not dialog or dialog.__sfRaidCheckWhisperInteractive then
+		return
+	end
+
+	dialog.__sfRaidCheckWhisperInteractive = true
+
+	dialog:SetClampedToScreen(true)
+	dialog:SetMovable(true)
+	dialog:EnableMouse(true)
+	dialog:RegisterForDrag("LeftButton")
+	dialog:SetScript("OnDragStart", function(self)
+		if self.IsMovable and self:IsMovable() then
+			self:StartMoving()
+		end
+	end)
+	dialog:SetScript("OnDragStop", function(self)
+		self:StopMovingOrSizing()
+	end)
+
+	dialog:SetResizable(true)
+	if dialog.SetMinResize then
+		dialog:SetMinResize(RAIDCHECK_WHISPER_MIN_WIDTH, RAIDCHECK_WHISPER_MIN_HEIGHT)
+	end
+
+	if not dialog.__sfResizeButton then
+		local resizeBtn = CreateFrame("Button", nil, dialog, "UIPanelResizeButtonTemplate")
+		resizeBtn:SetPoint("BOTTOMRIGHT", dialog, "BOTTOMRIGHT", -6, 6)
+		dialog.__sfResizeButton = resizeBtn
+	end
+
+	dialog:HookScript("OnSizeChanged", function(self)
+		UpdateRaidCheckWhisperDialogLayout(self)
+	end)
+end
+
 if not StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] then
 	StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] = {
-		text = "%s",
+		text = "",
 		button1 = RAIDCHECK_WHISPER_SAVE_LABEL,
 		button2 = CANCEL,
 		timeout = 0,
@@ -274,6 +352,8 @@ if not StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] then
 		preferredIndex = 3,
 
 		OnShow = function(self, data)
+			EnsureRaidCheckWhisperDialogInteractions(self)
+
 			local content = EnsureRaidCheckWhisperPopupContent(self.insertedFrame)
 			if not content then
 				return
@@ -284,18 +364,11 @@ if not StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] then
 			content.raidMissingEditBox:SetText(tostring(templates.raidMissing or ""))
 			content.raidPreparedEditBox:SetText(tostring(templates.raidPrepared or ""))
 
-			if content.preMissingUpdateSize then content.preMissingUpdateSize() end
-			if content.raidMissingUpdateSize then content.raidMissingUpdateSize() end
-			if content.raidPreparedUpdateSize then content.raidPreparedUpdateSize() end
-
 			content.preMissingEditBox:SetCursorPosition(0)
 			content.raidMissingEditBox:SetCursorPosition(0)
 			content.raidPreparedEditBox:SetCursorPosition(0)
 
-			LayoutRaidCheckWhisperPopupContent(content)
-			if self.Resize then
-				self:Resize()
-			end
+			UpdateRaidCheckWhisperDialogLayout(self)
 		end,
 
 		OnAccept = function(self, data)
@@ -630,7 +703,7 @@ function Dialogs:EditRaidCheckWhispers(message, acceptText, templates, onAccept)
 	insertedFrame:Show()
 	LayoutRaidCheckWhisperPopupContent(insertedFrame)
 
-	return StaticPopup_Show(RAIDCHECK_WHISPER_KEY, message, nil, {
+	return StaticPopup_Show(RAIDCHECK_WHISPER_KEY, message or "", nil, {
 		templates = templates or {},
 		onAccept = onAccept,
 	}, insertedFrame) ~= nil
