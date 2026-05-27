@@ -56,21 +56,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.21-beta.1] - 2026-05-27
 
-### Fixed
-- Improved positioning of equipment slots in the Loot Helper screen for better clarity and usability. Updated layout to a four-column grid with adjusted spacing for a more intuitive arrangement of gear slots.
+## [0.5.21] - 2026-05-27
 
-## [0.5.20-beta.21] - 2026-05-27
-
-### Added
-- New option to enable or disable whispers to prepared players when they earn a point during a Raid Check.
-- Checkbox in the Raid Check settings to toggle whispers for prepared players who earn points.
-
-## [0.5.20-beta.1] - 2026-05-22
-
-### Added
-- Admin-configurable "Points Per Raid Check" setting, allowing customization of point awards for prepared players during raid checks.
+### Changed
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [0.5.20] - 2026-05-20
 
