@@ -177,10 +177,28 @@ local function IsRaidCheckMetaGemRequired()
 	return false
 end
 
+local function GetRaidCheckPointsAwardPerCheck()
+	local cfg = GetRaidCheckConfig()
+	if cfg ~= nil then
+		local amount = tonumber(cfg.pointsAwardPerRaidCheck)
+		if amount ~= nil then
+			return amount
+		end
+	end
+	return 0.5
+end
+
 local function SetRaidCheckSlot(slotKey, value)
 	local profile = GetActiveProfileObject(SF.SettingsStore)
 	if profile and profile.SetRaidCheckSlotEnabled then
 		profile:SetRaidCheckSlotEnabled(slotKey, value and true or false)
+	end
+end
+
+local function SetRaidCheckPointsAwardPerCheck(value)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckPointsAwardPerCheck then
+		profile:SetRaidCheckPointsAwardPerCheck(tonumber(value) or 0.5)
 	end
 end
 
@@ -202,6 +220,13 @@ local function SetRaidCheckWhispers(mode, value)
 	local profile = GetActiveProfileObject(SF.SettingsStore)
 	if profile and profile.SetRaidCheckWhispers then
 		profile:SetRaidCheckWhispers(mode, value and true or false)
+	end
+end
+
+local function SetRaidCheckPreparedWhispers(value)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckWhisperPrepared then
+		profile:SetRaidCheckWhisperPrepared(value and true or false)
 	end
 end
 
@@ -1465,6 +1490,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				},
 				{ type = "spacer", height = 12 },
 				{ type = "heading", text = "Raid Check Profile Settings" },
+				{ type = "slider", label = "Points Per Raid Check", adminOnly = true, min = 0, max = 1, step = 0.5, tooltip = "Set how many points each prepared player earns when running a Raid Check.", enabled = function() return ProfileActionsEnabled() end, get = function() return GetRaidCheckPointsAwardPerCheck() end, set = function(v) SetRaidCheckPointsAwardPerCheck(v) end },
 				{ type = "text", text = "Requirements to look for" },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Gem in Sockets", tooltip = "Require socketed gear to have gems inserted during raid checks.", get = function() return IsRaidCheckGemSocketsEnabled() end, set = function(v) SetRaidCheckGemSockets(v) end }, { label = "At Least One Meta Gem", tooltip = "Require at least one meta gem to be equipped in a valid socket during raid checks.", get = function() return IsRaidCheckMetaGemRequired() end, set = function(v) SetRaidCheckMetaGemRequired(v) end } } },
 				{ type = "text", text = "Enchants to look for" },
@@ -1490,12 +1516,13 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "spacer", height = 12 },
 				{ type = "heading", text = "Raid Check Settings" },
 				{ type = "text", text = "Raid Checks..." },
-				{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then SF.RaidCheck:RunPreRaidCheck() ctx.section:SetMessage("Pre-Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then SF.RaidCheck:RunRaidCheck() ctx.section:SetMessage("Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end } },
-				{ type = "text", text = "Enable Whispers During..." },
-				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing required enchants or gems.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) end } } },
+					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then SF.RaidCheck:RunPreRaidCheck() ctx.section:SetMessage("Pre-Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then SF.RaidCheck:RunRaidCheck() ctx.section:SetMessage("Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end } },
+					{ type = "text", text = "Enable Whispers During..." },
+					{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing required enchants or gems.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end } } },
+					{ type = "checkbox", label = "Whisper when a point is earned", adminOnly = true, tooltip = "Only applies when Raid Check whispers are enabled. When checked, prepared players are whispered that they earned a point.", visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() if cfg == nil then return true end return cfg.enableWhispersRaidPrepared ~= false end, set = function(value) SetRaidCheckPreparedWhispers(value) end },
+				},
 			},
-		},
-		admin = {
+			admin = {
 			id = "admin",
 			title = "Admin Settings",
 			tooltip = "Manage who can administer the active profile and use admin-only session tools.",

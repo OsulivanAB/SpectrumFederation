@@ -13,7 +13,7 @@ SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
 
 local RAID_CHECK_REASON = "RAID_CHECK"
-local RAID_CHECK_POINT_AWARD = 0.5
+local RAID_CHECK_POINT_AWARD_DEFAULT = 0.5
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
 local INSPECT_CACHE_TTL_SECONDS = 30 -- Background recheck cadence for live inspect data.
@@ -1824,13 +1824,28 @@ local function FormatPointAmount(amount)
 	return text
 end
 
-local function AwardPrepared(profile, member, pointName)
+local function GetRaidCheckPointAward(cfg)
+	if type(cfg) ~= "table" then
+		return RAID_CHECK_POINT_AWARD_DEFAULT
+	end
+
+	local amount = tonumber(cfg.pointsAwardPerRaidCheck)
+	if amount == nil then
+		return RAID_CHECK_POINT_AWARD_DEFAULT
+	end
+
+	amount = math.max(0, math.min(1, amount))
+	amount = math.floor((amount / 0.5) + 0.5) * 0.5
+	return amount
+end
+
+local function AwardPrepared(profile, member, pointName, pointAward)
 	if not member or not member.IncrementPoints then
 		return false
 	end
 
 	local ok = member:IncrementPoints({
-		amount = RAID_CHECK_POINT_AWARD,
+		amount = pointAward,
 		logAuthor = "Raid Check",
 		reason = RAID_CHECK_REASON,
 	})
@@ -1841,14 +1856,14 @@ local function AwardPrepared(profile, member, pointName)
 
 	if SF.Debug then
 		local identifier = (member and member.GetFullIdentifier and member:GetFullIdentifier()) or "?"
-		SF.Debug:Info("RAID_CHECK", "Awarded %s raid check points to %s", FormatPointAmount(RAID_CHECK_POINT_AWARD), tostring(identifier))
+		SF.Debug:Info("RAID_CHECK", "Awarded %s raid check points to %s", FormatPointAmount(pointAward), tostring(identifier))
 	end
 
 	return true
 end
 
-local function WhisperPrepared(target, pointName)
-	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(RAID_CHECK_POINT_AWARD), pointName))
+local function WhisperPrepared(target, pointName, pointAward)
+	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(pointAward), pointName))
 end
 
 local function WhisperMissing(target, pointName, list, mode)
@@ -1929,6 +1944,13 @@ local function ShouldWhisper(mode, cfg)
 		return cfg.enableWhispersPreRaid
 	end
 	return cfg.enableWhispersRaid
+end
+
+local function ShouldWhisperPrepared(cfg)
+	if type(cfg) ~= "table" then
+		return true
+	end
+	return cfg.enableWhispersRaidPrepared ~= false
 end
 
 local function GetWhisperDayKey(timestamp)
@@ -2012,7 +2034,7 @@ local function HasEquipmentData(slotsByInventory)
 	return false
 end
 
-local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
+local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 	local inspectState = RC:_GetTroubleshootingInspectState(unitInfo.unit, unitInfo)
 	local whisper = ShouldWhisper(mode, cfg)
 	local whisperTarget = unitInfo.id or unitInfo.short
@@ -2063,9 +2085,9 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName)
 			return result
 		end
 
-		local awarded = AwardPrepared(profile, member, pointName)
-		if awarded and whisper then
-			WhisperPrepared(whisperTarget, pointName)
+		local awarded = AwardPrepared(profile, member, pointName, pointAward)
+		if awarded and whisper and ShouldWhisperPrepared(cfg) then
+			WhisperPrepared(whisperTarget, pointName, pointAward)
 		end
 	end
 
@@ -2134,13 +2156,14 @@ end
 		end
 
 	local pointName = GetPointName(profile)
+	local pointAward = GetRaidCheckPointAward(cfg)
 	local summaryMissing = {}
 	local summaryPending = {}
 
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
 		if info.id then
-			local res = RunForUnit(info, profile, cfg, "raid", pointName)
+			local res = RunForUnit(info, profile, cfg, "raid", pointName, pointAward)
 			if res then
 				if res.whisperedMissing then
 					SF:PrintInfo(string.format("[Raid Check] Whispered %s about missing enchants/gems.", res.name))
