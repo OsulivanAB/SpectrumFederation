@@ -445,13 +445,15 @@ local function UpdateRaidCheckWhisperDialogLayout(dialog)
 	end
 	content:SetWidth(availableWidth)
 
-	local dialogHeight = dialog:GetHeight() or 0
-	local approxNonContent = 210
-	local availableHeight = dialogHeight - approxNonContent
+	local availableHeight = content.GetHeight and content:GetHeight() or 0
+	if availableHeight <= 0 then
+		local dialogHeight = dialog:GetHeight() or 0
+		local approxNonContent = 210
+		availableHeight = dialogHeight - approxNonContent
+	end
 	if availableHeight < RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT then
 		availableHeight = RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT
 	end
-	content:SetHeight(availableHeight)
 
 	local desiredBoxHeight = math.floor(availableHeight / 3)
 	desiredBoxHeight = math.max(RAIDCHECK_WHISPER_TEXTBOX_HEIGHT, desiredBoxHeight)
