@@ -95,11 +95,32 @@ function R:Build(panel, pageDef)
 			elseif t == "heading" then
 				sec:AddHeading(item.text)
 
+			elseif t == "titleDivider" then
+				controls:AddTitleDivider(sec, item)
+
 			elseif t == "spacer" then
-				sec:AddSpacer(item.height or 8)
+				if item.visible ~= nil or item.adminOnly or item.enabled ~= nil then
+					controls:AddSpacerRow(sec, item)
+				else
+					sec:AddSpacer(item.height or 8)
+				end
 
 			elseif t == "help" then
 				controls:AddHelpText(sec, item)
+
+			elseif t == "keyValueBox" then
+				controls:AddKeyValueBox(sec, item)
+
+			elseif t == "templateEditor" then
+				local opts = item
+				if type(opts.onReset) == "function" then
+					local fn = opts.onReset
+					opts = CopyTable(opts)
+					opts.onReset = function(btn)
+						return fn(MakeCtx(panel, sec), btn)
+					end
+				end
+				controls:AddTemplateEditor(sec, opts)
 
 			elseif t == "checkbox" then
 				local opts = item

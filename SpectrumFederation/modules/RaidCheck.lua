@@ -1824,6 +1824,21 @@ local function FormatPointAmount(amount)
 	return text
 end
 
+local function RenderWhisperTemplate(template, vars)
+	if type(template) ~= "string" or template == "" then
+		return nil
+	end
+
+	vars = type(vars) == "table" and vars or {}
+	return (template:gsub("%{([%w_]+)%}", function(key)
+		local value = vars[key]
+		if value == nil then
+			return "{" .. key .. "}"
+		end
+		return tostring(value)
+	end))
+end
+
 local function GetRaidCheckPointAward(cfg)
 	if type(cfg) ~= "table" then
 		return RAID_CHECK_POINT_AWARD_DEFAULT
@@ -1862,16 +1877,44 @@ local function AwardPrepared(profile, member, pointName, pointAward)
 	return true
 end
 
-local function WhisperPrepared(target, pointName, pointAward)
-	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(pointAward), pointName))
+local function WhisperPrepared(target, cfg, playerName, pointName, pointAward)
+	local template = type(cfg) == "table" and cfg.whisperTemplateRaidPrepared or nil
+	local message = RenderWhisperTemplate(template, {
+		player_name = playerName,
+		point_name = pointName,
+		points_awarded = FormatPointAmount(pointAward),
+	})
+
+	if not message then
+		message = ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(pointAward), pointName)
+	end
+
+	SendWhisper(target, message)
 end
 
-local function WhisperMissing(target, pointName, list, mode)
+local function WhisperMissing(target, cfg, playerName, pointName, list, mode)
+	local template
 	if mode == "pre" then
-		SendWhisper(target, ("Spectrum Federation: You're missing the following enchants/gems: %s."):format(list))
+		template = type(cfg) == "table" and cfg.whisperTemplatePreRaidMissing or nil
 	else
-		SendWhisper(target, ("Spectrum Federation: You're missing the following enchants/gems: %s. No new %s awarded."):format(list, pointName))
+		template = type(cfg) == "table" and cfg.whisperTemplateRaidMissing or nil
 	end
+
+	local message = RenderWhisperTemplate(template, {
+		player_name = playerName,
+		missing = list,
+		point_name = pointName,
+	})
+
+	if not message then
+		if mode == "pre" then
+			message = ("Spectrum Federation: You're missing the following enchants/gems: %s."):format(list)
+		else
+			message = ("Spectrum Federation: You're missing the following enchants/gems: %s. No new %s awarded."):format(list, pointName)
+		end
+	end
+
+	SendWhisper(target, message)
 end
 
 local function GetPointName(profile)
@@ -2067,7 +2110,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 		local suffix = ""
 		local alreadyWhispered = HasBeenWhisperedToday(member, mode)
 		if whisper and not alreadyWhispered then
-			WhisperMissing(whisperTarget, pointName, list, mode)
+			WhisperMissing(whisperTarget, cfg, unitInfo.short, pointName, list, mode)
 			result.whisperedMissing = true
 			MarkWhisperSent(member, mode, time())
 			suffix = " (whispered)"
@@ -2087,7 +2130,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 
 		local awarded = AwardPrepared(profile, member, pointName, pointAward)
 		if awarded and whisper and ShouldWhisperPrepared(cfg) then
-			WhisperPrepared(whisperTarget, pointName, pointAward)
+			WhisperPrepared(whisperTarget, cfg, unitInfo.short, pointName, pointAward)
 		end
 	end
 
