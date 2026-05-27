@@ -95,6 +95,9 @@ function R:Build(panel, pageDef)
 			elseif t == "heading" then
 				sec:AddHeading(item.text)
 
+			elseif t == "titleDivider" then
+				sec:AddTitleDivider(item.text, item.tooltip, item)
+
 			elseif t == "spacer" then
 				sec:AddSpacer(item.height or 8)
 

@@ -298,6 +298,18 @@ function SectionMixin:AddHeading(text)
 	end)
 end
 
+function SectionMixin:AddTitleDivider(title, tooltipText, opts)
+	opts = type(opts) == "table" and opts or {}
+	local height = tonumber(opts.height) or HEADER_HEIGHT
+
+	return self:AddRow(height, function(row)
+		if UI.TitleDivider and UI.TitleDivider.Create then
+			local divider = UI.TitleDivider:Create(row, title, tooltipText, opts)
+			divider:SetAllPoints(row)
+		end
+	end)
+end
+
 -- -------- Messages --------
 local function MessageColor(kind)
 	if kind == "error" then

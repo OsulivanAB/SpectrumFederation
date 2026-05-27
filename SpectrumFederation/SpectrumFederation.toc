@@ -60,6 +60,7 @@ modules/Settings/Apply.lua
 
 
 modules/UI/Settings/Style.lua
+modules/UI/Settings/Widgets/TitleDivider.lua
 modules/UI/Settings/Widgets/Section.lua
 modules/UI/Settings/PageBuilder.lua
 modules/UI/Settings/Control/Controls.lua
