@@ -125,12 +125,13 @@ local RAIDCHECK_WHISPER_TEXTBOX_HEIGHT = 64
 	local RAIDCHECK_WHISPER_SCROLLBAR_TEXT_GAP = 10
 	local RAIDCHECK_WHISPER_VARIABLE_NAME_COL_WIDTH = 110
 	local RAIDCHECK_WHISPER_VARIABLE_GAP_X = 12
-	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH = 700
-	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT = 650
+	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH = 1050
+	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT = 4550
 	local RAIDCHECK_WHISPER_OUTER_SCROLL_INSET = 8
 	local RAIDCHECK_WHISPER_DIALOG_EDGE_INSET = 12
 	local RAIDCHECK_WHISPER_DIALOG_BUTTONS_BOTTOM_INSET = 16
 	local RAIDCHECK_WHISPER_DIALOG_CONTENT_BUTTON_GAP_Y = 9
+	local RAIDCHECK_WHISPER_DIALOG_SCREEN_CLAMP_INSET = 40
 
 local RAIDCHECK_WHISPER_BOX_BACKDROP = {
 	bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -621,11 +622,24 @@ if not StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] then
 				self.__sfRaidCheckWhisperDefaultSizeApplied = true
 				local w = self.GetWidth and self:GetWidth() or 0
 				local h = self.GetHeight and self:GetHeight() or 0
-				if w < RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH then
-					self:SetWidth(RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH)
+				local screenW = UIParent and UIParent.GetWidth and UIParent:GetWidth() or 0
+				local screenH = UIParent and UIParent.GetHeight and UIParent:GetHeight() or 0
+
+				local targetW = RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH
+				local targetH = RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT
+
+				if screenW > 0 then
+					targetW = math.min(targetW, screenW - RAIDCHECK_WHISPER_DIALOG_SCREEN_CLAMP_INSET)
 				end
-				if h < RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT then
-					self:SetHeight(RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT)
+				if screenH > 0 then
+					targetH = math.min(targetH, screenH - RAIDCHECK_WHISPER_DIALOG_SCREEN_CLAMP_INSET)
+				end
+
+				if w < targetW then
+					self:SetWidth(targetW)
+				end
+				if h < targetH then
+					self:SetHeight(targetH)
 				end
 			end
 
