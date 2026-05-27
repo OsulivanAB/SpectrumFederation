@@ -96,10 +96,14 @@ function R:Build(panel, pageDef)
 				sec:AddHeading(item.text)
 
 			elseif t == "titleDivider" then
-				sec:AddTitleDivider(item.text, item.tooltip, item)
+				controls:AddTitleDivider(sec, item)
 
 			elseif t == "spacer" then
-				sec:AddSpacer(item.height or 8)
+				if item.visible ~= nil or item.adminOnly or item.enabled ~= nil then
+					controls:AddSpacerRow(sec, item)
+				else
+					sec:AddSpacer(item.height or 8)
+				end
 
 			elseif t == "help" then
 				controls:AddHelpText(sec, item)

@@ -1785,6 +1785,46 @@ function Controls:AddKeyValueBox(section, opts)
 end
 
 -- =======================================
+-- Spacer Row (with visibility/admin options)
+-- =======================================
+function Controls:AddSpacerRow(section, opts)
+	opts = opts or {}
+	local height = tonumber(opts.height) or 8
+
+	return section:AddRow(height, function(row)
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, nil)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
+-- =======================================
+-- Title Divider Row (center title + lines)
+-- =======================================
+function Controls:AddTitleDivider(section, opts)
+	opts = opts or {}
+	local height = tonumber(opts.height) or 22
+
+	return section:AddRow(height, function(row)
+		local divider
+		if UI.TitleDivider and UI.TitleDivider.Create then
+			divider = UI.TitleDivider:Create(row, opts.text, opts.tooltip, opts)
+			divider:SetAllPoints(row)
+		end
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, {divider})
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
+-- =======================================
 -- Template Editor (Label + EditBox + Button)
 -- =======================================
 -- Add a 3-row editor: label row, full-width edit box row, and a button row.
