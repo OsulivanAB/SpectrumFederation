@@ -15,13 +15,22 @@ local TITLE_HEIGHT = 28
 local PADDING = 8  -- Reduced from 10 to minimize extra space
 local ICON_SIZE = 32
 local ICON_SPACING = 4
-local COL_SPACING = ICON_SIZE * 2  -- Double icon size for spacer between columns
 local NUM_ROWS = 9
-local NUM_COLS = 2
+local NUM_COLS = 4
+
+-- Four-column grid (no horizontal spacing):
+-- - Col 1 and 4 hold the "outer" equipment slots
+-- - Col 2 and 3 are the center gap, used only on the bottom row (Weapon/OffHand)
+local GRID_COL_X = {
+    0,
+    ICON_SIZE,
+    ICON_SIZE * 2,
+    ICON_SIZE * 3,
+}
 
 -- Calculate window dimensions based on content
--- Width: left padding + icon + col spacer + icon + right padding
-local CONTENT_WIDTH = ICON_SIZE * NUM_COLS + COL_SPACING + (PADDING * 2)
+-- Width: left padding + four columns + right padding
+local CONTENT_WIDTH = (ICON_SIZE * NUM_COLS) + (PADDING * 2)
 local WINDOW_WIDTH = CONTENT_WIDTH + 8  -- Minimal backdrop insets
 
 -- Height: title bar + top gap + padding + icons + spacing + padding
@@ -314,17 +323,18 @@ function EquipmentWindow:_CreateGearGrid(content)
     -- Create left column
     for i = 1, NUM_ROWS do
         local y = (i - 1) * (ICON_SIZE + ICON_SPACING)
-        local btn = CreateSlotButton(content, LEFT_SLOTS[i], 0, y)
+        local x = (i == NUM_ROWS) and GRID_COL_X[2] or GRID_COL_X[1]
+        local btn = CreateSlotButton(content, LEFT_SLOTS[i], x, y)
         if btn then
             table.insert(buttons, btn)
         end
     end
 
-    -- Create right column with spacer
-    local colGap = ICON_SIZE + COL_SPACING
+    -- Create right column; bottom row (OffHand) is intentionally centered
     for i = 1, NUM_ROWS do
         local y = (i - 1) * (ICON_SIZE + ICON_SPACING)
-        local btn = CreateSlotButton(content, RIGHT_SLOTS[i], colGap, y)
+        local x = (i == NUM_ROWS) and GRID_COL_X[3] or GRID_COL_X[4]
+        local btn = CreateSlotButton(content, RIGHT_SLOTS[i], x, y)
         if btn then
             table.insert(buttons, btn)
         end
