@@ -116,6 +116,62 @@ local RAIDCHECK_WHISPER_CONTENT_WIDTH = 290
 local RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT = 1
 local RAIDCHECK_WHISPER_CONTENT_INSET_X = 8
 local RAIDCHECK_WHISPER_SAVE_LABEL = (type(SAVE) == "string" and SAVE) or "Save"
+local RAIDCHECK_WHISPER_BOX_INSET = 4
+local RAIDCHECK_WHISPER_SCROLLBAR_WIDTH = 24
+local RAIDCHECK_WHISPER_TEXTBOX_HEIGHT = 64
+
+local RAIDCHECK_WHISPER_BOX_BACKDROP = {
+	bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+	edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+	tile = true,
+	tileSize = 8,
+	edgeSize = 12,
+	insets = { left = 4, right = 4, top = 4, bottom = 4 },
+}
+
+local function CreateTextBox(parent)
+	local box = CreateFrame("Frame", nil, parent, "BackdropTemplate")
+	if box.SetBackdrop then
+		box:SetBackdrop(RAIDCHECK_WHISPER_BOX_BACKDROP)
+		box:SetBackdropColor(0, 0, 0, 0.12)
+		box:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+	end
+
+	local scroll = CreateFrame("ScrollFrame", nil, box, "UIPanelScrollFrameTemplate")
+	scroll:SetPoint("TOPLEFT", box, "TOPLEFT", RAIDCHECK_WHISPER_BOX_INSET, -RAIDCHECK_WHISPER_BOX_INSET)
+	scroll:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", -RAIDCHECK_WHISPER_BOX_INSET, RAIDCHECK_WHISPER_BOX_INSET)
+
+	local editBox = CreateFrame("EditBox", nil, scroll)
+	editBox:SetPoint("TOPLEFT")
+	editBox:SetPoint("TOPRIGHT")
+	editBox:SetMultiLine(true)
+	editBox:SetFontObject(ChatFontNormal)
+	editBox:SetAutoFocus(false)
+	editBox:SetTextColor(1, 1, 1)
+	editBox:SetTextInsets(2, 2, 2, 2)
+	editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+	scroll:SetScrollChild(editBox)
+
+	local function UpdateSize()
+		local w = (scroll:GetWidth() or 0) - RAIDCHECK_WHISPER_SCROLLBAR_WIDTH
+		if w > 20 then
+			editBox:SetWidth(w)
+		end
+
+		local minH = scroll:GetHeight() or RAIDCHECK_WHISPER_TEXTBOX_HEIGHT
+		local textH = (editBox:GetStringHeight() or 0) + 16
+		editBox:SetHeight(math.max(minH, textH))
+
+		if scroll.UpdateScrollChildRect then
+			scroll:UpdateScrollChildRect()
+		end
+	end
+
+	scroll:SetScript("OnSizeChanged", UpdateSize)
+	editBox:SetScript("OnTextChanged", UpdateSize)
+
+	return box, scroll, editBox, UpdateSize
+end
 
 local function EnsureRaidCheckWhisperPopupContent(content)
 	if not content then
@@ -139,68 +195,23 @@ local function EnsureRaidCheckWhisperPopupContent(content)
 			"  {point_name}    - The profile point name\n" ..
 			"  {point_award}   - The points awarded (raid only)\n" ..
 			"  {player}        - The player's name\n\n" ..
-			"Leave a box blank to use the default message."
+			"Clearing a box and saving will reset it to the default message."
 	)
 
 	content.preMissingLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	content.preMissingLabel:SetText("Pre-Raid: Missing requirements")
 
-	content.preMissingScroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
-	content.preMissingEditBox = CreateFrame("EditBox", nil, content.preMissingScroll)
-	content.preMissingEditBox:SetPoint("TOPLEFT")
-	content.preMissingEditBox:SetPoint("TOPRIGHT")
-	content.preMissingEditBox:SetHeight(64)
-	content.preMissingEditBox:SetMultiLine(true)
-	content.preMissingEditBox:SetFontObject(ChatFontNormal)
-	content.preMissingEditBox:SetAutoFocus(false)
-	content.preMissingEditBox:SetTextColor(1, 1, 1)
-	content.preMissingEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-	content.preMissingEditBox:SetScript("OnTextChanged", function()
-		if content.preMissingScroll and content.preMissingScroll.UpdateScrollChildRect then
-			content.preMissingScroll:UpdateScrollChildRect()
-		end
-	end)
-	content.preMissingScroll:SetScrollChild(content.preMissingEditBox)
+	content.preMissingBox, content.preMissingScroll, content.preMissingEditBox, content.preMissingUpdateSize = CreateTextBox(content)
 
 	content.raidMissingLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	content.raidMissingLabel:SetText("Raid Check: Missing requirements")
 
-	content.raidMissingScroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
-	content.raidMissingEditBox = CreateFrame("EditBox", nil, content.raidMissingScroll)
-	content.raidMissingEditBox:SetPoint("TOPLEFT")
-	content.raidMissingEditBox:SetPoint("TOPRIGHT")
-	content.raidMissingEditBox:SetHeight(64)
-	content.raidMissingEditBox:SetMultiLine(true)
-	content.raidMissingEditBox:SetFontObject(ChatFontNormal)
-	content.raidMissingEditBox:SetAutoFocus(false)
-	content.raidMissingEditBox:SetTextColor(1, 1, 1)
-	content.raidMissingEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-	content.raidMissingEditBox:SetScript("OnTextChanged", function()
-		if content.raidMissingScroll and content.raidMissingScroll.UpdateScrollChildRect then
-			content.raidMissingScroll:UpdateScrollChildRect()
-		end
-	end)
-	content.raidMissingScroll:SetScrollChild(content.raidMissingEditBox)
+	content.raidMissingBox, content.raidMissingScroll, content.raidMissingEditBox, content.raidMissingUpdateSize = CreateTextBox(content)
 
 	content.raidPreparedLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	content.raidPreparedLabel:SetText("Raid Check: Point awarded")
 
-	content.raidPreparedScroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
-	content.raidPreparedEditBox = CreateFrame("EditBox", nil, content.raidPreparedScroll)
-	content.raidPreparedEditBox:SetPoint("TOPLEFT")
-	content.raidPreparedEditBox:SetPoint("TOPRIGHT")
-	content.raidPreparedEditBox:SetHeight(64)
-	content.raidPreparedEditBox:SetMultiLine(true)
-	content.raidPreparedEditBox:SetFontObject(ChatFontNormal)
-	content.raidPreparedEditBox:SetAutoFocus(false)
-	content.raidPreparedEditBox:SetTextColor(1, 1, 1)
-	content.raidPreparedEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-	content.raidPreparedEditBox:SetScript("OnTextChanged", function()
-		if content.raidPreparedScroll and content.raidPreparedScroll.UpdateScrollChildRect then
-			content.raidPreparedScroll:UpdateScrollChildRect()
-		end
-	end)
-	content.raidPreparedScroll:SetScrollChild(content.raidPreparedEditBox)
+	content.raidPreparedBox, content.raidPreparedScroll, content.raidPreparedEditBox, content.raidPreparedUpdateSize = CreateTextBox(content)
 
 	content._sfRaidCheckWhisperInitialized = true
 	return content
@@ -226,28 +237,28 @@ local function LayoutRaidCheckWhisperPopupContent(content)
 	content.preMissingLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
 	y = y - (content.preMissingLabel:GetStringHeight() or 0) - 4
 
-	content.preMissingScroll:ClearAllPoints()
-	content.preMissingScroll:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
-	content.preMissingScroll:SetSize(innerWidth, 64)
-	y = y - 64 - 10
+	content.preMissingBox:ClearAllPoints()
+	content.preMissingBox:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.preMissingBox:SetSize(innerWidth, RAIDCHECK_WHISPER_TEXTBOX_HEIGHT)
+	y = y - RAIDCHECK_WHISPER_TEXTBOX_HEIGHT - 10
 
 	content.raidMissingLabel:ClearAllPoints()
 	content.raidMissingLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
 	y = y - (content.raidMissingLabel:GetStringHeight() or 0) - 4
 
-	content.raidMissingScroll:ClearAllPoints()
-	content.raidMissingScroll:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
-	content.raidMissingScroll:SetSize(innerWidth, 64)
-	y = y - 64 - 10
+	content.raidMissingBox:ClearAllPoints()
+	content.raidMissingBox:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.raidMissingBox:SetSize(innerWidth, RAIDCHECK_WHISPER_TEXTBOX_HEIGHT)
+	y = y - RAIDCHECK_WHISPER_TEXTBOX_HEIGHT - 10
 
 	content.raidPreparedLabel:ClearAllPoints()
 	content.raidPreparedLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
 	y = y - (content.raidPreparedLabel:GetStringHeight() or 0) - 4
 
-	content.raidPreparedScroll:ClearAllPoints()
-	content.raidPreparedScroll:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
-	content.raidPreparedScroll:SetSize(innerWidth, 64)
-	y = y - 64
+	content.raidPreparedBox:ClearAllPoints()
+	content.raidPreparedBox:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.raidPreparedBox:SetSize(innerWidth, RAIDCHECK_WHISPER_TEXTBOX_HEIGHT)
+	y = y - RAIDCHECK_WHISPER_TEXTBOX_HEIGHT
 
 	content:SetHeight(math.max(1, -y))
 end
@@ -272,6 +283,10 @@ if not StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] then
 			content.preMissingEditBox:SetText(tostring(templates.preMissing or ""))
 			content.raidMissingEditBox:SetText(tostring(templates.raidMissing or ""))
 			content.raidPreparedEditBox:SetText(tostring(templates.raidPrepared or ""))
+
+			if content.preMissingUpdateSize then content.preMissingUpdateSize() end
+			if content.raidMissingUpdateSize then content.raidMissingUpdateSize() end
+			if content.raidPreparedUpdateSize then content.raidPreparedUpdateSize() end
 
 			content.preMissingEditBox:SetCursorPosition(0)
 			content.raidMissingEditBox:SetCursorPosition(0)

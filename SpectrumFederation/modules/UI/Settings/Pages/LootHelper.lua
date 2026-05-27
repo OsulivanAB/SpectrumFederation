@@ -1572,7 +1572,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 								local cfg = profile:GetRaidCheckConfig() or {}
 
 								dialogs:EditRaidCheckWhispers(
-									"Customize whispers for the active profile.\n\nLeave a box blank to use the default message.",
+									"Customize whispers for the active profile.\n\nClearing a box and saving will reset it to the default message.",
 									"Save",
 									{
 										preMissing = cfg.whisperTemplatePreMissing or "",
