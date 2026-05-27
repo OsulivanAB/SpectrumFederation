@@ -1717,6 +1717,73 @@ function Controls:AddHelpText(section, opts)
 	end)
 end
 
+-- =======================================
+-- Key/Value Box
+-- =======================================
+-- Add a key/value table-style box (no borders, subtle background)
+-- @param section table Section to add row into
+-- @param opts table Options including items (array of {key=, value=}), keyWidth, rowHeight
+-- @return Frame The created row
+function Controls:AddKeyValueBox(section, opts)
+	opts = opts or {}
+	local items = type(opts.items) == "table" and opts.items or {}
+	local rowHeight = tonumber(opts.rowHeight) or 18
+	local rowGap = tonumber(opts.rowGap) or 2
+	local padX = tonumber(opts.padX) or 10
+	local padY = tonumber(opts.padY) or 8
+	local keyWidth = tonumber(opts.keyWidth) or 160
+	local keyGap = tonumber(opts.keyGap) or 12
+
+	local count = #items
+	local height = (padY * 2) + (count * rowHeight) + (math.max(0, count - 1) * rowGap)
+	height = math.max(24, height)
+
+	return section:AddRow(height, function(row)
+		local container = CreateFrame("Frame", nil, row)
+		container:SetAllPoints(row)
+
+		local bg = container:CreateTexture(nil, "BACKGROUND")
+		bg:SetAllPoints(container)
+		bg:SetColorTexture(0, 0, 0, 0.25)
+
+		local keyFont = opts.keyFontObject or "GameFontHighlightSmall"
+		local valueFont = opts.valueFontObject or "GameFontDisableSmall"
+
+		local widgets = { container }
+		local y = -padY
+		for i = 1, count do
+			local entry = items[i]
+			if type(entry) == "table" then
+				local keyText = entry.key or entry[1] or ""
+				local valueText = entry.value or entry[2] or ""
+
+				local keyFs = container:CreateFontString(nil, "ARTWORK", keyFont)
+				keyFs:SetPoint("TOPLEFT", container, "TOPLEFT", padX, y)
+				keyFs:SetWidth(keyWidth)
+				keyFs:SetJustifyH("LEFT")
+				keyFs:SetText(tostring(keyText))
+
+				local valueFs = container:CreateFontString(nil, "ARTWORK", valueFont)
+				valueFs:SetPoint("TOPLEFT", keyFs, "TOPRIGHT", keyGap, 0)
+				valueFs:SetPoint("TOPRIGHT", container, "TOPRIGHT", -padX, y)
+				valueFs:SetJustifyH("LEFT")
+				valueFs:SetText(tostring(valueText))
+
+				widgets[#widgets + 1] = keyFs
+				widgets[#widgets + 1] = valueFs
+				y = y - (rowHeight + rowGap)
+			end
+		end
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, widgets)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
 -- Add a scrollable text box (read-only, multiline, copyable)
 -- @param section table Section to add row into
 -- @param opts table Options including label, height, get
