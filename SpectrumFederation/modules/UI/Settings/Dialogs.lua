@@ -125,6 +125,8 @@ local RAIDCHECK_WHISPER_TEXTBOX_HEIGHT = 64
 	local RAIDCHECK_WHISPER_SCROLLBAR_TEXT_GAP = 10
 	local RAIDCHECK_WHISPER_VARIABLE_NAME_COL_WIDTH = 110
 	local RAIDCHECK_WHISPER_VARIABLE_GAP_X = 12
+	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH = 560
+	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT = 520
 
 local RAIDCHECK_WHISPER_BOX_BACKDROP = {
 	bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -155,7 +157,6 @@ local RAIDCHECK_WHISPER_BOX_BACKDROP = {
 
 		local editBox = CreateFrame("EditBox", nil, scroll)
 		editBox:SetPoint("TOPLEFT")
-		editBox:SetPoint("TOPRIGHT")
 		editBox:SetMultiLine(true)
 		editBox:SetFontObject(ChatFontNormal)
 		editBox:SetAutoFocus(false)
@@ -418,7 +419,7 @@ local function UpdateRaidCheckWhisperDialogLayout(dialog)
 		if content.raidPreparedScheduleUpdateSize then content.raidPreparedScheduleUpdateSize() end
 	end
 
-local function EnsureRaidCheckWhisperDialogInteractions(dialog)
+	local function EnsureRaidCheckWhisperDialogInteractions(dialog)
 	if not dialog or dialog.__sfRaidCheckWhisperInteractive then
 		return
 	end
@@ -438,26 +439,34 @@ local function EnsureRaidCheckWhisperDialogInteractions(dialog)
 		self:StopMovingOrSizing()
 	end)
 
-	dialog:SetResizable(true)
-	if dialog.SetMinResize then
-		dialog:SetMinResize(RAIDCHECK_WHISPER_MIN_WIDTH, RAIDCHECK_WHISPER_MIN_HEIGHT)
-	end
+		dialog:SetResizable(true)
+		if dialog.SetMinResize then
+			dialog:SetMinResize(RAIDCHECK_WHISPER_MIN_WIDTH, RAIDCHECK_WHISPER_MIN_HEIGHT)
+		end
 
 		if not dialog.__sfResizeButton then
-			local resizeBtn = CreateFrame("Button", nil, dialog, "UIPanelResizeButtonTemplate")
+			local resizeBtn = CreateFrame("Button", nil, dialog)
 			resizeBtn:SetSize(16, 16)
-			resizeBtn:SetPoint("BOTTOMRIGHT", dialog, "BOTTOMRIGHT", -6, 6)
-			resizeBtn:SetFrameLevel((dialog:GetFrameLevel() or 0) + 10)
-			resizeBtn:SetScript("OnMouseDown", function()
+			resizeBtn:SetPoint("BOTTOMRIGHT", dialog, "BOTTOMRIGHT", -4, 4)
+			resizeBtn:SetFrameLevel((dialog:GetFrameLevel() or 0) + 20)
+
+			resizeBtn:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+			resizeBtn:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+			resizeBtn:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+
+			resizeBtn:SetScript("OnMouseDown", function(_, button)
+				if button ~= "LeftButton" then return end
 				if dialog.StartSizing then
 					dialog:StartSizing("BOTTOMRIGHT")
 				end
 			end)
-			resizeBtn:SetScript("OnMouseUp", function()
+			resizeBtn:SetScript("OnMouseUp", function(_, button)
+				if button ~= "LeftButton" then return end
 				if dialog.StopMovingOrSizing then
 					dialog:StopMovingOrSizing()
 				end
 			end)
+
 			dialog.__sfResizeButton = resizeBtn
 		end
 
@@ -478,6 +487,18 @@ if not StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] then
 
 		OnShow = function(self, data)
 			EnsureRaidCheckWhisperDialogInteractions(self)
+
+			if not self.__sfRaidCheckWhisperDefaultSizeApplied then
+				self.__sfRaidCheckWhisperDefaultSizeApplied = true
+				local w = self.GetWidth and self:GetWidth() or 0
+				local h = self.GetHeight and self:GetHeight() or 0
+				if w < RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH then
+					self:SetWidth(RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH)
+				end
+				if h < RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT then
+					self:SetHeight(RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT)
+				end
+			end
 
 			local content = EnsureRaidCheckWhisperPopupContent(self.insertedFrame)
 			if not content then
