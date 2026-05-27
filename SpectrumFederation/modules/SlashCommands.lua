@@ -47,7 +47,12 @@ local function ShowHelp()
     -- Display each command
     for _, cmd in ipairs(sortedCommands) do
         local cmdData = SF.SlashCommands[cmd]
-        SF:PrintInfo(string.format("|cFFFFFF00/sf %s|r - %s", cmd, cmdData.description))
+        if cmd == "trade" then
+            SF:PrintInfo("|cFFFFFF00/sf trade|r - Opens the raid trade assistant window.")
+            SF:PrintInfo("|cFFFFFF00/sf trade [shift-click item] [quantity]|r - Queues an item to trade to every current raid member. Quantity defaults to 1.")
+        else
+            SF:PrintInfo(string.format("|cFFFFFF00/sf %s|r - %s", cmd, cmdData.description))
+        end
     end
 end
 
@@ -55,8 +60,7 @@ end
 -- @param msg string Raw message after /sf
 -- @return nil
 local function SlashCommandHandler(msg)
-    -- Trim whitespace and convert to lowercase
-    msg = msg:trim():lower()
+    msg = strtrim(msg or "")
     
     -- Empty command or no arguments - open settings
     if msg == "" then
@@ -72,7 +76,7 @@ local function SlashCommandHandler(msg)
     
     -- Split command and arguments
     local command, args = msg:match("^(%S+)%s*(.*)")
-    command = command or msg
+    command = (command or msg):lower()
     args = args or ""
     
     -- Check for help command
