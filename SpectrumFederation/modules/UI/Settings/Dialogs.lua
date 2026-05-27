@@ -128,6 +128,9 @@ local RAIDCHECK_WHISPER_TEXTBOX_HEIGHT = 64
 	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH = 700
 	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT = 650
 	local RAIDCHECK_WHISPER_OUTER_SCROLL_INSET = 8
+	local RAIDCHECK_WHISPER_DIALOG_EDGE_INSET = 12
+	local RAIDCHECK_WHISPER_DIALOG_BUTTONS_BOTTOM_INSET = 16
+	local RAIDCHECK_WHISPER_DIALOG_CONTENT_BUTTON_GAP_Y = 9
 
 local RAIDCHECK_WHISPER_BOX_BACKDROP = {
 	bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -443,45 +446,74 @@ end
 	y = y - boxHeight
 
 	root:SetHeight(math.max(1, -y))
-end
+	end
+
+	local function EnsureRaidCheckWhisperDialogAnchors(dialog)
+		if not dialog then
+			return
+		end
+
+		local insertedFrame = dialog.insertedFrame
+		if not insertedFrame then
+			return
+		end
+
+		local buttonContainer = dialog.ButtonContainer
+		if buttonContainer then
+			buttonContainer:ClearAllPoints()
+			buttonContainer:SetPoint("BOTTOM", dialog, "BOTTOM", 0, RAIDCHECK_WHISPER_DIALOG_BUTTONS_BOTTOM_INSET)
+		end
+
+		local topRegion = dialog.Text
+		if dialog.SubText and dialog.SubText.IsShown and dialog.SubText:IsShown() then
+			topRegion = dialog.SubText
+		elseif dialog.ItemFrame and dialog.ItemFrame.IsShown and dialog.ItemFrame:IsShown() then
+			topRegion = dialog.ItemFrame
+		end
+
+		insertedFrame:ClearAllPoints()
+		if topRegion then
+			insertedFrame:SetPoint("TOP", topRegion, "BOTTOM", 0, 0)
+		else
+			insertedFrame:SetPoint("TOP", dialog, "TOP", 0, -RAIDCHECK_WHISPER_DIALOG_BUTTONS_BOTTOM_INSET)
+		end
+		insertedFrame:SetPoint("LEFT", dialog, "LEFT", RAIDCHECK_WHISPER_DIALOG_EDGE_INSET, 0)
+		insertedFrame:SetPoint("RIGHT", dialog, "RIGHT", -RAIDCHECK_WHISPER_DIALOG_EDGE_INSET, 0)
+
+		if buttonContainer then
+			insertedFrame:SetPoint("BOTTOM", buttonContainer, "TOP", 0, RAIDCHECK_WHISPER_DIALOG_CONTENT_BUTTON_GAP_Y)
+		else
+			insertedFrame:SetPoint("BOTTOM", dialog, "BOTTOM", 0, RAIDCHECK_WHISPER_DIALOG_BUTTONS_BOTTOM_INSET * 2)
+		end
+	end
 
 local function UpdateRaidCheckWhisperDialogLayout(dialog)
 	if not dialog then
 		return
 	end
 
+	EnsureRaidCheckWhisperDialogAnchors(dialog)
+
 	local content = EnsureRaidCheckWhisperPopupContent(dialog.insertedFrame)
 	if not content then
 		return
 	end
 
-		local dialogWidth = dialog:GetWidth() or 0
-		local availableWidth = dialogWidth - 70
-		if availableWidth < RAIDCHECK_WHISPER_CONTENT_WIDTH then
-			availableWidth = RAIDCHECK_WHISPER_CONTENT_WIDTH
+	local outerScroll = content.__sfRaidCheckWhisperOuterScroll
+	local availableHeight = content.GetHeight and content:GetHeight() or 0
+	if outerScroll and outerScroll.GetHeight then
+		local h = outerScroll:GetHeight() or 0
+		if h > 0 then
+			availableHeight = h
 		end
-		content:SetWidth(availableWidth)
+	end
+	if availableHeight < RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT then
+		availableHeight = RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT
+	end
 
-		local dialogHeight = dialog:GetHeight() or 0
-		local approxNonContent = 210
-		local contentHeight = dialogHeight - approxNonContent
-		if contentHeight < RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT then
-			contentHeight = RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT
-		end
-		content:SetHeight(contentHeight)
-
-		local outerScroll = content.__sfRaidCheckWhisperOuterScroll
-		local availableHeight = contentHeight
-		if outerScroll and outerScroll.GetHeight then
-			local h = outerScroll:GetHeight() or 0
-			if h > 0 then
-				availableHeight = h
-			end
-		end
-
-		local desiredBoxHeight = math.floor(availableHeight / 3)
-		desiredBoxHeight = math.max(RAIDCHECK_WHISPER_TEXTBOX_HEIGHT, desiredBoxHeight)
-		desiredBoxHeight = math.min(160, desiredBoxHeight)
+	local desiredBoxHeight = math.floor(availableHeight / 3)
+	desiredBoxHeight = math.max(RAIDCHECK_WHISPER_TEXTBOX_HEIGHT, desiredBoxHeight)
+	desiredBoxHeight = math.min(160, desiredBoxHeight)
 		content.__sfTextBoxHeight = desiredBoxHeight
 
 			LayoutRaidCheckWhisperPopupContent(content)
