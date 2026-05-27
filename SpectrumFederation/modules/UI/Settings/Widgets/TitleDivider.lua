@@ -71,7 +71,7 @@ function TitleDividerMixin:Init(title, tooltipText, opts)
 
 	local fontObject = self.opts.fontObject or "GameFontNormal"
 
-	local label = self:CreateFontString(nil, "ARTWORK", fontObject)
+	local label = titleContainer:CreateFontString(nil, "ARTWORK", fontObject)
 	self.Label = label
 	label:SetPoint("LEFT", titleContainer, "LEFT", 0, 0)
 	label:SetJustifyH("LEFT")
@@ -108,6 +108,15 @@ function TitleDividerMixin:Init(title, tooltipText, opts)
 	rightLine:SetHeight(LINE_THICKNESS)
 
 	self:_UpdateLayout()
+
+	self:HookScript("OnShow", function()
+		self:_UpdateLayout()
+	end)
+
+	self:HookScript("OnSizeChanged", function(_, width, height)
+		self.TitleContainer:SetHeight(height or 1)
+		self:_UpdateLayout()
+	end)
 end
 
 function TitleDividerMixin:_UpdateLayout()
@@ -148,4 +157,3 @@ function TitleDividerMixin:SetTooltipText(text)
 	self.tooltipText = text or ""
 	self:_UpdateLayout()
 end
-
