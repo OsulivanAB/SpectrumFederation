@@ -1824,6 +1824,27 @@ local function FormatPointAmount(amount)
 	return text
 end
 
+local function ExpandWhisperTemplate(template, vars)
+	if type(template) ~= "string" or template == "" then
+		return nil
+	end
+
+	vars = type(vars) == "table" and vars or {}
+
+	local out = template:gsub("{([%w_]+)}", function(key)
+		local value = vars[key]
+		if value == nil then
+			return "{" .. key .. "}"
+		end
+		return tostring(value)
+	end)
+
+	out = out:gsub("[\r\n]+", " ")
+	out = out:gsub("%s%s+", " ")
+	out = out:gsub("^%s+", ""):gsub("%s+$", "")
+	return out
+end
+
 local function GetRaidCheckPointAward(cfg)
 	if type(cfg) ~= "table" then
 		return RAID_CHECK_POINT_AWARD_DEFAULT
@@ -1862,16 +1883,32 @@ local function AwardPrepared(profile, member, pointName, pointAward)
 	return true
 end
 
-local function WhisperPrepared(target, pointName, pointAward)
-	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(pointAward), pointName))
+local function WhisperPrepared(target, cfg, pointName, pointAward, playerName)
+	local message = ExpandWhisperTemplate(cfg and cfg.whisperTemplateRaidPrepared, {
+		addon = "Spectrum Federation",
+		player = playerName or "",
+		point_name = pointName or "Points",
+		point_award = FormatPointAmount(pointAward),
+	})
+	SendWhisper(target, message)
 end
 
-local function WhisperMissing(target, pointName, list, mode)
+local function WhisperMissing(target, cfg, pointName, list, mode, playerName)
+	local template
 	if mode == "pre" then
-		SendWhisper(target, ("Spectrum Federation: You're missing the following enchants/gems: %s."):format(list))
+		template = cfg and cfg.whisperTemplatePreMissing
 	else
-		SendWhisper(target, ("Spectrum Federation: You're missing the following enchants/gems: %s. No new %s awarded."):format(list, pointName))
+		template = cfg and cfg.whisperTemplateRaidMissing
 	end
+
+	local message = ExpandWhisperTemplate(template, {
+		addon = "Spectrum Federation",
+		player = playerName or "",
+		missing_list = list or "",
+		point_name = pointName or "Points",
+		point_award = "",
+	})
+	SendWhisper(target, message)
 end
 
 local function GetPointName(profile)
@@ -2069,7 +2106,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 		local suffix = ""
 		local alreadyWhispered = HasBeenWhisperedToday(member, mode)
 		if whisper and not alreadyWhispered then
-			WhisperMissing(whisperTarget, pointName, list, mode)
+			WhisperMissing(whisperTarget, cfg, pointName, list, mode, unitInfo.short)
 			result.whisperedMissing = true
 			MarkWhisperSent(member, mode, time())
 			suffix = " (whispered)"
@@ -2089,7 +2126,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 
 		local awarded = AwardPrepared(profile, member, pointName, pointAward)
 		if awarded and whisper and ShouldWhisperPrepared(cfg) then
-			WhisperPrepared(whisperTarget, pointName, pointAward)
+			WhisperPrepared(whisperTarget, cfg, pointName, pointAward, unitInfo.short)
 		end
 	end
 

@@ -266,7 +266,9 @@ function Controls:AddButtonRow(section, opts)
 			rowOpts = CopyTable(opts)
 			rowOpts.adminOnly = true
 		end
-		for i = 1, 2 do
+		local maxButtons = #opts
+		local previous = nil
+		for i = 1, maxButtons do
 			local def = opts[i]
 			if def then
 				defs[#defs + 1] = def
@@ -274,8 +276,16 @@ function Controls:AddButtonRow(section, opts)
 				btn:SetSize(def.width or 140, def.height or 22)
 				if i == 1 then
 					btn:SetPoint("LEFT", row, "LEFT", 0, 0)
-				else
+				elseif i == 2 then
 					btn:SetPoint("LEFT", row, "LEFT", (def.offsetX or 200), 0)
+				else
+					if def.offsetX ~= nil then
+						btn:SetPoint("LEFT", row, "LEFT", def.offsetX, 0)
+					elseif previous then
+						btn:SetPoint("LEFT", previous, "RIGHT", def.gapX or 10, 0)
+					else
+						btn:SetPoint("LEFT", row, "LEFT", 0, 0)
+					end
 				end
 				local function ApplyText()
 					if type(def.text) == "function" then
@@ -294,6 +304,7 @@ function Controls:AddButtonRow(section, opts)
 				end
 				btns[#btns + 1] = btn
 				btn.ApplyText = ApplyText
+				previous = btn
 			end
 		end
 

@@ -230,6 +230,14 @@ local function SetRaidCheckPreparedWhispers(value)
 	end
 end
 
+local function SetRaidCheckWhisperTemplates(preMissing, raidMissing, raidPrepared)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckWhisperTemplates then
+		return profile:SetRaidCheckWhisperTemplates(preMissing, raidMissing, raidPrepared)
+	end
+	return false, "Raid Check whisper template settings are unavailable."
+end
+
 local function ToWoWHexColor(color)
 	if type(color) == "string" then
 		return color
@@ -1514,9 +1522,79 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Only in-combat", tooltip = "Automatically enable raid-wide safemode during combat. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false) end return false end, set = function(value) if store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false) end end }, { label = "All the Time", tooltip = "Keep raid-wide safemode enabled for the full session. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeMode", false) end return false end, set = function(value) if store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeMode", value and true or false) end end } } },
 				{ type = "button", label = "Trigger Raid-Wide Sync", adminOnly = true, buttonText = "Sync", width = 120, tooltip = "Planned admin action: ask everyone in the active session to resend their Loot Helper data. This button is not implemented yet.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:SetMessage("Stub: Trigger Raid-Wide Sync (implement later).", "warn") end },
 				{ type = "spacer", height = 12 },
-				{ type = "heading", text = "Raid Check Settings" },
-				{ type = "text", text = "Raid Checks..." },
-					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then SF.RaidCheck:RunPreRaidCheck() ctx.section:SetMessage("Pre-Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then SF.RaidCheck:RunRaidCheck() ctx.section:SetMessage("Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end } },
+					{ type = "heading", text = "Raid Check Settings" },
+					{ type = "text", text = "Raid Checks..." },
+					{
+						type = "buttonRow",
+						adminOnly = true,
+						enabled = function() return ProfileActionsEnabled() end,
+						{
+							text = "Pre-Raid Check",
+							width = 180,
+							onClick = function(ctx)
+								if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then
+									SF.RaidCheck:RunPreRaidCheck()
+									ctx.section:SetMessage("Pre-Raid Check started.", "info")
+								else
+									ctx.section:SetMessage("Raid Check is not available.", "error")
+								end
+							end,
+						},
+						{
+							text = "Raid Check",
+							width = 180,
+							onClick = function(ctx)
+								if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then
+									SF.RaidCheck:RunRaidCheck()
+									ctx.section:SetMessage("Raid Check started.", "info")
+								else
+									ctx.section:SetMessage("Raid Check is not available.", "error")
+								end
+							end,
+						},
+						{
+							text = "Customize Whispers",
+							width = 180,
+							onClick = function(ctx)
+								ctx.section:ClearMessage()
+
+								if not dialogs or not dialogs.EditRaidCheckWhispers then
+									ctx.section:SetMessage("Whisper customization dialog is not available.", "error")
+									return
+								end
+
+								local profile = GetActiveProfileObject(ctx.store)
+								if not profile or type(profile.GetRaidCheckConfig) ~= "function" then
+									ctx.section:SetMessage("No active profile selected.", "error")
+									return
+								end
+
+								local cfg = profile:GetRaidCheckConfig() or {}
+
+								dialogs:EditRaidCheckWhispers(
+									"Customize whispers for the active profile.\n\nLeave a box blank to use the default message.",
+									"Save",
+									{
+										preMissing = cfg.whisperTemplatePreMissing or "",
+										raidMissing = cfg.whisperTemplateRaidMissing or "",
+										raidPrepared = cfg.whisperTemplateRaidPrepared or "",
+									},
+									function(preMissing, raidMissing, raidPrepared)
+										local ok, err = SetRaidCheckWhisperTemplates(preMissing, raidMissing, raidPrepared)
+										if not ok then
+											ctx.section:SetMessage(err or "Failed to save whisper templates.", "error")
+											return
+										end
+
+										ctx.section:SetMessage("Whisper templates saved.", "success")
+										if ctx.pageBuilder then
+											ctx.pageBuilder:Refresh()
+										end
+									end
+								)
+							end,
+						},
+					},
 					{ type = "text", text = "Enable Whispers During..." },
 					{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing required enchants or gems.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end } } },
 					{ type = "checkbox", label = "Whisper when a point is earned", adminOnly = true, tooltip = "Only applies when Raid Check whispers are enabled. When checked, prepared players are whispered that they earned a point.", visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() if cfg == nil then return true end return cfg.enableWhispersRaidPrepared ~= false end, set = function(value) SetRaidCheckPreparedWhispers(value) end },

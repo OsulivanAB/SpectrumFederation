@@ -191,7 +191,7 @@ function R:Build(panel, pageDef)
 
 			elseif t == "buttonRow" then
 				local opts = CopyTable(item)
-				for i = 1, 2 do
+				for i = 1, #opts do
 					if type(opts[i]) == "table" and type(opts[i].onClick) == "function" then
 						local fn = opts[i].onClick
 						opts[i] = CopyTable(opts[i])

@@ -111,6 +111,204 @@ local TRANSFER_CONTENT_WIDTH = 290
 local TRANSFER_CONTENT_INITIAL_HEIGHT = 1
 local TRANSFER_CONTENT_INSET_X = 8
 
+local RAIDCHECK_WHISPER_KEY = "SF_SETTINGS_RAIDCHECK_WHISPERS"
+local RAIDCHECK_WHISPER_CONTENT_WIDTH = 290
+local RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT = 1
+local RAIDCHECK_WHISPER_CONTENT_INSET_X = 8
+local RAIDCHECK_WHISPER_SAVE_LABEL = (type(SAVE) == "string" and SAVE) or "Save"
+
+local function EnsureRaidCheckWhisperPopupContent(content)
+	if not content then
+		return nil
+	end
+
+	if content._sfRaidCheckWhisperInitialized then
+		return content
+	end
+
+	content:SetSize(RAIDCHECK_WHISPER_CONTENT_WIDTH, RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT)
+
+	content.instructions = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+	content.instructions:SetJustifyH("LEFT")
+	content.instructions:SetJustifyV("TOP")
+	content.instructions:SetWordWrap(true)
+	content.instructions:SetText(
+		"Customize the whispers sent during Pre-Raid and Raid Check.\n\n" ..
+			"Variables:\n" ..
+			"  {missing_list}  - List of missing enchants/gems\n" ..
+			"  {point_name}    - The profile point name\n" ..
+			"  {point_award}   - The points awarded (raid only)\n" ..
+			"  {player}        - The player's name\n\n" ..
+			"Leave a box blank to use the default message."
+	)
+
+	content.preMissingLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	content.preMissingLabel:SetText("Pre-Raid: Missing requirements")
+
+	content.preMissingScroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
+	content.preMissingEditBox = CreateFrame("EditBox", nil, content.preMissingScroll)
+	content.preMissingEditBox:SetPoint("TOPLEFT")
+	content.preMissingEditBox:SetPoint("TOPRIGHT")
+	content.preMissingEditBox:SetHeight(64)
+	content.preMissingEditBox:SetMultiLine(true)
+	content.preMissingEditBox:SetFontObject(ChatFontNormal)
+	content.preMissingEditBox:SetAutoFocus(false)
+	content.preMissingEditBox:SetTextColor(1, 1, 1)
+	content.preMissingEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+	content.preMissingEditBox:SetScript("OnTextChanged", function()
+		if content.preMissingScroll and content.preMissingScroll.UpdateScrollChildRect then
+			content.preMissingScroll:UpdateScrollChildRect()
+		end
+	end)
+	content.preMissingScroll:SetScrollChild(content.preMissingEditBox)
+
+	content.raidMissingLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	content.raidMissingLabel:SetText("Raid Check: Missing requirements")
+
+	content.raidMissingScroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
+	content.raidMissingEditBox = CreateFrame("EditBox", nil, content.raidMissingScroll)
+	content.raidMissingEditBox:SetPoint("TOPLEFT")
+	content.raidMissingEditBox:SetPoint("TOPRIGHT")
+	content.raidMissingEditBox:SetHeight(64)
+	content.raidMissingEditBox:SetMultiLine(true)
+	content.raidMissingEditBox:SetFontObject(ChatFontNormal)
+	content.raidMissingEditBox:SetAutoFocus(false)
+	content.raidMissingEditBox:SetTextColor(1, 1, 1)
+	content.raidMissingEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+	content.raidMissingEditBox:SetScript("OnTextChanged", function()
+		if content.raidMissingScroll and content.raidMissingScroll.UpdateScrollChildRect then
+			content.raidMissingScroll:UpdateScrollChildRect()
+		end
+	end)
+	content.raidMissingScroll:SetScrollChild(content.raidMissingEditBox)
+
+	content.raidPreparedLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	content.raidPreparedLabel:SetText("Raid Check: Point awarded")
+
+	content.raidPreparedScroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
+	content.raidPreparedEditBox = CreateFrame("EditBox", nil, content.raidPreparedScroll)
+	content.raidPreparedEditBox:SetPoint("TOPLEFT")
+	content.raidPreparedEditBox:SetPoint("TOPRIGHT")
+	content.raidPreparedEditBox:SetHeight(64)
+	content.raidPreparedEditBox:SetMultiLine(true)
+	content.raidPreparedEditBox:SetFontObject(ChatFontNormal)
+	content.raidPreparedEditBox:SetAutoFocus(false)
+	content.raidPreparedEditBox:SetTextColor(1, 1, 1)
+	content.raidPreparedEditBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+	content.raidPreparedEditBox:SetScript("OnTextChanged", function()
+		if content.raidPreparedScroll and content.raidPreparedScroll.UpdateScrollChildRect then
+			content.raidPreparedScroll:UpdateScrollChildRect()
+		end
+	end)
+	content.raidPreparedScroll:SetScrollChild(content.raidPreparedEditBox)
+
+	content._sfRaidCheckWhisperInitialized = true
+	return content
+end
+
+local function LayoutRaidCheckWhisperPopupContent(content)
+	if not content then
+		return
+	end
+
+	local contentWidth = content:GetWidth() or RAIDCHECK_WHISPER_CONTENT_WIDTH
+	local insetX = RAIDCHECK_WHISPER_CONTENT_INSET_X
+	local innerWidth = math.max(1, contentWidth - (insetX * 2))
+
+	content.instructions:ClearAllPoints()
+	content.instructions:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, 0)
+	content.instructions:SetPoint("TOPRIGHT", content, "TOPRIGHT", -insetX, 0)
+	content.instructions:SetWidth(innerWidth)
+
+	local y = -(content.instructions:GetStringHeight() or 0) - 10
+
+	content.preMissingLabel:ClearAllPoints()
+	content.preMissingLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	y = y - (content.preMissingLabel:GetStringHeight() or 0) - 4
+
+	content.preMissingScroll:ClearAllPoints()
+	content.preMissingScroll:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.preMissingScroll:SetSize(innerWidth, 64)
+	y = y - 64 - 10
+
+	content.raidMissingLabel:ClearAllPoints()
+	content.raidMissingLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	y = y - (content.raidMissingLabel:GetStringHeight() or 0) - 4
+
+	content.raidMissingScroll:ClearAllPoints()
+	content.raidMissingScroll:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.raidMissingScroll:SetSize(innerWidth, 64)
+	y = y - 64 - 10
+
+	content.raidPreparedLabel:ClearAllPoints()
+	content.raidPreparedLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	y = y - (content.raidPreparedLabel:GetStringHeight() or 0) - 4
+
+	content.raidPreparedScroll:ClearAllPoints()
+	content.raidPreparedScroll:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.raidPreparedScroll:SetSize(innerWidth, 64)
+	y = y - 64
+
+	content:SetHeight(math.max(1, -y))
+end
+
+if not StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] then
+	StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] = {
+		text = "%s",
+		button1 = RAIDCHECK_WHISPER_SAVE_LABEL,
+		button2 = CANCEL,
+		timeout = 0,
+		whileDead = true,
+		hideOnEscape = true,
+		preferredIndex = 3,
+
+		OnShow = function(self, data)
+			local content = EnsureRaidCheckWhisperPopupContent(self.insertedFrame)
+			if not content then
+				return
+			end
+
+			local templates = data and data.templates or {}
+			content.preMissingEditBox:SetText(tostring(templates.preMissing or ""))
+			content.raidMissingEditBox:SetText(tostring(templates.raidMissing or ""))
+			content.raidPreparedEditBox:SetText(tostring(templates.raidPrepared or ""))
+
+			content.preMissingEditBox:SetCursorPosition(0)
+			content.raidMissingEditBox:SetCursorPosition(0)
+			content.raidPreparedEditBox:SetCursorPosition(0)
+
+			LayoutRaidCheckWhisperPopupContent(content)
+			if self.Resize then
+				self:Resize()
+			end
+		end,
+
+		OnAccept = function(self, data)
+			if not data or type(data.onAccept) ~= "function" then
+				return
+			end
+
+			local content = EnsureRaidCheckWhisperPopupContent(self.insertedFrame)
+			if not content then
+				return
+			end
+
+			data.onAccept(
+				content.preMissingEditBox and content.preMissingEditBox:GetText() or "",
+				content.raidMissingEditBox and content.raidMissingEditBox:GetText() or "",
+				content.raidPreparedEditBox and content.raidPreparedEditBox:GetText() or ""
+			)
+		end,
+
+		OnHide = function(self)
+			local content = self.insertedFrame
+			if content and content.preMissingEditBox then content.preMissingEditBox:SetText("") end
+			if content and content.raidMissingEditBox then content.raidMissingEditBox:SetText("") end
+			if content and content.raidPreparedEditBox then content.raidPreparedEditBox:SetText("") end
+		end,
+	}
+end
+
 local function SameMember(a, b)
     if SF.NameUtil and SF.NameUtil.SamePlayer then
         return SF.NameUtil.SamePlayer(a, b)
@@ -394,4 +592,31 @@ function Dialogs:TransferMemberHistory(message, acceptText, sourceOptions, targe
         targetOptions = targetOptions or {},
         onAccept = onAccept,
     }, insertedFrame) ~= nil
+end
+
+-- Show a dialog to edit Raid Check whisper templates
+-- @param message string Message text to display
+-- @param acceptText string|nil Text for accept button (defaults to SAVE)
+-- @param templates table|nil Table containing preMissing, raidMissing, raidPrepared strings
+-- @param onAccept function|nil Callback function(preMissing, raidMissing, raidPrepared) called if user accepts
+-- @return boolean True if dialog was shown, false otherwise
+function Dialogs:EditRaidCheckWhispers(message, acceptText, templates, onAccept)
+	if SF.Debug then
+		SF.Debug:Verbose("UI", "Showing raid check whisper editor dialog")
+	end
+
+	StaticPopupDialogs[RAIDCHECK_WHISPER_KEY].button1 = acceptText or RAIDCHECK_WHISPER_SAVE_LABEL
+
+	if not self._sfRaidCheckWhisperInsertedFrame then
+		self._sfRaidCheckWhisperInsertedFrame = CreateFrame("Frame", nil, UIParent)
+	end
+
+	local insertedFrame = EnsureRaidCheckWhisperPopupContent(self._sfRaidCheckWhisperInsertedFrame)
+	insertedFrame:Show()
+	LayoutRaidCheckWhisperPopupContent(insertedFrame)
+
+	return StaticPopup_Show(RAIDCHECK_WHISPER_KEY, message, nil, {
+		templates = templates or {},
+		onAccept = onAccept,
+	}, insertedFrame) ~= nil
 end

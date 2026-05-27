@@ -43,11 +43,27 @@ local RAID_CHECK_DEFAULTS = {
 	enableWhispersPreRaid = false,
 	enableWhispersRaid = false,
 	enableWhispersRaidPrepared = true,
+	whisperTemplatePreMissing = "Spectrum Federation: You're missing the following enchants/gems: {missing_list}.",
+	whisperTemplateRaidMissing = "Spectrum Federation: You're missing the following enchants/gems: {missing_list}. No new {point_name} awarded.",
+	whisperTemplateRaidPrepared = "Spectrum Federation: You've been awarded {point_award} {point_name}. Thanks for showing up prepared and on time!",
 	pointsAwardPerRaidCheck = 0.5,
 	checkGemsInSockets = true,
 	requireMetaGem = false,
 	slots = RAID_CHECK_SLOT_DEFAULTS,
 }
+
+local function NormalizeRaidCheckWhisperTemplate(value, defaultValue)
+	if type(value) ~= "string" then
+		return defaultValue
+	end
+
+	local trimmed = value:gsub("^%s+", ""):gsub("%s+$", "")
+	if trimmed == "" then
+		return defaultValue
+	end
+
+	return value
+end
 
 local function NormalizeRaidCheckPointsAward(value)
 	local amount = tonumber(value)
@@ -65,6 +81,9 @@ local function CopyRaidCheckDefaults()
 		enableWhispersPreRaid = RAID_CHECK_DEFAULTS.enableWhispersPreRaid,
 		enableWhispersRaid = RAID_CHECK_DEFAULTS.enableWhispersRaid,
 		enableWhispersRaidPrepared = RAID_CHECK_DEFAULTS.enableWhispersRaidPrepared,
+		whisperTemplatePreMissing = RAID_CHECK_DEFAULTS.whisperTemplatePreMissing,
+		whisperTemplateRaidMissing = RAID_CHECK_DEFAULTS.whisperTemplateRaidMissing,
+		whisperTemplateRaidPrepared = RAID_CHECK_DEFAULTS.whisperTemplateRaidPrepared,
 		pointsAwardPerRaidCheck = RAID_CHECK_DEFAULTS.pointsAwardPerRaidCheck,
 		checkGemsInSockets = RAID_CHECK_DEFAULTS.checkGemsInSockets,
 		requireMetaGem = RAID_CHECK_DEFAULTS.requireMetaGem,
@@ -107,6 +126,9 @@ function LootProfile:_EnsureRaidCheckConfig()
 	cfg.enableWhispersPreRaid = cfg.enableWhispersPreRaid and true or false
 	cfg.enableWhispersRaid = cfg.enableWhispersRaid and true or false
 	cfg.enableWhispersRaidPrepared = cfg.enableWhispersRaidPrepared ~= false
+	cfg.whisperTemplatePreMissing = NormalizeRaidCheckWhisperTemplate(cfg.whisperTemplatePreMissing, RAID_CHECK_DEFAULTS.whisperTemplatePreMissing)
+	cfg.whisperTemplateRaidMissing = NormalizeRaidCheckWhisperTemplate(cfg.whisperTemplateRaidMissing, RAID_CHECK_DEFAULTS.whisperTemplateRaidMissing)
+	cfg.whisperTemplateRaidPrepared = NormalizeRaidCheckWhisperTemplate(cfg.whisperTemplateRaidPrepared, RAID_CHECK_DEFAULTS.whisperTemplateRaidPrepared)
 	cfg.pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(cfg.pointsAwardPerRaidCheck)
 	cfg.checkGemsInSockets = cfg.checkGemsInSockets ~= false
 	cfg.requireMetaGem = cfg.requireMetaGem and true or false
@@ -701,6 +723,9 @@ function LootProfile:GetRaidCheckConfig()
 		enableWhispersPreRaid = self._raidCheckConfig.enableWhispersPreRaid and true or false,
 		enableWhispersRaid = self._raidCheckConfig.enableWhispersRaid and true or false,
 		enableWhispersRaidPrepared = self._raidCheckConfig.enableWhispersRaidPrepared ~= false,
+		whisperTemplatePreMissing = self._raidCheckConfig.whisperTemplatePreMissing,
+		whisperTemplateRaidMissing = self._raidCheckConfig.whisperTemplateRaidMissing,
+		whisperTemplateRaidPrepared = self._raidCheckConfig.whisperTemplateRaidPrepared,
 		pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(self._raidCheckConfig.pointsAwardPerRaidCheck),
 		checkGemsInSockets = self._raidCheckConfig.checkGemsInSockets ~= false,
 		requireMetaGem = self._raidCheckConfig.requireMetaGem and true or false,
@@ -827,6 +852,34 @@ function LootProfile:SetRaidCheckWhisperPrepared(enabled)
 	end
 
 	self._raidCheckConfig.enableWhispersRaidPrepared = enabled and true or false
+	return true, nil
+end
+
+-- Function set the whisper templates used by Pre-Raid and Raid Check
+-- @param string|nil preMissingTemplate
+-- @param string|nil raidMissingTemplate
+-- @param string|nil raidPreparedTemplate
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetRaidCheckWhisperTemplates(preMissingTemplate, raidMissingTemplate, raidPreparedTemplate)
+	self:_EnsureRaidCheckConfig()
+	if not self:IsCurrentUserAdmin() then
+		return false, "You must be an admin to change Raid Check settings."
+	end
+
+	self._raidCheckConfig.whisperTemplatePreMissing = NormalizeRaidCheckWhisperTemplate(
+		preMissingTemplate,
+		RAID_CHECK_DEFAULTS.whisperTemplatePreMissing
+	)
+	self._raidCheckConfig.whisperTemplateRaidMissing = NormalizeRaidCheckWhisperTemplate(
+		raidMissingTemplate,
+		RAID_CHECK_DEFAULTS.whisperTemplateRaidMissing
+	)
+	self._raidCheckConfig.whisperTemplateRaidPrepared = NormalizeRaidCheckWhisperTemplate(
+		raidPreparedTemplate,
+		RAID_CHECK_DEFAULTS.whisperTemplateRaidPrepared
+	)
+
 	return true, nil
 end
 
@@ -1638,6 +1691,15 @@ function LootProfile.ValidateSnapshot(snapshot)
 	if snapshot.raidCheck ~= nil then
 		if type(snapshot.raidCheck) ~= "table" then return false, "snapshot.raidCheck must be a table or nil" end
 
+		if snapshot.raidCheck.whisperTemplatePreMissing ~= nil and type(snapshot.raidCheck.whisperTemplatePreMissing) ~= "string" then
+			return false, "snapshot.raidCheck.whisperTemplatePreMissing must be a string when provided"
+		end
+		if snapshot.raidCheck.whisperTemplateRaidMissing ~= nil and type(snapshot.raidCheck.whisperTemplateRaidMissing) ~= "string" then
+			return false, "snapshot.raidCheck.whisperTemplateRaidMissing must be a string when provided"
+		end
+		if snapshot.raidCheck.whisperTemplateRaidPrepared ~= nil and type(snapshot.raidCheck.whisperTemplateRaidPrepared) ~= "string" then
+			return false, "snapshot.raidCheck.whisperTemplateRaidPrepared must be a string when provided"
+		end
 		if snapshot.raidCheck.pointsAwardPerRaidCheck ~= nil and type(snapshot.raidCheck.pointsAwardPerRaidCheck) ~= "number" then
 			return false, "snapshot.raidCheck.pointsAwardPerRaidCheck must be a number when provided"
 		end
@@ -1745,6 +1807,15 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		end
 		if snapshot.raidCheck.enableWhispersRaidPrepared ~= nil then
 			self._raidCheckConfig.enableWhispersRaidPrepared = snapshot.raidCheck.enableWhispersRaidPrepared and true or false
+		end
+		if snapshot.raidCheck.whisperTemplatePreMissing ~= nil then
+			self._raidCheckConfig.whisperTemplatePreMissing = snapshot.raidCheck.whisperTemplatePreMissing
+		end
+		if snapshot.raidCheck.whisperTemplateRaidMissing ~= nil then
+			self._raidCheckConfig.whisperTemplateRaidMissing = snapshot.raidCheck.whisperTemplateRaidMissing
+		end
+		if snapshot.raidCheck.whisperTemplateRaidPrepared ~= nil then
+			self._raidCheckConfig.whisperTemplateRaidPrepared = snapshot.raidCheck.whisperTemplateRaidPrepared
 		end
 		if snapshot.raidCheck.pointsAwardPerRaidCheck ~= nil then
 			self._raidCheckConfig.pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(snapshot.raidCheck.pointsAwardPerRaidCheck)
