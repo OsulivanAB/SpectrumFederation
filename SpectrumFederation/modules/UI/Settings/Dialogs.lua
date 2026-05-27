@@ -127,6 +127,7 @@ local RAIDCHECK_WHISPER_TEXTBOX_HEIGHT = 64
 	local RAIDCHECK_WHISPER_VARIABLE_GAP_X = 12
 	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_WIDTH = 700
 	local RAIDCHECK_WHISPER_DEFAULT_DIALOG_HEIGHT = 650
+	local RAIDCHECK_WHISPER_OUTER_SCROLL_INSET = 8
 
 local RAIDCHECK_WHISPER_BOX_BACKDROP = {
 	bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -232,12 +233,12 @@ local function EnsureRaidCheckWhisperPopupContent(content)
 
 	content:SetSize(RAIDCHECK_WHISPER_CONTENT_WIDTH, RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT)
 
-		if not content.__sfRaidCheckWhisperOuterScroll then
-			local outerScroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
-			outerScroll:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
-			outerScroll:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", 0, 0)
+			if not content.__sfRaidCheckWhisperOuterScroll then
+				local outerScroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
+				outerScroll:SetPoint("TOPLEFT", content, "TOPLEFT", RAIDCHECK_WHISPER_OUTER_SCROLL_INSET, -RAIDCHECK_WHISPER_OUTER_SCROLL_INSET)
+				outerScroll:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", -RAIDCHECK_WHISPER_OUTER_SCROLL_INSET, RAIDCHECK_WHISPER_OUTER_SCROLL_INSET)
 
-			outerScroll:EnableMouseWheel(true)
+				outerScroll:EnableMouseWheel(true)
 			outerScroll:SetScript("OnMouseWheel", function(self, delta)
 				local step = 20
 				local current = self.GetVerticalScroll and self:GetVerticalScroll() or 0
@@ -251,12 +252,16 @@ local function EnsureRaidCheckWhisperPopupContent(content)
 			end)
 
 			local child = CreateFrame("Frame", nil, outerScroll)
-			child:SetSize(1, 1)
-			outerScroll:SetScrollChild(child)
+				child:SetSize(1, 1)
+				outerScroll:SetScrollChild(child)
 
-			content.__sfRaidCheckWhisperOuterScroll = outerScroll
-			content.__sfRaidCheckWhisperOuterChild = child
-		end
+				if outerScroll.ScrollBar and outerScroll.ScrollBar.Hide then
+					outerScroll.ScrollBar:Hide()
+				end
+
+				content.__sfRaidCheckWhisperOuterScroll = outerScroll
+				content.__sfRaidCheckWhisperOuterChild = child
+			end
 
 		local root = content.__sfRaidCheckWhisperOuterChild or content
 
@@ -322,29 +327,41 @@ local function EnsureRaidCheckWhisperPopupContent(content)
 	return content
 end
 
-local function LayoutRaidCheckWhisperPopupContent(content)
-	if not content then
-		return
-	end
+	local function LayoutRaidCheckWhisperPopupContent(content)
+		if not content then
+			return
+		end
 
-	local outerScroll = content.__sfRaidCheckWhisperOuterScroll
-	local outerScrollBarWidth = 0
-	if outerScroll and outerScroll.ScrollBar and outerScroll.ScrollBar.GetWidth then
-		outerScrollBarWidth = outerScroll.ScrollBar:GetWidth() or 0
-	end
-	if outerScrollBarWidth <= 0 then
-		outerScrollBarWidth = RAIDCHECK_WHISPER_SCROLLBAR_WIDTH
-	end
+		local outerScroll = content.__sfRaidCheckWhisperOuterScroll
+		local outerScrollBarWidth = 0
+		if outerScroll and outerScroll.ScrollBar and outerScroll.ScrollBar.GetWidth then
+			outerScrollBarWidth = outerScroll.ScrollBar:GetWidth() or 0
+		end
+		if outerScrollBarWidth <= 0 then
+			outerScrollBarWidth = RAIDCHECK_WHISPER_SCROLLBAR_WIDTH
+		end
 
-	local root = content.__sfRaidCheckWhisperOuterChild or content
+		local root = content.__sfRaidCheckWhisperOuterChild or content
 
-	local contentWidth = content:GetWidth() or RAIDCHECK_WHISPER_CONTENT_WIDTH
-	contentWidth = contentWidth - outerScrollBarWidth - RAIDCHECK_WHISPER_SCROLLBAR_TEXT_GAP
-	if contentWidth < RAIDCHECK_WHISPER_CONTENT_WIDTH then
-		contentWidth = RAIDCHECK_WHISPER_CONTENT_WIDTH
-	end
+		local viewportWidth = content:GetWidth() or RAIDCHECK_WHISPER_CONTENT_WIDTH
+		if outerScroll and outerScroll.GetWidth then
+			local w = outerScroll:GetWidth() or 0
+			if w > 0 then
+				viewportWidth = w
+			end
+		end
 
-	root:SetWidth(contentWidth)
+		local reserveForScrollBar = 0
+		if outerScroll and outerScroll.ScrollBar and outerScroll.ScrollBar.IsShown and outerScroll.ScrollBar:IsShown() then
+			reserveForScrollBar = outerScrollBarWidth + RAIDCHECK_WHISPER_SCROLLBAR_TEXT_GAP
+		end
+
+		local contentWidth = viewportWidth - reserveForScrollBar
+		if contentWidth < RAIDCHECK_WHISPER_CONTENT_WIDTH then
+			contentWidth = RAIDCHECK_WHISPER_CONTENT_WIDTH
+		end
+
+		root:SetWidth(contentWidth)
 	local insetX = RAIDCHECK_WHISPER_CONTENT_INSET_X
 	local innerWidth = math.max(1, contentWidth - (insetX * 2))
 	local boxHeight = content.__sfTextBoxHeight or RAIDCHECK_WHISPER_TEXTBOX_HEIGHT
@@ -438,45 +455,60 @@ local function UpdateRaidCheckWhisperDialogLayout(dialog)
 		return
 	end
 
-	local dialogWidth = dialog:GetWidth() or 0
-	local availableWidth = dialogWidth - 70
-	if availableWidth < RAIDCHECK_WHISPER_CONTENT_WIDTH then
-		availableWidth = RAIDCHECK_WHISPER_CONTENT_WIDTH
-	end
-	content:SetWidth(availableWidth)
+		local dialogWidth = dialog:GetWidth() or 0
+		local availableWidth = dialogWidth - 70
+		if availableWidth < RAIDCHECK_WHISPER_CONTENT_WIDTH then
+			availableWidth = RAIDCHECK_WHISPER_CONTENT_WIDTH
+		end
+		content:SetWidth(availableWidth)
 
-	local availableHeight = content.GetHeight and content:GetHeight() or 0
-	if availableHeight <= 0 then
 		local dialogHeight = dialog:GetHeight() or 0
 		local approxNonContent = 210
-		availableHeight = dialogHeight - approxNonContent
-	end
-	if availableHeight < RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT then
-		availableHeight = RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT
-	end
-
-	local desiredBoxHeight = math.floor(availableHeight / 3)
-	desiredBoxHeight = math.max(RAIDCHECK_WHISPER_TEXTBOX_HEIGHT, desiredBoxHeight)
-	desiredBoxHeight = math.min(160, desiredBoxHeight)
-	content.__sfTextBoxHeight = desiredBoxHeight
-
-		LayoutRaidCheckWhisperPopupContent(content)
+		local contentHeight = dialogHeight - approxNonContent
+		if contentHeight < RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT then
+			contentHeight = RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT
+		end
+		content:SetHeight(contentHeight)
 
 		local outerScroll = content.__sfRaidCheckWhisperOuterScroll
-		if outerScroll and outerScroll.UpdateScrollChildRect then
-			outerScroll:UpdateScrollChildRect()
-		end
-		if outerScroll and outerScroll.GetVerticalScrollRange and outerScroll.ScrollBar then
-			local range = outerScroll:GetVerticalScrollRange() or 0
-			if range > 0 then
-				outerScroll.ScrollBar:Show()
-			else
-				outerScroll.ScrollBar:Hide()
+		local availableHeight = contentHeight
+		if outerScroll and outerScroll.GetHeight then
+			local h = outerScroll:GetHeight() or 0
+			if h > 0 then
+				availableHeight = h
 			end
 		end
 
-		if content.preMissingUpdateSize then content.preMissingUpdateSize() end
-		if content.raidMissingUpdateSize then content.raidMissingUpdateSize() end
+		local desiredBoxHeight = math.floor(availableHeight / 3)
+		desiredBoxHeight = math.max(RAIDCHECK_WHISPER_TEXTBOX_HEIGHT, desiredBoxHeight)
+		desiredBoxHeight = math.min(160, desiredBoxHeight)
+		content.__sfTextBoxHeight = desiredBoxHeight
+
+			LayoutRaidCheckWhisperPopupContent(content)
+
+			if outerScroll and outerScroll.UpdateScrollChildRect then
+				outerScroll:UpdateScrollChildRect()
+			end
+			if outerScroll and outerScroll.GetVerticalScrollRange and outerScroll.ScrollBar then
+				local range = outerScroll:GetVerticalScrollRange() or 0
+				local shouldShow = range > 0
+				local isShown = outerScroll.ScrollBar.IsShown and outerScroll.ScrollBar:IsShown() or true
+				if shouldShow ~= isShown then
+					if shouldShow then
+						outerScroll.ScrollBar:Show()
+					else
+						outerScroll.ScrollBar:Hide()
+					end
+
+					LayoutRaidCheckWhisperPopupContent(content)
+					if outerScroll.UpdateScrollChildRect then
+						outerScroll:UpdateScrollChildRect()
+					end
+				end
+			end
+
+			if content.preMissingUpdateSize then content.preMissingUpdateSize() end
+			if content.raidMissingUpdateSize then content.raidMissingUpdateSize() end
 		if content.raidPreparedUpdateSize then content.raidPreparedUpdateSize() end
 
 		if content.preMissingScheduleUpdateSize then content.preMissingScheduleUpdateSize() end
