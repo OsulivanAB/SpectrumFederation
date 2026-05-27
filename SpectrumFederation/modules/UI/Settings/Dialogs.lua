@@ -232,18 +232,46 @@ local function EnsureRaidCheckWhisperPopupContent(content)
 
 	content:SetSize(RAIDCHECK_WHISPER_CONTENT_WIDTH, RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT)
 
-		content.titleText = content:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+		if not content.__sfRaidCheckWhisperOuterScroll then
+			local outerScroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
+			outerScroll:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+			outerScroll:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", 0, 0)
+
+			outerScroll:EnableMouseWheel(true)
+			outerScroll:SetScript("OnMouseWheel", function(self, delta)
+				local step = 20
+				local current = self.GetVerticalScroll and self:GetVerticalScroll() or 0
+				local range = self.GetVerticalScrollRange and self:GetVerticalScrollRange() or 0
+				local nextScroll = current - (delta * step)
+				if nextScroll < 0 then nextScroll = 0 end
+				if nextScroll > range then nextScroll = range end
+				if self.SetVerticalScroll then
+					self:SetVerticalScroll(nextScroll)
+				end
+			end)
+
+			local child = CreateFrame("Frame", nil, outerScroll)
+			child:SetSize(1, 1)
+			outerScroll:SetScrollChild(child)
+
+			content.__sfRaidCheckWhisperOuterScroll = outerScroll
+			content.__sfRaidCheckWhisperOuterChild = child
+		end
+
+		local root = content.__sfRaidCheckWhisperOuterChild or content
+
+		content.titleText = root:CreateFontString(nil, "ARTWORK", "GameFontNormal")
 		content.titleText:SetJustifyH("LEFT")
 		content.titleText:SetJustifyV("TOP")
 		content.titleText:SetWordWrap(true)
 		content.titleText:SetText("Customize whispers for Raid Check and Pre-Raid Check.")
 
-		content.variablesHeader = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+		content.variablesHeader = root:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 		content.variablesHeader:SetJustifyH("LEFT")
 		content.variablesHeader:SetJustifyV("TOP")
 		content.variablesHeader:SetText("Variables:")
 
-		content.variablesFrame = CreateFrame("Frame", nil, content)
+		content.variablesFrame = CreateFrame("Frame", nil, root)
 
 		content.variableRows = {}
 		local variables = {
@@ -269,26 +297,26 @@ local function EnsureRaidCheckWhisperPopupContent(content)
 			content.variableRows[#content.variableRows + 1] = row
 		end
 
-		content.noteText = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+		content.noteText = root:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 		content.noteText:SetJustifyH("LEFT")
 		content.noteText:SetJustifyV("TOP")
 		content.noteText:SetWordWrap(true)
 		content.noteText:SetText("Clearing a box and saving will reset it to the default message.")
 
-	content.preMissingLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	content.preMissingLabel = root:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	content.preMissingLabel:SetText("Pre-Raid: Missing requirements")
 
-		content.preMissingBox, content.preMissingScroll, content.preMissingEditBox, content.preMissingUpdateSize, content.preMissingScheduleUpdateSize = CreateTextBox(content)
+		content.preMissingBox, content.preMissingScroll, content.preMissingEditBox, content.preMissingUpdateSize, content.preMissingScheduleUpdateSize = CreateTextBox(root)
 
-	content.raidMissingLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	content.raidMissingLabel = root:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	content.raidMissingLabel:SetText("Raid Check: Missing requirements")
 
-		content.raidMissingBox, content.raidMissingScroll, content.raidMissingEditBox, content.raidMissingUpdateSize, content.raidMissingScheduleUpdateSize = CreateTextBox(content)
+		content.raidMissingBox, content.raidMissingScroll, content.raidMissingEditBox, content.raidMissingUpdateSize, content.raidMissingScheduleUpdateSize = CreateTextBox(root)
 
-	content.raidPreparedLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+	content.raidPreparedLabel = root:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	content.raidPreparedLabel:SetText("Raid Check: Point awarded")
 
-		content.raidPreparedBox, content.raidPreparedScroll, content.raidPreparedEditBox, content.raidPreparedUpdateSize, content.raidPreparedScheduleUpdateSize = CreateTextBox(content)
+		content.raidPreparedBox, content.raidPreparedScroll, content.raidPreparedEditBox, content.raidPreparedUpdateSize, content.raidPreparedScheduleUpdateSize = CreateTextBox(root)
 
 	content._sfRaidCheckWhisperInitialized = true
 	return content
@@ -299,21 +327,38 @@ local function LayoutRaidCheckWhisperPopupContent(content)
 		return
 	end
 
+	local outerScroll = content.__sfRaidCheckWhisperOuterScroll
+	local outerScrollBarWidth = 0
+	if outerScroll and outerScroll.ScrollBar and outerScroll.ScrollBar.GetWidth then
+		outerScrollBarWidth = outerScroll.ScrollBar:GetWidth() or 0
+	end
+	if outerScrollBarWidth <= 0 then
+		outerScrollBarWidth = RAIDCHECK_WHISPER_SCROLLBAR_WIDTH
+	end
+
+	local root = content.__sfRaidCheckWhisperOuterChild or content
+
 	local contentWidth = content:GetWidth() or RAIDCHECK_WHISPER_CONTENT_WIDTH
+	contentWidth = contentWidth - outerScrollBarWidth - RAIDCHECK_WHISPER_SCROLLBAR_TEXT_GAP
+	if contentWidth < RAIDCHECK_WHISPER_CONTENT_WIDTH then
+		contentWidth = RAIDCHECK_WHISPER_CONTENT_WIDTH
+	end
+
+	root:SetWidth(contentWidth)
 	local insetX = RAIDCHECK_WHISPER_CONTENT_INSET_X
 	local innerWidth = math.max(1, contentWidth - (insetX * 2))
 	local boxHeight = content.__sfTextBoxHeight or RAIDCHECK_WHISPER_TEXTBOX_HEIGHT
 
 		content.titleText:ClearAllPoints()
-		content.titleText:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, 0)
-		content.titleText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -insetX, 0)
+		content.titleText:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, 0)
+		content.titleText:SetPoint("TOPRIGHT", root, "TOPRIGHT", -insetX, 0)
 		content.titleText:SetWidth(innerWidth)
 
 		local y = -(content.titleText:GetStringHeight() or 0) - 8
 
 		content.variablesHeader:ClearAllPoints()
-		content.variablesHeader:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
-		content.variablesHeader:SetPoint("TOPRIGHT", content, "TOPRIGHT", -insetX, y)
+		content.variablesHeader:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, y)
+		content.variablesHeader:SetPoint("TOPRIGHT", root, "TOPRIGHT", -insetX, y)
 		content.variablesHeader:SetWidth(innerWidth)
 
 		y = y - (content.variablesHeader:GetStringHeight() or 0) - 4
@@ -323,7 +368,7 @@ local function LayoutRaidCheckWhisperPopupContent(content)
 		local descWidth = math.max(1, innerWidth - descX)
 
 		content.variablesFrame:ClearAllPoints()
-		content.variablesFrame:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+		content.variablesFrame:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, y)
 		content.variablesFrame:SetWidth(innerWidth)
 
 		local rowsHeight = 0
@@ -347,40 +392,40 @@ local function LayoutRaidCheckWhisperPopupContent(content)
 		y = y - rowsHeight - 6
 
 		content.noteText:ClearAllPoints()
-		content.noteText:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
-		content.noteText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -insetX, y)
+		content.noteText:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, y)
+		content.noteText:SetPoint("TOPRIGHT", root, "TOPRIGHT", -insetX, y)
 		content.noteText:SetWidth(innerWidth)
 
 		y = y - (content.noteText:GetStringHeight() or 0) - 10
 
 	content.preMissingLabel:ClearAllPoints()
-	content.preMissingLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.preMissingLabel:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, y)
 	y = y - (content.preMissingLabel:GetStringHeight() or 0) - 4
 
 	content.preMissingBox:ClearAllPoints()
-	content.preMissingBox:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.preMissingBox:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, y)
 	content.preMissingBox:SetSize(innerWidth, boxHeight)
 	y = y - boxHeight - 10
 
 	content.raidMissingLabel:ClearAllPoints()
-	content.raidMissingLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.raidMissingLabel:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, y)
 	y = y - (content.raidMissingLabel:GetStringHeight() or 0) - 4
 
 	content.raidMissingBox:ClearAllPoints()
-	content.raidMissingBox:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.raidMissingBox:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, y)
 	content.raidMissingBox:SetSize(innerWidth, boxHeight)
 	y = y - boxHeight - 10
 
 	content.raidPreparedLabel:ClearAllPoints()
-	content.raidPreparedLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.raidPreparedLabel:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, y)
 	y = y - (content.raidPreparedLabel:GetStringHeight() or 0) - 4
 
 	content.raidPreparedBox:ClearAllPoints()
-	content.raidPreparedBox:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+	content.raidPreparedBox:SetPoint("TOPLEFT", root, "TOPLEFT", insetX, y)
 	content.raidPreparedBox:SetSize(innerWidth, boxHeight)
 	y = y - boxHeight
 
-	content:SetHeight(math.max(1, -y))
+	root:SetHeight(math.max(1, -y))
 end
 
 local function UpdateRaidCheckWhisperDialogLayout(dialog)
@@ -403,12 +448,30 @@ local function UpdateRaidCheckWhisperDialogLayout(dialog)
 	local dialogHeight = dialog:GetHeight() or 0
 	local approxNonContent = 210
 	local availableHeight = dialogHeight - approxNonContent
+	if availableHeight < RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT then
+		availableHeight = RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT
+	end
+	content:SetHeight(availableHeight)
+
 	local desiredBoxHeight = math.floor(availableHeight / 3)
 	desiredBoxHeight = math.max(RAIDCHECK_WHISPER_TEXTBOX_HEIGHT, desiredBoxHeight)
 	desiredBoxHeight = math.min(160, desiredBoxHeight)
 	content.__sfTextBoxHeight = desiredBoxHeight
 
 		LayoutRaidCheckWhisperPopupContent(content)
+
+		local outerScroll = content.__sfRaidCheckWhisperOuterScroll
+		if outerScroll and outerScroll.UpdateScrollChildRect then
+			outerScroll:UpdateScrollChildRect()
+		end
+		if outerScroll and outerScroll.GetVerticalScrollRange and outerScroll.ScrollBar then
+			local range = outerScroll:GetVerticalScrollRange() or 0
+			if range > 0 then
+				outerScroll.ScrollBar:Show()
+			else
+				outerScroll.ScrollBar:Hide()
+			end
+		end
 
 		if content.preMissingUpdateSize then content.preMissingUpdateSize() end
 		if content.raidMissingUpdateSize then content.raidMissingUpdateSize() end
@@ -517,6 +580,10 @@ if not StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] then
 			content.preMissingEditBox:SetCursorPosition(0)
 			content.raidMissingEditBox:SetCursorPosition(0)
 			content.raidPreparedEditBox:SetCursorPosition(0)
+
+			if content.__sfRaidCheckWhisperOuterScroll and content.__sfRaidCheckWhisperOuterScroll.SetVerticalScroll then
+				content.__sfRaidCheckWhisperOuterScroll:SetVerticalScroll(0)
+			end
 
 			UpdateRaidCheckWhisperDialogLayout(self)
 		end,
