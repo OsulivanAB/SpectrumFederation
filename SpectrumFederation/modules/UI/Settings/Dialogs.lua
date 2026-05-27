@@ -119,9 +119,12 @@ local RAIDCHECK_WHISPER_SAVE_LABEL = (type(SAVE) == "string" and SAVE) or "Save"
 local RAIDCHECK_WHISPER_BOX_INSET = 4
 local RAIDCHECK_WHISPER_SCROLLBAR_WIDTH = 24
 local RAIDCHECK_WHISPER_TEXTBOX_HEIGHT = 64
-local RAIDCHECK_WHISPER_SCROLL_RIGHT_GAP = 6
-local RAIDCHECK_WHISPER_MIN_WIDTH = 360
-local RAIDCHECK_WHISPER_MIN_HEIGHT = 420
+	local RAIDCHECK_WHISPER_SCROLL_RIGHT_GAP = 6
+	local RAIDCHECK_WHISPER_MIN_WIDTH = 360
+	local RAIDCHECK_WHISPER_MIN_HEIGHT = 420
+	local RAIDCHECK_WHISPER_SCROLLBAR_TEXT_GAP = 10
+	local RAIDCHECK_WHISPER_VARIABLE_NAME_COL_WIDTH = 110
+	local RAIDCHECK_WHISPER_VARIABLE_GAP_X = 12
 
 local RAIDCHECK_WHISPER_BOX_BACKDROP = {
 	bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -132,7 +135,7 @@ local RAIDCHECK_WHISPER_BOX_BACKDROP = {
 	insets = { left = 4, right = 4, top = 4, bottom = 4 },
 }
 
-local function CreateTextBox(parent)
+	local function CreateTextBox(parent)
 	local box = CreateFrame("Frame", nil, parent, "BackdropTemplate")
 	if box.SetBackdrop then
 		box:SetBackdrop(RAIDCHECK_WHISPER_BOX_BACKDROP)
@@ -150,22 +153,41 @@ local function CreateTextBox(parent)
 		RAIDCHECK_WHISPER_BOX_INSET
 	)
 
-	local editBox = CreateFrame("EditBox", nil, scroll)
-	editBox:SetPoint("TOPLEFT")
-	editBox:SetPoint("TOPRIGHT")
-	editBox:SetMultiLine(true)
-	editBox:SetFontObject(ChatFontNormal)
-	editBox:SetAutoFocus(false)
-	editBox:SetTextColor(1, 1, 1)
-	editBox:SetTextInsets(2, 2, 2, 2)
-	editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-	scroll:SetScrollChild(editBox)
+		local editBox = CreateFrame("EditBox", nil, scroll)
+		editBox:SetPoint("TOPLEFT")
+		editBox:SetPoint("TOPRIGHT")
+		editBox:SetMultiLine(true)
+		editBox:SetFontObject(ChatFontNormal)
+		editBox:SetAutoFocus(false)
+		editBox:SetTextColor(1, 1, 1)
+		editBox:SetTextInsets(2, 2, 2, 2)
+		editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+		scroll:SetScrollChild(editBox)
 
-	local function UpdateSize()
-		local w = (scroll:GetWidth() or 0) - RAIDCHECK_WHISPER_SCROLLBAR_WIDTH
-		if w > 20 then
-			editBox:SetWidth(w)
+		editBox:SetWidth(200)
+		editBox:SetHeight(RAIDCHECK_WHISPER_TEXTBOX_HEIGHT)
+
+		local function GetScrollBarWidth()
+			local sb = scroll.ScrollBar
+			if sb and sb.GetWidth then
+				local sbw = sb:GetWidth()
+				if sbw and sbw > 0 then
+					return sbw
+				end
+			end
+			return RAIDCHECK_WHISPER_SCROLLBAR_WIDTH
 		end
+
+		local function UpdateSize()
+			local scrollWidth = scroll:GetWidth() or 0
+			if scrollWidth < 40 then
+				return
+			end
+
+			local w = scrollWidth - GetScrollBarWidth() - RAIDCHECK_WHISPER_SCROLLBAR_TEXT_GAP
+			if w > 20 then
+				editBox:SetWidth(w)
+			end
 
 		local minH = scroll:GetHeight() or RAIDCHECK_WHISPER_TEXTBOX_HEIGHT
 		local textH = (editBox:GetStringHeight() or 0) + 16
@@ -173,14 +195,30 @@ local function CreateTextBox(parent)
 
 		if scroll.UpdateScrollChildRect then
 			scroll:UpdateScrollChildRect()
+			end
 		end
+
+		local function ScheduleUpdate()
+			if box.__sfUpdateScheduled then return end
+			box.__sfUpdateScheduled = true
+
+			if C_Timer and C_Timer.After then
+				C_Timer.After(0, function()
+					box.__sfUpdateScheduled = false
+					UpdateSize()
+				end)
+			else
+				box.__sfUpdateScheduled = false
+				UpdateSize()
+			end
+		end
+
+		scroll:SetScript("OnSizeChanged", UpdateSize)
+		editBox:SetScript("OnTextChanged", UpdateSize)
+
+		ScheduleUpdate()
+		return box, scroll, editBox, UpdateSize, ScheduleUpdate
 	end
-
-	scroll:SetScript("OnSizeChanged", UpdateSize)
-	editBox:SetScript("OnTextChanged", UpdateSize)
-
-	return box, scroll, editBox, UpdateSize
-end
 
 local function EnsureRaidCheckWhisperPopupContent(content)
 	if not content then
@@ -193,34 +231,63 @@ local function EnsureRaidCheckWhisperPopupContent(content)
 
 	content:SetSize(RAIDCHECK_WHISPER_CONTENT_WIDTH, RAIDCHECK_WHISPER_CONTENT_INITIAL_HEIGHT)
 
-	content.instructions = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-	content.instructions:SetJustifyH("LEFT")
-	content.instructions:SetJustifyV("TOP")
-	content.instructions:SetWordWrap(true)
-	content.instructions:SetText(
-		"Customize whispers for Raid Check and Pre-Raid Check.\n\n" ..
-			"Variables:\n" ..
-			"  {missing_list}  - List of missing enchants/gems\n" ..
-			"  {point_name}    - The profile point name\n" ..
-			"  {point_award}   - The points awarded (raid only)\n" ..
-			"  {player}        - The player's name\n\n" ..
-			"Clearing a box and saving will reset it to the default message."
-	)
+		content.titleText = content:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+		content.titleText:SetJustifyH("LEFT")
+		content.titleText:SetJustifyV("TOP")
+		content.titleText:SetWordWrap(true)
+		content.titleText:SetText("Customize whispers for Raid Check and Pre-Raid Check.")
+
+		content.variablesHeader = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+		content.variablesHeader:SetJustifyH("LEFT")
+		content.variablesHeader:SetJustifyV("TOP")
+		content.variablesHeader:SetText("Variables:")
+
+		content.variablesFrame = CreateFrame("Frame", nil, content)
+
+		content.variableRows = {}
+		local variables = {
+			{ "{missing_list}", "List of missing enchants/gems" },
+			{ "{point_name}", "The profile point name" },
+			{ "{point_award}", "The points awarded (raid only)" },
+			{ "{player}", "The player's name" },
+		}
+
+		for i = 1, #variables do
+			local row = CreateFrame("Frame", nil, content.variablesFrame)
+			row.nameText = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+			row.nameText:SetJustifyH("LEFT")
+			row.nameText:SetJustifyV("TOP")
+			row.nameText:SetText(variables[i][1])
+
+			row.descText = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+			row.descText:SetJustifyH("LEFT")
+			row.descText:SetJustifyV("TOP")
+			row.descText:SetWordWrap(true)
+			row.descText:SetText(variables[i][2])
+
+			content.variableRows[#content.variableRows + 1] = row
+		end
+
+		content.noteText = content:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+		content.noteText:SetJustifyH("LEFT")
+		content.noteText:SetJustifyV("TOP")
+		content.noteText:SetWordWrap(true)
+		content.noteText:SetText("Clearing a box and saving will reset it to the default message.")
 
 	content.preMissingLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	content.preMissingLabel:SetText("Pre-Raid: Missing requirements")
 
-	content.preMissingBox, content.preMissingScroll, content.preMissingEditBox, content.preMissingUpdateSize = CreateTextBox(content)
+		content.preMissingBox, content.preMissingScroll, content.preMissingEditBox, content.preMissingUpdateSize, content.preMissingScheduleUpdateSize = CreateTextBox(content)
 
 	content.raidMissingLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	content.raidMissingLabel:SetText("Raid Check: Missing requirements")
 
-	content.raidMissingBox, content.raidMissingScroll, content.raidMissingEditBox, content.raidMissingUpdateSize = CreateTextBox(content)
+		content.raidMissingBox, content.raidMissingScroll, content.raidMissingEditBox, content.raidMissingUpdateSize, content.raidMissingScheduleUpdateSize = CreateTextBox(content)
 
 	content.raidPreparedLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	content.raidPreparedLabel:SetText("Raid Check: Point awarded")
 
-	content.raidPreparedBox, content.raidPreparedScroll, content.raidPreparedEditBox, content.raidPreparedUpdateSize = CreateTextBox(content)
+		content.raidPreparedBox, content.raidPreparedScroll, content.raidPreparedEditBox, content.raidPreparedUpdateSize, content.raidPreparedScheduleUpdateSize = CreateTextBox(content)
 
 	content._sfRaidCheckWhisperInitialized = true
 	return content
@@ -236,12 +303,54 @@ local function LayoutRaidCheckWhisperPopupContent(content)
 	local innerWidth = math.max(1, contentWidth - (insetX * 2))
 	local boxHeight = content.__sfTextBoxHeight or RAIDCHECK_WHISPER_TEXTBOX_HEIGHT
 
-	content.instructions:ClearAllPoints()
-	content.instructions:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, 0)
-	content.instructions:SetPoint("TOPRIGHT", content, "TOPRIGHT", -insetX, 0)
-	content.instructions:SetWidth(innerWidth)
+		content.titleText:ClearAllPoints()
+		content.titleText:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, 0)
+		content.titleText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -insetX, 0)
+		content.titleText:SetWidth(innerWidth)
 
-	local y = -(content.instructions:GetStringHeight() or 0) - 10
+		local y = -(content.titleText:GetStringHeight() or 0) - 8
+
+		content.variablesHeader:ClearAllPoints()
+		content.variablesHeader:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+		content.variablesHeader:SetPoint("TOPRIGHT", content, "TOPRIGHT", -insetX, y)
+		content.variablesHeader:SetWidth(innerWidth)
+
+		y = y - (content.variablesHeader:GetStringHeight() or 0) - 4
+
+		local nameColWidth = RAIDCHECK_WHISPER_VARIABLE_NAME_COL_WIDTH
+		local descX = nameColWidth + RAIDCHECK_WHISPER_VARIABLE_GAP_X
+		local descWidth = math.max(1, innerWidth - descX)
+
+		content.variablesFrame:ClearAllPoints()
+		content.variablesFrame:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+		content.variablesFrame:SetWidth(innerWidth)
+
+		local rowsHeight = 0
+		for i = 1, #content.variableRows do
+			local row = content.variableRows[i]
+
+			row.nameText:ClearAllPoints()
+			row.nameText:SetPoint("TOPLEFT", content.variablesFrame, "TOPLEFT", 0, -rowsHeight)
+			row.nameText:SetWidth(nameColWidth)
+
+			row.descText:ClearAllPoints()
+			row.descText:SetPoint("TOPLEFT", content.variablesFrame, "TOPLEFT", descX, -rowsHeight)
+			row.descText:SetWidth(descWidth)
+
+			local nameHeight = row.nameText:GetStringHeight() or 0
+			local descHeight = row.descText:GetStringHeight() or 0
+			rowsHeight = rowsHeight + math.max(nameHeight, descHeight) + 2
+		end
+
+		content.variablesFrame:SetHeight(rowsHeight)
+		y = y - rowsHeight - 6
+
+		content.noteText:ClearAllPoints()
+		content.noteText:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
+		content.noteText:SetPoint("TOPRIGHT", content, "TOPRIGHT", -insetX, y)
+		content.noteText:SetWidth(innerWidth)
+
+		y = y - (content.noteText:GetStringHeight() or 0) - 10
 
 	content.preMissingLabel:ClearAllPoints()
 	content.preMissingLabel:SetPoint("TOPLEFT", content, "TOPLEFT", insetX, y)
@@ -298,12 +407,16 @@ local function UpdateRaidCheckWhisperDialogLayout(dialog)
 	desiredBoxHeight = math.min(160, desiredBoxHeight)
 	content.__sfTextBoxHeight = desiredBoxHeight
 
-	LayoutRaidCheckWhisperPopupContent(content)
+		LayoutRaidCheckWhisperPopupContent(content)
 
-	if content.preMissingUpdateSize then content.preMissingUpdateSize() end
-	if content.raidMissingUpdateSize then content.raidMissingUpdateSize() end
-	if content.raidPreparedUpdateSize then content.raidPreparedUpdateSize() end
-end
+		if content.preMissingUpdateSize then content.preMissingUpdateSize() end
+		if content.raidMissingUpdateSize then content.raidMissingUpdateSize() end
+		if content.raidPreparedUpdateSize then content.raidPreparedUpdateSize() end
+
+		if content.preMissingScheduleUpdateSize then content.preMissingScheduleUpdateSize() end
+		if content.raidMissingScheduleUpdateSize then content.raidMissingScheduleUpdateSize() end
+		if content.raidPreparedScheduleUpdateSize then content.raidPreparedScheduleUpdateSize() end
+	end
 
 local function EnsureRaidCheckWhisperDialogInteractions(dialog)
 	if not dialog or dialog.__sfRaidCheckWhisperInteractive then
@@ -330,11 +443,23 @@ local function EnsureRaidCheckWhisperDialogInteractions(dialog)
 		dialog:SetMinResize(RAIDCHECK_WHISPER_MIN_WIDTH, RAIDCHECK_WHISPER_MIN_HEIGHT)
 	end
 
-	if not dialog.__sfResizeButton then
-		local resizeBtn = CreateFrame("Button", nil, dialog, "UIPanelResizeButtonTemplate")
-		resizeBtn:SetPoint("BOTTOMRIGHT", dialog, "BOTTOMRIGHT", -6, 6)
-		dialog.__sfResizeButton = resizeBtn
-	end
+		if not dialog.__sfResizeButton then
+			local resizeBtn = CreateFrame("Button", nil, dialog, "UIPanelResizeButtonTemplate")
+			resizeBtn:SetSize(16, 16)
+			resizeBtn:SetPoint("BOTTOMRIGHT", dialog, "BOTTOMRIGHT", -6, 6)
+			resizeBtn:SetFrameLevel((dialog:GetFrameLevel() or 0) + 10)
+			resizeBtn:SetScript("OnMouseDown", function()
+				if dialog.StartSizing then
+					dialog:StartSizing("BOTTOMRIGHT")
+				end
+			end)
+			resizeBtn:SetScript("OnMouseUp", function()
+				if dialog.StopMovingOrSizing then
+					dialog:StopMovingOrSizing()
+				end
+			end)
+			dialog.__sfResizeButton = resizeBtn
+		end
 
 	dialog:HookScript("OnSizeChanged", function(self)
 		UpdateRaidCheckWhisperDialogLayout(self)
@@ -363,6 +488,10 @@ if not StaticPopupDialogs[RAIDCHECK_WHISPER_KEY] then
 			content.preMissingEditBox:SetText(tostring(templates.preMissing or ""))
 			content.raidMissingEditBox:SetText(tostring(templates.raidMissing or ""))
 			content.raidPreparedEditBox:SetText(tostring(templates.raidPrepared or ""))
+
+			if content.preMissingScroll and content.preMissingScroll.SetVerticalScroll then content.preMissingScroll:SetVerticalScroll(0) end
+			if content.raidMissingScroll and content.raidMissingScroll.SetVerticalScroll then content.raidMissingScroll:SetVerticalScroll(0) end
+			if content.raidPreparedScroll and content.raidPreparedScroll.SetVerticalScroll then content.raidPreparedScroll:SetVerticalScroll(0) end
 
 			content.preMissingEditBox:SetCursorPosition(0)
 			content.raidMissingEditBox:SetCursorPosition(0)
