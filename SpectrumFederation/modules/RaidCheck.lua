@@ -1946,6 +1946,13 @@ local function ShouldWhisper(mode, cfg)
 	return cfg.enableWhispersRaid
 end
 
+local function ShouldWhisperPrepared(cfg)
+	if type(cfg) ~= "table" then
+		return true
+	end
+	return cfg.enableWhispersRaidPrepared ~= false
+end
+
 local function GetWhisperDayKey(timestamp)
 	local value = tonumber(timestamp)
 	if not value then
@@ -2081,7 +2088,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 		end
 
 		local awarded = AwardPrepared(profile, member, pointName, pointAward)
-		if awarded and whisper then
+		if awarded and whisper and ShouldWhisperPrepared(cfg) then
 			WhisperPrepared(whisperTarget, pointName, pointAward)
 		end
 	end

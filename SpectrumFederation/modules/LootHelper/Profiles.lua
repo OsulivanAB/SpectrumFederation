@@ -42,6 +42,7 @@ local RAID_CHECK_SLOT_DEFAULTS = {
 local RAID_CHECK_DEFAULTS = {
 	enableWhispersPreRaid = false,
 	enableWhispersRaid = false,
+	enableWhispersRaidPrepared = true,
 	pointsAwardPerRaidCheck = 0.5,
 	checkGemsInSockets = true,
 	requireMetaGem = false,
@@ -63,6 +64,7 @@ local function CopyRaidCheckDefaults()
 	return {
 		enableWhispersPreRaid = RAID_CHECK_DEFAULTS.enableWhispersPreRaid,
 		enableWhispersRaid = RAID_CHECK_DEFAULTS.enableWhispersRaid,
+		enableWhispersRaidPrepared = RAID_CHECK_DEFAULTS.enableWhispersRaidPrepared,
 		pointsAwardPerRaidCheck = RAID_CHECK_DEFAULTS.pointsAwardPerRaidCheck,
 		checkGemsInSockets = RAID_CHECK_DEFAULTS.checkGemsInSockets,
 		requireMetaGem = RAID_CHECK_DEFAULTS.requireMetaGem,
@@ -104,6 +106,7 @@ function LootProfile:_EnsureRaidCheckConfig()
 
 	cfg.enableWhispersPreRaid = cfg.enableWhispersPreRaid and true or false
 	cfg.enableWhispersRaid = cfg.enableWhispersRaid and true or false
+	cfg.enableWhispersRaidPrepared = cfg.enableWhispersRaidPrepared ~= false
 	cfg.pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(cfg.pointsAwardPerRaidCheck)
 	cfg.checkGemsInSockets = cfg.checkGemsInSockets ~= false
 	cfg.requireMetaGem = cfg.requireMetaGem and true or false
@@ -697,6 +700,7 @@ function LootProfile:GetRaidCheckConfig()
 	return {
 		enableWhispersPreRaid = self._raidCheckConfig.enableWhispersPreRaid and true or false,
 		enableWhispersRaid = self._raidCheckConfig.enableWhispersRaid and true or false,
+		enableWhispersRaidPrepared = self._raidCheckConfig.enableWhispersRaidPrepared ~= false,
 		pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(self._raidCheckConfig.pointsAwardPerRaidCheck),
 		checkGemsInSockets = self._raidCheckConfig.checkGemsInSockets ~= false,
 		requireMetaGem = self._raidCheckConfig.requireMetaGem and true or false,
@@ -809,6 +813,20 @@ function LootProfile:SetRaidCheckWhispers(mode, enabled)
 		return false, "Invalid whisper mode."
 	end
 
+	return true, nil
+end
+
+-- Function toggle whether prepared players are whispered during Raid Check
+-- @param boolean enabled
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetRaidCheckWhisperPrepared(enabled)
+	self:_EnsureRaidCheckConfig()
+	if not self:IsCurrentUserAdmin() then
+		return false, "You must be an admin to change Raid Check settings."
+	end
+
+	self._raidCheckConfig.enableWhispersRaidPrepared = enabled and true or false
 	return true, nil
 end
 
@@ -1724,6 +1742,9 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		end
 		if snapshot.raidCheck.enableWhispersRaid ~= nil then
 			self._raidCheckConfig.enableWhispersRaid = snapshot.raidCheck.enableWhispersRaid and true or false
+		end
+		if snapshot.raidCheck.enableWhispersRaidPrepared ~= nil then
+			self._raidCheckConfig.enableWhispersRaidPrepared = snapshot.raidCheck.enableWhispersRaidPrepared and true or false
 		end
 		if snapshot.raidCheck.pointsAwardPerRaidCheck ~= nil then
 			self._raidCheckConfig.pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(snapshot.raidCheck.pointsAwardPerRaidCheck)
