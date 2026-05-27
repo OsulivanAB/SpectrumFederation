@@ -1784,6 +1784,116 @@ function Controls:AddKeyValueBox(section, opts)
 	end)
 end
 
+-- =======================================
+-- Template Editor (Label + EditBox + Button)
+-- =======================================
+-- Add a 3-row editor: label row, full-width edit box row, and a button row.
+-- Useful for settings that feel too cramped as a single inline row.
+-- @param section table Section to add rows into
+-- @param opts table Options including label, get/set or path, buttonText, onReset, visible/enabled/adminOnly
+-- @return table rows {labelRow=Frame, editRow=Frame, buttonRow=Frame}
+function Controls:AddTemplateEditor(section, opts)
+	opts = opts or {}
+	local get, set = ResolveGetSet(opts)
+
+	local labelRow = section:AddRow(opts.labelHeight or 18, function(row)
+		local fs = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+		fs:SetPoint("LEFT", row, "LEFT", 0, 0)
+		fs:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+		fs:SetJustifyH("LEFT")
+		fs:SetText(opts.label or "")
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, {fs})
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+
+	local editRow = section:AddRow(opts.editHeight or 26, function(row)
+		local edit = CreateFrame("EditBox", nil, row, "InputBoxTemplate")
+		edit:SetAutoFocus(false)
+		edit:SetPoint("LEFT", row, "LEFT", 0, 0)
+		edit:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+		edit:SetHeight(22)
+		edit:SetTextColor(1, 1, 1)
+		if edit.SetHighlightColor then
+			edit:SetHighlightColor(0.25, 0.5, 1, 0.35)
+		end
+
+		if opts.maxLetters then
+			edit:SetMaxLetters(opts.maxLetters)
+		end
+
+		local ignore = false
+
+		local function Commit()
+			if ignore then return end
+			if edit.IsEnabled and not edit:IsEnabled() then return end
+
+			local text = edit:GetText() or ""
+			set(text)
+
+			if opts.onCommit then
+				opts.onCommit(text, edit)
+			end
+		end
+
+		edit:SetScript("OnEnterPressed", function(selfEdit)
+			Commit()
+			selfEdit:ClearFocus()
+		end)
+
+		edit:SetScript("OnEditFocusLost", function()
+			Commit()
+		end)
+
+		local function Refresh()
+			ignore = true
+			edit:SetText(tostring(get() or ""))
+			if edit.SetCursorPosition then
+				edit:SetCursorPosition(0)
+			end
+			ignore = false
+
+			local _, enabled = self:_ApplyRowState(row, section, opts, {edit})
+			local c = enabled and 1 or 0.6
+			edit:SetTextColor(c, c, c)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+
+	local buttonRow = section:AddRow(opts.buttonHeight or 26, function(row)
+		local btn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+		btn:SetPoint("LEFT", row, "LEFT", 0, 0)
+		btn:SetSize(opts.buttonWidth or 120, 22)
+		btn:SetText(opts.buttonText or "Reset")
+
+		btn:SetScript("OnClick", function()
+			if btn.IsEnabled and not btn:IsEnabled() then return end
+			if opts.onReset then
+				opts.onReset(btn)
+			end
+		end)
+
+		local function Refresh()
+			self:_ApplyRowState(row, section, opts, {btn})
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+
+	return {
+		labelRow = labelRow,
+		editRow = editRow,
+		buttonRow = buttonRow,
+	}
+end
+
 -- Add a scrollable text box (read-only, multiline, copyable)
 -- @param section table Section to add row into
 -- @param opts table Options including label, height, get

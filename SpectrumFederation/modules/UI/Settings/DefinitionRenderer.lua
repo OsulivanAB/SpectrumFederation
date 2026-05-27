@@ -107,6 +107,17 @@ function R:Build(panel, pageDef)
 			elseif t == "keyValueBox" then
 				controls:AddKeyValueBox(sec, item)
 
+			elseif t == "templateEditor" then
+				local opts = item
+				if type(opts.onReset) == "function" then
+					local fn = opts.onReset
+					opts = CopyTable(opts)
+					opts.onReset = function(btn)
+						return fn(MakeCtx(panel, sec), btn)
+					end
+				end
+				controls:AddTemplateEditor(sec, opts)
+
 			elseif t == "checkbox" then
 				local opts = item
 				if type(opts.onValueChanged) == "function" then
