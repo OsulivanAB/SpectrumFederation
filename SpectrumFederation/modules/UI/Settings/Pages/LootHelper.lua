@@ -230,6 +230,47 @@ local function SetRaidCheckPreparedWhispers(value)
 	end
 end
 
+local function GetRaidCheckWhisperTemplate(templateKey)
+	local cfg = GetRaidCheckConfig()
+	if not cfg then
+		return ""
+	end
+
+	if templateKey == "pre_raid_missing" then
+		return cfg.whisperTemplatePreRaidMissing or ""
+	end
+	if templateKey == "raid_missing" then
+		return cfg.whisperTemplateRaidMissing or ""
+	end
+	if templateKey == "raid_prepared" then
+		return cfg.whisperTemplateRaidPrepared or ""
+	end
+
+	return ""
+end
+
+local function SetRaidCheckWhisperTemplate(templateKey, template)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckWhisperTemplate then
+		profile:SetRaidCheckWhisperTemplate(templateKey, template)
+	end
+end
+
+local function ResetRaidCheckWhisperTemplate(templateKey)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.ResetRaidCheckWhisperTemplate then
+		profile:ResetRaidCheckWhisperTemplate(templateKey)
+	end
+end
+
+local function ShouldShowWhisperTemplates()
+	local cfg = GetRaidCheckConfig()
+	if not cfg then
+		return false
+	end
+	return (cfg.enableWhispersPreRaid and true or false) or (cfg.enableWhispersRaid and true or false)
+end
+
 local function ToWoWHexColor(color)
 	if type(color) == "string" then
 		return color
@@ -1518,8 +1559,19 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "text", text = "Raid Checks..." },
 					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then SF.RaidCheck:RunPreRaidCheck() ctx.section:SetMessage("Pre-Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then SF.RaidCheck:RunRaidCheck() ctx.section:SetMessage("Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end } },
 					{ type = "text", text = "Enable Whispers During..." },
-					{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing required enchants or gems.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end } } },
-					{ type = "checkbox", label = "Whisper when a point is earned", adminOnly = true, tooltip = "Only applies when Raid Check whispers are enabled. When checked, prepared players are whispered that they earned a point.", visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() if cfg == nil then return true end return cfg.enableWhispersRaidPrepared ~= false end, set = function(value) SetRaidCheckPreparedWhispers(value) end },
+					{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing required enchants or gems.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end } } },
+					{ type = "checkbox", label = "Whisper when a point is earned", adminOnly = true, tooltip = "Only applies when Raid Check whispers are enabled. When checked, prepared players are whispered that they earned a point.", visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() if cfg == nil then return true end return cfg.enableWhispersRaidPrepared ~= false end, set = function(value) SetRaidCheckPreparedWhispers(value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end },
+					{ type = "spacer", height = 12, adminOnly = true, visible = function() return ShouldShowWhisperTemplates() end },
+					{ type = "heading", text = "Whisper Templates", adminOnly = true, visible = function() return ShouldShowWhisperTemplates() end },
+					{ type = "text", text = "Customize the whisper that is sent by modifying the templates below.", adminOnly = true, visible = function() return ShouldShowWhisperTemplates() end },
+					{ type = "text", text = "Variables you can use:", adminOnly = true, visible = function() return ShouldShowWhisperTemplates() end },
+					{ type = "text", text = "{player_name} - The name of the player being whispered", adminOnly = true, visible = function() return ShouldShowWhisperTemplates() end },
+					{ type = "text", text = "{missing} - Comma separated list of missing enchants/gems", adminOnly = true, visible = function() return ShouldShowWhisperTemplates() end },
+					{ type = "text", text = "{point_name} - The profile's point name (Raid Check only)", adminOnly = true, visible = function() return ShouldShowWhisperTemplates() end },
+					{ type = "text", text = "{points_awarded} - The number of points awarded (Raid Check only)", adminOnly = true, visible = function() return ShouldShowWhisperTemplates() end },
+					{ type = "editboxButton", label = "Pre-Raid Check Whisper", adminOnly = true, editWidth = 360, buttonWidth = 70, buttonText = "Reset", enabled = function() return ProfileActionsEnabled() end, visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, get = function() return GetRaidCheckWhisperTemplate("pre_raid_missing") end, set = function(value) SetRaidCheckWhisperTemplate("pre_raid_missing", value) end, onSubmit = function(ctx) ResetRaidCheckWhisperTemplate("pre_raid_missing") ctx.pageBuilder:Refresh() ctx.pageBuilder:Reflow() end },
+					{ type = "editboxButton", label = "Raid-Check Whisper (Missing something)", adminOnly = true, editWidth = 360, buttonWidth = 70, buttonText = "Reset", enabled = function() return ProfileActionsEnabled() end, visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, get = function() return GetRaidCheckWhisperTemplate("raid_missing") end, set = function(value) SetRaidCheckWhisperTemplate("raid_missing", value) end, onSubmit = function(ctx) ResetRaidCheckWhisperTemplate("raid_missing") ctx.pageBuilder:Refresh() ctx.pageBuilder:Reflow() end },
+					{ type = "editboxButton", label = "Raid-Check Whisper (Nothing missing)", adminOnly = true, editWidth = 360, buttonWidth = 70, buttonText = "Reset", enabled = function() return ProfileActionsEnabled() end, visible = function() local cfg = GetRaidCheckConfig() return cfg and (cfg.enableWhispersRaid and cfg.enableWhispersRaidPrepared ~= false) or false end, get = function() return GetRaidCheckWhisperTemplate("raid_prepared") end, set = function(value) SetRaidCheckWhisperTemplate("raid_prepared", value) end, onSubmit = function(ctx) ResetRaidCheckWhisperTemplate("raid_prepared") ctx.pageBuilder:Refresh() ctx.pageBuilder:Reflow() end },
 				},
 			},
 			admin = {

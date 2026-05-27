@@ -739,11 +739,26 @@ function Controls:AddEditBoxWithButton(section, opts)
 	return section:AddRow(26, function(row)
 		local _, control = self:InitRow(row, opts)
 
+		local bound = false
+		local get, set
+		if opts.path or (type(opts.get) == "function" and type(opts.set) == "function") then
+			bound = true
+			get, set = ResolveGetSet(opts)
+		end
+
 		local edit = CreateFrame("EditBox", nil, control, "InputBoxTemplate")
 		edit:SetAutoFocus(false)
 		edit:SetSize(opts.editWidth or 150, 22)
 		edit:SetPoint("LEFT", control, "LEFT", 0, 0)
 		edit:SetText("")
+		edit:SetTextColor(1, 1, 1)
+		if edit.SetHighlightColor then
+			edit:SetHighlightColor(0.25, 0.5, 1, 0.35)
+		end
+
+		if opts.maxLetters then
+			edit:SetMaxLetters(opts.maxLetters)
+		end
 
 		if opts.hint and edit.Instructions then
 			edit.Instructions:SetText(opts.hint)
@@ -754,22 +769,59 @@ function Controls:AddEditBoxWithButton(section, opts)
 		btn:SetText(opts.buttonText or "OK")
 		btn:SetPoint("LEFT", edit, "RIGHT", 8, 0)
 
+		local ignore = false
+
+		local function Commit()
+			if not bound then return end
+			if ignore then return end
+			if edit.IsEnabled and not edit:IsEnabled() then return end
+
+			local text = edit:GetText() or ""
+			set(text)
+
+			if opts.onCommit then
+				opts.onCommit(text, edit)
+			end
+		end
+
 		local function DoSubmit()
 			if (btn.IsEnabled and not btn:IsEnabled()) then return end	
 			local text = edit:GetText()
 			if opts.onSubmit then
 				opts.onSubmit(text, edit, btn)
+			elseif bound then
+				Commit()
 			end
 		end
 
 		btn:SetScript("OnClick", DoSubmit)
 		edit:SetScript("OnEnterPressed", function(selfEdit)
-			DoSubmit()
+			if bound then
+				Commit()
+			else
+				DoSubmit()
+			end
 			selfEdit:ClearFocus()
+		end)
+		edit:SetScript("OnEditFocusLost", function()
+			if bound then
+				Commit()
+			end
 		end)
 
 		local function Refresh()
-			self:_ApplyRowState(row, section, opts, {edit, btn})
+			if bound then
+				ignore = true
+				edit:SetText(tostring(get() or ""))
+				if edit.SetCursorPosition then
+					edit:SetCursorPosition(0)
+				end
+				ignore = false
+			end
+
+			local _, enabled = self:_ApplyRowState(row, section, opts, {edit, btn})
+			local c = enabled and 1 or 0.6
+			edit:SetTextColor(c, c, c)
 		end
 		Refresh()
 		RegisterRefresh(section, Refresh)
