@@ -58,6 +58,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.22-beta.2] - 2026-05-29
+
+### Fixed
+- Resolved an issue causing false-positive raid check results when item data was partially loaded. Players with incomplete item data are now marked as "pending" instead of failing checks.
+
 ## [0.5.22-beta.1] - 2026-05-27
 
 ### Added
