@@ -12,7 +12,7 @@ local PADDING = 10
 local ROW_HEIGHT = 40
 local MAX_TRADE_ITEMS = 6
 local RANGE_REFRESH_INTERVAL = 0.5
-local TRADE_FILL_MAX_VERIFY_TICKS = 30
+local TRADE_FILL_MAX_VERIFY_TICKS = 180
 
 local function GetNormalizedPlayerId(name, realm)
     if not (SF.NameUtil and SF.NameUtil.NormalizeNameRealm) then
@@ -479,11 +479,13 @@ function TradeAssistant:PickupBagItem(bag, slot, amount, stackCount)
 
     if amount < stackCount and C_Container.SplitContainerItem then
         C_Container.SplitContainerItem(bag, slot, amount)
+        return true
     elseif C_Container.PickupContainerItem then
         C_Container.PickupContainerItem(bag, slot)
+        return true
     end
 
-    return CursorHasItem and CursorHasItem() or false
+    return false
 end
 
 function TradeAssistant:GetCursorItemId()
