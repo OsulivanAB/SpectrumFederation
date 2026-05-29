@@ -84,8 +84,8 @@ end
 --- Parse an item link from command args
 -- Returns itemLink, itemId or nil on failure
 local function ParseItemLink(text)
-    -- Match a WoW item link pattern
-    local link = text:match("|c%x+|Hitem:[^|]+|h%[.-%]|h|r")
+    -- Match a WoW item link pattern (supports both hex |cFFFFFFFF and named |cnCOLOR_NAME: color formats)
+    local link = text:match("|c[^|]+|Hitem:[^|]+|h%[.-%]|h|r")
     if not link then
         return nil, nil
     end
