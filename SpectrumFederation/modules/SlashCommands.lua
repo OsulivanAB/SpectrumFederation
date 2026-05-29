@@ -55,8 +55,8 @@ end
 -- @param msg string Raw message after /sf
 -- @return nil
 local function SlashCommandHandler(msg)
-    -- Trim whitespace and convert to lowercase
-    msg = msg:trim():lower()
+    -- Trim whitespace
+    msg = msg:trim()
     
     -- Empty command or no arguments - open settings
     if msg == "" then
@@ -70,9 +70,9 @@ local function SlashCommandHandler(msg)
         return
     end
     
-    -- Split command and arguments
+    -- Split command and arguments (preserve original case in args for item links)
     local command, args = msg:match("^(%S+)%s*(.*)")
-    command = command or msg
+    command = (command or msg):lower()
     args = args or ""
     
     -- Check for help command
