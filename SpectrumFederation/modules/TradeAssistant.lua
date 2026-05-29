@@ -360,7 +360,13 @@ function TA:_QueueItemPlacement(items)
     end
 
     self._placementIndex = 1
-    self:_ProcessNextPlacement()
+
+    -- Delay the first placement to allow the trade frame to fully initialize
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0.3, function() self:_ProcessNextPlacement() end)
+    else
+        self:_ProcessNextPlacement()
+    end
 end
 
 --- Process the next item placement from the queue
@@ -368,6 +374,14 @@ function TA:_ProcessNextPlacement()
     if not self._placementQueue then return end
     if not self._placementIndex then return end
     if self._placementIndex > #self._placementQueue then
+        self._placementQueue = nil
+        self._placementIndex = nil
+        return
+    end
+
+    -- Check if there is an empty trade slot available
+    if not self:_FindEmptyTradeSlot() then
+        SF:PrintError("SF Trade: No empty trade slots available.")
         self._placementQueue = nil
         self._placementIndex = nil
         return
@@ -382,31 +396,19 @@ function TA:_ProcessNextPlacement()
         SF:PrintError("SF Trade: Could not find " .. (entry.itemLink or "item") .. " in your bags.")
         -- Continue with next item
         if C_Timer and C_Timer.After then
-            C_Timer.After(0.1, function() self:_ProcessNextPlacement() end)
+            C_Timer.After(0.2, function() self:_ProcessNextPlacement() end)
         end
         return
     end
 
-    -- Pick up the item and place it in the trade window
+    -- Use the item directly - when a trade window is open, UseContainerItem
+    -- automatically places the item into the next available trade slot
     ClearCursor()
-    C_Container.PickupContainerItem(bagId, slotId)
-
-    -- Find an empty trade slot
-    local tradeSlot = self:_FindEmptyTradeSlot()
-    if not tradeSlot then
-        SF:PrintError("SF Trade: Could not add " .. (entry.itemLink or "item") .. " to the trade window.")
-        ClearCursor()
-        if C_Timer and C_Timer.After then
-            C_Timer.After(0.1, function() self:_ProcessNextPlacement() end)
-        end
-        return
-    end
-
-    ClickTradeButton(tradeSlot)
+    C_Container.UseContainerItem(bagId, slotId)
 
     -- Schedule next placement
     if C_Timer and C_Timer.After then
-        C_Timer.After(0.1, function() self:_ProcessNextPlacement() end)
+        C_Timer.After(0.2, function() self:_ProcessNextPlacement() end)
     end
 end
 
@@ -433,8 +435,8 @@ end
 -- @return number|nil slot index or nil
 function TA:_FindEmptyTradeSlot()
     for i = 1, 6 do
-        local _, _, _, _, _, hasItem = GetTradePlayerItemInfo(i)
-        if not hasItem then
+        local name = GetTradePlayerItemInfo(i)
+        if not name then
             return i
         end
     end
