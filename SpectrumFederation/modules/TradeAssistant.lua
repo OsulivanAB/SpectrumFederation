@@ -12,7 +12,7 @@ local PADDING = 10
 local ROW_HEIGHT = 40
 local MAX_TRADE_ITEMS = 6
 local RANGE_REFRESH_INTERVAL = 0.5
-local TRADE_FILL_PHASE_TIMEOUT = 0.5
+local TRADE_FILL_MAX_VERIFY_TICKS = 30
 
 local function GetNormalizedPlayerId(name, realm)
     if not (SF.NameUtil and SF.NameUtil.NormalizeNameRealm) then
@@ -412,38 +412,6 @@ function TradeAssistant:FindBagStacks(itemID)
         return stacks
     end
 
-    function TradeAssistant:GetBagItemInfo(bag, slot)
-        if not (C_Container and C_Container.GetContainerItemInfo) then
-            return nil
-        end
-
-        local info = C_Container.GetContainerItemInfo(bag, slot)
-        if not info or info.itemID == nil or (info.stackCount or 0) <= 0 then
-            return nil
-        end
-
-        return {
-            itemID = info.itemID,
-            stackCount = info.stackCount or 0,
-            isLocked = info.isLocked == true,
-        }
-    end
-
-    function TradeAssistant:FindBagStackForTransfer(itemID, amount)
-        local bestMatch
-        for _, stack in ipairs(self:FindBagStacks(itemID)) do
-            if stack.count == amount then
-                return stack
-            end
-
-            if stack.count > amount and (not bestMatch or stack.count < bestMatch.count) then
-                bestMatch = stack
-            end
-        end
-
-        return bestMatch
-    end
-
     for bag = 0, GetBagSlotCount() do
         local slotCount = C_Container.GetContainerNumSlots and C_Container.GetContainerNumSlots(bag) or 0
         for slot = 1, slotCount do
@@ -459,6 +427,38 @@ function TradeAssistant:FindBagStacks(itemID)
     end
 
     return stacks
+end
+
+function TradeAssistant:GetBagItemInfo(bag, slot)
+    if not (C_Container and C_Container.GetContainerItemInfo) then
+        return nil
+    end
+
+    local info = C_Container.GetContainerItemInfo(bag, slot)
+    if not info or info.itemID == nil or (info.stackCount or 0) <= 0 then
+        return nil
+    end
+
+    return {
+        itemID = info.itemID,
+        stackCount = info.stackCount or 0,
+        isLocked = info.isLocked == true,
+    }
+end
+
+function TradeAssistant:FindBagStackForTransfer(itemID, amount)
+    local bestMatch
+    for _, stack in ipairs(self:FindBagStacks(itemID)) do
+        if stack.count == amount then
+            return stack
+        end
+
+        if stack.count > amount and (not bestMatch or stack.count < bestMatch.count) then
+            bestMatch = stack
+        end
+    end
+
+    return bestMatch
 end
 
 function TradeAssistant:GetNextTradeSlot()
@@ -604,20 +604,20 @@ function TradeAssistant:ProcessPendingTradeFill()
         state.sourceBag = stack.bag
         state.sourceSlot = stack.slot
         state.expectedRemaining = math.max((stack.count or 0) - (transfer.amount or 0), 0)
-        state.phaseStartedAt = GetTimePreciseSec and GetTimePreciseSec() or 0
+        state.phaseTicks = 0
         state.phase = "verify"
         return
     end
 
     if state.phase == "verify" then
         if self:IsTransferReadyToPlace(transfer, state) then
-            state.phaseStartedAt = nil
+            state.phaseTicks = nil
             state.phase = "place"
             return
         end
 
-        local now = GetTimePreciseSec and GetTimePreciseSec() or 0
-        if (now - (state.phaseStartedAt or now)) >= TRADE_FILL_PHASE_TIMEOUT then
+        state.phaseTicks = (state.phaseTicks or 0) + 1
+        if state.phaseTicks >= TRADE_FILL_MAX_VERIFY_TICKS then
             if CursorHasItem and CursorHasItem() then
                 ClearCursor()
             end
