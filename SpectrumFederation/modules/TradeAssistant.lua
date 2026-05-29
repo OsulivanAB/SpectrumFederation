@@ -1,4 +1,4 @@
--- luacheck: globals CreateFrame UIParent IsInRaid GetNumGroupMembers GetRaidRosterInfo UnitFullName CheckInteractDistance InitiateTrade C_Container GetItemInfo GetItemInfoInstant ClickTradeButton GetTradePlayerItemInfo ClearCursor CursorHasItem strtrim Ambiguate GetUnitName
+-- luacheck: globals CreateFrame UIParent IsInRaid GetNumGroupMembers GetRaidRosterInfo UnitFullName CheckInteractDistance InitiateTrade C_Container GetItemInfo GetItemInfoInstant ClickTradeButton GetTradePlayerItemInfo ClearCursor CursorHasItem GetCursorInfo strtrim Ambiguate GetUnitName
 local addonName, SF = ...
 
 SF.TradeAssistant = SF.TradeAssistant or {}
@@ -12,6 +12,7 @@ local PADDING = 10
 local ROW_HEIGHT = 40
 local MAX_TRADE_ITEMS = 6
 local RANGE_REFRESH_INTERVAL = 0.5
+local TRADE_FILL_PHASE_TIMEOUT = 0.5
 
 local function GetNormalizedPlayerId(name, realm)
     if not (SF.NameUtil and SF.NameUtil.NormalizeNameRealm) then
@@ -411,6 +412,38 @@ function TradeAssistant:FindBagStacks(itemID)
         return stacks
     end
 
+    function TradeAssistant:GetBagItemInfo(bag, slot)
+        if not (C_Container and C_Container.GetContainerItemInfo) then
+            return nil
+        end
+
+        local info = C_Container.GetContainerItemInfo(bag, slot)
+        if not info or info.itemID == nil or (info.stackCount or 0) <= 0 then
+            return nil
+        end
+
+        return {
+            itemID = info.itemID,
+            stackCount = info.stackCount or 0,
+            isLocked = info.isLocked == true,
+        }
+    end
+
+    function TradeAssistant:FindBagStackForTransfer(itemID, amount)
+        local bestMatch
+        for _, stack in ipairs(self:FindBagStacks(itemID)) do
+            if stack.count == amount then
+                return stack
+            end
+
+            if stack.count > amount and (not bestMatch or stack.count < bestMatch.count) then
+                bestMatch = stack
+            end
+        end
+
+        return bestMatch
+    end
+
     for bag = 0, GetBagSlotCount() do
         local slotCount = C_Container.GetContainerNumSlots and C_Container.GetContainerNumSlots(bag) or 0
         for slot = 1, slotCount do
@@ -453,6 +486,41 @@ function TradeAssistant:PickupBagItem(bag, slot, amount, stackCount)
     return CursorHasItem and CursorHasItem() or false
 end
 
+function TradeAssistant:IsCursorHoldingItem(itemID)
+    if not (CursorHasItem and CursorHasItem()) then
+        return false
+    end
+
+    if not GetCursorInfo then
+        return true
+    end
+
+    local cursorType, cursorItemID = GetCursorInfo()
+    if cursorType ~= "item" then
+        return false
+    end
+
+    return itemID == nil or cursorItemID == itemID
+end
+
+function TradeAssistant:IsTransferReadyToPlace(transfer, state)
+    if not self:IsCursorHoldingItem(transfer.item.itemID) then
+        return false
+    end
+
+    local remaining = state.expectedRemaining or 0
+    local sourceInfo = self:GetBagItemInfo(state.sourceBag, state.sourceSlot)
+
+    if remaining <= 0 then
+        return sourceInfo == nil
+    end
+
+    return sourceInfo
+        and sourceInfo.itemID == transfer.item.itemID
+        and sourceInfo.isLocked ~= true
+        and sourceInfo.stackCount == remaining
+end
+
 function TradeAssistant:QueueTradeWindowPopulation(playerId)
     local entry = self.pending[playerId]
     if not entry or type(entry.items) ~= "table" then
@@ -481,10 +549,7 @@ function TradeAssistant:QueueTradeWindowPopulation(playerId)
                 local amount = math.min(remaining, stack.count)
                 table.insert(transfers, {
                     item = item,
-                    bag = stack.bag,
-                    slot = stack.slot,
                     amount = amount,
-                    stackCount = stack.count,
                 })
                 remaining = remaining - amount
             end
@@ -521,7 +586,14 @@ function TradeAssistant:ProcessPendingTradeFill()
             return
         end
 
-        local pickedUp = self:PickupBagItem(transfer.bag, transfer.slot, transfer.amount, transfer.stackCount)
+        local stack = self:FindBagStackForTransfer(item.itemID, transfer.amount)
+        if not stack then
+            SF:PrintError(string.format("Trade: Could not find a stack of %s for %s.", tostring(transfer.amount), item.itemLink or item.itemName or ("item:" .. tostring(item.itemID))))
+            self._pendingTradeFill = nil
+            return
+        end
+
+        local pickedUp = self:PickupBagItem(stack.bag, stack.slot, transfer.amount, stack.count)
         if not pickedUp then
             SF:PrintError(string.format("Trade: Could not add %s to the trade window.", item.itemLink or item.itemName or ("item:" .. tostring(item.itemID))))
             self._pendingTradeFill = nil
@@ -529,11 +601,41 @@ function TradeAssistant:ProcessPendingTradeFill()
         end
 
         state.tradeSlot = tradeSlot
-        state.phase = "place"
+        state.sourceBag = stack.bag
+        state.sourceSlot = stack.slot
+        state.expectedRemaining = math.max((stack.count or 0) - (transfer.amount or 0), 0)
+        state.phaseStartedAt = GetTimePreciseSec and GetTimePreciseSec() or 0
+        state.phase = "verify"
         return
     end
 
-    if not (CursorHasItem and CursorHasItem()) then
+    if state.phase == "verify" then
+        if self:IsTransferReadyToPlace(transfer, state) then
+            state.phaseStartedAt = nil
+            state.phase = "place"
+            return
+        end
+
+        local now = GetTimePreciseSec and GetTimePreciseSec() or 0
+        if (now - (state.phaseStartedAt or now)) >= TRADE_FILL_PHASE_TIMEOUT then
+            if CursorHasItem and CursorHasItem() then
+                ClearCursor()
+            end
+            SF:PrintError(string.format("Trade: Could not split %s to %s before adding it to the trade window.", item.itemLink or item.itemName or ("item:" .. tostring(item.itemID)), tostring(transfer.amount)))
+            self._pendingTradeFill = nil
+        end
+        return
+    end
+
+    if not self:IsCursorHoldingItem(item.itemID) then
+        SF:PrintError(string.format("Trade: Could not add %s to the trade window.", item.itemLink or item.itemName or ("item:" .. tostring(item.itemID))))
+        self._pendingTradeFill = nil
+        return
+    end
+
+    state.tradeSlot = self:GetNextTradeSlot()
+    if not state.tradeSlot then
+        ClearCursor()
         SF:PrintError(string.format("Trade: Could not add %s to the trade window.", item.itemLink or item.itemName or ("item:" .. tostring(item.itemID))))
         self._pendingTradeFill = nil
         return
