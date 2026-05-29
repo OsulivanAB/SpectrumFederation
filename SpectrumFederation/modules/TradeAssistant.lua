@@ -1,4 +1,4 @@
--- luacheck: globals CreateFrame UIParent IsInRaid GetNumGroupMembers GetRaidRosterInfo UnitFullName CheckInteractDistance InitiateTrade C_Container GetItemInfo GetItemInfoInstant ClickTradeButton GetTradePlayerItemInfo ClearCursor CursorHasItem GetCursorInfo strtrim Ambiguate GetUnitName
+-- luacheck: globals CreateFrame UIParent IsInRaid GetNumGroupMembers GetRaidRosterInfo UnitFullName CheckInteractDistance InitiateTrade C_Container C_Cursor C_Item GetItemInfo GetItemInfoInstant ClickTradeButton GetTradePlayerItemInfo ClearCursor CursorHasItem GetCursorInfo strtrim Ambiguate GetUnitName
 local addonName, SF = ...
 
 SF.TradeAssistant = SF.TradeAssistant or {}
@@ -486,6 +486,38 @@ function TradeAssistant:PickupBagItem(bag, slot, amount, stackCount)
     return CursorHasItem and CursorHasItem() or false
 end
 
+function TradeAssistant:GetCursorItemId()
+    if C_Cursor and C_Cursor.GetCursorItem and C_Item and C_Item.GetItemID then
+        local cursorItem = C_Cursor.GetCursorItem()
+        local cursorItemID = cursorItem and C_Item.GetItemID(cursorItem)
+        if cursorItemID then
+            return cursorItemID
+        end
+    end
+
+    if not GetCursorInfo then
+        return nil
+    end
+
+    local cursorType, cursorArg1, cursorArg2 = GetCursorInfo()
+    if cursorType ~= "item" then
+        return nil
+    end
+
+    if cursorArg2 ~= nil then
+        local sourceInfo = self:GetBagItemInfo(cursorArg1, cursorArg2)
+        if sourceInfo and sourceInfo.itemID then
+            return sourceInfo.itemID
+        end
+    end
+
+    if cursorArg2 == nil and type(cursorArg1) == "number" then
+        return cursorArg1
+    end
+
+    return nil
+end
+
 function TradeAssistant:IsCursorHoldingItem(itemID)
     if not (CursorHasItem and CursorHasItem()) then
         return false
@@ -495,8 +527,8 @@ function TradeAssistant:IsCursorHoldingItem(itemID)
         return true
     end
 
-    local cursorType, cursorItemID = GetCursorInfo()
-    if cursorType ~= "item" then
+    local cursorItemID = self:GetCursorItemId()
+    if cursorItemID == nil then
         return false
     end
 
