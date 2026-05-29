@@ -38,6 +38,10 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             if SF.Debug then SF.Debug:Info("SYNC", "LootHelper Sync system enabled") end
         end
 
+        if SF.TradeAssistant and SF.TradeAssistant.Init then
+            SF.TradeAssistant:Init()
+        end
+
         -- Register Loot Helper slash commands
         if SF.RegisterLootHelperSlashCommands then
             SF:RegisterLootHelperSlashCommands()
@@ -49,6 +53,10 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
         -- Initialize Slash Commands
         if SF.InitializeSlashCommands then
             SF:InitializeSlashCommands()
+
+            if SF.RegisterTradeAssistantSlashCommands then
+                SF:RegisterTradeAssistantSlashCommands()
+            end
             
             -- Register debug commands
             SF:RegisterSlashCommand("debug", function(args)
