@@ -48,6 +48,13 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.RaidCheck:EnsureInspectSupport()
     end
 
+    if SF.TradeAssistant and SF.TradeAssistant.Init then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing Trade Assistant")
+        end
+        SF.TradeAssistant:Init()
+    end
+
     if SF.Debug then
         SF.Debug:Info("INIT", "All modules initialized successfully")
     end

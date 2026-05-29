@@ -50,6 +50,15 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
         if SF.InitializeSlashCommands then
             SF:InitializeSlashCommands()
             
+            -- Register trade command
+            SF:RegisterSlashCommand("trade", function(args)
+                if SF.TradeAssistant and SF.TradeAssistant.HandleCommand then
+                    SF.TradeAssistant:HandleCommand(args)
+                else
+                    SF:PrintError("Trade Assistant module not available.")
+                end
+            end, "Opens the raid trade assistant window. /sf trade [shift-click item] [quantity] - Queues an item to trade to every current raid member. Quantity defaults to 1.")
+
             -- Register debug commands
             SF:RegisterSlashCommand("debug", function(args)
                 args = args:trim():lower()
