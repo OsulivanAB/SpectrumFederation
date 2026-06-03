@@ -4,6 +4,9 @@ local _, SF = ...
 local Page = {
 	id = "debugging",
 	name = "Debugging",
+	navLabel = "Debugging",
+	group = "Advanced",
+	description = "Enable diagnostics and review live addon logs for troubleshooting.",
 	order = 40,
 }
 

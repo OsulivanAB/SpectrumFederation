@@ -2,8 +2,11 @@ local _, SF = ...
 
 local Page = {
 	id = "nicheFeatures",
-	name = "Niche Features",
-	order = 50,
+	name = "Gameplay",
+	navLabel = "Gameplay",
+	group = "Core",
+	description = "Manage character-specific gameplay toggles and automation.",
+	order = 15,
 }
 
 local function GetCurrentSpecID()
