@@ -57,6 +57,22 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+
+## [0.5.22-beta.2] - 2026-05-29
+
+### Fixed
+- Resolved an issue causing false-positive raid check results when item data was partially loaded. Players with incomplete item data are now marked as "pending" instead of failing checks.
+
+## [0.5.22-beta.1] - 2026-05-27
+
+### Added
+- Customizable templates for pre-raid and raid check whisper messages, allowing guild admins to personalize communication.
+- New settings UI elements to configure whisper templates for missing enchants/gems and raid preparation acknowledgments.
+
+### Changed
+- Updated raid check functionality to use customizable whisper templates for notifying players about missing items or awarding points for preparation.
+
 ## [0.5.21] - 2026-05-27
 
 ### Changed

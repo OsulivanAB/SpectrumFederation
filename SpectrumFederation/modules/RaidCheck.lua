@@ -393,6 +393,25 @@ local function GetSnapshotSlotLink(slotsByInventory, inventorySlot)
 	return slotData and slotData.link or nil
 end
 
+-- Returns true when a slot has evidence that an item is equipped (texture or
+-- itemId present) but the full item link has not loaded yet.  This allows the
+-- raid check to distinguish between "slot is empty" and "item data is still
+-- loading" to avoid false positives.
+local function IsSlotItemDataPending(slotsByInventory, inventorySlot)
+	local slotData = slotsByInventory and slotsByInventory[inventorySlot]
+	if type(slotData) ~= "table" then
+		return false
+	end
+	if slotData.link then
+		return false
+	end
+	local itemId = tonumber(slotData.itemId)
+	if (itemId and itemId > 0) or slotData.texture then
+		return true
+	end
+	return false
+end
+
 local function SlotHasAnyItemData(slotData)
 	if type(slotData) ~= "table" then
 		return false
@@ -1233,6 +1252,19 @@ function RC:_HandleInspectReady(guid)
 		entry.averageItemLevel = captured.averageItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
 		PersistProfileEquipmentSnapshot(active.id, captured)
+
+		-- If any tracked slot has evidence of an item (texture/itemId) but the
+		-- link is unavailable, the data is only partially loaded.  Shorten the
+		-- cache freshness window so the background poll re-inspects this player
+		-- sooner rather than waiting the full TTL.
+		if type(captured.slotsByInventory) == "table" then
+			for _, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+				if IsSlotItemDataPending(captured.slotsByInventory, column.inventorySlot) then
+					entry.updatedAt = now - (INSPECT_CACHE_TTL_SECONDS - INSPECT_RETRY_BASE_SECONDS)
+					break
+				end
+			end
+		end
 	else
 		entry.status = "timeout"
 		entry.failCount = (entry.failCount or 0) + 1
@@ -1408,7 +1440,8 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 end
 
 local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, idx, mainHandLink, cfg)
-	local link = GetSnapshotSlotLink(slotsByInventory, slotDef.slots[idx])
+	local inventorySlot = slotDef.slots[idx]
+	local link = GetSnapshotSlotLink(slotsByInventory, inventorySlot)
 	local label = slotDef.label
 	if #slotDef.slots > 1 then
 		label = string.format("%s %d", label, idx)
@@ -1416,12 +1449,18 @@ local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, i
 
 	if not link then
 		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
-			return {}
+			return {}, false
 		end
 		if not IsSlotEnabledInConfig(cfg, slotKey, nil) then
-			return {}
+			return {}, false
 		end
-		return { label .. " Item" }
+		-- If the slot has evidence of an equipped item (texture/itemId) but the
+		-- link has not loaded yet, do not report it as definitively missing.
+		-- Signal the caller that this slot is still pending item data.
+		if IsSlotItemDataPending(slotsByInventory, inventorySlot) then
+			return {}, true
+		end
+		return { label .. " Item" }, false
 	end
 
 	local missing = {}
@@ -1433,7 +1472,7 @@ local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, i
 		table.insert(missing, label .. " Gem")
 	end
 
-	return missing
+	return missing, false
 end
 
 local function HasEquippedMetaGemInSnapshot(slotsByInventory)
@@ -1457,10 +1496,14 @@ end
 local function EvaluateSnapshot(slotsByInventory, cfg)
 	local mainHandLink = GetSnapshotSlotLink(slotsByInventory, INVSLOT_MAINHAND)
 	local missing = {}
+	local hasItemDataPending = false
 
 	for slotKey, slotDef in pairs(SLOT_DEFS) do
 		for idx = 1, #slotDef.slots do
-			local slotMissing = BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, idx, mainHandLink, cfg)
+			local slotMissing, slotPending = BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, idx, mainHandLink, cfg)
+			if slotPending then
+				hasItemDataPending = true
+			end
 			for _, entry in ipairs(slotMissing) do
 				table.insert(missing, entry)
 			end
@@ -1471,7 +1514,7 @@ local function EvaluateSnapshot(slotsByInventory, cfg)
 		table.insert(missing, "Meta Gem")
 	end
 
-	return missing
+	return missing, hasItemDataPending
 end
 
 local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlot, isKnown)
@@ -1494,6 +1537,7 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 	local missingGems = isKnown and link and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
 	local missingItem = isKnown and (not hasItem) and configEnabled and not twoHandExempt
 	local skippedEnchant = isKnown and link and configEnabled and not shouldCheckEnchant
+	local itemDataPending = isKnown and hasItem and not link and true or false
 
 	return {
 		key = slotKey,
@@ -1513,6 +1557,7 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 		missingGems = missingGems and true or false,
 		missingItem = missingItem and true or false,
 		skippedEnchant = skippedEnchant and true or false,
+		itemDataPending = itemDataPending,
 	}
 end
 
@@ -1824,6 +1869,21 @@ local function FormatPointAmount(amount)
 	return text
 end
 
+local function RenderWhisperTemplate(template, vars)
+	if type(template) ~= "string" or template == "" then
+		return nil
+	end
+
+	vars = type(vars) == "table" and vars or {}
+	return (template:gsub("%{([%w_]+)%}", function(key)
+		local value = vars[key]
+		if value == nil then
+			return "{" .. key .. "}"
+		end
+		return tostring(value)
+	end))
+end
+
 local function GetRaidCheckPointAward(cfg)
 	if type(cfg) ~= "table" then
 		return RAID_CHECK_POINT_AWARD_DEFAULT
@@ -1862,16 +1922,44 @@ local function AwardPrepared(profile, member, pointName, pointAward)
 	return true
 end
 
-local function WhisperPrepared(target, pointName, pointAward)
-	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(pointAward), pointName))
+local function WhisperPrepared(target, cfg, playerName, pointName, pointAward)
+	local template = type(cfg) == "table" and cfg.whisperTemplateRaidPrepared or nil
+	local message = RenderWhisperTemplate(template, {
+		player_name = playerName,
+		point_name = pointName,
+		points_awarded = FormatPointAmount(pointAward),
+	})
+
+	if not message then
+		message = ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(pointAward), pointName)
+	end
+
+	SendWhisper(target, message)
 end
 
-local function WhisperMissing(target, pointName, list, mode)
+local function WhisperMissing(target, cfg, playerName, pointName, list, mode)
+	local template
 	if mode == "pre" then
-		SendWhisper(target, ("Spectrum Federation: You're missing the following enchants/gems: %s."):format(list))
+		template = type(cfg) == "table" and cfg.whisperTemplatePreRaidMissing or nil
 	else
-		SendWhisper(target, ("Spectrum Federation: You're missing the following enchants/gems: %s. No new %s awarded."):format(list, pointName))
+		template = type(cfg) == "table" and cfg.whisperTemplateRaidMissing or nil
 	end
+
+	local message = RenderWhisperTemplate(template, {
+		player_name = playerName,
+		missing = list,
+		point_name = pointName,
+	})
+
+	if not message then
+		if mode == "pre" then
+			message = ("Spectrum Federation: You're missing the following enchants/gems: %s."):format(list)
+		else
+			message = ("Spectrum Federation: You're missing the following enchants/gems: %s. No new %s awarded."):format(list, pointName)
+		end
+	end
+
+	SendWhisper(target, message)
 end
 
 local function GetPointName(profile)
@@ -2061,13 +2149,23 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 		return result
 	end
 
-	local missing = EvaluateSnapshot(inspectState.slotsByInventory, cfg)
+	local missing, hasItemDataPending = EvaluateSnapshot(inspectState.slotsByInventory, cfg)
+
+	-- If any tracked slot still has incomplete item data (texture/itemId present
+	-- but link unavailable), treat the player as pending rather than definitively
+	-- missing requirements.  This prevents false-positive whispers and raid check
+	-- failures caused by partially-loaded item data.
+	if hasItemDataPending then
+		result.inspectPending = "Item data loading"
+		return result
+	end
+
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
 		local alreadyWhispered = HasBeenWhisperedToday(member, mode)
 		if whisper and not alreadyWhispered then
-			WhisperMissing(whisperTarget, pointName, list, mode)
+			WhisperMissing(whisperTarget, cfg, unitInfo.short, pointName, list, mode)
 			result.whisperedMissing = true
 			MarkWhisperSent(member, mode, time())
 			suffix = " (whispered)"
@@ -2087,7 +2185,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 
 		local awarded = AwardPrepared(profile, member, pointName, pointAward)
 		if awarded and whisper and ShouldWhisperPrepared(cfg) then
-			WhisperPrepared(whisperTarget, pointName, pointAward)
+			WhisperPrepared(whisperTarget, cfg, unitInfo.short, pointName, pointAward)
 		end
 	end
 
