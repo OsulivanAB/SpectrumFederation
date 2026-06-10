@@ -60,6 +60,14 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.22-beta.4] - 2026-06-10
+
+### Fixed
+- Resolved false-positive alerts for missing enchants and gems on inspected players in The War Within (TWW) when item data was incomplete or not fully loaded.
+- Improved handling of partially loaded item data to avoid incorrect raid check failures.
+- Enhanced gem and enchant detection by adding fallback mechanisms for parsing item links directly when API data is unavailable.
+
 ## [0.5.22-beta.3] - 2026-06-10
 
 ### Added
