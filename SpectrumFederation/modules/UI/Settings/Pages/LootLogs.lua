@@ -3,10 +3,11 @@ local _, SF = ...
 
 local Page = {
 	id = "lootLogs",
-	parentId = "lootHelper",
 	name = "Loot Logs",
 	navLabel = "Loot Logs",
-	order = 24,
+	group = "Loot Tools",
+	description = "Review loot history, filter activity, and audit profile changes.",
+	order = 30,
 	layout = {
 		windowWidth = 1350,
 		disablePageScroll = true,

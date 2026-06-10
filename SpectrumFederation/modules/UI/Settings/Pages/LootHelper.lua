@@ -3,8 +3,10 @@ local _, SF = ...
 
 local RootPage = {
 	id = "lootHelper",
-	name = "Loot Helper Settings",
+	name = "Loot Helper",
 	navLabel = "Loot Helper",
+	group = "Loot Tools",
+	description = "Configure loot profiles, sessions, raid check tools, and admin workflows.",
 	defaultChildId = "lootHelperGeneral",
 	order = 20,
 }
@@ -14,6 +16,7 @@ local GeneralPage = {
 	parentId = "lootHelper",
 	name = "General Settings",
 	navLabel = "General",
+	description = "Set the default behavior used across Loot Helper features.",
 	order = 20.5,
 }
 
@@ -22,6 +25,7 @@ local ProfilePage = {
 	parentId = "lootHelper",
 	name = "Profile Settings",
 	navLabel = "Profile",
+	description = "Create, choose, and manage the active loot profile.",
 	order = 21,
 }
 
@@ -30,6 +34,7 @@ local SessionPage = {
 	parentId = "lootHelper",
 	name = "Session Settings",
 	navLabel = "Session",
+	description = "Control sync sessions, member handling, and live raid activity.",
 	order = 22,
 }
 
@@ -45,6 +50,7 @@ local EquipmentPage = {
 	parentId = "lootHelper",
 	name = "Raid Check Equipment",
 	navLabel = "Equipment",
+	description = "Inspect raid equipment and gem state from the Raid Check tools.",
 	order = 22.5,
 	layout = {
 		windowWidth = EQUIPMENT_PAGE_WINDOW_WIDTH,
@@ -57,6 +63,7 @@ local AdminPage = {
 	parentId = "lootHelper",
 	name = "Admin Settings",
 	navLabel = "Admin",
+	description = "Manage admin-only tools and profile permissions.",
 	order = 23,
 }
 

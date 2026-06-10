@@ -14,12 +14,17 @@ local C = {
     HEIGHT = 900,
     
     -- Layout
-    NAV_WIDTH = 180,
+    NAV_WIDTH = 220,
     PADDING = 12,
     
     -- Navigation elements
     BANNER_HEIGHT = 54,  -- Maintains 4:1 aspect ratio for 512x128 banner texture
     VERSION_HEIGHT = 16,
+    SEARCH_LABEL_HEIGHT = 14,
+    SEARCH_HEIGHT = 24,
+    SEARCH_GAP = 8,
+    GROUP_HEADER_HEIGHT = 18,
+    GROUP_GAP = 8,
     NAV_BUTTON_HEIGHT = 28,
     NAV_BUTTON_GAP = 6,
     NAV_SPACER_HEIGHT = 12,
@@ -27,12 +32,14 @@ local C = {
     -- Content area
     CONTENT_PADDING = 12,
     DIVIDER_WIDTH = 1,
+    CONTENT_HEADER_HEIGHT = 78,
     
     -- Colors (RGBA, 0-1 range)
     BG = {0, 0, 0, 0.70},
     BORDER = {0.65, 0.65, 0.65, 0.65},
     DIVIDER = {1, 1, 1, 0.08},
     NAV_SELECTED_BG = {1, 1, 1, 0.08},
+    NAV_ACTIVE_ROOT_BG = {0.50, 0.78, 1, 0.10},
     NAV_HOVER_BG = {1, 1, 1, 0.04},
     NAV_TRANSPARENT_BG = {0, 0, 0, 0},
     
@@ -59,12 +66,17 @@ local SettingsWindow = SF.SettingsWindow
 SettingsWindow.frame = nil
 SettingsWindow.navItems = {}
 SettingsWindow.navButtons = {}
+SettingsWindow.navGroups = {}
 SettingsWindow.pagePanels = {}
 SettingsWindow.currentPageId = nil
+SettingsWindow.rootPages = {}
+SettingsWindow.childrenByParent = {}
 
 local function SortPages(a, b)
     return (a.order or 1000) < (b.order or 1000)
 end
+
+local GetRootPageId
 
 -- ============================================================
 -- Helper Functions
@@ -85,6 +97,97 @@ end
 local function GetPageLayout(pageId)
     local page = pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId]
     return page and page.layout or nil
+end
+
+local function GetPage(pageId)
+    return pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId] or nil
+end
+
+local function GetPageLabel(page)
+    return page and (page.navLabel or page.name) or ""
+end
+
+local function GetPageGroup(pageId)
+    local page = GetPage(pageId)
+    if not page then
+        return "Settings"
+    end
+
+    if page.parentId then
+        local rootPage = GetPage(GetRootPageId(pageId))
+        if rootPage and rootPage.group and rootPage.group ~= "" then
+            return rootPage.group
+        end
+    end
+
+    return page.group or "Settings"
+end
+
+local function GetPageDescription(pageId)
+    local page = GetPage(pageId)
+    if not page then
+        return nil
+    end
+
+    if page.description and page.description ~= "" then
+        return page.description
+    end
+
+    local rootPage = GetPage(GetRootPageId(pageId))
+    if rootPage and rootPage.description and rootPage.description ~= "" then
+        return rootPage.description
+    end
+
+    return nil
+end
+
+local function NormalizeQuery(text)
+    if type(text) ~= "string" then
+        return ""
+    end
+
+    return text:lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function PageMatchesQuery(pageId, query)
+    if query == "" then
+        return true
+    end
+
+    local page = GetPage(pageId)
+    if not page then
+        return false
+    end
+
+    local candidates = {
+        page.name,
+        page.navLabel,
+        page.description,
+        page.group,
+    }
+
+    for _, text in ipairs(candidates) do
+        if type(text) == "string" and text ~= "" and text:lower():find(query, 1, true) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function BuildBreadcrumb(pageId)
+    local page = GetPage(pageId)
+    if not page then
+        return ""
+    end
+
+    local parts = { GetPageGroup(pageId) }
+    local rootPage = GetPage(GetRootPageId(pageId))
+    if rootPage and rootPage.id ~= page.id then
+        table.insert(parts, GetPageLabel(rootPage))
+    end
+
+    return table.concat(parts, " / ")
 end
 
 -- ============================================================
@@ -111,7 +214,7 @@ function SettingsWindow:AddNavPage(pageId, label)
     })
 end
 
-local function GetRootPageId(pageId)
+GetRootPageId = function(pageId)
     local page = pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId]
     while page and page.parentId do
         page = SF.SettingsUI.pagesById[page.parentId]
@@ -129,6 +232,7 @@ end
 
 function SettingsWindow:BuildNavItemsFromRegistry()
     self.navItems = {}
+    self.navGroups = {}
 
     local roots = {}
     local childrenByParent = {}
@@ -146,8 +250,21 @@ function SettingsWindow:BuildNavItemsFromRegistry()
         table.sort(children, SortPages)
     end
 
-    self:AddNavSpacer()
+    self.rootPages = roots
+    self.childrenByParent = childrenByParent
+
+    local currentGroup
     for _, page in ipairs(roots) do
+        local group = GetPageGroup(page.id)
+        if group ~= currentGroup then
+            currentGroup = group
+            table.insert(self.navItems, {
+                type = "group",
+                id = group,
+                label = group,
+            })
+        end
+
         table.insert(self.navItems, {
             type = "page",
             id = page.id,
@@ -191,18 +308,18 @@ local function CreateNavButton(parent, label, pageId, depth)
     btn.text:SetPoint("LEFT", btn, "LEFT", 8 + ((depth or 0) * 14), 0)
     btn.text:SetText(label)
     btn.text:SetJustifyH("LEFT")
+    btn.text:SetFontObject((depth or 0) > 0 and GameFontHighlightSmall or GameFontNormal)
     
     -- Hover effect
     btn:SetScript("OnEnter", function(self)
-        if SettingsWindow.currentPageId ~= pageId then
+        local activeRootId = GetRootPageId(SettingsWindow.currentPageId)
+        if SettingsWindow.currentPageId ~= pageId and activeRootId ~= pageId then
             self.bg:SetColorTexture(unpack(C.NAV_HOVER_BG))
         end
     end)
     
     btn:SetScript("OnLeave", function(self)
-        if SettingsWindow.currentPageId ~= pageId then
-            self.bg:SetColorTexture(unpack(C.NAV_TRANSPARENT_BG))
-        end
+        SettingsWindow:UpdateNavButtonStates(SettingsWindow.currentPageId)
     end)
     
     -- Click handler
@@ -215,11 +332,65 @@ local function CreateNavButton(parent, label, pageId, depth)
     return btn
 end
 
+local function CreateGroupHeader(parent, label)
+    local frame = CreateFrame("Frame", nil, parent)
+    frame:SetSize(C.NAV_WIDTH - C.PADDING * 2, C.GROUP_HEADER_HEIGHT)
+
+    frame.text = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    frame.text:SetPoint("LEFT", frame, "LEFT", 0, 0)
+    frame.text:SetTextColor(0.65, 0.78, 0.95, 0.95)
+    frame.text:SetText(label)
+    frame.text:SetJustifyH("LEFT")
+
+    return frame
+end
+
+function SettingsWindow:ComputeVisibleNavState()
+    local activeRootId = GetRootPageId(self.currentPageId)
+    local query = NormalizeQuery(self.navSearchBox and self.navSearchBox:GetText() or "")
+    local visiblePages = {}
+    local visibleGroups = {}
+    local visiblePageCount = 0
+
+    for _, rootPage in ipairs(self.rootPages or {}) do
+        local rootMatches = PageMatchesQuery(rootPage.id, query)
+        local rootVisible = (query == "") and true or false
+        local visibleChildren = {}
+
+        for _, childPage in ipairs(self.childrenByParent[rootPage.id] or {}) do
+            local childMatches = PageMatchesQuery(childPage.id, query)
+            if query == "" then
+                if rootPage.id == activeRootId then
+                    visibleChildren[childPage.id] = true
+                end
+            elseif rootMatches or childMatches then
+                rootVisible = true
+                if rootMatches or childMatches then
+                    visibleChildren[childPage.id] = true
+                end
+            end
+        end
+
+        if rootVisible then
+            local group = GetPageGroup(rootPage.id)
+            visiblePages[rootPage.id] = true
+            visibleGroups[group] = true
+            visiblePageCount = visiblePageCount + 1
+
+            for childId in pairs(visibleChildren) do
+                visiblePages[childId] = true
+                visiblePageCount = visiblePageCount + 1
+            end
+        end
+    end
+
+    return visiblePages, visibleGroups, visiblePageCount, query
+end
+
 function SettingsWindow:UpdateNavLayout()
     if not self.navPanel then return end
-
-    local activeRootId = GetRootPageId(self.currentPageId)
     local yOffset = -C.PADDING
+    local visiblePages, visibleGroups, visiblePageCount, query = self:ComputeVisibleNavState()
 
     if self.navBanner then
         self.navBanner:SetPoint("TOP", self.navPanel, "TOP", 0, yOffset)
@@ -231,14 +402,35 @@ function SettingsWindow:UpdateNavLayout()
         yOffset = yOffset - C.VERSION_HEIGHT
     end
 
+    if self.navSearchLabel then
+        yOffset = yOffset - C.SEARCH_GAP
+        self.navSearchLabel:SetPoint("TOPLEFT", self.navPanel, "TOPLEFT", C.PADDING, yOffset)
+        yOffset = yOffset - C.SEARCH_LABEL_HEIGHT
+    end
+
+    if self.navSearchBox then
+        self.navSearchBox:ClearAllPoints()
+        self.navSearchBox:SetPoint("TOPLEFT", self.navPanel, "TOPLEFT", C.PADDING, yOffset)
+        yOffset = yOffset - C.SEARCH_HEIGHT - C.GROUP_GAP
+    end
+
     for _, item in ipairs(self.navItems) do
-        if item.type == "spacer" then
-            yOffset = yOffset - item.height
+        if item.type == "group" then
+            local groupHeader = self.navGroups[item.id]
+            if groupHeader then
+                if visibleGroups[item.id] then
+                    groupHeader:Show()
+                    groupHeader:ClearAllPoints()
+                    groupHeader:SetPoint("TOPLEFT", self.navPanel, "TOPLEFT", C.PADDING, yOffset)
+                    yOffset = yOffset - C.GROUP_HEADER_HEIGHT - 4
+                else
+                    groupHeader:Hide()
+                end
+            end
         elseif item.type == "page" then
             local btn = self.navButtons[item.id]
             if btn then
-                local isVisible = not item.parentId or item.parentId == activeRootId
-                if isVisible then
+                if visiblePages[item.id] then
                     btn:Show()
                     btn:ClearAllPoints()
                     btn:SetPoint("TOP", self.navPanel, "TOP", 0, yOffset)
@@ -247,6 +439,16 @@ function SettingsWindow:UpdateNavLayout()
                     btn:Hide()
                 end
             end
+        end
+    end
+
+    if self.navEmptyText then
+        if query ~= "" and visiblePageCount == 0 then
+            self.navEmptyText:Show()
+            self.navEmptyText:ClearAllPoints()
+            self.navEmptyText:SetPoint("TOPLEFT", self.navPanel, "TOPLEFT", C.PADDING, yOffset - 6)
+        else
+            self.navEmptyText:Hide()
         end
     end
 end
@@ -271,11 +473,43 @@ function SettingsWindow:BuildNavPanel(navPanel)
     versionText:SetTextColor(0.7, 0.7, 0.7, 1)
     self.navVersionText = versionText
     yOffset = yOffset - C.VERSION_HEIGHT
+
+    local searchLabel = navPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    searchLabel:SetText("Quick Find")
+    searchLabel:SetTextColor(0.75, 0.75, 0.75, 0.95)
+    self.navSearchLabel = searchLabel
+    yOffset = yOffset - C.SEARCH_GAP - C.SEARCH_LABEL_HEIGHT
+
+    local searchBox = CreateFrame("EditBox", nil, navPanel, "InputBoxTemplate")
+    searchBox:SetAutoFocus(false)
+    searchBox:SetSize(C.NAV_WIDTH - C.PADDING * 2, C.SEARCH_HEIGHT)
+    searchBox:SetPoint("TOPLEFT", navPanel, "TOPLEFT", C.PADDING, yOffset)
+    searchBox:SetScript("OnTextChanged", function()
+        SettingsWindow:UpdateNavLayout()
+    end)
+    searchBox:SetScript("OnEscapePressed", function(selfEdit)
+        selfEdit:SetText("")
+        selfEdit:ClearFocus()
+    end)
+    self.navSearchBox = searchBox
+    yOffset = yOffset - C.SEARCH_HEIGHT - C.GROUP_GAP
+
+    local emptyText = navPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    emptyText:SetWidth(C.NAV_WIDTH - C.PADDING * 2)
+    emptyText:SetJustifyH("LEFT")
+    emptyText:SetJustifyV("TOP")
+    emptyText:SetText("No matching settings.")
+    emptyText:SetTextColor(0.8, 0.8, 0.8, 0.85)
+    emptyText:Hide()
+    self.navEmptyText = emptyText
     
     -- Build navigation items
     for _, item in ipairs(self.navItems) do
-        if item.type == "spacer" then
-            yOffset = yOffset - item.height
+        if item.type == "group" then
+            local groupHeader = CreateGroupHeader(navPanel, item.label)
+            groupHeader:SetPoint("TOPLEFT", navPanel, "TOPLEFT", C.PADDING, yOffset)
+            yOffset = yOffset - C.GROUP_HEADER_HEIGHT - 4
+            self.navGroups[item.id] = groupHeader
         elseif item.type == "page" then
             local btn = CreateNavButton(navPanel, item.label, item.id, item.depth)
             btn:SetPoint("TOP", navPanel, "TOP", 0, yOffset)
@@ -291,13 +525,26 @@ end
 -- Update navigation button states to reflect selected tab
 -- @param selectedPageId string The currently selected page ID
 function SettingsWindow:UpdateNavButtonStates(selectedPageId)
+    local activeRootId = GetRootPageId(selectedPageId)
     for pageId, btn in pairs(self.navButtons) do
-        if pageId == selectedPageId then
+        local page = GetPage(pageId)
+        local isRoot = page and not page.parentId
+        local isSelected = pageId == selectedPageId
+        local isActiveRoot = isRoot and pageId == activeRootId
+
+        if isSelected then
             btn.bg:SetColorTexture(unpack(C.NAV_SELECTED_BG))
             btn.text:SetTextColor(1, 1, 1, 1)
+        elseif isActiveRoot then
+            btn.bg:SetColorTexture(unpack(C.NAV_ACTIVE_ROOT_BG))
+            btn.text:SetTextColor(0.92, 0.97, 1, 1)
         else
             btn.bg:SetColorTexture(unpack(C.NAV_TRANSPARENT_BG))
-            btn.text:SetTextColor(0.8, 0.8, 0.8, 1)
+            if btn.depth > 0 then
+                btn.text:SetTextColor(0.72, 0.72, 0.72, 1)
+            else
+                btn.text:SetTextColor(0.84, 0.84, 0.84, 1)
+            end
         end
     end
 
@@ -357,6 +604,23 @@ function SettingsWindow:ApplyPageLayout(pageId)
     end
 end
 
+function SettingsWindow:UpdateContentHeader(pageId)
+    if not self.contentTitleText then
+        return
+    end
+
+    local page = GetPage(pageId)
+    if not page then
+        return
+    end
+
+    self.contentBreadcrumbText:SetText(BuildBreadcrumb(pageId))
+    self.contentTitleText:SetText(page.name or "")
+
+    local description = GetPageDescription(pageId) or ""
+    self.contentDescriptionText:SetText(description)
+end
+
 -- Select and display a tab by page ID
 -- @param pageId string The page ID to select
 function SettingsWindow:SelectTab(pageId)
@@ -386,6 +650,7 @@ function SettingsWindow:SelectTab(pageId)
     
     -- Show the new page panel
     panel:Show()
+    self:UpdateContentHeader(pageId)
     
     -- Refresh the page if it has a Refresh method
     local page = SF.SettingsUI.pagesById[pageId]
@@ -452,16 +717,52 @@ function SettingsWindow:CreateWindow()
     contentPanel:SetPoint("TOPLEFT", divider, "TOPRIGHT", C.CONTENT_PADDING, 0)
     contentPanel:SetPoint("TOP", closeBtn, "BOTTOM", 0, 0)
     contentPanel:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -C.PADDING, C.PADDING)
+
+    local contentHeader = CreateFrame("Frame", nil, contentPanel)
+    contentHeader:SetPoint("TOPLEFT", contentPanel, "TOPLEFT", 0, 0)
+    contentHeader:SetPoint("TOPRIGHT", contentPanel, "TOPRIGHT", 0, 0)
+    contentHeader:SetHeight(C.CONTENT_HEADER_HEIGHT)
+
+    local breadcrumbText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    breadcrumbText:SetPoint("TOPLEFT", contentHeader, "TOPLEFT", 0, -4)
+    breadcrumbText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, -4)
+    breadcrumbText:SetJustifyH("LEFT")
+    breadcrumbText:SetTextColor(0.62, 0.75, 0.9, 0.95)
+
+    local titleText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    titleText:SetPoint("TOPLEFT", breadcrumbText, "BOTTOMLEFT", 0, -6)
+    titleText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, -28)
+    titleText:SetJustifyH("LEFT")
+    titleText:SetTextColor(1, 1, 1, 1)
+
+    local descriptionText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    descriptionText:SetPoint("TOPLEFT", titleText, "BOTTOMLEFT", 0, -4)
+    descriptionText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, -46)
+    descriptionText:SetJustifyH("LEFT")
+    descriptionText:SetJustifyV("TOP")
+    descriptionText:SetTextColor(0.8, 0.8, 0.8, 0.95)
+
+    local headerDivider = contentHeader:CreateTexture(nil, "ARTWORK")
+    headerDivider:SetPoint("BOTTOMLEFT", contentHeader, "BOTTOMLEFT", 0, 0)
+    headerDivider:SetPoint("BOTTOMRIGHT", contentHeader, "BOTTOMRIGHT", 0, 0)
+    headerDivider:SetHeight(C.DIVIDER_WIDTH)
+    headerDivider:SetColorTexture(unpack(C.DIVIDER))
     
     -- Content host (will contain page panels)
     local contentHost = CreateFrame("Frame", nil, contentPanel)
-    contentHost:SetAllPoints(contentPanel)
+    contentHost:SetPoint("TOPLEFT", contentHeader, "BOTTOMLEFT", 0, -C.CONTENT_PADDING)
+    contentHost:SetPoint("TOPRIGHT", contentHeader, "BOTTOMRIGHT", 0, -C.CONTENT_PADDING)
+    contentHost:SetPoint("BOTTOMRIGHT", contentPanel, "BOTTOMRIGHT", 0, 0)
     
     -- Store references
     self.frame = frame
     self.navPanel = navPanel
     self.contentPanel = contentPanel
+    self.contentHeader = contentHeader
     self.contentHost = contentHost
+    self.contentBreadcrumbText = breadcrumbText
+    self.contentTitleText = titleText
+    self.contentDescriptionText = descriptionText
     
     -- Build navigation UI
     self:BuildNavPanel(navPanel)
