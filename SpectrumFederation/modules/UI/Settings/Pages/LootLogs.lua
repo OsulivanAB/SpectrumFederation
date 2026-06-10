@@ -134,6 +134,7 @@ local EVENT_TYPE_COLORS = {
 	SAFEMODE_ON_COMBAT_CHANGE = "|cffff6600",
 	ADMIN_ADDED = "|cff66ff66",
 	ADMIN_REMOVED = "|cffff6666",
+	LOOT_AWARDED = "|cffa335ee",
 }
 
 local EVENT_TYPE_LABELS = {
@@ -147,6 +148,7 @@ local EVENT_TYPE_LABELS = {
 	SAFEMODE_ON_COMBAT_CHANGE = "Combat Safe Mode",
 	ADMIN_ADDED = "Admin Added",
 	ADMIN_REMOVED = "Admin Removed",
+	LOOT_AWARDED = "Loot Awarded",
 }
 
 function GetEventTypeLabel(eventType)
@@ -235,6 +237,9 @@ local function BuildActionText(eventType, data, author)
 		return "Added as admin"
 	elseif eventType == "ADMIN_REMOVED" then
 		return "Removed from admins"
+	elseif eventType == "LOOT_AWARDED" then
+		local rollLabel = FormatLabel(data.rollType or "Unknown")
+		return string.format("Awarded (%s)", rollLabel)
 	end
 
 	return ""
@@ -263,6 +268,7 @@ local function BuildLogRow(log)
 		author = ColorizeName(author),
 		member = ColorizeName(data.member),
 		action = BuildActionText(eventType, data, author),
+		item = data.itemLink or "",
 	}
 end
 
@@ -444,6 +450,7 @@ function Page:Build(panel)
 							{ key = "changeType", label = "Type of Change", width = 180 },
 							{ key = "member", label = "Member", width = 150 },
 							{ key = "action", label = "Action" },
+							{ key = "item", label = "Item", width = 180 },
 							{ key = "author", label = "Author", width = 165 },
 						},
 						emptyText = "No logs found matching the selected filters.\n\nCreate a profile and perform actions to see logs here.",

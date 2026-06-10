@@ -291,5 +291,47 @@ function LootLogValidators.ValidateAdminRemovedData(eventData)
     return true
 end
 
+-- Function to validate the LOOT_AWARDED event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateLootAwardedData(eventData)
+    local memberID = eventData.member
+    local itemLink = eventData.itemLink
+    local rollType = eventData.rollType
+
+    -- Validate member ID is a non-empty string in "Name-Realm" format
+    if type(memberID) ~= "string" or memberID == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Loot awarded log has invalid member ID: %s", tostring(memberID))
+        end
+        return false
+    end
+
+    if not memberID:match("^[^%-]+%-[^%-]+$") then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Loot awarded log has invalid member ID format (expected Name-Realm): %s", tostring(memberID))
+        end
+        return false
+    end
+
+    -- Validate itemLink is a non-empty string
+    if type(itemLink) ~= "string" or itemLink == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Loot awarded log has invalid itemLink: %s", tostring(itemLink))
+        end
+        return false
+    end
+
+    -- Validate rollType is a non-empty string
+    if type(rollType) ~= "string" or rollType == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Loot awarded log has invalid rollType: %s", tostring(rollType))
+        end
+        return false
+    end
+
+    return true
+end
+
 -- Export to namespace
 SF.LootLogValidators = LootLogValidators

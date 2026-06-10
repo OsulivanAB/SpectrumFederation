@@ -19,7 +19,8 @@ local EVENT_TYPES = {
     SAFEMODE_CHANGE             = "SAFEMODE_CHANGE",
     SAFEMODE_ON_COMBAT_CHANGE   = "SAFEMODE_ON_COMBAT_CHANGE",
     ADMIN_ADDED                 = "ADMIN_ADDED",
-    ADMIN_REMOVED               = "ADMIN_REMOVED"
+    ADMIN_REMOVED               = "ADMIN_REMOVED",
+    LOOT_AWARDED                = "LOOT_AWARDED"
 }
 
 local POINT_CHANGE_TYPES = {
@@ -72,6 +73,12 @@ local EVENT_DATA_TEMPLATES = {
     },
     [EVENT_TYPES.ADMIN_REMOVED] = {
         member = "" -- "Name-Realm"
+    },
+    [EVENT_TYPES.LOOT_AWARDED] = {
+        member      = "", -- "Name-Realm" recipient
+        itemLink    = "", -- WoW item link string
+        rollType    = "", -- e.g. "Need", "Greed", "Mainspec", etc.
+        -- @field source string|nil Integration name (e.g. "RCLootCouncil")
     }
 }
 
@@ -218,6 +225,10 @@ function LootLog.new(eventType, eventData, opts)
         end
     elseif eventType == EVENT_TYPES.ADMIN_REMOVED then
         if not SF.LootLogValidators.ValidateAdminRemovedData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.LOOT_AWARDED then
+        if not SF.LootLogValidators.ValidateLootAwardedData(eventData) then
             return nil
         end
     end
