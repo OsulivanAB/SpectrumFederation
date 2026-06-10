@@ -59,6 +59,21 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.22-beta.3] - 2026-06-10
+
+### Added
+- Descriptions for settings pages to provide better context for their functionality.
+- Grouping and search functionality in the settings menu for easier navigation.
+- New layout elements in the settings window, including group headers and a search bar.
+
+### Changed
+- Updated settings menu structure with improved navigation and categorization.
+- Adjusted navigation panel layout, including increased navigation width and updated styling for active and hover states.
+
+### Fixed
+- Resolved navigation state issues to ensure proper highlighting of active and hovered items in the settings menu.
+
 ## [0.5.22-beta.2] - 2026-05-29
 
 ### Fixed
