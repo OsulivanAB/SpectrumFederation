@@ -4,6 +4,9 @@ local _, SF = ...
 local Page = {
 	id = "general",
 	name = "General",
+	navLabel = "General",
+	group = "Core",
+	description = "Customize the addon's overall look and feel.",
 	order = 10,
 }
 

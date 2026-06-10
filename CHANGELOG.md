@@ -57,6 +57,43 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+
+
+
+## [0.5.22-beta.4] - 2026-06-10
+
+### Changed
+- Updated `SpectrumFederation.toc` to include interface ID 120007 for compatibility with the latest game client.
+
+## [0.5.22-beta.3] - 2026-06-10
+
+### Added
+- Descriptions for settings pages to provide better context for their functionality.
+- Grouping and search functionality in the settings menu for easier navigation.
+- New layout elements in the settings window, including group headers and a search bar.
+
+### Changed
+- Updated settings menu structure with improved navigation and categorization.
+- Adjusted navigation panel layout, including increased navigation width and updated styling for active and hover states.
+
+### Fixed
+- Resolved navigation state issues to ensure proper highlighting of active and hovered items in the settings menu.
+
+## [0.5.22-beta.2] - 2026-05-29
+
+### Fixed
+- Resolved an issue causing false-positive raid check results when item data was partially loaded. Players with incomplete item data are now marked as "pending" instead of failing checks.
+
+## [0.5.22-beta.1] - 2026-05-27
+
+### Added
+- Customizable templates for pre-raid and raid check whisper messages, allowing guild admins to personalize communication.
+- New settings UI elements to configure whisper templates for missing enchants/gems and raid preparation acknowledgments.
+
+### Changed
+- Updated raid check functionality to use customizable whisper templates for notifying players about missing items or awarding points for preparation.
+
 ## [0.5.21] - 2026-05-27
 
 ### Changed

@@ -122,12 +122,37 @@ local function ColorizeProfileMemberName(profile, memberId, name)
 	return name
 end
 
+local function ParseEnchantIdFromLink(link)
+	if type(link) ~= "string" then return nil end
+	local itemString = link:match("item:([%-%d:]+)")
+	if not itemString then return nil end
+	local _, enchantId = strsplit(":", itemString)
+	if enchantId and enchantId ~= "" and enchantId ~= "0" then
+		return enchantId
+	end
+	return nil
+end
+
 local function HasEnchant(link)
 	if type(link) ~= "string" then return false end
-	local itemString = link:match("item:([%-%d:]+)")
-	if not itemString then return false end
-	local _, enchantId = strsplit(":", itemString)
-	return enchantId and enchantId ~= "" and enchantId ~= "0"
+
+	-- Primary: parse enchantId directly from the item link string.
+	if ParseEnchantIdFromLink(link) then
+		return true
+	end
+
+	-- Fallback: use C_Item.GetItemEnchantID if the client provides it.
+	-- In TWW (11.0+), GetInventoryItemLink for inspected players may
+	-- temporarily return a link with enchantId=0 before the full item
+	-- data resolves; this API reads from the resolved item cache instead.
+	if C_Item and C_Item.GetItemEnchantID then
+		local ok, enchantID = pcall(C_Item.GetItemEnchantID, link)
+		if ok and type(enchantID) == "number" and enchantID ~= 0 then
+			return true
+		end
+	end
+
+	return false
 end
 
 local function GetItemEquipLocation(link)
@@ -170,7 +195,43 @@ local function IsGemPresentInSocket(link, i)
 			return type(gemID) == "number" and gemID ~= 0
 		end
 	end
+
+	-- Fallback: parse gem IDs directly from the item link string.
+	-- Gem fields start at position 3 (0-indexed) in the item string:
+	-- item:itemID:enchantID:gem1:gem2:gem3:gem4:...
+	if type(link) == "string" then
+		local itemString = link:match("item:([%-%d:]+)")
+		if itemString then
+			local fields = { strsplit(":", itemString) }
+			-- Gem slots occupy fields 3-6 (indices 3+i-1 in the array, offset by 2 for itemId & enchant)
+			local fieldIndex = 2 + i
+			local gemField = fields[fieldIndex]
+			if gemField and gemField ~= "" and gemField ~= "0" then
+				return true
+			end
+		end
+	end
+
 	return (GetItemGem ~= nil) and (GetItemGem(link, i) ~= nil) or false
+end
+
+local function CountGemsFilledFromLink(link)
+	-- Parse gem IDs directly from the item link to detect filled sockets
+	-- without depending on GetItemGem/C_Item API calls which may fail for
+	-- inspected players whose gem item data isn't locally cached.
+	if type(link) ~= "string" then return 0 end
+	local itemString = link:match("item:([%-%d:]+)")
+	if not itemString then return 0 end
+	local fields = { strsplit(":", itemString) }
+	local filled = 0
+	-- Gem fields are at indices 3-6 in the item string fields array
+	for idx = 3, math.min(6, #fields) do
+		local gemField = fields[idx]
+		if gemField and gemField ~= "" and gemField ~= "0" then
+			filled = filled + 1
+		end
+	end
+	return filled
 end
 
 local function HasMissingGems(link)
@@ -188,12 +249,25 @@ local function HasMissingGems(link)
 		return false
 	end
 
+	-- Cross-check: count gems directly from the item link's gem fields.
+	-- In TWW (11.0+), C_Item.GetItemGemID and GetItemGem can fail for inspected
+	-- players whose gem item data is not cached locally. If the link shows gems
+	-- are present in its gem fields, trust that over the API check.
+	local gemsFromLink = CountGemsFilledFromLink(link)
+	if gemsFromLink >= sockets then
+		return false
+	end
+
 	local filled = 0
 	for i = 1, sockets do
 		if IsGemPresentInSocket(link, i) then
 			filled = filled + 1
 		end
 	end
+
+	-- Use the higher of the two gem counts to avoid false positives from
+	-- API calls that fail on uncached inspected-player gem data.
+	filled = math.max(filled, gemsFromLink)
 
 	return filled < sockets
 end
@@ -391,6 +465,72 @@ end
 local function GetSnapshotSlotLink(slotsByInventory, inventorySlot)
 	local slotData = slotsByInventory and slotsByInventory[inventorySlot]
 	return slotData and slotData.link or nil
+end
+
+-- Returns true when a slot has evidence that an item is equipped (texture or
+-- itemId present) but the full item link has not loaded yet.  This allows the
+-- raid check to distinguish between "slot is empty" and "item data is still
+-- loading" to avoid false positives.
+local function IsSlotItemDataPending(slotsByInventory, inventorySlot)
+	local slotData = slotsByInventory and slotsByInventory[inventorySlot]
+	if type(slotData) ~= "table" then
+		return false
+	end
+	if slotData.link then
+		return false
+	end
+	local itemId = tonumber(slotData.itemId)
+	if (itemId and itemId > 0) or slotData.texture then
+		return true
+	end
+	return false
+end
+
+-- Returns true when a slot has a link but the link looks like it may be a
+-- stub with incomplete modification data.  In TWW (11.0+), inspect responses
+-- can arrive in stages: the item placement is known immediately, but enchant,
+-- gem, and bonus ID data may not be populated in the link until the full item
+-- resolution completes.  Detecting this avoids caching false "missing enchant"
+-- or "missing gem" results.
+local function IsSlotLinkPotentiallyIncomplete(slotsByInventory, inventorySlot)
+	local slotData = slotsByInventory and slotsByInventory[inventorySlot]
+	if type(slotData) ~= "table" or not slotData.link then
+		return false
+	end
+
+	local link = slotData.link
+	local itemString = link:match("item:([%-%d:]+)")
+	if not itemString then
+		return false
+	end
+
+	-- Split the item string and inspect modification fields.
+	-- Format: itemID:enchantID:gem1:gem2:gem3:gem4:suffixID:uniqueID:level:...
+	-- If ALL modification fields (enchant + gems + suffix, indices 2-7) are
+	-- empty/zero, the link is likely a stub that has not fully resolved yet.
+	local fields = { strsplit(":", itemString) }
+	if #fields < 7 then
+		-- Very short link; could be incomplete or non-standard.
+		return true
+	end
+
+	for i = 2, math.min(7, #fields) do
+		local v = fields[i]
+		if v and v ~= "" and v ~= "0" then
+			-- At least one modification field is populated; link looks complete.
+			return false
+		end
+	end
+
+	-- All modification fields are zero/empty.  If the item also has a texture
+	-- or itemId (meaning the server confirmed an item is equipped), the link is
+	-- likely a stub awaiting full resolution.
+	local itemId = tonumber(slotData.itemId)
+	if (itemId and itemId > 0) or slotData.texture then
+		return true
+	end
+
+	return false
 end
 
 local function SlotHasAnyItemData(slotData)
@@ -1233,6 +1373,21 @@ function RC:_HandleInspectReady(guid)
 		entry.averageItemLevel = captured.averageItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
 		PersistProfileEquipmentSnapshot(active.id, captured)
+
+		-- If any tracked slot has evidence of an item (texture/itemId) but the
+		-- link is unavailable, or the link looks like an incomplete stub, the
+		-- data is only partially loaded.  Shorten the cache freshness window so
+		-- the background poll re-inspects this player sooner rather than waiting
+		-- the full TTL.
+		if type(captured.slotsByInventory) == "table" then
+			for _, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+				if IsSlotItemDataPending(captured.slotsByInventory, column.inventorySlot)
+					or IsSlotLinkPotentiallyIncomplete(captured.slotsByInventory, column.inventorySlot) then
+					entry.updatedAt = now - (INSPECT_CACHE_TTL_SECONDS - INSPECT_RETRY_BASE_SECONDS)
+					break
+				end
+			end
+		end
 	else
 		entry.status = "timeout"
 		entry.failCount = (entry.failCount or 0) + 1
@@ -1396,11 +1551,31 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 	end
 
 	local missing = {}
-	if IsSlotEnabledInConfig(cfg, slotKey, link) and ShouldCheckEnchant(slotDef, link) and not HasEnchant(link) then
+
+	-- If the link has all modification fields zeroed (enchant, gems, suffix),
+	-- it may be a stub that has not fully resolved.  Skip enchant/gem checks
+	-- to avoid false positives; the background poll will re-check soon.
+	local itemString = link:match("item:([%-%d:]+)")
+	local linkMayBeIncomplete = false
+	if itemString then
+		local fields = { strsplit(":", itemString) }
+		if #fields >= 7 then
+			linkMayBeIncomplete = true
+			for i = 2, math.min(7, #fields) do
+				local v = fields[i]
+				if v and v ~= "" and v ~= "0" then
+					linkMayBeIncomplete = false
+					break
+				end
+			end
+		end
+	end
+
+	if not linkMayBeIncomplete and IsSlotEnabledInConfig(cfg, slotKey, link) and ShouldCheckEnchant(slotDef, link) and not HasEnchant(link) then
 		table.insert(missing, label .. " Enchant")
 	end
 
-	if cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
+	if not linkMayBeIncomplete and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
 		table.insert(missing, label .. " Gem")
 	end
 
@@ -1408,7 +1583,8 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 end
 
 local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, idx, mainHandLink, cfg)
-	local link = GetSnapshotSlotLink(slotsByInventory, slotDef.slots[idx])
+	local inventorySlot = slotDef.slots[idx]
+	local link = GetSnapshotSlotLink(slotsByInventory, inventorySlot)
 	local label = slotDef.label
 	if #slotDef.slots > 1 then
 		label = string.format("%s %d", label, idx)
@@ -1416,12 +1592,25 @@ local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, i
 
 	if not link then
 		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
-			return {}
+			return {}, false
 		end
 		if not IsSlotEnabledInConfig(cfg, slotKey, nil) then
-			return {}
+			return {}, false
 		end
-		return { label .. " Item" }
+		-- If the slot has evidence of an equipped item (texture/itemId) but the
+		-- link has not loaded yet, do not report it as definitively missing.
+		-- Signal the caller that this slot is still pending item data.
+		if IsSlotItemDataPending(slotsByInventory, inventorySlot) then
+			return {}, true
+		end
+		return { label .. " Item" }, false
+	end
+
+	-- If the link looks like an incomplete stub (all modification fields are
+	-- zero), do not flag enchant or gem requirements as missing.  The data
+	-- will be re-fetched on the next inspect cycle.
+	if IsSlotLinkPotentiallyIncomplete(slotsByInventory, inventorySlot) then
+		return {}, true
 	end
 
 	local missing = {}
@@ -1433,7 +1622,7 @@ local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, i
 		table.insert(missing, label .. " Gem")
 	end
 
-	return missing
+	return missing, false
 end
 
 local function HasEquippedMetaGemInSnapshot(slotsByInventory)
@@ -1457,10 +1646,14 @@ end
 local function EvaluateSnapshot(slotsByInventory, cfg)
 	local mainHandLink = GetSnapshotSlotLink(slotsByInventory, INVSLOT_MAINHAND)
 	local missing = {}
+	local hasItemDataPending = false
 
 	for slotKey, slotDef in pairs(SLOT_DEFS) do
 		for idx = 1, #slotDef.slots do
-			local slotMissing = BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, idx, mainHandLink, cfg)
+			local slotMissing, slotPending = BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, idx, mainHandLink, cfg)
+			if slotPending then
+				hasItemDataPending = true
+			end
 			for _, entry in ipairs(slotMissing) do
 				table.insert(missing, entry)
 			end
@@ -1471,7 +1664,7 @@ local function EvaluateSnapshot(slotsByInventory, cfg)
 		table.insert(missing, "Meta Gem")
 	end
 
-	return missing
+	return missing, hasItemDataPending
 end
 
 local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlot, isKnown)
@@ -1490,10 +1683,21 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 	local twoHandExempt = isKnown and (slotKey == "offHand") and (not hasItem) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
 	local shouldCheckEnchant = isKnown and link and configEnabled and ShouldCheckTroubleshootingEnchant(slotKey, link) or false
 	local hasEnchant = isKnown and link and HasEnchant(link) or false
-	local missingEnchant = shouldCheckEnchant and not hasEnchant
-	local missingGems = isKnown and link and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
+
+	-- Detect potentially incomplete links: if the link is a stub with all
+	-- modification fields zeroed, suppress false missing-enchant/gem alerts
+	-- until the data fully resolves on the next inspect cycle.
+	local linkIncomplete = false
+	if isKnown and link and sourceSlot then
+		local tempSlots = { [inventorySlot] = sourceSlot }
+		linkIncomplete = IsSlotLinkPotentiallyIncomplete(tempSlots, inventorySlot)
+	end
+
+	local missingEnchant = shouldCheckEnchant and not hasEnchant and not linkIncomplete
+	local missingGems = isKnown and link and cfg and cfg.checkGemsInSockets ~= false and not linkIncomplete and HasMissingGems(link) or false
 	local missingItem = isKnown and (not hasItem) and configEnabled and not twoHandExempt
 	local skippedEnchant = isKnown and link and configEnabled and not shouldCheckEnchant
+	local itemDataPending = ((isKnown and hasItem and not link) or linkIncomplete) and true or false
 
 	return {
 		key = slotKey,
@@ -1513,6 +1717,7 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 		missingGems = missingGems and true or false,
 		missingItem = missingItem and true or false,
 		skippedEnchant = skippedEnchant and true or false,
+		itemDataPending = itemDataPending,
 	}
 end
 
@@ -1824,6 +2029,21 @@ local function FormatPointAmount(amount)
 	return text
 end
 
+local function RenderWhisperTemplate(template, vars)
+	if type(template) ~= "string" or template == "" then
+		return nil
+	end
+
+	vars = type(vars) == "table" and vars or {}
+	return (template:gsub("%{([%w_]+)%}", function(key)
+		local value = vars[key]
+		if value == nil then
+			return "{" .. key .. "}"
+		end
+		return tostring(value)
+	end))
+end
+
 local function GetRaidCheckPointAward(cfg)
 	if type(cfg) ~= "table" then
 		return RAID_CHECK_POINT_AWARD_DEFAULT
@@ -1862,16 +2082,44 @@ local function AwardPrepared(profile, member, pointName, pointAward)
 	return true
 end
 
-local function WhisperPrepared(target, pointName, pointAward)
-	SendWhisper(target, ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(pointAward), pointName))
+local function WhisperPrepared(target, cfg, playerName, pointName, pointAward)
+	local template = type(cfg) == "table" and cfg.whisperTemplateRaidPrepared or nil
+	local message = RenderWhisperTemplate(template, {
+		player_name = playerName,
+		point_name = pointName,
+		points_awarded = FormatPointAmount(pointAward),
+	})
+
+	if not message then
+		message = ("Spectrum Federation: You've been awarded %s %s. Thanks for showing up prepared and on time!"):format(FormatPointAmount(pointAward), pointName)
+	end
+
+	SendWhisper(target, message)
 end
 
-local function WhisperMissing(target, pointName, list, mode)
+local function WhisperMissing(target, cfg, playerName, pointName, list, mode)
+	local template
 	if mode == "pre" then
-		SendWhisper(target, ("Spectrum Federation: You're missing the following enchants/gems: %s."):format(list))
+		template = type(cfg) == "table" and cfg.whisperTemplatePreRaidMissing or nil
 	else
-		SendWhisper(target, ("Spectrum Federation: You're missing the following enchants/gems: %s. No new %s awarded."):format(list, pointName))
+		template = type(cfg) == "table" and cfg.whisperTemplateRaidMissing or nil
 	end
+
+	local message = RenderWhisperTemplate(template, {
+		player_name = playerName,
+		missing = list,
+		point_name = pointName,
+	})
+
+	if not message then
+		if mode == "pre" then
+			message = ("Spectrum Federation: You're missing the following enchants/gems: %s."):format(list)
+		else
+			message = ("Spectrum Federation: You're missing the following enchants/gems: %s. No new %s awarded."):format(list, pointName)
+		end
+	end
+
+	SendWhisper(target, message)
 end
 
 local function GetPointName(profile)
@@ -2061,13 +2309,23 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 		return result
 	end
 
-	local missing = EvaluateSnapshot(inspectState.slotsByInventory, cfg)
+	local missing, hasItemDataPending = EvaluateSnapshot(inspectState.slotsByInventory, cfg)
+
+	-- If any tracked slot still has incomplete item data (texture/itemId present
+	-- but link unavailable), treat the player as pending rather than definitively
+	-- missing requirements.  This prevents false-positive whispers and raid check
+	-- failures caused by partially-loaded item data.
+	if hasItemDataPending then
+		result.inspectPending = "Item data loading"
+		return result
+	end
+
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local suffix = ""
 		local alreadyWhispered = HasBeenWhisperedToday(member, mode)
 		if whisper and not alreadyWhispered then
-			WhisperMissing(whisperTarget, pointName, list, mode)
+			WhisperMissing(whisperTarget, cfg, unitInfo.short, pointName, list, mode)
 			result.whisperedMissing = true
 			MarkWhisperSent(member, mode, time())
 			suffix = " (whispered)"
@@ -2087,7 +2345,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 
 		local awarded = AwardPrepared(profile, member, pointName, pointAward)
 		if awarded and whisper and ShouldWhisperPrepared(cfg) then
-			WhisperPrepared(whisperTarget, pointName, pointAward)
+			WhisperPrepared(whisperTarget, cfg, unitInfo.short, pointName, pointAward)
 		end
 	end
 
