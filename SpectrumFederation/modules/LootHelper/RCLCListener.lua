@@ -34,6 +34,13 @@ local function DWarn(fmt, ...)
     end
 end
 
+-- Check if a Loot Helper sync session is currently active
+local function IsSessionActive()
+    return SF.LootHelperSync
+        and type(SF.LootHelperSync.IsSessionActive) == "function"
+        and SF.LootHelperSync:IsSessionActive()
+end
+
 -- Get the active profile, or nil
 local function GetActiveProfile()
     if SF.GetActiveProfile then
@@ -103,6 +110,11 @@ end
 -- @param rollType string Roll type (e.g. "Need", "Greed", "Mainspec")
 -- @param source string|nil Source addon identifier
 local function RecordLootAward(member, itemLink, rollType, source)
+    if not IsSessionActive() then
+        DVerbose("No active Loot Helper session; skipping loot award record")
+        return
+    end
+
     local profile = GetActiveProfile()
     if not profile then
         DVerbose("No active profile; skipping loot award record")
