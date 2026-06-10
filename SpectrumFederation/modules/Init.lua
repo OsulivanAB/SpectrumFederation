@@ -48,6 +48,13 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.RaidCheck:EnsureInspectSupport()
     end
 
+    if SF.RCLCListener and SF.RCLCListener.Init then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing RCLootCouncil Listener")
+        end
+        SF.RCLCListener:Init()
+    end
+
     if SF.Debug then
         SF.Debug:Info("INIT", "All modules initialized successfully")
     end
