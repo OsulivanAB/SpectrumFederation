@@ -19,7 +19,8 @@ local EVENT_TYPES = {
     SAFEMODE_CHANGE             = "SAFEMODE_CHANGE",
     SAFEMODE_ON_COMBAT_CHANGE   = "SAFEMODE_ON_COMBAT_CHANGE",
     ADMIN_ADDED                 = "ADMIN_ADDED",
-    ADMIN_REMOVED               = "ADMIN_REMOVED"
+    ADMIN_REMOVED               = "ADMIN_REMOVED",
+    MAIN_SWAP                   = "MAIN_SWAP"
 }
 
 local POINT_CHANGE_TYPES = {
@@ -72,6 +73,10 @@ local EVENT_DATA_TEMPLATES = {
     },
     [EVENT_TYPES.ADMIN_REMOVED] = {
         member = "" -- "Name-Realm"
+    },
+    [EVENT_TYPES.MAIN_SWAP] = {
+        member = "", -- "Name-Realm" (the new/target character)
+        sourceMember = "" -- "Name-Realm" (the old character that was consolidated)
     }
 }
 
@@ -218,6 +223,10 @@ function LootLog.new(eventType, eventData, opts)
         end
     elseif eventType == EVENT_TYPES.ADMIN_REMOVED then
         if not SF.LootLogValidators.ValidateAdminRemovedData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.MAIN_SWAP then
+        if not SF.LootLogValidators.ValidateMainSwapData(eventData) then
             return nil
         end
     end
