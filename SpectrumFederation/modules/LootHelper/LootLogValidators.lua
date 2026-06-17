@@ -291,5 +291,45 @@ function LootLogValidators.ValidateAdminRemovedData(eventData)
     return true
 end
 
+-- Function to validate the MAIN_SWAP event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateMainSwapData(eventData)
+    local memberID = eventData.member
+    local sourceMember = eventData.sourceMember
+
+    -- Validate target member ID is a non-empty string in "Name-Realm" format
+    if type(memberID) ~= "string" or memberID == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid target member ID: %s", tostring(memberID))
+        end
+        return false
+    end
+
+    if not memberID:match("^[^%-]+%-[^%-]+$") then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid target member ID format (expected Name-Realm): %s", tostring(memberID))
+        end
+        return false
+    end
+
+    -- Validate source member ID is a non-empty string in "Name-Realm" format
+    if type(sourceMember) ~= "string" or sourceMember == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid source member ID: %s", tostring(sourceMember))
+        end
+        return false
+    end
+
+    if not sourceMember:match("^[^%-]+%-[^%-]+$") then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid source member ID format (expected Name-Realm): %s", tostring(sourceMember))
+        end
+        return false
+    end
+
+    return true
+end
+
 -- Export to namespace
 SF.LootLogValidators = LootLogValidators

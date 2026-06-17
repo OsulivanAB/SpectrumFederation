@@ -1585,6 +1585,26 @@ function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
         self:_EnsureOwnerIsAdmin()
     end
 
+    -- Create a MAIN_SWAP log entry to record the consolidation event.
+    -- Assigned to the target (new) character, referencing the source (old) character.
+    if SF.LootLog and SF.LootLogEventTypes then
+        local logEventData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.MAIN_SWAP)
+        if logEventData then
+            logEventData.member = targetMemberId
+            logEventData.sourceMember = sourceMemberId
+
+            local logOpts = { skipPermission = true }
+            logOpts.author = self._author or (SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier())
+            if self.AllocateNextCounter and logOpts.author then
+                logOpts.counter = self:AllocateNextCounter(logOpts.author)
+            end
+            local logEntry = SF.LootLog.new(SF.LootLogEventTypes.MAIN_SWAP, logEventData, logOpts)
+            if logEntry and self.AddLootLog then
+                self:AddLootLog(logEntry)
+            end
+        end
+    end
+
     if SF.LootHelperSync and SF.LootHelperSync.AdvertiseProfileMutation and self.GetProfileId then
         local affectedRanges = {}
         for _, range in pairs(affectedRangesByAuthor) do
