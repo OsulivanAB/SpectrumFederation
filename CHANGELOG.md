@@ -62,6 +62,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.22-beta.7] - 2026-06-17
+
+### Fixed
+- Resolved an issue where pre-raid checks incorrectly reported players with known but outdated equipment data as pending. Stale equipment data will now be used for evaluations while background refreshes are performed.
+
 ## [0.5.22] - 2026-06-10
 
 ### Changed
