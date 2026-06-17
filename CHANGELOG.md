@@ -63,6 +63,16 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.22-beta.8] - 2026-06-17
+
+### Added
+- Introduced the `MAIN_SWAP` loot log event to track character consolidation actions, including equipment and history transfers.
+- Added visual indicators for `MAIN_SWAP` events in the loot log UI, including color coding and descriptive labels.
+
+### Fixed
+- Improved validation for member IDs in loot log events to ensure proper format and prevent errors.
+
 ## [0.5.22-beta.7] - 2026-06-17
 
 ### Fixed
