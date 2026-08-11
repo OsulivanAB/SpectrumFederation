@@ -65,28 +65,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [0.5.22-beta.9] - 2026-08-11
-
-### Changed
-- Merge pull request #240 from OsulivanAB/update-game-version
-
-chore: update interface version to 120100 in SpectrumFederation.toc
-
-## [0.5.22-beta.8] - 2026-06-17
-
-### Added
-- Introduced the `MAIN_SWAP` loot log event to track character consolidation actions, including equipment and history transfers.
-- Added visual indicators for `MAIN_SWAP` events in the loot log UI, including color coding and descriptive labels.
-
-### Fixed
-- Improved validation for member IDs in loot log events to ensure proper format and prevent errors.
-
-## [0.5.22-beta.7] - 2026-06-17
-
-### Fixed
-- Resolved an issue where pre-raid checks incorrectly reported players with known but outdated equipment data as pending. Stale equipment data will now be used for evaluations while background refreshes are performed.
-
-## [0.5.22] - 2026-06-10
+## [0.5.22] - 2026-08-11
 
 ### Changed
 - Infrastructure and tooling updates (no addon code changes)
