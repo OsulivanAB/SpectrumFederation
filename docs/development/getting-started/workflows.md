@@ -58,7 +58,7 @@ graph TB
 **Inputs**:
 - `dry_run`: Test promotion without making changes (default: `false`)
 
-**Jobs** (sequential):
+**Jobs**:
 1. **pre-merge-validation**: Validate beta state before merge
 2. **merge-beta-to-main**: Merge beta → main with special handling
    - Use `-X ours` strategy for CHANGELOG.md and README.md
@@ -66,10 +66,11 @@ graph TB
    - Query Blizzard API for Live Interface version
 3. **update-changelog-main**: Update CHANGELOG.md on main
 4. **update-readme-main**: Update README.md badges for main
-5. **deploy-docs**: Deploy documentation to GitHub Pages
-6. **publish-stable-release**: Create stable GitHub release
-7. **fast-forward-beta**: Sync beta to match main
-8. **summary**: Display promotion summary
+5. **In parallel** (after README updates; dry-run phase uses the same graph):
+   - **deploy-docs**: Deploy documentation to GitHub Pages
+   - **publish-stable-release**: Create stable GitHub release
+   - **fast-forward-beta**: Sync beta to match main
+6. **summary**: Display promotion summary
 
 **Safety Features**:
 - Dry-run mode for testing
