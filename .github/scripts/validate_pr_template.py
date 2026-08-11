@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Validates that PR descriptions follow the required template format.
 """

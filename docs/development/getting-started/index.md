@@ -39,7 +39,7 @@ SpectrumFederation is a World of Warcraft addon written in **Lua 5.1** for the S
    sudo luarocks install luacheck
    
    # Python tools for CI scripts
-   pip install yamllint ruff
+   pip install yamllint ruff==0.16.2
    ```
 
 ## Code Structure

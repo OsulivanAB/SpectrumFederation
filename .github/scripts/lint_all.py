@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Unified linter for SpectrumFederation CI/CD.
 
@@ -40,7 +39,7 @@ def run_command(cmd, description):
     except FileNotFoundError:
         print(f"[lint] ✗ {description} tool not found")
         return False
-    except Exception as e:
+    except (OSError, UnicodeError, ValueError) as e:
         print(f"[lint] ✗ {description} error: {e}")
         return False
 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Validate MkDocs documentation.
 
@@ -49,7 +48,7 @@ def main():
         print("::error::mkdocs command not found. Install with: pip install -r requirements-docs.txt")
         print("[validate-docs] ✗ mkdocs not installed")
         return 1
-    except Exception as e:
+    except (OSError, UnicodeError, ValueError) as e:
         print(f"::error::Unexpected error during validation: {e}")
         print(f"[validate-docs] ✗ Validation failed: {e}")
         return 1

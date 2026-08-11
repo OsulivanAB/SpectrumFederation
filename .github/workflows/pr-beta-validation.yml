@@ -40,7 +40,7 @@ jobs:
         run: pip install yamllint
 
       - name: Install ruff
-        run: pip install ruff
+        run: pip install ruff==0.16.2
 
       - name: Run unified linter
         run: python3 .github/scripts/lint_all.py

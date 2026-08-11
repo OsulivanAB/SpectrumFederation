@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Update CHANGELOG.md using GitHub Copilot to analyze recent changes.
 
@@ -16,8 +15,9 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
 
 def main():
     # Get environment variables
@@ -52,7 +52,7 @@ def main():
     is_beta = "-beta" in version
     
     # Get current date for version sections
-    current_date = datetime.now().strftime("%Y-%m-%d")
+    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     
     # Determine which section to use
     # CHANGED: Beta now uses actual version number with date instead of "Unreleased - Beta"
@@ -69,7 +69,8 @@ def main():
         is_merge = subprocess.run(
             ["git", "rev-parse", "--verify", "HEAD^2"],
             capture_output=True,
-            text=True
+            text=True,
+            check=False,
         ).returncode == 0
         
         if is_merge:
@@ -83,7 +84,8 @@ def main():
             verify_result = subprocess.run(
                 ["git", "rev-parse", "--verify", base_commit],
                 capture_output=True,
-                text=True
+                text=True,
+                check=False,
             )
             if verify_result.returncode != 0:
                 print(f"Warning: {base_commit} not available, trying to find merge base")
@@ -91,7 +93,8 @@ def main():
                 merge_base_result = subprocess.run(
                     ["git", "merge-base", "HEAD", "origin/main"],
                     capture_output=True,
-                    text=True
+                    text=True,
+                    check=False,
                 )
                 if merge_base_result.returncode == 0:
                     base_commit = merge_base_result.stdout.strip()
@@ -263,25 +266,25 @@ def main():
         # If we get 401, skip to fallback immediately
         if response.status_code == 401:
             print("GitHub Models API not available (missing permissions), using basic changelog generation")
-            raise Exception("API not available")
+        else:
+            response.raise_for_status()
+            result = response.json()
+            new_entry = result["choices"][0]["message"]["content"].strip()
             
-        response.raise_for_status()
-        result = response.json()
-        new_entry = result["choices"][0]["message"]["content"].strip()
+            # Clean up any markdown code blocks if present
+            new_entry = re.sub(r'^```markdown?\s*', '', new_entry, flags=re.MULTILINE)
+            new_entry = re.sub(r'```\s*$', '', new_entry, flags=re.MULTILINE)
+            new_entry = new_entry.strip()
+            
+            print("Generated changelog entry using GitHub Models API:")
+            print(new_entry)
         
-        # Clean up any markdown code blocks if present
-        new_entry = re.sub(r'^```markdown?\s*', '', new_entry, flags=re.MULTILINE)
-        new_entry = re.sub(r'```\s*$', '', new_entry, flags=re.MULTILINE)
-        new_entry = new_entry.strip()
-        
-        print("Generated changelog entry using GitHub Models API:")
-        print(new_entry)
-        
-    except Exception as e:
+    except (requests.RequestException, OSError, ValueError, KeyError, IndexError, TypeError) as e:
         print(f"Could not use GitHub Models API: {e}")
         if hasattr(e, 'response') and hasattr(e.response, 'text'):
             print(f"Response: {e.response.text}")
-        
+
+    if new_entry is None:
         # Generate a basic changelog from commit message and file changes
         print("Generating basic changelog from commit analysis...")
         
