@@ -448,6 +448,15 @@ jobs:
       - name: Summary
         run: |
           # Determine status emojis based on job results
+          ADDON_CHANGED="${{ needs.detect-promotion-scope.outputs.addon_changed }}"
+          if [[ "$ADDON_CHANGED" == "true" ]]; then
+            PROMOTION_TYPE="Addon release"
+          elif [[ "$ADDON_CHANGED" == "false" ]]; then
+            PROMOTION_TYPE="Non-addon changes only"
+          else
+            PROMOTION_TYPE="Unknown (scope detection failed)"
+          fi
+
           VALIDATION_STATUS="${{ needs.dry-run-pre-merge-validation.result == 'success' && '✅' || '❌' }}"
           MERGE_STATUS="${{ needs.dry-run-merge-beta-to-main.result == 'success' && '✅' || '❌' }}"
           CHANGELOG_STATUS="${{ needs.dry-run-update-changelog-main.result == 'success' && '✅' || '❌' }}"
@@ -464,7 +473,9 @@ jobs:
           FASTFORWARD_STATUS="${{ needs.dry-run-fast-forward-beta.result == 'success' && '✅' || '❌' }}"
 
           # Determine overall status
-          if [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "true" &&
+          if [[ "$ADDON_CHANGED" != "true" && "$ADDON_CHANGED" != "false" ]]; then
+            TITLE="## [DRY RUN] Promotion Failed ❌"
+          elif [[ "$ADDON_CHANGED" == "true" &&
                 "${{ needs.dry-run-publish-stable-release.result }}" == "skipped" ]]; then
             TITLE="## [DRY RUN] Promotion Failed ❌"
           elif [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
@@ -477,7 +488,7 @@ jobs:
 
           echo "$TITLE" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Promotion Type**: ${{ needs.detect-promotion-scope.outputs.addon_changed == 'true' && 'Addon release' || 'Non-addon changes only' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Promotion Type**: $PROMOTION_TYPE" >> $GITHUB_STEP_SUMMARY
           echo "**Stable Version**: ${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
           echo "**Interface Version**: ${{ needs.dry-run-merge-beta-to-main.outputs.interface }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -880,6 +891,15 @@ jobs:
       - name: Summary
         run: |
           # Determine status emojis based on job results
+          ADDON_CHANGED="${{ needs.detect-promotion-scope.outputs.addon_changed }}"
+          if [[ "$ADDON_CHANGED" == "true" ]]; then
+            PROMOTION_TYPE="Addon release"
+          elif [[ "$ADDON_CHANGED" == "false" ]]; then
+            PROMOTION_TYPE="Non-addon changes only"
+          else
+            PROMOTION_TYPE="Unknown (scope detection failed)"
+          fi
+
           MERGE_STATUS="${{ needs.merge-beta-to-main.result == 'success' && '✅' || '❌' }}"
           CHANGELOG_STATUS="${{ needs.update-changelog-main.result == 'success' && '✅' || '❌' }}"
           README_STATUS="${{ needs.update-readme-main.result == 'success' && '✅' || '❌' }}"
@@ -895,7 +915,9 @@ jobs:
           FASTFORWARD_STATUS="${{ needs.fast-forward-beta.result == 'success' && '✅' || '❌' }}"
 
           # Determine overall status
-          if [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "true" &&
+          if [[ "$ADDON_CHANGED" != "true" && "$ADDON_CHANGED" != "false" ]]; then
+            TITLE="## Promotion Failed ❌"
+          elif [[ "$ADDON_CHANGED" == "true" &&
                 "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
             TITLE="## Promotion Failed ❌"
           elif [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
@@ -908,7 +930,7 @@ jobs:
 
           echo "$TITLE" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Promotion Type**: ${{ needs.detect-promotion-scope.outputs.addon_changed == 'true' && 'Addon release' || 'Non-addon changes only' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Promotion Type**: $PROMOTION_TYPE" >> $GITHUB_STEP_SUMMARY
           echo "**Stable Version**: ${{ needs.merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
           echo "**Interface Version**: ${{ needs.merge-beta-to-main.outputs.interface }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
