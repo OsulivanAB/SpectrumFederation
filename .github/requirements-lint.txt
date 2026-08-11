@@ -1,0 +1,9 @@
+# Pinned linter versions for CI and local tooling.
+# Keep these in sync with .devcontainer/requirements.txt and luarocks luacheck installs.
+#
+# Current toolchain:
+#   luacheck 1.2.0-1  (via: luarocks install luacheck 1.2.0-1)
+#   yamllint 1.35.1
+#   ruff     0.16.2
+yamllint==1.35.1
+ruff==0.16.2

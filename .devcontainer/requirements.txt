@@ -7,9 +7,9 @@ pymdown-extensions==10.19.1
 
 # YAML tools for linting workflows
 PyYAML==6.0.3
-yamllint==1.35.1
 
-# Python linter (keep in sync with CI workflow pins)
+# Python linters (keep in sync with .github/requirements-lint.txt)
+yamllint==1.35.1
 ruff==0.16.2
 
 # Dependencies (automatically installed but pinned for reproducibility)

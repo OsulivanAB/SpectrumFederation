@@ -8,6 +8,7 @@ on:
       - 'SpectrumFederation/**'
       - '.github/scripts/**'
       - '.github/workflows/**'
+      - '.github/requirements-lint.txt'
       - 'docs/**'
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
@@ -34,13 +35,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y luarocks
-          sudo luarocks install luacheck
+          sudo luarocks install luacheck 1.2.0-1
 
-      - name: Install yamllint
-        run: pip install yamllint
-
-      - name: Install ruff
-        run: pip install ruff==0.16.2
+      - name: Install Python linters
+        run: pip install -r .github/requirements-lint.txt
 
       - name: Run unified linter
         run: python3 .github/scripts/lint_all.py
