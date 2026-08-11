@@ -279,7 +279,7 @@ def main():
             print("Generated changelog entry using GitHub Models API:")
             print(new_entry)
         
-    except (requests.RequestException, OSError, ValueError, KeyError, IndexError, TypeError) as e:
+    except (requests.RequestException, OSError, ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
         print(f"Could not use GitHub Models API: {e}")
         if hasattr(e, 'response') and hasattr(e.response, 'text'):
             print(f"Response: {e.response.text}")
