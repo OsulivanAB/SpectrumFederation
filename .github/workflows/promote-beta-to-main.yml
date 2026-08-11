@@ -13,12 +13,42 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  detect-promotion-scope:
+    name: Detect Promotion Scope
+    runs-on: ubuntu-latest
+    outputs:
+      addon_changed: ${{ steps.changes.outputs.addon_changed }}
+
+    steps:
+      - name: Checkout beta branch
+        uses: actions/checkout@v6
+        with:
+          ref: beta
+          fetch-depth: 0
+
+      - name: Fetch main branch
+        run: git fetch origin main
+
+      - name: Check for addon changes
+        id: changes
+        run: |
+          CHANGED_FILES=$(git diff --name-only "origin/main...HEAD" -- 'SpectrumFederation/')
+          if [[ -n "$CHANGED_FILES" ]]; then
+            echo "addon_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Addon files changed between main and beta:"
+            echo "$CHANGED_FILES"
+          else
+            echo "addon_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No addon files changed between main and beta."
+          fi
+
   # ==========================================
   # Phase 1: Dry Run (validation only, no pushes)
   # ==========================================
   dry-run-pre-merge-validation:
     name: "[DRY RUN] Pre-Merge Validation"
     runs-on: ubuntu-latest
+    needs: detect-promotion-scope
 
     steps:
       - name: Checkout beta branch
@@ -52,6 +82,7 @@ jobs:
         run: python3 .github/scripts/validate_docs.py
 
       - name: Verify beta version format
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         run: |
           VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
           echo "Beta version: $VERSION"
@@ -64,13 +95,25 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
         id: beta_version
 
+      - name: Verify unchanged addon uses stable version
+        if: needs.detect-promotion-scope.outputs.addon_changed != 'true'
+        run: |
+          VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+          echo "Unchanged addon version: $VERSION"
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error ::A promotion without addon changes must retain a stable X.Y.Z version"
+            exit 1
+          fi
+
   dry-run-merge-beta-to-main:
     name: "[DRY RUN] Merge Beta to Main"
     runs-on: ubuntu-latest
-    needs: dry-run-pre-merge-validation
+    needs: [detect-promotion-scope, dry-run-pre-merge-validation]
     outputs:
-      stable_version: ${{ steps.remove_beta.outputs.stable_version }}
-      interface: ${{ steps.blizzard.outputs.interface }}
+      addon_changed: ${{ needs.detect-promotion-scope.outputs.addon_changed }}
+      stable_version: ${{ steps.metadata.outputs.stable_version }}
+      interface: ${{ steps.metadata.outputs.interface }}
 
     steps:
       - name: Checkout main branch
@@ -109,11 +152,13 @@ jobs:
           git commit -m "chore: promote beta to main [skip ci]"
 
       - name: Set up Python
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Validate merged TOC version
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         run: |
           MERGED_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
           echo "Merged TOC version: $MERGED_VERSION"
@@ -127,6 +172,7 @@ jobs:
           echo "✓ Merged version contains -beta suffix as expected"
 
       - name: Remove -beta suffix from version
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         id: remove_beta
         run: |
           BETA_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
@@ -141,6 +187,7 @@ jobs:
           git commit -m "chore: update version to $STABLE_VERSION [skip ci]"
 
       - name: Query Blizzard API for live Interface version
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         id: blizzard
         run: |
           INTERFACE=$(python3 .github/scripts/blizzard_api.py --environment live --output interface)
@@ -148,6 +195,7 @@ jobs:
           echo "Live Interface version: $INTERFACE"
 
       - name: Update Interface version in TOC
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         run: |
           INTERFACE="${{ steps.blizzard.outputs.interface }}"
           echo "Updating Interface to: $INTERFACE"
@@ -155,6 +203,20 @@ jobs:
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation/SpectrumFederation.toc
           git add SpectrumFederation/SpectrumFederation.toc
           git commit -m "chore: update Interface to $INTERFACE [skip ci]" || echo "No Interface changes"
+
+      - name: Set promotion metadata
+        id: metadata
+        run: |
+          if [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "true" ]]; then
+            VERSION="${{ steps.remove_beta.outputs.stable_version }}"
+            INTERFACE="${{ steps.blizzard.outputs.interface }}"
+          else
+            VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+            INTERFACE=$(grep -E '^## Interface:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Interface://i' | xargs)
+          fi
+
+          echo "stable_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "interface=$INTERFACE" >> "$GITHUB_OUTPUT"
 
       - name: Push changes to main
         if: false  # Dry run - skip push
@@ -295,7 +357,8 @@ jobs:
   dry-run-publish-stable-release:
     name: "[DRY RUN] Publish Stable Release"
     runs-on: ubuntu-latest
-    needs: [dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main]
+    needs: [detect-promotion-scope, dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main]
+    if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
 
     steps:
       - name: Checkout main branch
@@ -358,7 +421,7 @@ jobs:
   dry-run-summary:
     name: "[DRY RUN] Promotion Summary"
     runs-on: ubuntu-latest
-    needs: [dry-run-pre-merge-validation, dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main, dry-run-deploy-docs, dry-run-publish-stable-release, dry-run-fast-forward-beta]
+    needs: [detect-promotion-scope, dry-run-pre-merge-validation, dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main, dry-run-deploy-docs, dry-run-publish-stable-release, dry-run-fast-forward-beta]
     if: always()
 
     steps:
@@ -370,7 +433,13 @@ jobs:
           CHANGELOG_STATUS="${{ needs.dry-run-update-changelog-main.result == 'success' && '✅' || '❌' }}"
           README_STATUS="${{ needs.dry-run-update-readme-main.result == 'success' && '✅' || '❌' }}"
           DOCS_STATUS="${{ needs.dry-run-deploy-docs.result == 'success' && '✅' || '❌' }}"
-          RELEASE_STATUS="${{ needs.dry-run-publish-stable-release.result == 'success' && '✅' || '❌' }}"
+          if [[ "${{ needs.dry-run-publish-stable-release.result }}" == "success" ]]; then
+            RELEASE_STATUS="✅"
+          elif [[ "${{ needs.dry-run-publish-stable-release.result }}" == "skipped" ]]; then
+            RELEASE_STATUS="⏭️"
+          else
+            RELEASE_STATUS="❌"
+          fi
           FASTFORWARD_STATUS="${{ needs.dry-run-fast-forward-beta.result == 'success' && '✅' || '❌' }}"
 
           # Determine overall status
@@ -384,6 +453,7 @@ jobs:
 
           echo "$TITLE" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Promotion Type**: ${{ needs.detect-promotion-scope.outputs.addon_changed == 'true' && 'Addon release' || 'Non-addon changes only' }}" >> $GITHUB_STEP_SUMMARY
           echo "**Stable Version**: ${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
           echo "**Interface Version**: ${{ needs.dry-run-merge-beta-to-main.outputs.interface }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -411,11 +481,12 @@ jobs:
   merge-beta-to-main:
     name: "Merge Beta to Main"
     runs-on: ubuntu-latest
-    needs: [dry-run-summary, dry-run-merge-beta-to-main]
+    needs: [detect-promotion-scope, dry-run-summary, dry-run-merge-beta-to-main]
     if: needs.dry-run-merge-beta-to-main.result == 'success'
     outputs:
-      stable_version: ${{ steps.remove_beta.outputs.stable_version }}
-      interface: ${{ steps.blizzard.outputs.interface }}
+      addon_changed: ${{ needs.detect-promotion-scope.outputs.addon_changed }}
+      stable_version: ${{ steps.metadata.outputs.stable_version }}
+      interface: ${{ steps.metadata.outputs.interface }}
 
     steps:
       - name: Log phase transition
@@ -462,11 +533,13 @@ jobs:
           git commit -m "chore: promote beta to main [skip ci]"
 
       - name: Set up Python
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Validate merged TOC version
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         run: |
           MERGED_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
           echo "Merged TOC version: $MERGED_VERSION"
@@ -480,6 +553,7 @@ jobs:
           echo "✓ Merged version contains -beta suffix as expected"
 
       - name: Remove -beta suffix from version
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         id: remove_beta
         run: |
           BETA_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
@@ -494,6 +568,7 @@ jobs:
           git commit -m "chore: update version to $STABLE_VERSION [skip ci]"
 
       - name: Query Blizzard API for live Interface version
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         id: blizzard
         run: |
           INTERFACE=$(python3 .github/scripts/blizzard_api.py --environment live --output interface)
@@ -501,6 +576,7 @@ jobs:
           echo "Live Interface version: $INTERFACE"
 
       - name: Update Interface version in TOC
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
         run: |
           INTERFACE="${{ steps.blizzard.outputs.interface }}"
           echo "Updating Interface to: $INTERFACE"
@@ -508,6 +584,20 @@ jobs:
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation/SpectrumFederation.toc
           git add SpectrumFederation/SpectrumFederation.toc
           git commit -m "chore: update Interface to $INTERFACE [skip ci]" || echo "No Interface changes"
+
+      - name: Set promotion metadata
+        id: metadata
+        run: |
+          if [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "true" ]]; then
+            VERSION="${{ steps.remove_beta.outputs.stable_version }}"
+            INTERFACE="${{ steps.blizzard.outputs.interface }}"
+          else
+            VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+            INTERFACE=$(grep -E '^## Interface:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Interface://i' | xargs)
+          fi
+
+          echo "stable_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "interface=$INTERFACE" >> "$GITHUB_OUTPUT"
 
       - name: Push changes to main
         run: git push origin main
@@ -643,9 +733,10 @@ jobs:
   publish-stable-release:
     name: "Publish Stable Release"
     runs-on: ubuntu-latest
-    needs: [merge-beta-to-main, update-changelog-main, update-readme-main]
+    needs: [detect-promotion-scope, merge-beta-to-main, update-changelog-main, update-readme-main]
     # Explicitly check that all prerequisites succeeded
     if: |
+      needs.detect-promotion-scope.outputs.addon_changed == 'true' &&
       needs.merge-beta-to-main.result == 'success' &&
       needs.update-changelog-main.result == 'success' &&
       needs.update-readme-main.result == 'success'
@@ -728,7 +819,7 @@ jobs:
   final-summary:
     name: "Final Promotion Summary"
     runs-on: ubuntu-latest
-    needs: [merge-beta-to-main, update-changelog-main, update-readme-main, deploy-docs, publish-stable-release, fast-forward-beta]
+    needs: [detect-promotion-scope, merge-beta-to-main, update-changelog-main, update-readme-main, deploy-docs, publish-stable-release, fast-forward-beta]
     if: always()
 
     steps:
@@ -739,7 +830,13 @@ jobs:
           CHANGELOG_STATUS="${{ needs.update-changelog-main.result == 'success' && '✅' || '❌' }}"
           README_STATUS="${{ needs.update-readme-main.result == 'success' && '✅' || '❌' }}"
           DOCS_STATUS="${{ needs.deploy-docs.result == 'success' && '✅' || '❌' }}"
-          RELEASE_STATUS="${{ needs.publish-stable-release.result == 'success' && '✅' || '❌' }}"
+          if [[ "${{ needs.publish-stable-release.result }}" == "success" ]]; then
+            RELEASE_STATUS="✅"
+          elif [[ "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
+            RELEASE_STATUS="⏭️"
+          else
+            RELEASE_STATUS="❌"
+          fi
           FASTFORWARD_STATUS="${{ needs.fast-forward-beta.result == 'success' && '✅' || '❌' }}"
 
           # Determine overall status
@@ -753,6 +850,7 @@ jobs:
 
           echo "$TITLE" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Promotion Type**: ${{ needs.detect-promotion-scope.outputs.addon_changed == 'true' && 'Addon release' || 'Non-addon changes only' }}" >> $GITHUB_STEP_SUMMARY
           echo "**Stable Version**: ${{ needs.merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
           echo "**Interface Version**: ${{ needs.merge-beta-to-main.outputs.interface }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -775,6 +873,10 @@ jobs:
             echo "- Release zip file for addon installation" >> $GITHUB_STEP_SUMMARY
             echo "- Release metadata (release.json)" >> $GITHUB_STEP_SUMMARY
             echo "- Changelog notes" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
+            echo "### ⏭️ Stable Release Skipped" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No files under \`SpectrumFederation/**\` changed between main and beta." >> $GITHUB_STEP_SUMMARY
           else
             echo "### ⚠️ Release Creation Failed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
