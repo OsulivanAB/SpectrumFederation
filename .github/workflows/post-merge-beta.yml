@@ -6,8 +6,6 @@ on:
       - beta
     paths:
       - 'SpectrumFederation/**'
-      - '.github/scripts/**'
-      - '.github/workflows/**'
 
 concurrency:
   group: beta-release
