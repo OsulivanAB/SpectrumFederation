@@ -36,8 +36,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y luarocks
-          sudo luarocks install luacheck
-          pip install yamllint ruff
+          sudo luarocks install luacheck 1.2.0-1
+          pip install -r .github/requirements-lint.txt
 
       - name: Run linters
         run: python3 .github/scripts/lint_all.py

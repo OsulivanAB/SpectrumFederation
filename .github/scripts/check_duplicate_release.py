@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Check if a GitHub release already exists for the given version.
 
@@ -76,7 +75,7 @@ def check_duplicate_release(version, repo):
         release_tag = release.get("tag_name", "").lstrip("v")
         
         # Parse release version
-        release_base, release_suffix = parse_version(release_tag)
+        release_base, _ = parse_version(release_tag)
         if release_base is None:
             continue
         

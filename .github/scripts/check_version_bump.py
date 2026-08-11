@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Check if version was bumped in TOC file compared to base branch.
 

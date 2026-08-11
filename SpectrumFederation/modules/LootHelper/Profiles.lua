@@ -1452,6 +1452,17 @@ function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
         return false, "The target character is not part of this profile."
     end
 
+    -- Snapshot the source member's equipment (armor) state before any mutations.
+    -- This ensures equipment slots transfer even if the source's armor state is not
+    -- fully backed by ARMOR_CHANGE logs (e.g. sync/import edge cases).
+    local sourceMember = self:getMemberByID(sourceMemberId)
+    local sourceArmorSnapshot = {}
+    if sourceMember and type(sourceMember.armor) == "table" then
+        for slot, used in pairs(sourceMember.armor) do
+            sourceArmorSnapshot[slot] = used
+        end
+    end
+
     local logsUpdated = 0
     local affectedRangesByAuthor = {}
     for _, log in ipairs(self._lootLogs or {}) do
@@ -1531,8 +1542,67 @@ function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
         return false, rebuildErr or "Failed to rebuild profile after transferring points."
     end
 
+    -- Reconcile equipment state: ensure the target member carries forward any
+    -- equipment slots that were marked as used on the source.  If the rebuild
+    -- did not pick them up (e.g. missing backing logs), create ARMOR_CHANGE
+    -- logs so the state is durable and sync-safe.
+    self._memberById = nil  -- force fresh lookup after rebuild
+    local targetMember = self:getMemberByID(targetMemberId)
+    if targetMember and type(targetMember.armor) == "table" then
+        for slot, wasUsed in pairs(sourceArmorSnapshot) do
+            if wasUsed == true and targetMember.armor[slot] == false then
+                targetMember.armor[slot] = true
+
+                -- Create a backing ARMOR_CHANGE log so state persists across rebuilds/sync
+                if SF.LootLog and SF.LootLogEventTypes and SF.LootLogArmorActions then
+                    local logEventData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.ARMOR_CHANGE)
+                    if logEventData then
+                        logEventData.member = targetMemberId
+                        logEventData.slot = slot
+                        logEventData.action = SF.LootLogArmorActions.USED
+                        logEventData.source = "main_swap_reconcile"
+
+                        local logOpts = { skipPermission = true }
+                        logOpts.author = self._author or (SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier())
+                        if self.AllocateNextCounter and logOpts.author then
+                            logOpts.counter = self:AllocateNextCounter(logOpts.author)
+                        end
+                        local logEntry = SF.LootLog.new(SF.LootLogEventTypes.ARMOR_CHANGE, logEventData, logOpts)
+                        if logEntry and self.AddLootLog then
+                            self:AddLootLog(logEntry)
+                        end
+                    end
+                end
+
+                if SF.Debug then
+                    SF.Debug:Info("LootProfile", "Reconciled equipment slot '%s' for target %s (main swap)", tostring(slot), tostring(targetMemberId))
+                end
+            end
+        end
+    end
+
     if self._EnsureOwnerIsAdmin then
         self:_EnsureOwnerIsAdmin()
+    end
+
+    -- Create a MAIN_SWAP log entry to record the consolidation event.
+    -- Assigned to the target (new) character, referencing the source (old) character.
+    if SF.LootLog and SF.LootLogEventTypes then
+        local logEventData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.MAIN_SWAP)
+        if logEventData then
+            logEventData.member = targetMemberId
+            logEventData.sourceMember = sourceMemberId
+
+            local logOpts = { skipPermission = true }
+            logOpts.author = self._author or (SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier())
+            if self.AllocateNextCounter and logOpts.author then
+                logOpts.counter = self:AllocateNextCounter(logOpts.author)
+            end
+            local logEntry = SF.LootLog.new(SF.LootLogEventTypes.MAIN_SWAP, logEventData, logOpts)
+            if logEntry and self.AddLootLog then
+                self:AddLootLog(logEntry)
+            end
+        end
     end
 
     if SF.LootHelperSync and SF.LootHelperSync.AdvertiseProfileMutation and self.GetProfileId then

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Package addon and create GitHub release.
 
@@ -70,7 +69,7 @@ def get_changelog_for_version(version):
         print(f"[publish-release] ✓ Extracted changelog for version {version}")
         return changelog_section
         
-    except Exception as e:
+    except (OSError, UnicodeError) as e:
         print(f"[publish-release] Warning: Failed to read changelog: {e}")
         return None
 

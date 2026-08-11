@@ -134,6 +134,7 @@ local EVENT_TYPE_COLORS = {
 	SAFEMODE_ON_COMBAT_CHANGE = "|cffff6600",
 	ADMIN_ADDED = "|cff66ff66",
 	ADMIN_REMOVED = "|cffff6666",
+	MAIN_SWAP = "|cff9966ff",
 }
 
 local EVENT_TYPE_LABELS = {
@@ -147,6 +148,7 @@ local EVENT_TYPE_LABELS = {
 	SAFEMODE_ON_COMBAT_CHANGE = "Combat Safe Mode",
 	ADMIN_ADDED = "Admin Added",
 	ADMIN_REMOVED = "Admin Removed",
+	MAIN_SWAP = "Main Swap",
 }
 
 function GetEventTypeLabel(eventType)
@@ -235,6 +237,11 @@ local function BuildActionText(eventType, data, author)
 		return "Added as admin"
 	elseif eventType == "ADMIN_REMOVED" then
 		return "Removed from admins"
+	elseif eventType == "MAIN_SWAP" then
+		local sourceName = data.sourceMember or "Unknown"
+		-- Strip realm for cleaner display if present
+		local shortName = sourceName:match("^([^%-]+)") or sourceName
+		return string.format("Consolidated from %s", shortName)
 	end
 
 	return ""

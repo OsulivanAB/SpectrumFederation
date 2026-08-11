@@ -1908,6 +1908,43 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
+	-- Stale-but-available data: if equipment data exists (even beyond the
+	-- freshness window), return it as known so raid checks can evaluate it
+	-- rather than reporting the player as pending/unavailable.  The background
+	-- inspect system will continue to attempt refreshes independently.
+	local hasStaleCachedData = cacheEntry and cacheEntry.slotsByInventory and HasEquipmentData(cacheEntry.slotsByInventory)
+	local hasStaleProfileData = (not hasStaleCachedData)
+		and profileSnapshot and profileSnapshot.slotsByInventory
+		and HasEquipmentData(profileSnapshot.slotsByInventory)
+
+	if hasStaleCachedData then
+		return {
+			status = "stale",
+			label = nil,
+			message = "Showing older cached inspect data. Background refresh will update when possible.",
+			isKnown = true,
+			averageItemLevel = cacheEntry.averageItemLevel,
+			slotsByInventory = cacheEntry.slotsByInventory,
+			entry = cacheEntry,
+			stale = true,
+			cacheHolder = cacheEntry,
+		}
+	end
+
+	if hasStaleProfileData then
+		return {
+			status = "stale",
+			label = nil,
+			message = BuildSavedSnapshotMessage(profileSnapshot, false),
+			isKnown = true,
+			averageItemLevel = profileSnapshot.averageItemLevel,
+			slotsByInventory = profileSnapshot.slotsByInventory,
+			entry = profileSnapshot,
+			stale = true,
+			cacheHolder = profileSnapshot,
+		}
+	end
+
 	if cacheEntry and cacheEntry.nextRetryAt and cacheEntry.nextRetryAt > now then
 		return {
 			status = "retrying",
