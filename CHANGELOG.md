@@ -66,6 +66,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+## [1.0.0-beta.1] - 2026-08-11
+
+### Changed
+- Prepared the addon metadata and release documentation for the first stable 1.0.0 release.
+
 ## [0.5.23-beta.1] - 2026-08-11
 
 ### Removed
