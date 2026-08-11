@@ -65,6 +65,21 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [1.0.0-beta.1] - 2026-08-11
+
+### Changed
+- Merge pull request #242 from OsulivanAB/cursor/launch-v1-0-0-433e
+
+Prepare SpectrumFederation 1.0.0 launch candidate
+
+## [0.5.23-beta.1] - 2026-08-11
+
+### Removed
+- Merge pull request #241 from OsulivanAB/update-promote-beta-to-main
+
+chore: remove deploy-docs from workflow dependencies for stable release promotion
+
 ## [0.5.22] - 2026-08-11
 
 ### Changed
