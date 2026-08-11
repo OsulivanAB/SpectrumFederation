@@ -96,7 +96,7 @@ jobs:
         id: beta_version
 
       - name: Verify unchanged addon uses stable version
-        if: needs.detect-promotion-scope.outputs.addon_changed != 'true'
+        if: needs.detect-promotion-scope.outputs.addon_changed == 'false'
         run: |
           VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
           echo "Unchanged addon version: $VERSION"
@@ -240,7 +240,7 @@ jobs:
           token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Skip changelog update for non-addon promotion
-        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed != 'true'
+        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'false'
         run: echo "No addon changes; preserving the existing stable release notes."
 
       - name: Set up Python
@@ -455,7 +455,7 @@ jobs:
           DOCS_STATUS="${{ needs.dry-run-deploy-docs.result == 'success' && '✅' || '❌' }}"
           if [[ "${{ needs.dry-run-publish-stable-release.result }}" == "success" ]]; then
             RELEASE_STATUS="✅"
-          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" != "true" &&
+          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "false" &&
                   "${{ needs.dry-run-publish-stable-release.result }}" == "skipped" ]]; then
             RELEASE_STATUS="⏭️"
           else
@@ -519,7 +519,7 @@ jobs:
       (
         needs.dry-run-publish-stable-release.result == 'success' ||
         (
-          needs.detect-promotion-scope.outputs.addon_changed != 'true' &&
+          needs.detect-promotion-scope.outputs.addon_changed == 'false' &&
           needs.dry-run-publish-stable-release.result == 'skipped'
         )
       )
@@ -660,7 +660,7 @@ jobs:
           token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Skip changelog update for non-addon promotion
-        if: needs.merge-beta-to-main.outputs.addon_changed != 'true'
+        if: needs.merge-beta-to-main.outputs.addon_changed == 'false'
         run: echo "No addon changes; preserving the existing stable release notes."
 
       - name: Set up Python
@@ -886,7 +886,7 @@ jobs:
           DOCS_STATUS="${{ needs.deploy-docs.result == 'success' && '✅' || '❌' }}"
           if [[ "${{ needs.publish-stable-release.result }}" == "success" ]]; then
             RELEASE_STATUS="✅"
-          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" != "true" &&
+          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "false" &&
                   "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
             RELEASE_STATUS="⏭️"
           else
@@ -931,7 +931,7 @@ jobs:
             echo "- Release zip file for addon installation" >> $GITHUB_STEP_SUMMARY
             echo "- Release metadata (release.json)" >> $GITHUB_STEP_SUMMARY
             echo "- Changelog notes" >> $GITHUB_STEP_SUMMARY
-          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" != "true" &&
+          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "false" &&
                   "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
             echo "### ⏭️ Stable Release Skipped" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
