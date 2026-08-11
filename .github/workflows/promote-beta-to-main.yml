@@ -239,15 +239,22 @@ jobs:
           ref: main
           token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
+      - name: Skip changelog update for non-addon promotion
+        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed != 'true'
+        run: echo "No addon changes; preserving the existing stable release notes."
+
       - name: Set up Python
+        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Install dependencies
+        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'true'
         run: pip install requests
 
       - name: Update CHANGELOG.md
+        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH_NAME: main
@@ -255,6 +262,7 @@ jobs:
           python3 .github/scripts/update_changelog.py
 
       - name: Commit changelog changes
+        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -447,7 +455,8 @@ jobs:
           DOCS_STATUS="${{ needs.dry-run-deploy-docs.result == 'success' && '✅' || '❌' }}"
           if [[ "${{ needs.dry-run-publish-stable-release.result }}" == "success" ]]; then
             RELEASE_STATUS="✅"
-          elif [[ "${{ needs.dry-run-publish-stable-release.result }}" == "skipped" ]]; then
+          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" != "true" &&
+                  "${{ needs.dry-run-publish-stable-release.result }}" == "skipped" ]]; then
             RELEASE_STATUS="⏭️"
           else
             RELEASE_STATUS="❌"
@@ -455,7 +464,10 @@ jobs:
           FASTFORWARD_STATUS="${{ needs.dry-run-fast-forward-beta.result == 'success' && '✅' || '❌' }}"
 
           # Determine overall status
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+          if [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "true" &&
+                "${{ needs.dry-run-publish-stable-release.result }}" == "skipped" ]]; then
+            TITLE="## [DRY RUN] Promotion Failed ❌"
+          elif [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
             TITLE="## [DRY RUN] Promotion Failed ❌"
           elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             TITLE="## [DRY RUN] Promotion Cancelled ⚠️"
@@ -647,15 +659,22 @@ jobs:
           ref: main
           token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
+      - name: Skip changelog update for non-addon promotion
+        if: needs.merge-beta-to-main.outputs.addon_changed != 'true'
+        run: echo "No addon changes; preserving the existing stable release notes."
+
       - name: Set up Python
+        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Install dependencies
+        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         run: pip install requests
 
       - name: Update CHANGELOG.md
+        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH_NAME: main
@@ -663,6 +682,7 @@ jobs:
           python3 .github/scripts/update_changelog.py
 
       - name: Commit changelog changes
+        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -675,6 +695,7 @@ jobs:
           fi
 
       - name: Push changelog to main
+        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         run: |
           git pull --rebase origin main
           git push
@@ -865,7 +886,8 @@ jobs:
           DOCS_STATUS="${{ needs.deploy-docs.result == 'success' && '✅' || '❌' }}"
           if [[ "${{ needs.publish-stable-release.result }}" == "success" ]]; then
             RELEASE_STATUS="✅"
-          elif [[ "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
+          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" != "true" &&
+                  "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
             RELEASE_STATUS="⏭️"
           else
             RELEASE_STATUS="❌"
@@ -873,7 +895,10 @@ jobs:
           FASTFORWARD_STATUS="${{ needs.fast-forward-beta.result == 'success' && '✅' || '❌' }}"
 
           # Determine overall status
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+          if [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "true" &&
+                "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
+            TITLE="## Promotion Failed ❌"
+          elif [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
             TITLE="## Promotion Failed ❌"
           elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             TITLE="## Promotion Cancelled ⚠️"
@@ -906,7 +931,8 @@ jobs:
             echo "- Release zip file for addon installation" >> $GITHUB_STEP_SUMMARY
             echo "- Release metadata (release.json)" >> $GITHUB_STEP_SUMMARY
             echo "- Changelog notes" >> $GITHUB_STEP_SUMMARY
-          elif [[ "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
+          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" != "true" &&
+                  "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
             echo "### ⏭️ Stable Release Skipped" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "No files under \`SpectrumFederation/**\` changed between main and beta." >> $GITHUB_STEP_SUMMARY
