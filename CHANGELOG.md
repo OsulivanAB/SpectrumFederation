@@ -64,6 +64,14 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [0.5.22-beta.9] - 2026-08-11
+
+### Changed
+- Merge pull request #240 from OsulivanAB/update-game-version
+
+chore: update interface version to 120100 in SpectrumFederation.toc
+
 ## [0.5.22-beta.8] - 2026-06-17
 
 ### Added
