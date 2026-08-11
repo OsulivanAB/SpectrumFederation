@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Synchronize WoW Interface and addon versions on main and beta branches.
 
@@ -17,7 +16,6 @@ import time
 from pathlib import Path
 from urllib import error, request
 
-
 PATCH_VERSIONS_URL_TEMPLATE = "https://{region}.patch.battle.net:1119/wow/versions"
 BLIZZTRACK_VERSIONS_URL = "https://blizztrack.com/view/wow?type=versions"
 BLIZZMETA_VERSIONS_URL = "https://www.blizzmeta.com/view/wow?type=versions"
@@ -32,7 +30,9 @@ MARKER_CONTEXT_TRAILING_CHARS = 320
 NEARBY_CONTEXT_CHARS = 80
 # Larger window to evaluate surrounding HTML/text for fallback scoring signals.
 SCORING_CONTEXT_CHARS = 240
-NON_RETAIL_PATTERN = re.compile(r"\b(?:%s)\b" % "|".join(re.escape(token) for token in NON_RETAIL_TOKENS))
+NON_RETAIL_PATTERN = re.compile(
+    rf"\b(?:{'|'.join(re.escape(token) for token in NON_RETAIL_TOKENS)})\b"
+)
 
 
 class VersionInfo:
@@ -85,8 +85,12 @@ def http_get_with_retries(url, *, headers=None, timeout=30, attempts=3, base_sle
         if attempt < attempts:
             time.sleep(_backoff_sleep_seconds(attempt, base_sleep=base_sleep, max_sleep=max_sleep))
 
-    if isinstance(last_error, error.HTTPError):
-        raise RuntimeError(f"HTTP {last_error.code} from {url}") from last_error
+    if last_error is None:
+        raise RuntimeError(f"Failed to reach {url}: unknown error")
+
+    code = getattr(last_error, "code", None)
+    if code is not None:
+        raise RuntimeError(f"HTTP {code} from {url}") from last_error
 
     reason = getattr(last_error, "reason", str(last_error))
     raise RuntimeError(f"Failed to reach {url}: {reason}") from last_error
@@ -234,7 +238,7 @@ def _resolve_https_fallback():
             interface_int = _validate_interface(version_to_interface(game_version))
             print(f"[resolver] Strategy B ({source_name} HTTPS fallback) succeeded")
             return game_version, interface_int, strategy_name
-        except Exception as exc:
+        except (RuntimeError, OSError, ValueError, UnicodeError) as exc:
             failures.append(f"{source_name}: {exc}")
             print(f"[resolver] Strategy B ({source_name} HTTPS fallback) failed: {exc}")
 
@@ -269,14 +273,14 @@ def resolve_live_interface(region, allow_network=True):
             game_version, interface_int = _resolve_patch_server(region)
             print(f"[resolver] Strategy A (patch server) succeeded for region '{region}'")
             return game_version, interface_int, "patch_server"
-        except Exception as exc:
+        except (RuntimeError, OSError, ValueError, UnicodeError) as exc:
             failures.append(f"Strategy A (patch server): {exc}")
             print(f"[resolver] Strategy A (patch server) failed: {exc}")
 
         try:
             game_version, interface_int, strategy_name = _resolve_https_fallback()
             return game_version, interface_int, strategy_name
-        except Exception as exc:
+        except (RuntimeError, OSError, ValueError, UnicodeError) as exc:
             failures.append(f"Strategy B (HTTPS fallback): {exc}")
             print(f"[resolver] Strategy B (HTTPS fallback) failed: {exc}")
     else:
@@ -286,7 +290,7 @@ def resolve_live_interface(region, allow_network=True):
     try:
         game_version, interface_int = _resolve_manual_override()
         return game_version, interface_int, "manual_override"
-    except Exception as exc:
+    except (RuntimeError, OSError, ValueError) as exc:
         failures.append(f"Strategy C (manual override): {exc}")
         print(f"[resolver] Strategy C (manual override) failed: {exc}")
 
@@ -395,7 +399,10 @@ def git_config(path):
 def git_commit_and_push(path, branch, toc_path, message):
     rel_toc = os.path.relpath(toc_path, path)
 
-    diff_check = subprocess.run(["git", "-C", str(path), "diff", "--quiet", "--", rel_toc])
+    diff_check = subprocess.run(
+        ["git", "-C", str(path), "diff", "--quiet", "--", rel_toc],
+        check=False,
+    )
     if diff_check.returncode == 0:
         return False
 

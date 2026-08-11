@@ -30,6 +30,7 @@ jobs:
           cache: "pip"
           cache-dependency-path: |
             .devcontainer/requirements.txt
+            .github/requirements-lint.txt
 
       - name: Install OS packages (Lua + Luarocks)
         run: |
@@ -44,12 +45,11 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r .devcontainer/requirements.txt
-          python -m pip install ruff
 
       - name: Install luacheck (Lua linter)
         run: |
           set -euxo pipefail
-          luarocks install --local luacheck
+          luarocks install --local luacheck 1.2.0-1
           echo "${HOME}/.luarocks/bin" >> "${GITHUB_PATH}"
 
       - name: Verify toolchain

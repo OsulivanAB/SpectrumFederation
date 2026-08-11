@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Test Blizzard API endpoints for game version queries.
 
@@ -22,10 +21,10 @@ Expected Response Format (unknown - to be determined):
 """
 
 import argparse
-import sys
-import urllib.request
-import urllib.error
 import os
+import sys
+import urllib.error
+import urllib.request
 
 # Endpoints provided by Gemini (to be verified)
 ENDPOINTS = {
@@ -52,7 +51,7 @@ def test_no_auth(url):
     except urllib.error.HTTPError as e:
         print(f"✗ HTTP Error: {e.code} {e.reason}")
         return False, None
-    except Exception as e:
+    except (urllib.error.URLError, OSError, UnicodeError, ValueError) as e:
         print(f"✗ Error: {e}")
         return False, None
 
@@ -75,7 +74,7 @@ def test_bearer_token(url, token):
     except urllib.error.HTTPError as e:
         print(f"✗ HTTP Error: {e.code} {e.reason}")
         return False, None
-    except Exception as e:
+    except (urllib.error.URLError, OSError, UnicodeError, ValueError) as e:
         print(f"✗ Error: {e}")
         return False, None
 
@@ -100,7 +99,7 @@ def test_api_key_header(url, api_id, api_secret):
     except urllib.error.HTTPError as e:
         print(f"✗ HTTP Error: {e.code} {e.reason}")
         return False, None
-    except Exception as e:
+    except (urllib.error.URLError, OSError, UnicodeError, ValueError) as e:
         print(f"✗ Error: {e}")
         return False, None
 
@@ -120,7 +119,7 @@ def test_api_key_query_param(url, api_id, api_secret):
     except urllib.error.HTTPError as e:
         print(f"✗ HTTP Error: {e.code} {e.reason}")
         return False, None
-    except Exception as e:
+    except (urllib.error.URLError, OSError, UnicodeError, ValueError) as e:
         print(f"✗ Error: {e}")
         return False, None
 

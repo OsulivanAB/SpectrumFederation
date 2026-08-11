@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Clean up merged feature branch after successful release.
 

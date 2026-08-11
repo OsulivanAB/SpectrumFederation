@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Blizzard API client for querying WoW game versions.
 
@@ -9,9 +8,8 @@ No authentication required - endpoints are publicly accessible.
 import argparse
 import re
 import sys
-import urllib.request
 import urllib.error
-
+import urllib.request
 
 ENDPOINTS = {
     "live": "http://us.patch.battle.net:1119/wow/versions",
@@ -119,7 +117,7 @@ def get_game_version(environment="live"):
     except urllib.error.URLError as e:
         print(f"Error: Failed to reach Blizzard API: {e.reason}", file=sys.stderr)
         return None, None
-    except Exception as e:
+    except (OSError, UnicodeError, ValueError) as e:
         print(f"Error: Unexpected error querying Blizzard API: {e}", file=sys.stderr)
         return None, None
 
