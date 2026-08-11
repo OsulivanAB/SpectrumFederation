@@ -493,12 +493,24 @@ jobs:
   merge-beta-to-main:
     name: "Merge Beta to Main"
     runs-on: ubuntu-latest
-    needs: [detect-promotion-scope, dry-run-summary, dry-run-merge-beta-to-main]
+    needs: [detect-promotion-scope, dry-run-pre-merge-validation, dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main, dry-run-deploy-docs, dry-run-publish-stable-release, dry-run-fast-forward-beta, dry-run-summary]
     if: |
-      always() &&
+      !cancelled() &&
       needs.detect-promotion-scope.result == 'success' &&
+      needs.dry-run-pre-merge-validation.result == 'success' &&
+      needs.dry-run-merge-beta-to-main.result == 'success' &&
+      needs.dry-run-update-changelog-main.result == 'success' &&
+      needs.dry-run-update-readme-main.result == 'success' &&
+      needs.dry-run-deploy-docs.result == 'success' &&
+      needs.dry-run-fast-forward-beta.result == 'success' &&
       needs.dry-run-summary.result == 'success' &&
-      needs.dry-run-merge-beta-to-main.result == 'success'
+      (
+        needs.dry-run-publish-stable-release.result == 'success' ||
+        (
+          needs.detect-promotion-scope.outputs.addon_changed != 'true' &&
+          needs.dry-run-publish-stable-release.result == 'skipped'
+        )
+      )
     outputs:
       addon_changed: ${{ needs.detect-promotion-scope.outputs.addon_changed }}
       stable_version: ${{ steps.metadata.outputs.stable_version }}
