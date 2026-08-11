@@ -109,6 +109,8 @@ jobs:
 
   check-duplicate-beta-release:
     name: Check for Duplicate Beta Release
+    needs: detect-addon-changes
+    if: needs.detect-addon-changes.outputs.addon_changed == 'true'
     runs-on: ubuntu-latest
 
     steps:
