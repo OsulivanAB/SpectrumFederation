@@ -22,6 +22,8 @@ Documentation-only changes do not require an addon version bump.
 
 `.github/workflows/pr-template-validation.yml` separately validates pull-request template completion.
 
+Both branch-validation workflows include `README.md` in their path filters so metadata-only documentation changes cannot bypass the documentation guardrails.
+
 ## Post-merge beta release
 
 `.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes `SpectrumFederation/**`.
@@ -55,6 +57,8 @@ The workflow:
 If there are no addon changes, the promotion preserves the stable version and skips stable release creation while still promoting and deploying non-addon changes.
 
 Older instructions that ask for a promotion `dry_run` input are obsolete; the workflow now always validates with its built-in dry-run phase.
+
+Both the dry-run build and the final `main` deployment call `validate_docs.py`, ensuring generated stable README badges are checked after promotion metadata is written.
 
 ## Roll back a release
 

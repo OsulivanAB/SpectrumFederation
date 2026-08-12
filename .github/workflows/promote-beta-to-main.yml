@@ -352,9 +352,9 @@ jobs:
 
       - name: Build documentation
         run: |
-          echo "Building documentation from beta branch (dry run)..."
-          mkdocs build --clean --strict
-          echo "Documentation build successful"
+          echo "Validating documentation from beta branch (dry run)..."
+          python3 .github/scripts/validate_docs.py
+          echo "Documentation validation successful"
 
       - name: Upload Pages artifact
         if: false  # Dry run - skip upload
@@ -782,9 +782,9 @@ jobs:
 
       - name: Build documentation
         run: |
-          echo "Building documentation from main branch..."
-          mkdocs build --clean --strict
-          echo "Documentation build successful"
+          echo "Validating documentation from main branch..."
+          python3 .github/scripts/validate_docs.py
+          echo "Documentation validation successful"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

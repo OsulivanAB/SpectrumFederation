@@ -187,22 +187,15 @@ def validate_readme_badges(repo_root):
 
 def validate_slash_command_reference(repo_root):
     """Require every registered command and diagnostic alias in the reference."""
-    slash_sources = [
-        repo_root / "SpectrumFederation/modules/SlashCommands.lua",
-        repo_root / "SpectrumFederation/SpectrumFederation.lua",
-    ]
+    addon_root = repo_root / "SpectrumFederation"
     commands = set()
-    for source in slash_sources:
+    aliases = set()
+    for source in addon_root.rglob("*.lua"):
+        source_text = source.read_text(encoding="utf-8")
         commands.update(
-            REGISTERED_COMMAND_RE.findall(source.read_text(encoding="utf-8"))
+            REGISTERED_COMMAND_RE.findall(source_text)
         )
-
-    debug_source = (
-        repo_root / "SpectrumFederation/modules/LootHelperSync/17_DebugSlash.lua"
-    )
-    aliases = set(
-        SLASH_ALIAS_RE.findall(debug_source.read_text(encoding="utf-8"))
-    )
+        aliases.update(SLASH_ALIAS_RE.findall(source_text))
     reference = (
         repo_root / "docs/reference/slash-commands.md"
     ).read_text(encoding="utf-8").lower()
