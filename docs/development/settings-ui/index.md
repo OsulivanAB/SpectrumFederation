@@ -45,7 +45,7 @@ SF.SettingsStore:RegisterCallback("global.exampleEnabled", function(newValue, ol
 end)
 ```
 
-The callback API is path-first. Older documentation that shows an arbitrary callback ID or `SF.Settings.Store` does not match the current implementation.
+The callback API is path-first. Older documentation that shows an arbitrary callback ID or the legacy namespaced Store form does not match the current implementation.
 
 ## Add a page
 

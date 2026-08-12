@@ -5,14 +5,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 STALE_PATTERNS = {
     r"/sfdebug\b": "Use '/sf debug', not the removed '/sfdebug' command.",
     r"\bSF\.Settings\.(?:Store|Schema|Apply|Registry)\b": (
         "Use the current SF.SettingsStore/SF.SettingsSchema/SF.SettingsApply/SF.SettingsUI APIs."
     ),
     r"\bPages/Main\.lua\b": "The current general settings page is Pages/General.lua.",
-    r"\bmodules/(?:Core|LootProfiles|settings_ui)\.lua\b": (
+    r"\bmodules/(?:(?-i:Core)|LootProfiles|settings_ui)\.lua\b": (
         "This references a removed or incorrectly-cased addon module."
     ),
     r"\blinter\.ya?ml\b": "There is no standalone linter workflow.",
