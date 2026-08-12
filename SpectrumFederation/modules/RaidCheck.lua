@@ -7,7 +7,7 @@ local addonName, SF = ...
 -- luacheck: globals GetInventoryItemID
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
--- luacheck: globals InspectFrame InspectUnit hooksecurefunc
+-- luacheck: globals InspectFrame InspectUnit hooksecurefunc canaccessvalue
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -397,6 +397,10 @@ local function IsSlotEnabledInConfig(cfg, slotKey, link)
 	return cfg.slots[configKey] and true or false
 end
 
+local function CanAccessValue(value)
+	return not canaccessvalue or canaccessvalue(value)
+end
+
 local function IsSelfUnit(unit)
 	if not unit then
 		return false
@@ -406,12 +410,12 @@ local function IsSelfUnit(unit)
 		return true
 	end
 
-	if UnitGUID then
-		local playerGUID = UnitGUID("player")
-		local unitGUID = UnitGUID(unit)
-		if playerGUID and unitGUID and unitGUID == playerGUID then
-			return true
+	if UnitIsUnit then
+		local isSelf = UnitIsUnit(unit, "player")
+		if not CanAccessValue(isSelf) then
+			return false
 		end
+		return isSelf and true or false
 	end
 
 	return false
@@ -733,9 +737,12 @@ local function BuildSavedSnapshotMessage(snapshot, whileRefreshing)
 end
 
 local function FindUnitByGuidOrId(guid, id)
-	for _, unit in ipairs(CollectUnits()) do
-		if guid and UnitGUID and UnitGUID(unit) == guid then
-			return unit
+	if UnitGUID and CanAccessValue(guid) and guid then
+		for _, unit in ipairs(CollectUnits()) do
+			local unitGUID = UnitGUID(unit)
+			if CanAccessValue(unitGUID) and unitGUID and unitGUID == guid then
+				return unit
+			end
 		end
 	end
 
@@ -1003,9 +1010,15 @@ function RC:_GetInspectAliases(unit, info)
 	local guid = UnitGUID and UnitGUID(unit) or nil
 	local id = info and info.id or nil
 
+	if not CanAccessValue(guid) then
+		guid = nil
+	end
+
 	if not id and unit and UnitFullName then
 		local name, realm = UnitFullName(unit)
-		id = NormalizeNameRealm(name, realm)
+		if CanAccessValue(name) and CanAccessValue(realm) then
+			id = NormalizeNameRealm(name, realm)
+		end
 	end
 
 	if guid and guid ~= "" then

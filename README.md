@@ -1,7 +1,7 @@
 <!-- STATUS_BADGES_START -->
 ![Interface](https://img.shields.io/badge/Interface-120100-00aaff)
 ![Track](https://img.shields.io/badge/Track-Retail-ff8800)
-![Addon Version](https://img.shields.io/badge/Version-1.0.0-brightgreen)
+![Addon Version](https://img.shields.io/badge/Version-1.0.1-brightgreen)
 
 <!-- STATUS_BADGES_END -->
 
