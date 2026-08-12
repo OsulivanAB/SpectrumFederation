@@ -68,12 +68,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [1.0.1-beta.1] - 2026-08-12
 
-### Fixed
-- Merge pull request #245 from OsulivanAB/cursor/fix-raidcheck-secret-guid-168a
+## [1.0.1] - 2026-08-12
 
-Fix Raid Check secret unit identity errors
+### Changed
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [1.0.0] - 2026-08-11
 
