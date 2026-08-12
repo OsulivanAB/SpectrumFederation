@@ -1,25 +1,25 @@
 # Spectrum Federation
 
-![Addon Banner](assets/readme/SpectrumFederation.jpg)
+Spectrum Federation is a World of Warcraft Retail addon for coordinating guild raid loot. It keeps shared loot profiles, member point balances, equipment-slot history, raid-readiness checks, and profile changes in one place.
 
-World of Warcraft addon for the Spectrum Federation guild on Garona.
+## What the addon provides
 
-## About Us
+- **Loot Helper** — a raid roster window where profile admins manage points, add raid members, and record which equipment categories a member has used.
+- **Loot profiles** — separate, named sets of members, admins, point rules, Raid Check options, and history.
+- **Sync sessions** — group-wide profile and log synchronization, with automatic catch-up for late joiners and clients that missed updates.
+- **Raid Check** — configurable enchant and gem checks, optional whispers, and point awards for prepared profile members.
+- **Loot Logs** — a filterable history of point, equipment, profile, safe-mode, admin, and main-swap changes.
+- **Gameplay settings** — per-specialization control of WoW's Press and Hold Casting option.
 
-Spectrum Phoenix (Alliance) and Spectrum Rage (Horde) were forged from the collective desire of LGBTQIA (Lesbian, Gay, Bisexual, Transgender, Queer, Intersex, Asexual) WoW players, and their friends, to find a guild free of the bigotry and intolerance that seems to reign free elsewhere in the game, as it does in the real world. Being around since WoW vanilla, Spectrum Phoenix and Spectrum Rage grew steadily as prospective members discovered the existence of our family.
+[Install and get started](getting-started.md){ .md-button .md-button--primary }
+[Open the feature guides](features/loot-helper.md){ .md-button }
 
-In Dragonflight, with Blizzard lowering the barriers between Horde and Alliance, Phoenix and Rage merged to become the cross-faction guild Spectrum Federation.
+## Who can change shared data?
 
-The reason for our guild's existence is simple: To provide a fun, friendly and supportive atmosphere for LGBTQIA players and their allies to game in and be themselves without fear of prejudice or homophobia. We consider ourselves a casual guild, though many of our members enjoy raiding, mythic+ and PvP as well.
+Everyone with the addon can view the active profile. Profile admins can change points and equipment history, manage profile settings and admins, run Raid Checks, and coordinate sync sessions. The profile creator is its initial owner and admin.
 
-## Becoming a Member
+## About Spectrum Federation
 
-Interested in becoming a member? Check out our [Discord server](https://discordapp.com/channels/222059618426159104/1361029940325126457/1373328232878833665) which has more information on how to join our guild family.
+Spectrum Federation is a cross-faction guild on Garona formed from Spectrum Phoenix and Spectrum Rage. The guild provides a friendly, supportive home for LGBTQIA players and allies across casual play, raiding, Mythic+, and PvP.
 
-## Features
-
-/// under-construction | Documentation In Progress
-We're actively building comprehensive documentation for all addon features. Check back soon for detailed guides and tutorials!
-
-///
-Test change
+For guild membership information, visit the Spectrum Federation Discord.

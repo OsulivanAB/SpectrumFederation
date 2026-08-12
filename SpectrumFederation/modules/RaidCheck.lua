@@ -7,7 +7,7 @@ local addonName, SF = ...
 -- luacheck: globals GetInventoryItemID
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
--- luacheck: globals InspectFrame InspectUnit hooksecurefunc
+-- luacheck: globals InspectFrame InspectUnit hooksecurefunc canaccessvalue
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -46,6 +46,22 @@ local function CalculateInspectRetryDelay(failCount)
 	return math.min(INSPECT_RETRY_MAX_SECONDS, INSPECT_RETRY_BASE_SECONDS * attempts)
 end
 
+local function CanAccessValue(value)
+	return not canaccessvalue or canaccessvalue(value)
+end
+
+local function GetAccessibleUnitGUID(unit)
+	if not UnitGUID then
+		return nil
+	end
+
+	local guid = UnitGUID(unit)
+	if not CanAccessValue(guid) then
+		return nil
+	end
+	return guid
+end
+
 local TROUBLESHOOTING_COLUMNS = {
 	{ key = "head", label = "Head", shortLabel = "Hd", inventorySlot = INVSLOT_HEAD },
 	{ key = "neck", label = "Neck", shortLabel = "Nk", inventorySlot = INVSLOT_NECK },
@@ -66,8 +82,14 @@ local TROUBLESHOOTING_COLUMNS = {
 }
 
 local function NormalizeNameRealm(name, realm)
+	if not CanAccessValue(name) or not CanAccessValue(realm) then
+		return nil
+	end
 	if not name or name == "" then return nil end
 	realm = realm or GetRealmName()
+	if not CanAccessValue(realm) then
+		return nil
+	end
 	if realm then realm = realm:gsub("%s+", "") end
 	local full = realm and (name .. "-" .. realm) or name
 	if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
@@ -406,12 +428,12 @@ local function IsSelfUnit(unit)
 		return true
 	end
 
-	if UnitGUID then
-		local playerGUID = UnitGUID("player")
-		local unitGUID = UnitGUID(unit)
-		if playerGUID and unitGUID and unitGUID == playerGUID then
-			return true
+	if UnitIsUnit then
+		local isSelf = UnitIsUnit(unit, "player")
+		if not CanAccessValue(isSelf) then
+			return false
 		end
+		return isSelf and true or false
 	end
 
 	return false
@@ -733,9 +755,19 @@ local function BuildSavedSnapshotMessage(snapshot, whileRefreshing)
 end
 
 local function FindUnitByGuidOrId(guid, id)
-	for _, unit in ipairs(CollectUnits()) do
-		if guid and UnitGUID and UnitGUID(unit) == guid then
-			return unit
+	if not CanAccessValue(guid) then
+		guid = nil
+	end
+	if not CanAccessValue(id) then
+		id = nil
+	end
+
+	if guid then
+		for _, unit in ipairs(CollectUnits()) do
+			local unitGUID = GetAccessibleUnitGUID(unit)
+			if unitGUID and unitGUID == guid then
+				return unit
+			end
 		end
 	end
 
@@ -1000,12 +1032,18 @@ end
 
 function RC:_GetInspectAliases(unit, info)
 	local aliases = {}
-	local guid = UnitGUID and UnitGUID(unit) or nil
+	local guid = GetAccessibleUnitGUID(unit)
 	local id = info and info.id or nil
+
+	if not CanAccessValue(id) then
+		id = nil
+	end
 
 	if not id and unit and UnitFullName then
 		local name, realm = UnitFullName(unit)
-		id = NormalizeNameRealm(name, realm)
+		if CanAccessValue(name) and CanAccessValue(realm) then
+			id = NormalizeNameRealm(name, realm)
+		end
 	end
 
 	if guid and guid ~= "" then
@@ -1315,6 +1353,12 @@ function RC:_HandleInspectReady(guid)
 	if not active then
 		return
 	end
+	if not CanAccessValue(guid) then
+		guid = nil
+	end
+	if not CanAccessValue(active.guid) then
+		active.guid = nil
+	end
 	if guid and active.guid and guid ~= active.guid then
 		return
 	end
@@ -1431,7 +1475,7 @@ function RC:_ProcessInspectQueue()
 			local now = GetTime and GetTime() or 0
 			state.active = {
 				key = item.key,
-				guid = item.guid or (UnitGUID and UnitGUID(unit)) or nil,
+				guid = (CanAccessValue(item.guid) and item.guid) or GetAccessibleUnitGUID(unit),
 				id = item.id,
 				aliases = item.aliases,
 				unit = unit,

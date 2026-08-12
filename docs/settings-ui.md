@@ -1,236 +1,98 @@
-# Settings UI
+# Settings and Gameplay
 
-The Settings UI provides a modern, declarative framework for managing addon configuration. It features a data-driven architecture with automatic state management, validation, and reactive updates.
+Enter `/sf` to toggle Spectrum Federation's standalone settings window. Changes are saved immediately; there is no Apply button.
 
-## Features
+## General
 
-**Declarative Page Definitions**
+**Window Style**
 
-- Define settings pages as data structures, not imperative code
-- Automatic control creation from specifications
-- Conditional visibility and section management
+Choose **Default**, **Compact**, or **Minimal** for the Loot Helper window.
 
-**13+ Control Types**
+**Font Style**
 
-- Checkboxes, sliders, dropdowns, editboxes, buttons
-- Read-only displays, help text, spacers
-- Composite controls (dropdown + icon button, editbox + button)
-- Scrollable lists with custom item templates
-- Scrollable text boxes for logs and large content
+Choose **Friz Quadrata**, **Arial Narrow**, or **Morpheus** for the Loot Helper title and roster.
 
-**Smart State Management**
+**Font Size**
 
-- Path-based storage with dot notation (e.g., `"global.fontSize"`)
-- Automatic binding between controls and settings
-- Callback system for reactive updates
-- Profile-specific settings isolation
+Set Loot Helper title and roster text between 8 and 20 points.
 
-**Combat-aware Operations**
+These appearance settings do not currently restyle the standalone settings window or every addon surface.
 
-- Queues UI operations during combat
-- Automatic execution when safe
-- Prevents frame errors during encounters
+## Gameplay
 
-**Flexible Schema**
+### Press and Hold Casting
 
-- Version migrations for data structure changes
-- Validation system for user input
-- Deep merge of defaults with user data
+The Gameplay page lists every specialization for the current character. Enable a specialization to turn WoW's Press and Hold Casting CVar on automatically while that specialization is active; disable it to turn the CVar off.
 
-## Quick Example
+This preference is saved per character and per specialization. The addon:
 
-```lua
--- Define a settings page
-{
-    {
-        type = "section",
-        title = "General Settings",
-        controls = {
-            {
-                type = "checkbox",
-                label = "Enable Feature",
-                path = "myFeature.enabled",
-                tooltip = "Enable or disable this feature"
-            },
-            {
-                type = "slider",
-                label = "Intensity",
-                path = "myFeature.intensity",
-                min = 0,
-                max = 100,
-                step = 5,
-                format = "%d%%"
-            }
-        }
-    }
-}
-```
+- initializes missing specialization choices from the character's current CVar;
+- reapplies the selected value after login or UI reload;
+- reapplies it when the active specialization changes;
+- defers the CVar update until combat ends when necessary.
 
-That's it! The system automatically:
+Because this controls a shared WoW CVar, changing it elsewhere may be overwritten the next time Spectrum Federation reapplies the selected specialization preference.
 
-- Creates the UI controls
-- Binds them to settings storage
-- Saves changes immediately
-- Triggers reactive updates
-- Handles combat lockdown
+## Loot Helper: General
 
-## Architecture
+- **Enable LootHelper** — show or hide the roster window when its other visibility conditions are met. Sync and Raid Check still initialize and remain available.
+- **Lock Loot Window** — prevent moving and resizing the Loot Helper window.
+- **Show Members not in raid** — include profile members who are absent from the current raid.
+- **Show Loot Window outside of Raid** — allow the roster window while solo or in a party.
+- **Enable Local Safemode** — save the intended local safe-mode preference.
+- **Enable Local Safemode on Combat** — save the intended combat preference.
+- **Reset All LootHelper Settings** — delete every local profile and clear the active profile selection.
 
-The Settings UI system is organized into two main layers:
+The two local safe-mode controls are not currently connected to the synchronization runtime and do not pause transfers. The reset action is destructive and requires confirmation; despite its label, it does not restore every Loot Helper option.
 
-### Data Layer
+## Loot Helper: Profile
 
-**Schema** - Defines default values, enums, and version migrations
+This page selects and manages the active profile. It includes:
 
-**Store** - Path-based storage with callbacks and profile management
+- profile creation, selection, rename, reset, and deletion;
+- profile owner and point-name display;
+- Raid Check point, gem, meta-gem, and enchant requirements.
 
-**Apply** - Reactive effects that respond to setting changes (debounced and combat-aware)
+Rename and profile-specific configuration are admin-only. Creating a profile makes the creator its owner and first admin.
 
-### UI Layer
+**Reset Current Profile** is currently a nonfunctional placeholder and reports that it is not implemented.
 
-**Registry** - Page registration and lifecycle management
+## Loot Helper: Session
 
-**PageBuilder** - Layout engine for scrollable pages with sections
+This page includes:
 
-**DefinitionRenderer** - Converts declarative page definitions into UI controls
+- start/end session control;
+- saved raid-wide safe-mode preferences for all-the-time or combat use;
+- Pre-Raid Check and Raid Check actions;
+- optional whispers for missing and prepared players;
+- editable whisper templates.
 
-**Controls** - 14+ control types with automatic state binding
+The two raid-wide safe-mode preferences are not currently connected to the runtime session safe-mode API. They persist on the profile but do not pause session transfers.
 
-**Dialogs** - Modal confirmation and prompt dialogs
+The visible **Trigger Raid-Wide Sync** control is currently a placeholder. It does not initiate a sync; use `/sf loot sync` on the client that needs to catch up.
 
-**Pages** - Declarative page definitions (Main, LootHelper, LootLogs, Debugging)
+## Loot Helper: Equipment
 
-## Documentation
+The Equipment page displays the current Raid Check inspection snapshot. Auto refresh is off by default; enable it or select **Refresh Snapshot** when you need current data.
 
-For detailed information, see the developer documentation:
+See [Raid Check](features/raid-check.md) for interpretation and inspection limitations.
 
-- **[Architecture Overview](development/settings-ui/index.md)** - System architecture and key concepts
-- **[Data Layer](development/settings-ui/data-layer.md)** - Schema, Store, and Apply modules
-- **[UI Layer](development/settings-ui/ui-layer.md)** - Registry, PageBuilder, and DefinitionRenderer
-- **[Controls Reference](development/settings-ui/controls.md)** - Available control types and usage
-- **[Creating Pages](development/settings-ui/creating-pages.md)** - Guide to adding new settings pages
-- **[Best Practices](development/settings-ui/best-practices.md)** - Design patterns and conventions
+## Loot Helper: Admin
 
-## Getting Started
+Profile admins can add profile members as admins, remove admins other than the owner, and run **Transfer Points / Main Swap**.
 
-### Accessing Settings
+The owner cannot be removed from the admin list through this page.
 
-In-game, you can access settings via:
+## Loot Logs
 
-- **Slash Command**: `/sf`
-- **Escape Menu**: ESC → Interface → AddOns → Spectrum Federation
+Filter the active profile's history by event type, author, or member. These filters are temporary UI state and are not saved.
 
-### Adding a New Setting
+## Debugging
 
-1. **Define the default in Schema**:
+Start or stop diagnostic logging, filter the viewer by level, copy log text, or clear the diagnostic log. Debug data is separate from Loot Logs.
 
-```lua
--- modules/Settings/Schema.lua
-DEFAULTS = {
-    myFeature = {
-        enabled = false
-    }
-}
-```
+Use debugging while investigating a problem; verbose logs can be noisy. The database retains at most 500 diagnostic entries.
 
-2. **Add to a page**:
+## For contributors
 
-```lua
--- modules/UI/Settings/Pages/MyFeature.lua
-{
-    type = "checkbox",
-    label = "Enable My Feature",
-    path = "myFeature.enabled"
-}
-```
-
-3. **Access the setting**:
-
-```lua
-local enabled = SF.Settings.Store:Get("myFeature.enabled")
-```
-
-That's all you need! The setting will automatically save to SavedVariables and persist across sessions.
-
-## Current Pages
-
-### Main Settings
-
-Global addon configuration:
-
-- Window style (Blizzard vs. Custom)
-- Font family and size
-- General addon preferences
-
-### LootHelper Settings
-
-LootHelper system configuration:
-
-- Enable/disable LootHelper
-- Profile management (create, rename, delete, import/export)
-- Active profile selection
-- Admin management (view admins, add/remove)
-- Member management (view members)
-- Raid-wide safe mode toggle
-
-### Loot Logs
-
-View and filter loot profile logs:
-
-- Filter by log type (PROFILE_CREATION, POINT_CHANGE, ARMOR_CHANGE, ROLE_CHANGE)
-- Filter by author (who created the log)
-- Filter by member (who was affected by the log)
-- Scrollable log display with timestamps and details
-
-### Debugging
-
-Debug logging controls and viewer:
-
-- Start/Stop debugging
-- Filter by log level (VERBOSE, INFO, WARN, ERROR)
-- Scrollable log viewer with copyable text
-- Clear logs functionality
-
-/// note | Work in Progress
-The Settings UI is functional but some features are still under development:
-
-- Import/Export functionality (UI present, backend pending)
-- Admin management (add/remove admins)
-- Full member management interface
-
-Check the [GitHub project](https://github.com/users/OsulivanAB/projects/1) for current status.
-
-///
-
-## Integration
-
-The Settings UI integrates with:
-
-- **LootHelper** - Profile management and safe mode settings
-- **Debug System** - All operations logged with appropriate levels
-- **WoW API** - Blizzard Settings API for native integration
-- **SavedVariables** - Persistent storage across sessions
-
-## Performance
-
-The Settings UI is designed for performance:
-
-- **Lazy building** - Pages built only when first opened
-- **Debounced updates** - Rapid changes coalesced into single operations
-- **Combat queueing** - UI operations deferred during combat
-- **Efficient rendering** - Conditional visibility skips hidden controls
-- **Cached computations** - Expensive operations cached and reused
-
-## Developer Resources
-
-For contributors working on the Settings UI:
-
-- Read the [Architecture Overview](development/settings-ui/index.md) to understand the system design
-- Review [Best Practices](development/settings-ui/best-practices.md) for coding standards
-- Follow the [Creating Pages](development/settings-ui/creating-pages.md) guide when adding features
-- Use the [Controls Reference](development/settings-ui/controls.md) to choose appropriate control types
-- Check the [Data Layer](development/settings-ui/data-layer.md) docs for state management patterns
-
-## Feedback
-
-Encounter issues or have suggestions? Please report them on our [GitHub Issues](https://github.com/OsulivanAB/SpectrumFederation/issues) page.
+Implementation and extension guidance lives in [Settings System](development/settings-ui/index.md).

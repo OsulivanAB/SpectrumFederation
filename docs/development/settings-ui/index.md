@@ -1,196 +1,129 @@
-# Settings UI Architecture
+# Settings System
 
-The Settings UI system is a comprehensive, declarative framework for managing addon configuration. It provides a data-driven approach to building settings pages with automatic state management, validation, and reactive updates.
+The settings implementation separates persistence, runtime effects, page registration, and rendering. User-facing option descriptions belong on [Settings and Gameplay](../../settings-ui.md); this page describes how to extend the system.
 
-## Overview
+## Components
 
-The Settings UI system consists of two main layers:
+| File | Role |
+| --- | --- |
+| `modules/Settings/Schema.lua` | Account-wide and character defaults, enums, and migrations. |
+| `modules/Settings/Store.lua` | Dot-path reads/writes, callbacks, resets, profile adapters, and per-character storage. |
+| `modules/Settings/Apply.lua` | Debouncing, combat deferral, CVar automation, and feature reactions. |
+| `modules/UI/Settings/Registry.lua` | Page metadata and registration. Blizzard Settings registration is currently disabled. |
+| `modules/UI/Settings/StandaloneWindow.lua` | The `/sf` window, grouped navigation, page lifecycle, and selected page. |
+| `modules/UI/Settings/PageBuilder.lua` | Scroll hosts, sections, sizing, refresh, and reflow. |
+| `modules/UI/Settings/DefinitionRenderer.lua` | Declarative section/control definitions and refresh bindings. |
+| `modules/UI/Settings/Control/Controls.lua` | Concrete control builders. |
+| `modules/UI/Settings/Dialogs.lua` | Confirmation, prompt, and Main Swap dialogs. |
+| `modules/UI/Settings/Pages/` | Registered user-facing pages. |
 
-**Data Layer**
+## Add a persisted setting
 
-- **Schema** - Defines default values, enums, and version migrations
-- **Store** - Path-based storage with callbacks and profile management
-- **Apply** - Reactive effects that respond to setting changes (debounced and combat-aware)
-
-**UI Layer**
-
-- **Registry** - Page registration and lifecycle management
-- **PageBuilder** - Layout engine for scrollable pages with sections
-- **DefinitionRenderer** - Converts declarative page definitions into UI controls
-- **Controls** - 13+ control types with automatic state binding
-- **Dialogs** - Modal confirmation and prompt dialogs
-- **Pages** - Declarative page definitions (Main, LootHelper)
-
-## Architecture Diagram
-
-```mermaid
-graph TB
-    subgraph "UI Layer"
-        Registry[Registry.lua<br/>Page Registration]
-        PageBuilder[PageBuilder.lua<br/>Layout Engine]
-        DefinitionRenderer[DefinitionRenderer.lua<br/>Control Factory]
-        Controls[Controls.lua<br/>13+ Control Types]
-        Dialogs[Dialogs.lua<br/>Modal Dialogs]
-        Pages[Pages/<br/>Page Definitions]
-    end
-    
-    subgraph "Data Layer"
-        Schema[Schema.lua<br/>Defaults & Migrations]
-        Store[Store.lua<br/>Path-based Storage]
-        Apply[Apply.lua<br/>Reactive Effects]
-    end
-    
-    subgraph "Integration"
-        LootHelper[LootHelper System]
-        Debug[Debug System]
-        WoWAPI[WoW UI API]
-    end
-    
-    Pages --> Registry
-    Registry --> PageBuilder
-    PageBuilder --> DefinitionRenderer
-    DefinitionRenderer --> Controls
-    Controls --> Store
-    Store --> Apply
-    Schema --> Store
-    Apply --> LootHelper
-    Apply --> WoWAPI
-    Controls --> Dialogs
-    Registry --> Debug
-    Store --> Debug
-    Apply --> Debug
-    
-    style Schema fill:#e1f5ff
-    style Store fill:#e1f5ff
-    style Apply fill:#e1f5ff
-    style Registry fill:#fff4e1
-    style PageBuilder fill:#fff4e1
-    style DefinitionRenderer fill:#fff4e1
-    style Controls fill:#fff4e1
-```
-
-## Key Features
-
-**Declarative UI**
-
-- Pages defined as data structures, not imperative code
-- Automatic control creation from specifications
-- Conditional visibility and section management
-
-**Path-based Storage**
-
-- Dot notation access (e.g., `"global.fontSize"`)
-- Flexible schema evolution
-- Profile-specific settings support
-
-**Combat-aware Operations**
-
-- Queues apply operations during combat
-- Automatic execution when combat ends
-- Prevents UI errors during encounters
-
-**Reactive Updates**
-
-- Callbacks trigger on setting changes
-- Debounced effects reduce redundant operations
-- Automatic UI refresh on state changes
-
-**Profile Management**
-
-- ID-based profile storage
-- Active profile tracking
-- Profile-specific settings isolation
-
-## Quick Start
-
-### Adding a New Setting
-
-1. **Define the setting in Schema**:
+1. Add an account-wide default to `SettingsSchema.DEFAULTS`, or a per-character default to `CHARACTER_DEFAULTS`.
+2. Read and write it through `SF.SettingsStore`.
+3. Add the control to the appropriate page.
+4. Register any runtime reaction in the owning feature or `SettingsApply`.
+5. Add a migration only when existing saved data must change shape.
+6. Document the visible behavior on the user settings page.
 
 ```lua
--- modules/Settings/Schema.lua
-DEFAULTS = {
-    global = {
-        myNewSetting = true
-    }
+-- Schema.lua
+global = {
+    exampleEnabled = false,
 }
+
+-- Feature code
+local enabled = SF.SettingsStore:Get("global.exampleEnabled")
+SF.SettingsStore:Set("global.exampleEnabled", true)
 ```
 
-2. **Add to a page definition**:
+`Store:Set(path, value)` writes immediately and fires callbacks registered for that exact path:
 
 ```lua
--- modules/UI/Settings/Pages/Main.lua
-{
-    type = "checkbox",
-    label = "My New Setting",
-    path = "global.myNewSetting",
-    tooltip = "Description of what this does"
-}
-```
-
-3. **Access the setting**:
-
-```lua
-local value = SF.Settings.Store:Get("global.myNewSetting")
-SF.Settings.Store:Set("global.myNewSetting", false)
-```
-
-### Reacting to Setting Changes
-
-```lua
-SF.Settings.Apply:RegisterCallback("myFeature", function(newValue, oldValue, path)
-    if path == "global.myNewSetting" then
-        -- React to the change
-        UpdateMyFeature(newValue)
-    end
+SF.SettingsStore:RegisterCallback("global.exampleEnabled", function(newValue, oldValue, path)
+    -- Keep this callback small; defer protected or repeated work as needed.
 end)
 ```
 
-## Documentation Sections
+The callback API is path-first. Older documentation that shows an arbitrary callback ID or the legacy namespaced Store form does not match the current implementation.
 
-For detailed information about each component:
+## Add a page
 
-- **[Data Layer](data-layer.md)** - Schema, Store, and Apply modules
-- **[UI Layer](ui-layer.md)** - Registry, PageBuilder, and DefinitionRenderer
-- **[Controls](controls.md)** - Available control types and usage
-- **[Creating Pages](creating-pages.md)** - Guide to adding new settings pages
-- **[Best Practices](best-practices.md)** - Design patterns and conventions
+A page is an object with metadata plus `Build` and optional `Refresh` methods:
 
-## Integration Points
+```lua
+local Page = {
+    id = "example",
+    name = "Example",
+    navLabel = "Example",
+    group = "Core",
+    description = "Configure the example feature.",
+    order = 25,
+}
 
-The Settings UI integrates with:
+function Page:Build(panel)
+    SF.SettingsUI.DefinitionRenderer:Build(panel, {
+        sections = {
+            {
+                id = "general",
+                title = "General",
+                items = {
+                    {
+                        type = "checkbox",
+                        label = "Enable Example",
+                        tooltip = "Turn the example feature on or off.",
+                        path = "global.exampleEnabled",
+                    },
+                },
+            },
+        },
+    })
+end
 
-- **LootHelper** - Profile management and safe mode settings
-- **Debug System** - All operations logged with appropriate levels
-- **WoW API** - Blizzard Settings API for native integration
-- **WoW Classes** - Class color codes for admin lists
+function Page:Refresh(panel)
+    SF.SettingsUI.DefinitionRenderer:Refresh(panel)
+end
 
-## File Structure
-
+SF.SettingsUI:RegisterPage(Page)
 ```
-SpectrumFederation/modules/
-├── Settings/
-│   ├── Schema.lua          # Defaults, enums, migrations
-│   ├── Store.lua           # Storage with callbacks
-│   └── Apply.lua           # Reactive effects
-└── UI/Settings/
-    ├── Registry.lua        # Page registration
-    ├── PageBuilder.lua     # Layout engine
-    ├── DefinitionRenderer.lua  # Control factory
-    ├── Dialogs.lua         # Modal dialogs
-    ├── Style.lua           # UI constants
-    ├── Control/
-    │   └── Controls.lua    # Control implementations
-    ├── Pages/
-    │   ├── Main.lua        # Main settings page
-    │   └── LootHelper.lua  # LootHelper page
-    └── Widgets/
-        └── Section.lua     # Section containers
-```
 
-## Next Steps
+Add the page file to `SpectrumFederation.toc` after the registry, renderer, and controls and before initialization.
 
-- Read the [Data Layer](data-layer.md) documentation to understand state management
-- Learn about [Controls](controls.md) to see available UI components
-- Follow the [Creating Pages](creating-pages.md) guide to add new settings pages
-- Review [Best Practices](best-practices.md) for design patterns
+Use `parentId` and `defaultChildId` for nested navigation. Loot Helper is the current example. Keep `id` stable because other modules can open pages with `SF.SettingsWindow:ShowPage(id)`.
+
+## Declarative controls
+
+`DefinitionRenderer` currently supports:
+
+- text, heading, title divider, spacer, help, and key/value box;
+- checkbox, checkbox row/grid, slider, dropdown, display, and edit box;
+- buttons, button rows, inline controls, edit-box/button, and dropdown/icon-button composites;
+- scroll list, scrollable text, log table, and template editor.
+
+Prefer a `path` for ordinary persisted values. Use custom `get`/`set` functions for profile methods, validation, computed state, or temporary panel state.
+
+Common dynamic fields include `visible`, `enabled`, and `adminOnly`. `adminOnly` disables presentation for non-admins, but domain methods must still enforce permission checks.
+
+Callbacks receive a context containing `panel`, `section`, `store`, `schema`, `ui`, and `pageBuilder`. Use it to show section messages and refresh/reflow after structural changes.
+
+## Profile settings
+
+Loot profiles are domain objects, not ordinary schema subtrees. The Store methods under `GetActiveLootHelperProfileObject`, `CreateLootHelperProfile`, admin management, rename, reset, and Main Swap adapt settings pages to `LootProfile` methods.
+
+Do not add profile-authoritative data only to `SettingsSchema.PROFILE_SETTINGS_DEFAULTS`; define it on `LootProfile`, include it in snapshots when synchronization requires it, and expose validated getters/setters.
+
+## Combat and CVar work
+
+Use `SettingsApply:Debounce(token, delay, fn)` for rapid repeated changes and `RunOrDefer(fn)` for work that must wait until combat ends.
+
+Press and Hold Casting is the complete character-setting example: Store maintains a specialization-keyed table, Apply listens for login/world/spec events, and the Gameplay page renders one checkbox per specialization.
+
+## Review checklist
+
+- Defaults and migrations preserve existing SavedVariables.
+- Page and setting IDs remain stable.
+- Runtime behavior changes when the setting changes.
+- The selected write path enforces permissions independently of UI state; add an explicit check when a low-level mutator does not.
+- Tooltips explain user behavior, not implementation.
+- `/reload`, specialization changes, and combat deferral are tested where relevant.
+- New Lua files appear in TOC load order and the addon version is bumped.
