@@ -286,10 +286,10 @@ jobs:
     needs: [dry-run-merge-beta-to-main, dry-run-update-changelog-main]
 
     steps:
-      - name: Checkout main branch
+      - name: Checkout beta branch
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: beta  # Actual promotion explicitly takes README.md from beta
           token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Update README badges
