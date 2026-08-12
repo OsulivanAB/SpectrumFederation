@@ -6,15 +6,17 @@ Enter `/sf` to toggle Spectrum Federation's standalone settings window. Changes 
 
 **Window Style**
 
-Choose **Default**, **Compact**, or **Minimal** for supported Spectrum Federation windows.
+Choose **Default**, **Compact**, or **Minimal** for the Loot Helper window.
 
 **Font Style**
 
-Choose **Friz Quadrata**, **Arial Narrow**, or **Morpheus**.
+Choose **Friz Quadrata**, **Arial Narrow**, or **Morpheus** for the Loot Helper title and roster.
 
 **Font Size**
 
-Set addon text between 8 and 20 points.
+Set Loot Helper title and roster text between 8 and 20 points.
+
+These appearance settings do not currently restyle the standalone settings window or every addon surface.
 
 ## Gameplay
 

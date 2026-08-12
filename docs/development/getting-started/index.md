@@ -15,7 +15,7 @@ SpectrumFederation/
     UI/Settings/               standalone settings framework and pages
     UI/LootHelper/             roster and equipment windows
     RaidCheck.lua              inspection, preparation checks, and awards
-  locale/                      user-facing strings
+  locale/                      early localization work (not currently loaded by the TOC)
 .github/scripts/               validation and release helpers
 .github/workflows/             PR, beta, promotion, and rollback automation
 assets/                        standalone Google Sheet sync utility
@@ -59,6 +59,8 @@ Addon behavior or UI changes require a new version in `SpectrumFederation.toc`; 
 - Normalize character identifiers through `NameUtil` rather than comparing raw names.
 - Guard protected UI work during combat and prefer `hooksecurefunc` over replacing Blizzard functions.
 - Follow nearby code for naming. Existing persisted keys use both legacy camelCase and newer stable keys, so migrations matter more than cosmetic renaming.
+
+Most current UI text is hardcoded English. `locale/enUS.lua` is not listed in the TOC, so do not assume `ns.L` strings are available at runtime until localization initialization and load order are implemented.
 
 ## Validation
 

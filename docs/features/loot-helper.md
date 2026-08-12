@@ -47,7 +47,7 @@ Select the equipment button on a member row to open the equipment window. It tra
 - weapon and off-hand;
 - two ring uses and two trinket uses.
 
-This is profile history, not a live inspection of equipped items. Admins toggle a category when the member uses or regains that loot opportunity. Toggling a category also adjusts the member's points and creates a log entry.
+This is profile history, not a live inspection of equipped items. Admins toggle a category when the member uses or regains that loot opportunity. Toggling creates an equipment-history log entry but does not change the member's point balance; use the separate point controls when an award should also spend or return points.
 
 The separate [Raid Check](raid-check.md) equipment page inspects current gear for enchants and gems.
 
