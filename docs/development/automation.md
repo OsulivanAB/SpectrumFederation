@@ -58,7 +58,7 @@ If there are no addon changes, the promotion preserves the stable version and sk
 
 Older instructions that ask for a promotion `dry_run` input are obsolete; the workflow now always validates with its built-in dry-run phase.
 
-Both the dry-run build and the final `main` deployment call `validate_docs.py`, ensuring generated stable README badges are checked after promotion metadata is written.
+The dry-run README job uploads its simulated stable badge output to the dry-run docs job, which applies the simulated stable TOC metadata before calling `validate_docs.py`. The final `main` deployment also calls the validator after generated metadata is pushed.
 
 ## Roll back a release
 

@@ -325,6 +325,12 @@ jobs:
             git commit -m "docs: update badges for ${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }} [skip ci]"
           fi
 
+      - name: Upload simulated stable README
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run-stable-readme
+          path: README.md
+
       - name: Push README to main
         if: false  # Dry run - skip push
         run: |
@@ -341,6 +347,19 @@ jobs:
         uses: actions/checkout@v6
         with:
           ref: beta  # Dry run always uses beta
+
+      - name: Download simulated stable README
+        uses: actions/download-artifact@v4
+        with:
+          name: dry-run-stable-readme
+          path: .
+
+      - name: Prepare simulated stable TOC
+        run: |
+          VERSION="${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}"
+          INTERFACE="${{ needs.dry-run-merge-beta-to-main.outputs.interface }}"
+          sed -i "s/^## Version:.*$/## Version: $VERSION/" SpectrumFederation/SpectrumFederation.toc
+          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation/SpectrumFederation.toc
 
       - name: Set up Python
         uses: actions/setup-python@v6
