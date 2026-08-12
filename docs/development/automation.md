@@ -83,7 +83,7 @@ python -m pytest tests/test_wow_interface_sync.py
 | --- | --- |
 | `lint_all.py` | Lua, YAML, and Python validation. |
 | `validate_packaging.py` | TOC references, required files, and package structure. |
-| `validate_docs.py` | `mkdocs build --clean --strict`. |
+| `validate_docs.py` | Repository-specific documentation guardrails plus `mkdocs build --clean --strict`. |
 | `check_version_bump.py` | Compare TOC versions against a base branch. |
 | `check_duplicate_release.py` | Reject an existing release version. |
 | `publish_release.py` | Build release artifacts and publish or dry-run them. |
@@ -91,6 +91,20 @@ python -m pytest tests/test_wow_interface_sync.py
 | `cleanup_merged_branch.py` | Remove the merged source branch after beta release. |
 
 Use the scripts rather than reproducing their logic in ad hoc commands.
+
+### Documentation guardrails
+
+`validate_docs.py` fails before the MkDocs build when it finds:
+
+- a Markdown page missing from navigation or a navigation target missing on disk;
+- a broken relative link or image;
+- known stale commands, APIs, module paths, workflow names, or Blizzard Settings instructions;
+- a referenced workflow, script, or asset that does not exist;
+- missing automation-compatible README badges, or stable-branch badge values that disagree with `SpectrumFederation.toc`;
+- a registered `/sf` command or sync diagnostic alias missing from the command reference;
+- a visible unimplemented settings action whose limitation is no longer documented.
+
+When behavior changes intentionally, update the implementation and its documentation together. Remove or revise a stale-pattern rule only when the old form has genuinely become valid again.
 
 ## Version and manifest source of truth
 
