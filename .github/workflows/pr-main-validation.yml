@@ -12,6 +12,7 @@ on:
       - 'docs/**'
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
+      - 'README.md'
 
 concurrency:
   group: main-validation-${{ github.ref }}

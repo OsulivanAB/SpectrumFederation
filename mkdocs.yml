@@ -71,32 +71,24 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - Getting Started: getting-started.md
   - Features:
-    - Settings UI: settings-ui.md
+    - Loot Helper: features/loot-helper.md
+    - Raid Check: features/raid-check.md
+    - Sync Sessions: features/sync-sessions.md
+    - Loot Logs: features/loot-logs.md
+    - Settings and Gameplay: settings-ui.md
+  - Reference:
+    - Slash Commands: reference/slash-commands.md
+    - Troubleshooting: reference/troubleshooting.md
+  - Tools:
+    - Google Sheet Sync: development/tools/google-sheet-sync.md
   - Development:
-    - Getting Started:
-      - Overview: development/getting-started/index.md
-      - Naming Conventions: development/getting-started/naming-conventions.md
-      - Promoting Beta to Main: development/getting-started/promoting-to-main.md
-      - CI/CD Workflows: development/getting-started/workflows.md
-      - WoW Classes: development/getting-started/wow-classes.md
-      - Slash Commands: development/getting-started/slash-commands.md
-    - Settings UI:
-      - Overview: development/settings-ui/index.md
-      - Data Layer: development/settings-ui/data-layer.md
-      - UI Layer: development/settings-ui/ui-layer.md
-      - Controls Reference: development/settings-ui/controls.md
-      - Creating Pages: development/settings-ui/creating-pages.md
-      - Best Practices: development/settings-ui/best-practices.md
-    - Loot Helper:
-      - Overview: development/loot-helper/loot-helper.md
-      - Members Class: development/loot-helper/members-class.md
-      - Loot Profile Class: development/loot-helper/loot-profile-class.md
-      - Loot Logs Class: development/loot-helper/loot-logs.md
-      - Data Syncing: development/loot-helper/loot-profile-data-syncing.md
-    - Tools:
-      - Overview: development/tools/index.md
-      - Google Sheet Sync: development/tools/google-sheet-sync.md
+    - Contributing: development/getting-started/index.md
+    - Addon Architecture: development/architecture.md
+    - Settings System: development/settings-ui/index.md
+    - Loot Helper Internals: development/loot-helper/index.md
+    - Automation and Releases: development/automation.md
 
 plugins:
   - search
