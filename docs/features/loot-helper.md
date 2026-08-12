@@ -28,14 +28,16 @@ Profile admins can:
 - increase or decrease points in half-point steps;
 - add current raid members to the profile;
 - mark equipment categories used or available;
-- create, select, rename, reset, and delete profiles;
+- create, select, rename, and delete profiles;
 - change the profile's point name;
 - add or remove admins;
 - transfer one character's point and equipment history to another with **Main Swap**;
 - configure and run Raid Checks;
-- start or end sync sessions.
+- start sync sessions and, when acting as coordinator, end them.
 
-Non-admins can view the roster, points, equipment history, logs, and synchronized profile data, but modification controls are hidden or disabled.
+Non-admins can view the roster, points, equipment history, logs, and synchronized profile data. Shared-data controls such as point/equipment changes, profile settings, Raid Check, sessions, and admin management are hidden or disabled in the UI.
+
+Creating, selecting, and deleting a local profile copy are available without profile-admin status. Those local actions are distinct from authorization to write shared profile history during synchronization.
 
 ## Equipment-category history
 
@@ -64,6 +66,8 @@ A profile includes:
 - append-only change logs.
 
 Deleting a profile removes it from this client. During an active sync session, other clients may still retain their copy.
+
+The current **Reset Current Profile** action is a placeholder and does not reset profile settings. **Reset All LootHelper Settings** deletes local profiles and clears the active selection; it does not restore every general Loot Helper option.
 
 ## Main Swap
 

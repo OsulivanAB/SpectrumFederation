@@ -52,13 +52,13 @@ Active session identity is saved locally so a reload or world transition can res
 
 ## Safe modes
 
-Safe mode pauses bulk synchronization and profile transfers. Small control traffic and the local profile remain available.
+Safe mode pauses profile snapshots, missing-log batches, and live-log transfer. Small control traffic and the existing local profile remain available.
 
 **Local safe mode**
 
-- affects only your client;
-- can be enabled all the time;
-- can enable automatically when your character enters combat.
+- is supported by the synchronization protocol and affects only one client;
+- can pause that client's profile snapshots, log batches, and live-log transfer;
+- currently has no user-facing setting wired to its runtime API.
 
 **Session safe mode**
 
@@ -67,7 +67,7 @@ Safe mode pauses bulk synchronization and profile transfers. Small control traff
 - pauses participating clients when the coordinator accepts the request.
 
 /// warning | Current settings limitation
-The **All the Time** and **Only in-combat** raid-wide safe-mode options are saved on the profile, but the current settings/runtime integration does not apply them to the active sync session. Local safe mode works; do not rely on the two raid-wide settings until that integration is completed.
+The local and raid-wide safe-mode options shown in settings are saved, but the current settings/runtime integration does not apply them to the active sync session. The protocol APIs exist; users cannot activate them through these controls yet.
 ///
 
 Safe mode is useful during combat or when you want to defer larger transfers. It does not delete data, end the session, or turn off Loot Helper.

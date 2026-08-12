@@ -10,7 +10,7 @@ Loot Helper is split into domain models, synchronization, UI, and Raid Check. Th
 
 Profile IDs are stable across renames. The creator becomes author, owner, first admin, and first member. Admin and member identifiers are normalized `Name-Realm` strings.
 
-Use profile methods for mutations. They validate permissions, create the appropriate logs, and preserve synchronized state. Directly changing private fields bypasses those guarantees.
+Use the highest-level Store or domain method available for mutations so validation, logging, and refresh behavior stay together. Low-level profile mutators are not uniformly permission-guarded and some do not create logs; callers must enforce authorization and choose the log-producing path. Directly changing private fields bypasses all of those contracts.
 
 ### Member
 
@@ -80,7 +80,7 @@ Feature updates should fire or reuse `LootHelperEvents` so views refresh without
 5. control/bulk handlers and profile integration;
 6. debug commands and public API.
 
-Control messages use the small `SF_LH` traffic class; snapshots and log batches use `SF_LHB`. `modules/LootHelper/Comm.lua` integrates AceComm/ChatThrottleLib transport.
+Control messages use the small `SF_LH` traffic class; snapshots and log batches use `SF_LHB`. `modules/LootHelper/Comm.lua` is the current AceComm/ChatThrottleLib transport adapter.
 
 ### Session lifecycle
 
@@ -107,7 +107,7 @@ UI admin gating is not sufficient for network input.
 
 ### Safe mode
 
-Local and session safe mode pause bulk/profile-transfer work while preserving control traffic. Session safe-mode requests are validated and coordinated; combat auto-enable behavior is split between local user settings and coordinator/profile settings.
+Local and session safe mode pause snapshots, log batches, and live-log transfer while preserving control traffic. Session safe-mode requests are validated and coordinated. The current settings keys for local and raid-wide safe mode are not bridged to these runtime APIs; treat that integration as incomplete.
 
 When adding a new message type, update constants, routing, validation, handler registration, metrics/debug output, safe-mode policy, and retry/timeout behavior together.
 

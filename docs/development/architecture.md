@@ -26,7 +26,7 @@ local addonName, SF = ...
 | `modules/SlashCommands.lua` | `/sf` dispatch and feature command registry. |
 | `modules/Settings/` | Defaults, migrations, path-based storage, per-character storage, and runtime application. |
 | `modules/UI/Settings/` | Page registry, standalone navigation window, controls, dialogs, and page definitions. |
-| `modules/LootHelper/` | Profile, member, and log domain models plus serialization and legacy communication glue. |
+| `modules/LootHelper/` | Profile, member, and log domain models plus serialization and the current communication adapter. |
 | `modules/LootHelperSync/` | Session state, validation, requests, convergence, heartbeat, routing, bulk handlers, and public API. |
 | `modules/UI/LootHelper/` | Roster/equipment presentation and controller logic. |
 | `modules/RaidCheck.lua` | Inspection cache, equipment evaluation, whispers, snapshots, and point awards. |
@@ -69,7 +69,7 @@ flowchart LR
 
 ## Permissions
 
-Profile methods enforce write permissions; disabled UI controls are not the security boundary. Sync also verifies group membership, sender identity, and profile authorization before accepting changes.
+Authorization is enforced by specific guarded domain methods, log insertion, and sync validation, but Store adapters and low-level `LootProfile` mutators are not uniformly guarded. Callers must check authorization before invoking an unguarded write path; disabled UI controls alone are not a security boundary. Sync verifies group membership, sender identity, and profile authorization before accepting network changes.
 
 The profile creator is the initial owner and admin. Ownership and admin membership use normalized `Name-Realm` identifiers. Use `NameUtil` for comparisons because connected-realm and short-name forms can differ.
 

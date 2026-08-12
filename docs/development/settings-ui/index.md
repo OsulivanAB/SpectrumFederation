@@ -123,7 +123,7 @@ Press and Hold Casting is the complete character-setting example: Store maintain
 - Defaults and migrations preserve existing SavedVariables.
 - Page and setting IDs remain stable.
 - Runtime behavior changes when the setting changes.
-- Domain methods enforce permissions independently of UI state.
+- The selected write path enforces permissions independently of UI state; add an explicit check when a low-level mutator does not.
 - Tooltips explain user behavior, not implementation.
 - `/reload`, specialization changes, and combat deferral are tested where relevant.
 - New Lua files appear in TOC load order and the addon version is bumped.

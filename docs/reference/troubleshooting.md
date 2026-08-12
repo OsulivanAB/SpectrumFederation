@@ -38,7 +38,7 @@ Use `/sf loot sync` on the affected client. It requests a snapshot or missing lo
 
 The coordinator cannot request a manual catch-up from itself. If the wrong client is coordinating, end the session and have the intended up-to-date admin start a new one.
 
-Bulk transfers pause while local or raid-wide safe mode is active. Disable the relevant safe mode or wait until combat restrictions have cleared.
+Runtime safe mode pauses profile and log transfers, but the visible local and raid-wide safe-mode settings are not currently wired to that runtime state. Toggling those settings will not repair a stalled transfer. If sync diagnostics report safe mode active unexpectedly, have the coordinator end and restart the session and include `/sflhsync status` in the bug report.
 
 ## Raid Check shows Loading, Out of range, or Unavailable
 

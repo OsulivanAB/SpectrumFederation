@@ -33,15 +33,15 @@ Because this controls a shared WoW CVar, changing it elsewhere may be overwritte
 
 ## Loot Helper: General
 
-- **Enable LootHelper** — enable or disable the roster window and related local behavior.
+- **Enable LootHelper** — show or hide the roster window when its other visibility conditions are met. Sync and Raid Check still initialize and remain available.
 - **Lock Loot Window** — prevent moving and resizing the Loot Helper window.
 - **Show Members not in raid** — include profile members who are absent from the current raid.
 - **Show Loot Window outside of Raid** — allow the roster window while solo or in a party.
-- **Enable Local Safemode** — pause bulk sync and profile transfers on this client.
-- **Enable Local Safemode on Combat** — turn local safe mode on when combat begins during an active session.
-- **Reset All LootHelper Settings** — delete every local profile and restore Loot Helper defaults.
+- **Enable Local Safemode** — save the intended local safe-mode preference.
+- **Enable Local Safemode on Combat** — save the intended combat preference.
+- **Reset All LootHelper Settings** — delete every local profile and clear the active profile selection.
 
-The reset action is destructive and requires confirmation.
+The two local safe-mode controls are not currently connected to the synchronization runtime and do not pause transfers. The reset action is destructive and requires confirmation; despite its label, it does not restore every Loot Helper option.
 
 ## Loot Helper: Profile
 
@@ -53,6 +53,8 @@ This page selects and manages the active profile. It includes:
 
 Rename and profile-specific configuration are admin-only. Creating a profile makes the creator its owner and first admin.
 
+**Reset Current Profile** is currently a nonfunctional placeholder and reports that it is not implemented.
+
 ## Loot Helper: Session
 
 This page includes:
@@ -63,7 +65,7 @@ This page includes:
 - optional whispers for missing and prepared players;
 - editable whisper templates.
 
-The two raid-wide safe-mode preferences are not currently connected to the runtime session safe-mode API. They persist on the profile but do not pause session transfers. Local safe mode remains functional.
+The two raid-wide safe-mode preferences are not currently connected to the runtime session safe-mode API. They persist on the profile but do not pause session transfers.
 
 The visible **Trigger Raid-Wide Sync** control is currently a placeholder. It does not initiate a sync; use `/sf loot sync` on the client that needs to catch up.
 
