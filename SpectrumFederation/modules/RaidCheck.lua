@@ -256,9 +256,7 @@ local function CountGemsFilledFromLink(link)
 	return filled
 end
 
-local function HasMissingGems(link)
-	if type(link) ~= "string" then return false end
-
+local function CountSocketsFromItemStats(link)
 	local stats = GetItemStatsSafe(link) or {}
 	local sockets = 0
 	for stat, value in pairs(stats) do
@@ -266,32 +264,44 @@ local function HasMissingGems(link)
 			sockets = sockets + (tonumber(value) or 0)
 		end
 	end
+	return sockets
+end
 
+local function CountItemSockets(link)
+	-- Prefer the dedicated socket-count API when it accepts an item link.
+	-- A zero/failed result is ignored because some clients only support
+	-- ItemLocation inputs; fall back to EMPTY_SOCKET* stats in that case.
+	if C_Item and C_Item.GetItemNumSockets then
+		local ok, num = pcall(C_Item.GetItemNumSockets, link)
+		if ok then
+			num = tonumber(num)
+			if num and num > 0 then
+				return num
+			end
+		end
+	end
+
+	return CountSocketsFromItemStats(link)
+end
+
+local function HasMissingGems(link)
+	if type(link) ~= "string" then return false end
+
+	-- Every socket on the item must contain a gem. Socket count comes from
+	-- item stats / C_Item; fill state is checked per index so one empty
+	-- socket still fails even when other sockets are filled.
+	local sockets = CountItemSockets(link)
 	if sockets == 0 then
 		return false
 	end
 
-	-- Cross-check: count gems directly from the item link's gem fields.
-	-- In TWW (11.0+), C_Item.GetItemGemID and GetItemGem can fail for inspected
-	-- players whose gem item data is not cached locally. If the link shows gems
-	-- are present in its gem fields, trust that over the API check.
-	local gemsFromLink = CountGemsFilledFromLink(link)
-	if gemsFromLink >= sockets then
-		return false
-	end
-
-	local filled = 0
 	for i = 1, sockets do
-		if IsGemPresentInSocket(link, i) then
-			filled = filled + 1
+		if not IsGemPresentInSocket(link, i) then
+			return true
 		end
 	end
 
-	-- Use the higher of the two gem counts to avoid false positives from
-	-- API calls that fail on uncached inspected-player gem data.
-	filled = math.max(filled, gemsFromLink)
-
-	return filled < sockets
+	return false
 end
 
 local function GetDetailedItemLevelSafe(link)
@@ -320,22 +330,60 @@ local function IsEpicQualityLink(link)
 	return colorCode ~= nil and colorCode:lower() == "ffa335ee"
 end
 
-local function IsMetaGemSocketed(gemName, gemLink)
+local function IsMetaGemSocketed(gemName, gemLink, gemID)
 	if IsEpicQualityLink(gemLink) or IsEpicQualityLink(gemName) then
-		return true
+		return true, false
 	end
 
-	if GetItemInfo and (gemLink or gemName) then
-		local _, itemLink, quality = GetItemInfo(gemLink or gemName)
+	local infoArg = gemLink or gemName or gemID
+	if GetItemInfo and infoArg then
+		local _, itemLink, quality = GetItemInfo(infoArg)
 		if quality == META_GEM_QUALITY then
-			return true
+			return true, false
 		end
 		if IsEpicQualityLink(itemLink) then
-			return true
+			return true, false
+		end
+		if quality ~= nil then
+			return false, false
+		end
+		return false, true
+	end
+
+	if gemLink or gemName or gemID then
+		return false, true
+	end
+
+	return false, false
+end
+
+local function GetSocketedGemIdentity(link, gemIndex)
+	local gemID = nil
+	if C_Item and C_Item.GetItemGemID then
+		local ok, id = pcall(C_Item.GetItemGemID, link, gemIndex)
+		if ok and type(id) == "number" and id ~= 0 then
+			gemID = id
 		end
 	end
 
-	return false
+	local gemName, gemLink = nil, nil
+	if GetItemGem then
+		gemName, gemLink = GetItemGem(link, gemIndex)
+	end
+
+	if not gemID and type(link) == "string" then
+		local itemString = link:match("item:([%-%d:]+)")
+		if itemString then
+			local fields = { strsplit(":", itemString) }
+			local gemField = fields[2 + gemIndex]
+			local parsedId = tonumber(gemField)
+			if parsedId and parsedId ~= 0 then
+				gemID = parsedId
+			end
+		end
+	end
+
+	return gemName, gemLink, gemID
 end
 
 local function HasEquippedMetaGem(unit)
@@ -344,8 +392,9 @@ local function HasEquippedMetaGem(unit)
 			local link = GetInventoryItemLink(unit, slotDef.slots[idx])
 			if type(link) == "string" then
 				for gemIndex = 1, MAX_GEM_SOCKETS_TO_SCAN do
-					local gemName, gemLink = GetItemGem(link, gemIndex)
-					if IsMetaGemSocketed(gemName, gemLink) then
+					local gemName, gemLink, gemID = GetSocketedGemIdentity(link, gemIndex)
+					local isMeta = IsMetaGemSocketed(gemName, gemLink, gemID)
+					if isMeta then
 						return true
 					end
 				end
@@ -570,6 +619,23 @@ local function SlotHasAnyItemData(slotData)
 		return true
 	end
 	return slotData.hasItem and true or false
+end
+
+local function HasEquipmentData(slotsByInventory)
+	if type(slotsByInventory) ~= "table" then
+		return false
+	end
+
+	-- Count any populated slot metadata as usable inspect data so raid checks do
+	-- not treat an empty placeholder snapshot as a real equipment capture.
+	for _, slotData in pairs(slotsByInventory) do
+		local itemLevel = type(slotData) == "table" and tonumber(slotData.itemLevel) or nil
+		if type(slotData) == "table" and (SlotHasAnyItemData(slotData) or itemLevel ~= nil) then
+			return true
+		end
+	end
+
+	return false
 end
 
 local function NormalizeSlotData(slotData)
@@ -1670,21 +1736,26 @@ local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, i
 end
 
 local function HasEquippedMetaGemInSnapshot(slotsByInventory)
+	local unresolved = false
 	for _, slotDef in pairs(SLOT_DEFS) do
 		for idx = 1, #slotDef.slots do
 			local link = GetSnapshotSlotLink(slotsByInventory, slotDef.slots[idx])
 			if type(link) == "string" then
 				for gemIndex = 1, MAX_GEM_SOCKETS_TO_SCAN do
-					local gemName, gemLink = GetItemGem(link, gemIndex)
-					if IsMetaGemSocketed(gemName, gemLink) then
-						return true
+					local gemName, gemLink, gemID = GetSocketedGemIdentity(link, gemIndex)
+					local isMeta, qualityPending = IsMetaGemSocketed(gemName, gemLink, gemID)
+					if isMeta then
+						return true, false
+					end
+					if qualityPending then
+						unresolved = true
 					end
 				end
 			end
 		end
 	end
 
-	return false
+	return false, unresolved
 end
 
 local function EvaluateSnapshot(slotsByInventory, cfg)
@@ -1704,11 +1775,29 @@ local function EvaluateSnapshot(slotsByInventory, cfg)
 		end
 	end
 
-	if cfg and cfg.requireMetaGem and not HasEquippedMetaGemInSnapshot(slotsByInventory) then
-		table.insert(missing, "Meta Gem")
+	if cfg and cfg.requireMetaGem then
+		local hasMetaGem, metaGemPending = HasEquippedMetaGemInSnapshot(slotsByInventory)
+		if metaGemPending and not hasMetaGem then
+			hasItemDataPending = true
+		elseif not hasMetaGem then
+			table.insert(missing, "Meta Gem")
+		end
 	end
 
 	return missing, hasItemDataPending
+end
+
+local function EvaluateMetaGemRowState(slotsByInventory, cfg, isKnown)
+	if not (cfg and cfg.requireMetaGem and isKnown and type(slotsByInventory) == "table") then
+		return false, false
+	end
+
+	local hasMetaGem, metaGemPending = HasEquippedMetaGemInSnapshot(slotsByInventory)
+	if hasMetaGem then
+		return false, false
+	end
+
+	return not metaGemPending, metaGemPending and true or false
 end
 
 local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlot, isKnown)
@@ -2345,22 +2434,43 @@ local function HasBeenWhisperedToday(member, mode)
 	return whisperDay == currentDay
 end
 
-local function HasEquipmentData(slotsByInventory)
-	if type(slotsByInventory) ~= "table" then
-		return false
+local function EmitAdminMessage(message)
+	if type(message) ~= "string" or message == "" then
+		return
+	end
+	if SF.SystemMessage then
+		SF:SystemMessage(message)
+	else
+		SF:PrintWarning(message)
+	end
+end
+
+local function EmitAdminMissingSummary(modeLabel, summaryMissing)
+	if type(summaryMissing) ~= "table" or #summaryMissing == 0 then
+		return
 	end
 
-	-- Count any populated slot metadata as usable inspect data so raid checks do
-	-- not treat an empty placeholder snapshot as a real equipment capture.
-	for _, slotData in pairs(slotsByInventory) do
-		local isSlotData = type(slotData) == "table"
-		local itemLevel = isSlotData and tonumber(slotData.itemLevel) or nil
-		if isSlotData and (slotData.link or slotData.texture or itemLevel ~= nil) then
-			return true
+	EmitAdminMessage(string.format("[%s] Players missing enchants/gems:", modeLabel))
+	for _, entry in ipairs(summaryMissing) do
+		local suffix = ""
+		if entry.whisperedMissing then
+			suffix = " (whispered)"
+		elseif entry.alreadyWhispered then
+			suffix = " (already whispered today)"
 		end
+		EmitAdminMessage(string.format("  %s - %s%s", entry.displayName or entry.name, entry.missing, suffix))
+	end
+end
+
+local function EmitAdminPendingSummary(modeLabel, summaryPending)
+	if type(summaryPending) ~= "table" or #summaryPending == 0 then
+		return
 	end
 
-	return false
+	SF:PrintInfo(string.format("[%s] Players still waiting on inspect data:", modeLabel))
+	for _, entry in ipairs(summaryPending) do
+		SF:PrintInfo(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectPending))
+	end
 end
 
 local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
@@ -2378,6 +2488,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 		missing = nil,
 		inspectPending = nil,
 		whisperedMissing = false,
+		alreadyWhispered = false,
 	}
 
 	if type(inspectState) ~= "table" then
@@ -2403,24 +2514,21 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
-		local suffix = ""
 		local alreadyWhispered = HasBeenWhisperedToday(member, mode)
 		if whisper and not alreadyWhispered then
 			WhisperMissing(whisperTarget, cfg, unitInfo.short, pointName, list, mode)
 			result.whisperedMissing = true
 			MarkWhisperSent(member, mode, time())
-			suffix = " (whispered)"
 		elseif whisper and alreadyWhispered then
-			suffix = " (already whispered today)"
+			result.alreadyWhispered = true
 		end
-		SF:PrintWarning(("%s Missing: %s%s"):format(result.displayName, list, suffix))
 		result.missing = list
 		return result
 	end
 
 	if mode == "raid" then
 		if not member then
-			SF:PrintWarning(("Skipping point award for %s (not in active profile)."):format(unitInfo.short))
+			result.skippedAward = true
 			return result
 		end
 
@@ -2433,17 +2541,17 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 	return result
 end
 
-	function RC:RunPreRaidCheck()
-		local profile, cfg = ValidateCanRun("pre")
-		if not profile then return end
+function RC:RunPreRaidCheck()
+	local profile, cfg = ValidateCanRun("pre")
+	if not profile then return end
 
-		self:RequestTroubleshootingRefresh()
-	
-		if SF.SystemMessage then
-			SF:SystemMessage("Pre-Raid Check started.")
-		else
-			SF:PrintInfo("[Pre-Raid Check] Initiated.")
-		end
+	self:RequestTroubleshootingRefresh()
+
+	if SF.SystemMessage then
+		SF:SystemMessage("Pre-Raid Check started.")
+	else
+		SF:PrintInfo("[Pre-Raid Check] Initiated.")
+	end
 
 	local summaryMissing = {}
 	local summaryPending = {}
@@ -2453,9 +2561,6 @@ end
 		if info.id then
 			local res = RunForUnit(info, profile, cfg, "pre", GetPointName(profile))
 			if res then
-				if res.whisperedMissing then
-					SF:PrintInfo(string.format("[Pre-Raid Check] Whispered %s about missing enchants/gems.", res.name))
-				end
 				if res.missing then
 					table.insert(summaryMissing, res)
 				elseif res.inspectPending then
@@ -2465,71 +2570,56 @@ end
 		end
 	end
 
-	if not ShouldWhisper("pre", cfg) and #summaryMissing > 0 then
-		SF:PrintWarning("[Pre-Raid Check] Players missing enchants/gems:")
-		for _, entry in ipairs(summaryMissing) do
-			SF:PrintWarning(string.format("  %s - %s", entry.displayName or entry.name, entry.missing))
-		end
+	EmitAdminMissingSummary("Pre-Raid Check", summaryMissing)
+	EmitAdminPendingSummary("Pre-Raid Check", summaryPending)
+	if SF.Debug then
+		SF.Debug:Info("RAID_CHECK", "Pre-Raid Check finished: %d missing, %d pending", #summaryMissing, #summaryPending)
 	end
-
-	if #summaryPending > 0 then
-		SF:PrintInfo("[Pre-Raid Check] Players still waiting on inspect data:")
-		for _, entry in ipairs(summaryPending) do
-			SF:PrintInfo(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectPending))
-		end
-	end
-
 	SF:PrintSuccess("[Pre-Raid Check] Complete.")
 end
 
-	function RC:RunRaidCheck()
-		local profile, cfg = ValidateCanRun("raid")
-		if not profile then return end
+function RC:RunRaidCheck()
+	local profile, cfg = ValidateCanRun("raid")
+	if not profile then return end
 
-		self:RequestTroubleshootingRefresh()
-	
-		if SF.SystemMessage then
-			SF:SystemMessage("Raid Check started.")
-		else
-			SF:PrintInfo("[Raid Check] Initiated.")
-		end
+	self:RequestTroubleshootingRefresh()
+
+	if SF.SystemMessage then
+		SF:SystemMessage("Raid Check started.")
+	else
+		SF:PrintInfo("[Raid Check] Initiated.")
+	end
 
 	local pointName = GetPointName(profile)
 	local pointAward = GetRaidCheckPointAward(cfg)
 	local summaryMissing = {}
 	local summaryPending = {}
+	local summarySkippedAward = {}
 
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
 		if info.id then
 			local res = RunForUnit(info, profile, cfg, "raid", pointName, pointAward)
 			if res then
-				if res.whisperedMissing then
-					SF:PrintInfo(string.format("[Raid Check] Whispered %s about missing enchants/gems.", res.name))
-				end
 				if res.missing then
 					table.insert(summaryMissing, res)
 				elseif res.inspectPending then
 					table.insert(summaryPending, res)
+				elseif res.skippedAward then
+					table.insert(summarySkippedAward, res)
 				end
 			end
 		end
 	end
 
-	if not ShouldWhisper("raid", cfg) and #summaryMissing > 0 then
-		SF:PrintWarning("[Raid Check] Players missing enchants/gems:")
-		for _, entry in ipairs(summaryMissing) do
-			SF:PrintWarning(string.format("  %s - %s", entry.displayName or entry.name, entry.missing))
-		end
+	EmitAdminMissingSummary("Raid Check", summaryMissing)
+	for _, entry in ipairs(summarySkippedAward) do
+		EmitAdminMessage(("Skipping point award for %s (not in active profile)."):format(entry.name))
 	end
-
-	if #summaryPending > 0 then
-		SF:PrintInfo("[Raid Check] Players still waiting on inspect data:")
-		for _, entry in ipairs(summaryPending) do
-			SF:PrintInfo(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectPending))
-		end
+	EmitAdminPendingSummary("Raid Check", summaryPending)
+	if SF.Debug then
+		SF.Debug:Info("RAID_CHECK", "Raid Check finished: %d missing, %d pending, %d skipped awards", #summaryMissing, #summaryPending, #summarySkippedAward)
 	end
-
 	SF:PrintSuccess("[Raid Check] Complete.")
 end
 
@@ -2564,6 +2654,11 @@ function RC:GetTroubleshootingSnapshot()
 	for _, info in ipairs(CollectTroubleshootingUnitsAndMembers(profile)) do
 		if info.id then
 			local inspectState = self:_GetTroubleshootingInspectState(info.unit, info)
+			local missingMetaGem, metaGemPending = EvaluateMetaGemRowState(
+				inspectState and inspectState.slotsByInventory or nil,
+				cfg,
+				inspectState and inspectState.isKnown
+			)
 			rows[#rows + 1] = {
 				unit = info.unit,
 				id = info.id,
@@ -2574,6 +2669,8 @@ function RC:GetTroubleshootingSnapshot()
 				inspectStatus = inspectState and inspectState.status or "ready",
 				inspectLabel = inspectState and inspectState.label or nil,
 				inspectMessage = inspectState and inspectState.message or nil,
+				missingMetaGem = missingMetaGem,
+				metaGemPending = metaGemPending,
 				slots = BuildTroubleshootingSlots(inspectState, cfg),
 			}
 		end
@@ -2604,11 +2701,19 @@ function RC:GetTroubleshootingSlotsForUnit(unit, cfg)
 		return nil
 	end
 
+	local missingMetaGem, metaGemPending = EvaluateMetaGemRowState(
+		inspectState.slotsByInventory,
+		cfg,
+		inspectState.isKnown
+	)
+
 	return {
 		status = inspectState.status,
 		label = inspectState.label,
 		message = inspectState.message,
 		stale = inspectState.stale and true or false,
+		missingMetaGem = missingMetaGem,
+		metaGemPending = metaGemPending,
 		slots = BuildTroubleshootingSlots(inspectState, cfg),
 	}
 end
