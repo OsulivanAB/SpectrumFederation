@@ -1807,10 +1807,11 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 	-- itemContext mean the inspect resolved, even when enchant/gem fields
 	-- are still zero. Incomplete stubs skip both enchant and gem failures.
 	local inventorySlot = slotDef.slots[idx]
+	local liveItemId = GetInventoryItemID(unit, inventorySlot) or tonumber(link:match("item:(%d+)"))
 	local tempSlots = {
 		[inventorySlot] = {
 			link = link,
-			itemId = GetInventoryItemID(unit, inventorySlot),
+			itemId = liveItemId,
 			texture = GetInventoryItemTexture(unit, inventorySlot),
 		},
 	}
