@@ -150,7 +150,6 @@ def test_stub_links_with_item_evidence_are_incomplete():
 def test_raid_check_lua_keeps_stub_gems_pending():
     source = RAID_CHECK_LUA.read_text(encoding="utf-8")
     assert "C_TooltipInfo" in source
-    assert "not linkIncomplete and HasMissingGems" in source
     incomplete_fn = source.split("local function IsSlotLinkPotentiallyIncomplete", 1)[1]
     incomplete_fn = incomplete_fn.split("local function SlotHasAnyItemData", 1)[0]
     assert "numBonusIDs" in incomplete_fn
@@ -160,6 +159,10 @@ def test_raid_check_lua_keeps_stub_gems_pending():
     snapshot_fn = snapshot_fn.split("local function HasEquippedMetaGemInSnapshot", 1)[0]
     assert "return {}, true" in snapshot_fn
     assert 'return { label .. " Gem" }, false' not in snapshot_fn
+    troubleshooting_fn = source.split("local function BuildTroubleshootingSlotBase", 1)[1]
+    troubleshooting_fn = troubleshooting_fn.split("local function BuildTroubleshootingSlot(", 1)[0]
+    assert "not linkIncomplete" in troubleshooting_fn
+    assert "HasMissingGems(link)" in troubleshooting_fn
 
 
 def test_admin_missing_summary_is_independent_of_whisper_setting():
