@@ -30,6 +30,7 @@ read_globals = {
   "C_DateAndTime",
   "GameTooltip",
   "GameTooltip_Hide",
+  "GetCoinTextureString",
   "Settings",
   "UIParent",
   "UIPanelCloseButton",

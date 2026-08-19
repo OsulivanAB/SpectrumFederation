@@ -23,6 +23,7 @@ end
 local function _ResetMemberState(member)
     if not member then return end
     member.pointBalance = 0
+    member.attendanceBalance = 0
     member.armor = _BuildEmptyArmor()
     if not member.role and SF.MemberRoles then
         member.role = SF.MemberRoles.MEMBER
@@ -372,6 +373,14 @@ function Sync:RebuildProfile(profileId, reason)
 	if profile._EnsureRaidCheckConfig then
 		profile:_EnsureRaidCheckConfig()
 	end
+	if profile._EnsureRewardPotConfig then
+		profile:_EnsureRewardPotConfig()
+	end
+
+	local lootMode = profile._lootMode
+	local startingPotCopper = tonumber(profile._rewardPotStartingCopper) or 0
+	local deductionType = profile._rewardPotDeductionType
+	local deductionValue = tonumber(profile._rewardPotDeductionValue) or 0
 
 	local rebuildReason = tostring(reason or "unknown")
 	local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
@@ -470,6 +479,36 @@ function Sync:RebuildProfile(profileId, reason)
                         rebuildReason, tostring(_MemberId(member) or data.member), tostring(oldPoints or 0), tostring(newPoints - oldPoints),
                         tostring(newPoints), tostring(data.change))
                 end
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ATTENDANCE_CHANGE) then
+                local member = ensureMember(data.member)
+                local amount = (SF.LootLog and SF.LootLog.GetAttendanceChangeAmount and SF.LootLog.GetAttendanceChangeAmount(data)) or 1
+                if member then
+                    member.attendanceBalance = tonumber(member.attendanceBalance) or 0
+                    if data.change == SF.LootLogPointChangeTypes.INCREMENT then
+                        member.attendanceBalance = member.attendanceBalance + amount
+                    elseif data.change == SF.LootLogPointChangeTypes.DECREMENT then
+                        member.attendanceBalance = member.attendanceBalance - amount
+                    end
+                    if member.attendanceBalance < 0 then
+                        member.attendanceBalance = 0
+                    end
+                end
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.LOOT_MODE_CHANGE) then
+                if type(data.newMode) == "string" then
+                    lootMode = data.newMode
+                end
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.REWARD_POT_CONFIG_CHANGE) then
+                if data.startingPotCopper ~= nil then
+                    startingPotCopper = math.floor(tonumber(data.startingPotCopper) or 0)
+                    if startingPotCopper < 0 then startingPotCopper = 0 end
+                end
+                if type(data.deductionType) == "string" then
+                    deductionType = data.deductionType
+                end
+                if data.deductionValue ~= nil then
+                    deductionValue = tonumber(data.deductionValue) or 0
+                    if deductionValue < 0 then deductionValue = 0 end
+                end
             elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ARMOR_CHANGE) then
                 local member = ensureMember(data.member)
                 if member and data.slot then
@@ -528,6 +567,14 @@ function Sync:RebuildProfile(profileId, reason)
 
     if profile._EnsureOwnerIsAdmin then
         profile:_EnsureOwnerIsAdmin()
+    end
+
+    profile._lootMode = lootMode
+    profile._rewardPotStartingCopper = startingPotCopper
+    profile._rewardPotDeductionType = deductionType
+    profile._rewardPotDeductionValue = deductionValue
+    if profile._EnsureRewardPotConfig then
+        profile:_EnsureRewardPotConfig()
     end
 
     if SF.Debug then

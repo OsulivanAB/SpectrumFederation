@@ -52,6 +52,46 @@ local RAID_CHECK_DEFAULTS = {
 	slots = RAID_CHECK_SLOT_DEFAULTS,
 }
 
+local LOOT_MODE_POINT_BASED = "point_based"
+local LOOT_MODE_REWARD_POT = "reward_pot"
+local DEDUCTION_TYPE_FLAT = "flat"
+local DEDUCTION_TYPE_PERCENT = "percent"
+
+local REWARD_POT_DEFAULTS = {
+	startingPotCopper = 0,
+	deductionType = DEDUCTION_TYPE_FLAT,
+	deductionValue = 0,
+}
+
+local function NormalizeLootMode(value)
+	if value == LOOT_MODE_REWARD_POT then
+		return LOOT_MODE_REWARD_POT
+	end
+	return LOOT_MODE_POINT_BASED
+end
+
+local function NormalizeDeductionType(value)
+	if value == DEDUCTION_TYPE_PERCENT then
+		return DEDUCTION_TYPE_PERCENT
+	end
+	return DEDUCTION_TYPE_FLAT
+end
+
+local function NormalizeNonNegativeNumber(value, defaultValue)
+	local amount = tonumber(value)
+	if amount == nil then
+		amount = tonumber(defaultValue) or 0
+	end
+	if amount < 0 then
+		amount = 0
+	end
+	return amount
+end
+
+local function NormalizeCopper(value)
+	return math.floor(NormalizeNonNegativeNumber(value, 0))
+end
+
 local function NormalizeRaidCheckPointsAward(value)
 	local amount = tonumber(value)
 	if amount == nil then
@@ -125,6 +165,16 @@ function LootProfile:_EnsureRaidCheckConfig()
 	cfg.pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(cfg.pointsAwardPerRaidCheck)
 	cfg.checkGemsInSockets = cfg.checkGemsInSockets ~= false
 	cfg.requireMetaGem = cfg.requireMetaGem and true or false
+end
+
+function LootProfile:_EnsureRewardPotConfig()
+	self._lootMode = NormalizeLootMode(self._lootMode)
+	self._rewardPotStartingCopper = NormalizeCopper(self._rewardPotStartingCopper)
+	self._rewardPotDeductionType = NormalizeDeductionType(self._rewardPotDeductionType)
+	self._rewardPotDeductionValue = NormalizeNonNegativeNumber(self._rewardPotDeductionValue, REWARD_POT_DEFAULTS.deductionValue)
+	if self._rewardPotDeductionType == DEDUCTION_TYPE_FLAT then
+		self._rewardPotDeductionValue = math.floor(self._rewardPotDeductionValue)
+	end
 end
 
 function LootProfile:_EnsureRaidCheckEquipmentSnapshots()
@@ -440,6 +490,10 @@ function LootProfile.new(profileName)
     instance._raidWideSafeModeOnCombat = false
     instance._raidCheckConfig = CopyRaidCheckDefaults()
     instance._raidCheckEquipmentSnapshots = {}
+    instance._lootMode = LOOT_MODE_POINT_BASED
+    instance._rewardPotStartingCopper = REWARD_POT_DEFAULTS.startingPotCopper
+    instance._rewardPotDeductionType = REWARD_POT_DEFAULTS.deductionType
+    instance._rewardPotDeductionValue = REWARD_POT_DEFAULTS.deductionValue
     -- Create member instance for author
     local class = SF:GetPlayerClass()
     local adminRole = (SF.MemberRoles and SF.MemberRoles.ADMIN) or "admin"
@@ -685,6 +739,253 @@ function LootProfile:IsCurrentUserAdmin()
         end
     end
     return false
+end
+
+-- Function to check if the current user is the owner of this profile
+-- @return boolean isOwner
+function LootProfile:IsCurrentUserOwner()
+    local currentUser = SF:GetPlayerFullIdentifier()
+    if not currentUser then return false end
+    return self:IsOwner(currentUser)
+end
+
+-- Function to get the loot mode for this profile
+-- @return string lootMode
+function LootProfile:GetLootMode()
+    self:_EnsureRewardPotConfig()
+    return self._lootMode
+end
+
+-- Function to check whether Reward Pot mode is active
+-- @return boolean
+function LootProfile:IsRewardPotMode()
+    return self:GetLootMode() == LOOT_MODE_REWARD_POT
+end
+
+-- Function to check whether Point Based mode is active
+-- @return boolean
+function LootProfile:IsPointBasedMode()
+    return self:GetLootMode() == LOOT_MODE_POINT_BASED
+end
+
+-- Function to get Reward Pot configuration
+-- @return table
+function LootProfile:GetRewardPotConfig()
+    self:_EnsureRewardPotConfig()
+    return {
+        startingPotCopper = self._rewardPotStartingCopper,
+        deductionType = self._rewardPotDeductionType,
+        deductionValue = self._rewardPotDeductionValue,
+    }
+end
+
+-- Function to compute the current Reward Pot from starting amount plus logged deltas
+-- @return number copper
+function LootProfile:GetCurrentRewardPotCopper()
+    self:_EnsureRewardPotConfig()
+    local copper = self._rewardPotStartingCopper
+    local logs = self._lootLogs or {}
+    for i = 1, #logs do
+        local log = logs[i]
+        local eventType = (log.GetEventType and log:GetEventType()) or log._eventType
+        if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.REWARD_POT_CHANGE) then
+            local data = (log.GetEventData and log:GetEventData()) or log._data or {}
+            local amount = (SF.LootLog and SF.LootLog.GetRewardPotChangeAmount and SF.LootLog.GetRewardPotChangeAmount(data)) or 0
+            if data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
+                copper = copper + amount
+            elseif data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
+                copper = copper - amount
+            end
+        end
+    end
+    if copper < 0 then
+        copper = 0
+    end
+    return copper
+end
+
+-- Function to compute a Raid Check pot deduction from the current pot
+-- @return number copper
+-- @return string|nil deductionType
+-- @return number|nil percent
+function LootProfile:ComputeRewardPotDeductionCopper()
+    self:_EnsureRewardPotConfig()
+    local current = self:GetCurrentRewardPotCopper()
+    if self._rewardPotDeductionType == DEDUCTION_TYPE_PERCENT then
+        local percent = tonumber(self._rewardPotDeductionValue) or 0
+        if percent <= 0 or current <= 0 then
+            return 0, DEDUCTION_TYPE_PERCENT, percent
+        end
+        local deducted = math.floor(current * percent / 100)
+        if deducted > current then
+            deducted = current
+        end
+        return deducted, DEDUCTION_TYPE_PERCENT, percent
+    end
+
+    local amount = math.floor(tonumber(self._rewardPotDeductionValue) or 0)
+    if amount > current then
+        amount = current
+    end
+    return amount, DEDUCTION_TYPE_FLAT, nil
+end
+
+local function AppendProfileLog(self, eventType, eventData, opts)
+    if not SF.LootLog then
+        return false, "Loot logs are unavailable."
+    end
+    local logEntry = SF.LootLog.new(eventType, eventData, opts)
+    if not logEntry then
+        return false, "Failed to create loot log entry."
+    end
+    if self.AddLootLog then
+        self:AddLootLog(logEntry)
+    end
+    return true, nil
+end
+
+-- Function to set loot mode. Owner only.
+-- @param string mode
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetLootMode(mode)
+    self:_EnsureRewardPotConfig()
+    if not self:IsCurrentUserOwner() then
+        return false, "Only the profile owner can change loot mode."
+    end
+
+    mode = NormalizeLootMode(mode)
+    local oldMode = self._lootMode
+    if oldMode == mode then
+        return true, nil
+    end
+
+    local eventType = SF.LootLogEventTypes.LOOT_MODE_CHANGE
+    local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+    eventData.oldMode = oldMode
+    eventData.newMode = mode
+    local ok, err = AppendProfileLog(self, eventType, eventData)
+    if not ok then
+        return false, err
+    end
+
+    self._lootMode = mode
+    if SF.Debug then
+        SF.Debug:Info("LootProfile", "Loot mode changed: %s -> %s", tostring(oldMode), tostring(mode))
+    end
+    return true, nil
+end
+
+-- Function to set Reward Pot configuration. Admin or owner.
+-- @param table cfg
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:SetRewardPotConfig(cfg)
+    self:_EnsureRewardPotConfig()
+    if not self:IsCurrentUserAdmin() then
+        return false, "You must be an admin to change Reward Pot settings."
+    end
+
+    cfg = type(cfg) == "table" and cfg or {}
+    local startingPotCopper = cfg.startingPotCopper
+    if startingPotCopper == nil then
+        startingPotCopper = self._rewardPotStartingCopper
+    end
+    local deductionType = cfg.deductionType
+    if deductionType == nil then
+        deductionType = self._rewardPotDeductionType
+    end
+    local deductionValue = cfg.deductionValue
+    if deductionValue == nil then
+        deductionValue = self._rewardPotDeductionValue
+    end
+
+    startingPotCopper = NormalizeCopper(startingPotCopper)
+    deductionType = NormalizeDeductionType(deductionType)
+    deductionValue = NormalizeNonNegativeNumber(deductionValue, 0)
+    if deductionType == DEDUCTION_TYPE_FLAT then
+        deductionValue = math.floor(deductionValue)
+    end
+
+    if startingPotCopper == self._rewardPotStartingCopper
+        and deductionType == self._rewardPotDeductionType
+        and deductionValue == self._rewardPotDeductionValue then
+        return true, nil
+    end
+
+    local eventType = SF.LootLogEventTypes.REWARD_POT_CONFIG_CHANGE
+    local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+    eventData.startingPotCopper = startingPotCopper
+    eventData.deductionType = deductionType
+    eventData.deductionValue = deductionValue
+    local ok, err = AppendProfileLog(self, eventType, eventData)
+    if not ok then
+        return false, err
+    end
+
+    self._rewardPotStartingCopper = startingPotCopper
+    self._rewardPotDeductionType = deductionType
+    self._rewardPotDeductionValue = deductionValue
+    return true, nil
+end
+
+-- Function to add or subtract gold from the Reward Pot. Admin or owner.
+-- Amount is clamped so the pot never goes below zero; the log stores the applied copper.
+-- @param string change INCREMENT or DECREMENT
+-- @param number amountCopper
+-- @param string|nil reason
+-- @param table|nil extra
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:AdjustRewardPot(change, amountCopper, reason, extra)
+    self:_EnsureRewardPotConfig()
+    if not self:IsCurrentUserAdmin() then
+        return false, "You must be an admin to adjust the Reward Pot."
+    end
+
+    amountCopper = NormalizeCopper(amountCopper)
+    if amountCopper <= 0 then
+        return false, "Enter an amount greater than zero."
+    end
+
+    local increment = SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT or "INCREMENT"
+    local decrement = SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT or "DECREMENT"
+    if change ~= increment and change ~= decrement then
+        return false, "Invalid Reward Pot adjustment."
+    end
+
+    if change == decrement then
+        local current = self:GetCurrentRewardPotCopper()
+        if current <= 0 then
+            return false, "The Reward Pot is already empty."
+        end
+        if amountCopper > current then
+            amountCopper = current
+        end
+    end
+
+    local eventType = SF.LootLogEventTypes.REWARD_POT_CHANGE
+    local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+    eventData.change = change
+    eventData.amount = amountCopper
+    eventData.reason = reason or "MANUAL"
+    extra = type(extra) == "table" and extra or nil
+    if extra and extra.deductionType then
+        eventData.deductionType = extra.deductionType
+    end
+    if extra and extra.percent ~= nil then
+        eventData.percent = extra.percent
+    end
+
+    local logOpts = {}
+    if extra and extra.logAuthor then
+        logOpts.author = extra.logAuthor
+    end
+    local ok, err = AppendProfileLog(self, eventType, eventData, logOpts)
+    if not ok then
+        return false, err
+    end
+    return true, nil
 end
 
 -- Function to get the point name for this profile
@@ -1689,6 +1990,8 @@ function LootProfile:ExportSnapshot()
 		equipmentSnapshots = equipmentSnapshotsOut,
 		pointName       = self._pointName or "Points",
 		raidCheck       = self:GetRaidCheckConfig(),
+		lootMode        = self:GetLootMode(),
+		rewardPot       = self:GetRewardPotConfig(),
 	}
 end
 
@@ -1774,6 +2077,27 @@ function LootProfile.ValidateSnapshot(snapshot)
 		end
 		if snapshot.raidCheck.slots ~= nil and type(snapshot.raidCheck.slots) ~= "table" then
 			return false, "snapshot.raidCheck.slots must be a table when provided"
+		end
+	end
+
+	if snapshot.lootMode ~= nil then
+		if type(snapshot.lootMode) ~= "string" then
+			return false, "snapshot.lootMode must be a string when provided"
+		end
+	end
+
+	if snapshot.rewardPot ~= nil then
+		if type(snapshot.rewardPot) ~= "table" then
+			return false, "snapshot.rewardPot must be a table or nil"
+		end
+		if snapshot.rewardPot.startingPotCopper ~= nil and type(snapshot.rewardPot.startingPotCopper) ~= "number" then
+			return false, "snapshot.rewardPot.startingPotCopper must be a number when provided"
+		end
+		if snapshot.rewardPot.deductionType ~= nil and type(snapshot.rewardPot.deductionType) ~= "string" then
+			return false, "snapshot.rewardPot.deductionType must be a string when provided"
+		end
+		if snapshot.rewardPot.deductionValue ~= nil and type(snapshot.rewardPot.deductionValue) ~= "number" then
+			return false, "snapshot.rewardPot.deductionValue must be a number when provided"
 		end
 	end
 
@@ -1906,6 +2230,28 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	end
 
 	self:_EnsureRaidCheckConfig()
+	self:_EnsureRewardPotConfig()
+
+	-- Import loot mode / Reward Pot config only when the snapshot actually contains them.
+	-- Older clients omit these fields; keeping local values prevents clobbering.
+	if type(snapshot.lootMode) == "string" then
+		self._lootMode = NormalizeLootMode(snapshot.lootMode)
+	end
+	if type(snapshot.rewardPot) == "table" then
+		if snapshot.rewardPot.startingPotCopper ~= nil then
+			self._rewardPotStartingCopper = NormalizeCopper(snapshot.rewardPot.startingPotCopper)
+		end
+		if snapshot.rewardPot.deductionType ~= nil then
+			self._rewardPotDeductionType = NormalizeDeductionType(snapshot.rewardPot.deductionType)
+		end
+		if snapshot.rewardPot.deductionValue ~= nil then
+			self._rewardPotDeductionValue = NormalizeNonNegativeNumber(snapshot.rewardPot.deductionValue, 0)
+			if self._rewardPotDeductionType == DEDUCTION_TYPE_FLAT then
+				self._rewardPotDeductionValue = math.floor(self._rewardPotDeductionValue)
+			end
+		end
+	end
+	self:_EnsureRewardPotConfig()
 
 	-- Merge Logs
 	local inserted = self:MergeLogTables(snapshot.lootLogs, opts)
@@ -2051,3 +2397,11 @@ end
 -- Export to Namespace
 -- ========================================================================
 SF.LootProfile = LootProfile
+SF.LootModes = {
+	POINT_BASED = LOOT_MODE_POINT_BASED,
+	REWARD_POT = LOOT_MODE_REWARD_POT,
+}
+SF.RewardPotDeductionTypes = {
+	FLAT = DEDUCTION_TYPE_FLAT,
+	PERCENT = DEDUCTION_TYPE_PERCENT,
+}
