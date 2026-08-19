@@ -115,10 +115,10 @@ When adding a new message type, update constants, routing, validation, handler r
 
 `modules/RaidCheck.lua` maintains an inspect queue and cache because WoW inspection and item links are asynchronous. It creates user-readable states for loading, out-of-range, stale, and saved snapshots.
 
-Pre-Raid Check only evaluates/report results. Raid Check additionally creates point-change logs for prepared profile members. Whisper timestamps are stored on members to suppress repeated missing-result messages on the same day.
+Pre-Raid Check only evaluates/report results. Raid Check additionally creates point-change logs for prepared profile members. The admin who runs either check always receives a system-message summary of missing players. Whisper timestamps are stored on members to suppress repeated missing-result messages on the same day.
 
 The settings Equipment page consumes versioned troubleshooting snapshots through listener callbacks. Avoid rebuilding it from raw WoW APIs independently; use `GetTroubleshootingSnapshot` or `GetTroubleshootingSlotsForUnit`.
 
 ## Testing changes
 
-For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover partial item data, range changes, profile/non-profile members, whisper suppression, and zero/fractional awards.
+For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover partial item data, range changes, profile/non-profile members, whisper suppression, zero/fractional awards, and admin system-message output independent of whisper settings. Item-link parsing used by enchant/gem checks is covered by `python -m pytest tests/test_raid_check_item_links.py`.

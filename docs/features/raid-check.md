@@ -11,7 +11,7 @@ Open **Loot Helper → Profile → Raid Check Profile Settings**.
 For each profile, admins can choose:
 
 - the point award per successful Raid Check: `0`, `0.5`, or `1`;
-- whether socketed equipment must contain gems;
+- whether every socket on socketed equipment must contain a gem;
 - whether at least one meta gem is required;
 - which equipment categories require enchant checks.
 
@@ -23,16 +23,16 @@ Both modes inspect every available party or raid unit.
 
 **Pre-Raid Check**
 
-- reports missing configured requirements;
-- can whisper members who are missing requirements;
+- reports missing configured requirements to the admin who ran the check as system messages;
+- can whisper offenders who are missing requirements when that setting is enabled;
 - does not award points.
 
 **Raid Check**
 
-- reports missing configured requirements;
+- reports missing configured requirements to the admin who ran the check as system messages;
 - awards the configured amount to each prepared player who belongs to the active profile;
 - skips point awards for prepared players who are not profile members;
-- can whisper missing and prepared results.
+- can whisper missing and prepared results when those settings are enabled.
 
 Run checks from **Loot Helper → Session**, or use `/sf raidcheck pre` and `/sf raidcheck raid`.
 
@@ -40,7 +40,7 @@ Run checks from **Loot Helper → Session**, or use `/sf raidcheck pre` and `/sf
 
 WoW only exposes another player's equipment when that player can be inspected. Results may temporarily show **Loading**, **Out of range**, **Unavailable**, or a saved snapshot while fresh data is collected.
 
-Raid Check does not treat partial item data as a definite failure and does not award points until the inspection is usable. Move close to unresolved players and refresh the equipment snapshot before rerunning the check.
+Raid Check does not treat partial item data as a definite failure and does not award points until the inspection is usable. Inspect stubs can already show a base item level and empty sockets from the item tooltip before gems and enchants populate; bonus IDs and item context are the signals that the inspect has resolved. Move close to unresolved players and refresh the equipment snapshot before rerunning the check.
 
 ## Equipment audit page
 
@@ -57,7 +57,7 @@ Saved profile snapshots allow absent members or temporarily unavailable inspecti
 
 ## Whispers
 
-Whispers are disabled by default. Admins can enable them separately for Pre-Raid Check and Raid Check.
+Whispers are disabled by default. Admins can enable them separately for Pre-Raid Check and Raid Check. Whisper settings do not control the admin-facing system-message summary; that summary always lists every player who is missing configured requirements.
 
 Templates support:
 
