@@ -339,6 +339,8 @@ function Controller:RefreshTitle()
     local primaryTitle = "Points"
     local pointName = ""
     local canAdmin = false
+    local rewardPot = false
+    local potText = nil
 
     if SF.GetActiveProfile then
         local p = SF:GetActiveProfile()
@@ -347,12 +349,25 @@ function Controller:RefreshTitle()
             canAdmin = p:IsCurrentUserAdmin() and true or false
            end
 
-           primaryTitle = "Points"
-           if p.GetPointName then
-            local v = p:GetPointName()
-            v = tostring(v or ""):match("^%s*(.-)%s*$")  -- trim
-            if v ~= "" then
-                primaryTitle = v
+           rewardPot = p.IsRewardPotMode and p:IsRewardPotMode() and true or false
+           if rewardPot then
+            primaryTitle = "Attendance"
+            if p.GetCurrentRewardPotCopper then
+                local copper = p:GetCurrentRewardPotCopper() or 0
+                if SF.FormatMoney then
+                    potText = "Reward Pot: " .. SF.FormatMoney(copper)
+                else
+                    potText = "Reward Pot: " .. tostring(copper)
+                end
+            end
+           else
+            primaryTitle = "Points"
+            if p.GetPointName then
+                local v = p:GetPointName()
+                v = tostring(v or ""):match("^%s*(.-)%s*$")  -- trim
+                if v ~= "" then
+                    primaryTitle = v
+                end
             end
            end
         end
@@ -361,6 +376,9 @@ function Controller:RefreshTitle()
     if LH.Window then
         LH.Window:SetProfileName(primaryTitle)
         LH.Window:SetPointName(pointName)
+        if LH.Window.SetRewardPotHeader then
+            LH.Window:SetRewardPotHeader(rewardPot, potText)
+        end
         LH.Window:SetPlayButtonVisible(canAdmin)
         LH.Window:SetSessionActive(IsSessionActive())
     end

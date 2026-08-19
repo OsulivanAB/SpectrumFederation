@@ -39,6 +39,16 @@ local function MakeAdminPredicate(panel, section, pageDef)
 	end
 end
 
+local function MakeOwnerPredicate(panel, section, pageDef)
+	if type(pageDef.isOwner) ~= "function" then
+		return nil
+	end
+
+	return function()
+		return pageDef.isOwner(MakeCtx(panel, section))
+	end
+end
+
 -- Build a settings page from definition and populate with controls
 -- @param panel Frame The panel frame to build into
 -- @param pageDef table Page definition with sections and items
@@ -64,6 +74,7 @@ function R:Build(panel, pageDef)
 		})
 		sec.__sfPageBuilder = pb
 		sec.__sfAdminPredicate = MakeAdminPredicate(panel, sec, pageDef)
+		sec.__sfOwnerPredicate = MakeOwnerPredicate(panel, sec, pageDef)
 		sec.__sfFillHeight = secDef.fillHeight and true or false
 
 		local key = SectionKey(secDef)
@@ -99,7 +110,7 @@ function R:Build(panel, pageDef)
 				controls:AddTitleDivider(sec, item)
 
 			elseif t == "spacer" then
-				if item.visible ~= nil or item.adminOnly or item.enabled ~= nil then
+				if item.visible ~= nil or item.adminOnly or item.ownerOnly or item.enabled ~= nil then
 					controls:AddSpacerRow(sec, item)
 				else
 					sec:AddSpacer(item.height or 8)
@@ -169,6 +180,17 @@ function R:Build(panel, pageDef)
 					end
 				end
 				controls:AddEditBox(sec, opts)
+
+			elseif t == "moneyEdit" then
+				local opts = item
+				if type(opts.onCommit) == "function" then
+					local fn = opts.onCommit
+					opts = CopyTable(opts)
+					opts.onCommit = function(copper)
+						return fn(MakeCtx(panel, sec), copper)
+					end
+				end
+				controls:AddMoneyEdit(sec, opts)
 
 			elseif t == "dropdownIconButton" then
 				local opts = item

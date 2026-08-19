@@ -568,6 +568,22 @@ function Window:Create()
     content:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -C.CONTENT_PADDING, C.CONTENT_PADDING)
     frame.Content = content
 
+    local potHeader = CreateFrame("Frame", nil, content)
+    potHeader:SetHeight(C.POT_HEADER_HEIGHT or 22)
+    potHeader:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+    potHeader:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, 0)
+    potHeader:Hide()
+    content.PotHeader = potHeader
+
+    local potText = potHeader:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    potText:SetPoint("LEFT", potHeader, "LEFT", 4, 0)
+    potText:SetPoint("RIGHT", potHeader, "RIGHT", -4, 0)
+    potText:SetJustifyH("LEFT")
+    potText:SetWordWrap(false)
+    potText:SetMaxLines(1)
+    potText:SetText("")
+    potHeader.Text = potText
+
     local scroll = CreateFrame("ScrollFrame", nil, content, "UIPanelScrollFrameTemplate")
     scroll:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
     local sb = scroll.ScrollBar
@@ -682,6 +698,23 @@ function Window:SetPointName(name)
     end
 end
 
+function Window:SetRewardPotHeader(isVisible, text)
+    local f = self._frame
+    if not f or not f.Content or not f.Content.PotHeader then return end
+
+    local header = f.Content.PotHeader
+    isVisible = isVisible and true or false
+    header:SetShown(isVisible)
+    if header.Text then
+        if isVisible then
+            header.Text:SetText(tostring(text or ""))
+        else
+            header.Text:SetText("")
+        end
+    end
+    self:RequestScrollInsetsUpdate()
+end
+
 function Window:SetPlayButtonVisible(isVisible)
     local f = self._frame
     if not f or not f.Title or not f.Title.Play then return end
@@ -789,9 +822,16 @@ function Window:UpdateScrollInsets()
 		bottomInset = h + (C.RESIZE_HANDLE_GAP or 6)
 	end
 
+	-- Reserve top inset if the Reward Pot header is shown
+	local topInset = 0
+	local potHeader = content.PotHeader
+	if potHeader and potHeader:IsShown() then
+		topInset = potHeader:GetHeight() or (C.POT_HEADER_HEIGHT or 22)
+	end
+
 	-- Apply anchors
 	scroll:ClearAllPoints()
-	scroll:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+	scroll:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -topInset)
 	scroll:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", -rightInset, bottomInset)
 
 	-- Clamp scroll offset if content shrank while scrolled

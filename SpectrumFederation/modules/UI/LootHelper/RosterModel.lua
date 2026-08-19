@@ -222,6 +222,7 @@ function Model:Build(profile)
     if profile.IsCurrentUserAdmin then
         canAdmin = profile:IsCurrentUserAdmin() and true or false
     end
+    local rewardPot = profile.IsRewardPotMode and profile:IsRewardPotMode() and true or false
 
     local raidById = BuildRaidMap()
     for id, info in pairs(raidById) do
@@ -239,7 +240,12 @@ function Model:Build(profile)
 
         if showMembersNotInRaid or inRaid then
             local m = entry.member
-            local points = (m and m.GetPointBalance and m:GetPointBalance()) or m.pointBalance or 0
+            local points = 0
+            if rewardPot then
+                points = (m and m.GetAttendanceBalance and m:GetAttendanceBalance()) or (m and m.attendanceBalance) or 0
+            else
+                points = (m and m.GetPointBalance and m:GetPointBalance()) or (m and m.pointBalance) or 0
+            end
             local resolvedClass = (raidInfo and raidInfo.class) or entry.class or self._classByMemberId[id] or "UNKNOWN"
             if resolvedClass == "UNKNOWN" and SF.Debug then
                 SF.Debug:Warn("LH_ICON", "Unable to resolve class metadata (member=%s classRaw=%s inRaid=%s)",
@@ -260,6 +266,7 @@ function Model:Build(profile)
                 member = m,
                 canAdmin = canAdmin,
                 inRaid = inRaid,
+                rewardPot = rewardPot,
             })
         end
     end
