@@ -666,17 +666,15 @@ local function IsSlotLinkPotentiallyIncomplete(slotsByInventory, inventorySlot)
 		end
 	end
 
-	-- Bonus IDs / item context mean inspect data has resolved. An unenchanted
+	-- Bonus IDs / itemContext mean inspect data has resolved. An unenchanted
 	-- item with empty sockets is a complete link, not a TWW inspect stub.
 	-- Format after uniqueID: linkLevel:spec:modifiersMask:itemContext:numBonusIDs:...
+	-- Inspect stubs often include linkLevel (field 9) plus the item's base
+	-- itemLevel from GetDetailedItemLevelInfo before gems/enchants populate,
+	-- so itemLevel is not a completeness signal.
 	local itemContext = tonumber(fields[12])
 	local numBonusIDs = tonumber(fields[13])
 	if (itemContext and itemContext ~= 0) or (numBonusIDs and numBonusIDs > 0) then
-		return false
-	end
-
-	local itemLevel = tonumber(slotData.itemLevel)
-	if itemLevel and itemLevel > 0 and #fields >= 9 then
 		return false
 	end
 
@@ -1805,30 +1803,24 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 
 	local missing = {}
 
-	-- If the link has all modification fields zeroed (enchant, gems, suffix),
-	-- it may be a stub that has not fully resolved.  Skip enchant/gem checks
-	-- to avoid false positives; the background poll will re-check soon.
-	local itemString = link:match("item:([%-%d:]+)")
-	local linkMayBeIncomplete = false
-	if itemString then
-		local fields = { strsplit(":", itemString) }
-		if #fields >= 7 then
-			linkMayBeIncomplete = true
-			for i = 2, math.min(7, #fields) do
-				local v = fields[i]
-				if v and v ~= "" and v ~= "0" then
-					linkMayBeIncomplete = false
-					break
-				end
-			end
-		end
-	end
+	-- Use the same completeness rules as snapshot/audit: bonus IDs and
+	-- itemContext mean the inspect resolved, even when enchant/gem fields
+	-- are still zero. Incomplete stubs skip both enchant and gem failures.
+	local inventorySlot = slotDef.slots[idx]
+	local tempSlots = {
+		[inventorySlot] = {
+			link = link,
+			itemId = GetInventoryItemID(unit, inventorySlot),
+			texture = GetInventoryItemTexture(unit, inventorySlot),
+		},
+	}
+	local linkMayBeIncomplete = IsSlotLinkPotentiallyIncomplete(tempSlots, inventorySlot)
 
 	if not linkMayBeIncomplete and IsSlotEnabledInConfig(cfg, slotKey, link) and ShouldCheckEnchant(slotDef, link) and not HasEnchant(link) then
 		table.insert(missing, label .. " Enchant")
 	end
 
-	if cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
+	if not linkMayBeIncomplete and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
 		table.insert(missing, label .. " Gem")
 	end
 
@@ -1859,14 +1851,11 @@ local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, i
 		return { label .. " Item" }, false
 	end
 
-	-- If the link looks like an incomplete stub (all modification fields are
-	-- zero), do not flag enchant requirements as missing. Gem checks still run
-	-- because a resolved unenchanted item with empty sockets has the same
-	-- zeroed early fields.
+	-- Incomplete TWW inspect stubs omit gem IDs and can still show empty
+	-- sockets from the base item tooltip/stats. Keep those pending instead
+	-- of treating them as definitive gem failures. Resolved items with
+	-- bonus IDs or itemContext skip this branch.
 	if IsSlotLinkPotentiallyIncomplete(slotsByInventory, inventorySlot) then
-		if cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
-			return { label .. " Gem" }, false
-		end
 		return {}, true
 	end
 
@@ -1974,10 +1963,10 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 	end
 
 	local missingEnchant = shouldCheckEnchant and not hasEnchant and not linkIncomplete
-	-- Gem checks are independent of enchant-slot toggles and of the stub-link
-	-- guard. A fully resolved unenchanted item with an empty prismatic socket
-	-- has zeroed enchant/gem fields and must still blink for missing gems.
-	local missingGems = isKnown and link and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
+	-- Gem checks are independent of enchant-slot toggles, but still wait for
+	-- inspect stubs to resolve. Bonus IDs / itemContext mark unenchanted
+	-- empty-socket items as complete so they can blink for missing gems.
+	local missingGems = isKnown and link and not linkIncomplete and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
 	local missingItem = isKnown and (not hasItem) and configEnabled and not twoHandExempt
 	local skippedEnchant = isKnown and link and configEnabled and not shouldCheckEnchant
 	local itemDataPending = ((isKnown and hasItem and not link) or linkIncomplete) and true or false

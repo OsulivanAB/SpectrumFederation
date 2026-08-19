@@ -71,6 +71,7 @@ def has_missing_gems(link: str, socket_count: int) -> bool:
 
 
 def is_link_potentially_incomplete(link: str, has_item_evidence: bool, item_level: int | None = None) -> bool:
+    """Match RaidCheck.lua: bonus IDs / itemContext complete a link, item_level does not."""
     fields = item_fields(link)
     if not fields:
         return False
@@ -82,8 +83,6 @@ def is_link_potentially_incomplete(link: str, has_item_evidence: bool, item_leve
     item_context = int(fields[11]) if len(fields) >= 12 and fields[11].isdigit() else 0
     num_bonus_ids = int(fields[12]) if len(fields) >= 13 and fields[12].isdigit() else 0
     if item_context or num_bonus_ids > 0:
-        return False
-    if item_level and item_level > 0 and len(fields) >= 9:
         return False
     return has_item_evidence
 
@@ -140,18 +139,27 @@ def test_stub_links_with_item_evidence_are_incomplete():
     assert is_link_potentially_incomplete(STUB_LINK, has_item_evidence=True) is True
     assert is_link_potentially_incomplete(UNENCHANTED_COMPLETE_LINK, has_item_evidence=True) is False
     assert is_link_potentially_incomplete(ENCHANTED_GEMMED_LINK, has_item_evidence=True) is False
-    assert is_link_potentially_incomplete(RESOLVED_EMPTY_SOCKET_NECK, has_item_evidence=True, item_level=305) is False
+    # Bonus IDs / itemContext prove completeness even when early fields are zero.
     assert is_link_potentially_incomplete(RESOLVED_EMPTY_SOCKET_NECK, has_item_evidence=True) is False
+    assert is_link_potentially_incomplete(RESOLVED_EMPTY_SOCKET_NECK, has_item_evidence=True, item_level=305) is False
+    # A stub can already expose a base itemLevel and linkLevel without being complete.
+    stub_with_ilvl = "|cffffffff|Hitem:12345:0:0:0:0:0:0:0:80:::|h[Test Item]|h|r"
+    assert is_link_potentially_incomplete(stub_with_ilvl, has_item_evidence=True, item_level=305) is True
 
 
-def test_raid_check_lua_does_not_hide_gems_behind_stub_guard():
+def test_raid_check_lua_keeps_stub_gems_pending():
     source = RAID_CHECK_LUA.read_text(encoding="utf-8")
-    assert "not linkIncomplete and HasMissingGems" not in source
     assert "C_TooltipInfo" in source
+    assert "not linkIncomplete and HasMissingGems" in source
     incomplete_fn = source.split("local function IsSlotLinkPotentiallyIncomplete", 1)[1]
     incomplete_fn = incomplete_fn.split("local function SlotHasAnyItemData", 1)[0]
     assert "numBonusIDs" in incomplete_fn
     assert "itemContext" in incomplete_fn
+    assert "itemLevel and itemLevel > 0 and #fields >= 9" not in incomplete_fn
+    snapshot_fn = source.split("local function BuildMissingForSlotSnapshot", 1)[1]
+    snapshot_fn = snapshot_fn.split("local function HasEquippedMetaGemInSnapshot", 1)[0]
+    assert "return {}, true" in snapshot_fn
+    assert 'return { label .. " Gem" }, false' not in snapshot_fn
 
 
 def test_admin_missing_summary_is_independent_of_whisper_setting():
