@@ -448,6 +448,8 @@ local function BuildAuditRowSignature(rowData)
 		tostring(rowData.inspectStatus or "ready"),
 		tostring(rowData.inspectLabel or ""),
 		tostring(rowData.inspectMessage or ""),
+		rowData.missingMetaGem and "mm1" or "mm0",
+		rowData.metaGemPending and "mp1" or "mp0",
 	}
 
 	for _, slotData in ipairs(rowData.slots or {}) do
@@ -487,6 +489,9 @@ end
 
 local function FormatAuditRowName(rowData)
 	local name = (rowData and (rowData.displayName or rowData.name)) or "?"
+	if rowData and rowData.missingMetaGem then
+		name = string.format("%s |cffff4040(Meta Gem)|r", name)
+	end
 	local status = rowData and rowData.inspectStatus
 	if status == "saved" or status == "paused" then
 		return name
@@ -555,6 +560,12 @@ local function ShowAuditCellTooltip(self)
 
 	if slotData.missingItem then
 		GameTooltip:AddLine("Raid Check will flag this slot as missing gear.", 1, 0.35, 0.35, true)
+	end
+
+	if rowData and rowData.missingMetaGem then
+		GameTooltip:AddLine("Missing required meta gem.", 1, 0.25, 0.25, true)
+	elseif rowData and rowData.metaGemPending then
+		GameTooltip:AddLine("Meta gem data is still loading.", 0.75, 0.75, 0.75, true)
 	end
 
 	if slotData.stale then
@@ -1540,7 +1551,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "heading", text = "Raid Check Profile Settings" },
 				{ type = "slider", label = "Points Per Raid Check", adminOnly = true, min = 0, max = 1, step = 0.5, tooltip = "Set how many points each prepared player earns when running a Raid Check.", enabled = function() return ProfileActionsEnabled() end, get = function() return GetRaidCheckPointsAwardPerCheck() end, set = function(v) SetRaidCheckPointsAwardPerCheck(v) end },
 				{ type = "text", text = "Requirements to look for" },
-				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Gem in Sockets", tooltip = "Require socketed gear to have gems inserted during raid checks.", get = function() return IsRaidCheckGemSocketsEnabled() end, set = function(v) SetRaidCheckGemSockets(v) end }, { label = "At Least One Meta Gem", tooltip = "Require at least one meta gem to be equipped in a valid socket during raid checks.", get = function() return IsRaidCheckMetaGemRequired() end, set = function(v) SetRaidCheckMetaGemRequired(v) end } } },
+				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Gem in Sockets", tooltip = "Require every socket on equipped gear to contain a gem during raid checks.", get = function() return IsRaidCheckGemSocketsEnabled() end, set = function(v) SetRaidCheckGemSockets(v) end }, { label = "At Least One Meta Gem", tooltip = "Require at least one meta gem to be equipped in a valid socket during raid checks.", get = function() return IsRaidCheckMetaGemRequired() end, set = function(v) SetRaidCheckMetaGemRequired(v) end } } },
 				{ type = "text", text = "Enchants to look for" },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Head", get = function() return IsRaidCheckSlotEnabled("head") end, set = function(v) SetRaidCheckSlot("head", v) end }, { label = "Gloves", get = function() return IsRaidCheckSlotEnabled("hands") end, set = function(v) SetRaidCheckSlot("hands", v) end } } },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Neck", get = function() return IsRaidCheckSlotEnabled("neck") end, set = function(v) SetRaidCheckSlot("neck", v) end }, { label = "Belt", get = function() return IsRaidCheckSlotEnabled("belt") end, set = function(v) SetRaidCheckSlot("belt", v) end } } },

@@ -64,6 +64,7 @@ This page includes:
 - start/end session control;
 - saved raid-wide safe-mode preferences for all-the-time or combat use;
 - Pre-Raid Check and Raid Check actions;
+- admin system-message summaries of missing players, independent of whisper settings;
 - optional whispers for missing and prepared players;
 - editable whisper templates.
 
