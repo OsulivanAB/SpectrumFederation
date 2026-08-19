@@ -4,7 +4,9 @@ local addonName, SF = ...
 -- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET
 -- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
 -- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetDetailedItemLevelInfo C_Item
--- luacheck: globals GetInventoryItemID
+-- luacheck: globals GetInventoryItemID C_TooltipInfo TooltipUtil Enum
+-- luacheck: globals EMPTY_SOCKET_PRISMATIC EMPTY_SOCKET_META EMPTY_SOCKET_RED EMPTY_SOCKET_YELLOW EMPTY_SOCKET_BLUE
+-- luacheck: globals EMPTY_SOCKET_HYDRAULIC EMPTY_SOCKET_COGWHEEL EMPTY_SOCKET_DOMINATION EMPTY_SOCKET_TINKER EMPTY_SOCKET_PRIMORDIAL
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
 -- luacheck: globals InspectFrame InspectUnit hooksecurefunc canaccessvalue
@@ -284,8 +286,79 @@ local function CountItemSockets(link)
 	return CountSocketsFromItemStats(link)
 end
 
+local function GetGemSocketLineType()
+	if Enum and Enum.TooltipDataLineType and Enum.TooltipDataLineType.GemSocket then
+		return Enum.TooltipDataLineType.GemSocket
+	end
+	return 3
+end
+
+local function IsLocalizedEmptySocketText(text)
+	if type(text) ~= "string" or text == "" then
+		return false
+	end
+
+	if EMPTY_SOCKET_PRISMATIC and text == EMPTY_SOCKET_PRISMATIC then return true end
+	if EMPTY_SOCKET_META and text == EMPTY_SOCKET_META then return true end
+	if EMPTY_SOCKET_RED and text == EMPTY_SOCKET_RED then return true end
+	if EMPTY_SOCKET_YELLOW and text == EMPTY_SOCKET_YELLOW then return true end
+	if EMPTY_SOCKET_BLUE and text == EMPTY_SOCKET_BLUE then return true end
+	if EMPTY_SOCKET_HYDRAULIC and text == EMPTY_SOCKET_HYDRAULIC then return true end
+	if EMPTY_SOCKET_COGWHEEL and text == EMPTY_SOCKET_COGWHEEL then return true end
+	if EMPTY_SOCKET_DOMINATION and text == EMPTY_SOCKET_DOMINATION then return true end
+	if EMPTY_SOCKET_TINKER and text == EMPTY_SOCKET_TINKER then return true end
+	if EMPTY_SOCKET_PRIMORDIAL and text == EMPTY_SOCKET_PRIMORDIAL then return true end
+
+	return false
+end
+
+local function SurfaceTooltipTable(data)
+	if type(data) == "table" and TooltipUtil and TooltipUtil.SurfaceArgs then
+		pcall(TooltipUtil.SurfaceArgs, data)
+	end
+end
+
+local function CountEmptySocketsFromTooltip(link)
+	if type(link) ~= "string" or not (C_TooltipInfo and C_TooltipInfo.GetHyperlink) then
+		return 0, 0
+	end
+
+	local ok, data = pcall(C_TooltipInfo.GetHyperlink, link)
+	if not ok or type(data) ~= "table" or type(data.lines) ~= "table" then
+		return 0, 0
+	end
+
+	SurfaceTooltipTable(data)
+
+	local gemSocketType = GetGemSocketLineType()
+	local empty = 0
+	local total = 0
+	for i = 1, #data.lines do
+		local line = data.lines[i]
+		if type(line) == "table" then
+			SurfaceTooltipTable(line)
+			if line.type == gemSocketType then
+				total = total + 1
+				local text = line.leftText
+				if IsLocalizedEmptySocketText(text) or type(text) ~= "string" or text == "" then
+					empty = empty + 1
+				end
+			end
+		end
+	end
+
+	return empty, total
+end
+
 local function HasMissingGems(link)
 	if type(link) ~= "string" then return false end
+
+	-- The item tooltip is the same source players see, including bonus-ID
+	-- prismatic sockets that may not appear in GetItemStats or gem link fields.
+	local emptyFromTooltip, socketsFromTooltip = CountEmptySocketsFromTooltip(link)
+	if socketsFromTooltip > 0 then
+		return emptyFromTooltip > 0
+	end
 
 	-- Every socket on the item must contain a gem. Socket count comes from
 	-- item stats / C_Item; fill state is checked per index so one empty
@@ -591,6 +664,20 @@ local function IsSlotLinkPotentiallyIncomplete(slotsByInventory, inventorySlot)
 			-- At least one modification field is populated; link looks complete.
 			return false
 		end
+	end
+
+	-- Bonus IDs / item context mean inspect data has resolved. An unenchanted
+	-- item with empty sockets is a complete link, not a TWW inspect stub.
+	-- Format after uniqueID: linkLevel:spec:modifiersMask:itemContext:numBonusIDs:...
+	local itemContext = tonumber(fields[12])
+	local numBonusIDs = tonumber(fields[13])
+	if (itemContext and itemContext ~= 0) or (numBonusIDs and numBonusIDs > 0) then
+		return false
+	end
+
+	local itemLevel = tonumber(slotData.itemLevel)
+	if itemLevel and itemLevel > 0 and #fields >= 9 then
+		return false
 	end
 
 	-- All modification fields are zero/empty.  If the item also has a texture
@@ -1136,6 +1223,59 @@ function RC:_NotifyTroubleshootingListeners(force)
 	return version
 end
 
+function RC:_ClearPreparedSlotCaches()
+	local state = self:_GetInspectState()
+	if state.localSnapshot then
+		state.localSnapshot.preparedSlotsByConfig = {}
+	end
+
+	local seen = {}
+	for _, entry in pairs(state.cache) do
+		if type(entry) == "table" and not seen[entry] then
+			seen[entry] = true
+			entry.preparedSlotsByConfig = {}
+		end
+	end
+
+	local profile = GetProfile()
+	if profile and type(profile.GetRaidCheckEquipmentSnapshotIds) == "function" then
+		for _, memberId in ipairs(profile:GetRaidCheckEquipmentSnapshotIds() or {}) do
+			local snapshot = profile:GetRaidCheckEquipmentSnapshot(memberId)
+			if type(snapshot) == "table" then
+				snapshot.preparedSlotsByConfig = {}
+			end
+		end
+	end
+end
+
+function RC:_ScheduleTooltipDataRefresh()
+	local state = self:_GetInspectState()
+	if not next(state.listeners) then
+		return
+	end
+	if state.tooltipRefreshScheduled then
+		return
+	end
+	if not (C_Timer and C_Timer.After) then
+		self:_ClearPreparedSlotCaches()
+		self:_MarkTroubleshootingDirty()
+		self:_NotifyTroubleshootingListeners()
+		return
+	end
+
+	state.tooltipRefreshScheduled = true
+	C_Timer.After(0.25, function()
+		local current = self:_GetInspectState()
+		current.tooltipRefreshScheduled = false
+		if not next(current.listeners) then
+			return
+		end
+		self:_ClearPreparedSlotCaches()
+		self:_MarkTroubleshootingDirty()
+		self:_NotifyTroubleshootingListeners()
+	end)
+end
+
 function RC:RegisterTroubleshootingListener(key, callback)
 	if not key or type(callback) ~= "function" then
 		return
@@ -1305,6 +1445,7 @@ function RC:EnsureInspectSupport()
 	frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 	frame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 	frame:RegisterEvent("UNIT_INVENTORY_CHANGED")
+	frame:RegisterEvent("TOOLTIP_DATA_UPDATE")
 	frame:SetScript("OnEvent", function(_, event, arg1)
 		if event == "ADDON_LOADED" then
 			if arg1 == "Blizzard_InspectUI" then
@@ -1323,6 +1464,8 @@ function RC:EnsureInspectSupport()
 			self:_InvalidateInspectUnit("player")
 		elseif event == "UNIT_INVENTORY_CHANGED" then
 			self:_InvalidateInspectUnit(arg1)
+		elseif event == "TOOLTIP_DATA_UPDATE" then
+			self:_ScheduleTooltipDataRefresh()
 		elseif event == "PLAYER_ENTERING_WORLD" then
 			local state = self:_GetInspectState()
 			-- Preserve cached inspect snapshots across zoning so the Equipment
@@ -1685,7 +1828,7 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 		table.insert(missing, label .. " Enchant")
 	end
 
-	if not linkMayBeIncomplete and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
+	if cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
 		table.insert(missing, label .. " Gem")
 	end
 
@@ -1717,9 +1860,13 @@ local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, i
 	end
 
 	-- If the link looks like an incomplete stub (all modification fields are
-	-- zero), do not flag enchant or gem requirements as missing.  The data
-	-- will be re-fetched on the next inspect cycle.
+	-- zero), do not flag enchant requirements as missing. Gem checks still run
+	-- because a resolved unenchanted item with empty sockets has the same
+	-- zeroed early fields.
 	if IsSlotLinkPotentiallyIncomplete(slotsByInventory, inventorySlot) then
+		if cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) then
+			return { label .. " Gem" }, false
+		end
 		return {}, true
 	end
 
@@ -1827,7 +1974,10 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 	end
 
 	local missingEnchant = shouldCheckEnchant and not hasEnchant and not linkIncomplete
-	local missingGems = isKnown and link and cfg and cfg.checkGemsInSockets ~= false and not linkIncomplete and HasMissingGems(link) or false
+	-- Gem checks are independent of enchant-slot toggles and of the stub-link
+	-- guard. A fully resolved unenchanted item with an empty prismatic socket
+	-- has zeroed enchant/gem fields and must still blink for missing gems.
+	local missingGems = isKnown and link and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
 	local missingItem = isKnown and (not hasItem) and configEnabled and not twoHandExempt
 	local skippedEnchant = isKnown and link and configEnabled and not shouldCheckEnchant
 	local itemDataPending = ((isKnown and hasItem and not link) or linkIncomplete) and true or false

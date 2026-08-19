@@ -70,7 +70,7 @@ def has_missing_gems(link: str, socket_count: int) -> bool:
     return False
 
 
-def is_link_potentially_incomplete(link: str, has_item_evidence: bool) -> bool:
+def is_link_potentially_incomplete(link: str, has_item_evidence: bool, item_level: int | None = None) -> bool:
     fields = item_fields(link)
     if not fields:
         return False
@@ -79,6 +79,12 @@ def is_link_potentially_incomplete(link: str, has_item_evidence: bool) -> bool:
     for value in fields[1:7]:
         if value and value not in ("", "0"):
             return False
+    item_context = int(fields[11]) if len(fields) >= 12 and fields[11].isdigit() else 0
+    num_bonus_ids = int(fields[12]) if len(fields) >= 13 and fields[12].isdigit() else 0
+    if item_context or num_bonus_ids > 0:
+        return False
+    if item_level and item_level > 0 and len(fields) >= 9:
+        return False
     return has_item_evidence
 
 
@@ -100,8 +106,13 @@ def format_admin_missing_lines(mode_label: str, results: list[dict], whisper_ena
 
 ENCHANTED_GEMMED_LINK = "|cffa335ee|Hitem:12345:6789:111:222:333:0:0:0:80:::|h[Test Item]|h|r"
 EMPTY_SOCKET_LINK = "|cffa335ee|Hitem:12345:6789:111:0:0:0:0:0:80:::|h[Test Item]|h|r"
-STUB_LINK = "|cffffffff|Hitem:12345:0:0:0:0:0:0:0:80:::|h[Test Item]|h|r"
+STUB_LINK = "|cffffffff|Hitem:12345:0:0:0:0:0:0:0|h[Test Item]|h|r"
 UNENCHANTED_COMPLETE_LINK = "|cffa335ee|Hitem:12345:0:111:222:0:0:44:0:80:::|h[Test Item]|h|r"
+# Unenchanted neck with an empty bonus-ID prismatic socket: early gem/enchant
+# fields are zero, but bonus IDs prove the inspect has fully resolved.
+RESOLVED_EMPTY_SOCKET_NECK = (
+    "|cffa335ee|Hitem:237567:0:0:0:0:0:0:0:80:71:0:8:4:10390:10391:10392:10393|h[Strand of Warding Fangs]|h|r"
+)
 
 
 def test_parse_enchant_id_from_populated_link():
@@ -129,6 +140,18 @@ def test_stub_links_with_item_evidence_are_incomplete():
     assert is_link_potentially_incomplete(STUB_LINK, has_item_evidence=True) is True
     assert is_link_potentially_incomplete(UNENCHANTED_COMPLETE_LINK, has_item_evidence=True) is False
     assert is_link_potentially_incomplete(ENCHANTED_GEMMED_LINK, has_item_evidence=True) is False
+    assert is_link_potentially_incomplete(RESOLVED_EMPTY_SOCKET_NECK, has_item_evidence=True, item_level=305) is False
+    assert is_link_potentially_incomplete(RESOLVED_EMPTY_SOCKET_NECK, has_item_evidence=True) is False
+
+
+def test_raid_check_lua_does_not_hide_gems_behind_stub_guard():
+    source = RAID_CHECK_LUA.read_text(encoding="utf-8")
+    assert "not linkIncomplete and HasMissingGems" not in source
+    assert "C_TooltipInfo" in source
+    incomplete_fn = source.split("local function IsSlotLinkPotentiallyIncomplete", 1)[1]
+    incomplete_fn = incomplete_fn.split("local function SlotHasAnyItemData", 1)[0]
+    assert "numBonusIDs" in incomplete_fn
+    assert "itemContext" in incomplete_fn
 
 
 def test_admin_missing_summary_is_independent_of_whisper_setting():
