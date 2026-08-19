@@ -70,12 +70,11 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
-## [1.0.2-beta.3] - 2026-08-19
+
+## [1.0.2] - 2026-08-19
 
 ### Changed
-- Merge pull request #246 from OsulivanAB/cursor/raidcheck-admin-whisper-a340
-
-Keep Raid Check admin reports independent of whispers
+- Infrastructure and tooling updates (no addon code changes)
 
 ## [1.0.1] - 2026-08-12
 
