@@ -448,6 +448,8 @@ local function BuildAuditRowSignature(rowData)
 		tostring(rowData.inspectStatus or "ready"),
 		tostring(rowData.inspectLabel or ""),
 		tostring(rowData.inspectMessage or ""),
+		rowData.missingMetaGem and "mm1" or "mm0",
+		rowData.metaGemPending and "mp1" or "mp0",
 	}
 
 	for _, slotData in ipairs(rowData.slots or {}) do
@@ -487,6 +489,9 @@ end
 
 local function FormatAuditRowName(rowData)
 	local name = (rowData and (rowData.displayName or rowData.name)) or "?"
+	if rowData and rowData.missingMetaGem then
+		name = string.format("%s |cffff4040(Meta Gem)|r", name)
+	end
 	local status = rowData and rowData.inspectStatus
 	if status == "saved" or status == "paused" then
 		return name
@@ -555,6 +560,12 @@ local function ShowAuditCellTooltip(self)
 
 	if slotData.missingItem then
 		GameTooltip:AddLine("Raid Check will flag this slot as missing gear.", 1, 0.35, 0.35, true)
+	end
+
+	if rowData and rowData.missingMetaGem then
+		GameTooltip:AddLine("Missing required meta gem.", 1, 0.25, 0.25, true)
+	elseif rowData and rowData.metaGemPending then
+		GameTooltip:AddLine("Meta gem data is still loading.", 0.75, 0.75, 0.75, true)
 	end
 
 	if slotData.stale then
