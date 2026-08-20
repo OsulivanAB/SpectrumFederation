@@ -51,9 +51,11 @@ This page selects and manages the active profile. It includes:
 
 - profile creation, selection, rename, reset, and deletion;
 - profile owner and point-name display;
+- owner-only loot mode: Point Based or Reward Pot;
+- Reward Pot starting amount, Raid Check deduction, and gold add/subtract controls when Reward Pot is active;
 - Raid Check point, gem, meta-gem, and enchant requirements.
 
-Rename and profile-specific configuration are admin-only. Creating a profile makes the creator its owner and first admin.
+Rename and profile-specific configuration are admin-only. Only the profile owner can change loot mode. Creating a profile makes the creator its owner and first admin.
 
 **Reset Current Profile** is currently a nonfunctional placeholder and reports that it is not implemented.
 

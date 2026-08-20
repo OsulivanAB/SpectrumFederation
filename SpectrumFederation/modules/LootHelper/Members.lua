@@ -147,6 +147,7 @@ function Member.new(identifier, role, class)
     instance.className = instance.class
     
     instance.pointBalance = 0
+    instance.attendanceBalance = 0
     instance.most_recent_pre_raid_check_whisper = nil
     instance.most_recent_raid_check_whisper = nil
     
@@ -309,6 +310,12 @@ function Member:GetPointBalance()
     return self.pointBalance
 end
 
+-- Function to get the current attendance balance
+-- @return (number) - Current attendance balance
+function Member:GetAttendanceBalance()
+    return tonumber(self.attendanceBalance) or 0
+end
+
 function Member:GetMostRecentPreRaidCheckWhisper()
     return tonumber(self.most_recent_pre_raid_check_whisper) or nil
 end
@@ -457,6 +464,121 @@ function Member:DecrementPoints(metadata)
     return true
 end
 
+local ATTENDANCE_STEP = 1
+
+local function IsActiveProfileRewardPot()
+    local activeProfile = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+    return activeProfile and activeProfile.IsRewardPotMode and activeProfile:IsRewardPotMode()
+end
+
+-- Function to increment attendance by 1 (or opts.amount)
+-- @param opts table|nil Optional amount, reason, and log author
+-- @return (boolean) - True if successful, false otherwise
+function Member:IncrementAttendance(opts)
+    if not CanCurrentUserEditActiveProfile() then
+        return false
+    end
+
+    local logEventType = SF.LootLogEventTypes.ATTENDANCE_CHANGE
+    local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
+    logEventData.member = self:GetFullIdentifier()
+    logEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+    if opts and opts.amount ~= nil then
+        logEventData.amount = tonumber(opts.amount) or ATTENDANCE_STEP
+    else
+        logEventData.amount = ATTENDANCE_STEP
+    end
+    if opts and opts.reason then
+        logEventData.reason = opts.reason
+    end
+
+    local logOpts = {}
+    if opts and opts.logAuthor then
+        logOpts.author = opts.logAuthor
+    end
+    if opts and opts.timestamp then
+        logOpts.timestamp = opts.timestamp
+    end
+    local logEntry = SF.LootLog.new(logEventType, logEventData, logOpts)
+    if not logEntry then
+        SF:PrintError("Failed to create loot log entry for attendance increment.")
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create loot log entry for attendance increment for %s", self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    local amount = SF.LootLog.GetAttendanceChangeAmount(logEventData)
+    local oldBalance = tonumber(self.attendanceBalance) or 0
+    self.attendanceBalance = oldBalance + amount
+
+    AddLootLogToActiveProfile(logEntry)
+
+    if SF.Debug then
+        SF.Debug:Verbose("MEMBER", "%s attendance incremented: %s -> %s", self:GetFullIdentifier(), tostring(oldBalance), tostring(self.attendanceBalance))
+    end
+    return true
+end
+
+-- Function to decrement attendance, never going below zero
+-- @param opts table|nil Optional amount, reason, and log author
+-- @return (boolean) - True if successful, false otherwise
+function Member:DecrementAttendance(opts)
+    if not CanCurrentUserEditActiveProfile() then
+        return false
+    end
+
+    local oldBalance = tonumber(self.attendanceBalance) or 0
+    if oldBalance <= 0 then
+        return false
+    end
+
+    local requested = ATTENDANCE_STEP
+    if opts and opts.amount ~= nil then
+        requested = tonumber(opts.amount) or ATTENDANCE_STEP
+    end
+    if requested <= 0 then
+        return false
+    end
+    if requested > oldBalance then
+        requested = oldBalance
+    end
+
+    local logEventType = SF.LootLogEventTypes.ATTENDANCE_CHANGE
+    local logEventData = SF.LootLog.GetEventDataTemplate(logEventType)
+    logEventData.member = self:GetFullIdentifier()
+    logEventData.change = SF.LootLogPointChangeTypes.DECREMENT
+    logEventData.amount = requested
+    if opts and opts.reason then
+        logEventData.reason = opts.reason
+    end
+
+    local logOpts = {}
+    if opts and opts.logAuthor then
+        logOpts.author = opts.logAuthor
+    end
+    if opts and opts.timestamp then
+        logOpts.timestamp = opts.timestamp
+    end
+    local logEntry = SF.LootLog.new(logEventType, logEventData, logOpts)
+    if not logEntry then
+        SF:PrintError("Failed to create loot log entry for attendance decrement.")
+        if SF.Debug then
+            SF.Debug:Error("MEMBER", "Failed to create loot log entry for attendance decrement for %s", self:GetFullIdentifier())
+        end
+        return false
+    end
+
+    self.attendanceBalance = oldBalance - requested
+
+    AddLootLogToActiveProfile(logEntry)
+
+    if SF.Debug then
+        SF.Debug:Verbose("MEMBER", "%s attendance decremented: %s -> %s", self:GetFullIdentifier(), tostring(oldBalance), tostring(self.attendanceBalance))
+    end
+    return true
+end
+
 function Member:ApplyAwardedItem(slot, metadata)
     metadata = metadata or {}
 
@@ -513,38 +635,46 @@ function Member:ApplyAwardedItem(slot, metadata)
         return false
     end
 
-    local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
-    local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
+    local skipPoints = IsActiveProfileRewardPot()
+    local pointLogEntry = nil
     local pointAmount = EQUIPMENT_AWARD_POINT_COST
-    pointLogEventData.member = self:GetFullIdentifier()
-    pointLogEventData.change = SF.LootLogPointChangeTypes.DECREMENT
-    pointLogEventData.amount = pointAmount
-    if metadata.reason ~= nil then
-        pointLogEventData.reason = tostring(metadata.reason)
-    end
-    if metadata.source ~= nil then
-        pointLogEventData.source = tostring(metadata.source)
-    end
-    if metadata.rollType ~= nil then
-        pointLogEventData.rollType = tostring(metadata.rollType)
-    end
-    if metadata.itemLink ~= nil then
-        pointLogEventData.itemLink = tostring(metadata.itemLink)
-    end
-
-    local pointLogEntry = SF.LootLog.new(pointLogEventType, pointLogEventData, logOpts)
-    if not pointLogEntry then
-        if SF.Debug then
-            SF.Debug:Error("MEMBER", "Failed to create point log for awarded item for %s", self:GetFullIdentifier())
+    if not skipPoints then
+        local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
+        local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
+        pointLogEventData.member = self:GetFullIdentifier()
+        pointLogEventData.change = SF.LootLogPointChangeTypes.DECREMENT
+        pointLogEventData.amount = pointAmount
+        if metadata.reason ~= nil then
+            pointLogEventData.reason = tostring(metadata.reason)
         end
-        return false
+        if metadata.source ~= nil then
+            pointLogEventData.source = tostring(metadata.source)
+        end
+        if metadata.rollType ~= nil then
+            pointLogEventData.rollType = tostring(metadata.rollType)
+        end
+        if metadata.itemLink ~= nil then
+            pointLogEventData.itemLink = tostring(metadata.itemLink)
+        end
+
+        pointLogEntry = SF.LootLog.new(pointLogEventType, pointLogEventData, logOpts)
+        if not pointLogEntry then
+            if SF.Debug then
+                SF.Debug:Error("MEMBER", "Failed to create point log for awarded item for %s", self:GetFullIdentifier())
+            end
+            return false
+        end
     end
 
     self.armor[slot] = true
-    self.pointBalance = self.pointBalance - pointAmount
+    if not skipPoints then
+        self.pointBalance = self.pointBalance - pointAmount
+    end
 
     AddLootLogToActiveProfile(armorLogEntry)
-    AddLootLogToActiveProfile(pointLogEntry)
+    if pointLogEntry then
+        AddLootLogToActiveProfile(pointLogEntry)
+    end
 
     if SF.Debug then
         SF.Debug:Info(
@@ -620,38 +750,46 @@ function Member:ClearAwardedItem(slot, metadata)
         return false
     end
 
-    local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
-    local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
+    local skipPoints = IsActiveProfileRewardPot()
+    local pointLogEntry = nil
     local pointAmount = EQUIPMENT_AWARD_POINT_COST
-    pointLogEventData.member = self:GetFullIdentifier()
-    pointLogEventData.change = SF.LootLogPointChangeTypes.INCREMENT
-    pointLogEventData.amount = pointAmount
-    if metadata.reason ~= nil then
-        pointLogEventData.reason = tostring(metadata.reason)
-    end
-    if metadata.source ~= nil then
-        pointLogEventData.source = tostring(metadata.source)
-    end
-    if metadata.rollType ~= nil then
-        pointLogEventData.rollType = tostring(metadata.rollType)
-    end
-    if metadata.itemLink ~= nil then
-        pointLogEventData.itemLink = tostring(metadata.itemLink)
-    end
-
-    local pointLogEntry = SF.LootLog.new(pointLogEventType, pointLogEventData, logOpts)
-    if not pointLogEntry then
-        if SF.Debug then
-            SF.Debug:Error("MEMBER", "Failed to create point clear log for %s", self:GetFullIdentifier())
+    if not skipPoints then
+        local pointLogEventType = SF.LootLogEventTypes.POINT_CHANGE
+        local pointLogEventData = SF.LootLog.GetEventDataTemplate(pointLogEventType)
+        pointLogEventData.member = self:GetFullIdentifier()
+        pointLogEventData.change = SF.LootLogPointChangeTypes.INCREMENT
+        pointLogEventData.amount = pointAmount
+        if metadata.reason ~= nil then
+            pointLogEventData.reason = tostring(metadata.reason)
         end
-        return false
+        if metadata.source ~= nil then
+            pointLogEventData.source = tostring(metadata.source)
+        end
+        if metadata.rollType ~= nil then
+            pointLogEventData.rollType = tostring(metadata.rollType)
+        end
+        if metadata.itemLink ~= nil then
+            pointLogEventData.itemLink = tostring(metadata.itemLink)
+        end
+
+        pointLogEntry = SF.LootLog.new(pointLogEventType, pointLogEventData, logOpts)
+        if not pointLogEntry then
+            if SF.Debug then
+                SF.Debug:Error("MEMBER", "Failed to create point clear log for %s", self:GetFullIdentifier())
+            end
+            return false
+        end
     end
 
     self.armor[slot] = false
-    self.pointBalance = self.pointBalance + pointAmount
+    if not skipPoints then
+        self.pointBalance = self.pointBalance + pointAmount
+    end
 
     AddLootLogToActiveProfile(armorLogEntry)
-    AddLootLogToActiveProfile(pointLogEntry)
+    if pointLogEntry then
+        AddLootLogToActiveProfile(pointLogEntry)
+    end
 
     if SF.Debug then
         SF.Debug:Info(
@@ -816,6 +954,7 @@ function Member:UpdateFromLootLog()
 
     -- Calculate point balance from POINT_CHANGE logs
     pointBalance = 0
+    local attendanceBalance = 0
     for _, log in ipairs(filteredLogs) do
         if log.eventType == SF.LootLogEventTypes.POINT_CHANGE then
             local amount = SF.LootLog.GetPointChangeAmount(log.eventData)
@@ -824,9 +963,20 @@ function Member:UpdateFromLootLog()
             elseif log.eventData.change == SF.LootLogPointChangeTypes.DECREMENT then
                 pointBalance = pointBalance - amount
             end
+        elseif log.eventType == SF.LootLogEventTypes.ATTENDANCE_CHANGE then
+            local amount = SF.LootLog.GetAttendanceChangeAmount(log.eventData)
+            if log.eventData.change == SF.LootLogPointChangeTypes.INCREMENT then
+                attendanceBalance = attendanceBalance + amount
+            elseif log.eventData.change == SF.LootLogPointChangeTypes.DECREMENT then
+                attendanceBalance = attendanceBalance - amount
+            end
         end
     end
+    if attendanceBalance < 0 then
+        attendanceBalance = 0
+    end
     self.pointBalance = pointBalance
+    self.attendanceBalance = attendanceBalance
     self.armor = armorStatuses
 end
 
@@ -848,6 +998,7 @@ function Member:ToTable()
         role = self.role,
         class = self.class,
         pointBalance = self.pointBalance,
+        attendanceBalance = tonumber(self.attendanceBalance) or 0,
         armor = armorCopy,
         most_recent_pre_raid_check_whisper = tonumber(self.most_recent_pre_raid_check_whisper) or nil,
         most_recent_raid_check_whisper = tonumber(self.most_recent_raid_check_whisper) or nil,
@@ -867,6 +1018,7 @@ function Member.FromTable(t)
     
     -- Set point balance
     m.pointBalance = tonumber(t.pointBalance) or 0
+    m.attendanceBalance = tonumber(t.attendanceBalance) or 0
     m.most_recent_pre_raid_check_whisper = tonumber(t.most_recent_pre_raid_check_whisper) or nil
     m.most_recent_raid_check_whisper = tonumber(t.most_recent_raid_check_whisper) or nil
     

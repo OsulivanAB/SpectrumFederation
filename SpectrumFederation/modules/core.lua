@@ -148,6 +148,64 @@ function SF:Now()
     return (GetServerTime and GetServerTime()) or time()
 end
 
+-- ============================================================================
+-- Money helpers (WoW copper)
+-- ============================================================================
+
+SF.COPPER_PER_SILVER = 100
+SF.COPPER_PER_GOLD = 10000
+
+-- Convert gold/silver/copper components into a non-negative copper integer.
+-- @param gold number|nil
+-- @param silver number|nil
+-- @param copper number|nil
+-- @return number copper
+function SF.MoneyFromCoins(gold, silver, copper)
+	local g = math.floor(tonumber(gold) or 0)
+	local s = math.floor(tonumber(silver) or 0)
+	local c = math.floor(tonumber(copper) or 0)
+	if g < 0 then g = 0 end
+	if s < 0 then s = 0 end
+	if c < 0 then c = 0 end
+	local total = (g * SF.COPPER_PER_GOLD) + (s * SF.COPPER_PER_SILVER) + c
+	if total < 0 then
+		return 0
+	end
+	return total
+end
+
+-- Split a copper amount into gold, silver, and copper components.
+-- @param copper number|nil
+-- @return number gold
+-- @return number silver
+-- @return number copper
+function SF.MoneyToCoins(copper)
+	copper = math.floor(tonumber(copper) or 0)
+	if copper < 0 then
+		copper = 0
+	end
+	local gold = math.floor(copper / SF.COPPER_PER_GOLD)
+	local remain = copper - (gold * SF.COPPER_PER_GOLD)
+	local silver = math.floor(remain / SF.COPPER_PER_SILVER)
+	remain = remain - (silver * SF.COPPER_PER_SILVER)
+	return gold, silver, remain
+end
+
+-- Format a copper amount using WoW coin icons when available.
+-- @param copper number|nil
+-- @return string
+function SF.FormatMoney(copper)
+	copper = math.floor(tonumber(copper) or 0)
+	if copper < 0 then
+		copper = 0
+	end
+	if GetCoinTextureString then
+		return GetCoinTextureString(copper)
+	end
+	local gold, silver, remain = SF.MoneyToCoins(copper)
+	return string.format("%dg %ds %dc", gold, silver, remain)
+end
+
 -- Get the addon's current version from metadata
 -- @return string Addon version or "Unknown" if not found
 function SF:GetAddonVersion()

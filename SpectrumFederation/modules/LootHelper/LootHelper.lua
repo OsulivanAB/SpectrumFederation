@@ -316,6 +316,9 @@ function SF:RehydrateLootHelperDB()
 			if profile._EnsureOwnerIsAdmin then
 				profile:_EnsureOwnerIsAdmin()
 			end
+			if profile._EnsureRewardPotConfig then
+				profile:_EnsureRewardPotConfig()
+			end
 		end
 	end
 

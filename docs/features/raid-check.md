@@ -1,6 +1,6 @@
 # Raid Check
 
-Raid Check inspects group members' current equipment against requirements stored in the active loot profile. It can report missing gear, enchants, and gems, optionally whisper results, and award points to prepared profile members.
+Raid Check inspects group members' current equipment against requirements stored in the active loot profile. It can report missing gear, enchants, and gems, optionally whisper results, and award loot points or Attendance to prepared profile members.
 
 Only an admin of the active profile can run or configure a check.
 
@@ -10,37 +10,47 @@ Open **Loot Helper → Profile → Raid Check Profile Settings**.
 
 For each profile, admins can choose:
 
-- the point award per successful Raid Check: `0`, `0.5`, or `1`;
+- in [Point Based](point-based.md) mode, the loot-point award per successful Raid Check: `0`, `0.5`, or `1`;
 - whether every socket on socketed equipment must contain a gem;
 - whether at least one meta gem is required;
 - which equipment categories require enchant checks.
 
-All enchant categories and socketed-gem checks are enabled for a new profile. The meta-gem requirement is disabled, and the default point award is `0.5`.
+All enchant categories and socketed-gem checks are enabled for a new profile. The meta-gem requirement is disabled, and the default Point Based award is `0.5`.
+
+In [Reward Pot](reward-pot.md) mode, **Points Per Raid Check** is hidden. Prepared members receive `1` Attendance instead, and the pot uses the profile's Raid Check deduction settings.
+
+## Who is evaluated
+
+**Pre-Raid Check** and **Raid Check** both inspect profile members who are currently in the raid. Players who are in the raid but not in the profile are ignored. Players who are in the profile but not in the raid are ignored.
 
 ## Pre-Raid Check and Raid Check
 
-Both modes inspect every available party or raid unit.
-
 **Pre-Raid Check**
 
-- reports missing configured requirements to the admin who ran the check as system messages;
-- can whisper offenders who are missing requirements when that setting is enabled;
-- does not award points.
+- reports missing configured requirements and missing inspect data to the admin who ran the check as system messages;
+- can whisper players who are missing configured enchants or gems when that setting is enabled;
+- does not award loot points or Attendance;
+- does not change the Reward Pot.
 
 **Raid Check**
 
-- reports missing configured requirements to the admin who ran the check as system messages;
-- awards the configured amount to each prepared player who belongs to the active profile;
-- skips point awards for prepared players who are not profile members;
+- reports missing configured requirements and missing inspect data to the admin who ran the check as system messages;
+- in Point Based mode, awards the configured loot points to each prepared profile member in the raid;
+- in Reward Pot mode, awards `1` Attendance to each prepared profile member in the raid;
+- in Reward Pot mode, subtracts from the pot once if any evaluated member is unprepared;
 - can whisper missing and prepared results when those settings are enabled.
 
+A member with no usable inspect data is unprepared. That includes out of range, never inspected, and incomplete item data. Inspect gaps are listed in the admin summary and do not send a missing-gear whisper.
+
 Run checks from **Loot Helper → Session**, or use `/sf raidcheck pre` and `/sf raidcheck raid`.
+
+Running Raid Check more than once can award points or Attendance again and, in Reward Pot mode, deduct from the pot again.
 
 ## Inspect-data limitations
 
 WoW only exposes another player's equipment when that player can be inspected. Results may temporarily show **Loading**, **Out of range**, **Unavailable**, or a saved snapshot while fresh data is collected.
 
-Raid Check does not treat partial item data as a definite failure and does not award points until the inspection is usable. Inspect stubs can already show a base item level and empty sockets from the item tooltip before gems and enchants populate; bonus IDs and item context are the signals that the inspect has resolved. Move close to unresolved players and refresh the equipment snapshot before rerunning the check.
+Inspect stubs can already show a base item level and empty sockets from the item tooltip before gems and enchants populate. Move close to unresolved players and refresh the equipment snapshot before rerunning the check.
 
 ## Equipment audit page
 
@@ -57,7 +67,7 @@ Saved profile snapshots allow absent members or temporarily unavailable inspecti
 
 ## Whispers
 
-Whispers are disabled by default. Admins can enable them separately for Pre-Raid Check and Raid Check. Whisper settings do not control the admin-facing system-message summary; that summary always lists every player who is missing configured requirements.
+Whispers are disabled by default. Admins can enable them separately for Pre-Raid Check and Raid Check. Whisper settings do not control the admin-facing system-message summary; that summary always lists every evaluated player who is missing configured requirements or inspect data.
 
 Templates support:
 
@@ -66,8 +76,8 @@ Templates support:
 - `{point_name}`
 - `{points_awarded}`
 
-For missing requirements, the addon records when each profile member was whispered and suppresses repeated whispers of the same check type on the same calendar day. Prepared-player whispers are controlled separately and are sent only after a successful Raid Check point award.
+For missing requirements, the addon records when each profile member was whispered and suppresses repeated whispers of the same check type on the same calendar day. Prepared-player whispers are controlled separately and are sent only after a successful Raid Check award. In Reward Pot mode, `{point_name}` in both missing and prepared whispers uses Attendance rather than the profile's loot-point name.
 
 ## What gets recorded
 
-Raid Check point awards are normal point-change log entries with **Raid Check** as the author and can be reviewed on the [Loot Logs](loot-logs.md) page.
+Point Based awards are loot-point log entries with **Raid Check** as the author. Reward Pot awards are Attendance log entries with the same author. A Reward Pot deduction is a Reward Pot change with **Raid Check** as the author. Review them on the [Loot Logs](loot-logs.md) page.

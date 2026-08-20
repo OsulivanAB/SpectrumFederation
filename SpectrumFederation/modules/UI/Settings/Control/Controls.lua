@@ -14,6 +14,7 @@ local LABEL_WIDTH   = R.labelWidth or 220
 local GUTTER        = R.gutter or 16
 local CONTROL_WIDTH = R.controlWidth or 240
 local ADMIN_ONLY_SUFFIX = "|cffff4040(Admin Only)|r"
+local OWNER_ONLY_SUFFIX = "|cffff4040(Owner Only)|r"
 
 -- Evaluate a value or thunk to a boolean with default
 -- @param v any Boolean, function returning boolean, or nil
@@ -64,24 +65,47 @@ local function IsAdminForSection(section)
 	return result and true or false
 end
 
+local function IsOwnerForSection(section)
+	local predicate = section and section.__sfOwnerPredicate
+	if type(predicate) ~= "function" then
+		return true
+	end
+
+	local ok, result = pcall(predicate)
+	if not ok then
+		return true
+	end
+
+	return result and true or false
+end
+
 local function EvalEnabled(section, opts)
 	opts = opts or {}
 	local enabled = EvalBool(opts.enabled, true)
 	if opts.adminOnly then
 		enabled = enabled and IsAdminForSection(section)
 	end
+	if opts.ownerOnly then
+		enabled = enabled and IsOwnerForSection(section)
+	end
 	return enabled
 end
 
-local function FormatTooltipTitle(title, adminOnly)
+local function FormatTooltipTitle(title, adminOnly, ownerOnly)
 	title = title or ""
-	if not adminOnly then
+	local suffix
+	if ownerOnly then
+		suffix = OWNER_ONLY_SUFFIX
+	elseif adminOnly then
+		suffix = ADMIN_ONLY_SUFFIX
+	end
+	if not suffix then
 		return title
 	end
 	if title ~= "" then
-		return string.format("%s %s", title, ADMIN_ONLY_SUFFIX)
+		return string.format("%s %s", title, suffix)
 	end
-	return ADMIN_ONLY_SUFFIX
+	return suffix
 end
 
 local function HasAdminOnlyItems(items)
@@ -196,13 +220,13 @@ end
 -- @param title string|nil Tooltip title
 -- @param text string|nil Tooltip body text
 -- @return nil
-local function AttachTooltip(region, title, text, adminOnly)
+local function AttachTooltip(region, title, text, adminOnly, ownerOnly)
 	if not text or text == "" then return end
 	region:EnableMouse(true)
 
 	region:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		GameTooltip:SetText(FormatTooltipTitle(title, adminOnly), 1, 1, 1)
+		GameTooltip:SetText(FormatTooltipTitle(title, adminOnly, ownerOnly), 1, 1, 1)
 		GameTooltip:AddLine(text, nil, nil, nil, true)
 		GameTooltip:Show()
 	end)
@@ -374,7 +398,7 @@ end
 				end)
 
 				if def.tooltip then
-					AttachTooltip(dropdown, def.defaultText or "", def.tooltip, def.adminOnly or opts.adminOnly)
+					AttachTooltip(dropdown, def.defaultText or "", def.tooltip, def.adminOnly or opts.adminOnly, def.ownerOnly or opts.ownerOnly)
 				end
 
 				widgets[#widgets + 1] = dropdown
@@ -400,7 +424,7 @@ end
 				end)
 
 				if def.tooltip then
-					AttachTooltip(button, def.buttonText or def.text or "", def.tooltip, def.adminOnly or opts.adminOnly)
+					AttachTooltip(button, def.buttonText or def.text or "", def.tooltip, def.adminOnly or opts.adminOnly, def.ownerOnly or opts.ownerOnly)
 				end
 
 				widgets[#widgets + 1] = button
@@ -468,7 +492,7 @@ function Controls:AddCheckboxRow(section, opts)
 			label:SetText(def.label or "")
 
 			if def.tooltip then
-				AttachTooltip(label, def.label, def.tooltip, def.adminOnly or rowOpts.adminOnly)
+				AttachTooltip(label, def.label, def.tooltip, def.adminOnly or rowOpts.adminOnly, def.ownerOnly or rowOpts.ownerOnly)
 			end
 
 			cb:SetScript("OnClick", function(selfBtn)
@@ -544,7 +568,7 @@ function Controls:InitRow(row, opts)
 	control:SetPoint("TOP", row, "TOP", 0, 0)
 	control:SetPoint("BOTTOM", row, "BOTTOM", 0, 0)
 
-	AttachTooltip(row, opts.label, opts.tooltip, opts.adminOnly)
+	AttachTooltip(row, opts.label, opts.tooltip, opts.adminOnly, opts.ownerOnly)
 	return label, control
 end
 
@@ -645,7 +669,7 @@ function Controls:AddCheckboxGrid(section, opts)
 			label:SetText(def.label or "")
 
 			if def.tooltip then
-				AttachTooltip(cell, def.label, def.tooltip, def.adminOnly or rowOpts.adminOnly)
+				AttachTooltip(cell, def.label, def.tooltip, def.adminOnly or rowOpts.adminOnly, def.ownerOnly or rowOpts.ownerOnly)
 			end
 
 			cb:SetScript("OnClick", function(selfBtn)
@@ -1052,6 +1076,93 @@ function Controls:AddEditBox(section, opts)
 	end)
 end
 
+-- Add gold/silver/copper money editors bound to a copper getter/setter.
+-- @param section table Section to add row into
+-- @param opts table Options including get/set copper
+-- @return Frame The created row
+function Controls:AddMoneyEdit(section, opts)
+	local get, set = ResolveGetSet(opts)
+
+	return section:AddRow(26, function(row)
+		local _, control = self:InitRow(row, opts)
+		local boxes = {}
+		local ignore = false
+
+		local function MakeBox(parent, width)
+			local edit = CreateFrame("EditBox", nil, parent, "InputBoxTemplate")
+			edit:SetAutoFocus(false)
+			edit:SetSize(width, 22)
+			edit:SetNumeric(true)
+			edit:SetMaxLetters(8)
+			edit:SetTextColor(1, 1, 1)
+			return edit
+		end
+
+		local goldBox = MakeBox(control, 70)
+		goldBox:SetPoint("LEFT", control, "LEFT", 0, 0)
+		local goldLabel = control:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+		goldLabel:SetPoint("LEFT", goldBox, "RIGHT", 4, 0)
+		goldLabel:SetText("g")
+
+		local silverBox = MakeBox(control, 44)
+		silverBox:SetPoint("LEFT", goldLabel, "RIGHT", 8, 0)
+		local silverLabel = control:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+		silverLabel:SetPoint("LEFT", silverBox, "RIGHT", 4, 0)
+		silverLabel:SetText("s")
+
+		local copperBox = MakeBox(control, 44)
+		copperBox:SetPoint("LEFT", silverLabel, "RIGHT", 8, 0)
+		local copperLabel = control:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+		copperLabel:SetPoint("LEFT", copperBox, "RIGHT", 4, 0)
+		copperLabel:SetText("c")
+
+		boxes[1] = goldBox
+		boxes[2] = silverBox
+		boxes[3] = copperBox
+
+		local function Commit()
+			if ignore then return end
+			if goldBox.IsEnabled and not goldBox:IsEnabled() then return end
+			local copper = SF.MoneyFromCoins(goldBox:GetText(), silverBox:GetText(), copperBox:GetText())
+			set(copper)
+			if opts.onCommit then
+				opts.onCommit(copper)
+			end
+		end
+
+		local function RefreshFromValue()
+			ignore = true
+			local gold, silver, remain = SF.MoneyToCoins(get() or 0)
+			goldBox:SetText(tostring(gold))
+			silverBox:SetText(tostring(silver))
+			copperBox:SetText(tostring(remain))
+			ignore = false
+		end
+
+		for i = 1, #boxes do
+			boxes[i]:SetScript("OnEnterPressed", function(selfEdit)
+				Commit()
+				selfEdit:ClearFocus()
+			end)
+			boxes[i]:SetScript("OnEditFocusLost", function()
+				Commit()
+			end)
+		end
+
+		local function Refresh()
+			RefreshFromValue()
+			local _, enabled = self:_ApplyRowState(row, section, opts, boxes)
+			local c = enabled and 1 or 0.6
+			for i = 1, #boxes do
+				boxes[i]:SetTextColor(c, c, c)
+			end
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end
+
 -- Add a dropdown with an adjacent icon button
 -- @param section table Section to add row into
 -- @param opts table Options including label, options, iconAtlas, iconTooltip, onIconClick
@@ -1074,7 +1185,7 @@ function Controls:AddDropdownWithIconButton(section, opts)
 
 		local iconTooltip = opts.iconTooltip or opts.iconToolTip
 		if iconTooltip then
-			AttachTooltip(iconBtn, opts.label or "", iconTooltip, opts.adminOnly)
+			AttachTooltip(iconBtn, opts.label or "", iconTooltip, opts.adminOnly, opts.ownerOnly)
 		end
 
 		local function GetOptions()

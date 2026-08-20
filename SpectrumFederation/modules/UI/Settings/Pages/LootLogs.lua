@@ -135,6 +135,10 @@ local EVENT_TYPE_COLORS = {
 	ADMIN_ADDED = "|cff66ff66",
 	ADMIN_REMOVED = "|cffff6666",
 	MAIN_SWAP = "|cff9966ff",
+	LOOT_MODE_CHANGE = "|cffcc99ff",
+	REWARD_POT_CONFIG_CHANGE = "|cffffcc66",
+	REWARD_POT_CHANGE = "|cffffd700",
+	ATTENDANCE_CHANGE = "|cff66ccff",
 }
 
 local EVENT_TYPE_LABELS = {
@@ -149,6 +153,10 @@ local EVENT_TYPE_LABELS = {
 	ADMIN_ADDED = "Admin Added",
 	ADMIN_REMOVED = "Admin Removed",
 	MAIN_SWAP = "Main Swap",
+	LOOT_MODE_CHANGE = "Loot Mode Change",
+	REWARD_POT_CONFIG_CHANGE = "Reward Pot Config",
+	REWARD_POT_CHANGE = "Reward Pot Change",
+	ATTENDANCE_CHANGE = "Attendance Change",
 }
 
 function GetEventTypeLabel(eventType)
@@ -185,6 +193,24 @@ local function FormatPointAmount(amount)
 	local text = string.format("%.2f", amount)
 	text = text:gsub("0+$", ""):gsub("%.$", "")
 	return text
+end
+
+local function FormatCopperAmount(amount)
+	amount = math.floor(tonumber(amount) or 0)
+	if SF.FormatMoney then
+		return SF.FormatMoney(amount)
+	end
+	return tostring(amount)
+end
+
+local function FormatLootMode(mode)
+	if mode == (SF.LootModes and SF.LootModes.REWARD_POT) or mode == "reward_pot" then
+		return "Reward Pot"
+	end
+	if mode == (SF.LootModes and SF.LootModes.POINT_BASED) or mode == "point_based" then
+		return "Point Based"
+	end
+	return FormatLabel(mode)
 end
 
 local function GetArmorSlotLabel(slot)
@@ -242,6 +268,46 @@ local function BuildActionText(eventType, data, author)
 		-- Strip realm for cleaner display if present
 		local shortName = sourceName:match("^([^%-]+)") or sourceName
 		return string.format("Consolidated from %s", shortName)
+	elseif eventType == "LOOT_MODE_CHANGE" then
+		return string.format("%s -> %s", FormatLootMode(data.oldMode), FormatLootMode(data.newMode))
+	elseif eventType == "REWARD_POT_CONFIG_CHANGE" then
+		local starting = FormatCopperAmount(data.startingPotCopper)
+		local deductionType = data.deductionType
+		if deductionType == (SF.RewardPotDeductionTypes and SF.RewardPotDeductionTypes.PERCENT) or deductionType == "percent" then
+			return string.format("Starting %s; deduct %s%%", starting, FormatPointAmount(data.deductionValue or 0))
+		end
+		return string.format("Starting %s; deduct %s", starting, FormatCopperAmount(data.deductionValue))
+	elseif eventType == "REWARD_POT_CHANGE" then
+		local amount = (SF.LootLog and SF.LootLog.GetRewardPotChangeAmount and SF.LootLog.GetRewardPotChangeAmount(data)) or 0
+		local money = FormatCopperAmount(amount)
+		if data.reason == "RAID_DEDUCTION" or author == "Raid Check" then
+			if data.deductionType == (SF.RewardPotDeductionTypes and SF.RewardPotDeductionTypes.PERCENT) or data.deductionType == "percent" then
+				return string.format("Raid Check deducted %s (%s%%)", money, FormatPointAmount(data.percent or 0))
+			end
+			return string.format("Raid Check deducted %s", money)
+		end
+		if data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
+			return string.format("Pot Increased (+%s)", money)
+		elseif data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
+			return string.format("Pot Decreased (-%s)", money)
+		end
+		return FormatLabel(data.change or "?")
+	elseif eventType == "ATTENDANCE_CHANGE" then
+		local isRaidCheck = (data.reason == "RAID_CHECK") or (author == "Raid Check")
+		local amount = (SF.LootLog and SF.LootLog.GetAttendanceChangeAmount and SF.LootLog.GetAttendanceChangeAmount(data)) or 1
+		if isRaidCheck and data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
+			return string.format("Raid Check prepared (+%s)", FormatPointAmount(amount))
+		elseif isRaidCheck then
+			return string.format("Raid Check change (%s)", FormatLabel(data.change or "?"))
+		end
+
+		if data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
+			return string.format("Attendance Increased (+%s)", FormatPointAmount(amount))
+		elseif data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
+			return string.format("Attendance Decreased (-%s)", FormatPointAmount(amount))
+		end
+
+		return FormatLabel(data.change or "?")
 	end
 
 	return ""

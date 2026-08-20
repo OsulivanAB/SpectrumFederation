@@ -16,6 +16,7 @@ local RC = SF.RaidCheck
 
 local RAID_CHECK_REASON = "RAID_CHECK"
 local RAID_CHECK_POINT_AWARD_DEFAULT = 0.5
+local ATTENDANCE_POINT_NAME = "Attendance Point"
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
 local INSPECT_CACHE_TTL_SECONDS = 30 -- Background recheck cadence for live inspect data.
@@ -2617,10 +2618,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 	local inspectState = RC:_GetTroubleshootingInspectState(unitInfo.unit, unitInfo)
 	local whisper = ShouldWhisper(mode, cfg)
 	local whisperTarget = unitInfo.id or unitInfo.short
-	local member = nil
-	if whisper or mode == "raid" then
-		member = FindMember(profile, unitInfo.id)
-	end
+	local member = FindMember(profile, unitInfo.id)
 	local result = {
 		name = unitInfo.short,
 		displayName = unitInfo.displayName or unitInfo.short,
@@ -2629,52 +2627,78 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 		inspectPending = nil,
 		whisperedMissing = false,
 		alreadyWhispered = false,
+		prepared = false,
+		unprepared = false,
+		noInspectData = false,
 	}
 
-	if type(inspectState) ~= "table" then
-		result.inspectPending = "Unavailable"
+	if not member then
+		result.skippedAward = true
 		return result
+	end
+
+	local rewardPot = profile.IsRewardPotMode and profile:IsRewardPotMode()
+	local whisperPointName = pointName
+	if rewardPot then
+		whisperPointName = ATTENDANCE_POINT_NAME
+	end
+
+	local function MarkUnprepared(reason, noInspectData)
+		result.unprepared = true
+		result.missing = reason
+		result.noInspectData = noInspectData and true or false
+		return result
+	end
+
+	if type(inspectState) ~= "table" then
+		return MarkUnprepared("No inspect data", true)
 	end
 
 	if not (inspectState.isKnown and HasEquipmentData(inspectState.slotsByInventory)) then
-		result.inspectPending = inspectState and (inspectState.label or inspectState.status) or "Loading"
-		return result
+		return MarkUnprepared(inspectState.message or inspectState.label or inspectState.status or "No inspect data", true)
 	end
 
 	local missing, hasItemDataPending = EvaluateSnapshot(inspectState.slotsByInventory, cfg)
-
-	-- If any tracked slot still has incomplete item data (texture/itemId present
-	-- but link unavailable), treat the player as pending rather than definitively
-	-- missing requirements.  This prevents false-positive whispers and raid check
-	-- failures caused by partially-loaded item data.
 	if hasItemDataPending then
-		result.inspectPending = "Item data loading"
-		return result
+		return MarkUnprepared("Item data incomplete", true)
 	end
 
 	if #missing > 0 then
 		local list = FormatMissingList(missing)
 		local alreadyWhispered = HasBeenWhisperedToday(member, mode)
 		if whisper and not alreadyWhispered then
-			WhisperMissing(whisperTarget, cfg, unitInfo.short, pointName, list, mode)
+			WhisperMissing(whisperTarget, cfg, unitInfo.short, whisperPointName, list, mode)
 			result.whisperedMissing = true
 			MarkWhisperSent(member, mode, time())
 		elseif whisper and alreadyWhispered then
 			result.alreadyWhispered = true
 		end
+		result.unprepared = true
 		result.missing = list
 		return result
 	end
 
-	if mode == "raid" then
-		if not member then
-			result.skippedAward = true
-			return result
-		end
+	result.prepared = true
 
-		local awarded = AwardPrepared(profile, member, pointName, pointAward)
+	if mode == "raid" then
+		local awarded = false
+		if rewardPot then
+			if member.IncrementAttendance then
+				awarded = member:IncrementAttendance({
+					amount = 1,
+					logAuthor = "Raid Check",
+					reason = RAID_CHECK_REASON,
+				})
+			end
+		else
+			awarded = AwardPrepared(profile, member, pointName, pointAward)
+		end
 		if awarded and whisper and ShouldWhisperPrepared(cfg) then
-			WhisperPrepared(whisperTarget, cfg, unitInfo.short, pointName, pointAward)
+			local whisperAward = pointAward
+			if rewardPot then
+				whisperAward = 1
+			end
+			WhisperPrepared(whisperTarget, cfg, unitInfo.short, whisperPointName, whisperAward)
 		end
 	end
 
@@ -2698,7 +2722,7 @@ function RC:RunPreRaidCheck()
 
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
-		if info.id then
+		if info.id and FindMember(profile, info.id) then
 			local res = RunForUnit(info, profile, cfg, "pre", GetPointName(profile))
 			if res then
 				if res.missing then
@@ -2735,12 +2759,16 @@ function RC:RunRaidCheck()
 	local summaryMissing = {}
 	local summaryPending = {}
 	local summarySkippedAward = {}
+	local anyUnprepared = false
 
 	for _, unit in ipairs(CollectUnits()) do
 		local info = BuildUnitInfo(unit)
-		if info.id then
+		if info.id and FindMember(profile, info.id) then
 			local res = RunForUnit(info, profile, cfg, "raid", pointName, pointAward)
 			if res then
+				if res.unprepared or res.missing then
+					anyUnprepared = true
+				end
 				if res.missing then
 					table.insert(summaryMissing, res)
 				elseif res.inspectPending then
@@ -2748,6 +2776,27 @@ function RC:RunRaidCheck()
 				elseif res.skippedAward then
 					table.insert(summarySkippedAward, res)
 				end
+			end
+		end
+	end
+
+	if profile.IsRewardPotMode and profile:IsRewardPotMode() and anyUnprepared and profile.AdjustRewardPot then
+		local amount, deductionType, percent = profile:ComputeRewardPotDeductionCopper()
+		if amount and amount > 0 then
+			local ok, err = profile:AdjustRewardPot(
+				SF.LootLogPointChangeTypes.DECREMENT,
+				amount,
+				"RAID_DEDUCTION",
+				{
+					logAuthor = "Raid Check",
+					deductionType = deductionType,
+					percent = percent,
+				}
+			)
+			if ok then
+				EmitAdminMessage(("[Raid Check] Reward Pot deducted %s."):format(SF.FormatMoney and SF.FormatMoney(amount) or tostring(amount)))
+			elseif err then
+				SF:PrintWarning(err)
 			end
 		end
 	end
