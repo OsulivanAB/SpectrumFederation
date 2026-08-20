@@ -76,7 +76,7 @@ Templates support:
 - `{point_name}`
 - `{points_awarded}`
 
-For missing requirements, the addon records when each profile member was whispered and suppresses repeated whispers of the same check type on the same calendar day. Prepared-player whispers are controlled separately and are sent only after a successful Raid Check award. In Reward Pot mode, that prepared whisper uses Attendance rather than the profile's loot-point name.
+For missing requirements, the addon records when each profile member was whispered and suppresses repeated whispers of the same check type on the same calendar day. Prepared-player whispers are controlled separately and are sent only after a successful Raid Check award. In Reward Pot mode, `{point_name}` in both missing and prepared whispers uses Attendance rather than the profile's loot-point name.
 
 ## What gets recorded
 

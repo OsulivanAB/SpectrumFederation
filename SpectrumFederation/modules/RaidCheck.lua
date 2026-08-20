@@ -16,6 +16,7 @@ local RC = SF.RaidCheck
 
 local RAID_CHECK_REASON = "RAID_CHECK"
 local RAID_CHECK_POINT_AWARD_DEFAULT = 0.5
+local ATTENDANCE_POINT_NAME = "Attendance Point"
 local META_GEM_QUALITY = 4
 local MAX_GEM_SOCKETS_TO_SCAN = 8
 local INSPECT_CACHE_TTL_SECONDS = 30 -- Background recheck cadence for live inspect data.
@@ -2637,6 +2638,10 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 	end
 
 	local rewardPot = profile.IsRewardPotMode and profile:IsRewardPotMode()
+	local whisperPointName = pointName
+	if rewardPot then
+		whisperPointName = ATTENDANCE_POINT_NAME
+	end
 
 	local function MarkUnprepared(reason, noInspectData)
 		result.unprepared = true
@@ -2662,7 +2667,7 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 		local list = FormatMissingList(missing)
 		local alreadyWhispered = HasBeenWhisperedToday(member, mode)
 		if whisper and not alreadyWhispered then
-			WhisperMissing(whisperTarget, cfg, unitInfo.short, pointName, list, mode)
+			WhisperMissing(whisperTarget, cfg, unitInfo.short, whisperPointName, list, mode)
 			result.whisperedMissing = true
 			MarkWhisperSent(member, mode, time())
 		elseif whisper and alreadyWhispered then
@@ -2689,10 +2694,8 @@ local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
 			awarded = AwardPrepared(profile, member, pointName, pointAward)
 		end
 		if awarded and whisper and ShouldWhisperPrepared(cfg) then
-			local whisperPointName = pointName
 			local whisperAward = pointAward
 			if rewardPot then
-				whisperPointName = "Attendance Point"
 				whisperAward = 1
 			end
 			WhisperPrepared(whisperTarget, cfg, unitInfo.short, whisperPointName, whisperAward)
