@@ -30,6 +30,7 @@ local addonName, SF = ...
 | `modules/LootHelperSync/` | Session state, validation, requests, convergence, heartbeat, routing, bulk handlers, and public API. |
 | `modules/UI/LootHelper/` | Roster/equipment presentation and controller logic. |
 | `modules/RaidCheck.lua` | Inspection cache, equipment evaluation, whispers, snapshots, and point awards. |
+| `modules/VersionCheck.lua` | Raid/party addon-version query, roster snapshot, and `/sf version` window. |
 
 ## Persistent data
 

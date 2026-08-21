@@ -48,6 +48,13 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.RaidCheck:EnsureInspectSupport()
     end
 
+    if SF.VersionCheck and SF.VersionCheck.EnsureSupport then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing addon version check")
+        end
+        SF.VersionCheck:EnsureSupport()
+    end
+
     if SF.Debug then
         SF.Debug:Info("INIT", "All modules initialized successfully")
     end

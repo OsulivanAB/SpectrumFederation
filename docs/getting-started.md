@@ -78,6 +78,7 @@ See [Raid Check](features/raid-check.md) before enabling automatic whispers or a
 - `/sf profiles` — list local profiles.
 - `/sf raidcheck pre` — run a pre-raid check.
 - `/sf raidcheck raid` — run the awarding raid check.
+- `/sf version` — show who in the raid or party is running Spectrum Federation, and which version.
 - `/sf loot sync` — manually compare your data with the active session.
 
 The [Slash Command Reference](reference/slash-commands.md) lists every supported command and restriction.
