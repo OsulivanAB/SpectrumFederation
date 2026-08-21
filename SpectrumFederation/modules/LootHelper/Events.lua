@@ -80,6 +80,9 @@ function E:_TryHookLootProfile()
     Hook("ImportSnapshot",  "LP:")
     Hook("SetProfileName",  "LP:")
     Hook("SetPointName",    "LP:")
+    Hook("SetLootMode",     "LP:")
+    Hook("SetRewardPotConfig", "LP:")
+    Hook("AdjustRewardPot", "LP:")
 
     return okAny
 end
@@ -102,6 +105,8 @@ function E:_TryHookMember()
     -- Points / membership-related changes
     Hook("IncrementPoints",       "M:")
     Hook("DecrementPoints",       "M:")
+    Hook("IncrementAttendance",   "M:")
+    Hook("DecrementAttendance",   "M:")
     Hook("ToggleEquipment",       "M:")
 
     return okAny

@@ -35,7 +35,7 @@ You can also enter `/sf loot` to enable Loot Helper and ask it to show the windo
 
 The new profile becomes active immediately. Its creator is added as the owner, first member, and first admin.
 
-Profiles hold their own roster, point name, admin list, Raid Check configuration, safe-mode options, equipment snapshots, and change history. Switching profiles changes the data shown by Loot Helper and Loot Logs.
+Profiles hold their own roster, loot mode, point name, Attendance, Reward Pot, admin list, Raid Check configuration, safe-mode options, equipment snapshots, and change history. Switching profiles changes the data shown by Loot Helper and Loot Logs.
 
 ## Add and manage members
 
@@ -43,11 +43,14 @@ Join a raid with the people you want to add. In the Loot Helper roster, players 
 
 For profile members:
 
-- The up and down buttons adjust the member's point balance in half-point steps.
+- In Point Based mode, the up and down buttons adjust the member's loot-point balance in half-point steps.
+- In Reward Pot mode, those buttons adjust Attendance by one, and the current pot is shown above the list.
 - The equipment button opens that member's equipment-category history.
 - Admins can mark equipment categories used or available; all users can view them.
 
 Enable **Show Members not in raid** if you want the roster to include offline or absent profile members.
+
+The profile owner can switch loot mode under **Loot Helper → Profile**. See [Point Based](features/point-based.md) and [Reward Pot](features/reward-pot.md).
 
 ## Start a shared session
 
@@ -63,10 +66,10 @@ The coordinator compares profile history with other online admins, then announce
 
 Profile admins can configure requirements under **Loot Helper → Profile**, then run:
 
-- **Pre-Raid Check** to report preparation problems without awarding points.
-- **Raid Check** to report problems and award the configured points to prepared profile members.
+- **Pre-Raid Check** to report preparation problems without awarding points, Attendance, or pot changes.
+- **Raid Check** to report problems and award loot points in Point Based mode, or Attendance and a possible pot deduction in Reward Pot mode.
 
-See [Raid Check](features/raid-check.md) before enabling automatic whispers or point awards.
+See [Raid Check](features/raid-check.md) before enabling automatic whispers or awards.
 
 ## Useful commands
 

@@ -119,6 +119,16 @@ function Sync:HandleNewLog(sender, payload)
             return
         end
     end
+
+    local eventType = logTable._eventType or logTable.eventType
+    if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.LOOT_MODE_CHANGE) then
+        if not (profile.IsOwner and profile:IsOwner(sender)) then
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring loot mode change from %s for profile %s: not the owner."):format(tostring(sender), tostring(profileId)))
+            end
+            return
+        end
+    end
     
     -- Dedupe by logId
     local logId = self:_ExtractLogId(logTable)

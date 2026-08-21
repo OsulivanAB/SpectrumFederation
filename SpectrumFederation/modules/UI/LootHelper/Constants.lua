@@ -11,6 +11,7 @@ LH.Constants = LH.Constants or {
     TITLE_HEIGHT = 28,
     TITLE_PADDING_X = 10,
     CONTENT_PADDING = 10,
+    POT_HEADER_HEIGHT = 22,
 
     -- Default placement
     DEFAULT_POINT = "CENTER",

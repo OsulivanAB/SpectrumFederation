@@ -331,5 +331,132 @@ function LootLogValidators.ValidateMainSwapData(eventData)
     return true
 end
 
+local VALID_LOOT_MODES = {
+    point_based = true,
+    reward_pot = true,
+}
+
+local VALID_DEDUCTION_TYPES = {
+    flat = true,
+    percent = true,
+}
+
+-- Function to validate the LOOT_MODE_CHANGE event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateLootModeChangeData(eventData)
+    local oldMode = eventData.oldMode
+    local newMode = eventData.newMode
+
+    if type(oldMode) ~= "string" or not VALID_LOOT_MODES[oldMode] then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid oldMode in LOOT_MODE_CHANGE: %s", tostring(oldMode))
+        end
+        return false
+    end
+
+    if type(newMode) ~= "string" or not VALID_LOOT_MODES[newMode] then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid newMode in LOOT_MODE_CHANGE: %s", tostring(newMode))
+        end
+        return false
+    end
+
+    return true
+end
+
+-- Function to validate the REWARD_POT_CONFIG_CHANGE event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateRewardPotConfigChangeData(eventData)
+    local startingPotCopper = math.floor(tonumber(eventData.startingPotCopper) or -1)
+    local deductionType = eventData.deductionType
+    local deductionValue = tonumber(eventData.deductionValue)
+
+    if startingPotCopper < 0 then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid startingPotCopper in REWARD_POT_CONFIG_CHANGE: %s", tostring(eventData.startingPotCopper))
+        end
+        return false
+    end
+
+    if type(deductionType) ~= "string" or not VALID_DEDUCTION_TYPES[deductionType] then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid deductionType in REWARD_POT_CONFIG_CHANGE: %s", tostring(deductionType))
+        end
+        return false
+    end
+
+    if not deductionValue or deductionValue < 0 then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid deductionValue in REWARD_POT_CONFIG_CHANGE: %s", tostring(eventData.deductionValue))
+        end
+        return false
+    end
+
+    return true
+end
+
+-- Function to validate the REWARD_POT_CHANGE event data
+-- @param eventData (table) - Event data to validate
+-- @param POINT_CHANGE_TYPES (table) - Increment/decrement constants
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateRewardPotChangeData(eventData, POINT_CHANGE_TYPES)
+    local changeType = eventData.change
+    local amount = math.floor(tonumber(eventData.amount) or 0)
+
+    if changeType ~= POINT_CHANGE_TYPES.INCREMENT and changeType ~= POINT_CHANGE_TYPES.DECREMENT then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid reward pot change type: %s", tostring(changeType))
+        end
+        return false
+    end
+
+    if amount <= 0 then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid reward pot change amount: %s", tostring(eventData.amount))
+        end
+        return false
+    end
+
+    return true
+end
+
+-- Function to validate the ATTENDANCE_CHANGE event data
+-- @param eventData (table) - Event data to validate
+-- @param POINT_CHANGE_TYPES (table) - Increment/decrement constants
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES)
+    local memberID = eventData.member
+    local changeType = eventData.change
+    local amount = eventData.amount
+
+    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Attendance change log references non-existent member: %s", tostring(memberID))
+        end
+        return false
+    end
+
+    if changeType ~= POINT_CHANGE_TYPES.INCREMENT and changeType ~= POINT_CHANGE_TYPES.DECREMENT then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Invalid attendance change type in log for member %s: %s", tostring(memberID), tostring(changeType))
+        end
+        return false
+    end
+
+    if amount ~= nil then
+        amount = tonumber(amount)
+        if not amount or amount <= 0 then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid attendance change amount in log for member %s: %s", tostring(memberID), tostring(eventData.amount))
+            end
+            return false
+        end
+    end
+
+    return true
+end
+
 -- Export to namespace
 SF.LootLogValidators = LootLogValidators

@@ -71,6 +71,14 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [1.1.0-beta.1] - 2026-08-20
+
+### Added
+- Merge pull request #249 from OsulivanAB/cursor/reward-pot-loot-system-ab6b
+
+Add Reward Pot loot mode alongside Point Based
+
 ## [1.0.2] - 2026-08-19
 
 ### Changed

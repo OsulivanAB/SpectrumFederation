@@ -18,7 +18,7 @@ A current raid member who is not in the profile appears as an addable row only f
 
 ## I cannot change points, equipment, or profile settings
 
-These operations require admin status in the active profile. The profile owner is always an admin and cannot be removed through the settings page.
+These operations require admin status in the active profile. Changing loot mode requires the profile owner. The profile owner is always an admin and cannot be removed through the settings page.
 
 If a recently changed admin list differs between clients, synchronize the profile or restart the session after admins have converged.
 
@@ -49,19 +49,19 @@ WoW throttles inspection and requires other players to be nearby and inspectable
 - Wait for item links and inspection data to populate.
 - Rerun the check after pending statuses resolve.
 
-Raid Check intentionally avoids treating incomplete item data as a definite failure or awarding points from it.
+Raid Check treats incomplete item data as unprepared. Move closer, refresh the snapshot, then rerun the check.
 
-## A player did not receive a Raid Check point
+## A player did not receive a Raid Check point or Attendance
 
 Confirm that:
 
 - you ran **Raid Check**, not **Pre-Raid Check**;
 - the player passed every enabled requirement;
 - inspection was complete;
-- the player belongs to the active profile;
-- **Points Per Raid Check** is greater than zero.
+- the player belongs to the active profile and is in the raid;
+- in Point Based mode, **Points Per Raid Check** is greater than zero.
 
-The point change appears in Loot Logs with **Raid Check** as its author.
+The award appears in Loot Logs with **Raid Check** as its author. In Reward Pot mode, prepared players receive Attendance rather than loot points.
 
 ## A whisper was not sent
 

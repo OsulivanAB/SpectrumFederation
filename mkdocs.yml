@@ -74,6 +74,8 @@ nav:
   - Getting Started: getting-started.md
   - Features:
     - Loot Helper: features/loot-helper.md
+    - Point Based: features/point-based.md
+    - Reward Pot: features/reward-pot.md
     - Raid Check: features/raid-check.md
     - Sync Sessions: features/sync-sessions.md
     - Loot Logs: features/loot-logs.md

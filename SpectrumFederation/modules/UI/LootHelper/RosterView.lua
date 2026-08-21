@@ -15,6 +15,7 @@ local BTN_SIZE = 20
 local BTN_GAP = 3
 local POINTS_WIDTH = 32
 local MANUAL_POINT_STEP = 0.5
+local MANUAL_ATTENDANCE_STEP = 1
 
 -- Cropping presets you can tweak quickly:
 local CROP_ICON   = 0.07  -- great for Interface\Icons\
@@ -462,7 +463,15 @@ function View:_BindRowActions(r, model)
         -- Up/Down buttons (admin only)
         if model.canAdmin and model.member then
             r.BtnUp:SetScript("OnClick", function()
-                if model.member.IncrementPoints then
+                if model.rewardPot then
+                    if model.member.IncrementAttendance then
+                        pcall(function()
+                            model.member:IncrementAttendance({
+                                amount = MANUAL_ATTENDANCE_STEP,
+                            })
+                        end)
+                    end
+                elseif model.member.IncrementPoints then
                     pcall(function()
                         model.member:IncrementPoints({
                             amount = MANUAL_POINT_STEP,
@@ -471,12 +480,20 @@ function View:_BindRowActions(r, model)
                 end
                 -- DATA_CHANGED event is automatically fired via Events.lua hook
                 if SF.Debug then
-                    SF.Debug:Info("LH_ROSTER_VIEW", "IncrementPoints: %s", tostring(model.memberId))
+                    SF.Debug:Info("LH_ROSTER_VIEW", "%s: %s", model.rewardPot and "IncrementAttendance" or "IncrementPoints", tostring(model.memberId))
                 end
             end)
             
             r.BtnDown:SetScript("OnClick", function()
-                if model.member.DecrementPoints then
+                if model.rewardPot then
+                    if model.member.DecrementAttendance then
+                        pcall(function()
+                            model.member:DecrementAttendance({
+                                amount = MANUAL_ATTENDANCE_STEP,
+                            })
+                        end)
+                    end
+                elseif model.member.DecrementPoints then
                     pcall(function()
                         model.member:DecrementPoints({
                             amount = MANUAL_POINT_STEP,
@@ -485,7 +502,7 @@ function View:_BindRowActions(r, model)
                 end
                 -- DATA_CHANGED event is automatically fired via Events.lua hook
                 if SF.Debug then
-                    SF.Debug:Info("LH_ROSTER_VIEW", "DecrementPoints: %s", tostring(model.memberId))
+                    SF.Debug:Info("LH_ROSTER_VIEW", "%s: %s", model.rewardPot and "DecrementAttendance" or "DecrementPoints", tostring(model.memberId))
                 end
             end)
         end

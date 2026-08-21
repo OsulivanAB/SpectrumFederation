@@ -144,6 +144,50 @@ local function IsAdmin()
 	return false
 end
 
+local function IsOwner()
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.IsCurrentUserOwner then
+		local ok, res = pcall(profile.IsCurrentUserOwner, profile)
+		if ok then
+			return res and true or false
+		end
+	end
+	return false
+end
+
+local function IsRewardPotMode()
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.IsRewardPotMode then
+		local ok, res = pcall(profile.IsRewardPotMode, profile)
+		if ok then
+			return res and true or false
+		end
+	end
+	return false
+end
+
+local function IsPointBasedMode()
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if not profile then
+		return false
+	end
+	if profile.IsPointBasedMode then
+		local ok, res = pcall(profile.IsPointBasedMode, profile)
+		if ok then
+			return res and true or false
+		end
+	end
+	return not IsRewardPotMode()
+end
+
+local function GetRewardPotConfig()
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.GetRewardPotConfig then
+		return profile:GetRewardPotConfig()
+	end
+	return nil
+end
+
 local function GetRaidCheckConfig()
 	local profile = GetActiveProfileObject(SF.SettingsStore)
 	if profile and profile.GetRaidCheckConfig then
@@ -1241,6 +1285,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 	local store = SF.SettingsStore
 
 	panel.__sfAddAdminSelectedId = panel.__sfAddAdminSelectedId or nil
+	panel.__sfRewardPotAdjustCopper = panel.__sfRewardPotAdjustCopper or 0
 
 	local function HasActiveProfile()
 		return GetActiveProfileObject(store) ~= nil or GetActiveProfileId(store) ~= nil
@@ -1497,10 +1542,45 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					end,
 				},
 				{
+					type = "dropdown",
+					label = "Loot Mode",
+					ownerOnly = true,
+					tooltip = "Choose how this profile tracks raid participation. Point Based uses loot points. Reward Pot uses Attendance and a shared gold pot. Only the profile owner can change this. Switching modes hides the unused counter without wiping it.",
+					visible = function() return HasActiveProfile() end,
+					enabled = function() return ProfileActionsEnabled() end,
+					get = function()
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.GetLootMode) == "function" then
+							return profile:GetLootMode()
+						end
+						return (SF.LootModes and SF.LootModes.POINT_BASED) or "point_based"
+					end,
+					set = function(value)
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.SetLootMode) == "function" then
+							profile:SetLootMode(value)
+						end
+					end,
+					options = function()
+						local pointBased = (SF.LootModes and SF.LootModes.POINT_BASED) or "point_based"
+						local rewardPot = (SF.LootModes and SF.LootModes.REWARD_POT) or "reward_pot"
+						return {
+							{ value = pointBased, label = "Point Based" },
+							{ value = rewardPot, label = "Reward Pot" },
+						}
+					end,
+					onValueChanged = function(ctx)
+						ctx.section:ClearMessage()
+						ctx.pageBuilder:Refresh()
+						ctx.pageBuilder:Reflow()
+					end,
+				},
+				{
 					type = "editbox",
 					label = "Point Name",
 					adminOnly = true,
 					tooltip = "Rename the point currency used by this profile. This changes labels like 'Points' in the Loot Helper window and related messages.",
+					visible = function() return HasActiveProfile() and IsPointBasedMode() end,
 					enabled = function() return ProfileActionsEnabled() end,
 					get = function()
 						local profile = GetActiveProfileObject(store)
@@ -1516,6 +1596,219 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 						end
 					end,
 					maxLetters = 24,
+				},
+				{ type = "titleDivider", text = "Reward Pot", visible = function() return HasActiveProfile() and IsRewardPotMode() end },
+				{
+					type = "display",
+					label = "Current Pot",
+					tooltip = "The current Reward Pot is the starting amount plus every logged add and subtract. It never goes below zero. Edit the pot in Settings; the raid window only displays it.",
+					visible = function() return HasActiveProfile() and IsRewardPotMode() end,
+					get = function()
+						local profile = GetActiveProfileObject(store)
+						local copper = 0
+						if profile and type(profile.GetCurrentRewardPotCopper) == "function" then
+							copper = profile:GetCurrentRewardPotCopper() or 0
+						end
+						if SF.FormatMoney then
+							return SF.FormatMoney(copper)
+						end
+						return tostring(copper)
+					end,
+				},
+				{
+					type = "moneyEdit",
+					label = "Starting Pot",
+					adminOnly = true,
+					tooltip = "Set the starting gold amount used when calculating the current Reward Pot. Changing this updates the current pot immediately.",
+					visible = function() return HasActiveProfile() and IsRewardPotMode() end,
+					enabled = function() return ProfileActionsEnabled() end,
+					get = function()
+						local cfg = GetRewardPotConfig()
+						return cfg and cfg.startingPotCopper or 0
+					end,
+					set = function(value)
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.SetRewardPotConfig) == "function" then
+							profile:SetRewardPotConfig({ startingPotCopper = value })
+						end
+					end,
+					onCommit = function(ctx)
+						if ctx and ctx.pageBuilder then
+							ctx.pageBuilder:Refresh()
+						end
+					end,
+				},
+				{
+					type = "dropdown",
+					label = "Raid Check Deduction",
+					adminOnly = true,
+					tooltip = "Choose how Raid Check reduces the Reward Pot when any evaluated profile member is unprepared. Flat subtracts a gold amount. Percent subtracts that percent of the current pot at click time, then stores the resulting gold amount.",
+					visible = function() return HasActiveProfile() and IsRewardPotMode() end,
+					enabled = function() return ProfileActionsEnabled() end,
+					get = function()
+						local cfg = GetRewardPotConfig()
+						return (cfg and cfg.deductionType) or ((SF.RewardPotDeductionTypes and SF.RewardPotDeductionTypes.FLAT) or "flat")
+					end,
+					set = function(value)
+						local profile = GetActiveProfileObject(store)
+						if not (profile and type(profile.SetRewardPotConfig) == "function") then
+							return
+						end
+						local cfg = GetRewardPotConfig() or {}
+						if cfg.deductionType == value then
+							return
+						end
+						profile:SetRewardPotConfig({
+							deductionType = value,
+							deductionValue = 0,
+						})
+					end,
+					options = function()
+						local flat = (SF.RewardPotDeductionTypes and SF.RewardPotDeductionTypes.FLAT) or "flat"
+						local percent = (SF.RewardPotDeductionTypes and SF.RewardPotDeductionTypes.PERCENT) or "percent"
+						return {
+							{ value = flat, label = "Flat Amount" },
+							{ value = percent, label = "Percent of Current Pot" },
+						}
+					end,
+					onValueChanged = function(ctx)
+						ctx.pageBuilder:Refresh()
+						ctx.pageBuilder:Reflow()
+					end,
+				},
+				{
+					type = "moneyEdit",
+					label = "Deduction Amount",
+					adminOnly = true,
+					tooltip = "Gold amount subtracted from the Reward Pot when a Raid Check finds any unprepared profile member. The amount is clamped so the pot never goes below zero.",
+					visible = function()
+						if not (HasActiveProfile() and IsRewardPotMode()) then
+							return false
+						end
+						local cfg = GetRewardPotConfig()
+						local percent = (SF.RewardPotDeductionTypes and SF.RewardPotDeductionTypes.PERCENT) or "percent"
+						return not (cfg and cfg.deductionType == percent)
+					end,
+					enabled = function() return ProfileActionsEnabled() end,
+					get = function()
+						local cfg = GetRewardPotConfig()
+						return cfg and cfg.deductionValue or 0
+					end,
+					set = function(value)
+						local profile = GetActiveProfileObject(store)
+						if profile and type(profile.SetRewardPotConfig) == "function" then
+							profile:SetRewardPotConfig({ deductionValue = value })
+						end
+					end,
+				},
+				{
+					type = "editbox",
+					label = "Deduction Percent",
+					adminOnly = true,
+					tooltip = "Percent of the current Reward Pot subtracted when a Raid Check finds any unprepared profile member. Partial copper is rounded down. The log stores the gold amount calculated at click time, not a live percent.",
+					visible = function()
+						if not (HasActiveProfile() and IsRewardPotMode()) then
+							return false
+						end
+						local cfg = GetRewardPotConfig()
+						local percent = (SF.RewardPotDeductionTypes and SF.RewardPotDeductionTypes.PERCENT) or "percent"
+						return cfg and cfg.deductionType == percent or false
+					end,
+					enabled = function() return ProfileActionsEnabled() end,
+					get = function()
+						local cfg = GetRewardPotConfig()
+						if not cfg then
+							return "0"
+						end
+						return tostring(cfg.deductionValue or 0)
+					end,
+					set = function(value)
+						local profile = GetActiveProfileObject(store)
+						if not (profile and type(profile.SetRewardPotConfig) == "function") then
+							return
+						end
+						local amount = tonumber(value)
+						if amount == nil or amount < 0 then
+							return
+						end
+						profile:SetRewardPotConfig({ deductionValue = amount })
+					end,
+					maxLetters = 8,
+				},
+				{
+					type = "moneyEdit",
+					label = "Add or Subtract",
+					adminOnly = true,
+					tooltip = "Enter an amount, then use Add or Subtract. Subtracting more than the current pot removes only what remains. These adjustments are logged.",
+					visible = function() return HasActiveProfile() and IsRewardPotMode() end,
+					enabled = function() return ProfileActionsEnabled() end,
+					get = function()
+						return panel.__sfRewardPotAdjustCopper or 0
+					end,
+					set = function(value)
+						panel.__sfRewardPotAdjustCopper = math.floor(tonumber(value) or 0)
+						if panel.__sfRewardPotAdjustCopper < 0 then
+							panel.__sfRewardPotAdjustCopper = 0
+						end
+					end,
+				},
+				{
+					type = "buttonRow",
+					adminOnly = true,
+					visible = function() return HasActiveProfile() and IsRewardPotMode() end,
+					enabled = function() return ProfileActionsEnabled() end,
+					{
+						text = "Add to Pot",
+						width = 140,
+						onClick = function(ctx)
+							ctx.section:ClearMessage()
+							local profile = GetActiveProfileObject(ctx.store)
+							if not (profile and type(profile.AdjustRewardPot) == "function") then
+								ctx.section:SetMessage("Reward Pot adjustments are unavailable.", "error")
+								return
+							end
+							local amount = math.floor(tonumber(panel.__sfRewardPotAdjustCopper) or 0)
+							local ok, err = profile:AdjustRewardPot(
+								(SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) or "INCREMENT",
+								amount,
+								"MANUAL"
+							)
+							if not ok then
+								ctx.section:SetMessage(err or "Failed to add to the Reward Pot.", "error")
+								return
+							end
+							panel.__sfRewardPotAdjustCopper = 0
+							ctx.section:SetMessage("Added to the Reward Pot.", "success")
+							ctx.pageBuilder:Refresh()
+							ctx.pageBuilder:Reflow()
+						end,
+					},
+					{
+						text = "Subtract from Pot",
+						width = 180,
+						onClick = function(ctx)
+							ctx.section:ClearMessage()
+							local profile = GetActiveProfileObject(ctx.store)
+							if not (profile and type(profile.AdjustRewardPot) == "function") then
+								ctx.section:SetMessage("Reward Pot adjustments are unavailable.", "error")
+								return
+							end
+							local amount = math.floor(tonumber(panel.__sfRewardPotAdjustCopper) or 0)
+							local ok, err = profile:AdjustRewardPot(
+								(SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) or "DECREMENT",
+								amount,
+								"MANUAL"
+							)
+							if not ok then
+								ctx.section:SetMessage(err or "Failed to subtract from the Reward Pot.", "error")
+								return
+							end
+							panel.__sfRewardPotAdjustCopper = 0
+							ctx.section:SetMessage("Subtracted from the Reward Pot.", "success")
+							ctx.pageBuilder:Refresh()
+							ctx.pageBuilder:Reflow()
+						end,
+					},
 				},
 				{
 					type = "button",
@@ -1549,7 +1842,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				},
 				{ type = "spacer", height = 12 },
 				{ type = "heading", text = "Raid Check Profile Settings" },
-				{ type = "slider", label = "Points Per Raid Check", adminOnly = true, min = 0, max = 1, step = 0.5, tooltip = "Set how many points each prepared player earns when running a Raid Check.", enabled = function() return ProfileActionsEnabled() end, get = function() return GetRaidCheckPointsAwardPerCheck() end, set = function(v) SetRaidCheckPointsAwardPerCheck(v) end },
+				{ type = "slider", label = "Points Per Raid Check", adminOnly = true, min = 0, max = 1, step = 0.5, tooltip = "Set how many points each prepared player earns when running a Raid Check.", visible = function() return HasActiveProfile() and IsPointBasedMode() end, enabled = function() return ProfileActionsEnabled() end, get = function() return GetRaidCheckPointsAwardPerCheck() end, set = function(v) SetRaidCheckPointsAwardPerCheck(v) end },
 				{ type = "text", text = "Requirements to look for" },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Gem in Sockets", tooltip = "Require every socket on equipped gear to contain a gem during raid checks.", get = function() return IsRaidCheckGemSocketsEnabled() end, set = function(v) SetRaidCheckGemSockets(v) end }, { label = "At Least One Meta Gem", tooltip = "Require at least one meta gem to be equipped in a valid socket during raid checks.", get = function() return IsRaidCheckMetaGemRequired() end, set = function(v) SetRaidCheckMetaGemRequired(v) end } } },
 				{ type = "text", text = "Enchants to look for" },
@@ -1578,7 +1871,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck then SF.RaidCheck:RunPreRaidCheck() ctx.section:SetMessage("Pre-Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if SF.RaidCheck and SF.RaidCheck.RunRaidCheck then SF.RaidCheck:RunRaidCheck() ctx.section:SetMessage("Raid Check started.", "info") else ctx.section:SetMessage("Raid Check is not available.", "error") end end } },
 					{ type = "text", text = "Enable Whispers During..." },
 					{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing required enchants or gems.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end } } },
-					{ type = "checkbox", label = "Whisper when a point is earned", adminOnly = true, tooltip = "Only applies when Raid Check whispers are enabled. When checked, prepared players are whispered that they earned a point.", visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() if cfg == nil then return true end return cfg.enableWhispersRaidPrepared ~= false end, set = function(value) SetRaidCheckPreparedWhispers(value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end },
+					{ type = "checkbox", label = "Whisper when a point is earned", adminOnly = true, tooltip = "Only applies when Raid Check whispers are enabled. When checked, prepared players are whispered that they earned a point in Point Based mode, or an Attendance point in Reward Pot mode.", visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() if cfg == nil then return true end return cfg.enableWhispersRaidPrepared ~= false end, set = function(value) SetRaidCheckPreparedWhispers(value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end },
 					{
 						type = "spacer",
 						adminOnly = true,
@@ -1619,7 +1912,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			items = {
 				{ type = "scrollList", label = "Admins", adminOnly = true, height = 160, rowHeight = 20, removeAtlas = "common-icon-redx", compactColumns = true, removeColumnGap = 6, enabled = function() return ProfileActionsEnabled() end, getItems = function() return BuildAdminItems() end, onRemove = function(ctx, item) if type(ctx.store.RemoveAdminFromActiveProfile) ~= "function" then ctx.section:SetMessage("RemoveAdminFromActiveProfile() not implemented", "error") return end local ok, err = ctx.store:RemoveAdminFromActiveProfile(item.id) if not ok then ctx.section:SetMessage(err or "Failed to remove admin", "error") return end ctx.section:SetMessage("Admin removed.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "dropdownIconButton", label = "Add Admin", adminOnly = true, defaultText = "Select member", options = function() return BuildMemberOptions() end, get = function() return panel.__sfAddAdminSelectedId end, set = function(value) panel.__sfAddAdminSelectedId = value end, enabled = function() return ProfileActionsEnabled() end, iconAtlas = "common-icon-plus", iconToolTip = "Add the selected member as an admin for the active profile", iconEnabled = function() return ProfileActionsEnabled() and panel.__sfAddAdminSelectedId ~= nil end, onIconClick = function(ctx) if SF.Debug then SF.Debug:Info("UI", "Add Admin button clicked") end ctx.section:ClearMessage() local memberId = panel.__sfAddAdminSelectedId if SF.Debug then SF.Debug:Info("UI", "Selected memberId: %s", tostring(memberId)) end if not memberId then ctx.section:SetMessage("Select a member first.", "error") return end if type(ctx.store.AddAdminToActiveProfile) ~= "function" then ctx.section:SetMessage("AddAdminToActiveProfile() not implemented", "error") return end if SF.Debug then SF.Debug:Info("UI", "Calling AddAdminToActiveProfile with memberId: %s", tostring(memberId)) end local ok, err = ctx.store:AddAdminToActiveProfile(memberId) if SF.Debug then SF.Debug:Info("UI", "AddAdminToActiveProfile returned: ok=%s, err=%s", tostring(ok), tostring(err)) end if not ok then ctx.section:SetMessage(err or "Failed to add admin", "error") return end ctx.section:SetMessage("Admin added.", "success") ctx.pageBuilder:Refresh() end },
-				{ type = "button", label = "Transfer Points / Main Swap", adminOnly = true, buttonText = "Main Swap", width = 140, tooltip = "Transfer all point and member-history references from one existing profile member to another existing profile member, then remove the old character from the profile.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if type(ctx.store.TransferMemberHistoryInActiveProfile) ~= "function" then ctx.section:SetMessage("TransferMemberHistoryInActiveProfile() not implemented", "error") return end local memberOptions = BuildAllMemberOptions() if #memberOptions < 2 then ctx.section:SetMessage("Add at least two profile members before using Main Swap.", "error") return end dialogs:TransferMemberHistory("Transfer all point history from one profile member to another, then remove the old character from this profile?", "Transfer", memberOptions, memberOptions, function(sourceMemberId, targetMemberId) local ok, err = ctx.store:TransferMemberHistoryInActiveProfile(sourceMemberId, targetMemberId) if not ok then ctx.section:SetMessage(err or "Main Swap failed", "error") return end ctx.section:SetMessage("Main Swap completed.", "success") ctx.pageBuilder:Refresh() end) end },
+				{ type = "button", label = "Transfer Points / Main Swap", adminOnly = true, buttonText = "Main Swap", width = 140, tooltip = "Transfer loot points, Attendance, and member-history references from one existing profile member to another existing profile member, then remove the old character from the profile.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if type(ctx.store.TransferMemberHistoryInActiveProfile) ~= "function" then ctx.section:SetMessage("TransferMemberHistoryInActiveProfile() not implemented", "error") return end local memberOptions = BuildAllMemberOptions() if #memberOptions < 2 then ctx.section:SetMessage("Add at least two profile members before using Main Swap.", "error") return end dialogs:TransferMemberHistory("Transfer all point and Attendance history from one profile member to another, then remove the old character from this profile?", "Transfer", memberOptions, memberOptions, function(sourceMemberId, targetMemberId) local ok, err = ctx.store:TransferMemberHistoryInActiveProfile(sourceMemberId, targetMemberId) if not ok then ctx.section:SetMessage(err or "Main Swap failed", "error") return end ctx.section:SetMessage("Main Swap completed.", "success") ctx.pageBuilder:Refresh() end) end },
 			},
 		},
 	}
@@ -1635,6 +1928,9 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 	return {
 		isAdmin = function()
 			return IsAdmin()
+		end,
+		isOwner = function()
+			return IsOwner()
 		end,
 		sections = sections,
 	}

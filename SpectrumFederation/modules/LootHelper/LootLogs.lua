@@ -20,7 +20,11 @@ local EVENT_TYPES = {
     SAFEMODE_ON_COMBAT_CHANGE   = "SAFEMODE_ON_COMBAT_CHANGE",
     ADMIN_ADDED                 = "ADMIN_ADDED",
     ADMIN_REMOVED               = "ADMIN_REMOVED",
-    MAIN_SWAP                   = "MAIN_SWAP"
+    MAIN_SWAP                   = "MAIN_SWAP",
+    LOOT_MODE_CHANGE            = "LOOT_MODE_CHANGE",
+    REWARD_POT_CONFIG_CHANGE    = "REWARD_POT_CONFIG_CHANGE",
+    REWARD_POT_CHANGE           = "REWARD_POT_CHANGE",
+    ATTENDANCE_CHANGE           = "ATTENDANCE_CHANGE",
 }
 
 local POINT_CHANGE_TYPES = {
@@ -77,6 +81,28 @@ local EVENT_DATA_TEMPLATES = {
     [EVENT_TYPES.MAIN_SWAP] = {
         member = "", -- "Name-Realm" (the new/target character)
         sourceMember = "" -- "Name-Realm" (the old character that was consolidated)
+    },
+    [EVENT_TYPES.LOOT_MODE_CHANGE] = {
+        oldMode = "",
+        newMode = ""
+    },
+    [EVENT_TYPES.REWARD_POT_CONFIG_CHANGE] = {
+        startingPotCopper = 0,
+        deductionType = "",
+        deductionValue = 0
+    },
+    [EVENT_TYPES.REWARD_POT_CHANGE] = {
+        change = "", -- INCREMENT/DECREMENT
+        amount = 0 -- copper
+        -- @field reason string|nil MANUAL or RAID_DEDUCTION
+        -- @field deductionType string|nil flat or percent at the time of a raid deduction
+        -- @field percent number|nil percent used when deductionType is percent
+    },
+    [EVENT_TYPES.ATTENDANCE_CHANGE] = {
+        member = "",
+        change = "" -- INCREMENT/DECREMENT
+        -- @field amount number|nil positive attendance amount
+        -- @field reason string|nil RAID_CHECK or MANUAL
     }
 }
 
@@ -167,6 +193,15 @@ function LootLog.new(eventType, eventData, opts)
             end
             return nil
         end
+
+        if eventType == EVENT_TYPES.LOOT_MODE_CHANGE then
+            if type(ap.IsCurrentUserOwner) ~= "function" or not ap:IsCurrentUserOwner() then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Current user is not the owner; cannot change loot mode")
+                end
+                return nil
+            end
+        end
     end
 
     -- Validate event type
@@ -227,6 +262,22 @@ function LootLog.new(eventType, eventData, opts)
         end
     elseif eventType == EVENT_TYPES.MAIN_SWAP then
         if not SF.LootLogValidators.ValidateMainSwapData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.LOOT_MODE_CHANGE then
+        if not SF.LootLogValidators.ValidateLootModeChangeData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.REWARD_POT_CONFIG_CHANGE then
+        if not SF.LootLogValidators.ValidateRewardPotConfigChangeData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.REWARD_POT_CHANGE then
+        if not SF.LootLogValidators.ValidateRewardPotChangeData(eventData, POINT_CHANGE_TYPES) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.ATTENDANCE_CHANGE then
+        if not SF.LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES) then
             return nil
         end
     end
@@ -321,6 +372,31 @@ function LootLog.GetPointChangeAmount(eventData)
     end
 
     return DEFAULT_POINT_CHANGE_AMOUNT
+end
+
+function LootLog.GetAttendanceChangeAmount(eventData)
+    if type(eventData) ~= "table" then
+        return 1
+    end
+
+    local amount = tonumber(eventData.amount)
+    if amount and amount > 0 then
+        return amount
+    end
+
+    return 1
+end
+
+function LootLog.GetRewardPotChangeAmount(eventData)
+    if type(eventData) ~= "table" then
+        return 0
+    end
+
+    local amount = math.floor(tonumber(eventData.amount) or 0)
+    if amount < 0 then
+        return 0
+    end
+    return amount
 end
 
 -- Function to get the Unique ID of this log entry

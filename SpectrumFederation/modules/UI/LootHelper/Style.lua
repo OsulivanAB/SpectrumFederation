@@ -56,6 +56,9 @@ function Style:Apply(frame)
     if frame.Title and frame.Title.Session and frame.Title.Session.SetFont then
         frame.Title.Session:SetFont(fontPath, math.max(8, fontSize - 1), "OUTLINE")
     end
+    if frame.Content and frame.Content.PotHeader and frame.Content.PotHeader.Text and frame.Content.PotHeader.Text.SetFont then
+        frame.Content.PotHeader.Text:SetFont(fontPath, fontSize, "")
+    end
 
     -- Placeholder hook
     if frame.Content and frame.Content.Placeholder and frame.Content.Placeholder.SetFont then
