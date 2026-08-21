@@ -51,6 +51,18 @@ WoW throttles inspection and requires other players to be nearby and inspectable
 
 Raid Check treats incomplete item data as unprepared. Move closer, refresh the snapshot, then rerun the check.
 
+## `/sf version` shows a red X for someone who has the addon
+
+The version window asks current group members to report the addon version they are running. A red X means that player did not answer in time.
+
+Common causes:
+
+- the player does not have Spectrum Federation enabled;
+- the player is offline or still loading;
+- the player is on an older build that does not answer version queries.
+
+Run `/sf version` again after they reload. Your own row always shows the version from this client.
+
 ## A player did not receive a Raid Check point or Attendance
 
 Confirm that:

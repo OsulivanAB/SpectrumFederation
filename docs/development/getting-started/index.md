@@ -15,6 +15,8 @@ SpectrumFederation/
     UI/Settings/               standalone settings framework and pages
     UI/LootHelper/             roster and equipment windows
     RaidCheck.lua              inspection, preparation checks, and awards
+    VersionCheck.lua           raid/party addon-version query
+    UI/VersionCheck/           resizable `/sf version` window
   locale/                      early localization work (not currently loaded by the TOC)
 .github/scripts/               validation and release helpers
 .github/workflows/             PR, beta, promotion, and rollback automation
