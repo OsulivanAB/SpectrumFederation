@@ -439,6 +439,17 @@ function VC:_FinishRound(round)
 		end
 	end
 
+	-- Drop the round nonce so idle roster updates do not keep treating the
+	-- last query as in-progress (new joiners would otherwise stay "checking",
+	-- and RequestRefresh would keep applying the in-flight ping throttle).
+	if state.timeoutHandle and state.timeoutHandle.Cancel then
+		pcall(function()
+			state.timeoutHandle:Cancel()
+		end)
+	end
+	state.timeoutHandle = nil
+	state.activeNonce = nil
+
 	DebugInfo("Version check round %d finished (%d players)", round, #state.order)
 	self:_MarkDirty()
 	self:_NotifyListeners(true)
