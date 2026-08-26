@@ -8,6 +8,7 @@ Spectrum Federation is a World of Warcraft Retail addon for coordinating guild r
 - **Loot profiles** — separate, named sets of members, admins, Point Based or Reward Pot rules, Raid Check options, and history.
 - **Sync sessions** — group-wide profile and log synchronization, with automatic catch-up for late joiners and clients that missed updates.
 - **Raid Check** — configurable enchant and gem checks, optional whispers, and loot-point or Attendance awards for prepared profile members.
+- **Addon versions** — `/sf version` lists current raid or party members and the Spectrum Federation version each one is running.
 - **Loot Logs** — a filterable history of point, Attendance, Reward Pot, equipment, profile, safe-mode, admin, and main-swap changes.
 - **Gameplay settings** — per-specialization control of WoW's Press and Hold Casting option.
 

@@ -41,6 +41,14 @@ Any other text after `/sf loot` currently performs the same default action as `/
 
 Both modes require an active profile and profile-admin permission. Entering another argument prints the supported syntax.
 
+## Addon versions
+
+| Command | Result |
+| --- | --- |
+| `/sf version` | Open a resizable window listing current raid or party members and the Spectrum Federation version each one is running. Players who do not respond receive a red X. |
+
+The window remembers its size and position, and it can be closed with the title-bar X. Use the command again to refresh the list. Solo players see only themselves.
+
 ## Debugging
 
 | Command | Aliases | Result |

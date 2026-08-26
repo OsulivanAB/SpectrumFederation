@@ -73,6 +73,14 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [1.2.0-beta.2] - 2026-08-21
+
+### Added
+- Merge pull request #251 from OsulivanAB/cursor/addon-version-roster-3443
+
+Add /sf version window for raid addon versions
+
 ## [1.1.0] - 2026-08-21
 
 ### Changed
