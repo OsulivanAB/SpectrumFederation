@@ -75,6 +75,14 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 
 
+
+## [1.3.0-beta.2] - 2026-08-27
+
+### Added
+- Merge pull request #253 from OsulivanAB/cursor/cursed-surge-tracker-8250
+
+Add Spectrum Federation: Cursed Surge Tracker child addon
+
 ## [1.2.0] - 2026-08-26
 
 ### Changed
