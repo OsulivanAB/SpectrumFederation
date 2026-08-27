@@ -10,7 +10,8 @@ alwaysApply: true
   - packaging or release behavior -> `python3 .github/scripts/validate_packaging.py`
   - docs, `README.md`, or `mkdocs.yml` -> `python3 .github/scripts/validate_docs.py`
   - `wow_interface_sync.py` or parser fixtures/tests -> `python -m pytest tests/test_wow_interface_sync.py`
+  - Cursed Surge schedule/map helpers -> `python -m pytest tests/test_cursed_surge_tracker.py`
 - Normal development targets `beta`; `main` is for promotion and release workflows.
 - Do not weaken CI to make checks pass.
 - Keep the job name in `.github/workflows/copilot-setup-steps.yml` exactly `copilot-setup-steps`.
-- Treat `SpectrumFederation/SpectrumFederation.toc` as the authoritative source for addon version, interface value, and load order whenever a task touches addon packaging or release/version logic.
+- Treat `SpectrumFederation/SpectrumFederation.toc` as the authoritative source for addon version, interface value, and load order whenever a task touches addon packaging or release/version logic. Packaged child TOC files must stay on the same Version and Interface values.

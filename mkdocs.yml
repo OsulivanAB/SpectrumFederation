@@ -79,6 +79,7 @@ nav:
     - Raid Check: features/raid-check.md
     - Sync Sessions: features/sync-sessions.md
     - Loot Logs: features/loot-logs.md
+    - Cursed Surge Tracker: features/cursed-surge-tracker.md
     - Settings and Gameplay: settings-ui.md
   - Reference:
     - Slash Commands: reference/slash-commands.md

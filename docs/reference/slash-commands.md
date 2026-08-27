@@ -74,6 +74,18 @@ Debug logs are not Loot Logs and clearing them does not change profile history.
 
 These commands inspect state; they do not start, stop, or repair a session.
 
+## Cursed Surge Tracker diagnostics
+
+`/sfcst` and `/sfcursedsurge` are equivalent opt-in diagnostic commands for the Cursed Surge Tracker child addon. `/sf cst` registers the same dump through the parent slash dispatcher when Spectrum Federation is loaded.
+
+| Command | Result |
+| --- | --- |
+| `/sfcst` | Print zone, map, schedule, ring, and timer state for the five Curse Surge locations. |
+| `/sfcst status` | Print the same dump. Aliases: `debug`, `dump`. |
+| `/sfcst help` | Print the diagnostic command list. Alias: `?`. |
+
+These commands inspect state; they do not enable or disable the tracker. Use WoW's AddOns checkbox to toggle the child addon.
+
 ## Unknown commands
 
 An unknown top-level command prints an error and points to `/sf help`. Command execution is protected so a handler error is reported instead of stopping the entire slash-command dispatcher.

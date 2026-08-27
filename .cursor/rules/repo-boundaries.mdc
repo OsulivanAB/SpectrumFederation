@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Repo Boundaries
 
-- This repo contains one WoW addon plus its Python automation and MkDocs docs; there is no package-manager workspace to extend.
+- This repo contains the Spectrum Federation WoW addon, optional packaged child addons, Python automation, and MkDocs docs; there is no package-manager workspace to extend.
 - Keep changes inside the relevant concern unless the task explicitly spans addon runtime, automation, and docs together.
 - Prefer existing repo scripts and workflow files over inventing new commands or pipelines.
 - When prose docs disagree with workflow/script behavior, trust `.github/workflows/` and `.github/scripts/` first, then update docs if needed.

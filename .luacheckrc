@@ -1,6 +1,10 @@
 std = "lua51"
 
-globals = {}
+globals = {
+  "SpectrumFederationCSTPinMixin",
+  "SLASH_SPECTRUMFEDERATIONCST1",
+  "SLASH_SPECTRUMFEDERATIONCST2",
+}
 read_globals = {
   "CreateFrame",
   "C_Timer",
@@ -35,4 +39,15 @@ read_globals = {
   "UIParent",
   "UIPanelCloseButton",
   "RAID_CLASS_COLORS",
+  "C_Map",
+  "C_EventScheduler",
+  "C_AreaPoiInfo",
+  "C_AddOns",
+  "GetTime",
+  "CreateFromMixins",
+  "MapCanvasDataProviderMixin",
+  "MapCanvasPinMixin",
+  "WorldMapFrame",
+  "SlashCmdList",
+  "CooldownFrameTemplate",
 }

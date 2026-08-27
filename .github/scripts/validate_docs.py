@@ -187,15 +187,19 @@ def validate_readme_badges(repo_root):
 
 def validate_slash_command_reference(repo_root):
     """Require every registered command and diagnostic alias in the reference."""
-    addon_root = repo_root / "SpectrumFederation"
+    addon_roots = [repo_root / "SpectrumFederation"]
+    child_root = repo_root / "SpectrumFederation_CursedSurgeTracker"
+    if child_root.exists():
+        addon_roots.append(child_root)
     commands = set()
     aliases = set()
-    for source in addon_root.rglob("*.lua"):
-        source_text = source.read_text(encoding="utf-8")
-        commands.update(
-            REGISTERED_COMMAND_RE.findall(source_text)
-        )
-        aliases.update(SLASH_ALIAS_RE.findall(source_text))
+    for addon_root in addon_roots:
+        for source in addon_root.rglob("*.lua"):
+            source_text = source.read_text(encoding="utf-8")
+            commands.update(
+                REGISTERED_COMMAND_RE.findall(source_text)
+            )
+            aliases.update(SLASH_ALIAS_RE.findall(source_text))
     reference = (
         repo_root / "docs/reference/slash-commands.md"
     ).read_text(encoding="utf-8").lower()

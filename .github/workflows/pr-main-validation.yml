@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'SpectrumFederation/**'
+      - 'SpectrumFederation_CursedSurgeTracker/**'
       - '.github/scripts/**'
       - '.github/workflows/**'
       - '.github/requirements-lint.txt'

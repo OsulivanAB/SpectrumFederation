@@ -26,7 +26,7 @@ Both branch-validation workflows include `README.md` in their path filters so me
 
 ## Post-merge beta release
 
-`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes `SpectrumFederation/**`.
+`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes `SpectrumFederation/**` or `SpectrumFederation_CursedSurgeTracker/**`.
 
 It:
 
@@ -45,7 +45,7 @@ Docs-only merges do not trigger a beta addon release.
 
 The workflow:
 
-1. determines whether `SpectrumFederation/**` differs between `main` and `beta`;
+1. determines whether `SpectrumFederation/**` or `SpectrumFederation_CursedSurgeTracker/**` differs between `main` and `beta`;
 2. validates lint, packaging, docs, and the appropriate version format;
 3. simulates the merge, metadata changes, docs build, release packaging, and beta synchronization without pushing;
 4. merges `beta` into `main`;
@@ -112,11 +112,6 @@ When behavior changes intentionally, update the implementation and its documenta
 
 ## Version and manifest source of truth
 
-`SpectrumFederation/SpectrumFederation.toc` is authoritative for:
-
-- addon version;
-- WoW Interface value;
-- packaged SavedVariables;
-- Lua library/module load order.
+Release zips contain sibling top-level folders `SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/`. Extracting the archive into `Interface/AddOns` installs both addons. The child TOC must keep the same `## Interface` and `## Version` values as the parent.
 
 README badges are generated release metadata, not the source of truth.

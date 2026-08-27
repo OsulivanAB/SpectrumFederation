@@ -6,7 +6,7 @@ Spectrum Federation is a World of Warcraft Retail addon written for WoW's embedd
 
 ```text
 SpectrumFederation/
-  SpectrumFederation.toc       authoritative manifest and load order
+  SpectrumFederation.toc       authoritative parent manifest and load order
   SpectrumFederation.lua       login initialization
   modules/
     LootHelper/                profiles, members, logs, and transport
@@ -18,6 +18,11 @@ SpectrumFederation/
     VersionCheck.lua           raid/party addon-version query
     UI/VersionCheck/           resizable `/sf version` window
   locale/                      early localization work (not currently loaded by the TOC)
+SpectrumFederation_CursedSurgeTracker/
+  SpectrumFederation_CursedSurgeTracker.toc
+  Schedule.lua                 pure schedule/map helpers
+  Tracker.lua                  zone, scheduler, and timer runtime
+  MapPins.lua                  World Map data provider and pins
 .github/scripts/               validation and release helpers
 .github/workflows/             PR, beta, promotion, and rollback automation
 assets/                        standalone Google Sheet sync utility
@@ -38,7 +43,7 @@ python3 -m pip install -r .github/requirements-lint.txt
 python3 -m pip install -r requirements-docs.txt
 ```
 
-Link `SpectrumFederation/` into the Retail client's `Interface/AddOns/` directory for in-game testing. Enable Lua errors while developing:
+Link `SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/` into the Retail client's `Interface/AddOns/` directory for in-game testing. Enable Lua errors while developing:
 
 ```text
 /console scriptErrors 1
@@ -55,7 +60,7 @@ Addon behavior or UI changes require a new version in `SpectrumFederation.toc`; 
 
 - Start modules with `local addonName, SF = ...` (or `local _, SF = ...`) and attach shared APIs to `SF`; do not introduce globals.
 - Remain compatible with Lua 5.1 and the WoW sandbox.
-- Add every packaged Lua file to the TOC after its dependencies.
+- Add every packaged Lua file to the matching addon TOC after its dependencies. Child-addon files belong in `SpectrumFederation_CursedSurgeTracker.toc`, not the parent TOC.
 - Prefer `SF.Debug:Verbose/Info/Warn/Error` for diagnostics.
 - Prefer `SF:PrintSuccess/Error/Warning/Info` for user-visible chat output.
 - Normalize character identifiers through `NameUtil` rather than comparing raw names.
