@@ -61,8 +61,9 @@ When you need a new toggle/option:
 - If existing code is not fully localized yet, keep your additions consistent with the existing direction (don’t introduce a third pattern).
 
 ## Packaging + versioning
-- **Any new Lua file must be listed in** `SpectrumFederation/SpectrumFederation.toc`.
-- **Any behavior/UI/settings change must bump** `## Version:` in the `.toc`.
+- **Any new Lua file must be listed in** the TOC of the addon that owns it (`SpectrumFederation.toc` or a child-addon TOC).
+- Parent TOC files must not load child-addon Lua or XML.
+- **Any behavior/UI/settings change must bump** `## Version:` in `SpectrumFederation/SpectrumFederation.toc` and keep any packaged child TOC on the same version.
 
 ## Validation checklist (do these before declaring “done”)
 - `python3 .github/scripts/lint_all.py`

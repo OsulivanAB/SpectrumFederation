@@ -1,6 +1,11 @@
 -- Grab the namespace
 local addonName, SF = ...
 
+-- Optional child addons declare ## Dependencies: SpectrumFederation and may
+-- read _G.SpectrumFederation for Debug, slash registration, and time helpers.
+-- The parent never loads or references child addons.
+_G[addonName] = SF
+
 local f = CreateFrame("Frame")
 f:RegisterEvent("ADDON_LOADED")
 f:SetScript("OnEvent", function(_, _, loadedAddonName)
