@@ -285,6 +285,26 @@ def format_duration(seconds):
     return f"{minutes:02d}:{remain:02d}"
 
 
+def scheduler_atlas_from_row(row):
+    if not isinstance(row, dict):
+        return None
+    for key in ("atlasName", "atlas", "overrideAtlas", "iconAtlas"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def localized_name_from_row(row):
+    if not isinstance(row, dict):
+        return None
+    for key in ("name", "eventName", "title"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def resolve_location_state(location, rows, now, schedule_status, extras=None):
     extras = extras or {}
     state = {
@@ -315,12 +335,23 @@ def resolve_location_state(location, rows, now, schedule_status, extras=None):
     state["coordinateSource"] = source
     filtered = filter_rows_for_location(rows, location)
     state["rowCount"] = len(filtered)
+    scheduler_atlas = extras.get("schedulerAtlas")
+    name = extras.get("name")
+    for item in filtered:
+        if not scheduler_atlas:
+            scheduler_atlas = scheduler_atlas_from_row(item)
+        if not name:
+            name = localized_name_from_row(item)
+        if scheduler_atlas and name:
+            break
     atlas, atlas_source = resolve_atlas(
-        extras.get("schedulerAtlas"), extras.get("poiAtlas"), FALLBACK_ATLAS
+        extras.get("schedulerAtlas") or scheduler_atlas,
+        extras.get("poiAtlas"),
+        FALLBACK_ATLAS,
     )
     state["atlas"] = atlas
     state["atlasSource"] = atlas_source
-    state["name"] = extras.get("name") or extras.get("fallbackName")
+    state["name"] = name or extras.get("fallbackName")
 
     if schedule_status == "loading":
         state["status"] = "loading"

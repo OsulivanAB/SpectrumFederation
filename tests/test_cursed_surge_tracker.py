@@ -242,6 +242,65 @@ def test_atlas_priority():
     assert cst.resolve_atlas(None, None, None) == (cst.FALLBACK_ATLAS, "fallback")
 
 
+def test_scheduler_name_is_kept_when_row_has_atlas():
+    payload = row(
+        8936,
+        100,
+        200,
+        name="Venomous Tides",
+        atlasName="UI-EventPoi-venomoustides",
+    )
+    state = cst.resolve_location_state(
+        location(8936),
+        [payload],
+        150,
+        "ready",
+        extras={"fallbackName": "Curse Surge"},
+    )
+    assert state["name"] == "Venomous Tides"
+    assert state["atlas"] == "UI-EventPoi-venomoustides"
+
+
+def test_scheduler_name_from_later_row_if_first_has_atlas_only():
+    first = row(8936, 100, 200, atlasName="UI-EventPoi-venomoustides")
+    second = row(8936, 400, 500, name="Venomous Tides")
+    state = cst.resolve_location_state(
+        location(8936),
+        [first, second],
+        50,
+        "ready",
+        extras={"fallbackName": "Curse Surge"},
+    )
+    assert state["name"] == "Venomous Tides"
+    assert state["atlas"] == "UI-EventPoi-venomoustides"
+
+
+def test_re_resolve_from_cached_rows_advances_status_with_time():
+    rows = [row(8936, 100, 200), row(8936, 400, 500)]
+    loc = location(8936)
+    at_entry = cst.resolve_location_state(loc, rows, 150, "ready")
+    at_reopen = cst.resolve_location_state(loc, rows, 250, "ready")
+    assert at_entry["status"] == "active"
+    assert at_entry["countdownSeconds"] == 50
+    assert at_reopen["status"] == "inactive"
+    assert at_reopen["countdownSeconds"] == 150
+
+
+def test_tracker_re_resolves_cached_states_when_map_opens():
+    text = (CHILD_ROOT / "Tracker.lua").read_text(encoding="utf-8")
+    resolve_pos = text.find("local function ResolveFromCache()")
+    rebuild_pos = text.find("local function RebuildModel()")
+    assert resolve_pos != -1 and rebuild_pos != -1
+    assert resolve_pos < rebuild_pos
+    shown = text[text.find("function Tracker.OnPinsShown()") : text.find("function Tracker.OnPinsHidden()")]
+    infos = text[text.find("function Tracker.GetPinInfos()") : text.find("function Tracker.HasBoundaryTimer()")]
+    assert "ResolveFromCache()" in shown
+    assert "ResolveFromCache()" in infos
+    consume = text[text.find("local function ConsumeSchedulerData()") : text.find("local function RequestSchedulerData()")]
+    assert "RefreshPinsIfMapVisible()" in consume
+    assert "CST.MapPins.Refresh()" not in consume
+
+
 def test_missing_poi_metadata_still_resolves_fixed_pin():
     loc = location(8938)
     state = cst.resolve_location_state(loc, [], 1, "loading", extras={})

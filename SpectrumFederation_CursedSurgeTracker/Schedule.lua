@@ -533,14 +533,17 @@ function CST.ResolveLocationState(location, rows, now, scheduleStatus, extras)
     local filtered = CST.FilterRowsForLocation(rows, location)
     state.rowCount = #filtered
 
-    local schedulerAtlas = nil
+    local schedulerAtlas = extras.schedulerAtlas
     for index = 1, #filtered do
-        schedulerAtlas = CST.SchedulerAtlasFromRow(filtered[index])
-        if schedulerAtlas then
-            break
+        local row = filtered[index]
+        if not schedulerAtlas then
+            schedulerAtlas = CST.SchedulerAtlasFromRow(row)
         end
         if not state.name then
-            state.name = CST.LocalizedNameFromRow(filtered[index])
+            state.name = CST.LocalizedNameFromRow(row)
+        end
+        if schedulerAtlas and state.name then
+            break
         end
     end
     state.atlas, state.atlasSource = CST.ResolveAtlas(

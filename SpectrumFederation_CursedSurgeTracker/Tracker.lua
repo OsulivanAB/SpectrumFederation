@@ -274,10 +274,23 @@ local function BuildExtras()
     return extras
 end
 
+-- ResolveFromCache must be declared before RebuildModel. Lua 5.1 does not
+-- see a later `local function` from an earlier local function body.
+local function ResolveFromCache()
+    resolvedStates = CST.ResolveAllLocationStates(cachedRows, Now(), scheduleStatus, extrasByPoi)
+end
+
 local function RebuildModel()
     extrasByPoi = BuildExtras()
     cachedRows = CollectSchedulerRows()
-    resolvedStates = CST.ResolveAllLocationStates(cachedRows, Now(), scheduleStatus, extrasByPoi)
+    ResolveFromCache()
+end
+
+local function RefreshPinsIfMapVisible()
+    local mapVisible = CST.MapPins and CST.MapPins.IsWorldMapVisible and CST.MapPins.IsWorldMapVisible()
+    if mapVisible and CST.MapPins and CST.MapPins.Refresh then
+        CST.MapPins.Refresh()
+    end
 end
 
 local ScheduleBoundaryTimer
@@ -334,6 +347,10 @@ ScheduleBoundaryTimer = function()
 end
 
 function Tracker.OnPinsShown()
+    -- Re-derive active/inactive rings from absolute timestamps whenever the
+    -- map becomes visible. Do not keep a snapshot from zone entry or from
+    -- the last scheduler update while the map was closed.
+    ResolveFromCache()
     ScheduleBoundaryTimer()
 end
 
@@ -343,6 +360,7 @@ function Tracker.OnPinsHidden()
 end
 
 function Tracker.GetPinInfos()
+    ResolveFromCache()
     return resolvedStates
 end
 
@@ -394,9 +412,10 @@ local function ConsumeSchedulerData()
         scheduleStatus = "ready"
     end
     RebuildModel()
-    if CST.MapPins and CST.MapPins.Refresh then
-        CST.MapPins.Refresh()
-    end
+    -- Cache the latest scheduler rows even while the map is closed. Pin
+    -- rendering waits until the World Map is visible; GetPinInfos/OnPinsShown
+    -- then re-derive rings from these cached rows and the current timestamp.
+    RefreshPinsIfMapVisible()
     if hoveredPin then
         ShowPinTooltip(hoveredPin)
     end
@@ -417,9 +436,7 @@ local function RequestSchedulerData()
     end
     scheduleStatus = "loading"
     RebuildModel()
-    if CST.MapPins and CST.MapPins.Refresh then
-        CST.MapPins.Refresh()
-    end
+    RefreshPinsIfMapVisible()
     if requestedEvents then
         return
     end
