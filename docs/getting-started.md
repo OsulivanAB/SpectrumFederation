@@ -4,7 +4,7 @@
 
 Install **Spectrum Federation** with the CurseForge client, WowUp, or a release archive from [GitHub Releases](https://github.com/OsulivanAB/SpectrumFederation/releases).
 
-For a manual installation, extract the archive and place the `SpectrumFederation` folder in the Retail AddOns directory:
+For a manual installation, extract the archive and place **both** `SpectrumFederation` and `SpectrumFederation_CursedSurgeTracker` folders in the Retail AddOns directory:
 
 - Windows: `World of Warcraft\_retail_\Interface\AddOns\`
 - macOS: `World of Warcraft/_retail_/Interface/AddOns/`
@@ -80,5 +80,6 @@ See [Raid Check](features/raid-check.md) before enabling automatic whispers or a
 - `/sf raidcheck raid` — run the awarding raid check.
 - `/sf version` — show who in the raid or party is running Spectrum Federation, and which version.
 - `/sf loot sync` — manually compare your data with the active session.
+- `/sfcst` — dump Cursed Surge Tracker diagnostics.
 
 The [Slash Command Reference](reference/slash-commands.md) lists every supported command and restriction.

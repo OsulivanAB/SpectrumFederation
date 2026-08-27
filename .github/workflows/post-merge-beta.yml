@@ -6,6 +6,7 @@ on:
       - beta
     paths:
       - 'SpectrumFederation/**'
+      - 'SpectrumFederation_CursedSurgeTracker/**'
 
 concurrency:
   group: beta-release

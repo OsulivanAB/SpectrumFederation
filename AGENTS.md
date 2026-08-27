@@ -4,7 +4,8 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 
 ## What Lives Where
 
-- `SpectrumFederation/`: packaged addon runtime code, TOC manifest, locale files, and bundled libraries.
+- `SpectrumFederation/`: packaged parent addon runtime code, TOC manifest, locale files, and bundled libraries.
+- `SpectrumFederation_CursedSurgeTracker/`: optional child addon shipped in the same release zip.
 - `.github/scripts/`: Python automation for linting, packaging, docs validation, release/version checks, and Blizzard interface sync.
 - `.github/workflows/`: GitHub Actions workflows for PR validation, beta releases, promotion to `main`, rollback, and Copilot setup.
 - `docs/` + `mkdocs.yml`: documentation source for the published docs site.
@@ -13,7 +14,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 
 ## Source Of Truth
 
-- Treat `SpectrumFederation/SpectrumFederation.toc` as the authoritative addon manifest for load order, interface version, and addon version.
+- Treat `SpectrumFederation/SpectrumFederation.toc` as the authoritative addon manifest for load order, interface version, and addon version. Child-addon TOC files must stay on the same Interface and Version values.
 - Prefer `.github/workflows/` and `.github/scripts/` over prose docs when they disagree; some docs still mention older workflow names.
 - Prefer existing repo scripts over inventing new validation commands.
 

@@ -94,3 +94,9 @@ The codebase exposes internal addon APIs on `SF`, including:
 - `SF.Debug` and message helpers.
 
 These are internal project APIs, not stable third-party compatibility guarantees. Prefer feature-level methods over writing SavedVariables directly.
+
+## Child addons
+
+`SpectrumFederation_CursedSurgeTracker` is a sibling addon folder packaged in the same release zip. It declares `## Dependencies: SpectrumFederation` and `## Group: SpectrumFederation` so WoW nests it under the parent in the AddOns list.
+
+The parent does not load child Lua/XML and does not depend on the child. Optional children may read `_G.SpectrumFederation` for Debug, slash registration, and `SF:Now()`. The assignment is made in `modules/Init.lua` so the parent remains fully usable when no child is present.

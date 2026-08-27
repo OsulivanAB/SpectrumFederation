@@ -6,6 +6,7 @@ on:
       - beta
     paths:
       - 'SpectrumFederation/**'
+      - 'SpectrumFederation_CursedSurgeTracker/**'
       - '.github/scripts/**'
       - '.github/workflows/**'
       - '.github/requirements-lint.txt'
@@ -37,7 +38,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          CHANGED_FILES=$(git diff --name-only "$BASE_SHA...$HEAD_SHA" -- 'SpectrumFederation/')
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA...$HEAD_SHA" -- 'SpectrumFederation/' 'SpectrumFederation_CursedSurgeTracker/')
           if [[ -n "$CHANGED_FILES" ]]; then
             echo "addon_changed=true" >> "$GITHUB_OUTPUT"
             echo "Addon files changed:"
