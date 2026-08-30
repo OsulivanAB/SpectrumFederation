@@ -930,7 +930,17 @@ Respond with JSON only in this exact shape:
   ]
 }}
 """
-    if len(prompt) > MAX_PROMPT_CHARS:
+    schema_marker = "Respond with JSON only"
+    if len(prompt) > MAX_PROMPT_CHARS and schema_marker in prompt:
+        head, schema = prompt.rsplit(schema_marker, 1)
+        keep = MAX_PROMPT_CHARS - len(schema_marker) - len(schema) - 40
+        prompt = (
+            head[:keep]
+            + "\n... (earlier context truncated; JSON schema follows)\n\n"
+            + schema_marker
+            + schema
+        )
+    elif len(prompt) > MAX_PROMPT_CHARS:
         prompt = prompt[:MAX_PROMPT_CHARS] + "\n... (prompt truncated)\n"
     return prompt
 
@@ -1132,10 +1142,9 @@ def choose_entries(context, token):
         return fallback
 
     if ai_error:
-        raise ChangelogError(
-            f"Refusing to write a guessed changelog entry ({ai_error})"
-        )
-    print("[changelog] No grounded changelog entries available; skipping")
+        print(f"[changelog] Skipping write rather than guessing ({ai_error})")
+    else:
+        print("[changelog] No grounded changelog entries available; skipping")
     return None
 
 

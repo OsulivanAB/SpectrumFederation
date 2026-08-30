@@ -6,8 +6,6 @@ import importlib.util
 import subprocess
 from pathlib import Path
 
-import pytest
-
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / ".github" / "scripts" / "update_changelog.py"
 SPEC = importlib.util.spec_from_file_location("update_changelog", MODULE_PATH)
@@ -358,6 +356,28 @@ def test_rerun_does_not_replace_existing_equivalent_section(tmp_path, monkeypatc
     assert written == SAMPLE_CHANGELOG
 
 
+def test_prompt_truncation_keeps_json_schema():
+    context = {
+        "mode": "promote",
+        "version": "1.3.0",
+        "range": {"label": "v1.2.0...HEAD"},
+        "user_facing_files": ["SpectrumFederation_CursedSurgeTracker/Tracker.lua"],
+        "commits": [],
+        "pull_requests": [],
+        "beta_sections": [],
+        "previous_stable_section": "",
+        "diff": {
+            "stat": "ok",
+            "name_status": "A\tTracker.lua",
+            "patch": "x" * 40000,
+        },
+    }
+    prompt = changelog.build_prompt(context)
+    assert "Respond with JSON only" in prompt
+    assert '"confidence"' in prompt
+    assert len(prompt) <= changelog.MAX_PROMPT_CHARS + 80
+
+
 def test_ambiguous_ai_output_does_not_write_when_fallback_is_empty(monkeypatch):
     context = {
         "version": "1.4.0-beta.1",
@@ -372,5 +392,4 @@ def test_ambiguous_ai_output_does_not_write_when_fallback_is_empty(monkeypatch):
     }
     monkeypatch.setattr(changelog, "request_ai_entries", lambda _context, _token: (None, "model confidence was 'low'"))
     monkeypatch.setattr(changelog, "fallback_entries", lambda _context: [])
-    with pytest.raises(changelog.ChangelogError, match="Refusing to write"):
-        changelog.choose_entries(context, token=None)
+    assert changelog.choose_entries(context, token=None) is None

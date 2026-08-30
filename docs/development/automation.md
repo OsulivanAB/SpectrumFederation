@@ -67,7 +67,7 @@ GitHub Models is retired. The script uses Copilot CLI when it is installed, or a
 
 For Promote Beta to Main, the range is the previous stable `vX.Y.Z` tag (or the first parent of the previous promotion merge) through the commit being promoted. Beta changelog sections for the same `X.Y.Z` train are inputs to consolidate; they are not copied one-for-one onto `main`.
 
-The dry-run promotion job fetches `origin/beta` and analyzes `HEAD...origin/beta` with the upcoming stable version so the changelog path can be validated without pushing.
+The dry-run promotion job fetches `origin/beta`, uses the incoming `update_changelog.py` from beta, and analyzes `HEAD...origin/beta` with the upcoming stable version so the changelog path can be validated without pushing.
 
 ### Safeguards
 
@@ -75,7 +75,9 @@ The dry-run promotion job fetches `origin/beta` and analyzes `HEAD...origin/beta
 - Rerunning a job does not replace an existing non-placeholder section for the same version.
 - Internal-only changes (CI, tests, docs, TOC metadata) do not create a user-facing entry.
 - Reverted beta work that is absent from the net addon diff is omitted from the main entry.
-- If the model is uncertain and no grounded fallback exists, the script fails instead of inventing an entry.
+- If the model is uncertain and no grounded fallback exists, the script leaves `CHANGELOG.md` unchanged instead of inventing an entry.
+
+Deterministic range, validation, and write-safety behavior is covered by `tests/test_update_changelog.py`.
 
 ## Promote beta to main
 
