@@ -39,6 +39,44 @@ It:
 
 Docs-only merges do not trigger a beta addon release.
 
+## Changelog automation
+
+Beta and main changelog updates share `.github/scripts/update_changelog.py`. The workflows stay separate; only the generation logic is shared.
+
+### What updates each changelog
+
+- **Beta:** `.github/workflows/post-merge-beta.yml` runs the script after an addon change is pushed to `beta`. The new `## [X.Y.Z-beta.N]` section describes that incremental development update.
+- **Main:** `.github/workflows/promote-beta-to-main.yml` runs the same script after beta is merged to `main` and the TOC version is stripped to `X.Y.Z`. That section describes the net user-facing result since the previous main release.
+
+### Deterministic vs AI work
+
+The script determines the following without a model:
+
+- whether this is a beta update or a promotion
+- the git range to analyze
+- changed addon files, commits, and pull-request metadata
+- which existing changelog sections belong to the current release train
+- whether the current version section already exists
+- whether output is valid enough to write
+
+AI is used only for semantic judgment: whether a change is user-facing, how related beta work should be grouped, and the wording of entries. The model must return JSON. Entries are rejected when they are ungrounded, low-confidence, placeholders, or malformed.
+
+GitHub Models is retired. The script uses Copilot CLI when it is installed, or an optional OpenAI-compatible endpoint from `CHANGELOG_AI_BASE_URL` / `CHANGELOG_AI_API_KEY`. If no model is available, it falls back to pull-request titles and beta notes that can be grounded in the net file list. It does not write the old "Infrastructure and tooling updates" placeholder.
+
+### Promotion range
+
+For Promote Beta to Main, the range is the previous stable `vX.Y.Z` tag (or the first parent of the previous promotion merge) through the commit being promoted. Beta changelog sections for the same `X.Y.Z` train are inputs to consolidate; they are not copied one-for-one onto `main`.
+
+The dry-run promotion job fetches `origin/beta` and analyzes `HEAD...origin/beta` with the upcoming stable version so the changelog path can be validated without pushing.
+
+### Safeguards
+
+- Historical stable sections are not rewritten.
+- Rerunning a job does not replace an existing non-placeholder section for the same version.
+- Internal-only changes (CI, tests, docs, TOC metadata) do not create a user-facing entry.
+- Reverted beta work that is absent from the net addon diff is omitted from the main entry.
+- If the model is uncertain and no grounded fallback exists, the script fails instead of inventing an entry.
+
 ## Promote beta to main
 
 `.github/workflows/promote-beta-to-main.yml` is manually dispatched with no inputs. Every run performs a complete local dry-run phase first. The actual phase starts automatically only if all required dry-run jobs succeed.
@@ -91,7 +129,7 @@ python -m pytest tests/test_wow_interface_sync.py
 | `check_version_bump.py` | Compare TOC versions against a base branch. |
 | `check_duplicate_release.py` | Reject an existing release version. |
 | `publish_release.py` | Build release artifacts and publish or dry-run them. |
-| `update_changelog.py` | Generate/update release notes. |
+| `update_changelog.py` | Update the beta changelog after merge, or consolidate the main changelog during promotion. |
 | `cleanup_merged_branch.py` | Remove the merged source branch after beta release. |
 
 Use the scripts rather than reproducing their logic in ad hoc commands.
