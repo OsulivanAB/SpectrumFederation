@@ -114,7 +114,7 @@ Run and review the default dry run before setting `dry_run` to false.
 
 ## Interface synchronization
 
-`.github/scripts/blizzard_api.py` queries Blizzard's public version endpoint for current metadata and formats the README Interface badge from the 6-digit TOC value (`120100` → `12.1.0`). `.github/scripts/wow_interface_sync.py` updates interface metadata through its own workflow/script integration and has focused parser tests in `tests/test_wow_interface_sync.py`.
+`.github/scripts/blizzard_api.py` queries Blizzard's public version endpoint for current metadata and formats the README Interface badge from that 6-digit Interface number (`120100` → `12.1.0`). `.github/scripts/wow_interface_sync.py` updates interface metadata through its own workflow/script integration and has focused parser tests in `tests/test_wow_interface_sync.py`.
 
 When changing parser behavior, run:
 
@@ -161,4 +161,4 @@ When behavior changes intentionally, update the implementation and its documenta
 
 Release zips contain sibling top-level folders `SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/`. Extracting the archive into `Interface/AddOns` installs both addons. The child TOC must keep the same `## Interface` and `## Version` values as the parent.
 
-README badges are generated release metadata, not the source of truth. The Interface badge is formatted from the 6-digit TOC value by adding decimals and stripping leading zeros (`120100` → `12.1.0`).
+README badges are generated release metadata, not the source of truth. The Interface badge is formatted from the 6-digit Interface number (the same `MMmmpp` value stored in the TOC) by adding decimals and stripping leading zeros (`120100` → `12.1.0`).
