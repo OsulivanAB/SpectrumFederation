@@ -74,7 +74,7 @@ The dry-run promotion job fetches `origin/beta`, uses the incoming `update_chang
 - Historical stable sections are not rewritten.
 - Rerunning a job does not replace an existing non-placeholder section for the same version.
 - Internal-only changes (CI, tests, docs, TOC metadata) do not create a user-facing entry.
-- Reverted beta work that is absent from the net addon diff is omitted from the main entry, including when the remaining files do not match a known feature name.
+- Reverted beta work that is absent from the net addon diff is omitted from the main entry, including when the remaining files do not match a known feature name. Pull-request titles and commit subjects are filtered the same way so they cannot restore a dropped feature.
 - If the model is uncertain and no grounded fallback exists, the script does not invent a stable entry. On promotion it still removes leftover `-beta` sections so `main` does not keep prerelease headings.
 
 Deterministic range, validation, and write-safety behavior is covered by `tests/test_update_changelog.py`.

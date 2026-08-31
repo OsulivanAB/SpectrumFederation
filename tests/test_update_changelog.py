@@ -314,6 +314,39 @@ def test_fallback_drops_reverted_catalog_notes_when_only_uncataloged_files_remai
     assert any("core login" in text.lower() for text in texts)
 
 
+def test_fallback_does_not_restore_reverted_notes_from_prs_or_commits():
+    context = {
+        "mode": "promote",
+        "features": [],
+        "user_facing_files": ["SpectrumFederation/modules/core.lua"],
+        "beta_sections": [
+            {
+                "text": """### Added
+- Added Cursed Surge Tracker child addon
+"""
+            }
+        ],
+        "pull_requests": [
+            {
+                "number": "253",
+                "title": "Add Spectrum Federation: Cursed Surge Tracker child addon",
+                "body": "",
+                "labels": [],
+            }
+        ],
+        "commits": [
+            {
+                "sha": "abc",
+                "subject": "feat: add Cursed Surge Tracker child addon",
+                "body": "Add Spectrum Federation: Cursed Surge Tracker child addon",
+            }
+        ],
+    }
+    entries = changelog.fallback_entries(context)
+    texts = [entry["text"] for entry in entries]
+    assert all("Cursed Surge Tracker" not in text for text in texts)
+
+
 def test_promote_skip_still_strips_beta_sections(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()

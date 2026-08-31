@@ -769,6 +769,17 @@ def merge_body_summaries(commits):
     return summaries
 
 
+def promote_text_allowed(text, context):
+    """Return False for promote text that names a feature absent from the net diff."""
+    if context.get("mode") != "promote":
+        return True
+    feature = feature_for_text(text)
+    user_features = set(context.get("features") or [])
+    if feature and feature not in user_features:
+        return False
+    return bool(feature or context.get("user_facing_files") or user_features)
+
+
 def fallback_entries(context):
     """Build grounded entries without calling a model."""
     entries = []
@@ -777,6 +788,8 @@ def fallback_entries(context):
     def add(category, text):
         cleaned = normalize_bullet_text(text)
         if not cleaned or is_placeholder_text(cleaned) or is_internal_subject(cleaned):
+            return
+        if not promote_text_allowed(cleaned, context):
             return
         key = (category, cleaned.lower())
         if key in seen:
