@@ -80,7 +80,7 @@ nav:
     - Sync Sessions: features/sync-sessions.md
     - Loot Logs: features/loot-logs.md
     - Cursed Surge Tracker: features/cursed-surge-tracker.md
-    - Settings and Gameplay: settings-ui.md
+    - Settings: settings-ui.md
   - Reference:
     - Slash Commands: reference/slash-commands.md
     - Troubleshooting: reference/troubleshooting.md

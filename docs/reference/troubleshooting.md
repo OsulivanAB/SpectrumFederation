@@ -81,10 +81,6 @@ Check that whispers are enabled for the mode you ran. Prepared-player whispers h
 
 Missing-result whispers are sent at most once per profile member, check type, and calendar day. Players who are not in the profile can be inspected, but their daily whisper state cannot be stored as profile-member data.
 
-## Settings changed after switching specialization
-
-The Gameplay page intentionally controls WoW's Press and Hold Casting CVar per character specialization. Spectrum Federation reapplies the saved choice after login, reload, and specialization changes.
-
 ## Collect diagnostic information
 
 1. Run `/sf debug on`.

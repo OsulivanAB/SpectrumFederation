@@ -91,4 +91,4 @@ Both source and target must already be profile members. Review the selected name
 - [Raid Check](raid-check.md)
 - [Sync Sessions](sync-sessions.md)
 - [Loot Logs](loot-logs.md)
-- [Settings and Gameplay](../settings-ui.md)
+- [Settings](../settings-ui.md)

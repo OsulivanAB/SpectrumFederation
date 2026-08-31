@@ -1,4 +1,4 @@
-# Settings and Gameplay
+# Settings
 
 Enter `/sf` to toggle Spectrum Federation's standalone settings window. Changes are saved immediately; there is no Apply button.
 
@@ -6,7 +6,7 @@ The left sidebar lists **categories** grouped as Core, Loot Tools, Advanced, and
 
 **Quick Find** matches category and page names, descriptions, and group labels. With a search query, choosing a category opens the best matching page in that category.
 
-Installed optional child addons appear under **Optional**. If the add-on is enabled for this character but has no settings pages yet, the category opens to a generic empty state. If it is disabled for this character, the row stays visible and greyed; hover explains that it must be enabled in World of Warcraft's AddOns list. Spectrum Federation cannot enable or disable child addons from `/sf`.
+Installed optional child addons appear under **Optional**. If the add-on is enabled for this character but has no settings pages yet, the category opens to a generic empty state. **Gameplay** uses that same empty state today because it has no pages yet. If an optional add-on is disabled for this character, the row stays visible and greyed; hover explains that it must be enabled in World of Warcraft's AddOns list. Spectrum Federation cannot enable or disable child addons from `/sf`.
 
 `Enable LootHelper` on the Loot Helper General tab only shows or hides the roster window. It does not grey the Loot Helper category.
 
@@ -30,18 +30,7 @@ These appearance settings do not currently restyle the standalone settings windo
 
 ## Gameplay
 
-### Press and Hold Casting
-
-The Gameplay page lists every specialization for the current character. Enable a specialization to turn WoW's Press and Hold Casting CVar on automatically while that specialization is active; disable it to turn the CVar off.
-
-This preference is saved per character and per specialization. The addon:
-
-- initializes missing specialization choices from the character's current CVar;
-- reapplies the selected value after login or UI reload;
-- reapplies it when the active specialization changes;
-- defers the CVar update until combat ends when necessary.
-
-Because this controls a shared WoW CVar, changing it elsewhere may be overwritten the next time Spectrum Federation reapplies the selected specialization preference.
+Gameplay currently has no settings. Selecting it opens the empty category state until options are added.
 
 ## Loot Helper: General
 

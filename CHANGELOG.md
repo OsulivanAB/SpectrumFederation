@@ -2,6 +2,14 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.3.0-beta.4] - 2026-08-31
+
+### Removed
+- Press and Hold Casting per-specialization automation
+
+### Changed
+- Gameplay settings category is retained as an empty placeholder
+
 ## [1.3.0-beta.3] - 2026-08-31
 
 ### Changed

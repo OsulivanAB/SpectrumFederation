@@ -88,14 +88,6 @@ local function productionFixture()
             order = 10,
         }),
         page({
-            id = "nicheFeatures",
-            name = "Gameplay",
-            navLabel = "Gameplay",
-            group = "Core",
-            description = "Manage character-specific gameplay toggles and automation.",
-            order = 15,
-        }),
-        page({
             id = "lootHelper",
             name = "Loot Helper",
             navLabel = "Loot Helper",
@@ -238,6 +230,18 @@ local function productionFixture()
     end
 
     table.insert(categories, {
+        id = "nicheFeatures",
+        name = "Gameplay",
+        navLabel = "Gameplay",
+        group = "Core",
+        description = "Manage character-specific gameplay toggles and automation.",
+        order = 15,
+        enabled = true,
+        enablementResolved = true,
+    })
+    categoriesById.nicheFeatures = categories[#categories]
+
+    table.insert(categories, {
         id = "SpectrumFederation_CursedSurgeTracker",
         name = "Cursed Surge Tracker",
         navLabel = "Cursed Surge Tracker",
@@ -291,6 +295,7 @@ assertDeepEq(
     "root without children is itself the content page"
 )
 assertEq(#Model.GetContentPages(registry, "emptyAddon"), 0, "enabled empty category has zero content pages")
+assertEq(#Model.GetContentPages(registry, "nicheFeatures"), 0, "Gameplay is a parent-owned empty category")
 assertEq(#Model.GetContentPages(registry, "SpectrumFederation_CursedSurgeTracker"), 0, "disabled discovered category has zero content pages")
 assertEq(#Model.GetContentPages(registry, "lootHelper") >= 2 and 2 or 0, 2, "Loot Helper is a 2+ page category")
 assertEq(#Model.GetContentPages(registry, "debugging"), 1, "Debugging is a single-page category")
@@ -351,6 +356,9 @@ assertEq(disabledSidebar.changed, false, "disabled sidebar click is rejected")
 local emptySelect = Model.ResolveSidebarSelect(registry, {}, "emptyAddon")
 assertEq(emptySelect.categoryId, "emptyAddon", "enabled empty category can be selected")
 assertEq(emptySelect.pageId, nil, "enabled empty category has a nil page id")
+local gameplaySelect = Model.ResolveSidebarSelect(registry, {}, "nicheFeatures")
+assertEq(gameplaySelect.categoryId, "nicheFeatures", "Gameplay empty category can be selected")
+assertEq(gameplaySelect.pageId, nil, "Gameplay empty category has a nil page id")
 
 -- Unknown id fallback
 local unknownWithSession = Model.ResolveShowPage(registry, session, "noSuchPage")
@@ -365,6 +373,7 @@ assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "Loot Tools"), "se
 assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "raid check tools"), "search matches category description")
 assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "Equipment"), "search matches content-page navLabel")
 assertTrue(Model.CategoryMatchesQuery(registry, "debugging", "Debugging"), "search matches category name")
+assertTrue(Model.CategoryMatchesQuery(registry, "nicheFeatures", "Gameplay"), "search matches Gameplay category name")
 assertTrue(not Model.CategoryMatchesQuery(registry, "debugging", "Equipment"), "unrelated category does not match Equipment")
 
 local equipmentHits = Model.Search(registry, "Equipment")
@@ -554,6 +563,20 @@ assertDeepEq(
     "Registry GetPagesForCategory excludes the lootHelper root"
 )
 assertTrue(notified >= 3, "RegisterPage notifies listeners")
+
+UI:RegisterCategory({
+    id = "nicheFeatures",
+    name = "Gameplay",
+    navLabel = "Gameplay",
+    group = "Core",
+    description = "Manage character-specific gameplay toggles and automation.",
+    order = 15,
+})
+local gameplay = UI:GetCategory("nicheFeatures")
+assertTrue(gameplay ~= nil, "RegisterCategory upserts a parent-owned category")
+assertEq(gameplay.group, "Core", "Gameplay stays in Core")
+assertEq(#UI:GetPagesForCategory("nicheFeatures"), 0, "Gameplay has no synthetic content pages")
+assertTrue(notified >= 4, "RegisterCategory notifies listeners")
 
 local dupOk = pcall(function()
     UI:RegisterPage(page({ id = "lootHelper", name = "Loot Helper" }))
