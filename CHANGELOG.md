@@ -2,79 +2,10 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.3.0-beta.3] - 2026-08-31
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+### Changed
+- Settings window category sidebar and content tabs
 
 ## [1.3.0-beta.2] - 2026-08-27
 
