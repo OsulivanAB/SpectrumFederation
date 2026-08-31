@@ -114,12 +114,18 @@ Run and review the default dry run before setting `dry_run` to false.
 
 ## Interface synchronization
 
-`.github/scripts/blizzard_api.py` queries Blizzard's public version endpoint for current metadata. `.github/scripts/wow_interface_sync.py` updates interface metadata through its own workflow/script integration and has focused parser tests in `tests/test_wow_interface_sync.py`.
+`.github/scripts/blizzard_api.py` queries Blizzard's public version endpoint for current metadata and formats the README Interface badge from that 6-digit Interface number (`120100` → `12.1.0`). `.github/scripts/wow_interface_sync.py` updates interface metadata through its own workflow/script integration and has focused parser tests in `tests/test_wow_interface_sync.py`.
 
 When changing parser behavior, run:
 
 ```bash
 python -m pytest tests/test_wow_interface_sync.py
+```
+
+When changing Interface badge formatting, run:
+
+```bash
+python -m pytest tests/test_interface_badge.py
 ```
 
 ## Validation scripts
@@ -145,7 +151,7 @@ Use the scripts rather than reproducing their logic in ad hoc commands.
 - a broken relative link or image;
 - known stale commands, APIs, module paths, workflow names, or Blizzard Settings instructions;
 - a referenced workflow, script, or asset that does not exist;
-- missing automation-compatible README badges, or stable-branch badge values that disagree with `SpectrumFederation.toc`;
+- missing automation-compatible README badges, or stable-branch badge values that disagree with `SpectrumFederation.toc` (the Interface badge uses the human-readable form, so `120100` is shown as `12.1.0`);
 - a registered `/sf` command or sync diagnostic alias missing from the command reference;
 - a visible unimplemented settings action whose limitation is no longer documented.
 
@@ -155,4 +161,4 @@ When behavior changes intentionally, update the implementation and its documenta
 
 Release zips contain sibling top-level folders `SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/`. Extracting the archive into `Interface/AddOns` installs both addons. The child TOC must keep the same `## Interface` and `## Version` values as the parent.
 
-README badges are generated release metadata, not the source of truth.
+README badges are generated release metadata, not the source of truth. The Interface badge is formatted from the 6-digit Interface number (the same `MMmmpp` value stored in the TOC) by adding decimals and stripping leading zeros (`120100` → `12.1.0`).

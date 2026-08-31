@@ -11,3 +11,4 @@ alwaysApply: false
 - Keep docs and README commands aligned with real scripts and workflows; avoid reintroducing stale workflow names.
 - Use `requirements-docs.txt` and `mkdocs.yml` as the source of truth for docs build behavior.
 - When changing `wow_interface_sync.py`, its fixtures, or parser behavior, update or run `tests/test_wow_interface_sync.py`.
+- When changing README Interface badge formatting or `blizzard_api.py` display conversion, update or run `tests/test_interface_badge.py`.

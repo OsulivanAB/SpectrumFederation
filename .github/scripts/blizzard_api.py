@@ -72,6 +72,27 @@ def version_to_interface(version):
         return None
 
 
+def interface_to_display(interface):
+    """
+    Convert a 6-digit TOC Interface value to a human-readable game version.
+
+    Example:
+        120100 -> 12.1.0
+        120001 -> 12.0.1
+        110207 -> 11.2.7
+
+    Leading zeros in the minor and patch segments are stripped.
+    """
+    digits = str(interface).strip()
+    if not re.fullmatch(r"\d{6}", digits):
+        raise ValueError(f"Interface must be a 6-digit number, got {interface!r}")
+
+    major = int(digits[0:2])
+    minor = int(digits[2:4])
+    patch = int(digits[4:6])
+    return f"{major}.{minor}.{patch}"
+
+
 def get_game_version(environment="live"):
     """
     Query Blizzard API for current game version.
@@ -138,8 +159,21 @@ def main():
         default="both",
         help="What to output (default: both)"
     )
+    parser.add_argument(
+        "--format-interface",
+        metavar="INTERFACE",
+        help="Convert a 6-digit TOC Interface value to human-readable form and exit",
+    )
     
     args = parser.parse_args()
+
+    if args.format_interface is not None:
+        try:
+            print(interface_to_display(args.format_interface))
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return 0
     
     version, interface = get_game_version(args.environment)
     

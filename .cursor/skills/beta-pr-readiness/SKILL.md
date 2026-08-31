@@ -23,6 +23,7 @@ Use this skill when a task is close to done and you need a repo-specific merge-r
    - `python3 .github/scripts/validate_packaging.py`
    - `python3 .github/scripts/validate_docs.py`
    - `python -m pytest tests/test_wow_interface_sync.py`
+   - `python -m pytest tests/test_interface_badge.py` when README badges or `blizzard_api.py` display conversion changed
    - `python -m pytest tests/test_settings_navigation.py` when Settings navigation/Registry/TOC metadata changed
    - `python -m pytest tests/test_mouse_tracer.py` when Mouse Tracer constants, engine, or runtime tests changed
 4. If the change touches addon packaging, release logic, or TOC-driven behavior, inspect `SpectrumFederation/SpectrumFederation.toc` before finishing.

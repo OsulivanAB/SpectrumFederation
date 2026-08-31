@@ -24,6 +24,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Validate addon packaging: `python3 .github/scripts/validate_packaging.py`
 - Validate docs build: `python3 .github/scripts/validate_docs.py`
 - Run targeted parser tests: `python -m pytest tests/test_wow_interface_sync.py`
+- Run Interface badge formatting tests: `python -m pytest tests/test_interface_badge.py`
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
 - Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
 
@@ -49,5 +50,6 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Packaging or release behavior: also run `python3 .github/scripts/validate_packaging.py`
 - Docs, `README.md`, or `mkdocs.yml`: also run `python3 .github/scripts/validate_docs.py`
 - `wow_interface_sync.py` or parser fixtures/tests: also run `python -m pytest tests/test_wow_interface_sync.py`
+- README Interface badge formatting or `blizzard_api.py` display conversion: also run `python -m pytest tests/test_interface_badge.py`
 - Settings navigation or Registry helpers: also run `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer constants or trail engine: also run `python -m pytest tests/test_mouse_tracer.py`
