@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.3.0-beta.6] - 2026-08-31
+
+### Fixed
+- Loot Helper window now expands and collapses from the title bar instead of growing from its center
+
 ## [1.3.0-beta.5] - 2026-08-31
 
 ### Added

@@ -15,7 +15,7 @@ Enter `/sf loot` to enable Loot Helper and re-evaluate the window. The title bar
 - a minimize button;
 - drag and resize behavior, unless **Lock Loot Window** is enabled.
 
-The window's position, size, and minimized state are saved locally.
+The window's position, size, and minimized state are saved locally. Minimizing and restoring keep the title bar in place so the window grows and shrinks downward.
 
 ## Understanding the roster
 

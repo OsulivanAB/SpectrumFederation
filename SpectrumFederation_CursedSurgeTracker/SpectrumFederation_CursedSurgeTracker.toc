@@ -2,7 +2,7 @@
 ## Title: Spectrum Federation: Cursed Surge Tracker
 ## Notes: Shows Curse Surge locations and countdowns on The Coiled Isle map.
 ## Author: OsulivanAB
-## Version: 1.3.0-beta.5
+## Version: 1.3.0-beta.6
 ## Dependencies: SpectrumFederation
 ## Group: SpectrumFederation
 ## X-SpectrumFederation-Parent: SpectrumFederation
