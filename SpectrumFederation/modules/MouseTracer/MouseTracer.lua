@@ -298,7 +298,7 @@ local function StopRuntime()
 	HideAllStamps()
 	if engine then
 		engine:Reset()
-		engine:SetConfig(cache.trailLength, cache.fadeDuration, cache.rainbowSpeed)
+		engine:SetConfig(cache.trailLength, cache.fadeDuration, cache.rainbowSpeed, cache.thickness)
 		engine:SetScale(cache.scale)
 	end
 	lastRawX = nil
@@ -387,7 +387,7 @@ end
 
 local function SyncEngineConfig()
 	if engine then
-		engine:SetConfig(cache.trailLength, cache.fadeDuration, cache.rainbowSpeed)
+		engine:SetConfig(cache.trailLength, cache.fadeDuration, cache.rainbowSpeed, cache.thickness)
 	end
 end
 
@@ -431,7 +431,7 @@ local function OnSettingChanged(key, newValue)
 		return
 	end
 
-	if key == "trailLength" or key == "fadeDuration" or key == "rainbowSpeed" then
+	if key == "trailLength" or key == "fadeDuration" or key == "rainbowSpeed" or key == "thickness" then
 		SyncEngineConfig()
 	end
 	if engine and engine.count > 0 then
@@ -476,12 +476,40 @@ function Tracer:HasCopySources()
 	return #self:GetCopyOptions() > 0
 end
 
+function Tracer.IsCopySelectionEnabled(sourceId, options)
+	if type(sourceId) ~= "string" or sourceId == "" then
+		return false
+	end
+	if type(options) ~= "table" then
+		return false
+	end
+	for i = 1, #options do
+		local opt = options[i]
+		local value = opt
+		if type(opt) == "table" then
+			value = opt.value
+		end
+		if value == sourceId then
+			return true
+		end
+	end
+	return false
+end
+
+function Tracer:CanCopy()
+	return Tracer.IsCopySelectionEnabled(self:GetCopySource(), self:GetCopyOptions())
+end
+
 function Tracer:GetCopySource()
 	return copySource
 end
 
 function Tracer:SetCopySource(value)
-	copySource = value
+	if type(value) == "string" and value ~= "" then
+		copySource = value
+	else
+		copySource = nil
+	end
 end
 
 function Tracer:CopyFromCharacter(sourceId)
@@ -518,7 +546,7 @@ function Tracer:OnDiscontinuity(clearTrail)
 	if clearTrail and engine then
 		HideAllStamps()
 		engine:Reset()
-		engine:SetConfig(cache.trailLength, cache.fadeDuration, cache.rainbowSpeed)
+		engine:SetConfig(cache.trailLength, cache.fadeDuration, cache.rainbowSpeed, cache.thickness)
 		engine:SetScale(cache.scale)
 	elseif engine then
 		engine:InvalidateBaseline()

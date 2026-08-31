@@ -55,9 +55,16 @@ engineChunk("SpectrumFederation", SF)
 local C = SF.MouseTracer.Constants
 local Engine = SF.MouseTracer.TrailEngine
 
-assertEq(C.MAX_POINTS, 69, "MAX_POINTS is derived from 400/6 + 2")
-assertEq(C.MAX_SEGMENTS, 68, "MAX_SEGMENTS is MAX_POINTS - 1")
-assertEq(C.MAX_NEW_POINTS_PER_TICK, 12, "emit cap is 12")
+assertEq(C.MAX_POINTS, 202, "MAX_POINTS is derived from 400/2 + 2")
+assertEq(C.MAX_SEGMENTS, 201, "MAX_SEGMENTS is MAX_POINTS - 1")
+assertEq(C.MAX_NEW_POINTS_PER_TICK, 125, "emit cap covers a non-teleport move at the spacing floor")
+assertAlmost(C.SPACING_THICKNESS_RATIO, 0.20, 1e-9, "stamp spacing is 20% of thickness")
+assertEq(C.MIN_SPACING_FLOOR, 2, "spacing floor is 2px")
+assertAlmost(Engine.SpacingForThickness(6), 2, 1e-9, "thinnest trail uses the spacing floor")
+assertAlmost(Engine.SpacingForThickness(14), 2.8, 1e-9, "default thickness spaces stamps at 2.8px")
+assertAlmost(Engine.SpacingForThickness(28), 5.6, 1e-9, "thickest trail still overlaps (spacing < diameter)")
+assertTrue(Engine.SpacingForThickness(14) < 14 * 0.5, "default spacing is less than half the circle diameter")
+assertTrue(Engine.SpacingForThickness(28) < 28 * 0.5, "thick spacing is less than half the circle diameter")
 assertAlmost(C.ACTIVE_SAMPLE_INTERVAL, 1 / 60, 1e-9, "active sample cadence is 60 Hz")
 assertAlmost(C.FADE_INTERVAL, 1 / 30, 1e-9, "fade cadence is 30 Hz")
 assertAlmost(C.IDLE_POLL_INTERVAL, 1 / 60, 1e-9, "idle poll cadence is 60 Hz")
@@ -65,7 +72,7 @@ assertAlmost(C.IDLE_POLL_INTERVAL, 1 / 60, 1e-9, "idle poll cadence is 60 Hz")
 local function newEngine()
     local engine = Engine.New()
     engine:SetScale(1)
-    engine:SetConfig(C.DEFAULT_TRAIL_LENGTH, C.DEFAULT_FADE_DURATION, C.DEFAULT_RAINBOW_SPEED)
+    engine:SetConfig(C.DEFAULT_TRAIL_LENGTH, C.DEFAULT_FADE_DURATION, C.DEFAULT_RAINBOW_SPEED, C.DEFAULT_THICKNESS)
     return engine
 end
 
@@ -115,6 +122,7 @@ assertEq(e.activeSegCount, 0, "zero movement creates no segments")
 
 -- Small rejected movement does not move the acceptance baseline
 e = newEngine()
+e.minSpacing = 6
 e:ProcessSample(1.0, 100, 0, false)
 e:ProcessSample(1.1, 102, 0, false)
 e:ProcessSample(1.2, 104, 0, false)
@@ -127,29 +135,50 @@ assertAlmost(e.lastX, 107, 1e-6, "accepted emit reaches 107")
 local newestX = select(1, e:GetPoint(e.count))
 assertAlmost(newestX, 107, 1e-6, "newest point is the current cursor after accumulation")
 
--- Normal spacing emit
+-- Thickness-based spacing emit
 e = newEngine()
+e:SetConfig(C.DEFAULT_TRAIL_LENGTH, C.DEFAULT_FADE_DURATION, C.DEFAULT_RAINBOW_SPEED, 14)
+assertAlmost(e.minSpacing, 2.8, 1e-9, "default engine spacing follows thickness")
 e:ProcessSample(1.0, 0, 0, false)
-e:ProcessSample(1.2, 12, 0, false)
-assertEq(e.count, 3, "12px move at 6px spacing stores start + 2 points")
-assertEq(e.activeSegCount, 2, "12px move creates 2 segments")
+e:ProcessSample(1.2, 9, 0, false)
+assertEq(e.count, 4, "9px move at 2.8px spacing stores start + 3 points")
+assertEq(e.activeSegCount, 3, "9px move creates 3 segments")
 local x1 = select(1, e:GetPoint(1))
 local x2 = select(1, e:GetPoint(2))
-local x3 = select(1, e:GetPoint(3))
+local xLast = select(1, e:GetPoint(e.count))
 assertAlmost(x1, 0, 1e-6, "start point is the previous accepted position")
-assertAlmost(x2, 6, 1e-6, "first interpolated point is 6px along")
-assertAlmost(x3, 12, 1e-6, "final interpolated point is the cursor")
+assertAlmost(x2, 3, 1e-6, "first interpolated point is equally spaced toward the cursor")
+assertAlmost(xLast, 9, 1e-6, "final interpolated point is the cursor")
 
--- Long movement reaches the cursor in one tick
+-- Long movement reaches the cursor in one tick without visual gaps
 e = newEngine()
 e:ProcessSample(2.0, 0, 0, false)
 e:ProcessSample(2.1, 150, 0, false)
 assertTrue(e.count >= 2, "150px move emits points")
 assertTrue(e.activeSegCount <= C.MAX_NEW_POINTS_PER_TICK, "150px move respects the emit cap")
-assertEq(e.activeSegCount, 12, "150px move emits exactly 12 segments")
 local lastX = select(1, e:GetPoint(e.count))
 assertAlmost(lastX, 150, 1e-6, "150px move reaches the current cursor this tick")
 assertAlmost(e.lastX, 150, 1e-6, "accepted baseline is the current cursor after a long move")
+local prevPx = select(1, e:GetPoint(1))
+for chrono = 2, e.count do
+    local px = select(1, e:GetPoint(chrono))
+    assertTrue((px - prevPx) <= e.minSpacing + 0.05, "interpolated neighbor spacing stays at the thickness spacing")
+    assertTrue((px - prevPx) < C.DEFAULT_THICKNESS * 0.5, "fast-move stamps still overlap at default thickness")
+    prevPx = px
+end
+
+-- Thicker trails use wider spacing but still overlap
+e = newEngine()
+e:SetConfig(C.DEFAULT_TRAIL_LENGTH, C.DEFAULT_FADE_DURATION, C.DEFAULT_RAINBOW_SPEED, 28)
+e:ProcessSample(3.0, 0, 0, false)
+e:ProcessSample(3.1, 80, 0, false)
+assertAlmost(e.minSpacing, 5.6, 1e-9, "28px thickness uses 5.6px spacing")
+prevPx = select(1, e:GetPoint(1))
+for chrono = 2, e.count do
+    local px = select(1, e:GetPoint(chrono))
+    assertTrue((px - prevPx) < 28 * 0.5, "thick-trail stamps overlap")
+    prevPx = px
+end
 
 -- Interpolated timestamps are monotonic
 e = newEngine()
@@ -353,6 +382,30 @@ assertTrue(not e:IsLiveIndex(C.MAX_POINTS + 1), "out-of-range index is not live"
 e:Reset()
 assertTrue(not e:IsLiveIndex(1), "reset engine has no live points")
 assertEq(C.CIRCLE_TEXTURE, "Interface\\CharacterFrame\\TempPortraitAlphaMask", "trail stamps use the circular portrait mask")
+
+local tracerChunk = assert(loadfile(repoPath("SpectrumFederation/modules/MouseTracer/MouseTracer.lua")))
+tracerChunk("SpectrumFederation", SF)
+local Tracer = SF.MouseTracer
+
+local copyOptions = {
+    { value = "Other-Realm", label = "Other-Realm" },
+    { value = "Alt-Realm", label = "Alt-Realm" },
+}
+assertTrue(not Tracer.IsCopySelectionEnabled(nil, copyOptions), "Copy stays disabled with no selection")
+assertTrue(not Tracer.IsCopySelectionEnabled("", copyOptions), "Copy stays disabled for an empty selection")
+assertTrue(not Tracer.IsCopySelectionEnabled("Self-Realm", copyOptions), "Copy stays disabled for the current/missing character")
+assertTrue(not Tracer.IsCopySelectionEnabled("Other-Realm", {}), "Copy stays disabled when no sources exist")
+assertTrue(not Tracer.IsCopySelectionEnabled("Other-Realm", nil), "Copy stays disabled when options are missing")
+assertTrue(Tracer.IsCopySelectionEnabled("Other-Realm", copyOptions), "Copy enables for a valid other character")
+assertTrue(Tracer.IsCopySelectionEnabled("Alt-Realm", copyOptions), "Copy enables for each valid listed character")
+
+Tracer:SetCopySource(nil)
+assertTrue(not Tracer:CanCopy(), "CanCopy is false before a source is chosen")
+-- CanCopy uses live GetCopyOptions (empty without a store), so exercise SetCopySource sanitizing only.
+Tracer:SetCopySource("Other-Realm")
+assertEq(Tracer:GetCopySource(), "Other-Realm", "SetCopySource keeps a non-empty character id")
+Tracer:SetCopySource("")
+assertEq(Tracer:GetCopySource(), nil, "SetCopySource clears an empty selection")
 
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then

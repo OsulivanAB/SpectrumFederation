@@ -288,14 +288,29 @@ function Engine.Reset(self)
 	self.trailLength = C.DEFAULT_TRAIL_LENGTH
 	self.fadeDuration = C.DEFAULT_FADE_DURATION
 	self.rainbowSpeed = C.DEFAULT_RAINBOW_SPEED
-	self.minSpacing = C.MIN_SPACING
+	self.thickness = C.DEFAULT_THICKNESS
+	self.minSpacing = Engine.SpacingForThickness(C.DEFAULT_THICKNESS)
 	self.scale = 1
 end
 
-function Engine.SetConfig(self, trailLength, fadeDuration, rainbowSpeed)
+function Engine.SpacingForThickness(thickness)
+	thickness = Clamp(thickness, C.MIN_THICKNESS, C.MAX_THICKNESS, C.DEFAULT_THICKNESS)
+	local spacing = thickness * C.SPACING_THICKNESS_RATIO
+	if spacing < C.MIN_SPACING_FLOOR then
+		return C.MIN_SPACING_FLOOR
+	end
+	return spacing
+end
+
+function Engine.SetConfig(self, trailLength, fadeDuration, rainbowSpeed, thickness)
 	self.trailLength = Clamp(trailLength, C.MIN_TRAIL_LENGTH, C.MAX_TRAIL_LENGTH, C.DEFAULT_TRAIL_LENGTH)
 	self.fadeDuration = Clamp(fadeDuration, C.MIN_FADE_DURATION, C.MAX_FADE_DURATION, C.DEFAULT_FADE_DURATION)
 	self.rainbowSpeed = Clamp(rainbowSpeed, C.MIN_RAINBOW_SPEED, C.MAX_RAINBOW_SPEED, C.DEFAULT_RAINBOW_SPEED)
+	if thickness == nil then
+		thickness = self.thickness or C.DEFAULT_THICKNESS
+	end
+	self.thickness = Clamp(thickness, C.MIN_THICKNESS, C.MAX_THICKNESS, C.DEFAULT_THICKNESS)
+	self.minSpacing = Engine.SpacingForThickness(self.thickness)
 end
 
 function Engine.SetScale(self, scale)

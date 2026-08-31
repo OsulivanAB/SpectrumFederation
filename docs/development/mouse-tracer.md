@@ -32,12 +32,15 @@ Bounded 60 Hz cursor polling. O(1) work. No segment traversal, no Store access, 
 
 Bounded 60 Hz sample/emission, independent of rendered FPS. Every accepted movement reaches the current cursor this tick. At most 12 emitted points per sample. No interpolation backlog and no trail gaps. After initialization the hot path must not allocate. Settings and UI scale are cached.
 
-Dynamic spacing for a move of distance `dist`:
+Stamp spacing follows trail thickness so circles overlap:
 
 ```text
-n = min(12, max(1, floor(dist / MIN_SPACING)))
+minSpacing = max(2, thickness * 0.20)
+n = min(MAX_NEW_POINTS_PER_TICK, max(1, floor(dist / minSpacing)))
 spacing = dist / n
 ```
+
+`MAX_NEW_POINTS_PER_TICK` is `ceil(250 / 2)` so a non-teleport move can still reach the cursor this tick without stretching stamps past the overlap spacing.
 
 Interpolated timestamps use `t(i) = prevT + (now - prevT) * (i / n)`.
 
@@ -47,7 +50,7 @@ No geometry generation. Bounded 30 Hz fade processing. No allocations. Return to
 
 ### Resources
 
-`MAX_POINTS = 69` and `MAX_SEGMENTS = 68` (`ceil(400 / 6) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures (`TempPortraitAlphaMask`) and must not grow at runtime. Do not return to square `CreateLine` quads.
+`MAX_POINTS = 202` and `MAX_SEGMENTS = 201` (`ceil(400 / 2) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures (`TempPortraitAlphaMask`) and must not grow at runtime. Do not return to square `CreateLine` quads.
 
 Cadence constants:
 
