@@ -33,6 +33,13 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.SettingsApply:Init()
     end
 
+    if SF.MouseTracer and SF.MouseTracer.Init then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing Mouse Tracer")
+        end
+        SF.MouseTracer:Init()
+    end
+
     if SF.SettingsUI and SF.SettingsUI.Init then
         if SF.Debug then
             SF.Debug:Verbose("INIT", "Initializing SettingsUI")
