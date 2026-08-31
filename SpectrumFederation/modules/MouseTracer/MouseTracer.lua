@@ -207,11 +207,11 @@ local function RefreshLiveStampSizes(newestDist, oldestDist)
 end
 
 local function ApplyReleased()
+	-- Always hide released slots, including indices that wrap and become
+	-- live again this tick. PlaceStamp then treats them as new and restores
+	-- full opacity. Skipping hide would leave the newest stamp at the tail's faded alpha.
 	for i = 1, engine.releasedPointCount do
-		local idx = engine.releasedPoints[i]
-		if not engine:IsLiveIndex(idx) then
-			HideStamp(idx)
-		end
+		HideStamp(engine.releasedPoints[i])
 	end
 	engine.releasedCount = 0
 	engine.releasedPointCount = 0

@@ -271,6 +271,31 @@ assertTrue(e.count <= C.MAX_POINTS, "max-length dense trail stays within MAX_POI
 assertTrue(e.activeSegCount <= C.MAX_SEGMENTS, "max-length dense trail stays within MAX_SEGMENTS")
 assertAlmost(select(1, e:GetPoint(e.count)), maxLenCursor, 1e-6, "max-length trail still reaches the current cursor")
 
+-- Ring wrap reports the reused index as released even though it is live again.
+-- The host must hide that stamp before PlaceStamp so the newest circle is not left at the tail's faded alpha.
+e = newEngine()
+e:SetConfig(1200, 1.5, C.DEFAULT_RAINBOW_SPEED, 6)
+e:ProcessSample(8.0, 0, 0, false)
+local wrapT = 8.0
+local wrapCursor = 0
+for _ = 1, 6 do
+    wrapCursor = wrapCursor + 200
+    wrapT = wrapT + 0.02
+    e:ProcessSample(wrapT, wrapCursor, 0, false)
+end
+wrapCursor = wrapCursor + 249
+wrapT = wrapT + 0.02
+e:ProcessSample(wrapT, wrapCursor, 0, false)
+local reusedLive = 0
+for i = 1, e.releasedPointCount do
+    if e:IsLiveIndex(e.releasedPoints[i]) then
+        reusedLive = reusedLive + 1
+    end
+end
+assertTrue(reusedLive > 0, "ring wrap releases slot indices that are immediately reused as live points")
+assertTrue(e.count <= C.MAX_POINTS, "wrap still stays within the fixed point pool")
+assertAlmost(select(1, e:GetPoint(e.count)), wrapCursor, 1e-6, "wrapped emit still reaches the current cursor")
+
 -- Interpolated timestamps are monotonic
 e = newEngine()
 e:ProcessSample(5.0, 0, 0, false)
