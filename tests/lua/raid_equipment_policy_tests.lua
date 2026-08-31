@@ -198,6 +198,36 @@ local ordinary = eval(completeSlots({
 }))
 assertHas(ordinary.missing, "Limited Gem", "ordinary gem does not satisfy limited gem")
 assertNotHas(ordinary.missing, "Chest Gem", "ordinary filled gem still fills the socket")
+assertTrue(ordinary.complete, "ordinary gem with a resolved non-family category is complete")
+
+local ordinaryNoCategory = eval(completeSlots({
+    [5] = equipped({
+        equipLoc = "INVTYPE_CHEST",
+        sockets = { gem(true, 12345, { resolved = false }) },
+    }),
+}))
+assertTrue(ordinaryNoCategory.complete, "successful uniqueness lookup with no category is complete")
+assertHas(ordinaryNoCategory.missing, "Limited Gem", "ordinary gem without uniqueness is not a limited gem")
+assertNotHas(ordinaryNoCategory.missing, "Chest Gem", "ordinary gem without uniqueness still fills the socket")
+assertEq(select(1, Policy.IsQualifyingLimitedGem(12345, { resolved = false })), false, "resolved=false uniqueness is not-family")
+
+local missingGemId = eval(completeSlots({
+    [5] = equipped({
+        equipLoc = "INVTYPE_CHEST",
+        sockets = { gem(true, nil) },
+    }),
+}))
+assertTrue(not missingGemId.complete, "filled socket with no gem id is incomplete")
+assertEq(missingGemId.incompleteReason, "unresolved", "missing gem id does not guess not-limited")
+
+local zeroGemId = eval(completeSlots({
+    [5] = equipped({
+        equipLoc = "INVTYPE_CHEST",
+        sockets = { gem(true, 0) },
+    }),
+}))
+assertTrue(not zeroGemId.complete, "filled socket with gem id 0 is incomplete")
+assertEq(select(1, Policy.IsQualifyingLimitedGem(0)), nil, "zero gem id is unresolved rather than not-limited")
 
 local reagent = Policy.IsQualifyingLimitedGem(242712, { resolved = true, category = "Thalassian Diamond" })
 assertEq(reagent, false, "raw Eversong Diamond reagent is excluded even if uniqueness matches")

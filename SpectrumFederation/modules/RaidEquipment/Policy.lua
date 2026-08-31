@@ -180,7 +180,7 @@ end
 function Policy.IsQualifyingLimitedGem(gemId, uniqueness)
 	gemId = tonumber(gemId)
 	if not gemId or gemId == 0 then
-		return false, "unresolved"
+		return nil, "unresolved"
 	end
 	if Policy.LIMITED_GEM.rawReagentItemIds[gemId] then
 		return false, "reagent"
@@ -193,7 +193,9 @@ function Policy.IsQualifyingLimitedGem(gemId, uniqueness)
 		if type(category) == "string" and category:find(Policy.LIMITED_GEM.uniquenessCategory, 1, true) then
 			return true, "uniqueness"
 		end
-		if uniqueness.resolved == true then
+		-- A successful uniqueness lookup with no category means this gem is not
+		-- a Thalassian Diamond. Do not treat that as unresolved identity.
+		if uniqueness.resolved == true or uniqueness.resolved == false then
 			return false, "not_family"
 		end
 		return nil, "unresolved_uniqueness"
