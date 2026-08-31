@@ -256,6 +256,17 @@ assertAlmost(Window._frame:GetTop(), loadedTop, 1e-6, "expand after load keeps t
 assertAlmost(Window._frame:GetLeft(), loadedLeft, 1e-6, "expand after load keeps the loaded left edge")
 assertEq(Window._frame:GetHeight(), 520, "expand after load restores saved height")
 
+resetWindowState()
+Window._frame = makeFrame(480, 1000)
+Window._frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+local clampTop = Window._frame:GetTop()
+local clampLeft = Window._frame:GetLeft()
+Window:ClampSizeToBounds()
+assertEq(Window._frame:GetHeight(), C.MAX_HEIGHT, "ClampSizeToBounds enforces MAX_HEIGHT")
+assertAlmost(Window._frame:GetTop(), clampTop, 1e-6, "ClampSizeToBounds keeps the top edge")
+assertAlmost(Window._frame:GetLeft(), clampLeft, 1e-6, "ClampSizeToBounds keeps the left edge")
+assertEq(Window._frame.point, "TOPLEFT", "ClampSizeToBounds re-anchors to TOPLEFT before SetSize")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

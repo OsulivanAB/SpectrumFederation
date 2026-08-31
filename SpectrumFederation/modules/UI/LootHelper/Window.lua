@@ -76,6 +76,8 @@ function Window:ClampSizeToBounds()
     local f = self._frame
     if not f then return end
 
+    self:_AnchorToCurrentTopLeft()
+
     local w, h = f:GetSize()
     w = Clamp(w, C.MIN_WIDTH, C.MAX_WIDTH)
     if f.__sfMinimized then
@@ -657,6 +659,7 @@ function Window:Create()
     resize:SetScript("OnMouseDown", function(_, button)
         if button ~= "LeftButton" then return end
         if frame.__sfLocked then return end
+        Window:_AnchorToCurrentTopLeft()
         frame:StartSizing("BOTTOMRIGHT")
     end)
 
