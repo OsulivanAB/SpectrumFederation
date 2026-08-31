@@ -30,17 +30,19 @@ Bounded 60 Hz cursor polling. O(1) work. No segment traversal, no Store access, 
 
 ### Moving
 
-Bounded 60 Hz sample/emission, independent of rendered FPS. Every accepted movement reaches the current cursor this tick. At most 12 emitted points per sample. No interpolation backlog and no trail gaps. After initialization the hot path must not allocate. Settings and UI scale are cached.
+Bounded 60 Hz sample/emission, independent of rendered FPS. Every accepted movement reaches the current cursor this tick. No interpolation backlog and no trail gaps. After initialization the hot path must not allocate. Settings and UI scale are cached.
 
-Stamp spacing follows trail thickness so circles overlap:
+Stamp spacing follows trail thickness so circles overlap heavily:
 
 ```text
-minSpacing = max(2, thickness * 0.20)
+minSpacing = max(1, thickness * 0.10)
 n = min(MAX_NEW_POINTS_PER_TICK, max(1, floor(dist / minSpacing)))
 spacing = dist / n
 ```
 
-`MAX_NEW_POINTS_PER_TICK` is `ceil(250 / 2)` so a non-teleport move can still reach the cursor this tick without stretching stamps past the overlap spacing.
+`MAX_NEW_POINTS_PER_TICK` is `ceil(250 / 1)` so a non-teleport move can still reach the cursor this tick without stretching stamps past the overlap spacing.
+
+Stamp diameter tapers along path distance: newest uses full Trail Thickness, oldest uses `TAPER_MIN_RATIO` (0.40) of that thickness. Opacity fade still runs independently. Emit ticks refresh live stamp sizes without resetting fade alpha.
 
 Interpolated timestamps use `t(i) = prevT + (now - prevT) * (i / n)`.
 
@@ -50,7 +52,7 @@ No geometry generation. Bounded 30 Hz fade processing. No allocations. Return to
 
 ### Resources
 
-`MAX_POINTS = 202` and `MAX_SEGMENTS = 201` (`ceil(400 / 2) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures (`TempPortraitAlphaMask`) and must not grow at runtime. Do not return to square `CreateLine` quads.
+`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures (`TempPortraitAlphaMask`) and must not grow at runtime. Do not return to square `CreateLine` quads.
 
 Cadence constants:
 

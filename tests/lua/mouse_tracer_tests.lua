@@ -55,16 +55,37 @@ engineChunk("SpectrumFederation", SF)
 local C = SF.MouseTracer.Constants
 local Engine = SF.MouseTracer.TrailEngine
 
-assertEq(C.MAX_POINTS, 202, "MAX_POINTS is derived from 400/2 + 2")
-assertEq(C.MAX_SEGMENTS, 201, "MAX_SEGMENTS is MAX_POINTS - 1")
-assertEq(C.MAX_NEW_POINTS_PER_TICK, 125, "emit cap covers a non-teleport move at the spacing floor")
-assertAlmost(C.SPACING_THICKNESS_RATIO, 0.20, 1e-9, "stamp spacing is 20% of thickness")
-assertEq(C.MIN_SPACING_FLOOR, 2, "spacing floor is 2px")
-assertAlmost(Engine.SpacingForThickness(6), 2, 1e-9, "thinnest trail uses the spacing floor")
-assertAlmost(Engine.SpacingForThickness(14), 2.8, 1e-9, "default thickness spaces stamps at 2.8px")
-assertAlmost(Engine.SpacingForThickness(28), 5.6, 1e-9, "thickest trail still overlaps (spacing < diameter)")
-assertTrue(Engine.SpacingForThickness(14) < 14 * 0.5, "default spacing is less than half the circle diameter")
-assertTrue(Engine.SpacingForThickness(28) < 28 * 0.5, "thick spacing is less than half the circle diameter")
+assertEq(C.DEFAULT_TRAIL_LENGTH, 400, "default trail length is 400")
+assertEq(C.MAX_TRAIL_LENGTH, 1200, "maximum trail length is 1200")
+assertEq(C.MIN_TRAIL_LENGTH, 80, "minimum trail length stays 80")
+assertAlmost(C.DEFAULT_RAINBOW_SPEED, 0.25, 1e-9, "default rainbow speed is 0.25")
+assertAlmost(C.TAPER_MIN_RATIO, 0.40, 1e-9, "oldest stamp is 40% of configured thickness")
+assertEq(C.MAX_POINTS, 1202, "MAX_POINTS is derived from 1200/1 + 2")
+assertEq(C.MAX_SEGMENTS, 1201, "MAX_SEGMENTS is MAX_POINTS - 1")
+assertEq(C.MAX_NEW_POINTS_PER_TICK, 250, "emit cap covers a non-teleport move at the spacing floor")
+assertEq(C.MAX_NEW_POINTS_PER_TICK, math.ceil(C.TELEPORT_DISTANCE / C.MIN_SPACING_FLOOR), "emit cap is derived from teleport distance / spacing floor")
+assertAlmost(C.SPACING_THICKNESS_RATIO, 0.10, 1e-9, "stamp spacing is 10% of thickness")
+assertEq(C.MIN_SPACING_FLOOR, 1, "spacing floor is 1px")
+assertAlmost(Engine.SpacingForThickness(6), 1, 1e-9, "thinnest trail uses the spacing floor")
+assertAlmost(Engine.SpacingForThickness(14), 1.4, 1e-9, "default thickness spaces stamps at 1.4px")
+assertAlmost(Engine.SpacingForThickness(28), 2.8, 1e-9, "thickest trail still overlaps (spacing < diameter)")
+assertTrue(Engine.SpacingForThickness(14) < 14 * 0.15, "default spacing is tight enough that circles heavily overlap")
+assertTrue(Engine.SpacingForThickness(28) < 28 * 0.15, "thick spacing is tight enough that circles heavily overlap")
+assertTrue(Engine.SpacingForThickness(14) * 2 < 14, "default neighbor centers sit well inside one circle diameter")
+assertTrue(Engine.SpacingForThickness(28) * 2 < 28, "thick neighbor centers sit well inside one circle diameter")
+
+assertAlmost(Engine.TaperedSize(14, 100, 0, 100), 14, 1e-9, "newest stamp uses full thickness")
+assertAlmost(Engine.TaperedSize(14, 100, 0, 0), 14 * 0.40, 1e-9, "oldest stamp uses 40% thickness")
+assertAlmost(Engine.TaperedSize(14, 100, 0, 50), 14 * 0.70, 1e-9, "mid-trail stamp is halfway between full and minimum")
+assertAlmost(Engine.TaperedSize(14, 10, 10, 10), 14, 1e-9, "a single-point trail stays full thickness")
+assertTrue(Engine.TaperedSize(28, 80, 0, 0) >= 28 * 0.35, "oldest thick stamp stays above 35%")
+assertTrue(Engine.TaperedSize(28, 80, 0, 0) <= 28 * 0.45, "oldest thick stamp stays at or below 45%")
+local prevSize = Engine.TaperedSize(14, 100, 0, 100)
+for dist = 90, 0, -10 do
+    local size = Engine.TaperedSize(14, 100, 0, dist)
+    assertTrue(size <= prevSize + 1e-9, "taper decreases smoothly toward the tail")
+    prevSize = size
+end
 assertAlmost(C.ACTIVE_SAMPLE_INTERVAL, 1 / 60, 1e-9, "active sample cadence is 60 Hz")
 assertAlmost(C.FADE_INTERVAL, 1 / 30, 1e-9, "fade cadence is 30 Hz")
 assertAlmost(C.IDLE_POLL_INTERVAL, 1 / 60, 1e-9, "idle poll cadence is 60 Hz")
@@ -75,6 +96,14 @@ local function newEngine()
     engine:SetConfig(C.DEFAULT_TRAIL_LENGTH, C.DEFAULT_FADE_DURATION, C.DEFAULT_RAINBOW_SPEED, C.DEFAULT_THICKNESS)
     return engine
 end
+
+local fresh = Engine.New()
+assertEq(fresh.trailLength, 400, "new engine uses the 400px trail-length default")
+assertAlmost(fresh.rainbowSpeed, 0.25, 1e-9, "new engine uses the 0.25 rainbow-speed default")
+fresh:SetConfig(2000, 0.5, 0.25, 14)
+assertEq(fresh.trailLength, 1200, "trail length clamps to the 1200px maximum")
+fresh:SetConfig(400, 0.5, 0.10, 14)
+assertAlmost(fresh.rainbowSpeed, 0.25, 1e-9, "rainbow speed below the slider min clamps to 0.25")
 
 -- HSV / fade / scale helpers
 local r1, g1, b1 = Engine.HSVToRGB(0, 1, 1)
@@ -138,17 +167,17 @@ assertAlmost(newestX, 107, 1e-6, "newest point is the current cursor after accum
 -- Thickness-based spacing emit
 e = newEngine()
 e:SetConfig(C.DEFAULT_TRAIL_LENGTH, C.DEFAULT_FADE_DURATION, C.DEFAULT_RAINBOW_SPEED, 14)
-assertAlmost(e.minSpacing, 2.8, 1e-9, "default engine spacing follows thickness")
+assertAlmost(e.minSpacing, 1.4, 1e-9, "default engine spacing follows thickness")
 e:ProcessSample(1.0, 0, 0, false)
-e:ProcessSample(1.2, 9, 0, false)
-assertEq(e.count, 4, "9px move at 2.8px spacing stores start + 3 points")
-assertEq(e.activeSegCount, 3, "9px move creates 3 segments")
+e:ProcessSample(1.2, 7, 0, false)
+assertEq(e.count, 6, "7px move at 1.4px spacing stores start + 5 points")
+assertEq(e.activeSegCount, 5, "7px move creates 5 segments")
 local x1 = select(1, e:GetPoint(1))
 local x2 = select(1, e:GetPoint(2))
 local xLast = select(1, e:GetPoint(e.count))
 assertAlmost(x1, 0, 1e-6, "start point is the previous accepted position")
-assertAlmost(x2, 3, 1e-6, "first interpolated point is equally spaced toward the cursor")
-assertAlmost(xLast, 9, 1e-6, "final interpolated point is the cursor")
+assertAlmost(x2, 1.4, 1e-6, "first interpolated point uses thickness spacing")
+assertAlmost(xLast, 7, 1e-6, "final interpolated point is the cursor")
 
 -- Long movement reaches the cursor in one tick without visual gaps
 e = newEngine()
@@ -172,13 +201,68 @@ e = newEngine()
 e:SetConfig(C.DEFAULT_TRAIL_LENGTH, C.DEFAULT_FADE_DURATION, C.DEFAULT_RAINBOW_SPEED, 28)
 e:ProcessSample(3.0, 0, 0, false)
 e:ProcessSample(3.1, 80, 0, false)
-assertAlmost(e.minSpacing, 5.6, 1e-9, "28px thickness uses 5.6px spacing")
+assertAlmost(e.minSpacing, 2.8, 1e-9, "28px thickness uses 2.8px spacing")
 prevPx = select(1, e:GetPoint(1))
 for chrono = 2, e.count do
     local px = select(1, e:GetPoint(chrono))
     assertTrue((px - prevPx) < 28 * 0.5, "thick-trail stamps overlap")
     prevPx = px
 end
+
+-- Just-under-teleport move at the 1px floor still reaches the cursor without gaps
+e = newEngine()
+e:SetConfig(C.DEFAULT_TRAIL_LENGTH, 1.5, C.DEFAULT_RAINBOW_SPEED, 6)
+e:ProcessSample(4.0, 0, 0, false)
+e:ProcessSample(4.1, 249, 0, false)
+assertAlmost(e.minSpacing, 1, 1e-9, "6px thickness uses the 1px spacing floor")
+assertAlmost(select(1, e:GetPoint(e.count)), 249, 1e-6, "249px move at 1px spacing reaches the cursor this tick")
+assertTrue(e.activeSegCount <= C.MAX_NEW_POINTS_PER_TICK, "249px move stays within the emit cap")
+assertTrue(e.count <= C.MAX_POINTS, "249px move stays within the point pool")
+prevPx = select(1, e:GetPoint(1))
+for chrono = 2, e.count do
+    local px = select(1, e:GetPoint(chrono))
+    assertTrue((px - prevPx) <= e.minSpacing + 0.05, "1px-floor interpolation does not leave gaps")
+    prevPx = px
+end
+
+-- Live trail taper uses path distance from newest to oldest
+e = newEngine()
+e:SetConfig(C.DEFAULT_TRAIL_LENGTH, 1.5, C.DEFAULT_RAINBOW_SPEED, 14)
+e:ProcessSample(6.0, 0, 0, false)
+e:ProcessSample(6.1, 80, 0, false)
+local newestDist = select(4, e:GetPoint(e.count))
+local oldestDist = select(4, e:GetPoint(1))
+assertTrue(newestDist > oldestDist, "live trail has a path-distance span")
+assertAlmost(Engine.TaperedSize(14, newestDist, oldestDist, newestDist), 14, 1e-9, "live newest stamp is full thickness")
+assertAlmost(Engine.TaperedSize(14, newestDist, oldestDist, oldestDist), 14 * 0.40, 1e-9, "live oldest stamp is 40% thickness")
+local midDist = (newestDist + oldestDist) / 2
+assertAlmost(Engine.TaperedSize(14, newestDist, oldestDist, midDist), 14 * 0.70, 0.05, "live mid-trail stamp is near the halfway taper")
+local livePrev = Engine.TaperedSize(14, newestDist, oldestDist, newestDist)
+for chrono = e.count, 1, -1 do
+    local _, _, _, dist = e:GetPoint(chrono)
+    local size = Engine.TaperedSize(14, newestDist, oldestDist, dist)
+    assertTrue(size <= livePrev + 1e-9, "live taper shrinks toward the oldest point")
+    assertTrue(size >= 14 * 0.40 - 1e-9, "live taper never drops below the 40% floor")
+    livePrev = size
+end
+
+-- Maximum trail length trims a dense path and stays inside the fixed pool
+e = newEngine()
+e:SetConfig(1200, 1.5, C.DEFAULT_RAINBOW_SPEED, 6)
+e:ProcessSample(7.0, 0, 0, false)
+local maxLenT = 7.0
+local maxLenCursor = 0
+for _ = 1, 8 do
+    maxLenCursor = maxLenCursor + 200
+    maxLenT = maxLenT + 0.02
+    e:ProcessSample(maxLenT, maxLenCursor, 0, false)
+end
+newestDist = select(4, e:GetPoint(e.count))
+oldestDist = select(4, e:GetPoint(1))
+assertTrue((newestDist - oldestDist) <= 1200 + 1e-6, "path length is trimmed to the 1200px maximum")
+assertTrue(e.count <= C.MAX_POINTS, "max-length dense trail stays within MAX_POINTS")
+assertTrue(e.activeSegCount <= C.MAX_SEGMENTS, "max-length dense trail stays within MAX_SEGMENTS")
+assertAlmost(select(1, e:GetPoint(e.count)), maxLenCursor, 1e-6, "max-length trail still reaches the current cursor")
 
 -- Interpolated timestamps are monotonic
 e = newEngine()

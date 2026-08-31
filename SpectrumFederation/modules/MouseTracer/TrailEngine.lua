@@ -302,6 +302,23 @@ function Engine.SpacingForThickness(thickness)
 	return spacing
 end
 
+-- Newest point uses full thickness; oldest uses TAPER_MIN_RATIO of thickness.
+function Engine.TaperedSize(thickness, newestDist, oldestDist, pointDist)
+	thickness = Clamp(thickness, C.MIN_THICKNESS, C.MAX_THICKNESS, C.DEFAULT_THICKNESS)
+	local minRatio = C.TAPER_MIN_RATIO
+	if not newestDist or not oldestDist or newestDist <= oldestDist then
+		return thickness
+	end
+	pointDist = tonumber(pointDist) or newestDist
+	local t = (newestDist - pointDist) / (newestDist - oldestDist)
+	if t < 0 then
+		t = 0
+	elseif t > 1 then
+		t = 1
+	end
+	return thickness * (1 - t * (1 - minRatio))
+end
+
 function Engine.SetConfig(self, trailLength, fadeDuration, rainbowSpeed, thickness)
 	self.trailLength = Clamp(trailLength, C.MIN_TRAIL_LENGTH, C.MAX_TRAIL_LENGTH, C.DEFAULT_TRAIL_LENGTH)
 	self.fadeDuration = Clamp(fadeDuration, C.MIN_FADE_DURATION, C.MAX_FADE_DURATION, C.DEFAULT_FADE_DURATION)

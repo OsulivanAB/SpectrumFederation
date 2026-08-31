@@ -151,7 +151,19 @@ local function HideStamp(idx)
 	end
 end
 
-local function PlaceStamp(idx)
+local function TrailDistRange()
+	local newest = engine:ChronoIndex(engine.count)
+	local oldest = engine:ChronoIndex(1)
+	local newestDist = newest and engine.pdist[newest] or 0
+	local oldestDist = oldest and engine.pdist[oldest] or 0
+	return newestDist, oldestDist
+end
+
+local function StampSize(idx, newestDist, oldestDist)
+	return Engine.TaperedSize(cache.thickness, newestDist, oldestDist, engine.pdist[idx])
+end
+
+local function PlaceStamp(idx, newestDist, oldestDist)
 	if not host or not stamps or not idx then
 		return
 	end
@@ -159,15 +171,36 @@ local function PlaceStamp(idx)
 	if not stamp then
 		return
 	end
+	if newestDist == nil or oldestDist == nil then
+		newestDist, oldestDist = TrailDistRange()
+	end
+	local size = StampSize(idx, newestDist, oldestDist)
 	local r, g, b = Engine.HSVToRGB(engine.pdist[idx] * C.HUE_PER_PIXEL * cache.rainbowSpeed, 1, 1)
 	stamp:SetPoint("CENTER", host, "BOTTOMLEFT", engine.px[idx], engine.py[idx])
-	stamp:SetSize(cache.thickness, cache.thickness)
+	stamp:SetSize(size, size)
 	if stamp.SetVertexColor then
 		stamp:SetVertexColor(r, g, b, 1)
 	end
 	stamp:SetAlpha(cache.opacity)
 	stamp:Show()
 	stampLastAlpha[idx] = cache.opacity
+end
+
+local function RefreshLiveStampSizes(newestDist, oldestDist)
+	if not stamps then
+		return
+	end
+	if newestDist == nil or oldestDist == nil then
+		newestDist, oldestDist = TrailDistRange()
+	end
+	for chrono = 1, engine.count do
+		local idx = engine:ChronoIndex(chrono)
+		local stamp = idx and stamps[idx]
+		if stamp then
+			local size = StampSize(idx, newestDist, oldestDist)
+			stamp:SetSize(size, size)
+		end
+	end
 end
 
 local function ApplyReleased()
@@ -185,11 +218,13 @@ local function ApplyNewStamps()
 	if not host or not stamps then
 		return
 	end
+	local newestDist, oldestDist = TrailDistRange()
 	for i = 1, engine.newSegCount do
 		local id = engine.newSegs[i]
-		PlaceStamp(engine.segI0[id])
-		PlaceStamp(engine.segI1[id])
+		PlaceStamp(engine.segI0[id], newestDist, oldestDist)
+		PlaceStamp(engine.segI1[id], newestDist, oldestDist)
 	end
+	RefreshLiveStampSizes(newestDist, oldestDist)
 	engine.newSegCount = 0
 end
 
@@ -200,6 +235,7 @@ local function UpdateAlphas(now)
 	local fadeDuration = cache.fadeDuration
 	local opacity = cache.opacity
 	local epsilon = C.ALPHA_EPSILON
+	local newestDist, oldestDist = TrailDistRange()
 	for chrono = 1, engine.count do
 		local idx = engine:ChronoIndex(chrono)
 		if idx then
@@ -207,9 +243,13 @@ local function UpdateAlphas(now)
 			local stamp = stamps[idx]
 			if alpha <= 0 then
 				HideStamp(idx)
-			elseif stamp and math.abs(alpha - (stampLastAlpha[idx] or 0)) > epsilon then
-				stamp:SetAlpha(alpha)
-				stampLastAlpha[idx] = alpha
+			elseif stamp then
+				local size = StampSize(idx, newestDist, oldestDist)
+				stamp:SetSize(size, size)
+				if math.abs(alpha - (stampLastAlpha[idx] or 0)) > epsilon then
+					stamp:SetAlpha(alpha)
+					stampLastAlpha[idx] = alpha
+				end
 			end
 		end
 	end
@@ -395,10 +435,11 @@ local function ReconfigureActiveStamps()
 	if not poolReady or not engine or not stamps then
 		return
 	end
+	local newestDist, oldestDist = TrailDistRange()
 	for chrono = 1, engine.count do
 		local idx = engine:ChronoIndex(chrono)
 		if idx then
-			PlaceStamp(idx)
+			PlaceStamp(idx, newestDist, oldestDist)
 		end
 	end
 	UpdateAlphas(Now())
@@ -439,7 +480,7 @@ local function OnSettingChanged(key, newValue)
 			engine:ProcessFade(Now())
 			ApplyReleased()
 		end
-		if key == "rainbowSpeed" or key == "thickness" or key == "opacity" or key == "fadeDuration" then
+		if key == "rainbowSpeed" or key == "thickness" or key == "opacity" or key == "fadeDuration" or key == "trailLength" then
 			ReconfigureActiveStamps()
 		end
 	end

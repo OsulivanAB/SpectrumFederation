@@ -3,10 +3,10 @@ local _, SF = ...
 SF.MouseTracer = SF.MouseTracer or {}
 
 -- Center-to-center stamp spacing is a fraction of thickness so circles overlap
--- across the 6–28px range. Floor keeps the pool bounded at the thinnest trail.
-local MIN_SPACING_FLOOR = 2
-local SPACING_THICKNESS_RATIO = 0.20
-local MAX_TRAIL_LENGTH = 400
+-- heavily across the 6–28px range. Floor keeps the pool bounded at the thinnest trail.
+local MIN_SPACING_FLOOR = 1
+local SPACING_THICKNESS_RATIO = 0.10
+local MAX_TRAIL_LENGTH = 1200
 local TELEPORT_DISTANCE = 250
 
 SF.MouseTracer.Constants = {
@@ -21,11 +21,12 @@ SF.MouseTracer.Constants = {
 	MIN_OPACITY = 0.2,
 	MAX_OPACITY = 1.0,
 
-	DEFAULT_TRAIL_LENGTH = 200,
+	DEFAULT_TRAIL_LENGTH = 400,
 	DEFAULT_FADE_DURATION = 0.50,
 	DEFAULT_THICKNESS = 14,
-	DEFAULT_RAINBOW_SPEED = 1.0,
+	DEFAULT_RAINBOW_SPEED = 0.25,
 	DEFAULT_OPACITY = 0.70,
+	TAPER_MIN_RATIO = 0.40,
 
 	MIN_SPACING = MIN_SPACING_FLOOR,
 	MIN_SPACING_FLOOR = MIN_SPACING_FLOOR,

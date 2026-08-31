@@ -33,10 +33,10 @@ SF.SettingsSchema = {
 	CHARACTER_DEFAULTS = {
 		mouseTracer = {
 			enabled = false,
-			trailLength = 200,
+			trailLength = 400,
 			fadeDuration = 0.50,
 			thickness = 14,
-			rainbowSpeed = 1.0,
+			rainbowSpeed = 0.25,
 			opacity = 0.70,
 		},
 	},

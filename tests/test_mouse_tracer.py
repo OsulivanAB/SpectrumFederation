@@ -14,6 +14,8 @@ LUA_TESTS = REPO_ROOT / "tests" / "lua" / "mouse_tracer_tests.lua"
 CONSTANTS = REPO_ROOT / "SpectrumFederation" / "modules" / "MouseTracer" / "Constants.lua"
 ENGINE = REPO_ROOT / "SpectrumFederation" / "modules" / "MouseTracer" / "TrailEngine.lua"
 RUNTIME = REPO_ROOT / "SpectrumFederation" / "modules" / "MouseTracer" / "MouseTracer.lua"
+SCHEMA = REPO_ROOT / "SpectrumFederation" / "modules" / "Settings" / "Schema.lua"
+NICHE_FEATURES = REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "NicheFeatures.lua"
 
 
 def _lua51() -> str:
@@ -48,3 +50,17 @@ def test_parent_toc_loads_mouse_tracer_modules():
     assert "modules/MouseTracer/Constants.lua" in parent
     assert "modules/MouseTracer/TrailEngine.lua" in parent
     assert "modules/MouseTracer/MouseTracer.lua" in parent
+
+
+def test_schema_and_slider_match_new_mouse_tracer_defaults():
+    schema = SCHEMA.read_text(encoding="utf-8")
+    page = NICHE_FEATURES.read_text(encoding="utf-8")
+    constants = CONSTANTS.read_text(encoding="utf-8")
+    assert "trailLength = 400" in schema
+    assert "rainbowSpeed = 0.25" in schema
+    assert "DEFAULT_TRAIL_LENGTH = 400" in constants
+    assert "DEFAULT_RAINBOW_SPEED = 0.25" in constants
+    assert "MAX_TRAIL_LENGTH = 1200" in constants
+    assert "TAPER_MIN_RATIO = 0.40" in constants
+    assert "max = 1200" in page
+    assert "label = \"Trail Length\"" in page
