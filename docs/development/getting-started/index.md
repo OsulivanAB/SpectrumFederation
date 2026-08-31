@@ -87,6 +87,9 @@ python3 .github/scripts/validate_docs.py
 # Interface-sync parser or fixtures
 python -m pytest tests/test_wow_interface_sync.py
 
+# README Interface badge formatting
+python -m pytest tests/test_interface_badge.py
+
 # Settings navigation (loads production NavigationModel.lua; requires lua5.1)
 python -m pytest tests/test_settings_navigation.py
 

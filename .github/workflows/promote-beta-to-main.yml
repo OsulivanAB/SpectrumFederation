@@ -315,10 +315,11 @@ jobs:
         run: |
           VERSION="${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}"
           INTERFACE="${{ needs.dry-run-merge-beta-to-main.outputs.interface }}"
+          INTERFACE_DISPLAY=$(python3 .github/scripts/blizzard_api.py --format-interface "$INTERFACE")
 
           echo "Updating README badges:"
           echo "  Version: $VERSION"
-          echo "  Interface: $INTERFACE"
+          echo "  Interface: $INTERFACE ($INTERFACE_DISPLAY)"
 
           # Escape hyphens for shields.io (- becomes --)
           VERSION_ESCAPED="${VERSION//-/--}"
@@ -326,8 +327,8 @@ jobs:
           # Update version badge (match between Version- and - at end)
           sed -i 's|badge/Version-[^)]*-brightgreen|badge/Version-'"${VERSION_ESCAPED}"'-brightgreen|g' README.md
 
-          # Update interface badge
-          sed -i "s|badge/Interface-[^-]*-|badge/Interface-${INTERFACE}-|g" README.md
+          # Update interface badge (120100 -> 12.1.0)
+          sed -i "s|badge/Interface-[^-]*-|badge/Interface-${INTERFACE_DISPLAY}-|g" README.md
 
           # Update track badge to Retail
           sed -i 's|badge/Track-[^-]*-|badge/Track-Retail-|g' README.md
@@ -779,10 +780,11 @@ jobs:
         run: |
           VERSION="${{ needs.merge-beta-to-main.outputs.stable_version }}"
           INTERFACE="${{ needs.merge-beta-to-main.outputs.interface }}"
+          INTERFACE_DISPLAY=$(python3 .github/scripts/blizzard_api.py --format-interface "$INTERFACE")
 
           echo "Updating README badges:"
           echo "  Version: $VERSION"
-          echo "  Interface: $INTERFACE"
+          echo "  Interface: $INTERFACE ($INTERFACE_DISPLAY)"
 
           # Escape hyphens for shields.io (- becomes --)
           VERSION_ESCAPED="${VERSION//-/--}"
@@ -790,8 +792,8 @@ jobs:
           # Update version badge (match between Version- and - at end)
           sed -i 's|badge/Version-[^)]*-brightgreen|badge/Version-'"${VERSION_ESCAPED}"'-brightgreen|g' README.md
 
-          # Update interface badge
-          sed -i "s|badge/Interface-[^-]*-|badge/Interface-${INTERFACE}-|g" README.md
+          # Update interface badge (120100 -> 12.1.0)
+          sed -i "s|badge/Interface-[^-]*-|badge/Interface-${INTERFACE_DISPLAY}-|g" README.md
 
           # Update track badge to Retail
           sed -i 's|badge/Track-[^-]*-|badge/Track-Retail-|g' README.md
