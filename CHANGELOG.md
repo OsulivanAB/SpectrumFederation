@@ -2,35 +2,20 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.3.0-beta.6] - 2026-08-31
-
-### Fixed
-- Loot Helper window now expands and collapses from the title bar instead of growing from its center
-
-## [1.3.0-beta.5] - 2026-08-31
+## [1.3.0] - 2026-08-31
 
 ### Added
 - Add optional Mouse Tracer on Gameplay → UI Enhancements
-
-## [1.3.0-beta.4] - 2026-08-31
-
-### Removed
-- Press and Hold Casting per-specialization automation
+- Add Spectrum Federation: Cursed Surge Tracker child addon
 
 ### Changed
 - Gameplay settings category is retained as an empty placeholder
 
-## [1.3.0-beta.3] - 2026-08-31
+### Fixed
+- Loot Helper window now expands and collapses from the title bar instead of growing from its center
 
-### Changed
-- Settings window category sidebar and content tabs
-
-## [1.3.0-beta.2] - 2026-08-27
-
-### Added
-- Merge pull request #253 from OsulivanAB/cursor/cursed-surge-tracker-8250
-
-Add Spectrum Federation: Cursed Surge Tracker child addon
+### Removed
+- Press and Hold Casting per-specialization automation
 
 ## [1.2.0] - 2026-08-26
 
