@@ -163,7 +163,7 @@ jobs:
         run: pip install pytest
 
       - name: Run tests
-        run: python -m pytest tests/test_settings_navigation.py tests/test_cursed_surge_tracker.py
+        run: python -m pytest tests/test_settings_navigation.py tests/test_cursed_surge_tracker.py tests/test_mouse_tracer.py
 
   validate-docs:
     name: Validate Documentation

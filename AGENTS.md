@@ -9,7 +9,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - `.github/scripts/`: Python automation for linting, packaging, docs validation, release/version checks, and Blizzard interface sync.
 - `.github/workflows/`: GitHub Actions workflows for PR validation, beta releases, promotion to `main`, rollback, and Copilot setup.
 - `docs/` + `mkdocs.yml`: documentation source for the published docs site.
-- `tests/`: Python tests plus Lua 5.1 navigation tests that load production Settings Lua.
+- `tests/`: Python tests plus Lua 5.1 tests that load production Settings and Mouse Tracer Lua.
 - `SpectrumFederation/AGENTS.md`: deeper addon-specific implementation guidance for work inside the addon tree.
 
 ## Source Of Truth
@@ -25,6 +25,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Validate docs build: `python3 .github/scripts/validate_docs.py`
 - Run targeted parser tests: `python -m pytest tests/test_wow_interface_sync.py`
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
+- Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
 
 ## Important Workflows
 
@@ -37,6 +38,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 
 - Addon feature or bugfix: start in `SpectrumFederation/AGENTS.md`, then inspect the relevant module under `SpectrumFederation/modules/`.
 - Settings work: start with `SpectrumFederation/modules/Settings/` and `SpectrumFederation/modules/UI/Settings/`, then read `docs/development/settings-ui/`.
+- Mouse Tracer work: start with `SpectrumFederation/modules/MouseTracer/` and `docs/development/mouse-tracer.md`.
 - Loot Helper or sync work: inspect `SpectrumFederation/modules/LootHelper/`, `SpectrumFederation/modules/LootHelperSync/`, and the related docs under `docs/development/loot-helper/`.
 - Workflow or CI script work: inspect the matching file under `.github/workflows/` or `.github/scripts/` first, then use `.github/instructions/` as supplemental guidance.
 - Docs work: start with `mkdocs.yml` for nav/build behavior, then edit files in `docs/`.
@@ -48,3 +50,4 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Docs, `README.md`, or `mkdocs.yml`: also run `python3 .github/scripts/validate_docs.py`
 - `wow_interface_sync.py` or parser fixtures/tests: also run `python -m pytest tests/test_wow_interface_sync.py`
 - Settings navigation or Registry helpers: also run `python -m pytest tests/test_settings_navigation.py`
+- Mouse Tracer constants or trail engine: also run `python -m pytest tests/test_mouse_tracer.py`

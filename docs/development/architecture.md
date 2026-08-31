@@ -6,7 +6,7 @@
 
 There are two initialization paths:
 
-- `modules/Init.lua` initializes settings storage/application and the standalone settings UI.
+- `modules/Init.lua` initializes settings storage/application, Mouse Tracer, and the standalone settings UI.
 - `SpectrumFederation.lua` handles `PLAYER_LOGIN`, initializes diagnostics and Loot Helper persistence, enables sync, and registers feature slash commands.
 
 Modules share the table passed by WoW as the addon's second vararg:
@@ -25,6 +25,7 @@ local addonName, SF = ...
 | `modules/debug.lua` | Persistent, bounded diagnostic logging. |
 | `modules/SlashCommands.lua` | `/sf` dispatch and feature command registry. |
 | `modules/Settings/` | Defaults, migrations, path-based storage, per-character storage, and runtime application. |
+| `modules/MouseTracer/` | Optional per-character cursor trail: cached settings, fixed-pool rendering, and account-wide copy snapshots. |
 | `modules/UI/Settings/` | Page/category registry, navigation model, standalone window, controls, dialogs, and page definitions. |
 | `modules/LootHelper/` | Profile, member, and log domain models plus serialization and the current communication adapter. |
 | `modules/LootHelperSync/` | Session state, validation, requests, convergence, heartbeat, routing, bulk handlers, and public API. |

@@ -12,6 +12,7 @@ alwaysApply: true
   - `wow_interface_sync.py` or parser fixtures/tests -> `python -m pytest tests/test_wow_interface_sync.py`
   - Cursed Surge schedule/map helpers -> `python -m pytest tests/test_cursed_surge_tracker.py`
   - Settings navigation model or Registry helpers -> `python -m pytest tests/test_settings_navigation.py` (requires `lua5.1`)
+  - Mouse Tracer constants or trail engine -> `python -m pytest tests/test_mouse_tracer.py` (requires `lua5.1`)
 - Normal development targets `beta`; `main` is for promotion and release workflows.
 - Do not weaken CI to make checks pass.
 - Keep the job name in `.github/workflows/copilot-setup-steps.yml` exactly `copilot-setup-steps`.

@@ -12,6 +12,7 @@ SpectrumFederation/
     LootHelper/                profiles, members, logs, and transport
     LootHelperSync/            session protocol and synchronization
     Settings/                  schema, persistence, and apply behavior
+    MouseTracer/               optional per-character cursor trail
     UI/Settings/               standalone settings framework and pages
     UI/LootHelper/             roster and equipment windows
     RaidCheck.lua              inspection, preparation checks, and awards
@@ -27,7 +28,7 @@ SpectrumFederation_CursedSurgeTracker/
 .github/workflows/             PR, beta, promotion, and rollback automation
 assets/                        standalone Google Sheet sync utility
 docs/                          MkDocs content
-tests/                         Python tests and Lua 5.1 Settings navigation tests
+tests/                         Python tests and Lua 5.1 Settings/Mouse Tracer tests
 ```
 
 Always inspect `SpectrumFederation/SpectrumFederation.toc` before changing load order, packaged files, Interface metadata, or addon versioning.
@@ -88,6 +89,9 @@ python -m pytest tests/test_wow_interface_sync.py
 
 # Settings navigation (loads production NavigationModel.lua; requires lua5.1)
 python -m pytest tests/test_settings_navigation.py
+
+# Mouse Tracer engine (loads production Constants.lua and TrailEngine.lua; requires lua5.1)
+python -m pytest tests/test_mouse_tracer.py
 ```
 
 Do not weaken a check to make a change pass.
@@ -122,6 +126,7 @@ Update the [Slash Command Reference](../../reference/slash-commands.md) for user
 
 - [Addon Architecture](../architecture.md)
 - [Settings System](../settings-ui/index.md)
+- [Mouse Tracer](../mouse-tracer.md)
 - [Loot Helper Internals](../loot-helper/index.md)
 - [Automation and Releases](../automation.md)
 

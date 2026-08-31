@@ -27,6 +27,7 @@ These notes apply when changing files under `SpectrumFederation/`.
 - Settings:
   - Schema/Store/Apply: `SpectrumFederation/modules/Settings/`
   - Settings UI framework + pages: `SpectrumFederation/modules/UI/Settings/`
+- Mouse Tracer: `SpectrumFederation/modules/MouseTracer/` (constants, pure trail engine, runtime host). The Gameplay / UI Enhancements page lives in `modules/UI/Settings/Pages/NicheFeatures.lua`.
 
 ## Adding a new setting (correct, minimal workflow)
 When you need a new toggle/option:
@@ -71,3 +72,4 @@ When you need a new toggle/option:
 - `/reload` in-game without errors.
 - Verify the new setting appears (when applicable) and toggling it changes behavior as intended.
 - Settings navigation changes: `python -m pytest tests/test_settings_navigation.py`
+- Mouse Tracer engine or constants changes: `python -m pytest tests/test_mouse_tracer.py`
