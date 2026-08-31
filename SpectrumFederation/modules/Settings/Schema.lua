@@ -35,7 +35,7 @@ SF.SettingsSchema = {
 			enabled = false,
 			trailLength = 400,
 			fadeDuration = 0.50,
-			thickness = 14,
+			thickness = 16,
 			rainbowSpeed = 0.25,
 			opacity = 0.70,
 		},

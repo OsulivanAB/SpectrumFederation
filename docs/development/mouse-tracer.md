@@ -14,7 +14,7 @@ Mouse Tracer is an optional per-character cursor trail. User-facing control desc
 
 `Init.lua` starts Mouse Tracer after `SettingsStore` and `SettingsApply`. Live values live in `SpectrumFederationCharDB`. Account-wide `mouseTracerCopies` exist only so **Copy From Character** can read another character's last saved settings. WoW cannot read another character's per-character SavedVariables.
 
-Do not bump `SettingsSchema.VERSION` for these defaults. `MergeDefaults` fills missing character and account keys.
+Character defaults (filled only when a key is unset): off, Trail Length 400, Fade Duration 0.50, Trail Thickness 16, Rainbow Cycle Speed 0.25, Trail Opacity 0.70. Do not bump `SettingsSchema.VERSION` for these defaults. `MergeDefaults` fills missing character and account keys.
 
 ## Performance contract
 

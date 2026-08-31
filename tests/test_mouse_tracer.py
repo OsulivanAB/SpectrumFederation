@@ -56,10 +56,17 @@ def test_schema_and_slider_match_new_mouse_tracer_defaults():
     schema = SCHEMA.read_text(encoding="utf-8")
     page = NICHE_FEATURES.read_text(encoding="utf-8")
     constants = CONSTANTS.read_text(encoding="utf-8")
+    assert "enabled = false" in schema
     assert "trailLength = 400" in schema
+    assert "fadeDuration = 0.50" in schema
+    assert "thickness = 16" in schema
     assert "rainbowSpeed = 0.25" in schema
+    assert "opacity = 0.70" in schema
     assert "DEFAULT_TRAIL_LENGTH = 400" in constants
+    assert "DEFAULT_FADE_DURATION = 0.50" in constants
+    assert "DEFAULT_THICKNESS = 16" in constants
     assert "DEFAULT_RAINBOW_SPEED = 0.25" in constants
+    assert "DEFAULT_OPACITY = 0.70" in constants
     assert "MAX_TRAIL_LENGTH = 1200" in constants
     assert "TAPER_MIN_RATIO = 0.40" in constants
     assert "max = 1200" in page
