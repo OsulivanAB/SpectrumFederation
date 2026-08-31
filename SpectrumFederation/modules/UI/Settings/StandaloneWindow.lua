@@ -588,8 +588,12 @@ function SettingsWindow:UpdateContentChrome()
                 })
             end
             self.tabBar:Show()
-            self.tabBar:SetTabs(tabs)
-            self.tabBar:SetSelected(self.currentPageId)
+            if self.tabBar.HasSameTabs and self.tabBar:HasSameTabs(tabs) then
+                self.tabBar:SetSelected(self.currentPageId)
+            else
+                self.tabBar:SetTabs(tabs)
+                self.tabBar:SetSelected(self.currentPageId)
+            end
             self.contentHeader:SetHeight(C.CONTENT_HEADER_HEIGHT + C.TAB_BAR_HEIGHT + C.TAB_BAR_GAP)
         else
             self.tabBar:Hide()

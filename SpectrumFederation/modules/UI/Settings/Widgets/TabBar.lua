@@ -84,35 +84,71 @@ function TabBarMixin:SetOnSelect(callback)
 	self.onSelect = callback
 end
 
+function TabBarMixin:HasSameTabs(tabs)
+	tabs = tabs or {}
+	if #tabs ~= #(self.tabs or {}) then
+		return false
+	end
+	for index, tab in ipairs(tabs) do
+		local current = self.tabs[index]
+		if not current or current.id ~= tab.id or current.label ~= tab.label then
+			return false
+		end
+	end
+	return true
+end
+
+function TabBarMixin:BindButton(btn)
+	btn:SetScript("OnEnter", function(button)
+		if button.tabId ~= self.selectedId then
+			button.bg:SetColorTexture(unpack(HOVER_BG))
+		end
+	end)
+	btn:SetScript("OnLeave", function()
+		self:UpdateVisuals()
+	end)
+	btn:SetScript("OnClick", function(button)
+		if self.onSelect then
+			self.onSelect(button.tabId)
+		end
+	end)
+end
+
+function TabBarMixin:ApplyTabToButton(btn, tab)
+	btn.tabId = tab.id
+	btn.text:SetText(tab.label or tab.id)
+	local textWidth = btn.text:GetStringWidth() or 0
+	btn:SetWidth(math.max(72, textWidth + TAB_PADDING_X * 2))
+end
+
 function TabBarMixin:SetTabs(tabs)
 	self.tabs = tabs or {}
-	for _, btn in ipairs(self.buttons) do
-		btn:Hide()
-		btn:SetParent(nil)
-	end
-	self.buttons = {}
 
 	local x = 0
-	for _, tab in ipairs(self.tabs) do
-		local btn = CreateTabButton(self.child, tab)
+	for index, tab in ipairs(self.tabs) do
+		local btn = self.buttons[index]
+		if not btn then
+			btn = CreateTabButton(self.child, tab)
+			self:BindButton(btn)
+			self.buttons[index] = btn
+		else
+			self:ApplyTabToButton(btn, tab)
+		end
+		btn:ClearAllPoints()
 		btn:SetPoint("TOPLEFT", self.child, "TOPLEFT", x, 0)
-		btn:SetScript("OnEnter", function(button)
-			if button.tabId ~= self.selectedId then
-				button.bg:SetColorTexture(unpack(HOVER_BG))
-			end
-		end)
-		btn:SetScript("OnLeave", function()
-			self:UpdateVisuals()
-		end)
-		btn:SetScript("OnClick", function(button)
-			if self.onSelect then
-				self.onSelect(button.tabId)
-			end
-		end)
-		table.insert(self.buttons, btn)
+		btn:Show()
 		x = x + btn:GetWidth() + TAB_GAP
 	end
-	self.child:SetWidth(math.max(1, x - TAB_GAP))
+
+	for index = #self.tabs + 1, #self.buttons do
+		self.buttons[index]:Hide()
+	end
+
+	if #self.tabs == 0 then
+		self.child:SetWidth(1)
+	else
+		self.child:SetWidth(math.max(1, x - TAB_GAP))
+	end
 	self:Layout()
 	self:UpdateVisuals()
 end
