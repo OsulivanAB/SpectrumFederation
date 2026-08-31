@@ -57,3 +57,35 @@ def test_parent_toc_loads_raid_equipment_modules():
     assert parent.index("modules/RaidEquipment/Policy.lua") < parent.index("modules/RaidCheck.lua")
     assert parent.index("modules/RaidEquipment/CheckRun.lua") < parent.index("modules/RaidCheck.lua")
     assert "modules/UI/Settings/Pages/RaidEquipment.lua" in parent
+
+
+def test_raid_check_does_not_consume_persisted_equipment_snapshots():
+    raid_check = (REPO_ROOT / "SpectrumFederation" / "modules" / "RaidCheck.lua").read_text(
+        encoding="utf-8"
+    )
+    profiles = (REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "Profiles.lua").read_text(
+        encoding="utf-8"
+    )
+    policy = POLICY.read_text(encoding="utf-8")
+    check_run = CHECK_RUN.read_text(encoding="utf-8")
+
+    persist = raid_check.split("local function PersistProfileEquipmentSnapshot", 1)[1]
+    persist = persist.split("local function GetProfileEquipmentSnapshot", 1)[0]
+    assert "return false" in persist
+    assert "_raidCheckEquipmentSnapshots" not in persist
+    assert "SetRaidCheckEquipmentSnapshot" not in persist
+
+    assert "function LootProfile:SetRaidCheckEquipmentSnapshot(memberId, snapshot)" in profiles
+    assert "self._raidCheckEquipmentSnapshots[memberId] = snapshotCopy" in profiles
+
+    assert "GetRaidCheckEquipmentSnapshot" not in policy
+    assert "GetRaidCheckEquipmentSnapshot" not in check_run
+    assert "_raidCheckEquipmentSnapshots" not in policy
+    assert "_raidCheckEquipmentSnapshots" not in check_run
+    assert "CheckRun.ClassifyRun(run, now, state.lastGood)" in raid_check
+    assert "GetProfileEquipmentSnapshot(" not in raid_check.split(
+        "function RC:_SettleAdhocRun", 1
+    )[1]
+    assert "GetRaidCheckEquipmentSnapshot" not in raid_check.split(
+        "function RC:_SettleAdhocRun", 1
+    )[1]

@@ -123,8 +123,8 @@ Acquisition, policy, and consequences are separate:
 - Only complete trustworthy observations enter runtime last-good storage. `/reload` blanks them. Legacy `_raidCheckEquipmentSnapshots` remain inert: they are not written, not consumed, and not wiped.
 - Combat and Blizzard Inspect are paused states. Paused time does not consume active acquisition bounds.
 - Target membership is `profile membership ∩ current group` at run start. Roster updates only re-resolve frozen members.
-- Local `StartSession()` may begin inspecting immediately. Session-backed consequences wait until the local CONTROL/ALERT `SES_START` send is accepted (`HasAnnouncedCurrentSession`). A failed send leaves the session unannounced.
-- Mismatched or unannounced sessions apply frozen-profile consequences locally (`skipBroadcast`) and do not send logs through an unrelated session.
+- Local `StartSession()` may begin inspecting immediately. Session-backed consequences wait until the local CONTROL/ALERT `SES_START` send is accepted (`HasAnnouncedCurrentSession`). If that send is not accepted, the never-announced session is reset locally (no `SES_END`), Raid Check consequences apply once to the frozen profile with `skipBroadcast`, and the session is no longer treated as active.
+- Mismatched sessions apply frozen-profile consequences locally (`skipBroadcast`) and do not send logs through an unrelated session.
 
 The standalone **Raid Equipment** settings page consumes versioned troubleshooting snapshots through listener callbacks. Avoid rebuilding it from raw WoW APIs independently; use `GetTroubleshootingSnapshot` or `GetTroubleshootingSlotsForUnit`. The page does not require a Loot Helper profile or session. Auto Refresh remains `lootHelper.raidCheckAuditAutoRefresh`.
 

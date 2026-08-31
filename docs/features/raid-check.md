@@ -38,7 +38,7 @@ When you run Pre-Raid Check or Raid Check:
 - If a Loot Helper session is already active for the selected profile, the check starts immediately.
 - If a session is active for a **different** profile, the check still runs against the selected profile. A warning explains that consequences stay local to that profile and will not synchronize through the unrelated session. The addon does not switch profiles or end the other session.
 - If no session is active, a prompt appears:
-  - **Yes** starts a Loot Helper session for the selected profile, then starts the check only if session startup succeeds.
+  - **Yes** starts a Loot Helper session for the selected profile, then starts the check only if local session startup succeeds. Inspection may begin immediately. Synchronized consequences wait until the local `SES_START` send is accepted. If that announcement cannot be sent, the unfinished session is cleared locally without `SES_END`, the check finishes with local-only results, and the next check prompts again.
   - **No** runs the check without a session.
   - **Escape / close / Cancel** aborts. Nothing is inspected and no session is started.
 

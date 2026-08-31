@@ -415,6 +415,17 @@ function CheckRun.ApplyDialogChoice(choice, startSessionSucceeded)
 	return { action = "abort" }
 end
 
+function CheckRun.NoteSessionStartFailed(run)
+	if type(run) ~= "table" then
+		return false
+	end
+	if run.sessionStartFailed then
+		return false
+	end
+	run.sessionStartFailed = true
+	return true
+end
+
 function CheckRun.ConsequenceSyncEligible(run, session)
 	session = session or {}
 	if type(run) ~= "table" then
@@ -423,19 +434,30 @@ function CheckRun.ConsequenceSyncEligible(run, session)
 	if run.sessionMismatch then
 		return false, "mismatch"
 	end
+	if run.startedSessionForCheck then
+		if run.sessionStartFailed then
+			return false, "announce_failed"
+		end
+		local expected = run.expectedSessionId
+		if session.active and (not expected or session.sessionId == expected) and not session.announced then
+			return false, "awaiting_announce"
+		end
+		if session.active and session.announced and (not expected or session.sessionId == expected) then
+			if session.profileId ~= run.profileId then
+				return false, "wrong_profile"
+			end
+			return true, "eligible"
+		end
+		if session.active and expected and session.sessionId ~= expected then
+			return false, "session_changed"
+		end
+		return false, "announce_failed"
+	end
 	if not session.active then
 		return false, "no_session"
 	end
 	if session.profileId ~= run.profileId then
 		return false, "wrong_profile"
-	end
-	if run.startedSessionForCheck then
-		if not session.announced then
-			return false, "awaiting_announce"
-		end
-		if run.expectedSessionId and session.sessionId ~= run.expectedSessionId then
-			return false, "session_changed"
-		end
 	end
 	return true, "eligible"
 end

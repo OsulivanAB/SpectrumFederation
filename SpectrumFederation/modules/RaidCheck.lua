@@ -1279,15 +1279,6 @@ function RC:_ClearPreparedSlotCaches()
 		end
 	end
 
-	local profile = GetProfile()
-	if profile and type(profile.GetRaidCheckEquipmentSnapshotIds) == "function" then
-		for _, memberId in ipairs(profile:GetRaidCheckEquipmentSnapshotIds() or {}) do
-			local snapshot = profile:GetRaidCheckEquipmentSnapshot(memberId)
-			if type(snapshot) == "table" then
-				snapshot.preparedSlotsByConfig = {}
-			end
-		end
-	end
 end
 
 function RC:_ScheduleTooltipDataRefresh()
@@ -2934,7 +2925,9 @@ function RC:_ApplyCheckConsequences(run)
 		whisperPointName = ATTENDANCE_POINT_NAME
 	end
 
-	if run.startedSessionForCheck and reason == "session_changed" then
+	if run.startedSessionForCheck and reason == "announce_failed" then
+		SF:PrintWarning(string.format("[%s] The check completed, but Loot Helper session synchronization could not be established. Results were saved locally.", ModeLabel(mode)))
+	elseif run.startedSessionForCheck and reason == "session_changed" then
 		SF:PrintWarning(string.format("[%s] The expected session is no longer active. Results are saved locally and were not synchronized.", ModeLabel(mode)))
 	elseif run.sessionMismatch or reason == "mismatch" or reason == "wrong_profile" then
 		SF:PrintWarning(string.format("[%s] Consequences stay on the selected profile and will not synchronize through the unrelated session.", ModeLabel(mode)))
@@ -3080,6 +3073,25 @@ function RC:_TryReleaseCheckConsequences()
 	end
 	self:_ApplyCheckConsequences(run)
 	state.adhocRun = nil
+end
+
+function RC:OnSessionStartAnnounceFailed(sessionId)
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	local state = self:_GetInspectState()
+	local run = state.adhocRun
+	if not run then
+		return
+	end
+	if run.expectedSessionId and sessionId and run.expectedSessionId ~= sessionId then
+		return
+	end
+	if CheckRun and CheckRun.NoteSessionStartFailed then
+		CheckRun.NoteSessionStartFailed(run)
+	else
+		run.sessionStartFailed = true
+	end
+	-- Release already-classified consequences locally. Do not rescan or start a replacement session.
+	self:_TryReleaseCheckConsequences()
 end
 
 function RC:_SettleAdhocRun(reason)

@@ -674,6 +674,8 @@ function Sync:StartSession(profileId, opts)
     self.state.coordinator = me
     self.state.coordEpoch = epoch
     self.state.isCoordinator = true
+    self.state._sessionAnnounced = nil
+    self.state._sessionStartFailedFor = nil
     self:_PersistSessionState("StartSession")
 
     self:_ResetSessionSafeMode("StartSession")

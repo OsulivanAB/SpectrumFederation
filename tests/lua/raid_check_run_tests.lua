@@ -230,11 +230,63 @@ local hold, holdReason = CheckRun.ShouldHoldConsequences(yesRun, {
 assertTrue(hold, "local StartSession return alone does not release consequences")
 assertEq(holdReason, "awaiting_announce", "consequences wait for SES_START send acceptance")
 
-local state = { sessionId = "SES1" }
-assertTrue(not Sync.ApplySesStartSendResult(state, "SES1", false), "failed SES_START send does not mark announced")
-assertEq(state._sessionAnnounced, nil, "failed send leaves _sessionAnnounced unset")
-assertTrue(Sync.ApplySesStartSendResult(state, "SES1", true), "successful SES_START send marks announced")
-assertEq(state._sessionAnnounced, "SES1", "successful announce records the session id")
+local function tryApply(run, session)
+    if run.consequencesApplied then
+        return false, "already_applied"
+    end
+    local shouldHold, reason = CheckRun.ShouldHoldConsequences(run, session)
+    if shouldHold then
+        return false, reason
+    end
+    local eligible, applyReason = CheckRun.ConsequenceSyncEligible(run, session)
+    run.consequencesApplied = true
+    run.consequencesEligible = eligible and true or false
+    run.consequencesReason = applyReason
+    run.consequencesSkipBroadcast = not eligible
+    return true, applyReason
+end
+
+-- Successful announcement: classify before announce, hold, then apply once and stay active.
+yesRun.classified = true
+yesRun.consequencesApplied = false
+local successState = { active = true, sessionId = "SES1", profileId = "p1" }
+assertTrue(not Sync.ApplySesStartSendResult(successState, "SES1", false), "failed SES_START send does not mark announced")
+assertEq(successState._sessionAnnounced, nil, "failed send leaves _sessionAnnounced unset")
+local applied, appliedReason = tryApply(yesRun, {
+    active = true,
+    sessionId = "SES1",
+    profileId = "p1",
+    announced = false,
+})
+assertTrue(not applied, "classified results stay held until SES_START is accepted")
+assertEq(appliedReason, "awaiting_announce", "pre-announce apply is skipped")
+assertTrue(Sync.ApplySesStartSendResult(successState, "SES1", true), "successful SES_START send marks announced")
+assertEq(successState._sessionAnnounced, "SES1", "successful announce records the session id")
+assertEq(successState.active, true, "successful announce leaves the session active")
+applied, appliedReason = tryApply(yesRun, {
+    active = true,
+    sessionId = "SES1",
+    profileId = "p1",
+    announced = true,
+})
+assertTrue(applied, "accepted SES_START releases consequences")
+assertEq(appliedReason, "eligible", "successful announce is session-sync eligible")
+assertTrue(not yesRun.consequencesSkipBroadcast, "successful announce may broadcast NEW_LOG")
+applied, appliedReason = tryApply(yesRun, {
+    active = true,
+    sessionId = "SES1",
+    profileId = "p1",
+    announced = true,
+})
+assertTrue(not applied, "successful announce cannot apply consequences twice")
+assertEq(appliedReason, "already_applied", "duplicate success callback is idempotent")
+assertEq(Sync.ClassifyUnannouncedStartFailure(successState, "SES1"), "already_announced", "successful announcement cannot enter the failed-start path")
+Sync.state = successState
+local didReset, failOutcome = Sync:FailUnannouncedSessionStart("SES1")
+assertTrue(not didReset, "FailUnannouncedSessionStart is a no-op after a successful announce")
+assertEq(failOutcome, "already_announced", "announced sessions are not reset by a late fail callback")
+assertEq(successState.active, true, "session remains active after a late failed-start callback")
+assertEq(successState._sessionAnnounced, "SES1", "late fail callback does not clear an announced session")
 
 Sync.state = {
     active = true,
@@ -278,16 +330,113 @@ eligible, eligReason = CheckRun.ConsequenceSyncEligible(mismatchRun, {
 assertTrue(not eligible, "unrelated session never receives the frozen profile's logs")
 assertEq(eligReason, "mismatch", "mismatch is decided before broadcast")
 
--- Classify before announce does not apply consequences
-yesRun.classified = true
-yesRun.consequencesApplied = false
-hold = CheckRun.ShouldHoldConsequences(yesRun, {
+-- Failed announcement: terminal failed-start, local apply once, no session broadcast, no SES_END.
+local failedRun = CheckRun.NewRun({
+    profileId = "p1",
+    startedSessionForCheck = true,
+    expectedSessionId = "SES-FAIL",
+    targetIds = { "A" },
+    now = 0,
+})
+failedRun.classified = true
+failedRun.consequencesApplied = false
+local failedState = { active = true, sessionId = "SES-FAIL", profileId = "p1", isCoordinator = true }
+hold, holdReason = CheckRun.ShouldHoldConsequences(failedRun, {
     active = true,
-    sessionId = "SES1",
+    sessionId = "SES-FAIL",
     profileId = "p1",
     announced = false,
 })
-assertTrue(hold, "acquisition may classify before announce while consequences wait")
+assertTrue(hold, "failed-send path still holds until terminal failed-start cleanup")
+assertEq(holdReason, "awaiting_announce", "unannounced active session holds before cleanup")
+assertTrue(not Sync.ApplySesStartSendResult(failedState, "SES-FAIL", false), "rejected SES_START send does not announce")
+assertEq(Sync.ClassifyUnannouncedStartFailure(failedState, "SES-FAIL"), "reset", "rejected send classifies as a terminal reset")
+
+local sentMessages = {}
+SF.LootHelperComm = {
+    Send = function(_, _, msg)
+        sentMessages[#sentMessages + 1] = msg
+        return true
+    end,
+}
+local originalReset = Sync._ResetSessionState
+local resetCount = 0
+function Sync:_ResetSessionState(reason)
+    resetCount = resetCount + 1
+    local failedFor = self.state._sessionStartFailedFor
+    self.state.active = false
+    self.state.sessionId = nil
+    self.state.profileId = nil
+    self.state.isCoordinator = false
+    self.state._sessionAnnounced = nil
+    self.state._sessionStartFailedFor = failedFor
+    self._lastResetReason = reason
+end
+local notified = {}
+SF.RaidCheck = {
+    OnSessionStartAnnounceFailed = function(_, sessionId)
+        notified[#notified + 1] = sessionId
+        CheckRun.NoteSessionStartFailed(failedRun)
+    end,
+}
+Sync.state = failedState
+didReset, failOutcome = Sync:FailUnannouncedSessionStart("SES-FAIL", "ses_start_send_failed")
+assertTrue(didReset, "failed SES_START resets the never-announced session")
+assertEq(failOutcome, "reset", "first failed-start cleanup resets")
+assertEq(resetCount, 1, "failed-start uses one local session reset")
+assertEq(failedState.active, false, "failed never-announced session is no longer active")
+assertEq(failedState.sessionId, nil, "failed-start clears local session identity")
+assertTrue(not Sync:HasAnnouncedCurrentSession("SES-FAIL"), "failed start is not announced")
+assertEq(#sentMessages, 0, "failed-start cleanup does not broadcast SES_END")
+assertEq(notified[1], "SES-FAIL", "Raid Check is notified of the failed start")
+assertTrue(failedRun.sessionStartFailed, "run records terminal session-start failure")
+
+local inactiveSession = { active = false, sessionId = nil, profileId = nil, announced = false }
+hold, holdReason = CheckRun.ShouldHoldConsequences(failedRun, inactiveSession)
+assertTrue(not hold, "terminal failed-start does not leave consequences pending")
+assertEq(holdReason, "announce_failed", "hold reason becomes announce_failed after cleanup")
+applied, appliedReason = tryApply(failedRun, inactiveSession)
+assertTrue(applied, "deferred consequences apply locally after failed start")
+assertEq(appliedReason, "announce_failed", "failed start applies with announce_failed")
+assertTrue(failedRun.consequencesSkipBroadcast, "failed start uses local-only skipBroadcast")
+assertTrue(not failedRun.consequencesEligible, "failed start is not session-sync eligible")
+applied, appliedReason = tryApply(failedRun, inactiveSession)
+assertTrue(not applied, "failed-start cleanup cannot apply consequences twice")
+assertEq(appliedReason, "already_applied", "duplicate fail callback is idempotent")
+
+didReset, failOutcome = Sync:FailUnannouncedSessionStart("SES-FAIL")
+assertTrue(not didReset, "duplicate failed-start cleanup does not reset again")
+assertEq(failOutcome, "already_failed", "second fail callback is already_failed")
+assertEq(resetCount, 1, "duplicate fail does not reset session state twice")
+assertEq(#sentMessages, 0, "duplicate fail still does not broadcast SES_END")
+
+assertTrue(not Sync.ApplySesStartSendResult(failedState, "SES-FAIL", true), "late success cannot resurrect a terminally failed session")
+assertEq(failedState.active, false, "late success leaves the reset session inactive")
+assertTrue(failedState._sessionAnnounced ~= "SES-FAIL", "late success does not mark the failed session announced")
+local resurrectState = {
+    active = true,
+    sessionId = "SES-FAIL",
+    profileId = "p1",
+    _sessionStartFailedFor = "SES-FAIL",
+}
+assertTrue(not Sync.ApplySesStartSendResult(resurrectState, "SES-FAIL", true), "late success cannot revive a failed session id even if active flags are present")
+assertEq(resurrectState._sessionAnnounced, nil, "failed session id cannot be marked announced after terminal failure")
+
+-- Subsequent Raid Check after failed-start cleanup sees no active session and prompts again.
+assertEq(failedState.active, false, "IsSessionActive equivalent is false after failed start")
+local laterPreflight = CheckRun.DecidePreflight({
+    hasProfile = true,
+    isAdmin = true,
+    sessionActive = failedState.active and true or false,
+})
+assertEq(laterPreflight.action, "prompt", "later Raid Check shows Yes/No/Cancel preflight again")
+
+-- Race: NoteSessionStartFailed is idempotent.
+assertTrue(not CheckRun.NoteSessionStartFailed(failedRun), "session-start failure flag is set only once")
+
+Sync._ResetSessionState = originalReset
+SF.RaidCheck = nil
+SF.LootHelperComm = nil
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

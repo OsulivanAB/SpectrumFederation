@@ -1067,10 +1067,25 @@ function LootProfile:GetRaidCheckEquipmentSnapshotIds()
 	return ids
 end
 
-function LootProfile:SetRaidCheckEquipmentSnapshot()
-	-- Equipment observations are runtime-only. Previously stored snapshots stay
-	-- intact for mixed-version import/export and are not used for behavior.
-	return false
+function LootProfile:SetRaidCheckEquipmentSnapshot(memberId, snapshot)
+	self:_EnsureRaidCheckEquipmentSnapshots()
+	if type(memberId) ~= "string" or memberId == "" or type(snapshot) ~= "table" then
+		return false
+	end
+
+	memberId = NormalizeMemberId(memberId)
+	if not self:GetMemberByID(memberId) then
+		return false
+	end
+
+	local snapshotCopy = CopyRaidCheckEquipmentSnapshot(snapshot)
+	if not snapshotCopy then
+		return false
+	end
+
+	snapshotCopy.preparedSlotsByConfig = {}
+	self._raidCheckEquipmentSnapshots[memberId] = snapshotCopy
+	return true
 end
 
 -- Function check if a Raid Check slot is enabled
