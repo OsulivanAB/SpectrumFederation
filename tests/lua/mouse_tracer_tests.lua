@@ -169,15 +169,16 @@ e = newEngine()
 e:SetConfig(C.DEFAULT_TRAIL_LENGTH, C.DEFAULT_FADE_DURATION, C.DEFAULT_RAINBOW_SPEED, 14)
 assertAlmost(e.minSpacing, 1.4, 1e-9, "default engine spacing follows thickness")
 e:ProcessSample(1.0, 0, 0, false)
-e:ProcessSample(1.2, 7, 0, false)
-assertEq(e.count, 6, "7px move at 1.4px spacing stores start + 5 points")
-assertEq(e.activeSegCount, 5, "7px move creates 5 segments")
+e:ProcessSample(1.2, 8, 0, false)
+local expectedN = math.min(C.MAX_NEW_POINTS_PER_TICK, math.max(1, math.floor(8 / e.minSpacing)))
+assertEq(e.count, expectedN + 1, "8px move stores the start point plus interpolated stamps")
+assertEq(e.activeSegCount, expectedN, "8px move creates one segment per new stamp")
 local x1 = select(1, e:GetPoint(1))
 local x2 = select(1, e:GetPoint(2))
 local xLast = select(1, e:GetPoint(e.count))
 assertAlmost(x1, 0, 1e-6, "start point is the previous accepted position")
-assertAlmost(x2, 1.4, 1e-6, "first interpolated point uses thickness spacing")
-assertAlmost(xLast, 7, 1e-6, "final interpolated point is the cursor")
+assertAlmost(x2, 8 / expectedN, 1e-6, "first interpolated point uses even catch-up spacing")
+assertAlmost(xLast, 8, 1e-6, "final interpolated point is the cursor")
 
 -- Long movement reaches the cursor in one tick without visual gaps
 e = newEngine()
@@ -365,6 +366,7 @@ local function assertRingSynchronized(engine, label)
     assertTrue(prevX ~= nil and prevY ~= nil, label .. ": live points exist")
 
     local pairSeen = {}
+    local staleInactive = 0
     for i = 1, C.MAX_SEGMENTS do
         if engine.segActive[i] then
             local i0 = engine.segI0[i]
@@ -378,16 +380,12 @@ local function assertRingSynchronized(engine, label)
             local dy = engine.py[i1] - engine.py[i0]
             assertTrue((dx * dx + dy * dy) > 0, label .. ": active segment has non-zero length")
             assertTrue(engine.segBorn[i] ~= 0, label .. ": active segment has a birth time")
-        else
-            assertEq(engine.segI0[i], 0, label .. ": inactive segment does not keep a stale i0")
-            assertEq(engine.segI1[i], 0, label .. ": inactive segment does not keep a stale i1")
-            assertEq(engine.segBorn[i], 0, label .. ": inactive segment does not keep a stale birth time")
-            assertEq(engine.segDist[i], 0, label .. ": inactive segment does not keep a stale distance")
-            assertEq(engine.segR[i], 0, label .. ": inactive segment does not keep stale red")
-            assertEq(engine.segG[i], 0, label .. ": inactive segment does not keep stale green")
-            assertEq(engine.segB[i], 0, label .. ": inactive segment does not keep stale blue")
+        elseif engine.segI0[i] ~= 0 or engine.segI1[i] ~= 0 or engine.segBorn[i] ~= 0
+            or engine.segDist[i] ~= 0 or engine.segR[i] ~= 0 or engine.segG[i] ~= 0 or engine.segB[i] ~= 0 then
+            staleInactive = staleInactive + 1
         end
     end
+    assertEq(staleInactive, 0, label .. ": inactive segments keep no stale fields")
 end
 
 -- Ring wrap + neighbor synchronization
