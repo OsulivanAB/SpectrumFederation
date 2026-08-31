@@ -274,6 +274,63 @@ def test_fallback_keeps_unrelated_features_separate():
     assert len(entries) == 2
 
 
+def test_fallback_drops_catalog_notes_when_net_features_are_empty():
+    context = {
+        "mode": "promote",
+        "features": [],
+        "user_facing_files": [],
+        "beta_sections": [
+            {
+                "text": """### Added
+- Added Cursed Surge Tracker child addon
+"""
+            }
+        ],
+        "pull_requests": [],
+        "commits": [],
+    }
+    assert changelog.fallback_entries(context) == []
+
+
+def test_fallback_drops_reverted_catalog_notes_when_only_uncataloged_files_remain():
+    context = {
+        "mode": "promote",
+        "features": [],
+        "user_facing_files": ["SpectrumFederation/modules/core.lua"],
+        "beta_sections": [
+            {
+                "text": """### Added
+- Added Cursed Surge Tracker child addon
+- Tweaked core login initialization
+"""
+            }
+        ],
+        "pull_requests": [],
+        "commits": [],
+    }
+    entries = changelog.fallback_entries(context)
+    texts = [entry["text"] for entry in entries]
+    assert all("Cursed Surge Tracker" not in text for text in texts)
+    assert any("core login" in text.lower() for text in texts)
+
+
+def test_promote_skip_still_strips_beta_sections(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    context = {
+        "mode": "promote",
+        "version": "1.3.0",
+        "changelog_text": SAMPLE_CHANGELOG,
+    }
+    cleaned, removed = changelog.strip_promoted_beta_sections(context)
+    assert removed
+    assert "1.3.0-beta" not in cleaned
+    assert "## [1.2.0]" in cleaned
+    assert "## [1.1.0]" in cleaned
+    assert context["changelog_text"] == cleaned
+
+
 def test_choose_entries_skips_internal_only_and_existing_sections():
     existing_context = {
         "version": "1.3.0-beta.2",

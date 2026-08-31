@@ -796,7 +796,9 @@ def fallback_entries(context):
 
         user_features = set(context.get("features", []))
         for feature, items in grouped.items():
-            if feature != "other" and user_features and feature not in user_features:
+            if feature != "other" and feature not in user_features:
+                continue
+            if feature == "other" and not context.get("user_facing_files") and not user_features:
                 continue
             if feature != "other" and len(items) > 1:
                 added = [text for category, text in items if category == "Added"]
@@ -1127,8 +1129,7 @@ def choose_entries(context, token):
     if context.get("existing_section") and not is_placeholder_text(context["existing_section"].get("text", "")):
         print(f"[changelog] Section for {context['version']} already exists; leaving it unchanged")
         return None
-    has_promote_notes = context.get("mode") == "promote" and context.get("beta_sections")
-    if not context.get("user_facing_files") and not has_promote_notes:
+    if not context.get("user_facing_files"):
         print("[changelog] No user-facing addon changes in range; not writing an entry")
         return None
 
@@ -1148,18 +1149,25 @@ def choose_entries(context, token):
     return None
 
 
+def strip_promoted_beta_sections(context):
+    """Remove beta sections from a main changelog, even when no new entry is written."""
+    if context.get("mode") != "promote":
+        return context.get("changelog_text", ""), []
+    cleaned, removed = strip_beta_sections(
+        context.get("changelog_text", ""),
+        keep_other_trains=False,
+        current_version=context.get("version"),
+    )
+    for heading in removed:
+        print(f"[changelog] Removed beta section: {heading}")
+    context["changelog_text"] = cleaned
+    return cleaned, removed
+
+
 def apply_changelog(context, entries, date_text):
     """Write the current version section and preserve historical sections."""
     version = context["version"]
-    changelog_text = context["changelog_text"]
-    if context["mode"] == "promote":
-        changelog_text, removed = strip_beta_sections(
-            changelog_text,
-            keep_other_trains=False,
-            current_version=version,
-        )
-        for heading in removed:
-            print(f"[changelog] Removed beta section: {heading}")
+    changelog_text, _removed = strip_promoted_beta_sections(context)
 
     rendered = render_section(version, date_text, entries)
     updated, changed = replace_or_insert_section(
@@ -1239,9 +1247,14 @@ def main(argv=None):
             if entries:
                 print(render_section(version, date_text, entries))
             return 0
-        if not entries:
+        if entries:
+            apply_changelog(context, entries, date_text)
             return 0
-        apply_changelog(context, entries, date_text)
+        if context["mode"] == "promote":
+            cleaned, removed = strip_promoted_beta_sections(context)
+            if removed:
+                CHANGELOG_PATH.write_text(cleaned, encoding="utf-8")
+                print("[changelog] Removed leftover beta sections without writing a new stable entry")
         return 0
     except ChangelogError as error:
         print(f"::error ::{error}")
