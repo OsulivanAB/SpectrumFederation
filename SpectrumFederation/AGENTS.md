@@ -73,3 +73,4 @@ When you need a new toggle/option:
 - Verify the new setting appears (when applicable) and toggling it changes behavior as intended.
 - Settings navigation changes: `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer engine or constants changes: `python -m pytest tests/test_mouse_tracer.py`
+- Raid Equipment policy, CheckRun, or Raid Check lifecycle changes: `python -m pytest tests/test_raid_equipment.py`

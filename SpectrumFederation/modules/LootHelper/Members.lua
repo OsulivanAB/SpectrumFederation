@@ -62,8 +62,8 @@ end
 
 local SYNC_REBUILD_NOTE = "state will be reconciled from logs via sync rebuild"
 
-local function CanCurrentUserEditActiveProfile()
-    local activeProfile = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+local function CanCurrentUserEditActiveProfile(profile)
+    local activeProfile = profile or (SF.lootHelperDB and SF.lootHelperDB.activeProfile)
     if not activeProfile then
         if SF.Debug then
             SF.Debug:Warn("MEMBER", "No active profile is available for member mutation")
@@ -88,10 +88,14 @@ local function CanCurrentUserEditActiveProfile()
     return true
 end
 
-local function AddLootLogToActiveProfile(logEntry)
-    local activeProfile = SF.lootHelperDB and SF.lootHelperDB.activeProfile
-    if activeProfile and type(activeProfile.AddLootLog) == "function" then
-        activeProfile:AddLootLog(logEntry)
+local function AddLootLogToActiveProfile(logEntry, opts)
+    local profile = opts and opts.profile or (SF.lootHelperDB and SF.lootHelperDB.activeProfile)
+    if profile and type(profile.AddLootLog) == "function" then
+        local addOpts = nil
+        if opts and opts.skipBroadcast then
+            addOpts = { skipBroadcast = true }
+        end
+        profile:AddLootLog(logEntry, addOpts)
         return true
     end
 
@@ -347,7 +351,7 @@ end
 -- Function to increment point balance by 1
 -- @return (boolean) - True if successful, false otherwise
 function Member:IncrementPoints(opts)
-    if not CanCurrentUserEditActiveProfile() then
+    if not CanCurrentUserEditActiveProfile(opts and opts.profile) then
         return false
     end
     
@@ -390,7 +394,7 @@ function Member:IncrementPoints(opts)
     end
 
     -- Add Log Entry to Loot Profile Table
-    AddLootLogToActiveProfile(logEntry)
+    AddLootLogToActiveProfile(logEntry, opts)
     
     if SF.Debug then
         SF.Debug:Verbose("MEMBER", "%s points incremented: %s -> %s", self:GetFullIdentifier(), tostring(oldBalance), tostring(self.pointBalance))
@@ -475,7 +479,7 @@ end
 -- @param opts table|nil Optional amount, reason, and log author
 -- @return (boolean) - True if successful, false otherwise
 function Member:IncrementAttendance(opts)
-    if not CanCurrentUserEditActiveProfile() then
+    if not CanCurrentUserEditActiveProfile(opts and opts.profile) then
         return false
     end
 
@@ -512,7 +516,7 @@ function Member:IncrementAttendance(opts)
     local oldBalance = tonumber(self.attendanceBalance) or 0
     self.attendanceBalance = oldBalance + amount
 
-    AddLootLogToActiveProfile(logEntry)
+    AddLootLogToActiveProfile(logEntry, opts)
 
     if SF.Debug then
         SF.Debug:Verbose("MEMBER", "%s attendance incremented: %s -> %s", self:GetFullIdentifier(), tostring(oldBalance), tostring(self.attendanceBalance))

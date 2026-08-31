@@ -14,9 +14,9 @@ Attendance is not shown in this mode. If the profile later uses Reward Pot, Atte
 
 **Pre-Raid Check** reports missing requirements. It does not change loot points.
 
-**Raid Check** inspects only profile members who are currently in the raid. Prepared members receive the profile's **Points Per Raid Check** award (`0`, `0.5`, or `1`). A member with no usable inspect data counts as unprepared and does not receive points.
+**Raid Check** inspects only profile members who are currently in the raid. Prepared members receive the profile's **Points Per Raid Check** award (`0`, `0.5`, or `1`). Inspection Failed does not receive points and does not count as Unprepared. Never-inspectable players are Unprepared.
 
-Configure the award and gear requirements under **Loot Helper → Profile**. Only profile admins can change those settings or run a check.
+Configure the award and whispers under **Loot Helper → Session**. Equipment rules are addon-owned. Only profile admins can change those settings or run a check.
 
 ## Equipment history
 

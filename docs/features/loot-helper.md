@@ -57,7 +57,7 @@ Select the equipment button on a member row to open the equipment window. It tra
 
 This is profile history, not a live inspection of equipped items. Admins toggle a category when the member uses or regains that loot opportunity. Toggling creates an equipment-history log entry and does not change loot points or Attendance.
 
-The separate [Raid Check](raid-check.md) equipment page inspects current gear for enchants and gems.
+The separate [Raid Check](raid-check.md) **Raid Equipment** page inspects current gear for enchants and gems.
 
 ## Profiles
 
@@ -70,7 +70,7 @@ A profile includes:
 - a loot mode, customizable point name, loot-point balances, and Attendance balances;
 - Reward Pot starting amount and deduction settings;
 - equipment-category state;
-- Raid Check requirements and saved equipment snapshots;
+- Raid Check whisper/award settings and inert legacy equipment snapshots;
 - raid-wide safe-mode preferences;
 - append-only change logs.
 

@@ -277,6 +277,23 @@ function Sync:GetSessionProfileId()
     return self:IsSessionActive() and self.state.profileId or nil
 end
 
+-- Function Returns whether the current session has successfully announced SES_START.
+-- Successful local StartSession() is not sufficient; the CONTROL send must have been accepted.
+-- @param sessionId string|nil When provided, also require this session id.
+-- @return boolean
+function Sync:HasAnnouncedCurrentSession(sessionId)
+    if not (self.state and self.state.active) then
+        return false
+    end
+    if type(self.state.sessionId) ~= "string" or self.state.sessionId == "" then
+        return false
+    end
+    if sessionId ~= nil and sessionId ~= self.state.sessionId then
+        return false
+    end
+    return self.state._sessionAnnounced == self.state.sessionId
+end
+
 -- Function Returns current coordinator "Name-Realm" (or nil).
 -- @param none
 -- @return string|nil Current coordinator.

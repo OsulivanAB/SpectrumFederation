@@ -44,12 +44,12 @@ Runtime safe mode pauses profile and log transfers, but the visible local and ra
 
 WoW throttles inspection and requires other players to be nearby and inspectable.
 
-- Open **Loot Helper → Equipment** and select **Refresh Snapshot**.
+- Open **Raid Equipment** and select **Refresh Snapshot**.
 - Move closer to unresolved players.
 - Wait for item links and inspection data to populate.
 - Rerun the check after pending statuses resolve.
 
-Raid Check treats incomplete item data as unprepared. Move closer, refresh the snapshot, then rerun the check.
+Incomplete inspects are **Inspection Failed**, not Unprepared. Move closer, refresh the snapshot, then rerun the check.
 
 ## `/sf version` shows a red X for someone who has the addon
 

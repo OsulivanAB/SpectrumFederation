@@ -16,11 +16,11 @@ Restart World of Warcraft or run `/reload`, then enable the addon for the charac
 Enter `/sf` to toggle the addon's standalone settings window. The left sidebar lists categories grouped into:
 
 - **Core** — appearance and Gameplay, including the optional Mouse Tracer on **UI Enhancements**.
-- **Loot Tools** — Loot Helper configuration, profiles, sessions, equipment auditing, and logs.
+- **Loot Tools** — Loot Helper configuration, profiles, sessions, Raid Equipment, and logs.
 - **Advanced** — diagnostic logging.
 - **Optional** — installed child addons, such as Cursed Surge Tracker when it is present.
 
-Loot Helper's General, Profile, Session, Equipment, and Admin pages are **tabs** on the Loot Helper category, not extra sidebar rows. Paths such as **Loot Helper → Profile** mean: select Loot Helper, then the Profile tab.
+Loot Helper's General, Profile, Session, and Admin pages are **tabs** on the Loot Helper category, not extra sidebar rows. Paths such as **Loot Helper → Profile** mean: select Loot Helper, then the Profile tab. **Raid Equipment** is its own sidebar category.
 
 The Loot Helper window appears automatically when all of these conditions are true:
 
@@ -38,7 +38,7 @@ You can also enter `/sf loot` to enable Loot Helper and ask it to show the windo
 
 The new profile becomes active immediately. Its creator is added as the owner, first member, and first admin.
 
-Profiles hold their own roster, loot mode, point name, Attendance, Reward Pot, admin list, Raid Check configuration, safe-mode options, equipment snapshots, and change history. Switching profiles changes the data shown by Loot Helper and Loot Logs.
+Profiles hold their own roster, loot mode, point name, Attendance, Reward Pot, admin list, Raid Check whisper/award settings, safe-mode options, and change history. Switching profiles changes the data shown by Loot Helper and Loot Logs.
 
 ## Add and manage members
 
@@ -67,12 +67,12 @@ The coordinator compares profile history with other online admins, then announce
 
 ## Run a Raid Check
 
-Profile admins can configure requirements under **Loot Helper → Profile**, then run:
+Profile admins run checks from **Loot Helper → Session**:
 
 - **Pre-Raid Check** to report preparation problems without awarding points, Attendance, or pot changes.
 - **Raid Check** to report problems and award loot points in Point Based mode, or Attendance and a possible pot deduction in Reward Pot mode.
 
-See [Raid Check](features/raid-check.md) before enabling automatic whispers or awards.
+If no session is active, the addon asks whether to start one. See [Raid Check](features/raid-check.md) before enabling automatic whispers or awards.
 
 ## Useful commands
 

@@ -6,7 +6,7 @@ Loot Helper is split into domain models, synchronization, UI, and Raid Check. Th
 
 ### LootProfile
 
-`modules/LootHelper/Profiles.lua` owns profile identity, metadata, members, admins, logs, per-author counters, Raid Check configuration/snapshots, serialization, and mutation permissions.
+`modules/LootHelper/Profiles.lua` owns profile identity, metadata, members, admins, logs, per-author counters, Raid Check consequence configuration, inert legacy equipment snapshots, serialization, and mutation permissions.
 
 Profile IDs are stable across renames. The creator becomes author, owner, first admin, and first member. Admin and member identifiers are normalized `Name-Realm` strings.
 
@@ -115,12 +115,19 @@ When adding a new message type, update constants, routing, validation, handler r
 
 ## Raid Check integration
 
-`modules/RaidCheck.lua` maintains an inspect queue and cache because WoW inspection and item links are asynchronous. It creates user-readable states for loading, out-of-range, stale, and saved snapshots.
+`modules/RaidEquipment/Policy.lua` owns current-Retail completeness and Prepared/Unprepared rules. `modules/RaidEquipment/CheckRun.lua` owns frozen run identity, pause clocks, scaled inspect bounds, inspect-generation tokens, classification, session preflight, and the session-announce gate for consequences. `modules/RaidCheck.lua` owns the shared serial `NotifyInspect` queue, runtime last-good observations, the standalone audit snapshot, and Pre-Raid / Raid Check entry.
 
-Pre-Raid Check only evaluates/report results. Raid Check additionally creates point-change logs for prepared profile members. The admin who runs either check always receives a system-message summary of missing players. Whisper timestamps are stored on members to suppress repeated missing-result messages on the same day.
+Acquisition, policy, and consequences are separate:
 
-The settings Equipment page consumes versioned troubleshooting snapshots through listener callbacks. Avoid rebuilding it from raw WoW APIs independently; use `GetTroubleshootingSnapshot` or `GetTroubleshootingSlotsForUnit`.
+- Acquisition is local to the initiating client. There is no peer-assisted scan and no equipment addon-message protocol.
+- Only complete trustworthy observations enter runtime last-good storage. `/reload` blanks them. Legacy `_raidCheckEquipmentSnapshots` remain inert: they are not written, not consumed, and not wiped.
+- Combat and Blizzard Inspect are paused states. Paused time does not consume active acquisition bounds.
+- Target membership is `profile membership ∩ current group` at run start. Roster updates only re-resolve frozen members.
+- Local `StartSession()` may begin inspecting immediately. Session-backed consequences wait until the local CONTROL/ALERT `SES_START` send is accepted (`HasAnnouncedCurrentSession`). A failed send leaves the session unannounced.
+- Mismatched or unannounced sessions apply frozen-profile consequences locally (`skipBroadcast`) and do not send logs through an unrelated session.
+
+The standalone **Raid Equipment** settings page consumes versioned troubleshooting snapshots through listener callbacks. Avoid rebuilding it from raw WoW APIs independently; use `GetTroubleshootingSnapshot` or `GetTroubleshootingSlotsForUnit`. The page does not require a Loot Helper profile or session. Auto Refresh remains `lootHelper.raidCheckAuditAutoRefresh`.
 
 ## Testing changes
 
-For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover partial item data, range changes, profile/non-profile members, whisper suppression, zero/fractional awards, and admin system-message output independent of whisper settings. Item-link parsing used by enchant/gem checks is covered by `python -m pytest tests/test_raid_check_item_links.py`. Minimize/expand anchoring for the roster window is covered by `python -m pytest tests/test_loot_helper_window.py`.
+For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover session preflight, announce vs consequence apply, frozen joiners/leavers, combat pause, range-only recent-good, Inspection Failed, and incomplete item data. Production-Lua policy and CheckRun coverage is `python -m pytest tests/test_raid_equipment.py`. Item-link parsing remains `python -m pytest tests/test_raid_check_item_links.py`. Settings navigation for the standalone Raid Equipment category is `python -m pytest tests/test_settings_navigation.py`. Minimize/expand anchoring for the roster window is covered by `python -m pytest tests/test_loot_helper_window.py`.

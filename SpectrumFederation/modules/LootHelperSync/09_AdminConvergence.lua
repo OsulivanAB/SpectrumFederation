@@ -2,6 +2,23 @@ local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+-- Record whether the local CONTROL/ALERT SES_START send was accepted.
+-- This is a local send-acceptance boundary, not proof that every peer received it.
+-- @param state table Sync state
+-- @param sessionId string
+-- @param sendOk boolean
+-- @return boolean true when the session is now marked announced
+function Sync.ApplySesStartSendResult(state, sessionId, sendOk)
+    if type(state) ~= "table" or type(sessionId) ~= "string" or sessionId == "" then
+        return false
+    end
+    if not sendOk then
+        return false
+    end
+    state._sessionAnnounced = sessionId
+    return true
+end
+
 -- ============================================================================
 -- Coordinator responsibilities (Sequence 1 and 2)
 -- ============================================================================
@@ -462,12 +479,20 @@ function Sync:BroadcastSessionStart()
         helpersReady = {},  -- Track which helpers have received SES_START
     }
 
-    if SF.LootHelperComm then
-        SF.LootHelperComm:Send("CONTROL", self.MSG.SES_START, payload, dist, nil, "ALERT")
+    local sendOk = false
+    if SF.LootHelperComm and SF.LootHelperComm.Send then
+        sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_START, payload, dist, nil, "ALERT") and true or false
     end
 
-    -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
-    self.state._sessionAnnounced = self.state.sessionId
+    -- Only mark announced when the local comm layer accepted the SES_START send.
+    -- A failed send must not look ready for session-backed consequence broadcasts.
+    if not Sync.ApplySesStartSendResult(self.state, self.state.sessionId, sendOk) then
+        if SF.Debug then
+            SF.Debug:Error("SYNC", "SES_START send was not accepted (sessionId=%s); leaving session unannounced",
+                tostring(self.state.sessionId))
+        end
+        return
+    end
     self:_MarkRosterAnnounced(self.state.sessionId)
 
     -- Start coordinator heartbeat sender (ticker)

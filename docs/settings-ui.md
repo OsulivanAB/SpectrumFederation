@@ -10,7 +10,7 @@ Installed optional child addons appear under **Optional**. If the add-on is enab
 
 `Enable LootHelper` on the Loot Helper General tab only shows or hides the roster window. It does not grey the Loot Helper category.
 
-The window can be resized from the bottom-right grip. Wide pages such as Equipment and Loot Logs raise the minimum size when needed, but leaving those pages does not shrink the window.
+The window can be resized from the bottom-right grip. Wide pages such as Raid Equipment and Loot Logs raise the minimum size when needed, but leaving those pages does not shrink the window.
 
 ## General
 
@@ -65,8 +65,9 @@ This page selects and manages the active profile. It includes:
 - profile creation, selection, rename, reset, and deletion;
 - profile owner and point-name display;
 - owner-only loot mode: Point Based or Reward Pot;
-- Reward Pot starting amount, Raid Check deduction, and gold add/subtract controls when Reward Pot is active;
-- Raid Check point, gem, meta-gem, and enchant requirements.
+- Reward Pot starting amount, Raid Check deduction, and gold add/subtract controls when Reward Pot is active.
+
+Equipment enchant and gem rules are not profile-configurable; they live on **Raid Equipment**.
 
 Rename and profile-specific configuration are admin-only. Only the profile owner can change loot mode. Creating a profile makes the creator its owner and first admin.
 
@@ -78,8 +79,9 @@ This page includes:
 
 - start/end session control;
 - saved raid-wide safe-mode preferences for all-the-time or combat use;
-- Pre-Raid Check and Raid Check actions;
-- admin system-message summaries of missing players, independent of whisper settings;
+- Points Per Raid Check in Point Based mode;
+- Pre-Raid Check and Raid Check actions, including the session start prompt;
+- admin system-message summaries of missing players and Inspection Failed, independent of whisper settings;
 - optional whispers for missing and prepared players;
 - editable whisper templates.
 
@@ -87,9 +89,9 @@ The two raid-wide safe-mode preferences are not currently connected to the runti
 
 The visible **Trigger Raid-Wide Sync** control is currently a placeholder. It does not initiate a sync; use `/sf loot sync` on the client that needs to catch up.
 
-## Loot Helper: Equipment
+## Raid Equipment
 
-The Equipment page displays the current Raid Check inspection snapshot. Auto refresh is off by default; enable it or select **Refresh Snapshot** when you need current data.
+**Raid Equipment** is a top-level Loot Tools category. It does not require a Loot Helper profile or session. Auto refresh is off by default and remains stored as `lootHelper.raidCheckAuditAutoRefresh`; enable it or select **Refresh Snapshot** when you need current data.
 
 See [Raid Check](features/raid-check.md) for interpretation and inspection limitations.
 
