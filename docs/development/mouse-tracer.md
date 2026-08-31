@@ -8,7 +8,7 @@ Mouse Tracer is an optional per-character cursor trail. User-facing control desc
 | --- | --- |
 | `modules/MouseTracer/Constants.lua` | Spacing, cadence, pool bounds, slider ranges, and setting keys. |
 | `modules/MouseTracer/TrailEngine.lua` | Pure sampling, interpolation, ring buffer, fade/trim, and HSV color. No frames. |
-| `modules/MouseTracer/MouseTracer.lua` | Host frame, line pool, cached settings, snapshot debounce, copy helpers, and event resets. |
+| `modules/MouseTracer/MouseTracer.lua` | Host frame, circular stamp pool, cached settings, snapshot debounce, copy helpers, and event resets. |
 | `modules/UI/Settings/Pages/NicheFeatures.lua` | Gameplay category plus the UI Enhancements page. |
 | `modules/Settings/Schema.lua` | `CHARACTER_DEFAULTS.mouseTracer` and account-wide `mouseTracerCopies`. |
 
@@ -47,7 +47,7 @@ No geometry generation. Bounded 30 Hz fade processing. No allocations. Return to
 
 ### Resources
 
-`MAX_POINTS = 69` and `MAX_SEGMENTS = 68` (`ceil(400 / 6) + 2` and one less). The line pool is fixed at those sizes and must not grow at runtime.
+`MAX_POINTS = 69` and `MAX_SEGMENTS = 68` (`ceil(400 / 6) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures (`TempPortraitAlphaMask`) and must not grow at runtime. Do not return to square `CreateLine` quads.
 
 Cadence constants:
 

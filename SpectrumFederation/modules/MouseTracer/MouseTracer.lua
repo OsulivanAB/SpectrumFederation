@@ -20,8 +20,8 @@ local cache = {
 
 local engine
 local host
-local lines
-local lineLastAlpha
+local stamps
+local stampLastAlpha
 local poolReady = false
 local applySuspended = false
 local sampleElapsed = 0
@@ -141,76 +141,86 @@ function Tracer:ScheduleSnapshot()
 	end)
 end
 
-local function HideLine(id)
-	local line = lines and lines[id]
-	if line then
-		line:Hide()
+local function HideStamp(idx)
+	local stamp = stamps and stamps[idx]
+	if stamp then
+		stamp:Hide()
 	end
-	if lineLastAlpha then
-		lineLastAlpha[id] = 0
+	if stampLastAlpha then
+		stampLastAlpha[idx] = 0
 	end
+end
+
+local function PlaceStamp(idx)
+	if not host or not stamps or not idx then
+		return
+	end
+	local stamp = stamps[idx]
+	if not stamp then
+		return
+	end
+	local r, g, b = Engine.HSVToRGB(engine.pdist[idx] * C.HUE_PER_PIXEL * cache.rainbowSpeed, 1, 1)
+	stamp:SetPoint("CENTER", host, "BOTTOMLEFT", engine.px[idx], engine.py[idx])
+	stamp:SetSize(cache.thickness, cache.thickness)
+	if stamp.SetVertexColor then
+		stamp:SetVertexColor(r, g, b, 1)
+	end
+	stamp:SetAlpha(cache.opacity)
+	stamp:Show()
+	stampLastAlpha[idx] = cache.opacity
 end
 
 local function ApplyReleased()
-	for i = 1, engine.releasedCount do
-		HideLine(engine.releasedSegs[i])
+	for i = 1, engine.releasedPointCount do
+		local idx = engine.releasedPoints[i]
+		if not engine:IsLiveIndex(idx) then
+			HideStamp(idx)
+		end
 	end
 	engine.releasedCount = 0
+	engine.releasedPointCount = 0
 end
 
-local function ApplyNewSegments()
-	if not host or not lines then
+local function ApplyNewStamps()
+	if not host or not stamps then
 		return
 	end
 	for i = 1, engine.newSegCount do
 		local id = engine.newSegs[i]
-		local line = lines[id]
-		if line then
-			local i0 = engine.segI0[id]
-			local i1 = engine.segI1[id]
-			line:SetStartPoint("BOTTOMLEFT", host, engine.px[i0], engine.py[i0])
-			line:SetEndPoint("BOTTOMLEFT", host, engine.px[i1], engine.py[i1])
-			if line.SetThickness then
-				line:SetThickness(cache.thickness)
-			end
-			if line.SetColorTexture then
-				line:SetColorTexture(engine.segR[id], engine.segG[id], engine.segB[id], 1)
-			end
-			line:SetAlpha(cache.opacity)
-			line:Show()
-			lineLastAlpha[id] = cache.opacity
-		end
+		PlaceStamp(engine.segI0[id])
+		PlaceStamp(engine.segI1[id])
 	end
 	engine.newSegCount = 0
 end
 
 local function UpdateAlphas(now)
-	if not lines then
+	if not stamps then
 		return
 	end
 	local fadeDuration = cache.fadeDuration
 	local opacity = cache.opacity
 	local epsilon = C.ALPHA_EPSILON
-	for id = 1, C.MAX_SEGMENTS do
-		if engine.segActive[id] then
-			local alpha = opacity * Engine.FadeFactor(now - engine.segBorn[id], fadeDuration)
-			local line = lines[id]
+	for chrono = 1, engine.count do
+		local idx = engine:ChronoIndex(chrono)
+		if idx then
+			local alpha = opacity * Engine.FadeFactor(now - engine.pt[idx], fadeDuration)
+			local stamp = stamps[idx]
 			if alpha <= 0 then
-				HideLine(id)
-			elseif line and math.abs(alpha - (lineLastAlpha[id] or 0)) > epsilon then
-				line:SetAlpha(alpha)
-				lineLastAlpha[id] = alpha
+				HideStamp(idx)
+			elseif stamp and math.abs(alpha - (stampLastAlpha[idx] or 0)) > epsilon then
+				stamp:SetAlpha(alpha)
+				stampLastAlpha[idx] = alpha
 			end
 		end
 	end
 end
 
-local function HideAllLines()
-	if not lines then
+local function HideAllStamps()
+	if not stamps then
 		return
 	end
-	for id = 1, C.MAX_SEGMENTS do
-		HideLine(id)
+	for idx = 1, C.MAX_POINTS do
+		HideStamp(idx)
 	end
 end
 
@@ -257,19 +267,23 @@ local function EnsurePool()
 	end
 	host:Hide()
 
-	lines = {}
-	lineLastAlpha = {}
-	for id = 1, C.MAX_SEGMENTS do
-		local line = host:CreateLine(nil, "ARTWORK")
-		if line.SetBlendMode then
-			pcall(line.SetBlendMode, line, "ADD")
+	stamps = {}
+	stampLastAlpha = {}
+	for idx = 1, C.MAX_POINTS do
+		local stamp = host:CreateTexture(nil, "ARTWORK")
+		if stamp.SetTexture then
+			stamp:SetTexture(C.CIRCLE_TEXTURE)
 		end
-		if line.SetThickness then
-			line:SetThickness(cache.thickness)
+		if stamp.SetMask then
+			pcall(stamp.SetMask, stamp, C.CIRCLE_TEXTURE)
 		end
-		line:Hide()
-		lines[id] = line
-		lineLastAlpha[id] = 0
+		if stamp.SetBlendMode then
+			pcall(stamp.SetBlendMode, stamp, "ADD")
+		end
+		stamp:SetSize(cache.thickness, cache.thickness)
+		stamp:Hide()
+		stamps[idx] = stamp
+		stampLastAlpha[idx] = 0
 	end
 
 	RecacheScale()
@@ -281,7 +295,7 @@ local function StopRuntime()
 		host:SetScript("OnUpdate", nil)
 		host:Hide()
 	end
-	HideAllLines()
+	HideAllStamps()
 	if engine then
 		engine:Reset()
 		engine:SetConfig(cache.trailLength, cache.fadeDuration, cache.rainbowSpeed)
@@ -297,7 +311,7 @@ end
 local function DoSample(rawX, rawY, looking)
 	engine:ProcessSample(Now(), rawX, rawY, looking)
 	ApplyReleased()
-	ApplyNewSegments()
+	ApplyNewStamps()
 end
 
 local function DoFade()
@@ -318,7 +332,7 @@ local function OnUpdate(_, dt)
 	sampleElapsed = sampleElapsed + dt
 	fadeElapsed = fadeElapsed + dt
 
-	local hasTrail = engine.activeSegCount > 0
+	local hasTrail = engine.count > 0
 	local sampleDue = sampleElapsed >= (hasTrail and C.ACTIVE_SAMPLE_INTERVAL or C.IDLE_POLL_INTERVAL)
 	if sampleDue then
 		sampleElapsed = 0
@@ -377,22 +391,14 @@ local function SyncEngineConfig()
 	end
 end
 
-local function ReconfigureActiveSegments()
-	if not poolReady or not engine or not lines then
+local function ReconfigureActiveStamps()
+	if not poolReady or not engine or not stamps then
 		return
 	end
-	engine:RecolorActive()
-	for id = 1, C.MAX_SEGMENTS do
-		if engine.segActive[id] then
-			local line = lines[id]
-			if line then
-				if line.SetThickness then
-					line:SetThickness(cache.thickness)
-				end
-				if line.SetColorTexture then
-					line:SetColorTexture(engine.segR[id], engine.segG[id], engine.segB[id], 1)
-				end
-			end
+	for chrono = 1, engine.count do
+		local idx = engine:ChronoIndex(chrono)
+		if idx then
+			PlaceStamp(idx)
 		end
 	end
 	UpdateAlphas(Now())
@@ -428,13 +434,13 @@ local function OnSettingChanged(key, newValue)
 	if key == "trailLength" or key == "fadeDuration" or key == "rainbowSpeed" then
 		SyncEngineConfig()
 	end
-	if engine and engine.activeSegCount > 0 then
+	if engine and engine.count > 0 then
 		if key == "trailLength" or key == "fadeDuration" then
 			engine:ProcessFade(Now())
 			ApplyReleased()
 		end
 		if key == "rainbowSpeed" or key == "thickness" or key == "opacity" or key == "fadeDuration" then
-			ReconfigureActiveSegments()
+			ReconfigureActiveStamps()
 		end
 	end
 	Tracer:ScheduleSnapshot()
@@ -500,8 +506,8 @@ function Tracer:CopyFromCharacter(sourceId)
 
 	self:ReloadCacheFromStore()
 	self:ApplyEnabled(cache.enabled)
-	if cache.enabled and engine and engine.activeSegCount > 0 then
-		ReconfigureActiveSegments()
+	if cache.enabled and engine and engine.count > 0 then
+		ReconfigureActiveStamps()
 	end
 	self:FlushSnapshot()
 	DebugInfo("Copied Mouse Tracer settings from %s", tostring(sourceId))
@@ -510,7 +516,7 @@ end
 
 function Tracer:OnDiscontinuity(clearTrail)
 	if clearTrail and engine then
-		HideAllLines()
+		HideAllStamps()
 		engine:Reset()
 		engine:SetConfig(cache.trailLength, cache.fadeDuration, cache.rainbowSpeed)
 		engine:SetScale(cache.scale)

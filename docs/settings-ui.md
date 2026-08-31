@@ -34,7 +34,7 @@ The **Gameplay** category opens a single **UI Enhancements** page. That page is 
 
 ### Mouse Tracer
 
-Mouse Tracer can leave a fading rainbow trail behind the mouse cursor. It is off by default.
+Mouse Tracer can leave a fading circular rainbow trail behind the mouse cursor. It is off by default.
 
 - **Enable Mouse Tracer** — show or hide the trail on this character. When this is off, the trail is removed immediately and Mouse Tracer does no continuous work.
 - **Trail Length** — how far the trail can extend behind the cursor.

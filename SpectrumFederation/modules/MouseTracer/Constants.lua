@@ -37,6 +37,7 @@ SF.MouseTracer.Constants = {
 	ALPHA_EPSILON = 0.01,
 
 	HUE_PER_PIXEL = 1 / 200,
+	CIRCLE_TEXTURE = "Interface\\CharacterFrame\\TempPortraitAlphaMask",
 
 	SETTING_KEYS = {
 		"enabled",

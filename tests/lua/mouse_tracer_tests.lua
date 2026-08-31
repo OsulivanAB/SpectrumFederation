@@ -207,6 +207,7 @@ assertTrue(e.activeSegCount > 0, "pre-fade trail has segments")
 e:ProcessFade(1.1 + 0.50)
 assertEq(e.count, 0, "fully expired points are removed")
 assertEq(e.activeSegCount, 0, "fully expired segments are released")
+assertTrue(e.releasedPointCount > 0, "fade records released stamp indices")
 assertEq(e.lastAcceptedIdx, 0, "empty ring clears lastAcceptedIdx")
 
 -- Trail-length trimming
@@ -340,6 +341,18 @@ local dr = e.segR[secondHueSeg] - e.segR[firstHueSeg]
 local dg = e.segG[secondHueSeg] - e.segG[firstHueSeg]
 local db = e.segB[secondHueSeg] - e.segB[firstHueSeg]
 assertTrue((dr * dr + dg * dg + db * db) < 0.25, "neighboring rainbow colors are continuous")
+
+-- Live ring indices used by circular stamps
+e = newEngine()
+e:ProcessSample(1.0, 0, 0, false)
+e:ProcessSample(1.1, 18, 0, false)
+assertTrue(e:IsLiveIndex(e:ChronoIndex(1)), "oldest point is live")
+assertTrue(e:IsLiveIndex(e:ChronoIndex(e.count)), "newest point is live")
+assertTrue(not e:IsLiveIndex(0), "index 0 is never live")
+assertTrue(not e:IsLiveIndex(C.MAX_POINTS + 1), "out-of-range index is not live")
+e:Reset()
+assertTrue(not e:IsLiveIndex(1), "reset engine has no live points")
+assertEq(C.CIRCLE_TEXTURE, "Interface\\CharacterFrame\\TempPortraitAlphaMask", "trail stamps use the circular portrait mask")
 
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then

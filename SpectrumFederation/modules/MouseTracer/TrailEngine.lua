@@ -119,11 +119,17 @@ local function NewestIdx(self)
 	return ((self.head + self.count - 2) % C.MAX_POINTS) + 1
 end
 
+local function NoteReleasedPoint(self, idx)
+	self.releasedPointCount = self.releasedPointCount + 1
+	self.releasedPoints[self.releasedPointCount] = idx
+end
+
 local function DropOldest(self)
 	if self.count < 1 then
 		return
 	end
 	ReleaseSegmentsForPoint(self, self.head)
+	NoteReleasedPoint(self, self.head)
 	self.px[self.head] = 0
 	self.py[self.head] = 0
 	self.pt[self.head] = 0
@@ -142,6 +148,7 @@ local function PushPoint(self, x, y, t, dist)
 		self.count = self.count + 1
 	else
 		ReleaseSegmentsForPoint(self, self.head)
+		NoteReleasedPoint(self, self.head)
 		idx = self.head
 		self.px[idx] = 0
 		self.py[idx] = 0
@@ -218,11 +225,13 @@ function Engine.InitStorage(self)
 	self.free = {}
 	self.newSegs = {}
 	self.releasedSegs = {}
+	self.releasedPoints = {}
 	for i = 1, maxP do
 		self.px[i] = 0
 		self.py[i] = 0
 		self.pt[i] = 0
 		self.pdist[i] = 0
+		self.releasedPoints[i] = 0
 	end
 	for i = 1, maxS do
 		self.segI0[i] = 0
@@ -247,6 +256,7 @@ function Engine.Reset(self)
 		self.py[i] = 0
 		self.pt[i] = 0
 		self.pdist[i] = 0
+		self.releasedPoints[i] = 0
 	end
 	for i = 1, maxS do
 		self.segActive[i] = false
@@ -264,6 +274,7 @@ function Engine.Reset(self)
 	self.freeCount = maxS
 	self.newSegCount = 0
 	self.releasedCount = 0
+	self.releasedPointCount = 0
 	self.activeSegCount = 0
 	self.head = 1
 	self.count = 0
@@ -307,6 +318,17 @@ function Engine.ChronoIndex(self, chrono)
 	return ((self.head + chrono - 2) % C.MAX_POINTS) + 1
 end
 
+function Engine.IsLiveIndex(self, idx)
+	if self.count < 1 or not idx or idx < 1 or idx > C.MAX_POINTS then
+		return false
+	end
+	local offset = idx - self.head
+	if offset < 0 then
+		offset = offset + C.MAX_POINTS
+	end
+	return offset < self.count
+end
+
 function Engine.GetPoint(self, chrono)
 	local idx = Engine.ChronoIndex(self, chrono)
 	if not idx then
@@ -331,6 +353,7 @@ end
 function Engine.ProcessSample(self, now, rawX, rawY, isMouselook)
 	self.newSegCount = 0
 	self.releasedCount = 0
+	self.releasedPointCount = 0
 
 	if isMouselook then
 		self.wasMouselook = true
@@ -410,6 +433,7 @@ end
 function Engine.ProcessFade(self, now)
 	self.newSegCount = 0
 	self.releasedCount = 0
+	self.releasedPointCount = 0
 	if self.count < 1 and self.activeSegCount < 1 then
 		return
 	end
