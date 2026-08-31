@@ -79,6 +79,10 @@ jobs:
     name: Update Changelog
     runs-on: ubuntu-latest
     needs: [sanity-checks, extract-version]
+    permissions:
+      contents: write
+      pull-requests: read
+      copilot-requests: write
 
     steps:
       - name: Checkout code
@@ -92,8 +96,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install requests
+      - name: Install Copilot CLI
+        continue-on-error: true
+        run: npm install -g @github/copilot
 
       - name: Update CHANGELOG.md
         env:
