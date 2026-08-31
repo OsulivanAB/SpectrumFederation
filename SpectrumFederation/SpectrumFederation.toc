@@ -74,6 +74,7 @@ modules/UI/Settings/SubAddons.lua
 modules/UI/Settings/Dialogs.lua
 modules/UI/Settings/DefinitionRenderer.lua
 modules/UI/Settings/Pages/General.lua
+modules/UI/Settings/Pages/NicheFeatures.lua
 modules/UI/Settings/Pages/LootHelper.lua
 modules/UI/Settings/Pages/LootLogs.lua
 modules/UI/Settings/Pages/Debugging.lua

@@ -154,6 +154,42 @@ function UI:RegisterPage(page)
     self:NotifyRegistryChanged()
 end
 
+-- Register a top-level settings category that may have zero content pages.
+-- Empty categories show the empty-state widget; do not register a synthetic page.
+-- @param category table Category definition with id, name, and optional navLabel/group/description/order
+-- @return nil
+-- @error if category is invalid
+function UI:RegisterCategory(category)
+    assert(type(category) == "table", "RegisterCategory(category): category must be a table")
+    assert(type(category.id) == "string" and category.id ~= "", "Category requires a string id")
+    assert(type(category.name) == "string" and category.name ~= "", "Category requires a display name")
+
+    local existing = self.categoriesById[category.id]
+    local cat = existing or {
+        id = category.id,
+        enabled = true,
+        enablementResolved = true,
+        source = "page",
+    }
+
+    cat.name = category.name
+    cat.navLabel = category.navLabel or category.name
+    cat.group = category.group or cat.group or "Optional"
+    cat.description = category.description
+    cat.order = category.order or cat.order or DEFAULT_ORDER
+    if category.enabled ~= nil then
+        cat.enabled = category.enabled and true or false
+    end
+
+    if not existing then
+        self.categoriesById[category.id] = cat
+        table.insert(self.categories, cat)
+    end
+
+    DebugVerbose("Registering settings category: %s", cat.name)
+    self:NotifyRegistryChanged()
+end
+
 -- Compare two pages for sorting by order property
 -- @param a table First page definition
 -- @param b table Second page definition
