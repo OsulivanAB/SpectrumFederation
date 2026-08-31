@@ -88,14 +88,6 @@ local function productionFixture()
             order = 10,
         }),
         page({
-            id = "nicheFeatures",
-            name = "Gameplay",
-            navLabel = "Gameplay",
-            group = "Core",
-            description = "Manage character-specific gameplay toggles and automation.",
-            order = 15,
-        }),
-        page({
             id = "lootHelper",
             name = "Loot Helper",
             navLabel = "Loot Helper",
@@ -412,8 +404,7 @@ assertDeepEq(
 )
 local sorted = Model.SortedCategories(reverseRegistry)
 assertEq(sorted[1].id, "general", "category sort starts with General")
-assertEq(sorted[2].id, "nicheFeatures", "category sort keeps Gameplay after General")
-assertEq(sorted[3].id, "lootHelper", "category sort keeps Loot Helper after Gameplay")
+assertEq(sorted[2].id, "lootHelper", "category sort keeps Loot Helper after General")
 
 local sidebarItems = Model.BuildSidebarItems(registry)
 assertEq(sidebarItems[1].type, "group", "sidebar starts with a group header")

@@ -15,7 +15,7 @@ Restart World of Warcraft or run `/reload`, then enable the addon for the charac
 
 Enter `/sf` to toggle the addon's standalone settings window. The left sidebar lists categories grouped into:
 
-- **Core** — appearance and character-specific gameplay automation.
+- **Core** — appearance.
 - **Loot Tools** — Loot Helper configuration, profiles, sessions, equipment auditing, and logs.
 - **Advanced** — diagnostic logging.
 - **Optional** — installed child addons, such as Cursed Surge Tracker when it is present.

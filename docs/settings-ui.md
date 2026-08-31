@@ -1,4 +1,4 @@
-# Settings and Gameplay
+# Settings
 
 Enter `/sf` to toggle Spectrum Federation's standalone settings window. Changes are saved immediately; there is no Apply button.
 
@@ -27,21 +27,6 @@ Choose **Friz Quadrata**, **Arial Narrow**, or **Morpheus** for the Loot Helper 
 Set Loot Helper title and roster text between 8 and 20 points.
 
 These appearance settings do not currently restyle the standalone settings window or every addon surface.
-
-## Gameplay
-
-### Press and Hold Casting
-
-The Gameplay page lists every specialization for the current character. Enable a specialization to turn WoW's Press and Hold Casting CVar on automatically while that specialization is active; disable it to turn the CVar off.
-
-This preference is saved per character and per specialization. The addon:
-
-- initializes missing specialization choices from the character's current CVar;
-- reapplies the selected value after login or UI reload;
-- reapplies it when the active specialization changes;
-- defers the CVar update until combat ends when necessary.
-
-Because this controls a shared WoW CVar, changing it elsewhere may be overwritten the next time Spectrum Federation reapplies the selected specialization preference.
 
 ## Loot Helper: General
 

@@ -1,6 +1,6 @@
 # Settings System
 
-The settings implementation separates persistence, runtime effects, page registration, and rendering. User-facing option descriptions belong on [Settings and Gameplay](../../settings-ui.md); this page describes how to extend the system.
+The settings implementation separates persistence, runtime effects, page registration, and rendering. User-facing option descriptions belong on [Settings](../../settings-ui.md); this page describes how to extend the system.
 
 ## Components
 
@@ -8,7 +8,7 @@ The settings implementation separates persistence, runtime effects, page registr
 | --- | --- |
 | `modules/Settings/Schema.lua` | Account-wide and character defaults, enums, and migrations. |
 | `modules/Settings/Store.lua` | Dot-path reads/writes, callbacks, resets, profile adapters, and per-character storage. |
-| `modules/Settings/Apply.lua` | Debouncing, combat deferral, CVar automation, and feature reactions. |
+| `modules/Settings/Apply.lua` | Debouncing, combat deferral, and feature reactions. |
 | `modules/UI/Settings/Registry.lua` | Canonical page and category inventory, `categoryId` normalization, sub-addon discovery, and enablement refresh. Blizzard Settings registration is currently disabled. |
 | `modules/UI/Settings/NavigationModel.lua` | Pure navigation helpers (content pages, `ShowPage`, search ranking, sort, window minima). No frames and no C_AddOns. |
 | `modules/UI/Settings/SubAddons.lua` | C_AddOns adapter used only by Registry. |
@@ -30,7 +30,7 @@ The sidebar shows **top-level categories only**. Nested sidebar children are not
 - New pages set `categoryId` to the category they belong to.
 - Legacy `parentId` is still accepted and becomes `categoryId`. If both are set and differ, registration errors.
 - A page whose `id` equals its `categoryId` is the category root. If other pages share that category, the root is metadata only (`name`, `navLabel`, `group`, `description`, `defaultChildId`, `order`) and is **not** a tab. Loot Helper is the current example: five content pages, not six.
-- A root with no children is itself the one content page (General, Gameplay, Loot Logs, Debugging).
+- A root with no children is itself the one content page (General, Loot Logs, Debugging).
 - Zero content pages: show the empty-state widget. Do not register a synthetic page.
 - One content page: hide the tab bar.
 - Two or more: show tabs.
@@ -162,11 +162,11 @@ Loot profiles are domain objects, not ordinary schema subtrees. The Store method
 
 Do not add profile-authoritative data only to `SettingsSchema.PROFILE_SETTINGS_DEFAULTS`; define it on `LootProfile`, include it in snapshots when synchronization requires it, and expose validated getters/setters.
 
-## Combat and CVar work
+## Combat and deferred apply
 
 Use `SettingsApply:Debounce(token, delay, fn)` for rapid repeated changes and `RunOrDefer(fn)` for work that must wait until combat ends.
 
-Press and Hold Casting is the complete character-setting example: Store maintains a specialization-keyed table, Apply listens for login/world/spec events, and the Gameplay page renders one checkbox per specialization.
+Character-specific settings belong in `CHARACTER_DEFAULTS` and are read or written through `Store:GetCharacter` / `Store:SetCharacter`. Register any runtime reaction in the owning feature or `SettingsApply`.
 
 ## Review checklist
 
@@ -175,7 +175,7 @@ Press and Hold Casting is the complete character-setting example: Store maintain
 - Runtime behavior changes when the setting changes.
 - The selected write path enforces permissions independently of UI state; add an explicit check when a low-level mutator does not.
 - Tooltips explain user behavior, not implementation.
-- `/reload`, specialization changes, and combat deferral are tested where relevant.
+- `/reload` and combat deferral are tested where relevant.
 - New Lua files appear in TOC load order and the addon version is bumped.
 - New pages use `categoryId` (or legacy `parentId`) and do not add nested sidebar children.
 - A category root with child pages is metadata only and is not a tab.

@@ -38,7 +38,7 @@ The TOC declares:
 
 - `SpectrumFederationDB` — account-wide settings, profiles, logs, equipment snapshots, and resumable sync-session identity.
 - `SpectrumFederationDebugDB` — debug enabled state and up to 500 diagnostic entries.
-- `SpectrumFederationCharDB` — character-specific gameplay choices, currently Press and Hold Casting by specialization.
+- `SpectrumFederationCharDB` — character-specific settings storage.
 
 WoW serializes plain tables, not metatables. Loot Helper database initialization restores `LootProfile`, `Member`, and `LootLog` metatables after SavedVariables load.
 
@@ -76,7 +76,7 @@ The profile creator is the initial owner and admin. Ownership and admin membersh
 
 ## Combat and asynchronous APIs
 
-Settings application can debounce and defer work until `PLAYER_REGEN_ENABLED`. The Press and Hold Casting automation uses this path.
+Settings application can debounce and defer work until `PLAYER_REGEN_ENABLED`.
 
 Raid inspection and item information are asynchronous and throttled. `RaidCheck.lua` queues inspect requests, caches current and profile-backed snapshots, tracks pending/stale states, and notifies UI listeners through a snapshot version.
 
