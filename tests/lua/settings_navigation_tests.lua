@@ -121,12 +121,14 @@ local function productionFixture()
             order = 22,
         }),
         page({
-            id = "lootHelperEquipment",
-            parentId = "lootHelper",
-            name = "Raid Check Equipment",
-            navLabel = "Equipment",
-            description = "Inspect raid equipment and gem state from the Raid Check tools.",
-            order = 22.5,
+            id = "raidEquipmentAudit",
+            categoryId = "raidEquipment",
+            name = "Raid Equipment",
+            navLabel = "Raid Equipment",
+            contentHeading = "Raid Equipment",
+            group = "Loot Tools",
+            description = "Inspect current group equipment, refresh snapshots, and review missing enchants or gems.",
+            order = 18,
             layout = { windowWidth = 1280, disablePageScroll = true },
         }),
         page({
@@ -197,6 +199,18 @@ local function productionFixture()
 
     -- Parent-owned Gameplay must exist before the UI Enhancements page is upserted
     -- so the category title stays "Gameplay" instead of inheriting the page name.
+    table.insert(categories, {
+        id = "raidEquipment",
+        name = "Raid Equipment",
+        navLabel = "Raid Equipment",
+        group = "Loot Tools",
+        description = "Inspect current group equipment against current-Retail enchant and gem rules.",
+        order = 18,
+        enabled = true,
+        enablementResolved = true,
+    })
+    categoriesById.raidEquipment = categories[#categories]
+
     table.insert(categories, {
         id = "nicheFeatures",
         name = "Gameplay",
@@ -292,8 +306,8 @@ local registry = productionFixture()
 -- Content page lists
 assertDeepEq(
     idsOf(Model.GetContentPages(registry, "lootHelper")),
-    { "lootHelperGeneral", "lootHelperProfile", "lootHelperSession", "lootHelperEquipment", "lootHelperAdmin" },
-    "Loot Helper has exactly five content pages"
+    { "lootHelperGeneral", "lootHelperProfile", "lootHelperSession", "lootHelperAdmin" },
+    "Loot Helper has exactly four content pages"
 )
 assertTrue(not Model.IsContentPage(registry, "lootHelper"), "lootHelper root is not a content page")
 assertDeepEq(
@@ -348,27 +362,28 @@ assertEq(
 -- ShowPage ignores last-tab
 local session = {
     currentCategoryId = "lootHelper",
-    currentPageId = "lootHelperEquipment",
-    lastPageByCategory = { lootHelper = "lootHelperEquipment" },
+    currentPageId = "lootHelperSession",
+    lastPageByCategory = { lootHelper = "lootHelperSession" },
 }
 local showRoot = Model.ResolveShowPage(registry, session, "lootHelper")
 assertEq(showRoot.categoryId, "lootHelper", "ShowPage(lootHelper) stays on Loot Helper")
 assertEq(showRoot.pageId, "lootHelperGeneral", "ShowPage(lootHelper) opens General, not last-tab")
-local showEquip = Model.ResolveShowPage(registry, session, "lootHelperEquipment")
-assertEq(showEquip.pageId, "lootHelperEquipment", "ShowPage(lootHelperEquipment) opens Equipment")
+local showEquip = Model.ResolveShowPage(registry, session, "raidEquipmentAudit")
+assertEq(showEquip.pageId, "raidEquipmentAudit", "ShowPage(raidEquipmentAudit) opens Raid Equipment")
+assertEq(showEquip.categoryId, "raidEquipment", "ShowPage(raidEquipmentAudit) uses the Raid Equipment category")
 local showDebug = Model.ResolveShowPage(registry, session, "debugging")
 assertEq(showDebug.pageId, "debugging", "ShowPage(debugging) opens Debugging")
 
 -- Sidebar last-tab vs ShowPage
 local sidebar = Model.ResolveSidebarSelect(registry, session, "lootHelper")
-assertEq(sidebar.pageId, "lootHelperEquipment", "sidebar click restores last-tab Equipment")
+assertEq(sidebar.pageId, "lootHelperSession", "sidebar click restores last-tab Session")
 local sidebarFresh = Model.ResolveSidebarSelect(registry, { lastPageByCategory = {} }, "lootHelper")
 assertEq(sidebarFresh.pageId, "lootHelperGeneral", "sidebar without last-tab uses defaultChildId")
 
 -- Disabled selection rejected
 local disabled = Model.ResolveShowPage(registry, session, "SpectrumFederation_CursedSurgeTracker")
 assertEq(disabled.changed, false, "ShowPage of a disabled category is rejected")
-assertEq(disabled.pageId, "lootHelperEquipment", "disabled ShowPage keeps the current page")
+assertEq(disabled.pageId, "lootHelperSession", "disabled ShowPage keeps the current page")
 local disabledSidebar = Model.ResolveSidebarSelect(registry, session, "SpectrumFederation_CursedSurgeTracker")
 assertEq(disabledSidebar.changed, false, "disabled sidebar click is rejected")
 local emptySelect = Model.ResolveSidebarSelect(registry, {}, "emptyAddon")
@@ -391,7 +406,8 @@ assertEq(firstOpen.pageId, "general", "first open with no id is general")
 -- Search fields
 assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "Loot Tools"), "search matches category group")
 assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "raid check tools"), "search matches category description")
-assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "Equipment"), "search matches content-page navLabel")
+assertTrue(Model.CategoryMatchesQuery(registry, "raidEquipment", "Raid Equipment"), "search matches Raid Equipment category")
+assertTrue(Model.CategoryMatchesQuery(registry, "raidEquipment", "Equipment"), "search matches Raid Equipment navLabel")
 assertTrue(Model.CategoryMatchesQuery(registry, "debugging", "Debugging"), "search matches category name")
 assertTrue(Model.CategoryMatchesQuery(registry, "nicheFeatures", "Gameplay"), "search matches Gameplay category name")
 assertTrue(Model.CategoryMatchesQuery(registry, "nicheFeatures", "UI Enhancements"), "search matches the UI Enhancements page")
@@ -404,7 +420,7 @@ assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelper), nil, "Loot 
 assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperGeneral), nil, "Loot Helper General has no page-level heading")
 assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperProfile), nil, "Loot Helper Profile has no page-level heading")
 assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperSession), nil, "Loot Helper Session has no page-level heading")
-assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperEquipment), nil, "Loot Helper Equipment has no page-level heading")
+assertEq(Model.GetPageContentHeading(registry.pagesById.raidEquipmentAudit), "Raid Equipment", "Raid Equipment opts into a page heading")
 assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperAdmin), nil, "Loot Helper Admin has no page-level heading")
 assertEq(Model.GetPageContentHeading(registry.pagesById.debugging), nil, "Debugging has no page-level heading")
 assertEq(Model.GetPageContentHeading(nil), nil, "missing page has no heading")
@@ -419,11 +435,11 @@ assertEq(gameplaySearchClick.pageId, "uiEnhancements", "Gameplay search click op
 
 local equipmentHits = Model.Search(registry, "Equipment")
 assertTrue(#equipmentHits > 0, "Equipment query returns hits")
-assertEq(equipmentHits[1].pageId, "lootHelperEquipment", "Equipment query ranks the Equipment page first")
-assertEq(equipmentHits[1].categoryId, "lootHelper", "Equipment query stays in Loot Helper")
+assertEq(equipmentHits[1].pageId, "raidEquipmentAudit", "Equipment query ranks the Raid Equipment page first")
+assertEq(equipmentHits[1].categoryId, "raidEquipment", "Equipment query opens the Raid Equipment category")
 
-local searchClick = Model.ResolveSearchCategoryClick(registry, session, "lootHelper", "Equipment")
-assertEq(searchClick.pageId, "lootHelperEquipment", "search category click opens the matching tab, not last-tab")
+local searchClick = Model.ResolveSearchCategoryClick(registry, session, "raidEquipment", "Equipment")
+assertEq(searchClick.pageId, "raidEquipmentAudit", "search category click opens Raid Equipment")
 local groupClick = Model.ResolveSearchCategoryClick(registry, session, "lootHelper", "Loot Tools")
 assertEq(groupClick.pageId, "lootHelperGeneral", "category-only search click opens the default page, not a blank category")
 local descClick = Model.ResolveSearchCategoryClick(registry, session, "lootHelper", "admin workflows")
@@ -457,13 +473,14 @@ for id, item in pairs(registry.categoriesById) do
 end
 assertDeepEq(
     idsOf(Model.GetContentPages(reverseRegistry, "lootHelper")),
-    { "lootHelperGeneral", "lootHelperProfile", "lootHelperSession", "lootHelperEquipment", "lootHelperAdmin" },
+    { "lootHelperGeneral", "lootHelperProfile", "lootHelperSession", "lootHelperAdmin" },
     "content page order does not follow pairs/insertion order"
 )
 local sorted = Model.SortedCategories(reverseRegistry)
 assertEq(sorted[1].id, "general", "category sort starts with General")
 assertEq(sorted[2].id, "nicheFeatures", "category sort keeps Gameplay after General")
-assertEq(sorted[3].id, "lootHelper", "category sort keeps Loot Helper after Gameplay")
+assertEq(sorted[3].id, "raidEquipment", "category sort keeps Raid Equipment after Gameplay")
+assertEq(sorted[4].id, "lootHelper", "category sort keeps Loot Helper after Raid Equipment")
 
 local sidebarItems = Model.BuildSidebarItems(registry)
 assertEq(sidebarItems[1].type, "group", "sidebar starts with a group header")

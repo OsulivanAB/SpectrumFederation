@@ -509,12 +509,38 @@ local function ShouldCheckEnchant(slotDef, link)
 	return false
 end
 
+local function GetAddonOwnedAuditConfig()
+	return {
+		checkGemsInSockets = true,
+		requireMetaGem = false,
+		slots = {
+			head = true,
+			neck = true,
+			shoulders = true,
+			back = true,
+			chest = true,
+			wrist = true,
+			hands = true,
+			belt = true,
+			legs = true,
+			boots = true,
+			rings = true,
+			trinkets = true,
+			weapon = true,
+			offHand = true,
+		},
+	}
+end
+
 local function ShouldCheckTroubleshootingEnchant(slotKey, link)
+	if slotKey == "head" or slotKey == "shoulders" or slotKey == "chest"
+		or slotKey == "legs" or slotKey == "boots" or slotKey == "rings" or slotKey == "mainHand" then
+		return true
+	end
 	if slotKey == "offHand" then
 		return ShouldCheckEnchant(SLOT_DEFS.offHand, link)
 	end
-
-	return true
+	return false
 end
 
 local function GetRaidCheckSlotConfigKey(slotKey, link)
@@ -829,20 +855,9 @@ local function GetProfile()
 	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
 end
 
-local function PersistProfileEquipmentSnapshot(memberId, captured)
-	local profile = GetProfile()
-	if not profile or type(profile.SetRaidCheckEquipmentSnapshot) ~= "function" then
-		return false
-	end
-	if type(memberId) ~= "string" or memberId == "" or type(captured) ~= "table" or type(captured.slotsByInventory) ~= "table" then
-		return false
-	end
-
-	return profile:SetRaidCheckEquipmentSnapshot(memberId, {
-		capturedAt = GetServerTime and GetServerTime() or nil,
-		averageItemLevel = captured.averageItemLevel,
-		slotsByInventory = captured.slotsByInventory,
-	})
+local function PersistProfileEquipmentSnapshot()
+	-- Equipment observations are runtime-only. Legacy profile snapshots stay inert.
+	return false
 end
 
 local function GetProfileEquipmentSnapshot(memberId)
@@ -977,11 +992,14 @@ end
 function RC:_GetInspectState()
 	self._inspectState = self._inspectState or {
 		cache = {},
+		lastGood = {},
 		queue = {},
 		queueHead = 1,
 		queued = {},
 		listeners = {},
 		active = nil,
+		retired = nil,
+		lastIssuedGeneration = 0,
 		inspectPausedForCombat = false,
 		manualInspectPauseUntil = nil,
 		localSnapshot = nil,
@@ -989,7 +1007,12 @@ function RC:_GetInspectState()
 		lastNotifiedVersion = -1,
 		backgroundInspectEnabled = false,
 		backgroundMonitorStarted = false,
+		adhocRun = nil,
+		preflightOpen = false,
+		adhocTickerStarted = false,
 	}
+	self._inspectState.lastGood = self._inspectState.lastGood or {}
+	self._inspectState.lastIssuedGeneration = self._inspectState.lastIssuedGeneration or 0
 	return self._inspectState
 end
 
@@ -1028,9 +1051,19 @@ function RC:_PauseInspectForManualInspect(reason)
 		state.manualInspectPauseUntil = pauseUntil
 	end
 
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if state.adhocRun and CheckRun then
+		CheckRun.SetPause(state.adhocRun, "manual_inspect", true)
+		state.adhocRun.status = "paused"
+	end
+
 	if state.active then
 		local active = state.active
-		state.active = nil
+		if CheckRun then
+			CheckRun.RetireActive(state, "manual_inspect")
+		else
+			state.active = nil
+		end
 
 		if active.key and not state.queued[active.key] then
 			state.queued[active.key] = true
@@ -1040,6 +1073,7 @@ function RC:_PauseInspectForManualInspect(reason)
 				guid = active.guid,
 				id = active.id,
 				aliases = active.aliases,
+				source = active.source,
 			})
 		end
 	end
@@ -1108,6 +1142,15 @@ function RC:_ResumeInspectAfterManualInspect(reason)
 	end
 
 	state.manualInspectPauseUntil = nil
+
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if state.adhocRun and CheckRun then
+		CheckRun.SetPause(state.adhocRun, "manual_inspect", false)
+		if state.adhocRun.status == "paused" and not CheckRun.IsPaused(state.adhocRun) then
+			state.adhocRun.status = "running"
+			state.adhocRun.lastRunningAt = GetTime and GetTime() or nil
+		end
+	end
 
 	if SF.Debug then
 		SF.Debug:Verbose("RAID_CHECK", "Resuming background inspect after manual inspect (%s)", tostring(reason or "unknown"))
@@ -1236,15 +1279,6 @@ function RC:_ClearPreparedSlotCaches()
 		end
 	end
 
-	local profile = GetProfile()
-	if profile and type(profile.GetRaidCheckEquipmentSnapshotIds) == "function" then
-		for _, memberId in ipairs(profile:GetRaidCheckEquipmentSnapshotIds() or {}) do
-			local snapshot = profile:GetRaidCheckEquipmentSnapshot(memberId)
-			if type(snapshot) == "table" then
-				snapshot.preparedSlotsByConfig = {}
-			end
-		end
-	end
 end
 
 function RC:_ScheduleTooltipDataRefresh()
@@ -1330,7 +1364,10 @@ function RC:_PrimeBackgroundInspectQueue()
 		return
 	end
 
-	if not HasActiveLootHelperSession() or IsInspectPausedForCombat() or self:_IsInspectPausedForManual() then
+	if IsInspectPausedForCombat() or self:_IsInspectPausedForManual() then
+		return
+	end
+	if state.adhocRun and (state.adhocRun.status == "running" or state.adhocRun.status == "paused") then
 		return
 	end
 
@@ -1391,10 +1428,19 @@ function RC:_PauseInspectForCombat()
 	end
 
 	state.inspectPausedForCombat = true
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if state.adhocRun and CheckRun then
+		CheckRun.SetPause(state.adhocRun, "combat", true)
+		state.adhocRun.status = "paused"
+	end
 
 	if state.active then
 		local active = state.active
-		state.active = nil
+		if CheckRun then
+			CheckRun.RetireActive(state, "combat")
+		else
+			state.active = nil
+		end
 
 		if active.key and not state.queued[active.key] then
 			state.queued[active.key] = true
@@ -1423,6 +1469,14 @@ function RC:_ResumeInspectAfterCombat()
 	end
 
 	state.inspectPausedForCombat = false
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if state.adhocRun and CheckRun then
+		CheckRun.SetPause(state.adhocRun, "combat", false)
+		if state.adhocRun.status == "paused" and not CheckRun.IsPaused(state.adhocRun) then
+			state.adhocRun.status = "running"
+			state.adhocRun.lastRunningAt = GetTime and GetTime() or nil
+		end
+	end
 	self:_ProcessInspectQueue()
 	self:_RunBackgroundInspectPass()
 	self:_MarkTroubleshootingDirty()
@@ -1483,6 +1537,7 @@ function RC:EnsureInspectSupport()
 			self:_NotifyTroubleshootingListeners()
 			self:_RunBackgroundInspectPass()
 		elseif event == "GROUP_ROSTER_UPDATE" then
+			self:_ReconcileFrozenTargets()
 			self:_MarkTroubleshootingDirty()
 			self:_NotifyTroubleshootingListeners()
 			self:_ProcessInspectQueue()
@@ -1524,6 +1579,32 @@ function RC:_HookInspectUI()
 	end
 end
 
+function RC:_ReconcileFrozenTargets()
+	local state = self:_GetInspectState()
+	local run = state.adhocRun
+	if not run or type(run.targetIds) ~= "table" then
+		return
+	end
+
+	for _, memberId in ipairs(run.targetIds) do
+		local player = run.players and run.players[memberId]
+		if player then
+			local unit = FindUnitByGuidOrId(player.guid, memberId)
+			if unit then
+				player.unitHint = unit
+				player.leftGroup = false
+				local guid = GetAccessibleUnitGUID(unit)
+				if guid then
+					player.guid = guid
+				end
+			else
+				player.leftGroup = true
+				player.currentlyInspectable = false
+			end
+		end
+	end
+end
+
 function RC:_HandleInspectTimeout(key, requestedAt)
 	local state = self:_GetInspectState()
 	local active = state.active
@@ -1545,24 +1626,129 @@ function RC:_HandleInspectTimeout(key, requestedAt)
 	entry.nextRetryAt = now + CalculateInspectRetryDelay(failCount)
 	self:_StoreInspectCacheEntry(entry, active.aliases)
 
-	state.active = nil
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if CheckRun then
+		CheckRun.RetireActive(state, "timeout")
+	else
+		state.active = nil
+	end
+	if state.adhocRun and CheckRun then
+		local player = active.id and state.adhocRun.players and state.adhocRun.players[active.id]
+		if player then
+			CheckRun.MarkAttempt(player, "timeout", true)
+		end
+	end
 	if ClearInspectPlayer then
 		pcall(ClearInspectPlayer)
 	end
 
 	self:_MarkTroubleshootingDirty()
 	self:_NotifyTroubleshootingListeners()
-	self:_ProcessInspectQueue()
+	-- Delay the next NotifyInspect so a late INSPECT_READY can still bind to this
+	-- generation. Starting a successor immediately would make that event unsafe.
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0.25, function()
+			if self and self._ProcessInspectQueue then
+				self:_ProcessInspectQueue()
+			end
+		end)
+	else
+		self:_ProcessInspectQueue()
+	end
+end
+
+local function SlotSocketsFromCaptured(slotData)
+	local sockets = {}
+	local link = slotData and slotData.link
+	if type(link) ~= "string" or link == "" then
+		return sockets
+	end
+
+	local socketCount = CountItemSockets(link)
+	local emptyFromTooltip, socketsFromTooltip = CountEmptySocketsFromTooltip(link)
+	if socketsFromTooltip and socketsFromTooltip > socketCount then
+		socketCount = socketsFromTooltip
+	end
+	if socketCount <= 0 then
+		return sockets
+	end
+
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	for i = 1, socketCount do
+		local _, _, gemID = GetSocketedGemIdentity(link, i)
+		local filled = IsGemPresentInSocket(link, i)
+		if not filled and emptyFromTooltip and emptyFromTooltip > 0 then
+			-- tooltip empty count is aggregate; treat missing gem ID as empty when present checks fail
+			filled = false
+		end
+		local uniqueness = nil
+		if filled and gemID and Policy and Policy.LookupUniqueness then
+			uniqueness = Policy.LookupUniqueness(gemID)
+			if uniqueness == nil then
+				uniqueness = false
+			end
+		end
+		sockets[#sockets + 1] = {
+			filled = filled and true or false,
+			empty = not filled,
+			gemId = gemID,
+			uniqueness = uniqueness,
+		}
+	end
+	return sockets
+end
+
+local function BuildPolicyObservation(captured)
+	local slotsByInventory = {}
+	if type(captured) ~= "table" or type(captured.slotsByInventory) ~= "table" then
+		return { slotsByInventory = slotsByInventory }
+	end
+
+	for inventorySlot, slotData in pairs(captured.slotsByInventory) do
+		local link = slotData and slotData.link or nil
+		local hasItem = slotData and (slotData.hasItem or SlotHasAnyItemData(slotData))
+		local pending = IsSlotItemDataPending(captured.slotsByInventory, inventorySlot)
+			or IsSlotLinkPotentiallyIncomplete(captured.slotsByInventory, inventorySlot)
+		local mapped = {
+			empty = not hasItem and not pending,
+			itemId = slotData and slotData.itemId or nil,
+			link = link,
+			texture = slotData and slotData.texture or nil,
+			equipLoc = (type(link) == "string" and GetItemEquipLocation(link)) or nil,
+			linkComplete = not pending,
+		}
+		if hasItem and (not link or link == "") then
+			mapped.empty = false
+			mapped.linkComplete = false
+		end
+		if type(link) == "string" and link ~= "" then
+			local enchantId = tonumber(ParseEnchantIdFromLink(link))
+			mapped.enchantId = enchantId
+			mapped.hasEnchant = HasEnchant(link)
+			mapped.sockets = SlotSocketsFromCaptured(slotData)
+		elseif mapped.empty then
+			mapped.sockets = {}
+			mapped.hasEnchant = false
+			mapped.enchantId = 0
+		end
+		slotsByInventory[inventorySlot] = mapped
+	end
+
+	return { slotsByInventory = slotsByInventory }
 end
 
 function RC:_HandleInspectReady(guid)
 	local state = self:_GetInspectState()
-	local active = state.active
-	if not active then
-		return
-	end
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
 	if not CanAccessValue(guid) then
 		guid = nil
+	end
+	if CheckRun and not CheckRun.CanAcceptInspectReady(state, guid) then
+		return
+	end
+	local active = state.active or state.retired
+	if not active then
+		return
 	end
 	if not CanAccessValue(active.guid) then
 		active.guid = nil
@@ -1609,7 +1795,6 @@ function RC:_HandleInspectReady(guid)
 				NormalizeSlotData(slotData)
 			end
 		end
-
 		RecalculateCapturedSummary(captured)
 	end
 
@@ -1625,6 +1810,38 @@ function RC:_HandleInspectReady(guid)
 		entry.averageItemLevel = captured.averageItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
 		PersistProfileEquipmentSnapshot(active.id, captured)
+
+		local policyObs = BuildPolicyObservation(captured)
+		local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+		local policyResult = Policy and policyObs and Policy.EvaluateObservation(policyObs) or nil
+		if policyResult and policyResult.complete and active.id then
+			state.lastGood = state.lastGood or {}
+			state.lastGood[active.id] = {
+				capturedAt = now,
+				complete = true,
+				policy = policyResult,
+				observation = policyObs,
+			}
+		end
+		if state.adhocRun and CheckRun and active.id then
+			local player = state.adhocRun.players and state.adhocRun.players[active.id]
+			if player then
+				CheckRun.NoteProgress(state.adhocRun, now)
+				if policyResult and policyResult.complete then
+					CheckRun.MarkAttempt(player, "complete", true)
+					player.freshObservation = {
+						complete = true,
+						policy = policyResult,
+						capturedAt = now,
+					}
+					player.policyResult = policyResult
+					player.technicalFailure = false
+					player.lastGood = state.lastGood[active.id]
+				else
+					CheckRun.MarkAttempt(player, "incomplete", true)
+				end
+			end
+		end
 
 		-- If any tracked slot has evidence of an item (texture/itemId) but the
 		-- link is unavailable, or the link looks like an incomplete stub, the
@@ -1649,10 +1866,18 @@ function RC:_HandleInspectReady(guid)
 		-- inspectable again. The delay scales from INSPECT_RETRY_BASE_SECONDS up
 		-- to INSPECT_RETRY_MAX_SECONDS.
 		entry.nextRetryAt = now + CalculateInspectRetryDelay(entry.failCount)
+		if state.adhocRun and CheckRun and active.id then
+			local player = state.adhocRun.players and state.adhocRun.players[active.id]
+			if player then
+				CheckRun.NoteProgress(state.adhocRun, now)
+				CheckRun.MarkAttempt(player, "incomplete", true)
+			end
+		end
 	end
 
 	self:_StoreInspectCacheEntry(entry, active.aliases)
 	state.active = nil
+	state.retired = nil
 	if ClearInspectPlayer then
 		pcall(ClearInspectPlayer)
 	end
@@ -1678,33 +1903,55 @@ function RC:_ProcessInspectQueue()
 			state.queued[item.key] = nil
 		end
 
-		local unit = item and FindUnitByGuidOrId(item.guid, item.id) or nil
-		if CanInspectUnitNow(unit) then
-			local now = GetTime and GetTime() or 0
-			state.active = {
-				key = item.key,
-				guid = (CanAccessValue(item.guid) and item.guid) or GetAccessibleUnitGUID(unit),
-				id = item.id,
-				aliases = item.aliases,
-				unit = unit,
-				requestedAt = now,
-			}
+		if state.adhocRun and item and item.source ~= "adhoc" then
+			-- Drop background work while an ad-hoc check owns the inspect pipeline.
+		else
+			local unit = item and FindUnitByGuidOrId(item.guid, item.id) or nil
+			if CanInspectUnitNow(unit) then
+				local now = GetTime and GetTime() or 0
+				local guid = (CanAccessValue(item.guid) and item.guid) or GetAccessibleUnitGUID(unit)
+				local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+				if CheckRun then
+					local issued = CheckRun.IssueInspect(state, {
+						guid = guid,
+						key = item.key,
+						id = item.id,
+						aliases = item.aliases,
+						runId = state.adhocRun and state.adhocRun.id or nil,
+						requestedAt = now,
+					})
+					issued.unit = unit
+					issued.source = item.source
+				else
+					state.active = {
+						key = item.key,
+						guid = guid,
+						id = item.id,
+						aliases = item.aliases,
+						unit = unit,
+						requestedAt = now,
+						source = item.source,
+					}
+				end
 
-			local entry = self:_GetInspectCacheEntryByAliases(item.aliases) or {}
-			entry.lastAttemptAt = now
-			self:_StoreInspectCacheEntry(entry, item.aliases)
+				local entry = self:_GetInspectCacheEntryByAliases(item.aliases) or {}
+				entry.lastAttemptAt = now
+				self:_StoreInspectCacheEntry(entry, item.aliases)
 
-			NotifyInspect(unit)
-			if C_Timer and C_Timer.After then
-				C_Timer.After(INSPECT_REQUEST_TIMEOUT_SECONDS, function()
-					-- The active-request guard in _HandleInspectTimeout ignores stale callbacks
-					-- once INSPECT_READY advances the queue or a newer request replaces this one.
-					if self and self._HandleInspectTimeout then
-						self:_HandleInspectTimeout(item.key, now)
-					end
-				end)
+				local waitSeconds = INSPECT_REQUEST_TIMEOUT_SECONDS
+				if CheckRun and CheckRun.PER_INSPECT_ACTIVE_WAIT then
+					waitSeconds = CheckRun.PER_INSPECT_ACTIVE_WAIT
+				end
+				NotifyInspect(unit)
+				if C_Timer and C_Timer.After then
+					C_Timer.After(waitSeconds, function()
+						if self and self._HandleInspectTimeout then
+							self:_HandleInspectTimeout(item.key, now)
+						end
+					end)
+				end
+				return
 			end
-			return
 		end
 	end
 
@@ -1739,12 +1986,19 @@ function RC:_QueueInspectForUnit(unit, info, cacheEntry)
 	end
 
 	state.queued[key] = true
-	table.insert(state.queue, {
+	local source = (state.adhocRun and (state.adhocRun.status == "running" or state.adhocRun.status == "paused")) and "adhoc" or "background"
+	local entry = {
 		key = key,
 		guid = guid,
 		id = id,
 		aliases = aliases,
-	})
+		source = source,
+	}
+	if source == "adhoc" then
+		table.insert(state.queue, state.queueHead, entry)
+	else
+		table.insert(state.queue, entry)
+	end
 	self:_ProcessInspectQueue()
 end
 
@@ -1926,16 +2180,24 @@ local function EvaluateSnapshot(slotsByInventory, cfg)
 end
 
 local function EvaluateMetaGemRowState(slotsByInventory, cfg, isKnown)
-	if not (cfg and cfg.requireMetaGem and isKnown and type(slotsByInventory) == "table") then
+	if not (isKnown and type(slotsByInventory) == "table") then
 		return false, false
 	end
-
-	local hasMetaGem, metaGemPending = HasEquippedMetaGemInSnapshot(slotsByInventory)
-	if hasMetaGem then
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if not Policy then
 		return false, false
 	end
-
-	return not metaGemPending, metaGemPending and true or false
+	local observation = BuildPolicyObservation({ slotsByInventory = slotsByInventory })
+	local result = Policy.EvaluateObservation(observation)
+	if not result.complete then
+		return false, true
+	end
+	for i = 1, #(result.missing or {}) do
+		if result.missing[i] == "Limited Gem" then
+			return true, false
+		end
+	end
+	return false, false
 end
 
 local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlot, isKnown)
@@ -2060,7 +2322,6 @@ end
 
 function RC:_GetTroubleshootingInspectState(unit, info)
 	self:EnsureInspectSupport()
-	local memberId = info and info.id or nil
 
 	if IsSelfUnit(unit) then
 		local captured = self:_GetLocalTroubleshootingSnapshot()
@@ -2078,11 +2339,9 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 
 	local aliases = self:_GetInspectAliases(unit, info)
 	local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
-	local profileSnapshot = GetProfileEquipmentSnapshot(memberId)
 	local now = GetTime and GetTime() or 0
 	local hasFreshData = cacheEntry and cacheEntry.updatedAt and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
 	local hasFreshCachedSnapshot = cacheEntry and cacheEntry.slotsByInventory and IsEquipmentSnapshotFresh(cacheEntry)
-	local hasFreshProfileSnapshot = profileSnapshot and profileSnapshot.slotsByInventory and IsEquipmentSnapshotFresh(profileSnapshot)
 
 	if hasFreshData and cacheEntry.slotsByInventory then
 		return {
@@ -2144,52 +2403,10 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		}
 	end
 
-	if hasFreshProfileSnapshot then
-		local status = "saved"
-		local label = "Saved"
-		local message = BuildSavedSnapshotMessage(profileSnapshot, false)
-
-		if pausedForCombat then
-			status = "paused"
-			label = "Paused"
-			message = "Showing the saved profile snapshot until combat ends."
-		elseif pausedForManual then
-			status = "paused"
-			label = "Paused"
-			message = "Showing the saved profile snapshot while the Inspect window is open."
-		elseif isInspectActive then
-			status = "refreshing"
-			label = "Refreshing"
-			message = BuildSavedSnapshotMessage(profileSnapshot, true)
-		elseif isQueued or canInspectNow then
-			status = "loading"
-			label = "Loading"
-			message = BuildSavedSnapshotMessage(profileSnapshot, true)
-		elseif not inRange then
-			message = BuildSavedSnapshotMessage(profileSnapshot, false) .. " Move closer to refresh this player."
-		end
-
-		return {
-			status = status,
-			label = label,
-			message = message,
-			isKnown = true,
-			averageItemLevel = profileSnapshot.averageItemLevel,
-			slotsByInventory = profileSnapshot.slotsByInventory,
-			entry = profileSnapshot,
-			stale = true,
-			cacheHolder = profileSnapshot,
-		}
-	end
-
-	-- Stale-but-available data: if equipment data exists (even beyond the
-	-- freshness window), return it as known so raid checks can evaluate it
-	-- rather than reporting the player as pending/unavailable.  The background
-	-- inspect system will continue to attempt refreshes independently.
+	-- Stale-but-available runtime data: if equipment data exists (even beyond the
+	-- freshness window), return it as known so the audit page can display it.
+	-- Legacy persisted profile snapshots are not consumed.
 	local hasStaleCachedData = cacheEntry and cacheEntry.slotsByInventory and HasEquipmentData(cacheEntry.slotsByInventory)
-	local hasStaleProfileData = (not hasStaleCachedData)
-		and profileSnapshot and profileSnapshot.slotsByInventory
-		and HasEquipmentData(profileSnapshot.slotsByInventory)
 
 	if hasStaleCachedData then
 		return {
@@ -2202,20 +2419,6 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			entry = cacheEntry,
 			stale = true,
 			cacheHolder = cacheEntry,
-		}
-	end
-
-	if hasStaleProfileData then
-		return {
-			status = "stale",
-			label = nil,
-			message = BuildSavedSnapshotMessage(profileSnapshot, false),
-			isKnown = true,
-			averageItemLevel = profileSnapshot.averageItemLevel,
-			slotsByInventory = profileSnapshot.slotsByInventory,
-			entry = profileSnapshot,
-			stale = true,
-			cacheHolder = profileSnapshot,
 		}
 	end
 
@@ -2370,15 +2573,18 @@ local function GetRaidCheckPointAward(cfg)
 	return amount
 end
 
-local function AwardPrepared(profile, member, pointName, pointAward)
+local function AwardPrepared(profile, member, pointName, pointAward, extra)
 	if not member or not member.IncrementPoints then
 		return false
 	end
 
+	extra = extra or {}
 	local ok = member:IncrementPoints({
 		amount = pointAward,
 		logAuthor = "Raid Check",
 		reason = RAID_CHECK_REASON,
+		profile = profile,
+		skipBroadcast = extra.skipBroadcast and true or false,
 	})
 
 	if not ok then
@@ -2462,7 +2668,7 @@ local function BuildProfileMemberInfo(profile, memberId)
 	}
 end
 
-local function CollectTroubleshootingUnitsAndMembers(profile)
+local function CollectTroubleshootingUnitsAndMembers()
 	local items = {}
 	local seen = {}
 
@@ -2471,15 +2677,6 @@ local function CollectTroubleshootingUnitsAndMembers(profile)
 		if info.id and not seen[info.id] then
 			seen[info.id] = true
 			items[#items + 1] = info
-		end
-	end
-
-	if not IsInRaid() and not IsInGroup() and profile and type(profile.GetRaidCheckEquipmentSnapshotIds) == "function" then
-		for _, memberId in ipairs(profile:GetRaidCheckEquipmentSnapshotIds() or {}) do
-			if memberId and not seen[memberId] then
-				seen[memberId] = true
-				items[#items + 1] = BuildProfileMemberInfo(profile, memberId)
-			end
 		end
 	end
 
@@ -2614,173 +2811,249 @@ local function EmitAdminPendingSummary(modeLabel, summaryPending)
 	end
 end
 
-local function RunForUnit(unitInfo, profile, cfg, mode, pointName, pointAward)
-	local inspectState = RC:_GetTroubleshootingInspectState(unitInfo.unit, unitInfo)
-	local whisper = ShouldWhisper(mode, cfg)
-	local whisperTarget = unitInfo.id or unitInfo.short
-	local member = FindMember(profile, unitInfo.id)
-	local result = {
-		name = unitInfo.short,
-		displayName = unitInfo.displayName or unitInfo.short,
-		id = unitInfo.id,
-		missing = nil,
-		inspectPending = nil,
-		whisperedMissing = false,
-		alreadyWhispered = false,
-		prepared = false,
-		unprepared = false,
-		noInspectData = false,
-	}
+local function EmitAdminInspectionFailedSummary(modeLabel, summaryFailed)
+	if type(summaryFailed) ~= "table" or #summaryFailed == 0 then
+		return
+	end
+	EmitAdminMessage(string.format("[%s] Inspection Failed (not awarded, not counted as Unprepared):", modeLabel))
+	for _, entry in ipairs(summaryFailed) do
+		EmitAdminMessage(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectFailed or "Inspect could not be completed"))
+	end
+end
 
-	if not member then
-		result.skippedAward = true
-		return result
+local function GetProfileById(profileId)
+	if type(profileId) ~= "string" or profileId == "" then
+		return nil
+	end
+	if SF.LootHelperSync and SF.LootHelperSync.FindLocalProfileById then
+		local profile = SF.LootHelperSync:FindLocalProfileById(profileId)
+		if profile then
+			return profile
+		end
+	end
+	if SF.lootHelperDB and type(SF.lootHelperDB.profiles) == "table" then
+		return SF.lootHelperDB.profiles[profileId]
+	end
+	return nil
+end
+
+local function CollectGroupMemberIds()
+	local ids = {}
+	for _, unit in ipairs(CollectUnits()) do
+		local info = BuildUnitInfo(unit)
+		if info.id then
+			ids[#ids + 1] = info.id
+		end
+	end
+	return ids
+end
+
+local function CurrentSessionSnapshot()
+	local sync = SF.LootHelperSync
+	local active = sync and sync.IsSessionActive and sync:IsSessionActive() and true or false
+	local sessionId = nil
+	local profileId = nil
+	local announced = false
+	if active then
+		if sync.GetSessionId then
+			sessionId = sync:GetSessionId()
+		end
+		if sync.GetSessionProfileId then
+			profileId = sync:GetSessionProfileId()
+		end
+		if sync.HasAnnouncedCurrentSession then
+			announced = sync:HasAnnouncedCurrentSession(sessionId) and true or false
+		end
+	end
+	return {
+		active = active,
+		sessionId = sessionId,
+		profileId = profileId,
+		announced = announced,
+	}
+end
+
+local function ModeLabel(mode)
+	if mode == "pre" then
+		return "Pre-Raid Check"
+	end
+	return "Raid Check"
+end
+
+local function QueueFrozenInspectTargets(self, run)
+	for _, memberId in ipairs(run.targetIds or {}) do
+		local player = run.players and run.players[memberId]
+		local unit = (player and player.unitHint) or FindUnitByGuidOrId(player and player.guid, memberId)
+		if unit and not IsSelfUnit(unit) then
+			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+			if CheckRun and CheckRun.PlayerNeedsMoreInspects and not CheckRun.PlayerNeedsMoreInspects(player) then
+				-- Already complete, or this target has used its inspect attempt cap.
+			else
+				local info = BuildUnitInfo(unit)
+				info.id = memberId
+				local aliases = self:_GetInspectAliases(unit, info)
+				local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+				if type(cacheEntry) == "table" then
+					cacheEntry.nextRetryAt = nil
+				end
+				self:_QueueInspectForUnit(unit, info, cacheEntry)
+			end
+		elseif player and IsSelfUnit(unit) then
+			local captured = self:_GetLocalTroubleshootingSnapshot()
+			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+			local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+			if captured and CheckRun and Policy and player then
+				local now = GetTime and GetTime() or 0
+				local observation = BuildPolicyObservation(captured)
+				local policyResult = Policy.EvaluateObservation(observation)
+				if policyResult and policyResult.complete then
+					CheckRun.MarkAttempt(player, "complete", true)
+					player.freshObservation = {
+						complete = true,
+						policy = policyResult,
+						capturedAt = now,
+					}
+					player.policyResult = policyResult
+					local state = self:_GetInspectState()
+					state.lastGood = state.lastGood or {}
+					state.lastGood[memberId] = {
+						capturedAt = now,
+						complete = true,
+						policy = policyResult,
+						observation = observation,
+					}
+					player.lastGood = state.lastGood[memberId]
+					CheckRun.NoteProgress(run, now)
+				end
+			end
+		end
+	end
+end
+
+function RC:_ApplyCheckConsequences(run)
+	if not run or run.consequencesApplied then
+		return
 	end
 
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if not CheckRun then
+		return
+	end
+
+	local profile = GetProfileById(run.profileId)
+	if not profile then
+		run.consequencesApplied = true
+		SF:PrintError(string.format("[%s] Frozen profile is no longer available. Consequences were not applied and were not redirected.", ModeLabel(run.mode)))
+		return
+	end
+
+	local cfg = run.cfg or (profile.GetRaidCheckConfig and profile:GetRaidCheckConfig()) or {}
+	local session = CurrentSessionSnapshot()
+	local eligible, reason = CheckRun.ConsequenceSyncEligible(run, session)
+	local skipBroadcast = not eligible
+	local results = run.classifiedResults or {}
+	local mode = run.mode
+	local pointName = GetPointName(profile)
+	local pointAward = GetRaidCheckPointAward(cfg)
+	local whisper = ShouldWhisper(mode, cfg)
 	local rewardPot = profile.IsRewardPotMode and profile:IsRewardPotMode()
 	local whisperPointName = pointName
 	if rewardPot then
 		whisperPointName = ATTENDANCE_POINT_NAME
 	end
 
-	local function MarkUnprepared(reason, noInspectData)
-		result.unprepared = true
-		result.missing = reason
-		result.noInspectData = noInspectData and true or false
-		return result
-	end
-
-	if type(inspectState) ~= "table" then
-		return MarkUnprepared("No inspect data", true)
-	end
-
-	if not (inspectState.isKnown and HasEquipmentData(inspectState.slotsByInventory)) then
-		return MarkUnprepared(inspectState.message or inspectState.label or inspectState.status or "No inspect data", true)
-	end
-
-	local missing, hasItemDataPending = EvaluateSnapshot(inspectState.slotsByInventory, cfg)
-	if hasItemDataPending then
-		return MarkUnprepared("Item data incomplete", true)
-	end
-
-	if #missing > 0 then
-		local list = FormatMissingList(missing)
-		local alreadyWhispered = HasBeenWhisperedToday(member, mode)
-		if whisper and not alreadyWhispered then
-			WhisperMissing(whisperTarget, cfg, unitInfo.short, whisperPointName, list, mode)
-			result.whisperedMissing = true
-			MarkWhisperSent(member, mode, time())
-		elseif whisper and alreadyWhispered then
-			result.alreadyWhispered = true
-		end
-		result.unprepared = true
-		result.missing = list
-		return result
-	end
-
-	result.prepared = true
-
-	if mode == "raid" then
-		local awarded = false
-		if rewardPot then
-			if member.IncrementAttendance then
-				awarded = member:IncrementAttendance({
-					amount = 1,
-					logAuthor = "Raid Check",
-					reason = RAID_CHECK_REASON,
-				})
-			end
-		else
-			awarded = AwardPrepared(profile, member, pointName, pointAward)
-		end
-		if awarded and whisper and ShouldWhisperPrepared(cfg) then
-			local whisperAward = pointAward
-			if rewardPot then
-				whisperAward = 1
-			end
-			WhisperPrepared(whisperTarget, cfg, unitInfo.short, whisperPointName, whisperAward)
-		end
-	end
-
-	return result
-end
-
-function RC:RunPreRaidCheck()
-	local profile, cfg = ValidateCanRun("pre")
-	if not profile then return end
-
-	self:RequestTroubleshootingRefresh()
-
-	if SF.SystemMessage then
-		SF:SystemMessage("Pre-Raid Check started.")
-	else
-		SF:PrintInfo("[Pre-Raid Check] Initiated.")
+	if run.startedSessionForCheck and reason == "announce_failed" then
+		SF:PrintWarning(string.format("[%s] The check completed, but Loot Helper session synchronization could not be established. Results were saved locally.", ModeLabel(mode)))
+	elseif run.startedSessionForCheck and reason == "session_changed" then
+		SF:PrintWarning(string.format("[%s] The expected session is no longer active. Results are saved locally and were not synchronized.", ModeLabel(mode)))
+	elseif run.sessionMismatch or reason == "mismatch" or reason == "wrong_profile" then
+		SF:PrintWarning(string.format("[%s] Consequences stay on the selected profile and will not synchronize through the unrelated session.", ModeLabel(mode)))
+	elseif skipBroadcast and reason ~= "no_session" then
+		SF:PrintWarning(string.format("[%s] Session-backed synchronization did not complete. Results were saved locally.", ModeLabel(mode)))
 	end
 
 	local summaryMissing = {}
-	local summaryPending = {}
+	local summaryFailed = {}
+	local summaryRecent = {}
+	local memberOpts = { profile = profile, skipBroadcast = skipBroadcast }
 
-	for _, unit in ipairs(CollectUnits()) do
-		local info = BuildUnitInfo(unit)
-		if info.id and FindMember(profile, info.id) then
-			local res = RunForUnit(info, profile, cfg, "pre", GetPointName(profile))
-			if res then
-				if res.missing then
-					table.insert(summaryMissing, res)
-				elseif res.inspectPending then
-					table.insert(summaryPending, res)
+	for _, memberId in ipairs(run.targetIds or {}) do
+		local classified = results[memberId]
+		local player = run.players and run.players[memberId]
+		local unit = FindUnitByGuidOrId(player and player.guid, memberId)
+		local info = unit and BuildUnitInfo(unit) or { id = memberId, short = ShortName(memberId), displayName = ShortName(memberId) }
+		local member = FindMember(profile, memberId)
+		local displayName = info.displayName or info.short or ShortName(memberId)
+		local classId = classified and classified.class or nil
+
+		if classId == CheckRun.CLASS.INSPECTION_FAILED then
+			summaryFailed[#summaryFailed + 1] = {
+				name = info.short or ShortName(memberId),
+				displayName = displayName,
+				inspectFailed = "Inspect attempt failed",
+			}
+		elseif classId == CheckRun.CLASS.UNPREPARED or classId == CheckRun.CLASS.UNPREPARED_AVAILABILITY then
+			local missing = classified.missing
+			local list
+			if type(missing) == "table" and #missing > 0 then
+				list = FormatMissingList(missing)
+			elseif classId == CheckRun.CLASS.UNPREPARED_AVAILABILITY then
+				list = "Out of range / never inspectable"
+			else
+				list = "Unprepared"
+			end
+			local entry = {
+				name = info.short or ShortName(memberId),
+				displayName = displayName,
+				missing = list,
+				whisperedMissing = false,
+				alreadyWhispered = false,
+			}
+			if whisper and member and classId == CheckRun.CLASS.UNPREPARED then
+				local alreadyWhispered = HasBeenWhisperedToday(member, mode)
+				if not alreadyWhispered then
+					WhisperMissing(memberId, cfg, info.short or ShortName(memberId), whisperPointName, list, mode)
+					entry.whisperedMissing = true
+					MarkWhisperSent(member, mode, time())
+				else
+					entry.alreadyWhispered = true
+				end
+			end
+			summaryMissing[#summaryMissing + 1] = entry
+		elseif classId == CheckRun.CLASS.PREPARED then
+			if classified.verified == CheckRun.VERIFIED.RECENT then
+				summaryRecent[#summaryRecent + 1] = {
+					name = info.short or ShortName(memberId),
+					displayName = displayName,
+				}
+			end
+			if mode == "raid" and member then
+				local awarded = false
+				if rewardPot then
+					if member.IncrementAttendance then
+						awarded = member:IncrementAttendance({
+							amount = 1,
+							logAuthor = "Raid Check",
+							reason = RAID_CHECK_REASON,
+							profile = profile,
+							skipBroadcast = skipBroadcast,
+						})
+					end
+				else
+					awarded = AwardPrepared(profile, member, pointName, pointAward, memberOpts)
+				end
+				if awarded and whisper and ShouldWhisperPrepared(cfg) then
+					local whisperAward = pointAward
+					if rewardPot then
+						whisperAward = 1
+					end
+					WhisperPrepared(memberId, cfg, info.short or ShortName(memberId), whisperPointName, whisperAward)
 				end
 			end
 		end
 	end
 
-	EmitAdminMissingSummary("Pre-Raid Check", summaryMissing)
-	EmitAdminPendingSummary("Pre-Raid Check", summaryPending)
-	if SF.Debug then
-		SF.Debug:Info("RAID_CHECK", "Pre-Raid Check finished: %d missing, %d pending", #summaryMissing, #summaryPending)
-	end
-	SF:PrintSuccess("[Pre-Raid Check] Complete.")
-end
-
-function RC:RunRaidCheck()
-	local profile, cfg = ValidateCanRun("raid")
-	if not profile then return end
-
-	self:RequestTroubleshootingRefresh()
-
-	if SF.SystemMessage then
-		SF:SystemMessage("Raid Check started.")
-	else
-		SF:PrintInfo("[Raid Check] Initiated.")
-	end
-
-	local pointName = GetPointName(profile)
-	local pointAward = GetRaidCheckPointAward(cfg)
-	local summaryMissing = {}
-	local summaryPending = {}
-	local summarySkippedAward = {}
-	local anyUnprepared = false
-
-	for _, unit in ipairs(CollectUnits()) do
-		local info = BuildUnitInfo(unit)
-		if info.id and FindMember(profile, info.id) then
-			local res = RunForUnit(info, profile, cfg, "raid", pointName, pointAward)
-			if res then
-				if res.unprepared or res.missing then
-					anyUnprepared = true
-				end
-				if res.missing then
-					table.insert(summaryMissing, res)
-				elseif res.inspectPending then
-					table.insert(summaryPending, res)
-				elseif res.skippedAward then
-					table.insert(summarySkippedAward, res)
-				end
-			end
-		end
-	end
-
-	if profile.IsRewardPotMode and profile:IsRewardPotMode() and anyUnprepared and profile.AdjustRewardPot then
+	if mode == "raid" and rewardPot and CheckRun.AnyUnpreparedForPot(results) and profile.AdjustRewardPot then
 		local amount, deductionType, percent = profile:ComputeRewardPotDeductionCopper()
 		if amount and amount > 0 then
 			local ok, err = profile:AdjustRewardPot(
@@ -2791,6 +3064,7 @@ function RC:RunRaidCheck()
 					logAuthor = "Raid Check",
 					deductionType = deductionType,
 					percent = percent,
+					skipBroadcast = skipBroadcast,
 				}
 			)
 			if ok then
@@ -2801,22 +3075,331 @@ function RC:RunRaidCheck()
 		end
 	end
 
-	EmitAdminMissingSummary("Raid Check", summaryMissing)
-	for _, entry in ipairs(summarySkippedAward) do
-		EmitAdminMessage(("Skipping point award for %s (not in active profile)."):format(entry.name))
+	local label = ModeLabel(mode)
+	EmitAdminMissingSummary(label, summaryMissing)
+	EmitAdminInspectionFailedSummary(label, summaryFailed)
+	if #summaryRecent > 0 then
+		SF:PrintInfo(string.format("[%s] Recently Verified (range-only, last-good within 120s):", label))
+		for _, entry in ipairs(summaryRecent) do
+			SF:PrintInfo(string.format("  %s", entry.displayName or entry.name))
+		end
 	end
-	EmitAdminPendingSummary("Raid Check", summaryPending)
+
+	run.consequencesApplied = true
 	if SF.Debug then
-		SF.Debug:Info("RAID_CHECK", "Raid Check finished: %d missing, %d pending, %d skipped awards", #summaryMissing, #summaryPending, #summarySkippedAward)
+		SF.Debug:Info("RAID_CHECK", "%s consequences applied (missing=%d failed=%d skipBroadcast=%s reason=%s)",
+			label, #summaryMissing, #summaryFailed, tostring(skipBroadcast), tostring(reason))
 	end
-	SF:PrintSuccess("[Raid Check] Complete.")
+	SF:PrintSuccess(string.format("[%s] Complete.", label))
+end
+
+function RC:_TryReleaseCheckConsequences()
+	local state = self:_GetInspectState()
+	local run = state.adhocRun
+	if not run or not run.classified or run.consequencesApplied then
+		return
+	end
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if not CheckRun then
+		return
+	end
+	local session = CurrentSessionSnapshot()
+	local hold = CheckRun.ShouldHoldConsequences(run, session)
+	if hold then
+		return
+	end
+	self:_ApplyCheckConsequences(run)
+	state.adhocRun = nil
+end
+
+function RC:OnSessionStartAnnounceFailed(sessionId)
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	local state = self:_GetInspectState()
+	local run = state.adhocRun
+	if not run then
+		return
+	end
+	if run.expectedSessionId and sessionId and run.expectedSessionId ~= sessionId then
+		return
+	end
+	if CheckRun and CheckRun.NoteSessionStartFailed then
+		CheckRun.NoteSessionStartFailed(run)
+	else
+		run.sessionStartFailed = true
+	end
+	-- Release already-classified consequences locally. Do not rescan or start a replacement session.
+	self:_TryReleaseCheckConsequences()
+end
+
+function RC:_SettleAdhocRun(reason)
+	local state = self:_GetInspectState()
+	local run = state.adhocRun
+	if not run or run.classified then
+		return
+	end
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if not CheckRun then
+		return
+	end
+	local now = GetTime and GetTime() or 0
+	CheckRun.ClassifyRun(run, now, state.lastGood)
+	if SF.Debug then
+		SF.Debug:Info("RAID_CHECK", "%s classified (%s)", ModeLabel(run.mode), tostring(reason))
+	end
+	self:_TryReleaseCheckConsequences()
+	if state.adhocRun and state.adhocRun.classified and not state.adhocRun.consequencesApplied then
+		SF:PrintInfo(string.format("[%s] Equipment results are ready. Waiting for session announcement before applying synchronized consequences.", ModeLabel(run.mode)))
+	end
+end
+
+function RC:_TickAdhocRun()
+	local state = self:_GetInspectState()
+	local run = state.adhocRun
+	if not run then
+		return
+	end
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if not CheckRun then
+		return
+	end
+	local now = GetTime and GetTime() or 0
+	CheckRun.AdvanceClock(run, now, {
+		paused = IsInspectPausedForCombat() or self:_IsInspectPausedForManual(),
+	})
+	self:_ReconcileFrozenTargets()
+	if not run.classified then
+		QueueFrozenInspectTargets(self, run)
+		local settle, why = CheckRun.ShouldSettle(run, now)
+		if settle then
+			self:_SettleAdhocRun(why)
+		end
+	end
+	self:_TryReleaseCheckConsequences()
+end
+
+function RC:_EnsureAdhocTicker()
+	local state = self:_GetInspectState()
+	if state.adhocTickerStarted or not (C_Timer and C_Timer.After) then
+		if not (C_Timer and C_Timer.After) then
+			self:_TickAdhocRun()
+		end
+		return
+	end
+	state.adhocTickerStarted = true
+	local function Tick()
+		local current = self:_GetInspectState()
+		if not current.adhocRun then
+			current.adhocTickerStarted = false
+			return
+		end
+		self:_TickAdhocRun()
+		if current.adhocRun then
+			C_Timer.After(0.25, Tick)
+		else
+			current.adhocTickerStarted = false
+		end
+	end
+	C_Timer.After(0.25, Tick)
+end
+
+function RC:_StartAdhocRun(mode, profile, cfg, opts)
+	opts = opts or {}
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if not CheckRun then
+		SF:PrintError("Raid Equipment check runtime is unavailable.")
+		return "error"
+	end
+
+	self:EnsureInspectSupport()
+	local memberIds = {}
+	if profile.GetMemberIds then
+		memberIds = profile:GetMemberIds() or {}
+	end
+	local targetIds = CheckRun.IntersectMembershipAndGroup(memberIds, CollectGroupMemberIds())
+	local now = GetTime and GetTime() or 0
+	local run = CheckRun.NewRun({
+		id = tostring(now),
+		mode = mode,
+		profileId = profile:GetProfileId() or opts.profileId,
+		expectedSessionId = opts.expectedSessionId,
+		expectedSessionProfileId = opts.expectedSessionProfileId,
+		startedSessionForCheck = opts.startedSessionForCheck and true or false,
+		sessionMismatch = opts.sessionMismatch and true or false,
+		targetIds = targetIds,
+		now = now,
+	})
+	run.cfg = cfg
+	for _, memberId in ipairs(targetIds) do
+		local player = run.players[memberId]
+		local unit = FindUnitByGuidOrId(nil, memberId)
+		if player then
+			player.unitHint = unit
+			player.guid = unit and GetAccessibleUnitGUID(unit) or nil
+			if unit and CanInspectUnitNow(unit) then
+				player.currentlyInspectable = true
+			end
+		end
+	end
+
+	local state = self:_GetInspectState()
+	state.adhocRun = run
+	state.preflightOpen = false
+
+	local label = ModeLabel(mode)
+	if SF.SystemMessage then
+		SF:SystemMessage(label .. " started.")
+	else
+		SF:PrintInfo(string.format("[%s] Initiated.", label))
+	end
+
+	if IsInspectPausedForCombat() or (InCombatLockdown and InCombatLockdown()) then
+		state.inspectPausedForCombat = true
+		CheckRun.SetPause(run, "combat", true)
+		run.status = "paused"
+		SF:PrintInfo(string.format("[%s] Paused in combat. Inspection resumes when combat ends.", label))
+	else
+		QueueFrozenInspectTargets(self, run)
+		self:_ProcessInspectQueue()
+	end
+
+	self:_EnsureAdhocTicker()
+	self:_TickAdhocRun()
+	return "started"
+end
+
+function RC:BeginCheck(mode)
+	if mode ~= "pre" and mode ~= "raid" then
+		SF:PrintError("Invalid Raid Check mode.")
+		return "error"
+	end
+
+	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+	if not CheckRun then
+		SF:PrintError("Raid Equipment check runtime is unavailable.")
+		return "error"
+	end
+
+	local state = self:_GetInspectState()
+	local session = CurrentSessionSnapshot()
+	local profile = GetProfile()
+	local decision = CheckRun.DecidePreflight({
+		dialogOpen = state.preflightOpen and true or false,
+		runInFlight = state.adhocRun ~= nil,
+		hasProfile = profile ~= nil,
+		isAdmin = profile and IsCurrentUserAdmin(profile) or false,
+		sessionActive = session.active,
+		sessionProfileId = session.profileId,
+		selectedProfileId = profile and profile.GetProfileId and profile:GetProfileId() or nil,
+	})
+
+	if decision.action == "busy" then
+		SF:PrintInfo("A Raid Check is already in progress.")
+		return "busy"
+	end
+	if decision.action == "error" then
+		ValidateCanRun(mode)
+		return "error"
+	end
+
+	local profileObj, cfg = ValidateCanRun(mode)
+	if not profileObj then
+		return "error"
+	end
+	profile = profileObj
+
+	if decision.action == "start" then
+		if decision.warnMismatch then
+			SF:PrintWarning("This check uses the selected profile. Its consequences will not synchronize through the unrelated active session.")
+		end
+		return self:_StartAdhocRun(mode, profile, cfg, {
+			profileId = profile:GetProfileId(),
+			sessionMismatch = decision.warnMismatch and true or false,
+			expectedSessionId = (not decision.warnMismatch) and session.sessionId or nil,
+			expectedSessionProfileId = (not decision.warnMismatch) and session.profileId or nil,
+			startedSessionForCheck = false,
+		})
+	end
+
+	-- No active session: three-outcome prompt. Do not start inspect work until answered.
+	if state.preflightOpen then
+		return "busy"
+	end
+	local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
+	if not (dialogs and dialogs.ConfirmChoice) then
+		SF:PrintError("Session preflight dialog is unavailable.")
+		return "error"
+	end
+
+	state.preflightOpen = true
+	local shown = dialogs:ConfirmChoice(
+		"No Loot Helper session is active. Start a session for this check?",
+		YES or "Yes",
+		NO or "No",
+		function()
+			local current = self:_GetInspectState()
+			current.preflightOpen = false
+			local liveProfile = GetProfile()
+			if not liveProfile or (liveProfile.GetProfileId and liveProfile:GetProfileId() ~= profile:GetProfileId()) then
+				-- Frozen to the profile selected when the check was invoked.
+				liveProfile = profile
+			end
+			if not (SF.LootHelperSync and SF.LootHelperSync.StartSession) then
+				SF:PrintError("Loot Helper Sync is unavailable. The check was not started.")
+				return
+			end
+			local sessionId = SF.LootHelperSync:StartSession(profile:GetProfileId())
+			if not sessionId then
+				SF:PrintError("Failed to start a Loot Helper session. The check was not started.")
+				return
+			end
+			local liveCfg = cfg
+			if liveProfile.GetRaidCheckConfig then
+				liveCfg = liveProfile:GetRaidCheckConfig() or cfg
+			end
+			self:_StartAdhocRun(mode, liveProfile, liveCfg, {
+				profileId = profile:GetProfileId(),
+				expectedSessionId = sessionId,
+				expectedSessionProfileId = profile:GetProfileId(),
+				startedSessionForCheck = true,
+				sessionMismatch = false,
+			})
+		end,
+		function()
+			local current = self:_GetInspectState()
+			current.preflightOpen = false
+			self:_StartAdhocRun(mode, profile, cfg, {
+				profileId = profile:GetProfileId(),
+				startedSessionForCheck = false,
+				sessionMismatch = false,
+			})
+		end,
+		function()
+			local current = self:_GetInspectState()
+			current.preflightOpen = false
+			SF:PrintInfo(string.format("[%s] Cancelled.", ModeLabel(mode)))
+		end
+	)
+	if not shown then
+		state.preflightOpen = false
+		SF:PrintError("Could not show the session prompt. The check was not started.")
+		return "error"
+	end
+	return "prompt"
+end
+
+function RC:RunPreRaidCheck()
+	return self:BeginCheck("pre")
+end
+
+function RC:RunRaidCheck()
+	return self:BeginCheck("raid")
 end
 
 function RC:Run(mode)
 	if mode == "pre" then
-		return self:RunPreRaidCheck()
+		return self:BeginCheck("pre")
 	end
-	return self:RunRaidCheck()
+	return self:BeginCheck("raid")
 end
 
 function RC:GetTroubleshootingColumns()
@@ -2836,11 +3419,10 @@ end
 
 function RC:GetTroubleshootingSnapshot()
 	self:EnsureInspectSupport()
-	local profile = GetProfile()
-	local cfg = profile and profile.GetRaidCheckConfig and profile:GetRaidCheckConfig() or nil
+	local cfg = GetAddonOwnedAuditConfig()
 	local rows = {}
 
-	for _, info in ipairs(CollectTroubleshootingUnitsAndMembers(profile)) do
+	for _, info in ipairs(CollectTroubleshootingUnitsAndMembers()) do
 		if info.id then
 			local inspectState = self:_GetTroubleshootingInspectState(info.unit, info)
 			local missingMetaGem, metaGemPending = EvaluateMetaGemRowState(
@@ -2866,7 +3448,7 @@ function RC:GetTroubleshootingSnapshot()
 	end
 
 	return {
-		hasActiveProfile = profile ~= nil,
+		hasActiveProfile = GetProfile() ~= nil,
 		version = self:GetTroubleshootingVersion(),
 		columns = self:GetTroubleshootingColumns(),
 		rows = rows,
@@ -2880,8 +3462,7 @@ function RC:GetTroubleshootingSlotsForUnit(unit, cfg)
 
 	self:EnsureInspectSupport()
 	if cfg == nil then
-		local profile = GetProfile()
-		cfg = profile and profile.GetRaidCheckConfig and profile:GetRaidCheckConfig() or nil
+		cfg = GetAddonOwnedAuditConfig()
 	end
 
 	local info = BuildUnitInfo(unit)

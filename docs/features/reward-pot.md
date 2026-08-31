@@ -22,7 +22,7 @@ Gold amounts use WoW's gold, silver, and copper coins.
 
 ## Raid Check deductions
 
-When **Raid Check** finds any evaluated profile member unprepared, it subtracts from the pot once for that click.
+When **Raid Check** finds any evaluated profile member Unprepared, it subtracts from the pot once for that click. Inspection Failed does not count as Unprepared and does not deduct.
 
 The deduction can be:
 
@@ -35,7 +35,7 @@ Example: a 10% deduction from a 500,000 gold pot records a 50,000 gold subtracti
 
 If the configured amount is larger than the current pot, only the remaining gold is removed. A deduction of zero is skipped.
 
-Missing inspect data counts as unprepared. Out of range, never inspected, or incomplete item data all prevent Attendance awards and can trigger the one pot deduction.
+Never-inspectable players count as Unprepared. Inspection Failed (attempted inspect, incomplete or timed out) does not award Attendance and does not trigger the pot deduction.
 
 Running Raid Check more than once can award Attendance and deduct from the pot again. Use Loot Logs if you need to correct an extra run.
 

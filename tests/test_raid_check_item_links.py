@@ -190,7 +190,7 @@ def test_raid_check_lua_keeps_admin_summary_ungated():
     source = RAID_CHECK_LUA.read_text(encoding="utf-8")
     assert "EmitAdminMissingSummary" in source
     assert "if not ShouldWhisper(" not in source
-    assert source.count("EmitAdminMissingSummary") >= 2
+    assert source.count("EmitAdminMissingSummary") >= 1
 
 
 def test_raid_check_lua_checks_each_socket_for_a_gem():

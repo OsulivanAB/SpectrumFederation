@@ -839,7 +839,11 @@ local function AppendProfileLog(self, eventType, eventData, opts)
         return false, "Failed to create loot log entry."
     end
     if self.AddLootLog then
-        self:AddLootLog(logEntry)
+        local addOpts = nil
+        if opts and opts.skipBroadcast then
+            addOpts = { skipBroadcast = true }
+        end
+        self:AddLootLog(logEntry, addOpts)
     end
     return true, nil
 end
@@ -980,6 +984,9 @@ function LootProfile:AdjustRewardPot(change, amountCopper, reason, extra)
     local logOpts = {}
     if extra and extra.logAuthor then
         logOpts.author = extra.logAuthor
+    end
+    if extra and extra.skipBroadcast then
+        logOpts.skipBroadcast = true
     end
     local ok, err = AppendProfileLog(self, eventType, eventData, logOpts)
     if not ok then
@@ -1347,12 +1354,16 @@ end
 -- Function to add a loot log entry to this profile
 -- @param LootLog lootLog Instance of LootLog to add
 -- @return boolean success
-function LootProfile:AddLootLog(lootLog)
+function LootProfile:AddLootLog(lootLog, opts)
+    opts = opts or {}
     local ok, err = self:_InsertLog(lootLog, { requireAdmin = true })
     if ok then
         -- If Sync is loaded, ask it to broadcast this log.
         -- Sync will no-op unless there is an active session AND the profileId matches.
-        if SF
+        -- Callers that already know sync is ineligible (mismatch, unannounced
+        -- Yes-path session) pass skipBroadcast so we do not hit the wrong-profile path.
+        if not opts.skipBroadcast
+            and SF
             and SF.LootHelperSync
             and SF.LootHelperSync.BroadcastNewLog
             and self.GetProfileId

@@ -2,6 +2,99 @@ local addonName, SF = ...
 SF.LootHelperSync = SF.LootHelperSync or {}
 local Sync = SF.LootHelperSync
 
+-- Record whether the local CONTROL/ALERT SES_START send was accepted.
+-- This is a local send-acceptance boundary, not proof that every peer received it.
+-- A terminally failed or already-reset session cannot be resurrected by a late success.
+-- @param state table Sync state
+-- @param sessionId string
+-- @param sendOk boolean
+-- @return boolean true when the session is now marked announced
+function Sync.ApplySesStartSendResult(state, sessionId, sendOk)
+    if type(state) ~= "table" or type(sessionId) ~= "string" or sessionId == "" then
+        return false
+    end
+    if state._sessionStartFailedFor == sessionId then
+        return false
+    end
+    if state.active ~= true or state.sessionId ~= sessionId then
+        return false
+    end
+    if not sendOk then
+        return false
+    end
+    state._sessionAnnounced = sessionId
+    return true
+end
+
+-- Classify a failed initial SES_START against coordinator session state.
+-- @param state table Sync state
+-- @param sessionId string
+-- @return string "reset"|"already_announced"|"already_failed"|"stale"|"invalid"
+function Sync.ClassifyUnannouncedStartFailure(state, sessionId)
+    if type(state) ~= "table" or type(sessionId) ~= "string" or sessionId == "" then
+        return "invalid"
+    end
+    if state._sessionStartFailedFor == sessionId then
+        return "already_failed"
+    end
+    if state.active == true and state.sessionId == sessionId and state._sessionAnnounced == sessionId then
+        return "already_announced"
+    end
+    if state.active ~= true or state.sessionId ~= sessionId then
+        return "stale"
+    end
+    return "reset"
+end
+
+-- Remember that this session id reached a terminal failed-start state.
+-- @param state table Sync state
+-- @param sessionId string
+-- @return nil
+function Sync.MarkSessionStartFailed(state, sessionId)
+    if type(state) ~= "table" or type(sessionId) ~= "string" or sessionId == "" then
+        return
+    end
+    state._sessionStartFailedFor = sessionId
+end
+
+-- Terminal failed-start cleanup for a locally created session that never announced.
+-- Resets local session identity without broadcasting SES_END, then notifies Raid Check.
+-- @param sessionId string|nil Session id that failed to announce
+-- @param reason string|nil Reset reason
+-- @return boolean didReset
+-- @return string outcome
+function Sync:FailUnannouncedSessionStart(sessionId, reason)
+    local state = self.state
+    sessionId = sessionId or (state and state.sessionId) or nil
+    local outcome = Sync.ClassifyUnannouncedStartFailure(state, sessionId)
+    if outcome == "already_announced" or outcome == "invalid" then
+        return false, outcome
+    end
+
+    local didReset = false
+    if outcome == "reset" then
+        Sync.MarkSessionStartFailed(state, sessionId)
+        -- Never-announced sessions must not send SES_END.
+        if self._ResetSessionState then
+            self:_ResetSessionState(reason or "ses_start_announce_failed")
+        else
+            state.active = false
+            state.sessionId = nil
+            state.profileId = nil
+            state.isCoordinator = false
+            state._sessionAnnounced = nil
+        end
+        didReset = true
+    end
+    -- Preserve the failed-id marker across reset so a late success cannot resurrect it.
+    Sync.MarkSessionStartFailed(self.state, sessionId)
+
+    if SF.RaidCheck and SF.RaidCheck.OnSessionStartAnnounceFailed then
+        SF.RaidCheck:OnSessionStartAnnounceFailed(sessionId)
+    end
+    return didReset, outcome
+end
+
 -- ============================================================================
 -- Coordinator responsibilities (Sequence 1 and 2)
 -- ============================================================================
@@ -419,8 +512,12 @@ end
 function Sync:BroadcastSessionStart()
     if not self.state.active or not self.state.isCoordinator then return end
 
+    local sessionId = self.state.sessionId
     local dist = self:_EnforceGroupedSessionActive("StartSession")
-    if not dist then return end
+    if not dist then
+        self:FailUnannouncedSessionStart(sessionId, "ses_start_no_dist")
+        return
+    end
 
     local profileId = self.state.profileId
     self.state.authorMax = self:ComputeAuthorMax(profileId) or {}
@@ -462,12 +559,21 @@ function Sync:BroadcastSessionStart()
         helpersReady = {},  -- Track which helpers have received SES_START
     }
 
-    if SF.LootHelperComm then
-        SF.LootHelperComm:Send("CONTROL", self.MSG.SES_START, payload, dist, nil, "ALERT")
+    local sendOk = false
+    if SF.LootHelperComm and SF.LootHelperComm.Send then
+        sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_START, payload, dist, nil, "ALERT") and true or false
     end
 
-    -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
-    self.state._sessionAnnounced = self.state.sessionId
+    -- Only mark announced when the local comm layer accepted the SES_START send.
+    -- A failed send must become a terminal failed-start, not an active unannounced session.
+    if not Sync.ApplySesStartSendResult(self.state, self.state.sessionId, sendOk) then
+        if SF.Debug then
+            SF.Debug:Error("SYNC", "SES_START send was not accepted (sessionId=%s); failing unannounced session start",
+                tostring(self.state.sessionId))
+        end
+        self:FailUnannouncedSessionStart(self.state.sessionId, "ses_start_send_failed")
+        return
+    end
     self:_MarkRosterAnnounced(self.state.sessionId)
 
     -- Start coordinator heartbeat sender (ticker)
