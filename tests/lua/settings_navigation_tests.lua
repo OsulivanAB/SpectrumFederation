@@ -374,6 +374,13 @@ assertEq(equipmentHits[1].categoryId, "lootHelper", "Equipment query stays in Lo
 
 local searchClick = Model.ResolveSearchCategoryClick(registry, session, "lootHelper", "Equipment")
 assertEq(searchClick.pageId, "lootHelperEquipment", "search category click opens the matching tab, not last-tab")
+local groupClick = Model.ResolveSearchCategoryClick(registry, session, "lootHelper", "Loot Tools")
+assertEq(groupClick.pageId, "lootHelperGeneral", "category-only search click opens the default page, not a blank category")
+local descClick = Model.ResolveSearchCategoryClick(registry, session, "lootHelper", "admin workflows")
+assertEq(descClick.pageId, "lootHelperGeneral", "description-only search click opens the default Loot Helper page")
+local emptySearchClick = Model.ResolveSearchCategoryClick(registry, {}, "emptyAddon", "Empty Addon")
+assertEq(emptySearchClick.categoryId, "emptyAddon", "empty category remains selectable from search")
+assertEq(emptySearchClick.pageId, nil, "empty category search still has no content page")
 local searchEnterDisabled = Model.ResolveSearchEnter(registry, session, "Cursed Surge")
 assertEq(searchEnterDisabled.changed, false, "Enter does not select a disabled category")
 local searchEnter = Model.ResolveSearchEnter(registry, session, "Debugging")

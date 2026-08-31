@@ -500,7 +500,13 @@ function Model.BestMatchingPageInCategory(registry, categoryId, query)
         end
     end
 
-    return bestPage
+    if bestPage then
+        return bestPage
+    end
+
+    -- Category-only hits (group/description/name) still open a real page when
+    -- the category has content pages. Empty categories keep a nil pageId.
+    return Model.GetDefaultPageId(registry, categoryId)
 end
 
 function Model.ResolveSearchCategoryClick(registry, session, categoryId, query)
@@ -515,11 +521,7 @@ function Model.ResolveSearchCategoryClick(registry, session, categoryId, query)
         return Model.ResolveSidebarSelect(registry, session, categoryId)
     end
 
-    local pageId = Model.BestMatchingPageInCategory(registry, categoryId, query)
-    if not pageId then
-        return CopySelection(categoryId, nil, true)
-    end
-    return CopySelection(categoryId, pageId, true)
+    return CopySelection(categoryId, Model.BestMatchingPageInCategory(registry, categoryId, query), true)
 end
 
 function Model.ResolveSearchEnter(registry, session, query)
