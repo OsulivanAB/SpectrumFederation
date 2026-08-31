@@ -9,7 +9,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - `.github/scripts/`: Python automation for linting, packaging, docs validation, release/version checks, and Blizzard interface sync.
 - `.github/workflows/`: GitHub Actions workflows for PR validation, beta releases, promotion to `main`, rollback, and Copilot setup.
 - `docs/` + `mkdocs.yml`: documentation source for the published docs site.
-- `tests/`: Python tests plus Lua 5.1 tests that load production Settings and Mouse Tracer Lua.
+- `tests/`: Python tests plus Lua 5.1 tests that load production Settings, Mouse Tracer, and Loot Helper window Lua.
 - `SpectrumFederation/AGENTS.md`: deeper addon-specific implementation guidance for work inside the addon tree.
 
 ## Source Of Truth
@@ -27,6 +27,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Run Interface badge formatting tests: `python -m pytest tests/test_interface_badge.py`
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
 - Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
+- Run Loot Helper window tests (production Lua via lua5.1): `python -m pytest tests/test_loot_helper_window.py
 
 ## Important Workflows
 
@@ -53,3 +54,4 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - README Interface badge formatting or `blizzard_api.py` display conversion: also run `python -m pytest tests/test_interface_badge.py`
 - Settings navigation or Registry helpers: also run `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer constants or trail engine: also run `python -m pytest tests/test_mouse_tracer.py`
+- Loot Helper window minimize/positioning: also run `python -m pytest tests/test_loot_helper_window.py

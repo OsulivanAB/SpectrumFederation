@@ -23,6 +23,28 @@ local function Round(v)
     return math.floor(v + 0.5)
 end
 
+-- WoW resizes a frame around its current anchor. CENTER (the default, and the
+-- typical point after StopMovingOrSizing) therefore grows and shrinks from the
+-- middle. Pin the current top-left screen position so height changes expand
+-- and collapse downward, keeping the title bar in place.
+function Window:_GetFrameTopLeft()
+    local f = self._frame
+    if not f or not f.GetLeft or not f.GetTop then return nil, nil end
+    return f:GetLeft(), f:GetTop()
+end
+
+function Window:_SetFrameTopLeft(left, top)
+    local f = self._frame
+    if not f or left == nil or top == nil then return end
+    f:ClearAllPoints()
+    f:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", left, top)
+end
+
+function Window:_AnchorToCurrentTopLeft()
+    local left, top = self:_GetFrameTopLeft()
+    self:_SetFrameTopLeft(left, top)
+end
+
 function Window:_GetWindowStateTable()
     -- Persist per-account in SpectrumFederationDB.lootHelper.window
     SpectrumFederationDB = SpectrumFederationDB or {}
@@ -109,6 +131,9 @@ function Window:_ApplyMinimizedState()
     local st = self:_GetWindowStateTable()
     local minimized = f.__sfMinimized and true or false
 
+    -- Re-anchor before SetSize so restore grows downward from the title bar.
+    self:_AnchorToCurrentTopLeft()
+
     if minimized then
         local w = Clamp(st.width or f:GetWidth() or C.DEFAULT_WIDTH, C.MIN_WIDTH, C.MAX_WIDTH)
         f:SetSize(w, C.MINIMIZED_HEIGHT)
@@ -153,27 +178,33 @@ end
 function Window:LoadState()
     local f = self._frame
     if not f then return end
-     local st = self:_GetWindowStateTable()
+    local st = self:_GetWindowStateTable()
 
-      -- Size
-      local w = Clamp(st.width or C.DEFAULT_WIDTH, C.MIN_WIDTH, C.MAX_WIDTH)
-      local h = Clamp(st.height or C.DEFAULT_HEIGHT, C.MIN_HEIGHT, C.MAX_HEIGHT)
-      f:SetSize(w, h)
-      f.__sfMinimized = st.minimized and true or false
+    -- Apply the currently displayed size before restoring the saved point so a
+    -- CENTER-saved minimized window does not jump when height is applied later.
+    f.__sfMinimized = st.minimized and true or false
+    local w = Clamp(st.width or C.DEFAULT_WIDTH, C.MIN_WIDTH, C.MAX_WIDTH)
+    local h
+    if f.__sfMinimized then
+        h = C.MINIMIZED_HEIGHT
+    else
+        h = Clamp(st.height or C.DEFAULT_HEIGHT, C.MIN_HEIGHT, C.MAX_HEIGHT)
+    end
+    f:SetSize(w, h)
 
-      -- Position
-      local point = st.point or C.DEFAULT_POINT
-     local relativePoint = st.relativePoint or C.DEFAULT_RELATIVE_POINT
-     local x = tonumber(st.x) or C.DEFAULT_X
-     local y = tonumber(st.y) or C.DEFAULT_Y
+    -- Position
+    local point = st.point or C.DEFAULT_POINT
+    local relativePoint = st.relativePoint or C.DEFAULT_RELATIVE_POINT
+    local x = tonumber(st.x) or C.DEFAULT_X
+    local y = tonumber(st.y) or C.DEFAULT_Y
 
-      f:ClearAllPoints()
-      f:SetPoint(point, UIParent, relativePoint, x, y)
-      self:_ApplyMinimizedState()
+    f:ClearAllPoints()
+    f:SetPoint(point, UIParent, relativePoint, x, y)
+    self:_ApplyMinimizedState()
 
-      if SF.Debug then
-          SF.Debug:Verbose("LH_WINDOW", "LoadState: size=%dx%d, minimized=%s, position=%s->%s at (%d,%d)", w, h, tostring(f.__sfMinimized), point, relativePoint, x, y)
-      end
+    if SF.Debug then
+        SF.Debug:Verbose("LH_WINDOW", "LoadState: size=%dx%d, minimized=%s, position=%s->%s at (%d,%d)", w, h, tostring(f.__sfMinimized), point, relativePoint, x, y)
+    end
 
      -- Ensure safe after layout settles
      if C_Timer and C_Timer.After then
@@ -239,6 +270,10 @@ function Window:SetMinimized(minimized)
     f.__sfMinimized = minimized
     st.minimized = minimized
 
+    if SF.Debug then
+        SF.Debug:Info("LH_WINDOW", "SetMinimized: minimized=%s", tostring(minimized))
+    end
+
     self:_ApplyMinimizedState()
     self:SaveState()
 end
@@ -288,6 +323,7 @@ function Window:SetLocked(locked)
 
             f.Title:SetScript("OnDragStop", function()
                 f:StopMovingOrSizing()
+                Window:_AnchorToCurrentTopLeft()
                 Window:SaveState()
             end)
         end
@@ -627,6 +663,7 @@ function Window:Create()
     resize:SetScript("OnMouseUp", function(_, button)
         if button ~= "LeftButton" then return end
         frame:StopMovingOrSizing()
+        Window:_AnchorToCurrentTopLeft()
         Window:ClampSizeToBounds()
         Window:SaveState()
     end)

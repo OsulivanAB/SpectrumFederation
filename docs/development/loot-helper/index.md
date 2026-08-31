@@ -57,6 +57,8 @@ Profiles are keyed by stable ID and `activeProfileId` stores the local selection
 
 `UI/LootHelper/Controller.lua` decides window visibility, observes settings/profile/session changes, builds roster models, and connects row actions.
 
+`UI/LootHelper/Window.lua` owns the roster window frame. Minimize and restore re-anchor the frame to its current top-left so height changes expand downward from the title bar instead of growing around a CENTER point.
+
 `RosterModel.lua` merges:
 
 - members from the active profile;
@@ -121,4 +123,4 @@ The settings Equipment page consumes versioned troubleshooting snapshots through
 
 ## Testing changes
 
-For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover partial item data, range changes, profile/non-profile members, whisper suppression, zero/fractional awards, and admin system-message output independent of whisper settings. Item-link parsing used by enchant/gem checks is covered by `python -m pytest tests/test_raid_check_item_links.py`.
+For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover partial item data, range changes, profile/non-profile members, whisper suppression, zero/fractional awards, and admin system-message output independent of whisper settings. Item-link parsing used by enchant/gem checks is covered by `python -m pytest tests/test_raid_check_item_links.py`. Minimize/expand anchoring for the roster window is covered by `python -m pytest tests/test_loot_helper_window.py`.
