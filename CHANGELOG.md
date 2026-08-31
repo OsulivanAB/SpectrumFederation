@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.3.0-beta.5] - 2026-08-31
+
+### Added
+- Add optional Mouse Tracer on Gameplay → UI Enhancements
+
 ## [1.3.0-beta.4] - 2026-08-31
 
 ### Removed
