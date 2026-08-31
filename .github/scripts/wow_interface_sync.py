@@ -378,6 +378,20 @@ def read_toc_fields(toc_path):
     return interface_match.group(1).strip(), version_match.group(1).strip()
 
 
+def extra_packaged_toc_paths(toc_path):
+    """Return sibling child-addon TOC paths that must stay in lockstep."""
+    toc_path = Path(toc_path)
+    repo_root = toc_path.parent.parent
+    child_toc = (
+        repo_root
+        / "SpectrumFederation_CursedSurgeTracker"
+        / "SpectrumFederation_CursedSurgeTracker.toc"
+    )
+    if child_toc.exists() and child_toc.resolve() != toc_path.resolve():
+        return [child_toc]
+    return []
+
+
 def update_toc(toc_path, interface, version):
     path = Path(toc_path)
     content = path.read_text(encoding="utf-8")
@@ -391,22 +405,35 @@ def update_toc(toc_path, interface, version):
     return False
 
 
+def update_packaged_tocs(toc_path, interface, version):
+    """Update the primary TOC and any sibling packaged addon TOCs."""
+    changed = update_toc(toc_path, interface, version)
+    extra_paths = extra_packaged_toc_paths(toc_path)
+    for extra_toc in extra_paths:
+        if update_toc(extra_toc, interface, version):
+            changed = True
+            print(f"[sync] Updated sibling TOC: {extra_toc}")
+    return changed
+
+
 def git_config(path):
     subprocess.run(["git", "-C", str(path), "config", "user.name", "github-actions[bot]"], check=True)
     subprocess.run(["git", "-C", str(path), "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=True)
 
 
 def git_commit_and_push(path, branch, toc_path, message):
-    rel_toc = os.path.relpath(toc_path, path)
+    rel_paths = [os.path.relpath(toc_path, path)]
+    for extra_toc in extra_packaged_toc_paths(toc_path):
+        rel_paths.append(os.path.relpath(extra_toc, path))
 
     diff_check = subprocess.run(
-        ["git", "-C", str(path), "diff", "--quiet", "--", rel_toc],
+        ["git", "-C", str(path), "diff", "--quiet", "--", *rel_paths],
         check=False,
     )
     if diff_check.returncode == 0:
         return False
 
-    subprocess.run(["git", "-C", str(path), "add", rel_toc], check=True)
+    subprocess.run(["git", "-C", str(path), "add", *rel_paths], check=True)
     subprocess.run(["git", "-C", str(path), "commit", "-m", message], check=True)
     subprocess.run(["git", "-C", str(path), "push", "origin", branch], check=True)
     return True
@@ -518,8 +545,8 @@ def main():
     print(f"[sync] Main: {main_version.raw} -> {new_main_version.raw}")
     print(f"[sync] Beta: {beta_version.raw} -> {new_beta_version.raw} (offset preserved)")
 
-    main_changed = update_toc(main_toc, target_interface, new_main_version.raw) if main_update_needed else False
-    beta_changed = update_toc(beta_toc, target_interface, new_beta_version.raw) if beta_update_needed else False
+    main_changed = update_packaged_tocs(main_toc, target_interface, new_main_version.raw) if main_update_needed else False
+    beta_changed = update_packaged_tocs(beta_toc, target_interface, new_beta_version.raw) if beta_update_needed else False
 
     if args.commit_and_push:
         git_config(args.main_path)

@@ -9,7 +9,7 @@ UI.Style = {
         paddingTop      = 12,
         paddingBottom   = 16,
         paddingX        = 16,
-        sectionSpacing  = 1,
+        sectionSpacing  = 14,
     },
         
     Section = {

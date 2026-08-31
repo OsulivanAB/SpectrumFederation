@@ -227,7 +227,7 @@ function Store:Set(path, value)
 end
 
 -- Retrieve a character-specific setting value by dot-path notation
--- @param path string Dot-path like "pressAndHoldCastingBySpec.71"
+-- @param path string Dot-path like "exampleSetting"
 -- @return any Setting value, or nil if path does not exist
 function Store:GetCharacter(path)
 	local parent, key = ResolvePath(self.charDb, path, false)
@@ -236,7 +236,7 @@ function Store:GetCharacter(path)
 end
 
 -- Set a character-specific setting value by dot-path notation and trigger callbacks
--- @param path string Dot-path like "pressAndHoldCastingBySpec.71"
+-- @param path string Dot-path like "exampleSetting"
 -- @param value any The value to set
 -- @return nil
 function Store:SetCharacter(path, value)
@@ -249,45 +249,6 @@ function Store:SetCharacter(path, value)
 	-- Character-scoped callbacks use a "character." prefix so they stay distinct
 	-- from account-scoped paths passed to Store:RegisterCallback.
 	self:_Fire("character." .. tostring(path), value, old)
-end
-
--- Get the saved Press and Hold Casting setting for a specialization
--- @param specID number|string Specialization ID
--- @return boolean|nil Saved setting value, or nil if not set
-function Store:GetPressAndHoldCastingBySpec(specID)
-	if specID == nil then return nil end
-	return self:GetCharacter("pressAndHoldCastingBySpec." .. tostring(specID))
-end
-
--- Set the saved Press and Hold Casting setting for a specialization
--- @param specID number|string Specialization ID
--- @param enabled boolean Whether Press and Hold Casting should be enabled
--- @return nil
-function Store:SetPressAndHoldCastingBySpec(specID, enabled)
-	if specID == nil then return end
-	self:SetCharacter("pressAndHoldCastingBySpec." .. tostring(specID), enabled and true or false)
-end
-
--- Ensure all player specializations have a saved Press and Hold Casting value
--- @param defaultEnabled boolean Default setting used for any missing specs
--- @return nil
-function Store:EnsurePressAndHoldCastingDefaultsForPlayer(defaultEnabled)
-	if not UnitClass or not GetNumSpecializationsForClassID or not GetSpecializationInfoForClassID then
-		return
-	end
-
-	local _, _, classID = UnitClass("player")
-	if not classID then return end
-
-	local specCount = GetNumSpecializationsForClassID(classID)
-	if not specCount or specCount < 1 then return end
-
-	for specIndex = 1, specCount do
-		local specID = GetSpecializationInfoForClassID(classID, specIndex)
-		if specID and self:GetPressAndHoldCastingBySpec(specID) == nil then
-			self:SetPressAndHoldCastingBySpec(specID, defaultEnabled and true or false)
-		end
-	end
 end
 
 -- Register a callback to be called when a setting at path changes

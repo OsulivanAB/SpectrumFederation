@@ -1,0 +1,99 @@
+# Mouse Tracer
+
+Mouse Tracer is an optional per-character cursor trail. User-facing control descriptions belong on [Settings](../settings-ui.md). This page is the maintainership contract for the runtime.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `modules/MouseTracer/Constants.lua` | Spacing, cadence, pool bounds, slider ranges, and setting keys. |
+| `modules/MouseTracer/TrailEngine.lua` | Pure sampling, interpolation, ring buffer, fade/trim, and HSV color. No frames. |
+| `modules/MouseTracer/MouseTracer.lua` | Host frame, circular stamp pool, cached settings, snapshot debounce, copy helpers, and event resets. |
+| `modules/UI/Settings/Pages/NicheFeatures.lua` | Gameplay category plus the UI Enhancements page. |
+| `modules/Settings/Schema.lua` | `CHARACTER_DEFAULTS.mouseTracer` and account-wide `mouseTracerCopies`. |
+
+`Init.lua` starts Mouse Tracer after `SettingsStore` and `SettingsApply`. Live values live in `SpectrumFederationCharDB`. Account-wide `mouseTracerCopies` exist only so **Copy From Character** can read another character's last saved settings. WoW cannot read another character's per-character SavedVariables.
+
+Character defaults (filled only when a key is unset): off, Trail Length 400, Fade Duration 0.50, Trail Thickness 16, Rainbow Cycle Speed 0.25, Trail Opacity 0.70. Do not bump `SettingsSchema.VERSION` for these defaults. `MergeDefaults` fills missing character and account keys.
+
+## Performance contract
+
+These bounds are intentional. Do not grow the pool, add interpolation backlog, or put Store access on the sample/fade path for convenience.
+
+### Disabled
+
+No `OnUpdate`, no cursor polling, no visible regions, and no Mouse Tracer runtime processing.
+
+### Enabled, idle, and fully faded
+
+Bounded 60 Hz cursor polling. O(1) work. No segment traversal, no Store access, and no allocations.
+
+### Moving
+
+Bounded 60 Hz sample/emission, independent of rendered FPS. Every accepted movement reaches the current cursor this tick. No interpolation backlog and no trail gaps. After initialization the hot path must not allocate. Settings and UI scale are cached.
+
+Stamp spacing follows trail thickness so circles overlap heavily:
+
+```text
+minSpacing = max(1, thickness * 0.10)
+n = min(MAX_NEW_POINTS_PER_TICK, max(1, floor(dist / minSpacing)))
+spacing = dist / n
+```
+
+`MAX_NEW_POINTS_PER_TICK` is `ceil(250 / 1)` so a non-teleport move can still reach the cursor this tick without stretching stamps past the overlap spacing.
+
+Stamp diameter tapers along path distance: newest uses full Trail Thickness, oldest uses `TAPER_MIN_RATIO` (0.40) of that thickness. Opacity fade still runs independently. Emit ticks refresh live stamp sizes without resetting fade alpha.
+
+Interpolated timestamps use `t(i) = prevT + (now - prevT) * (i / n)`.
+
+### Stationary and fading
+
+No geometry generation. Bounded 30 Hz fade processing. No allocations. Return to idle when the final segment expires.
+
+### Resources
+
+`MAX_POINTS = 1202` and `MAX_SEGMENTS = 1201` (`ceil(1200 / 1) + 2` and one less). The circular stamp pool is `MAX_POINTS` textures (`TempPortraitAlphaMask`) and must not grow at runtime. Do not return to square `CreateLine` quads.
+
+Cadence constants:
+
+```text
+ACTIVE_SAMPLE_INTERVAL = 1/60
+FADE_INTERVAL = 1/30
+IDLE_POLL_INTERVAL = 1/60
+```
+
+## Baseline safety
+
+Invalidate the sampling baseline, and do not emit a segment from stale coordinates, on:
+
+- initial enable;
+- `PLAYER_ENTERING_WORLD`;
+- UI scale changes;
+- mouselook transitions;
+- teleport or other discontinuity resets.
+
+The first valid cursor sample after a reset establishes position only. Rejected small movements must keep the last **accepted** trail point as the spacing baseline. Do not slide that baseline on every rejected sample.
+
+`PLAYER_ENTERING_WORLD` and `UI_SCALE_CHANGED` also clear the visible trail. Scale changes recache `GetEffectiveScale()` before the next sample.
+
+Cursor coordinates come from `GetCursorPosition()` divided by the host's effective scale. `GetScaledCursorPosition` is not used.
+
+## Settings and snapshots
+
+Sliders write character settings immediately so the visible trail updates while dragging. Account-wide copy snapshots are debounced (~0.35s) with one reusable ticker. Enable/disable, Copy From Character, login, and logout flush immediately.
+
+Copy From Character applies the six character keys under `applySuspended` so the runtime reconfigures once, writes one snapshot, and refreshes the page once.
+
+Identity keys for snapshots use `NameUtil.GetSelfId()` (`Name-Realm`). Compare identities with `NameUtil.SamePlayer`.
+
+## Tests
+
+Production Lua tests load `Constants.lua` and `TrailEngine.lua`:
+
+```bash
+python -m pytest tests/test_mouse_tracer.py
+```
+
+PR validation on `beta` and `main` runs that file beside the Settings navigation and Cursed Surge Tracker tests.
+
+In-game profiler checks must use isolated `C_AddOnProfiler.MeasureCall` around Mouse Tracer work. Addon-wide LastTime is not a Mouse Tracer pass/fail signal.

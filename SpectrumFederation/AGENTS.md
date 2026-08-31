@@ -27,6 +27,7 @@ These notes apply when changing files under `SpectrumFederation/`.
 - Settings:
   - Schema/Store/Apply: `SpectrumFederation/modules/Settings/`
   - Settings UI framework + pages: `SpectrumFederation/modules/UI/Settings/`
+- Mouse Tracer: `SpectrumFederation/modules/MouseTracer/` (constants, pure trail engine, runtime host). The Gameplay / UI Enhancements page lives in `modules/UI/Settings/Pages/NicheFeatures.lua`.
 
 ## Adding a new setting (correct, minimal workflow)
 When you need a new toggle/option:
@@ -37,8 +38,9 @@ When you need a new toggle/option:
 2. **Storage:** follow existing patterns in `modules/Settings/Store.lua` (many settings are automatic—copy what existing settings do).
 3. **Apply behavior:** ensure the setting actually affects runtime behavior.
    - Prefer handling in the feature module, but use `modules/Settings/Apply.lua` if that’s the established pattern.
-4. **UI:** render it in the Settings UI (typically `modules/UI/Settings/Pages/Main.lua` for General).
-   - Use the existing renderer/controls—do not create a second UI system.
+4. **UI:** render it in the Settings UI (typically `modules/UI/Settings/Pages/General.lua` for General).
+   - Use the existing renderer, registry, and standalone window—do not create a second UI system.
+   - New pages use `categoryId` for the sidebar category. Legacy `parentId` still works. Categories with two or more content pages appear as tabs, not nested sidebar rows.
 5. **Schema migrations:** avoid unless strictly necessary. If needed, keep it tiny and backward-compatible.
 
 ## Debug logging (required for new features)
@@ -61,10 +63,13 @@ When you need a new toggle/option:
 - If existing code is not fully localized yet, keep your additions consistent with the existing direction (don’t introduce a third pattern).
 
 ## Packaging + versioning
-- **Any new Lua file must be listed in** `SpectrumFederation/SpectrumFederation.toc`.
-- **Any behavior/UI/settings change must bump** `## Version:` in the `.toc`.
+- **Any new Lua file must be listed in** the TOC of the addon that owns it (`SpectrumFederation.toc` or a child-addon TOC).
+- Parent TOC files must not load child-addon Lua or XML.
+- **Any behavior/UI/settings change must bump** `## Version:` in `SpectrumFederation/SpectrumFederation.toc` and keep any packaged child TOC on the same version.
 
 ## Validation checklist (do these before declaring “done”)
 - `python3 .github/scripts/lint_all.py`
 - `/reload` in-game without errors.
 - Verify the new setting appears (when applicable) and toggling it changes behavior as intended.
+- Settings navigation changes: `python -m pytest tests/test_settings_navigation.py`
+- Mouse Tracer engine or constants changes: `python -m pytest tests/test_mouse_tracer.py`

@@ -16,6 +16,7 @@ When invoked:
    - `python3 .github/scripts/validate_packaging.py`
    - `python3 .github/scripts/validate_docs.py`
    - `python -m pytest tests/test_wow_interface_sync.py`
+   - `python -m pytest tests/test_interface_badge.py` when README badges or `blizzard_api.py` display conversion changed
 4. Pay extra attention to:
    - TOC load order or version/interface changes
    - workflow edits that weaken checks

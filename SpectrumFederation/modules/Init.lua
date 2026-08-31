@@ -1,6 +1,13 @@
 -- Grab the namespace
 local addonName, SF = ...
 
+-- Optional child addons declare ## Dependencies: SpectrumFederation and
+-- ## X-SpectrumFederation-Parent: SpectrumFederation. They may read
+-- _G.SpectrumFederation for Debug, slash registration, and time helpers.
+-- The parent discovers installed children from TOC metadata only and never
+-- loads child Lua or XML.
+_G[addonName] = SF
+
 local f = CreateFrame("Frame")
 f:RegisterEvent("ADDON_LOADED")
 f:SetScript("OnEvent", function(_, _, loadedAddonName)
@@ -24,6 +31,13 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
             SF.Debug:Verbose("INIT", "Initializing SettingsApply")
         end
         SF.SettingsApply:Init()
+    end
+
+    if SF.MouseTracer and SF.MouseTracer.Init then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing Mouse Tracer")
+        end
+        SF.MouseTracer:Init()
     end
 
     if SF.SettingsUI and SF.SettingsUI.Init then

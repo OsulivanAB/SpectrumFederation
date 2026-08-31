@@ -15,7 +15,7 @@ Enter `/sf loot` to enable Loot Helper and re-evaluate the window. The title bar
 - a minimize button;
 - drag and resize behavior, unless **Lock Loot Window** is enabled.
 
-The window's position, size, and minimized state are saved locally.
+The window's position, size, and minimized state are saved locally. Minimizing and restoring keep the title bar in place so the window grows and shrinks downward.
 
 ## Understanding the roster
 
@@ -91,4 +91,4 @@ Both source and target must already be profile members. Review the selected name
 - [Raid Check](raid-check.md)
 - [Sync Sessions](sync-sessions.md)
 - [Loot Logs](loot-logs.md)
-- [Settings and Gameplay](../settings-ui.md)
+- [Settings](../settings-ui.md)

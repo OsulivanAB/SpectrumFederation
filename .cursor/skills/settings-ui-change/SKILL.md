@@ -15,11 +15,14 @@ Use this skill for work in `SpectrumFederation/modules/Settings/` or `SpectrumFe
    - confirm storage behavior in `modules/Settings/Store.lua`
    - wire runtime behavior in the feature module or `modules/Settings/Apply.lua`
    - render it through the existing settings UI under `modules/UI/Settings/`
-3. Reuse the existing page builder, registry, definition renderer, and control helpers instead of introducing a parallel settings framework.
-4. If the change adds user-facing text, check whether `locale/enUS.lua` should own the string.
-5. If the change adds a new packaged Lua file, update `SpectrumFederation/SpectrumFederation.toc` in load order.
+3. Reuse the existing page builder, registry, navigation model, definition renderer, and control helpers instead of introducing a parallel settings framework.
+4. New pages use `categoryId` for the sidebar category. `parentId` remains a legacy alias. Do not add nested sidebar children.
+5. If the change adds user-facing text, check whether `locale/enUS.lua` should own the string. Settings chrome is currently hardcoded English.
+6. If the change adds a new packaged Lua file, update `SpectrumFederation/SpectrumFederation.toc` in load order.
 
 ## Validation
 
 - Run `python3 .github/scripts/lint_all.py`
+- If navigation, categories, tabs, search, or `ShowPage` changed: `python -m pytest tests/test_settings_navigation.py`
+- If Mouse Tracer settings or page chrome changed, also run `python -m pytest tests/test_mouse_tracer.py` when the engine or constants were touched
 - Recommend in-game verification with `/reload` and a quick settings UI smoke test

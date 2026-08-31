@@ -1,9 +1,24 @@
 """Validate MkDocs documentation and its code-facing references."""
 
+import importlib.util
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _load_blizzard_api():
+    """Load the sibling Blizzard API helper without treating scripts as a package."""
+    module_path = Path(__file__).resolve().parent / "blizzard_api.py"
+    spec = importlib.util.spec_from_file_location("blizzard_api", module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    return module
+
+
+blizzard_api = _load_blizzard_api()
+interface_to_display = blizzard_api.interface_to_display
 
 STALE_PATTERNS = {
     r"/sfdebug\b": "Use '/sf debug', not the removed '/sfdebug' command.",
@@ -145,7 +160,11 @@ def read_toc_field(toc_text, field):
 
 
 def validate_readme_badges(repo_root):
-    """Keep generated README version/interface badges aligned with the TOC."""
+    """Keep generated README version/interface badges aligned with the TOC.
+
+    The Interface badge uses the human-readable form of the 6-digit TOC value
+    (for example 120100 becomes 12.1.0).
+    """
     toc_text = (repo_root / "SpectrumFederation/SpectrumFederation.toc").read_text(
         encoding="utf-8"
     )
@@ -162,10 +181,23 @@ def validate_readme_badges(repo_root):
         )
     elif "badge/Interface-" not in readme_text:
         errors.append("README.md: missing automation-compatible Interface badge")
-    elif not is_beta_version and f"badge/Interface-{interface}-" not in readme_text:
-        errors.append(
-            f"README.md: Interface badge does not match TOC value {interface}"
-        )
+    else:
+        try:
+            interface_display = interface_to_display(interface)
+        except ValueError:
+            errors.append(
+                "SpectrumFederation/SpectrumFederation.toc: "
+                f"Interface '{interface}' is not a 6-digit value"
+            )
+        else:
+            if (
+                not is_beta_version
+                and f"badge/Interface-{interface_display}-" not in readme_text
+            ):
+                errors.append(
+                    "README.md: Interface badge does not match TOC value "
+                    f"{interface} ({interface_display})"
+                )
 
     if not version:
         errors.append(
@@ -187,15 +219,19 @@ def validate_readme_badges(repo_root):
 
 def validate_slash_command_reference(repo_root):
     """Require every registered command and diagnostic alias in the reference."""
-    addon_root = repo_root / "SpectrumFederation"
+    addon_roots = [repo_root / "SpectrumFederation"]
+    child_root = repo_root / "SpectrumFederation_CursedSurgeTracker"
+    if child_root.exists():
+        addon_roots.append(child_root)
     commands = set()
     aliases = set()
-    for source in addon_root.rglob("*.lua"):
-        source_text = source.read_text(encoding="utf-8")
-        commands.update(
-            REGISTERED_COMMAND_RE.findall(source_text)
-        )
-        aliases.update(SLASH_ALIAS_RE.findall(source_text))
+    for addon_root in addon_roots:
+        for source in addon_root.rglob("*.lua"):
+            source_text = source.read_text(encoding="utf-8")
+            commands.update(
+                REGISTERED_COMMAND_RE.findall(source_text)
+            )
+            aliases.update(SLASH_ALIAS_RE.findall(source_text))
     reference = (
         repo_root / "docs/reference/slash-commands.md"
     ).read_text(encoding="utf-8").lower()

@@ -4,7 +4,7 @@ applyTo: "SpectrumFederation/**/*,.github/**/*"
 
 # TOC Version Bump — Required on Every Change
 
-**Any change to files under `SpectrumFederation/` MUST be accompanied by a version bump in `SpectrumFederation/SpectrumFederation.toc`.**
+**Any change to files under `SpectrumFederation/` or a packaged child addon MUST be accompanied by a version bump in `SpectrumFederation/SpectrumFederation.toc`, and packaged child TOC Version/Interface values must stay in lockstep.**
 
 **Even if your PR only touches `.github/` files** (e.g. workflows, scripts, instruction files), you must still verify that the TOC version is valid for the current branch — and fix it if it is not.
 

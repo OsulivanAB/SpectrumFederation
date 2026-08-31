@@ -44,12 +44,19 @@ def run_command(cmd, description):
         return False
 
 
-def lint_lua(addon_dir):
-    """Run luacheck on Lua files."""
-    return run_command(
-        ["luacheck", addon_dir, "--only", "0"],
-        "luacheck (Lua linter)"
-    )
+def lint_lua(addon_dirs):
+    """Run luacheck on Lua files in each packaged addon directory."""
+    if isinstance(addon_dirs, str):
+        addon_dirs = [addon_dirs]
+
+    all_passed = True
+    for addon_dir in addon_dirs:
+        passed = run_command(
+            ["luacheck", addon_dir, "--only", "0"],
+            f"luacheck (Lua linter) [{addon_dir}]"
+        )
+        all_passed = all_passed and passed
+    return all_passed
 
 
 def lint_yaml(workflow_dir):
@@ -104,11 +111,18 @@ def main():
     )
     
     args = parser.parse_args()
+
+    lua_dirs = [args.addon_dir]
+    child_addon_dir = "SpectrumFederation_CursedSurgeTracker"
+    if child_addon_dir != args.addon_dir and Path(child_addon_dir).exists():
+        lua_dirs.append(child_addon_dir)
     
     # Verify directories exist
-    if not args.skip_lua and not Path(args.addon_dir).exists():
-        print(f"Error: Addon directory '{args.addon_dir}' not found")
-        sys.exit(1)
+    if not args.skip_lua:
+        for addon_dir in lua_dirs:
+            if not Path(addon_dir).exists():
+                print(f"Error: Addon directory '{addon_dir}' not found")
+                sys.exit(1)
     
     if not args.skip_yaml and not Path(args.workflow_dir).exists():
         print(f"Error: Workflow directory '{args.workflow_dir}' not found")
@@ -126,7 +140,7 @@ def main():
     
     # Run linters
     if not args.skip_lua:
-        results.append(("Lua", lint_lua(args.addon_dir)))
+        results.append(("Lua", lint_lua(lua_dirs)))
     
     if not args.skip_yaml:
         results.append(("YAML", lint_yaml(args.workflow_dir)))

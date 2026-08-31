@@ -1,0 +1,9 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.blizzard.com/wow/ui/
+..\FrameXML\UI.xsd">
+    <!-- MapCanvas requires a named virtual template to acquire pins.
+         Visual children are created in Lua so the rest of the addon can
+         stay consistent with Spectrum Federation's Lua-built UI. -->
+    <Frame name="SpectrumFederationCSTPinTemplate" hidden="true" virtual="true" mixin="SpectrumFederationCSTPinMixin" enableMouse="true">
+        <Size x="36" y="36"/>
+    </Frame>
+</Ui>

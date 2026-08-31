@@ -126,15 +126,21 @@ def create_addon_zip(addon_name, version):
         zip_path.unlink()
     
     print(f"[publish-release] Creating release zip: {zip_path}")
+
+    child_addon_name = "SpectrumFederation_CursedSurgeTracker"
+    zip_entries = [addon_name]
+    if Path(child_addon_name).exists() and child_addon_name != addon_name:
+        zip_entries.append(child_addon_name)
     
     # Create zip using subprocess for consistency with validation
     try:
         subprocess.run(
-            ["zip", "-r", str(zip_path), addon_name, "-x", "*.git*", "*/AGENTS.md"],
+            ["zip", "-r", str(zip_path), *zip_entries, "-x", "*.git*", "*/AGENTS.md"],
             check=True,
             capture_output=True
         )
         print(f"[publish-release] ✓ Created {zip_path}")
+        print(f"[publish-release] Packaged folders: {', '.join(zip_entries)}")
         return zip_path
         
     except subprocess.CalledProcessError as e:

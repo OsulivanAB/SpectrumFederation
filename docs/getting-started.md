@@ -4,7 +4,7 @@
 
 Install **Spectrum Federation** with the CurseForge client, WowUp, or a release archive from [GitHub Releases](https://github.com/OsulivanAB/SpectrumFederation/releases).
 
-For a manual installation, extract the archive and place the `SpectrumFederation` folder in the Retail AddOns directory:
+For a manual installation, extract the archive and place **both** `SpectrumFederation` and `SpectrumFederation_CursedSurgeTracker` folders in the Retail AddOns directory:
 
 - Windows: `World of Warcraft\_retail_\Interface\AddOns\`
 - macOS: `World of Warcraft/_retail_/Interface/AddOns/`
@@ -13,11 +13,14 @@ Restart World of Warcraft or run `/reload`, then enable the addon for the charac
 
 ## Open Spectrum Federation
 
-Enter `/sf` to toggle the addon's standalone settings window. The navigation is grouped into:
+Enter `/sf` to toggle the addon's standalone settings window. The left sidebar lists categories grouped into:
 
-- **Core** — appearance and character-specific gameplay automation.
+- **Core** — appearance and Gameplay, including the optional Mouse Tracer on **UI Enhancements**.
 - **Loot Tools** — Loot Helper configuration, profiles, sessions, equipment auditing, and logs.
 - **Advanced** — diagnostic logging.
+- **Optional** — installed child addons, such as Cursed Surge Tracker when it is present.
+
+Loot Helper's General, Profile, Session, Equipment, and Admin pages are **tabs** on the Loot Helper category, not extra sidebar rows. Paths such as **Loot Helper → Profile** mean: select Loot Helper, then the Profile tab.
 
 The Loot Helper window appears automatically when all of these conditions are true:
 
@@ -80,5 +83,6 @@ See [Raid Check](features/raid-check.md) before enabling automatic whispers or a
 - `/sf raidcheck raid` — run the awarding raid check.
 - `/sf version` — show who in the raid or party is running Spectrum Federation, and which version.
 - `/sf loot sync` — manually compare your data with the active session.
+- `/sfcst` — dump Cursed Surge Tracker diagnostics.
 
 The [Slash Command Reference](reference/slash-commands.md) lists every supported command and restriction.
