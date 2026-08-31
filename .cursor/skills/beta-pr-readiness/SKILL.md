@@ -23,6 +23,7 @@ Use this skill when a task is close to done and you need a repo-specific merge-r
    - `python3 .github/scripts/validate_packaging.py`
    - `python3 .github/scripts/validate_docs.py`
    - `python -m pytest tests/test_wow_interface_sync.py`
+   - `python -m pytest tests/test_settings_navigation.py` when Settings navigation/Registry/TOC metadata changed
 4. If the change touches addon packaging, release logic, or TOC-driven behavior, inspect `SpectrumFederation/SpectrumFederation.toc` before finishing.
 5. For workflow changes, verify checks were not weakened and `copilot-setup-steps` still uses the required job name.
 6. For docs changes, compare commands and workflow names against the actual files in `.github/workflows/` and `.github/scripts/`.

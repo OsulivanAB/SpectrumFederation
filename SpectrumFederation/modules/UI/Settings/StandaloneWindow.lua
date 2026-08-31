@@ -12,11 +12,13 @@ local C = {
     FRAME_NAME = "SF_SettingsWindow",
     WIDTH = 900,
     HEIGHT = 900,
-    
+    SCREEN_MARGIN = 40,
+    RESIZE_HANDLE_SIZE = 16,
+
     -- Layout
     NAV_WIDTH = 220,
     PADDING = 12,
-    
+
     -- Navigation elements
     BANNER_HEIGHT = 54,  -- Maintains 4:1 aspect ratio for 512x128 banner texture
     VERSION_HEIGHT = 16,
@@ -28,21 +30,28 @@ local C = {
     NAV_BUTTON_HEIGHT = 28,
     NAV_BUTTON_GAP = 6,
     NAV_SPACER_HEIGHT = 12,
-    
+    TAB_BAR_HEIGHT = 28,
+    TAB_BAR_GAP = 8,
+
     -- Content area
     CONTENT_PADDING = 12,
     DIVIDER_WIDTH = 1,
-    CONTENT_HEADER_HEIGHT = 78,
-    
+    CONTENT_HEADER_HEIGHT = 70,
+
     -- Colors (RGBA, 0-1 range)
     BG = {0, 0, 0, 0.70},
     BORDER = {0.65, 0.65, 0.65, 0.65},
     DIVIDER = {1, 1, 1, 0.08},
     NAV_SELECTED_BG = {1, 1, 1, 0.08},
-    NAV_ACTIVE_ROOT_BG = {0.50, 0.78, 1, 0.10},
     NAV_HOVER_BG = {1, 1, 1, 0.04},
     NAV_TRANSPARENT_BG = {0, 0, 0, 0},
-    
+    NAV_DISABLED_TEXT = {0.50, 0.50, 0.50, 0.90},
+    NAV_NORMAL_TEXT = {0.84, 0.84, 0.84, 1},
+    NAV_SELECTED_TEXT = {1, 1, 1, 1},
+
+    DISABLED_TOOLTIP_TITLE = "Add-on disabled",
+    DISABLED_TOOLTIP_TEXT = "This add-on is disabled for this character. Enable it in World of Warcraft's AddOns list. Spectrum Federation cannot enable or disable it from this window.",
+
     -- Backdrop settings
     BACKDROP = {
         bgFile = "Interface\\Buttons\\WHITE8X8",
@@ -52,7 +61,7 @@ local C = {
         edgeSize = 16,
         insets = { left = 4, right = 4, top = 4, bottom = 4 }
     },
-    
+
     -- Texture paths
     BANNER_TEXTURE = "Interface\\AddOns\\SpectrumFederation\\media\\Textures\\SpectrumFederationBanner.tga",
 }
@@ -68,15 +77,17 @@ SettingsWindow.navItems = {}
 SettingsWindow.navButtons = {}
 SettingsWindow.navGroups = {}
 SettingsWindow.pagePanels = {}
+SettingsWindow.currentCategoryId = nil
 SettingsWindow.currentPageId = nil
-SettingsWindow.rootPages = {}
-SettingsWindow.childrenByParent = {}
+SettingsWindow.lastPageByCategory = {}
 
-local function SortPages(a, b)
-    return (a.order or 1000) < (b.order or 1000)
+local function Registry()
+    return SF.SettingsUI
 end
 
-local GetRootPageId
+local function Model()
+    return SF.SettingsNavigationModel
+end
 
 -- ============================================================
 -- Helper Functions
@@ -94,194 +105,137 @@ local function GetVersionString()
     return "Retail " .. version
 end
 
-local function GetPageLayout(pageId)
-    local page = pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId]
-    return page and page.layout or nil
-end
-
 local function GetPage(pageId)
-    return pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId] or nil
+    local ui = Registry()
+    return pageId and ui and ui.pagesById and ui.pagesById[pageId] or nil
 end
 
-local function GetPageLabel(page)
-    return page and (page.navLabel or page.name) or ""
-end
-
-local function GetPageGroup(pageId)
-    local page = GetPage(pageId)
-    if not page then
-        return "Settings"
+local function GetCategory(categoryId)
+    local ui = Registry()
+    if ui and ui.GetCategory then
+        return ui:GetCategory(categoryId)
     end
-
-    if page.parentId then
-        local rootPage = GetPage(GetRootPageId(pageId))
-        if rootPage and rootPage.group and rootPage.group ~= "" then
-            return rootPage.group
-        end
-    end
-
-    return page.group or "Settings"
-end
-
-local function GetPageDescription(pageId)
-    local page = GetPage(pageId)
-    if not page then
-        return nil
-    end
-
-    if page.description and page.description ~= "" then
-        return page.description
-    end
-
-    local rootPage = GetPage(GetRootPageId(pageId))
-    if rootPage and rootPage.description and rootPage.description ~= "" then
-        return rootPage.description
-    end
-
     return nil
 end
 
-local function NormalizeQuery(text)
-    if type(text) ~= "string" then
-        return ""
-    end
+local function GetPageLayout(pageId)
+    local page = GetPage(pageId)
+    return page and page.layout or nil
+end
 
+local function GetSearchQuery()
+    local model = Model()
+    local text = SettingsWindow.navSearchBox and SettingsWindow.navSearchBox:GetText() or ""
+    if model and model.NormalizeQuery then
+        return model.NormalizeQuery(text)
+    end
     return text:lower():gsub("^%s+", ""):gsub("%s+$", "")
 end
 
-local function PageMatchesQuery(pageId, query)
-    if query == "" then
-        return true
-    end
-
-    local page = GetPage(pageId)
-    if not page then
-        return false
-    end
-
-    local candidates = {
-        page.name,
-        page.navLabel,
-        page.description,
-        page.group,
+function SettingsWindow:Session()
+    return {
+        currentCategoryId = self.currentCategoryId,
+        currentPageId = self.currentPageId,
+        lastPageByCategory = self.lastPageByCategory,
     }
-
-    for _, text in ipairs(candidates) do
-        if type(text) == "string" and text ~= "" and text:lower():find(query, 1, true) then
-            return true
-        end
-    end
-
-    return false
 end
 
-local function BuildBreadcrumb(pageId)
-    local page = GetPage(pageId)
-    if not page then
+local function CategoryLabel(category)
+    if not category then
         return ""
     end
+    return category.navLabel or category.name or ""
+end
 
-    local parts = { GetPageGroup(pageId) }
-    local rootPage = GetPage(GetRootPageId(pageId))
-    if rootPage and rootPage.id ~= page.id then
-        table.insert(parts, GetPageLabel(rootPage))
+-- ============================================================
+-- Resize
+-- ============================================================
+
+function SettingsWindow:GetAvailableSize()
+    local width = C.WIDTH
+    local height = C.HEIGHT
+    if UIParent and UIParent.GetWidth then
+        width = UIParent:GetWidth() or width
+        height = UIParent:GetHeight() or height
+    end
+    width = math.max(1, width - (C.SCREEN_MARGIN * 2))
+    height = math.max(1, height - (C.SCREEN_MARGIN * 2))
+    return width, height
+end
+
+function SettingsWindow:_ApplyResizeBounds(minWidth, minHeight, maxWidth, maxHeight)
+    local frame = self.frame
+    if not frame then return end
+
+    frame:SetResizable(true)
+    if maxWidth < minWidth then maxWidth = minWidth end
+    if maxHeight < minHeight then maxHeight = minHeight end
+
+    if frame.SetResizeBounds then
+        frame:SetResizeBounds(minWidth, minHeight, maxWidth, maxHeight)
+    else
+        if frame.SetMinResize then frame:SetMinResize(minWidth, minHeight) end
+        if frame.SetMaxResize then frame:SetMaxResize(maxWidth, maxHeight) end
+    end
+end
+
+function SettingsWindow:ApplyPreferredWindowMin(pageId)
+    if not self.frame then return end
+
+    local preferredWidth = C.WIDTH
+    local preferredHeight = C.HEIGHT
+    local layout = GetPageLayout(pageId)
+    if layout then
+        preferredWidth = layout.windowWidth or preferredWidth
+        preferredHeight = layout.windowHeight or preferredHeight
     end
 
-    return table.concat(parts, " / ")
+    local availableWidth, availableHeight = self:GetAvailableSize()
+    local model = Model()
+    local minWidth, minHeight = preferredWidth, preferredHeight
+    if model and model.EffectiveWindowMin then
+        minWidth, minHeight = model.EffectiveWindowMin(
+            preferredWidth, preferredHeight, availableWidth, availableHeight)
+    else
+        minWidth = math.min(preferredWidth, availableWidth)
+        minHeight = math.min(preferredHeight, availableHeight)
+    end
+
+    self:_ApplyResizeBounds(minWidth, minHeight, availableWidth, availableHeight)
+
+    local currentWidth = self.frame:GetWidth() or C.WIDTH
+    local currentHeight = self.frame:GetHeight() or C.HEIGHT
+    local newWidth = currentWidth
+    local newHeight = currentHeight
+    if currentWidth < minWidth then
+        newWidth = minWidth
+    end
+    if currentHeight < minHeight then
+        newHeight = minHeight
+    end
+    if currentWidth > availableWidth then
+        newWidth = availableWidth
+    end
+    if currentHeight > availableHeight then
+        newHeight = availableHeight
+    end
+
+    if math.abs(newWidth - currentWidth) > 0.5 or math.abs(newHeight - currentHeight) > 0.5 then
+        self.frame:SetSize(newWidth, newHeight)
+    end
 end
 
 -- ============================================================
 -- Navigation Item Registry
 -- ============================================================
 
--- Add a spacer to the navigation
--- @param height number Optional height in pixels (default: C.NAV_SPACER_HEIGHT)
-function SettingsWindow:AddNavSpacer(height)
-    table.insert(self.navItems, {
-        type = "spacer",
-        height = height or C.NAV_SPACER_HEIGHT
-    })
-end
-
--- Add a page button to the navigation
--- @param pageId string Page ID to link to
--- @param label string Display label for the button
-function SettingsWindow:AddNavPage(pageId, label)
-    table.insert(self.navItems, {
-        type = "page",
-        id = pageId,
-        label = label
-    })
-end
-
-GetRootPageId = function(pageId)
-    local page = pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId]
-    while page and page.parentId do
-        page = SF.SettingsUI.pagesById[page.parentId]
-    end
-    return page and page.id or pageId
-end
-
-local function ResolveSelectablePageId(pageId)
-    local page = pageId and SF.SettingsUI and SF.SettingsUI.pagesById and SF.SettingsUI.pagesById[pageId]
-    if page and page.defaultChildId and SF.SettingsUI.pagesById[page.defaultChildId] then
-        return page.defaultChildId
-    end
-    return pageId
-end
-
 function SettingsWindow:BuildNavItemsFromRegistry()
-    self.navItems = {}
-    self.navGroups = {}
-
-    local roots = {}
-    local childrenByParent = {}
-    for _, page in ipairs(SF.SettingsUI.pages or {}) do
-        if page.parentId then
-            childrenByParent[page.parentId] = childrenByParent[page.parentId] or {}
-            table.insert(childrenByParent[page.parentId], page)
-        else
-            table.insert(roots, page)
-        end
-    end
-
-    table.sort(roots, SortPages)
-    for _, children in pairs(childrenByParent) do
-        table.sort(children, SortPages)
-    end
-
-    self.rootPages = roots
-    self.childrenByParent = childrenByParent
-
-    local currentGroup
-    for _, page in ipairs(roots) do
-        local group = GetPageGroup(page.id)
-        if group ~= currentGroup then
-            currentGroup = group
-            table.insert(self.navItems, {
-                type = "group",
-                id = group,
-                label = group,
-            })
-        end
-
-        table.insert(self.navItems, {
-            type = "page",
-            id = page.id,
-            label = page.navLabel or page.name,
-            depth = 0,
-            parentId = nil,
-        })
-
-        for _, childPage in ipairs(childrenByParent[page.id] or {}) do
-            table.insert(self.navItems, {
-                type = "page",
-                id = childPage.id,
-                label = childPage.navLabel or childPage.name,
-                depth = 1,
-                parentId = page.id,
-            })
-        end
+    local model = Model()
+    local ui = Registry()
+    if model and model.BuildSidebarItems and ui then
+        self.navItems = model.BuildSidebarItems(ui)
+    else
+        self.navItems = {}
     end
 end
 
@@ -289,46 +243,59 @@ end
 -- Navigation UI Creation
 -- ============================================================
 
--- Create a navigation button
--- @param parent Frame Parent frame
--- @param label string Button label
--- @param pageId string Page ID this button links to
--- @return Button The created button
-local function CreateNavButton(parent, label, pageId, depth)
+local function ShowDisabledTooltip(region)
+    if not region or not GameTooltip then return end
+    GameTooltip:SetOwner(region, "ANCHOR_RIGHT")
+    GameTooltip:SetText(C.DISABLED_TOOLTIP_TITLE, 1, 1, 1)
+    GameTooltip:AddLine(C.DISABLED_TOOLTIP_TEXT, nil, nil, nil, true)
+    GameTooltip:Show()
+end
+
+local function HideTooltip()
+    if GameTooltip then
+        GameTooltip:Hide()
+    end
+end
+
+local function CreateNavButton(parent, label, categoryId, selectable)
     local btn = CreateFrame("Button", nil, parent)
     btn:SetSize(C.NAV_WIDTH - C.PADDING * 2, C.NAV_BUTTON_HEIGHT)
-    
-    -- Background highlight
+    btn:EnableMouse(true)
+
     btn.bg = btn:CreateTexture(nil, "BACKGROUND")
     btn.bg:SetAllPoints()
     btn.bg:SetColorTexture(unpack(C.NAV_TRANSPARENT_BG))
-    
-    -- Label text
+
     btn.text = btn:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    btn.text:SetPoint("LEFT", btn, "LEFT", 8 + ((depth or 0) * 14), 0)
+    btn.text:SetPoint("LEFT", btn, "LEFT", 8, 0)
+    btn.text:SetPoint("RIGHT", btn, "RIGHT", -8, 0)
     btn.text:SetText(label)
     btn.text:SetJustifyH("LEFT")
-    btn.text:SetFontObject((depth or 0) > 0 and GameFontHighlightSmall or GameFontNormal)
-    
-    -- Hover effect
-    btn:SetScript("OnEnter", function(self)
-        local activeRootId = GetRootPageId(SettingsWindow.currentPageId)
-        if SettingsWindow.currentPageId ~= pageId and activeRootId ~= pageId then
-            self.bg:SetColorTexture(unpack(C.NAV_HOVER_BG))
+
+    btn:SetScript("OnEnter", function(selfBtn)
+        if not selectable then
+            ShowDisabledTooltip(selfBtn)
+            return
+        end
+        if SettingsWindow.currentCategoryId ~= categoryId then
+            selfBtn.bg:SetColorTexture(unpack(C.NAV_HOVER_BG))
         end
     end)
-    
-    btn:SetScript("OnLeave", function(self)
-        SettingsWindow:UpdateNavButtonStates(SettingsWindow.currentPageId)
+
+    btn:SetScript("OnLeave", function()
+        HideTooltip()
+        SettingsWindow:UpdateNavButtonStates()
     end)
-    
-    -- Click handler
+
     btn:SetScript("OnClick", function()
-        SettingsWindow:SelectTab(pageId)
+        if not selectable then
+            return
+        end
+        SettingsWindow:SelectCategory(categoryId)
     end)
-    
-    btn.pageId = pageId
-    btn.depth = depth or 0
+
+    btn.categoryId = categoryId
+    btn.selectable = selectable and true or false
     return btn
 end
 
@@ -346,51 +313,36 @@ local function CreateGroupHeader(parent, label)
 end
 
 function SettingsWindow:ComputeVisibleNavState()
-    local activeRootId = GetRootPageId(self.currentPageId)
-    local query = NormalizeQuery(self.navSearchBox and self.navSearchBox:GetText() or "")
-    local visiblePages = {}
+    local query = GetSearchQuery()
+    local visibleCategories = {}
     local visibleGroups = {}
-    local visiblePageCount = 0
+    local visibleCount = 0
+    local model = Model()
+    local ui = Registry()
 
-    for _, rootPage in ipairs(self.rootPages or {}) do
-        local rootMatches = PageMatchesQuery(rootPage.id, query)
-        local rootVisible = (query == "") and true or false
-        local visibleChildren = {}
-
-        for _, childPage in ipairs(self.childrenByParent[rootPage.id] or {}) do
-            local childMatches = PageMatchesQuery(childPage.id, query)
-            if query == "" then
-                if rootPage.id == activeRootId then
-                    visibleChildren[childPage.id] = true
-                end
-            elseif rootMatches or childMatches then
-                rootVisible = true
-                if rootMatches or childMatches then
-                    visibleChildren[childPage.id] = true
-                end
+    for _, item in ipairs(self.navItems or {}) do
+        if item.type == "category" then
+            local matches = true
+            if model and model.CategoryMatchesQuery then
+                matches = model.CategoryMatchesQuery(ui, item.id, query)
             end
-        end
-
-        if rootVisible then
-            local group = GetPageGroup(rootPage.id)
-            visiblePages[rootPage.id] = true
-            visibleGroups[group] = true
-            visiblePageCount = visiblePageCount + 1
-
-            for childId in pairs(visibleChildren) do
-                visiblePages[childId] = true
-                visiblePageCount = visiblePageCount + 1
+            if matches then
+                visibleCategories[item.id] = true
+                visibleCount = visibleCount + 1
+                local category = GetCategory(item.id)
+                local group = category and category.group or "Optional"
+                visibleGroups[group] = true
             end
         end
     end
 
-    return visiblePages, visibleGroups, visiblePageCount, query
+    return visibleCategories, visibleGroups, visibleCount, query
 end
 
 function SettingsWindow:UpdateNavLayout()
     if not self.navPanel then return end
     local yOffset = -C.PADDING
-    local visiblePages, visibleGroups, visiblePageCount, query = self:ComputeVisibleNavState()
+    local visibleCategories, visibleGroups, visibleCount, query = self:ComputeVisibleNavState()
 
     if self.navBanner then
         self.navBanner:SetPoint("TOP", self.navPanel, "TOP", 0, yOffset)
@@ -427,10 +379,10 @@ function SettingsWindow:UpdateNavLayout()
                     groupHeader:Hide()
                 end
             end
-        elseif item.type == "page" then
+        elseif item.type == "category" then
             local btn = self.navButtons[item.id]
             if btn then
-                if visiblePages[item.id] then
+                if visibleCategories[item.id] then
                     btn:Show()
                     btn:ClearAllPoints()
                     btn:SetPoint("TOP", self.navPanel, "TOP", 0, yOffset)
@@ -443,7 +395,7 @@ function SettingsWindow:UpdateNavLayout()
     end
 
     if self.navEmptyText then
-        if query ~= "" and visiblePageCount == 0 then
+        if query ~= "" and visibleCount == 0 then
             self.navEmptyText:Show()
             self.navEmptyText:ClearAllPoints()
             self.navEmptyText:SetPoint("TOPLEFT", self.navPanel, "TOPLEFT", C.PADDING, yOffset - 6)
@@ -453,20 +405,49 @@ function SettingsWindow:UpdateNavLayout()
     end
 end
 
+function SettingsWindow:ClearNavRows()
+    for _, btn in pairs(self.navButtons) do
+        btn:Hide()
+        btn:SetParent(nil)
+    end
+    for _, header in pairs(self.navGroups) do
+        header:Hide()
+        header:SetParent(nil)
+    end
+    self.navButtons = {}
+    self.navGroups = {}
+end
+
+function SettingsWindow:RebuildNavRows()
+    if not self.navPanel then return end
+    self:BuildNavItemsFromRegistry()
+    self:ClearNavRows()
+
+    for _, item in ipairs(self.navItems) do
+        if item.type == "group" then
+            local groupHeader = CreateGroupHeader(self.navPanel, item.label)
+            self.navGroups[item.id] = groupHeader
+        elseif item.type == "category" then
+            local btn = CreateNavButton(self.navPanel, item.label, item.id, item.selectable)
+            self.navButtons[item.id] = btn
+        end
+    end
+
+    self:UpdateNavButtonStates()
+end
+
 -- Build the navigation panel UI
 -- @param navPanel Frame The navigation panel frame
 function SettingsWindow:BuildNavPanel(navPanel)
     local yOffset = -C.PADDING
-    
-    -- Banner texture
+
     local banner = navPanel:CreateTexture(nil, "ARTWORK")
     banner:SetPoint("TOP", navPanel, "TOP", 0, yOffset)
     banner:SetSize(C.NAV_WIDTH - C.PADDING * 2, C.BANNER_HEIGHT)
     banner:SetTexture(C.BANNER_TEXTURE)
     self.navBanner = banner
     yOffset = yOffset - C.BANNER_HEIGHT - 4
-    
-    -- Version text
+
     local versionText = navPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     versionText:SetPoint("TOP", navPanel, "TOP", 0, yOffset)
     versionText:SetText(GetVersionString())
@@ -490,6 +471,11 @@ function SettingsWindow:BuildNavPanel(navPanel)
     searchBox:SetScript("OnEscapePressed", function(selfEdit)
         selfEdit:SetText("")
         selfEdit:ClearFocus()
+        SettingsWindow:UpdateNavLayout()
+    end)
+    searchBox:SetScript("OnEnterPressed", function(selfEdit)
+        selfEdit:ClearFocus()
+        SettingsWindow:ActivateSearchEnter()
     end)
     self.navSearchBox = searchBox
     yOffset = yOffset - C.SEARCH_HEIGHT - C.GROUP_GAP
@@ -502,49 +488,24 @@ function SettingsWindow:BuildNavPanel(navPanel)
     emptyText:SetTextColor(0.8, 0.8, 0.8, 0.85)
     emptyText:Hide()
     self.navEmptyText = emptyText
-    
-    -- Build navigation items
-    for _, item in ipairs(self.navItems) do
-        if item.type == "group" then
-            local groupHeader = CreateGroupHeader(navPanel, item.label)
-            groupHeader:SetPoint("TOPLEFT", navPanel, "TOPLEFT", C.PADDING, yOffset)
-            yOffset = yOffset - C.GROUP_HEADER_HEIGHT - 4
-            self.navGroups[item.id] = groupHeader
-        elseif item.type == "page" then
-            local btn = CreateNavButton(navPanel, item.label, item.id, item.depth)
-            btn:SetPoint("TOP", navPanel, "TOP", 0, yOffset)
-            yOffset = yOffset - C.NAV_BUTTON_HEIGHT - C.NAV_BUTTON_GAP
-            
-            self.navButtons[item.id] = btn
-        end
-    end
 
+    self:RebuildNavRows()
     self:UpdateNavLayout()
 end
 
--- Update navigation button states to reflect selected tab
--- @param selectedPageId string The currently selected page ID
-function SettingsWindow:UpdateNavButtonStates(selectedPageId)
-    local activeRootId = GetRootPageId(selectedPageId)
-    for pageId, btn in pairs(self.navButtons) do
-        local page = GetPage(pageId)
-        local isRoot = page and not page.parentId
-        local isSelected = pageId == selectedPageId
-        local isActiveRoot = isRoot and pageId == activeRootId
-
-        if isSelected then
+function SettingsWindow:UpdateNavButtonStates()
+    for categoryId, btn in pairs(self.navButtons) do
+        local selected = categoryId == self.currentCategoryId
+        local selectable = btn.selectable
+        if not selectable then
+            btn.bg:SetColorTexture(unpack(C.NAV_TRANSPARENT_BG))
+            btn.text:SetTextColor(unpack(C.NAV_DISABLED_TEXT))
+        elseif selected then
             btn.bg:SetColorTexture(unpack(C.NAV_SELECTED_BG))
-            btn.text:SetTextColor(1, 1, 1, 1)
-        elseif isActiveRoot then
-            btn.bg:SetColorTexture(unpack(C.NAV_ACTIVE_ROOT_BG))
-            btn.text:SetTextColor(0.92, 0.97, 1, 1)
+            btn.text:SetTextColor(unpack(C.NAV_SELECTED_TEXT))
         else
             btn.bg:SetColorTexture(unpack(C.NAV_TRANSPARENT_BG))
-            if btn.depth > 0 then
-                btn.text:SetTextColor(0.72, 0.72, 0.72, 1)
-            else
-                btn.text:SetTextColor(0.84, 0.84, 0.84, 1)
-            end
+            btn.text:SetTextColor(unpack(C.NAV_NORMAL_TEXT))
         end
     end
 
@@ -555,164 +516,215 @@ end
 -- Content Panel Management
 -- ============================================================
 
--- Create or get a panel for a page
--- @param pageId string The page ID
--- @return Frame The panel frame for this page
 function SettingsWindow:GetOrCreatePagePanel(pageId)
     if self.pagePanels[pageId] then
         return self.pagePanels[pageId]
     end
-    
-    -- Get the page object from the registry
-    local page = SF.SettingsUI.pagesById[pageId]
+
+    local page = GetPage(pageId)
     if not page then
         if SF.Debug then
             SF.Debug:Error("UI", "Page not found in registry: %s", tostring(pageId))
         end
         return nil
     end
-    
-    -- Create a new panel for this page
+
     local panel = CreateFrame("Frame", nil, self.contentHost)
     panel:SetAllPoints(self.contentHost)
     panel:Hide()
     panel.__sfPageLayout = page.layout or {}
-    
-    -- Build the page UI into this panel (lazy build)
+
     if type(page.Build) == "function" then
         page:Build(panel)
     end
-    
+
     self.pagePanels[pageId] = panel
-    
+
     if SF.Debug then
         SF.Debug:Verbose("UI", "Created panel for page: %s", pageId)
     end
-    
+
     return panel
 end
 
-function SettingsWindow:ApplyPageLayout(pageId)
-    if not self.frame then return end
-
-    local layout = GetPageLayout(pageId) or {}
-    local width = layout.windowWidth or C.WIDTH
-    local height = layout.windowHeight or C.HEIGHT
-
-    if math.abs((self.frame:GetWidth() or 0) - width) > 0.5 or math.abs((self.frame:GetHeight() or 0) - height) > 0.5 then
-        self.frame:SetSize(width, height)
+function SettingsWindow:HidePagePanel(pageId)
+    if pageId and self.pagePanels[pageId] then
+        self.pagePanels[pageId]:Hide()
     end
 end
 
-function SettingsWindow:UpdateContentHeader(pageId)
+function SettingsWindow:UpdateContentChrome()
     if not self.contentTitleText then
         return
     end
 
-    local page = GetPage(pageId)
-    if not page then
-        return
+    local category = GetCategory(self.currentCategoryId)
+    local page = GetPage(self.currentPageId)
+    local ui = Registry()
+    local model = Model()
+    local contentPages = {}
+    if model and category then
+        contentPages = model.GetContentPages(ui, category.id)
     end
 
-    self.contentBreadcrumbText:SetText(BuildBreadcrumb(pageId))
-    self.contentTitleText:SetText(page.name or "")
+    self.contentTitleText:SetText(CategoryLabel(category))
 
-    local description = GetPageDescription(pageId) or ""
+    local description = ""
+    if page and page.description and page.description ~= "" then
+        description = page.description
+    elseif category and category.description then
+        description = category.description
+    end
     self.contentDescriptionText:SetText(description)
+
+    local showTabs = #contentPages >= 2
+    if self.tabBar then
+        if showTabs then
+            local tabs = {}
+            for _, contentPage in ipairs(contentPages) do
+                table.insert(tabs, {
+                    id = contentPage.id,
+                    label = contentPage.navLabel or contentPage.name,
+                })
+            end
+            self.tabBar:Show()
+            self.tabBar:SetTabs(tabs)
+            self.tabBar:SetSelected(self.currentPageId)
+            self.contentHeader:SetHeight(C.CONTENT_HEADER_HEIGHT + C.TAB_BAR_HEIGHT + C.TAB_BAR_GAP)
+        else
+            self.tabBar:Hide()
+            self.contentHeader:SetHeight(C.CONTENT_HEADER_HEIGHT)
+        end
+        self.tabBar:Layout()
+    end
+
+    local showEmpty = category
+        and model
+        and model.IsCategorySelectable(category)
+        and #contentPages == 0
+
+    if self.emptyState then
+        if showEmpty then
+            self.emptyState:SetCategory(category)
+            self.emptyState:Show()
+        else
+            self.emptyState:Hide()
+        end
+    end
 end
 
--- Select and display a tab by page ID
--- @param pageId string The page ID to select
-function SettingsWindow:SelectTab(pageId)
-    if not pageId then return end
-
-    pageId = ResolveSelectablePageId(pageId)
-    
-    if SF.Debug then
-        SF.Debug:Verbose("UI", "Selecting tab: %s", pageId)
-    end
-    
-    -- Hide current page panel
-    if self.currentPageId and self.pagePanels[self.currentPageId] then
-        self.pagePanels[self.currentPageId]:Hide()
-    end
-
-    self:ApplyPageLayout(pageId)
-    
-    -- Get or create the new page panel
-    local panel = self:GetOrCreatePagePanel(pageId)
-    if not panel then
-        if SF.Debug then
-            SF.Debug:Error("UI", "Failed to get panel for page: %s", pageId)
-        end
+function SettingsWindow:ApplySelection(selection, opts)
+    if not selection or not selection.categoryId then
         return
     end
-    
-    -- Show the new page panel
-    panel:Show()
-    self:UpdateContentHeader(pageId)
-    
-    -- Refresh the page if it has a Refresh method
-    local page = SF.SettingsUI.pagesById[pageId]
-    if page and type(page.Refresh) == "function" then
-        page:Refresh(panel)
+    opts = opts or {}
+
+    local previousPageId = self.currentPageId
+    if previousPageId and previousPageId ~= selection.pageId then
+        self:HidePagePanel(previousPageId)
     end
-    
-    -- Update state
-    self.currentPageId = pageId
-    self:UpdateNavButtonStates(pageId)
+
+    self.currentCategoryId = selection.categoryId
+    self.currentPageId = selection.pageId
+
+    if opts.rememberTab and selection.pageId then
+        self.lastPageByCategory[selection.categoryId] = selection.pageId
+    end
+
+    self:ApplyPreferredWindowMin(selection.pageId)
+
+    if selection.pageId then
+        local panel = self:GetOrCreatePagePanel(selection.pageId)
+        if not panel then
+            if SF.Debug then
+                SF.Debug:Error("UI", "Failed to get panel for page: %s", selection.pageId)
+            end
+            return
+        end
+        panel:Show()
+
+        local page = GetPage(selection.pageId)
+        if page and type(page.Refresh) == "function" then
+            page:Refresh(panel)
+        end
+    end
+
+    self:UpdateContentChrome()
+    self:UpdateNavButtonStates()
+end
+
+function SettingsWindow:SelectCategory(categoryId)
+    local model = Model()
+    local ui = Registry()
+    if not model or not ui then return end
+
+    local query = GetSearchQuery()
+    local selection
+    if query ~= "" then
+        selection = model.ResolveSearchCategoryClick(ui, self:Session(), categoryId, query)
+    else
+        selection = model.ResolveSidebarSelect(ui, self:Session(), categoryId)
+    end
+    self:ApplySelection(selection, { rememberTab = true })
+end
+
+function SettingsWindow:SelectTab(pageId)
+    local model = Model()
+    local ui = Registry()
+    if not model or not ui then return end
+    local selection = model.ResolveShowPage(ui, self:Session(), pageId)
+    self:ApplySelection(selection, { rememberTab = true })
+end
+
+function SettingsWindow:ActivateSearchEnter()
+    local model = Model()
+    local ui = Registry()
+    if not model or not ui then return end
+    local selection = model.ResolveSearchEnter(ui, self:Session(), GetSearchQuery())
+    self:ApplySelection(selection, { rememberTab = true })
 end
 
 -- ============================================================
 -- Window Frame Creation
 -- ============================================================
 
--- Create the main settings window frame
 function SettingsWindow:CreateWindow()
     if self.frame then return self.frame end
-    
-    -- Main frame
+
     local frame = CreateFrame("Frame", C.FRAME_NAME, UIParent, "BackdropTemplate")
     frame:SetSize(C.WIDTH, C.HEIGHT)
     frame:SetPoint("CENTER")
     frame:SetFrameStrata("DIALOG")
     frame:Hide()
-    
-    -- Backdrop
+
     frame:SetBackdrop(C.BACKDROP)
     frame:SetBackdropColor(unpack(C.BG))
     frame:SetBackdropBorderColor(unpack(C.BORDER))
-    
-    -- Make movable
+
     frame:SetMovable(true)
     frame:EnableMouse(true)
     frame:RegisterForDrag("LeftButton")
-    frame:SetScript("OnDragStart", function(self) self:StartMoving() end)
-    frame:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    frame:SetScript("OnDragStart", function(selfFrame) selfFrame:StartMoving() end)
+    frame:SetScript("OnDragStop", function(selfFrame) selfFrame:StopMovingOrSizing() end)
     frame:SetClampedToScreen(true)
-    
-    -- Close button
+
     local closeBtn = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
     closeBtn:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -4, -4)
     closeBtn:SetScript("OnClick", function()
         SettingsWindow:Hide()
     end)
-    
-    -- Left navigation panel
+
     local navPanel = CreateFrame("Frame", nil, frame)
     navPanel:SetPoint("TOPLEFT", frame, "TOPLEFT", C.PADDING, -C.PADDING)
     navPanel:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", C.PADDING, C.PADDING)
     navPanel:SetWidth(C.NAV_WIDTH)
-    
-    -- Vertical divider
+
     local divider = frame:CreateTexture(nil, "ARTWORK")
     divider:SetPoint("TOPLEFT", navPanel, "TOPRIGHT", 0, 0)
     divider:SetPoint("BOTTOMLEFT", navPanel, "BOTTOMRIGHT", 0, 0)
     divider:SetWidth(C.DIVIDER_WIDTH)
     divider:SetColorTexture(unpack(C.DIVIDER))
-    
-    -- Right content panel (with scroll frame)
-    -- Position below close button to avoid scrollbar overlap
+
     local contentPanel = CreateFrame("Frame", nil, frame)
     contentPanel:SetPoint("TOPLEFT", divider, "TOPRIGHT", C.CONTENT_PADDING, 0)
     contentPanel:SetPoint("TOP", closeBtn, "BOTTOM", 0, 0)
@@ -723,54 +735,91 @@ function SettingsWindow:CreateWindow()
     contentHeader:SetPoint("TOPRIGHT", contentPanel, "TOPRIGHT", 0, 0)
     contentHeader:SetHeight(C.CONTENT_HEADER_HEIGHT)
 
-    local breadcrumbText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    breadcrumbText:SetPoint("TOPLEFT", contentHeader, "TOPLEFT", 0, -4)
-    breadcrumbText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, -4)
-    breadcrumbText:SetJustifyH("LEFT")
-    breadcrumbText:SetTextColor(0.62, 0.75, 0.9, 0.95)
-
     local titleText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    titleText:SetPoint("TOPLEFT", breadcrumbText, "BOTTOMLEFT", 0, -6)
-    titleText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, -28)
+    titleText:SetPoint("TOPLEFT", contentHeader, "TOPLEFT", 0, -4)
+    titleText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, -4)
     titleText:SetJustifyH("LEFT")
     titleText:SetTextColor(1, 1, 1, 1)
 
     local descriptionText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     descriptionText:SetPoint("TOPLEFT", titleText, "BOTTOMLEFT", 0, -4)
-    descriptionText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, -46)
+    descriptionText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, -28)
     descriptionText:SetJustifyH("LEFT")
     descriptionText:SetJustifyV("TOP")
     descriptionText:SetTextColor(0.8, 0.8, 0.8, 0.95)
+
+    local tabBar
+    if SF.SettingsUI and SF.SettingsUI.TabBar and SF.SettingsUI.TabBar.Create then
+        tabBar = SF.SettingsUI.TabBar:Create(contentHeader)
+        tabBar:SetPoint("BOTTOMLEFT", contentHeader, "BOTTOMLEFT", 0, 4)
+        tabBar:SetPoint("BOTTOMRIGHT", contentHeader, "BOTTOMRIGHT", 0, 4)
+        tabBar:SetHeight(C.TAB_BAR_HEIGHT)
+        tabBar:SetOnSelect(function(pageId)
+            SettingsWindow:SelectTab(pageId)
+        end)
+        tabBar:Hide()
+    end
 
     local headerDivider = contentHeader:CreateTexture(nil, "ARTWORK")
     headerDivider:SetPoint("BOTTOMLEFT", contentHeader, "BOTTOMLEFT", 0, 0)
     headerDivider:SetPoint("BOTTOMRIGHT", contentHeader, "BOTTOMRIGHT", 0, 0)
     headerDivider:SetHeight(C.DIVIDER_WIDTH)
     headerDivider:SetColorTexture(unpack(C.DIVIDER))
-    
-    -- Content host (will contain page panels)
+
     local contentHost = CreateFrame("Frame", nil, contentPanel)
     contentHost:SetPoint("TOPLEFT", contentHeader, "BOTTOMLEFT", 0, -C.CONTENT_PADDING)
     contentHost:SetPoint("TOPRIGHT", contentHeader, "BOTTOMRIGHT", 0, -C.CONTENT_PADDING)
     contentHost:SetPoint("BOTTOMRIGHT", contentPanel, "BOTTOMRIGHT", 0, 0)
-    
-    -- Store references
+
+    local emptyState
+    if SF.SettingsUI and SF.SettingsUI.EmptyState and SF.SettingsUI.EmptyState.Create then
+        emptyState = SF.SettingsUI.EmptyState:Create(contentHost)
+        emptyState:SetAllPoints(contentHost)
+        emptyState:Hide()
+    end
+
+    local resize = CreateFrame("Button", nil, frame)
+    resize:SetSize(C.RESIZE_HANDLE_SIZE, C.RESIZE_HANDLE_SIZE)
+    resize:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -4, 4)
+    resize:SetNormalTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    resize:SetHighlightTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Highlight")
+    resize:SetPushedTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Down")
+    resize:SetScript("OnMouseDown", function(_, button)
+        if button ~= "LeftButton" then return end
+        frame:StartSizing("BOTTOMRIGHT")
+    end)
+    resize:SetScript("OnMouseUp", function(_, button)
+        if button ~= "LeftButton" then return end
+        frame:StopMovingOrSizing()
+        SettingsWindow:ApplyPreferredWindowMin(SettingsWindow.currentPageId)
+    end)
+
+    frame:HookScript("OnSizeChanged", function()
+        -- Geometry only. Do not Refresh pages, Store, sync, or inspect.
+        SettingsWindow:UpdateNavLayout()
+        if SettingsWindow.tabBar and SettingsWindow.tabBar.Layout then
+            SettingsWindow.tabBar:Layout()
+        end
+    end)
+
     self.frame = frame
     self.navPanel = navPanel
     self.contentPanel = contentPanel
     self.contentHeader = contentHeader
     self.contentHost = contentHost
-    self.contentBreadcrumbText = breadcrumbText
     self.contentTitleText = titleText
     self.contentDescriptionText = descriptionText
-    
-    -- Build navigation UI
+    self.tabBar = tabBar
+    self.emptyState = emptyState
+    self.resizeHandle = resize
+
     self:BuildNavPanel(navPanel)
-    
+    self:ApplyPreferredWindowMin(nil)
+
     if SF.Debug then
         SF.Debug:Info("UI", "Standalone Settings Window created")
     end
-    
+
     return frame
 end
 
@@ -778,64 +827,118 @@ end
 -- Public API
 -- ============================================================
 
--- Initialize the standalone settings window
+function SettingsWindow:HandleRegistryChanged()
+    if not self.navPanel then
+        return
+    end
+
+    self:RebuildNavRows()
+
+    local model = Model()
+    local ui = Registry()
+    if not model or not ui or not self.currentCategoryId then
+        return
+    end
+
+    local category = GetCategory(self.currentCategoryId)
+    if not category or not model.IsCategorySelectable(category) then
+        self:ApplySelection(model.ResolveShowPage(ui, self:Session(), "general"), { rememberTab = false })
+        return
+    end
+
+    if self.currentPageId and not model.IsContentPage(ui, self.currentPageId) then
+        self:ApplySelection(model.ResolveSidebarSelect(ui, self:Session(), self.currentCategoryId), { rememberTab = true })
+        return
+    end
+
+    if not self.currentPageId then
+        local defaultPageId = model.GetDefaultPageId(ui, self.currentCategoryId)
+        if defaultPageId then
+            self:ApplySelection({
+                categoryId = self.currentCategoryId,
+                pageId = defaultPageId,
+                changed = true,
+            }, { rememberTab = true })
+            return
+        end
+    end
+
+    self:UpdateContentChrome()
+    self:UpdateNavButtonStates()
+end
+
+function SettingsWindow:RefreshEnablementIfNeeded()
+    local ui = Registry()
+    if ui and ui.HasUnresolvedSubAddonEnablement and ui.HasUnresolvedSubAddonEnablement(ui) then
+        ui:RefreshSubAddonEnablement()
+    end
+end
+
 function SettingsWindow:Init()
     if self.initialized then return end
     self.initialized = true
-    
+
     if SF.Debug then
         SF.Debug:Info("UI", "Initializing Standalone Settings Window")
     end
-    
+
+    local ui = Registry()
+    if ui and ui.OnRegistryChanged and not self._registryListener then
+        ui:OnRegistryChanged(function()
+            SettingsWindow:HandleRegistryChanged()
+        end)
+        self._registryListener = true
+    end
+
     self:BuildNavItemsFromRegistry()
-    
-    -- Create the window frame
     self:CreateWindow()
-    
+
     if SF.Debug then
         SF.Debug:Info("UI", "Standalone Settings Window initialized")
     end
 end
 
--- Show the settings window
 function SettingsWindow:Show()
     if not self.frame then
         self:Init()
     end
-    
+
+    self:RefreshEnablementIfNeeded()
     self.frame:Show()
-    
-    -- Select the first page if none selected
-    if not self.currentPageId then
-        self:SelectTab("general")
+
+    if not self.currentCategoryId then
+        self:ShowPage("general")
     end
 end
 
--- Show the settings window and open to a specific page
--- @param pageId string The page ID to open to
 function SettingsWindow:ShowPage(pageId)
     if not self.frame then
         self:Init()
     end
-    
+
+    self:RefreshEnablementIfNeeded()
     self.frame:Show()
-    
-    -- Select the specified page
-    if pageId and self.navButtons[pageId] then
-        self:SelectTab(pageId)
-    elseif not self.currentPageId then
-        self:SelectTab("general")
+
+    local model = Model()
+    local ui = Registry()
+    if not model or not ui then
+        return
+    end
+
+    local selection = model.ResolveShowPage(ui, self:Session(), pageId)
+    self:ApplySelection(selection, { rememberTab = false })
+
+    if not self.currentCategoryId then
+        self:ApplySelection(model.ResolveShowPage(ui, self:Session(), "general"), { rememberTab = false })
     end
 end
 
--- Hide the settings window
 function SettingsWindow:Hide()
     if self.frame then
         self.frame:Hide()
     end
 end
 
--- Toggle the settings window visibility
 function SettingsWindow:Toggle()
     if self.frame and self.frame:IsShown() then
         self:Hide()

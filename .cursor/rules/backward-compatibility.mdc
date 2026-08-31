@@ -1,0 +1,13 @@
+---
+description: Preserve persisted user data, schema versions, and migrations
+alwaysApply: true
+---
+
+# Backward Compatibility
+
+- Preserve existing user data and configuration. Older SavedVariables and schema versions must remain usable through the project's existing compatibility approach.
+- Before changing stored data or persisted behavior, inspect the existing persistence, schema-versioning, migration, and compatibility mechanisms. Use or extend those mechanisms; do not invent a parallel path.
+- Do not casually rename, move, delete, or change the type of persisted values. Do not change defaults in a way that overwrites or resets existing user configuration.
+- Account for older database and schema versions. Missing keys introduced by newer versions should fill from defaults without destroying older data.
+- If a schema or storage change is required, explain why it is needed, how migration works, how older stored versions remain compatible, and how existing users' values are preserved. Validate that compatibility path.
+- Treat backward compatibility as a requirement for all future changes, not an optional consideration for this settings redesign.

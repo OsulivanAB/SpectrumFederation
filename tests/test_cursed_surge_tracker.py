@@ -358,5 +358,6 @@ def test_parent_toc_does_not_load_child_files():
     child = CHILD_TOC.read_text(encoding="utf-8")
     assert "## Dependencies: SpectrumFederation" in child
     assert "## Group: SpectrumFederation" in child
+    assert "## X-SpectrumFederation-Parent: SpectrumFederation" in child
     assert "## Title: Spectrum Federation: Cursed Surge Tracker" in child
     assert "## LoadOnDemand:" not in child

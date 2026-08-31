@@ -10,6 +10,7 @@ Spectrum Federation uses a beta-first workflow. Normal pull requests target `bet
 
 - detects whether packaged addon files changed;
 - runs the unified Lua/YAML/Python linter;
+- runs `tests/test_settings_navigation.py` and `tests/test_cursed_surge_tracker.py` (installs `lua5.1`);
 - validates package structure;
 - requires a TOC version bump and a non-duplicate beta release only for addon changes;
 - builds MkDocs in strict mode.
@@ -18,11 +19,11 @@ Documentation-only changes do not require an addon version bump.
 
 ### PRs to main
 
-`.github/workflows/pr-main-validation.yml` runs lint, packaging, stable-version-format, and documentation checks. Direct feature work should not normally target this branch.
+`.github/workflows/pr-main-validation.yml` runs lint, tests, packaging, stable-version-format, and documentation checks. Direct feature work should not normally target this branch.
 
 `.github/workflows/pr-template-validation.yml` separately validates pull-request template completion.
 
-Both branch-validation workflows include `README.md` in their path filters so metadata-only documentation changes cannot bypass the documentation guardrails.
+Both branch-validation workflows include `README.md` and `tests/**` in their path filters so documentation and test-only changes still run the matching checks.
 
 ## Post-merge beta release
 

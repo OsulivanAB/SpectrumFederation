@@ -37,8 +37,9 @@ When you need a new toggle/option:
 2. **Storage:** follow existing patterns in `modules/Settings/Store.lua` (many settings are automatic—copy what existing settings do).
 3. **Apply behavior:** ensure the setting actually affects runtime behavior.
    - Prefer handling in the feature module, but use `modules/Settings/Apply.lua` if that’s the established pattern.
-4. **UI:** render it in the Settings UI (typically `modules/UI/Settings/Pages/Main.lua` for General).
-   - Use the existing renderer/controls—do not create a second UI system.
+4. **UI:** render it in the Settings UI (typically `modules/UI/Settings/Pages/General.lua` for General).
+   - Use the existing renderer, registry, and standalone window—do not create a second UI system.
+   - New pages use `categoryId` for the sidebar category. Legacy `parentId` still works. Categories with two or more content pages appear as tabs, not nested sidebar rows.
 5. **Schema migrations:** avoid unless strictly necessary. If needed, keep it tiny and backward-compatible.
 
 ## Debug logging (required for new features)
@@ -69,3 +70,4 @@ When you need a new toggle/option:
 - `python3 .github/scripts/lint_all.py`
 - `/reload` in-game without errors.
 - Verify the new setting appears (when applicable) and toggling it changes behavior as intended.
+- Settings navigation changes: `python -m pytest tests/test_settings_navigation.py`

@@ -6,7 +6,7 @@ The dispatcher lowercases the entire command line. Commands are therefore case-i
 
 | Command | Result |
 | --- | --- |
-| `/sf` | Toggle the standalone settings window. |
+| `/sf` | Toggle the standalone settings window. The first open in a session starts on General. Later toggles restore this session's category and tab. |
 | `/sf help` | Print all registered commands and short descriptions. |
 
 ## Profile commands
@@ -55,7 +55,7 @@ The window remembers its size and position, and it can be closed with the title-
 | --- | --- | --- |
 | `/sf debug on` | `enable` | Enable diagnostic logging. |
 | `/sf debug off` | `disable` | Disable diagnostic logging. |
-| `/sf debug show` | `logs`, no argument | Open the Debugging page. |
+| `/sf debug show` | `logs`, no argument | Open the Debugging category. |
 | `/sf debug clear` | — | Remove all diagnostic entries. |
 
 Debug logs are not Loot Logs and clearing them does not change profile history.

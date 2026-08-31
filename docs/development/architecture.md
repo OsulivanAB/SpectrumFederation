@@ -25,7 +25,7 @@ local addonName, SF = ...
 | `modules/debug.lua` | Persistent, bounded diagnostic logging. |
 | `modules/SlashCommands.lua` | `/sf` dispatch and feature command registry. |
 | `modules/Settings/` | Defaults, migrations, path-based storage, per-character storage, and runtime application. |
-| `modules/UI/Settings/` | Page registry, standalone navigation window, controls, dialogs, and page definitions. |
+| `modules/UI/Settings/` | Page/category registry, navigation model, standalone window, controls, dialogs, and page definitions. |
 | `modules/LootHelper/` | Profile, member, and log domain models plus serialization and the current communication adapter. |
 | `modules/LootHelperSync/` | Session state, validation, requests, convergence, heartbeat, routing, bulk handlers, and public API. |
 | `modules/UI/LootHelper/` | Roster/equipment presentation and controller logic. |
@@ -97,6 +97,6 @@ These are internal project APIs, not stable third-party compatibility guarantees
 
 ## Child addons
 
-`SpectrumFederation_CursedSurgeTracker` is a sibling addon folder packaged in the same release zip. It declares `## Dependencies: SpectrumFederation` and `## Group: SpectrumFederation` so WoW nests it under the parent in the AddOns list.
+`SpectrumFederation_CursedSurgeTracker` is a sibling addon folder packaged in the same release zip. It declares `## Dependencies: SpectrumFederation`, `## Group: SpectrumFederation`, and `## X-SpectrumFederation-Parent: SpectrumFederation` so WoW nests it under the parent in the AddOns list and the parent Settings UI can discover it.
 
-The parent does not load child Lua/XML and does not depend on the child. Optional children may read `_G.SpectrumFederation` for Debug, slash registration, and `SF:Now()`. The assignment is made in `modules/Init.lua` so the parent remains fully usable when no child is present.
+The parent does not load child Lua/XML and does not depend on the child. Discovery uses TOC metadata only. Optional children may read `_G.SpectrumFederation` for Debug, slash registration, and `SF:Now()`. The assignment is made in `modules/Init.lua` so the parent remains fully usable when no child is present.
