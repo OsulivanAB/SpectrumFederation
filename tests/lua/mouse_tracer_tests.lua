@@ -330,6 +330,16 @@ assertEq(e.activeSegCount, 0, "fully expired segments are released")
 assertTrue(e.releasedPointCount > 0, "fade records released stamp indices")
 assertEq(e.lastAcceptedIdx, 0, "empty ring clears lastAcceptedIdx")
 
+-- A new stroke after a full fade must not inherit the stale start timestamp
+e:ProcessSample(3.0, 24, 0, false)
+e:ProcessSample(3.1, 40, 0, false)
+assertTrue(e.count >= 2, "movement after a full fade emits a new stroke")
+assertTrue(e.activeSegCount >= 1, "movement after a full fade creates a visible segment")
+local _, _, restartT = e:GetPoint(1)
+assertTrue(restartT >= 3.0 - 1e-9, "new stroke after fade uses the current time, not the stale lastT")
+local newestAfterFade = select(1, e:GetPoint(e.count))
+assertAlmost(newestAfterFade, 40, 1e-6, "new stroke after fade reaches the current cursor")
+
 -- Trail-length trimming
 e = newEngine()
 e:SetConfig(80, 1.5, 1.0)

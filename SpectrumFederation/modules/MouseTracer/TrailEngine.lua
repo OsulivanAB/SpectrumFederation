@@ -138,6 +138,7 @@ local function DropOldest(self)
 	self.count = self.count - 1
 	if self.count == 0 then
 		self.lastAcceptedIdx = 0
+		self.needsFreshStrokeTime = true
 	end
 end
 
@@ -279,6 +280,7 @@ function Engine.Reset(self)
 	self.head = 1
 	self.count = 0
 	self.lastAcceptedIdx = 0
+	self.needsFreshStrokeTime = false
 	self.lastX = 0
 	self.lastY = 0
 	self.lastT = 0
@@ -434,6 +436,13 @@ function Engine.ProcessSample(self, now, rawX, rawY, isMouselook)
 	local startDist = self.lastDist
 	local prevIdx = self.lastAcceptedIdx
 	if prevIdx == 0 or self.count == 0 then
+		-- After a full fade the last accepted timestamp is stale. Stamp the
+		-- new stroke at `now` so Trim does not immediately drop it.
+		if self.needsFreshStrokeTime then
+			prevT = now
+			dt = 0
+			self.needsFreshStrokeTime = false
+		end
 		prevIdx = PushPoint(self, startX, startY, prevT, startDist)
 	end
 

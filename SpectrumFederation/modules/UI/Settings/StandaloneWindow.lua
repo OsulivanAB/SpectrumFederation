@@ -784,7 +784,7 @@ function SettingsWindow:CreateWindow()
 
     local headingText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     headingText:SetPoint("TOPLEFT", titleText, "BOTTOMLEFT", 0, -2)
-    headingText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, 0)
+    headingText:SetPoint("TOPRIGHT", titleText, "BOTTOMRIGHT", 0, -2)
     headingText:SetJustifyH("LEFT")
     headingText:SetTextColor(0.92, 0.92, 0.92, 1)
     headingText:Hide()

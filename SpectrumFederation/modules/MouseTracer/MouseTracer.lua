@@ -164,7 +164,7 @@ local function StampSize(idx, newestDist, oldestDist)
 end
 
 local function PlaceStamp(idx, newestDist, oldestDist)
-	if not host or not stamps or not idx then
+	if not host or not stamps or not idx or idx < 1 then
 		return
 	end
 	local stamp = stamps[idx]
@@ -181,9 +181,12 @@ local function PlaceStamp(idx, newestDist, oldestDist)
 	if stamp.SetVertexColor then
 		stamp:SetVertexColor(r, g, b, 1)
 	end
-	stamp:SetAlpha(cache.opacity)
+	local alreadyShown = stamp.IsShown and stamp:IsShown()
+	if not alreadyShown then
+		stamp:SetAlpha(cache.opacity)
+		stampLastAlpha[idx] = cache.opacity
+	end
 	stamp:Show()
-	stampLastAlpha[idx] = cache.opacity
 end
 
 local function RefreshLiveStampSizes(newestDist, oldestDist)
@@ -221,8 +224,16 @@ local function ApplyNewStamps()
 	local newestDist, oldestDist = TrailDistRange()
 	for i = 1, engine.newSegCount do
 		local id = engine.newSegs[i]
-		PlaceStamp(engine.segI0[id], newestDist, oldestDist)
-		PlaceStamp(engine.segI1[id], newestDist, oldestDist)
+		if engine.segActive[id] then
+			local i0 = engine.segI0[id]
+			local i1 = engine.segI1[id]
+			if engine:IsLiveIndex(i0) then
+				PlaceStamp(i0, newestDist, oldestDist)
+			end
+			if engine:IsLiveIndex(i1) then
+				PlaceStamp(i1, newestDist, oldestDist)
+			end
+		end
 	end
 	RefreshLiveStampSizes(newestDist, oldestDist)
 	engine.newSegCount = 0
