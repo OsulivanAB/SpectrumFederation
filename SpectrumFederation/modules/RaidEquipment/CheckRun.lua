@@ -241,6 +241,16 @@ function CheckRun.MarkAttempt(player, kind, inspectable)
 	end
 end
 
+function CheckRun.PlayerNeedsMoreInspects(player)
+	if type(player) ~= "table" then
+		return false
+	end
+	if player.freshObservation then
+		return false
+	end
+	return (player.attemptCount or 0) < CheckRun.PER_TARGET_ATTEMPT_CAP
+end
+
 function CheckRun.ShouldSettle(run, now)
 	if type(run) ~= "table" then
 		return true, "no_run"
@@ -252,11 +262,11 @@ function CheckRun.ShouldSettle(run, now)
 	local allResolved = true
 	for _, id in ipairs(run.targetIds or {}) do
 		local player = run.players[id]
-		if not player or not player.freshObservation then
-			if not player or (not player.technicalFailure and (player.attemptCount or 0) < CheckRun.PER_TARGET_ATTEMPT_CAP) then
-				allResolved = false
-				break
-			end
+		-- A single timeout/incomplete sets technicalFailure for classification,
+		-- but acquisition still retries until PER_TARGET_ATTEMPT_CAP.
+		if not player or CheckRun.PlayerNeedsMoreInspects(player) then
+			allResolved = false
+			break
 		end
 	end
 	if allResolved then

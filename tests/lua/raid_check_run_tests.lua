@@ -172,12 +172,17 @@ assertEq(why, nil, "no settle reason while still working after resume")
 
 -- Per-target cap settles a broken target
 local capRun = CheckRun.NewRun({ targetIds = { "A" }, now = 0 })
-for _ = 1, CheckRun.PER_TARGET_ATTEMPT_CAP do
+CheckRun.MarkAttempt(capRun.players.A, "timeout", true)
+local settleAfterOne, whyAfterOne = CheckRun.ShouldSettle(capRun, 1)
+assertTrue(not settleAfterOne, "first timeout does not settle before the attempt cap")
+assertTrue(CheckRun.PlayerNeedsMoreInspects(capRun.players.A), "technicalFailure still retries until the attempt cap")
+for _ = 2, CheckRun.PER_TARGET_ATTEMPT_CAP do
     CheckRun.MarkAttempt(capRun.players.A, "timeout", true)
 end
 settle, why = CheckRun.ShouldSettle(capRun, 1)
 assertTrue(settle, "per-target cap prevents infinite retry")
 assertEq(why, "targets_resolved", "attempt-capped target is treated as resolved")
+assertTrue(not CheckRun.PlayerNeedsMoreInspects(capRun.players.A), "capped target does not keep queueing inspects")
 
 -- Preflight
 assertEq(CheckRun.DecidePreflight({ dialogOpen = true, hasProfile = true, isAdmin = true }).action, "busy", "duplicate clicks do not create duplicate dialogs")

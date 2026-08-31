@@ -1767,13 +1767,38 @@ function RC:_HandleInspectReady(guid)
 	local captured = unit and CaptureTroubleshootingInventory(unit) or nil
 
 	if captured and type(captured.slotsByInventory) == "table" then
-		for _, slotData in pairs(captured.slotsByInventory) do
-			NormalizeSlotData(slotData)
+		-- Occasionally, inspect responses return partial inventory data (certain
+		-- slots missing link/texture temporarily). Prefer the new snapshot where
+		-- it has real data, but do not overwrite a previously-known slot with a
+		-- completely blank result.
+		local fallbackSlots = entry and entry.slotsByInventory or nil
+		if type(fallbackSlots) == "table" then
+			for inventorySlot, fallbackSlot in pairs(fallbackSlots) do
+				if type(inventorySlot) == "number" and type(fallbackSlot) == "table" then
+					local nextSlot = captured.slotsByInventory[inventorySlot]
+					local hasNext = SlotHasAnyItemData(nextSlot) or (type(nextSlot) == "table" and nextSlot.texture) or false
+					local hasFallback = SlotHasAnyItemData(fallbackSlot) or fallbackSlot.texture or false
+					if (not hasNext) and hasFallback then
+						local copy = {}
+						for key, value in pairs(fallbackSlot) do
+							copy[key] = value
+						end
+						NormalizeSlotData(copy)
+						captured.slotsByInventory[inventorySlot] = copy
+					else
+						NormalizeSlotData(nextSlot)
+					end
+				end
+			end
+		else
+			for _, slotData in pairs(captured.slotsByInventory) do
+				NormalizeSlotData(slotData)
+			end
 		end
 		RecalculateCapturedSummary(captured)
 	end
 
-	if captured and type(captured.slotsByInventory) == "table" then
+	if captured and captured.sawAnyData then
 		entry.guid = guid or active.guid
 		entry.id = active.id
 		entry.status = "ready"
@@ -1841,6 +1866,13 @@ function RC:_HandleInspectReady(guid)
 		-- inspectable again. The delay scales from INSPECT_RETRY_BASE_SECONDS up
 		-- to INSPECT_RETRY_MAX_SECONDS.
 		entry.nextRetryAt = now + CalculateInspectRetryDelay(entry.failCount)
+		if state.adhocRun and CheckRun and active.id then
+			local player = state.adhocRun.players and state.adhocRun.players[active.id]
+			if player then
+				CheckRun.NoteProgress(state.adhocRun, now)
+				CheckRun.MarkAttempt(player, "incomplete", true)
+			end
+		end
 	end
 
 	self:_StoreInspectCacheEntry(entry, active.aliases)
@@ -2853,14 +2885,19 @@ local function QueueFrozenInspectTargets(self, run)
 		local player = run.players and run.players[memberId]
 		local unit = (player and player.unitHint) or FindUnitByGuidOrId(player and player.guid, memberId)
 		if unit and not IsSelfUnit(unit) then
-			local info = BuildUnitInfo(unit)
-			info.id = memberId
-			local aliases = self:_GetInspectAliases(unit, info)
-			local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
-			if type(cacheEntry) == "table" then
-				cacheEntry.nextRetryAt = nil
+			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
+			if CheckRun and CheckRun.PlayerNeedsMoreInspects and not CheckRun.PlayerNeedsMoreInspects(player) then
+				-- Already complete, or this target has used its inspect attempt cap.
+			else
+				local info = BuildUnitInfo(unit)
+				info.id = memberId
+				local aliases = self:_GetInspectAliases(unit, info)
+				local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+				if type(cacheEntry) == "table" then
+					cacheEntry.nextRetryAt = nil
+				end
+				self:_QueueInspectForUnit(unit, info, cacheEntry)
 			end
-			self:_QueueInspectForUnit(unit, info, cacheEntry)
 		elseif player and IsSelfUnit(unit) then
 			local captured = self:_GetLocalTroubleshootingSnapshot()
 			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
