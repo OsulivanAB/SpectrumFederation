@@ -37,6 +37,7 @@ local C = {
     CONTENT_PADDING = 12,
     DIVIDER_WIDTH = 1,
     CONTENT_HEADER_HEIGHT = 70,
+    CONTENT_HEADING_HEIGHT = 22,
 
     -- Colors (RGBA, 0-1 range)
     BG = {0, 0, 0, 0.70},
@@ -569,6 +570,35 @@ function SettingsWindow:UpdateContentChrome()
 
     self.contentTitleText:SetText(CategoryLabel(category))
 
+    local contentHeading = nil
+    if model and model.GetPageContentHeading then
+        contentHeading = model.GetPageContentHeading(page)
+    elseif page and type(page.contentHeading) == "string" and page.contentHeading ~= "" then
+        contentHeading = page.contentHeading
+    end
+
+    local headingShown = contentHeading ~= nil
+    if self.contentHeadingText then
+        if headingShown then
+            self.contentHeadingText:SetText(contentHeading)
+            self.contentHeadingText:Show()
+            if self.contentDescriptionText then
+                self.contentDescriptionText:ClearAllPoints()
+                self.contentDescriptionText:SetPoint("TOPLEFT", self.contentHeadingText, "BOTTOMLEFT", 0, -4)
+                self.contentDescriptionText:SetPoint("TOPRIGHT", self.contentHeadingText, "BOTTOMRIGHT", 0, -4)
+            end
+        else
+            self.contentHeadingText:SetText("")
+            self.contentHeadingText:Hide()
+            if self.contentDescriptionText then
+                -- Restore the original title-relative anchors used when no page heading is set.
+                self.contentDescriptionText:ClearAllPoints()
+                self.contentDescriptionText:SetPoint("TOPLEFT", self.contentTitleText, "BOTTOMLEFT", 0, -4)
+                self.contentDescriptionText:SetPoint("TOPRIGHT", self.contentHeader, "TOPRIGHT", 0, -28)
+            end
+        end
+    end
+
     local description = ""
     if page and page.description and page.description ~= "" then
         description = page.description
@@ -576,6 +606,11 @@ function SettingsWindow:UpdateContentChrome()
         description = category.description
     end
     self.contentDescriptionText:SetText(description)
+
+    local headerHeight = C.CONTENT_HEADER_HEIGHT
+    if headingShown then
+        headerHeight = headerHeight + C.CONTENT_HEADING_HEIGHT
+    end
 
     local showTabs = #contentPages >= 2
     if self.tabBar then
@@ -594,12 +629,14 @@ function SettingsWindow:UpdateContentChrome()
                 self.tabBar:SetTabs(tabs)
                 self.tabBar:SetSelected(self.currentPageId)
             end
-            self.contentHeader:SetHeight(C.CONTENT_HEADER_HEIGHT + C.TAB_BAR_HEIGHT + C.TAB_BAR_GAP)
+            self.contentHeader:SetHeight(headerHeight + C.TAB_BAR_HEIGHT + C.TAB_BAR_GAP)
         else
             self.tabBar:Hide()
-            self.contentHeader:SetHeight(C.CONTENT_HEADER_HEIGHT)
+            self.contentHeader:SetHeight(headerHeight)
         end
         self.tabBar:Layout()
+    elseif self.contentHeader then
+        self.contentHeader:SetHeight(headerHeight)
     end
 
     local showEmpty = category
@@ -745,6 +782,13 @@ function SettingsWindow:CreateWindow()
     titleText:SetJustifyH("LEFT")
     titleText:SetTextColor(1, 1, 1, 1)
 
+    local headingText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    headingText:SetPoint("TOPLEFT", titleText, "BOTTOMLEFT", 0, -2)
+    headingText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, 0)
+    headingText:SetJustifyH("LEFT")
+    headingText:SetTextColor(0.92, 0.92, 0.92, 1)
+    headingText:Hide()
+
     local descriptionText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     descriptionText:SetPoint("TOPLEFT", titleText, "BOTTOMLEFT", 0, -4)
     descriptionText:SetPoint("TOPRIGHT", contentHeader, "TOPRIGHT", 0, -28)
@@ -812,6 +856,7 @@ function SettingsWindow:CreateWindow()
     self.contentHeader = contentHeader
     self.contentHost = contentHost
     self.contentTitleText = titleText
+    self.contentHeadingText = headingText
     self.contentDescriptionText = descriptionText
     self.tabBar = tabBar
     self.emptyState = emptyState

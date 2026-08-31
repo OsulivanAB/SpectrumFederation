@@ -41,6 +41,18 @@ function Model.LabelOf(item)
     return item.name or ""
 end
 
+-- Optional secondary heading shown under the category title.
+-- Pages without contentHeading keep the existing header layout.
+function Model.GetPageContentHeading(page)
+    if type(page) ~= "table" then
+        return nil
+    end
+    if IsNonEmptyString(page.contentHeading) then
+        return page.contentHeading
+    end
+    return nil
+end
+
 local function CompareByOrderLabelId(a, b)
     local oa = (a and a.order) or DEFAULT_ORDER
     local ob = (b and b.order) or DEFAULT_ORDER
