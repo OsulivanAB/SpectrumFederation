@@ -46,6 +46,8 @@ read_globals = {
   "UnitGUID",
   "Enum",
   "GetTime",
+  "GetCursorPosition",
+  "IsMouselooking",
   "CreateFromMixins",
   "MapCanvasDataProviderMixin",
   "MapCanvasPinMixin",

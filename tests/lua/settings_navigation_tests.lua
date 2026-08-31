@@ -147,6 +147,16 @@ local function productionFixture()
             layout = { windowWidth = 1350, disablePageScroll = true },
         }),
         page({
+            id = "uiEnhancements",
+            categoryId = "nicheFeatures",
+            name = "UI Enhancements",
+            navLabel = "UI Enhancements",
+            contentHeading = "UI Enhancements",
+            group = "Core",
+            description = "Optional on-screen enhancements for this character, including Mouse Tracer.",
+            order = 15,
+        }),
+        page({
             id = "debugging",
             name = "Debugging",
             navLabel = "Debugging",
@@ -184,6 +194,20 @@ local function productionFixture()
     local pagesById = {}
     local categories = {}
     local categoriesById = {}
+
+    -- Parent-owned Gameplay must exist before the UI Enhancements page is upserted
+    -- so the category title stays "Gameplay" instead of inheriting the page name.
+    table.insert(categories, {
+        id = "nicheFeatures",
+        name = "Gameplay",
+        navLabel = "Gameplay",
+        group = "Core",
+        description = "Manage character-specific gameplay toggles and automation.",
+        order = 15,
+        enabled = true,
+        enablementResolved = true,
+    })
+    categoriesById.nicheFeatures = categories[#categories]
 
     for _, item in ipairs(pages) do
         item.categoryId = Model.NormalizePageRelationship(item)
@@ -228,18 +252,6 @@ local function productionFixture()
     for _, item in ipairs(pages) do
         upsertCategory(item)
     end
-
-    table.insert(categories, {
-        id = "nicheFeatures",
-        name = "Gameplay",
-        navLabel = "Gameplay",
-        group = "Core",
-        description = "Manage character-specific gameplay toggles and automation.",
-        order = 15,
-        enabled = true,
-        enablementResolved = true,
-    })
-    categoriesById.nicheFeatures = categories[#categories]
 
     table.insert(categories, {
         id = "SpectrumFederation_CursedSurgeTracker",
@@ -295,7 +307,13 @@ assertDeepEq(
     "root without children is itself the content page"
 )
 assertEq(#Model.GetContentPages(registry, "emptyAddon"), 0, "enabled empty category has zero content pages")
-assertEq(#Model.GetContentPages(registry, "nicheFeatures"), 0, "Gameplay is a parent-owned empty category")
+assertDeepEq(
+    idsOf(Model.GetContentPages(registry, "nicheFeatures")),
+    { "uiEnhancements" },
+    "Gameplay has the UI Enhancements content page"
+)
+assertTrue(Model.IsContentPage(registry, "uiEnhancements"), "uiEnhancements is a content page")
+assertTrue(not Model.IsContentPage(registry, "nicheFeatures"), "Gameplay category id is not a content page")
 assertEq(#Model.GetContentPages(registry, "SpectrumFederation_CursedSurgeTracker"), 0, "disabled discovered category has zero content pages")
 assertEq(#Model.GetContentPages(registry, "lootHelper") >= 2 and 2 or 0, 2, "Loot Helper is a 2+ page category")
 assertEq(#Model.GetContentPages(registry, "debugging"), 1, "Debugging is a single-page category")
@@ -357,8 +375,10 @@ local emptySelect = Model.ResolveSidebarSelect(registry, {}, "emptyAddon")
 assertEq(emptySelect.categoryId, "emptyAddon", "enabled empty category can be selected")
 assertEq(emptySelect.pageId, nil, "enabled empty category has a nil page id")
 local gameplaySelect = Model.ResolveSidebarSelect(registry, {}, "nicheFeatures")
-assertEq(gameplaySelect.categoryId, "nicheFeatures", "Gameplay empty category can be selected")
-assertEq(gameplaySelect.pageId, nil, "Gameplay empty category has a nil page id")
+assertEq(gameplaySelect.categoryId, "nicheFeatures", "Gameplay category can be selected")
+assertEq(gameplaySelect.pageId, "uiEnhancements", "Gameplay sidebar opens UI Enhancements")
+local gameplayShow = Model.ResolveShowPage(registry, {}, "nicheFeatures")
+assertEq(gameplayShow.pageId, "uiEnhancements", "ShowPage(nicheFeatures) opens UI Enhancements")
 
 -- Unknown id fallback
 local unknownWithSession = Model.ResolveShowPage(registry, session, "noSuchPage")
@@ -374,7 +394,28 @@ assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "raid check tools"
 assertTrue(Model.CategoryMatchesQuery(registry, "lootHelper", "Equipment"), "search matches content-page navLabel")
 assertTrue(Model.CategoryMatchesQuery(registry, "debugging", "Debugging"), "search matches category name")
 assertTrue(Model.CategoryMatchesQuery(registry, "nicheFeatures", "Gameplay"), "search matches Gameplay category name")
+assertTrue(Model.CategoryMatchesQuery(registry, "nicheFeatures", "UI Enhancements"), "search matches the UI Enhancements page")
+assertTrue(Model.CategoryMatchesQuery(registry, "nicheFeatures", "Mouse Tracer"), "search matches the UI Enhancements description")
 assertTrue(not Model.CategoryMatchesQuery(registry, "debugging", "Equipment"), "unrelated category does not match Equipment")
+
+assertEq(Model.GetPageContentHeading(registry.pagesById.uiEnhancements), "UI Enhancements", "UI Enhancements opts into a page heading")
+assertEq(Model.GetPageContentHeading(registry.pagesById.general), nil, "General has no page-level heading")
+assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelper), nil, "Loot Helper root has no page-level heading")
+assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperGeneral), nil, "Loot Helper General has no page-level heading")
+assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperProfile), nil, "Loot Helper Profile has no page-level heading")
+assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperSession), nil, "Loot Helper Session has no page-level heading")
+assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperEquipment), nil, "Loot Helper Equipment has no page-level heading")
+assertEq(Model.GetPageContentHeading(registry.pagesById.lootHelperAdmin), nil, "Loot Helper Admin has no page-level heading")
+assertEq(Model.GetPageContentHeading(registry.pagesById.debugging), nil, "Debugging has no page-level heading")
+assertEq(Model.GetPageContentHeading(nil), nil, "missing page has no heading")
+assertEq(Model.GetPageContentHeading({ contentHeading = "" }), nil, "empty contentHeading is ignored")
+
+local uiEnhancementHits = Model.Search(registry, "UI Enhancements")
+assertTrue(#uiEnhancementHits > 0, "UI Enhancements query returns hits")
+assertEq(uiEnhancementHits[1].pageId, "uiEnhancements", "UI Enhancements query ranks that page first")
+assertEq(uiEnhancementHits[1].categoryId, "nicheFeatures", "UI Enhancements query stays in Gameplay")
+local gameplaySearchClick = Model.ResolveSearchCategoryClick(registry, {}, "nicheFeatures", "UI Enhancements")
+assertEq(gameplaySearchClick.pageId, "uiEnhancements", "Gameplay search click opens UI Enhancements")
 
 local equipmentHits = Model.Search(registry, "Equipment")
 assertTrue(#equipmentHits > 0, "Equipment query returns hits")
@@ -577,6 +618,25 @@ assertTrue(gameplay ~= nil, "RegisterCategory upserts a parent-owned category")
 assertEq(gameplay.group, "Core", "Gameplay stays in Core")
 assertEq(#UI:GetPagesForCategory("nicheFeatures"), 0, "Gameplay has no synthetic content pages")
 assertTrue(notified >= 4, "RegisterCategory notifies listeners")
+
+UI:RegisterPage(page({
+    id = "uiEnhancements",
+    categoryId = "nicheFeatures",
+    name = "UI Enhancements",
+    navLabel = "UI Enhancements",
+    contentHeading = "UI Enhancements",
+    group = "Core",
+    description = "Optional on-screen enhancements for this character, including Mouse Tracer.",
+    order = 15,
+}))
+assertEq(UI:GetCategory("nicheFeatures").name, "Gameplay", "RegisterPage does not overwrite the Gameplay category title")
+assertDeepEq(
+    idsOf(UI:GetPagesForCategory("nicheFeatures")),
+    { "uiEnhancements" },
+    "Gameplay content pages include UI Enhancements"
+)
+assertEq(Model.GetPageContentHeading(UI.pagesById.uiEnhancements), "UI Enhancements", "registered page keeps contentHeading")
+assertTrue(notified >= 5, "RegisterPage of UI Enhancements notifies listeners")
 
 local dupOk = pcall(function()
     UI:RegisterPage(page({ id = "lootHelper", name = "Loot Helper" }))

@@ -24,9 +24,22 @@ SF.SettingsSchema = {
 			activeProfileId = nil,
 			profiles = {},
 		},
+
+		-- Last-seen Mouse Tracer settings keyed by Name-Realm.
+		-- Used only so another character can copy them. Not a general profile system.
+		mouseTracerCopies = {},
 	},
 
-	CHARACTER_DEFAULTS = {},
+	CHARACTER_DEFAULTS = {
+		mouseTracer = {
+			enabled = false,
+			trailLength = 400,
+			fadeDuration = 0.50,
+			thickness = 16,
+			rainbowSpeed = 0.25,
+			opacity = 0.70,
+		},
+	},
 
 	-- Default *settings* for a profile
 	-- These are the fields we can safely "reset" without nuking membership/admins

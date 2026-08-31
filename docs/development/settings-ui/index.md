@@ -10,9 +10,9 @@ The settings implementation separates persistence, runtime effects, page registr
 | `modules/Settings/Store.lua` | Dot-path reads/writes, callbacks, resets, profile adapters, and per-character storage. |
 | `modules/Settings/Apply.lua` | Debouncing, combat deferral, and feature reactions. |
 | `modules/UI/Settings/Registry.lua` | Canonical page and category inventory, `RegisterCategory` for empty parent-owned categories, `categoryId` normalization, sub-addon discovery, and enablement refresh. Blizzard Settings registration is currently disabled. |
-| `modules/UI/Settings/NavigationModel.lua` | Pure navigation helpers (content pages, `ShowPage`, search ranking, sort, window minima). No frames and no C_AddOns. |
+| `modules/UI/Settings/NavigationModel.lua` | Pure navigation helpers (content pages, `ShowPage`, search ranking, sort, window minima, optional `contentHeading`). No frames and no C_AddOns. |
 | `modules/UI/Settings/SubAddons.lua` | C_AddOns adapter used only by Registry. |
-| `modules/UI/Settings/StandaloneWindow.lua` | The `/sf` window: category sidebar, tabs, session last-tab, search, resize. |
+| `modules/UI/Settings/StandaloneWindow.lua` | The `/sf` window: category sidebar, optional page heading, tabs, session last-tab, search, resize. |
 | `modules/UI/Settings/Widgets/TabBar.lua` | Content tab strip for categories with two or more pages. |
 | `modules/UI/Settings/Widgets/EmptyState.lua` | Generic empty category presentation. |
 | `modules/UI/Settings/PageBuilder.lua` | Scroll hosts, sections, sizing, refresh, and reflow. |
@@ -31,9 +31,11 @@ The sidebar shows **top-level categories only**. Nested sidebar children are not
 - Legacy `parentId` is still accepted and becomes `categoryId`. If both are set and differ, registration errors.
 - A page whose `id` equals its `categoryId` is the category root. If other pages share that category, the root is metadata only (`name`, `navLabel`, `group`, `description`, `defaultChildId`, `order`) and is **not** a tab. Loot Helper is the current example: five content pages, not six.
 - A root with no children is itself the one content page (General, Loot Logs, Debugging).
-- Zero content pages: show the empty-state widget. Do not register a synthetic page. Gameplay is the parent-owned example; discovered child addons can also be empty.
-- One content page: hide the tab bar.
+- Zero content pages: show the empty-state widget. Do not register a synthetic page. Discovered child addons can be empty; tests use `emptyAddon` as the parent-owned empty example.
+- One content page: hide the tab bar. Gameplay is the current example: the sidebar label stays **Gameplay**, and its one content page is **UI Enhancements**.
 - Two or more: show tabs.
+
+Pages may set optional `contentHeading`. When present, the window keeps the category name as the primary title and shows that string as a secondary heading above the page description. Pages without `contentHeading` keep the existing header layout. Do not set it on Loot Helper pages; that category title must remain **Loot Helper**.
 
 Discovered child addons default to group **Optional**. Parent-owned categories keep Core / Loot Tools / Advanced.
 
@@ -150,10 +152,12 @@ SF.SettingsUI:RegisterCategory({
 
 Do not register a synthetic page for an empty category. The empty-state widget is shown until a content page is registered with that `categoryId`.
 
-Navigation tests load production `NavigationModel.lua`:
+To keep a reserved category title when the first content page has a different name, call `RegisterCategory` first, then `RegisterPage` with a distinct `id` and that `categoryId`. If a page `id` equals its `categoryId`, registration treats the page as the category root and overwrites the category name.
+
+Navigation and Mouse Tracer production-Lua tests:
 
 ```bash
-python -m pytest tests/test_settings_navigation.py
+python -m pytest tests/test_settings_navigation.py tests/test_mouse_tracer.py
 ```
 
 ## Declarative controls
@@ -195,3 +199,5 @@ Character-specific settings belong in `CHARACTER_DEFAULTS` and are read or writt
 - New pages use `categoryId` (or legacy `parentId`) and do not add nested sidebar children.
 - A category root with child pages is metadata only and is not a tab.
 - Settings navigation changes run `python -m pytest tests/test_settings_navigation.py`.
+- Mouse Tracer engine or constants changes also run `python -m pytest tests/test_mouse_tracer.py`.
+- See [Mouse Tracer](../mouse-tracer.md) for the runtime performance and snapshot contracts.

@@ -90,6 +90,7 @@ nav:
     - Contributing: development/getting-started/index.md
     - Addon Architecture: development/architecture.md
     - Settings System: development/settings-ui/index.md
+    - Mouse Tracer: development/mouse-tracer.md
     - Loot Helper Internals: development/loot-helper/index.md
     - Automation and Releases: development/automation.md
 

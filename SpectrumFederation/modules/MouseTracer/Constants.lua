@@ -1,0 +1,58 @@
+local _, SF = ...
+
+SF.MouseTracer = SF.MouseTracer or {}
+
+-- Center-to-center stamp spacing is a fraction of thickness so circles overlap
+-- heavily across the 6–28px range. Floor keeps the pool bounded at the thinnest trail.
+local MIN_SPACING_FLOOR = 1
+local SPACING_THICKNESS_RATIO = 0.10
+local MAX_TRAIL_LENGTH = 1200
+local TELEPORT_DISTANCE = 250
+
+SF.MouseTracer.Constants = {
+	MAX_TRAIL_LENGTH = MAX_TRAIL_LENGTH,
+	MIN_TRAIL_LENGTH = 80,
+	MIN_FADE_DURATION = 0.2,
+	MAX_FADE_DURATION = 1.5,
+	MIN_THICKNESS = 6,
+	MAX_THICKNESS = 28,
+	MIN_RAINBOW_SPEED = 0.25,
+	MAX_RAINBOW_SPEED = 3.0,
+	MIN_OPACITY = 0.2,
+	MAX_OPACITY = 1.0,
+
+	DEFAULT_TRAIL_LENGTH = 400,
+	DEFAULT_FADE_DURATION = 0.50,
+	DEFAULT_THICKNESS = 16,
+	DEFAULT_RAINBOW_SPEED = 0.25,
+	DEFAULT_OPACITY = 0.70,
+	TAPER_MIN_RATIO = 0.40,
+
+	MIN_SPACING = MIN_SPACING_FLOOR,
+	MIN_SPACING_FLOOR = MIN_SPACING_FLOOR,
+	SPACING_THICKNESS_RATIO = SPACING_THICKNESS_RATIO,
+
+	MAX_POINTS = math.ceil(MAX_TRAIL_LENGTH / MIN_SPACING_FLOOR) + 2,
+	MAX_SEGMENTS = math.ceil(MAX_TRAIL_LENGTH / MIN_SPACING_FLOOR) + 1,
+	MAX_NEW_POINTS_PER_TICK = math.ceil(TELEPORT_DISTANCE / MIN_SPACING_FLOOR),
+	TELEPORT_DISTANCE = TELEPORT_DISTANCE,
+
+	ACTIVE_SAMPLE_INTERVAL = 1 / 60,
+	FADE_INTERVAL = 1 / 30,
+	IDLE_POLL_INTERVAL = 1 / 60,
+	SNAPSHOT_DEBOUNCE = 0.35,
+	SNAPSHOT_TICKER_INTERVAL = 0.1,
+	ALPHA_EPSILON = 0.01,
+
+	HUE_PER_PIXEL = 1 / 200,
+	CIRCLE_TEXTURE = "Interface\\CharacterFrame\\TempPortraitAlphaMask",
+
+	SETTING_KEYS = {
+		"enabled",
+		"trailLength",
+		"fadeDuration",
+		"thickness",
+		"rainbowSpeed",
+		"opacity",
+	},
+}
