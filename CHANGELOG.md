@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.1] - 2026-08-31
+
+### Changed
+- Raid Equipment standalone page and async Raid Check
+
 ## [1.3.0] - 2026-08-31
 
 ### Added
