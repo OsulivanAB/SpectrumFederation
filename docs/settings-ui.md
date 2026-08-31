@@ -2,6 +2,16 @@
 
 Enter `/sf` to toggle Spectrum Federation's standalone settings window. Changes are saved immediately; there is no Apply button.
 
+The left sidebar lists **categories** grouped as Core, Loot Tools, Advanced, and Optional. Categories with more than one page show **tabs** in the content area. Categories with a single page have no tab bar. The first `/sf` open in a session starts on **General**. Later `/sf` toggles restore the category and tab from this session; that restoration is not saved across a reload.
+
+**Quick Find** matches category and page names, descriptions, and group labels. With a search query, choosing a category opens the best matching page in that category.
+
+Installed optional child addons appear under **Optional**. If the add-on is enabled for this character but has no settings pages yet, the category opens to a generic empty state. If it is disabled for this character, the row stays visible and greyed; hover explains that it must be enabled in World of Warcraft's AddOns list. Spectrum Federation cannot enable or disable child addons from `/sf`.
+
+`Enable LootHelper` on the Loot Helper General tab only shows or hides the roster window. It does not grey the Loot Helper category.
+
+The window can be resized from the bottom-right grip. Wide pages such as Equipment and Loot Logs raise the minimum size when needed, but leaving those pages does not shrink the window.
+
 ## General
 
 **Window Style**

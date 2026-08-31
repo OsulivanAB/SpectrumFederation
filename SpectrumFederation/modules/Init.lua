@@ -1,9 +1,11 @@
 -- Grab the namespace
 local addonName, SF = ...
 
--- Optional child addons declare ## Dependencies: SpectrumFederation and may
--- read _G.SpectrumFederation for Debug, slash registration, and time helpers.
--- The parent never loads or references child addons.
+-- Optional child addons declare ## Dependencies: SpectrumFederation and
+-- ## X-SpectrumFederation-Parent: SpectrumFederation. They may read
+-- _G.SpectrumFederation for Debug, slash registration, and time helpers.
+-- The parent discovers installed children from TOC metadata only and never
+-- loads child Lua or XML.
 _G[addonName] = SF
 
 local f = CreateFrame("Frame")

@@ -27,7 +27,7 @@ SpectrumFederation_CursedSurgeTracker/
 .github/workflows/             PR, beta, promotion, and rollback automation
 assets/                        standalone Google Sheet sync utility
 docs/                          MkDocs content
-tests/                         interface-sync parser tests
+tests/                         Python tests and Lua 5.1 Settings navigation tests
 ```
 
 Always inspect `SpectrumFederation/SpectrumFederation.toc` before changing load order, packaged files, Interface metadata, or addon versioning.
@@ -85,6 +85,9 @@ python3 .github/scripts/validate_docs.py
 
 # Interface-sync parser or fixtures
 python -m pytest tests/test_wow_interface_sync.py
+
+# Settings navigation (loads production NavigationModel.lua; requires lua5.1)
+python -m pytest tests/test_settings_navigation.py
 ```
 
 Do not weaken a check to make a change pass.

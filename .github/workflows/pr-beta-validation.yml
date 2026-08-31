@@ -14,6 +14,7 @@ on:
       - 'mkdocs.yml'
       - 'requirements-docs.txt'
       - 'README.md'
+      - 'tests/**'
 
 concurrency:
   group: beta-validation-${{ github.ref }}
@@ -139,6 +140,30 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 .github/scripts/check_duplicate_release.py "${{ steps.version.outputs.version }}"
+
+  run-tests:
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install lua5.1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lua5.1
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run tests
+        run: python -m pytest tests/test_settings_navigation.py tests/test_cursed_surge_tracker.py
 
   validate-docs:
     name: Validate Documentation

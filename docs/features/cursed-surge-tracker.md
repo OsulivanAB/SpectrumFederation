@@ -4,7 +4,14 @@ Spectrum Federation: Cursed Surge Tracker is a child addon that shows the five C
 
 It ships in the same Spectrum Federation release archive. After install it appears as its own checkbox nested under Spectrum Federation in WoW's AddOns list. Disable the child to hide the tracker without affecting Loot Helper or other parent features. Disable Spectrum Federation and the child is dependency-disabled.
 
-No extra in-addon toggle is required.
+No extra in-addon toggle is required, and `/sf` cannot enable or disable the tracker.
+
+When the child is installed, it also appears as an **Optional** category in the Spectrum Federation settings window:
+
+- If it is enabled for this character and has no settings pages yet, opening the category shows a generic empty state. Future pages will replace that empty state.
+- If it is disabled for this character, the category stays visible, grey, and not selectable. Hover the row for a reminder to enable it in WoW's AddOns list.
+
+The tracker is not configured from `/sf` today. Map pins and countdowns are the feature; the settings category is only a discovered entry point.
 
 ## When it runs
 

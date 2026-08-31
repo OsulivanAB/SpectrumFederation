@@ -13,11 +13,14 @@ Restart World of Warcraft or run `/reload`, then enable the addon for the charac
 
 ## Open Spectrum Federation
 
-Enter `/sf` to toggle the addon's standalone settings window. The navigation is grouped into:
+Enter `/sf` to toggle the addon's standalone settings window. The left sidebar lists categories grouped into:
 
 - **Core** — appearance and character-specific gameplay automation.
 - **Loot Tools** — Loot Helper configuration, profiles, sessions, equipment auditing, and logs.
 - **Advanced** — diagnostic logging.
+- **Optional** — installed child addons, such as Cursed Surge Tracker when it is present.
+
+Loot Helper's General, Profile, Session, Equipment, and Admin pages are **tabs** on the Loot Helper category, not extra sidebar rows. Paths such as **Loot Helper → Profile** mean: select Loot Helper, then the Profile tab.
 
 The Loot Helper window appears automatically when all of these conditions are true:
 
