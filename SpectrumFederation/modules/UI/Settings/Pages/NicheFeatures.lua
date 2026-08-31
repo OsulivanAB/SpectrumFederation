@@ -155,6 +155,11 @@ function Page:Build(panel)
 						enabled = function()
 							return tracer and tracer.HasCopySources and tracer:HasCopySources()
 						end,
+						onValueChanged = function(ctx)
+							if ctx.pageBuilder then
+								ctx.pageBuilder:Refresh()
+							end
+						end,
 					},
 					{
 						type = "button",
@@ -163,11 +168,7 @@ function Page:Build(panel)
 						width = 90,
 						tooltip = "Overwrite this character's Mouse Tracer settings with the selected character's saved settings. This cannot be undone except by copying back or changing the sliders.",
 						enabled = function()
-							if not (tracer and tracer.HasCopySources and tracer:HasCopySources()) then
-								return false
-							end
-							local source = tracer.GetCopySource and tracer:GetCopySource() or panel.__sfMouseTracerCopySource
-							return source ~= nil
+							return tracer and tracer.CanCopy and tracer:CanCopy() or false
 						end,
 						onClick = function(ctx)
 							ctx.section:ClearMessage()
