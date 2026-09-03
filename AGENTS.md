@@ -28,8 +28,9 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
 - Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
 - Run Loot Helper window tests (production Lua via lua5.1): `python -m pytest tests/test_loot_helper_window.py`
-- Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py
+- Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py`
 - Run Raid Equipment policy and check-run tests (production Lua via lua5.1): `python -m pytest tests/test_raid_equipment.py`
+- Run PR template validator tests: `python -m pytest tests/test_pr_template.py`
 
 ## Important Workflows
 
@@ -46,6 +47,8 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Loot Helper or sync work: inspect `SpectrumFederation/modules/LootHelper/`, `SpectrumFederation/modules/LootHelperSync/`, and the related docs under `docs/development/loot-helper/`.
 - Workflow or CI script work: inspect the matching file under `.github/workflows/` or `.github/scripts/` first, then use `.github/instructions/` as supplemental guidance.
 - Docs work: start with `mkdocs.yml` for nav/build behavior, then edit files in `docs/`.
+- PR descriptions: follow `.cursor/rules/pr-template.mdc`. Never check **I have tested these changes in-game**.
+- PR review comments: follow `.cursor/skills/pr-review-comments/SKILL.md`.
 
 ## Validation By Change Area
 
@@ -59,3 +62,4 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Loot Helper window minimize/positioning: also run `python -m pytest tests/test_loot_helper_window.py`
 - Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`
+- PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`

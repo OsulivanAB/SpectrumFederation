@@ -48,6 +48,7 @@ python3 .github/scripts/lint_all.py
 - Fill out every section **to the best of your ability** using the information available from the task, code changes, validation, and testing performed.
 - If a section does not apply or you do not have the information, keep the template section and state that clearly instead of omitting it.
 - When a tool asks for a PR title/description, first read the template and then format the response to match it.
+- **Never check `I have tested these changes in-game`.** That box is human-owned after Retail QA. Leave it unchecked even when automated tests passed. Do not check **WoW Client Type** as a substitute. Report automated validation in **Testing** and state that in-game QA was not performed when it was not. `.github/scripts/validate_pr_template.py` skips this item so leaving it unchecked does not fail CI.
 
 ## Optional local references
 A Blizzard UI source mirror may exist at:

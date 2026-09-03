@@ -23,7 +23,7 @@
 
 ## Checklist
 
-- [ ] I have tested these changes in-game
+- [ ] I have tested these changes in-game <!-- Agents: leave unchecked. Humans mark this after Retail QA. -->
 - [ ] My code follows the project's style guidelines
 - [ ] I have added/updated documentation as needed
 - [ ] I have added appropriate Debug Logging if necessary

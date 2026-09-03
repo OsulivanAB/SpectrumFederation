@@ -83,7 +83,12 @@ def main():
     if not checklist_section:
         errors.append("Missing '## Checklist' section")
     else:
-        optional_items = ["linked this pr to any related issues"]
+        # Human-owned: in-game QA and optional issue linking. Agents must leave
+        # the in-game box unchecked; humans may check it after Retail QA.
+        optional_items = [
+            "linked this pr to any related issues",
+            "tested these changes in-game",
+        ]
         total_checklist, checked_checklist = count_checkboxes(checklist_section, optional_items)
         print(f"✓ Found 'Checklist' section with {total_checklist} items")
         
