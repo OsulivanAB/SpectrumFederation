@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.6] - 2026-09-03
+
+### Changed
+- Session settings help now states that syncing between addons only happens during a session
+
 ## [1.4.0-beta.5] - 2026-09-03
 
 ### Changed

@@ -77,7 +77,7 @@ Rename and profile-specific configuration are admin-only. Only the profile owner
 
 This page includes:
 
-- a short note on what only happens while a session is active, then start/end session control;
+- a note that syncing between addons only happens during a session, then start/end session control;
 - saved raid-wide safe-mode preferences for all-the-time or combat use;
 - Points Per Raid Check in Point Based mode;
 - Pre-Raid Check and Raid Check actions;
