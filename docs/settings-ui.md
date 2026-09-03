@@ -77,10 +77,10 @@ Rename and profile-specific configuration are admin-only. Only the profile owner
 
 This page includes:
 
-- start/end session control;
+- a short note on what only happens while a session is active, then start/end session control;
 - saved raid-wide safe-mode preferences for all-the-time or combat use;
 - Points Per Raid Check in Point Based mode;
-- Pre-Raid Check and Raid Check actions, including the session start prompt;
+- Pre-Raid Check and Raid Check actions;
 - admin system-message summaries of missing players and Inspection Failed, independent of whisper settings;
 - optional whispers for missing and prepared players;
 - editable whisper templates.

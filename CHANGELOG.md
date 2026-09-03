@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.5] - 2026-09-03
+
+### Changed
+- Loot Helper Session settings now explain what only happens during an active session, and drop the Raid Check prompt and Raid Equipment policy help copy
+
 ## [1.4.0-beta.4] - 2026-09-03
 
 ### Fixed

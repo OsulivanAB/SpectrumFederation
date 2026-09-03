@@ -882,8 +882,6 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 						)
 					end,
 				},
-				{ type = "spacer", height = 12 },
-				{ type = "help", indent = "label", text = "Equipment enchant and gem rules are addon-owned current-Retail policy. Review them on the Raid Equipment page. Raid Check awards and whispers remain on Session." },
 			},
 		},
 		session = {
@@ -892,6 +890,11 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			tooltip = "Manage the live Loot Helper session for this profile, including session start and stop, raid-wide safemode, and raid check behavior.",
 			condition = CanShowAdminTools,
 			items = {
+				{
+					type = "help",
+					indent = "label",
+					text = "These behaviors only happen while a session is active: sharing profile updates, live admin changes, and log transfers with other addon users in your group, and Raid Check awards or whispers those clients should receive. Roster, equipment history, and Raid Equipment review on this client still work without a session.",
+				},
 				{ type = "button", label = "Session Control", adminOnly = true, buttonText = function() if IsSessionActive() then return "End Session" end return "Start Session" end, width = 120, tooltip = "Start a Loot Helper session for the active profile, or end the current one if a session is already running.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then ctx.section:SetMessage("Loot Helper Sync system not available", "error") return end if IsSessionActive() then local ok = SF.LootHelperSync:EndSession("manual") if ok then ctx.section:SetMessage("Session ended successfully", "success") else ctx.section:SetMessage("Failed to end session", "error") end else local profileId = GetActiveProfileId(ctx.store) if not profileId then ctx.section:SetMessage("No active profile selected", "error") return end local sessionId = SF.LootHelperSync:StartSession(profileId) if sessionId then ctx.section:SetMessage("Session started successfully", "success") else ctx.section:SetMessage("Failed to start session (not in a group/raid?)", "error") end end ctx.pageBuilder:Refresh() end },
 				{ type = "text", text = "Enable Raid Wide Safe Mode" },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Only in-combat", tooltip = "Automatically enable raid-wide safemode during combat. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false) end return false end, set = function(value) if IsAdmin() and store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false) end end }, { label = "All the Time", tooltip = "Keep raid-wide safemode enabled for the full session. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeMode", false) end return false end, set = function(value) if IsAdmin() and store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeMode", value and true or false) end end } } },
@@ -899,7 +902,6 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "spacer", height = 12 },
 				{ type = "heading", text = "Raid Check Settings" },
 				{ type = "slider", label = "Points Per Raid Check", adminOnly = true, min = 0, max = 1, step = 0.5, tooltip = "Set how many points each prepared player earns when running a Raid Check. Equipment rules are addon-owned and are not configured here.", visible = function() return HasActiveProfile() and IsPointBasedMode() end, enabled = function() return ProfileActionsEnabled() end, get = function() return GetRaidCheckPointsAwardPerCheck() end, set = function(v) SetRaidCheckPointsAwardPerCheck(v) end },
-				{ type = "help", indent = "label", text = "If no session is active, Pre-Raid Check and Raid Check ask whether to start one. Yes starts a session then the check. No runs the check without a session. Escape or Cancel aborts." },
 				{ type = "text", text = "Raid Checks..." },
 					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunPreRaidCheck() if status == "prompt" then ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info") elseif status == "started" then ctx.section:SetMessage("Pre-Raid Check started.", "info") elseif status == "busy" then ctx.section:SetMessage("A Raid Check is already in progress.", "warn") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunRaidCheck() if status == "prompt" then ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info") elseif status == "started" then ctx.section:SetMessage("Raid Check started.", "info") elseif status == "busy" then ctx.section:SetMessage("A Raid Check is already in progress.", "warn") end end } },
 					{ type = "text", text = "Enable Whispers During..." },
