@@ -63,6 +63,12 @@ local hooksInstalled = false
 local initialized = false
 local settingsPanel = nil
 local pageRegistered = false
+local summary = {
+    ready = false,
+    totalEntries = 0,
+    messageCount = 0,
+    latestTimestamp = nil,
+}
 
 local function ParentAddon()
     return _G[Capture.PARENT_ADDON_NAME]
@@ -311,6 +317,66 @@ function Capture.GetLatestTimestamp(db)
     return nil
 end
 
+function Capture.ComputeSummaryFromEntries(entries)
+    local total = 0
+    local messages = 0
+    local latest = nil
+    if type(entries) ~= "table" then
+        return total, messages, latest
+    end
+    total = #entries
+    for i = 1, total do
+        local entry = entries[i]
+        if type(entry) == "table" then
+            if entry.kind == "message" then
+                messages = messages + 1
+            end
+            if type(entry.timestamp) == "number" then
+                latest = entry.timestamp
+            end
+        end
+    end
+    return total, messages, latest
+end
+
+function Capture.EnsureSummary(db)
+    if summary.ready then
+        return Capture.GetSummary()
+    end
+    db = db or Capture.GetDatabase()
+    local total, messages, latest = Capture.ComputeSummaryFromEntries(db and db.entries)
+    summary.totalEntries = total
+    summary.messageCount = messages
+    summary.latestTimestamp = latest
+    summary.ready = true
+    return Capture.GetSummary()
+end
+
+function Capture.GetSummary()
+    if not summary.ready then
+        return Capture.EnsureSummary()
+    end
+    return {
+        totalEntries = summary.totalEntries,
+        messageCount = summary.messageCount,
+        latestTimestamp = summary.latestTimestamp,
+    }
+end
+
+local function NoteAppendedEntry(db, entry)
+    if not summary.ready then
+        Capture.EnsureSummary(db)
+        return
+    end
+    summary.totalEntries = summary.totalEntries + 1
+    if type(entry) == "table" and entry.kind == "message" then
+        summary.messageCount = summary.messageCount + 1
+    end
+    if type(entry) == "table" and type(entry.timestamp) == "number" then
+        summary.latestTimestamp = entry.timestamp
+    end
+end
+
 function Capture.AppendEntry(db, entry)
     db = Capture.EnsureDatabase(db)
     if type(entry) ~= "table" then
@@ -321,6 +387,7 @@ function Capture.AppendEntry(db, entry)
     entry.sequence = sequence
     db.nextSequence = sequence + 1
     db.entries[#db.entries + 1] = entry
+    NoteAppendedEntry(db, entry)
     return entry
 end
 
@@ -598,6 +665,10 @@ function Capture.HandleIncomingMessage(prefix, message, distribution, sender)
     if not Capture.IsKnownPrefix(prefix) then
         return nil
     end
+    if not Capture.IsSpectrumSessionActive() then
+        Capture.ReconcileListener("incoming_inactive")
+        return nil
+    end
 
     local entry = Capture.BuildMessageEntry(prefix, message, distribution, sender)
     return Capture.PersistEntry(entry)
@@ -638,6 +709,7 @@ local SESSION_HOOKS = {
     "TryRestorePersistedSession",
     "HandleSessionStart",
     "HandleSessionReannounce",
+    "HandleSessionHeartbeat",
     "TakeoverSession",
     "Enable",
     "Disable",
@@ -834,8 +906,8 @@ end
 function Capture.GetStatusLines()
     local context = Capture.GetSessionContext()
     local libs = Capture.ResolveLibraries()
-    local total, messages = Capture.CountEntries()
-    local latest = Capture.GetLatestTimestamp()
+    local counts = Capture.GetSummary()
+    local latest = counts.latestTimestamp
     local latestText = latest and Capture.FormatTimestamp(latest) or "none"
     return {
         temporary = "Temporary diagnostic tooling. It does not award loot, write Loot Logs, or talk to RC Loot Council.",
@@ -847,8 +919,8 @@ function Capture.GetStatusLines()
         sessionId = context.sessionId or "none",
         profileId = context.profileId or "none",
         coordinator = context.coordinator or "none",
-        messageCount = tostring(messages),
-        entryCount = tostring(total),
+        messageCount = tostring(counts.messageCount),
+        entryCount = tostring(counts.totalEntries),
         latestTimestamp = latestText,
         savedVariablesGlobal = Capture.SAVED_VARIABLES_GLOBAL,
         savedVariablesFile = Capture.GetSavedVariablesFileHint(),
@@ -868,7 +940,7 @@ function Capture.RegisterSettingsPage()
 
     local Page = {
         id = Capture.PAGE_ID,
-        parentId = "lootHelper",
+        categoryId = "lootHelper",
         name = "RC Loot Council",
         navLabel = "RC Loot Council",
         description = "Temporary diagnostic capture of RC Loot Council communications.",
@@ -979,6 +1051,7 @@ function Capture.Init(reason)
     initialized = true
 
     local db = Capture.GetDatabase()
+    Capture.EnsureSummary(db)
     Capture.RebuildRecentView(db)
     Capture.RegisterSettingsPage()
     Capture.InstallSessionHooks()

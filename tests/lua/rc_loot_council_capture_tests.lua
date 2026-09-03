@@ -276,6 +276,114 @@ _G.SpectrumFederation.LootHelperSync:EndSession()
 assertFalse(Capture.IsListenerRegistered(), "session end unregisters the listener")
 
 -- ---------------------------------------------------------------------------
+-- Heartbeat-driven session activation reconciles the listener
+-- ---------------------------------------------------------------------------
+
+Capture = loadCapture()
+registerCalls = {}
+unregisterCalls = 0
+_G.LibStub = function(name)
+    if name == "AceComm-3.0" then
+        return aceComm
+    end
+    return nil
+end
+_G.SpectrumFederation = {
+    LootHelperSync = {
+        state = { active = false },
+        IsSessionActive = function(self)
+            return self.state.active == true
+        end,
+        GetSessionId = function(self)
+            return self.state.active and self.state.sessionId or nil
+        end,
+        GetSessionProfileId = function(self)
+            return self.state.active and self.state.profileId or nil
+        end,
+        GetCoordinator = function(self)
+            return self.state.active and self.state.coordinator or nil
+        end,
+        -- Mirrors production HandleSessionHeartbeat applying a valid descriptor:
+        -- SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua
+        -- sets state.active = true after validation.
+        HandleSessionHeartbeat = function(self, _sender, payload)
+            if type(payload) ~= "table" then
+                return
+            end
+            if type(payload.sessionId) ~= "string" or payload.sessionId == "" then
+                return
+            end
+            if type(payload.profileId) ~= "string" or payload.profileId == "" then
+                return
+            end
+            if type(payload.coordinator) ~= "string" or payload.coordinator == "" then
+                return
+            end
+            self.state.active = true
+            self.state.sessionId = payload.sessionId
+            self.state.profileId = payload.profileId
+            self.state.coordinator = payload.coordinator
+            self.state.coordEpoch = payload.coordEpoch
+        end,
+    },
+}
+_G.hooksecurefunc = function(tbl, name, hook)
+    local original = tbl[name]
+    tbl[name] = function(self, ...)
+        local a, b, c = original(self, ...)
+        hook(self, ...)
+        return a, b, c
+    end
+end
+
+assertTrue(Capture.InstallSessionHooks(), "heartbeat hooks install")
+assertFalse(Capture.IsListenerRegistered(), "listener is inactive before heartbeat activation")
+assertEq(#registerCalls, 0, "no prefix registrations before heartbeat")
+
+_G.SpectrumFederation.LootHelperSync:HandleSessionHeartbeat("Coord-Realm", {
+    sessionId = "SES-HB",
+    profileId = "P-HB",
+    coordinator = "Coord-Realm",
+    coordEpoch = 7,
+})
+
+assertTrue(Capture.IsListenerRegistered(), "heartbeat activation registers the listener")
+assertEq(#registerCalls, 3, "heartbeat activation registers all RC prefixes once")
+assertEq(registerCalls[1].prefix, "RCLC", "heartbeat registers RCLC")
+assertEq(registerCalls[2].prefix, "RCLCv", "heartbeat registers RCLCv")
+assertEq(registerCalls[3].prefix, "RCLCs", "heartbeat registers RCLCs")
+
+local heartbeatStarts = 0
+local heartbeatDb = Capture.GetDatabase()
+for i = 1, #heartbeatDb.entries do
+    if heartbeatDb.entries[i].kind == "capture_start" then
+        heartbeatStarts = heartbeatStarts + 1
+        assertEq(heartbeatDb.entries[i].reason, "HandleSessionHeartbeat", "start marker records heartbeat reason")
+    end
+end
+assertEq(heartbeatStarts, 1, "heartbeat activation writes exactly one capture_start marker")
+
+_G.SpectrumFederation.LootHelperSync:HandleSessionHeartbeat("Coord-Realm", {
+    sessionId = "SES-HB",
+    profileId = "P-HB",
+    coordinator = "Coord-Realm",
+    coordEpoch = 7,
+})
+assertEq(#registerCalls, 3, "repeat heartbeat does not register prefixes again")
+heartbeatStarts = 0
+heartbeatDb = Capture.GetDatabase()
+for i = 1, #heartbeatDb.entries do
+    if heartbeatDb.entries[i].kind == "capture_start" then
+        heartbeatStarts = heartbeatStarts + 1
+    end
+end
+assertEq(heartbeatStarts, 1, "repeat heartbeat does not write another start marker")
+local hbCounts = Capture.GetRegisterCounts()
+assertEq(hbCounts.RCLC, 1, "heartbeat path registers RCLC once")
+assertEq(hbCounts.RCLCv, 1, "heartbeat path registers RCLCv once")
+assertEq(hbCounts.RCLCs, 1, "heartbeat path registers RCLCs once")
+
+-- ---------------------------------------------------------------------------
 -- Incoming messages persist raw data even when decoders are missing
 -- ---------------------------------------------------------------------------
 
@@ -364,6 +472,31 @@ local forced = Capture.BuildMessageEntry("RCLC", "!!!", "RAID", "Sender-Realm", 
 })
 assertEq(forced.decodeStatus, "error", "injected exploding decoder is caught")
 assertTrue(forced.raw == "!!!", "raw payload survives exploding decoder")
+
+-- ---------------------------------------------------------------------------
+-- Incoming messages drop and reconcile if the session is no longer active
+-- ---------------------------------------------------------------------------
+
+_G.SpectrumFederation.LootHelperSync.IsSessionActive = function()
+    return false
+end
+assertTrue(Capture.IsListenerRegistered(), "listener is still registered after session becomes inactive")
+local beforeStale = #Capture.GetDatabase().entries
+local stale = Capture.HandleIncomingMessage("RCLC", "stale-after-inactive", "RAID", "Sender-Realm")
+assertTrue(stale == nil, "inactive-session inbound message is not persisted")
+assertFalse(Capture.IsListenerRegistered(), "inbound guard unregisters the stale listener")
+local afterStale = Capture.GetDatabase().entries
+assertTrue(#afterStale >= beforeStale, "inbound guard may append a stop marker")
+assertTrue(afterStale[#afterStale].raw ~= "stale-after-inactive", "stale payload is not stored")
+local foundStale = false
+for i = 1, #afterStale do
+    if afterStale[i].kind == "message" and afterStale[i].raw == "stale-after-inactive" then
+        foundStale = true
+    end
+end
+assertFalse(foundStale, "stale inbound RC payload is absent from history")
+assertEq(afterStale[#afterStale].kind, "capture_stop", "inbound guard writes capture_stop")
+assertEq(afterStale[#afterStale].reason, "incoming_inactive", "stop marker records incoming_inactive")
 
 -- ---------------------------------------------------------------------------
 -- Successful semantic decode and xrealm preservation
@@ -460,7 +593,8 @@ _G.SpectrumFederation = {
 assertTrue(Capture.RegisterSettingsPage(), "settings page registers once")
 assertFalse(Capture.RegisterSettingsPage(), "settings page registration is idempotent")
 assertEq(registeredPage.id, "lootHelperRCLootCouncilCapture", "page id is lootHelperRCLootCouncilCapture")
-assertEq(registeredPage.parentId, "lootHelper", "page is parented to Loot Helper")
+assertEq(registeredPage.categoryId, "lootHelper", "page uses canonical categoryId lootHelper")
+assertTrue(registeredPage.parentId == nil, "new page does not set legacy parentId")
 assertEq(registeredPage.name, "RC Loot Council", "user-visible page name is RC Loot Council")
 assertTrue(registeredPage.contentHeading == nil, "page does not set conflicting heading metadata")
 assertTrue(type(registeredPage.Build) == "function", "page provides Build")
@@ -549,6 +683,85 @@ assertTrue(ignored == nil, "inactive listener stores no further RC messages")
 local total = #Capture.GetDatabase().entries
 local last = Capture.GetDatabase().entries[total]
 assertTrue(last.kind ~= "message" or last.raw ~= "after-stop", "post-stop RC traffic is not appended")
+
+-- ---------------------------------------------------------------------------
+-- Settings status counters initialize from history and stay O(1)
+-- ---------------------------------------------------------------------------
+
+Capture = loadCapture()
+_G.SpectrumFederation = {
+    LootHelperSync = {
+        IsSessionActive = function()
+            return false
+        end,
+    },
+    SettingsUI = {
+        RegisterPage = function()
+        end,
+    },
+}
+_G.SpectrumFederationRCLootCouncilCaptureDB = {
+    schemaVersion = 1,
+    nextSequence = 5,
+    entries = {
+        { kind = "capture_start", sequence = 1, timestamp = 100 },
+        { kind = "message", sequence = 2, timestamp = 200, raw = "old-a" },
+        { kind = "message", sequence = 3, timestamp = 300, raw = "old-b" },
+        { kind = "capture_stop", sequence = 4, timestamp = 400 },
+    },
+}
+
+assertTrue(Capture.Init("summary"), "init seeds summary from existing history")
+local seeded = Capture.GetSummary()
+assertEq(seeded.totalEntries, 4, "summary total entries initialize from history")
+assertEq(seeded.messageCount, 2, "summary message count initializes from history")
+assertEq(seeded.latestTimestamp, 400, "summary latest timestamp initializes from history")
+
+local status = Capture.GetStatusLines()
+assertEq(status.entryCount, "4", "status entry count uses seeded summary")
+assertEq(status.messageCount, "2", "status message count uses seeded summary")
+
+local scanCalls = 0
+local originalCount = Capture.CountEntries
+function Capture.CountEntries(...)
+    scanCalls = scanCalls + 1
+    return originalCount(...)
+end
+local originalLatest = Capture.GetLatestTimestamp
+function Capture.GetLatestTimestamp(...)
+    scanCalls = scanCalls + 1
+    return originalLatest(...)
+end
+local originalCompute = Capture.ComputeSummaryFromEntries
+function Capture.ComputeSummaryFromEntries(...)
+    scanCalls = scanCalls + 1
+    return originalCompute(...)
+end
+
+status = Capture.GetStatusLines()
+assertEq(status.entryCount, "4", "repeat status read still reports seeded totals")
+assertEq(scanCalls, 0, "normal status reads do not walk persisted history")
+
+local afterMessage = Capture.PersistEntry({ kind = "message", timestamp = 500, raw = "new-msg" })
+assertTrue(afterMessage ~= nil, "message append succeeds after seeded init")
+local afterMessageSummary = Capture.GetSummary()
+assertEq(afterMessageSummary.totalEntries, 5, "appending a message increments total entries")
+assertEq(afterMessageSummary.messageCount, 3, "appending a message increments message count")
+assertEq(afterMessageSummary.latestTimestamp, 500, "appending a message updates latest timestamp")
+
+local afterMarker = Capture.PersistEntry({ kind = "capture_start", timestamp = 600, reason = "manual" })
+assertTrue(afterMarker ~= nil, "marker append succeeds")
+local afterMarkerSummary = Capture.GetSummary()
+assertEq(afterMarkerSummary.totalEntries, 6, "appending a lifecycle marker increments total entries")
+assertEq(afterMarkerSummary.messageCount, 3, "appending a lifecycle marker does not increment message count")
+assertEq(afterMarkerSummary.latestTimestamp, 600, "appending a marker updates latest timestamp")
+
+scanCalls = 0
+status = Capture.GetStatusLines()
+assertEq(status.entryCount, "6", "status entry count follows incremental updates")
+assertEq(status.messageCount, "3", "status message count follows incremental updates")
+assertEq(scanCalls, 0, "incremental status updates do not rescan history")
+assertEq(#Capture.GetDatabase().entries, 6, "persistent history still contains every appended entry")
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

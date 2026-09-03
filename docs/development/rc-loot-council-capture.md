@@ -15,6 +15,10 @@ The logger registers its own AceComm receiver for the current RC prefixes `RCLC`
 
 Locally sent RC messages are not recorded. WoW does not echo a sender's own RAID/PARTY/INSTANCE addon traffic back through `CHAT_MSG_ADDON`, and this addon does not hook `SendAddonMessage` or RC internals.
 
+Capture is gated on `SF.LootHelperSync:IsSessionActive()`. Lifecycle hooks include heartbeat-driven activation (`HandleSessionHeartbeat`), which can set `state.active = true` without going through `StartSession`. Incoming messages also re-check session activity before persist and reconcile the listener if Spectrum is no longer active.
+
+Live Settings status uses cached entry/message counts and the latest timestamp so routine visible updates stay O(1) as history grows. **Load Full History** may walk the entire log when requested.
+
 ## SavedVariables
 
 Account-wide data is stored in `SpectrumFederationRCLootCouncilCaptureDB` and written by WoW to:
