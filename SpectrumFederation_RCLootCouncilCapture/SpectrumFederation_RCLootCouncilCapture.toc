@@ -1,0 +1,12 @@
+## Interface: 120100
+## Title: Spectrum Federation: RC Loot Council Capture
+## Notes: Temporary diagnostic capture of RC Loot Council addon communications during Spectrum Loot Helper sessions.
+## Author: OsulivanAB
+## Version: 1.4.0-beta.7
+## Dependencies: SpectrumFederation
+## Group: SpectrumFederation
+## X-SpectrumFederation-Parent: SpectrumFederation
+## IconTexture: Interface\AddOns\SpectrumFederation\media\Icons\SpectrumFederationIcon
+## SavedVariables: SpectrumFederationRCLootCouncilCaptureDB
+
+Capture.lua

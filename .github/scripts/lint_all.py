@@ -113,9 +113,12 @@ def main():
     args = parser.parse_args()
 
     lua_dirs = [args.addon_dir]
-    child_addon_dir = "SpectrumFederation_CursedSurgeTracker"
-    if child_addon_dir != args.addon_dir and Path(child_addon_dir).exists():
-        lua_dirs.append(child_addon_dir)
+    for child_addon_dir in (
+        "SpectrumFederation_CursedSurgeTracker",
+        "SpectrumFederation_RCLootCouncilCapture",
+    ):
+        if child_addon_dir != args.addon_dir and Path(child_addon_dir).exists():
+            lua_dirs.append(child_addon_dir)
     
     # Verify directories exist
     if not args.skip_lua:

@@ -6,6 +6,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 
 - `SpectrumFederation/`: packaged parent addon runtime code, TOC manifest, locale files, and bundled libraries.
 - `SpectrumFederation_CursedSurgeTracker/`: optional child addon shipped in the same release zip.
+- `SpectrumFederation_RCLootCouncilCapture/`: temporary diagnostic child addon for RC Loot Council capture, shipped in the same release zip.
 - `.github/scripts/`: Python automation for linting, packaging, docs validation, release/version checks, and Blizzard interface sync.
 - `.github/workflows/`: GitHub Actions workflows for PR validation, beta releases, promotion to `main`, rollback, and Copilot setup.
 - `docs/` + `mkdocs.yml`: documentation source for the published docs site.
@@ -28,6 +29,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
 - Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
 - Run Loot Helper window tests (production Lua via lua5.1): `python -m pytest tests/test_loot_helper_window.py`
+- Run RC Loot Council capture tests (production Lua via lua5.1): `python -m pytest tests/test_rc_loot_council_capture.py`
 - Run Settings window layout tests (production Lua via lua5.1): `python -m pytest tests/test_settings_window_layout.py`
 - Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py`
 - Run Raid Equipment policy and check-run tests (production Lua via lua5.1): `python -m pytest tests/test_raid_equipment.py`
@@ -61,6 +63,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Settings navigation or Registry helpers: also run `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer constants or trail engine: also run `python -m pytest tests/test_mouse_tracer.py`
 - Loot Helper window minimize/positioning: also run `python -m pytest tests/test_loot_helper_window.py`
+- RC Loot Council capture child addon: also run `python -m pytest tests/test_rc_loot_council_capture.py`
 - Settings window impersonation-banner layout: also run `python -m pytest tests/test_settings_window_layout.py`
 - Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`

@@ -4,11 +4,15 @@ globals = {
   "SpectrumFederationCSTPinMixin",
   "SLASH_SPECTRUMFEDERATIONCST1",
   "SLASH_SPECTRUMFEDERATIONCST2",
+  "SpectrumFederationRCLootCouncilCaptureDB",
 }
 read_globals = {
   "CreateFrame",
   "C_Timer",
   "C_ChatInfo",
+  "LibStub",
+  "hooksecurefunc",
+  "GetAddOnMetadata",
   "C_Texture",
   "IsInGroup",
   "IsInRaid",

@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.7] - 2026-09-03
+
+### Added
+- Add a temporary RC Loot Council capture child addon that records RC communications during Spectrum Loot Helper sessions
+
 ## [1.4.0-beta.6] - 2026-09-03
 
 ### Changed

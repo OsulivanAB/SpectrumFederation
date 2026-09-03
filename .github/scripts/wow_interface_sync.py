@@ -378,18 +378,22 @@ def read_toc_fields(toc_path):
     return interface_match.group(1).strip(), version_match.group(1).strip()
 
 
+CHILD_ADDON_NAMES = (
+    "SpectrumFederation_CursedSurgeTracker",
+    "SpectrumFederation_RCLootCouncilCapture",
+)
+
+
 def extra_packaged_toc_paths(toc_path):
     """Return sibling child-addon TOC paths that must stay in lockstep."""
     toc_path = Path(toc_path)
     repo_root = toc_path.parent.parent
-    child_toc = (
-        repo_root
-        / "SpectrumFederation_CursedSurgeTracker"
-        / "SpectrumFederation_CursedSurgeTracker.toc"
-    )
-    if child_toc.exists() and child_toc.resolve() != toc_path.resolve():
-        return [child_toc]
-    return []
+    extra = []
+    for child_name in CHILD_ADDON_NAMES:
+        child_toc = repo_root / child_name / f"{child_name}.toc"
+        if child_toc.exists() and child_toc.resolve() != toc_path.resolve():
+            extra.append(child_toc)
+    return extra
 
 
 def update_toc(toc_path, interface, version):

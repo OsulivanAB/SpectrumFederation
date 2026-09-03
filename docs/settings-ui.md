@@ -103,6 +103,10 @@ Profile admins can add profile members as admins, remove admins other than the o
 
 The owner cannot be removed from the admin list through this page.
 
+## Loot Helper: RC Loot Council
+
+This tab is temporary diagnostic tooling from the `SpectrumFederation_RCLootCouncilCapture` child addon. It records RC Loot Council addon communications while a Spectrum Loot Helper session is active. It does not award loot, write Loot Logs, or send RC messages. See [RC Loot Council Capture](development/rc-loot-council-capture.md).
+
 ## Loot Logs
 
 Filter the active profile's history by event type, author, or member. These filters are temporary UI state and are not saved.

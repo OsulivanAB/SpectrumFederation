@@ -2130,6 +2130,8 @@ function LootProfile.ValidateSnapshot(snapshot)
 		end
 	end
 
+	-- Legacy compatibility only: older snapshots may still carry rcLootCouncil
+	-- metadata. This is not an active RC Loot Council integration.
 	if snapshot.rcLootCouncil ~= nil then
 		if type(snapshot.rcLootCouncil) ~= "table" then return false, "snapshot.rcLootCouncil must be a table or nil" end
 		if snapshot.rcLootCouncil.rollType ~= nil and type(snapshot.rcLootCouncil.rollType) ~= "string" then
