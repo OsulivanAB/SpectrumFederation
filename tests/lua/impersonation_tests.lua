@@ -653,6 +653,46 @@ Controller:OnPlayClicked()
 capturedAccept()
 assertTrue(Sync._playEndCalled, "play-button Stop works again after impersonation ends")
 
+-- Stale play-button Start confirmation: dialog opened as admin, then impersonation,
+-- then accept must not call StartSession or print the generic group/raid error.
+function Sync:IsSessionActive()
+    return false
+end
+function Sync:StartSession()
+    self._playStartCalled = true
+    return "SES-TEST"
+end
+function SF.SettingsStore:GetActiveLootHelperProfileId()
+    return SF.lootHelperDB and SF.lootHelperDB.activeProfileId
+end
+Sync._playStartCalled = false
+capturedAccept = nil
+printed = {}
+Controller:OnPlayClicked()
+assertTrue(type(capturedAccept) == "function", "play-button start opened a confirmation")
+assertTrue(Imp:Enable(), "enable after opening start confirmation")
+capturedAccept()
+assertFalse(Sync._playStartCalled, "stale play-button Start cannot StartSession while impersonating")
+local staleStartGeneric = false
+local staleStartDenied = false
+for i = 1, #printed do
+    if printed[i][2]:find("not in a group/raid") then
+        staleStartGeneric = true
+    end
+    if printed[i][1] == "error" and printed[i][2]:find("previewing as a non%-admin") then
+        staleStartDenied = true
+    end
+end
+assertTrue(staleStartDenied, "stale play-button Start prints impersonation deny")
+assertFalse(staleStartGeneric, "stale play-button Start does not report a group/raid failure")
+
+Imp:Disable("start-cleanup")
+Sync._playStartCalled = false
+capturedAccept = nil
+Controller:OnPlayClicked()
+capturedAccept()
+assertTrue(Sync._playStartCalled, "play-button Start works again after impersonation ends")
+
 -- ---------------------------------------------------------------------------
 -- Settings page contract (source-level, production definition)
 -- ---------------------------------------------------------------------------

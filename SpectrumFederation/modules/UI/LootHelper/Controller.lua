@@ -454,7 +454,23 @@ function Controller:OnPlayClicked()
         return
     end
 
+    local Imp = SF.LootHelperImpersonation
+    if Imp and Imp.IsEffectiveLocalAdmin and not Imp:IsEffectiveLocalAdmin() then
+        if SF.PrintError then
+            SF:PrintError("Cannot start a session while previewing as a non-admin.")
+        end
+        return
+    end
+
     Confirm("Start a Loot Helper session for the active profile?", "Start Session", function()
+        local ImpNow = SF.LootHelperImpersonation
+        if ImpNow and ImpNow.IsEffectiveLocalAdmin and not ImpNow:IsEffectiveLocalAdmin() then
+            if SF.PrintError then
+                SF:PrintError("Cannot start a session while previewing as a non-admin.")
+            end
+            self:RequestRefresh("PlayButtonStartSessionDenied")
+            return
+        end
         local sessionId = SF.LootHelperSync:StartSession(profileId)
         if SF.PrintSuccess and SF.PrintError then
             if sessionId then
