@@ -28,6 +28,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
 - Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
 - Run Loot Helper window tests (production Lua via lua5.1): `python -m pytest tests/test_loot_helper_window.py`
+- Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py
 - Run Raid Equipment policy and check-run tests (production Lua via lua5.1): `python -m pytest tests/test_raid_equipment.py`
 
 ## Important Workflows
@@ -56,4 +57,5 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Settings navigation or Registry helpers: also run `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer constants or trail engine: also run `python -m pytest tests/test_mouse_tracer.py`
 - Loot Helper window minimize/positioning: also run `python -m pytest tests/test_loot_helper_window.py`
+- Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`

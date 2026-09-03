@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.2] - 2026-09-03
+
+### Added
+- Preview as Non-Admin (impersonation) for Loot Helper admins: local, runtime-only downgrade that never grants privileges and never changes sync identity
+
 ## [1.4.0-beta.1] - 2026-08-31
 
 ### Changed

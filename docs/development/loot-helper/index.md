@@ -12,6 +12,8 @@ Profile IDs are stable across renames. The creator becomes author, owner, first 
 
 Use the highest-level Store or domain method available for mutations so validation, logging, and refresh behavior stay together. Low-level profile mutators are not uniformly permission-guarded and some do not create logs; callers must enforce authorization and choose the log-producing path. Directly changing private fields bypasses all of those contracts.
 
+`SF.LootHelperImpersonation` is the runtime-only Preview as Non-Admin overlay. Keep `IsCurrentUserAdmin` / `IsCurrentUserOwner` canonical. Local UI and mutators that a player can trigger should use effective local admin/owner. Do not persist impersonation, do not put it in snapshots or sync payloads, and do not let it change sender authorization, `CanSelfCoordinate`, takeover, heartbeat, restore, or inbound validation.
+
 ### Member
 
 `modules/LootHelper/Members.lua` is the derived representation of one member. It exposes identity/class data, point balance, admin role, equipment-category state, and Raid Check whisper timestamps.
@@ -86,7 +88,7 @@ Control messages use the small `SF_LH` traffic class; snapshots and log batches 
 
 ### Session lifecycle
 
-The starting profile admin becomes coordinator. `StartSession` validates group membership, local profile availability, and admin authorization, then rebuilds derived state and begins admin convergence.
+The starting profile admin becomes coordinator. `StartSession` is a user-facing entry point: it denies Preview as Non-Admin before `CanSelfCoordinate`. `CanSelfCoordinate`, takeover, restore, heartbeat/election, admin convergence, sender authorization, and inbound protocol logic stay canonical. `EndSession` remains available for internal/automatic cleanup; slash `/sf loot session end` and the play-button Stop confirmation re-check effective local admin so a stale dialog cannot end a session after impersonation starts.
 
 Admins exchange per-author log summaries. The coordinator requests missing ranges before selecting helpers and announcing the session. Members respond with `HAVE_PROFILE`, `NEED_PROFILE`, or `NEED_LOGS`; helpers are preferred for bulk responses with coordinator fallback.
 
@@ -115,7 +117,7 @@ When adding a new message type, update constants, routing, validation, handler r
 
 ## Raid Check integration
 
-`modules/RaidEquipment/Policy.lua` owns current-Retail completeness and Prepared/Unprepared rules. `modules/RaidEquipment/CheckRun.lua` owns frozen run identity, pause clocks, scaled inspect bounds, inspect-generation tokens, classification, session preflight, and the session-announce gate for consequences. `modules/RaidCheck.lua` owns the shared serial `NotifyInspect` queue, runtime last-good observations, the standalone audit snapshot, and Pre-Raid / Raid Check entry.
+`modules/RaidEquipment/Policy.lua` owns current-Retail completeness and Prepared/Unprepared rules. `modules/RaidEquipment/CheckRun.lua` owns frozen run identity, pause clocks, scaled inspect bounds, inspect-generation tokens, classification, session preflight, and the session-announce gate for consequences. `modules/RaidCheck.lua` owns the shared serial `NotifyInspect` queue, runtime last-good observations, the standalone audit snapshot, and Pre-Raid / Raid Check entry. Consequence application is fail-closed on effective local admin: if Preview as Non-Admin becomes active during an in-flight run, awards, Reward Pot writes, logs, and admin whispers abort as a unit and the run is marked settled so it cannot replay.
 
 Acquisition, policy, and consequences are separate:
 

@@ -74,3 +74,4 @@ When you need a new toggle/option:
 - Settings navigation changes: `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer engine or constants changes: `python -m pytest tests/test_mouse_tracer.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle changes: `python -m pytest tests/test_raid_equipment.py`
+- Loot Helper impersonation / Preview as Non-Admin: `python -m pytest tests/test_impersonation.py`
