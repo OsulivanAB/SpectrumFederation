@@ -71,6 +71,17 @@ local function CanCurrentUserEditActiveProfile(profile)
         return false
     end
 
+    local Imp = SF.LootHelperImpersonation
+    if Imp and Imp.IsEffectiveLocalAdmin then
+        if not Imp:IsEffectiveLocalAdmin(activeProfile) then
+            if SF.Debug then
+                SF.Debug:Warn("MEMBER", "Current user is not an effective local admin in active profile; cannot change member state")
+            end
+            return false
+        end
+        return true
+    end
+
     if type(activeProfile.IsCurrentUserAdmin) ~= "function" then
         if SF.Debug then
             SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member state")
@@ -198,18 +209,8 @@ Member.ARMOR_SLOTS = ARMOR_SLOTS
 -- @return success (boolean) - True if role updated, false otherwise
 function Member:SetRole(newRole)
 
-    -- Enforce admin permissions
-    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
-        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
-            if SF.Debug then
-                SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
-            end
-            return false
-        end
-    else
-        if SF.Debug then
-            SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member roles")
-        end
+    -- Enforce admin permissions (effective local admin while impersonating)
+    if not CanCurrentUserEditActiveProfile() then
         return false
     end
     
@@ -814,18 +815,8 @@ end
 -- @return (boolean) - True if successful, false otherwise
 function Member:ToggleEquipment(slot)
 
-    -- Enforce admin permissions
-    if SF.lootHelperDB.activeProfile.IsCurrentUserAdmin then
-        if not SF.lootHelperDB.activeProfile:IsCurrentUserAdmin() then
-            if SF.Debug then
-                SF.Debug:Warn("MEMBER", "Current user is not an admin in active profile; cannot change member roles")
-            end
-            return false
-        end
-    else
-        if SF.Debug then
-            SF.Debug:Warn("MEMBER", "Active profile does not support IsCurrentUserAdmin; cannot change member roles")
-        end
+    -- Enforce admin permissions (effective local admin while impersonating)
+    if not CanCurrentUserEditActiveProfile() then
         return false
     end
 

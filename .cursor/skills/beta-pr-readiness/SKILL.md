@@ -27,9 +27,12 @@ Use this skill when a task is close to done and you need a repo-specific merge-r
    - `python -m pytest tests/test_settings_navigation.py` when Settings navigation/Registry/TOC metadata changed
    - `python -m pytest tests/test_mouse_tracer.py` when Mouse Tracer constants, engine, or runtime tests changed
    - `python -m pytest tests/test_loot_helper_window.py` when Loot Helper window minimize or positioning changed
+   - `python -m pytest tests/test_settings_window_layout.py` when Settings window content layout or the impersonation banner changed
+   - `python -m pytest tests/test_pr_template.py` when the PR template or `validate_pr_template.py` changed
 4. If the change touches addon packaging, release logic, or TOC-driven behavior, inspect `SpectrumFederation/SpectrumFederation.toc` before finishing.
-5. For workflow changes, verify checks were not weakened and `copilot-setup-steps` still uses the required job name.
-6. For docs changes, compare commands and workflow names against the actual files in `.github/workflows/` and `.github/scripts/`.
+5. When filling the PR template, follow `.cursor/rules/pr-template.mdc`: never check **I have tested these changes in-game**; always check **WoW Client Type → Retail**; never check linked issues unless the user provided the link. Do not check the in-game box to make Validate PR Description pass.
+6. For workflow changes, verify checks were not weakened and `copilot-setup-steps` still uses the required job name.
+7. For docs changes, compare commands and workflow names against the actual files in `.github/workflows/` and `.github/scripts/`.
 
 ## Output
 

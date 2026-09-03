@@ -26,11 +26,22 @@ Profile names may contain spaces. Profiles created by slash command receive a lo
 | Command | Result |
 | --- | --- |
 | `/sf loot` | Enable Loot Helper if needed and re-evaluate roster-window visibility. |
-| `/sf loot session start` | Start a sync session for the active profile. Requires a party or raid and profile-admin permission. |
-| `/sf loot session end` | End the active session. Only its coordinator can end it explicitly. |
+| `/sf loot session start` | Start a sync session for the active profile. Requires a party or raid and profile-admin permission. Denied while Preview as Non-Admin is active. |
+| `/sf loot session end` | End the active session. Only its coordinator can end it explicitly. Denied while Preview as Non-Admin is active. |
 | `/sf loot sync` | Ask the current coordinator to compare and catch up this client. Not available to the coordinator. |
 
 Any other text after `/sf loot` currently performs the same default action as `/sf loot`; it does not produce a subcommand error.
+
+## Preview as Non-Admin
+
+| Command | Result |
+| --- | --- |
+| `/sf impersonate` | Print whether Preview as Non-Admin is on and the usage line. Does not toggle. |
+| `/sf impersonate status` | Print the same status summary. Does not toggle. |
+| `/sf impersonate on` | Preview the active profile as a non-admin on this client. Requires a canonical admin of the active profile. |
+| `/sf impersonate off` | End the local preview. Always safe if it is already off. |
+
+Unsupported arguments such as `admin` or `as-admin` are rejected. This command never grants admin or owner authority. Other clients still see your real role. Switching, clearing, deleting, or resetting the active profile, losing admin on it, or `/reload` ends the preview.
 
 ## Raid Check
 

@@ -77,10 +77,10 @@ Rename and profile-specific configuration are admin-only. Only the profile owner
 
 This page includes:
 
-- start/end session control;
+- a note that syncing between addons only happens during a session, then start/end session control;
 - saved raid-wide safe-mode preferences for all-the-time or combat use;
 - Points Per Raid Check in Point Based mode;
-- Pre-Raid Check and Raid Check actions, including the session start prompt;
+- Pre-Raid Check and Raid Check actions;
 - admin system-message summaries of missing players and Inspection Failed, independent of whisper settings;
 - optional whispers for missing and prepared players;
 - editable whisper templates.
@@ -96,6 +96,8 @@ The visible **Trigger Raid-Wide Sync** control is currently a placeholder. It do
 See [Raid Check](features/raid-check.md) for interpretation and inspection limitations.
 
 ## Loot Helper: Admin
+
+**Preview as Non-Admin** is the first control on this page. It is a runtime preview for the canonical admin of the active profile, not a saved setting. Genuine non-admins do not see it. While the preview is on, the control stays available so you can turn it off, a red banner appears on every Settings page, and the other admin/owner rows stay visible but grey like they do for a genuine non-admin.
 
 Profile admins can add profile members as admins, remove admins other than the owner, and run **Transfer Points / Main Swap**.
 

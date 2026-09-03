@@ -2,7 +2,7 @@
 
 Raid Check inspects profile members who are currently in the group against **addon-owned current-Retail** enchant and gem rules, then optionally whispers results and awards loot points or Attendance.
 
-Only an admin of the selected loot profile can run a check. Equipment rules are not configured per profile.
+Only an admin of the selected loot profile can run a check. Equipment rules are not configured per profile. Preview as Non-Admin uses the same local non-admin restriction: a check cannot be started while the preview is on. If a run is already in flight when the preview is enabled, its awards, Reward Pot changes, logs, and admin whispers are aborted as a unit and are not replayed after the preview ends.
 
 ## Where to look
 

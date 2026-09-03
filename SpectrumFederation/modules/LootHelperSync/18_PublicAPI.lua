@@ -637,6 +637,12 @@ end
 -- @return string sessionId
 function Sync:StartSession(profileId, opts)
     opts = opts or {}
+    local Imp = SF.LootHelperImpersonation
+    if Imp and Imp.IsActive and Imp:IsActive() then
+        if SF.PrintError then SF:PrintError("Cannot start a session while previewing as a non-admin.") end
+        return nil
+    end
+
     local dist = self:_EnforceGroupedSessionActive("StartSession")
     if not dist then
         if SF.PrintError then SF:PrintError("Cannot start session: not in a group/raid.") end

@@ -345,7 +345,10 @@ function Controller:RefreshTitle()
     if SF.GetActiveProfile then
         local p = SF:GetActiveProfile()
         if p then
-           if p.IsCurrentUserAdmin then
+           local Imp = SF.LootHelperImpersonation
+           if Imp and Imp.IsEffectiveLocalAdmin then
+            canAdmin = Imp:IsEffectiveLocalAdmin(p) and true or false
+           elseif p.IsCurrentUserAdmin then
             canAdmin = p:IsCurrentUserAdmin() and true or false
            end
 
@@ -422,6 +425,14 @@ function Controller:OnPlayClicked()
 
     if IsSessionActive() then
         Confirm("Stop the active Loot Helper session?", "Stop Session", function()
+            local Imp = SF.LootHelperImpersonation
+            if Imp and Imp.IsEffectiveLocalAdmin and not Imp:IsEffectiveLocalAdmin() then
+                if SF.PrintError then
+                    SF:PrintError("Cannot end a session while previewing as a non-admin.")
+                end
+                self:RequestRefresh("PlayButtonEndSessionDenied")
+                return
+            end
             local ok = SF.LootHelperSync:EndSession("manual")
             if SF.PrintSuccess and SF.PrintError then
                 if ok then
@@ -443,7 +454,23 @@ function Controller:OnPlayClicked()
         return
     end
 
+    local Imp = SF.LootHelperImpersonation
+    if Imp and Imp.IsEffectiveLocalAdmin and not Imp:IsEffectiveLocalAdmin() then
+        if SF.PrintError then
+            SF:PrintError("Cannot start a session while previewing as a non-admin.")
+        end
+        return
+    end
+
     Confirm("Start a Loot Helper session for the active profile?", "Start Session", function()
+        local ImpNow = SF.LootHelperImpersonation
+        if ImpNow and ImpNow.IsEffectiveLocalAdmin and not ImpNow:IsEffectiveLocalAdmin() then
+            if SF.PrintError then
+                SF:PrintError("Cannot start a session while previewing as a non-admin.")
+            end
+            self:RequestRefresh("PlayButtonStartSessionDenied")
+            return
+        end
         local sessionId = SF.LootHelperSync:StartSession(profileId)
         if SF.PrintSuccess and SF.PrintError then
             if sessionId then
@@ -566,8 +593,16 @@ function Controller:OnAddRaidNonMember(model)
         return
     end
 
-    -- Check admin permissions
-    if profile.IsCurrentUserAdmin and not profile:IsCurrentUserAdmin() then
+    -- Check effective local admin permissions
+    local Imp = SF.LootHelperImpersonation
+    if Imp and Imp.IsEffectiveLocalAdmin then
+        if not Imp:IsEffectiveLocalAdmin(profile) then
+            if SF.Debug then
+                SF.Debug:Warn("LH_WINDOW", "OnAddRaidNonMember: User is not an effective local admin")
+            end
+            return
+        end
+    elseif profile.IsCurrentUserAdmin and not profile:IsCurrentUserAdmin() then
         if SF.Debug then
             SF.Debug:Warn("LH_WINDOW", "OnAddRaidNonMember: User is not admin")
         end
@@ -651,9 +686,12 @@ function Controller:OnEquipmentClicked(model)
         return
     end
 
-    -- Check admin permissions
+    -- Check effective local admin permissions
     local canAdmin = false
-    if profile.IsCurrentUserAdmin then
+    local Imp = SF.LootHelperImpersonation
+    if Imp and Imp.IsEffectiveLocalAdmin then
+        canAdmin = Imp:IsEffectiveLocalAdmin(profile) and true or false
+    elseif profile.IsCurrentUserAdmin then
         canAdmin = profile:IsCurrentUserAdmin() and true or false
     end
 

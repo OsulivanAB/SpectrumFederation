@@ -47,6 +47,19 @@ Non-admins can view the roster, totals, the Reward Pot amount, equipment history
 
 Creating, selecting, and deleting a local profile copy are available without profile-admin status. Those local actions are distinct from authorization to write shared profile history during synchronization.
 
+## Preview as Non-Admin
+
+Canonical admins of the active profile can preview that profile as a non-admin on this client only. Enable it from **Loot Helper → Admin → Preview as Non-Admin** or `/sf impersonate on`.
+
+The preview:
+
+- never grants admin or owner privileges;
+- does not change your real profile role, admin list, or sync identity;
+- is not saved; `/reload` ends it;
+- ends immediately if you switch, clear, delete, or reset the active profile, including **Reset All LootHelper Settings**. Switching back does not turn it back on.
+
+While it is active, a red banner appears on every Settings page, local admin/owner controls behave as they do for a genuine non-admin, and other clients still treat you as your real role. Use the same Settings toggle or `/sf impersonate off` to return to your real local permissions.
+
 ## Equipment-category history
 
 Select the equipment button on a member row to open the equipment window. It tracks these loot categories:

@@ -12,7 +12,7 @@ The settings implementation separates persistence, runtime effects, page registr
 | `modules/UI/Settings/Registry.lua` | Canonical page and category inventory, `RegisterCategory` for empty parent-owned categories, `categoryId` normalization, sub-addon discovery, and enablement refresh. Blizzard Settings registration is currently disabled. |
 | `modules/UI/Settings/NavigationModel.lua` | Pure navigation helpers (content pages, `ShowPage`, search ranking, sort, window minima, optional `contentHeading`). No frames and no C_AddOns. |
 | `modules/UI/Settings/SubAddons.lua` | C_AddOns adapter used only by Registry. |
-| `modules/UI/Settings/StandaloneWindow.lua` | The `/sf` window: category sidebar, optional page heading, tabs, session last-tab, search, resize. |
+| `modules/UI/Settings/StandaloneWindow.lua` | The `/sf` window: category sidebar, optional page heading, tabs, session last-tab, search, resize, and the runtime impersonation banner. |
 | `modules/UI/Settings/Widgets/TabBar.lua` | Content tab strip for categories with two or more pages. |
 | `modules/UI/Settings/Widgets/EmptyState.lua` | Generic empty category presentation. |
 | `modules/UI/Settings/PageBuilder.lua` | Scroll hosts, sections, sizing, refresh, and reflow. |
@@ -157,7 +157,7 @@ To keep a reserved category title when the first content page has a different na
 Navigation and Mouse Tracer production-Lua tests:
 
 ```bash
-python -m pytest tests/test_settings_navigation.py tests/test_mouse_tracer.py
+python -m pytest tests/test_settings_navigation.py tests/test_mouse_tracer.py tests/test_settings_window_layout.py
 ```
 
 ## Declarative controls
@@ -171,7 +171,9 @@ python -m pytest tests/test_settings_navigation.py tests/test_mouse_tracer.py
 
 Prefer a `path` for ordinary persisted values. Use custom `get`/`set` functions for profile methods, validation, computed state, or temporary panel state.
 
-Common dynamic fields include `visible`, `enabled`, and `adminOnly`. `adminOnly` disables presentation for non-admins, but domain methods must still enforce permission checks.
+`Preview as Non-Admin` on Loot Helper → Admin is a runtime custom get/set control with no schema path. It is not `adminOnly`: genuine non-admins never see it, and the canonical admin must still be able to turn it off while the preview is active. Other admin/owner rows keep the existing grey/disabled `(Admin Only)` / `(Owner Only)` presentation.
+
+Common dynamic fields include `visible`, `enabled`, and `adminOnly`. `adminOnly` disables presentation for non-admins, but domain methods must still enforce permission checks. For Loot Helper pages, `isAdmin` / `isOwner` are effective local queries so impersonation greys those rows without hiding them.
 
 Callbacks receive a context containing `panel`, `section`, `store`, `schema`, `ui`, and `pageBuilder`. Use it to show section messages and refresh/reflow after structural changes.
 

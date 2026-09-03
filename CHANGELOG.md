@@ -2,6 +2,31 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.6] - 2026-09-03
+
+### Changed
+- Session settings help now states that syncing between addons only happens during a session
+
+## [1.4.0-beta.5] - 2026-09-03
+
+### Changed
+- Loot Helper Session settings now explain what only happens during an active session, and drop the Raid Check prompt and Raid Equipment policy help copy
+
+## [1.4.0-beta.4] - 2026-09-03
+
+### Fixed
+- Reset Current Profile is admin-only, including while Preview as Non-Admin is active
+
+## [1.4.0-beta.3] - 2026-09-03
+
+### Fixed
+- Settings pages no longer render blank: the impersonation banner is not used as a layout parent while hidden
+
+## [1.4.0-beta.2] - 2026-09-03
+
+### Added
+- Preview as Non-Admin (impersonation) for Loot Helper admins: local, runtime-only downgrade that never grants privileges and never changes sync identity
+
 ## [1.4.0-beta.1] - 2026-08-31
 
 ### Changed

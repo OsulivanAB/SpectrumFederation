@@ -83,7 +83,11 @@ def main():
     if not checklist_section:
         errors.append("Missing '## Checklist' section")
     else:
-        optional_items = ["linked this pr to any related issues"]
+        # Linked-issue remains optional. In-game testing stays required so a
+        # human must check it before merge; agents must leave it unchecked.
+        optional_items = [
+            "linked this pr to any related issues",
+        ]
         total_checklist, checked_checklist = count_checkboxes(checklist_section, optional_items)
         print(f"✓ Found 'Checklist' section with {total_checklist} items")
         
