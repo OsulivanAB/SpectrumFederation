@@ -702,12 +702,17 @@ end
 
 function SettingsWindow:UpdateImpersonationBanner()
     local banner = self.impersonationBanner
-    if not banner then
+    local header = self.contentHeader
+    if not banner or not header or not self.contentPanel then
         return
     end
 
     local Imp = SF.LootHelperImpersonation
     local active = Imp and Imp.IsActive and Imp:IsActive() and true or false
+
+    -- Hidden WoW frames can report a nil rect. Never leave contentHeader
+    -- (and therefore contentHost / page panels) anchored to a hidden banner.
+    header:ClearAllPoints()
     if active then
         banner:SetHeight(C.IMPERSONATION_BANNER_HEIGHT)
         if self.impersonationBannerText then
@@ -715,9 +720,13 @@ function SettingsWindow:UpdateImpersonationBanner()
             self.impersonationBannerText:SetText(text)
         end
         banner:Show()
+        header:SetPoint("TOPLEFT", banner, "BOTTOMLEFT", 0, 0)
+        header:SetPoint("TOPRIGHT", banner, "BOTTOMRIGHT", 0, 0)
     else
         banner:SetHeight(0)
         banner:Hide()
+        header:SetPoint("TOPLEFT", self.contentPanel, "TOPLEFT", 0, 0)
+        header:SetPoint("TOPRIGHT", self.contentPanel, "TOPRIGHT", 0, 0)
     end
 end
 
@@ -838,8 +847,11 @@ function SettingsWindow:CreateWindow()
     impersonationBannerText:SetTextColor(unpack(C.IMPERSONATION_BANNER_TEXT))
 
     local contentHeader = CreateFrame("Frame", nil, contentPanel)
-    contentHeader:SetPoint("TOPLEFT", impersonationBanner, "BOTTOMLEFT", 0, 0)
-    contentHeader:SetPoint("TOPRIGHT", impersonationBanner, "BOTTOMRIGHT", 0, 0)
+    -- Inactive layout must not depend on the banner. Hidden WoW frames can
+    -- report a nil rect, which collapses anything anchored to them (header,
+    -- content host, and every settings page).
+    contentHeader:SetPoint("TOPLEFT", contentPanel, "TOPLEFT", 0, 0)
+    contentHeader:SetPoint("TOPRIGHT", contentPanel, "TOPRIGHT", 0, 0)
     contentHeader:SetHeight(C.CONTENT_HEADER_HEIGHT)
 
     local titleText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")

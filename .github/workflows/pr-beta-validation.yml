@@ -163,7 +163,7 @@ jobs:
         run: pip install pytest
 
       - name: Run tests
-        run: python -m pytest tests/test_settings_navigation.py tests/test_cursed_surge_tracker.py tests/test_mouse_tracer.py tests/test_interface_badge.py tests/test_loot_helper_window.py tests/test_raid_equipment.py tests/test_raid_check_item_links.py tests/test_impersonation.py tests/test_pr_template.py
+        run: python -m pytest tests/test_settings_navigation.py tests/test_cursed_surge_tracker.py tests/test_mouse_tracer.py tests/test_interface_badge.py tests/test_loot_helper_window.py tests/test_raid_equipment.py tests/test_raid_check_item_links.py tests/test_impersonation.py tests/test_pr_template.py tests/test_settings_window_layout.py
 
   validate-docs:
     name: Validate Documentation

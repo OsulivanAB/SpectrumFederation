@@ -157,7 +157,7 @@ To keep a reserved category title when the first content page has a different na
 Navigation and Mouse Tracer production-Lua tests:
 
 ```bash
-python -m pytest tests/test_settings_navigation.py tests/test_mouse_tracer.py
+python -m pytest tests/test_settings_navigation.py tests/test_mouse_tracer.py tests/test_settings_window_layout.py
 ```
 
 ## Declarative controls

@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.3] - 2026-09-03
+
+### Fixed
+- Settings pages no longer render blank: the impersonation banner is not used as a layout parent while hidden
+
 ## [1.4.0-beta.2] - 2026-09-03
 
 ### Added
