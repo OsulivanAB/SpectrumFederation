@@ -897,7 +897,7 @@ function Capture.RegisterSettingsPage()
                 {
                     id = "about",
                     title = "Temporary Diagnostic Capture",
-                    intro = "This page is temporary diagnostic tooling. It records RC Loot Council addon communications while a Spectrum Loot Helper session is active. It does not interpret those messages into Spectrum loot actions.",
+                    intro = "This page is temporary diagnostic tooling. It records RC Loot Council addon communications while a Spectrum Loot Helper session is active. It does not interpret those messages into Spectrum loot actions. An empty Optional sidebar row may also appear for this child addon; this Loot Helper tab is the live log.",
                     items = {
                         { type = "help", text = Capture.GetStatusLines().receiveOnly, indent = "label" },
                         { type = "help", text = Capture.GetStatusLines().reloadReminder, indent = "label" },

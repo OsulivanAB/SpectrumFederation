@@ -25,7 +25,7 @@ The in-memory table is the authoritative log. `/reload` or logout serializes it 
 
 ## Settings
 
-Open `/sf` → **Loot Helper → RC Loot Council**. The page shows live status and the most recent 250 persisted entries. There is no clear/reset control.
+Open `/sf` → **Loot Helper → RC Loot Council**. The page shows live status and the most recent 250 persisted entries. There is no clear/reset control. Because this is a packaged child addon, Settings may also show an empty **Optional** row for it; the live log lives on the Loot Helper tab.
 
 ## Removal
 

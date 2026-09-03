@@ -105,7 +105,7 @@ The owner cannot be removed from the admin list through this page.
 
 ## Loot Helper: RC Loot Council
 
-This tab is temporary diagnostic tooling from the `SpectrumFederation_RCLootCouncilCapture` child addon. It records RC Loot Council addon communications while a Spectrum Loot Helper session is active. It does not award loot, write Loot Logs, or send RC messages. See [RC Loot Council Capture](development/rc-loot-council-capture.md).
+This tab is temporary diagnostic tooling from the `SpectrumFederation_RCLootCouncilCapture` child addon. It records RC Loot Council addon communications while a Spectrum Loot Helper session is active. It does not award loot, write Loot Logs, or send RC messages. Because it is a child addon, an empty **Optional** sidebar row may also appear; use **Loot Helper → RC Loot Council**. See [RC Loot Council Capture](development/rc-loot-council-capture.md).
 
 ## Loot Logs
 
