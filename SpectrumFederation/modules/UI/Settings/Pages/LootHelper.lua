@@ -841,16 +841,30 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{
 					type = "button",
 					label = "Reset Current Profile",
+					adminOnly = true,
 					buttonText = "Reset",
 					width = 120,
 					tooltip = "Reset the active profile back to its default settings without deleting the profile itself.",
 					enabled = function() return ProfileActionsEnabled() end,
 					onClick = function(ctx)
 						ctx.section:ClearMessage()
+						if not IsAdmin() then
+							ctx.section:SetMessage("Only an admin can reset the current profile.", "error")
+							return
+						end
 						dialogs:Confirm(
 							"Reset settings for the current profile?",
 							"Reset",
 							function()
+								if not IsAdmin() then
+									local Imp = SF.LootHelperImpersonation
+									if Imp and Imp.IsActive and Imp:IsActive() then
+										ctx.section:SetMessage("Cannot reset the current profile while previewing as a non-admin.", "error")
+									else
+										ctx.section:SetMessage("Only an admin can reset the current profile.", "error")
+									end
+									return
+								end
 								if type(ctx.store.ResetCurrentLootHelperProfile) ~= "function" then
 									ctx.section:SetMessage("ResetCurrentLootHelperProfile() not implemented", "error")
 									return

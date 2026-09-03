@@ -694,6 +694,97 @@ capturedAccept()
 assertTrue(Sync._playStartCalled, "play-button Start works again after impersonation ends")
 
 -- ---------------------------------------------------------------------------
+-- Reset Current Profile: grey for non-admin / impersonation, stale confirm denied
+-- ---------------------------------------------------------------------------
+local registeredPages = {}
+local capturedDef
+function SF.SettingsUI:RegisterPage(page)
+    registeredPages[page.id] = page
+end
+SF.SettingsUI.DefinitionRenderer = SF.SettingsUI.DefinitionRenderer or {}
+function SF.SettingsUI.DefinitionRenderer:Build(_panel, pageDef)
+    capturedDef = pageDef
+end
+function SF.SettingsUI.DefinitionRenderer:Refresh()
+end
+local resetConfirm
+function SF.SettingsUI.Dialogs:Confirm(_message, _acceptText, onAccept)
+    resetConfirm = onAccept
+end
+function SF.SettingsStore:GetActiveLootHelperProfileObject()
+    return SF.lootHelperDB and SF.lootHelperDB.activeProfile
+end
+
+local lootHelperPages = assert(loadfile("SpectrumFederation/modules/UI/Settings/Pages/LootHelper.lua"))
+lootHelperPages("SpectrumFederation", SF)
+assertTrue(registeredPages.lootHelperProfile ~= nil, "Loot Helper Profile page registered")
+registeredPages.lootHelperProfile:Build({})
+assertTrue(capturedDef ~= nil, "profile page definition captured")
+
+local resetItem
+for _, sec in ipairs(capturedDef.sections or {}) do
+    for _, item in ipairs(sec.items or {}) do
+        if item.label == "Reset Current Profile" then
+            resetItem = item
+            break
+        end
+    end
+end
+assertTrue(resetItem ~= nil, "Reset Current Profile item exists")
+assertTrue(resetItem.adminOnly == true, "Reset Current Profile is adminOnly")
+
+local resetCalled = false
+local resetMessages = {}
+local resetCtx = {
+    section = {
+        ClearMessage = function() end,
+        SetMessage = function(_, text, _kind)
+            table.insert(resetMessages, tostring(text))
+        end,
+    },
+    store = {
+        ResetCurrentLootHelperProfile = function()
+            resetCalled = true
+            return true
+        end,
+    },
+    pageBuilder = {
+        Refresh = function() end,
+    },
+}
+
+Imp:Disable("reset-profile-setup")
+resetConfirm = nil
+resetItem.onClick(resetCtx)
+assertTrue(type(resetConfirm) == "function", "admin can open Reset Current Profile confirm")
+
+assertTrue(Imp:Enable(), "enable after opening Reset confirm")
+resetCalled = false
+resetConfirm()
+assertFalse(resetCalled, "stale Reset confirm cannot reset while impersonating")
+local resetDenied = false
+for i = 1, #resetMessages do
+    if resetMessages[i]:find("previewing as a non%-admin") then
+        resetDenied = true
+    end
+end
+assertTrue(resetDenied, "stale Reset confirm reports impersonation deny")
+
+resetConfirm = nil
+resetCalled = false
+resetItem.onClick(resetCtx)
+assertTrue(resetConfirm == nil, "impersonating admin cannot open Reset Current Profile confirm")
+assertFalse(resetCalled, "Reset Current Profile onClick does not reset while impersonating")
+
+Imp:Disable("reset-profile-cleanup")
+resetConfirm = nil
+resetCalled = false
+resetItem.onClick(resetCtx)
+assertTrue(type(resetConfirm) == "function", "Reset confirm opens again after impersonation ends")
+resetConfirm()
+assertTrue(resetCalled, "admin Reset Current Profile confirm can call store reset")
+
+-- ---------------------------------------------------------------------------
 -- Settings page contract (source-level, production definition)
 -- ---------------------------------------------------------------------------
 local pageFile = io.open("SpectrumFederation/modules/UI/Settings/Pages/LootHelper.lua", "r")
@@ -711,6 +802,13 @@ local previewChunk = pageText:sub(previewPos, adminsListPos - 1)
 assertTrue(not previewChunk:find("adminOnly"), "Preview as Non-Admin is not adminOnly")
 assertTrue(previewChunk:find("CanShowImpersonationToggle") ~= nil, "toggle visibility uses CanShowImpersonationToggle")
 assertTrue(not previewChunk:find("path%s*="), "toggle has no schema path")
+
+local resetPos = pageText:find('label = "Reset Current Profile"', 1, true)
+assertTrue(resetPos ~= nil, "Reset Current Profile control exists")
+local resetChunk = pageText:sub(math.max(1, resetPos - 120), math.min(#pageText, resetPos + 900))
+assertTrue(resetChunk:find("adminOnly%s*=%s*true") ~= nil, "Reset Current Profile is adminOnly")
+assertTrue(resetChunk:find("if not IsAdmin()") ~= nil, "Reset Current Profile re-checks IsAdmin before confirm")
+assertTrue(resetChunk:find("previewing as a non%-admin") ~= nil, "stale Reset confirm denies impersonation")
 
 local toc = io.open("SpectrumFederation/SpectrumFederation.toc", "r"):read("*a")
 assertTrue(toc:find("modules/LootHelper/Impersonation.lua", 1, true) ~= nil, "Impersonation.lua is in parent TOC")

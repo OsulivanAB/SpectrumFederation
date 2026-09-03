@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.4] - 2026-09-03
+
+### Fixed
+- Reset Current Profile is admin-only, including while Preview as Non-Admin is active
+
 ## [1.4.0-beta.3] - 2026-09-03
 
 ### Fixed
