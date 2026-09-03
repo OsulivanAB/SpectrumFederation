@@ -6,9 +6,9 @@ alwaysApply: true
 # PR Template
 
 - Always use `.github/pull_request_template.md`. Keep its section headings, order, checklist items, and prompts.
-- Never check **I have tested these changes in-game**. That box is reserved for a human after Retail QA. Leave it unchecked even if automated tests passed, even if CI requires other checklist items, and even if a previous PR checked it.
-- Do not check **WoW Client Type** boxes as a substitute for in-game testing.
-- In **Testing**, report automated and static validation actually run. State clearly that manual in-game QA was not performed when it was not.
+- Never check **I have tested these changes in-game**. That box is reserved for a human after Retail QA. Leave it unchecked even if automated tests passed, even if Validate PR Description fails, and even if a previous PR checked it. Do not check it to make CI pass.
+- Always check **WoW Client Type → Retail**. This addon targets Retail. Checking Retail is the product target, not a claim that in-game QA was done. Leave Classic, PTR, and Beta unchecked unless the change is specifically for those clients.
+- In **Testing**, report automated and static validation actually run. State clearly that manual in-game QA was not performed when it was not. You may optionally add suggested in-game test steps as unchecked checkboxes for the human; never mark those complete.
 - Do not claim in-game verification, and do not fabricate screenshots or videos as Retail proof.
-- Treat **I've linked this PR to any related issues** as optional. Check other applicable checklist items.
-- `.github/scripts/validate_pr_template.py` skips the in-game testing and linked-issue items so agents can leave those unchecked without failing CI.
+- Never check **I've linked this PR to any related issues** unless the user explicitly provided the issue or project-link information to use. Leave that box for the human.
+- `.github/scripts/validate_pr_template.py` still requires the in-game checklist item so a human must check it before merge. Agents must not check it and must not treat that CI failure as something to fix. Linked-issue remains optional in CI.

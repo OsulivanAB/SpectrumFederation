@@ -40,7 +40,7 @@ def _run_validator(body: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_in_game_testing_unchecked_does_not_fail_validation():
+def test_in_game_testing_unchecked_fails_validation():
     result = _run_validator(
         _body(
             "- [ ] I have tested these changes in-game",
@@ -48,25 +48,38 @@ def test_in_game_testing_unchecked_does_not_fail_validation():
             "- [ ] I've linked this PR to any related issues in the repo project",
         )
     )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "PR description validation PASSED" in result.stdout
+    assert result.returncode == 1
+    assert "Not all checklist items are checked" in result.stdout
 
 
-def test_in_game_line_with_agent_html_comment_still_optional():
+def test_in_game_line_with_agent_html_comment_unchecked_still_fails():
     result = _run_validator(
         _body(
             "- [ ] I have tested these changes in-game <!-- Agents: leave unchecked. Humans mark this after Retail QA. -->",
             *REQUIRED,
         )
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 1
+    assert "Not all checklist items are checked" in result.stdout
 
 
-def test_in_game_testing_checked_still_passes():
+def test_in_game_testing_checked_passes():
     result = _run_validator(
         _body(
             "- [x] I have tested these changes in-game",
             *REQUIRED,
+        )
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PR description validation PASSED" in result.stdout
+
+
+def test_linked_issues_unchecked_is_still_optional():
+    result = _run_validator(
+        _body(
+            "- [x] I have tested these changes in-game",
+            *REQUIRED,
+            "- [ ] I've linked this PR to any related issues in the repo project",
         )
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -75,6 +88,6 @@ def test_in_game_testing_checked_still_passes():
 def test_required_unchecked_item_is_still_a_failure():
     items = list(REQUIRED)
     items[0] = "- [ ] My code follows the project's style guidelines"
-    result = _run_validator(_body("- [ ] I have tested these changes in-game", *items))
+    result = _run_validator(_body("- [x] I have tested these changes in-game", *items))
     assert result.returncode == 1
     assert "Not all checklist items are checked" in result.stdout

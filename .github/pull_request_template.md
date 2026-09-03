@@ -30,7 +30,7 @@
 - [ ] I have added/updated localization strings in `locale/enUS.lua` if applicable
 - [ ] My changes generate no new warnings or errors
 - [ ] Any dependent changes have been merged and published
-- [ ] I've linked this PR to any related issues in the [repo project](https://github.com/users/OsulivanAB/projects/1).
+- [ ] I've linked this PR to any related issues in the [repo project](https://github.com/users/OsulivanAB/projects/1). <!-- Agents: leave unchecked unless the user provided issue links. -->
 
 ## Testing
 
