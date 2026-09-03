@@ -337,6 +337,10 @@ function SF:RegisterLootHelperSlashCommands()
         
         -- Handle "session start" subcommand
         if args == "session start" then
+            if SF.LootHelperImpersonation and SF.LootHelperImpersonation.IsActive and SF.LootHelperImpersonation:IsActive() then
+                SF:PrintError("Cannot start a session while previewing as a non-admin.")
+                return
+            end
             -- Check if sync system is available
             if not (SF.LootHelperSync and SF.LootHelperSync.StartSession) then
                 SF:PrintError("Loot Helper Sync system not available")
@@ -362,6 +366,10 @@ function SF:RegisterLootHelperSlashCommands()
         
         -- Handle "session end" subcommand
         if args == "session end" then
+            if SF.LootHelperImpersonation and SF.LootHelperImpersonation.IsActive and SF.LootHelperImpersonation:IsActive() then
+                SF:PrintError("Cannot end a session while previewing as a non-admin.")
+                return
+            end
             -- Check if sync system is available
             if not (SF.LootHelperSync and SF.LootHelperSync.EndSession) then
                 SF:PrintError("Loot Helper Sync system not available")

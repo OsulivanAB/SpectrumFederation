@@ -182,12 +182,19 @@ function LootLog.new(eventType, eventData, opts)
     -- Permission enforcement
     if not opts.skipPermission then
         local ap = SF.lootHelperDB and SF.lootHelperDB.activeProfile
-        if not ap or not ap.IsCurrentUserAdmin then
+        local Imp = SF.LootHelperImpersonation
+        local isAdmin
+        if Imp and Imp.IsEffectiveLocalAdmin then
+            isAdmin = Imp:IsEffectiveLocalAdmin(ap)
+        else
+            isAdmin = ap and ap.IsCurrentUserAdmin and ap:IsCurrentUserAdmin()
+        end
+        if not ap or (not Imp and not ap.IsCurrentUserAdmin) then
             if SF.Debug then
                 SF.Debug:Warn("LOOTLOG", "Active profile missing or IsCurrentUserAdmin not found; cannot create log entry")
             end
             return nil
-        elseif not ap:IsCurrentUserAdmin() then
+        elseif not isAdmin then
             if SF.Debug then
                 SF.Debug:Warn("LOOTLOG", "Current user is not an admin; cannot create log entry")
             end
@@ -195,7 +202,13 @@ function LootLog.new(eventType, eventData, opts)
         end
 
         if eventType == EVENT_TYPES.LOOT_MODE_CHANGE then
-            if type(ap.IsCurrentUserOwner) ~= "function" or not ap:IsCurrentUserOwner() then
+            local isOwner
+            if Imp and Imp.IsEffectiveLocalOwner then
+                isOwner = Imp:IsEffectiveLocalOwner(ap)
+            else
+                isOwner = type(ap.IsCurrentUserOwner) == "function" and ap:IsCurrentUserOwner()
+            end
+            if not isOwner then
                 if SF.Debug then
                     SF.Debug:Warn("LOOTLOG", "Current user is not the owner; cannot change loot mode")
                 end

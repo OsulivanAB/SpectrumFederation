@@ -603,6 +603,22 @@ function SF:RenameActiveLootHelperProfile(newName)
 		return false, "No active profile."
 	end
 
+	local Imp = SF.LootHelperImpersonation
+	local canRename
+	if Imp and Imp.IsEffectiveLocalAdmin then
+		canRename = Imp:IsEffectiveLocalAdmin(p)
+	elseif p.IsCurrentUserAdmin then
+		canRename = p:IsCurrentUserAdmin()
+	else
+		canRename = false
+	end
+	if not canRename then
+		if SF.Debug then
+			SF.Debug:Warn("DATABASE", "Cannot rename - effective local admin required")
+		end
+		return false, "You must be an admin to rename this profile."
+	end
+
 	local oldName = p:GetProfileName()
 	newName = tostring(newName or ""):match("^%s*(.-)%s*$")
 	if newName == "" then return false, "Profile name cannot be empty." end

@@ -38,6 +38,7 @@ local C = {
     DIVIDER_WIDTH = 1,
     CONTENT_HEADER_HEIGHT = 70,
     CONTENT_HEADING_HEIGHT = 22,
+    IMPERSONATION_BANNER_HEIGHT = 36,
 
     -- Colors (RGBA, 0-1 range)
     BG = {0, 0, 0, 0.70},
@@ -49,6 +50,9 @@ local C = {
     NAV_DISABLED_TEXT = {0.50, 0.50, 0.50, 0.90},
     NAV_NORMAL_TEXT = {0.84, 0.84, 0.84, 1},
     NAV_SELECTED_TEXT = {1, 1, 1, 1},
+
+    IMPERSONATION_BANNER_BG = {0.55, 0.07, 0.07, 0.94},
+    IMPERSONATION_BANNER_TEXT = {1, 0.82, 0.82, 1},
 
     DISABLED_TOOLTIP_TITLE = "Add-on disabled",
     DISABLED_TOOLTIP_TEXT = "This add-on is disabled for this character. Enable it in World of Warcraft's AddOns list. Spectrum Federation cannot enable or disable it from this window.",
@@ -639,6 +643,8 @@ function SettingsWindow:UpdateContentChrome()
         self.contentHeader:SetHeight(headerHeight)
     end
 
+    self:UpdateImpersonationBanner()
+
     local showEmpty = category
         and model
         and model.IsCategorySelectable(category)
@@ -692,6 +698,49 @@ function SettingsWindow:ApplySelection(selection, opts)
 
     self:UpdateContentChrome()
     self:UpdateNavButtonStates()
+end
+
+function SettingsWindow:UpdateImpersonationBanner()
+    local banner = self.impersonationBanner
+    if not banner then
+        return
+    end
+
+    local Imp = SF.LootHelperImpersonation
+    local active = Imp and Imp.IsActive and Imp:IsActive() and true or false
+    if active then
+        banner:SetHeight(C.IMPERSONATION_BANNER_HEIGHT)
+        if self.impersonationBannerText then
+            local text = Imp.GetBannerText and Imp:GetBannerText() or ""
+            self.impersonationBannerText:SetText(text)
+        end
+        banner:Show()
+    else
+        banner:SetHeight(0)
+        banner:Hide()
+    end
+end
+
+function SettingsWindow:RefreshCurrentPage()
+    if not self.currentPageId then
+        return
+    end
+    local panel = self.pagePanels and self.pagePanels[self.currentPageId]
+    local page = GetPage(self.currentPageId)
+    if page and panel and type(page.Refresh) == "function" then
+        page:Refresh(panel)
+    end
+    self:UpdateContentChrome()
+end
+
+function SettingsWindow:OnImpersonationChanged()
+    if not self.frame then
+        return
+    end
+    self:UpdateImpersonationBanner()
+    if self.frame.IsShown and self.frame:IsShown() then
+        self:RefreshCurrentPage()
+    end
 end
 
 function SettingsWindow:SelectCategory(categoryId)
@@ -771,9 +820,26 @@ function SettingsWindow:CreateWindow()
     contentPanel:SetPoint("TOP", closeBtn, "BOTTOM", 0, 0)
     contentPanel:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -C.PADDING, C.PADDING)
 
+    local impersonationBanner = CreateFrame("Frame", nil, contentPanel)
+    impersonationBanner:SetPoint("TOPLEFT", contentPanel, "TOPLEFT", 0, 0)
+    impersonationBanner:SetPoint("TOPRIGHT", contentPanel, "TOPRIGHT", 0, 0)
+    impersonationBanner:SetHeight(0)
+    impersonationBanner:Hide()
+
+    local impersonationBannerBg = impersonationBanner:CreateTexture(nil, "BACKGROUND")
+    impersonationBannerBg:SetAllPoints(impersonationBanner)
+    impersonationBannerBg:SetColorTexture(unpack(C.IMPERSONATION_BANNER_BG))
+
+    local impersonationBannerText = impersonationBanner:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    impersonationBannerText:SetPoint("LEFT", impersonationBanner, "LEFT", 8, 0)
+    impersonationBannerText:SetPoint("RIGHT", impersonationBanner, "RIGHT", -8, 0)
+    impersonationBannerText:SetJustifyH("LEFT")
+    impersonationBannerText:SetWordWrap(true)
+    impersonationBannerText:SetTextColor(unpack(C.IMPERSONATION_BANNER_TEXT))
+
     local contentHeader = CreateFrame("Frame", nil, contentPanel)
-    contentHeader:SetPoint("TOPLEFT", contentPanel, "TOPLEFT", 0, 0)
-    contentHeader:SetPoint("TOPRIGHT", contentPanel, "TOPRIGHT", 0, 0)
+    contentHeader:SetPoint("TOPLEFT", impersonationBanner, "BOTTOMLEFT", 0, 0)
+    contentHeader:SetPoint("TOPRIGHT", impersonationBanner, "BOTTOMRIGHT", 0, 0)
     contentHeader:SetHeight(C.CONTENT_HEADER_HEIGHT)
 
     local titleText = contentHeader:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
@@ -854,6 +920,8 @@ function SettingsWindow:CreateWindow()
     self.navPanel = navPanel
     self.contentPanel = contentPanel
     self.contentHeader = contentHeader
+    self.impersonationBanner = impersonationBanner
+    self.impersonationBannerText = impersonationBannerText
     self.contentHost = contentHost
     self.contentTitleText = titleText
     self.contentHeadingText = headingText
@@ -953,6 +1021,10 @@ function SettingsWindow:Show()
     end
 
     self:RefreshEnablementIfNeeded()
+    self:UpdateImpersonationBanner()
+    if self.currentCategoryId then
+        self:RefreshCurrentPage()
+    end
     self.frame:Show()
 
     if not self.currentCategoryId then

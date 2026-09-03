@@ -77,6 +77,24 @@ local function NormalizeDeductionType(value)
 	return DEDUCTION_TYPE_FLAT
 end
 
+-- Local user-facing mutators use effective admin/owner. Canonical
+-- IsCurrentUserAdmin / IsCurrentUserOwner remain membership queries.
+local function CurrentUserHasEffectiveLocalAdmin(profile)
+    local Imp = SF.LootHelperImpersonation
+    if Imp and Imp.IsEffectiveLocalAdmin then
+        return Imp:IsEffectiveLocalAdmin(profile)
+    end
+    return profile:IsCurrentUserAdmin()
+end
+
+local function CurrentUserHasEffectiveLocalOwner(profile)
+    local Imp = SF.LootHelperImpersonation
+    if Imp and Imp.IsEffectiveLocalOwner then
+        return Imp:IsEffectiveLocalOwner(profile)
+    end
+    return profile:IsCurrentUserOwner()
+end
+
 local function NormalizeNonNegativeNumber(value, defaultValue)
 	local amount = tonumber(value)
 	if amount == nil then
@@ -854,7 +872,7 @@ end
 -- @return string|nil errorMessage
 function LootProfile:SetLootMode(mode)
     self:_EnsureRewardPotConfig()
-    if not self:IsCurrentUserOwner() then
+    if not CurrentUserHasEffectiveLocalOwner(self) then
         return false, "Only the profile owner can change loot mode."
     end
 
@@ -886,7 +904,7 @@ end
 -- @return string|nil errorMessage
 function LootProfile:SetRewardPotConfig(cfg)
     self:_EnsureRewardPotConfig()
-    if not self:IsCurrentUserAdmin() then
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
         return false, "You must be an admin to change Reward Pot settings."
     end
 
@@ -943,7 +961,7 @@ end
 -- @return string|nil errorMessage
 function LootProfile:AdjustRewardPot(change, amountCopper, reason, extra)
     self:_EnsureRewardPotConfig()
-    if not self:IsCurrentUserAdmin() then
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
         return false, "You must be an admin to adjust the Reward Pot."
     end
 
@@ -1114,7 +1132,7 @@ function LootProfile:SetRaidCheckSlotEnabled(slotKey, enabled)
 		return false, "Unknown slot key."
 	end
 
-	if not self:IsCurrentUserAdmin() then
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change Raid Check settings."
 	end
 
@@ -1129,7 +1147,7 @@ end
 -- @return string|nil errorMessage
 function LootProfile:SetRaidCheckWhispers(mode, enabled)
 	self:_EnsureRaidCheckConfig()
-	if not self:IsCurrentUserAdmin() then
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change Raid Check settings."
 	end
 
@@ -1150,7 +1168,7 @@ end
 -- @return string|nil errorMessage
 function LootProfile:SetRaidCheckWhisperPrepared(enabled)
 	self:_EnsureRaidCheckConfig()
-	if not self:IsCurrentUserAdmin() then
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change Raid Check settings."
 	end
 
@@ -1166,7 +1184,7 @@ local RAID_CHECK_WHISPER_TEMPLATE_KEYS = {
 
 function LootProfile:SetRaidCheckWhisperTemplate(key, template)
 	self:_EnsureRaidCheckConfig()
-	if not self:IsCurrentUserAdmin() then
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change Raid Check settings."
 	end
 
@@ -1186,7 +1204,7 @@ end
 
 function LootProfile:ResetRaidCheckWhisperTemplate(key)
 	self:_EnsureRaidCheckConfig()
-	if not self:IsCurrentUserAdmin() then
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change Raid Check settings."
 	end
 
@@ -1205,7 +1223,7 @@ end
 -- @return string|nil errorMessage
 function LootProfile:SetRaidCheckPointsAwardPerCheck(amount)
 	self:_EnsureRaidCheckConfig()
-	if not self:IsCurrentUserAdmin() then
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change Raid Check settings."
 	end
 
@@ -1219,7 +1237,7 @@ end
 -- @return string|nil errorMessage
 function LootProfile:SetRaidCheckGemSocketsEnabled(enabled)
     self:_EnsureRaidCheckConfig()
-    if not self:IsCurrentUserAdmin() then
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
         return false, "You must be an admin to change Raid Check settings."
     end
 
@@ -1233,7 +1251,7 @@ end
 -- @return string|nil errorMessage
 function LootProfile:SetRaidCheckMetaGemRequired(enabled)
     self:_EnsureRaidCheckConfig()
-    if not self:IsCurrentUserAdmin() then
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
         return false, "You must be an admin to change Raid Check settings."
     end
 
@@ -1397,7 +1415,7 @@ function LootProfile:_InsertLog(lootLog, opts)
         return false
     end
 
-    if opts.requireAdmin and not self:IsCurrentUserAdmin() then
+    if opts.requireAdmin and not CurrentUserHasEffectiveLocalAdmin(self) then
         if SF.Debug then
             SF.Debug("LootProfile", "_InsertLog: Current user is not an admin; cannot add loot log entries")
         end
@@ -1512,7 +1530,7 @@ end
 -- @return boolean success
 -- @return string|nil errorMessage
 function LootProfile:SetPointName(name)
-	if not self:IsCurrentUserAdmin() then
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change Point Name."
 	end
 	name = tostring(name or ""):match("^%s*(.-)%s*$")
@@ -1544,7 +1562,7 @@ end
 -- @return boolean success
 -- @return string|nil errorMessage
 function LootProfile:SetRaidWideSafeMode(v)
-	if not self:IsCurrentUserAdmin() then
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change Raid-Wide Safemode."
 	end
 	
@@ -1571,7 +1589,7 @@ end
 -- @return boolean success
 -- @return string|nil errorMessage
 function LootProfile:SetRaidWideSafeModeOnCombat(v)
-	if not self:IsCurrentUserAdmin() then
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change Raid-Wide Safemode on Combat."
 	end
 	
@@ -1632,7 +1650,7 @@ function LootProfile:AddAdminMemberId(memberId)
         SF.Debug:Info("LootProfile", "Normalized memberId: %s", tostring(memberId))
     end
 
-    if not self:IsCurrentUserAdmin() then
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Current user is not an admin; cannot add admin member IDs")
         end
@@ -1689,7 +1707,7 @@ function LootProfile:RemoveAdminMemberId(memberId)
     end
     memberId = NormalizeMemberId(memberId)
 
-    if not self:IsCurrentUserAdmin() then
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Current user is not an admin; cannot remove admin member IDs")
         end
@@ -1747,7 +1765,7 @@ function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
     if type(targetMemberId) ~= "string" or targetMemberId == "" then
         return false, "Select a target character."
     end
-    if not self:IsCurrentUserAdmin() then
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
         return false, "You must be an admin to transfer points."
     end
 

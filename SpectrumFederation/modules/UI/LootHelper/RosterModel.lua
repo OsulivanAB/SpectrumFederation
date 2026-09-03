@@ -217,9 +217,12 @@ function Model:Build(profile)
     -- settings
     local showMembersNotInRaid = GetSetting("lootHelper.showMembersNotInRaid", false) and true or false
 
-    -- permissions
+    -- permissions (effective local admin while impersonating)
     local canAdmin = false
-    if profile.IsCurrentUserAdmin then
+    local Imp = SF.LootHelperImpersonation
+    if Imp and Imp.IsEffectiveLocalAdmin then
+        canAdmin = Imp:IsEffectiveLocalAdmin(profile) and true or false
+    elseif profile.IsCurrentUserAdmin then
         canAdmin = profile:IsCurrentUserAdmin() and true or false
     end
     local rewardPot = profile.IsRewardPotMode and profile:IsRewardPotMode() and true or false

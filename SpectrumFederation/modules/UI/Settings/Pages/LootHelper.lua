@@ -115,6 +115,13 @@ end
 
 local function IsAdmin()
 	local profile = GetActiveProfileObject(SF.SettingsStore)
+	local Imp = SF.LootHelperImpersonation
+	if Imp and Imp.IsEffectiveLocalAdmin then
+		local ok, res = pcall(Imp.IsEffectiveLocalAdmin, Imp, profile)
+		if ok then
+			return res and true or false
+		end
+	end
 	if profile and profile.IsCurrentUserAdmin then
 		local ok, res = pcall(profile.IsCurrentUserAdmin, profile)
 		if ok then
@@ -126,11 +133,26 @@ end
 
 local function IsOwner()
 	local profile = GetActiveProfileObject(SF.SettingsStore)
+	local Imp = SF.LootHelperImpersonation
+	if Imp and Imp.IsEffectiveLocalOwner then
+		local ok, res = pcall(Imp.IsEffectiveLocalOwner, Imp, profile)
+		if ok then
+			return res and true or false
+		end
+	end
 	if profile and profile.IsCurrentUserOwner then
 		local ok, res = pcall(profile.IsCurrentUserOwner, profile)
 		if ok then
 			return res and true or false
 		end
+	end
+	return false
+end
+
+local function CanShowImpersonationToggle()
+	local Imp = SF.LootHelperImpersonation
+	if Imp and Imp.CanShowToggle then
+		return Imp:CanShowToggle() and true or false
 	end
 	return false
 end
@@ -858,7 +880,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			items = {
 				{ type = "button", label = "Session Control", adminOnly = true, buttonText = function() if IsSessionActive() then return "End Session" end return "Start Session" end, width = 120, tooltip = "Start a Loot Helper session for the active profile, or end the current one if a session is already running.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then ctx.section:SetMessage("Loot Helper Sync system not available", "error") return end if IsSessionActive() then local ok = SF.LootHelperSync:EndSession("manual") if ok then ctx.section:SetMessage("Session ended successfully", "success") else ctx.section:SetMessage("Failed to end session", "error") end else local profileId = GetActiveProfileId(ctx.store) if not profileId then ctx.section:SetMessage("No active profile selected", "error") return end local sessionId = SF.LootHelperSync:StartSession(profileId) if sessionId then ctx.section:SetMessage("Session started successfully", "success") else ctx.section:SetMessage("Failed to start session (not in a group/raid?)", "error") end end ctx.pageBuilder:Refresh() end },
 				{ type = "text", text = "Enable Raid Wide Safe Mode" },
-				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Only in-combat", tooltip = "Automatically enable raid-wide safemode during combat. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false) end return false end, set = function(value) if store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false) end end }, { label = "All the Time", tooltip = "Keep raid-wide safemode enabled for the full session. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeMode", false) end return false end, set = function(value) if store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeMode", value and true or false) end end } } },
+				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Only in-combat", tooltip = "Automatically enable raid-wide safemode during combat. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false) end return false end, set = function(value) if IsAdmin() and store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false) end end }, { label = "All the Time", tooltip = "Keep raid-wide safemode enabled for the full session. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeMode", false) end return false end, set = function(value) if IsAdmin() and store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeMode", value and true or false) end end } } },
 				{ type = "button", label = "Trigger Raid-Wide Sync", adminOnly = true, buttonText = "Sync", width = 120, tooltip = "Planned admin action: ask everyone in the active session to resend their Loot Helper data. This button is not implemented yet.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:SetMessage("Stub: Trigger Raid-Wide Sync (implement later).", "warn") end },
 				{ type = "spacer", height = 12 },
 				{ type = "heading", text = "Raid Check Settings" },
@@ -907,6 +929,27 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			tooltip = "Manage who can administer the active profile and use admin-only session tools.",
 			condition = CanShowAdminTools,
 			items = {
+				{
+					type = "checkbox",
+					label = "Preview as Non-Admin",
+					tooltip = "View the active profile as a non-admin on this client only. This never grants privileges, does not change your real profile role or sync identity, and ends on profile switch, reset, or /reload.",
+					visible = function() return CanShowImpersonationToggle() end,
+					get = function()
+						local Imp = SF.LootHelperImpersonation
+						return Imp and Imp.IsActive and Imp:IsActive() or false
+					end,
+					set = function(value)
+						local Imp = SF.LootHelperImpersonation
+						if not Imp then
+							return
+						end
+						if value then
+							Imp:Enable()
+						else
+							Imp:Disable("settings")
+						end
+					end,
+				},
 				{ type = "scrollList", label = "Admins", adminOnly = true, height = 160, rowHeight = 20, removeAtlas = "common-icon-redx", compactColumns = true, removeColumnGap = 6, enabled = function() return ProfileActionsEnabled() end, getItems = function() return BuildAdminItems() end, onRemove = function(ctx, item) if type(ctx.store.RemoveAdminFromActiveProfile) ~= "function" then ctx.section:SetMessage("RemoveAdminFromActiveProfile() not implemented", "error") return end local ok, err = ctx.store:RemoveAdminFromActiveProfile(item.id) if not ok then ctx.section:SetMessage(err or "Failed to remove admin", "error") return end ctx.section:SetMessage("Admin removed.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "dropdownIconButton", label = "Add Admin", adminOnly = true, defaultText = "Select member", options = function() return BuildMemberOptions() end, get = function() return panel.__sfAddAdminSelectedId end, set = function(value) panel.__sfAddAdminSelectedId = value end, enabled = function() return ProfileActionsEnabled() end, iconAtlas = "common-icon-plus", iconToolTip = "Add the selected member as an admin for the active profile", iconEnabled = function() return ProfileActionsEnabled() and panel.__sfAddAdminSelectedId ~= nil end, onIconClick = function(ctx) if SF.Debug then SF.Debug:Info("UI", "Add Admin button clicked") end ctx.section:ClearMessage() local memberId = panel.__sfAddAdminSelectedId if SF.Debug then SF.Debug:Info("UI", "Selected memberId: %s", tostring(memberId)) end if not memberId then ctx.section:SetMessage("Select a member first.", "error") return end if type(ctx.store.AddAdminToActiveProfile) ~= "function" then ctx.section:SetMessage("AddAdminToActiveProfile() not implemented", "error") return end if SF.Debug then SF.Debug:Info("UI", "Calling AddAdminToActiveProfile with memberId: %s", tostring(memberId)) end local ok, err = ctx.store:AddAdminToActiveProfile(memberId) if SF.Debug then SF.Debug:Info("UI", "AddAdminToActiveProfile returned: ok=%s, err=%s", tostring(ok), tostring(err)) end if not ok then ctx.section:SetMessage(err or "Failed to add admin", "error") return end ctx.section:SetMessage("Admin added.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "button", label = "Transfer Points / Main Swap", adminOnly = true, buttonText = "Main Swap", width = 140, tooltip = "Transfer loot points, Attendance, and member-history references from one existing profile member to another existing profile member, then remove the old character from the profile.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if type(ctx.store.TransferMemberHistoryInActiveProfile) ~= "function" then ctx.section:SetMessage("TransferMemberHistoryInActiveProfile() not implemented", "error") return end local memberOptions = BuildAllMemberOptions() if #memberOptions < 2 then ctx.section:SetMessage("Add at least two profile members before using Main Swap.", "error") return end dialogs:TransferMemberHistory("Transfer all point and Attendance history from one profile member to another, then remove the old character from this profile?", "Transfer", memberOptions, memberOptions, function(sourceMemberId, targetMemberId) local ok, err = ctx.store:TransferMemberHistoryInActiveProfile(sourceMemberId, targetMemberId) if not ok then ctx.section:SetMessage(err or "Main Swap failed", "error") return end ctx.section:SetMessage("Main Swap completed.", "success") ctx.pageBuilder:Refresh() end) end },

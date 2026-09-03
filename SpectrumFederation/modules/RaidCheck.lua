@@ -2025,6 +2025,10 @@ function RC:RequestTroubleshootingRefresh()
 end
 
 local function IsCurrentUserAdmin(profile)
+	local Imp = SF.LootHelperImpersonation
+	if Imp and Imp.IsEffectiveLocalAdmin then
+		return Imp:IsEffectiveLocalAdmin(profile)
+	end
 	return profile and profile.IsCurrentUserAdmin and profile:IsCurrentUserAdmin()
 end
 
@@ -2944,6 +2948,18 @@ function RC:_ApplyCheckConsequences(run)
 	if not profile then
 		run.consequencesApplied = true
 		SF:PrintError(string.format("[%s] Frozen profile is no longer available. Consequences were not applied and were not redirected.", ModeLabel(run.mode)))
+		return
+	end
+
+	-- Fail-closed: impersonation (or any loss of effective local admin) aborts
+	-- awards, Reward Pot writes, logs, and admin whispers as a unit.
+	if not IsCurrentUserAdmin(profile) then
+		run.consequencesApplied = true
+		if SF.LootHelperImpersonation and SF.LootHelperImpersonation.IsActive and SF.LootHelperImpersonation:IsActive() then
+			SF:PrintError("Raid Check results were not applied because you are viewing the profile as a non-admin.")
+		else
+			SF:PrintError("Raid Check results were not applied because you are not an admin of this profile.")
+		end
 		return
 	end
 
