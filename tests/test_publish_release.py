@@ -166,11 +166,13 @@ def test_wago_auth_uses_api_key_not_webhook_secret(tmp_path, monkeypatch):
     def fake_urlopen(request, timeout=None):
         captured["authorization"] = request.get_header("Authorization")
         captured["body"] = request.data
+        captured["user_agent"] = request.get_header("User-agent") or request.get_header("User-Agent")
         return FakeResponse(201, b'{"id":"abc"}')
 
     result = publish.publish_to_wago(_plan(tmp_path), opener=fake_urlopen)
     assert result == "uploaded"
     assert captured["authorization"] == "Bearer developer-key-123"
+    assert captured["user_agent"] == publish.WAGO_USER_AGENT
     assert b"legacy-webhook-secret" not in captured["body"]
     assert b"developer-key-123" not in captured["body"]
     metadata = json.loads(captured["body"].split(b"\r\n\r\n", 1)[1].split(b"\r\n")[0])
@@ -204,7 +206,8 @@ def test_wago_authentication_failure(tmp_path, monkeypatch, capsys):
     assert result is None
     assert "authentication failed" in captured.out
     assert "developer-key-123" not in captured.out
-    assert "Authorization" not in captured.out
+    assert "Bearer <redacted>" in captured.out
+    assert "Bearer developer-key-123" not in captured.out
 
 
 def test_wago_validation_failure(tmp_path, monkeypatch, capsys):

@@ -22,12 +22,16 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import blizzard_api  # noqa: E402
+import blizzard_api
 
 WAGO_API_BASE = "https://addons.wago.io/api"
 WAGO_GAME_DATA_URL = f"{WAGO_API_BASE}/data/game"
 WAGO_API_KEY_ENV = "WAGO_API_KEY"
 WAGO_LEGACY_WEBHOOK_SECRET_ENV = "WAGO_API_SECRET"
+WAGO_USER_AGENT = (
+    "SpectrumFederation-PublishRelease/1.0 "
+    "(+https://github.com/OsulivanAB/SpectrumFederation)"
+)
 WAGO_STABILITY_VALUES = ("stable", "beta", "alpha")
 WAGO_UPLOAD_TIMEOUT_SECONDS = 60
 WAGO_GAME_DATA_TIMEOUT_SECONDS = 15
@@ -189,7 +193,10 @@ def fetch_wago_game_data(timeout=WAGO_GAME_DATA_TIMEOUT_SECONDS):
     """Fetch Wago's public game-version catalog. Returns None on failure."""
     request = urllib_request.Request(
         WAGO_GAME_DATA_URL,
-        headers={"Accept": "application/json"},
+        headers={
+            "Accept": "application/json",
+            "User-Agent": WAGO_USER_AGENT,
+        },
         method="GET",
     )
     try:
@@ -234,23 +241,23 @@ def encode_multipart_form(fields, files):
     chunks = []
 
     for name, value in fields.items():
-        chunks.append(f"--{boundary}".encode("utf-8"))
-        chunks.append(f'Content-Disposition: form-data; name="{name}"'.encode("utf-8"))
+        chunks.append(f"--{boundary}".encode())
+        chunks.append(f'Content-Disposition: form-data; name="{name}"'.encode())
         chunks.append(b"")
-        chunks.append(value.encode("utf-8") if isinstance(value, str) else value)
+        chunks.append(value.encode() if isinstance(value, str) else value)
 
     for name, path in files.items():
         file_path = Path(path)
         filename = file_path.name.replace('"', "")
-        chunks.append(f"--{boundary}".encode("utf-8"))
+        chunks.append(f"--{boundary}".encode())
         chunks.append(
-            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"'.encode("utf-8")
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"'.encode()
         )
         chunks.append(b"Content-Type: application/zip")
         chunks.append(b"")
         chunks.append(file_path.read_bytes())
 
-    chunks.append(f"--{boundary}--".encode("utf-8"))
+    chunks.append(f"--{boundary}--".encode())
     chunks.append(b"")
     return b"\r\n".join(chunks), f"multipart/form-data; boundary={boundary}"
 
@@ -742,6 +749,7 @@ def publish_to_wago(plan, *, dry_run=False, opener=None):
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
         "Content-Type": content_type,
+        "User-Agent": WAGO_USER_AGENT,
     }
     request = urllib_request.Request(
         plan.endpoint,
