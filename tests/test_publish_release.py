@@ -268,6 +268,53 @@ def test_wago_duplicate_version_is_success(tmp_path, monkeypatch, capsys):
     assert "already has this version" in captured.out
 
 
+def test_is_existing_wago_release_requires_explicit_duplicate_text():
+    assert publish.is_existing_wago_release(409, '{"message":"version already exists"}') is True
+    assert publish.is_existing_wago_release(409, "This label already exists on the project") is True
+    assert publish.is_existing_wago_release(409, "") is False
+    assert publish.is_existing_wago_release(409, "{}") is False
+    assert publish.is_existing_wago_release(409, '{"message":"conflict"}') is False
+    assert publish.is_existing_wago_release(409, "Conflict") is False
+    assert publish.is_existing_wago_release(409, '{"error":"duplicate"}') is False
+
+
+def test_wago_empty_409_is_not_treated_as_success(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WAGO_API_KEY", "developer-key-123")
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib_error.HTTPError(
+            request.full_url,
+            409,
+            "Conflict",
+            hdrs=None,
+            fp=io.BytesIO(b""),
+        )
+
+    result = publish.publish_to_wago(_plan(tmp_path), opener=fake_urlopen)
+    captured = capsys.readouterr()
+    assert result is None
+    assert "without a clear already-exists indication" in captured.out
+
+
+def test_wago_generic_conflict_409_is_not_treated_as_success(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("WAGO_API_KEY", "developer-key-123")
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib_error.HTTPError(
+            request.full_url,
+            409,
+            "Conflict",
+            hdrs=None,
+            fp=io.BytesIO(b'{"message":"conflict"}'),
+        )
+
+    result = publish.publish_to_wago(_plan(tmp_path), opener=fake_urlopen)
+    captured = capsys.readouterr()
+    assert result is None
+    assert "without a clear already-exists indication" in captured.out
+    assert "already has this version" not in captured.out
+
+
 def test_wago_generic_400_is_not_treated_as_duplicate(tmp_path, monkeypatch):
     monkeypatch.setenv("WAGO_API_KEY", "developer-key-123")
 
@@ -553,3 +600,103 @@ def test_build_wago_plan_fails_when_patch_is_not_advertised(tmp_path, monkeypatc
     captured = capsys.readouterr()
     assert plan is None
     assert "does not currently advertise Retail patch '12.1.5'" in captured.out
+
+
+def _orchestrator_args(tmp_path, *, version="1.5.0-beta.1"):
+    zip_path = tmp_path / f"SpectrumFederation-{version}.zip"
+    json_path = tmp_path / "release.json"
+    notes_path = tmp_path / "notes.md"
+    zip_path.write_bytes(b"zip")
+    json_path.write_text("{}", encoding="utf-8")
+    notes_path.write_text("notes", encoding="utf-8")
+    return {
+        "version": version,
+        "classification": publish.classify_release(version),
+        "addon_name": "SpectrumFederation",
+        "interface": 120100,
+        "zip_path": zip_path,
+        "json_path": json_path,
+        "notes": "Beta release notes",
+        "notes_path": notes_path,
+        "repo": "OsulivanAB/SpectrumFederation",
+    }
+
+
+def test_live_github_runs_before_wago_catalog_lookup(tmp_path, monkeypatch, capsys):
+    addon = tmp_path / "SpectrumFederation"
+    addon.mkdir()
+    (addon / "SpectrumFederation.toc").write_text(
+        "## X-Wago-ID: BNBmnlGx\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    order = []
+
+    def fake_github(*args, **kwargs):
+        order.append("github")
+        return "created"
+
+    def fake_catalog():
+        order.append("wago-catalog")
+        return None
+
+    def fail_upload(*args, **kwargs):
+        raise AssertionError("Wago upload must not run")
+
+    monkeypatch.setattr(publish, "create_github_release", fake_github)
+    monkeypatch.setattr(publish, "fetch_wago_game_data", fake_catalog)
+    monkeypatch.setattr(publish, "publish_to_wago", fail_upload)
+
+    result = publish.publish_github_then_wago(**_orchestrator_args(tmp_path), dry_run=False)
+    captured = capsys.readouterr()
+    assert result is False
+    assert order == ["github", "wago-catalog"]
+    assert "GitHub release succeeded, but Wago publication failed" in captured.out
+    assert "Do not roll back CurseForge" in captured.out
+
+
+def test_live_wago_plan_failure_does_not_block_github(tmp_path, monkeypatch, capsys):
+    github_calls = []
+
+    def fake_github(*args, **kwargs):
+        github_calls.append(kwargs.get("dry_run"))
+        return "updated"
+
+    def fail_plan(**kwargs):
+        print("::error ::Could not load Wago's Retail patch catalog")
+        return None
+
+    def fail_upload(*args, **kwargs):
+        raise AssertionError("Wago upload must not run")
+
+    monkeypatch.setattr(publish, "create_github_release", fake_github)
+    monkeypatch.setattr(publish, "resolve_wago_publish_plan", fail_plan)
+    monkeypatch.setattr(publish, "publish_to_wago", fail_upload)
+
+    result = publish.publish_github_then_wago(**_orchestrator_args(tmp_path), dry_run=False)
+    captured = capsys.readouterr()
+    assert result is False
+    assert github_calls == [False]
+    assert "GitHub release action: updated" in captured.out
+    assert "GitHub release succeeded, but Wago publication failed" in captured.out
+
+
+def test_dry_run_validates_wago_before_simulated_github(tmp_path, monkeypatch, capsys):
+    order = []
+
+    def fail_plan(**kwargs):
+        order.append("wago-plan")
+        return None
+
+    def fake_github(*args, **kwargs):
+        order.append("github")
+        return "dry-run"
+
+    monkeypatch.setattr(publish, "resolve_wago_publish_plan", fail_plan)
+    monkeypatch.setattr(publish, "create_github_release", fake_github)
+
+    result = publish.publish_github_then_wago(**_orchestrator_args(tmp_path), dry_run=True)
+    captured = capsys.readouterr()
+    assert result is False
+    assert order == ["wago-plan"]
+    assert "GitHub release succeeded, but Wago publication failed" not in captured.out

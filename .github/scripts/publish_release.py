@@ -330,18 +330,15 @@ def summarize_wago_http_error(status, body):
 
 
 def is_existing_wago_release(status, body):
-    """Return True only when the response clearly means this version exists."""
+    """Return True only when the response clearly says this version exists.
+
+    Wago's public docs do not define HTTP 409 as "already exists". An empty
+    or generic conflict body is treated as a hard failure, not a retry success.
+    """
+    if status not in (400, 409, 422):
+        return False
     text = (body or "").lower()
-    if status == 409:
-        if not text:
-            return True
-        return any(
-            phrase in text
-            for phrase in (*WAGO_DUPLICATE_PHRASES, "conflict", "duplicate")
-        )
-    if status in (400, 422):
-        return any(phrase in text for phrase in WAGO_DUPLICATE_PHRASES)
-    return False
+    return any(phrase in text for phrase in WAGO_DUPLICATE_PHRASES)
 
 
 def _is_beta_prerelease(version):
@@ -712,6 +709,124 @@ def build_wago_publish_plan(
     )
 
 
+def log_github_succeeded_wago_failed():
+    """Explain that CurseForge is intact and Wago can be retried."""
+    print(
+        "[publish-release] GitHub release succeeded, but Wago publication failed. "
+        "Rerun this script to retry Wago without deleting the GitHub Release. "
+        "Do not roll back CurseForge."
+    )
+
+
+def resolve_wago_publish_plan(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    changelog,
+):
+    """Fetch Wago's catalog and build a publish plan. Returns None on failure."""
+    game_data = fetch_wago_game_data()
+    return build_wago_publish_plan(
+        version=version,
+        classification=classification,
+        addon_name=addon_name,
+        interface=interface,
+        zip_path=zip_path,
+        changelog=changelog,
+        game_data=game_data,
+    )
+
+
+def log_wago_summary(plan):
+    """Log non-secret Wago plan fields after they have been resolved."""
+    print(f"[publish-release] Wago project ID: {plan.project_id}")
+    print(
+        f"[publish-release] Supported retail patch: {plan.supported_retail_patch} "
+        f"({plan.patch_match})"
+    )
+
+
+def publish_github_then_wago(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    json_path,
+    notes,
+    notes_path,
+    repo,
+    dry_run,
+):
+    """Publish GitHub first on live runs; validate Wago first only for dry-run.
+
+    Live Wago catalog, metadata, auth, and upload failures happen after the
+    GitHub Release exists so CurseForge still receives the Release event.
+    """
+    def resolve_plan():
+        return resolve_wago_publish_plan(
+            version=version,
+            classification=classification,
+            addon_name=addon_name,
+            interface=interface,
+            zip_path=zip_path,
+            changelog=notes,
+        )
+
+    if dry_run:
+        wago_plan = resolve_plan()
+        if not wago_plan:
+            return False
+        log_wago_summary(wago_plan)
+        github_action = create_github_release(
+            version,
+            zip_path,
+            json_path,
+            repo,
+            classification,
+            notes_path,
+            dry_run=True,
+        )
+        if not github_action:
+            return False
+        print(f"[publish-release] GitHub release action: {github_action}")
+        wago_action = publish_to_wago(wago_plan, dry_run=True)
+        if not wago_action:
+            return False
+        print(f"[publish-release] Wago publication action: {wago_action}")
+        return True
+
+    github_action = create_github_release(
+        version,
+        zip_path,
+        json_path,
+        repo,
+        classification,
+        notes_path,
+        dry_run=False,
+    )
+    if not github_action:
+        return False
+    print(f"[publish-release] GitHub release action: {github_action}")
+
+    wago_plan = resolve_plan()
+    if not wago_plan:
+        log_github_succeeded_wago_failed()
+        return False
+    log_wago_summary(wago_plan)
+
+    wago_action = publish_to_wago(wago_plan, dry_run=False)
+    if not wago_action:
+        log_github_succeeded_wago_failed()
+        return False
+    print(f"[publish-release] Wago publication action: {wago_action}")
+    return True
+
+
 def log_wago_plan(plan, *, dry_run=False):
     """Log non-secret Wago publish state."""
     prefix = "[publish-release] DRY RUN - Would upload to Wago:" if dry_run else "[publish-release] Wago upload:"
@@ -783,6 +898,11 @@ def publish_to_wago(plan, *, dry_run=False, opener=None):
         elif status == 404:
             print(
                 f"::error ::Wago project '{plan.project_id}' was not found ({summary})"
+            )
+        elif status == 409:
+            print(
+                f"::error ::Wago returned HTTP 409 without a clear already-exists "
+                f"indication ({summary})"
             )
         elif status in (400, 422):
             print(f"::error ::Wago rejected the release metadata or file ({summary})")
@@ -869,51 +989,23 @@ def main():
 
     notes = build_release_notes(args.version, args.repo, classification)
     notes_path = write_release_notes(notes)
+    print(f"[publish-release] ZIP artifact: {zip_path.name}")
 
-    game_data = fetch_wago_game_data()
-    wago_plan = build_wago_publish_plan(
+    published = publish_github_then_wago(
         version=args.version,
         classification=classification,
         addon_name=args.addon_name,
         interface=args.interface,
         zip_path=zip_path,
-        changelog=notes,
-        game_data=game_data,
+        json_path=json_path,
+        notes=notes,
+        notes_path=notes_path,
+        repo=args.repo,
+        dry_run=args.dry_run,
     )
-    if not wago_plan:
+    if not published:
         sys.exit(1)
 
-    print(f"[publish-release] Wago project ID: {wago_plan.project_id}")
-    print(
-        f"[publish-release] Supported retail patch: {wago_plan.supported_retail_patch} "
-        f"({wago_plan.patch_match})"
-    )
-    print(f"[publish-release] ZIP artifact: {zip_path.name}")
-
-    github_action = create_github_release(
-        args.version,
-        zip_path,
-        json_path,
-        args.repo,
-        classification,
-        notes_path,
-        dry_run=args.dry_run
-    )
-    if not github_action:
-        sys.exit(1)
-    print(f"[publish-release] GitHub release action: {github_action}")
-
-    wago_action = publish_to_wago(wago_plan, dry_run=args.dry_run)
-    if not wago_action:
-        if github_action in ("created", "updated"):
-            print(
-                "[publish-release] GitHub release succeeded, but Wago publication failed. "
-                "Rerun this script to retry Wago without deleting the GitHub Release. "
-                "Do not roll back CurseForge."
-            )
-        sys.exit(1)
-    print(f"[publish-release] Wago publication action: {wago_action}")
-    
     print("[publish-release] ✅ Release published successfully")
     return 0
 

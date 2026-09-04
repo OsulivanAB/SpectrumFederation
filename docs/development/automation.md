@@ -107,10 +107,13 @@ The dry-run README job uploads its simulated stable badge output to the dry-run 
 
 A live publish does the following, in order:
 
-1. Build the addon zip (`SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/` at the zip root).
-2. Write WowUp Hub `release.json`.
+1. Build the existing release artifacts: the addon zip (`SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/` at the zip root) and WowUp Hub `release.json`.
+2. Build release notes from `CHANGELOG.md`.
 3. Create or update the GitHub Release (prerelease for `-beta`, `-alpha`, and `-rc` versions).
-4. Upload the same addon zip to Wago Addons with an explicit stability value.
+4. After GitHub succeeds, load Wago's catalog, require an exact Retail patch match, and validate Wago project metadata.
+5. Upload the same addon zip to Wago Addons with an explicit stability value.
+
+Wago catalog, metadata, authentication, and upload failures happen after the GitHub Release exists. They fail the workflow visibly and do not delete the GitHub Release or roll back CurseForge. Dry-run may resolve and validate Wago before printing the simulated GitHub and Wago actions because dry-run performs no external mutations.
 
 GitHub Release events still fire. CurseForge continues to receive releases through its existing GitHub Release webhook. WowUp continues to use `release.json`. Changelog text is reused for both GitHub release notes and the Wago changelog; there is no second changelog generator.
 
@@ -131,7 +134,7 @@ Matching is case-insensitive (`1.5.0-BETA.2` is still a GitHub prerelease and Wa
 
 The public Wago project ID is stored once, as `## X-Wago-ID:` in `SpectrumFederation/SpectrumFederation.toc`. The child addon is packaged in the same zip and does not get a second Wago ID. The publisher reads that TOC field instead of hard-coding the ID in workflows.
 
-The Wago `supported_retail_patch` value is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`). The script requires that exact string to appear in Wago's public catalog at `https://addons.wago.io/api/data/game`. If the catalog cannot be loaded, or Wago does not advertise that patch yet, both live publishing and dry-run fail instead of claiming an older patch.
+The Wago `supported_retail_patch` value is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`). The script requires that exact string to appear in Wago's public catalog at `https://addons.wago.io/api/data/game`. If the catalog cannot be loaded, or Wago does not advertise that patch yet, publishing fails instead of claiming an older patch. On a live run that failure happens after GitHub has already published, so CurseForge still receives the Release event.
 
 Release notes reuse `CHANGELOG.md`. Beta versions look for `## [X.Y.Z-beta.N]` and then `## [Unreleased - Beta]`. Stable, alpha, and RC versions use exact-heading lookup only; current changelog automation does not create alpha/RC sections, and the publisher does not invent them.
 
@@ -156,7 +159,7 @@ Leave every other GitHub Release consumer untouched. After the Wago webhook is r
 
 ### Dry-run
 
-A dry-run must not create a GitHub Release, upload to Wago, or mutate any external release service. It still prints version, GitHub prerelease classification, Wago stability, Wago project ID, supported Retail patch, artifact filename, and the Wago `POST` endpoint.
+A dry-run must not create a GitHub Release, upload to Wago, or mutate any external release service. It may resolve the Wago catalog and validate project metadata before printing the simulated GitHub and Wago actions. It still prints version, GitHub prerelease classification, Wago stability, Wago project ID, supported Retail patch, artifact filename, and the Wago `POST` endpoint.
 
 From the repository root, after substituting the version and Interface values you intend to publish:
 
@@ -169,7 +172,7 @@ The promotion workflow already runs this with `--dry-run` during its validation 
 ### Retry when one destination fails
 
 - If GitHub succeeds and Wago fails, CurseForge may already have the GitHub Release. Do not delete that GitHub Release and do not roll back CurseForge. Fix the Wago error and rerun `publish_release.py` for the same version. The GitHub side updates the existing release; Wago is retried independently.
-- If Wago accepted the version and a later step failed, a rerun treats a clear "version already exists" / HTTP 409 response as success rather than creating an uncontrolled duplicate.
+- A Wago HTTP 409 is treated as success only when the response body clearly says this exact version or label already exists. An empty or generic 409 is a visible failure, not an automatic retry success.
 - If the GitHub Release already exists, the existing update/reuse path is preserved, and Wago publishing still runs afterward.
 
 ### Tests
