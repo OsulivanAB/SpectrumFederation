@@ -131,7 +131,9 @@ Matching is case-insensitive (`1.5.0-BETA.2` is still a GitHub prerelease and Wa
 
 The public Wago project ID is stored once, as `## X-Wago-ID:` in `SpectrumFederation/SpectrumFederation.toc`. The child addon is packaged in the same zip and does not get a second Wago ID. The publisher reads that TOC field instead of hard-coding the ID in workflows.
 
-The Wago `supported_retail_patch` value is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`). The script checks Wago's public catalog at `https://addons.wago.io/api/data/game`. If Wago has not listed the current patch yet, it uses the highest catalog patch that is still at or below that version.
+The Wago `supported_retail_patch` value is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`). The script requires that exact string to appear in Wago's public catalog at `https://addons.wago.io/api/data/game`. If the catalog cannot be loaded, or Wago does not advertise that patch yet, both live publishing and dry-run fail instead of claiming an older patch.
+
+Release notes reuse `CHANGELOG.md`. Beta versions look for `## [X.Y.Z-beta.N]` and then `## [Unreleased - Beta]`. Stable, alpha, and RC versions use exact-heading lookup only; current changelog automation does not create alpha/RC sections, and the publisher does not invent them.
 
 ### Credentials
 

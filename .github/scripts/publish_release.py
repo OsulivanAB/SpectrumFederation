@@ -160,33 +160,24 @@ def parse_patch_tuple(patch):
 
 
 def select_wago_retail_patch(desired_patch, available_patches):
-    """Choose a Wago-supported retail patch for the desired game version.
+    """Require an exact Wago catalog match for the desired Retail patch.
 
-    Prefer an exact catalog match. If Wago has not listed the current Retail
-    patch yet, use the highest catalog patch that is still less than or equal
-    to the desired version.
+    Never fall back to an older advertised patch. Publishing a newer Interface
+    as an older `supported_retail_patch` would silently claim the wrong
+    compatibility window.
     """
-    desired = parse_patch_tuple(desired_patch)
-    if desired is None:
+    if parse_patch_tuple(desired_patch) is None:
         raise ValueError(f"Invalid retail patch '{desired_patch}'")
 
     normalized = [str(patch) for patch in available_patches or [] if str(patch).strip()]
     if desired_patch in normalized:
         return desired_patch, "exact"
 
-    candidates = []
-    for patch in normalized:
-        parsed = parse_patch_tuple(patch)
-        if parsed is not None and parsed <= desired:
-            candidates.append((parsed, patch))
-
-    if not candidates:
-        raise ValueError(
-            f"Wago game catalog has no retail patch at or below '{desired_patch}'"
-        )
-
-    candidates.sort()
-    return candidates[-1][1], "fallback"
+    raise ValueError(
+        f"Wago does not currently advertise Retail patch '{desired_patch}' in "
+        f"{WAGO_GAME_DATA_URL}. Live publishing requires an exact catalog match "
+        "and will not claim compatibility with an older patch."
+    )
 
 
 def fetch_wago_game_data(timeout=WAGO_GAME_DATA_TIMEOUT_SECONDS):
@@ -216,11 +207,14 @@ def resolve_supported_retail_patch(interface, game_data=None):
     """Return (patch, match_kind) for Wago's supported_retail_patch field."""
     desired_patch = interface_to_retail_patch(interface)
     if not game_data:
-        return desired_patch, "unvalidated"
+        raise ValueError(
+            f"Could not load Wago's Retail patch catalog from {WAGO_GAME_DATA_URL}. "
+            f"Requested patch '{desired_patch}' cannot be verified. "
+            "Live publishing requires an exact catalog match."
+        )
 
     available = (game_data.get("patches") or {}).get("retail") or []
-    patch, match_kind = select_wago_retail_patch(desired_patch, available)
-    return patch, match_kind
+    return select_wago_retail_patch(desired_patch, available)
 
 
 def build_wago_metadata(label, stability, changelog, supported_retail_patch):
@@ -350,8 +344,20 @@ def is_existing_wago_release(status, body):
     return False
 
 
+def _is_beta_prerelease(version):
+    """Return True for -beta versions only, not -alpha or -rc."""
+    match = PRERELEASE_MARKER_RE.search(version or "")
+    return bool(match and match.group(1).lower() == "beta")
+
+
 def get_changelog_for_version(version):
     """Extract changelog content for a specific version from CHANGELOG.md.
+
+    Beta versions first look for an exact `## [X.Y.Z-beta.N]` heading and then
+    fall back to `## [Unreleased - Beta]`, matching the existing changelog
+    generator. Stable, alpha, and RC versions use exact-heading lookup only.
+    Current automation does not create alpha/RC sections, so those releases
+    reuse whatever exact heading already exists and do not invent new ones.
     
     Args:
         version: Version string (e.g., '0.0.18' or '0.0.18-beta.1')
@@ -369,20 +375,18 @@ def get_changelog_for_version(version):
         with open(changelog_path, "r") as f:
             content = f.read()
         
-        # For beta versions, try both the exact version and the [Unreleased - Beta] section
-        if "-beta" in version:
-            # First try to find exact version match
-            pattern = rf"^## \[{re.escape(version)}\].*?$"
-            match = re.search(pattern, content, re.MULTILINE)
-            
-            if not match:
-                # Fall back to [Unreleased - Beta] section
-                pattern = r"^## \[Unreleased - Beta\].*?$"
-                match = re.search(pattern, content, re.MULTILINE)
-        else:
-            # For stable releases, look for exact version
-            pattern = rf"^## \[{re.escape(version)}\].*?$"
-            match = re.search(pattern, content, re.MULTILINE)
+        pattern = rf"^## \[{re.escape(version)}\].*?$"
+        match = re.search(pattern, content, re.MULTILINE)
+
+        # Beta-only fallback: changelog automation still writes
+        # `[Unreleased - Beta]` for in-progress beta work. Do not reuse that
+        # heading for alpha or RC versions.
+        if not match and _is_beta_prerelease(version):
+            match = re.search(
+                r"^## \[Unreleased - Beta\].*?$",
+                content,
+                re.MULTILINE,
+            )
         
         if not match:
             print(f"[publish-release] Warning: No changelog entry found for version {version}")

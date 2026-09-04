@@ -112,15 +112,18 @@ def test_get_wago_project_id_reads_parent_toc(tmp_path, monkeypatch):
     assert publish.get_wago_project_id("SpectrumFederation") == "BNBmnlGx"
 
 
-def test_select_wago_retail_patch_prefers_exact_then_fallback():
+def test_select_wago_retail_patch_requires_exact_match():
     assert publish.select_wago_retail_patch("12.1.0", ["12.0.1", "12.1.0"]) == (
         "12.1.0",
         "exact",
     )
-    assert publish.select_wago_retail_patch("12.1.5", ["12.0.1", "12.1.0"]) == (
-        "12.1.0",
-        "fallback",
-    )
+    with pytest.raises(ValueError, match="does not currently advertise Retail patch '12.1.5'"):
+        publish.select_wago_retail_patch("12.1.5", ["12.0.1", "12.1.0"])
+
+
+def test_resolve_supported_retail_patch_fails_without_catalog():
+    with pytest.raises(ValueError, match="Requested patch '12.1.0' cannot be verified"):
+        publish.resolve_supported_retail_patch(120100, game_data=None)
 
 
 def test_interface_to_retail_patch_uses_blizzard_helper():
@@ -466,3 +469,87 @@ def test_legacy_webhook_secret_is_never_read_for_auth():
     assert "os.environ.get(WAGO_LEGACY_WEBHOOK_SECRET_ENV)" not in source
     assert 'os.environ.get("WAGO_API_SECRET")' not in source
     assert "WAGO_API_SECRET" in source
+
+
+CHANGELOG_FIXTURE = """# Changelog
+
+## [1.5.0-beta.1] - 2026-09-04
+
+### Changed
+- Beta notes
+
+## [Unreleased - Beta]
+
+### Changed
+- Unreleased beta notes
+
+## [1.5.0-alpha.1] - 2026-09-03
+
+### Changed
+- Alpha notes
+
+## [1.5.0-rc.1] - 2026-09-02
+
+### Changed
+- RC notes
+
+## [1.4.0] - 2026-09-01
+
+### Changed
+- Stable notes
+"""
+
+
+def test_changelog_beta_uses_exact_heading_then_unreleased(tmp_path, monkeypatch):
+    (tmp_path / "CHANGELOG.md").write_text(CHANGELOG_FIXTURE, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    exact = publish.get_changelog_for_version("1.5.0-beta.1")
+    assert "## [1.5.0-beta.1]" in exact
+    assert "Beta notes" in exact
+    assert "Unreleased beta notes" not in exact
+
+    missing_beta = publish.get_changelog_for_version("1.5.0-BETA.2")
+    assert "## [Unreleased - Beta]" in missing_beta
+    assert "Unreleased beta notes" in missing_beta
+
+
+def test_changelog_alpha_and_rc_use_exact_heading_only(tmp_path, monkeypatch):
+    (tmp_path / "CHANGELOG.md").write_text(CHANGELOG_FIXTURE, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    alpha = publish.get_changelog_for_version("1.5.0-alpha.1")
+    assert "## [1.5.0-alpha.1]" in alpha
+    assert "Alpha notes" in alpha
+    assert "Unreleased beta notes" not in alpha
+
+    rc = publish.get_changelog_for_version("1.5.0-rc.1")
+    assert "## [1.5.0-rc.1]" in rc
+    assert "RC notes" in rc
+    assert "Unreleased beta notes" not in rc
+
+    assert publish.get_changelog_for_version("1.5.0-alpha.2") is None
+    assert publish.get_changelog_for_version("1.5.0-rc.2") is None
+
+
+def test_build_wago_plan_fails_when_patch_is_not_advertised(tmp_path, monkeypatch, capsys):
+    addon = tmp_path / "SpectrumFederation"
+    addon.mkdir()
+    (addon / "SpectrumFederation.toc").write_text(
+        "## X-Wago-ID: BNBmnlGx\n",
+        encoding="utf-8",
+    )
+    zip_path = tmp_path / "addon.zip"
+    zip_path.write_bytes(b"zip")
+    monkeypatch.chdir(tmp_path)
+    plan = publish.build_wago_publish_plan(
+        version="1.5.0",
+        classification=publish.classify_release("1.5.0"),
+        addon_name="SpectrumFederation",
+        interface=120105,
+        zip_path=zip_path,
+        changelog="notes",
+        game_data={"patches": {"retail": ["12.1.0", "12.0.1"]}},
+    )
+    captured = capsys.readouterr()
+    assert plan is None
+    assert "does not currently advertise Retail patch '12.1.5'" in captured.out
