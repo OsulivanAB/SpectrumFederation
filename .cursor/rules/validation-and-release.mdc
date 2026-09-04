@@ -19,6 +19,7 @@ alwaysApply: true
   - Loot Helper impersonation / Preview as Non-Admin -> `python -m pytest tests/test_impersonation.py` (requires `lua5.1`)
   - Raid Equipment policy or CheckRun -> `python -m pytest tests/test_raid_equipment.py` (requires `lua5.1`)
   - PR template or `validate_pr_template.py` -> `python -m pytest tests/test_pr_template.py`
+- Release classification or Wago publishing -> `python -m pytest tests/test_publish_release.py`
 - Normal development targets `beta`; `main` is for promotion and release workflows.
 - Do not weaken CI to make checks pass.
 - Keep the job name in `.github/workflows/copilot-setup-steps.yml` exactly `copilot-setup-steps`.

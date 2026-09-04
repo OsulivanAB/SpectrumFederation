@@ -884,6 +884,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          WAGO_API_KEY: ${{ secrets.WAGO_API_KEY }}
         run: |
           python3 .github/scripts/publish_release.py "${{ needs.merge-beta-to-main.outputs.stable_version }}" --interface "${{ needs.merge-beta-to-main.outputs.interface }}"
 
@@ -1007,6 +1008,7 @@ jobs:
             echo "- Release zip file for addon installation" >> $GITHUB_STEP_SUMMARY
             echo "- Release metadata (release.json)" >> $GITHUB_STEP_SUMMARY
             echo "- Changelog notes" >> $GITHUB_STEP_SUMMARY
+            echo "- Direct Wago Addons upload with explicit stable classification" >> $GITHUB_STEP_SUMMARY
           elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "false" &&
                   "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
             echo "### ⏭️ Stable Release Skipped" >> $GITHUB_STEP_SUMMARY

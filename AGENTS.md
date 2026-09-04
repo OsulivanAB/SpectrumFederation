@@ -65,3 +65,4 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`
 - PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`
+- Release classification or Wago publishing: also run `python -m pytest tests/test_publish_release.py`
