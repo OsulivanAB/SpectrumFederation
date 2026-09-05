@@ -21,7 +21,7 @@ Documentation-only changes do not require an addon version bump.
 
 `.github/workflows/pr-main-validation.yml` runs lint, tests, packaging, stable-version-format, and documentation checks. Direct feature work should not normally target this branch.
 
-`.github/workflows/pr-template-validation.yml` separately validates pull-request template completion.
+`.github/workflows/pr-template-validation.yml` separately validates pull-request template completion. In-game testing must be either marked complete or explicitly marked not applicable. N/A is rejected when packaged addon files changed, or when a TOC change is runtime-affecting, unknown, or not inspectable. Zip-excluded repository files such as `*/AGENTS.md` may still use N/A.
 
 Both branch-validation workflows include `README.md` and `tests/**` in their path filters so documentation and test-only changes still run the matching checks.
 
@@ -35,7 +35,7 @@ It:
 2. queries Blizzard's beta product for Interface metadata;
 3. updates `CHANGELOG.md`;
 4. updates README badges;
-5. packages and publishes a beta release;
+5. packages the addon zip, writes WowUp `release.json`, creates a GitHub prerelease, and uploads the same zip to Wago as `beta`;
 6. deletes the merged source branch when the release succeeds.
 
 Docs-only merges do not trigger a beta addon release.
@@ -90,7 +90,7 @@ The workflow:
 2. validates lint, packaging, docs, and the appropriate version format;
 3. simulates the merge, metadata changes, docs build, release packaging, and beta synchronization without pushing;
 4. merges `beta` into `main`;
-5. for addon changes, removes `-beta.N`, fetches the live Interface value, updates the changelog, and publishes a stable release;
+5. for addon changes, removes `-beta.N`, fetches the live Interface value, updates the changelog, and publishes a stable GitHub Release plus a Wago `stable` upload;
 6. updates README badges;
 7. deploys MkDocs from `main`;
 8. force-with-lease synchronizes `beta` to `main`.
@@ -100,6 +100,84 @@ If there are no addon changes, the promotion preserves the stable version and sk
 Older instructions that ask for a promotion `dry_run` input are obsolete; the workflow now always validates with its built-in dry-run phase.
 
 The dry-run README job uploads its simulated stable badge output to the dry-run docs job, which applies the simulated stable TOC metadata before calling `validate_docs.py`. The final `main` deployment also calls the validator after generated metadata is pushed.
+
+## GitHub, CurseForge, and Wago publishing
+
+`.github/scripts/publish_release.py` is the shared publisher for beta and stable addon releases. GitHub Releases remain part of the pipeline. Do not replace them with Wago-only publishing.
+
+A live publish does the following, in order:
+
+1. Build the existing release artifacts: the addon zip (`SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/` at the zip root) and WowUp Hub `release.json`.
+2. Build release notes from `CHANGELOG.md`.
+3. Create or update the GitHub Release (prerelease for `-beta`, `-alpha`, and `-rc` versions).
+4. After GitHub succeeds, load Wago's catalog, require an exact Retail patch match, and validate Wago project metadata.
+5. Upload the same addon zip to Wago Addons with an explicit stability value.
+
+Wago catalog, metadata, authentication, and upload failures happen after the GitHub Release exists. They fail the workflow visibly and do not delete the GitHub Release or roll back CurseForge. Dry-run may resolve and validate Wago before printing the simulated GitHub and Wago actions because dry-run performs no external mutations.
+
+GitHub Release events still fire. CurseForge continues to receive releases through its existing GitHub Release webhook. WowUp continues to use `release.json`. Changelog text is reused for both GitHub release notes and the Wago changelog; there is no second changelog generator.
+
+### Version mapping
+
+Classification comes from the version string, not from the current git branch:
+
+| Version | GitHub | Wago stability |
+| --- | --- | --- |
+| `1.4.0` | Release | `stable` |
+| `1.5.0-beta.1` | Prerelease | `beta` |
+| `1.5.0-alpha.1` | Prerelease | `alpha` |
+| `1.5.0-rc.1` | Prerelease | `beta` |
+
+Matching is case-insensitive (`1.5.0-BETA.2` is still a GitHub prerelease and Wago `beta`).
+
+### Wago project ID and Retail patch
+
+The public Wago project ID is stored once, as `## X-Wago-ID:` in `SpectrumFederation/SpectrumFederation.toc`. The child addon is packaged in the same zip and does not get a second Wago ID. The publisher reads that TOC field instead of hard-coding the ID in workflows.
+
+The Wago `supported_retail_patch` value is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`). The script requires that exact string to appear in Wago's public catalog at `https://addons.wago.io/api/data/game`. If the catalog cannot be loaded, or Wago does not advertise that patch yet, publishing fails instead of claiming an older patch. On a live run that failure happens after GitHub has already published, so CurseForge still receives the Release event.
+
+Release notes reuse `CHANGELOG.md`. Beta versions look for `## [X.Y.Z-beta.N]` and then `## [Unreleased - Beta]`. Stable, alpha, and RC versions use exact-heading lookup only; current changelog automation does not create alpha/RC sections, and the publisher does not invent them.
+
+### Credentials
+
+There are two Wago-related GitHub repository secrets with different purposes:
+
+- `WAGO_API_KEY` is the Wago developer API credential. Direct publishing uses only this value, as `Authorization: Bearer …` according to [Wago's API docs](https://docs.wago.io/).
+- `WAGO_API_SECRET` is the signing secret from the old GitHub Release webhook. The new publisher does not read or send it.
+
+Never log either secret, Authorization headers, or tokens.
+
+### Migration: disable only the old Wago webhook
+
+Historically Wago imported GitHub Release events through a repository webhook. That import classified beta GitHub prereleases as Wago Stable.
+
+**Disable/remove ONLY the old Wago GitHub Release webhook before enabling direct Wago publishing in production.**
+
+**DO NOT disable the CurseForge Release webhook.**
+
+Leave every other GitHub Release consumer untouched. After the Wago webhook is removed, `WAGO_API_SECRET` may remain in repository Secrets; the new code does not use it.
+
+### Dry-run
+
+A dry-run must not create a GitHub Release, upload to Wago, or mutate any external release service. It may resolve the Wago catalog and validate project metadata before printing the simulated GitHub and Wago actions. It still prints version, GitHub prerelease classification, Wago stability, Wago project ID, supported Retail patch, artifact filename, and the Wago `POST` endpoint.
+
+From the repository root, after substituting the version and Interface values you intend to publish:
+
+```bash
+python3 .github/scripts/publish_release.py 1.5.0-beta.1 --interface 120100 --dry-run
+```
+
+The promotion workflow already runs this with `--dry-run` during its validation phase. Dry-run does not require `WAGO_API_KEY` or a GitHub token.
+
+### Retry when one destination fails
+
+- If GitHub succeeds and Wago fails, CurseForge may already have the GitHub Release. Do not delete that GitHub Release and do not roll back CurseForge. Fix the Wago error and rerun `publish_release.py` for the same version. The GitHub side updates the existing release; Wago is retried independently.
+- A Wago HTTP 409 is treated as success only when the response body clearly says this exact version or label already exists. An empty or generic 409 is a visible failure, not an automatic retry success.
+- If the GitHub Release already exists, the existing update/reuse path is preserved, and Wago publishing still runs afterward.
+
+### Tests
+
+Release classification, Wago metadata, credential handling, and mocked HTTP behavior are covered by `tests/test_publish_release.py`.
 
 ## Roll back a release
 
@@ -137,7 +215,7 @@ python -m pytest tests/test_interface_badge.py
 | `validate_docs.py` | Repository-specific documentation guardrails plus `mkdocs build --clean --strict`. |
 | `check_version_bump.py` | Compare TOC versions against a base branch. |
 | `check_duplicate_release.py` | Reject an existing release version. |
-| `publish_release.py` | Build release artifacts and publish or dry-run them. |
+| `publish_release.py` | Build release artifacts, create or update the GitHub Release, and publish the same zip to Wago. |
 | `update_changelog.py` | Update the beta changelog after merge, or consolidate the main changelog during promotion. |
 | `cleanup_merged_branch.py` | Remove the merged source branch after beta release. |
 
