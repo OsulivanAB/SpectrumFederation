@@ -39,7 +39,7 @@ For detailed information about our guild, addon features, and guides, visit our 
 
 1. Download the latest release from the [Releases page](https://github.com/OsulivanAB/SpectrumFederation/releases)
 2. Extract the downloaded ZIP file
-3. Copy the SpectrumFederation, SpectrumFederation_CursedSurgeTracker, and SpectrumFederation_RCLootCouncilCapture folders to your World of Warcraft AddOns directory:
+3. Copy the SpectrumFederation, SpectrumFederation_CursedSurgeTracker, and SpectrumFederation_RCLootCouncilIntegration folders to your World of Warcraft AddOns directory:
   - **Windows**: C:\Program Files (x86)\World of Warcraft\_retail_\Interface\AddOns\
   - **macOS**: /Applications/World of Warcraft/_retail_/Interface/AddOns/
 4. Restart World of Warcraft or type `/reload` in-game

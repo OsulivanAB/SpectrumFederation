@@ -24,9 +24,9 @@ SpectrumFederation_CursedSurgeTracker/
   Schedule.lua                 pure schedule/map helpers
   Tracker.lua                  zone, scheduler, and timer runtime
   MapPins.lua                  World Map data provider and pins
-SpectrumFederation_RCLootCouncilCapture/
-  SpectrumFederation_RCLootCouncilCapture.toc
-  Capture.lua                  temporary RC Loot Council diagnostic logger
+SpectrumFederation_RCLootCouncilIntegration/
+  SpectrumFederation_RCLootCouncilIntegration.toc
+  Integration.lua              records RC Loot Council awards in Spectrum Loot Logs
 .github/scripts/               validation and release helpers
 .github/workflows/             PR, beta, promotion, and rollback automation
 assets/                        standalone Google Sheet sync utility
@@ -47,7 +47,7 @@ python3 -m pip install -r .github/requirements-lint.txt
 python3 -m pip install -r requirements-docs.txt
 ```
 
-Link `SpectrumFederation/`, `SpectrumFederation_CursedSurgeTracker/`, and `SpectrumFederation_RCLootCouncilCapture/` into the Retail client's `Interface/AddOns/` directory for in-game testing. Enable Lua errors while developing:
+Link `SpectrumFederation/`, `SpectrumFederation_CursedSurgeTracker/`, and `SpectrumFederation_RCLootCouncilIntegration/` into the Retail client's `Interface/AddOns/` directory for in-game testing. Enable Lua errors while developing:
 
 ```text
 /console scriptErrors 1

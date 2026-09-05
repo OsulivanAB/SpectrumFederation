@@ -27,7 +27,7 @@ Both branch-validation workflows include `README.md` and `tests/**` in their pat
 
 ## Post-merge beta release
 
-`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilCapture/**`.
+`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**`.
 
 It:
 
@@ -86,7 +86,7 @@ Deterministic range, validation, and write-safety behavior is covered by `tests/
 
 The workflow:
 
-1. determines whether `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilCapture/**` differs between `main` and `beta`;
+1. determines whether `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**` differs between `main` and `beta`;
 2. validates lint, packaging, docs, and the appropriate version format;
 3. simulates the merge, metadata changes, docs build, release packaging, and beta synchronization without pushing;
 4. merges `beta` into `main`;
@@ -159,6 +159,6 @@ When behavior changes intentionally, update the implementation and its documenta
 
 ## Version and manifest source of truth
 
-Release zips contain sibling top-level folders `SpectrumFederation/`, `SpectrumFederation_CursedSurgeTracker/`, and `SpectrumFederation_RCLootCouncilCapture/`. Extracting the archive into `Interface/AddOns` installs those addons. Packaged child TOCs must keep the same `## Interface` and `## Version` values as the parent.
+Release zips contain sibling top-level folders `SpectrumFederation/`, `SpectrumFederation_CursedSurgeTracker/`, and `SpectrumFederation_RCLootCouncilIntegration/`. Extracting the archive into `Interface/AddOns` installs those addons. Packaged child TOCs must keep the same `## Interface` and `## Version` values as the parent.
 
 README badges are generated release metadata, not the source of truth. The Interface badge is formatted from the 6-digit Interface number (the same `MMmmpp` value stored in the TOC) by adding decimals and stripping leading zeros (`120100` → `12.1.0`).

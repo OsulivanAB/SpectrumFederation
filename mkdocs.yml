@@ -92,7 +92,7 @@ nav:
     - Settings System: development/settings-ui/index.md
     - Mouse Tracer: development/mouse-tracer.md
     - Loot Helper Internals: development/loot-helper/index.md
-    - RC Loot Council Capture: development/rc-loot-council-capture.md
+    - RC Loot Council Integration: development/rc-loot-council-integration.md
     - Automation and Releases: development/automation.md
 
 plugins:

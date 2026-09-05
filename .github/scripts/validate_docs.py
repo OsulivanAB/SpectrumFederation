@@ -222,7 +222,7 @@ def validate_slash_command_reference(repo_root):
     addon_roots = [repo_root / "SpectrumFederation"]
     for child_name in (
         "SpectrumFederation_CursedSurgeTracker",
-        "SpectrumFederation_RCLootCouncilCapture",
+        "SpectrumFederation_RCLootCouncilIntegration",
     ):
         child_root = repo_root / child_name
         if child_root.exists():

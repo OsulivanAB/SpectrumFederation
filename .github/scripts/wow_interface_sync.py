@@ -380,7 +380,7 @@ def read_toc_fields(toc_path):
 
 CHILD_ADDON_NAMES = (
     "SpectrumFederation_CursedSurgeTracker",
-    "SpectrumFederation_RCLootCouncilCapture",
+    "SpectrumFederation_RCLootCouncilIntegration",
 )
 
 

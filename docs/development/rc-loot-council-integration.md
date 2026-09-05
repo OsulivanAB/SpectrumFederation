@@ -1,0 +1,76 @@
+# RC Loot Council Integration
+
+The optional child addon `SpectrumFederation_RCLootCouncilIntegration` records finalized RC Loot Council awards in Spectrum Loot Logs while a Spectrum Loot Helper session is active.
+
+It does not send RC messages, persist raw RC traffic, or keep its own SavedVariables.
+
+## When it records
+
+Recording requires all of the following:
+
+- the child addon is enabled;
+- a Spectrum Loot Helper session is active;
+- the award belongs to the active profile;
+- the local client is a Spectrum profile admin;
+- the profile's RC integration settings allow that response.
+
+The Loot Log **Author** is the RC master looter who awarded the item. The Spectrum writer must still be a profile admin. Any eligible Spectrum admin may create the log; there is no coordinator-only writer restriction.
+
+If the winner is not a member of the active profile, no Loot Log is created. Spectrum admins see a local warning only. Replay and reload do not repeat that warning for the same award in the same session.
+
+## Settings
+
+Open `/sf` → **Loot Helper → RC Loot Council**. The page appears only when this child addon is enabled. It does not add a redundant **Optional** sidebar row.
+
+Settings are profile-scoped and admin-editable:
+
+- **Record RC Loot Council Awards in Loot Logs** (default on)
+- **Record all award types** (default on)
+- **Allowed Award Types** when record-all is off
+
+Matching is case-insensitive after trimming. The original RC response text is stored on the Loot Log. Empty and duplicate allow-list entries are rejected.
+
+These settings sync with the profile snapshot as `snapshot.rcLootCouncilIntegration`, using the same profile-snapshot path as Raid Check. Changing them does not create a visible Loot Log row. Older snapshots may still carry unused `snapshot.rcLootCouncil` metadata; that field remains compatibility-only and is not the live integration.
+
+Defaults fill in for older profiles that have no stored RC configuration.
+
+## Loot Log shape
+
+Recorded awards use type `RC_LOOT_COUNCIL`:
+
+- **Type of Change** — RC Loot Council
+- **Member** — loot recipient
+- **Action** — the WoW item link (hoverable and clickable in Loot Logs)
+- **Author** — RC master looter / awarder
+- persisted audit fields include the original RC response, `history.id`, and the deterministic award key
+
+## Award identity
+
+The primary finalized RC signal is the RC `history` payload. The local master-looter path is AceEvent `RCMLLootHistorySend`. Both paths normalize the same award into the same external identity and the same deterministic Loot Log contents.
+
+Identity is derived from finalized history data available to every observer:
+
+`RCLootCouncil|<normalizedAwarder>|<history.id>|<normalizedWinner>|<itemString>|<normalizedOwner or "">`
+
+The human-readable response label is audit data only and is not part of the key. Spectrum ignores RC `delete_history`; a new `history.id` is a new Spectrum event.
+
+## Sync isolation
+
+External RC logs are kept outside the sequential `author:counter` repair system:
+
+- `_externalId` is the canonical award key
+- `_id` equals `_externalId`
+- `_counter` is the sentinel `0`
+- they do not allocate or advance ordinary author counters
+- they do not enqueue gap, integrity, `AUTH_LOGS`, or convergence repair
+- a same-id / different-fingerprint collision keeps the first stored row and does not request sequential repair
+
+Ordinary sequential Loot Logs keep their existing repair and sync behavior.
+
+Mixed-version clients that do not understand `_externalId` drop only the RC row. A snapshot is not invalidated by the presence of one RC log.
+
+## Limits
+
+- If RC has both history options off, or `reason.log` is false, there is no history object and Spectrum cannot record the award.
+- If RC history is self-only or guild-only, other Spectrum admins may not observe the remote `history` message. The master looter still has `RCMLLootHistorySend`.
+- The parent addon does nothing RC-specific when this child is absent or disabled.

@@ -1,5 +1,5 @@
 ---
-applyTo: "SpectrumFederation/**/*.lua,SpectrumFederation_CursedSurgeTracker/**/*.lua,SpectrumFederation_RCLootCouncilCapture/**/*.lua"
+applyTo: "SpectrumFederation/**/*.lua,SpectrumFederation_CursedSurgeTracker/**/*.lua,SpectrumFederation_RCLootCouncilIntegration/**/*.lua"
 ---
 
 # Lua (WoW Addon) Instructions

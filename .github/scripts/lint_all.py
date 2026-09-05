@@ -115,7 +115,7 @@ def main():
     lua_dirs = [args.addon_dir]
     for child_addon_dir in (
         "SpectrumFederation_CursedSurgeTracker",
-        "SpectrumFederation_RCLootCouncilCapture",
+        "SpectrumFederation_RCLootCouncilIntegration",
     ):
         if child_addon_dir != args.addon_dir and Path(child_addon_dir).exists():
             lua_dirs.append(child_addon_dir)

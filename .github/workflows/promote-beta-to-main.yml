@@ -32,7 +32,7 @@ jobs:
       - name: Check for addon changes
         id: changes
         run: |
-          CHANGED_FILES=$(git diff --name-only "origin/main...HEAD" -- 'SpectrumFederation/' 'SpectrumFederation_CursedSurgeTracker/' 'SpectrumFederation_RCLootCouncilCapture/')
+          CHANGED_FILES=$(git diff --name-only "origin/main...HEAD" -- 'SpectrumFederation/' 'SpectrumFederation_CursedSurgeTracker/' 'SpectrumFederation_RCLootCouncilIntegration/')
           if [[ -n "$CHANGED_FILES" ]]; then
             echo "addon_changed=true" >> "$GITHUB_OUTPUT"
             echo "Addon files changed between main and beta:"
@@ -139,10 +139,10 @@ jobs:
 
           # Explicitly use beta's CHANGELOG.md, README.md, and TOC file
           # TOC must come from beta to preserve the -beta suffix in version
-          git checkout beta -- CHANGELOG.md README.md SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
+          git checkout beta -- CHANGELOG.md README.md SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
 
           # Check for conflicts in other files
-          if git diff --name-only --diff-filter=U | grep -v -E '(CHANGELOG\.md|README\.md|SpectrumFederation\.toc|SpectrumFederation_CursedSurgeTracker\.toc|SpectrumFederation_RCLootCouncilCapture\.toc)'; then
+          if git diff --name-only --diff-filter=U | grep -v -E '(CHANGELOG\.md|README\.md|SpectrumFederation\.toc|SpectrumFederation_CursedSurgeTracker\.toc|SpectrumFederation_RCLootCouncilIntegration\.toc)'; then
             echo "::error ::Merge conflicts detected in files other than CHANGELOG.md, README.md, and .toc"
             echo "Please resolve conflicts manually and try again"
             git merge --abort
@@ -189,8 +189,8 @@ jobs:
 
           sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation/SpectrumFederation.toc
           sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc
-          sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
-          git add SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
+          sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
+          git add SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
           git commit -m "chore: update version to $STABLE_VERSION [skip ci]"
 
       - name: Query Blizzard API for live Interface version
@@ -209,8 +209,8 @@ jobs:
 
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation/SpectrumFederation.toc
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc
-          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
-          git add SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
+          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
+          git add SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
           git commit -m "chore: update Interface to $INTERFACE [skip ci]" || echo "No Interface changes"
 
       - name: Set promotion metadata
@@ -384,8 +384,8 @@ jobs:
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation/SpectrumFederation.toc
           sed -i "s/^## Version:.*$/## Version: $VERSION/" SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc
-          sed -i "s/^## Version:.*$/## Version: $VERSION/" SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
-          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
+          sed -i "s/^## Version:.*$/## Version: $VERSION/" SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
+          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -432,8 +432,8 @@ jobs:
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation/SpectrumFederation.toc
           sed -i "s/^## Version:.*$/## Version: $VERSION/" SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc
-          sed -i "s/^## Version:.*$/## Version: $VERSION/" SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
-          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
+          sed -i "s/^## Version:.*$/## Version: $VERSION/" SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
+          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -620,10 +620,10 @@ jobs:
 
           # Explicitly use beta's CHANGELOG.md, README.md, and TOC file
           # TOC must come from beta to preserve the -beta suffix in version
-          git checkout beta -- CHANGELOG.md README.md SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
+          git checkout beta -- CHANGELOG.md README.md SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
 
           # Check for conflicts in other files
-          if git diff --name-only --diff-filter=U | grep -v -E '(CHANGELOG\.md|README\.md|SpectrumFederation\.toc|SpectrumFederation_CursedSurgeTracker\.toc|SpectrumFederation_RCLootCouncilCapture\.toc)'; then
+          if git diff --name-only --diff-filter=U | grep -v -E '(CHANGELOG\.md|README\.md|SpectrumFederation\.toc|SpectrumFederation_CursedSurgeTracker\.toc|SpectrumFederation_RCLootCouncilIntegration\.toc)'; then
             echo "::error ::Merge conflicts detected in files other than CHANGELOG.md, README.md, and .toc"
             echo "Please resolve conflicts manually and try again"
             git merge --abort
@@ -670,8 +670,8 @@ jobs:
 
           sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation/SpectrumFederation.toc
           sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc
-          sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
-          git add SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
+          sed -i "s/^## Version:.*$/## Version: $STABLE_VERSION/" SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
+          git add SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
           git commit -m "chore: update version to $STABLE_VERSION [skip ci]"
 
       - name: Query Blizzard API for live Interface version
@@ -690,8 +690,8 @@ jobs:
 
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation/SpectrumFederation.toc
           sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc
-          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
-          git add SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilCapture/SpectrumFederation_RCLootCouncilCapture.toc
+          sed -i "s/^## Interface:.*$/## Interface: $INTERFACE/" SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
+          git add SpectrumFederation/SpectrumFederation.toc SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc
           git commit -m "chore: update Interface to $INTERFACE [skip ci]" || echo "No Interface changes"
 
       - name: Set promotion metadata

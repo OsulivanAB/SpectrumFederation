@@ -1,6 +1,6 @@
 ---
 description: WoW addon runtime constraints and common implementation paths
-globs: "SpectrumFederation/**,SpectrumFederation_CursedSurgeTracker/**,SpectrumFederation_RCLootCouncilCapture/**"
+globs: "SpectrumFederation/**,SpectrumFederation_CursedSurgeTracker/**,SpectrumFederation_RCLootCouncilIntegration/**"
 alwaysApply: false
 ---
 

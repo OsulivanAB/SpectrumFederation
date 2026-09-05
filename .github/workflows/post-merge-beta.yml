@@ -7,7 +7,7 @@ on:
     paths:
       - 'SpectrumFederation/**'
       - 'SpectrumFederation_CursedSurgeTracker/**'
-      - 'SpectrumFederation_RCLootCouncilCapture/**'
+      - 'SpectrumFederation_RCLootCouncilIntegration/**'
 
 concurrency:
   group: beta-release

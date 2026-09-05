@@ -17,7 +17,7 @@ from pathlib import Path
 
 CHILD_ADDON_NAMES = (
     "SpectrumFederation_CursedSurgeTracker",
-    "SpectrumFederation_RCLootCouncilCapture",
+    "SpectrumFederation_RCLootCouncilIntegration",
 )
 ZIP_EXCLUDES = ["*.git*", "*/AGENTS.md"]
 

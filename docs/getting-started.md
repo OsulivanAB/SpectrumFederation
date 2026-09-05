@@ -4,7 +4,7 @@
 
 Install **Spectrum Federation** with the CurseForge client, WowUp, or a release archive from [GitHub Releases](https://github.com/OsulivanAB/SpectrumFederation/releases).
 
-For a manual installation, extract the archive and place the `SpectrumFederation`, `SpectrumFederation_CursedSurgeTracker`, and `SpectrumFederation_RCLootCouncilCapture` folders in the Retail AddOns directory:
+For a manual installation, extract the archive and place the `SpectrumFederation`, `SpectrumFederation_CursedSurgeTracker`, and `SpectrumFederation_RCLootCouncilIntegration` folders in the Retail AddOns directory:
 
 - Windows: `World of Warcraft\_retail_\Interface\AddOns\`
 - macOS: `World of Warcraft/_retail_/Interface/AddOns/`

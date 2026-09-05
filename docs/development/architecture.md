@@ -102,6 +102,6 @@ These are internal project APIs, not stable third-party compatibility guarantees
 
 ## Child addons
 
-`SpectrumFederation_CursedSurgeTracker` and the temporary `SpectrumFederation_RCLootCouncilCapture` child addon are sibling addon folders packaged in the same release zip. Each declares `## Dependencies: SpectrumFederation`, `## Group: SpectrumFederation`, and `## X-SpectrumFederation-Parent: SpectrumFederation` so WoW nests them under the parent in the AddOns list and the parent Settings UI can discover them. See [RC Loot Council Capture](rc-loot-council-capture.md) for the diagnostic logger.
+`SpectrumFederation_CursedSurgeTracker` and `SpectrumFederation_RCLootCouncilIntegration` are sibling addon folders packaged in the same release zip. Each declares `## Dependencies: SpectrumFederation`, `## Group: SpectrumFederation`, and `## X-SpectrumFederation-Parent: SpectrumFederation` so WoW nests them under the parent in the AddOns list and the parent Settings UI can discover them. The RC child also sets `## X-SpectrumFederation-Settings-Host: lootHelper` so it registers under Loot Helper instead of creating an Optional sidebar row. See [RC Loot Council Integration](rc-loot-council-integration.md).
 
 The parent does not load child Lua/XML and does not depend on the child. Discovery uses TOC metadata only. Optional children may read `_G.SpectrumFederation` for Debug, slash registration, and `SF:Now()`. The assignment is made in `modules/Init.lua` so the parent remains fully usable when no child is present.

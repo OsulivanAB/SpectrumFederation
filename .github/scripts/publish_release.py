@@ -130,7 +130,7 @@ def create_addon_zip(addon_name, version):
     zip_entries = [addon_name]
     for child_addon_name in (
         "SpectrumFederation_CursedSurgeTracker",
-        "SpectrumFederation_RCLootCouncilCapture",
+        "SpectrumFederation_RCLootCouncilIntegration",
     ):
         if Path(child_addon_name).exists() and child_addon_name != addon_name:
             zip_entries.append(child_addon_name)

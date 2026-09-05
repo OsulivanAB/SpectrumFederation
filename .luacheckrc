@@ -4,7 +4,6 @@ globals = {
   "SpectrumFederationCSTPinMixin",
   "SLASH_SPECTRUMFEDERATIONCST1",
   "SLASH_SPECTRUMFEDERATIONCST2",
-  "SpectrumFederationRCLootCouncilCaptureDB",
 }
 read_globals = {
   "CreateFrame",
