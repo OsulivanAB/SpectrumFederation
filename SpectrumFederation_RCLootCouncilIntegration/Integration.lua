@@ -18,7 +18,6 @@ Integration.DEBUG_CATEGORY = "RCLC_INTEGRATION"
 local initialized = false
 local pageRegistered = false
 local hooksInstalled = false
-local rcMessageRegistered = false
 local settingsPanel = nil
 local seenAwardKeys = {}
 local warnedAwardKeys = {}
@@ -26,6 +25,12 @@ local warnedAwardKeys = {}
 local commReceiver = {
     _registered = false,
     _embedded = false,
+}
+
+local messageReceiver = {
+    _registered = false,
+    _embedded = false,
+    _fallbackOnRC = false,
 }
 
 local SESSION_HOOKS = {
@@ -135,9 +140,90 @@ function Integration.ResolveLibraries(libStub)
     return libs
 end
 
+function Integration.NormalizeRCPlayerId(player)
+    if type(player) == "table" then
+        local name
+        if type(player.GetName) == "function" then
+            name = player:GetName()
+        elseif type(player.GetFullName) == "function" then
+            name = player:GetFullName()
+        else
+            name = player.name
+        end
+        player = name
+    end
+    local SF = ParentAddon()
+    if SF and SF.LootLog and SF.LootLog.NormalizePlayerId then
+        return SF.LootLog.NormalizePlayerId(player)
+    end
+    if type(player) == "string" and player ~= "" then
+        return player
+    end
+    return nil
+end
+
+function Integration.SamePlayer(a, b)
+    local SF = ParentAddon()
+    if SF and SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b) == true
+    end
+    local left = Integration.NormalizeRCPlayerId(a)
+    local right = Integration.NormalizeRCPlayerId(b)
+    return left and right and string.lower(left) == string.lower(right)
+end
+
+function Integration.GetCurrentRCMasterLooter()
+    local rc = _G.RCLootCouncil
+    if type(rc) ~= "table" then
+        return nil
+    end
+
+    -- Prefer the live ML RC already resolved for this client/session.
+    local cached = Integration.NormalizeRCPlayerId(rc.masterLooter)
+    if cached then
+        return cached
+    end
+
+    -- Public API: GetML() -> isLocalML, ml (Player or name).
+    if type(rc.GetML) == "function" then
+        local ok, first, second = pcall(rc.GetML, rc)
+        if ok then
+            local ml = second
+            if ml == nil and first ~= nil and first ~= true and first ~= false then
+                ml = first
+            end
+            local normalized = Integration.NormalizeRCPlayerId(ml)
+            if normalized then
+                return normalized
+            end
+        end
+    end
+    return nil
+end
+
+function Integration.SenderIsCurrentMasterLooter(sender)
+    if type(sender) ~= "string" or sender == "" then
+        return false
+    end
+    local current = Integration.GetCurrentRCMasterLooter()
+    if current and Integration.SamePlayer(sender, current) then
+        return true
+    end
+    local rc = _G.RCLootCouncil
+    if rc and type(rc.IsMasterLooter) == "function" then
+        local ok, isML = pcall(rc.IsMasterLooter, rc, sender)
+        if ok and isML == true then
+            return true
+        end
+    end
+    return false
+end
+
 -- Decode RC MAIN prefix traffic enough to recover ("history", winner, historyTable).
--- Mirrors RCLootCouncil2 Services/Comms.lua ReceiveComm without persisting raw bytes.
-function Integration.DecodeHistoryPayload(raw, libs)
+-- Mirrors current RCLootCouncil2 Services/Comms.lua: Serialize(command, data)
+-- where data is the argument table, and xrealm is command="xrealm",
+-- data = { target, innerCommand, ...innerArgs }.
+function Integration.DecodeHistoryPayload(raw, libs, opts)
     local result = {
         ok = false,
         command = nil,
@@ -148,6 +234,7 @@ function Integration.DecodeHistoryPayload(raw, libs)
         return result
     end
 
+    opts = type(opts) == "table" and opts or {}
     libs = libs or Integration.ResolveLibraries()
     local ld = libs.LibDeflate
     local serializer = libs.AceSerializer
@@ -164,21 +251,38 @@ function Integration.DecodeHistoryPayload(raw, libs)
         return result
     end
 
+    -- RCLootCouncil2 Comms.EncodeData serializes exactly (command, dataTable).
+    -- Deserialize therefore returns true, command, data — never a flattened
+    -- vararg list of command arguments.
     local command = unpacked[2]
-    local winner = unpacked[3]
-    local history = unpacked[4]
-    if command == "xrealm" and type(winner) == "table" then
-        local inner = winner
-        command = inner[2]
-        winner = inner[3]
-        history = inner[4]
+    local data = unpacked[3]
+    if type(data) ~= "table" then
+        result.command = command
+        return result
+    end
+
+    if command == "xrealm" then
+        -- ReceiveComm: target = tremove(data, 1); if target is local player then
+        -- command = tremove(data, 1); remaining data is the original args table.
+        local target = data[1]
+        local localPlayer = opts.localPlayer or GetLocalPlayerId()
+        if not Integration.SamePlayer(target, localPlayer) then
+            result.command = "xrealm"
+            return result
+        end
+        command = data[2]
+        local inner = {}
+        for i = 3, #data do
+            inner[#inner + 1] = data[i]
+        end
+        data = inner
     end
 
     result.command = command
-    if command == "history" and type(winner) == "string" and type(history) == "table" then
+    result.winner = data[1]
+    result.history = data[2]
+    if command == "history" and type(result.winner) == "string" and type(result.history) == "table" then
         result.ok = true
-        result.winner = winner
-        result.history = history
     end
     return result
 end
@@ -219,12 +323,13 @@ function Integration.WarnNonMember(canonical)
     if not IsEffectiveAdmin(profile) then
         return false
     end
+    local message = string.format(
+        "%s was awarded to %s, who is not a member of the active profile. No Loot Log was recorded.",
+        tostring(canonical.itemLink or "[item]"),
+        tostring(canonical.winner or "Unknown")
+    )
     if SF and SF.PrintWarning then
-        SF:PrintWarning(string.format(
-            "Spectrum Federation: %s was awarded to %s, who is not a member of the active profile. No Loot Log was recorded.",
-            tostring(canonical.itemLink or "[item]"),
-            tostring(canonical.winner or "Unknown")
-        ))
+        SF:PrintWarning(message)
         return true
     end
     return false
@@ -289,6 +394,10 @@ function Integration.HandleIncomingMessage(prefix, message, _distribution, sende
     if not decoded.ok then
         return "ignored"
     end
+    if not Integration.SenderIsCurrentMasterLooter(sender) then
+        DebugInfo("Ignoring RC history from non-ML sender %s", tostring(sender))
+        return "not_ml"
+    end
     return Integration.HandleHistory(sender, decoded.winner, decoded.history, "acecomm")
 end
 
@@ -335,19 +444,64 @@ function Integration.IsListenerRegistered()
     return commReceiver._registered == true
 end
 
+local function HandleLocalHistoryMessage(_, history, winner)
+    Integration.HandleLocalHistory(history, winner)
+end
+
 function Integration.RegisterRCMessages()
-    if rcMessageRegistered then
+    if messageReceiver._registered then
         return false
     end
+
+    local aceEvent
+    local libStub = _G.LibStub
+    if type(libStub) == "function" or type(libStub) == "table" then
+        local ok, lib = pcall(libStub, "AceEvent-3.0", true)
+        if ok then
+            aceEvent = lib
+        end
+    end
+    if aceEvent and aceEvent.Embed then
+        if not messageReceiver._embedded then
+            aceEvent:Embed(messageReceiver)
+            messageReceiver._embedded = true
+        end
+        if messageReceiver.RegisterMessage then
+            messageReceiver:RegisterMessage("RCMLLootHistorySend", HandleLocalHistoryMessage)
+            messageReceiver._registered = true
+            messageReceiver._fallbackOnRC = false
+            return true
+        end
+    end
+
+    -- Fallback: subscribe on the RC addon object. Do not later UnregisterMessage
+    -- there; that can drop other subscribers on the same embed.
     local rc = _G.RCLootCouncil
     if not (rc and rc.RegisterMessage) then
         return false
     end
-    rc:RegisterMessage("RCMLLootHistorySend", function(_, history, winner)
-        Integration.HandleLocalHistory(history, winner)
-    end)
-    rcMessageRegistered = true
+    rc:RegisterMessage("RCMLLootHistorySend", HandleLocalHistoryMessage)
+    messageReceiver._registered = true
+    messageReceiver._fallbackOnRC = true
     return true
+end
+
+function Integration.UnregisterRCMessages()
+    if not messageReceiver._registered then
+        return false
+    end
+    if messageReceiver._fallbackOnRC then
+        return false
+    end
+    if messageReceiver.UnregisterMessage then
+        messageReceiver:UnregisterMessage("RCMLLootHistorySend")
+    end
+    messageReceiver._registered = false
+    return true
+end
+
+function Integration.AreRCMessagesRegistered()
+    return messageReceiver._registered == true
 end
 
 function Integration.ReconcileListener(reason)
@@ -357,6 +511,7 @@ function Integration.ReconcileListener(reason)
         return "active"
     end
     Integration.UnregisterListener()
+    Integration.UnregisterRCMessages()
     Integration.ClearSessionMemory()
     return "inactive"
 end
@@ -581,7 +736,6 @@ function Integration.Init(reason)
     initialized = true
     Integration.RegisterSettingsPage()
     Integration.InstallSessionHooks()
-    Integration.RegisterRCMessages()
     Integration.ReconcileListener(reason or "Init")
     DebugInfo("RC Loot Council Integration initialized")
     return true
@@ -601,12 +755,11 @@ local function EnsureEventFrame()
             if loadedName == Integration.ADDON_NAME then
                 Integration.Init("ADDON_LOADED")
             elseif loadedName == "RCLootCouncil" or loadedName == "RCLootCouncil2" then
-                Integration.RegisterRCMessages()
+                Integration.ReconcileListener(loadedName)
             end
         elseif event == "PLAYER_LOGIN" then
             Integration.InstallSessionHooks()
             Integration.RegisterSettingsPage()
-            Integration.RegisterRCMessages()
             Integration.ReconcileListener("PLAYER_LOGIN")
         end
     end)

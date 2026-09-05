@@ -773,6 +773,39 @@ UI:RefreshSubAddonEnablement({
 })
 assertEq(notified, unchangedNotified, "identical enablement refresh does not notify")
 
+UI:DiscoverSubAddons("SpectrumFederation", {
+    GetNumAddOns = function()
+        return 2
+    end,
+    GetAddOnName = function(index)
+        return ({
+            "SpectrumFederation",
+            "SpectrumFederation_UnknownHostChild",
+        })[index]
+    end,
+    GetAddOnMetadata = function(name, key)
+        if name == "SpectrumFederation_UnknownHostChild" then
+            if key == "Title" then
+                return "Spectrum Federation: Unknown Host Child"
+            end
+            if key == "X-SpectrumFederation-Parent" then
+                return "SpectrumFederation"
+            end
+            if key == "X-SpectrumFederation-Settings-Host" then
+                return "doesNotExist"
+            end
+        end
+        return nil
+    end,
+})
+local unknownHost = UI:GetCategory("SpectrumFederation_UnknownHostChild")
+assertTrue(unknownHost ~= nil, "unknown Settings-Host metadata still creates the Optional fallback category")
+assertEq(unknownHost.group, "Optional", "unknown host remains in the Optional group")
+assertTrue(
+    UI:GetCategory("SpectrumFederation_RCLootCouncilIntegration") == nil,
+    "valid lootHelper host still does not create an Optional RC category"
+)
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

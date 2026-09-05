@@ -461,6 +461,33 @@ function LootLog.new(eventType, eventData, opts)
     local externalId = opts.externalId
     local isExternal = type(externalId) == "string" and externalId ~= ""
 
+    -- External IDs are a narrow RC_LOOT_COUNCIL audit exception.
+    if isExternal then
+        if eventType ~= EVENT_TYPES.RC_LOOT_COUNCIL then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "externalId is only valid for RC_LOOT_COUNCIL")
+            end
+            return nil
+        end
+        if type(eventData.awardKey) ~= "string" or eventData.awardKey == "" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "RC external logs require data.awardKey")
+            end
+            return nil
+        end
+        if externalId ~= eventData.awardKey then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "RC externalId must match data.awardKey")
+            end
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "RC_LOOT_COUNCIL logs require an externalId")
+        end
+        return nil
+    end
+
     -- Counter allocation: must be per-profile per-author to avoid collisions.
     -- External RC awards use sentinel counter 0 and never allocate a sequence.
     local counter = opts.counter
@@ -706,15 +733,32 @@ function LootLog.ValidateTable(t, opts)
     if type(t._id) ~= "string" or t._id == "" then return false, "log._id must be a non-empty string" end
     if type(t._timestamp) ~= "number" then return false, "log._timestamp must be a number" end
     if type(t._author) ~= "string" or t._author == "" then return false, "log._author must be a non-empty string" end
+    if type(t._eventType) ~= "string" or t._eventType == "" then
+        return false, "log._eventType must be a non-empty string"
+    end
+    if type(t._data) ~= "table" then return false, "log._data must be a table" end
+
     local isExternal = LootLog.IsExternalLogTable(t)
     if isExternal then
+        if t._eventType ~= EVENT_TYPES.RC_LOOT_COUNCIL then
+            return false, "external logs are only valid for RC_LOOT_COUNCIL"
+        end
         if t._id ~= t._externalId then
             return false, "log._id must match _externalId"
         end
         if type(t._counter) ~= "number" or t._counter ~= 0 then
             return false, "external log._counter must be 0"
         end
+        if type(t._data.awardKey) ~= "string" or t._data.awardKey == "" then
+            return false, "RC external log requires data.awardKey"
+        end
+        if t._externalId ~= t._data.awardKey then
+            return false, "log._externalId must match data.awardKey"
+        end
     else
+        if t._eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+            return false, "RC_LOOT_COUNCIL logs must use an external id"
+        end
         if type(t._counter) ~= "number" or t._counter < 1 or t._counter ~= math.floor(t._counter) then
             return false, "log._counter must be a positive integer"
         end
@@ -723,10 +767,6 @@ function LootLog.ValidateTable(t, opts)
             return false, ("log._id mismatch (expected %s, got %s)"):format(expectedId, tostring(t._id))
         end
     end
-    if type(t._eventType) ~= "string" or t._eventType == "" then
-        return false, "log._eventType must be a non-empty string"
-    end
-    if type(t._data) ~= "table" then return false, "log._data must be a table" end
 
     local computedFingerprint = ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, t._data)
     if t._fingerprint ~= nil then

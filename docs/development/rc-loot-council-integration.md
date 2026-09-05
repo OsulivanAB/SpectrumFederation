@@ -46,7 +46,9 @@ Recorded awards use type `RC_LOOT_COUNCIL`:
 
 ## Award identity
 
-The primary finalized RC signal is the RC `history` payload. The local master-looter path is AceEvent `RCMLLootHistorySend`. Both paths normalize the same award into the same external identity and the same deterministic Loot Log contents.
+The primary finalized RC signal is the RC `history` payload. RCLootCouncil2 serializes `command` plus one `data` table (`Serialize(command, data)`). For `Send(..., "history", winner, history_table)` that is `command = "history"` and `data = { winner, history_table }`. Cross-realm wraps that as `command = "xrealm"` and `data = { target, "history", winner, history_table }`; Spectrum unwraps the inner command only when the target is the local player.
+
+Remote `history` is accepted only when the AceComm sender is the current RC master looter for this client (`masterLooter` / `GetML()` / `IsMasterLooter()`). Unrelated guild `history` from another RC raid is ignored. The local master-looter path is AceEvent `RCMLLootHistorySend` and does not re-check the sender, because RC fires that message only on the ML client. Both paths normalize the same award into the same external identity and the same deterministic Loot Log contents.
 
 Identity is derived from finalized history data available to every observer:
 
@@ -56,11 +58,14 @@ The human-readable response label is audit data only and is not part of the key.
 
 ## Sync isolation
 
-External RC logs are kept outside the sequential `author:counter` repair system:
+External IDs and sentinel counter `0` are a narrow `RC_LOOT_COUNCIL` exception. Ordinary event types must keep `_id == author:counter` with a positive sequential counter and must not carry `_externalId`.
+
+Valid RC external rows require all of:
 
 - `_externalId` is the canonical award key
 - `_id` equals `_externalId`
 - `_counter` is the sentinel `0`
+- `_data.awardKey` is present and equals `_externalId`
 - they do not allocate or advance ordinary author counters
 - they do not enqueue gap, integrity, `AUTH_LOGS`, or convergence repair
 - a same-id / different-fingerprint collision keeps the first stored row and does not request sequential repair

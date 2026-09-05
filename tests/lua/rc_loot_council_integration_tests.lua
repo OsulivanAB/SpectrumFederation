@@ -392,7 +392,95 @@ end
 oldClientShape._externalId = nil
 local oldOk, oldErr = SF.LootLog.ValidateTable(oldClientShape)
 assertFalse(oldOk, "old clients without _externalId reject counter-0 logs")
-assertTrue(type(oldErr) == "string" and oldErr:find("positive integer", 1, true) ~= nil, "old-client rejection names the sequential counter rule")
+assertTrue(type(oldErr) == "string" and oldErr:find("external id", 1, true) ~= nil, "RC rows without _externalId are rejected")
+
+local ordinary = SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = WINNER,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+}, {
+    author = PLAYER,
+    counter = 2,
+    skipPermission = true,
+})
+assertTrue(ordinary ~= nil, "ordinary sequential logs still create")
+assertEq(SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = WINNER,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+}, {
+    author = PLAYER,
+    externalId = expectedKey,
+    skipPermission = true,
+}), nil, "ordinary event + externalId is rejected")
+assertEq(SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = WINNER,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+}, {
+    author = PLAYER,
+    counter = 0,
+    skipPermission = true,
+}), nil, "ordinary event + counter 0 is rejected")
+
+local ordinaryWire = ordinary:ToTable()
+ordinaryWire._externalId = expectedKey
+ordinaryWire._id = expectedKey
+ordinaryWire._counter = 0
+ordinaryWire._fingerprint = nil
+assertFalse(select(1, SF.LootLog.ValidateTable(ordinaryWire)), "ordinary wire table cannot use an external id")
+
+local zeroCounter = ordinary:ToTable()
+zeroCounter._counter = 0
+zeroCounter._id = PLAYER .. ":0"
+zeroCounter._fingerprint = nil
+assertFalse(select(1, SF.LootLog.ValidateTable(zeroCounter)), "ordinary wire table cannot use counter 0")
+
+local mismatchId = {}
+for key, value in pairs(wire) do
+    mismatchId[key] = value
+end
+mismatchId._id = "RCLootCouncil|other"
+mismatchId._fingerprint = nil
+assertFalse(select(1, SF.LootLog.ValidateTable(mismatchId)), "RC row with mismatched _id is rejected")
+
+local mismatchKey = {}
+for key, value in pairs(wire) do
+    mismatchKey[key] = value
+end
+mismatchKey._data = {}
+for key, value in pairs(wire._data) do
+    mismatchKey._data[key] = value
+end
+mismatchKey._data.awardKey = "RCLootCouncil|other"
+mismatchKey._fingerprint = nil
+assertFalse(select(1, SF.LootLog.ValidateTable(mismatchKey)), "RC row with mismatched data.awardKey is rejected")
+
+local mismatchExternal = {}
+for key, value in pairs(wire) do
+    mismatchExternal[key] = value
+end
+mismatchExternal._externalId = "RCLootCouncil|other"
+mismatchExternal._fingerprint = nil
+assertFalse(select(1, SF.LootLog.ValidateTable(mismatchExternal)), "RC row with mismatched _externalId is rejected")
+
+for _, eventType in ipairs({
+    SF.LootLogEventTypes.POINT_CHANGE,
+    SF.LootLogEventTypes.ARMOR_CHANGE,
+    SF.LootLogEventTypes.ADMIN_ADDED,
+    SF.LootLogEventTypes.ROLE_CHANGE,
+    SF.LootLogEventTypes.LOOT_MODE_CHANGE,
+    SF.LootLogEventTypes.REWARD_POT_CHANGE,
+    SF.LootLogEventTypes.ATTENDANCE_CHANGE,
+}) do
+    local ordinaryExternal = ordinary:ToTable()
+    ordinaryExternal._eventType = eventType
+    ordinaryExternal._externalId = expectedKey
+    ordinaryExternal._id = expectedKey
+    ordinaryExternal._counter = 0
+    ordinaryExternal._fingerprint = nil
+    assertFalse(
+        select(1, SF.LootLog.ValidateTable(ordinaryExternal)),
+        eventType .. " cannot use a counter-zero external representation"
+    )
+end
 
 assertFalse(select(1, profile:TryAddRCLootCouncilAward(localCanonical)), "replay of the same award is a duplicate")
 assertEq(countRCLogs(profile), 1, "replay does not duplicate the RC log")
@@ -688,6 +776,8 @@ assertEq(countRCLogs(profile), 1, "non-member award does not create a log")
 assertEq(#printed, 1, "admin receives exactly one local warning")
 assertTrue(printed[1][2]:find("not a member of the active profile", 1, true) ~= nil, "warning names the missing-member reason")
 assertTrue(printed[1][2]:find("Stranger-Garona", 1, true) ~= nil, "warning names the recipient")
+assertTrue(printed[1][2]:find("Spectrum Federation:", 1, true) == nil, "warning payload does not include a doubled Spectrum prefix")
+assertTrue(printed[1][2]:find(ITEM_LINK, 1, true) ~= nil, "warning preserves the real item link")
 assertEq(Integration.HandleHistory(AWARDER, "Stranger-Garona", historyTable({ id = "1700000600-6" }), "acecomm"), "seen", "replay does not warn again")
 assertEq(#printed, 1, "replay of a non-member award does not spam the warning")
 
@@ -698,37 +788,125 @@ assertEq(Integration.HandleHistory(AWARDER, "Stranger-Garona", historyTable({ id
 assertEq(#printed, 0, "non-admins do not receive the local outsider warning")
 PLAYER = "Tester-Garona"
 
-local libs = {
-    LibDeflate = {
-        DecodeForWoWAddonChannel = function(_self, raw)
-            return raw
-        end,
-        DecompressDeflate = function(_self, bytes)
-            return bytes
-        end,
-    },
-    AceSerializer = {
-        Deserialize = function(_self)
-            return true, "history", WINNER, historyTable()
-        end,
-    },
-}
+local function passthroughLibs(deserialize)
+    return {
+        LibDeflate = {
+            DecodeForWoWAddonChannel = function(_self, raw)
+                return raw
+            end,
+            DecompressDeflate = function(_self, bytes)
+                return bytes
+            end,
+        },
+        AceSerializer = {
+            Deserialize = deserialize,
+        },
+    }
+end
+
+local realHistory = historyTable()
+local libs = passthroughLibs(function(_self)
+    return true, "history", { WINNER, realHistory }
+end)
 local decoded = Integration.DecodeHistoryPayload("payload", libs)
-assertTrue(decoded.ok, "history payloads decode to a winner and history table")
+assertTrue(decoded.ok, "real-shape history decodes winner/history correctly")
 assertEq(decoded.winner, WINNER, "decoded winner is preserved")
 assertEq(decoded.history.id, HISTORY_ID, "decoded history id is preserved")
 
-libs.AceSerializer.Deserialize = function(_self)
-    return true, "xrealm", { "unused", "history", WINNER, historyTable() }
-end
-local xrealm = Integration.DecodeHistoryPayload("payload", libs)
-assertTrue(xrealm.ok, "xrealm envelopes unwrap to the inner history command")
+libs = passthroughLibs(function(_self)
+    return true, "xrealm", { PLAYER, "history", WINNER, realHistory }
+end)
+local xrealm = Integration.DecodeHistoryPayload("payload", libs, { localPlayer = PLAYER })
+assertTrue(xrealm.ok, "xrealm addressed to the local player decodes correctly")
 assertEq(xrealm.winner, WINNER, "xrealm winner is the inner winner")
 
-libs.AceSerializer.Deserialize = function(_self)
-    return true, "awarded", WINNER
+libs = passthroughLibs(function(_self)
+    return true, "xrealm", { "Other-Garona", "history", WINNER, realHistory }
+end)
+local foreign = Integration.DecodeHistoryPayload("payload", libs, { localPlayer = PLAYER })
+assertFalse(foreign.ok, "xrealm addressed to another player is ignored")
+assertEq(foreign.command, "xrealm", "foreign xrealm keeps the outer command")
+
+libs = passthroughLibs(function(_self)
+    return false, "deserialize failed"
+end)
+assertFalse(Integration.DecodeHistoryPayload("payload", libs).ok, "malformed decode is ignored")
+assertFalse(Integration.DecodeHistoryPayload(nil, libs).ok, "non-string payload is ignored")
+
+libs = passthroughLibs(function(_self)
+    return true, "awarded", { WINNER }
+end)
+assertFalse(Integration.DecodeHistoryPayload("payload", libs).ok, "unrelated awarded command remains ignored")
+
+libs = passthroughLibs(function(_self)
+    return true, "history", WINNER, realHistory
+end)
+assertFalse(Integration.DecodeHistoryPayload("payload", libs).ok, "flattened AceSerializer history shape is ignored")
+
+_G.RCLootCouncil = {
+    masterLooter = AWARDER,
+    GetML = function()
+        return false, AWARDER
+    end,
+    IsMasterLooter = function(_, unit)
+        return SF.NameUtil.SamePlayer(unit, AWARDER)
+    end,
+}
+assertTrue(Integration.SenderIsCurrentMasterLooter(AWARDER), "current RC ML group sender is accepted")
+assertFalse(Integration.SenderIsCurrentMasterLooter("Other-Garona"), "non-ML group sender is rejected")
+assertFalse(Integration.SenderIsCurrentMasterLooter("Guildie-OtherRealm"), "unrelated guild history sender is rejected")
+
+function Integration.ResolveLibraries()
+    return passthroughLibs(function(_self)
+        return true, "history", { WINNER, historyTable({ id = "1700000900-9" }) }
+    end)
 end
-assertFalse(Integration.DecodeHistoryPayload("payload", libs).ok, "awarded-only traffic is ignored")
+Sync.state.active = true
+function Sync:IsSessionActive()
+    return true
+end
+Integration.ClearSessionMemory()
+assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", AWARDER), "recorded", "remote history from the current ML is recorded")
+assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", "Other-Garona"), "not_ml", "remote history from a non-ML is rejected")
+assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "GUILD", "Guildie-OtherRealm"), "not_ml", "guild-distributed history from a non-ML is rejected")
+
+local localHistory = historyTable({ id = "1700000900-9" })
+local remoteCanonical = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, localHistory)
+PLAYER = AWARDER
+local localResult = Integration.HandleLocalHistory(localHistory, WINNER)
+PLAYER = "Tester-Garona"
+assertEq(localResult, "seen", "local RCMLLootHistorySend of the same award is accepted then deduped")
+assertEq(remoteCanonical.awardKey, SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, localHistory).awardKey, "accepted local and remote observations share the same award key")
+assertEq(countRCLogs(profile), 2, "the ML-authorized remote award created exactly one additional RC log")
+
+local localOnlyHistory = historyTable({ id = "1700001000-10" })
+local localOnlyKey = SF.LootLog.BuildRCLootCouncilCanonical(PLAYER, WINNER, localOnlyHistory).awardKey
+_G.RCLootCouncil = {
+    masterLooter = PLAYER,
+    GetML = function()
+        return true, PLAYER
+    end,
+    IsMasterLooter = function(_, unit)
+        return SF.NameUtil.SamePlayer(unit, PLAYER)
+    end,
+}
+Integration.ClearSessionMemory()
+assertEq(Integration.HandleLocalHistory(localOnlyHistory, WINNER), "recorded", "local RCMLLootHistorySend is accepted")
+local storedLocalId = nil
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.RC_LOOT_COUNCIL and log:GetEventData().rcAwardId == "1700001000-10" then
+        storedLocalId = log:GetID()
+    end
+end
+assertEq(storedLocalId, localOnlyKey, "local RCMLLootHistorySend stores the same deterministic award key")
+function Integration.ResolveLibraries()
+    return passthroughLibs(function(_self)
+        return true, "history", { WINNER, historyTable({ id = "1700001000-10" }) }
+    end)
+end
+Integration.ClearSessionMemory()
+assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", PLAYER), "duplicate", "remote observation of the same local award converges without a second log")
+assertEq(countRCLogs(profile), 3, "local and remote observations of the same award share one stored row")
 
 local registeredPages = {}
 SF.SettingsUI = {

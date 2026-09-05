@@ -210,8 +210,11 @@ function UI:DiscoverSubAddons(parentAddonName, api)
 
     for _, child in ipairs(children) do
         -- Hosted children register pages into an existing category and must
-        -- not create a redundant Optional sidebar row.
-        if type(child.settingsHost) ~= "string" or child.settingsHost == "" then
+        -- not create a redundant Optional sidebar row. Unknown hosts keep the
+        -- fallback child category so a typo cannot hide the addon entirely.
+        local hostId = child.settingsHost
+        local hostExists = type(hostId) == "string" and hostId ~= "" and self.categoriesById[hostId] ~= nil
+        if not hostExists then
             local categoryId = child.addonName
             local existing = self.categoriesById[categoryId]
             if not existing then
