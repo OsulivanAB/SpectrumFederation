@@ -2,6 +2,7 @@
 Validates that PR descriptions follow the required template format.
 """
 
+import fnmatch
 import os
 import re
 import subprocess
@@ -17,11 +18,15 @@ IN_GAME_CHECKLIST_PHRASES = (
     IN_GAME_TESTED_PHRASE,
     IN_GAME_NA_PHRASE,
 )
-ADDON_RUNTIME_ROOTS = (
+PACKAGED_ADDON_ROOTS = (
     "SpectrumFederation/",
     "SpectrumFederation_CursedSurgeTracker/",
 )
-ADDON_RUNTIME_SUFFIXES = (".lua", ".xml")
+# Keep in sync with validate_packaging.ZIP_EXCLUDES and publish_release zip -x.
+NON_PACKAGED_ADDON_GLOBS = (
+    "*.git*",
+    "*/AGENTS.md",
+)
 SAFE_TOC_FIELDS = frozenset(
     {
         "version",
@@ -117,25 +122,44 @@ def _normalize_repo_path(path):
     return str(path or "").replace("\\", "/").lstrip("./")
 
 
-def is_addon_runtime_path(path):
-    """Return True for packaged addon Lua/XML that players load in-game."""
+def _is_under_packaged_addon_root(path):
+    """Return True when path is inside a sibling addon folder that the zip includes."""
     normalized = _normalize_repo_path(path)
-    if not any(normalized.startswith(root) for root in ADDON_RUNTIME_ROOTS):
+    for root in PACKAGED_ADDON_ROOTS:
+        prefix = root.rstrip("/")
+        if normalized == prefix or normalized.startswith(f"{prefix}/"):
+            return True
+    return False
+
+
+def is_explicitly_non_runtime_packaged_exception(path):
+    """Return True for addon-tree files that zip -x demonstrably excludes."""
+    normalized = _normalize_repo_path(path)
+    if not _is_under_packaged_addon_root(normalized):
         return False
-    return normalized.lower().endswith(ADDON_RUNTIME_SUFFIXES)
+    return any(fnmatch.fnmatch(normalized, pattern) for pattern in NON_PACKAGED_ADDON_GLOBS)
+
+
+def is_packaged_addon_path(path):
+    """Return True for a file that ships in the addon release zip."""
+    normalized = _normalize_repo_path(path)
+    if not _is_under_packaged_addon_root(normalized):
+        return False
+    return not is_explicitly_non_runtime_packaged_exception(normalized)
 
 
 def is_addon_toc_path(path):
     """Return True for a packaged addon TOC file."""
-    normalized = _normalize_repo_path(path)
-    if not any(normalized.startswith(root) for root in ADDON_RUNTIME_ROOTS):
-        return False
-    return normalized.lower().endswith(".toc")
+    return is_packaged_addon_path(path) and _normalize_repo_path(path).lower().endswith(".toc")
 
 
-def addon_runtime_changes(paths):
-    """Return runtime addon paths from a changed-file list."""
-    return [path for path in paths if is_addon_runtime_path(path)]
+def packaged_addon_changes_requiring_qa(paths):
+    """Return packaged addon files that require QA without TOC-diff inspection."""
+    return [
+        path
+        for path in paths
+        if is_packaged_addon_path(path) and not is_addon_toc_path(path)
+    ]
 
 
 def addon_toc_changes(paths):
@@ -355,17 +379,17 @@ def validate_in_game_testing(checklist_section, changed_files, toc_diffs="auto")
         errors.append(
             "In-game testing N/A requires a changed-file list "
             "(PR_CHANGED_FILES, PR_CHANGED_FILES_PATH, or PR_BASE_SHA/PR_HEAD_SHA) "
-            "so addon Lua/XML changes cannot skip Retail QA"
+            "so packaged addon changes cannot skip Retail QA"
         )
         return errors
 
-    runtime_paths = addon_runtime_changes(changed_files)
-    if runtime_paths:
-        shown = ", ".join(runtime_paths[:5])
-        extra = "" if len(runtime_paths) <= 5 else f" (+{len(runtime_paths) - 5} more)"
+    packaged_paths = packaged_addon_changes_requiring_qa(changed_files)
+    if packaged_paths:
+        shown = ", ".join(packaged_paths[:5])
+        extra = "" if len(packaged_paths) <= 5 else f" (+{len(packaged_paths) - 5} more)"
         errors.append(
-            "In-game testing is not applicable cannot be selected when addon "
-            f"Lua/XML runtime files changed: {shown}{extra}"
+            "In-game testing is not applicable cannot be selected when packaged "
+            f"addon files changed: {shown}{extra}"
         )
         return errors
 

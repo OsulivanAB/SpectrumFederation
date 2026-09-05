@@ -23,12 +23,16 @@ REQUIRED = [
 ]
 
 
-def _load_validator():
-    spec = importlib.util.spec_from_file_location("validate_pr_template", VALIDATOR)
+def _load_script(name):
+    spec = importlib.util.spec_from_file_location(name, SCRIPTS_DIR / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
     return module
+
+
+def _load_validator():
+    return _load_script("validate_pr_template")
 
 
 validate_pr_template = _load_validator()
@@ -137,7 +141,7 @@ def test_in_game_na_rejected_when_addon_lua_changed():
         changed_files="SpectrumFederation/modules/core.lua\n.github/scripts/publish_release.py",
     )
     assert result.returncode == 1
-    assert "cannot be selected when addon Lua/XML runtime files changed" in result.stdout
+    assert "cannot be selected when packaged addon files changed" in result.stdout
     assert "SpectrumFederation/modules/core.lua" in result.stdout
 
 
@@ -193,20 +197,38 @@ def test_required_unchecked_item_is_still_a_failure():
     assert "Not all checklist items are checked" in result.stdout
 
 
-def test_addon_runtime_path_detection():
-    assert validate_pr_template.is_addon_runtime_path("SpectrumFederation/modules/core.lua")
-    assert validate_pr_template.is_addon_runtime_path(
+def test_packaged_addon_path_uses_package_membership_not_extension():
+    packaging = _load_script("validate_packaging")
+    assert list(validate_pr_template.NON_PACKAGED_ADDON_GLOBS) == packaging.ZIP_EXCLUDES
+
+    assert validate_pr_template.is_packaged_addon_path("SpectrumFederation/modules/core.lua")
+    assert validate_pr_template.is_packaged_addon_path(
         "SpectrumFederation_CursedSurgeTracker/Tracker.lua"
     )
-    assert validate_pr_template.is_addon_runtime_path("SpectrumFederation/locale/enUS.lua")
-    assert validate_pr_template.is_addon_runtime_path("SpectrumFederation/Foo.xml")
-    assert not validate_pr_template.is_addon_runtime_path(
+    assert validate_pr_template.is_packaged_addon_path("SpectrumFederation/locale/enUS.lua")
+    assert validate_pr_template.is_packaged_addon_path("SpectrumFederation/Foo.xml")
+    assert validate_pr_template.is_packaged_addon_path(
+        "SpectrumFederation/media/Icons/SpectrumFederationIcon.tga"
+    )
+    assert validate_pr_template.is_packaged_addon_path(
+        "SpectrumFederation_CursedSurgeTracker/media/ring.png"
+    )
+    assert validate_pr_template.is_packaged_addon_path(
+        "SpectrumFederation/some_future_asset.xyz"
+    )
+    assert validate_pr_template.is_packaged_addon_path(
         "SpectrumFederation/SpectrumFederation.toc"
     )
-    assert not validate_pr_template.is_addon_runtime_path(
+    assert not validate_pr_template.is_packaged_addon_path(
+        "SpectrumFederation/AGENTS.md"
+    )
+    assert validate_pr_template.is_explicitly_non_runtime_packaged_exception(
+        "SpectrumFederation/AGENTS.md"
+    )
+    assert not validate_pr_template.is_packaged_addon_path(
         ".github/scripts/publish_release.py"
     )
-    assert not validate_pr_template.is_addon_runtime_path("docs/development/automation.md")
+    assert not validate_pr_template.is_packaged_addon_path("docs/development/automation.md")
     assert validate_pr_template.is_addon_toc_path("SpectrumFederation/SpectrumFederation.toc")
     assert validate_pr_template.is_addon_toc_path(
         "SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc"
@@ -258,6 +280,58 @@ PR267_CHANGED_FILES = (
     "SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc\n"
     "tests/test_publish_release.py"
 )
+
+PACKAGED_QA_PATHS = (
+    "SpectrumFederation/modules/core.lua",
+    "SpectrumFederation_CursedSurgeTracker/Tracker.lua",
+    "SpectrumFederation/Foo.xml",
+    "SpectrumFederation/media/Icons/SpectrumFederationIcon.tga",
+    "SpectrumFederation/media/Textures/SpectrumFederationBanner.tga",
+    "SpectrumFederation_CursedSurgeTracker/media/ring.png",
+    "SpectrumFederation/some_future_asset.xyz",
+    "SpectrumFederation/locale/enUS.lua",
+    "SpectrumFederation/Libs/LibStub/LibStub.lua",
+)
+
+
+def test_na_rejected_for_packaged_addon_assets_and_unknown_types():
+    for path in PACKAGED_QA_PATHS:
+        result = _run_validator(NA_BODY, changed_files=path)
+        assert result.returncode == 1, path
+        assert "packaged addon files changed" in result.stdout
+        assert path in result.stdout
+
+
+def test_na_rejected_for_child_addon_tga_loophole():
+    """A packaged texture must not qualify for in-game testing N/A."""
+    result = _run_validator(
+        NA_BODY,
+        changed_files="SpectrumFederation_CursedSurgeTracker/media/ring.tga",
+    )
+    assert result.returncode == 1
+    assert "packaged addon files changed" in result.stdout
+    assert "SpectrumFederation_CursedSurgeTracker/media/ring.tga" in result.stdout
+
+
+def test_na_rejected_for_added_or_deleted_packaged_asset():
+    added = _run_validator(
+        NA_BODY,
+        changed_files="SpectrumFederation/media/Textures/NewBanner.tga",
+    )
+    deleted = _run_validator(
+        NA_BODY,
+        changed_files="SpectrumFederation_CursedSurgeTracker/media/ring.png",
+    )
+    assert added.returncode == 1
+    assert deleted.returncode == 1
+    assert "NewBanner.tga" in added.stdout
+    assert "ring.png" in deleted.stdout
+
+
+def test_na_allowed_for_repository_only_agents_md():
+    result = _run_validator(NA_BODY, changed_files="SpectrumFederation/AGENTS.md")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "In-game testing is marked not applicable" in result.stdout
 
 
 def _toc_diff(path, body):

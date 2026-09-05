@@ -24,7 +24,7 @@
 ## Checklist
 
 - [ ] I have tested these changes in-game <!-- Humans: check after Retail QA. Agents: never check this. -->
-- [ ] In-game testing is not applicable to this change <!-- Check only when no addon Lua/XML changed and any TOC edits are allowlisted metadata (Version, X-Wago-ID, informational X-*). Agents may check N/A; never check "tested in-game". -->
+- [ ] In-game testing is not applicable to this change <!-- Check only when no packaged addon/runtime files changed, except allowlisted TOC metadata or zip-excluded repo files such as AGENTS.md. Agents may check N/A; never check "tested in-game". -->
 - [ ] My code follows the project's style guidelines
 - [ ] I have added/updated documentation as needed
 - [ ] I have added appropriate Debug Logging if necessary

@@ -48,7 +48,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Loot Helper or sync work: inspect `SpectrumFederation/modules/LootHelper/`, `SpectrumFederation/modules/LootHelperSync/`, and the related docs under `docs/development/loot-helper/`.
 - Workflow or CI script work: inspect the matching file under `.github/workflows/` or `.github/scripts/` first, then use `.github/instructions/` as supplemental guidance.
 - Docs work: start with `mkdocs.yml` for nav/build behavior, then edit files in `docs/`.
-- PR descriptions: follow `.cursor/rules/pr-template.mdc`. Never check **I have tested these changes in-game**. You may check **In-game testing is not applicable** only when no addon Lua/XML changed and any TOC edits are allowlisted non-runtime metadata. Always check **WoW Client Type → Retail**. Leave linked issues to the human unless they provided the link.
+- PR descriptions: follow `.cursor/rules/pr-template.mdc`. Never check **I have tested these changes in-game**. You may check **In-game testing is not applicable** only when there are no packaged addon/runtime changes, except allowlisted TOC metadata or files proven not to ship. Always check **WoW Client Type → Retail**. Leave linked issues to the human unless they provided the link.
 - PR review comments: follow `.cursor/skills/pr-review-comments/SKILL.md`.
 
 ## Validation By Change Area

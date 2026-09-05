@@ -30,5 +30,5 @@ Follow this order on every comment. Do not skip the reply, and do not GitHub-res
 ## Constraints
 
 - Do not reopen settled product or architecture decisions unless current repository evidence makes them impossible.
-- Do not weaken CI, skip validation, or mark in-game testing complete in the PR template. In-game QA is human-owned. You may mark in-game testing N/A only when no addon Lua/XML changed and any TOC edits are allowlisted non-runtime metadata (see `.cursor/rules/pr-template.mdc`).
+- Do not weaken CI, skip validation, or mark in-game testing complete in the PR template. In-game QA is human-owned. You may mark in-game testing N/A only when there are no packaged addon/runtime changes except allowlisted TOC metadata or proven non-shipped files (see `.cursor/rules/pr-template.mdc`).
 - Keep replies factual and specific to the cited code.
