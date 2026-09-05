@@ -11,6 +11,7 @@ Spectrum Federation is a World of Warcraft Retail addon for coordinating guild r
 - **Addon versions** — `/sf version` lists current raid or party members and the Spectrum Federation version each one is running.
 - **Loot Logs** — a filterable history of point, Attendance, Reward Pot, equipment, profile, safe-mode, admin, and main-swap changes.
 - **Cursed Surge Tracker** — a nested child addon that shows Curse Surge locations and countdowns on The Coiled Isle World Map. When installed it also appears as an Optional settings category; enable or disable it from WoW's AddOns list, not from `/sf`.
+- **RC Loot Council Integration** — an optional nested child addon that records finalized RC Loot Council awards in Loot Logs while a Spectrum Loot Helper session is active. Open it from **Loot Helper → RC Loot Council**.
 - **Mouse Tracer** — an optional, per-character rainbow cursor trail on **Gameplay → UI Enhancements**. It is off by default.
 
 [Install and get started](getting-started.md){ .md-button .md-button--primary }

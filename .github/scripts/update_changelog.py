@@ -29,6 +29,7 @@ TOC_PATH = Path("SpectrumFederation/SpectrumFederation.toc")
 ADDON_PATHS = (
     "SpectrumFederation/",
     "SpectrumFederation_CursedSurgeTracker/",
+    "SpectrumFederation_RCLootCouncilIntegration/",
 )
 INTERNAL_PATH_PREFIXES = (
     ".github/",
@@ -84,6 +85,11 @@ FEATURE_CATALOG = (
         "name": "Cursed Surge Tracker",
         "aliases": ("cursed surge", "cursed-surge", "coiled isle"),
         "paths": ("SpectrumFederation_CursedSurgeTracker/",),
+    },
+    {
+        "name": "RC Loot Council Integration",
+        "aliases": ("rc loot council", "rclootcouncil", "rclc integration"),
+        "paths": ("SpectrumFederation_RCLootCouncilIntegration/",),
     },
     {
         "name": "Version Check",

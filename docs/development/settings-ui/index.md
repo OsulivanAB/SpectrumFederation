@@ -29,7 +29,7 @@ The sidebar shows **top-level categories only**. Nested sidebar children are not
 
 - New pages set `categoryId` to the category they belong to.
 - Legacy `parentId` is still accepted and becomes `categoryId`. If both are set and differ, registration errors.
-- A page whose `id` equals its `categoryId` is the category root. If other pages share that category, the root is metadata only (`name`, `navLabel`, `group`, `description`, `defaultChildId`, `order`) and is **not** a tab. Loot Helper is the current example: five content pages, not six.
+- A page whose `id` equals its `categoryId` is the category root. If other pages share that category, the root is metadata only (`name`, `navLabel`, `group`, `description`, `defaultChildId`, `order`) and is **not** a tab. Loot Helper is the current example: four parent-owned content pages, not five. When the RC Loot Council Integration child addon is enabled, it registers a fifth Loot Helper tab and does not add an Optional sidebar row.
 - A root with no children is itself the one content page (General, Loot Logs, Debugging).
 - Zero content pages: show the empty-state widget. Do not register a synthetic page. Discovered child addons can be empty; tests use `emptyAddon` as the parent-owned empty example.
 - One content page: hide the tab bar. Gameplay is the current example: the sidebar label stays **Gameplay**, and its one content page is **UI Enhancements**.

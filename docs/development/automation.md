@@ -27,7 +27,7 @@ Both branch-validation workflows include `README.md` and `tests/**` in their pat
 
 ## Post-merge beta release
 
-`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes `SpectrumFederation/**` or `SpectrumFederation_CursedSurgeTracker/**`.
+`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**`.
 
 It:
 
@@ -86,7 +86,7 @@ Deterministic range, validation, and write-safety behavior is covered by `tests/
 
 The workflow:
 
-1. determines whether `SpectrumFederation/**` or `SpectrumFederation_CursedSurgeTracker/**` differs between `main` and `beta`;
+1. determines whether `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**` differs between `main` and `beta`;
 2. validates lint, packaging, docs, and the appropriate version format;
 3. simulates the merge, metadata changes, docs build, release packaging, and beta synchronization without pushing;
 4. merges `beta` into `main`;
@@ -132,7 +132,7 @@ Matching is case-insensitive (`1.5.0-BETA.2` is still a GitHub prerelease and Wa
 
 ### Wago project ID and Retail patch
 
-The public Wago project ID is stored once, as `## X-Wago-ID:` in `SpectrumFederation/SpectrumFederation.toc`. The child addon is packaged in the same zip and does not get a second Wago ID. The publisher reads that TOC field instead of hard-coding the ID in workflows.
+The public Wago project ID is stored once, as `## X-Wago-ID:` in `SpectrumFederation/SpectrumFederation.toc`. Packaged child addons ship in the same zip and do not get a second Wago ID. The publisher reads that TOC field instead of hard-coding the ID in workflows.
 
 The Wago `supported_retail_patch` value is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`). The script requires that exact string to appear in Wago's public catalog at `https://addons.wago.io/api/data/game`. If the catalog cannot be loaded, or Wago does not advertise that patch yet, publishing fails instead of claiming an older patch. On a live run that failure happens after GitHub has already published, so CurseForge still receives the Release event.
 
@@ -237,6 +237,6 @@ When behavior changes intentionally, update the implementation and its documenta
 
 ## Version and manifest source of truth
 
-Release zips contain sibling top-level folders `SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/`. Extracting the archive into `Interface/AddOns` installs both addons. The child TOC must keep the same `## Interface` and `## Version` values as the parent.
+Release zips contain sibling top-level folders `SpectrumFederation/`, `SpectrumFederation_CursedSurgeTracker/`, and `SpectrumFederation_RCLootCouncilIntegration/`. Extracting the archive into `Interface/AddOns` installs those addons. Packaged child TOCs must keep the same `## Interface` and `## Version` values as the parent.
 
 README badges are generated release metadata, not the source of truth. The Interface badge is formatted from the 6-digit Interface number (the same `MMmmpp` value stored in the TOC) by adding decimals and stripping leading zeros (`120100` → `12.1.0`).

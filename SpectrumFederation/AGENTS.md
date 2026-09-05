@@ -63,9 +63,9 @@ When you need a new toggle/option:
 - If existing code is not fully localized yet, keep your additions consistent with the existing direction (don’t introduce a third pattern).
 
 ## Packaging + versioning
-- **Any new Lua file must be listed in** the TOC of the addon that owns it (`SpectrumFederation.toc` or a child-addon TOC).
+- **Any new Lua file must be listed in** the TOC of the addon that owns it (`SpectrumFederation.toc` or the owning child-addon TOC).
 - Parent TOC files must not load child-addon Lua or XML.
-- **Any behavior/UI/settings change must bump** `## Version:` in `SpectrumFederation/SpectrumFederation.toc` and keep any packaged child TOC on the same version.
+- **Any behavior/UI/settings change must bump** `## Version:` in `SpectrumFederation/SpectrumFederation.toc` and keep packaged child TOCs on the same version.
 
 ## Validation checklist (do these before declaring “done”)
 - `python3 .github/scripts/lint_all.py`
@@ -76,3 +76,4 @@ When you need a new toggle/option:
 - Mouse Tracer engine or constants changes: `python -m pytest tests/test_mouse_tracer.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle changes: `python -m pytest tests/test_raid_equipment.py`
 - Loot Helper impersonation / Preview as Non-Admin: `python -m pytest tests/test_impersonation.py`
+- RC Loot Council Integration child addon: `python -m pytest tests/test_rc_loot_council_integration.py`

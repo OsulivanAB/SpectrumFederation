@@ -412,7 +412,7 @@ function Sync:RebuildProfile(profileId, reason)
 
             local author = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
             local counter = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
-            if type(author) == "string" and type(counter) == "number" then
+            if type(author) == "string" and type(counter) == "number" and counter >= 1 then
                 local prev = profile._authorCounters[author] or 0
                 if counter > prev then
                     profile._authorCounters[author] = counter
@@ -904,6 +904,8 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
             and type(range.author) == "string"
             and type(range.fromCounter) == "number"
             and type(range.toCounter) == "number"
+            and range.fromCounter >= 1
+            and range.toCounter >= 1
             and not self:_HasOutstandingLogRangeRequest(profileId, range.author, range.fromCounter, range.toCounter)
         then
             local fallback = {}

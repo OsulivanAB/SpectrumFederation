@@ -1657,6 +1657,30 @@ function Controls:AddLogTable(section, opts)
 					text:SetMaxLines(1)
 				end
 				cell.Text = text
+				cell:EnableMouse(true)
+				cell:SetScript("OnEnter", function()
+					dataRow.Hover:Show()
+					if cell.hyperlink and GameTooltip and GameTooltip.SetHyperlink then
+						GameTooltip:SetOwner(cell, "ANCHOR_RIGHT")
+						GameTooltip:SetHyperlink(cell.hyperlink)
+						GameTooltip:Show()
+					end
+				end)
+				cell:SetScript("OnLeave", function()
+					dataRow.Hover:Hide()
+					if GameTooltip and GameTooltip.Hide then
+						GameTooltip:Hide()
+					end
+				end)
+				cell:SetScript("OnMouseUp", function()
+					local itemRef = cell.itemRef
+					if type(itemRef) ~= "string" or itemRef == "" then
+						return
+					end
+					if type(SetItemRef) == "function" then
+						SetItemRef(itemRef, cell.itemLinkText or cell.hyperlink or itemRef, "LeftButton")
+					end
+				end)
 				dataRow.Cells[columnIndex] = cell
 			end
 
@@ -1700,7 +1724,19 @@ function Controls:AddLogTable(section, opts)
 
 				for columnIndex, column in ipairs(columns) do
 					local value = rowData[column.key]
-					dataRow.Cells[columnIndex].Text:SetText(value or "")
+					local cell = dataRow.Cells[columnIndex]
+					cell.Text:SetText(value or "")
+					local hyperlink
+					local itemRef
+					if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
+						hyperlink = SF.LootLog.ExtractItemHyperlink(value)
+					end
+					if SF.LootLog and SF.LootLog.ExtractItemRef then
+						itemRef = SF.LootLog.ExtractItemRef(value)
+					end
+					cell.hyperlink = hyperlink
+					cell.itemRef = itemRef
+					cell.itemLinkText = hyperlink and value or nil
 				end
 
 				dataRow:Show()

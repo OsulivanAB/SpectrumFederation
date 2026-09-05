@@ -24,6 +24,9 @@ SpectrumFederation_CursedSurgeTracker/
   Schedule.lua                 pure schedule/map helpers
   Tracker.lua                  zone, scheduler, and timer runtime
   MapPins.lua                  World Map data provider and pins
+SpectrumFederation_RCLootCouncilIntegration/
+  SpectrumFederation_RCLootCouncilIntegration.toc
+  Integration.lua              records RC Loot Council awards in Spectrum Loot Logs
 .github/scripts/               validation and release helpers
 .github/workflows/             PR, beta, promotion, and rollback automation
 assets/                        standalone Google Sheet sync utility
@@ -44,7 +47,7 @@ python3 -m pip install -r .github/requirements-lint.txt
 python3 -m pip install -r requirements-docs.txt
 ```
 
-Link `SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/` into the Retail client's `Interface/AddOns/` directory for in-game testing. Enable Lua errors while developing:
+Link `SpectrumFederation/`, `SpectrumFederation_CursedSurgeTracker/`, and `SpectrumFederation_RCLootCouncilIntegration/` into the Retail client's `Interface/AddOns/` directory for in-game testing. Enable Lua errors while developing:
 
 ```text
 /console scriptErrors 1
@@ -61,7 +64,7 @@ Addon behavior or UI changes require a new version in `SpectrumFederation.toc`; 
 
 - Start modules with `local addonName, SF = ...` (or `local _, SF = ...`) and attach shared APIs to `SF`; do not introduce globals.
 - Remain compatible with Lua 5.1 and the WoW sandbox.
-- Add every packaged Lua file to the matching addon TOC after its dependencies. Child-addon files belong in `SpectrumFederation_CursedSurgeTracker.toc`, not the parent TOC.
+- Add every packaged Lua file to the matching addon TOC after its dependencies. Child-addon files belong in that child's TOC, not the parent TOC.
 - Prefer `SF.Debug:Verbose/Info/Warn/Error` for diagnostics.
 - Prefer `SF:PrintSuccess/Error/Warning/Info` for user-visible chat output.
 - Normalize character identifiers through `NameUtil` rather than comparing raw names.

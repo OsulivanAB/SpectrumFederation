@@ -458,5 +458,47 @@ function LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_
     return true
 end
 
+-- Function to validate RC_LOOT_COUNCIL event data
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateRCLootCouncilData(eventData)
+    if type(eventData) ~= "table" then
+        return false
+    end
+
+    if type(eventData.member) ~= "string" or eventData.member == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "RC Loot Council log is missing member")
+        end
+        return false
+    end
+    if type(eventData.itemLink) ~= "string" or eventData.itemLink == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "RC Loot Council log is missing itemLink")
+        end
+        return false
+    end
+    if type(eventData.response) ~= "string" or eventData.response == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "RC Loot Council log is missing response")
+        end
+        return false
+    end
+    if type(eventData.rcAwardId) ~= "string" or eventData.rcAwardId == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "RC Loot Council log is missing rcAwardId")
+        end
+        return false
+    end
+    if type(eventData.awardKey) ~= "string" or eventData.awardKey == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "RC Loot Council log is missing awardKey")
+        end
+        return false
+    end
+
+    return true
+end
+
 -- Export to namespace
 SF.LootLogValidators = LootLogValidators

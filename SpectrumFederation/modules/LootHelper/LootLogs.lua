@@ -25,6 +25,7 @@ local EVENT_TYPES = {
     REWARD_POT_CONFIG_CHANGE    = "REWARD_POT_CONFIG_CHANGE",
     REWARD_POT_CHANGE           = "REWARD_POT_CHANGE",
     ATTENDANCE_CHANGE           = "ATTENDANCE_CHANGE",
+    RC_LOOT_COUNCIL             = "RC_LOOT_COUNCIL",
 }
 
 local POINT_CHANGE_TYPES = {
@@ -103,6 +104,17 @@ local EVENT_DATA_TEMPLATES = {
         change = "" -- INCREMENT/DECREMENT
         -- @field amount number|nil positive attendance amount
         -- @field reason string|nil RAID_CHECK or MANUAL
+    },
+    [EVENT_TYPES.RC_LOOT_COUNCIL] = {
+        member = "",
+        itemLink = "",
+        response = "",
+        rcAwardId = "",
+        awardKey = ""
+        -- @field itemString string|nil stable item identity
+        -- @field owner string|nil RC item owner
+        -- @field responseId number|nil RC response id
+        -- @field isAwardReason boolean|nil RC award-reason flag
     }
 }
 
@@ -166,6 +178,151 @@ end
 
 local LootLog = {}
 LootLog.__index = LootLog
+
+function LootLog.IsSequentialCounter(counter)
+    return type(counter) == "number" and counter >= 1 and counter == math.floor(counter)
+end
+
+function LootLog.IsExternalLogTable(t)
+    return type(t) == "table" and type(t._externalId) == "string" and t._externalId ~= ""
+end
+
+function LootLog.ExtractItemString(link)
+    if type(link) ~= "string" or link == "" then
+        return nil
+    end
+    local itemString = link:match("(item:[%-%d:]+)")
+    if type(itemString) == "string" and itemString ~= "" then
+        return itemString
+    end
+    return nil
+end
+
+function LootLog.ExtractItemHyperlink(text)
+    if type(text) ~= "string" or text == "" then
+        return nil
+    end
+    local colored = text:match("(|c%x+|Hitem:[^|]+|h.-|h|r)")
+    if colored then
+        return colored
+    end
+    local plain = text:match("(|Hitem:[^|]+|h.-|h)")
+    if plain then
+        return plain
+    end
+    return LootLog.ExtractItemString(text)
+end
+
+-- Inner item token for SetItemRef. Chat-frame clicks pass the payload between
+-- |H and |h (for example item:12345:...), not the colored display string.
+function LootLog.ExtractItemRef(text)
+    if type(text) ~= "string" or text == "" then
+        return nil
+    end
+    local fromHyperlink = text:match("|H(item:[^|]+)|h")
+    if type(fromHyperlink) == "string" and fromHyperlink ~= "" then
+        return fromHyperlink
+    end
+    return LootLog.ExtractItemString(text)
+end
+
+function LootLog.ParseHistoryTimestamp(historyId)
+    if type(historyId) ~= "string" or historyId == "" then
+        return nil
+    end
+    local prefix = historyId:match("^(%d+)")
+    local timestamp = tonumber(prefix)
+    if type(timestamp) == "number" and timestamp > 0 then
+        return math.floor(timestamp)
+    end
+    return nil
+end
+
+function LootLog.NormalizePlayerId(nameOrNameRealm)
+    if type(nameOrNameRealm) ~= "string" or nameOrNameRealm == "" then
+        return nil
+    end
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        return SF.NameUtil.NormalizeNameRealm(nameOrNameRealm)
+    end
+    return strtrim(nameOrNameRealm)
+end
+
+function LootLog.MakeRCAwardExternalId(awarder, historyId, winner, itemLink, owner)
+    local normalizedAwarder = LootLog.NormalizePlayerId(awarder)
+    local normalizedWinner = LootLog.NormalizePlayerId(winner)
+    local itemString = LootLog.ExtractItemString(itemLink)
+    local normalizedOwner = LootLog.NormalizePlayerId(owner) or ""
+    if not normalizedAwarder or not normalizedWinner or type(historyId) ~= "string" or historyId == "" or not itemString then
+        return nil
+    end
+    return table.concat({
+        "RCLootCouncil",
+        normalizedAwarder,
+        historyId,
+        normalizedWinner,
+        itemString,
+        normalizedOwner,
+    }, "|")
+end
+
+function LootLog.BuildRCLootCouncilCanonical(awarder, winner, history)
+    if type(history) ~= "table" then
+        return nil
+    end
+    local normalizedAwarder = LootLog.NormalizePlayerId(awarder)
+    local normalizedWinner = LootLog.NormalizePlayerId(winner)
+    local itemLink = history.lootWon
+    if type(itemLink) ~= "string" or itemLink == "" then
+        return nil
+    end
+    local response = history.response
+    if type(response) ~= "string" or strtrim(response) == "" then
+        return nil
+    end
+    local rcAwardId = history.id
+    if type(rcAwardId) ~= "string" or rcAwardId == "" then
+        return nil
+    end
+    local awardKey = LootLog.MakeRCAwardExternalId(normalizedAwarder, rcAwardId, normalizedWinner, itemLink, history.owner)
+    if not awardKey then
+        return nil
+    end
+    local timestamp = LootLog.ParseHistoryTimestamp(rcAwardId)
+    if not timestamp then
+        return nil
+    end
+    return {
+        awarder = normalizedAwarder,
+        winner = normalizedWinner,
+        itemLink = itemLink,
+        response = response,
+        rcAwardId = rcAwardId,
+        owner = LootLog.NormalizePlayerId(history.owner),
+        itemString = LootLog.ExtractItemString(itemLink),
+        responseId = history.responseID,
+        isAwardReason = history.isAwardReason and true or false,
+        timestamp = timestamp,
+        awardKey = awardKey,
+    }
+end
+
+function LootLog.BuildRCLootCouncilEventData(canonical)
+    if type(canonical) ~= "table" then
+        return nil
+    end
+    return {
+        member = canonical.winner,
+        itemLink = canonical.itemLink,
+        response = canonical.response,
+        rcAwardId = canonical.rcAwardId,
+        awardKey = canonical.awardKey,
+        itemString = canonical.itemString,
+        owner = canonical.owner,
+        responseId = canonical.responseId,
+        isAwardReason = canonical.isAwardReason and true or false,
+    }
+end
 
 -- Constructor for creating a new log entry
 -- @param eventType string Type of event (from EVENT_TYPES)
@@ -293,14 +450,50 @@ function LootLog.new(eventType, eventData, opts)
         if not SF.LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES) then
             return nil
         end
+    elseif eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+        if not SF.LootLogValidators.ValidateRCLootCouncilData(eventData) then
+            return nil
+        end
     end
 
     local timestamp = opts.timestamp or GetServerTime()
     local author = opts.author or SF:GetPlayerFullIdentifier()
+    local externalId = opts.externalId
+    local isExternal = type(externalId) == "string" and externalId ~= ""
+
+    -- External IDs are a narrow RC_LOOT_COUNCIL audit exception.
+    if isExternal then
+        if eventType ~= EVENT_TYPES.RC_LOOT_COUNCIL then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "externalId is only valid for RC_LOOT_COUNCIL")
+            end
+            return nil
+        end
+        if type(eventData.awardKey) ~= "string" or eventData.awardKey == "" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "RC external logs require data.awardKey")
+            end
+            return nil
+        end
+        if externalId ~= eventData.awardKey then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "RC externalId must match data.awardKey")
+            end
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "RC_LOOT_COUNCIL logs require an externalId")
+        end
+        return nil
+    end
 
     -- Counter allocation: must be per-profile per-author to avoid collisions.
+    -- External RC awards use sentinel counter 0 and never allocate a sequence.
     local counter = opts.counter
-    if type(counter) ~= "number" then
+    if isExternal then
+        counter = 0
+    elseif type(counter) ~= "number" then
         local ap = SF.lootHelperDB and SF.lootHelperDB.activeProfile
         if ap and ap.AllocateNextCounter then
             counter = ap:AllocateNextCounter(author)
@@ -314,13 +507,27 @@ function LootLog.new(eventType, eventData, opts)
         return nil
     end
 
+    if isExternal then
+        counter = 0
+    elseif not LootLog.IsSequentialCounter(counter) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Ordinary logs require a positive integer counter")
+        end
+        return nil
+    end
+
     local instance = setmetatable({}, LootLog)
     instance._timestamp = timestamp
     instance._author = author
     instance._counter = counter
     instance._eventType = eventType
     instance._data = eventData
-    instance._id = GenerateLogID(author, counter)
+    if isExternal then
+        instance._externalId = externalId
+        instance._id = externalId
+    else
+        instance._id = GenerateLogID(author, counter)
+    end
     instance._fingerprint = ComputeFingerprintFromFields(timestamp, author, counter, eventType, eventData)
 
     if SF.Debug then
@@ -492,7 +699,7 @@ end
 -- @param none
 -- @return table logTable Plain table representation of the log
 function LootLog:ToTable()
-    return {
+    local t = {
         version     = LOG_FORMAT_VERSION,
         _id         = self._id,
         _timestamp  = self._timestamp,
@@ -502,6 +709,10 @@ function LootLog:ToTable()
         _data       = self._data,
         _fingerprint= self:GetFingerprint(),
     }
+    if type(self._externalId) == "string" and self._externalId ~= "" then
+        t._externalId = self._externalId
+    end
+    return t
 end
 
 -- Function Validate a log wire table (structural validation).
@@ -522,18 +733,39 @@ function LootLog.ValidateTable(t, opts)
     if type(t._id) ~= "string" or t._id == "" then return false, "log._id must be a non-empty string" end
     if type(t._timestamp) ~= "number" then return false, "log._timestamp must be a number" end
     if type(t._author) ~= "string" or t._author == "" then return false, "log._author must be a non-empty string" end
-    if type(t._counter) ~= "number" or t._counter < 1 or t._counter ~= math.floor(t._counter) then
-        return false, "log._counter must be a positive integer"
-    end
     if type(t._eventType) ~= "string" or t._eventType == "" then
         return false, "log._eventType must be a non-empty string"
     end
     if type(t._data) ~= "table" then return false, "log._data must be a table" end
 
-    -- Integrity check: id must match author:counter
-    local expectedId = ("%s:%d"):format(t._author, t._counter)
-    if t._id ~= expectedId then
-        return false, ("log._id mismatch (expected %s, got %s)"):format(expectedId, tostring(t._id))
+    local isExternal = LootLog.IsExternalLogTable(t)
+    if isExternal then
+        if t._eventType ~= EVENT_TYPES.RC_LOOT_COUNCIL then
+            return false, "external logs are only valid for RC_LOOT_COUNCIL"
+        end
+        if t._id ~= t._externalId then
+            return false, "log._id must match _externalId"
+        end
+        if type(t._counter) ~= "number" or t._counter ~= 0 then
+            return false, "external log._counter must be 0"
+        end
+        if type(t._data.awardKey) ~= "string" or t._data.awardKey == "" then
+            return false, "RC external log requires data.awardKey"
+        end
+        if t._externalId ~= t._data.awardKey then
+            return false, "log._externalId must match data.awardKey"
+        end
+    else
+        if t._eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+            return false, "RC_LOOT_COUNCIL logs must use an external id"
+        end
+        if type(t._counter) ~= "number" or t._counter < 1 or t._counter ~= math.floor(t._counter) then
+            return false, "log._counter must be a positive integer"
+        end
+        local expectedId = ("%s:%d"):format(t._author, t._counter)
+        if t._id ~= expectedId then
+            return false, ("log._id mismatch (expected %s, got %s)"):format(expectedId, tostring(t._id))
+        end
     end
 
     local computedFingerprint = ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, t._data)
@@ -577,6 +809,9 @@ function LootLog.FromTable(t, opts)
     instance._counter   = t._counter
     instance._eventType = t._eventType
     instance._data      = t._data
+    if LootLog.IsExternalLogTable(t) then
+        instance._externalId = t._externalId
+    end
     instance._fingerprint = t._fingerprint or ComputeFingerprintFromFields(
         t._timestamp,
         t._author,

@@ -220,9 +220,13 @@ def validate_readme_badges(repo_root):
 def validate_slash_command_reference(repo_root):
     """Require every registered command and diagnostic alias in the reference."""
     addon_roots = [repo_root / "SpectrumFederation"]
-    child_root = repo_root / "SpectrumFederation_CursedSurgeTracker"
-    if child_root.exists():
-        addon_roots.append(child_root)
+    for child_name in (
+        "SpectrumFederation_CursedSurgeTracker",
+        "SpectrumFederation_RCLootCouncilIntegration",
+    ):
+        child_root = repo_root / child_name
+        if child_root.exists():
+            addon_roots.append(child_root)
     commands = set()
     aliases = set()
     for addon_root in addon_roots:

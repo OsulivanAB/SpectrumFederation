@@ -464,10 +464,13 @@ def create_addon_zip(addon_name, version):
     
     print(f"[publish-release] Creating release zip: {zip_path}")
 
-    child_addon_name = "SpectrumFederation_CursedSurgeTracker"
     zip_entries = [addon_name]
-    if Path(child_addon_name).exists() and child_addon_name != addon_name:
-        zip_entries.append(child_addon_name)
+    for child_addon_name in (
+        "SpectrumFederation_CursedSurgeTracker",
+        "SpectrumFederation_RCLootCouncilIntegration",
+    ):
+        if Path(child_addon_name).exists() and child_addon_name != addon_name:
+            zip_entries.append(child_addon_name)
     
     # Create zip using subprocess for consistency with validation
     try:
