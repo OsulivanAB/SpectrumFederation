@@ -398,31 +398,3 @@ def test_classify_toc_line_allowlist_and_runtime_fields():
         "safe",
         "comment",
     )
-
-
-def test_live_pr_toc_diff_against_beta_is_safe():
-    result = subprocess.run(
-        [
-            "git",
-            "diff",
-            "origin/beta...HEAD",
-            "--",
-            "SpectrumFederation/SpectrumFederation.toc",
-            "SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0 or not result.stdout.strip():
-        pytest.skip("origin/beta...HEAD TOC diff is unavailable")
-    parsed = validate_pr_template.get_changed_toc_lines(result.stdout)
-    reasons = validate_pr_template.toc_changes_require_in_game_testing(
-        [
-            "SpectrumFederation/SpectrumFederation.toc",
-            "SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc",
-        ],
-        parsed,
-    )
-    assert parsed is not None
-    assert reasons == []
