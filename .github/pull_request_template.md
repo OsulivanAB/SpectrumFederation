@@ -23,11 +23,12 @@
 
 ## Checklist
 
-- [ ] I have tested these changes in-game <!-- Agents: leave unchecked. Humans mark this after Retail QA. -->
+- [ ] I have tested these changes in-game <!-- Humans: check after Retail QA. Agents: never check this. -->
+- [ ] In-game testing is not applicable to this change <!-- Check only when no addon Lua/XML runtime files changed. Agents may check N/A; never check "tested in-game". -->
 - [ ] My code follows the project's style guidelines
 - [ ] I have added/updated documentation as needed
 - [ ] I have added appropriate Debug Logging if necessary
-- [ ] I have added/updated localization strings in `locale/enUS.lua` if applicable
+- [ ] I have added/updated localization strings in `locale/enUS.lua` if applicable <!-- Check when strings were updated, or when no user-facing addon strings changed. -->
 - [ ] My changes generate no new warnings or errors
 - [ ] Any dependent changes have been merged and published
 - [ ] I've linked this PR to any related issues in the [repo project](https://github.com/users/OsulivanAB/projects/1). <!-- Agents: leave unchecked unless the user provided issue links. -->

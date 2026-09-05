@@ -6,9 +6,12 @@ alwaysApply: true
 # PR Template
 
 - Always use `.github/pull_request_template.md`. Keep its section headings, order, checklist items, and prompts.
-- Never check **I have tested these changes in-game**. That box is reserved for a human after Retail QA. Leave it unchecked even if automated tests passed, even if Validate PR Description fails, and even if a previous PR checked it. Do not check it to make CI pass.
+- Never check **I have tested these changes in-game**. That box is reserved for a human after Retail QA. Do not check it to make CI pass, even if automated tests passed or a previous PR checked it.
+- You MAY check **In-game testing is not applicable to this change** only when the PR does not change packaged addon Lua or XML (`SpectrumFederation/**/*.lua`, `SpectrumFederation/**/*.xml`, and the matching child-addon paths). Typical N/A changes: GitHub Actions, release/CI scripts, docs, tests, packaging/release metadata, or TOC metadata with no Lua/XML behavior.
+- If the PR changes addon runtime Lua/XML or other player-visible in-game behavior, leave N/A unchecked and leave **tested in-game** unchecked for the human. Do not use N/A to skip Retail QA.
 - Always check **WoW Client Type → Retail**. This addon targets Retail. Checking Retail is the product target, not a claim that in-game QA was done. Leave Classic, PTR, and Beta unchecked unless the change is specifically for those clients.
-- In **Testing**, report automated and static validation actually run. State clearly that manual in-game QA was not performed when it was not. You may optionally add suggested in-game test steps as unchecked checkboxes for the human; never mark those complete.
+- In **Testing**, report automated and static validation actually run. If N/A is selected, say that in-game QA is not applicable and why. If the change needs Retail QA, state that it was not performed. You may optionally add suggested in-game test steps as unchecked checkboxes for the human; never mark those complete.
 - Do not claim in-game verification, and do not fabricate screenshots or videos as Retail proof.
+- Check **I have added/updated localization strings in `locale/enUS.lua` if applicable** when you updated those strings, or when no user-facing addon strings changed. Do not edit `locale/enUS.lua` just to satisfy the checkbox.
 - Never check **I've linked this PR to any related issues** unless the user explicitly provided the issue or project-link information to use. Leave that box for the human.
-- `.github/scripts/validate_pr_template.py` still requires the in-game checklist item so a human must check it before merge. Agents must not check it and must not treat that CI failure as something to fix. Linked-issue remains optional in CI.
+- `.github/scripts/validate_pr_template.py` requires exactly one in-game testing state. N/A is rejected when addon Lua/XML files changed. Linked-issue remains optional in CI.
