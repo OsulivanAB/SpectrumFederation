@@ -856,6 +856,28 @@ assertTrue(Integration.SenderIsCurrentMasterLooter(AWARDER), "current RC ML grou
 assertFalse(Integration.SenderIsCurrentMasterLooter("Other-Garona"), "non-ML group sender is rejected")
 assertFalse(Integration.SenderIsCurrentMasterLooter("Guildie-OtherRealm"), "unrelated guild history sender is rejected")
 
+_G.RCLootCouncil = {
+    masterLooter = PLAYER,
+    GetML = function()
+        return true, PLAYER
+    end,
+    IsMasterLooter = function()
+        return true
+    end,
+}
+assertTrue(Integration.SenderIsCurrentMasterLooter(PLAYER), "local player is accepted when they are the current RC ML")
+assertFalse(Integration.SenderIsCurrentMasterLooter("Guildie-OtherRealm"), "local-only IsMasterLooter must not accept a different sender")
+assertFalse(Integration.SenderIsCurrentMasterLooter("Other-Garona"), "non-ML sender is rejected even when the local client is ML")
+_G.RCLootCouncil = {
+    masterLooter = AWARDER,
+    GetML = function()
+        return false, AWARDER
+    end,
+    IsMasterLooter = function()
+        return true
+    end,
+}
+
 function Integration.ResolveLibraries()
     return passthroughLibs(function(_self)
         return true, "history", { WINNER, historyTable({ id = "1700000900-9" }) }

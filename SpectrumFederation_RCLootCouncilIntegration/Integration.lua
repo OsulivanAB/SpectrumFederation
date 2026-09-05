@@ -205,18 +205,11 @@ function Integration.SenderIsCurrentMasterLooter(sender)
     if type(sender) ~= "string" or sender == "" then
         return false
     end
+    -- Compare the AceComm sender to the resolved current ML only.
+    -- Do not call RCLootCouncil:IsMasterLooter() as a fallback: some builds
+    -- treat that as "is the local client ML" and ignore the unit argument.
     local current = Integration.GetCurrentRCMasterLooter()
-    if current and Integration.SamePlayer(sender, current) then
-        return true
-    end
-    local rc = _G.RCLootCouncil
-    if rc and type(rc.IsMasterLooter) == "function" then
-        local ok, isML = pcall(rc.IsMasterLooter, rc, sender)
-        if ok and isML == true then
-            return true
-        end
-    end
-    return false
+    return current ~= nil and Integration.SamePlayer(sender, current)
 end
 
 -- Decode RC MAIN prefix traffic enough to recover ("history", winner, historyTable).
