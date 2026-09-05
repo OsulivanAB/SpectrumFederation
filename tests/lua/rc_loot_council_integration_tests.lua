@@ -160,11 +160,23 @@ function Sync:LogSessionPointsSummary() end
 function Sync:EnsureRepairConvergence() end
 function Sync:_KickRepairConvergence() end
 function Sync:RequestProfileSnapshot() end
+function Sync:_Now()
+    return 1
+end
+function Sync:GetIntegrityWindowSize()
+    return 25
+end
 function Sync:IsBulkTransferAllowed()
     return true
 end
 function Sync:IsSenderAuthorized()
     return true
+end
+function Sync:BroadcastNewLog()
+    return true
+end
+function Sync:_EnforceGroupedSessionActive()
+    return "RAID"
 end
 
 local ns = {}
@@ -418,7 +430,8 @@ assertEq(select(2, profile:TryAddRCLootCouncilAward(adminOnly)), "not_admin", "n
 PLAYER = "Tester-Garona"
 
 -- Awarder remains a non-Spectrum-admin; the writer is still the profile admin.
-assertFalse(profile:IsCurrentUserAdmin and profile:IsCurrentUserAdmin() and AWARDER == PLAYER, "awarder is not the local Spectrum admin")
+assertTrue(profile:IsCurrentUserAdmin(), "Spectrum writer remains a profile admin")
+assertFalse(AWARDER == PLAYER, "RC awarder is not the local Spectrum writer")
 local awarderIsAdmin = false
 for _, adminId in ipairs(profile:getAdminMemberIds()) do
     if adminId == AWARDER then
@@ -445,10 +458,22 @@ assertTrue(adminA:TryAddRCLootCouncilAward(raceCanonical), "admin A records the 
 SF.lootHelperDB.activeProfile = adminB
 assertTrue(adminB:TryAddRCLootCouncilAward(raceCanonical), "admin B records the same award locally before sync")
 
-assertEq(adminA:GetLootLogs()[#adminA:GetLootLogs()]:GetID(), adminB:GetLootLogs()[#adminB:GetLootLogs()]:GetID(), "both admins produce the same external id")
-assertEq(adminA:GetLootLogs()[#adminA:GetLootLogs()]:GetFingerprint(), adminB:GetLootLogs()[#adminB:GetLootLogs()]:GetFingerprint(), "both admins produce the same fingerprint")
+local function findRCLog(profile)
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        if log:GetEventType() == SF.LootLogEventTypes.RC_LOOT_COUNCIL then
+            return log
+        end
+    end
+    return nil
+end
 
-local merged = adminA:MergeLogTables({ adminB:GetLootLogs()[#adminB:GetLootLogs()]:ToTable() })
+local raceA = findRCLog(adminA)
+local raceB = findRCLog(adminB)
+assertTrue(raceA ~= nil and raceB ~= nil, "both admins stored an RC log")
+assertEq(raceA:GetID(), raceB:GetID(), "both admins produce the same external id")
+assertEq(raceA:GetFingerprint(), raceB:GetFingerprint(), "both admins produce the same fingerprint")
+
+local merged = adminA:MergeLogTables({ raceB:ToTable() })
 assertEq(merged, 0, "merging the peer's identical RC log inserts nothing")
 assertEq(countRCLogs(adminA), 1, "final synchronized profile has exactly one RC log")
 
