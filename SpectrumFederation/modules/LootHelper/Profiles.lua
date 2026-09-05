@@ -1477,11 +1477,16 @@ function LootProfile:TryAddRCLootCouncilAward(canonical)
 		return false, "invalid_award"
 	end
 
+	-- skipPermission is required here: LootLog.new() otherwise checks the
+	-- UI-selected lootHelperDB.activeProfile, which can differ from this
+	-- session profile. Admin authorization was already verified on self
+	-- above, and AddLootLog/_InsertLog still require admin on this profile.
 	local logEntry = SF.LootLog.new(eventType, eventData, {
 		author = canonical.awarder,
 		timestamp = canonical.timestamp,
 		externalId = awardKey,
 		counter = 0,
+		skipPermission = true,
 	})
 	if not logEntry then
 		return false, "create_failed"

@@ -89,7 +89,7 @@ function Integration.IsSpectrumSessionActive()
     return ok and active == true
 end
 
-function Integration.GetActiveProfile()
+function Integration.GetSelectedProfile()
     local SF = ParentAddon()
     if SF and SF.GetActiveProfile then
         local ok, profile = pcall(SF.GetActiveProfile, SF)
@@ -98,6 +98,62 @@ function Integration.GetActiveProfile()
         end
     end
     return SF and SF.lootHelperDB and SF.lootHelperDB.activeProfile or nil
+end
+
+-- UI-selected profile. Not the authority for live RC award processing.
+function Integration.GetActiveProfile()
+    return Integration.GetSelectedProfile()
+end
+
+-- Profile attached to the active Spectrum Loot Helper session.
+-- Never falls back to the locally selected profile.
+function Integration.GetSessionProfile()
+    if not Integration.IsSpectrumSessionActive() then
+        return nil, "no_session"
+    end
+    local SF = ParentAddon()
+    local sync = SF and SF.LootHelperSync
+    if not sync then
+        DebugWarn("Active Spectrum session has no LootHelperSync")
+        return nil, "no_profile"
+    end
+
+    local profileId
+    if type(sync.GetSessionProfileId) == "function" then
+        local ok, value = pcall(sync.GetSessionProfileId, sync)
+        if ok and type(value) == "string" and value ~= "" then
+            profileId = value
+        end
+    elseif sync.state and type(sync.state.profileId) == "string" and sync.state.profileId ~= "" then
+        profileId = sync.state.profileId
+    end
+    if type(profileId) ~= "string" or profileId == "" then
+        DebugWarn("Active Spectrum session has no profileId")
+        return nil, "no_profile"
+    end
+
+    local profile
+    if type(sync.FindLocalProfileById) == "function" then
+        local ok, found = pcall(sync.FindLocalProfileById, sync, profileId)
+        if ok then
+            profile = found
+        end
+    end
+    if not (profile and profile.TryAddRCLootCouncilAward) then
+        DebugWarn("Session profile %s is not available locally", tostring(profileId))
+        return nil, "no_profile"
+    end
+    return profile
+end
+
+-- Settings edit the session profile while a session is live; otherwise the
+-- selected Loot Helper profile, matching existing Settings conventions.
+function Integration.GetSettingsProfile()
+    if Integration.IsSpectrumSessionActive() then
+        local profile = Integration.GetSessionProfile()
+        return profile
+    end
+    return Integration.GetSelectedProfile()
 end
 
 local function WipeTable(t)
@@ -299,7 +355,7 @@ local function IsEffectiveAdmin(profile)
     return profile and profile.IsCurrentUserAdmin and profile:IsCurrentUserAdmin()
 end
 
-function Integration.WarnNonMember(canonical)
+function Integration.WarnNonMember(canonical, profile)
     if type(canonical) ~= "table" then
         return false
     end
@@ -312,7 +368,9 @@ function Integration.WarnNonMember(canonical)
     end
 
     local SF = ParentAddon()
-    local profile = Integration.GetActiveProfile()
+    if not profile then
+        profile = Integration.GetSessionProfile()
+    end
     if not IsEffectiveAdmin(profile) then
         return false
     end
@@ -339,14 +397,14 @@ function Integration.ProcessCanonicalAward(canonical, source)
         return "seen"
     end
 
-    local profile = Integration.GetActiveProfile()
-    if not profile or not profile.TryAddRCLootCouncilAward then
-        return "no_profile"
+    local profile, profileErr = Integration.GetSessionProfile()
+    if not profile then
+        return profileErr or "no_profile"
     end
 
     local member = profile.getMemberByID and profile:getMemberByID(canonical.winner)
     if not member then
-        Integration.WarnNonMember(canonical)
+        Integration.WarnNonMember(canonical, profile)
         Integration.MarkSeen(canonical.awardKey)
         return "not_member"
     end
@@ -535,7 +593,7 @@ function Integration.AreHooksInstalled()
 end
 
 local function GetProfile()
-    return Integration.GetActiveProfile()
+    return Integration.GetSettingsProfile()
 end
 
 function Integration.RegisterSettingsPage()

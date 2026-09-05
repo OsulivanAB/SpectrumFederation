@@ -10,17 +10,21 @@ Recording requires all of the following:
 
 - the child addon is enabled;
 - a Spectrum Loot Helper session is active;
-- the award belongs to the active profile;
-- the local client is a Spectrum profile admin;
-- the profile's RC integration settings allow that response.
+- the award belongs to the profile attached to that session;
+- the local client is an admin of the session profile;
+- that profile's RC integration settings allow that response.
 
-The Loot Log **Author** is the RC master looter who awarded the item. The Spectrum writer must still be a profile admin. Any eligible Spectrum admin may create the log; there is no coordinator-only writer restriction.
+The locally selected Loot Helper profile is not used for live recording. If the session `profileId` cannot be resolved locally, the award is ignored rather than written to another profile.
 
-If the winner is not a member of the active profile, no Loot Log is created. Spectrum admins see a local warning only. Replay and reload do not repeat that warning for the same award in the same session.
+The Loot Log **Author** is the RC master looter who awarded the item. The Spectrum writer must still be an admin of the session profile. Any eligible Spectrum admin may create the log; there is no coordinator-only writer restriction.
+
+If the winner is not a member of the session profile, no Loot Log is created. Admins of the session profile see a local warning only. Replay and reload do not repeat that warning for the same award in the same session.
 
 ## Settings
 
 Open `/sf` → **Loot Helper → RC Loot Council**. The page appears only when this child addon is enabled. It does not add a redundant **Optional** sidebar row.
+
+While a Loot Helper session is active, the page shows and edits that session profile's RC settings, because those settings control live recording. With no session, it uses the currently selected Loot Helper profile.
 
 Settings are profile-scoped and admin-editable:
 

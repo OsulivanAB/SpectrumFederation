@@ -148,6 +148,14 @@ end
 
 local Sync = SF.LootHelperSync
 
+function Sync:IsSessionActive()
+    return self.state and self.state.active == true
+end
+
+function Sync:GetSessionProfileId()
+    return self:IsSessionActive() and self.state.profileId or nil
+end
+
 function Sync:FindLocalProfileById(profileId)
     return SF.lootHelperDB and SF.lootHelperDB.profiles and SF.lootHelperDB.profiles[profileId]
 end
@@ -228,6 +236,24 @@ end
 local function setActive(profile)
     SF:SetActiveProfileById(profile:GetProfileId())
     Sync.state.profileId = profile:GetProfileId()
+end
+
+local function selectProfile(profile)
+    SF:SetActiveProfileById(profile:GetProfileId())
+end
+
+local function startSessionOn(profile)
+    Sync.state.active = true
+    Sync.state.sessionId = "SES1"
+    Sync.state.profileId = profile and profile.GetProfileId and profile:GetProfileId() or profile
+end
+
+local function makeProfileOwnedBy(name, ownerId)
+    local previous = PLAYER
+    PLAYER = ownerId
+    local profile = makeProfile(name)
+    PLAYER = previous
+    return profile
 end
 
 local function historyTable(overrides)
@@ -929,6 +955,96 @@ end
 Integration.ClearSessionMemory()
 assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", PLAYER), "duplicate", "remote observation of the same local award converges without a second log")
 assertEq(countRCLogs(profile), 3, "local and remote observations of the same award share one stored row")
+
+-- ---------------------------------------------------------------------------
+-- Session profile vs selected profile (A vs B)
+-- ---------------------------------------------------------------------------
+function Sync:IsSessionActive()
+    return self.state and self.state.active == true
+end
+resetEnv()
+local sessionA = makeProfile("Session A")
+local selectedB = makeProfile("Selected B")
+addMember(sessionA, WINNER)
+startSessionOn(sessionA)
+selectProfile(selectedB)
+assertEq(Integration.GetSessionProfile(), sessionA, "runtime resolver uses the session profile")
+assertEq(Integration.GetSelectedProfile(), selectedB, "selected profile remains B")
+assertEq(Integration.GetSettingsProfile(), sessionA, "Settings follow the session profile while a session is active")
+assertEq(Integration.HandleHistory(AWARDER, WINNER, historyTable({ id = "1700002000-20" }), "acecomm"), "recorded", "member-only-in-session-profile award is recorded in A")
+assertEq(countRCLogs(sessionA), 1, "Case A records into the session profile")
+assertEq(countRCLogs(selectedB), 0, "Case A does not write the selected profile")
+assertEq(#printed, 0, "Case A does not emit a false non-member warning")
+
+resetEnv()
+sessionA = makeProfile("Session A Admin")
+addMember(sessionA, WINNER)
+selectedB = makeProfileOwnedBy("Selected B Other", "OtherOwner-Garona")
+startSessionOn(sessionA)
+selectProfile(selectedB)
+assertTrue(sessionA:IsCurrentUserAdmin(), "writer is admin of the session profile")
+assertFalse(selectedB:IsCurrentUserAdmin(), "writer is not admin of the selected profile")
+assertEq(Integration.HandleHistory(AWARDER, WINNER, historyTable({ id = "1700002100-21" }), "acecomm"), "recorded", "admin-only-in-session-profile can still record into A")
+assertEq(countRCLogs(sessionA), 1, "Case B records into A despite B permission denial")
+assertEq(countRCLogs(selectedB), 0, "Case B does not write B")
+
+resetEnv()
+sessionA = makeProfile("Session A Empty")
+selectedB = makeProfile("Selected B Member")
+addMember(selectedB, WINNER)
+startSessionOn(sessionA)
+selectProfile(selectedB)
+assertEq(Integration.HandleHistory(AWARDER, WINNER, historyTable({ id = "1700002200-22" }), "acecomm"), "not_member", "recipient only in selected profile is not recorded")
+assertEq(countRCLogs(sessionA), 0, "Case C writes nothing to the session profile")
+assertEq(countRCLogs(selectedB), 0, "Case C does not write the selected profile")
+assertEq(#printed, 1, "Case C warns the session-profile admin")
+assertTrue(printed[1][2]:find("not a member of the active profile", 1, true) ~= nil, "Case C warning names the session-profile membership miss")
+
+resetEnv()
+sessionA = makeProfile("Session A Both")
+selectedB = makeProfile("Selected B Both")
+addMember(sessionA, WINNER)
+addMember(selectedB, WINNER)
+startSessionOn(sessionA)
+selectProfile(selectedB)
+assertEq(Integration.HandleHistory(AWARDER, WINNER, historyTable({ id = "1700002300-23" }), "acecomm"), "recorded", "shared recipient still routes to the session profile")
+assertEq(countRCLogs(sessionA), 1, "Case D records only into A")
+assertEq(countRCLogs(selectedB), 0, "Case D does not copy the award into B")
+
+resetEnv()
+sessionA = makeProfile("Session A Settings")
+selectedB = makeProfile("Selected B Settings")
+addMember(sessionA, WINNER)
+addMember(selectedB, WINNER)
+assertTrue(sessionA:SetRCLootCouncilRecordAwards(true), "A can enable RC recording")
+assertTrue(selectedB:SetRCLootCouncilRecordAwards(false), "B can disable RC recording")
+startSessionOn(sessionA)
+selectProfile(selectedB)
+assertEq(Integration.HandleHistory(AWARDER, WINNER, historyTable({ id = "1700002400-24" }), "acecomm"), "recorded", "enabled session-profile settings allow the award")
+assertEq(countRCLogs(sessionA), 1, "Case E records when A logging is on")
+assertEq(countRCLogs(selectedB), 0, "Case E ignores B's disabled setting for insertion")
+assertTrue(sessionA:SetRCLootCouncilRecordAwards(false), "A can disable RC recording")
+assertTrue(selectedB:SetRCLootCouncilRecordAwards(true), "B can enable RC recording")
+Integration.ClearSessionMemory()
+printed = {}
+assertEq(Integration.HandleHistory(AWARDER, WINNER, historyTable({ id = "1700002500-25" }), "acecomm"), "filtered", "disabled session-profile settings reject the award")
+assertEq(countRCLogs(sessionA), 1, "Case E does not add a second A log after A is disabled")
+assertEq(countRCLogs(selectedB), 0, "Case E still does not write B after B is enabled")
+
+resetEnv()
+selectedB = makeProfile("Selected B Orphan")
+addMember(selectedB, WINNER)
+startSessionOn(nil)
+Sync.state.active = true
+Sync.state.profileId = "missing-session-profile"
+selectProfile(selectedB)
+assertEq(Integration.GetSessionProfile(), nil, "missing local session profile does not resolve")
+assertEq(Integration.GetSettingsProfile(), nil, "Settings do not fall back to B during an unresolved session")
+assertEq(Integration.HandleHistory(AWARDER, WINNER, historyTable({ id = "1700002600-26" }), "acecomm"), "no_profile", "unresolved session profile fails safely")
+assertEq(countRCLogs(selectedB), 0, "Case F does not write the selected profile")
+
+Sync.state.active = false
+assertEq(Integration.GetSettingsProfile(), selectedB, "Settings use the selected profile when no session is active")
 
 local registeredPages = {}
 SF.SettingsUI = {
