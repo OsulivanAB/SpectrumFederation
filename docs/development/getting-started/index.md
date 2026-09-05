@@ -101,6 +101,12 @@ python -m pytest tests/test_mouse_tracer.py
 
 # Loot Helper window minimize/expand anchoring (loads production Window.lua; requires lua5.1)
 python -m pytest tests/test_loot_helper_window.py
+
+# PR template or `validate_pr_template.py`
+python -m pytest tests/test_pr_template.py
+
+# GitHub/Wago release classification and Wago publishing
+python -m pytest tests/test_publish_release.py
 ```
 
 Do not weaken a check to make a change pass.

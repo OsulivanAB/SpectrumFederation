@@ -1,7 +1,8 @@
 """
-Package addon and create GitHub release.
+Package addon and create GitHub and Wago releases.
 
-Creates a zip file with proper structure and publishes to GitHub Releases.
+Creates a zip file with proper structure, publishes to GitHub Releases,
+and uploads the same zip to Wago Addons with an explicit stability value.
 """
 
 import argparse
@@ -11,11 +12,349 @@ import re
 import shlex
 import subprocess
 import sys
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import blizzard_api
+
+WAGO_API_BASE = "https://addons.wago.io/api"
+WAGO_GAME_DATA_URL = f"{WAGO_API_BASE}/data/game"
+WAGO_API_KEY_ENV = "WAGO_API_KEY"
+WAGO_LEGACY_WEBHOOK_SECRET_ENV = "WAGO_API_SECRET"
+WAGO_USER_AGENT = (
+    "SpectrumFederation-PublishRelease/1.0 "
+    "(+https://github.com/OsulivanAB/SpectrumFederation)"
+)
+WAGO_STABILITY_VALUES = ("stable", "beta", "alpha")
+WAGO_UPLOAD_TIMEOUT_SECONDS = 60
+WAGO_GAME_DATA_TIMEOUT_SECONDS = 15
+WAGO_DUPLICATE_PHRASES = (
+    "already exists",
+    "already been uploaded",
+    "already been released",
+    "already been published",
+    "duplicate version",
+    "version already",
+    "label already",
+    "label has already",
+    "release already",
+)
+PRERELEASE_MARKER_RE = re.compile(
+    r"-(alpha|beta|rc)(?=[.\-]|$)",
+    re.IGNORECASE,
+)
+SECRET_LIKE_RE = re.compile(
+    r"(authorization:\s*(?:token|bearer|basic)\s+)\S+"
+    r"|(bearer\s+)[A-Za-z0-9._\-]+"
+    r"|\b(gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b"
+    r"|(\b(?:WAGO_API_KEY|WAGO_API_SECRET|GH_TOKEN|GITHUB_TOKEN)\s*[:=]\s*)\S+",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class ReleaseClassification:
+    """Shared GitHub/Wago release classification derived from the version string."""
+
+    version: str
+    is_prerelease: bool
+    wago_stability: str
+    github_release_kind: str
+
+
+@dataclass(frozen=True)
+class WagoPublishPlan:
+    """Non-secret Wago upload plan used by dry-run logging and live publishing."""
+
+    project_id: str
+    label: str
+    stability: str
+    supported_retail_patch: str
+    patch_match: str
+    changelog: str
+    zip_path: Path
+    endpoint: str
+
+
+def classify_release(version):
+    """Classify a version for GitHub prerelease flags and Wago stability.
+
+    Matching is case-insensitive and looks for `-alpha`, `-beta`, and `-rc`
+    prerelease identifiers. `-rc` maps to Wago `beta`.
+    """
+    version = version or ""
+    match = PRERELEASE_MARKER_RE.search(version)
+    if not match:
+        return ReleaseClassification(
+            version=version,
+            is_prerelease=False,
+            wago_stability="stable",
+            github_release_kind="release",
+        )
+
+    marker = match.group(1).lower()
+    stability = "alpha" if marker == "alpha" else "beta"
+    return ReleaseClassification(
+        version=version,
+        is_prerelease=True,
+        wago_stability=stability,
+        github_release_kind="prerelease",
+    )
+
+
+def toc_path_for_addon(addon_name):
+    """Return the primary TOC path for an addon folder."""
+    return Path(addon_name) / f"{addon_name}.toc"
+
+
+def read_toc_field(toc_file, field_name):
+    """Return a TOC metadata field value or None."""
+    toc_file = Path(toc_file)
+    if not toc_file.exists():
+        return None
+    content = toc_file.read_text(encoding="utf-8")
+    pattern = re.compile(rf"^## {re.escape(field_name)}:\s*(.+)$", re.MULTILINE)
+    match = pattern.search(content)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def get_wago_project_id(addon_name):
+    """Read the public Wago project ID from the parent addon's TOC."""
+    toc_file = toc_path_for_addon(addon_name)
+    project_id = read_toc_field(toc_file, "X-Wago-ID")
+    if not project_id:
+        print(f"::error ::Missing ## X-Wago-ID in {toc_file}")
+        print("          Add the public Wago project ID to the parent TOC.")
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9]{8}", project_id):
+        print(f"::error ::X-Wago-ID '{project_id}' in {toc_file} is not an 8-character Wago project ID")
+        return None
+    return project_id
+
+
+def wago_version_endpoint(project_id):
+    """Return the documented Wago version-upload URL for a project."""
+    return f"{WAGO_API_BASE}/projects/{project_id}/version"
+
+
+def interface_to_retail_patch(interface):
+    """Convert a 6-digit TOC Interface value to a Wago retail patch string."""
+    return blizzard_api.interface_to_display(interface)
+
+
+def parse_patch_tuple(patch):
+    """Parse a dotted patch string into comparable integers."""
+    parts = str(patch).split(".")
+    if not parts or any(not part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def select_wago_retail_patch(desired_patch, available_patches):
+    """Require an exact Wago catalog match for the desired Retail patch.
+
+    Never fall back to an older advertised patch. Publishing a newer Interface
+    as an older `supported_retail_patch` would silently claim the wrong
+    compatibility window.
+    """
+    if parse_patch_tuple(desired_patch) is None:
+        raise ValueError(f"Invalid retail patch '{desired_patch}'")
+
+    normalized = [str(patch) for patch in available_patches or [] if str(patch).strip()]
+    if desired_patch in normalized:
+        return desired_patch, "exact"
+
+    raise ValueError(
+        f"Wago does not currently advertise Retail patch '{desired_patch}' in "
+        f"{WAGO_GAME_DATA_URL}. Live publishing requires an exact catalog match "
+        "and will not claim compatibility with an older patch."
+    )
+
+
+def fetch_wago_game_data(timeout=WAGO_GAME_DATA_TIMEOUT_SECONDS):
+    """Fetch Wago's public game-version catalog. Returns None on failure."""
+    request = urllib_request.Request(
+        WAGO_GAME_DATA_URL,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": WAGO_USER_AGENT,
+        },
+        method="GET",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib_error.URLError, TimeoutError, json.JSONDecodeError, OSError, UnicodeError) as error:
+        print(f"[publish-release] Warning: Failed to fetch Wago game catalog: {error}")
+        return None
+
+    if not isinstance(payload, dict):
+        print("[publish-release] Warning: Wago game catalog was not a JSON object")
+        return None
+    return payload
+
+
+def resolve_supported_retail_patch(interface, game_data=None):
+    """Return (patch, match_kind) for Wago's supported_retail_patch field."""
+    desired_patch = interface_to_retail_patch(interface)
+    if not game_data:
+        raise ValueError(
+            f"Could not load Wago's Retail patch catalog from {WAGO_GAME_DATA_URL}. "
+            f"Requested patch '{desired_patch}' cannot be verified. "
+            "Live publishing requires an exact catalog match."
+        )
+
+    available = (game_data.get("patches") or {}).get("retail") or []
+    return select_wago_retail_patch(desired_patch, available)
+
+
+def build_wago_metadata(label, stability, changelog, supported_retail_patch):
+    """Build the JSON object Wago expects in the multipart `metadata` field."""
+    if stability not in WAGO_STABILITY_VALUES:
+        raise ValueError(f"Invalid Wago stability '{stability}'")
+    return {
+        "label": label,
+        "stability": stability,
+        "changelog": changelog or "",
+        "supported_retail_patch": supported_retail_patch,
+    }
+
+
+def encode_multipart_form(fields, files):
+    """Encode multipart/form-data without placing credentials in the body."""
+    boundary = f"----SpectrumFederationFormBoundary{uuid.uuid4().hex}"
+    chunks = []
+
+    for name, value in fields.items():
+        chunks.append(f"--{boundary}".encode())
+        chunks.append(f'Content-Disposition: form-data; name="{name}"'.encode())
+        chunks.append(b"")
+        chunks.append(value.encode() if isinstance(value, str) else value)
+
+    for name, path in files.items():
+        file_path = Path(path)
+        filename = file_path.name.replace('"', "")
+        chunks.append(f"--{boundary}".encode())
+        chunks.append(
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"'.encode()
+        )
+        chunks.append(b"Content-Type: application/zip")
+        chunks.append(b"")
+        chunks.append(file_path.read_bytes())
+
+    chunks.append(f"--{boundary}--".encode())
+    chunks.append(b"")
+    return b"\r\n".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def sanitize_output(text):
+    """Redact credentials and token-like values from logged output."""
+    if not text:
+        return text
+
+    def _redact(match):
+        prefix = match.group(1) or match.group(2) or match.group(4) or ""
+        if prefix:
+            return f"{prefix}***"
+        return "***"
+
+    return SECRET_LIKE_RE.sub(_redact, str(text))
+
+
+def format_command(cmd):
+    """Format a subprocess command for logging."""
+    return shlex.join(str(part) for part in cmd)
+
+
+def log_command_failure(prefix, error):
+    """Log a subprocess failure with masked stdout/stderr."""
+    print(f"::error ::{prefix} (exit code {error.returncode})")
+
+    if error.cmd:
+        print(f"[publish-release] Command: {format_command(error.cmd)}")
+
+    if error.stdout:
+        print("[publish-release] stdout:")
+        print(sanitize_output(error.stdout.strip()))
+
+    if error.stderr:
+        print("[publish-release] stderr:", file=sys.stderr)
+        print(sanitize_output(error.stderr.strip()), file=sys.stderr)
+
+
+def read_http_error_body(error):
+    """Read an HTTPError body without logging request headers."""
+    try:
+        raw = error.read()
+    except (OSError, AttributeError):
+        return ""
+    if not raw:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
+
+
+def summarize_wago_http_error(status, body):
+    """Return a credential-free summary of a Wago HTTP response."""
+    text = sanitize_output((body or "").strip())
+    if not text:
+        return f"HTTP {status}"
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        compact = re.sub(r"\s+", " ", text)
+        return f"HTTP {status}: {compact[:300]}"
+
+    if isinstance(payload, dict):
+        message = (
+            payload.get("message")
+            or payload.get("error")
+            or payload.get("detail")
+            or payload.get("title")
+        )
+        if message:
+            return f"HTTP {status}: {sanitize_output(str(message))[:300]}"
+    compact = re.sub(r"\s+", " ", text)
+    return f"HTTP {status}: {compact[:300]}"
+
+
+def is_existing_wago_release(status, body):
+    """Return True only when the response clearly says this version exists.
+
+    Wago's public docs do not define HTTP 409 as "already exists". An empty
+    or generic conflict body is treated as a hard failure, not a retry success.
+    """
+    if status not in (400, 409, 422):
+        return False
+    text = (body or "").lower()
+    return any(phrase in text for phrase in WAGO_DUPLICATE_PHRASES)
+
+
+def _is_beta_prerelease(version):
+    """Return True for -beta versions only, not -alpha or -rc."""
+    match = PRERELEASE_MARKER_RE.search(version or "")
+    return bool(match and match.group(1).lower() == "beta")
 
 
 def get_changelog_for_version(version):
     """Extract changelog content for a specific version from CHANGELOG.md.
+
+    Beta versions first look for an exact `## [X.Y.Z-beta.N]` heading and then
+    fall back to `## [Unreleased - Beta]`, matching the existing changelog
+    generator. Stable, alpha, and RC versions use exact-heading lookup only.
+    Current automation does not create alpha/RC sections, so those releases
+    reuse whatever exact heading already exists and do not invent new ones.
     
     Args:
         version: Version string (e.g., '0.0.18' or '0.0.18-beta.1')
@@ -33,20 +372,18 @@ def get_changelog_for_version(version):
         with open(changelog_path, "r") as f:
             content = f.read()
         
-        # For beta versions, try both the exact version and the [Unreleased - Beta] section
-        if "-beta" in version:
-            # First try to find exact version match
-            pattern = rf"^## \[{re.escape(version)}\].*?$"
-            match = re.search(pattern, content, re.MULTILINE)
-            
-            if not match:
-                # Fall back to [Unreleased - Beta] section
-                pattern = r"^## \[Unreleased - Beta\].*?$"
-                match = re.search(pattern, content, re.MULTILINE)
-        else:
-            # For stable releases, look for exact version
-            pattern = rf"^## \[{re.escape(version)}\].*?$"
-            match = re.search(pattern, content, re.MULTILINE)
+        pattern = rf"^## \[{re.escape(version)}\].*?$"
+        match = re.search(pattern, content, re.MULTILINE)
+
+        # Beta-only fallback: changelog automation still writes
+        # `[Unreleased - Beta]` for in-progress beta work. Do not reuse that
+        # heading for alpha or RC versions.
+        if not match and _is_beta_prerelease(version):
+            match = re.search(
+                r"^## \[Unreleased - Beta\].*?$",
+                content,
+                re.MULTILINE,
+            )
         
         if not match:
             print(f"[publish-release] Warning: No changelog entry found for version {version}")
@@ -151,47 +488,20 @@ def create_addon_zip(addon_name, version):
         return None
 
 
-def sanitize_output(text):
-    """Redact token-like values from subprocess output."""
-    if not text:
-        return text
-
-    sanitized = re.sub(r"(authorization:\s*(?:token|bearer|basic)\s+)\S+", r"\1***", text, flags=re.IGNORECASE)
-    sanitized = re.sub(r"\b(gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b", "***", sanitized)
-    return sanitized
-
-
-def format_command(cmd):
-    """Format a subprocess command for logging."""
-    return shlex.join(str(part) for part in cmd)
-
-
-def log_command_failure(prefix, error):
-    """Log a subprocess failure with masked stdout/stderr."""
-    print(f"::error ::{prefix} (exit code {error.returncode})")
-
-    if error.cmd:
-        print(f"[publish-release] Command: {format_command(error.cmd)}")
-
-    if error.stdout:
-        print("[publish-release] stdout:")
-        print(sanitize_output(error.stdout.strip()))
-
-    if error.stderr:
-        print("[publish-release] stderr:", file=sys.stderr)
-        print(sanitize_output(error.stderr.strip()), file=sys.stderr)
-
-
-def build_release_notes(version, repo):
+def build_release_notes(version, repo, classification=None):
     """Build release notes for a version."""
+    classification = classification or classify_release(version)
     changelog = get_changelog_for_version(version)
 
-    if "-beta" in version:
-        notes = f"Beta release {version}\n\n"
-        branch = "beta"
-    else:
+    if classification.wago_stability == "stable":
         notes = f"Stable release {version}\n\n"
         branch = "main"
+    elif classification.wago_stability == "alpha":
+        notes = f"Alpha release {version}\n\n"
+        branch = "beta"
+    else:
+        notes = f"Beta release {version}\n\n"
+        branch = "beta"
 
     if changelog:
         notes += changelog + "\n\n"
@@ -273,37 +583,36 @@ def update_github_release(tag_name, release_name, notes_path, zip_path, json_pat
             text=True,
             env=env,
         )
-        print("[publish-release] ✓ Release updated successfully")
-        return True
+        print("[publish-release] ✓ GitHub release updated successfully")
+        return "updated"
     except subprocess.CalledProcessError as error:
         log_command_failure("Failed to update GitHub release", error)
-        return False
+        return None
 
 
-def create_github_release(version, zip_path, json_path, repo, is_prerelease=False, dry_run=False):
+def create_github_release(version, zip_path, json_path, repo, classification, notes_path, dry_run=False):
     """Create GitHub release and upload assets using gh CLI."""
+    tag_name = f"v{version}"
+    release_name = f"Release {version}"
+    is_prerelease = classification.is_prerelease
+
+    if dry_run:
+        print("[publish-release] DRY RUN - Would create GitHub release:")
+        print(f"  Tag: {tag_name}")
+        print(f"  Name: {release_name}")
+        print(f"  GitHub classification: {classification.github_release_kind}")
+        print(f"  Prerelease: {is_prerelease}")
+        print(f"  Assets: {zip_path}, {json_path}")
+        print(f"  Notes file: {notes_path}")
+        return "dry-run"
+
     # Support both workflow GH_TOKEN usage and local/manual GITHUB_TOKEN usage.
     github_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if not github_token:
         print("Error: GH_TOKEN or GITHUB_TOKEN environment variable not set")
-        return False
+        return None
 
-    tag_name = f"v{version}"
-    release_name = f"Release {version}"
-
-    notes = build_release_notes(version, repo)
-    notes_path = write_release_notes(notes)
     gh_env = {**os.environ, "GH_TOKEN": github_token}
-
-    if dry_run:
-        print("[publish-release] DRY RUN - Would create release:")
-        print(f"  Tag: {tag_name}")
-        print(f"  Name: {release_name}")
-        print(f"  Prerelease: {is_prerelease}")
-        print(f"  Assets: {zip_path}, {json_path}")
-        print(f"  Notes file: {notes_path}")
-        print(f"  Notes: {notes}")
-        return True
 
     print(f"[publish-release] Creating GitHub release: {tag_name}")
 
@@ -339,22 +648,295 @@ def create_github_release(version, zip_path, json_path, repo, is_prerelease=Fals
             env=gh_env
         )
 
-        print("[publish-release] ✓ Release created successfully")
+        print("[publish-release] ✓ GitHub release created successfully")
         if result.stdout:
-            print(result.stdout)
+            print(sanitize_output(result.stdout))
 
-        return True
+        return "created"
     except subprocess.CalledProcessError as error:
         log_command_failure("Failed to create GitHub release", error)
-        return False
+        return None
     except FileNotFoundError as error:
         print(f"::error ::Failed to invoke GitHub CLI: {error}")
+        return None
+
+
+def get_wago_api_key(*, required):
+    """Return the Wago developer API key, never the legacy webhook secret."""
+    raw_key = os.environ.get(WAGO_API_KEY_ENV)
+    key = raw_key.strip() if raw_key else ""
+    if key:
+        return key
+    if required:
+        print(
+            f"::error ::{WAGO_API_KEY_ENV} is not set. "
+            "Direct Wago publishing requires the Wago developer API key."
+        )
+        print(
+            f"[publish-release] {WAGO_LEGACY_WEBHOOK_SECRET_ENV} is the legacy "
+            "GitHub webhook signing secret and must not be used for the Wago API."
+        )
+    return None
+
+
+def build_wago_publish_plan(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    changelog,
+    game_data=None,
+):
+    """Build a Wago upload plan from local release metadata."""
+    project_id = get_wago_project_id(addon_name)
+    if not project_id:
+        return None
+
+    try:
+        supported_patch, patch_match = resolve_supported_retail_patch(interface, game_data)
+    except ValueError as error:
+        print(f"::error ::{error}")
+        return None
+
+    return WagoPublishPlan(
+        project_id=project_id,
+        label=version,
+        stability=classification.wago_stability,
+        supported_retail_patch=supported_patch,
+        patch_match=patch_match,
+        changelog=changelog,
+        zip_path=Path(zip_path),
+        endpoint=wago_version_endpoint(project_id),
+    )
+
+
+def log_github_succeeded_wago_failed():
+    """Explain that CurseForge is intact and Wago can be retried."""
+    print(
+        "[publish-release] GitHub release succeeded, but Wago publication failed. "
+        "Rerun this script to retry Wago without deleting the GitHub Release. "
+        "Do not roll back CurseForge."
+    )
+
+
+def resolve_wago_publish_plan(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    changelog,
+):
+    """Fetch Wago's catalog and build a publish plan. Returns None on failure."""
+    game_data = fetch_wago_game_data()
+    return build_wago_publish_plan(
+        version=version,
+        classification=classification,
+        addon_name=addon_name,
+        interface=interface,
+        zip_path=zip_path,
+        changelog=changelog,
+        game_data=game_data,
+    )
+
+
+def log_wago_summary(plan):
+    """Log non-secret Wago plan fields after they have been resolved."""
+    print(f"[publish-release] Wago project ID: {plan.project_id}")
+    print(
+        f"[publish-release] Supported retail patch: {plan.supported_retail_patch} "
+        f"({plan.patch_match})"
+    )
+
+
+def publish_github_then_wago(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    json_path,
+    notes,
+    notes_path,
+    repo,
+    dry_run,
+):
+    """Publish GitHub first on live runs; validate Wago first only for dry-run.
+
+    Live Wago catalog, metadata, auth, and upload failures happen after the
+    GitHub Release exists so CurseForge still receives the Release event.
+    """
+    def resolve_plan():
+        return resolve_wago_publish_plan(
+            version=version,
+            classification=classification,
+            addon_name=addon_name,
+            interface=interface,
+            zip_path=zip_path,
+            changelog=notes,
+        )
+
+    if dry_run:
+        wago_plan = resolve_plan()
+        if not wago_plan:
+            return False
+        log_wago_summary(wago_plan)
+        github_action = create_github_release(
+            version,
+            zip_path,
+            json_path,
+            repo,
+            classification,
+            notes_path,
+            dry_run=True,
+        )
+        if not github_action:
+            return False
+        print(f"[publish-release] GitHub release action: {github_action}")
+        wago_action = publish_to_wago(wago_plan, dry_run=True)
+        if not wago_action:
+            return False
+        print(f"[publish-release] Wago publication action: {wago_action}")
+        return True
+
+    github_action = create_github_release(
+        version,
+        zip_path,
+        json_path,
+        repo,
+        classification,
+        notes_path,
+        dry_run=False,
+    )
+    if not github_action:
         return False
+    print(f"[publish-release] GitHub release action: {github_action}")
+
+    wago_plan = resolve_plan()
+    if not wago_plan:
+        log_github_succeeded_wago_failed()
+        return False
+    log_wago_summary(wago_plan)
+
+    wago_action = publish_to_wago(wago_plan, dry_run=False)
+    if not wago_action:
+        log_github_succeeded_wago_failed()
+        return False
+    print(f"[publish-release] Wago publication action: {wago_action}")
+    return True
+
+
+def log_wago_plan(plan, *, dry_run=False):
+    """Log non-secret Wago publish state."""
+    prefix = "[publish-release] DRY RUN - Would upload to Wago:" if dry_run else "[publish-release] Wago upload:"
+    print(prefix)
+    print(f"  Endpoint: POST {plan.endpoint}")
+    print(f"  Project ID: {plan.project_id}")
+    print(f"  Label: {plan.label}")
+    print(f"  Stability: {plan.stability}")
+    print(f"  Supported retail patch: {plan.supported_retail_patch} ({plan.patch_match})")
+    print(f"  Artifact: {plan.zip_path.name}")
+    print("  Authorization: Bearer <redacted>" if not dry_run else "  Authorization: not sent (dry-run)")
+
+
+def publish_to_wago(plan, *, dry_run=False, opener=None):
+    """Upload the addon zip to Wago using the documented multipart API."""
+    if dry_run:
+        log_wago_plan(plan, dry_run=True)
+        return "dry-run"
+
+    api_key = get_wago_api_key(required=True)
+    if not api_key:
+        return None
+
+    if not plan.zip_path.exists():
+        print(f"::error ::Wago artifact does not exist: {plan.zip_path}")
+        return None
+
+    metadata = build_wago_metadata(
+        plan.label,
+        plan.stability,
+        plan.changelog,
+        plan.supported_retail_patch,
+    )
+    body, content_type = encode_multipart_form(
+        {"metadata": json.dumps(metadata)},
+        {"file": plan.zip_path},
+    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "Content-Type": content_type,
+        "User-Agent": WAGO_USER_AGENT,
+    }
+    request = urllib_request.Request(
+        plan.endpoint,
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    log_wago_plan(plan, dry_run=False)
+    urlopen = opener or urllib_request.urlopen
+
+    try:
+        with urlopen(request, timeout=WAGO_UPLOAD_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", 200)
+            response_body = response.read().decode("utf-8", errors="replace")
+    except urllib_error.HTTPError as error:
+        status = error.code
+        response_body = read_http_error_body(error)
+        summary = summarize_wago_http_error(status, response_body)
+        if is_existing_wago_release(status, response_body):
+            print(
+                "[publish-release] ✓ Wago already has this version; "
+                f"treating as success ({summary})"
+            )
+            return "already-exists"
+        if status in (401, 403):
+            print(f"::error ::Wago authentication failed ({summary})")
+        elif status == 404:
+            print(
+                f"::error ::Wago project '{plan.project_id}' was not found ({summary})"
+            )
+        elif status == 409:
+            print(
+                f"::error ::Wago returned HTTP 409 without a clear already-exists "
+                f"indication ({summary})"
+            )
+        elif status in (400, 422):
+            print(f"::error ::Wago rejected the release metadata or file ({summary})")
+        elif status >= 500:
+            print(f"::error ::Wago server error ({summary})")
+        else:
+            print(f"::error ::Wago upload failed ({summary})")
+        return None
+    except (urllib_error.URLError, TimeoutError, OSError) as error:
+        print(f"::error ::Wago upload failed: {sanitize_output(str(error))}")
+        return None
+
+    if status in (200, 201):
+        print(f"[publish-release] ✓ Wago publication succeeded (HTTP {status})")
+        return "uploaded"
+
+    summary = summarize_wago_http_error(status, response_body)
+    if is_existing_wago_release(status, response_body):
+        print(
+            "[publish-release] ✓ Wago already has this version; "
+            f"treating as success ({summary})"
+        )
+        return "already-exists"
+
+    print(f"::error ::Wago upload returned unexpected status ({summary})")
+    return None
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Package addon and create GitHub release"
+        description="Package addon and create GitHub and Wago releases"
     )
     parser.add_argument(
         "version",
@@ -383,14 +965,14 @@ def main():
     )
     
     args = parser.parse_args()
-    
-    # Determine if this is a prerelease
-    is_prerelease = "-beta" in args.version or "-alpha" in args.version or "-rc" in args.version
+    classification = classify_release(args.version)
     
     print("[publish-release] Starting release process...")
     print(f"[publish-release] Version: {args.version}")
     print(f"[publish-release] Interface: {args.interface}")
-    print(f"[publish-release] Prerelease: {is_prerelease}")
+    print(f"[publish-release] GitHub classification: {classification.github_release_kind}")
+    print(f"[publish-release] GitHub prerelease: {classification.is_prerelease}")
+    print(f"[publish-release] Wago stability: {classification.wago_stability}")
     
     # Construct zip filename
     zip_filename = f"{args.addon_name}-{args.version}.zip"
@@ -407,20 +989,26 @@ def main():
     zip_path = create_addon_zip(args.addon_name, args.version)
     if not zip_path:
         sys.exit(1)
-    
-    # Create GitHub release
-    success = create_github_release(
-        args.version,
-        zip_path,
-        json_path,
-        args.repo,
-        is_prerelease=is_prerelease,
-        dry_run=args.dry_run
+
+    notes = build_release_notes(args.version, args.repo, classification)
+    notes_path = write_release_notes(notes)
+    print(f"[publish-release] ZIP artifact: {zip_path.name}")
+
+    published = publish_github_then_wago(
+        version=args.version,
+        classification=classification,
+        addon_name=args.addon_name,
+        interface=args.interface,
+        zip_path=zip_path,
+        json_path=json_path,
+        notes=notes,
+        notes_path=notes_path,
+        repo=args.repo,
+        dry_run=args.dry_run,
     )
-    
-    if not success:
+    if not published:
         sys.exit(1)
-    
+
     print("[publish-release] ✅ Release published successfully")
     return 0
 

@@ -6,6 +6,7 @@
 ## IconTexture: Interface\AddOns\SpectrumFederation\media\Icons\SpectrumFederationIcon
 ## X-Website: https://github.com/OsulivanAB/SpectrumFederation
 ## X-Documentation: https://osullivanab.github.io/SpectrumFederation/
+## X-Wago-ID: BNBmnlGx
 ## SavedVariables: SpectrumFederationDB, SpectrumFederationDebugDB
 ## SavedVariablesPerCharacter: SpectrumFederationCharDB
 

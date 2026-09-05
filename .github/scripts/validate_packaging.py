@@ -87,6 +87,30 @@ def validate_interface_field(toc_file):
     return True
 
 
+def validate_wago_project_id(parent_toc, child_toc=None):
+    """Verify the parent TOC has a public Wago project ID for direct publishing."""
+    wago_id = toc_field(parent_toc, "X-Wago-ID")
+    if not wago_id:
+        print(f"::error ::No '## X-Wago-ID:' line found in {parent_toc}")
+        print("          Direct Wago publishing reads the project ID from the parent TOC")
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9]{8}", wago_id):
+        print(
+            f"::error ::X-Wago-ID '{wago_id}' in {parent_toc} is not an 8-character Wago project ID"
+        )
+        return False
+    if child_toc is not None:
+        child_wago_id = toc_field(child_toc, "X-Wago-ID")
+        if child_wago_id and child_wago_id != wago_id:
+            print(
+                f"::error ::Child X-Wago-ID '{child_wago_id}' does not match parent '{wago_id}'"
+            )
+            print("          Nested child addons share the parent Wago project; do not use a second ID")
+            return False
+    print(f"[validate-packaging] Parent X-Wago-ID '{wago_id}' looks OK")
+    return True
+
+
 def validate_child_relationship(parent_name, child_name, parent_toc, child_toc):
     """Verify child metadata, dependency direction, and version alignment."""
     parent_interface = toc_field(parent_toc, "Interface")
@@ -218,7 +242,12 @@ def main():
 
         toc_files.append(toc_file)
 
+    if not validate_wago_project_id(toc_files[0]):
+        sys.exit(1)
+
     for index in range(1, len(addon_names)):
+        if not validate_wago_project_id(toc_files[0], toc_files[index]):
+            sys.exit(1)
         if not validate_child_relationship(
             addon_names[0],
             addon_names[index],

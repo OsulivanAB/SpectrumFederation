@@ -29,6 +29,11 @@ For detailed information about our guild, addon features, and guides, visit our 
   https://github.com/OsulivanAB/SpectrumFederation
   ```
 
+### Wago Addons Installation
+
+- Spectrum Federation is available on Wago Addons — search for "Spectrum Federation" or visit:
+  https://addons.wago.io/addons/spectrumfederation
+
 ### CurseForge Installation
 
 - Spectrum Federation is available on CurseForge — search for "Spectrum Federation" in the CurseForge client or visit:

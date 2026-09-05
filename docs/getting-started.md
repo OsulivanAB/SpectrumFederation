@@ -2,7 +2,7 @@
 
 ## Install the addon
 
-Install **Spectrum Federation** with the CurseForge client, WowUp, or a release archive from [GitHub Releases](https://github.com/OsulivanAB/SpectrumFederation/releases).
+Install **Spectrum Federation** with the CurseForge client, WowUp, [Wago Addons](https://addons.wago.io/addons/spectrumfederation), or a release archive from [GitHub Releases](https://github.com/OsulivanAB/SpectrumFederation/releases).
 
 For a manual installation, extract the archive and place the `SpectrumFederation`, `SpectrumFederation_CursedSurgeTracker`, and `SpectrumFederation_RCLootCouncilIntegration` folders in the Retail AddOns directory:
 

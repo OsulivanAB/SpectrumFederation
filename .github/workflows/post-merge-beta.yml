@@ -183,6 +183,7 @@ jobs:
       - name: Package and publish release
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          WAGO_API_KEY: ${{ secrets.WAGO_API_KEY }}
         run: |
           python3 .github/scripts/publish_release.py "${{ needs.extract-version.outputs.version }}" --interface "${{ needs.extract-version.outputs.interface }}"
 
