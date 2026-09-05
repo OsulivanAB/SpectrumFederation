@@ -63,6 +63,57 @@ local REWARD_POT_DEFAULTS = {
 	deductionValue = 0,
 }
 
+local RC_LOOT_COUNCIL_INTEGRATION_DEFAULTS = {
+	recordAwards = true,
+	recordAllAwardTypes = true,
+	allowedResponses = {},
+}
+
+local function CopyRCLootCouncilIntegrationDefaults()
+	return {
+		recordAwards = RC_LOOT_COUNCIL_INTEGRATION_DEFAULTS.recordAwards,
+		recordAllAwardTypes = RC_LOOT_COUNCIL_INTEGRATION_DEFAULTS.recordAllAwardTypes,
+		allowedResponses = {},
+	}
+end
+
+local function IsSequentialLogCounter(counter)
+	if SF.LootLog and SF.LootLog.IsSequentialCounter then
+		return SF.LootLog.IsSequentialCounter(counter)
+	end
+	return type(counter) == "number" and counter >= 1 and counter == math.floor(counter)
+end
+
+local function NormalizeAllowedResponse(value)
+	if type(value) ~= "string" then
+		return nil
+	end
+	local trimmed = strtrim(value)
+	if trimmed == "" then
+		return nil
+	end
+	return trimmed
+end
+
+local function CopyAllowedResponses(values)
+	local copied = {}
+	local seen = {}
+	if type(values) ~= "table" then
+		return copied
+	end
+	for _, value in ipairs(values) do
+		local trimmed = NormalizeAllowedResponse(value)
+		if trimmed then
+			local key = string.lower(trimmed)
+			if not seen[key] then
+				seen[key] = true
+				copied[#copied + 1] = trimmed
+			end
+		end
+	end
+	return copied
+end
+
 local function NormalizeLootMode(value)
 	if value == LOOT_MODE_REWARD_POT then
 		return LOOT_MODE_REWARD_POT
@@ -512,6 +563,8 @@ function LootProfile.new(profileName)
     instance._rewardPotStartingCopper = REWARD_POT_DEFAULTS.startingPotCopper
     instance._rewardPotDeductionType = REWARD_POT_DEFAULTS.deductionType
     instance._rewardPotDeductionValue = REWARD_POT_DEFAULTS.deductionValue
+    instance._rcLootCouncilIntegration = CopyRCLootCouncilIntegrationDefaults()
+    instance._rcAwardIndex = {}
     -- Create member instance for author
     local class = SF:GetPlayerClass()
     local adminRole = (SF.MemberRoles and SF.MemberRoles.ADMIN) or "admin"
@@ -572,7 +625,7 @@ function LootProfile:ComputeAuthorMax()
         local author = log.GetAuthor and log:GetAuthor() or log._author
         local counter = log.GetCounter and log:GetCounter() or log._counter
 
-        if type(author) == "string" and type(counter) == "number" then
+        if type(author) == "string" and IsSequentialLogCounter(counter) then
             local prev = authorMax[author] or 0
             if counter > prev then
                 authorMax[author] = counter
@@ -609,6 +662,7 @@ function LootProfile:RebuildLogIndex()
     self._logPositionIndex = {}
     self._logFingerprintIndex = {}
     self._authorCounters = {}
+    self._rcAwardIndex = {}
 
     for i, log in ipairs(self._lootLogs or {}) do
         local id = log.GetID and log:GetID() or log._id
@@ -621,11 +675,22 @@ function LootProfile:RebuildLogIndex()
 
         local author = log.GetAuthor and log:GetAuthor() or log._author
         local counter = log.GetCounter and log:GetCounter() or log._counter
-        if type(author) == "string" and type(counter) == "number" then
+        if type(author) == "string" and IsSequentialLogCounter(counter) then
             local prev = self._authorCounters[author] or 0
             if counter > prev then
                 self._authorCounters[author] = counter
             end
+        end
+
+        local eventType = log.GetEventType and log:GetEventType() or log._eventType
+        local data = log.GetEventData and log:GetEventData() or log._data
+        if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.RC_LOOT_COUNCIL)
+            and type(data) == "table"
+            and type(data.awardKey) == "string"
+            and data.awardKey ~= ""
+            and type(id) == "string"
+        then
+            self._rcAwardIndex[data.awardKey] = id
         end
     end
 
@@ -1259,6 +1324,176 @@ function LootProfile:SetRaidCheckMetaGemRequired(enabled)
     return true, nil
 end
 
+function LootProfile:_EnsureRCLootCouncilIntegrationConfig()
+	if type(self._rcLootCouncilIntegration) ~= "table" then
+		self._rcLootCouncilIntegration = CopyRCLootCouncilIntegrationDefaults()
+		return
+	end
+	local cfg = self._rcLootCouncilIntegration
+	if cfg.recordAwards == nil then
+		cfg.recordAwards = RC_LOOT_COUNCIL_INTEGRATION_DEFAULTS.recordAwards
+	end
+	if cfg.recordAllAwardTypes == nil then
+		cfg.recordAllAwardTypes = RC_LOOT_COUNCIL_INTEGRATION_DEFAULTS.recordAllAwardTypes
+	end
+	cfg.allowedResponses = CopyAllowedResponses(cfg.allowedResponses)
+end
+
+function LootProfile:GetRCLootCouncilIntegrationConfig()
+	self:_EnsureRCLootCouncilIntegrationConfig()
+	return {
+		recordAwards = self._rcLootCouncilIntegration.recordAwards ~= false,
+		recordAllAwardTypes = self._rcLootCouncilIntegration.recordAllAwardTypes ~= false,
+		allowedResponses = CopyAllowedResponses(self._rcLootCouncilIntegration.allowedResponses),
+	}
+end
+
+function LootProfile:SetRCLootCouncilRecordAwards(enabled)
+	self:_EnsureRCLootCouncilIntegrationConfig()
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
+		return false, "You must be an admin to change RC Loot Council settings."
+	end
+	self._rcLootCouncilIntegration.recordAwards = enabled and true or false
+	return true, nil
+end
+
+function LootProfile:SetRCLootCouncilRecordAllAwardTypes(enabled)
+	self:_EnsureRCLootCouncilIntegrationConfig()
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
+		return false, "You must be an admin to change RC Loot Council settings."
+	end
+	self._rcLootCouncilIntegration.recordAllAwardTypes = enabled and true or false
+	return true, nil
+end
+
+function LootProfile:AddRCLootCouncilAllowedResponse(value)
+	self:_EnsureRCLootCouncilIntegrationConfig()
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
+		return false, "You must be an admin to change RC Loot Council settings."
+	end
+	local trimmed = NormalizeAllowedResponse(value)
+	if not trimmed then
+		return false, "Enter a non-empty award type."
+	end
+	local key = string.lower(trimmed)
+	for _, existing in ipairs(self._rcLootCouncilIntegration.allowedResponses) do
+		if string.lower(existing) == key then
+			return false, "That award type is already in the list."
+		end
+	end
+	self._rcLootCouncilIntegration.allowedResponses[#self._rcLootCouncilIntegration.allowedResponses + 1] = trimmed
+	return true, nil
+end
+
+function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
+	self:_EnsureRCLootCouncilIntegrationConfig()
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
+		return false, "You must be an admin to change RC Loot Council settings."
+	end
+	local trimmed = NormalizeAllowedResponse(value)
+	if not trimmed then
+		return false, "Select an award type to remove."
+	end
+	local key = string.lower(trimmed)
+	local filtered = {}
+	local removed = false
+	for _, existing in ipairs(self._rcLootCouncilIntegration.allowedResponses) do
+		if string.lower(existing) == key then
+			removed = true
+		else
+			filtered[#filtered + 1] = existing
+		end
+	end
+	if not removed then
+		return false, "That award type is not in the list."
+	end
+	self._rcLootCouncilIntegration.allowedResponses = filtered
+	return true, nil
+end
+
+function LootProfile:ShouldRecordRCResponse(response)
+	local cfg = self:GetRCLootCouncilIntegrationConfig()
+	if not cfg.recordAwards then
+		return false
+	end
+	if cfg.recordAllAwardTypes then
+		return true
+	end
+	if type(response) ~= "string" then
+		return false
+	end
+	local needle = string.lower(strtrim(response))
+	if needle == "" then
+		return false
+	end
+	for _, allowed in ipairs(cfg.allowedResponses) do
+		if string.lower(allowed) == needle then
+			return true
+		end
+	end
+	return false
+end
+
+function LootProfile:GetRCAwardLogId(awardKey)
+	if type(awardKey) ~= "string" or awardKey == "" then
+		return nil
+	end
+	self._rcAwardIndex = self._rcAwardIndex or {}
+	return self._rcAwardIndex[awardKey]
+end
+
+function LootProfile:TryAddRCLootCouncilAward(canonical)
+	if type(canonical) ~= "table" then
+		return false, "invalid_award"
+	end
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
+		return false, "not_admin"
+	end
+	if not self:ShouldRecordRCResponse(canonical.response) then
+		return false, "filtered"
+	end
+	local awardKey = canonical.awardKey
+	if type(awardKey) ~= "string" or awardKey == "" then
+		return false, "invalid_award"
+	end
+	if self:GetRCAwardLogId(awardKey) then
+		return false, "duplicate"
+	end
+	if self._logIndex and self._logIndex[awardKey] then
+		return false, "duplicate"
+	end
+
+	local memberId = canonical.winner
+	if type(memberId) ~= "string" or memberId == "" then
+		return false, "invalid_award"
+	end
+	if not self.getMemberByID or not self:getMemberByID(memberId) then
+		return false, "not_member"
+	end
+
+	local eventType = SF.LootLogEventTypes and SF.LootLogEventTypes.RC_LOOT_COUNCIL
+	local eventData = SF.LootLog and SF.LootLog.BuildRCLootCouncilEventData and SF.LootLog.BuildRCLootCouncilEventData(canonical)
+	if not eventType or not eventData then
+		return false, "invalid_award"
+	end
+
+	local logEntry = SF.LootLog.new(eventType, eventData, {
+		author = canonical.awarder,
+		timestamp = canonical.timestamp,
+		externalId = awardKey,
+		counter = 0,
+	})
+	if not logEntry then
+		return false, "create_failed"
+	end
+
+	local inserted = self:AddLootLog(logEntry)
+	if not inserted then
+		return false, "duplicate"
+	end
+	return true, nil
+end
+
 -- Function Get list of admin member IDs
 -- @return table adminMemberIds List of "Name-Realm" strings
 function LootProfile:getAdminMemberIds()
@@ -1447,11 +1682,22 @@ function LootProfile:_InsertLog(lootLog, opts)
     -- Keep authorCounters synced to max seen
     local author = lootLog:GetAuthor()
     local counter = lootLog:GetCounter()
-    if type(author) == "string" and type(counter) == "number" then
+    if type(author) == "string" and IsSequentialLogCounter(counter) then
         local prev = self._authorCounters[author] or 0
         if counter > prev then
             self._authorCounters[author] = counter
         end
+    end
+
+    local eventType = lootLog.GetEventType and lootLog:GetEventType() or lootLog._eventType
+    local data = lootLog.GetEventData and lootLog:GetEventData() or lootLog._data
+    if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.RC_LOOT_COUNCIL)
+        and type(data) == "table"
+        and type(data.awardKey) == "string"
+        and data.awardKey ~= ""
+    then
+        self._rcAwardIndex = self._rcAwardIndex or {}
+        self._rcAwardIndex[data.awardKey] = id
     end
 
     table.sort(self._lootLogs, function(a, b)
@@ -1805,7 +2051,7 @@ function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
 
             local author = log.GetAuthor and log:GetAuthor() or log._author
             local counter = log.GetCounter and log:GetCounter() or log._counter
-            if type(author) == "string" and type(counter) == "number" then
+            if type(author) == "string" and IsSequentialLogCounter(counter) then
                 local range = affectedRangesByAuthor[author]
                 if not range then
                     range = {
@@ -2021,6 +2267,7 @@ function LootProfile:ExportSnapshot()
 		raidCheck       = self:GetRaidCheckConfig(),
 		lootMode        = self:GetLootMode(),
 		rewardPot       = self:GetRewardPotConfig(),
+		rcLootCouncilIntegration = self:GetRCLootCouncilIntegrationConfig(),
 	}
 end
 
@@ -2136,6 +2383,17 @@ function LootProfile.ValidateSnapshot(snapshot)
 		if type(snapshot.rcLootCouncil) ~= "table" then return false, "snapshot.rcLootCouncil must be a table or nil" end
 		if snapshot.rcLootCouncil.rollType ~= nil and type(snapshot.rcLootCouncil.rollType) ~= "string" then
 			return false, "snapshot.rcLootCouncil.rollType must be a string when provided"
+		end
+	end
+
+	if snapshot.rcLootCouncilIntegration ~= nil then
+		if type(snapshot.rcLootCouncilIntegration) ~= "table" then
+			return false, "snapshot.rcLootCouncilIntegration must be a table or nil"
+		end
+		if snapshot.rcLootCouncilIntegration.allowedResponses ~= nil
+			and type(snapshot.rcLootCouncilIntegration.allowedResponses) ~= "table"
+		then
+			return false, "snapshot.rcLootCouncilIntegration.allowedResponses must be a table when provided"
 		end
 	end
 
@@ -2262,6 +2520,19 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 
 	self:_EnsureRaidCheckConfig()
 	self:_EnsureRewardPotConfig()
+	self:_EnsureRCLootCouncilIntegrationConfig()
+
+	if type(snapshot.rcLootCouncilIntegration) == "table" then
+		if snapshot.rcLootCouncilIntegration.recordAwards ~= nil then
+			self._rcLootCouncilIntegration.recordAwards = snapshot.rcLootCouncilIntegration.recordAwards and true or false
+		end
+		if snapshot.rcLootCouncilIntegration.recordAllAwardTypes ~= nil then
+			self._rcLootCouncilIntegration.recordAllAwardTypes = snapshot.rcLootCouncilIntegration.recordAllAwardTypes and true or false
+		end
+		if type(snapshot.rcLootCouncilIntegration.allowedResponses) == "table" then
+			self._rcLootCouncilIntegration.allowedResponses = CopyAllowedResponses(snapshot.rcLootCouncilIntegration.allowedResponses)
+		end
+	end
 
 	-- Import loot mode / Reward Pot config only when the snapshot actually contains them.
 	-- Older clients omit these fields; keeping local values prevents clobbering.
@@ -2327,11 +2598,22 @@ function LootProfile:MergeLogTables(logTables, opts)
                 -- Keep authorCounters synced to max seen
                 local author = log:GetAuthor()
                 local counter = log:GetCounter()
-                if type(author) == "string" and type(counter) == "number" then
+                if type(author) == "string" and IsSequentialLogCounter(counter) then
                     local prev = self._authorCounters[author] or 0
                     if counter > prev then
                         self._authorCounters[author] = counter
                     end
+                end
+
+                local eventType = log.GetEventType and log:GetEventType() or log._eventType
+                local data = log.GetEventData and log:GetEventData() or log._data
+                if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.RC_LOOT_COUNCIL)
+                    and type(data) == "table"
+                    and type(data.awardKey) == "string"
+                    and data.awardKey ~= ""
+                then
+                    self._rcAwardIndex = self._rcAwardIndex or {}
+                    self._rcAwardIndex[data.awardKey] = id
                 end
             else
                 local existingFingerprint = self._logFingerprintIndex[id]

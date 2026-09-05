@@ -209,33 +209,37 @@ function UI:DiscoverSubAddons(parentAddonName, api)
     local changed = false
 
     for _, child in ipairs(children) do
-        local categoryId = child.addonName
-        local existing = self.categoriesById[categoryId]
-        if not existing then
-            local category = {
-                id = categoryId,
-                name = child.navLabel or child.title or categoryId,
-                navLabel = child.navLabel or child.title or categoryId,
-                group = "Optional",
-                description = child.notes,
-                order = DEFAULT_ORDER,
-                enabled = false,
-                enablementResolved = false,
-                addonName = child.addonName,
-                source = "addon",
-            }
-            self.categoriesById[categoryId] = category
-            table.insert(self.categories, category)
-            changed = true
-        else
-            if child.navLabel and existing.source == "addon" then
-                existing.name = child.navLabel
-                existing.navLabel = child.navLabel
+        -- Hosted children register pages into an existing category and must
+        -- not create a redundant Optional sidebar row.
+        if type(child.settingsHost) ~= "string" or child.settingsHost == "" then
+            local categoryId = child.addonName
+            local existing = self.categoriesById[categoryId]
+            if not existing then
+                local category = {
+                    id = categoryId,
+                    name = child.navLabel or child.title or categoryId,
+                    navLabel = child.navLabel or child.title or categoryId,
+                    group = "Optional",
+                    description = child.notes,
+                    order = DEFAULT_ORDER,
+                    enabled = false,
+                    enablementResolved = false,
+                    addonName = child.addonName,
+                    source = "addon",
+                }
+                self.categoriesById[categoryId] = category
+                table.insert(self.categories, category)
+                changed = true
+            else
+                if child.navLabel and existing.source == "addon" then
+                    existing.name = child.navLabel
+                    existing.navLabel = child.navLabel
+                end
+                if child.notes and existing.source == "addon" then
+                    existing.description = child.notes
+                end
+                existing.addonName = existing.addonName or child.addonName
             end
-            if child.notes and existing.source == "addon" then
-                existing.description = child.notes
-            end
-            existing.addonName = existing.addonName or child.addonName
         end
     end
 

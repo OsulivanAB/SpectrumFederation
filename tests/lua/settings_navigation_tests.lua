@@ -528,6 +528,13 @@ local fakeAddons = {
         notes = "Shows Curse Surge locations and countdowns on The Coiled Isle map.",
         parent = "SpectrumFederation",
     },
+    {
+        name = "SpectrumFederation_RCLootCouncilIntegration",
+        title = "Spectrum Federation: RC Loot Council Integration",
+        notes = "Records RC Loot Council awards in Spectrum Loot Logs.",
+        parent = "SpectrumFederation",
+        settingsHost = "lootHelper",
+    },
 }
 local enumerated = SubAddons.EnumerateChildren("SpectrumFederation", {
     GetNumAddOns = function()
@@ -549,14 +556,20 @@ local enumerated = SubAddons.EnumerateChildren("SpectrumFederation", {
                 if key == "X-SpectrumFederation-Parent" then
                     return addon.parent
                 end
+                if key == "X-SpectrumFederation-Settings-Host" then
+                    return addon.settingsHost
+                end
             end
         end
         return nil
     end,
 })
-assertEq(#enumerated, 1, "enumerator finds only addons with the parent metadata key")
+assertEq(#enumerated, 2, "enumerator finds only addons with the parent metadata key")
 assertEq(enumerated[1].addonName, "SpectrumFederation_CursedSurgeTracker", "enumerator uses the addon folder name")
 assertEq(enumerated[1].navLabel, "Cursed Surge Tracker", "enumerator strips the parent title prefix")
+assertEq(enumerated[1].settingsHost, nil, "Cursed Surge has no Settings host category")
+assertEq(enumerated[2].addonName, "SpectrumFederation_RCLootCouncilIntegration", "hosted RC child is still enumerated")
+assertEq(enumerated[2].settingsHost, "lootHelper", "RC child declares Loot Helper as its Settings host")
 
 local enabled = SubAddons.IsEnabledForCharacter("SpectrumFederation_CursedSurgeTracker", {
     character = "Player-1",
@@ -690,6 +703,9 @@ UI:DiscoverSubAddons("SpectrumFederation", {
                 if key == "X-SpectrumFederation-Parent" then
                     return addon.parent
                 end
+                if key == "X-SpectrumFederation-Settings-Host" then
+                    return addon.settingsHost
+                end
             end
         end
         return nil
@@ -701,6 +717,31 @@ assertEq(discovered.enabled, false, "discovered categories start disabled until 
 assertEq(discovered.enablementResolved, false, "discovered categories start unresolved")
 assertEq(discovered.group, "Optional", "discovered categories default to Optional")
 assertEq(#UI:GetPagesForCategory("SpectrumFederation_CursedSurgeTracker"), 0, "discovered category has no synthetic pages")
+assertTrue(
+    UI:GetCategory("SpectrumFederation_RCLootCouncilIntegration") == nil,
+    "hosted RC child does not create an Optional sidebar category"
+)
+assertDeepEq(
+    idsOf(UI:GetPagesForCategory("lootHelper")),
+    { "lootHelperGeneral", "lootHelperProfile" },
+    "Loot Helper stays on parent tabs while the RC page is unregistered"
+)
+UI:RegisterPage(page({
+    id = "lootHelperRCLootCouncil",
+    categoryId = "lootHelper",
+    name = "RC Loot Council",
+    navLabel = "RC Loot Council",
+    order = 24,
+}))
+assertDeepEq(
+    idsOf(UI:GetPagesForCategory("lootHelper")),
+    { "lootHelperGeneral", "lootHelperProfile", "lootHelperRCLootCouncil" },
+    "enabled RC child registers a Loot Helper tab without an Optional row"
+)
+assertTrue(
+    UI:GetCategory("SpectrumFederation_RCLootCouncilIntegration") == nil,
+    "registering the hosted RC page still does not create an Optional category"
+)
 
 local enableNotified = notified
 UI:RefreshSubAddonEnablement({
