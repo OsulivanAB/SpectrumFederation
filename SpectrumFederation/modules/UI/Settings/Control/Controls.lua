@@ -1673,11 +1673,12 @@ function Controls:AddLogTable(section, opts)
 					end
 				end)
 				cell:SetScript("OnMouseUp", function()
-					if not cell.hyperlink then
+					local itemRef = cell.itemRef
+					if type(itemRef) ~= "string" or itemRef == "" then
 						return
 					end
 					if type(SetItemRef) == "function" then
-						SetItemRef(cell.hyperlink, cell.itemLinkText or cell.hyperlink, "LeftButton")
+						SetItemRef(itemRef, cell.itemLinkText or cell.hyperlink or itemRef, "LeftButton")
 					end
 				end)
 				dataRow.Cells[columnIndex] = cell
@@ -1726,10 +1727,15 @@ function Controls:AddLogTable(section, opts)
 					local cell = dataRow.Cells[columnIndex]
 					cell.Text:SetText(value or "")
 					local hyperlink
+					local itemRef
 					if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
 						hyperlink = SF.LootLog.ExtractItemHyperlink(value)
 					end
+					if SF.LootLog and SF.LootLog.ExtractItemRef then
+						itemRef = SF.LootLog.ExtractItemRef(value)
+					end
 					cell.hyperlink = hyperlink
+					cell.itemRef = itemRef
 					cell.itemLinkText = hyperlink and value or nil
 				end
 

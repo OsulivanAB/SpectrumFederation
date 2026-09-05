@@ -446,6 +446,10 @@ function Integration.RegisterSettingsPage()
                                 if profile and profile.SetRCLootCouncilRecordAwards then
                                     profile:SetRCLootCouncilRecordAwards(value and true or false)
                                 end
+                                if panel.__sfPageBuilder then
+                                    panel.__sfPageBuilder:Refresh()
+                                    panel.__sfPageBuilder:Reflow()
+                                end
                             end,
                         },
                         {

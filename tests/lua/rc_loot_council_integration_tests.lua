@@ -309,6 +309,16 @@ assertEq(
     ITEM_LINK,
     "item hyperlink can be recovered from surrounding Action text"
 )
+assertEq(
+    SF.LootLog.ExtractItemRef(ITEM_LINK),
+    "item:12345::::::::80:259:::::::::",
+    "SetItemRef receives the inner item token, not the colored display string"
+)
+assertEq(
+    SF.LootLog.ExtractItemRef("Awarded " .. ITEM_LINK),
+    "item:12345::::::::80:259:::::::::",
+    "SetItemRef token can be recovered from surrounding Action text"
+)
 assertEq(SF.LootLog.ParseHistoryTimestamp(HISTORY_ID), 1700000000, "history.id prefix is the award timestamp")
 assertEq(SF.LootLog.ParseHistoryTimestamp("nope"), nil, "non-numeric history ids do not invent a timestamp")
 
@@ -515,6 +525,40 @@ assertEq(importedCfg.allowedResponses[1], "Major Upgrade", "imported profile res
 local oldProfile = makeProfile("Old Defaults")
 local oldCfg = oldProfile:GetRCLootCouncilIntegrationConfig()
 assertTrue(oldCfg.recordAwards and oldCfg.recordAllAwardTypes and #oldCfg.allowedResponses == 0, "profiles without stored RC config fill defaults")
+
+-- Main Swap must not rewrite isolated RC recipients.
+resetEnv()
+local swapProfile = makeProfile("Swap")
+local sourceAlt = "Alt-Garona"
+addMember(swapProfile, sourceAlt)
+addMember(swapProfile, WINNER)
+setActive(swapProfile)
+local sourceCanonical = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, sourceAlt, historyTable({ id = "1700000800-8" }))
+assertTrue(swapProfile:TryAddRCLootCouncilAward(sourceCanonical), "RC award is recorded on the source alt")
+local pointLog = SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = sourceAlt,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+}, {
+    author = PLAYER,
+    counter = 2,
+    skipPermission = true,
+})
+assertTrue(swapProfile:AddLootLog(pointLog, { skipBroadcast = true }), "sequential point log is recorded on the source alt")
+assertTrue(swapProfile:TransferMemberHistory(sourceAlt, WINNER), "Main Swap transfers sequential history")
+local swappedRC = nil
+local swappedPoint = nil
+for _, log in ipairs(swapProfile:GetLootLogs() or {}) do
+    if log:GetEventType() == SF.LootLogEventTypes.RC_LOOT_COUNCIL then
+        swappedRC = log
+    elseif log:GetEventType() == SF.LootLogEventTypes.POINT_CHANGE then
+        swappedPoint = log
+    end
+end
+assertTrue(swappedRC ~= nil, "RC log remains after Main Swap")
+assertEq(swappedRC:GetEventData().member, sourceAlt, "Main Swap does not rewrite the RC recipient")
+assertEq(swappedRC:GetID(), sourceCanonical.awardKey, "Main Swap does not change the external RC identity")
+assertTrue(swappedPoint ~= nil, "sequential point log remains after Main Swap")
+assertEq(swappedPoint:GetEventData().member, WINNER, "Main Swap still rewrites ordinary sequential member references")
 
 -- ---------------------------------------------------------------------------
 -- Sequential isolation (required regression boundary)

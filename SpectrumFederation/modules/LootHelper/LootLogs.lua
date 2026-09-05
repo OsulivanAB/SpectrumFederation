@@ -213,6 +213,19 @@ function LootLog.ExtractItemHyperlink(text)
     return LootLog.ExtractItemString(text)
 end
 
+-- Inner item token for SetItemRef. Chat-frame clicks pass the payload between
+-- |H and |h (for example item:12345:...), not the colored display string.
+function LootLog.ExtractItemRef(text)
+    if type(text) ~= "string" or text == "" then
+        return nil
+    end
+    local fromHyperlink = text:match("|H(item:[^|]+)|h")
+    if type(fromHyperlink) == "string" and fromHyperlink ~= "" then
+        return fromHyperlink
+    end
+    return LootLog.ExtractItemString(text)
+end
+
 function LootLog.ParseHistoryTimestamp(historyId)
     if type(historyId) ~= "string" or historyId == "" then
         return nil

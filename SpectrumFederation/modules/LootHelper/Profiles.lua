@@ -2045,7 +2045,17 @@ function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
     local affectedRangesByAuthor = {}
     for _, log in ipairs(self._lootLogs or {}) do
         local eventData = (log.GetEventData and log:GetEventData()) or log._data
-        if type(eventData) == "table" and type(eventData.member) == "string" and SameMember(eventData.member, sourceMemberId) then
+        local eventType = (log.GetEventType and log:GetEventType()) or log._eventType
+        local isExternal = (type(log._externalId) == "string" and log._externalId ~= "")
+            or eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.RC_LOOT_COUNCIL)
+        -- External RC awards keep the original recipient. Rewriting member
+        -- would change the fingerprint of an isolated external id that peers
+        -- cannot request through sequential repair.
+        if (not isExternal)
+            and type(eventData) == "table"
+            and type(eventData.member) == "string"
+            and SameMember(eventData.member, sourceMemberId)
+        then
             eventData.member = targetMemberId
             logsUpdated = logsUpdated + 1
 
