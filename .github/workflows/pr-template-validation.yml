@@ -6,6 +6,10 @@ on:
     branches:
       - beta
 
+concurrency:
+  group: pr-template-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate-pr-description:
     runs-on: ubuntu-latest
