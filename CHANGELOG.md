@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.8] - 2026-09-05
+
+### Changed
+- Replace RC capture with permanent Loot Council Integration
+
 ## [1.4.0-beta.7] - 2026-09-03
 
 ### Added
