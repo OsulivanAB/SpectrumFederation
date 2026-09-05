@@ -21,7 +21,7 @@ Documentation-only changes do not require an addon version bump.
 
 `.github/workflows/pr-main-validation.yml` runs lint, tests, packaging, stable-version-format, and documentation checks. Direct feature work should not normally target this branch.
 
-`.github/workflows/pr-template-validation.yml` separately validates pull-request template completion. In-game testing must be either marked complete or explicitly marked not applicable; N/A is rejected when packaged addon Lua or XML files changed.
+`.github/workflows/pr-template-validation.yml` separately validates pull-request template completion. In-game testing must be either marked complete or explicitly marked not applicable. N/A is rejected when packaged addon Lua or XML files changed, or when a TOC change is runtime-affecting, unknown, or not inspectable.
 
 Both branch-validation workflows include `README.md` and `tests/**` in their path filters so documentation and test-only changes still run the matching checks.
 
