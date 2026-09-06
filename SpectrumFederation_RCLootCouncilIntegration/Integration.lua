@@ -596,6 +596,35 @@ local function GetProfile()
     return Integration.GetSettingsProfile()
 end
 
+-- Same effective-admin contract as Loot Helper Settings: Preview non-admin
+-- and real non-admins evaluate false for the renderer isAdmin predicate.
+local function IsSettingsAdmin()
+    local profile = GetProfile()
+    local SF = ParentAddon()
+    local Imp = SF and SF.LootHelperImpersonation
+    if Imp and Imp.IsEffectiveLocalAdmin then
+        local ok, res = pcall(Imp.IsEffectiveLocalAdmin, Imp, profile)
+        if ok then
+            return res and true or false
+        end
+    end
+    if profile and profile.IsCurrentUserAdmin then
+        local ok, res = pcall(profile.IsCurrentUserAdmin, profile)
+        if ok then
+            return res and true or false
+        end
+    end
+    return false
+end
+
+local function RefreshSettingsPanel(panel)
+    local SF = ParentAddon()
+    local renderer = SF and SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
+    if renderer and renderer.Refresh then
+        renderer:Refresh(panel)
+    end
+end
+
 function Integration.RegisterSettingsPage()
     if pageRegistered then
         return false
@@ -622,6 +651,9 @@ function Integration.RegisterSettingsPage()
         end
 
         renderer:Build(panel, {
+            isAdmin = function()
+                return IsSettingsAdmin()
+            end,
             sections = {
                 {
                     id = "about",
@@ -652,10 +684,7 @@ function Integration.RegisterSettingsPage()
                                 if profile and profile.SetRCLootCouncilRecordAwards then
                                     profile:SetRCLootCouncilRecordAwards(value and true or false)
                                 end
-                                if panel.__sfPageBuilder then
-                                    panel.__sfPageBuilder:Refresh()
-                                    panel.__sfPageBuilder:Reflow()
-                                end
+                                RefreshSettingsPanel(panel)
                             end,
                         },
                         {
@@ -682,10 +711,7 @@ function Integration.RegisterSettingsPage()
                                 if profile and profile.SetRCLootCouncilRecordAllAwardTypes then
                                     profile:SetRCLootCouncilRecordAllAwardTypes(value and true or false)
                                 end
-                                if panel.__sfPageBuilder then
-                                    panel.__sfPageBuilder:Refresh()
-                                    panel.__sfPageBuilder:Reflow()
-                                end
+                                RefreshSettingsPanel(panel)
                             end,
                         },
                     },
@@ -693,7 +719,7 @@ function Integration.RegisterSettingsPage()
                 {
                     id = "allowList",
                     title = "Allowed Award Types",
-                    visible = function()
+                    condition = function()
                         local profile = GetProfile()
                         if not profile or not profile.GetRCLootCouncilIntegrationConfig then
                             return false
@@ -769,9 +795,7 @@ function Integration.RegisterSettingsPage()
 
     function Page.Refresh(_self, panel)
         settingsPanel = panel
-        if SF.SettingsUI.DefinitionRenderer then
-            SF.SettingsUI.DefinitionRenderer:Refresh(panel)
-        end
+        RefreshSettingsPanel(panel)
     end
 
     SF.SettingsUI:RegisterPage(Page)
