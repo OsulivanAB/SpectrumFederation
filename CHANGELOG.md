@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.0-beta.9] - 2026-09-06
+
+### Fixed
+- Fix RC Loot Council Settings visibility and admin state
+
 ## [1.4.0-beta.8] - 2026-09-05
 
 ### Changed
