@@ -115,6 +115,7 @@ loadModule("SpectrumFederation/modules/LootHelper/LootLogValidators.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogs.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Profiles.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootHelper.lua")
+loadModule("SpectrumFederation/modules/LootHelper/Impersonation.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/00_Namespace.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/01_Constants.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/02_State.lua")
@@ -544,6 +545,17 @@ for _, log in ipairs(profile:GetLootLogs()) do
     end
 end
 assertEq(storedNeed:GetEventData().response, "NEED", "original RC response casing is stored, not the allow-list casing")
+
+assertTrue(profile:SetRCLootCouncilRecordAllAwardTypes(true), "admin can re-enable record-all")
+assertTrue(profile:ShouldRecordRCResponse("Want"), "record-all ignores a Need-only allow-list")
+assertTrue(profile:ShouldRecordRCResponse("Need"), "record-all still records allow-listed labels")
+local wantCanonical = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+    id = "1700000310-31",
+    response = "Want",
+}))
+assertTrue(profile:TryAddRCLootCouncilAward(wantCanonical), "record-all records a Want award despite Need-only allow-list")
+assertTrue(profile:SetRCLootCouncilRecordAllAwardTypes(false), "admin can disable record-all again")
+assertFalse(profile:ShouldRecordRCResponse("Want"), "record-all off restores allow-list filtering")
 
 local outsider = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, "Stranger-Garona", historyTable({ id = "1700000400-4" }))
 assertEq(select(2, profile:TryAddRCLootCouncilAward(outsider)), "not_member", "non-profile recipients are not logged")
@@ -1047,16 +1059,211 @@ Sync.state.active = false
 assertEq(Integration.GetSettingsProfile(), selectedB, "Settings use the selected profile when no session is active")
 
 local registeredPages = {}
+local capturedDef = nil
+local refreshCount = 0
+local lastAllowCondition = nil
+local lastRecordAllVisible = nil
 SF.SettingsUI = {
     RegisterPage = function(_self, page)
         registeredPages[#registeredPages + 1] = page
     end,
     DefinitionRenderer = {},
 }
+
+local function findSection(pageDef, id)
+    for _, sec in ipairs((pageDef and pageDef.sections) or {}) do
+        if sec.id == id then
+            return sec
+        end
+    end
+    return nil
+end
+
+local function findItem(section, label)
+    for _, item in ipairs((section and section.items) or {}) do
+        if item.label == label then
+            return item
+        end
+    end
+    return nil
+end
+
+local function evaluateAllowCondition()
+    local allow = findSection(capturedDef, "allowList")
+    if allow and type(allow.condition) == "function" then
+        lastAllowCondition = allow.condition() and true or false
+    else
+        lastAllowCondition = nil
+    end
+    local recording = findSection(capturedDef, "recording")
+    local recordAll = findItem(recording, "Record all award types")
+    if recordAll and type(recordAll.visible) == "function" then
+        lastRecordAllVisible = recordAll.visible() and true or false
+    else
+        lastRecordAllVisible = nil
+    end
+end
+
+function SF.SettingsUI.DefinitionRenderer:Build(panel, pageDef)
+    capturedDef = pageDef
+    panel.__sfPageDef = pageDef
+    panel.__sfPageBuilder = {
+        Refresh = function() end,
+        Reflow = function() end,
+    }
+    panel.__sfSections = {}
+    evaluateAllowCondition()
+end
+
+function SF.SettingsUI.DefinitionRenderer:Refresh(panel)
+    refreshCount = refreshCount + 1
+    capturedDef = (panel and panel.__sfPageDef) or capturedDef
+    evaluateAllowCondition()
+end
+
 assertTrue(Integration.RegisterSettingsPage(), "child registers the Loot Helper RC page")
 assertEq(registeredPages[1].id, "lootHelperRCLootCouncil", "page id is lootHelperRCLootCouncil")
 assertEq(registeredPages[1].categoryId, "lootHelper", "page is hosted under Loot Helper")
 assertFalse(Integration.RegisterSettingsPage(), "settings page is registered once")
+
+resetEnv()
+local settingsProfile = makeProfile("RC Settings UX")
+addMember(settingsProfile, WINNER)
+selectProfile(settingsProfile)
+local settingsPanel = {}
+registeredPages[1].Build(registeredPages[1], settingsPanel)
+assertTrue(capturedDef ~= nil, "Page.Build passes a definition to DefinitionRenderer")
+assertTrue(type(capturedDef.isAdmin) == "function", "RC page supplies the renderer isAdmin predicate")
+assertEq(capturedDef.visible, nil, "RC page does not use an unused page-level visible flag")
+
+local recordingSec = findSection(capturedDef, "recording")
+local allowSec = findSection(capturedDef, "allowList")
+local recordAwardsItem = findItem(recordingSec, "Record RC Loot Council Awards in Loot Logs")
+local recordAllItem = findItem(recordingSec, "Record all award types")
+local addItem = findItem(allowSec, "Add award type")
+local listItem = findItem(allowSec, "Allowed types")
+assertTrue(recordingSec ~= nil and allowSec ~= nil, "recording and allow-list sections exist")
+assertTrue(recordAwardsItem ~= nil and recordAllItem ~= nil, "both recording checkboxes exist")
+assertTrue(addItem ~= nil and listItem ~= nil, "allow-list add and scroll-list controls exist")
+assertTrue(type(allowSec.condition) == "function", "Allowed Award Types uses section condition")
+assertEq(allowSec.visible, nil, "Allowed Award Types does not use unused section visible")
+assertTrue(recordAwardsItem.adminOnly and recordAllItem.adminOnly, "recording checkboxes are adminOnly")
+assertTrue(addItem.adminOnly and listItem.adminOnly, "allow-list add/remove controls are adminOnly")
+assertTrue(type(recordAllItem.visible) == "function", "Record all award types uses item-level visible")
+
+local function assertVisibility(recordAwards, recordAll, expectRecordAllShown, expectAllowShown, message)
+    assertTrue(settingsProfile:SetRCLootCouncilRecordAwards(recordAwards), "admin can set recordAwards for " .. message)
+    assertTrue(settingsProfile:SetRCLootCouncilRecordAllAwardTypes(recordAll), "admin can set recordAllAwardTypes for " .. message)
+    evaluateAllowCondition()
+    assertEq(lastRecordAllVisible, expectRecordAllShown, message .. ": Record-all checkbox visibility")
+    assertEq(lastAllowCondition, expectAllowShown, message .. ": Allowed Award Types visibility")
+end
+
+assertVisibility(false, true, false, false, "recordAwards=false recordAll=true")
+assertVisibility(false, false, false, false, "recordAwards=false recordAll=false")
+assertVisibility(true, true, true, false, "recordAwards=true recordAll=true")
+assertVisibility(true, false, true, true, "recordAwards=true recordAll=false")
+
+assertTrue(settingsProfile:AddRCLootCouncilAllowedResponse("Need"), "admin can seed an allowed type")
+refreshCount = 0
+recordAllItem.set(true)
+assertTrue(refreshCount >= 1, "toggling record-all calls DefinitionRenderer:Refresh")
+assertFalse(lastAllowCondition, "record-all false→true immediately hides Allowed Award Types")
+assertEq(
+    settingsProfile:GetRCLootCouncilIntegrationConfig().allowedResponses[1],
+    "Need",
+    "hidden allow-list keeps stored values"
+)
+assertEq(listItem.getItems()[1].label, "Need", "getItems still returns stored types while hidden")
+
+refreshCount = 0
+recordAllItem.set(false)
+assertTrue(refreshCount >= 1, "toggling record-all back on calls DefinitionRenderer:Refresh")
+assertTrue(lastAllowCondition, "record-all true→false immediately shows Allowed Award Types")
+assertEq(listItem.getItems()[1].label, "Need", "stored allowed types reappear after the section is shown")
+
+refreshCount = 0
+recordAwardsItem.set(false)
+assertTrue(refreshCount >= 1, "toggling record-awards calls DefinitionRenderer:Refresh")
+assertFalse(lastRecordAllVisible, "recordAwards false hides Record all award types")
+assertFalse(lastAllowCondition, "recordAwards false hides Allowed Award Types")
+
+recordAwardsItem.set(true)
+assertTrue(lastRecordAllVisible, "recordAwards true shows Record all award types")
+assertTrue(lastAllowCondition, "recordAwards true shows Allowed Award Types when record-all is false")
+
+assertTrue(capturedDef.isAdmin(), "admin user evaluates as admin for the renderer")
+
+local Imp = SF.LootHelperImpersonation
+assertTrue(Imp and Imp.Enable, "impersonation helper is available")
+assertTrue(Imp:Enable(), "Preview non-admin can be enabled for the selected profile")
+assertFalse(capturedDef.isAdmin(), "Preview non-admin evaluates as non-admin for the renderer")
+assertFalse(settingsProfile:AddRCLootCouncilAllowedResponse("Want"), "Preview non-admin cannot add allowed types")
+assertFalse(settingsProfile:RemoveRCLootCouncilAllowedResponse("Need"), "Preview non-admin cannot remove allowed types")
+local previewMessages = {}
+local previewCtx = {
+    section = {
+        ClearMessage = function() end,
+        SetMessage = function(_, text, _kind)
+            previewMessages[#previewMessages + 1] = tostring(text)
+        end,
+    },
+    pageBuilder = { Refresh = function() end },
+}
+local previewEdit = { text = "", SetText = function(self, value) self.text = value end }
+addItem.onSubmit(previewCtx, "Want", previewEdit)
+assertEq(#settingsProfile:GetRCLootCouncilIntegrationConfig().allowedResponses, 1, "add control cannot mutate while previewing")
+listItem.onRemove(previewCtx, { id = "Need" })
+assertEq(settingsProfile:GetRCLootCouncilIntegrationConfig().allowedResponses[1], "Need", "remove control cannot mutate while previewing")
+assertTrue(Imp:Disable("rc-settings-preview"), "Preview non-admin can be disabled")
+assertTrue(capturedDef.isAdmin(), "disabling Preview restores renderer admin")
+
+local nonAdminProfile = makeProfileOwnedBy("RC Non-Admin", "OtherOwner-Garona")
+selectProfile(nonAdminProfile)
+assertFalse(nonAdminProfile:IsCurrentUserAdmin(), "real non-admin is not a profile admin")
+assertFalse(capturedDef.isAdmin(), "real non-admin evaluates as non-admin for the renderer")
+assertFalse(nonAdminProfile:AddRCLootCouncilAllowedResponse("Need"), "real non-admin cannot add allowed types")
+assertFalse(nonAdminProfile:RemoveRCLootCouncilAllowedResponse("Need"), "real non-admin cannot remove allowed types")
+
+loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+local greyRow = {
+    shown = true,
+    alpha = 1,
+    IsShown = function(self) return self.shown end,
+    SetShown = function(self, shown) self.shown = shown and true or false end,
+    SetAlpha = function(self, alpha) self.alpha = alpha end,
+}
+local greySection = {
+    __sfAdminPredicate = function()
+        return capturedDef.isAdmin()
+    end,
+}
+SF.SettingsUI.Controls:_ApplyRowState(greyRow, greySection, { adminOnly = true })
+assertEq(greyRow.alpha, 0.45, "non-admin adminOnly controls use the generic grey alpha")
+selectProfile(settingsProfile)
+SF.SettingsUI.Controls:_ApplyRowState(greyRow, greySection, { adminOnly = true })
+assertEq(greyRow.alpha, 1, "admin adminOnly controls stay fully opaque")
+
+resetEnv()
+sessionA = makeProfile("Session A Settings UX")
+selectedB = makeProfileOwnedBy("Selected B Settings UX", "OtherOwner-Garona")
+addMember(sessionA, WINNER)
+startSessionOn(sessionA)
+selectProfile(selectedB)
+local sessionPanel = {}
+registeredPages[1].Build(registeredPages[1], sessionPanel)
+assertEq(Integration.GetSettingsProfile(), sessionA, "Settings still follow the session profile while a session is active")
+assertTrue(capturedDef.isAdmin(), "renderer admin follows the session profile, not the selected profile")
+assertTrue(sessionA:SetRCLootCouncilRecordAwards(false), "session-profile admin can still mutate A from Settings")
+assertTrue(selectedB:GetRCLootCouncilIntegrationConfig().recordAwards, "session Settings mutation does not write selected B")
+assertFalse(sessionA:GetRCLootCouncilIntegrationConfig().recordAwards, "session Settings mutation writes A")
+local recordAwardsDuringSession = findItem(findSection(capturedDef, "recording"), "Record RC Loot Council Awards in Loot Logs")
+recordAwardsDuringSession.set(true)
+assertTrue(sessionA:GetRCLootCouncilIntegrationConfig().recordAwards, "page set() writes the session profile")
+assertTrue(selectedB:GetRCLootCouncilIntegrationConfig().recordAwards, "selected B keeps its own record-awards default")
+Sync.state.active = false
+assertEq(Integration.GetSettingsProfile(), selectedB, "Settings use the selected profile when no session is active")
+assertFalse(capturedDef.isAdmin(), "renderer admin follows the selected profile outside a session")
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
