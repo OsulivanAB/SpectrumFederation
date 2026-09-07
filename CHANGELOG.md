@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.4.1-beta.1] - 2026-09-07
+
+### Added
+- Add v2 guild banner and crest and restyle docs dark-first
+
 ## [1.4.0] - 2026-09-07
 
 ### Added

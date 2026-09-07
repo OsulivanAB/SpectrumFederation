@@ -1,11 +1,13 @@
 <!-- STATUS_BADGES_START -->
-![Interface](https://img.shields.io/badge/Interface-12.1.0-00aaff)
-![Track](https://img.shields.io/badge/Track-Retail-ff8800)
-![Addon Version](https://img.shields.io/badge/Version-1.4.0-brightgreen)
+![Interface](https://img.shields.io/badge/Interface-12.0.1-00aaff)
+![Track](https://img.shields.io/badge/Track-Beta-ff8800)
+![Addon Version](https://img.shields.io/badge/Version-1.4.1--beta.1-brightgreen)
 
 <!-- STATUS_BADGES_END -->
 
-
+<p align="center">
+  <img src="assets/readme/SpectrumFederationV2.jpg" alt="Spectrum Federation — Play, belong, be yourself. A safe, friendly, supportive home for LGBTQIA players and allies.">
+</p>
 
 World of Warcraft addon for the Spectrum Federation guild on Garona.
 
