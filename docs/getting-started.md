@@ -4,11 +4,11 @@
 
 <div class="sf-install-links">
   <a class="sf-install-links__item" href="https://addons.wago.io/addons/spectrumfederation" title="Install with WowUp on Wago Addons" target="_blank" rel="noopener noreferrer">
-    <img src="assets/wowup.png" alt="WowUp">
+    <img src="../assets/wowup.png" alt="WowUp">
     <span>WowUp</span>
   </a>
   <a class="sf-install-links__item" href="https://www.curseforge.com/wow/addons/spectrum-federation" title="Install with CurseForge" target="_blank" rel="noopener noreferrer">
-    <img class="sf-install-links__icon--curseforge" src="assets/curseforge.png" alt="CurseForge">
+    <img class="sf-install-links__icon--curseforge" src="../assets/curseforge.png" alt="CurseForge">
     <span>CurseForge</span>
   </a>
 </div>
