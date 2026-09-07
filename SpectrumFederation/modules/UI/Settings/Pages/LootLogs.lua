@@ -139,6 +139,7 @@ local EVENT_TYPE_COLORS = {
 	REWARD_POT_CONFIG_CHANGE = "|cffffcc66",
 	REWARD_POT_CHANGE = "|cffffd700",
 	ATTENDANCE_CHANGE = "|cff66ccff",
+	RC_LOOT_COUNCIL = "|cffff99cc",
 }
 
 local EVENT_TYPE_LABELS = {
@@ -157,6 +158,7 @@ local EVENT_TYPE_LABELS = {
 	REWARD_POT_CONFIG_CHANGE = "Reward Pot Config",
 	REWARD_POT_CHANGE = "Reward Pot Change",
 	ATTENDANCE_CHANGE = "Attendance Change",
+	RC_LOOT_COUNCIL = "RC Loot Council",
 }
 
 function GetEventTypeLabel(eventType)
@@ -308,6 +310,8 @@ local function BuildActionText(eventType, data, author)
 		end
 
 		return FormatLabel(data.change or "?")
+	elseif eventType == "RC_LOOT_COUNCIL" then
+		return tostring(data.itemLink or "")
 	end
 
 	return ""

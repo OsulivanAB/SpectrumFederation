@@ -26,6 +26,13 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.SettingsStore:Init()
     end
 
+    if SF.LootHelperImpersonation and SF.LootHelperImpersonation.Init then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing Loot Helper impersonation")
+        end
+        SF.LootHelperImpersonation:Init()
+    end
+
     if SF.SettingsApply and SF.SettingsApply.Init then
         if SF.Debug then
             SF.Debug:Verbose("INIT", "Initializing SettingsApply")

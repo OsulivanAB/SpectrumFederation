@@ -149,14 +149,6 @@ local function ResolveDisplayUnit(rowModel)
     return nil
 end
 
-local function GetActiveRaidCheckConfig()
-    local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
-    if profile and profile.GetRaidCheckConfig then
-        return profile:GetRaidCheckConfig()
-    end
-    return nil
-end
-
 local function SetIssueOverlayShown(texture, shown)
     if not texture then
         return
@@ -434,12 +426,7 @@ function EquipmentWindow:_GetEquipmentIssuesByInventorySlot()
         return nil
     end
 
-    local cfg = GetActiveRaidCheckConfig()
-    if not cfg then
-        return nil
-    end
-
-    local snapshot = SF.RaidCheck:GetTroubleshootingSlotsForUnit(unit, cfg)
+    local snapshot = SF.RaidCheck:GetTroubleshootingSlotsForUnit(unit)
     local issuesByInventory = {}
 
     for _, slot in ipairs(snapshot and snapshot.slots or {}) do

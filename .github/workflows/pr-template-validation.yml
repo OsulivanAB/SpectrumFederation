@@ -6,6 +6,10 @@ on:
     branches:
       - beta
 
+concurrency:
+  group: pr-template-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate-pr-description:
     runs-on: ubuntu-latest
@@ -13,6 +17,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -22,5 +28,11 @@ jobs:
       - name: Validate PR Template
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # SHAs are also used to inspect TOC hunks; N/A is fail-closed without a readable diff.
         run: |
+          set -euo pipefail
+          PR_CHANGED_FILES="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"
+          export PR_CHANGED_FILES
           python3 .github/scripts/validate_pr_template.py

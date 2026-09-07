@@ -41,6 +41,62 @@ function Dialogs:Confirm(message, acceptText, onAccept)
     return popup ~= nil
 end
 
+local CHOICE_KEY = "SF_RAID_CHECK_SESSION_PREFLIGHT"
+
+if not StaticPopupDialogs[CHOICE_KEY] then
+    StaticPopupDialogs[CHOICE_KEY] = {
+        text = "%s",
+        button1 = YES,
+        button2 = CANCEL,
+        button3 = NO,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+        preferredIndex = 3,
+
+        OnAccept = function(_, data)
+            if type(data) == "table" and type(data.onYes) == "function" then
+                data.onYes()
+            end
+        end,
+
+        OnAlt = function(_, data)
+            if type(data) == "table" and type(data.onNo) == "function" then
+                data.onNo()
+            end
+        end,
+
+        OnCancel = function(_, data)
+            if type(data) == "table" and type(data.onCancel) == "function" then
+                data.onCancel()
+            end
+        end,
+    }
+end
+
+-- Three-outcome confirmation: Yes, explicit No, and Escape/Cancel abort.
+-- @param message string
+-- @param yesText string|nil
+-- @param noText string|nil
+-- @param onYes function|nil
+-- @param onNo function|nil
+-- @param onCancel function|nil
+-- @return boolean
+function Dialogs:ConfirmChoice(message, yesText, noText, onYes, onNo, onCancel)
+    if SF.Debug then
+        SF.Debug:Verbose("UI", "Showing choice dialog: %s", tostring(message))
+    end
+    StaticPopupDialogs[CHOICE_KEY].button1 = yesText or YES
+    StaticPopupDialogs[CHOICE_KEY].button3 = noText or NO
+    StaticPopupDialogs[CHOICE_KEY].button2 = CANCEL
+    local popup = StaticPopup_Show(CHOICE_KEY, message, nil, {
+        onYes = onYes,
+        onNo = onNo,
+        onCancel = onCancel,
+    })
+    return popup ~= nil
+end
+
 local PROMPT_KEY = "SF_SETTINGS_PROMPT"
 
 if not StaticPopupDialogs[PROMPT_KEY] then

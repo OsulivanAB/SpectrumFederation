@@ -8,6 +8,7 @@ SF.SettingsSubAddons = SF.SettingsSubAddons or {}
 local SubAddons = SF.SettingsSubAddons
 
 SubAddons.PARENT_METADATA_KEY = "X-SpectrumFederation-Parent"
+SubAddons.SETTINGS_HOST_METADATA_KEY = "X-SpectrumFederation-Settings-Host"
 
 local function GetApi(api, name, fallback)
     if type(api) == "table" and api[name] ~= nil then
@@ -117,11 +118,16 @@ function SubAddons.EnumerateChildren(parentAddonName, api)
             if SubAddons.MatchesParent(parentValue, parentAddonName) then
                 local title = getMeta(name, "Title") or name
                 local notes = getMeta(name, "Notes")
+                local settingsHost = getMeta(name, SubAddons.SETTINGS_HOST_METADATA_KEY)
+                if type(settingsHost) ~= "string" or settingsHost == "" then
+                    settingsHost = nil
+                end
                 table.insert(results, {
                     addonName = name,
                     title = title,
                     navLabel = SubAddons.StripParentTitlePrefix(title, parentTitle),
                     notes = notes,
+                    settingsHost = settingsHost,
                 })
             end
         end

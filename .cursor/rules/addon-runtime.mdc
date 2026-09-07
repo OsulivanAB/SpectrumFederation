@@ -1,6 +1,6 @@
 ---
 description: WoW addon runtime constraints and common implementation paths
-globs: "SpectrumFederation/**,SpectrumFederation_CursedSurgeTracker/**"
+globs: "SpectrumFederation/**,SpectrumFederation_CursedSurgeTracker/**,SpectrumFederation_RCLootCouncilIntegration/**"
 alwaysApply: false
 ---
 
@@ -8,7 +8,7 @@ alwaysApply: false
 
 - Target WoW Lua 5.1 only; avoid Lua 5.2+ features plus `io`, `os`, sockets, or external process assumptions.
 - Follow the repo namespace pattern: `local addonName, SF = ...`; attach addon APIs to `SF` and avoid globals.
-- Any new packaged Lua file must be added to the owning addon's TOC in load order. Child-addon files belong in `SpectrumFederation_CursedSurgeTracker.toc`.
+- Any new packaged Lua file must be added to the owning addon's TOC in load order. Child-addon files belong in that child's TOC.
 - For settings work, start with `modules/Settings/Schema.lua`, `modules/Settings/Store.lua`, `modules/Settings/Apply.lua`, and `modules/UI/Settings/`.
 - Prefer `SF.Debug` for diagnostics and `SF:PrintSuccess/Error/Warning/Info` for user-visible messages.
 - Guard protected UI changes with `InCombatLockdown()` when relevant and prefer `hooksecurefunc` over replacing Blizzard functions.

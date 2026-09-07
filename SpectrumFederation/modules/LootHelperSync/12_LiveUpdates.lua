@@ -142,7 +142,9 @@ function Sync:HandleNewLog(sender, payload)
         if incomingFingerprint ~= nil and localFingerprint ~= nil and incomingFingerprint ~= localFingerprint then
             local author, counter = self:_ExtractAuthorCounter(logTable)
             local target = self.state.isCoordinator and sender or self.state.coordinator
-            if type(author) == "string" and type(counter) == "number" then
+            local isExternal = SF.LootLog and SF.LootLog.IsExternalLogTable and SF.LootLog.IsExternalLogTable(logTable)
+            local isSequential = SF.LootLog and SF.LootLog.IsSequentialCounter and SF.LootLog.IsSequentialCounter(counter)
+            if (not isExternal) and type(author) == "string" and isSequential then
                 self:QueueRepairRanges(profileId, {
                     {
                         author = author,

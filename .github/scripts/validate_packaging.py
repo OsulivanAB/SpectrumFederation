@@ -15,7 +15,10 @@ import sys
 import zipfile
 from pathlib import Path
 
-CHILD_ADDON_NAME = "SpectrumFederation_CursedSurgeTracker"
+CHILD_ADDON_NAMES = (
+    "SpectrumFederation_CursedSurgeTracker",
+    "SpectrumFederation_RCLootCouncilIntegration",
+)
 ZIP_EXCLUDES = ["*.git*", "*/AGENTS.md"]
 
 
@@ -32,8 +35,9 @@ def toc_field(toc_file, field_name):
 def packaged_addon_names(parent_name):
     """Return sibling addon folder names that belong in the release zip."""
     names = [parent_name]
-    if Path(CHILD_ADDON_NAME).exists() and CHILD_ADDON_NAME != parent_name:
-        names.append(CHILD_ADDON_NAME)
+    for child_name in CHILD_ADDON_NAMES:
+        if Path(child_name).exists() and child_name != parent_name:
+            names.append(child_name)
     return names
 
 
@@ -80,6 +84,30 @@ def validate_interface_field(toc_file):
         return False
 
     print(f"[validate-packaging] Interface value '{interface_value}' looks OK")
+    return True
+
+
+def validate_wago_project_id(parent_toc, child_toc=None):
+    """Verify the parent TOC has a public Wago project ID for direct publishing."""
+    wago_id = toc_field(parent_toc, "X-Wago-ID")
+    if not wago_id:
+        print(f"::error ::No '## X-Wago-ID:' line found in {parent_toc}")
+        print("          Direct Wago publishing reads the project ID from the parent TOC")
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9]{8}", wago_id):
+        print(
+            f"::error ::X-Wago-ID '{wago_id}' in {parent_toc} is not an 8-character Wago project ID"
+        )
+        return False
+    if child_toc is not None:
+        child_wago_id = toc_field(child_toc, "X-Wago-ID")
+        if child_wago_id and child_wago_id != wago_id:
+            print(
+                f"::error ::Child X-Wago-ID '{child_wago_id}' does not match parent '{wago_id}'"
+            )
+            print("          Nested child addons share the parent Wago project; do not use a second ID")
+            return False
+    print(f"[validate-packaging] Parent X-Wago-ID '{wago_id}' looks OK")
     return True
 
 
@@ -172,13 +200,13 @@ def validate_zip_structure(zip_path, addon_names, toc_files):
             print(f"::error ::TOC file '{toc_in_zip}' not found inside zip")
             return False
 
-    child_name = CHILD_ADDON_NAME
-    if child_name in expected:
-        nested_child = f"{addon_names[0]}/{child_name}/"
-        for file_path in all_files:
-            if file_path.startswith(nested_child):
-                print(f"::error ::Child addon files are nested inside the parent folder: {file_path}")
-                return False
+    for child_name in CHILD_ADDON_NAMES:
+        if child_name in expected:
+            nested_child = f"{addon_names[0]}/{child_name}/"
+            for file_path in all_files:
+                if file_path.startswith(nested_child):
+                    print(f"::error ::Child addon files are nested inside the parent folder: {file_path}")
+                    return False
 
     print("[validate-packaging] Zip structure looks good for WowUp and CurseForge")
     return True
@@ -214,13 +242,19 @@ def main():
 
         toc_files.append(toc_file)
 
-    if len(addon_names) > 1 and not validate_child_relationship(
-        addon_names[0],
-        addon_names[1],
-        toc_files[0],
-        toc_files[1],
-    ):
+    if not validate_wago_project_id(toc_files[0]):
         sys.exit(1)
+
+    for index in range(1, len(addon_names)):
+        if not validate_wago_project_id(toc_files[0], toc_files[index]):
+            sys.exit(1)
+        if not validate_child_relationship(
+            addon_names[0],
+            addon_names[index],
+            toc_files[0],
+            toc_files[index],
+        ):
+            sys.exit(1)
 
     success, zip_path = create_test_zip(addon_names)
     if not success:

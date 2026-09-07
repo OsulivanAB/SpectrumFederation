@@ -27,7 +27,7 @@ local addonName, SF = ...
 | `modules/Settings/` | Defaults, migrations, path-based storage, per-character storage, and runtime application. |
 | `modules/MouseTracer/` | Optional per-character cursor trail: cached settings, fixed-pool rendering, and account-wide copy snapshots. |
 | `modules/UI/Settings/` | Page/category registry, navigation model, standalone window, controls, dialogs, and page definitions. |
-| `modules/LootHelper/` | Profile, member, and log domain models plus serialization and the current communication adapter. |
+| `modules/LootHelper/` | Profile, member, and log domain models plus serialization, the current communication adapter, and runtime-only local impersonation. |
 | `modules/LootHelperSync/` | Session state, validation, requests, convergence, heartbeat, routing, bulk handlers, and public API. |
 | `modules/UI/LootHelper/` | Roster/equipment presentation and controller logic. |
 | `modules/RaidCheck.lua` | Inspection cache, equipment evaluation, whispers, snapshots, and point awards. |
@@ -71,6 +71,10 @@ flowchart LR
 
 ## Permissions
 
+`LootProfile:IsCurrentUserAdmin()` and `IsCurrentUserOwner()` are canonical membership queries. Named-sender, protocol, and sync authorization also stay canonical and can never be granted by Preview as Non-Admin.
+
+Local user-facing capability (Settings controls, roster/equipment actions, member and profile mutators, local loot-log creation, Raid Check start/consequences, and user-triggered session start/end) uses `SF.LootHelperImpersonation` effective local admin/owner. That overlay is a runtime-only one-way downgrade bound to the active profile. It is not persisted, does not change SavedVariables or sync payloads, and is cleared by profile switch/clear/delete/reset, canonical admin loss, and `/reload`.
+
 Authorization is enforced by specific guarded domain methods, log insertion, and sync validation, but Store adapters and low-level `LootProfile` mutators are not uniformly guarded. Callers must check authorization before invoking an unguarded write path; disabled UI controls alone are not a security boundary. Sync verifies group membership, sender identity, and profile authorization before accepting network changes.
 
 The profile creator is the initial owner and admin. Ownership and admin membership use normalized `Name-Realm` identifiers. Use `NameUtil` for comparisons because connected-realm and short-name forms can differ.
@@ -98,6 +102,6 @@ These are internal project APIs, not stable third-party compatibility guarantees
 
 ## Child addons
 
-`SpectrumFederation_CursedSurgeTracker` is a sibling addon folder packaged in the same release zip. It declares `## Dependencies: SpectrumFederation`, `## Group: SpectrumFederation`, and `## X-SpectrumFederation-Parent: SpectrumFederation` so WoW nests it under the parent in the AddOns list and the parent Settings UI can discover it.
+`SpectrumFederation_CursedSurgeTracker` and `SpectrumFederation_RCLootCouncilIntegration` are sibling addon folders packaged in the same release zip. Each declares `## Dependencies: SpectrumFederation`, `## Group: SpectrumFederation`, and `## X-SpectrumFederation-Parent: SpectrumFederation` so WoW nests them under the parent in the AddOns list and the parent Settings UI can discover them. The RC child also sets `## X-SpectrumFederation-Settings-Host: lootHelper` so it registers under Loot Helper instead of creating an Optional sidebar row. See [RC Loot Council Integration](rc-loot-council-integration.md).
 
 The parent does not load child Lua/XML and does not depend on the child. Discovery uses TOC metadata only. Optional children may read `_G.SpectrumFederation` for Debug, slash registration, and `SF:Now()`. The assignment is made in `modules/Init.lua` so the parent remains fully usable when no child is present.

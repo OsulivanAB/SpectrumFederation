@@ -14,6 +14,8 @@ Start or stop from:
 
 The client that starts the session becomes its coordinator. Only that coordinator can explicitly end it. Leaving the group clears the local active-session state.
 
+Preview as Non-Admin cannot start a session and cannot use the user-facing stop/end controls, including `/sf loot session end` and the Loot Helper play-button Stop confirmation. Internal session cleanup such as leaving the group is unchanged. Other clients still see the impersonating player as their real admin.
+
 ## What happens automatically
 
 At session start, the coordinator:

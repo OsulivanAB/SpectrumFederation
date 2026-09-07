@@ -132,6 +132,11 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
         local preferredTarget = opts.preferredTarget or (type(range) == "table" and range.preferredTarget) or nil
 
         if type(author) == "string" and author ~= "" and fromCounter and toCounter then
+            -- External/nonsequential logs use sentinel counter 0. A 0-0 range
+            -- must never be clamped to the sequential 1-1 integrity window.
+            if fromCounter < 1 and toCounter < 1 then
+                -- skip
+            else
             fromCounter = math.max(1, math.floor(fromCounter))
             toCounter = math.max(1, math.floor(toCounter))
             if fromCounter <= toCounter and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter) then
@@ -173,6 +178,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                         entry.nextAttemptAt = now
                     end
                 end
+            end
             end
         end
     end

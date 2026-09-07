@@ -1,5 +1,5 @@
 ---
-applyTo: "SpectrumFederation/**/*.lua,SpectrumFederation_CursedSurgeTracker/**/*.lua"
+applyTo: "SpectrumFederation/**/*.lua,SpectrumFederation_CursedSurgeTracker/**/*.lua,SpectrumFederation_RCLootCouncilIntegration/**/*.lua"
 ---
 
 # Lua (WoW Addon) Instructions
@@ -9,7 +9,7 @@ applyTo: "SpectrumFederation/**/*.lua,SpectrumFederation_CursedSurgeTracker/**/*
   - `local addonName, SF = ...`
   - attach public APIs/modules onto `SF`
 - Keep changes minimal and localized to the feature you are implementing.
-- Add new Lua files to the owning addon's TOC in correct load order (deps before dependents). Child-addon files go in `SpectrumFederation_CursedSurgeTracker.toc`, not the parent TOC.
+- Add new Lua files to the owning addon's TOC in correct load order (deps before dependents). Child-addon files go in that child's TOC, not the parent TOC.
 - **Every Lua change requires a TOC version bump** — update `## Version:` in `SpectrumFederation/SpectrumFederation.toc`:
   - On **beta branch**: keep the `-beta.N` suffix and increment N by 1 (e.g., `0.5.0-beta.3` → `0.5.0-beta.4`). A version without `-beta.N` is **invalid** on beta.
   - On **main branch**: bump the SemVer component (patch/minor/major) and drop the `-beta.N` suffix.
