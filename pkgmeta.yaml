@@ -21,6 +21,7 @@ ignore:
   - docs
   - site
   - assets
+  - overrides
   - requirements-docs.txt
   - mkdocs.yml
   - pkgmeta.yaml

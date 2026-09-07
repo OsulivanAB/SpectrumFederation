@@ -20,7 +20,7 @@ local C = {
     PADDING = 12,
 
     -- Navigation elements
-    BANNER_HEIGHT = 54,  -- Maintains 4:1 aspect ratio for 512x128 banner texture
+    BANNER_HEIGHT = 54,  -- Maintains 4:1 aspect ratio for the 512x128 v2 banner texture
     VERSION_HEIGHT = 16,
     SEARCH_LABEL_HEIGHT = 14,
     SEARCH_HEIGHT = 24,
@@ -68,7 +68,7 @@ local C = {
     },
 
     -- Texture paths
-    BANNER_TEXTURE = "Interface\\AddOns\\SpectrumFederation\\media\\Textures\\SpectrumFederationBanner.tga",
+    BANNER_TEXTURE = "Interface\\AddOns\\SpectrumFederation\\media\\Textures\\SpectrumFederationBannerV2.tga",
 }
 
 -- ============================================================
