@@ -426,6 +426,64 @@ body {
   margin: 0.15rem 0.25rem 0.4rem;
 }
 
+/* --------------------------- Install store icons --------------------------- */
+
+.md-typeset .sf-install-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: flex-start;
+  gap: 1.1rem 1.4rem;
+  margin: 0.35rem 0 1.15rem;
+}
+
+.sf-landing .sf-install-links {
+  justify-content: center;
+  margin: 0.15rem 0 1.15rem;
+}
+
+.md-typeset .sf-install-links__item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--sf-accent-text);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-decoration: none;
+  text-transform: uppercase;
+}
+
+.md-typeset .sf-install-links__item:hover {
+  color: var(--sf-accent-text-hover);
+  text-decoration: none;
+}
+
+.md-typeset .sf-install-links img {
+  display: block;
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+  border-radius: 14px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.28);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.md-typeset .sf-install-links__item:hover img {
+  transform: translateY(-2px) scale(1.04);
+  box-shadow:
+    0 0 0 2px var(--sf-gold),
+    0 8px 18px rgba(0, 0, 0, 0.35);
+}
+
+/* CurseForge hexagon is near-black; keep the silhouette readable on dark pages. */
+.md-typeset img.sf-install-links__icon--curseforge {
+  background: #f4efe4;
+  box-sizing: border-box;
+  padding: 5px;
+}
+
 .md-typeset h1,
 .md-typeset h2,
 .md-typeset h3 {
