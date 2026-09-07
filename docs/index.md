@@ -1,3 +1,12 @@
+---
+hide:
+  - toc
+---
+
+<p class="sf-hero">
+  <img class="sf-hero__banner" src="assets/SpectrumFederationBannerV2.jpg" alt="Spectrum Federation guild banner: Alliance and Horde adventurers looking toward a rainbow over Azeroth. Play, belong, be yourself.">
+</p>
+
 # Spectrum Federation
 
 Spectrum Federation is a World of Warcraft Retail addon for coordinating guild raid loot. It keeps shared loot profiles, member loot points and Attendance, a Reward Pot, equipment-slot history, raid-readiness checks, and profile changes in one place.

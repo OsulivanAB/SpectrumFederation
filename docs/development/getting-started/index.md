@@ -29,7 +29,7 @@ SpectrumFederation_RCLootCouncilIntegration/
   Integration.lua              records RC Loot Council awards in Spectrum Loot Logs
 .github/scripts/               validation and release helpers
 .github/workflows/             PR, beta, promotion, and rollback automation
-assets/                        standalone Google Sheet sync utility
+assets/                        branding sources, GitHub/readme images, and the Google Sheet sync utility
 docs/                          MkDocs content
 tests/                         Python tests and Lua 5.1 Settings/Mouse Tracer tests
 ```
