@@ -1,15 +1,27 @@
 ---
 hide:
+  - navigation
   - toc
 ---
 
-<p class="sf-hero">
+<div class="sf-hero">
   <img class="sf-hero__banner" src="assets/SpectrumFederationBannerV2.jpg" alt="Spectrum Federation guild banner: Alliance and Horde adventurers looking toward a rainbow over Azeroth. Play, belong, be yourself.">
-</p>
+</div>
+
+<div class="sf-landing" markdown="1">
+
+![Spectrum Federation crest](assets/SpectrumFederationIconV2.png){ .sf-landing__crest }
+
+<p class="sf-landing__badge">Garona-US · Addon docs</p>
 
 # Spectrum Federation
 
-Spectrum Federation is a World of Warcraft Retail addon for coordinating guild raid loot. It keeps shared loot profiles, member loot points and Attendance, a Reward Pot, equipment-slot history, raid-readiness checks, and profile changes in one place.
+A World of Warcraft Retail addon for coordinating guild raid loot, and a home for LGBTQIA players and allies on Garona.
+
+[Install and get started](getting-started.md){ .md-button .md-button--primary }
+[Open the feature guides](features/loot-helper.md){ .md-button }
+
+</div>
 
 ## What the addon provides
 
@@ -22,9 +34,6 @@ Spectrum Federation is a World of Warcraft Retail addon for coordinating guild r
 - **Cursed Surge Tracker** — a nested child addon that shows Curse Surge locations and countdowns on The Coiled Isle World Map. When installed it also appears as an Optional settings category; enable or disable it from WoW's AddOns list, not from `/sf`.
 - **RC Loot Council Integration** — an optional nested child addon that records finalized RC Loot Council awards in Loot Logs while a Spectrum Loot Helper session is active. Open it from **Loot Helper → RC Loot Council**.
 - **Mouse Tracer** — an optional, per-character rainbow cursor trail on **Gameplay → UI Enhancements**. It is off by default.
-
-[Install and get started](getting-started.md){ .md-button .md-button--primary }
-[Open the feature guides](features/loot-helper.md){ .md-button }
 
 ## Who can change shared data?
 

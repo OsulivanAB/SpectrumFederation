@@ -43,6 +43,7 @@ extra_css:
   - stylesheets/extra.css
 
 extra:
+  tagline: A Brighter Azeroth Together
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/OsulivanAB/SpectrumFederation
