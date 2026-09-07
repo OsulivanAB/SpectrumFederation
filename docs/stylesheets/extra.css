@@ -355,9 +355,10 @@ body {
   margin: 0 0 0 -50vw;
 }
 
-.sf-hero__banner {
+.md-typeset img.sf-hero__banner {
   display: block;
   width: 100%;
+  max-width: none;
   height: min(46vh, 520px);
   object-fit: cover;
   object-position: center 46%;
