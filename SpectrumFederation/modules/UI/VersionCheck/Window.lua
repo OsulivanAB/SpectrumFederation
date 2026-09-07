@@ -458,7 +458,7 @@ function Window:Create()
 	local logo = title:CreateTexture(nil, "ARTWORK")
 	logo:SetSize(C.LOGO_SIZE, C.LOGO_SIZE)
 	logo:SetPoint("LEFT", title, "LEFT", C.TITLE_PADDING_X, 0)
-	logo:SetTexture("Interface\\AddOns\\SpectrumFederation\\media\\Icons\\SpectrumFederationIcon.tga")
+	logo:SetTexture("Interface\\AddOns\\SpectrumFederation\\media\\Icons\\SpectrumFederationIconV2.tga")
 	title.Logo = logo
 
 	local close = CreateFrame("Button", nil, title, "UIPanelCloseButton")

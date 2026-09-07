@@ -5,7 +5,9 @@
 
 <!-- STATUS_BADGES_END -->
 
-
+<p align="center">
+  <img src="assets/readme/SpectrumFederationV2.jpg" alt="Spectrum Federation — Play, belong, be yourself. A safe, friendly, supportive home for LGBTQIA players and allies.">
+</p>
 
 World of Warcraft addon for the Spectrum Federation guild on Garona.
 
