@@ -15,7 +15,7 @@ Spectrum Federation uses a beta-first workflow. Normal pull requests target `bet
 - requires a TOC version bump and a non-duplicate beta release only for addon changes;
 - builds MkDocs in strict mode.
 
-Documentation-only changes do not require an addon version bump.
+Documentation-only changes do not require an addon version bump. Packaged-addon detection uses `.github/scripts/classify_promotion_scope.py`, so zip-excluded files such as `*/AGENTS.md` do not count as addon changes.
 
 ### PRs to main
 
@@ -23,11 +23,11 @@ Documentation-only changes do not require an addon version bump.
 
 `.github/workflows/pr-template-validation.yml` separately validates pull-request template completion. In-game testing must be either marked complete or explicitly marked not applicable. N/A is rejected when packaged addon files changed, or when a TOC change is runtime-affecting, unknown, or not inspectable. Zip-excluded repository files such as `*/AGENTS.md` may still use N/A.
 
-Both branch-validation workflows include `README.md` and `tests/**` in their path filters so documentation and test-only changes still run the matching checks.
+Both branch-validation workflows include `README.md`, `tests/**`, and MkDocs inputs (`docs/**`, `mkdocs.yml`, `overrides/**`, `requirements-docs.txt`) in their path filters.
 
 ## Post-merge beta release
 
-`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**`.
+`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes packaged addon files under `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**`. Zip-excluded files such as `*/AGENTS.md` do not start a beta release.
 
 It:
 
@@ -82,24 +82,57 @@ Deterministic range, validation, and write-safety behavior is covered by `tests/
 
 ## Promote beta to main
 
-`.github/workflows/promote-beta-to-main.yml` is manually dispatched with no inputs. Every run performs a complete local dry-run phase first. The actual phase starts automatically only if all required dry-run jobs succeed.
+`.github/workflows/promote-beta-to-main.yml` is manually dispatched with no inputs. Every run performs a complete local dry-run phase first. The actual phase starts automatically only if all required dry-run jobs succeed, including jobs that were skipped because they were not applicable.
+
+Branch promotion and downstream publishing are separate decisions. Every valid dispatch still merges `beta` into `main` and fast-forwards `beta` to `main`. Changelog generation, README badge work, stable addon publishing, and MkDocs deployment run only when the promotion scope says they are applicable.
+
+### How promotion scope is determined
+
+The first job captures an immutable range and classifies it with `.github/scripts/classify_promotion_scope.py`:
+
+1. `promotion_base_sha` is `origin/main` at workflow start.
+2. `promotion_target_sha` is the `beta` HEAD at workflow start.
+3. Changed files are `git diff --name-only` from `merge-base(base, target)` to `target` (`origin/main...beta`). That is the incoming promotion, not later workflow-generated commits.
+
+The script is the source of truth for path classification. Update it when packaged addon roots, zip excludes, or MkDocs inputs change. It does not use AI.
+
+| Flag | Meaning |
+| --- | --- |
+| `addon_changed` | A file that ships in the release zip changed. Addon roots come from packaging; `*/AGENTS.md` and `*.git*` are excluded. |
+| `docs_changed` | MkDocs sources changed: `docs/**`, `mkdocs.yml`, `overrides/**`, or `requirements-docs.txt`. |
+| `readme_changed` | `README.md` is in the incoming diff. |
+| `release_required` | Same as `addon_changed`. Incoming packaged addon changes warrant a stable release. Generated TOC/version commits do not create this flag. |
+| `changelog_required` | Same as `release_required`. AI may write the changelog text; it does not decide whether a changelog is needed. |
+| `documentation_deploy_required` | Same as `docs_changed`. Docs-only promotions deploy MkDocs and do not publish an addon release. |
+| `readme_work_required` | Incoming README change or a stable addon release (badge/version updates). |
+
+These flags are independent. Addon plus documentation is `addon_changed=true` and `docs_changed=true`, which requires both a stable release and MkDocs deployment.
+
+| Incoming changes | Promote branches | Changelog | Addon release | MkDocs deploy | README work |
+| --- | --- | --- | --- | --- | --- |
+| Addon only | Yes | Yes | Yes | No | Yes |
+| Docs only | Yes | No | No | Yes | No |
+| Addon + docs | Yes | Yes | Yes | Yes | Yes |
+| README only | Yes | No | No | No | Yes |
+| Workflow/dev only | Yes | No | No | No | No |
+| No downstream-relevant changes | Yes | No | No | No | No |
 
 The workflow:
 
-1. determines whether `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**` differs between `main` and `beta`;
-2. validates lint, packaging, docs, and the appropriate version format;
-3. simulates the merge, metadata changes, docs build, release packaging, and beta synchronization without pushing;
+1. classifies the incoming `main...beta` range;
+2. validates lint, packaging, docs, and the appropriate version format (required on every promotion);
+3. dry-runs only the applicable merge, changelog, README, docs, release, and fast-forward steps without pushing;
 4. merges `beta` into `main`;
-5. for addon changes, removes `-beta.N`, fetches the live Interface value, updates the changelog, and publishes a stable GitHub Release plus a Wago `stable` upload;
-6. updates README badges;
-7. deploys MkDocs from `main`;
+5. when `release_required`, removes `-beta.N`, fetches the live Interface value, updates the changelog, and publishes a stable GitHub Release plus a Wago `stable` upload;
+6. when `readme_work_required`, updates README badges;
+7. when `documentation_deploy_required`, deploys MkDocs from `main`;
 8. force-with-lease synchronizes `beta` to `main`.
 
-If there are no addon changes, the promotion preserves the stable version and skips stable release creation while still promoting and deploying non-addon changes.
+Dry-run and real jobs consume the same scope outputs. The dry-run summary prints the detected flags and which operations would run. The final summary compares detected scope, required operations, and actual job results. If a required operation is skipped or fails, the summary fails the workflow instead of reporting success.
 
 Older instructions that ask for a promotion `dry_run` input are obsolete; the workflow now always validates with its built-in dry-run phase.
 
-The dry-run README job uploads its simulated stable badge output to the dry-run docs job, which applies the simulated stable TOC metadata before calling `validate_docs.py`. The final `main` deployment also calls the validator after generated metadata is pushed.
+When a dry-run README job runs, it uploads its simulated stable badge output to the dry-run docs job, which applies simulated stable TOC metadata before calling `validate_docs.py`. Docs-only dry runs skip that overlay and validate the incoming documentation as-is. The final `main` deployment also calls the validator after generated metadata is pushed.
 
 ## GitHub, CurseForge, and Wago publishing
 
@@ -217,6 +250,7 @@ python -m pytest tests/test_interface_badge.py
 | `check_duplicate_release.py` | Reject an existing release version. |
 | `publish_release.py` | Build release artifacts, create or update the GitHub Release, and publish the same zip to Wago. |
 | `update_changelog.py` | Update the beta changelog after merge, or consolidate the main changelog during promotion. |
+| `classify_promotion_scope.py` | Classify a git range or file list into addon/docs/README/infra flags used by promotion and PR addon detection. |
 | `cleanup_merged_branch.py` | Remove the merged source branch after beta release. |
 
 Use the scripts rather than reproducing their logic in ad hoc commands.

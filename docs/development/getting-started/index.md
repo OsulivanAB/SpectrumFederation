@@ -107,6 +107,9 @@ python -m pytest tests/test_pr_template.py
 
 # GitHub/Wago release classification and Wago publishing
 python -m pytest tests/test_publish_release.py
+
+# Promotion-scope path classification
+python -m pytest tests/test_promotion_scope.py
 ```
 
 Do not weaken a check to make a change pass.

@@ -8,6 +8,7 @@ on:
       - 'SpectrumFederation/**'
       - 'SpectrumFederation_CursedSurgeTracker/**'
       - 'SpectrumFederation_RCLootCouncilIntegration/**'
+      - '!**/AGENTS.md'
 
 concurrency:
   group: beta-release

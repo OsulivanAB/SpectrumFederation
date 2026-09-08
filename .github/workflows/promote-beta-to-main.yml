@@ -12,12 +12,29 @@ concurrency:
   group: main-release
   cancel-in-progress: false
 
+# GitHub Actions default `if: success()` is false when ANY ancestor job was
+# skipped. Optional jobs therefore use explicit result checks. Do not add a
+# skippable job to this graph without giving every descendant an explicit `if:`.
+
 jobs:
   detect-promotion-scope:
     name: Detect Promotion Scope
     runs-on: ubuntu-latest
     outputs:
-      addon_changed: ${{ steps.changes.outputs.addon_changed }}
+      promotion_base_sha: ${{ steps.scope.outputs.promotion_base_sha }}
+      promotion_target_sha: ${{ steps.scope.outputs.promotion_target_sha }}
+      promotion_merge_base_sha: ${{ steps.scope.outputs.promotion_merge_base_sha }}
+      promotion_type: ${{ steps.scope.outputs.promotion_type }}
+      addon_changed: ${{ steps.scope.outputs.addon_changed }}
+      docs_changed: ${{ steps.scope.outputs.docs_changed }}
+      readme_changed: ${{ steps.scope.outputs.readme_changed }}
+      changelog_changed: ${{ steps.scope.outputs.changelog_changed }}
+      infra_changed: ${{ steps.scope.outputs.infra_changed }}
+      release_required: ${{ steps.scope.outputs.release_required }}
+      changelog_required: ${{ steps.scope.outputs.changelog_required }}
+      documentation_deploy_required: ${{ steps.scope.outputs.documentation_deploy_required }}
+      readme_work_required: ${{ steps.scope.outputs.readme_work_required }}
+      has_incoming_changes: ${{ steps.scope.outputs.has_incoming_changes }}
 
     steps:
       - name: Checkout beta branch
@@ -29,18 +46,17 @@ jobs:
       - name: Fetch main branch
         run: git fetch origin main:refs/remotes/origin/main
 
-      - name: Check for addon changes
-        id: changes
+      - name: Classify incoming promotion range
+        id: scope
         run: |
-          CHANGED_FILES=$(git diff --name-only "origin/main...HEAD" -- 'SpectrumFederation/' 'SpectrumFederation_CursedSurgeTracker/' 'SpectrumFederation_RCLootCouncilIntegration/')
-          if [[ -n "$CHANGED_FILES" ]]; then
-            echo "addon_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Addon files changed between main and beta:"
-            echo "$CHANGED_FILES"
-          else
-            echo "addon_changed=false" >> "$GITHUB_OUTPUT"
-            echo "No addon files changed between main and beta."
-          fi
+          # Capture SHAs before any later workflow commit can rewrite HEAD.
+          # origin/main...HEAD is merge-base(main, beta)..beta: the changes
+          # being promoted, not commits that already exist only on main.
+          python3 .github/scripts/classify_promotion_scope.py \
+            --base origin/main \
+            --head HEAD \
+            --github-output \
+            --step-summary
 
   # ==========================================
   # Phase 1: Dry Run (validation only, no pushes)
@@ -82,7 +98,7 @@ jobs:
         run: python3 .github/scripts/validate_docs.py
 
       - name: Verify beta version format
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         run: |
           VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
           echo "Beta version: $VERSION"
@@ -96,7 +112,7 @@ jobs:
         id: beta_version
 
       - name: Verify unchanged addon uses stable version
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'false'
+        if: needs.detect-promotion-scope.outputs.release_required == 'false'
         run: |
           VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
           echo "Unchanged addon version: $VERSION"
@@ -111,7 +127,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: [detect-promotion-scope, dry-run-pre-merge-validation]
     outputs:
+      promotion_base_sha: ${{ needs.detect-promotion-scope.outputs.promotion_base_sha }}
+      promotion_target_sha: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
+      promotion_type: ${{ needs.detect-promotion-scope.outputs.promotion_type }}
       addon_changed: ${{ needs.detect-promotion-scope.outputs.addon_changed }}
+      docs_changed: ${{ needs.detect-promotion-scope.outputs.docs_changed }}
+      readme_changed: ${{ needs.detect-promotion-scope.outputs.readme_changed }}
+      release_required: ${{ needs.detect-promotion-scope.outputs.release_required }}
+      changelog_required: ${{ needs.detect-promotion-scope.outputs.changelog_required }}
+      documentation_deploy_required: ${{ needs.detect-promotion-scope.outputs.documentation_deploy_required }}
+      readme_work_required: ${{ needs.detect-promotion-scope.outputs.readme_work_required }}
       stable_version: ${{ steps.metadata.outputs.stable_version }}
       interface: ${{ steps.metadata.outputs.interface }}
 
@@ -157,13 +182,13 @@ jobs:
           git commit -m "$COMMIT_MESSAGE"
 
       - name: Set up Python
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Validate merged TOC version
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         run: |
           MERGED_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
           echo "Merged TOC version: $MERGED_VERSION"
@@ -177,7 +202,7 @@ jobs:
           echo "✓ Merged version contains -beta suffix as expected"
 
       - name: Remove -beta suffix from version
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         id: remove_beta
         run: |
           BETA_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
@@ -194,7 +219,7 @@ jobs:
           git commit -m "chore: update version to $STABLE_VERSION [skip ci]"
 
       - name: Query Blizzard API for live Interface version
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         id: blizzard
         run: |
           INTERFACE=$(python3 .github/scripts/blizzard_api.py --environment live --output interface)
@@ -202,7 +227,7 @@ jobs:
           echo "Live Interface version: $INTERFACE"
 
       - name: Update Interface version in TOC
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         run: |
           INTERFACE="${{ steps.blizzard.outputs.interface }}"
           echo "Updating Interface to: $INTERFACE"
@@ -216,7 +241,7 @@ jobs:
       - name: Set promotion metadata
         id: metadata
         run: |
-          if [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "true" ]]; then
+          if [[ "${{ needs.detect-promotion-scope.outputs.release_required }}" == "true" ]]; then
             VERSION="${{ steps.remove_beta.outputs.stable_version }}"
             INTERFACE="${{ steps.blizzard.outputs.interface }}"
           else
@@ -235,6 +260,10 @@ jobs:
     name: "[DRY RUN] Update Changelog for Main"
     runs-on: ubuntu-latest
     needs: dry-run-merge-beta-to-main
+    if: |
+      !cancelled() &&
+      needs.dry-run-merge-beta-to-main.result == 'success' &&
+      needs.dry-run-merge-beta-to-main.outputs.changelog_required == 'true'
     permissions:
       contents: write
       pull-requests: read
@@ -254,23 +283,16 @@ jobs:
           git fetch origin beta --tags
           git checkout origin/beta -- .github/scripts/update_changelog.py
 
-      - name: Skip changelog update for non-addon promotion
-        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'false'
-        run: echo "No addon changes; preserving the existing stable release notes."
-
       - name: Set up Python
-        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Install Copilot CLI
-        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'true'
         continue-on-error: true
         run: npm install -g @github/copilot
 
       - name: Update CHANGELOG.md
-        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH_NAME: main
@@ -283,7 +305,6 @@ jobs:
           python3 .github/scripts/update_changelog.py
 
       - name: Commit changelog changes
-        if: needs.dry-run-merge-beta-to-main.outputs.addon_changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -305,6 +326,11 @@ jobs:
     name: "[DRY RUN] Update README for Main"
     runs-on: ubuntu-latest
     needs: [dry-run-merge-beta-to-main, dry-run-update-changelog-main]
+    if: |
+      !cancelled() &&
+      needs.dry-run-merge-beta-to-main.result == 'success' &&
+      (needs.dry-run-update-changelog-main.result == 'success' || needs.dry-run-update-changelog-main.result == 'skipped') &&
+      needs.dry-run-merge-beta-to-main.outputs.readme_work_required == 'true'
 
     steps:
       - name: Checkout beta branch
@@ -363,6 +389,12 @@ jobs:
     name: "[DRY RUN] Deploy Documentation"
     runs-on: ubuntu-latest
     needs: [dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main]
+    if: |
+      !cancelled() &&
+      needs.dry-run-merge-beta-to-main.result == 'success' &&
+      (needs.dry-run-update-changelog-main.result == 'success' || needs.dry-run-update-changelog-main.result == 'skipped') &&
+      (needs.dry-run-update-readme-main.result == 'success' || needs.dry-run-update-readme-main.result == 'skipped') &&
+      needs.dry-run-merge-beta-to-main.outputs.documentation_deploy_required == 'true'
 
     steps:
       - name: Checkout branch
@@ -371,12 +403,14 @@ jobs:
           ref: beta  # Dry run always uses beta
 
       - name: Download simulated stable README
+        if: needs.dry-run-update-readme-main.result == 'success'
         uses: actions/download-artifact@v4
         with:
           name: dry-run-stable-readme
           path: .
 
       - name: Prepare simulated stable TOC
+        if: needs.dry-run-merge-beta-to-main.outputs.release_required == 'true'
         run: |
           VERSION="${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}"
           INTERFACE="${{ needs.dry-run-merge-beta-to-main.outputs.interface }}"
@@ -416,7 +450,12 @@ jobs:
     name: "[DRY RUN] Publish Stable Release"
     runs-on: ubuntu-latest
     needs: [detect-promotion-scope, dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main]
-    if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+    if: |
+      !cancelled() &&
+      needs.detect-promotion-scope.outputs.release_required == 'true' &&
+      needs.dry-run-merge-beta-to-main.result == 'success' &&
+      needs.dry-run-update-changelog-main.result == 'success' &&
+      needs.dry-run-update-readme-main.result == 'success'
 
     steps:
       - name: Checkout beta branch
@@ -451,6 +490,11 @@ jobs:
     name: "[DRY RUN] Fast-Forward Beta to Main"
     runs-on: ubuntu-latest
     needs: [dry-run-merge-beta-to-main, dry-run-update-changelog-main, dry-run-update-readme-main]
+    if: |
+      !cancelled() &&
+      needs.dry-run-merge-beta-to-main.result == 'success' &&
+      (needs.dry-run-update-changelog-main.result == 'success' || needs.dry-run-update-changelog-main.result == 'skipped') &&
+      (needs.dry-run-update-readme-main.result == 'success' || needs.dry-run-update-readme-main.result == 'skipped')
 
     steps:
       - name: Checkout beta branch
@@ -495,39 +539,78 @@ jobs:
 
     steps:
       - name: Summary
+        env:
+          ADDON_CHANGED: ${{ needs.detect-promotion-scope.outputs.addon_changed }}
+          DOCS_CHANGED: ${{ needs.detect-promotion-scope.outputs.docs_changed }}
+          README_CHANGED: ${{ needs.detect-promotion-scope.outputs.readme_changed }}
+          RELEASE_REQUIRED: ${{ needs.detect-promotion-scope.outputs.release_required }}
+          CHANGELOG_REQUIRED: ${{ needs.detect-promotion-scope.outputs.changelog_required }}
+          DOCS_DEPLOY_REQUIRED: ${{ needs.detect-promotion-scope.outputs.documentation_deploy_required }}
+          README_WORK_REQUIRED: ${{ needs.detect-promotion-scope.outputs.readme_work_required }}
+          PROMOTION_TYPE: ${{ needs.detect-promotion-scope.outputs.promotion_type }}
+          STABLE_VERSION: ${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}
+          INTERFACE: ${{ needs.dry-run-merge-beta-to-main.outputs.interface }}
+          VALIDATION_RESULT: ${{ needs.dry-run-pre-merge-validation.result }}
+          MERGE_RESULT: ${{ needs.dry-run-merge-beta-to-main.result }}
+          CHANGELOG_RESULT: ${{ needs.dry-run-update-changelog-main.result }}
+          README_RESULT: ${{ needs.dry-run-update-readme-main.result }}
+          DOCS_RESULT: ${{ needs.dry-run-deploy-docs.result }}
+          RELEASE_RESULT: ${{ needs.dry-run-publish-stable-release.result }}
+          FASTFORWARD_RESULT: ${{ needs.dry-run-fast-forward-beta.result }}
         run: |
-          # Determine status emojis based on job results
-          ADDON_CHANGED="${{ needs.detect-promotion-scope.outputs.addon_changed }}"
-          if [[ "$ADDON_CHANGED" == "true" ]]; then
-            PROMOTION_TYPE="Addon release"
-          elif [[ "$ADDON_CHANGED" == "false" ]]; then
-            PROMOTION_TYPE="Non-addon changes only"
-          else
-            PROMOTION_TYPE="Unknown (scope detection failed)"
+          set -euo pipefail
+
+          outcome_icon() {
+            local required="$1"
+            local result="$2"
+            if [[ "$required" == "true" ]]; then
+              if [[ "$result" == "success" ]]; then echo "✅"; else echo "❌"; fi
+            else
+              if [[ "$result" == "skipped" || "$result" == "success" ]]; then echo "⏭️"; else echo "❌"; fi
+            fi
+          }
+
+          always_icon() {
+            local result="$1"
+            if [[ "$result" == "success" ]]; then echo "✅"; else echo "❌"; fi
+          }
+
+          yes_no() {
+            if [[ "$1" == "true" ]]; then echo "Yes"; else echo "No"; fi
+          }
+
+          VALIDATION_STATUS="$(always_icon "$VALIDATION_RESULT")"
+          MERGE_STATUS="$(always_icon "$MERGE_RESULT")"
+          CHANGELOG_STATUS="$(outcome_icon "$CHANGELOG_REQUIRED" "$CHANGELOG_RESULT")"
+          README_STATUS="$(outcome_icon "$README_WORK_REQUIRED" "$README_RESULT")"
+          DOCS_STATUS="$(outcome_icon "$DOCS_DEPLOY_REQUIRED" "$DOCS_RESULT")"
+          RELEASE_STATUS="$(outcome_icon "$RELEASE_REQUIRED" "$RELEASE_RESULT")"
+          FASTFORWARD_STATUS="$(always_icon "$FASTFORWARD_RESULT")"
+
+          ERRORS=()
+          if [[ "$VALIDATION_RESULT" != "success" ]]; then
+            ERRORS+=("Pre-merge validation was required but result was '$VALIDATION_RESULT'")
+          fi
+          if [[ "$MERGE_RESULT" != "success" ]]; then
+            ERRORS+=("Merge was required but result was '$MERGE_RESULT'")
+          fi
+          if [[ "$FASTFORWARD_RESULT" != "success" ]]; then
+            ERRORS+=("Fast-forward was required but result was '$FASTFORWARD_RESULT'")
+          fi
+          if [[ "$CHANGELOG_REQUIRED" == "true" && "$CHANGELOG_RESULT" != "success" ]]; then
+            ERRORS+=("Changelog update was required but result was '$CHANGELOG_RESULT'")
+          fi
+          if [[ "$README_WORK_REQUIRED" == "true" && "$README_RESULT" != "success" ]]; then
+            ERRORS+=("README work was required but result was '$README_RESULT'")
+          fi
+          if [[ "$DOCS_DEPLOY_REQUIRED" == "true" && "$DOCS_RESULT" != "success" ]]; then
+            ERRORS+=("Documentation deployment was required but result was '$DOCS_RESULT'")
+          fi
+          if [[ "$RELEASE_REQUIRED" == "true" && "$RELEASE_RESULT" != "success" ]]; then
+            ERRORS+=("Stable release was required but result was '$RELEASE_RESULT'")
           fi
 
-          VALIDATION_STATUS="${{ needs.dry-run-pre-merge-validation.result == 'success' && '✅' || '❌' }}"
-          MERGE_STATUS="${{ needs.dry-run-merge-beta-to-main.result == 'success' && '✅' || '❌' }}"
-          CHANGELOG_STATUS="${{ needs.dry-run-update-changelog-main.result == 'success' && '✅' || '❌' }}"
-          README_STATUS="${{ needs.dry-run-update-readme-main.result == 'success' && '✅' || '❌' }}"
-          DOCS_STATUS="${{ needs.dry-run-deploy-docs.result == 'success' && '✅' || '❌' }}"
-          if [[ "${{ needs.dry-run-publish-stable-release.result }}" == "success" ]]; then
-            RELEASE_STATUS="✅"
-          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "false" &&
-                  "${{ needs.dry-run-publish-stable-release.result }}" == "skipped" ]]; then
-            RELEASE_STATUS="⏭️"
-          else
-            RELEASE_STATUS="❌"
-          fi
-          FASTFORWARD_STATUS="${{ needs.dry-run-fast-forward-beta.result == 'success' && '✅' || '❌' }}"
-
-          # Determine overall status
-          if [[ "$ADDON_CHANGED" != "true" && "$ADDON_CHANGED" != "false" ]]; then
-            TITLE="## [DRY RUN] Promotion Failed ❌"
-          elif [[ "$ADDON_CHANGED" == "true" &&
-                "${{ needs.dry-run-publish-stable-release.result }}" == "skipped" ]]; then
-            TITLE="## [DRY RUN] Promotion Failed ❌"
-          elif [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+          if [[ ${#ERRORS[@]} -gt 0 ]]; then
             TITLE="## [DRY RUN] Promotion Failed ❌"
           elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             TITLE="## [DRY RUN] Promotion Cancelled ⚠️"
@@ -535,29 +618,53 @@ jobs:
             TITLE="## [DRY RUN] Promotion Validation Complete ✅"
           fi
 
-          echo "$TITLE" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Promotion Type**: $PROMOTION_TYPE" >> $GITHUB_STEP_SUMMARY
-          echo "**Stable Version**: ${{ needs.dry-run-merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Interface Version**: ${{ needs.dry-run-merge-beta-to-main.outputs.interface }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Job Results:" >> $GITHUB_STEP_SUMMARY
-          echo "- $VALIDATION_STATUS Pre-merge validation" >> $GITHUB_STEP_SUMMARY
-          echo "- $MERGE_STATUS Merged beta → main" >> $GITHUB_STEP_SUMMARY
-          echo "- $CHANGELOG_STATUS Updated CHANGELOG.md" >> $GITHUB_STEP_SUMMARY
-          echo "- $README_STATUS Updated README badges" >> $GITHUB_STEP_SUMMARY
-          echo "- $DOCS_STATUS Deployed documentation" >> $GITHUB_STEP_SUMMARY
-          echo "- $RELEASE_STATUS Published stable release" >> $GITHUB_STEP_SUMMARY
-          echo "- $FASTFORWARD_STATUS Fast-forwarded beta to main" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ **This was a DRY RUN - all operations executed locally but no changes were pushed**" >> $GITHUB_STEP_SUMMARY
-          echo "- No commits were pushed to branches" >> $GITHUB_STEP_SUMMARY
-          echo "- No GitHub release was created" >> $GITHUB_STEP_SUMMARY
-          echo "- No documentation was deployed" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ **If validation passed, the actual promotion will now proceed automatically in this same workflow run**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📋 **Scroll down or check the jobs list to see the actual promotion jobs running below**" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "$TITLE"
+            echo ""
+            echo "### Detected Scope"
+            echo ""
+            echo "| Signal | Value |"
+            echo "| --- | --- |"
+            echo "| Promotion type | ${PROMOTION_TYPE:-unknown} |"
+            echo "| Addon changes | $(yes_no "$ADDON_CHANGED") |"
+            echo "| Documentation changes | $(yes_no "$DOCS_CHANGED") |"
+            echo "| README changed | $(yes_no "$README_CHANGED") |"
+            echo "| Changelog required | $(yes_no "$CHANGELOG_REQUIRED") |"
+            echo "| README work required | $(yes_no "$README_WORK_REQUIRED") |"
+            echo "| Stable addon release | $(yes_no "$RELEASE_REQUIRED") |"
+            echo "| Documentation deployment | $(yes_no "$DOCS_DEPLOY_REQUIRED") |"
+            echo "| Stable version | $STABLE_VERSION |"
+            echo "| Interface version | $INTERFACE |"
+            echo ""
+            echo "### Expected vs Actual"
+            echo ""
+            echo "| Operation | Required | Result |"
+            echo "| --- | --- | --- |"
+            echo "| $VALIDATION_STATUS Pre-merge validation | Yes | $VALIDATION_RESULT |"
+            echo "| $MERGE_STATUS Merge beta → main | Yes | $MERGE_RESULT |"
+            echo "| $CHANGELOG_STATUS Changelog update | $(yes_no "$CHANGELOG_REQUIRED") | $CHANGELOG_RESULT |"
+            echo "| $README_STATUS README work | $(yes_no "$README_WORK_REQUIRED") | $README_RESULT |"
+            echo "| $DOCS_STATUS Documentation deployment | $(yes_no "$DOCS_DEPLOY_REQUIRED") | $DOCS_RESULT |"
+            echo "| $RELEASE_STATUS Stable addon release | $(yes_no "$RELEASE_REQUIRED") | $RELEASE_RESULT |"
+            echo "| $FASTFORWARD_STATUS Fast-forward beta to main | Yes | $FASTFORWARD_RESULT |"
+            echo ""
+            echo "⚠️ **This was a DRY RUN - all operations executed locally but no changes were pushed**"
+            echo "- No commits were pushed to branches"
+            echo "- No GitHub release was created"
+            echo "- No documentation was deployed"
+            echo ""
+            echo "✅ **If validation passed, the actual promotion will now proceed automatically in this same workflow run**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ ${#ERRORS[@]} -gt 0 ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Outcome mismatches" >> "$GITHUB_STEP_SUMMARY"
+            for error in "${ERRORS[@]}"; do
+              echo "::error::$error"
+              echo "- $error" >> "$GITHUB_STEP_SUMMARY"
+            done
+            exit 1
+          fi
 
   # ==========================================
   # Phase 2: Actual Promotion (only if dry run succeeds)
@@ -571,20 +678,47 @@ jobs:
       needs.detect-promotion-scope.result == 'success' &&
       needs.dry-run-pre-merge-validation.result == 'success' &&
       needs.dry-run-merge-beta-to-main.result == 'success' &&
-      needs.dry-run-update-changelog-main.result == 'success' &&
-      needs.dry-run-update-readme-main.result == 'success' &&
-      needs.dry-run-deploy-docs.result == 'success' &&
-      needs.dry-run-fast-forward-beta.result == 'success' &&
-      needs.dry-run-summary.result == 'success' &&
+      (
+        needs.dry-run-update-changelog-main.result == 'success' ||
+        (
+          needs.detect-promotion-scope.outputs.changelog_required != 'true' &&
+          needs.dry-run-update-changelog-main.result == 'skipped'
+        )
+      ) &&
+      (
+        needs.dry-run-update-readme-main.result == 'success' ||
+        (
+          needs.detect-promotion-scope.outputs.readme_work_required != 'true' &&
+          needs.dry-run-update-readme-main.result == 'skipped'
+        )
+      ) &&
+      (
+        needs.dry-run-deploy-docs.result == 'success' ||
+        (
+          needs.detect-promotion-scope.outputs.documentation_deploy_required != 'true' &&
+          needs.dry-run-deploy-docs.result == 'skipped'
+        )
+      ) &&
       (
         needs.dry-run-publish-stable-release.result == 'success' ||
         (
-          needs.detect-promotion-scope.outputs.addon_changed == 'false' &&
+          needs.detect-promotion-scope.outputs.release_required != 'true' &&
           needs.dry-run-publish-stable-release.result == 'skipped'
         )
-      )
+      ) &&
+      needs.dry-run-fast-forward-beta.result == 'success' &&
+      needs.dry-run-summary.result == 'success'
     outputs:
+      promotion_base_sha: ${{ needs.detect-promotion-scope.outputs.promotion_base_sha }}
+      promotion_target_sha: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
+      promotion_type: ${{ needs.detect-promotion-scope.outputs.promotion_type }}
       addon_changed: ${{ needs.detect-promotion-scope.outputs.addon_changed }}
+      docs_changed: ${{ needs.detect-promotion-scope.outputs.docs_changed }}
+      readme_changed: ${{ needs.detect-promotion-scope.outputs.readme_changed }}
+      release_required: ${{ needs.detect-promotion-scope.outputs.release_required }}
+      changelog_required: ${{ needs.detect-promotion-scope.outputs.changelog_required }}
+      documentation_deploy_required: ${{ needs.detect-promotion-scope.outputs.documentation_deploy_required }}
+      readme_work_required: ${{ needs.detect-promotion-scope.outputs.readme_work_required }}
       stable_version: ${{ steps.metadata.outputs.stable_version }}
       interface: ${{ steps.metadata.outputs.interface }}
 
@@ -638,13 +772,13 @@ jobs:
           git commit -m "$COMMIT_MESSAGE"
 
       - name: Set up Python
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Validate merged TOC version
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         run: |
           MERGED_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
           echo "Merged TOC version: $MERGED_VERSION"
@@ -658,7 +792,7 @@ jobs:
           echo "✓ Merged version contains -beta suffix as expected"
 
       - name: Remove -beta suffix from version
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         id: remove_beta
         run: |
           BETA_VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
@@ -675,7 +809,7 @@ jobs:
           git commit -m "chore: update version to $STABLE_VERSION [skip ci]"
 
       - name: Query Blizzard API for live Interface version
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         id: blizzard
         run: |
           INTERFACE=$(python3 .github/scripts/blizzard_api.py --environment live --output interface)
@@ -683,7 +817,7 @@ jobs:
           echo "Live Interface version: $INTERFACE"
 
       - name: Update Interface version in TOC
-        if: needs.detect-promotion-scope.outputs.addon_changed == 'true'
+        if: needs.detect-promotion-scope.outputs.release_required == 'true'
         run: |
           INTERFACE="${{ steps.blizzard.outputs.interface }}"
           echo "Updating Interface to: $INTERFACE"
@@ -697,7 +831,7 @@ jobs:
       - name: Set promotion metadata
         id: metadata
         run: |
-          if [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "true" ]]; then
+          if [[ "${{ needs.detect-promotion-scope.outputs.release_required }}" == "true" ]]; then
             VERSION="${{ steps.remove_beta.outputs.stable_version }}"
             INTERFACE="${{ steps.blizzard.outputs.interface }}"
           else
@@ -715,6 +849,10 @@ jobs:
     name: "Update Changelog for Main"
     runs-on: ubuntu-latest
     needs: merge-beta-to-main
+    if: |
+      !cancelled() &&
+      needs.merge-beta-to-main.result == 'success' &&
+      needs.merge-beta-to-main.outputs.changelog_required == 'true'
     permissions:
       contents: write
       pull-requests: read
@@ -729,23 +867,16 @@ jobs:
           fetch-tags: true
           token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Skip changelog update for non-addon promotion
-        if: needs.merge-beta-to-main.outputs.addon_changed == 'false'
-        run: echo "No addon changes; preserving the existing stable release notes."
-
       - name: Set up Python
-        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Install Copilot CLI
-        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         continue-on-error: true
         run: npm install -g @github/copilot
 
       - name: Update CHANGELOG.md
-        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH_NAME: main
@@ -754,7 +885,6 @@ jobs:
           python3 .github/scripts/update_changelog.py
 
       - name: Commit changelog changes
-        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -767,7 +897,6 @@ jobs:
           fi
 
       - name: Push changelog to main
-        if: needs.merge-beta-to-main.outputs.addon_changed == 'true'
         run: |
           git pull --rebase origin main
           git push
@@ -776,6 +905,11 @@ jobs:
     name: "Update README for Main"
     runs-on: ubuntu-latest
     needs: [merge-beta-to-main, update-changelog-main]
+    if: |
+      !cancelled() &&
+      needs.merge-beta-to-main.result == 'success' &&
+      (needs.update-changelog-main.result == 'success' || needs.update-changelog-main.result == 'skipped') &&
+      needs.merge-beta-to-main.outputs.readme_work_required == 'true'
 
     steps:
       - name: Checkout main branch
@@ -827,6 +961,12 @@ jobs:
     name: "Deploy Documentation"
     runs-on: ubuntu-latest
     needs: [merge-beta-to-main, update-changelog-main, update-readme-main]
+    if: |
+      !cancelled() &&
+      needs.merge-beta-to-main.result == 'success' &&
+      (needs.update-changelog-main.result == 'success' || needs.update-changelog-main.result == 'skipped') &&
+      (needs.update-readme-main.result == 'success' || needs.update-readme-main.result == 'skipped') &&
+      needs.merge-beta-to-main.outputs.documentation_deploy_required == 'true'
 
     steps:
       - name: Checkout branch
@@ -861,9 +1001,9 @@ jobs:
     name: "Publish Stable Release"
     runs-on: ubuntu-latest
     needs: [detect-promotion-scope, merge-beta-to-main, update-changelog-main, update-readme-main]
-    # Explicitly check that all prerequisites succeeded
     if: |
-      needs.detect-promotion-scope.outputs.addon_changed == 'true' &&
+      !cancelled() &&
+      needs.detect-promotion-scope.outputs.release_required == 'true' &&
       needs.merge-beta-to-main.result == 'success' &&
       needs.update-changelog-main.result == 'success' &&
       needs.update-readme-main.result == 'success'
@@ -910,6 +1050,11 @@ jobs:
     name: "Fast-Forward Beta to Main"
     runs-on: ubuntu-latest
     needs: [merge-beta-to-main, update-changelog-main, update-readme-main]
+    if: |
+      !cancelled() &&
+      needs.merge-beta-to-main.result == 'success' &&
+      (needs.update-changelog-main.result == 'success' || needs.update-changelog-main.result == 'skipped') &&
+      (needs.update-readme-main.result == 'success' || needs.update-readme-main.result == 'skipped')
 
     steps:
       - name: Checkout beta branch
@@ -952,38 +1097,73 @@ jobs:
 
     steps:
       - name: Summary
+        env:
+          ADDON_CHANGED: ${{ needs.detect-promotion-scope.outputs.addon_changed }}
+          DOCS_CHANGED: ${{ needs.detect-promotion-scope.outputs.docs_changed }}
+          README_CHANGED: ${{ needs.detect-promotion-scope.outputs.readme_changed }}
+          RELEASE_REQUIRED: ${{ needs.detect-promotion-scope.outputs.release_required }}
+          CHANGELOG_REQUIRED: ${{ needs.detect-promotion-scope.outputs.changelog_required }}
+          DOCS_DEPLOY_REQUIRED: ${{ needs.detect-promotion-scope.outputs.documentation_deploy_required }}
+          README_WORK_REQUIRED: ${{ needs.detect-promotion-scope.outputs.readme_work_required }}
+          PROMOTION_TYPE: ${{ needs.detect-promotion-scope.outputs.promotion_type }}
+          STABLE_VERSION: ${{ needs.merge-beta-to-main.outputs.stable_version }}
+          INTERFACE: ${{ needs.merge-beta-to-main.outputs.interface }}
+          MERGE_RESULT: ${{ needs.merge-beta-to-main.result }}
+          CHANGELOG_RESULT: ${{ needs.update-changelog-main.result }}
+          README_RESULT: ${{ needs.update-readme-main.result }}
+          DOCS_RESULT: ${{ needs.deploy-docs.result }}
+          RELEASE_RESULT: ${{ needs.publish-stable-release.result }}
+          FASTFORWARD_RESULT: ${{ needs.fast-forward-beta.result }}
         run: |
-          # Determine status emojis based on job results
-          ADDON_CHANGED="${{ needs.detect-promotion-scope.outputs.addon_changed }}"
-          if [[ "$ADDON_CHANGED" == "true" ]]; then
-            PROMOTION_TYPE="Addon release"
-          elif [[ "$ADDON_CHANGED" == "false" ]]; then
-            PROMOTION_TYPE="Non-addon changes only"
-          else
-            PROMOTION_TYPE="Unknown (scope detection failed)"
+          set -euo pipefail
+
+          outcome_icon() {
+            local required="$1"
+            local result="$2"
+            if [[ "$required" == "true" ]]; then
+              if [[ "$result" == "success" ]]; then echo "✅"; else echo "❌"; fi
+            else
+              if [[ "$result" == "skipped" || "$result" == "success" ]]; then echo "⏭️"; else echo "❌"; fi
+            fi
+          }
+
+          always_icon() {
+            local result="$1"
+            if [[ "$result" == "success" ]]; then echo "✅"; else echo "❌"; fi
+          }
+
+          yes_no() {
+            if [[ "$1" == "true" ]]; then echo "Yes"; else echo "No"; fi
+          }
+
+          MERGE_STATUS="$(always_icon "$MERGE_RESULT")"
+          CHANGELOG_STATUS="$(outcome_icon "$CHANGELOG_REQUIRED" "$CHANGELOG_RESULT")"
+          README_STATUS="$(outcome_icon "$README_WORK_REQUIRED" "$README_RESULT")"
+          DOCS_STATUS="$(outcome_icon "$DOCS_DEPLOY_REQUIRED" "$DOCS_RESULT")"
+          RELEASE_STATUS="$(outcome_icon "$RELEASE_REQUIRED" "$RELEASE_RESULT")"
+          FASTFORWARD_STATUS="$(always_icon "$FASTFORWARD_RESULT")"
+
+          ERRORS=()
+          if [[ "$MERGE_RESULT" != "success" ]]; then
+            ERRORS+=("Merge was required but result was '$MERGE_RESULT'")
+          fi
+          if [[ "$MERGE_RESULT" == "success" && "$FASTFORWARD_RESULT" != "success" ]]; then
+            ERRORS+=("Fast-forward was required but result was '$FASTFORWARD_RESULT'")
+          fi
+          if [[ "$MERGE_RESULT" == "success" && "$CHANGELOG_REQUIRED" == "true" && "$CHANGELOG_RESULT" != "success" ]]; then
+            ERRORS+=("Changelog update was required but result was '$CHANGELOG_RESULT'")
+          fi
+          if [[ "$MERGE_RESULT" == "success" && "$README_WORK_REQUIRED" == "true" && "$README_RESULT" != "success" ]]; then
+            ERRORS+=("README work was required but result was '$README_RESULT'")
+          fi
+          if [[ "$MERGE_RESULT" == "success" && "$DOCS_DEPLOY_REQUIRED" == "true" && "$DOCS_RESULT" != "success" ]]; then
+            ERRORS+=("Documentation deployment was required but result was '$DOCS_RESULT'")
+          fi
+          if [[ "$MERGE_RESULT" == "success" && "$RELEASE_REQUIRED" == "true" && "$RELEASE_RESULT" != "success" ]]; then
+            ERRORS+=("Stable release was required but result was '$RELEASE_RESULT'")
           fi
 
-          MERGE_STATUS="${{ needs.merge-beta-to-main.result == 'success' && '✅' || '❌' }}"
-          CHANGELOG_STATUS="${{ needs.update-changelog-main.result == 'success' && '✅' || '❌' }}"
-          README_STATUS="${{ needs.update-readme-main.result == 'success' && '✅' || '❌' }}"
-          DOCS_STATUS="${{ needs.deploy-docs.result == 'success' && '✅' || '❌' }}"
-          if [[ "${{ needs.publish-stable-release.result }}" == "success" ]]; then
-            RELEASE_STATUS="✅"
-          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "false" &&
-                  "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
-            RELEASE_STATUS="⏭️"
-          else
-            RELEASE_STATUS="❌"
-          fi
-          FASTFORWARD_STATUS="${{ needs.fast-forward-beta.result == 'success' && '✅' || '❌' }}"
-
-          # Determine overall status
-          if [[ "$ADDON_CHANGED" != "true" && "$ADDON_CHANGED" != "false" ]]; then
-            TITLE="## Promotion Failed ❌"
-          elif [[ "$ADDON_CHANGED" == "true" &&
-                "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
-            TITLE="## Promotion Failed ❌"
-          elif [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+          if [[ ${#ERRORS[@]} -gt 0 ]]; then
             TITLE="## Promotion Failed ❌"
           elif [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             TITLE="## Promotion Cancelled ⚠️"
@@ -991,39 +1171,65 @@ jobs:
             TITLE="## Promotion Complete 🎉"
           fi
 
-          echo "$TITLE" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Promotion Type**: $PROMOTION_TYPE" >> $GITHUB_STEP_SUMMARY
-          echo "**Stable Version**: ${{ needs.merge-beta-to-main.outputs.stable_version }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Interface Version**: ${{ needs.merge-beta-to-main.outputs.interface }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Job Results:" >> $GITHUB_STEP_SUMMARY
-          echo "- $MERGE_STATUS Merged beta → main" >> $GITHUB_STEP_SUMMARY
-          echo "- $CHANGELOG_STATUS Updated CHANGELOG.md" >> $GITHUB_STEP_SUMMARY
-          echo "- $README_STATUS Updated README badges" >> $GITHUB_STEP_SUMMARY
-          echo "- $DOCS_STATUS Deployed documentation" >> $GITHUB_STEP_SUMMARY
-          echo "- $RELEASE_STATUS Published stable release" >> $GITHUB_STEP_SUMMARY
-          echo "- $FASTFORWARD_STATUS Fast-forwarded beta to main" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "$TITLE"
+            echo ""
+            echo "### Detected Scope"
+            echo ""
+            echo "| Signal | Detected | Required | Actual |"
+            echo "| --- | --- | --- | --- |"
+            echo "| Addon changes | $(yes_no "$ADDON_CHANGED") | $(yes_no "$RELEASE_REQUIRED") | $RELEASE_RESULT |"
+            echo "| Documentation changes | $(yes_no "$DOCS_CHANGED") | $(yes_no "$DOCS_DEPLOY_REQUIRED") | $DOCS_RESULT |"
+            echo "| README changed | $(yes_no "$README_CHANGED") | $(yes_no "$README_WORK_REQUIRED") | $README_RESULT |"
+            echo "| Changelog | — | $(yes_no "$CHANGELOG_REQUIRED") | $CHANGELOG_RESULT |"
+            echo ""
+            echo "**Promotion type**: ${PROMOTION_TYPE:-unknown}"
+            echo "**Stable version**: $STABLE_VERSION"
+            echo "**Interface version**: $INTERFACE"
+            echo ""
+            echo "### Job Results"
+            echo ""
+            echo "- $MERGE_STATUS Merged beta → main"
+            echo "- $CHANGELOG_STATUS Updated CHANGELOG.md"
+            echo "- $README_STATUS Updated README badges"
+            echo "- $DOCS_STATUS Deployed documentation"
+            echo "- $RELEASE_STATUS Published stable release"
+            echo "- $FASTFORWARD_STATUS Fast-forwarded beta to main"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          # Add prominent release link if successful
-          if [[ "${{ needs.publish-stable-release.result }}" == "success" ]]; then
-            echo "### 📦 Stable Release Created" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "🔗 **[View Release v${{ needs.merge-beta-to-main.outputs.stable_version }}](https://github.com/${{ github.repository }}/releases/tag/v${{ needs.merge-beta-to-main.outputs.stable_version }})**" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The stable release has been published with:" >> $GITHUB_STEP_SUMMARY
-            echo "- Release zip file for addon installation" >> $GITHUB_STEP_SUMMARY
-            echo "- Release metadata (release.json)" >> $GITHUB_STEP_SUMMARY
-            echo "- Changelog notes" >> $GITHUB_STEP_SUMMARY
-            echo "- Direct Wago Addons upload with explicit stable classification" >> $GITHUB_STEP_SUMMARY
-          elif [[ "${{ needs.detect-promotion-scope.outputs.addon_changed }}" == "false" &&
-                  "${{ needs.publish-stable-release.result }}" == "skipped" ]]; then
-            echo "### ⏭️ Stable Release Skipped" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "No files under \`SpectrumFederation/**\` changed between main and beta." >> $GITHUB_STEP_SUMMARY
+          if [[ "$RELEASE_RESULT" == "success" ]]; then
+            {
+              echo "### 📦 Stable Release Created"
+              echo ""
+              echo "🔗 **[View Release v${STABLE_VERSION}](https://github.com/${{ github.repository }}/releases/tag/v${STABLE_VERSION})**"
+              echo ""
+              echo "The stable release has been published with:"
+              echo "- Release zip file for addon installation"
+              echo "- Release metadata (release.json)"
+              echo "- Changelog notes"
+              echo "- Direct Wago Addons upload with explicit stable classification"
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$RELEASE_REQUIRED" != "true" ]]; then
+            {
+              echo "### ⏭️ Stable Release Skipped"
+              echo ""
+              echo "No packaged addon files changed in the incoming promotion range."
+            } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### ⚠️ Release Creation Failed" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "The stable release was NOT created. Check the 'Publish Stable Release' job logs for details." >> $GITHUB_STEP_SUMMARY
+            {
+              echo "### ⚠️ Release Creation Failed"
+              echo ""
+              echo "The stable release was NOT created. Check the 'Publish Stable Release' job logs for details."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ ${#ERRORS[@]} -gt 0 ]]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### Outcome mismatches" >> "$GITHUB_STEP_SUMMARY"
+            for error in "${ERRORS[@]}"; do
+              echo "::error::$error"
+              echo "- $error" >> "$GITHUB_STEP_SUMMARY"
+            done
+            exit 1
           fi

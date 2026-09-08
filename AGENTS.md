@@ -34,6 +34,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py`
 - Run Raid Equipment policy and check-run tests (production Lua via lua5.1): `python -m pytest tests/test_raid_equipment.py`
 - Run PR template validator tests: `python -m pytest tests/test_pr_template.py`
+- Run promotion-scope classification tests: `python -m pytest tests/test_promotion_scope.py`
 
 ## Important Workflows
 
@@ -68,4 +69,5 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`
 - PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`
+- Promotion-scope classification or `classify_promotion_scope.py`: also run `python -m pytest tests/test_promotion_scope.py`
 - Release classification or Wago publishing: also run `python -m pytest tests/test_publish_release.py`
