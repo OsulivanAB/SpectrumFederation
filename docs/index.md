@@ -18,6 +18,17 @@ hide:
 
 A World of Warcraft Retail addon for coordinating guild raid loot, and a home for LGBTQIA players and allies on Garona.
 
+<div class="sf-install-links">
+  <a class="sf-install-links__item" href="https://addons.wago.io/addons/spectrumfederation" title="Install with WowUp on Wago Addons" target="_blank" rel="noopener noreferrer">
+    <img src="assets/wowup.png" alt="WowUp">
+    <span>WowUp</span>
+  </a>
+  <a class="sf-install-links__item" href="https://www.curseforge.com/wow/addons/spectrum-federation" title="Install with CurseForge" target="_blank" rel="noopener noreferrer">
+    <img class="sf-install-links__icon--curseforge" src="assets/curseforge.png" alt="CurseForge">
+    <span>CurseForge</span>
+  </a>
+</div>
+
 [Install and get started](getting-started.md){ .md-button .md-button--primary }
 [Open the feature guides](features/loot-helper.md){ .md-button }
 
