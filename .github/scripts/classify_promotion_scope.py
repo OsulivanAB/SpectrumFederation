@@ -235,17 +235,22 @@ def collect_changed_files(base, head, cwd=None):
 
     Triple-dot / merge-base semantics are used so independent commits already
     on the base branch are not treated as incoming promotion changes.
+
+    `--no-renames` reports a move as delete plus add so a file leaving the
+    packaged addon tree still counts as `addon_changed`.
     """
     merge_base = run_git(["merge-base", base, head], cwd=cwd)
     result = subprocess.run(
-        ["git", "diff", "--name-only", "-z", merge_base, head],
+        ["git", "diff", "--name-only", "-z", "--no-renames", merge_base, head],
         cwd=cwd,
         capture_output=True,
         check=False,
     )
     if result.returncode != 0:
         message = result.stderr.decode().strip() or "git diff failed"
-        raise RuntimeError(f"git diff --name-only -z {merge_base} {head}: {message}")
+        raise RuntimeError(
+            f"git diff --name-only -z --no-renames {merge_base} {head}: {message}"
+        )
     files = [
         normalize_repo_path(path)
         for path in result.stdout.decode().split("\0")

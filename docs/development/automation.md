@@ -8,9 +8,9 @@ Spectrum Federation uses a beta-first workflow. Normal pull requests target `bet
 
 `.github/workflows/pr-beta-validation.yml` runs when relevant addon, automation, workflow, or documentation files change. It:
 
-- detects whether packaged addon files changed;
+- detects whether packaged addon files changed (via `classify_promotion_scope.py`);
 - runs the unified Lua/YAML/Python linter;
-- runs `tests/test_settings_navigation.py`, `tests/test_cursed_surge_tracker.py`, `tests/test_mouse_tracer.py`, `tests/test_interface_badge.py`, and `tests/test_loot_helper_window.py` (installs `lua5.1`);
+- runs focused Python/Lua tests, including `tests/test_promotion_scope.py`;
 - validates package structure;
 - requires a TOC version bump and a non-duplicate beta release only for addon changes;
 - builds MkDocs in strict mode.

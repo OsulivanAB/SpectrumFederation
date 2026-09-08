@@ -304,6 +304,27 @@ def test_git_range_does_not_treat_later_generated_commits_as_incoming(tmp_path):
     assert rerun.files == incoming.files
 
 
+def test_git_range_treats_rename_out_of_addon_tree_as_addon_and_docs(tmp_path):
+    repo = init_repo(tmp_path)
+    git(repo, "checkout", "main")
+    commit_files(
+        repo,
+        {"SpectrumFederation/Core/Foo.lua": "print('feature')\n"},
+        "feat: addon file",
+    )
+    git(repo, "checkout", "beta")
+    git(repo, "merge", "main", "-m", "sync addon file onto beta")
+    git(repo, "mv", "SpectrumFederation/Core/Foo.lua", "docs/Foo.lua")
+    git(repo, "commit", "-m", "docs: move file into mkdocs")
+    scope = scope_mod.classify_git_range("main", "HEAD", cwd=repo)
+    assert "SpectrumFederation/Core/Foo.lua" in scope.files
+    assert "docs/Foo.lua" in scope.files
+    assert scope.addon_changed is True
+    assert scope.docs_changed is True
+    assert scope.release_required is True
+    assert scope.documentation_deploy_required is True
+
+
 def test_write_github_output_uses_true_false_strings(tmp_path):
     output_path = tmp_path / "output"
     output_path.write_text("", encoding="utf-8")
