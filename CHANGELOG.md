@@ -16,6 +16,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Overflow warnings fire only when a live LINK introduces a new equipment conflict
 - Linked Characters dialog uses Character 1 / Character 2 labels, and unlink asks for confirmation
 - Identity projection is cached per profile and reused for helpers, UI reads, and live point/Attendance fan-out
+- Out-of-order point or Attendance inserts replay identity totals instead of fan-out through the Attendance zero floor
 
 ## [1.5.0-beta.1] - 2026-09-09
 

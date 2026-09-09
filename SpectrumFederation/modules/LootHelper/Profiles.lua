@@ -1825,7 +1825,11 @@ function LootProfile:_InsertLog(lootLog, opts)
         self._rcAwardIndex[data.awardKey] = id
     end
 
-    if not previousLast or self:_CompareLogs(previousLast, lootLog) then
+    -- Fan-out is only valid for an in-order append. An out-of-order insert is
+    -- sorted back into history, and Attendance floors at zero, so a live delta
+    -- on the cached total can diverge from a full chronological replay.
+    local appendedInOrder = not previousLast or self:_CompareLogs(previousLast, lootLog)
+    if appendedInOrder then
         self._logPositionIndex = self._logPositionIndex or {}
         self._logPositionIndex[id] = #self._lootLogs
     else
@@ -1837,7 +1841,8 @@ function LootProfile:_InsertLog(lootLog, opts)
     self:_MarkIntegritySummaryDirty()
     local Identity = SF.LootHelperIdentity
     if Identity and Identity.AffectsProjection and Identity.AffectsProjection(eventType) then
-        if Identity.CanFanOutBalance and Identity.CanFanOutBalance(eventType)
+        if appendedInOrder
+            and Identity.CanFanOutBalance and Identity.CanFanOutBalance(eventType)
             and Identity.FanOutBalance and Identity.FanOutBalance(self, lootLog)
         then
             -- Cached identity totals were updated in O(identity size).

@@ -1227,6 +1227,37 @@ addLog(profile, SF.LootLogEventTypes.POINT_CHANGE, {
 assertEq(SF.LootHelperIdentity.replayCount, beforePoints, "live point change fans out without a full replay")
 assertEq(profile:GetIdentityPoints(PLAYER), profile:GetIdentityPoints(ALT_A), "fan-out keeps identity totals aligned")
 
+-- Out-of-order Attendance must replay. A live decrement that already hit the
+-- zero floor plus a later-inserted earlier increment would otherwise stay at 1.
+resetEnv()
+profile = makeProfile("OutOfOrderAttendance")
+addMember(profile, ALT_A)
+assertTrue(profile:LinkCharacters(PLAYER, ALT_A), "link for out-of-order attendance")
+local laterTs = GetServerTime() + 10000
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.DECREMENT,
+    amount = 1,
+}, { timestamp = laterTs })
+assertEq(profile:GetIdentityAttendance(ALT_A), 0, "live decrement floors at zero")
+SF.LootHelperIdentity.replayCount = 0
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+}, { timestamp = laterTs - 50 })
+assertTrue(SF.LootHelperIdentity.replayCount > 0, "out-of-order attendance forces a full replay")
+assertEq(profile:GetIdentityAttendance(ALT_A), 0, "replay applies earlier increment before later decrement")
+assertEq(profile:GetIdentityAttendance(PLAYER), 0, "linked identity attendance stays aligned after replay")
+local beforeInOrderAttendance = SF.LootHelperIdentity.replayCount
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 2,
+}, { timestamp = laterTs + 50 })
+assertEq(SF.LootHelperIdentity.replayCount, beforeInOrderAttendance, "in-order attendance still fans out")
+assertEq(profile:GetIdentityAttendance(ALT_A), 2, "in-order attendance fan-out updates the cached total")
+
 -- ---------------------------------------------------------------------------
 -- Permission matrix
 -- ---------------------------------------------------------------------------
