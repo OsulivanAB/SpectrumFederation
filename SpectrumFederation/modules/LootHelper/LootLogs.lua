@@ -21,6 +21,8 @@ local EVENT_TYPES = {
     ADMIN_ADDED                 = "ADMIN_ADDED",
     ADMIN_REMOVED               = "ADMIN_REMOVED",
     MAIN_SWAP                   = "MAIN_SWAP",
+    CHARACTER_LINK              = "CHARACTER_LINK",
+    CHARACTER_UNLINK            = "CHARACTER_UNLINK",
     LOOT_MODE_CHANGE            = "LOOT_MODE_CHANGE",
     REWARD_POT_CONFIG_CHANGE    = "REWARD_POT_CONFIG_CHANGE",
     REWARD_POT_CHANGE           = "REWARD_POT_CHANGE",
@@ -82,6 +84,14 @@ local EVENT_DATA_TEMPLATES = {
     [EVENT_TYPES.MAIN_SWAP] = {
         member = "", -- "Name-Realm" (the new/target character)
         sourceMember = "" -- "Name-Realm" (the old character that was consolidated)
+    },
+    [EVENT_TYPES.CHARACTER_LINK] = {
+        memberA = "",
+        memberB = "",
+        adminMembersAtLink = {},
+    },
+    [EVENT_TYPES.CHARACTER_UNLINK] = {
+        member = "",
     },
     [EVENT_TYPES.LOOT_MODE_CHANGE] = {
         oldMode = "",
@@ -331,14 +341,23 @@ end
 --     opts.author string override author (used for imports / special cases)
 --     opts.counter number override counter (used for imports / special cases)
 --     opts.timestamp number override timestamp (used for imports)
+--     opts.profile LootProfile owning profile for permission and counters
 --     opts.skipPermission boolean bypass admin check (used for profile creation/import)
 -- @return LootLog instance or nil if failed
 function LootLog.new(eventType, eventData, opts)
     opts = opts or {}
 
+    local owningProfile = opts.profile
+    if not owningProfile and not opts.skipPermission then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Owning profile is required to create a loot log entry")
+        end
+        return nil
+    end
+
     -- Permission enforcement
     if not opts.skipPermission then
-        local ap = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+        local ap = owningProfile
         local Imp = SF.LootHelperImpersonation
         local isAdmin
         if Imp and Imp.IsEffectiveLocalAdmin then
@@ -348,7 +367,7 @@ function LootLog.new(eventType, eventData, opts)
         end
         if not ap or (not Imp and not ap.IsCurrentUserAdmin) then
             if SF.Debug then
-                SF.Debug:Warn("LOOTLOG", "Active profile missing or IsCurrentUserAdmin not found; cannot create log entry")
+                SF.Debug:Warn("LOOTLOG", "Owning profile missing or IsCurrentUserAdmin not found; cannot create log entry")
             end
             return nil
         elseif not isAdmin then
@@ -360,14 +379,21 @@ function LootLog.new(eventType, eventData, opts)
 
         if eventType == EVENT_TYPES.LOOT_MODE_CHANGE then
             local isOwner
-            if Imp and Imp.IsEffectiveLocalOwner then
+            if type(ap.IsCurrentUserEffectiveOwner) == "function" then
+                isOwner = ap:IsCurrentUserEffectiveOwner()
+                if Imp and Imp.IsEffectiveLocalOwner and ap.IsCurrentUserOwner and ap:IsCurrentUserOwner() then
+                    isOwner = Imp:IsEffectiveLocalOwner(ap)
+                elseif Imp and Imp.IsActive and Imp:IsActive() then
+                    isOwner = false
+                end
+            elseif Imp and Imp.IsEffectiveLocalOwner then
                 isOwner = Imp:IsEffectiveLocalOwner(ap)
             else
                 isOwner = type(ap.IsCurrentUserOwner) == "function" and ap:IsCurrentUserOwner()
             end
             if not isOwner then
                 if SF.Debug then
-                    SF.Debug:Warn("LOOTLOG", "Current user is not the owner; cannot change loot mode")
+                    SF.Debug:Warn("LOOTLOG", "Current user is not an effective owner; cannot change loot mode")
                 end
                 return nil
             end
@@ -434,6 +460,14 @@ function LootLog.new(eventType, eventData, opts)
         if not SF.LootLogValidators.ValidateMainSwapData(eventData) then
             return nil
         end
+    elseif eventType == EVENT_TYPES.CHARACTER_LINK then
+        if not SF.LootLogValidators.ValidateCharacterLinkData(eventData) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.CHARACTER_UNLINK then
+        if not SF.LootLogValidators.ValidateCharacterUnlinkData(eventData) then
+            return nil
+        end
     elseif eventType == EVENT_TYPES.LOOT_MODE_CHANGE then
         if not SF.LootLogValidators.ValidateLootModeChangeData(eventData) then
             return nil
@@ -494,7 +528,7 @@ function LootLog.new(eventType, eventData, opts)
     if isExternal then
         counter = 0
     elseif type(counter) ~= "number" then
-        local ap = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+        local ap = owningProfile
         if ap and ap.AllocateNextCounter then
             counter = ap:AllocateNextCounter(author)
         end
@@ -502,7 +536,7 @@ function LootLog.new(eventType, eventData, opts)
 
     if type(counter) ~= "number" then
         if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "No counter available. Pass opts.counter or ensure active profile supports AllocateNextCounter().")
+            SF.Debug:Warn("LOOTLOG", "No counter available. Pass opts.counter or ensure the owning profile supports AllocateNextCounter().")
         end
         return nil
     end
@@ -574,9 +608,20 @@ function LootLog.GetEventDataTemplate(eventType)
         return nil
     end
 
+    local function copyValue(value)
+        if type(value) ~= "table" then
+            return value
+        end
+        local copy = {}
+        for nestedKey, nestedValue in pairs(value) do
+            copy[nestedKey] = copyValue(nestedValue)
+        end
+        return copy
+    end
+
     local template = {}
     for key, value in pairs(EVENT_DATA_TEMPLATES[eventType]) do
-        template[key] = value
+        template[key] = copyValue(value)
     end
     return template
 end
@@ -774,10 +819,14 @@ function LootLog.ValidateTable(t, opts)
             return false, "log._fingerprint must be a number when provided"
         end
         if t._fingerprint ~= computedFingerprint then
-            return false, ("log._fingerprint mismatch (expected %s, got %s)"):format(
-                tostring(computedFingerprint),
-                tostring(t._fingerprint)
-            )
+            if opts.allowMainSwapFingerprintNormalize and LootLog.TryNormalizeMainSwapStaleFingerprintTable(t, opts.mainSwapLineage) then
+                computedFingerprint = t._fingerprint
+            else
+                return false, ("log._fingerprint mismatch (expected %s, got %s)"):format(
+                    tostring(computedFingerprint),
+                    tostring(t._fingerprint)
+                )
+            end
         end
     end
 
@@ -826,6 +875,108 @@ end
 function LootLog.ComputeFingerprintFromTable(t)
     if type(t) ~= "table" then return nil end
     return ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, t._data)
+end
+
+local function CopyEventData(data)
+    local copy = {}
+    if type(data) ~= "table" then
+        return copy
+    end
+    for key, value in pairs(data) do
+        copy[key] = value
+    end
+    return copy
+end
+
+function LootLog.TryNormalizeMainSwapStaleFingerprintTable(t, lineage)
+    if type(t) ~= "table" then
+        return false
+    end
+    if LootLog.IsExternalLogTable(t) or t._eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+        return false
+    end
+    if type(t._fingerprint) ~= "number" then
+        return false
+    end
+    if type(t._data) ~= "table" or type(t._data.member) ~= "string" then
+        return false
+    end
+    if type(lineage) ~= "table" or #lineage == 0 then
+        return false
+    end
+    local computed = ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, t._data)
+    if computed == t._fingerprint then
+        return false
+    end
+    local Identity = SF.LootHelperIdentity
+    if not Identity or not Identity.MainSwapAncestors then
+        return false
+    end
+    local ancestors = Identity.MainSwapAncestors(lineage, t._data.member)
+    for i = 1, #ancestors do
+        local candidate = ancestors[i]
+        if candidate and candidate ~= t._data.member then
+            local trial = CopyEventData(t._data)
+            trial.member = candidate
+            local trialFp = ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, trial)
+            if trialFp == t._fingerprint then
+                t._fingerprint = computed
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function LootLog.TryNormalizeMainSwapStaleFingerprint(log, lineage)
+    if type(log) ~= "table" then
+        return false
+    end
+    if type(log._externalId) == "string" and log._externalId ~= "" then
+        return false
+    end
+    local eventType = log.GetEventType and log:GetEventType() or log._eventType
+    if eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+        return false
+    end
+    if type(log._fingerprint) ~= "number" then
+        return false
+    end
+    local data = log.GetEventData and log:GetEventData() or log._data
+    if type(data) ~= "table" or type(data.member) ~= "string" then
+        return false
+    end
+    if type(lineage) ~= "table" or #lineage == 0 then
+        return false
+    end
+    local timestamp = log.GetTimestamp and log:GetTimestamp() or log._timestamp
+    local author = log.GetAuthor and log:GetAuthor() or log._author
+    local counter = log.GetCounter and log:GetCounter() or log._counter
+    local computed = ComputeFingerprintFromFields(timestamp, author, counter, eventType, data)
+    if computed == log._fingerprint then
+        return false
+    end
+    local Identity = SF.LootHelperIdentity
+    if not Identity or not Identity.MainSwapAncestors then
+        return false
+    end
+    local ancestors = Identity.MainSwapAncestors(lineage, data.member)
+    for i = 1, #ancestors do
+        local candidate = ancestors[i]
+        if candidate and candidate ~= data.member then
+            local trial = CopyEventData(data)
+            trial.member = candidate
+            local trialFp = ComputeFingerprintFromFields(timestamp, author, counter, eventType, trial)
+            if trialFp == log._fingerprint then
+                log._fingerprint = computed
+                return true
+            end
+        end
+    end
+    if SF.Debug then
+        SF.Debug:Warn("LOOTLOG", "Unrelated sequential fingerprint mismatch left unnormalized (id=%s)", tostring(log._id))
+    end
+    return false
 end
 
 -- ============================================================================

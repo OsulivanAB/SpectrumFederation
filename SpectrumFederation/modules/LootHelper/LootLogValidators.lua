@@ -127,7 +127,46 @@ function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS)
         end
         return false
     end
-    
+
+    if eventData.scope ~= nil then
+        if eventData.scope ~= "identity" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid armor scope for member %s: %s", tostring(memberID), tostring(eventData.scope))
+            end
+            return false
+        end
+        if type(eventData.identityMembers) ~= "table" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Identity armor change missing identityMembers for member %s", tostring(memberID))
+            end
+            return false
+        end
+        local seen = {}
+        local count = 0
+        for _, id in ipairs(eventData.identityMembers) do
+            if type(id) ~= "string" or id == "" or not id:match("^[^%-]+%-[^%-]+$") then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Invalid identityMembers entry: %s", tostring(id))
+                end
+                return false
+            end
+            if seen[id] then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Duplicate identityMembers entry: %s", tostring(id))
+                end
+                return false
+            end
+            seen[id] = true
+            count = count + 1
+        end
+        if count < 2 then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "identityMembers must contain at least two members")
+            end
+            return false
+        end
+    end
+
     return true
 end
 
@@ -328,6 +367,84 @@ function LootLogValidators.ValidateMainSwapData(eventData)
         return false
     end
 
+    return true
+end
+
+local function ValidateNameRealmList(list, fieldName, allowEmpty)
+    if type(list) ~= "table" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "%s must be an array", tostring(fieldName))
+        end
+        return false
+    end
+    local seen = {}
+    local count = 0
+    for _, id in ipairs(list) do
+        if type(id) ~= "string" or id == "" or not id:match("^[^%-]+%-[^%-]+$") then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid %s entry: %s", tostring(fieldName), tostring(id))
+            end
+            return false
+        end
+        if seen[id] then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Duplicate %s entry: %s", tostring(fieldName), tostring(id))
+            end
+            return false
+        end
+        seen[id] = true
+        count = count + 1
+    end
+    if count == 0 and not allowEmpty then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "%s must not be empty", tostring(fieldName))
+        end
+        return false
+    end
+    return true
+end
+
+function LootLogValidators.ValidateCharacterLinkData(eventData)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    local memberA = eventData.memberA
+    local memberB = eventData.memberB
+    if type(memberA) ~= "string" or memberA == "" or not memberA:match("^[^%-]+%-[^%-]+$") then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK has invalid memberA: %s", tostring(memberA))
+        end
+        return false
+    end
+    if type(memberB) ~= "string" or memberB == "" or not memberB:match("^[^%-]+%-[^%-]+$") then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK has invalid memberB: %s", tostring(memberB))
+        end
+        return false
+    end
+    if memberA == memberB then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK requires two different characters")
+        end
+        return false
+    end
+    return ValidateNameRealmList(eventData.adminMembersAtLink, "adminMembersAtLink", true)
+end
+
+function LootLogValidators.ValidateCharacterUnlinkData(eventData)
+    local memberID = eventData and eventData.member
+    if type(memberID) ~= "string" or memberID == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_UNLINK has invalid member ID: %s", tostring(memberID))
+        end
+        return false
+    end
+    if not memberID:match("^[^%-]+%-[^%-]+$") then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_UNLINK has invalid member ID format: %s", tostring(memberID))
+        end
+        return false
+    end
     return true
 end
 

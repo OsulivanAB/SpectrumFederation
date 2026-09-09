@@ -2,6 +2,21 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.0] - 2026-09-09
+
+### Added
+- Linked Characters for Loot Helper profiles: admins can link and unlink characters so they share identity-wide points, Attendance, and equipment opportunity state while remaining separate roster members
+- `CHARACTER_LINK` and `CHARACTER_UNLINK` loot-log events, including per-LINK contemporaneous admin evidence
+- Identity-scoped equipment corrections that record `identityMembers` at write time
+
+### Changed
+- Replace live Main Swap / Transfer Main with Linked Characters
+- Points, Attendance, and equipment opportunity state are projected from the linked identity instead of a single character cache
+- Loot Helper sync protocol version is now 2 so older Main Swap clients cannot share a session
+
+### Fixed
+- Guarded repair for the historical Main Swap stale-fingerprint rewrite, without blessing unrelated mismatches
+
 ## [1.4.1] - 2026-09-07
 
 ### Added

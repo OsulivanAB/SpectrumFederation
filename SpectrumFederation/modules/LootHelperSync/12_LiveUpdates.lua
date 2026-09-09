@@ -122,7 +122,13 @@ function Sync:HandleNewLog(sender, payload)
 
     local eventType = logTable._eventType or logTable.eventType
     if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.LOOT_MODE_CHANGE) then
-        if not (profile.IsOwner and profile:IsOwner(sender)) then
+        local isOwner = false
+        if profile.IsEffectiveOwner then
+            isOwner = profile:IsEffectiveOwner(sender)
+        elseif profile.IsOwner then
+            isOwner = profile:IsOwner(sender)
+        end
+        if not isOwner then
             if SF.PrintWarning then
                 SF:PrintWarning(("Ignoring loot mode change from %s for profile %s: not the owner."):format(tostring(sender), tostring(profileId)))
             end

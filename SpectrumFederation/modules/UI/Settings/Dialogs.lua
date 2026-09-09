@@ -423,7 +423,8 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
     }
 end
 
--- Show a member-transfer dialog with source/target dropdowns
+-- Show a two-member dialog with source/target dropdowns.
+-- Used for Linked Characters (and historically Main Swap).
 -- @param message string Message text to display
 -- @param acceptText string|nil Text for accept button (defaults to ACCEPT)
 -- @param sourceOptions table|nil Dropdown options for the source member

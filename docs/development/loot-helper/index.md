@@ -18,9 +18,11 @@ Use the highest-level Store or domain method available for mutations so validati
 
 `modules/LootHelper/Members.lua` is the derived representation of one member. It exposes identity/class data, point balance, admin role, equipment-category state, and Raid Check whisper timestamps.
 
-Point and equipment methods append logs through the active profile. Point changes support fractional amounts; the current roster UI uses `0.5` for manual adjustments and Raid Check permits `0`, `0.5`, or `1`.
+Getters read cached projected values only. They must not scan logs or resolve a globally active profile. Mutators require an explicit owning `LootProfile` and fail closed when it is missing.
 
-Member state can be rebuilt by replaying the profile's logs. Do not treat the saved object fields as the independent source of truth.
+Point and equipment methods append logs through that owning profile. Point changes support fractional amounts; the current roster UI uses `0.5` for manual adjustments and Raid Check permits `0`, `0.5`, or `1`.
+
+Member caches are written by identity projection on the profile. Do not treat the saved object fields as independently authoritative.
 
 ### LootLog
 
@@ -36,7 +38,9 @@ Member state can be rebuilt by replaying the profile's logs. Do not treat the sa
 - `SAFEMODE_ON_COMBAT_CHANGE`
 - `ADMIN_ADDED`
 - `ADMIN_REMOVED`
-- `MAIN_SWAP`
+- `MAIN_SWAP` (legacy lineage only)
+- `CHARACTER_LINK`
+- `CHARACTER_UNLINK`
 
 Each ID is `author:counter`, where the counter is allocated per profile and author. Serialization uses versioned CBOR encoded as Base64. Validation lives in `LootLogValidators.lua`.
 
@@ -48,6 +52,18 @@ When adding an event:
 4. include it in snapshot/log serialization;
 5. add readable Loot Logs UI formatting;
 6. verify sync deduplication and counter behavior.
+
+### Linked character identities
+
+`modules/LootHelper/Identity.lua` reconstructs profile-scoped linked identities from append-only history. Characters remain distinct members. There is no Main/Primary, no synthetic roster collapse, and no live Main Swap rewrite.
+
+`CHARACTER_LINK` stores `memberA`, `memberB`, and `adminMembersAtLink` (canonical admins in either pre-link component at that event). That evidence applies only at that LINK, is never recomputed, and is ignored when an id is outside the two components being joined. `CHARACTER_UNLINK` splits one character. Historical `MAIN_SWAP` unions lineage only and does not grant admin.
+
+Identity-wide points and Attendance are sums of retained character logs. Unmarked `ARMOR_CHANGE` stays character-local forever; new shared corrections use `scope = "identity"` and `identityMembers`. Ring/Trinket packing is chronological by log order, then explicit identity-scoped slot targeting. Do not implement BiS opportunity state from issue #275 here; this projection is the foundation that work should reuse.
+
+Admin missing-grant reconciliation is coordinator-only, outside silent rebuild, and writes normal `ADMIN_ADDED` history. Effective owner follows the canonical owner's current identity for LINK/UNLINK and loot-mode authorization. `IsCurrentUserOwner` remains canonical.
+
+Fingerprint repair may normalize a sequential log only when MAIN_SWAP lineage plus ancestor substitution proves the known rewrite bug. Incoming single `NEW_LOG` validation stays strict.
 
 ## Persistence and restoration
 
@@ -85,6 +101,8 @@ Feature updates should fire or reuse `LootHelperEvents` so views refresh without
 6. debug commands and public API.
 
 Control messages use the small `SF_LH` traffic class; snapshots and log batches use `SF_LHB`. `modules/LootHelper/Comm.lua` is the current AceComm/ChatThrottleLib transport adapter.
+
+The current protocol version is **2**. Clients on protocol 1 cannot participate in a linked-identity session; mixed Main Swap and Linked Character interpretation of the same profile is unsafe. `PROTO_MIN`, `PROTO_MAX`, `PROTO_CURRENT`, and `Sync.PROTO_VERSION` must stay aligned.
 
 ### Session lifecycle
 

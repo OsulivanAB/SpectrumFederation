@@ -2,6 +2,8 @@
 
 A Loot Helper sync session keeps one profile consistent across addon users in the same party or raid. Profiles are synchronized from their append-only change logs, so clients transfer only missing history when possible.
 
+Linked Character identity, admin implication, and progression are derived from that same history. All clients in a session must speak protocol version 2; older Main Swap clients are incompatible.
+
 ## Start and end a session
 
 Any admin of the selected profile can start a session while in a party or raid. Raid leadership is not required.

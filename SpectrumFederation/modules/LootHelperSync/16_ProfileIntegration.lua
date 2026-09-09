@@ -535,6 +535,14 @@ function Sync:RebuildProfile(profileId, reason)
             elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.ADMIN_REMOVED) then
                 local norm = _NormalizeMemberId(data.member) or data.member
                 adminSet[norm] = nil
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.MAIN_SWAP) then
+                ensureMember(data.member)
+                ensureMember(data.sourceMember)
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.CHARACTER_LINK) then
+                ensureMember(data.memberA)
+                ensureMember(data.memberB)
+            elseif eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.CHARACTER_UNLINK) then
+                ensureMember(data.member)
             end
         end
     end
@@ -577,6 +585,10 @@ function Sync:RebuildProfile(profileId, reason)
         profile:_EnsureRewardPotConfig()
     end
 
+    if profile.ApplyIdentityProjection then
+        profile:ApplyIdentityProjection()
+    end
+
     if SF.Debug then
         local summary = _BuildPointsSummary(profile)
         SF.Debug:Info("SYNC_PROFILE", "Rebuild done (profileId=%s, reason=%s, members=%d, admins=%d, created=%d, pointsMembers=%d, pointsSum=%d, pointsChecksum=%d)",
@@ -597,7 +609,51 @@ function Sync:RebuildProfile(profileId, reason)
         SF.LootHelperEvents:NotifyDataChanged("SYNC:REBUILD", { profileId = profileId })
     end
 
+    self:ScheduleIdentityAdminReconcile(profileId)
+
     return true, nil
+end
+
+-- Coordinator-only: persist missing identity admin grants after silent rebuild.
+-- Debounced so burst rebuilds (live_update, AUTH_LOGS, snapshots) converge once.
+function Sync:ScheduleIdentityAdminReconcile(profileId)
+    if type(profileId) ~= "string" or profileId == "" then
+        return
+    end
+    if not self.state or not self.state.active or not self.state.isCoordinator then
+        return
+    end
+    if self.state.profileId ~= profileId then
+        return
+    end
+
+    self._identityAdminReconcilePending = self._identityAdminReconcilePending or {}
+    if self._identityAdminReconcilePending[profileId] then
+        return
+    end
+    self._identityAdminReconcilePending[profileId] = true
+
+    local function run()
+        if self._identityAdminReconcilePending then
+            self._identityAdminReconcilePending[profileId] = nil
+        end
+        if not self.state or not self.state.active or not self.state.isCoordinator then
+            return
+        end
+        if self.state.profileId ~= profileId then
+            return
+        end
+        local profile = self:FindLocalProfileById(profileId)
+        if profile and profile.ReconcileIdentityAdmins then
+            profile:ReconcileIdentityAdmins()
+        end
+    end
+
+    if type(self.RunAfter) == "function" then
+        self:RunAfter(0, run)
+    else
+        run()
+    end
 end
 
 -- Function Emit a concise member-point summary for session lifecycle logs.

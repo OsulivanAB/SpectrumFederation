@@ -113,6 +113,7 @@ loadModule("SpectrumFederation/modules/core.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Members.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogValidators.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogs.lua")
+loadModule("SpectrumFederation/modules/LootHelper/Identity.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Profiles.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootHelper.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Impersonation.lua")
@@ -652,7 +653,8 @@ local oldProfile = makeProfile("Old Defaults")
 local oldCfg = oldProfile:GetRCLootCouncilIntegrationConfig()
 assertTrue(oldCfg.recordAwards and oldCfg.recordAllAwardTypes and #oldCfg.allowedResponses == 0, "profiles without stored RC config fill defaults")
 
--- Main Swap must not rewrite isolated RC recipients.
+-- Live Main Swap is retired. Linking must not rewrite isolated RC recipients
+-- or sequential member attribution.
 resetEnv()
 local swapProfile = makeProfile("Swap")
 local sourceAlt = "Alt-Garona"
@@ -665,12 +667,16 @@ local pointLog = SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
     member = sourceAlt,
     change = SF.LootLogPointChangeTypes.INCREMENT,
 }, {
+    profile = swapProfile,
     author = PLAYER,
     counter = 2,
     skipPermission = true,
 })
 assertTrue(swapProfile:AddLootLog(pointLog, { skipBroadcast = true }), "sequential point log is recorded on the source alt")
-assertTrue(swapProfile:TransferMemberHistory(sourceAlt, WINNER), "Main Swap transfers sequential history")
+local liveSwapOk, liveSwapErr = swapProfile:TransferMemberHistory(sourceAlt, WINNER)
+assertFalse(liveSwapOk, "live Main Swap is retired")
+assertTrue(type(liveSwapErr) == "string" and liveSwapErr:find("Linked Characters", 1, true) ~= nil, "retired Main Swap explains Linked Characters")
+assertTrue(swapProfile:LinkCharacters(sourceAlt, WINNER), "characters can be linked instead of swapped")
 local swappedRC = nil
 local swappedPoint = nil
 for _, log in ipairs(swapProfile:GetLootLogs() or {}) do
@@ -680,11 +686,15 @@ for _, log in ipairs(swapProfile:GetLootLogs() or {}) do
         swappedPoint = log
     end
 end
-assertTrue(swappedRC ~= nil, "RC log remains after Main Swap")
-assertEq(swappedRC:GetEventData().member, sourceAlt, "Main Swap does not rewrite the RC recipient")
-assertEq(swappedRC:GetID(), sourceCanonical.awardKey, "Main Swap does not change the external RC identity")
-assertTrue(swappedPoint ~= nil, "sequential point log remains after Main Swap")
-assertEq(swappedPoint:GetEventData().member, WINNER, "Main Swap still rewrites ordinary sequential member references")
+assertTrue(swappedRC ~= nil, "RC log remains after character link")
+assertEq(swappedRC:GetEventData().member, sourceAlt, "linking does not rewrite the RC recipient")
+assertEq(swappedRC:GetID(), sourceCanonical.awardKey, "linking does not change the external RC identity")
+assertTrue(swappedPoint ~= nil, "sequential point log remains after character link")
+assertEq(swappedPoint:GetEventData().member, sourceAlt, "linking does not rewrite sequential member attribution")
+local sourceMember = swapProfile:getMemberByID(sourceAlt)
+local winnerMember = swapProfile:getMemberByID(WINNER)
+assertTrue(sourceMember ~= nil and winnerMember ~= nil, "linked characters remain distinct members")
+assertEq(sourceMember:GetPointBalance(), winnerMember:GetPointBalance(), "linked characters share identity-wide points")
 
 -- ---------------------------------------------------------------------------
 -- Sequential isolation (required regression boundary)

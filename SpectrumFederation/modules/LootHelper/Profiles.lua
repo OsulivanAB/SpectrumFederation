@@ -140,8 +140,21 @@ end
 
 local function CurrentUserHasEffectiveLocalOwner(profile)
     local Imp = SF.LootHelperImpersonation
-    if Imp and Imp.IsEffectiveLocalOwner then
+    if Imp and Imp.IsEffectiveLocalOwner and profile.IsCurrentUserOwner and profile:IsCurrentUserOwner() then
         return Imp:IsEffectiveLocalOwner(profile)
+    end
+    if Imp and Imp.IsActive and Imp:IsActive() then
+        local active = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+        if active and profile and active.GetProfileId and profile.GetProfileId then
+            if active:GetProfileId() == profile:GetProfileId() then
+                return false
+            end
+        elseif active == profile then
+            return false
+        end
+    end
+    if profile.IsCurrentUserEffectiveOwner then
+        return profile:IsCurrentUserEffectiveOwner()
     end
     return profile:IsCurrentUserOwner()
 end
@@ -595,9 +608,10 @@ function LootProfile.new(profileName)
 
     local creationCounter = instance:AllocateNextCounter(instance._author)
     local logEntry = SF.LootLog.new(logEventType, logEventData, {
+        profile = instance,
         author = instance._author,
         counter = creationCounter,
-        skipPermission = true, -- creation is special; no activeProfile yet
+        skipPermission = true, -- creation is special; no session yet
     })
 
     if not logEntry then
@@ -663,6 +677,16 @@ function LootProfile:RebuildLogIndex()
     self._logFingerprintIndex = {}
     self._authorCounters = {}
     self._rcAwardIndex = {}
+
+    local lineage = nil
+    if SF.LootHelperIdentity and SF.LootHelperIdentity.BuildMainSwapLineage then
+        lineage = SF.LootHelperIdentity.BuildMainSwapLineage(self._lootLogs)
+    end
+    if lineage and #lineage > 0 and SF.LootLog and SF.LootLog.TryNormalizeMainSwapStaleFingerprint then
+        for _, log in ipairs(self._lootLogs or {}) do
+            SF.LootLog.TryNormalizeMainSwapStaleFingerprint(log, lineage)
+        end
+    end
 
     for i, log in ipairs(self._lootLogs or {}) do
         local id = log.GetID and log:GetID() or log._id
@@ -772,6 +796,25 @@ end
 function LootProfile:IsOwner(memberId)
     if type(memberId) ~= "string" or memberId == "" then return false end
     return SameMember(NormalizeMemberId(memberId), self._owner)
+end
+
+function LootProfile:IsEffectiveOwner(memberId)
+    if self:IsOwner(memberId) then
+        return true
+    end
+    local Identity = SF.LootHelperIdentity
+    if not Identity or not Identity.SameIdentity then
+        return false
+    end
+    return Identity.SameIdentity(self._lootLogs, self._owner, memberId)
+end
+
+function LootProfile:IsCurrentUserEffectiveOwner()
+    local currentUser = SF:GetPlayerFullIdentifier()
+    if not currentUser then
+        return false
+    end
+    return self:IsEffectiveOwner(currentUser)
 end
 
 -- Function to get the list of members in this profile
@@ -917,13 +960,17 @@ local function AppendProfileLog(self, eventType, eventData, opts)
     if not SF.LootLog then
         return false, "Loot logs are unavailable."
     end
+    opts = opts or {}
+    if opts.profile == nil then
+        opts.profile = self
+    end
     local logEntry = SF.LootLog.new(eventType, eventData, opts)
     if not logEntry then
         return false, "Failed to create loot log entry."
     end
     if self.AddLootLog then
         local addOpts = nil
-        if opts and opts.skipBroadcast then
+        if opts.skipBroadcast then
             addOpts = { skipBroadcast = true }
         end
         self:AddLootLog(logEntry, addOpts)
@@ -1482,6 +1529,7 @@ function LootProfile:TryAddRCLootCouncilAward(canonical)
 	-- session profile. Admin authorization was already verified on self
 	-- above, and AddLootLog/_InsertLog still require admin on this profile.
 	local logEntry = SF.LootLog.new(eventType, eventData, {
+		profile = self,
 		author = canonical.awarder,
 		timestamp = canonical.timestamp,
 		externalId = awardKey,
@@ -1576,7 +1624,7 @@ function LootProfile:SetProfileName(newName)
             eventData.oldName = oldName
             eventData.newName = newName
             
-            local logEntry = SF.LootLog.new(eventType, eventData)
+            local logEntry = SF.LootLog.new(eventType, eventData, { profile = self })
             if logEntry and self.AddLootLog then
                 self:AddLootLog(logEntry)
             end
@@ -1614,7 +1662,8 @@ end
 -- @return boolean success
 function LootProfile:AddLootLog(lootLog, opts)
     opts = opts or {}
-    local ok, err = self:_InsertLog(lootLog, { requireAdmin = true })
+    local requireAdmin = opts.skipPermission ~= true
+    local ok, err = self:_InsertLog(lootLog, { requireAdmin = requireAdmin })
     if ok then
         -- If Sync is loaded, ask it to broadcast this log.
         -- Sync will no-op unless there is an active session AND the profileId matches.
@@ -1710,6 +1759,9 @@ function LootProfile:_InsertLog(lootLog, opts)
     end)
     self:_RefreshLogPositionIndex()
     self:_MarkIntegritySummaryDirty()
+    if self.ApplyIdentityProjection then
+        self:ApplyIdentityProjection()
+    end
 
     return true
 end
@@ -1799,7 +1851,7 @@ function LootProfile:SetPointName(name)
 		eventData.oldName = oldName
 		eventData.newName = name
 		
-		local logEntry = SF.LootLog.new(eventType, eventData)
+		local logEntry = SF.LootLog.new(eventType, eventData, { profile = self })
 		if logEntry and self.AddLootLog then
 			self:AddLootLog(logEntry)
 		end
@@ -1826,7 +1878,7 @@ function LootProfile:SetRaidWideSafeMode(v)
 		local eventData = SF.LootLog.GetEventDataTemplate(eventType)
 		eventData.enabled = enabled
 		
-		local logEntry = SF.LootLog.new(eventType, eventData)
+		local logEntry = SF.LootLog.new(eventType, eventData, { profile = self })
 		if logEntry and self.AddLootLog then
 			self:AddLootLog(logEntry)
 		end
@@ -1853,7 +1905,7 @@ function LootProfile:SetRaidWideSafeModeOnCombat(v)
 		local eventData = SF.LootLog.GetEventDataTemplate(eventType)
 		eventData.enabled = enabled
 		
-		local logEntry = SF.LootLog.new(eventType, eventData)
+		local logEntry = SF.LootLog.new(eventType, eventData, { profile = self })
 		if logEntry and self.AddLootLog then
 			self:AddLootLog(logEntry)
 		end
@@ -1884,7 +1936,8 @@ end
 -- Function to add an admin member ID to this profile
 -- @param string memberId "Name-Realm" of member to add as admin
 -- @return boolean success, string|nil errorMessage
-function LootProfile:AddAdminMemberId(memberId)
+function LootProfile:AddAdminMemberId(memberId, opts)
+    opts = opts or {}
     if SF.Debug then
         SF.Debug:Info("LootProfile", "AddAdminMemberId called with memberId: %s", tostring(memberId))
     end
@@ -1901,7 +1954,7 @@ function LootProfile:AddAdminMemberId(memberId)
         SF.Debug:Info("LootProfile", "Normalized memberId: %s", tostring(memberId))
     end
 
-    if not CurrentUserHasEffectiveLocalAdmin(self) then
+    if not opts.skipPermission and not CurrentUserHasEffectiveLocalAdmin(self) then
         if SF.Debug then
             SF.Debug:Warn("LootProfile", "Current user is not an admin; cannot add admin member IDs")
         end
@@ -1931,9 +1984,9 @@ function LootProfile:AddAdminMemberId(memberId)
         local eventData = SF.LootLog.GetEventDataTemplate(eventType)
         eventData.member = memberId
         
-        local logEntry = SF.LootLog.new(eventType, eventData)
+        local logEntry = SF.LootLog.new(eventType, eventData, { profile = self, skipPermission = opts.skipPermission })
         if logEntry and self.AddLootLog then
-            self:AddLootLog(logEntry)
+            self:AddLootLog(logEntry, { skipPermission = opts.skipPermission, skipBroadcast = opts.skipBroadcast })
         end
     end
     
@@ -1983,7 +2036,7 @@ function LootProfile:RemoveAdminMemberId(memberId)
                 local eventData = SF.LootLog.GetEventDataTemplate(eventType)
                 eventData.member = memberId
                 
-                local logEntry = SF.LootLog.new(eventType, eventData)
+                local logEntry = SF.LootLog.new(eventType, eventData, { profile = self })
                 if logEntry and self.AddLootLog then
                     self:AddLootLog(logEntry)
                 end
@@ -2002,234 +2055,176 @@ function LootProfile:RemoveAdminMemberId(memberId)
     return false, "That member is not an admin."
 end
 
--- Function to transfer all source-member history to an existing target member
--- Rewrites member-linked log references, updates admin/owner state, removes the source
--- member from the profile, and rebuilds derived profile state.
--- @param string sourceMemberId "Name-Realm" of member to transfer history from
--- @param string targetMemberId "Name-Realm" of member to transfer history to
--- @return boolean success
--- @return string|nil errorMessage
-function LootProfile:TransferMemberHistory(sourceMemberId, targetMemberId)
-    if type(sourceMemberId) ~= "string" or sourceMemberId == "" then
-        return false, "Select a source character."
+-- Live Main Swap is retired. Historical MAIN_SWAP logs remain as lineage during identity replay.
+function LootProfile:TransferMemberHistory()
+    return false, "Main Swap has been replaced by Linked Characters."
+end
+
+function LootProfile:ApplyIdentityProjection()
+    local Identity = SF.LootHelperIdentity
+    if not Identity or not Identity.ApplyToProfileMembers then
+        return nil
     end
-    if type(targetMemberId) ~= "string" or targetMemberId == "" then
-        return false, "Select a target character."
+    return Identity.ApplyToProfileMembers(self)
+end
+
+local function TouchesOwnerIdentity(profile, memberA, memberB)
+    if profile:IsEffectiveOwner(memberA) or profile:IsEffectiveOwner(memberB) then
+        return true
     end
-    if not CurrentUserHasEffectiveLocalAdmin(self) then
-        return false, "You must be an admin to transfer points."
+    return false
+end
+
+function LootProfile:LinkCharacters(memberA, memberB, opts)
+    opts = opts or {}
+    memberA = NormalizeMemberId(memberA)
+    memberB = NormalizeMemberId(memberB)
+    if type(memberA) ~= "string" or memberA == "" or type(memberB) ~= "string" or memberB == "" then
+        return false, "Select two characters."
+    end
+    if SameMember(memberA, memberB) then
+        return false, "Select two different characters."
+    end
+    if not self:getMemberByID(memberA) or not self:getMemberByID(memberB) then
+        return false, "Both characters must be members of this profile."
+    end
+    if TouchesOwnerIdentity(self, memberA, memberB) then
+        if not CurrentUserHasEffectiveLocalOwner(self) then
+            return false, "Only the owner may change the owner's linked identity."
+        end
+    elseif not CurrentUserHasEffectiveLocalAdmin(self) then
+        return false, "You must be an admin to link characters."
     end
 
-    sourceMemberId = NormalizeMemberId(sourceMemberId)
-    targetMemberId = NormalizeMemberId(targetMemberId)
-
-    if SameMember(sourceMemberId, targetMemberId) then
-        return false, "Source and target must be different characters."
+    local Identity = SF.LootHelperIdentity
+    if Identity and Identity.SameIdentity and Identity.SameIdentity(self._lootLogs, memberA, memberB) then
+        return false, "Those characters are already linked."
     end
 
-    if not self:getMemberByID(sourceMemberId) then
-        return false, "The source character is not part of this profile."
+    local adminMembersAtLink = {}
+    if Identity and Identity.ComponentAdmins then
+        adminMembersAtLink = Identity.ComponentAdmins(self, memberA, memberB)
     end
 
-    if not self:getMemberByID(targetMemberId) then
-        return false, "The target character is not part of this profile."
+    local eventType = SF.LootLogEventTypes.CHARACTER_LINK
+    local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+    eventData.memberA = memberA
+    eventData.memberB = memberB
+    eventData.adminMembersAtLink = adminMembersAtLink
+    local logOpts = {
+        profile = self,
+        skipPermission = opts.skipPermission,
+    }
+    local logEntry = SF.LootLog.new(eventType, eventData, logOpts)
+    if not logEntry then
+        return false, "Failed to create character link log."
+    end
+    local ok = self:AddLootLog(logEntry, {
+        skipBroadcast = opts.skipBroadcast,
+        skipPermission = opts.skipPermission,
+    })
+    if not ok then
+        return false, "Failed to record character link."
     end
 
-    -- Snapshot the source member's equipment (armor) state before any mutations.
-    -- This ensures equipment slots transfer even if the source's armor state is not
-    -- fully backed by ARMOR_CHANGE logs (e.g. sync/import edge cases).
-    local sourceMember = self:getMemberByID(sourceMemberId)
-    local sourceArmorSnapshot = {}
-    if sourceMember and type(sourceMember.armor) == "table" then
-        for slot, used in pairs(sourceMember.armor) do
-            sourceArmorSnapshot[slot] = used
+    local result = self:ApplyIdentityProjection()
+    if result and result.overflowByIdentity then
+        local group = result.identityOf and result.identityOf[memberA]
+        local root = group and group[1]
+        if root and result.overflowByIdentity[root] and SF.PrintWarning then
+            SF:PrintWarning("Linked characters share equipment history with overlapping slot usage.")
         end
     end
 
-    local logsUpdated = 0
-    local affectedRangesByAuthor = {}
-    for _, log in ipairs(self._lootLogs or {}) do
-        local eventData = (log.GetEventData and log:GetEventData()) or log._data
-        local eventType = (log.GetEventType and log:GetEventType()) or log._eventType
-        local isExternal = (type(log._externalId) == "string" and log._externalId ~= "")
-            or eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.RC_LOOT_COUNCIL)
-        -- External RC awards keep the original recipient. Rewriting member
-        -- would change the fingerprint of an isolated external id that peers
-        -- cannot request through sequential repair.
-        if (not isExternal)
-            and type(eventData) == "table"
-            and type(eventData.member) == "string"
-            and SameMember(eventData.member, sourceMemberId)
-        then
-            eventData.member = targetMemberId
-            logsUpdated = logsUpdated + 1
-
-            local author = log.GetAuthor and log:GetAuthor() or log._author
-            local counter = log.GetCounter and log:GetCounter() or log._counter
-            if type(author) == "string" and IsSequentialLogCounter(counter) then
-                local range = affectedRangesByAuthor[author]
-                if not range then
-                    range = {
-                        author = author,
-                        fromCounter = counter,
-                        toCounter = counter,
-                    }
-                    affectedRangesByAuthor[author] = range
-                else
-                    if counter < range.fromCounter then
-                        range.fromCounter = counter
-                    end
-                    if counter > range.toCounter then
-                        range.toCounter = counter
-                    end
-                end
+    if result and result.simulatedAdmins then
+        for memberId in pairs(result.simulatedAdmins) do
+            if not self:IsAdminMemberId(memberId) then
+                self:AddAdminMemberId(memberId, {
+                    skipPermission = true,
+                })
             end
         end
-    end
-
-    if type(self._adminUsers) ~= "table" then
-        self._adminUsers = {}
-    end
-
-    local sourceWasAdmin = false
-    local targetIsAdmin = false
-    for i = #self._adminUsers, 1, -1 do
-        local adminId = self._adminUsers[i]
-        if type(adminId) == "string" then
-            if SameMember(adminId, targetMemberId) then
-                targetIsAdmin = true
-            end
-            if SameMember(adminId, sourceMemberId) then
-                sourceWasAdmin = true
-                table.remove(self._adminUsers, i)
-            end
-        end
-    end
-    if sourceWasAdmin and not targetIsAdmin then
-        table.insert(self._adminUsers, targetMemberId)
-    end
-
-    if SameMember(self._owner, sourceMemberId) then
-        self._owner = targetMemberId
-    end
-    if SameMember(self._author, sourceMemberId) then
-        self._author = targetMemberId
-    end
-
-    self:_EnsureRaidCheckEquipmentSnapshots()
-    self._raidCheckEquipmentSnapshots[sourceMemberId] = nil
-
-    self:RemoveMemberById(sourceMemberId)
-    self._memberById = nil
-
-    local rebuildOk = false
-    local rebuildErr = nil
-    if SF.LootHelperSync and SF.LootHelperSync.RebuildProfile and self.GetProfileId then
-        rebuildOk, rebuildErr = SF.LootHelperSync:RebuildProfile(self:GetProfileId(), "member_history_transfer")
-    elseif self.RebuildLogIndex then
-        self:RebuildLogIndex()
-        rebuildOk = true
-    end
-
-    if not rebuildOk then
-        return false, rebuildErr or "Failed to rebuild profile after transferring points."
-    end
-
-    -- Reconcile equipment state: ensure the target member carries forward any
-    -- equipment slots that were marked as used on the source.  If the rebuild
-    -- did not pick them up (e.g. missing backing logs), create ARMOR_CHANGE
-    -- logs so the state is durable and sync-safe.
-    self._memberById = nil  -- force fresh lookup after rebuild
-    local targetMember = self:getMemberByID(targetMemberId)
-    if targetMember and type(targetMember.armor) == "table" then
-        for slot, wasUsed in pairs(sourceArmorSnapshot) do
-            if wasUsed == true and targetMember.armor[slot] == false then
-                targetMember.armor[slot] = true
-
-                -- Create a backing ARMOR_CHANGE log so state persists across rebuilds/sync
-                if SF.LootLog and SF.LootLogEventTypes and SF.LootLogArmorActions then
-                    local logEventData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.ARMOR_CHANGE)
-                    if logEventData then
-                        logEventData.member = targetMemberId
-                        logEventData.slot = slot
-                        logEventData.action = SF.LootLogArmorActions.USED
-                        logEventData.source = "main_swap_reconcile"
-
-                        local logOpts = { skipPermission = true }
-                        logOpts.author = self._author or (SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier())
-                        if self.AllocateNextCounter and logOpts.author then
-                            logOpts.counter = self:AllocateNextCounter(logOpts.author)
-                        end
-                        local logEntry = SF.LootLog.new(SF.LootLogEventTypes.ARMOR_CHANGE, logEventData, logOpts)
-                        if logEntry and self.AddLootLog then
-                            self:AddLootLog(logEntry)
-                        end
-                    end
-                end
-
-                if SF.Debug then
-                    SF.Debug:Info("LootProfile", "Reconciled equipment slot '%s' for target %s (main swap)", tostring(slot), tostring(targetMemberId))
-                end
-            end
-        end
-    end
-
-    if self._EnsureOwnerIsAdmin then
-        self:_EnsureOwnerIsAdmin()
-    end
-
-    -- Create a MAIN_SWAP log entry to record the consolidation event.
-    -- Assigned to the target (new) character, referencing the source (old) character.
-    if SF.LootLog and SF.LootLogEventTypes then
-        local logEventData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.MAIN_SWAP)
-        if logEventData then
-            logEventData.member = targetMemberId
-            logEventData.sourceMember = sourceMemberId
-
-            local logOpts = { skipPermission = true }
-            logOpts.author = self._author or (SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier())
-            if self.AllocateNextCounter and logOpts.author then
-                logOpts.counter = self:AllocateNextCounter(logOpts.author)
-            end
-            local logEntry = SF.LootLog.new(SF.LootLogEventTypes.MAIN_SWAP, logEventData, logOpts)
-            if logEntry and self.AddLootLog then
-                self:AddLootLog(logEntry)
-            end
-        end
-    end
-
-    if SF.LootHelperSync and SF.LootHelperSync.AdvertiseProfileMutation and self.GetProfileId then
-        local affectedRanges = {}
-        for _, range in pairs(affectedRangesByAuthor) do
-            affectedRanges[#affectedRanges + 1] = range
-        end
-        SF.LootHelperSync:AdvertiseProfileMutation(self:GetProfileId(), affectedRanges, "member_history_transfer")
-
-        if SF.LootHelperSync.state and SF.LootHelperSync.state.active and SF.LootHelperSync.state.profileId == self:GetProfileId() then
-            SF.LootHelperSync.state._sentJoinStatusForSessionId = nil
-            SF.LootHelperSync.state._sentJoinStatusType = nil
-            if SF.LootHelperSync.state.isCoordinator and SF.LootHelperSync.BroadcastSessionHeartbeat then
-                SF.LootHelperSync.state.authorWindowSummary = SF.LootHelperSync:ComputeAuthorWindowSummary(self:GetProfileId())
-                SF.LootHelperSync:BroadcastSessionHeartbeat()
-            elseif SF.LootHelperSync.SendJoinStatus then
-                SF.LootHelperSync:SendJoinStatus()
-            end
-        end
-    end
-
-    if SF.Debug then
-        SF.Debug:Info(
-            "LootProfile",
-            "Transferred member history from %s to %s in profile %s (%d log references updated)",
-            tostring(sourceMemberId),
-            tostring(targetMemberId),
-            tostring(self._profileName),
-            logsUpdated
-        )
     end
 
     return true, nil
 end
+
+function LootProfile:UnlinkCharacter(memberId, opts)
+    opts = opts or {}
+    memberId = NormalizeMemberId(memberId)
+    if type(memberId) ~= "string" or memberId == "" then
+        return false, "Select a character to unlink."
+    end
+    if not self:getMemberByID(memberId) then
+        return false, "That character is not part of this profile."
+    end
+    if self:IsEffectiveOwner(memberId) or TouchesOwnerIdentity(self, memberId, self._owner) then
+        if not CurrentUserHasEffectiveLocalOwner(self) then
+            return false, "Only the owner may change the owner's linked identity."
+        end
+    elseif not CurrentUserHasEffectiveLocalAdmin(self) then
+        return false, "You must be an admin to unlink characters."
+    end
+
+    local Identity = SF.LootHelperIdentity
+    local group = Identity and Identity.ComponentMembers and Identity.ComponentMembers(self._lootLogs, memberId)
+    if not group or #group < 2 then
+        return false, "That character is not linked to another character."
+    end
+
+    local eventType = SF.LootLogEventTypes.CHARACTER_UNLINK
+    local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+    eventData.member = memberId
+    local logEntry = SF.LootLog.new(eventType, eventData, {
+        profile = self,
+        skipPermission = opts.skipPermission,
+    })
+    if not logEntry then
+        return false, "Failed to create character unlink log."
+    end
+    local ok = self:AddLootLog(logEntry, {
+        skipBroadcast = opts.skipBroadcast,
+        skipPermission = opts.skipPermission,
+    })
+    if not ok then
+        return false, "Failed to record character unlink."
+    end
+    self:ApplyIdentityProjection()
+    return true, nil
+end
+
+function LootProfile:ReconcileIdentityAdmins(opts)
+    opts = opts or {}
+    local Identity = SF.LootHelperIdentity
+    if not Identity or not Identity.Replay then
+        return 0
+    end
+    local result = Identity.Replay(self._lootLogs, { owner = self._owner })
+    local added = 0
+    for memberId in pairs(result.simulatedAdmins or {}) do
+        if memberId and not self:IsAdminMemberId(memberId) then
+            if not self:getMemberByID(memberId) and SF.Member and SF.Member.new then
+                local created = SF.Member.new(memberId)
+                if created then
+                    self._members = self._members or {}
+                    self._members[#self._members + 1] = created
+                end
+            end
+            local ok = self:AddAdminMemberId(memberId, {
+                skipPermission = true,
+                skipBroadcast = opts.skipBroadcast,
+            })
+            if ok then
+                added = added + 1
+            end
+        end
+    end
+    if added > 0 then
+        self:ApplyIdentityProjection()
+    end
+    return added
+end
+
 
 -- ========================================================================
 -- Exports and Imports
@@ -2585,6 +2580,21 @@ function LootProfile:MergeLogTables(logTables, opts)
     if type(logTables) ~= "table" then return 0 end
 
     opts = opts or {}
+    if SF.LootHelperIdentity and SF.LootHelperIdentity.BuildMainSwapLineage then
+        local lineageSource = {}
+        for _, log in ipairs(self._lootLogs or {}) do
+            lineageSource[#lineageSource + 1] = log
+        end
+        for _, t in ipairs(logTables) do
+            lineageSource[#lineageSource + 1] = t
+        end
+        local lineage = SF.LootHelperIdentity.BuildMainSwapLineage(lineageSource)
+        if lineage and #lineage > 0 then
+            opts = CopyTableShallow(opts)
+            opts.allowMainSwapFingerprintNormalize = true
+            opts.mainSwapLineage = lineage
+        end
+    end
     self._lootLogs = self._lootLogs or {}
     self._logIndex = self._logIndex or {}
     self._logById = self._logById or {}
@@ -2658,6 +2668,9 @@ function LootProfile:MergeLogTables(logTables, opts)
         table.sort(self._lootLogs, function(a, b) return self:_CompareLogs(a, b) end)
         self:_RefreshLogPositionIndex()
         self:_MarkIntegritySummaryDirty()
+        if self.ApplyIdentityProjection then
+            self:ApplyIdentityProjection()
+        end
     end
 
     return inserted, {

@@ -336,7 +336,7 @@ function EquipmentWindow:_CreateGearGrid(content)
 end
 
 -- Show equipment window for a specific member
-function EquipmentWindow:ShowForMember(mainFrame, rowModel, memberObj, canAdmin)
+function EquipmentWindow:ShowForMember(mainFrame, rowModel, memberObj, canAdmin, profile)
     self:Create()
 
     if SF.Debug then
@@ -358,6 +358,7 @@ function EquipmentWindow:ShowForMember(mainFrame, rowModel, memberObj, canAdmin)
     self._rowModel = rowModel
     self._memberObj = memberObj
     self._canAdmin = canAdmin
+    self._profile = profile or (rowModel and rowModel.profile)
 
     -- Update member info
     self:SetMember(rowModel, memberObj, canAdmin)
@@ -505,7 +506,7 @@ function EquipmentWindow:_OnSlotClicked(slotKey)
     -- Call member toggle
     if self._memberObj.ToggleEquipment then
         local ok = pcall(function()
-            self._memberObj:ToggleEquipment(slotKey)
+            self._memberObj:ToggleEquipment(slotKey, { profile = self._profile })
         end)
 
         if ok then
