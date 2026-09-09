@@ -421,15 +421,15 @@ function LootLog.new(eventType, eventData, opts)
 
     -- Additional validation based on event type
     if eventType == EVENT_TYPES.POINT_CHANGE then
-        if not SF.LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES) then
+        if not SF.LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES, owningProfile) then
             return nil
         end
     elseif eventType == EVENT_TYPES.ARMOR_CHANGE then
-        if not SF.LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS) then
+        if not SF.LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, owningProfile) then
             return nil
         end
     elseif eventType == EVENT_TYPES.ROLE_CHANGE then
-        if not SF.LootLogValidators.ValidateRoleChangeData(eventData) then
+        if not SF.LootLogValidators.ValidateRoleChangeData(eventData, owningProfile) then
             return nil
         end
     elseif eventType == EVENT_TYPES.POINT_NAME_CHANGE then
@@ -481,7 +481,7 @@ function LootLog.new(eventType, eventData, opts)
             return nil
         end
     elseif eventType == EVENT_TYPES.ATTENDANCE_CHANGE then
-        if not SF.LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES) then
+        if not SF.LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES, owningProfile) then
             return nil
         end
     elseif eventType == EVENT_TYPES.RC_LOOT_COUNCIL then

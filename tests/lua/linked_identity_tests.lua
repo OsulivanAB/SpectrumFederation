@@ -218,6 +218,7 @@ local function makeTable(eventType, data, extra)
         _data = data,
     }
     t._id = string.format("%s:%d", t._author, t._counter)
+    t.version = 2
     t._fingerprint = SF.LootLog.ComputeFingerprintFromTable(t)
     return t
 end
@@ -568,6 +569,7 @@ addMember(profile, ALT_A)
 addMember(profile, ALT_B)
 addMember(profile, ALT_C)
 assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "original A+B identity")
+assertEq(armorOf(profile, ALT_A, "Chest"), false, "unused ordinary slots stay false after projection")
 assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "identity-wide Chest correction")
 local correction = nil
 for _, log in ipairs(profile:GetLootLogs()) do
@@ -579,7 +581,9 @@ for _, log in ipairs(profile:GetLootLogs()) do
     end
 end
 assertTrue(correction ~= nil, "new shared correction stores identity scope")
-assertEq(#correction.identityMembers, 2, "identityMembers records original membership")
+if correction then
+    assertEq(#correction.identityMembers, 2, "identityMembers records original membership")
+end
 assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "unrelated C joins")
 assertTrue(armorOf(profile, ALT_A, "Chest"), "adding C does not invalidate A+B correction")
 assertTrue(armorOf(profile, ALT_C, "Chest"), "C sees the still-valid A+B correction")

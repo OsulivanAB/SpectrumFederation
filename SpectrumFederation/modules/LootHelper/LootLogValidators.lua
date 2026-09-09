@@ -13,16 +13,12 @@ local LootLogValidators = {}
 -- Function to validate if member exists in Loot Profiles member dictionary
 -- @param memberIdentifier (string) - Member full identifier "Name-Realm"
 -- @return (boolean) - True if member exists, false otherwise
-function LootLogValidators.MemberExistsInProfiles(memberIdentifier)
-	local activeProfile = SF.lootHelperDB and SF.lootHelperDB.activeProfile
-	if not activeProfile or not activeProfile.GetMemberList then
-		if SF.Debug then
-			SF.Debug:Warn("LOOTLOG", "No active loot profile set when validating member: %s", tostring(memberIdentifier))
-		end
-		return false
+function LootLogValidators.MemberExistsInProfiles(memberIdentifier, profile)
+	if type(profile) ~= "table" or not profile.GetMemberList then
+		return true
 	end
 
-	local members = activeProfile:GetMemberList()
+	local members = profile:GetMemberList()
 	if type(members) ~= "table" then return false end
 
 	-- Normalize compare if NameUtil exists
@@ -53,13 +49,13 @@ end
 -- @param eventData (table) - Event data to validate
 -- @param POINT_CHANGE_TYPES (table) - Point change type constants
 -- @return (boolean) - True if valid, false otherwise
-function LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES)
+function LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES, profile)
     local memberID = eventData.member
     local changeType = eventData.change
     local amount = eventData.amount
 
-    -- Validate member exists in profiles
-    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+    -- Validate member exists in the owning profile when one is supplied
+    if not LootLogValidators.MemberExistsInProfiles(memberID, profile) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Point change log references non-existent member: %s", tostring(memberID))
         end
@@ -91,13 +87,13 @@ end
 -- @param eventData (table) - Event data to validate
 -- @param ARMOR_ACTIONS (table) - Armor action constants
 -- @return (boolean) - True if valid, false otherwise
-function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS)
+function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, profile)
     local memberID = eventData.member
     local slot = eventData.slot
     local action = eventData.action
 
-    -- Validate member exists in profiles
-    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+    -- Validate member exists in the owning profile when one is supplied
+    if not LootLogValidators.MemberExistsInProfiles(memberID, profile) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Armor change log references non-existent member: %s", tostring(memberID))
         end
@@ -173,12 +169,12 @@ end
 -- Function to validate the ROLE_CHANGE event data
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
-function LootLogValidators.ValidateRoleChangeData(eventData)
+function LootLogValidators.ValidateRoleChangeData(eventData, profile)
     local memberID = eventData.member
     local newRole = eventData.newRole
 
-    -- Validate member exists in profiles
-    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+    -- Validate member exists in the owning profile when one is supplied
+    if not LootLogValidators.MemberExistsInProfiles(memberID, profile) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Role change log references non-existent member: %s", tostring(memberID))
         end
@@ -543,12 +539,12 @@ end
 -- @param eventData (table) - Event data to validate
 -- @param POINT_CHANGE_TYPES (table) - Increment/decrement constants
 -- @return (boolean) - True if valid, false otherwise
-function LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES)
+function LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES, profile)
     local memberID = eventData.member
     local changeType = eventData.change
     local amount = eventData.amount
 
-    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+    if not LootLogValidators.MemberExistsInProfiles(memberID, profile) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Attendance change log references non-existent member: %s", tostring(memberID))
         end

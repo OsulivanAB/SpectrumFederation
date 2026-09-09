@@ -409,9 +409,22 @@ local function OccupiedBool(occ, slot)
     local family, key = FamilyForSlot(slot)
     if family == "ordinary" then
         local state = occ.ordinary[key]
-        return state and state.occupied == true
+        -- Lua `and` would return nil for unused slots; Member:ToggleEquipment
+        -- treats a missing key as an invalid slot.
+        return (state and state.occupied) == true
     end
     return occ[family].occupied[key] == true
+end
+
+local function CopyArmor(src)
+    local armor = EmptyArmor()
+    if type(src) ~= "table" then
+        return armor
+    end
+    for slot in pairs(armor) do
+        armor[slot] = src[slot] == true
+    end
+    return armor
 end
 
 local function IdentityHasOverflow(occ)
@@ -733,7 +746,7 @@ function Identity.Replay(logs, opts)
             for j = 1, #ids do
                 points[ids[j]] = pointTotal
                 attendance[ids[j]] = attendanceTotal
-                armor[ids[j]] = projected
+                armor[ids[j]] = CopyArmor(projected)
             end
         end
     end
