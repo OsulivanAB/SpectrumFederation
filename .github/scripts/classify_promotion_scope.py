@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -32,7 +33,11 @@ DOCS_EXACT_PATHS = frozenset({"mkdocs.yml", "requirements-docs.txt"})
 DOCS_PREFIXES = ("docs/", "overrides/")
 README_PATH = "README.md"
 CHANGELOG_PATH = "CHANGELOG.md"
+PARENT_TOC_PATH = "SpectrumFederation/SpectrumFederation.toc"
 MAX_FILES_PER_CATEGORY = 40
+STABLE_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+BETA_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$")
+TOC_VERSION_RE = re.compile(r"^## Version:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
 
 
 def normalize_repo_path(path):
@@ -427,6 +432,73 @@ def plan_promotion_git_mutation(target, main, cwd=None):
     }
 
 
+def read_toc_version_from_ref(ref, cwd=None, path=PARENT_TOC_PATH):
+    """Return the ## Version value from a TOC blob at ref."""
+    content = run_git(["show", f"{ref}:{path}"], cwd=cwd)
+    match = TOC_VERSION_RE.search(content)
+    if not match:
+        raise RuntimeError(f"No '## Version:' line in {path} at {ref}")
+    return match.group(1).strip()
+
+
+def is_stable_toc_version(version):
+    """Return True for a stable X.Y.Z TOC version."""
+    return bool(STABLE_VERSION_RE.fullmatch((version or "").strip()))
+
+
+def is_beta_toc_version(version):
+    """Return True for an X.Y.Z-beta.N TOC version."""
+    return bool(BETA_VERSION_RE.fullmatch((version or "").strip()))
+
+
+def validate_promotion_toc_versions(
+    release_required,
+    merge_required,
+    target_ref,
+    base_ref,
+    cwd=None,
+):
+    """Return error strings when TOC versions do not match the promotion case.
+
+    release_required selects the expected *shape* of the version.
+    merge_required selects which captured SHA is authoritative:
+    - merge required: the captured beta target will be merged/overlaid
+    - no merge: captured main is preserved, so main's TOC is authoritative
+    """
+    errors = []
+    try:
+        if release_required:
+            version = read_toc_version_from_ref(target_ref, cwd=cwd)
+            if not is_beta_toc_version(version):
+                errors.append(
+                    "Addon release requires captured beta TOC version X.Y.Z-beta.N, "
+                    f"got {version!r} at {target_ref}."
+                )
+            return errors
+
+        if merge_required:
+            version = read_toc_version_from_ref(target_ref, cwd=cwd)
+            if not is_stable_toc_version(version):
+                errors.append(
+                    "A non-addon promotion that still merges into main must keep a stable "
+                    f"X.Y.Z TOC version on the captured beta target, got {version!r}. "
+                    "Beta appears to contain stale release metadata from an incomplete "
+                    "previous addon promotion. Synchronize beta to main before merging "
+                    "new non-addon work so a prerelease TOC is not restored onto main."
+                )
+            return errors
+
+        version = read_toc_version_from_ref(base_ref, cwd=cwd)
+        if not is_stable_toc_version(version):
+            errors.append(
+                "No-op recovery requires the captured main TOC version to be stable "
+                f"X.Y.Z, got {version!r} at {base_ref}."
+            )
+    except RuntimeError as exc:
+        errors.append(str(exc))
+    return errors
+
+
 def bool_text(value):
     """Return GitHub Actions-friendly true/false."""
     return "true" if value else "false"
@@ -628,6 +700,11 @@ def build_parser():
         action="store_true",
         help="Decide whether the captured target still needs a merge into main",
     )
+    parser.add_argument(
+        "--validate-versions",
+        action="store_true",
+        help="Validate TOC versions for the captured base/target promotion case",
+    )
     return parser
 
 
@@ -686,6 +763,37 @@ def main(argv=None):
                 "Captured promotion target is already contained in main. "
                 "No merge commit required."
             )
+        return 0
+
+    if args.validate_versions:
+        if not args.expected_base or not args.expected_target:
+            parser.error(
+                "--validate-versions requires --expected-base and --expected-target"
+            )
+        scope = classify_git_range(args.expected_base, args.expected_target)
+        errors = validate_promotion_toc_versions(
+            scope.release_required,
+            bool(scope.merge_required),
+            args.expected_target,
+            args.expected_base,
+        )
+        authoritative = (
+            args.expected_target if (scope.release_required or scope.merge_required) else args.expected_base
+        )
+        version = read_toc_version_from_ref(authoritative)
+        print(
+            "TOC version validation: "
+            f"release_required={bool_text(scope.release_required)} "
+            f"merge_required={bool_text(scope.merge_required)}"
+        )
+        print(f"Authoritative commit: {resolve_commit(authoritative)}")
+        print(f"Version: {version}")
+        if errors:
+            for error in errors:
+                print(f"::error::{error}", file=sys.stderr)
+                print(error)
+            return 1
+        print("TOC version validation passed.")
         return 0
 
     if args.files is not None and (args.base or args.head):

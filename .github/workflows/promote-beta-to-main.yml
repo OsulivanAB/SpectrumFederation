@@ -106,30 +106,33 @@ jobs:
       - name: Validate documentation
         run: python3 .github/scripts/validate_docs.py
 
-      - name: Verify beta version format
-        if: needs.detect-promotion-scope.outputs.release_required == 'true'
+      - name: Verify promotion TOC versions
+        env:
+          PROMOTION_BASE_SHA: ${{ needs.detect-promotion-scope.outputs.promotion_base_sha }}
+          PROMOTION_TARGET_SHA: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
         run: |
-          VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
-          echo "Beta version: $VERSION"
-
-          if [[ ! "$VERSION" =~ -beta\. ]]; then
-            echo "::error ::Beta branch version must contain '-beta' suffix"
-            exit 1
-          fi
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-        id: beta_version
-
-      - name: Verify unchanged addon uses stable version
-        if: needs.detect-promotion-scope.outputs.release_required == 'false'
-        run: |
-          VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
-          echo "Unchanged addon version: $VERSION"
-
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error ::A promotion without addon changes must retain a stable X.Y.Z version"
-            exit 1
-          fi
+          set -euo pipefail
+          git fetch origin "$PROMOTION_BASE_SHA" || git fetch origin main
+          git cat-file -t "$PROMOTION_TARGET_SHA" >/dev/null || git fetch origin "$PROMOTION_TARGET_SHA"
+          mkdir -p /tmp/promotion-scope
+          materialize_scope_helper() {
+            local ref="$1"
+            git cat-file -e "$ref:.github/scripts/classify_promotion_scope.py" 2>/dev/null || return 1
+            git show "$ref:.github/scripts/classify_promotion_scope.py" \
+              > /tmp/promotion-scope/classify_promotion_scope.py
+            git show "$ref:.github/scripts/validate_packaging.py" \
+              > /tmp/promotion-scope/validate_packaging.py
+            grep -q -- '--validate-versions' /tmp/promotion-scope/classify_promotion_scope.py
+          }
+          # Prefer the captured target (this promotion) then captured main so a
+          # no-op recovery can use the helper from main when beta predates it.
+          materialize_scope_helper "$PROMOTION_TARGET_SHA" \
+            || materialize_scope_helper "$PROMOTION_BASE_SHA" \
+            || materialize_scope_helper HEAD
+          python3 /tmp/promotion-scope/classify_promotion_scope.py \
+            --validate-versions \
+            --expected-base "$PROMOTION_BASE_SHA" \
+            --expected-target "$PROMOTION_TARGET_SHA"
 
   dry-run-merge-beta-to-main:
     name: "[DRY RUN] Merge Beta to Main"
@@ -206,6 +209,16 @@ jobs:
             --expected-target "$EXPECTED_TARGET" \
             --current-base origin/main \
             --github-output
+
+      - name: Verify promotion TOC versions
+        env:
+          EXPECTED_BASE: ${{ needs.detect-promotion-scope.outputs.promotion_base_sha }}
+          EXPECTED_TARGET: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
+        run: |
+          python3 /tmp/promotion-scope/classify_promotion_scope.py \
+            --validate-versions \
+            --expected-base "$EXPECTED_BASE" \
+            --expected-target "$EXPECTED_TARGET"
 
       - name: Merge captured promotion target into main
         if: steps.merge_decision.outputs.merge_required == 'true'
@@ -887,6 +900,16 @@ jobs:
             --expected-target "$EXPECTED_TARGET" \
             --current-base origin/main \
             --github-output
+
+      - name: Verify promotion TOC versions
+        env:
+          EXPECTED_BASE: ${{ needs.detect-promotion-scope.outputs.promotion_base_sha }}
+          EXPECTED_TARGET: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
+        run: |
+          python3 /tmp/promotion-scope/classify_promotion_scope.py \
+            --validate-versions \
+            --expected-base "$EXPECTED_BASE" \
+            --expected-target "$EXPECTED_TARGET"
 
       - name: Merge captured promotion target into main
         if: steps.merge_decision.outputs.merge_required == 'true'

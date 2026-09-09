@@ -122,7 +122,7 @@ These flags are independent. Addon plus documentation is `addon_changed=true` an
 The workflow:
 
 1. classifies the incoming `main...beta` range and captures the base/target SHAs;
-2. validates lint, packaging, docs, and the appropriate version format (required on every promotion);
+2. validates lint, packaging, docs, and TOC version format. Addon releases require `X.Y.Z-beta.N` on the captured beta target. Non-addon merges require a stable `X.Y.Z` on that target so a prerelease TOC cannot be overlaid onto `main`. When the captured target is already contained in `main`, the captured main SHA is authoritative and must be stable `X.Y.Z`; the leftover beta checkout may still contain `-beta.N`;
 3. dry-runs only the applicable merge, changelog, README, docs, release, and fast-forward steps without pushing, using the captured target SHA and the same ref-drift checks as the real merge;
 4. re-verifies that `origin/main` and `origin/beta` still match the captured SHAs, then merges the captured target SHA into `main` only when that target is not already contained in `main`;
 5. when `release_required`, removes `-beta.N`, fetches the live Interface value, updates the changelog, and publishes a stable GitHub Release plus a Wago `stable` upload;

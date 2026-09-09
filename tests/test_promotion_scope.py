@@ -563,6 +563,8 @@ def test_promotion_workflow_pins_mutations_to_captured_shas():
     assert "steps.merge_decision.outputs.merge_required == 'true'" in text
     assert "Preserve current main (no merge required)" in text
     assert text.count('git commit -m "$COMMIT_MESSAGE"') == 2
+    assert "--validate-versions" in text
+    assert "A promotion without addon changes must retain a stable X.Y.Z version" not in text
 
 
 def _repo_beta_equals_main(tmp_path):
@@ -781,6 +783,192 @@ def test_cli_decide_merge_reports_contained_target(tmp_path, monkeypatch, capsys
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "already contained in main" in captured.out
+
+
+def parent_toc(version):
+    return f"## Interface: 120100\n## Version: {version}\n"
+
+
+def test_version_a_contained_prerelease_beta_accepts_stable_main(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {
+            "SpectrumFederation/Core/Foo.lua": "print('feat')\n",
+            "SpectrumFederation/SpectrumFederation.toc": parent_toc("1.4.2-beta.5"),
+        },
+        "feat: addon 1.4.2-beta.5",
+    )
+    git(repo, "checkout", "main")
+    git(repo, "merge", "--no-ff", "beta", "-m", "promote addon")
+    commit_files(
+        repo,
+        {"SpectrumFederation/SpectrumFederation.toc": parent_toc("1.4.2")},
+        "chore: stable 1.4.2",
+    )
+    git(repo, "checkout", "beta")
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.release_required is False
+    assert scope.merge_required is False
+    assert scope_mod.read_toc_version_from_ref("beta", cwd=repo) == "1.4.2-beta.5"
+    assert scope_mod.read_toc_version_from_ref("main", cwd=repo) == "1.4.2"
+    errors = scope_mod.validate_promotion_toc_versions(
+        scope.release_required,
+        scope.merge_required,
+        "beta",
+        "main",
+        cwd=repo,
+    )
+    assert errors == []
+    plan = scope_mod.plan_promotion_git_mutation("beta", "main", cwd=repo)
+    assert plan["create_merge_commit"] is False
+    assert plan["overlay_captured_target_files"] == []
+    ff_errors = scope_mod.verify_promotion_refs(
+        scope_mod.resolve_commit("main", cwd=repo),
+        scope_mod.resolve_commit("beta", cwd=repo),
+        "main",
+        "beta",
+        cwd=repo,
+        mode="fast-forward",
+        destination="main",
+    )
+    assert ff_errors == []
+
+
+def test_version_b_beta_equals_stable_main(tmp_path):
+    repo = init_repo(tmp_path)
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.release_required is False
+    assert scope.merge_required is False
+    errors = scope_mod.validate_promotion_toc_versions(
+        False, False, "beta", "main", cwd=repo
+    )
+    assert errors == []
+    assert scope_mod.read_toc_version_from_ref("main", cwd=repo) == "1.4.1"
+
+
+def test_version_c_non_addon_merge_with_stable_beta(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming docs\n"}, "docs: incoming")
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.release_required is False
+    assert scope.merge_required is True
+    errors = scope_mod.validate_promotion_toc_versions(
+        scope.release_required,
+        scope.merge_required,
+        "beta",
+        "main",
+        cwd=repo,
+    )
+    assert errors == []
+    assert scope_mod.read_toc_version_from_ref("beta", cwd=repo) == "1.4.1"
+
+
+def test_version_d_non_addon_merge_with_stale_beta_suffix_is_rejected(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {
+            "SpectrumFederation/Core/Foo.lua": "print('feat')\n",
+            "SpectrumFederation/SpectrumFederation.toc": parent_toc("1.4.2-beta.5"),
+        },
+        "feat: addon 1.4.2-beta.5",
+    )
+    git(repo, "checkout", "main")
+    git(repo, "merge", "--no-ff", "beta", "-m", "promote addon")
+    commit_files(
+        repo,
+        {"SpectrumFederation/SpectrumFederation.toc": parent_toc("1.4.2")},
+        "chore: stable 1.4.2",
+    )
+    git(repo, "checkout", "beta")
+    commit_files(repo, {"docs/index.md": "# later docs\n"}, "docs: after incomplete FF")
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.release_required is False
+    assert scope.merge_required is True
+    errors = scope_mod.validate_promotion_toc_versions(
+        scope.release_required,
+        scope.merge_required,
+        "beta",
+        "main",
+        cwd=repo,
+    )
+    assert errors
+    assert "stale release metadata" in errors[0]
+    assert "1.4.2-beta.5" in errors[0]
+
+
+def test_version_e_addon_release_requires_beta_suffix(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {
+            "SpectrumFederation/Core/Foo.lua": "print('feat')\n",
+            "SpectrumFederation/SpectrumFederation.toc": parent_toc("1.4.2-beta.5"),
+        },
+        "feat: addon 1.4.2-beta.5",
+    )
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.release_required is True
+    assert scope.merge_required is True
+    errors = scope_mod.validate_promotion_toc_versions(
+        scope.release_required,
+        scope.merge_required,
+        "beta",
+        "main",
+        cwd=repo,
+    )
+    assert errors == []
+
+
+def test_version_e_addon_release_rejects_stable_beta_toc(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {"SpectrumFederation/Core/Foo.lua": "print('feat')\n"},
+        "feat: addon without bumping to -beta",
+    )
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.release_required is True
+    errors = scope_mod.validate_promotion_toc_versions(
+        True, True, "beta", "main", cwd=repo
+    )
+    assert errors
+    assert "X.Y.Z-beta.N" in errors[0]
+
+
+def test_cli_validate_versions_accepts_noop_prerelease_beta(tmp_path, monkeypatch, capsys):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {
+            "SpectrumFederation/Core/Foo.lua": "print('feat')\n",
+            "SpectrumFederation/SpectrumFederation.toc": parent_toc("1.4.2-beta.5"),
+        },
+        "feat: addon 1.4.2-beta.5",
+    )
+    git(repo, "checkout", "main")
+    git(repo, "merge", "--no-ff", "beta", "-m", "promote addon")
+    commit_files(
+        repo,
+        {"SpectrumFederation/SpectrumFederation.toc": parent_toc("1.4.2")},
+        "chore: stable 1.4.2",
+    )
+    monkeypatch.chdir(repo)
+    exit_code = scope_mod.main(
+        [
+            "--validate-versions",
+            "--expected-base",
+            scope_mod.resolve_commit("main", cwd=repo),
+            "--expected-target",
+            scope_mod.resolve_commit("beta", cwd=repo),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "release_required=false" in captured.out
+    assert "merge_required=false" in captured.out
+    assert "1.4.2" in captured.out
 
 
 def test_cli_files_mode_prints_scope_report(capsys):
