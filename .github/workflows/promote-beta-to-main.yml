@@ -19,8 +19,10 @@ concurrency:
 # Captured promotion SHAs are invariants, not informational outputs. Later jobs
 # must re-fetch origin/main and origin/beta, verify they still match
 # promotion_base_sha / promotion_target_sha (or, for the final sync, that beta
-# has not advanced), and merge/checkout that target SHA. Do not merge, reset,
-# or force-push the live beta ref.
+# has not advanced), and merge/checkout that target SHA only when it is not
+# already contained in main. Do not merge, reset, or force-push the live beta
+# ref. An already-contained target is a valid no-op: preserve main and
+# fast-forward beta without manufacturing an empty merge commit.
 
 jobs:
   detect-promotion-scope:
@@ -41,6 +43,7 @@ jobs:
       documentation_deploy_required: ${{ steps.scope.outputs.documentation_deploy_required }}
       readme_work_required: ${{ steps.scope.outputs.readme_work_required }}
       has_incoming_changes: ${{ steps.scope.outputs.has_incoming_changes }}
+      merge_required: ${{ steps.scope.outputs.merge_required }}
 
     steps:
       - name: Checkout beta branch
@@ -143,6 +146,7 @@ jobs:
       changelog_required: ${{ needs.detect-promotion-scope.outputs.changelog_required }}
       documentation_deploy_required: ${{ needs.detect-promotion-scope.outputs.documentation_deploy_required }}
       readme_work_required: ${{ needs.detect-promotion-scope.outputs.readme_work_required }}
+      merge_required: ${{ steps.merge_decision.outputs.merge_required }}
       stable_version: ${{ steps.metadata.outputs.stable_version }}
       interface: ${{ steps.metadata.outputs.interface }}
 
@@ -168,11 +172,21 @@ jobs:
           git fetch origin main beta
           git cat-file -t "$EXPECTED_TARGET" >/dev/null || git fetch origin "$EXPECTED_TARGET"
           git cat-file -t "$EXPECTED_BASE" >/dev/null || git fetch origin "$EXPECTED_BASE"
+          git reset --hard origin/main
           mkdir -p /tmp/promotion-scope
-          git show "$EXPECTED_TARGET:.github/scripts/classify_promotion_scope.py" \
-            > /tmp/promotion-scope/classify_promotion_scope.py
-          git show "$EXPECTED_TARGET:.github/scripts/validate_packaging.py" \
-            > /tmp/promotion-scope/validate_packaging.py
+          materialize_scope_helper() {
+            local ref="$1"
+            git cat-file -e "$ref:.github/scripts/classify_promotion_scope.py" 2>/dev/null || return 1
+            git show "$ref:.github/scripts/classify_promotion_scope.py" \
+              > /tmp/promotion-scope/classify_promotion_scope.py
+            git show "$ref:.github/scripts/validate_packaging.py" \
+              > /tmp/promotion-scope/validate_packaging.py
+            grep -q -- '--decide-merge' /tmp/promotion-scope/classify_promotion_scope.py
+          }
+          # Prefer verified origin/main so a no-op recovery can use --decide-merge
+          # even when the captured target predates that helper. Fall back to the
+          # captured target for the first promotion of this helper onto main.
+          materialize_scope_helper HEAD || materialize_scope_helper "$EXPECTED_TARGET"
           python3 /tmp/promotion-scope/classify_promotion_scope.py \
             --verify-refs \
             --expected-base "$EXPECTED_BASE" \
@@ -180,9 +194,21 @@ jobs:
             --current-base origin/main \
             --current-target origin/beta \
             --mode merge
-          git reset --hard origin/main
+
+      - name: Decide whether a merge commit is required
+        id: merge_decision
+        env:
+          EXPECTED_TARGET: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
+        run: |
+          set -euo pipefail
+          python3 /tmp/promotion-scope/classify_promotion_scope.py \
+            --decide-merge \
+            --expected-target "$EXPECTED_TARGET" \
+            --current-base origin/main \
+            --github-output
 
       - name: Merge captured promotion target into main
+        if: steps.merge_decision.outputs.merge_required == 'true'
         env:
           EXPECTED_TARGET: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
         run: |
@@ -208,6 +234,18 @@ jobs:
             COMMIT_MESSAGE="chore: promote non-addon changes to main [skip ci]"
           fi
           git commit -m "$COMMIT_MESSAGE"
+
+      - name: Preserve current main (no merge required)
+        if: steps.merge_decision.outputs.merge_required != 'true'
+        run: |
+          echo "Captured promotion target is already contained in origin/main."
+          echo "No merge commit required. Preserving the current main tree."
+          echo "CHANGELOG.md, README.md, and TOC files are not overlaid from beta."
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Working tree is dirty on a no-op merge; refusing to continue"
+            git status
+            exit 1
+          fi
 
       - name: Set up Python
         if: needs.detect-promotion-scope.outputs.release_required == 'true'
@@ -591,6 +629,7 @@ jobs:
           CHANGELOG_REQUIRED: ${{ needs.detect-promotion-scope.outputs.changelog_required }}
           DOCS_DEPLOY_REQUIRED: ${{ needs.detect-promotion-scope.outputs.documentation_deploy_required }}
           README_WORK_REQUIRED: ${{ needs.detect-promotion-scope.outputs.readme_work_required }}
+          MERGE_REQUIRED: ${{ needs.detect-promotion-scope.outputs.merge_required }}
           PROMOTION_TYPE: ${{ needs.detect-promotion-scope.outputs.promotion_type }}
           PROMOTION_BASE_SHA: ${{ needs.detect-promotion-scope.outputs.promotion_base_sha }}
           PROMOTION_TARGET_SHA: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
@@ -693,6 +732,7 @@ jobs:
             echo "| README work required | $(yes_no "$README_WORK_REQUIRED") |"
             echo "| Stable addon release | $(yes_no "$RELEASE_REQUIRED") |"
             echo "| Documentation deployment | $(yes_no "$DOCS_DEPLOY_REQUIRED") |"
+            echo "| Merge commit required | $(yes_no "$MERGE_REQUIRED") |"
             echo "| Stable version | $STABLE_VERSION |"
             echo "| Interface version | $INTERFACE |"
             echo ""
@@ -779,6 +819,7 @@ jobs:
       changelog_required: ${{ needs.detect-promotion-scope.outputs.changelog_required }}
       documentation_deploy_required: ${{ needs.detect-promotion-scope.outputs.documentation_deploy_required }}
       readme_work_required: ${{ needs.detect-promotion-scope.outputs.readme_work_required }}
+      merge_required: ${{ steps.merge_decision.outputs.merge_required }}
       stable_version: ${{ steps.metadata.outputs.stable_version }}
       interface: ${{ steps.metadata.outputs.interface }}
 
@@ -812,11 +853,21 @@ jobs:
           git fetch origin main beta
           git cat-file -t "$EXPECTED_TARGET" >/dev/null || git fetch origin "$EXPECTED_TARGET"
           git cat-file -t "$EXPECTED_BASE" >/dev/null || git fetch origin "$EXPECTED_BASE"
+          git reset --hard origin/main
           mkdir -p /tmp/promotion-scope
-          git show "$EXPECTED_TARGET:.github/scripts/classify_promotion_scope.py" \
-            > /tmp/promotion-scope/classify_promotion_scope.py
-          git show "$EXPECTED_TARGET:.github/scripts/validate_packaging.py" \
-            > /tmp/promotion-scope/validate_packaging.py
+          materialize_scope_helper() {
+            local ref="$1"
+            git cat-file -e "$ref:.github/scripts/classify_promotion_scope.py" 2>/dev/null || return 1
+            git show "$ref:.github/scripts/classify_promotion_scope.py" \
+              > /tmp/promotion-scope/classify_promotion_scope.py
+            git show "$ref:.github/scripts/validate_packaging.py" \
+              > /tmp/promotion-scope/validate_packaging.py
+            grep -q -- '--decide-merge' /tmp/promotion-scope/classify_promotion_scope.py
+          }
+          # Prefer verified origin/main so a no-op recovery can use --decide-merge
+          # even when the captured target predates that helper. Fall back to the
+          # captured target for the first promotion of this helper onto main.
+          materialize_scope_helper HEAD || materialize_scope_helper "$EXPECTED_TARGET"
           python3 /tmp/promotion-scope/classify_promotion_scope.py \
             --verify-refs \
             --expected-base "$EXPECTED_BASE" \
@@ -824,9 +875,21 @@ jobs:
             --current-base origin/main \
             --current-target origin/beta \
             --mode merge
-          git reset --hard origin/main
+
+      - name: Decide whether a merge commit is required
+        id: merge_decision
+        env:
+          EXPECTED_TARGET: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
+        run: |
+          set -euo pipefail
+          python3 /tmp/promotion-scope/classify_promotion_scope.py \
+            --decide-merge \
+            --expected-target "$EXPECTED_TARGET" \
+            --current-base origin/main \
+            --github-output
 
       - name: Merge captured promotion target into main
+        if: steps.merge_decision.outputs.merge_required == 'true'
         env:
           EXPECTED_TARGET: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
         run: |
@@ -852,6 +915,18 @@ jobs:
             COMMIT_MESSAGE="chore: promote non-addon changes to main [skip ci]"
           fi
           git commit -m "$COMMIT_MESSAGE"
+
+      - name: Preserve current main (no merge required)
+        if: steps.merge_decision.outputs.merge_required != 'true'
+        run: |
+          echo "Captured promotion target is already contained in origin/main."
+          echo "No merge commit required. Preserving the current main tree."
+          echo "CHANGELOG.md, README.md, and TOC files are not overlaid from beta."
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Working tree is dirty on a no-op merge; refusing to continue"
+            git status
+            exit 1
+          fi
 
       - name: Set up Python
         if: needs.detect-promotion-scope.outputs.release_required == 'true'
@@ -1203,6 +1278,7 @@ jobs:
           CHANGELOG_REQUIRED: ${{ needs.detect-promotion-scope.outputs.changelog_required }}
           DOCS_DEPLOY_REQUIRED: ${{ needs.detect-promotion-scope.outputs.documentation_deploy_required }}
           README_WORK_REQUIRED: ${{ needs.detect-promotion-scope.outputs.readme_work_required }}
+          MERGE_REQUIRED: ${{ needs.detect-promotion-scope.outputs.merge_required }}
           PROMOTION_TYPE: ${{ needs.detect-promotion-scope.outputs.promotion_type }}
           PROMOTION_BASE_SHA: ${{ needs.detect-promotion-scope.outputs.promotion_base_sha }}
           PROMOTION_TARGET_SHA: ${{ needs.detect-promotion-scope.outputs.promotion_target_sha }}
@@ -1296,6 +1372,7 @@ jobs:
             echo "| Changelog | — | $(yes_no "$CHANGELOG_REQUIRED") | $CHANGELOG_RESULT |"
             echo ""
             echo "**Promotion type**: ${PROMOTION_TYPE:-unknown}"
+            echo "**Merge commit required**: $(yes_no "$MERGE_REQUIRED")"
             echo "**Base SHA**: ${PROMOTION_BASE_SHA:-unknown}"
             echo "**Target SHA**: ${PROMOTION_TARGET_SHA:-unknown}"
             echo "**Stable version**: $STABLE_VERSION"
@@ -1303,7 +1380,7 @@ jobs:
             echo ""
             echo "### Job Results"
             echo ""
-            echo "- $MERGE_STATUS Merged beta → main"
+            echo "- $MERGE_STATUS Merged beta → main (or preserved main when already contained)"
             echo "- $CHANGELOG_STATUS Updated CHANGELOG.md"
             echo "- $README_STATUS Updated README badges"
             echo "- $DOCS_STATUS Deployed documentation"

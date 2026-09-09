@@ -84,7 +84,7 @@ Deterministic range, validation, and write-safety behavior is covered by `tests/
 
 `.github/workflows/promote-beta-to-main.yml` is manually dispatched with no inputs. Every run performs a complete local dry-run phase first. The actual phase starts automatically only if all required dry-run jobs succeed, including jobs that were skipped because they were not applicable.
 
-Branch promotion and downstream publishing are separate decisions. Every valid dispatch still promotes the captured `beta` SHA into `main` and fast-forwards `beta` onto the new `main` when remote `beta` has not advanced. Changelog generation, README badge work, stable addon publishing, and MkDocs deployment run only when the promotion scope says they are applicable.
+Branch promotion and downstream publishing are separate decisions. Every valid dispatch still promotes the captured `beta` SHA into `main` when that SHA is not already contained in `main`, and fast-forwards `beta` onto current `main` when remote `beta` has not advanced. If the captured target is already an ancestor of `main`, the merge is a no-op: `main` is preserved and `beta` can catch up without an empty promotion commit. Changelog generation, README badge work, stable addon publishing, and MkDocs deployment run only when the promotion scope says they are applicable.
 
 ### How promotion scope is determined
 
@@ -94,7 +94,7 @@ The first job captures an immutable range and classifies it with `.github/script
 2. `promotion_target_sha` is the `beta` HEAD at workflow start.
 3. Changed files are `git diff --name-only` from `merge-base(base, target)` to `target` (`origin/main...beta`). That is the incoming promotion, not later workflow-generated commits.
 
-Before the dry-run merge, the real merge, and the final beta sync, the workflow re-fetches `origin/main` and `origin/beta` and verifies them with `classify_promotion_scope.py --verify-refs`. Merge and file checkouts use the captured target SHA, not the live `beta` ref. If either branch has moved, the job fails and tells the maintainer to rerun the promotion so scope and mutation stay aligned.
+Before the dry-run merge, the real merge, and the final beta sync, the workflow re-fetches `origin/main` and `origin/beta` and verifies them with `classify_promotion_scope.py --verify-refs`. Git ancestry, via `--decide-merge`, then decides whether a merge commit is required. `has_incoming_changes` is a changed-file classification and is not used as the merge skip switch. When the captured target is not already contained in `main`, merge and file checkouts use that target SHA, not the live `beta` ref. When it is already contained, the workflow does not manufacture an empty merge commit and does not overlay CHANGELOG/README/TOC files from the older beta target. If either branch has moved unexpectedly, the job fails and tells the maintainer to rerun the promotion so scope and mutation stay aligned.
 
 The script is the source of truth for path classification. Update it when packaged addon roots, zip excludes, or MkDocs inputs change. It does not use AI.
 
@@ -124,7 +124,7 @@ The workflow:
 1. classifies the incoming `main...beta` range and captures the base/target SHAs;
 2. validates lint, packaging, docs, and the appropriate version format (required on every promotion);
 3. dry-runs only the applicable merge, changelog, README, docs, release, and fast-forward steps without pushing, using the captured target SHA and the same ref-drift checks as the real merge;
-4. re-verifies that `origin/main` and `origin/beta` still match the captured SHAs, then merges the captured target SHA into `main`;
+4. re-verifies that `origin/main` and `origin/beta` still match the captured SHAs, then merges the captured target SHA into `main` only when that target is not already contained in `main`;
 5. when `release_required`, removes `-beta.N`, fetches the live Interface value, updates the changelog, and publishes a stable GitHub Release plus a Wago `stable` upload;
 6. when `readme_work_required`, updates README badges;
 7. when `documentation_deploy_required`, deploys MkDocs from `main`;

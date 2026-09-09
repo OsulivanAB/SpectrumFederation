@@ -559,6 +559,228 @@ def test_promotion_workflow_pins_mutations_to_captured_shas():
     assert text.count("\n          ref: beta\n") == 1
     assert "needs.detect-promotion-scope.outputs.promotion_target_sha" in text
     assert "was not required but ran with result" in text
+    assert "--decide-merge" in text
+    assert "steps.merge_decision.outputs.merge_required == 'true'" in text
+    assert "Preserve current main (no merge required)" in text
+    assert text.count('git commit -m "$COMMIT_MESSAGE"') == 2
+
+
+def _repo_beta_equals_main(tmp_path):
+    return init_repo(tmp_path)
+
+
+def _repo_beta_behind_main(tmp_path, generated_on_main=True):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# B on beta\n"}, "docs: B")
+    git(repo, "checkout", "main")
+    git(repo, "merge", "--no-ff", "beta", "-m", "promote B")
+    if generated_on_main:
+        commit_files(
+            repo,
+            {
+                "CHANGELOG.md": "# Changelog\n\n## generated on main\n",
+                "README.md": "# README generated on main\n",
+                "SpectrumFederation/SpectrumFederation.toc": (
+                    "## Version: 1.4.1\n## Interface: 120100\n"
+                ),
+                "SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc": (
+                    "## Version: 1.4.1\n## Interface: 120100\n"
+                ),
+                "SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc": (
+                    "## Version: 1.4.1\n## Interface: 120100\n"
+                ),
+            },
+            "docs: generated main state",
+        )
+    git(repo, "checkout", "beta")
+    return repo
+
+
+def test_case_a_beta_equals_main_does_not_require_merge(tmp_path):
+    repo = _repo_beta_equals_main(tmp_path)
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.has_incoming_changes is False
+    assert scope.merge_required is False
+    assert scope.release_required is False
+    base, target = _captured_shas(repo)
+    assert scope_mod.verify_promotion_refs(
+        base, target, "main", "beta", cwd=repo, mode="merge"
+    ) == []
+    plan = scope_mod.plan_promotion_git_mutation("beta", "main", cwd=repo)
+    assert plan["merge_required"] is False
+    assert plan["create_merge_commit"] is False
+    assert plan["overlay_captured_target_files"] == []
+    ff_errors = scope_mod.verify_promotion_refs(
+        base,
+        target,
+        "main",
+        "beta",
+        cwd=repo,
+        mode="fast-forward",
+        destination="main",
+    )
+    assert ff_errors == []
+
+
+def test_case_b_beta_behind_main_does_not_require_merge(tmp_path):
+    repo = _repo_beta_behind_main(tmp_path, generated_on_main=False)
+    git(repo, "checkout", "main")
+    main_sha = scope_mod.resolve_commit("HEAD", cwd=repo)
+    git(repo, "checkout", "beta")
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.has_incoming_changes is False
+    assert scope.merge_required is False
+    plan = scope_mod.plan_promotion_git_mutation("beta", "main", cwd=repo)
+    assert plan["merge_required"] is False
+    assert plan["overlay_captured_target_files"] == []
+    git(repo, "checkout", "main")
+    assert scope_mod.resolve_commit("HEAD", cwd=repo) == main_sha
+    assert scope_mod.git_is_ancestor("beta", "main", cwd=repo)
+
+
+def test_case_b_fast_forward_allows_beta_to_catch_up(tmp_path):
+    repo = _repo_beta_behind_main(tmp_path, generated_on_main=False)
+    git(repo, "checkout", "beta")
+    expected_base = scope_mod.resolve_commit("main", cwd=repo)
+    expected_target = scope_mod.resolve_commit("beta", cwd=repo)
+    errors = scope_mod.verify_promotion_refs(
+        expected_base,
+        expected_target,
+        "main",
+        "beta",
+        cwd=repo,
+        mode="merge",
+    )
+    assert errors == []
+    ff_errors = scope_mod.verify_promotion_refs(
+        expected_base,
+        expected_target,
+        "main",
+        "beta",
+        cwd=repo,
+        mode="fast-forward",
+        destination="main",
+    )
+    assert ff_errors == []
+    assert scope_mod.git_is_ancestor("beta", "main", cwd=repo)
+
+
+def test_case_c_noop_does_not_restore_older_beta_generated_files(tmp_path):
+    repo = _repo_beta_behind_main(tmp_path, generated_on_main=True)
+    git(repo, "checkout", "beta")
+    beta_changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    beta_readme = (repo / "README.md").read_text(encoding="utf-8")
+    beta_toc = (repo / "SpectrumFederation" / "SpectrumFederation.toc").read_text(
+        encoding="utf-8"
+    )
+    git(repo, "checkout", "main")
+    main_changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    main_readme = (repo / "README.md").read_text(encoding="utf-8")
+    main_toc = (repo / "SpectrumFederation" / "SpectrumFederation.toc").read_text(
+        encoding="utf-8"
+    )
+    assert main_changelog != beta_changelog
+    assert main_readme != beta_readme
+    assert main_toc != beta_toc
+    plan = scope_mod.plan_promotion_git_mutation("beta", "main", cwd=repo)
+    assert plan["merge_required"] is False
+    assert plan["overlay_captured_target_files"] == []
+    assert (repo / "CHANGELOG.md").read_text(encoding="utf-8") == main_changelog
+    assert (repo / "README.md").read_text(encoding="utf-8") == main_readme
+    assert (
+        repo / "SpectrumFederation" / "SpectrumFederation.toc"
+    ).read_text(encoding="utf-8") == main_toc
+
+
+def test_case_d_genuine_incoming_beta_work_still_requires_merge(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.docs_changed is True
+    assert scope.merge_required is True
+    plan = scope_mod.plan_promotion_git_mutation("beta", "main", cwd=repo)
+    assert plan["merge_required"] is True
+    assert plan["create_merge_commit"] is True
+    assert plan["overlay_captured_target_files"] == list(
+        scope_mod.PROMOTION_MERGE_OVERLAY_PATHS
+    )
+    base, target = _captured_shas(repo)
+    assert scope_mod.verify_promotion_refs(
+        base, target, "main", "beta", cwd=repo, mode="merge"
+    ) == []
+
+
+def test_case_e_beta_advance_during_noop_refuses_fast_forward(tmp_path):
+    repo = _repo_beta_behind_main(tmp_path, generated_on_main=True)
+    expected_base = scope_mod.resolve_commit("main", cwd=repo)
+    expected_target = scope_mod.resolve_commit("beta", cwd=repo)
+    git(repo, "checkout", "beta")
+    commit_files(repo, {"docs/index.md": "# newer beta\n"}, "docs: newer beta")
+    newer = scope_mod.resolve_commit("beta", cwd=repo)
+    errors = scope_mod.verify_promotion_refs(
+        expected_base,
+        expected_target,
+        "main",
+        "beta",
+        cwd=repo,
+        mode="fast-forward",
+        destination="main",
+    )
+    assert any("Refusing to overwrite newer beta work" in error for error in errors)
+    assert scope_mod.resolve_commit("beta", cwd=repo) == newer
+
+
+def test_case_f_unexpected_main_move_still_fails_closed_on_noop_graph(tmp_path):
+    repo = _repo_beta_behind_main(tmp_path, generated_on_main=True)
+    expected_base = scope_mod.resolve_commit("main", cwd=repo)
+    expected_target = scope_mod.resolve_commit("beta", cwd=repo)
+    git(repo, "checkout", "main")
+    commit_files(
+        repo,
+        {".github/workflows/promote-beta-to-main.yml": "name: unexpected main\n"},
+        "ci: unexpected main change",
+    )
+    errors = scope_mod.verify_promotion_refs(
+        expected_base,
+        expected_target,
+        "main",
+        "beta",
+        cwd=repo,
+        mode="merge",
+    )
+    assert any("origin/main has moved" in error for error in errors)
+    plan = scope_mod.plan_promotion_git_mutation(expected_target, "main", cwd=repo)
+    assert plan["merge_required"] is False
+
+
+def test_empty_beta_commit_requires_merge_even_without_incoming_files(tmp_path):
+    repo = init_repo(tmp_path)
+    git(repo, "commit", "--allow-empty", "-m", "empty beta commit")
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.has_incoming_changes is False
+    assert scope.merge_required is True
+    plan = scope_mod.plan_promotion_git_mutation("beta", "main", cwd=repo)
+    assert plan["merge_required"] is True
+    assert plan["overlay_captured_target_files"] == list(
+        scope_mod.PROMOTION_MERGE_OVERLAY_PATHS
+    )
+
+
+def test_cli_decide_merge_reports_contained_target(tmp_path, monkeypatch, capsys):
+    repo = _repo_beta_behind_main(tmp_path, generated_on_main=False)
+    monkeypatch.chdir(repo)
+    exit_code = scope_mod.main(
+        [
+            "--decide-merge",
+            "--expected-target",
+            scope_mod.resolve_commit("beta", cwd=repo),
+            "--current-base",
+            "main",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "already contained in main" in captured.out
 
 
 def test_cli_files_mode_prints_scope_report(capsys):

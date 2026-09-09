@@ -123,6 +123,7 @@ class PromotionScope:
     readme_files: list[str] = field(default_factory=list)
     changelog_files: list[str] = field(default_factory=list)
     infra_files: list[str] = field(default_factory=list)
+    merge_required: bool | None = None
 
     @property
     def addon_changed(self):
@@ -147,6 +148,17 @@ class PromotionScope:
     @property
     def has_incoming_changes(self):
         return bool(self.files)
+
+    @property
+    def target_contained_in_main(self):
+        """True when git ancestry says the captured target is already in main.
+
+        Distinct from has_incoming_changes, which is a changed-file classification.
+        None when ancestry was not computed (explicit --files mode).
+        """
+        if self.merge_required is None:
+            return None
+        return not self.merge_required
 
     @property
     def release_required(self):
@@ -264,12 +276,14 @@ def classify_git_range(base, head, cwd=None):
     base_sha = resolve_commit(base, cwd=cwd)
     head_sha = resolve_commit(head, cwd=cwd)
     files, merge_base_sha = collect_changed_files(base_sha, head_sha, cwd=cwd)
-    return classify_files(
+    scope = classify_files(
         files,
         base_sha=base_sha,
         target_sha=head_sha,
         merge_base_sha=merge_base_sha,
     )
+    scope.merge_required = promotion_merge_required(head_sha, base_sha, cwd=cwd)
+    return scope
 
 
 def git_is_ancestor(ancestor, descendant, cwd=None):
@@ -369,6 +383,50 @@ def verify_promotion_refs(
     return errors
 
 
+PROMOTION_MERGE_OVERLAY_PATHS = (
+    "CHANGELOG.md",
+    "README.md",
+    "SpectrumFederation/SpectrumFederation.toc",
+    "SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc",
+    "SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc",
+)
+
+
+def captured_target_contained_in_main(target, main, cwd=None):
+    """Return True when the captured promotion target is already in main's history.
+
+    A commit is an ancestor of itself, so beta == main is contained.
+    """
+    return git_is_ancestor(target, main, cwd=cwd)
+
+
+def promotion_merge_required(target, main, cwd=None):
+    """Return True when main still needs a merge of the captured target SHA."""
+    return not captured_target_contained_in_main(target, main, cwd=cwd)
+
+
+def plan_promotion_git_mutation(target, main, cwd=None):
+    """Return whether to merge/overlay the captured target onto verified main.
+
+    Ancestry decides this, not has_incoming_changes. When the target is already
+    contained in main, overlays must not restore older beta copies of generated
+    CHANGELOG/README/TOC files.
+    """
+    target_sha = resolve_commit(target, cwd=cwd)
+    main_sha = resolve_commit(main, cwd=cwd)
+    merge_required = promotion_merge_required(target_sha, main_sha, cwd=cwd)
+    return {
+        "merge_required": merge_required,
+        "target_contained_in_main": not merge_required,
+        "target_sha": target_sha,
+        "main_sha": main_sha,
+        "create_merge_commit": merge_required,
+        "overlay_captured_target_files": (
+            list(PROMOTION_MERGE_OVERLAY_PATHS) if merge_required else []
+        ),
+    }
+
+
 def bool_text(value):
     """Return GitHub Actions-friendly true/false."""
     return "true" if value else "false"
@@ -403,6 +461,7 @@ def format_scope_report(scope):
         f"Merge-base SHA:             {scope.promotion_merge_base_sha or '(file list)'}",
         f"Promotion type:             {scope.promotion_type}",
         f"Incoming changes:           {yes_no(scope.has_incoming_changes)} ({len(scope.files)} files)",
+        f"Merge commit required:      {yes_no(scope.merge_required) if scope.merge_required is not None else '(file list)'}",
         f"Addon changes:              {yes_no(scope.addon_changed)}",
         f"Documentation changes:      {yes_no(scope.docs_changed)}",
         f"README changed:             {yes_no(scope.readme_changed)}",
@@ -447,6 +506,12 @@ def write_github_output(scope, output_path):
         )
         handle.write(f"readme_work_required={bool_text(scope.readme_work_required)}\n")
         handle.write(f"has_incoming_changes={bool_text(scope.has_incoming_changes)}\n")
+        if scope.merge_required is not None:
+            handle.write(f"merge_required={bool_text(scope.merge_required)}\n")
+            handle.write(
+                "target_contained_in_main="
+                f"{bool_text(scope.target_contained_in_main)}\n"
+            )
 
 
 def job_outcome_ok(required, result):
@@ -558,6 +623,11 @@ def build_parser():
         "--fast-forward-to",
         help="Destination commit beta should fast-forward to (usually origin/main)",
     )
+    parser.add_argument(
+        "--decide-merge",
+        action="store_true",
+        help="Decide whether the captured target still needs a merge into main",
+    )
     return parser
 
 
@@ -589,6 +659,33 @@ def main(argv=None):
             )
         else:
             print("Captured promotion refs still match origin/main and origin/beta.")
+        return 0
+
+    if args.decide_merge:
+        if not args.expected_target:
+            parser.error("--decide-merge requires --expected-target")
+        plan = plan_promotion_git_mutation(args.expected_target, args.current_base)
+        if args.github_output:
+            output_path = os.environ.get("GITHUB_OUTPUT")
+            if not output_path:
+                print("::error::GITHUB_OUTPUT is not set", file=sys.stderr)
+                return 1
+            with Path(output_path).open("a", encoding="utf-8") as handle:
+                handle.write(f"merge_required={bool_text(plan['merge_required'])}\n")
+                handle.write(
+                    "target_contained_in_main="
+                    f"{bool_text(plan['target_contained_in_main'])}\n"
+                )
+        if plan["merge_required"]:
+            print(
+                "Captured promotion target is not contained in main. "
+                "Merge commit required."
+            )
+        else:
+            print(
+                "Captured promotion target is already contained in main. "
+                "No merge commit required."
+            )
         return 0
 
     if args.files is not None and (args.base or args.head):
