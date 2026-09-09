@@ -354,21 +354,36 @@ local function PackLocals(memberIds, localArmor, localOrigin)
         end
     end
 
-    local function packFamily(usages, familyOcc)
+    -- Place each usage in its original slot when that slot is free. Chronological
+    -- order only decides who wins a contested slot; leftovers spill to the other
+    -- family slot, then overflow. Compact-to-front packing would remap a lone
+    -- Ring2/Trinket2 onto Slot 1 so a later click on the displayed slot could not
+    -- clear the original usage.
+    local function packFamily(usages, familyOcc, slotIndex)
         table.sort(usages, CompareOrigin)
         for i = 1, #usages do
-            if i == 1 then
-                familyOcc.occupied[1] = true
-            elseif i == 2 then
-                familyOcc.occupied[2] = true
+            local preferred = slotIndex[usages[i].slot]
+            local placed = false
+            if preferred and not familyOcc.occupied[preferred] then
+                familyOcc.occupied[preferred] = true
+                placed = true
             else
+                for idx = 1, 2 do
+                    if not familyOcc.occupied[idx] then
+                        familyOcc.occupied[idx] = true
+                        placed = true
+                        break
+                    end
+                end
+            end
+            if not placed then
                 familyOcc.overflow = familyOcc.overflow + 1
             end
         end
     end
 
-    packFamily(ringUsages, occ.ring)
-    packFamily(trinketUsages, occ.trinket)
+    packFamily(ringUsages, occ.ring, RING_INDEX)
+    packFamily(trinketUsages, occ.trinket, TRINKET_INDEX)
     return occ
 end
 

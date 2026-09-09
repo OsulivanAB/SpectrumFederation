@@ -550,6 +550,42 @@ local root = replay.identityOf[ALT_A][1]
 assertTrue(replay.overflowByIdentity[root], "third ring usage is overflow")
 
 resetEnv()
+profile = makeProfile("PreserveRingSlots")
+addMember(profile, ALT_A)
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Ring2",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000300 })
+profile:ApplyIdentityProjection()
+assertFalse(armorOf(profile, ALT_A, "Ring1"), "lone Ring2 usage does not remap onto Ring1")
+assertTrue(armorOf(profile, ALT_A, "Ring2"), "lone Ring2 usage stays on Ring2")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring2", { profile = profile }), "clearing displayed Ring2")
+assertFalse(armorOf(profile, ALT_A, "Ring2"), "original Ring2 usage can be cleared")
+assertFalse(armorOf(profile, ALT_A, "Ring1"), "clearing Ring2 does not occupy Ring1")
+
+resetEnv()
+profile = makeProfile("DistinctRingSlots")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Ring2",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000200 })
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_B,
+    slot = "Ring1",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000300 })
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "link distinct ring slots")
+assertTrue(armorOf(profile, ALT_A, "Ring1"), "B's Ring1 stays projected Ring1")
+assertTrue(armorOf(profile, ALT_A, "Ring2"), "A's earlier Ring2 stays projected Ring2")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring2", { profile = profile }), "clear displayed Ring2")
+assertTrue(armorOf(profile, ALT_A, "Ring1"), "clearing Ring2 leaves Ring1 occupied")
+assertFalse(armorOf(profile, ALT_A, "Ring2"), "displayed Ring2 is cleared")
+
+resetEnv()
 profile = makeProfile("ManualSlots")
 addMember(profile, ALT_A)
 addMember(profile, ALT_B)
