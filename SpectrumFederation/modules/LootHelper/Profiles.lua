@@ -802,11 +802,70 @@ function LootProfile:IsEffectiveOwner(memberId)
     if self:IsOwner(memberId) then
         return true
     end
-    local Identity = SF.LootHelperIdentity
-    if not Identity or not Identity.SameIdentity then
+    return self:AreSameIdentity(self._owner, memberId)
+end
+
+function LootProfile:IsCurrentUserEffectiveOwner()
+    local currentUser = SF:GetPlayerFullIdentifier()
+    if not currentUser then
         return false
     end
-    return Identity.SameIdentity(self._lootLogs, self._owner, memberId)
+    return self:IsEffectiveOwner(currentUser)
+end
+
+function LootProfile:GetIdentityProjection()
+    if self._identityProjection then
+        return self._identityProjection
+    end
+    return self:ApplyIdentityProjection({ force = true })
+end
+
+function LootProfile:GetIdentityMembers(memberId)
+    local Identity = SF.LootHelperIdentity
+    memberId = NormalizeMemberId(memberId)
+    if not memberId then
+        return {}
+    end
+    local result = self:GetIdentityProjection()
+    if Identity and Identity.ComponentMembers then
+        return Identity.ComponentMembers(self._lootLogs, memberId, result)
+    end
+    return { memberId }
+end
+
+function LootProfile:AreSameIdentity(memberA, memberB)
+    local Identity = SF.LootHelperIdentity
+    if not Identity or not Identity.SameIdentity then
+        return SameMember(NormalizeMemberId(memberA), NormalizeMemberId(memberB))
+    end
+    return Identity.SameIdentity(self._lootLogs, memberA, memberB, self:GetIdentityProjection())
+end
+
+function LootProfile:GetIdentityPoints(memberId)
+    memberId = NormalizeMemberId(memberId)
+    local result = self:GetIdentityProjection()
+    if memberId and result and result.points then
+        return result.points[memberId] or 0
+    end
+    return 0
+end
+
+function LootProfile:GetIdentityAttendance(memberId)
+    memberId = NormalizeMemberId(memberId)
+    local result = self:GetIdentityProjection()
+    if memberId and result and result.attendance then
+        return result.attendance[memberId] or 0
+    end
+    return 0
+end
+
+function LootProfile:GetIdentityArmor(memberId)
+    memberId = NormalizeMemberId(memberId)
+    local result = self:GetIdentityProjection()
+    if memberId and result and result.armor then
+        return result.armor[memberId] or {}
+    end
+    return {}
 end
 
 function LootProfile:IsCurrentUserEffectiveOwner()
@@ -1704,11 +1763,22 @@ function LootProfile:_InsertLog(lootLog, opts)
         return false
     end
 
-    if opts.requireAdmin and not CurrentUserHasEffectiveLocalAdmin(self) then
-        if SF.Debug then
-            SF.Debug("LootProfile", "_InsertLog: Current user is not an admin; cannot add loot log entries")
+    if opts.requireAdmin then
+        local eventType = lootLog.GetEventType and lootLog:GetEventType() or lootLog._eventType
+        local isLootMode = eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.LOOT_MODE_CHANGE)
+        if isLootMode then
+            if not CurrentUserHasEffectiveLocalOwner(self) then
+                if SF.Debug then
+                    SF.Debug("LootProfile", "_InsertLog: Current user is not an effective owner; cannot add loot mode entries")
+                end
+                return false
+            end
+        elseif not CurrentUserHasEffectiveLocalAdmin(self) then
+            if SF.Debug then
+                SF.Debug("LootProfile", "_InsertLog: Current user is not an admin; cannot add loot log entries")
+            end
+            return false
         end
-        return false
     end
 
     self._lootLogs = self._lootLogs or {}
@@ -1731,6 +1801,7 @@ function LootProfile:_InsertLog(lootLog, opts)
     self._logIndex[id] = true
     self._logById[id] = lootLog
     self._logFingerprintIndex[id] = lootLog:GetFingerprint()
+    local previousLast = self._lootLogs[#self._lootLogs]
     table.insert(self._lootLogs, lootLog)
     
     -- Keep authorCounters synced to max seen
@@ -1754,13 +1825,25 @@ function LootProfile:_InsertLog(lootLog, opts)
         self._rcAwardIndex[data.awardKey] = id
     end
 
-    table.sort(self._lootLogs, function(a, b)
-        return self:_CompareLogs(a, b)
-    end)
-    self:_RefreshLogPositionIndex()
+    if not previousLast or self:_CompareLogs(previousLast, lootLog) then
+        self._logPositionIndex = self._logPositionIndex or {}
+        self._logPositionIndex[id] = #self._lootLogs
+    else
+        table.sort(self._lootLogs, function(a, b)
+            return self:_CompareLogs(a, b)
+        end)
+        self:_RefreshLogPositionIndex()
+    end
     self:_MarkIntegritySummaryDirty()
-    if self.ApplyIdentityProjection then
-        self:ApplyIdentityProjection()
+    local Identity = SF.LootHelperIdentity
+    if Identity and Identity.AffectsProjection and Identity.AffectsProjection(eventType) then
+        if Identity.CanFanOutBalance and Identity.CanFanOutBalance(eventType)
+            and Identity.FanOutBalance and Identity.FanOutBalance(self, lootLog)
+        then
+            -- Cached identity totals were updated in O(identity size).
+        else
+            self:ApplyIdentityProjection({ force = true })
+        end
     end
 
     return true
@@ -2060,10 +2143,17 @@ function LootProfile:TransferMemberHistory()
     return false, "Main Swap has been replaced by Linked Characters."
 end
 
-function LootProfile:ApplyIdentityProjection()
+function LootProfile:ApplyIdentityProjection(opts)
+    opts = opts or {}
     local Identity = SF.LootHelperIdentity
     if not Identity or not Identity.ApplyToProfileMembers then
         return nil
+    end
+    if not opts.force and self._identityProjection then
+        if Identity.WriteProjection then
+            Identity.WriteProjection(self, self._identityProjection)
+        end
+        return self._identityProjection
     end
     return Identity.ApplyToProfileMembers(self)
 end
@@ -2097,9 +2187,13 @@ function LootProfile:LinkCharacters(memberA, memberB, opts)
     end
 
     local Identity = SF.LootHelperIdentity
-    if Identity and Identity.SameIdentity and Identity.SameIdentity(self._lootLogs, memberA, memberB) then
+    if self:AreSameIdentity(memberA, memberB) then
         return false, "Those characters are already linked."
     end
+
+    local before = self._identityProjection
+    local overflowA = Identity and Identity.ComponentHasOverflow and Identity.ComponentHasOverflow(before, memberA)
+    local overflowB = Identity and Identity.ComponentHasOverflow and Identity.ComponentHasOverflow(before, memberB)
 
     local adminMembersAtLink = {}
     if Identity and Identity.ComponentAdmins then
@@ -2127,20 +2221,29 @@ function LootProfile:LinkCharacters(memberA, memberB, opts)
         return false, "Failed to record character link."
     end
 
-    local result = self:ApplyIdentityProjection()
-    if result and result.overflowByIdentity then
-        local group = result.identityOf and result.identityOf[memberA]
-        local root = group and group[1]
-        if root and result.overflowByIdentity[root] and SF.PrintWarning then
-            SF:PrintWarning("Linked characters share equipment history with overlapping slot usage.")
-        end
+    local result = self._identityProjection
+    if result and Identity and Identity.ComponentHasOverflow
+        and Identity.ComponentHasOverflow(result, memberA)
+        and not overflowA
+        and not overflowB
+        and SF.PrintWarning
+    then
+        SF:PrintWarning("Linked characters share equipment history with overlapping slot usage.")
     end
 
+    local linkedIds = (Identity and Identity.ComponentMembers)
+        and Identity.ComponentMembers(self._lootLogs, memberA, result)
+        or { memberA, memberB }
+    local linkedSet = {}
+    for i = 1, #linkedIds do
+        linkedSet[linkedIds[i]] = true
+    end
     if result and result.simulatedAdmins then
         for memberId in pairs(result.simulatedAdmins) do
-            if not self:IsAdminMemberId(memberId) then
+            if linkedSet[memberId] and not self:IsAdminMemberId(memberId) then
                 self:AddAdminMemberId(memberId, {
                     skipPermission = true,
+                    skipBroadcast = opts.skipBroadcast,
                 })
             end
         end
@@ -2158,7 +2261,7 @@ function LootProfile:UnlinkCharacter(memberId, opts)
     if not self:getMemberByID(memberId) then
         return false, "That character is not part of this profile."
     end
-    if self:IsEffectiveOwner(memberId) or TouchesOwnerIdentity(self, memberId, self._owner) then
+    if self:IsEffectiveOwner(memberId) then
         if not CurrentUserHasEffectiveLocalOwner(self) then
             return false, "Only the owner may change the owner's linked identity."
         end
@@ -2167,7 +2270,7 @@ function LootProfile:UnlinkCharacter(memberId, opts)
     end
 
     local Identity = SF.LootHelperIdentity
-    local group = Identity and Identity.ComponentMembers and Identity.ComponentMembers(self._lootLogs, memberId)
+    local group = self:GetIdentityMembers(memberId)
     if not group or #group < 2 then
         return false, "That character is not linked to another character."
     end
@@ -2189,7 +2292,6 @@ function LootProfile:UnlinkCharacter(memberId, opts)
     if not ok then
         return false, "Failed to record character unlink."
     end
-    self:ApplyIdentityProjection()
     return true, nil
 end
 
@@ -2220,7 +2322,7 @@ function LootProfile:ReconcileIdentityAdmins(opts)
         end
     end
     if added > 0 then
-        self:ApplyIdentityProjection()
+        self:ApplyIdentityProjection({ force = true })
     end
     return added
 end
@@ -2566,6 +2668,11 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	self:_EnsureRewardPotConfig()
 
 	-- Merge Logs
+	opts = opts or {}
+	if opts.allowMainSwapFingerprintNormalize == nil then
+		opts = CopyTableShallow(opts)
+		opts.allowMainSwapFingerprintNormalize = true
+	end
 	local inserted = self:MergeLogTables(snapshot.lootLogs, opts)
 
 	return true, inserted, nil
@@ -2580,19 +2687,20 @@ function LootProfile:MergeLogTables(logTables, opts)
     if type(logTables) ~= "table" then return 0 end
 
     opts = opts or {}
-    if SF.LootHelperIdentity and SF.LootHelperIdentity.BuildMainSwapLineage then
-        local lineageSource = {}
-        for _, log in ipairs(self._lootLogs or {}) do
-            lineageSource[#lineageSource + 1] = log
-        end
-        for _, t in ipairs(logTables) do
-            lineageSource[#lineageSource + 1] = t
-        end
-        local lineage = SF.LootHelperIdentity.BuildMainSwapLineage(lineageSource)
-        if lineage and #lineage > 0 then
-            opts = CopyTableShallow(opts)
-            opts.allowMainSwapFingerprintNormalize = true
-            opts.mainSwapLineage = lineage
+    if opts.allowMainSwapFingerprintNormalize and SF.LootHelperIdentity and SF.LootHelperIdentity.BuildMainSwapLineage then
+        if type(opts.mainSwapLineage) ~= "table" or #opts.mainSwapLineage == 0 then
+            local lineageSource = {}
+            for _, log in ipairs(self._lootLogs or {}) do
+                lineageSource[#lineageSource + 1] = log
+            end
+            for _, t in ipairs(logTables) do
+                lineageSource[#lineageSource + 1] = t
+            end
+            local lineage = SF.LootHelperIdentity.BuildMainSwapLineage(lineageSource)
+            if lineage and #lineage > 0 then
+                opts = CopyTableShallow(opts)
+                opts.mainSwapLineage = lineage
+            end
         end
     end
     self._lootLogs = self._lootLogs or {}
@@ -2605,6 +2713,7 @@ function LootProfile:MergeLogTables(logTables, opts)
     local inserted = 0
     local replaced = 0
     local dirtySort = false
+    local identityDirty = false
     local mismatches = {}
 
     for _, t in ipairs(logTables) do
@@ -2619,6 +2728,12 @@ function LootProfile:MergeLogTables(logTables, opts)
                 table.insert(self._lootLogs, log)
                 inserted = inserted + 1
                 dirtySort = true
+                local incomingEventType = log.GetEventType and log:GetEventType() or log._eventType
+                if SF.LootHelperIdentity and SF.LootHelperIdentity.AffectsProjection
+                    and SF.LootHelperIdentity.AffectsProjection(incomingEventType)
+                then
+                    identityDirty = true
+                end
 
                 -- Keep authorCounters synced to max seen
                 local author = log:GetAuthor()
@@ -2654,6 +2769,12 @@ function LootProfile:MergeLogTables(logTables, opts)
                     if opts.allowReplaceExisting and self:_ReplaceLogById(id, log) then
                         replaced = replaced + 1
                         dirtySort = true
+                        local replacedEventType = log.GetEventType and log:GetEventType() or log._eventType
+                        if SF.LootHelperIdentity and SF.LootHelperIdentity.AffectsProjection
+                            and SF.LootHelperIdentity.AffectsProjection(replacedEventType)
+                        then
+                            identityDirty = true
+                        end
                     end
                 end
             end
@@ -2668,8 +2789,8 @@ function LootProfile:MergeLogTables(logTables, opts)
         table.sort(self._lootLogs, function(a, b) return self:_CompareLogs(a, b) end)
         self:_RefreshLogPositionIndex()
         self:_MarkIntegritySummaryDirty()
-        if self.ApplyIdentityProjection then
-            self:ApplyIdentityProjection()
+        if identityDirty then
+            self:ApplyIdentityProjection({ force = true })
         end
     end
 

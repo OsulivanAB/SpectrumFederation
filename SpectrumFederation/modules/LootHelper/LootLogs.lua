@@ -370,33 +370,35 @@ function LootLog.new(eventType, eventData, opts)
                 SF.Debug:Warn("LOOTLOG", "Owning profile missing or IsCurrentUserAdmin not found; cannot create log entry")
             end
             return nil
-        elseif not isAdmin then
-            if SF.Debug then
-                SF.Debug:Warn("LOOTLOG", "Current user is not an admin; cannot create log entry")
-            end
-            return nil
         end
 
-        if eventType == EVENT_TYPES.LOOT_MODE_CHANGE then
-            local isOwner
-            if type(ap.IsCurrentUserEffectiveOwner) == "function" then
-                isOwner = ap:IsCurrentUserEffectiveOwner()
-                if Imp and Imp.IsEffectiveLocalOwner and ap.IsCurrentUserOwner and ap:IsCurrentUserOwner() then
-                    isOwner = Imp:IsEffectiveLocalOwner(ap)
-                elseif Imp and Imp.IsActive and Imp:IsActive() then
-                    isOwner = false
-                end
-            elseif Imp and Imp.IsEffectiveLocalOwner then
+        local isLootMode = eventType == EVENT_TYPES.LOOT_MODE_CHANGE
+        local isOwner
+        if type(ap.IsCurrentUserEffectiveOwner) == "function" then
+            isOwner = ap:IsCurrentUserEffectiveOwner()
+            if Imp and Imp.IsEffectiveLocalOwner and ap.IsCurrentUserOwner and ap:IsCurrentUserOwner() then
                 isOwner = Imp:IsEffectiveLocalOwner(ap)
-            else
-                isOwner = type(ap.IsCurrentUserOwner) == "function" and ap:IsCurrentUserOwner()
+            elseif Imp and Imp.IsActive and Imp:IsActive() then
+                isOwner = false
             end
+        elseif Imp and Imp.IsEffectiveLocalOwner then
+            isOwner = Imp:IsEffectiveLocalOwner(ap)
+        else
+            isOwner = type(ap.IsCurrentUserOwner) == "function" and ap:IsCurrentUserOwner()
+        end
+
+        if isLootMode then
             if not isOwner then
                 if SF.Debug then
                     SF.Debug:Warn("LOOTLOG", "Current user is not an effective owner; cannot change loot mode")
                 end
                 return nil
             end
+        elseif not isAdmin then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Current user is not an admin; cannot create log entry")
+            end
+            return nil
         end
     end
 

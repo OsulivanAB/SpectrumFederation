@@ -198,6 +198,7 @@ function Sync:HandleAuthLogs(sender, payload)
         )
     local changed, mergeDetails = self:MergeLogs(payload.profileId, payload.logs, {
         allowReplaceExisting = allowReplaceExisting,
+        allowMainSwapFingerprintNormalize = true,
     })
     if t0 then
         self:_MObserve("sync.merge.auth_logs.merge_ms", debugprofilestop() - t0)

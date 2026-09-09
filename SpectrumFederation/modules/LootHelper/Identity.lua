@@ -354,29 +354,29 @@ local function PackLocals(memberIds, localArmor, localOrigin)
         end
     end
 
-    -- Place each usage in its original slot when that slot is free. Chronological
-    -- order only decides who wins a contested slot; leftovers spill to the other
-    -- family slot, then overflow. Compact-to-front packing would remap a lone
-    -- Ring2/Trinket2 onto Slot 1 so a later click on the displayed slot could not
-    -- clear the original usage.
+    -- Singleton identities keep each character's local Ring1/Ring2 and
+    -- Trinket1/Trinket2. Linked identities pack currently-active local usages
+    -- chronologically onto projected Slot 1, then Slot 2, then overflow.
+    local linked = #memberIds >= 2
     local function packFamily(usages, familyOcc, slotIndex)
         table.sort(usages, CompareOrigin)
-        for i = 1, #usages do
-            local preferred = slotIndex[usages[i].slot]
-            local placed = false
-            if preferred and not familyOcc.occupied[preferred] then
-                familyOcc.occupied[preferred] = true
-                placed = true
-            else
-                for idx = 1, 2 do
-                    if not familyOcc.occupied[idx] then
-                        familyOcc.occupied[idx] = true
-                        placed = true
-                        break
-                    end
+        if not linked then
+            for i = 1, #usages do
+                local preferred = slotIndex[usages[i].slot]
+                if preferred and not familyOcc.occupied[preferred] then
+                    familyOcc.occupied[preferred] = true
+                elseif preferred then
+                    familyOcc.overflow = familyOcc.overflow + 1
                 end
             end
-            if not placed then
+            return
+        end
+        for i = 1, #usages do
+            if i == 1 then
+                familyOcc.occupied[1] = true
+            elseif i == 2 then
+                familyOcc.occupied[2] = true
+            else
                 familyOcc.overflow = familyOcc.overflow + 1
             end
         end
@@ -558,7 +558,35 @@ function Identity.SortedUnique(ids)
     return SortedUnique(ids)
 end
 
+function Identity.AffectsProjection(eventType)
+    return eventType == (EventTypes().CHARACTER_LINK)
+        or eventType == (EventTypes().CHARACTER_UNLINK)
+        or eventType == (EventTypes().MAIN_SWAP)
+        or eventType == (EventTypes().POINT_CHANGE)
+        or eventType == (EventTypes().ATTENDANCE_CHANGE)
+        or eventType == (EventTypes().ARMOR_CHANGE)
+        or eventType == (EventTypes().ADMIN_ADDED)
+        or eventType == (EventTypes().ADMIN_REMOVED)
+        or eventType == (EventTypes().ROLE_CHANGE)
+end
+
+function Identity.CanFanOutBalance(eventType)
+    return eventType == (EventTypes().POINT_CHANGE)
+        or eventType == (EventTypes().ATTENDANCE_CHANGE)
+end
+
+function Identity.ComponentHasOverflow(result, memberId)
+    if type(result) ~= "table" or type(result.identityOf) ~= "table" then
+        return false
+    end
+    memberId = NormalizeId(memberId)
+    local group = memberId and result.identityOf[memberId]
+    local root = group and group[1]
+    return root and result.overflowByIdentity and result.overflowByIdentity[root] == true
+end
+
 function Identity.Replay(logs, opts)
+    Identity.replayCount = (Identity.replayCount or 0) + 1
     opts = opts or {}
     local owner = NormalizeId(opts.owner)
     local types = EventTypes()
@@ -793,13 +821,13 @@ function Identity.Replay(logs, opts)
     }
 end
 
-function Identity.ComponentMembers(logs, memberId)
-    local result = Identity.Replay(logs, {})
+function Identity.ComponentMembers(logs, memberId, result)
+    result = result or Identity.Replay(logs, {})
     memberId = NormalizeId(memberId)
-    return (memberId and result.identityOf[memberId]) or { memberId }
+    return (memberId and result.identityOf and result.identityOf[memberId]) or { memberId }
 end
 
-function Identity.SameIdentity(logs, a, b)
+function Identity.SameIdentity(logs, a, b, result)
     a = NormalizeId(a)
     b = NormalizeId(b)
     if not a or not b then
@@ -808,8 +836,8 @@ function Identity.SameIdentity(logs, a, b)
     if a == b then
         return true
     end
-    local result = Identity.Replay(logs, {})
-    local group = result.identityOf[a]
+    result = result or Identity.Replay(logs, {})
+    local group = result.identityOf and result.identityOf[a]
     if not group then
         return false
     end
@@ -821,15 +849,79 @@ function Identity.SameIdentity(logs, a, b)
     return false
 end
 
+function Identity.FanOutBalance(profile, lootLog)
+    if type(profile) ~= "table" or type(lootLog) ~= "table" then
+        return false
+    end
+    local result = profile._identityProjection
+    if type(result) ~= "table" or type(result.identityOf) ~= "table" then
+        return false
+    end
+    local eventType = GetLogType(lootLog)
+    if not Identity.CanFanOutBalance(eventType) then
+        return false
+    end
+    local data = GetLogData(lootLog)
+    local memberId = NormalizeId(data and data.member)
+    local group = memberId and result.identityOf[memberId]
+    if type(group) ~= "table" or #group == 0 then
+        return false
+    end
+    local amount = GetAmount(eventType == EventTypes().POINT_CHANGE and "points" or "attendance", data)
+    local delta = amount
+    if data.change == (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.DECREMENT) then
+        delta = -amount
+    elseif data.change ~= (SF.LootLogPointChangeTypes and SF.LootLogPointChangeTypes.INCREMENT) then
+        return false
+    end
+    if eventType == EventTypes().POINT_CHANGE then
+        local nextValue = (result.points[memberId] or 0) + delta
+        for i = 1, #group do
+            local id = group[i]
+            result.points[id] = nextValue
+            local member = profile.getMemberByID and profile:getMemberByID(id)
+            if member then
+                if member.SetPoints then
+                    member:SetPoints(nextValue)
+                else
+                    member.pointBalance = nextValue
+                end
+            end
+        end
+        return true
+    end
+    local nextValue = (result.attendance[memberId] or 0) + delta
+    if nextValue < 0 then
+        nextValue = 0
+    end
+    for i = 1, #group do
+        local id = group[i]
+        result.attendance[id] = nextValue
+        local member = profile.getMemberByID and profile:getMemberByID(id)
+        if member then
+            if member.SetAttendance then
+                member:SetAttendance(nextValue)
+            else
+                member.attendanceBalance = nextValue
+            end
+        end
+    end
+    return true
+end
+
 function Identity.ComponentAdmins(profile, memberA, memberB)
     if type(profile) ~= "table" then
         return {}
     end
-    local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
-    local owner = profile.GetOwner and profile:GetOwner() or profile._owner
-    local result = Identity.Replay(logs, { owner = owner })
+    local result = profile._identityProjection
+    if type(result) ~= "table" or type(result.identityOf) ~= "table" then
+        local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
+        local owner = profile.GetOwner and profile:GetOwner() or profile._owner
+        result = Identity.Replay(logs, { owner = owner })
+    end
     memberA = NormalizeId(memberA)
     memberB = NormalizeId(memberB)
+    local owner = profile.GetOwner and profile:GetOwner() or profile._owner
     local seen = {}
     local admins = {}
     local function consider(id)
@@ -909,26 +1001,67 @@ function Identity.ApplyToProfileMembers(profile)
         return aid < bid
     end)
     profile._memberById = nil
+    profile._identityProjection = result
 
     return result
 end
 
-function Identity.LinkedGroups(logs)
-    local result = Identity.Replay(logs, {})
+function Identity.WriteProjection(profile, result)
+    if not profile or type(result) ~= "table" then
+        return
+    end
+    local members = profile._members
+    if type(members) ~= "table" then
+        return
+    end
+    for _, member in ipairs(members) do
+        local memberId = (member.GetFullIdentifier and member:GetFullIdentifier()) or member.identifier
+        if memberId then
+            local points = result.points[memberId] or 0
+            local attendance = result.attendance[memberId] or 0
+            if member.SetPoints then
+                member:SetPoints(points)
+            else
+                member.pointBalance = points
+            end
+            if member.SetAttendance then
+                member:SetAttendance(attendance)
+            else
+                member.attendanceBalance = attendance
+            end
+            if member.SetArmor then
+                member:SetArmor(result.armor[memberId] or EmptyArmor())
+            else
+                member.armor = result.armor[memberId] or EmptyArmor()
+            end
+        end
+    end
+    profile._identityProjection = result
+end
+
+function Identity.LinkedGroupsFromResult(result)
     local seen = {}
     local groups = {}
-    for i = 1, #(result.members or {}) do
+    for i = 1, #(result and result.members or {}) do
         local memberId = result.members[i]
-        local group = result.identityOf[memberId]
-        if type(group) == "table" and #group >= 2 then
-            local key = table.concat(group, "|")
-            if not seen[key] then
-                seen[key] = true
+        if not seen[memberId] then
+            local group = result.identityOf and result.identityOf[memberId]
+            if type(group) == "table" and #group >= 2 then
+                for j = 1, #group do
+                    seen[group[j]] = true
+                end
                 groups[#groups + 1] = group
+            else
+                seen[memberId] = true
             end
         end
     end
     return groups
+end
+
+function Identity.LinkedGroups(logs, result)
+    result = result or Identity.Replay(logs, {})
+    return Identity.LinkedGroupsFromResult(result)
 end
 
 function Identity.BuildMainSwapLineage(logs)

@@ -45,6 +45,39 @@ function LootLogValidators.MemberExistsInProfiles(memberIdentifier, profile)
 	return false
 end
 
+local function NormalizeStoredNameRealm(id)
+    if type(id) ~= "string" or id == "" or not id:find("-", 1, true) then
+        return nil
+    end
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        return SF.NameUtil.NormalizeNameRealm(id)
+    end
+    return id
+end
+
+local function SameStoredPlayer(a, b)
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+    local na = NormalizeStoredNameRealm(a)
+    local nb = NormalizeStoredNameRealm(b)
+    return na ~= nil and na == nb
+end
+
+local function IsArrayLikeList(list)
+    if type(list) ~= "table" then
+        return false
+    end
+    local count = 0
+    for key in pairs(list) do
+        if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then
+            return false
+        end
+        count = count + 1
+    end
+    return count == #list
+end
+
 -- Function to validate the POINT_CHANGE event data
 -- @param eventData (table) - Event data to validate
 -- @param POINT_CHANGE_TYPES (table) - Point change type constants
@@ -139,20 +172,29 @@ function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, pro
         end
         local seen = {}
         local count = 0
+        if not IsArrayLikeList(eventData.identityMembers) then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "identityMembers must be an array")
+            end
+            return false
+        end
         for _, id in ipairs(eventData.identityMembers) do
-            if type(id) ~= "string" or id == "" or not id:match("^[^%-]+%-[^%-]+$") then
+            local normalized = NormalizeStoredNameRealm(id)
+            if not normalized then
                 if SF.Debug then
                     SF.Debug:Warn("LOOTLOG", "Invalid identityMembers entry: %s", tostring(id))
                 end
                 return false
             end
-            if seen[id] then
-                if SF.Debug then
-                    SF.Debug:Warn("LOOTLOG", "Duplicate identityMembers entry: %s", tostring(id))
+            for seenId in pairs(seen) do
+                if SameStoredPlayer(seenId, normalized) then
+                    if SF.Debug then
+                        SF.Debug:Warn("LOOTLOG", "Duplicate identityMembers entry: %s", tostring(id))
+                    end
+                    return false
                 end
-                return false
             end
-            seen[id] = true
+            seen[normalized] = true
             count = count + 1
         end
         if count < 2 then
@@ -367,7 +409,7 @@ function LootLogValidators.ValidateMainSwapData(eventData)
 end
 
 local function ValidateNameRealmList(list, fieldName, allowEmpty)
-    if type(list) ~= "table" then
+    if not IsArrayLikeList(list) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "%s must be an array", tostring(fieldName))
         end
@@ -376,19 +418,22 @@ local function ValidateNameRealmList(list, fieldName, allowEmpty)
     local seen = {}
     local count = 0
     for _, id in ipairs(list) do
-        if type(id) ~= "string" or id == "" or not id:match("^[^%-]+%-[^%-]+$") then
+        local normalized = NormalizeStoredNameRealm(id)
+        if not normalized then
             if SF.Debug then
                 SF.Debug:Warn("LOOTLOG", "Invalid %s entry: %s", tostring(fieldName), tostring(id))
             end
             return false
         end
-        if seen[id] then
-            if SF.Debug then
-                SF.Debug:Warn("LOOTLOG", "Duplicate %s entry: %s", tostring(fieldName), tostring(id))
+        for seenId in pairs(seen) do
+            if SameStoredPlayer(seenId, normalized) then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Duplicate %s entry: %s", tostring(fieldName), tostring(id))
+                end
+                return false
             end
-            return false
         end
-        seen[id] = true
+        seen[normalized] = true
         count = count + 1
     end
     if count == 0 and not allowEmpty then
@@ -404,21 +449,21 @@ function LootLogValidators.ValidateCharacterLinkData(eventData)
     if type(eventData) ~= "table" then
         return false
     end
-    local memberA = eventData.memberA
-    local memberB = eventData.memberB
-    if type(memberA) ~= "string" or memberA == "" or not memberA:match("^[^%-]+%-[^%-]+$") then
+    local memberA = NormalizeStoredNameRealm(eventData.memberA)
+    local memberB = NormalizeStoredNameRealm(eventData.memberB)
+    if not memberA then
         if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK has invalid memberA: %s", tostring(memberA))
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK has invalid memberA: %s", tostring(eventData.memberA))
         end
         return false
     end
-    if type(memberB) ~= "string" or memberB == "" or not memberB:match("^[^%-]+%-[^%-]+$") then
+    if not memberB then
         if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK has invalid memberB: %s", tostring(memberB))
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK has invalid memberB: %s", tostring(eventData.memberB))
         end
         return false
     end
-    if memberA == memberB then
+    if SameStoredPlayer(memberA, memberB) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK requires two different characters")
         end
@@ -429,15 +474,9 @@ end
 
 function LootLogValidators.ValidateCharacterUnlinkData(eventData)
     local memberID = eventData and eventData.member
-    if type(memberID) ~= "string" or memberID == "" then
+    if not NormalizeStoredNameRealm(memberID) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "CHARACTER_UNLINK has invalid member ID: %s", tostring(memberID))
-        end
-        return false
-    end
-    if not memberID:match("^[^%-]+%-[^%-]+$") then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "CHARACTER_UNLINK has invalid member ID format: %s", tostring(memberID))
         end
         return false
     end

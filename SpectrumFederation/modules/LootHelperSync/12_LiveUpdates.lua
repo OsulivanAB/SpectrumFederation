@@ -15,6 +15,53 @@ local function GetMemberById(profile, memberId)
 end
 
 
+local function GetLogEventType(logTable)
+    if type(logTable) ~= "table" then
+        return nil
+    end
+    return logTable._eventType or logTable.eventType
+end
+
+local function GetLogEventData(logTable)
+    if type(logTable) ~= "table" then
+        return {}
+    end
+    return logTable._data or logTable.data or {}
+end
+
+function Sync:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData)
+    if type(profile) ~= "table" or type(eventData) ~= "table" then
+        return false
+    end
+    local types = SF.LootLogEventTypes or {}
+    if eventType == types.CHARACTER_LINK then
+        if profile.IsEffectiveOwner and (
+            profile:IsEffectiveOwner(eventData.memberA) or profile:IsEffectiveOwner(eventData.memberB)
+        ) then
+            return true
+        end
+        return false
+    end
+    if eventType == types.CHARACTER_UNLINK then
+        return profile.IsEffectiveOwner and profile:IsEffectiveOwner(eventData.member) or false
+    end
+    return false
+end
+
+local function SenderIsEffectiveOwner(profile, sender)
+    if type(profile) ~= "table" or type(sender) ~= "string" then
+        return false
+    end
+    if profile.IsEffectiveOwner then
+        return profile:IsEffectiveOwner(sender)
+    end
+    if profile.IsOwner then
+        return profile:IsOwner(sender)
+    end
+    return false
+end
+
+
 -- Function Called when a local admin creates a new log entry; broadcasts NEW_LOG to raid.
 -- @param profileId string Current session profile id
 -- @param logTable table A network-safe representation of the lootLog entry
@@ -36,9 +83,19 @@ function Sync:BroadcastNewLog(profileId, logTable)
     local dist = self:_EnforceGroupedSessionActive("BroadcastNewLog")
     if not dist then return fail("not in group/raid") end
 
-    -- Only admins should be able to push live updates
+    -- Owner-only events follow effective owner identity. Other live writes
+    -- remain admin-authorized; coordinator trust does not bypass owner-identity.
     local me = self:_SelfId()
-    if not self:IsSenderAuthorized(profileId, me) then
+    local profile = self:FindLocalProfileById(profileId)
+    local eventType = GetLogEventType(logTable)
+    local eventData = GetLogEventData(logTable)
+    local types = SF.LootLogEventTypes or {}
+    local touchesOwnerIdentity = self:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData)
+    if eventType == types.LOOT_MODE_CHANGE or touchesOwnerIdentity then
+        if not SenderIsEffectiveOwner(profile, me) then
+            return fail("not authorized to broadcast owner-identity NEW_LOG")
+        end
+    elseif not self:IsSenderAuthorized(profileId, me) then
         return fail("not authorized to broadcast NEW_LOG")
     end
 
@@ -92,7 +149,7 @@ function Sync:HandleNewLog(sender, payload)
 
     local profileId = payload.profileId
     local logTable = payload.log
-    local eventData = logTable._data or logTable.data or {}
+    local eventData = GetLogEventData(logTable)
     local memberId = eventData.member
     local profileBefore = self:FindLocalProfileById(profileId)
     local oldPoints = 0
@@ -110,27 +167,23 @@ function Sync:HandleNewLog(sender, payload)
         return
     end
 
-    -- Trust policy: accept from coordinator; otherwise require sender is an admin
-    if not self:_SamePlayer(sender, self.state.coordinator) then
-        if not self:IsSenderAuthorized(profileId, sender) then
+    -- Trust policy: coordinator or canonical admin for ordinary live writes.
+    -- Owner-only and owner-identity relationship events require effective owner
+    -- even when the sender is a canonical admin or the coordinator.
+    local eventType = GetLogEventType(logTable)
+    local types = SF.LootLogEventTypes or {}
+    local touchesOwnerIdentity = self:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData)
+    if eventType == types.LOOT_MODE_CHANGE or touchesOwnerIdentity then
+        if not SenderIsEffectiveOwner(profile, sender) then
             if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not the owner."):format(tostring(sender), tostring(profileId)))
             end
             return
         end
-    end
-
-    local eventType = logTable._eventType or logTable.eventType
-    if eventType == (SF.LootLogEventTypes and SF.LootLogEventTypes.LOOT_MODE_CHANGE) then
-        local isOwner = false
-        if profile.IsEffectiveOwner then
-            isOwner = profile:IsEffectiveOwner(sender)
-        elseif profile.IsOwner then
-            isOwner = profile:IsOwner(sender)
-        end
-        if not isOwner then
+    elseif not self:_SamePlayer(sender, self.state.coordinator) then
+        if not self:IsSenderAuthorized(profileId, sender) then
             if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring loot mode change from %s for profile %s: not the owner."):format(tostring(sender), tostring(profileId)))
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
             end
             return
         end

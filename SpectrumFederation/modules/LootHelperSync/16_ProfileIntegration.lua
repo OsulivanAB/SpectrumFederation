@@ -615,7 +615,66 @@ function Sync:RebuildProfile(profileId, reason)
 end
 
 -- Coordinator-only: persist missing identity admin grants after silent rebuild.
--- Debounced so burst rebuilds (live_update, AUTH_LOGS, snapshots) converge once.
+-- Wait until contiguous history matches known author maxima and no repair
+-- work remains, so implied grants are not written from incomplete logs.
+function Sync:IsIdentityAdminReconcileReady(profileId)
+    if type(profileId) ~= "string" or profileId == "" then
+        return false
+    end
+    if not self.state or not self.state.active or not self.state.isCoordinator then
+        return false
+    end
+    if self.state.profileId ~= profileId then
+        return false
+    end
+
+    local conv = self.state.convergence
+    if type(conv) == "table" then
+        if conv.started and not conv.complete and not conv.finalizeStarted then
+            return false
+        end
+        if conv.adminLogSyncComplete == false then
+            return false
+        end
+    end
+
+    local queue = self.state.repairQueue
+    if type(queue) == "table" and type(queue.items) == "table" then
+        for _, entry in pairs(queue.items) do
+            if type(entry) == "table" and entry.profileId == profileId then
+                return false
+            end
+        end
+    end
+
+    if type(self.state.requests) == "table" then
+        for _, req in pairs(self.state.requests) do
+            local meta = type(req) == "table" and req.meta or nil
+            local reqProfile = meta and meta.profileId or (type(req) == "table" and req.profileId) or nil
+            if reqProfile == profileId then
+                return false
+            end
+        end
+    end
+
+    local contig = (self.ComputeContigAuthorMax and self:ComputeContigAuthorMax(profileId)) or {}
+    local known = {}
+    if type(self.state.authorMax) == "table" then
+        for author, maxCounter in pairs(self.state.authorMax) do
+            known[author] = tonumber(maxCounter) or 0
+        end
+    end
+    local localMax = (self.ComputeAuthorMax and self:ComputeAuthorMax(profileId)) or {}
+    for author, maxCounter in pairs(localMax) do
+        known[author] = math.max(known[author] or 0, tonumber(maxCounter) or 0)
+    end
+    local missing = self:ComputeMissingLogRequests(contig, known)
+    if type(missing) == "table" and #missing > 0 then
+        return false
+    end
+    return true
+end
+
 function Sync:ScheduleIdentityAdminReconcile(profileId)
     if type(profileId) ~= "string" or profileId == "" then
         return
@@ -641,6 +700,9 @@ function Sync:ScheduleIdentityAdminReconcile(profileId)
             return
         end
         if self.state.profileId ~= profileId then
+            return
+        end
+        if not self:IsIdentityAdminReconcileReady(profileId) then
             return
         end
         local profile = self:FindLocalProfileById(profileId)

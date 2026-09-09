@@ -123,13 +123,15 @@ local function AttachIdentityArmorScope(profile, eventData)
         return
     end
     local Identity = SF.LootHelperIdentity
-    if not Identity or not Identity.ComponentMembers then
-        return
+    local group
+    if profile.GetIdentityMembers then
+        group = profile:GetIdentityMembers(eventData.member)
+    elseif Identity and Identity.ComponentMembers then
+        group = Identity.ComponentMembers(profile._lootLogs, eventData.member, profile._identityProjection)
     end
-    local group = Identity.ComponentMembers(profile._lootLogs, eventData.member)
     if type(group) == "table" and #group >= 2 then
         eventData.scope = "identity"
-        eventData.identityMembers = Identity.SortedUnique(group)
+        eventData.identityMembers = (Identity and Identity.SortedUnique and Identity.SortedUnique(group)) or group
     end
 end
 
