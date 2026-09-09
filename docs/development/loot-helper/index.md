@@ -59,11 +59,13 @@ When adding an event:
 
 `CHARACTER_LINK` stores `memberA`, `memberB`, and `adminMembersAtLink` (canonical admins in either pre-link component at that event). That evidence applies only at that LINK, is never recomputed, and is ignored when an id is outside the two components being joined. `CHARACTER_UNLINK` splits one character. Historical `MAIN_SWAP` unions lineage only and does not grant admin.
 
-Identity-wide points and Attendance are sums of retained character logs. Unmarked `ARMOR_CHANGE` stays character-local forever; new shared corrections use `scope = "identity"` and `identityMembers`. Ring/Trinket packing is chronological by log order, then explicit identity-scoped slot targeting. Do not implement BiS opportunity state from issue #275 here; this projection is the foundation that work should reuse.
+Identity-wide points and Attendance are sums of retained character logs. Unmarked `ARMOR_CHANGE` stays character-local forever; new shared corrections use `scope = "identity"` and `identityMembers`. Singleton identities keep original local Ring1/Ring2 and Trinket1/Trinket2. Linked identities pack currently-active local ring and trinket usages chronologically onto projected Slot 1, then Slot 2, then overflow. Manual identity-scoped clicks still target the displayed projected slot. Do not implement BiS opportunity state from issue #275 here; this projection is the foundation that work should reuse.
 
-Admin missing-grant reconciliation is coordinator-only, outside silent rebuild, and writes normal `ADMIN_ADDED` history. Effective owner follows the canonical owner's current identity for LINK/UNLINK and loot-mode authorization. `IsCurrentUserOwner` remains canonical.
+`LootProfile` owns a cached identity projection. Rebuild it when identity-affecting history changes. Profile helpers such as `GetIdentityMembers`, `AreSameIdentity`, `GetIdentityPoints`, `GetIdentityAttendance`, and `GetIdentityArmor` read that cache. Live point and Attendance writes may fan out across the current identity instead of replaying all logs. Full replay remains the convergence path for relationship changes, migration, import, and sync rebuild.
 
-Fingerprint repair may normalize a sequential log only when MAIN_SWAP lineage plus ancestor substitution proves the known rewrite bug. Incoming single `NEW_LOG` validation stays strict.
+Admin missing-grant reconciliation is coordinator-only, outside silent rebuild, and writes normal `ADMIN_ADDED` history. It must wait until contiguous author history matches known maxima and no integrity repair or missing-range work remains. Live LINK eager grants apply only to the resulting identity of that LINK. Effective owner follows the canonical owner's current identity for LINK/UNLINK and loot-mode authorization. `IsCurrentUserOwner` remains canonical. Live `NEW_LOG` owner-identity relationship events require the effective owner even when the sender is a canonical admin.
+
+Fingerprint repair may normalize a sequential log only when a batch/import/snapshot/`AUTH_LOGS` caller opts in and MAIN_SWAP lineage plus ancestor substitution proves the known rewrite bug. Incoming single `NEW_LOG` validation stays strict.
 
 ## Persistence and restoration
 

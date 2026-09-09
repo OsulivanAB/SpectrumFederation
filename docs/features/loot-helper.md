@@ -110,6 +110,10 @@ Admins can:
 
 There is no Main or Primary character, and linking does not copy or delete history. Only the effective owner may change the canonical owner's identity. Other admins may manage non-owner identities.
 
+Unlinking asks for confirmation because shared points, Attendance, and equipment opportunity state stop being combined.
+
+Singleton characters keep their local Ring1/Ring2 and Trinket1/Trinket2. Linked identities pack currently-active local ring and trinket usages in log order onto projected Slot 1, then Slot 2, then overflow. Manual identity-scoped clicks still target the displayed projected slot.
+
 Historical **Main Swap** entries remain in Loot Logs as lineage. They are not offered as a live transfer action.
 
 ## Related pages

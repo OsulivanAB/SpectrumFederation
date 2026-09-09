@@ -2,6 +2,21 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.0-beta.2] - 2026-09-09
+
+### Fixed
+- Non-owner admins can link and unlink identities that do not include the canonical owner
+- Live `NEW_LOG` relationship events that modify the owner's identity require the effective owner, including when the sender is a canonical admin
+- Effective-owner alts can create and sync loot-mode changes without becoming general admins
+- Coordinator identity-admin reconciliation waits until contiguous history, known author maxima, and repair work are complete
+- Lone live `NEW_LOG` fingerprint mismatches stay strict; MAIN_SWAP fingerprint repair is opt-in for batch import, snapshot, and `AUTH_LOGS`
+- Linked identities pack active ring and trinket usages chronologically; singletons keep original local slots
+- Linked Character Name-Realm fields accept hyphenated realms and use `NameUtil` equality
+- Eager admin grants after a live LINK apply only to that LINK's resulting identity
+- Overflow warnings fire only when a live LINK introduces a new equipment conflict
+- Linked Characters dialog uses Character 1 / Character 2 labels, and unlink asks for confirmation
+- Identity projection is cached per profile and reused for helpers, UI reads, and live point/Attendance fan-out
+
 ## [1.5.0-beta.1] - 2026-09-09
 
 ### Added
