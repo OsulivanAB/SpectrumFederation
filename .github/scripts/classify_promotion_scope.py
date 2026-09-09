@@ -272,6 +272,103 @@ def classify_git_range(base, head, cwd=None):
     )
 
 
+def git_is_ancestor(ancestor, descendant, cwd=None):
+    """Return True when ancestor is in descendant's history."""
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def describe_ref_drift(expected_sha, actual_sha, cwd=None):
+    """Return how actual_sha relates to expected_sha: match, advanced, rewound, or diverged."""
+    expected_sha = resolve_commit(expected_sha, cwd=cwd)
+    actual_sha = resolve_commit(actual_sha, cwd=cwd)
+    if expected_sha == actual_sha:
+        return "match"
+    if git_is_ancestor(expected_sha, actual_sha, cwd=cwd):
+        return "advanced"
+    if git_is_ancestor(actual_sha, expected_sha, cwd=cwd):
+        return "rewound"
+    return "diverged"
+
+
+def _rerun_instruction():
+    return "Rerun Promote Beta to Main so scope detection and the merge use the same commits."
+
+
+def verify_promotion_refs(
+    expected_base,
+    expected_target,
+    current_base,
+    current_target,
+    cwd=None,
+    mode="merge",
+    destination=None,
+):
+    """Return error strings when remote refs drifted from the captured promotion range.
+
+    mode='merge': origin/main and origin/beta must still equal the captured SHAs.
+    mode='fast-forward': origin/beta must still equal the captured target, and
+    that target must be an ancestor of destination (usually origin/main after
+    the promotion merge). Newer beta work is never overwritten.
+    """
+    expected_base = resolve_commit(expected_base, cwd=cwd)
+    expected_target = resolve_commit(expected_target, cwd=cwd)
+    current_base = resolve_commit(current_base, cwd=cwd)
+    current_target = resolve_commit(current_target, cwd=cwd)
+    errors = []
+
+    if mode == "fast-forward":
+        beta_drift = describe_ref_drift(expected_target, current_target, cwd=cwd)
+        if beta_drift == "advanced":
+            errors.append(
+                "origin/beta has advanced beyond the captured promotion target "
+                f"({expected_target} -> {current_target}). "
+                "Refusing to overwrite newer beta work. "
+                + _rerun_instruction()
+            )
+        elif beta_drift != "match":
+            errors.append(
+                "origin/beta no longer points at the captured promotion target "
+                f"({expected_target} -> {current_target}, {beta_drift}). "
+                + _rerun_instruction()
+            )
+        if destination:
+            destination = resolve_commit(destination, cwd=cwd)
+            if not git_is_ancestor(expected_target, destination, cwd=cwd):
+                errors.append(
+                    f"Captured promotion target {expected_target} is not an ancestor of "
+                    f"{destination}. A fast-forward of beta onto that commit is not possible."
+                )
+        return errors
+
+    if current_base != expected_base:
+        errors.append(
+            "origin/main has moved since promotion scope was captured "
+            f"({expected_base} -> {current_base}). "
+            + _rerun_instruction()
+        )
+    beta_drift = describe_ref_drift(expected_target, current_target, cwd=cwd)
+    if beta_drift == "advanced":
+        errors.append(
+            "origin/beta has advanced beyond the captured promotion target "
+            f"({expected_target} -> {current_target}). "
+            "Newer beta work will not be promoted or overwritten. "
+            + _rerun_instruction()
+        )
+    elif beta_drift != "match":
+        errors.append(
+            "origin/beta no longer points at the captured promotion target "
+            f"({expected_target} -> {current_target}, {beta_drift}). "
+            + _rerun_instruction()
+        )
+    return errors
+
+
 def bool_text(value):
     """Return GitHub Actions-friendly true/false."""
     return "true" if value else "false"
@@ -355,13 +452,13 @@ def write_github_output(scope, output_path):
 def job_outcome_ok(required, result):
     """Return True when a job result matches the required/optional expectation.
 
-    Required jobs must succeed. Optional jobs may be skipped or succeed.
-    Anything else (failure, cancellation, missing result) is not OK.
+    Required jobs must succeed. Conditional jobs must be skipped when they are
+    not required. Unexpected success is a mismatch, not a pass.
     """
     result = (result or "").strip().lower()
     if required:
         return result == "success"
-    return result in {"skipped", "success"}
+    return result == "skipped"
 
 
 def verify_promotion_outcomes(expectations):
@@ -379,7 +476,7 @@ def verify_promotion_outcomes(expectations):
             )
         else:
             errors.append(
-                f"{name} was not required but result was '{result or 'missing'}'"
+                f"{name} was not required but ran with result '{result or 'missing'}'"
             )
     return errors
 
@@ -428,6 +525,39 @@ def build_parser():
         action="store_true",
         help="Do not print the scope report to stdout",
     )
+    parser.add_argument(
+        "--verify-refs",
+        action="store_true",
+        help="Verify captured promotion SHAs still match remote refs",
+    )
+    parser.add_argument(
+        "--expected-base",
+        help="Captured promotion_base_sha (origin/main at scope detection)",
+    )
+    parser.add_argument(
+        "--expected-target",
+        help="Captured promotion_target_sha (beta HEAD at scope detection)",
+    )
+    parser.add_argument(
+        "--current-base",
+        default="origin/main",
+        help="Live base ref to compare (default: origin/main)",
+    )
+    parser.add_argument(
+        "--current-target",
+        default="origin/beta",
+        help="Live target ref to compare (default: origin/beta)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("merge", "fast-forward"),
+        default="merge",
+        help="merge requires both refs unchanged; fast-forward allows main to move",
+    )
+    parser.add_argument(
+        "--fast-forward-to",
+        help="Destination commit beta should fast-forward to (usually origin/main)",
+    )
     return parser
 
 
@@ -435,6 +565,31 @@ def main(argv=None):
     """Classify a git range or explicit file list."""
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.verify_refs:
+        if not args.expected_base or not args.expected_target:
+            parser.error("--verify-refs requires --expected-base and --expected-target")
+        errors = verify_promotion_refs(
+            args.expected_base,
+            args.expected_target,
+            args.current_base,
+            args.current_target,
+            mode=args.mode,
+            destination=args.fast_forward_to,
+        )
+        if errors:
+            for error in errors:
+                print(f"::error::{error}", file=sys.stderr)
+                print(error)
+            return 1
+        if args.mode == "fast-forward":
+            print(
+                "Captured promotion target is unchanged and is an ancestor of "
+                "the fast-forward destination."
+            )
+        else:
+            print("Captured promotion refs still match origin/main and origin/beta.")
+        return 0
 
     if args.files is not None and (args.base or args.head):
         parser.error("Use either --files or --base/--head, not both")

@@ -342,7 +342,7 @@ def test_job_outcome_ok_fails_closed_when_required_job_is_skipped():
     assert scope_mod.job_outcome_ok(True, "success") is True
     assert scope_mod.job_outcome_ok(True, "skipped") is False
     assert scope_mod.job_outcome_ok(False, "skipped") is True
-    assert scope_mod.job_outcome_ok(False, "success") is True
+    assert scope_mod.job_outcome_ok(False, "success") is False
     assert scope_mod.job_outcome_ok(False, "failure") is False
     assert scope_mod.job_outcome_ok(True, "failure") is False
 
@@ -373,6 +373,192 @@ def test_docs_only_expected_outcomes_pass_verification():
         ]
     )
     assert errors == []
+
+
+def test_verify_promotion_outcomes_catches_unexpected_side_effect_success():
+    errors = scope_mod.verify_promotion_outcomes(
+        [
+            ("Merge Beta to Main", True, "success"),
+            ("Update Changelog for Main", False, "success"),
+            ("Update README for Main", False, "success"),
+            ("Deploy Documentation", False, "success"),
+            ("Publish Stable Release", False, "success"),
+            ("Fast-Forward Beta to Main", True, "success"),
+        ]
+    )
+    assert "Update Changelog for Main was not required but ran with result 'success'" in errors
+    assert "Update README for Main was not required but ran with result 'success'" in errors
+    assert "Deploy Documentation was not required but ran with result 'success'" in errors
+    assert "Publish Stable Release was not required but ran with result 'success'" in errors
+
+
+def _captured_shas(repo):
+    return (
+        scope_mod.resolve_commit("main", cwd=repo),
+        scope_mod.resolve_commit("beta", cwd=repo),
+    )
+
+
+def test_verify_promotion_refs_merge_accepts_unchanged_refs(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    base, target = _captured_shas(repo)
+    assert scope_mod.verify_promotion_refs(
+        base, target, "main", "beta", cwd=repo, mode="merge"
+    ) == []
+
+
+def test_verify_promotion_refs_merge_rejects_main_move(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    base, target = _captured_shas(repo)
+    git(repo, "checkout", "main")
+    commit_files(
+        repo,
+        {".github/workflows/promote-beta-to-main.yml": "name: later main\n"},
+        "ci: main moved",
+    )
+    errors = scope_mod.verify_promotion_refs(
+        base, target, "main", "beta", cwd=repo, mode="merge"
+    )
+    assert any("origin/main has moved" in error for error in errors)
+    assert any("Rerun Promote Beta to Main" in error for error in errors)
+
+
+def test_verify_promotion_refs_merge_rejects_beta_advance(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    base, target = _captured_shas(repo)
+    commit_files(repo, {"docs/index.md": "# later beta\n"}, "docs: later beta")
+    errors = scope_mod.verify_promotion_refs(
+        base, target, "main", "beta", cwd=repo, mode="merge"
+    )
+    assert len(errors) == 1
+    assert "origin/beta has advanced" in errors[0]
+    assert "will not be promoted or overwritten" in errors[0]
+
+
+def test_verify_promotion_refs_merge_rejects_beta_rewind(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    base, target = _captured_shas(repo)
+    git(repo, "checkout", "beta")
+    git(repo, "reset", "--hard", "main")
+    errors = scope_mod.verify_promotion_refs(
+        base, target, "main", "beta", cwd=repo, mode="merge"
+    )
+    assert any("rewound" in error for error in errors)
+
+
+def test_verify_promotion_refs_merge_rejects_beta_diverge(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    base, target = _captured_shas(repo)
+    git(repo, "checkout", "beta")
+    git(repo, "reset", "--hard", "main")
+    commit_files(repo, {"README.md": "# diverged\n"}, "docs: diverged beta")
+    errors = scope_mod.verify_promotion_refs(
+        base, target, "main", "beta", cwd=repo, mode="merge"
+    )
+    assert any("diverged" in error for error in errors)
+
+
+def test_verify_promotion_refs_fast_forward_allows_main_to_move(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    base, target = _captured_shas(repo)
+    git(repo, "checkout", "main")
+    git(repo, "merge", "--no-ff", "beta", "-m", "promote")
+    errors = scope_mod.verify_promotion_refs(
+        base,
+        target,
+        "main",
+        "beta",
+        cwd=repo,
+        mode="fast-forward",
+        destination="main",
+    )
+    assert errors == []
+
+
+def test_verify_promotion_refs_fast_forward_refuses_newer_beta(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    base, target = _captured_shas(repo)
+    git(repo, "checkout", "main")
+    git(repo, "merge", "--no-ff", "beta", "-m", "promote")
+    git(repo, "checkout", "beta")
+    commit_files(repo, {"docs/index.md": "# newer beta\n"}, "docs: newer beta")
+    errors = scope_mod.verify_promotion_refs(
+        base,
+        target,
+        "main",
+        "beta",
+        cwd=repo,
+        mode="fast-forward",
+        destination="main",
+    )
+    assert any("Refusing to overwrite newer beta work" in error for error in errors)
+
+
+def test_verify_promotion_refs_fast_forward_requires_target_ancestor(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    base, target = _captured_shas(repo)
+    errors = scope_mod.verify_promotion_refs(
+        base,
+        target,
+        "main",
+        "beta",
+        cwd=repo,
+        mode="fast-forward",
+        destination="main",
+    )
+    assert any("is not an ancestor" in error for error in errors)
+
+
+def test_cli_verify_refs_fails_on_beta_drift(tmp_path, monkeypatch, capsys):
+    repo = init_repo(tmp_path)
+    commit_files(repo, {"docs/index.md": "# incoming\n"}, "docs: incoming")
+    base, target = _captured_shas(repo)
+    commit_files(repo, {"docs/index.md": "# later\n"}, "docs: later")
+    monkeypatch.chdir(repo)
+    exit_code = scope_mod.main(
+        [
+            "--verify-refs",
+            "--expected-base",
+            base,
+            "--expected-target",
+            target,
+            "--current-base",
+            "main",
+            "--current-target",
+            "beta",
+            "--mode",
+            "merge",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "origin/beta has advanced" in captured.out
+    assert "origin/beta has advanced" in captured.err
+
+
+def test_promotion_workflow_pins_mutations_to_captured_shas():
+    workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "promote-beta-to-main.yml"
+    text = workflow.read_text(encoding="utf-8")
+    assert 'git merge -X ours --no-commit --no-ff "$EXPECTED_TARGET"' in text
+    assert "git merge -X ours --no-commit --no-ff beta" not in text
+    assert "git checkout beta --" not in text
+    assert "git checkout origin/beta --" not in text
+    assert "--force-with-lease" not in text
+    assert "git push origin origin/main:refs/heads/beta" in text
+    assert "--verify-refs" in text
+    assert "--mode fast-forward" in text
+    assert "git reset --hard main" not in text
+    assert text.count("\n          ref: beta\n") == 1
+    assert "needs.detect-promotion-scope.outputs.promotion_target_sha" in text
+    assert "was not required but ran with result" in text
 
 
 def test_cli_files_mode_prints_scope_report(capsys):
