@@ -2,7 +2,7 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.0] - 2026-09-09
+## [1.5.0-beta.1] - 2026-09-09
 
 ### Added
 - Linked Characters for Loot Helper profiles: admins can link and unlink characters so they share identity-wide points, Attendance, and equipment opportunity state while remaining separate roster members
