@@ -108,7 +108,9 @@ loadModule("SpectrumFederation/modules/LootHelperSync/01_Constants.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/02_State.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/16_ProfileIntegration.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/08_Requests.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/12_LiveUpdates.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
 
 function SF:GetPlayerFullIdentifier()
     return PLAYER
@@ -138,11 +140,24 @@ SF.Debug = {
 }
 
 local Sync = SF.LootHelperSync
+local deferredAfter = {}
 function Sync:FindLocalProfileById(profileId)
     return SF.lootHelperDB and SF.lootHelperDB.profiles and SF.lootHelperDB.profiles[profileId]
 end
-function Sync:RunAfter(_, fn)
-    fn()
+function Sync:RunAfter(delaySec, fn)
+    delaySec = tonumber(delaySec) or 0
+    if delaySec <= 0 then
+        fn()
+        return
+    end
+    deferredAfter[#deferredAfter + 1] = fn
+end
+function runDeferred()
+    local queued = deferredAfter
+    deferredAfter = {}
+    for i = 1, #queued do
+        queued[i]()
+    end
 end
 function Sync:IsBulkTransferAllowed()
     return true
@@ -160,9 +175,24 @@ end
 function Sync:QueueRepairRanges()
     return true
 end
+function Sync:_Now()
+    return 0
+end
+function Sync:_NextNonce(tag)
+    return tostring(tag or "N") .. "1"
+end
+function Sync:BroadcastSessionStart()
+end
+function Sync:_MInc()
+end
+function Sync:_MObserve()
+end
+function Sync:_MetricsUpdateRequestQueueGauges()
+end
 
 local function resetEnv()
     printed = {}
+    deferredAfter = {}
     PLAYER = "Owner-Garona"
     NOW = 1700001000
     SF.lootHelperDB = {
@@ -185,7 +215,14 @@ local function resetEnv()
         authorMax = {},
         repairQueue = { order = {}, items = {} },
         convergence = {},
+        _adminConvergence = nil,
     }
+    Sync._identityAdminReconcileNeeded = {}
+    Sync._identityAdminReconcilePending = {}
+    Sync._pendingLiveRelationship = {}
+    Sync._consideringIdentitySideEffects = nil
+    Sync._flushingLiveRelationship = nil
+    Sync._liveRelationshipInFlight = nil
 end
 
 local function makeProfile(name)
@@ -982,6 +1019,90 @@ assertFalse(SF.LootLogValidators.ValidateCharacterLinkData({
 assertTrue(profile:LinkCharacters(hyphen, ALT_A), "live link accepts hyphenated realm names")
 
 resetEnv()
+profile = makeProfile("HyphenAdmin")
+local hyphen = "Thrall-Azjol-Nerub"
+addMember(profile, hyphen)
+addMember(profile, ALT_A)
+assertTrue(profile:AddAdminMemberId(ALT_A), "seed admin for hyphen propagation")
+assertTrue(SF.LootLogValidators.ValidateAdminAddedData({ member = hyphen }), "ADMIN_ADDED accepts hyphenated realms")
+assertTrue(profile:LinkCharacters(ALT_A, hyphen), "linking an admin identity to a hyphenated realm")
+assertTrue(profile:IsAdminMemberId(hyphen), "hyphenated member is a canonical admin after live LINK")
+local sawAdminAdded = false
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.ADMIN_ADDED then
+        local data = log:GetEventData()
+        if SF.NameUtil.SamePlayer(data.member, hyphen) then
+            sawAdminAdded = true
+        end
+    end
+end
+assertTrue(sawAdminAdded, "propagation wrote a real ADMIN_ADDED log")
+local rebuild = makeProfile("HyphenAdminRebuild")
+local tables = {}
+for _, log in ipairs(profile:GetLootLogs()) do
+    tables[#tables + 1] = log:ToTable()
+end
+assertTrue(rebuild:MergeLogTables(tables) > 0, "peer/rebuild imports hyphen admin history")
+rebuild._adminUsers = { rebuild:GetOwnerId() }
+rebuild:ApplyIdentityProjection()
+Sync:RebuildProfile(rebuild:GetProfileId(), "hyphen-rebuild")
+assertTrue(rebuild:IsAdminMemberId(hyphen), "rebuild from logs reproduces the hyphenated grant")
+assertTrue(profile:RemoveAdminMemberId(hyphen), "removing the hyphenated admin")
+local sawAdminRemoved = false
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.ADMIN_REMOVED then
+        local data = log:GetEventData()
+        if SF.NameUtil.SamePlayer(data.member, hyphen) then
+            sawAdminRemoved = true
+        end
+    end
+end
+assertTrue(sawAdminRemoved, "removal wrote ADMIN_REMOVED")
+local afterRemove = makeProfile("HyphenAdminRemoved")
+tables = {}
+for _, log in ipairs(profile:GetLootLogs()) do
+    tables[#tables + 1] = log:ToTable()
+end
+afterRemove:MergeLogTables(tables)
+afterRemove._adminUsers = { afterRemove:GetOwnerId(), hyphen }
+Sync:RebuildProfile(afterRemove:GetProfileId(), "hyphen-removed")
+assertFalse(afterRemove:IsAdminMemberId(hyphen), "rebuild after ADMIN_REMOVED does not keep the grant")
+
+resetEnv()
+profile = makeProfile("AdminFailClosed")
+addMember(profile, ALT_A)
+local originalNew = SF.LootLog.new
+SF.LootLog.new = function(eventType, ...)
+    if eventType == SF.LootLogEventTypes.ADMIN_ADDED or eventType == SF.LootLogEventTypes.ADMIN_REMOVED then
+        return nil
+    end
+    return originalNew(eventType, ...)
+end
+assertFalse(profile:AddAdminMemberId(ALT_A), "failed ADMIN_ADDED construction reports failure")
+assertFalse(profile:IsAdminMemberId(ALT_A), "failed admin log write does not mutate _adminUsers")
+SF.LootLog.new = originalNew
+assertTrue(profile:AddAdminMemberId(ALT_A), "admin add succeeds after constructor is restored")
+SF.LootLog.new = function(eventType, ...)
+    if eventType == SF.LootLogEventTypes.ADMIN_REMOVED then
+        return nil
+    end
+    return originalNew(eventType, ...)
+end
+assertFalse(profile:RemoveAdminMemberId(ALT_A), "failed ADMIN_REMOVED construction reports failure")
+assertTrue(profile:IsAdminMemberId(ALT_A), "failed admin removal does not mutate _adminUsers")
+SF.LootLog.new = originalNew
+addMember(profile, ALT_B)
+local originalAdd = profile.AddLootLog
+profile.AddLootLog = function()
+    return false
+end
+assertFalse(profile:AddAdminMemberId(ALT_B), "failed ADMIN_ADDED insert reports failure")
+assertFalse(profile:IsAdminMemberId(ALT_B), "failed admin add insert does not mutate _adminUsers")
+assertFalse(profile:RemoveAdminMemberId(ALT_A), "failed ADMIN_REMOVED insert reports failure")
+assertTrue(profile:IsAdminMemberId(ALT_A), "failed admin removal insert does not mutate _adminUsers")
+profile.AddLootLog = originalAdd
+
+resetEnv()
 profile = makeProfile("OverflowWarn")
 addMember(profile, ALT_A)
 addMember(profile, ALT_B)
@@ -1004,6 +1125,79 @@ addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
 printed = {}
 assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "harmless link onto an already overflowing component")
 assertEq(overflowWarningCount(), 0, "existing overflow does not warn again")
+
+resetEnv()
+profile = makeProfile("OverflowNewChest")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Ring1",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000100 })
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Ring2",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000110 })
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Ring1",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000120 })
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Chest",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000130 })
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_B,
+    slot = "Chest",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000140 })
+printed = {}
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "pre-existing ring overflow plus a new Chest conflict")
+assertEq(overflowWarningCount(), 1, "new Chest conflict warns once even when a ring overflow already existed")
+
+resetEnv()
+profile = makeProfile("OverflowNewRing")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Head",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000100 })
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_B,
+    slot = "Head",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000110 })
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Ring1",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000120 })
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Ring2",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000130 })
+addLog(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_B,
+    slot = "Ring1",
+    action = SF.LootLogArmorActions.USED,
+}, { timestamp = 1700000140 })
+printed = {}
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "pre-existing Head conflict plus a new ring overflow")
+assertEq(overflowWarningCount(), 1, "new ring overflow warns once even when a Head conflict already existed")
+printed = {}
+local mixedLogs = {}
+for _, log in ipairs(profile:GetLootLogs()) do
+    mixedLogs[#mixedLogs + 1] = log:ToTable()
+end
+makeProfile("OverflowMixedRebuild"):MergeLogTables(mixedLogs)
+assertEq(overflowWarningCount(), 0, "replay of mixed conflict history is silent")
 
 resetEnv()
 profile = makeProfile("OverflowNew")
@@ -1137,6 +1331,35 @@ local strangerLoot = liveTable(profile, SF.LootLogEventTypes.LOOT_MODE_CHANGE, {
 }, ALT_B)
 Sync:HandleNewLog(ALT_B, livePayload(profile, strangerLoot))
 assertEq(profile:GetLootMode(), "point_based", "non-owner/non-admin cannot send loot-mode change")
+addMember(profile, ALT_B)
+assertFalse(asPlayer(ALT_A, function()
+    return profile:LinkCharacters(ALT_A, ALT_B)
+end), "effective owner without canonical admin cannot LINK")
+assertFalse(asPlayer(ALT_A, function()
+    return profile:LinkCharacters(OWNER, ALT_B)
+end), "effective owner without canonical admin cannot LINK the owner identity")
+local seedOwnerLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = OWNER,
+    memberB = ALT_B,
+    adminMembersAtLink = { OWNER },
+}, { timestamp = 1700000800, counter = 30 })
+assertTrue(profile:MergeLogTables({ seedOwnerLink }) > 0, "bulk owner LINK does not eagerly grant")
+assertFalse(profile:IsAdminMemberId(ALT_A), "MAIN_SWAP alt is still not a canonical admin")
+assertFalse(asPlayer(ALT_A, function()
+    return profile:UnlinkCharacter(ALT_B)
+end), "effective owner without canonical admin cannot UNLINK")
+local ownerLinkData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.CHARACTER_LINK)
+ownerLinkData.memberA = OWNER
+ownerLinkData.memberB = ALT_B
+ownerLinkData.adminMembersAtLink = { ALT_A }
+assertFalse(asPlayer(ALT_A, function()
+    return SF.LootLog.new(SF.LootLogEventTypes.CHARACTER_LINK, ownerLinkData, { profile = profile })
+end), "LootLog.new rejects LINK from effective owner without canonical admin")
+local ownerUnlinkData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.CHARACTER_UNLINK)
+ownerUnlinkData.member = ALT_B
+assertFalse(asPlayer(ALT_A, function()
+    return SF.LootLog.new(SF.LootLogEventTypes.CHARACTER_UNLINK, ownerUnlinkData, { profile = profile })
+end), "LootLog.new rejects UNLINK from effective owner without canonical admin")
 
 -- ---------------------------------------------------------------------------
 -- Coordinator reconcile completeness gate
@@ -1199,6 +1422,59 @@ local beforeReconcileLogs = #(profile:GetLootLogs())
 Sync:ScheduleIdentityAdminReconcile(profile:GetProfileId())
 assertEq(#(profile:GetLootLogs()), beforeReconcileLogs, "eager grant plus later reconcile does not duplicate ADMIN_ADDED")
 assertEq(profile:ReconcileIdentityAdmins({ skipBroadcast = true }), 0, "second reconcile remains idempotent")
+
+resetEnv()
+profile = makeProfile("ReconcileAdminConv")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+profile:AddAdminMemberId(ALT_A)
+local impliedLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { ALT_A },
+}, { timestamp = 1700000400, counter = (profile._authorCounters[OWNER] or 0) + 1 })
+assertTrue(profile:MergeLogTables({ impliedLink }) > 0, "implied LINK without eager grant")
+activateSession(profile)
+Sync:BeginAdminConvergence(Sync.state.sessionId, profile:GetProfileId(), {
+    onComplete = function() end,
+})
+assertTrue(type(Sync.state._adminConvergence) == "table", "real _adminConvergence lifecycle is active")
+assertFalse(Sync:IsIdentityAdminReconcileReady(profile:GetProfileId()), "active _adminConvergence blocks identity-admin persistence")
+Sync:ScheduleIdentityAdminReconcile(profile:GetProfileId())
+assertFalse(profile:IsAdminMemberId(ALT_B), "blocked reconcile does not persist yet")
+Sync:_FinishAdminConvergence("complete")
+assertTrue(profile:IsAdminMemberId(ALT_B), "reconcile applies automatically when admin convergence finishes")
+local afterWakeLogs = #(profile:GetLootLogs())
+assertEq(profile:ReconcileIdentityAdmins({ skipBroadcast = true }), 0, "wake-up grant is not duplicated")
+assertEq(#(profile:GetLootLogs()), afterWakeLogs, "no duplicate canonical ADMIN_ADDED writes")
+
+resetEnv()
+profile = makeProfile("ReconcileAdminLogReq")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+profile:AddAdminMemberId(ALT_A)
+impliedLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { ALT_A },
+}, { timestamp = 1700000400, counter = (profile._authorCounters[OWNER] or 0) + 1 })
+assertTrue(profile:MergeLogTables({ impliedLink }) > 0, "implied LINK waiting on ADMIN_LOG_REQ")
+activateSession(profile)
+local reqId = "admin-log-req-1"
+Sync.state.requests[reqId] = {
+    id = reqId,
+    kind = "ADMIN_LOG_REQ",
+    meta = { profileId = profile:GetProfileId() },
+    attempt = 1,
+}
+assertFalse(Sync:IsIdentityAdminReconcileReady(profile:GetProfileId()), "pending ADMIN_LOG_REQ blocks persistence")
+Sync:ScheduleIdentityAdminReconcile(profile:GetProfileId())
+assertFalse(profile:IsAdminMemberId(ALT_B), "ADMIN_LOG_REQ block does not persist yet")
+Sync:CompleteRequest(reqId)
+assertTrue(profile:IsAdminMemberId(ALT_B), "request completion wakes deferred reconcile")
+Sync.state.isCoordinator = false
+Sync:ScheduleIdentityAdminReconcile(profile:GetProfileId())
+assertTrue(profile:IsAdminMemberId(ALT_B), "coordinator failover abandons pending reconcile without a second grant")
 
 -- ---------------------------------------------------------------------------
 -- Projection cache / helper performance
@@ -1338,7 +1614,7 @@ assertFalse(asPlayer(ALT_D, function()
 end), "ordinary member of another identity cannot UNLINK owner identity")
 assertTrue(asPlayer(ALT_A, function()
     return profile:UnlinkCharacter(ALT_B)
-end), "linked effective-owner alt can UNLINK owner identity")
+end), "effective-owner alt with canonical admin can UNLINK owner identity")
 
 local liveLinkOther = liveTable(profile, SF.LootLogEventTypes.CHARACTER_LINK, {
     memberA = ALT_B,
@@ -1354,6 +1630,182 @@ local liveOwnerByC = liveTable(profile, SF.LootLogEventTypes.CHARACTER_LINK, {
 }, ALT_C)
 Sync:HandleNewLog(ALT_C, livePayload(profile, liveOwnerByC))
 assertFalse(profile:AreSameIdentity(OWNER, ALT_B), "admin in another identity cannot live-LINK the owner identity")
+
+resetEnv()
+local ownerThenA = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = OWNER,
+    memberB = ALT_A,
+    adminMembersAtLink = { OWNER },
+}, { author = OWNER, counter = 2, timestamp = 1700002000 })
+local adminThenB = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OTHER },
+}, { author = OTHER, counter = 1, timestamp = 1700002010 })
+
+local peerFirst = makeProfile("ReorderFirst")
+addMember(peerFirst, ALT_A)
+addMember(peerFirst, ALT_B)
+addMember(peerFirst, OTHER)
+peerFirst._adminUsers = { OWNER, OTHER }
+activateSession(peerFirst)
+Sync.state.authorMax[OWNER] = ownerThenA._counter
+Sync:HandleNewLog(OWNER, livePayload(peerFirst, ownerThenA))
+Sync:HandleNewLog(OTHER, livePayload(peerFirst, adminThenB))
+assertTrue(peerFirst:AreSameIdentity(OWNER, ALT_A), "owner LINK is kept")
+assertFalse(peerFirst:AreSameIdentity(ALT_A, ALT_B), "later admin LINK into owner identity is rejected")
+
+local peerSecond = makeProfile("ReorderSecond")
+addMember(peerSecond, ALT_A)
+addMember(peerSecond, ALT_B)
+addMember(peerSecond, OTHER)
+peerSecond._adminUsers = { OWNER, OTHER }
+activateSession(peerSecond)
+Sync.state.authorMax[OWNER] = ownerThenA._counter
+Sync:HandleNewLog(OTHER, livePayload(peerSecond, adminThenB))
+assertFalse(peerSecond:AreSameIdentity(ALT_A, ALT_B), "admin LINK is deferred while owner predecessor is missing")
+Sync:HandleNewLog(OWNER, livePayload(peerSecond, ownerThenA))
+assertTrue(peerSecond:AreSameIdentity(OWNER, ALT_A), "owner predecessor is accepted")
+assertFalse(peerSecond:AreSameIdentity(ALT_A, ALT_B), "flushed admin LINK still cannot join the owner identity")
+local rebuildLogs = {}
+for _, log in ipairs(peerFirst:GetLootLogs()) do
+    rebuildLogs[#rebuildLogs + 1] = log:ToTable()
+end
+local rebuilt = makeProfile("ReorderRebuild")
+rebuilt:MergeLogTables(rebuildLogs)
+assertTrue(rebuilt:AreSameIdentity(OWNER, ALT_A), "rebuild matches live accepted owner LINK")
+assertFalse(rebuilt:AreSameIdentity(ALT_A, ALT_B), "rebuild matches live rejected owner-identity LINK")
+
+resetEnv()
+local peerMember = makeProfile("ReorderMember")
+addMember(peerMember, ALT_A)
+addMember(peerMember, ALT_B)
+addMember(peerMember, OTHER)
+peerMember._adminUsers = { OWNER, OTHER }
+activateSession(peerMember)
+Sync.state.isCoordinator = false
+Sync.state.authorMax[OWNER] = ownerThenA._counter
+Sync:HandleNewLog(OTHER, livePayload(peerMember, adminThenB))
+assertFalse(peerMember:AreSameIdentity(ALT_A, ALT_B), "non-coordinator defers admin LINK while owner predecessor is missing")
+Sync:HandleNewLog(OWNER, livePayload(peerMember, ownerThenA))
+assertTrue(peerMember:AreSameIdentity(OWNER, ALT_A), "non-coordinator applies owner predecessor without coordinator reconcile")
+assertFalse(peerMember:AreSameIdentity(ALT_A, ALT_B), "non-coordinator flush still rejects owner-identity LINK")
+
+resetEnv()
+local peerKnown = makeProfile("ReorderKnownMax")
+addMember(peerKnown, ALT_A)
+addMember(peerKnown, ALT_B)
+addMember(peerKnown, OTHER)
+peerKnown._adminUsers = { OWNER, OTHER }
+activateSession(peerKnown)
+Sync.state.authorMax[OWNER] = ownerThenA._counter
+Sync.state.authorMax[OTHER] = adminThenB._counter
+local queuedRepairs = 0
+local originalQueueRepair = Sync.QueueRepairRanges
+function Sync:QueueRepairRanges(...)
+    queuedRepairs = queuedRepairs + 1
+    return true
+end
+Sync:HandleNewLog(OTHER, livePayload(peerKnown, adminThenB))
+assertTrue(queuedRepairs > 0, "missing predecessor logs trigger catch-up rather than a permanent decision")
+assertFalse(peerKnown:AreSameIdentity(ALT_A, ALT_B), "known authorMax for both authors still defers the later admin LINK")
+Sync:HandleNewLog(OWNER, livePayload(peerKnown, ownerThenA))
+assertTrue(peerKnown:AreSameIdentity(OWNER, ALT_A), "owner LINK applies when both author maxima were already advertised")
+assertFalse(peerKnown:AreSameIdentity(ALT_A, ALT_B), "pending fill does not deadlock or accept the owner-identity LINK")
+Sync.QueueRepairRanges = originalQueueRepair
+
+resetEnv()
+profile = makeProfile("LootLogNewOwnerGate")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+local nonOwnerData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.CHARACTER_LINK)
+nonOwnerData.memberA = ALT_A
+nonOwnerData.memberB = ALT_B
+nonOwnerData.adminMembersAtLink = { OTHER }
+assertTrue(asPlayer(OTHER, function()
+    return SF.LootLog.new(SF.LootLogEventTypes.CHARACTER_LINK, nonOwnerData, { profile = profile })
+end), "LootLog.new allows a non-owner admin to LINK a non-owner identity")
+local ownerIdentityData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.CHARACTER_LINK)
+ownerIdentityData.memberA = OWNER
+ownerIdentityData.memberB = ALT_A
+ownerIdentityData.adminMembersAtLink = { OTHER }
+assertFalse(asPlayer(OTHER, function()
+    return SF.LootLog.new(SF.LootLogEventTypes.CHARACTER_LINK, ownerIdentityData, { profile = profile })
+end), "LootLog.new rejects a non-owner admin LINK into the owner identity")
+assertTrue(profile:LinkCharacters(OWNER, ALT_A, { skipBroadcast = true }), "owner seeds an identity for UNLINK gate")
+local unlinkOwnerData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.CHARACTER_UNLINK)
+unlinkOwnerData.member = ALT_A
+assertFalse(asPlayer(OTHER, function()
+    return SF.LootLog.new(SF.LootLogEventTypes.CHARACTER_UNLINK, unlinkOwnerData, { profile = profile })
+end), "LootLog.new rejects a non-owner admin UNLINK from the owner identity")
+
+resetEnv()
+profile = makeProfile("MalformedLive")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile._adminUsers = { OWNER, OTHER }
+activateSession(profile)
+local malformedSame = liveTable(profile, SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_A,
+    adminMembersAtLink = { OTHER },
+}, OTHER)
+Sync:HandleNewLog(OTHER, livePayload(profile, malformedSame))
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "malformed same-character live LINK is rejected")
+local malformedMap = liveTable(profile, SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { ignored = OTHER },
+}, OTHER)
+Sync:HandleNewLog(OTHER, livePayload(profile, malformedMap))
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "malformed adminMembersAtLink live LINK is rejected")
+local missingMember = liveTable(profile, SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = "Ghost-Garona",
+    adminMembersAtLink = { OTHER },
+}, OTHER)
+Sync:HandleNewLog(OTHER, livePayload(profile, missingMember))
+assertFalse(profile:getMemberByID("Ghost-Garona"), "live LINK cannot introduce a missing profile member")
+local malformedUnlink = liveTable(profile, SF.LootLogEventTypes.CHARACTER_UNLINK, {
+    member = ALT_A,
+}, OTHER)
+Sync:HandleNewLog(OTHER, livePayload(profile, malformedUnlink))
+assertEq(#profile:GetIdentityMembers(ALT_A), 1, "live UNLINK of a singleton is rejected")
+
+resetEnv()
+profile = makeProfile("RemoteFanOut")
+addMember(profile, ALT_A)
+assertTrue(profile:LinkCharacters(OWNER, ALT_A), "link for remote fan-out")
+activateSession(profile)
+SF.LootHelperIdentity.replayCount = 0
+local rebuilds = 0
+local originalRebuild = Sync.RebuildProfile
+function Sync:RebuildProfile(...)
+    rebuilds = rebuilds + 1
+    return originalRebuild(self, ...)
+end
+for i = 1, 3 do
+    local livePoint = liveTable(profile, SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 1,
+    }, OWNER)
+    Sync:HandleNewLog(OWNER, livePayload(profile, livePoint))
+end
+assertEq(SF.LootHelperIdentity.replayCount, 0, "in-order remote point NEW_LOGs do not replay identity history")
+assertEq(rebuilds, 0, "in-order remote point NEW_LOGs do not rebuild the profile once per award")
+assertEq(profile:GetIdentityPoints(OWNER), profile:GetIdentityPoints(ALT_A), "remote fan-out keeps identity points aligned")
+local lateAttendance = liveTable(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+}, OWNER, 1700000001)
+Sync:HandleNewLog(OWNER, livePayload(profile, lateAttendance))
+assertTrue(SF.LootHelperIdentity.replayCount > 0, "out-of-order remote Attendance still replays")
+Sync.RebuildProfile = originalRebuild
 
 -- ---------------------------------------------------------------------------
 -- Protocol
