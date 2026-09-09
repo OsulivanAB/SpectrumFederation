@@ -1907,6 +1907,7 @@ end
 local function assertOwnerIdentityOnly(peer, label)
     assertTrue(peer:AreSameIdentity(OWNER, ALT_A), label .. ": owner LINK is applied")
     assertFalse(peer:AreSameIdentity(ALT_A, ALT_B), label .. ": non-owner LINK into the owner identity is not applied")
+    assertFalse(peer:IsAdminMemberId(ALT_B), label .. ": skipped A+B does not persist implied admin on B")
 end
 
 resetEnv()
@@ -1945,6 +1946,33 @@ assertTrue(bulkReplica:MergeLogTables(copyLogTables(raceAB)) > 0, "bulk/AUTH_LOG
 assertOwnerIdentityOnly(bulkReplica, "bulk")
 local reloadReplica = rebuildFrom(raceOA, "RaceReload")
 assertOwnerIdentityOnly(reloadReplica, "reload")
+
+local function seedRaceCoordinator(name)
+    local peer = seedRacePeer(name)
+    Sync.state.isCoordinator = true
+    return peer
+end
+
+resetEnv()
+local raceCoordAB = seedRaceCoordinator("RaceCoordAB")
+Sync:HandleNewLog(OTHER, livePayload(raceCoordAB, raceAdminLink))
+assertTrue(raceCoordAB:AreSameIdentity(ALT_A, ALT_B), "coordinator may apply A+B until owner predecessor arrives")
+assertFalse(raceCoordAB:IsAdminMemberId(ALT_B), "live_update does not persist implied admin from unadvertised-predecessor A+B")
+Sync:HandleNewLog(OWNER, livePayload(raceCoordAB, raceOwnerLink))
+assertOwnerIdentityOnly(raceCoordAB, "coordinator AB then OA")
+Sync:ScheduleIdentityAdminReconcile(raceCoordAB:GetProfileId())
+assertOwnerIdentityOnly(raceCoordAB, "coordinator reconcile after complete AB-first history")
+
+resetEnv()
+local raceCoordOA = seedRaceCoordinator("RaceCoordOA")
+Sync:HandleNewLog(OWNER, livePayload(raceCoordOA, raceOwnerLink))
+Sync:HandleNewLog(OTHER, livePayload(raceCoordOA, raceAdminLink))
+assertOwnerIdentityOnly(raceCoordOA, "coordinator OA then AB")
+Sync:ScheduleIdentityAdminReconcile(raceCoordOA:GetProfileId())
+assertOwnerIdentityOnly(raceCoordOA, "coordinator reconcile after complete OA-first history")
+assertEq(raceCoordAB:IsAdminMemberId(ALT_B), raceCoordOA:IsAdminMemberId(ALT_B), "both coordinator arrival orders agree on B admin")
+assertFalse(raceCoordAB:AreSameIdentity(ALT_A, ALT_B), "both coordinator arrival orders skip unauthorized A+B")
+assertFalse(raceCoordOA:AreSameIdentity(ALT_A, ALT_B), "OA-first coordinator also skips unauthorized A+B")
 
 resetEnv()
 profile = makeProfile("RaceUnlinkSeed")

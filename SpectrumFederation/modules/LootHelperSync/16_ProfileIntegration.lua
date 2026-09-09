@@ -648,7 +648,14 @@ function Sync:RebuildProfile(profileId, reason)
         SF.LootHelperEvents:NotifyDataChanged("SYNC:REBUILD", { profileId = profileId })
     end
 
-    self:ScheduleIdentityAdminReconcile(profileId)
+    -- Live NEW_LOG rebuilds must not persist implied ADMIN_ADDED from a
+    -- relationship that Identity.Replay may later skip once earlier owner
+    -- history arrives. Writer-side LinkCharacters still eager-grants, and
+    -- AUTH_LOGS / snapshot / session-start rebuilds still reconcile after
+    -- advertised history is present.
+    if rebuildReason ~= "live_update" then
+        self:ScheduleIdentityAdminReconcile(profileId)
+    end
 
     return true, nil
 end

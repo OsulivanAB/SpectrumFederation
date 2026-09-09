@@ -34,6 +34,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - In-order remote Raid Check `NEW_LOG` point/Attendance updates use the same incremental fan-out as local writes
 - Live relationship authorization uses deterministic pre-operation history and defers when predecessor logs are missing
 - `Identity.Replay` is the relationship authorization source of truth: live receipt, bulk/`AUTH_LOGS` repair, and reload skip unauthorized `CHARACTER_LINK` / `CHARACTER_UNLINK` events instead of permanently accepting an unadvertised-predecessor race
+- Live `NEW_LOG` rebuilds do not persist implied `ADMIN_ADDED` grants, so a coordinator cannot lock in admin side effects from a relationship that Replay later skips
 - Live relationship `NEW_LOG` is strictly deserialized and baseline-admin authorized before it can enter pending or repair state
 - Deferred live relationship work is scoped to the originating session and discarded across session reset, new session, and persisted restore
 - Admin-convergence target maxima survive AUTH_LOGS timeout so identity-admin reconciliation cannot run against incomplete advertised history
