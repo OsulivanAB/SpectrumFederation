@@ -4,22 +4,6 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ## [1.5.0-beta.2] - 2026-09-09
 
-### Fixed
-- Non-owner admins can link and unlink identities that do not include the canonical owner
-- Live `NEW_LOG` relationship events that modify the owner's identity require the effective owner, including when the sender is a canonical admin
-- Effective-owner alts can create and sync loot-mode changes without becoming general admins
-- Coordinator identity-admin reconciliation waits until contiguous history, known author maxima, and repair work are complete
-- Lone live `NEW_LOG` fingerprint mismatches stay strict; MAIN_SWAP fingerprint repair is opt-in for batch import, snapshot, and `AUTH_LOGS`
-- Linked identities pack active ring and trinket usages chronologically; singletons keep original local slots
-- Linked Character Name-Realm fields accept hyphenated realms and use `NameUtil` equality
-- Eager admin grants after a live LINK apply only to that LINK's resulting identity
-- Overflow warnings fire only when a live LINK introduces a new equipment conflict
-- Linked Characters dialog uses Character 1 / Character 2 labels, and unlink asks for confirmation
-- Identity projection is cached per profile and reused for helpers, UI reads, and live point/Attendance fan-out
-- Out-of-order point or Attendance inserts replay identity totals instead of fan-out through the Attendance zero floor
-
-## [1.5.0-beta.1] - 2026-09-09
-
 ### Added
 - Linked Characters for Loot Helper profiles: admins can link and unlink characters so they share identity-wide points, Attendance, and equipment opportunity state while remaining separate roster members
 - `CHARACTER_LINK` and `CHARACTER_UNLINK` loot-log events, including per-LINK contemporaneous admin evidence
@@ -32,6 +16,23 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ### Fixed
 - Guarded repair for the historical Main Swap stale-fingerprint rewrite, without blessing unrelated mismatches
+- Non-owner admins can link and unlink identities that do not include the canonical owner
+- Live `NEW_LOG` relationship events that modify the owner's identity require the effective owner, including when the sender is a canonical admin
+- Live relationship `NEW_LOG` payloads are domain-validated at the receiving trust boundary; bulk/snapshot/`AUTH_LOGS` repair can still reconstruct authoritative legacy history
+- Effective-owner alts can create and sync loot-mode changes without becoming general admins
+- Coordinator identity-admin reconciliation waits until contiguous history, known author maxima, `_adminConvergence`, and repair work are complete, then resumes when those blockers finish
+- Live `CHARACTER_LINK` / `CHARACTER_UNLINK` creation (`LootLog.new`, profile APIs, and `NEW_LOG`) requires canonical admin authorization, plus effective owner when the relationship touches the owner identity
+- Lone live `NEW_LOG` fingerprint mismatches stay strict; MAIN_SWAP fingerprint repair is opt-in for batch import, snapshot, and `AUTH_LOGS`
+- Linked identities pack active ring and trinket usages chronologically; singletons keep original local slots
+- Linked Character and admin Name-Realm fields accept hyphenated realms and use `NameUtil` equality
+- Canonical admin add/remove fails closed when the required log cannot be written
+- Eager admin grants after a live LINK apply only to that LINK's resulting identity
+- Overflow warnings fire only when a live LINK introduces a new identifiable conflict
+- Linked Characters dialog uses Character 1 / Character 2 labels, and unlink asks for confirmation
+- Identity projection is cached per profile and reused for helpers, UI reads, and live point/Attendance fan-out
+- Out-of-order point or Attendance inserts replay identity totals instead of fan-out through the Attendance zero floor
+- In-order remote Raid Check `NEW_LOG` point/Attendance updates use the same incremental fan-out as local writes
+- Live relationship authorization uses deterministic pre-operation history and defers when predecessor logs are missing
 
 ## [1.4.1] - 2026-09-07
 

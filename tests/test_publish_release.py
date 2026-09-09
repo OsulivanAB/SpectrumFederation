@@ -560,6 +560,17 @@ def test_changelog_beta_uses_exact_heading_then_unreleased(tmp_path, monkeypatch
     assert "Unreleased beta notes" in missing_beta
 
 
+def test_current_unreleased_beta_notes_include_linked_characters():
+    notes = publish.get_changelog_for_version("1.5.0-beta.2")
+    assert notes is not None
+    assert "## [1.5.0-beta.2]" in notes
+    assert "Linked Characters" in notes
+    assert "CHARACTER_LINK" in notes
+    changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## [1.5.0-beta.1]" not in changelog
+    assert notes.count("## [") == 1
+
+
 def test_changelog_alpha_and_rc_use_exact_heading_only(tmp_path, monkeypatch):
     (tmp_path / "CHANGELOG.md").write_text(CHANGELOG_FIXTURE, encoding="utf-8")
     monkeypatch.chdir(tmp_path)
