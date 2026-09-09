@@ -121,6 +121,10 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = self:_Now()
 
+    if self._ClearIdentitySessionBookkeeping then
+        self:_ClearIdentitySessionBookkeeping("RestorePersistedSession")
+    end
+
     self.state.heartbeat = {}
     local hb = self.state.heartbeat
     hb.lastHeartbeatAt = self:_Now()
@@ -525,7 +529,7 @@ function Sync:OnGroupRosterUpdate()
     local me = self:_SelfId()
 
     -- Build a single payload to reuse
-    self.state.authorMax = self:ComputeAuthorMax(profileId) or (self.state.authorMax or {})
+    self:_RefreshAdvertisedAuthorMax(profileId)
     local payload = {
         sessionId   = sid,
         profileId   = profileId,
@@ -774,6 +778,10 @@ function Sync:_ResetSessionState(reason)
     self:_ResetSessionSafeMode("ResetSessionState")
     self:_ResetLocalSafeMode("ResetSessionState")
 
+    if self._ClearIdentitySessionBookkeeping then
+        self:_ClearIdentitySessionBookkeeping(reason or "ResetSessionState")
+    end
+
     -- Clear heartbeat state and stop any heartbeat timer/ticker
     do
         local hb = self.state.heartbeat
@@ -935,7 +943,7 @@ function Sync:ReannounceSession()
     if not SF.LootHelperComm then return end
 
     local profileId = self.state.profileId
-    self.state.authorMax = self:ComputeAuthorMax(profileId) or {}
+    self:_RefreshAdvertisedAuthorMax(profileId)
 
     local payload = {
         sessionId   = self.state.sessionId,

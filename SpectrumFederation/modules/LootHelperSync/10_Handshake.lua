@@ -37,9 +37,9 @@ function Sync:BroadcastSessionHeartbeat()
     if type(sid) ~= "string" or sid == "" then return false end 
     if type(profileId) ~= "string" or profileId == "" then return false end
 
-    -- Keep authorMax fresh so reconnecting clients can catch up.
-    -- Note: If performance becomes an issue, we can later switch this to reuse self.state.authorMax and only recompute periodically
-    self.state.authorMax = self:ComputeAuthorMax(profileId) or (self.state.authorMax or {})
+    -- Keep authorMax fresh so reconnecting clients can catch up, without
+    -- lowering a previously advertised frontier.
+    self:_RefreshAdvertisedAuthorMax(profileId)
     self.state.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or (self.state.authorWindowSummary or {})
 
     local payload = {

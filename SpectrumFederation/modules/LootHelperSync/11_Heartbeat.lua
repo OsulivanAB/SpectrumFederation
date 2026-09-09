@@ -68,7 +68,9 @@ function Sync:HandleSessionStart(sender, payload)
         self:StopHeartbeatSender("lost coordinator via SES_START")
     end
 
-    if type(payload.authorMax) == "table" then
+    if self._MergeAuthorMaxFrontier then
+        self:_MergeAuthorMaxFrontier(payload.authorMax)
+    elseif type(payload.authorMax) == "table" then
         self.state.authorMax = payload.authorMax
     else
         self.state.authorMax = {}

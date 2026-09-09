@@ -6,7 +6,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 
 ### Added
 - Linked Characters for Loot Helper profiles: admins can link and unlink characters so they share identity-wide points, Attendance, and equipment opportunity state while remaining separate roster members
-- `CHARACTER_LINK` and `CHARACTER_UNLINK` loot-log events, including per-LINK contemporaneous admin evidence
+- `CHARACTER_LINK` and `CHARACTER_UNLINK` loot-log events, including per-LINK contemporaneous admin evidence and `preOpAuthorMax` writer-observed heads
 - Identity-scoped equipment corrections that record `identityMembers` at write time
 
 ### Changed
@@ -33,6 +33,13 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Out-of-order point or Attendance inserts replay identity totals instead of fan-out through the Attendance zero floor
 - In-order remote Raid Check `NEW_LOG` point/Attendance updates use the same incremental fan-out as local writes
 - Live relationship authorization uses deterministic pre-operation history and defers when predecessor logs are missing
+- `Identity.Replay` is the relationship authorization source of truth: live receipt, bulk/`AUTH_LOGS` repair, and reload skip unauthorized `CHARACTER_LINK` / `CHARACTER_UNLINK` events instead of permanently accepting an unadvertised-predecessor race
+- Live relationship `NEW_LOG` is strictly deserialized and baseline-admin authorized before it can enter pending or repair state
+- Deferred live relationship work is scoped to the originating session and discarded across session reset, new session, and persisted restore
+- Admin-convergence target maxima survive AUTH_LOGS timeout so identity-admin reconciliation cannot run against incomplete advertised history
+- Later live LINK does not retroactively grant MAIN_SWAP-restored non-admin sources; canonical admin implication crosses only the pre-link boundary
+- Identity-scoped equipment corrections no longer erase later character-local actions after unlink/relink
+- Overflow warnings detect increased conflict multiplicity per slot/family, not only new conflict keys
 
 ## [1.4.1] - 2026-09-07
 

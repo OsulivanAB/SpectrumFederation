@@ -258,7 +258,11 @@ function Sync:HandleSessionReannounce(sender, payload)
         self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
     end
 
-    self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
+    if self._MergeAuthorMaxFrontier then
+        self:_MergeAuthorMaxFrontier(payload.authorMax)
+    else
+        self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
+    end
     self.state.authorWindowSummary = (type(payload.authorWindowSummary) == "table") and payload.authorWindowSummary or {}
     self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
 

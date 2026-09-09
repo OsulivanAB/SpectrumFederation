@@ -419,6 +419,51 @@ local function ValidateNameRealmList(list, fieldName, allowEmpty)
     return true
 end
 
+local function ValidatePreOpAuthorMax(list)
+    if list == nil then
+        return true
+    end
+    if not IsArrayLikeList(list) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "preOpAuthorMax must be an array")
+        end
+        return false
+    end
+    local seen = {}
+    for _, entry in ipairs(list) do
+        if type(entry) ~= "table" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "preOpAuthorMax entries must be tables")
+            end
+            return false
+        end
+        local author = NormalizeStoredNameRealm(entry.author)
+        local counter = tonumber(entry.counter)
+        if not author then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid preOpAuthorMax author: %s", tostring(entry.author))
+            end
+            return false
+        end
+        if not counter or counter < 1 or counter ~= math.floor(counter) then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid preOpAuthorMax counter for %s: %s", tostring(author), tostring(entry.counter))
+            end
+            return false
+        end
+        for seenId in pairs(seen) do
+            if SameStoredPlayer(seenId, author) then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Duplicate preOpAuthorMax author: %s", tostring(author))
+                end
+                return false
+            end
+        end
+        seen[author] = true
+    end
+    return true
+end
+
 function LootLogValidators.ValidateCharacterLinkData(eventData)
     if type(eventData) ~= "table" then
         return false
@@ -443,11 +488,17 @@ function LootLogValidators.ValidateCharacterLinkData(eventData)
         end
         return false
     end
-    return ValidateNameRealmList(eventData.adminMembersAtLink, "adminMembersAtLink", true)
+    if not ValidateNameRealmList(eventData.adminMembersAtLink, "adminMembersAtLink", true) then
+        return false
+    end
+    return ValidatePreOpAuthorMax(eventData.preOpAuthorMax)
 end
 
 function LootLogValidators.ValidateCharacterUnlinkData(eventData)
-    return ValidateStoredNameRealmField(eventData and eventData.member, "CHARACTER_UNLINK")
+    if not ValidateStoredNameRealmField(eventData and eventData.member, "CHARACTER_UNLINK") then
+        return false
+    end
+    return ValidatePreOpAuthorMax(eventData and eventData.preOpAuthorMax)
 end
 
 local VALID_LOOT_MODES = {

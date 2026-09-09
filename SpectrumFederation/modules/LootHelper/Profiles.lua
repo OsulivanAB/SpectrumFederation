@@ -2206,8 +2206,8 @@ function LootProfile:LinkCharacters(memberA, memberB, opts)
     end
 
     local before = self._identityProjection
-    local conflictsA = Identity and Identity.ComponentConflictKeys and Identity.ComponentConflictKeys(before, memberA)
-    local conflictsB = Identity and Identity.ComponentConflictKeys and Identity.ComponentConflictKeys(before, memberB)
+    local conflictCountsA = Identity and Identity.ComponentConflictCounts and Identity.ComponentConflictCounts(before, memberA)
+    local conflictCountsB = Identity and Identity.ComponentConflictCounts and Identity.ComponentConflictCounts(before, memberB)
 
     local adminMembersAtLink = {}
     if Identity and Identity.ComponentAdmins then
@@ -2237,7 +2237,11 @@ function LootProfile:LinkCharacters(memberA, memberB, opts)
 
     local result = self._identityProjection
     if result and Identity and Identity.IntroducedNewConflict
-        and Identity.IntroducedNewConflict(conflictsA, conflictsB, Identity.ComponentConflictKeys(result, memberA))
+        and Identity.IntroducedNewConflict(
+            conflictCountsA,
+            conflictCountsB,
+            Identity.ComponentConflictCounts and Identity.ComponentConflictCounts(result, memberA)
+        )
         and SF.PrintWarning
     then
         SF:PrintWarning("Linked characters share equipment history with overlapping slot usage.")

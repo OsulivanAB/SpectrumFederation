@@ -317,6 +317,45 @@ function Sync:ComputeAuthorMax(profileId)
     return {}
 end
 
+-- Retain the highest advertised per-author frontier. Timeout or a later
+-- local ComputeAuthorMax must not forget history that is already known to exist.
+function Sync:_MergeAuthorMaxFrontier(incoming)
+    self.state = self.state or {}
+    self.state.authorMax = self.state.authorMax or {}
+    if type(incoming) ~= "table" then
+        return self.state.authorMax
+    end
+    for author, maxCounter in pairs(incoming) do
+        maxCounter = tonumber(maxCounter)
+        if type(author) == "string" and author ~= "" and maxCounter then
+            local prev = tonumber(self.state.authorMax[author]) or 0
+            if maxCounter > prev then
+                self.state.authorMax[author] = maxCounter
+            end
+        end
+    end
+    return self.state.authorMax
+end
+
+function Sync:_RefreshAdvertisedAuthorMax(profileId)
+    return self:_MergeAuthorMaxFrontier(self:ComputeAuthorMax(profileId))
+end
+
+-- Drop live-relationship and identity-admin bookkeeping that belongs to a
+-- session that is ending, changing, or being restored from persistence.
+-- Same-session coordinator failover must not call this.
+function Sync:_ClearIdentitySessionBookkeeping(reason)
+    self._pendingLiveRelationship = {}
+    self._liveRelationshipInFlight = nil
+    self._flushingLiveRelationship = nil
+    self._identityAdminReconcileNeeded = {}
+    self._identityAdminReconcilePending = {}
+    self._consideringIdentitySideEffects = nil
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Cleared identity session bookkeeping (reason=%s)", tostring(reason or "unknown"))
+    end
+end
+
 -- Function Compute missing log ranges given local authorMax and remote authorMax (or detect gaps).
 -- @param localAuthorMax table Map [author] = maxCounterSeen
 -- @param remoteAuthorMax table Map [author] = maxCounterSeen

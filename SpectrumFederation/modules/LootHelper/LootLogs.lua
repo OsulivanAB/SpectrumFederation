@@ -89,9 +89,11 @@ local EVENT_DATA_TEMPLATES = {
         memberA = "",
         memberB = "",
         adminMembersAtLink = {},
+        preOpAuthorMax = {},
     },
     [EVENT_TYPES.CHARACTER_UNLINK] = {
         member = "",
+        preOpAuthorMax = {},
     },
     [EVENT_TYPES.LOOT_MODE_CHANGE] = {
         oldMode = "",
@@ -520,6 +522,18 @@ function LootLog.new(eventType, eventData, opts)
         end
     end
 
+    -- Snapshot contemporaneous author heads before this event allocates a counter.
+    if eventType == EVENT_TYPES.CHARACTER_LINK or eventType == EVENT_TYPES.CHARACTER_UNLINK then
+        if type(eventData.preOpAuthorMax) ~= "table" or #eventData.preOpAuthorMax == 0 then
+            local Identity = SF.LootHelperIdentity
+            if Identity and Identity.SnapshotPreOpAuthorMax then
+                eventData.preOpAuthorMax = Identity.SnapshotPreOpAuthorMax(owningProfile)
+            else
+                eventData.preOpAuthorMax = {}
+            end
+        end
+    end
+
     local timestamp = opts.timestamp or GetServerTime()
     local author = opts.author or SF:GetPlayerFullIdentifier()
     local externalId = opts.externalId
@@ -844,6 +858,9 @@ function LootLog.ValidateTable(t, opts)
     end
 
     local computedFingerprint = ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, t._data)
+    if opts.requireFingerprint and type(t._fingerprint) ~= "number" then
+        return false, "log._fingerprint is required"
+    end
     if t._fingerprint ~= nil then
         if type(t._fingerprint) ~= "number" then
             return false, "log._fingerprint must be a number when provided"

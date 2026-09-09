@@ -97,6 +97,16 @@ local function GetLogData(log)
     return log._data
 end
 
+local function GetLogAuthor(log)
+    if type(log) ~= "table" then
+        return nil
+    end
+    if log.GetAuthor then
+        return NormalizeId(log:GetAuthor())
+    end
+    return NormalizeId(log._author)
+end
+
 function Identity.CompareLogs(a, b)
     local aTime = (a and a.GetTimestamp and a:GetTimestamp()) or (a and a._timestamp) or 0
     local bTime = (b and b.GetTimestamp and b:GetTimestamp()) or (b and b._timestamp) or 0
@@ -442,33 +452,64 @@ local function CopyArmor(src)
     return armor
 end
 
-local function OverflowKeys(occ)
-    local keys = {}
+local function OverflowCounts(occ)
+    local counts = {}
     if occ.ring.overflow > 0 then
-        keys[#keys + 1] = "ring"
+        counts.ring = occ.ring.overflow
     end
     if occ.trinket.overflow > 0 then
-        keys[#keys + 1] = "trinket"
+        counts.trinket = occ.trinket.overflow
     end
     for slot, state in pairs(occ.ordinary) do
         if state.overflow and state.overflow > 0 then
-            keys[#keys + 1] = slot
+            counts[slot] = state.overflow
         end
+    end
+    return counts
+end
+
+local function OverflowKeys(occ)
+    local keys = {}
+    local counts = OverflowCounts(occ)
+    for key in pairs(counts) do
+        keys[#keys + 1] = key
     end
     table.sort(keys)
     return keys
 end
 
-local function IdentityHasOverflow(occ)
-    return #OverflowKeys(occ) > 0
+local function LatestLocalOriginForSlot(ids, slot, localOrigin)
+    local family = FamilyForSlot(slot)
+    local latest = nil
+    local function consider(log)
+        if not log then
+            return
+        end
+        if not latest or Identity.CompareLogs(latest, log) then
+            latest = log
+        end
+    end
+    for i = 1, #ids do
+        local origin = localOrigin[ids[i]] or {}
+        if family == "ordinary" then
+            consider(origin[slot])
+        elseif family == "ring" then
+            consider(origin.Ring1)
+            consider(origin.Ring2)
+        elseif family == "trinket" then
+            consider(origin.Trinket1)
+            consider(origin.Trinket2)
+        end
+    end
+    return latest
 end
 
-local function ArmorFromOcc(occ)
-    local armor = EmptyArmor()
-    for slot in pairs(armor) do
-        armor[slot] = OccupiedBool(occ, slot)
+local function IdentityEventSupersededByLocals(ev, ids, localOrigin)
+    local latest = LatestLocalOriginForSlot(ids, ev.slot, localOrigin)
+    if not latest or not ev.log then
+        return false
     end
-    return armor
+    return Identity.CompareLogs(ev.log, latest)
 end
 
 local function EventTypes()
@@ -481,6 +522,74 @@ end
 
 local function MemberRoles()
     return (SF.MemberRoles) or { ADMIN = "admin", MEMBER = "member" }
+end
+
+local function IsCanonicalAdminAt(memberId, simulated, auth, owner)
+    memberId = NormalizeId(memberId)
+    if not memberId then
+        return false
+    end
+    if auth[memberId] == "member" then
+        return false
+    end
+    if simulated[memberId] then
+        return true
+    end
+    if auth[memberId] == "admin" then
+        return true
+    end
+    return SamePlayer(memberId, owner)
+end
+
+local function IsEffectiveOwnerAt(memberId, partition, owner)
+    owner = NormalizeId(owner)
+    memberId = NormalizeId(memberId)
+    if not owner or not memberId then
+        return false
+    end
+    if SamePlayer(memberId, owner) then
+        return true
+    end
+    local ownerRoot = FindRoot(partition, owner)
+    local memberRoot = FindRoot(partition, memberId)
+    return ownerRoot and memberRoot and ownerRoot == memberRoot
+end
+
+local function RelationshipTouchesOwnerAt(eventType, eventData, partition, owner)
+    local types = EventTypes()
+    if eventType == types.CHARACTER_LINK then
+        return IsEffectiveOwnerAt(eventData.memberA, partition, owner)
+            or IsEffectiveOwnerAt(eventData.memberB, partition, owner)
+    end
+    if eventType == types.CHARACTER_UNLINK then
+        return IsEffectiveOwnerAt(eventData.member, partition, owner)
+    end
+    return false
+end
+
+local function RelationshipAuthorizedAt(log, eventType, eventData, partition, simulated, auth, owner)
+    local author = GetLogAuthor(log)
+    if not IsCanonicalAdminAt(author, simulated, auth, owner) then
+        return false
+    end
+    if RelationshipTouchesOwnerAt(eventType, eventData, partition, owner)
+        and not IsEffectiveOwnerAt(author, partition, owner)
+    then
+        return false
+    end
+    return true
+end
+
+local function IdentityHasOverflow(occ)
+    return #OverflowKeys(occ) > 0
+end
+
+local function ArmorFromOcc(occ)
+    local armor = EmptyArmor()
+    for slot in pairs(armor) do
+        armor[slot] = OccupiedBool(occ, slot)
+    end
+    return armor
 end
 
 local function IsIdentityArmor(data)
@@ -567,6 +676,26 @@ function Identity.SortedUnique(ids)
     return SortedUnique(ids)
 end
 
+function Identity.SnapshotPreOpAuthorMax(profile)
+    local out = {}
+    if type(profile) ~= "table" or type(profile._authorCounters) ~= "table" then
+        return out
+    end
+    for author, counter in pairs(profile._authorCounters) do
+        local n = tonumber(counter)
+        if type(author) == "string" and author ~= "" and n and n > 0 then
+            out[#out + 1] = {
+                author = NormalizeId(author) or author,
+                counter = math.floor(n),
+            }
+        end
+    end
+    table.sort(out, function(a, b)
+        return tostring(a.author) < tostring(b.author)
+    end)
+    return out
+end
+
 function Identity.AffectsProjection(eventType)
     return eventType == (EventTypes().CHARACTER_LINK)
         or eventType == (EventTypes().CHARACTER_UNLINK)
@@ -595,6 +724,16 @@ function Identity.ComponentHasOverflow(result, memberId)
 end
 
 function Identity.ComponentConflictKeys(result, memberId)
+    local counts = Identity.ComponentConflictCounts(result, memberId)
+    local keys = {}
+    for key in pairs(counts) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys)
+    return keys
+end
+
+function Identity.ComponentConflictCounts(result, memberId)
     if type(result) ~= "table" or type(result.identityOf) ~= "table" then
         return {}
     end
@@ -604,19 +743,35 @@ function Identity.ComponentConflictKeys(result, memberId)
     if not root then
         return {}
     end
-    return (result.overflowKeysByIdentity and result.overflowKeysByIdentity[root]) or {}
+    return (result.overflowCountsByIdentity and result.overflowCountsByIdentity[root]) or {}
 end
 
-function Identity.IntroducedNewConflict(keysA, keysB, keysAfter)
+function Identity.IntroducedNewConflict(countsA, countsB, countsAfter)
+    local function asCounts(value)
+        if type(value) ~= "table" then
+            return {}
+        end
+        if value[1] ~= nil then
+            local counts = {}
+            for i = 1, #value do
+                counts[value[i]] = 1
+            end
+            return counts
+        end
+        return value
+    end
+    countsA = asCounts(countsA)
+    countsB = asCounts(countsB)
+    countsAfter = asCounts(countsAfter)
     local before = {}
-    for i = 1, #(keysA or {}) do
-        before[keysA[i]] = true
+    for key, count in pairs(countsA) do
+        before[key] = math.max(before[key] or 0, tonumber(count) or 0)
     end
-    for i = 1, #(keysB or {}) do
-        before[keysB[i]] = true
+    for key, count in pairs(countsB) do
+        before[key] = math.max(before[key] or 0, tonumber(count) or 0)
     end
-    for i = 1, #(keysAfter or {}) do
-        if not before[keysAfter[i]] then
+    for key, count in pairs(countsAfter) do
+        if (tonumber(count) or 0) > (before[key] or 0) then
             return true
         end
     end
@@ -664,8 +819,17 @@ end
 function Identity.Replay(logs, opts)
     Identity.replayCount = (Identity.replayCount or 0) + 1
     opts = opts or {}
-    local owner = NormalizeId(opts.owner)
     local types = EventTypes()
+    local owner = NormalizeId(opts.owner)
+    if not owner then
+        for i = 1, #(logs or {}) do
+            local log = logs[i]
+            if GetLogType(log) == types.PROFILE_CREATION then
+                owner = GetLogAuthor(log)
+                break
+            end
+        end
+    end
     local actions = ArmorActions()
     local roles = MemberRoles()
     local partition = NewPartition()
@@ -729,38 +893,46 @@ function Identity.Replay(logs, opts)
                 local memberB = ensureLocal(data.memberB)
                 local preA = ComponentList(partition, memberA)
                 local preB = ComponentList(partition, memberB)
-                local preSet = ListToSet(preA)
-                for j = 1, #preB do
-                    preSet[preB[j]] = true
-                end
-                local evidence = CanonicalAdminMembersAtLink(data)
-                for j = 1, #evidence do
-                    local adminId = evidence[j]
-                    if not preSet[adminId] then
-                        if SF.Debug then
-                            SF.Debug:Warn(
-                                "IDENTITY",
-                                "Ignoring out-of-component adminMembersAtLink entry %s on CHARACTER_LINK %s+%s",
-                                tostring(adminId),
-                                tostring(memberA),
-                                tostring(memberB)
-                            )
+                if RelationshipAuthorizedAt(log, eventType, data, partition, simulated, auth, owner) then
+                    local preSet = ListToSet(preA)
+                    for j = 1, #preB do
+                        preSet[preB[j]] = true
+                    end
+                    local evidence = CanonicalAdminMembersAtLink(data)
+                    for j = 1, #evidence do
+                        local adminId = evidence[j]
+                        if not preSet[adminId] then
+                            if SF.Debug then
+                                SF.Debug:Warn(
+                                    "IDENTITY",
+                                    "Ignoring out-of-component adminMembersAtLink entry %s on CHARACTER_LINK %s+%s",
+                                    tostring(adminId),
+                                    tostring(memberA),
+                                    tostring(memberB)
+                                )
+                            end
+                        elseif auth[adminId] == "member" then
+                            -- Explicit earlier removal wins over stale evidence.
+                        elseif auth[adminId] == "admin" then
+                            simulated[adminId] = true
+                        else
+                            simulated[adminId] = true
                         end
-                    elseif auth[adminId] == "member" then
-                        -- Explicit earlier removal wins over stale evidence.
-                    elseif auth[adminId] == "admin" then
-                        simulated[adminId] = true
-                    else
-                        simulated[adminId] = true
+                    end
+                    local preAHasAdmin = ComponentHasSimulatedAdmin(preA, simulated, owner)
+                    local preBHasAdmin = ComponentHasSimulatedAdmin(preB, simulated, owner)
+                    Union(partition, memberA, memberB)
+                    if preAHasAdmin then
+                        ImplyIdentityAdmins(preB, simulated, owner)
+                    end
+                    if preBHasAdmin then
+                        ImplyIdentityAdmins(preA, simulated, owner)
                     end
                 end
-                Union(partition, memberA, memberB)
-                local resultIds = ComponentList(partition, memberA or memberB)
-                if ComponentHasSimulatedAdmin(resultIds, simulated, owner) then
-                    ImplyIdentityAdmins(resultIds, simulated, owner)
-                end
             elseif eventType == types.CHARACTER_UNLINK then
-                Split(partition, data.member)
+                if RelationshipAuthorizedAt(log, eventType, data, partition, simulated, auth, owner) then
+                    Split(partition, data.member)
+                end
                 ensureLocal(data.member)
             elseif eventType == types.ADMIN_ADDED then
                 ensureLocal(data.member)
@@ -812,7 +984,9 @@ function Identity.Replay(logs, opts)
                             localOrigin[memberId][data.slot] = log
                         elseif data.action == actions.AVAILABLE then
                             localArmor[memberId][data.slot] = false
-                            localOrigin[memberId][data.slot] = nil
+                            -- Keep AVAILABLE origins so later local actions supersede
+                            -- older identity-scoped corrections after unlink/relink.
+                            localOrigin[memberId][data.slot] = log
                         end
                     end
                 end
@@ -826,6 +1000,7 @@ function Identity.Replay(logs, opts)
     local armor = {}
     local overflowByIdentity = {}
     local overflowKeysByIdentity = {}
+    local overflowCountsByIdentity = {}
     local occByRoot = {}
     local members = {}
 
@@ -856,13 +1031,16 @@ function Identity.Replay(logs, opts)
             local idSet = ListToSet(ids)
             for j = 1, #identityArmorEvents do
                 local ev = identityArmorEvents[j]
-                if IsSubset(ev.identityMembers, idSet) then
+                if IsSubset(ev.identityMembers, idSet)
+                    and not IdentityEventSupersededByLocals(ev, ids, localOrigin)
+                then
                     ApplyIdentityArmor(occ, ev.slot, ev.action)
                 end
             end
             occByRoot[root] = occ
             overflowByIdentity[root] = IdentityHasOverflow(occ)
             overflowKeysByIdentity[root] = OverflowKeys(occ)
+            overflowCountsByIdentity[root] = OverflowCounts(occ)
             local projected = ArmorFromOcc(occ)
             for j = 1, #ids do
                 points[ids[j]] = pointTotal
@@ -896,6 +1074,7 @@ function Identity.Replay(logs, opts)
         restoredSources = restoredSources,
         overflowByIdentity = overflowByIdentity,
         overflowKeysByIdentity = overflowKeysByIdentity,
+        overflowCountsByIdentity = overflowCountsByIdentity,
         partition = partition,
     }
 end
@@ -995,12 +1174,12 @@ function Identity.ComponentAdmins(profile, memberA, memberB)
     local result = profile._identityProjection
     if type(result) ~= "table" or type(result.identityOf) ~= "table" then
         local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
-        local owner = profile.GetOwner and profile:GetOwner() or profile._owner
+        local owner = (profile.GetOwnerId and profile:GetOwnerId()) or profile._owner
         result = Identity.Replay(logs, { owner = owner })
     end
     memberA = NormalizeId(memberA)
     memberB = NormalizeId(memberB)
-    local owner = profile.GetOwner and profile:GetOwner() or profile._owner
+    local owner = (profile.GetOwnerId and profile:GetOwnerId()) or profile._owner
     local seen = {}
     local admins = {}
     local function consider(id)
@@ -1037,7 +1216,7 @@ function Identity.ApplyToProfileMembers(profile)
         return nil
     end
     local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
-    local owner = profile.GetOwner and profile:GetOwner() or profile._owner
+    local owner = (profile.GetOwnerId and profile:GetOwnerId()) or profile._owner
     local result = Identity.Replay(logs, { owner = owner })
 
     local existing = {}

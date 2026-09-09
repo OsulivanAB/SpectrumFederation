@@ -319,8 +319,20 @@ function Sync:FinalizeAdminConvergence()
         end
     end
 
-    -- 4) compute missing ranges for the coordinator
+    -- 4) Retain advertised maxima even if AUTH_LOGS later times out, then
+    -- compute missing ranges for the coordinator.
+    if self._MergeAuthorMaxFrontier then
+        self:_MergeAuthorMaxFrontier(targetMax)
+    else
+        self.state.authorMax = targetMax
+    end
     local missing = self:ComputeMissingLogRequests(localContig, targetMax)
+    if type(missing) == "table" and #missing > 0 and self.QueueRepairRanges then
+        self:QueueRepairRanges(profileId, missing, {
+            mode = "missing",
+            reason = "admin-convergence-target",
+        })
+    end
 
     -- 5) send LOG_REQs to a reasonable provider
     conv.pendingReq = {}
@@ -360,6 +372,10 @@ function Sync:FinalizeAdminConvergence()
         if not ok then
             conv.pendingReq[requestId] = nil
             conv.pendingCount = math.max(0, conv.pendingCount - 1)
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "ADMIN_LOG_REQ register failed (author=%s range=%s-%s); advertised targetMax is retained",
+                    tostring(author), tostring(fromCounter), tostring(toCounter))
+            end
         end
 
         return ok
@@ -524,7 +540,7 @@ function Sync:BroadcastSessionStart()
     end
 
     local profileId = self.state.profileId
-    self.state.authorMax = self:ComputeAuthorMax(profileId) or {}
+    self:_RefreshAdvertisedAuthorMax(profileId)
     self.state.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or {}
     
     -- Store chosen helpers for later activation

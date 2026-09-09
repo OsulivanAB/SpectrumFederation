@@ -69,6 +69,13 @@ local function SenderIsEffectiveOwner(profile, sender)
 end
 
 function Sync:_QueuePendingLiveRelationship(profileId, sender, logTable)
+    local sessionId = self.state and self.state.sessionId
+    if type(sessionId) ~= "string" or sessionId == "" then
+        return
+    end
+    if type(profileId) ~= "string" or profileId == "" then
+        return
+    end
     self._pendingLiveRelationship = self._pendingLiveRelationship or {}
     local list = self._pendingLiveRelationship[profileId] or {}
     local logId = self:_ExtractLogId(logTable)
@@ -77,7 +84,12 @@ function Sync:_QueuePendingLiveRelationship(profileId, sender, logTable)
             return
         end
     end
-    list[#list + 1] = { sender = sender, logTable = logTable }
+    list[#list + 1] = {
+        sender = sender,
+        logTable = logTable,
+        sessionId = sessionId,
+        profileId = profileId,
+    }
     self._pendingLiveRelationship[profileId] = list
 end
 
@@ -144,6 +156,19 @@ function Sync:_LiveRelationshipPredecessorState(profileId, logTable)
             known[author] = math.max(known[author] or 0, tonumber(maxCounter) or 0)
         end
     end
+    local eventData = GetLogEventData(logTable)
+    if type(eventData) == "table" and type(eventData.preOpAuthorMax) == "table" then
+        for i = 1, #eventData.preOpAuthorMax do
+            local entry = eventData.preOpAuthorMax[i]
+            if type(entry) == "table" then
+                local author = entry.author
+                local maxCounter = tonumber(entry.counter)
+                if type(author) == "string" and author ~= "" and maxCounter then
+                    known[author] = math.max(known[author] or 0, maxCounter)
+                end
+            end
+        end
+    end
     if type(incomingAuthor) == "string" and type(incomingCounter) == "number" then
         known[incomingAuthor] = math.min(tonumber(known[incomingAuthor]) or incomingCounter, incomingCounter)
     end
@@ -204,13 +229,16 @@ function Sync:FlushPendingLiveRelationshipLogs(profileId)
     self._flushingLiveRelationship = true
     self._liveRelationshipInFlight = pending
     self._pendingLiveRelationship[profileId] = {}
+    local currentSessionId = self.state and self.state.sessionId
     for i = 1, #pending do
         local item = pending[i]
-        self:HandleNewLog(item.sender, {
-            sessionId = self.state and self.state.sessionId,
-            profileId = profileId,
-            log = item.logTable,
-        })
+        if type(item.sessionId) == "string" and item.sessionId == currentSessionId then
+            self:HandleNewLog(item.sender, {
+                sessionId = item.sessionId,
+                profileId = profileId,
+                log = item.logTable,
+            })
+        end
     end
     self._liveRelationshipInFlight = nil
     self._flushingLiveRelationship = nil
@@ -331,15 +359,42 @@ function Sync:HandleNewLog(sender, payload)
     end
 
     -- Trust policy: coordinator or canonical admin for ordinary live writes.
-    -- Relationship events always require admin; owner-identity also requires
-    -- effective owner. Authorization uses deterministic pre-operation history.
+    -- Relationship events always require baseline canonical admin before they
+    -- can enter pending/repair state. Owner-identity authorization is applied
+    -- by Identity.Replay against the ordered historical prefix so live receipt,
+    -- bulk repair, and reload converge from the same logs.
     local eventType = GetLogEventType(logTable)
     local types = SF.LootLogEventTypes or {}
     local isRelationship = eventType == types.CHARACTER_LINK or eventType == types.CHARACTER_UNLINK
+    local lootLog = logTable
     if isRelationship then
+        if SF.LootLog and SF.LootLog.FromTable and getmetatable(logTable) ~= SF.LootLog then
+            lootLog = select(1, SF.LootLog.FromTable(logTable, {
+                allowUnknownEventType = false,
+                requireFingerprint = true,
+            }))
+        end
+        if not lootLog then
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: invalid relationship log."):format(tostring(sender), tostring(profileId)))
+            end
+            return
+        end
+        if lootLog.ToTable then
+            logTable = lootLog:ToTable()
+        end
+        eventType = GetLogEventType(logTable) or eventType
+        eventData = GetLogEventData(logTable)
+        memberId = eventData.member or memberId
         if not self:_LiveRelationshipDomainValid(profile, eventType, eventData, logTable) then
             if SF.PrintWarning then
                 SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: invalid relationship payload."):format(tostring(sender), tostring(profileId)))
+            end
+            return
+        end
+        if not self:IsSenderAuthorized(profileId, sender) then
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
             end
             return
         end
@@ -361,7 +416,6 @@ function Sync:HandleNewLog(sender, payload)
         end
     end
 
-    local touchesOwnerIdentity = isRelationship and self:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData, logTable)
     if eventType == types.LOOT_MODE_CHANGE then
         if not SenderIsEffectiveOwner(profile, sender) then
             if SF.PrintWarning then
@@ -369,20 +423,7 @@ function Sync:HandleNewLog(sender, payload)
             end
             return
         end
-    elseif isRelationship then
-        if not self:IsSenderAuthorized(profileId, sender) then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
-            end
-            return
-        end
-        if touchesOwnerIdentity and not SenderIsEffectiveOwner(profile, sender) then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not the owner."):format(tostring(sender), tostring(profileId)))
-            end
-            return
-        end
-    elseif not self:_SamePlayer(sender, self.state.coordinator) then
+    elseif not isRelationship and not self:_SamePlayer(sender, self.state.coordinator) then
         if not self:IsSenderAuthorized(profileId, sender) then
             if SF.PrintWarning then
                 SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
@@ -439,10 +480,12 @@ function Sync:HandleNewLog(sender, payload)
 
     -- Apply a single live log through the profile insert path so in-order
     -- point/Attendance fan-out matches local writes. Do not use the batch
-    -- merge+rebuild path for every Raid Check award.
-    local lootLog = logTable
-    if SF.LootLog and SF.LootLog.FromTable and getmetatable(logTable) ~= SF.LootLog then
-        lootLog = select(1, SF.LootLog.FromTable(logTable, { allowUnknownEventType = true }))
+    -- merge+rebuild path for every Raid Check award. Relationship logs were
+    -- already strictly deserialized above.
+    if not isRelationship then
+        if SF.LootLog and SF.LootLog.FromTable and getmetatable(logTable) ~= SF.LootLog then
+            lootLog = select(1, SF.LootLog.FromTable(logTable, { allowUnknownEventType = true }))
+        end
     end
     if not lootLog then
         return
