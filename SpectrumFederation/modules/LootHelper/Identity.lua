@@ -442,16 +442,25 @@ local function CopyArmor(src)
     return armor
 end
 
-local function IdentityHasOverflow(occ)
-    if occ.ring.overflow > 0 or occ.trinket.overflow > 0 then
-        return true
+local function OverflowKeys(occ)
+    local keys = {}
+    if occ.ring.overflow > 0 then
+        keys[#keys + 1] = "ring"
     end
-    for _, state in pairs(occ.ordinary) do
+    if occ.trinket.overflow > 0 then
+        keys[#keys + 1] = "trinket"
+    end
+    for slot, state in pairs(occ.ordinary) do
         if state.overflow and state.overflow > 0 then
-            return true
+            keys[#keys + 1] = slot
         end
     end
-    return false
+    table.sort(keys)
+    return keys
+end
+
+local function IdentityHasOverflow(occ)
+    return #OverflowKeys(occ) > 0
 end
 
 local function ArmorFromOcc(occ)
@@ -583,6 +592,73 @@ function Identity.ComponentHasOverflow(result, memberId)
     local group = memberId and result.identityOf[memberId]
     local root = group and group[1]
     return root and result.overflowByIdentity and result.overflowByIdentity[root] == true
+end
+
+function Identity.ComponentConflictKeys(result, memberId)
+    if type(result) ~= "table" or type(result.identityOf) ~= "table" then
+        return {}
+    end
+    memberId = NormalizeId(memberId)
+    local group = memberId and result.identityOf[memberId]
+    local root = group and group[1]
+    if not root then
+        return {}
+    end
+    return (result.overflowKeysByIdentity and result.overflowKeysByIdentity[root]) or {}
+end
+
+function Identity.IntroducedNewConflict(keysA, keysB, keysAfter)
+    local before = {}
+    for i = 1, #(keysA or {}) do
+        before[keysA[i]] = true
+    end
+    for i = 1, #(keysB or {}) do
+        before[keysB[i]] = true
+    end
+    for i = 1, #(keysAfter or {}) do
+        if not before[keysAfter[i]] then
+            return true
+        end
+    end
+    return false
+end
+
+function Identity.LogsBefore(logs, incoming)
+    local before = {}
+    if type(logs) ~= "table" then
+        return before
+    end
+    for i = 1, #logs do
+        local log = logs[i]
+        if Identity.CompareLogs(log, incoming) then
+            before[#before + 1] = log
+        end
+    end
+    return before
+end
+
+function Identity.PreOpTouchesOwner(logs, eventType, eventData, owner)
+    local types = EventTypes()
+    local result = Identity.Replay(logs or {}, { owner = owner })
+    if eventType == types.CHARACTER_LINK then
+        return Identity.SameIdentity(logs, owner, eventData.memberA, result)
+            or Identity.SameIdentity(logs, owner, eventData.memberB, result)
+    end
+    if eventType == types.CHARACTER_UNLINK then
+        return Identity.SameIdentity(logs, owner, eventData.member, result)
+    end
+    return false
+end
+
+function Identity.RequiresProfileRebuild(eventType)
+    if Identity.CanFanOutBalance(eventType) then
+        return false
+    end
+    return Identity.AffectsProjection(eventType)
+        or eventType == (EventTypes().LOOT_MODE_CHANGE)
+        or eventType == (EventTypes().REWARD_POT_CONFIG_CHANGE)
+        or eventType == (EventTypes().REWARD_POT_CHANGE)
+        or eventType == (EventTypes().PROFILE_NAME_CHANGE)
 end
 
 function Identity.Replay(logs, opts)
@@ -749,6 +825,7 @@ function Identity.Replay(logs, opts)
     local attendance = {}
     local armor = {}
     local overflowByIdentity = {}
+    local overflowKeysByIdentity = {}
     local occByRoot = {}
     local members = {}
 
@@ -785,6 +862,7 @@ function Identity.Replay(logs, opts)
             end
             occByRoot[root] = occ
             overflowByIdentity[root] = IdentityHasOverflow(occ)
+            overflowKeysByIdentity[root] = OverflowKeys(occ)
             local projected = ArmorFromOcc(occ)
             for j = 1, #ids do
                 points[ids[j]] = pointTotal
@@ -817,6 +895,7 @@ function Identity.Replay(logs, opts)
         simulatedAdminList = simulatedList,
         restoredSources = restoredSources,
         overflowByIdentity = overflowByIdentity,
+        overflowKeysByIdentity = overflowKeysByIdentity,
         partition = partition,
     }
 end

@@ -64,6 +64,16 @@ local function SameStoredPlayer(a, b)
     return na ~= nil and na == nb
 end
 
+local function ValidateStoredNameRealmField(memberID, fieldName)
+    if not NormalizeStoredNameRealm(memberID) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "%s has invalid member ID: %s", tostring(fieldName), tostring(memberID))
+        end
+        return false
+    end
+    return true
+end
+
 local function IsArrayLikeList(list)
     if type(list) ~= "table" then
         return false
@@ -322,50 +332,14 @@ end
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
 function LootLogValidators.ValidateAdminAddedData(eventData)
-    local memberID = eventData.member
-    
-    -- Validate member ID is a non-empty string in "Name-Realm" format
-    if type(memberID) ~= "string" or memberID == "" then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Admin added log has invalid member ID: %s", tostring(memberID))
-        end
-        return false
-    end
-    
-    -- Validate it follows "Name-Realm" format
-    if not memberID:match("^[^%-]+%-[^%-]+$") then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Admin added log has invalid member ID format (expected Name-Realm): %s", tostring(memberID))
-        end
-        return false
-    end
-    
-    return true
+    return ValidateStoredNameRealmField(eventData and eventData.member, "ADMIN_ADDED")
 end
 
 -- Function to validate the ADMIN_REMOVED event data
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
 function LootLogValidators.ValidateAdminRemovedData(eventData)
-    local memberID = eventData.member
-    
-    -- Validate member ID is a non-empty string in "Name-Realm" format
-    if type(memberID) ~= "string" or memberID == "" then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Admin removed log has invalid member ID: %s", tostring(memberID))
-        end
-        return false
-    end
-    
-    -- Validate it follows "Name-Realm" format
-    if not memberID:match("^[^%-]+%-[^%-]+$") then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Admin removed log has invalid member ID format (expected Name-Realm): %s", tostring(memberID))
-        end
-        return false
-    end
-    
-    return true
+    return ValidateStoredNameRealmField(eventData and eventData.member, "ADMIN_REMOVED")
 end
 
 -- Function to validate the MAIN_SWAP event data
@@ -473,14 +447,7 @@ function LootLogValidators.ValidateCharacterLinkData(eventData)
 end
 
 function LootLogValidators.ValidateCharacterUnlinkData(eventData)
-    local memberID = eventData and eventData.member
-    if not NormalizeStoredNameRealm(memberID) then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "CHARACTER_UNLINK has invalid member ID: %s", tostring(memberID))
-        end
-        return false
-    end
-    return true
+    return ValidateStoredNameRealmField(eventData and eventData.member, "CHARACTER_UNLINK")
 end
 
 local VALID_LOOT_MODES = {

@@ -488,6 +488,13 @@ function Sync:CompleteRequest(requestId)
 
     self:_MetricsUpdateRequestQueueGauges()
 
+    if type(self.ConsiderIdentityAdminSideEffects) == "function" then
+        local profileId = (req.meta and req.meta.profileId) or (self.state and self.state.profileId)
+        if type(profileId) == "string" and profileId ~= "" then
+            self:ConsiderIdentityAdminSideEffects(profileId)
+        end
+    end
+
     return true
 end
 

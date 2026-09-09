@@ -628,14 +628,9 @@ function Sync:IsIdentityAdminReconcileReady(profileId)
         return false
     end
 
-    local conv = self.state.convergence
-    if type(conv) == "table" then
-        if conv.started and not conv.complete and not conv.finalizeStarted then
-            return false
-        end
-        if conv.adminLogSyncComplete == false then
-            return false
-        end
+    local adminConv = self.state._adminConvergence
+    if type(adminConv) == "table" and not adminConv.finished then
+        return false
     end
 
     local queue = self.state.repairQueue
@@ -675,6 +670,75 @@ function Sync:IsIdentityAdminReconcileReady(profileId)
     return true
 end
 
+function Sync:ConsiderIdentityAdminSideEffects(profileId)
+    if type(profileId) ~= "string" or profileId == "" then
+        return
+    end
+    if self._consideringIdentitySideEffects then
+        return
+    end
+    self._consideringIdentitySideEffects = true
+
+    local function finish()
+        self._consideringIdentitySideEffects = nil
+    end
+
+    if not self.state or not self.state.active then
+        if self._identityAdminReconcileNeeded then
+            self._identityAdminReconcileNeeded[profileId] = nil
+        end
+        if self._pendingLiveRelationship then
+            self._pendingLiveRelationship[profileId] = nil
+        end
+        if self._identityAdminReconcilePending then
+            self._identityAdminReconcilePending[profileId] = nil
+        end
+        finish()
+        return
+    end
+    -- Coordinator failover abandons pending identity-admin grants. Deferred
+    -- live relationship logs still belong to every session member.
+    if not self.state.isCoordinator then
+        if self._identityAdminReconcileNeeded then
+            self._identityAdminReconcileNeeded[profileId] = nil
+        end
+        if self._identityAdminReconcilePending then
+            self._identityAdminReconcilePending[profileId] = nil
+        end
+        if self.FlushPendingLiveRelationshipLogs then
+            self:FlushPendingLiveRelationshipLogs(profileId)
+        end
+        finish()
+        return
+    end
+    if self.state.profileId ~= profileId then
+        finish()
+        return
+    end
+
+    if self.FlushPendingLiveRelationshipLogs then
+        self:FlushPendingLiveRelationshipLogs(profileId)
+    end
+
+    if not (self._identityAdminReconcileNeeded and self._identityAdminReconcileNeeded[profileId]) then
+        finish()
+        return
+    end
+    if not self:IsIdentityAdminReconcileReady(profileId) then
+        finish()
+        return
+    end
+    self._identityAdminReconcileNeeded[profileId] = nil
+    if self._identityAdminReconcilePending then
+        self._identityAdminReconcilePending[profileId] = nil
+    end
+    local profile = self:FindLocalProfileById(profileId)
+    if profile and profile.ReconcileIdentityAdmins then
+        profile:ReconcileIdentityAdmins()
+    end
+    finish()
+end
+
 function Sync:ScheduleIdentityAdminReconcile(profileId)
     if type(profileId) ~= "string" or profileId == "" then
         return
@@ -686,6 +750,8 @@ function Sync:ScheduleIdentityAdminReconcile(profileId)
         return
     end
 
+    self._identityAdminReconcileNeeded = self._identityAdminReconcileNeeded or {}
+    self._identityAdminReconcileNeeded[profileId] = true
     self._identityAdminReconcilePending = self._identityAdminReconcilePending or {}
     if self._identityAdminReconcilePending[profileId] then
         return
@@ -696,19 +762,7 @@ function Sync:ScheduleIdentityAdminReconcile(profileId)
         if self._identityAdminReconcilePending then
             self._identityAdminReconcilePending[profileId] = nil
         end
-        if not self.state or not self.state.active or not self.state.isCoordinator then
-            return
-        end
-        if self.state.profileId ~= profileId then
-            return
-        end
-        if not self:IsIdentityAdminReconcileReady(profileId) then
-            return
-        end
-        local profile = self:FindLocalProfileById(profileId)
-        if profile and profile.ReconcileIdentityAdmins then
-            profile:ReconcileIdentityAdmins()
-        end
+        self:ConsiderIdentityAdminSideEffects(profileId)
     end
 
     if type(self.RunAfter) == "function" then

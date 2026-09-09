@@ -216,6 +216,10 @@ function Sync:_FinishAdminConvergence(reason)
     -- Clean up convergence state
     self.state._adminConvergence = nil
     
+    if type(self.ConsiderIdentityAdminSideEffects) == "function" and type(self.state.profileId) == "string" then
+        self:ConsiderIdentityAdminSideEffects(self.state.profileId)
+    end
+    
     if SF.Debug then
         local missing = {}
         for adminKey in pairs(conv.expected or {}) do

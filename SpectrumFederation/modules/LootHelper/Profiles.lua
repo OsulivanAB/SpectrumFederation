@@ -868,14 +868,6 @@ function LootProfile:GetIdentityArmor(memberId)
     return {}
 end
 
-function LootProfile:IsCurrentUserEffectiveOwner()
-    local currentUser = SF:GetPlayerFullIdentifier()
-    if not currentUser then
-        return false
-    end
-    return self:IsEffectiveOwner(currentUser)
-end
-
 -- Function to get the list of members in this profile
 -- @return table members List of LootProfileMember instances
 function LootProfile:GetMemberList()
@@ -2063,27 +2055,34 @@ function LootProfile:AddAdminMemberId(memberId, opts)
         return false, "That member is already an admin"
     end
 
+    if not SF.LootLog then
+        return false, "Failed to create admin added log."
+    end
+
+    local eventType = SF.LootLogEventTypes.ADMIN_ADDED
+    local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+    eventData.member = memberId
+    local logEntry = SF.LootLog.new(eventType, eventData, { profile = self, skipPermission = opts.skipPermission })
+    if not logEntry then
+        return false, "Failed to create admin added log."
+    end
+    local inserted = self:AddLootLog(logEntry, {
+        skipPermission = opts.skipPermission,
+        skipBroadcast = opts.skipBroadcast,
+    })
+    if not inserted then
+        return false, "Failed to record admin added."
+    end
+
     self._adminUsers = self._adminUsers or {}
     table.insert(self._adminUsers, memberId)
-    
-    -- Create log entry for admin added
-    if SF.LootLog then
-        local eventType = SF.LootLogEventTypes.ADMIN_ADDED
-        local eventData = SF.LootLog.GetEventDataTemplate(eventType)
-        eventData.member = memberId
-        
-        local logEntry = SF.LootLog.new(eventType, eventData, { profile = self, skipPermission = opts.skipPermission })
-        if logEntry and self.AddLootLog then
-            self:AddLootLog(logEntry, { skipPermission = opts.skipPermission, skipBroadcast = opts.skipBroadcast })
-        end
-    end
-    
+
     if SF.Debug then
         SF.Debug:Info("LootProfile", "Successfully added admin: %s", tostring(memberId))
-        SF.Debug:Info("ADMIN_STATUS", "User %s granted admin in profile %s", 
+        SF.Debug:Info("ADMIN_STATUS", "User %s granted admin in profile %s",
             tostring(memberId), tostring(self._profileName))
     end
-    
+
     return true
 end
 
@@ -2114,33 +2113,42 @@ function LootProfile:RemoveAdminMemberId(memberId)
     end
 
     local admins = self._adminUsers or {}
+    local removeIndex = nil
     for i = #admins, 1, -1 do
         if SameMember(admins[i], memberId) then
-            table.remove(admins, i)
-            
-            -- Create log entry for admin removed
-            if SF.LootLog then
-                local eventType = SF.LootLogEventTypes.ADMIN_REMOVED
-                local eventData = SF.LootLog.GetEventDataTemplate(eventType)
-                eventData.member = memberId
-                
-                local logEntry = SF.LootLog.new(eventType, eventData, { profile = self })
-                if logEntry and self.AddLootLog then
-                    self:AddLootLog(logEntry)
-                end
-            end
-            
-            if SF.Debug then
-                SF.Debug:Info("LootProfile", "Removed admin: %s", tostring(memberId))
-                SF.Debug:Info("ADMIN_STATUS", "User %s admin revoked in profile %s", 
-                    tostring(memberId), tostring(self._profileName))
-            end
-            
-            return true
+            removeIndex = i
+            break
         end
     end
+    if not removeIndex then
+        return false, "That member is not an admin."
+    end
 
-    return false, "That member is not an admin."
+    if not SF.LootLog then
+        return false, "Failed to create admin removed log."
+    end
+
+    local eventType = SF.LootLogEventTypes.ADMIN_REMOVED
+    local eventData = SF.LootLog.GetEventDataTemplate(eventType)
+    eventData.member = memberId
+    local logEntry = SF.LootLog.new(eventType, eventData, { profile = self })
+    if not logEntry then
+        return false, "Failed to create admin removed log."
+    end
+    local inserted = self:AddLootLog(logEntry)
+    if not inserted then
+        return false, "Failed to record admin removed."
+    end
+
+    table.remove(admins, removeIndex)
+
+    if SF.Debug then
+        SF.Debug:Info("LootProfile", "Removed admin: %s", tostring(memberId))
+        SF.Debug:Info("ADMIN_STATUS", "User %s admin revoked in profile %s",
+            tostring(memberId), tostring(self._profileName))
+    end
+
+    return true
 end
 
 -- Live Main Swap is retired. Historical MAIN_SWAP logs remain as lineage during identity replay.
@@ -2183,12 +2191,13 @@ function LootProfile:LinkCharacters(memberA, memberB, opts)
     if not self:getMemberByID(memberA) or not self:getMemberByID(memberB) then
         return false, "Both characters must be members of this profile."
     end
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
+        return false, "You must be an admin to link characters."
+    end
     if TouchesOwnerIdentity(self, memberA, memberB) then
         if not CurrentUserHasEffectiveLocalOwner(self) then
             return false, "Only the owner may change the owner's linked identity."
         end
-    elseif not CurrentUserHasEffectiveLocalAdmin(self) then
-        return false, "You must be an admin to link characters."
     end
 
     local Identity = SF.LootHelperIdentity
@@ -2197,8 +2206,8 @@ function LootProfile:LinkCharacters(memberA, memberB, opts)
     end
 
     local before = self._identityProjection
-    local overflowA = Identity and Identity.ComponentHasOverflow and Identity.ComponentHasOverflow(before, memberA)
-    local overflowB = Identity and Identity.ComponentHasOverflow and Identity.ComponentHasOverflow(before, memberB)
+    local conflictsA = Identity and Identity.ComponentConflictKeys and Identity.ComponentConflictKeys(before, memberA)
+    local conflictsB = Identity and Identity.ComponentConflictKeys and Identity.ComponentConflictKeys(before, memberB)
 
     local adminMembersAtLink = {}
     if Identity and Identity.ComponentAdmins then
@@ -2227,10 +2236,8 @@ function LootProfile:LinkCharacters(memberA, memberB, opts)
     end
 
     local result = self._identityProjection
-    if result and Identity and Identity.ComponentHasOverflow
-        and Identity.ComponentHasOverflow(result, memberA)
-        and not overflowA
-        and not overflowB
+    if result and Identity and Identity.IntroducedNewConflict
+        and Identity.IntroducedNewConflict(conflictsA, conflictsB, Identity.ComponentConflictKeys(result, memberA))
         and SF.PrintWarning
     then
         SF:PrintWarning("Linked characters share equipment history with overlapping slot usage.")
@@ -2266,12 +2273,13 @@ function LootProfile:UnlinkCharacter(memberId, opts)
     if not self:getMemberByID(memberId) then
         return false, "That character is not part of this profile."
     end
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
+        return false, "You must be an admin to unlink characters."
+    end
     if self:IsEffectiveOwner(memberId) then
         if not CurrentUserHasEffectiveLocalOwner(self) then
             return false, "Only the owner may change the owner's linked identity."
         end
-    elseif not CurrentUserHasEffectiveLocalAdmin(self) then
-        return false, "You must be an admin to unlink characters."
     end
 
     local Identity = SF.LootHelperIdentity

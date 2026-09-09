@@ -29,9 +29,16 @@ local function GetLogEventData(logTable)
     return logTable._data or logTable.data or {}
 end
 
-function Sync:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData)
+function Sync:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData, incomingLog)
     if type(profile) ~= "table" or type(eventData) ~= "table" then
         return false
+    end
+    local Identity = SF.LootHelperIdentity
+    local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
+    local owner = (profile.GetOwnerId and profile:GetOwnerId()) or profile._owner
+    if Identity and Identity.PreOpTouchesOwner then
+        local prefix = incomingLog and Identity.LogsBefore and Identity.LogsBefore(logs, incomingLog) or logs
+        return Identity.PreOpTouchesOwner(prefix, eventType, eventData, owner)
     end
     local types = SF.LootLogEventTypes or {}
     if eventType == types.CHARACTER_LINK then
@@ -59,6 +66,154 @@ local function SenderIsEffectiveOwner(profile, sender)
         return profile:IsOwner(sender)
     end
     return false
+end
+
+function Sync:_QueuePendingLiveRelationship(profileId, sender, logTable)
+    self._pendingLiveRelationship = self._pendingLiveRelationship or {}
+    local list = self._pendingLiveRelationship[profileId] or {}
+    local logId = self:_ExtractLogId(logTable)
+    for i = 1, #list do
+        if self:_ExtractLogId(list[i].logTable) == logId then
+            return
+        end
+    end
+    list[#list + 1] = { sender = sender, logTable = logTable }
+    self._pendingLiveRelationship[profileId] = list
+end
+
+function Sync:_PendingRelationshipCounterSets(profileId)
+    local seen = {}
+    local function add(logTable)
+        local author, counter = self:_ExtractAuthorCounter(logTable)
+        if type(author) == "string" and type(counter) == "number" then
+            seen[author] = seen[author] or {}
+            seen[author][counter] = true
+        end
+    end
+    local pending = self._pendingLiveRelationship and self._pendingLiveRelationship[profileId]
+    if type(pending) == "table" then
+        for i = 1, #pending do
+            add(pending[i].logTable)
+        end
+    end
+    local inflight = self._liveRelationshipInFlight
+    if type(inflight) == "table" then
+        for i = 1, #inflight do
+            add(inflight[i].logTable)
+        end
+    end
+    return seen
+end
+
+function Sync:_ExtendContigWithPending(profileId, contig)
+    contig = contig or {}
+    local seen = self:_PendingRelationshipCounterSets(profileId)
+    for author, counters in pairs(seen) do
+        local n = tonumber(contig[author]) or 0
+        while counters[n + 1] do
+            n = n + 1
+        end
+        contig[author] = n
+    end
+    return contig
+end
+
+function Sync:_LiveRelationshipPredecessorState(profileId, logTable)
+    local hasGap, gapFrom, gapTo = self:DetectGap(profileId, logTable)
+    if hasGap then
+        return false, nil, hasGap, gapFrom, gapTo
+    end
+    if type(self.ComputeContigAuthorMax) ~= "function" or type(self.ComputeMissingLogRequests) ~= "function" then
+        return true, nil, false, nil, nil
+    end
+    local incomingAuthor, incomingCounter = self:_ExtractAuthorCounter(logTable)
+    local contig = self:ComputeContigAuthorMax(profileId) or {}
+    contig = self:_ExtendContigWithPending(profileId, contig)
+    if type(incomingAuthor) == "string" and type(incomingCounter) == "number" then
+        contig[incomingAuthor] = math.max(tonumber(contig[incomingAuthor]) or 0, incomingCounter)
+    end
+    local known = {}
+    if type(self.state.authorMax) == "table" then
+        for author, maxCounter in pairs(self.state.authorMax) do
+            known[author] = tonumber(maxCounter) or 0
+        end
+    end
+    if type(self.ComputeAuthorMax) == "function" then
+        local localMax = self:ComputeAuthorMax(profileId) or {}
+        for author, maxCounter in pairs(localMax) do
+            known[author] = math.max(known[author] or 0, tonumber(maxCounter) or 0)
+        end
+    end
+    if type(incomingAuthor) == "string" and type(incomingCounter) == "number" then
+        known[incomingAuthor] = math.min(tonumber(known[incomingAuthor]) or incomingCounter, incomingCounter)
+    end
+    local missing = self:ComputeMissingLogRequests(contig, known)
+    if type(missing) == "table" and #missing > 0 then
+        return false, missing, false, nil, nil
+    end
+    return true, nil, false, nil, nil
+end
+
+function Sync:_LiveRelationshipPredecessorReady(profileId, logTable)
+    local ready = self:_LiveRelationshipPredecessorState(profileId, logTable)
+    return ready
+end
+
+function Sync:_LiveRelationshipDomainValid(profile, eventType, eventData, incomingLog)
+    local types = SF.LootLogEventTypes or {}
+    local Validators = SF.LootLogValidators
+    if eventType == types.CHARACTER_LINK then
+        if not (Validators and Validators.ValidateCharacterLinkData and Validators.ValidateCharacterLinkData(eventData)) then
+            return false
+        end
+        if not (profile.getMemberByID and profile:getMemberByID(eventData.memberA) and profile:getMemberByID(eventData.memberB)) then
+            return false
+        end
+        return true
+    end
+    if eventType == types.CHARACTER_UNLINK then
+        if not (Validators and Validators.ValidateCharacterUnlinkData and Validators.ValidateCharacterUnlinkData(eventData)) then
+            return false
+        end
+        if not (profile.getMemberByID and profile:getMemberByID(eventData.member)) then
+            return false
+        end
+        local Identity = SF.LootHelperIdentity
+        local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
+        local prefix = (Identity and Identity.LogsBefore and incomingLog) and Identity.LogsBefore(logs, incomingLog) or logs
+        local group = Identity and Identity.ComponentMembers and Identity.ComponentMembers(prefix, eventData.member) or nil
+        return type(group) == "table" and #group >= 2
+    end
+    return true
+end
+
+function Sync:FlushPendingLiveRelationshipLogs(profileId)
+    if self._flushingLiveRelationship then
+        return
+    end
+    local pending = self._pendingLiveRelationship and self._pendingLiveRelationship[profileId]
+    if type(pending) ~= "table" or #pending == 0 then
+        return
+    end
+    local Identity = SF.LootHelperIdentity
+    if Identity and Identity.CompareLogs then
+        table.sort(pending, function(a, b)
+            return Identity.CompareLogs(a.logTable, b.logTable)
+        end)
+    end
+    self._flushingLiveRelationship = true
+    self._liveRelationshipInFlight = pending
+    self._pendingLiveRelationship[profileId] = {}
+    for i = 1, #pending do
+        local item = pending[i]
+        self:HandleNewLog(item.sender, {
+            sessionId = self.state and self.state.sessionId,
+            profileId = profileId,
+            log = item.logTable,
+        })
+    end
+    self._liveRelationshipInFlight = nil
+    self._flushingLiveRelationship = nil
 end
 
 
@@ -90,9 +245,17 @@ function Sync:BroadcastNewLog(profileId, logTable)
     local eventType = GetLogEventType(logTable)
     local eventData = GetLogEventData(logTable)
     local types = SF.LootLogEventTypes or {}
-    local touchesOwnerIdentity = self:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData)
-    if eventType == types.LOOT_MODE_CHANGE or touchesOwnerIdentity then
+    local isRelationship = eventType == types.CHARACTER_LINK or eventType == types.CHARACTER_UNLINK
+    local touchesOwnerIdentity = isRelationship and self:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData, logTable)
+    if eventType == types.LOOT_MODE_CHANGE then
         if not SenderIsEffectiveOwner(profile, me) then
+            return fail("not authorized to broadcast owner-only NEW_LOG")
+        end
+    elseif isRelationship then
+        if not self:IsSenderAuthorized(profileId, me) then
+            return fail("not authorized to broadcast NEW_LOG")
+        end
+        if touchesOwnerIdentity and not SenderIsEffectiveOwner(profile, me) then
             return fail("not authorized to broadcast owner-identity NEW_LOG")
         end
     elseif not self:IsSenderAuthorized(profileId, me) then
@@ -168,13 +331,52 @@ function Sync:HandleNewLog(sender, payload)
     end
 
     -- Trust policy: coordinator or canonical admin for ordinary live writes.
-    -- Owner-only and owner-identity relationship events require effective owner
-    -- even when the sender is a canonical admin or the coordinator.
+    -- Relationship events always require admin; owner-identity also requires
+    -- effective owner. Authorization uses deterministic pre-operation history.
     local eventType = GetLogEventType(logTable)
     local types = SF.LootLogEventTypes or {}
-    local touchesOwnerIdentity = self:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData)
-    if eventType == types.LOOT_MODE_CHANGE or touchesOwnerIdentity then
+    local isRelationship = eventType == types.CHARACTER_LINK or eventType == types.CHARACTER_UNLINK
+    if isRelationship then
+        if not self:_LiveRelationshipDomainValid(profile, eventType, eventData, logTable) then
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: invalid relationship payload."):format(tostring(sender), tostring(profileId)))
+            end
+            return
+        end
+        local ready, missing, hasPredGap, predFrom, predTo = self:_LiveRelationshipPredecessorState(profileId, logTable)
+        if not ready then
+            self:_QueuePendingLiveRelationship(profileId, sender, logTable)
+            if hasPredGap and type(predFrom) == "number" and type(predTo) == "number" then
+                local author = (self:_ExtractAuthorCounter(logTable))
+                if type(author) == "string" and author ~= "" and self.RequestGapRepair then
+                    self:RequestGapRepair(profileId, author, predFrom, predTo, "new-log-gap")
+                end
+            elseif type(missing) == "table" and #missing > 0 and self.QueueRepairRanges then
+                self:QueueRepairRanges(profileId, missing, {
+                    mode = "missing",
+                    reason = "live-relationship-predecessor",
+                })
+            end
+            return
+        end
+    end
+
+    local touchesOwnerIdentity = isRelationship and self:LiveRelationshipTouchesOwnerIdentity(profile, eventType, eventData, logTable)
+    if eventType == types.LOOT_MODE_CHANGE then
         if not SenderIsEffectiveOwner(profile, sender) then
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not the owner."):format(tostring(sender), tostring(profileId)))
+            end
+            return
+        end
+    elseif isRelationship then
+        if not self:IsSenderAuthorized(profileId, sender) then
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
+            end
+            return
+        end
+        if touchesOwnerIdentity and not SenderIsEffectiveOwner(profile, sender) then
             if SF.PrintWarning then
                 SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not the owner."):format(tostring(sender), tostring(profileId)))
             end
@@ -235,14 +437,34 @@ function Sync:HandleNewLog(sender, payload)
     -- Gap detection BEFORE merge
     local hasGap, gapFrom, gapTo = self:DetectGap(profileId, logTable)
 
-    -- Apply log
-    local inserted = self:MergeLogs(profileId, { logTable })
+    -- Apply a single live log through the profile insert path so in-order
+    -- point/Attendance fan-out matches local writes. Do not use the batch
+    -- merge+rebuild path for every Raid Check award.
+    local lootLog = logTable
+    if SF.LootLog and SF.LootLog.FromTable and getmetatable(logTable) ~= SF.LootLog then
+        lootLog = select(1, SF.LootLog.FromTable(logTable, { allowUnknownEventType = true }))
+    end
+    if not lootLog then
+        return
+    end
+    local inserted = profile:AddLootLog(lootLog, { skipPermission = true, skipBroadcast = true })
     if not inserted then
         return
     end
 
-    -- Update UI / derived state
-    self:RebuildProfile(profileId, "live_update")
+    local Identity = SF.LootHelperIdentity
+    local needsRebuild = true
+    if Identity and Identity.RequiresProfileRebuild then
+        needsRebuild = Identity.RequiresProfileRebuild(eventType)
+    elseif Identity and Identity.CanFanOutBalance then
+        needsRebuild = not Identity.CanFanOutBalance(eventType)
+    end
+    if needsRebuild then
+        self:RebuildProfile(profileId, "live_update")
+    elseif SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
+        SF.LootHelperEvents:NotifyDataChanged("SYNC:LIVE", { profileId = profileId })
+    end
+    self:FlushPendingLiveRelationshipLogs(profileId)
     self:LogSessionPointsSummary(profileId, "live_update")
 
     if SF.Debug then

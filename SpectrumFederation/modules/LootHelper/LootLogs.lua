@@ -387,10 +387,38 @@ function LootLog.new(eventType, eventData, opts)
             isOwner = type(ap.IsCurrentUserOwner) == "function" and ap:IsCurrentUserOwner()
         end
 
+        local isRelationship = eventType == EVENT_TYPES.CHARACTER_LINK
+            or eventType == EVENT_TYPES.CHARACTER_UNLINK
         if isLootMode then
             if not isOwner then
                 if SF.Debug then
                     SF.Debug:Warn("LOOTLOG", "Current user is not an effective owner; cannot change loot mode")
+                end
+                return nil
+            end
+        elseif isRelationship then
+            if not isAdmin then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Current user is not an admin; cannot create log entry")
+                end
+                return nil
+            end
+            local Identity = SF.LootHelperIdentity
+            local owner = (ap.GetOwnerId and ap:GetOwnerId()) or ap._owner
+            local logs = (ap.GetLootLogs and ap:GetLootLogs()) or ap._lootLogs or {}
+            local touchesOwner = false
+            if Identity and Identity.PreOpTouchesOwner then
+                touchesOwner = Identity.PreOpTouchesOwner(logs, eventType, eventData, owner)
+            elseif ap.IsEffectiveOwner then
+                if eventType == EVENT_TYPES.CHARACTER_LINK then
+                    touchesOwner = ap:IsEffectiveOwner(eventData.memberA) or ap:IsEffectiveOwner(eventData.memberB)
+                else
+                    touchesOwner = ap:IsEffectiveOwner(eventData.member)
+                end
+            end
+            if touchesOwner and not isOwner then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Current user is not an effective owner; cannot change the owner's linked identity")
                 end
                 return nil
             end
