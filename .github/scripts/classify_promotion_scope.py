@@ -780,14 +780,18 @@ def main(argv=None):
         authoritative = (
             args.expected_target if (scope.release_required or scope.merge_required) else args.expected_base
         )
-        version = read_toc_version_from_ref(authoritative)
         print(
             "TOC version validation: "
             f"release_required={bool_text(scope.release_required)} "
             f"merge_required={bool_text(scope.merge_required)}"
         )
-        print(f"Authoritative commit: {resolve_commit(authoritative)}")
-        print(f"Version: {version}")
+        try:
+            print(f"Authoritative commit: {resolve_commit(authoritative)}")
+            print(f"Version: {read_toc_version_from_ref(authoritative)}")
+        except RuntimeError as exc:
+            message = str(exc)
+            if message not in errors:
+                errors.append(message)
         if errors:
             for error in errors:
                 print(f"::error::{error}", file=sys.stderr)

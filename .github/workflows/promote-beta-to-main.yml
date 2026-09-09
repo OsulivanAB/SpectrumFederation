@@ -184,12 +184,13 @@ jobs:
               > /tmp/promotion-scope/classify_promotion_scope.py
             git show "$ref:.github/scripts/validate_packaging.py" \
               > /tmp/promotion-scope/validate_packaging.py
-            grep -q -- '--decide-merge' /tmp/promotion-scope/classify_promotion_scope.py
+            grep -q -- '--validate-versions' /tmp/promotion-scope/classify_promotion_scope.py
           }
-          # Prefer verified origin/main so a no-op recovery can use --decide-merge
-          # even when the captured target predates that helper. Fall back to the
-          # captured target for the first promotion of this helper onto main.
-          materialize_scope_helper HEAD || materialize_scope_helper "$EXPECTED_TARGET"
+          # Prefer the captured beta SHA so the first promotion of
+          # --validate-versions uses the incoming helper. Fall back to verified
+          # origin/main (HEAD) for leftover no-op recoveries whose captured
+          # target predates that flag. The same copy also runs --decide-merge.
+          materialize_scope_helper "$EXPECTED_TARGET" || materialize_scope_helper HEAD
           python3 /tmp/promotion-scope/classify_promotion_scope.py \
             --verify-refs \
             --expected-base "$EXPECTED_BASE" \
@@ -875,12 +876,13 @@ jobs:
               > /tmp/promotion-scope/classify_promotion_scope.py
             git show "$ref:.github/scripts/validate_packaging.py" \
               > /tmp/promotion-scope/validate_packaging.py
-            grep -q -- '--decide-merge' /tmp/promotion-scope/classify_promotion_scope.py
+            grep -q -- '--validate-versions' /tmp/promotion-scope/classify_promotion_scope.py
           }
-          # Prefer verified origin/main so a no-op recovery can use --decide-merge
-          # even when the captured target predates that helper. Fall back to the
-          # captured target for the first promotion of this helper onto main.
-          materialize_scope_helper HEAD || materialize_scope_helper "$EXPECTED_TARGET"
+          # Prefer the captured beta SHA so the first promotion of
+          # --validate-versions uses the incoming helper. Fall back to verified
+          # origin/main (HEAD) for leftover no-op recoveries whose captured
+          # target predates that flag. The same copy also runs --decide-merge.
+          materialize_scope_helper "$EXPECTED_TARGET" || materialize_scope_helper HEAD
           python3 /tmp/promotion-scope/classify_promotion_scope.py \
             --verify-refs \
             --expected-base "$EXPECTED_BASE" \

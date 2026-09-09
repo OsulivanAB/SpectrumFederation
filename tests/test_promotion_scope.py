@@ -567,6 +567,20 @@ def test_promotion_workflow_pins_mutations_to_captured_shas():
     assert "A promotion without addon changes must retain a stable X.Y.Z version" not in text
 
 
+def test_merge_jobs_materialize_helper_that_supports_validate_versions():
+    workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "promote-beta-to-main.yml"
+    text = workflow.read_text(encoding="utf-8")
+    assert text.count("grep -q -- '--validate-versions'") == 3
+    assert "grep -q -- '--decide-merge'" not in text
+    assert 'materialize_scope_helper HEAD || materialize_scope_helper "$EXPECTED_TARGET"' not in text
+    assert (
+        text.count(
+            'materialize_scope_helper "$EXPECTED_TARGET" || materialize_scope_helper HEAD'
+        )
+        == 2
+    )
+
+
 def _repo_beta_equals_main(tmp_path):
     return init_repo(tmp_path)
 
@@ -969,6 +983,33 @@ def test_cli_validate_versions_accepts_noop_prerelease_beta(tmp_path, monkeypatc
     assert "release_required=false" in captured.out
     assert "merge_required=false" in captured.out
     assert "1.4.2" in captured.out
+
+
+def test_cli_validate_versions_reports_missing_version_without_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {"SpectrumFederation/SpectrumFederation.toc": "## Interface: 120100\n"},
+        "chore: drop version line",
+    )
+    monkeypatch.chdir(repo)
+    exit_code = scope_mod.main(
+        [
+            "--validate-versions",
+            "--expected-base",
+            scope_mod.resolve_commit("main", cwd=repo),
+            "--expected-target",
+            scope_mod.resolve_commit("beta", cwd=repo),
+        ]
+    )
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert exit_code == 1
+    assert "::error::" in captured.err
+    assert "No '## Version:' line" in combined
+    assert "Traceback" not in combined
 
 
 def test_cli_files_mode_prints_scope_report(capsys):
