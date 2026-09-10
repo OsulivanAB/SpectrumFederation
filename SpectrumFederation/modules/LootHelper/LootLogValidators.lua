@@ -662,5 +662,13 @@ function LootLogValidators.ValidateRCLootCouncilData(eventData)
     return true
 end
 
+local _ValidateArmorChangeData = LootLogValidators.ValidateArmorChangeData
+function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, profile)
+    if not _ValidateArmorChangeData(eventData, ARMOR_ACTIONS, profile) then
+        return false
+    end
+    return ValidatePreOpAuthorMax(eventData and eventData.preOpAuthorMax)
+end
+
 -- Export to namespace
 SF.LootLogValidators = LootLogValidators

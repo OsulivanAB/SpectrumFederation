@@ -523,7 +523,11 @@ function LootLog.new(eventType, eventData, opts)
     end
 
     -- Snapshot contemporaneous author heads before this event allocates a counter.
-    if eventType == EVENT_TYPES.CHARACTER_LINK or eventType == EVENT_TYPES.CHARACTER_UNLINK then
+    local isIdentityArmor = eventType == EVENT_TYPES.ARMOR_CHANGE and eventData.scope == "identity"
+    if eventType == EVENT_TYPES.CHARACTER_LINK
+        or eventType == EVENT_TYPES.CHARACTER_UNLINK
+        or isIdentityArmor
+    then
         if type(eventData.preOpAuthorMax) ~= "table" or #eventData.preOpAuthorMax == 0 then
             local Identity = SF.LootHelperIdentity
             if Identity and Identity.SnapshotPreOpAuthorMax then
@@ -538,6 +542,10 @@ function LootLog.new(eventType, eventData, opts)
             end
         elseif eventType == EVENT_TYPES.CHARACTER_UNLINK then
             if not SF.LootLogValidators.ValidateCharacterUnlinkData(eventData) then
+                return nil
+            end
+        elseif isIdentityArmor then
+            if not SF.LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, owningProfile) then
                 return nil
             end
         end
