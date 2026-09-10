@@ -60,7 +60,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - In-place integrity `_ReplaceLogById` rebuilds from current log contents; OrderLogs is not cached across rebuilds by table identity
 - MAIN_SWAP-less stale fingerprints can be repaired when a unique attributed source candidate reproduces the stored checksum; unrelated mismatches stay rejected
 - Re-using a displayed equipment opportunity (`AVAILABLE` then `USED`) does not pack historical locals as phantom overflow; independent uses still overflow
-- In-order Attendance fan-out keeps raw deltas so `1 - 1 - 1 + 1` converges with Replay instead of clamping to `1`
+- In-order Attendance fan-out and Replay keep raw identity totals so `1 - 1 - 1 + 1` stays 0 after a force Replay; displayed Attendance still floors at zero
 - Identity-scoped `ARMOR_CHANGE` snapshots `preOpAuthorMax` in `LootLog.new`; Replay ignores identity equipment written while those members were not actually unified
 - Redundant concurrent LINKs remain valid history but do not propagate admin across an already-unified component
 - Characters named only in historical awards with no `MAIN_SWAP` lineage restore as unlinked shells with an admin warning

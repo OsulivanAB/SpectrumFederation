@@ -1350,6 +1350,14 @@ function Identity.AffectsProjection(eventType)
         or eventType == (EventTypes().ROLE_CHANGE)
 end
 
+local function ClampNonNegative(n)
+    n = tonumber(n) or 0
+    if n < 0 then
+        return 0
+    end
+    return n
+end
+
 function Identity.CanFanOutBalance(eventType)
     return eventType == (EventTypes().POINT_CHANGE)
         or eventType == (EventTypes().ATTENDANCE_CHANGE)
@@ -1726,9 +1734,6 @@ function Identity.Replay(logs, opts)
                 pointTotal = pointTotal + (rawPoints[ids[j]] or 0)
                 attendanceTotal = attendanceTotal + (rawAttendance[ids[j]] or 0)
             end
-            if attendanceTotal < 0 then
-                attendanceTotal = 0
-            end
             local occ = ProjectIdentityOccupancy(ids, localArmor, localOrigin, identityArmorEvents)
             occByRoot[root] = occ
             overflowByIdentity[root] = IdentityHasOverflow(occ)
@@ -1849,10 +1854,7 @@ function Identity.FanOutBalance(profile, lootLog)
     -- each in-order delta or concurrent decrements below zero diverge from
     -- retained history once a later increment arrives.
     local nextValue = (result.attendance[memberId] or 0) + delta
-    local displayed = nextValue
-    if displayed < 0 then
-        displayed = 0
-    end
+    local displayed = ClampNonNegative(nextValue)
     for i = 1, #group do
         local id = group[i]
         result.attendance[id] = nextValue
@@ -2047,7 +2049,7 @@ function Identity.ApplyToProfileMembers(profile)
     profile._members = {}
     for memberId, member in pairs(existing) do
         member.pointBalance = result.points[memberId] or 0
-        member.attendanceBalance = result.attendance[memberId] or 0
+        member.attendanceBalance = ClampNonNegative(result.attendance[memberId])
         member.armor = result.armor[memberId] or EmptyArmor()
         profile._members[#profile._members + 1] = member
     end
@@ -2075,7 +2077,7 @@ function Identity.WriteProjection(profile, result)
         local memberId = (member.GetFullIdentifier and member:GetFullIdentifier()) or member.identifier
         if memberId then
             local points = result.points[memberId] or 0
-            local attendance = result.attendance[memberId] or 0
+            local attendance = ClampNonNegative(result.attendance[memberId])
             if member.SetPoints then
                 member:SetPoints(points)
             else

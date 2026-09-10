@@ -3945,6 +3945,40 @@ checkSurfaces(profile, "InOrderAttendanceClamp", function(p, label)
 end)
 
 resetEnv()
+profile = makeProfile("ReplayThenFanOutAttendance")
+addMember(profile, ALT_A)
+assertTrue(profile:LinkCharacters(OWNER, ALT_A), "link for replay-then-fan-out attendance")
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+})
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.DECREMENT,
+    amount = 1,
+})
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.DECREMENT,
+    amount = 1,
+})
+assertEq(profile:GetIdentityAttendance(ALT_A), 0, "displayed attendance floors at zero after 1-1-1")
+profile:ApplyIdentityProjection({ force = true })
+assertEq(profile:GetIdentityAttendance(ALT_A), 0, "force Replay still displays 0")
+SF.LootHelperIdentity.replayCount = 0
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+})
+assertEq(SF.LootHelperIdentity.replayCount, 0, "later in-order +1 still fans out")
+assertEq(profile:GetIdentityAttendance(ALT_A), 0, "force Replay baseline keeps raw 1-1-1 so +1 is 0")
+checkSurfaces(profile, "ReplayThenFanOutAttendance", function(p, label)
+    assertEq(p:GetIdentityAttendance(ALT_A), 0, label .. ": attendance 0")
+end)
+
+resetEnv()
 profile = makeProfile("ProductionArmorPreOp")
 local ADMIN_Z = "Zulu-Garona"
 local ADMIN_A_WRITER = "AlphaAdmin-Garona"
