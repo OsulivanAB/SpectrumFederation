@@ -46,7 +46,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Auto-admin grants from `LinkCharacters` / reconcile are causally bound to the source LINK via `sourceLogId`
 - Replay uses writer-observed `preOpAuthorMax` as causal predecessors so same-timestamp admin grants authorize the LINK that observed them
 - Frozen `_legacyCanonicalAdmins` preserve Main Swap / snapshot admins that have no grant log, without letting a later `ADMIN_ADDED` authorize older relationships
-- Identity-scoped equipment corrections do not apply across later joiners who were outside the recorded `identityMembers`
+- Identity-scoped equipment corrections do not apply across later joiners who were outside the recorded `identityMembers`; the latest in-scope correction per original identity+slot is applied so skipped `AVAILABLE` does not leave a stacked `USED`
 - Characters named only in historical awards with no `MAIN_SWAP` lineage restore as unlinked shells with an admin warning
 - `MAIN_SWAP` validation accepts hyphenated realms through `NameUtil`
 

@@ -802,6 +802,13 @@ local function CanonicalIdentityMembers(data)
     return SortedUnique(data.identityMembers)
 end
 
+local function IdentityMembersKey(memberIds)
+    if type(memberIds) ~= "table" then
+        return ""
+    end
+    return table.concat(memberIds, "\0")
+end
+
 local function CanonicalAdminMembersAtLink(data)
     if type(data) ~= "table" then
         return {}
@@ -1339,17 +1346,35 @@ function Identity.Replay(logs, opts)
             end
             local occ = PackLocals(ids, localArmor, localOrigin)
             local idSet = ListToSet(ids)
+            -- Apply the latest in-scope correction per original identity+slot.
+            -- USED then AVAILABLE must not leave a stacked USED when the later
+            -- AVAILABLE is skipped because a later joiner has local use.
+            local latestByKey = {}
             for j = 1, #identityArmorEvents do
                 local ev = identityArmorEvents[j]
-                if IsSubset(ev.identityMembers, idSet) then
-                    local insiderIds = ev.identityMembers
-                    if not IdentityEventSupersededByLocals(ev, insiderIds, localOrigin) then
-                        local skipAvailable = ev.action == actions.AVAILABLE
-                            and OutsidersHaveLocalUse(ids, ListToSet(insiderIds), ev.slot, localArmor)
-                        if not skipAvailable then
-                            ApplyIdentityArmor(occ, ev.slot, ev.action)
-                        end
+                if IsSubset(ev.identityMembers, idSet)
+                    and not IdentityEventSupersededByLocals(ev, ev.identityMembers, localOrigin)
+                then
+                    local key = IdentityMembersKey(ev.identityMembers) .. "\0" .. tostring(ev.slot)
+                    local prev = latestByKey[key]
+                    if not prev or Identity.CompareLogs(prev.log, ev.log) then
+                        latestByKey[key] = ev
                     end
+                end
+            end
+            local netEvents = {}
+            for _, ev in pairs(latestByKey) do
+                netEvents[#netEvents + 1] = ev
+            end
+            table.sort(netEvents, function(a, b)
+                return Identity.CompareLogs(a.log, b.log)
+            end)
+            for j = 1, #netEvents do
+                local ev = netEvents[j]
+                local skipAvailable = ev.action == actions.AVAILABLE
+                    and OutsidersHaveLocalUse(ids, ListToSet(ev.identityMembers), ev.slot, localArmor)
+                if not skipAvailable then
+                    ApplyIdentityArmor(occ, ev.slot, ev.action)
                 end
             end
             occByRoot[root] = occ
