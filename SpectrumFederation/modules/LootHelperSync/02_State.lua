@@ -66,6 +66,7 @@ Sync.state = Sync.state or {
     helpers     = {},   -- array of "Name-Realm"
     authorMax   = {},   -- raw map: exact `_author` spelling -> highest retained counter
     authorWindowSummary = {}, -- map: [author] = { {fromCounter,toCounter,count,checksum,maxCounter}, ... }
+    containedExactWindows = {}, -- session-scoped advertised windows proven contained (not equality)
 
     isCoordinator = false,
 

@@ -890,6 +890,7 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self.state._adminConvergence = nil
     self.state.handshake = nil
     self.state._sessionAnnounced = nil
+    self.state.containedExactWindows = {}
 
     local me = self:_SelfId()
     local oldEpoch = tonumber(self.state.coordEpoch) or 0

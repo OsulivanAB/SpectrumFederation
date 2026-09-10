@@ -6795,6 +6795,20 @@ Sync.state.repairQueue = { order = {}, items = {} }
 Sync.state._adminConvergence = nil
 Sync.state.authorWindowSummary = coord:ComputeAuthorWindowSummary(3)
 Sync.state.authorMax = coord:ComputeAuthorMax()
+local behindRow = coord:GetLogById("owner-Garona:1")
+local behindProof = Sync:_MakeExactRowWindowEvidence(
+    "owner-Garona",
+    1,
+    "owner-Garona:1",
+    behindRow and behindRow:GetFingerprint()
+)
+local behindWindow = {
+    fromCounter = 1,
+    toCounter = 3,
+    count = 1,
+    maxCounter = 1,
+    checksum = behindProof.checksum,
+}
 Sync.state.adminStatuses = {
     [OTHER] = {
         hasProfile = true,
@@ -6807,15 +6821,7 @@ Sync.state.adminStatuses = {
         hasGaps = false,
         authorMax = { [OWNER] = 2, ["owner-Garona"] = 1 },
         authorWindowSummary = {
-            ["owner-Garona"] = {
-                {
-                    fromCounter = 1,
-                    toCounter = 3,
-                    count = 1,
-                    maxCounter = 1,
-                    checksum = 1,
-                },
-            },
+            ["owner-Garona"] = { behindWindow },
         },
     },
 }
@@ -6838,15 +6844,7 @@ Sync.state.adminStatuses = {
         hasGaps = false,
         authorMax = { [OWNER] = 2, ["owner-Garona"] = 1 },
         authorWindowSummary = {
-            ["owner-Garona"] = {
-                {
-                    fromCounter = 1,
-                    toCounter = 3,
-                    count = 1,
-                    maxCounter = 1,
-                    checksum = 1,
-                },
-            },
+            ["owner-Garona"] = { behindWindow },
         },
     },
 }
@@ -6902,6 +6900,445 @@ assertTrue(sawOther and sawC, "logical ADMIN_LOG_REQ keeps in-request fallbacks"
 restoreUniqueNonces()
 end
 runAdminConvergenceIntegrityTests()
+
+local function runAdvertisedContainmentTests()
+local function installUniqueNonces()
+    local nonce = 0
+    function Sync:_NextNonce(tag)
+        nonce = nonce + 1
+        return tostring(tag or "N") .. tostring(nonce)
+    end
+end
+local function restoreUniqueNonces()
+    function Sync:_NextNonce(tag)
+        return tostring(tag or "N") .. "1"
+    end
+end
+local function findReqForAuthor(author, integrity)
+    for id, req in pairs(Sync.state.requests or {}) do
+        local meta = req and req.meta
+        if type(meta) == "table" and meta.author == author then
+            if integrity == nil or (meta.integrityRepair == true) == integrity then
+                return id, req
+            end
+        end
+    end
+    return nil, nil
+end
+local function queuedRepairFor(author)
+    for _, entry in pairs((Sync.state.repairQueue and Sync.state.repairQueue.items) or {}) do
+        if entry.author == author then
+            return entry
+        end
+    end
+    return nil
+end
+local function startConv(profile)
+    registerProfile(profile)
+    activateSession(profile)
+    profile._adminUsers = { OWNER, OTHER }
+    Sync.state.isCoordinator = true
+    Sync.state.coordEpoch = 1
+    Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+    installUniqueNonces()
+    Sync:BeginAdminConvergence(Sync.state.sessionId, profile:GetProfileId(), {
+        onComplete = function() end,
+    })
+end
+local function setRemoteAdmin(coord, remote, extraStatuses)
+    local summary = remote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+    Sync.state.authorWindowSummary = coord:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+    Sync.state.authorMax = coord:ComputeAuthorMax()
+    Sync.state.adminStatuses = {
+        [OTHER] = {
+            hasProfile = true,
+            hasGaps = false,
+            authorMax = remote:ComputeAuthorMax(),
+            authorWindowSummary = summary,
+        },
+    }
+    if type(extraStatuses) == "table" then
+        for name, st in pairs(extraStatuses) do
+            Sync.state.adminStatuses[name] = st
+        end
+    end
+    return summary
+end
+local function addOwnerSiblings(profile)
+    assertTrue(profile:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 2,
+        }, { author = OWNER, counter = 2, timestamp = 1700030002 }),
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 3,
+        }, { author = OWNER, counter = 3, timestamp = 1700030003 }),
+    }) > 0, "SameAuthor sibling Owner-Garona rows exist")
+end
+local function seedLaterWindowConflict(coordName, remoteName)
+    local remote = makeProfile(remoteName)
+    addMember(remote, ALT_A)
+    addMember(remote, ALT_B)
+    addMember(remote, OTHER)
+    addOwnerSiblings(remote)
+    assertTrue(remote:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.ADMIN_ADDED, {
+            member = ALT_A,
+        }, { author = OWNER, counter = 4, timestamp = 1700030010 }),
+        makeTable(SF.LootLogEventTypes.ADMIN_REMOVED, {
+            member = ALT_A,
+            preOpAuthorMax = {
+                { author = OWNER, counter = 4 },
+            },
+        }, { author = "owner-Garona", counter = 1, timestamp = 1700030020 }),
+        makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+            memberA = ALT_A,
+            memberB = ALT_B,
+            adminMembersAtLink = { ALT_A },
+        }, { author = OWNER, counter = 5, timestamp = 1700030030 }),
+    }) > 0, "remote later-window source has owner-Garona:1 ADMIN_REMOVED")
+    if remote.RebuildLogIndex then
+        remote:RebuildLogIndex()
+    end
+    remote._adminUsers = { OWNER, OTHER }
+    local coord = cloneWithout(remote, coordName, "owner-Garona:1")
+    local wrong = makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 99,
+    }, { author = "owner-Garona", counter = 1, timestamp = 1700030020 })
+    assertTrue(coord:MergeLogTables({
+        wrong,
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 30,
+        }, { author = "owner-Garona", counter = 30, timestamp = 1700030090 }),
+    }, { allowReplaceExisting = true }) > 0, "coordinator has wrong :1 plus later :30")
+    if coord.RebuildLogIndex then
+        coord:RebuildLogIndex()
+    end
+    coord._adminUsers = { OWNER, OTHER }
+    return coord, remote
+end
+local function seedMissingEarlier(coordName, remoteName)
+    local remote = makeProfile(remoteName)
+    addMember(remote, ALT_A)
+    addMember(remote, OTHER)
+    addOwnerSiblings(remote)
+    assertTrue(remote:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 11,
+        }, { author = "owner-Garona", counter = 1, timestamp = 1700030101 }),
+    }) > 0, "remote missing-earlier source has owner-Garona:1")
+    if remote.RebuildLogIndex then
+        remote:RebuildLogIndex()
+    end
+    remote._adminUsers = { OWNER, OTHER }
+    local coord = cloneWithout(remote, coordName, "owner-Garona:1")
+    assertTrue(coord:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 12,
+        }, { author = "owner-Garona", counter = 2, timestamp = 1700030102 }),
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 13,
+        }, { author = "owner-Garona", counter = 3, timestamp = 1700030103 }),
+    }) > 0, "local missing-earlier store has owner-Garona:2 and :3")
+    if coord.RebuildLogIndex then
+        coord:RebuildLogIndex()
+    end
+    coord._adminUsers = { OWNER, OTHER }
+    return coord, remote
+end
+local function seedTrueBehind(coordName, remoteName)
+    local remote = makeProfile(remoteName)
+    addMember(remote, ALT_A)
+    addMember(remote, OTHER)
+    addOwnerSiblings(remote)
+    assertTrue(remote:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 11,
+        }, { author = "owner-Garona", counter = 1, timestamp = 1700030201 }),
+    }) > 0, "true-behind remote has owner-Garona:1")
+    if remote.RebuildLogIndex then
+        remote:RebuildLogIndex()
+    end
+    remote._adminUsers = { OWNER, OTHER }
+    local coord = cloneWithout(remote, coordName, "__none__")
+    assertTrue(coord:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 13,
+        }, { author = "owner-Garona", counter = 3, timestamp = 1700030203 }),
+    }) > 0, "true-behind local keeps :1 and adds :3")
+    if coord.RebuildLogIndex then
+        coord:RebuildLogIndex()
+    end
+    coord._adminUsers = { OWNER, OTHER }
+    return coord, remote
+end
+local function seedSuperset(coordName, remoteName, conflictFirst)
+    local remote = makeProfile(remoteName)
+    addMember(remote, ALT_A)
+    addMember(remote, OTHER)
+    addOwnerSiblings(remote)
+    assertTrue(remote:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 11,
+        }, { author = "owner-Garona", counter = 1, timestamp = 1700030301 }),
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 13,
+        }, { author = "owner-Garona", counter = 3, timestamp = 1700030303 }),
+    }) > 0, "superset remote has owner-Garona:1 and :3")
+    if remote.RebuildLogIndex then
+        remote:RebuildLogIndex()
+    end
+    remote._adminUsers = { OWNER, OTHER }
+    local coord = cloneWithout(remote, coordName, "__none__")
+    assertTrue(coord:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 12,
+        }, { author = "owner-Garona", counter = 2, timestamp = 1700030302 }),
+    }) > 0, "superset local inserts interleaved owner-Garona:2")
+    if conflictFirst then
+        local wrong = coord:GetLogById("owner-Garona:1"):ToTable()
+        wrong._data = { member = ALT_A, change = SF.LootLogPointChangeTypes.INCREMENT, amount = 99 }
+        wrong._fingerprint = SF.LootLog.ComputeFingerprintFromTable(wrong)
+        assertTrue(coord:MergeLogTables({ wrong }, { allowReplaceExisting = true }) >= 0,
+            "superset conflict replaces owner-Garona:1 fingerprint")
+    end
+    if coord.RebuildLogIndex then
+        coord:RebuildLogIndex()
+    end
+    coord._adminUsers = { OWNER, OTHER }
+    return coord, remote
+end
+local function assertRepairObtains(remote, coord, evid, requestId, expectId)
+    applyDiscoveredRange(remote, coord, {
+        author = "owner-Garona",
+        fromCounter = evid.fromCounter,
+        toCounter = evid.maxCounter > 0 and evid.maxCounter or evid.toCounter,
+        exactAuthor = true,
+        integrityRepair = true,
+        expectedCount = evid.count,
+        expectedChecksum = evid.checksum,
+        expectedMaxCounter = evid.maxCounter,
+        expectedFromCounter = evid.fromCounter,
+        expectedToCounter = evid.toCounter,
+        expectedWindows = { evid },
+    }, requestId)
+    assertTrue(hasLogId(coord, expectId), "repair obtained " .. tostring(expectId))
+end
+
+-- 1 / 6 / 7 / 8 / 9 / 10. Later window must not hide earlier fingerprint conflict.
+resetEnv()
+local coord, remote = seedLaterWindowConflict("ContainLaterCoord", "ContainLaterRemote")
+assertEq(coord:ComputeAuthorMax()["owner-Garona"], 30, "later-window fixture has global raw max 30")
+assertTrue(coord:ComputeAuthorMax()["owner-Garona"] > (remote:ComputeAuthorMax()["owner-Garona"] or 0),
+    "later local max is newer than remote first-window max")
+local _, hbIntegrity = discoverFrom(coord, remote)
+assertTrue(rangeForAuthor(hbIntegrity, "owner-Garona") ~= nil,
+    "heartbeat/member discovery still sees the first-window conflict")
+assertEq(rangeForAuthor(hbIntegrity, "owner-Garona").toCounter, 1,
+    "first-window conflict requests the remote filled frontier, not :30")
+startConv(coord)
+local remoteSummary = setRemoteAdmin(coord, remote)
+local evid = remoteSummary["owner-Garona"][1]
+assertEq(evid.maxCounter, 1, "remote first window filled frontier is 1")
+assertTrue(Sync:_IsUnresolvedAdvertisedWindow(coord:GetProfileId(), {
+    author = "owner-Garona",
+    expectedMaxCounter = evid.maxCounter,
+    toCounter = evid.toCounter,
+    expectedWindows = { evid },
+}), "global :30 does not contain the conflicting 1..25 window")
+assertTrue(Sync:_HasUnresolvedRemoteWindowMismatch(coord:GetProfileId()),
+    "later-window conflict remains an unresolved remote mismatch")
+local grantsBefore = adminAddedCount(coord)
+Sync:FinalizeAdminConvergence()
+local _, req = findReqForAuthor("owner-Garona", true)
+assertTrue(req ~= nil, "admin convergence still queues first-window integrity")
+assertEq(req.meta.expectedChecksum, evid.checksum, "integrity proof stays advertiser-owned")
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "later local max does not make identity-admin reconcile ready")
+assertFalse(coord:IsAdminMemberId(ALT_B), "unresolved earlier window does not persist implied ADMIN_ADDED")
+assertEq(adminAddedCount(coord), grantsBefore, "no ADMIN_ADDED while earlier window is uncontained")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "clearing the request does not treat the earlier window as contained")
+Sync.state._adminConvergence = { finished = false, finalizeStarted = true }
+assertTrue(Sync:_QueueRemoteWindowMismatches(coord:GetProfileId(), OTHER, remoteSummary),
+    "late ADMIN_STATUS still queues the earlier-window conflict")
+assertTrue(queuedRepairFor("owner-Garona") ~= nil, "late ADMIN_STATUS repair keeps first-window proof")
+assertRepairObtains(remote, coord, evid, "REQ-CONTAIN-LATER", "owner-Garona:1")
+assertEq(coord:GetLogById("owner-Garona:1"):GetFingerprint(), remote:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "trusted integrity replaces the conflicting first-window row")
+assertTrue(hasLogId(coord, "owner-Garona:30"), "later local row is retained")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "reconcile may run after the earlier advertised window is contained")
+Sync:ScheduleIdentityAdminReconcile(coord:GetProfileId())
+assertFalse(coord:IsAdminMemberId(ALT_A), "ADMIN_REMOVED remains in force after containment")
+assertFalse(coord:IsAdminMemberId(ALT_B), "contained ADMIN_REMOVED history does not grant B")
+
+-- 2 / 6 / 7 / 10 / 11. Higher local max with a genuinely missing earlier row.
+resetEnv()
+coord, remote = seedMissingEarlier("ContainMissingCoord", "ContainMissingRemote")
+assertEq(coord:ComputeAuthorMax()["owner-Garona"], 3, "missing-earlier local exact max is 3")
+assertEq(remote:ComputeAuthorMax()["owner-Garona"], 1, "missing-earlier remote exact max is 1")
+assertFalse(hasLogId(coord, "owner-Garona:1"), "local does not already have remote :1")
+local missingHb, missingIntegrity = discoverFrom(coord, remote)
+assertTrue(rangeForAuthor(missingHb, "owner-Garona") == nil,
+    "exact catch-up stays idle when local raw max is already newer")
+assertTrue(rangeForAuthor(missingIntegrity, "owner-Garona") ~= nil,
+    "heartbeat/member path discovers missing remote :1 despite a newer local max")
+startConv(coord)
+remoteSummary = setRemoteAdmin(coord, remote)
+evid = remoteSummary["owner-Garona"][1]
+assertTrue(Sync:_IsUnresolvedAdvertisedWindow(coord:GetProfileId(), {
+    author = "owner-Garona",
+    expectedWindows = { evid },
+    expectedMaxCounter = evid.maxCounter,
+}), "missing :1 is not resolved by local :2/:3")
+Sync:FinalizeAdminConvergence()
+_, req = findReqForAuthor("owner-Garona", true)
+assertTrue(req ~= nil, "admin convergence requests the missing earlier row")
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "missing earlier row blocks identity-admin reconcile")
+Sync.state._adminConvergence = { finished = false, finalizeStarted = true }
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+assertTrue(Sync:_QueueRemoteWindowMismatches(coord:GetProfileId(), OTHER, remoteSummary),
+    "late ADMIN_STATUS still discovers the missing earlier row")
+assertRepairObtains(remote, coord, evid, "REQ-CONTAIN-MISSING", "owner-Garona:1")
+assertTrue(hasLogId(coord, "owner-Garona:2"), "local :2 is retained after missing-row repair")
+assertTrue(hasLogId(coord, "owner-Garona:3"), "local :3 is retained after missing-row repair")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "reconcile may run after the missing advertised row is present")
+
+-- 3 / 6 / 7. True behind advertiser whose advertised rows are already local.
+resetEnv()
+coord, remote = seedTrueBehind("ContainBehindCoord", "ContainBehindRemote")
+assertTrue(hasLogId(coord, "owner-Garona:1"), "true-behind local already has remote :1")
+assertTrue(hasLogId(coord, "owner-Garona:3"), "true-behind local also has extra :3")
+assertEq(coord:GetLogById("owner-Garona:1"):GetFingerprint(), remote:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "true-behind :1 fingerprints match")
+local _, behindIntegrity = discoverFrom(coord, remote)
+assertTrue(rangeForAuthor(behindIntegrity, "owner-Garona") == nil,
+    "heartbeat/member path does not repair a true-behind advertiser")
+startConv(coord)
+remoteSummary = setRemoteAdmin(coord, remote)
+evid = remoteSummary["owner-Garona"][1]
+assertFalse(Sync:_IsUnresolvedAdvertisedWindow(coord:GetProfileId(), {
+    author = "owner-Garona",
+    expectedWindows = { evid },
+    expectedMaxCounter = evid.maxCounter,
+}), "advertised :1 is contained despite local :3")
+assertFalse(Sync:_HasUnresolvedRemoteWindowMismatch(coord:GetProfileId()),
+    "true-behind remote window is not an unresolved dependency")
+Sync:FinalizeAdminConvergence()
+_, req = findReqForAuthor("owner-Garona", true)
+assertTrue(req == nil, "admin convergence does not aim integrity at a contained behind window")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "true-behind advertiser does not stall identity-admin reconcile")
+Sync.state._adminConvergence = { finished = false, finalizeStarted = true }
+assertFalse(Sync:_QueueRemoteWindowMismatches(coord:GetProfileId(), OTHER, remoteSummary),
+    "late ADMIN_STATUS does not requeue a contained behind window")
+assertTrue(hasLogId(coord, "owner-Garona:3"), "true-behind path does not delete local :3")
+
+-- 4 / 6 / 7 / 10. Local superset with an interleaved extra sparse row.
+resetEnv()
+coord, remote = seedSuperset("ContainSuperCoord", "ContainSuperRemote", false)
+assertTrue(hasLogId(coord, "owner-Garona:2"), "superset local has interleaved :2")
+assertEq(coord:GetLogById("owner-Garona:1"):GetFingerprint(), remote:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "superset remote :1 is already present locally")
+assertEq(coord:GetLogById("owner-Garona:3"):GetFingerprint(), remote:GetLogById("owner-Garona:3"):GetFingerprint(),
+    "superset remote :3 is already present locally")
+local _, superIntegrity = discoverFrom(coord, remote)
+assertTrue(rangeForAuthor(superIntegrity, "owner-Garona") ~= nil,
+    "compact window summary cannot prove interleaved containment without AUTH_LOGS")
+startConv(coord)
+remoteSummary = setRemoteAdmin(coord, remote)
+evid = remoteSummary["owner-Garona"][1]
+assertTrue(Sync:_IsUnresolvedAdvertisedWindow(coord:GetProfileId(), {
+    author = "owner-Garona",
+    expectedWindows = { evid },
+}), "interleaved extra :2 is not compact containment of remote {1,3}")
+Sync:FinalizeAdminConvergence()
+_, req = findReqForAuthor("owner-Garona", true)
+assertTrue(req ~= nil, "admin convergence fetches advertiser rows to prove the superset")
+assertRepairObtains(remote, coord, evid, "REQ-CONTAIN-SUPER", "owner-Garona:1")
+assertTrue(hasLogId(coord, "owner-Garona:2"), "proof-bearing AUTH_LOGS does not delete interleaved :2")
+assertTrue(hasLogId(coord, "owner-Garona:3"), "superset :3 remains")
+assertFalse(Sync:_IsUnresolvedAdvertisedWindow(coord:GetProfileId(), {
+    author = "owner-Garona",
+    expectedWindows = { evid },
+}), "AUTH_LOGS row proof marks the advertised {1,3} window contained")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "contained superset does not permanently block identity-admin reconcile")
+assertFalse(Sync:_QueueRemoteWindowMismatches(coord:GetProfileId(), OTHER, remoteSummary),
+    "late ADMIN_STATUS is idle after AUTH_LOGS proved the superset")
+
+-- 5 / 6 / 9 / 10. Local superset plus one conflicting advertised fingerprint.
+resetEnv()
+coord, remote = seedSuperset("ContainSuperFpCoord", "ContainSuperFpRemote", true)
+assertTrue(coord:GetLogById("owner-Garona:1"):GetFingerprint() ~= remote:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "conflicting superset has the wrong owner-Garona:1 fingerprint")
+startConv(coord)
+remoteSummary = setRemoteAdmin(coord, remote)
+evid = remoteSummary["owner-Garona"][1]
+grantsBefore = adminAddedCount(coord)
+assertTrue(Sync:_HasUnresolvedRemoteWindowMismatch(coord:GetProfileId()),
+    "conflicting advertised :1 stays unresolved despite local :2/:3")
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "fingerprint conflict blocks identity-admin reconcile")
+Sync:FinalizeAdminConvergence()
+_, req = findReqForAuthor("owner-Garona", true)
+assertTrue(req ~= nil, "admin convergence requests the conflicting advertised row")
+assertEq(adminAddedCount(coord), grantsBefore, "no ADMIN_ADDED while advertised :1 still conflicts")
+assertRepairObtains(remote, coord, evid, "REQ-CONTAIN-SUPER-FP", "owner-Garona:1")
+assertEq(coord:GetLogById("owner-Garona:1"):GetFingerprint(), remote:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "trusted integrity replaces the conflicting superset :1")
+assertTrue(hasLogId(coord, "owner-Garona:2"), "conflicting-superset repair retains interleaved :2")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "reconcile may run after the conflicting advertised row is repaired")
+
+restoreUniqueNonces()
+end
+runAdvertisedContainmentTests()
 end
 runExactAuthorProofTests()
 

@@ -235,6 +235,12 @@ function Sync:HandleAuthLogs(sender, payload)
         if req.meta and req.meta.author and req.meta.toCounter then
             local exactRepair = self:_IsExactAuthorRepair(req.meta)
             if exactRepair then
+                -- A proof-bearing AUTH_LOGS payload can establish that the
+                -- advertiser's filled set is present locally even when the
+                -- receiver also retains extra valid rows in the same window.
+                if self._ProveAdvertisedWindowsFromAuthLogs then
+                    self:_ProveAdvertisedWindowsFromAuthLogs(payload.profileId, req.meta, payload.logs)
+                end
                 -- Empty AUTH_LOGS, SameAuthor siblings, later-window rows,
                 -- and incomplete integrity subsets must not complete
                 -- exact-author repairs. Coordinator fallback has to keep

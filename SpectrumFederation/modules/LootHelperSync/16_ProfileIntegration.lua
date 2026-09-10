@@ -218,30 +218,16 @@ function Sync:ComputeAuthorWindowSummary(profileId)
 end
 
 -- Protocol 2 authorWindowSummary is still per raw `_author` with count,
--- checksum, and maxCounter. Comparison uses logical SameAuthor contig so a
--- previously unseen alias spelling is not treated as contig 0. Partial/final
--- windows (maxCounter < toCounter) are compared at the filled frontier;
--- mismatch requests for those windows use toCounter = maxCounter so AUTH_LOGS
--- can complete when the remote stream has not filled the whole window.
+-- checksum, and maxCounter. A higher local raw max is not set containment.
+-- Emit integrity whenever the advertised filled set is not proven present
+-- locally. Partial windows request through maxCounter until logical contig
+-- covers the whole bucket, so AUTH_LOGS can complete a filled frontier
+-- without waiting for counters the advertiser never claimed.
 function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localContig)
     local mismatches = {}
     if type(remoteSummary) ~= "table" then return mismatches end
 
-    local localSummary = self:ComputeAuthorWindowSummary(profileId)
     localContig = localContig or self:ComputeContigAuthorMax(profileId)
-
-    local localByAuthor = {}
-    for author, windows in pairs(localSummary or {}) do
-        if type(windows) == "table" then
-            local indexed = {}
-            for _, row in ipairs(windows) do
-                if type(row) == "table" and type(row.fromCounter) == "number" then
-                    indexed[row.fromCounter] = row
-                end
-            end
-            localByAuthor[author] = indexed
-        end
-    end
 
     for author, windows in pairs(remoteSummary) do
         if type(author) == "string" and type(windows) == "table" then
@@ -251,42 +237,22 @@ function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localConti
             else
                 authorContig = tonumber(localContig and localContig[author]) or 0
             end
-            local indexed = localByAuthor[author] or {}
             for _, remoteWindow in ipairs(windows) do
                 if type(remoteWindow) == "table"
                     and type(remoteWindow.fromCounter) == "number"
                     and type(remoteWindow.toCounter) == "number"
                 then
-                    local localWindow = indexed[remoteWindow.fromCounter]
                     local remoteCount = tonumber(remoteWindow.count) or 0
-                    local remoteFilledTo = tonumber(remoteWindow.maxCounter) or 0
-                    local localFilledTo = localWindow and tonumber(localWindow.maxCounter) or 0
-                    local fullWindowReady = authorContig >= remoteWindow.toCounter
-                    local missingExactAuthor = remoteCount > 0
-                        and not localWindow
-                        and remoteFilledTo > 0
-                        and authorContig >= remoteFilledTo
-                    local partialSameFrontier = remoteFilledTo > 0
-                        and remoteFilledTo < remoteWindow.toCounter
-                        and localWindow
-                        and localFilledTo == remoteFilledTo
-                    local behindExactAuthor = localWindow
-                        and remoteFilledTo > localFilledTo
-                        and authorContig >= remoteFilledTo
-
-                    if fullWindowReady or missingExactAuthor or partialSameFrontier or behindExactAuthor then
-                        local localCount = localWindow and tonumber(localWindow.count) or 0
-                        local localChecksum = localWindow and tonumber(localWindow.checksum) or nil
-                        local remoteChecksum = tonumber(remoteWindow.checksum) or nil
-
-                        if (not localWindow)
-                            or localCount ~= remoteCount
-                            or localChecksum ~= remoteChecksum
-                        then
-                            local reqTo = remoteWindow.toCounter
-                            if not fullWindowReady and remoteFilledTo > 0 then
-                                reqTo = remoteFilledTo
-                            end
+                    if remoteCount > 0
+                        and not self:_IsAdvertisedExactWindowContained(profileId, author, remoteWindow)
+                    then
+                        local remoteFilledTo = tonumber(remoteWindow.maxCounter) or 0
+                        local remoteChecksum = tonumber(remoteWindow.checksum)
+                        local reqTo = remoteWindow.toCounter
+                        if authorContig < remoteWindow.toCounter and remoteFilledTo > 0 then
+                            reqTo = remoteFilledTo
+                        end
+                        if reqTo >= remoteWindow.fromCounter then
                             local evidence = {
                                 fromCounter = remoteWindow.fromCounter,
                                 toCounter = remoteWindow.toCounter,
@@ -401,6 +367,9 @@ function Sync:_ClearIdentitySessionBookkeeping(reason)
     self._identityAdminReconcileNeeded = {}
     self._identityAdminReconcilePending = {}
     self._consideringIdentitySideEffects = nil
+    if type(self.state) == "table" then
+        self.state.containedExactWindows = {}
+    end
     if SF.Debug then
         SF.Debug:Verbose("SYNC", "Cleared identity session bookkeeping (reason=%s)", tostring(reason or "unknown"))
     end
@@ -775,38 +744,200 @@ function Sync:_NormalizeExpectedWindows(opts, fromCounter, toCounter)
     }
 end
 
--- Local exact `_author` window must match advertised count / max / checksum.
--- Sparse holes are allowed because the checksum is over retained rows, not
--- every integer in the range. A later row outside the window cannot match.
+-- Advertised maxCounter is the filled frontier of that window, not a claim
+-- about later counters in the same fixed bucket. Extras after filledTo must
+-- not satisfy or invalidate earlier proof.
+function Sync:_AdvertisedWindowFilledTo(window)
+    local fromCounter = tonumber(window and window.fromCounter) or 0
+    local toCounter = tonumber(window and window.toCounter) or 0
+    local maxCounter = tonumber(window and window.maxCounter)
+    if maxCounter and maxCounter > 0 then
+        if toCounter > 0 and maxCounter > toCounter then
+            return toCounter
+        end
+        if fromCounter > 0 and maxCounter < fromCounter then
+            return fromCounter - 1
+        end
+        return maxCounter
+    end
+    return toCounter
+end
+
+function Sync:_AdvertisedWindowProofKey(profileId, author, window)
+    return table.concat({
+        tostring(profileId or ""),
+        tostring(author or ""),
+        tostring(tonumber(window and window.fromCounter) or 0),
+        tostring(tonumber(window and window.toCounter) or 0),
+        tostring(tonumber(window and window.count) or 0),
+        tostring(tonumber(window and window.maxCounter) or 0),
+        tostring(tonumber(window and window.checksum) or 0),
+    }, "|")
+end
+
+function Sync:_MarkAdvertisedWindowContained(profileId, author, window)
+    if type(window) ~= "table" then
+        return
+    end
+    self.state = self.state or {}
+    if type(self.state.containedExactWindows) ~= "table" then
+        self.state.containedExactWindows = {}
+    end
+    self.state.containedExactWindows[self:_AdvertisedWindowProofKey(profileId, author, window)] = true
+end
+
+function Sync:_HasContainedExactWindowProof(profileId, author, window)
+    local contained = self.state and self.state.containedExactWindows
+    if type(contained) ~= "table" or type(window) ~= "table" then
+        return false
+    end
+    return contained[self:_AdvertisedWindowProofKey(profileId, author, window)] == true
+end
+
+-- Compact proof: local retained rows in [from, filledTo] match advertised
+-- count and/or checksum. That is containment of the advertiser's filled set,
+-- not equality of the whole fixed bucket. Interleaved extras inside the
+-- filled frontier still require AUTH_LOGS row proof.
+function Sync:_LocalFrontierMatchesAdvertisedWindow(profileId, author, window)
+    if type(window) ~= "table" then
+        return false
+    end
+    local fromCounter = tonumber(window.fromCounter)
+    local toCounter = tonumber(window.toCounter)
+    if not fromCounter or not toCounter or fromCounter <= 0 or toCounter < fromCounter then
+        return false
+    end
+    local expectedCount = tonumber(window.count)
+    local expectedChecksum = tonumber(window.checksum)
+    local expectedMax = tonumber(window.maxCounter)
+    if expectedCount == nil and expectedChecksum == nil then
+        return false
+    end
+    local filledTo = self:_AdvertisedWindowFilledTo(window)
+    if filledTo < fromCounter then
+        return expectedCount == 0
+    end
+    local count, maxInRange, checksum = self:_ScanExactAuthorRange(profileId, author, fromCounter, filledTo)
+    if expectedCount ~= nil and count ~= expectedCount then
+        return false
+    end
+    if expectedMax ~= nil and expectedMax > 0 and maxInRange ~= expectedMax then
+        return false
+    end
+    if expectedChecksum ~= nil and checksum ~= expectedChecksum then
+        return false
+    end
+    return true
+end
+
+function Sync:_IsAdvertisedExactWindowContained(profileId, author, window)
+    if self:_HasContainedExactWindowProof(profileId, author, window) then
+        return true
+    end
+    return self:_LocalFrontierMatchesAdvertisedWindow(profileId, author, window)
+end
+
+function Sync:_AuthLogsProveAdvertisedWindow(profileId, author, window, payloadLogs)
+    if type(window) ~= "table" or type(author) ~= "string" or author == "" then
+        return false
+    end
+    local advertisedCount = tonumber(window.count)
+    local advertisedChecksum = tonumber(window.checksum)
+    if advertisedCount == nil or advertisedChecksum == nil then
+        return false
+    end
+    local fromCounter = tonumber(window.fromCounter) or 0
+    local filledTo = self:_AdvertisedWindowFilledTo(window)
+    local matched = {}
+    for _, log in ipairs(payloadLogs or {}) do
+        if type(log) == "table" then
+            local logAuthor = log._author or log.author
+            if logAuthor == author then
+                local counter = tonumber(log._counter or log.counter)
+                if counter and counter >= fromCounter and counter <= filledTo then
+                    local id = log._id or log.id or ""
+                    local fingerprint = log._fingerprint or log.fingerprint or 0
+                    matched[#matched + 1] = ("%s=%s"):format(id, tostring(fingerprint))
+                end
+            end
+        end
+    end
+    if ExactRangeFingerprintRollup(matched) ~= advertisedChecksum or #matched ~= advertisedCount then
+        return false
+    end
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        return false
+    end
+    local byId = {}
+    for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
+        local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
+        if a == author then
+            local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
+            c = tonumber(c)
+            if c and c >= fromCounter and c <= filledTo then
+                local id = (log.GetID and log:GetID()) or log._id
+                if type(id) == "string" and id ~= "" then
+                    byId[id] = log
+                end
+            end
+        end
+    end
+    for _, log in ipairs(payloadLogs or {}) do
+        if type(log) == "table" then
+            local logAuthor = log._author or log.author
+            local counter = tonumber(log._counter or log.counter)
+            if logAuthor == author and counter and counter >= fromCounter and counter <= filledTo then
+                local id = log._id or log.id
+                local localLog = type(id) == "string" and byId[id]
+                if not localLog then
+                    return false
+                end
+                local localFp = tonumber((localLog.GetFingerprint and localLog:GetFingerprint()) or localLog._fingerprint)
+                local remoteFp = tonumber(log._fingerprint or log.fingerprint)
+                if not localFp or not remoteFp or localFp ~= remoteFp then
+                    return false
+                end
+            end
+        end
+    end
+    return true
+end
+
+function Sync:_ProveAdvertisedWindowsFromAuthLogs(profileId, request, payloadLogs)
+    if type(request) ~= "table" or type(profileId) ~= "string" or profileId == "" then
+        return false
+    end
+    if not self:_IsExactAuthorRepair(request) then
+        return false
+    end
+    local windows = request.expectedWindows
+    if type(windows) ~= "table" or #windows == 0 then
+        windows = self:_NormalizeExpectedWindows(request, request.fromCounter, request.toCounter)
+    end
+    if type(windows) ~= "table" then
+        return false
+    end
+    local marked = false
+    for i = 1, #windows do
+        local window = windows[i]
+        if self:_AuthLogsProveAdvertisedWindow(profileId, request.author, window, payloadLogs) then
+            self:_MarkAdvertisedWindowContained(profileId, request.author, window)
+            marked = true
+        end
+    end
+    return marked
+end
+
+-- Advertised history is satisfied when local retained immutable rows contain
+-- the advertiser's proven filled set. A later raw max is not containment.
+-- Sparse holes are allowed because the checksum is over retained rows.
 function Sync:_ExactAuthorEvidenceSatisfied(profileId, author, expectedWindows)
     if type(expectedWindows) ~= "table" or #expectedWindows == 0 then
         return false
     end
     for _, expected in ipairs(expectedWindows) do
-        if type(expected) ~= "table" then
-            return false
-        end
-        local windowFrom = tonumber(expected.fromCounter)
-        local windowTo = tonumber(expected.toCounter)
-        if not windowFrom or not windowTo then
-            return false
-        end
-        local count, maxInRange, checksum = self:_ScanExactAuthorRange(profileId, author, windowFrom, windowTo)
-        local expectedCount = tonumber(expected.count)
-        if expectedCount ~= nil and count ~= expectedCount then
-            return false
-        end
-        local expectedMax = tonumber(expected.maxCounter)
-        if expectedMax ~= nil and expectedMax > 0 and maxInRange ~= expectedMax then
-            return false
-        end
-        local expectedChecksum = tonumber(expected.checksum)
-        if expectedChecksum ~= nil and checksum ~= expectedChecksum then
-            return false
-        end
-        -- Retained max is not set completeness. Count and/or checksum must
-        -- prove which exact rows belong in the window.
-        if expectedCount == nil and expectedChecksum == nil then
+        if not self:_IsAdvertisedExactWindowContained(profileId, author, expected) then
             return false
         end
     end
@@ -815,8 +946,9 @@ end
 
 -- Exact-author satisfaction requires advertised raw-window proof. Global
 -- retained max, a non-empty AUTH_LOGS payload, and SameAuthor contig are not
--- sufficient. Completeness and integrity both compare local exact rows in each
--- advertised window to that window's count / maxCounter / checksum.
+-- sufficient. Completeness and integrity both ask whether local exact rows
+-- contain each advertiser's filled set (count / maxCounter / checksum, or a
+-- proof-bearing AUTH_LOGS row set). Extra valid local rows are allowed.
 function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCounter, opts)
     if type(profileId) ~= "string" or profileId == "" then return false end
     if type(author) ~= "string" or author == "" then return false end
@@ -1321,20 +1453,26 @@ function Sync:_QueueAdvertisedRepair(profileId, range, mode, preferredTarget)
     })
 end
 
--- A poorer advertised window (remote max < local exact max) is not an
--- unresolved dependency. Identity-admin must not wait on a behind admin,
--- and integrity repair must not aim at that poorer checksum.
+-- Advertised history is unresolved until local retained rows contain that
+-- advertiser's proven filled set. A larger local raw max is only a frontier
+-- hint; it does not prove an earlier window is already present.
 function Sync:_IsUnresolvedAdvertisedWindow(profileId, range)
     if type(range) ~= "table" or type(range.author) ~= "string" or range.author == "" then
         return false
     end
-    local remoteMax = tonumber(range.expectedMaxCounter) or tonumber(range.toCounter) or 0
-    local localRaw = (self.ComputeAuthorMax and self:ComputeAuthorMax(profileId)) or {}
-    local localMax = tonumber(localRaw[range.author]) or 0
-    if remoteMax > 0 and localMax > remoteMax then
-        return false
+    local expectedWindows = range.expectedWindows
+    if type(expectedWindows) ~= "table" or #expectedWindows == 0 then
+        expectedWindows = self:_NormalizeExpectedWindows(range, range.fromCounter, range.toCounter)
     end
-    return true
+    if type(expectedWindows) ~= "table" or #expectedWindows == 0 then
+        return true
+    end
+    for i = 1, #expectedWindows do
+        if not self:_IsAdvertisedExactWindowContained(profileId, range.author, expectedWindows[i]) then
+            return true
+        end
+    end
+    return false
 end
 
 -- Remote ADMIN_STATUS window summaries remain authoritative even after
@@ -1429,19 +1567,38 @@ function Sync:IsIdentityAdminReconcileReady(profileId)
     end
 
     local contig = (self.ComputeContigAuthorMax and self:ComputeContigAuthorMax(profileId)) or {}
-    -- known is the raw advertised frontier union local ComputeAuthorMax.
-    -- Do not collapse SameAuthor aliases here; that would wait for phantom rows.
-    local known = {}
-    if type(self.state.authorMax) == "table" then
+    -- Completeness waits on advertised raw maxima. Do not copy local
+    -- ComputeAuthorMax into that remote map: a later local row (:30) is not
+    -- a claim that :2..:29 exist. When ADMIN_STATUS maxima are present they
+    -- are the peer frontier; otherwise session authorMax is the advertised
+    -- target (sequential catch-up before any admin has reported).
+    local advertised = {}
+    local sawAdminMax = false
+    for _, name in ipairs(self:_SortedAdminStatusNames()) do
+        local st = self.state.adminStatuses[name]
+        if type(st) == "table" and type(st.authorMax) == "table" then
+            for author, maxCounter in pairs(st.authorMax) do
+                maxCounter = tonumber(maxCounter)
+                if type(author) == "string" and author ~= "" and maxCounter then
+                    sawAdminMax = true
+                    local prev = tonumber(advertised[author]) or 0
+                    if maxCounter > prev then
+                        advertised[author] = maxCounter
+                    end
+                end
+            end
+        end
+    end
+    if not sawAdminMax and type(self.state.authorMax) == "table" then
         for author, maxCounter in pairs(self.state.authorMax) do
-            known[author] = tonumber(maxCounter) or 0
+            maxCounter = tonumber(maxCounter)
+            if type(author) == "string" and author ~= "" and maxCounter then
+                advertised[author] = maxCounter
+            end
         end
     end
     local localMax = (self.ComputeAuthorMax and self:ComputeAuthorMax(profileId)) or {}
-    for author, maxCounter in pairs(localMax) do
-        known[author] = math.max(known[author] or 0, tonumber(maxCounter) or 0)
-    end
-    local missing = self:ComputeMissingLogRequests(contig, known, localMax)
+    local missing = self:ComputeMissingLogRequests(contig, advertised, localMax)
     if type(missing) == "table" and #missing > 0 then
         return false
     end
