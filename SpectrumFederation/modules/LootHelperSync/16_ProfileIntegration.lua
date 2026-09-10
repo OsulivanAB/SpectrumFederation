@@ -1187,6 +1187,184 @@ function Sync:RebuildProfile(profileId, reason)
     return true, nil
 end
 
+function Sync:_SortedAdminStatusNames()
+    local names = {}
+    if type(self.state) ~= "table" or type(self.state.adminStatuses) ~= "table" then
+        return names
+    end
+    for name in pairs(self.state.adminStatuses) do
+        if type(name) == "string" and name ~= "" then
+            names[#names + 1] = name
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+function Sync:_ExpectedWindowsFingerprint(windows)
+    if type(windows) ~= "table" or #windows == 0 then
+        return ""
+    end
+    local parts = {}
+    for _, window in ipairs(windows) do
+        if type(window) == "table" then
+            parts[#parts + 1] = table.concat({
+                tostring(tonumber(window.fromCounter) or 0),
+                tostring(tonumber(window.toCounter) or 0),
+                tostring(tonumber(window.count) or 0),
+                tostring(tonumber(window.maxCounter) or 0),
+                tostring(tonumber(window.checksum) or 0),
+            }, ":")
+        end
+    end
+    return table.concat(parts, "|")
+end
+
+-- Providers who advertised authorMax[rawAuthor] >= toCounter.
+-- Prefer the author themselves, then anyone with overlapping window proof,
+-- using sorted names so Lua pair order cannot choose the advertiser.
+function Sync:_ProvidersAdvertisingAuthorMax(author, fromCounter, toCounter)
+    local withWindows, withoutWindows = {}, {}
+    toCounter = tonumber(toCounter) or 0
+    fromCounter = tonumber(fromCounter) or 1
+    for _, name in ipairs(self:_SortedAdminStatusNames()) do
+        local st = self.state.adminStatuses[name]
+        local advertisedMax = type(st) == "table" and type(st.authorMax) == "table"
+            and tonumber(st.authorMax[author])
+        if advertisedMax and advertisedMax >= toCounter then
+            local windows = self:_CollectOverlappingWindowEvidence(
+                st.authorWindowSummary,
+                author,
+                fromCounter,
+                toCounter
+            )
+            if #windows > 0 then
+                withWindows[#withWindows + 1] = name
+            else
+                withoutWindows[#withoutWindows + 1] = name
+            end
+        end
+    end
+    local function preferAuthor(list)
+        for i, name in ipairs(list) do
+            if name == author then
+                table.remove(list, i)
+                table.insert(list, 1, name)
+                break
+            end
+        end
+        return list
+    end
+    preferAuthor(withWindows)
+    preferAuthor(withoutWindows)
+    local out = {}
+    for i = 1, #withWindows do
+        out[#out + 1] = withWindows[i]
+    end
+    for i = 1, #withoutWindows do
+        out[#out + 1] = withoutWindows[i]
+    end
+    return out
+end
+
+function Sync:_FilterProvidersMatchingWindowProof(providers, author, fromCounter, toCounter, expectedWindows)
+    local expectedFp = self:_ExpectedWindowsFingerprint(expectedWindows)
+    if expectedFp == "" or type(providers) ~= "table" then
+        local copy = {}
+        if type(providers) == "table" and providers[1] then
+            copy[1] = providers[1]
+        end
+        return copy
+    end
+    local out = {}
+    local seen = {}
+    for _, name in ipairs(providers) do
+        if type(name) == "string" and name ~= "" and not seen[name] then
+            local st = self.state.adminStatuses and self.state.adminStatuses[name]
+            local windows = self:_CollectOverlappingWindowEvidence(
+                st and st.authorWindowSummary,
+                author,
+                fromCounter,
+                toCounter
+            )
+            if self:_ExpectedWindowsFingerprint(windows) == expectedFp then
+                seen[name] = true
+                out[#out + 1] = name
+            end
+        end
+    end
+    return out
+end
+
+function Sync:_QueueAdvertisedRepair(profileId, range, mode, preferredTarget)
+    if type(profileId) ~= "string" or profileId == "" then
+        return false
+    end
+    if type(range) ~= "table" or not self.QueueRepairRanges then
+        return false
+    end
+    range.mode = mode or range.mode or "missing"
+    range.exactAuthor = range.mode == "integrity" or range.exactAuthor == true
+    range.preferredTarget = preferredTarget or range.preferredTarget
+    return self:QueueRepairRanges(profileId, {
+        range
+    }, {
+        mode = range.mode,
+        reason = range.reason or "admin-convergence",
+        preferredTarget = range.preferredTarget,
+        exactAuthor = range.exactAuthor == true,
+    })
+end
+
+-- Remote ADMIN_STATUS window summaries remain authoritative even after
+-- session authorWindowSummary is overwritten with coordinator-local windows.
+function Sync:_HasUnresolvedRemoteWindowMismatch(profileId)
+    if type(profileId) ~= "string" or profileId == "" then
+        return false
+    end
+    if type(self.ComputeWindowMismatchRequests) ~= "function" then
+        return false
+    end
+    local contig = (self.ComputeContigAuthorMax and self:ComputeContigAuthorMax(profileId)) or {}
+    for _, name in ipairs(self:_SortedAdminStatusNames()) do
+        local st = self.state.adminStatuses[name]
+        if type(st) == "table" and type(st.authorWindowSummary) == "table" then
+            local ranges = self:ComputeWindowMismatchRequests(profileId, st.authorWindowSummary, contig)
+            if type(ranges) == "table" and #ranges > 0 then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function Sync:_QueueRemoteWindowMismatches(profileId, adminName, remoteSummary)
+    if type(profileId) ~= "string" or profileId == "" then
+        return false
+    end
+    if type(adminName) ~= "string" or adminName == "" then
+        return false
+    end
+    if type(remoteSummary) ~= "table" or type(self.ComputeWindowMismatchRequests) ~= "function" then
+        return false
+    end
+    local contig = (self.ComputeContigAuthorMax and self:ComputeContigAuthorMax(profileId)) or {}
+    local ranges = self:ComputeWindowMismatchRequests(profileId, remoteSummary, contig)
+    if type(ranges) ~= "table" or #ranges == 0 then
+        return false
+    end
+    local queued = false
+    for _, range in ipairs(ranges) do
+        if type(range) == "table" then
+            range.reason = "late-admin-status-integrity"
+            if self:_QueueAdvertisedRepair(profileId, range, "integrity", adminName) then
+                queued = true
+            end
+        end
+    end
+    return queued
+end
+
 -- Coordinator-only: persist missing identity admin grants after silent rebuild.
 -- Wait until contiguous history matches known author maxima and no repair
 -- work remains, so implied grants are not written from incomplete logs.
@@ -1248,6 +1426,9 @@ function Sync:IsIdentityAdminReconcileReady(profileId)
         if type(integrity) == "table" and #integrity > 0 then
             return false
         end
+    end
+    if self:_HasUnresolvedRemoteWindowMismatch(profileId) then
+        return false
     end
     return true
 end

@@ -392,6 +392,13 @@ function Sync:_FailRequest(req, reason)
         end
         SF:PrintWarning(("Sync request failed (%s). %s"):format(tostring(reason or "unknown"), guidance))
     end
+
+    if type(self.ConsiderIdentityAdminSideEffects) == "function" then
+        local profileId = (req.meta and req.meta.profileId) or (self.state and self.state.profileId)
+        if type(profileId) == "string" and profileId ~= "" then
+            self:ConsiderIdentityAdminSideEffects(profileId)
+        end
+    end
 end
 
 -- Function Register an outstanding request so it can timeout / retry / be matched.

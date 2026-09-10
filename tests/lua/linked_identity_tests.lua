@@ -6302,6 +6302,473 @@ assertFalse(Sync:_ExactAuthorRangeSatisfied(dest:GetProfileId(), "owner-Garona",
 }), "mismatched local fingerprint does not satisfy incoming row proof")
 end
 runExactAuthorHangTests()
+
+local function runAdminConvergenceIntegrityTests()
+local function installUniqueNonces()
+    local nonce = 0
+    function Sync:_NextNonce(tag)
+        nonce = nonce + 1
+        return tostring(tag or "N") .. tostring(nonce)
+    end
+end
+local function restoreUniqueNonces()
+    function Sync:_NextNonce(tag)
+        return tostring(tag or "N") .. "1"
+    end
+end
+local function findReqForAuthor(author, integrity)
+    for id, req in pairs(Sync.state.requests or {}) do
+        local meta = req and req.meta
+        if type(meta) == "table" and meta.author == author then
+            if integrity == nil or (meta.integrityRepair == true) == integrity then
+                return id, req
+            end
+        end
+    end
+    return nil, nil
+end
+local function queuedRepairFor(author)
+    for _, entry in pairs((Sync.state.repairQueue and Sync.state.repairQueue.items) or {}) do
+        if entry.author == author then
+            return entry
+        end
+    end
+    return nil
+end
+local function seedEqualMaxMissing(coordName, remoteName)
+    local remote = makeProfile(remoteName)
+    addMember(remote, ALT_A)
+    addMember(remote, ALT_B)
+    addMember(remote, OTHER)
+    if remote.RebuildLogIndex then
+        remote:RebuildLogIndex()
+    end
+    assertTrue(remote:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.ADMIN_ADDED, {
+            member = ALT_A,
+        }, { author = OWNER, counter = 2, timestamp = 1700020575 }),
+        makeTable(SF.LootLogEventTypes.ADMIN_REMOVED, {
+            member = ALT_A,
+            preOpAuthorMax = {
+                { author = OWNER, counter = 2 },
+            },
+        }, { author = "owner-Garona", counter = 1, timestamp = 1700020590 }),
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 2,
+        }, { author = OWNER, counter = 3, timestamp = 1700020602 }),
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 13,
+        }, { author = "owner-Garona", counter = 3, timestamp = 1700020613 }),
+        makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+            memberA = ALT_A,
+            memberB = ALT_B,
+            adminMembersAtLink = { ALT_A },
+        }, { author = OWNER, counter = 4, timestamp = 1700020700 }),
+    }) > 0, "remote equal-max store has owner-Garona:1 and :3")
+    if remote.RebuildLogIndex then
+        remote:RebuildLogIndex()
+    end
+    remote._adminUsers = { OWNER, OTHER }
+    local coord = cloneWithout(remote, coordName, "owner-Garona:1")
+    coord._adminUsers = { OWNER, OTHER }
+    assertTrue(hasLogId(coord, OWNER .. ":4"), "coordinator implied LINK waits on remote owner-Garona:1")
+    return coord, remote
+end
+local function startConv(profile)
+    registerProfile(profile)
+    activateSession(profile)
+    profile._adminUsers = { OWNER, OTHER }
+    Sync.state.isCoordinator = true
+    Sync.state.coordEpoch = 1
+    Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+    installUniqueNonces()
+    Sync:BeginAdminConvergence(Sync.state.sessionId, profile:GetProfileId(), {
+        onComplete = function() end,
+    })
+end
+
+-- A. Equal raw max, missing earlier exact row; fetch failure must not forget proof.
+resetEnv()
+local coord, remote = seedEqualMaxMissing("ConvMissCoord", "ConvMissRemote")
+assertFalse(hasLogId(coord, "owner-Garona:1"), "coordinator lacks owner-Garona:1")
+assertTrue(hasLogId(coord, "owner-Garona:3"), "coordinator has owner-Garona:3")
+assertEq(coord:ComputeAuthorMax()["owner-Garona"], remote:ComputeAuthorMax()["owner-Garona"],
+    "raw owner-Garona max is equal")
+startConv(coord)
+local remoteSummary = remote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+local localSummary = coord:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.authorWindowSummary = localSummary
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remoteSummary,
+    },
+}
+Sync:FinalizeAdminConvergence()
+local reqId, req = findReqForAuthor("owner-Garona", true)
+assertTrue(req ~= nil, "equal-max missing :1 creates integrity ADMIN_LOG_REQ")
+assertTrue(req.meta.integrityRepair == true, "equal-max discrepancy is integrity repair")
+assertTrue(req.meta.backgroundRepair == true, "admin integrity request is background-repair-backed")
+assertEq(req.meta.preferredTarget, OTHER, "integrity provider is the advertising admin")
+assertTrue(type(req.meta.expectedWindows) == "table" and #req.meta.expectedWindows > 0,
+    "integrity request carries remote window proof")
+assertEq(req.meta.expectedChecksum, remoteSummary["owner-Garona"][1].checksum,
+    "integrity expected checksum is the remote advertiser checksum")
+assertTrue(req.meta.expectedChecksum ~= (localSummary["owner-Garona"] and localSummary["owner-Garona"][1] and localSummary["owner-Garona"][1].checksum),
+    "integrity proof is not the coordinator-local checksum")
+local grantsBefore = adminAddedCount(coord)
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()), "known remote integrity blocks reconcile")
+Sync:ScheduleIdentityAdminReconcile(coord:GetProfileId())
+assertFalse(coord:IsAdminMemberId(ALT_B), "unresolved integrity does not persist implied ADMIN_ADDED")
+assertEq(adminAddedCount(coord), grantsBefore, "no ADMIN_ADDED while remote proof is unresolved")
+
+-- Case 1: convergence timeout first, then request exhausts.
+Sync:_FinishAdminConvergence("timeout")
+assertTrue(Sync.state.requests[reqId] ~= nil, "timeout leaves ADMIN_LOG_REQ outstanding")
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()), "timeout while outstanding still blocks reconcile")
+assertFalse(coord:IsAdminMemberId(ALT_B), "timeout does not emit ADMIN_ADDED")
+Sync:_FailRequest(req, "max attempts reached")
+assertTrue(Sync.state.requests[reqId] == nil, "exhausted ADMIN_LOG_REQ is removed")
+assertTrue(queuedRepairFor("owner-Garona") ~= nil, "failed admin integrity is requeued with proof")
+assertEq(queuedRepairFor("owner-Garona").expectedChecksum, remoteSummary["owner-Garona"][1].checksum,
+    "requeued integrity keeps remote checksum")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "clearing the failed request does not forget advertised remote windows")
+assertFalse(coord:IsAdminMemberId(ALT_B), "forgotten request still cannot grant ADMIN_ADDED")
+
+-- Case 2: request failure first.
+resetEnv()
+coord, remote = seedEqualMaxMissing("ConvFailFirstCoord", "ConvFailFirstRemote")
+startConv(coord)
+remoteSummary = remote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.authorWindowSummary = coord:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remoteSummary,
+    },
+}
+Sync:FinalizeAdminConvergence()
+reqId, req = findReqForAuthor("owner-Garona", true)
+assertTrue(req ~= nil, "failure-first path created integrity ADMIN_LOG_REQ")
+grantsBefore = adminAddedCount(coord)
+Sync:_FailRequest(req, "max attempts reached")
+assertTrue(Sync.state._adminConvergence == nil, "pendingCount 0 finishes admin convergence after failure")
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "complete_after_failure does not erase remote integrity frontier")
+assertFalse(coord:IsAdminMemberId(ALT_B), "failure-first path does not persist implied ADMIN_ADDED")
+assertEq(adminAddedCount(coord), grantsBefore, "no extra ADMIN_ADDED after request failure")
+
+-- Case 3: RegisterRequest failure still keeps the mismatch known/retryable.
+resetEnv()
+coord, remote = seedEqualMaxMissing("ConvRegFailCoord", "ConvRegFailRemote")
+startConv(coord)
+remoteSummary = remote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.authorWindowSummary = coord:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remoteSummary,
+    },
+}
+local originalRegister = Sync.RegisterRequest
+function Sync:RegisterRequest()
+    return false
+end
+Sync:FinalizeAdminConvergence()
+Sync.RegisterRequest = originalRegister
+assertTrue(queuedRepairFor("owner-Garona") ~= nil, "register failure queues advertised integrity repair")
+assertEq(queuedRepairFor("owner-Garona").expectedChecksum, remoteSummary["owner-Garona"][1].checksum,
+    "queued register-failure repair uses remote checksum")
+Sync.state.requests = {}
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "register failure does not treat remote integrity as resolved")
+assertFalse(coord:IsAdminMemberId(ALT_B), "register failure does not persist implied ADMIN_ADDED")
+
+-- Restore provider and prove the missing row; only then reconcile.
+resetEnv()
+coord, remote = seedEqualMaxMissing("ConvRestoreCoord", "ConvRestoreRemote")
+startConv(coord)
+remoteSummary = remote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.authorWindowSummary = coord:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remoteSummary,
+    },
+}
+Sync:FinalizeAdminConvergence()
+local evid = remoteSummary["owner-Garona"][1]
+applyDiscoveredRange(remote, coord, {
+    author = "owner-Garona",
+    fromCounter = evid.fromCounter,
+    toCounter = evid.maxCounter,
+    exactAuthor = true,
+    integrityRepair = true,
+    expectedCount = evid.count,
+    expectedChecksum = evid.checksum,
+    expectedMaxCounter = evid.maxCounter,
+    expectedFromCounter = evid.fromCounter,
+    expectedToCounter = evid.toCounter,
+    expectedWindows = { evid },
+}, "REQ-CONV-RESTORE")
+assertTrue(hasLogId(coord, "owner-Garona:1"), "restored provider supplied owner-Garona:1")
+assertEq(coord:GetLogById("owner-Garona:1"):GetAuthor(), "owner-Garona", "restored row keeps exact author")
+assertFalse(hasLogId(coord, "owner-Garona:2"), "restore does not invent owner-Garona:2")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "reconcile may run after local window matches remote proof")
+Sync:ScheduleIdentityAdminReconcile(coord:GetProfileId())
+assertFalse(coord:IsAdminMemberId(ALT_B), "complete remote history with ADMIN_REMOVED does not grant B")
+assertFalse(coord:IsAdminMemberId(ALT_A), "ADMIN_REMOVED remains in force after integrity proof matches")
+
+-- B. Fingerprint mismatch with equal max.
+resetEnv()
+coord, remote = seedEqualMaxMissing("ConvFpCoord", "ConvFpRemote")
+local wrong = coord:GetLogById("owner-Garona:3"):ToTable()
+wrong._data = { member = ALT_A, change = SF.LootLogPointChangeTypes.INCREMENT, amount = 99 }
+wrong._fingerprint = SF.LootLog.ComputeFingerprintFromTable(wrong)
+assertTrue(coord:MergeLogTables({
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 11,
+    }, { author = "owner-Garona", counter = 1, timestamp = 1700020590 }),
+}, { allowReplaceExisting = true }) >= 0, "fingerprint coord installs owner-Garona:1 placeholder")
+assertTrue(coord:MergeLogTables({ wrong }, { allowReplaceExisting = true }) >= 0,
+    "fingerprint coord installs mismatched owner-Garona:3")
+-- rebuild remote as sparse {1,3} with distinct :1 fingerprint vs coordinator placeholder
+-- seedEqualMaxMissing remote already has ADMIN_REMOVED as :1; coordinator now has a POINT :1 plus wrong :3
+startConv(coord)
+remoteSummary = remote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.authorWindowSummary = coord:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remoteSummary,
+    },
+}
+Sync:FinalizeAdminConvergence()
+reqId, req = findReqForAuthor("owner-Garona", true)
+assertTrue(req ~= nil, "equal-max fingerprint mismatch creates integrity ADMIN_LOG_REQ")
+assertEq(req.meta.expectedChecksum, remoteSummary["owner-Garona"][1].checksum,
+    "fingerprint integrity uses remote checksum")
+Sync:_FailRequest(req, "max attempts reached")
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "failed fingerprint integrity remains unresolved")
+evid = remoteSummary["owner-Garona"][1]
+applyDiscoveredRange(remote, coord, {
+    author = "owner-Garona",
+    fromCounter = evid.fromCounter,
+    toCounter = evid.maxCounter,
+    exactAuthor = true,
+    integrityRepair = true,
+    expectedCount = evid.count,
+    expectedChecksum = evid.checksum,
+    expectedMaxCounter = evid.maxCounter,
+    expectedFromCounter = evid.fromCounter,
+    expectedToCounter = evid.toCounter,
+    expectedWindows = { evid },
+}, "REQ-CONV-FP")
+assertEq(coord:GetLogById("owner-Garona:1"):GetFingerprint(), remote:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "trusted integrity replaces mismatched/missing owner-Garona:1")
+assertEq(coord:GetLogById("owner-Garona:3"):GetFingerprint(), remote:GetLogById("owner-Garona:3"):GetFingerprint(),
+    "trusted integrity replaces mismatched owner-Garona:3")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "fingerprint repair completes only after remote checksum matches")
+
+-- C. Exact missing uses remote provider windows, not coordinator-local proof.
+resetEnv()
+remote = makeProfile("ConvLocalProofRemote")
+addMember(remote, ALT_A)
+addMember(remote, OTHER)
+assertTrue(remote:MergeLogTables({
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 2,
+    }, { author = OWNER, counter = 2, timestamp = 1700020802 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 3,
+    }, { author = OWNER, counter = 3, timestamp = 1700020803 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 11,
+    }, { author = "owner-Garona", counter = 1, timestamp = 1700020811 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 13,
+    }, { author = "owner-Garona", counter = 3, timestamp = 1700020813 }),
+}) > 0, "remote exact-missing source has owner-Garona:1 and :3")
+if remote.RebuildLogIndex then
+    remote:RebuildLogIndex()
+end
+remote._adminUsers = { OWNER, OTHER }
+coord = cloneWithout(remote, "ConvLocalProofCoord", "owner-Garona:3")
+coord._adminUsers = { OWNER, OTHER }
+startConv(coord)
+remoteSummary = remote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+localSummary = coord:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.authorWindowSummary = localSummary
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remoteSummary,
+    },
+}
+Sync:FinalizeAdminConvergence()
+reqId, req = findReqForAuthor("owner-Garona", false)
+if req == nil then
+    reqId, req = findReqForAuthor("owner-Garona", true)
+end
+assertTrue(req ~= nil, "exact missing owner-Garona:3 is requested")
+assertTrue(req.meta.exactAuthor == true, "exact missing keeps exactAuthor")
+assertEq(req.meta.expectedChecksum, remoteSummary["owner-Garona"][1].checksum,
+    "exact missing carries remote advertiser checksum")
+assertTrue(req.meta.expectedChecksum ~= (localSummary["owner-Garona"] and localSummary["owner-Garona"][1] and localSummary["owner-Garona"][1].checksum),
+    "exact missing does not use coordinator-local checksum")
+assertEq(req.meta.expectedCount, remoteSummary["owner-Garona"][1].count,
+    "exact missing expected count is remote window count")
+assertEq(req.lastTarget, OTHER, "exact missing provider advertised owner-Garona max")
+applyDiscoveredRange(remote, coord, {
+    author = req.meta.author,
+    fromCounter = req.meta.fromCounter,
+    toCounter = req.meta.toCounter,
+    exactAuthor = true,
+    integrityRepair = req.meta.integrityRepair == true,
+    expectedCount = req.meta.expectedCount,
+    expectedChecksum = req.meta.expectedChecksum,
+    expectedMaxCounter = req.meta.expectedMaxCounter,
+    expectedFromCounter = req.meta.expectedFromCounter,
+    expectedToCounter = req.meta.expectedToCounter,
+    expectedWindows = req.meta.expectedWindows,
+}, "REQ-CONV-LOCAL-PROOF")
+assertTrue(hasLogId(coord, "owner-Garona:3"), "remote sparse :3 merged")
+assertTrue(hasLogId(coord, "owner-Garona:1"), "remote sparse :1 kept")
+assertFalse(hasLogId(coord, "owner-Garona:2"), "sparse exact missing does not invent :2")
+assertTrue(Sync:_ExactAuthorRangeSatisfied(coord:GetProfileId(), "owner-Garona", req.meta.fromCounter, req.meta.toCounter, {
+    expectedWindows = req.meta.expectedWindows,
+    expectedCount = req.meta.expectedCount,
+    expectedChecksum = req.meta.expectedChecksum,
+    expectedMaxCounter = req.meta.expectedMaxCounter,
+}), "merged remote {1,3} satisfies advertiser proof")
+
+-- Fallback with a different window proof is not attached to the request.
+resetEnv()
+coord, remote = seedEqualMaxMissing("ConvFbCoord", "ConvFbRemote")
+local otherRemote = cloneWithout(remote, "ConvFbOther", "__none__")
+local wrongOther = otherRemote:GetLogById("owner-Garona:1"):ToTable()
+wrongOther._data = { member = ALT_B }
+wrongOther._fingerprint = SF.LootLog.ComputeFingerprintFromTable(wrongOther)
+assertTrue(otherRemote:MergeLogTables({ wrongOther }, { allowReplaceExisting = true }) >= 0,
+    "conflicting admin has a different owner-Garona:1 fingerprint")
+startConv(coord)
+remoteSummary = remote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+local conflictSummary = otherRemote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remoteSummary,
+    },
+    [ALT_C] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = otherRemote:ComputeAuthorMax(),
+        authorWindowSummary = conflictSummary,
+    },
+}
+addMember(coord, ALT_C)
+coord._adminUsers = { OWNER, OTHER, ALT_C }
+Sync:FinalizeAdminConvergence()
+local otherReq = nil
+local ownerReq = nil
+for _, pending in pairs(Sync.state.requests or {}) do
+    if pending.meta and pending.meta.author == "owner-Garona" and pending.meta.integrityRepair == true then
+        if pending.meta.expectedChecksum == remoteSummary["owner-Garona"][1].checksum then
+            ownerReq = pending
+        elseif pending.meta.expectedChecksum == conflictSummary["owner-Garona"][1].checksum then
+            otherReq = pending
+        end
+    end
+end
+assertTrue(ownerReq ~= nil, "OTHER's remote checksum gets its own integrity request")
+assertTrue(otherReq ~= nil, "conflicting ALT_C checksum gets a distinct integrity request")
+assertTrue(ownerReq.meta.expectedChecksum ~= otherReq.meta.expectedChecksum,
+    "conflicting admin proofs are not flattened")
+local otherInOwnerFallback = false
+for _, target in ipairs(ownerReq.targets or {}) do
+    if target == ALT_C then
+        otherInOwnerFallback = true
+    end
+end
+assertFalse(otherInOwnerFallback, "fallback list does not include a provider with unrelated proof")
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "conflicting admin window proofs fail closed")
+
+-- Same-session reannounce/takeover rebuilds evidence from ADMIN_STATUS.
+resetEnv()
+coord, remote = seedEqualMaxMissing("ConvTakeCoord", "ConvTakeRemote")
+startConv(coord)
+remoteSummary = remote:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remoteSummary,
+    },
+}
+Sync:FinalizeAdminConvergence()
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()), "pre-takeover remote proof blocks reconcile")
+Sync.state.adminStatuses = {}
+Sync.state._adminConvergence = nil
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "takeover/session rebuild may clear transient remote window evidence")
+startConv(coord)
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remoteSummary,
+    },
+}
+Sync:FinalizeAdminConvergence()
+assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "reconverged ADMIN_STATUS rebuilds the unresolved integrity blocker")
+restoreUniqueNonces()
+end
+runAdminConvergenceIntegrityTests()
 end
 runExactAuthorProofTests()
 

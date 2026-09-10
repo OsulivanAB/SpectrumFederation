@@ -188,6 +188,9 @@ function Sync:HandleAdminStatus(sender, payload)
         if self._MergeAuthorMaxFrontier then
             self:_MergeAuthorMaxFrontier(payload.authorMax)
         end
+        if type(payload.authorWindowSummary) == "table" then
+            self:_QueueRemoteWindowMismatches(self.state.profileId, normalizedSender, payload.authorWindowSummary)
+        end
         if SF.Debug then
             for author, _ in pairs(payload.authorMax) do
                 if type(author) == "string" then
