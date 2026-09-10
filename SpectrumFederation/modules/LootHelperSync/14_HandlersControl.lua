@@ -954,7 +954,18 @@ function Sync:HandleLogRequest(sender, payload)
         local author = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
         local counter = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
         counter = tonumber(counter)
-        if author == payload.author and counter and counter >= fromC and counter <= toC then
+        local authorMatches = author == payload.author
+        if self._LogAuthorMatches then
+            authorMatches = self:_LogAuthorMatches(author, payload.author)
+        else
+            local Identity = SF.LootHelperIdentity
+            if Identity and Identity.SameAuthor then
+                authorMatches = Identity.SameAuthor(author, payload.author)
+            elseif Identity and Identity.SamePlayer then
+                authorMatches = Identity.SamePlayer(author, payload.author)
+            end
+        end
+        if authorMatches and counter and counter >= fromC and counter <= toC then
             if log and log.ToTable then
                 table.insert(out, log:ToTable())
             elseif type(log) == "table" then

@@ -120,12 +120,33 @@ end
 function Sync:_ExtendContigWithPending(profileId, contig)
     contig = contig or {}
     local seen = self:_PendingRelationshipCounterSets(profileId)
+    local Identity = SF.LootHelperIdentity
     for author, counters in pairs(seen) do
         local n = tonumber(contig[author]) or 0
+        for existing, value in pairs(contig) do
+            local match = existing == author
+            if Identity and Identity.SameAuthor then
+                match = Identity.SameAuthor(existing, author)
+            elseif Identity and Identity.SamePlayer then
+                match = Identity.SamePlayer(existing, author)
+            end
+            if match then
+                local cur = tonumber(value) or 0
+                if cur > n then
+                    n = cur
+                end
+            end
+        end
         while counters[n + 1] do
             n = n + 1
         end
         contig[author] = n
+        if Identity and Identity.CanonicalAuthorKey then
+            local key = Identity.CanonicalAuthorKey(author)
+            if key then
+                contig[key] = math.max(tonumber(contig[key]) or 0, n)
+            end
+        end
     end
     return contig
 end

@@ -382,8 +382,37 @@ function LootProfile:SetProfileIdIfNil(profileId)
     self._profileId = profileId
 end
 
+function LootProfile:_AuthorsMatch(a, b)
+    if type(a) ~= "string" or type(b) ~= "string" then
+        return false
+    end
+    local Identity = SF.LootHelperIdentity
+    if Identity and Identity.SameAuthor then
+        return Identity.SameAuthor(a, b)
+    end
+    if Identity and Identity.SamePlayer then
+        return Identity.SamePlayer(a, b)
+    end
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+    return a == b
+end
+
+function LootProfile:_LogicalAuthorCounterMax(author)
+    local maxSeen = 0
+    for existing, counter in pairs(self._authorCounters or {}) do
+        local n = tonumber(counter)
+        if n and n > maxSeen and self:_AuthorsMatch(existing, author) then
+            maxSeen = n
+        end
+    end
+    return maxSeen
+end
+
 -- Function: allocate and return the next counter for a given author (used when creating new logs locally).
 -- IMPORTANT: This is per-profile, per-author. That's what prevents multi-writer collissions.
+-- SamePlayer-equivalent author strings share one counter stream.
 -- @param author string "Name-Realm" of author
 -- @return number nextCounter
 function LootProfile:AllocateNextCounter(author)
@@ -395,7 +424,7 @@ function LootProfile:AllocateNextCounter(author)
     end
 
     self._authorCounters = self._authorCounters or {}
-    local nextCounter = (self._authorCounters[author] or 0) + 1
+    local nextCounter = self:_LogicalAuthorCounterMax(author) + 1
     self._authorCounters[author] = nextCounter
     return nextCounter
 end
@@ -1810,9 +1839,11 @@ function LootProfile:_InsertLog(lootLog, opts)
     local author = lootLog:GetAuthor()
     local counter = lootLog:GetCounter()
     if type(author) == "string" and IsSequentialLogCounter(counter) then
-        local prev = self._authorCounters[author] or 0
+        local prev = self:_LogicalAuthorCounterMax(author)
         if counter > prev then
             self._authorCounters[author] = counter
+        elseif (self._authorCounters[author] or 0) < prev then
+            self._authorCounters[author] = prev
         end
     end
 
@@ -2800,9 +2831,11 @@ function LootProfile:MergeLogTables(logTables, opts)
                 local author = log:GetAuthor()
                 local counter = log:GetCounter()
                 if type(author) == "string" and IsSequentialLogCounter(counter) then
-                    local prev = self._authorCounters[author] or 0
+                    local prev = self:_LogicalAuthorCounterMax(author)
                     if counter > prev then
                         self._authorCounters[author] = counter
+                    elseif (self._authorCounters[author] or 0) < prev then
+                        self._authorCounters[author] = prev
                     end
                 end
 

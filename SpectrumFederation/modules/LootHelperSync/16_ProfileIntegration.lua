@@ -332,6 +332,23 @@ function Sync:_MergeAuthorMaxFrontier(incoming)
             if maxCounter > prev then
                 self.state.authorMax[author] = maxCounter
             end
+            local Identity = SF.LootHelperIdentity
+            for existing, existingMax in pairs(self.state.authorMax) do
+                local match = existing == author
+                if Identity and Identity.SameAuthor then
+                    match = Identity.SameAuthor(existing, author)
+                elseif Identity and Identity.SamePlayer then
+                    match = Identity.SamePlayer(existing, author)
+                end
+                if existing ~= author and match then
+                    local n = tonumber(existingMax) or 0
+                    if maxCounter > n then
+                        self.state.authorMax[existing] = maxCounter
+                    elseif n > (tonumber(self.state.authorMax[author]) or 0) then
+                        self.state.authorMax[author] = n
+                    end
+                end
+            end
         end
     end
     return self.state.authorMax
@@ -356,6 +373,45 @@ function Sync:_ClearIdentitySessionBookkeeping(reason)
     end
 end
 
+local function AuthorsMatch(a, b)
+    if type(a) ~= "string" or type(b) ~= "string" then
+        return false
+    end
+    local Identity = SF.LootHelperIdentity
+    if Identity and Identity.SameAuthor then
+        return Identity.SameAuthor(a, b)
+    end
+    if Identity and Identity.SamePlayer then
+        return Identity.SamePlayer(a, b)
+    end
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+    return a == b
+end
+
+function Sync:_LogAuthorMatches(a, b)
+    return AuthorsMatch(a, b)
+end
+
+local function CollapseAuthorCounterMap(map)
+    local byKey = {}
+    local Identity = SF.LootHelperIdentity
+    for author, counter in pairs(map or {}) do
+        counter = tonumber(counter)
+        if type(author) == "string" and author ~= "" and counter then
+            local key = (Identity and Identity.CanonicalAuthorKey and Identity.CanonicalAuthorKey(author)) or string.lower(author)
+            local cur = byKey[key]
+            if not cur or counter > cur.counter then
+                byKey[key] = { author = author, counter = counter }
+            elseif counter == cur.counter and tostring(author) < tostring(cur.author) then
+                cur.author = author
+            end
+        end
+    end
+    return byKey
+end
+
 -- Function Compute missing log ranges given local authorMax and remote authorMax (or detect gaps).
 -- @param localAuthorMax table Map [author] = maxCounterSeen
 -- @param remoteAuthorMax table Map [author] = maxCounterSeen
@@ -365,16 +421,16 @@ function Sync:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax)
     if type(remoteAuthorMax) ~= "table" then return missing end
     localAuthorMax = localAuthorMax or {}
 
-    for author, remoteMax in pairs(remoteAuthorMax) do
-        if type(author) == "string" and type(remoteMax) == "number" then
-            local localMax = tonumber(localAuthorMax[author]) or 0
-            if remoteMax > localMax then
-                table.insert(missing, {
-                    author = author,
-                    fromCounter = localMax + 1,
-                    toCounter = remoteMax,
-                })
-            end
+    local localLogical = CollapseAuthorCounterMap(localAuthorMax)
+    local remoteLogical = CollapseAuthorCounterMap(remoteAuthorMax)
+    for key, remote in pairs(remoteLogical) do
+        local localMax = (localLogical[key] and localLogical[key].counter) or 0
+        if remote.counter > localMax then
+            table.insert(missing, {
+                author = remote.author,
+                fromCounter = localMax + 1,
+                toCounter = remote.counter,
+            })
         end
     end
     return missing
@@ -867,7 +923,7 @@ function Sync:_ComputeContigCounter(profileId, author)
 
     for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
         local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
-        if a == author then
+        if AuthorsMatch(a, author) then
             local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
             c = tonumber(c)
             if c then
@@ -894,6 +950,7 @@ function Sync:ComputeContigAuthorMax(profileId)
     if not profile then return {} end
 
     local seenByAuthor = {}
+    local aliasesByKey = {}
 
     for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
         local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
@@ -902,22 +959,35 @@ function Sync:ComputeContigAuthorMax(profileId)
 
         if type(a) == "string" and a ~= "" and c and c >= 1 then
             c = math.floor(c)
-            local set = seenByAuthor[a]
+            local key = a
+            local Identity = SF.LootHelperIdentity
+            if Identity and Identity.CanonicalAuthorKey then
+                key = Identity.CanonicalAuthorKey(a) or a
+            end
+            local set = seenByAuthor[key]
             if not set then
                 set = {}
-                seenByAuthor[a] = set
+                seenByAuthor[key] = set
+                aliasesByKey[key] = {}
             end
             set[c] = true
+            aliasesByKey[key][a] = true
         end
     end
 
     local contig = {}
-    for author, set in pairs(seenByAuthor) do
+    for key, set in pairs(seenByAuthor) do
         local n = 0
         while set[n + 1] do
             n = n + 1
         end
-        contig[author] = n
+        contig[key] = n
+        local aliases = aliasesByKey[key]
+        if type(aliases) == "table" then
+            for alias in pairs(aliases) do
+                contig[alias] = n
+            end
+        end
     end
 
     return contig
