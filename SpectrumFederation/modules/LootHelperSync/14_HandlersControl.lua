@@ -866,7 +866,18 @@ function Sync:HandleNeedLogs(sender, payload)
                     local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
                     local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
                     c = tonumber(c)
-                    if a == author and c and c >= fromC and c <= toC then
+                    local authorMatches = a == author
+                    if self._LogAuthorMatches then
+                        authorMatches = self:_LogAuthorMatches(a, author)
+                    else
+                        local Identity = SF.LootHelperIdentity
+                        if Identity and Identity.SameAuthor then
+                            authorMatches = Identity.SameAuthor(a, author)
+                        elseif Identity and Identity.SamePlayer then
+                            authorMatches = Identity.SamePlayer(a, author)
+                        end
+                    end
+                    if authorMatches and c and c >= fromC and c <= toC then
                         if log and log.ToTable then
                             table.insert(out, log:ToTable())
                         elseif type(log) == "table" then

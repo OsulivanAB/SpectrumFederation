@@ -168,7 +168,18 @@ function Sync:HandleAuthLogs(sender, payload)
                 local logAuthor = logTable._author or logTable.author
                 local logCounter = logTable._counter or logTable.counter
                 
-                if logAuthor ~= requestedAuthor then
+                local authorMatches = logAuthor == requestedAuthor
+                if self._LogAuthorMatches then
+                    authorMatches = self:_LogAuthorMatches(logAuthor, requestedAuthor)
+                else
+                    local Identity = SF.LootHelperIdentity
+                    if Identity and Identity.SameAuthor then
+                        authorMatches = Identity.SameAuthor(logAuthor, requestedAuthor)
+                    elseif Identity and Identity.SamePlayer then
+                        authorMatches = Identity.SamePlayer(logAuthor, requestedAuthor)
+                    end
+                end
+                if not authorMatches then
                     if SF.Debug then
                         SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log author %s doesn't match requested %s",
                             tostring(logAuthor), tostring(requestedAuthor))
