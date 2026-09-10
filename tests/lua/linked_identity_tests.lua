@@ -811,8 +811,23 @@ assertTrue(profile:UnlinkCharacter(ALT_B), "split original members")
 assertFalse(armorOf(profile, ALT_A, "Chest"), "splitting original members invalidates the shared correction")
 assertFalse(armorOf(profile, ALT_B, "Chest"), "B also loses the shared correction while split")
 assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "re-link original membership")
-assertTrue(armorOf(profile, ALT_A, "Chest"), "re-link reactivates the historical correction")
-assertTrue(armorOf(profile, ALT_B, "Chest"), "both original members see the correction again")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "re-link does not resurrect a correction after an original-scope split")
+assertFalse(armorOf(profile, ALT_B, "Chest"), "both original members stay without the expired correction")
+
+resetEnv()
+profile = makeProfile("IdentityMembersABC")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B before ABC correction")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "A+B+C identity")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A+B+C Chest correction")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "ABC Chest USED")
+assertTrue(profile:UnlinkCharacter(ALT_C), "C leaves the original ABC scope")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "splitting any original ABC member expires the correction")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "later C relink")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "relinking C does not resurrect the expired ABC correction")
+assertFalse(armorOf(profile, ALT_C, "Chest"), "C also does not see the expired ABC correction")
 
 resetEnv()
 profile = makeProfile("NoBackfill")
@@ -3262,10 +3277,12 @@ local ordered1 = SF.LootHelperIdentity.OrderLogs(scaleLogs)
 local stats1 = SF.LootHelperIdentity.lastOrderStats
 assertEq(stats1.n, #scaleLogs, "order stats record n")
 assertTrue(stats1.heapOps < stats1.n * stats1.n / 8, "1000-log heap work is far below n^2")
-assertTrue(not stats1.cacheHit, "first order is not a cache hit")
-local orderedCached = SF.LootHelperIdentity.OrderLogs(scaleLogs)
-assertTrue(SF.LootHelperIdentity.lastOrderStats.cacheHit, "identical log table reuses ordered history")
-assertEq(#orderedCached, #ordered1, "cached order has the same length")
+assertTrue((stats1.edgeCalls or 0) >= (stats1.edgeInserts or 0), "edge inserts never exceed edge attempts")
+assertTrue((stats1.edgeCalls or 0) < stats1.n * 8, "edge construction stays linear in n")
+assertTrue(not stats1.cacheHit, "OrderLogs does not reuse a stale table-identity cache")
+local orderedAgain = SF.LootHelperIdentity.OrderLogs(scaleLogs)
+assertEq(#orderedAgain, #ordered1, "second order has the same length")
+assertTrue(not SF.LootHelperIdentity.lastOrderStats.cacheHit, "in-place log replacement cannot be hidden by an OrderLogs cache")
 local shuffled = {}
 for i = 1, #scaleLogs do
     shuffled[i] = scaleLogs[i]
@@ -3370,6 +3387,366 @@ assertTrue(profile:MergeLogTables({
 assertTrue(profile:AreSameIdentity(ALT_C, ALT_D), "canonical author keys keep one causal stream")
 end
 runCorrectnessHardeningTests()
+
+local function runStateMachinePassTests()
+local ALT_F = "Foxtrot-Garona"
+
+local function checkSurfaces(profile, name, check)
+    check(profile, "live")
+    local reload = rebuildFrom(profile, name .. "Reload")
+    check(reload, "reload")
+    local export = profile:ExportSnapshot()
+    local snap = makeProfile(name .. "Snap")
+    snap._profileId = export.meta._profileId
+    assertTrue(select(1, snap:ImportSnapshot(export)), name .. " snapshot import")
+    snap:ApplyIdentityProjection({ force = true })
+    check(snap, "snapshot")
+    assertTrue(snap:MergeLogTables(copyLogTables(profile)) >= 0, name .. " AUTH_LOGS merge")
+    check(snap, "AUTH_LOGS")
+end
+
+local function assertAdminState(p, label)
+    assertTrue(p:AreSameIdentity(OWNER, ALT_A), label .. ": O+A linked")
+    assertTrue(p:AreSameIdentity(ALT_B, ALT_C), label .. ": B+C linked")
+    assertFalse(p:AreSameIdentity(OWNER, ALT_B), label .. ": B is not in owner identity")
+    assertFalse(p:IsAdminMemberId(ALT_B), label .. ": B is not admin")
+    assertFalse(p:IsAdminMemberId(ALT_C), label .. ": C is not admin")
+end
+
+local function seedRejectedGrantHistory(target)
+    addMember(target, ALT_A)
+    addMember(target, ALT_B)
+    addMember(target, ALT_C)
+    addMember(target, OTHER)
+    target:AddAdminMemberId(OTHER)
+    local linkOA = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+        memberA = OWNER,
+        memberB = ALT_A,
+        adminMembersAtLink = { OWNER },
+        preOpAuthorMax = {},
+    }, { author = OWNER, counter = 3, timestamp = 1700002000 })
+    local linkL1 = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+        memberA = ALT_A,
+        memberB = ALT_B,
+        adminMembersAtLink = { OTHER },
+        preOpAuthorMax = {},
+    }, { author = OTHER, counter = 1, timestamp = 1700002100 })
+    local grantG1 = makeTable(SF.LootLogEventTypes.ADMIN_ADDED, {
+        member = ALT_B,
+        sourceLogId = linkL1._id,
+    }, { author = OTHER, counter = 2, timestamp = 1700002110 })
+    local linkL2 = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+        memberA = ALT_B,
+        memberB = ALT_C,
+        adminMembersAtLink = { ALT_B },
+        preOpAuthorMax = { { author = OTHER, counter = 2 } },
+    }, { author = OTHER, counter = 3, timestamp = 1700002120 })
+    return linkOA, linkL1, grantG1, linkL2
+end
+
+resetEnv()
+profile = makeProfile("RejectedGrantResurrect")
+local linkOA, linkL1, grantG1, linkL2 = seedRejectedGrantHistory(profile)
+assertTrue(profile:MergeLogTables({ linkOA, linkL1, grantG1, linkL2 }) > 0, "complete history with hidden O+A")
+checkSurfaces(profile, "RejectedGrantResurrect", assertAdminState)
+resetEnv()
+profile = makeProfile("RejectedGrantResurrectRev")
+linkOA, linkL1, grantG1, linkL2 = seedRejectedGrantHistory(profile)
+assertTrue(profile:MergeLogTables({ linkL2, grantG1, linkL1, linkOA }) > 0, "opposite arrival of hidden O+A")
+assertAdminState(profile, "opposite-arrival")
+local laterGrant = makeTable(SF.LootLogEventTypes.ADMIN_ADDED, {
+    member = ALT_B,
+}, { author = OWNER, counter = 4, timestamp = 1700003000 })
+assertTrue(profile:MergeLogTables({ laterGrant }) > 0, "later explicit ADMIN_ADDED is stored")
+assertTrue(profile:IsAdminMemberId(ALT_B), "later explicit ADMIN_ADDED still grants B")
+assertFalse(profile:IsAdminMemberId(ALT_C), "explicit B grant does not make C admin")
+
+resetEnv()
+profile = makeProfile("ExpireAvailable")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A local Chest USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B after local USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A+B Chest AVAILABLE")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "shared Chest AVAILABLE")
+assertTrue(profile:UnlinkCharacter(ALT_A), "UNLINK A splits original scope")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "relink A+B with no local equipment action")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "expired AVAILABLE does not suppress A's local USED")
+assertTrue(armorOf(profile, ALT_B, "Chest"), "relinked partner sees packed local USED")
+checkSurfaces(profile, "ExpireAvailable", function(p, label)
+    assertTrue(armorOf(p, ALT_A, "Chest"), label .. ": Chest USED after expired AVAILABLE")
+end)
+
+resetEnv()
+profile = makeProfile("ExpireUsed")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B before identity USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A+B Chest USED")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "shared Chest USED")
+assertTrue(profile:UnlinkCharacter(ALT_A), "UNLINK A expires the USED correction")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "relink A+B with no underlying local Chest use")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "expired USED does not resurrect")
+assertFalse(armorOf(profile, ALT_B, "Chest"), "partner Chest stays AVAILABLE")
+checkSurfaces(profile, "ExpireUsed", function(p, label)
+    assertFalse(armorOf(p, ALT_A, "Chest"), label .. ": Chest AVAILABLE after expired USED")
+end)
+
+resetEnv()
+profile = makeProfile("ExpireRing")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B before ring correction")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring1", { profile = profile }), "A+B Ring1 USED")
+assertTrue(profile:UnlinkCharacter(ALT_A), "split expires ring correction")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "relink after ring split")
+assertFalse(armorOf(profile, ALT_A, "Ring1"), "expired Ring1 USED does not resurrect")
+assertFalse(armorOf(profile, ALT_A, "Ring2"), "expired ring does not occupy Ring2")
+
+resetEnv()
+profile = makeProfile("NestedSuperset")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A+B Chest USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "C joins current identity")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "current identity Chest AVAILABLE")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "superset AVAILABLE supersedes subset USED")
+assertFalse(armorOf(profile, ALT_C, "Chest"), "expanded identity sees AVAILABLE")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "nested AVAILABLE does not OR leftover USED")
+checkSurfaces(profile, "NestedSuperset", function(p, label)
+    assertFalse(armorOf(p, ALT_A, "Chest"), label .. ": Chest AVAILABLE")
+    assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(p._identityProjection, ALT_A), label .. ": no overflow")
+end)
+
+resetEnv()
+profile = makeProfile("NestedSupersetUsed")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B for inverse")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A+B Chest USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A+B Chest AVAILABLE")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "C joins after AVAILABLE")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "current identity Chest USED")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "superset USED supersedes subset AVAILABLE")
+assertTrue(armorOf(profile, ALT_C, "Chest"), "expanded identity sees USED")
+
+resetEnv()
+profile = makeProfile("RingPackMerge")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B identity")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "A+B Ring1 USED")
+assertTrue(profile:LinkCharacters(ALT_C, ALT_D), "C+D identity")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "C+D Ring1 USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "merge A+B with C+D")
+assertTrue(armorOf(profile, ALT_A, "Ring1"), "merged Ring1 occupied")
+assertTrue(armorOf(profile, ALT_A, "Ring2"), "second scoped Ring1 packs into Ring2")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "two scoped Ring1 usages do not overflow")
+checkSurfaces(profile, "RingPackMerge", function(p, label)
+    assertTrue(armorOf(p, ALT_A, "Ring1"), label .. ": Ring1 USED")
+    assertTrue(armorOf(p, ALT_A, "Ring2"), label .. ": Ring2 USED")
+    assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(p._identityProjection, ALT_A), label .. ": overflow 0")
+end)
+
+resetEnv()
+profile = makeProfile("RingPackThree")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+addMember(profile, ALT_E)
+addMember(profile, ALT_F)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "pair AB")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "AB Ring1")
+assertTrue(profile:LinkCharacters(ALT_C, ALT_D), "pair CD")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "CD Ring1")
+assertTrue(profile:LinkCharacters(ALT_E, ALT_F), "pair EF")
+assertTrue(memberOf(profile, ALT_E):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "EF Ring1")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "merge AB+CD")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_E), "merge in EF")
+assertTrue(armorOf(profile, ALT_A, "Ring1"), "three ring usages still occupy Ring1")
+assertTrue(armorOf(profile, ALT_A, "Ring2"), "three ring usages still occupy Ring2")
+assertTrue(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "third independent ring usage overflows")
+local ringCounts = profile._identityProjection.overflowCountsByIdentity
+local ringRoot = profile._identityProjection.identityOf[ALT_A][1]
+assertEq(ringCounts[ringRoot].ring, 1, "exactly one ring overflow")
+
+resetEnv()
+profile = makeProfile("TrinketPackMerge")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B trinket identity")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Trinket1", { profile = profile, scope = "identity" }), "A+B Trinket1 USED")
+assertTrue(profile:LinkCharacters(ALT_C, ALT_D), "C+D trinket identity")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Trinket1", { profile = profile, scope = "identity" }), "C+D Trinket1 USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "merge trinket identities")
+assertTrue(armorOf(profile, ALT_A, "Trinket1"), "merged Trinket1 occupied")
+assertTrue(armorOf(profile, ALT_A, "Trinket2"), "second scoped Trinket1 packs into Trinket2")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "two scoped Trinket1 usages do not overflow")
+
+resetEnv()
+profile = makeProfile("CausalRankEquip")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+local causalLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OWNER },
+    preOpAuthorMax = {},
+}, { author = OWNER, counter = 3, timestamp = 1700004000 })
+local usedLaterByTie = makeTable(SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Chest",
+    action = SF.LootLogArmorActions.USED,
+    scope = "identity",
+    identityMembers = { ALT_A, ALT_B },
+}, { author = OWNER, counter = 4, timestamp = 1700004100 })
+local availEarlierByTie = makeTable(SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Chest",
+    action = SF.LootLogArmorActions.AVAILABLE,
+    scope = "identity",
+    identityMembers = { ALT_A, ALT_B },
+    preOpAuthorMax = { { author = OWNER, counter = 4 } },
+}, { author = OTHER, counter = 1, timestamp = 1700004100 })
+assertTrue(SF.LootHelperIdentity.CompareLogs(availEarlierByTie, usedLaterByTie), "CompareLogs tie-break puts OTHER before OWNER")
+assertTrue(profile:MergeLogTables({ causalLink, usedLaterByTie, availEarlierByTie }) > 0, "same-timestamp cross-author equipment")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "causal later AVAILABLE wins over tie-break-later USED")
+checkSurfaces(profile, "CausalRankEquip", function(p, label)
+    assertFalse(armorOf(p, ALT_A, "Chest"), label .. ": causal AVAILABLE")
+end)
+
+resetEnv()
+profile = makeProfile("ReplaceMiddleLog")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "original middle LINK A+B")
+addLog(profile, SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+})
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_C,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+})
+local linkLog = nil
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.CHARACTER_LINK then
+        linkLog = log
+        break
+    end
+end
+assertTrue(linkLog ~= nil, "captured non-final LINK")
+local lastBefore = profile._lootLogs[#profile._lootLogs]
+local nBefore = #profile._lootLogs
+SF.LootHelperIdentity.OrderLogs(profile:GetLootLogs())
+local replacement = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_C,
+    adminMembersAtLink = { OWNER },
+    preOpAuthorMax = {},
+}, {
+    author = linkLog:GetAuthor(),
+    counter = linkLog:GetCounter(),
+    timestamp = linkLog:GetTimestamp(),
+})
+replacement._id = linkLog:GetID()
+replacement._fingerprint = SF.LootLog.ComputeFingerprintFromTable(replacement)
+assertTrue(profile:MergeLogTables({ replacement }, { allowReplaceExisting = true }) >= 0, "integrity replace of non-last LINK")
+assertEq(#profile._lootLogs, nBefore, "replace keeps log table length")
+assertTrue(profile._lootLogs[#profile._lootLogs] == lastBefore, "replace keeps the last log object")
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_C), "replaced LINK is visible immediately")
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "old LINK topology is gone without a later write")
+assertEq(profile:GetIdentityPoints(ALT_A), profile:GetIdentityPoints(ALT_C), "points follow replaced topology")
+
+resetEnv()
+profile = makeProfile("AuthorStream")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+for i = 2, 6 do
+    addLog(profile, SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 1,
+    }, { author = "owner-Garona", counter = i, timestamp = 1700005000 + i })
+end
+assertEq(profile:_LogicalAuthorCounterMax(OWNER), 6, "logical max includes owner-Garona:6")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "relationship uses the continued counter")
+local wroteSeven = false
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.CHARACTER_LINK and log:GetCounter() == 7 then
+        wroteSeven = true
+    end
+end
+assertTrue(wroteSeven, "Owner-Garona counter 7 continues the alias stream")
+SF.LootHelperIdentity.OrderLogs(profile:GetLootLogs())
+assertEq(SF.LootHelperIdentity.lastOrderStats.leftover or 0, 0, "alias continuation does not form a causal cycle")
+local missing = Sync:ComputeMissingLogRequests({ ["owner-Garona"] = 6 }, { [OWNER] = 7 })
+assertEq(#missing, 1, "alias catch-up requests one range")
+assertEq(missing[1].fromCounter, 7, "does not request an impossible 1-6 gap")
+assertEq(missing[1].toCounter, 7, "requests only the new counter")
+assertFalse(Sync:DetectGap(profile:GetProfileId(), { _author = OWNER, _counter = 7 }), "counter 7 is contiguous with alias 1-6")
+assertTrue(Sync:_LogAuthorMatches("owner-Garona", OWNER), "LOG_REQ author match is alias-safe")
+local contig = Sync:ComputeContigAuthorMax(profile:GetProfileId())
+assertEq(contig[OWNER], 7, "contig under current author includes alias history")
+assertEq(contig["owner-Garona"], 7, "contig under historical author includes new writes")
+local streamReload = rebuildFrom(profile, "AuthorStreamReload")
+assertTrue(streamReload:AreSameIdentity(ALT_A, ALT_B), "reload preserves alias-continued relationship")
+assertEq(streamReload:AllocateNextCounter(OWNER), 8, "reload continues the same logical stream")
+
+resetEnv()
+local depLogs = {
+    {
+        _timestamp = 1700060000,
+        _author = OWNER,
+        _counter = 1,
+        _eventType = SF.LootLogEventTypes.POINT_CHANGE,
+        _data = {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 1,
+        },
+        _id = OWNER .. ":1",
+    },
+}
+for i = 1, 200 do
+    depLogs[#depLogs + 1] = {
+        _timestamp = 1700060001,
+        _author = OTHER,
+        _counter = i,
+        _eventType = SF.LootLogEventTypes.CHARACTER_LINK,
+        _data = {
+            memberA = ALT_A,
+            memberB = ALT_B,
+            adminMembersAtLink = { OWNER },
+            preOpAuthorMax = {
+                { author = OWNER, counter = 1 },
+                { author = OWNER, counter = 1 },
+            },
+        },
+        _id = string.format("%s:%d", OTHER, i),
+    }
+end
+SF.LootHelperIdentity.OrderLogs(depLogs)
+local depStats = SF.LootHelperIdentity.lastOrderStats
+assertEq(depStats.n, 201, "dependency-heavy history n")
+assertTrue((depStats.edgeCalls or 0) > (depStats.edgeInserts or 0), "duplicate predecessor edges are detected")
+assertTrue((depStats.edgeCalls or 0) < depStats.n * 8, "shared predecessor heads stay linear in edge work")
+assertTrue((depStats.heapOps or 0) < depStats.n * depStats.n / 8, "heap work stays far below n^2")
+end
+runStateMachinePassTests()
 
 -- ---------------------------------------------------------------------------
 -- Protocol

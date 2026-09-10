@@ -72,7 +72,7 @@ Select the equipment button on a member row to open the equipment window. It tra
 
 This is profile history, not a live inspection of equipped items. Admins toggle a category when the member uses or regains that loot opportunity. Toggling creates an equipment-history log entry and does not change loot points or Attendance.
 
-Linked characters share the projected equipment opportunity state. Unmarked historical equipment changes stay character-local and are aggregated after reconstruction. New shared corrections record the linked membership at write time and keep applying while those original members remain together.
+Linked characters share the projected equipment opportunity state. Unmarked historical equipment changes stay character-local and are aggregated after reconstruction. New shared corrections record the linked membership at write time. They stay active while those original members remain together, including when other characters join or leave. If any original member is split from the others, that correction expires permanently and does not return if the same characters are linked again. A later correction on a newly expanded identity replaces earlier overlapping subset-scope state for that slot. Independent identities that later merge still combine their equipment histories: two scoped ring or trinket uses fill the two shared opportunities before overflowing.
 
 Manual Ring 1 / Ring 2 and Trinket 1 / Trinket 2 clicks target the displayed slot. An empty Ring 1 is not filled automatically by a Ring 2 click.
 

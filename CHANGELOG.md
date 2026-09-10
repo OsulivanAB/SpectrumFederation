@@ -47,8 +47,15 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Replay uses writer-observed `preOpAuthorMax` as causal predecessors so same-timestamp admin grants authorize the LINK that observed them
 - Frozen `_legacyCanonicalAdmins` preserve Main Swap / snapshot admins that have no grant log, without letting a later `ADMIN_ADDED` authorize older relationships
 - Identity-scoped equipment corrections apply to contributions from their recorded `identityMembers`; AVAILABLE suppresses that scope without clearing another identity's scoped USED, and later joiners do not resurrect suppressed insider locals
+- Identity-scoped equipment corrections expire permanently after any original-scope split; later relink does not resurrect them
+- A later current-identity equipment correction supersedes earlier overlapping subset-scope state for that slot or ring/trinket family
+- Independent scoped ring and trinket usages pack into opportunity 1 then 2 before overflow when identities merge
+- Equipment chronology uses `OrderLogs` causal rank rather than the raw `CompareLogs` tie-break
 - `ADMIN_ADDED.sourceLogId` is a causal predecessor of the sourced grant
-- `Identity.OrderLogs` uses a ready min-heap and canonical author keys; `SnapshotPreOpAuthorMax` deduplicates SamePlayer aliases
+- A skipped sourced `ADMIN_ADDED` is rejected provenance, not missing evidence, so later `adminMembersAtLink` cannot resurrect that grant
+- `Identity.OrderLogs` uses a ready min-heap, O(1) successor-edge dedup, and canonical author keys; `SnapshotPreOpAuthorMax` deduplicates SamePlayer aliases
+- SamePlayer-equivalent authors share one counter stream for new writes, contiguous catch-up, and LOG_REQ serving
+- In-place integrity `_ReplaceLogById` rebuilds from current log contents; OrderLogs is not cached across rebuilds by table identity
 - MAIN_SWAP-less stale fingerprints can be repaired when a unique attributed source candidate reproduces the stored checksum; unrelated mismatches stay rejected
 - Redundant concurrent LINKs remain valid history but do not propagate admin across an already-unified component
 - Characters named only in historical awards with no `MAIN_SWAP` lineage restore as unlinked shells with an admin warning
