@@ -4223,6 +4223,455 @@ assertTrue(dest:GetLogById(otherAlias .. ":1") ~= nil, "other-Garona:1 is indepe
 assertEq(dest:GetLogById(otherTitle .. ":1"):GetAuthor(), otherTitle, "does not rewrite Other-Garona author")
 assertEq(dest:GetLogById(otherAlias .. ":1"):GetAuthor(), otherAlias, "does not rewrite other-Garona author")
 
+local function runHistoricalAliasConvergenceTests()
+local function registerProfile(profile)
+    SF.lootHelperDB.profiles[profile:GetProfileId()] = profile
+    SF.lootHelperDB.activeProfile = profile
+    SF.lootHelperDB.activeProfileId = profile:GetProfileId()
+end
+
+local function rangeForAuthor(ranges, author)
+    for i = 1, #(ranges or {}) do
+        if ranges[i].author == author then
+            return ranges[i]
+        end
+    end
+    return nil
+end
+
+local function unionRanges(a, b)
+    local out = {}
+    local seen = {}
+    local function add(list)
+        for i = 1, #(list or {}) do
+            local r = list[i]
+            local key = string.format("%s:%s:%s", tostring(r.author), tostring(r.fromCounter), tostring(r.toCounter))
+            if not seen[key] then
+                seen[key] = true
+                out[#out + 1] = r
+            end
+        end
+    end
+    add(a)
+    add(b)
+    return out
+end
+
+local function discoverFrom(dst, src)
+    registerProfile(dst)
+    local contig = Sync:ComputeContigAuthorMax(dst:GetProfileId())
+    local remoteMax = src:ComputeAuthorMax()
+    local missing = Sync:ComputeMissingLogRequests(contig, remoteMax)
+    local remoteWindows = src:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+    local integrity = Sync:ComputeWindowMismatchRequests(dst:GetProfileId(), remoteWindows, contig)
+    return missing, integrity, contig
+end
+
+local function applyDiscoveredRange(src, dst, req, requestId)
+    registerProfile(src)
+    Sync.state.active = true
+    Sync.state.sessionId = "SES1"
+    Sync.state.profileId = src:GetProfileId()
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = OWNER
+    capturedComm = {}
+    Sync:HandleLogRequest(OWNER, {
+        sessionId = "SES1",
+        requestId = requestId,
+        profileId = src:GetProfileId(),
+        author = req.author,
+        fromCounter = req.fromCounter,
+        toCounter = req.toCounter,
+    })
+    local served = findCaptured(Sync.MSG.AUTH_LOGS)
+    assertTrue(served ~= nil, "discovered range produced AUTH_LOGS for " .. tostring(req.author))
+    registerProfile(dst)
+    Sync.state.profileId = dst:GetProfileId()
+    Sync.state.requests = Sync.state.requests or {}
+    Sync.state.requests[requestId] = {
+        kind = "LOG_REQ",
+        meta = {
+            profileId = dst:GetProfileId(),
+            author = req.author,
+            fromCounter = req.fromCounter,
+            toCounter = req.toCounter,
+        },
+    }
+    served.payload.sessionId = "SES1"
+    served.payload.profileId = dst:GetProfileId()
+    served.payload.requestId = requestId
+    Sync:HandleAuthLogs(OWNER, served.payload)
+    dst:ApplyIdentityProjection({ force = true })
+    src:ApplyIdentityProjection({ force = true })
+    return served
+end
+
+local function hasLogId(profile, id)
+    if profile.GetLogById and profile:GetLogById(id) then
+        return true
+    end
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        local lid = (log.GetID and log:GetID()) or log._id
+        if lid == id then
+            return true
+        end
+    end
+    return false
+end
+
+local function cloneWithout(src, name, dropId)
+    local dest = makeProfile(name)
+    if dest.RebuildLogIndex then
+        dest:RebuildLogIndex()
+    end
+    dest._profileId = src:GetProfileId()
+    for _, member in ipairs(src:GetMemberList() or src._members or {}) do
+        local id = (member.GetFullIdentifier and member:GetFullIdentifier())
+            or member.identifier
+            or (member.GetID and member:GetID())
+            or member._id
+        if id and not dest:getMemberByID(id) then
+            addMember(dest, id)
+        end
+    end
+    local tables = {}
+    for _, log in ipairs(src:GetLootLogs()) do
+        if log:GetID() ~= dropId then
+            tables[#tables + 1] = log:ToTable()
+        end
+    end
+    dest:MergeLogTables(tables, { allowReplaceExisting = true })
+    if dest.RebuildLogIndex then
+        dest:RebuildLogIndex()
+    end
+    dest:ApplyIdentityProjection({ force = true })
+    return dest
+end
+
+local function orderedIds(logs)
+    local ordered = SF.LootHelperIdentity.OrderLogs(logs)
+    local ids = {}
+    for i = 1, #ordered do
+        ids[i] = ordered[i]._id or (ordered[i].GetID and ordered[i]:GetID())
+    end
+    return ids, SF.LootHelperIdentity.lastOrderStats, ordered
+end
+
+local function indexOfId(ids, id)
+    for i = 1, #ids do
+        if ids[i] == id then
+            return i
+        end
+    end
+    return nil
+end
+
+-- Direct missing-range: overlapping historical aliases vs logical catch-up
+resetEnv()
+local overlapMissing = Sync:ComputeMissingLogRequests(
+    { [OWNER] = 1 },
+    { [OWNER] = 1, ["owner-Garona"] = 1 }
+)
+assertTrue(rangeForAuthor(overlapMissing, "owner-Garona") ~= nil, "missing-range discovers owner-Garona when logical max already matches")
+assertEq(rangeForAuthor(overlapMissing, "owner-Garona").fromCounter, 1, "alias completeness requests 1..remoteMax")
+assertEq(rangeForAuthor(overlapMissing, "owner-Garona").toCounter, 1, "alias completeness stops at remote max")
+local catchUp = Sync:ComputeMissingLogRequests({ ["owner-Garona"] = 6 }, { [OWNER] = 7 })
+assertEq(#catchUp, 1, "logical catch-up still requests one range")
+assertEq(catchUp[1].fromCounter, 7, "logical catch-up still starts at 7")
+assertEq(catchUp[1].toCounter, 7, "logical catch-up still ends at 7")
+assertTrue(rangeForAuthor(catchUp, "owner-Garona") == nil, "logical catch-up does not request a 1-6 alias gap")
+
+-- Automatic discovery of overlapping Owner-Garona:1 / owner-Garona:1
+resetEnv()
+profile = makeProfile("AliasDiscoverA")
+addMember(profile, ALT_A)
+setActive(profile)
+local eventY = makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 7,
+}, { author = "owner-Garona", counter = 1, timestamp = 1700008102 })
+assertTrue(profile:MergeLogTables({ eventY }) > 0, "authoritative peer stores owner-Garona:1")
+if profile.RebuildLogIndex then
+    profile:RebuildLogIndex()
+end
+assertTrue(hasLogId(profile, OWNER .. ":1"), "Owner-Garona:1 remains")
+assertTrue(hasLogId(profile, "owner-Garona:1"), "owner-Garona:1 remains")
+local yFp = profile:GetLogById("owner-Garona:1"):GetFingerprint()
+local destB = cloneWithout(profile, "AliasDiscoverB", "owner-Garona:1")
+assertTrue(hasLogId(destB, OWNER .. ":1"), "incomplete peer keeps Owner-Garona:1")
+assertFalse(hasLogId(destB, "owner-Garona:1"), "incomplete peer lacks owner-Garona:1")
+
+local missing, integrity = discoverFrom(destB, profile)
+assertTrue(rangeForAuthor(missing, "owner-Garona") ~= nil, "heartbeat missing-range discovers owner-Garona without a seeded LOG_REQ")
+assertEq(rangeForAuthor(missing, "owner-Garona").fromCounter, 1, "discovered alias range starts at 1")
+assertEq(rangeForAuthor(missing, "owner-Garona").toCounter, 1, "discovered alias range ends at 1")
+assertTrue(rangeForAuthor(integrity, "owner-Garona") ~= nil, "partial-window integrity also discovers unseen owner-Garona")
+assertEq(rangeForAuthor(integrity, "owner-Garona").toCounter, 1, "partial integrity requests filled maxCounter, not 25")
+
+applyDiscoveredRange(profile, destB, rangeForAuthor(missing, "owner-Garona"), "REQ-DISCOVER-Y")
+assertTrue(hasLogId(destB, "owner-Garona:1"), "Y transferred by discovered repair")
+assertEq(destB:GetLogById("owner-Garona:1"):GetAuthor(), "owner-Garona", "transferred row keeps owner-Garona spelling")
+assertEq(destB:GetLogById("owner-Garona:1"):GetFingerprint(), yFp, "transferred fingerprint is unchanged")
+assertEq(destB:GetLogById(OWNER .. ":1"):GetAuthor(), OWNER, "Owner-Garona spelling is unchanged")
+assertEq(destB:GetIdentityPoints(ALT_A), profile:GetIdentityPoints(ALT_A), "derived points converge after alias repair")
+
+local missing2, integrity2 = discoverFrom(destB, profile)
+assertEq(#missing2, 0, "second missing-range pass is idle")
+assertEq(#integrity2, 0, "second integrity pass is idle")
+
+-- Unknown local alias spelling still uses logical contig
+resetEnv()
+profile = makeProfile("AliasUnknownSpelling")
+addMember(profile, ALT_A)
+assertTrue(profile:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 3,
+}, { author = "owner-Garona", counter = 1, timestamp = 1700008201 }) }) > 0, "remote-only alias row")
+local destSpell = cloneWithout(profile, "AliasUnknownSpellingB", "owner-Garona:1")
+registerProfile(destSpell)
+local spellContig = Sync:ComputeContigAuthorMax(destSpell:GetProfileId())
+assertEq(spellContig["owner-Garona"], nil, "exact owner-Garona spelling is absent locally")
+assertTrue((spellContig[OWNER] or 0) >= 1, "title-case contig is present")
+local remoteWindows = profile:ComputeAuthorWindowSummary(25)
+local spellMismatch = Sync:ComputeWindowMismatchRequests(destSpell:GetProfileId(), remoteWindows, spellContig)
+assertTrue(rangeForAuthor(spellMismatch, "owner-Garona") ~= nil, "unseen remote spelling is not skipped as contig 0")
+
+-- OrderLogs retains both rows at one logical counter
+resetEnv()
+local pointX = {
+    _timestamp = 1700009000,
+    _author = "X-Garona",
+    _counter = 1,
+    _eventType = SF.LootLogEventTypes.POINT_CHANGE,
+    _data = {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 1,
+    },
+    _id = "X-Garona:1",
+}
+local adminY = {
+    _timestamp = 1700009000,
+    _author = "x-Garona",
+    _counter = 1,
+    _eventType = SF.LootLogEventTypes.ADMIN_ADDED,
+    _data = { member = ALT_B },
+    _id = "x-Garona:1",
+}
+local linkB = {
+    _timestamp = 1700009000,
+    _author = ALT_B,
+    _counter = 1,
+    _eventType = SF.LootLogEventTypes.CHARACTER_LINK,
+    _data = {
+        memberA = ALT_A,
+        memberB = ALT_C,
+        adminMembersAtLink = { OWNER },
+        preOpAuthorMax = { { author = "X-Garona", counter = 1 } },
+    },
+    _id = ALT_B .. ":1",
+}
+assertTrue(SF.LootHelperIdentity.CompareLogs(linkB, adminY), "without a causal edge Bravo sorts before x-Garona")
+local idsForward, statsForward = orderedIds({ pointX, adminY, linkB })
+local idsReverse, statsReverse = orderedIds({ linkB, adminY, pointX })
+assertEq(statsForward.leftover or 0, 0, "duplicate logical-counter rows do not cycle")
+assertEq(statsReverse.leftover or 0, 0, "reversed duplicate logical-counter rows do not cycle")
+assertTrue(indexOfId(idsForward, "X-Garona:1") ~= nil, "X-Garona:1 is retained")
+assertTrue(indexOfId(idsForward, "x-Garona:1") ~= nil, "x-Garona:1 is retained")
+assertTrue(indexOfId(idsForward, "X-Garona:1") < indexOfId(idsForward, ALT_B .. ":1"), "point at frontier 1 precedes dependent LINK")
+assertTrue(indexOfId(idsForward, "x-Garona:1") < indexOfId(idsForward, ALT_B .. ":1"), "ADMIN_ADDED at frontier 1 precedes dependent LINK")
+for i = 1, #idsForward do
+    assertEq(idsForward[i], idsReverse[i], "OrderLogs is independent of input order at " .. tostring(i))
+end
+
+local nextCounter = {
+    _timestamp = 1700009000,
+    _author = "X-Garona",
+    _counter = 2,
+    _eventType = SF.LootLogEventTypes.POINT_CHANGE,
+    _data = {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 1,
+    },
+    _id = "X-Garona:2",
+}
+local idsNext, statsNext = orderedIds({ nextCounter, adminY, pointX })
+assertEq(statsNext.leftover or 0, 0, "logical N+1 with duplicate N does not cycle")
+assertTrue(indexOfId(idsNext, "X-Garona:1") < indexOfId(idsNext, "X-Garona:2"), "logical 2 is after X-Garona:1")
+assertTrue(indexOfId(idsNext, "x-Garona:1") < indexOfId(idsNext, "X-Garona:2"), "logical 2 is after x-Garona:1")
+
+-- Authorization-sensitive Replay + arrival permutations
+resetEnv()
+local causalRows = {
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 1,
+    }, { author = "X-Garona", counter = 1, timestamp = 1700009000 }),
+    makeTable(SF.LootLogEventTypes.ADMIN_ADDED, {
+        member = ALT_B,
+    }, { author = "x-Garona", counter = 1, timestamp = 1700009000 }),
+    makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+        memberA = ALT_A,
+        memberB = ALT_C,
+        adminMembersAtLink = { OWNER },
+        preOpAuthorMax = { { author = "X-Garona", counter = 1 } },
+    }, { author = ALT_B, counter = 1, timestamp = 1700009000 }),
+}
+local permutations = {
+    { 1, 2, 3 },
+    { 3, 2, 1 },
+    { 2, 3, 1 },
+    { 3, 1, 2 },
+    { 2, 1, 3 },
+    { 1, 3, 2 },
+}
+local firstReplay = nil
+for p = 1, #permutations do
+    local order = permutations[p]
+    local replica = makeProfile("AliasCausalAuth" .. tostring(p))
+    addMember(replica, ALT_A)
+    addMember(replica, ALT_B)
+    addMember(replica, ALT_C)
+    addMember(replica, "X-Garona")
+    local batch = { causalRows[order[1]], causalRows[order[2]], causalRows[order[3]] }
+    assertTrue(replica:MergeLogTables(batch) > 0, "perm " .. tostring(p) .. " merges")
+    replica:ApplyIdentityProjection({ force = true })
+    SF.LootHelperIdentity.OrderLogs(replica:GetLootLogs())
+    assertEq(SF.LootHelperIdentity.lastOrderStats.leftover or 0, 0, "perm " .. tostring(p) .. " has no causal fallback")
+    assertTrue(replica:AreSameIdentity(ALT_A, ALT_C), "perm " .. tostring(p) .. " applies LINK after ADMIN_ADDED")
+    assertTrue(replica:IsAdminMemberId(ALT_B), "perm " .. tostring(p) .. " grants B")
+    local replay = SF.LootHelperIdentity.Replay(replica:GetLootLogs(), { owner = OWNER })
+    if not firstReplay then
+        firstReplay = replay
+    else
+        assertEq(replay.points[ALT_A], firstReplay.points[ALT_A], "perm " .. tostring(p) .. " points match")
+        assertEq(replay.attendance[ALT_A] or 0, firstReplay.attendance[ALT_A] or 0, "perm " .. tostring(p) .. " attendance match")
+    end
+end
+
+exportCausal = makeProfile("AliasCausalExport")
+addMember(exportCausal, ALT_A)
+addMember(exportCausal, ALT_B)
+addMember(exportCausal, ALT_C)
+addMember(exportCausal, "X-Garona")
+assertTrue(exportCausal:MergeLogTables(causalRows) > 0, "snapshot source merges both alias rows")
+exportCausal:ApplyIdentityProjection({ force = true })
+local snapExport = exportCausal:ExportSnapshot()
+local snapDest = makeProfile("AliasCausalSnap")
+snapDest._profileId = snapExport.meta._profileId
+assertTrue(select(1, snapDest:ImportSnapshot(snapExport)), "snapshot import keeps overlapping alias rows")
+assertTrue(snapDest:GetLogById("X-Garona:1") ~= nil, "snapshot retains X-Garona:1")
+assertTrue(snapDest:GetLogById("x-Garona:1") ~= nil, "snapshot retains x-Garona:1")
+snapDest:ApplyIdentityProjection({ force = true })
+assertTrue(snapDest:AreSameIdentity(ALT_A, ALT_C), "snapshot Replay matches complete peer identity")
+assertTrue(snapDest:IsAdminMemberId(ALT_B), "snapshot Replay matches complete peer admins")
+
+-- End-to-end: discovery + causal Replay + idle second pass
+resetEnv()
+profile = makeProfile("AliasE2E")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, "X-Garona")
+assertTrue(profile:MergeLogTables(causalRows) > 0, "complete peer has both counter-1 alias rows and dependent LINK")
+profile:ApplyIdentityProjection({ force = true })
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_C), "complete peer linked A+C")
+local incomplete = cloneWithout(profile, "AliasE2EB", "x-Garona:1")
+assertTrue(incomplete:GetLogById("X-Garona:1") ~= nil, "incomplete peer has X-Garona:1")
+assertTrue(incomplete:GetLogById("x-Garona:1") == nil, "incomplete peer lacks ADMIN_ADDED alias row")
+assertTrue(incomplete:GetLogById(ALT_B .. ":1") ~= nil, "incomplete peer already has the dependent LINK")
+assertFalse(incomplete:AreSameIdentity(ALT_A, ALT_C), "without ADMIN_ADDED the LINK does not authorize")
+
+local e2eMissing, e2eIntegrity = discoverFrom(incomplete, profile)
+local e2eRanges = unionRanges(e2eMissing, e2eIntegrity)
+assertTrue(rangeForAuthor(e2eRanges, "x-Garona") ~= nil, "e2e discovery finds x-Garona without a seeded request")
+applyDiscoveredRange(profile, incomplete, rangeForAuthor(e2eRanges, "x-Garona"), "REQ-E2E-ALIAS")
+assertTrue(incomplete:GetLogById("x-Garona:1") ~= nil, "e2e AUTH_LOGS transferred ADMIN_ADDED")
+assertEq(incomplete:GetLogById("x-Garona:1"):GetAuthor(), "x-Garona", "e2e does not rewrite alias author")
+assertTrue(incomplete:AreSameIdentity(ALT_A, ALT_C), "e2e Replay applies LINK after transferred ADMIN_ADDED")
+assertTrue(incomplete:IsAdminMemberId(ALT_B), "e2e Replay grants B")
+assertEq(incomplete:GetIdentityPoints(ALT_A), profile:GetIdentityPoints(ALT_A), "e2e derived points match")
+local e2eMissing2, e2eIntegrity2 = discoverFrom(incomplete, profile)
+assertEq(#e2eMissing2, 0, "e2e second missing-range pass is idle")
+assertEq(#e2eIntegrity2, 0, "e2e second integrity pass is idle")
+
+-- Performance: large history with a few alias collisions
+resetEnv()
+local perfLogs = {}
+local perfCounters = {}
+local perfAuthors = { OWNER, ALT_A, OTHER, ALT_C }
+for i = 1, 1800 do
+    local author = perfAuthors[(i % #perfAuthors) + 1]
+    perfCounters[author] = (perfCounters[author] or 0) + 1
+    perfLogs[#perfLogs + 1] = {
+        _timestamp = 1700070000 + math.floor(i / 6),
+        _author = author,
+        _counter = perfCounters[author],
+        _eventType = SF.LootLogEventTypes.POINT_CHANGE,
+        _data = {
+            member = ALT_D,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 1,
+        },
+        _id = string.format("%s:%d", author, perfCounters[author]),
+    }
+end
+for i = 1, 4 do
+    perfLogs[#perfLogs + 1] = {
+        _timestamp = 1700070000,
+        _author = "owner-Garona",
+        _counter = i,
+        _eventType = SF.LootLogEventTypes.ATTENDANCE_CHANGE,
+        _data = {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 1,
+        },
+        _id = string.format("owner-Garona:%d", i),
+    }
+end
+perfLogs[#perfLogs + 1] = {
+    _timestamp = 1700071000,
+    _author = OWNER,
+    _counter = (perfCounters[OWNER] or 0) + 1,
+    _eventType = SF.LootLogEventTypes.ADMIN_ADDED,
+    _data = { member = ALT_B, sourceLogId = nil },
+    _id = string.format("%s:%d", OWNER, (perfCounters[OWNER] or 0) + 1),
+}
+perfCounters[OWNER] = (perfCounters[OWNER] or 0) + 1
+perfLogs[#perfLogs + 1] = {
+    _timestamp = 1700071001,
+    _author = OWNER,
+    _counter = perfCounters[OWNER] + 1,
+    _eventType = SF.LootLogEventTypes.CHARACTER_LINK,
+    _data = {
+        memberA = ALT_A,
+        memberB = ALT_B,
+        adminMembersAtLink = { OWNER },
+        preOpAuthorMax = {
+            { author = OWNER, counter = perfCounters[OWNER] },
+            { author = "owner-Garona", counter = 4 },
+        },
+        sourceLogId = nil,
+    },
+    _id = string.format("%s:%d", OWNER, perfCounters[OWNER] + 1),
+}
+local t0 = os.clock()
+local perfOrdered = SF.LootHelperIdentity.OrderLogs(perfLogs)
+local elapsed = os.clock() - t0
+local perfStats = SF.LootHelperIdentity.lastOrderStats
+assertEq(#perfOrdered, #perfLogs, "performance order retains every log")
+assertEq(perfStats.leftover or 0, 0, "performance order has no causal cycle")
+assertTrue(perfStats.heapOps < perfStats.n * perfStats.n / 8, "alias-collision heap work stays far below n^2")
+assertTrue((perfStats.edgeCalls or 0) < perfStats.n * 8, "alias-collision edges stay linear in n")
+assertTrue(elapsed < 2.0, "1800-log alias-collision OrderLogs stays comfortably sub-quadratic")
+end
+runHistoricalAliasConvergenceTests()
+
 -- ---------------------------------------------------------------------------
 -- Protocol
 -- ---------------------------------------------------------------------------

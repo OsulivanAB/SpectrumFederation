@@ -65,6 +65,8 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Redundant concurrent LINKs remain valid history but do not propagate admin across an already-unified component
 - Characters named only in historical awards with no `MAIN_SWAP` lineage restore as unlinked shells with an admin warning
 - `MAIN_SWAP` validation accepts hyphenated realms through `NameUtil`
+- Overlapping historical SameAuthor rows at one logical counter are discovered by normal missing-range and partial-window integrity repair without rewriting `_author`, `_id`, or fingerprints
+- `Identity.OrderLogs` keeps every immutable row at a logical author counter so `preOpAuthorMax` and logical `N+1` wait for all retained alias rows at frontier `N`
 
 ## [1.4.1] - 2026-09-07
 
