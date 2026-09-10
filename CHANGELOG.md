@@ -67,6 +67,8 @@ All notable changes to SpectrumFederation will be documented in this file.
 - `MAIN_SWAP` validation accepts hyphenated realms through `NameUtil`
 - Overlapping historical SameAuthor rows at one logical counter are discovered by normal missing-range and partial-window integrity repair without rewriting `_author`, `_id`, or fingerprints
 - `Identity.OrderLogs` keeps every immutable row at a logical author counter so `preOpAuthorMax` and logical `N+1` wait for all retained alias rows at frontier `N`
+- Session `authorMax` stays a raw `_author` -> retained-counter map; SameAuthor merge no longer advertises phantom historical maxima such as `owner-Garona:7`
+- `BuildAdminStatus.hasGaps` scores logical sequential presence so alias continuation is not treated as a gappy raw stream
 
 ## [1.4.1] - 2026-09-07
 

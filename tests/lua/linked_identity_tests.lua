@@ -112,6 +112,7 @@ loadModule("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/08_Requests.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/12_LiveUpdates.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/10_Handshake.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/15_HandlersBulk.lua")
 
@@ -143,6 +144,7 @@ SF.Debug = {
 }
 
 local Sync = SF.LootHelperSync
+local ProductionBroadcastSessionHeartbeat = Sync.BroadcastSessionHeartbeat
 local deferredAfter = {}
 function Sync:FindLocalProfileById(profileId)
     return SF.lootHelperDB and SF.lootHelperDB.profiles and SF.lootHelperDB.profiles[profileId]
@@ -177,6 +179,24 @@ function Sync:_SelfId()
 end
 function Sync:QueueRepairRanges()
     return true
+end
+function Sync:_PersistSessionState()
+end
+function Sync:_GetSessionSafeModePayload()
+    return {}
+end
+function Sync:_ApplySessionSafeModeFromPayload()
+end
+function Sync:EnsureHeartbeatMonitor()
+end
+function Sync:EnsureRepairConvergence()
+end
+function Sync:_KickRepairConvergence()
+end
+function Sync:_GetAddonVersion()
+    return "1.5.0-beta.2"
+end
+function Sync:TouchPeer()
 end
 function Sync:IsSafeModeEnabled()
     return false
@@ -4685,6 +4705,267 @@ assertEq(incomplete:GetIdentityPoints(ALT_A), profile:GetIdentityPoints(ALT_A), 
 local e2eMissing2, e2eIntegrity2 = discoverFrom(incomplete, profile)
 assertEq(#e2eMissing2, 0, "e2e second missing-range pass is idle")
 assertEq(#e2eIntegrity2, 0, "e2e second integrity pass is idle")
+
+-- Raw advertised authorMax must not copy logical maxima onto historical aliases
+local function addAliasContinuation(dst, ownerAliasThrough)
+    ownerAliasThrough = ownerAliasThrough or 6
+    for i = 1, ownerAliasThrough do
+        assertTrue(dst:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = i,
+        }, { author = "owner-Garona", counter = i, timestamp = 1700010000 + i }) }) > 0,
+            "continuation owner-Garona:" .. tostring(i))
+    end
+    assertTrue(dst:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 7,
+    }, { author = OWNER, counter = 7, timestamp = 1700010007 }) }) > 0, "continuation Owner-Garona:7")
+    if dst.RebuildLogIndex then
+        dst:RebuildLogIndex()
+    end
+end
+
+local function repairQueueIdle()
+    local queue = Sync.state.repairQueue
+    if type(queue) ~= "table" then
+        return true
+    end
+    if type(queue.order) == "table" and #queue.order > 0 then
+        return false
+    end
+    if type(queue.items) == "table" then
+        for _ in pairs(queue.items) do
+            return false
+        end
+    end
+    return true
+end
+
+local function rangeCoversCounter(ranges, author, counter)
+    for i = 1, #(ranges or {}) do
+        local r = ranges[i]
+        if type(r) == "table"
+            and type(r.fromCounter) == "number"
+            and type(r.toCounter) == "number"
+            and r.fromCounter <= counter
+            and r.toCounter >= counter
+        then
+            if r.author == author or (SF.LootHelperIdentity and SF.LootHelperIdentity.SameAuthor and SF.LootHelperIdentity.SameAuthor(r.author, author)) then
+                return r
+            end
+        end
+    end
+    return nil
+end
+
+resetEnv()
+profile = makeProfile("RawFrontierStamp")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addAliasContinuation(profile, 6)
+local rawMax = profile:ComputeAuthorMax()
+assertEq(rawMax["owner-Garona"], 6, "raw ComputeAuthorMax keeps owner-Garona at 6")
+assertEq(rawMax[OWNER], 7, "raw ComputeAuthorMax keeps Owner-Garona at 7")
+activateSession(profile)
+Sync.state.authorMax = {}
+Sync.state.coordEpoch = 1
+local advertised = Sync:_RefreshAdvertisedAuthorMax(profile:GetProfileId())
+assertEq(advertised["owner-Garona"], 6, "refresh does not advertise phantom owner-Garona:7")
+assertEq(advertised[OWNER], 7, "refresh keeps raw Owner-Garona at 7")
+Sync:_MergeAuthorMaxFrontier({ [OWNER] = 7 })
+assertEq(Sync.state.authorMax["owner-Garona"], 6, "later Owner-Garona merge does not raise owner-Garona")
+Sync:_MergeAuthorMaxFrontier({ ["owner-Garona"] = 6 })
+assertEq(Sync.state.authorMax[OWNER], 7, "later owner-Garona merge does not lower Owner-Garona")
+assertEq(Sync.state.authorMax["owner-Garona"], 6, "raw owner-Garona spelling is retained independently")
+
+resetEnv()
+profile = makeProfile("HasGapsAliasContinuation")
+addMember(profile, ALT_A)
+addAliasContinuation(profile, 6)
+setActive(profile)
+local statusComplete = Sync:BuildAdminStatus(profile:GetProfileId())
+assertFalse(statusComplete.hasGaps, "alias continuation 1..6 + :7 is not a sequential gap")
+
+resetEnv()
+profile = makeProfile("HasGapsAliasHole")
+addMember(profile, ALT_A)
+addAliasContinuation(profile, 5)
+setActive(profile)
+local statusGappy = Sync:BuildAdminStatus(profile:GetProfileId())
+assertTrue(statusGappy.hasGaps, "missing owner-Garona:6 is a logical sequential gap")
+
+resetEnv()
+profile = makeProfile("HasGapsDuplicateCounter")
+addMember(profile, ALT_A)
+assertTrue(profile:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+}, { author = "owner-Garona", counter = 1, timestamp = 1700011001 }) }) > 0, "duplicate logical-counter alias row")
+setActive(profile)
+local statusDup = Sync:BuildAdminStatus(profile:GetProfileId())
+assertFalse(statusDup.hasGaps, "duplicate Owner-Garona:1 / owner-Garona:1 is not a sequential gap")
+
+local function installHeartbeatCatchup(queued)
+    Sync.BroadcastSessionHeartbeat = ProductionBroadcastSessionHeartbeat
+    Sync.QueueRepairRanges = function(self, profileId, ranges, opts)
+        opts = type(opts) == "table" and opts or {}
+        self.state.repairQueue = self.state.repairQueue or { order = {}, items = {} }
+        local queue = self.state.repairQueue
+        queue.order = queue.order or {}
+        queue.items = queue.items or {}
+        local added = 0
+        for _, range in ipairs(ranges or {}) do
+            if type(range) == "table" and type(range.author) == "string" then
+                queued[#queued + 1] = {
+                    author = range.author,
+                    fromCounter = range.fromCounter,
+                    toCounter = range.toCounter,
+                    mode = range.mode or opts.mode,
+                    reason = opts.reason,
+                }
+                local key = table.concat({
+                    tostring(profileId or ""),
+                    tostring(range.author or ""),
+                    tostring(tonumber(range.fromCounter) or 0),
+                    tostring(tonumber(range.toCounter) or 0),
+                    tostring(range.mode or opts.mode or "missing"),
+                }, "|")
+                if not queue.items[key] then
+                    queue.items[key] = {
+                        key = key,
+                        profileId = profileId,
+                        author = range.author,
+                        fromCounter = range.fromCounter,
+                        toCounter = range.toCounter,
+                        mode = range.mode or opts.mode or "missing",
+                        reason = opts.reason,
+                    }
+                    queue.order[#queue.order + 1] = key
+                    added = added + 1
+                end
+            end
+        end
+        return added > 0
+    end
+end
+
+local function restoreHeartbeatCatchup()
+    Sync.BroadcastSessionHeartbeat = function() end
+    Sync.QueueRepairRanges = function()
+        return true
+    end
+    PLAYER = OWNER
+end
+
+local function runHeartbeatCatchup(coordProfile, memberProfile, queued)
+    local pid = coordProfile:GetProfileId()
+    PLAYER = OWNER
+    registerProfile(coordProfile)
+    Sync.state.active = true
+    Sync.state.sessionId = "SES1"
+    Sync.state.profileId = pid
+    Sync.state.coordinator = OWNER
+    Sync.state.coordEpoch = 1
+    Sync.state.isCoordinator = true
+    Sync.state.helpers = {}
+    Sync.state.authorWindowSummary = {}
+    capturedComm = {}
+    assertTrue(Sync:BroadcastSessionHeartbeat() == true, "coordinator BroadcastSessionHeartbeat sent")
+    local hb = findCaptured(Sync.MSG.SES_HEARTBEAT)
+    assertTrue(hb ~= nil and type(hb.payload) == "table", "SES_HEARTBEAT payload captured")
+    local advertisedMax = hb.payload.authorMax or {}
+    PLAYER = OTHER
+    registerProfile(memberProfile)
+    Sync.state.active = true
+    Sync.state.sessionId = "SES1"
+    Sync.state.profileId = pid
+    Sync.state.coordinator = OWNER
+    Sync.state.coordEpoch = 1
+    Sync.state.isCoordinator = false
+    Sync.state.heartbeat = Sync.state.heartbeat or {}
+    Sync.state.heartbeat.lastCatchupAt = nil
+    local prevCooldown = Sync.cfg.catchupOnHeartbeatCooldownSec
+    Sync.cfg.catchupOnHeartbeatCooldownSec = 0
+    Sync:HandleSessionHeartbeat(OWNER, hb.payload)
+    Sync.cfg.catchupOnHeartbeatCooldownSec = prevCooldown
+    PLAYER = OWNER
+    return advertisedMax
+end
+
+resetEnv()
+profile = makeProfile("HeartbeatRawFrontierA")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addAliasContinuation(profile, 6)
+local memberComplete = cloneWithout(profile, "HeartbeatRawFrontierB", "__none__")
+assertTrue(hasLogId(memberComplete, "owner-Garona:6"), "complete member has owner-Garona:6")
+assertTrue(hasLogId(memberComplete, OWNER .. ":7"), "complete member has Owner-Garona:7")
+local queuedHb = {}
+installHeartbeatCatchup(queuedHb)
+local advertisedHb
+for cycle = 1, 3 do
+    advertisedHb = runHeartbeatCatchup(profile, memberComplete, queuedHb)
+    assertEq(advertisedHb["owner-Garona"], 6, "heartbeat cycle " .. tostring(cycle) .. " advertises raw owner-Garona=6")
+    assertEq(advertisedHb[OWNER], 7, "heartbeat cycle " .. tostring(cycle) .. " advertises raw Owner-Garona=7")
+    assertEq(#queuedHb, 0, "complete member queues no repair after heartbeat " .. tostring(cycle))
+    assertTrue(repairQueueIdle(), "complete member repair queue stays idle after heartbeat " .. tostring(cycle))
+end
+registerProfile(profile)
+Sync.state.active = true
+Sync.state.isCoordinator = true
+Sync.state.profileId = profile:GetProfileId()
+Sync.state.authorMax = advertisedHb
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+assertTrue(Sync:IsIdentityAdminReconcileReady(profile:GetProfileId()), "complete alias continuation is identity-admin ready")
+local liveFrontier = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OWNER },
+    preOpAuthorMax = {
+        { author = OWNER, counter = 7 },
+        { author = "owner-Garona", counter = 6 },
+    },
+}, { author = OWNER, counter = 8, timestamp = 1700010108 })
+registerProfile(memberComplete)
+Sync.state.authorMax = advertisedHb
+local liveReady, liveMissing = Sync:_LiveRelationshipPredecessorState(memberComplete:GetProfileId(), liveFrontier)
+assertTrue(liveReady, "live relationship at logical frontier 7 is ready")
+assertTrue(liveMissing == nil or #liveMissing == 0, "live predecessor does not request phantom owner-Garona:7")
+restoreHeartbeatCatchup()
+
+resetEnv()
+profile = makeProfile("HeartbeatRawFrontierMissingA")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addAliasContinuation(profile, 6)
+local memberBehind = cloneWithout(profile, "HeartbeatRawFrontierMissingB", "owner-Garona:6")
+assertTrue(hasLogId(memberBehind, "owner-Garona:5"), "incomplete member keeps owner-Garona:5")
+assertFalse(hasLogId(memberBehind, "owner-Garona:6"), "incomplete member lacks owner-Garona:6")
+assertTrue(hasLogId(memberBehind, OWNER .. ":7"), "incomplete member already has Owner-Garona:7")
+queuedHb = {}
+installHeartbeatCatchup(queuedHb)
+advertisedHb = runHeartbeatCatchup(profile, memberBehind, queuedHb)
+assertEq(advertisedHb["owner-Garona"], 6, "incomplete-path heartbeat still advertises raw owner-Garona=6")
+assertEq(advertisedHb[OWNER], 7, "incomplete-path heartbeat still advertises raw Owner-Garona=7")
+local phantomRange = rangeForAuthor(queuedHb, "owner-Garona")
+if phantomRange then
+    assertFalse(phantomRange.fromCounter == 1 and phantomRange.toCounter == 7, "must not request fabricated owner-Garona:1..7")
+end
+assertTrue(rangeCoversCounter(queuedHb, "owner-Garona", 6) ~= nil, "production catch-up still discovers missing owner-Garona:6")
+local discovered = rangeForAuthor(queuedHb, "owner-Garona") or rangeCoversCounter(queuedHb, "owner-Garona", 6)
+applyDiscoveredRange(profile, memberBehind, {
+    author = discovered.author,
+    fromCounter = discovered.fromCounter,
+    toCounter = discovered.toCounter,
+}, "REQ-HB-OWNER-6")
+assertTrue(hasLogId(memberBehind, "owner-Garona:6"), "AUTH_LOGS transferred the real missing owner-Garona:6")
+assertEq(memberBehind:GetLogById("owner-Garona:6"):GetAuthor(), "owner-Garona", "transferred missing row keeps owner-Garona")
+restoreHeartbeatCatchup()
 
 -- Performance: large history with a few alias collisions
 resetEnv()
