@@ -2770,6 +2770,587 @@ assertTrue(sawRestoreWarn, "admin warning is emitted for unrostered historical a
 end
 runAuthorizationHardeningTests()
 
+local function runCorrectnessHardeningTests()
+-- ---------------------------------------------------------------------------
+-- Redundant concurrent LINK is not an admin-propagation boundary
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("RedundantLink")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(ALT_A)
+profile:AddAdminMemberId(OTHER)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B linked with A admin")
+assertTrue(profile:RemoveAdminMemberId(ALT_B), "B explicitly removed after the original LINK")
+assertFalse(profile:IsAdminMemberId(ALT_B), "B remains non-admin after ADMIN_REMOVED")
+local linkAC1 = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_C,
+    adminMembersAtLink = { ALT_A },
+    preOpAuthorMax = {},
+}, { author = OTHER, counter = 4, timestamp = 1700009000 })
+local linkAC2 = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_C,
+    adminMembersAtLink = { ALT_A },
+    preOpAuthorMax = {},
+}, { author = ALT_A, counter = 8, timestamp = 1700009000 })
+local redA = makeProfile("RedundantArriveA")
+addMember(redA, ALT_A)
+addMember(redA, ALT_B)
+addMember(redA, ALT_C)
+addMember(redA, OTHER)
+redA:AddAdminMemberId(ALT_A)
+redA:AddAdminMemberId(OTHER)
+redA:LinkCharacters(ALT_A, ALT_B)
+redA:RemoveAdminMemberId(ALT_B)
+redA:MergeLogTables({ linkAC1, linkAC2 })
+local redB = makeProfile("RedundantArriveB")
+addMember(redB, ALT_A)
+addMember(redB, ALT_B)
+addMember(redB, ALT_C)
+addMember(redB, OTHER)
+redB:AddAdminMemberId(ALT_A)
+redB:AddAdminMemberId(OTHER)
+redB:LinkCharacters(ALT_A, ALT_B)
+redB:RemoveAdminMemberId(ALT_B)
+redB:MergeLogTables({ linkAC2, linkAC1 })
+assertTrue(redA:AreSameIdentity(ALT_A, ALT_C), "first concurrent A+C applies")
+assertTrue(redB:AreSameIdentity(ALT_A, ALT_C), "opposite arrival still unifies A+C")
+assertFalse(redA:IsAdminMemberId(ALT_B), "redundant LINK does not re-grant explicitly removed B")
+assertFalse(redB:IsAdminMemberId(ALT_B), "opposite order still leaves B non-admin")
+local replayA = SF.LootHelperIdentity.Replay(redA:GetLootLogs(), { owner = OWNER })
+assertTrue(replayA.simulatedAdmins[ALT_C], "C is implied by the topology-changing LINK")
+assertFalse(replayA.simulatedAdmins[ALT_B], "B is not implied across the already-unified component")
+assertTrue(redA:ReconcileIdentityAdmins({ skipBroadcast = true }) >= 1, "coordinator persists C from the qualifying LINK")
+assertTrue(redA:IsAdminMemberId(ALT_C), "C crossing a real boundary is granted")
+assertFalse(redA:IsAdminMemberId(ALT_B), "reconcile still leaves B non-admin")
+local cGrantSource
+for _, log in ipairs(redA:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.ADMIN_ADDED then
+        local data = log:GetEventData()
+        if data.member == ALT_C and type(data.sourceLogId) == "string" then
+            cGrantSource = data.sourceLogId
+        end
+    end
+end
+assertTrue(cGrantSource == linkAC1._id or cGrantSource == linkAC2._id, "C's grant is sourced from one of the concurrent A+C LINKs")
+assertTrue(replayA.impliedAdminSource[ALT_C] == cGrantSource, "reconcile uses the topology-changing LINK, not a same-component implication")
+assertEq(redA:ReconcileIdentityAdmins({ skipBroadcast = true }), 0, "coordinator reconcile does not synthesize a grant from the redundant LINK")
+redB:ReconcileIdentityAdmins({ skipBroadcast = true })
+assertTrue(redB:IsAdminMemberId(ALT_C), "opposite order still grants C")
+assertFalse(redB:IsAdminMemberId(ALT_B), "opposite order reconcile still leaves B non-admin")
+assertFalse(rebuildFrom(redA, "RedundantReload"):IsAdminMemberId(ALT_B), "reload leaves B non-admin")
+local redSnapExport = redA:ExportSnapshot()
+local redSnap = makeProfile("RedundantSnap")
+redSnap._profileId = redSnapExport.meta._profileId
+assertTrue(select(1, redSnap:ImportSnapshot(redSnapExport)), "snapshot redundant LINK")
+redSnap:ApplyIdentityProjection({ force = true })
+assertFalse(redSnap:IsAdminMemberId(ALT_B), "snapshot leaves B non-admin")
+assertTrue(redSnap:IsAdminMemberId(ALT_C), "snapshot still grants C")
+assertTrue(redSnap:MergeLogTables(copyLogTables(redA)) >= 0, "AUTH_LOGS redundant LINK")
+assertFalse(redSnap:IsAdminMemberId(ALT_B), "AUTH_LOGS leaves B non-admin")
+
+resetEnv()
+profile = makeProfile("RedundantTransitive")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+profile:AddAdminMemberId(ALT_A)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B")
+assertTrue(profile:RemoveAdminMemberId(ALT_B), "B removed before transitive close")
+assertTrue(profile:LinkCharacters(ALT_B, ALT_C), "B+C")
+local closeAC = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_C,
+    adminMembersAtLink = { ALT_A },
+    preOpAuthorMax = {},
+}, { author = OWNER, counter = 12, timestamp = 1700009100 })
+assertTrue(profile:MergeLogTables({ closeAC }) > 0, "redundant A+C after transitive A+B / B+C")
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_C), "A+C already unified")
+assertFalse(profile:IsAdminMemberId(ALT_B), "transitive redundant A+C does not grant B")
+
+resetEnv()
+profile = makeProfile("RedundantMainSwap")
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+addLog(profile, SF.LootLogEventTypes.MAIN_SWAP, {
+    member = OWNER,
+    sourceMember = ALT_B,
+})
+profile:ApplyIdentityProjection()
+assertFalse(profile:IsAdminMemberId(ALT_B), "MAIN_SWAP-restored B is not admin")
+assertTrue(profile:LinkCharacters(OWNER, ALT_C), "owner links C onto migrated identity")
+local dupOwnerC = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = OWNER,
+    memberB = ALT_C,
+    adminMembersAtLink = { OWNER },
+    preOpAuthorMax = {},
+}, { author = OWNER, counter = 20, timestamp = 1700009200 })
+assertTrue(profile:MergeLogTables({ dupOwnerC }) > 0, "duplicate owner+C LINK stored")
+assertTrue(profile:IsAdminMemberId(ALT_C), "C is granted by the qualifying LINK")
+assertFalse(profile:IsAdminMemberId(ALT_B), "MAIN_SWAP-restored B stays non-admin after redundant LINK")
+
+resetEnv()
+profile = makeProfile("RedundantWriterGrant")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(ALT_A)
+profile:AddAdminMemberId(OTHER)
+assertTrue(asPlayer(OTHER, function()
+    return profile:LinkCharacters(ALT_A, ALT_C, { skipBroadcast = true })
+end), "writer OTHER LINKs A+C and eager-grants C")
+assertTrue(profile:IsAdminMemberId(ALT_C), "writer grant made C canonical")
+local writerGrantId
+local writerLinkId
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.ADMIN_ADDED then
+        local data = log:GetEventData()
+        if data.member == ALT_C and type(data.sourceLogId) == "string" then
+            writerGrantId = log:GetID()
+            writerLinkId = data.sourceLogId
+        end
+    end
+end
+assertTrue(writerGrantId ~= nil, "writer emitted sourced ADMIN_ADDED for C")
+local peerLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_C,
+    adminMembersAtLink = { ALT_A },
+    preOpAuthorMax = {},
+}, { author = ALT_A, counter = 9, timestamp = 1700008900 })
+assertTrue(profile:MergeLogTables({ peerLink }) > 0, "earlier concurrent A+C from A arrives")
+profile:ApplyIdentityProjection({ force = true })
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_C), "both LINKs unify A+C")
+assertTrue(profile:IsAdminMemberId(ALT_C), "writer-emitted sourced grant survives the redundant peer LINK")
+local grantStillSourced = false
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetID() == writerGrantId then
+        grantStillSourced = log:GetEventData().sourceLogId == writerLinkId
+    end
+end
+assertTrue(grantStillSourced, "sourced ADMIN_ADDED is not discarded")
+
+-- ---------------------------------------------------------------------------
+-- Orphan MAIN_SWAP-less rewrite survives snapshot / AUTH_LOGS
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("OrphanFp")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+local rewrittenPoint = addLog(profile, SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_B,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 3,
+}, { timestamp = 1700000100 })
+local rewrittenAttendance = addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_B,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 2,
+}, { timestamp = 1700000101 })
+assertTrue(memberOf(profile, ALT_B):ToggleEquipment("Chest", { profile = profile }), "source Chest USED before rewrite")
+local rewrittenArmor
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.ARMOR_CHANGE then
+        local data = log:GetEventData()
+        if data.member == ALT_B and data.slot == "Chest" then
+            rewrittenArmor = log
+        end
+    end
+end
+assertTrue(rewrittenArmor ~= nil, "captured character-local Chest log")
+local originalFp = rewrittenPoint:GetFingerprint()
+local originalAttFp = rewrittenAttendance:GetFingerprint()
+local originalArmorFp = rewrittenArmor:GetFingerprint()
+rewrittenPoint._data.member = ALT_A
+rewrittenAttendance._data.member = ALT_A
+rewrittenArmor._data.member = ALT_A
+assertTrue(originalFp ~= SF.LootLog.ComputeFingerprintFromTable(rewrittenPoint:ToTable()), "cached fingerprint is stale after in-place rewrite")
+assertTrue(originalAttFp == rewrittenAttendance:GetFingerprint(), "attendance fingerprint cache is left stale")
+assertTrue(originalArmorFp == rewrittenArmor:GetFingerprint(), "armor fingerprint cache is left stale")
+assertTrue(profile:RemoveMemberById(ALT_B), "source removed")
+local orphanRc = makeTable(SF.LootLogEventTypes.RC_LOOT_COUNCIL, {
+    member = ALT_B,
+    itemLink = "|cffa335ee|Hitem:1::::::::80:259:::::::::|h[X]|h|r",
+    response = "Need",
+    rcAwardId = "orphan-fp-1",
+    awardKey = "orphan-fp-1",
+}, { timestamp = 1700000200, counter = 0, author = "RCLootCouncil" })
+orphanRc._externalId = "orphan-fp-1"
+orphanRc._id = "orphan-fp-1"
+orphanRc._fingerprint = SF.LootLog.ComputeFingerprintFromTable(orphanRc)
+assertTrue(profile:MergeLogTables({ orphanRc }, { allowUnknownEventType = true }) >= 0, "RC still names the missing source")
+profile:ApplyIdentityProjection({ force = true })
+assertTrue(memberOf(profile, ALT_B) ~= nil, "local migration restores the unrostered source shell")
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "no link is invented")
+assertEq(memberOf(profile, ALT_A):GetPointBalance(), 3, "rewritten points remain on the target")
+assertEq(memberOf(profile, ALT_A):GetAttendanceBalance(), 2, "rewritten Attendance remains on the target")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "rewritten Chest remains on the target")
+local function hasEverySourceLog(src, dst)
+    local present = {}
+    for _, log in ipairs(dst:GetLootLogs()) do
+        present[log:GetID()] = true
+    end
+    for _, log in ipairs(src:GetLootLogs()) do
+        if not present[log:GetID()] then
+            return false
+        end
+    end
+    return true
+end
+local orphanExport = profile:ExportSnapshot()
+local orphanSnap = makeProfile("OrphanFpSnap")
+orphanSnap._profileId = orphanExport.meta._profileId
+assertTrue(select(1, orphanSnap:ImportSnapshot(orphanExport)), "snapshot import retains rewritten sequential events")
+orphanSnap:ApplyIdentityProjection({ force = true })
+assertTrue(hasEverySourceLog(profile, orphanSnap), "snapshot keeps every sequential event")
+assertEq(memberOf(orphanSnap, ALT_A):GetPointBalance(), 3, "snapshot points match")
+assertEq(memberOf(orphanSnap, ALT_A):GetAttendanceBalance(), 2, "snapshot Attendance match")
+assertTrue(armorOf(orphanSnap, ALT_A, "Chest"), "snapshot equipment matches")
+assertFalse(orphanSnap:AreSameIdentity(ALT_A, ALT_B), "snapshot does not invent a link")
+local authPeer = makeProfile("OrphanFpAuth")
+assertTrue(authPeer:MergeLogTables(copyLogTables(profile), { allowMainSwapFingerprintNormalize = true }) > 0, "AUTH_LOGS/integrity-repair converges")
+authPeer:ApplyIdentityProjection({ force = true })
+assertTrue(hasEverySourceLog(profile, authPeer), "AUTH_LOGS keeps every sequential event")
+assertEq(memberOf(authPeer, ALT_A) and memberOf(authPeer, ALT_A):GetPointBalance(), 3, "AUTH_LOGS points match")
+assertEq(memberOf(authPeer, ALT_A) and memberOf(authPeer, ALT_A):GetAttendanceBalance(), 2, "AUTH_LOGS Attendance match")
+assertTrue(armorOf(authPeer, ALT_A, "Chest"), "AUTH_LOGS equipment matches")
+assertTrue(select(1, orphanSnap:ImportSnapshot(orphanExport)), "repeated snapshot import is idempotent")
+profile:RebuildLogIndex()
+assertEq(rewrittenPoint:GetFingerprint(), SF.LootLog.ComputeFingerprintFromTable(rewrittenPoint:ToTable()), "repeated repair recomputes the rewritten fingerprint")
+local corrupt = makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+}, { timestamp = 1700000300, counter = 99 })
+corrupt._fingerprint = 123456789
+assertEq(profile:MergeLogTables({ corrupt }, { allowMainSwapFingerprintNormalize = true }), 0, "unrelated fingerprint corruption is still rejected")
+local ambiguous = makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 7,
+}, { timestamp = 1700000310, counter = 100 })
+local baseB = makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_B,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 7,
+}, { timestamp = 1700000310, counter = 100 })
+ambiguous._fingerprint = baseB._fingerprint
+assertFalse(SF.LootLog.TryNormalizeOrphanRewriteStaleFingerprintTable(ambiguous, {}), "no candidates does not guess")
+assertFalse(SF.LootLog.TryNormalizeOrphanRewriteStaleFingerprintTable(ambiguous, { ALT_C, ALT_D }), "wrong candidates are not guessed")
+assertTrue(SF.LootLog.TryNormalizeOrphanRewriteStaleFingerprintTable(ambiguous, { ALT_B, ALT_C, ALT_D }), "unique matching candidate proves the rewrite")
+
+-- ---------------------------------------------------------------------------
+-- Equipment corrections operate on recorded-scope contributions
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("ArmorScopeA")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A local legacy Chest USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "shared Chest AVAILABLE")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "A+B Chest is cleared")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Chest", { profile = profile }), "C independent Chest USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "C joins A+B")
+assertTrue(armorOf(profile, ALT_C, "Chest"), "C local Chest contribution remains active")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "projected Chest is USED")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "A's suppressed Chest does not overflow with C")
+local scopeAReload = rebuildFrom(profile, "ArmorScopeAReload")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(scopeAReload._identityProjection, ALT_A), "reload Case A overflow is still 0")
+assertTrue(armorOf(scopeAReload, ALT_A, "Chest"), "reload projected Chest USED")
+local scopeAExport = profile:ExportSnapshot()
+local scopeASnap = makeProfile("ArmorScopeASnap")
+scopeASnap._profileId = scopeAExport.meta._profileId
+assertTrue(select(1, scopeASnap:ImportSnapshot(scopeAExport)), "snapshot scope A")
+scopeASnap:ApplyIdentityProjection({ force = true })
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(scopeASnap._identityProjection, ALT_A), "snapshot overflow is 0")
+assertTrue(scopeASnap:MergeLogTables(copyLogTables(profile)) >= 0, "AUTH_LOGS scope A")
+assertTrue(armorOf(scopeASnap, ALT_A, "Chest"), "AUTH_LOGS projected Chest USED")
+
+resetEnv()
+profile = makeProfile("ArmorScopeHead")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Head", { profile = profile }), "A local Head USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B head")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Head", { profile = profile, scope = "identity" }), "shared Head AVAILABLE")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Head", { profile = profile }), "C Head USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "C joins head identity")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "Head has no false overflow")
+
+resetEnv()
+profile = makeProfile("ArmorScopeRing")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring1", { profile = profile }), "A local Ring1 USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B ring")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "shared Ring1 AVAILABLE")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Ring1", { profile = profile }), "C Ring1 USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "C joins ring identity")
+assertTrue(armorOf(profile, ALT_C, "Ring1") or armorOf(profile, ALT_C, "Ring2"), "C ring opportunity remains")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "A's cleared ring does not overflow with C")
+
+resetEnv()
+profile = makeProfile("ArmorScopeMerge")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "A+B Chest USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "A+B Chest AVAILABLE")
+assertTrue(profile:LinkCharacters(ALT_C, ALT_D), "C+D")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "C+D Chest USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "merge A+B with C+D")
+assertTrue(armorOf(profile, ALT_C, "Chest"), "C+D scoped USED survives the merge")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "A sees C+D's scoped USED")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "A+B AVAILABLE still suppresses A/B without overflow")
+local mergeReload = rebuildFrom(profile, "ArmorScopeMergeReload")
+assertTrue(armorOf(mergeReload, ALT_C, "Chest"), "reload merge keeps C+D USED")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(mergeReload._identityProjection, ALT_A), "reload merge overflow is 0")
+local mergeExport = profile:ExportSnapshot()
+local mergeSnap = makeProfile("ArmorScopeMergeSnap")
+mergeSnap._profileId = mergeExport.meta._profileId
+assertTrue(select(1, mergeSnap:ImportSnapshot(mergeExport)), "snapshot merge")
+mergeSnap:ApplyIdentityProjection({ force = true })
+assertTrue(armorOf(mergeSnap, ALT_A, "Chest"), "snapshot merge keeps USED")
+assertTrue(mergeSnap:MergeLogTables(copyLogTables(profile)) >= 0, "AUTH_LOGS merge")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(mergeSnap._identityProjection, ALT_A), "AUTH_LOGS merge overflow is 0")
+
+-- ---------------------------------------------------------------------------
+-- sourceLogId is a causal predecessor of sourced ADMIN_ADDED
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("SourceEdge")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+local linkL = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { ALT_A },
+    preOpAuthorMax = {},
+}, { author = OTHER, counter = 1, timestamp = 1700010000 })
+assertTrue(profile:MergeLogTables({ linkL }) > 0, "X authors LINK L")
+local sourcedGrant = makeTable(SF.LootLogEventTypes.ADMIN_ADDED, {
+    member = ALT_B,
+    sourceLogId = linkL._id,
+}, { author = ALT_A, counter = 2, timestamp = 1700010000 })
+assertTrue(profile:MergeLogTables({ sourcedGrant }) > 0, "coordinator writes sourced ADMIN_ADDED at the same timestamp")
+local laterByB = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_C,
+    memberB = ALT_D,
+    adminMembersAtLink = { ALT_B },
+    preOpAuthorMax = {
+        { author = ALT_A, counter = 2 },
+        { author = OTHER, counter = 1 },
+    },
+}, { author = ALT_B, counter = 1, timestamp = 1700010000 })
+assertTrue(profile:MergeLogTables({ laterByB }) > 0, "B authors a later LINK after observing the grant")
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_B), "source LINK applies")
+assertTrue(profile:IsAdminMemberId(ALT_B), "sourced grant becomes canonical")
+assertTrue(profile:AreSameIdentity(ALT_C, ALT_D), "B's later valid LINK is authorized")
+local edgeReload = rebuildFrom(profile, "SourceEdgeReload")
+assertTrue(edgeReload:AreSameIdentity(ALT_C, ALT_D), "reload keeps B's later LINK")
+local edgeExport = profile:ExportSnapshot()
+local edgeSnap = makeProfile("SourceEdgeSnap")
+edgeSnap._profileId = edgeExport.meta._profileId
+assertTrue(select(1, edgeSnap:ImportSnapshot(edgeExport)), "snapshot source edge")
+edgeSnap:ApplyIdentityProjection({ force = true })
+assertTrue(edgeSnap:AreSameIdentity(ALT_C, ALT_D), "snapshot keeps B's later LINK")
+assertTrue(edgeSnap:MergeLogTables(copyLogTables(profile)) >= 0, "AUTH_LOGS source edge")
+assertTrue(edgeSnap:AreSameIdentity(ALT_C, ALT_D), "AUTH_LOGS keeps B's later LINK")
+local reverse = makeProfile("SourceEdgeRev")
+addMember(reverse, ALT_A)
+addMember(reverse, ALT_B)
+addMember(reverse, ALT_C)
+addMember(reverse, ALT_D)
+addMember(reverse, OTHER)
+reverse:AddAdminMemberId(OTHER)
+reverse:MergeLogTables({ laterByB, sourcedGrant, linkL })
+assertTrue(reverse:AreSameIdentity(ALT_C, ALT_D), "opposite arrival still authorizes B's LINK")
+resetEnv()
+profile = makeProfile("SourceEdgeSkip")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+local skippedLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { ALT_A },
+    preOpAuthorMax = {},
+}, { author = ALT_C, counter = 1, timestamp = 1700010100 })
+assertTrue(profile:MergeLogTables({ skippedLink }) > 0, "unauthorized LINK is stored")
+local skippedGrant = makeTable(SF.LootLogEventTypes.ADMIN_ADDED, {
+    member = ALT_B,
+    sourceLogId = skippedLink._id,
+}, { author = OWNER, counter = 8, timestamp = 1700010100 })
+assertTrue(profile:MergeLogTables({ skippedGrant }) > 0, "sourced grant for skipped LINK is stored")
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "skipped source LINK remains unapplied")
+assertFalse(profile:IsAdminMemberId(ALT_B), "sourced grant is invalid while the source LINK is skipped")
+
+-- ---------------------------------------------------------------------------
+-- OrderLogs is heap-based and deterministic
+-- ---------------------------------------------------------------------------
+resetEnv()
+local scaleLogs = {}
+local scaleCounters = {}
+local scaleAuthors = { OWNER, ALT_A, OTHER, ALT_C }
+for i = 1, 1000 do
+    local author = scaleAuthors[(i % #scaleAuthors) + 1]
+    scaleCounters[author] = (scaleCounters[author] or 0) + 1
+    scaleLogs[i] = {
+        _timestamp = 1700020000 + math.floor(i / 4),
+        _author = author,
+        _counter = scaleCounters[author],
+        _eventType = SF.LootLogEventTypes.POINT_CHANGE,
+        _data = {
+            member = ALT_B,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 1,
+        },
+        _id = string.format("%s:%d", author, scaleCounters[author]),
+    }
+end
+scaleLogs[#scaleLogs + 1] = {
+    _timestamp = 1700020000,
+    _author = OWNER,
+    _counter = (scaleCounters[OWNER] or 0) + 1,
+    _eventType = SF.LootLogEventTypes.CHARACTER_LINK,
+    _data = {
+        memberA = ALT_A,
+        memberB = OTHER,
+        adminMembersAtLink = { OWNER },
+        preOpAuthorMax = { { author = ALT_A, counter = scaleCounters[ALT_A] or 1 } },
+        sourceLogId = nil,
+    },
+    _id = string.format("%s:%d", OWNER, (scaleCounters[OWNER] or 0) + 1),
+}
+local ordered1 = SF.LootHelperIdentity.OrderLogs(scaleLogs)
+local stats1 = SF.LootHelperIdentity.lastOrderStats
+assertEq(stats1.n, #scaleLogs, "order stats record n")
+assertTrue(stats1.heapOps < stats1.n * stats1.n / 8, "1000-log heap work is far below n^2")
+assertTrue(not stats1.cacheHit, "first order is not a cache hit")
+local orderedCached = SF.LootHelperIdentity.OrderLogs(scaleLogs)
+assertTrue(SF.LootHelperIdentity.lastOrderStats.cacheHit, "identical log table reuses ordered history")
+assertEq(#orderedCached, #ordered1, "cached order has the same length")
+local shuffled = {}
+for i = 1, #scaleLogs do
+    shuffled[i] = scaleLogs[i]
+end
+for i = #shuffled, 2, -1 do
+    local j = (i % (i - 1)) + 1
+    shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+end
+local ordered2 = SF.LootHelperIdentity.OrderLogs(shuffled)
+assertEq(#ordered2, #ordered1, "shuffled input yields the same length")
+for i = 1, #ordered1 do
+    assertEq(ordered1[i]._id, ordered2[i]._id, "order is independent of input permutation at " .. tostring(i))
+end
+local bigLogs = {}
+local bigCounters = {}
+for i = 1, 3000 do
+    local author = scaleAuthors[(i % #scaleAuthors) + 1]
+    bigCounters[author] = (bigCounters[author] or 0) + 1
+    bigLogs[i] = {
+        _timestamp = 1700030000 + math.floor(i / 5),
+        _author = author,
+        _counter = bigCounters[author],
+        _eventType = SF.LootLogEventTypes.ATTENDANCE_CHANGE,
+        _data = {
+            member = ALT_D,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 1,
+        },
+        _id = string.format("%s:%d", author, bigCounters[author]),
+    }
+end
+SF.LootHelperIdentity.OrderLogs(bigLogs)
+local statsBig = SF.LootHelperIdentity.lastOrderStats
+assertTrue(statsBig.heapOps < statsBig.n * statsBig.n / 10, "3000-log heap work is far below n^2")
+
+-- ---------------------------------------------------------------------------
+-- preOpAuthorMax canonicalizes SamePlayer author aliases
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("PreOpAlias")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+profile._authorCounters["Owner-Garona"] = 4
+profile._authorCounters["owner-Garona"] = 6
+profile._authorCounters["OWNER-Garona"] = 2
+local frontier = SF.LootHelperIdentity.SnapshotPreOpAuthorMax(profile)
+assertEq(#frontier, 1, "SamePlayer author aliases collapse to one frontier entry")
+assertEq(frontier[1].counter, 6, "highest observed alias counter is retained")
+assertTrue(SF.LootLogValidators.ValidateCharacterLinkData({
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OWNER },
+    preOpAuthorMax = frontier,
+}), "SnapshotPreOpAuthorMax is accepted by ValidatePreOpAuthorMax")
+local aliasEarly = {
+    _timestamp = 1700040000,
+    _author = "owner-Garona",
+    _counter = 6,
+    _eventType = SF.LootLogEventTypes.ADMIN_ADDED,
+    _data = { member = ALT_A },
+    _id = "owner-Garona:6",
+}
+local aliasLink = {
+    _timestamp = 1700040000,
+    _author = OTHER,
+    _counter = 1,
+    _eventType = SF.LootLogEventTypes.CHARACTER_LINK,
+    _data = {
+        memberA = ALT_C,
+        memberB = ALT_D,
+        adminMembersAtLink = { ALT_A },
+        preOpAuthorMax = { { author = "OWNER-Garona", counter = 6 } },
+    },
+    _id = OTHER .. ":1",
+}
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+assertTrue(profile:MergeLogTables({
+    {
+        version = 2,
+        _timestamp = aliasEarly._timestamp,
+        _author = aliasEarly._author,
+        _counter = aliasEarly._counter,
+        _eventType = aliasEarly._eventType,
+        _data = aliasEarly._data,
+        _id = aliasEarly._id,
+        _fingerprint = SF.LootLog.ComputeFingerprintFromTable(aliasEarly),
+    },
+    {
+        version = 2,
+        _timestamp = aliasLink._timestamp,
+        _author = aliasLink._author,
+        _counter = aliasLink._counter,
+        _eventType = aliasLink._eventType,
+        _data = aliasLink._data,
+        _id = aliasLink._id,
+        _fingerprint = SF.LootLog.ComputeFingerprintFromTable(aliasLink),
+    },
+}) > 0, "alias authors share one causal stream")
+assertTrue(profile:AreSameIdentity(ALT_C, ALT_D), "canonical author keys keep one causal stream")
+end
+runCorrectnessHardeningTests()
+
 -- ---------------------------------------------------------------------------
 -- Protocol
 -- ---------------------------------------------------------------------------

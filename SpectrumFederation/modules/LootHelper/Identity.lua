@@ -37,6 +37,14 @@ local function SamePlayer(a, b)
     return a == b
 end
 
+local function CanonicalAuthorKey(author)
+    local norm = NormalizeId(author)
+    if not norm then
+        return nil
+    end
+    return string.lower(norm)
+end
+
 local function SortedUnique(ids)
     local seen = {}
     local out = {}
@@ -151,18 +159,33 @@ function Identity.CompareLogs(a, b)
     return aId < bId
 end
 
--- Causal-then-deterministic order: per-author counters, then writer-observed
--- preOpAuthorMax predecessors, then CompareLogs among ready events.
+-- Causal-then-deterministic order: per-author counters, writer-observed
+-- preOpAuthorMax, sourceLogId grant edges, then CompareLogs among ready events.
+-- Ready selection is a binary min-heap so the Kahn walk is O(n log n).
 function Identity.OrderLogs(logs)
     if type(logs) ~= "table" then
+        Identity.lastOrderStats = { n = 0, readyPops = 0, heapOps = 0, cacheHit = false }
         return {}
     end
     local n = #logs
-    local ordered = {}
     if n == 0 then
-        return ordered
+        Identity.lastOrderStats = { n = 0, readyPops = 0, heapOps = 0, cacheHit = false }
+        return {}
     end
 
+    local cache = Identity._orderCache
+    if cache and cache.logs == logs and cache.n == n and cache.last == logs[n] then
+        Identity.lastOrderStats = {
+            n = n,
+            readyPops = cache.readyPops or n,
+            heapOps = cache.heapOps or 0,
+            cacheHit = true,
+        }
+        return cache.ordered
+    end
+
+    local ordered = {}
+    local heapOps = 0
     local idOf = {}
     local byId = {}
     for i = 1, n do
@@ -178,33 +201,54 @@ function Identity.OrderLogs(logs)
     local byAuthor = {}
     for i = 1, n do
         local log = logs[i]
-        local author = GetLogAuthor(log)
+        local key = CanonicalAuthorKey(GetLogAuthor(log) or (log and log._author))
         local counter = tonumber(GetLogCounter(log))
-        if author and counter then
-            byAuthor[author] = byAuthor[author] or {}
-            local existing = byAuthor[author][counter]
+        if key and counter then
+            local bucket = byAuthor[key]
+            if not bucket then
+                bucket = { byCounter = {}, sorted = {} }
+                byAuthor[key] = bucket
+            end
+            local existing = bucket.byCounter[counter]
             if not existing or Identity.CompareLogs(log, existing) then
-                byAuthor[author][counter] = log
+                bucket.byCounter[counter] = log
             end
         end
     end
+    for _, bucket in pairs(byAuthor) do
+        local sorted = bucket.sorted
+        for counter in pairs(bucket.byCounter) do
+            sorted[#sorted + 1] = counter
+        end
+        table.sort(sorted)
+    end
 
     local function bestAtOrBefore(author, counter)
-        local counters = byAuthor[author]
-        if not counters then
+        local key = CanonicalAuthorKey(author)
+        local bucket = key and byAuthor[key]
+        if not bucket then
             return nil
         end
-        if counters[counter] then
-            return counters[counter]
+        local exact = bucket.byCounter[counter]
+        if exact then
+            return exact
         end
-        local bestC, best = nil, nil
-        for c, log in pairs(counters) do
-            if c <= counter and (not bestC or c > bestC) then
-                bestC = c
-                best = log
+        local sorted = bucket.sorted
+        local lo, hi, best = 1, #sorted, nil
+        while lo <= hi do
+            local mid = math.floor((lo + hi) / 2)
+            local c = sorted[mid]
+            if c <= counter then
+                best = c
+                lo = mid + 1
+            else
+                hi = mid - 1
             end
         end
-        return best
+        if not best then
+            return nil
+        end
+        return bucket.byCounter[best]
     end
 
     local indegree = {}
@@ -235,7 +279,7 @@ function Identity.OrderLogs(logs)
 
     for i = 1, n do
         local log = logs[i]
-        local author = GetLogAuthor(log)
+        local author = GetLogAuthor(log) or (log and log._author)
         local counter = tonumber(GetLogCounter(log))
         if author and counter then
             addEdge(bestAtOrBefore(author, counter - 1), log)
@@ -246,7 +290,7 @@ function Identity.OrderLogs(logs)
             for j = 1, #pre do
                 local entry = pre[j]
                 if type(entry) == "table" then
-                    local pAuthor = NormalizeId(entry.author) or entry.author
+                    local pAuthor = entry.author
                     local pCounter = tonumber(entry.counter)
                     if type(pAuthor) == "string" and pAuthor ~= "" and pCounter then
                         addEdge(bestAtOrBefore(pAuthor, pCounter), log)
@@ -254,37 +298,99 @@ function Identity.OrderLogs(logs)
                 end
             end
         end
+        local sourceLogId = data and data.sourceLogId
+        if type(sourceLogId) == "string" and sourceLogId ~= "" then
+            local sourceLog = byId[sourceLogId]
+            if sourceLog then
+                addEdge(sourceLog, log)
+            end
+        end
+    end
+
+    local heap = {}
+    local function heapLess(i, j)
+        return Identity.CompareLogs(heap[i].log, heap[j].log)
+    end
+    local function heapSwap(i, j)
+        heap[i], heap[j] = heap[j], heap[i]
+        heapOps = heapOps + 1
+    end
+    local function heapUp(i)
+        while i > 1 do
+            local parent = math.floor(i / 2)
+            if not heapLess(i, parent) then
+                break
+            end
+            heapSwap(i, parent)
+            i = parent
+        end
+    end
+    local function heapDown(i)
+        local size = #heap
+        while true do
+            local left = i * 2
+            local right = left + 1
+            local smallest = i
+            if left <= size and heapLess(left, smallest) then
+                smallest = left
+            end
+            if right <= size and heapLess(right, smallest) then
+                smallest = right
+            end
+            if smallest == i then
+                break
+            end
+            heapSwap(i, smallest)
+            i = smallest
+        end
+    end
+    local function heapPush(id, log)
+        heap[#heap + 1] = { id = id, log = log }
+        heapOps = heapOps + 1
+        heapUp(#heap)
+    end
+    local function heapPop()
+        local size = #heap
+        if size == 0 then
+            return nil, nil
+        end
+        local top = heap[1]
+        heap[1] = heap[size]
+        heap[size] = nil
+        heapOps = heapOps + 1
+        if #heap > 0 then
+            heapDown(1)
+        end
+        return top.id, top.log
     end
 
     local remaining = {}
     for i = 1, n do
-        remaining[idOf[logs[i]]] = logs[i]
-    end
-
-    local function pickReady()
-        local bestId, bestLog = nil, nil
-        for id, log in pairs(remaining) do
-            if (indegree[id] or 0) <= 0 then
-                if not bestLog or Identity.CompareLogs(log, bestLog) then
-                    bestId = id
-                    bestLog = log
-                end
-            end
+        local id = idOf[logs[i]]
+        remaining[id] = logs[i]
+        if (indegree[id] or 0) <= 0 then
+            heapPush(id, logs[i])
         end
-        return bestId, bestLog
     end
 
+    local readyPops = 0
     while true do
-        local id, log = pickReady()
+        local id, log = heapPop()
         if not log then
             break
         end
-        ordered[#ordered + 1] = log
-        remaining[id] = nil
-        local succs = successors[id] or {}
-        for i = 1, #succs do
-            local sid = succs[i]
-            indegree[sid] = (indegree[sid] or 0) - 1
+        if remaining[id] then
+            readyPops = readyPops + 1
+            ordered[#ordered + 1] = log
+            remaining[id] = nil
+            local succs = successors[id] or {}
+            for i = 1, #succs do
+                local sid = succs[i]
+                indegree[sid] = (indegree[sid] or 0) - 1
+                if remaining[sid] and (indegree[sid] or 0) <= 0 then
+                    heapPush(sid, remaining[sid])
+                end
+            end
         end
     end
 
@@ -303,6 +409,22 @@ function Identity.OrderLogs(logs)
             ordered[#ordered + 1] = leftover[i]
         end
     end
+
+    Identity.lastOrderStats = {
+        n = n,
+        readyPops = readyPops,
+        heapOps = heapOps,
+        leftover = #leftover,
+        cacheHit = false,
+    }
+    Identity._orderCache = {
+        logs = logs,
+        n = n,
+        last = logs[n],
+        ordered = ordered,
+        readyPops = readyPops,
+        heapOps = heapOps,
+    }
     return ordered
 end
 
@@ -473,6 +595,37 @@ local function CloneOcc(occ)
     }
 end
 
+local function MergeFamily(dst, src)
+    dst.overflow = (dst.overflow or 0) + (src.overflow or 0)
+    for i = 1, 2 do
+        if src.occupied[i] then
+            if dst.occupied[i] then
+                dst.overflow = dst.overflow + 1
+            else
+                dst.occupied[i] = true
+            end
+        end
+    end
+end
+
+local function MergeOcc(dst, src)
+    MergeFamily(dst.ring, src.ring)
+    MergeFamily(dst.trinket, src.trinket)
+    for slot, state in pairs(src.ordinary) do
+        local current = dst.ordinary[slot]
+        local dstCount = 0
+        if current then
+            dstCount = (current.occupied and 1 or 0) + (current.overflow or 0)
+        end
+        local srcCount = (state.occupied and 1 or 0) + (state.overflow or 0)
+        local total = dstCount + srcCount
+        dst.ordinary[slot] = {
+            occupied = total > 0,
+            overflow = math.max(0, total - 1),
+        }
+    end
+end
+
 local function FamilyForSlot(slot)
     if RING_INDEX[slot] then
         return "ring", RING_INDEX[slot]
@@ -499,10 +652,13 @@ local function CompareOrigin(a, b)
     return tostring(a.slot) < tostring(b.slot)
 end
 
-local function PackLocals(memberIds, localArmor, localOrigin)
+local function PackLocals(memberIds, localArmor, localOrigin, familyFilter)
     local occ = NewIdentityOcc()
     local ringUsages = {}
     local trinketUsages = {}
+    local packOrdinary = (not familyFilter) or familyFilter == "ordinary"
+    local packRing = (not familyFilter) or familyFilter == "ring"
+    local packTrinket = (not familyFilter) or familyFilter == "trinket"
 
     for i = 1, #memberIds do
         local memberId = memberIds[i]
@@ -511,19 +667,19 @@ local function PackLocals(memberIds, localArmor, localOrigin)
         for slot, used in pairs(armor) do
             if used then
                 local family = FamilyForSlot(slot)
-                if family == "ring" then
+                if family == "ring" and packRing then
                     ringUsages[#ringUsages + 1] = {
                         log = origin[slot],
                         member = memberId,
                         slot = slot,
                     }
-                elseif family == "trinket" then
+                elseif family == "trinket" and packTrinket then
                     trinketUsages[#trinketUsages + 1] = {
                         log = origin[slot],
                         member = memberId,
                         slot = slot,
                     }
-                else
+                elseif family == "ordinary" and packOrdinary then
                     local state = occ.ordinary[slot]
                     if not state then
                         state = { occupied = false, overflow = 0 }
@@ -685,30 +841,6 @@ local function IdentityEventSupersededByLocals(ev, ids, localOrigin)
         return false
     end
     return Identity.CompareLogs(ev.log, latest)
-end
-
-local function OutsidersHaveLocalUse(ids, insiderSet, slot, localArmor)
-    local family = FamilyForSlot(slot)
-    for i = 1, #ids do
-        local memberId = ids[i]
-        if not insiderSet[memberId] then
-            local armor = localArmor[memberId] or {}
-            if family == "ordinary" then
-                if armor[slot] then
-                    return true
-                end
-            elseif family == "ring" then
-                if armor.Ring1 or armor.Ring2 then
-                    return true
-                end
-            elseif family == "trinket" then
-                if armor.Trinket1 or armor.Trinket2 then
-                    return true
-                end
-            end
-        end
-    end
-    return false
 end
 
 local function EventTypes()
@@ -949,6 +1081,28 @@ function Identity.UnrosteredAttributedMembers(logs, rosterSet)
     return out
 end
 
+function Identity.AttributedMemberIds(logs)
+    local found = {}
+    for i = 1, #(logs or {}) do
+        local data = GetLogData(logs[i])
+        if type(data) == "table" then
+            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember }
+            for j = 1, #candidates do
+                local id = NormalizeId(candidates[j])
+                if id then
+                    found[id] = true
+                end
+            end
+        end
+    end
+    local out = {}
+    for id in pairs(found) do
+        out[#out + 1] = id
+    end
+    table.sort(out)
+    return out
+end
+
 function Identity.NormalizeMemberId(id)
     return NormalizeId(id)
 end
@@ -966,14 +1120,30 @@ function Identity.SnapshotPreOpAuthorMax(profile)
     if type(profile) ~= "table" or type(profile._authorCounters) ~= "table" then
         return out
     end
+    local byKey = {}
     for author, counter in pairs(profile._authorCounters) do
         local n = tonumber(counter)
         if type(author) == "string" and author ~= "" and n and n > 0 then
-            out[#out + 1] = {
-                author = NormalizeId(author) or author,
-                counter = math.floor(n),
-            }
+            local key = CanonicalAuthorKey(author)
+            local display = NormalizeId(author) or author
+            if key then
+                local existing = byKey[key]
+                local floorN = math.floor(n)
+                if not existing then
+                    byKey[key] = { author = display, counter = floorN }
+                else
+                    if floorN > existing.counter then
+                        existing.counter = floorN
+                        existing.author = display
+                    elseif floorN == existing.counter and tostring(display) < tostring(existing.author) then
+                        existing.author = display
+                    end
+                end
+            end
         end
+    end
+    for _, entry in pairs(byKey) do
+        out[#out + 1] = entry
     end
     table.sort(out, function(a, b)
         return tostring(a.author) < tostring(b.author)
@@ -1193,6 +1363,8 @@ function Identity.Replay(logs, opts)
             elseif eventType == types.CHARACTER_LINK then
                 local memberA = ensureLocal(data.memberA)
                 local memberB = ensureLocal(data.memberB)
+                local alreadyUnified = memberA and memberB
+                    and FindRoot(partition, memberA) == FindRoot(partition, memberB)
                 local preA = ComponentList(partition, memberA)
                 local preB = ComponentList(partition, memberB)
                 if RelationshipAuthorizedAt(log, eventType, data, partition, simulated, auth, owner) then
@@ -1228,11 +1400,16 @@ function Identity.Replay(logs, opts)
                     if type(linkId) == "string" and linkId ~= "" then
                         appliedRelationshipIds[linkId] = true
                     end
-                    if preAHasAdmin then
-                        ImplyIdentityAdmins(preB, simulated, owner, impliedAdminSource, linkId)
-                    end
-                    if preBHasAdmin then
-                        ImplyIdentityAdmins(preA, simulated, owner, impliedAdminSource, linkId)
+                    -- Redundant LINKs remain valid history and may source a
+                    -- writer grant, but they are not a new admin-propagation
+                    -- boundary. Do not imply across an already-unified component.
+                    if not alreadyUnified then
+                        if preAHasAdmin then
+                            ImplyIdentityAdmins(preB, simulated, owner, impliedAdminSource, linkId)
+                        end
+                        if preBHasAdmin then
+                            ImplyIdentityAdmins(preA, simulated, owner, impliedAdminSource, linkId)
+                        end
                     end
                 end
             elseif eventType == types.CHARACTER_UNLINK then
@@ -1344,11 +1521,7 @@ function Identity.Replay(logs, opts)
             if attendanceTotal < 0 then
                 attendanceTotal = 0
             end
-            local occ = PackLocals(ids, localArmor, localOrigin)
             local idSet = ListToSet(ids)
-            -- Apply the latest in-scope correction per original identity+slot.
-            -- USED then AVAILABLE must not leave a stacked USED when the later
-            -- AVAILABLE is skipped because a later joiner has local use.
             local latestByKey = {}
             for j = 1, #identityArmorEvents do
                 local ev = identityArmorEvents[j]
@@ -1362,21 +1535,74 @@ function Identity.Replay(logs, opts)
                     end
                 end
             end
-            local netEvents = {}
+            -- Corrections occupy their recorded identityMembers scope, then
+            -- merge. A same-component AVAILABLE cannot clear another scope's
+            -- USED, and it cannot resurrect locals it already suppressed.
+            local scopes = {}
             for _, ev in pairs(latestByKey) do
-                netEvents[#netEvents + 1] = ev
+                local scopeKey = IdentityMembersKey(ev.identityMembers)
+                local scope = scopes[scopeKey]
+                if not scope then
+                    scope = { members = ev.identityMembers, events = {} }
+                    scopes[scopeKey] = scope
+                end
+                scope.events[#scope.events + 1] = ev
             end
-            table.sort(netEvents, function(a, b)
-                return Identity.CompareLogs(a.log, b.log)
-            end)
-            for j = 1, #netEvents do
-                local ev = netEvents[j]
-                local skipAvailable = ev.action == actions.AVAILABLE
-                    and OutsidersHaveLocalUse(ids, ListToSet(ev.identityMembers), ev.slot, localArmor)
-                if not skipAvailable then
-                    ApplyIdentityArmor(occ, ev.slot, ev.action)
+            local scopeOrder = {}
+            for scopeKey in pairs(scopes) do
+                scopeOrder[#scopeOrder + 1] = scopeKey
+            end
+            table.sort(scopeOrder)
+            local occ = NewIdentityOcc()
+            local claimed = { ordinary = {}, ring = {}, trinket = {} }
+            for s = 1, #scopeOrder do
+                local scope = scopes[scopeOrder[s]]
+                local scopeIds = {}
+                for j = 1, #scope.members do
+                    local scopeMember = scope.members[j]
+                    if idSet[scopeMember] then
+                        scopeIds[#scopeIds + 1] = scopeMember
+                    end
+                end
+                table.sort(scopeIds)
+                local byFamily = { ordinary = {}, ring = {}, trinket = {} }
+                for j = 1, #scope.events do
+                    local ev = scope.events[j]
+                    local family = FamilyForSlot(ev.slot)
+                    byFamily[family][#byFamily[family] + 1] = ev
+                end
+                local families = { "ordinary", "ring", "trinket" }
+                for f = 1, #families do
+                    local family = families[f]
+                    local familyEvents = byFamily[family]
+                    if #familyEvents > 0 then
+                        for j = 1, #scopeIds do
+                            claimed[family][scopeIds[j]] = true
+                        end
+                        local packed = PackLocals(scopeIds, localArmor, localOrigin, family)
+                        table.sort(familyEvents, function(a, b)
+                            return Identity.CompareLogs(a.log, b.log)
+                        end)
+                        for j = 1, #familyEvents do
+                            local ev = familyEvents[j]
+                            ApplyIdentityArmor(packed, ev.slot, ev.action)
+                        end
+                        MergeOcc(occ, packed)
+                    end
                 end
             end
+            local function leftoverIds(family)
+                local leftover = {}
+                for j = 1, #ids do
+                    if not claimed[family][ids[j]] then
+                        leftover[#leftover + 1] = ids[j]
+                    end
+                end
+                return leftover
+            end
+            MergeOcc(occ, PackLocals(leftoverIds("ordinary"), localArmor, localOrigin, "ordinary"))
+            MergeOcc(occ, PackLocals(leftoverIds("ring"), localArmor, localOrigin, "ring"))
+            MergeOcc(occ, PackLocals(leftoverIds("trinket"), localArmor, localOrigin, "trinket"))
             occByRoot[root] = occ
             overflowByIdentity[root] = IdentityHasOverflow(occ)
             overflowKeysByIdentity[root] = OverflowKeys(occ)
@@ -1414,6 +1640,7 @@ function Identity.Replay(logs, opts)
         restoredSources = restoredSources,
         appliedRelationshipIds = appliedRelationshipIds,
         impliedAdminSource = impliedAdminSource,
+        orderedLogs = ordered,
         overflowByIdentity = overflowByIdentity,
         overflowKeysByIdentity = overflowKeysByIdentity,
         overflowCountsByIdentity = overflowCountsByIdentity,
@@ -1574,7 +1801,7 @@ function Identity.ApplyCanonicalAdmins(profile, result)
             adminSet[id] = true
         end
     end
-    local orderedLogs = Identity.OrderLogs(logs)
+    local orderedLogs = (result and result.orderedLogs) or Identity.OrderLogs(logs)
     for i = 1, #orderedLogs do
         local log = orderedLogs[i]
         local eventType = GetLogType(log)

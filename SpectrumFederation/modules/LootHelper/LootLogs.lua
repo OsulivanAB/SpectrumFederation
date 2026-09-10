@@ -532,6 +532,15 @@ function LootLog.new(eventType, eventData, opts)
                 eventData.preOpAuthorMax = {}
             end
         end
+        if eventType == EVENT_TYPES.CHARACTER_LINK then
+            if not SF.LootLogValidators.ValidateCharacterLinkData(eventData) then
+                return nil
+            end
+        elseif eventType == EVENT_TYPES.CHARACTER_UNLINK then
+            if not SF.LootLogValidators.ValidateCharacterUnlinkData(eventData) then
+                return nil
+            end
+        end
     end
 
     local timestamp = opts.timestamp or GetServerTime()
@@ -868,6 +877,10 @@ function LootLog.ValidateTable(t, opts)
         if t._fingerprint ~= computedFingerprint then
             if opts.allowMainSwapFingerprintNormalize and LootLog.TryNormalizeMainSwapStaleFingerprintTable(t, opts.mainSwapLineage) then
                 computedFingerprint = t._fingerprint
+            elseif opts.allowMainSwapFingerprintNormalize
+                and LootLog.TryNormalizeOrphanRewriteStaleFingerprintTable(t, opts.orphanRewriteCandidates)
+            then
+                computedFingerprint = t._fingerprint
             else
                 return false, ("log._fingerprint mismatch (expected %s, got %s)"):format(
                     tostring(computedFingerprint),
@@ -1024,6 +1037,80 @@ function LootLog.TryNormalizeMainSwapStaleFingerprint(log, lineage)
         SF.Debug:Warn("LOOTLOG", "Unrelated sequential fingerprint mismatch left unnormalized (id=%s)", tostring(log._id))
     end
     return false
+end
+
+function LootLog.TryNormalizeOrphanRewriteStaleFingerprintTable(t, candidates)
+    if type(t) ~= "table" then
+        return false
+    end
+    if LootLog.IsExternalLogTable(t) or t._eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+        return false
+    end
+    if type(t._fingerprint) ~= "number" then
+        return false
+    end
+    if type(t._data) ~= "table" or type(t._data.member) ~= "string" then
+        return false
+    end
+    if type(candidates) ~= "table" or #candidates == 0 then
+        return false
+    end
+    local computed = ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, t._data)
+    if computed == t._fingerprint then
+        return false
+    end
+    local current = t._data.member
+    local matchCount = 0
+    local seen = {}
+    for i = 1, #candidates do
+        local candidate = candidates[i]
+        if type(candidate) == "string" and candidate ~= "" then
+            local seenKey = string.lower(candidate)
+            if not seen[seenKey] and candidate ~= current then
+                seen[seenKey] = true
+                local trial = CopyEventData(t._data)
+                trial.member = candidate
+                local trialFp = ComputeFingerprintFromFields(t._timestamp, t._author, t._counter, t._eventType, trial)
+                if trialFp == t._fingerprint then
+                    matchCount = matchCount + 1
+                    if matchCount > 1 then
+                        return false
+                    end
+                end
+            end
+        end
+    end
+    if matchCount ~= 1 then
+        return false
+    end
+    t._fingerprint = computed
+    return true
+end
+
+function LootLog.TryNormalizeOrphanRewriteStaleFingerprint(log, candidates)
+    if type(log) ~= "table" then
+        return false
+    end
+    if type(log._externalId) == "string" and log._externalId ~= "" then
+        return false
+    end
+    local eventType = log.GetEventType and log:GetEventType() or log._eventType
+    if eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+        return false
+    end
+    local t = {
+        _fingerprint = log._fingerprint,
+        _timestamp = log.GetTimestamp and log:GetTimestamp() or log._timestamp,
+        _author = log.GetAuthor and log:GetAuthor() or log._author,
+        _counter = log.GetCounter and log:GetCounter() or log._counter,
+        _eventType = eventType,
+        _data = log.GetEventData and log:GetEventData() or log._data,
+    }
+    if not LootLog.TryNormalizeOrphanRewriteStaleFingerprintTable(t, candidates) then
+        return false
+    end
+    log._fingerprint = t._fingerprint
+    return true
 end
 
 -- ============================================================================

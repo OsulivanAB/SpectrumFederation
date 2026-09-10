@@ -687,6 +687,16 @@ function LootProfile:RebuildLogIndex()
             SF.LootLog.TryNormalizeMainSwapStaleFingerprint(log, lineage)
         end
     end
+    if SF.LootLog and SF.LootLog.TryNormalizeOrphanRewriteStaleFingerprint
+        and SF.LootHelperIdentity and SF.LootHelperIdentity.AttributedMemberIds
+    then
+        local candidates = SF.LootHelperIdentity.AttributedMemberIds(self._lootLogs)
+        if #candidates > 0 then
+            for _, log in ipairs(self._lootLogs or {}) do
+                SF.LootLog.TryNormalizeOrphanRewriteStaleFingerprint(log, candidates)
+            end
+        end
+    end
 
     for i, log in ipairs(self._lootLogs or {}) do
         local id = log.GetID and log:GetID() or log._id
@@ -2730,19 +2740,27 @@ function LootProfile:MergeLogTables(logTables, opts)
     if type(logTables) ~= "table" then return 0 end
 
     opts = opts or {}
-    if opts.allowMainSwapFingerprintNormalize and SF.LootHelperIdentity and SF.LootHelperIdentity.BuildMainSwapLineage then
-        if type(opts.mainSwapLineage) ~= "table" or #opts.mainSwapLineage == 0 then
-            local lineageSource = {}
-            for _, log in ipairs(self._lootLogs or {}) do
-                lineageSource[#lineageSource + 1] = log
-            end
-            for _, t in ipairs(logTables) do
-                lineageSource[#lineageSource + 1] = t
-            end
+    if opts.allowMainSwapFingerprintNormalize and SF.LootHelperIdentity then
+        local lineageSource = {}
+        for _, log in ipairs(self._lootLogs or {}) do
+            lineageSource[#lineageSource + 1] = log
+        end
+        for _, t in ipairs(logTables) do
+            lineageSource[#lineageSource + 1] = t
+        end
+        if SF.LootHelperIdentity.BuildMainSwapLineage
+            and (type(opts.mainSwapLineage) ~= "table" or #opts.mainSwapLineage == 0)
+        then
             local lineage = SF.LootHelperIdentity.BuildMainSwapLineage(lineageSource)
             if lineage and #lineage > 0 then
                 opts = CopyTableShallow(opts)
                 opts.mainSwapLineage = lineage
+            end
+        end
+        if type(opts.orphanRewriteCandidates) ~= "table" or #opts.orphanRewriteCandidates == 0 then
+            if SF.LootHelperIdentity.AttributedMemberIds then
+                opts = CopyTableShallow(opts)
+                opts.orphanRewriteCandidates = SF.LootHelperIdentity.AttributedMemberIds(lineageSource)
             end
         end
     end
