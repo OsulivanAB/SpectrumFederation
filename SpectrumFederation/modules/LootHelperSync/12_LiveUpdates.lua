@@ -171,8 +171,9 @@ function Sync:_LiveRelationshipPredecessorState(profileId, logTable)
             known[author] = tonumber(maxCounter) or 0
         end
     end
+    local localMax = {}
     if type(self.ComputeAuthorMax) == "function" then
-        local localMax = self:ComputeAuthorMax(profileId) or {}
+        localMax = self:ComputeAuthorMax(profileId) or {}
         for author, maxCounter in pairs(localMax) do
             known[author] = math.max(known[author] or 0, tonumber(maxCounter) or 0)
         end
@@ -193,8 +194,57 @@ function Sync:_LiveRelationshipPredecessorState(profileId, logTable)
     if type(incomingAuthor) == "string" and type(incomingCounter) == "number" then
         known[incomingAuthor] = math.min(tonumber(known[incomingAuthor]) or incomingCounter, incomingCounter)
     end
-    local missing = self:ComputeMissingLogRequests(contig, known, localMax)
-    if type(missing) == "table" and #missing > 0 then
+    -- Logical catch-up uses contig vs writer-observed known heads, including
+    -- preOpAuthorMax. Exact-spelling completeness must use advertised authorMax
+    -- plus ComputeAuthorMax, and only for authors this event actually depends
+    -- on. Scanning every advertised peer would defer an unrelated live LINK.
+    local missing = self:ComputeMissingLogRequests(contig, known) or {}
+    local rawForAlias = {}
+    for author, maxCounter in pairs(localMax) do
+        rawForAlias[author] = tonumber(maxCounter) or 0
+    end
+    if type(incomingAuthor) == "string" and type(incomingCounter) == "number" then
+        rawForAlias[incomingAuthor] = math.max(tonumber(rawForAlias[incomingAuthor]) or 0, incomingCounter)
+    end
+    local aliasRemote = {}
+    local advertised = self.state.authorMax or {}
+    local Identity = SF.LootHelperIdentity
+    local function takeAdvertisedAliases(author)
+        if type(author) ~= "string" or author == "" then
+            return
+        end
+        for auth, maxCounter in pairs(advertised) do
+            maxCounter = tonumber(maxCounter)
+            if type(auth) == "string" and maxCounter then
+                local match = auth == author
+                if Identity and Identity.SameAuthor then
+                    match = Identity.SameAuthor(auth, author)
+                end
+                if match then
+                    local prev = tonumber(aliasRemote[auth]) or 0
+                    if maxCounter > prev then
+                        aliasRemote[auth] = maxCounter
+                    end
+                end
+            end
+        end
+    end
+    takeAdvertisedAliases(incomingAuthor)
+    if type(eventData) == "table" and type(eventData.preOpAuthorMax) == "table" then
+        for i = 1, #eventData.preOpAuthorMax do
+            local entry = eventData.preOpAuthorMax[i]
+            if type(entry) == "table" then
+                takeAdvertisedAliases(entry.author)
+            end
+        end
+    end
+    local aliasMissing = self:ComputeMissingLogRequests(contig, aliasRemote, rawForAlias)
+    if type(aliasMissing) == "table" then
+        for i = 1, #aliasMissing do
+            missing[#missing + 1] = aliasMissing[i]
+        end
+    end
+    if #missing > 0 then
         return false, missing, false, nil, nil
     end
     return true, nil, false, nil, nil

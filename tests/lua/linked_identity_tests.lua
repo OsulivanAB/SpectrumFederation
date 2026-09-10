@@ -4490,6 +4490,41 @@ local behindMissing, behindIntegrity = discoverFrom(destBehind, profile)
 assertTrue(rangeForAuthor(behindMissing, "owner-Garona") ~= nil, "production missing-range discovers behind alias spelling")
 assertTrue(rangeForAuthor(behindIntegrity, "owner-Garona") ~= nil, "integrity also discovers behind alias spelling")
 
+resetEnv()
+profile = makeProfile("LivePredBehind")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+for i = 2, 3 do
+    assertTrue(profile:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = i,
+    }, { author = OWNER, counter = i, timestamp = 1700008290 + i }) }) > 0, "live-pred Owner-Garona:" .. tostring(i))
+end
+assertTrue(profile:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+}, { author = "owner-Garona", counter = 1, timestamp = 1700008301 }) }) > 0, "live-pred owner-Garona:1")
+if profile.RebuildLogIndex then
+    profile:RebuildLogIndex()
+end
+setActive(profile)
+activateSession(profile)
+local liveContig = Sync:ComputeContigAuthorMax(profile:GetProfileId())
+assertEq(liveContig["owner-Garona"], 3, "live contig stamps the behind alias")
+assertEq(profile:ComputeAuthorMax()["owner-Garona"], 1, "live raw max for the behind alias is 1")
+Sync.state.authorMax = { [OWNER] = 3, ["owner-Garona"] = 3 }
+local livePredLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OWNER },
+    preOpAuthorMax = { { author = "owner-Garona", counter = 3 } },
+}, { author = OWNER, counter = 4, timestamp = 1700008400 })
+local liveReady, liveMissing = Sync:_LiveRelationshipPredecessorState(profile:GetProfileId(), livePredLink)
+assertFalse(liveReady, "live predecessor waits for behind raw alias rows")
+assertTrue(rangeForAuthor(liveMissing, "owner-Garona") ~= nil, "live predecessor requests the behind alias spelling")
+
 -- OrderLogs retains both rows at one logical counter
 resetEnv()
 local pointX = {
