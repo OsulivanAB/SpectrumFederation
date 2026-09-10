@@ -107,12 +107,14 @@ loadModule("SpectrumFederation/modules/LootHelper/SyncProtocol.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/00_Namespace.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/01_Constants.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/02_State.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/05_Scheduling.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/16_ProfileIntegration.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/08_Requests.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/12_LiveUpdates.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/10_Handshake.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/15_HandlersBulk.lua")
 
@@ -144,7 +146,13 @@ SF.Debug = {
 }
 
 local Sync = SF.LootHelperSync
-local ProductionBroadcastSessionHeartbeat = Sync.BroadcastSessionHeartbeat
+local ProductionSync = {
+    BroadcastSessionHeartbeat = Sync.BroadcastSessionHeartbeat,
+    QueueRepairRanges = Sync.QueueRepairRanges,
+    GetRequestTargets = Sync.GetRequestTargets,
+    SendJoinStatus = Sync.SendJoinStatus,
+    ProcessRepairConvergenceTick = Sync._ProcessRepairConvergenceTick,
+}
 local deferredAfter = {}
 function Sync:FindLocalProfileById(profileId)
     return SF.lootHelperDB and SF.lootHelperDB.profiles and SF.lootHelperDB.profiles[profileId]
@@ -4302,6 +4310,7 @@ local function applyDiscoveredRange(src, dst, req, requestId)
         author = req.author,
         fromCounter = req.fromCounter,
         toCounter = req.toCounter,
+        exactAuthor = req.exactAuthor == true or nil,
     })
     local served = findCaptured(Sync.MSG.AUTH_LOGS)
     assertTrue(served ~= nil, "discovered range produced AUTH_LOGS for " .. tostring(req.author))
@@ -4315,6 +4324,7 @@ local function applyDiscoveredRange(src, dst, req, requestId)
             author = req.author,
             fromCounter = req.fromCounter,
             toCounter = req.toCounter,
+            exactAuthor = req.exactAuthor == true or nil,
         },
     }
     served.payload.sessionId = "SES1"
@@ -4395,10 +4405,12 @@ local overlapMissing = Sync:ComputeMissingLogRequests(
 assertTrue(rangeForAuthor(overlapMissing, "owner-Garona") ~= nil, "missing-range discovers owner-Garona when logical max already matches")
 assertEq(rangeForAuthor(overlapMissing, "owner-Garona").fromCounter, 1, "alias completeness requests 1..remoteMax")
 assertEq(rangeForAuthor(overlapMissing, "owner-Garona").toCounter, 1, "alias completeness stops at remote max")
+assertTrue(rangeForAuthor(overlapMissing, "owner-Garona").exactAuthor == true, "alias completeness is exact raw-author repair")
 local catchUp = Sync:ComputeMissingLogRequests({ ["owner-Garona"] = 6 }, { [OWNER] = 7 })
 assertEq(#catchUp, 1, "logical catch-up still requests one range")
 assertEq(catchUp[1].fromCounter, 7, "logical catch-up still starts at 7")
 assertEq(catchUp[1].toCounter, 7, "logical catch-up still ends at 7")
+assertTrue(catchUp[1].exactAuthor ~= true, "logical catch-up is not exact-author repair")
 assertTrue(rangeForAuthor(catchUp, "owner-Garona") == nil, "logical catch-up does not request a 1-6 alias gap")
 local behindMissing = Sync:ComputeMissingLogRequests(
     { [OWNER] = 3, ["owner-Garona"] = 3, ["owner-garona"] = 3 },
@@ -4408,6 +4420,23 @@ local behindMissing = Sync:ComputeMissingLogRequests(
 assertTrue(rangeForAuthor(behindMissing, "owner-Garona") ~= nil, "behind-but-present alias is not treated as complete")
 assertEq(rangeForAuthor(behindMissing, "owner-Garona").fromCounter, 1, "behind alias requests from 1")
 assertEq(rangeForAuthor(behindMissing, "owner-Garona").toCounter, 3, "behind alias requests through remote max")
+assertTrue(rangeForAuthor(behindMissing, "owner-Garona").exactAuthor == true, "behind alias completeness is exact-author repair")
+local mixedLogical = Sync:ComputeMissingLogRequests(
+    { ["owner-Garona"] = 5, [OWNER] = 7 },
+    { ["owner-Garona"] = 6, [OWNER] = 7 }
+)
+assertTrue(rangeForAuthor(mixedLogical, "owner-Garona") ~= nil, "real missing owner-Garona:6 is discovered beside Owner-Garona:7")
+assertEq(rangeForAuthor(mixedLogical, "owner-Garona").fromCounter, 1, "behind owner-Garona:6 requests from 1")
+assertEq(rangeForAuthor(mixedLogical, "owner-Garona").toCounter, 6, "behind owner-Garona:6 requests through remote max")
+assertTrue(rangeForAuthor(mixedLogical, "owner-Garona").exactAuthor == true, "owner-Garona:6 completeness is exact when logical head is already 7")
+local sequentialSix = Sync:ComputeMissingLogRequests(
+    { ["owner-Garona"] = 5 },
+    { ["owner-Garona"] = 6 }
+)
+assertEq(#sequentialSix, 1, "sequential owner-Garona:6 is one logical range")
+assertEq(sequentialSix[1].fromCounter, 6, "sequential owner-Garona:6 starts at 6")
+assertEq(sequentialSix[1].toCounter, 6, "sequential owner-Garona:6 ends at 6")
+assertTrue(sequentialSix[1].exactAuthor ~= true, "sequential owner-Garona:6 catch-up stays logical SameAuthor repair")
 
 -- Automatic discovery of overlapping Owner-Garona:1 / owner-Garona:1
 resetEnv()
@@ -4809,7 +4838,7 @@ local statusDup = Sync:BuildAdminStatus(profile:GetProfileId())
 assertFalse(statusDup.hasGaps, "duplicate Owner-Garona:1 / owner-Garona:1 is not a sequential gap")
 
 local function installHeartbeatCatchup(queued)
-    Sync.BroadcastSessionHeartbeat = ProductionBroadcastSessionHeartbeat
+    Sync.BroadcastSessionHeartbeat = ProductionSync.BroadcastSessionHeartbeat
     Sync.QueueRepairRanges = function(self, profileId, ranges, opts)
         opts = type(opts) == "table" and opts or {}
         self.state.repairQueue = self.state.repairQueue or { order = {}, items = {} }
@@ -4966,6 +4995,352 @@ applyDiscoveredRange(profile, memberBehind, {
 assertTrue(hasLogId(memberBehind, "owner-Garona:6"), "AUTH_LOGS transferred the real missing owner-Garona:6")
 assertEq(memberBehind:GetLogById("owner-Garona:6"):GetAuthor(), "owner-Garona", "transferred missing row keeps owner-Garona")
 restoreHeartbeatCatchup()
+
+local function runExactAuthorRepairRoutingTests()
+-- Exact vs logical outstanding coverage
+resetEnv()
+profile = makeProfile("ExactCoverage")
+addMember(profile, ALT_A)
+activateSession(profile)
+local pidCover = profile:GetProfileId()
+Sync.state.requests["REQ-LOGICAL"] = {
+    kind = "NEED_LOGS",
+    meta = {
+        profileId = pidCover,
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 1,
+    },
+}
+assertTrue(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, false), "logical outstanding covers logical overlap")
+assertFalse(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, true), "logical outstanding does not cover exact raw-author repair")
+Sync.state.requests["REQ-EXACT"] = {
+    kind = "NEED_LOGS",
+    meta = {
+        profileId = pidCover,
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 1,
+        exactAuthor = true,
+    },
+}
+assertTrue(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, true), "exact outstanding covers exact overlap")
+assertTrue(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, false), "exact outstanding can cover logical overlap")
+
+-- Three-peer production routing: helper cannot satisfy exact owner-Garona:1
+local MEMBER = "Member-Garona"
+local function outstandingCount()
+    local n = 0
+    for _ in pairs(Sync.state.requests or {}) do
+        n = n + 1
+    end
+    return n
+end
+local function installUniqueNonces()
+    local nonce = 0
+    function Sync:_NextNonce(tag)
+        nonce = nonce + 1
+        return tostring(tag or "N") .. tostring(nonce)
+    end
+end
+local function restoreUniqueNonces()
+    function Sync:_NextNonce(tag)
+        return tostring(tag or "N") .. "1"
+    end
+end
+
+resetEnv()
+installUniqueNonces()
+profile = makeProfile("ExactHelperStarvationA")
+addMember(profile, ALT_A)
+addMember(profile, OTHER)
+addMember(profile, MEMBER)
+assertTrue(profile:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 7,
+}, { author = "owner-Garona", counter = 1, timestamp = 1700020002 }) }) > 0, "coordinator stores owner-Garona:1")
+if profile.RebuildLogIndex then
+    profile:RebuildLogIndex()
+end
+profile._adminUsers = { OWNER, OTHER }
+assertTrue(hasLogId(profile, OWNER .. ":1"), "coordinator has Owner-Garona:1")
+assertTrue(hasLogId(profile, "owner-Garona:1"), "coordinator has owner-Garona:1")
+local yFpExact = profile:GetLogById("owner-Garona:1"):GetFingerprint()
+local helperOnly = cloneWithout(profile, "ExactHelperStarvationHelper", "owner-Garona:1")
+local memberOnly = cloneWithout(profile, "ExactHelperStarvationMember", "owner-Garona:1")
+helperOnly._adminUsers = { OWNER, OTHER }
+memberOnly._adminUsers = { OWNER, OTHER }
+assertTrue(hasLogId(helperOnly, OWNER .. ":1"), "helper keeps Owner-Garona:1")
+assertFalse(hasLogId(helperOnly, "owner-Garona:1"), "helper lacks owner-Garona:1")
+assertTrue(hasLogId(memberOnly, OWNER .. ":1"), "member keeps Owner-Garona:1")
+assertFalse(hasLogId(memberOnly, "owner-Garona:1"), "member lacks owner-Garona:1")
+
+local pidExact = profile:GetProfileId()
+local peers = {
+    [OWNER] = { profile = profile, isCoordinator = true },
+    [OTHER] = { profile = helperOnly, isCoordinator = false },
+    [MEMBER] = { profile = memberOnly, isCoordinator = false },
+}
+local function become(id)
+    PLAYER = id
+    local peer = peers[id]
+    registerProfile(peer.profile)
+    Sync.state.active = true
+    Sync.state.sessionId = "SES1"
+    Sync.state.profileId = pidExact
+    Sync.state.coordinator = OWNER
+    Sync.state.coordEpoch = 1
+    Sync.state.isCoordinator = peer.isCoordinator
+    Sync.state.helpers = { OTHER }
+end
+
+become(OTHER)
+activateSession(helperOnly)
+Sync.state.isCoordinator = false
+Sync.state.coordinator = OWNER
+Sync.state.helpers = { OTHER }
+PLAYER = OTHER
+capturedComm = {}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = "SES1",
+    profileId = pidExact,
+    requestId = "REQ-EXACT-HELPER",
+    exactAuthor = true,
+    missing = {
+        {
+            author = "owner-Garona",
+            fromCounter = 1,
+            toCounter = 1,
+            exactAuthor = true,
+        },
+    },
+})
+local helperServed = findCaptured(Sync.MSG.AUTH_LOGS)
+assertTrue(helperServed ~= nil, "exact NEED_LOGS to helper produced AUTH_LOGS")
+assertFalse(payloadHasAuthor(helperServed.payload, "owner-Garona"), "helper does not substitute Owner-Garona for exact owner-Garona")
+assertFalse(payloadHasAuthor(helperServed.payload, OWNER), "exact serve does not return sibling Owner-Garona")
+become(MEMBER)
+Sync.state.requests["REQ-EXACT-HELPER"] = {
+    kind = "NEED_LOGS",
+    meta = {
+        profileId = pidExact,
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 1,
+        exactAuthor = true,
+    },
+}
+helperServed.payload.sessionId = "SES1"
+helperServed.payload.profileId = pidExact
+helperServed.payload.requestId = "REQ-EXACT-HELPER"
+Sync:HandleAuthLogs(OTHER, helperServed.payload)
+assertFalse(hasLogId(memberOnly, "owner-Garona:1"), "sibling/empty helper AUTH_LOGS does not insert owner-Garona:1")
+assertTrue(Sync.state.requests["REQ-EXACT-HELPER"] ~= nil, "exact request stays pending after helper sibling/empty response")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(pidExact, "owner-Garona", 1, 1), "exact satisfaction fails without owner-Garona:1")
+
+-- Production heartbeat routing outside helperWarmupSec
+local originalSend = SF.LootHelperComm.Send
+local originalQueue = Sync.QueueRepairRanges
+Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+local function routeSend(_, prefix, msgType, payload, dist, target)
+    capturedComm[#capturedComm + 1] = {
+        prefix = prefix,
+        msgType = msgType,
+        payload = payload,
+        target = target,
+    }
+    if payload and payload.statusOnly == true then
+        return true
+    end
+    if msgType == Sync.MSG.NEED_LOGS and type(target) == "string" then
+        local requester = PLAYER
+        become(target)
+        Sync:HandleNeedLogs(requester, payload)
+        become(requester)
+    elseif msgType == Sync.MSG.LOG_REQ and type(target) == "string" then
+        local requester = PLAYER
+        become(target)
+        Sync:HandleLogRequest(requester, payload)
+        become(requester)
+    elseif msgType == Sync.MSG.AUTH_LOGS and type(target) == "string" then
+        local sender = PLAYER
+        become(target)
+        Sync:HandleAuthLogs(sender, payload)
+        become(sender)
+    end
+    return true
+end
+SF.LootHelperComm.Send = routeSend
+
+become(MEMBER)
+Sync.state._sessionDescriptorAt = -100
+local ordinaryTargets = ProductionSync.GetRequestTargets(Sync, { OTHER }, OWNER)
+assertEq(ordinaryTargets[1], OTHER, "ordinary missing-log traffic prefers helper outside warmup")
+assertEq(ordinaryTargets[2], OWNER, "ordinary missing-log traffic falls back to coordinator")
+local exactTargets = ProductionSync.GetRequestTargets(Sync, { OTHER }, OWNER, {
+    preferCoordinatorFirst = true,
+    preferredTarget = OWNER,
+})
+assertEq(exactTargets[1], OWNER, "exact raw-author repair prefers the advertising coordinator")
+assertTrue(exactTargets[2] == OTHER, "exact repair still lists helper as fallback")
+
+become(OWNER)
+Sync.state.authorWindowSummary = {}
+Sync.state.heartbeat = {}
+capturedComm = {}
+assertTrue(ProductionSync.BroadcastSessionHeartbeat(Sync) == true, "coordinator heartbeat sent for exact-repair e2e")
+local hbExact = findCaptured(Sync.MSG.SES_HEARTBEAT)
+assertTrue(hbExact ~= nil, "exact-repair e2e captured SES_HEARTBEAT")
+assertEq((hbExact.payload.authorMax or {})["owner-Garona"], 1, "coordinator heartbeat advertises raw owner-Garona=1")
+assertEq((hbExact.payload.authorMax or {})[OWNER], 1, "coordinator heartbeat advertises raw Owner-Garona=1")
+assertTrue(#(hbExact.payload.helpers or {}) >= 1, "heartbeat advertises the preferred helper")
+
+become(MEMBER)
+Sync.state.heartbeat = {}
+Sync.state.heartbeat.lastCatchupAt = nil
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state.requests = {}
+Sync.state._sessionDescriptorAt = -100
+local prevCooldown = Sync.cfg.catchupOnHeartbeatCooldownSec
+Sync.cfg.catchupOnHeartbeatCooldownSec = 0
+Sync:HandleSessionHeartbeat(OWNER, hbExact.payload)
+Sync.state._sessionDescriptorAt = -100
+local missingAfterHb, integrityAfterHb = discoverFrom(memberOnly, profile)
+assertTrue(rangeForAuthor(missingAfterHb, "owner-Garona") ~= nil, "member initially detects missing owner-Garona:1")
+assertTrue(rangeForAuthor(integrityAfterHb, "owner-Garona") ~= nil, "member also sees exact-window integrity mismatch")
+assertTrue(rangeForAuthor(missingAfterHb, "owner-Garona").exactAuthor == true, "heartbeat missing owner-Garona is exact-author repair")
+ProductionSync.ProcessRepairConvergenceTick(Sync, "exact-e2e")
+assertTrue(hasLogId(memberOnly, "owner-Garona:1"), "fallback/preferred exact provider supplied owner-Garona:1")
+assertEq(memberOnly:GetLogById("owner-Garona:1"):GetAuthor(), "owner-Garona", "exact repair does not rewrite _author")
+assertEq(memberOnly:GetLogById("owner-Garona:1"):GetFingerprint(), yFpExact, "exact repair does not rewrite fingerprint")
+assertEq(memberOnly:GetLogById(OWNER .. ":1"):GetAuthor(), OWNER, "Owner-Garona spelling is unchanged")
+assertEq(outstandingCount(), 0, "exact repair request completed after coordinator AUTH_LOGS")
+assertTrue(repairQueueIdle(), "repair queue drains after exact row arrives")
+
+for cycle = 1, 3 do
+    become(OWNER)
+    capturedComm = {}
+    assertTrue(ProductionSync.BroadcastSessionHeartbeat(Sync) == true, "idle heartbeat cycle " .. tostring(cycle))
+    local hbIdle = findCaptured(Sync.MSG.SES_HEARTBEAT)
+    become(MEMBER)
+    Sync.state.heartbeat.lastCatchupAt = nil
+    Sync:HandleSessionHeartbeat(OWNER, hbIdle.payload)
+    Sync.state._sessionDescriptorAt = -100
+    ProductionSync.ProcessRepairConvergenceTick(Sync, "idle-" .. tostring(cycle))
+    local idleMissing, idleIntegrity = discoverFrom(memberOnly, profile)
+    assertEq(#idleMissing, 0, "idle heartbeat " .. tostring(cycle) .. " has no missing ranges")
+    assertEq(#idleIntegrity, 0, "idle heartbeat " .. tostring(cycle) .. " has no integrity ranges")
+    assertTrue(repairQueueIdle(), "idle heartbeat " .. tostring(cycle) .. " queues no repairs")
+    assertEq(outstandingCount(), 0, "idle heartbeat " .. tostring(cycle) .. " has no outstanding requests")
+end
+Sync.cfg.catchupOnHeartbeatCooldownSec = prevCooldown
+
+-- Join-status path: missing exact range must not starve behind helper SameAuthor
+resetEnv()
+installUniqueNonces()
+profile = makeProfile("ExactJoinStatusA")
+addMember(profile, ALT_A)
+addMember(profile, OTHER)
+addMember(profile, MEMBER)
+assertTrue(profile:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 9,
+}, { author = "owner-Garona", counter = 1, timestamp = 1700020102 }) }) > 0, "join coordinator stores owner-Garona:1")
+if profile.RebuildLogIndex then
+    profile:RebuildLogIndex()
+end
+profile._adminUsers = { OWNER, OTHER }
+helperOnly = cloneWithout(profile, "ExactJoinStatusHelper", "owner-Garona:1")
+memberOnly = cloneWithout(profile, "ExactJoinStatusMember", "owner-Garona:1")
+helperOnly._adminUsers = { OWNER, OTHER }
+memberOnly._adminUsers = { OWNER, OTHER }
+pidExact = profile:GetProfileId()
+peers = {
+    [OWNER] = { profile = profile, isCoordinator = true },
+    [OTHER] = { profile = helperOnly, isCoordinator = false },
+    [MEMBER] = { profile = memberOnly, isCoordinator = false },
+}
+Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+SF.LootHelperComm.Send = routeSend
+become(MEMBER)
+Sync.state.authorMax = profile:ComputeAuthorMax()
+Sync.state.authorWindowSummary = profile:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.helpers = { OTHER }
+Sync.state._sessionDescriptorAt = -100
+Sync.state._sentJoinStatusForSessionId = nil
+Sync.state._sentJoinStatusType = nil
+assertFalse(hasLogId(memberOnly, "owner-Garona:1"), "join member starts without owner-Garona:1")
+ProductionSync.SendJoinStatus(Sync)
+assertTrue(hasLogId(memberOnly, "owner-Garona:1"), "join-status exact repair obtained owner-Garona:1")
+assertEq(memberOnly:GetLogById("owner-Garona:1"):GetAuthor(), "owner-Garona", "join-status does not rewrite owner-Garona")
+assertEq(outstandingCount(), 0, "join-status exact request completed")
+Sync.state._sentJoinStatusForSessionId = nil
+Sync.state._sentJoinStatusType = nil
+capturedComm = {}
+ProductionSync.SendJoinStatus(Sync)
+local joinHave = findCaptured(Sync.MSG.HAVE_PROFILE)
+assertTrue(joinHave ~= nil, "subsequent join-status sends HAVE_PROFILE")
+assertEq(outstandingCount(), 0, "synced join-status has no outstanding requests")
+assertTrue(repairQueueIdle(), "synced join-status queues no repairs")
+
+SF.LootHelperComm.Send = originalSend
+Sync.QueueRepairRanges = originalQueue
+PLAYER = OWNER
+restoreUniqueNonces()
+
+-- Admin convergence already selects providers by exact authorMax[author]
+resetEnv()
+installUniqueNonces()
+profile = makeProfile("ExactAdminProvider")
+addMember(profile, ALT_A)
+addMember(profile, OTHER)
+addMember(profile, ALT_C)
+assertTrue(profile:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+}, { author = OWNER, counter = 1, timestamp = 1700020201 }) }) > 0, "admin coordinator already has Owner-Garona:1")
+activateSession(profile)
+profile._adminUsers = { OWNER, OTHER, ALT_C }
+Sync.state.isCoordinator = true
+Sync.state.coordEpoch = 1
+Sync.state._adminConvergence = {
+    adminSyncId = "ADM1",
+    pendingReq = {},
+    pendingCount = 0,
+    finished = false,
+    finalizeStarted = false,
+}
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = { [OWNER] = 1 },
+    },
+    [ALT_C] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = { [OWNER] = 1, ["owner-Garona"] = 1 },
+    },
+}
+capturedComm = {}
+Sync:FinalizeAdminConvergence()
+local adminExactReq = nil
+for _, req in pairs(Sync.state.requests or {}) do
+    if type(req) == "table" and req.meta and req.meta.author == "owner-Garona" then
+        adminExactReq = req
+        break
+    end
+end
+assertTrue(adminExactReq ~= nil, "admin convergence requests exact owner-Garona history")
+assertTrue(adminExactReq.meta.exactAuthor == true, "admin exact missing range keeps exactAuthor")
+assertEq(adminExactReq.lastTarget, ALT_C, "admin provider is the status whose exact authorMax has owner-Garona")
+assertTrue(adminExactReq.lastTarget ~= OTHER, "admin does not pick a sibling-only helper by logical stream")
+restoreUniqueNonces()
+end
+runExactAuthorRepairRoutingTests()
 
 -- Performance: large history with a few alias collisions
 resetEnv()
