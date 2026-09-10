@@ -348,8 +348,13 @@ function Sync:ComputeAuthorMax(profileId)
     return {}
 end
 
--- Retain the highest advertised per-author frontier. Timeout or a later
--- local ComputeAuthorMax must not forget history that is already known to exist.
+-- Session authorMax is the raw advertised frontier: exact `_author` spelling
+-- -> actual highest retained counter for that spelling. SameAuthor aliases
+-- stay independent keys. Timeout, late ADMIN_STATUS, heartbeats, and
+-- coordinator changes may retain already-advertised spellings forever, but
+-- must not copy a higher counter onto a different historical spelling.
+-- Logical SameAuthor maxima are derived with CanonicalAuthorKey /
+-- CollapseAuthorCounterMap / LogicalContigForAuthor when needed.
 function Sync:_MergeAuthorMaxFrontier(incoming)
     self.state = self.state or {}
     self.state.authorMax = self.state.authorMax or {}
@@ -362,23 +367,6 @@ function Sync:_MergeAuthorMaxFrontier(incoming)
             local prev = tonumber(self.state.authorMax[author]) or 0
             if maxCounter > prev then
                 self.state.authorMax[author] = maxCounter
-            end
-            local Identity = SF.LootHelperIdentity
-            for existing, existingMax in pairs(self.state.authorMax) do
-                local match = existing == author
-                if Identity and Identity.SameAuthor then
-                    match = Identity.SameAuthor(existing, author)
-                elseif Identity and Identity.SamePlayer then
-                    match = Identity.SamePlayer(existing, author)
-                end
-                if existing ~= author and match then
-                    local n = tonumber(existingMax) or 0
-                    if maxCounter > n then
-                        self.state.authorMax[existing] = maxCounter
-                    elseif n > (tonumber(self.state.authorMax[author]) or 0) then
-                        self.state.authorMax[author] = n
-                    end
-                end
             end
         end
     end
@@ -860,6 +848,8 @@ function Sync:IsIdentityAdminReconcileReady(profileId)
     end
 
     local contig = (self.ComputeContigAuthorMax and self:ComputeContigAuthorMax(profileId)) or {}
+    -- known is the raw advertised frontier union local ComputeAuthorMax.
+    -- Do not collapse SameAuthor aliases here; that would wait for phantom rows.
     local known = {}
     if type(self.state.authorMax) == "table" then
         for author, maxCounter in pairs(self.state.authorMax) do

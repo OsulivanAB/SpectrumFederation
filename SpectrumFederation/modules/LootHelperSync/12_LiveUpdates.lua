@@ -618,7 +618,7 @@ function Sync:HandleNewLog(sender, payload)
         SF.Debug:Verbose("SYNC", "Applied NEW_LOG without gap (id=%s, author=%s)", tostring(logId), tostring(self:_ExtractAuthorCounter(logTable)))
     end
 
-    -- Keep local session authorMax fresh
+    -- Keep local session authorMax fresh for this exact `_author` spelling only.
     do
         local author, counter = self:_ExtractAuthorCounter(logTable)
         if type(author) == "string" and type(counter) == "number" then

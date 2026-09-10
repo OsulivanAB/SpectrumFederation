@@ -64,7 +64,7 @@ Sync.state = Sync.state or {
     coordEpoch  = nil,  -- monotonic coordinator generation/epoch
 
     helpers     = {},   -- array of "Name-Realm"
-    authorMax   = {},   -- map: [author] = maxCounterSeen
+    authorMax   = {},   -- raw map: exact `_author` spelling -> highest retained counter
     authorWindowSummary = {}, -- map: [author] = { {fromCounter,toCounter,count,checksum,maxCounter}, ... }
 
     isCoordinator = false,

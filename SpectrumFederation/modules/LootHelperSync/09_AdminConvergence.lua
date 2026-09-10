@@ -319,8 +319,8 @@ function Sync:FinalizeAdminConvergence()
         end
     end
 
-    -- 4) Retain advertised maxima even if AUTH_LOGS later times out, then
-    -- compute missing ranges for the coordinator.
+    -- 4) Retain advertised raw maxima even if AUTH_LOGS later times out, then
+    -- compute missing ranges for the coordinator. targetMax is exact-spelling.
     if self._MergeAuthorMaxFrontier then
         self:_MergeAuthorMaxFrontier(targetMax)
     else

@@ -76,46 +76,52 @@ function Sync:BuildAdminStatus(profileId)
     status.authorMax = profile:ComputeAuthorMax() or {}
     status.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or {}
 
-    -- hasGaps heuristic: Check for non-contiguous sequences
-    -- Instead of just counting, verify that counters 1..max all exist for each author
-    local counts = {}
-    local logsByAuthor = {}  -- [author] = { [counter] = true }
-    
+    -- hasGaps heuristic: is the logical SameAuthor sequence missing a counter?
+    -- Historical alias continuation (owner-Garona:1..6 + Owner-Garona:7) is
+    -- complete sequential history. Duplicate logical-counter alias rows are
+    -- not a gap. Raw-window integrity still discovers missing immutable rows.
+    local Identity = SF.LootHelperIdentity
+    local countersByKey = {}
+    local maxByKey = {}
+
     for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
         if log and log.GetAuthor and log.GetCounter then
             local a = log:GetAuthor()
-            local c = log:GetCounter()
-            if type(a) == "string" and type(c) == "number" then
-                counts[a] = (counts[a] or 0) + 1
-                logsByAuthor[a] = logsByAuthor[a] or {}
-                logsByAuthor[a][c] = true
+            local c = tonumber(log:GetCounter())
+            if type(a) == "string" and a ~= "" and c and c >= 1 then
+                c = math.floor(c)
+                local key = a
+                if Identity and Identity.CanonicalAuthorKey then
+                    key = Identity.CanonicalAuthorKey(a) or a
+                else
+                    key = string.lower(a)
+                end
+                local set = countersByKey[key]
+                if not set then
+                    set = {}
+                    countersByKey[key] = set
+                end
+                set[c] = true
+                local prev = maxByKey[key] or 0
+                if c > prev then
+                    maxByKey[key] = c
+                end
             end
         end
     end
 
-    -- Check for gaps: verify counters 1..max are all present
-    for author, maxCounter in pairs(status.authorMax) do
-        if type(author) == "string" and type(maxCounter) == "number" then
-            -- First check if count matches max (quick check for obvious gaps)
-            if (counts[author] or 0) < maxCounter then
-                status.hasGaps = true
-                break
-            end
-            
-            -- Then verify contiguity: check that all counters from 1 to max exist
-            local authorLogs = logsByAuthor[author]
-            if authorLogs then
-                for i = 1, maxCounter do
-                    if not authorLogs[i] then
-                        status.hasGaps = true
-                        break
-                    end
+    for key, maxCounter in pairs(maxByKey) do
+        local set = countersByKey[key]
+        if type(maxCounter) == "number" and type(set) == "table" then
+            for i = 1, maxCounter do
+                if not set[i] then
+                    status.hasGaps = true
+                    break
                 end
             end
-            
-            if status.hasGaps then
-                break
-            end
+        end
+        if status.hasGaps then
+            break
         end
     end
 
@@ -172,16 +178,25 @@ function Sync:HandleAdminStatus(sender, payload)
             tostring(sender), tostring(payload.hasProfile), tostring(payload.hasGaps), authorCount)
     end
     
-    -- Issue #10 Rec 3: Progressive convergence - update authorMax with late responses
+    -- Issue #10 Rec 3: Progressive convergence - retain late raw author maxima
+    -- without copying them onto SameAuthor historical spellings.
     if conv.finalizeStarted and payload.authorMax then
-        -- Merge late admin's authorMax into session authorMax
-        for author, maxCounter in pairs(payload.authorMax) do
-            local current = self.state.authorMax[author] or 0
-            if type(maxCounter) == "number" and maxCounter > current then
-                self.state.authorMax[author] = maxCounter
-                if SF.Debug then
-                    SF.Debug:Info("SYNC", "Late ADMIN_STATUS from %s: updated authorMax[%s] from %d to %d",
-                        tostring(sender), tostring(author), current, maxCounter)
+        local before = {}
+        for author, maxCounter in pairs(self.state.authorMax or {}) do
+            before[author] = tonumber(maxCounter) or 0
+        end
+        if self._MergeAuthorMaxFrontier then
+            self:_MergeAuthorMaxFrontier(payload.authorMax)
+        end
+        if SF.Debug then
+            for author, _ in pairs(payload.authorMax) do
+                if type(author) == "string" then
+                    local current = tonumber(self.state.authorMax[author]) or 0
+                    local previous = before[author] or 0
+                    if current > previous then
+                        SF.Debug:Info("SYNC", "Late ADMIN_STATUS from %s: updated authorMax[%s] from %d to %d",
+                            tostring(sender), tostring(author), previous, current)
+                    end
                 end
             end
         end
@@ -407,12 +422,17 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         self.state.helpers = payload.helpers
     end
     if type(payload.authorMax) == "table" then
-        -- Merge authorMax with max() to preserve local progress from NEW_LOG messages
-        self.state.authorMax = self.state.authorMax or {}
-        for author, remoteMax in pairs(payload.authorMax) do
-            if type(author) == "string" and type(remoteMax) == "number" then
-                local localMax = tonumber(self.state.authorMax[author]) or 0
-                self.state.authorMax[author] = math.max(localMax, remoteMax)
+        -- Exact-key max only: retain local NEW_LOG progress and previously
+        -- advertised raw spellings without alias-stamping historical maxima.
+        if self._MergeAuthorMaxFrontier then
+            self:_MergeAuthorMaxFrontier(payload.authorMax)
+        else
+            self.state.authorMax = self.state.authorMax or {}
+            for author, remoteMax in pairs(payload.authorMax) do
+                if type(author) == "string" and type(remoteMax) == "number" then
+                    local localMax = tonumber(self.state.authorMax[author]) or 0
+                    self.state.authorMax[author] = math.max(localMax, remoteMax)
+                end
             end
         end
     end

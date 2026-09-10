@@ -38,7 +38,8 @@ function Sync:BroadcastSessionHeartbeat()
     if type(profileId) ~= "string" or profileId == "" then return false end
 
     -- Keep authorMax fresh so reconnecting clients can catch up, without
-    -- lowering a previously advertised frontier.
+    -- lowering a previously advertised raw spelling or copying a logical
+    -- maximum onto a different historical alias.
     self:_RefreshAdvertisedAuthorMax(profileId)
     self.state.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or (self.state.authorWindowSummary or {})
 
