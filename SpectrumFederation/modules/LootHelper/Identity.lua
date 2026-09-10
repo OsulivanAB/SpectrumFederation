@@ -162,6 +162,9 @@ end
 -- Causal-then-deterministic order: per-author counters, writer-observed
 -- preOpAuthorMax, sourceLogId grant edges, then CompareLogs among ready events.
 -- Ready selection is a binary min-heap so the Kahn walk is O(n log n).
+-- SameAuthor aliases share one logical counter stream, but every immutable
+-- historical row at a logical counter stays its own node. Observing frontier N
+-- (preOpAuthorMax or logical N+1) depends on all retained rows at that N.
 function Identity.OrderLogs(logs)
     if type(logs) ~= "table" then
         Identity.lastOrderStats = { n = 0, readyPops = 0, heapOps = 0, edgeInserts = 0, edgeCalls = 0 }
@@ -201,26 +204,41 @@ function Identity.OrderLogs(logs)
                 byAuthor[key] = bucket
             end
             local existing = bucket.byCounter[counter]
-            if not existing or Identity.CompareLogs(log, existing) then
-                bucket.byCounter[counter] = log
+            if not existing then
+                bucket.byCounter[counter] = { log }
+            else
+                existing[#existing + 1] = log
             end
         end
     end
     for _, bucket in pairs(byAuthor) do
         local sorted = bucket.sorted
-        for counter in pairs(bucket.byCounter) do
+        for counter, rows in pairs(bucket.byCounter) do
             sorted[#sorted + 1] = counter
+            table.sort(rows, function(a, b)
+                if Identity.CompareLogs(a, b) then
+                    return true
+                end
+                if Identity.CompareLogs(b, a) then
+                    return false
+                end
+                return tostring(idOf[a] or "") < tostring(idOf[b] or "")
+            end)
         end
         table.sort(sorted)
     end
 
-    local function bestAtOrBefore(author, counter)
+    local function rowsAtCounter(bucket, counter)
+        return bucket and bucket.byCounter[counter] or nil
+    end
+
+    local function logsAtOrBefore(author, counter)
         local key = CanonicalAuthorKey(author)
         local bucket = key and byAuthor[key]
-        if not bucket then
+        if not bucket or not counter or counter < 1 then
             return nil
         end
-        local exact = bucket.byCounter[counter]
+        local exact = rowsAtCounter(bucket, counter)
         if exact then
             return exact
         end
@@ -239,7 +257,7 @@ function Identity.OrderLogs(logs)
         if not best then
             return nil
         end
-        return bucket.byCounter[best]
+        return rowsAtCounter(bucket, best)
     end
 
     local indegree = {}
@@ -272,12 +290,21 @@ function Identity.OrderLogs(logs)
         edgeInserts = edgeInserts + 1
     end
 
+    local function addPreds(predLogs, succLog)
+        if type(predLogs) ~= "table" then
+            return
+        end
+        for i = 1, #predLogs do
+            addEdge(predLogs[i], succLog)
+        end
+    end
+
     for i = 1, n do
         local log = logs[i]
         local author = GetLogAuthor(log) or (log and log._author)
         local counter = tonumber(GetLogCounter(log))
         if author and counter then
-            addEdge(bestAtOrBefore(author, counter - 1), log)
+            addPreds(logsAtOrBefore(author, counter - 1), log)
         end
         local data = GetLogData(log)
         local pre = data and data.preOpAuthorMax
@@ -288,7 +315,15 @@ function Identity.OrderLogs(logs)
                     local pAuthor = entry.author
                     local pCounter = tonumber(entry.counter)
                     if type(pAuthor) == "string" and pAuthor ~= "" and pCounter then
-                        addEdge(bestAtOrBefore(pAuthor, pCounter), log)
+                        -- Observing logical frontier N means every retained
+                        -- row at that SameAuthor counter is a predecessor.
+                        -- A sibling at the same logical counter must not
+                        -- treat the sibling set as predecessors (cycle).
+                        local predCounter = pCounter
+                        if author and counter == pCounter and Identity.SameAuthor(author, pAuthor) then
+                            predCounter = pCounter - 1
+                        end
+                        addPreds(logsAtOrBefore(pAuthor, predCounter), log)
                     end
                 end
             end
