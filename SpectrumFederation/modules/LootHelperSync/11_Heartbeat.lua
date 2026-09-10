@@ -320,7 +320,7 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
             end
 
             local requestId = self:NewRequestId()
-            local ok = self:RegisterRequest(requestId, "NEED_LOGS", targets[1], {
+            local ok = self:RegisterRequest(requestId, "NEED_LOGS", targets[1], self:_CopyExpectedWindowEvidence(range, {
                 sessionId   = self.state.sessionId,
                 profileId   = self.state.profileId,
                 author      = range.author,
@@ -332,7 +332,7 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
                 reason = reason,
                 exactAuthor = exactAuthor,
                 preferredTarget = preferredTarget,
-            })
+            }))
 
             if ok then
                 count = count + 1

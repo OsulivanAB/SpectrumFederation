@@ -5381,7 +5381,163 @@ assertTrue(hasLogId(sparseDest, "owner-Garona:3"), "sparse exact repair obtained
 assertTrue(hasLogId(sparseDest, "owner-Garona:1"), "sparse exact repair kept owner-Garona:1")
 assertFalse(hasLogId(sparseDest, "owner-Garona:2"), "sparse exact repair does not invent owner-Garona:2")
 assertTrue(Sync:_ExactAuthorRangeSatisfied(sparseDest:GetProfileId(), "owner-Garona", 1, 3), "exact max 3 satisfies 1..3 without a dense :2")
+assertTrue(Sync:_ExactAuthorRangeSatisfied(sparseDest:GetProfileId(), "owner-Garona", 1, 3, {
+    integrityRepair = true,
+    expectedCount = 2,
+    expectedMaxCounter = 3,
+}), "sparse exact 1+3 satisfies integrity when expectedCount=2 and expectedMax=3")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(sparseDest:GetProfileId(), "owner-Garona", 1, 3, {
+    integrityRepair = true,
+    expectedCount = 2,
+    expectedMaxCounter = 3,
+    expectedChecksum = 1,
+}), "sparse integrity still requires matching checksum when advertised")
 assertTrue(Sync.state.requests["REQ-SPARSE-EXACT"] == nil, "sparse exact AUTH_LOGS completed the request")
+
+-- Later retained exact rows must not complete an earlier window.
+resetEnv()
+installUniqueNonces()
+profile = makeProfile("LaterExactWindowA")
+addMember(profile, ALT_A)
+assertTrue(profile:MergeLogTables({
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 30,
+    }, { author = "owner-Garona", counter = 30, timestamp = 1700020330 }),
+}) > 0, "later-window source stores owner-Garona:30")
+if profile.RebuildLogIndex then
+    profile:RebuildLogIndex()
+end
+pidExact = profile:GetProfileId()
+assertTrue(hasLogId(profile, "owner-Garona:30"), "later-window profile kept owner-Garona:30")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(pidExact, "owner-Garona", 1, 25),
+    "later exact row 30 does not satisfy completeness window 1-25")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(pidExact, "owner-Garona", 1, 25, {
+    integrityRepair = true,
+    expectedCount = 3,
+    expectedMaxCounter = 25,
+}), "later exact row 30 does not satisfy integrity window 1-25")
+
+-- Integrity discovery stamps advertised window evidence, and a non-empty
+-- helper subset must not complete when expectedCount is higher.
+resetEnv()
+installUniqueNonces()
+profile = makeProfile("SubsetIntegrityA")
+addMember(profile, ALT_A)
+assertTrue(profile:MergeLogTables({
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 21,
+    }, { author = OWNER, counter = 1, timestamp = 1700020341 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 22,
+    }, { author = OWNER, counter = 2, timestamp = 1700020342 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 23,
+    }, { author = OWNER, counter = 3, timestamp = 1700020343 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 11,
+    }, { author = "owner-Garona", counter = 1, timestamp = 1700020351 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 12,
+    }, { author = "owner-Garona", counter = 2, timestamp = 1700020352 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 13,
+    }, { author = "owner-Garona", counter = 3, timestamp = 1700020353 }),
+}) > 0, "subset source has Owner-Garona:1..3 and owner-Garona:1..3")
+if profile.RebuildLogIndex then
+    profile:RebuildLogIndex()
+end
+memberOnly = cloneWithout(profile, "SubsetIntegrityMid", "owner-Garona:2")
+memberOnly = cloneWithout(memberOnly, "SubsetIntegrityB", "owner-Garona:3")
+assertTrue(hasLogId(memberOnly, "owner-Garona:1"), "subset dest keeps owner-Garona:1")
+assertFalse(hasLogId(memberOnly, "owner-Garona:2"), "subset dest lacks owner-Garona:2")
+assertFalse(hasLogId(memberOnly, "owner-Garona:3"), "subset dest lacks owner-Garona:3")
+registerProfile(memberOnly)
+sparseReq = rangeForAuthor((select(2, discoverFrom(memberOnly, profile))), "owner-Garona")
+assertTrue(sparseReq ~= nil, "integrity discovers owner-Garona window against sibling contig")
+assertEq(sparseReq.expectedCount, 3, "integrity stamps remote window count")
+assertEq(sparseReq.expectedMaxCounter, 3, "integrity stamps remote filled frontier")
+assertTrue(type(sparseReq.expectedChecksum) == "number", "integrity stamps remote window checksum")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(memberOnly:GetProfileId(), "owner-Garona", 1, 3, {
+    integrityRepair = true,
+    expectedCount = 3,
+    expectedMaxCounter = 3,
+    expectedChecksum = sparseReq.expectedChecksum,
+}), "one exact row does not satisfy integrity expectedCount=3")
+
+activateSession(memberOnly)
+pidExact = memberOnly:GetProfileId()
+helperServed = nil
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetAuthor() == "owner-Garona" and log:GetCounter() == 1 then
+        helperServed = log:ToTable()
+        break
+    end
+end
+assertTrue(helperServed ~= nil, "subset payload uses the exact owner-Garona:1 table")
+Sync.state.requests["REQ-SUBSET"] = {
+    kind = "LOG_REQ",
+    meta = {
+        profileId = pidExact,
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 3,
+        exactAuthor = true,
+        integrityRepair = true,
+        expectedCount = 3,
+        expectedMaxCounter = 3,
+        expectedChecksum = sparseReq.expectedChecksum,
+    },
+}
+Sync:HandleAuthLogs(OWNER, {
+    sessionId = "SES1",
+    profileId = pidExact,
+    requestId = "REQ-SUBSET",
+    author = "owner-Garona",
+    fromCounter = 1,
+    toCounter = 3,
+    logs = { helperServed },
+})
+assertTrue(Sync.state.requests["REQ-SUBSET"] ~= nil, "incomplete integrity AUTH_LOGS stays pending")
+assertTrue(hasLogId(memberOnly, "owner-Garona:1"), "helper subset still stores the exact row it did send")
+assertFalse(hasLogId(memberOnly, "owner-Garona:2"), "helper subset does not complete owner-Garona:2")
+assertFalse(hasLogId(memberOnly, "owner-Garona:3"), "helper subset does not complete owner-Garona:3")
+
+activateSession(profile)
+ProductionSync.QueueRepairRanges(Sync, profile:GetProfileId(), {
+    {
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 25,
+        mode = "integrity",
+        exactAuthor = true,
+        expectedCount = 4,
+        expectedChecksum = 123,
+        expectedMaxCounter = 20,
+    },
+}, { mode = "integrity", reason = "test-expected-evidence" })
+helperServed = nil
+for _, entry in pairs(Sync.state.repairQueue.items or {}) do
+    helperServed = entry
+    break
+end
+assertTrue(helperServed ~= nil, "integrity evidence range was queued")
+assertEq(helperServed.expectedCount, 4, "queue copies expectedCount")
+assertEq(helperServed.expectedChecksum, 123, "queue copies expectedChecksum")
+assertEq(helperServed.expectedMaxCounter, 20, "queue copies expectedMaxCounter")
 restoreUniqueNonces()
 end
 runExactAuthorRepairRoutingTests()

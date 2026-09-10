@@ -341,15 +341,17 @@ function Sync:_FailRequest(req, reason)
         and self.QueueRepairRanges
     then
         local nextQueueAttempts = math.max(0, tonumber(req.meta.queueAttempts) or 0) + 1
+        local retryRange = {
+            author = req.meta.author,
+            fromCounter = req.meta.fromCounter,
+            toCounter = req.meta.toCounter,
+            mode = req.meta.integrityRepair == true and "integrity" or "missing",
+            preferredTarget = req.meta.preferredTarget or req.lastTarget,
+            exactAuthor = self:_IsExactAuthorRepair(req.meta),
+        }
+        self:_CopyExpectedWindowEvidence(req.meta, retryRange)
         requeued = self:QueueRepairRanges(req.meta.profileId, {
-            {
-                author = req.meta.author,
-                fromCounter = req.meta.fromCounter,
-                toCounter = req.meta.toCounter,
-                mode = req.meta.integrityRepair == true and "integrity" or "missing",
-                preferredTarget = req.meta.preferredTarget or req.lastTarget,
-                exactAuthor = self:_IsExactAuthorRepair(req.meta),
-            }
+            retryRange
         }, {
             mode = req.meta.integrityRepair == true and "integrity" or "missing",
             reason = req.meta.reason or reason or "background-retry",

@@ -69,6 +69,26 @@ function Sync:_MakeRepairQueueKey(profileId, author, fromCounter, toCounter, mod
     }, "|")
 end
 
+-- Copy advertised integrity-window evidence onto a queued range or request.
+function Sync:_CopyExpectedWindowEvidence(src, dest)
+    if type(src) ~= "table" or type(dest) ~= "table" then
+        return dest
+    end
+    local expectedCount = tonumber(src.expectedCount)
+    if expectedCount ~= nil then
+        dest.expectedCount = expectedCount
+    end
+    local expectedChecksum = tonumber(src.expectedChecksum)
+    if expectedChecksum ~= nil then
+        dest.expectedChecksum = expectedChecksum
+    end
+    local expectedMaxCounter = tonumber(src.expectedMaxCounter)
+    if expectedMaxCounter ~= nil then
+        dest.expectedMaxCounter = expectedMaxCounter
+    end
+    return dest
+end
+
 function Sync:_ComputeQueuedRepairBackoffSec(attempt)
     local base = tonumber(self.cfg and self.cfg.convergenceRetryBaseSec) or 12
     local cap = tonumber(self.cfg and self.cfg.convergenceRetryMaxSec) or 90
@@ -173,6 +193,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                             queueAttempts = math.max(0, tonumber(opts.queueAttempts) or 0),
                             lastQueuedAt = now,
                         }
+                        self:_CopyExpectedWindowEvidence(range, entry)
                         queue.items[key] = entry
                         queue.order[#queue.order + 1] = key
                         added = added + 1
@@ -183,6 +204,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                     if exactAuthor then
                         entry.exactAuthor = true
                     end
+                    self:_CopyExpectedWindowEvidence(range, entry)
                     if opts.delaySec then
                         local requestedAt = now + math.max(0, tonumber(opts.delaySec) or 0)
                         if type(entry.nextAttemptAt) ~= "number" or requestedAt < entry.nextAttemptAt then
@@ -211,28 +233,32 @@ end
 function Sync:_DispatchQueuedRepair(entry)
     if type(entry) ~= "table" then return false end
     if entry.mode == "integrity" then
+        local integrityRange = {
+            author = entry.author,
+            fromCounter = entry.fromCounter,
+            toCounter = entry.toCounter,
+            mode = "integrity",
+            exactAuthor = true,
+        }
+        self:_CopyExpectedWindowEvidence(entry, integrityRange)
         return self:RequestIntegrityRepairRanges(entry.profileId, {
-            {
-                author = entry.author,
-                fromCounter = entry.fromCounter,
-                toCounter = entry.toCounter,
-                mode = "integrity",
-                exactAuthor = true,
-            }
+            integrityRange
         }, entry.reason or "queued-integrity", entry.preferredTarget, {
             backgroundRepair = true,
             queueAttempts = entry.queueAttempts,
         })
     end
 
+    local missingRange = {
+        author = entry.author,
+        fromCounter = entry.fromCounter,
+        toCounter = entry.toCounter,
+        exactAuthor = entry.exactAuthor == true,
+        preferredTarget = entry.preferredTarget,
+    }
+    self:_CopyExpectedWindowEvidence(entry, missingRange)
     return self:RequestMissingLogs({
-        {
-            author = entry.author,
-            fromCounter = entry.fromCounter,
-            toCounter = entry.toCounter,
-            exactAuthor = entry.exactAuthor == true,
-            preferredTarget = entry.preferredTarget,
-        }
+        missingRange
     }, entry.reason or "queued-missing", {
         backgroundRepair = true,
         queueAttempts = entry.queueAttempts,

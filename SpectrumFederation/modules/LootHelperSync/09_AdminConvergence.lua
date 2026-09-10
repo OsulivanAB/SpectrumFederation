@@ -342,7 +342,7 @@ function Sync:FinalizeAdminConvergence()
         and SF.SyncProtocol.GetSupportedEncodings()
         or nil
 
-    local function registerAdminLogReq(providerList, author, fromCounter, toCounter, integrityRepair, exactAuthor)
+    local function registerAdminLogReq(providerList, author, fromCounter, toCounter, integrityRepair, exactAuthor, range)
         if type(providerList) ~= "table" or #providerList == 0 then
             return false
         end
@@ -356,7 +356,7 @@ function Sync:FinalizeAdminConvergence()
             fallback[#fallback + 1] = providerList[i]
         end
 
-        local ok = self:RegisterRequest(requestId, "ADMIN_LOG_REQ", providerList[1], {
+        local meta = {
             sessionId       = self.state.sessionId,
             profileId       = profileId,
             adminSyncId     = conv.adminSyncId,
@@ -368,7 +368,12 @@ function Sync:FinalizeAdminConvergence()
             targets         = fallback,
             integrityRepair = integrityRepair == true,
             exactAuthor     = integrityRepair == true or exactAuthor == true,
-        })
+        }
+        if type(range) == "table" then
+            self:_CopyExpectedWindowEvidence(range, meta)
+        end
+
+        local ok = self:RegisterRequest(requestId, "ADMIN_LOG_REQ", providerList[1], meta)
 
         if not ok then
             conv.pendingReq[requestId] = nil
@@ -419,7 +424,7 @@ function Sync:FinalizeAdminConvergence()
                 end
             end
 
-            registerAdminLogReq(providers, author, req.fromCounter, req.toCounter, false, req.exactAuthor == true)
+            registerAdminLogReq(providers, author, req.fromCounter, req.toCounter, false, req.exactAuthor == true, req)
         end
     end
 
@@ -431,7 +436,7 @@ function Sync:FinalizeAdminConvergence()
                 local key = ("%s|%s|%d|%d"):format(tostring(adminName), tostring(range.author), tonumber(range.fromCounter) or 0, tonumber(range.toCounter) or 0)
                 if not integritySeen[key] then
                     integritySeen[key] = true
-                    registerAdminLogReq({ adminName }, range.author, range.fromCounter, range.toCounter, true, true)
+                    registerAdminLogReq({ adminName }, range.author, range.fromCounter, range.toCounter, true, true, range)
                 end
             end
         end

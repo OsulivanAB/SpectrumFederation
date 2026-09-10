@@ -293,6 +293,9 @@ function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localConti
                                 toCounter = reqTo,
                                 mode = "integrity",
                                 exactAuthor = true,
+                                expectedCount = remoteCount,
+                                expectedChecksum = remoteChecksum,
+                                expectedMaxCounter = (remoteFilledTo > 0) and remoteFilledTo or nil,
                             }
                         end
                     end
@@ -492,11 +495,56 @@ function Sync:_AuthorMatchesRepairRequest(logAuthor, requestedAuthor, exactAutho
     return AuthorsMatch(logAuthor, requestedAuthor)
 end
 
--- Exact-author satisfaction: this spelling's retained max covers toCounter.
--- Completeness/integrity ask for 1..authorMax or a window end, but SameAuthor
--- history only stores some counters under that spelling. Sibling aliases do
--- not count. Integrity may complete after a non-empty exact payload when the
--- window is sparse and toCounter is the window end rather than a dense max.
+local function ExactRangeFingerprintRollup(rows)
+    local checksum = 5381
+    table.sort(rows)
+    for _, row in ipairs(rows) do
+        for i = 1, #row do
+            checksum = (checksum * 33 + row:byte(i)) % 2147483647
+        end
+    end
+    return checksum
+end
+
+-- Exact `_author` rows inside [fromCounter, toCounter] only. A later retained
+-- row (for example :30) must not complete an earlier window (1..25).
+function Sync:_ScanExactAuthorRange(profileId, author, fromCounter, toCounter)
+    local count, maxInRange = 0, 0
+    local rows = {}
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        return 0, 0, ExactRangeFingerprintRollup(rows)
+    end
+
+    for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
+        local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
+        if a == author then
+            local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
+            c = tonumber(c)
+            if c then
+                c = math.floor(c)
+                if c >= fromCounter and c <= toCounter then
+                    count = count + 1
+                    if c > maxInRange then
+                        maxInRange = c
+                    end
+                    local id = (log.GetID and log:GetID()) or log._id or ""
+                    local fingerprint = (log.GetFingerprint and log:GetFingerprint()) or log._fingerprint or 0
+                    rows[#rows + 1] = ("%s=%s"):format(id, tostring(fingerprint))
+                end
+            end
+        end
+    end
+
+    return count, maxInRange, ExactRangeFingerprintRollup(rows)
+end
+
+-- Exact-author satisfaction uses in-window exact `_author` rows, not the
+-- global retained max. Completeness: maxInRange >= toCounter (sparse holes
+-- are allowed). Integrity also requires advertised count / checksum /
+-- filled-frontier evidence when those fields are present. Sibling aliases,
+-- later-window rows, empty AUTH_LOGS, and incomplete helper subsets must
+-- not complete the request.
 function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCounter, opts)
     if type(profileId) ~= "string" or profileId == "" then return false end
     if type(author) ~= "string" or author == "" then return false end
@@ -507,17 +555,30 @@ function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCount
     fromCounter = math.max(1, math.floor(fromCounter))
     toCounter = math.max(fromCounter, math.floor(toCounter))
 
-    local exactMax = ExactAuthorCounter(self:ComputeAuthorMax(profileId), author)
-    if exactMax >= toCounter then
+    local countInRange, maxInRange, checksumInRange = self:_ScanExactAuthorRange(profileId, author, fromCounter, toCounter)
+    opts = type(opts) == "table" and opts or {}
+
+    if opts.integrityRepair == true then
+        local neededMax = toCounter
+        local expectedMax = tonumber(opts.expectedMaxCounter)
+        if expectedMax and expectedMax > 0 then
+            neededMax = expectedMax
+        end
+        if maxInRange < neededMax then
+            return false
+        end
+        local expectedCount = tonumber(opts.expectedCount)
+        if expectedCount ~= nil and countInRange < expectedCount then
+            return false
+        end
+        local expectedChecksum = tonumber(opts.expectedChecksum)
+        if expectedChecksum ~= nil and checksumInRange ~= expectedChecksum then
+            return false
+        end
         return true
     end
 
-    opts = type(opts) == "table" and opts or {}
-    local received = tonumber(opts.receivedExactCount) or 0
-    if opts.integrityRepair == true and received > 0 then
-        return true
-    end
-    return false
+    return maxInRange >= toCounter
 end
 
 -- Function Compute missing log ranges given local authorMax and remote authorMax (or detect gaps).
@@ -1356,7 +1417,7 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
 
             local requestId = self:NewRequestId()
             local kind = (self.state.isCoordinator or self:CanSelfCoordinate(profileId)) and "LOG_REQ" or "NEED_LOGS"
-            local ok = self:RegisterRequest(requestId, kind, targets[1], {
+            local meta = {
                 sessionId = self.state.sessionId,
                 profileId = profileId,
                 author = range.author,
@@ -1370,7 +1431,9 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
                 preferredTarget = preferredTarget,
                 backgroundRepair = opts.backgroundRepair == true,
                 queueAttempts = tonumber(opts.queueAttempts) or 0,
-            })
+            }
+            self:_CopyExpectedWindowEvidence(range, meta)
+            local ok = self:RegisterRequest(requestId, kind, targets[1], meta)
             if ok then
                 count = count + 1
             end

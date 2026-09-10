@@ -70,6 +70,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Session `authorMax` stays a raw `_author` -> retained-counter map; SameAuthor merge no longer advertises phantom historical maxima such as `owner-Garona:7`
 - `BuildAdminStatus.hasGaps` scores logical sequential presence so alias continuation is not treated as a gappy raw stream
 - Exact raw-author repair (`exactAuthor`) is distinct from logical SameAuthor catch-up through discovery, routing, NEED_LOGS/LOG_REQ serving, AUTH_LOGS validation, and request satisfaction; a helper that only has a sibling alias cannot complete `owner-Garona:1`
+- Exact-author and integrity satisfaction use exact `_author` rows inside the requested window plus advertised count/checksum/maxCounter; a later retained row or a non-empty helper subset cannot complete an earlier window
 
 ## [1.4.1] - 2026-09-07
 

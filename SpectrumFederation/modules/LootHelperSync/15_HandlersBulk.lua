@@ -235,6 +235,10 @@ function Sync:HandleAuthLogs(sender, payload)
         if req.meta and req.meta.author and req.meta.toCounter then
             local exactRepair = self:_IsExactAuthorRepair(req.meta)
             if exactRepair then
+                -- Empty AUTH_LOGS, SameAuthor siblings, later-window rows,
+                -- and incomplete integrity subsets must not complete
+                -- exact-author repairs. Coordinator fallback has to keep
+                -- running until the requested window is actually filled.
                 requestSatisfied = self:_ExactAuthorRangeSatisfied(
                     payload.profileId,
                     req.meta.author,
@@ -242,7 +246,9 @@ function Sync:HandleAuthLogs(sender, payload)
                     req.meta.toCounter,
                     {
                         integrityRepair = req.meta.integrityRepair == true,
-                        receivedExactCount = (type(payload.logs) == "table") and #payload.logs or 0,
+                        expectedCount = req.meta.expectedCount,
+                        expectedChecksum = req.meta.expectedChecksum,
+                        expectedMaxCounter = req.meta.expectedMaxCounter,
                     }
                 )
                 if requestSatisfied then
