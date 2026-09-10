@@ -1267,12 +1267,17 @@ function Sync:_ProvidersAdvertisingAuthorMax(author, fromCounter, toCounter)
     return out
 end
 
+-- Exact/integrity proof comparison. Empty expected windows mean "no proof
+-- to match"; the caller decides whether to keep the full provider list
+-- (logical catch-up) or pin to the primary (exact without advertiser windows).
 function Sync:_FilterProvidersMatchingWindowProof(providers, author, fromCounter, toCounter, expectedWindows)
     local expectedFp = self:_ExpectedWindowsFingerprint(expectedWindows)
     if expectedFp == "" or type(providers) ~= "table" then
         local copy = {}
-        if type(providers) == "table" and providers[1] then
-            copy[1] = providers[1]
+        if type(providers) == "table" then
+            for i = 1, #providers do
+                copy[i] = providers[i]
+            end
         end
         return copy
     end
@@ -1316,6 +1321,22 @@ function Sync:_QueueAdvertisedRepair(profileId, range, mode, preferredTarget)
     })
 end
 
+-- A poorer advertised window (remote max < local exact max) is not an
+-- unresolved dependency. Identity-admin must not wait on a behind admin,
+-- and integrity repair must not aim at that poorer checksum.
+function Sync:_IsUnresolvedAdvertisedWindow(profileId, range)
+    if type(range) ~= "table" or type(range.author) ~= "string" or range.author == "" then
+        return false
+    end
+    local remoteMax = tonumber(range.expectedMaxCounter) or tonumber(range.toCounter) or 0
+    local localRaw = (self.ComputeAuthorMax and self:ComputeAuthorMax(profileId)) or {}
+    local localMax = tonumber(localRaw[range.author]) or 0
+    if remoteMax > 0 and localMax > remoteMax then
+        return false
+    end
+    return true
+end
+
 -- Remote ADMIN_STATUS window summaries remain authoritative even after
 -- session authorWindowSummary is overwritten with coordinator-local windows.
 function Sync:_HasUnresolvedRemoteWindowMismatch(profileId)
@@ -1330,8 +1351,12 @@ function Sync:_HasUnresolvedRemoteWindowMismatch(profileId)
         local st = self.state.adminStatuses[name]
         if type(st) == "table" and type(st.authorWindowSummary) == "table" then
             local ranges = self:ComputeWindowMismatchRequests(profileId, st.authorWindowSummary, contig)
-            if type(ranges) == "table" and #ranges > 0 then
-                return true
+            if type(ranges) == "table" then
+                for _, range in ipairs(ranges) do
+                    if self:_IsUnresolvedAdvertisedWindow(profileId, range) then
+                        return true
+                    end
+                end
             end
         end
     end
@@ -1355,7 +1380,7 @@ function Sync:_QueueRemoteWindowMismatches(profileId, adminName, remoteSummary)
     end
     local queued = false
     for _, range in ipairs(ranges) do
-        if type(range) == "table" then
+        if type(range) == "table" and self:_IsUnresolvedAdvertisedWindow(profileId, range) then
             range.reason = "late-admin-status-integrity"
             if self:_QueueAdvertisedRepair(profileId, range, "integrity", adminName) then
                 queued = true

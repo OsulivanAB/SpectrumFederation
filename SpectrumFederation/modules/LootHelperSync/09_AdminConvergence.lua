@@ -404,15 +404,22 @@ function Sync:FinalizeAdminConvergence()
             if type(st) == "table" then
                 self:_AttachExactWindowEvidence({ req }, st.authorWindowSummary or {})
             end
-            local matched = self:_FilterProvidersMatchingWindowProof(
-                providers,
-                author,
-                fromCounter,
-                toCounter,
-                req.expectedWindows
-            )
-            if #matched == 0 then
+            local matched
+            if type(req.expectedWindows) == "table" and #req.expectedWindows > 0 then
+                matched = self:_FilterProvidersMatchingWindowProof(
+                    providers,
+                    author,
+                    fromCounter,
+                    toCounter,
+                    req.expectedWindows
+                )
+                if #matched == 0 then
+                    matched = { primary }
+                end
+            elseif req.exactAuthor == true then
                 matched = { primary }
+            else
+                matched = providers
             end
             registerAdminLogReq(matched, author, fromCounter, toCounter, false, req.exactAuthor == true, req)
         end
@@ -424,34 +431,36 @@ function Sync:FinalizeAdminConvergence()
         if type(st) == "table" and type(st.authorWindowSummary) == "table" then
             local ranges = self:ComputeWindowMismatchRequests(profileId, st.authorWindowSummary, localContig)
             for _, range in ipairs(ranges) do
-                local fp = self:_ExpectedWindowsFingerprint(range.expectedWindows)
-                local key = ("%s|%d|%d|%s"):format(
-                    tostring(range.author),
-                    tonumber(range.fromCounter) or 0,
-                    tonumber(range.toCounter) or 0,
-                    fp
-                )
-                if not integritySeen[key] then
-                    integritySeen[key] = true
-                    local providers = self:_FilterProvidersMatchingWindowProof(
-                        self:_ProvidersAdvertisingAuthorMax(range.author, range.fromCounter, range.toCounter),
-                        range.author,
-                        range.fromCounter,
-                        range.toCounter,
-                        range.expectedWindows
+                if self:_IsUnresolvedAdvertisedWindow(profileId, range) then
+                    local fp = self:_ExpectedWindowsFingerprint(range.expectedWindows)
+                    local key = ("%s|%d|%d|%s"):format(
+                        tostring(range.author),
+                        tonumber(range.fromCounter) or 0,
+                        tonumber(range.toCounter) or 0,
+                        fp
                     )
-                    if #providers == 0 then
-                        providers = { adminName }
-                    elseif providers[1] ~= adminName then
-                        local rest = { adminName }
-                        for i = 1, #providers do
-                            if providers[i] ~= adminName then
-                                rest[#rest + 1] = providers[i]
+                    if not integritySeen[key] then
+                        integritySeen[key] = true
+                        local providers = self:_FilterProvidersMatchingWindowProof(
+                            self:_ProvidersAdvertisingAuthorMax(range.author, range.fromCounter, range.toCounter),
+                            range.author,
+                            range.fromCounter,
+                            range.toCounter,
+                            range.expectedWindows
+                        )
+                        if #providers == 0 then
+                            providers = { adminName }
+                        elseif providers[1] ~= adminName then
+                            local rest = { adminName }
+                            for i = 1, #providers do
+                                if providers[i] ~= adminName then
+                                    rest[#rest + 1] = providers[i]
+                                end
                             end
+                            providers = rest
                         end
-                        providers = rest
+                        registerAdminLogReq(providers, range.author, range.fromCounter, range.toCounter, true, true, range)
                     end
-                    registerAdminLogReq(providers, range.author, range.fromCounter, range.toCounter, true, true, range)
                 end
             end
         end

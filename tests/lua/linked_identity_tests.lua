@@ -6766,6 +6766,139 @@ Sync.state.adminStatuses = {
 Sync:FinalizeAdminConvergence()
 assertFalse(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
     "reconverged ADMIN_STATUS rebuilds the unresolved integrity blocker")
+
+-- A behind admin's poorer window is not an unresolved remote dependency.
+resetEnv()
+coord, remote = seedEqualMaxMissing("ConvBehindCoord", "ConvBehindRemote")
+startConv(coord)
+remoteSummary = remote:ComputeAuthorWindowSummary(3)
+evid = remoteSummary["owner-Garona"][1]
+applyDiscoveredRange(remote, coord, {
+    author = "owner-Garona",
+    fromCounter = evid.fromCounter,
+    toCounter = evid.maxCounter,
+    exactAuthor = true,
+    integrityRepair = true,
+    expectedCount = evid.count,
+    expectedChecksum = evid.checksum,
+    expectedMaxCounter = evid.maxCounter,
+    expectedFromCounter = evid.fromCounter,
+    expectedToCounter = evid.toCounter,
+    expectedWindows = { evid },
+}, "REQ-CONV-BEHIND")
+Sync.cfg = Sync.cfg or {}
+local prevWindow = Sync.cfg.integrityWindowSize
+Sync.cfg.integrityWindowSize = 3
+startConv(coord)
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+Sync.state.authorWindowSummary = coord:ComputeAuthorWindowSummary(3)
+Sync.state.authorMax = coord:ComputeAuthorMax()
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remote:ComputeAuthorWindowSummary(3),
+    },
+    [ALT_C] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = { [OWNER] = 2, ["owner-Garona"] = 1 },
+        authorWindowSummary = {
+            ["owner-Garona"] = {
+                {
+                    fromCounter = 1,
+                    toCounter = 3,
+                    count = 1,
+                    maxCounter = 1,
+                    checksum = 1,
+                },
+            },
+        },
+    },
+}
+addMember(coord, ALT_C)
+coord._adminUsers = { OWNER, OTHER, ALT_C }
+assertFalse(Sync:_HasUnresolvedRemoteWindowMismatch(coord:GetProfileId()),
+    "behind admin poorer window is not an unresolved dependency")
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "behind admin does not stall identity-admin reconcile")
+startConv(coord)
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = remote:ComputeAuthorMax(),
+        authorWindowSummary = remote:ComputeAuthorWindowSummary(3),
+    },
+    [ALT_C] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = { [OWNER] = 2, ["owner-Garona"] = 1 },
+        authorWindowSummary = {
+            ["owner-Garona"] = {
+                {
+                    fromCounter = 1,
+                    toCounter = 3,
+                    count = 1,
+                    maxCounter = 1,
+                    checksum = 1,
+                },
+            },
+        },
+    },
+}
+coord._adminUsers = { OWNER, OTHER, ALT_C }
+Sync:FinalizeAdminConvergence()
+local aimedBehind = false
+for _, pending in pairs(Sync.state.requests or {}) do
+    if pending.meta and pending.meta.author == "owner-Garona" and pending.meta.preferredTarget == ALT_C then
+        aimedBehind = true
+    end
+end
+assertFalse(aimedBehind, "integrity is not aimed at a behind advertiser")
+Sync.cfg.integrityWindowSize = prevWindow
+
+-- Logical catch-up keeps in-request fallbacks when no window proof is attached.
+resetEnv()
+coord = makeProfile("ConvLogicalFb")
+addMember(coord, OTHER)
+addMember(coord, ALT_C)
+startConv(coord)
+coord._adminUsers = { OWNER, OTHER, ALT_C }
+Sync.state.adminStatuses = {
+    [OTHER] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = { [OWNER] = 2 },
+    },
+    [ALT_C] = {
+        hasProfile = true,
+        hasGaps = false,
+        authorMax = { [OWNER] = 2 },
+    },
+}
+Sync:FinalizeAdminConvergence()
+local logicalReq = nil
+for _, pending in pairs(Sync.state.requests or {}) do
+    if pending.meta and pending.meta.author == OWNER and pending.meta.integrityRepair ~= true then
+        logicalReq = pending
+    end
+end
+assertTrue(logicalReq ~= nil, "logical catch-up request exists")
+local sawOther, sawC = false, false
+for _, name in ipairs(logicalReq.targets or {}) do
+    if name == OTHER then
+        sawOther = true
+    end
+    if name == ALT_C then
+        sawC = true
+    end
+end
+assertTrue(sawOther and sawC, "logical ADMIN_LOG_REQ keeps in-request fallbacks")
+
 restoreUniqueNonces()
 end
 runAdminConvergenceIntegrityTests()
