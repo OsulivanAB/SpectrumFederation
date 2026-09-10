@@ -270,8 +270,11 @@ function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localConti
                         and remoteFilledTo < remoteWindow.toCounter
                         and localWindow
                         and localFilledTo == remoteFilledTo
+                    local behindExactAuthor = localWindow
+                        and remoteFilledTo > localFilledTo
+                        and authorContig >= remoteFilledTo
 
-                    if fullWindowReady or missingExactAuthor or partialSameFrontier then
+                    if fullWindowReady or missingExactAuthor or partialSameFrontier or behindExactAuthor then
                         local localCount = localWindow and tonumber(localWindow.count) or 0
                         local localChecksum = localWindow and tonumber(localWindow.checksum) or nil
                         local remoteChecksum = tonumber(remoteWindow.checksum) or nil
@@ -490,10 +493,14 @@ end
 -- Immutable raw spellings remain distinct for historical completeness: when
 -- logical frontiers already match, a remote raw alias that is absent or
 -- behind locally is still requested as that exact spelling.
-function Sync:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax)
+-- localAuthorMax may be a contig map that stamps every alias with the logical
+-- head. localRawAuthorMax, when provided, is ComputeAuthorMax (per exact
+-- `_author`) and is the source of truth for that completeness pass.
+function Sync:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax, localRawAuthorMax)
     local missing = {}
     if type(remoteAuthorMax) ~= "table" then return missing end
     localAuthorMax = localAuthorMax or {}
+    local exactSource = type(localRawAuthorMax) == "table" and localRawAuthorMax or localAuthorMax
 
     local localLogical = CollapseAuthorCounterMap(localAuthorMax)
     local remoteLogical = CollapseAuthorCounterMap(remoteAuthorMax)
@@ -511,7 +518,7 @@ function Sync:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax)
     for author, remoteMax in pairs(remoteAuthorMax) do
         remoteMax = tonumber(remoteMax)
         if type(author) == "string" and author ~= "" and remoteMax and remoteMax >= 1 then
-            local localExact = ExactAuthorCounter(localAuthorMax, author)
+            local localExact = ExactAuthorCounter(exactSource, author)
             if localExact < remoteMax then
                 local logicalMax = 0
                 local collapsed = localLogical[ (SF.LootHelperIdentity and SF.LootHelperIdentity.CanonicalAuthorKey and SF.LootHelperIdentity.CanonicalAuthorKey(author)) or string.lower(author) ]
@@ -863,7 +870,7 @@ function Sync:IsIdentityAdminReconcileReady(profileId)
     for author, maxCounter in pairs(localMax) do
         known[author] = math.max(known[author] or 0, tonumber(maxCounter) or 0)
     end
-    local missing = self:ComputeMissingLogRequests(contig, known)
+    local missing = self:ComputeMissingLogRequests(contig, known, localMax)
     if type(missing) == "table" and #missing > 0 then
         return false
     end

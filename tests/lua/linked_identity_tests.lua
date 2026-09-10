@@ -4261,7 +4261,7 @@ local function discoverFrom(dst, src)
     registerProfile(dst)
     local contig = Sync:ComputeContigAuthorMax(dst:GetProfileId())
     local remoteMax = src:ComputeAuthorMax()
-    local missing = Sync:ComputeMissingLogRequests(contig, remoteMax)
+    local missing = Sync:ComputeMissingLogRequests(contig, remoteMax, dst:ComputeAuthorMax())
     local remoteWindows = src:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
     local integrity = Sync:ComputeWindowMismatchRequests(dst:GetProfileId(), remoteWindows, contig)
     return missing, integrity, contig
@@ -4380,6 +4380,14 @@ assertEq(#catchUp, 1, "logical catch-up still requests one range")
 assertEq(catchUp[1].fromCounter, 7, "logical catch-up still starts at 7")
 assertEq(catchUp[1].toCounter, 7, "logical catch-up still ends at 7")
 assertTrue(rangeForAuthor(catchUp, "owner-Garona") == nil, "logical catch-up does not request a 1-6 alias gap")
+local behindMissing = Sync:ComputeMissingLogRequests(
+    { [OWNER] = 3, ["owner-Garona"] = 3, ["owner-garona"] = 3 },
+    { [OWNER] = 3, ["owner-Garona"] = 3 },
+    { [OWNER] = 3, ["owner-Garona"] = 1 }
+)
+assertTrue(rangeForAuthor(behindMissing, "owner-Garona") ~= nil, "behind-but-present alias is not treated as complete")
+assertEq(rangeForAuthor(behindMissing, "owner-Garona").fromCounter, 1, "behind alias requests from 1")
+assertEq(rangeForAuthor(behindMissing, "owner-Garona").toCounter, 3, "behind alias requests through remote max")
 
 -- Automatic discovery of overlapping Owner-Garona:1 / owner-Garona:1
 resetEnv()
@@ -4437,6 +4445,50 @@ assertTrue((spellContig[OWNER] or 0) >= 1, "title-case contig is present")
 local remoteWindows = profile:ComputeAuthorWindowSummary(25)
 local spellMismatch = Sync:ComputeWindowMismatchRequests(destSpell:GetProfileId(), remoteWindows, spellContig)
 assertTrue(rangeForAuthor(spellMismatch, "owner-Garona") ~= nil, "unseen remote spelling is not skipped as contig 0")
+
+resetEnv()
+profile = makeProfile("AliasBehindA")
+addMember(profile, ALT_A)
+for i = 2, 3 do
+    assertTrue(profile:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = i,
+    }, { author = OWNER, counter = i, timestamp = 1700008290 + i }) }) > 0, "shared Owner-Garona:" .. tostring(i))
+end
+for i = 1, 3 do
+    assertTrue(profile:MergeLogTables({ makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = i,
+    }, { author = "owner-Garona", counter = i, timestamp = 1700008300 + i }) }) > 0, "authoritative owner-Garona:" .. tostring(i))
+end
+if profile.RebuildLogIndex then
+    profile:RebuildLogIndex()
+end
+local destBehind = makeProfile("AliasBehindB")
+if destBehind.RebuildLogIndex then
+    destBehind:RebuildLogIndex()
+end
+destBehind._profileId = profile:GetProfileId()
+addMember(destBehind, ALT_A)
+local behindKeep = {}
+for _, log in ipairs(profile:GetLootLogs()) do
+    local id = log:GetID()
+    if id ~= "owner-Garona:2" and id ~= "owner-Garona:3" then
+        behindKeep[#behindKeep + 1] = log:ToTable()
+    end
+end
+destBehind:MergeLogTables(behindKeep, { allowReplaceExisting = true })
+if destBehind.RebuildLogIndex then
+    destBehind:RebuildLogIndex()
+end
+destBehind:ApplyIdentityProjection({ force = true })
+assertTrue(hasLogId(destBehind, "owner-Garona:1"), "behind peer keeps owner-Garona:1")
+assertFalse(hasLogId(destBehind, "owner-Garona:2"), "behind peer lacks owner-Garona:2")
+local behindMissing, behindIntegrity = discoverFrom(destBehind, profile)
+assertTrue(rangeForAuthor(behindMissing, "owner-Garona") ~= nil, "production missing-range discovers behind alias spelling")
+assertTrue(rangeForAuthor(behindIntegrity, "owner-Garona") ~= nil, "integrity also discovers behind alias spelling")
 
 -- OrderLogs retains both rows at one logical counter
 resetEnv()

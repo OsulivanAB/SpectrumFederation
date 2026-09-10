@@ -326,7 +326,7 @@ function Sync:FinalizeAdminConvergence()
     else
         self.state.authorMax = targetMax
     end
-    local missing = self:ComputeMissingLogRequests(localContig, targetMax)
+    local missing = self:ComputeMissingLogRequests(localContig, targetMax, self:ComputeAuthorMax(profileId))
     if type(missing) == "table" and #missing > 0 and self.QueueRepairRanges then
         self:QueueRepairRanges(profileId, missing, {
             mode = "missing",

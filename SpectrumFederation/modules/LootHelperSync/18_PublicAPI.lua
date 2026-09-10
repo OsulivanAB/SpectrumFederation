@@ -355,7 +355,7 @@ function Sync:RequestManualSync(reason)
     else
         local localContig = self:ComputeContigAuthorMax(profileId)
         local remoteAuthorMax = self.state.authorMax or {}
-        local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax) or {}
+        local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax, self:ComputeAuthorMax(profileId)) or {}
 
         if #missing > 0 then
             local hasNewRequests = false

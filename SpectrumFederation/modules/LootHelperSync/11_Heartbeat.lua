@@ -359,7 +359,7 @@ function Sync:AssessLocalState(profileId, sessionAuthorMax)
     end
 
     -- Compute missing log requests
-    local missingRanges = self:ComputeMissingLogRequests(localContig, sessionAuthorMax)
+    local missingRanges = self:ComputeMissingLogRequests(localContig, sessionAuthorMax, self:ComputeAuthorMax(profileId))
     if not missingRanges then
         missingRanges = {}
     end
@@ -436,7 +436,7 @@ function Sync:SendJoinStatus()
 
     local localContig = self:ComputeContigAuthorMax(profileId)
     local remoteAuthorMax = self.state.authorMax or {}
-    local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax)
+    local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax, localAuthorMax)
     local integrityRanges = self:ComputeWindowMismatchRequests(profileId, self.state.authorWindowSummary or {}, localContig)
 
     if missing and #missing > 0 then

@@ -495,7 +495,8 @@ function Sync:HandleSessionHeartbeat(sender, payload)
             -- If we have the profile, request missing logs (if any)
             local localContig = self:ComputeContigAuthorMax(self.state.profileId)   -- Bug: Don't we have our Authormax values saved? recalculating our Authormax maps every 30 seconds seems intense
             local remoteMax = self.state.authorMax or {}
-            local missing = self:ComputeMissingLogRequests(localContig, remoteMax)
+            local localRawMax = self:ComputeAuthorMax(self.state.profileId)
+            local missing = self:ComputeMissingLogRequests(localContig, remoteMax, localRawMax)
             local integrityRanges = self:ComputeWindowMismatchRequests(
                 self.state.profileId,
                 self.state.authorWindowSummary or {},

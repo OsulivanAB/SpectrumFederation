@@ -193,7 +193,7 @@ function Sync:_LiveRelationshipPredecessorState(profileId, logTable)
     if type(incomingAuthor) == "string" and type(incomingCounter) == "number" then
         known[incomingAuthor] = math.min(tonumber(known[incomingAuthor]) or incomingCounter, incomingCounter)
     end
-    local missing = self:ComputeMissingLogRequests(contig, known)
+    local missing = self:ComputeMissingLogRequests(contig, known, localMax)
     if type(missing) == "table" and #missing > 0 then
         return false, missing, false, nil, nil
     end
