@@ -356,7 +356,7 @@ function Sync:RequestManualSync(reason)
         local localContig = self:ComputeContigAuthorMax(profileId)
         local remoteAuthorMax = self.state.authorMax or {}
         local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax, self:ComputeAuthorMax(profileId)) or {}
-        self:_AttachExactWindowEvidence(missing, self.state.authorWindowSummary or {})
+        self:_BindSessionWindowEvidence(missing)
 
         if #missing > 0 then
             local hasNewRequests = false

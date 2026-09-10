@@ -549,6 +549,147 @@ function Sync:_ScanExactAuthorRange(profileId, author, fromCounter, toCounter)
     return count, maxInRange, ExactRangeFingerprintRollup(rows)
 end
 
+function Sync:_RangeHasWindowEvidence(range)
+    if type(range) ~= "table" then
+        return false
+    end
+    if type(range.expectedWindows) == "table" and #range.expectedWindows > 0 then
+        return true
+    end
+    if range.expectedCount ~= nil or range.expectedChecksum ~= nil then
+        return true
+    end
+    return false
+end
+
+function Sync:_MakeExactRowWindowEvidence(author, counter, logId, fingerprint)
+    counter = tonumber(counter)
+    if type(author) ~= "string" or author == "" or not counter then
+        return nil
+    end
+    counter = math.max(1, math.floor(counter))
+    local row = ("%s=%s"):format(tostring(logId or ""), tostring(fingerprint or 0))
+    local checksum = ExactRangeFingerprintRollup({ row })
+    return {
+        fromCounter = counter,
+        toCounter = counter,
+        count = 1,
+        maxCounter = counter,
+        checksum = checksum,
+    }
+end
+
+function Sync:_StampExactRowWindowEvidence(range, logId, fingerprint)
+    if type(range) ~= "table" or self:_RangeHasWindowEvidence(range) then
+        return range
+    end
+    local window = self:_MakeExactRowWindowEvidence(range.author, range.fromCounter, logId, fingerprint)
+    if not window then
+        return range
+    end
+    range.expectedWindows = { window }
+    range.expectedCount = window.count
+    range.expectedChecksum = window.checksum
+    range.expectedMaxCounter = window.maxCounter
+    range.expectedFromCounter = window.fromCounter
+    range.expectedToCounter = window.toCounter
+    return range
+end
+
+function Sync:_UpgradeOutstandingLogRangeEvidence(profileId, author, fromCounter, toCounter, src)
+    if type(src) ~= "table" or not self:_RangeHasWindowEvidence(src) then
+        return false
+    end
+    if type(profileId) ~= "string" or profileId == "" then
+        return false
+    end
+    if type(author) ~= "string" or author == "" then
+        return false
+    end
+    fromCounter = tonumber(fromCounter)
+    toCounter = tonumber(toCounter)
+    if not fromCounter or not toCounter then
+        return false
+    end
+
+    local upgraded = false
+    local function consider(dest)
+        if type(dest) ~= "table" then
+            return
+        end
+        if dest.profileId ~= profileId or dest.author ~= author then
+            return
+        end
+        local f = tonumber(dest.fromCounter)
+        local t = tonumber(dest.toCounter)
+        if not f or not t then
+            return
+        end
+        if f <= fromCounter and t >= toCounter and not self:_RangeHasWindowEvidence(dest) then
+            self:_CopyExpectedWindowEvidence(src, dest)
+            upgraded = true
+        end
+    end
+
+    if type(self.state) == "table" and type(self.state.requests) == "table" then
+        for _, req in pairs(self.state.requests) do
+            if type(req) == "table"
+                and (req.kind == "NEED_LOGS" or req.kind == "LOG_REQ" or req.kind == "ADMIN_LOG_REQ")
+            then
+                consider(req.meta)
+            end
+        end
+    end
+    local queue = self.state and self.state.repairQueue
+    if type(queue) == "table" and type(queue.items) == "table" then
+        for _, entry in pairs(queue.items) do
+            consider(entry)
+        end
+    end
+    return upgraded
+end
+
+function Sync:_BindSessionWindowEvidence(ranges)
+    if type(ranges) ~= "table" then
+        return ranges
+    end
+    if self.state and self.state.isCoordinator then
+        return ranges
+    end
+    return self:_AttachExactWindowEvidence(ranges, (self.state and self.state.authorWindowSummary) or {})
+end
+
+function Sync:_IntegrityRangesFromAdvertisement(payload, sender)
+    local advertisedRanges = {}
+    if type(payload) ~= "table" then
+        return advertisedRanges
+    end
+    for _, range in ipairs(payload.mutationRanges or {}) do
+        if type(range) == "table"
+            and type(range.author) == "string"
+            and type(range.fromCounter) == "number"
+            and type(range.toCounter) == "number"
+        then
+            local advertised = {
+                author = range.author,
+                fromCounter = range.fromCounter,
+                toCounter = range.toCounter,
+                mode = "integrity",
+                exactAuthor = true,
+                preferredTarget = sender,
+            }
+            self:_CopyExpectedWindowEvidence(range, advertised)
+            advertisedRanges[#advertisedRanges + 1] = advertised
+        end
+    end
+    local advertiserSummary = payload.authorWindowSummary or payload.localWindowSummary
+    if type(advertiserSummary) == "table" then
+        self:_AttachExactWindowEvidence(advertisedRanges, advertiserSummary)
+    end
+    self:_BindSessionWindowEvidence(advertisedRanges)
+    return advertisedRanges
+end
+
 function Sync:_CollectOverlappingWindowEvidence(remoteSummary, author, fromCounter, toCounter)
     local out = {}
     if type(remoteSummary) ~= "table" or type(author) ~= "string" or author == "" then
@@ -663,7 +804,9 @@ function Sync:_ExactAuthorEvidenceSatisfied(profileId, author, expectedWindows)
         if expectedChecksum ~= nil and checksum ~= expectedChecksum then
             return false
         end
-        if expectedCount == nil and expectedChecksum == nil and (expectedMax == nil or expectedMax <= 0) then
+        -- Retained max is not set completeness. Count and/or checksum must
+        -- prove which exact rows belong in the window.
+        if expectedCount == nil and expectedChecksum == nil then
             return false
         end
     end
@@ -687,7 +830,21 @@ function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCount
     opts = type(opts) == "table" and opts or {}
     local expectedWindows = self:_NormalizeExpectedWindows(opts, fromCounter, toCounter)
     if not expectedWindows then
-        return false
+        -- Members may late-bind coordinator-advertised windows that were
+        -- present in session state but not copied onto the request. The
+        -- coordinator must not treat its own local summary as advertiser
+        -- proof for a peer mutation or fingerprint repair.
+        if self.state and self.state.isCoordinator ~= true then
+            expectedWindows = self:_CollectOverlappingWindowEvidence(
+                self.state.authorWindowSummary,
+                author,
+                fromCounter,
+                toCounter
+            )
+        end
+        if type(expectedWindows) ~= "table" or #expectedWindows == 0 then
+            return false
+        end
     end
     return self:_ExactAuthorEvidenceSatisfied(profileId, author, expectedWindows)
 end
@@ -1512,6 +1669,7 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
     if type(ranges) ~= "table" or #ranges == 0 then return false end
 
     opts = type(opts) == "table" and opts or {}
+    self:_BindSessionWindowEvidence(ranges)
 
     local targets = nil
     if type(preferredTarget) == "string" and preferredTarget ~= "" then
@@ -1533,6 +1691,21 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
 
     local count = 0
     for _, range in ipairs(ranges) do
+        if type(range) == "table"
+            and type(range.author) == "string"
+            and type(range.fromCounter) == "number"
+            and type(range.toCounter) == "number"
+            and range.fromCounter >= 1
+            and range.toCounter >= 1
+        then
+            self:_UpgradeOutstandingLogRangeEvidence(
+                profileId,
+                range.author,
+                range.fromCounter,
+                range.toCounter,
+                range
+            )
+        end
         if type(range) == "table"
             and type(range.author) == "string"
             and type(range.fromCounter) == "number"
@@ -1581,9 +1754,17 @@ end
 
 function Sync:AdvertiseProfileMutation(profileId, ranges, reason)
     if type(profileId) ~= "string" or profileId == "" then return false end
+    ranges = type(ranges) == "table" and ranges or {}
+    for _, range in ipairs(ranges) do
+        if type(range) == "table" then
+            range.mode = range.mode or "integrity"
+            range.exactAuthor = true
+        end
+    end
+    self:_AttachExactWindowEvidence(ranges, self:ComputeAuthorWindowSummary(profileId) or {})
     self.state._pendingMutationAdvertisement = {
         profileId = profileId,
-        ranges = type(ranges) == "table" and ranges or {},
+        ranges = ranges,
         reason = reason,
     }
     return true

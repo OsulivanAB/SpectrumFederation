@@ -6098,6 +6098,210 @@ Sync.state.authorWindowSummary = dest:ComputeAuthorWindowSummary(Sync:GetIntegri
 assertTrue(Sync:IsIdentityAdminReconcileReady(dest:GetProfileId()), "reconcile may proceed after integrity proof matches")
 Sync:ScheduleIdentityAdminReconcile(dest:GetProfileId())
 assertTrue(dest:IsAdminMemberId(ALT_B), "reconcile grants after exact integrity is proven")
+
+local function runExactAuthorHangTests()
+-- Mutation integrity without pre-stamped windows binds session proof and
+-- still refuses to complete on max alone while :1 is missing.
+resetEnv()
+src = seedSparseExact("ProofHangMutA")
+dest = cloneWithout(src, "ProofHangMutB", "owner-Garona:1")
+registerProfile(dest)
+activateSession(dest)
+Sync.state.isCoordinator = false
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 1
+Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+local srcSummary = src:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.authorWindowSummary = srcSummary
+assertTrue(ProductionSync.QueueRepairRanges(Sync, dest:GetProfileId(), {
+    {
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 3,
+        mode = "integrity",
+        exactAuthor = true,
+    },
+}, { mode = "integrity", reason = "proof-mutation-no-windows" }), "proof-less mutation integrity still queues")
+local queuedMutation = nil
+for _, entry in pairs(Sync.state.repairQueue.items or {}) do
+    if entry.mode == "integrity" and entry.author == "owner-Garona" then
+        queuedMutation = entry
+    end
+end
+assertTrue(queuedMutation ~= nil, "mutation integrity queue entry exists")
+assertTrue(type(queuedMutation.expectedWindows) == "table" and #queuedMutation.expectedWindows > 0,
+    "queue stamps session window proof onto proof-less mutation integrity")
+assertEq(queuedMutation.expectedCount, srcSummary["owner-Garona"][1].count,
+    "stamped mutation evidence uses advertiser count")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(dest:GetProfileId(), "owner-Garona", 1, 3),
+    "late-bind session proof still fails while owner-Garona:1 is missing")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(dest:GetProfileId(), "owner-Garona", 1, 3, {
+    expectedMaxCounter = 3,
+}), "exact max 3 without count/checksum is not window proof")
+
+-- AdvertiseProfileMutation stamps the advertiser's local windows.
+resetEnv()
+src = seedSparseExact("ProofHangAdvA")
+registerProfile(src)
+activateSession(src)
+assertTrue(Sync:AdvertiseProfileMutation(src:GetProfileId(), {
+    { author = "owner-Garona", fromCounter = 1, toCounter = 3 },
+}, "proof-advertise"), "mutation advertisement stored")
+local pending = Sync.state._pendingMutationAdvertisement
+assertTrue(pending ~= nil and type(pending.ranges) == "table" and pending.ranges[1] ~= nil,
+    "pending mutation ranges exist")
+assertTrue(type(pending.ranges[1].expectedWindows) == "table" and #pending.ranges[1].expectedWindows > 0,
+    "advertiser stamps overlapping local windows onto mutation ranges")
+
+-- Proof-less outstanding integrity is upgraded instead of blocking later proof.
+resetEnv()
+src = seedSparseExact("ProofHangUpA")
+dest = cloneWithout(src, "ProofHangUpB", "owner-Garona:1")
+registerProfile(dest)
+activateSession(dest)
+evid = ownerWindow(src)
+Sync.state.requests["REQ-PROOFLESS"] = {
+    kind = "LOG_REQ",
+    meta = {
+        profileId = dest:GetProfileId(),
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 3,
+        exactAuthor = true,
+        integrityRepair = true,
+    },
+}
+assertTrue(Sync:_HasOutstandingLogRangeRequest(dest:GetProfileId(), "owner-Garona", 1, 3, true, true),
+    "proof-less integrity is outstanding")
+Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+assertFalse(ProductionSync.QueueRepairRanges(Sync, dest:GetProfileId(), {
+    {
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 3,
+        mode = "integrity",
+        exactAuthor = true,
+        expectedCount = evid.count,
+        expectedChecksum = evid.checksum,
+        expectedMaxCounter = evid.maxCounter,
+        expectedFromCounter = evid.fromCounter,
+        expectedToCounter = evid.toCounter,
+        expectedWindows = {
+            {
+                fromCounter = evid.fromCounter,
+                toCounter = evid.toCounter,
+                count = evid.count,
+                maxCounter = evid.maxCounter,
+                checksum = evid.checksum,
+            },
+        },
+    },
+}, { mode = "integrity", reason = "proof-upgrade" }), "later evidence does not duplicate an outstanding integrity request")
+assertEq(Sync.state.requests["REQ-PROOFLESS"].meta.expectedChecksum, evid.checksum,
+    "outstanding proof-less integrity is upgraded with advertised checksum")
+assertTrue(type(Sync.state.requests["REQ-PROOFLESS"].meta.expectedWindows) == "table"
+    and #Sync.state.requests["REQ-PROOFLESS"].meta.expectedWindows > 0,
+    "upgraded outstanding request carries expectedWindows")
+applyDiscoveredRange(src, dest, {
+    author = "owner-Garona",
+    fromCounter = 1,
+    toCounter = 3,
+    exactAuthor = true,
+    integrityRepair = true,
+    expectedCount = evid.count,
+    expectedChecksum = evid.checksum,
+    expectedMaxCounter = evid.maxCounter,
+    expectedFromCounter = evid.fromCounter,
+    expectedToCounter = evid.toCounter,
+    expectedWindows = Sync.state.requests["REQ-PROOFLESS"].meta.expectedWindows,
+}, "REQ-PROOFLESS")
+assertTrue(hasLogId(dest, "owner-Garona:1"), "upgraded integrity obtained owner-Garona:1")
+assertFalse(hasLogId(dest, "owner-Garona:2"), "upgraded integrity does not invent owner-Garona:2")
+assertTrue(Sync.state.requests["REQ-PROOFLESS"] == nil, "upgraded integrity completes after window proof matches")
+
+-- Heartbeat mutation copies advertiser windows even when range fields omit them.
+resetEnv()
+src = seedSparseExact("ProofHangHbA")
+dest = cloneWithout(src, "ProofHangHbB", "owner-Garona:1")
+registerProfile(dest)
+activateSession(dest)
+PLAYER = OTHER
+Sync.state.isCoordinator = false
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 1
+Sync.state.heartbeat = { lastCatchupAt = 0 }
+Sync.cfg.catchupOnHeartbeatCooldownSec = 10
+Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+local hbSummary = src:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync:HandleSessionHeartbeat(OWNER, {
+    sessionId = "SES1",
+    profileId = dest:GetProfileId(),
+    coordinator = OWNER,
+    coordEpoch = 1,
+    helpers = {},
+    authorMax = src:ComputeAuthorMax(),
+    authorWindowSummary = hbSummary,
+    integrityHint = "mutation",
+    mutationReason = "proof-heartbeat-mutation",
+    mutationRanges = {
+        { author = "owner-Garona", fromCounter = 1, toCounter = 3 },
+    },
+    sentAt = 1,
+})
+PLAYER = OWNER
+queuedMutation = nil
+for _, entry in pairs(Sync.state.repairQueue.items or {}) do
+    if entry.mode == "integrity" and entry.author == "owner-Garona" then
+        queuedMutation = entry
+    end
+end
+assertTrue(queuedMutation ~= nil, "heartbeat mutation queued integrity without pre-stamped range windows")
+assertTrue(type(queuedMutation.expectedWindows) == "table" and #queuedMutation.expectedWindows > 0,
+    "heartbeat mutation attached overlapping advertiser windows")
+assertEq(queuedMutation.expectedChecksum, hbSummary["owner-Garona"][1].checksum,
+    "heartbeat mutation evidence matches advertiser checksum")
+
+-- Single-counter NEW_LOG fingerprint mismatch stamps row proof.
+resetEnv()
+src = seedSparseExact("ProofHangFpA")
+dest = cloneWithout(src, "ProofHangFpB", "__none__")
+local incoming = src:GetLogById("owner-Garona:1"):ToTable()
+local localWrong = dest:GetLogById("owner-Garona:1"):ToTable()
+localWrong._data = { member = ALT_A, change = SF.LootLogPointChangeTypes.INCREMENT, amount = 99 }
+localWrong._fingerprint = SF.LootLog.ComputeFingerprintFromTable(localWrong)
+assertTrue(dest:MergeLogTables({ localWrong }, { allowReplaceExisting = true }) >= 0,
+    "local installs mismatched owner-Garona:1 for NEW_LOG")
+registerProfile(dest)
+activateSession(dest)
+Sync.state.isCoordinator = true
+Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+Sync:HandleNewLog(OWNER, {
+    sessionId = "SES1",
+    profileId = dest:GetProfileId(),
+    log = incoming,
+})
+local queuedFp = nil
+for _, entry in pairs(Sync.state.repairQueue.items or {}) do
+    if entry.mode == "integrity" and entry.author == "owner-Garona" then
+        queuedFp = entry
+    end
+end
+assertTrue(queuedFp ~= nil, "NEW_LOG fingerprint mismatch queued integrity")
+assertEq(queuedFp.fromCounter, 1, "fingerprint integrity is the mismatched counter")
+assertEq(queuedFp.toCounter, 1, "fingerprint integrity stays single-counter")
+assertTrue(type(queuedFp.expectedWindows) == "table" and #queuedFp.expectedWindows > 0,
+    "fingerprint integrity carries row window proof")
+assertEq(queuedFp.expectedCount, 1, "fingerprint row proof expects a single exact row")
+local rowWindow = Sync:_MakeExactRowWindowEvidence("owner-Garona", 1, "owner-Garona:1", incoming._fingerprint)
+assertEq(queuedFp.expectedChecksum, rowWindow.checksum, "fingerprint proof checksum matches incoming row")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(dest:GetProfileId(), "owner-Garona", 1, 1, {
+    expectedWindows = queuedFp.expectedWindows,
+    expectedCount = queuedFp.expectedCount,
+    expectedChecksum = queuedFp.expectedChecksum,
+    expectedMaxCounter = queuedFp.expectedMaxCounter,
+}), "mismatched local fingerprint does not satisfy incoming row proof")
+end
+runExactAuthorHangTests()
 end
 runExactAuthorProofTests()
 

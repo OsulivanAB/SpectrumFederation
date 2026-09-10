@@ -470,23 +470,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     self:TouchPeer(sender, { inGroup = true })
 
     if not self.state.isCoordinator and payload.integrityHint == "mutation" then
-        local advertisedRanges = {}
-        for _, range in ipairs(payload.mutationRanges or {}) do
-            if type(range) == "table"
-                and type(range.author) == "string"
-                and type(range.fromCounter) == "number"
-                and type(range.toCounter) == "number"
-            then
-                advertisedRanges[#advertisedRanges + 1] = {
-                    author = range.author,
-                    fromCounter = range.fromCounter,
-                    toCounter = range.toCounter,
-                    mode = "integrity",
-                    preferredTarget = sender,
-                }
-            end
-        end
-
+        local advertisedRanges = self:_IntegrityRangesFromAdvertisement(payload, sender)
         if #advertisedRanges > 0 then
             self:QueueRepairRanges(self.state.profileId, advertisedRanges, {
                 mode = "integrity",
@@ -535,6 +519,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
                         if r.exactAuthor then
                             r.preferredTarget = r.preferredTarget or sender
                         end
+                        self:_UpgradeOutstandingLogRangeEvidence(self.state.profileId, a, f, t, r)
                         if not self:_HasOutstandingLogRangeRequest(self.state.profileId, a, f, t, r.exactAuthor == true) then
                             table.insert(filtered, r)
                         end
@@ -639,22 +624,7 @@ function Sync:_HandlePeerIntegrityAdvertisement(sender, payload)
     if payload.integrityHint ~= "mutation" then return end
     if not self:IsSenderAuthorized(payload.profileId, sender) then return end
 
-    local ranges = {}
-    for _, range in ipairs(payload.mutationRanges or {}) do
-        if type(range) == "table"
-            and type(range.author) == "string"
-            and type(range.fromCounter) == "number"
-            and type(range.toCounter) == "number"
-        then
-            ranges[#ranges + 1] = {
-                author = range.author,
-                fromCounter = range.fromCounter,
-                toCounter = range.toCounter,
-                mode = "integrity",
-            }
-        end
-    end
-
+    local ranges = self:_IntegrityRangesFromAdvertisement(payload, sender)
     if #ranges > 0 then
         self:QueueRepairRanges(payload.profileId, ranges, {
             mode = "integrity",

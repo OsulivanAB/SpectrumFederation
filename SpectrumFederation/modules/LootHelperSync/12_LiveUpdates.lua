@@ -532,14 +532,18 @@ function Sync:HandleNewLog(sender, payload)
             local isExternal = SF.LootLog and SF.LootLog.IsExternalLogTable and SF.LootLog.IsExternalLogTable(logTable)
             local isSequential = SF.LootLog and SF.LootLog.IsSequentialCounter and SF.LootLog.IsSequentialCounter(counter)
             if (not isExternal) and type(author) == "string" and isSequential then
+                local range = {
+                    author = author,
+                    fromCounter = counter,
+                    toCounter = counter,
+                    mode = "integrity",
+                    preferredTarget = target,
+                    exactAuthor = true,
+                }
+                self:_StampExactRowWindowEvidence(range, logId, incomingFingerprint)
+                self:_BindSessionWindowEvidence({ range })
                 self:QueueRepairRanges(profileId, {
-                    {
-                        author = author,
-                        fromCounter = counter,
-                        toCounter = counter,
-                        mode = "integrity",
-                        preferredTarget = target,
-                    }
+                    range
                 }, {
                     mode = "integrity",
                     reason = "new-log-mismatch",

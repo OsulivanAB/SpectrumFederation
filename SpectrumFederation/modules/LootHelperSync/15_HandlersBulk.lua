@@ -239,6 +239,9 @@ function Sync:HandleAuthLogs(sender, payload)
                 -- and incomplete integrity subsets must not complete
                 -- exact-author repairs. Coordinator fallback has to keep
                 -- running until the requested window is actually filled.
+                -- Members late-bind coordinator-advertised windows onto
+                -- in-flight exact requests that were queued without proof.
+                self:_BindSessionWindowEvidence({ req.meta })
                 requestSatisfied = self:_ExactAuthorRangeSatisfied(
                     payload.profileId,
                     req.meta.author,

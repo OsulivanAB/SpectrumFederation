@@ -289,7 +289,7 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
     if type(missingRanges) ~= "table" or #missingRanges == 0 then return false end
 
     opts = type(opts) == "table" and opts or {}
-    self:_AttachExactWindowEvidence(missingRanges, self.state.authorWindowSummary or {})
+    self:_BindSessionWindowEvidence(missingRanges)
 
     -- Cap to avoid spamming
     local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeededLogs) or 8
@@ -304,6 +304,22 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
             and type(range.toCounter) == "number"
         then
             local exactAuthor = range.exactAuthor == true or opts.exactAuthor == true
+            self:_UpgradeOutstandingLogRangeEvidence(
+                self.state.profileId,
+                range.author,
+                range.fromCounter,
+                range.toCounter,
+                range
+            )
+            if self:_HasOutstandingLogRangeRequest(
+                self.state.profileId,
+                range.author,
+                range.fromCounter,
+                range.toCounter,
+                exactAuthor
+            ) then
+                count = count + 1
+            else
             local preferredTarget = range.preferredTarget or opts.preferredTarget
             local targetOpts = nil
             if exactAuthor then
@@ -344,6 +360,7 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
                         tonumber(range.toCounter) or 0,
                         tostring(targets[1]), #targets, table.concat(targets, ", "))
                 end
+            end
             end
         end
     end
@@ -469,9 +486,11 @@ function Sync:SendJoinStatus()
                 if type(author) == "string"
                     and type(fromCounter) == "number"
                     and type(toCounter) == "number"
-                    and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, range.exactAuthor == true)
                 then
-                    table.insert(filtered, range)
+                    self:_UpgradeOutstandingLogRangeEvidence(profileId, author, fromCounter, toCounter, range)
+                    if not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, range.exactAuthor == true) then
+                        table.insert(filtered, range)
+                    end
                 end
             end
         end

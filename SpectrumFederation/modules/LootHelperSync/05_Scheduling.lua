@@ -170,6 +170,9 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
     if type(ranges) ~= "table" or #ranges == 0 then return false end
 
     opts = type(opts) == "table" and opts or {}
+    if self._BindSessionWindowEvidence then
+        self:_BindSessionWindowEvidence(ranges)
+    end
 
     local queue = self:_EnsureRepairQueueState()
     local added = 0
@@ -194,7 +197,11 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
             else
             fromCounter = math.max(1, math.floor(fromCounter))
             toCounter = math.max(1, math.floor(toCounter))
-            if fromCounter <= toCounter and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, exactAuthor, mode == "integrity") then
+            if fromCounter <= toCounter then
+            if self._UpgradeOutstandingLogRangeEvidence then
+                self:_UpgradeOutstandingLogRangeEvidence(profileId, author, fromCounter, toCounter, range)
+            end
+            if not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, exactAuthor, mode == "integrity") then
                 local key = self:_MakeRepairQueueKey(profileId, author, fromCounter, toCounter, mode, exactAuthor)
                 local entry = queue.items[key]
                 if not entry then
@@ -239,6 +246,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                         entry.nextAttemptAt = now
                     end
                 end
+            end
             end
             end
         end
