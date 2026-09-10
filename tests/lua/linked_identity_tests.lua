@@ -112,6 +112,8 @@ loadModule("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/08_Requests.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/12_LiveUpdates.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/15_HandlersBulk.lua")
 
 function SF:GetPlayerFullIdentifier()
     return PLAYER
@@ -198,10 +200,27 @@ function Sync:_MObserve()
 end
 function Sync:_MetricsUpdateRequestQueueGauges()
 end
+function Sync:SetPeerSyncState()
+end
+function Sync:BroadcastSessionHeartbeat()
+end
+
+local capturedComm = {}
+SF.LootHelperComm = {
+    Send = function(_, prefix, msgType, payload, dist, target)
+        capturedComm[#capturedComm + 1] = {
+            prefix = prefix,
+            msgType = msgType,
+            payload = payload,
+            target = target,
+        }
+    end,
+}
 
 local function resetEnv()
     printed = {}
     deferredAfter = {}
+    capturedComm = {}
     PLAYER = "Owner-Garona"
     NOW = 1700001000
     SF.lootHelperDB = {
@@ -309,6 +328,11 @@ end
 local function armorOf(profile, id, slot)
     local member = memberOf(profile, id)
     return member and member.armor and member.armor[slot]
+end
+
+local function slotOverflow(profile, id, key)
+    local counts = SF.LootHelperIdentity.ComponentConflictCounts(profile._identityProjection, id)
+    return (counts and counts[key]) or 0
 end
 
 local function makeTable(eventType, data, extra)
@@ -3817,8 +3841,353 @@ assertEq(depStats.n, 201, "dependency-heavy history n")
 assertTrue((depStats.edgeCalls or 0) > (depStats.edgeInserts or 0), "duplicate predecessor edges are detected")
 assertTrue((depStats.edgeCalls or 0) < depStats.n * 8, "shared predecessor heads stay linear in edge work")
 assertTrue((depStats.heapOps or 0) < depStats.n * depStats.n / 8, "heap work stays far below n^2")
+
+resetEnv()
+profile = makeProfile("ReuseDisplayedChest")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A local Chest USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B projects Chest USED")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "Chest projected USED after LINK")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "identity Chest AVAILABLE")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "displayed Chest AVAILABLE")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "identity Chest USED re-use")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "re-used displayed Chest is USED")
+assertEq(slotOverflow(profile, ALT_A, "Chest"), 0, "AVAILABLE then USED does not phantom-overflow Chest")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "Chest re-use overflow is 0")
+checkSurfaces(profile, "ReuseDisplayedChest", function(p, label)
+    assertTrue(armorOf(p, ALT_A, "Chest"), label .. ": Chest USED")
+    assertEq(slotOverflow(p, ALT_A, "Chest"), 0, label .. ": Chest overflow 0")
+end)
+
+resetEnv()
+profile = makeProfile("ReuseDisplayedChestTwice")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "A local Chest USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "AVAILABLE")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "AVAILABLE again")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile }), "USED again")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "second re-use is USED")
+assertEq(slotOverflow(profile, ALT_A, "Chest"), 0, "AVAILABLE/USED/AVAILABLE/USED overflow stays 0")
+checkSurfaces(profile, "ReuseDisplayedChestTwice", function(p, label)
+    assertTrue(armorOf(p, ALT_A, "Chest"), label .. ": Chest USED")
+    assertEq(slotOverflow(p, ALT_A, "Chest"), 0, label .. ": Chest overflow 0")
+end)
+
+resetEnv()
+profile = makeProfile("ReuseDisplayedRing2")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B before ring projection")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring1", { profile = profile }), "projected Ring1 USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring2", { profile = profile }), "historical projected Ring2 USED")
+assertTrue(armorOf(profile, ALT_A, "Ring2"), "Ring2 occupied")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring2", { profile = profile }), "manual Ring2 AVAILABLE")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring2", { profile = profile }), "manual Ring2 USED re-use")
+assertTrue(armorOf(profile, ALT_A, "Ring2"), "re-used Ring2 is USED")
+assertEq(slotOverflow(profile, ALT_A, "ring"), 0, "Ring2 re-use does not phantom-overflow")
+checkSurfaces(profile, "ReuseDisplayedRing2", function(p, label)
+    assertTrue(armorOf(p, ALT_A, "Ring2"), label .. ": Ring2 USED")
+    assertEq(slotOverflow(p, ALT_A, "ring"), 0, label .. ": ring overflow 0")
+end)
+
+resetEnv()
+profile = makeProfile("ReuseDisplayedTrinket2")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "LINK A+B before trinket projection")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Trinket1", { profile = profile }), "projected Trinket1 USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Trinket2", { profile = profile }), "historical projected Trinket2 USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Trinket2", { profile = profile }), "manual Trinket2 AVAILABLE")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Trinket2", { profile = profile }), "manual Trinket2 USED re-use")
+assertTrue(armorOf(profile, ALT_A, "Trinket2"), "re-used Trinket2 is USED")
+assertEq(slotOverflow(profile, ALT_A, "trinket"), 0, "Trinket2 re-use does not phantom-overflow")
+checkSurfaces(profile, "ReuseDisplayedTrinket2", function(p, label)
+    assertTrue(armorOf(p, ALT_A, "Trinket2"), label .. ": Trinket2 USED")
+    assertEq(slotOverflow(p, ALT_A, "trinket"), 0, label .. ": trinket overflow 0")
+end)
+
+resetEnv()
+profile = makeProfile("InOrderAttendanceClamp")
+addMember(profile, ALT_A)
+assertTrue(profile:LinkCharacters(OWNER, ALT_A), "link for in-order attendance")
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+})
+SF.LootHelperIdentity.replayCount = 0
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.DECREMENT,
+    amount = 1,
+})
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.DECREMENT,
+    amount = 1,
+})
+addLog(profile, SF.LootLogEventTypes.ATTENDANCE_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+})
+assertEq(SF.LootHelperIdentity.replayCount, 0, "in-order concurrent attendance uses the fast path")
+assertEq(profile:GetIdentityAttendance(ALT_A), 0, "1-1-1+1 live attendance is 0")
+profile:ApplyIdentityProjection({ force = true })
+assertEq(profile:GetIdentityAttendance(ALT_A), 0, "force Replay attendance is 0")
+checkSurfaces(profile, "InOrderAttendanceClamp", function(p, label)
+    assertEq(p:GetIdentityAttendance(ALT_A), 0, label .. ": attendance 0")
+    assertEq(p:GetIdentityAttendance(OWNER), 0, label .. ": linked attendance 0")
+end)
+
+resetEnv()
+profile = makeProfile("ProductionArmorPreOp")
+local ADMIN_Z = "Zulu-Garona"
+local ADMIN_A_WRITER = "AlphaAdmin-Garona"
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ADMIN_Z)
+addMember(profile, ADMIN_A_WRITER)
+profile:AddAdminMemberId(ADMIN_Z)
+profile:AddAdminMemberId(ADMIN_A_WRITER)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B linked before same-timestamp armor")
+local frozenTs = 1700007777
+local realGetServerTime = GetServerTime
+function GetServerTime()
+    return frozenTs
+end
+assertTrue(asPlayer(ADMIN_Z, function()
+    return memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile })
+end), "Admin Z identity Chest USED")
+assertTrue(asPlayer(ADMIN_A_WRITER, function()
+    return memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile })
+end), "Admin A identity Chest AVAILABLE via ToggleEquipment")
+GetServerTime = realGetServerTime
+local usedArmor, availArmor
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.ARMOR_CHANGE then
+        local data = log:GetEventData()
+        if data.scope == "identity" and data.slot == "Chest" and data.action == SF.LootLogArmorActions.USED then
+            usedArmor = log
+        elseif data.scope == "identity" and data.slot == "Chest" and data.action == SF.LootLogArmorActions.AVAILABLE then
+            availArmor = log
+        end
+    end
+end
+assertTrue(usedArmor ~= nil, "captured production USED")
+assertTrue(availArmor ~= nil, "captured production AVAILABLE")
+assertEq(usedArmor:GetTimestamp(), availArmor:GetTimestamp(), "USED and AVAILABLE share timestamp T")
+assertTrue(SF.LootHelperIdentity.CompareLogs(availArmor, usedArmor), "CompareLogs alone would put A before Z")
+local preOp = availArmor:GetEventData().preOpAuthorMax
+assertTrue(type(preOp) == "table" and #preOp > 0, "production identity ARMOR_CHANGE snapshots preOpAuthorMax")
+local sawZ = false
+for i = 1, #preOp do
+    if SF.LootHelperIdentity.SameAuthor(preOp[i].author, ADMIN_Z) then
+        sawZ = true
+    end
+end
+assertTrue(sawZ, "AVAILABLE observed Z's USED as a causal predecessor")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "observed later AVAILABLE wins over CompareLogs order")
+checkSurfaces(profile, "ProductionArmorPreOp", function(p, label)
+    assertFalse(armorOf(p, ALT_A, "Chest"), label .. ": Chest AVAILABLE")
+end)
+
+resetEnv()
+profile = makeProfile("InvalidViewArmor")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+local bogusIdentityUsed = makeTable(SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_A,
+    slot = "Chest",
+    action = SF.LootLogArmorActions.USED,
+    scope = "identity",
+    identityMembers = { ALT_A, ALT_B },
+}, { author = OWNER, counter = 3, timestamp = 1700002000 })
+assertTrue(profile:MergeLogTables({ bogusIdentityUsed }) > 0, "stored incomplete-view identity USED")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "identity USED is inactive while A and B are unlinked")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "later legitimate LINK A+B")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "later legitimate LINK does not activate the incomplete-view correction")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "resurrected view does not overflow")
+checkSurfaces(profile, "InvalidViewArmor", function(p, label)
+    assertFalse(armorOf(p, ALT_A, "Chest"), label .. ": Chest stays AVAILABLE")
+end)
 end
 runStateMachinePassTests()
+
+local function findCaptured(msgType)
+    for i = 1, #capturedComm do
+        if capturedComm[i].msgType == msgType then
+            return capturedComm[i]
+        end
+    end
+    return nil
+end
+
+local function logIdOf(logTable)
+    return (logTable and (logTable._id or logTable.id)) or nil
+end
+
+local function payloadHasAuthor(payload, author)
+    for _, logTable in ipairs((payload and payload.logs) or {}) do
+        local a = logTable._author or logTable.author
+        if a == author then
+            return true
+        end
+    end
+    return false
+end
+
+local function destFromSource(src, name)
+    local dest = makeProfile(name)
+    addMember(dest, ALT_A)
+    dest._profileId = src:GetProfileId()
+    SF.lootHelperDB.profiles[src:GetProfileId()] = dest
+    return dest
+end
+
+-- ---------------------------------------------------------------------------
+-- Real LOG_REQ / NEED_LOGS / AUTH_LOGS handlers with historical aliases
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("AliasLogReq")
+addMember(profile, ALT_A)
+setActive(profile)
+local aliasPoint = addLog(profile, SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 4,
+}, { author = "owner-Garona" })
+assertEq(aliasPoint:GetAuthor(), "owner-Garona", "historical row keeps owner-Garona")
+activateSession(profile)
+capturedComm = {}
+Sync:HandleLogRequest(OWNER, {
+    sessionId = "SES1",
+    requestId = "REQ-ALIAS",
+    profileId = profile:GetProfileId(),
+    author = OWNER,
+    fromCounter = aliasPoint:GetCounter(),
+    toCounter = aliasPoint:GetCounter(),
+})
+local servedReq = findCaptured(Sync.MSG.AUTH_LOGS)
+assertTrue(servedReq ~= nil, "LOG_REQ produced AUTH_LOGS")
+assertTrue(payloadHasAuthor(servedReq.payload, "owner-Garona"), "LOG_REQ serves historical owner-Garona for Owner-Garona")
+local dest = destFromSource(profile, "AliasLogReqDest")
+activateSession(dest)
+Sync.state.requests["REQ-ALIAS"] = {
+    kind = "LOG_REQ",
+    meta = {
+        profileId = dest:GetProfileId(),
+        author = OWNER,
+        fromCounter = aliasPoint:GetCounter(),
+        toCounter = aliasPoint:GetCounter(),
+    },
+}
+servedReq.payload.sessionId = "SES1"
+servedReq.payload.profileId = dest:GetProfileId()
+servedReq.payload.requestId = "REQ-ALIAS"
+Sync:HandleAuthLogs(OWNER, servedReq.payload)
+assertTrue(dest:GetLogById(aliasPoint:GetID()) ~= nil, "AUTH_LOGS accepts SamePlayer historical alias row")
+assertEq(dest:GetLogById(aliasPoint:GetID()):GetAuthor(), "owner-Garona", "accepted row keeps historical author")
+
+resetEnv()
+profile = makeProfile("AliasNeedLogs")
+addMember(profile, ALT_A)
+setActive(profile)
+local needAlias = addLog(profile, SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 5,
+}, { author = "owner-Garona" })
+activateSession(profile)
+capturedComm = {}
+Sync:HandleNeedLogs(OWNER, {
+    sessionId = "SES1",
+    profileId = profile:GetProfileId(),
+    requestId = "REQ-NEED",
+    missing = {
+        {
+            author = OWNER,
+            fromCounter = needAlias:GetCounter(),
+            toCounter = needAlias:GetCounter(),
+        },
+    },
+})
+local servedNeed = findCaptured(Sync.MSG.AUTH_LOGS)
+assertTrue(servedNeed ~= nil, "NEED_LOGS produced AUTH_LOGS")
+assertTrue(payloadHasAuthor(servedNeed.payload, "owner-Garona"), "NEED_LOGS serves historical owner-Garona for Owner-Garona")
+dest = destFromSource(profile, "AliasNeedLogsDest")
+activateSession(dest)
+Sync.state.requests["REQ-NEED"] = {
+    kind = "NEED_LOGS",
+    meta = {
+        profileId = dest:GetProfileId(),
+        author = OWNER,
+        fromCounter = needAlias:GetCounter(),
+        toCounter = needAlias:GetCounter(),
+    },
+}
+servedNeed.payload.sessionId = "SES1"
+servedNeed.payload.profileId = dest:GetProfileId()
+servedNeed.payload.requestId = "REQ-NEED"
+Sync:HandleAuthLogs(OWNER, servedNeed.payload)
+assertTrue(dest:GetLogById(needAlias:GetID()) ~= nil, "NEED_LOGS AUTH_LOGS accepts historical alias row")
+
+resetEnv()
+profile = makeProfile("OverlappingAliasCounters")
+addMember(profile, ALT_A)
+setActive(profile)
+local otherTitle = "Other-Garona"
+local otherAlias = "other-Garona"
+local eventX = makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 1,
+}, { author = otherTitle, counter = 1, timestamp = 1700008001 })
+local eventY = makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_A,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 7,
+}, { author = otherAlias, counter = 1, timestamp = 1700008002 })
+assertTrue(profile:MergeLogTables({ eventX, eventY }) > 0, "pre-alias-safe overlapping :1 counters exist")
+assertTrue(profile:GetLogById(otherTitle .. ":1") ~= nil, "Other-Garona:1 remains")
+assertTrue(profile:GetLogById(otherAlias .. ":1") ~= nil, "other-Garona:1 remains")
+activateSession(profile)
+capturedComm = {}
+Sync:HandleLogRequest(OWNER, {
+    sessionId = "SES1",
+    requestId = "REQ-OVERLAP",
+    profileId = profile:GetProfileId(),
+    author = otherTitle,
+    fromCounter = 1,
+    toCounter = 1,
+})
+local servedOverlap = findCaptured(Sync.MSG.AUTH_LOGS)
+assertTrue(servedOverlap ~= nil, "overlapping counters LOG_REQ produced AUTH_LOGS")
+assertTrue(payloadHasAuthor(servedOverlap.payload, otherTitle), "overlapping serve includes Other-Garona:1")
+assertTrue(payloadHasAuthor(servedOverlap.payload, otherAlias), "overlapping serve includes other-Garona:1")
+dest = destFromSource(profile, "OverlappingAliasDest")
+activateSession(dest)
+Sync.state.requests["REQ-OVERLAP"] = {
+    kind = "LOG_REQ",
+    meta = {
+        profileId = dest:GetProfileId(),
+        author = otherTitle,
+        fromCounter = 1,
+        toCounter = 1,
+    },
+}
+servedOverlap.payload.sessionId = "SES1"
+servedOverlap.payload.profileId = dest:GetProfileId()
+servedOverlap.payload.requestId = "REQ-OVERLAP"
+Sync:HandleAuthLogs(OWNER, servedOverlap.payload)
+assertTrue(dest:GetLogById(otherTitle .. ":1") ~= nil, "Other-Garona:1 is repairable")
+assertTrue(dest:GetLogById(otherAlias .. ":1") ~= nil, "other-Garona:1 is independently repairable")
+assertEq(dest:GetLogById(otherTitle .. ":1"):GetAuthor(), otherTitle, "does not rewrite Other-Garona author")
+assertEq(dest:GetLogById(otherAlias .. ":1"):GetAuthor(), otherAlias, "does not rewrite other-Garona author")
 
 -- ---------------------------------------------------------------------------
 -- Protocol

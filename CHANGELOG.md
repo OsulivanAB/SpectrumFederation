@@ -56,8 +56,12 @@ All notable changes to SpectrumFederation will be documented in this file.
 - A skipped sourced `ADMIN_ADDED` is rejected provenance, not missing evidence, so later `adminMembersAtLink` cannot resurrect that grant
 - `Identity.OrderLogs` uses a ready min-heap, O(1) successor-edge dedup, and canonical author keys; `SnapshotPreOpAuthorMax` deduplicates SamePlayer aliases
 - SamePlayer-equivalent authors share one counter stream for new writes, contiguous catch-up, and LOG_REQ serving
+- `HandleNeedLogs` serving and `HandleAuthLogs` log-row checks use the same SameAuthor match as `HandleLogRequest`, without rewriting historical IDs, authors, or fingerprints
 - In-place integrity `_ReplaceLogById` rebuilds from current log contents; OrderLogs is not cached across rebuilds by table identity
 - MAIN_SWAP-less stale fingerprints can be repaired when a unique attributed source candidate reproduces the stored checksum; unrelated mismatches stay rejected
+- Re-using a displayed equipment opportunity (`AVAILABLE` then `USED`) does not pack historical locals as phantom overflow; independent uses still overflow
+- In-order Attendance fan-out keeps raw deltas so `1 - 1 - 1 + 1` converges with Replay instead of clamping to `1`
+- Identity-scoped `ARMOR_CHANGE` snapshots `preOpAuthorMax` in `LootLog.new`; Replay ignores identity equipment written while those members were not actually unified
 - Redundant concurrent LINKs remain valid history but do not propagate admin across an already-unified component
 - Characters named only in historical awards with no `MAIN_SWAP` lineage restore as unlinked shells with an admin warning
 - `MAIN_SWAP` validation accepts hyphenated realms through `NameUtil`
