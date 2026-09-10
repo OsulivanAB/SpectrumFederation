@@ -455,6 +455,11 @@ function LootProfile:GetLogById(logId)
     return self._logById[logId]
 end
 
+-- Per raw `_author` integrity windows. `maxCounter` is the highest counter
+-- actually present in the window so protocol-2 peers can compare a partial
+-- final window (for example 1 of 1-25) instead of waiting until it is full.
+-- SameAuthor aliases stay distinct keys; missing-history repair uses that
+-- exact spelling rather than rewriting `_author`.
 function LootProfile:ComputeAuthorWindowSummary(windowSize)
     windowSize = tonumber(windowSize) or _GetIntegrityWindowSize()
     windowSize = math.max(1, math.floor(windowSize))

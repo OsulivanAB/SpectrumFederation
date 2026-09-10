@@ -217,6 +217,12 @@ function Sync:ComputeAuthorWindowSummary(profileId)
     return {}
 end
 
+-- Protocol 2 authorWindowSummary is still per raw `_author` with count,
+-- checksum, and maxCounter. Comparison uses logical SameAuthor contig so a
+-- previously unseen alias spelling is not treated as contig 0. Partial/final
+-- windows (maxCounter < toCounter) are compared at the filled frontier;
+-- mismatch requests for those windows use toCounter = maxCounter so AUTH_LOGS
+-- can complete when the remote stream has not filled the whole window.
 function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localContig)
     local mismatches = {}
     if type(remoteSummary) ~= "table" then return mismatches end
@@ -239,30 +245,52 @@ function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localConti
 
     for author, windows in pairs(remoteSummary) do
         if type(author) == "string" and type(windows) == "table" then
-            local authorContig = tonumber(localContig and localContig[author]) or 0
+            local authorContig = 0
+            if self._LogicalContigForAuthor then
+                authorContig = self:_LogicalContigForAuthor(localContig, author)
+            else
+                authorContig = tonumber(localContig and localContig[author]) or 0
+            end
             local indexed = localByAuthor[author] or {}
             for _, remoteWindow in ipairs(windows) do
                 if type(remoteWindow) == "table"
                     and type(remoteWindow.fromCounter) == "number"
                     and type(remoteWindow.toCounter) == "number"
-                    and authorContig >= remoteWindow.toCounter
                 then
                     local localWindow = indexed[remoteWindow.fromCounter]
-                    local localCount = localWindow and tonumber(localWindow.count) or 0
-                    local localChecksum = localWindow and tonumber(localWindow.checksum) or nil
                     local remoteCount = tonumber(remoteWindow.count) or 0
-                    local remoteChecksum = tonumber(remoteWindow.checksum) or nil
+                    local remoteFilledTo = tonumber(remoteWindow.maxCounter) or 0
+                    local localFilledTo = localWindow and tonumber(localWindow.maxCounter) or 0
+                    local fullWindowReady = authorContig >= remoteWindow.toCounter
+                    local missingExactAuthor = remoteCount > 0
+                        and not localWindow
+                        and remoteFilledTo > 0
+                        and authorContig >= remoteFilledTo
+                    local partialSameFrontier = remoteFilledTo > 0
+                        and remoteFilledTo < remoteWindow.toCounter
+                        and localWindow
+                        and localFilledTo == remoteFilledTo
 
-                    if (not localWindow)
-                        or localCount ~= remoteCount
-                        or localChecksum ~= remoteChecksum
-                    then
-                        mismatches[#mismatches + 1] = {
-                            author = author,
-                            fromCounter = remoteWindow.fromCounter,
-                            toCounter = remoteWindow.toCounter,
-                            mode = "integrity",
-                        }
+                    if fullWindowReady or missingExactAuthor or partialSameFrontier then
+                        local localCount = localWindow and tonumber(localWindow.count) or 0
+                        local localChecksum = localWindow and tonumber(localWindow.checksum) or nil
+                        local remoteChecksum = tonumber(remoteWindow.checksum) or nil
+
+                        if (not localWindow)
+                            or localCount ~= remoteCount
+                            or localChecksum ~= remoteChecksum
+                        then
+                            local reqTo = remoteWindow.toCounter
+                            if not fullWindowReady and remoteFilledTo > 0 then
+                                reqTo = remoteFilledTo
+                            end
+                            mismatches[#mismatches + 1] = {
+                                author = author,
+                                fromCounter = remoteWindow.fromCounter,
+                                toCounter = reqTo,
+                                mode = "integrity",
+                            }
+                        end
                     end
                 end
             end
@@ -412,10 +440,56 @@ local function CollapseAuthorCounterMap(map)
     return byKey
 end
 
+-- Highest contiguous/advertised counter for a logical author, including
+-- SameAuthor aliases and CanonicalAuthorKey entries in contig maps.
+-- Exact raw spelling is not required; missing local spellings must not
+-- look like contig 0 when another alias already has history.
+local function LogicalContigForAuthor(localContig, author)
+    if type(localContig) ~= "table" or type(author) ~= "string" or author == "" then
+        return 0
+    end
+    local best = tonumber(localContig[author]) or 0
+    local Identity = SF.LootHelperIdentity
+    local key = Identity and Identity.CanonicalAuthorKey and Identity.CanonicalAuthorKey(author)
+    if type(key) == "string" then
+        local byKey = tonumber(localContig[key]) or 0
+        if byKey > best then
+            best = byKey
+        end
+    end
+    for localAuthor, localVal in pairs(localContig) do
+        if type(localAuthor) == "string" then
+            local n = tonumber(localVal) or 0
+            if n > best and AuthorsMatch(localAuthor, author) then
+                best = n
+            end
+        end
+    end
+    return best
+end
+
+-- Exact raw-author max only. Canonical-key entries in contig maps must not
+-- count as possessing that historical spelling.
+local function ExactAuthorCounter(map, author)
+    if type(map) ~= "table" or type(author) ~= "string" then
+        return 0
+    end
+    return tonumber(map[author]) or 0
+end
+
+function Sync:_LogicalContigForAuthor(localContig, author)
+    return LogicalContigForAuthor(localContig, author)
+end
+
 -- Function Compute missing log ranges given local authorMax and remote authorMax (or detect gaps).
 -- @param localAuthorMax table Map [author] = maxCounterSeen
 -- @param remoteAuthorMax table Map [author] = maxCounterSeen
 -- @return table missingRequests Array describing needed author/range requests.
+-- Logical SameAuthor collapse is for future counter catch-up: owner-Garona:6
+-- vs Owner-Garona:7 requests 7-7, not an impossible 1-6 gap.
+-- Immutable raw spellings remain distinct for historical completeness: when
+-- logical frontiers already match, a remote raw alias that is absent or
+-- behind locally is still requested as that exact spelling.
 function Sync:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax)
     local missing = {}
     if type(remoteAuthorMax) ~= "table" then return missing end
@@ -431,6 +505,30 @@ function Sync:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax)
                 fromCounter = localMax + 1,
                 toCounter = remote.counter,
             })
+        end
+    end
+
+    for author, remoteMax in pairs(remoteAuthorMax) do
+        remoteMax = tonumber(remoteMax)
+        if type(author) == "string" and author ~= "" and remoteMax and remoteMax >= 1 then
+            local localExact = ExactAuthorCounter(localAuthorMax, author)
+            if localExact < remoteMax then
+                local logicalMax = 0
+                local collapsed = localLogical[ (SF.LootHelperIdentity and SF.LootHelperIdentity.CanonicalAuthorKey and SF.LootHelperIdentity.CanonicalAuthorKey(author)) or string.lower(author) ]
+                if collapsed then
+                    logicalMax = tonumber(collapsed.counter) or 0
+                end
+                if logicalMax < remoteMax then
+                    logicalMax = LogicalContigForAuthor(localAuthorMax, author)
+                end
+                if logicalMax >= remoteMax then
+                    table.insert(missing, {
+                        author = author,
+                        fromCounter = 1,
+                        toCounter = remoteMax,
+                    })
+                end
+            end
         end
     end
     return missing
