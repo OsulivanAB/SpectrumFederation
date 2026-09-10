@@ -267,6 +267,7 @@ function Model:Build(profile)
                 unit = raidInfo and raidInfo.unit or nil,
                 points = tonumber(points) or 0,
                 member = m,
+                profile = profile,
                 canAdmin = canAdmin,
                 inRaid = inRaid,
                 rewardPot = rewardPot,

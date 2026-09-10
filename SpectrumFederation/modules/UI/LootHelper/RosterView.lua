@@ -468,6 +468,8 @@ function View:_BindRowActions(r, model)
                         pcall(function()
                             model.member:IncrementAttendance({
                                 amount = MANUAL_ATTENDANCE_STEP,
+                                reason = "MANUAL",
+                                profile = model.profile,
                             })
                         end)
                     end
@@ -475,6 +477,8 @@ function View:_BindRowActions(r, model)
                     pcall(function()
                         model.member:IncrementPoints({
                             amount = MANUAL_POINT_STEP,
+                            reason = "MANUAL",
+                            profile = model.profile,
                         })
                     end)
                 end
@@ -490,6 +494,8 @@ function View:_BindRowActions(r, model)
                         pcall(function()
                             model.member:DecrementAttendance({
                                 amount = MANUAL_ATTENDANCE_STEP,
+                                reason = "MANUAL",
+                                profile = model.profile,
                             })
                         end)
                     end
@@ -497,6 +503,8 @@ function View:_BindRowActions(r, model)
                     pcall(function()
                         model.member:DecrementPoints({
                             amount = MANUAL_POINT_STEP,
+                            reason = "MANUAL",
+                            profile = model.profile,
                         })
                     end)
                 end

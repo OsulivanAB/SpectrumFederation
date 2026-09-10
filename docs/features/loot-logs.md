@@ -19,7 +19,8 @@ The log includes:
 - point-name changes;
 - raid-wide safe-mode changes;
 - admins added or removed;
-- Main Swap consolidations;
+- character links and unlinks;
+- historical Main Swap consolidations;
 - RC Loot Council awards, when the optional integration child addon is enabled and an active Spectrum session records them.
 
 Each row shows the date, change type, affected member when applicable, a readable action, and the author.

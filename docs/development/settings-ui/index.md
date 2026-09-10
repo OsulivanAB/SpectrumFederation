@@ -18,7 +18,7 @@ The settings implementation separates persistence, runtime effects, page registr
 | `modules/UI/Settings/PageBuilder.lua` | Scroll hosts, sections, sizing, refresh, and reflow. |
 | `modules/UI/Settings/DefinitionRenderer.lua` | Declarative section/control definitions and refresh bindings. |
 | `modules/UI/Settings/Control/Controls.lua` | Concrete control builders. |
-| `modules/UI/Settings/Dialogs.lua` | Confirmation, prompt, and Main Swap dialogs. |
+| `modules/UI/Settings/Dialogs.lua` | Confirmation, prompt, and Linked Character dialogs. |
 | `modules/UI/Settings/Pages/` | Registered user-facing pages. |
 
 Registry is the only inventory. NavigationModel receives Registry data as arguments and does not keep a second copy of categories or pages. The window owns frames and session state (`currentCategoryId`, `currentPageId`, `lastPageByCategory`). Last-tab is in-memory only; it is not persisted.
@@ -179,7 +179,7 @@ Callbacks receive a context containing `panel`, `section`, `store`, `schema`, `u
 
 ## Profile settings
 
-Loot profiles are domain objects, not ordinary schema subtrees. The Store methods under `GetActiveLootHelperProfileObject`, `CreateLootHelperProfile`, admin management, rename, reset, and Main Swap adapt settings pages to `LootProfile` methods.
+Loot profiles are domain objects, not ordinary schema subtrees. The Store methods under `GetActiveLootHelperProfileObject`, `CreateLootHelperProfile`, admin management, rename, reset, and Linked Characters adapt settings pages to `LootProfile` methods.
 
 Do not add profile-authoritative data only to `SettingsSchema.PROFILE_SETTINGS_DEFAULTS`; define it on `LootProfile`, include it in snapshots when synchronization requires it, and expose validated getters/setters.
 

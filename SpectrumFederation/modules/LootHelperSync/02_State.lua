@@ -64,8 +64,9 @@ Sync.state = Sync.state or {
     coordEpoch  = nil,  -- monotonic coordinator generation/epoch
 
     helpers     = {},   -- array of "Name-Realm"
-    authorMax   = {},   -- map: [author] = maxCounterSeen
+    authorMax   = {},   -- raw map: exact `_author` spelling -> highest retained counter
     authorWindowSummary = {}, -- map: [author] = { {fromCounter,toCounter,count,checksum,maxCounter}, ... }
+    containedExactWindows = {}, -- session-scoped advertised windows with row-level id+fingerprint proof; revalidated against current local history
 
     isCoordinator = false,
 

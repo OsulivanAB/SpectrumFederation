@@ -311,6 +311,9 @@ function SF:RehydrateLootHelperDB()
 			if profile.RebuildLogIndex then
 				profile:RebuildLogIndex()
 			end
+			if profile.ApplyIdentityProjection then
+				profile:ApplyIdentityProjection()
+			end
 
 			-- Ensure owner is admin if you added that helper
 			if profile._EnsureOwnerIsAdmin then
@@ -696,11 +699,22 @@ end
 -- @param sourceMemberId (string) - Member ID to transfer history from
 -- @param targetMemberId (string) - Member ID to transfer history to
 -- @return (boolean, string|nil) - Success status and optional error message
-function SF:TransferMemberHistoryInActiveLootHelperProfile(sourceMemberId, targetMemberId)
+function SF:TransferMemberHistoryInActiveLootHelperProfile()
+	return false, "Main Swap has been replaced by Linked Characters."
+end
+
+function SF:LinkCharactersInActiveLootHelperProfile(memberA, memberB)
 	local p = self:GetActiveProfile()
 	if not p then return false, "No active profile." end
-	if not p.TransferMemberHistory then return false, "Profile missing TransferMemberHistory." end
-	return p:TransferMemberHistory(sourceMemberId, targetMemberId)
+	if not p.LinkCharacters then return false, "Profile missing LinkCharacters." end
+	return p:LinkCharacters(memberA, memberB)
+end
+
+function SF:UnlinkCharacterInActiveLootHelperProfile(memberId)
+	local p = self:GetActiveProfile()
+	if not p then return false, "No active profile." end
+	if not p.UnlinkCharacter then return false, "Profile missing UnlinkCharacter." end
+	return p:UnlinkCharacter(memberId)
 end
 
 -- Reset all loot helper settings (dangerous operation)

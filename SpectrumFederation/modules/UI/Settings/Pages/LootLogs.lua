@@ -52,6 +52,28 @@ local function GetUniqueAuthors(logs)
 	return options
 end
 
+local function CollectLogMemberIds(data)
+	local membersSet = {}
+	if type(data) ~= "table" then
+		return membersSet
+	end
+	local function add(id)
+		if type(id) == "string" and id ~= "" then
+			membersSet[id] = true
+		end
+	end
+	add(data.member)
+	add(data.memberA)
+	add(data.memberB)
+	add(data.sourceMember)
+	if type(data.identityMembers) == "table" then
+		for _, id in ipairs(data.identityMembers) do
+			add(id)
+		end
+	end
+	return membersSet
+end
+
 -- Get unique member names from logs
 -- @param logs table Array of LootLog objects
 -- @return table Array of {value, label} for dropdown
@@ -60,8 +82,8 @@ local function GetUniqueMembers(logs)
 	for _, log in ipairs(logs) do
 		if type(log.GetEventData) == "function" then
 			local data = log:GetEventData()
-			if data and data.member then
-				membersSet[data.member] = true
+			for member in pairs(CollectLogMemberIds(data)) do
+				membersSet[member] = true
 			end
 		end
 	end
@@ -135,6 +157,8 @@ local EVENT_TYPE_COLORS = {
 	ADMIN_ADDED = "|cff66ff66",
 	ADMIN_REMOVED = "|cffff6666",
 	MAIN_SWAP = "|cff9966ff",
+	CHARACTER_LINK = "|cff66ccff",
+	CHARACTER_UNLINK = "|cff6699cc",
 	LOOT_MODE_CHANGE = "|cffcc99ff",
 	REWARD_POT_CONFIG_CHANGE = "|cffffcc66",
 	REWARD_POT_CHANGE = "|cffffd700",
@@ -154,6 +178,8 @@ local EVENT_TYPE_LABELS = {
 	ADMIN_ADDED = "Admin Added",
 	ADMIN_REMOVED = "Admin Removed",
 	MAIN_SWAP = "Main Swap",
+	CHARACTER_LINK = "Character Link",
+	CHARACTER_UNLINK = "Character Unlink",
 	LOOT_MODE_CHANGE = "Loot Mode Change",
 	REWARD_POT_CONFIG_CHANGE = "Reward Pot Config",
 	REWARD_POT_CHANGE = "Reward Pot Change",
@@ -243,12 +269,16 @@ local function BuildActionText(eventType, data, author)
 		return FormatLabel(data.change or "?")
 	elseif eventType == "ARMOR_CHANGE" then
 		local slotLabel = GetArmorSlotLabel(data.slot)
-		if data.action == (SF.LootLogArmorActions and SF.LootLogArmorActions.USED) then
-			return slotLabel .. " Used"
-		elseif data.action == (SF.LootLogArmorActions and SF.LootLogArmorActions.AVAILABLE) then
-			return slotLabel .. " Available"
+		local suffix = ""
+		if data.scope == "identity" then
+			suffix = " (linked identity)"
 		end
-		return slotLabel .. " " .. FormatLabel(data.action or "")
+		if data.action == (SF.LootLogArmorActions and SF.LootLogArmorActions.USED) then
+			return slotLabel .. " Used" .. suffix
+		elseif data.action == (SF.LootLogArmorActions and SF.LootLogArmorActions.AVAILABLE) then
+			return slotLabel .. " Available" .. suffix
+		end
+		return slotLabel .. " " .. FormatLabel(data.action or "") .. suffix
 	elseif eventType == "ROLE_CHANGE" then
 		return string.format("Role -> %s", tostring(data.newRole or "?"))
 	elseif eventType == "PROFILE_CREATION" then
@@ -270,6 +300,10 @@ local function BuildActionText(eventType, data, author)
 		-- Strip realm for cleaner display if present
 		local shortName = sourceName:match("^([^%-]+)") or sourceName
 		return string.format("Consolidated from %s", shortName)
+	elseif eventType == "CHARACTER_LINK" then
+		return "Linked"
+	elseif eventType == "CHARACTER_UNLINK" then
+		return "Unlinked"
 	elseif eventType == "LOOT_MODE_CHANGE" then
 		return string.format("%s -> %s", FormatLootMode(data.oldMode), FormatLootMode(data.newMode))
 	elseif eventType == "REWARD_POT_CONFIG_CHANGE" then
@@ -334,11 +368,16 @@ local function BuildLogRow(log)
 		and SF:FormatTimestampForUser(timestamp)
 		or tostring(timestamp)
 
+	local memberText = ColorizeName(data.member)
+	if type(data.memberA) == "string" and type(data.memberB) == "string" then
+		memberText = ColorizeName(data.memberA) .. " / " .. ColorizeName(data.memberB)
+	end
+
 	return {
 		date = dateText,
 		changeType = string.format("%s%s%s", eventColor, GetEventTypeLabel(eventType), reset),
 		author = ColorizeName(author),
-		member = ColorizeName(data.member),
+		member = memberText,
 		action = BuildActionText(eventType, data, author),
 	}
 end
@@ -384,9 +423,10 @@ function Page:Build(panel)
 				end
 				
 				-- Filter by member
-				if panel.__sfSelectedMember then
+					if panel.__sfSelectedMember then
 					local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
-					if not data or data.member ~= panel.__sfSelectedMember then
+					local ids = CollectLogMemberIds(data)
+					if not ids[panel.__sfSelectedMember] then
 						include = false
 					end
 				end

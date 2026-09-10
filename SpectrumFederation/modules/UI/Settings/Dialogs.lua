@@ -199,13 +199,13 @@ local function EnsureTransferPopupContent(content)
     content:SetSize(TRANSFER_CONTENT_WIDTH, TRANSFER_CONTENT_INITIAL_HEIGHT)
 
     content.sourceLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    content.sourceLabel:SetText("Transfer points from")
+    content.sourceLabel:SetText("Character 1")
 
     content.sourceDropdown = CreateFrame("DropdownButton", nil, content, "WowStyle1DropdownTemplate")
     content.sourceDropdown:SetDefaultText("Select member")
 
     content.targetLabel = content:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-    content.targetLabel:SetText("Transfer points to")
+    content.targetLabel:SetText("Character 2")
 
     content.targetDropdown = CreateFrame("DropdownButton", nil, content, "WowStyle1DropdownTemplate")
     content.targetDropdown:SetDefaultText("Select member")
@@ -316,7 +316,7 @@ local function UpdateTransferPopupState(dialog)
         message = "Select both characters before confirming."
     elseif SameMember(sourceMemberId, targetMemberId) then
         valid = false
-        message = "Source and target must be different characters."
+        message = (data.sameCharacterMessage) or "Select two different characters."
     end
 
     if button1 then
@@ -367,6 +367,12 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
 
             self.__sfSourceMemberId = nil
             self.__sfTargetMemberId = nil
+            if content.sourceLabel then
+                content.sourceLabel:SetText((data and data.sourceLabel) or "Character 1")
+            end
+            if content.targetLabel then
+                content.targetLabel:SetText((data and data.targetLabel) or "Character 2")
+            end
             LayoutTransferPopupContent(content)
 
             SetupTransferDropdown(
@@ -423,16 +429,19 @@ if not StaticPopupDialogs[TRANSFER_KEY] then
     }
 end
 
--- Show a member-transfer dialog with source/target dropdowns
+-- Show a two-member dialog with character dropdowns.
+-- Used for Linked Characters (and historically Main Swap).
 -- @param message string Message text to display
 -- @param acceptText string|nil Text for accept button (defaults to ACCEPT)
--- @param sourceOptions table|nil Dropdown options for the source member
--- @param targetOptions table|nil Dropdown options for the target member
--- @param onAccept function|nil Callback function(sourceMemberId, targetMemberId) called if user accepts
+-- @param sourceOptions table|nil Dropdown options for the first character
+-- @param targetOptions table|nil Dropdown options for the second character
+-- @param onAccept function|nil Callback function(memberA, memberB) called if user accepts
+-- @param ui table|nil Optional label overrides
 -- @return boolean True if dialog was shown, false otherwise
-function Dialogs:TransferMemberHistory(message, acceptText, sourceOptions, targetOptions, onAccept)
+function Dialogs:TransferMemberHistory(message, acceptText, sourceOptions, targetOptions, onAccept, ui)
+    ui = type(ui) == "table" and ui or {}
     if SF.Debug then
-        SF.Debug:Verbose("UI", "Showing transfer dialog: %s", message)
+        SF.Debug:Verbose("UI", "Showing character relationship dialog: %s", message)
     end
 
     StaticPopupDialogs[TRANSFER_KEY].button1 = acceptText or ACCEPT
@@ -449,5 +458,8 @@ function Dialogs:TransferMemberHistory(message, acceptText, sourceOptions, targe
         sourceOptions = sourceOptions or {},
         targetOptions = targetOptions or {},
         onAccept = onAccept,
+        sourceLabel = ui.sourceLabel or "Character 1",
+        targetLabel = ui.targetLabel or "Character 2",
+        sameCharacterMessage = ui.sameCharacterMessage or "Select two different characters.",
     }, insertedFrame) ~= nil
 end

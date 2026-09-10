@@ -733,11 +733,22 @@ end
 -- @param targetMemberId string Member ID to transfer history to
 -- @return boolean True on success, false on failure
 -- @return string|nil Error message if failed
-function Store:TransferMemberHistoryInActiveProfile(sourceMemberId, targetMemberId)
-	if SF.TransferMemberHistoryInActiveLootHelperProfile then
-		return SF:TransferMemberHistoryInActiveLootHelperProfile(sourceMemberId, targetMemberId)
+function Store:TransferMemberHistoryInActiveProfile()
+	return false, "Main Swap has been replaced by Linked Characters."
+end
+
+function Store:LinkCharactersInActiveProfile(memberA, memberB)
+	if SF.LinkCharactersInActiveLootHelperProfile then
+		return SF:LinkCharactersInActiveLootHelperProfile(memberA, memberB)
 	end
-	return false, "TransferMemberHistoryInActiveLootHelperProfile not implemented"
+	return false, "LinkCharactersInActiveLootHelperProfile not implemented"
+end
+
+function Store:UnlinkCharacterInActiveProfile(memberId)
+	if SF.UnlinkCharacterInActiveLootHelperProfile then
+		return SF:UnlinkCharacterInActiveLootHelperProfile(memberId)
+	end
+	return false, "UnlinkCharacterInActiveLootHelperProfile not implemented"
 end
 
 -- Rename the active loot helper profile by delegating to SF namespace
