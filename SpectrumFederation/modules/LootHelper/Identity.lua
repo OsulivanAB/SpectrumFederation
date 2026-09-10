@@ -613,15 +613,17 @@ local function MergeOcc(dst, src)
     MergeFamily(dst.trinket, src.trinket)
     for slot, state in pairs(src.ordinary) do
         local current = dst.ordinary[slot]
-        local dstCount = 0
-        if current then
-            dstCount = (current.occupied and 1 or 0) + (current.overflow or 0)
+        local dstOccupied = current and current.occupied == true
+        local srcOccupied = state.occupied == true
+        local overflow = (current and current.overflow or 0) + (state.overflow or 0)
+        if dstOccupied and srcOccupied then
+            overflow = overflow + 1
         end
-        local srcCount = (state.occupied and 1 or 0) + (state.overflow or 0)
-        local total = dstCount + srcCount
+        -- Overflow is leftover extra uses. It must not refill a slot that
+        -- AVAILABLE already cleared in its own scope.
         dst.ordinary[slot] = {
-            occupied = total > 0,
-            overflow = math.max(0, total - 1),
+            occupied = dstOccupied or srcOccupied,
+            overflow = overflow,
         }
     end
 end
@@ -743,7 +745,10 @@ local function ApplyIdentityArmor(occ, slot, action)
                 state.occupied = true
             end
         elseif action == "AVAILABLE" then
+            -- Ordinary slots have one opportunity. Clearing the recorded
+            -- scope suppresses that scope's packed locals, including overflow.
             state.occupied = false
+            state.overflow = 0
         end
         return
     end
