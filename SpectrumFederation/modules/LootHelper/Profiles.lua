@@ -893,7 +893,11 @@ function LootProfile:GetIdentityAttendance(memberId)
     memberId = NormalizeMemberId(memberId)
     local result = self:GetIdentityProjection()
     if memberId and result and result.attendance then
-        return result.attendance[memberId] or 0
+        local total = result.attendance[memberId] or 0
+        if total < 0 then
+            return 0
+        end
+        return total
     end
     return 0
 end

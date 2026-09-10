@@ -877,23 +877,28 @@ local function IdentityEventSupersededByLocals(ev, ids, localOrigin)
     return CausalBefore(ev.log, latest)
 end
 
+local function IdentityMembersUnifiedAt(partition, members)
+    if type(members) ~= "table" or #members < 2 then
+        return false
+    end
+    local root = FindRoot(partition, members[1])
+    if not root then
+        return false
+    end
+    for j = 2, #members do
+        if FindRoot(partition, members[j]) ~= root then
+            return false
+        end
+    end
+    return true
+end
+
 local function ExpireSplitIdentityEvents(events, partition)
     for i = 1, #(events or {}) do
         local ev = events[i]
         if ev and not ev.expired then
-            local members = ev.identityMembers
-            if type(members) == "table" and #members >= 2 then
-                local root = FindRoot(partition, members[1])
-                if not root then
-                    ev.expired = true
-                else
-                    for j = 2, #members do
-                        if FindRoot(partition, members[j]) ~= root then
-                            ev.expired = true
-                            break
-                        end
-                    end
-                end
+            if not IdentityMembersUnifiedAt(partition, ev.identityMembers) then
+                ev.expired = true
             end
         end
     end
@@ -910,7 +915,13 @@ local function IdentityEventSupersededByLaterSuperset(ev, events)
             and CausalBefore(ev.log, other.log)
             and IsSupersetScope(other.identityMembers, ev.identityMembers)
         then
-            return true
+            -- A later equal/superset AVAILABLE replaces earlier occupancy for
+            -- this slot. A later USED must not discard an earlier AVAILABLE:
+            -- that AVAILABLE is what cleared packed locals before the displayed
+            -- opportunity was re-used. Independent USEDs still overflow.
+            if other.action == "AVAILABLE" or ev.action ~= "AVAILABLE" then
+                return true
+            end
         end
     end
     return false
@@ -1657,12 +1668,17 @@ function Identity.Replay(logs, opts)
                 local memberId = ensureLocal(data.member)
                 if memberId and type(data.slot) == "string" then
                     if IsIdentityArmor(data) then
+                        local identityMembers = CanonicalIdentityMembers(data)
                         identityArmorEvents[#identityArmorEvents + 1] = {
                             log = log,
                             member = memberId,
                             slot = data.slot,
                             action = data.action,
-                            identityMembers = CanonicalIdentityMembers(data),
+                            identityMembers = identityMembers,
+                            -- A correction written from an incomplete or invalid
+                            -- relationship view must not become active merely
+                            -- because those characters later link for real.
+                            expired = not IdentityMembersUnifiedAt(partition, identityMembers),
                         }
                     else
                         if data.action == actions.USED then
@@ -1829,9 +1845,13 @@ function Identity.FanOutBalance(profile, lootLog)
         end
         return true
     end
+    -- Replay sums raw deltas then clamps the final total. Do not clamp after
+    -- each in-order delta or concurrent decrements below zero diverge from
+    -- retained history once a later increment arrives.
     local nextValue = (result.attendance[memberId] or 0) + delta
-    if nextValue < 0 then
-        nextValue = 0
+    local displayed = nextValue
+    if displayed < 0 then
+        displayed = 0
     end
     for i = 1, #group do
         local id = group[i]
@@ -1839,9 +1859,9 @@ function Identity.FanOutBalance(profile, lootLog)
         local member = profile.getMemberByID and profile:getMemberByID(id)
         if member then
             if member.SetAttendance then
-                member:SetAttendance(nextValue)
+                member:SetAttendance(displayed)
             else
-                member.attendanceBalance = nextValue
+                member.attendanceBalance = displayed
             end
         end
     end
