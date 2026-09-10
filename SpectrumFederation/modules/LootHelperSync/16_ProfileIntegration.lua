@@ -492,9 +492,12 @@ function Sync:_AuthorMatchesRepairRequest(logAuthor, requestedAuthor, exactAutho
     return AuthorsMatch(logAuthor, requestedAuthor)
 end
 
--- Exact-author satisfaction: every requested counter must exist as that
--- exact `_author` spelling. SameAuthor siblings do not count.
-function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCounter)
+-- Exact-author satisfaction: this spelling's retained max covers toCounter.
+-- Completeness/integrity ask for 1..authorMax or a window end, but SameAuthor
+-- history only stores some counters under that spelling. Sibling aliases do
+-- not count. Integrity may complete after a non-empty exact payload when the
+-- window is sparse and toCounter is the window end rather than a dense max.
+function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCounter, opts)
     if type(profileId) ~= "string" or profileId == "" then return false end
     if type(author) ~= "string" or author == "" then return false end
 
@@ -504,30 +507,17 @@ function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCount
     fromCounter = math.max(1, math.floor(fromCounter))
     toCounter = math.max(fromCounter, math.floor(toCounter))
 
-    local profile = self:FindLocalProfileById(profileId)
-    if not profile then return false end
-
-    local seen = {}
-    for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
-        local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
-        if a == author then
-            local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
-            c = tonumber(c)
-            if c then
-                c = math.floor(c)
-                if c >= fromCounter and c <= toCounter then
-                    seen[c] = true
-                end
-            end
-        end
+    local exactMax = ExactAuthorCounter(self:ComputeAuthorMax(profileId), author)
+    if exactMax >= toCounter then
+        return true
     end
 
-    for c = fromCounter, toCounter do
-        if not seen[c] then
-            return false
-        end
+    opts = type(opts) == "table" and opts or {}
+    local received = tonumber(opts.receivedExactCount) or 0
+    if opts.integrityRepair == true and received > 0 then
+        return true
     end
-    return true
+    return false
 end
 
 -- Function Compute missing log ranges given local authorMax and remote authorMax (or detect gaps).

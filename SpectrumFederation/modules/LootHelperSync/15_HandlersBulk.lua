@@ -239,7 +239,11 @@ function Sync:HandleAuthLogs(sender, payload)
                     payload.profileId,
                     req.meta.author,
                     req.meta.fromCounter or 1,
-                    req.meta.toCounter
+                    req.meta.toCounter,
+                    {
+                        integrityRepair = req.meta.integrityRepair == true,
+                        receivedExactCount = (type(payload.logs) == "table") and #payload.logs or 0,
+                    }
                 )
                 if requestSatisfied then
                     if SF.Debug then

@@ -5338,6 +5338,50 @@ assertTrue(adminExactReq ~= nil, "admin convergence requests exact owner-Garona 
 assertTrue(adminExactReq.meta.exactAuthor == true, "admin exact missing range keeps exactAuthor")
 assertEq(adminExactReq.lastTarget, ALT_C, "admin provider is the status whose exact authorMax has owner-Garona")
 assertTrue(adminExactReq.lastTarget ~= OTHER, "admin does not pick a sibling-only helper by logical stream")
+
+-- Sparse exact history: 1..authorMax is a fetch window, not a dense counter list
+resetEnv()
+installUniqueNonces()
+profile = makeProfile("SparseExactA")
+addMember(profile, ALT_A)
+assertTrue(profile:MergeLogTables({
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 2,
+    }, { author = OWNER, counter = 2, timestamp = 1700020302 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 3,
+    }, { author = OWNER, counter = 3, timestamp = 1700020303 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 11,
+    }, { author = "owner-Garona", counter = 1, timestamp = 1700020311 }),
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 13,
+    }, { author = "owner-Garona", counter = 3, timestamp = 1700020313 }),
+}) > 0, "sparse coordinator has owner-Garona:1 and :3, no :2")
+if profile.RebuildLogIndex then
+    profile:RebuildLogIndex()
+end
+assertTrue(hasLogId(profile, "owner-Garona:1"), "sparse source keeps owner-Garona:1")
+assertTrue(hasLogId(profile, "owner-Garona:3"), "sparse source has owner-Garona:3")
+assertFalse(hasLogId(profile, "owner-Garona:2"), "owner-Garona:2 never existed")
+local sparseDest = cloneWithout(profile, "SparseExactB", "owner-Garona:3")
+assertTrue(hasLogId(sparseDest, "owner-Garona:1"), "sparse dest keeps owner-Garona:1")
+assertFalse(hasLogId(sparseDest, "owner-Garona:3"), "sparse dest lacks owner-Garona:3")
+local sparseReq = { author = "owner-Garona", fromCounter = 1, toCounter = 3, exactAuthor = true }
+applyDiscoveredRange(profile, sparseDest, sparseReq, "REQ-SPARSE-EXACT")
+assertTrue(hasLogId(sparseDest, "owner-Garona:3"), "sparse exact repair obtained owner-Garona:3")
+assertTrue(hasLogId(sparseDest, "owner-Garona:1"), "sparse exact repair kept owner-Garona:1")
+assertFalse(hasLogId(sparseDest, "owner-Garona:2"), "sparse exact repair does not invent owner-Garona:2")
+assertTrue(Sync:_ExactAuthorRangeSatisfied(sparseDest:GetProfileId(), "owner-Garona", 1, 3), "exact max 3 satisfies 1..3 without a dense :2")
+assertTrue(Sync.state.requests["REQ-SPARSE-EXACT"] == nil, "sparse exact AUTH_LOGS completed the request")
 restoreUniqueNonces()
 end
 runExactAuthorRepairRoutingTests()
