@@ -8,6 +8,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Linked Characters for Loot Helper profiles: admins can link and unlink characters so they share identity-wide points, Attendance, and equipment opportunity state while remaining separate roster members
 - `CHARACTER_LINK` and `CHARACTER_UNLINK` loot-log events, including per-LINK contemporaneous admin evidence and `preOpAuthorMax` writer-observed heads
 - Identity-scoped equipment corrections that record `identityMembers` at write time
+- Optional `sourceLogId` on auto-generated `ADMIN_ADDED` grants so Replay can drop a grant whose source LINK is skipped
 
 ### Changed
 - Replace live Main Swap / Transfer Main with Linked Characters
@@ -41,6 +42,13 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Later live LINK does not retroactively grant MAIN_SWAP-restored non-admin sources; canonical admin implication crosses only the pre-link boundary
 - Identity-scoped equipment corrections no longer erase later character-local actions after unlink/relink
 - Overflow warnings detect increased conflict multiplicity per slot/family, not only new conflict keys
+- Live relationship `NEW_LOG` requires the network sender to match the relationship log author
+- Auto-admin grants from `LinkCharacters` / reconcile are causally bound to the source LINK via `sourceLogId`
+- Replay uses writer-observed `preOpAuthorMax` as causal predecessors so same-timestamp admin grants authorize the LINK that observed them
+- Frozen `_legacyCanonicalAdmins` preserve Main Swap / snapshot admins that have no grant log, without letting a later `ADMIN_ADDED` authorize older relationships
+- Identity-scoped equipment corrections do not apply across later joiners who were outside the recorded `identityMembers`
+- Characters named only in historical awards with no `MAIN_SWAP` lineage restore as unlinked shells with an admin warning
+- `MAIN_SWAP` validation accepts hyphenated realms through `NameUtil`
 
 ## [1.4.1] - 2026-09-07
 

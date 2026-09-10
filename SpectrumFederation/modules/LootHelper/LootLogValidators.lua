@@ -332,7 +332,18 @@ end
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
 function LootLogValidators.ValidateAdminAddedData(eventData)
-    return ValidateStoredNameRealmField(eventData and eventData.member, "ADMIN_ADDED")
+    if not ValidateStoredNameRealmField(eventData and eventData.member, "ADMIN_ADDED") then
+        return false
+    end
+    if eventData.sourceLogId ~= nil then
+        if type(eventData.sourceLogId) ~= "string" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "ADMIN_ADDED sourceLogId must be a string")
+            end
+            return false
+        end
+    end
+    return true
 end
 
 -- Function to validate the ADMIN_REMOVED event data
@@ -346,39 +357,20 @@ end
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
 function LootLogValidators.ValidateMainSwapData(eventData)
+    if not ValidateStoredNameRealmField(eventData and eventData.member, "MAIN_SWAP target") then
+        return false
+    end
+    if not ValidateStoredNameRealmField(eventData and eventData.sourceMember, "MAIN_SWAP source") then
+        return false
+    end
     local memberID = eventData.member
     local sourceMember = eventData.sourceMember
-
-    -- Validate target member ID is a non-empty string in "Name-Realm" format
-    if type(memberID) ~= "string" or memberID == "" then
+    if SameStoredPlayer(memberID, sourceMember) then
         if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid target member ID: %s", tostring(memberID))
+            SF.Debug:Warn("LOOTLOG", "MAIN_SWAP source and target must be different")
         end
         return false
     end
-
-    if not memberID:match("^[^%-]+%-[^%-]+$") then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid target member ID format (expected Name-Realm): %s", tostring(memberID))
-        end
-        return false
-    end
-
-    -- Validate source member ID is a non-empty string in "Name-Realm" format
-    if type(sourceMember) ~= "string" or sourceMember == "" then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid source member ID: %s", tostring(sourceMember))
-        end
-        return false
-    end
-
-    if not sourceMember:match("^[^%-]+%-[^%-]+$") then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid source member ID format (expected Name-Realm): %s", tostring(sourceMember))
-        end
-        return false
-    end
-
     return true
 end
 

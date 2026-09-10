@@ -107,6 +107,26 @@ local function GetLogAuthor(log)
     return NormalizeId(log._author)
 end
 
+local function GetLogId(log)
+    if type(log) ~= "table" then
+        return nil
+    end
+    if log.GetID then
+        return log:GetID()
+    end
+    return log._id
+end
+
+local function GetLogCounter(log)
+    if type(log) ~= "table" then
+        return nil
+    end
+    if log.GetCounter then
+        return log:GetCounter()
+    end
+    return log._counter
+end
+
 function Identity.CompareLogs(a, b)
     local aTime = (a and a.GetTimestamp and a:GetTimestamp()) or (a and a._timestamp) or 0
     local bTime = (b and b.GetTimestamp and b:GetTimestamp()) or (b and b._timestamp) or 0
@@ -129,6 +149,161 @@ function Identity.CompareLogs(a, b)
     local aId = (a and a.GetID and a:GetID()) or (a and a._id) or ""
     local bId = (b and b.GetID and b:GetID()) or (b and b._id) or ""
     return aId < bId
+end
+
+-- Causal-then-deterministic order: per-author counters, then writer-observed
+-- preOpAuthorMax predecessors, then CompareLogs among ready events.
+function Identity.OrderLogs(logs)
+    if type(logs) ~= "table" then
+        return {}
+    end
+    local n = #logs
+    local ordered = {}
+    if n == 0 then
+        return ordered
+    end
+
+    local idOf = {}
+    local byId = {}
+    for i = 1, n do
+        local log = logs[i]
+        local id = GetLogId(log)
+        if type(id) ~= "string" or id == "" or byId[id] then
+            id = string.format("__idx:%d", i)
+        end
+        idOf[log] = id
+        byId[id] = log
+    end
+
+    local byAuthor = {}
+    for i = 1, n do
+        local log = logs[i]
+        local author = GetLogAuthor(log)
+        local counter = tonumber(GetLogCounter(log))
+        if author and counter then
+            byAuthor[author] = byAuthor[author] or {}
+            local existing = byAuthor[author][counter]
+            if not existing or Identity.CompareLogs(log, existing) then
+                byAuthor[author][counter] = log
+            end
+        end
+    end
+
+    local function bestAtOrBefore(author, counter)
+        local counters = byAuthor[author]
+        if not counters then
+            return nil
+        end
+        if counters[counter] then
+            return counters[counter]
+        end
+        local bestC, best = nil, nil
+        for c, log in pairs(counters) do
+            if c <= counter and (not bestC or c > bestC) then
+                bestC = c
+                best = log
+            end
+        end
+        return best
+    end
+
+    local indegree = {}
+    local successors = {}
+    for i = 1, n do
+        local id = idOf[logs[i]]
+        indegree[id] = 0
+        successors[id] = {}
+    end
+
+    local function addEdge(predLog, succLog)
+        if not predLog or not succLog or predLog == succLog then
+            return
+        end
+        local a, b = idOf[predLog], idOf[succLog]
+        if not a or not b or a == b then
+            return
+        end
+        local list = successors[a]
+        for i = 1, #list do
+            if list[i] == b then
+                return
+            end
+        end
+        list[#list + 1] = b
+        indegree[b] = (indegree[b] or 0) + 1
+    end
+
+    for i = 1, n do
+        local log = logs[i]
+        local author = GetLogAuthor(log)
+        local counter = tonumber(GetLogCounter(log))
+        if author and counter then
+            addEdge(bestAtOrBefore(author, counter - 1), log)
+        end
+        local data = GetLogData(log)
+        local pre = data and data.preOpAuthorMax
+        if type(pre) == "table" then
+            for j = 1, #pre do
+                local entry = pre[j]
+                if type(entry) == "table" then
+                    local pAuthor = NormalizeId(entry.author) or entry.author
+                    local pCounter = tonumber(entry.counter)
+                    if type(pAuthor) == "string" and pAuthor ~= "" and pCounter then
+                        addEdge(bestAtOrBefore(pAuthor, pCounter), log)
+                    end
+                end
+            end
+        end
+    end
+
+    local remaining = {}
+    for i = 1, n do
+        remaining[idOf[logs[i]]] = logs[i]
+    end
+
+    local function pickReady()
+        local bestId, bestLog = nil, nil
+        for id, log in pairs(remaining) do
+            if (indegree[id] or 0) <= 0 then
+                if not bestLog or Identity.CompareLogs(log, bestLog) then
+                    bestId = id
+                    bestLog = log
+                end
+            end
+        end
+        return bestId, bestLog
+    end
+
+    while true do
+        local id, log = pickReady()
+        if not log then
+            break
+        end
+        ordered[#ordered + 1] = log
+        remaining[id] = nil
+        local succs = successors[id] or {}
+        for i = 1, #succs do
+            local sid = succs[i]
+            indegree[sid] = (indegree[sid] or 0) - 1
+        end
+    end
+
+    local leftover = {}
+    for _, log in pairs(remaining) do
+        leftover[#leftover + 1] = log
+    end
+    if #leftover > 0 then
+        table.sort(leftover, function(a, b)
+            return Identity.CompareLogs(a, b)
+        end)
+        if SF.Debug then
+            SF.Debug:Warn("IDENTITY", "Causal order fell back for %d events", #leftover)
+        end
+        for i = 1, #leftover do
+            ordered[#ordered + 1] = leftover[i]
+        end
+    end
+    return ordered
 end
 
 local function NewPartition()
@@ -512,6 +687,30 @@ local function IdentityEventSupersededByLocals(ev, ids, localOrigin)
     return Identity.CompareLogs(ev.log, latest)
 end
 
+local function OutsidersHaveLocalUse(ids, insiderSet, slot, localArmor)
+    local family = FamilyForSlot(slot)
+    for i = 1, #ids do
+        local memberId = ids[i]
+        if not insiderSet[memberId] then
+            local armor = localArmor[memberId] or {}
+            if family == "ordinary" then
+                if armor[slot] then
+                    return true
+                end
+            elseif family == "ring" then
+                if armor.Ring1 or armor.Ring2 then
+                    return true
+                end
+            elseif family == "trinket" then
+                if armor.Trinket1 or armor.Trinket2 then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 local function EventTypes()
     return (SF.LootLogEventTypes) or {}
 end
@@ -654,14 +853,93 @@ local function ComponentHasSimulatedAdmin(memberIds, simulated, owner)
     return false
 end
 
-local function ImplyIdentityAdmins(memberIds, simulated, owner)
+local function ImplyIdentityAdmins(memberIds, simulated, owner, impliedAdminSource, sourceLogId)
     for i = 1, #memberIds do
         local memberId = memberIds[i]
+        if memberId and not SamePlayer(memberId, owner) and not simulated[memberId] then
+            if impliedAdminSource and type(sourceLogId) == "string" and sourceLogId ~= "" then
+                impliedAdminSource[memberId] = sourceLogId
+            end
+        end
         simulated[memberId] = true
-        if SamePlayer(memberId, owner) then
-            simulated[memberId] = true
+    end
+end
+
+function Identity.EnsureLegacyCanonicalAdmins(profile)
+    if type(profile) ~= "table" then
+        return {}
+    end
+    if type(profile._legacyCanonicalAdmins) == "table" then
+        return profile._legacyCanonicalAdmins
+    end
+    local types = EventTypes()
+    local roles = MemberRoles()
+    local granted = {}
+    local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
+    for i = 1, #logs do
+        local log = logs[i]
+        local eventType = GetLogType(log)
+        local data = GetLogData(log)
+        if eventType == types.ADMIN_ADDED and type(data) == "table" then
+            local id = NormalizeId(data.member)
+            if id then
+                granted[id] = true
+            end
+        elseif eventType == types.ROLE_CHANGE and type(data) == "table" and data.newRole == roles.ADMIN then
+            local id = NormalizeId(data.member)
+            if id then
+                granted[id] = true
+            end
         end
     end
+    local owner = NormalizeId((profile.GetOwnerId and profile:GetOwnerId()) or profile._owner)
+    if owner then
+        granted[owner] = true
+    end
+    local legacy = {}
+    local seen = {}
+    for _, id in ipairs(profile._adminUsers or {}) do
+        local norm = NormalizeId(id)
+        if norm and not granted[norm] and not seen[norm] then
+            seen[norm] = true
+            legacy[#legacy + 1] = norm
+        end
+    end
+    table.sort(legacy)
+    profile._legacyCanonicalAdmins = legacy
+    return legacy
+end
+
+function Identity.UnrosteredAttributedMembers(logs, rosterSet)
+    local types = EventTypes()
+    local found = {}
+    rosterSet = rosterSet or {}
+    for i = 1, #(logs or {}) do
+        local data = GetLogData(logs[i])
+        local eventType = GetLogType(logs[i])
+        if type(data) == "table" then
+            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember }
+            if eventType == types.RC_LOOT_COUNCIL or eventType == types.POINT_CHANGE
+                or eventType == types.ATTENDANCE_CHANGE or eventType == types.ARMOR_CHANGE
+                or eventType == types.ADMIN_ADDED or eventType == types.ADMIN_REMOVED
+                or eventType == types.ROLE_CHANGE
+            then
+                candidates[#candidates + 1] = data.member
+            end
+            for j = 1, #candidates do
+                local id = NormalizeId(candidates[j])
+                if id and not rosterSet[id] then
+                    found[id] = true
+                end
+            end
+        end
+    end
+    local out = {}
+    for id in pairs(found) do
+        out[#out + 1] = id
+    end
+    table.sort(out)
+    return out
 end
 
 function Identity.NormalizeMemberId(id)
@@ -779,15 +1057,24 @@ function Identity.IntroducedNewConflict(countsA, countsB, countsAfter)
 end
 
 function Identity.LogsBefore(logs, incoming)
-    local before = {}
-    if type(logs) ~= "table" then
-        return before
-    end
-    for i = 1, #logs do
-        local log = logs[i]
-        if Identity.CompareLogs(log, incoming) then
-            before[#before + 1] = log
+    local combined = {}
+    if type(logs) == "table" then
+        for i = 1, #logs do
+            combined[#combined + 1] = logs[i]
         end
+    end
+    if incoming then
+        combined[#combined + 1] = incoming
+    end
+    local ordered = Identity.OrderLogs(combined)
+    local before = {}
+    local incomingId = GetLogId(incoming)
+    for i = 1, #ordered do
+        local log = ordered[i]
+        if log == incoming or (incomingId and GetLogId(log) == incomingId) then
+            break
+        end
+        before[#before + 1] = log
     end
     return before
 end
@@ -841,19 +1128,27 @@ function Identity.Replay(logs, opts)
     local simulated = {}
     local restoredSources = {}
     local identityArmorEvents = {}
+    local appliedRelationshipIds = {}
+    local impliedAdminSource = {}
 
     if owner then
         EnsureMember(partition, owner)
         simulated[owner] = true
     end
 
-    local ordered = {}
-    for i = 1, #(logs or {}) do
-        ordered[i] = logs[i]
+    local legacyAdmins = opts.legacyAdmins
+    if type(legacyAdmins) == "table" then
+        for i = 1, #legacyAdmins do
+            local legacyId = NormalizeId(legacyAdmins[i])
+            if legacyId and not SamePlayer(legacyId, owner) then
+                EnsureMember(partition, legacyId)
+                simulated[legacyId] = true
+                auth[legacyId] = "admin"
+            end
+        end
     end
-    table.sort(ordered, function(a, b)
-        return Identity.CompareLogs(a, b)
-    end)
+
+    local ordered = Identity.OrderLogs(logs)
 
     local function ensureLocal(memberId)
         memberId = EnsureMember(partition, memberId)
@@ -922,21 +1217,36 @@ function Identity.Replay(logs, opts)
                     local preAHasAdmin = ComponentHasSimulatedAdmin(preA, simulated, owner)
                     local preBHasAdmin = ComponentHasSimulatedAdmin(preB, simulated, owner)
                     Union(partition, memberA, memberB)
+                    local linkId = GetLogId(log)
+                    if type(linkId) == "string" and linkId ~= "" then
+                        appliedRelationshipIds[linkId] = true
+                    end
                     if preAHasAdmin then
-                        ImplyIdentityAdmins(preB, simulated, owner)
+                        ImplyIdentityAdmins(preB, simulated, owner, impliedAdminSource, linkId)
                     end
                     if preBHasAdmin then
-                        ImplyIdentityAdmins(preA, simulated, owner)
+                        ImplyIdentityAdmins(preA, simulated, owner, impliedAdminSource, linkId)
                     end
                 end
             elseif eventType == types.CHARACTER_UNLINK then
                 if RelationshipAuthorizedAt(log, eventType, data, partition, simulated, auth, owner) then
                     Split(partition, data.member)
+                    local unlinkId = GetLogId(log)
+                    if type(unlinkId) == "string" and unlinkId ~= "" then
+                        appliedRelationshipIds[unlinkId] = true
+                    end
                 end
                 ensureLocal(data.member)
             elseif eventType == types.ADMIN_ADDED then
                 ensureLocal(data.member)
-                ApplyAuthAdmin(auth, simulated, owner, data.member, true)
+                local sourceLogId = data.sourceLogId
+                if type(sourceLogId) == "string" and sourceLogId ~= "" then
+                    if appliedRelationshipIds[sourceLogId] then
+                        ApplyAuthAdmin(auth, simulated, owner, data.member, true)
+                    end
+                else
+                    ApplyAuthAdmin(auth, simulated, owner, data.member, true)
+                end
             elseif eventType == types.ADMIN_REMOVED then
                 ensureLocal(data.member)
                 ApplyAuthAdmin(auth, simulated, owner, data.member, false)
@@ -1031,10 +1341,15 @@ function Identity.Replay(logs, opts)
             local idSet = ListToSet(ids)
             for j = 1, #identityArmorEvents do
                 local ev = identityArmorEvents[j]
-                if IsSubset(ev.identityMembers, idSet)
-                    and not IdentityEventSupersededByLocals(ev, ids, localOrigin)
-                then
-                    ApplyIdentityArmor(occ, ev.slot, ev.action)
+                if IsSubset(ev.identityMembers, idSet) then
+                    local insiderIds = ev.identityMembers
+                    if not IdentityEventSupersededByLocals(ev, insiderIds, localOrigin) then
+                        local skipAvailable = ev.action == actions.AVAILABLE
+                            and OutsidersHaveLocalUse(ids, ListToSet(insiderIds), ev.slot, localArmor)
+                        if not skipAvailable then
+                            ApplyIdentityArmor(occ, ev.slot, ev.action)
+                        end
+                    end
                 end
             end
             occByRoot[root] = occ
@@ -1072,6 +1387,8 @@ function Identity.Replay(logs, opts)
         simulatedAdmins = simulated,
         simulatedAdminList = simulatedList,
         restoredSources = restoredSources,
+        appliedRelationshipIds = appliedRelationshipIds,
+        impliedAdminSource = impliedAdminSource,
         overflowByIdentity = overflowByIdentity,
         overflowKeysByIdentity = overflowKeysByIdentity,
         overflowCountsByIdentity = overflowCountsByIdentity,
@@ -1211,13 +1528,89 @@ function Identity.ComponentAdmins(profile, memberA, memberB)
     return admins
 end
 
+function Identity.ApplyCanonicalAdmins(profile, result)
+    if type(profile) ~= "table" then
+        return
+    end
+    result = result or profile._identityProjection
+    local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
+    local types = EventTypes()
+    local roles = MemberRoles()
+    local appliedLinks = (result and result.appliedRelationshipIds) or {}
+    local adminSet = {}
+    local owner = NormalizeId((profile.GetOwnerId and profile:GetOwnerId()) or profile._owner)
+    if owner then
+        adminSet[owner] = true
+    end
+    local legacy = profile._legacyCanonicalAdmins or {}
+    for i = 1, #legacy do
+        local id = NormalizeId(legacy[i])
+        if id then
+            adminSet[id] = true
+        end
+    end
+    local orderedLogs = Identity.OrderLogs(logs)
+    for i = 1, #orderedLogs do
+        local log = orderedLogs[i]
+        local eventType = GetLogType(log)
+        local data = GetLogData(log)
+        if type(eventType) == "string" and type(data) == "table" then
+            if eventType == types.ADMIN_ADDED then
+                local memberId = NormalizeId(data.member)
+                local sourceLogId = data.sourceLogId
+                if memberId then
+                    if type(sourceLogId) == "string" and sourceLogId ~= "" then
+                        if appliedLinks[sourceLogId] then
+                            adminSet[memberId] = true
+                        end
+                    else
+                        adminSet[memberId] = true
+                    end
+                end
+            elseif eventType == types.ADMIN_REMOVED then
+                local memberId = NormalizeId(data.member)
+                if memberId then
+                    adminSet[memberId] = nil
+                end
+            elseif eventType == types.ROLE_CHANGE then
+                local memberId = NormalizeId(data.member)
+                if memberId and data.newRole == roles.ADMIN then
+                    adminSet[memberId] = true
+                elseif memberId and data.newRole == roles.MEMBER then
+                    adminSet[memberId] = nil
+                end
+            end
+        end
+    end
+    if owner then
+        adminSet[owner] = true
+    end
+    local admins = {}
+    for id in pairs(adminSet) do
+        admins[#admins + 1] = id
+    end
+    table.sort(admins)
+    profile._adminUsers = admins
+    if SF.MemberRoles then
+        for _, member in ipairs(profile._members or {}) do
+            local mid = NormalizeId((member.GetFullIdentifier and member:GetFullIdentifier()) or member.identifier)
+            if mid and adminSet[mid] then
+                member.role = SF.MemberRoles.ADMIN
+            elseif member then
+                member.role = SF.MemberRoles.MEMBER
+            end
+        end
+    end
+end
+
 function Identity.ApplyToProfileMembers(profile)
     if type(profile) ~= "table" then
         return nil
     end
     local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
     local owner = (profile.GetOwnerId and profile:GetOwnerId()) or profile._owner
-    local result = Identity.Replay(logs, { owner = owner })
+    local legacyAdmins = Identity.EnsureLegacyCanonicalAdmins(profile)
+    local result = Identity.Replay(logs, { owner = owner, legacyAdmins = legacyAdmins })
 
     local existing = {}
     if type(profile._members) == "table" then
@@ -1235,6 +1628,27 @@ function Identity.ApplyToProfileMembers(profile)
             local created = SF.Member.new(sourceId)
             if created then
                 existing[sourceId] = created
+            end
+        end
+    end
+
+    local rosterSet = {}
+    for memberId in pairs(existing) do
+        rosterSet[memberId] = true
+    end
+    local unrostered = Identity.UnrosteredAttributedMembers(logs, rosterSet)
+    for i = 1, #unrostered do
+        local sourceId = unrostered[i]
+        if not existing[sourceId] and SF.Member and SF.Member.new then
+            local created = SF.Member.new(sourceId)
+            if created then
+                existing[sourceId] = created
+                result.restoredSources[sourceId] = true
+                if SF.PrintWarning and not (profile._warnedUnrosteredRestore and profile._warnedUnrosteredRestore[sourceId]) then
+                    profile._warnedUnrosteredRestore = profile._warnedUnrosteredRestore or {}
+                    profile._warnedUnrosteredRestore[sourceId] = true
+                    SF:PrintWarning(("Loot Helper restored %s from historical logs with no Main Swap lineage. Link it manually if it should share an identity."):format(tostring(sourceId)))
+                end
             end
         end
     end
@@ -1260,6 +1674,7 @@ function Identity.ApplyToProfileMembers(profile)
     end)
     profile._memberById = nil
     profile._identityProjection = result
+    Identity.ApplyCanonicalAdmins(profile, result)
 
     return result
 end

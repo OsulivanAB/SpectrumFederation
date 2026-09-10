@@ -2062,6 +2062,9 @@ function LootProfile:AddAdminMemberId(memberId, opts)
     local eventType = SF.LootLogEventTypes.ADMIN_ADDED
     local eventData = SF.LootLog.GetEventDataTemplate(eventType)
     eventData.member = memberId
+    if type(opts.sourceLogId) == "string" and opts.sourceLogId ~= "" then
+        eventData.sourceLogId = opts.sourceLogId
+    end
     local logEntry = SF.LootLog.new(eventType, eventData, { profile = self, skipPermission = opts.skipPermission })
     if not logEntry then
         return false, "Failed to create admin added log."
@@ -2074,16 +2077,13 @@ function LootProfile:AddAdminMemberId(memberId, opts)
         return false, "Failed to record admin added."
     end
 
-    self._adminUsers = self._adminUsers or {}
-    table.insert(self._adminUsers, memberId)
-
     if SF.Debug then
         SF.Debug:Info("LootProfile", "Successfully added admin: %s", tostring(memberId))
         SF.Debug:Info("ADMIN_STATUS", "User %s granted admin in profile %s",
             tostring(memberId), tostring(self._profileName))
     end
 
-    return true
+    return self:IsAdminMemberId(memberId)
 end
 
 -- Function to remove an admin member ID from this profile
@@ -2254,12 +2254,15 @@ function LootProfile:LinkCharacters(memberA, memberB, opts)
     for i = 1, #linkedIds do
         linkedSet[linkedIds[i]] = true
     end
+    local linkId = logEntry.GetID and logEntry:GetID() or logEntry._id
     if result and result.simulatedAdmins then
         for memberId in pairs(result.simulatedAdmins) do
             if linkedSet[memberId] and not self:IsAdminMemberId(memberId) then
+                local sourceLogId = (result.impliedAdminSource and result.impliedAdminSource[memberId]) or linkId
                 self:AddAdminMemberId(memberId, {
                     skipPermission = true,
                     skipBroadcast = opts.skipBroadcast,
+                    sourceLogId = sourceLogId,
                 })
             end
         end
@@ -2318,23 +2321,28 @@ function LootProfile:ReconcileIdentityAdmins(opts)
     if not Identity or not Identity.Replay then
         return 0
     end
-    local result = Identity.Replay(self._lootLogs, { owner = self._owner })
+    local legacyAdmins = Identity.EnsureLegacyCanonicalAdmins and Identity.EnsureLegacyCanonicalAdmins(self) or nil
+    local result = Identity.Replay(self._lootLogs, { owner = self._owner, legacyAdmins = legacyAdmins })
     local added = 0
     for memberId in pairs(result.simulatedAdmins or {}) do
         if memberId and not self:IsAdminMemberId(memberId) then
-            if not self:getMemberByID(memberId) and SF.Member and SF.Member.new then
-                local created = SF.Member.new(memberId)
-                if created then
-                    self._members = self._members or {}
-                    self._members[#self._members + 1] = created
+            local sourceLogId = result.impliedAdminSource and result.impliedAdminSource[memberId]
+            if type(sourceLogId) == "string" and sourceLogId ~= "" then
+                if not self:getMemberByID(memberId) and SF.Member and SF.Member.new then
+                    local created = SF.Member.new(memberId)
+                    if created then
+                        self._members = self._members or {}
+                        self._members[#self._members + 1] = created
+                    end
                 end
-            end
-            local ok = self:AddAdminMemberId(memberId, {
-                skipPermission = true,
-                skipBroadcast = opts.skipBroadcast,
-            })
-            if ok then
-                added = added + 1
+                local ok = self:AddAdminMemberId(memberId, {
+                    skipPermission = true,
+                    skipBroadcast = opts.skipBroadcast,
+                    sourceLogId = sourceLogId,
+                })
+                if ok then
+                    added = added + 1
+                end
             end
         end
     end
@@ -2389,6 +2397,9 @@ function LootProfile:ExportSnapshot()
         version         = PROFILE_SNAPSHOT_VERSION,
         meta            = self:ExportMeta(),
 		adminUsers      = CopyArray(self._adminUsers),
+		legacyCanonicalAdmins = type(self._legacyCanonicalAdmins) == "table"
+			and CopyArray(self._legacyCanonicalAdmins)
+			or nil,
 		lootLogs        = logsOut,
 		members         = membersOut,
 		equipmentSnapshots = equipmentSnapshotsOut,
@@ -2435,6 +2446,16 @@ function LootProfile.ValidateSnapshot(snapshot)
     for i, admin in ipairs(snapshot.adminUsers) do
         if type(admin) ~= "string" or admin == "" then
             return false, ("snapshot.adminUsers[%d] is invalid"):format(i)
+        end
+    end
+    if snapshot.legacyCanonicalAdmins ~= nil then
+        if type(snapshot.legacyCanonicalAdmins) ~= "table" then
+            return false, "snapshot.legacyCanonicalAdmins must be a table or nil"
+        end
+        for i, admin in ipairs(snapshot.legacyCanonicalAdmins) do
+            if type(admin) ~= "string" or admin == "" then
+                return false, ("snapshot.legacyCanonicalAdmins[%d] is invalid"):format(i)
+            end
         end
     end
 
@@ -2563,6 +2584,11 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 
     -- Replace admin list (later we may derive this from logs; for now keep it explicit)
     self._adminUsers = CopyArray(snapshot.adminUsers)
+    if type(snapshot.legacyCanonicalAdmins) == "table" then
+        self._legacyCanonicalAdmins = CopyArray(snapshot.legacyCanonicalAdmins)
+    else
+        self._legacyCanonicalAdmins = nil
+    end
 
     self:_EnsureOwnerIsAdmin()
     

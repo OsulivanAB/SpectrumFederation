@@ -2297,6 +2297,478 @@ assertFalse(armorOf(profile, ALT_B, "Chest"), "relinked partner sees the later A
 local armorReverseReload = rebuildFrom(profile, "ArmorChronologyReverseReload")
 assertFalse(armorOf(armorReverseReload, ALT_A, "Chest"), "reload matches live later AVAILABLE")
 
+local function runAuthorizationHardeningTests()
+
+-- ---------------------------------------------------------------------------
+-- Live NEW_LOG sender must equal relationship author
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("SenderAuthor")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+activateSession(profile)
+
+local spoofOwner = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = OWNER,
+    memberB = ALT_B,
+    adminMembersAtLink = { OWNER },
+}, { author = OWNER, counter = 40, timestamp = 1700005000 })
+Sync:HandleNewLog(OTHER, livePayload(profile, spoofOwner))
+assertFalse(profile:AreSameIdentity(OWNER, ALT_B), "non-owner admin cannot spoof owner as relationship author")
+assertEq(#pendingList(profile), 0, "spoofed owner author never enters pending")
+
+local spoofAdmin = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OTHER },
+}, { author = ALT_A, counter = 1, timestamp = 1700005010 })
+Sync:HandleNewLog(OTHER, livePayload(profile, spoofAdmin))
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "non-owner admin cannot spoof another admin as relationship author")
+
+local ownerMismatch = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OTHER },
+}, { author = OTHER, counter = 2, timestamp = 1700005020 })
+Sync:HandleNewLog(OWNER, livePayload(profile, ownerMismatch))
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "owner sender with mismatched author is rejected")
+
+local matching = liveTable(profile, SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OTHER },
+}, OTHER)
+Sync:HandleNewLog(OTHER, livePayload(profile, matching))
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_B), "matching sender/author valid non-owner LINK is accepted")
+
+resetEnv()
+profile = makeProfile("SenderAuthorPending")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+activateSession(profile)
+Sync.state.authorMax[OWNER] = 9
+local deferredMatch = liveTable(profile, SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OTHER },
+}, OTHER)
+Sync:HandleNewLog(OTHER, livePayload(profile, deferredMatch))
+assertEq(#pendingList(profile), 1, "matching sender/author LINK can still defer")
+assertEq(pendingList(profile)[1].sender, OTHER, "pending preserves original sender")
+local spoofWhilePending = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = OWNER,
+    memberB = ALT_A,
+    adminMembersAtLink = { OWNER },
+}, { author = OWNER, counter = 50, timestamp = 1700005100 })
+Sync:HandleNewLog(OTHER, livePayload(profile, spoofWhilePending))
+assertEq(#pendingList(profile), 1, "mismatched sender/author does not join pending")
+Sync.state.authorMax = Sync:ComputeAuthorMax(profile:GetProfileId()) or {}
+Sync:FlushPendingLiveRelationshipLogs(profile:GetProfileId())
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_B), "flush still enforces sender/author and applies the original matching LINK")
+assertFalse(profile:AreSameIdentity(OWNER, ALT_A), "spoofed owner LINK remains rejected after flush")
+
+resetEnv()
+profile = makeProfile("SenderAuthorBulk")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+local bulkOwnerLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OTHER },
+}, { author = OTHER, counter = 3, timestamp = 1700005200 })
+assertTrue(profile:MergeLogTables({ bulkOwnerLink }) > 0, "AUTH_LOGS/snapshot relay of another author's LINK is accepted")
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_B), "historical relay is not sender-bound")
+
+-- ---------------------------------------------------------------------------
+-- Writer-side eager ADMIN_ADDED is bound to the source LINK
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("WriterEagerGrant")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+profile:AddAdminMemberId(ALT_A)
+assertTrue(asPlayer(OTHER, function()
+    return profile:LinkCharacters(ALT_A, ALT_B, { skipBroadcast = true })
+end), "writer X locally LINKs A+B before seeing O+A")
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_B), "incomplete local history applies A+B")
+local sawSourcedGrant = false
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.ADMIN_ADDED then
+        local data = log:GetEventData()
+        if data.member == ALT_B and type(data.sourceLogId) == "string" and data.sourceLogId ~= "" then
+            sawSourcedGrant = true
+        end
+    end
+end
+assertTrue(sawSourcedGrant, "eager grant records sourceLogId")
+local hiddenOwnerLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = OWNER,
+    memberB = ALT_A,
+    adminMembersAtLink = { OWNER },
+}, { author = OWNER, counter = (profile._authorCounters[OWNER] or 1) + 1, timestamp = 1700000400 })
+assertTrue(profile:MergeLogTables({ hiddenOwnerLink }) > 0, "earlier owner O+A arrives after writer LINK")
+profile:ApplyIdentityProjection({ force = true })
+assertTrue(profile:AreSameIdentity(OWNER, ALT_A), "complete history keeps owner LINK")
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "complete history skips writer A+B")
+assertFalse(profile:IsAdminMemberId(ALT_B), "sourced ADMIN_ADDED does not survive a skipped LINK")
+local writerReload = rebuildFrom(profile, "WriterEagerReload")
+assertFalse(writerReload:IsAdminMemberId(ALT_B), "reload also drops the skipped LINK's auto-admin")
+assertFalse(writerReload:AreSameIdentity(ALT_A, ALT_B), "reload topology matches")
+
+resetEnv()
+profile = makeProfile("UnlinkKeepsValidGrant")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+profile:AddAdminMemberId(ALT_A)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "valid LINK grants B")
+assertTrue(profile:IsAdminMemberId(ALT_B), "B is canonical after valid LINK")
+assertTrue(profile:UnlinkCharacter(ALT_B), "unlink after valid grant")
+assertTrue(profile:IsAdminMemberId(ALT_B), "unlink does not revoke a previously valid grant")
+
+-- ---------------------------------------------------------------------------
+-- Legacy canonical admins without ADMIN_ADDED
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("LegacyAdmin")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile._adminUsers = { OWNER, OTHER }
+profile:ApplyIdentityProjection({ force = true })
+assertEq(SF.LootHelperIdentity.EnsureLegacyCanonicalAdmins(profile)[1], OTHER, "OTHER is frozen as a legacy canonical admin")
+assertTrue(asPlayer(OTHER, function()
+    return profile:LinkCharacters(ALT_A, ALT_B, { skipBroadcast = true })
+end), "legacy MAIN_SWAP-style admin can create a non-owner LINK")
+assertTrue(profile:AreSameIdentity(ALT_A, ALT_B), "live state keeps the legacy-admin LINK")
+local legacyReload = rebuildFrom(profile, "LegacyAdminReload")
+legacyReload._legacyCanonicalAdmins = { OTHER }
+legacyReload._adminUsers = { OWNER, OTHER }
+legacyReload:ApplyIdentityProjection({ force = true })
+assertTrue(legacyReload:AreSameIdentity(ALT_A, ALT_B), "full rebuild keeps the legacy-admin LINK")
+local snap = profile:ExportSnapshot()
+local legacySnap = makeProfile("LegacyAdminSnap")
+legacySnap._profileId = snap.meta._profileId
+assertTrue(select(1, legacySnap:ImportSnapshot(snap)), "snapshot replica imports legacyCanonicalAdmins")
+legacySnap:ApplyIdentityProjection({ force = true })
+assertTrue(legacySnap:AreSameIdentity(ALT_A, ALT_B), "snapshot replica keeps the legacy-admin LINK")
+assertEq((legacySnap._legacyCanonicalAdmins or {})[1], OTHER, "imported freeze list retains the legacy admin")
+assertTrue(legacySnap:MergeLogTables(copyLogTables(profile)) >= 0, "AUTH_LOGS into snapshot replica")
+assertTrue(legacySnap:AreSameIdentity(ALT_A, ALT_B), "AUTH_LOGS keeps the legacy-admin LINK")
+assertTrue(profile:RemoveAdminMemberId(OTHER), "later explicit ADMIN_REMOVED works")
+assertFalse(profile:IsAdminMemberId(OTHER), "legacy admin can be removed")
+
+resetEnv()
+profile = makeProfile("LegacyAdminOmittedFreeze")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile._adminUsers = { OWNER, OTHER }
+local omittedSnap = profile:ExportSnapshot()
+omittedSnap.legacyCanonicalAdmins = nil
+omittedSnap.adminUsers = { OWNER, OTHER }
+local omittedReplica = makeProfile("LegacyAdminOmittedFreezeSnap")
+omittedReplica._profileId = omittedSnap.meta._profileId
+assertTrue(select(1, omittedReplica:ImportSnapshot(omittedSnap)), "snapshot without freeze field still imports")
+assertTrue(asPlayer(OTHER, function()
+    return omittedReplica:LinkCharacters(ALT_A, ALT_B, { skipBroadcast = true })
+end), "omitted freeze field still recovers legacy admin from adminUsers")
+assertTrue(omittedReplica:AreSameIdentity(ALT_A, ALT_B), "recovered legacy admin LINK survives")
+
+resetEnv()
+profile = makeProfile("NoRetroAdmin")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+local earlyLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { ALT_C },
+}, { author = ALT_C, counter = 1, timestamp = 1700000300 })
+assertTrue(profile:MergeLogTables({ earlyLink }) > 0, "LINK predates ALT_C's grant")
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "later newly-added admin does not retroactively authorize an older LINK")
+profile:AddAdminMemberId(ALT_C)
+profile:ApplyIdentityProjection({ force = true })
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "adding ALT_C later still does not apply the older LINK")
+
+-- ---------------------------------------------------------------------------
+-- Causal Replay via preOpAuthorMax
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("CausalAdmin")
+addMember(profile, ALT_A)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+local grant = addLog(profile, SF.LootLogEventTypes.ADMIN_ADDED, {
+    member = ALT_A,
+}, { timestamp = 1700007000, counter = 2 })
+local causalLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_C,
+    memberB = ALT_D,
+    adminMembersAtLink = { ALT_A },
+    preOpAuthorMax = {
+        { author = OWNER, counter = grant:GetCounter() },
+    },
+}, { author = ALT_A, counter = 1, timestamp = 1700007000 })
+assertTrue(profile:MergeLogTables({ causalLink }) > 0, "same-timestamp LINK after observed ADMIN_ADDED")
+assertTrue(profile:AreSameIdentity(ALT_C, ALT_D), "causal order applies the LINK that observed ADMIN_ADDED")
+local causalReload = rebuildFrom(profile, "CausalAdminReload")
+assertTrue(causalReload:AreSameIdentity(ALT_C, ALT_D), "reload keeps causal ADMIN_ADDED -> LINK")
+
+resetEnv()
+profile = makeProfile("CausalAutoAdmin")
+addMember(profile, ALT_A)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+assertTrue(profile:LinkCharacters(OWNER, ALT_A), "owner LINK implies auto-admin for A")
+assertTrue(profile:IsAdminMemberId(ALT_A), "A received a sourced auto-admin grant")
+local autoGrant
+local ownerLinkId
+for _, log in ipairs(profile:GetLootLogs()) do
+    if log:GetEventType() == SF.LootLogEventTypes.ADMIN_ADDED then
+        local data = log:GetEventData()
+        if data.member == ALT_A and type(data.sourceLogId) == "string" and data.sourceLogId ~= "" then
+            autoGrant = log
+            ownerLinkId = data.sourceLogId
+        end
+    end
+end
+assertTrue(autoGrant ~= nil, "owner LINK wrote a sourced ADMIN_ADDED")
+assertTrue(type(ownerLinkId) == "string" and ownerLinkId ~= "", "auto-admin sourceLogId points at the LINK")
+local autoLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_C,
+    memberB = ALT_D,
+    adminMembersAtLink = { ALT_A },
+    preOpAuthorMax = {
+        { author = OWNER, counter = autoGrant:GetCounter() },
+    },
+}, { author = ALT_A, counter = 1, timestamp = autoGrant:GetTimestamp() })
+assertTrue(profile:MergeLogTables({ autoLink }) > 0, "same-timestamp LINK after observed auto-admin grant")
+assertTrue(profile:AreSameIdentity(ALT_C, ALT_D), "newly linked auto-admin can act once the grant is in the prefix")
+assertTrue(rebuildFrom(profile, "CausalAutoAdminReload"):AreSameIdentity(ALT_C, ALT_D), "reload keeps auto-admin causal LINK")
+
+resetEnv()
+profile = makeProfile("CausalOwnerPred")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+local ownerPred = addLog(profile, SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = OWNER,
+    memberB = ALT_A,
+    adminMembersAtLink = { OWNER },
+    preOpAuthorMax = {},
+}, { timestamp = 1700007100, counter = 4 })
+local skippedIntoOwner = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OTHER },
+    preOpAuthorMax = {
+        { author = OWNER, counter = ownerPred:GetCounter() },
+    },
+}, { author = OTHER, counter = 3, timestamp = 1700007100 })
+assertTrue(profile:MergeLogTables({ skippedIntoOwner }) > 0, "same-timestamp A+B that observed O+A is stored")
+assertTrue(profile:AreSameIdentity(OWNER, ALT_A), "owner predecessor LINK remains")
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "Replay skips A+B because the writer had already observed O+A")
+assertFalse(rebuildFrom(profile, "CausalOwnerPredReload"):AreSameIdentity(ALT_A, ALT_B), "reload also skips A+B after owner predecessor")
+
+resetEnv()
+local causalFirst = makeProfile("CausalArrive1")
+addMember(causalFirst, ALT_A)
+addMember(causalFirst, ALT_C)
+addMember(causalFirst, ALT_D)
+addMember(causalFirst, OTHER)
+profile = causalFirst
+local grant2 = addLog(profile, SF.LootLogEventTypes.ADMIN_ADDED, {
+    member = ALT_A,
+}, { timestamp = 1700007000, counter = 2 })
+activateSession(profile)
+local causalLive = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_C,
+    memberB = ALT_D,
+    adminMembersAtLink = { ALT_A },
+    preOpAuthorMax = {
+        { author = OWNER, counter = grant2:GetCounter() },
+    },
+}, { author = ALT_A, counter = 1, timestamp = 1700007000 })
+Sync:HandleNewLog(ALT_A, livePayload(profile, causalLive))
+assertTrue(profile:AreSameIdentity(ALT_C, ALT_D), "live receipt uses the same causal semantics")
+
+resetEnv()
+profile = makeProfile("CausalConcurrent")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+addMember(profile, OTHER)
+profile:AddAdminMemberId(OTHER)
+local linkAB = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { OWNER },
+    preOpAuthorMax = {},
+}, { author = OWNER, counter = 8, timestamp = 1700008000 })
+local linkCD = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_C,
+    memberB = ALT_D,
+    adminMembersAtLink = { OTHER },
+    preOpAuthorMax = {},
+}, { author = OTHER, counter = 2, timestamp = 1700008000 })
+local concA = makeProfile("CausalConcA")
+addMember(concA, ALT_A)
+addMember(concA, ALT_B)
+addMember(concA, ALT_C)
+addMember(concA, ALT_D)
+addMember(concA, OTHER)
+concA:AddAdminMemberId(OTHER)
+concA:MergeLogTables({ linkAB, linkCD })
+local concB = makeProfile("CausalConcB")
+addMember(concB, ALT_A)
+addMember(concB, ALT_B)
+addMember(concB, ALT_C)
+addMember(concB, ALT_D)
+addMember(concB, OTHER)
+concB:AddAdminMemberId(OTHER)
+concB:MergeLogTables({ linkCD, linkAB })
+assertTrue(concA:AreSameIdentity(ALT_A, ALT_B), "concurrent independent LINK AB applies")
+assertTrue(concA:AreSameIdentity(ALT_C, ALT_D), "concurrent independent LINK CD applies")
+assertTrue(concB:AreSameIdentity(ALT_A, ALT_B), "opposite merge order keeps AB")
+assertTrue(concB:AreSameIdentity(ALT_C, ALT_D), "opposite merge order keeps CD")
+
+-- ---------------------------------------------------------------------------
+-- Equipment corrections do not reach later joiners
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("ArmorFutureA")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Chest", { profile = profile }), "C independent Chest USED")
+assertTrue(armorOf(profile, ALT_C, "Chest"), "C Chest USED before A+B correction")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B linked")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "A+B identity Chest USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "A+B identity Chest AVAILABLE")
+assertFalse(armorOf(profile, ALT_A, "Chest"), "A+B Chest is available")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "C joins A+B")
+assertTrue(armorOf(profile, ALT_C, "Chest"), "C's historical Chest USED is not erased by older A+B AVAILABLE")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "combined identity keeps C's USED")
+local futureAReload = rebuildFrom(profile, "ArmorFutureAReload")
+assertTrue(armorOf(futureAReload, ALT_C, "Chest"), "reload Case A matches live")
+local futureASnapExport = profile:ExportSnapshot()
+local futureASnap = makeProfile("ArmorFutureASnap")
+futureASnap._profileId = futureASnapExport.meta._profileId
+assertTrue(select(1, futureASnap:ImportSnapshot(futureASnapExport)), "snapshot Case A")
+futureASnap:ApplyIdentityProjection({ force = true })
+assertTrue(armorOf(futureASnap, ALT_C, "Chest"), "snapshot Case A matches live")
+assertTrue(futureASnap:MergeLogTables(copyLogTables(profile)) >= 0, "AUTH_LOGS Case A")
+assertTrue(armorOf(futureASnap, ALT_C, "Chest"), "AUTH_LOGS Case A matches live")
+
+resetEnv()
+profile = makeProfile("ArmorFutureB")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B linked first")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "A+B identity Chest USED")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "A+B Chest USED")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Chest", { profile = profile }), "C independent Chest USED")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Chest", { profile = profile }), "C independent Chest AVAILABLE")
+assertFalse(armorOf(profile, ALT_C, "Chest"), "C Chest AVAILABLE")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "C joins A+B after AVAILABLE")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "C's unrelated AVAILABLE does not suppress A+B USED")
+assertTrue(armorOf(profile, ALT_C, "Chest"), "joiner sees the active shared USED")
+local futureBReload = rebuildFrom(profile, "ArmorFutureBReload")
+assertTrue(armorOf(futureBReload, ALT_A, "Chest"), "reload Case B matches live")
+local futureBSnapExport = profile:ExportSnapshot()
+local futureBSnap = makeProfile("ArmorFutureBSnap")
+futureBSnap._profileId = futureBSnapExport.meta._profileId
+assertTrue(select(1, futureBSnap:ImportSnapshot(futureBSnapExport)), "snapshot Case B")
+futureBSnap:ApplyIdentityProjection({ force = true })
+assertTrue(armorOf(futureBSnap, ALT_A, "Chest"), "snapshot Case B matches live")
+assertTrue(futureBSnap:MergeLogTables(copyLogTables(profile)) >= 0, "AUTH_LOGS Case B")
+assertTrue(armorOf(futureBSnap, ALT_A, "Chest"), "AUTH_LOGS Case B matches live")
+
+resetEnv()
+profile = makeProfile("ArmorFutureRing")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Ring1", { profile = profile }), "C independent Ring1 USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B for ring case")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "A+B identity Ring1 USED")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "A+B identity Ring1 AVAILABLE")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "C joins ring identity")
+assertTrue(armorOf(profile, ALT_C, "Ring1") or armorOf(profile, ALT_C, "Ring2"), "C's ring usage remains after older A+B AVAILABLE")
+
+resetEnv()
+profile = makeProfile("ArmorFutureTrinket")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B for trinket case")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Trinket1", { profile = profile, scope = "identity" }), "A+B identity Trinket1 USED")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Trinket1", { profile = profile }), "C independent Trinket1 USED")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Trinket1", { profile = profile }), "C independent Trinket1 AVAILABLE")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "C joins trinket identity")
+assertTrue(armorOf(profile, ALT_A, "Trinket1") or armorOf(profile, ALT_A, "Trinket2"), "C AVAILABLE does not suppress A+B trinket USED")
+
+-- ---------------------------------------------------------------------------
+-- Main Swap with failed MAIN_SWAP lineage log
+-- ---------------------------------------------------------------------------
+resetEnv()
+profile = makeProfile("OrphanSwap")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addLog(profile, SF.LootLogEventTypes.POINT_CHANGE, {
+    member = ALT_B,
+    change = SF.LootLogPointChangeTypes.INCREMENT,
+    amount = 3,
+}, { timestamp = 1700000100 })
+local hyphen = "Thrall-Azjol-Nerub"
+assertTrue(SF.LootLogValidators.ValidateMainSwapData({
+    member = ALT_A,
+    sourceMember = hyphen,
+}), "MAIN_SWAP validation accepts hyphenated realms")
+for _, log in ipairs(profile:GetLootLogs()) do
+    local data = log:GetEventData()
+    if log:GetEventType() == SF.LootLogEventTypes.POINT_CHANGE and data.member == ALT_B then
+        data.member = ALT_A
+    end
+end
+assertTrue(profile:RemoveMemberById(ALT_B), "old TransferMemberHistory removed the source")
+local rcAward = makeTable(SF.LootLogEventTypes.RC_LOOT_COUNCIL, {
+    member = ALT_B,
+    itemLink = "|cffa335ee|Hitem:1::::::::80:259:::::::::|h[X]|h|r",
+    response = "Need",
+    rcAwardId = "orphan-1",
+    awardKey = "orphan-1",
+}, { timestamp = 1700000200, counter = 0, author = "RCLootCouncil" })
+rcAward._externalId = "orphan-1"
+rcAward._id = "orphan-1"
+rcAward._fingerprint = SF.LootLog.ComputeFingerprintFromTable(rcAward)
+assertTrue(profile:MergeLogTables({ rcAward }, { allowUnknownEventType = true }) >= 0, "RC award still names the missing source")
+profile:ApplyIdentityProjection({ force = true })
+assertTrue(memberOf(profile, ALT_B) ~= nil, "missing source is restored as a shell")
+assertFalse(profile:AreSameIdentity(ALT_A, ALT_B), "no MAIN_SWAP lineage is not invented")
+local sawRestoreWarn = false
+for i = 1, #printed do
+    if printed[i][1] == "warn" and tostring(printed[i][2]):find("no Main Swap lineage", 1, true) then
+        sawRestoreWarn = true
+    end
+end
+assertTrue(sawRestoreWarn, "admin warning is emitted for unrostered historical attribution")
+end
+runAuthorizationHardeningTests()
+
 -- ---------------------------------------------------------------------------
 -- Protocol
 -- ---------------------------------------------------------------------------

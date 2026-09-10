@@ -283,6 +283,13 @@ function Sync:BroadcastNewLog(profileId, logTable)
         if not self:IsSenderAuthorized(profileId, me) then
             return fail("not authorized to broadcast NEW_LOG")
         end
+        local logAuthor = self:_ExtractAuthorCounter(logTable)
+        if type(logTable) == "table" and logTable.GetAuthor then
+            logAuthor = logTable:GetAuthor()
+        end
+        if not self:_SamePlayer(me, logAuthor) then
+            return fail("relationship NEW_LOG author must match sender")
+        end
         if touchesOwnerIdentity and not SenderIsEffectiveOwner(profile, me) then
             return fail("not authorized to broadcast owner-identity NEW_LOG")
         end
@@ -389,6 +396,13 @@ function Sync:HandleNewLog(sender, payload)
         if not self:_LiveRelationshipDomainValid(profile, eventType, eventData, logTable) then
             if SF.PrintWarning then
                 SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: invalid relationship payload."):format(tostring(sender), tostring(profileId)))
+            end
+            return
+        end
+        local logAuthor = self:_ExtractAuthorCounter(logTable)
+        if not self:_SamePlayer(sender, logAuthor) then
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: relationship author must match sender."):format(tostring(sender), tostring(profileId)))
             end
             return
         end
