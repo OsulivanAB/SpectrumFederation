@@ -164,28 +164,19 @@ end
 -- Ready selection is a binary min-heap so the Kahn walk is O(n log n).
 function Identity.OrderLogs(logs)
     if type(logs) ~= "table" then
-        Identity.lastOrderStats = { n = 0, readyPops = 0, heapOps = 0, cacheHit = false }
+        Identity.lastOrderStats = { n = 0, readyPops = 0, heapOps = 0, edgeInserts = 0, edgeCalls = 0 }
         return {}
     end
     local n = #logs
     if n == 0 then
-        Identity.lastOrderStats = { n = 0, readyPops = 0, heapOps = 0, cacheHit = false }
+        Identity.lastOrderStats = { n = 0, readyPops = 0, heapOps = 0, edgeInserts = 0, edgeCalls = 0 }
         return {}
-    end
-
-    local cache = Identity._orderCache
-    if cache and cache.logs == logs and cache.n == n and cache.last == logs[n] then
-        Identity.lastOrderStats = {
-            n = n,
-            readyPops = cache.readyPops or n,
-            heapOps = cache.heapOps or 0,
-            cacheHit = true,
-        }
-        return cache.ordered
     end
 
     local ordered = {}
     local heapOps = 0
+    local edgeInserts = 0
+    local edgeCalls = 0
     local idOf = {}
     local byId = {}
     for i = 1, n do
@@ -253,13 +244,16 @@ function Identity.OrderLogs(logs)
 
     local indegree = {}
     local successors = {}
+    local successorSet = {}
     for i = 1, n do
         local id = idOf[logs[i]]
         indegree[id] = 0
         successors[id] = {}
+        successorSet[id] = {}
     end
 
     local function addEdge(predLog, succLog)
+        edgeCalls = edgeCalls + 1
         if not predLog or not succLog or predLog == succLog then
             return
         end
@@ -267,14 +261,15 @@ function Identity.OrderLogs(logs)
         if not a or not b or a == b then
             return
         end
-        local list = successors[a]
-        for i = 1, #list do
-            if list[i] == b then
-                return
-            end
+        local seen = successorSet[a]
+        if seen[b] then
+            return
         end
+        seen[b] = true
+        local list = successors[a]
         list[#list + 1] = b
         indegree[b] = (indegree[b] or 0) + 1
+        edgeInserts = edgeInserts + 1
     end
 
     for i = 1, n do
@@ -415,15 +410,8 @@ function Identity.OrderLogs(logs)
         readyPops = readyPops,
         heapOps = heapOps,
         leftover = #leftover,
-        cacheHit = false,
-    }
-    Identity._orderCache = {
-        logs = logs,
-        n = n,
-        last = logs[n],
-        ordered = ordered,
-        readyPops = readyPops,
-        heapOps = heapOps,
+        edgeInserts = edgeInserts,
+        edgeCalls = edgeCalls,
     }
     return ordered
 end
@@ -595,17 +583,42 @@ local function CloneOcc(occ)
     }
 end
 
-local function MergeFamily(dst, src)
-    dst.overflow = (dst.overflow or 0) + (src.overflow or 0)
-    for i = 1, 2 do
-        if src.occupied[i] then
-            if dst.occupied[i] then
-                dst.overflow = dst.overflow + 1
-            else
-                dst.occupied[i] = true
-            end
-        end
+local function FamilyHasOccupancy(familyOcc)
+    return familyOcc.occupied[1] or familyOcc.occupied[2] or (familyOcc.overflow or 0) > 0
+end
+
+local function OccupiedDisplayCount(familyOcc)
+    local n = 0
+    if familyOcc.occupied[1] then
+        n = n + 1
     end
+    if familyOcc.occupied[2] then
+        n = n + 1
+    end
+    return n
+end
+
+local function MergeFamily(dst, src)
+    if not FamilyHasOccupancy(src) then
+        return
+    end
+    if not FamilyHasOccupancy(dst) then
+        dst.occupied[1] = src.occupied[1] and true or false
+        dst.occupied[2] = src.occupied[2] and true or false
+        dst.overflow = src.overflow or 0
+        return
+    end
+    -- Independent scopes combine by packing displayed uses into
+    -- opportunity 1, then 2, then overflow. Do not preserve source indices.
+    local displayed = OccupiedDisplayCount(dst) + OccupiedDisplayCount(src)
+    local overflow = (dst.overflow or 0) + (src.overflow or 0)
+    if displayed > 2 then
+        overflow = overflow + (displayed - 2)
+        displayed = 2
+    end
+    dst.occupied[1] = displayed >= 1
+    dst.occupied[2] = displayed >= 2
+    dst.overflow = overflow
 end
 
 local function MergeOcc(dst, src)
@@ -638,10 +651,26 @@ local function FamilyForSlot(slot)
     return "ordinary", slot
 end
 
+local causalRank = nil
+
+local function CausalBefore(a, b)
+    if causalRank and a and b then
+        local ra = causalRank[a]
+        local rb = causalRank[b]
+        if ra and rb and ra ~= rb then
+            return ra < rb
+        end
+    end
+    if a and b then
+        return Identity.CompareLogs(a, b)
+    end
+    return a and true or false
+end
+
 local function CompareOrigin(a, b)
     if a.log and b.log then
         if a.log ~= b.log then
-            return Identity.CompareLogs(a.log, b.log)
+            return CausalBefore(a.log, b.log)
         end
     elseif a.log then
         return true
@@ -821,7 +850,7 @@ local function LatestLocalOriginForSlot(ids, slot, localOrigin)
         if not log then
             return
         end
-        if not latest or Identity.CompareLogs(latest, log) then
+        if not latest or CausalBefore(latest, log) then
             latest = log
         end
     end
@@ -845,7 +874,154 @@ local function IdentityEventSupersededByLocals(ev, ids, localOrigin)
     if not latest or not ev.log then
         return false
     end
-    return Identity.CompareLogs(ev.log, latest)
+    return CausalBefore(ev.log, latest)
+end
+
+local function ExpireSplitIdentityEvents(events, partition)
+    for i = 1, #(events or {}) do
+        local ev = events[i]
+        if ev and not ev.expired then
+            local members = ev.identityMembers
+            if type(members) == "table" and #members >= 2 then
+                local root = FindRoot(partition, members[1])
+                if not root then
+                    ev.expired = true
+                else
+                    for j = 2, #members do
+                        if FindRoot(partition, members[j]) ~= root then
+                            ev.expired = true
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function ScopeShareMember(a, b)
+    local set = ListToSet(b)
+    for i = 1, #a do
+        if set[a[i]] then
+            return true
+        end
+    end
+    return false
+end
+
+local function ProjectFamilyOccupancy(ids, idSet, localArmor, localOrigin, familyEvents, family)
+    if #familyEvents == 0 then
+        return PackLocals(ids, localArmor, localOrigin, family)
+    end
+    local parent = {}
+    local function find(i)
+        local cur = i
+        while parent[cur] ~= cur do
+            parent[cur] = parent[parent[cur]]
+            cur = parent[cur]
+        end
+        return cur
+    end
+    for i = 1, #familyEvents do
+        parent[i] = i
+    end
+    for i = 1, #familyEvents do
+        for j = i + 1, #familyEvents do
+            if ScopeShareMember(familyEvents[i].identityMembers, familyEvents[j].identityMembers) then
+                local ri, rj = find(i), find(j)
+                if ri ~= rj then
+                    parent[ri] = rj
+                end
+            end
+        end
+    end
+    local clusters = {}
+    local claimed = {}
+    for i = 1, #familyEvents do
+        local root = find(i)
+        local cluster = clusters[root]
+        if not cluster then
+            cluster = { events = {}, members = {} }
+            clusters[root] = cluster
+        end
+        cluster.events[#cluster.events + 1] = familyEvents[i]
+        local members = familyEvents[i].identityMembers
+        for m = 1, #members do
+            local id = members[m]
+            if idSet[id] then
+                cluster.members[id] = true
+                claimed[id] = true
+            end
+        end
+    end
+    local clusterList = {}
+    for _, cluster in pairs(clusters) do
+        clusterList[#clusterList + 1] = cluster
+    end
+    table.sort(clusterList, function(a, b)
+        return table.concat(a.events[1].identityMembers, "\0") < table.concat(b.events[1].identityMembers, "\0")
+    end)
+    local occ = NewIdentityOcc()
+    for c = 1, #clusterList do
+        local cluster = clusterList[c]
+        local scopeIds = {}
+        for id in pairs(cluster.members) do
+            scopeIds[#scopeIds + 1] = id
+        end
+        table.sort(scopeIds)
+        local packed = PackLocals(scopeIds, localArmor, localOrigin, family)
+        local latestBySlot = {}
+        for e = 1, #cluster.events do
+            local ev = cluster.events[e]
+            local prev = latestBySlot[ev.slot]
+            if not prev or CausalBefore(prev.log, ev.log) then
+                latestBySlot[ev.slot] = ev
+            end
+        end
+        local apply = {}
+        for _, ev in pairs(latestBySlot) do
+            apply[#apply + 1] = ev
+        end
+        table.sort(apply, function(a, b)
+            return CausalBefore(a.log, b.log)
+        end)
+        for e = 1, #apply do
+            ApplyIdentityArmor(packed, apply[e].slot, apply[e].action)
+        end
+        MergeOcc(occ, packed)
+    end
+    local leftover = {}
+    for i = 1, #ids do
+        if not claimed[ids[i]] then
+            leftover[#leftover + 1] = ids[i]
+        end
+    end
+    if #leftover > 0 then
+        MergeOcc(occ, PackLocals(leftover, localArmor, localOrigin, family))
+    end
+    return occ
+end
+
+local function ProjectIdentityOccupancy(ids, localArmor, localOrigin, identityArmorEvents)
+    local idSet = ListToSet(ids)
+    local byFamily = { ordinary = {}, ring = {}, trinket = {} }
+    for i = 1, #identityArmorEvents do
+        local ev = identityArmorEvents[i]
+        if not ev.expired
+            and IsSubset(ev.identityMembers, idSet)
+            and not IdentityEventSupersededByLocals(ev, ev.identityMembers, localOrigin)
+        then
+            local family = FamilyForSlot(ev.slot)
+            byFamily[family][#byFamily[family] + 1] = ev
+        end
+    end
+    local occ = NewIdentityOcc()
+    local families = { "ordinary", "ring", "trinket" }
+    for f = 1, #families do
+        local family = families[f]
+        MergeOcc(occ, ProjectFamilyOccupancy(ids, idSet, localArmor, localOrigin, byFamily[family], family))
+    end
+    return occ
 end
 
 local function EventTypes()
@@ -937,13 +1113,6 @@ local function CanonicalIdentityMembers(data)
         return {}
     end
     return SortedUnique(data.identityMembers)
-end
-
-local function IdentityMembersKey(memberIds)
-    if type(memberIds) ~= "table" then
-        return ""
-    end
-    return table.concat(memberIds, "\0")
 end
 
 local function CanonicalAdminMembersAtLink(data)
@@ -1110,6 +1279,16 @@ end
 
 function Identity.NormalizeMemberId(id)
     return NormalizeId(id)
+end
+
+function Identity.CanonicalAuthorKey(author)
+    return CanonicalAuthorKey(author)
+end
+
+function Identity.SameAuthor(a, b)
+    local ka = CanonicalAuthorKey(a)
+    local kb = CanonicalAuthorKey(b)
+    return ka and kb and ka == kb
 end
 
 function Identity.SamePlayer(a, b)
@@ -1331,6 +1510,11 @@ function Identity.Replay(logs, opts)
     end
 
     local ordered = Identity.OrderLogs(logs)
+    local logRank = {}
+    for i = 1, #ordered do
+        logRank[ordered[i]] = i
+    end
+    causalRank = logRank
 
     local function ensureLocal(memberId)
         memberId = EnsureMember(partition, memberId)
@@ -1392,6 +1576,9 @@ function Identity.Replay(logs, opts)
                             end
                         elseif auth[adminId] == "member" then
                             -- Explicit earlier removal wins over stale evidence.
+                        elseif auth[adminId] == "invalid_source" then
+                            -- A sourced grant whose LINK was skipped is not
+                            -- legacy/unlogged admin evidence.
                         elseif auth[adminId] == "admin" then
                             simulated[adminId] = true
                         else
@@ -1424,6 +1611,7 @@ function Identity.Replay(logs, opts)
                     if type(unlinkId) == "string" and unlinkId ~= "" then
                         appliedRelationshipIds[unlinkId] = true
                     end
+                    ExpireSplitIdentityEvents(identityArmorEvents, partition)
                 end
                 ensureLocal(data.member)
             elseif eventType == types.ADMIN_ADDED then
@@ -1432,6 +1620,13 @@ function Identity.Replay(logs, opts)
                 if type(sourceLogId) == "string" and sourceLogId ~= "" then
                     if appliedRelationshipIds[sourceLogId] then
                         ApplyAuthAdmin(auth, simulated, owner, data.member, true)
+                    else
+                        local memberId = NormalizeId(data.member)
+                        if memberId and not SamePlayer(memberId, owner)
+                            and auth[memberId] ~= "admin" and auth[memberId] ~= "member"
+                        then
+                            auth[memberId] = "invalid_source"
+                        end
                     end
                 else
                     ApplyAuthAdmin(auth, simulated, owner, data.member, true)
@@ -1526,88 +1721,7 @@ function Identity.Replay(logs, opts)
             if attendanceTotal < 0 then
                 attendanceTotal = 0
             end
-            local idSet = ListToSet(ids)
-            local latestByKey = {}
-            for j = 1, #identityArmorEvents do
-                local ev = identityArmorEvents[j]
-                if IsSubset(ev.identityMembers, idSet)
-                    and not IdentityEventSupersededByLocals(ev, ev.identityMembers, localOrigin)
-                then
-                    local key = IdentityMembersKey(ev.identityMembers) .. "\0" .. tostring(ev.slot)
-                    local prev = latestByKey[key]
-                    if not prev or Identity.CompareLogs(prev.log, ev.log) then
-                        latestByKey[key] = ev
-                    end
-                end
-            end
-            -- Corrections occupy their recorded identityMembers scope, then
-            -- merge. A same-component AVAILABLE cannot clear another scope's
-            -- USED, and it cannot resurrect locals it already suppressed.
-            local scopes = {}
-            for _, ev in pairs(latestByKey) do
-                local scopeKey = IdentityMembersKey(ev.identityMembers)
-                local scope = scopes[scopeKey]
-                if not scope then
-                    scope = { members = ev.identityMembers, events = {} }
-                    scopes[scopeKey] = scope
-                end
-                scope.events[#scope.events + 1] = ev
-            end
-            local scopeOrder = {}
-            for scopeKey in pairs(scopes) do
-                scopeOrder[#scopeOrder + 1] = scopeKey
-            end
-            table.sort(scopeOrder)
-            local occ = NewIdentityOcc()
-            local claimed = { ordinary = {}, ring = {}, trinket = {} }
-            for s = 1, #scopeOrder do
-                local scope = scopes[scopeOrder[s]]
-                local scopeIds = {}
-                for j = 1, #scope.members do
-                    local scopeMember = scope.members[j]
-                    if idSet[scopeMember] then
-                        scopeIds[#scopeIds + 1] = scopeMember
-                    end
-                end
-                table.sort(scopeIds)
-                local byFamily = { ordinary = {}, ring = {}, trinket = {} }
-                for j = 1, #scope.events do
-                    local ev = scope.events[j]
-                    local family = FamilyForSlot(ev.slot)
-                    byFamily[family][#byFamily[family] + 1] = ev
-                end
-                local families = { "ordinary", "ring", "trinket" }
-                for f = 1, #families do
-                    local family = families[f]
-                    local familyEvents = byFamily[family]
-                    if #familyEvents > 0 then
-                        for j = 1, #scopeIds do
-                            claimed[family][scopeIds[j]] = true
-                        end
-                        local packed = PackLocals(scopeIds, localArmor, localOrigin, family)
-                        table.sort(familyEvents, function(a, b)
-                            return Identity.CompareLogs(a.log, b.log)
-                        end)
-                        for j = 1, #familyEvents do
-                            local ev = familyEvents[j]
-                            ApplyIdentityArmor(packed, ev.slot, ev.action)
-                        end
-                        MergeOcc(occ, packed)
-                    end
-                end
-            end
-            local function leftoverIds(family)
-                local leftover = {}
-                for j = 1, #ids do
-                    if not claimed[family][ids[j]] then
-                        leftover[#leftover + 1] = ids[j]
-                    end
-                end
-                return leftover
-            end
-            MergeOcc(occ, PackLocals(leftoverIds("ordinary"), localArmor, localOrigin, "ordinary"))
-            MergeOcc(occ, PackLocals(leftoverIds("ring"), localArmor, localOrigin, "ring"))
-            MergeOcc(occ, PackLocals(leftoverIds("trinket"), localArmor, localOrigin, "trinket"))
+            local occ = ProjectIdentityOccupancy(ids, localArmor, localOrigin, identityArmorEvents)
             occByRoot[root] = occ
             overflowByIdentity[root] = IdentityHasOverflow(occ)
             overflowKeysByIdentity[root] = OverflowKeys(occ)
@@ -1633,6 +1747,7 @@ function Identity.Replay(logs, opts)
     end
     table.sort(simulatedList)
 
+    causalRank = nil
     return {
         members = members,
         identityOf = identityOf,
