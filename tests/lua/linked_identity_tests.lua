@@ -4302,6 +4302,9 @@ local function applyDiscoveredRange(src, dst, req, requestId)
     Sync.state.profileId = src:GetProfileId()
     Sync.state.isCoordinator = true
     Sync.state.coordinator = OWNER
+    if src.ComputeAuthorWindowSummary then
+        Sync:_AttachExactWindowEvidence({ req }, src:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize()) or {})
+    end
     capturedComm = {}
     Sync:HandleLogRequest(OWNER, {
         sessionId = "SES1",
@@ -4311,21 +4314,25 @@ local function applyDiscoveredRange(src, dst, req, requestId)
         fromCounter = req.fromCounter,
         toCounter = req.toCounter,
         exactAuthor = req.exactAuthor == true or nil,
+        integrityRepair = req.integrityRepair == true or req.mode == "integrity" or nil,
     })
     local served = findCaptured(Sync.MSG.AUTH_LOGS)
     assertTrue(served ~= nil, "discovered range produced AUTH_LOGS for " .. tostring(req.author))
     registerProfile(dst)
     Sync.state.profileId = dst:GetProfileId()
     Sync.state.requests = Sync.state.requests or {}
+    local meta = {
+        profileId = dst:GetProfileId(),
+        author = req.author,
+        fromCounter = req.fromCounter,
+        toCounter = req.toCounter,
+        exactAuthor = req.exactAuthor == true or nil,
+        integrityRepair = req.integrityRepair == true or req.mode == "integrity" or nil,
+    }
+    Sync:_CopyExpectedWindowEvidence(req, meta)
     Sync.state.requests[requestId] = {
         kind = "LOG_REQ",
-        meta = {
-            profileId = dst:GetProfileId(),
-            author = req.author,
-            fromCounter = req.fromCounter,
-            toCounter = req.toCounter,
-            exactAuthor = req.exactAuthor == true or nil,
-        },
+        meta = meta,
     }
     served.payload.sessionId = "SES1"
     served.payload.profileId = dst:GetProfileId()
@@ -5026,6 +5033,21 @@ Sync.state.requests["REQ-EXACT"] = {
 }
 assertTrue(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, true), "exact outstanding covers exact overlap")
 assertTrue(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, false), "exact outstanding can cover logical overlap")
+assertFalse(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, true, true), "exact missing does not cover exact integrity")
+Sync.state.requests["REQ-INTEGRITY"] = {
+    kind = "NEED_LOGS",
+    meta = {
+        profileId = pidCover,
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 1,
+        exactAuthor = true,
+        integrityRepair = true,
+    },
+}
+assertTrue(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, true, true), "exact integrity covers exact integrity")
+assertTrue(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, true, false), "exact integrity covers exact missing")
+assertTrue(Sync:_HasOutstandingLogRangeRequest(pidCover, "owner-Garona", 1, 1, false), "exact integrity covers logical missing")
 
 -- Three-peer production routing: helper cannot satisfy exact owner-Garona:1
 local MEMBER = "Member-Garona"
@@ -5380,7 +5402,10 @@ applyDiscoveredRange(profile, sparseDest, sparseReq, "REQ-SPARSE-EXACT")
 assertTrue(hasLogId(sparseDest, "owner-Garona:3"), "sparse exact repair obtained owner-Garona:3")
 assertTrue(hasLogId(sparseDest, "owner-Garona:1"), "sparse exact repair kept owner-Garona:1")
 assertFalse(hasLogId(sparseDest, "owner-Garona:2"), "sparse exact repair does not invent owner-Garona:2")
-assertTrue(Sync:_ExactAuthorRangeSatisfied(sparseDest:GetProfileId(), "owner-Garona", 1, 3), "exact max 3 satisfies 1..3 without a dense :2")
+assertTrue(Sync:_ExactAuthorRangeSatisfied(sparseDest:GetProfileId(), "owner-Garona", 1, 3, {
+    expectedCount = 2,
+    expectedMaxCounter = 3,
+}), "exact advertised count/max satisfies 1..3 without a dense :2")
 assertTrue(Sync:_ExactAuthorRangeSatisfied(sparseDest:GetProfileId(), "owner-Garona", 1, 3, {
     integrityRepair = true,
     expectedCount = 2,
@@ -5541,6 +5566,540 @@ assertEq(helperServed.expectedMaxCounter, 20, "queue copies expectedMaxCounter")
 restoreUniqueNonces()
 end
 runExactAuthorRepairRoutingTests()
+
+local function runExactAuthorProofTests()
+local function outstandingCount()
+    local n = 0
+    for _ in pairs(Sync.state.requests or {}) do
+        n = n + 1
+    end
+    return n
+end
+local function adminAddedCount(p)
+    local n = 0
+    for _, log in ipairs(p:GetLootLogs() or {}) do
+        if log:GetEventType() == SF.LootLogEventTypes.ADMIN_ADDED then
+            n = n + 1
+        end
+    end
+    return n
+end
+local function seedSparseExact(name)
+    local p = makeProfile(name)
+    addMember(p, ALT_A)
+    assertTrue(p:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 1,
+        }, { author = OWNER, counter = 1, timestamp = 1700020401 }),
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 2,
+        }, { author = OWNER, counter = 2, timestamp = 1700020402 }),
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 3,
+        }, { author = OWNER, counter = 3, timestamp = 1700020403 }),
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 11,
+        }, { author = "owner-Garona", counter = 1, timestamp = 1700020411 }),
+        makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = ALT_A,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 13,
+        }, { author = "owner-Garona", counter = 3, timestamp = 1700020413 }),
+    }) > 0, "sparse exact source stores owner-Garona:1 and :3")
+    if p.RebuildLogIndex then
+        p:RebuildLogIndex()
+    end
+    p._adminUsers = { OWNER, OTHER }
+    return p
+end
+local function ownerWindow(p)
+    local summary = p:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+    local rows = summary and summary["owner-Garona"]
+    return rows and rows[1] or nil
+end
+
+-- 1. Same max, missing earlier exact row
+resetEnv()
+local src = seedSparseExact("ProofSameMaxA")
+local dest = cloneWithout(src, "ProofSameMaxB", "owner-Garona:1")
+assertTrue(hasLogId(dest, "owner-Garona:3"), "local keeps owner-Garona:3")
+assertFalse(hasLogId(dest, "owner-Garona:1"), "local lacks owner-Garona:1")
+registerProfile(dest)
+local missing, integrity = discoverFrom(dest, src)
+assertTrue(rangeForAuthor(integrity, "owner-Garona") ~= nil, "same-max missing :1 still creates integrity mismatch")
+local evid = rangeForAuthor(integrity, "owner-Garona")
+assertEq(evid.expectedCount, 2, "integrity expectedCount is remote window count")
+assertEq(evid.expectedMaxCounter, 3, "integrity expectedMaxCounter is remote filled frontier")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(dest:GetProfileId(), "owner-Garona", 1, 3, {
+    expectedCount = 2,
+    expectedMaxCounter = 3,
+    expectedChecksum = evid.expectedChecksum,
+    expectedFromCounter = evid.expectedFromCounter,
+    expectedToCounter = evid.expectedToCounter,
+    expectedWindows = evid.expectedWindows,
+}), "exact max 3 does not satisfy missing owner-Garona:1")
+applyDiscoveredRange(src, dest, evid, "REQ-PROOF-SAME-MAX")
+assertTrue(hasLogId(dest, "owner-Garona:1"), "integrity obtained missing owner-Garona:1")
+assertFalse(hasLogId(dest, "owner-Garona:2"), "same-max repair does not invent owner-Garona:2")
+assertEq(dest:GetLogById("owner-Garona:1"):GetAuthor(), "owner-Garona", "repaired :1 keeps exact author")
+assertTrue(Sync:_ExactAuthorRangeSatisfied(dest:GetProfileId(), "owner-Garona", evid.fromCounter, evid.toCounter, {
+    expectedWindows = evid.expectedWindows,
+    expectedCount = evid.expectedCount,
+    expectedChecksum = evid.expectedChecksum,
+    expectedMaxCounter = evid.expectedMaxCounter,
+    expectedFromCounter = evid.expectedFromCounter,
+    expectedToCounter = evid.expectedToCounter,
+}), "local window matches remote after :1 arrives")
+assertTrue(Sync.state.requests["REQ-PROOF-SAME-MAX"] == nil, "request completes only after window proof matches")
+
+-- 2. Empty integrity AUTH_LOGS
+resetEnv()
+src = seedSparseExact("ProofEmptyA")
+dest = cloneWithout(src, "ProofEmptyB", "owner-Garona:1")
+registerProfile(dest)
+activateSession(dest)
+evid = ownerWindow(src)
+Sync.state.requests["REQ-EMPTY"] = {
+    kind = "LOG_REQ",
+    meta = {
+        profileId = dest:GetProfileId(),
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 3,
+        exactAuthor = true,
+        integrityRepair = true,
+        expectedCount = evid.count,
+        expectedChecksum = evid.checksum,
+        expectedMaxCounter = evid.maxCounter,
+        expectedFromCounter = evid.fromCounter,
+        expectedToCounter = evid.toCounter,
+        expectedWindows = {
+            {
+                fromCounter = evid.fromCounter,
+                toCounter = evid.toCounter,
+                count = evid.count,
+                maxCounter = evid.maxCounter,
+                checksum = evid.checksum,
+            },
+        },
+    },
+}
+Sync:HandleAuthLogs(OWNER, {
+    sessionId = "SES1",
+    profileId = dest:GetProfileId(),
+    requestId = "REQ-EMPTY",
+    author = "owner-Garona",
+    fromCounter = 1,
+    toCounter = 3,
+    logs = {},
+})
+assertTrue(Sync.state.requests["REQ-EMPTY"] ~= nil, "empty integrity AUTH_LOGS does not complete")
+assertFalse(hasLogId(dest, "owner-Garona:1"), "empty payload does not insert owner-Garona:1")
+assertTrue(#deferredAfter > 0, "empty integrity response schedules retry/fallback")
+
+-- 3. Non-empty partial response (only :3)
+resetEnv()
+src = seedSparseExact("ProofPartialA")
+dest = cloneWithout(src, "ProofPartialB", "owner-Garona:1")
+registerProfile(dest)
+activateSession(dest)
+evid = ownerWindow(src)
+local partial = dest:GetLogById("owner-Garona:3"):ToTable()
+Sync.state.requests["REQ-PARTIAL"] = {
+    kind = "LOG_REQ",
+    meta = {
+        profileId = dest:GetProfileId(),
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 3,
+        exactAuthor = true,
+        integrityRepair = true,
+        expectedCount = evid.count,
+        expectedChecksum = evid.checksum,
+        expectedMaxCounter = evid.maxCounter,
+        expectedFromCounter = evid.fromCounter,
+        expectedToCounter = evid.toCounter,
+        expectedWindows = {
+            {
+                fromCounter = evid.fromCounter,
+                toCounter = evid.toCounter,
+                count = evid.count,
+                maxCounter = evid.maxCounter,
+                checksum = evid.checksum,
+            },
+        },
+    },
+}
+Sync:HandleAuthLogs(OWNER, {
+    sessionId = "SES1",
+    profileId = dest:GetProfileId(),
+    requestId = "REQ-PARTIAL",
+    author = "owner-Garona",
+    fromCounter = 1,
+    toCounter = 3,
+    logs = { partial },
+})
+assertTrue(Sync.state.requests["REQ-PARTIAL"] ~= nil, "partial :3 AUTH_LOGS does not complete expected count 2")
+assertFalse(hasLogId(dest, "owner-Garona:1"), "partial payload still lacks owner-Garona:1")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(dest:GetProfileId(), "owner-Garona", 1, evid.toCounter, {
+    expectedCount = evid.count,
+    expectedChecksum = evid.checksum,
+    expectedMaxCounter = evid.maxCounter,
+    expectedFromCounter = evid.fromCounter,
+    expectedToCounter = evid.toCounter,
+}), "receivedExactCount>0 is not enough without checksum/count match")
+
+-- 4. Sparse complete response
+resetEnv()
+src = seedSparseExact("ProofSparseA")
+dest = cloneWithout(src, "ProofSparseB", "owner-Garona:1")
+evid = ownerWindow(src)
+applyDiscoveredRange(src, dest, {
+    author = "owner-Garona",
+    fromCounter = 1,
+    toCounter = 3,
+    exactAuthor = true,
+    integrityRepair = true,
+    expectedCount = evid.count,
+    expectedChecksum = evid.checksum,
+    expectedMaxCounter = evid.maxCounter,
+    expectedFromCounter = evid.fromCounter,
+    expectedToCounter = evid.toCounter,
+    expectedWindows = {
+        {
+            fromCounter = evid.fromCounter,
+            toCounter = evid.toCounter,
+            count = evid.count,
+            maxCounter = evid.maxCounter,
+            checksum = evid.checksum,
+        },
+    },
+}, "REQ-SPARSE-COMPLETE")
+assertTrue(hasLogId(dest, "owner-Garona:1"), "sparse complete obtained owner-Garona:1")
+assertTrue(hasLogId(dest, "owner-Garona:3"), "sparse complete kept owner-Garona:3")
+assertFalse(hasLogId(dest, "owner-Garona:2"), "sparse complete does not invent owner-Garona:2")
+assertTrue(Sync.state.requests["REQ-SPARSE-COMPLETE"] == nil, "sparse complete AUTH_LOGS finished the request")
+local destWindow = ownerWindow(dest)
+assertEq(destWindow.count, evid.count, "sparse complete count matches remote")
+assertEq(destWindow.maxCounter, evid.maxCounter, "sparse complete max matches remote")
+assertEq(destWindow.checksum, evid.checksum, "sparse complete checksum matches remote")
+registerProfile(src)
+Sync.state.authorMax = src:ComputeAuthorMax()
+Sync.state.authorWindowSummary = src:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+registerProfile(dest)
+missing, integrity = discoverFrom(dest, src)
+assertEq(#missing, 0, "sparse complete later discovery has no missing ranges")
+assertTrue(rangeForAuthor(integrity, "owner-Garona") == nil, "sparse complete later discovery has no owner-Garona integrity")
+
+-- 5. Fingerprint replacement
+resetEnv()
+src = seedSparseExact("ProofFpA")
+dest = cloneWithout(src, "ProofFpB", "__none__")
+local wrong = dest:GetLogById("owner-Garona:1"):ToTable()
+wrong._data = { member = ALT_A, change = SF.LootLogPointChangeTypes.INCREMENT, amount = 99 }
+wrong._fingerprint = SF.LootLog.ComputeFingerprintFromTable(wrong)
+assertTrue(dest:MergeLogTables({ wrong }, { allowReplaceExisting = true }) >= 0, "local installs mismatched owner-Garona:1")
+assertTrue(hasLogId(dest, "owner-Garona:1"), "fingerprint dest still has owner-Garona:1")
+assertTrue(hasLogId(dest, "owner-Garona:3"), "fingerprint dest still has owner-Garona:3")
+assertTrue(dest:GetLogById("owner-Garona:1"):GetFingerprint() ~= src:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "local :1 fingerprint disagrees with remote")
+registerProfile(dest)
+missing, integrity = discoverFrom(dest, src)
+assertEq(#missing, 0, "matching maxima do not create completeness missing")
+assertTrue(rangeForAuthor(integrity, "owner-Garona") ~= nil, "fingerprint mismatch still creates integrity repair")
+evid = rangeForAuthor(integrity, "owner-Garona")
+assertFalse(Sync:_ExactAuthorRangeSatisfied(dest:GetProfileId(), "owner-Garona", 1, 3, {
+    expectedChecksum = evid.expectedChecksum,
+    expectedCount = evid.expectedCount,
+    expectedMaxCounter = evid.expectedMaxCounter,
+    expectedFromCounter = evid.expectedFromCounter,
+    expectedToCounter = evid.expectedToCounter,
+    expectedWindows = evid.expectedWindows,
+}), "mismatched fingerprint fails advertised checksum")
+applyDiscoveredRange(src, dest, evid, "REQ-FP")
+assertEq(dest:GetLogById("owner-Garona:1"):GetFingerprint(), src:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "trusted integrity merge replaces mismatched owner-Garona:1")
+assertEq(dest:GetLogById("owner-Garona:1"):GetAuthor(), "owner-Garona", "replacement keeps exact _author")
+assertEq(dest:GetLogById("owner-Garona:1"):GetID(), "owner-Garona:1", "replacement keeps exact _id")
+assertTrue(Sync.state.requests["REQ-FP"] == nil, "fingerprint repair completes after checksum matches")
+assertEq(ownerWindow(dest).checksum, evid.expectedChecksum, "local checksum matches expected after replace")
+
+-- 6. Fallback helper with same exact max but incomplete set
+resetEnv()
+src = seedSparseExact("ProofHelperA")
+local helper = cloneWithout(src, "ProofHelperH", "owner-Garona:1")
+dest = cloneWithout(src, "ProofHelperM", "owner-Garona:1")
+dest = cloneWithout(dest, "ProofHelperM2", "owner-Garona:3")
+src._adminUsers = { OWNER, OTHER }
+helper._adminUsers = { OWNER, OTHER }
+dest._adminUsers = { OWNER, OTHER }
+assertFalse(hasLogId(helper, "owner-Garona:1"), "helper lacks owner-Garona:1")
+assertTrue(hasLogId(helper, "owner-Garona:3"), "helper has owner-Garona:3")
+assertFalse(hasLogId(dest, "owner-Garona:1"), "member lacks owner-Garona:1")
+assertFalse(hasLogId(dest, "owner-Garona:3"), "member lacks owner-Garona:3")
+evid = ownerWindow(src)
+registerProfile(dest)
+activateSession(dest)
+Sync.state.isCoordinator = false
+Sync.state.coordinator = OWNER
+Sync.state.helpers = { OTHER }
+Sync.state.authorWindowSummary = src:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.authorMax = src:ComputeAuthorMax()
+Sync.cfg.maxRetries = 5
+local originalSend = SF.LootHelperComm.Send
+local originalQueue = Sync.QueueRepairRanges
+Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+SF.LootHelperComm.Send = function(_, prefix, msgType, payload, dist, target)
+    capturedComm[#capturedComm + 1] = { prefix = prefix, msgType = msgType, payload = payload, target = target }
+    return true
+end
+assertTrue(Sync:RequestMissingLogs({
+    {
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 3,
+        exactAuthor = true,
+        preferredTarget = OWNER,
+        expectedCount = evid.count,
+        expectedChecksum = evid.checksum,
+        expectedMaxCounter = evid.maxCounter,
+        expectedFromCounter = evid.fromCounter,
+        expectedToCounter = evid.toCounter,
+        expectedWindows = {
+            {
+                fromCounter = evid.fromCounter,
+                toCounter = evid.toCounter,
+                count = evid.count,
+                maxCounter = evid.maxCounter,
+                checksum = evid.checksum,
+            },
+        },
+    },
+}, "proof-helper-fallback", { preferredTarget = OWNER, exactAuthor = true }), "exact completeness request registered")
+local reqId = nil
+local req = nil
+for id, pending in pairs(Sync.state.requests) do
+    reqId = id
+    req = pending
+    break
+end
+assertTrue(req ~= nil, "fallback test has an outstanding NEED_LOGS")
+assertEq(req.lastTarget, OWNER, "first attempt prefers the advertising coordinator")
+Sync:OnRequestTimeout(reqId)
+assertEq(req.lastTarget, OTHER, "timeout walks to the fallback helper")
+registerProfile(helper)
+local helperPlayer = PLAYER
+PLAYER = OTHER
+capturedComm = {}
+Sync:HandleNeedLogs(dest._author or "Member-Garona", {
+    sessionId = "SES1",
+    profileId = dest:GetProfileId(),
+    requestId = reqId,
+    exactAuthor = true,
+    missing = {
+        {
+            author = "owner-Garona",
+            fromCounter = 1,
+            toCounter = 3,
+            exactAuthor = true,
+        },
+    },
+})
+PLAYER = helperPlayer
+local helperServed = findCaptured(Sync.MSG.AUTH_LOGS)
+assertTrue(helperServed ~= nil, "helper produced AUTH_LOGS")
+assertEq(#(helperServed.payload.logs or {}), 1, "helper AUTH_LOGS contains only the exact row it has")
+assertTrue(payloadHasAuthor(helperServed.payload, "owner-Garona"), "helper AUTH_LOGS is exact owner-Garona")
+registerProfile(dest)
+PLAYER = OWNER
+Sync.state.isCoordinator = false
+Sync.state.coordinator = OWNER
+helperServed.payload.sessionId = "SES1"
+helperServed.payload.profileId = dest:GetProfileId()
+helperServed.payload.requestId = reqId
+Sync:HandleAuthLogs(OTHER, helperServed.payload)
+assertTrue(Sync.state.requests[reqId] ~= nil, "helper :3 does not satisfy coordinator sparse history")
+assertFalse(hasLogId(dest, "owner-Garona:1"), "helper fallback did not supply owner-Garona:1")
+registerProfile(src)
+capturedComm = {}
+PLAYER = OWNER
+Sync.state.isCoordinator = true
+Sync.state.coordinator = OWNER
+Sync:HandleNeedLogs("Member-Garona", {
+    sessionId = "SES1",
+    profileId = dest:GetProfileId(),
+    requestId = reqId,
+    exactAuthor = true,
+    missing = {
+        {
+            author = "owner-Garona",
+            fromCounter = 1,
+            toCounter = 3,
+            exactAuthor = true,
+        },
+    },
+})
+local coordServed = findCaptured(Sync.MSG.AUTH_LOGS)
+assertTrue(coordServed ~= nil, "coordinator produced complete sparse AUTH_LOGS")
+registerProfile(dest)
+coordServed.payload.sessionId = "SES1"
+coordServed.payload.profileId = dest:GetProfileId()
+coordServed.payload.requestId = reqId
+Sync.state.isCoordinator = false
+Sync.state.coordinator = OWNER
+Sync:HandleAuthLogs(OWNER, coordServed.payload)
+assertTrue(hasLogId(dest, "owner-Garona:1"), "coordinator recovered owner-Garona:1 after helper fallback")
+assertTrue(hasLogId(dest, "owner-Garona:3"), "coordinator recovered owner-Garona:3")
+assertFalse(hasLogId(dest, "owner-Garona:2"), "fallback recovery does not invent :2")
+assertEq(ownerWindow(dest).checksum, evid.checksum, "final raw window matches expected checksum")
+assertTrue(Sync.state.requests[reqId] == nil, "request completes after coordinator proof matches")
+SF.LootHelperComm.Send = originalSend
+Sync.QueueRepairRanges = originalQueue
+
+-- 7. Exact missing must not suppress exact integrity
+resetEnv()
+src = seedSparseExact("ProofOverlapA")
+dest = cloneWithout(src, "ProofOverlapB", "owner-Garona:3")
+wrong = dest:GetLogById("owner-Garona:1"):ToTable()
+wrong._data = { member = ALT_A, change = SF.LootLogPointChangeTypes.INCREMENT, amount = 77 }
+wrong._fingerprint = SF.LootLog.ComputeFingerprintFromTable(wrong)
+assertTrue(dest:MergeLogTables({ wrong }, { allowReplaceExisting = true }) >= 0, "overlap dest has mismatched :1")
+registerProfile(dest)
+missing, integrity = discoverFrom(dest, src)
+assertTrue(rangeForAuthor(missing, "owner-Garona") ~= nil, "absent :3 creates exact missing")
+assertTrue(rangeForAuthor(integrity, "owner-Garona") ~= nil, "mismatched :1 creates exact integrity")
+activateSession(dest)
+Sync.state.requests["REQ-MISS"] = {
+    kind = "NEED_LOGS",
+    meta = {
+        profileId = dest:GetProfileId(),
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 3,
+        exactAuthor = true,
+    },
+}
+assertFalse(Sync:_HasOutstandingLogRangeRequest(dest:GetProfileId(), "owner-Garona", 1, 3, true, true),
+    "exact missing does not suppress exact integrity")
+Sync.QueueRepairRanges = ProductionSync.QueueRepairRanges
+assertTrue(ProductionSync.QueueRepairRanges(Sync, dest:GetProfileId(), {
+    rangeForAuthor(integrity, "owner-Garona"),
+}, { mode = "integrity", reason = "proof-overlap" }), "integrity still queues beside exact missing")
+local queuedIntegrity = false
+for _, entry in pairs(Sync.state.repairQueue.items or {}) do
+    if entry.mode == "integrity" and entry.author == "owner-Garona" then
+        queuedIntegrity = true
+    end
+end
+assertTrue(queuedIntegrity, "integrity repair entry exists beside outstanding exact missing")
+evid = rangeForAuthor(integrity, "owner-Garona")
+applyDiscoveredRange(src, dest, evid, "REQ-OVERLAP-INT")
+assertTrue(hasLogId(dest, "owner-Garona:3"), "overlap integrity added missing owner-Garona:3")
+assertEq(dest:GetLogById("owner-Garona:1"):GetFingerprint(), src:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "overlap integrity replaced mismatched owner-Garona:1")
+assertEq(ownerWindow(dest).checksum, evid.expectedChecksum, "overlap local window matches expected checksum")
+
+-- 8. Identity-admin gating stays blocked on incomplete integrity
+resetEnv()
+src = seedSparseExact("ProofGateA")
+dest = cloneWithout(src, "ProofGateB", "owner-Garona:1")
+addMember(dest, ALT_B)
+dest:AddAdminMemberId(ALT_A)
+local impliedLink = makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+    memberA = ALT_A,
+    memberB = ALT_B,
+    adminMembersAtLink = { ALT_A },
+}, { timestamp = 1700020500, counter = (dest._authorCounters[OWNER] or 0) + 1 })
+assertTrue(dest:MergeLogTables({ impliedLink }) > 0, "implied LINK waits on integrity proof")
+registerProfile(dest)
+activateSession(dest)
+evid = ownerWindow(src)
+Sync.state.authorMax = src:ComputeAuthorMax()
+Sync.state.authorWindowSummary = src:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+Sync.state.requests["REQ-GATE"] = {
+    id = "REQ-GATE",
+    kind = "LOG_REQ",
+    meta = {
+        profileId = dest:GetProfileId(),
+        author = "owner-Garona",
+        fromCounter = 1,
+        toCounter = 3,
+        exactAuthor = true,
+        integrityRepair = true,
+        expectedCount = evid.count,
+        expectedChecksum = evid.checksum,
+        expectedMaxCounter = evid.maxCounter,
+        expectedFromCounter = evid.fromCounter,
+        expectedToCounter = evid.toCounter,
+        expectedWindows = {
+            {
+                fromCounter = evid.fromCounter,
+                toCounter = evid.toCounter,
+                count = evid.count,
+                maxCounter = evid.maxCounter,
+                checksum = evid.checksum,
+            },
+        },
+    },
+}
+local grantsBefore = adminAddedCount(dest)
+assertFalse(Sync:IsIdentityAdminReconcileReady(dest:GetProfileId()), "integrity discrepancy blocks identity-admin reconcile")
+Sync:ScheduleIdentityAdminReconcile(dest:GetProfileId())
+assertFalse(dest:IsAdminMemberId(ALT_B), "incomplete integrity does not persist implied ADMIN_ADDED")
+Sync:HandleAuthLogs(OWNER, {
+    sessionId = "SES1",
+    profileId = dest:GetProfileId(),
+    requestId = "REQ-GATE",
+    author = "owner-Garona",
+    fromCounter = 1,
+    toCounter = 3,
+    logs = {},
+})
+assertTrue(Sync.state.requests["REQ-GATE"] ~= nil, "empty integrity AUTH_LOGS keeps the request pending")
+assertFalse(Sync:IsIdentityAdminReconcileReady(dest:GetProfileId()), "empty integrity response keeps reconcile unready")
+Sync:ConsiderIdentityAdminSideEffects(dest:GetProfileId())
+assertFalse(dest:IsAdminMemberId(ALT_B), "false completion does not emit ADMIN_ADDED")
+assertEq(adminAddedCount(dest), grantsBefore, "no extra ADMIN_ADDED during incomplete integrity")
+applyDiscoveredRange(src, dest, {
+    author = "owner-Garona",
+    fromCounter = 1,
+    toCounter = 3,
+    exactAuthor = true,
+    integrityRepair = true,
+    expectedCount = evid.count,
+    expectedChecksum = evid.checksum,
+    expectedMaxCounter = evid.maxCounter,
+    expectedFromCounter = evid.fromCounter,
+    expectedToCounter = evid.toCounter,
+    expectedWindows = {
+        {
+            fromCounter = evid.fromCounter,
+            toCounter = evid.toCounter,
+            count = evid.count,
+            maxCounter = evid.maxCounter,
+            checksum = evid.checksum,
+        },
+    },
+}, "REQ-GATE-COMPLETE")
+assertTrue(hasLogId(dest, "owner-Garona:1"), "gating path obtained owner-Garona:1")
+assertEq(ownerWindow(dest).checksum, evid.checksum, "gating path window proof matches")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state.authorMax = dest:ComputeAuthorMax()
+Sync.state.authorWindowSummary = dest:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+assertTrue(Sync:IsIdentityAdminReconcileReady(dest:GetProfileId()), "reconcile may proceed after integrity proof matches")
+Sync:ScheduleIdentityAdminReconcile(dest:GetProfileId())
+assertTrue(dest:IsAdminMemberId(ALT_B), "reconcile grants after exact integrity is proven")
+end
+runExactAuthorProofTests()
 
 -- Performance: large history with a few alias collisions
 resetEnv()

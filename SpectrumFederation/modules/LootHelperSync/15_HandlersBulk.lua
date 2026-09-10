@@ -249,6 +249,9 @@ function Sync:HandleAuthLogs(sender, payload)
                         expectedCount = req.meta.expectedCount,
                         expectedChecksum = req.meta.expectedChecksum,
                         expectedMaxCounter = req.meta.expectedMaxCounter,
+                        expectedFromCounter = req.meta.expectedFromCounter,
+                        expectedToCounter = req.meta.expectedToCounter,
+                        expectedWindows = req.meta.expectedWindows,
                     }
                 )
                 if requestSatisfied then

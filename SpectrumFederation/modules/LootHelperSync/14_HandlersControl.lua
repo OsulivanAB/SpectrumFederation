@@ -517,6 +517,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
             local remoteMax = self.state.authorMax or {}
             local localRawMax = self:ComputeAuthorMax(self.state.profileId)
             local missing = self:ComputeMissingLogRequests(localContig, remoteMax, localRawMax)
+            self:_AttachExactWindowEvidence(missing, self.state.authorWindowSummary or {})
             local integrityRanges = self:ComputeWindowMismatchRequests(
                 self.state.profileId,
                 self.state.authorWindowSummary or {},

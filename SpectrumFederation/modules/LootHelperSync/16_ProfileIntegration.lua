@@ -287,6 +287,13 @@ function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localConti
                             if not fullWindowReady and remoteFilledTo > 0 then
                                 reqTo = remoteFilledTo
                             end
+                            local evidence = {
+                                fromCounter = remoteWindow.fromCounter,
+                                toCounter = remoteWindow.toCounter,
+                                count = remoteCount,
+                                maxCounter = remoteFilledTo,
+                                checksum = remoteChecksum,
+                            }
                             mismatches[#mismatches + 1] = {
                                 author = author,
                                 fromCounter = remoteWindow.fromCounter,
@@ -296,6 +303,9 @@ function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localConti
                                 expectedCount = remoteCount,
                                 expectedChecksum = remoteChecksum,
                                 expectedMaxCounter = (remoteFilledTo > 0) and remoteFilledTo or nil,
+                                expectedFromCounter = remoteWindow.fromCounter,
+                                expectedToCounter = remoteWindow.toCounter,
+                                expectedWindows = { evidence },
                             }
                         end
                     end
@@ -539,12 +549,131 @@ function Sync:_ScanExactAuthorRange(profileId, author, fromCounter, toCounter)
     return count, maxInRange, ExactRangeFingerprintRollup(rows)
 end
 
--- Exact-author satisfaction uses in-window exact `_author` rows, not the
--- global retained max. Completeness: maxInRange >= toCounter (sparse holes
--- are allowed). Integrity also requires advertised count / checksum /
--- filled-frontier evidence when those fields are present. Sibling aliases,
--- later-window rows, empty AUTH_LOGS, and incomplete helper subsets must
--- not complete the request.
+function Sync:_CollectOverlappingWindowEvidence(remoteSummary, author, fromCounter, toCounter)
+    local out = {}
+    if type(remoteSummary) ~= "table" or type(author) ~= "string" or author == "" then
+        return out
+    end
+    local windows = remoteSummary[author]
+    if type(windows) ~= "table" then
+        return out
+    end
+    fromCounter = tonumber(fromCounter) or 0
+    toCounter = tonumber(toCounter) or 0
+    for _, window in ipairs(windows) do
+        if type(window) == "table" then
+            local windowFrom = tonumber(window.fromCounter)
+            local windowTo = tonumber(window.toCounter)
+            if windowFrom and windowTo and windowFrom <= toCounter and windowTo >= fromCounter then
+                out[#out + 1] = {
+                    fromCounter = windowFrom,
+                    toCounter = windowTo,
+                    count = tonumber(window.count) or 0,
+                    maxCounter = tonumber(window.maxCounter) or 0,
+                    checksum = tonumber(window.checksum),
+                }
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        return (tonumber(a.fromCounter) or 0) < (tonumber(b.fromCounter) or 0)
+    end)
+    return out
+end
+
+-- Stamp advertiser raw-window proof onto exact completeness/integrity ranges.
+-- authorMax only encodes the highest retained counter; set completeness lives
+-- in count / maxCounter / checksum of the overlapping raw windows.
+function Sync:_AttachExactWindowEvidence(ranges, remoteSummary)
+    if type(ranges) ~= "table" or type(remoteSummary) ~= "table" then
+        return ranges
+    end
+    for _, range in ipairs(ranges) do
+        if type(range) == "table"
+            and (range.exactAuthor == true or range.mode == "integrity" or range.integrityRepair == true)
+            and (type(range.expectedWindows) ~= "table" or #range.expectedWindows == 0)
+        then
+            local windows = self:_CollectOverlappingWindowEvidence(
+                remoteSummary,
+                range.author,
+                range.fromCounter,
+                range.toCounter
+            )
+            if #windows > 0 then
+                range.expectedWindows = windows
+                local first = windows[1]
+                range.expectedCount = first.count
+                range.expectedChecksum = first.checksum
+                range.expectedMaxCounter = first.maxCounter
+                range.expectedFromCounter = first.fromCounter
+                range.expectedToCounter = first.toCounter
+            end
+        end
+    end
+    return ranges
+end
+
+function Sync:_NormalizeExpectedWindows(opts, fromCounter, toCounter)
+    if type(opts) == "table" and type(opts.expectedWindows) == "table" and #opts.expectedWindows > 0 then
+        return opts.expectedWindows
+    end
+    if type(opts) ~= "table" then
+        return nil
+    end
+    if opts.expectedCount == nil and opts.expectedChecksum == nil and opts.expectedMaxCounter == nil then
+        return nil
+    end
+    return {
+        {
+            fromCounter = tonumber(opts.expectedFromCounter) or fromCounter,
+            toCounter = tonumber(opts.expectedToCounter) or toCounter,
+            count = tonumber(opts.expectedCount),
+            maxCounter = tonumber(opts.expectedMaxCounter),
+            checksum = tonumber(opts.expectedChecksum),
+        },
+    }
+end
+
+-- Local exact `_author` window must match advertised count / max / checksum.
+-- Sparse holes are allowed because the checksum is over retained rows, not
+-- every integer in the range. A later row outside the window cannot match.
+function Sync:_ExactAuthorEvidenceSatisfied(profileId, author, expectedWindows)
+    if type(expectedWindows) ~= "table" or #expectedWindows == 0 then
+        return false
+    end
+    for _, expected in ipairs(expectedWindows) do
+        if type(expected) ~= "table" then
+            return false
+        end
+        local windowFrom = tonumber(expected.fromCounter)
+        local windowTo = tonumber(expected.toCounter)
+        if not windowFrom or not windowTo then
+            return false
+        end
+        local count, maxInRange, checksum = self:_ScanExactAuthorRange(profileId, author, windowFrom, windowTo)
+        local expectedCount = tonumber(expected.count)
+        if expectedCount ~= nil and count ~= expectedCount then
+            return false
+        end
+        local expectedMax = tonumber(expected.maxCounter)
+        if expectedMax ~= nil and expectedMax > 0 and maxInRange ~= expectedMax then
+            return false
+        end
+        local expectedChecksum = tonumber(expected.checksum)
+        if expectedChecksum ~= nil and checksum ~= expectedChecksum then
+            return false
+        end
+        if expectedCount == nil and expectedChecksum == nil and (expectedMax == nil or expectedMax <= 0) then
+            return false
+        end
+    end
+    return true
+end
+
+-- Exact-author satisfaction requires advertised raw-window proof. Global
+-- retained max, a non-empty AUTH_LOGS payload, and SameAuthor contig are not
+-- sufficient. Completeness and integrity both compare local exact rows in each
+-- advertised window to that window's count / maxCounter / checksum.
 function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCounter, opts)
     if type(profileId) ~= "string" or profileId == "" then return false end
     if type(author) ~= "string" or author == "" then return false end
@@ -555,30 +684,12 @@ function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCount
     fromCounter = math.max(1, math.floor(fromCounter))
     toCounter = math.max(fromCounter, math.floor(toCounter))
 
-    local countInRange, maxInRange, checksumInRange = self:_ScanExactAuthorRange(profileId, author, fromCounter, toCounter)
     opts = type(opts) == "table" and opts or {}
-
-    if opts.integrityRepair == true then
-        local neededMax = toCounter
-        local expectedMax = tonumber(opts.expectedMaxCounter)
-        if expectedMax and expectedMax > 0 then
-            neededMax = expectedMax
-        end
-        if maxInRange < neededMax then
-            return false
-        end
-        local expectedCount = tonumber(opts.expectedCount)
-        if expectedCount ~= nil and countInRange < expectedCount then
-            return false
-        end
-        local expectedChecksum = tonumber(opts.expectedChecksum)
-        if expectedChecksum ~= nil and checksumInRange ~= expectedChecksum then
-            return false
-        end
-        return true
+    local expectedWindows = self:_NormalizeExpectedWindows(opts, fromCounter, toCounter)
+    if not expectedWindows then
+        return false
     end
-
-    return maxInRange >= toCounter
+    return self:_ExactAuthorEvidenceSatisfied(profileId, author, expectedWindows)
 end
 
 -- Function Compute missing log ranges given local authorMax and remote authorMax (or detect gaps).
@@ -974,6 +1085,13 @@ function Sync:IsIdentityAdminReconcileReady(profileId)
     if type(missing) == "table" and #missing > 0 then
         return false
     end
+    local remoteWindows = self.state.authorWindowSummary
+    if type(remoteWindows) == "table" and self.ComputeWindowMismatchRequests then
+        local integrity = self:ComputeWindowMismatchRequests(profileId, remoteWindows, contig)
+        if type(integrity) == "table" and #integrity > 0 then
+            return false
+        end
+    end
     return true
 end
 
@@ -1223,10 +1341,14 @@ end
 -- @param fromCounter number Starting counter of range
 -- @param toCounter number Ending counter of range
 -- @param exactAuthor boolean|nil When true, only an exact raw-author request covers this range
+-- @param integrityRepair boolean|nil When true, only an integrity request covers this range
 -- @return boolean True if overlapping request exists, false otherwise
 -- Returns true only if an existing request fully covers [fromCounter, toCounter]
--- A logical SameAuthor request must not suppress an exact raw-author repair.
-function Sync:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, exactAuthor)
+-- Coverage strength:
+--   logical missing does not cover exact missing or exact integrity
+--   exact missing may cover logical missing, but not exact integrity
+--   exact integrity may cover exact missing and logical missing over the same range
+function Sync:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, exactAuthor, integrityRepair)
     if type(self.state) ~= "table" then return false end
     if type(self.state.requests) ~= "table" then return false end
     if type(profileId) ~= "string" or profileId == "" then return false end
@@ -1237,6 +1359,7 @@ function Sync:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toC
     if not fromCounter or not toCounter then return false end
 
     local neededExact = exactAuthor == true
+    local neededIntegrity = integrityRepair == true
 
     for _, req in pairs(self.state.requests) do
         if type(req) == "table" and type(req.meta) == "table" then
@@ -1246,10 +1369,18 @@ function Sync:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toC
                     local f = tonumber(m.fromCounter)
                     local t = tonumber(m.toCounter)
                     if f and t then
-                        -- Suppress only if existing request fully covers new desired range
                         if f <= fromCounter and t >= toCounter then
+                            local outstandingIntegrity = m.integrityRepair == true
                             local outstandingExact = self:_IsExactAuthorRepair(m)
-                            if (not neededExact) or outstandingExact then
+                            if neededIntegrity then
+                                if outstandingIntegrity then
+                                    return true
+                                end
+                            elseif neededExact then
+                                if outstandingExact then
+                                    return true
+                                end
+                            else
                                 return true
                             end
                         end
@@ -1408,7 +1539,7 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
             and type(range.toCounter) == "number"
             and range.fromCounter >= 1
             and range.toCounter >= 1
-            and not self:_HasOutstandingLogRangeRequest(profileId, range.author, range.fromCounter, range.toCounter, true)
+            and not self:_HasOutstandingLogRangeRequest(profileId, range.author, range.fromCounter, range.toCounter, true, true)
         then
             local fallback = {}
             for i = 2, #targets do

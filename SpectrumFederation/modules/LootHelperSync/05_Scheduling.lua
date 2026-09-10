@@ -69,7 +69,7 @@ function Sync:_MakeRepairQueueKey(profileId, author, fromCounter, toCounter, mod
     }, "|")
 end
 
--- Copy advertised integrity-window evidence onto a queued range or request.
+-- Copy advertised window evidence onto a queued range or request.
 function Sync:_CopyExpectedWindowEvidence(src, dest)
     if type(src) ~= "table" or type(dest) ~= "table" then
         return dest
@@ -85,6 +85,31 @@ function Sync:_CopyExpectedWindowEvidence(src, dest)
     local expectedMaxCounter = tonumber(src.expectedMaxCounter)
     if expectedMaxCounter ~= nil then
         dest.expectedMaxCounter = expectedMaxCounter
+    end
+    local expectedFromCounter = tonumber(src.expectedFromCounter)
+    if expectedFromCounter ~= nil then
+        dest.expectedFromCounter = expectedFromCounter
+    end
+    local expectedToCounter = tonumber(src.expectedToCounter)
+    if expectedToCounter ~= nil then
+        dest.expectedToCounter = expectedToCounter
+    end
+    if type(src.expectedWindows) == "table" then
+        local copy = {}
+        for i, window in ipairs(src.expectedWindows) do
+            if type(window) == "table" then
+                copy[#copy + 1] = {
+                    fromCounter = tonumber(window.fromCounter),
+                    toCounter = tonumber(window.toCounter),
+                    count = tonumber(window.count),
+                    maxCounter = tonumber(window.maxCounter),
+                    checksum = tonumber(window.checksum),
+                }
+            end
+        end
+        if #copy > 0 then
+            dest.expectedWindows = copy
+        end
     end
     return dest
 end
@@ -169,7 +194,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
             else
             fromCounter = math.max(1, math.floor(fromCounter))
             toCounter = math.max(1, math.floor(toCounter))
-            if fromCounter <= toCounter and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, exactAuthor) then
+            if fromCounter <= toCounter and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, exactAuthor, mode == "integrity") then
                 local key = self:_MakeRepairQueueKey(profileId, author, fromCounter, toCounter, mode, exactAuthor)
                 local entry = queue.items[key]
                 if not entry then
@@ -287,7 +312,7 @@ function Sync:_ProcessRepairConvergenceTick(trigger)
             table.remove(queue.order, idx)
         elseif entry.profileId ~= self.state.profileId then
             self:_RemoveQueuedRepair(key)
-        elseif self:_HasOutstandingLogRangeRequest(entry.profileId, entry.author, entry.fromCounter, entry.toCounter, entry.exactAuthor == true or entry.mode == "integrity") then
+        elseif self:_HasOutstandingLogRangeRequest(entry.profileId, entry.author, entry.fromCounter, entry.toCounter, entry.exactAuthor == true or entry.mode == "integrity", entry.mode == "integrity") then
             self:_RemoveQueuedRepair(key)
         elseif type(entry.nextAttemptAt) == "number" and entry.nextAttemptAt > now then
             idx = idx + 1

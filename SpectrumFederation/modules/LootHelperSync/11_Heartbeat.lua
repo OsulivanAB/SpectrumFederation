@@ -289,6 +289,7 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
     if type(missingRanges) ~= "table" or #missingRanges == 0 then return false end
 
     opts = type(opts) == "table" and opts or {}
+    self:_AttachExactWindowEvidence(missingRanges, self.state.authorWindowSummary or {})
 
     -- Cap to avoid spamming
     local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeededLogs) or 8
@@ -455,6 +456,7 @@ function Sync:SendJoinStatus()
     local localContig = self:ComputeContigAuthorMax(profileId)
     local remoteAuthorMax = self.state.authorMax or {}
     local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax, localAuthorMax)
+    self:_AttachExactWindowEvidence(missing, self.state.authorWindowSummary or {})
     local integrityRanges = self:ComputeWindowMismatchRequests(profileId, self.state.authorWindowSummary or {}, localContig)
 
     if missing and #missing > 0 then

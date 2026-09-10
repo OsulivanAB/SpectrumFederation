@@ -327,6 +327,7 @@ function Sync:FinalizeAdminConvergence()
         self.state.authorMax = targetMax
     end
     local missing = self:ComputeMissingLogRequests(localContig, targetMax, self:ComputeAuthorMax(profileId))
+    self:_AttachExactWindowEvidence(missing, self.state.authorWindowSummary or {})
     if type(missing) == "table" and #missing > 0 and self.QueueRepairRanges then
         self:QueueRepairRanges(profileId, missing, {
             mode = "missing",
