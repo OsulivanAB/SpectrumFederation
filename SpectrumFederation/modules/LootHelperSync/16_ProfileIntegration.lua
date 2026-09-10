@@ -775,23 +775,75 @@ function Sync:_AdvertisedWindowProofKey(profileId, author, window)
     }, "|")
 end
 
-function Sync:_MarkAdvertisedWindowContained(profileId, author, window)
-    if type(window) ~= "table" then
+function Sync:_MarkAdvertisedWindowContained(profileId, author, window, rows)
+    if type(window) ~= "table" or type(rows) ~= "table" or #rows == 0 then
         return
+    end
+    local copied = {}
+    for i = 1, #rows do
+        local row = rows[i]
+        if type(row) ~= "table" or type(row.id) ~= "string" or row.id == "" then
+            return
+        end
+        local fingerprint = tonumber(row.fingerprint)
+        if not fingerprint then
+            return
+        end
+        copied[i] = {
+            id = row.id,
+            fingerprint = fingerprint,
+        }
     end
     self.state = self.state or {}
     if type(self.state.containedExactWindows) ~= "table" then
         self.state.containedExactWindows = {}
     end
-    self.state.containedExactWindows[self:_AdvertisedWindowProofKey(profileId, author, window)] = true
+    self.state.containedExactWindows[self:_AdvertisedWindowProofKey(profileId, author, window)] = {
+        rows = copied,
+    }
 end
 
+-- Cached AUTH_LOGS containment is only valid while those exact rows still
+-- exist locally with the same IDs and fingerprints. A later trusted
+-- replacement of the same ID must not keep a prior advertiser's proof.
 function Sync:_HasContainedExactWindowProof(profileId, author, window)
     local contained = self.state and self.state.containedExactWindows
     if type(contained) ~= "table" or type(window) ~= "table" then
         return false
     end
-    return contained[self:_AdvertisedWindowProofKey(profileId, author, window)] == true
+    local key = self:_AdvertisedWindowProofKey(profileId, author, window)
+    local entry = contained[key]
+    if entry == true then
+        contained[key] = nil
+        return false
+    end
+    if type(entry) ~= "table" or type(entry.rows) ~= "table" or #entry.rows == 0 then
+        return false
+    end
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then
+        contained[key] = nil
+        return false
+    end
+    for i = 1, #entry.rows do
+        local row = entry.rows[i]
+        if type(row) ~= "table" or type(row.id) ~= "string" or row.id == "" then
+            contained[key] = nil
+            return false
+        end
+        local expectedFp = tonumber(row.fingerprint)
+        local log = profile.GetLogById and profile:GetLogById(row.id)
+        if not log or not expectedFp then
+            contained[key] = nil
+            return false
+        end
+        local localFp = tonumber((log.GetFingerprint and log:GetFingerprint()) or log._fingerprint)
+        if not localFp or localFp ~= expectedFp then
+            contained[key] = nil
+            return false
+        end
+    end
+    return true
 end
 
 -- Compact proof: local retained rows in [from, filledTo] match advertised
@@ -839,16 +891,17 @@ end
 
 function Sync:_AuthLogsProveAdvertisedWindow(profileId, author, window, payloadLogs)
     if type(window) ~= "table" or type(author) ~= "string" or author == "" then
-        return false
+        return nil
     end
     local advertisedCount = tonumber(window.count)
     local advertisedChecksum = tonumber(window.checksum)
     if advertisedCount == nil or advertisedChecksum == nil then
-        return false
+        return nil
     end
     local fromCounter = tonumber(window.fromCounter) or 0
     local filledTo = self:_AdvertisedWindowFilledTo(window)
     local matched = {}
+    local evidence = {}
     for _, log in ipairs(payloadLogs or {}) do
         if type(log) == "table" then
             local logAuthor = log._author or log.author
@@ -856,18 +909,25 @@ function Sync:_AuthLogsProveAdvertisedWindow(profileId, author, window, payloadL
                 local counter = tonumber(log._counter or log.counter)
                 if counter and counter >= fromCounter and counter <= filledTo then
                     local id = log._id or log.id or ""
-                    local fingerprint = log._fingerprint or log.fingerprint or 0
+                    local fingerprint = tonumber(log._fingerprint or log.fingerprint)
+                    if type(id) ~= "string" or id == "" or not fingerprint then
+                        return nil
+                    end
                     matched[#matched + 1] = ("%s=%s"):format(id, tostring(fingerprint))
+                    evidence[#evidence + 1] = {
+                        id = id,
+                        fingerprint = fingerprint,
+                    }
                 end
             end
         end
     end
     if ExactRangeFingerprintRollup(matched) ~= advertisedChecksum or #matched ~= advertisedCount then
-        return false
+        return nil
     end
     local profile = self:FindLocalProfileById(profileId)
     if not profile then
-        return false
+        return nil
     end
     local byId = {}
     for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
@@ -883,25 +943,18 @@ function Sync:_AuthLogsProveAdvertisedWindow(profileId, author, window, payloadL
             end
         end
     end
-    for _, log in ipairs(payloadLogs or {}) do
-        if type(log) == "table" then
-            local logAuthor = log._author or log.author
-            local counter = tonumber(log._counter or log.counter)
-            if logAuthor == author and counter and counter >= fromCounter and counter <= filledTo then
-                local id = log._id or log.id
-                local localLog = type(id) == "string" and byId[id]
-                if not localLog then
-                    return false
-                end
-                local localFp = tonumber((localLog.GetFingerprint and localLog:GetFingerprint()) or localLog._fingerprint)
-                local remoteFp = tonumber(log._fingerprint or log.fingerprint)
-                if not localFp or not remoteFp or localFp ~= remoteFp then
-                    return false
-                end
-            end
+    for i = 1, #evidence do
+        local row = evidence[i]
+        local localLog = byId[row.id]
+        if not localLog then
+            return nil
+        end
+        local localFp = tonumber((localLog.GetFingerprint and localLog:GetFingerprint()) or localLog._fingerprint)
+        if not localFp or localFp ~= row.fingerprint then
+            return nil
         end
     end
-    return true
+    return evidence
 end
 
 function Sync:_ProveAdvertisedWindowsFromAuthLogs(profileId, request, payloadLogs)
@@ -921,8 +974,9 @@ function Sync:_ProveAdvertisedWindowsFromAuthLogs(profileId, request, payloadLog
     local marked = false
     for i = 1, #windows do
         local window = windows[i]
-        if self:_AuthLogsProveAdvertisedWindow(profileId, request.author, window, payloadLogs) then
-            self:_MarkAdvertisedWindowContained(profileId, request.author, window)
+        local evidence = self:_AuthLogsProveAdvertisedWindow(profileId, request.author, window, payloadLogs)
+        if evidence then
+            self:_MarkAdvertisedWindowContained(profileId, request.author, window, evidence)
             marked = true
         end
     end

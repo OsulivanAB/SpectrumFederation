@@ -7336,6 +7336,233 @@ Sync.state._adminConvergence = nil
 assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
     "reconcile may run after the conflicting advertised row is repaired")
 
+local function runStaleContainmentProofTests()
+local function seedConflictAdmins(coordName, aName, bName)
+    local adminA = makeProfile(aName)
+    addMember(adminA, ALT_A)
+    addMember(adminA, ALT_B)
+    addMember(adminA, OTHER)
+    addMember(adminA, ALT_C)
+    addOwnerSiblings(adminA)
+    assertTrue(adminA:MergeLogTables({
+        makeTable(SF.LootLogEventTypes.ADMIN_ADDED, {
+            member = ALT_A,
+        }, { author = OWNER, counter = 4, timestamp = 1700031004 }),
+        makeTable(SF.LootLogEventTypes.ADMIN_REMOVED, {
+            member = ALT_A,
+            preOpAuthorMax = {
+                { author = OWNER, counter = 4 },
+            },
+        }, { author = "owner-Garona", counter = 1, timestamp = 1700031010 }),
+        makeTable(SF.LootLogEventTypes.CHARACTER_LINK, {
+            memberA = ALT_A,
+            memberB = ALT_B,
+            adminMembersAtLink = { ALT_A },
+        }, { author = OWNER, counter = 5, timestamp = 1700031020 }),
+    }) > 0, "conflict admin A stores ADMIN_REMOVED as owner-Garona:1")
+    if adminA.RebuildLogIndex then
+        adminA:RebuildLogIndex()
+    end
+    adminA._adminUsers = { OWNER, OTHER, ALT_C }
+    local adminB = cloneWithout(adminA, bName, "__none__")
+    local conflictRow = makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 77,
+    }, { author = "owner-Garona", counter = 1, timestamp = 1700031010 })
+    assertTrue(adminB:MergeLogTables({ conflictRow }, { allowReplaceExisting = true }) >= 0,
+        "conflict admin B replaces owner-Garona:1 with a different fingerprint")
+    if adminB.RebuildLogIndex then
+        adminB:RebuildLogIndex()
+    end
+    adminB._adminUsers = { OWNER, OTHER, ALT_C }
+    local coord = cloneWithout(adminA, coordName, "owner-Garona:1")
+    coord._adminUsers = { OWNER, OTHER, ALT_C }
+    return coord, adminA, adminB
+end
+local function bindConflictAdmins(coord, adminA, adminB)
+    startConv(coord)
+    coord._adminUsers = { OWNER, OTHER, ALT_C }
+    local summaryA = adminA:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+    local summaryB = adminB:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+    Sync.state.authorWindowSummary = coord:ComputeAuthorWindowSummary(Sync:GetIntegrityWindowSize())
+    Sync.state.authorMax = coord:ComputeAuthorMax()
+    Sync.state.adminStatuses = {
+        [OTHER] = {
+            hasProfile = true,
+            hasGaps = false,
+            authorMax = adminA:ComputeAuthorMax(),
+            authorWindowSummary = summaryA,
+        },
+        [ALT_C] = {
+            hasProfile = true,
+            hasGaps = false,
+            authorMax = adminB:ComputeAuthorMax(),
+            authorWindowSummary = summaryB,
+        },
+    }
+    return summaryA["owner-Garona"][1], summaryB["owner-Garona"][1]
+end
+local function applyAdvertiser(src, coord, evid, requestId)
+    applyDiscoveredRange(src, coord, {
+        author = "owner-Garona",
+        fromCounter = evid.fromCounter,
+        toCounter = evid.maxCounter > 0 and evid.maxCounter or evid.toCounter,
+        exactAuthor = true,
+        integrityRepair = true,
+        expectedCount = evid.count,
+        expectedChecksum = evid.checksum,
+        expectedMaxCounter = evid.maxCounter,
+        expectedFromCounter = evid.fromCounter,
+        expectedToCounter = evid.toCounter,
+        expectedWindows = { evid },
+    }, requestId)
+    registerProfile(coord)
+end
+local function assertConflictOpen(coord, evidA, evidB, message)
+    local pid = coord:GetProfileId()
+    local aContained = Sync:_IsAdvertisedExactWindowContained(pid, "owner-Garona", evidA)
+    local bContained = Sync:_IsAdvertisedExactWindowContained(pid, "owner-Garona", evidB)
+    assertFalse(aContained and bContained, message .. ": both contradictory proofs cannot be contained")
+    assertTrue(Sync:_HasUnresolvedRemoteWindowMismatch(pid),
+        message .. ": unresolved remote window mismatch remains")
+    Sync.state.requests = {}
+    Sync.state.repairQueue = { order = {}, items = {} }
+    Sync.state._adminConvergence = nil
+    assertFalse(Sync:IsIdentityAdminReconcileReady(pid),
+        message .. ": identity-admin reconcile stays blocked")
+    assertFalse(coord:IsAdminMemberId(ALT_B), message .. ": no implied ADMIN_ADDED for B")
+    return aContained, bContained
+end
+
+-- 1 / 3 / 4 / 5 / 6. Conflicting advertiser A then B.
+resetEnv()
+local coord, adminA, adminB = seedConflictAdmins("StaleABCoord", "StaleAdminA", "StaleAdminB")
+assertTrue(adminA:GetLogById("owner-Garona:1"):GetFingerprint() ~= adminB:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "admin A and admin B disagree on owner-Garona:1")
+local evidA, evidB = bindConflictAdmins(coord, adminA, adminB)
+assertTrue(evidA.checksum ~= evidB.checksum, "conflicting advertisers have distinct window checksums")
+local grantsBefore = adminAddedCount(coord)
+applyAdvertiser(adminA, coord, evidA, "REQ-STALE-A1")
+assertEq(coord:GetLogById("owner-Garona:1"):GetFingerprint(), adminA:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "after A, local fingerprint is A's ADMIN_REMOVED")
+local aContained, bContained = assertConflictOpen(coord, evidA, evidB, "after A")
+assertTrue(aContained, "after A, A's advertised proof is contained")
+assertFalse(bContained, "after A, B's advertised proof remains unresolved")
+assertEq(adminAddedCount(coord), grantsBefore, "no ADMIN_ADDED after A's repair while B still conflicts")
+applyAdvertiser(adminB, coord, evidB, "REQ-STALE-B1")
+assertEq(coord:GetLogById("owner-Garona:1"):GetFingerprint(), adminB:GetLogById("owner-Garona:1"):GetFingerprint(),
+    "trusted integrity replaces fingerprint A with B")
+aContained, bContained = assertConflictOpen(coord, evidA, evidB, "after A then B")
+assertFalse(aContained, "after B replaces A, A's advertised proof is unresolved again")
+assertTrue(bContained, "after B replaces A, B's advertised proof is contained")
+assertFalse(Sync:_HasContainedExactWindowProof(coord:GetProfileId(), "owner-Garona", evidA),
+    "stale AUTH_LOGS cache for A does not survive fingerprint replacement")
+
+-- 2 / 7. Reverse arrival and alternating replacements.
+resetEnv()
+coord, adminA, adminB = seedConflictAdmins("StaleBACoord", "StaleAdminA2", "StaleAdminB2")
+evidA, evidB = bindConflictAdmins(coord, adminA, adminB)
+applyAdvertiser(adminB, coord, evidB, "REQ-STALE-B2")
+aContained, bContained = assertConflictOpen(coord, evidA, evidB, "after B first")
+assertFalse(aContained, "after B first, A's proof is unresolved")
+assertTrue(bContained, "after B first, B's proof is contained")
+applyAdvertiser(adminA, coord, evidA, "REQ-STALE-A2")
+aContained, bContained = assertConflictOpen(coord, evidA, evidB, "after B then A")
+assertTrue(aContained, "after A replaces B, A's proof is contained")
+assertFalse(bContained, "after A replaces B, B's proof is unresolved")
+applyAdvertiser(adminB, coord, evidB, "REQ-STALE-B3")
+applyAdvertiser(adminA, coord, evidA, "REQ-STALE-A3")
+aContained, bContained = assertConflictOpen(coord, evidA, evidB, "after alternating replacements")
+assertTrue(aContained, "last writer A is contained")
+assertFalse(bContained, "last writer A leaves B unresolved")
+assertFalse(aContained and bContained, "alternating replacements never satisfy both contradictory proofs")
+
+-- 8. Identical proof from two admins is satisfied normally.
+resetEnv()
+coord, adminA, adminB = seedConflictAdmins("StaleSameCoord", "StaleSameA", "StaleSameB")
+adminB = cloneWithout(adminA, "StaleSameB2", "__none__")
+adminB._adminUsers = { OWNER, OTHER, ALT_C }
+evidA, evidB = bindConflictAdmins(coord, adminA, adminB)
+assertEq(evidA.checksum, evidB.checksum, "identical advertisers share one window checksum")
+applyAdvertiser(adminA, coord, evidA, "REQ-STALE-SAME")
+assertTrue(Sync:_IsAdvertisedExactWindowContained(coord:GetProfileId(), "owner-Garona", evidA),
+    "identical A proof is contained")
+assertTrue(Sync:_IsAdvertisedExactWindowContained(coord:GetProfileId(), "owner-Garona", evidB),
+    "identical B proof is contained by the same local history")
+Sync.state.requests = {}
+Sync.state.repairQueue = { order = {}, items = {} }
+Sync.state._adminConvergence = nil
+assertFalse(Sync:_HasUnresolvedRemoteWindowMismatch(coord:GetProfileId()),
+    "identical advertiser windows are not an unresolved mismatch")
+assertTrue(Sync:IsIdentityAdminReconcileReady(coord:GetProfileId()),
+    "identical advertiser proofs allow identity-admin reconcile")
+Sync:ScheduleIdentityAdminReconcile(coord:GetProfileId())
+assertFalse(coord:IsAdminMemberId(ALT_A), "ADMIN_REMOVED remains in force for identical proofs")
+assertFalse(coord:IsAdminMemberId(ALT_B), "identical contained ADMIN_REMOVED does not grant B")
+
+-- 9 / 10. Ordinary append does not invalidate valid cached containment,
+-- including interleaved-superset AUTH_LOGS proof.
+resetEnv()
+coord, remote = seedSuperset("StaleAppendCoord", "StaleAppendRemote", false)
+startConv(coord)
+remoteSummary = setRemoteAdmin(coord, remote)
+evid = remoteSummary["owner-Garona"][1]
+applyAdvertiser(remote, coord, evid, "REQ-STALE-APPEND")
+assertFalse(Sync:_IsUnresolvedAdvertisedWindow(coord:GetProfileId(), {
+    author = "owner-Garona",
+    expectedWindows = { evid },
+}), "interleaved superset AUTH_LOGS proof is contained before append")
+assertTrue(Sync:_HasContainedExactWindowProof(coord:GetProfileId(), "owner-Garona", evid),
+    "interleaved superset uses cached row-level AUTH_LOGS proof")
+assertTrue(coord:MergeLogTables({
+    makeTable(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = ALT_A,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 14,
+    }, { author = "owner-Garona", counter = 4, timestamp = 1700031090 }),
+}) > 0, "ordinary append adds owner-Garona:4")
+assertTrue(hasLogId(coord, "owner-Garona:2"), "append keeps interleaved :2")
+assertTrue(Sync:_HasContainedExactWindowProof(coord:GetProfileId(), "owner-Garona", evid),
+    "ordinary append does not drop cached containment")
+assertFalse(Sync:_IsUnresolvedAdvertisedWindow(coord:GetProfileId(), {
+    author = "owner-Garona",
+    expectedWindows = { evid },
+}), "advertised {1,3} stays contained after an unrelated later row")
+
+-- 11. Session reset / takeover clears transient containment evidence.
+Sync:_ClearIdentitySessionBookkeeping("test-session-reset")
+assertFalse(Sync:_HasContainedExactWindowProof(coord:GetProfileId(), "owner-Garona", evid),
+    "session reset clears cached AUTH_LOGS containment")
+assertTrue(Sync:_IsUnresolvedAdvertisedWindow(coord:GetProfileId(), {
+    author = "owner-Garona",
+    expectedWindows = { evid },
+}), "interleaved superset becomes unproven after session reset until AUTH_LOGS re-proves it")
+applyAdvertiser(remote, coord, evid, "REQ-STALE-TAKEOVER")
+assertTrue(Sync:_HasContainedExactWindowProof(coord:GetProfileId(), "owner-Garona", evid),
+    "AUTH_LOGS can re-prove interleaved containment after reset")
+Sync.state.containedExactWindows = {}
+assertFalse(Sync:_HasContainedExactWindowProof(coord:GetProfileId(), "owner-Garona", evid),
+    "coordinator takeover clears transient containment evidence")
+
+-- 12. Snapshot/import replacement path (MergeLogTables allowReplaceExisting)
+-- invalidates the replaced advertiser's proof.
+resetEnv()
+coord, adminA, adminB = seedConflictAdmins("StaleSnapCoord", "StaleSnapA", "StaleSnapB")
+evidA, evidB = bindConflictAdmins(coord, adminA, adminB)
+applyAdvertiser(adminA, coord, evidA, "REQ-STALE-SNAP-A")
+assertTrue(Sync:_IsAdvertisedExactWindowContained(coord:GetProfileId(), "owner-Garona", evidA),
+    "snapshot fixture starts with A's proof contained")
+local replaced = adminB:GetLogById("owner-Garona:1"):ToTable()
+assertTrue(coord:MergeLogTables({ replaced }, { allowReplaceExisting = true }) >= 0,
+    "ImportSnapshot/MergeLogTables replacement path rewrites owner-Garona:1")
+aContained, bContained = assertConflictOpen(coord, evidA, evidB, "after snapshot replacement")
+assertFalse(aContained, "snapshot replacement uncontains A's previous proof")
+assertFalse(Sync:_HasContainedExactWindowProof(coord:GetProfileId(), "owner-Garona", evidA),
+    "row-level cache rejects the replaced fingerprint")
+end
+runStaleContainmentProofTests()
+
 restoreUniqueNonces()
 end
 runAdvertisedContainmentTests()
