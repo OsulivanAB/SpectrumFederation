@@ -899,105 +899,97 @@ local function ExpireSplitIdentityEvents(events, partition)
     end
 end
 
-local function ScopeShareMember(a, b)
-    local set = ListToSet(b)
-    for i = 1, #a do
-        if set[a[i]] then
+local function IsSupersetScope(outerMembers, innerMembers)
+    return IsSubset(innerMembers, ListToSet(outerMembers))
+end
+
+local function IdentityEventSupersededByLaterSuperset(ev, events)
+    for i = 1, #events do
+        local other = events[i]
+        if other ~= ev and other.slot == ev.slot and ev.log and other.log
+            and CausalBefore(ev.log, other.log)
+            and IsSupersetScope(other.identityMembers, ev.identityMembers)
+        then
             return true
         end
     end
     return false
 end
 
+local function CoversCurrentIdentity(ev, ids)
+    return IsSubset(ids, ListToSet(ev.identityMembers))
+end
+
+-- Independent scoped contributions merge first. A later correction recorded
+-- on the current identity then applies to that packed occupancy. Same-slot
+-- later supersets drop replaced subset events. Different-slot current-identity
+-- actions must not collapse disjoint same-slot histories into latest-wins.
 local function ProjectFamilyOccupancy(ids, idSet, localArmor, localOrigin, familyEvents, family)
     if #familyEvents == 0 then
         return PackLocals(ids, localArmor, localOrigin, family)
     end
-    local parent = {}
-    local function find(i)
-        local cur = i
-        while parent[cur] ~= cur do
-            parent[cur] = parent[parent[cur]]
-            cur = parent[cur]
-        end
-        return cur
-    end
+    local remaining = {}
     for i = 1, #familyEvents do
-        parent[i] = i
-    end
-    for i = 1, #familyEvents do
-        for j = i + 1, #familyEvents do
-            if ScopeShareMember(familyEvents[i].identityMembers, familyEvents[j].identityMembers) then
-                local ri, rj = find(i), find(j)
-                if ri ~= rj then
-                    parent[ri] = rj
-                end
-            end
+        local ev = familyEvents[i]
+        if not IdentityEventSupersededByLaterSuperset(ev, familyEvents) then
+            remaining[#remaining + 1] = ev
         end
     end
-    local clusters = {}
-    local claimed = {}
-    for i = 1, #familyEvents do
-        local root = find(i)
-        local cluster = clusters[root]
-        if not cluster then
-            cluster = { events = {}, members = {} }
-            clusters[root] = cluster
+    local base = {}
+    local covering = {}
+    for i = 1, #remaining do
+        local ev = remaining[i]
+        if CoversCurrentIdentity(ev, ids) then
+            covering[#covering + 1] = ev
+        else
+            base[#base + 1] = ev
         end
-        cluster.events[#cluster.events + 1] = familyEvents[i]
-        local members = familyEvents[i].identityMembers
+    end
+    local function byCausal(a, b)
+        return CausalBefore(a.log, b.log)
+    end
+    table.sort(base, byCausal)
+    table.sort(covering, byCausal)
+
+    local occ = NewIdentityOcc()
+    local packedSet = {}
+    local packedAny = false
+    for i = 1, #base do
+        local ev = base[i]
+        local scopeIds = {}
+        local members = ev.identityMembers
         for m = 1, #members do
             local id = members[m]
-            if idSet[id] then
-                cluster.members[id] = true
-                claimed[id] = true
+            if idSet[id] and not packedSet[id] then
+                scopeIds[#scopeIds + 1] = id
+                packedSet[id] = true
             end
         end
-    end
-    local clusterList = {}
-    for _, cluster in pairs(clusters) do
-        clusterList[#clusterList + 1] = cluster
-    end
-    table.sort(clusterList, function(a, b)
-        return table.concat(a.events[1].identityMembers, "\0") < table.concat(b.events[1].identityMembers, "\0")
-    end)
-    local occ = NewIdentityOcc()
-    for c = 1, #clusterList do
-        local cluster = clusterList[c]
-        local scopeIds = {}
-        for id in pairs(cluster.members) do
-            scopeIds[#scopeIds + 1] = id
+        if #scopeIds > 0 then
+            table.sort(scopeIds)
+            local packed = PackLocals(scopeIds, localArmor, localOrigin, family)
+            ApplyIdentityArmor(packed, ev.slot, ev.action)
+            MergeOcc(occ, packed)
+            packedAny = true
+        else
+            ApplyIdentityArmor(occ, ev.slot, ev.action)
         end
-        table.sort(scopeIds)
-        local packed = PackLocals(scopeIds, localArmor, localOrigin, family)
-        local latestBySlot = {}
-        for e = 1, #cluster.events do
-            local ev = cluster.events[e]
-            local prev = latestBySlot[ev.slot]
-            if not prev or CausalBefore(prev.log, ev.log) then
-                latestBySlot[ev.slot] = ev
-            end
-        end
-        local apply = {}
-        for _, ev in pairs(latestBySlot) do
-            apply[#apply + 1] = ev
-        end
-        table.sort(apply, function(a, b)
-            return CausalBefore(a.log, b.log)
-        end)
-        for e = 1, #apply do
-            ApplyIdentityArmor(packed, apply[e].slot, apply[e].action)
-        end
-        MergeOcc(occ, packed)
     end
     local leftover = {}
     for i = 1, #ids do
-        if not claimed[ids[i]] then
+        if not packedSet[ids[i]] then
             leftover[#leftover + 1] = ids[i]
         end
     end
     if #leftover > 0 then
         MergeOcc(occ, PackLocals(leftover, localArmor, localOrigin, family))
+        packedAny = true
+    end
+    if not packedAny then
+        occ = PackLocals(ids, localArmor, localOrigin, family)
+    end
+    for i = 1, #covering do
+        ApplyIdentityArmor(occ, covering[i].slot, covering[i].action)
     end
     return occ
 end

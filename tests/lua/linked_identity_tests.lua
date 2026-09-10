@@ -3534,6 +3534,51 @@ assertTrue(armorOf(profile, ALT_A, "Chest"), "superset USED supersedes subset AV
 assertTrue(armorOf(profile, ALT_C, "Chest"), "expanded identity sees USED")
 
 resetEnv()
+profile = makeProfile("DisjointChestPlusHead")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B for disjoint Chest")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "A+B Chest USED")
+assertTrue(profile:LinkCharacters(ALT_C, ALT_D), "C+D for disjoint Chest")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "C+D Chest USED")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "merge disjoint Chest identities")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "merged Chest stays USED")
+assertTrue(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "two disjoint Chest USEDs overflow")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Head", { profile = profile, scope = "identity" }), "current identity Head AVAILABLE/USED toggle")
+-- Toggle from empty Head writes USED; toggle again for AVAILABLE if first fill is USED.
+if armorOf(profile, ALT_A, "Head") then
+    assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Head", { profile = profile, scope = "identity" }), "current identity Head AVAILABLE")
+end
+assertFalse(armorOf(profile, ALT_A, "Head"), "combined Head AVAILABLE")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "later Head correction does not drop disjoint Chest uses")
+assertTrue(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "Chest overflow survives a later Head correction")
+checkSurfaces(profile, "DisjointChestPlusHead", function(p, label)
+    assertTrue(armorOf(p, ALT_A, "Chest"), label .. ": Chest USED")
+    assertFalse(armorOf(p, ALT_A, "Head"), label .. ": Head AVAILABLE")
+    assertTrue(SF.LootHelperIdentity.ComponentHasOverflow(p._identityProjection, ALT_A), label .. ": Chest overflow remains")
+end)
+
+resetEnv()
+profile = makeProfile("OverlapChestNoErase")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B overlapping Chest")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Chest", { profile = profile, scope = "identity" }), "A+B Chest USED")
+assertTrue(profile:LinkCharacters(ALT_B, ALT_C), "B+C join")
+local subsetAvail = liveTable(profile, SF.LootLogEventTypes.ARMOR_CHANGE, {
+    member = ALT_B,
+    slot = "Chest",
+    action = SF.LootLogArmorActions.AVAILABLE,
+    scope = "identity",
+    identityMembers = { ALT_B, ALT_C },
+}, OWNER)
+assertTrue(profile:MergeLogTables({ subsetAvail }) > 0, "subset B+C Chest AVAILABLE is stored")
+assertTrue(armorOf(profile, ALT_A, "Chest"), "B+C AVAILABLE does not erase A+B Chest USED")
+
+resetEnv()
 profile = makeProfile("RingPackMerge")
 addMember(profile, ALT_A)
 addMember(profile, ALT_B)
@@ -3552,6 +3597,33 @@ checkSurfaces(profile, "RingPackMerge", function(p, label)
     assertTrue(armorOf(p, ALT_A, "Ring2"), label .. ": Ring2 USED")
     assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(p._identityProjection, ALT_A), label .. ": overflow 0")
 end)
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring2", { profile = profile, scope = "identity" }), "current identity clears displayed Ring2")
+assertTrue(armorOf(profile, ALT_A, "Ring1"), "clearing Ring2 keeps packed Ring1")
+assertFalse(armorOf(profile, ALT_A, "Ring2"), "combined Ring2 AVAILABLE clears opportunity 2")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "Ring2 clear does not drop the remaining Ring1 use into overflow")
+checkSurfaces(profile, "RingPackThenRing2", function(p, label)
+    assertTrue(armorOf(p, ALT_A, "Ring1"), label .. ": Ring1 USED")
+    assertFalse(armorOf(p, ALT_A, "Ring2"), label .. ": Ring2 AVAILABLE")
+end)
+
+resetEnv()
+profile = makeProfile("RingPackThenHead")
+addMember(profile, ALT_A)
+addMember(profile, ALT_B)
+addMember(profile, ALT_C)
+addMember(profile, ALT_D)
+assertTrue(profile:LinkCharacters(ALT_A, ALT_B), "A+B ring pair")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "A+B Ring1")
+assertTrue(profile:LinkCharacters(ALT_C, ALT_D), "C+D ring pair")
+assertTrue(memberOf(profile, ALT_C):ToggleEquipment("Ring1", { profile = profile, scope = "identity" }), "C+D Ring1")
+assertTrue(profile:LinkCharacters(ALT_A, ALT_C), "merge ring pairs")
+assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Head", { profile = profile, scope = "identity" }), "combined Head USED")
+if armorOf(profile, ALT_A, "Head") then
+    assertTrue(memberOf(profile, ALT_A):ToggleEquipment("Head", { profile = profile, scope = "identity" }), "combined Head AVAILABLE")
+end
+assertTrue(armorOf(profile, ALT_A, "Ring1"), "later Head correction keeps packed Ring1")
+assertTrue(armorOf(profile, ALT_A, "Ring2"), "later Head correction keeps packed Ring2")
+assertFalse(SF.LootHelperIdentity.ComponentHasOverflow(profile._identityProjection, ALT_A), "Head correction does not create ring overflow")
 
 resetEnv()
 profile = makeProfile("RingPackThree")

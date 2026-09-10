@@ -49,6 +49,7 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Identity-scoped equipment corrections apply to contributions from their recorded `identityMembers`; AVAILABLE suppresses that scope without clearing another identity's scoped USED, and later joiners do not resurrect suppressed insider locals
 - Identity-scoped equipment corrections expire permanently after any original-scope split; later relink does not resurrect them
 - A later current-identity equipment correction supersedes earlier overlapping subset-scope state for that slot or ring/trinket family
+- A later current-identity correction on a different slot does not collapse disjoint same-slot contributions into latest-wins
 - Independent scoped ring and trinket usages pack into opportunity 1 then 2 before overflow when identities merge
 - Equipment chronology uses `OrderLogs` causal rank rather than the raw `CompareLogs` tie-break
 - `ADMIN_ADDED.sourceLogId` is a causal predecessor of the sourced grant
