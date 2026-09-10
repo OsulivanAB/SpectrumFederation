@@ -531,7 +531,10 @@ function Sync:HandleSessionHeartbeat(sender, payload)
                     local f = r.fromCounter
                     local t = r.toCounter
                     if type(a) == "string" and type(f) == "number" and type(t) == "number" then
-                        if not self:_HasOutstandingLogRangeRequest(self.state.profileId, a, f, t) then
+                        if r.exactAuthor then
+                            r.preferredTarget = r.preferredTarget or sender
+                        end
+                        if not self:_HasOutstandingLogRangeRequest(self.state.profileId, a, f, t, r.exactAuthor == true) then
                             table.insert(filtered, r)
                         end
                     end
@@ -874,6 +877,7 @@ function Sync:HandleNeedLogs(sender, payload)
             local author = req.author
             local fromC = math.max(1, math.floor(req.fromCounter))
             local toC   = math.max(fromC, math.floor(req.toCounter))
+            local exactAuthor = req.exactAuthor == true or payload.exactAuthor == true or payload.integrityRepair == true
             local delay = (i - 1) * spacingSec
 
             self:RunAfter(delay, function()
@@ -887,17 +891,7 @@ function Sync:HandleNeedLogs(sender, payload)
                     local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
                     local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
                     c = tonumber(c)
-                    local authorMatches = a == author
-                    if self._LogAuthorMatches then
-                        authorMatches = self:_LogAuthorMatches(a, author)
-                    else
-                        local Identity = SF.LootHelperIdentity
-                        if Identity and Identity.SameAuthor then
-                            authorMatches = Identity.SameAuthor(a, author)
-                        elseif Identity and Identity.SamePlayer then
-                            authorMatches = Identity.SamePlayer(a, author)
-                        end
-                    end
+                    local authorMatches = self:_AuthorMatchesRepairRequest(a, author, exactAuthor)
                     if authorMatches and c and c >= fromC and c <= toC then
                         if log and log.ToTable then
                             table.insert(out, log:ToTable())
@@ -975,6 +969,7 @@ function Sync:HandleLogRequest(sender, payload)
 
     local fromC = math.max(1, math.floor(payload.fromCounter))
     local toC = (toCounter and math.floor(toCounter)) or fromC
+    local exactAuthor = payload.exactAuthor == true or payload.integrityRepair == true
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Serving logs for %s [%d-%d] to %s",
@@ -986,17 +981,7 @@ function Sync:HandleLogRequest(sender, payload)
         local author = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
         local counter = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
         counter = tonumber(counter)
-        local authorMatches = author == payload.author
-        if self._LogAuthorMatches then
-            authorMatches = self:_LogAuthorMatches(author, payload.author)
-        else
-            local Identity = SF.LootHelperIdentity
-            if Identity and Identity.SameAuthor then
-                authorMatches = Identity.SameAuthor(author, payload.author)
-            elseif Identity and Identity.SamePlayer then
-                authorMatches = Identity.SamePlayer(author, payload.author)
-            end
-        end
+        local authorMatches = self:_AuthorMatchesRepairRequest(author, payload.author, exactAuthor)
         if authorMatches and counter and counter >= fromC and counter <= toC then
             if log and log.ToTable then
                 table.insert(out, log:ToTable())

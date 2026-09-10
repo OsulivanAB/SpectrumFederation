@@ -367,7 +367,7 @@ function Sync:RequestManualSync(reason)
                     if type(author) == "string"
                         and type(fromCounter) == "number"
                         and type(toCounter) == "number"
-                        and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter)
+                        and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, range.exactAuthor == true)
                     then
                         hasNewRequests = true
                         break

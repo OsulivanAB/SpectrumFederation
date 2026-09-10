@@ -342,7 +342,7 @@ function Sync:FinalizeAdminConvergence()
         and SF.SyncProtocol.GetSupportedEncodings()
         or nil
 
-    local function registerAdminLogReq(providerList, author, fromCounter, toCounter, integrityRepair)
+    local function registerAdminLogReq(providerList, author, fromCounter, toCounter, integrityRepair, exactAuthor)
         if type(providerList) ~= "table" or #providerList == 0 then
             return false
         end
@@ -367,6 +367,7 @@ function Sync:FinalizeAdminConvergence()
             supportsEnc     = mySupportsEnc,
             targets         = fallback,
             integrityRepair = integrityRepair == true,
+            exactAuthor     = integrityRepair == true or exactAuthor == true,
         })
 
         if not ok then
@@ -418,7 +419,7 @@ function Sync:FinalizeAdminConvergence()
                 end
             end
 
-            registerAdminLogReq(providers, author, req.fromCounter, req.toCounter, false)
+            registerAdminLogReq(providers, author, req.fromCounter, req.toCounter, false, req.exactAuthor == true)
         end
     end
 
@@ -430,7 +431,7 @@ function Sync:FinalizeAdminConvergence()
                 local key = ("%s|%s|%d|%d"):format(tostring(adminName), tostring(range.author), tonumber(range.fromCounter) or 0, tonumber(range.toCounter) or 0)
                 if not integritySeen[key] then
                     integritySeen[key] = true
-                    registerAdminLogReq({ adminName }, range.author, range.fromCounter, range.toCounter, true)
+                    registerAdminLogReq({ adminName }, range.author, range.fromCounter, range.toCounter, true, true)
                 end
             end
         end

@@ -58,13 +58,14 @@ function Sync:_EnsureRepairQueueState()
     return self.state.repairQueue, self.state.convergence
 end
 
-function Sync:_MakeRepairQueueKey(profileId, author, fromCounter, toCounter, mode)
+function Sync:_MakeRepairQueueKey(profileId, author, fromCounter, toCounter, mode, exactAuthor)
     return table.concat({
         tostring(profileId or ""),
         tostring(author or ""),
         tostring(tonumber(fromCounter) or 0),
         tostring(tonumber(toCounter) or 0),
         tostring(mode or "missing"),
+        (exactAuthor == true or mode == "integrity") and "exact" or "logical",
     }, "|")
 end
 
@@ -136,6 +137,9 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
         local toCounter = type(range) == "table" and tonumber(range.toCounter) or nil
         local mode = (type(range) == "table" and range.mode) or opts.mode or "missing"
         local preferredTarget = opts.preferredTarget or (type(range) == "table" and range.preferredTarget) or nil
+        local exactAuthor = (mode == "integrity")
+            or (type(range) == "table" and range.exactAuthor == true)
+            or (opts.exactAuthor == true)
 
         if type(author) == "string" and author ~= "" and fromCounter and toCounter then
             -- External/nonsequential logs use sentinel counter 0. A 0-0 range
@@ -145,8 +149,8 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
             else
             fromCounter = math.max(1, math.floor(fromCounter))
             toCounter = math.max(1, math.floor(toCounter))
-            if fromCounter <= toCounter and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter) then
-                local key = self:_MakeRepairQueueKey(profileId, author, fromCounter, toCounter, mode)
+            if fromCounter <= toCounter and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, exactAuthor) then
+                local key = self:_MakeRepairQueueKey(profileId, author, fromCounter, toCounter, mode, exactAuthor)
                 local entry = queue.items[key]
                 if not entry then
                     if #queue.order >= limit then
@@ -162,6 +166,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                             fromCounter = fromCounter,
                             toCounter = toCounter,
                             mode = mode,
+                            exactAuthor = exactAuthor,
                             preferredTarget = preferredTarget,
                             reason = opts.reason,
                             nextAttemptAt = opts.delaySec and (now + math.max(0, tonumber(opts.delaySec) or 0)) or now,
@@ -175,6 +180,9 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                 else
                     entry.reason = opts.reason or entry.reason
                     entry.preferredTarget = preferredTarget or entry.preferredTarget
+                    if exactAuthor then
+                        entry.exactAuthor = true
+                    end
                     if opts.delaySec then
                         local requestedAt = now + math.max(0, tonumber(opts.delaySec) or 0)
                         if type(entry.nextAttemptAt) ~= "number" or requestedAt < entry.nextAttemptAt then
@@ -209,6 +217,7 @@ function Sync:_DispatchQueuedRepair(entry)
                 fromCounter = entry.fromCounter,
                 toCounter = entry.toCounter,
                 mode = "integrity",
+                exactAuthor = true,
             }
         }, entry.reason or "queued-integrity", entry.preferredTarget, {
             backgroundRepair = true,
@@ -221,10 +230,14 @@ function Sync:_DispatchQueuedRepair(entry)
             author = entry.author,
             fromCounter = entry.fromCounter,
             toCounter = entry.toCounter,
+            exactAuthor = entry.exactAuthor == true,
+            preferredTarget = entry.preferredTarget,
         }
     }, entry.reason or "queued-missing", {
         backgroundRepair = true,
         queueAttempts = entry.queueAttempts,
+        preferredTarget = entry.preferredTarget,
+        exactAuthor = entry.exactAuthor == true,
     })
 end
 
@@ -248,7 +261,7 @@ function Sync:_ProcessRepairConvergenceTick(trigger)
             table.remove(queue.order, idx)
         elseif entry.profileId ~= self.state.profileId then
             self:_RemoveQueuedRepair(key)
-        elseif self:_HasOutstandingLogRangeRequest(entry.profileId, entry.author, entry.fromCounter, entry.toCounter) then
+        elseif self:_HasOutstandingLogRangeRequest(entry.profileId, entry.author, entry.fromCounter, entry.toCounter, entry.exactAuthor == true or entry.mode == "integrity") then
             self:_RemoveQueuedRepair(key)
         elseif type(entry.nextAttemptAt) == "number" and entry.nextAttemptAt > now then
             idx = idx + 1

@@ -177,8 +177,9 @@ end
 -- Function Choose the best target (helper/coordinator) for a request, with fallback ordering.
 -- @param helpers table Array of helpers "Name-Realm"
 -- @param coordinator string|nil Coordinator "Name-Realm"
+-- @param opts table|nil { preferCoordinatorFirst=bool, preferredTarget=string }
 -- @return table targets Ordered list of targets "Name-Realm" to try
-function Sync:GetRequestTargets(helpers, coordinator)
+function Sync:GetRequestTargets(helpers, coordinator, opts)
     local targets, seen = {}, {}
     
     local function add(t)
@@ -190,10 +191,17 @@ function Sync:GetRequestTargets(helpers, coordinator)
 
     -- Simplify: no need for redundant conditional assignment
     local me = self:_SelfId()
-    local warmupSec = tonumber(self.cfg.helperWarmupSec) or 0
-    local preferCoordinatorFirst = false
-    if warmupSec > 0 and type(self.state._sessionDescriptorAt) == "number" then
-        preferCoordinatorFirst = (self:_Now() - self.state._sessionDescriptorAt) <= warmupSec
+    opts = type(opts) == "table" and opts or {}
+    local preferCoordinatorFirst = opts.preferCoordinatorFirst == true
+    if not preferCoordinatorFirst then
+        local warmupSec = tonumber(self.cfg.helperWarmupSec) or 0
+        if warmupSec > 0 and type(self.state._sessionDescriptorAt) == "number" then
+            preferCoordinatorFirst = (self:_Now() - self.state._sessionDescriptorAt) <= warmupSec
+        end
+    end
+
+    if type(opts.preferredTarget) == "string" and opts.preferredTarget ~= "" then
+        add(opts.preferredTarget)
     end
 
     if preferCoordinatorFirst then
@@ -282,15 +290,6 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
 
     opts = type(opts) == "table" and opts or {}
 
-    -- Build ordered target list: helpers first, coordinator fallback
-    local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator)
-    if not targets or #targets == 0 then
-        if SF.PrintWarning then
-            SF:PrintWarning("Cannot request missing logs: no targets available")
-        end
-        return false
-    end
-
     -- Cap to avoid spamming
     local maxRanges = tonumber(self.cfg.maxMissingRangesPerNeededLogs) or 8
     local count = 0
@@ -303,6 +302,23 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
             and type(range.fromCounter) == "number"
             and type(range.toCounter) == "number"
         then
+            local exactAuthor = range.exactAuthor == true or opts.exactAuthor == true
+            local preferredTarget = range.preferredTarget or opts.preferredTarget
+            local targetOpts = nil
+            if exactAuthor then
+                targetOpts = {
+                    preferCoordinatorFirst = true,
+                    preferredTarget = preferredTarget,
+                }
+            end
+            local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator, targetOpts)
+            if not targets or #targets == 0 then
+                if SF.PrintWarning then
+                    SF:PrintWarning("Cannot request missing logs: no targets available")
+                end
+                return count > 0
+            end
+
             local requestId = self:NewRequestId()
             local ok = self:RegisterRequest(requestId, "NEED_LOGS", targets[1], {
                 sessionId   = self.state.sessionId,
@@ -314,6 +330,8 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
                 backgroundRepair = opts.backgroundRepair == true,
                 queueAttempts = tonumber(opts.queueAttempts) or 0,
                 reason = reason,
+                exactAuthor = exactAuthor,
+                preferredTarget = preferredTarget,
             })
 
             if ok then
@@ -449,7 +467,7 @@ function Sync:SendJoinStatus()
                 if type(author) == "string"
                     and type(fromCounter) == "number"
                     and type(toCounter) == "number"
-                    and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter)
+                    and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, range.exactAuthor == true)
                 then
                     table.insert(filtered, range)
                 end
@@ -457,7 +475,8 @@ function Sync:SendJoinStatus()
         end
 
         if #filtered > 0 then
-            -- Fetch missing logs (helpers preferred; coordinator fallback via request retry)
+            -- Fetch missing logs (helpers preferred for logical catch-up;
+            -- exact raw-author ranges prefer the advertising coordinator)
             self:RequestMissingLogs(filtered, "join-status")
         end
 
@@ -490,7 +509,6 @@ function Sync:SendJoinStatus()
         if type(pendingMutation) == "table" and pendingMutation.profileId == profileId then
             self.state._pendingMutationAdvertisement = nil
         end
-        return
     end
 
     if integrityRanges and #integrityRanges > 0 then
@@ -514,6 +532,9 @@ function Sync:SendJoinStatus()
         if type(pendingMutation) == "table" and pendingMutation.profileId == profileId then
             self.state._pendingMutationAdvertisement = nil
         end
+    end
+
+    if (missing and #missing > 0) or (integrityRanges and #integrityRanges > 0) then
         return
     end
 

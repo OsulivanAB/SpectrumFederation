@@ -122,6 +122,8 @@ function Sync:_SendAdminLogReq(req, target)
         fromCounter = meta.fromCounter,
         toCounter   = meta.toCounter,
         supportsEnc = meta.supportsEnc,
+        exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
+        integrityRepair = meta.integrityRepair == true or nil,
     }
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.LOG_REQ, payload, "WHISPER", target, "NORMAL")
@@ -179,6 +181,7 @@ function Sync:_SendNeedLogsReq(req, target)
             author      = meta.author,
             fromCounter = meta.fromCounter,
             toCounter   = meta.toCounter,
+            exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
         })
     end
 
@@ -189,6 +192,8 @@ function Sync:_SendNeedLogsReq(req, target)
         profileId       = profileId,
         requestId       = req.id,
         missing         = missing,
+        exactAuthor     = self:_IsExactAuthorRepair(meta) or nil,
+        integrityRepair = meta.integrityRepair == true or nil,
         supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
         supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
         addonVersion    = self:_GetAddonVersion(),
@@ -343,6 +348,7 @@ function Sync:_FailRequest(req, reason)
                 toCounter = req.meta.toCounter,
                 mode = req.meta.integrityRepair == true and "integrity" or "missing",
                 preferredTarget = req.meta.preferredTarget or req.lastTarget,
+                exactAuthor = self:_IsExactAuthorRepair(req.meta),
             }
         }, {
             mode = req.meta.integrityRepair == true and "integrity" or "missing",
@@ -350,6 +356,7 @@ function Sync:_FailRequest(req, reason)
             preferredTarget = req.meta.preferredTarget or req.lastTarget,
             delaySec = self:_ComputeQueuedRepairBackoffSec(nextQueueAttempts),
             queueAttempts = nextQueueAttempts,
+            exactAuthor = self:_IsExactAuthorRepair(req.meta),
         })
 
         if requeued and SF.Debug then

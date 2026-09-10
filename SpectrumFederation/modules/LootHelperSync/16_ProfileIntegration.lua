@@ -292,6 +292,7 @@ function Sync:ComputeWindowMismatchRequests(profileId, remoteSummary, localConti
                                 fromCounter = remoteWindow.fromCounter,
                                 toCounter = reqTo,
                                 mode = "integrity",
+                                exactAuthor = true,
                             }
                         end
                     end
@@ -472,6 +473,63 @@ function Sync:_LogicalContigForAuthor(localContig, author)
     return LogicalContigForAuthor(localContig, author)
 end
 
+-- Exact raw-author repair is a distinct request intent from logical
+-- SameAuthor catch-up. Integrity windows are also per exact `_author`.
+function Sync:_IsExactAuthorRepair(meta)
+    return type(meta) == "table" and (meta.exactAuthor == true or meta.integrityRepair == true)
+end
+
+function Sync:_AuthorMatchesRepairRequest(logAuthor, requestedAuthor, exactAuthor)
+    if type(logAuthor) ~= "string" or logAuthor == "" then
+        return false
+    end
+    if type(requestedAuthor) ~= "string" or requestedAuthor == "" then
+        return false
+    end
+    if exactAuthor == true then
+        return logAuthor == requestedAuthor
+    end
+    return AuthorsMatch(logAuthor, requestedAuthor)
+end
+
+-- Exact-author satisfaction: every requested counter must exist as that
+-- exact `_author` spelling. SameAuthor siblings do not count.
+function Sync:_ExactAuthorRangeSatisfied(profileId, author, fromCounter, toCounter)
+    if type(profileId) ~= "string" or profileId == "" then return false end
+    if type(author) ~= "string" or author == "" then return false end
+
+    fromCounter = tonumber(fromCounter)
+    toCounter = tonumber(toCounter)
+    if not fromCounter or not toCounter then return false end
+    fromCounter = math.max(1, math.floor(fromCounter))
+    toCounter = math.max(fromCounter, math.floor(toCounter))
+
+    local profile = self:FindLocalProfileById(profileId)
+    if not profile then return false end
+
+    local seen = {}
+    for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
+        local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
+        if a == author then
+            local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
+            c = tonumber(c)
+            if c then
+                c = math.floor(c)
+                if c >= fromCounter and c <= toCounter then
+                    seen[c] = true
+                end
+            end
+        end
+    end
+
+    for c = fromCounter, toCounter do
+        if not seen[c] then
+            return false
+        end
+    end
+    return true
+end
+
 -- Function Compute missing log ranges given local authorMax and remote authorMax (or detect gaps).
 -- @param localAuthorMax table Map [author] = maxCounterSeen
 -- @param remoteAuthorMax table Map [author] = maxCounterSeen
@@ -521,6 +579,7 @@ function Sync:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax, localRa
                         author = author,
                         fromCounter = 1,
                         toCounter = remoteMax,
+                        exactAuthor = true,
                     })
                 end
             end
@@ -1112,9 +1171,11 @@ end
 -- @param author string Author name
 -- @param fromCounter number Starting counter of range
 -- @param toCounter number Ending counter of range
+-- @param exactAuthor boolean|nil When true, only an exact raw-author request covers this range
 -- @return boolean True if overlapping request exists, false otherwise
 -- Returns true only if an existing request fully covers [fromCounter, toCounter]
-function Sync:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter)
+-- A logical SameAuthor request must not suppress an exact raw-author repair.
+function Sync:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, exactAuthor)
     if type(self.state) ~= "table" then return false end
     if type(self.state.requests) ~= "table" then return false end
     if type(profileId) ~= "string" or profileId == "" then return false end
@@ -1123,6 +1184,8 @@ function Sync:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toC
     fromCounter = tonumber(fromCounter)
     toCounter = tonumber(toCounter)
     if not fromCounter or not toCounter then return false end
+
+    local neededExact = exactAuthor == true
 
     for _, req in pairs(self.state.requests) do
         if type(req) == "table" and type(req.meta) == "table" then
@@ -1134,7 +1197,10 @@ function Sync:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toC
                     if f and t then
                         -- Suppress only if existing request fully covers new desired range
                         if f <= fromCounter and t >= toCounter then
-                            return true
+                            local outstandingExact = self:_IsExactAuthorRepair(m)
+                            if (not neededExact) or outstandingExact then
+                                return true
+                            end
                         end
                     end
                 end
@@ -1173,6 +1239,8 @@ function Sync:_SendLogReq(req, target)
         fromCounter = meta.fromCounter,
         toCounter   = meta.toCounter,
         supportsEnc = meta.supportsEnc,
+        exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
+        integrityRepair = meta.integrityRepair == true or nil,
     }
 
     return SF.LootHelperComm:Send(
@@ -1289,7 +1357,7 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
             and type(range.toCounter) == "number"
             and range.fromCounter >= 1
             and range.toCounter >= 1
-            and not self:_HasOutstandingLogRangeRequest(profileId, range.author, range.fromCounter, range.toCounter)
+            and not self:_HasOutstandingLogRangeRequest(profileId, range.author, range.fromCounter, range.toCounter, true)
         then
             local fallback = {}
             for i = 2, #targets do
@@ -1307,6 +1375,7 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
                 supportsEnc = supportsEnc,
                 targets = fallback,
                 integrityRepair = true,
+                exactAuthor = true,
                 reason = reason,
                 preferredTarget = preferredTarget,
                 backgroundRepair = opts.backgroundRepair == true,
