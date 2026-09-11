@@ -104,6 +104,7 @@ local ITEM_META = {
     ["19020"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 0 },
     ["19021"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 13 },
     ["19022"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 4 },
+    ["19023"] = { loc = "INVTYPE_WEAPONMAINHAND", class = 2, sub = 7 },
 }
 
 function GetItemInfoInstant(link)
@@ -2405,6 +2406,265 @@ assertEq(linkedTrinket:GetIdentityBisSlots(ALT_A).Trinket1.legacyOriginLogId, zu
 assertTrue(ownerTrinket:GetID() ~= zuluTrinket:GetID(), "the two trinket origins remain distinct")
 end
 finalPassTests()
+
+local function reviewFindingTests()
+    local function lastOutcome(profile, awardKey)
+        local last
+        for _, log in ipairs(profile:GetLootLogs()) do
+            local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+            if data and (not awardKey or data.awardKey == awardKey) then
+                last = data
+            end
+        end
+        return last
+    end
+
+    local function occupancy(profile, memberId)
+        return SF.LootHelperBis.LiveOccupancyFromProjection(profile:GetIdentityProjection(), memberId)
+    end
+
+    local function snapshotRoundTrip(source, name)
+        local snap = source:ExportSnapshot()
+        resetEnv()
+        local restored = makeProfile(name)
+        restored._profileId = snap.meta._profileId
+        assertTrue((select(1, restored:ImportSnapshot(snap))), name .. " imports snapshot")
+        return restored
+    end
+
+    local function packFamily(opts)
+        resetEnv()
+        local p = makeProfile(opts.name)
+        addMember(p, ALT_A)
+        addLog(p, "ARMOR_CHANGE", { member = ALT_A, slot = opts.usedSlot, action = "USED" })
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(p, ALT_A, opts.usedSlot), "LEGACY_UNKNOWN", opts.usedSlot .. " starts legacy-consumed")
+        assertEq(slotState(p, ALT_A, opts.freeSlot), "AVAILABLE", opts.freeSlot .. " starts available")
+        assertTrue(p:AddRCLootCouncilBisResponse("Need"))
+        local first = makeCanonical(ALT_A, opts.itemId, "Need", opts.stamp1)
+        assertTrue(p:TryAddRCLootCouncilAward(first))
+        local decided = lastOutcome(p, first.awardKey)
+        assertTrue(decided ~= nil, opts.family .. " first award wrote an outcome")
+        assertEq(decided.outcome, "ASSIGNED", opts.family .. " first award is assigned")
+        assertEq(decided.assignedSlots and decided.assignedSlots[1], opts.freeSlot, "frozen decision chooses the free " .. opts.family)
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(p, ALT_A, opts.usedSlot), "LEGACY_UNKNOWN", "legacy " .. opts.usedSlot .. " stays consumed after packing")
+        assertEq(slotState(p, ALT_A, opts.freeSlot), "ASSIGNED_AUTO", "new " .. opts.family .. " occupies the free slot")
+        local occ = occupancy(p, ALT_A)
+        assertTrue(occ[opts.usedSlot] == true, "live occupancy keeps legacy " .. opts.usedSlot)
+        assertTrue(occ[opts.freeSlot] == true, "live occupancy marks packed " .. opts.freeSlot)
+        local second = makeCanonical(ALT_A, opts.itemId, "Need", opts.stamp2)
+        assertTrue(p:TryAddRCLootCouncilAward(second))
+        local overflow = lastOutcome(p, second.awardKey)
+        assertEq(overflow.outcome, "OVERFLOW", "subsequent " .. opts.family .. " overflows both opportunities")
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(p, ALT_A, opts.usedSlot), "LEGACY_UNKNOWN", "overflow does not backfill legacy " .. opts.usedSlot)
+        assertEq(slotState(p, ALT_A, opts.freeSlot), "ASSIGNED_AUTO", "overflow does not move the packed " .. opts.family)
+        local restored = snapshotRoundTrip(p, opts.name .. "Snap")
+        assertEq(slotState(restored, ALT_A, opts.usedSlot), "LEGACY_UNKNOWN", "snapshot keeps legacy " .. opts.usedSlot)
+        assertEq(slotState(restored, ALT_A, opts.freeSlot), "ASSIGNED_AUTO", "snapshot keeps packed " .. opts.freeSlot)
+        local third = makeCanonical(ALT_A, opts.itemId, "Need", opts.stamp3)
+        assertTrue(restored:TryAddRCLootCouncilAward(third))
+        assertEq(lastOutcome(restored, third.awardKey).outcome, "OVERFLOW", "rebuild still overflows a third " .. opts.family)
+    end
+
+    packFamily({
+        name = "LegacyRingPack",
+        family = "ring",
+        usedSlot = "Ring1",
+        freeSlot = "Ring2",
+        itemId = 19002,
+        stamp1 = "1700031000",
+        stamp2 = "1700031001",
+        stamp3 = "1700031002",
+    })
+    packFamily({
+        name = "LegacyTrinketPack",
+        family = "trinket",
+        usedSlot = "Trinket1",
+        freeSlot = "Trinket2",
+        itemId = 19003,
+        stamp1 = "1700031100",
+        stamp2 = "1700031101",
+        stamp3 = "1700031102",
+    })
+
+    resetEnv()
+    local emptyRings = makeProfile("EmptyRings")
+    addMember(emptyRings, ALT_A)
+    assertTrue(emptyRings:AddRCLootCouncilBisResponse("Need"))
+    assertTrue(emptyRings:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700031200")))
+    assertTrue(emptyRings:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700031201")))
+    emptyRings:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(emptyRings, ALT_A, "Ring1"), "ASSIGNED_AUTO", "first empty ring occupies Ring1")
+    assertEq(slotState(emptyRings, ALT_A, "Ring2"), "ASSIGNED_AUTO", "second empty ring occupies Ring2")
+    assertTrue(emptyRings:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700031202")))
+    assertEq(lastOutcome(emptyRings).outcome, "OVERFLOW", "third empty ring overflows")
+
+    local function notBisEquipmentFallback()
+        local function makeBtn(slotKey)
+            local overlay = {}
+            function overlay:Show()
+                self.shown = true
+            end
+            function overlay:Hide()
+                self.shown = false
+            end
+            local icon = { texture = "default" }
+            function icon:SetTexture(tex)
+                self.texture = tex
+            end
+            function icon:GetTexture()
+                return self.texture
+            end
+            function icon:SetDesaturated()
+            end
+            function icon:SetVertexColor()
+            end
+            local btn = {
+                slotKey = slotKey,
+                defaultTexture = "default",
+                scripts = {},
+                Icon = icon,
+                UsedOverlay = overlay,
+            }
+            function btn:SetScript(ev, fn)
+                self.scripts[ev] = fn
+            end
+            function btn:GetScript(ev)
+                return self.scripts[ev]
+            end
+            function btn:EnableMouse(v)
+                self.mouse = v and true or false
+            end
+            return btn
+        end
+
+        loadModule("SpectrumFederation/modules/UI/LootHelper/EquipmentWindow.lua")
+        local EW = SF.LootHelperWindow.EquipmentWindow
+        local head = makeBtn("Head")
+        EW._frame = { Content = { SlotButtons = { head } } }
+        EW._canAdmin = true
+
+        local function countArmor(profile, slot)
+            local n = 0
+            for _, log in ipairs(profile:GetLootLogs()) do
+                local data = log:GetEventType() == "ARMOR_CHANGE" and log:GetEventData()
+                if data and data.slot == slot then
+                    n = n + 1
+                end
+            end
+            return n
+        end
+
+        local function wire(profile)
+            profile:ApplyIdentityProjection({ force = true })
+            EW._profile = profile
+            EW._memberObj = profile:getMemberByID(ALT_A)
+            EW._rowModel = { memberId = ALT_A }
+            EW:Refresh()
+        end
+
+        resetEnv()
+        local p = makeProfile("NotBisFallback")
+        addMember(p, ALT_A)
+        assertTrue(p:ApplyRCLootCouncilIntegrationConfig({
+            recordAwards = true,
+            recordAllAwardTypes = false,
+            allowedResponses = { "Need" },
+            bisResponses = {},
+        }, { skipPermission = true, skipSync = true }), "record awards with no BiS responses")
+        wire(p)
+        assertFalse(p:IsItemAwareEquipmentPopup(), "no BiS config keeps the manual popup")
+        assertTrue(head.scripts.OnClick ~= nil, "manual equipment OnClick is wired before awards")
+        assertTrue(countArmor(p, "Head") == 0, "Head starts with no armor logs")
+        head.scripts.OnClick()
+        assertEq(countArmor(p, "Head"), 1, "manual Head toggle writes ARMOR_CHANGE")
+
+        local award = makeCanonical(ALT_A, 19001, "Need", "1700032000")
+        assertTrue(p:TryAddRCLootCouncilAward(award), "ordinary non-BiS award records")
+        local outcome = lastOutcome(p, award.awardKey)
+        assertEq(outcome.outcome, "NOT_BIS", "ordinary award is NOT_BIS")
+        wire(p)
+        assertFalse(p:IsItemAwareEquipmentPopup(), "NOT_BIS history does not make the popup item-aware")
+        assertTrue(head.scripts.OnClick ~= nil, "manual equipment OnClick survives NOT_BIS history")
+        if head.scripts.OnClick then
+            head.scripts.OnClick()
+            assertEq(countArmor(p, "Head"), 2, "manual Head toggle still works after NOT_BIS")
+        end
+
+        assertTrue(p:SetRCLootCouncilRecordAwards(false))
+        wire(p)
+        assertFalse(p:IsItemAwareEquipmentPopup(), "recording off after NOT_BIS still uses the manual fallback")
+        assertTrue(head.scripts.OnClick ~= nil, "manual equipment OnClick survives recording off")
+        if head.scripts.OnClick then
+            head.scripts.OnClick()
+            assertEq(countArmor(p, "Head"), 3, "manual Head toggle still works after recording off")
+        end
+    end
+    notBisEquipmentFallback()
+
+    local function mainHandOnlyOffHand()
+        resetEnv()
+        local mhLink = itemLink(19023, "MainHand")
+        local classif = SF.LootHelperBis.ClassifyItem(mhLink)
+        assertEq(classif.equipLoc, "INVTYPE_WEAPONMAINHAND", "fixture is MAINHAND-only")
+        local fury = 72
+        local slots, err = SF.LootHelperBis.WeaponAssignSlots(classif, fury, { Weapon = true, OffHand = false })
+        assertTrue(err == nil, "MAINHAND assign does not fail closed")
+        assertEq(slots and #slots or -1, 0, "MAINHAND does not take OffHand when Weapon is occupied")
+        assertFalse(select(1, SF.LootHelperBis.ItemFitsSlots(classif, { "OffHand" }, fury)), "MAINHAND does not fit OffHand")
+        assertTrue(select(1, SF.LootHelperBis.ItemFitsSlots(classif, { "Weapon" }, fury)), "MAINHAND still fits Weapon")
+        local compatible = SF.LootHelperBis.CompatibleSlotsForItem(classif, fury)
+        assertEq(#compatible, 1, "MAINHAND has one compatible slot")
+        assertEq(compatible[1], "Weapon", "MAINHAND compatible loot is Weapon only")
+
+        local generic = SF.LootHelperBis.ClassifyItem(itemLink(19005, "OneHand"))
+        local genericSlots = SF.LootHelperBis.WeaponAssignSlots(generic, fury, { Weapon = true, OffHand = false })
+        assertEq(genericSlots and genericSlots[1], "OffHand", "generic INVTYPE_WEAPON still dual-wields into OffHand")
+
+        resetEnv()
+        local p = makeProfile("MainHandOH")
+        addMember(p, ALT_A)
+        assertTrue(p:SetMemberSpec(ALT_A, fury))
+        assertTrue(p:AddRCLootCouncilBisResponse("Need"))
+        assertTrue(p:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700033000")))
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(p, ALT_A, "Weapon"), "ASSIGNED_AUTO", "first generic 1H occupies Weapon")
+        local mhCanon = makeCanonical(ALT_A, 19023, "Need", "1700033001")
+        assertTrue(p:TryAddRCLootCouncilAward(mhCanon))
+        local mhOutcome = lastOutcome(p, mhCanon.awardKey)
+        assertTrue(mhOutcome.outcome == "OVERFLOW" or mhOutcome.outcome == "UNRESOLVED", "MAINHAND does not assign OffHand")
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(p, ALT_A, "OffHand"), "AVAILABLE", "OffHand stays free after MAINHAND-only award")
+        local options = p:GetGearOverrideCompatibleAwards(ALT_A, "OffHand")
+        local sawMainHand = false
+        for i = 1, #options do
+            if tostring(options[i].itemString or ""):find("item:19023", 1, true) then
+                sawMainHand = true
+            end
+        end
+        assertFalse(sawMainHand, "Gear Override OffHand options omit MAINHAND-only items")
+        assertFalse(p:ApplyBisOverride("ASSIGN", {
+            viewMember = ALT_A,
+            awardRef = { kind = "RC", id = mhCanon.awardKey },
+            assignedSlots = { "OffHand" },
+            slotBinding = "BOUND",
+        }), "Gear Override cannot place MAINHAND on OffHand")
+
+        resetEnv()
+        local dual = makeProfile("GenericDW")
+        addMember(dual, ALT_A)
+        assertTrue(dual:SetMemberSpec(ALT_A, fury))
+        assertTrue(dual:AddRCLootCouncilBisResponse("Need"))
+        assertTrue(dual:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700033100")))
+        assertTrue(dual:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700033101")))
+        dual:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(dual, ALT_A, "OffHand"), "ASSIGNED_AUTO", "generic INVTYPE_WEAPON still occupies OffHand")
+    end
+    mainHandOnlyOffHand()
+end
+reviewFindingTests()
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

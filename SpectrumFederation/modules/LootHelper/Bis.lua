@@ -444,11 +444,11 @@ function Bis.WeaponAssignSlots(classif, specId, occupancy)
         return {}, nil
     end
 
-    -- 1H / MH
+    -- 1H / MH. INVTYPE_WEAPONMAINHAND is Weapon-only even when the spec dual-wields.
     if weaponFree then
         return { "Weapon" }, nil
     end
-    if flags.canDualWield1H and offFree then
+    if classif.equipLoc ~= "INVTYPE_WEAPONMAINHAND" and flags.canDualWield1H and offFree then
         return { "OffHand" }, nil
     end
     return {}, nil
@@ -586,7 +586,7 @@ function Bis.ItemFitsSlots(classif, slots, specId)
         if slots[1] == "Weapon" then
             return true, nil
         end
-        if slots[1] == "OffHand" and flags.canDualWield1H then
+        if slots[1] == "OffHand" and flags.canDualWield1H and classif.equipLoc ~= "INVTYPE_WEAPONMAINHAND" then
             return true, nil
         end
         return false, "INCOMPATIBLE_SLOT"
@@ -788,13 +788,49 @@ local function PlaceBoundOnBoard(board, assignment, index)
     assignment._pending = true
 end
 
-local function PackPending(board, pending)
+local function OriginBelongsToComponent(rec, componentSet)
+    if type(rec) ~= "table" or type(componentSet) ~= "table" then
+        return false
+    end
+    if rec.kind == "local" and rec.member and componentSet[rec.member] then
+        return true
+    end
+    if rec.kind == "identity" then
+        return ScopeFullyPresent(SortedCopy(rec.identityMembers), componentSet)
+    end
+    return rec.member and componentSet[rec.member] == true
+end
+
+-- Reserve ring/trinket cells occupied by non-overflow legacy usage so PACKABLE
+-- assignments cannot pack into a hole that live occupancy still consumes.
+local function ReservedFamilyIndices(state, memberIds, family)
+    local indexOf = family == "ring" and RING_INDEX or TRINKET_INDEX
+    local reserved = {}
+    local origins = state and state.occupancyOrigins
+    if type(origins) ~= "table" then
+        return reserved
+    end
+    local componentSet = ListSet(SortedCopy(memberIds))
+    for _, rec in pairs(origins) do
+        if type(rec) == "table" and rec.isOverflow ~= true and OriginBelongsToComponent(rec, componentSet) then
+            local slot = rec.slot
+            local idx = slot and indexOf[slot]
+            if idx then
+                reserved[idx] = true
+            end
+        end
+    end
+    return reserved
+end
+
+local function PackPending(board, pending, reserved)
+    reserved = reserved or {}
     table.sort(pending, AssignmentCausal)
     for i = 1, #pending do
         local asg = pending[i]
-        if board.cells[1] == nil then
+        if board.cells[1] == nil and not reserved[1] then
             board.cells[1] = asg
-        elseif board.cells[2] == nil then
+        elseif board.cells[2] == nil and not reserved[2] then
             board.cells[2] = asg
         else
             board.overflow[#board.overflow + 1] = asg
@@ -802,7 +838,7 @@ local function PackPending(board, pending)
     end
 end
 
-local function ProjectScopeFamily(assignments, family)
+local function ProjectScopeFamily(assignments, family, reserved)
     local board = NewFamilyBoard()
     local pending = {}
     local names = family == "ring" and RING_SLOTS or TRINKET_SLOTS
@@ -828,12 +864,12 @@ local function ProjectScopeFamily(assignments, family)
             pending[#pending + 1] = asg
         end
     end
-    PackPending(board, pending)
+    PackPending(board, pending, reserved)
     board.slotNames = names
     return board
 end
 
-local function MergeFamilyBoards(dst, src)
+local function MergeFamilyBoards(dst, src, reserved)
     local pending = {}
     local srcCells = {}
     if src.cells[1] then
@@ -857,7 +893,7 @@ local function MergeFamilyBoards(dst, src)
     for i = 1, #(src.overflow or {}) do
         pending[#pending + 1] = src.overflow[i]
     end
-    PackPending(dst, pending)
+    PackPending(dst, pending, reserved)
 end
 
 local function ProjectOrdinarySlot(assignments)
@@ -936,6 +972,8 @@ function Bis.ProjectComponent(state, memberIds)
     local ordinaryOverflow = {}
     local weaponOccupants = {}
     local weaponOverflow = {}
+    local reservedRing = ReservedFamilyIndices(state, memberIds, "ring")
+    local reservedTrinket = ReservedFamilyIndices(state, memberIds, "trinket")
 
     for gi = 1, #groupOrder do
         local group = grouped[groupOrder[gi]]
@@ -953,8 +991,8 @@ function Bis.ProjectComponent(state, memberIds)
                 byFamily.ordinary[#byFamily.ordinary + 1] = asg
             end
         end
-        MergeFamilyBoards(ringMerged, ProjectScopeFamily(byFamily.ring, "ring"))
-        MergeFamilyBoards(trinketMerged, ProjectScopeFamily(byFamily.trinket, "trinket"))
+        MergeFamilyBoards(ringMerged, ProjectScopeFamily(byFamily.ring, "ring", reservedRing), reservedRing)
+        MergeFamilyBoards(trinketMerged, ProjectScopeFamily(byFamily.trinket, "trinket", reservedTrinket), reservedTrinket)
         for i = 1, #byFamily.ordinary do
             local asg = byFamily.ordinary[i]
             local slot = asg.assignedSlots[1]
@@ -1366,9 +1404,14 @@ function Bis.ApplyLog(state, log, ctx)
     local logId = GetLogId(log)
     local rank = ctx.rank or 0
     state.rank[logId] = rank
-    if eventType == types.BIS_OUTCOME or eventType == types.BIS_OVERRIDE
+    if eventType == types.BIS_OVERRIDE
         or eventType == types.MANUAL_AWARD or eventType == types.MANUAL_AWARD_REVERSE then
         state.hasItemAwareEvents = true
+    elseif eventType == types.BIS_OUTCOME then
+        local outcome = data and data.outcome
+        if outcome and outcome ~= Bis.OUTCOME.NOT_BIS then
+            state.hasItemAwareEvents = true
+        end
     end
 
     local function componentOf(memberId)
