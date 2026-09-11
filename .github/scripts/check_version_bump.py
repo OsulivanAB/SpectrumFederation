@@ -144,7 +144,7 @@ def get_base_version(addon_name, base_ref, commit=None):
     return version
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Check if addon version was bumped"
     )
@@ -162,7 +162,7 @@ def main():
         help="Compare against this commit's TOC instead of origin/<base_ref>",
     )
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     
     print("[check-version-bump] Checking addon version bump...")
     
