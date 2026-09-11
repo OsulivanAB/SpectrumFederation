@@ -544,6 +544,9 @@ function Sync:OnGroupRosterUpdate()
         helpers     = self.state.helpers or {},
         safeMode    = self:_GetSessionSafeModePayload(),
     }
+    if self._AttachRCConfigGeneration then
+        self:_AttachRCConfigGeneration(payload, profileId)
+    end
 
     -- Find targets who are in-group but haven't been announced to for this sessionId
     local targets = {}
@@ -969,6 +972,9 @@ function Sync:ReannounceSession()
         helpers     = self.state.helpers or {},
         safeMode    = self:_GetSessionSafeModePayload(),
     }
+    if self._AttachRCConfigGeneration then
+        self:_AttachRCConfigGeneration(payload, profileId)
+    end
 
     if SF.Debug then
         local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0

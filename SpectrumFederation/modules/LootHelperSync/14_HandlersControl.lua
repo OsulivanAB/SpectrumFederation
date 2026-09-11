@@ -283,6 +283,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     end
     self.state.authorWindowSummary = (type(payload.authorWindowSummary) == "table") and payload.authorWindowSummary or {}
     self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
+    if self._RememberAdvertisedRCConfigGeneration then
+        self:_RememberAdvertisedRCConfigGeneration(payload)
+    end
 
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
@@ -442,6 +445,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     if type(payload.authorWindowSummary) == "table" then
         self.state.authorWindowSummary = payload.authorWindowSummary
     end
+    if self._RememberAdvertisedRCConfigGeneration then
+        self:_RememberAdvertisedRCConfigGeneration(payload)
+    end
 
     -- Heartbeat bookkeeping
     self.state.heartbeat = self.state.heartbeat or {}
@@ -542,6 +548,10 @@ function Sync:HandleSessionHeartbeat(sender, payload)
                     reason = "heartbeat-integrity",
                     preferredTarget = sender,
                 })
+            end
+
+            if self._CatchUpRCConfigIfNeeded then
+                self:_CatchUpRCConfigIfNeeded(profile, "heartbeat-rc-config")
             end
         end
     end

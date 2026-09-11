@@ -588,6 +588,9 @@ function Sync:BroadcastSessionStart()
         helpers     = chosenHelpers,  -- Broadcast includes helpers for members to know about
         safeMode    = self:_GetSessionSafeModePayload(),
     }
+    if self._AttachRCConfigGeneration then
+        self:_AttachRCConfigGeneration(payload, profileId)
+    end
 
     if SF.Debug then
         local helpersCount = type(chosenHelpers) == "table" and #chosenHelpers or 0

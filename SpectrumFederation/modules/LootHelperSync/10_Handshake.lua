@@ -54,6 +54,9 @@ function Sync:BroadcastSessionHeartbeat()
         sentAt      = self:_Now(),
         safeMode    = self:_GetSessionSafeModePayload(),
     }
+    if self._AttachRCConfigGeneration then
+        self:_AttachRCConfigGeneration(payload, profileId)
+    end
 
     local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, "NORMAL")
     

@@ -316,6 +316,70 @@ function Sync:BuildProfileSnapshot(profileId)
     }
 end
 
+-- Advertise accepted RC generation on session descriptors so a log-complete
+-- reconnect can detect a missed RC_CONFIG_SET without inventing a config log.
+function Sync:_AttachRCConfigGeneration(payload, profileId)
+    if type(payload) ~= "table" then
+        return payload
+    end
+    local profile = nil
+    if type(profileId) == "string" and profileId ~= "" and self.FindLocalProfileById then
+        profile = self:FindLocalProfileById(profileId)
+    end
+    local seq = tonumber(self.state and self.state.rcConfigSeq)
+    if seq == nil and profile then
+        seq = tonumber(profile._rcConfigSeq)
+    end
+    local epoch = profile and tonumber(profile._rcConfigEpoch) or nil
+    if epoch == nil then
+        epoch = tonumber(self.state and self.state.coordEpoch)
+    end
+    payload.rcConfigSeq = math.floor(tonumber(seq) or 0)
+    payload.rcConfigEpoch = math.floor(tonumber(epoch) or 0)
+    return payload
+end
+
+function Sync:_RememberAdvertisedRCConfigGeneration(payload)
+    if type(payload) ~= "table" then
+        return
+    end
+    if type(payload.rcConfigSeq) == "number" then
+        self.state.advertisedRcConfigSeq = math.floor(payload.rcConfigSeq)
+    end
+    if type(payload.rcConfigEpoch) == "number" then
+        self.state.advertisedRcConfigEpoch = math.floor(payload.rcConfigEpoch)
+    end
+end
+
+function Sync:_NeedsRCConfigCatchUp(profile)
+    if not profile then
+        return false
+    end
+    local advSeq = tonumber(self.state and self.state.advertisedRcConfigSeq)
+    local advEpoch = tonumber(self.state and self.state.advertisedRcConfigEpoch)
+    if advSeq == nil and advEpoch == nil then
+        return false
+    end
+    local LootProfile = SF.LootProfile
+    if not (LootProfile and LootProfile.IsNewerRCConfigGeneration) then
+        return false
+    end
+    local localSeq = tonumber(profile._rcConfigSeq) or 0
+    local localEpoch = tonumber(profile._rcConfigEpoch) or 0
+    return LootProfile.IsNewerRCConfigGeneration(advEpoch or 0, advSeq or 0, localEpoch, localSeq)
+end
+
+function Sync:_CatchUpRCConfigIfNeeded(profile, reason)
+    if not self:_NeedsRCConfigCatchUp(profile) then
+        return false
+    end
+    self.state._profileReqInFlight = nil
+    if self.RequestProfileSnapshot then
+        self:RequestProfileSnapshot(reason or "rc-config-catchup")
+    end
+    return true
+end
+
 -- Push the current profile snapshot to session peers.
 -- Full snapshots are coordinator/helper trust-boundary traffic (NEED_PROFILE).
 -- Live RC integration edits use PublishRCIntegrationConfig instead.

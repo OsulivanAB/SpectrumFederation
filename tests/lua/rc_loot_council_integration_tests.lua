@@ -2135,6 +2135,246 @@ local function testAcceptedVsPendingAndTakeover()
 end
 testAcceptedVsPendingAndTakeover()
 
+local function testExistingProfileReconnectCatchesUpRCConfig()
+    loadModule("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
+
+    local function captureComm()
+        local captured = {}
+        SF.LootHelperComm = {
+            Send = function(_, channel, msgType, payload, dist, target)
+                captured[#captured + 1] = {
+                    channel = channel,
+                    msgType = msgType,
+                    payload = payload,
+                    dist = dist,
+                    target = target,
+                }
+                return true
+            end,
+        }
+        return captured
+    end
+
+    local function lastOfType(captured, msgType)
+        local found
+        for i = 1, #captured do
+            if captured[i].msgType == msgType then
+                found = captured[i]
+            end
+        end
+        return found
+    end
+
+    local function greedMeta()
+        return { typeCode = "default", responseId = 2, isAwardReason = false }
+    end
+
+    function Sync:NewRequestId()
+        return "REQ-RC-CATCHUP"
+    end
+    function Sync:GetPeer(nameRealm)
+        self.state.peers = self.state.peers or {}
+        local peer = self.state.peers[nameRealm]
+        if not peer then
+            peer = { name = nameRealm, inGroup = true }
+            self.state.peers[nameRealm] = peer
+        end
+        peer.inGroup = true
+        return peer
+    end
+    function Sync:_ApplySessionSafeModeFromPayload()
+    end
+    function Sync:EnsureHeartbeatMonitor()
+        return false
+    end
+    function Sync:SetPeerSyncState()
+    end
+    function Sync:RegisterRequest(requestId, kind, target, meta)
+        self.state.requests = self.state.requests or {}
+        self.state.requests[requestId] = { id = requestId, kind = kind, target = target, meta = meta }
+        if kind == "NEED_PROFILE" and SF.LootHelperComm then
+            SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, {
+                sessionId = self.state.sessionId,
+                profileId = self.state.profileId,
+                requestId = requestId,
+            }, "WHISPER", target, "NORMAL")
+        end
+        return true
+    end
+
+    local function settleSnapshot(coordProfile, follower, captured)
+        local need = lastOfType(captured, Sync.MSG.NEED_PROFILE)
+        assertTrue(need ~= nil, "join/catch-up requested NEED_PROFILE without a manual SET")
+        if not need then
+            return
+        end
+        assertTrue(need.payload.statusOnly ~= true, "catch-up NEED_PROFILE asks for a trusted snapshot")
+        local served
+        withLocalProfile(coordProfile, function()
+            Sync.state.isCoordinator = true
+            Sync.state.coordinator = "Tester-Garona"
+            local before = #captured
+            Sync:HandleNeedProfile(ADMIN_B, need.payload)
+            served = captured[#captured]
+            assertTrue(#captured > before, "coordinator served a snapshot for NEED_PROFILE")
+        end)
+        assertEq(served.msgType, Sync.MSG.PROFILE_SNAPSHOT, "trusted catch-up is PROFILE_SNAPSHOT")
+        PLAYER = ADMIN_B
+        withLocalProfile(follower, function()
+            Sync.state.isCoordinator = false
+            Sync.state.coordinator = "Tester-Garona"
+            Sync:HandleProfileSnapshot("Tester-Garona", served.payload)
+        end)
+        PLAYER = "Tester-Garona"
+    end
+
+    resetEnv()
+    local coord = makeProfile("RC Reconnect Coord")
+    addMember(coord, WINNER)
+    addMember(coord, ADMIN_B)
+    assertTrue(coord:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Admin B shares the profile")
+    assertTrue(coord:ApplyRCLootCouncilIntegrationConfig({
+        recordAwards = true,
+        recordAllAwardTypes = false,
+        allowedResponses = { "Need" },
+        bisResponses = {
+            { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+        },
+    }, { skipPermission = true, skipSync = true }), "shared accepted config excludes Greed")
+    setActive(coord)
+    startSessionOn(coord)
+    Sync.state.coordinator = PLAYER
+    Sync.state.isCoordinator = true
+    Sync.state.coordEpoch = 1
+    coord._rcConfigSeq = 1
+    coord._rcConfigEpoch = 1
+    Sync.state.rcConfigSeq = 1
+    local follower = cloneProfileAs("RC Reconnect B", coord)
+    assertEq(follower._rcConfigSeq, 1, "Admin B starts at accepted seq 1")
+    assertFalse(follower:IsBisQualifyingResponse("Greed", greedMeta()), "Admin B starts without Greed as BiS")
+
+    local captured = captureComm()
+    assertTrue(coord:AddRCLootCouncilBisResponse({
+        text = "Greed",
+        typeCode = "default",
+        responseId = 2,
+        isAwardReason = false,
+    }), "coordinator accepts Greed as BiS")
+    local setMsg = lastOfType(captured, Sync.MSG.RC_CONFIG_SET)
+    assertTrue(setMsg ~= nil, "coordinator published the next SET")
+    assertTrue(coord:IsBisQualifyingResponse("Greed", greedMeta()), "coordinator accepted Greed")
+    assertFalse(follower:IsBisQualifyingResponse("Greed", greedMeta()), "Admin B missed the SET")
+    assertEq(follower._rcConfigSeq, 1, "Admin B still has the previous accepted seq")
+
+    captured = captureComm()
+    Sync.state.isCoordinator = true
+    Sync:BroadcastSessionHeartbeat()
+    local heartbeat = lastOfType(captured, Sync.MSG.SES_HEARTBEAT)
+    assertTrue(heartbeat ~= nil, "coordinator heartbeat was sent")
+    Sync:ReannounceSession()
+    local reannounce = lastOfType(captured, Sync.MSG.SES_REANNOUNCE)
+    if not reannounce then
+        reannounce = {
+            payload = heartbeat.payload,
+        }
+    end
+
+    PLAYER = ADMIN_B
+    captured = captureComm()
+    withLocalProfile(follower, function()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.isCoordinator = false
+        Sync.state.coordEpoch = 1
+        Sync.state._sentJoinStatusForSessionId = Sync.state.sessionId
+        Sync.state._sentJoinStatusType = "HAVE_PROFILE"
+        Sync.state._profileReqInFlight = nil
+        Sync.state.heartbeat = { lastCatchupAt = nil }
+        Sync:HandleSessionReannounce("Tester-Garona", reannounce.payload)
+        Sync:SendJoinStatus()
+    end)
+    settleSnapshot(coord, follower, captured)
+    assertTrue(follower:IsBisQualifyingResponse("Greed", greedMeta()), "reannounce/join catch-up applies coordinator-accepted Greed")
+    assertEq(follower._rcConfigSeq, coord._rcConfigSeq, "follower accepted seq matches coordinator after join catch-up")
+
+    resetEnv()
+    coord = makeProfile("RC Heartbeat Catchup")
+    addMember(coord, WINNER)
+    addMember(coord, ADMIN_B)
+    assertTrue(coord:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "heartbeat catch-up Admin B shares the profile")
+    assertTrue(coord:ApplyRCLootCouncilIntegrationConfig({
+        recordAwards = true,
+        recordAllAwardTypes = false,
+        allowedResponses = { "Need" },
+        bisResponses = {
+            { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+        },
+    }, { skipPermission = true, skipSync = true }), "heartbeat catch-up seeds Need-only config")
+    setActive(coord)
+    startSessionOn(coord)
+    Sync.state.coordinator = PLAYER
+    Sync.state.isCoordinator = true
+    Sync.state.coordEpoch = 1
+    coord._rcConfigSeq = 1
+    coord._rcConfigEpoch = 1
+    Sync.state.rcConfigSeq = 1
+    follower = cloneProfileAs("RC Heartbeat B", coord)
+    captured = captureComm()
+    assertTrue(coord:AddRCLootCouncilBisResponse({
+        text = "Greed",
+        typeCode = "default",
+        responseId = 2,
+        isAwardReason = false,
+    }), "heartbeat-path coordinator accepts Greed as BiS")
+    captured = captureComm()
+    Sync:BroadcastSessionHeartbeat()
+    heartbeat = lastOfType(captured, Sync.MSG.SES_HEARTBEAT)
+    assertTrue(heartbeat ~= nil, "heartbeat advertises session state")
+
+    PLAYER = ADMIN_B
+    captured = captureComm()
+    withLocalProfile(follower, function()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.isCoordinator = false
+        Sync.state.coordEpoch = 1
+        Sync.state._sentJoinStatusForSessionId = Sync.state.sessionId
+        Sync.state._sentJoinStatusType = "HAVE_PROFILE"
+        Sync.state._profileReqInFlight = nil
+        Sync.state.heartbeat = { lastCatchupAt = nil }
+        Sync:HandleSessionHeartbeat("Tester-Garona", heartbeat.payload)
+    end)
+    settleSnapshot(coord, follower, captured)
+    assertTrue(follower:IsBisQualifyingResponse("Greed", greedMeta()), "heartbeat catch-up applies coordinator-accepted Greed")
+    assertTrue(follower:GetProposedRCLootCouncilIntegrationConfig() == nil, "catch-up writes accepted config, not a pending proposal")
+
+    local greedCanon = SF.LootLog.BuildRCLootCouncilCanonical("Tester-Garona", WINNER, {
+        lootWon = ITEM_LINK,
+        response = "Greed",
+        id = "1700000912-1",
+        owner = WINNER,
+        responseID = 2,
+        isAwardReason = false,
+    })
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[follower:GetProfileId()] = follower
+    SF.lootHelperDB.activeProfileId = follower:GetProfileId()
+    SF.lootHelperDB.activeProfile = follower
+    assertTrue(follower:TryAddRCLootCouncilAward(greedCanon), "Admin B records a Greed award after catch-up")
+    local qualified
+    local outcome
+    for _, log in ipairs(follower:GetLootLogs() or {}) do
+        local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+        if data and data.awardKey == greedCanon.awardKey then
+            qualified = data.qualified
+            outcome = data.outcome
+        end
+    end
+    assertEq(qualified, true, "Greed is qualified BiS on Admin B after reconnect catch-up")
+    assertTrue(outcome ~= "NOT_BIS", "caught-up Greed is not recorded as NOT_BIS")
+    PLAYER = "Tester-Garona"
+    SF.LootHelperComm = nil
+end
+testExistingProfileReconnectCatchesUpRCConfig()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
