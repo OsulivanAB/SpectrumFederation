@@ -184,13 +184,19 @@ function SectionMixin:Init(titleOrOptions)
 	msgText:SetWordWrap(true)
 	msgText:SetText("")
 
-	-- Resize message height if the section width changes
-	content:HookScript("OnSizeChanged", function()
-		if self.MessageRow:IsShown() then
-			self:_UpdateMessageHeight()
-			self:ReflowRows()
-			self:_NotifyPageReflow()
+	-- Wrapped messages only need to be remeasured when available width changes.
+	-- OnSizeChanged also fires for height-only layout, and reacting to that can
+	-- re-enter fill-height reflow until the client freezes.
+	content:HookScript("OnSizeChanged", function(_, width)
+		if not self.MessageRow:IsShown() then
+			return
 		end
+		if not self:_HasMessageWidthChanged(width) then
+			return
+		end
+		self:_UpdateMessageHeight()
+		self:ReflowRows()
+		self:_NotifyPageReflow()
 	end)
 
 	self:_UpdateHeaderLayout()
@@ -323,14 +329,31 @@ local function MessageColor(kind)
 	end
 end
 
+local MESSAGE_WIDTH_EPSILON = 0.5
+
+local function GetContentWidth(self)
+	return (self.Content and self.Content:GetWidth()) or 0
+end
+
+function SectionMixin:_HasMessageWidthChanged(width)
+	width = tonumber(width) or GetContentWidth(self)
+	local lastWidth = self.__sfMessageMeasuredWidth
+	if lastWidth and math.abs(width - lastWidth) <= MESSAGE_WIDTH_EPSILON then
+		return false
+	end
+	return true
+end
+
 -- Internal: recalc message row height based on content width/text
 -- @return nil
 function SectionMixin:_UpdateMessageHeight()
 	-- Compute a reasonable height for wrapped text
-	local width = (self.Content:GetWidth() or 0) - (MSG_PAD_X * 2)
+	local contentWidth = GetContentWidth(self)
+	local width = contentWidth - (MSG_PAD_X * 2)
 	if width < 60 then width = 300 end
 
 	self.MessageText:SetWidth(width)
+	self.__sfMessageMeasuredWidth = contentWidth
 
 	local h = self.MessageText:GetStringHeight() or 0
 	local howH = math.max(18 + MSG_PAD_Y * 2, h + MSG_PAD_Y * 2 + 2)
@@ -364,8 +387,20 @@ function SectionMixin:ClearMessage()
 	self.MessageText:SetText("")
 	self.MessageRow:SetHeight(0)
 	self.MessageRow:Hide()
+	self.__sfMessageMeasuredWidth = nil
 	self:ReflowRows()
 	self:_NotifyPageReflow()
+end
+
+-- Natural height for fill-height rows must stay independent of any extra
+-- height assigned by a previous fill pass. Measuring GetHeight() after
+-- expansion makes leftover space look consumed, so the next reflow shrinks
+-- the row and the following one expands it again.
+local function GetRowNaturalHeight(row)
+	if row and row.__sfFillHeight then
+		return row.__sfBaseHeight or row:GetHeight() or 0
+	end
+	return row:GetHeight() or 0
 end
 
 -- -------- Layout --------
@@ -394,7 +429,7 @@ function SectionMixin:ReflowRows()
 		if index > 1 then
 			baseContentHeight = baseContentHeight + ROW_SPACING
 		end
-		baseContentHeight = baseContentHeight + (row:GetHeight() or 0)
+		baseContentHeight = baseContentHeight + GetRowNaturalHeight(row)
 	end
 
 	if #fillRows > 0 then
@@ -430,6 +465,31 @@ function SectionMixin:ReflowRows()
 
 	self.Content:SetHeight(math.max(1, contentHeight))
 	self:_UpdateHeight()
+end
+
+-- Height this section would use without leftover fill-height expansion.
+-- PageBuilder uses this so idle reflows can keep an existing assigned height
+-- instead of shrinking and expanding fill rows on every pass.
+function SectionMixin:GetNaturalHeight()
+	local baseContentHeight = 0
+	local visibleCount = 0
+
+	if self.MessageRow and self.MessageRow:IsShown() then
+		visibleCount = visibleCount + 1
+		baseContentHeight = baseContentHeight + GetRowNaturalHeight(self.MessageRow)
+	end
+
+	for _, row in ipairs(self._rows or {}) do
+		if row:IsShown() then
+			if visibleCount > 0 then
+				baseContentHeight = baseContentHeight + ROW_SPACING
+			end
+			visibleCount = visibleCount + 1
+			baseContentHeight = baseContentHeight + GetRowNaturalHeight(row)
+		end
+	end
+
+	return HEADER_HEIGHT + CONTENT_PADDING_TOP + baseContentHeight + CONTENT_PADDING_BOTTOM
 end
 
 -- Internal: recalc section frame height based on content

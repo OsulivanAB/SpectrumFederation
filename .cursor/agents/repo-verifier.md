@@ -22,4 +22,5 @@ When invoked:
    - workflow edits that weaken checks
    - docs that drift from current workflow/script filenames
    - addon changes that bypass `SF.Debug`, localization, or combat-safe UI patterns
+   - runtime freeze/crash risks: unbounded loops, layout/`OnSizeChanged` feedback, leftover timers/listeners, queues that never drain, idle pages that keep rebuilding, and `pcall` that hides unexpected errors. Report credible mechanisms only; see `SpectrumFederation/AGENTS.md` Client Stability.
 5. Report findings first, ordered by severity. If no issues are found, say so and list any remaining validation gaps.
