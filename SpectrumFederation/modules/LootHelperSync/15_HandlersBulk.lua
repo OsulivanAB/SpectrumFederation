@@ -449,10 +449,7 @@ function Sync:HandleProfileSnapshot(sender, payload)
         return
     end
 
-    local importedSeq = tonumber(profile._rcConfigSeq) or 0
-    if importedSeq > (tonumber(self.state.rcConfigSeq) or 0) then
-        self.state.rcConfigSeq = importedSeq
-    end
+    self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
 
     -- Store new profile in canonical map (keyed by profileId)
     if isNew then

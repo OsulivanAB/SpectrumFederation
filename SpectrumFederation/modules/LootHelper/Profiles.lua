@@ -1698,6 +1698,45 @@ function LootProfile:SetRaidCheckMetaGemRequired(enabled)
     return true, nil
 end
 
+local function CopyRCLootCouncilIntegrationConfig(cfg)
+	if type(cfg) ~= "table" then
+		return CopyRCLootCouncilIntegrationDefaults()
+	end
+	return {
+		recordAwards = cfg.recordAwards ~= false,
+		recordAllAwardTypes = cfg.recordAllAwardTypes ~= false,
+		allowedResponses = CopyAllowedResponses(cfg.allowedResponses),
+		bisResponses = CopyBisResponses(cfg.bisResponses),
+	}
+end
+
+local function NormalizeRCConfigGeneration(epoch, seq)
+	epoch = tonumber(epoch) or 0
+	seq = tonumber(seq) or 0
+	return epoch, math.floor(seq)
+end
+
+-- Coordinator-assigned RC config generation is (coordEpoch, seq). A newer
+-- coordinator epoch wins even when seq collides after takeover; the same
+-- epoch still requires a strictly greater seq.
+function LootProfile.IsNewerRCConfigGeneration(incomingEpoch, incomingSeq, localEpoch, localSeq)
+	incomingEpoch, incomingSeq = NormalizeRCConfigGeneration(incomingEpoch, incomingSeq)
+	localEpoch, localSeq = NormalizeRCConfigGeneration(localEpoch, localSeq)
+	if incomingEpoch ~= localEpoch then
+		return incomingEpoch > localEpoch
+	end
+	return incomingSeq > localSeq
+end
+
+function LootProfile.IsOlderRCConfigGeneration(incomingEpoch, incomingSeq, localEpoch, localSeq)
+	incomingEpoch, incomingSeq = NormalizeRCConfigGeneration(incomingEpoch, incomingSeq)
+	localEpoch, localSeq = NormalizeRCConfigGeneration(localEpoch, localSeq)
+	if incomingEpoch ~= localEpoch then
+		return incomingEpoch < localEpoch
+	end
+	return incomingSeq < localSeq
+end
+
 function LootProfile:_EnsureRCLootCouncilIntegrationConfig()
 	if type(self._rcLootCouncilIntegration) ~= "table" then
 		self._rcLootCouncilIntegration = CopyRCLootCouncilIntegrationDefaults()
@@ -1717,21 +1756,93 @@ function LootProfile:_EnsureRCLootCouncilIntegrationConfig()
 	cfg.bisResponses = CopyBisResponses(cfg.bisResponses)
 end
 
+-- Live-session followers keep unaccepted edits on a pending copy. Award
+-- recording, BiS qualification, and PROFILE_SNAPSHOT always read accepted
+-- `_rcLootCouncilIntegration`. Coordinator / local-only edits write accepted.
+local function IsRCConfigAuthoritativeLocally(self)
+	local Sync = SF.LootHelperSync
+	if not Sync or type(Sync.state) ~= "table" then
+		return true, nil
+	end
+	local state = Sync.state
+	if state.active ~= true then
+		return true, state
+	end
+	local profileId = self.GetProfileId and self:GetProfileId() or nil
+	if state.profileId ~= nil and profileId ~= nil and state.profileId ~= profileId then
+		return true, state
+	end
+	return state.isCoordinator == true, state
+end
+
+local function GetMutableRCLootCouncilIntegration(self)
+	self:_EnsureRCLootCouncilIntegrationConfig()
+	if IsRCConfigAuthoritativeLocally(self) then
+		self._pendingRCLootCouncilIntegration = nil
+		return self._rcLootCouncilIntegration, false
+	end
+	if type(self._pendingRCLootCouncilIntegration) ~= "table" then
+		self._pendingRCLootCouncilIntegration = CopyRCLootCouncilIntegrationConfig(self._rcLootCouncilIntegration)
+	end
+	return self._pendingRCLootCouncilIntegration, true
+end
+
+local function ConfigIsBisQualifyingResponse(cfg, response, meta)
+	if type(cfg) ~= "table" then
+		return false
+	end
+	if type(response) == "table" and meta == nil then
+		meta = response
+		response = response.response or response.text
+	end
+	for _, existing in ipairs(cfg.bisResponses or {}) do
+		if BisEntryMatchesCanonical(existing, response, meta) then
+			return true
+		end
+	end
+	return false
+end
+
+local function DiscardPendingRCLootCouncilIntegration(self, reason)
+	if type(self._pendingRCLootCouncilIntegration) ~= "table" then
+		return
+	end
+	self._pendingRCLootCouncilIntegration = nil
+	if SF.Debug then
+		SF.Debug:Verbose("LootProfile", "Discarded unaccepted RC config proposal (%s)", tostring(reason or "unknown"))
+	end
+end
+
 local function PushRCIntegrationConfig(self)
 	local Sync = SF.LootHelperSync
-	if Sync and Sync.PublishRCIntegrationConfig then
-		Sync:PublishRCIntegrationConfig(self:GetProfileId())
+	if not (Sync and Sync.PublishRCIntegrationConfig) then
+		DiscardPendingRCLootCouncilIntegration(self, "sync unavailable")
+		return true
 	end
+	local ok, err = Sync:PublishRCIntegrationConfig(self:GetProfileId())
+	if ok then
+		return true
+	end
+	if self._pendingRCLootCouncilIntegration then
+		-- Followers must not keep an unaccepted proposal that never left this client.
+		DiscardPendingRCLootCouncilIntegration(self, err)
+		return false, err
+	end
+	-- Coordinator / local-only accepted mutations stay in place when there is
+	-- no session to serialize. "no session" is the expected no-op publish.
+	return true
 end
 
 function LootProfile:GetRCLootCouncilIntegrationConfig()
 	self:_EnsureRCLootCouncilIntegrationConfig()
-	return {
-		recordAwards = self._rcLootCouncilIntegration.recordAwards ~= false,
-		recordAllAwardTypes = self._rcLootCouncilIntegration.recordAllAwardTypes ~= false,
-		allowedResponses = CopyAllowedResponses(self._rcLootCouncilIntegration.allowedResponses),
-		bisResponses = CopyBisResponses(self._rcLootCouncilIntegration.bisResponses),
-	}
+	return CopyRCLootCouncilIntegrationConfig(self._rcLootCouncilIntegration)
+end
+
+function LootProfile:GetProposedRCLootCouncilIntegrationConfig()
+	if type(self._pendingRCLootCouncilIntegration) ~= "table" then
+		return nil
+	end
+	return CopyRCLootCouncilIntegrationConfig(self._pendingRCLootCouncilIntegration)
 end
 
 -- Apply a strictly validated RC integration config table. Extra keys are ignored.
@@ -1741,6 +1852,21 @@ end
 -- @param options table|nil { skipPermission = bool, skipSync = bool }
 -- @return boolean success
 -- @return string|nil errorMessage
+local function ApplyRCLootCouncilIntegrationFields(target, config)
+	if config.recordAwards ~= nil then
+		target.recordAwards = config.recordAwards and true or false
+	end
+	if config.recordAllAwardTypes ~= nil then
+		target.recordAllAwardTypes = config.recordAllAwardTypes and true or false
+	end
+	if config.allowedResponses ~= nil then
+		target.allowedResponses = CopyAllowedResponses(config.allowedResponses)
+	end
+	if config.bisResponses ~= nil then
+		target.bisResponses = CopyBisResponses(config.bisResponses)
+	end
+end
+
 function LootProfile:ApplyRCLootCouncilIntegrationConfig(config, options)
 	options = options or {}
 	if type(config) ~= "table" then
@@ -1756,46 +1882,41 @@ function LootProfile:ApplyRCLootCouncilIntegrationConfig(config, options)
 	if config.bisResponses ~= nil and type(config.bisResponses) ~= "table" then
 		return false, "invalid-bis-responses"
 	end
-	if config.recordAwards ~= nil then
-		self._rcLootCouncilIntegration.recordAwards = config.recordAwards and true or false
+	-- Coordinator SET/REQ apply, and coordinator/local edits, write accepted
+	-- state. A live follower proposal stays on the pending copy until SET.
+	local target
+	if options.skipSync or IsRCConfigAuthoritativeLocally(self) then
+		target = self._rcLootCouncilIntegration
+		self._pendingRCLootCouncilIntegration = nil
+	else
+		target = GetMutableRCLootCouncilIntegration(self)
 	end
-	if config.recordAllAwardTypes ~= nil then
-		self._rcLootCouncilIntegration.recordAllAwardTypes = config.recordAllAwardTypes and true or false
-	end
-	if config.allowedResponses ~= nil then
-		self._rcLootCouncilIntegration.allowedResponses = CopyAllowedResponses(config.allowedResponses)
-	end
-	if config.bisResponses ~= nil then
-		self._rcLootCouncilIntegration.bisResponses = CopyBisResponses(config.bisResponses)
-	end
+	ApplyRCLootCouncilIntegrationFields(target, config)
 	if not options.skipSync then
-		PushRCIntegrationConfig(self)
+		return PushRCIntegrationConfig(self)
 	end
 	return true, nil
 end
 
 function LootProfile:SetRCLootCouncilRecordAwards(enabled)
-	self:_EnsureRCLootCouncilIntegrationConfig()
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
-	self._rcLootCouncilIntegration.recordAwards = enabled and true or false
-	PushRCIntegrationConfig(self)
-	return true, nil
+	local cfg = GetMutableRCLootCouncilIntegration(self)
+	cfg.recordAwards = enabled and true or false
+	return PushRCIntegrationConfig(self)
 end
 
 function LootProfile:SetRCLootCouncilRecordAllAwardTypes(enabled)
-	self:_EnsureRCLootCouncilIntegrationConfig()
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
-	self._rcLootCouncilIntegration.recordAllAwardTypes = enabled and true or false
-	PushRCIntegrationConfig(self)
-	return true, nil
+	local cfg = GetMutableRCLootCouncilIntegration(self)
+	cfg.recordAllAwardTypes = enabled and true or false
+	return PushRCIntegrationConfig(self)
 end
 
 function LootProfile:AddRCLootCouncilAllowedResponse(value)
-	self:_EnsureRCLootCouncilIntegrationConfig()
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
@@ -1803,19 +1924,18 @@ function LootProfile:AddRCLootCouncilAllowedResponse(value)
 	if not trimmed then
 		return false, "Enter a non-empty award type."
 	end
+	local cfg = GetMutableRCLootCouncilIntegration(self)
 	local key = string.lower(trimmed)
-	for _, existing in ipairs(self._rcLootCouncilIntegration.allowedResponses) do
+	for _, existing in ipairs(cfg.allowedResponses) do
 		if string.lower(existing) == key then
 			return false, "That award type is already in the list."
 		end
 	end
-	self._rcLootCouncilIntegration.allowedResponses[#self._rcLootCouncilIntegration.allowedResponses + 1] = trimmed
-	PushRCIntegrationConfig(self)
-	return true, nil
+	cfg.allowedResponses[#cfg.allowedResponses + 1] = trimmed
+	return PushRCIntegrationConfig(self)
 end
 
 function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
-	self:_EnsureRCLootCouncilIntegrationConfig()
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
@@ -1823,13 +1943,14 @@ function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
 	if not trimmed then
 		return false, "Select an award type to remove."
 	end
-	if self:IsBisQualifyingResponse(trimmed) then
+	local cfg = GetMutableRCLootCouncilIntegration(self)
+	if ConfigIsBisQualifyingResponse(cfg, trimmed) then
 		return false, "BiS-qualified responses cannot be filtered out of recorded award history."
 	end
 	local key = string.lower(trimmed)
 	local filtered = {}
 	local removed = false
-	for _, existing in ipairs(self._rcLootCouncilIntegration.allowedResponses) do
+	for _, existing in ipairs(cfg.allowedResponses) do
 		if string.lower(existing) == key then
 			removed = true
 		else
@@ -1839,9 +1960,8 @@ function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
 	if not removed then
 		return false, "That award type is not in the list."
 	end
-	self._rcLootCouncilIntegration.allowedResponses = filtered
-	PushRCIntegrationConfig(self)
-	return true, nil
+	cfg.allowedResponses = filtered
+	return PushRCIntegrationConfig(self)
 end
 
 function LootProfile:IsBisQualifyingResponse(response, meta)
@@ -1859,7 +1979,6 @@ function LootProfile:IsBisQualifyingResponse(response, meta)
 end
 
 function LootProfile:AddRCLootCouncilBisResponse(value)
-	self:_EnsureRCLootCouncilIntegrationConfig()
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
@@ -1868,19 +1987,18 @@ function LootProfile:AddRCLootCouncilBisResponse(value)
 	if not entry then
 		return false, "Enter a non-empty BiS response."
 	end
-	for _, existing in ipairs(self._rcLootCouncilIntegration.bisResponses or {}) do
+	local cfg = GetMutableRCLootCouncilIntegration(self)
+	cfg.bisResponses = cfg.bisResponses or {}
+	for _, existing in ipairs(cfg.bisResponses) do
 		if existing.key == entry.key then
 			return false, "That BiS response is already in the list."
 		end
 	end
-	self._rcLootCouncilIntegration.bisResponses = self._rcLootCouncilIntegration.bisResponses or {}
-	self._rcLootCouncilIntegration.bisResponses[#self._rcLootCouncilIntegration.bisResponses + 1] = entry
-	PushRCIntegrationConfig(self)
-	return true, nil
+	cfg.bisResponses[#cfg.bisResponses + 1] = entry
+	return PushRCIntegrationConfig(self)
 end
 
 function LootProfile:RemoveRCLootCouncilBisResponse(value)
-	self:_EnsureRCLootCouncilIntegrationConfig()
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
@@ -1893,9 +2011,10 @@ function LootProfile:RemoveRCLootCouncilBisResponse(value)
 	if type(needle) ~= "string" or needle == "" then
 		return false, "Select a BiS response to remove."
 	end
+	local cfg = GetMutableRCLootCouncilIntegration(self)
 	local filtered = {}
 	local removed = false
-	for _, existing in ipairs(self._rcLootCouncilIntegration.bisResponses or {}) do
+	for _, existing in ipairs(cfg.bisResponses or {}) do
 		local id = BisResponseDisplayId(existing)
 		if id == needle or existing.key == needle or (existing.text and string.lower(existing.text) == string.lower(needle)) then
 			removed = true
@@ -1906,9 +2025,8 @@ function LootProfile:RemoveRCLootCouncilBisResponse(value)
 	if not removed then
 		return false, "That BiS response is not in the list."
 	end
-	self._rcLootCouncilIntegration.bisResponses = filtered
-	PushRCIntegrationConfig(self)
-	return true, nil
+	cfg.bisResponses = filtered
+	return PushRCIntegrationConfig(self)
 end
 
 function LootProfile:ShouldRecordRCResponse(response, meta)
@@ -3282,6 +3400,7 @@ function LootProfile:ExportSnapshot()
 		rewardPot       = self:GetRewardPotConfig(),
 		rcLootCouncilIntegration = self:GetRCLootCouncilIntegrationConfig(),
 		rcConfigSeq     = tonumber(self._rcConfigSeq) or 0,
+		rcConfigEpoch   = tonumber(self._rcConfigEpoch) or 0,
 	}
 end
 
@@ -3564,10 +3683,17 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	if type(snapshot.rcConfigSeq) == "number" then
 		incomingSeq = math.floor(snapshot.rcConfigSeq)
 	end
+	local incomingEpoch = 0
+	if type(snapshot.rcConfigEpoch) == "number" then
+		incomingEpoch = math.floor(snapshot.rcConfigEpoch)
+	end
 	local localSeq = tonumber(self._rcConfigSeq) or 0
+	local localEpoch = tonumber(self._rcConfigEpoch) or 0
 	-- Trusted snapshots remain authoritative for joiners, but must not rewind
 	-- a newer coordinator-serialized RC_CONFIG_SET already applied locally.
-	if incomingSeq >= localSeq then
+	-- Compare (coordEpoch, seq) so a post-takeover snapshot with a colliding
+	-- seq is not treated as equal to a previous coordinator generation.
+	if not LootProfile.IsOlderRCConfigGeneration(incomingEpoch, incomingSeq, localEpoch, localSeq) then
 		if type(snapshot.rcLootCouncilIntegration) == "table" then
 			if snapshot.rcLootCouncilIntegration.recordAwards ~= nil then
 				self._rcLootCouncilIntegration.recordAwards = snapshot.rcLootCouncilIntegration.recordAwards and true or false
@@ -3583,6 +3709,8 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 			end
 		end
 		self._rcConfigSeq = incomingSeq
+		self._rcConfigEpoch = incomingEpoch
+		self._pendingRCLootCouncilIntegration = nil
 	end
 
 	-- Import loot mode / Reward Pot config only when the snapshot actually contains them.

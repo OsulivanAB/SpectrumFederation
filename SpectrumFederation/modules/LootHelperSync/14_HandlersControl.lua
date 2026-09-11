@@ -1116,7 +1116,7 @@ function Sync:HandleRCConfigRequest(sender, payload)
 end
 
 -- Function Handle RC_CONFIG_SET as a session member: apply coordinator-authored
--- RC configuration when seq is newer than the local profile seq.
+-- RC configuration when (coordEpoch, seq) is newer than the local generation.
 -- @param sender string "Name-Realm"
 -- @param payload table {sessionId, profileId, seq, rcLootCouncilIntegration, coordinator?, coordEpoch?}
 -- @return nil
@@ -1159,7 +1159,16 @@ function Sync:HandleRCConfigSet(sender, payload)
         return
     end
     local current = tonumber(profile._rcConfigSeq) or 0
-    if seq <= current then
+    local localEpoch = tonumber(profile._rcConfigEpoch) or 0
+    local incomingEpoch = tonumber(payload.coordEpoch) or 0
+    local LootProfile = SF.LootProfile
+    local isNewer = true
+    if LootProfile and LootProfile.IsNewerRCConfigGeneration then
+        isNewer = LootProfile.IsNewerRCConfigGeneration(incomingEpoch, seq, localEpoch, current)
+    else
+        isNewer = seq > current
+    end
+    if not isNewer then
         return
     end
     local cfg = CopyRCConfigFromPayload(payload.rcLootCouncilIntegration)
@@ -1174,9 +1183,8 @@ function Sync:HandleRCConfigSet(sender, payload)
         return
     end
     profile._rcConfigSeq = seq
-    if seq > (tonumber(self.state.rcConfigSeq) or 0) then
-        self.state.rcConfigSeq = seq
-    end
+    profile._rcConfigEpoch = incomingEpoch
+    self.state.rcConfigSeq = seq
     if SF.Debug then
         SF.Debug:Verbose("SYNC", "Applied RC_CONFIG_SET seq=%s from %s", tostring(seq), tostring(sender))
     end

@@ -363,8 +363,9 @@ function Sync:PushActiveProfileSnapshot(profileId, reason)
 end
 
 -- Function Publish RC integration configuration for the session profile.
--- Coordinator applies a monotonic session seq and RAID-broadcasts RC_CONFIG_SET.
--- Non-coordinators WHISPER RC_CONFIG_REQ with the RC config table only.
+-- Coordinator applies a monotonic session seq and RAID-broadcasts RC_CONFIG_SET
+-- from accepted RC config, stamped with coordEpoch.
+-- Non-coordinators WHISPER RC_CONFIG_REQ from the pending proposal when present.
 -- Never sends a full PROFILE_SNAPSHOT.
 -- @param profileId string|nil Session profile id
 -- @return boolean success
@@ -398,7 +399,17 @@ function Sync:PublishRCIntegrationConfig(profileId)
     if not profile or not profile.GetRCLootCouncilIntegrationConfig then
         return false, "no profile"
     end
-    local config = profile:GetRCLootCouncilIntegrationConfig()
+    local config
+    if self.state.isCoordinator then
+        config = profile:GetRCLootCouncilIntegrationConfig()
+    elseif profile.GetProposedRCLootCouncilIntegrationConfig then
+        config = profile:GetProposedRCLootCouncilIntegrationConfig()
+        if type(config) ~= "table" then
+            config = profile:GetRCLootCouncilIntegrationConfig()
+        end
+    else
+        config = profile:GetRCLootCouncilIntegrationConfig()
+    end
     if type(config) ~= "table" then
         return false, "no config"
     end
@@ -409,6 +420,8 @@ function Sync:PublishRCIntegrationConfig(profileId)
         local nextSeq = (tonumber(self.state.rcConfigSeq) or 0) + 1
         self.state.rcConfigSeq = nextSeq
         profile._rcConfigSeq = nextSeq
+        profile._rcConfigEpoch = tonumber(self.state.coordEpoch) or 0
+        profile._pendingRCLootCouncilIntegration = nil
         local payload = {
             sessionId = self.state.sessionId,
             profileId = profileId,
@@ -417,7 +430,7 @@ function Sync:PublishRCIntegrationConfig(profileId)
             seq = nextSeq,
             rcLootCouncilIntegration = config,
         }
-        SF.LootHelperComm:Send(
+        local sent = SF.LootHelperComm:Send(
             "CONTROL",
             self.MSG.RC_CONFIG_SET,
             payload,
@@ -425,8 +438,11 @@ function Sync:PublishRCIntegrationConfig(profileId)
             nil,
             "NORMAL"
         )
+        if sent == false then
+            return false, "send failed"
+        end
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "RC_CONFIG_SET seq=%s profile=%s", tostring(nextSeq), tostring(profileId))
+            SF.Debug:Verbose("SYNC", "RC_CONFIG_SET seq=%s epoch=%s profile=%s", tostring(nextSeq), tostring(payload.coordEpoch), tostring(profileId))
         end
         return true, payload
     end
@@ -438,7 +454,7 @@ function Sync:PublishRCIntegrationConfig(profileId)
         profileId = profileId,
         rcLootCouncilIntegration = config,
     }
-    SF.LootHelperComm:Send(
+    local sent = SF.LootHelperComm:Send(
         "CONTROL",
         self.MSG.RC_CONFIG_REQ,
         req,
@@ -446,6 +462,9 @@ function Sync:PublishRCIntegrationConfig(profileId)
         self.state.coordinator,
         "NORMAL"
     )
+    if sent == false then
+        return false, "send failed"
+    end
     if SF.Debug then
         SF.Debug:Verbose("SYNC", "RC_CONFIG_REQ to %s profile=%s", tostring(self.state.coordinator), tostring(profileId))
     end

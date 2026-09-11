@@ -913,6 +913,13 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
         newEpoch = oldEpoch + 1
     end
     self.state.coordEpoch = newEpoch
+    -- Adopt this client's last accepted RC seq so the first post-takeover
+    -- SET continues from local accepted state. Peers compare (coordEpoch, seq),
+    -- so a colliding seq after a missed SET is still accepted under the new epoch.
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if profile then
+        self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
+    end
     self:_PersistSessionState("TakeoverSession")
 
     if SF.Debug then
