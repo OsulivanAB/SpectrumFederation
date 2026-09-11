@@ -537,27 +537,42 @@ end
 
 local afterHandles = {}
 local timerHandles = {}
-local function makeHandle(delay, fn)
-    local handle = {
+local function makeUserdataHandle(delay, fn)
+    local state = {
         delay = delay,
         fn = fn,
         cancelled = false,
     }
-    function handle:Cancel()
-        self.cancelled = true
+    local handle = newproxy(true)
+    local mt = getmetatable(handle)
+    mt.__index = function(_, key)
+        if key == "Cancel" then
+            return function()
+                state.cancelled = true
+            end
+        end
+        return state[key]
+    end
+    mt.__newindex = function(_, key, value)
+        state[key] = value
     end
     return handle
 end
 C_Timer = {
     After = function(delay, fn)
-        local handle = makeHandle(delay, fn)
+        local handle = {
+            delay = delay,
+            fn = fn,
+            cancelled = false,
+        }
         afterHandles[#afterHandles + 1] = handle
         -- Retail C_Timer.After returns nothing.
         return nil
     end,
     NewTimer = function(delay, fn)
-        local handle = makeHandle(delay, fn)
+        local handle = makeUserdataHandle(delay, fn)
         timerHandles[#timerHandles + 1] = handle
+        assert(type(handle) == "userdata", "NewTimer mock must be userdata like Retail FunctionContainer")
         return handle
     end,
     NewTicker = function()

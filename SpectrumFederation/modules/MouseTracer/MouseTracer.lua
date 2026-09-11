@@ -125,9 +125,11 @@ local function CancelSnapshotTimer()
 	snapshotTimerGen = snapshotTimerGen + 1
 	local handle = snapshotTicker
 	snapshotTicker = nil
-	if type(handle) == "table" and handle.Cancel then
-		pcall(function() handle:Cancel() end)
+	if not handle then
+		return
 	end
+	-- Retail NewTimer returns FunctionContainer userdata, not a table.
+	pcall(function() handle:Cancel() end)
 end
 
 -- C_Timer.After does not return a cancellable handle. Prefer NewTimer, and
