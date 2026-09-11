@@ -1319,6 +1319,39 @@ assertTrue(outcomeData ~= nil, "BIS_OUTCOME exists")
 assertEq(outcomeData.typeCode, "default", "typeCode is RCLC context, not item family")
 assertEq(outcomeData.itemFamily, "ordinary", "itemFamily is the classified family")
 
+-- Malformed AUTO BIS_OUTCOME does not pin the winner or occupy an incompatible slot
+resetEnv()
+local badAuto = makeProfile("BadAuto")
+addMember(badAuto, ALT_A)
+assertTrue(badAuto:SetMemberSpec(ALT_A, 73), "Protection Warrior")
+local shieldCanon = makeCanonical(ALT_A, 19011, "Need", "1700010000")
+insertRC(badAuto, shieldCanon)
+addLog(badAuto, "BIS_OUTCOME", {
+    sourceLogId = shieldCanon.awardKey,
+    awardKey = shieldCanon.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "Weapon" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+    specIdUsed = 73,
+}, { author = ZULU })
+addLog(badAuto, "BIS_OUTCOME", {
+    sourceLogId = shieldCanon.awardKey,
+    awardKey = shieldCanon.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "OffHand" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+    specIdUsed = 73,
+}, { author = OWNER })
+badAuto:ApplyIdentityProjection({ force = true })
+assertEq(slotState(badAuto, ALT_A, "Weapon"), "AVAILABLE", "shield AUTO cannot occupy Weapon")
+assertEq(slotState(badAuto, ALT_A, "OffHand"), "ASSIGNED_AUTO", "later compatible AUTO outcome still wins")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

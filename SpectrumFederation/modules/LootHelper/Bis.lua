@@ -1022,29 +1022,11 @@ local function CreateAssignment(state, opts)
         slots = { "Weapon", "OffHand" }
     end
     local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
-    local source = opts.source or "AUTO"
-    if classif then
-        if source == "OVERRIDE" then
-            local specId = opts.specId or (award.member and state.specs[award.member])
-            if not Bis.ItemFitsSlots(classif, slots, specId) then
-                return nil
-            end
-        else
-            local itemFamily = classif.family
-            if itemFamily == "ordinary" and (family ~= "ordinary" or slots[1] ~= classif.slot) then
-                return nil
-            end
-            if itemFamily == "ring" and family ~= "ring" then
-                return nil
-            end
-            if itemFamily == "trinket" and family ~= "trinket" then
-                return nil
-            end
-            if (itemFamily == "weapon" or classif.isWeaponLoc or classif.isOffHandLoc) and family ~= "weapon" then
-                return nil
-            end
-        end
-    elseif source == "OVERRIDE" then
+    if not classif then
+        return nil
+    end
+    local specId = opts.specId or (award.member and state.specs[award.member])
+    if not Bis.ItemFitsSlots(classif, slots, specId) then
         return nil
     end
     local asg = {
@@ -1283,6 +1265,32 @@ function Bis.ApplyLog(state, log, ctx)
         if state.outcomeWinner[data.awardKey] then
             return
         end
+        if data.outcome == Bis.OUTCOME.OVERFLOW or data.outcome == Bis.OUTCOME.UNRESOLVED or data.outcome == Bis.OUTCOME.NOT_BIS then
+            state.outcomeWinner[data.awardKey] = logId
+            local award = state.awards[Bis.AwardRefKey("RC", data.awardKey)]
+            if award then
+                award.autoOutcome = data.outcome
+                award.qualified = data.qualified
+                award.specIdUsed = data.specIdUsed
+            end
+            if data.outcome == Bis.OUTCOME.OVERFLOW then
+                state.frozenOverflow[data.awardKey] = true
+            end
+            return
+        end
+        local asg = CreateAssignment(state, {
+            id = logId,
+            awardRef = { kind = "RC", id = data.awardKey },
+            assignedSlots = data.assignedSlots,
+            slotBinding = data.slotBinding,
+            assignmentScopeMembers = data.assignmentScopeMembers,
+            source = "AUTO",
+            specId = data.specIdUsed,
+            rank = rank,
+        })
+        if not asg then
+            return
+        end
         state.outcomeWinner[data.awardKey] = logId
         local award = state.awards[Bis.AwardRefKey("RC", data.awardKey)]
         if award then
@@ -1290,21 +1298,6 @@ function Bis.ApplyLog(state, log, ctx)
             award.qualified = data.qualified
             award.specIdUsed = data.specIdUsed
         end
-        if data.outcome == Bis.OUTCOME.OVERFLOW or data.outcome == Bis.OUTCOME.UNRESOLVED or data.outcome == Bis.OUTCOME.NOT_BIS then
-            if data.outcome == Bis.OUTCOME.OVERFLOW then
-                state.frozenOverflow[data.awardKey] = true
-            end
-            return
-        end
-        CreateAssignment(state, {
-            id = logId,
-            awardRef = { kind = "RC", id = data.awardKey },
-            assignedSlots = data.assignedSlots,
-            slotBinding = data.slotBinding,
-            assignmentScopeMembers = data.assignmentScopeMembers,
-            source = "AUTO",
-            rank = rank,
-        })
         return
     end
 
