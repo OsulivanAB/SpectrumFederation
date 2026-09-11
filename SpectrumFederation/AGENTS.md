@@ -180,6 +180,37 @@ When you need a new toggle/option:
 - Prefer `modules/MessageHelpers.lua` helpers (`SF:PrintSuccess/Error/Warning/Info`) when you need to tell the user something.
 - Do not spam chat for debugging (use `SF.Debug` instead).
 
+### Anti-spam and repetition (proactive requirement)
+
+When adding or reviewing **any user-visible output** — chat messages, warnings, notifications, alerts, UI banners/toasts, errors from addon communications, status messages — proactively evaluate repetition/spam risk during **design, implementation, and review**, even if the task did not mention spam prevention.
+
+**Key question:** Can the same underlying condition cause this message to be emitted repeatedly without anything meaningful having changed?
+
+Pay particular attention when output is reachable from recurring execution: heartbeats, timers, `OnUpdate`, polling, retries, synchronization, addon communications, recurring callbacks, frequently firing game events, state refreshes, reconnect/recovery logic, and repeated validation or compatibility checks.
+
+**Choose protection appropriate to the behavior** (not an arbitrary cooldown on every message):
+
+- **State-transition messaging:** notify when a condition *becomes* true, not every time it is observed. Example: compatible → incompatible warns once; subsequent heartbeats while still incompatible stay silent; if compatibility is restored and later breaks again, a new warning is appropriate.
+- **Deduplication:** suppress identical repeats until something meaningful changes. Key by relevant context (player, warning type, protocol/version, item, feature, session, etc.). Do not deduplicate globally when separate occurrences genuinely matter.
+- **Meaningful-change detection:** if repeated processing discovers no new information, do not re-inform the user.
+- **Rate limiting:** use when repeated reminders are useful but should not fire at the underlying event frequency. Prefer state/dedup design first.
+
+Recurring processing (heartbeats, sync ticks, retries) should continue as needed. Suppress **redundant user-visible output**, not necessary processing.
+
+**This does not mean:** hide useful errors, eliminate warnings, make failures silent, suppress genuinely new information, apply long cooldowns to everything, or remove diagnostic logging for development. Distinguish `SF.Debug` diagnostics from normal user-facing output.
+
+**Review checklist** (treat obvious uncontrolled spam paths as implementation-quality issues):
+
+1. What causes the message?
+2. How often can that code path execute?
+3. Can the triggering condition remain true across multiple executions?
+4. Would those executions produce substantially identical messages?
+5. What constitutes a genuinely new occurrence?
+6. Does the design already include state, deduplication, edge detection, aggregation, or rate limiting?
+7. Could failure/retry behavior accidentally multiply the output?
+
+For sync/comm warning deduplication patterns, see `tests/test_sync_protocol.py` and existing Loot Helper sync code.
+
 ## Localization
 - If the repo has `locale/enUS.lua` and `ns.L`, use it for new user-facing strings.
 - If existing code is not fully localized yet, keep your additions consistent with the existing direction (don’t introduce a third pattern).

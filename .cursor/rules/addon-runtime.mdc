@@ -11,6 +11,7 @@ alwaysApply: false
 - Any new packaged Lua file must be added to the owning addon's TOC in load order. Child-addon files belong in that child's TOC.
 - For settings work, start with `modules/Settings/Schema.lua`, `modules/Settings/Store.lua`, `modules/Settings/Apply.lua`, and `modules/UI/Settings/`.
 - Prefer `SF.Debug` for diagnostics and `SF:PrintSuccess/Error/Warning/Info` for user-visible messages.
+- Proactively evaluate user-visible output for repetition/spam risk, especially on recurring paths (heartbeats, timers, sync, retries). One useful notification is information; repeated identical notifications are spam. Full guidance: `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition).
 - Guard protected UI changes with `InCombatLockdown()` when relevant and prefer `hooksecurefunc` over replacing Blizzard functions.
 - Check `locale/enUS.lua` before introducing new user-facing strings.
 - Inspect existing architecture, callers, and lifecycle before assuming a runtime change is local or safe.

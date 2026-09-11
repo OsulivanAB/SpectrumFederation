@@ -33,7 +33,7 @@ This is an engineering requirement, not a generic reminder to consider performan
 
 Addon Lua executes primarily on the game's UI thread. Work does not need to be literally infinite to freeze the client. Feedback loops and high-frequency expensive work can make the client appear frozen even if execution eventually yields.
 
-Canonical runtime guidance lives in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`.
+Canonical runtime guidance lives in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`. For user-visible messages on recurring paths (heartbeats, timers, sync, retries), also read **Anti-spam and repetition** in `SpectrumFederation/AGENTS.md`.
 
 When asked for a code review, technical audit, pre-release review, or architecture review that involves runtime addon behavior, treat client stability as a top review dimension by default, even if the prompt does not mention crashes. Report credible failure mechanisms only: trace callers, lifecycle, bounds, and termination. Do not flag every loop, timer, `OnUpdate`, event handler, or large function as dangerous merely because it exists.
 

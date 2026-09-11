@@ -30,6 +30,7 @@ Follow this order on every comment. Do not skip the reply, and do not GitHub-res
 ## Constraints
 
 - When a comment or requested review covers runtime addon behavior, treat client stability as a top dimension even if the prompt does not mention crashes. Report only credible freeze/hang/runaway mechanisms after tracing callers, lifecycle, bounds, and termination. See `SpectrumFederation/AGENTS.md` Client Stability.
+- When review touches user-visible messages, especially on recurring paths (heartbeats, timers, sync, retries), check for repetition/spam risk per `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition). Treat uncontrolled identical repeats as an implementation-quality issue.
 - Do not reopen settled product or architecture decisions unless current repository evidence makes them impossible.
 - Do not weaken CI, skip validation, or mark in-game testing complete in the PR template. In-game QA is human-owned. You may mark in-game testing N/A only when there are no packaged addon/runtime changes except allowlisted TOC metadata or proven non-shipped files (see `.cursor/rules/pr-template.mdc`).
 - Keep replies factual and specific to the cited code.

@@ -21,6 +21,7 @@ applyTo: "SpectrumFederation/**/*.lua,SpectrumFederation_CursedSurgeTracker/**/*
   - use `SF.Debug` (see `SpectrumFederation/modules/debug.lua`)
   - avoid chat spam for diagnostics
 - User-facing messages should use `SF:PrintSuccess/Error/Warning/Info` when appropriate (see `modules/MessageHelpers.lua`).
+- Proactively guard user-visible output against repetition/spam, especially on recurring paths (heartbeats, timers, sync, retries). Prefer state-transition messaging, deduplication, or meaningful-change detection over arbitrary cooldowns. Canonical guidance: `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition).
 - Inspect existing architecture, callers, and lifecycle before assuming a Lua change is local or safe.
 
 ## Client Stability
