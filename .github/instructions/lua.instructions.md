@@ -21,3 +21,20 @@ applyTo: "SpectrumFederation/**/*.lua,SpectrumFederation_CursedSurgeTracker/**/*
   - use `SF.Debug` (see `SpectrumFederation/modules/debug.lua`)
   - avoid chat spam for diagnostics
 - User-facing messages should use `SF:PrintSuccess/Error/Warning/Info` when appropriate (see `modules/MessageHelpers.lua`).
+- Inspect existing architecture, callers, and lifecycle before assuming a Lua change is local or safe.
+
+## Client Stability
+
+Preventing World of Warcraft client crashes, freezes, severe UI hangs, runaway execution, and long-session performance degradation is one of the highest priorities when reviewing, auditing, designing, or modifying addon runtime code. This is an engineering requirement, not a generic reminder to consider performance.
+
+Addon Lua runs primarily on the game's UI thread. Work does not need to be literally infinite to freeze the client.
+
+- **Idle means idle:** a visible page with no state change, user interaction, or intentionally scheduled task should not continuously rebuild, reflow, inspect, reconstruct databases, schedule refreshes, allocate objects, or broadcast sync traffic unless there is an intentional documented reason.
+- Repeated open/close, enable/disable, page switches, and resizes must not accumulate listeners, callbacks, timers, tickers, frames, textures, deferred work, inspect requests, or sync work.
+- Queues, retries, and deferred work should drain to empty and become idle after the producer stops.
+- Watch for unbounded loops, re-entrancy, `OnSizeChanged`/layout feedback, leftover timers, addon-message storms, inspect retry storms, high-frequency rebuilds, and growing allocations.
+- Shared Settings/UI (`Section`, `PageBuilder`, Controls, ScrollFrames, layout helpers) needs extra re-entrancy review and consumer inspection.
+- Prefer tests that assert bounded execution and convergence, not merely that no Lua error occurred.
+- Unexpected errors should remain visible via WoW's error handler / BugGrabber. `pcall` is appropriate for cleanup; do not hide severe defects.
+
+Canonical guidance: `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`.

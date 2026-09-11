@@ -26,3 +26,4 @@ alwaysApply: true
 - Do not weaken CI to make checks pass.
 - Keep the job name in `.github/workflows/copilot-setup-steps.yml` exactly `copilot-setup-steps`.
 - Treat `SpectrumFederation/SpectrumFederation.toc` as the authoritative source for addon version, interface value, and load order whenever a task touches addon packaging or release/version logic. Packaged child TOC files must stay on the same Version and Interface values.
+- For UI layout, sizing, callbacks, events, timers, listeners, queues, inspection, or sync changes, prefer existing Lua 5.1 tests that assert bounded execution and convergence, not only that no Lua error occurred. See `SpectrumFederation/AGENTS.md` Client Stability.
