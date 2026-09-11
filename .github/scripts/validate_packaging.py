@@ -22,6 +22,11 @@ CHILD_ADDON_NAMES = (
 ZIP_EXCLUDES = ["*.git*", "*/AGENTS.md"]
 
 
+def zip_create_command(zip_path, addon_names):
+    """Return the zip(1) command used for validation and production release zips."""
+    return ["zip", "-r", str(zip_path), *addon_names, "-x", *ZIP_EXCLUDES]
+
+
 def toc_field(toc_file, field_name):
     """Return a TOC metadata field value or None."""
     content = Path(toc_file).read_text(encoding="utf-8")
@@ -166,7 +171,7 @@ def create_test_zip(addon_names):
 
     print(f"[validate-packaging] Creating test zip: {zip_path}")
 
-    cmd = ["zip", "-r", str(zip_path), *addon_names, "-x", *ZIP_EXCLUDES]
+    cmd = zip_create_command(zip_path, addon_names)
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except subprocess.CalledProcessError as e:

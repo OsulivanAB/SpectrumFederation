@@ -9,6 +9,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import validate_packaging
+
 IN_GAME_TESTED_PHRASE = "i have tested these changes in-game"
 IN_GAME_NA_PHRASE = "in-game testing is not applicable"
 OPTIONAL_CHECKLIST_PHRASES = (
@@ -18,15 +24,11 @@ IN_GAME_CHECKLIST_PHRASES = (
     IN_GAME_TESTED_PHRASE,
     IN_GAME_NA_PHRASE,
 )
-PACKAGED_ADDON_ROOTS = (
-    "SpectrumFederation/",
-    "SpectrumFederation_CursedSurgeTracker/",
+PARENT_ADDON_NAME = "SpectrumFederation"
+PACKAGED_ADDON_ROOTS = tuple(
+    f"{name}/" for name in (PARENT_ADDON_NAME, *validate_packaging.CHILD_ADDON_NAMES)
 )
-# Keep in sync with validate_packaging.ZIP_EXCLUDES and publish_release zip -x.
-NON_PACKAGED_ADDON_GLOBS = (
-    "*.git*",
-    "*/AGENTS.md",
-)
+NON_PACKAGED_ADDON_GLOBS = tuple(validate_packaging.ZIP_EXCLUDES)
 SAFE_TOC_FIELDS = frozenset(
     {
         "version",

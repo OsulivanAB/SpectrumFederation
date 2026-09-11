@@ -1,5 +1,9 @@
 name: Post-Merge Beta
 
+# Path filters start the workflow for addon-tree pushes. Release side effects
+# still classify github.event.before...github.sha with
+# classify_promotion_scope.py so zip-excluded files cannot publish a beta
+# release. Do not encode individual ZIP_EXCLUDES here.
 on:
   push:
     branches:
@@ -14,9 +18,43 @@ concurrency:
   cancel-in-progress: false  # Don't cancel in-progress releases
 
 jobs:
+  detect-release-scope:
+    name: Detect Release Scope
+    runs-on: ubuntu-latest
+    outputs:
+      addon_changed: ${{ steps.scope.outputs.addon_changed }}
+      release_required: ${{ steps.scope.outputs.release_required }}
+      promotion_target_sha: ${{ steps.scope.outputs.promotion_target_sha }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Classify the pushed range
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            echo "::error::Push before SHA is empty; cannot classify the pushed range."
+            exit 1
+          fi
+          git cat-file -t "$BEFORE_SHA" >/dev/null || git fetch --no-tags origin "$BEFORE_SHA"
+          git cat-file -t "$AFTER_SHA" >/dev/null
+          python3 .github/scripts/classify_promotion_scope.py \
+            --base "$BEFORE_SHA" \
+            --head "$AFTER_SHA" \
+            --github-output \
+            --step-summary
+
   sanity-checks:
     name: Re-run Sanity Checks
     runs-on: ubuntu-latest
+    needs: [detect-release-scope]
 
     steps:
       - name: Checkout code
@@ -49,13 +87,17 @@ jobs:
   extract-version:
     name: Extract Version Info
     runs-on: ubuntu-latest
+    needs: [detect-release-scope]
+    if: needs.detect-release-scope.outputs.release_required == 'true'
     outputs:
       version: ${{ steps.version.outputs.version }}
       interface: ${{ steps.blizzard.outputs.interface }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout captured release source
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -76,10 +118,81 @@ jobs:
           echo "interface=$INTERFACE" >> $GITHUB_OUTPUT
           echo "Beta Interface version: $INTERFACE"
 
+  check-version-bump:
+    name: Check Version Bump
+    runs-on: ubuntu-latest
+    needs: [detect-release-scope]
+    if: needs.detect-release-scope.outputs.release_required == 'true'
+
+    steps:
+      - name: Checkout captured release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Check version was bumped against the previous beta tip
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          git cat-file -t "$BEFORE_SHA" >/dev/null || git fetch --no-tags origin "$BEFORE_SHA"
+          python3 .github/scripts/check_version_bump.py beta --base-commit "$BEFORE_SHA"
+
+  check-duplicate-beta-release:
+    name: Check for Duplicate Beta Release
+    runs-on: ubuntu-latest
+    needs: [detect-release-scope]
+    if: needs.detect-release-scope.outputs.release_required == 'true'
+
+    steps:
+      - name: Checkout captured release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Extract version from TOC
+        id: version
+        run: |
+          VERSION=$(grep -E '^## Version:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Version://i' | xargs)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Check for duplicate release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/check_duplicate_release.py "${{ steps.version.outputs.version }}"
+
   update-changelog:
     name: Update Changelog
     runs-on: ubuntu-latest
-    needs: [sanity-checks, extract-version]
+    needs:
+      - detect-release-scope
+      - sanity-checks
+      - extract-version
+      - check-version-bump
+      - check-duplicate-beta-release
+    if: |
+      !cancelled() &&
+      needs.detect-release-scope.outputs.release_required == 'true' &&
+      needs.sanity-checks.result == 'success' &&
+      needs.extract-version.result == 'success' &&
+      needs.check-version-bump.result == 'success' &&
+      needs.check-duplicate-beta-release.result == 'success'
     permissions:
       contents: write
       pull-requests: read
@@ -124,7 +237,12 @@ jobs:
   update-readme-badges:
     name: Update README Badges
     runs-on: ubuntu-latest
-    needs: [sanity-checks, extract-version, update-changelog]
+    needs: [detect-release-scope, extract-version, update-changelog]
+    if: |
+      !cancelled() &&
+      needs.detect-release-scope.outputs.release_required == 'true' &&
+      needs.extract-version.result == 'success' &&
+      needs.update-changelog.result == 'success'
 
     steps:
       - name: Checkout code
@@ -167,18 +285,45 @@ jobs:
   publish-beta-release:
     name: Publish Beta Release
     runs-on: ubuntu-latest
-    needs: [sanity-checks, extract-version, update-changelog, update-readme-badges]
+    needs:
+      - detect-release-scope
+      - sanity-checks
+      - extract-version
+      - update-changelog
+      - update-readme-badges
+    if: |
+      !cancelled() &&
+      needs.detect-release-scope.outputs.release_required == 'true' &&
+      needs.sanity-checks.result == 'success' &&
+      needs.extract-version.result == 'success' &&
+      needs.update-changelog.result == 'success' &&
+      needs.update-readme-badges.result == 'success'
 
     steps:
-      - name: Checkout code
+      - name: Checkout captured release source
         uses: actions/checkout@v6
         with:
-          ref: beta  # Ensure we have the latest with changelog/badge updates
+          ref: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+
+      - name: Overlay generated notes and verify packaged tree
+        env:
+          SOURCE_SHA: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
+          EXPECTED_VERSION: ${{ needs.extract-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch origin beta
+          git checkout origin/beta -- CHANGELOG.md README.md
+          python3 .github/scripts/classify_promotion_scope.py \
+            --verify-publish-tree \
+            --source "$SOURCE_SHA" \
+            --expected-version "$EXPECTED_VERSION" \
+            --publish-mode beta
 
       - name: Package and publish release
         env:
@@ -187,11 +332,77 @@ jobs:
         run: |
           python3 .github/scripts/publish_release.py "${{ needs.extract-version.outputs.version }}" --interface "${{ needs.extract-version.outputs.interface }}"
 
+  verify-release-outcome:
+    name: Verify Release Outcome
+    runs-on: ubuntu-latest
+    needs:
+      - detect-release-scope
+      - sanity-checks
+      - extract-version
+      - check-version-bump
+      - check-duplicate-beta-release
+      - update-changelog
+      - update-readme-badges
+      - publish-beta-release
+    if: ${{ always() && !cancelled() }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Confirm release jobs matched packaged-addon scope
+        env:
+          RELEASE_REQUIRED: ${{ needs.detect-release-scope.outputs.release_required }}
+          SANITY_RESULT: ${{ needs.sanity-checks.result }}
+          EXTRACT_RESULT: ${{ needs.extract-version.result }}
+          BUMP_RESULT: ${{ needs.check-version-bump.result }}
+          DUPLICATE_RESULT: ${{ needs.check-duplicate-beta-release.result }}
+          CHANGELOG_RESULT: ${{ needs.update-changelog.result }}
+          README_RESULT: ${{ needs.update-readme-badges.result }}
+          PUBLISH_RESULT: ${{ needs.publish-beta-release.result }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, ".github/scripts")
+          import classify_promotion_scope as scope
+
+          try:
+              required = scope.parse_bool_flag(os.environ.get("RELEASE_REQUIRED"))
+          except ValueError as exc:
+              print(f"::error::{exc}")
+              sys.exit(1)
+
+          errors = scope.verify_promotion_outcomes(
+              [
+                  ("Re-run Sanity Checks", True, os.environ.get("SANITY_RESULT")),
+                  ("Extract Version Info", required, os.environ.get("EXTRACT_RESULT")),
+                  ("Check Version Bump", required, os.environ.get("BUMP_RESULT")),
+                  ("Check for Duplicate Beta Release", required, os.environ.get("DUPLICATE_RESULT")),
+                  ("Update Changelog", required, os.environ.get("CHANGELOG_RESULT")),
+                  ("Update README Badges", required, os.environ.get("README_RESULT")),
+                  ("Publish Beta Release", required, os.environ.get("PUBLISH_RESULT")),
+              ]
+          )
+          if errors:
+              for error in errors:
+                  print(f"::error::{error}")
+              sys.exit(1)
+          print("Post-merge beta jobs matched packaged-addon release scope.")
+          PY
+
   cleanup-merged-branch:
     name: Cleanup Merged Branch
     runs-on: ubuntu-latest
-    needs: [publish-beta-release]
-    if: github.event_name == 'push'
+    needs: [detect-release-scope, sanity-checks, publish-beta-release]
+    if: |
+      github.event_name == 'push' &&
+      !cancelled() &&
+      needs.detect-release-scope.result == 'success' &&
+      needs.sanity-checks.result == 'success' &&
+      (needs.publish-beta-release.result == 'success' ||
+       needs.publish-beta-release.result == 'skipped')
 
     steps:
       - name: Checkout code

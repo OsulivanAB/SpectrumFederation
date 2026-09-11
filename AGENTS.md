@@ -54,6 +54,8 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Run linked character identity tests (production Lua via lua5.1): `python -m pytest tests/test_linked_identity.py`
 - Run Raid Equipment policy and check-run tests (production Lua via lua5.1): `python -m pytest tests/test_raid_equipment.py`
 - Run PR template validator tests: `python -m pytest tests/test_pr_template.py`
+- Run promotion-scope classification tests: `python -m pytest tests/test_promotion_scope.py`
+- Run TOC version-bump tests: `python -m pytest tests/test_check_version_bump.py`
 
 ## Important Workflows
 
@@ -92,4 +94,6 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`
 - UI layout, timers, listeners, queues, inspection, or sync: prefer the existing Lua 5.1 suite for that area, with assertions that execution stays bounded and converges. See Client Stability in `SpectrumFederation/AGENTS.md`.
 - PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`
+- Promotion-scope classification or `classify_promotion_scope.py`: also run `python -m pytest tests/test_promotion_scope.py`
+- Version bump comparison or `check_version_bump.py`: also run `python -m pytest tests/test_check_version_bump.py`
 - Release classification or Wago publishing: also run `python -m pytest tests/test_publish_release.py`

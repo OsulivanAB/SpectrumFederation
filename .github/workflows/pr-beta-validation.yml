@@ -13,6 +13,7 @@ on:
       - '.github/requirements-lint.txt'
       - 'docs/**'
       - 'mkdocs.yml'
+      - 'overrides/**'
       - 'requirements-docs.txt'
       - 'README.md'
       - 'tests/**'
@@ -27,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       addon_changed: ${{ steps.changes.outputs.addon_changed }}
+      release_required: ${{ steps.changes.outputs.release_required }}
 
     steps:
       - name: Checkout code
@@ -40,15 +42,10 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          CHANGED_FILES=$(git diff --name-only "$BASE_SHA...$HEAD_SHA" -- 'SpectrumFederation/' 'SpectrumFederation_CursedSurgeTracker/' 'SpectrumFederation_RCLootCouncilIntegration/')
-          if [[ -n "$CHANGED_FILES" ]]; then
-            echo "addon_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Addon files changed:"
-            echo "$CHANGED_FILES"
-          else
-            echo "addon_changed=false" >> "$GITHUB_OUTPUT"
-            echo "No addon files changed."
-          fi
+          python3 .github/scripts/classify_promotion_scope.py \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --github-output
 
   lint:
     name: Lint Code
@@ -94,7 +91,7 @@ jobs:
   check-version-bump:
     name: Check Version Bump
     needs: detect-addon-changes
-    if: needs.detect-addon-changes.outputs.addon_changed == 'true'
+    if: needs.detect-addon-changes.outputs.release_required == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -114,7 +111,7 @@ jobs:
   check-duplicate-beta-release:
     name: Check for Duplicate Beta Release
     needs: detect-addon-changes
-    if: needs.detect-addon-changes.outputs.addon_changed == 'true'
+    if: needs.detect-addon-changes.outputs.release_required == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -164,7 +161,7 @@ jobs:
         run: pip install pytest
 
       - name: Run tests
-        run: python -m pytest tests/test_settings_navigation.py tests/test_cursed_surge_tracker.py tests/test_mouse_tracer.py tests/test_interface_badge.py tests/test_loot_helper_window.py tests/test_sync_protocol.py tests/test_raid_equipment.py tests/test_raid_check_item_links.py tests/test_impersonation.py tests/test_linked_identity.py tests/test_pr_template.py tests/test_settings_window_layout.py tests/test_rc_loot_council_integration.py tests/test_publish_release.py
+        run: python -m pytest tests/test_settings_navigation.py tests/test_cursed_surge_tracker.py tests/test_mouse_tracer.py tests/test_interface_badge.py tests/test_loot_helper_window.py tests/test_sync_protocol.py tests/test_raid_equipment.py tests/test_raid_check_item_links.py tests/test_impersonation.py tests/test_linked_identity.py tests/test_pr_template.py tests/test_settings_window_layout.py tests/test_rc_loot_council_integration.py tests/test_publish_release.py tests/test_promotion_scope.py tests/test_check_version_bump.py
 
   validate-docs:
     name: Validate Documentation
