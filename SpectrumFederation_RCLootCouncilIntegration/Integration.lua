@@ -592,6 +592,49 @@ function Integration.AreHooksInstalled()
     return hooksInstalled
 end
 
+local function GetRCResponseLabels()
+    local labels = {}
+    local seen = {}
+    local function add(text)
+        if type(text) ~= "string" then
+            return
+        end
+        local trimmed = strtrim(text)
+        if trimmed == "" then
+            return
+        end
+        local key = string.lower(trimmed)
+        if seen[key] then
+            return
+        end
+        seen[key] = true
+        labels[#labels + 1] = trimmed
+    end
+    local rc = _G.RCLootCouncil
+    local db = rc and rc.Getdb and rc:Getdb() or (rc and rc.db)
+    local profile = db and (db.profile or db)
+    local responses = profile and (profile.responses or profile.buttonGroup)
+    if type(responses) == "table" then
+        for _, entry in pairs(responses) do
+            if type(entry) == "table" then
+                add(entry.text or entry.label or entry.name)
+            elseif type(entry) == "string" then
+                add(entry)
+            end
+        end
+    end
+    local buttons = rc and rc.buttons
+    if type(buttons) == "table" then
+        for _, entry in pairs(buttons) do
+            if type(entry) == "table" then
+                add(entry.text or entry.label)
+            end
+        end
+    end
+    table.sort(labels)
+    return labels
+end
+
 local function GetProfile()
     return Integration.GetSettingsProfile()
 end
@@ -784,6 +827,105 @@ function Integration.RegisterSettingsPage()
                                     return
                                 end
                                 ctx.section:SetMessage("Award type removed.", "success")
+                                ctx.pageBuilder:Refresh()
+                            end,
+                        },
+                    },
+                },
+                {
+                    id = "bisResponses",
+                    title = "BiS-Qualifying Responses",
+                    items = {
+                        { type = "help", text = "Only future RC awards use this list. Historical BiS outcomes are never reinterpreted. A BiS-qualified response cannot be filtered out of recorded award history.", indent = "label" },
+                        {
+                            type = "dropdownIconButton",
+                            label = "Add from RC Loot Council",
+                            adminOnly = true,
+                            defaultText = "Select response",
+                            visible = function()
+                                return #GetRCResponseLabels() > 0
+                            end,
+                            options = function()
+                                local options = {}
+                                for _, label in ipairs(GetRCResponseLabels()) do
+                                    options[#options + 1] = { value = label, text = label }
+                                end
+                                return options
+                            end,
+                            get = function() return panel.__sfBisResponseSelected end,
+                            set = function(value) panel.__sfBisResponseSelected = value end,
+                            iconAtlas = "common-icon-plus",
+                            iconToolTip = "Add the selected RC response as BiS-qualifying",
+                            onIconClick = function(ctx)
+                                local profile = GetProfile()
+                                if not (profile and profile.AddRCLootCouncilBisResponse) then
+                                    ctx.section:SetMessage("No active profile.", "error")
+                                    return
+                                end
+                                local ok, err = profile:AddRCLootCouncilBisResponse(panel.__sfBisResponseSelected)
+                                if not ok then
+                                    ctx.section:SetMessage(err or "Could not add BiS response.", "error")
+                                    return
+                                end
+                                ctx.section:SetMessage("BiS response added. Future awards only.", "success")
+                                ctx.pageBuilder:Refresh()
+                            end,
+                        },
+                        {
+                            type = "editboxButton",
+                            label = "Add BiS response",
+                            hint = "BiS",
+                            buttonText = "Add",
+                            buttonWidth = 80,
+                            editWidth = 180,
+                            adminOnly = true,
+                            onSubmit = function(ctx, text, editBox)
+                                ctx.section:ClearMessage()
+                                local profile = GetProfile()
+                                if not (profile and profile.AddRCLootCouncilBisResponse) then
+                                    ctx.section:SetMessage("No active profile.", "error")
+                                    return
+                                end
+                                local ok, err = profile:AddRCLootCouncilBisResponse(text)
+                                if not ok then
+                                    ctx.section:SetMessage(err or "Could not add BiS response.", "error")
+                                    return
+                                end
+                                editBox:SetText("")
+                                ctx.section:SetMessage("BiS response added. Future awards only.", "success")
+                                ctx.pageBuilder:Refresh()
+                            end,
+                        },
+                        {
+                            type = "scrollList",
+                            label = "BiS responses",
+                            adminOnly = true,
+                            height = 140,
+                            rowHeight = 20,
+                            removeAtlas = "common-icon-redx",
+                            compactColumns = true,
+                            getItems = function()
+                                local profile = GetProfile()
+                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                    return {}
+                                end
+                                local items = {}
+                                for _, value in ipairs(profile:GetRCLootCouncilIntegrationConfig().bisResponses or {}) do
+                                    items[#items + 1] = { id = value, label = value }
+                                end
+                                return items
+                            end,
+                            onRemove = function(ctx, item)
+                                local profile = GetProfile()
+                                if not (profile and profile.RemoveRCLootCouncilBisResponse) then
+                                    return
+                                end
+                                local ok, err = profile:RemoveRCLootCouncilBisResponse(item.id)
+                                if not ok then
+                                    ctx.section:SetMessage(err or "Could not remove BiS response.", "error")
+                                    return
+                                end
+                                ctx.section:SetMessage("BiS response removed. Future awards only.", "success")
                                 ctx.pageBuilder:Refresh()
                             end,
                         },

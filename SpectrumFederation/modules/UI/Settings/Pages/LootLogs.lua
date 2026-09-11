@@ -66,6 +66,8 @@ local function CollectLogMemberIds(data)
 	add(data.memberA)
 	add(data.memberB)
 	add(data.sourceMember)
+	add(data.awardMember)
+	add(data.viewMember)
 	if type(data.identityMembers) == "table" then
 		for _, id in ipairs(data.identityMembers) do
 			add(id)
@@ -164,6 +166,11 @@ local EVENT_TYPE_COLORS = {
 	REWARD_POT_CHANGE = "|cffffd700",
 	ATTENDANCE_CHANGE = "|cff66ccff",
 	RC_LOOT_COUNCIL = "|cffff99cc",
+	SPEC_CHANGE = "|cff99ccff",
+	BIS_OUTCOME = "|cff66ffcc",
+	BIS_OVERRIDE = "|cffffcc66",
+	MANUAL_AWARD = "|cffccff66",
+	MANUAL_AWARD_REVERSE = "|cffff9966",
 }
 
 local EVENT_TYPE_LABELS = {
@@ -185,6 +192,11 @@ local EVENT_TYPE_LABELS = {
 	REWARD_POT_CHANGE = "Reward Pot Change",
 	ATTENDANCE_CHANGE = "Attendance Change",
 	RC_LOOT_COUNCIL = "RC Loot Council",
+	SPEC_CHANGE = "Spec Change",
+	BIS_OUTCOME = "BiS Outcome",
+	BIS_OVERRIDE = "Gear Override",
+	MANUAL_AWARD = "Manual Award",
+	MANUAL_AWARD_REVERSE = "Manual Award Reverse",
 }
 
 function GetEventTypeLabel(eventType)
@@ -345,7 +357,45 @@ local function BuildActionText(eventType, data, author)
 
 		return FormatLabel(data.change or "?")
 	elseif eventType == "RC_LOOT_COUNCIL" then
-		return tostring(data.itemLink or "")
+		local item = tostring(data.itemLink or "")
+		local response = tostring(data.response or "")
+		if response ~= "" then
+			return string.format("%s (%s)", item, response)
+		end
+		return item
+	elseif eventType == "SPEC_CHANGE" then
+		local spec = data.specName or data.specId or "?"
+		return string.format("Spec -> %s", tostring(spec))
+	elseif eventType == "BIS_OUTCOME" then
+		local item = tostring(data.itemLink or data.awardKey or "")
+		local outcome = tostring(data.outcome or "?")
+		if outcome == "ASSIGNED" then
+			local slots = table.concat(data.assignedSlots or {}, ", ")
+			return string.format("BiS assigned %s%s", item ~= "" and (item .. " ") or "", slots ~= "" and ("[" .. slots .. "]") or "")
+		elseif outcome == "OVERFLOW" then
+			return string.format("BiS overflow %s", item)
+		elseif outcome == "UNRESOLVED" then
+			return string.format("BiS unresolved %s", item)
+		elseif outcome == "NOT_BIS" then
+			return string.format("Not BiS %s", item)
+		end
+		return outcome
+	elseif eventType == "BIS_OVERRIDE" then
+		local action = tostring(data.action or "?")
+		if action == "ASSIGN" then
+			return "Gear Override assign"
+		elseif action == "CLEAR" then
+			return "Gear Override clear"
+		elseif action == "REPLACE" then
+			return "Gear Override replace"
+		elseif action == "ASSOCIATE_LEGACY" then
+			return "Gear Override associate legacy"
+		end
+		return "Gear Override " .. action
+	elseif eventType == "MANUAL_AWARD" then
+		return string.format("Manually added %s", tostring(data.itemLink or data.itemString or "loot"))
+	elseif eventType == "MANUAL_AWARD_REVERSE" then
+		return "Manual loot reversed"
 	end
 
 	return ""
@@ -368,7 +418,7 @@ local function BuildLogRow(log)
 		and SF:FormatTimestampForUser(timestamp)
 		or tostring(timestamp)
 
-	local memberText = ColorizeName(data.member)
+	local memberText = ColorizeName(data.member or data.awardMember or data.viewMember)
 	if type(data.memberA) == "string" and type(data.memberB) == "string" then
 		memberText = ColorizeName(data.memberA) .. " / " .. ColorizeName(data.memberB)
 	end
