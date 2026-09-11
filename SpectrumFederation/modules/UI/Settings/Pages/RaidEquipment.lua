@@ -923,6 +923,9 @@ local function BuildEquipmentPage(panel)
 				else
 					error(message, 0)
 				end
+				-- Discard follow-up work queued during the failed refresh. A later
+				-- explicit user/event refresh can still run because flags are cleared.
+				return
 			end
 			if pending then
 				RefreshAuditTable()

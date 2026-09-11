@@ -619,6 +619,13 @@ Tracer:ApplyEnabled(false)
 assertEq(liveTimers(), 0, "disabling Mouse Tracer cancels the pending snapshot callback")
 assertTrue(persistCount >= persistBeforeDisable, "disable flushes or cancels snapshot work without leaving a ticker")
 
+Tracer:ApplyEnabled(true)
+assertEq(liveTimers(), 0, "re-enable does not start snapshot work by itself")
+Tracer:ScheduleSnapshot()
+assertEq(liveTimers(), 1, "re-enable still allows a new snapshot debounce")
+Tracer:ApplyEnabled(false)
+assertEq(liveTimers(), 0, "disable after re-enable cancels the new debounce")
+
 C_Timer.NewTimer = nil
 afterHandles = {}
 timerHandles = {}

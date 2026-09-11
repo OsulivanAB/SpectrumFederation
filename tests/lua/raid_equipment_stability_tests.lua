@@ -686,6 +686,32 @@ do
     assertTrue(snapshotCalls > callsBefore, "refresh flag is cleared after a failure so later refreshes run")
 end
 
+-- F-07: a pending refresh queued during a failed refresh is discarded, not retried immediately.
+do
+    local _, pageBuilder = buildPage({ rowCount = 1 })
+    local originalSnapshot = SF.RaidCheck.GetTroubleshootingSnapshot
+    local failingCalls = 0
+    function SF.RaidCheck:GetTroubleshootingSnapshot()
+        snapshotCalls = snapshotCalls + 1
+        failingCalls = failingCalls + 1
+        if failingCalls > 8 then
+            error("pending-after-failure loop")
+        end
+        pageBuilder:Refresh()
+        error("synthetic nested refresh boom")
+    end
+    local errorsBefore = #capturedErrors
+    pageBuilder:Refresh()
+    assertTrue(#capturedErrors > errorsBefore, "nested pending failure remains observable")
+    assertEq(failingCalls, 1, "pending follow-up is not executed immediately after a failed refresh")
+    SF.RaidCheck.GetTroubleshootingSnapshot = originalSnapshot
+    snapshotVersion = snapshotVersion + 1
+    local callsAfterFailure = snapshotCalls
+    pageBuilder:Refresh()
+    flushTimers(0.2)
+    assertTrue(snapshotCalls > callsAfterFailure, "a later explicit refresh succeeds after discarding the failed pending follow-up")
+end
+
 -- Fresh SavedVariables / no profile: page builds and idles.
 do
     local panel = buildPage({ rowCount = 1 })
