@@ -278,7 +278,7 @@ local function ShowAuditCellTooltip(self)
 			GameTooltip:AddLine("Raid Check is tracking this slot.", 0.75, 0.82, 1, true)
 		end
 	else
-		GameTooltip:AddLine("Enchant checks are disabled for this slot in the active profile.", 0.75, 0.75, 0.75, true)
+		GameTooltip:AddLine("Enchant checks are not enabled for this slot.", 0.75, 0.75, 0.75, true)
 	end
 
 	if slotData.missingGems then
@@ -847,12 +847,6 @@ local function BuildEquipmentPage(panel)
 						tostring(snapshotChanged),
 						tostring(forceLayout)
 					)
-				end
-
-				if snapshot.hasActiveProfile then
-					tableSection:ClearMessage()
-				else
-					tableSection:SetMessage("Select an active Loot Helper profile to apply raid check expectations.", "warn")
 				end
 
 				local knownSlotCount = 0
