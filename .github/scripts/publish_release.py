@@ -23,6 +23,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import blizzard_api
+import validate_packaging
 
 WAGO_API_BASE = "https://addons.wago.io/api"
 WAGO_GAME_DATA_URL = f"{WAGO_API_BASE}/data/game"
@@ -450,6 +451,40 @@ def create_release_json(version, interface, addon_name, zip_filename):
     return json_path
 
 
+def packaged_parent_toc_version(addon_name):
+    """Return the ## Version value from the packaged parent TOC on disk."""
+    toc_file = Path(addon_name) / f"{addon_name}.toc"
+    version = validate_packaging.toc_field(toc_file, "Version")
+    if not version:
+        raise RuntimeError(f"No '## Version:' line in {toc_file}")
+    return version
+
+
+def requested_version_matches_packaged_toc(addon_name, version):
+    """Return True when every packaged TOC matches the requested release version."""
+    try:
+        packaged = packaged_parent_toc_version(addon_name)
+    except RuntimeError as exc:
+        print(f"::error ::{exc}")
+        return False
+    if packaged != version:
+        print(
+            f"::error ::Requested release version {version!r} does not match "
+            f"packaged parent TOC {packaged!r}"
+        )
+        return False
+    for name in validate_packaging.packaged_addon_names(addon_name):
+        toc_file = Path(name) / f"{name}.toc"
+        toc_version = validate_packaging.toc_field(toc_file, "Version")
+        if toc_version != version:
+            print(
+                f"::error ::Packaged TOC version for {name} is {toc_version!r}, "
+                f"expected {version!r}"
+            )
+            return False
+    return True
+
+
 def create_addon_zip(addon_name, version):
     """Create addon zip file with proper structure."""
     build_dir = Path("build")
@@ -464,21 +499,12 @@ def create_addon_zip(addon_name, version):
     
     print(f"[publish-release] Creating release zip: {zip_path}")
 
-    zip_entries = [addon_name]
-    for child_addon_name in (
-        "SpectrumFederation_CursedSurgeTracker",
-        "SpectrumFederation_RCLootCouncilIntegration",
-    ):
-        if Path(child_addon_name).exists() and child_addon_name != addon_name:
-            zip_entries.append(child_addon_name)
+    zip_entries = validate_packaging.packaged_addon_names(addon_name)
+    cmd = validate_packaging.zip_create_command(zip_path, zip_entries)
     
     # Create zip using subprocess for consistency with validation
     try:
-        subprocess.run(
-            ["zip", "-r", str(zip_path), *zip_entries, "-x", "*.git*", "*/AGENTS.md"],
-            check=True,
-            capture_output=True
-        )
+        subprocess.run(cmd, check=True, capture_output=True)
         print(f"[publish-release] ✓ Created {zip_path}")
         print(f"[publish-release] Packaged folders: {', '.join(zip_entries)}")
         return zip_path
@@ -985,6 +1011,9 @@ def main():
         zip_filename
     )
     
+    if not requested_version_matches_packaged_toc(args.addon_name, args.version):
+        sys.exit(1)
+
     # Create zip
     zip_path = create_addon_zip(args.addon_name, args.version)
     if not zip_path:

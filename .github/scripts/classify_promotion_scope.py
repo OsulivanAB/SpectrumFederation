@@ -388,12 +388,15 @@ def verify_promotion_refs(
     return errors
 
 
+def packaged_toc_paths():
+    """Return repo-relative TOC paths for every known packaged addon root."""
+    return frozenset(f"{root}/{root}.toc" for root in ADDON_ROOTS)
+
+
 PROMOTION_MERGE_OVERLAY_PATHS = (
-    "CHANGELOG.md",
-    "README.md",
-    "SpectrumFederation/SpectrumFederation.toc",
-    "SpectrumFederation_CursedSurgeTracker/SpectrumFederation_CursedSurgeTracker.toc",
-    "SpectrumFederation_RCLootCouncilIntegration/SpectrumFederation_RCLootCouncilIntegration.toc",
+    CHANGELOG_PATH,
+    README_PATH,
+    *sorted(packaged_toc_paths()),
 )
 
 
@@ -439,6 +442,110 @@ def read_toc_version_from_ref(ref, cwd=None, path=PARENT_TOC_PATH):
     if not match:
         raise RuntimeError(f"No '## Version:' line in {path} at {ref}")
     return match.group(1).strip()
+
+
+def collect_direct_diff_paths(base, head=None, cwd=None):
+    """Return paths whose content differs between base and head (two-dot).
+
+    When head is omitted, compare base to the current worktree. `git diff`
+    exits 1 when differences exist, so that is not treated as a command error.
+    """
+    args = ["diff", "--name-only", "-z", "--no-renames", base]
+    if head is not None:
+        args.append(head)
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        message = result.stderr.decode().strip() or "git diff failed"
+        joined = " ".join(args)
+        raise RuntimeError(f"git {joined}: {message}")
+    return [
+        normalize_repo_path(path)
+        for path in result.stdout.decode().split("\0")
+        if path
+    ]
+
+
+def collect_untracked_paths(cwd=None):
+    """Return untracked, non-ignored paths in the current worktree."""
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = result.stderr.decode().strip() or "git ls-files failed"
+        raise RuntimeError(f"git ls-files --others --exclude-standard -z: {message}")
+    return [
+        normalize_repo_path(path)
+        for path in result.stdout.decode().split("\0")
+        if path
+    ]
+
+
+def read_working_tree_toc_version(cwd=None, path=PARENT_TOC_PATH):
+    """Return the ## Version value from the working-tree parent TOC."""
+    root = Path(cwd) if cwd else Path.cwd()
+    content = (root / path).read_text(encoding="utf-8")
+    match = TOC_VERSION_RE.search(content)
+    if not match:
+        raise RuntimeError(f"No '## Version:' line in {path}")
+    return match.group(1).strip()
+
+
+def verify_publish_tree(source_ref, expected_version, publish_mode, cwd=None):
+    """Return errors when a publish checkout does not match the captured source.
+
+    beta: the worktree may overlay CHANGELOG.md and README.md only.
+    stable: CHANGELOG.md, README.md, and packaged TOC files may differ from the
+    captured beta target because promotion rewrites version metadata.
+    Any other packaged addon path difference fails closed.
+    """
+    publish_mode = (publish_mode or "").strip().lower()
+    if publish_mode not in ("beta", "stable"):
+        raise ValueError(f"Unknown publish mode {publish_mode!r}")
+    if publish_mode == "beta":
+        allowed = {CHANGELOG_PATH, README_PATH}
+    else:
+        allowed = {CHANGELOG_PATH, README_PATH, *packaged_toc_paths()}
+    files = collect_direct_diff_paths(source_ref, cwd=cwd)
+    files.extend(
+        path
+        for path in collect_untracked_paths(cwd=cwd)
+        if path not in files
+    )
+    errors = []
+    packaged_drift = [
+        path
+        for path in files
+        if is_packaged_addon_path(path) and path not in allowed
+    ]
+    if packaged_drift:
+        shown = packaged_drift[:MAX_FILES_PER_CATEGORY]
+        extra = len(packaged_drift) - len(shown)
+        suffix = f" (+{extra} more)" if extra > 0 else ""
+        errors.append(
+            "Packaged addon files differ from captured source "
+            f"{source_ref}: {', '.join(shown)}{suffix}. "
+            "Refusing to publish a release whose zip would not match the "
+            "classified push."
+        )
+    try:
+        version = read_working_tree_toc_version(cwd=cwd)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        return errors
+    if version != expected_version:
+        errors.append(
+            f"Packaged TOC version {version!r} does not match requested "
+            f"release version {expected_version!r}."
+        )
+    return errors
 
 
 def is_stable_toc_version(version):
@@ -705,6 +812,24 @@ def build_parser():
         action="store_true",
         help="Validate TOC versions for the captured base/target promotion case",
     )
+    parser.add_argument(
+        "--verify-publish-tree",
+        action="store_true",
+        help="Verify a publish checkout matches the captured packaged source",
+    )
+    parser.add_argument(
+        "--source",
+        help="Captured source SHA for --verify-publish-tree",
+    )
+    parser.add_argument(
+        "--expected-version",
+        help="Release version that the packaged parent TOC must match",
+    )
+    parser.add_argument(
+        "--publish-mode",
+        choices=("beta", "stable"),
+        help="beta allows generated notes only; stable also allows TOC rewrites",
+    )
     return parser
 
 
@@ -798,6 +923,28 @@ def main(argv=None):
                 print(error)
             return 1
         print("TOC version validation passed.")
+        return 0
+
+    if args.verify_publish_tree:
+        if not args.source or not args.expected_version or not args.publish_mode:
+            parser.error(
+                "--verify-publish-tree requires --source, --expected-version, "
+                "and --publish-mode"
+            )
+        errors = verify_publish_tree(
+            args.source,
+            args.expected_version,
+            args.publish_mode,
+        )
+        if errors:
+            for error in errors:
+                print(f"::error::{error}", file=sys.stderr)
+                print(error)
+            return 1
+        print(
+            "Publish checkout matches captured packaged source "
+            f"({args.publish_mode} {args.expected_version})."
+        )
         return 0
 
     if args.files is not None and (args.base or args.head):

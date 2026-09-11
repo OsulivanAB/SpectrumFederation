@@ -27,9 +27,9 @@ Both branch-validation workflows include `README.md`, `tests/**`, and MkDocs inp
 
 ## Post-merge beta release
 
-`.github/workflows/post-merge-beta.yml` is triggered by pushes under the packaged addon trees. `!**/AGENTS.md` is only an efficiency filter. The workflow still classifies the immutable `github.event.before...github.sha` range with `classify_promotion_scope.py` before any release side effects. Zip-excluded addon-tree files, including `*/AGENTS.md`, do not set `release_required`.
+`.github/workflows/post-merge-beta.yml` is triggered by pushes under the packaged addon trees. Path filters start the workflow; they do not encode individual zip exclusions. The workflow classifies the immutable `github.event.before...github.sha` range with `classify_promotion_scope.py` before any release side effects. Zip-excluded addon-tree files, including `*/AGENTS.md`, do not set `release_required`.
 
-When `release_required` is false, changelog, README badge, GitHub Release, Wago, and CurseForge side effects are skipped. Lint/packaging/docs validation and merged-branch cleanup still run; they do not depend on a successful publish.
+When `release_required` is false, changelog, README badge, GitHub Release, Wago, and CurseForge side effects are skipped. Lint/packaging/docs validation and merged-branch cleanup still run; they do not depend on a successful publish. A guidance-only addon-tree push can therefore start the workflow, classify as `release_required=false`, skip every release/version job, and still run sanity checks plus merged-branch cleanup.
 
 When `release_required` is true, the workflow:
 
@@ -38,12 +38,16 @@ When `release_required` is true, the workflow:
 3. queries Blizzard's beta product for Interface metadata;
 4. updates `CHANGELOG.md`;
 5. updates README badges;
-6. packages the addon zip, writes WowUp `release.json`, creates a GitHub prerelease, and uploads the same zip to Wago as `beta`;
+6. checks out the captured push SHA, overlays generated `CHANGELOG.md` / `README.md` from live `beta`, refuses to publish if any packaged addon file has advanced, packages the addon zip, writes WowUp `release.json`, creates a GitHub prerelease, and uploads the same zip to Wago as `beta`;
 7. deletes the merged source branch after a successful or skipped publish, never after a failed one.
+
+Version extraction, duplicate-release checks, and the publisher all use the captured push SHA rather than live `beta`. `publish_release.py` also refuses to create a zip whose requested version does not match the packaged parent and child TOC versions. Concurrency serializes workflow runs, but it does not freeze the `beta` branch; the captured SHA plus packaged-tree verification is what keeps a later push from being published under an earlier version.
 
 A packaged addon change with a forgotten or invalid version fails the workflow instead of silently skipping the beta release.
 
 Docs-only merges do not trigger a beta addon release.
+
+Parent/child addon membership and zip exclusions live in `.github/scripts/validate_packaging.py`. The validation zip, production zip, and release-scope classifier all consume those definitions.
 
 ## Changelog automation
 
@@ -105,7 +109,7 @@ The script is the source of truth for path classification. Update it when packag
 
 | Flag | Meaning |
 | --- | --- |
-| `addon_changed` | A file that ships in the release zip changed. Addon roots come from packaging; `*/AGENTS.md` and `*.git*` are excluded. |
+| `addon_changed` | A file that ships in the release zip changed. Addon roots and zip exclusions come from `validate_packaging.py`; `*/AGENTS.md` and `*.git*` are excluded. |
 | `docs_changed` | MkDocs sources changed: `docs/**`, `mkdocs.yml`, `overrides/**`, or `requirements-docs.txt`. |
 | `readme_changed` | `README.md` is in the incoming diff. |
 | `release_required` | Same as `addon_changed`. Incoming packaged addon changes warrant a stable release. Generated TOC/version commits do not create this flag. |
@@ -130,7 +134,7 @@ The workflow:
 2. validates lint, packaging, docs, and TOC version format. Addon releases require `X.Y.Z-beta.N` on the captured beta target. Non-addon merges require a stable `X.Y.Z` on that target so a prerelease TOC cannot be overlaid onto `main`. When the captured target is already contained in `main`, the captured main SHA is authoritative and must be stable `X.Y.Z`; the leftover beta checkout may still contain `-beta.N`;
 3. dry-runs only the applicable merge, changelog, README, docs, release, and fast-forward steps without pushing, using the captured target SHA and the same ref-drift checks as the real merge;
 4. re-verifies that `origin/main` and `origin/beta` still match the captured SHAs, then merges the captured target SHA into `main` only when that target is not already contained in `main`;
-5. when `release_required`, removes `-beta.N`, fetches the live Interface value, updates the changelog, and publishes a stable GitHub Release plus a Wago `stable` upload;
+5. when `release_required`, removes `-beta.N`, fetches the live Interface value, updates the changelog, verifies the `main` checkout still matches the captured packaged source (TOC rewrites allowed), and publishes a stable GitHub Release plus a Wago `stable` upload;
 6. when `readme_work_required`, updates README badges;
 7. when `documentation_deploy_required`, deploys MkDocs from `main`;
 8. re-verifies that `origin/beta` still equals the captured target and that the target is an ancestor of `origin/main`, then fast-forwards `beta` with a non-force `git push origin origin/main:refs/heads/beta`. Newer beta work is never overwritten.
@@ -147,7 +151,7 @@ When a dry-run README job runs, it uploads its simulated stable badge output to 
 
 A live publish does the following, in order:
 
-1. Build the existing release artifacts: the addon zip (`SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/` at the zip root) and WowUp Hub `release.json`.
+1. Build the existing release artifacts: the addon zip (parent plus packaged child addons from `validate_packaging.py` at the zip root) and WowUp Hub `release.json`. The publisher refuses to zip when the requested version does not match the packaged TOC versions.
 2. Build release notes from `CHANGELOG.md`.
 3. Create or update the GitHub Release (prerelease for `-beta`, `-alpha`, and `-rc` versions).
 4. After GitHub succeeds, load Wago's catalog, require an exact Retail patch match, and validate Wago project metadata.

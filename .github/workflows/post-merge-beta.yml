@@ -1,8 +1,9 @@
 name: Post-Merge Beta
 
-# Path filters are an efficiency gate only. Release side effects still
-# classify github.event.before...github.sha with classify_promotion_scope.py
-# so zip-excluded addon-tree files cannot publish a beta release.
+# Path filters start the workflow for addon-tree pushes. Release side effects
+# still classify github.event.before...github.sha with
+# classify_promotion_scope.py so zip-excluded files cannot publish a beta
+# release. Do not encode individual ZIP_EXCLUDES here.
 on:
   push:
     branches:
@@ -11,7 +12,6 @@ on:
       - 'SpectrumFederation/**'
       - 'SpectrumFederation_CursedSurgeTracker/**'
       - 'SpectrumFederation_RCLootCouncilIntegration/**'
-      - '!**/AGENTS.md'
 
 concurrency:
   group: beta-release
@@ -24,6 +24,7 @@ jobs:
     outputs:
       addon_changed: ${{ steps.scope.outputs.addon_changed }}
       release_required: ${{ steps.scope.outputs.release_required }}
+      promotion_target_sha: ${{ steps.scope.outputs.promotion_target_sha }}
 
     steps:
       - name: Checkout code
@@ -93,8 +94,10 @@ jobs:
       interface: ${{ steps.blizzard.outputs.interface }}
 
     steps:
-      - name: Checkout code
+      - name: Checkout captured release source
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -122,9 +125,10 @@ jobs:
     if: needs.detect-release-scope.outputs.release_required == 'true'
 
     steps:
-      - name: Checkout code
+      - name: Checkout captured release source
         uses: actions/checkout@v6
         with:
+          ref: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
           fetch-depth: 0
 
       - name: Set up Python
@@ -147,8 +151,10 @@ jobs:
     if: needs.detect-release-scope.outputs.release_required == 'true'
 
     steps:
-      - name: Checkout code
+      - name: Checkout captured release source
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -294,15 +300,30 @@ jobs:
       needs.update-readme-badges.result == 'success'
 
     steps:
-      - name: Checkout code
+      - name: Checkout captured release source
         uses: actions/checkout@v6
         with:
-          ref: beta  # Ensure we have the latest with changelog/badge updates
+          ref: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+
+      - name: Overlay generated notes and verify packaged tree
+        env:
+          SOURCE_SHA: ${{ needs.detect-release-scope.outputs.promotion_target_sha }}
+          EXPECTED_VERSION: ${{ needs.extract-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git fetch origin beta
+          git checkout origin/beta -- CHANGELOG.md README.md
+          python3 .github/scripts/classify_promotion_scope.py \
+            --verify-publish-tree \
+            --source "$SOURCE_SHA" \
+            --expected-version "$EXPECTED_VERSION" \
+            --publish-mode beta
 
       - name: Package and publish release
         env:

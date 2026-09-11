@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -91,10 +92,37 @@ def flags(scope):
 
 
 def test_packaged_roots_match_release_zip_membership():
+    publish = _load_script("publish_release")
     assert "SpectrumFederation" in scope_mod.ADDON_ROOTS
     assert "SpectrumFederation_CursedSurgeTracker" in scope_mod.ADDON_ROOTS
     assert "SpectrumFederation_RCLootCouncilIntegration" in scope_mod.ADDON_ROOTS
+    assert scope_mod.ADDON_ROOTS[1:] == packaging.CHILD_ADDON_NAMES
     assert tuple(scope_mod.ZIP_EXCLUDES) == tuple(packaging.ZIP_EXCLUDES)
+
+    names = packaging.packaged_addon_names("SpectrumFederation")
+    assert names[0] == "SpectrumFederation"
+    assert names[1:] == list(packaging.CHILD_ADDON_NAMES)
+    zip_cmd = packaging.zip_create_command("addon.zip", names)
+    assert zip_cmd[:4] == ["zip", "-r", "addon.zip", "SpectrumFederation"]
+    assert zip_cmd[zip_cmd.index("-x") + 1 :] == list(packaging.ZIP_EXCLUDES)
+    for child in packaging.CHILD_ADDON_NAMES:
+        assert child in zip_cmd
+
+    create_zip_src = inspect.getsource(publish.create_addon_zip)
+    validate_zip_src = inspect.getsource(packaging.create_test_zip)
+    assert "zip_create_command" in create_zip_src
+    assert "packaged_addon_names" in create_zip_src
+    assert "zip_create_command" in validate_zip_src
+    assert "CursedSurgeTracker" not in create_zip_src
+    assert "RCLootCouncilIntegration" not in create_zip_src
+    assert "AGENTS.md" not in create_zip_src
+    assert "*.git*" not in create_zip_src
+    assert "AGENTS.md" not in validate_zip_src
+    assert not scope_mod.is_packaged_addon_path("SpectrumFederation/AGENTS.md")
+    assert scope_mod.is_packaged_addon_path("SpectrumFederation/Core.lua")
+    assert scope_mod.is_packaged_addon_path(
+        "SpectrumFederation_RCLootCouncilIntegration/Integration.lua"
+    )
 
 
 def test_case_a_documentation_only():
@@ -646,6 +674,12 @@ def test_promotion_workflow_pins_mutations_to_captured_shas():
     assert text.count('git commit -m "$COMMIT_MESSAGE"') == 2
     assert "--validate-versions" in text
     assert "A promotion without addon changes must retain a stable X.Y.Z version" not in text
+    assert "--verify-publish-tree" in text
+    assert "--publish-mode stable" in text
+    for path in scope_mod.PROMOTION_MERGE_OVERLAY_PATHS:
+        assert path in text
+    for child in packaging.CHILD_ADDON_NAMES:
+        assert f"{child}/{child}.toc" in text
 
 
 def test_merge_jobs_materialize_helper_that_supports_validate_versions():
@@ -709,8 +743,20 @@ def test_post_merge_beta_classifies_push_range_and_keeps_housekeeping():
     assert "needs.publish-beta-release.result == 'skipped'" in text
     assert "cleanup-merged-branch:" in text
     publish_if = text[text.index("publish-beta-release:") : text.index("verify-release-outcome:")]
+    extract_block = text[text.index("extract-version:") : text.index("check-version-bump:")]
     assert "release_required == 'true'" in publish_if
-    assert "!**/AGENTS.md" in text
+    assert "!**/AGENTS.md" not in text
+    assert "Do not encode individual ZIP_EXCLUDES here." in text
+    assert "promotion_target_sha: ${{ steps.scope.outputs.promotion_target_sha }}" in text
+    assert "--verify-publish-tree" in publish_if
+    assert "--publish-mode beta" in publish_if
+    assert "ref: beta" not in publish_if
+    assert "ref: beta" not in extract_block
+    assert "needs.detect-release-scope.outputs.promotion_target_sha" in publish_if
+    assert "needs.detect-release-scope.outputs.promotion_target_sha" in extract_block
+    assert "git checkout origin/beta -- CHANGELOG.md README.md" in publish_if
+    for root in scope_mod.ADDON_ROOTS:
+        assert f"- '{root}/**'" in text
 
 
 def _repo_beta_equals_main(tmp_path):
@@ -1142,6 +1188,167 @@ def test_cli_validate_versions_reports_missing_version_without_traceback(
     assert "::error::" in captured.err
     assert "No '## Version:' line" in combined
     assert "Traceback" not in combined
+
+
+def test_verify_publish_tree_allows_generated_notes(tmp_path):
+    repo = init_repo(tmp_path)
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "CHANGELOG.md").write_text("# generated notes\n", encoding="utf-8")
+    (repo / "README.md").write_text("# generated badges\n", encoding="utf-8")
+    errors = scope_mod.verify_publish_tree(source, "1.4.1", "beta", cwd=repo)
+    assert errors == []
+
+
+def test_verify_publish_tree_allows_later_notes_overlay_without_later_lua(tmp_path):
+    repo = init_repo(tmp_path)
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    commit_files(
+        repo,
+        {
+            "CHANGELOG.md": "# generated notes\n",
+            "README.md": "# generated badges\n",
+            "SpectrumFederation/modules/Foo.lua": "print(1)\n",
+        },
+        "feat: later packaged lua and notes",
+    )
+    later = git(repo, "rev-parse", "HEAD").stdout.strip()
+    git(repo, "checkout", source)
+    git(repo, "checkout", later, "--", "CHANGELOG.md", "README.md")
+    errors = scope_mod.verify_publish_tree(source, "1.4.1", "beta", cwd=repo)
+    assert errors == []
+    assert not (repo / "SpectrumFederation" / "modules" / "Foo.lua").exists()
+
+
+def test_verify_publish_tree_allows_later_agents_md(tmp_path):
+    repo = init_repo(tmp_path)
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    commit_files(
+        repo,
+        {"SpectrumFederation/AGENTS.md": "# later guidance\n"},
+        "docs: later agents",
+    )
+    errors = scope_mod.verify_publish_tree(source, "1.4.1", "beta", cwd=repo)
+    assert errors == []
+
+
+def test_verify_publish_tree_rejects_later_packaged_lua(tmp_path):
+    repo = init_repo(tmp_path)
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    commit_files(
+        repo,
+        {"SpectrumFederation/modules/Foo.lua": "print(1)\n"},
+        "feat: later packaged lua",
+    )
+    errors = scope_mod.verify_publish_tree(source, "1.4.1", "beta", cwd=repo)
+    assert errors
+    assert "Packaged addon files differ" in errors[0]
+
+
+def test_verify_publish_tree_rejects_untracked_packaged_file(tmp_path):
+    repo = init_repo(tmp_path)
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "SpectrumFederation" / "New.lua").write_text("print(1)\n", encoding="utf-8")
+    errors = scope_mod.verify_publish_tree(source, "1.4.1", "beta", cwd=repo)
+    assert errors
+    assert "Packaged addon files differ" in errors[0]
+
+
+def test_verify_publish_tree_rejects_version_mismatch(tmp_path):
+    repo = init_repo(tmp_path)
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    errors = scope_mod.verify_publish_tree(source, "1.5.3-beta.1", "beta", cwd=repo)
+    assert any("does not match requested" in error for error in errors)
+
+
+def test_verify_publish_tree_stable_allows_toc_rewrite(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {"SpectrumFederation/modules/Foo.lua": "print(1)\n"},
+        "feat: packaged lua",
+    )
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    git(repo, "checkout", "main")
+    git(repo, "merge", "--no-ff", "beta", "-m", "promote")
+    commit_files(
+        repo,
+        {
+            "SpectrumFederation/SpectrumFederation.toc": "## Version: 1.4.2\n",
+            "CHANGELOG.md": "# Changelog stable\n",
+        },
+        "chore: stable metadata",
+    )
+    errors = scope_mod.verify_publish_tree(source, "1.4.2", "stable", cwd=repo)
+    assert errors == []
+
+
+def test_verify_publish_tree_stable_rejects_later_packaged_lua(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {"SpectrumFederation/modules/Foo.lua": "print(1)\n"},
+        "feat: packaged lua",
+    )
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    git(repo, "checkout", "main")
+    git(repo, "merge", "--no-ff", "beta", "-m", "promote")
+    commit_files(
+        repo,
+        {
+            "SpectrumFederation/SpectrumFederation.toc": "## Version: 1.4.2\n",
+            "SpectrumFederation/modules/Bar.lua": "print(2)\n",
+        },
+        "feat: later lua on main",
+    )
+    errors = scope_mod.verify_publish_tree(source, "1.4.2", "stable", cwd=repo)
+    assert errors
+    assert "Packaged addon files differ" in errors[0]
+
+
+def test_cli_verify_publish_tree_rejects_packaged_drift(tmp_path, monkeypatch, capsys):
+    repo = init_repo(tmp_path)
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    commit_files(
+        repo,
+        {"SpectrumFederation/modules/Foo.lua": "print(1)\n"},
+        "feat: later packaged lua",
+    )
+    monkeypatch.chdir(repo)
+    exit_code = scope_mod.main(
+        [
+            "--verify-publish-tree",
+            "--source",
+            source,
+            "--expected-version",
+            "1.4.1",
+            "--publish-mode",
+            "beta",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Packaged addon files differ" in captured.err
+
+
+def test_cli_verify_publish_tree_allows_generated_notes(tmp_path, monkeypatch, capsys):
+    repo = init_repo(tmp_path)
+    source = git(repo, "rev-parse", "HEAD").stdout.strip()
+    (repo / "CHANGELOG.md").write_text("# generated notes\n", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    exit_code = scope_mod.main(
+        [
+            "--verify-publish-tree",
+            "--source",
+            source,
+            "--expected-version",
+            "1.4.1",
+            "--publish-mode",
+            "beta",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Publish checkout matches captured packaged source" in captured.out
 
 
 def test_cli_files_mode_prints_scope_report(capsys):
