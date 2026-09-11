@@ -16,14 +16,15 @@ Use this skill for work in `SpectrumFederation/modules/Settings/` or `SpectrumFe
    - wire runtime behavior in the feature module or `modules/Settings/Apply.lua`
    - render it through the existing settings UI under `modules/UI/Settings/`
 3. Reuse the existing page builder, registry, navigation model, definition renderer, and control helpers instead of introducing a parallel settings framework.
-4. New pages use `categoryId` for the sidebar category. `parentId` remains a legacy alias. Do not add nested sidebar children.
-5. If the change adds user-facing text, check whether `locale/enUS.lua` should own the string. Settings chrome is currently hardcoded English.
-6. If the change adds a new packaged Lua file, update `SpectrumFederation/SpectrumFederation.toc` in load order.
+4. Shared Settings/UI infrastructure (`Section`, `PageBuilder`, Controls, ScrollFrames, sizing/layout helpers, shared refresh) can affect many pages. Inspect major consumers and look for re-entrancy, `OnSizeChanged`/layout feedback, leftover listeners after hide, and idle refresh loops before declaring the change safe. Follow Client Stability in `SpectrumFederation/AGENTS.md`.
+5. New pages use `categoryId` for the sidebar category. `parentId` remains a legacy alias. Do not add nested sidebar children.
+6. If the change adds user-facing text, check whether `locale/enUS.lua` should own the string. Settings chrome is currently hardcoded English.
+7. If the change adds a new packaged Lua file, update `SpectrumFederation/SpectrumFederation.toc` in load order.
 
 ## Validation
 
 - Run `python3 .github/scripts/lint_all.py`
 - If navigation, categories, tabs, search, or `ShowPage` changed: `python -m pytest tests/test_settings_navigation.py`
-- If Settings window chrome, content host, or the impersonation banner changed: `python -m pytest tests/test_settings_window_layout.py`
+- If Settings window chrome, content host, Section/PageBuilder layout, or the impersonation banner changed: `python -m pytest tests/test_settings_window_layout.py`. Prefer assertions that layout/refresh work converges rather than only that no Lua error occurred.
 - If Mouse Tracer settings or page chrome changed, also run `python -m pytest tests/test_mouse_tracer.py` when the engine or constants were touched
 - Recommend in-game verification with `/reload` and a quick settings UI smoke test

@@ -15,6 +15,7 @@ alwaysApply: true
   - Settings navigation model or Registry helpers -> `python -m pytest tests/test_settings_navigation.py` (requires `lua5.1`)
   - Mouse Tracer constants or trail engine -> `python -m pytest tests/test_mouse_tracer.py` (requires `lua5.1`)
   - Loot Helper window minimize/positioning -> `python -m pytest tests/test_loot_helper_window.py` (requires `lua5.1`)
+  - Sync protocol NACK/warning throttling -> `python -m pytest tests/test_sync_protocol.py` (requires `lua5.1`)
   - RC Loot Council Integration child addon -> `python -m pytest tests/test_rc_loot_council_integration.py` (requires `lua5.1`)
   - Settings window impersonation-banner layout -> `python -m pytest tests/test_settings_window_layout.py` (requires `lua5.1`)
   - Loot Helper impersonation / Preview as Non-Admin -> `python -m pytest tests/test_impersonation.py` (requires `lua5.1`)
@@ -27,3 +28,4 @@ alwaysApply: true
 - Do not weaken CI to make checks pass.
 - Keep the job name in `.github/workflows/copilot-setup-steps.yml` exactly `copilot-setup-steps`.
 - Treat `SpectrumFederation/SpectrumFederation.toc` as the authoritative source for addon version, interface value, and load order whenever a task touches addon packaging or release/version logic. Packaged child TOC files must stay on the same Version and Interface values.
+- For UI layout, sizing, callbacks, events, timers, listeners, queues, inspection, or sync changes, prefer existing Lua 5.1 tests that assert bounded execution and convergence, not only that no Lua error occurred. See `SpectrumFederation/AGENTS.md` Client Stability.

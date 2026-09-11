@@ -19,6 +19,24 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Prefer `.github/workflows/` and `.github/scripts/` over prose docs when they disagree; some docs still mention older workflow names.
 - Prefer existing repo scripts over inventing new validation commands.
 
+## Working Approach
+
+- Inspect existing architecture, callers, lifecycle, and persisted data before assuming a change is local, safe, or complete.
+- Understand the current pattern before introducing a new one. Prefer extending existing systems over inventing a parallel path.
+- Keep changes targeted. Do not refactor unrelated systems while you are here.
+
+## Quality Priorities
+
+Preventing World of Warcraft client crashes, freezes, severe UI hangs, runaway execution, and long-session performance degradation is one of the highest priorities whenever reviewing, auditing, designing, or modifying SpectrumFederation.
+
+This is an engineering requirement, not a generic reminder to consider performance. It sits alongside—and does not replace—inspect-before-assuming, architecture-first changes, compatibility, functionality preservation, appropriate testing, and minimal targeted edits.
+
+Addon Lua executes primarily on the game's UI thread. Work does not need to be literally infinite to freeze the client. Feedback loops and high-frequency expensive work can make the client appear frozen even if execution eventually yields.
+
+Canonical runtime guidance lives in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`.
+
+When asked for a code review, technical audit, pre-release review, or architecture review that involves runtime addon behavior, treat client stability as a top review dimension by default, even if the prompt does not mention crashes. Report credible failure mechanisms only: trace callers, lifecycle, bounds, and termination. Do not flag every loop, timer, `OnUpdate`, event handler, or large function as dangerous merely because it exists.
+
 ## Key Commands
 
 - Lint addon, workflows, and CI scripts: `python3 .github/scripts/lint_all.py`
@@ -29,6 +47,7 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
 - Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
 - Run Loot Helper window tests (production Lua via lua5.1): `python -m pytest tests/test_loot_helper_window.py`
+- Run Sync protocol warning-dedupe tests (production Lua via lua5.1): `python -m pytest tests/test_sync_protocol.py`
 - Run RC Loot Council Integration tests (production Lua via lua5.1): `python -m pytest tests/test_rc_loot_council_integration.py`
 - Run Settings window layout tests (production Lua via lua5.1): `python -m pytest tests/test_settings_window_layout.py`
 - Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py`
@@ -47,7 +66,8 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 ## Where To Start
 
 - Addon feature or bugfix: start in `SpectrumFederation/AGENTS.md`, then inspect the relevant module under `SpectrumFederation/modules/`.
-- Settings work: start with `SpectrumFederation/modules/Settings/` and `SpectrumFederation/modules/UI/Settings/`, then read `docs/development/settings-ui/`.
+- Runtime freeze, hang, callback, layout, timer, queue, inspect, or sync work: read the Client Stability section in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc` before changing the code.
+- Settings work: start with `SpectrumFederation/modules/Settings/` and `SpectrumFederation/modules/UI/Settings/`, then read `docs/development/settings-ui/`. Shared Settings/UI infrastructure (`Section`, `PageBuilder`, Controls, ScrollFrames, layout helpers, shared refresh) needs extra re-entrancy and consumer review.
 - Mouse Tracer work: start with `SpectrumFederation/modules/MouseTracer/` and `docs/development/mouse-tracer.md`.
 - Loot Helper or sync work: inspect `SpectrumFederation/modules/LootHelper/`, `SpectrumFederation/modules/LootHelperSync/`, and the related docs under `docs/development/loot-helper/`.
 - Workflow or CI script work: inspect the matching file under `.github/workflows/` or `.github/scripts/` first, then use `.github/instructions/` as supplemental guidance.
@@ -65,11 +85,13 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Settings navigation or Registry helpers: also run `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer constants or trail engine: also run `python -m pytest tests/test_mouse_tracer.py`
 - Loot Helper window minimize/positioning: also run `python -m pytest tests/test_loot_helper_window.py`
+- Sync protocol NACK/warning throttling: also run `python -m pytest tests/test_sync_protocol.py`
 - RC Loot Council Integration child addon: also run `python -m pytest tests/test_rc_loot_council_integration.py`
 - Settings window impersonation-banner layout: also run `python -m pytest tests/test_settings_window_layout.py`
 - Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`
 - Linked character identities: also run `python -m pytest tests/test_linked_identity.py`
 - Item-aware BiS reconstruction: also run `python -m pytest tests/test_bis_reconstruction.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`
+- UI layout, timers, listeners, queues, inspection, or sync: prefer the existing Lua 5.1 suite for that area, with assertions that execution stays bounded and converges. See Client Stability in `SpectrumFederation/AGENTS.md`.
 - PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`
 - Release classification or Wago publishing: also run `python -m pytest tests/test_publish_release.py`

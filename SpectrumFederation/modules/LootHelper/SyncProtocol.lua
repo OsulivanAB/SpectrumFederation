@@ -75,11 +75,14 @@ end
 -- ================================================================
 -- Throttling (prevent spam)
 -- ================================================================
+-- Network NACKs stay on a short cooldown so a peer who /reloads can still
+-- be told the protocols differ. User-visible warnings are once per sender
+-- and incompatibility signature until reload; otherwise raid traffic plus
+-- mixed-version clients reprint the same chat line every inbound message.
 local NACK_COOLDOWN_SECONDS = 10
-local WARN_COOLDOWN_SECONDS = 10
 
-local lastNackAt = {}   -- [sender] = time
-local lastWarnAt = {}   -- [sender] = time
+local lastNackAt = {}    -- [senderKey] = time
+local lastWarnSigs = {}  -- [senderKey] = { [signature] = true }
 
 -- Function to get current time
 -- @param none
@@ -88,7 +91,32 @@ local function Now()
     if SF.Now then
         return SF:Now()
     end
+    if GetTime then
+        return GetTime()
+    end
     return GetServerTime and GetServerTime() or time()
+end
+
+-- Function to get a stable throttle key for a sender name
+-- @param sender string|nil Sender name
+-- @return string Throttle key
+local function SenderKey(sender)
+    if type(sender) ~= "string" or sender == "" then
+        return "?"
+    end
+    return string.lower(sender)
+end
+
+-- Function to build a warning-dedupe signature from parts
+-- @param ... any Signature parts
+-- @return string Signature
+local function WarningSignature(...)
+    local n = select("#", ...)
+    local parts = {}
+    for i = 1, n do
+        parts[i] = tostring(select(i, ...) or "")
+    end
+    return table.concat(parts, "\t")
 end
 
 -- Function to get the addon's version
@@ -293,16 +321,22 @@ end
 -- Graceful fallback: warnings + PROTO_NACK
 -- ================================================================
 
--- Function to determine if we should send a NACK to the sender
+-- Function to determine if we should print a user-facing protocol warning
 -- @param sender string Sender name
--- @return boolean True if we should send a NACK
-function P.ShouldWarn(sender)
-    local now = Now()
-    local last = lastWarnAt[sender]
-    if last and (now - last) < WARN_COOLDOWN_SECONDS then
+-- @param signature string|nil Stable incompatibility signature
+-- @return boolean True if we should print
+function P.ShouldWarn(sender, signature)
+    local key = SenderKey(sender)
+    signature = tostring(signature or "")
+    local seen = lastWarnSigs[key]
+    if not seen then
+        seen = {}
+        lastWarnSigs[key] = seen
+    end
+    if seen[signature] then
         return false
     end
-    lastWarnAt[sender] = now
+    seen[signature] = true
     return true
 end
 
@@ -311,11 +345,12 @@ end
 -- @return boolean True if we should send a NACK
 function P.ShouldNack(sender)
     local now = Now()
-    local last = lastNackAt[sender]
+    local key = SenderKey(sender)
+    local last = lastNackAt[key]
     if last and (now - last) < NACK_COOLDOWN_SECONDS then
         return false
     end
-    lastNackAt[sender] = now
+    lastNackAt[key] = now
     return true
 end
 
@@ -343,7 +378,7 @@ end
 function P.OnUnsupportedProto(sender, seenProto, seenType)
     DebugWarn("Unsupported proto from %s: type=%s proto=%s", tostring(sender), tostring(seenType), tostring(seenProto))
 
-    if P.ShouldWarn(sender) then
+    if P.ShouldWarn(sender, WarningSignature("unsupported", seenProto)) then
         PrintWarning(("Sync: %s is using unsupported protocol %s (this client supports %d..%d). Ask them to update."):
             format(tostring(sender), tostring(seenProto), P.PROTO_MIN, P.PROTO_MAX))
     end
@@ -362,7 +397,8 @@ function P.OnUnsupportedProto(sender, seenProto, seenType)
     return P.PackEnvelope(P.MSG_PROTO_NACK, P.PROTO_CURRENT, P.ENC_B64CBOR, b64)
 end
 
--- Function Handle receiving a PROTO_NACK (always show local warning; this is the "graceful feedback" loop).
+-- Function Handle receiving a PROTO_NACK (print once per sender + incompatibility).
+-- Repeat NACKs from mixed-version raid traffic stay in debug logs.
 -- @param sender string Sender name
 -- @param payload table|nil Decoded payload table
 -- @return nil
@@ -371,7 +407,14 @@ function P.OnProtoNack(sender, payload)
     local minV = payload and payload.supportedMin or "?"
     local maxV = payload and payload.supportedMax or "?"
     local ver = payload and payload.addonVersion or "unknown"
+    local signature = WarningSignature("nack", theirs, minV, maxV, ver)
 
-   PrintWarning(("Sync: %s says our protocol/version is incompatible (they saw proto=%s; they support %s..%s; addon ver=%s)."):
+    if not P.ShouldWarn(sender, signature) then
+        DebugWarn("Suppressed repeat PROTO_NACK from %s (seenProto=%s supported=%s..%s ver=%s)",
+            tostring(sender), tostring(theirs), tostring(minV), tostring(maxV), tostring(ver))
+        return
+    end
+
+    PrintWarning(("Sync: %s says our protocol/version is incompatible (they saw proto=%s; they support %s..%s; addon ver=%s)."):
         format(tostring(sender), tostring(theirs), tostring(minV), tostring(maxV), tostring(ver)))
 end

@@ -140,14 +140,18 @@ end
 
 -- Reflow section layout based on visibility and sizing
 -- @return nil
+local function SectionNaturalHeight(sec)
+	if sec.GetNaturalHeight then
+		return sec:GetNaturalHeight() or 0
+	end
+	return sec:GetHeight() or 0
+end
+
 function PageBuilder:Reflow()
 	local visibleSections = {}
 	local fillSections = {}
 
 	for _, sec in ipairs(self.sections) do
-		if sec.ClearAssignedHeight then
-			sec:ClearAssignedHeight()
-		end
 		if sec:IsShown() then
 			table.insert(visibleSections, sec)
 			if sec.__sfFillHeight then
@@ -161,20 +165,29 @@ function PageBuilder:Reflow()
 		if index > 1 then
 			naturalTotal = naturalTotal + SECTION_SPACING
 		end
-		naturalTotal = naturalTotal + (sec:GetHeight() or 0)
+		naturalTotal = naturalTotal + SectionNaturalHeight(sec)
 	end
 
 	local prevShown
 	local total = PAGE_PADDING_TOP + PAGE_PADDING_BOTTOM
 	local viewH = self.scrollFrame:GetHeight() or 0
 	local extra = math.max(0, (viewH - 1) - naturalTotal)
-
+	local extraPerSection = 0
 	if #fillSections > 0 and extra > 0 then
-		local extraPerSection = extra / #fillSections
-		for _, sec in ipairs(fillSections) do
+		extraPerSection = extra / #fillSections
+	end
+
+	-- Assign leftover height without shrinking fill sections first. Clearing
+	-- then re-expanding the same assigned height fires child OnSizeChanged and
+	-- can keep a page refreshing while it is merely visible.
+	for _, sec in ipairs(fillSections) do
+		local target = SectionNaturalHeight(sec) + extraPerSection
+		if extraPerSection > 0 then
 			if sec.SetAssignedHeight then
-				sec:SetAssignedHeight((sec:GetHeight() or 0) + extraPerSection)
+				sec:SetAssignedHeight(target)
 			end
+		elseif sec.ClearAssignedHeight then
+			sec:ClearAssignedHeight()
 		end
 	end
 

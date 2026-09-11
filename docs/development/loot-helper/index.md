@@ -109,7 +109,7 @@ Feature updates should fire or reuse `LootHelperEvents` so views refresh without
 
 Control messages use the small `SF_LH` traffic class; snapshots and log batches use `SF_LHB`. `modules/LootHelper/Comm.lua` is the current AceComm/ChatThrottleLib transport adapter.
 
-The current protocol version is **3**. Clients on protocol 2 cannot participate in an item-aware BiS session; mixed protocol 2 and protocol 3 interpretation of the same profile is unsafe. `PROTO_MIN`, `PROTO_MAX`, `PROTO_CURRENT`, and `Sync.PROTO_VERSION` must stay aligned.
+The current protocol version is **3**. Clients on protocol 2 cannot participate in an item-aware BiS session; mixed protocol 2 and protocol 3 interpretation of the same profile is unsafe. `PROTO_MIN`, `PROTO_MAX`, `PROTO_CURRENT`, and `Sync.PROTO_VERSION` must stay aligned. Incoming `PROTO_NACK` and local unsupported-protocol chat warnings print once per peer and incompatibility signature until reload; repeats stay in debug logs.
 
 ### Session lifecycle
 
@@ -157,4 +157,4 @@ The standalone **Raid Equipment** settings page consumes versioned troubleshooti
 
 ## Testing changes
 
-For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover session preflight, announce vs consequence apply, frozen joiners/leavers, combat pause, range-only recent-good, Inspection Failed, and incomplete item data. Production-Lua policy and CheckRun coverage is `python -m pytest tests/test_raid_equipment.py`. Item-link parsing remains `python -m pytest tests/test_raid_check_item_links.py`. Settings navigation for the standalone Raid Equipment category is `python -m pytest tests/test_settings_navigation.py`. Minimize/expand anchoring for the roster window is covered by `python -m pytest tests/test_loot_helper_window.py`.
+For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover session preflight, announce vs consequence apply, frozen joiners/leavers, combat pause, range-only recent-good, Inspection Failed, and incomplete item data. Production-Lua policy and CheckRun coverage is `python -m pytest tests/test_raid_equipment.py`. Item-link parsing remains `python -m pytest tests/test_raid_check_item_links.py`. Settings navigation for the standalone Raid Equipment category is `python -m pytest tests/test_settings_navigation.py`. Minimize/expand anchoring for the roster window is covered by `python -m pytest tests/test_loot_helper_window.py`. Protocol mismatch chat-warning dedupe is `python -m pytest tests/test_sync_protocol.py`.
