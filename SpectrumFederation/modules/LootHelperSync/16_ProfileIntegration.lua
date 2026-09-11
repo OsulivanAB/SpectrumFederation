@@ -316,6 +316,51 @@ function Sync:BuildProfileSnapshot(profileId)
     }
 end
 
+-- Push the current profile snapshot to session peers. Used when RC integration
+-- settings change so in-session admins converge without a new config-log type.
+function Sync:PushActiveProfileSnapshot(profileId, reason)
+    if not self.state or not self.state.active then
+        return false, "no session"
+    end
+    if type(self.state.sessionId) ~= "string" or self.state.sessionId == "" then
+        return false, "no session"
+    end
+    profileId = profileId or self.state.profileId
+    if type(profileId) ~= "string" or profileId == "" then
+        return false, "missing profileId"
+    end
+    if self.state.profileId and self.state.profileId ~= profileId then
+        return false, "wrong profile for session"
+    end
+    local me = self._SelfId and self:_SelfId() or nil
+    if not me or not self:IsSenderAuthorized(profileId, me) then
+        return false, "not authorized"
+    end
+    local dist = "RAID"
+    if self._EnforceGroupedSessionActive then
+        dist = self:_EnforceGroupedSessionActive("PushActiveProfileSnapshot")
+        if not dist then
+            return false, "not in group"
+        end
+    end
+    if not self.BuildProfileSnapshot then
+        return false, "unavailable"
+    end
+    local payload = self:BuildProfileSnapshot(profileId)
+    if not payload then
+        return false, "no snapshot"
+    end
+    payload.reason = reason
+    if SF.LootHelperComm and SF.LootHelperComm.Send then
+        local opts
+        if SF.SyncProtocol and SF.SyncProtocol.ENC_B64CBOR then
+            opts = { enc = SF.SyncProtocol.ENC_B64CBOR }
+        end
+        SF.LootHelperComm:Send("BULK", self.MSG.PROFILE_SNAPSHOT, payload, dist, nil, "BULK", opts)
+    end
+    return true, payload
+end
+
 -- Function Compute authorMax summary from profile's logs.
 -- @param profileId string Stable profile id
 -- @return table snapshotPayload Map [author] = maxCounterSeen

@@ -350,8 +350,14 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.snapshot) ~= "table" then return end
 
-    -- Trust policy: accept from coordinator or helper
-    if not self:IsTrustedDataSender(sender) then
+    -- Trust: coordinator/helper, or an authorized session admin of this profile.
+    -- RC integration settings ride on PROFILE_SNAPSHOT, so any session admin
+    -- who can change those settings must be able to propagate them.
+    local authorized = self:IsTrustedDataSender(sender)
+    if not authorized and self.IsSenderAuthorized and self:IsSenderAuthorized(payload.profileId, sender) then
+        authorized = true
+    end
+    if not authorized then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not a trusted sender", tostring(sender))
         end

@@ -1105,14 +1105,9 @@ function LootProfile:PlaceGearOverrideAward(memberId, slot, awardRef)
     local activeId = state and state.activeByAward and key and state.activeByAward[key]
     if cell and cell.state == "LEGACY_UNKNOWN" then
         local origins = self:GetIdentityLegacyOrigins(memberId) or {}
-        local originId
-        for i = 1, #origins do
-            local displayed = origins[i].displayedSlot or origins[i].slot
-            if displayed == slot or origins[i].slot == slot then
-                originId = origins[i].originLogId
-                break
-            end
-        end
+        local rec = SF.LootHelperBis and SF.LootHelperBis.LegacyOriginForDisplayedSlot
+            and SF.LootHelperBis.LegacyOriginForDisplayedSlot(origins, slot)
+        local originId = rec and rec.originLogId
         if not originId then
             return false, "No active legacy origin for that slot."
         end
@@ -1722,6 +1717,13 @@ function LootProfile:_EnsureRCLootCouncilIntegrationConfig()
 	cfg.bisResponses = CopyBisResponses(cfg.bisResponses)
 end
 
+local function PushRCIntegrationSnapshot(self)
+	local Sync = SF.LootHelperSync
+	if Sync and Sync.PushActiveProfileSnapshot then
+		Sync:PushActiveProfileSnapshot(self:GetProfileId(), "rc-integration")
+	end
+end
+
 function LootProfile:GetRCLootCouncilIntegrationConfig()
 	self:_EnsureRCLootCouncilIntegrationConfig()
 	return {
@@ -1738,6 +1740,7 @@ function LootProfile:SetRCLootCouncilRecordAwards(enabled)
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
 	self._rcLootCouncilIntegration.recordAwards = enabled and true or false
+	PushRCIntegrationSnapshot(self)
 	return true, nil
 end
 
@@ -1747,6 +1750,7 @@ function LootProfile:SetRCLootCouncilRecordAllAwardTypes(enabled)
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
 	self._rcLootCouncilIntegration.recordAllAwardTypes = enabled and true or false
+	PushRCIntegrationSnapshot(self)
 	return true, nil
 end
 
@@ -1766,6 +1770,7 @@ function LootProfile:AddRCLootCouncilAllowedResponse(value)
 		end
 	end
 	self._rcLootCouncilIntegration.allowedResponses[#self._rcLootCouncilIntegration.allowedResponses + 1] = trimmed
+	PushRCIntegrationSnapshot(self)
 	return true, nil
 end
 
@@ -1795,6 +1800,7 @@ function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
 		return false, "That award type is not in the list."
 	end
 	self._rcLootCouncilIntegration.allowedResponses = filtered
+	PushRCIntegrationSnapshot(self)
 	return true, nil
 end
 
@@ -1829,6 +1835,7 @@ function LootProfile:AddRCLootCouncilBisResponse(value)
 	end
 	self._rcLootCouncilIntegration.bisResponses = self._rcLootCouncilIntegration.bisResponses or {}
 	self._rcLootCouncilIntegration.bisResponses[#self._rcLootCouncilIntegration.bisResponses + 1] = entry
+	PushRCIntegrationSnapshot(self)
 	return true, nil
 end
 
@@ -1860,6 +1867,7 @@ function LootProfile:RemoveRCLootCouncilBisResponse(value)
 		return false, "That BiS response is not in the list."
 	end
 	self._rcLootCouncilIntegration.bisResponses = filtered
+	PushRCIntegrationSnapshot(self)
 	return true, nil
 end
 
@@ -1907,6 +1915,13 @@ function LootProfile:TryAddRCLootCouncilAward(canonical)
 	end
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "not_admin"
+	end
+	if type(canonical.equipLoc) ~= "string" or canonical.equipLoc == "" then
+		local classif = SF.LootHelperBis and SF.LootHelperBis.ClassifyItem
+			and SF.LootHelperBis.ClassifyItem(canonical.itemLink or canonical.itemString)
+		if classif then
+			canonical.equipLoc = classif.equipLoc
+		end
 	end
 	if not self:ShouldRecordRCResponse(canonical.response, canonical) then
 		return false, "filtered"
@@ -2355,10 +2370,12 @@ function LootProfile:ApplyBisOverride(action, opts)
         eventData.sourceLogIds = { opts.legacyOriginLogId }
         eventData.assignmentScopeMembers = opts.assignmentScopeMembers
             or SortedIdentityMembers(self, ownerMember or opts.viewMember)
-        local originSlot = rec.slot
+        local originSlot = (type(rec.displayedSlot) == "string" and rec.displayedSlot ~= "") and rec.displayedSlot or rec.slot
         local assigned = opts.assignedSlots
         if type(assigned) ~= "table" or #assigned == 0 then
             assigned = originSlot and { originSlot } or nil
+        elseif originSlot and (#assigned ~= 1 or assigned[1] ~= originSlot) then
+            return false, "That loot does not match the displayed legacy opportunity."
         end
         if not assigned then
             return false, "That legacy opportunity has no equipment slot."
@@ -2384,7 +2401,7 @@ function LootProfile:ApplyBisOverride(action, opts)
         eventData.assignedSlots = resolved
         eventData.slotBinding = opts.slotBinding or (SF.LootLogBisBindings and SF.LootLogBisBindings.BOUND) or "BOUND"
         local board = self:GetIdentityBisSlots(ownerMember or opts.viewMember)
-        local originDisplayed = rec.displayedSlot or rec.slot
+        local originDisplayed = originSlot
         for i = 1, #resolved do
             local cell = board and board[resolved[i]]
             if cell and cell.state and cell.state ~= "AVAILABLE" then
