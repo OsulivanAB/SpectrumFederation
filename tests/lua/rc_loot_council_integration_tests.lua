@@ -126,6 +126,8 @@ loadModule("SpectrumFederation/modules/LootHelperSync/05_Scheduling.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/12_LiveUpdates.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/16_ProfileIntegration.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/15_HandlersBulk.lua")
 
 function SF:GetPlayerFullIdentifier()
     return PLAYER
@@ -188,6 +190,20 @@ end
 function Sync:IsSenderAuthorized()
     return true
 end
+function Sync:IsRequesterInGroup()
+    return true
+end
+function Sync:RebuildProfile()
+end
+function Sync:CompleteRequest()
+end
+function Sync:_MInc()
+end
+function Sync:_MObserve()
+end
+function Sync:MetricsEnabled()
+    return false
+end
 function Sync:BroadcastNewLog()
     return true
 end
@@ -219,6 +235,8 @@ local function resetEnv()
         profileId = nil,
         coordinator = PLAYER,
         isCoordinator = true,
+        rcConfigSeq = 0,
+        coordEpoch = 1,
         requests = {},
         helpers = {},
         repairQueue = { order = {}, items = {} },
@@ -659,7 +677,7 @@ local oldProfile = makeProfile("Old Defaults")
 local oldCfg = oldProfile:GetRCLootCouncilIntegrationConfig()
 assertTrue(oldCfg.recordAwards and oldCfg.recordAllAwardTypes and #oldCfg.allowedResponses == 0, "profiles without stored RC config fill defaults")
 
--- In-session RC setting changes push PROFILE_SNAPSHOT so admins converge
+-- In-session RC setting changes publish coordinator-serialized RC_CONFIG_SET
 resetEnv()
 local source = makeProfile("RC Snap Source")
 addMember(source, WINNER)
@@ -667,12 +685,13 @@ setActive(source)
 startSessionOn(source)
 local captured = {}
 SF.LootHelperComm = {
-    Send = function(_, channel, msgType, payload, dist)
+    Send = function(_, channel, msgType, payload, dist, target)
         captured[#captured + 1] = {
             channel = channel,
             msgType = msgType,
             payload = payload,
             dist = dist,
+            target = target,
         }
     end,
 }
@@ -685,22 +704,32 @@ assertTrue(source:AddRCLootCouncilBisResponse({
     responseId = 1,
     isAwardReason = false,
 }), "bisResponses change is accepted")
-assertTrue(#captured >= 4, "each RC integration mutator pushes a snapshot")
+assertTrue(#captured >= 4, "each RC integration mutator publishes config")
 local last = captured[#captured]
-assertEq(last.msgType, Sync.MSG.PROFILE_SNAPSHOT, "pushed message is PROFILE_SNAPSHOT")
-assertEq(last.dist, "RAID", "snapshot is sent on the grouped session channel")
-assertTrue(last.payload and last.payload.snapshot and last.payload.snapshot.rcLootCouncilIntegration, "payload carries RC integration")
-assertEq(last.payload.snapshot.rcLootCouncilIntegration.bisResponses[1].responseId, 1, "snapshot carries the new BiS response")
-assertFalse(last.payload.snapshot.rcLootCouncilIntegration.recordAllAwardTypes, "snapshot carries record-all=false")
+assertEq(last.msgType, Sync.MSG.RC_CONFIG_SET, "coordinator publishes RC_CONFIG_SET")
+assertEq(last.channel, "CONTROL", "RC config uses the CONTROL prefix")
+assertEq(last.dist, "RAID", "authoritative config is sent on the grouped session channel")
+assertTrue(last.payload and last.payload.rcLootCouncilIntegration, "payload carries RC integration only")
+assertTrue(last.payload.snapshot == nil, "RC config publish does not include a full snapshot")
+assertEq(type(last.payload.seq), "number", "SET carries a monotonic seq")
+assertEq(last.payload.rcLootCouncilIntegration.bisResponses[1].responseId, 1, "SET carries the new BiS response")
+assertFalse(last.payload.rcLootCouncilIntegration.recordAllAwardTypes, "SET carries record-all=false")
 
 local replica = makeProfile("RC Snap Replica")
 replica._profileId = source:GetProfileId()
-assertTrue(select(1, replica:ImportSnapshot(last.payload.snapshot)), "replica imports the pushed snapshot")
+addMember(replica, WINNER)
+local priorPlayer = PLAYER
+PLAYER = "Replica-Garona"
+local previousLocal = SF.lootHelperDB.profiles[source:GetProfileId()]
+SF.lootHelperDB.profiles[source:GetProfileId()] = replica
+Sync:HandleRCConfigSet(priorPlayer, last.payload)
+PLAYER = priorPlayer
+SF.lootHelperDB.profiles[source:GetProfileId()] = previousLocal
 assertTrue(replica:IsBisQualifyingResponse("Need", {
     typeCode = "default",
     responseId = 1,
     isAwardReason = false,
-}), "replica qualifies Need after snapshot import")
+}), "replica qualifies Need after RC_CONFIG_SET")
 assertFalse(replica:GetRCLootCouncilIntegrationConfig().recordAllAwardTypes, "replica restored record-all=false")
 assertTrue(source:AddRCLootCouncilBisResponse({
     text = "Greed",
@@ -709,7 +738,11 @@ assertTrue(source:AddRCLootCouncilBisResponse({
     isAwardReason = false,
 }), "source adds Greed as BiS")
 last = captured[#captured]
-assertTrue(select(1, replica:ImportSnapshot(last.payload.snapshot)), "replica imports the Greed update")
+PLAYER = "Replica-Garona"
+SF.lootHelperDB.profiles[source:GetProfileId()] = replica
+Sync:HandleRCConfigSet(priorPlayer, last.payload)
+PLAYER = priorPlayer
+SF.lootHelperDB.profiles[source:GetProfileId()] = previousLocal
 local greedCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
     id = "1700000900-9",
     response = "Greed",
@@ -1430,6 +1463,310 @@ assertFalse(awardProfile:IsBisQualifyingResponse("Need", {
     isAwardReason = false,
 }), "non-award response with the same numeric id does not match")
 _G.RCLootCouncil = nil
+
+-- ---------------------------------------------------------------------------
+-- RC config trust boundary and coordinator-serialized convergence
+-- ---------------------------------------------------------------------------
+local function cloneProfileAs(name, source)
+    local copy = makeProfile(name)
+    copy._profileId = source:GetProfileId()
+    assertTrue((select(1, copy:ImportSnapshot(source:ExportSnapshot()))), name .. " imports source snapshot")
+    return copy
+end
+
+local function withLocalProfile(profile, fn)
+    local id = profile:GetProfileId()
+    local previous = SF.lootHelperDB.profiles[id]
+    SF.lootHelperDB.profiles[id] = profile
+    Sync.state.profileId = id
+    fn()
+    SF.lootHelperDB.profiles[id] = previous
+end
+
+local function cfgEqual(a, b)
+    if a.recordAwards ~= b.recordAwards then return false end
+    if a.recordAllAwardTypes ~= b.recordAllAwardTypes then return false end
+    if #a.allowedResponses ~= #b.allowedResponses then return false end
+    for i = 1, #a.allowedResponses do
+        if a.allowedResponses[i] ~= b.allowedResponses[i] then return false end
+    end
+    if #a.bisResponses ~= #b.bisResponses then return false end
+    for i = 1, #a.bisResponses do
+        if a.bisResponses[i].key ~= b.bisResponses[i].key then return false end
+    end
+    return true
+end
+
+resetEnv()
+local ADMIN_A = "AdminA-Garona"
+local ADMIN_B = "AdminB-Garona"
+local coord = makeProfile("RC Trust Coord")
+addMember(coord, WINNER)
+addMember(coord, ADMIN_A)
+addMember(coord, ADMIN_B)
+assertTrue(coord:AddAdminMemberId(ADMIN_A, { skipPermission = true, skipBroadcast = true }), "Admin A is a legitimate admin")
+assertTrue(coord:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Admin B is a legitimate admin")
+setActive(coord)
+startSessionOn(coord)
+assertTrue(coord:AddRCLootCouncilBisResponse({
+    text = "Need",
+    typeCode = "default",
+    responseId = 1,
+    isAwardReason = false,
+}), "shared starting BiS response")
+local startingOwner = coord:GetOwnerId()
+local startingAdmins = {}
+for i, admin in ipairs(coord:GetAdminUsers() or {}) do
+    startingAdmins[i] = admin
+end
+local startingLootMode = coord:GetLootMode()
+local startingPot = coord:GetRewardPotConfig()
+local startingRaid = coord:GetRaidCheckConfig()
+local startingMemberCount = #(coord._members or {})
+local startingLogCount = #(coord:GetLootLogs() or {})
+local startingFp
+local firstLog = coord:GetLootLogs()[1]
+if firstLog and firstLog.GetFingerprint then
+    startingFp = firstLog:GetFingerprint()
+end
+local startingEquip = coord._raidCheckEquipmentSnapshots
+
+local poisoned = coord:ExportSnapshot()
+poisoned.meta._owner = ADMIN_B
+poisoned.adminUsers = { ADMIN_B }
+poisoned.members = {}
+poisoned.lootMode = "reward_pot"
+poisoned.rewardPot = { startingPotCopper = 999999, deductionType = "percent", deductionValue = 50 }
+poisoned.raidCheck = coord:GetRaidCheckConfig()
+poisoned.raidCheck = {
+    enableWhispersPreRaid = true,
+    enableWhispersRaid = true,
+    enableWhispersRaidPrepared = true,
+    pointsAwardPerRaidCheck = 999,
+    slots = poisoned.raidCheck and poisoned.raidCheck.slots or {},
+}
+poisoned.equipmentSnapshots = {
+    [WINNER] = { capturedAt = 1, averageItemLevel = 999, slotsByInventory = {} },
+}
+if type(poisoned.lootLogs) == "table" and poisoned.lootLogs[1] then
+    poisoned.lootLogs[1]._fingerprint = "deadbeef-forged"
+end
+
+Sync:HandleProfileSnapshot(ADMIN_B, {
+    sessionId = Sync.state.sessionId,
+    profileId = coord:GetProfileId(),
+    snapshot = poisoned,
+    reason = "rc-integration",
+})
+assertEq(coord:GetOwnerId(), startingOwner, "ordinary admin PROFILE_SNAPSHOT cannot steal owner")
+assertEq(#(coord:GetAdminUsers() or {}), #startingAdmins, "ordinary admin PROFILE_SNAPSHOT cannot replace admins")
+assertEq(coord:GetLootMode(), startingLootMode, "ordinary admin PROFILE_SNAPSHOT cannot change loot mode")
+assertEq(coord:GetRewardPotConfig().startingPotCopper, startingPot.startingPotCopper, "ordinary admin PROFILE_SNAPSHOT cannot change Reward Pot")
+assertEq(coord:GetRaidCheckConfig().pointsAwardPerRaidCheck, startingRaid.pointsAwardPerRaidCheck, "ordinary admin PROFILE_SNAPSHOT cannot change Raid Check")
+assertEq(#(coord._members or {}), startingMemberCount, "ordinary admin PROFILE_SNAPSHOT cannot replace members")
+assertEq(#(coord:GetLootLogs() or {}), startingLogCount, "ordinary admin PROFILE_SNAPSHOT cannot replace logs")
+if startingFp then
+    assertEq(coord:GetLootLogs()[1]:GetFingerprint(), startingFp, "ordinary admin PROFILE_SNAPSHOT cannot rewrite fingerprints")
+end
+assertTrue(coord._raidCheckEquipmentSnapshots == startingEquip or not next(coord._raidCheckEquipmentSnapshots or {}), "ordinary admin PROFILE_SNAPSHOT cannot install equipment snapshots")
+
+local capturedReq = {}
+SF.LootHelperComm = {
+    Send = function(_, channel, msgType, payload, dist, target)
+        capturedReq[#capturedReq + 1] = {
+            channel = channel,
+            msgType = msgType,
+            payload = payload,
+            dist = dist,
+            target = target,
+        }
+    end,
+}
+
+local adminCfg = {
+    recordAwards = true,
+    recordAllAwardTypes = false,
+    allowedResponses = { "Need" },
+    bisResponses = {
+        { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false, key = "default:1" },
+    },
+}
+Sync:HandleRCConfigRequest(ADMIN_B, {
+    sessionId = Sync.state.sessionId,
+    profileId = coord:GetProfileId(),
+    rcLootCouncilIntegration = adminCfg,
+    snapshot = poisoned,
+    meta = { _owner = ADMIN_B },
+    adminUsers = { ADMIN_B },
+    lootLogs = poisoned.lootLogs,
+})
+assertEq(coord:GetOwnerId(), startingOwner, "RC_CONFIG_REQ cannot become canonical owner")
+assertEq(#(coord:GetAdminUsers() or {}), #startingAdmins, "RC_CONFIG_REQ cannot replace admins")
+assertEq(coord:GetLootMode(), startingLootMode, "RC_CONFIG_REQ cannot change loot mode")
+assertEq(coord:GetRewardPotConfig().startingPotCopper, startingPot.startingPotCopper, "RC_CONFIG_REQ cannot change Reward Pot")
+assertEq(coord:GetRaidCheckConfig().pointsAwardPerRaidCheck, startingRaid.pointsAwardPerRaidCheck, "RC_CONFIG_REQ cannot change Raid Check")
+assertEq(#(coord._members or {}), startingMemberCount, "RC_CONFIG_REQ cannot replace members")
+assertEq(#(coord:GetLootLogs() or {}), startingLogCount, "RC_CONFIG_REQ cannot replace logs")
+local afterCfg = coord:GetRCLootCouncilIntegrationConfig()
+assertFalse(afterCfg.recordAllAwardTypes, "RC_CONFIG_REQ still applies RC settings")
+assertEq(afterCfg.allowedResponses[1], "Need", "RC_CONFIG_REQ applied allowed responses")
+assertTrue(#capturedReq >= 1 and capturedReq[#capturedReq].msgType == Sync.MSG.RC_CONFIG_SET, "coordinator broadcasts RC_CONFIG_SET")
+assertTrue(capturedReq[#capturedReq].payload.snapshot == nil, "authoritative SET has no snapshot")
+
+Sync:HandleRCConfigSet(ADMIN_B, {
+    sessionId = Sync.state.sessionId,
+    profileId = coord:GetProfileId(),
+    coordinator = ADMIN_B,
+    seq = 99,
+    rcLootCouncilIntegration = {
+        recordAwards = false,
+        recordAllAwardTypes = true,
+        allowedResponses = {},
+        bisResponses = {},
+    },
+    snapshot = poisoned,
+})
+assertTrue(coord:GetRCLootCouncilIntegrationConfig().recordAwards, "non-coordinator RC_CONFIG_SET is ignored")
+assertEq(coord:GetOwnerId(), startingOwner, "spoofed RC_CONFIG_SET cannot steal owner")
+
+-- Non-coordinator admin publishes RC_CONFIG_REQ, not a full snapshot
+resetEnv()
+local follower = makeProfile("RC Follower")
+addMember(follower, WINNER)
+setActive(follower)
+startSessionOn(follower)
+Sync.state.isCoordinator = false
+Sync.state.coordinator = "Coord-Garona"
+capturedReq = {}
+SF.LootHelperComm = {
+    Send = function(_, channel, msgType, payload, dist, target)
+        capturedReq[#capturedReq + 1] = {
+            channel = channel,
+            msgType = msgType,
+            payload = payload,
+            dist = dist,
+            target = target,
+        }
+    end,
+}
+assertTrue(follower:SetRCLootCouncilRecordAllAwardTypes(false), "follower can change RC settings locally")
+assertEq(capturedReq[1].msgType, Sync.MSG.RC_CONFIG_REQ, "non-coordinator proposes RC_CONFIG_REQ")
+assertEq(capturedReq[1].target, "Coord-Garona", "REQ is whispered to the coordinator")
+assertTrue(capturedReq[1].payload.snapshot == nil, "REQ does not include a full snapshot")
+assertTrue(capturedReq[1].payload.rcLootCouncilIntegration ~= nil, "REQ carries RC config only")
+
+-- Concurrent A/B edits: opposite SET delivery still converges
+resetEnv()
+local shared = makeProfile("RC Concurrent")
+addMember(shared, WINNER)
+addMember(shared, ADMIN_A)
+addMember(shared, ADMIN_B)
+assertTrue(shared:AddAdminMemberId(ADMIN_A, { skipPermission = true, skipBroadcast = true }), "Admin A joined concurrent profile")
+assertTrue(shared:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Admin B joined concurrent profile")
+assertTrue(shared:AddRCLootCouncilBisResponse({
+    text = "Need",
+    typeCode = "default",
+    responseId = 1,
+    isAwardReason = false,
+}), "shared starting Need BiS")
+setActive(shared)
+startSessionOn(shared)
+local peerC = cloneProfileAs("PeerC", shared)
+local peerD = cloneProfileAs("PeerD", shared)
+capturedReq = {}
+SF.LootHelperComm = {
+    Send = function(_, channel, msgType, payload, dist, target)
+        capturedReq[#capturedReq + 1] = {
+            channel = channel,
+            msgType = msgType,
+            payload = payload,
+            dist = dist,
+            target = target,
+        }
+    end,
+}
+local cfgA = {
+    recordAwards = true,
+    recordAllAwardTypes = false,
+    allowedResponses = { "Need" },
+    bisResponses = {
+        { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+    },
+}
+local cfgB = {
+    recordAwards = true,
+    recordAllAwardTypes = true,
+    allowedResponses = {},
+    bisResponses = {
+        { text = "Greed", typeCode = "default", responseId = 2, isAwardReason = false },
+    },
+}
+Sync:HandleRCConfigRequest(ADMIN_A, {
+    sessionId = Sync.state.sessionId,
+    profileId = shared:GetProfileId(),
+    rcLootCouncilIntegration = cfgA,
+})
+Sync:HandleRCConfigRequest(ADMIN_B, {
+    sessionId = Sync.state.sessionId,
+    profileId = shared:GetProfileId(),
+    rcLootCouncilIntegration = cfgB,
+})
+local sets = {}
+for i = 1, #capturedReq do
+    if capturedReq[i].msgType == Sync.MSG.RC_CONFIG_SET then
+        sets[#sets + 1] = capturedReq[i].payload
+    end
+end
+assertEq(#sets, 2, "coordinator published two authoritative SETs")
+assertTrue(sets[1].seq < sets[2].seq, "coordinator seq is monotonic")
+
+local function applySets(profile, order)
+    local previousPlayer = PLAYER
+    PLAYER = "Peer-Garona"
+    withLocalProfile(profile, function()
+        for i = 1, #order do
+            Sync:HandleRCConfigSet("Tester-Garona", order[i])
+        end
+    end)
+    PLAYER = previousPlayer
+end
+applySets(peerC, { sets[1], sets[2] })
+applySets(peerD, { sets[2], sets[1] })
+local coordCfg = shared:GetRCLootCouncilIntegrationConfig()
+local cCfg = peerC:GetRCLootCouncilIntegrationConfig()
+local dCfg = peerD:GetRCLootCouncilIntegrationConfig()
+assertTrue(cfgEqual(coordCfg, cCfg), "peer C matches coordinator")
+assertTrue(cfgEqual(coordCfg, dCfg), "peer D matches coordinator despite reversed delivery")
+assertTrue(coordCfg.recordAllAwardTypes, "later coordinator-accepted config is B")
+assertEq(coordCfg.bisResponses[1].responseId, 2, "converged BiS list is Admin B's Greed")
+assertEq(peerC._rcConfigSeq, sets[2].seq, "peer C stored the highest seq")
+assertEq(peerD._rcConfigSeq, sets[2].seq, "peer D stored the highest seq")
+
+local greedCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+    id = "1700000911-1",
+    response = "Greed",
+    responseID = 2,
+}))
+assertTrue(shared:TryAddRCLootCouncilAward(greedCanon), "coordinator records the converged Greed award")
+assertTrue(peerC:TryAddRCLootCouncilAward(greedCanon), "peer C records the same award")
+assertTrue(peerD:TryAddRCLootCouncilAward(greedCanon), "peer D records the same award")
+local function awardOutcome(profile)
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+        if data and data.awardKey == greedCanon.awardKey then
+            return data.outcome, data.qualified
+        end
+    end
+end
+local o1, q1 = awardOutcome(shared)
+local o2, q2 = awardOutcome(peerC)
+local o3, q3 = awardOutcome(peerD)
+assertEq(q1, true, "coordinator qualifies Greed after convergence")
+assertEq(q2, q1, "peer C matches coordinator qualification")
+assertEq(q3, q1, "peer D matches coordinator qualification")
+assertEq(o2, o1, "peer C matches coordinator outcome")
+assertEq(o3, o1, "peer D matches coordinator outcome")
+SF.LootHelperComm = nil
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

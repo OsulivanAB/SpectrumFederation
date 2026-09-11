@@ -103,6 +103,7 @@ local ITEM_META = {
     ["19019"] = { loc = "INVTYPE_2HWEAPON", class = 2, sub = 1 },
     ["19020"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 0 },
     ["19021"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 13 },
+    ["19022"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 4 },
 }
 
 function GetItemInfoInstant(link)
@@ -903,14 +904,16 @@ assertTrue(later2h:AddRCLootCouncilBisResponse("Need"))
 assertTrue(later2h:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700004000")))
 assertTrue(later2h:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700004001")))
 later2h:ApplyIdentityProjection({ force = true })
-assertEq(slotState(later2h, ALT_A, "Weapon"), "ASSIGNED_AUTO", "existing 1H remains")
-local sawLaterOverflow = false
+local sawArms1hUnknown = false
 for _, log in ipairs(later2h:GetLootLogs()) do
-    if log:GetEventType() == "BIS_OUTCOME" and log:GetEventData().outcome == "OVERFLOW" then
-        sawLaterOverflow = true
+    local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+    if data and data.unresolvedReason == "UNKNOWN_COMPAT" then
+        sawArms1hUnknown = true
     end
 end
-assertTrue(sawLaterOverflow, "incompatible later 2H is frozen OVERFLOW")
+assertTrue(sawArms1hUnknown, "Arms rejects a 1H as combat BiS")
+assertEq(slotState(later2h, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Arms 2H occupies Weapon")
+assertEq(slotState(later2h, ALT_A, "OffHand"), "ASSIGNED_AUTO", "Arms 2H occupies OffHand")
 
 -- Gear Override 2H on Arms occupies both slots as one assignment
 resetEnv()
@@ -1588,8 +1591,8 @@ assertTrue(mageTwoHUnresolved, "Mage rejects a 2H sword")
 -- Writer occupancy parity: 2H OffHand click cannot succeed while Weapon is occupied
 resetEnv()
 local twoHBlock = makeProfile("TwoHBlock")
-addMember(twoHBlock, ALT_A)
-assertTrue(twoHBlock:SetMemberSpec(ALT_A, 71), "Arms")
+addMember(twoHBlock, ALT_A, "member", "PALADIN")
+assertTrue(twoHBlock:SetMemberSpec(ALT_A, 65), "Holy Paladin")
 assertTrue(twoHBlock:AddRCLootCouncilBisResponse("Need"))
 assertTrue(twoHBlock:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700013600")))
 twoHBlock:ApplyIdentityProjection({ force = true })
@@ -1896,6 +1899,184 @@ assertEq(aOut, bOut, "both admins freeze the same automatic outcome")
 assertEq(aOut, "ASSIGNED", "Greed helm assigns after both clients share BiS config")
 end
 extraCorrectnessTests()
+
+local function atomicReplaceTests()
+    local function rcKey(canonical)
+        return SF.LootHelperBis.AwardRefKey("RC", canonical.awardKey)
+    end
+
+    -- Unknown-item REPLACE reaches the reducer after occupancy, then CreateAssignment
+    -- returns nil. The original assignment must remain fully active.
+    resetEnv()
+    local atomic = makeProfile("AtomicReplace")
+    addMember(atomic, ALT_A)
+    assertTrue(atomic:SetMemberSpec(ALT_A, 72), "Fury")
+    assertTrue(atomic:AddRCLootCouncilBisResponse("Need"))
+    local rcCanon = makeCanonical(ALT_A, 19005, "Need", "1700030000")
+    assertTrue(atomic:TryAddRCLootCouncilAward(rcCanon))
+    atomic:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(atomic, ALT_A, "Weapon"), "ASSIGNED_AUTO", "1H is assigned before failed REPLACE")
+    local targetId = atomic:GetIdentityBisSlots(ALT_A).Weapon.assignmentId
+    assertTrue(type(targetId) == "string" and targetId ~= "", "target assignment id exists")
+    local unknownLink = itemLink(19999, "Unknown")
+    local man = addLog(atomic, "MANUAL_AWARD", {
+        member = ALT_A,
+        itemLink = unknownLink,
+        itemString = SF.LootLog.ExtractItemString(unknownLink),
+    })
+    local override = addLog(atomic, "BIS_OVERRIDE", {
+        action = "REPLACE",
+        viewMember = ALT_A,
+        targetAssignmentId = targetId,
+        awardRef = { kind = "MANUAL", id = man:GetID() },
+        sourceLogId = man:GetID(),
+        assignedSlots = { "Weapon" },
+        slotBinding = "BOUND",
+        assignmentScopeMembers = { ALT_A },
+    })
+    atomic:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(atomic, ALT_A, "Weapon"), "ASSIGNED_AUTO", "failed REPLACE is not an implicit CLEAR")
+    local state = atomic:GetIdentityProjection().bis.state
+    local original = state.assignments[targetId]
+    assertTrue(original and original.active == true, "original assignment remains active")
+    assertEq(state.activeByAward[rcKey(rcCanon)], targetId, "activeByAward still points at the original")
+    local created = state.assignments[override:GetID()]
+    assertTrue(created == nil or created.active ~= true, "failed replacement assignment is absent")
+
+    -- Legacy-associated Ring REPLACE failure restores associationByOrigin too.
+    resetEnv()
+    local ringAt = makeProfile("AtomicRingReplace")
+    addMember(ringAt, ALT_A)
+    local origin = addLog(ringAt, "ARMOR_CHANGE", {
+        member = ALT_A,
+        slot = "Ring1",
+        action = "USED",
+    })
+    ringAt:ApplyIdentityProjection({ force = true })
+    assertTrue(ringAt:AddManualAward(ALT_A, itemLink(19002, "RingA")))
+    local ringMan
+    for _, award in ipairs(ringAt:GetIdentityAwardPool(ALT_A)) do
+        if award.kind == "MANUAL" then
+            ringMan = award.id
+        end
+    end
+    assertTrue(ringAt:PlaceGearOverrideAward(ALT_A, "Ring1", { kind = "MANUAL", id = ringMan }), "bind Ring1")
+    ringAt:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(ringAt, ALT_A, "Ring1"), "ASSIGNED_OVERRIDE", "ring is assigned")
+    local ringTarget = ringAt:GetIdentityBisSlots(ALT_A).Ring1.assignmentId
+    local beforeState = ringAt:GetIdentityProjection().bis.state
+    local beforeAsg = beforeState.assignments[ringTarget]
+    assertTrue(beforeAsg and beforeAsg.active == true, "ring assignment is active before failed REPLACE")
+    local originKey = beforeAsg.legacyOriginLogId
+    if originKey then
+        assertEq(beforeState.associationByOrigin[originKey], ringTarget, "origin maps to the ring assignment")
+    end
+    local unknownRing = itemLink(19998, "UnknownRing")
+    local man2 = addLog(ringAt, "MANUAL_AWARD", {
+        member = ALT_A,
+        itemLink = unknownRing,
+        itemString = SF.LootLog.ExtractItemString(unknownRing),
+    })
+    addLog(ringAt, "BIS_OVERRIDE", {
+        action = "REPLACE",
+        viewMember = ALT_A,
+        targetAssignmentId = ringTarget,
+        awardRef = { kind = "MANUAL", id = man2:GetID() },
+        sourceLogId = man2:GetID(),
+        assignedSlots = { "Ring1" },
+        slotBinding = "BOUND",
+        assignmentScopeMembers = { ALT_A },
+    })
+    ringAt:ApplyIdentityProjection({ force = true })
+    local afterState = ringAt:GetIdentityProjection().bis.state
+    local afterAsg = afterState.assignments[ringTarget]
+    assertTrue(afterAsg and afterAsg.active == true, "failed ring REPLACE keeps the original assignment")
+    assertEq(slotState(ringAt, ALT_A, "Ring1"), "ASSIGNED_OVERRIDE", "Ring1 stays assigned")
+    if originKey then
+        assertEq(afterState.associationByOrigin[originKey], ringTarget, "associationByOrigin is restored")
+        assertEq(afterAsg.legacyOriginLogId, originKey, "legacy origin id is unchanged")
+    end
+end
+atomicReplaceTests()
+
+local function combatWeaponAuditTests()
+    local function sawUnresolved(profile)
+        for _, log in ipairs(profile:GetLootLogs()) do
+            local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+            if data and data.unresolvedReason == "UNKNOWN_COMPAT" then
+                return true
+            end
+        end
+        return false
+    end
+    local n = 0
+    local function case(opts)
+        n = n + 1
+        resetEnv()
+        local p = makeProfile("Wep" .. tostring(n))
+        addMember(p, ALT_A, "member", opts.class)
+        assertTrue(p:SetMemberSpec(ALT_A, opts.spec), opts.name .. " spec")
+        assertTrue(p:AddRCLootCouncilBisResponse("Need"))
+        assertTrue(p:TryAddRCLootCouncilAward(makeCanonical(ALT_A, opts.item, "Need", tostring(1700040000 + n))))
+        p:ApplyIdentityProjection({ force = true })
+        if opts.unresolved then
+            assertTrue(sawUnresolved(p), opts.name)
+            if opts.weapon ~= false then
+                assertEq(slotState(p, ALT_A, "Weapon"), "AVAILABLE", opts.name .. " does not occupy Weapon")
+            end
+        else
+            assertEq(slotState(p, ALT_A, opts.slot or "Weapon"), opts.state or "ASSIGNED_AUTO", opts.name)
+            if opts.offhand then
+                assertEq(slotState(p, ALT_A, "OffHand"), opts.offhand, opts.name .. " OffHand")
+            end
+        end
+    end
+
+    case({ name = "Arms 2H sword is combat BiS", class = "WARRIOR", spec = 71, item = 19004, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Arms 1H sword is not combat BiS", class = "WARRIOR", spec = 71, item = 19005, unresolved = true })
+    case({ name = "Fury 1H sword is combat BiS", class = "WARRIOR", spec = 72, item = 19005 })
+    case({ name = "Fury 2H sword is combat BiS", class = "WARRIOR", spec = 72, item = 19004 })
+    case({ name = "Protection Warrior 1H is combat BiS", class = "WARRIOR", spec = 73, item = 19005 })
+    case({ name = "Protection Warrior 2H is not combat BiS", class = "WARRIOR", spec = 73, item = 19004, unresolved = true })
+    case({ name = "Retribution 2H is combat BiS", class = "PALADIN", spec = 70, item = 19004, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Retribution 1H is not combat BiS", class = "PALADIN", spec = 70, item = 19005, unresolved = true })
+    case({ name = "Holy Paladin 1H is combat BiS", class = "PALADIN", spec = 65, item = 19005 })
+    case({ name = "Protection Paladin 1H is combat BiS", class = "PALADIN", spec = 66, item = 19005 })
+    case({ name = "Protection Paladin 2H is not combat BiS", class = "PALADIN", spec = 66, item = 19004, unresolved = true })
+    case({ name = "Blood DK 2H is combat BiS", class = "DEATHKNIGHT", spec = 250, item = 19004, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Blood DK 1H is not combat BiS", class = "DEATHKNIGHT", spec = 250, item = 19005, unresolved = true })
+    case({ name = "Frost DK 1H is combat BiS", class = "DEATHKNIGHT", spec = 251, item = 19005 })
+    case({ name = "Frost DK 2H is combat BiS", class = "DEATHKNIGHT", spec = 251, item = 19004, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Unholy DK 2H is combat BiS", class = "DEATHKNIGHT", spec = 252, item = 19004, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Unholy DK 1H is not combat BiS", class = "DEATHKNIGHT", spec = 252, item = 19005, unresolved = true })
+    case({ name = "Enhancement dagger is combat BiS", class = "SHAMAN", spec = 263, item = 19015 })
+    case({ name = "Enhancement 2H axe is not combat BiS", class = "SHAMAN", spec = 263, item = 19019, unresolved = true })
+    case({ name = "Elemental staff is combat BiS", class = "SHAMAN", spec = 262, item = 19012, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Feral polearm is combat BiS", class = "DRUID", spec = 103, item = 19013, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Feral 1H mace is not combat BiS", class = "DRUID", spec = 103, item = 19022, unresolved = true })
+    case({ name = "Guardian 2H mace is combat BiS", class = "DRUID", spec = 104, item = 19014, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Guardian 1H mace is not combat BiS", class = "DRUID", spec = 104, item = 19022, unresolved = true })
+    case({ name = "Balance staff is combat BiS", class = "DRUID", spec = 102, item = 19012, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Brewmaster staff is combat BiS", class = "MONK", spec = 268, item = 19012, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Windwalker 1H sword is combat BiS", class = "MONK", spec = 269, item = 19005 })
+    case({ name = "Mistweaver staff is combat BiS", class = "MONK", spec = 270, item = 19012, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Discipline priest staff is combat BiS", class = "PRIEST", spec = 256, item = 19012, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Fire Mage wand is combat BiS", class = "MAGE", spec = 63, item = 19017 })
+    case({ name = "Affliction Warlock staff is combat BiS", class = "WARLOCK", spec = 265, item = 19012, offhand = "ASSIGNED_AUTO" })
+    case({ name = "Assassination dagger is combat BiS", class = "ROGUE", spec = 259, item = 19015 })
+    case({ name = "Assassination 1H sword is not combat BiS", class = "ROGUE", spec = 259, item = 19005, unresolved = true })
+    case({ name = "Outlaw 1H sword is combat BiS", class = "ROGUE", spec = 260, item = 19005 })
+    case({ name = "Subtlety dagger is combat BiS", class = "ROGUE", spec = 261, item = 19015 })
+    case({ name = "Havoc warglaive is combat BiS", class = "DEMONHUNTER", spec = 577, item = 19018 })
+    case({ name = "Devastation Evoker 1H axe is combat BiS", class = "EVOKER", spec = 1467, item = 19020 })
+    case({ name = "Devastation Evoker fist is combat BiS", class = "EVOKER", spec = 1467, item = 19021 })
+    case({ name = "Preservation Evoker 1H sword is combat BiS", class = "EVOKER", spec = 1468, item = 19005 })
+    case({ name = "Augmentation Evoker 2H sword is not class-valid", class = "EVOKER", spec = 1473, item = 19004, unresolved = true })
+    case({ name = "Beast Mastery bow is combat BiS", class = "HUNTER", spec = 253, item = 19016 })
+    case({ name = "Marksmanship bow is combat BiS", class = "HUNTER", spec = 254, item = 19016 })
+    case({ name = "Survival 1H axe is combat BiS", class = "HUNTER", spec = 255, item = 19020 })
+end
+combatWeaponAuditTests()
 
 local function finalPassTests()
 local function sawUnresolved(profile)
