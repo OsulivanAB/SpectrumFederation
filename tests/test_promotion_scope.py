@@ -662,6 +662,18 @@ def test_merge_jobs_materialize_helper_that_supports_validate_versions():
     )
 
 
+def test_promotion_detect_and_fast_forward_materialize_helper_for_leftover_beta():
+    workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "promote-beta-to-main.yml"
+    text = workflow.read_text(encoding="utf-8")
+    detect_block = text[text.index("detect-promotion-scope:") : text.index("dry-run-pre-merge-validation:")]
+    assert "materialize_scope_helper \"$WORKFLOW_SHA\"" in detect_block
+    assert "python3 /tmp/promotion-scope/classify_promotion_scope.py" in detect_block
+    assert "python3 .github/scripts/classify_promotion_scope.py" not in detect_block
+    assert 'git show "$EXPECTED_TARGET:.github/scripts/classify_promotion_scope.py"' not in text
+    assert text.count("materialize_scope_helper \"$WORKFLOW_SHA\"") == 3
+    assert text.count("materialize_scope_helper origin/main") == 3
+
+
 def test_pr_beta_validation_gates_release_checks_on_packaged_scope():
     workflow = (
         Path(__file__).resolve().parents[1]

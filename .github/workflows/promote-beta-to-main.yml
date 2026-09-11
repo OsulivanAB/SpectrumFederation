@@ -57,11 +57,34 @@ jobs:
 
       - name: Classify incoming promotion range
         id: scope
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
           # Capture SHAs before any later workflow commit can rewrite HEAD.
           # origin/main...HEAD is merge-base(main, beta)..beta: the changes
           # being promoted, not commits that already exist only on main.
-          python3 .github/scripts/classify_promotion_scope.py \
+          git cat-file -t "$WORKFLOW_SHA" >/dev/null || git fetch --no-tags origin "$WORKFLOW_SHA"
+          mkdir -p /tmp/promotion-scope
+          materialize_scope_helper() {
+            local ref="$1"
+            git cat-file -e "$ref:.github/scripts/classify_promotion_scope.py" 2>/dev/null || return 1
+            git show "$ref:.github/scripts/classify_promotion_scope.py" \
+              > /tmp/promotion-scope/classify_promotion_scope.py
+            git show "$ref:.github/scripts/validate_packaging.py" \
+              > /tmp/promotion-scope/validate_packaging.py
+            grep -q -- 'merge_required=' /tmp/promotion-scope/classify_promotion_scope.py
+          }
+          # Prefer the dispatched workflow commit so leftover beta that predates
+          # this helper can still be classified. Fall back to origin/main, then
+          # the live beta checkout.
+          if ! (materialize_scope_helper "$WORKFLOW_SHA" \
+            || materialize_scope_helper origin/main \
+            || materialize_scope_helper HEAD); then
+            echo "::error::Could not materialize classify_promotion_scope.py from the dispatched workflow commit, origin/main, or live beta."
+            exit 1
+          fi
+          python3 /tmp/promotion-scope/classify_promotion_scope.py \
             --base origin/main \
             --head HEAD \
             --github-output \
@@ -593,15 +616,30 @@ jobs:
         env:
           EXPECTED_BASE: ${{ needs.dry-run-merge-beta-to-main.outputs.promotion_base_sha }}
           EXPECTED_TARGET: ${{ needs.dry-run-merge-beta-to-main.outputs.promotion_target_sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           git fetch origin main beta
           git cat-file -t "$EXPECTED_TARGET" >/dev/null || git fetch origin "$EXPECTED_TARGET"
+          git cat-file -t "$WORKFLOW_SHA" >/dev/null || git fetch --no-tags origin "$WORKFLOW_SHA"
           mkdir -p /tmp/promotion-scope
-          git show "$EXPECTED_TARGET:.github/scripts/classify_promotion_scope.py" \
-            > /tmp/promotion-scope/classify_promotion_scope.py
-          git show "$EXPECTED_TARGET:.github/scripts/validate_packaging.py" \
-            > /tmp/promotion-scope/validate_packaging.py
+          materialize_scope_helper() {
+            local ref="$1"
+            git cat-file -e "$ref:.github/scripts/classify_promotion_scope.py" 2>/dev/null || return 1
+            git show "$ref:.github/scripts/classify_promotion_scope.py" \
+              > /tmp/promotion-scope/classify_promotion_scope.py
+            git show "$ref:.github/scripts/validate_packaging.py" \
+              > /tmp/promotion-scope/validate_packaging.py
+            grep -q -- '--verify-refs' /tmp/promotion-scope/classify_promotion_scope.py
+          }
+          # Leftover beta may predate --verify-refs. Prefer the dispatched
+          # workflow commit, then origin/main, then the captured target.
+          if ! (materialize_scope_helper "$WORKFLOW_SHA" \
+            || materialize_scope_helper origin/main \
+            || materialize_scope_helper "$EXPECTED_TARGET"); then
+            echo "::error::Could not materialize classify_promotion_scope.py from the dispatched workflow commit, origin/main, or the captured beta SHA."
+            exit 1
+          fi
           python3 /tmp/promotion-scope/classify_promotion_scope.py \
             --verify-refs \
             --expected-base "$EXPECTED_BASE" \
@@ -1257,15 +1295,30 @@ jobs:
         env:
           EXPECTED_BASE: ${{ needs.merge-beta-to-main.outputs.promotion_base_sha }}
           EXPECTED_TARGET: ${{ needs.merge-beta-to-main.outputs.promotion_target_sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           git fetch origin main beta
           git cat-file -t "$EXPECTED_TARGET" >/dev/null || git fetch origin "$EXPECTED_TARGET"
+          git cat-file -t "$WORKFLOW_SHA" >/dev/null || git fetch --no-tags origin "$WORKFLOW_SHA"
           mkdir -p /tmp/promotion-scope
-          git show "$EXPECTED_TARGET:.github/scripts/classify_promotion_scope.py" \
-            > /tmp/promotion-scope/classify_promotion_scope.py
-          git show "$EXPECTED_TARGET:.github/scripts/validate_packaging.py" \
-            > /tmp/promotion-scope/validate_packaging.py
+          materialize_scope_helper() {
+            local ref="$1"
+            git cat-file -e "$ref:.github/scripts/classify_promotion_scope.py" 2>/dev/null || return 1
+            git show "$ref:.github/scripts/classify_promotion_scope.py" \
+              > /tmp/promotion-scope/classify_promotion_scope.py
+            git show "$ref:.github/scripts/validate_packaging.py" \
+              > /tmp/promotion-scope/validate_packaging.py
+            grep -q -- '--verify-refs' /tmp/promotion-scope/classify_promotion_scope.py
+          }
+          # Leftover beta may predate --verify-refs. Prefer the dispatched
+          # workflow commit, then origin/main, then the captured target.
+          if ! (materialize_scope_helper "$WORKFLOW_SHA" \
+            || materialize_scope_helper origin/main \
+            || materialize_scope_helper "$EXPECTED_TARGET"); then
+            echo "::error::Could not materialize classify_promotion_scope.py from the dispatched workflow commit, origin/main, or the captured beta SHA."
+            exit 1
+          fi
           python3 /tmp/promotion-scope/classify_promotion_scope.py \
             --verify-refs \
             --expected-base "$EXPECTED_BASE" \
