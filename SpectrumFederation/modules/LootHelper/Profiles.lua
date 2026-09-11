@@ -117,7 +117,90 @@ local function CopyAllowedResponses(values)
 end
 
 local function CopyBisResponses(values)
-	return CopyAllowedResponses(values)
+	local copied = {}
+	local seen = {}
+	if type(values) ~= "table" then
+		return copied
+	end
+	for _, value in ipairs(values) do
+		local entry
+		if type(value) == "string" then
+			local trimmed = NormalizeAllowedResponse(value)
+			if trimmed then
+				entry = {
+					key = "text:" .. string.lower(trimmed),
+					text = trimmed,
+				}
+			end
+		elseif type(value) == "table" then
+			local text = NormalizeAllowedResponse(value.text or value.label)
+			local responseId = value.responseId
+			if responseId == nil then
+				responseId = value.responseID
+			end
+			local typeCode = value.typeCode
+			if type(typeCode) ~= "string" or strtrim(typeCode) == "" then
+				typeCode = nil
+			else
+				typeCode = strtrim(typeCode)
+			end
+			local isAwardReason = value.isAwardReason and true or false
+			if responseId ~= nil then
+				entry = {
+					key = string.format("ctx:%s|%s|%s", tostring(typeCode or "default"), tostring(responseId), isAwardReason and "1" or "0"),
+					text = text or tostring(responseId),
+					typeCode = typeCode or "default",
+					responseId = responseId,
+					isAwardReason = isAwardReason,
+				}
+			elseif text then
+				entry = {
+					key = "text:" .. string.lower(text),
+					text = text,
+				}
+			end
+		end
+		if entry and entry.key and not seen[entry.key] then
+			seen[entry.key] = true
+			copied[#copied + 1] = entry
+		end
+	end
+	return copied
+end
+
+local function BisResponseDisplayId(entry)
+	if type(entry) == "table" then
+		return entry.key or entry.text
+	end
+	return entry
+end
+
+local function BisEntryMatchesCanonical(entry, response, meta)
+	if type(entry) ~= "table" then
+		return false
+	end
+	meta = meta or {}
+	if entry.responseId ~= nil and meta.responseId ~= nil then
+		if tostring(entry.responseId) ~= tostring(meta.responseId) then
+			return false
+		end
+		local entryCode = entry.typeCode or "default"
+		local metaCode = meta.typeCode or "default"
+		if entryCode ~= metaCode then
+			return false
+		end
+		local entryAward = entry.isAwardReason and true or false
+		local metaAward = meta.isAwardReason and true or false
+		if entryAward ~= metaAward then
+			return false
+		end
+		return true
+	end
+	local text = NormalizeAllowedResponse(response)
+	if not text or type(entry.text) ~= "string" then
+		return false
+	end
+	return string.lower(entry.text) == string.lower(text)
 end
 
 local function NormalizeLootMode(value)
@@ -951,7 +1034,7 @@ end
 
 function LootProfile:IsItemAwareEquipmentPopup()
     local cfg = self:GetRCLootCouncilIntegrationConfig()
-    local bisConfigured = type(cfg.bisResponses) == "table" and #cfg.bisResponses > 0
+    local bisConfigured = cfg.recordAwards and type(cfg.bisResponses) == "table" and #cfg.bisResponses > 0
     local result = self._identityProjection
     local Bis = SF.LootHelperBis
     if Bis and Bis.IsItemAwarePopup then
@@ -1609,15 +1692,14 @@ function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
 	return true, nil
 end
 
-function LootProfile:IsBisQualifyingResponse(response)
+function LootProfile:IsBisQualifyingResponse(response, meta)
 	self:_EnsureRCLootCouncilIntegrationConfig()
-	local trimmed = NormalizeAllowedResponse(response)
-	if not trimmed then
-		return false
+	if type(response) == "table" and meta == nil then
+		meta = response
+		response = response.response or response.text
 	end
-	local needle = string.lower(trimmed)
 	for _, existing in ipairs(self._rcLootCouncilIntegration.bisResponses or {}) do
-		if string.lower(existing) == needle then
+		if BisEntryMatchesCanonical(existing, response, meta) then
 			return true
 		end
 	end
@@ -1629,15 +1711,18 @@ function LootProfile:AddRCLootCouncilBisResponse(value)
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
-	local trimmed = NormalizeAllowedResponse(value)
-	if not trimmed then
+	local copied = CopyBisResponses({ value })
+	local entry = copied[1]
+	if not entry then
 		return false, "Enter a non-empty BiS response."
 	end
-	if self:IsBisQualifyingResponse(trimmed) then
-		return false, "That BiS response is already in the list."
+	for _, existing in ipairs(self._rcLootCouncilIntegration.bisResponses or {}) do
+		if existing.key == entry.key then
+			return false, "That BiS response is already in the list."
+		end
 	end
 	self._rcLootCouncilIntegration.bisResponses = self._rcLootCouncilIntegration.bisResponses or {}
-	self._rcLootCouncilIntegration.bisResponses[#self._rcLootCouncilIntegration.bisResponses + 1] = trimmed
+	self._rcLootCouncilIntegration.bisResponses[#self._rcLootCouncilIntegration.bisResponses + 1] = entry
 	return true, nil
 end
 
@@ -1646,15 +1731,20 @@ function LootProfile:RemoveRCLootCouncilBisResponse(value)
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
-	local trimmed = NormalizeAllowedResponse(value)
-	if not trimmed then
+	local needle
+	if type(value) == "table" then
+		needle = value.key or (CopyBisResponses({ value })[1] and CopyBisResponses({ value })[1].key)
+	else
+		needle = type(value) == "string" and value or nil
+	end
+	if type(needle) ~= "string" or needle == "" then
 		return false, "Select a BiS response to remove."
 	end
-	local key = string.lower(trimmed)
 	local filtered = {}
 	local removed = false
 	for _, existing in ipairs(self._rcLootCouncilIntegration.bisResponses or {}) do
-		if string.lower(existing) == key then
+		local id = BisResponseDisplayId(existing)
+		if id == needle or existing.key == needle or (existing.text and string.lower(existing.text) == string.lower(needle)) then
 			removed = true
 		else
 			filtered[#filtered + 1] = existing
@@ -1667,7 +1757,7 @@ function LootProfile:RemoveRCLootCouncilBisResponse(value)
 	return true, nil
 end
 
-function LootProfile:ShouldRecordRCResponse(response)
+function LootProfile:ShouldRecordRCResponse(response, meta)
 	local cfg = self:GetRCLootCouncilIntegrationConfig()
 	if not cfg.recordAwards then
 		return false
@@ -1675,8 +1765,12 @@ function LootProfile:ShouldRecordRCResponse(response)
 	if cfg.recordAllAwardTypes then
 		return true
 	end
-	if self:IsBisQualifyingResponse(response) then
+	if self:IsBisQualifyingResponse(response, meta) then
 		return true
+	end
+	if type(response) == "table" then
+		meta = meta or response
+		response = response.response or response.text
 	end
 	if type(response) ~= "string" then
 		return false
@@ -1708,7 +1802,7 @@ function LootProfile:TryAddRCLootCouncilAward(canonical)
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "not_admin"
 	end
-	if not self:ShouldRecordRCResponse(canonical.response) then
+	if not self:ShouldRecordRCResponse(canonical.response, canonical) then
 		return false, "filtered"
 	end
 	local awardKey = canonical.awardKey
@@ -1788,7 +1882,7 @@ function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical)
     local awardKey = canonical.awardKey
     local awardMember = canonical.winner
     local response = canonical.response
-    local qualified = self:IsBisQualifyingResponse(response)
+    local qualified = self:IsBisQualifyingResponse(response, canonical)
     local classif = Bis.ClassifyItem(canonical.itemLink or canonical.itemString)
     local storedSpec
     local member = self:getMemberByID(awardMember)
@@ -1825,13 +1919,15 @@ function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical)
     eventData.unresolvedReason = decided.unresolvedReason
     eventData.response = response
     eventData.responseId = canonical.responseId
+    eventData.isAwardReason = canonical.isAwardReason and true or false
+    eventData.typeCode = canonical.typeCode
     eventData.itemLink = canonical.itemLink
     eventData.itemString = canonical.itemString
     if decided.frozen then
         eventData.equipLoc = decided.frozen.equipLoc
         eventData.itemClass = decided.frozen.itemClass
         eventData.itemSubClass = decided.frozen.itemSubClass
-        eventData.typeCode = classif and classif.family
+        eventData.itemFamily = classif and classif.family
         eventData.isTwoHand = decided.frozen.isTwoHand
     end
     local logEntry = SF.LootLog.new(eventType, eventData, { profile = self })
@@ -1866,6 +1962,18 @@ function LootProfile:SetMemberSpec(memberId, specId, opts)
     if not self:getMemberByID(memberId) then
         return false, "That character is not a member of this profile."
     end
+    local member = self:getMemberByID(memberId)
+    local classToken = member and member.GetClass and member:GetClass()
+    if type(classToken) ~= "string" or classToken == "" then
+        return false, "That character's class is unknown."
+    end
+    local SpecWeapons = SF.LootHelperBis and SF.LootHelperBis.SpecWeapons
+    if not (SpecWeapons and SpecWeapons.IsKnownSpec and SpecWeapons.IsKnownSpec(specId)) then
+        return false, "Select a supported Retail specialization."
+    end
+    if not SpecWeapons.IsSpecValidForClass(specId, classToken) then
+        return false, "That specialization does not belong to this character's class."
+    end
     if not CurrentUserHasEffectiveLocalAdmin(self) then
         return false, "You must be an admin to change specialization."
     end
@@ -1873,12 +1981,8 @@ function LootProfile:SetMemberSpec(memberId, specId, opts)
     local eventData = SF.LootLog.GetEventDataTemplate(eventType)
     eventData.member = memberId
     eventData.specId = specId
-    local member = self:getMemberByID(memberId)
-    if member and member.GetClass then
-        eventData.class = member:GetClass()
-    end
-    local SpecWeapons = SF.LootHelperBis and SF.LootHelperBis.SpecWeapons
-    if SpecWeapons and SpecWeapons.SpecName then
+    eventData.class = classToken
+    if SpecWeapons.SpecName then
         eventData.specName = SpecWeapons.SpecName(specId)
     end
     local logEntry = SF.LootLog.new(eventType, eventData, {
@@ -1908,18 +2012,27 @@ function LootProfile:AddManualAward(memberId, itemLink, opts)
         return false, "That character is not a member of this profile."
     end
     if type(itemLink) ~= "string" or itemLink == "" then
-        return false, "Enter an item link."
+        return false, "Enter an item ID or item link."
     end
     if not CurrentUserHasEffectiveLocalAdmin(self) then
         return false, "You must be an admin to add loot."
     end
-    local itemString = (SF.LootLog and SF.LootLog.ExtractItemString and SF.LootLog.ExtractItemString(itemLink)) or itemLink
+    local canonicalLink, itemString, itemId, normalizeErr
+    if SF.LootHelperBis and SF.LootHelperBis.NormalizeAwardItemInput then
+        canonicalLink, itemString, itemId, normalizeErr = SF.LootHelperBis.NormalizeAwardItemInput(itemLink)
+        if not canonicalLink then
+            return false, normalizeErr or "Enter a valid item ID or item link."
+        end
+    else
+        canonicalLink = itemLink
+        itemString = (SF.LootLog and SF.LootLog.ExtractItemString and SF.LootLog.ExtractItemString(itemLink)) or itemLink
+        itemId = tonumber(itemString and itemString:match("item:(%d+)"))
+    end
     local eventType = SF.LootLogEventTypes.MANUAL_AWARD
     local eventData = SF.LootLog.GetEventDataTemplate(eventType)
     eventData.member = memberId
-    eventData.itemLink = itemLink
+    eventData.itemLink = canonicalLink
     eventData.itemString = itemString
-    local itemId = tonumber(itemString and itemString:match("item:(%d+)"))
     if itemId then
         eventData.itemId = itemId
     end
@@ -2048,18 +2161,37 @@ function LootProfile:ApplyBisOverride(action, opts)
         end
         eventData.assignmentScopeMembers = opts.assignmentScopeMembers
             or SortedIdentityMembers(self, ownerMember or opts.viewMember)
-        if type(eventData.assignedSlots) == "table" and SF.LootHelperBis and SF.LootHelperBis.NormalizeOverrideSlots then
-            local specId
-            local owner = ownerMember and self:getMemberByID(ownerMember)
-            if owner and owner.GetSpecId then
-                specId = owner:GetSpecId()
-            end
-            eventData.assignedSlots = SF.LootHelperBis.NormalizeOverrideSlots(
+        if type(eventData.assignedSlots) ~= "table" or not SF.LootHelperBis then
+            return false, "Select a compatible equipment slot."
+        end
+        local specId
+        local owner = ownerMember and self:getMemberByID(ownerMember)
+        if owner and owner.GetSpecId then
+            specId = owner:GetSpecId()
+        end
+        local resolved, resolveErr
+        if SF.LootHelperBis.ResolveOverrideSlots then
+            resolved, resolveErr = SF.LootHelperBis.ResolveOverrideSlots(
                 eventData.assignedSlots,
-                award and award.itemLink,
+                award and (award.itemLink or award.itemString),
                 specId
             )
+        else
+            resolved = eventData.assignedSlots
         end
+        if not resolved then
+            if resolveErr == "MISSING_SPEC" then
+                return false, "Set the award owner's specialization before assigning a weapon."
+            end
+            if resolveErr == "UNKNOWN_COMPAT" then
+                return false, "That item cannot be assigned to the selected slot for this specialization."
+            end
+            if resolveErr == "INCOMPATIBLE_SLOT" or resolveErr == "INVALID_SLOTS" then
+                return false, "That item does not fit the selected equipment slot."
+            end
+            return false, "That item cannot be assigned to the selected slot."
+        end
+        eventData.assignedSlots = resolved
     end
     if action == actions.ASSOCIATE_LEGACY then
         if type(opts.legacyOriginLogId) ~= "string" or opts.legacyOriginLogId == "" then
@@ -2067,26 +2199,59 @@ function LootProfile:ApplyBisOverride(action, opts)
         end
         local result = self:GetIdentityProjection()
         local state = result and result.bis and result.bis.state
-        local rec = state and state.contributingOrigins and state.contributingOrigins[opts.legacyOriginLogId]
-        if not rec or rec.active ~= true or rec.expired then
+        local ownerMember
+        local award
+        if state and state.awards and opts.awardRef then
+            local key = SF.LootHelperBis and SF.LootHelperBis.AwardRefKey
+                and SF.LootHelperBis.AwardRefKey(opts.awardRef.kind, opts.awardRef.id)
+            award = key and state.awards[key]
+            ownerMember = award and award.member
+        end
+        local origins = self:GetIdentityLegacyOrigins(ownerMember or opts.viewMember)
+        local rec
+        for i = 1, #origins do
+            if origins[i].originLogId == opts.legacyOriginLogId then
+                rec = origins[i]
+                break
+            end
+        end
+        if not rec then
             return false, "That legacy opportunity is not active."
         end
-        if state.associationByOrigin and state.associationByOrigin[opts.legacyOriginLogId] then
+        if state and state.associationByOrigin and state.associationByOrigin[opts.legacyOriginLogId] then
             return false, "That legacy opportunity is already associated."
         end
         eventData.legacyOriginLogId = opts.legacyOriginLogId
         eventData.sourceLogIds = { opts.legacyOriginLogId }
-        local result = self:GetIdentityProjection()
-        local state = result and result.bis and result.bis.state
-        local ownerMember
-        if state and state.awards and opts.awardRef then
-            local key = SF.LootHelperBis.AwardRefKey(opts.awardRef.kind, opts.awardRef.id)
-            local award = key and state.awards[key]
-            ownerMember = award and award.member
-        end
         eventData.assignmentScopeMembers = opts.assignmentScopeMembers
             or SortedIdentityMembers(self, ownerMember or opts.viewMember)
-        eventData.assignedSlots = opts.assignedSlots
+        local originSlot = rec.slot
+        local assigned = opts.assignedSlots
+        if type(assigned) ~= "table" or #assigned == 0 then
+            assigned = originSlot and { originSlot } or nil
+        end
+        if not assigned then
+            return false, "That legacy opportunity has no equipment slot."
+        end
+        local specId
+        local owner = ownerMember and self:getMemberByID(ownerMember)
+        if owner and owner.GetSpecId then
+            specId = owner:GetSpecId()
+        end
+        local resolved, resolveErr
+        if SF.LootHelperBis and SF.LootHelperBis.ResolveOverrideSlots then
+            resolved, resolveErr = SF.LootHelperBis.ResolveOverrideSlots(
+                assigned,
+                award and (award.itemLink or award.itemString),
+                specId
+            )
+        else
+            resolved = assigned
+        end
+        if not resolved then
+            return false, "That item does not fit the selected legacy opportunity."
+        end
+        eventData.assignedSlots = resolved
         eventData.slotBinding = opts.slotBinding or (SF.LootLogBisBindings and SF.LootLogBisBindings.BOUND) or "BOUND"
     end
     local logEntry = SF.LootLog.new(eventType, eventData, {
@@ -3248,6 +3413,10 @@ function LootProfile:MergeLogTables(logTables, opts)
     if type(logTables) ~= "table" then return 0 end
 
     opts = opts or {}
+    if opts.profile == nil then
+        opts = CopyTableShallow(opts)
+        opts.profile = self
+    end
     if opts.allowMainSwapFingerprintNormalize and SF.LootHelperIdentity then
         local lineageSource = {}
         for _, log in ipairs(self._lootLogs or {}) do

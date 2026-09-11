@@ -151,6 +151,8 @@ local EVENT_DATA_TEMPLATES = {
         -- @field owner string|nil RC item owner
         -- @field responseId number|nil RC response id
         -- @field isAwardReason boolean|nil RC award-reason flag
+        -- @field typeCode string|nil RCLC button-group / response context
+        -- @field equipLoc string|nil RC item equip loc when provided
     },
     [EVENT_TYPES.SPEC_CHANGE] = {
         member = "",
@@ -165,6 +167,8 @@ local EVENT_DATA_TEMPLATES = {
         outcome = "",
         assignedSlots = {},
         preOpAuthorMax = {},
+        -- @field itemFamily string|nil classified item family; distinct from RCLC typeCode
+        -- @field typeCode string|nil RCLC button-group / response context copied from the award
     },
     [EVENT_TYPES.BIS_OVERRIDE] = {
         action = "",
@@ -365,6 +369,8 @@ function LootLog.BuildRCLootCouncilCanonical(awarder, winner, history)
         owner = LootLog.NormalizePlayerId(history.owner),
         itemString = LootLog.ExtractItemString(itemLink),
         responseId = history.responseID,
+        typeCode = history.typeCode,
+        equipLoc = history.equipLoc,
         isAwardReason = history.isAwardReason and true or false,
         timestamp = timestamp,
         awardKey = awardKey,
@@ -385,6 +391,8 @@ function LootLog.BuildRCLootCouncilEventData(canonical)
         owner = canonical.owner,
         responseId = canonical.responseId,
         isAwardReason = canonical.isAwardReason and true or false,
+        typeCode = canonical.typeCode,
+        equipLoc = canonical.equipLoc,
     }
 end
 
@@ -999,6 +1007,30 @@ function LootLog.ValidateTable(t, opts)
     if not allowUnknown  then
         if not EVENT_TYPES[t._eventType] then
             return false, ("unknown event type %s"):format(tostring(t._eventType))
+        end
+    end
+
+    -- Known item-aware events still fail closed at the import boundary even
+    -- when unknown event types are otherwise permitted.
+    if t._eventType == EVENT_TYPES.SPEC_CHANGE then
+        local specId = tonumber(t._data and t._data.specId)
+        local SpecWeapons = SF.LootHelperBis and SF.LootHelperBis.SpecWeapons
+        if not specId or specId < 1 or specId ~= math.floor(specId) then
+            return false, "SPEC_CHANGE specId is invalid"
+        end
+        if not (SpecWeapons and SpecWeapons.IsKnownSpec and SpecWeapons.IsKnownSpec(specId)) then
+            return false, "SPEC_CHANGE specId is not a supported Retail specialization"
+        end
+        if opts.profile and SF.LootLogValidators.ValidateSpecChangeData then
+            if not SF.LootLogValidators.ValidateSpecChangeData(t._data, opts.profile) then
+                return false, "SPEC_CHANGE spec does not belong to the member's class"
+            end
+        end
+    elseif t._eventType == EVENT_TYPES.BIS_OVERRIDE then
+        if SF.LootLogValidators.ValidateBisOverrideData
+            and not SF.LootLogValidators.ValidateBisOverrideData(t._data, opts.profile)
+        then
+            return false, "BIS_OVERRIDE data is invalid"
         end
     end
 

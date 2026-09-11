@@ -28,14 +28,14 @@ While a Loot Helper session is active, the page shows and edits that session pro
 
 Settings are profile-scoped and admin-editable:
 
-- **Record RC Loot Council Awards in Loot Logs** (default on)
+- **Record RC Loot Council Awards in Loot Logs** (default on) — master switch for live RCLC recording and automatic BiS outcomes. When this is off, no future RC award is recorded or treated as BiS automation. Saved BiS-response configuration is kept so it can return when recording is turned back on, but the BiS UI is inactive.
 - **Record all award types** (default on)
 - **Allowed Award Types** when record-all is off
 - **BiS-Qualifying Responses** for future automatic BiS outcomes
 
-Matching is case-insensitive after trimming. The original RC response text is stored on the Loot Log. Empty and duplicate allow-list entries are rejected. A BiS-qualified response cannot be filtered out of recorded award history. Changing these lists never reinterprets historical `BIS_OUTCOME` rows.
+While recording is on, every active BiS-qualified response is always recorded; it cannot also be filtered out of the allow-list. Changing these lists never reinterprets historical `BIS_OUTCOME` rows.
 
-When RC Loot Council is available, the BiS list can be filled from configured RC response labels. If RC is not loaded, admins can still type response labels manually.
+When RC Loot Council is available, the BiS list is filled from configured RC responses using a stable contextual key (`typeCode` / button group, `responseId`, and award-reason vs normal response). Display labels stay user-friendly. If RC is not loaded, admins can still type response labels manually; that text-only fallback remains the compatibility path for older saved lists.
 
 These settings sync with the profile snapshot as `snapshot.rcLootCouncilIntegration`, using the same profile-snapshot path as Raid Check. Changing them does not create a visible Loot Log row. Older snapshots may still carry unused `snapshot.rcLootCouncil` metadata; that field remains compatibility-only and is not the live integration.
 

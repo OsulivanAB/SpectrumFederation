@@ -261,6 +261,26 @@ function R:Build(panel, pageDef)
 
 			elseif t == "logTable" then
 				controls:AddLogTable(sec, item)
+
+			elseif t == "equipmentBoard" then
+				local board = item
+				if type(board.onSlotClick) == "function" then
+					local fn = board.onSlotClick
+					board = CopyTable(board)
+					board.onSlotClick = function(slot, cell)
+						return fn(ctx, slot, cell)
+					end
+				end
+				if type(board.onClear) == "function" then
+					if board == item then
+						board = CopyTable(item)
+					end
+					local fn = board.onClear
+					board.onClear = function(slot, cell)
+						return fn(ctx, slot, cell)
+					end
+				end
+				controls:AddEquipmentBoard(sec, board)
 			end
 		end
 

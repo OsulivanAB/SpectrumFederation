@@ -1,6 +1,6 @@
 -- Item-aware BiS reconstruction. Derived only; logs remain authoritative.
 -- luacheck: globals GetItemInfoInstant GetSpecialization GetSpecializationInfo GetInspectSpecialization
--- luacheck: globals UnitGUID UnitExists UnitName IsInRaid GetNumGroupMembers
+-- luacheck: globals UnitGUID UnitExists UnitName IsInRaid GetNumGroupMembers strtrim
 
 local addonName, SF = ...
 
@@ -69,10 +69,6 @@ end
 
 local function EventTypes()
     return SF.LootLogEventTypes or {}
-end
-
-local function ArmorActions()
-    return SF.LootLogArmorActions or { USED = "USED", AVAILABLE = "AVAILABLE" }
 end
 
 local function NormalizeId(id)
@@ -256,12 +252,46 @@ function Bis.SlotsValid(slots)
     return true
 end
 
+-- Legal assignedSlots shapes: one named slot, or exactly Weapon+OffHand for a
+-- normal two-hand assignment. Mixed families such as Head+Ring1 are rejected.
+function Bis.IsLegalSlotShape(slots)
+    if not Bis.SlotsValid(slots) then
+        return false
+    end
+    if #slots == 1 then
+        return true
+    end
+    if #slots ~= 2 then
+        return false
+    end
+    local a, b = slots[1], slots[2]
+    return (a == "Weapon" and b == "OffHand") or (a == "OffHand" and b == "Weapon")
+end
+
 local function CopySlots(slots)
     local out = {}
     for i = 1, #(slots or {}) do
         out[i] = slots[i]
     end
     return out
+end
+
+local function SortedWeaponPair(slots)
+    if type(slots) ~= "table" then
+        return nil
+    end
+    local hasWeapon, hasOff = false, false
+    for i = 1, #slots do
+        if slots[i] == "Weapon" then
+            hasWeapon = true
+        elseif slots[i] == "OffHand" then
+            hasOff = true
+        end
+    end
+    if hasWeapon and hasOff and #slots == 2 then
+        return { "Weapon", "OffHand" }
+    end
+    return CopySlots(slots)
 end
 
 function Bis.NewState()
@@ -273,7 +303,7 @@ function Bis.NewState()
         activeByAward = {},
         associationByOrigin = {},
         reversedManual = {},
-        contributingOrigins = {},
+        occupancyOrigins = {},
         frozenOverflow = {},
         rank = {},
     }
@@ -344,6 +374,9 @@ function Bis.WeaponAssignSlots(classif, specId, occupancy)
     end
 
     if classif.isTwoHand then
+        if not flags.canTwoHand and not flags.canDualWield2H then
+            return nil, "UNKNOWN_COMPAT"
+        end
         if flags.canDualWield2H then
             if weaponFree then
                 return { "Weapon" }, nil
@@ -371,23 +404,221 @@ end
 
 -- Gear Override may pick Weapon or OffHand for a 2H. Non-dual specs occupy
 -- both opportunities with one assignment; dual-2H specs keep the requested slot.
-function Bis.NormalizeOverrideSlots(assignedSlots, itemLinkOrString, specId)
+-- Unknown spec or unverified weapon compatibility fails closed (slots=nil, err).
+function Bis.ResolveOverrideSlots(assignedSlots, itemLinkOrClassif, specId)
     local slots = CopySlots(assignedSlots)
-    if not Bis.SlotsValid(slots) then
-        return slots
+    if not Bis.IsLegalSlotShape(slots) then
+        return nil, "INVALID_SLOTS"
     end
-    local classif = Bis.ClassifyItem(itemLinkOrString)
-    if not classif or not classif.isTwoHand then
-        return slots
+    local classif = itemLinkOrClassif
+    if type(classif) ~= "table" or not classif.family then
+        classif = Bis.ClassifyItem(itemLinkOrClassif)
     end
-    local flags = specId and SF.LootHelperBis.SpecWeapons and SF.LootHelperBis.SpecWeapons.GetFlags(specId)
-    if flags and flags.canDualWield2H then
-        return slots
+    if not classif then
+        return nil, "UNKNOWN_SLOT"
     end
-    if #slots == 1 and (slots[1] == "Weapon" or slots[1] == "OffHand") then
-        return { "Weapon", "OffHand" }
+    local ok, err = Bis.ItemFitsSlots(classif, slots, specId)
+    if not ok then
+        return nil, err or "UNKNOWN_COMPAT"
     end
-    return slots
+    if classif.isTwoHand then
+        local flags = tonumber(specId) and SF.LootHelperBis.SpecWeapons and SF.LootHelperBis.SpecWeapons.GetFlags(specId)
+        if not flags then
+            return nil, specId and "UNKNOWN_COMPAT" or "MISSING_SPEC"
+        end
+        if flags.canDualWield2H then
+            if #slots == 2 then
+                return nil, "UNKNOWN_COMPAT"
+            end
+            return slots, nil
+        end
+        if #slots == 1 and (slots[1] == "Weapon" or slots[1] == "OffHand") then
+            return { "Weapon", "OffHand" }, nil
+        end
+        return SortedWeaponPair(slots), nil
+    end
+    return slots, nil
+end
+
+function Bis.NormalizeOverrideSlots(assignedSlots, itemLinkOrString, specId)
+    local slots, err = Bis.ResolveOverrideSlots(assignedSlots, itemLinkOrString, specId)
+    if not slots then
+        return nil, err
+    end
+    return slots, nil
+end
+
+function Bis.ItemFitsSlots(classif, slots, specId)
+    if type(classif) ~= "table" then
+        return false, "UNKNOWN_SLOT"
+    end
+    if not Bis.IsLegalSlotShape(slots) then
+        return false, "INVALID_SLOTS"
+    end
+    local family = classif.family
+    if family == "ordinary" then
+        if #slots ~= 1 or slots[1] ~= classif.slot then
+            return false, "INCOMPATIBLE_SLOT"
+        end
+        return true, nil
+    end
+    if family == "ring" then
+        if #slots ~= 1 or not RING_INDEX[slots[1]] then
+            return false, "INCOMPATIBLE_SLOT"
+        end
+        return true, nil
+    end
+    if family == "trinket" then
+        if #slots ~= 1 or not TRINKET_INDEX[slots[1]] then
+            return false, "INCOMPATIBLE_SLOT"
+        end
+        return true, nil
+    end
+    if family == "weapon" or classif.isWeaponLoc or classif.isOffHandLoc then
+        specId = tonumber(specId)
+        local flags = specId and SF.LootHelperBis.SpecWeapons and SF.LootHelperBis.SpecWeapons.GetFlags(specId)
+        if not specId or not flags then
+            return false, specId and "UNKNOWN_COMPAT" or "MISSING_SPEC"
+        end
+        if classif.isOffHandLoc then
+            if #slots ~= 1 or slots[1] ~= "OffHand" then
+                return false, "INCOMPATIBLE_SLOT"
+            end
+            local loc = classif.equipLoc
+            local allowed = false
+            if loc == "INVTYPE_SHIELD" then
+                allowed = flags.offHandShield == true
+            elseif loc == "INVTYPE_HOLDABLE" then
+                allowed = flags.offHandHoldable == true
+            elseif loc == "INVTYPE_WEAPONOFFHAND" or loc == "INVTYPE_WEAPON" then
+                allowed = flags.offHandWeapon == true
+            end
+            if not allowed then
+                return false, "UNKNOWN_COMPAT"
+            end
+            return true, nil
+        end
+        if classif.isTwoHand then
+            if not flags.canTwoHand and not flags.canDualWield2H then
+                return false, "UNKNOWN_COMPAT"
+            end
+            if flags.canDualWield2H then
+                if #slots == 1 and (slots[1] == "Weapon" or slots[1] == "OffHand") then
+                    return true, nil
+                end
+                return false, "INCOMPATIBLE_SLOT"
+            end
+            local pair = SortedWeaponPair(slots)
+            if pair and #pair == 2 then
+                return true, nil
+            end
+            if #slots == 1 and (slots[1] == "Weapon" or slots[1] == "OffHand") then
+                return true, nil
+            end
+            return false, "INCOMPATIBLE_SLOT"
+        end
+        -- 1H / MH / ranged occupying Weapon, or OffHand when the spec dual-wields 1H
+        if #slots ~= 1 then
+            return false, "INCOMPATIBLE_SLOT"
+        end
+        if slots[1] == "Weapon" then
+            return true, nil
+        end
+        if slots[1] == "OffHand" and flags.canDualWield1H then
+            return true, nil
+        end
+        return false, "INCOMPATIBLE_SLOT"
+    end
+    return false, "UNKNOWN_SLOT"
+end
+
+function Bis.ItemFitsSlot(classif, slot, specId)
+    if type(slot) ~= "string" then
+        return false, "INCOMPATIBLE_SLOT"
+    end
+    local dummy = { slot }
+    if classif and classif.isTwoHand then
+        dummy = { slot }
+    end
+    return Bis.ItemFitsSlots(classif, dummy, specId)
+end
+
+function Bis.CompatibleSlotsForItem(classif, specId)
+    if type(classif) ~= "table" then
+        return nil, "UNKNOWN_SLOT"
+    end
+    if classif.family == "ordinary" and classif.slot then
+        return { classif.slot }, nil
+    end
+    if classif.family == "ring" then
+        return { "Ring1", "Ring2" }, nil
+    end
+    if classif.family == "trinket" then
+        return { "Trinket1", "Trinket2" }, nil
+    end
+    if classif.family == "weapon" or classif.isWeaponLoc or classif.isOffHandLoc then
+        specId = tonumber(specId)
+        local flags = specId and SF.LootHelperBis.SpecWeapons and SF.LootHelperBis.SpecWeapons.GetFlags(specId)
+        if not specId or not flags then
+            return nil, specId and "UNKNOWN_COMPAT" or "MISSING_SPEC"
+        end
+        local out = {}
+        for _, slot in ipairs({ "Weapon", "OffHand" }) do
+            if Bis.ItemFitsSlot(classif, slot, specId) then
+                out[#out + 1] = slot
+            end
+        end
+        if #out == 0 then
+            return nil, "UNKNOWN_COMPAT"
+        end
+        return out, nil
+    end
+    return nil, "UNKNOWN_SLOT"
+end
+
+-- Canonicalize manual award input: numeric item ID, item:... token, or hyperlink.
+function Bis.NormalizeAwardItemInput(text)
+    if type(text) ~= "string" then
+        return nil, nil, nil, "Enter an item ID or item link."
+    end
+    local trimmed = strtrim(text)
+    if trimmed == "" then
+        return nil, nil, nil, "Enter an item ID or item link."
+    end
+    local itemString
+    local itemLink
+    if SF.LootLog and SF.LootLog.ExtractItemHyperlink then
+        itemLink = SF.LootLog.ExtractItemHyperlink(trimmed)
+    end
+    if type(itemLink) == "string" and itemLink:find("|Hitem:", 1, true) then
+        itemString = SF.LootLog.ExtractItemString(itemLink)
+    elseif trimmed:match("^item:[%-%d:]+$") then
+        itemString = trimmed
+        itemLink = "|H" .. trimmed .. "|h[Item]|h"
+    elseif trimmed:match("^%d+$") then
+        local itemId = tonumber(trimmed)
+        if not itemId or itemId < 1 or itemId ~= math.floor(itemId) then
+            return nil, nil, nil, "Enter a valid item ID or item link."
+        end
+        itemString = "item:" .. tostring(itemId)
+        itemLink = "|H" .. itemString .. "|h[Item]|h"
+    else
+        return nil, nil, nil, "Enter a valid item ID or item link."
+    end
+    if type(itemString) ~= "string" or itemString == "" then
+        return nil, nil, nil, "Enter a valid item ID or item link."
+    end
+    local itemId = tonumber(itemString:match("^item:(%d+)"))
+    if not itemId then
+        return nil, nil, nil, "Enter a valid item ID or item link."
+    end
+    if GetItemInfoInstant then
+        local ok, instantId = pcall(GetItemInfoInstant, itemId)
+        if not ok or instantId == nil then
+            return nil, nil, nil, "That item ID is not recognized."
+        end
+    end
+    return itemLink, itemString, itemId, nil
 end
 
 function Bis.NextPackableSlot(family, occupancy)
@@ -428,56 +659,30 @@ function Bis.LiveOccupancyFromProjection(result, memberId)
 end
 
 local function OriginActive(state, originLogId)
-    local rec = originLogId and state.contributingOrigins[originLogId]
-    return rec and rec.active == true
+    local rec = originLogId and state.occupancyOrigins and state.occupancyOrigins[originLogId]
+    return rec ~= nil
 end
 
-local function RegisterOrigin(state, log, data, kind)
-    local id = GetLogId(log)
-    if type(id) ~= "string" then
+function Bis.SetOccupancyOrigins(state, origins)
+    if type(state) ~= "table" then
         return
     end
-    local member = NormalizeId(data.member)
-    local slot = data.slot
-    state.contributingOrigins[id] = {
-        active = true,
-        kind = kind,
-        member = member,
-        slot = slot,
-        identityMembers = data.identityMembers,
-        log = log,
-        expired = false,
-    }
-end
-
-local function ClearLocalOrigin(state, memberId, slot)
-    for originId, rec in pairs(state.contributingOrigins) do
-        if rec.kind == "local" and rec.member == memberId and rec.slot == slot then
-            rec.active = false
-        end
-    end
-end
-
-local function MarkIdentityOriginExpired(state, originLogId)
-    local rec = state.contributingOrigins[originLogId]
-    if rec then
-        rec.active = false
-        rec.expired = true
-    end
-end
-
-function Bis.ExpireSplitOrigins(state, isUnified)
-    if type(state) ~= "table" or type(isUnified) ~= "function" then
-        return
-    end
-    for originId, rec in pairs(state.contributingOrigins) do
-        if rec.kind == "identity" and not rec.expired then
-            if not isUnified(rec.identityMembers) then
-                rec.active = false
-                rec.expired = true
+    local map = {}
+    if type(origins) == "table" then
+        for originId, rec in pairs(origins) do
+            if type(originId) == "string" and type(rec) == "table" then
+                map[originId] = rec
             end
         end
     end
+    state.occupancyOrigins = map
+end
+
+function Bis.GetOccupancyOrigin(state, originLogId)
+    if type(state) ~= "table" or type(originLogId) ~= "string" then
+        return nil
+    end
+    return state.occupancyOrigins and state.occupancyOrigins[originLogId] or nil
 end
 
 local function NewFamilyBoard()
@@ -804,7 +1009,7 @@ local function CreateAssignment(state, opts)
         return nil
     end
     local slots = CopySlots(opts.assignedSlots)
-    if not Bis.SlotsValid(slots) then
+    if not Bis.IsLegalSlotShape(slots) then
         return nil
     end
     local binding = opts.slotBinding
@@ -812,28 +1017,42 @@ local function CreateAssignment(state, opts)
         return nil
     end
     local family
-    for i = 1, #slots do
-        local fam = Bis.FamilyForSlot(slots[i])
-        if not fam then
-            return nil
-        end
-        family = family or fam
-        if fam ~= family and not (family == "weapon" or fam == "weapon") then
-            if not ((family == "weapon" and fam == "weapon") or (slots[1] == "Weapon" or slots[1] == "OffHand")) then
-                -- mixed families not allowed except Weapon+OffHand
-            end
-        end
-    end
-    if #slots == 2 and ((slots[1] == "Weapon" and slots[2] == "OffHand") or (slots[1] == "OffHand" and slots[2] == "Weapon")) then
-        family = "weapon"
-    elseif RING_INDEX[slots[1]] then
-        family = "ring"
-    elseif TRINKET_INDEX[slots[1]] then
-        family = "trinket"
-    elseif slots[1] == "Weapon" or slots[1] == "OffHand" then
+    if #slots == 2 then
         family = "weapon"
     else
-        family = "ordinary"
+        family = select(1, Bis.FamilyForSlot(slots[1]))
+    end
+    if not family then
+        return nil
+    end
+    if #slots == 2 then
+        slots = { "Weapon", "OffHand" }
+    end
+    local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
+    local source = opts.source or "AUTO"
+    if classif then
+        if source == "OVERRIDE" then
+            local specId = opts.specId or (award.member and state.specs[award.member])
+            if not Bis.ItemFitsSlots(classif, slots, specId) then
+                return nil
+            end
+        else
+            local itemFamily = classif.family
+            if itemFamily == "ordinary" and (family ~= "ordinary" or slots[1] ~= classif.slot) then
+                return nil
+            end
+            if itemFamily == "ring" and family ~= "ring" then
+                return nil
+            end
+            if itemFamily == "trinket" and family ~= "trinket" then
+                return nil
+            end
+            if (itemFamily == "weapon" or classif.isWeaponLoc or classif.isOffHandLoc) and family ~= "weapon" then
+                return nil
+            end
+        end
+    elseif source == "OVERRIDE" then
+        return nil
     end
     local asg = {
         id = opts.id,
@@ -920,7 +1139,7 @@ function Bis.IsOutcomeSchemaValid(data)
         return false
     end
     if outcome == Bis.OUTCOME.ASSIGNED then
-        if not Bis.SlotsValid(data.assignedSlots) then
+        if not Bis.IsLegalSlotShape(data.assignedSlots) then
             return false
         end
         if data.slotBinding ~= Bis.BINDING.PACKABLE and data.slotBinding ~= Bis.BINDING.BOUND then
@@ -972,7 +1191,6 @@ function Bis.ApplyLog(state, log, ctx)
     local eventType = GetLogType(log)
     local data = GetLogData(log)
     local types = EventTypes()
-    local actions = ArmorActions()
     local logId = GetLogId(log)
     local rank = ctx.rank or 0
     state.rank[logId] = rank
@@ -991,47 +1209,24 @@ function Bis.ApplyLog(state, log, ctx)
     if eventType == types.SPEC_CHANGE and data then
         local memberId = NormalizeId(data.member)
         local specId = tonumber(data.specId)
-        if memberId and specId then
-            state.specs[memberId] = specId
+        local SpecWeapons = SF.LootHelperBis.SpecWeapons
+        if not (memberId and specId and SpecWeapons and SpecWeapons.IsKnownSpec and SpecWeapons.IsKnownSpec(specId)) then
+            return
         end
+        if ctx.MemberClass then
+            local classToken = ctx.MemberClass(memberId)
+            if type(classToken) ~= "string" or classToken == "" then
+                return
+            end
+            if not SpecWeapons.IsSpecValidForClass(specId, classToken) then
+                return
+            end
+        end
+        state.specs[memberId] = specId
         return
     end
 
-    if eventType == types.ARMOR_CHANGE and data then
-        local memberId = NormalizeId(data.member)
-        if data.action == actions.USED then
-            if data.scope == "identity" then
-                local expired = ctx.IdentityEventExpired and ctx.IdentityEventExpired(log, data)
-                RegisterOrigin(state, log, data, "identity")
-                if expired then
-                    MarkIdentityOriginExpired(state, logId)
-                end
-            else
-                ClearLocalOrigin(state, memberId, data.slot)
-                RegisterOrigin(state, log, data, "local")
-            end
-        elseif data.action == actions.AVAILABLE then
-            if data.scope == "identity" then
-                -- identity AVAILABLE suppresses that scope's occupancy; origins in that
-                -- scope for the slot/family stop contributing when this correction is active.
-                local identityMembers = SortedCopy(data.identityMembers)
-                local expired = ctx.IdentityEventExpired and ctx.IdentityEventExpired(log, data)
-                if not expired then
-                    for originId, rec in pairs(state.contributingOrigins) do
-                        if rec.kind == "identity" then
-                            local sameScope = ScopeKey(rec.identityMembers) == ScopeKey(identityMembers)
-                            local famA = select(1, Bis.FamilyForSlot(rec.slot))
-                            local famB = select(1, Bis.FamilyForSlot(data.slot))
-                            if sameScope and (rec.slot == data.slot or (famA and famA == famB and famA ~= "ordinary" and famA ~= "weapon")) then
-                                rec.active = false
-                            end
-                        end
-                    end
-                end
-            else
-                ClearLocalOrigin(state, memberId, data.slot)
-            end
-        end
+    if eventType == types.ARMOR_CHANGE then
         return
     end
 
@@ -1144,17 +1339,31 @@ function Bis.ApplyLog(state, log, ctx)
             if not award or not ref then
                 return
             end
+            if type(data.sourceLogId) == "string" and data.sourceLogId ~= ref.id then
+                return
+            end
             if IsManualReversed(state, ref) then
                 return
             end
             if state.activeByAward[AwardKeyFromRef(ref)] then
                 return
             end
+            if not Bis.IsLegalSlotShape(data.assignedSlots or {}) then
+                return
+            end
             local members = componentOf(award.member)
-            -- occupancy: requested slots must be available in current projection
+            local specId = award.member and state.specs[award.member]
+            local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
+            local slots = data.assignedSlots
+            if classif then
+                slots = select(1, Bis.ResolveOverrideSlots(data.assignedSlots, classif, specId))
+                if not slots then
+                    return
+                end
+            end
             local view = Bis.ProjectComponent(state, members)
-            for i = 1, #(data.assignedSlots or {}) do
-                local cell = view.slots[data.assignedSlots[i]]
+            for i = 1, #slots do
+                local cell = view.slots[slots[i]]
                 if cell and cell.state and cell.state ~= "AVAILABLE" then
                     return
                 end
@@ -1162,10 +1371,11 @@ function Bis.ApplyLog(state, log, ctx)
             CreateAssignment(state, {
                 id = logId,
                 awardRef = ref,
-                assignedSlots = data.assignedSlots,
+                assignedSlots = slots,
                 slotBinding = data.slotBinding,
                 assignmentScopeMembers = data.assignmentScopeMembers or members,
                 source = "OVERRIDE",
+                specId = specId,
                 rank = rank,
             })
             return
@@ -1181,6 +1391,9 @@ function Bis.ApplyLog(state, log, ctx)
             if not award or not ref then
                 return
             end
+            if type(data.sourceLogId) == "string" and data.sourceLogId ~= ref.id then
+                return
+            end
             if IsManualReversed(state, ref) then
                 return
             end
@@ -1189,17 +1402,26 @@ function Bis.ApplyLog(state, log, ctx)
             if other and not movingSame then
                 return
             end
+            local specId = award.member and state.specs[award.member]
+            local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
+            local slots = data.assignedSlots
+            if classif then
+                slots = select(1, Bis.ResolveOverrideSlots(data.assignedSlots, classif, specId))
+                if not slots then
+                    return
+                end
+            elseif not Bis.IsLegalSlotShape(data.assignedSlots or {}) then
+                return
+            end
             local members = componentOf(award.member)
             local restore = HypotheticalWithout(state, target)
             local view = Bis.ProjectComponent(state, members)
-            local ok = Bis.SlotsValid(data.assignedSlots or {})
-            if ok then
-                for i = 1, #data.assignedSlots do
-                    local cell = view.slots[data.assignedSlots[i]]
-                    if cell and cell.state and cell.state ~= "AVAILABLE" then
-                        ok = false
-                        break
-                    end
+            local ok = true
+            for i = 1, #slots do
+                local cell = view.slots[slots[i]]
+                if cell and cell.state and cell.state ~= "AVAILABLE" then
+                    ok = false
+                    break
                 end
             end
             if not ok or (data.slotBinding ~= Bis.BINDING.PACKABLE and data.slotBinding ~= Bis.BINDING.BOUND) then
@@ -1211,10 +1433,11 @@ function Bis.ApplyLog(state, log, ctx)
             CreateAssignment(state, {
                 id = logId,
                 awardRef = ref,
-                assignedSlots = data.assignedSlots,
+                assignedSlots = slots,
                 slotBinding = data.slotBinding,
                 assignmentScopeMembers = data.assignmentScopeMembers or members,
                 source = "OVERRIDE",
+                specId = specId,
                 rank = rank,
             })
             return
@@ -1226,6 +1449,9 @@ function Bis.ApplyLog(state, log, ctx)
             if not award or not ref or type(originId) ~= "string" then
                 return
             end
+            if type(data.sourceLogId) == "string" and data.sourceLogId ~= ref.id then
+                return
+            end
             if IsManualReversed(state, ref) then
                 return
             end
@@ -1235,21 +1461,40 @@ function Bis.ApplyLog(state, log, ctx)
             if state.associationByOrigin[originId] then
                 return
             end
-            if not OriginActive(state, originId) then
+            local rec = ctx.GetContributingOrigin and ctx.GetContributingOrigin(originId)
+            if not rec then
+                rec = Bis.GetOccupancyOrigin(state, originId)
+            end
+            if not rec then
                 return
             end
-            local rec = state.contributingOrigins[originId]
-            if not rec or rec.expired then
-                return
-            end
+            local originSlot = rec.slot
             local members = componentOf(award.member)
+            local slots = data.assignedSlots
+            if type(slots) ~= "table" or #slots == 0 then
+                slots = originSlot and { originSlot } or nil
+            end
+            if not slots then
+                return
+            end
+            local specId = award.member and state.specs[award.member]
+            local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
+            if classif then
+                slots = select(1, Bis.ResolveOverrideSlots(slots, classif, specId))
+                if not slots then
+                    return
+                end
+            elseif not Bis.IsLegalSlotShape(slots) then
+                return
+            end
             CreateAssignment(state, {
                 id = logId,
                 awardRef = ref,
-                assignedSlots = data.assignedSlots or { rec.slot },
+                assignedSlots = slots,
                 slotBinding = Bis.BINDING.BOUND,
                 assignmentScopeMembers = data.assignmentScopeMembers or members,
                 source = "OVERRIDE",
+                specId = specId,
                 legacyOriginLogId = originId,
                 legacyOriginKind = rec.kind,
                 rank = rank,
@@ -1447,25 +1692,33 @@ function Bis.LegacyOriginsForDisplay(state, memberId, identityOf)
     local group = (identityOf and identityOf[memberId]) or { memberId }
     local set = ListSet(SortedCopy(group))
     local out = {}
-    for originId, rec in pairs(state.contributingOrigins) do
-        if rec.active and not rec.expired then
-            if rec.kind == "local" and set[rec.member] then
-                out[#out + 1] = {
-                    originLogId = originId,
-                    member = rec.member,
-                    slot = rec.slot,
-                    kind = "local",
-                }
+    local origins = state and state.occupancyOrigins
+    if type(origins) ~= "table" then
+        return out
+    end
+    for originId, rec in pairs(origins) do
+        if type(rec) == "table" then
+            local include = false
+            if rec.kind == "local" and rec.member and set[rec.member] then
+                include = true
             elseif rec.kind == "identity" then
                 if ScopeFullyPresent(SortedCopy(rec.identityMembers), set) then
-                    out[#out + 1] = {
-                        originLogId = originId,
-                        member = rec.member,
-                        slot = rec.slot,
-                        kind = "identity",
-                        identityMembers = rec.identityMembers,
-                    }
+                    include = true
                 end
+            elseif rec.member and set[rec.member] then
+                include = true
+            end
+            if include then
+                out[#out + 1] = {
+                    originLogId = rec.originLogId or originId,
+                    member = rec.member,
+                    slot = rec.slot,
+                    displayedSlot = rec.displayedSlot or rec.slot,
+                    kind = rec.kind,
+                    identityMembers = rec.identityMembers,
+                    packed = rec.packed == true,
+                    active = true,
+                }
             end
         end
     end

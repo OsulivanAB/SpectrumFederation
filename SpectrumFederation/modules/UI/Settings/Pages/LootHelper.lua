@@ -548,38 +548,6 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		return options
 	end
 
-	local function SlotLabel(cell, slot)
-		if not cell or not cell.state or cell.state == "AVAILABLE" then
-			return slot .. ": available"
-		end
-		if cell.state == "LEGACY_UNKNOWN" then
-			return slot .. ": legacy unknown"
-		end
-		local item = cell.itemLink or cell.itemString or "assigned"
-		return slot .. ": " .. tostring(item)
-	end
-
-	local function BuildOpportunityItems()
-		local profile = GetProfile()
-		local memberId = SelectedGearMember()
-		if not profile or not memberId or not profile.GetIdentityBisSlots then
-			return {}
-		end
-		local slots = profile:GetIdentityBisSlots(memberId) or {}
-		local items = {}
-		local Bis = SF.LootHelperBis
-		local names = Bis and Bis.SLOTS or {}
-		for i = 1, #names do
-			local slot = names[i]
-			local cell = slots[slot] or { state = "AVAILABLE" }
-			items[#items + 1] = {
-				id = slot,
-				label = SlotLabel(cell, slot),
-			}
-		end
-		return items
-	end
-
 	local function BuildAwardPoolItems()
 		local profile = GetProfile()
 		local memberId = SelectedGearMember()
@@ -600,24 +568,6 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		return items
 	end
 
-	local function BuildLegacyOriginItems()
-		local profile = GetProfile()
-		local memberId = SelectedGearMember()
-		if not profile or not memberId or not profile.GetIdentityLegacyOrigins then
-			return {}
-		end
-		local origins = profile:GetIdentityLegacyOrigins(memberId) or {}
-		local items = {}
-		for i = 1, #origins do
-			local origin = origins[i]
-			items[#items + 1] = {
-				id = origin.originLogId,
-				label = string.format("%s %s (%s)", tostring(origin.slot), origin.kind or "legacy", origin.member or ""),
-			}
-		end
-		return items
-	end
-
 	local function ParseAwardRef(key)
 		if type(key) ~= "string" then
 			return nil
@@ -627,6 +577,111 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			return nil
 		end
 		return { kind = kind, id = id }
+	end
+
+	local function AwardOwnerSpec(award)
+		local profile = GetProfile()
+		local member = profile and award and award.member and profile.getMemberByID and profile:getMemberByID(award.member)
+		return member and member.GetSpecId and member:GetSpecId() or nil
+	end
+
+	local function AwardFitsSlot(award, slot)
+		if not award or not slot then
+			return false
+		end
+		local Bis = SF.LootHelperBis
+		if not (Bis and Bis.ClassifyItem and Bis.ItemFitsSlot) then
+			return false
+		end
+		local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
+		if not classif then
+			return false
+		end
+		return Bis.ItemFitsSlot(classif, slot, AwardOwnerSpec(award))
+	end
+
+	local function BuildCompatibleAwardOptions(slot)
+		local options = {}
+		if not slot then
+			return options
+		end
+		local profile = GetProfile()
+		local memberId = SelectedGearMember()
+		local result = profile and profile.GetIdentityProjection and profile:GetIdentityProjection()
+		local state = result and result.bis and result.bis.state
+		for _, item in ipairs(BuildAwardPoolItems()) do
+			local award = item.awardRef and state and state.awards and state.awards[SF.LootHelperBis.AwardRefKey(item.awardRef.kind, item.awardRef.id)]
+			if award and AwardFitsSlot(award, slot) then
+				local activeId = state.activeByAward and state.activeByAward[SF.LootHelperBis.AwardRefKey(award.kind, award.id)]
+				local slots = profile.GetIdentityBisSlots and profile:GetIdentityBisSlots(memberId)
+				local cell = slots and slots[slot]
+				local movingSame = activeId and cell and cell.assignmentId == activeId
+				if not activeId or movingSame then
+					options[#options + 1] = { value = item.id, text = item.label }
+				end
+			end
+		end
+		return options
+	end
+
+	local function CharacterSection()
+		return panel.__sfSections and (panel.__sfSections.character)
+	end
+
+	local function TryPlaceSelectedAward()
+		local profile = GetProfile()
+		local memberId = SelectedGearMember()
+		local slot = panel.__sfGearSlot
+		local ref = ParseAwardRef(panel.__sfGearAward)
+		local sec = CharacterSection()
+		if not (profile and profile.ApplyBisOverride and memberId and slot and ref) then
+			return
+		end
+		local slots = profile.GetIdentityBisSlots and profile:GetIdentityBisSlots(memberId)
+		local cell = slots and slots[slot]
+		local ok, err
+		if cell and cell.state == "LEGACY_UNKNOWN" then
+			local origins = profile.GetIdentityLegacyOrigins and profile:GetIdentityLegacyOrigins(memberId) or {}
+			local originId
+			for i = 1, #origins do
+				local displayed = origins[i].displayedSlot or origins[i].slot
+				if displayed == slot or origins[i].slot == slot then
+					originId = origins[i].originLogId
+					break
+				end
+			end
+			if not originId then
+				if sec then sec:SetMessage("No active legacy origin for that slot.", "error") end
+				return
+			end
+			ok, err = profile:ApplyBisOverride("ASSOCIATE_LEGACY", {
+				viewMember = memberId,
+				awardRef = ref,
+				legacyOriginLogId = originId,
+				assignedSlots = { slot },
+			})
+		elseif cell and cell.assignmentId then
+			ok, err = profile:ApplyBisOverride("REPLACE", {
+				viewMember = memberId,
+				targetAssignmentId = cell.assignmentId,
+				awardRef = ref,
+				assignedSlots = { slot },
+				slotBinding = "BOUND",
+			})
+		else
+			ok, err = profile:ApplyBisOverride("ASSIGN", {
+				viewMember = memberId,
+				awardRef = ref,
+				assignedSlots = { slot },
+				slotBinding = "BOUND",
+			})
+		end
+		if sec then
+			sec:SetMessage(ok and "Assignment recorded." or (err or "Assign failed."), ok and "success" or "error")
+		end
+		if panel.__sfPageBuilder and panel.__sfPageBuilder.Refresh then
+			panel.__sfPageBuilder:Refresh()
+		end
 	end
 
 	local sectionsById = {
@@ -1216,158 +1271,13 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					end,
 					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
 				},
-				{ type = "scrollList", label = "BiS opportunities", adminOnly = true, height = 220, rowHeight = 20, compactColumns = true, getItems = function() return BuildOpportunityItems() end },
-				{ type = "scrollList", label = "Award pool", adminOnly = true, height = 160, rowHeight = 20, compactColumns = true, getItems = function() return BuildAwardPoolItems() end },
-				{ type = "scrollList", label = "Legacy unknown origins", adminOnly = true, height = 100, rowHeight = 20, compactColumns = true, getItems = function() return BuildLegacyOriginItems() end },
-				{
-					type = "dropdown",
-					label = "Loot to assign",
-					adminOnly = true,
-					defaultText = "Select loot",
-					options = function()
-						local options = {}
-						for _, item in ipairs(BuildAwardPoolItems()) do
-							options[#options + 1] = { value = item.id, text = item.label }
-						end
-						return options
-					end,
-					get = function() return panel.__sfGearAward end,
-					set = function(value) panel.__sfGearAward = value end,
-					enabled = function() return ProfileActionsEnabled() end,
-				},
-				{
-					type = "dropdown",
-					label = "Slot",
-					adminOnly = true,
-					defaultText = "Select slot",
-					options = function()
-						local Bis = SF.LootHelperBis
-						local options = {}
-						for _, slot in ipairs((Bis and Bis.SLOTS) or {}) do
-							options[#options + 1] = { value = slot, text = slot }
-						end
-						return options
-					end,
-					get = function() return panel.__sfGearSlot end,
-					set = function(value) panel.__sfGearSlot = value end,
-					enabled = function() return ProfileActionsEnabled() end,
-				},
-				{
-					type = "buttonRow",
-					adminOnly = true,
-					enabled = function() return ProfileActionsEnabled() end,
-					{
-						text = "Assign",
-						width = 110,
-						onClick = function(ctx)
-							local profile = GetProfile()
-							local ref = ParseAwardRef(panel.__sfGearAward)
-							if not (profile and profile.ApplyBisOverride) then
-								ctx.section:SetMessage("No active profile.", "error")
-								return
-							end
-							local ok, err = profile:ApplyBisOverride("ASSIGN", {
-								viewMember = SelectedGearMember(),
-								awardRef = ref,
-								assignedSlots = { panel.__sfGearSlot },
-								slotBinding = (panel.__sfGearSlot == "Ring1" or panel.__sfGearSlot == "Ring2"
-									or panel.__sfGearSlot == "Trinket1" or panel.__sfGearSlot == "Trinket2")
-									and "BOUND" or "BOUND",
-							})
-							ctx.section:SetMessage(ok and "Assignment recorded." or (err or "Assign failed."), ok and "success" or "error")
-							ctx.pageBuilder:Refresh()
-						end,
-					},
-					{
-						text = "Clear",
-						width = 110,
-						onClick = function(ctx)
-							local profile = GetProfile()
-							local memberId = SelectedGearMember()
-							local slots = profile and memberId and profile.GetIdentityBisSlots and profile:GetIdentityBisSlots(memberId)
-							local cell = slots and panel.__sfGearSlot and slots[panel.__sfGearSlot]
-							if not (profile and profile.ApplyBisOverride and cell and cell.assignmentId) then
-								ctx.section:SetMessage("Select an occupied slot to clear.", "error")
-								return
-							end
-							dialogs:Confirm("Clear this assignment? Frozen overflow awards will not backfill the hole.", "Clear", function()
-								local ok, err = profile:ApplyBisOverride("CLEAR", {
-									viewMember = memberId,
-									targetAssignmentId = cell.assignmentId,
-								})
-								ctx.section:SetMessage(ok and "Assignment cleared." or (err or "Clear failed."), ok and "success" or "error")
-								ctx.pageBuilder:Refresh()
-							end)
-						end,
-					},
-					{
-						text = "Replace / Move",
-						width = 140,
-						onClick = function(ctx)
-							local profile = GetProfile()
-							local memberId = SelectedGearMember()
-							local slots = profile and memberId and profile.GetIdentityBisSlots and profile:GetIdentityBisSlots(memberId)
-							local cell = slots and panel.__sfGearSlot and slots[panel.__sfGearSlot]
-							local ref = ParseAwardRef(panel.__sfGearAward)
-							if not (profile and profile.ApplyBisOverride and cell and cell.assignmentId and ref) then
-								ctx.section:SetMessage("Select the current assignment slot and the loot to place.", "error")
-								return
-							end
-							local ok, err = profile:ApplyBisOverride("REPLACE", {
-								viewMember = memberId,
-								targetAssignmentId = cell.assignmentId,
-								awardRef = ref,
-								assignedSlots = { panel.__sfGearSlot },
-								slotBinding = "BOUND",
-							})
-							ctx.section:SetMessage(ok and "Replacement recorded." or (err or "Replace failed."), ok and "success" or "error")
-							ctx.pageBuilder:Refresh()
-						end,
-					},
-				},
-				{
-					type = "dropdown",
-					label = "Legacy origin",
-					adminOnly = true,
-					defaultText = "Select origin",
-					options = function()
-						local options = {}
-						for _, item in ipairs(BuildLegacyOriginItems()) do
-							options[#options + 1] = { value = item.id, text = item.label }
-						end
-						return options
-					end,
-					get = function() return panel.__sfGearLegacyOrigin end,
-					set = function(value) panel.__sfGearLegacyOrigin = value end,
-					enabled = function() return ProfileActionsEnabled() end,
-				},
-				{
-					type = "button",
-					label = "Associate legacy origin",
-					adminOnly = true,
-					buttonText = "Associate",
-					width = 140,
-					enabled = function() return ProfileActionsEnabled() end,
-					onClick = function(ctx)
-						local profile = GetProfile()
-						local ref = ParseAwardRef(panel.__sfGearAward)
-						if not (profile and profile.ApplyBisOverride and ref and panel.__sfGearLegacyOrigin) then
-							ctx.section:SetMessage("Select loot and a legacy origin.", "error")
-							return
-						end
-						local ok, err = profile:ApplyBisOverride("ASSOCIATE_LEGACY", {
-							viewMember = SelectedGearMember(),
-							awardRef = ref,
-							legacyOriginLogId = panel.__sfGearLegacyOrigin,
-						})
-						ctx.section:SetMessage(ok and "Legacy association recorded." or (err or "Associate failed."), ok and "success" or "error")
-						ctx.pageBuilder:Refresh()
-					end,
-				},
+				{ type = "equipmentBoard", adminOnly = true, enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end, getSlots = function() local profile = GetProfile() local memberId = SelectedGearMember() if not (profile and memberId and profile.GetIdentityBisSlots) then return {} end return profile:GetIdentityBisSlots(memberId) or {} end, getSelectedSlot = function() return panel.__sfGearSlot end, onSlotClick = function(ctx, slot) panel.__sfGearSlot = slot if ctx.pageBuilder and ctx.pageBuilder.Refresh then ctx.pageBuilder:Refresh() end end, onClear = function(ctx, _slot, cell) local profile = GetProfile() if not (profile and profile.ApplyBisOverride and cell and cell.assignmentId) then ctx.section:SetMessage("Select an occupied slot to clear.", "error") return end dialogs:Confirm("Clear this assignment? Frozen overflow awards will not backfill the hole.", "Clear", function() local ok, err = profile:ApplyBisOverride("CLEAR", { viewMember = SelectedGearMember(), targetAssignmentId = cell.assignmentId }) ctx.section:SetMessage(ok and "Assignment cleared." or (err or "Clear failed."), ok and "success" or "error") ctx.pageBuilder:Refresh() end) end },
+				{ type = "dropdown", label = "Compatible loot", adminOnly = true, defaultText = "Select loot for the highlighted slot", options = function() return BuildCompatibleAwardOptions(panel.__sfGearSlot) end, get = function() return panel.__sfGearAward end, set = function(value) panel.__sfGearAward = value TryPlaceSelectedAward() end, enabled = function() return ProfileActionsEnabled() and panel.__sfGearSlot ~= nil end },
+				{ type = "help", indent = "label", text = "Click an empty slot to assign compatible loot, or an occupied slot to replace it. Legacy unknown usage is highlighted in gold. The red X clears an assignment." },
 				{
 					type = "editboxButton",
 					label = "Manually add loot",
-					hint = "Shift-click an item",
+					hint = "Item ID or item link",
 					buttonText = "Add",
 					buttonWidth = 80,
 					editWidth = 220,

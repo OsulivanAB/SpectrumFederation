@@ -592,47 +592,96 @@ function Integration.AreHooksInstalled()
     return hooksInstalled
 end
 
-local function GetRCResponseLabels()
-    local labels = {}
+local function RecordingEnabled()
+    local profile = Integration.GetSettingsProfile()
+    if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+        return false
+    end
+    return profile:GetRCLootCouncilIntegrationConfig().recordAwards and true or false
+end
+
+local function GetRCResponseOptions()
+    local options = {}
     local seen = {}
-    local function add(text)
-        if type(text) ~= "string" then
+    local function add(entry)
+        if type(entry) ~= "table" or type(entry.key) ~= "string" or seen[entry.key] then
             return
         end
-        local trimmed = strtrim(text)
-        if trimmed == "" then
-            return
-        end
-        local key = string.lower(trimmed)
-        if seen[key] then
-            return
-        end
-        seen[key] = true
-        labels[#labels + 1] = trimmed
+        seen[entry.key] = true
+        options[#options + 1] = {
+            value = entry.key,
+            text = entry.label or entry.text,
+            typeCode = entry.typeCode,
+            responseId = entry.responseId,
+            isAwardReason = entry.isAwardReason and true or false,
+            textLabel = entry.text,
+        }
     end
     local rc = _G.RCLootCouncil
     local db = rc and rc.Getdb and rc:Getdb() or (rc and rc.db)
     local profile = db and (db.profile or db)
-    local responses = profile and (profile.responses or profile.buttonGroup)
+    local responses = profile and profile.responses
     if type(responses) == "table" then
-        for _, entry in pairs(responses) do
-            if type(entry) == "table" then
-                add(entry.text or entry.label or entry.name)
-            elseif type(entry) == "string" then
-                add(entry)
+        for typeCode, group in pairs(responses) do
+            if type(group) == "table" then
+                for id, entry in pairs(group) do
+                    local numericId = tonumber(id)
+                    if type(entry) == "table" and numericId then
+                        local text = entry.text or entry.label or entry.name
+                        if type(text) == "string" and strtrim(text) ~= "" then
+                            add({
+                                key = string.format("ctx:%s|%s|0", tostring(typeCode), tostring(numericId)),
+                                text = strtrim(text),
+                                label = string.format("%s (%s #%s)", strtrim(text), tostring(typeCode), tostring(numericId)),
+                                typeCode = tostring(typeCode),
+                                responseId = numericId,
+                                isAwardReason = false,
+                            })
+                        end
+                    end
+                end
             end
         end
     end
-    local buttons = rc and rc.buttons
-    if type(buttons) == "table" then
-        for _, entry in pairs(buttons) do
+    local awardReasons = profile and profile.awardReasons
+    if type(awardReasons) == "table" then
+        for id, entry in ipairs(awardReasons) do
             if type(entry) == "table" then
-                add(entry.text or entry.label)
+                local text = entry.text or entry.label
+                if type(text) == "string" and strtrim(text) ~= "" then
+                    add({
+                        key = string.format("ctx:awardReason|%s|1", tostring(id)),
+                        text = strtrim(text),
+                        label = string.format("%s (award reason #%s)", strtrim(text), tostring(id)),
+                        typeCode = "awardReason",
+                        responseId = id,
+                        isAwardReason = true,
+                    })
+                end
             end
         end
     end
-    table.sort(labels)
-    return labels
+    table.sort(options, function(a, b)
+        return tostring(a.text) < tostring(b.text)
+    end)
+    return options
+end
+
+local function SelectedBisOption(key)
+    if type(key) ~= "string" then
+        return nil
+    end
+    for _, option in ipairs(GetRCResponseOptions()) do
+        if option.value == key then
+            return {
+                text = option.textLabel or option.text,
+                typeCode = option.typeCode,
+                responseId = option.responseId,
+                isAwardReason = option.isAwardReason,
+            }
+        end
+    end
+    return key
 end
 
 local function GetProfile()
@@ -836,33 +885,39 @@ function Integration.RegisterSettingsPage()
                     id = "bisResponses",
                     title = "BiS-Qualifying Responses",
                     items = {
-                        { type = "help", text = "Only future RC awards use this list. Historical BiS outcomes are never reinterpreted. A BiS-qualified response cannot be filtered out of recorded award history.", indent = "label" },
+                        { type = "help", text = "When recording is on, every BiS-qualified response is recorded. Configuration is kept while recording is off, but it is inactive until recording is turned back on. Only future RC awards use this list. Historical BiS outcomes are never reinterpreted.", indent = "label" },
                         {
                             type = "dropdownIconButton",
                             label = "Add from RC Loot Council",
                             adminOnly = true,
                             defaultText = "Select response",
+                            enabled = function()
+                                return RecordingEnabled()
+                            end,
                             visible = function()
-                                return #GetRCResponseLabels() > 0
+                                return #GetRCResponseOptions() > 0
                             end,
                             options = function()
-                                local options = {}
-                                for _, label in ipairs(GetRCResponseLabels()) do
-                                    options[#options + 1] = { value = label, text = label }
-                                end
-                                return options
+                                return GetRCResponseOptions()
                             end,
                             get = function() return panel.__sfBisResponseSelected end,
                             set = function(value) panel.__sfBisResponseSelected = value end,
                             iconAtlas = "common-icon-plus",
                             iconToolTip = "Add the selected RC response as BiS-qualifying",
+                            iconEnabled = function()
+                                return RecordingEnabled() and panel.__sfBisResponseSelected ~= nil
+                            end,
                             onIconClick = function(ctx)
                                 local profile = GetProfile()
                                 if not (profile and profile.AddRCLootCouncilBisResponse) then
                                     ctx.section:SetMessage("No active profile.", "error")
                                     return
                                 end
-                                local ok, err = profile:AddRCLootCouncilBisResponse(panel.__sfBisResponseSelected)
+                                if not RecordingEnabled() then
+                                    ctx.section:SetMessage("Turn on Record RC Loot Council awards before changing BiS responses.", "error")
+                                    return
+                                end
+                                local ok, err = profile:AddRCLootCouncilBisResponse(SelectedBisOption(panel.__sfBisResponseSelected))
                                 if not ok then
                                     ctx.section:SetMessage(err or "Could not add BiS response.", "error")
                                     return
@@ -879,11 +934,18 @@ function Integration.RegisterSettingsPage()
                             buttonWidth = 80,
                             editWidth = 180,
                             adminOnly = true,
+                            enabled = function()
+                                return RecordingEnabled()
+                            end,
                             onSubmit = function(ctx, text, editBox)
                                 ctx.section:ClearMessage()
                                 local profile = GetProfile()
                                 if not (profile and profile.AddRCLootCouncilBisResponse) then
                                     ctx.section:SetMessage("No active profile.", "error")
+                                    return
+                                end
+                                if not RecordingEnabled() then
+                                    ctx.section:SetMessage("Turn on Record RC Loot Council awards before changing BiS responses.", "error")
                                     return
                                 end
                                 local ok, err = profile:AddRCLootCouncilBisResponse(text)
@@ -904,6 +966,9 @@ function Integration.RegisterSettingsPage()
                             rowHeight = 20,
                             removeAtlas = "common-icon-redx",
                             compactColumns = true,
+                            enabled = function()
+                                return RecordingEnabled()
+                            end,
                             getItems = function()
                                 local profile = GetProfile()
                                 if not profile or not profile.GetRCLootCouncilIntegrationConfig then
@@ -911,13 +976,21 @@ function Integration.RegisterSettingsPage()
                                 end
                                 local items = {}
                                 for _, value in ipairs(profile:GetRCLootCouncilIntegrationConfig().bisResponses or {}) do
-                                    items[#items + 1] = { id = value, label = value }
+                                    local label = value.text or value.key or tostring(value)
+                                    if value.typeCode and value.responseId ~= nil then
+                                        label = string.format("%s [%s #%s%s]", label, tostring(value.typeCode), tostring(value.responseId), value.isAwardReason and ", award reason" or "")
+                                    end
+                                    items[#items + 1] = { id = value.key or value.text, label = label }
                                 end
                                 return items
                             end,
                             onRemove = function(ctx, item)
                                 local profile = GetProfile()
                                 if not (profile and profile.RemoveRCLootCouncilBisResponse) then
+                                    return
+                                end
+                                if not RecordingEnabled() then
+                                    ctx.section:SetMessage("Turn on Record RC Loot Council awards before changing BiS responses.", "error")
                                     return
                                 end
                                 local ok, err = profile:RemoveRCLootCouncilBisResponse(item.id)

@@ -105,7 +105,7 @@ The owner cannot be removed from the admin list through this page. Only the effe
 
 ## Loot Helper: Character
 
-Profile admins can choose a character, set that character's persistent specialization, and use Gear Override to assign, clear, replace, or associate historical loot with the linked identity's BiS opportunities. Selecting either linked character shows the shared BiS board and award pool. Award ownership stays with the character who received the loot. Manual loot additions enter the pool without consuming an opportunity.
+Profile admins can choose a character, set that character's persistent specialization, and use Gear Override from a character-equipment board. Empty slots show placeholders; used slots show the item icon, a WoW tooltip, and a red X to clear. Clicking a slot offers only loot that fits that slot. Selecting either linked character shows the shared BiS board and award pool. Award ownership stays with the character who received the loot. Manual loot additions enter the pool without consuming an opportunity. Legacy unknown usage is visually distinct. Final visual behavior still requires Retail QA.
 
 ## Loot Helper: RC Loot Council
 
