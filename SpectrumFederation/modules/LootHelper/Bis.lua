@@ -1,5 +1,5 @@
 -- Item-aware BiS reconstruction. Derived only; logs remain authoritative.
--- luacheck: globals GetItemInfoInstant GetSpecialization GetSpecializationInfo GetInspectSpecialization
+-- luacheck: globals GetItemInfoInstant
 -- luacheck: globals UnitGUID UnitExists UnitName IsInRaid GetNumGroupMembers strtrim
 
 local addonName, SF = ...
@@ -1218,13 +1218,16 @@ function Bis.ClassifFromFrozenOutcome(data)
     if not mapped then
         return nil
     end
-    local family = data.itemFamily
-    if type(family) ~= "string" or family == "" then
-        if mapped ~= "ring" and mapped ~= "trinket" and mapped ~= "weapon" and mapped ~= "offhand" then
-            family = "ordinary"
-        else
-            family = mapped
-        end
+    local family = mapped
+    if mapped ~= "ring" and mapped ~= "trinket" and mapped ~= "weapon" and mapped ~= "offhand" then
+        family = "ordinary"
+    end
+    if type(data.itemFamily) == "string" and data.itemFamily ~= "" and data.itemFamily ~= family then
+        return nil
+    end
+    local isTwoHand = equipLoc == "INVTYPE_2HWEAPON"
+    if data.isTwoHand ~= nil and (data.isTwoHand == true) ~= isTwoHand then
+        return nil
     end
     return {
         equipLoc = equipLoc,
@@ -1232,7 +1235,7 @@ function Bis.ClassifFromFrozenOutcome(data)
         slot = (family == "ordinary") and mapped or nil,
         itemClass = data.itemClass,
         itemSubClass = data.itemSubClass,
-        isTwoHand = data.isTwoHand == true or equipLoc == "INVTYPE_2HWEAPON",
+        isTwoHand = isTwoHand,
         isOffHandLoc = mapped == "offhand",
         isWeaponLoc = mapped == "weapon",
     }
@@ -1272,6 +1275,15 @@ function Bis.FrozenSlotsInternallyConsistent(classif, slots)
     return false
 end
 
+local function ItemIdFromString(value)
+    if type(value) ~= "string" or value == "" then
+        return nil
+    end
+    local extracted = SF.LootLog and SF.LootLog.ExtractItemString and SF.LootLog.ExtractItemString(value)
+    local s = extracted or value
+    return s:match("item:(%d+)")
+end
+
 function Bis.IsOutcomeSourceConsistent(data, rcLog)
     if not Bis.IsOutcomeSchemaValid(data) then
         return false
@@ -1292,6 +1304,36 @@ function Bis.IsOutcomeSourceConsistent(data, rcLog)
     end
     if not SamePlayer(rcData and rcData.member, data.awardMember) then
         return false
+    end
+    local rcItem = rcData and (rcData.itemString or rcData.itemLink)
+    local outcomeItem = data.itemString or data.itemLink
+    local rcItemString = type(rcItem) == "string" and SF.LootLog and SF.LootLog.ExtractItemString
+        and SF.LootLog.ExtractItemString(rcItem) or rcItem
+    local outItemString = type(outcomeItem) == "string" and SF.LootLog and SF.LootLog.ExtractItemString
+        and SF.LootLog.ExtractItemString(outcomeItem) or outcomeItem
+    if type(rcItemString) == "string" and rcItemString ~= ""
+        and type(outItemString) == "string" and outItemString ~= ""
+        and rcItemString ~= outItemString then
+        return false
+    end
+    local rcIdNum = ItemIdFromString(rcItem)
+    local outIdNum = ItemIdFromString(outcomeItem)
+    if rcIdNum and outIdNum and rcIdNum ~= outIdNum then
+        return false
+    end
+    if data.outcome == Bis.OUTCOME.ASSIGNED then
+        if rcIdNum and not outIdNum then
+            return false
+        end
+        local rcLoc = rcData and rcData.equipLoc
+        if type(rcLoc) == "string" and rcLoc ~= "" then
+            if data.equipLoc ~= rcLoc then
+                return false
+            end
+        end
+        if not Bis.ClassifFromFrozenOutcome(data) then
+            return false
+        end
     end
     return true
 end
@@ -1617,7 +1659,8 @@ function Bis.ApplyLog(state, log, ctx)
             if rec.isOverflow then
                 return
             end
-            local originSlot = rec.slot
+            local displayed = rec.displayedSlot
+            local originSlot = (type(displayed) == "string" and displayed ~= "") and displayed or rec.slot
             local members = componentOf(award.member)
             local slots = data.assignedSlots
             if type(slots) ~= "table" or #slots == 0 then
@@ -1625,6 +1668,11 @@ function Bis.ApplyLog(state, log, ctx)
             end
             if not slots then
                 return
+            end
+            if originSlot then
+                if #slots ~= 1 or slots[1] ~= originSlot then
+                    return
+                end
             end
             local specId = award.member and state.specs[award.member]
             local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
@@ -1635,6 +1683,18 @@ function Bis.ApplyLog(state, log, ctx)
                 end
             elseif not Bis.IsLegalSlotShape(slots) then
                 return
+            end
+            if originSlot then
+                local bound = false
+                for i = 1, #slots do
+                    if slots[i] == originSlot then
+                        bound = true
+                        break
+                    end
+                end
+                if not bound then
+                    return
+                end
             end
             CreateAssignment(state, {
                 id = logId,
@@ -1676,48 +1736,9 @@ function Bis.BuildMemberSlotMap(state, identityOf)
 end
 
 function Bis.ResolveRecipientSpec(memberId, storedSpecId)
-    memberId = NormalizeId(memberId)
+    -- Automatic outcomes use the stored SPEC_CHANGE spec only. Live player
+    -- spec and inspect spec can differ across admins for the same award.
     storedSpecId = tonumber(storedSpecId)
-    local selfId = SF.NameUtil and SF.NameUtil.GetSelfId and SF.NameUtil.GetSelfId()
-    if memberId and selfId and SamePlayer(memberId, selfId) and GetSpecialization and GetSpecializationInfo then
-        local index = GetSpecialization()
-        if index then
-            local specId = tonumber(GetSpecializationInfo(index))
-            if specId and specId > 0 then
-                return specId, "live"
-            end
-        end
-    end
-    if memberId and GetInspectSpecialization and UnitGUID and UnitExists then
-        local units = { "target", "focus", "mouseover" }
-        if IsInRaid and IsInRaid() then
-            local n = GetNumGroupMembers and GetNumGroupMembers() or 0
-            for i = 1, n do
-                units[#units + 1] = "raid" .. i
-            end
-        elseif GetNumGroupMembers then
-            local n = GetNumGroupMembers() or 0
-            for i = 1, n do
-                units[#units + 1] = "party" .. i
-            end
-        end
-        for i = 1, #units do
-            local unit = units[i]
-            if UnitExists(unit) then
-                local name, realm = UnitName(unit)
-                local unitId = name
-                if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
-                    unitId = SF.NameUtil.NormalizeNameRealm(name, realm)
-                end
-                if unitId and SamePlayer(unitId, memberId) then
-                    local specId = tonumber(GetInspectSpecialization(unit)) or 0
-                    if specId > 0 then
-                        return specId, "inspect"
-                    end
-                end
-            end
-        end
-    end
     if storedSpecId and storedSpecId > 0 then
         return storedSpecId, "stored"
     end
@@ -1875,4 +1896,27 @@ function Bis.LegacyOriginsForDisplay(state, memberId, identityOf)
         return tostring(a.originLogId) < tostring(b.originLogId)
     end)
     return out
+end
+
+-- displayedSlot is authoritative when present. Original slot is only a
+-- fallback for origins that never received a projected display slot.
+function Bis.LegacyOriginForDisplayedSlot(origins, slot)
+    if type(origins) ~= "table" or type(slot) ~= "string" then
+        return nil
+    end
+    local fallback
+    for i = 1, #origins do
+        local rec = origins[i]
+        if type(rec) == "table" and rec.isOverflow ~= true then
+            local displayed = rec.displayedSlot
+            if type(displayed) == "string" and displayed ~= "" then
+                if displayed == slot then
+                    return rec
+                end
+            elseif rec.slot == slot and not fallback then
+                fallback = rec
+            end
+        end
+    end
+    return fallback
 end
