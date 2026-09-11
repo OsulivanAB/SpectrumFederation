@@ -773,6 +773,14 @@ assertFalse(legacy:ApplyBisOverride("ASSOCIATE_LEGACY", {
     awardRef = { kind = "MANUAL", id = manId },
     legacyOriginLogId = origins[1].originLogId,
 }), "inactive origin cannot be associated")
+assertTrue(legacy:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = manId },
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+}), "expired association does not block reuse")
+legacy:ApplyIdentityProjection({ force = true })
+assertEq(slotState(legacy, ALT_A, "Head"), "ASSIGNED_OVERRIDE", "same award can be assigned after origin expiry")
 
 -- Stale CLEAR does not remove a replacement
 resetEnv()
@@ -953,6 +961,14 @@ assertEq(slotState(idOrigin, ALT_A, "Head"), "AVAILABLE", "expired identity orig
 assertTrue(idOrigin:LinkCharacters(ALT_A, ALT_B), "relink")
 idOrigin:ApplyIdentityProjection({ force = true })
 assertEq(slotState(idOrigin, ALT_A, "Head"), "AVAILABLE", "relink does not resurrect expired association")
+assertTrue(idOrigin:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = idMan },
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+}), "expired identity association does not block reuse")
+idOrigin:ApplyIdentityProjection({ force = true })
+assertEq(slotState(idOrigin, ALT_A, "Head"), "ASSIGNED_OVERRIDE", "same award can be assigned after identity origin expiry")
 
 -- Packed local ring origins associate to historical usage, not display packing
 resetEnv()

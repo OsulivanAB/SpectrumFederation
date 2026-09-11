@@ -705,6 +705,21 @@ local function OriginActive(state, originLogId)
     return rec ~= nil
 end
 
+local function ExpireInactiveLegacyAssociations(state)
+    if type(state) ~= "table" or type(state.assignments) ~= "table" then
+        return
+    end
+    local expired = {}
+    for id, asg in pairs(state.assignments) do
+        if asg.active and asg.legacyOriginLogId and not OriginActive(state, asg.legacyOriginLogId) then
+            expired[#expired + 1] = id
+        end
+    end
+    for i = 1, #expired do
+        DeactivateAssignment(state, expired[i])
+    end
+end
+
 function Bis.SetOccupancyOrigins(state, origins)
     if type(state) ~= "table" then
         return
@@ -718,6 +733,7 @@ function Bis.SetOccupancyOrigins(state, origins)
         end
     end
     state.occupancyOrigins = map
+    ExpireInactiveLegacyAssociations(state)
 end
 
 function Bis.GetOccupancyOrigin(state, originLogId)
