@@ -35,10 +35,10 @@ local FLAGS = {
     [65] = Flags(false, false, true, true, true, false),   -- Holy (1H+shield/holdable or 2H)
     [66] = Flags(false, false, false, true, false, false), -- Protection (1H + shield; not 2H)
     [70] = Flags(false, false, true, false, false, false), -- Retribution (2H; no shield)
-    -- Hunter: BM/MM fight with ranged (not melee 2H). Survival fights with melee 2H.
+    -- Hunter: BM/MM fight with ranged only. Survival fights with melee 2H or dual 1H.
     [253] = Flags(false, false, false, false, false, false), -- Beast Mastery
     [254] = Flags(false, false, false, false, false, false), -- Marksmanship
-    [255] = Flags(false, false, true, false, false, false),  -- Survival
+    [255] = Flags(true, false, true, false, false, true),    -- Survival (Midnight dual-wield 1H + 2H)
     -- Rogue: dual-wield 1H only; no 2H, shields, or frills
     [259] = Flags(true, false, false, false, false, true), -- Assassination
     [260] = Flags(true, false, false, false, false, true), -- Outlaw
@@ -133,7 +133,33 @@ local CLASS_WEAPON_SUBCLASS = {
     MONK = Subset(AXE1H, MACE1H, SWORD1H, POLEARM, STAFF, FIST),
     DRUID = Subset(MACE1H, MACE2H, POLEARM, STAFF, FIST, DAGGER),
     DEMONHUNTER = Subset(AXE1H, SWORD1H, WARGLAIVE, FIST),
-    EVOKER = Subset(MACE1H, MACE2H, STAFF, FIST, DAGGER),
+    EVOKER = Subset(AXE1H, MACE1H, MACE2H, SWORD1H, STAFF, FIST, DAGGER),
+}
+
+-- Spec combat-weapon subclasses. Distinct from class proficiency and from
+-- FLAGS slot occupancy. When a spec has an entry, BiS combat assignment
+-- requires that subclass even if the class can technically equip it.
+-- Specs omitted here use the class proficiency set.
+local MELEE_NO_RANGED = Subset(AXE1H, AXE2H, MACE1H, MACE2H, POLEARM, SWORD1H, SWORD2H, STAFF, FIST, DAGGER)
+local HUNTER_RANGED = Subset(BOW, GUN, CROSSBOW)
+-- Survival combat weapons follow current Midnight ability requirements:
+-- 1H/2H axes and swords, polearms, staves, and daggers. Class proficiency
+-- still includes fists and ranged, but those are not Survival combat BiS.
+local HUNTER_SURVIVAL = Subset(AXE1H, AXE2H, SWORD1H, SWORD2H, POLEARM, STAFF, DAGGER)
+local ROGUE_DAGGER = Subset(DAGGER)
+local ROGUE_OUTLAW = Subset(AXE1H, MACE1H, SWORD1H, FIST, DAGGER)
+local SHAMAN_ENHANCE = Subset(AXE1H, MACE1H, FIST, DAGGER)
+local SPEC_COMBAT_SUBCLASS = {
+    [71] = MELEE_NO_RANGED,
+    [72] = MELEE_NO_RANGED,
+    [73] = MELEE_NO_RANGED,
+    [253] = HUNTER_RANGED,
+    [254] = HUNTER_RANGED,
+    [255] = HUNTER_SURVIVAL,
+    [259] = ROGUE_DAGGER,
+    [260] = ROGUE_OUTLAW,
+    [261] = ROGUE_DAGGER,
+    [263] = SHAMAN_ENHANCE,
 }
 
 -- Fallback display names when GetSpecializationInfoByID is unavailable.
@@ -272,7 +298,14 @@ function SpecWeapons.IsItemAllowedForSpec(specId, classif)
     if not allowed or itemClass ~= ITEM_CLASS_WEAPON or subClass == nil then
         return false
     end
-    return allowed[subClass] == true
+    if allowed[subClass] ~= true then
+        return false
+    end
+    local combat = SPEC_COMBAT_SUBCLASS[specId]
+    if combat then
+        return combat[subClass] == true
+    end
+    return true
 end
 
 -- GetSpecializationInfoByID returns id, name, description, icon, role, ...
