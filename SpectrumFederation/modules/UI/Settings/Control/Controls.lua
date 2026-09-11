@@ -1711,6 +1711,11 @@ function Controls:AddLogTable(section, opts)
 		end
 
 		local function Refresh()
+			if row.__sfLogTableRefreshing then
+				return
+			end
+			row.__sfLogTableRefreshing = true
+			local ok, err = pcall(function()
 			local _, enabled = self:_ApplyRowState(row, section, opts, {scroll})
 			local dataRows = getRows() or {}
 			local yOffset = 0
@@ -1751,24 +1756,36 @@ function Controls:AddLogTable(section, opts)
 			content:SetHeight(math.max(1, contentHeight))
 			emptyText:SetShown(#dataRows == 0)
 
-			local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
-			local showScrollbar = contentHeight > visibleHeight
-			local scrollBarWidth = SetScrollBarShown(showScrollbar)
+			local function ApplyScrollAndColumns()
+				local visibleHeight = math.max(1, (scroll:GetHeight() or 0) - 2)
+				local showScrollbar = contentHeight > visibleHeight
+				local scrollBarWidth = SetScrollBarShown(showScrollbar)
 
-			tableArea:ClearAllPoints()
-			tableArea:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
-			tableArea:SetPoint("TOPRIGHT", container, "TOPRIGHT", -(showScrollbar and (scrollBarWidth + 4) or 0), 0)
-			tableArea:SetHeight(headerHeight)
+				tableArea:ClearAllPoints()
+				tableArea:SetPoint("TOPLEFT", container, "TOPLEFT", 0, 0)
+				tableArea:SetPoint("TOPRIGHT", container, "TOPRIGHT", -(showScrollbar and (scrollBarWidth + 4) or 0), 0)
+				tableArea:SetHeight(headerHeight)
 
-			local availableWidth = math.max(1, tableArea:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
-			content:SetWidth(availableWidth)
+				local availableWidth = math.max(1, tableArea:GetWidth() or ((scroll:GetWidth() or 0) - scrollBarWidth - 4))
+				content:SetWidth(availableWidth)
 
-			LayoutCells(header, headerCells, availableWidth)
-			for index = 1, #dataRows do
-				local dataRow = rows[index]
-				if dataRow and dataRow:IsShown() then
-					LayoutCells(dataRow, dataRow.Cells, availableWidth)
+				LayoutCells(header, headerCells, availableWidth)
+				for index = 1, #dataRows do
+					local dataRow = rows[index]
+					if dataRow and dataRow:IsShown() then
+						LayoutCells(dataRow, dataRow.Cells, availableWidth)
+					end
 				end
+			end
+
+			-- Two passes so showing or hiding the scrollbar can settle while
+			-- nested OnSizeChanged is ignored by the reentrancy guard.
+			ApplyScrollAndColumns()
+			ApplyScrollAndColumns()
+			end)
+			row.__sfLogTableRefreshing = false
+			if not ok then
+				error(tostring(err or "AddLogTable refresh failed"), 0)
 			end
 		end
 
