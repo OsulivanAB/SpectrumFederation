@@ -216,6 +216,10 @@ function Sync:_FinishAdminConvergence(reason)
     -- Clean up convergence state
     self.state._adminConvergence = nil
     
+    if type(self.ConsiderIdentityAdminSideEffects) == "function" and type(self.state.profileId) == "string" then
+        self:ConsiderIdentityAdminSideEffects(self.state.profileId)
+    end
+    
     if SF.Debug then
         local missing = {}
         for adminKey in pairs(conv.expected or {}) do
@@ -315,8 +319,14 @@ function Sync:FinalizeAdminConvergence()
         end
     end
 
-    -- 4) compute missing ranges for the coordinator
-    local missing = self:ComputeMissingLogRequests(localContig, targetMax)
+    -- 4) Retain advertised raw maxima even if AUTH_LOGS later times out, then
+    -- compute missing ranges for the coordinator. targetMax is exact-spelling.
+    if self._MergeAuthorMaxFrontier then
+        self:_MergeAuthorMaxFrontier(targetMax)
+    else
+        self.state.authorMax = targetMax
+    end
+    local missing = self:ComputeMissingLogRequests(localContig, targetMax, self:ComputeAuthorMax(profileId))
 
     -- 5) send LOG_REQs to a reasonable provider
     conv.pendingReq = {}
@@ -326,7 +336,7 @@ function Sync:FinalizeAdminConvergence()
         and SF.SyncProtocol.GetSupportedEncodings()
         or nil
 
-    local function registerAdminLogReq(providerList, author, fromCounter, toCounter, integrityRepair)
+    local function registerAdminLogReq(providerList, author, fromCounter, toCounter, integrityRepair, exactAuthor, range)
         if type(providerList) ~= "table" or #providerList == 0 then
             return false
         end
@@ -340,7 +350,7 @@ function Sync:FinalizeAdminConvergence()
             fallback[#fallback + 1] = providerList[i]
         end
 
-        local ok = self:RegisterRequest(requestId, "ADMIN_LOG_REQ", providerList[1], {
+        local meta = {
             sessionId       = self.state.sessionId,
             profileId       = profileId,
             adminSyncId     = conv.adminSyncId,
@@ -351,66 +361,106 @@ function Sync:FinalizeAdminConvergence()
             supportsEnc     = mySupportsEnc,
             targets         = fallback,
             integrityRepair = integrityRepair == true,
-        })
+            exactAuthor     = integrityRepair == true or exactAuthor == true,
+            backgroundRepair = true,
+            preferredTarget = providerList[1],
+            reason = integrityRepair == true and "admin-convergence-integrity" or "admin-convergence-missing",
+        }
+        if type(range) == "table" then
+            self:_CopyExpectedWindowEvidence(range, meta)
+        end
+
+        local ok = self:RegisterRequest(requestId, "ADMIN_LOG_REQ", providerList[1], meta)
 
         if not ok then
             conv.pendingReq[requestId] = nil
             conv.pendingCount = math.max(0, conv.pendingCount - 1)
+            if type(range) == "table" then
+                range.reason = meta.reason
+                self:_QueueAdvertisedRepair(
+                    profileId,
+                    range,
+                    integrityRepair == true and "integrity" or "missing",
+                    providerList[1]
+                )
+            end
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "ADMIN_LOG_REQ register failed (author=%s range=%s-%s); advertised mismatch remains queued",
+                    tostring(author), tostring(fromCounter), tostring(toCounter))
+            end
         end
 
         return ok
     end
 
-    for _, req in ipairs(missing) do
+    for _, req in ipairs(missing or {}) do
         local author = req.author
         local toCounter = req.toCounter
-
-        -- Provider selection:
-        -- Prefer the author themselves if they responded and claim to have up to that counter.
-        local provider = nil
-        local st = self.state.adminStatuses and self.state.adminStatuses[author]
-        if st and st.authorMax and (st.authorMax[author] or 0) >= toCounter then
-            provider = author
-        else
-            -- Otherwise, pick any admin who claims to have up to that counter.
-            for adminName, st2 in pairs(self.state.adminStatuses or {}) do
-                if st2 and st2.authorMax and (st2.authorMax[author] or 0) >= toCounter then
-                    provider = adminName
-                    break
-                end
+        local fromCounter = req.fromCounter
+        local providers = self:_ProvidersAdvertisingAuthorMax(author, fromCounter, toCounter)
+        if #providers > 0 then
+            local primary = providers[1]
+            local st = self.state.adminStatuses and self.state.adminStatuses[primary]
+            if type(st) == "table" then
+                self:_AttachExactWindowEvidence({ req }, st.authorWindowSummary or {})
             end
-        end
-
-        if provider then
-            -- Build ordered provider list: selected provider first, then any other admin who can serve
-            local providers, seen = {}, {}
-            local function addProvider(p)
-                if type(p) == "string" and p ~= "" and not seen[p] then
-                    seen[p] = true
-                    table.insert(providers, p)
+            local matched
+            if type(req.expectedWindows) == "table" and #req.expectedWindows > 0 then
+                matched = self:_FilterProvidersMatchingWindowProof(
+                    providers,
+                    author,
+                    fromCounter,
+                    toCounter,
+                    req.expectedWindows
+                )
+                if #matched == 0 then
+                    matched = { primary }
                 end
+            elseif req.exactAuthor == true then
+                matched = { primary }
+            else
+                matched = providers
             end
-
-            addProvider(provider)
-            for adminName, st2 in pairs(self.state.adminStatuses or {}) do
-                if st2 and st2.authorMax and (st2.authorMax[author] or 0) >= toCounter then
-                    addProvider(adminName)
-                end
-            end
-
-            registerAdminLogReq(providers, author, req.fromCounter, req.toCounter, false)
+            registerAdminLogReq(matched, author, fromCounter, toCounter, false, req.exactAuthor == true, req)
         end
     end
 
     local integritySeen = {}
-    for adminName, st in pairs(self.state.adminStatuses or {}) do
+    for _, adminName in ipairs(self:_SortedAdminStatusNames()) do
+        local st = self.state.adminStatuses[adminName]
         if type(st) == "table" and type(st.authorWindowSummary) == "table" then
             local ranges = self:ComputeWindowMismatchRequests(profileId, st.authorWindowSummary, localContig)
             for _, range in ipairs(ranges) do
-                local key = ("%s|%s|%d|%d"):format(tostring(adminName), tostring(range.author), tonumber(range.fromCounter) or 0, tonumber(range.toCounter) or 0)
-                if not integritySeen[key] then
-                    integritySeen[key] = true
-                    registerAdminLogReq({ adminName }, range.author, range.fromCounter, range.toCounter, true)
+                if self:_IsUnresolvedAdvertisedWindow(profileId, range) then
+                    local fp = self:_ExpectedWindowsFingerprint(range.expectedWindows)
+                    local key = ("%s|%d|%d|%s"):format(
+                        tostring(range.author),
+                        tonumber(range.fromCounter) or 0,
+                        tonumber(range.toCounter) or 0,
+                        fp
+                    )
+                    if not integritySeen[key] then
+                        integritySeen[key] = true
+                        local providers = self:_FilterProvidersMatchingWindowProof(
+                            self:_ProvidersAdvertisingAuthorMax(range.author, range.fromCounter, range.toCounter),
+                            range.author,
+                            range.fromCounter,
+                            range.toCounter,
+                            range.expectedWindows
+                        )
+                        if #providers == 0 then
+                            providers = { adminName }
+                        elseif providers[1] ~= adminName then
+                            local rest = { adminName }
+                            for i = 1, #providers do
+                                if providers[i] ~= adminName then
+                                    rest[#rest + 1] = providers[i]
+                                end
+                            end
+                            providers = rest
+                        end
+                        registerAdminLogReq(providers, range.author, range.fromCounter, range.toCounter, true, true, range)
+                    end
                 end
             end
         end
@@ -520,7 +570,7 @@ function Sync:BroadcastSessionStart()
     end
 
     local profileId = self.state.profileId
-    self.state.authorMax = self:ComputeAuthorMax(profileId) or {}
+    self:_RefreshAdvertisedAuthorMax(profileId)
     self.state.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or {}
     
     -- Store chosen helpers for later activation

@@ -13,16 +13,12 @@ local LootLogValidators = {}
 -- Function to validate if member exists in Loot Profiles member dictionary
 -- @param memberIdentifier (string) - Member full identifier "Name-Realm"
 -- @return (boolean) - True if member exists, false otherwise
-function LootLogValidators.MemberExistsInProfiles(memberIdentifier)
-	local activeProfile = SF.lootHelperDB and SF.lootHelperDB.activeProfile
-	if not activeProfile or not activeProfile.GetMemberList then
-		if SF.Debug then
-			SF.Debug:Warn("LOOTLOG", "No active loot profile set when validating member: %s", tostring(memberIdentifier))
-		end
-		return false
+function LootLogValidators.MemberExistsInProfiles(memberIdentifier, profile)
+	if type(profile) ~= "table" or not profile.GetMemberList then
+		return true
 	end
 
-	local members = activeProfile:GetMemberList()
+	local members = profile:GetMemberList()
 	if type(members) ~= "table" then return false end
 
 	-- Normalize compare if NameUtil exists
@@ -49,17 +45,60 @@ function LootLogValidators.MemberExistsInProfiles(memberIdentifier)
 	return false
 end
 
+local function NormalizeStoredNameRealm(id)
+    if type(id) ~= "string" or id == "" or not id:find("-", 1, true) then
+        return nil
+    end
+    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+        return SF.NameUtil.NormalizeNameRealm(id)
+    end
+    return id
+end
+
+local function SameStoredPlayer(a, b)
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+    local na = NormalizeStoredNameRealm(a)
+    local nb = NormalizeStoredNameRealm(b)
+    return na ~= nil and na == nb
+end
+
+local function ValidateStoredNameRealmField(memberID, fieldName)
+    if not NormalizeStoredNameRealm(memberID) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "%s has invalid member ID: %s", tostring(fieldName), tostring(memberID))
+        end
+        return false
+    end
+    return true
+end
+
+local function IsArrayLikeList(list)
+    if type(list) ~= "table" then
+        return false
+    end
+    local count = 0
+    for key in pairs(list) do
+        if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then
+            return false
+        end
+        count = count + 1
+    end
+    return count == #list
+end
+
 -- Function to validate the POINT_CHANGE event data
 -- @param eventData (table) - Event data to validate
 -- @param POINT_CHANGE_TYPES (table) - Point change type constants
 -- @return (boolean) - True if valid, false otherwise
-function LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES)
+function LootLogValidators.ValidatePointChangeData(eventData, POINT_CHANGE_TYPES, profile)
     local memberID = eventData.member
     local changeType = eventData.change
     local amount = eventData.amount
 
-    -- Validate member exists in profiles
-    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+    -- Validate member exists in the owning profile when one is supplied
+    if not LootLogValidators.MemberExistsInProfiles(memberID, profile) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Point change log references non-existent member: %s", tostring(memberID))
         end
@@ -91,13 +130,13 @@ end
 -- @param eventData (table) - Event data to validate
 -- @param ARMOR_ACTIONS (table) - Armor action constants
 -- @return (boolean) - True if valid, false otherwise
-function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS)
+function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, profile)
     local memberID = eventData.member
     local slot = eventData.slot
     local action = eventData.action
 
-    -- Validate member exists in profiles
-    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+    -- Validate member exists in the owning profile when one is supplied
+    if not LootLogValidators.MemberExistsInProfiles(memberID, profile) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Armor change log references non-existent member: %s", tostring(memberID))
         end
@@ -127,19 +166,67 @@ function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS)
         end
         return false
     end
-    
+
+    if eventData.scope ~= nil then
+        if eventData.scope ~= "identity" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid armor scope for member %s: %s", tostring(memberID), tostring(eventData.scope))
+            end
+            return false
+        end
+        if type(eventData.identityMembers) ~= "table" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Identity armor change missing identityMembers for member %s", tostring(memberID))
+            end
+            return false
+        end
+        local seen = {}
+        local count = 0
+        if not IsArrayLikeList(eventData.identityMembers) then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "identityMembers must be an array")
+            end
+            return false
+        end
+        for _, id in ipairs(eventData.identityMembers) do
+            local normalized = NormalizeStoredNameRealm(id)
+            if not normalized then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Invalid identityMembers entry: %s", tostring(id))
+                end
+                return false
+            end
+            for seenId in pairs(seen) do
+                if SameStoredPlayer(seenId, normalized) then
+                    if SF.Debug then
+                        SF.Debug:Warn("LOOTLOG", "Duplicate identityMembers entry: %s", tostring(id))
+                    end
+                    return false
+                end
+            end
+            seen[normalized] = true
+            count = count + 1
+        end
+        if count < 2 then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "identityMembers must contain at least two members")
+            end
+            return false
+        end
+    end
+
     return true
 end
 
 -- Function to validate the ROLE_CHANGE event data
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
-function LootLogValidators.ValidateRoleChangeData(eventData)
+function LootLogValidators.ValidateRoleChangeData(eventData, profile)
     local memberID = eventData.member
     local newRole = eventData.newRole
 
-    -- Validate member exists in profiles
-    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+    -- Validate member exists in the owning profile when one is supplied
+    if not LootLogValidators.MemberExistsInProfiles(memberID, profile) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Role change log references non-existent member: %s", tostring(memberID))
         end
@@ -245,24 +332,17 @@ end
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
 function LootLogValidators.ValidateAdminAddedData(eventData)
-    local memberID = eventData.member
-    
-    -- Validate member ID is a non-empty string in "Name-Realm" format
-    if type(memberID) ~= "string" or memberID == "" then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Admin added log has invalid member ID: %s", tostring(memberID))
-        end
+    if not ValidateStoredNameRealmField(eventData and eventData.member, "ADMIN_ADDED") then
         return false
     end
-    
-    -- Validate it follows "Name-Realm" format
-    if not memberID:match("^[^%-]+%-[^%-]+$") then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Admin added log has invalid member ID format (expected Name-Realm): %s", tostring(memberID))
+    if eventData.sourceLogId ~= nil then
+        if type(eventData.sourceLogId) ~= "string" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "ADMIN_ADDED sourceLogId must be a string")
+            end
+            return false
         end
-        return false
     end
-    
     return true
 end
 
@@ -270,65 +350,147 @@ end
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
 function LootLogValidators.ValidateAdminRemovedData(eventData)
-    local memberID = eventData.member
-    
-    -- Validate member ID is a non-empty string in "Name-Realm" format
-    if type(memberID) ~= "string" or memberID == "" then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Admin removed log has invalid member ID: %s", tostring(memberID))
-        end
-        return false
-    end
-    
-    -- Validate it follows "Name-Realm" format
-    if not memberID:match("^[^%-]+%-[^%-]+$") then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Admin removed log has invalid member ID format (expected Name-Realm): %s", tostring(memberID))
-        end
-        return false
-    end
-    
-    return true
+    return ValidateStoredNameRealmField(eventData and eventData.member, "ADMIN_REMOVED")
 end
 
 -- Function to validate the MAIN_SWAP event data
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
 function LootLogValidators.ValidateMainSwapData(eventData)
+    if not ValidateStoredNameRealmField(eventData and eventData.member, "MAIN_SWAP target") then
+        return false
+    end
+    if not ValidateStoredNameRealmField(eventData and eventData.sourceMember, "MAIN_SWAP source") then
+        return false
+    end
     local memberID = eventData.member
     local sourceMember = eventData.sourceMember
-
-    -- Validate target member ID is a non-empty string in "Name-Realm" format
-    if type(memberID) ~= "string" or memberID == "" then
+    if SameStoredPlayer(memberID, sourceMember) then
         if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid target member ID: %s", tostring(memberID))
+            SF.Debug:Warn("LOOTLOG", "MAIN_SWAP source and target must be different")
         end
         return false
     end
-
-    if not memberID:match("^[^%-]+%-[^%-]+$") then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid target member ID format (expected Name-Realm): %s", tostring(memberID))
-        end
-        return false
-    end
-
-    -- Validate source member ID is a non-empty string in "Name-Realm" format
-    if type(sourceMember) ~= "string" or sourceMember == "" then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid source member ID: %s", tostring(sourceMember))
-        end
-        return false
-    end
-
-    if not sourceMember:match("^[^%-]+%-[^%-]+$") then
-        if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "Main swap log has invalid source member ID format (expected Name-Realm): %s", tostring(sourceMember))
-        end
-        return false
-    end
-
     return true
+end
+
+local function ValidateNameRealmList(list, fieldName, allowEmpty)
+    if not IsArrayLikeList(list) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "%s must be an array", tostring(fieldName))
+        end
+        return false
+    end
+    local seen = {}
+    local count = 0
+    for _, id in ipairs(list) do
+        local normalized = NormalizeStoredNameRealm(id)
+        if not normalized then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid %s entry: %s", tostring(fieldName), tostring(id))
+            end
+            return false
+        end
+        for seenId in pairs(seen) do
+            if SameStoredPlayer(seenId, normalized) then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Duplicate %s entry: %s", tostring(fieldName), tostring(id))
+                end
+                return false
+            end
+        end
+        seen[normalized] = true
+        count = count + 1
+    end
+    if count == 0 and not allowEmpty then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "%s must not be empty", tostring(fieldName))
+        end
+        return false
+    end
+    return true
+end
+
+local function ValidatePreOpAuthorMax(list)
+    if list == nil then
+        return true
+    end
+    if not IsArrayLikeList(list) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "preOpAuthorMax must be an array")
+        end
+        return false
+    end
+    local seen = {}
+    for _, entry in ipairs(list) do
+        if type(entry) ~= "table" then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "preOpAuthorMax entries must be tables")
+            end
+            return false
+        end
+        local author = NormalizeStoredNameRealm(entry.author)
+        local counter = tonumber(entry.counter)
+        if not author then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid preOpAuthorMax author: %s", tostring(entry.author))
+            end
+            return false
+        end
+        if not counter or counter < 1 or counter ~= math.floor(counter) then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Invalid preOpAuthorMax counter for %s: %s", tostring(author), tostring(entry.counter))
+            end
+            return false
+        end
+        for seenId in pairs(seen) do
+            if SameStoredPlayer(seenId, author) then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "Duplicate preOpAuthorMax author: %s", tostring(author))
+                end
+                return false
+            end
+        end
+        seen[author] = true
+    end
+    return true
+end
+
+function LootLogValidators.ValidateCharacterLinkData(eventData)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    local memberA = NormalizeStoredNameRealm(eventData.memberA)
+    local memberB = NormalizeStoredNameRealm(eventData.memberB)
+    if not memberA then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK has invalid memberA: %s", tostring(eventData.memberA))
+        end
+        return false
+    end
+    if not memberB then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK has invalid memberB: %s", tostring(eventData.memberB))
+        end
+        return false
+    end
+    if SameStoredPlayer(memberA, memberB) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "CHARACTER_LINK requires two different characters")
+        end
+        return false
+    end
+    if not ValidateNameRealmList(eventData.adminMembersAtLink, "adminMembersAtLink", true) then
+        return false
+    end
+    return ValidatePreOpAuthorMax(eventData.preOpAuthorMax)
+end
+
+function LootLogValidators.ValidateCharacterUnlinkData(eventData)
+    if not ValidateStoredNameRealmField(eventData and eventData.member, "CHARACTER_UNLINK") then
+        return false
+    end
+    return ValidatePreOpAuthorMax(eventData and eventData.preOpAuthorMax)
 end
 
 local VALID_LOOT_MODES = {
@@ -426,12 +588,12 @@ end
 -- @param eventData (table) - Event data to validate
 -- @param POINT_CHANGE_TYPES (table) - Increment/decrement constants
 -- @return (boolean) - True if valid, false otherwise
-function LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES)
+function LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES, profile)
     local memberID = eventData.member
     local changeType = eventData.change
     local amount = eventData.amount
 
-    if not LootLogValidators.MemberExistsInProfiles(memberID) then
+    if not LootLogValidators.MemberExistsInProfiles(memberID, profile) then
         if SF.Debug then
             SF.Debug:Warn("LOOTLOG", "Attendance change log references non-existent member: %s", tostring(memberID))
         end
@@ -498,6 +660,14 @@ function LootLogValidators.ValidateRCLootCouncilData(eventData)
     end
 
     return true
+end
+
+local _ValidateArmorChangeData = LootLogValidators.ValidateArmorChangeData
+function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, profile)
+    if not _ValidateArmorChangeData(eventData, ARMOR_ACTIONS, profile) then
+        return false
+    end
+    return ValidatePreOpAuthorMax(eventData and eventData.preOpAuthorMax)
 end
 
 -- Export to namespace

@@ -99,9 +99,9 @@ See [Raid Check](features/raid-check.md) for interpretation and inspection limit
 
 **Preview as Non-Admin** is the first control on this page. It is a runtime preview for the canonical admin of the active profile, not a saved setting. Genuine non-admins do not see it. While the preview is on, the control stays available so you can turn it off, a red banner appears on every Settings page, and the other admin/owner rows stay visible but grey like they do for a genuine non-admin.
 
-Profile admins can add profile members as admins, remove admins other than the owner, and run **Transfer Points / Main Swap**.
+Profile admins can add profile members as admins, remove admins other than the owner, and manage **Linked Characters**. The link dialog asks for Character 1 and Character 2. Unlinking asks for confirmation because shared points, Attendance, and equipment opportunity state stop being combined.
 
-The owner cannot be removed from the admin list through this page.
+The owner cannot be removed from the admin list through this page. Only the effective owner may link or unlink characters that belong to the canonical owner's identity. Other admins may manage non-owner identities.
 
 ## Loot Helper: RC Loot Council
 

@@ -133,14 +133,33 @@ end
 
 local function IsOwner()
 	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if not profile then
+		return false
+	end
 	local Imp = SF.LootHelperImpersonation
-	if Imp and Imp.IsEffectiveLocalOwner then
+	if Imp and Imp.IsEffectiveLocalOwner and profile.IsCurrentUserOwner and profile:IsCurrentUserOwner() then
 		local ok, res = pcall(Imp.IsEffectiveLocalOwner, Imp, profile)
 		if ok then
 			return res and true or false
 		end
 	end
-	if profile and profile.IsCurrentUserOwner then
+	if Imp and Imp.IsActive and Imp:IsActive() then
+		local active = SF.lootHelperDB and SF.lootHelperDB.activeProfile
+		if active and profile.GetProfileId and active.GetProfileId then
+			if active:GetProfileId() == profile:GetProfileId() then
+				return false
+			end
+		elseif active == profile then
+			return false
+		end
+	end
+	if profile.IsCurrentUserEffectiveOwner then
+		local ok, res = pcall(profile.IsCurrentUserEffectiveOwner, profile)
+		if ok then
+			return res and true or false
+		end
+	end
+	if profile.IsCurrentUserOwner then
 		local ok, res = pcall(profile.IsCurrentUserOwner, profile)
 		if ok then
 			return res and true or false
@@ -422,6 +441,55 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 
 	local function BuildAllMemberOptions()
 		return BuildSelectableMemberOptions(true)
+	end
+
+	local function ShortMemberName(memberId)
+		if type(memberId) ~= "string" then
+			return "?"
+		end
+		return memberId:match("^([^%-]+)") or memberId
+	end
+
+	local function BuildLinkedCharacterItems()
+		local profile = GetActiveProfileObject(store)
+		if not profile then
+			return {}
+		end
+		local Identity = SF.LootHelperIdentity
+		if not Identity or not Identity.LinkedGroups then
+			return {}
+		end
+		local groups = {}
+		if profile.GetIdentityProjection and Identity.LinkedGroupsFromResult then
+			groups = Identity.LinkedGroupsFromResult(profile:GetIdentityProjection())
+		else
+			local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
+			groups = Identity.LinkedGroups(logs, profile._identityProjection)
+		end
+		local items = {}
+		for _, group in ipairs(groups) do
+			local names = {}
+			for i = 1, #group do
+				names[i] = ShortMemberName(group[i])
+			end
+			local groupLabel = table.concat(names, ", ")
+			for i = 1, #group do
+				local memberId = group[i]
+				local member = profile.getMemberByID and profile:getMemberByID(memberId)
+				local name = (type(member) == "table" and (member.member_name or member.name)) or ShortMemberName(memberId)
+				local color = GetMemberClassColor(member)
+				items[#items + 1] = {
+					id = memberId,
+					name = name,
+					text = color .. name .. "|r  (" .. groupLabel .. ")",
+					canRemove = true,
+				}
+			end
+		end
+		table.sort(items, function(a, b)
+			return tostring(a.name) < tostring(b.name)
+		end)
+		return items
 	end
 
 	local sectionsById = {
@@ -968,7 +1036,8 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				},
 				{ type = "scrollList", label = "Admins", adminOnly = true, height = 160, rowHeight = 20, removeAtlas = "common-icon-redx", compactColumns = true, removeColumnGap = 6, enabled = function() return ProfileActionsEnabled() end, getItems = function() return BuildAdminItems() end, onRemove = function(ctx, item) if type(ctx.store.RemoveAdminFromActiveProfile) ~= "function" then ctx.section:SetMessage("RemoveAdminFromActiveProfile() not implemented", "error") return end local ok, err = ctx.store:RemoveAdminFromActiveProfile(item.id) if not ok then ctx.section:SetMessage(err or "Failed to remove admin", "error") return end ctx.section:SetMessage("Admin removed.", "success") ctx.pageBuilder:Refresh() end },
 				{ type = "dropdownIconButton", label = "Add Admin", adminOnly = true, defaultText = "Select member", options = function() return BuildMemberOptions() end, get = function() return panel.__sfAddAdminSelectedId end, set = function(value) panel.__sfAddAdminSelectedId = value end, enabled = function() return ProfileActionsEnabled() end, iconAtlas = "common-icon-plus", iconToolTip = "Add the selected member as an admin for the active profile", iconEnabled = function() return ProfileActionsEnabled() and panel.__sfAddAdminSelectedId ~= nil end, onIconClick = function(ctx) if SF.Debug then SF.Debug:Info("UI", "Add Admin button clicked") end ctx.section:ClearMessage() local memberId = panel.__sfAddAdminSelectedId if SF.Debug then SF.Debug:Info("UI", "Selected memberId: %s", tostring(memberId)) end if not memberId then ctx.section:SetMessage("Select a member first.", "error") return end if type(ctx.store.AddAdminToActiveProfile) ~= "function" then ctx.section:SetMessage("AddAdminToActiveProfile() not implemented", "error") return end if SF.Debug then SF.Debug:Info("UI", "Calling AddAdminToActiveProfile with memberId: %s", tostring(memberId)) end local ok, err = ctx.store:AddAdminToActiveProfile(memberId) if SF.Debug then SF.Debug:Info("UI", "AddAdminToActiveProfile returned: ok=%s, err=%s", tostring(ok), tostring(err)) end if not ok then ctx.section:SetMessage(err or "Failed to add admin", "error") return end ctx.section:SetMessage("Admin added.", "success") ctx.pageBuilder:Refresh() end },
-				{ type = "button", label = "Transfer Points / Main Swap", adminOnly = true, buttonText = "Main Swap", width = 140, tooltip = "Transfer loot points, Attendance, and member-history references from one existing profile member to another existing profile member, then remove the old character from the profile.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if type(ctx.store.TransferMemberHistoryInActiveProfile) ~= "function" then ctx.section:SetMessage("TransferMemberHistoryInActiveProfile() not implemented", "error") return end local memberOptions = BuildAllMemberOptions() if #memberOptions < 2 then ctx.section:SetMessage("Add at least two profile members before using Main Swap.", "error") return end dialogs:TransferMemberHistory("Transfer all point and Attendance history from one profile member to another, then remove the old character from this profile?", "Transfer", memberOptions, memberOptions, function(sourceMemberId, targetMemberId) local ok, err = ctx.store:TransferMemberHistoryInActiveProfile(sourceMemberId, targetMemberId) if not ok then ctx.section:SetMessage(err or "Main Swap failed", "error") return end ctx.section:SetMessage("Main Swap completed.", "success") ctx.pageBuilder:Refresh() end) end },
+				{ type = "scrollList", label = "Linked Characters", adminOnly = true, height = 160, rowHeight = 20, removeAtlas = "common-icon-redx", compactColumns = true, removeColumnGap = 6, enabled = function() return ProfileActionsEnabled() end, getItems = function() return BuildLinkedCharacterItems() end, onRemove = function(ctx, item) if type(ctx.store.UnlinkCharacterInActiveProfile) ~= "function" then ctx.section:SetMessage("UnlinkCharacterInActiveProfile() not implemented", "error") return end dialogs:Confirm("Unlink this character from the shared identity? Points, Attendance, and equipment opportunity state will no longer be shared.", "Unlink", function() local ok, err = ctx.store:UnlinkCharacterInActiveProfile(item.id) if not ok then ctx.section:SetMessage(err or "Failed to unlink character", "error") return end ctx.section:SetMessage("Character unlinked.", "success") ctx.pageBuilder:Refresh() end) end },
+				{ type = "button", label = "Link Characters", adminOnly = true, buttonText = "Link", width = 140, tooltip = "Link two profile characters so they share identity-wide points, Attendance, and equipment opportunity state. Both remain on the roster as separate members. There is no Main or Primary character.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if type(ctx.store.LinkCharactersInActiveProfile) ~= "function" then ctx.section:SetMessage("LinkCharactersInActiveProfile() not implemented", "error") return end local memberOptions = BuildAllMemberOptions() if #memberOptions < 2 then ctx.section:SetMessage("Add at least two profile members before linking characters.", "error") return end dialogs:TransferMemberHistory("Link two characters in this profile. They keep separate roster rows and history, and share identity-wide points, Attendance, and equipment opportunity state.", "Link", memberOptions, memberOptions, function(memberA, memberB) local ok, err = ctx.store:LinkCharactersInActiveProfile(memberA, memberB) if not ok then ctx.section:SetMessage(err or "Link failed", "error") return end ctx.section:SetMessage("Characters linked.", "success") ctx.pageBuilder:Refresh() end, { sourceLabel = "Character 1", targetLabel = "Character 2", sameCharacterMessage = "Select two different characters." }) end },
 			},
 		},
 	}

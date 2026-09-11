@@ -164,14 +164,16 @@ function Sync:HandleAuthLogs(sender, payload)
             local requestedTo = req.meta.toCounter
             
             -- Verify all received logs are for the correct author and within requested range
+            local exactRepair = self:_IsExactAuthorRepair(req.meta)
             for _, logTable in ipairs(payload.logs) do
                 local logAuthor = logTable._author or logTable.author
                 local logCounter = logTable._counter or logTable.counter
                 
-                if logAuthor ~= requestedAuthor then
+                local authorMatches = self:_AuthorMatchesRepairRequest(logAuthor, requestedAuthor, exactRepair)
+                if not authorMatches then
                     if SF.Debug then
-                        SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log author %s doesn't match requested %s",
-                            tostring(logAuthor), tostring(requestedAuthor))
+                        SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log author %s doesn't match requested %s (exactAuthor=%s)",
+                            tostring(logAuthor), tostring(requestedAuthor), tostring(exactRepair))
                     end
                     self:_RetryRequestSoon(req)
                     return
@@ -198,6 +200,7 @@ function Sync:HandleAuthLogs(sender, payload)
         )
     local changed, mergeDetails = self:MergeLogs(payload.profileId, payload.logs, {
         allowReplaceExisting = allowReplaceExisting,
+        allowMainSwapFingerprintNormalize = true,
     })
     if t0 then
         self:_MObserve("sync.merge.auth_logs.merge_ms", debugprofilestop() - t0)
@@ -230,26 +233,73 @@ function Sync:HandleAuthLogs(sender, payload)
     local requestSatisfied = false
     if req.kind == "NEED_LOGS" or req.kind == "LOG_REQ" or req.kind == "ADMIN_LOG_REQ" then
         if req.meta and req.meta.author and req.meta.toCounter then
-            local contig = self:_ComputeContigCounter(payload.profileId, req.meta.author)
-            if contig >= req.meta.toCounter then
-                requestSatisfied = true
-                if SF.Debug then
-                    SF.Debug:Info("SYNC", "Request %s satisfied: author=%s contig=%d >= requested=%d",
-                        tostring(payload.requestId), tostring(req.meta.author), contig, req.meta.toCounter)
+            local exactRepair = self:_IsExactAuthorRepair(req.meta)
+            if exactRepair then
+                -- A proof-bearing AUTH_LOGS payload can establish that the
+                -- advertiser's filled set is present locally even when the
+                -- receiver also retains extra valid rows in the same window.
+                if self._ProveAdvertisedWindowsFromAuthLogs then
+                    self:_ProveAdvertisedWindowsFromAuthLogs(payload.profileId, req.meta, payload.logs)
+                end
+                -- Empty AUTH_LOGS, SameAuthor siblings, later-window rows,
+                -- and incomplete integrity subsets must not complete
+                -- exact-author repairs. Coordinator fallback has to keep
+                -- running until the requested window is actually filled.
+                -- Members late-bind coordinator-advertised windows onto
+                -- in-flight exact requests that were queued without proof.
+                self:_BindSessionWindowEvidence({ req.meta })
+                requestSatisfied = self:_ExactAuthorRangeSatisfied(
+                    payload.profileId,
+                    req.meta.author,
+                    req.meta.fromCounter or 1,
+                    req.meta.toCounter,
+                    {
+                        integrityRepair = req.meta.integrityRepair == true,
+                        expectedCount = req.meta.expectedCount,
+                        expectedChecksum = req.meta.expectedChecksum,
+                        expectedMaxCounter = req.meta.expectedMaxCounter,
+                        expectedFromCounter = req.meta.expectedFromCounter,
+                        expectedToCounter = req.meta.expectedToCounter,
+                        expectedWindows = req.meta.expectedWindows,
+                    }
+                )
+                if requestSatisfied then
+                    if SF.Debug then
+                        SF.Debug:Info("SYNC", "Request %s satisfied: exact author=%s range=%d-%d present",
+                            tostring(payload.requestId), tostring(req.meta.author),
+                            tonumber(req.meta.fromCounter) or 1, tonumber(req.meta.toCounter) or 0)
+                    end
+                else
+                    if SF.Debug then
+                        SF.Debug:Info("SYNC", "Request %s exact-author incomplete: author=%s range=%d-%d still missing locally",
+                            tostring(payload.requestId), tostring(req.meta.author),
+                            tonumber(req.meta.fromCounter) or 1, tonumber(req.meta.toCounter) or 0)
+                    end
+                    self:_RetryRequestSoon(req)
+                    return
                 end
             else
-                -- Partial response: adjust request to only ask for missing range (Rec 2)
-                -- Update fromCounter to contig+1 to avoid requesting already-merged logs
-                if SF.Debug then
-                    SF.Debug:Info("SYNC", "Request %s partial: author=%s contig=%d < requested=%d, adjusting retry range",
-                        tostring(payload.requestId), tostring(req.meta.author), contig, req.meta.toCounter)
+                local contig = self:_ComputeContigCounter(payload.profileId, req.meta.author)
+                if contig >= req.meta.toCounter then
+                    requestSatisfied = true
+                    if SF.Debug then
+                        SF.Debug:Info("SYNC", "Request %s satisfied: author=%s contig=%d >= requested=%d",
+                            tostring(payload.requestId), tostring(req.meta.author), contig, req.meta.toCounter)
+                    end
+                else
+                    -- Partial response: adjust request to only ask for missing range (Rec 2)
+                    -- Update fromCounter to contig+1 to avoid requesting already-merged logs
+                    if SF.Debug then
+                        SF.Debug:Info("SYNC", "Request %s partial: author=%s contig=%d < requested=%d, adjusting retry range",
+                            tostring(payload.requestId), tostring(req.meta.author), contig, req.meta.toCounter)
+                    end
+                    
+                    -- Update request metadata to request only remaining logs
+                    req.meta.fromCounter = contig + 1
+                    
+                    self:_RetryRequestSoon(req)
+                    return
                 end
-                
-                -- Update request metadata to request only remaining logs
-                req.meta.fromCounter = contig + 1
-                
-                self:_RetryRequestSoon(req)
-                return
             end
         else
             -- No meta to validate against; assume satisfied

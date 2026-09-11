@@ -76,46 +76,52 @@ function Sync:BuildAdminStatus(profileId)
     status.authorMax = profile:ComputeAuthorMax() or {}
     status.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or {}
 
-    -- hasGaps heuristic: Check for non-contiguous sequences
-    -- Instead of just counting, verify that counters 1..max all exist for each author
-    local counts = {}
-    local logsByAuthor = {}  -- [author] = { [counter] = true }
-    
+    -- hasGaps heuristic: is the logical SameAuthor sequence missing a counter?
+    -- Historical alias continuation (owner-Garona:1..6 + Owner-Garona:7) is
+    -- complete sequential history. Duplicate logical-counter alias rows are
+    -- not a gap. Raw-window integrity still discovers missing immutable rows.
+    local Identity = SF.LootHelperIdentity
+    local countersByKey = {}
+    local maxByKey = {}
+
     for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
         if log and log.GetAuthor and log.GetCounter then
             local a = log:GetAuthor()
-            local c = log:GetCounter()
-            if type(a) == "string" and type(c) == "number" then
-                counts[a] = (counts[a] or 0) + 1
-                logsByAuthor[a] = logsByAuthor[a] or {}
-                logsByAuthor[a][c] = true
+            local c = tonumber(log:GetCounter())
+            if type(a) == "string" and a ~= "" and c and c >= 1 then
+                c = math.floor(c)
+                local key = a
+                if Identity and Identity.CanonicalAuthorKey then
+                    key = Identity.CanonicalAuthorKey(a) or a
+                else
+                    key = string.lower(a)
+                end
+                local set = countersByKey[key]
+                if not set then
+                    set = {}
+                    countersByKey[key] = set
+                end
+                set[c] = true
+                local prev = maxByKey[key] or 0
+                if c > prev then
+                    maxByKey[key] = c
+                end
             end
         end
     end
 
-    -- Check for gaps: verify counters 1..max are all present
-    for author, maxCounter in pairs(status.authorMax) do
-        if type(author) == "string" and type(maxCounter) == "number" then
-            -- First check if count matches max (quick check for obvious gaps)
-            if (counts[author] or 0) < maxCounter then
-                status.hasGaps = true
-                break
-            end
-            
-            -- Then verify contiguity: check that all counters from 1 to max exist
-            local authorLogs = logsByAuthor[author]
-            if authorLogs then
-                for i = 1, maxCounter do
-                    if not authorLogs[i] then
-                        status.hasGaps = true
-                        break
-                    end
+    for key, maxCounter in pairs(maxByKey) do
+        local set = countersByKey[key]
+        if type(maxCounter) == "number" and type(set) == "table" then
+            for i = 1, maxCounter do
+                if not set[i] then
+                    status.hasGaps = true
+                    break
                 end
             end
-            
-            if status.hasGaps then
-                break
-            end
+        end
+        if status.hasGaps then
+            break
         end
     end
 
@@ -172,16 +178,28 @@ function Sync:HandleAdminStatus(sender, payload)
             tostring(sender), tostring(payload.hasProfile), tostring(payload.hasGaps), authorCount)
     end
     
-    -- Issue #10 Rec 3: Progressive convergence - update authorMax with late responses
+    -- Issue #10 Rec 3: Progressive convergence - retain late raw author maxima
+    -- without copying them onto SameAuthor historical spellings.
     if conv.finalizeStarted and payload.authorMax then
-        -- Merge late admin's authorMax into session authorMax
-        for author, maxCounter in pairs(payload.authorMax) do
-            local current = self.state.authorMax[author] or 0
-            if type(maxCounter) == "number" and maxCounter > current then
-                self.state.authorMax[author] = maxCounter
-                if SF.Debug then
-                    SF.Debug:Info("SYNC", "Late ADMIN_STATUS from %s: updated authorMax[%s] from %d to %d",
-                        tostring(sender), tostring(author), current, maxCounter)
+        local before = {}
+        for author, maxCounter in pairs(self.state.authorMax or {}) do
+            before[author] = tonumber(maxCounter) or 0
+        end
+        if self._MergeAuthorMaxFrontier then
+            self:_MergeAuthorMaxFrontier(payload.authorMax)
+        end
+        if type(payload.authorWindowSummary) == "table" then
+            self:_QueueRemoteWindowMismatches(self.state.profileId, normalizedSender, payload.authorWindowSummary)
+        end
+        if SF.Debug then
+            for author, _ in pairs(payload.authorMax) do
+                if type(author) == "string" then
+                    local current = tonumber(self.state.authorMax[author]) or 0
+                    local previous = before[author] or 0
+                    if current > previous then
+                        SF.Debug:Info("SYNC", "Late ADMIN_STATUS from %s: updated authorMax[%s] from %d to %d",
+                            tostring(sender), tostring(author), previous, current)
+                    end
                 end
             end
         end
@@ -258,7 +276,11 @@ function Sync:HandleSessionReannounce(sender, payload)
         self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
     end
 
-    self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
+    if self._MergeAuthorMaxFrontier then
+        self:_MergeAuthorMaxFrontier(payload.authorMax)
+    else
+        self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
+    end
     self.state.authorWindowSummary = (type(payload.authorWindowSummary) == "table") and payload.authorWindowSummary or {}
     self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
 
@@ -403,12 +425,17 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         self.state.helpers = payload.helpers
     end
     if type(payload.authorMax) == "table" then
-        -- Merge authorMax with max() to preserve local progress from NEW_LOG messages
-        self.state.authorMax = self.state.authorMax or {}
-        for author, remoteMax in pairs(payload.authorMax) do
-            if type(author) == "string" and type(remoteMax) == "number" then
-                local localMax = tonumber(self.state.authorMax[author]) or 0
-                self.state.authorMax[author] = math.max(localMax, remoteMax)
+        -- Exact-key max only: retain local NEW_LOG progress and previously
+        -- advertised raw spellings without alias-stamping historical maxima.
+        if self._MergeAuthorMaxFrontier then
+            self:_MergeAuthorMaxFrontier(payload.authorMax)
+        else
+            self.state.authorMax = self.state.authorMax or {}
+            for author, remoteMax in pairs(payload.authorMax) do
+                if type(author) == "string" and type(remoteMax) == "number" then
+                    local localMax = tonumber(self.state.authorMax[author]) or 0
+                    self.state.authorMax[author] = math.max(localMax, remoteMax)
+                end
             end
         end
     end
@@ -446,23 +473,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     self:TouchPeer(sender, { inGroup = true })
 
     if not self.state.isCoordinator and payload.integrityHint == "mutation" then
-        local advertisedRanges = {}
-        for _, range in ipairs(payload.mutationRanges or {}) do
-            if type(range) == "table"
-                and type(range.author) == "string"
-                and type(range.fromCounter) == "number"
-                and type(range.toCounter) == "number"
-            then
-                advertisedRanges[#advertisedRanges + 1] = {
-                    author = range.author,
-                    fromCounter = range.fromCounter,
-                    toCounter = range.toCounter,
-                    mode = "integrity",
-                    preferredTarget = sender,
-                }
-            end
-        end
-
+        local advertisedRanges = self:_IntegrityRangesFromAdvertisement(payload, sender)
         if #advertisedRanges > 0 then
             self:QueueRepairRanges(self.state.profileId, advertisedRanges, {
                 mode = "integrity",
@@ -491,7 +502,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
             -- If we have the profile, request missing logs (if any)
             local localContig = self:ComputeContigAuthorMax(self.state.profileId)   -- Bug: Don't we have our Authormax values saved? recalculating our Authormax maps every 30 seconds seems intense
             local remoteMax = self.state.authorMax or {}
-            local missing = self:ComputeMissingLogRequests(localContig, remoteMax)
+            local localRawMax = self:ComputeAuthorMax(self.state.profileId)
+            local missing = self:ComputeMissingLogRequests(localContig, remoteMax, localRawMax)
+            self:_AttachExactWindowEvidence(missing, self.state.authorWindowSummary or {})
             local integrityRanges = self:ComputeWindowMismatchRequests(
                 self.state.profileId,
                 self.state.authorWindowSummary or {},
@@ -506,7 +519,11 @@ function Sync:HandleSessionHeartbeat(sender, payload)
                     local f = r.fromCounter
                     local t = r.toCounter
                     if type(a) == "string" and type(f) == "number" and type(t) == "number" then
-                        if not self:_HasOutstandingLogRangeRequest(self.state.profileId, a, f, t) then
+                        if r.exactAuthor then
+                            r.preferredTarget = r.preferredTarget or sender
+                        end
+                        self:_UpgradeOutstandingLogRangeEvidence(self.state.profileId, a, f, t, r)
+                        if not self:_HasOutstandingLogRangeRequest(self.state.profileId, a, f, t, r.exactAuthor == true) then
                             table.insert(filtered, r)
                         end
                     end
@@ -610,22 +627,7 @@ function Sync:_HandlePeerIntegrityAdvertisement(sender, payload)
     if payload.integrityHint ~= "mutation" then return end
     if not self:IsSenderAuthorized(payload.profileId, sender) then return end
 
-    local ranges = {}
-    for _, range in ipairs(payload.mutationRanges or {}) do
-        if type(range) == "table"
-            and type(range.author) == "string"
-            and type(range.fromCounter) == "number"
-            and type(range.toCounter) == "number"
-        then
-            ranges[#ranges + 1] = {
-                author = range.author,
-                fromCounter = range.fromCounter,
-                toCounter = range.toCounter,
-                mode = "integrity",
-            }
-        end
-    end
-
+    local ranges = self:_IntegrityRangesFromAdvertisement(payload, sender)
     if #ranges > 0 then
         self:QueueRepairRanges(payload.profileId, ranges, {
             mode = "integrity",
@@ -849,6 +851,7 @@ function Sync:HandleNeedLogs(sender, payload)
             local author = req.author
             local fromC = math.max(1, math.floor(req.fromCounter))
             local toC   = math.max(fromC, math.floor(req.toCounter))
+            local exactAuthor = req.exactAuthor == true or payload.exactAuthor == true or payload.integrityRepair == true
             local delay = (i - 1) * spacingSec
 
             self:RunAfter(delay, function()
@@ -862,7 +865,8 @@ function Sync:HandleNeedLogs(sender, payload)
                     local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
                     local c = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
                     c = tonumber(c)
-                    if a == author and c and c >= fromC and c <= toC then
+                    local authorMatches = self:_AuthorMatchesRepairRequest(a, author, exactAuthor)
+                    if authorMatches and c and c >= fromC and c <= toC then
                         if log and log.ToTable then
                             table.insert(out, log:ToTable())
                         elseif type(log) == "table" then
@@ -939,6 +943,7 @@ function Sync:HandleLogRequest(sender, payload)
 
     local fromC = math.max(1, math.floor(payload.fromCounter))
     local toC = (toCounter and math.floor(toCounter)) or fromC
+    local exactAuthor = payload.exactAuthor == true or payload.integrityRepair == true
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Serving logs for %s [%d-%d] to %s",
@@ -950,7 +955,8 @@ function Sync:HandleLogRequest(sender, payload)
         local author = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
         local counter = (log and log.GetCounter and log:GetCounter()) or (log and log._counter)
         counter = tonumber(counter)
-        if author == payload.author and counter and counter >= fromC and counter <= toC then
+        local authorMatches = self:_AuthorMatchesRepairRequest(author, payload.author, exactAuthor)
+        if authorMatches and counter and counter >= fromC and counter <= toC then
             if log and log.ToTable then
                 table.insert(out, log:ToTable())
             elseif type(log) == "table" then
