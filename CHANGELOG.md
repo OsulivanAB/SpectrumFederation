@@ -2,7 +2,12 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.0-beta.2] - 2026-09-09
+## [1.5.1] - 2026-09-11
+
+### Fixed
+- Sync protocol incompatibility warnings print once per peer instead of repeating for every mixed-version raid message
+
+## [1.5.0] - 2026-09-11
 
 ### Added
 - Linked Characters for Loot Helper profiles: admins can link and unlink characters so they share identity-wide points, Attendance, and equipment opportunity state while remaining separate roster members
@@ -13,7 +18,6 @@ All notable changes to SpectrumFederation will be documented in this file.
 ### Changed
 - Replace live Main Swap / Transfer Main with Linked Characters
 - Points, Attendance, and equipment opportunity state are projected from the linked identity instead of a single character cache
-- Loot Helper sync protocol version is now 2 so older Main Swap clients cannot share a session
 
 ### Fixed
 - Guarded repair for the historical Main Swap stale-fingerprint rewrite, without blessing unrelated mismatches
@@ -32,7 +36,6 @@ All notable changes to SpectrumFederation will be documented in this file.
 - Linked Characters dialog uses Character 1 / Character 2 labels, and unlink asks for confirmation
 - Identity projection is cached per profile and reused for helpers, UI reads, and live point/Attendance fan-out
 - Out-of-order point or Attendance inserts replay identity totals instead of fan-out through the Attendance zero floor
-- In-order remote Raid Check `NEW_LOG` point/Attendance updates use the same incremental fan-out as local writes
 - Live relationship authorization uses deterministic pre-operation history and defers when predecessor logs are missing
 - `Identity.Replay` is the relationship authorization source of truth: live receipt, bulk/`AUTH_LOGS` repair, and reload skip unauthorized `CHARACTER_LINK` / `CHARACTER_UNLINK` events instead of permanently accepting an unadvertised-predecessor race
 - Live `NEW_LOG` rebuilds do not persist implied `ADMIN_ADDED` grants, so a coordinator cannot lock in admin side effects from a relationship that Replay later skips

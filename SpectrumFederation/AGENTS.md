@@ -200,4 +200,5 @@ When you need a new toggle/option:
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle changes: `python -m pytest tests/test_raid_equipment.py`
 - Loot Helper impersonation / Preview as Non-Admin: `python -m pytest tests/test_impersonation.py`
 - Linked character identities: `python -m pytest tests/test_linked_identity.py`
+- Sync protocol NACK/warning throttling: `python -m pytest tests/test_sync_protocol.py`
 - RC Loot Council Integration child addon: `python -m pytest tests/test_rc_loot_council_integration.py`

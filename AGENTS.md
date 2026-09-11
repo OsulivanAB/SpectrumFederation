@@ -47,6 +47,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
 - Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
 - Run Loot Helper window tests (production Lua via lua5.1): `python -m pytest tests/test_loot_helper_window.py`
+- Run Sync protocol warning-dedupe tests (production Lua via lua5.1): `python -m pytest tests/test_sync_protocol.py`
 - Run RC Loot Council Integration tests (production Lua via lua5.1): `python -m pytest tests/test_rc_loot_council_integration.py`
 - Run Settings window layout tests (production Lua via lua5.1): `python -m pytest tests/test_settings_window_layout.py`
 - Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py`
@@ -83,6 +84,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Settings navigation or Registry helpers: also run `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer constants or trail engine: also run `python -m pytest tests/test_mouse_tracer.py`
 - Loot Helper window minimize/positioning: also run `python -m pytest tests/test_loot_helper_window.py`
+- Sync protocol NACK/warning throttling: also run `python -m pytest tests/test_sync_protocol.py`
 - RC Loot Council Integration child addon: also run `python -m pytest tests/test_rc_loot_council_integration.py`
 - Settings window impersonation-banner layout: also run `python -m pytest tests/test_settings_window_layout.py`
 - Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`

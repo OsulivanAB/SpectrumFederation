@@ -27,6 +27,7 @@ Use this skill when a task is close to done and you need a repo-specific merge-r
    - `python -m pytest tests/test_settings_navigation.py` when Settings navigation/Registry/TOC metadata changed
    - `python -m pytest tests/test_mouse_tracer.py` when Mouse Tracer constants, engine, or runtime tests changed
    - `python -m pytest tests/test_loot_helper_window.py` when Loot Helper window minimize or positioning changed
+   - `python -m pytest tests/test_sync_protocol.py` when SyncProtocol NACK/warning throttling changed
    - `python -m pytest tests/test_settings_window_layout.py` when Settings window content layout or the impersonation banner changed
    - `python -m pytest tests/test_pr_template.py` when the PR template or `validate_pr_template.py` changed
 4. If the change touches addon packaging, release logic, or TOC-driven behavior, inspect `SpectrumFederation/SpectrumFederation.toc` before finishing.
