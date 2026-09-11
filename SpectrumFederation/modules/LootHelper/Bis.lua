@@ -822,14 +822,7 @@ function Bis.ProjectComponent(state, memberIds)
         if asg.active and ownerInComponent(asg.awardOwner) then
             local include = true
             if asg.legacyOriginLogId then
-                if not OriginActive(state, asg.legacyOriginLogId) then
-                    include = false
-                else
-                    local rec = state.contributingOrigins[asg.legacyOriginLogId]
-                    if rec and rec.expired then
-                        include = false
-                    end
-                end
+                include = OriginActive(state, asg.legacyOriginLogId)
             end
             if include then
                 local native = ScopeFullyPresent(asg.assignmentScopeMembers, componentSet)

@@ -838,7 +838,7 @@ assertEq(slotState(overlap, ALT_A, "Ring2"), "ASSIGNED_AUTO", "overlapping scope
 -- 1H then OffHand holdable; dual-wield 1H; incompatible later 2H
 resetEnv()
 local weapons = makeProfile("Weapons")
-addMember(weapons, ALT_A)
+addMember(weapons, ALT_A, "member", "PALADIN")
 assertTrue(weapons:SetMemberSpec(ALT_A, 65), "Holy paladin spec")
 assertTrue(weapons:AddRCLootCouncilBisResponse("Need"))
 assertTrue(weapons:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700003800")))
