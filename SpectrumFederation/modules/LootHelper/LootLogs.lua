@@ -28,6 +28,30 @@ local EVENT_TYPES = {
     REWARD_POT_CHANGE           = "REWARD_POT_CHANGE",
     ATTENDANCE_CHANGE           = "ATTENDANCE_CHANGE",
     RC_LOOT_COUNCIL             = "RC_LOOT_COUNCIL",
+    SPEC_CHANGE                = "SPEC_CHANGE",
+    BIS_OUTCOME                = "BIS_OUTCOME",
+    BIS_OVERRIDE              = "BIS_OVERRIDE",
+    MANUAL_AWARD              = "MANUAL_AWARD",
+    MANUAL_AWARD_REVERSE      = "MANUAL_AWARD_REVERSE",
+}
+
+local BIS_OUTCOMES = {
+    NOT_BIS = "NOT_BIS",
+    ASSIGNED = "ASSIGNED",
+    OVERFLOW = "OVERFLOW",
+    UNRESOLVED = "UNRESOLVED",
+}
+
+local BIS_BINDINGS = {
+    PACKABLE = "PACKABLE",
+    BOUND = "BOUND",
+}
+
+local BIS_OVERRIDE_ACTIONS = {
+    ASSIGN = "ASSIGN",
+    CLEAR = "CLEAR",
+    REPLACE = "REPLACE",
+    ASSOCIATE_LEGACY = "ASSOCIATE_LEGACY",
 }
 
 local POINT_CHANGE_TYPES = {
@@ -127,7 +151,35 @@ local EVENT_DATA_TEMPLATES = {
         -- @field owner string|nil RC item owner
         -- @field responseId number|nil RC response id
         -- @field isAwardReason boolean|nil RC award-reason flag
-    }
+    },
+    [EVENT_TYPES.SPEC_CHANGE] = {
+        member = "",
+        specId = 0,
+        preOpAuthorMax = {},
+    },
+    [EVENT_TYPES.BIS_OUTCOME] = {
+        sourceLogId = "",
+        awardKey = "",
+        awardMember = "",
+        qualified = false,
+        outcome = "",
+        assignedSlots = {},
+        preOpAuthorMax = {},
+    },
+    [EVENT_TYPES.BIS_OVERRIDE] = {
+        action = "",
+        preOpAuthorMax = {},
+    },
+    [EVENT_TYPES.MANUAL_AWARD] = {
+        member = "",
+        itemLink = "",
+        itemString = "",
+        preOpAuthorMax = {},
+    },
+    [EVENT_TYPES.MANUAL_AWARD_REVERSE] = {
+        sourceLogId = "",
+        preOpAuthorMax = {},
+    },
 }
 
 -- Generates a unique log ID based on author and a counter
@@ -520,14 +572,39 @@ function LootLog.new(eventType, eventData, opts)
         if not SF.LootLogValidators.ValidateRCLootCouncilData(eventData) then
             return nil
         end
+    elseif eventType == EVENT_TYPES.SPEC_CHANGE then
+        if not SF.LootLogValidators.ValidateSpecChangeData(eventData, owningProfile) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.BIS_OUTCOME then
+        if not SF.LootLogValidators.ValidateBisOutcomeData(eventData, owningProfile) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.BIS_OVERRIDE then
+        if not SF.LootLogValidators.ValidateBisOverrideData(eventData, owningProfile) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.MANUAL_AWARD then
+        if not SF.LootLogValidators.ValidateManualAwardData(eventData, owningProfile) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.MANUAL_AWARD_REVERSE then
+        if not SF.LootLogValidators.ValidateManualAwardReverseData(eventData, owningProfile) then
+            return nil
+        end
     end
 
     -- Snapshot contemporaneous author heads before this event allocates a counter.
     local isIdentityArmor = eventType == EVENT_TYPES.ARMOR_CHANGE and eventData.scope == "identity"
-    if eventType == EVENT_TYPES.CHARACTER_LINK
+    local needsPreOp = eventType == EVENT_TYPES.CHARACTER_LINK
         or eventType == EVENT_TYPES.CHARACTER_UNLINK
         or isIdentityArmor
-    then
+        or eventType == EVENT_TYPES.SPEC_CHANGE
+        or eventType == EVENT_TYPES.BIS_OUTCOME
+        or eventType == EVENT_TYPES.BIS_OVERRIDE
+        or eventType == EVENT_TYPES.MANUAL_AWARD
+        or eventType == EVENT_TYPES.MANUAL_AWARD_REVERSE
+    if needsPreOp then
         if type(eventData.preOpAuthorMax) ~= "table" or #eventData.preOpAuthorMax == 0 then
             local Identity = SF.LootHelperIdentity
             if Identity and Identity.SnapshotPreOpAuthorMax then
@@ -546,6 +623,26 @@ function LootLog.new(eventType, eventData, opts)
             end
         elseif isIdentityArmor then
             if not SF.LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, owningProfile) then
+                return nil
+            end
+        elseif eventType == EVENT_TYPES.SPEC_CHANGE then
+            if not SF.LootLogValidators.ValidateSpecChangeData(eventData, owningProfile) then
+                return nil
+            end
+        elseif eventType == EVENT_TYPES.BIS_OUTCOME then
+            if not SF.LootLogValidators.ValidateBisOutcomeData(eventData, owningProfile) then
+                return nil
+            end
+        elseif eventType == EVENT_TYPES.BIS_OVERRIDE then
+            if not SF.LootLogValidators.ValidateBisOverrideData(eventData, owningProfile) then
+                return nil
+            end
+        elseif eventType == EVENT_TYPES.MANUAL_AWARD then
+            if not SF.LootLogValidators.ValidateManualAwardData(eventData, owningProfile) then
+                return nil
+            end
+        elseif eventType == EVENT_TYPES.MANUAL_AWARD_REVERSE then
+            if not SF.LootLogValidators.ValidateManualAwardReverseData(eventData, owningProfile) then
                 return nil
             end
         end
@@ -1128,3 +1225,6 @@ SF.LootLog = LootLog
 SF.LootLogEventTypes = EVENT_TYPES
 SF.LootLogPointChangeTypes = POINT_CHANGE_TYPES
 SF.LootLogArmorActions = ARMOR_ACTIONS
+SF.LootLogBisOutcomes = BIS_OUTCOMES
+SF.LootLogBisBindings = BIS_BINDINGS
+SF.LootLogBisOverrideActions = BIS_OVERRIDE_ACTIONS

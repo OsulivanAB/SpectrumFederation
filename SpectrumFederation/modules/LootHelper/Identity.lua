@@ -160,7 +160,8 @@ function Identity.CompareLogs(a, b)
 end
 
 -- Causal-then-deterministic order: per-author counters, writer-observed
--- preOpAuthorMax, sourceLogId grant edges, then CompareLogs among ready events.
+-- preOpAuthorMax, sourceLogId / sourceLogIds / targetAssignmentId edges,
+-- then CompareLogs among ready events.
 -- Ready selection is a binary min-heap so the Kahn walk is O(n log n).
 -- SameAuthor aliases share one logical counter stream, but every immutable
 -- historical row at a logical counter stays its own node. Observing frontier N
@@ -299,6 +300,26 @@ function Identity.OrderLogs(logs)
         end
     end
 
+    local function addSourceEdges(data, succLog)
+        local function addOne(sourceId)
+            if type(sourceId) ~= "string" or sourceId == "" then
+                return
+            end
+            local sourceLog = byId[sourceId]
+            if sourceLog then
+                addEdge(sourceLog, succLog)
+            end
+        end
+        addOne(data and data.sourceLogId)
+        addOne(data and data.targetAssignmentId)
+        local sourceLogIds = data and data.sourceLogIds
+        if type(sourceLogIds) == "table" then
+            for j = 1, #sourceLogIds do
+                addOne(sourceLogIds[j])
+            end
+        end
+    end
+
     for i = 1, n do
         local log = logs[i]
         local author = GetLogAuthor(log) or (log and log._author)
@@ -328,13 +349,7 @@ function Identity.OrderLogs(logs)
                 end
             end
         end
-        local sourceLogId = data and data.sourceLogId
-        if type(sourceLogId) == "string" and sourceLogId ~= "" then
-            local sourceLog = byId[sourceLogId]
-            if sourceLog then
-                addEdge(sourceLog, log)
-            end
-        end
+        addSourceEdges(data, log)
     end
 
     local heap = {}
@@ -1269,13 +1284,16 @@ function Identity.UnrosteredAttributedMembers(logs, rosterSet)
         local data = GetLogData(logs[i])
         local eventType = GetLogType(logs[i])
         if type(data) == "table" then
-            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember }
+            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember, data.awardMember, data.viewMember }
             if eventType == types.RC_LOOT_COUNCIL or eventType == types.POINT_CHANGE
                 or eventType == types.ATTENDANCE_CHANGE or eventType == types.ARMOR_CHANGE
                 or eventType == types.ADMIN_ADDED or eventType == types.ADMIN_REMOVED
-                or eventType == types.ROLE_CHANGE
+                or eventType == types.ROLE_CHANGE or eventType == types.SPEC_CHANGE
+                or eventType == types.BIS_OUTCOME or eventType == types.BIS_OVERRIDE
+                or eventType == types.MANUAL_AWARD or eventType == types.MANUAL_AWARD_REVERSE
             then
                 candidates[#candidates + 1] = data.member
+                candidates[#candidates + 1] = data.awardMember
             end
             for j = 1, #candidates do
                 local id = NormalizeId(candidates[j])
@@ -1298,7 +1316,7 @@ function Identity.AttributedMemberIds(logs)
     for i = 1, #(logs or {}) do
         local data = GetLogData(logs[i])
         if type(data) == "table" then
-            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember }
+            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember, data.awardMember, data.viewMember }
             for j = 1, #candidates do
                 local id = NormalizeId(candidates[j])
                 if id then
@@ -1383,6 +1401,12 @@ function Identity.AffectsProjection(eventType)
         or eventType == (EventTypes().ADMIN_ADDED)
         or eventType == (EventTypes().ADMIN_REMOVED)
         or eventType == (EventTypes().ROLE_CHANGE)
+        or eventType == (EventTypes().RC_LOOT_COUNCIL)
+        or eventType == (EventTypes().SPEC_CHANGE)
+        or eventType == (EventTypes().BIS_OUTCOME)
+        or eventType == (EventTypes().BIS_OVERRIDE)
+        or eventType == (EventTypes().MANUAL_AWARD)
+        or eventType == (EventTypes().MANUAL_AWARD_REVERSE)
 end
 
 local function ClampNonNegative(n)
@@ -1537,6 +1561,8 @@ function Identity.Replay(logs, opts)
     local identityArmorEvents = {}
     local appliedRelationshipIds = {}
     local impliedAdminSource = {}
+    local bisState = (SF.LootHelperBis and SF.LootHelperBis.NewState) and SF.LootHelperBis.NewState() or nil
+    local logById = {}
 
     if owner then
         EnsureMember(partition, owner)
@@ -1559,6 +1585,10 @@ function Identity.Replay(logs, opts)
     local logRank = {}
     for i = 1, #ordered do
         logRank[ordered[i]] = i
+        local orderedId = GetLogId(ordered[i])
+        if type(orderedId) == "string" then
+            logById[orderedId] = ordered[i]
+        end
     end
     causalRank = logRank
 
@@ -1585,6 +1615,17 @@ function Identity.Replay(logs, opts)
         local eventType = GetLogType(log)
         local data = GetLogData(log)
         if type(eventType) == "string" and type(data) == "table" then
+            if eventType == types.SPEC_CHANGE then
+                ensureLocal(data.member)
+            elseif eventType == types.RC_LOOT_COUNCIL then
+                ensureLocal(data.member)
+            elseif eventType == types.MANUAL_AWARD then
+                ensureLocal(data.member)
+            elseif eventType == types.BIS_OUTCOME then
+                ensureLocal(data.awardMember)
+            elseif eventType == types.BIS_OVERRIDE then
+                ensureLocal(data.viewMember)
+            end
             if eventType == types.MAIN_SWAP then
                 local target = ensureLocal(data.member)
                 local source = NormalizeId(data.sourceMember)
@@ -1658,6 +1699,11 @@ function Identity.Replay(logs, opts)
                         appliedRelationshipIds[unlinkId] = true
                     end
                     ExpireSplitIdentityEvents(identityArmorEvents, partition)
+                    if bisState and SF.LootHelperBis and SF.LootHelperBis.ExpireSplitOrigins then
+                        SF.LootHelperBis.ExpireSplitOrigins(bisState, function(members)
+                            return IdentityMembersUnifiedAt(partition, members)
+                        end)
+                    end
                 end
                 ensureLocal(data.member)
             elseif eventType == types.ADMIN_ADDED then
@@ -1736,6 +1782,20 @@ function Identity.Replay(logs, opts)
                     end
                 end
             end
+            if bisState and SF.LootHelperBis and SF.LootHelperBis.ApplyLog then
+                SF.LootHelperBis.ApplyLog(bisState, log, {
+                    rank = i,
+                    FindLog = function(id)
+                        return logById[id]
+                    end,
+                    GetIdentityMembers = function(memberId)
+                        return ComponentList(partition, NormalizeId(memberId))
+                    end,
+                    IdentityEventExpired = function(_evLog, evData)
+                        return not IdentityMembersUnifiedAt(partition, CanonicalIdentityMembers(evData))
+                    end,
+                })
+            end
         end
     end
 
@@ -1796,12 +1856,50 @@ function Identity.Replay(logs, opts)
     table.sort(simulatedList)
 
     causalRank = nil
+    local specs = {}
+    local slotsByMember = {}
+    local poolByMember = {}
+    local bisStateOut = bisState
+    if bisState and SF.LootHelperBis and SF.LootHelperBis.BuildMemberSlotMap then
+        specs = bisState.specs or {}
+        slotsByMember, poolByMember = SF.LootHelperBis.BuildMemberSlotMap(bisState, identityOf)
+        for memberId, armorMap in pairs(armor) do
+            local slots = slotsByMember[memberId]
+            if type(slots) ~= "table" then
+                slots = {}
+                slotsByMember[memberId] = slots
+            end
+            for slot, used in pairs(armorMap) do
+                if used then
+                    local cell = slots[slot]
+                    if not cell or not cell.state or cell.state == "AVAILABLE" then
+                        slots[slot] = { state = "LEGACY_UNKNOWN" }
+                    end
+                end
+            end
+        end
+        if SF.LootHelperBis.LegacyOriginsForDisplay then
+            local originsByMember = {}
+            for memberId in pairs(identityOf) do
+                originsByMember[memberId] = SF.LootHelperBis.LegacyOriginsForDisplay(bisState, memberId, identityOf)
+            end
+            bisState.legacyOriginsByMember = originsByMember
+        end
+    end
     return {
         members = members,
         identityOf = identityOf,
         points = points,
         attendance = attendance,
         armor = armor,
+        specs = specs,
+        bis = {
+            state = bisStateOut,
+            slotsByMember = slotsByMember,
+            poolByMember = poolByMember,
+            legacyOriginsByMember = bisStateOut and bisStateOut.legacyOriginsByMember,
+            hasItemAwareEvents = bisStateOut and bisStateOut.hasItemAwareEvents == true,
+        },
         localArmor = localArmor,
         simulatedAdmins = simulated,
         simulatedAdminList = simulatedList,
@@ -2086,6 +2184,7 @@ function Identity.ApplyToProfileMembers(profile)
         member.pointBalance = result.points[memberId] or 0
         member.attendanceBalance = ClampNonNegative(result.attendance[memberId])
         member.armor = result.armor[memberId] or EmptyArmor()
+        member.specId = result.specs and result.specs[memberId] or nil
         profile._members[#profile._members + 1] = member
     end
     table.sort(profile._members, function(a, b)
@@ -2128,6 +2227,7 @@ function Identity.WriteProjection(profile, result)
             else
                 member.armor = result.armor[memberId] or EmptyArmor()
             end
+            member.specId = result.specs and result.specs[memberId] or nil
         end
     end
     profile._identityProjection = result
