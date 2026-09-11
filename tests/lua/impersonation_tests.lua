@@ -163,6 +163,8 @@ loadModule("SpectrumFederation/modules/LootHelper/Members.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogValidators.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogs.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Identity.lua")
+loadModule("SpectrumFederation/modules/LootHelper/SpecWeapons.lua")
+loadModule("SpectrumFederation/modules/LootHelper/Bis.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Profiles.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootHelper.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Impersonation.lua")
@@ -423,6 +425,14 @@ local renameOk, renameErr = SF:RenameActiveLootHelperProfile("RenamedWhilePrevie
 assertFalse(renameOk, "rename cannot mutate while impersonating")
 assertEq(p1:GetProfileName(), originalName, "profile name unchanged while impersonating")
 assertEq(#(p1._lootLogs or {}), logCountBefore, "rename while impersonating adds no log")
+
+local specOk = p1:SetMemberSpec(PLAYER, 71)
+assertFalse(specOk, "SetMemberSpec denied while impersonating")
+local manOk = p1:AddManualAward(PLAYER, "|cffffffff|Hitem:19001::::::::80:::::::::|h[Helm]|h|r")
+assertFalse(manOk, "AddManualAward denied while impersonating")
+local ovOk = p1:ApplyBisOverride("CLEAR", { viewMember = PLAYER, targetAssignmentId = "missing" })
+assertFalse(ovOk, "ApplyBisOverride denied while impersonating")
+assertEq(#(p1._lootLogs or {}), logCountBefore, "BiS writers add no logs while impersonating")
 
 -- Stale Rename callback: capture like Settings Prompt, enable, then accept
 Imp:Disable("rename-setup")

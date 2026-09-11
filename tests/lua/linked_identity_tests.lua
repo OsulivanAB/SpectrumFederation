@@ -101,6 +101,8 @@ loadModule("SpectrumFederation/modules/LootHelper/Members.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogValidators.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogs.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Identity.lua")
+loadModule("SpectrumFederation/modules/LootHelper/SpecWeapons.lua")
+loadModule("SpectrumFederation/modules/LootHelper/Bis.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Profiles.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootHelper.lua")
 loadModule("SpectrumFederation/modules/LootHelper/SyncProtocol.lua")
@@ -7642,15 +7644,16 @@ assertTrue(elapsed < 2.0, "1800-log alias-collision OrderLogs stays comfortably 
 end
 runHistoricalAliasConvergenceTests()
 
+local function runProtocolAndSourceIdTests()
 -- ---------------------------------------------------------------------------
 -- Protocol
 -- ---------------------------------------------------------------------------
-assertEq(SF.SyncProtocol.PROTO_CURRENT, 2, "protocol current is 2")
-assertEq(SF.LootHelperSync.PROTO_VERSION, 2, "sync PROTO_VERSION is 2")
-local protoOk, _, protoCode = SF.SyncProtocol.ValidateProtocolVersion(1)
-assertFalse(protoOk, "protocol 1 cannot participate")
+assertEq(SF.SyncProtocol.PROTO_CURRENT, 3, "protocol current is 3")
+assertEq(SF.LootHelperSync.PROTO_VERSION, 3, "sync PROTO_VERSION is 3")
+local protoOk, _, protoCode = SF.SyncProtocol.ValidateProtocolVersion(2)
+assertFalse(protoOk, "protocol 2 cannot participate")
 assertEq(protoCode, "TOO_OLD", "old clients are TOO_OLD")
-assertTrue(SF.SyncProtocol.ValidateProtocolVersion(2), "protocol 2 is accepted")
+assertTrue(SF.SyncProtocol.ValidateProtocolVersion(3), "protocol 3 is accepted")
 
 resetEnv()
 local histA = makeProfile("HistA")
@@ -7675,6 +7678,48 @@ local replayB = SF.LootHelperIdentity.Replay(histB:GetLootLogs(), { owner = hist
 assertEq(replayA.points[ALT_A], replayB.points[ALT_A], "identical complete history yields identical points")
 assertEq(replayA.attendance[ALT_A], replayB.attendance[ALT_A], "identical complete history yields identical attendance")
 assertTrue(SF.LootHelperIdentity.SameIdentity(histB:GetLootLogs(), ALT_A, ALT_B), "identical complete history yields identical identity")
+
+-- sourceLogIds and targetAssignmentId are causal predecessors
+resetEnv()
+local predA = makeTable("POINT_CHANGE", {
+    member = ALT_A,
+    change = "INCREMENT",
+    amount = 1,
+}, { author = OWNER, counter = 2, timestamp = 1700005000 })
+local predB = makeTable("POINT_CHANGE", {
+    member = ALT_B,
+    change = "INCREMENT",
+    amount = 1,
+}, { author = ALT_A, counter = 2, timestamp = 1700005000 })
+local multiChild = makeTable("ADMIN_ADDED", {
+    member = ALT_C,
+    sourceLogId = predA._id,
+    sourceLogIds = { predA._id, predB._id },
+    targetAssignmentId = predB._id,
+}, { author = "Zulu-Garona", counter = 2, timestamp = 1700005000 })
+local orderedSources = SF.LootHelperIdentity.OrderLogs({ multiChild, predB, predA })
+assertEq(#orderedSources, 3, "sourceLogIds OrderLogs retains all rows")
+local readyBeforeChild = {}
+for i = 1, #orderedSources do
+    if orderedSources[i]._id ~= multiChild._id then
+        readyBeforeChild[orderedSources[i]._id] = true
+    end
+end
+assertTrue(readyBeforeChild[predA._id] == true, "sourceLogId predecessor is before dependent")
+assertTrue(readyBeforeChild[predB._id] == true, "sourceLogIds second predecessor is before dependent")
+assertEq(orderedSources[3]._id, multiChild._id, "dependent waits for sourceLogIds and targetAssignmentId")
+
+local missingParent = makeTable("ADMIN_ADDED", {
+    member = ALT_C,
+    sourceLogId = "missing-award-key",
+    sourceLogIds = { "also-missing" },
+    targetAssignmentId = "also-missing",
+}, { author = OWNER, counter = 9, timestamp = 1700005001 })
+local orderedMissing = SF.LootHelperIdentity.OrderLogs({ missingParent })
+assertEq(#orderedMissing, 1, "missing source ids add no edges and still order")
+assertEq(orderedMissing[1]._id, missingParent._id, "orphan dependent remains in OrderLogs")
+end
+runProtocolAndSourceIdTests()
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

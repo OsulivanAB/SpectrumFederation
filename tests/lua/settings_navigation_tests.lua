@@ -140,6 +140,14 @@ local function productionFixture()
             order = 23,
         }),
         page({
+            id = "lootHelperCharacter",
+            parentId = "lootHelper",
+            name = "Character Settings",
+            navLabel = "Character",
+            description = "Set persistent specialization and correct item-aware BiS assignments.",
+            order = 23.5,
+        }),
+        page({
             id = "lootLogs",
             name = "Loot Logs",
             navLabel = "Loot Logs",
@@ -306,8 +314,8 @@ local registry = productionFixture()
 -- Content page lists
 assertDeepEq(
     idsOf(Model.GetContentPages(registry, "lootHelper")),
-    { "lootHelperGeneral", "lootHelperProfile", "lootHelperSession", "lootHelperAdmin" },
-    "Loot Helper has exactly four content pages"
+    { "lootHelperGeneral", "lootHelperProfile", "lootHelperSession", "lootHelperAdmin", "lootHelperCharacter" },
+    "Loot Helper has exactly five content pages"
 )
 assertTrue(not Model.IsContentPage(registry, "lootHelper"), "lootHelper root is not a content page")
 assertDeepEq(
@@ -473,7 +481,7 @@ for id, item in pairs(registry.categoriesById) do
 end
 assertDeepEq(
     idsOf(Model.GetContentPages(reverseRegistry, "lootHelper")),
-    { "lootHelperGeneral", "lootHelperProfile", "lootHelperSession", "lootHelperAdmin" },
+    { "lootHelperGeneral", "lootHelperProfile", "lootHelperSession", "lootHelperAdmin", "lootHelperCharacter" },
     "content page order does not follow pairs/insertion order"
 )
 local sorted = Model.SortedCategories(reverseRegistry)

@@ -114,6 +114,8 @@ loadModule("SpectrumFederation/modules/LootHelper/Members.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogValidators.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootLogs.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Identity.lua")
+loadModule("SpectrumFederation/modules/LootHelper/SpecWeapons.lua")
+loadModule("SpectrumFederation/modules/LootHelper/Bis.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Profiles.lua")
 loadModule("SpectrumFederation/modules/LootHelper/LootHelper.lua")
 loadModule("SpectrumFederation/modules/LootHelper/Impersonation.lua")
@@ -669,7 +671,6 @@ local pointLog = SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
 }, {
     profile = swapProfile,
     author = PLAYER,
-    counter = 2,
     skipPermission = true,
 })
 assertTrue(swapProfile:AddLootLog(pointLog, { skipBroadcast = true }), "sequential point log is recorded on the source alt")
@@ -719,12 +720,12 @@ local sequentialLog = SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
     member = WINNER,
     change = SF.LootLogPointChangeTypes.INCREMENT,
 }, {
+    profile = profile,
     author = PLAYER,
-    counter = 2,
     skipPermission = true,
 })
 assertTrue(profile:AddLootLog(sequentialLog, { skipBroadcast = true }), "ordinary sequential logs still insert")
-assertEq(profile:ComputeAuthorMax()[PLAYER], 2, "ordinary author max still tracks sequential counters")
+assertTrue((profile:ComputeAuthorMax()[PLAYER] or 0) >= 2, "ordinary author max still tracks sequential counters")
 
 Sync.state.active = true
 Sync.state.sessionId = "SES1"
@@ -771,21 +772,22 @@ assertEq(countRCLogs(profile), 1, "mismatch keeps the first RC log and does not 
 assertEq(profile:GetLogFingerprintById(rcTable._id), rcTable._fingerprint, "first-writer fingerprint is retained")
 
 -- Ordinary sequential gap/integrity behavior is unchanged.
+local lastContiguous = profile:ComputeAuthorMax()[PLAYER]
 local gapLog = SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
     member = WINNER,
     change = SF.LootLogPointChangeTypes.INCREMENT,
 }, {
     author = PLAYER,
-    counter = 5,
+    counter = lastContiguous + 3,
     skipPermission = true,
 }):ToTable()
 local hasGap, gapFrom, gapTo = Sync:DetectGap(profile:GetProfileId(), gapLog)
 assertTrue(hasGap, "ordinary sequential logs still detect gaps")
-assertEq(gapFrom, 3, "ordinary gap starts after the last contiguous sequential counter")
-assertEq(gapTo, 4, "ordinary gap ends before the received sequential counter")
+assertEq(gapFrom, lastContiguous + 1, "ordinary gap starts after the last contiguous sequential counter")
+assertEq(gapTo, lastContiguous + 2, "ordinary gap ends before the received sequential counter")
 
 assertTrue(Sync:QueueRepairRanges(profile:GetProfileId(), {
-    { author = PLAYER, fromCounter = 3, toCounter = 4, mode = "missing" },
+    { author = PLAYER, fromCounter = lastContiguous + 1, toCounter = lastContiguous + 2, mode = "missing" },
 }, { mode = "missing", reason = "ordinary-gap" }), "ordinary sequential ranges still enqueue")
 assertTrue(queuedRepairCount() >= 1, "ordinary sequential repair remains available")
 

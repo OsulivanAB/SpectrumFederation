@@ -1,0 +1,984 @@
+-- Production-Lua tests for item-aware BiS reconstruction (#275).
+-- Run from the repository root: lua5.1 tests/lua/bis_reconstruction_tests.lua
+
+local failures = 0
+local passes = 0
+
+local function fail(message)
+    failures = failures + 1
+    io.stderr:write("FAIL: " .. tostring(message) .. "\n")
+end
+
+local function pass(message)
+    passes = passes + 1
+    io.stdout:write("ok: " .. tostring(message or "") .. "\n")
+end
+
+local function assertTrue(cond, message)
+    if cond then
+        pass(message)
+    else
+        fail(message)
+    end
+end
+
+local function assertFalse(cond, message)
+    assertTrue(not cond, message)
+end
+
+local function assertEq(actual, expected, message)
+    if actual == expected then
+        pass(message)
+    else
+        fail(string.format("%s (expected %s, got %s)", message, tostring(expected), tostring(actual)))
+    end
+end
+
+local PLAYER = "Owner-Garona"
+local OWNER = "Owner-Garona"
+local ALT_A = "Alpha-Garona"
+local ALT_B = "Bravo-Garona"
+local ALT_C = "Charlie-Garona"
+local ZULU = "Zulu-Garona"
+
+function strtrim(s)
+    return tostring(s or ""):match("^%s*(.-)%s*$") or ""
+end
+
+function string.trim(s)
+    return strtrim(s)
+end
+
+function GetRealmName()
+    return "Garona"
+end
+
+function UnitName(unit)
+    if unit == "player" then
+        return PLAYER:match("^([^%-]+)")
+    end
+    return "Unknown"
+end
+
+function UnitFullName(unit)
+    if unit == "player" then
+        return PLAYER:match("^([^%-]+)"), "Garona"
+    end
+    return "Unknown", "Garona"
+end
+
+function UnitClass()
+    return "Warrior", "WARRIOR"
+end
+
+local NOW = 1700001000
+function GetServerTime()
+    NOW = NOW + 1
+    return NOW
+end
+
+function GetTime()
+    return 0
+end
+
+local ITEM_META = {
+    ["19001"] = { loc = "INVTYPE_HEAD", class = 4, sub = 4 },
+    ["19002"] = { loc = "INVTYPE_FINGER", class = 4, sub = 0 },
+    ["19003"] = { loc = "INVTYPE_TRINKET", class = 4, sub = 0 },
+    ["19004"] = { loc = "INVTYPE_2HWEAPON", class = 2, sub = 8 },
+    ["19005"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 7 },
+    ["19006"] = { loc = "INVTYPE_WEAPONOFFHAND", class = 2, sub = 0 },
+    ["19007"] = { loc = "INVTYPE_CLOAK", class = 4, sub = 1 },
+    ["19008"] = { loc = "INVTYPE_CHEST", class = 4, sub = 4 },
+    ["19009"] = { loc = "INVTYPE_HOLDABLE", class = 4, sub = 0 },
+}
+
+function GetItemInfoInstant(link)
+    local id = tostring(link):match("item:(%d+)")
+    local rec = ITEM_META[id]
+    if not rec then
+        return nil
+    end
+    return tonumber(id), "Armor", "Plate", rec.loc, 134400, rec.class, rec.sub
+end
+
+SpectrumFederationDB = { lootHelper = { profiles = {}, syncSession = {}, window = {} } }
+SpectrumFederationDebugDB = { enabled = false, logs = {} }
+
+local SF = {}
+local printed = {}
+
+local function loadModule(relative)
+    local chunk = assert(loadfile(relative))
+    chunk("SpectrumFederation", SF)
+end
+
+loadModule("SpectrumFederation/modules/NameUtil.lua")
+loadModule("SpectrumFederation/modules/core.lua")
+loadModule("SpectrumFederation/modules/LootHelper/Members.lua")
+loadModule("SpectrumFederation/modules/LootHelper/LootLogValidators.lua")
+loadModule("SpectrumFederation/modules/LootHelper/LootLogs.lua")
+loadModule("SpectrumFederation/modules/LootHelper/Identity.lua")
+loadModule("SpectrumFederation/modules/LootHelper/SpecWeapons.lua")
+loadModule("SpectrumFederation/modules/LootHelper/Bis.lua")
+loadModule("SpectrumFederation/modules/LootHelper/Profiles.lua")
+loadModule("SpectrumFederation/modules/LootHelper/LootHelper.lua")
+loadModule("SpectrumFederation/modules/LootHelper/SyncProtocol.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/00_Namespace.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/01_Constants.lua")
+
+function SF:GetPlayerFullIdentifier()
+    return PLAYER
+end
+
+function SF:GetPlayerClass()
+    return "WARRIOR"
+end
+
+function SF:PrintWarning(message)
+    printed[#printed + 1] = { "warn", tostring(message) }
+end
+
+function SF:PrintError(message)
+    printed[#printed + 1] = { "error", tostring(message) }
+end
+
+function SF:PrintInfo(message)
+    printed[#printed + 1] = { "info", tostring(message) }
+end
+
+SF.Debug = {
+    Info = function() end,
+    Warn = function() end,
+    Error = function() end,
+    Verbose = function() end,
+}
+
+local function resetEnv()
+    printed = {}
+    PLAYER = OWNER
+    NOW = 1700001000
+    SF.lootHelperDB = {
+        enabled = true,
+        profiles = {},
+        activeProfileId = nil,
+        activeProfile = nil,
+        window = {},
+        syncSession = {},
+    }
+    SpectrumFederationDB.lootHelper = SF.lootHelperDB
+end
+
+local function makeProfile(name)
+    local profile = SF.LootProfile.new(name)
+    assert(profile, "failed to create profile " .. tostring(name))
+    SF.lootHelperDB.profiles[profile:GetProfileId()] = profile
+    SF.lootHelperDB.activeProfileId = profile:GetProfileId()
+    SF.lootHelperDB.activeProfile = profile
+    return profile
+end
+
+local function addMember(profile, memberId, role)
+    local member = SF.Member.new(memberId, role or "member", "WARRIOR")
+    assert(member, "failed to create member " .. tostring(memberId))
+    assert(profile:AddMember(member), "failed to add member " .. tostring(memberId))
+    return member
+end
+
+local function addLog(profile, eventType, data, extra)
+    extra = extra or {}
+    data = data or {}
+    if data.preOpAuthorMax == nil then
+        data.preOpAuthorMax = {}
+    end
+    local opts = {
+        profile = profile,
+        skipPermission = true,
+        author = extra.author or PLAYER,
+        timestamp = extra.timestamp,
+        counter = extra.counter,
+    }
+    if opts.counter == nil then
+        opts.counter = profile:AllocateNextCounter(opts.author)
+    end
+    local log = SF.LootLog.new(eventType, data, opts)
+    assert(log, "failed to create " .. tostring(eventType))
+    assert(profile:AddLootLog(log, { skipPermission = true, skipBroadcast = true }), "failed to insert " .. tostring(eventType))
+    return log
+end
+
+local function asPlayer(memberId, fn)
+    local previous = PLAYER
+    PLAYER = memberId
+    local a, b, c = fn()
+    PLAYER = previous
+    return a, b, c
+end
+
+local function itemLink(itemId, name)
+    return string.format("|cffa335ee|Hitem:%s::::::::80:259:::::::::|h[%s]|h|r", tostring(itemId), name or "Item")
+end
+
+local function insertRC(profile, canonical)
+    local eventData = SF.LootLog.BuildRCLootCouncilEventData(canonical)
+    local log = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, eventData, {
+        profile = profile,
+        skipPermission = true,
+        author = canonical.awarder,
+        timestamp = canonical.timestamp,
+        externalId = canonical.awardKey,
+        counter = 0,
+    })
+    assert(log, "failed to create RC log")
+    assert(profile:AddLootLog(log, { skipPermission = true, skipBroadcast = true }), "failed to insert RC log")
+    return log
+end
+
+local function makeCanonical(winner, itemId, response, stamp)
+    stamp = stamp or tostring(GetServerTime())
+    return SF.LootLog.BuildRCLootCouncilCanonical(PLAYER, winner, {
+        lootWon = itemLink(itemId, "Item" .. tostring(itemId)),
+        response = response or "Need",
+        id = stamp .. "-7",
+        owner = winner,
+    })
+end
+
+local function slotState(profile, memberId, slot)
+    local slots = profile:GetIdentityBisSlots(memberId)
+    return slots and slots[slot] and slots[slot].state or "AVAILABLE"
+end
+
+local function warnCount()
+    local n = 0
+    for i = 1, #printed do
+        if printed[i][1] == "warn" then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+resetEnv()
+
+-- Schema rejects contradictory qualified/outcome pairs
+assertFalse(SF.LootHelperBis.IsOutcomeSchemaValid({
+    sourceLogId = "k", awardKey = "k", awardMember = ALT_A,
+    qualified = true, outcome = "NOT_BIS", assignedSlots = {},
+}), "NOT_BIS cannot be qualified")
+assertFalse(SF.LootHelperBis.IsOutcomeSchemaValid({
+    sourceLogId = "k", awardKey = "k", awardMember = ALT_A,
+    qualified = false, outcome = "ASSIGNED", assignedSlots = { "Head" }, slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+}), "ASSIGNED cannot be unqualified")
+assertFalse(SF.LootHelperBis.IsOutcomeSchemaValid({
+    sourceLogId = "k", awardKey = "k", awardMember = ALT_A,
+    qualified = true, outcome = "OVERFLOW", assignedSlots = { "Head" },
+}), "OVERFLOW assignedSlots must be empty")
+assertTrue(SF.LootHelperBis.IsOutcomeSchemaValid({
+    sourceLogId = "k", awardKey = "k", awardMember = ALT_A,
+    qualified = false, outcome = "NOT_BIS", assignedSlots = {},
+}), "valid NOT_BIS")
+assertTrue(SF.LootHelperBis.IsOutcomeSchemaValid({
+    sourceLogId = "k", awardKey = "k", awardMember = ALT_A,
+    qualified = true, outcome = "ASSIGNED", assignedSlots = { "Head" },
+    slotBinding = "BOUND", assignmentScopeMembers = { ALT_A },
+}), "valid ASSIGNED")
+
+-- Same-second observed SPEC edits: last causal write wins
+resetEnv()
+local specProfile = makeProfile("Spec")
+addMember(specProfile, ALT_A)
+addLog(specProfile, "SPEC_CHANGE", { member = ALT_A, specId = 72 }, { author = ZULU, timestamp = 1700005000 })
+addLog(specProfile, "SPEC_CHANGE", { member = ALT_A, specId = 71 }, { author = OWNER, timestamp = 1700005000 })
+specProfile:ApplyIdentityProjection({ force = true })
+assertEq(specProfile:getMemberByID(ALT_A):GetSpecId(), 71, "Replay last causal SPEC_CHANGE is Arms")
+
+-- Automatic NOT_BIS / ASSIGNED / OVERFLOW / UNRESOLVED
+resetEnv()
+local auto = makeProfile("Auto")
+addMember(auto, ALT_A)
+assertTrue(auto:AddRCLootCouncilBisResponse("Need"), "add BiS response")
+local notBis = makeCanonical(ALT_A, 19001, "Greed", "1700002001")
+assertTrue(auto:TryAddRCLootCouncilAward(notBis), "record non-BiS award")
+auto:ApplyIdentityProjection({ force = true })
+local pool = auto:GetIdentityAwardPool(ALT_A)
+assertTrue(#pool >= 1, "RC-only/non-BiS award still enters the pool")
+assertEq(slotState(auto, ALT_A, "Head"), "AVAILABLE", "NOT_BIS does not occupy Head")
+
+local assigned = makeCanonical(ALT_A, 19001, "Need", "1700002002")
+assertTrue(auto:TryAddRCLootCouncilAward(assigned), "record BiS head")
+auto:ApplyIdentityProjection({ force = true })
+assertEq(slotState(auto, ALT_A, "Head"), "ASSIGNED_AUTO", "first BiS head is assigned")
+
+local overflow = makeCanonical(ALT_A, 19001, "Need", "1700002003")
+assertTrue(auto:TryAddRCLootCouncilAward(overflow), "record second BiS head")
+auto:ApplyIdentityProjection({ force = true })
+assertEq(slotState(auto, ALT_A, "Head"), "ASSIGNED_AUTO", "first head remains assigned")
+local sawOverflow = false
+for _, log in ipairs(auto:GetLootLogs()) do
+    if log:GetEventType() == "BIS_OUTCOME" and log:GetEventData().outcome == "OVERFLOW" then
+        sawOverflow = true
+    end
+end
+assertTrue(sawOverflow, "second head is frozen OVERFLOW")
+assertTrue(warnCount() >= 1, "live overflow warns once")
+
+local unknown = makeCanonical(ALT_A, 19999, "Need", "1700002004")
+assertTrue(auto:TryAddRCLootCouncilAward(unknown), "record unclassifiable item")
+local sawUnresolved = false
+for _, log in ipairs(auto:GetLootLogs()) do
+    if log:GetEventType() == "BIS_OUTCOME" and log:GetEventData().outcome == "UNRESOLVED" then
+        sawUnresolved = true
+    end
+end
+assertTrue(sawUnresolved, "unknown item is UNRESOLVED")
+
+-- Duplicate RC insert does not write another automatic outcome
+local before = #(auto:GetLootLogs() or {})
+assertFalse(auto:TryAddRCLootCouncilAward(assigned), "duplicate RC is rejected")
+assertEq(#(auto:GetLootLogs() or {}), before, "duplicate RC does not add another outcome")
+
+-- Outcome-before-RC then RC arrives
+resetEnv()
+local orphan = makeProfile("Orphan")
+addMember(orphan, ALT_A)
+local rcCanon = makeCanonical(ALT_A, 19007, "Need", "1700002100")
+assertTrue(orphan:AddRCLootCouncilBisResponse("Need"))
+addLog(orphan, "BIS_OUTCOME", {
+    sourceLogId = rcCanon.awardKey,
+    awardKey = rcCanon.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "Back" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+})
+orphan:ApplyIdentityProjection({ force = true })
+assertEq(slotState(orphan, ALT_A, "Back"), "AVAILABLE", "orphan outcome does not assign without RC")
+assertTrue(orphan:TryAddRCLootCouncilAward(rcCanon), "RC source arrives later")
+orphan:ApplyIdentityProjection({ force = true })
+assertEq(slotState(orphan, ALT_A, "Back"), "ASSIGNED_AUTO", "outcome applies once RC exists")
+
+-- First source-consistent valid outcome wins; later duplicates ignored
+resetEnv()
+local firstWins = makeProfile("FirstWins")
+addMember(firstWins, ALT_A)
+local keyCanon = makeCanonical(ALT_A, 19008, "Need", "1700002200")
+insertRC(firstWins, keyCanon)
+addLog(firstWins, "BIS_OUTCOME", {
+    sourceLogId = keyCanon.awardKey,
+    awardKey = keyCanon.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "Chest" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+}, { author = ZULU })
+addLog(firstWins, "BIS_OUTCOME", {
+    sourceLogId = keyCanon.awardKey,
+    awardKey = keyCanon.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "OVERFLOW",
+    assignedSlots = {},
+}, { author = OWNER })
+firstWins:ApplyIdentityProjection({ force = true })
+assertEq(slotState(firstWins, ALT_A, "Chest"), "ASSIGNED_AUTO", "first valid outcome wins")
+
+-- Inconsistent awardMember is retained but does not win
+resetEnv()
+local mismatch = makeProfile("Mismatch")
+addMember(mismatch, ALT_A)
+addMember(mismatch, ALT_B)
+local rcA = makeCanonical(ALT_A, 19001, "Need", "1700002300")
+insertRC(mismatch, rcA)
+addLog(mismatch, "BIS_OUTCOME", {
+    sourceLogId = rcA.awardKey,
+    awardKey = rcA.awardKey,
+    awardMember = ALT_B,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_B },
+})
+addLog(mismatch, "BIS_OUTCOME", {
+    sourceLogId = rcA.awardKey,
+    awardKey = rcA.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+})
+mismatch:ApplyIdentityProjection({ force = true })
+assertEq(slotState(mismatch, ALT_A, "Head"), "ASSIGNED_AUTO", "first source-consistent outcome wins")
+assertEq(slotState(mismatch, ALT_B, "Head"), "AVAILABLE", "mismatched outcome does not retarget B")
+
+-- Manual award does not auto-consume; assign; reverse deactivates
+resetEnv()
+local manual = makeProfile("Manual")
+addMember(manual, ALT_A)
+assertTrue(manual:AddManualAward(ALT_A, itemLink(19001, "Helm")))
+manual:ApplyIdentityProjection({ force = true })
+assertEq(slotState(manual, ALT_A, "Head"), "AVAILABLE", "manual add does not consume")
+local manualId
+for _, award in ipairs(manual:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        manualId = award.id
+    end
+end
+assertTrue(manualId ~= nil, "manual award is in the pool")
+assertTrue(manual:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = manualId },
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+}), "assign manual loot")
+manual:ApplyIdentityProjection({ force = true })
+assertEq(slotState(manual, ALT_A, "Head"), "ASSIGNED_OVERRIDE", "manual loot can be assigned")
+assertTrue(manual:ReverseManualAward(manualId), "reverse manual loot")
+manual:ApplyIdentityProjection({ force = true })
+assertEq(slotState(manual, ALT_A, "Head"), "AVAILABLE", "reverse deactivates assignment")
+assertFalse(manual:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = manualId },
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+}), "reversed manual cannot be assigned")
+
+-- One award / one active assignment, including concurrent ASSIGN
+resetEnv()
+local uniq = makeProfile("Uniq")
+addMember(uniq, ALT_A)
+assertTrue(uniq:AddRCLootCouncilBisResponse("Need"))
+local ringCanon = makeCanonical(ALT_A, 19002, "Greed", "1700002400")
+assertTrue(uniq:TryAddRCLootCouncilAward(ringCanon))
+assertTrue(uniq:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "RC", id = ringCanon.awardKey },
+    assignedSlots = { "Ring1" },
+    slotBinding = "BOUND",
+}))
+assertFalse(uniq:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "RC", id = ringCanon.awardKey },
+    assignedSlots = { "Ring2" },
+    slotBinding = "BOUND",
+}), "second ASSIGN of the same award is a no-op")
+uniq:ApplyIdentityProjection({ force = true })
+assertEq(slotState(uniq, ALT_A, "Ring1"), "ASSIGNED_OVERRIDE", "first ring assignment remains")
+assertEq(slotState(uniq, ALT_A, "Ring2"), "AVAILABLE", "second ring stays free")
+
+-- REPLACE using another already-active award fails atomically
+local ring2 = makeCanonical(ALT_A, 19002, "Greed", "1700002401")
+assertTrue(uniq:TryAddRCLootCouncilAward(ring2))
+assertTrue(uniq:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "RC", id = ring2.awardKey },
+    assignedSlots = { "Ring2" },
+    slotBinding = "BOUND",
+}))
+local firstAssignment
+local slots = uniq:GetIdentityBisSlots(ALT_A)
+firstAssignment = slots.Ring1.assignmentId
+assertFalse(uniq:ApplyBisOverride("REPLACE", {
+    viewMember = ALT_A,
+    targetAssignmentId = firstAssignment,
+    awardRef = { kind = "RC", id = ring2.awardKey },
+    assignedSlots = { "Ring1" },
+    slotBinding = "BOUND",
+}), "REPLACE with already-active other award fails")
+uniq:ApplyIdentityProjection({ force = true })
+assertEq(uniq:GetIdentityBisSlots(ALT_A).Ring1.assignmentId, firstAssignment, "failed REPLACE leaves old assignment")
+assertEq(slotState(uniq, ALT_A, "Ring2"), "ASSIGNED_OVERRIDE", "other award remains on Ring2")
+
+-- Move/rebind same award onto Head
+assertTrue(uniq:ApplyBisOverride("REPLACE", {
+    viewMember = ALT_A,
+    targetAssignmentId = firstAssignment,
+    awardRef = { kind = "RC", id = ringCanon.awardKey },
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+}), "move/rebind same award")
+uniq:ApplyIdentityProjection({ force = true })
+assertEq(slotState(uniq, ALT_A, "Head"), "ASSIGNED_OVERRIDE", "rebind occupies Head")
+assertEq(slotState(uniq, ALT_A, "Ring1"), "AVAILABLE", "old ring hole remains after move")
+
+-- Frozen overflow does not backfill after CLEAR
+resetEnv()
+local pack = makeProfile("Pack")
+addMember(pack, ALT_A)
+assertTrue(pack:AddRCLootCouncilBisResponse("Need"))
+local r1 = makeCanonical(ALT_A, 19002, "Need", "1700002500")
+local r2 = makeCanonical(ALT_A, 19002, "Need", "1700002501")
+local r3 = makeCanonical(ALT_A, 19002, "Need", "1700002502")
+assertTrue(pack:TryAddRCLootCouncilAward(r1))
+assertTrue(pack:TryAddRCLootCouncilAward(r2))
+assertTrue(pack:TryAddRCLootCouncilAward(r3))
+pack:ApplyIdentityProjection({ force = true })
+assertEq(slotState(pack, ALT_A, "Ring1"), "ASSIGNED_AUTO", "first ring assigned")
+assertEq(slotState(pack, ALT_A, "Ring2"), "ASSIGNED_AUTO", "second ring assigned")
+local ring2Id = pack:GetIdentityBisSlots(ALT_A).Ring2.assignmentId
+assertTrue(pack:ApplyBisOverride("CLEAR", { viewMember = ALT_A, targetAssignmentId = ring2Id }))
+pack:ApplyIdentityProjection({ force = true })
+assertEq(slotState(pack, ALT_A, "Ring1"), "ASSIGNED_AUTO", "first ring remains")
+assertEq(slotState(pack, ALT_A, "Ring2"), "AVAILABLE", "cleared ring is a hole")
+local thirdStillOverflow = false
+for _, log in ipairs(pack:GetLootLogs()) do
+    if log:GetEventType() == "BIS_OUTCOME" and log:GetEventData().awardKey == r3.awardKey then
+        thirdStillOverflow = log:GetEventData().outcome == "OVERFLOW"
+    end
+end
+assertTrue(thirdStillOverflow, "frozen OVERFLOW remains overflow after CLEAR")
+
+-- Independent singleton Ring1 + Ring1 then LINK => Ring1 + Ring2
+resetEnv()
+local linkP = makeProfile("LinkRings")
+addMember(linkP, ALT_A)
+addMember(linkP, ALT_B)
+assertTrue(linkP:AddRCLootCouncilBisResponse("Need"))
+local aRing = makeCanonical(ALT_A, 19002, "Need", "1700002600")
+local bRing = makeCanonical(ALT_B, 19002, "Need", "1700002601")
+assertTrue(linkP:TryAddRCLootCouncilAward(aRing))
+assertTrue(linkP:TryAddRCLootCouncilAward(bRing))
+assertTrue(linkP:LinkCharacters(ALT_A, ALT_B))
+linkP:ApplyIdentityProjection({ force = true })
+assertEq(slotState(linkP, ALT_A, "Ring1"), "ASSIGNED_AUTO", "merged Ring1 occupied")
+assertEq(slotState(linkP, ALT_A, "Ring2"), "ASSIGNED_AUTO", "merged Ring2 occupied")
+assertEq(slotState(linkP, ALT_B, "Ring1"), "ASSIGNED_AUTO", "linked B sees the same board")
+
+-- Three independent rings => merge overflow
+resetEnv()
+local three = makeProfile("ThreeRings")
+addMember(three, ALT_A)
+addMember(three, ALT_B)
+addMember(three, ALT_C)
+assertTrue(three:AddRCLootCouncilBisResponse("Need"))
+assertTrue(three:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700002700")))
+assertTrue(three:TryAddRCLootCouncilAward(makeCanonical(ALT_B, 19002, "Need", "1700002701")))
+assertTrue(three:TryAddRCLootCouncilAward(makeCanonical(ALT_C, 19002, "Need", "1700002702")))
+assertTrue(three:LinkCharacters(ALT_A, ALT_B))
+assertTrue(three:LinkCharacters(ALT_B, ALT_C))
+three:ApplyIdentityProjection({ force = true })
+local merged = three:GetIdentityBisSlots(ALT_A)
+assertTrue(merged.Ring1.state ~= "AVAILABLE", "two rings remain assigned after 3-way link")
+assertTrue(merged.Ring2.state ~= "AVAILABLE", "second ring occupied")
+local overflowCount = 0
+local view = SF.LootHelperBis.ProjectComponent(three._identityProjection.bis.state, three:GetIdentityMembers(ALT_A))
+overflowCount = #(view.mergeOverflow or {})
+assertTrue(overflowCount >= 1, "third independent ring is merge-overflow")
+
+-- Unlink recomputes; relink does not resurrect a CLEARed assignment
+resetEnv()
+local relink = makeProfile("Relink")
+addMember(relink, ALT_A)
+addMember(relink, ALT_B)
+assertTrue(relink:AddRCLootCouncilBisResponse("Need"))
+local shared = makeCanonical(ALT_A, 19007, "Need", "1700002800")
+assertTrue(relink:TryAddRCLootCouncilAward(shared))
+assertTrue(relink:LinkCharacters(ALT_A, ALT_B))
+relink:ApplyIdentityProjection({ force = true })
+local asgId = relink:GetIdentityBisSlots(ALT_A).Back.assignmentId
+assertTrue(relink:ApplyBisOverride("CLEAR", { viewMember = ALT_B, targetAssignmentId = asgId }), "clear via B viewMember")
+assertTrue(relink:UnlinkCharacter(ALT_B))
+assertTrue(relink:LinkCharacters(ALT_A, ALT_B))
+relink:ApplyIdentityProjection({ force = true })
+assertEq(slotState(relink, ALT_A, "Back"), "AVAILABLE", "relink does not resurrect cleared assignment")
+
+-- 2H Arms occupies Weapon+OffHand as one assignment
+resetEnv()
+local arms = makeProfile("Arms")
+addMember(arms, ALT_A)
+assertTrue(arms:SetMemberSpec(ALT_A, 71))
+assertTrue(arms:AddRCLootCouncilBisResponse("Need"))
+local twoH = makeCanonical(ALT_A, 19004, "Need", "1700002900")
+assertTrue(arms:TryAddRCLootCouncilAward(twoH))
+arms:ApplyIdentityProjection({ force = true })
+assertEq(slotState(arms, ALT_A, "Weapon"), "ASSIGNED_AUTO", "2H occupies Weapon")
+assertEq(slotState(arms, ALT_A, "OffHand"), "ASSIGNED_AUTO", "2H occupies OffHand")
+local wcell = arms:GetIdentityBisSlots(ALT_A).Weapon
+local ocell = arms:GetIdentityBisSlots(ALT_A).OffHand
+assertEq(wcell.assignmentId, ocell.assignmentId, "one 2H assignment occupies both slots")
+
+-- Fury dual 2H: first Weapon, second OffHand
+resetEnv()
+local fury = makeProfile("Fury")
+addMember(fury, ALT_A)
+assertTrue(fury:SetMemberSpec(ALT_A, 72))
+assertTrue(fury:AddRCLootCouncilBisResponse("Need"))
+assertTrue(fury:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700003000")))
+assertTrue(fury:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700002901")))
+fury:ApplyIdentityProjection({ force = true })
+assertEq(slotState(fury, ALT_A, "Weapon"), "ASSIGNED_AUTO", "first Fury 2H is Weapon")
+assertEq(slotState(fury, ALT_A, "OffHand"), "ASSIGNED_AUTO", "second Fury 2H is OffHand")
+assertTrue(fury:GetIdentityBisSlots(ALT_A).Weapon.assignmentId ~= fury:GetIdentityBisSlots(ALT_A).OffHand.assignmentId, "dual-2H uses two assignments")
+
+-- Unknown spec weapon is UNRESOLVED
+resetEnv()
+local nospec = makeProfile("NoSpec")
+addMember(nospec, ALT_A)
+assertTrue(nospec:AddRCLootCouncilBisResponse("Need"))
+assertTrue(nospec:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700003100")))
+local unresolvedWeapon = false
+for _, log in ipairs(nospec:GetLootLogs()) do
+    if log:GetEventType() == "BIS_OUTCOME" and log:GetEventData().outcome == "UNRESOLVED" then
+        unresolvedWeapon = true
+    end
+end
+assertTrue(unresolvedWeapon, "weapon without spec is UNRESOLVED")
+
+-- Historical award does not move when spec later changes
+resetEnv()
+local laterSpec = makeProfile("LaterSpec")
+addMember(laterSpec, ALT_A)
+assertTrue(laterSpec:SetMemberSpec(ALT_A, 71))
+assertTrue(laterSpec:AddRCLootCouncilBisResponse("Need"))
+assertTrue(laterSpec:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700003200")))
+laterSpec:ApplyIdentityProjection({ force = true })
+local beforeWeapon = laterSpec:GetIdentityBisSlots(ALT_A).Weapon.assignmentId
+assertTrue(laterSpec:SetMemberSpec(ALT_A, 72))
+laterSpec:ApplyIdentityProjection({ force = true })
+assertEq(laterSpec:GetIdentityBisSlots(ALT_A).Weapon.assignmentId, beforeWeapon, "later spec change does not rewrite frozen 2H")
+assertEq(slotState(laterSpec, ALT_A, "OffHand"), "ASSIGNED_AUTO", "Arms 2H still occupies OffHand after Fury spec")
+
+-- Trinket equivalent packing
+resetEnv()
+local trink = makeProfile("Trink")
+addMember(trink, ALT_A)
+assertTrue(trink:AddRCLootCouncilBisResponse("Need"))
+assertTrue(trink:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19003, "Need", "1700003300")))
+assertTrue(trink:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19003, "Need", "1700003301")))
+trink:ApplyIdentityProjection({ force = true })
+assertEq(slotState(trink, ALT_A, "Trinket1"), "ASSIGNED_AUTO", "first trinket assigned")
+assertEq(slotState(trink, ALT_A, "Trinket2"), "ASSIGNED_AUTO", "second trinket assigned")
+
+-- Points / pot / attendance isolation
+resetEnv()
+local iso = makeProfile("Iso")
+addMember(iso, ALT_A)
+local pointsBefore = iso:GetIdentityPoints(ALT_A)
+local attBefore = iso:GetIdentityAttendance(ALT_A)
+assertTrue(iso:AddRCLootCouncilBisResponse("Need"))
+assertTrue(iso:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19001, "Need", "1700003400")))
+iso:ApplyIdentityProjection({ force = true })
+assertEq(iso:GetIdentityPoints(ALT_A), pointsBefore, "BiS does not spend points")
+assertEq(iso:GetIdentityAttendance(ALT_A), attBefore, "BiS does not change Attendance")
+
+-- Replay / snapshot does not warn
+resetEnv()
+local live = makeProfile("Warn")
+addMember(live, ALT_A)
+assertTrue(live:AddRCLootCouncilBisResponse("Need"))
+assertTrue(live:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19001, "Need", "1700003500")))
+assertTrue(live:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19001, "Need", "1700003501")))
+local liveWarns = warnCount()
+assertTrue(liveWarns >= 1, "live overflow warned")
+local snapshot = live:ExportSnapshot()
+resetEnv()
+local restored = makeProfile("Restored")
+restored._profileId = snapshot.meta._profileId
+assertTrue(select(1, restored:ImportSnapshot(snapshot)), "snapshot import")
+assertEq(warnCount(), 0, "snapshot import does not warn")
+
+-- Item-aware popup after BiS config or events
+assertTrue(live:IsItemAwareEquipmentPopup(), "configured BiS responses make the popup item-aware")
+resetEnv()
+local fallback = makeProfile("Fallback")
+addMember(fallback, ALT_A)
+assertFalse(fallback:IsItemAwareEquipmentPopup(), "no BiS config or events keeps manual popup")
+
+-- Protocol 2 rejected, 3 accepted
+assertEq(SF.SyncProtocol.PROTO_CURRENT, 3, "protocol is 3")
+assertFalse(select(1, SF.SyncProtocol.ValidateProtocolVersion(2)), "protocol 2 is rejected")
+assertTrue(SF.SyncProtocol.ValidateProtocolVersion(3), "protocol 3 is accepted")
+
+-- Back icon is distinct from Chest
+local eqSource = io.open("SpectrumFederation/modules/UI/LootHelper/EquipmentWindow.lua"):read("*a")
+assertTrue(eqSource:find("INV_Misc_Cape_01", 1, true) ~= nil, "Back uses a distinct cape fallback icon")
+assertTrue(eqSource:find("UI%-PaperDoll%-Slot%-Chest") ~= nil, "Chest keeps the chest paperdoll icon")
+
+-- Legacy association
+resetEnv()
+local legacy = makeProfile("Legacy")
+addMember(legacy, ALT_A)
+addLog(legacy, "ARMOR_CHANGE", {
+    member = ALT_A,
+    slot = "Head",
+    action = "USED",
+})
+legacy:ApplyIdentityProjection({ force = true })
+assertTrue(legacy:AddManualAward(ALT_A, itemLink(19001, "Helm")))
+local manId
+for _, award in ipairs(legacy:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        manId = award.id
+    end
+end
+local origins = legacy:GetIdentityLegacyOrigins(ALT_A)
+assertTrue(#origins >= 1, "local USED origin is exposed")
+assertTrue(legacy:ApplyBisOverride("ASSOCIATE_LEGACY", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = manId },
+    legacyOriginLogId = origins[1].originLogId,
+}), "associate legacy origin")
+legacy:ApplyIdentityProjection({ force = true })
+assertEq(slotState(legacy, ALT_A, "Head"), "ASSIGNED_OVERRIDE", "association occupies the origin slot")
+addLog(legacy, "ARMOR_CHANGE", {
+    member = ALT_A,
+    slot = "Head",
+    action = "AVAILABLE",
+})
+legacy:ApplyIdentityProjection({ force = true })
+assertEq(slotState(legacy, ALT_A, "Head"), "AVAILABLE", "clearing the origin deactivates the association")
+assertFalse(legacy:ApplyBisOverride("ASSOCIATE_LEGACY", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = manId },
+    legacyOriginLogId = origins[1].originLogId,
+}), "inactive origin cannot be associated")
+
+-- Stale CLEAR does not remove a replacement
+resetEnv()
+local stale = makeProfile("Stale")
+addMember(stale, ALT_A)
+local addedA = stale:AddManualAward(ALT_A, itemLink(19001, "HelmA"))
+local addedB = stale:AddManualAward(ALT_A, itemLink(19008, "ChestB"))
+assertTrue(addedA, "first manual loot added")
+assertTrue(addedB, "second manual loot added")
+local ids = {}
+for _, award in ipairs(stale:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        ids[#ids + 1] = award.id
+    end
+end
+assertTrue(stale:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = ids[1] },
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+}))
+stale:ApplyIdentityProjection({ force = true })
+local oldId = stale:GetIdentityBisSlots(ALT_A).Head.assignmentId
+assertTrue(stale:ApplyBisOverride("REPLACE", {
+    viewMember = ALT_A,
+    targetAssignmentId = oldId,
+    awardRef = { kind = "MANUAL", id = ids[2] },
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+}))
+stale:ApplyIdentityProjection({ force = true })
+assertTrue(stale:ApplyBisOverride("CLEAR", {
+    viewMember = ALT_A,
+    targetAssignmentId = oldId,
+}), "stale CLEAR is accepted as a no-op")
+stale:ApplyIdentityProjection({ force = true })
+assertTrue(stale:GetIdentityBisSlots(ALT_A).Head.assignmentId ~= oldId, "replacement assignment survives stale CLEAR")
+assertEq(slotState(stale, ALT_A, "Head"), "ASSIGNED_OVERRIDE", "replacement remains assigned")
+
+-- A+B BOUND Ring2 + C singleton Ring1 then LINK preserves both holes
+resetEnv()
+local hole = makeProfile("HoleMerge")
+addMember(hole, ALT_A)
+addMember(hole, ALT_B)
+addMember(hole, ALT_C)
+assertTrue(hole:LinkCharacters(ALT_A, ALT_B), "link A+B")
+assertTrue(hole:AddManualAward(ALT_A, itemLink(19002, "RingAB")))
+local abRingId
+for _, award in ipairs(hole:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        abRingId = award.id
+    end
+end
+assertTrue(hole:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = abRingId },
+    assignedSlots = { "Ring2" },
+    slotBinding = "BOUND",
+}), "A+B explicit Ring2")
+assertTrue(hole:AddRCLootCouncilBisResponse("Need"))
+assertTrue(hole:TryAddRCLootCouncilAward(makeCanonical(ALT_C, 19002, "Need", "1700003600")))
+hole:ApplyIdentityProjection({ force = true })
+assertEq(slotState(hole, ALT_C, "Ring1"), "ASSIGNED_AUTO", "C singleton occupies Ring1")
+assertTrue(hole:LinkCharacters(ALT_A, ALT_C), "link C into A+B")
+hole:ApplyIdentityProjection({ force = true })
+assertEq(slotState(hole, ALT_A, "Ring1"), "ASSIGNED_AUTO", "merged C remains Ring1")
+assertEq(slotState(hole, ALT_A, "Ring2"), "ASSIGNED_OVERRIDE", "A+B Ring2 is preserved")
+
+-- Overlapping historical scope keys: singleton {A} plus later {A,B}
+resetEnv()
+local overlap = makeProfile("Overlap")
+addMember(overlap, ALT_A)
+addMember(overlap, ALT_B)
+assertTrue(overlap:AddRCLootCouncilBisResponse("Need"))
+assertTrue(overlap:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700003700")))
+assertTrue(overlap:LinkCharacters(ALT_A, ALT_B))
+assertTrue(overlap:TryAddRCLootCouncilAward(makeCanonical(ALT_B, 19002, "Need", "1700003701")))
+overlap:ApplyIdentityProjection({ force = true })
+assertEq(slotState(overlap, ALT_A, "Ring1"), "ASSIGNED_AUTO", "overlapping scope first ring")
+assertEq(slotState(overlap, ALT_A, "Ring2"), "ASSIGNED_AUTO", "overlapping scope second ring")
+
+-- 1H then OffHand holdable; dual-wield 1H; incompatible later 2H
+resetEnv()
+local weapons = makeProfile("Weapons")
+addMember(weapons, ALT_A)
+assertTrue(weapons:SetMemberSpec(ALT_A, 65), "Holy paladin spec")
+assertTrue(weapons:AddRCLootCouncilBisResponse("Need"))
+assertTrue(weapons:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700003800")))
+assertTrue(weapons:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19009, "Need", "1700003801")))
+weapons:ApplyIdentityProjection({ force = true })
+assertEq(slotState(weapons, ALT_A, "Weapon"), "ASSIGNED_AUTO", "1H occupies Weapon")
+assertEq(slotState(weapons, ALT_A, "OffHand"), "ASSIGNED_AUTO", "holdable occupies OffHand")
+
+resetEnv()
+local dw = makeProfile("DualWield")
+addMember(dw, ALT_A)
+assertTrue(dw:SetMemberSpec(ALT_A, 72), "Fury spec")
+assertTrue(dw:AddRCLootCouncilBisResponse("Need"))
+assertTrue(dw:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700003900")))
+assertTrue(dw:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700003901")))
+dw:ApplyIdentityProjection({ force = true })
+assertEq(slotState(dw, ALT_A, "Weapon"), "ASSIGNED_AUTO", "first 1H is Weapon")
+assertEq(slotState(dw, ALT_A, "OffHand"), "ASSIGNED_AUTO", "dual-wield second 1H is OffHand")
+
+resetEnv()
+local later2h = makeProfile("Later2H")
+addMember(later2h, ALT_A)
+assertTrue(later2h:SetMemberSpec(ALT_A, 71), "Arms spec")
+assertTrue(later2h:AddRCLootCouncilBisResponse("Need"))
+assertTrue(later2h:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700004000")))
+assertTrue(later2h:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700004001")))
+later2h:ApplyIdentityProjection({ force = true })
+assertEq(slotState(later2h, ALT_A, "Weapon"), "ASSIGNED_AUTO", "existing 1H remains")
+local sawLaterOverflow = false
+for _, log in ipairs(later2h:GetLootLogs()) do
+    if log:GetEventType() == "BIS_OUTCOME" and log:GetEventData().outcome == "OVERFLOW" then
+        sawLaterOverflow = true
+    end
+end
+assertTrue(sawLaterOverflow, "incompatible later 2H is frozen OVERFLOW")
+
+-- Gear Override 2H on Arms occupies both slots as one assignment
+resetEnv()
+local ov2h = makeProfile("Override2H")
+addMember(ov2h, ALT_A)
+assertTrue(ov2h:SetMemberSpec(ALT_A, 71))
+assertTrue(ov2h:AddManualAward(ALT_A, itemLink(19004, "TwoHand")))
+local twoHId
+for _, award in ipairs(ov2h:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        twoHId = award.id
+    end
+end
+assertTrue(ov2h:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = twoHId },
+    assignedSlots = { "Weapon" },
+    slotBinding = "BOUND",
+}), "assign 2H via Weapon")
+ov2h:ApplyIdentityProjection({ force = true })
+assertEq(slotState(ov2h, ALT_A, "Weapon"), "ASSIGNED_OVERRIDE", "override 2H occupies Weapon")
+assertEq(slotState(ov2h, ALT_A, "OffHand"), "ASSIGNED_OVERRIDE", "override 2H occupies OffHand")
+assertEq(ov2h:GetIdentityBisSlots(ALT_A).Weapon.assignmentId, ov2h:GetIdentityBisSlots(ALT_A).OffHand.assignmentId, "override 2H is one assignment")
+
+-- Identity-scoped origin association expires after unlink
+resetEnv()
+local idOrigin = makeProfile("IdOrigin")
+addMember(idOrigin, ALT_A)
+addMember(idOrigin, ALT_B)
+assertTrue(idOrigin:LinkCharacters(ALT_A, ALT_B))
+assertTrue(idOrigin:getMemberByID(ALT_A):ToggleEquipment("Head", { profile = idOrigin, scope = "identity" }))
+idOrigin:ApplyIdentityProjection({ force = true })
+assertTrue(idOrigin:AddManualAward(ALT_A, itemLink(19001, "Helm")))
+local idMan
+for _, award in ipairs(idOrigin:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        idMan = award.id
+    end
+end
+local idOrigins = idOrigin:GetIdentityLegacyOrigins(ALT_A)
+local identityOriginId
+for i = 1, #idOrigins do
+    if idOrigins[i].kind == "identity" then
+        identityOriginId = idOrigins[i].originLogId
+    end
+end
+assertTrue(identityOriginId ~= nil, "identity-scoped origin is exposed")
+assertTrue(idOrigin:ApplyBisOverride("ASSOCIATE_LEGACY", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = idMan },
+    legacyOriginLogId = identityOriginId,
+}), "associate identity-scoped origin")
+idOrigin:ApplyIdentityProjection({ force = true })
+assertEq(slotState(idOrigin, ALT_A, "Head"), "ASSIGNED_OVERRIDE", "identity origin association occupies Head")
+assertTrue(idOrigin:UnlinkCharacter(ALT_B), "unlink expires identity origin")
+idOrigin:ApplyIdentityProjection({ force = true })
+assertEq(slotState(idOrigin, ALT_A, "Head"), "AVAILABLE", "expired identity origin deactivates association")
+assertTrue(idOrigin:LinkCharacters(ALT_A, ALT_B), "relink")
+idOrigin:ApplyIdentityProjection({ force = true })
+assertEq(slotState(idOrigin, ALT_A, "Head"), "AVAILABLE", "relink does not resurrect expired association")
+
+-- Packed local ring origins associate to historical usage, not display packing
+resetEnv()
+local packed = makeProfile("PackedOrigin")
+addMember(packed, ALT_A)
+addLog(packed, "ARMOR_CHANGE", { member = ALT_A, slot = "Ring1", action = "USED" })
+addLog(packed, "ARMOR_CHANGE", { member = ALT_A, slot = "Ring2", action = "USED" })
+packed:ApplyIdentityProjection({ force = true })
+assertTrue(packed:AddManualAward(ALT_A, itemLink(19002, "Ring")))
+local packedMan
+for _, award in ipairs(packed:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        packedMan = award.id
+    end
+end
+local packedOrigins = packed:GetIdentityLegacyOrigins(ALT_A)
+local ring2Origin
+for i = 1, #packedOrigins do
+    if packedOrigins[i].slot == "Ring2" then
+        ring2Origin = packedOrigins[i].originLogId
+    end
+end
+assertTrue(ring2Origin ~= nil, "Ring2 origin is exposed")
+assertTrue(packed:ApplyBisOverride("ASSOCIATE_LEGACY", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = packedMan },
+    legacyOriginLogId = ring2Origin,
+}), "associate historical Ring2 origin")
+packed:ApplyIdentityProjection({ force = true })
+assertEq(slotState(packed, ALT_A, "Ring2"), "ASSIGNED_OVERRIDE", "association follows origin slot")
+assertEq(slotState(packed, ALT_A, "Ring1"), "LEGACY_UNKNOWN", "unassociated Ring1 origin remains unknown")
+
+-- MergeLogTables / AUTH_LOGS-like import rebuilds BiS without live warnings
+resetEnv()
+local src = makeProfile("SrcLogs")
+addMember(src, ALT_A)
+assertTrue(src:AddRCLootCouncilBisResponse("Need"))
+assertTrue(src:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19001, "Need", "1700004100")))
+src:ApplyIdentityProjection({ force = true })
+local exported = {}
+for _, log in ipairs(src:GetLootLogs()) do
+    exported[#exported + 1] = log:ToTable()
+end
+resetEnv()
+local dest = makeProfile("DestLogs")
+addMember(dest, ALT_A)
+assertTrue(dest:MergeLogTables(exported) >= 0, "MergeLogTables inserts history")
+dest:ApplyIdentityProjection({ force = true })
+assertEq(slotState(dest, ALT_A, "Head"), "ASSIGNED_AUTO", "imported RC+outcome assigns Head")
+assertEq(warnCount(), 0, "MergeLogTables does not warn")
+
+-- BiS-qualified responses cannot be filtered from recorded history
+resetEnv()
+local cfg = makeProfile("Cfg")
+assertTrue(cfg:AddRCLootCouncilAllowedResponse("Need"), "record Need")
+assertTrue(cfg:AddRCLootCouncilBisResponse("Need"), "Need is BiS")
+assertFalse(cfg:RemoveRCLootCouncilAllowedResponse("Need"), "cannot un-record a BiS response")
+
+io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
+if failures > 0 then
+    os.exit(1)
+end
