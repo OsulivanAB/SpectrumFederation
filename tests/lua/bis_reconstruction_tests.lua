@@ -1352,6 +1352,26 @@ badAuto:ApplyIdentityProjection({ force = true })
 assertEq(slotState(badAuto, ALT_A, "Weapon"), "AVAILABLE", "shield AUTO cannot occupy Weapon")
 assertEq(slotState(badAuto, ALT_A, "OffHand"), "ASSIGNED_AUTO", "later compatible AUTO outcome still wins")
 
+-- AUTO ASSIGNED cannot freeze onto a slot #278 already occupies
+resetEnv()
+local occupiedAuto = makeProfile("OccupiedAuto")
+addMember(occupiedAuto, ALT_A)
+addLog(occupiedAuto, "ARMOR_CHANGE", { member = ALT_A, slot = "Head", action = "USED" })
+local occupiedCanon = makeCanonical(ALT_A, 19001, "Need", "1700011000")
+insertRC(occupiedAuto, occupiedCanon)
+addLog(occupiedAuto, "BIS_OUTCOME", {
+    sourceLogId = occupiedCanon.awardKey,
+    awardKey = occupiedCanon.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+})
+occupiedAuto:ApplyIdentityProjection({ force = true })
+assertEq(slotState(occupiedAuto, ALT_A, "Head"), "LEGACY_UNKNOWN", "malformed AUTO does not overlay #278 occupancy")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

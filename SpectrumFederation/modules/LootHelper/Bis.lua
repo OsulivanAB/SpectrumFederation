@@ -1278,6 +1278,22 @@ function Bis.ApplyLog(state, log, ctx)
             end
             return
         end
+        local slots = CopySlots(data.assignedSlots)
+        if #slots == 2 then
+            slots = { "Weapon", "OffHand" }
+        end
+        local members = componentOf(data.awardMember)
+        local view = Bis.ProjectComponent(state, members)
+        for i = 1, #slots do
+            local slot = slots[i]
+            local cell = view.slots[slot]
+            if cell and cell.state and cell.state ~= "AVAILABLE" then
+                return
+            end
+            if ctx.SlotOccupied and ctx.SlotOccupied(data.awardMember, slot) then
+                return
+            end
+        end
         local asg = CreateAssignment(state, {
             id = logId,
             awardRef = { kind = "RC", id = data.awardKey },

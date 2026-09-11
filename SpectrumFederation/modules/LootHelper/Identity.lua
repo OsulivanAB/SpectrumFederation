@@ -1981,7 +1981,7 @@ function Identity.Replay(logs, opts)
                 end
             end
             if bisState and SF.LootHelperBis and SF.LootHelperBis.ApplyLog then
-                if eventType == types.BIS_OVERRIDE then
+                if eventType == types.BIS_OVERRIDE or eventType == types.BIS_OUTCOME then
                     local originMap = OccupancyOriginMap(partition, localArmor, localOrigin, identityArmorEvents)
                     if SF.LootHelperBis.SetOccupancyOrigins then
                         SF.LootHelperBis.SetOccupancyOrigins(bisState, originMap)
@@ -1989,6 +1989,7 @@ function Identity.Replay(logs, opts)
                         bisState.occupancyOrigins = originMap
                     end
                 end
+                local occForMember = {}
                 SF.LootHelperBis.ApplyLog(bisState, log, {
                     rank = i,
                     FindLog = function(id)
@@ -2002,6 +2003,19 @@ function Identity.Replay(logs, opts)
                     end,
                     MemberClass = function(memberId)
                         return classByMember[NormalizeId(memberId)]
+                    end,
+                    SlotOccupied = function(memberId, slot)
+                        memberId = NormalizeId(memberId)
+                        if not memberId or type(slot) ~= "string" then
+                            return false
+                        end
+                        local occ = occForMember[memberId]
+                        if not occ then
+                            local ids = ComponentList(partition, memberId)
+                            occ = ProjectIdentityOccupancy(ids, localArmor, localOrigin, identityArmorEvents)
+                            occForMember[memberId] = occ
+                        end
+                        return OccupiedBool(occ, slot)
                     end,
                 })
             end
