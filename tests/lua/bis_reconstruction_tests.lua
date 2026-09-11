@@ -101,6 +101,8 @@ local ITEM_META = {
     ["19017"] = { loc = "INVTYPE_RANGEDRIGHT", class = 2, sub = 19 },
     ["19018"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 9 },
     ["19019"] = { loc = "INVTYPE_2HWEAPON", class = 2, sub = 1 },
+    ["19020"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 0 },
+    ["19021"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 13 },
 }
 
 function GetItemInfoInstant(link)
@@ -231,13 +233,16 @@ local function itemLink(itemId, name)
 end
 
 local function withFrozen(data, itemId)
-    local classif = SF.LootHelperBis.ClassifyItem(itemLink(itemId, "x"))
+    local link = itemLink(itemId, "x")
+    local classif = SF.LootHelperBis.ClassifyItem(link)
     assertTrue(classif ~= nil, "frozen classif exists for item " .. tostring(itemId))
     data.equipLoc = classif.equipLoc
     data.itemClass = classif.itemClass
     data.itemSubClass = classif.itemSubClass
     data.itemFamily = classif.family
     data.isTwoHand = classif.isTwoHand
+    data.itemLink = link
+    data.itemString = SF.LootLog.ExtractItemString(link)
     return data
 end
 
@@ -258,12 +263,17 @@ end
 
 local function makeCanonical(winner, itemId, response, stamp)
     stamp = stamp or tostring(GetServerTime())
-    return SF.LootLog.BuildRCLootCouncilCanonical(PLAYER, winner, {
+    local canonical = SF.LootLog.BuildRCLootCouncilCanonical(PLAYER, winner, {
         lootWon = itemLink(itemId, "Item" .. tostring(itemId)),
         response = response or "Need",
         id = stamp .. "-7",
         owner = winner,
     })
+    local meta = ITEM_META[tostring(itemId)]
+    if canonical and meta and meta.loc then
+        canonical.equipLoc = meta.loc
+    end
+    return canonical
 end
 
 local function slotState(profile, memberId, slot)
@@ -1825,7 +1835,7 @@ local unknownType = {
 unknownType._fingerprint = SF.LootLog.ComputeFingerprintFromTable(unknownType)
 assertTrue(select(1, SF.LootLog.ValidateTable(unknownType)), "unknown future event types stay forward-compatible")
 
--- Multi-admin bisResponses: profile snapshot config is not an append-only log
+-- Multi-admin bisResponses converge through the profile snapshot
 resetEnv()
 local adminA = makeProfile("AdminA")
 addMember(adminA, ALT_A)
@@ -1843,15 +1853,377 @@ assertTrue(adminB:AddRCLootCouncilBisResponse({
     responseId = 2,
     isAwardReason = false,
 }))
-assertTrue(adminA:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 1, isAwardReason = false }), "admin A qualifies Need")
-assertFalse(adminA:IsBisQualifyingResponse("Greed", { typeCode = "default", responseId = 2, isAwardReason = false }), "admin A does not have Greed")
-assertTrue(adminB:IsBisQualifyingResponse("Greed", { typeCode = "default", responseId = 2, isAwardReason = false }), "admin B qualifies Greed")
-assertFalse(adminB:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 1, isAwardReason = false }), "admin B does not have Need")
+assertTrue(adminA:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 1, isAwardReason = false }), "admin A qualifies Need before sync")
+assertFalse(adminA:IsBisQualifyingResponse("Greed", { typeCode = "default", responseId = 2, isAwardReason = false }), "admin A does not have Greed before sync")
+assertTrue(adminB:IsBisQualifyingResponse("Greed", { typeCode = "default", responseId = 2, isAwardReason = false }), "admin B qualifies Greed before sync")
+assertFalse(adminB:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 1, isAwardReason = false }), "admin B does not have Need before sync")
 local snapA = adminA:ExportSnapshot()
 assertTrue(type(snapA.rcLootCouncilIntegration) == "table", "bisResponses travels on the profile snapshot")
 assertEq(snapA.rcLootCouncilIntegration.bisResponses[1].responseId, 1, "snapshot carries admin A's contextual Need")
+adminB._profileId = snapA.meta._profileId
+assertTrue(select(1, adminB:ImportSnapshot(snapA)), "admin B imports admin A's snapshot")
+assertTrue(adminB:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 1, isAwardReason = false }), "after snapshot, B qualifies Need")
+assertFalse(adminB:IsBisQualifyingResponse("Greed", { typeCode = "default", responseId = 2, isAwardReason = false }), "after snapshot, B no longer has the stale Greed list")
+assertTrue(adminA:AddRCLootCouncilBisResponse({
+    text = "Greed",
+    typeCode = "default",
+    responseId = 2,
+    isAwardReason = false,
+}))
+local snapAfter = adminA:ExportSnapshot()
+assertTrue(select(1, adminB:ImportSnapshot(snapAfter)), "admin B imports the updated BiS list")
+assertTrue(adminA:IsBisQualifyingResponse("Greed", { typeCode = "default", responseId = 2, isAwardReason = false }), "A qualifies Greed after the change")
+assertTrue(adminB:IsBisQualifyingResponse("Greed", { typeCode = "default", responseId = 2, isAwardReason = false }), "B qualifies Greed after snapshot push")
+local greedCanon = makeCanonical(ALT_A, 19001, "Greed", "1700015000")
+greedCanon.responseId = 2
+greedCanon.typeCode = "default"
+greedCanon.isAwardReason = false
+assertTrue(adminA:TryAddRCLootCouncilAward(greedCanon))
+assertTrue(adminB:TryAddRCLootCouncilAward(greedCanon))
+local function autoOutcome(profile)
+    for _, log in ipairs(profile:GetLootLogs()) do
+        local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+        if data and data.response == "Greed" then
+            return data.outcome, data.qualified
+        end
+    end
+end
+local aOut, aQual = autoOutcome(adminA)
+local bOut, bQual = autoOutcome(adminB)
+assertEq(aQual, true, "admin A treats the later Greed award as BiS")
+assertEq(bQual, true, "admin B treats the later Greed award as BiS")
+assertEq(aOut, bOut, "both admins freeze the same automatic outcome")
+assertEq(aOut, "ASSIGNED", "Greed helm assigns after both clients share BiS config")
 end
 extraCorrectnessTests()
+
+local function finalPassTests()
+local function sawUnresolved(profile)
+    for _, log in ipairs(profile:GetLootLogs()) do
+        local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+        if data and data.unresolvedReason == "UNKNOWN_COMPAT" then
+            return true
+        end
+    end
+    return false
+end
+
+-- Survival dual-wield 1H is valid; ranged and fist are not combat BiS
+resetEnv()
+local survDW = makeProfile("SurvDW")
+addMember(survDW, ALT_A, "member", "HUNTER")
+assertTrue(survDW:SetMemberSpec(ALT_A, 255))
+assertTrue(survDW:AddRCLootCouncilBisResponse("Need"))
+assertTrue(survDW:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19020, "Need", "1700020000")))
+assertTrue(survDW:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700020001")))
+survDW:ApplyIdentityProjection({ force = true })
+assertEq(slotState(survDW, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Survival first 1H axe is Weapon")
+assertEq(slotState(survDW, ALT_A, "OffHand"), "ASSIGNED_AUTO", "Survival dual-wields a 1H sword")
+
+resetEnv()
+local survBow = makeProfile("SurvBow")
+addMember(survBow, ALT_A, "member", "HUNTER")
+assertTrue(survBow:SetMemberSpec(ALT_A, 255))
+assertTrue(survBow:AddRCLootCouncilBisResponse("Need"))
+assertTrue(survBow:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19016, "Need", "1700020100")))
+assertTrue(sawUnresolved(survBow), "Survival rejects a ranged BiS weapon")
+assertTrue(survBow:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19021, "Need", "1700020101")))
+assertTrue(sawUnresolved(survBow), "Survival rejects a fist as combat BiS")
+survBow:ApplyIdentityProjection({ force = true })
+assertEq(slotState(survBow, ALT_A, "Weapon"), "AVAILABLE", "Survival ranged/fist do not occupy Weapon")
+
+-- BM/MM accept ranged and reject melee BiS weapons
+resetEnv()
+local bmMelee = makeProfile("BMMelee")
+addMember(bmMelee, ALT_A, "member", "HUNTER")
+assertTrue(bmMelee:SetMemberSpec(ALT_A, 253))
+assertTrue(bmMelee:AddRCLootCouncilBisResponse("Need"))
+assertTrue(bmMelee:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19016, "Need", "1700020200")))
+bmMelee:ApplyIdentityProjection({ force = true })
+assertEq(slotState(bmMelee, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Beast Mastery accepts a bow")
+assertTrue(bmMelee:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700020201")))
+assertTrue(sawUnresolved(bmMelee), "Beast Mastery rejects a melee 1H as combat BiS")
+
+resetEnv()
+local mmMelee = makeProfile("MMMelee")
+addMember(mmMelee, ALT_A, "member", "HUNTER")
+assertTrue(mmMelee:SetMemberSpec(ALT_A, 254))
+assertTrue(mmMelee:AddRCLootCouncilBisResponse("Need"))
+assertTrue(mmMelee:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19016, "Need", "1700020300")))
+mmMelee:ApplyIdentityProjection({ force = true })
+assertEq(slotState(mmMelee, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Marksmanship accepts a bow")
+assertTrue(mmMelee:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19013, "Need", "1700020301")))
+assertTrue(sawUnresolved(mmMelee), "Marksmanship rejects a melee polearm as combat BiS")
+
+-- Evoker current 1H axe/sword; still fail-closed on 2H swords
+resetEnv()
+local evo = makeProfile("EvokerWeapons")
+addMember(evo, ALT_A, "member", "EVOKER")
+assertTrue(evo:SetMemberSpec(ALT_A, 1467))
+assertTrue(evo:AddRCLootCouncilBisResponse("Need"))
+assertTrue(evo:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19020, "Need", "1700020400")))
+evo:ApplyIdentityProjection({ force = true })
+assertEq(slotState(evo, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Devastation Evoker accepts a 1H axe")
+assertTrue(evo:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19009, "Need", "1700020401")))
+evo:ApplyIdentityProjection({ force = true })
+assertEq(slotState(evo, ALT_A, "OffHand"), "ASSIGNED_AUTO", "Evoker holdable still occupies OffHand")
+
+resetEnv()
+local evoSword = makeProfile("EvokerSword")
+addMember(evoSword, ALT_A, "member", "EVOKER")
+assertTrue(evoSword:SetMemberSpec(ALT_A, 1468))
+assertTrue(evoSword:AddRCLootCouncilBisResponse("Need"))
+assertTrue(evoSword:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700020500")))
+evoSword:ApplyIdentityProjection({ force = true })
+assertEq(slotState(evoSword, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Preservation Evoker accepts a 1H sword")
+assertTrue(evoSword:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700020501")))
+assertTrue(sawUnresolved(evoSword), "Evoker rejects a 2H sword")
+
+-- Rogue assassination is dagger-only; Outlaw can use 1H swords
+resetEnv()
+local sinSword = makeProfile("SinSword")
+addMember(sinSword, ALT_A, "member", "ROGUE")
+assertTrue(sinSword:SetMemberSpec(ALT_A, 259))
+assertTrue(sinSword:AddRCLootCouncilBisResponse("Need"))
+assertTrue(sinSword:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700020600")))
+assertTrue(sawUnresolved(sinSword), "Assassination rejects a 1H sword as combat BiS")
+
+resetEnv()
+local outlaw = makeProfile("OutlawSword")
+addMember(outlaw, ALT_A, "member", "ROGUE")
+assertTrue(outlaw:SetMemberSpec(ALT_A, 260))
+assertTrue(outlaw:AddRCLootCouncilBisResponse("Need"))
+assertTrue(outlaw:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700020700")))
+outlaw:ApplyIdentityProjection({ force = true })
+assertEq(slotState(outlaw, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Outlaw accepts a 1H sword")
+
+resetEnv()
+local enh = makeProfile("EnhStaff")
+addMember(enh, ALT_A, "member", "SHAMAN")
+assertTrue(enh:SetMemberSpec(ALT_A, 263))
+assertTrue(enh:AddRCLootCouncilBisResponse("Need"))
+assertTrue(enh:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19020, "Need", "1700020800")))
+enh:ApplyIdentityProjection({ force = true })
+assertEq(slotState(enh, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Enhancement accepts a 1H axe")
+assertTrue(enh:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19012, "Need", "1700020801")))
+assertTrue(sawUnresolved(enh), "Enhancement rejects a 2H staff as combat BiS")
+
+resetEnv()
+local furyBow = makeProfile("FuryBow")
+addMember(furyBow, ALT_A)
+assertTrue(furyBow:SetMemberSpec(ALT_A, 72))
+assertTrue(furyBow:AddRCLootCouncilBisResponse("Need"))
+assertTrue(furyBow:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19016, "Need", "1700020900")))
+assertTrue(sawUnresolved(furyBow), "Fury rejects a bow despite Warrior class proficiency")
+
+-- Stored spec wins over a stubbed live/inspect spec
+resetEnv()
+function GetSpecialization()
+    return 1
+end
+function GetSpecializationInfo()
+    return 253, "Beast Mastery"
+end
+function GetInspectSpecialization()
+    return 253
+end
+assertEq(select(1, SF.LootHelperBis.ResolveRecipientSpec(ALT_A, 255)), 255, "stored Survival spec is used")
+assertEq(select(2, SF.LootHelperBis.ResolveRecipientSpec(ALT_A, 255)), "stored", "authority is stored SPEC_CHANGE")
+assertEq(select(1, SF.LootHelperBis.ResolveRecipientSpec(ALT_A, nil)), nil, "missing stored spec stays unknown")
+local storedSpec = makeProfile("StoredSpec")
+addMember(storedSpec, ALT_A, "member", "HUNTER")
+assertTrue(storedSpec:SetMemberSpec(ALT_A, 255))
+assertTrue(storedSpec:AddRCLootCouncilBisResponse("Need"))
+assertTrue(storedSpec:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19020, "Need", "1700021000")))
+storedSpec:ApplyIdentityProjection({ force = true })
+assertEq(slotState(storedSpec, ALT_A, "Weapon"), "ASSIGNED_AUTO", "live BM inspect does not override stored Survival")
+GetSpecialization = nil
+GetSpecializationInfo = nil
+GetInspectSpecialization = nil
+
+-- Source-consistent but contradictory frozen classification is history-only
+resetEnv()
+assertEq(SF.LootHelperBis.ClassifFromFrozenOutcome({
+    equipLoc = "INVTYPE_HEAD",
+    itemFamily = "ring",
+    assignedSlots = { "Head" },
+}), nil, "frozen family must match equipLoc")
+assertEq(SF.LootHelperBis.ClassifFromFrozenOutcome({
+    equipLoc = "INVTYPE_FINGER",
+    itemFamily = "ring",
+    isTwoHand = true,
+}), nil, "frozen isTwoHand must match equipLoc")
+local forgedHead = makeProfile("ForgedHead")
+addMember(forgedHead, ALT_A)
+local ringCanon = makeCanonical(ALT_A, 19002, "Need", "1700022000")
+insertRC(forgedHead, ringCanon)
+addLog(forgedHead, "BIS_OUTCOME", {
+    sourceLogId = ringCanon.awardKey,
+    awardKey = ringCanon.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+    itemString = ringCanon.itemString,
+    itemLink = ringCanon.itemLink,
+    equipLoc = "INVTYPE_HEAD",
+    itemFamily = "ordinary",
+    itemClass = 4,
+    itemSubClass = 4,
+    isTwoHand = false,
+})
+forgedHead:ApplyIdentityProjection({ force = true })
+assertEq(slotState(forgedHead, ALT_A, "Head"), "AVAILABLE", "contradictory frozen Head does not consume Head")
+assertEq(slotState(forgedHead, ALT_A, "Ring1"), "AVAILABLE", "contradictory frozen Head does not consume Ring1")
+local forgedRetained = false
+for _, log in ipairs(forgedHead:GetLootLogs()) do
+    local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+    if data and data.equipLoc == "INVTYPE_HEAD" then
+        forgedRetained = true
+    end
+end
+assertTrue(forgedRetained, "contradictory frozen outcome is retained as history")
+addLog(forgedHead, "BIS_OUTCOME", withFrozen({
+    sourceLogId = ringCanon.awardKey,
+    awardKey = ringCanon.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "Ring1" },
+    slotBinding = "PACKABLE",
+    assignmentScopeMembers = { ALT_A },
+}, 19002))
+forgedHead:ApplyIdentityProjection({ force = true })
+assertEq(slotState(forgedHead, ALT_A, "Ring1"), "ASSIGNED_AUTO", "later source-consistent ring outcome still pins the winner")
+assertEq(slotState(forgedHead, ALT_A, "Head"), "AVAILABLE", "Head remains empty after the consistent ring wins")
+
+-- Linked Ring1/Ring2 pack order != lexical originLogId; displayed slot is authoritative
+resetEnv()
+local linkedRing = makeProfile("LinkedRingDisplay")
+addMember(linkedRing, ALT_A)
+addMember(linkedRing, ALT_B)
+local zuluOrigin = addLog(linkedRing, "ARMOR_CHANGE", {
+    member = ALT_A,
+    slot = "Ring1",
+    action = "USED",
+}, { author = ZULU, timestamp = 1700023000 })
+local ownerOrigin = addLog(linkedRing, "ARMOR_CHANGE", {
+    member = ALT_B,
+    slot = "Ring1",
+    action = "USED",
+}, { author = OWNER, timestamp = 1700024000 })
+assertTrue(linkedRing:LinkCharacters(ALT_A, ALT_B))
+linkedRing:ApplyIdentityProjection({ force = true })
+assertTrue(tostring(ownerOrigin:GetID()) < tostring(zuluOrigin:GetID()), "lexical originLogId is Owner then Zulu")
+local vis = linkedRing:GetIdentityLegacyOrigins(ALT_A)
+local ring1Origin, ring2Origin
+for i = 1, #vis do
+    if vis[i].displayedSlot == "Ring1" then
+        ring1Origin = vis[i]
+    elseif vis[i].displayedSlot == "Ring2" then
+        ring2Origin = vis[i]
+    end
+end
+assertTrue(ring1Origin ~= nil and ring2Origin ~= nil, "linked Ring1 usages pack onto Ring1 and Ring2")
+assertEq(ring1Origin.originLogId, zuluOrigin:GetID(), "earlier Zulu Ring1 is displayed Ring1")
+assertEq(ring2Origin.originLogId, ownerOrigin:GetID(), "later Owner Ring1 is displayed Ring2")
+assertEq(ring1Origin.slot, "Ring1", "Zulu historical slot remains Ring1")
+assertEq(ring2Origin.slot, "Ring1", "Owner historical slot remains Ring1")
+assertTrue(linkedRing:AddManualAward(ALT_A, itemLink(19002, "RingA")))
+assertTrue(linkedRing:AddManualAward(ALT_B, itemLink(19002, "RingB")))
+local manA, manB
+for _, award in ipairs(linkedRing:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        if award.member == ALT_A then
+            manA = award.id
+        elseif award.member == ALT_B then
+            manB = award.id
+        end
+    end
+end
+assertTrue(manA ~= nil and manB ~= nil, "two ring awards exist")
+assertTrue(linkedRing:PlaceGearOverrideAward(ALT_A, "Ring1", { kind = "MANUAL", id = manA }), "clicking displayed Ring1 binds")
+linkedRing:ApplyIdentityProjection({ force = true })
+assertEq(linkedRing:GetIdentityBisSlots(ALT_A).Ring1.legacyOriginLogId, zuluOrigin:GetID(), "displayed Ring1 binds the Zulu origin")
+assertTrue(linkedRing:PlaceGearOverrideAward(ALT_A, "Ring2", { kind = "MANUAL", id = manB }), "clicking displayed Ring2 binds")
+linkedRing:ApplyIdentityProjection({ force = true })
+assertEq(linkedRing:GetIdentityBisSlots(ALT_A).Ring2.legacyOriginLogId, ownerOrigin:GetID(), "displayed Ring2 binds the Owner origin")
+
+resetEnv()
+local forgedAssoc = makeProfile("ForgedAssoc")
+addMember(forgedAssoc, ALT_A)
+addMember(forgedAssoc, ALT_B)
+local zulu2 = addLog(forgedAssoc, "ARMOR_CHANGE", {
+    member = ALT_A,
+    slot = "Ring1",
+    action = "USED",
+}, { author = ZULU, timestamp = 1700025000 })
+addLog(forgedAssoc, "ARMOR_CHANGE", {
+    member = ALT_B,
+    slot = "Ring1",
+    action = "USED",
+}, { author = OWNER, timestamp = 1700026000 })
+assertTrue(forgedAssoc:LinkCharacters(ALT_A, ALT_B))
+forgedAssoc:ApplyIdentityProjection({ force = true })
+assertTrue(forgedAssoc:AddManualAward(ALT_A, itemLink(19002, "RingA")))
+local forgedMan
+for _, award in ipairs(forgedAssoc:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        forgedMan = award.id
+    end
+end
+assertFalse(forgedAssoc:ApplyBisOverride("ASSOCIATE_LEGACY", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = forgedMan },
+    legacyOriginLogId = zulu2:GetID(),
+    assignedSlots = { "Ring2" },
+}), "writer rejects associating Zulu origin to displayed Ring2")
+addLog(forgedAssoc, "BIS_OVERRIDE", {
+    action = "ASSOCIATE_LEGACY",
+    awardRef = { kind = "MANUAL", id = forgedMan },
+    sourceLogId = forgedMan,
+    legacyOriginLogId = zulu2:GetID(),
+    assignedSlots = { "Ring2" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A, ALT_B },
+    sourceLogIds = { zulu2:GetID() },
+})
+forgedAssoc:ApplyIdentityProjection({ force = true })
+assertEq(slotState(forgedAssoc, ALT_A, "Ring1"), "LEGACY_UNKNOWN", "forged Ring2 bind is a reducer no-op")
+assertEq(slotState(forgedAssoc, ALT_A, "Ring2"), "LEGACY_UNKNOWN", "displayed Ring2 stays a legacy origin")
+
+-- Linked Trinket1 usages follow the same displayed-slot rule
+resetEnv()
+local linkedTrinket = makeProfile("LinkedTrinketDisplay")
+addMember(linkedTrinket, ALT_A)
+addMember(linkedTrinket, ALT_B)
+local zuluTrinket = addLog(linkedTrinket, "ARMOR_CHANGE", {
+    member = ALT_A,
+    slot = "Trinket1",
+    action = "USED",
+}, { author = ZULU, timestamp = 1700027000 })
+local ownerTrinket = addLog(linkedTrinket, "ARMOR_CHANGE", {
+    member = ALT_B,
+    slot = "Trinket1",
+    action = "USED",
+}, { author = OWNER, timestamp = 1700028000 })
+assertTrue(linkedTrinket:LinkCharacters(ALT_A, ALT_B))
+linkedTrinket:ApplyIdentityProjection({ force = true })
+assertTrue(linkedTrinket:AddManualAward(ALT_A, itemLink(19003, "TrinketA")))
+local trinketMan
+for _, award in ipairs(linkedTrinket:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        trinketMan = award.id
+    end
+end
+assertTrue(linkedTrinket:PlaceGearOverrideAward(ALT_A, "Trinket1", { kind = "MANUAL", id = trinketMan }), "clicking displayed Trinket1 binds")
+linkedTrinket:ApplyIdentityProjection({ force = true })
+assertEq(linkedTrinket:GetIdentityBisSlots(ALT_A).Trinket1.legacyOriginLogId, zuluTrinket:GetID(), "displayed Trinket1 binds the earlier origin")
+assertTrue(ownerTrinket:GetID() ~= zuluTrinket:GetID(), "the two trinket origins remain distinct")
+end
+finalPassTests()
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

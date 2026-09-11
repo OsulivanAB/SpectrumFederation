@@ -175,6 +175,10 @@ function Sync:RequestProfileSnapshot() end
 function Sync:_Now()
     return 1
 end
+
+function Sync:_GetAddonVersion()
+    return "test"
+end
 function Sync:GetIntegrityWindowSize()
     return 25
 end
@@ -654,6 +658,79 @@ assertEq(importedCfg.allowedResponses[1], "Major Upgrade", "imported profile res
 local oldProfile = makeProfile("Old Defaults")
 local oldCfg = oldProfile:GetRCLootCouncilIntegrationConfig()
 assertTrue(oldCfg.recordAwards and oldCfg.recordAllAwardTypes and #oldCfg.allowedResponses == 0, "profiles without stored RC config fill defaults")
+
+-- In-session RC setting changes push PROFILE_SNAPSHOT so admins converge
+resetEnv()
+local source = makeProfile("RC Snap Source")
+addMember(source, WINNER)
+setActive(source)
+startSessionOn(source)
+local captured = {}
+SF.LootHelperComm = {
+    Send = function(_, channel, msgType, payload, dist)
+        captured[#captured + 1] = {
+            channel = channel,
+            msgType = msgType,
+            payload = payload,
+            dist = dist,
+        }
+    end,
+}
+assertTrue(source:SetRCLootCouncilRecordAwards(true), "recordAwards change is accepted")
+assertTrue(source:SetRCLootCouncilRecordAllAwardTypes(false), "recordAllAwardTypes change is accepted")
+assertTrue(source:AddRCLootCouncilAllowedResponse("Need"), "allowedResponses change is accepted")
+assertTrue(source:AddRCLootCouncilBisResponse({
+    text = "Need",
+    typeCode = "default",
+    responseId = 1,
+    isAwardReason = false,
+}), "bisResponses change is accepted")
+assertTrue(#captured >= 4, "each RC integration mutator pushes a snapshot")
+local last = captured[#captured]
+assertEq(last.msgType, Sync.MSG.PROFILE_SNAPSHOT, "pushed message is PROFILE_SNAPSHOT")
+assertEq(last.dist, "RAID", "snapshot is sent on the grouped session channel")
+assertTrue(last.payload and last.payload.snapshot and last.payload.snapshot.rcLootCouncilIntegration, "payload carries RC integration")
+assertEq(last.payload.snapshot.rcLootCouncilIntegration.bisResponses[1].responseId, 1, "snapshot carries the new BiS response")
+assertFalse(last.payload.snapshot.rcLootCouncilIntegration.recordAllAwardTypes, "snapshot carries record-all=false")
+
+local replica = makeProfile("RC Snap Replica")
+replica._profileId = source:GetProfileId()
+assertTrue(select(1, replica:ImportSnapshot(last.payload.snapshot)), "replica imports the pushed snapshot")
+assertTrue(replica:IsBisQualifyingResponse("Need", {
+    typeCode = "default",
+    responseId = 1,
+    isAwardReason = false,
+}), "replica qualifies Need after snapshot import")
+assertFalse(replica:GetRCLootCouncilIntegrationConfig().recordAllAwardTypes, "replica restored record-all=false")
+assertTrue(source:AddRCLootCouncilBisResponse({
+    text = "Greed",
+    typeCode = "default",
+    responseId = 2,
+    isAwardReason = false,
+}), "source adds Greed as BiS")
+last = captured[#captured]
+assertTrue(select(1, replica:ImportSnapshot(last.payload.snapshot)), "replica imports the Greed update")
+local greedCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+    id = "1700000900-9",
+    response = "Greed",
+    responseID = 2,
+}))
+assertTrue(source:TryAddRCLootCouncilAward(greedCanon), "source records the later Greed award")
+assertTrue(replica:TryAddRCLootCouncilAward(greedCanon), "replica records the same later Greed award")
+local function greedOutcome(profile)
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+        if data and data.awardKey == greedCanon.awardKey then
+            return data.outcome, data.qualified
+        end
+    end
+end
+local sourceOut, sourceQual = greedOutcome(source)
+local replicaOut, replicaQual = greedOutcome(replica)
+assertEq(sourceQual, true, "source treats Greed as BiS")
+assertEq(replicaQual, true, "replica treats Greed as BiS")
+assertEq(sourceOut, replicaOut, "both admins freeze the same automatic outcome for the same award")
+SF.LootHelperComm = nil
 
 -- Live Main Swap is retired. Linking must not rewrite isolated RC recipients
 -- or sequential member attribution.
