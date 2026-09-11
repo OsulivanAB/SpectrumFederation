@@ -2371,6 +2371,51 @@ local function testExistingProfileReconnectCatchesUpRCConfig()
     assertEq(qualified, true, "Greed is qualified BiS on Admin B after reconnect catch-up")
     assertTrue(outcome ~= "NOT_BIS", "caught-up Greed is not recorded as NOT_BIS")
     PLAYER = "Tester-Garona"
+
+    resetEnv()
+    local idle = makeProfile("RC Idle Reconnect")
+    addMember(idle, WINNER)
+    addMember(idle, ADMIN_B)
+    assertTrue(idle:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "idle reconnect Admin B shares the profile")
+    assertTrue(idle:ApplyRCLootCouncilIntegrationConfig({
+        recordAwards = true,
+        recordAllAwardTypes = false,
+        allowedResponses = { "Need" },
+        bisResponses = {
+            { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+        },
+    }, { skipPermission = true, skipSync = true }), "idle reconnect has accepted Need-only config and no SET")
+    setActive(idle)
+    startSessionOn(idle)
+    Sync.state.coordinator = PLAYER
+    Sync.state.isCoordinator = true
+    Sync.state.coordEpoch = 5
+    idle._rcConfigSeq = 0
+    idle._rcConfigEpoch = 0
+    Sync.state.rcConfigSeq = 0
+    local idleB = cloneProfileAs("RC Idle B", idle)
+    captured = captureComm()
+    Sync:BroadcastSessionHeartbeat()
+    heartbeat = lastOfType(captured, Sync.MSG.SES_HEARTBEAT)
+    assertTrue(heartbeat ~= nil, "idle reconnect heartbeat was sent")
+    assertEq(heartbeat.payload.rcConfigSeq, 0, "no SET advertises accepted seq 0")
+    assertEq(heartbeat.payload.rcConfigEpoch, 0, "no SET advertises accepted epoch 0, not live coordEpoch")
+    assertEq(heartbeat.payload.coordEpoch, 5, "session coordEpoch remains 5")
+    PLAYER = ADMIN_B
+    captured = captureComm()
+    withLocalProfile(idleB, function()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.isCoordinator = false
+        Sync.state.coordEpoch = 5
+        Sync.state._sentJoinStatusForSessionId = nil
+        Sync.state._sentJoinStatusType = nil
+        Sync.state._profileReqInFlight = nil
+        Sync.state.heartbeat = { lastCatchupAt = nil }
+        Sync:HandleSessionHeartbeat("Tester-Garona", heartbeat.payload)
+        Sync:SendJoinStatus()
+    end)
+    assertTrue(lastOfType(captured, Sync.MSG.NEED_PROFILE) == nil, "matching RC generation does not request a snapshot")
+    PLAYER = "Tester-Garona"
     SF.LootHelperComm = nil
 end
 testExistingProfileReconnectCatchesUpRCConfig()

@@ -326,16 +326,16 @@ function Sync:_AttachRCConfigGeneration(payload, profileId)
     if type(profileId) == "string" and profileId ~= "" and self.FindLocalProfileById then
         profile = self:FindLocalProfileById(profileId)
     end
-    local seq = tonumber(self.state and self.state.rcConfigSeq)
-    if seq == nil and profile then
-        seq = tonumber(profile._rcConfigSeq)
+    local seq = tonumber(profile and profile._rcConfigSeq)
+    if seq == nil then
+        seq = tonumber(self.state and self.state.rcConfigSeq)
     end
-    local epoch = profile and tonumber(profile._rcConfigEpoch) or nil
-    if epoch == nil then
-        epoch = tonumber(self.state and self.state.coordEpoch)
-    end
+    -- Match ExportSnapshot: unset accepted epoch is 0, not live coordEpoch.
+    -- Falling back to coordEpoch made log-complete peers request snapshots in a
+    -- loop in sessions that had never published RC_CONFIG_SET.
+    local epoch = tonumber(profile and profile._rcConfigEpoch) or 0
     payload.rcConfigSeq = math.floor(tonumber(seq) or 0)
-    payload.rcConfigEpoch = math.floor(tonumber(epoch) or 0)
+    payload.rcConfigEpoch = math.floor(epoch)
     return payload
 end
 
@@ -373,7 +373,9 @@ function Sync:_CatchUpRCConfigIfNeeded(profile, reason)
     if not self:_NeedsRCConfigCatchUp(profile) then
         return false
     end
-    self.state._profileReqInFlight = nil
+    if self.state._profileReqInFlight == self.state.sessionId then
+        return true
+    end
     if self.RequestProfileSnapshot then
         self:RequestProfileSnapshot(reason or "rc-config-catchup")
     end
