@@ -112,6 +112,10 @@ function Sync:TryRestorePersistedSession(reason)
     self.state.coordinator = persisted.coordinator
     self.state.coordEpoch = persisted.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(persisted.coordinator, self:_SelfId())
+    do
+        local restoredProfile = self.FindLocalProfileById and self:FindLocalProfileById(persisted.profileId) or nil
+        self.state.rcConfigSeq = (restoredProfile and tonumber(restoredProfile._rcConfigSeq)) or 0
+    end
     self.state.helpers = CopyStringArray(persisted.helpers)
     self.state.authorMax = {}
     self.state.authorWindowSummary = {}
@@ -685,6 +689,7 @@ function Sync:StartSession(profileId, opts)
     self.state.coordinator = me
     self.state.coordEpoch = epoch
     self.state.isCoordinator = true
+    self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
     self.state._sessionAnnounced = nil
     self.state._sessionStartFailedFor = nil
     self:_PersistSessionState("StartSession")
@@ -744,6 +749,7 @@ function Sync:_ResetSessionState(reason)
     self.state.coordinator = nil
     self.state.coordEpoch = nil
     self.state.isCoordinator = false
+    self.state.rcConfigSeq = nil
     self.state._restoredSessionNeedsReannounce = false
 
     -- Clear session metadata

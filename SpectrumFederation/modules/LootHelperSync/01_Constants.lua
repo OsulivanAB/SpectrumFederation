@@ -39,4 +39,8 @@ Sync.MSG = {
     -- Safe Mode
     SAFE_MODE_REQ   = "SAFE_MODE_REQ",
     SAFE_MODE_SET   = "SAFE_MODE_SET",
+
+    -- RC integration config (config-only; never a full profile snapshot)
+    RC_CONFIG_REQ   = "RC_CONFIG_REQ",
+    RC_CONFIG_SET   = "RC_CONFIG_SET",
 }

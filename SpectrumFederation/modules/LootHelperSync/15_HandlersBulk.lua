@@ -350,14 +350,10 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.snapshot) ~= "table" then return end
 
-    -- Trust: coordinator/helper, or an authorized session admin of this profile.
-    -- RC integration settings ride on PROFILE_SNAPSHOT, so any session admin
-    -- who can change those settings must be able to propagate them.
-    local authorized = self:IsTrustedDataSender(sender)
-    if not authorized and self.IsSenderAuthorized and self:IsSenderAuthorized(payload.profileId, sender) then
-        authorized = true
-    end
-    if not authorized then
+    -- Full snapshots remain coordinator/helper-only. Ordinary admins cannot
+    -- supply owner, roster, logs, loot mode, Reward Pot, Raid Check, or
+    -- equipment state through this path. RC settings use RC_CONFIG_REQ/SET.
+    if not self:IsTrustedDataSender(sender) then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not a trusted sender", tostring(sender))
         end
@@ -451,6 +447,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
             SF:PrintWarning(("PROFILE_SNAPSHOT import failed: %s"):format(importErr or "unknown"))
         end
         return
+    end
+
+    local importedSeq = tonumber(profile._rcConfigSeq) or 0
+    if importedSeq > (tonumber(self.state.rcConfigSeq) or 0) then
+        self.state.rcConfigSeq = importedSeq
     end
 
     -- Store new profile in canonical map (keyed by profileId)

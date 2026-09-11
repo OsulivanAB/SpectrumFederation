@@ -69,6 +69,7 @@ Sync.state = Sync.state or {
     containedExactWindows = {}, -- session-scoped advertised windows with row-level id+fingerprint proof; revalidated against current local history
 
     isCoordinator = false,
+    rcConfigSeq = 0, -- session-scoped monotonic RC config sequence (not wall-clock)
 
     -- Admin convergence bookkeeping
     adminStatuses = {}, -- map: [sender] = status table

@@ -316,8 +316,9 @@ function Sync:BuildProfileSnapshot(profileId)
     }
 end
 
--- Push the current profile snapshot to session peers. Used when RC integration
--- settings change so in-session admins converge without a new config-log type.
+-- Push the current profile snapshot to session peers.
+-- Full snapshots are coordinator/helper trust-boundary traffic (NEED_PROFILE).
+-- Live RC integration edits use PublishRCIntegrationConfig instead.
 function Sync:PushActiveProfileSnapshot(profileId, reason)
     if not self.state or not self.state.active then
         return false, "no session"
@@ -359,6 +360,96 @@ function Sync:PushActiveProfileSnapshot(profileId, reason)
         SF.LootHelperComm:Send("BULK", self.MSG.PROFILE_SNAPSHOT, payload, dist, nil, "BULK", opts)
     end
     return true, payload
+end
+
+-- Function Publish RC integration configuration for the session profile.
+-- Coordinator applies a monotonic session seq and RAID-broadcasts RC_CONFIG_SET.
+-- Non-coordinators WHISPER RC_CONFIG_REQ with the RC config table only.
+-- Never sends a full PROFILE_SNAPSHOT.
+-- @param profileId string|nil Session profile id
+-- @return boolean success
+-- @return table|string payloadOrError
+function Sync:PublishRCIntegrationConfig(profileId)
+    if not self.state or not self.state.active then
+        return false, "no session"
+    end
+    if type(self.state.sessionId) ~= "string" or self.state.sessionId == "" then
+        return false, "no session"
+    end
+    profileId = profileId or self.state.profileId
+    if type(profileId) ~= "string" or profileId == "" then
+        return false, "missing profileId"
+    end
+    if self.state.profileId and self.state.profileId ~= profileId then
+        return false, "wrong profile for session"
+    end
+    local me = self._SelfId and self:_SelfId() or nil
+    if not me or not self.IsSenderAuthorized or not self:IsSenderAuthorized(profileId, me) then
+        return false, "not authorized"
+    end
+    local dist = "RAID"
+    if self._EnforceGroupedSessionActive then
+        dist = self:_EnforceGroupedSessionActive("PublishRCIntegrationConfig")
+        if not dist then
+            return false, "not in group"
+        end
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+        return false, "no profile"
+    end
+    local config = profile:GetRCLootCouncilIntegrationConfig()
+    if type(config) ~= "table" then
+        return false, "no config"
+    end
+    if not (SF.LootHelperComm and SF.LootHelperComm.Send) then
+        return false, "comm not available"
+    end
+    if self.state.isCoordinator then
+        local nextSeq = (tonumber(self.state.rcConfigSeq) or 0) + 1
+        self.state.rcConfigSeq = nextSeq
+        profile._rcConfigSeq = nextSeq
+        local payload = {
+            sessionId = self.state.sessionId,
+            profileId = profileId,
+            coordinator = self.state.coordinator,
+            coordEpoch = self.state.coordEpoch,
+            seq = nextSeq,
+            rcLootCouncilIntegration = config,
+        }
+        SF.LootHelperComm:Send(
+            "CONTROL",
+            self.MSG.RC_CONFIG_SET,
+            payload,
+            dist,
+            nil,
+            "NORMAL"
+        )
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "RC_CONFIG_SET seq=%s profile=%s", tostring(nextSeq), tostring(profileId))
+        end
+        return true, payload
+    end
+    if type(self.state.coordinator) ~= "string" or self.state.coordinator == "" then
+        return false, "no coordinator"
+    end
+    local req = {
+        sessionId = self.state.sessionId,
+        profileId = profileId,
+        rcLootCouncilIntegration = config,
+    }
+    SF.LootHelperComm:Send(
+        "CONTROL",
+        self.MSG.RC_CONFIG_REQ,
+        req,
+        "WHISPER",
+        self.state.coordinator,
+        "NORMAL"
+    )
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "RC_CONFIG_REQ to %s profile=%s", tostring(self.state.coordinator), tostring(profileId))
+    end
+    return true, req
 end
 
 -- Function Compute authorMax summary from profile's logs.

@@ -1717,10 +1717,10 @@ function LootProfile:_EnsureRCLootCouncilIntegrationConfig()
 	cfg.bisResponses = CopyBisResponses(cfg.bisResponses)
 end
 
-local function PushRCIntegrationSnapshot(self)
+local function PushRCIntegrationConfig(self)
 	local Sync = SF.LootHelperSync
-	if Sync and Sync.PushActiveProfileSnapshot then
-		Sync:PushActiveProfileSnapshot(self:GetProfileId(), "rc-integration")
+	if Sync and Sync.PublishRCIntegrationConfig then
+		Sync:PublishRCIntegrationConfig(self:GetProfileId())
 	end
 end
 
@@ -1734,13 +1734,53 @@ function LootProfile:GetRCLootCouncilIntegrationConfig()
 	}
 end
 
+-- Apply a strictly validated RC integration config table. Extra keys are ignored.
+-- This is the only authority an ordinary admin has over RC settings: the four
+-- RC integration fields, never owner/admins/members/logs/loot mode/Reward Pot/Raid Check.
+-- @param config table
+-- @param options table|nil { skipPermission = bool, skipSync = bool }
+-- @return boolean success
+-- @return string|nil errorMessage
+function LootProfile:ApplyRCLootCouncilIntegrationConfig(config, options)
+	options = options or {}
+	if type(config) ~= "table" then
+		return false, "invalid-config"
+	end
+	self:_EnsureRCLootCouncilIntegrationConfig()
+	if not options.skipPermission and not CurrentUserHasEffectiveLocalAdmin(self) then
+		return false, "You must be an admin to change RC Loot Council settings."
+	end
+	if config.allowedResponses ~= nil and type(config.allowedResponses) ~= "table" then
+		return false, "invalid-allowed-responses"
+	end
+	if config.bisResponses ~= nil and type(config.bisResponses) ~= "table" then
+		return false, "invalid-bis-responses"
+	end
+	if config.recordAwards ~= nil then
+		self._rcLootCouncilIntegration.recordAwards = config.recordAwards and true or false
+	end
+	if config.recordAllAwardTypes ~= nil then
+		self._rcLootCouncilIntegration.recordAllAwardTypes = config.recordAllAwardTypes and true or false
+	end
+	if config.allowedResponses ~= nil then
+		self._rcLootCouncilIntegration.allowedResponses = CopyAllowedResponses(config.allowedResponses)
+	end
+	if config.bisResponses ~= nil then
+		self._rcLootCouncilIntegration.bisResponses = CopyBisResponses(config.bisResponses)
+	end
+	if not options.skipSync then
+		PushRCIntegrationConfig(self)
+	end
+	return true, nil
+end
+
 function LootProfile:SetRCLootCouncilRecordAwards(enabled)
 	self:_EnsureRCLootCouncilIntegrationConfig()
 	if not CurrentUserHasEffectiveLocalAdmin(self) then
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
 	self._rcLootCouncilIntegration.recordAwards = enabled and true or false
-	PushRCIntegrationSnapshot(self)
+	PushRCIntegrationConfig(self)
 	return true, nil
 end
 
@@ -1750,7 +1790,7 @@ function LootProfile:SetRCLootCouncilRecordAllAwardTypes(enabled)
 		return false, "You must be an admin to change RC Loot Council settings."
 	end
 	self._rcLootCouncilIntegration.recordAllAwardTypes = enabled and true or false
-	PushRCIntegrationSnapshot(self)
+	PushRCIntegrationConfig(self)
 	return true, nil
 end
 
@@ -1770,7 +1810,7 @@ function LootProfile:AddRCLootCouncilAllowedResponse(value)
 		end
 	end
 	self._rcLootCouncilIntegration.allowedResponses[#self._rcLootCouncilIntegration.allowedResponses + 1] = trimmed
-	PushRCIntegrationSnapshot(self)
+	PushRCIntegrationConfig(self)
 	return true, nil
 end
 
@@ -1800,7 +1840,7 @@ function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
 		return false, "That award type is not in the list."
 	end
 	self._rcLootCouncilIntegration.allowedResponses = filtered
-	PushRCIntegrationSnapshot(self)
+	PushRCIntegrationConfig(self)
 	return true, nil
 end
 
@@ -1835,7 +1875,7 @@ function LootProfile:AddRCLootCouncilBisResponse(value)
 	end
 	self._rcLootCouncilIntegration.bisResponses = self._rcLootCouncilIntegration.bisResponses or {}
 	self._rcLootCouncilIntegration.bisResponses[#self._rcLootCouncilIntegration.bisResponses + 1] = entry
-	PushRCIntegrationSnapshot(self)
+	PushRCIntegrationConfig(self)
 	return true, nil
 end
 
@@ -1867,7 +1907,7 @@ function LootProfile:RemoveRCLootCouncilBisResponse(value)
 		return false, "That BiS response is not in the list."
 	end
 	self._rcLootCouncilIntegration.bisResponses = filtered
-	PushRCIntegrationSnapshot(self)
+	PushRCIntegrationConfig(self)
 	return true, nil
 end
 
@@ -3241,6 +3281,7 @@ function LootProfile:ExportSnapshot()
 		lootMode        = self:GetLootMode(),
 		rewardPot       = self:GetRewardPotConfig(),
 		rcLootCouncilIntegration = self:GetRCLootCouncilIntegrationConfig(),
+		rcConfigSeq     = tonumber(self._rcConfigSeq) or 0,
 	}
 end
 
@@ -3383,6 +3424,10 @@ function LootProfile.ValidateSnapshot(snapshot)
 		then
 			return false, "snapshot.rcLootCouncilIntegration.bisResponses must be a table when provided"
 		end
+	end
+
+	if snapshot.rcConfigSeq ~= nil and type(snapshot.rcConfigSeq) ~= "number" then
+		return false, "snapshot.rcConfigSeq must be a number when provided"
 	end
 
 	return true, nil
@@ -3528,6 +3573,9 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		if type(snapshot.rcLootCouncilIntegration.bisResponses) == "table" then
 			self._rcLootCouncilIntegration.bisResponses = CopyBisResponses(snapshot.rcLootCouncilIntegration.bisResponses)
 		end
+	end
+	if type(snapshot.rcConfigSeq) == "number" then
+		self._rcConfigSeq = math.floor(snapshot.rcConfigSeq)
 	end
 
 	-- Import loot mode / Reward Pot config only when the snapshot actually contains them.

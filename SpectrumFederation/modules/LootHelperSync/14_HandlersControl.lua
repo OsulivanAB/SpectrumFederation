@@ -1059,3 +1059,125 @@ function Sync:_RecordHandshakeReply(sender, payload, status)
         self.state.handshake.replies[sender] = status
     end
 end
+
+local function CopyRCConfigFromPayload(src)
+    if type(src) ~= "table" then
+        return nil
+    end
+    return {
+        recordAwards = src.recordAwards,
+        recordAllAwardTypes = src.recordAllAwardTypes,
+        allowedResponses = src.allowedResponses,
+        bisResponses = src.bisResponses,
+    }
+end
+
+-- Function Handle RC_CONFIG_REQ as coordinator: accept config-only RC settings
+-- from an authorized admin, then broadcast RC_CONFIG_SET.
+-- Extra payload keys (snapshot, meta, owner, logs) are ignored.
+-- @param sender string "Name-Realm"
+-- @param payload table {sessionId, profileId, rcLootCouncilIntegration}
+-- @return nil
+function Sync:HandleRCConfigRequest(sender, payload)
+    if not (self.state and self.state.active and self.state.isCoordinator) then
+        return
+    end
+    if type(payload) ~= "table" then
+        return
+    end
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then
+        return
+    end
+    if not self:IsSenderAuthorized(self.state.profileId, sender) then
+        return
+    end
+    if self.IsRequesterInGroup and not self:IsRequesterInGroup(sender) then
+        return
+    end
+    local cfg = CopyRCConfigFromPayload(payload.rcLootCouncilIntegration)
+    if not cfg then
+        return
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if not profile or not profile.ApplyRCLootCouncilIntegrationConfig then
+        return
+    end
+    local applied = profile:ApplyRCLootCouncilIntegrationConfig(cfg, {
+        skipPermission = true,
+        skipSync = true,
+    })
+    if not applied then
+        return
+    end
+    if self.PublishRCIntegrationConfig then
+        self:PublishRCIntegrationConfig(self.state.profileId)
+    end
+end
+
+-- Function Handle RC_CONFIG_SET as a session member: apply coordinator-authored
+-- RC configuration when seq is newer than the local profile seq.
+-- @param sender string "Name-Realm"
+-- @param payload table {sessionId, profileId, seq, rcLootCouncilIntegration, coordinator?, coordEpoch?}
+-- @return nil
+function Sync:HandleRCConfigSet(sender, payload)
+    if not (self.state and self.state.active) then
+        return
+    end
+    if type(payload) ~= "table" then
+        return
+    end
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then
+        return
+    end
+    if type(self.state.coordinator) ~= "string" or self.state.coordinator == "" then
+        return
+    end
+    if not self:_SamePlayer(sender, self.state.coordinator) then
+        return
+    end
+    if type(payload.coordinator) == "string" and payload.coordinator ~= "" then
+        if not self:_SamePlayer(sender, payload.coordinator) then
+            return
+        end
+    end
+    if not self:IsControlMessageAllowed(payload, sender) then
+        return
+    end
+    local me = self._SelfId and self:_SelfId() or nil
+    if me and self:_SamePlayer(sender, me) then
+        return
+    end
+    local seq = tonumber(payload.seq)
+    if not seq then
+        return
+    end
+    seq = math.floor(seq)
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if not profile or not profile.ApplyRCLootCouncilIntegrationConfig then
+        return
+    end
+    local current = tonumber(profile._rcConfigSeq) or 0
+    if seq <= current then
+        return
+    end
+    local cfg = CopyRCConfigFromPayload(payload.rcLootCouncilIntegration)
+    if not cfg then
+        return
+    end
+    local applied = profile:ApplyRCLootCouncilIntegrationConfig(cfg, {
+        skipPermission = true,
+        skipSync = true,
+    })
+    if not applied then
+        return
+    end
+    profile._rcConfigSeq = seq
+    if seq > (tonumber(self.state.rcConfigSeq) or 0) then
+        self.state.rcConfigSeq = seq
+    end
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Applied RC_CONFIG_SET seq=%s from %s", tostring(seq), tostring(sender))
+    end
+end
