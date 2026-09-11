@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.1-beta.1] - 2026-09-11
+
+### Fixed
+- Sync protocol incompatibility warnings print once per peer instead of repeating for every mixed-version raid message
+
 ## [1.5.0] - 2026-09-11
 
 ### Added

@@ -102,6 +102,9 @@ python -m pytest tests/test_mouse_tracer.py
 # Loot Helper window minimize/expand anchoring (loads production Window.lua; requires lua5.1)
 python -m pytest tests/test_loot_helper_window.py
 
+# Sync protocol PROTO_NACK / unsupported-protocol warning dedupe (requires lua5.1)
+python -m pytest tests/test_sync_protocol.py
+
 # PR template or `validate_pr_template.py`
 python -m pytest tests/test_pr_template.py
 
