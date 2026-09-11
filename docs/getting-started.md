@@ -31,7 +31,7 @@ Enter `/sf` to toggle the addon's standalone settings window. The left sidebar l
 - **Advanced** — diagnostic logging.
 - **Optional** — installed child addons, such as Cursed Surge Tracker when it is present.
 
-Loot Helper's General, Profile, Session, Admin, and temporary RC Loot Council pages are **tabs** on the Loot Helper category, not extra sidebar rows. Paths such as **Loot Helper → Profile** mean: select Loot Helper, then the Profile tab. **Raid Equipment** is its own sidebar category.
+Loot Helper's General, Profile, Session, Admin, Character, and temporary RC Loot Council pages are **tabs** on the Loot Helper category, not extra sidebar rows. Paths such as **Loot Helper → Profile** mean: select Loot Helper, then the Profile tab. **Raid Equipment** is its own sidebar category.
 
 The Loot Helper window appears automatically when all of these conditions are true:
 

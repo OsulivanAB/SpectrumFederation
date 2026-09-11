@@ -31,8 +31,11 @@ Settings are profile-scoped and admin-editable:
 - **Record RC Loot Council Awards in Loot Logs** (default on)
 - **Record all award types** (default on)
 - **Allowed Award Types** when record-all is off
+- **BiS-Qualifying Responses** for future automatic BiS outcomes
 
-Matching is case-insensitive after trimming. The original RC response text is stored on the Loot Log. Empty and duplicate allow-list entries are rejected.
+Matching is case-insensitive after trimming. The original RC response text is stored on the Loot Log. Empty and duplicate allow-list entries are rejected. A BiS-qualified response cannot be filtered out of recorded award history. Changing these lists never reinterprets historical `BIS_OUTCOME` rows.
+
+When RC Loot Council is available, the BiS list can be filled from configured RC response labels. If RC is not loaded, admins can still type response labels manually.
 
 These settings sync with the profile snapshot as `snapshot.rcLootCouncilIntegration`, using the same profile-snapshot path as Raid Check. Changing them does not create a visible Loot Log row. Older snapshots may still carry unused `snapshot.rcLootCouncil` metadata; that field remains compatibility-only and is not the live integration.
 
@@ -44,7 +47,7 @@ Recorded awards use type `RC_LOOT_COUNCIL`:
 
 - **Type of Change** — RC Loot Council
 - **Member** — loot recipient
-- **Action** — the WoW item link (hoverable and clickable in Loot Logs)
+- **Action** — `[Item Link] (Response)` (hoverable and clickable in Loot Logs)
 - **Author** — RC master looter / awarder
 - persisted audit fields include the original RC response, `history.id`, and the deterministic award key
 

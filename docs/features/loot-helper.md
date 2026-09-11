@@ -41,7 +41,8 @@ Profile admins can:
 - add or remove admins;
 - link characters so they share identity-wide points, Attendance, and equipment opportunity state;
 - configure and run Raid Checks;
-- start sync sessions and, when acting as coordinator, end them.
+- start sync sessions and, when acting as coordinator, end them;
+- set a character's persistent spec and correct item-aware BiS assignments from **Loot Helper → Character**.
 
 Only the profile owner can change loot mode.
 
@@ -70,11 +71,17 @@ Select the equipment button on a member row to open the equipment window. It tra
 - weapon and off-hand;
 - two ring uses and two trinket uses.
 
-This is profile history, not a live inspection of equipped items. Admins toggle a category when the member uses or regains that loot opportunity. Toggling creates an equipment-history log entry and does not change loot points or Attendance.
+This is profile history, not a live inspection of currently equipped items.
+
+When the profile has BiS-qualifying RC responses configured, or any item-aware BiS history (`BIS_OUTCOME`, `BIS_OVERRIDE`, `MANUAL_AWARD`, `MANUAL_AWARD_REVERSE`), the popup is **item-aware**: it shows assigned item icons and tooltips, including legacy unknown consumptions. Admins do not click-to-toggle in that mode. Corrections happen in **Loot Helper → Character** (Gear Override).
+
+When there is no item-aware history or BiS configuration, the popup keeps generic equipment icons and the existing admin click-to-toggle behavior, including identity-wide occupancy from linked characters. The core popup works without the RC Loot Council Integration child addon.
+
+Toggling in manual mode creates an equipment-history log entry and does not change loot points or Attendance.
 
 Linked characters share the projected equipment opportunity state. Unmarked historical equipment changes stay character-local and are aggregated after reconstruction. New shared corrections record the linked membership at write time. They stay active while those original members remain together, including when other characters join or leave. If any original member is split from the others, that correction expires permanently and does not return if the same characters are linked again. A later correction on a newly expanded identity replaces earlier overlapping subset-scope state for that slot. Independent identities that later merge still combine their equipment histories: two scoped ring or trinket uses fill the two shared opportunities before overflowing.
 
-Manual Ring 1 / Ring 2 and Trinket 1 / Trinket 2 clicks target the displayed slot. An empty Ring 1 is not filled automatically by a Ring 2 click.
+Manual Ring 1 / Ring 2 and Trinket 1 / Trinket 2 clicks target the displayed slot. An empty Ring 1 is not filled automatically by a Ring 2 click. Frozen automatic BiS overflow never fills a later hole; Gear Override can assign that loot explicitly.
 
 The separate [Raid Check](raid-check.md) **Raid Equipment** page inspects current gear for enchants and gems.
 
