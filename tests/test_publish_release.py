@@ -571,10 +571,10 @@ def test_released_1_5_0_notes_include_linked_characters():
     assert notes.count("## [") == 1
 
 
-def test_current_beta_notes_include_sync_nack_warning_dedupe():
-    notes = publish.get_changelog_for_version("1.5.1-beta.1")
+def test_released_1_5_1_notes_include_sync_nack_warning_dedupe():
+    notes = publish.get_changelog_for_version("1.5.1")
     assert notes is not None
-    assert "## [1.5.1-beta.1]" in notes
+    assert "## [1.5.1]" in notes
     assert "incompatibility warnings print once" in notes
     assert notes.count("## [") == 1
 
