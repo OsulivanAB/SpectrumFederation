@@ -341,6 +341,26 @@ local function DeactivateAssignment(state, assignmentId)
     end
 end
 
+-- Inverse of DeactivateAssignment for the same assignment object. REPLACE
+-- must restore every mapping DeactivateAssignment cleared when creation fails.
+local function RestoreDeactivatedAssignment(state, assignmentId)
+    if not assignmentId then
+        return
+    end
+    local asg = state.assignments[assignmentId]
+    if not asg or asg.active == true then
+        return
+    end
+    asg.active = true
+    local key = AwardKeyFromRef(asg.awardRef)
+    if key then
+        state.activeByAward[key] = assignmentId
+    end
+    if asg.legacyOriginLogId then
+        state.associationByOrigin[asg.legacyOriginLogId] = assignmentId
+    end
+end
+
 local function WeaponProficiencyOk(classif, specId)
     specId = tonumber(specId)
     local SpecWeapons = SF.LootHelperBis.SpecWeapons
@@ -1618,7 +1638,7 @@ function Bis.ApplyLog(state, log, ctx)
             end
             restore()
             DeactivateAssignment(state, target)
-            CreateAssignment(state, {
+            local created = CreateAssignment(state, {
                 id = logId,
                 awardRef = ref,
                 assignedSlots = slots,
@@ -1628,6 +1648,9 @@ function Bis.ApplyLog(state, log, ctx)
                 specId = specId,
                 rank = rank,
             })
+            if not created then
+                RestoreDeactivatedAssignment(state, target)
+            end
             return
         end
 
