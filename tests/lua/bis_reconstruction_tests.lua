@@ -1701,6 +1701,55 @@ end
 assertEq(overrideCountAfter, overrideCountBefore + 1, "move writes one override")
 assertEq(replaceCount, 1, "move is a single REPLACE")
 
+-- REPLACE cannot overlay remaining #278 occupancy under a BiS assignment
+resetEnv()
+local replace278 = makeProfile("Replace278")
+addMember(replace278, ALT_A)
+assertTrue(replace278:AddRCLootCouncilBisResponse("Need"))
+assertTrue(replace278:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19001, "Need", "1700014300")))
+replace278:ApplyIdentityProjection({ force = true })
+assertEq(slotState(replace278, ALT_A, "Head"), "ASSIGNED_AUTO")
+local headAsg = replace278:GetIdentityBisSlots(ALT_A).Head.assignmentId
+addLog(replace278, "ARMOR_CHANGE", { member = ALT_A, slot = "Head", action = "USED" })
+assertTrue(replace278:AddManualAward(ALT_A, itemLink(19001, "Helm")))
+local replaceHelm
+for _, award in ipairs(replace278:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        replaceHelm = award.id
+    end
+end
+local replaceBefore = #(replace278:GetLootLogs() or {})
+assertFalse(replace278:ApplyBisOverride("REPLACE", {
+    viewMember = ALT_A,
+    targetAssignmentId = headAsg,
+    awardRef = { kind = "MANUAL", id = replaceHelm },
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+}), "REPLACE cannot overlay remaining #278 occupancy")
+assertEq(#(replace278:GetLootLogs() or {}), replaceBefore, "ineffective REPLACE over #278 is not appended")
+replace278:ApplyIdentityProjection({ force = true })
+assertEq(slotState(replace278, ALT_A, "Head"), "ASSIGNED_AUTO", "original AUTO assignment remains")
+addLog(replace278, "BIS_OVERRIDE", {
+    action = "REPLACE",
+    awardRef = { kind = "MANUAL", id = replaceHelm },
+    sourceLogId = replaceHelm,
+    targetAssignmentId = headAsg,
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+})
+replace278:ApplyIdentityProjection({ force = true })
+assertEq(slotState(replace278, ALT_A, "Head"), "ASSIGNED_AUTO", "injected REPLACE over #278 is a reducer no-op")
+local injectedReplace = false
+for _, log in ipairs(replace278:GetLootLogs()) do
+    local data = log:GetEventType() == "BIS_OVERRIDE" and log:GetEventData()
+    if data and data.action == "REPLACE" and data.targetAssignmentId == headAsg then
+        injectedReplace = true
+    end
+end
+assertTrue(injectedReplace, "injected REPLACE row is retained")
+assertEq(slotState(replace278, ALT_A, "Head"), "ASSIGNED_AUTO")
+
 -- Import-boundary semantic validation for protocol-3 item-aware types
 resetEnv()
 local importP = makeProfile("ImportSem")

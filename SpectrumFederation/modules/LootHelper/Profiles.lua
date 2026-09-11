@@ -2298,9 +2298,15 @@ function LootProfile:ApplyBisOverride(action, opts)
             return false, "That item cannot be assigned to the selected slot."
         end
         eventData.assignedSlots = resolved
-        local board = self:GetIdentityBisSlots(ownerMember or opts.viewMember)
+        local ownerId = ownerMember or opts.viewMember
+        local board = self:GetIdentityBisSlots(ownerId)
+        -- #278 occupancy is independent of BiS overlay. Replay rejects ASSIGN
+        -- and REPLACE via SlotOccupied even when the displayed cell is the
+        -- assignment being replaced.
+        local armor = self:GetIdentityArmor(ownerId)
         for i = 1, #resolved do
-            local cell = board and board[resolved[i]]
+            local slot = resolved[i]
+            local cell = board and board[slot]
             if cell and cell.state and cell.state ~= "AVAILABLE" then
                 local replacingSelf = action == actions.REPLACE
                     and opts.targetAssignmentId
@@ -2308,6 +2314,9 @@ function LootProfile:ApplyBisOverride(action, opts)
                 if not replacingSelf then
                     return false, "That equipment slot is already occupied."
                 end
+            end
+            if armor and armor[slot] then
+                return false, "That equipment slot already has a recorded equipment use."
             end
         end
     end
