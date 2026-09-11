@@ -27,7 +27,7 @@ local addonName, SF = ...
 | `modules/Settings/` | Defaults, migrations, path-based storage, per-character storage, and runtime application. |
 | `modules/MouseTracer/` | Optional per-character cursor trail: cached settings, fixed-pool rendering, and account-wide copy snapshots. |
 | `modules/UI/Settings/` | Page/category registry, navigation model, standalone window, controls, dialogs, and page definitions. |
-| `modules/LootHelper/` | Profile, member, and log domain models plus serialization, the current communication adapter, and runtime-only local impersonation. |
+| `modules/LootHelper/` | Profile, member, log, and linked-identity domain models plus serialization, the current communication adapter, and runtime-only local impersonation. |
 | `modules/LootHelperSync/` | Session state, validation, requests, convergence, heartbeat, routing, bulk handlers, and public API. |
 | `modules/UI/LootHelper/` | Roster/equipment presentation and controller logic. |
 | `modules/RaidCheck.lua` | Inspection cache, equipment evaluation, whispers, snapshots, and point awards. |
@@ -47,13 +47,13 @@ Settings schema migrations normalize older database shapes before defaults are m
 
 ## Event and update flow
 
-Profile mutations create immutable `LootLog` entries. Member point and equipment state is rebuilt from these entries, and Loot Helper events refresh the visible roster.
+Profile mutations create immutable `LootLog` entries. Member point, Attendance, and equipment caches are projected from linked-character identity reconstruction, and Loot Helper events refresh the visible roster.
 
 ```mermaid
 flowchart LR
     UI[Admin action] --> Model[Profile or Member method]
     Model --> Log[Append LootLog]
-    Log --> Replay[Rebuild derived member state]
+    Log --> Replay[Rebuild identity projection]
     Log --> Sync[Broadcast or later synchronize]
     Replay --> Events[Loot Helper data event]
     Events --> View[Roster and log views refresh]
@@ -71,7 +71,7 @@ flowchart LR
 
 ## Permissions
 
-`LootProfile:IsCurrentUserAdmin()` and `IsCurrentUserOwner()` are canonical membership queries. Named-sender, protocol, and sync authorization also stay canonical and can never be granted by Preview as Non-Admin.
+`LootProfile:IsCurrentUserAdmin()` and `IsCurrentUserOwner()` are canonical membership queries. Named-sender, protocol, and sync authorization also stay canonical and can never be granted by Preview as Non-Admin. Effective owner capability follows the canonical owner's linked identity for LINK/UNLINK and loot-mode authorization.
 
 Local user-facing capability (Settings controls, roster/equipment actions, member and profile mutators, local loot-log creation, Raid Check start/consequences, and user-triggered session start/end) uses `SF.LootHelperImpersonation` effective local admin/owner. That overlay is a runtime-only one-way downgrade bound to the active profile. It is not persisted, does not change SavedVariables or sync payloads, and is cleared by profile switch/clear/delete/reset, canonical admin loss, and `/reload`.
 

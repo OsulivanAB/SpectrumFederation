@@ -121,6 +121,10 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = self:_Now()
 
+    if self._ClearIdentitySessionBookkeeping then
+        self:_ClearIdentitySessionBookkeeping("RestorePersistedSession")
+    end
+
     self.state.heartbeat = {}
     local hb = self.state.heartbeat
     hb.lastHeartbeatAt = self:_Now()
@@ -351,7 +355,8 @@ function Sync:RequestManualSync(reason)
     else
         local localContig = self:ComputeContigAuthorMax(profileId)
         local remoteAuthorMax = self.state.authorMax or {}
-        local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax) or {}
+        local missing = self:ComputeMissingLogRequests(localContig, remoteAuthorMax, self:ComputeAuthorMax(profileId)) or {}
+        self:_BindSessionWindowEvidence(missing)
 
         if #missing > 0 then
             local hasNewRequests = false
@@ -363,7 +368,7 @@ function Sync:RequestManualSync(reason)
                     if type(author) == "string"
                         and type(fromCounter) == "number"
                         and type(toCounter) == "number"
-                        and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter)
+                        and not self:_HasOutstandingLogRangeRequest(profileId, author, fromCounter, toCounter, range.exactAuthor == true)
                     then
                         hasNewRequests = true
                         break
@@ -525,7 +530,7 @@ function Sync:OnGroupRosterUpdate()
     local me = self:_SelfId()
 
     -- Build a single payload to reuse
-    self.state.authorMax = self:ComputeAuthorMax(profileId) or (self.state.authorMax or {})
+    self:_RefreshAdvertisedAuthorMax(profileId)
     local payload = {
         sessionId   = sid,
         profileId   = profileId,
@@ -774,6 +779,10 @@ function Sync:_ResetSessionState(reason)
     self:_ResetSessionSafeMode("ResetSessionState")
     self:_ResetLocalSafeMode("ResetSessionState")
 
+    if self._ClearIdentitySessionBookkeeping then
+        self:_ClearIdentitySessionBookkeeping(reason or "ResetSessionState")
+    end
+
     -- Clear heartbeat state and stop any heartbeat timer/ticker
     do
         local hb = self.state.heartbeat
@@ -881,6 +890,7 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self.state._adminConvergence = nil
     self.state.handshake = nil
     self.state._sessionAnnounced = nil
+    self.state.containedExactWindows = {}
 
     local me = self:_SelfId()
     local oldEpoch = tonumber(self.state.coordEpoch) or 0
@@ -935,7 +945,7 @@ function Sync:ReannounceSession()
     if not SF.LootHelperComm then return end
 
     local profileId = self.state.profileId
-    self.state.authorMax = self:ComputeAuthorMax(profileId) or {}
+    self:_RefreshAdvertisedAuthorMax(profileId)
 
     local payload = {
         sessionId   = self.state.sessionId,

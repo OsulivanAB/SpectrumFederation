@@ -122,6 +122,8 @@ function Sync:_SendAdminLogReq(req, target)
         fromCounter = meta.fromCounter,
         toCounter   = meta.toCounter,
         supportsEnc = meta.supportsEnc,
+        exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
+        integrityRepair = meta.integrityRepair == true or nil,
     }
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.LOG_REQ, payload, "WHISPER", target, "NORMAL")
@@ -179,6 +181,7 @@ function Sync:_SendNeedLogsReq(req, target)
             author      = meta.author,
             fromCounter = meta.fromCounter,
             toCounter   = meta.toCounter,
+            exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
         })
     end
 
@@ -189,6 +192,8 @@ function Sync:_SendNeedLogsReq(req, target)
         profileId       = profileId,
         requestId       = req.id,
         missing         = missing,
+        exactAuthor     = self:_IsExactAuthorRepair(meta) or nil,
+        integrityRepair = meta.integrityRepair == true or nil,
         supportedMin    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MIN or nil,
         supportedMax    = SF.SyncProtocol and SF.SyncProtocol.PROTO_MAX or nil,
         addonVersion    = self:_GetAddonVersion(),
@@ -336,20 +341,24 @@ function Sync:_FailRequest(req, reason)
         and self.QueueRepairRanges
     then
         local nextQueueAttempts = math.max(0, tonumber(req.meta.queueAttempts) or 0) + 1
+        local retryRange = {
+            author = req.meta.author,
+            fromCounter = req.meta.fromCounter,
+            toCounter = req.meta.toCounter,
+            mode = req.meta.integrityRepair == true and "integrity" or "missing",
+            preferredTarget = req.meta.preferredTarget or req.lastTarget,
+            exactAuthor = self:_IsExactAuthorRepair(req.meta),
+        }
+        self:_CopyExpectedWindowEvidence(req.meta, retryRange)
         requeued = self:QueueRepairRanges(req.meta.profileId, {
-            {
-                author = req.meta.author,
-                fromCounter = req.meta.fromCounter,
-                toCounter = req.meta.toCounter,
-                mode = req.meta.integrityRepair == true and "integrity" or "missing",
-                preferredTarget = req.meta.preferredTarget or req.lastTarget,
-            }
+            retryRange
         }, {
             mode = req.meta.integrityRepair == true and "integrity" or "missing",
             reason = req.meta.reason or reason or "background-retry",
             preferredTarget = req.meta.preferredTarget or req.lastTarget,
             delaySec = self:_ComputeQueuedRepairBackoffSec(nextQueueAttempts),
             queueAttempts = nextQueueAttempts,
+            exactAuthor = self:_IsExactAuthorRepair(req.meta),
         })
 
         if requeued and SF.Debug then
@@ -382,6 +391,13 @@ function Sync:_FailRequest(req, reason)
             guidance = "Log sync is still in progress; totals may be temporarily incomplete."
         end
         SF:PrintWarning(("Sync request failed (%s). %s"):format(tostring(reason or "unknown"), guidance))
+    end
+
+    if type(self.ConsiderIdentityAdminSideEffects) == "function" then
+        local profileId = (req.meta and req.meta.profileId) or (self.state and self.state.profileId)
+        if type(profileId) == "string" and profileId ~= "" then
+            self:ConsiderIdentityAdminSideEffects(profileId)
+        end
     end
 end
 
@@ -487,6 +503,13 @@ function Sync:CompleteRequest(requestId)
     self:_MObserve("sync.req.attempts_used.kind." .. tostring(req.kind or "UNKNOWN"), tonumber(req.attempt) or 0)
 
     self:_MetricsUpdateRequestQueueGauges()
+
+    if type(self.ConsiderIdentityAdminSideEffects) == "function" then
+        local profileId = (req.meta and req.meta.profileId) or (self.state and self.state.profileId)
+        if type(profileId) == "string" and profileId ~= "" then
+            self:ConsiderIdentityAdminSideEffects(profileId)
+        end
+    end
 
     return true
 end

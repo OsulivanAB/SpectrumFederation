@@ -530,6 +530,132 @@ assertEq(Tracer:GetCopySource(), "Other-Realm", "SetCopySource keeps a non-empty
 Tracer:SetCopySource("")
 assertEq(Tracer:GetCopySource(), nil, "SetCopySource clears an empty selection")
 
+local now = 10
+function GetTime()
+    return now
+end
+
+local afterHandles = {}
+local timerHandles = {}
+local function makeUserdataHandle(delay, fn)
+    local state = {
+        delay = delay,
+        fn = fn,
+        cancelled = false,
+    }
+    local handle = newproxy(true)
+    local mt = getmetatable(handle)
+    mt.__index = function(_, key)
+        if key == "Cancel" then
+            return function()
+                state.cancelled = true
+            end
+        end
+        return state[key]
+    end
+    mt.__newindex = function(_, key, value)
+        state[key] = value
+    end
+    return handle
+end
+C_Timer = {
+    After = function(delay, fn)
+        local handle = {
+            delay = delay,
+            fn = fn,
+            cancelled = false,
+        }
+        afterHandles[#afterHandles + 1] = handle
+        -- Retail C_Timer.After returns nothing.
+        return nil
+    end,
+    NewTimer = function(delay, fn)
+        local handle = makeUserdataHandle(delay, fn)
+        timerHandles[#timerHandles + 1] = handle
+        assert(type(handle) == "userdata", "NewTimer mock must be userdata like Retail FunctionContainer")
+        return handle
+    end,
+    NewTicker = function()
+        error("Mouse Tracer must not create a persistent snapshot ticker")
+    end,
+}
+
+local persistCount = 0
+local copies = {}
+SF.NameUtil = {
+    GetSelfId = function()
+        return "Tester-Realm"
+    end,
+}
+SF.SettingsStore = {
+    Get = function(_, key)
+        if key == "mouseTracerCopies" then
+            return copies
+        end
+        return nil
+    end,
+    Set = function(_, key, value)
+        if key == "mouseTracerCopies" then
+            copies = value
+            persistCount = persistCount + 1
+        end
+    end,
+}
+
+local liveTimers = function()
+    local live = 0
+    for i = 1, #timerHandles do
+        if not timerHandles[i].cancelled then
+            live = live + 1
+        end
+    end
+    return live
+end
+
+Tracer:ScheduleSnapshot()
+Tracer:ScheduleSnapshot()
+assertEq(liveTimers(), 1, "rapid snapshot schedules coalesce to one NewTimer callback")
+assertEq(#afterHandles, 0, "NewTimer path does not fall back to C_Timer.After")
+now = now + 1
+for i = 1, #timerHandles do
+    local handle = timerHandles[i]
+    if not handle.cancelled then
+        handle.cancelled = true
+        handle.fn()
+    end
+end
+assertTrue(persistCount >= 1, "deferred snapshot persists after debounce")
+assertEq(liveTimers(), 0, "snapshot callback clears the pending NewTimer handle")
+
+local persistBeforeDisable = persistCount
+Tracer:ScheduleSnapshot()
+assertEq(liveTimers(), 1, "a new snapshot schedules one NewTimer callback")
+Tracer:ApplyEnabled(false)
+assertEq(liveTimers(), 0, "disabling Mouse Tracer cancels the pending snapshot callback")
+assertTrue(persistCount >= persistBeforeDisable, "disable flushes or cancels snapshot work without leaving a ticker")
+
+Tracer:ApplyEnabled(true)
+assertEq(liveTimers(), 0, "re-enable does not start snapshot work by itself")
+Tracer:ScheduleSnapshot()
+assertEq(liveTimers(), 1, "re-enable still allows a new snapshot debounce")
+Tracer:ApplyEnabled(false)
+assertEq(liveTimers(), 0, "disable after re-enable cancels the new debounce")
+
+C_Timer.NewTimer = nil
+afterHandles = {}
+timerHandles = {}
+local persistBeforeAfterFallback = persistCount
+Tracer:ScheduleSnapshot()
+Tracer:ScheduleSnapshot()
+assertEq(#afterHandles, 1, "After fallback coalesces rapid schedules to one callback")
+assertEq(#timerHandles, 0, "After fallback does not create NewTimer handles")
+Tracer:ApplyEnabled(false)
+assertEq(#afterHandles, 1, "After fallback cannot cancel the scheduled callback object")
+local persistAfterDisable = persistCount
+afterHandles[1].fn()
+assertEq(persistCount, persistAfterDisable, "cancelled After fallback callback does not persist after disable")
+assertTrue(persistCount >= persistBeforeAfterFallback, "After fallback disable still flushes or skips leftover work")
+
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then
     os.exit(1)

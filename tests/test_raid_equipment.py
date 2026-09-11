@@ -14,6 +14,12 @@ POLICY = REPO_ROOT / "SpectrumFederation" / "modules" / "RaidEquipment" / "Polic
 CHECK_RUN = REPO_ROOT / "SpectrumFederation" / "modules" / "RaidEquipment" / "CheckRun.lua"
 POLICY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_policy_tests.lua"
 RUN_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_run_tests.lua"
+FRESH_SNAPSHOT_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_fresh_snapshot_tests.lua"
+STABILITY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_stability_tests.lua"
+SCHEMA = REPO_ROOT / "SpectrumFederation" / "modules" / "Settings" / "Schema.lua"
+RAID_EQUIPMENT_PAGE = (
+    REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "RaidEquipment.lua"
+)
 
 
 def _lua51() -> str:
@@ -48,6 +54,21 @@ def test_raid_equipment_policy_production_lua():
 def test_raid_check_run_production_lua():
     _run_lua(RUN_TESTS, "Raid Check run")
     assert CHECK_RUN.exists()
+
+
+def test_raid_equipment_fresh_install_snapshot_production_lua():
+    _run_lua(FRESH_SNAPSHOT_TESTS, "Raid Equipment fresh snapshot")
+    assert RAID_EQUIPMENT_PAGE.exists()
+
+
+def test_raid_equipment_stability_production_lua():
+    _run_lua(STABILITY_TESTS, "Raid Equipment stability")
+    assert RAID_EQUIPMENT_PAGE.exists()
+
+
+def test_raid_equipment_auto_refresh_defaults_off():
+    schema = SCHEMA.read_text(encoding="utf-8")
+    assert "raidCheckAuditAutoRefresh = false" in schema
 
 
 def test_parent_toc_loads_raid_equipment_modules():

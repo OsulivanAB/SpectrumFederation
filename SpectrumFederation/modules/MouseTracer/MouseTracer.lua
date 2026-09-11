@@ -119,7 +119,37 @@ function Tracer:PersistSnapshot()
 	end
 end
 
+local snapshotTimerGen = 0
+
+local function CancelSnapshotTimer()
+	snapshotTimerGen = snapshotTimerGen + 1
+	local handle = snapshotTicker
+	snapshotTicker = nil
+	if not handle then
+		return
+	end
+	-- Retail NewTimer returns FunctionContainer userdata, not a table.
+	pcall(function() handle:Cancel() end)
+end
+
+-- C_Timer.After does not return a cancellable handle. Prefer NewTimer, and
+-- keep a pending marker plus generation so After callbacks can still coalesce
+-- and become no-ops after cancel/disable.
+local function StartSnapshotTimer(delay, callback)
+	if C_Timer and C_Timer.NewTimer then
+		snapshotTicker = C_Timer.NewTimer(delay, callback)
+		return snapshotTicker ~= nil
+	end
+	if C_Timer and C_Timer.After then
+		snapshotTicker = { after = true }
+		C_Timer.After(delay, callback)
+		return true
+	end
+	return false
+end
+
 function Tracer:FlushSnapshot()
+	CancelSnapshotTimer()
 	snapshotDirty = false
 	self:PersistSnapshot()
 end
@@ -127,18 +157,36 @@ end
 function Tracer:ScheduleSnapshot()
 	snapshotDirty = true
 	snapshotDue = Now() + C.SNAPSHOT_DEBOUNCE
-	if snapshotTicker or not (C_Timer and C_Timer.NewTicker) then
+	if snapshotTicker then
 		return
 	end
-	snapshotTicker = C_Timer.NewTicker(C.SNAPSHOT_TICKER_INTERVAL, function()
+
+	local gen = snapshotTimerGen
+
+	local function FireSnapshot()
+		if gen ~= snapshotTimerGen then
+			return
+		end
+		snapshotTicker = nil
 		if not snapshotDirty then
 			return
 		end
-		if Now() >= snapshotDue then
-			snapshotDirty = false
-			Tracer:PersistSnapshot()
+		local remaining = snapshotDue - Now()
+		if remaining > 0.01 then
+			if not StartSnapshotTimer(remaining, FireSnapshot) then
+				snapshotDirty = false
+				Tracer:PersistSnapshot()
+			end
+			return
 		end
-	end)
+		snapshotDirty = false
+		Tracer:PersistSnapshot()
+	end
+
+	if not StartSnapshotTimer(C.SNAPSHOT_DEBOUNCE, FireSnapshot) then
+		snapshotDirty = false
+		self:PersistSnapshot()
+	end
 end
 
 local function HideStamp(idx)
@@ -342,6 +390,7 @@ local function EnsurePool()
 end
 
 local function StopRuntime()
+	CancelSnapshotTimer()
 	if host then
 		host:SetScript("OnUpdate", nil)
 		host:Hide()

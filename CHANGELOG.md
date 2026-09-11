@@ -2,6 +2,85 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.2] - 2026-09-11
+
+### Changed
+- Stop Raid Equipment freeze and idle refresh-cycle risks
+
+## [1.5.1] - 2026-09-11
+
+### Fixed
+- Sync protocol incompatibility warnings print once per peer instead of repeating for every mixed-version raid message
+
+## [1.5.0] - 2026-09-11
+
+### Added
+- Linked Characters for Loot Helper profiles: admins can link and unlink characters so they share identity-wide points, Attendance, and equipment opportunity state while remaining separate roster members
+- `CHARACTER_LINK` and `CHARACTER_UNLINK` loot-log events, including per-LINK contemporaneous admin evidence and `preOpAuthorMax` writer-observed heads
+- Identity-scoped equipment corrections that record `identityMembers` at write time
+- Optional `sourceLogId` on auto-generated `ADMIN_ADDED` grants so Replay can drop a grant whose source LINK is skipped
+
+### Changed
+- Replace live Main Swap / Transfer Main with Linked Characters
+- Points, Attendance, and equipment opportunity state are projected from the linked identity instead of a single character cache
+
+### Fixed
+- Guarded repair for the historical Main Swap stale-fingerprint rewrite, without blessing unrelated mismatches
+- Non-owner admins can link and unlink identities that do not include the canonical owner
+- Live `NEW_LOG` relationship events that modify the owner's identity require the effective owner, including when the sender is a canonical admin
+- Live relationship `NEW_LOG` payloads are domain-validated at the receiving trust boundary; bulk/snapshot/`AUTH_LOGS` repair can still reconstruct authoritative legacy history
+- Effective-owner alts can create and sync loot-mode changes without becoming general admins
+- Coordinator identity-admin reconciliation waits until contiguous history, known author maxima, `_adminConvergence`, and repair work are complete, then resumes when those blockers finish
+- Live `CHARACTER_LINK` / `CHARACTER_UNLINK` creation (`LootLog.new`, profile APIs, and `NEW_LOG`) requires canonical admin authorization, plus effective owner when the relationship touches the owner identity
+- Lone live `NEW_LOG` fingerprint mismatches stay strict; MAIN_SWAP fingerprint repair is opt-in for batch import, snapshot, and `AUTH_LOGS`
+- Linked identities pack active ring and trinket usages chronologically; singletons keep original local slots
+- Linked Character and admin Name-Realm fields accept hyphenated realms and use `NameUtil` equality
+- Canonical admin add/remove fails closed when the required log cannot be written
+- Eager admin grants after a live LINK apply only to that LINK's resulting identity
+- Overflow warnings fire only when a live LINK introduces a new identifiable conflict
+- Linked Characters dialog uses Character 1 / Character 2 labels, and unlink asks for confirmation
+- Identity projection is cached per profile and reused for helpers, UI reads, and live point/Attendance fan-out
+- Out-of-order point or Attendance inserts replay identity totals instead of fan-out through the Attendance zero floor
+- Live relationship authorization uses deterministic pre-operation history and defers when predecessor logs are missing
+- `Identity.Replay` is the relationship authorization source of truth: live receipt, bulk/`AUTH_LOGS` repair, and reload skip unauthorized `CHARACTER_LINK` / `CHARACTER_UNLINK` events instead of permanently accepting an unadvertised-predecessor race
+- Live `NEW_LOG` rebuilds do not persist implied `ADMIN_ADDED` grants, so a coordinator cannot lock in admin side effects from a relationship that Replay later skips
+- Live relationship `NEW_LOG` is strictly deserialized and baseline-admin authorized before it can enter pending or repair state
+- Deferred live relationship work is scoped to the originating session and discarded across session reset, new session, and persisted restore
+- Admin-convergence target maxima survive AUTH_LOGS timeout so identity-admin reconciliation cannot run against incomplete advertised history
+- Later live LINK does not retroactively grant MAIN_SWAP-restored non-admin sources; canonical admin implication crosses only the pre-link boundary
+- Identity-scoped equipment corrections no longer erase later character-local actions after unlink/relink
+- Overflow warnings detect increased conflict multiplicity per slot/family, not only new conflict keys
+- Live relationship `NEW_LOG` requires the network sender to match the relationship log author
+- Auto-admin grants from `LinkCharacters` / reconcile are causally bound to the source LINK via `sourceLogId`
+- Replay uses writer-observed `preOpAuthorMax` as causal predecessors so same-timestamp admin grants authorize the LINK that observed them
+- Frozen `_legacyCanonicalAdmins` preserve Main Swap / snapshot admins that have no grant log, without letting a later `ADMIN_ADDED` authorize older relationships
+- Identity-scoped equipment corrections apply to contributions from their recorded `identityMembers`; AVAILABLE suppresses that scope without clearing another identity's scoped USED, and later joiners do not resurrect suppressed insider locals
+- Identity-scoped equipment corrections expire permanently after any original-scope split; later relink does not resurrect them
+- A later current-identity equipment correction supersedes earlier overlapping subset-scope state for that slot or ring/trinket family
+- A later current-identity correction on a different slot does not collapse disjoint same-slot contributions into latest-wins
+- Independent scoped ring and trinket usages pack into opportunity 1 then 2 before overflow when identities merge
+- Equipment chronology uses `OrderLogs` causal rank rather than the raw `CompareLogs` tie-break
+- `ADMIN_ADDED.sourceLogId` is a causal predecessor of the sourced grant
+- A skipped sourced `ADMIN_ADDED` is rejected provenance, not missing evidence, so later `adminMembersAtLink` cannot resurrect that grant
+- `Identity.OrderLogs` uses a ready min-heap, O(1) successor-edge dedup, and canonical author keys; `SnapshotPreOpAuthorMax` deduplicates SamePlayer aliases
+- SamePlayer-equivalent authors share one counter stream for new writes, contiguous catch-up, and LOG_REQ serving
+- `HandleNeedLogs` serving and `HandleAuthLogs` log-row checks use the same SameAuthor match as `HandleLogRequest`, without rewriting historical IDs, authors, or fingerprints
+- In-place integrity `_ReplaceLogById` rebuilds from current log contents; OrderLogs is not cached across rebuilds by table identity
+- MAIN_SWAP-less stale fingerprints can be repaired when a unique attributed source candidate reproduces the stored checksum; unrelated mismatches stay rejected
+- Re-using a displayed equipment opportunity (`AVAILABLE` then `USED`) does not pack historical locals as phantom overflow; independent uses still overflow
+- In-order Attendance fan-out and Replay keep raw identity totals so `1 - 1 - 1 + 1` stays 0 after a force Replay; displayed Attendance still floors at zero
+- Identity-scoped `ARMOR_CHANGE` snapshots `preOpAuthorMax` in `LootLog.new`; Replay ignores identity equipment written while those members were not actually unified
+- Redundant concurrent LINKs remain valid history but do not propagate admin across an already-unified component
+- Characters named only in historical awards with no `MAIN_SWAP` lineage restore as unlinked shells with an admin warning
+- `MAIN_SWAP` validation accepts hyphenated realms through `NameUtil`
+- Overlapping historical SameAuthor rows at one logical counter are discovered by normal missing-range and partial-window integrity repair without rewriting `_author`, `_id`, or fingerprints
+- `Identity.OrderLogs` keeps every immutable row at a logical author counter so `preOpAuthorMax` and logical `N+1` wait for all retained alias rows at frontier `N`
+- Session `authorMax` stays a raw `_author` -> retained-counter map; SameAuthor merge no longer advertises phantom historical maxima such as `owner-Garona:7`
+- `BuildAdminStatus.hasGaps` scores logical sequential presence so alias continuation is not treated as a gappy raw stream
+- Exact raw-author repair (`exactAuthor`) is distinct from logical SameAuthor catch-up through discovery, routing, NEED_LOGS/LOG_REQ serving, AUTH_LOGS validation, and request satisfaction; a helper that only has a sibling alias cannot complete `owner-Garona:1`
+- Exact-author and integrity satisfaction require the advertiser's raw-window count/checksum/maxCounter; a later retained row, empty payload, or helper subset cannot complete an earlier window
+- Exact missing requests do not suppress overlapping exact integrity repairs that may need trusted fingerprint replacement
+
 ## [1.4.1] - 2026-09-07
 
 ### Added

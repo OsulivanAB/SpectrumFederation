@@ -26,6 +26,8 @@ Profile members show their class or specialization icon, class-colored name, a m
 
 When you are in a raid, the window also identifies raid members who are not in the active profile. An admin can add them with the plus button. The **Show Members not in raid** setting controls whether absent profile members remain visible.
 
+Linked characters remain separate rows. When both are visible, identity-wide totals match while character-specific history stays distinct.
+
 ## Admin actions
 
 Profile admins can:
@@ -37,7 +39,7 @@ Profile admins can:
 - change the profile's point name in Point Based;
 - add or subtract Reward Pot gold and configure the pot in Reward Pot;
 - add or remove admins;
-- transfer one character's history to another with **Main Swap**;
+- link characters so they share identity-wide points, Attendance, and equipment opportunity state;
 - configure and run Raid Checks;
 - start sync sessions and, when acting as coordinator, end them.
 
@@ -70,6 +72,10 @@ Select the equipment button on a member row to open the equipment window. It tra
 
 This is profile history, not a live inspection of equipped items. Admins toggle a category when the member uses or regains that loot opportunity. Toggling creates an equipment-history log entry and does not change loot points or Attendance.
 
+Linked characters share the projected equipment opportunity state. Unmarked historical equipment changes stay character-local and are aggregated after reconstruction. New shared corrections record the linked membership at write time. They stay active while those original members remain together, including when other characters join or leave. If any original member is split from the others, that correction expires permanently and does not return if the same characters are linked again. A later correction on a newly expanded identity replaces earlier overlapping subset-scope state for that slot. Independent identities that later merge still combine their equipment histories: two scoped ring or trinket uses fill the two shared opportunities before overflowing.
+
+Manual Ring 1 / Ring 2 and Trinket 1 / Trinket 2 clicks target the displayed slot. An empty Ring 1 is not filled automatically by a Ring 2 click.
+
 The separate [Raid Check](raid-check.md) **Raid Equipment** page inspects current gear for enchants and gems.
 
 ## Profiles
@@ -91,11 +97,24 @@ Deleting a profile removes it from this client. During an active sync session, o
 
 The current **Reset Current Profile** action is a placeholder and does not reset profile settings. **Reset All LootHelper Settings** deletes local profiles and clears the active selection; it does not restore every general Loot Helper option.
 
-## Main Swap
+## Linked Characters
 
-**Transfer Points / Main Swap** consolidates an old profile character into another existing profile member. It rewrites relevant point, Attendance, and equipment history to the target, removes the source member, and records the operation in Loot Logs.
+**Link Characters** joins two existing profile members into one identity. They keep separate roster rows and character-attributed history. Points, Attendance, and equipment opportunity state are projected across the current linked group.
 
-Both source and target must already be profile members. Review the selected names carefully; this is an admin-only data migration, not a temporary display preference.
+Admins can:
+
+- link two characters;
+- add a character to an existing linked identity by linking it to any current member;
+- see current linked groups;
+- unlink a character.
+
+There is no Main or Primary character, and linking does not copy or delete history. Only the effective owner may change the canonical owner's identity. Other admins may manage non-owner identities.
+
+Unlinking asks for confirmation because shared points, Attendance, and equipment opportunity state stop being combined.
+
+Singleton characters keep their local Ring1/Ring2 and Trinket1/Trinket2. Linked identities pack currently-active local ring and trinket usages in log order onto projected Slot 1, then Slot 2, then overflow. Manual identity-scoped clicks still target the displayed projected slot.
+
+Historical **Main Swap** entries remain in Loot Logs as lineage. They are not offered as a live transfer action.
 
 ## Related pages
 

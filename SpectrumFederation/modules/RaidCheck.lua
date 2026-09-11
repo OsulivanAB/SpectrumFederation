@@ -1327,6 +1327,15 @@ function RC:UnregisterTroubleshootingListener(key)
 	state.listeners[key] = nil
 end
 
+function RC:CountTroubleshootingListeners()
+	local state = self:_GetInspectState()
+	local count = 0
+	for _ in pairs(state.listeners or {}) do
+		count = count + 1
+	end
+	return count
+end
+
 function RC:_InvalidateInspectAliases(aliases)
 	local state = self:_GetInspectState()
 	for _, key in ipairs(aliases or {}) do

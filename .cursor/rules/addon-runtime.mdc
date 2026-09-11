@@ -13,3 +13,24 @@ alwaysApply: false
 - Prefer `SF.Debug` for diagnostics and `SF:PrintSuccess/Error/Warning/Info` for user-visible messages.
 - Guard protected UI changes with `InCombatLockdown()` when relevant and prefer `hooksecurefunc` over replacing Blizzard functions.
 - Check `locale/enUS.lua` before introducing new user-facing strings.
+- Inspect existing architecture, callers, and lifecycle before assuming a runtime change is local or safe.
+
+## Client Stability
+
+Preventing World of Warcraft client crashes, freezes, severe UI hangs, runaway execution, and long-session performance degradation is one of the highest priorities when reviewing, auditing, designing, or modifying this addon. This is an engineering requirement, not a generic reminder to consider performance.
+
+Addon Lua runs primarily on the game's UI thread. Work does not need to be literally infinite to freeze the client. Actively consider unbounded loops, callback recursion/re-entrancy, layout/`OnSizeChanged` feedback, `OnShow`/`OnHide` feedback, event→mutation→same-event loops, high-frequency `OnUpdate`, leftover or self-scheduling timers/tickers, duplicate listeners after repeated page opens, addon-message storms, queues that never drain, inspect retry storms, high-frequency full rebuilds, growing frame/texture/animation allocations, large synchronous SavedVariables work, expensive login/reload work, and `pcall` that hides unexpected errors.
+
+Idle means idle: a visible page with no state change, user interaction, or intentionally scheduled task should not continuously rebuild, reflow, inspect, reconstruct databases, schedule refreshes, allocate objects, or broadcast sync traffic unless there is an intentional documented reason.
+
+Repeated open/close, enable/disable, page switches, and resizes must not accumulate listeners, callbacks, timers, frames, textures, deferred work, inspect requests, or sync work. Resource counts should converge.
+
+Queues, retries, debounces, and deferred work should drain to empty and become idle after the producer stops. Investigate work that generates more work.
+
+Shared Settings/UI infrastructure (`Section`, `PageBuilder`, Controls, ScrollFrames, sizing/layout helpers, shared refresh) can affect many pages. Look for re-entrancy and inspect major consumers before declaring those changes safe.
+
+For layout, sizing, callbacks, events, timers, listeners, queues, inspection, or sync changes, prefer tests that assert bounded execution and convergence (refresh count settles, listener count does not grow, same-size resize does no extra work, queue reaches zero, disable leaves no ticker). Use existing Lua 5.1 suites; do not invent counters everywhere.
+
+Unexpected programming errors should remain visible through WoW's error handler / BugGrabber where practical. `pcall` is fine for cleanup; do not turn expected conditions into fatal errors, and do not hide crashes behind protected calls.
+
+Full guidance: `SpectrumFederation/AGENTS.md`.

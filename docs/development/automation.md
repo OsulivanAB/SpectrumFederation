@@ -10,9 +10,9 @@ Spectrum Federation uses a beta-first workflow. Normal pull requests target `bet
 
 - detects whether packaged addon files changed (via `classify_promotion_scope.py`);
 - runs the unified Lua/YAML/Python linter;
-- runs focused Python/Lua tests, including `tests/test_promotion_scope.py`;
+- runs focused Python/Lua tests, including `tests/test_promotion_scope.py`, `tests/test_sync_protocol.py`, and `tests/test_linked_identity.py`;
 - validates package structure;
-- requires a TOC version bump and a non-duplicate beta release only for addon changes;
+- requires a TOC version bump and a non-duplicate beta release only when a packaged addon file changed;
 - builds MkDocs in strict mode.
 
 Documentation-only changes do not require an addon version bump. Packaged-addon detection uses `.github/scripts/classify_promotion_scope.py`, so zip-excluded files such as `*/AGENTS.md` do not count as addon changes.

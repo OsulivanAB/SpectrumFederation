@@ -703,6 +703,6 @@ function Controller:OnEquipmentClicked(model)
     -- Show equipment window
     if LH.EquipmentWindow and LH.EquipmentWindow.ShowForMember then
         local mainFrame = self:GetFrame()
-        LH.EquipmentWindow:ShowForMember(mainFrame, model, memberObj, canAdmin)
+        LH.EquipmentWindow:ShowForMember(mainFrame, model, memberObj, canAdmin, profile)
     end
 end

@@ -12,6 +12,8 @@ These instructions guide GitHub Copilot coding agent and VS Code Agent Mode for 
   - Forgetting the version bump is a blocker; do not submit a PR without it.
 - **Do not bypass CI:** never change workflows/checks to “make it green.”
 - **WoW Lua only:** Lua 5.1 sandbox (no `io`, `os`, Lua 5.2+ features).
+- **Inspect before assuming:** read existing architecture, callers, lifecycle, and persisted data before treating a change as local or safe.
+- **Client stability is a top runtime priority:** preventing WoW client crashes, freezes, severe UI hangs, runaway execution, and long-session degradation is an engineering requirement whenever reviewing, auditing, designing, or modifying addon runtime code. Addon Lua runs on the UI thread; work does not need to be infinite to freeze the client. Idle features should become idle. Repeated lifecycle operations and queues must converge. Shared Settings/UI infrastructure needs extra re-entrancy review. Prefer bounded-execution tests for layout/timer/listener/queue/sync changes. Unexpected errors should remain visible via the normal error handler / BugGrabber. Full guidance: `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`. This does not replace compatibility, functionality preservation, or minimal targeted changes.
 
 ## Branch policy (Copilot + agents)
 - **All Copilot coding agent work MUST start from `beta` and open a PR targeting `beta`.**
