@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import io
 import json
+import subprocess
+import sys
 from pathlib import Path
 from urllib import error as urllib_error
 
@@ -719,3 +722,120 @@ def test_dry_run_validates_wago_before_simulated_github(tmp_path, monkeypatch, c
     assert result is False
     assert order == ["wago-plan"]
     assert "GitHub release succeeded, but Wago publication failed" not in captured.out
+
+
+def _write_packaged_tocs(root, version):
+    names = ["SpectrumFederation", *validate_packaging.CHILD_ADDON_NAMES]
+    for name in names:
+        addon_dir = root / name
+        addon_dir.mkdir()
+        (addon_dir / f"{name}.toc").write_text(
+            f"## Version: {version}\n## X-Wago-ID: BNBmnlGx\n",
+            encoding="utf-8",
+        )
+    return names
+
+
+def test_create_addon_zip_uses_canonical_packaging_command(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    names = _write_packaged_tocs(tmp_path, "1.5.3-beta.1")
+    captured = {}
+
+    def fake_run(cmd, check=True, capture_output=True):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(publish.subprocess, "run", fake_run)
+    zip_path = publish.create_addon_zip("SpectrumFederation", "1.5.3-beta.1")
+    expected = validate_packaging.zip_create_command(
+        Path("build") / "SpectrumFederation-1.5.3-beta.1.zip",
+        names,
+    )
+    assert captured["cmd"] == expected
+    assert zip_path == Path("build") / "SpectrumFederation-1.5.3-beta.1.zip"
+    assert expected[expected.index("-x") + 1 :] == validate_packaging.ZIP_EXCLUDES
+    for child in validate_packaging.CHILD_ADDON_NAMES:
+        assert child in captured["cmd"]
+
+
+def test_create_test_zip_uses_the_same_canonical_command(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    names = _write_packaged_tocs(tmp_path, "1.5.3-beta.1")
+    captured = {}
+
+    def fake_run(cmd, check=True, capture_output=True):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(validate_packaging.subprocess, "run", fake_run)
+    ok, zip_path = validate_packaging.create_test_zip(names)
+    expected = validate_packaging.zip_create_command(
+        Path("build") / "SpectrumFederation-validation.zip",
+        names,
+    )
+    assert ok is True
+    assert captured["cmd"] == expected
+    assert zip_path == Path("build") / "SpectrumFederation-validation.zip"
+
+
+def test_requested_version_matches_packaged_parent_and_child_tocs(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _write_packaged_tocs(tmp_path, "1.5.3-beta.1")
+    assert publish.requested_version_matches_packaged_toc(
+        "SpectrumFederation", "1.5.3-beta.1"
+    )
+    assert not publish.requested_version_matches_packaged_toc(
+        "SpectrumFederation", "1.5.3-beta.2"
+    )
+    captured = capsys.readouterr()
+    assert "does not match packaged parent TOC" in captured.out
+
+
+def test_requested_version_rejects_child_toc_mismatch(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _write_packaged_tocs(tmp_path, "1.5.3-beta.1")
+    child = validate_packaging.CHILD_ADDON_NAMES[0]
+    (tmp_path / child / f"{child}.toc").write_text(
+        "## Version: 1.5.3-beta.2\n",
+        encoding="utf-8",
+    )
+    assert not publish.requested_version_matches_packaged_toc(
+        "SpectrumFederation", "1.5.3-beta.1"
+    )
+    captured = capsys.readouterr()
+    assert child in captured.out
+    assert "1.5.3-beta.2" in captured.out
+
+
+def test_main_refuses_to_zip_when_requested_version_differs_from_toc(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    _write_packaged_tocs(tmp_path, "1.5.3-beta.2")
+    zipped = []
+    monkeypatch.setattr(
+        publish,
+        "create_addon_zip",
+        lambda *args, **kwargs: zipped.append(args) or Path("missing.zip"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["publish_release.py", "1.5.3-beta.1", "--interface", "120100"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        publish.main()
+    captured = capsys.readouterr()
+    assert exc.value.code == 1
+    assert zipped == []
+    assert "does not match packaged parent TOC" in captured.out
+
+
+def test_publisher_does_not_hardcode_child_addons_or_zip_excludes():
+    create_zip_src = inspect.getsource(publish.create_addon_zip)
+    assert "zip_create_command" in create_zip_src
+    assert "packaged_addon_names" in create_zip_src
+    assert "CursedSurgeTracker" not in create_zip_src
+    assert "RCLootCouncilIntegration" not in create_zip_src
+    assert "AGENTS.md" not in create_zip_src
+    assert "*.git*" not in create_zip_src

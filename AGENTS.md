@@ -33,7 +33,7 @@ This is an engineering requirement, not a generic reminder to consider performan
 
 Addon Lua executes primarily on the game's UI thread. Work does not need to be literally infinite to freeze the client. Feedback loops and high-frequency expensive work can make the client appear frozen even if execution eventually yields.
 
-Canonical runtime guidance lives in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`.
+Canonical runtime guidance lives in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`. For user-visible messages on recurring paths (heartbeats, timers, sync, retries), also read **Anti-spam and repetition** in `SpectrumFederation/AGENTS.md`.
 
 When asked for a code review, technical audit, pre-release review, or architecture review that involves runtime addon behavior, treat client stability as a top review dimension by default, even if the prompt does not mention crashes. Report credible failure mechanisms only: trace callers, lifecycle, bounds, and termination. Do not flag every loop, timer, `OnUpdate`, event handler, or large function as dangerous merely because it exists.
 
@@ -55,6 +55,8 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Run item-aware BiS reconstruction tests (production Lua via lua5.1): `python -m pytest tests/test_bis_reconstruction.py`
 - Run Raid Equipment policy and check-run tests (production Lua via lua5.1): `python -m pytest tests/test_raid_equipment.py`
 - Run PR template validator tests: `python -m pytest tests/test_pr_template.py`
+- Run promotion-scope classification tests: `python -m pytest tests/test_promotion_scope.py`
+- Run TOC version-bump tests: `python -m pytest tests/test_check_version_bump.py`
 
 ## Important Workflows
 
@@ -94,4 +96,6 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`
 - UI layout, timers, listeners, queues, inspection, or sync: prefer the existing Lua 5.1 suite for that area, with assertions that execution stays bounded and converges. See Client Stability in `SpectrumFederation/AGENTS.md`.
 - PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`
+- Promotion-scope classification or `classify_promotion_scope.py`: also run `python -m pytest tests/test_promotion_scope.py`
+- Version bump comparison or `check_version_bump.py`: also run `python -m pytest tests/test_check_version_bump.py`
 - Release classification or Wago publishing: also run `python -m pytest tests/test_publish_release.py`

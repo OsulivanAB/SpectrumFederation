@@ -8,14 +8,14 @@ Spectrum Federation uses a beta-first workflow. Normal pull requests target `bet
 
 `.github/workflows/pr-beta-validation.yml` runs when relevant addon, automation, workflow, or documentation files change. It:
 
-- detects whether packaged addon files changed;
+- detects whether packaged addon files changed (via `classify_promotion_scope.py`);
 - runs the unified Lua/YAML/Python linter;
-- runs `tests/test_settings_navigation.py`, `tests/test_cursed_surge_tracker.py`, `tests/test_mouse_tracer.py`, `tests/test_interface_badge.py`, `tests/test_loot_helper_window.py`, and `tests/test_sync_protocol.py` (installs `lua5.1`);
+- runs focused Python/Lua tests, including `tests/test_promotion_scope.py`, `tests/test_sync_protocol.py`, and `tests/test_linked_identity.py`;
 - validates package structure;
-- requires a TOC version bump and a non-duplicate beta release only for addon changes;
+- requires a TOC version bump and a non-duplicate beta release only when a packaged addon file changed;
 - builds MkDocs in strict mode.
 
-Documentation-only changes do not require an addon version bump.
+Documentation-only changes do not require an addon version bump. Packaged-addon detection uses `.github/scripts/classify_promotion_scope.py`, so zip-excluded files such as `*/AGENTS.md` do not count as addon changes.
 
 ### PRs to main
 
@@ -23,22 +23,31 @@ Documentation-only changes do not require an addon version bump.
 
 `.github/workflows/pr-template-validation.yml` separately validates pull-request template completion. In-game testing must be either marked complete or explicitly marked not applicable. N/A is rejected when packaged addon files changed, or when a TOC change is runtime-affecting, unknown, or not inspectable. Zip-excluded repository files such as `*/AGENTS.md` may still use N/A.
 
-Both branch-validation workflows include `README.md` and `tests/**` in their path filters so documentation and test-only changes still run the matching checks.
+Both branch-validation workflows include `README.md`, `tests/**`, and MkDocs inputs (`docs/**`, `mkdocs.yml`, `overrides/**`, `requirements-docs.txt`) in their path filters.
 
 ## Post-merge beta release
 
-`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**`.
+`.github/workflows/post-merge-beta.yml` is triggered by pushes under the packaged addon trees. Path filters start the workflow; they do not encode individual zip exclusions. The workflow classifies the immutable `github.event.before...github.sha` range with `classify_promotion_scope.py` before any release side effects. Zip-excluded addon-tree files, including `*/AGENTS.md`, do not set `release_required`.
 
-It:
+When `release_required` is false, changelog, README badge, GitHub Release, Wago, and CurseForge side effects are skipped. Lint/packaging/docs validation and merged-branch cleanup still run; they do not depend on a successful publish. A guidance-only addon-tree push can therefore start the workflow, classify as `release_required=false`, skip every release/version job, and still run sanity checks plus merged-branch cleanup.
+
+When `release_required` is true, the workflow:
 
 1. reruns lint, packaging, and documentation validation;
-2. queries Blizzard's beta product for Interface metadata;
-3. updates `CHANGELOG.md`;
-4. updates README badges;
-5. packages the addon zip, writes WowUp `release.json`, creates a GitHub prerelease, and uploads the same zip to Wago as `beta`;
-6. deletes the merged source branch when the release succeeds.
+2. verifies the TOC was bumped against the previous beta tip (`check_version_bump.py --base-commit`) and is not a duplicate release;
+3. queries Blizzard's beta product for Interface metadata;
+4. updates `CHANGELOG.md`;
+5. updates README badges;
+6. checks out the captured push SHA, overlays generated `CHANGELOG.md` / `README.md` from live `beta`, refuses to publish if any packaged addon file has advanced, packages the addon zip, writes WowUp `release.json`, creates a GitHub prerelease, and uploads the same zip to Wago as `beta`;
+7. deletes the merged source branch after a successful or skipped publish, never after a failed one.
+
+Version extraction, duplicate-release checks, and the publisher all use the captured push SHA rather than live `beta`. `publish_release.py` also refuses to create a zip whose requested version does not match the packaged parent and child TOC versions. Concurrency serializes workflow runs, but it does not freeze the `beta` branch; the captured SHA plus packaged-tree verification is what keeps a later push from being published under an earlier version.
+
+A packaged addon change with a forgotten or invalid version fails the workflow instead of silently skipping the beta release.
 
 Docs-only merges do not trigger a beta addon release.
+
+Parent/child addon membership and zip exclusions live in `.github/scripts/validate_packaging.py`. The validation zip, production zip, and release-scope classifier all consume those definitions.
 
 ## Changelog automation
 
@@ -68,7 +77,7 @@ GitHub Models is retired. The script uses Copilot CLI when it is installed, or a
 
 For Promote Beta to Main, the range is the previous stable `vX.Y.Z` tag (or the first parent of the previous promotion merge) through the commit being promoted. Beta changelog sections for the same `X.Y.Z` train are inputs to consolidate; they are not copied one-for-one onto `main`.
 
-The dry-run promotion job fetches `origin/beta`, uses the incoming `update_changelog.py` from beta, and analyzes `HEAD...origin/beta` with the upcoming stable version so the changelog path can be validated without pushing.
+The dry-run promotion job fetches the captured promotion target SHA, uses the incoming `update_changelog.py` from that commit, and analyzes `HEAD...<target SHA>` with the upcoming stable version so the changelog path can be validated without pushing.
 
 ### Safeguards
 
@@ -82,24 +91,59 @@ Deterministic range, validation, and write-safety behavior is covered by `tests/
 
 ## Promote beta to main
 
-`.github/workflows/promote-beta-to-main.yml` is manually dispatched with no inputs. Every run performs a complete local dry-run phase first. The actual phase starts automatically only if all required dry-run jobs succeed.
+`.github/workflows/promote-beta-to-main.yml` is manually dispatched with no inputs. Every run performs a complete local dry-run phase first. The actual phase starts automatically only if all required dry-run jobs succeed, including jobs that were skipped because they were not applicable.
+
+Branch promotion and downstream publishing are separate decisions. Every valid dispatch still promotes the captured `beta` SHA into `main` when that SHA is not already contained in `main`, and fast-forwards `beta` onto current `main` when remote `beta` has not advanced. If the captured target is already an ancestor of `main`, the merge is a no-op: `main` is preserved and `beta` can catch up without an empty promotion commit. Changelog generation, README badge work, stable addon publishing, and MkDocs deployment run only when the promotion scope says they are applicable.
+
+### How promotion scope is determined
+
+The first job captures an immutable range and classifies it with `.github/scripts/classify_promotion_scope.py`. Detect still checks out live `beta` so `HEAD` is the captured target, and it copies the helper from that live checkout first so packaged membership matches the tree being classified. If leftover `beta` predates the helper, it falls back to `origin/main`, then the dispatched workflow commit (`github.sha`). Those SHAs are invariants for the rest of the run, not informational outputs:
+
+1. `promotion_base_sha` is `origin/main` at workflow start.
+2. `promotion_target_sha` is the `beta` HEAD at workflow start.
+3. Changed files are `git diff --name-only` from `merge-base(base, target)` to `target` (`origin/main...beta`). That is the incoming promotion, not later workflow-generated commits.
+
+Before the dry-run merge, the real merge, and the final beta sync, the workflow re-fetches `origin/main` and `origin/beta` and verifies them with `classify_promotion_scope.py --verify-refs`. Merge jobs check out `main`, so they copy that helper from a verified git object. The copy must support `--validate-versions` (and therefore `--decide-merge`): the workflow prefers the captured target SHA and falls back to current `main` when leftover beta predates the flag. Fast-forward jobs likewise copy a helper that supports `--verify-refs`, preferring the dispatched workflow commit, then `origin/main`, then the captured target. Git ancestry, via `--decide-merge`, then decides whether a merge commit is required. `has_incoming_changes` is a changed-file classification and is not used as the merge skip switch. When the captured target is not already contained in `main`, merge and file checkouts use that target SHA, not the live `beta` ref. When it is already contained, the workflow does not manufacture an empty merge commit and does not overlay CHANGELOG/README/TOC files from the older beta target. If either branch has moved unexpectedly, the job fails and tells the maintainer to rerun the promotion so scope and mutation stay aligned.
+
+The script is the source of truth for path classification. Update it when packaged addon roots, zip excludes, or MkDocs inputs change. It does not use AI.
+
+| Flag | Meaning |
+| --- | --- |
+| `addon_changed` | A file that ships in the release zip changed. Addon roots and zip exclusions come from `validate_packaging.py`; `*/AGENTS.md` and `*.git*` are excluded. |
+| `docs_changed` | MkDocs sources changed: `docs/**`, `mkdocs.yml`, `overrides/**`, or `requirements-docs.txt`. |
+| `readme_changed` | `README.md` is in the incoming diff. |
+| `release_required` | Same as `addon_changed`. Incoming packaged addon changes warrant a stable release. Generated TOC/version commits do not create this flag. |
+| `changelog_required` | Same as `release_required`. AI may write the changelog text; it does not decide whether a changelog is needed. |
+| `documentation_deploy_required` | Same as `docs_changed`. Docs-only promotions deploy MkDocs and do not publish an addon release. |
+| `readme_work_required` | Incoming README change or a stable addon release (badge/version updates). |
+
+These flags are independent. Addon plus documentation is `addon_changed=true` and `docs_changed=true`, which requires both a stable release and MkDocs deployment.
+
+| Incoming changes | Promote branches | Changelog | Addon release | MkDocs deploy | README work |
+| --- | --- | --- | --- | --- | --- |
+| Addon only | Yes | Yes | Yes | No | Yes |
+| Docs only | Yes | No | No | Yes | No |
+| Addon + docs | Yes | Yes | Yes | Yes | Yes |
+| README only | Yes | No | No | No | Yes |
+| Workflow/dev only | Yes | No | No | No | No |
+| No downstream-relevant changes | Yes | No | No | No | No |
 
 The workflow:
 
-1. determines whether `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**` differs between `main` and `beta`;
-2. validates lint, packaging, docs, and the appropriate version format;
-3. simulates the merge, metadata changes, docs build, release packaging, and beta synchronization without pushing;
-4. merges `beta` into `main`;
-5. for addon changes, removes `-beta.N`, fetches the live Interface value, updates the changelog, and publishes a stable GitHub Release plus a Wago `stable` upload;
-6. updates README badges;
-7. deploys MkDocs from `main`;
-8. force-with-lease synchronizes `beta` to `main`.
+1. classifies the incoming `main...beta` range and captures the base/target SHAs;
+2. validates lint, packaging, docs, and TOC version format. Addon releases require `X.Y.Z-beta.N` on the captured beta target. Non-addon merges require a stable `X.Y.Z` on that target so a prerelease TOC cannot be overlaid onto `main`. When the captured target is already contained in `main`, the captured main SHA is authoritative and must be stable `X.Y.Z`; the leftover beta checkout may still contain `-beta.N`;
+3. dry-runs only the applicable merge, changelog, README, docs, release, and fast-forward steps without pushing, using the captured target SHA and the same ref-drift checks as the real merge;
+4. re-verifies that `origin/main` and `origin/beta` still match the captured SHAs, then merges the captured target SHA into `main` only when that target is not already contained in `main`;
+5. when `release_required`, removes `-beta.N`, fetches the live Interface value, updates the changelog, verifies the `main` checkout still matches the captured packaged source (TOC rewrites allowed), and publishes a stable GitHub Release plus a Wago `stable` upload;
+6. when `readme_work_required`, updates README badges;
+7. when `documentation_deploy_required`, deploys MkDocs from `main`;
+8. re-verifies that `origin/beta` still equals the captured target and that the target is an ancestor of `origin/main`, then fast-forwards `beta` with a non-force `git push origin origin/main:refs/heads/beta`. Newer beta work is never overwritten.
 
-If there are no addon changes, the promotion preserves the stable version and skips stable release creation while still promoting and deploying non-addon changes.
+Dry-run and real jobs consume the same scope outputs. The dry-run summary prints the detected flags and which operations would run. The final summary compares detected scope, required operations, and actual job results. If a required operation is skipped or fails, or a non-required operation runs, the summary fails the workflow instead of reporting success.
 
 Older instructions that ask for a promotion `dry_run` input are obsolete; the workflow now always validates with its built-in dry-run phase.
 
-The dry-run README job uploads its simulated stable badge output to the dry-run docs job, which applies the simulated stable TOC metadata before calling `validate_docs.py`. The final `main` deployment also calls the validator after generated metadata is pushed.
+When a dry-run README job runs, it uploads its simulated stable badge output to the dry-run docs job, which applies simulated stable TOC metadata before calling `validate_docs.py`. Docs-only dry runs skip that overlay and validate the incoming documentation as-is. The final `main` deployment also calls the validator after generated metadata is pushed.
 
 ## GitHub, CurseForge, and Wago publishing
 
@@ -107,7 +151,7 @@ The dry-run README job uploads its simulated stable badge output to the dry-run 
 
 A live publish does the following, in order:
 
-1. Build the existing release artifacts: the addon zip (`SpectrumFederation/` and `SpectrumFederation_CursedSurgeTracker/` at the zip root) and WowUp Hub `release.json`.
+1. Build the existing release artifacts: the addon zip (parent plus packaged child addons from `validate_packaging.py` at the zip root) and WowUp Hub `release.json`. The publisher refuses to zip when the requested version does not match the packaged TOC versions.
 2. Build release notes from `CHANGELOG.md`.
 3. Create or update the GitHub Release (prerelease for `-beta`, `-alpha`, and `-rc` versions).
 4. After GitHub succeeds, load Wago's catalog, require an exact Retail patch match, and validate Wago project metadata.
@@ -217,6 +261,7 @@ python -m pytest tests/test_interface_badge.py
 | `check_duplicate_release.py` | Reject an existing release version. |
 | `publish_release.py` | Build release artifacts, create or update the GitHub Release, and publish the same zip to Wago. |
 | `update_changelog.py` | Update the beta changelog after merge, or consolidate the main changelog during promotion. |
+| `classify_promotion_scope.py` | Classify a git range or file list into addon/docs/README/infra flags used by promotion and PR addon detection. |
 | `cleanup_merged_branch.py` | Remove the merged source branch after beta release. |
 
 Use the scripts rather than reproducing their logic in ad hoc commands.

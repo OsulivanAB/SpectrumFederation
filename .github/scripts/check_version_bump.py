@@ -113,33 +113,38 @@ def get_current_version(addon_name):
     return version
 
 
-def get_base_version(addon_name, base_ref):
-    """Get version from base branch TOC file."""
+def get_base_version(addon_name, base_ref, commit=None):
+    """Get version from a base branch or explicit commit TOC blob."""
     toc_path = f"{addon_name}/{addon_name}.toc"
-    
+    spec = f"{commit}:{toc_path}" if commit else f"origin/{base_ref}:{toc_path}"
+
     try:
         result = subprocess.run(
-            ["git", "show", f"origin/{base_ref}:{toc_path}"],
+            ["git", "show", spec],
             capture_output=True,
             text=True,
             check=True
         )
         base_content = result.stdout
-        
+
     except subprocess.CalledProcessError:
+        if commit:
+            raise RuntimeError(f"Could not read TOC from {spec}") from None
         print(f"[check-version-bump] No TOC file in base branch origin/{base_ref}, probably first release")
         return None
     
     version = extract_version(base_content)
     
     if not version:
+        if commit:
+            raise RuntimeError(f"No '## Version:' line in {spec}")
         print("[check-version-bump] No '## Version:' in base branch TOC, skipping version bump check")
         return None
     
     return version
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Check if addon version was bumped"
     )
@@ -152,8 +157,12 @@ def main():
         default="SpectrumFederation",
         help="Name of the addon (default: SpectrumFederation)"
     )
+    parser.add_argument(
+        "--base-commit",
+        help="Compare against this commit's TOC instead of origin/<base_ref>",
+    )
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     
     print("[check-version-bump] Checking addon version bump...")
     
@@ -163,7 +172,15 @@ def main():
         sys.exit(1)
     
     # Get base version
-    base_version = get_base_version(args.addon_name, args.base_ref)
+    try:
+        base_version = get_base_version(
+            args.addon_name,
+            args.base_ref,
+            commit=args.base_commit,
+        )
+    except RuntimeError as exc:
+        print(f"::error ::{exc}")
+        sys.exit(1)
     
     # If no base version, this is probably the first release
     if base_version is None:

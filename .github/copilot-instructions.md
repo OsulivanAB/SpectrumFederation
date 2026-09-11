@@ -32,6 +32,7 @@ These instructions guide GitHub Copilot coding agent and VS Code Agent Mode for 
   - Schema/Store/Apply: `SpectrumFederation/modules/Settings/`
   - Settings UI: `SpectrumFederation/modules/UI/Settings/`
 - Use the built-in debug logger (`SpectrumFederation/modules/debug.lua`) instead of chat spam.
+- Proactively evaluate user-visible output for repetition/spam risk on recurring paths (heartbeats, timers, sync, retries). See `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition).
 - Prefer reusing existing settings controls and renderers; don’t introduce a second settings framework.
 
 ## Validation (always do before finalizing)

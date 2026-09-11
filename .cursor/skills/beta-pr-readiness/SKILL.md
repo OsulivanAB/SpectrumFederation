@@ -32,6 +32,8 @@ Use this skill when a task is close to done and you need a repo-specific merge-r
    - `python -m pytest tests/test_linked_identity.py` when linked identities changed
    - `python -m pytest tests/test_bis_reconstruction.py` when item-aware BiS reconstruction changed
    - `python -m pytest tests/test_pr_template.py` when the PR template or `validate_pr_template.py` changed
+   - `python -m pytest tests/test_promotion_scope.py` when promotion workflows or `classify_promotion_scope.py` changed
+   - `python -m pytest tests/test_check_version_bump.py` when version-bump comparison or `check_version_bump.py` changed
 4. If the change touches addon packaging, release logic, or TOC-driven behavior, inspect `SpectrumFederation/SpectrumFederation.toc` before finishing.
 5. If the change involves UI layout, sizing, callbacks, events, timers, listeners, queues, inspection, or synchronization, confirm the existing Lua 5.1 suite for that area covers bounded execution and convergence where practical. Do not invent counters everywhere; follow `SpectrumFederation/AGENTS.md` Client Stability.
 6. When filling the PR template, follow `.cursor/rules/pr-template.mdc`: never check **I have tested these changes in-game**; check **In-game testing is not applicable** only when there are no packaged addon/runtime changes except allowlisted TOC metadata or proven non-shipped files; always check **WoW Client Type → Retail**; never check linked issues unless the user provided the link. Do not claim in-game testing was performed when it was not.
