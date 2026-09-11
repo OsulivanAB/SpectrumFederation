@@ -139,8 +139,17 @@ local CLASS_WEAPON_SUBCLASS = {
 -- Spec combat-weapon subclasses. Distinct from class proficiency and from
 -- FLAGS slot occupancy. When a spec has an entry, BiS combat assignment
 -- requires that subclass even if the class can technically equip it.
--- Specs omitted here use the class proficiency set.
-local MELEE_NO_RANGED = Subset(AXE1H, AXE2H, MACE1H, MACE2H, POLEARM, SWORD1H, SWORD2H, STAFF, FIST, DAGGER)
+-- Unknown specs stay fail-closed via FLAGS. Specs listed here are current
+-- Retail/Midnight combat requirements, not "the class can equip this."
+local WARRIOR_2H = Subset(AXE2H, MACE2H, POLEARM, STAFF, SWORD2H)
+local WARRIOR_FURY = Subset(AXE1H, AXE2H, MACE1H, MACE2H, POLEARM, STAFF, SWORD1H, SWORD2H, FIST)
+local WARRIOR_1H = Subset(AXE1H, MACE1H, SWORD1H, FIST)
+local PALADIN_2H = Subset(AXE2H, MACE2H, POLEARM, SWORD2H)
+local PALADIN_1H = Subset(AXE1H, MACE1H, SWORD1H)
+local DK_2H = Subset(AXE2H, MACE2H, POLEARM, SWORD2H)
+local DK_FROST = Subset(AXE1H, AXE2H, MACE1H, MACE2H, POLEARM, SWORD1H, SWORD2H)
+local DRUID_CAT_BEAR = Subset(MACE2H, POLEARM, STAFF)
+local MONK_MELEE = Subset(AXE1H, MACE1H, SWORD1H, POLEARM, STAFF, FIST)
 local HUNTER_RANGED = Subset(BOW, GUN, CROSSBOW)
 -- Survival combat weapons follow current Midnight ability requirements:
 -- 1H/2H axes and swords, polearms, staves, and daggers. Class proficiency
@@ -150,16 +159,57 @@ local ROGUE_DAGGER = Subset(DAGGER)
 local ROGUE_OUTLAW = Subset(AXE1H, MACE1H, SWORD1H, FIST, DAGGER)
 local SHAMAN_ENHANCE = Subset(AXE1H, MACE1H, FIST, DAGGER)
 local SPEC_COMBAT_SUBCLASS = {
-    [71] = MELEE_NO_RANGED,
-    [72] = MELEE_NO_RANGED,
-    [73] = MELEE_NO_RANGED,
+    -- Warrior: Arms Mortal Strike is 2H; Protection is 1H+shield; Fury is 1H or Titan's Grip 2H.
+    [71] = WARRIOR_2H,
+    [72] = WARRIOR_FURY,
+    [73] = WARRIOR_1H,
+    -- Paladin: Retribution Templar's Verdict is 2H; Protection is 1H+shield; Holy uses the class set.
+    [65] = CLASS_WEAPON_SUBCLASS.PALADIN,
+    [66] = PALADIN_1H,
+    [70] = PALADIN_2H,
+    -- Hunter
     [253] = HUNTER_RANGED,
     [254] = HUNTER_RANGED,
     [255] = HUNTER_SURVIVAL,
+    -- Rogue
     [259] = ROGUE_DAGGER,
     [260] = ROGUE_OUTLAW,
     [261] = ROGUE_DAGGER,
+    -- Priest / Mage / Warlock: class proficiency is the combat set.
+    [256] = CLASS_WEAPON_SUBCLASS.PRIEST,
+    [257] = CLASS_WEAPON_SUBCLASS.PRIEST,
+    [258] = CLASS_WEAPON_SUBCLASS.PRIEST,
+    [62] = CLASS_WEAPON_SUBCLASS.MAGE,
+    [63] = CLASS_WEAPON_SUBCLASS.MAGE,
+    [64] = CLASS_WEAPON_SUBCLASS.MAGE,
+    [265] = CLASS_WEAPON_SUBCLASS.WARLOCK,
+    [266] = CLASS_WEAPON_SUBCLASS.WARLOCK,
+    [267] = CLASS_WEAPON_SUBCLASS.WARLOCK,
+    -- Death Knight: Blood/Unholy Scourge Strike and Heart Strike are 2H; Frost dual-wields 1H or 2H.
+    [250] = DK_2H,
+    [251] = DK_FROST,
+    [252] = DK_2H,
+    -- Shaman: Enhancement is dual-wield 1H (including daggers); Ele/Resto use the class set.
+    [262] = CLASS_WEAPON_SUBCLASS.SHAMAN,
     [263] = SHAMAN_ENHANCE,
+    [264] = CLASS_WEAPON_SUBCLASS.SHAMAN,
+    -- Monk: Brewmaster/Windwalker 1H or staff/polearm; Mistweaver uses the class set.
+    [268] = MONK_MELEE,
+    [269] = MONK_MELEE,
+    [270] = CLASS_WEAPON_SUBCLASS.MONK,
+    -- Druid: Feral/Guardian combat is 2H mace/polearm/staff; Balance/Resto use the class set.
+    [102] = CLASS_WEAPON_SUBCLASS.DRUID,
+    [103] = DRUID_CAT_BEAR,
+    [104] = DRUID_CAT_BEAR,
+    [105] = CLASS_WEAPON_SUBCLASS.DRUID,
+    -- Demon Hunter: class 1H glaives/axes/swords/fists.
+    [577] = CLASS_WEAPON_SUBCLASS.DEMONHUNTER,
+    [581] = CLASS_WEAPON_SUBCLASS.DEMONHUNTER,
+    [1480] = CLASS_WEAPON_SUBCLASS.DEMONHUNTER,
+    -- Evoker: class 1H axe/mace/sword/fist/dagger, 2H mace, staff. Not 2H swords.
+    [1467] = CLASS_WEAPON_SUBCLASS.EVOKER,
+    [1468] = CLASS_WEAPON_SUBCLASS.EVOKER,
+    [1473] = CLASS_WEAPON_SUBCLASS.EVOKER,
 }
 
 -- Fallback display names when GetSpecializationInfoByID is unavailable.
