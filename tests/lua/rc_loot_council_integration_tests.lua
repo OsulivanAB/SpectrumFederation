@@ -1768,6 +1768,49 @@ assertEq(o2, o1, "peer C matches coordinator outcome")
 assertEq(o3, o1, "peer D matches coordinator outcome")
 SF.LootHelperComm = nil
 
+resetEnv()
+local seqGuard = makeProfile("SeqGuard")
+addMember(seqGuard, WINNER)
+assertTrue(seqGuard:ApplyRCLootCouncilIntegrationConfig({
+    recordAwards = true,
+    recordAllAwardTypes = true,
+    allowedResponses = {},
+    bisResponses = {
+        { text = "Greed", typeCode = "default", responseId = 2, isAwardReason = false },
+    },
+}, { skipPermission = true, skipSync = true }), "seed newer RC config")
+seqGuard._rcConfigSeq = 2
+local staleSnap = seqGuard:ExportSnapshot()
+staleSnap.rcConfigSeq = 1
+staleSnap.rcLootCouncilIntegration = {
+    recordAwards = true,
+    recordAllAwardTypes = false,
+    allowedResponses = { "Need" },
+    bisResponses = {
+        { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+    },
+}
+assertTrue((select(1, seqGuard:ImportSnapshot(staleSnap))), "stale trusted snapshot still imports")
+assertEq(seqGuard._rcConfigSeq, 2, "stale snapshot cannot lower rcConfigSeq")
+assertTrue(seqGuard:IsBisQualifyingResponse("Greed", {
+    typeCode = "default",
+    responseId = 2,
+    isAwardReason = false,
+}), "stale snapshot cannot regress bisResponses")
+assertFalse(seqGuard:IsBisQualifyingResponse("Need", {
+    typeCode = "default",
+    responseId = 1,
+    isAwardReason = false,
+}), "stale snapshot cannot replace the newer BiS list")
+staleSnap.rcConfigSeq = 3
+assertTrue((select(1, seqGuard:ImportSnapshot(staleSnap))), "newer snapshot seq is accepted")
+assertEq(seqGuard._rcConfigSeq, 3, "newer snapshot advances rcConfigSeq")
+assertTrue(seqGuard:IsBisQualifyingResponse("Need", {
+    typeCode = "default",
+    responseId = 1,
+    isAwardReason = false,
+}), "newer snapshot may update RC config")
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

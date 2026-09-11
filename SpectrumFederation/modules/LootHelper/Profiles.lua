@@ -3560,22 +3560,29 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	self:_EnsureRewardPotConfig()
 	self:_EnsureRCLootCouncilIntegrationConfig()
 
-	if type(snapshot.rcLootCouncilIntegration) == "table" then
-		if snapshot.rcLootCouncilIntegration.recordAwards ~= nil then
-			self._rcLootCouncilIntegration.recordAwards = snapshot.rcLootCouncilIntegration.recordAwards and true or false
-		end
-		if snapshot.rcLootCouncilIntegration.recordAllAwardTypes ~= nil then
-			self._rcLootCouncilIntegration.recordAllAwardTypes = snapshot.rcLootCouncilIntegration.recordAllAwardTypes and true or false
-		end
-		if type(snapshot.rcLootCouncilIntegration.allowedResponses) == "table" then
-			self._rcLootCouncilIntegration.allowedResponses = CopyAllowedResponses(snapshot.rcLootCouncilIntegration.allowedResponses)
-		end
-		if type(snapshot.rcLootCouncilIntegration.bisResponses) == "table" then
-			self._rcLootCouncilIntegration.bisResponses = CopyBisResponses(snapshot.rcLootCouncilIntegration.bisResponses)
-		end
-	end
+	local incomingSeq = 0
 	if type(snapshot.rcConfigSeq) == "number" then
-		self._rcConfigSeq = math.floor(snapshot.rcConfigSeq)
+		incomingSeq = math.floor(snapshot.rcConfigSeq)
+	end
+	local localSeq = tonumber(self._rcConfigSeq) or 0
+	-- Trusted snapshots remain authoritative for joiners, but must not rewind
+	-- a newer coordinator-serialized RC_CONFIG_SET already applied locally.
+	if incomingSeq >= localSeq then
+		if type(snapshot.rcLootCouncilIntegration) == "table" then
+			if snapshot.rcLootCouncilIntegration.recordAwards ~= nil then
+				self._rcLootCouncilIntegration.recordAwards = snapshot.rcLootCouncilIntegration.recordAwards and true or false
+			end
+			if snapshot.rcLootCouncilIntegration.recordAllAwardTypes ~= nil then
+				self._rcLootCouncilIntegration.recordAllAwardTypes = snapshot.rcLootCouncilIntegration.recordAllAwardTypes and true or false
+			end
+			if type(snapshot.rcLootCouncilIntegration.allowedResponses) == "table" then
+				self._rcLootCouncilIntegration.allowedResponses = CopyAllowedResponses(snapshot.rcLootCouncilIntegration.allowedResponses)
+			end
+			if type(snapshot.rcLootCouncilIntegration.bisResponses) == "table" then
+				self._rcLootCouncilIntegration.bisResponses = CopyBisResponses(snapshot.rcLootCouncilIntegration.bisResponses)
+			end
+		end
+		self._rcConfigSeq = incomingSeq
 	end
 
 	-- Import loot mode / Reward Pot config only when the snapshot actually contains them.
