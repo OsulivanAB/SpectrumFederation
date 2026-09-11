@@ -119,13 +119,31 @@ function Tracer:PersistSnapshot()
 	end
 end
 
+local snapshotTimerGen = 0
+
 local function CancelSnapshotTimer()
-	if snapshotTicker then
-		if snapshotTicker.Cancel then
-			pcall(function() snapshotTicker:Cancel() end)
-		end
-		snapshotTicker = nil
+	snapshotTimerGen = snapshotTimerGen + 1
+	local handle = snapshotTicker
+	snapshotTicker = nil
+	if type(handle) == "table" and handle.Cancel then
+		pcall(function() handle:Cancel() end)
 	end
+end
+
+-- C_Timer.After does not return a cancellable handle. Prefer NewTimer, and
+-- keep a pending marker plus generation so After callbacks can still coalesce
+-- and become no-ops after cancel/disable.
+local function StartSnapshotTimer(delay, callback)
+	if C_Timer and C_Timer.NewTimer then
+		snapshotTicker = C_Timer.NewTimer(delay, callback)
+		return snapshotTicker ~= nil
+	end
+	if C_Timer and C_Timer.After then
+		snapshotTicker = { after = true }
+		C_Timer.After(delay, callback)
+		return true
+	end
+	return false
 end
 
 function Tracer:FlushSnapshot()
@@ -137,25 +155,36 @@ end
 function Tracer:ScheduleSnapshot()
 	snapshotDirty = true
 	snapshotDue = Now() + C.SNAPSHOT_DEBOUNCE
-	if snapshotTicker or not (C_Timer and C_Timer.After) then
+	if snapshotTicker then
 		return
 	end
 
+	local gen = snapshotTimerGen
+
 	local function FireSnapshot()
+		if gen ~= snapshotTimerGen then
+			return
+		end
 		snapshotTicker = nil
 		if not snapshotDirty then
 			return
 		end
 		local remaining = snapshotDue - Now()
-		if remaining > 0.01 and C_Timer and C_Timer.After then
-			snapshotTicker = C_Timer.After(remaining, FireSnapshot)
+		if remaining > 0.01 then
+			if not StartSnapshotTimer(remaining, FireSnapshot) then
+				snapshotDirty = false
+				Tracer:PersistSnapshot()
+			end
 			return
 		end
 		snapshotDirty = false
 		Tracer:PersistSnapshot()
 	end
 
-	snapshotTicker = C_Timer.After(C.SNAPSHOT_DEBOUNCE, FireSnapshot)
+	if not StartSnapshotTimer(C.SNAPSHOT_DEBOUNCE, FireSnapshot) then
+		snapshotDirty = false
+		self:PersistSnapshot()
+	end
 end
 
 local function HideStamp(idx)

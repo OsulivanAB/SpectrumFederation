@@ -536,17 +536,28 @@ function GetTime()
 end
 
 local afterHandles = {}
+local timerHandles = {}
+local function makeHandle(delay, fn)
+    local handle = {
+        delay = delay,
+        fn = fn,
+        cancelled = false,
+    }
+    function handle:Cancel()
+        self.cancelled = true
+    end
+    return handle
+end
 C_Timer = {
     After = function(delay, fn)
-        local handle = {
-            delay = delay,
-            fn = fn,
-            cancelled = false,
-        }
-        function handle:Cancel()
-            self.cancelled = true
-        end
+        local handle = makeHandle(delay, fn)
         afterHandles[#afterHandles + 1] = handle
+        -- Retail C_Timer.After returns nothing.
+        return nil
+    end,
+    NewTimer = function(delay, fn)
+        local handle = makeHandle(delay, fn)
+        timerHandles[#timerHandles + 1] = handle
         return handle
     end,
     NewTicker = function()
@@ -576,10 +587,10 @@ SF.SettingsStore = {
     end,
 }
 
-local liveAfter = function()
+local liveTimers = function()
     local live = 0
-    for i = 1, #afterHandles do
-        if not afterHandles[i].cancelled then
+    for i = 1, #timerHandles do
+        if not timerHandles[i].cancelled then
             live = live + 1
         end
     end
@@ -588,24 +599,40 @@ end
 
 Tracer:ScheduleSnapshot()
 Tracer:ScheduleSnapshot()
-assertEq(liveAfter(), 1, "rapid snapshot schedules coalesce to one deferred callback")
+assertEq(liveTimers(), 1, "rapid snapshot schedules coalesce to one NewTimer callback")
+assertEq(#afterHandles, 0, "NewTimer path does not fall back to C_Timer.After")
 now = now + 1
-for i = 1, #afterHandles do
-    local handle = afterHandles[i]
+for i = 1, #timerHandles do
+    local handle = timerHandles[i]
     if not handle.cancelled then
         handle.cancelled = true
         handle.fn()
     end
 end
 assertTrue(persistCount >= 1, "deferred snapshot persists after debounce")
-assertEq(liveAfter(), 0, "snapshot callback clears the pending handle")
+assertEq(liveTimers(), 0, "snapshot callback clears the pending NewTimer handle")
 
 local persistBeforeDisable = persistCount
 Tracer:ScheduleSnapshot()
-assertEq(liveAfter(), 1, "a new snapshot schedules one deferred callback")
+assertEq(liveTimers(), 1, "a new snapshot schedules one NewTimer callback")
 Tracer:ApplyEnabled(false)
-assertEq(liveAfter(), 0, "disabling Mouse Tracer cancels the pending snapshot callback")
+assertEq(liveTimers(), 0, "disabling Mouse Tracer cancels the pending snapshot callback")
 assertTrue(persistCount >= persistBeforeDisable, "disable flushes or cancels snapshot work without leaving a ticker")
+
+C_Timer.NewTimer = nil
+afterHandles = {}
+timerHandles = {}
+local persistBeforeAfterFallback = persistCount
+Tracer:ScheduleSnapshot()
+Tracer:ScheduleSnapshot()
+assertEq(#afterHandles, 1, "After fallback coalesces rapid schedules to one callback")
+assertEq(#timerHandles, 0, "After fallback does not create NewTimer handles")
+Tracer:ApplyEnabled(false)
+assertEq(#afterHandles, 1, "After fallback cannot cancel the scheduled callback object")
+local persistAfterDisable = persistCount
+afterHandles[1].fn()
+assertEq(persistCount, persistAfterDisable, "cancelled After fallback callback does not persist after disable")
+assertTrue(persistCount >= persistBeforeAfterFallback, "After fallback disable still flushes or skips leftover work")
 
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then
