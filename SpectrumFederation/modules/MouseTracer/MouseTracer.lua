@@ -119,7 +119,17 @@ function Tracer:PersistSnapshot()
 	end
 end
 
+local function CancelSnapshotTimer()
+	if snapshotTicker then
+		if snapshotTicker.Cancel then
+			pcall(function() snapshotTicker:Cancel() end)
+		end
+		snapshotTicker = nil
+	end
+end
+
 function Tracer:FlushSnapshot()
+	CancelSnapshotTimer()
 	snapshotDirty = false
 	self:PersistSnapshot()
 end
@@ -127,18 +137,25 @@ end
 function Tracer:ScheduleSnapshot()
 	snapshotDirty = true
 	snapshotDue = Now() + C.SNAPSHOT_DEBOUNCE
-	if snapshotTicker or not (C_Timer and C_Timer.NewTicker) then
+	if snapshotTicker or not (C_Timer and C_Timer.After) then
 		return
 	end
-	snapshotTicker = C_Timer.NewTicker(C.SNAPSHOT_TICKER_INTERVAL, function()
+
+	local function FireSnapshot()
+		snapshotTicker = nil
 		if not snapshotDirty then
 			return
 		end
-		if Now() >= snapshotDue then
-			snapshotDirty = false
-			Tracer:PersistSnapshot()
+		local remaining = snapshotDue - Now()
+		if remaining > 0.01 and C_Timer and C_Timer.After then
+			snapshotTicker = C_Timer.After(remaining, FireSnapshot)
+			return
 		end
-	end)
+		snapshotDirty = false
+		Tracer:PersistSnapshot()
+	end
+
+	snapshotTicker = C_Timer.After(C.SNAPSHOT_DEBOUNCE, FireSnapshot)
 end
 
 local function HideStamp(idx)
@@ -342,6 +359,7 @@ local function EnsurePool()
 end
 
 local function StopRuntime()
+	CancelSnapshotTimer()
 	if host then
 		host:SetScript("OnUpdate", nil)
 		host:Hide()

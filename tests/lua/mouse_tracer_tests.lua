@@ -530,6 +530,83 @@ assertEq(Tracer:GetCopySource(), "Other-Realm", "SetCopySource keeps a non-empty
 Tracer:SetCopySource("")
 assertEq(Tracer:GetCopySource(), nil, "SetCopySource clears an empty selection")
 
+local now = 10
+function GetTime()
+    return now
+end
+
+local afterHandles = {}
+C_Timer = {
+    After = function(delay, fn)
+        local handle = {
+            delay = delay,
+            fn = fn,
+            cancelled = false,
+        }
+        function handle:Cancel()
+            self.cancelled = true
+        end
+        afterHandles[#afterHandles + 1] = handle
+        return handle
+    end,
+    NewTicker = function()
+        error("Mouse Tracer must not create a persistent snapshot ticker")
+    end,
+}
+
+local persistCount = 0
+local copies = {}
+SF.NameUtil = {
+    GetSelfId = function()
+        return "Tester-Realm"
+    end,
+}
+SF.SettingsStore = {
+    Get = function(_, key)
+        if key == "mouseTracerCopies" then
+            return copies
+        end
+        return nil
+    end,
+    Set = function(_, key, value)
+        if key == "mouseTracerCopies" then
+            copies = value
+            persistCount = persistCount + 1
+        end
+    end,
+}
+
+local liveAfter = function()
+    local live = 0
+    for i = 1, #afterHandles do
+        if not afterHandles[i].cancelled then
+            live = live + 1
+        end
+    end
+    return live
+end
+
+Tracer:ScheduleSnapshot()
+Tracer:ScheduleSnapshot()
+assertEq(liveAfter(), 1, "rapid snapshot schedules coalesce to one deferred callback")
+now = now + 1
+for i = 1, #afterHandles do
+    local handle = afterHandles[i]
+    if not handle.cancelled then
+        handle.cancelled = true
+        handle.fn()
+    end
+end
+assertTrue(persistCount >= 1, "deferred snapshot persists after debounce")
+assertEq(liveAfter(), 0, "snapshot callback clears the pending handle")
+
+local persistBeforeDisable = persistCount
+Tracer:ScheduleSnapshot()
+assertEq(liveAfter(), 1, "a new snapshot schedules one deferred callback")
+Tracer:ApplyEnabled(false)
+assertEq(liveAfter(), 0, "disabling Mouse Tracer cancels the pending snapshot callback")
+assertTrue(persistCount >= persistBeforeDisable, "disable flushes or cancels snapshot work without leaving a ticker")
+
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then
     os.exit(1)
