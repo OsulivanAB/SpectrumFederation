@@ -2488,6 +2488,119 @@ local function reviewFindingTests()
         stamp2 = "1700031101",
         stamp3 = "1700031102",
     })
+    packFamily({
+        name = "LegacyRing2Pack",
+        family = "ring",
+        usedSlot = "Ring2",
+        freeSlot = "Ring1",
+        itemId = 19002,
+        stamp1 = "1700031110",
+        stamp2 = "1700031111",
+        stamp3 = "1700031112",
+    })
+    packFamily({
+        name = "LegacyTrinket2Pack",
+        family = "trinket",
+        usedSlot = "Trinket2",
+        freeSlot = "Trinket1",
+        itemId = 19003,
+        stamp1 = "1700031120",
+        stamp2 = "1700031121",
+        stamp3 = "1700031122",
+    })
+
+    local function packLinkedFamily(opts)
+        resetEnv()
+        local p = makeProfile(opts.name)
+        addMember(p, ALT_A)
+        addMember(p, ALT_B)
+        addLog(p, "ARMOR_CHANGE", { member = ALT_A, slot = opts.usedSlot, action = "USED" })
+        assertTrue(p:LinkCharacters(ALT_A, ALT_B), opts.name .. " links")
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(p, ALT_A, opts.displayedSlot), "LEGACY_UNKNOWN", "linked packing displays legacy on " .. opts.displayedSlot)
+        assertEq(slotState(p, ALT_A, opts.freeSlot), "AVAILABLE", "linked packing leaves " .. opts.freeSlot .. " free")
+        local vis = p:GetIdentityLegacyOrigins(ALT_A)
+        local rec
+        for i = 1, #(vis or {}) do
+            if vis[i].slot == opts.usedSlot then
+                rec = vis[i]
+            end
+        end
+        assertTrue(rec ~= nil, opts.family .. " provenance keeps original " .. opts.usedSlot)
+        assertEq(rec.displayedSlot, opts.displayedSlot, opts.family .. " displayedSlot is packed " .. opts.displayedSlot)
+        assertEq(rec.slot, opts.usedSlot, opts.family .. " original slot remains " .. opts.usedSlot)
+        assertTrue(p:AddRCLootCouncilBisResponse("Need"))
+        local first = makeCanonical(ALT_A, opts.itemId, "Need", opts.stamp1)
+        assertTrue(p:TryAddRCLootCouncilAward(first))
+        local decided = lastOutcome(p, first.awardKey)
+        assertEq(decided.outcome, "ASSIGNED", "linked " .. opts.family .. " first award is assigned")
+        assertEq(decided.assignedSlots and decided.assignedSlots[1], opts.freeSlot, "automatic decision selects displayed-free " .. opts.freeSlot)
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(p, ALT_A, opts.displayedSlot), "LEGACY_UNKNOWN", "packed legacy " .. opts.displayedSlot .. " stays consumed")
+        assertEq(slotState(p, ALT_A, opts.freeSlot), "ASSIGNED_AUTO", "new " .. opts.family .. " occupies displayed-free " .. opts.freeSlot)
+        local occ = occupancy(p, ALT_A)
+        assertTrue(occ[opts.displayedSlot] == true, "live occupancy keeps displayed legacy " .. opts.displayedSlot)
+        assertTrue(occ[opts.freeSlot] == true, "live occupancy marks packed " .. opts.freeSlot)
+        local second = makeCanonical(ALT_A, opts.itemId, "Need", opts.stamp2)
+        assertTrue(p:TryAddRCLootCouncilAward(second))
+        assertEq(lastOutcome(p, second.awardKey).outcome, "OVERFLOW", "next linked " .. opts.family .. " overflows")
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(p, ALT_A, opts.displayedSlot), "LEGACY_UNKNOWN", "overflow does not hide packed legacy " .. opts.displayedSlot)
+        assertEq(slotState(p, ALT_A, opts.freeSlot), "ASSIGNED_AUTO", "overflow does not move packed " .. opts.family)
+        local restored = snapshotRoundTrip(p, opts.name .. "Snap")
+        assertEq(slotState(restored, ALT_A, opts.displayedSlot), "LEGACY_UNKNOWN", "snapshot keeps packed legacy " .. opts.displayedSlot)
+        assertEq(slotState(restored, ALT_A, opts.freeSlot), "ASSIGNED_AUTO", "snapshot keeps packed " .. opts.family)
+        local third = makeCanonical(ALT_A, opts.itemId, "Need", opts.stamp3)
+        assertTrue(restored:TryAddRCLootCouncilAward(third))
+        assertEq(lastOutcome(restored, third.awardKey).outcome, "OVERFLOW", "rebuild still overflows a later " .. opts.family)
+    end
+
+    packLinkedFamily({
+        name = "LinkedRing2Display",
+        family = "ring",
+        usedSlot = "Ring2",
+        displayedSlot = "Ring1",
+        freeSlot = "Ring2",
+        itemId = 19002,
+        stamp1 = "1700031300",
+        stamp2 = "1700031301",
+        stamp3 = "1700031302",
+    })
+    packLinkedFamily({
+        name = "LinkedTrinket2Display",
+        family = "trinket",
+        usedSlot = "Trinket2",
+        displayedSlot = "Trinket1",
+        freeSlot = "Trinket2",
+        itemId = 19003,
+        stamp1 = "1700031400",
+        stamp2 = "1700031401",
+        stamp3 = "1700031402",
+    })
+
+    resetEnv()
+    local boundRing = makeProfile("BoundRingPack")
+    addMember(boundRing, ALT_A)
+    addMember(boundRing, ALT_B)
+    addLog(boundRing, "ARMOR_CHANGE", { member = ALT_A, slot = "Ring2", action = "USED" })
+    assertTrue(boundRing:LinkCharacters(ALT_A, ALT_B))
+    boundRing:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(boundRing, ALT_A, "Ring1"), "LEGACY_UNKNOWN", "BOUND setup packs Ring2 onto Ring1")
+    assertTrue(boundRing:AddManualAward(ALT_A, itemLink(19002, "BoundRing")))
+    local boundMan
+    for _, award in ipairs(boundRing:GetIdentityAwardPool(ALT_A)) do
+        if award.kind == "MANUAL" then
+            boundMan = award.id
+        end
+    end
+    assertTrue(boundRing:PlaceGearOverrideAward(ALT_A, "Ring2", { kind = "MANUAL", id = boundMan }), "BOUND override pins displayed Ring2")
+    boundRing:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(boundRing, ALT_A, "Ring1"), "LEGACY_UNKNOWN", "BOUND Ring2 does not hide packed legacy Ring1")
+    assertEq(slotState(boundRing, ALT_A, "Ring2"), "ASSIGNED_OVERRIDE", "BOUND award occupies Ring2")
+    assertTrue(boundRing:AddRCLootCouncilBisResponse("Need"))
+    local boundOverflow = makeCanonical(ALT_A, 19002, "Need", "1700031500")
+    assertTrue(boundRing:TryAddRCLootCouncilAward(boundOverflow))
+    assertEq(lastOutcome(boundRing, boundOverflow.awardKey).outcome, "OVERFLOW", "BOUND plus packed legacy overflows the next ring")
 
     resetEnv()
     local emptyRings = makeProfile("EmptyRings")
@@ -2500,6 +2613,127 @@ local function reviewFindingTests()
     assertEq(slotState(emptyRings, ALT_A, "Ring2"), "ASSIGNED_AUTO", "second empty ring occupies Ring2")
     assertTrue(emptyRings:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700031202")))
     assertEq(lastOutcome(emptyRings).outcome, "OVERFLOW", "third empty ring overflows")
+
+    resetEnv()
+    local linkedEmpty = makeProfile("LinkedEmptyRings")
+    addMember(linkedEmpty, ALT_A)
+    addMember(linkedEmpty, ALT_B)
+    assertTrue(linkedEmpty:LinkCharacters(ALT_A, ALT_B))
+    assertTrue(linkedEmpty:AddRCLootCouncilBisResponse("Need"))
+    assertTrue(linkedEmpty:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700031600")))
+    assertTrue(linkedEmpty:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700031601")))
+    linkedEmpty:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(linkedEmpty, ALT_A, "Ring1"), "ASSIGNED_AUTO", "linked empty first ring occupies Ring1")
+    assertEq(slotState(linkedEmpty, ALT_A, "Ring2"), "ASSIGNED_AUTO", "linked empty second ring occupies Ring2")
+    assertTrue(linkedEmpty:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700031602")))
+    assertEq(lastOutcome(linkedEmpty).outcome, "OVERFLOW", "linked empty third ring overflows")
+
+    local function twoHandLegacyAssociation()
+        local function lastOverride(profile)
+            local last
+            for _, log in ipairs(profile:GetLootLogs()) do
+                if log:GetEventType() == "BIS_OVERRIDE" then
+                    last = log:GetEventData()
+                end
+            end
+            return last
+        end
+
+        local function manualId(profile, itemId)
+            for _, award in ipairs(profile:GetIdentityAwardPool(ALT_A)) do
+                if award.kind == "MANUAL" and tostring(award.itemString or ""):find("item:" .. tostring(itemId), 1, true) then
+                    return award.id
+                end
+            end
+        end
+
+        resetEnv()
+        local weaponOrigin = makeProfile("TwoHAssocWeapon")
+        addMember(weaponOrigin, ALT_A)
+        assertTrue(weaponOrigin:SetMemberSpec(ALT_A, 71), "Arms spec occupies both weapon opportunities")
+        addLog(weaponOrigin, "ARMOR_CHANGE", { member = ALT_A, slot = "Weapon", action = "USED" })
+        weaponOrigin:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(weaponOrigin, ALT_A, "Weapon"), "LEGACY_UNKNOWN", "legacy Weapon is consumed")
+        assertEq(slotState(weaponOrigin, ALT_A, "OffHand"), "AVAILABLE", "OffHand starts free")
+        assertTrue(weaponOrigin:AddManualAward(ALT_A, itemLink(19004, "TwoHand")))
+        local weaponTwoH = manualId(weaponOrigin, 19004)
+        assertTrue(weaponTwoH ~= nil, "compatible 2H award is in the pool")
+        assertTrue(weaponOrigin:PlaceGearOverrideAward(ALT_A, "Weapon", { kind = "MANUAL", id = weaponTwoH }), "Gear Override associates 2H onto legacy Weapon")
+        local weaponData = lastOverride(weaponOrigin)
+        assertTrue(weaponData ~= nil, "ASSOCIATE_LEGACY was appended")
+        assertEq(weaponData.action, "ASSOCIATE_LEGACY", "appended action is ASSOCIATE_LEGACY")
+        assertEq(#(weaponData.assignedSlots or {}), 2, "writer stores the expanded Weapon/OffHand pair")
+        weaponOrigin:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(weaponOrigin, ALT_A, "Weapon"), "ASSIGNED_OVERRIDE", "replay applies the Weapon origin association")
+        assertEq(slotState(weaponOrigin, ALT_A, "OffHand"), "ASSIGNED_OVERRIDE", "normal 2H also occupies OffHand")
+        local weaponAsg = weaponOrigin:GetIdentityBisSlots(ALT_A).Weapon.assignmentId
+        assertTrue(weaponAsg ~= nil, "successful Weapon association created an assignment")
+        assertEq(
+            weaponAsg,
+            weaponOrigin:GetIdentityBisSlots(ALT_A).OffHand.assignmentId,
+            "normal 2H association is one assignment"
+        )
+        local weaponRestored = snapshotRoundTrip(weaponOrigin, "TwoHAssocWeaponSnap")
+        assertEq(slotState(weaponRestored, ALT_A, "Weapon"), "ASSIGNED_OVERRIDE", "snapshot rebuild keeps Weapon association")
+        assertEq(slotState(weaponRestored, ALT_A, "OffHand"), "ASSIGNED_OVERRIDE", "snapshot rebuild keeps OffHand association")
+
+        resetEnv()
+        local offOrigin = makeProfile("TwoHAssocOffHand")
+        addMember(offOrigin, ALT_A)
+        assertTrue(offOrigin:SetMemberSpec(ALT_A, 71))
+        addLog(offOrigin, "ARMOR_CHANGE", { member = ALT_A, slot = "OffHand", action = "USED" })
+        offOrigin:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(offOrigin, ALT_A, "OffHand"), "LEGACY_UNKNOWN", "legacy OffHand is consumed")
+        assertEq(slotState(offOrigin, ALT_A, "Weapon"), "AVAILABLE", "Weapon starts free for OffHand origin")
+        assertTrue(offOrigin:AddManualAward(ALT_A, itemLink(19004, "TwoHand")))
+        local offTwoH = manualId(offOrigin, 19004)
+        assertTrue(offOrigin:PlaceGearOverrideAward(ALT_A, "OffHand", { kind = "MANUAL", id = offTwoH }), "Gear Override associates 2H onto legacy OffHand")
+        offOrigin:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(offOrigin, ALT_A, "Weapon"), "ASSIGNED_OVERRIDE", "OffHand origin 2H occupies Weapon")
+        assertEq(slotState(offOrigin, ALT_A, "OffHand"), "ASSIGNED_OVERRIDE", "OffHand origin 2H occupies OffHand")
+        local offRestored = snapshotRoundTrip(offOrigin, "TwoHAssocOffHandSnap")
+        assertEq(slotState(offRestored, ALT_A, "Weapon"), "ASSIGNED_OVERRIDE", "OffHand origin snapshot keeps Weapon")
+        assertEq(slotState(offRestored, ALT_A, "OffHand"), "ASSIGNED_OVERRIDE", "OffHand origin snapshot keeps OffHand")
+
+        resetEnv()
+        local occupied = makeProfile("TwoHAssocOccupied")
+        addMember(occupied, ALT_A, "member", "PALADIN")
+        assertTrue(occupied:SetMemberSpec(ALT_A, 65), "Holy Paladin")
+        addLog(occupied, "ARMOR_CHANGE", { member = ALT_A, slot = "Weapon", action = "USED" })
+        occupied:ApplyIdentityProjection({ force = true })
+        assertTrue(occupied:AddManualAward(ALT_A, itemLink(19011, "Shield")))
+        local shieldId = manualId(occupied, 19011)
+        assertTrue(occupied:ApplyBisOverride("ASSIGN", {
+            viewMember = ALT_A,
+            awardRef = { kind = "MANUAL", id = shieldId },
+            assignedSlots = { "OffHand" },
+            slotBinding = "BOUND",
+        }), "shield occupies OffHand")
+        occupied:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(occupied, ALT_A, "OffHand"), "ASSIGNED_OVERRIDE", "counterpart OffHand is occupied")
+        assertTrue(occupied:AddManualAward(ALT_A, itemLink(19004, "TwoHand")))
+        local blockedTwoH = manualId(occupied, 19004)
+        local beforeLogs = #(occupied:GetLootLogs() or {})
+        assertFalse(occupied:PlaceGearOverrideAward(ALT_A, "Weapon", { kind = "MANUAL", id = blockedTwoH }), "2H cannot expand onto occupied OffHand")
+        assertEq(#(occupied:GetLootLogs() or {}), beforeLogs, "conflicting 2H association is not appended")
+
+        resetEnv()
+        local dual = makeProfile("TwoHAssocDual")
+        addMember(dual, ALT_A)
+        assertTrue(dual:SetMemberSpec(ALT_A, 72), "Fury dual-2H")
+        addLog(dual, "ARMOR_CHANGE", { member = ALT_A, slot = "Weapon", action = "USED" })
+        dual:ApplyIdentityProjection({ force = true })
+        assertTrue(dual:AddManualAward(ALT_A, itemLink(19004, "TwoHand")))
+        local dualTwoH = manualId(dual, 19004)
+        assertTrue(dual:PlaceGearOverrideAward(ALT_A, "Weapon", { kind = "MANUAL", id = dualTwoH }), "dual-2H associates the clicked Weapon only")
+        local dualData = lastOverride(dual)
+        assertEq(#(dualData.assignedSlots or {}), 1, "dual-2H stores a single slot")
+        assertEq(dualData.assignedSlots[1], "Weapon", "dual-2H stays on Weapon")
+        dual:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(dual, ALT_A, "Weapon"), "ASSIGNED_OVERRIDE", "dual-2H occupies Weapon")
+        assertEq(slotState(dual, ALT_A, "OffHand"), "AVAILABLE", "dual-2H leaves OffHand independent")
+    end
+    twoHandLegacyAssociation()
 
     local function notBisEquipmentFallback()
         local function makeBtn(slotKey)
@@ -2638,13 +2872,18 @@ local function reviewFindingTests()
         p:ApplyIdentityProjection({ force = true })
         assertEq(slotState(p, ALT_A, "OffHand"), "AVAILABLE", "OffHand stays free after MAINHAND-only award")
         local options = p:GetGearOverrideCompatibleAwards(ALT_A, "OffHand")
-        local sawMainHand = false
-        for i = 1, #options do
-            if tostring(options[i].itemString or ""):find("item:19023", 1, true) then
-                sawMainHand = true
+        local function optionsIncludeAward(list, awardKey)
+            for i = 1, #(list or {}) do
+                local ref = list[i].awardRef
+                if ref and ref.id == awardKey then
+                    return true
+                end
             end
+            return false
         end
-        assertFalse(sawMainHand, "Gear Override OffHand options omit MAINHAND-only items")
+        assertFalse(optionsIncludeAward(options, mhCanon.awardKey), "Gear Override OffHand options omit MAINHAND-only items")
+        local poisoned = { { value = "x", text = "x", awardRef = { kind = "RC", id = mhCanon.awardKey } } }
+        assertTrue(optionsIncludeAward(poisoned, mhCanon.awardKey), "awardRef scanner detects a forbidden MAINHAND option when present")
         assertFalse(p:ApplyBisOverride("ASSIGN", {
             viewMember = ALT_A,
             awardRef = { kind = "RC", id = mhCanon.awardKey },

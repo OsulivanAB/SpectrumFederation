@@ -276,6 +276,26 @@ local function CopySlots(slots)
     return out
 end
 
+local function SameSlotSet(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" or #a ~= #b then
+        return false
+    end
+    local counts = {}
+    for i = 1, #a do
+        local slot = a[i]
+        counts[slot] = (counts[slot] or 0) + 1
+    end
+    for i = 1, #b do
+        local slot = b[i]
+        local n = counts[slot]
+        if not n or n < 1 then
+            return false
+        end
+        counts[slot] = n - 1
+    end
+    return true
+end
+
 local function SortedWeaponPair(slots)
     if type(slots) ~= "table" then
         return nil
@@ -813,7 +833,10 @@ local function ReservedFamilyIndices(state, memberIds, family)
     local componentSet = ListSet(SortedCopy(memberIds))
     for _, rec in pairs(origins) do
         if type(rec) == "table" and rec.isOverflow ~= true and OriginBelongsToComponent(rec, componentSet) then
-            local slot = rec.slot
+            -- Reserve the projected cell. displayedSlot is authoritative when
+            -- present; original slot is only a fallback for unpacked origins.
+            local displayed = rec.displayedSlot
+            local slot = (type(displayed) == "string" and displayed ~= "") and displayed or rec.slot
             local idx = slot and indexOf[slot]
             if idx then
                 reserved[idx] = true
@@ -1728,34 +1751,51 @@ function Bis.ApplyLog(state, log, ctx)
             local displayed = rec.displayedSlot
             local originSlot = (type(displayed) == "string" and displayed ~= "") and displayed or rec.slot
             local members = componentOf(award.member)
-            local slots = data.assignedSlots
-            if type(slots) ~= "table" or #slots == 0 then
-                slots = originSlot and { originSlot } or nil
-            end
-            if not slots then
-                return
-            end
-            if originSlot then
-                if #slots ~= 1 or slots[1] ~= originSlot then
-                    return
-                end
-            end
+            local stored = data.assignedSlots
             local specId = award.member and state.specs[award.member]
             local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
-            if classif then
-                slots = select(1, Bis.ResolveOverrideSlots(slots, classif, specId))
-                if not slots then
+            local slots
+            if originSlot then
+                -- Writer may store either the clicked origin or ResolveOverrideSlots
+                -- output (a Weapon/OffHand pair for a normal two-hand). Replay
+                -- accepts only those canonical forms, then applies the resolved set.
+                local fromOrigin = { originSlot }
+                if classif then
+                    fromOrigin = select(1, Bis.ResolveOverrideSlots(fromOrigin, classif, specId))
+                    if not fromOrigin then
+                        return
+                    end
+                elseif not Bis.IsLegalSlotShape(fromOrigin) then
                     return
                 end
-            elseif not Bis.IsLegalSlotShape(slots) then
-                return
+                local storedOk = type(stored) ~= "table" or #stored == 0
+                    or SameSlotSet(stored, { originSlot })
+                    or SameSlotSet(stored, fromOrigin)
+                if not storedOk then
+                    return
+                end
+                slots = fromOrigin
+            else
+                slots = stored
+                if type(slots) ~= "table" or #slots == 0 then
+                    return
+                end
+                if classif then
+                    slots = select(1, Bis.ResolveOverrideSlots(slots, classif, specId))
+                    if not slots then
+                        return
+                    end
+                elseif not Bis.IsLegalSlotShape(slots) then
+                    return
+                end
             end
             if originSlot then
                 local bound = false
                 for i = 1, #slots do
                     if slots[i] == originSlot then
                         bound = true
-                        break
+                    elseif ctx.SlotOccupied and ctx.SlotOccupied(award.member, slots[i]) then
+                        return
                     end
                 end
                 if not bound then
