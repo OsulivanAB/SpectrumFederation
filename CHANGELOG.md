@@ -2,7 +2,7 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
-## [1.5.2-beta.2] - 2026-09-11
+## [1.5.2] - 2026-09-11
 
 ### Changed
 - Stop Raid Equipment freeze and idle refresh-cycle risks
