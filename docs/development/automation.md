@@ -27,16 +27,21 @@ Both branch-validation workflows include `README.md`, `tests/**`, and MkDocs inp
 
 ## Post-merge beta release
 
-`.github/workflows/post-merge-beta.yml` runs only when a push to `beta` changes packaged addon files under `SpectrumFederation/**`, `SpectrumFederation_CursedSurgeTracker/**`, or `SpectrumFederation_RCLootCouncilIntegration/**`. Zip-excluded files such as `*/AGENTS.md` do not start a beta release.
+`.github/workflows/post-merge-beta.yml` is triggered by pushes under the packaged addon trees. `!**/AGENTS.md` is only an efficiency filter. The workflow still classifies the immutable `github.event.before...github.sha` range with `classify_promotion_scope.py` before any release side effects. Zip-excluded addon-tree files, including `*/AGENTS.md`, do not set `release_required`.
 
-It:
+When `release_required` is false, changelog, README badge, GitHub Release, Wago, and CurseForge side effects are skipped. Lint/packaging/docs validation and merged-branch cleanup still run; they do not depend on a successful publish.
+
+When `release_required` is true, the workflow:
 
 1. reruns lint, packaging, and documentation validation;
-2. queries Blizzard's beta product for Interface metadata;
-3. updates `CHANGELOG.md`;
-4. updates README badges;
-5. packages the addon zip, writes WowUp `release.json`, creates a GitHub prerelease, and uploads the same zip to Wago as `beta`;
-6. deletes the merged source branch when the release succeeds.
+2. verifies the TOC was bumped against the previous beta tip (`check_version_bump.py --base-commit`) and is not a duplicate release;
+3. queries Blizzard's beta product for Interface metadata;
+4. updates `CHANGELOG.md`;
+5. updates README badges;
+6. packages the addon zip, writes WowUp `release.json`, creates a GitHub prerelease, and uploads the same zip to Wago as `beta`;
+7. deletes the merged source branch after a successful or skipped publish, never after a failed one.
+
+A packaged addon change with a forgotten or invalid version fails the workflow instead of silently skipping the beta release.
 
 Docs-only merges do not trigger a beta addon release.
 

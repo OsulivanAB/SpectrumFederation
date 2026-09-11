@@ -113,6 +113,9 @@ python -m pytest tests/test_publish_release.py
 
 # Promotion-scope path classification
 python -m pytest tests/test_promotion_scope.py
+
+# TOC version-bump comparison
+python -m pytest tests/test_check_version_bump.py
 ```
 
 Do not weaken a check to make a change pass.

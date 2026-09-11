@@ -202,6 +202,87 @@ def test_agents_md_inside_addon_tree_is_not_a_release():
     assert scope.documentation_deploy_required is False
 
 
+PR282_GUIDANCE_PATHS = [
+    "SpectrumFederation/AGENTS.md",
+    "AGENTS.md",
+    ".cursor/rules/addon-runtime.mdc",
+    ".cursor/skills/pr-review-comments/SKILL.md",
+    ".cursor/agents/repo-verifier.md",
+    ".github/copilot-instructions.md",
+    ".github/instructions/lua.instructions.md",
+]
+
+
+def test_pr282_style_guidance_set_does_not_require_release():
+    scope = scope_mod.classify_files(PR282_GUIDANCE_PATHS)
+    assert scope.addon_changed is False
+    assert scope.release_required is False
+    assert scope.changelog_required is False
+
+
+def test_child_addon_agents_md_is_not_a_release():
+    scope = scope_mod.classify_files(
+        ["SpectrumFederation_CursedSurgeTracker/AGENTS.md"]
+    )
+    assert scope.addon_changed is False
+    assert scope.release_required is False
+    assert scope.infra_changed is True
+
+
+def test_git_metadata_inside_addon_tree_is_not_a_release():
+    scope = scope_mod.classify_files(["SpectrumFederation/.gitignore"])
+    assert scope.addon_changed is False
+    assert scope.release_required is False
+    assert scope.infra_changed is True
+
+
+def test_packaged_lua_plus_excluded_agents_still_requires_release():
+    scope = scope_mod.classify_files(
+        [
+            "SpectrumFederation/modules/Foo.lua",
+            "SpectrumFederation/AGENTS.md",
+            "AGENTS.md",
+        ]
+    )
+    assert scope.addon_changed is True
+    assert scope.release_required is True
+    assert "SpectrumFederation/modules/Foo.lua" in scope.addon_files
+    assert "SpectrumFederation/AGENTS.md" in scope.infra_files
+
+
+def test_parent_toc_change_is_a_packaged_release():
+    scope = scope_mod.classify_files(
+        ["SpectrumFederation/SpectrumFederation.toc"]
+    )
+    assert scope.addon_changed is True
+    assert scope.release_required is True
+
+
+def test_git_range_addon_agents_md_is_not_a_release(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {"SpectrumFederation/AGENTS.md": "# updated guidance\n"},
+        "docs: addon agents guidance",
+    )
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.addon_changed is False
+    assert scope.release_required is False
+    assert "SpectrumFederation/AGENTS.md" in scope.infra_files
+
+
+def test_git_range_packaged_lua_requires_release_without_toc_change(tmp_path):
+    repo = init_repo(tmp_path)
+    commit_files(
+        repo,
+        {"SpectrumFederation/modules/Foo.lua": "print('feat')\n"},
+        "feat: runtime without toc bump",
+    )
+    scope = scope_mod.classify_git_range("main", "beta", cwd=repo)
+    assert scope.release_required is True
+    assert not any(path.endswith(".toc") for path in scope.files)
+
+
 def test_case_e_readme_only_does_not_publish_or_deploy_docs():
     scope = scope_mod.classify_files(["README.md"])
     assert flags(scope) == {
@@ -579,6 +660,45 @@ def test_merge_jobs_materialize_helper_that_supports_validate_versions():
         )
         == 2
     )
+
+
+def test_pr_beta_validation_gates_release_checks_on_packaged_scope():
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "pr-beta-validation.yml"
+    )
+    text = workflow.read_text(encoding="utf-8")
+    assert "classify_promotion_scope.py" in text
+    assert "release_required: ${{ steps.changes.outputs.release_required }}" in text
+    assert text.count("needs.detect-addon-changes.outputs.release_required == 'true'") == 2
+    assert "needs.detect-addon-changes.outputs.addon_changed == 'true'" not in text
+    detect_start = text.index("detect-addon-changes:")
+    detect_end = text.index("\n  lint:")
+    detect_block = text[detect_start:detect_end]
+    assert "classify_promotion_scope.py" in detect_block
+    assert "--base" in detect_block
+    assert "--head" in detect_block
+    assert "git diff --name-only" not in detect_block
+
+
+def test_post_merge_beta_classifies_push_range_and_keeps_housekeeping():
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "post-merge-beta.yml"
+    )
+    text = workflow.read_text(encoding="utf-8")
+    assert "classify_promotion_scope.py" in text
+    assert "github.event.before" in text
+    assert "needs.detect-release-scope.outputs.release_required == 'true'" in text
+    assert "check_version_bump.py beta --base-commit" in text
+    assert "check_duplicate_release.py" in text
+    assert "verify_promotion_outcomes" in text
+    assert "needs.publish-beta-release.result == 'skipped'" in text
+    assert "cleanup-merged-branch:" in text
+    publish_if = text[text.index("publish-beta-release:") : text.index("verify-release-outcome:")]
+    assert "release_required == 'true'" in publish_if
+    assert "!**/AGENTS.md" in text
 
 
 def _repo_beta_equals_main(tmp_path):

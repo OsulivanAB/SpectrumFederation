@@ -23,6 +23,7 @@ alwaysApply: true
   - Raid Equipment policy or CheckRun -> `python -m pytest tests/test_raid_equipment.py` (requires `lua5.1`)
   - PR template or `validate_pr_template.py` -> `python -m pytest tests/test_pr_template.py`
   - Promotion-scope classification or `classify_promotion_scope.py` -> `python -m pytest tests/test_promotion_scope.py`
+  - Version bump comparison or `check_version_bump.py` -> `python -m pytest tests/test_check_version_bump.py`
 - Release classification or Wago publishing -> `python -m pytest tests/test_publish_release.py`
 - Normal development targets `beta`; `main` is for promotion and release workflows.
 - Do not weaken CI to make checks pass.
