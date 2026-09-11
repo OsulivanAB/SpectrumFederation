@@ -467,6 +467,31 @@ function SectionMixin:ReflowRows()
 	self:_UpdateHeight()
 end
 
+-- Height this section would use without leftover fill-height expansion.
+-- PageBuilder uses this so idle reflows can keep an existing assigned height
+-- instead of shrinking and expanding fill rows on every pass.
+function SectionMixin:GetNaturalHeight()
+	local baseContentHeight = 0
+	local visibleCount = 0
+
+	if self.MessageRow and self.MessageRow:IsShown() then
+		visibleCount = visibleCount + 1
+		baseContentHeight = baseContentHeight + GetRowNaturalHeight(self.MessageRow)
+	end
+
+	for _, row in ipairs(self._rows or {}) do
+		if row:IsShown() then
+			if visibleCount > 0 then
+				baseContentHeight = baseContentHeight + ROW_SPACING
+			end
+			visibleCount = visibleCount + 1
+			baseContentHeight = baseContentHeight + GetRowNaturalHeight(row)
+		end
+	end
+
+	return HEADER_HEIGHT + CONTENT_PADDING_TOP + baseContentHeight + CONTENT_PADDING_BOTTOM
+end
+
 -- Internal: recalc section frame height based on content
 -- @return nil
 function SectionMixin:_UpdateHeight()

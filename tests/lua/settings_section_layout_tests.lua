@@ -509,6 +509,31 @@ do
     end
 end
 
+-- Idle reflow must not shrink/expand a stable fill row (F-01 PageBuilder).
+do
+    local fillRow
+    local height
+    local setHeightCount = 0
+    local ok = runBounded("idle reflow does not churn fill-row height", function()
+        local pageBuilder, tableSection = buildFillHeightPage({ height = 600 })
+        fillRow = tableSection._rows[1]
+        pageBuilder:Reflow()
+        height = fillRow:GetHeight()
+        local originalSetHeight = fillRow.SetHeight
+        function fillRow:SetHeight(value)
+            setHeightCount = setHeightCount + 1
+            return originalSetHeight(self, value)
+        end
+        pageBuilder:Reflow()
+        pageBuilder:Reflow()
+        pageBuilder:Reflow()
+        assertAlmost(fillRow:GetHeight(), height, 0.5, "fill row height is unchanged across idle reflows")
+    end)
+    if ok then
+        assertEq(setHeightCount, 0, "idle PageBuilder:Reflow does not SetHeight on a stable fill row")
+    end
+end
+
 -- Non-fill section messages still layout without a loop.
 do
     local section

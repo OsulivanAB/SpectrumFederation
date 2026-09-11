@@ -1,5 +1,5 @@
 -- Standalone Raid Equipment settings page (no Loot Helper profile/session required).
--- luacheck: globals CreateFrame GameTooltip GetTime C_Timer UIPanelScrollFrameTemplate OptionsSliderTemplate
+-- luacheck: globals CreateFrame GameTooltip GetTime C_Timer UIPanelScrollFrameTemplate OptionsSliderTemplate geterrorhandler
 
 local _, SF = ...
 
@@ -14,6 +14,7 @@ SF.SettingsUI:RegisterCategory({
 
 local EQUIPMENT_PAGE_WINDOW_WIDTH = 1280
 local EQUIPMENT_REFRESH_DEBOUNCE_SECONDS = 0.15
+local EQUIPMENT_SIZE_EPSILON = 0.5
 local EQUIPMENT_MANUAL_REFRESH_WINDOW_SECONDS = 4.0
 local EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_COUNT = 8
 local EQUIPMENT_MANUAL_REFRESH_FOLLOW_UP_DELAY_SECONDS = 0.25
@@ -682,8 +683,11 @@ local function BuildEquipmentPage(panel)
 		local isRefreshingAuditTable = false
 		local pendingAuditTableRefresh = false
 		local refreshAuditTableLaterPending = false
+		local applyingAuditTableLayout = false
 		local lastRenderedSnapshotVersion = -1
 		local lastLayoutState = nil
+		local lastScrollWidth = nil
+		local lastScrollHeight = nil
 
 		local function ApplyHorizontalScrollOffset(value)
 			scroll:SetHorizontalScroll(value)
@@ -736,13 +740,21 @@ local function BuildEquipmentPage(panel)
 			return knownCount, issueCount
 		end
 
-		local function ApplyAuditTableLayout(rowCount, contentHeight, forceLayout)
+		local function RememberScrollSize()
+			lastScrollWidth = scroll:GetWidth() or 0
+			lastScrollHeight = scroll:GetHeight() or 0
+		end
+
+		local function ApplyAuditTableLayout(rowCount, contentHeight)
 			local containerWidth = math.floor((container:GetWidth() or 0) + 0.5)
 			local containerHeight = math.floor((container:GetHeight() or 0) + 0.5)
 			local nextLayoutState = string.format("%d:%d:%d:%d:%d", rowCount, #columns, containerWidth, containerHeight, contentHeight)
-			if not forceLayout and lastLayoutState == nextLayoutState then
+			if lastLayoutState == nextLayoutState then
+				RememberScrollSize()
 				return false
 			end
+
+			applyingAuditTableLayout = true
 
 			local scrollBarWidth = 0
 			local horizontalScrollHeight = 0
@@ -797,10 +809,12 @@ local function BuildEquipmentPage(panel)
 			end
 
 			lastLayoutState = nextLayoutState
+			RememberScrollSize()
+			applyingAuditTableLayout = false
 			return true
 		end
 
-		ScheduleRefreshAuditTable = function(forceLayout)
+		ScheduleRefreshAuditTable = function()
 			if refreshAuditTableLaterPending then
 				return
 			end
@@ -811,7 +825,7 @@ local function BuildEquipmentPage(panel)
 					if not IsEquipmentPageActive() then
 						return
 					end
-					RefreshAuditTable(forceLayout and { forceLayout = true } or nil)
+					RefreshAuditTable()
 				end)
 				return
 			end
@@ -819,10 +833,10 @@ local function BuildEquipmentPage(panel)
 			if not IsEquipmentPageActive() then
 				return
 			end
-			RefreshAuditTable(forceLayout and { forceLayout = true } or nil)
+			RefreshAuditTable()
 		end
 
-		RefreshAuditTable = function(options)
+		RefreshAuditTable = function()
 			if not IsEquipmentPageActive() then
 				return
 			end
@@ -837,15 +851,13 @@ local function BuildEquipmentPage(panel)
 				local dataRows = snapshot.rows or {}
 				local snapshotVersion = snapshot.version or 0
 				local snapshotChanged = snapshotVersion ~= lastRenderedSnapshotVersion
-				local forceLayout = type(options) == "table" and options.forceLayout and true or false
 				if SF.Debug then
 					SF.Debug:Verbose(
 						"UI",
-						"Refreshing Raid Check Equipment table with %d row(s), version=%s changed=%s forceLayout=%s",
+						"Refreshing Raid Check Equipment table with %d row(s), version=%s changed=%s",
 						#dataRows,
 						tostring(snapshotVersion),
-						tostring(snapshotChanged),
-						tostring(forceLayout)
+						tostring(snapshotChanged)
 					)
 				end
 
@@ -872,7 +884,7 @@ local function BuildEquipmentPage(panel)
 				content:SetHeight(math.max(1, contentHeight))
 				emptyText:SetShown(#dataRows == 0)
 
-				local layoutChanged = ApplyAuditTableLayout(#dataRows, contentHeight, forceLayout)
+				local layoutChanged = ApplyAuditTableLayout(#dataRows, contentHeight)
 				if snapshotChanged then
 					lastRenderedSnapshotVersion = snapshotVersion
 				end
@@ -892,18 +904,28 @@ local function BuildEquipmentPage(panel)
 
 				if layoutChanged then
 					ReflowEquipmentPage()
+					ApplyAuditTableLayout(#dataRows, contentHeight)
 				end
 			end)
 
 			isRefreshingAuditTable = false
-			if pendingAuditTableRefresh then
-				pendingAuditTableRefresh = false
-				RefreshAuditTable()
-			end
+			applyingAuditTableLayout = false
+			local pending = pendingAuditTableRefresh
+			pendingAuditTableRefresh = false
 			if not ok then
+				local message = tostring(err or "Raid Equipment refresh failed")
 				if SF.Debug then
-					SF.Debug:Error("UI", "Raid Check equipment refresh failed: %s", tostring(err or "unknown error"))
+					SF.Debug:Error("UI", "Raid Check equipment refresh failed: %s", message)
 				end
+				local handler = geterrorhandler and geterrorhandler()
+				if type(handler) == "function" then
+					handler(message)
+				else
+					error(message, 0)
+				end
+			end
+			if pending then
+				RefreshAuditTable()
 			end
 		end
 
@@ -914,9 +936,12 @@ local function BuildEquipmentPage(panel)
 			end)
 		end
 
-		if SF.RaidCheck and SF.RaidCheck.RegisterTroubleshootingListener then
-			if panel.__sfEquipmentListenerKey and SF.RaidCheck.UnregisterTroubleshootingListener then
-				SF.RaidCheck:UnregisterTroubleshootingListener(panel.__sfEquipmentListenerKey)
+		local function EnsureEquipmentListener()
+			if not (SF.RaidCheck and SF.RaidCheck.RegisterTroubleshootingListener) then
+				return
+			end
+			if panel.__sfEquipmentListenerRegistered then
+				return
 			end
 			panel.__sfEquipmentListenerKey = panel
 			SF.RaidCheck:RegisterTroubleshootingListener(panel.__sfEquipmentListenerKey, function()
@@ -930,29 +955,60 @@ local function BuildEquipmentPage(panel)
 					ScheduleRefreshAuditTable()
 				end
 			end)
+			panel.__sfEquipmentListenerRegistered = true
+		end
+
+		local function ClearEquipmentListener()
+			if not panel.__sfEquipmentListenerRegistered then
+				return
+			end
+			if SF.RaidCheck and SF.RaidCheck.UnregisterTroubleshootingListener then
+				SF.RaidCheck:UnregisterTroubleshootingListener(panel.__sfEquipmentListenerKey or panel)
+			end
+			panel.__sfEquipmentListenerRegistered = false
 		end
 
 		pageBuilder:RegisterRefresh(RefreshAuditTable)
 		RefreshAuditTable()
 		if not scroll.__sfEquipmentSizeRefreshHooked then
 			scroll.__sfEquipmentSizeRefreshHooked = true
-			scroll:HookScript("OnSizeChanged", function()
-				ScheduleRefreshAuditTable(true)
+			scroll:HookScript("OnSizeChanged", function(self, width, height)
+				if applyingAuditTableLayout or isRefreshingAuditTable then
+					return
+				end
+				width = tonumber(width) or (self:GetWidth() or 0)
+				height = tonumber(height) or (self:GetHeight() or 0)
+				if lastScrollWidth and lastScrollHeight
+					and math.abs(width - lastScrollWidth) <= EQUIPMENT_SIZE_EPSILON
+					and math.abs(height - lastScrollHeight) <= EQUIPMENT_SIZE_EPSILON then
+					return
+				end
+				lastScrollWidth = width
+				lastScrollHeight = height
+				ScheduleRefreshAuditTable()
 			end)
+		end
+
+		if panel and panel.HookScript and not panel.__sfRaidCheckBackgroundInspectHooked then
+			panel.__sfRaidCheckBackgroundInspectHooked = true
+			panel:HookScript("OnShow", function()
+				EnsureEquipmentListener()
+				UpdateBackgroundInspect("equipment page shown")
+			end)
+			panel:HookScript("OnHide", function()
+				ClearEquipmentListener()
+				UpdateBackgroundInspect("equipment page hidden")
+			end)
+		end
+
+		if IsEquipmentPageActive() then
+			EnsureEquipmentListener()
+		else
+			ClearEquipmentListener()
 		end
 	end, { fillHeight = true })
 
 	pageBuilder:Finalize()
-
-	if panel and panel.HookScript and not panel.__sfRaidCheckBackgroundInspectHooked then
-		panel.__sfRaidCheckBackgroundInspectHooked = true
-		panel:HookScript("OnShow", function()
-			UpdateBackgroundInspect("equipment page shown")
-		end)
-		panel:HookScript("OnHide", function()
-			UpdateBackgroundInspect("equipment page hidden")
-		end)
-	end
 
 	UpdateBackgroundInspect("equipment page initialized")
 end
