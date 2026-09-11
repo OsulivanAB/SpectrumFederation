@@ -369,6 +369,30 @@ function Sync:_NeedsRCConfigCatchUp(profile)
     return LootProfile.IsNewerRCConfigGeneration(advEpoch or 0, advSeq or 0, localEpoch, localSeq)
 end
 
+-- Coordinator StartSession serializes the current accepted RC config as this
+-- session's initial generation. Out-of-session mutators change accepted fields
+-- without bumping (_rcConfigEpoch, _rcConfigSeq); a new coordEpoch alone is
+-- not advertised. Publishing SET here (or stamping the generation if comm is
+-- unavailable) makes joiners catch up without an extra in-session toggle.
+function Sync:_EstablishSessionRCConfig(profile)
+    if not (self.state and self.state.active and self.state.isCoordinator) then
+        return
+    end
+    if not profile then
+        return
+    end
+    if self.PublishRCIntegrationConfig then
+        local ok = self:PublishRCIntegrationConfig(profile:GetProfileId())
+        if ok then
+            return
+        end
+    end
+    local nextSeq = (tonumber(self.state.rcConfigSeq) or tonumber(profile._rcConfigSeq) or 0) + 1
+    self.state.rcConfigSeq = nextSeq
+    profile._rcConfigSeq = nextSeq
+    profile._rcConfigEpoch = tonumber(self.state.coordEpoch) or 0
+end
+
 function Sync:_CatchUpRCConfigIfNeeded(profile, reason)
     if not self:_NeedsRCConfigCatchUp(profile) then
         return false
