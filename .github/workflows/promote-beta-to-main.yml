@@ -69,19 +69,21 @@ jobs:
           materialize_scope_helper() {
             local ref="$1"
             git cat-file -e "$ref:.github/scripts/classify_promotion_scope.py" 2>/dev/null || return 1
+            git cat-file -e "$ref:.github/scripts/validate_packaging.py" 2>/dev/null || return 1
             git show "$ref:.github/scripts/classify_promotion_scope.py" \
               > /tmp/promotion-scope/classify_promotion_scope.py
             git show "$ref:.github/scripts/validate_packaging.py" \
               > /tmp/promotion-scope/validate_packaging.py
             grep -q -- 'merge_required=' /tmp/promotion-scope/classify_promotion_scope.py
           }
-          # Prefer the dispatched workflow commit so leftover beta that predates
-          # this helper can still be classified. Fall back to origin/main, then
-          # the live beta checkout.
-          if ! (materialize_scope_helper "$WORKFLOW_SHA" \
+          # Prefer the live beta checkout so packaged membership matches the
+          # tree being classified. Fall back to origin/main, then the
+          # dispatched workflow commit, so leftover beta that predates this
+          # helper can still be classified.
+          if ! (materialize_scope_helper HEAD \
             || materialize_scope_helper origin/main \
-            || materialize_scope_helper HEAD); then
-            echo "::error::Could not materialize classify_promotion_scope.py from the dispatched workflow commit, origin/main, or live beta."
+            || materialize_scope_helper "$WORKFLOW_SHA"); then
+            echo "::error::Could not materialize classify_promotion_scope.py from live beta, origin/main, or the dispatched workflow commit."
             exit 1
           fi
           python3 /tmp/promotion-scope/classify_promotion_scope.py \

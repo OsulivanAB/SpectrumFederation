@@ -706,6 +706,12 @@ def test_promotion_detect_and_fast_forward_materialize_helper_for_leftover_beta(
     assert 'git show "$EXPECTED_TARGET:.github/scripts/classify_promotion_scope.py"' not in text
     assert text.count("materialize_scope_helper \"$WORKFLOW_SHA\"") == 3
     assert text.count("materialize_scope_helper origin/main") == 3
+    head_pos = detect_block.index("materialize_scope_helper HEAD")
+    main_pos = detect_block.index("materialize_scope_helper origin/main")
+    workflow_pos = detect_block.index('materialize_scope_helper "$WORKFLOW_SHA"')
+    assert head_pos < main_pos < workflow_pos
+    assert "Prefer the live beta checkout" in detect_block
+    assert 'materialize_scope_helper "$WORKFLOW_SHA" \\\n            || materialize_scope_helper origin/main \\\n            || materialize_scope_helper HEAD' not in detect_block
 
 
 def test_pr_beta_validation_gates_release_checks_on_packaged_scope():

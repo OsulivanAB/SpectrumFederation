@@ -97,7 +97,7 @@ Branch promotion and downstream publishing are separate decisions. Every valid d
 
 ### How promotion scope is determined
 
-The first job captures an immutable range and classifies it with `.github/scripts/classify_promotion_scope.py`. Detect still checks out live `beta` so `HEAD` is the captured target, but it copies the helper from the dispatched workflow commit (`github.sha`), then `origin/main`, then live `beta`. Leftover `beta` that predates the helper can still be classified when the new workflow is dispatched. Those SHAs are invariants for the rest of the run, not informational outputs:
+The first job captures an immutable range and classifies it with `.github/scripts/classify_promotion_scope.py`. Detect still checks out live `beta` so `HEAD` is the captured target, and it copies the helper from that live checkout first so packaged membership matches the tree being classified. If leftover `beta` predates the helper, it falls back to `origin/main`, then the dispatched workflow commit (`github.sha`). Those SHAs are invariants for the rest of the run, not informational outputs:
 
 1. `promotion_base_sha` is `origin/main` at workflow start.
 2. `promotion_target_sha` is the `beta` HEAD at workflow start.
