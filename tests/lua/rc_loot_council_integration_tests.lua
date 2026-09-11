@@ -124,10 +124,12 @@ loadModule("SpectrumFederation/modules/LootHelperSync/01_Constants.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/02_State.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/05_Scheduling.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/10_Handshake.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/12_LiveUpdates.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/16_ProfileIntegration.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/15_HandlersBulk.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua")
 
 function SF:GetPlayerFullIdentifier()
     return PLAYER
@@ -143,6 +145,10 @@ end
 
 function SF:PrintInfo(message)
     printed[#printed + 1] = { "info", tostring(message) }
+end
+
+function SF:PrintError(message)
+    printed[#printed + 1] = { "error", tostring(message) }
 end
 
 function SF:SetActiveProfileById(profileId)
@@ -209,6 +215,24 @@ function Sync:BroadcastNewLog()
 end
 function Sync:_EnforceGroupedSessionActive()
     return "RAID"
+end
+function Sync:UpdatePeersFromRoster()
+    self.state.peers = self.state.peers or {}
+end
+function Sync:TouchPeer()
+end
+function Sync:_GetSessionSafeModePayload()
+    return { enabled = false, rev = 0 }
+end
+function Sync:EnsureHeartbeatSender()
+    return false
+end
+function Sync:_MarkRosterAnnounced()
+end
+function Sync:StartHeartbeatSender()
+    return false
+end
+function Sync:StopHeartbeatSender()
 end
 
 local ns = {}
@@ -1649,11 +1673,16 @@ SF.LootHelperComm = {
         }
     end,
 }
-assertTrue(follower:SetRCLootCouncilRecordAllAwardTypes(false), "follower can change RC settings locally")
+assertTrue(follower:SetRCLootCouncilRecordAllAwardTypes(false), "follower can propose RC settings")
+assertTrue(follower:GetRCLootCouncilIntegrationConfig().recordAllAwardTypes, "unaccepted follower proposal is not locally authoritative")
 assertEq(capturedReq[1].msgType, Sync.MSG.RC_CONFIG_REQ, "non-coordinator proposes RC_CONFIG_REQ")
 assertEq(capturedReq[1].target, "Coord-Garona", "REQ is whispered to the coordinator")
 assertTrue(capturedReq[1].payload.snapshot == nil, "REQ does not include a full snapshot")
 assertTrue(capturedReq[1].payload.rcLootCouncilIntegration ~= nil, "REQ carries RC config only")
+assertFalse(capturedReq[1].payload.rcLootCouncilIntegration.recordAllAwardTypes, "REQ carries the unaccepted proposal")
+local pendingFollower = follower:GetProposedRCLootCouncilIntegrationConfig()
+assertTrue(pendingFollower ~= nil, "follower keeps a pending proposal until SET")
+assertFalse(pendingFollower.recordAllAwardTypes, "pending proposal has record-all=false")
 
 -- Concurrent A/B edits: opposite SET delivery still converges
 resetEnv()
@@ -1810,6 +1839,301 @@ assertTrue(seqGuard:IsBisQualifyingResponse("Need", {
     responseId = 1,
     isAwardReason = false,
 }), "newer snapshot may update RC config")
+
+local function testAcceptedVsPendingAndTakeover()
+    local function captureComm()
+        local captured = {}
+        SF.LootHelperComm = {
+            Send = function(_, channel, msgType, payload, dist, target)
+                captured[#captured + 1] = {
+                    channel = channel,
+                    msgType = msgType,
+                    payload = payload,
+                    dist = dist,
+                    target = target,
+                }
+            end,
+        }
+        return captured
+    end
+
+    local function lastOfType(captured, msgType)
+        local found
+        for i = 1, #captured do
+            if captured[i].msgType == msgType then
+                found = captured[i]
+            end
+        end
+        return found
+    end
+
+    local function greedMeta()
+        return { typeCode = "default", responseId = 2, isAwardReason = false }
+    end
+
+    local function greedHistory(historyId)
+        return historyTable({
+            id = historyId,
+            response = "Greed",
+            responseID = 2,
+            isAwardReason = false,
+        })
+    end
+
+    local function awardOutcome(profile, awardKey)
+        for _, log in ipairs(profile:GetLootLogs() or {}) do
+            local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+            if data and data.awardKey == awardKey then
+                return data.outcome, data.qualified
+            end
+        end
+    end
+
+    local function seedNeedOnlyConfig(profile)
+        assertTrue(profile:ApplyRCLootCouncilIntegrationConfig({
+            recordAwards = true,
+            recordAllAwardTypes = false,
+            allowedResponses = { "Need" },
+            bisResponses = {
+                { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+            },
+        }, { skipPermission = true, skipSync = true }), "seed accepted Need-only RC config")
+    end
+
+    -- Award after local proposal, before coordinator acceptance
+    resetEnv()
+    local previousPlayer = PLAYER
+    local adminA = makeProfile("RC Pre-SET A")
+    addMember(adminA, WINNER)
+    addMember(adminA, ADMIN_B)
+    assertTrue(adminA:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Admin B can propose from a follower client")
+    seedNeedOnlyConfig(adminA)
+    setActive(adminA)
+    startSessionOn(adminA)
+    adminA._rcConfigSeq = 4
+    adminA._rcConfigEpoch = Sync.state.coordEpoch
+    Sync.state.rcConfigSeq = 4
+    local adminB = cloneProfileAs("RC Pre-SET B", adminA)
+    assertEq(adminB._rcConfigSeq, 4, "both clients start at accepted seq 4")
+    assertFalse(adminA:IsBisQualifyingResponse("Greed", greedMeta()), "Admin A does not treat Greed as BiS")
+    assertFalse(adminB:IsBisQualifyingResponse("Greed", greedMeta()), "Admin B starts without Greed as BiS")
+
+    local captured = captureComm()
+    PLAYER = ADMIN_B
+    Sync.state.isCoordinator = false
+    Sync.state.coordinator = previousPlayer
+    SF.lootHelperDB.profiles[adminB:GetProfileId()] = adminB
+    assertTrue(adminB:AddRCLootCouncilBisResponse({
+        text = "Greed",
+        typeCode = "default",
+        responseId = 2,
+        isAwardReason = false,
+    }), "non-coordinator can send an RC_CONFIG_REQ proposal")
+    local req = lastOfType(captured, Sync.MSG.RC_CONFIG_REQ)
+    assertTrue(req ~= nil, "Admin B sent RC_CONFIG_REQ")
+    assertTrue(req.payload.rcLootCouncilIntegration ~= nil, "REQ carries the proposal")
+    local proposed = adminB:GetProposedRCLootCouncilIntegrationConfig()
+    assertTrue(proposed ~= nil, "Admin B stores a pending proposal")
+    assertEq(proposed.bisResponses[#proposed.bisResponses].responseId, 2, "pending proposal adds Greed as BiS")
+    assertFalse(adminB:IsBisQualifyingResponse("Greed", greedMeta()), "pending Greed BiS is not accepted yet")
+    assertEq(adminB._rcConfigSeq, 4, "proposal does not advance accepted seq")
+
+    local preSetCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, greedHistory("1700003000-pre"))
+    PLAYER = previousPlayer
+    SF.lootHelperDB.profiles[adminA:GetProfileId()] = adminA
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = previousPlayer
+    assertEq(select(2, adminA:TryAddRCLootCouncilAward(preSetCanon)), "filtered", "coordinator still filters Greed before accepting the REQ")
+    PLAYER = ADMIN_B
+    assertEq(select(2, adminB:TryAddRCLootCouncilAward(preSetCanon)), "filtered", "proposer still filters Greed before RC_CONFIG_SET")
+    assertEq(countRCLogs(adminA), 0, "coordinator did not freeze a pre-SET Greed award")
+    assertEq(countRCLogs(adminB), 0, "proposer did not freeze a pre-SET Greed award")
+    assertEq(awardOutcome(adminA, preSetCanon.awardKey), nil, "coordinator wrote no pre-SET BIS_OUTCOME")
+    assertEq(awardOutcome(adminB, preSetCanon.awardKey), nil, "proposer wrote no pre-SET BIS_OUTCOME")
+
+    -- Failed RC_CONFIG_REQ send discards the proposal
+    resetEnv()
+    previousPlayer = PLAYER
+    local failProfile = makeProfile("RC REQ Fail")
+    addMember(failProfile, WINNER)
+    seedNeedOnlyConfig(failProfile)
+    setActive(failProfile)
+    startSessionOn(failProfile)
+    failProfile._rcConfigSeq = 5
+    Sync.state.rcConfigSeq = 5
+    Sync.state.isCoordinator = false
+    Sync.state.coordinator = "Coord-Garona"
+    SF.LootHelperComm = {
+        Send = function()
+            return false
+        end,
+    }
+    local okFail, failErr = failProfile:AddRCLootCouncilBisResponse({
+        text = "Greed",
+        typeCode = "default",
+        responseId = 2,
+        isAwardReason = false,
+    })
+    assertFalse(okFail, "failed REQ send does not report success")
+    assertEq(failErr, "send failed", "failed REQ send surfaces the send error")
+    assertTrue(failProfile:GetProposedRCLootCouncilIntegrationConfig() == nil, "failed REQ send discards pending proposal")
+    assertFalse(failProfile:IsBisQualifyingResponse("Greed", greedMeta()), "failed REQ cannot make Greed BiS-authoritative")
+    assertTrue(failProfile:GetRCLootCouncilIntegrationConfig().recordAllAwardTypes == false, "accepted config is unchanged after REQ failure")
+
+    -- Helper snapshot while a proposal is pending exports accepted config only
+    resetEnv()
+    previousPlayer = PLAYER
+    local helper = makeProfile("RC Helper Pending")
+    addMember(helper, WINNER)
+    addMember(helper, ADMIN_B)
+    assertTrue(helper:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "helper is an admin")
+    seedNeedOnlyConfig(helper)
+    setActive(helper)
+    startSessionOn(helper)
+    helper._rcConfigSeq = 6
+    helper._rcConfigEpoch = Sync.state.coordEpoch
+    Sync.state.rcConfigSeq = 6
+    captured = captureComm()
+    PLAYER = ADMIN_B
+    Sync.state.isCoordinator = false
+    Sync.state.coordinator = "Coord-Garona"
+    assertTrue(helper:AddRCLootCouncilBisResponse({
+        text = "Greed",
+        typeCode = "default",
+        responseId = 2,
+        isAwardReason = false,
+    }), "helper can propose Greed BiS")
+    assertEq(helper._rcConfigSeq, 6, "helper accepted seq stays at 6")
+    local pendingSnap = helper:ExportSnapshot()
+    assertEq(pendingSnap.rcConfigSeq, 6, "helper snapshot keeps accepted seq 6")
+    assertEq(pendingSnap.rcConfigEpoch, helper._rcConfigEpoch, "helper snapshot keeps accepted epoch")
+    assertEq(#pendingSnap.rcLootCouncilIntegration.bisResponses, 1, "helper snapshot does not export the pending BiS list")
+    assertEq(pendingSnap.rcLootCouncilIntegration.bisResponses[1].responseId, 1, "helper snapshot still exports Need-only accepted config")
+    local joiner = makeProfile("RC Joiner")
+    joiner._profileId = helper:GetProfileId()
+    assertTrue((select(1, joiner:ImportSnapshot(pendingSnap))), "joiner imports helper snapshot at equal seq")
+    assertEq(joiner._rcConfigSeq, 6, "joiner stores accepted seq 6")
+    assertFalse(joiner:IsBisQualifyingResponse("Greed", greedMeta()), "equal-seq helper snapshot cannot install the unaccepted proposal")
+    assertTrue(joiner:IsBisQualifyingResponse("Need", {
+        typeCode = "default",
+        responseId = 1,
+        isAwardReason = false,
+    }), "joiner keeps the last accepted Need BiS")
+
+    -- Proposal accepted via SET, then a subsequent award uses the new config
+    PLAYER = previousPlayer
+    resetEnv()
+    previousPlayer = PLAYER
+    adminA = makeProfile("RC Post-SET A")
+    addMember(adminA, WINNER)
+    addMember(adminA, ADMIN_B)
+    assertTrue(adminA:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Admin B may propose")
+    seedNeedOnlyConfig(adminA)
+    setActive(adminA)
+    startSessionOn(adminA)
+    adminA._rcConfigSeq = 7
+    adminA._rcConfigEpoch = Sync.state.coordEpoch
+    Sync.state.rcConfigSeq = 7
+    adminB = cloneProfileAs("RC Post-SET B", adminA)
+    captured = captureComm()
+    PLAYER = ADMIN_B
+    Sync.state.isCoordinator = false
+    Sync.state.coordinator = previousPlayer
+    SF.lootHelperDB.profiles[adminB:GetProfileId()] = adminB
+    assertTrue(adminB:AddRCLootCouncilBisResponse({
+        text = "Greed",
+        typeCode = "default",
+        responseId = 2,
+        isAwardReason = false,
+    }), "Admin B proposes Greed BiS")
+    req = lastOfType(captured, Sync.MSG.RC_CONFIG_REQ)
+    PLAYER = previousPlayer
+    SF.lootHelperDB.profiles[adminA:GetProfileId()] = adminA
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = previousPlayer
+    captured = captureComm()
+    Sync:HandleRCConfigRequest(ADMIN_B, req.payload)
+    local setMsg = lastOfType(captured, Sync.MSG.RC_CONFIG_SET)
+    assertTrue(setMsg ~= nil, "coordinator accepts the REQ and publishes RC_CONFIG_SET")
+    assertTrue(adminA:IsBisQualifyingResponse("Greed", greedMeta()), "coordinator accepted Greed as BiS")
+    PLAYER = "Peer-Garona"
+    withLocalProfile(adminB, function()
+        Sync:HandleRCConfigSet(previousPlayer, setMsg.payload)
+    end)
+    PLAYER = previousPlayer
+    assertTrue(adminB:IsBisQualifyingResponse("Greed", greedMeta()), "follower accepted Greed as BiS from SET")
+    assertTrue(cfgEqual(adminA:GetRCLootCouncilIntegrationConfig(), adminB:GetRCLootCouncilIntegrationConfig()), "both accepted configs match after SET")
+    assertTrue(adminB:GetProposedRCLootCouncilIntegrationConfig() == nil, "SET clears the follower proposal")
+    local postSetCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, greedHistory("1700003001-post"))
+    assertTrue(adminA:TryAddRCLootCouncilAward(postSetCanon), "coordinator records Greed after SET")
+    assertTrue(adminB:TryAddRCLootCouncilAward(postSetCanon), "follower records Greed after SET")
+    local postOutcomeA, postQualA = awardOutcome(adminA, postSetCanon.awardKey)
+    local postOutcomeB, postQualB = awardOutcome(adminB, postSetCanon.awardKey)
+    assertEq(postQualA, true, "coordinator qualifies Greed after SET")
+    assertEq(postQualB, true, "follower qualifies Greed after SET")
+    assertEq(postOutcomeB, postOutcomeA, "post-SET BIS_OUTCOME matches on both clients")
+
+    -- Coordinator takeover with a stale RC seq must not reuse an ignored generation
+    resetEnv()
+    local COORD_C = PLAYER
+    local ADMIN_D = "AdminD-Garona"
+    local coordC = makeProfile("RC Takeover C")
+    addMember(coordC, WINNER)
+    addMember(coordC, ADMIN_D)
+    assertTrue(coordC:AddAdminMemberId(ADMIN_D, { skipPermission = true, skipBroadcast = true }), "Admin D can take over")
+    seedNeedOnlyConfig(coordC)
+    setActive(coordC)
+    startSessionOn(coordC)
+    captured = captureComm()
+    assertTrue(coordC:AddRCLootCouncilAllowedResponse("Offspec"), "coordinator C publishes SET seq N")
+    local firstSet = lastOfType(captured, Sync.MSG.RC_CONFIG_SET)
+    assertTrue(firstSet ~= nil, "coordinator C sent RC_CONFIG_SET")
+    assertEq(firstSet.payload.seq, 1, "first SET is seq 1")
+    local peer = cloneProfileAs("RC Takeover Peer", coordC)
+    assertEq(peer._rcConfigSeq, 1, "peer accepted seq N")
+    local staleD = cloneProfileAs("RC Takeover D", coordC)
+    staleD._rcConfigSeq = 0
+    staleD._rcConfigEpoch = 0
+    seedNeedOnlyConfig(staleD)
+    assertEq(staleD._rcConfigSeq, 0, "Admin D missed SET N and still has N-1")
+
+    PLAYER = ADMIN_D
+    SF.lootHelperDB.profiles[staleD:GetProfileId()] = staleD
+    Sync.state.coordinator = COORD_C
+    Sync.state.isCoordinator = false
+    Sync.state.rcConfigSeq = 0
+    local oldEpoch = tonumber(Sync.state.coordEpoch) or 0
+    captured = captureComm()
+    assertTrue(Sync:TakeoverSession(Sync.state.sessionId, staleD:GetProfileId(), "coord-offline"), "Admin D takes over through production TakeoverSession")
+    assertTrue(Sync.state.isCoordinator, "Admin D is coordinator after takeover")
+    assertTrue(Sync.state.coordEpoch > oldEpoch, "takeover bumps coordEpoch")
+    assertTrue(lastOfType(captured, Sync.MSG.COORD_TAKEOVER) ~= nil, "takeover broadcasts COORD_TAKEOVER")
+    assertTrue(lastOfType(captured, Sync.MSG.SES_REANNOUNCE) ~= nil, "takeover reannounces the session")
+    assertEq(Sync.state.rcConfigSeq, 0, "new coordinator adopted its last accepted RC seq")
+    captured = captureComm()
+    assertTrue(staleD:AddRCLootCouncilBisResponse({
+        text = "Greed",
+        typeCode = "default",
+        responseId = 2,
+        isAwardReason = false,
+    }), "new coordinator publishes RC config after takeover")
+    local takeoverSet = lastOfType(captured, Sync.MSG.RC_CONFIG_SET)
+    assertTrue(takeoverSet ~= nil, "new coordinator sent RC_CONFIG_SET")
+    assertEq(takeoverSet.payload.seq, 1, "stale coordinator would reuse seq N")
+    assertTrue(takeoverSet.payload.coordEpoch > oldEpoch, "new SET is tagged with the takeover epoch")
+    assertTrue(takeoverSet.payload.coordEpoch > (tonumber(peer._rcConfigEpoch) or 0), "incoming epoch is newer than the peer's accepted epoch")
+
+    PLAYER = "Peer-Garona"
+    withLocalProfile(peer, function()
+        Sync:HandleRCConfigSet(ADMIN_D, takeoverSet.payload)
+    end)
+    PLAYER = COORD_C
+    assertTrue(peer:IsBisQualifyingResponse("Greed", greedMeta()), "peer accepts the new coordinator SET despite a colliding seq")
+    assertEq(peer._rcConfigSeq, 1, "peer stores the reused seq under the new epoch")
+    assertEq(peer._rcConfigEpoch, takeoverSet.payload.coordEpoch, "peer stores the takeover RC config epoch")
+    assertTrue(staleD:IsBisQualifyingResponse("Greed", greedMeta()), "new coordinator's accepted config includes Greed")
+end
+testAcceptedVsPendingAndTakeover()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
