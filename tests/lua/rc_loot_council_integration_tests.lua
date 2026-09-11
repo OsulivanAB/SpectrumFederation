@@ -1277,6 +1277,83 @@ Sync.state.active = false
 assertEq(Integration.GetSettingsProfile(), selectedB, "Settings use the selected profile when no session is active")
 assertFalse(capturedDef.isAdmin(), "renderer admin follows the selected profile outside a session")
 
+-- RCLC award-reason identity follows history sort-400, not array index or typeCode
+resetEnv()
+_G.RCLootCouncil = {
+    Getdb = function()
+        return {
+            profile = {
+                responses = {
+                    default = {
+                        [1] = { text = "Need" },
+                    },
+                    WEAPON = {
+                        [1] = { text = "Need" },
+                    },
+                },
+                awardReasons = {
+                    { text = "Bank", sort = 401, log = true },
+                    { text = "Disenchant", sort = 405, log = true },
+                },
+            },
+        }
+    end,
+}
+assertEq(Integration.AwardReasonHistoryResponseId({ sort = 405 }), 5, "history responseID is sort-400")
+local rcOptions = Integration.GetRCResponseOptions()
+local sawDefaultNeed, sawWeaponNeed, sawBank, sawDisenchant = false, false, false, false
+local disenchantOption
+for i = 1, #rcOptions do
+    local opt = rcOptions[i]
+    if opt.isAwardReason then
+        assertTrue(opt.typeCode == nil, "award-reason option does not invent typeCode awardReason")
+        if opt.responseId == 1 and opt.textLabel == "Bank" then
+            sawBank = true
+        end
+        if opt.responseId == 5 and opt.textLabel == "Disenchant" then
+            sawDisenchant = true
+            disenchantOption = opt
+        end
+        assertFalse(opt.responseId == 2 and opt.textLabel == "Disenchant", "array index is not the persisted award-reason id")
+    else
+        if opt.typeCode == "default" and opt.responseId == 1 then
+            sawDefaultNeed = true
+        end
+        if opt.typeCode == "WEAPON" and opt.responseId == 1 then
+            sawWeaponNeed = true
+        end
+    end
+end
+assertTrue(sawDefaultNeed, "normal default Need is enumerated")
+assertTrue(sawWeaponNeed, "same responseId exists in a second typeCode")
+assertTrue(sawBank, "default-shaped award reason uses sort-400")
+assertTrue(sawDisenchant, "reordered award reason uses sort-400 rather than ipairs index")
+
+local awardProfile = makeProfile("AwardReasonBis")
+addMember(awardProfile, WINNER)
+setActive(awardProfile)
+assertTrue(awardProfile:AddRCLootCouncilBisResponse({
+    text = disenchantOption.textLabel,
+    responseId = disenchantOption.responseId,
+    isAwardReason = true,
+}), "configure the real RCLC award reason")
+assertTrue(awardProfile:IsBisQualifyingResponse("Disenchant", {
+    typeCode = "default",
+    responseId = 5,
+    isAwardReason = true,
+}), "real-shaped award-reason history qualifies")
+assertTrue(awardProfile:IsBisQualifyingResponse("Disenchant", {
+    typeCode = "WEAPON",
+    responseId = 5,
+    isAwardReason = true,
+}), "award reason still matches when the item typeCode differs")
+assertFalse(awardProfile:IsBisQualifyingResponse("Need", {
+    typeCode = "default",
+    responseId = 5,
+    isAwardReason = false,
+}), "non-award response with the same numeric id does not match")
+_G.RCLootCouncil = nil
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

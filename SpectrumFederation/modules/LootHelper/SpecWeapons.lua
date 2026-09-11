@@ -98,6 +98,44 @@ local CLASS_SPECS = {
     EVOKER = { 1467, 1468, 1473 },
 }
 
+-- Enum.ItemWeaponSubclass (stable). There is no reliable Retail API that answers
+-- "can this other profile character/class/spec use this weapon?" C_Item.IsEquippableItem
+-- is the local player; C_Item.GetItemSpecInfo is item-drop spec restriction, not class
+-- proficiency. Unknown subclass IDs fail closed.
+local AXE1H, AXE2H, BOW, GUN = 0, 1, 2, 3
+local MACE1H, MACE2H, POLEARM = 4, 5, 6
+local SWORD1H, SWORD2H, WARGLAIVE, STAFF = 7, 8, 9, 10
+local FIST, DAGGER, CROSSBOW, WAND = 13, 15, 18, 19
+local ITEM_CLASS_WEAPON, ITEM_CLASS_ARMOR = 2, 4
+local ARMOR_SHIELD = 6
+
+local function Subset(...)
+    local t = {}
+    local n = select("#", ...)
+    for i = 1, n do
+        t[select(i, ...)] = true
+    end
+    return t
+end
+
+-- Class-level weapon proficiency. Spec FLAGS still decide combat slotting
+-- (2H vs 1H+shield vs dual-wield vs ranged-as-Weapon).
+local CLASS_WEAPON_SUBCLASS = {
+    WARRIOR = Subset(AXE1H, AXE2H, MACE1H, MACE2H, POLEARM, SWORD1H, SWORD2H, STAFF, FIST, DAGGER, BOW, GUN, CROSSBOW),
+    PALADIN = Subset(AXE1H, AXE2H, MACE1H, MACE2H, POLEARM, SWORD1H, SWORD2H),
+    HUNTER = Subset(AXE1H, AXE2H, SWORD1H, SWORD2H, POLEARM, STAFF, FIST, DAGGER, BOW, GUN, CROSSBOW),
+    ROGUE = Subset(AXE1H, MACE1H, SWORD1H, FIST, DAGGER),
+    PRIEST = Subset(MACE1H, STAFF, DAGGER, WAND),
+    DEATHKNIGHT = Subset(AXE1H, AXE2H, MACE1H, MACE2H, POLEARM, SWORD1H, SWORD2H),
+    SHAMAN = Subset(AXE1H, AXE2H, MACE1H, MACE2H, STAFF, FIST, DAGGER),
+    MAGE = Subset(SWORD1H, STAFF, DAGGER, WAND),
+    WARLOCK = Subset(SWORD1H, STAFF, DAGGER, WAND),
+    MONK = Subset(AXE1H, MACE1H, SWORD1H, POLEARM, STAFF, FIST),
+    DRUID = Subset(MACE1H, MACE2H, POLEARM, STAFF, FIST, DAGGER),
+    DEMONHUNTER = Subset(AXE1H, SWORD1H, WARGLAIVE, FIST),
+    EVOKER = Subset(MACE1H, MACE2H, STAFF, FIST, DAGGER),
+}
+
 -- Fallback display names when GetSpecializationInfoByID is unavailable.
 local SPEC_NAMES = {
     [71] = "Arms",
@@ -200,6 +238,41 @@ function SpecWeapons.ClassForSpec(specId)
         end
     end
     return nil
+end
+
+function SpecWeapons.IsRangedEquipLoc(equipLoc)
+    return equipLoc == "INVTYPE_RANGED" or equipLoc == "INVTYPE_RANGEDRIGHT"
+end
+
+-- Fail-closed subclass/proficiency check for another profile character.
+-- Shields and holdables are slot-flag questions, not weapon-subclass questions.
+function SpecWeapons.IsItemAllowedForSpec(specId, classif)
+    specId = tonumber(specId)
+    if not specId or type(classif) ~= "table" then
+        return false
+    end
+    if not SpecWeapons.IsKnownSpec(specId) then
+        return false
+    end
+    local loc = classif.equipLoc
+    if loc == "INVTYPE_SHIELD" then
+        return tonumber(classif.itemClass) == ITEM_CLASS_ARMOR
+            and tonumber(classif.itemSubClass) == ARMOR_SHIELD
+    end
+    if loc == "INVTYPE_HOLDABLE" then
+        return tonumber(classif.itemClass) == ITEM_CLASS_ARMOR
+    end
+    if classif.family ~= "weapon" and not classif.isWeaponLoc and not classif.isOffHandLoc then
+        return true
+    end
+    local classToken = SpecWeapons.ClassForSpec(specId)
+    local allowed = classToken and CLASS_WEAPON_SUBCLASS[classToken]
+    local itemClass = tonumber(classif.itemClass)
+    local subClass = tonumber(classif.itemSubClass)
+    if not allowed or itemClass ~= ITEM_CLASS_WEAPON or subClass == nil then
+        return false
+    end
+    return allowed[subClass] == true
 end
 
 -- GetSpecializationInfoByID returns id, name, description, icon, role, ...

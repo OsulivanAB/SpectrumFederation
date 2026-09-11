@@ -341,6 +341,27 @@ local function DeactivateAssignment(state, assignmentId)
     end
 end
 
+local function WeaponProficiencyOk(classif, specId)
+    specId = tonumber(specId)
+    local SpecWeapons = SF.LootHelperBis.SpecWeapons
+    if not specId then
+        return false, "MISSING_SPEC"
+    end
+    if not (SpecWeapons and SpecWeapons.IsItemAllowedForSpec) then
+        return false, "UNKNOWN_COMPAT"
+    end
+    if not SpecWeapons.IsItemAllowedForSpec(specId, classif) then
+        return false, "UNKNOWN_COMPAT"
+    end
+    return true, nil
+end
+
+local function IsRangedWeaponLoc(classif)
+    local SpecWeapons = SF.LootHelperBis.SpecWeapons
+    return classif and SpecWeapons and SpecWeapons.IsRangedEquipLoc
+        and SpecWeapons.IsRangedEquipLoc(classif.equipLoc)
+end
+
 function Bis.WeaponAssignSlots(classif, specId, occupancy)
     occupancy = occupancy or {}
     if not classif or not classif.isWeaponLoc and not classif.isOffHandLoc then
@@ -351,8 +372,19 @@ function Bis.WeaponAssignSlots(classif, specId, occupancy)
     if not specId or not flags then
         return nil, specId and "UNKNOWN_COMPAT" or "MISSING_SPEC"
     end
+    local okProf, profErr = WeaponProficiencyOk(classif, specId)
+    if not okProf then
+        return nil, profErr
+    end
     local weaponFree = occupancy.Weapon ~= true
     local offFree = occupancy.OffHand ~= true
+
+    if IsRangedWeaponLoc(classif) then
+        if not weaponFree then
+            return {}, nil
+        end
+        return { "Weapon" }, nil
+    end
 
     if classif.isOffHandLoc then
         local loc = classif.equipLoc
@@ -479,6 +511,16 @@ function Bis.ItemFitsSlots(classif, slots, specId)
         local flags = specId and SF.LootHelperBis.SpecWeapons and SF.LootHelperBis.SpecWeapons.GetFlags(specId)
         if not specId or not flags then
             return false, specId and "UNKNOWN_COMPAT" or "MISSING_SPEC"
+        end
+        local okProf, profErr = WeaponProficiencyOk(classif, specId)
+        if not okProf then
+            return false, profErr
+        end
+        if IsRangedWeaponLoc(classif) then
+            if #slots == 1 and slots[1] == "Weapon" then
+                return true, nil
+            end
+            return false, "INCOMPATIBLE_SLOT"
         end
         if classif.isOffHandLoc then
             if #slots ~= 1 or slots[1] ~= "OffHand" then
@@ -1021,13 +1063,24 @@ local function CreateAssignment(state, opts)
     if #slots == 2 then
         slots = { "Weapon", "OffHand" }
     end
-    local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
-    if not classif then
-        return nil
-    end
-    local specId = opts.specId or (award.member and state.specs[award.member])
-    if not Bis.ItemFitsSlots(classif, slots, specId) then
-        return nil
+    local classif
+    if opts.replayFrozen then
+        classif = opts.frozenClassif
+        if not classif then
+            return nil
+        end
+        if not Bis.FrozenSlotsInternallyConsistent(classif, slots) then
+            return nil
+        end
+    else
+        classif = Bis.ClassifyItem(award.itemLink or award.itemString)
+        if not classif then
+            return nil
+        end
+        local specId = opts.specId or (award.member and state.specs[award.member])
+        if not Bis.ItemFitsSlots(classif, slots, specId) then
+            return nil
+        end
     end
     local asg = {
         id = opts.id,
@@ -1135,6 +1188,72 @@ function Bis.IsOutcomeSchemaValid(data)
         end
     end
     return true
+end
+
+function Bis.ClassifFromFrozenOutcome(data)
+    if type(data) ~= "table" then
+        return nil
+    end
+    local equipLoc = data.equipLoc
+    if type(equipLoc) ~= "string" or equipLoc == "" then
+        return nil
+    end
+    local mapped = EQUIP_TO_SLOT[equipLoc]
+    if not mapped then
+        return nil
+    end
+    local family = data.itemFamily
+    if type(family) ~= "string" or family == "" then
+        if mapped ~= "ring" and mapped ~= "trinket" and mapped ~= "weapon" and mapped ~= "offhand" then
+            family = "ordinary"
+        else
+            family = mapped
+        end
+    end
+    return {
+        equipLoc = equipLoc,
+        family = family,
+        slot = (family == "ordinary") and mapped or nil,
+        itemClass = data.itemClass,
+        itemSubClass = data.itemSubClass,
+        isTwoHand = data.isTwoHand == true or equipLoc == "INVTYPE_2HWEAPON",
+        isOffHandLoc = mapped == "offhand",
+        isWeaponLoc = mapped == "weapon",
+    }
+end
+
+-- Internal consistency of a frozen AUTO assignment. Does not consult live
+-- SpecWeapons tables or GetItemInfoInstant.
+function Bis.FrozenSlotsInternallyConsistent(classif, slots)
+    if type(classif) ~= "table" or not Bis.IsLegalSlotShape(slots) then
+        return false
+    end
+    local family = classif.family
+    if family == "ordinary" then
+        return #slots == 1 and slots[1] == classif.slot
+    end
+    if family == "ring" then
+        return #slots == 1 and RING_INDEX[slots[1]] ~= nil
+    end
+    if family == "trinket" then
+        return #slots == 1 and TRINKET_INDEX[slots[1]] ~= nil
+    end
+    if family == "weapon" or classif.isWeaponLoc or classif.isOffHandLoc then
+        if IsRangedWeaponLoc(classif) then
+            return #slots == 1 and slots[1] == "Weapon"
+        end
+        if classif.isOffHandLoc then
+            return #slots == 1 and slots[1] == "OffHand"
+        end
+        if classif.isTwoHand then
+            if #slots == 2 then
+                return true
+            end
+            return #slots == 1 and (slots[1] == "Weapon" or slots[1] == "OffHand")
+        end
+        return #slots == 1 and (slots[1] == "Weapon" or slots[1] == "OffHand")
+    end
+    return false
 end
 
 function Bis.IsOutcomeSourceConsistent(data, rcLog)
@@ -1303,6 +1422,8 @@ function Bis.ApplyLog(state, log, ctx)
             source = "AUTO",
             specId = data.specIdUsed,
             rank = rank,
+            replayFrozen = true,
+            frozenClassif = Bis.ClassifFromFrozenOutcome(data),
         })
         if not asg then
             return
@@ -1369,6 +1490,9 @@ function Bis.ApplyLog(state, log, ctx)
                 if cell and cell.state and cell.state ~= "AVAILABLE" then
                     return
                 end
+                if ctx.SlotOccupied and ctx.SlotOccupied(award.member, slots[i]) then
+                    return
+                end
             end
             CreateAssignment(state, {
                 id = logId,
@@ -1425,6 +1549,10 @@ function Bis.ApplyLog(state, log, ctx)
                     ok = false
                     break
                 end
+                if ctx.SlotOccupied and ctx.SlotOccupied(award.member, slots[i]) then
+                    ok = false
+                    break
+                end
             end
             if not ok or (data.slotBinding ~= Bis.BINDING.PACKABLE and data.slotBinding ~= Bis.BINDING.BOUND) then
                 restore()
@@ -1468,6 +1596,9 @@ function Bis.ApplyLog(state, log, ctx)
                 rec = Bis.GetOccupancyOrigin(state, originId)
             end
             if not rec then
+                return
+            end
+            if rec.isOverflow then
                 return
             end
             local originSlot = rec.slot
@@ -1710,7 +1841,7 @@ function Bis.LegacyOriginsForDisplay(state, memberId, identityOf)
             elseif rec.member and set[rec.member] then
                 include = true
             end
-            if include then
+            if include and rec.isOverflow ~= true then
                 out[#out + 1] = {
                     originLogId = rec.originLogId or originId,
                     member = rec.member,

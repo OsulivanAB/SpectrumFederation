@@ -93,6 +93,14 @@ local ITEM_META = {
     ["19009"] = { loc = "INVTYPE_HOLDABLE", class = 4, sub = 0 },
     ["19010"] = { loc = "INVTYPE_HEAD", class = 4, sub = 4 },
     ["19011"] = { loc = "INVTYPE_SHIELD", class = 4, sub = 6 },
+    ["19012"] = { loc = "INVTYPE_2HWEAPON", class = 2, sub = 10 },
+    ["19013"] = { loc = "INVTYPE_2HWEAPON", class = 2, sub = 6 },
+    ["19014"] = { loc = "INVTYPE_2HWEAPON", class = 2, sub = 5 },
+    ["19015"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 15 },
+    ["19016"] = { loc = "INVTYPE_RANGED", class = 2, sub = 2 },
+    ["19017"] = { loc = "INVTYPE_RANGEDRIGHT", class = 2, sub = 19 },
+    ["19018"] = { loc = "INVTYPE_WEAPON", class = 2, sub = 9 },
+    ["19019"] = { loc = "INVTYPE_2HWEAPON", class = 2, sub = 1 },
 }
 
 function GetItemInfoInstant(link)
@@ -222,6 +230,17 @@ local function itemLink(itemId, name)
     return string.format("|cffa335ee|Hitem:%s::::::::80:259:::::::::|h[%s]|h|r", tostring(itemId), name or "Item")
 end
 
+local function withFrozen(data, itemId)
+    local classif = SF.LootHelperBis.ClassifyItem(itemLink(itemId, "x"))
+    assertTrue(classif ~= nil, "frozen classif exists for item " .. tostring(itemId))
+    data.equipLoc = classif.equipLoc
+    data.itemClass = classif.itemClass
+    data.itemSubClass = classif.itemSubClass
+    data.itemFamily = classif.family
+    data.isTwoHand = classif.isTwoHand
+    return data
+end
+
 local function insertRC(profile, canonical)
     local eventData = SF.LootLog.BuildRCLootCouncilEventData(canonical)
     local log = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, eventData, {
@@ -348,7 +367,7 @@ local orphan = makeProfile("Orphan")
 addMember(orphan, ALT_A)
 local rcCanon = makeCanonical(ALT_A, 19007, "Need", "1700002100")
 assertTrue(orphan:AddRCLootCouncilBisResponse("Need"))
-addLog(orphan, "BIS_OUTCOME", {
+addLog(orphan, "BIS_OUTCOME", withFrozen({
     sourceLogId = rcCanon.awardKey,
     awardKey = rcCanon.awardKey,
     awardMember = ALT_A,
@@ -357,7 +376,7 @@ addLog(orphan, "BIS_OUTCOME", {
     assignedSlots = { "Back" },
     slotBinding = "BOUND",
     assignmentScopeMembers = { ALT_A },
-})
+}, 19007))
 orphan:ApplyIdentityProjection({ force = true })
 assertEq(slotState(orphan, ALT_A, "Back"), "AVAILABLE", "orphan outcome does not assign without RC")
 assertTrue(orphan:TryAddRCLootCouncilAward(rcCanon), "RC source arrives later")
@@ -370,7 +389,7 @@ local firstWins = makeProfile("FirstWins")
 addMember(firstWins, ALT_A)
 local keyCanon = makeCanonical(ALT_A, 19008, "Need", "1700002200")
 insertRC(firstWins, keyCanon)
-addLog(firstWins, "BIS_OUTCOME", {
+addLog(firstWins, "BIS_OUTCOME", withFrozen({
     sourceLogId = keyCanon.awardKey,
     awardKey = keyCanon.awardKey,
     awardMember = ALT_A,
@@ -379,7 +398,7 @@ addLog(firstWins, "BIS_OUTCOME", {
     assignedSlots = { "Chest" },
     slotBinding = "BOUND",
     assignmentScopeMembers = { ALT_A },
-}, { author = ZULU })
+}, 19008), { author = ZULU })
 addLog(firstWins, "BIS_OUTCOME", {
     sourceLogId = keyCanon.awardKey,
     awardKey = keyCanon.awardKey,
@@ -408,7 +427,7 @@ addLog(mismatch, "BIS_OUTCOME", {
     slotBinding = "BOUND",
     assignmentScopeMembers = { ALT_B },
 })
-addLog(mismatch, "BIS_OUTCOME", {
+addLog(mismatch, "BIS_OUTCOME", withFrozen({
     sourceLogId = rcA.awardKey,
     awardKey = rcA.awardKey,
     awardMember = ALT_A,
@@ -417,7 +436,7 @@ addLog(mismatch, "BIS_OUTCOME", {
     assignedSlots = { "Head" },
     slotBinding = "BOUND",
     assignmentScopeMembers = { ALT_A },
-})
+}, 19001))
 mismatch:ApplyIdentityProjection({ force = true })
 assertEq(slotState(mismatch, ALT_A, "Head"), "ASSIGNED_AUTO", "first source-consistent outcome wins")
 assertEq(slotState(mismatch, ALT_B, "Head"), "AVAILABLE", "mismatched outcome does not retarget B")
@@ -1142,9 +1161,27 @@ assertTrue(ctxP:AddRCLootCouncilBisResponse({
 assertTrue(ctxP:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 1, isAwardReason = false }), "same context matches")
 assertFalse(ctxP:IsBisQualifyingResponse("Need", { typeCode = "WEAPON", responseId = 1, isAwardReason = false }), "same responseId different typeCode does not match")
 assertFalse(ctxP:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 1, isAwardReason = true }), "award reason does not match normal response")
+assertFalse(ctxP:IsBisQualifyingResponse("Need", { typeCode = "default" }), "contextual entry does not fall back to label matching")
+assertTrue(ctxP:AddRCLootCouncilBisResponse({
+    text = "Need",
+    typeCode = "WEAPON",
+    responseId = 1,
+    isAwardReason = false,
+}), "same responseId in a second typeCode")
+assertTrue(ctxP:IsBisQualifyingResponse("Need", { typeCode = "WEAPON", responseId = 1, isAwardReason = false }), "second typeCode matches its own contextual entry")
+assertTrue(ctxP:AddRCLootCouncilBisResponse({
+    text = "Bank",
+    isAwardReason = true,
+    responseId = 3,
+}), "award reason uses persisted history responseId")
+assertTrue(ctxP:IsBisQualifyingResponse("Bank", { typeCode = "default", responseId = 3, isAwardReason = true }), "award reason matches despite item typeCode default")
+assertTrue(ctxP:IsBisQualifyingResponse("Bank", { typeCode = "WEAPON", responseId = 3, isAwardReason = true }), "award reason ignores item typeCode")
+assertFalse(ctxP:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 3, isAwardReason = false }), "non-award responseId does not match award reason")
+assertFalse(ctxP:IsBisQualifyingResponse("Bank", { typeCode = "awardReason", responseId = 1, isAwardReason = true }), "array index is not assumed to be the persisted award-reason id")
 resetEnv()
 local textP = makeProfile("TextBis")
 assertTrue(textP:AddRCLootCouncilBisResponse("Need"), "text-only fallback")
+assertTrue(textP:IsBisQualifyingResponse("Need", { typeCode = "default" }), "legacy text entry still qualifies label-only awards")
 assertTrue(textP:IsBisQualifyingResponse("Need", { typeCode = "WEAPON", responseId = 2 }), "historical text-only still matches by label")
 assertTrue(textP:SetRCLootCouncilRecordAwards(false))
 assertFalse(textP:ShouldRecordRCResponse("Need"), "recordAwards off disables live recording")
@@ -1326,7 +1363,7 @@ addMember(badAuto, ALT_A)
 assertTrue(badAuto:SetMemberSpec(ALT_A, 73), "Protection Warrior")
 local shieldCanon = makeCanonical(ALT_A, 19011, "Need", "1700010000")
 insertRC(badAuto, shieldCanon)
-addLog(badAuto, "BIS_OUTCOME", {
+addLog(badAuto, "BIS_OUTCOME", withFrozen({
     sourceLogId = shieldCanon.awardKey,
     awardKey = shieldCanon.awardKey,
     awardMember = ALT_A,
@@ -1336,8 +1373,8 @@ addLog(badAuto, "BIS_OUTCOME", {
     slotBinding = "BOUND",
     assignmentScopeMembers = { ALT_A },
     specIdUsed = 73,
-}, { author = ZULU })
-addLog(badAuto, "BIS_OUTCOME", {
+}, 19011), { author = ZULU })
+addLog(badAuto, "BIS_OUTCOME", withFrozen({
     sourceLogId = shieldCanon.awardKey,
     awardKey = shieldCanon.awardKey,
     awardMember = ALT_A,
@@ -1347,7 +1384,7 @@ addLog(badAuto, "BIS_OUTCOME", {
     slotBinding = "BOUND",
     assignmentScopeMembers = { ALT_A },
     specIdUsed = 73,
-}, { author = OWNER })
+}, 19011), { author = OWNER })
 badAuto:ApplyIdentityProjection({ force = true })
 assertEq(slotState(badAuto, ALT_A, "Weapon"), "AVAILABLE", "shield AUTO cannot occupy Weapon")
 assertEq(slotState(badAuto, ALT_A, "OffHand"), "ASSIGNED_AUTO", "later compatible AUTO outcome still wins")
@@ -1359,7 +1396,7 @@ addMember(occupiedAuto, ALT_A)
 addLog(occupiedAuto, "ARMOR_CHANGE", { member = ALT_A, slot = "Head", action = "USED" })
 local occupiedCanon = makeCanonical(ALT_A, 19001, "Need", "1700011000")
 insertRC(occupiedAuto, occupiedCanon)
-addLog(occupiedAuto, "BIS_OUTCOME", {
+addLog(occupiedAuto, "BIS_OUTCOME", withFrozen({
     sourceLogId = occupiedCanon.awardKey,
     awardKey = occupiedCanon.awardKey,
     awardMember = ALT_A,
@@ -1368,11 +1405,391 @@ addLog(occupiedAuto, "BIS_OUTCOME", {
     assignedSlots = { "Head" },
     slotBinding = "BOUND",
     assignmentScopeMembers = { ALT_A },
-})
+}, 19001))
 occupiedAuto:ApplyIdentityProjection({ force = true })
 assertEq(slotState(occupiedAuto, ALT_A, "Head"), "LEGACY_UNKNOWN", "malformed AUTO does not overlay #278 occupancy")
+
+local function extraCorrectnessTests()
+-- Frozen AUTO replay ignores live classifier/proficiency changes
+resetEnv()
+local frozenAuto = makeProfile("FrozenAuto")
+addMember(frozenAuto, ALT_A)
+assertTrue(frozenAuto:AddRCLootCouncilBisResponse("Need"))
+assertTrue(frozenAuto:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19001, "Need", "1700012000")))
+frozenAuto:ApplyIdentityProjection({ force = true })
+assertEq(slotState(frozenAuto, ALT_A, "Head"), "ASSIGNED_AUTO", "AUTO helm assigned before stub")
+local origClassify = SF.LootHelperBis.ClassifyItem
+local origAllowed = SF.LootHelperBis.SpecWeapons.IsItemAllowedForSpec
+SF.LootHelperBis.ClassifyItem = function()
+    return nil
+end
+SF.LootHelperBis.SpecWeapons.IsItemAllowedForSpec = function()
+    return false
+end
+frozenAuto:ApplyIdentityProjection({ force = true })
+assertEq(slotState(frozenAuto, ALT_A, "Head"), "ASSIGNED_AUTO", "frozen AUTO still reconstructs after live classifier stub")
+SF.LootHelperBis.ClassifyItem = origClassify
+SF.LootHelperBis.SpecWeapons.IsItemAllowedForSpec = origAllowed
+
+-- ASSIGNED AUTO without frozen facts fails closed
+resetEnv()
+local missingFrozen = makeProfile("MissingFrozen")
+addMember(missingFrozen, ALT_A)
+local missingCanon = makeCanonical(ALT_A, 19001, "Need", "1700012100")
+insertRC(missingFrozen, missingCanon)
+addLog(missingFrozen, "BIS_OUTCOME", {
+    sourceLogId = missingCanon.awardKey,
+    awardKey = missingCanon.awardKey,
+    awardMember = ALT_A,
+    qualified = true,
+    outcome = "ASSIGNED",
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+})
+missingFrozen:ApplyIdentityProjection({ force = true })
+assertEq(slotState(missingFrozen, ALT_A, "Head"), "AVAILABLE", "ASSIGNED AUTO without frozen facts does not reconstruct")
+
+-- Weapon subclass: two 2H specs, different subtypes
+resetEnv()
+local priestStaff = makeProfile("PriestStaff")
+addMember(priestStaff, ALT_A, "member", "PRIEST")
+assertTrue(priestStaff:SetMemberSpec(ALT_A, 257))
+assertTrue(priestStaff:AddRCLootCouncilBisResponse("Need"))
+assertTrue(priestStaff:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19012, "Need", "1700013000")))
+priestStaff:ApplyIdentityProjection({ force = true })
+assertEq(slotState(priestStaff, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Holy Priest accepts a staff")
+assertEq(slotState(priestStaff, ALT_A, "OffHand"), "ASSIGNED_AUTO", "Priest 2H staff occupies both slots")
+assertTrue(priestStaff:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700013001")))
+local priestSwordUnresolved = false
+for _, log in ipairs(priestStaff:GetLootLogs()) do
+    local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+    if data and data.unresolvedReason == "UNKNOWN_COMPAT" then
+        priestSwordUnresolved = true
+    end
+end
+assertTrue(priestSwordUnresolved, "Holy Priest rejects a 2H sword")
+
+resetEnv()
+local retP = makeProfile("RetStaff")
+addMember(retP, ALT_A, "member", "PALADIN")
+assertTrue(retP:SetMemberSpec(ALT_A, 70))
+assertTrue(retP:AddRCLootCouncilBisResponse("Need"))
+assertTrue(retP:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700013100")))
+retP:ApplyIdentityProjection({ force = true })
+assertEq(slotState(retP, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Ret Paladin accepts a 2H sword")
+assertTrue(retP:AddManualAward(ALT_A, itemLink(19012, "Staff")))
+local staffId
+for _, award in ipairs(retP:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        staffId = award.id
+    end
+end
+assertFalse(retP:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = staffId },
+    assignedSlots = { "Weapon" },
+    slotBinding = "BOUND",
+}), "Ret Paladin cannot assign a staff")
+
+resetEnv()
+local surv = makeProfile("SurvMace")
+addMember(surv, ALT_A, "member", "HUNTER")
+assertTrue(surv:SetMemberSpec(ALT_A, 255))
+assertTrue(surv:AddRCLootCouncilBisResponse("Need"))
+assertTrue(surv:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19013, "Need", "1700013200")))
+surv:ApplyIdentityProjection({ force = true })
+assertEq(slotState(surv, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Survival Hunter accepts a polearm")
+assertTrue(surv:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19014, "Need", "1700013201")))
+local survMaceUnresolved = false
+for _, log in ipairs(surv:GetLootLogs()) do
+    local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+    if data and data.unresolvedReason == "UNKNOWN_COMPAT" then
+        survMaceUnresolved = true
+    end
+end
+assertTrue(survMaceUnresolved, "Survival Hunter rejects a 2H mace")
+
+-- Ranged vs melee / dual-wield
+resetEnv()
+local bm = makeProfile("BMBow")
+addMember(bm, ALT_A, "member", "HUNTER")
+assertTrue(bm:SetMemberSpec(ALT_A, 253))
+assertTrue(bm:AddRCLootCouncilBisResponse("Need"))
+assertTrue(bm:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19016, "Need", "1700013300")))
+bm:ApplyIdentityProjection({ force = true })
+assertEq(slotState(bm, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Beast Mastery bow occupies Weapon")
+assertEq(slotState(bm, ALT_A, "OffHand"), "AVAILABLE", "ranged loc is never an OffHand candidate")
+
+resetEnv()
+local rogueBow = makeProfile("RogueBow")
+addMember(rogueBow, ALT_A, "member", "ROGUE")
+assertTrue(rogueBow:SetMemberSpec(ALT_A, 259))
+assertTrue(rogueBow:AddRCLootCouncilBisResponse("Need"))
+assertTrue(rogueBow:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19016, "Need", "1700013400")))
+local rogueBowUnresolved = false
+for _, log in ipairs(rogueBow:GetLootLogs()) do
+    local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+    if data and data.unresolvedReason == "UNKNOWN_COMPAT" then
+        rogueBowUnresolved = true
+    end
+end
+assertTrue(rogueBowUnresolved, "Rogue rejects a bow")
+assertTrue(rogueBow:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19015, "Need", "1700013401")))
+assertTrue(rogueBow:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19015, "Need", "1700013402")))
+rogueBow:ApplyIdentityProjection({ force = true })
+assertEq(slotState(rogueBow, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Rogue first dagger is Weapon")
+assertEq(slotState(rogueBow, ALT_A, "OffHand"), "ASSIGNED_AUTO", "Rogue dual-wields a second dagger")
+
+resetEnv()
+local mageWand = makeProfile("MageWand")
+addMember(mageWand, ALT_A, "member", "MAGE")
+assertTrue(mageWand:SetMemberSpec(ALT_A, 62))
+assertTrue(mageWand:AddRCLootCouncilBisResponse("Need"))
+assertTrue(mageWand:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19017, "Need", "1700013500")))
+mageWand:ApplyIdentityProjection({ force = true })
+assertEq(slotState(mageWand, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Mage wand occupies Weapon")
+assertTrue(mageWand:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19004, "Need", "1700013501")))
+local mageTwoHUnresolved = false
+for _, log in ipairs(mageWand:GetLootLogs()) do
+    local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+    if data and data.unresolvedReason == "UNKNOWN_COMPAT" then
+        mageTwoHUnresolved = true
+    end
+end
+assertTrue(mageTwoHUnresolved, "Mage rejects a 2H sword")
+
+-- Writer occupancy parity: 2H OffHand click cannot succeed while Weapon is occupied
+resetEnv()
+local twoHBlock = makeProfile("TwoHBlock")
+addMember(twoHBlock, ALT_A)
+assertTrue(twoHBlock:SetMemberSpec(ALT_A, 71), "Arms")
+assertTrue(twoHBlock:AddRCLootCouncilBisResponse("Need"))
+assertTrue(twoHBlock:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700013600")))
+twoHBlock:ApplyIdentityProjection({ force = true })
+assertEq(slotState(twoHBlock, ALT_A, "Weapon"), "ASSIGNED_AUTO", "1H occupies Weapon")
+assertTrue(twoHBlock:AddManualAward(ALT_A, itemLink(19004, "TwoHand")))
+local twoHId
+for _, award in ipairs(twoHBlock:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" and tostring(award.itemString or ""):find("item:19004", 1, true) then
+        twoHId = award.id
+    end
+end
+local beforeLogs = #(twoHBlock:GetLootLogs() or {})
+assertFalse(twoHBlock:ApplyBisOverride("ASSIGN", {
+    viewMember = ALT_A,
+    awardRef = { kind = "MANUAL", id = twoHId },
+    assignedSlots = { "OffHand" },
+    slotBinding = "BOUND",
+}), "normal 2H cannot expand onto occupied Weapon")
+assertEq(#(twoHBlock:GetLootLogs() or {}), beforeLogs, "ineffective 2H override is not appended")
+
+-- REPLACE 2H also accounts for the other occupied slot
+resetEnv()
+local holyReplace = makeProfile("HolyReplace")
+addMember(holyReplace, ALT_A, "member", "PALADIN")
+assertTrue(holyReplace:SetMemberSpec(ALT_A, 65))
+assertTrue(holyReplace:AddRCLootCouncilBisResponse("Need"))
+assertTrue(holyReplace:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19005, "Need", "1700014000")))
+assertTrue(holyReplace:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19011, "Need", "1700014001")))
+holyReplace:ApplyIdentityProjection({ force = true })
+assertEq(slotState(holyReplace, ALT_A, "Weapon"), "ASSIGNED_AUTO", "Holy 1H Weapon")
+assertEq(slotState(holyReplace, ALT_A, "OffHand"), "ASSIGNED_AUTO", "Holy shield OffHand")
+local holyWeaponAsg = holyReplace:GetIdentityBisSlots(ALT_A).Weapon.assignmentId
+assertTrue(holyReplace:AddManualAward(ALT_A, itemLink(19004, "TwoHand")))
+local holyTwoH
+for _, award in ipairs(holyReplace:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" and tostring(award.itemString or ""):find("item:19004", 1, true) then
+        holyTwoH = award.id
+    end
+end
+local holyBefore = #(holyReplace:GetLootLogs() or {})
+assertFalse(holyReplace:ApplyBisOverride("REPLACE", {
+    viewMember = ALT_A,
+    targetAssignmentId = holyWeaponAsg,
+    awardRef = { kind = "MANUAL", id = holyTwoH },
+    assignedSlots = { "Weapon" },
+    slotBinding = "BOUND",
+}), "replacing Weapon with 2H is rejected while OffHand stays occupied")
+assertEq(#(holyReplace:GetLootLogs() or {}), holyBefore, "ineffective REPLACE is not appended")
+
+-- Forged ASSIGN cannot hide #278 occupancy
+resetEnv()
+local forgedAssign = makeProfile("ForgedAssign")
+addMember(forgedAssign, ALT_A)
+addLog(forgedAssign, "ARMOR_CHANGE", { member = ALT_A, slot = "Head", action = "USED" })
+assertTrue(forgedAssign:AddManualAward(ALT_A, itemLink(19001, "Helm")))
+local forgedId
+for _, award in ipairs(forgedAssign:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "MANUAL" then
+        forgedId = award.id
+    end
+end
+addLog(forgedAssign, "BIS_OVERRIDE", {
+    action = "ASSIGN",
+    awardRef = { kind = "MANUAL", id = forgedId },
+    sourceLogId = forgedId,
+    assignedSlots = { "Head" },
+    slotBinding = "BOUND",
+    assignmentScopeMembers = { ALT_A },
+})
+forgedAssign:ApplyIdentityProjection({ force = true })
+assertEq(slotState(forgedAssign, ALT_A, "Head"), "LEGACY_UNKNOWN", "plain ASSIGN does not cover #278 occupancy")
+
+-- Overflow origins are not associable Gear Override opportunities
+resetEnv()
+local overflowOrg = makeProfile("OverflowOrg")
+addMember(overflowOrg, ALT_A)
+addLog(overflowOrg, "ARMOR_CHANGE", { member = ALT_A, slot = "Ring1", action = "USED" })
+addLog(overflowOrg, "ARMOR_CHANGE", { member = ALT_A, slot = "Ring2", action = "USED" })
+addLog(overflowOrg, "ARMOR_CHANGE", { member = ALT_A, slot = "Ring1", action = "USED" })
+overflowOrg:ApplyIdentityProjection({ force = true })
+assertEq(slotState(overflowOrg, ALT_A, "Ring1"), "LEGACY_UNKNOWN")
+assertEq(slotState(overflowOrg, ALT_A, "Ring2"), "LEGACY_UNKNOWN")
+local visOrigins = overflowOrg:GetIdentityLegacyOrigins(ALT_A)
+assertEq(#visOrigins, 2, "only two visible ring origins are associable")
+local displayed = {}
+for i = 1, #visOrigins do
+    displayed[visOrigins[i].displayedSlot or visOrigins[i].slot] = true
+    assertFalse(visOrigins[i].isOverflow == true, "displayed origin is not overflow")
+end
+assertTrue(displayed.Ring1 and displayed.Ring2, "visible origins are Ring1 and Ring2")
+
+-- Atomic move/rebind: Ring1 assignment can be selected for empty Ring2
+resetEnv()
+local moveP = makeProfile("MoveRing")
+addMember(moveP, ALT_A)
+assertTrue(moveP:AddRCLootCouncilBisResponse("Need"))
+assertTrue(moveP:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700014100")))
+moveP:ApplyIdentityProjection({ force = true })
+assertEq(slotState(moveP, ALT_A, "Ring1"), "ASSIGNED_AUTO")
+assertEq(slotState(moveP, ALT_A, "Ring2"), "AVAILABLE")
+local ringOpts = moveP:GetGearOverrideCompatibleAwards(ALT_A, "Ring2")
+local ringAward
+for _, award in ipairs(moveP:GetIdentityAwardPool(ALT_A)) do
+    if award.kind == "RC" then
+        ringAward = award
+    end
+end
+local listed = false
+for i = 1, #ringOpts do
+    if ringOpts[i].awardRef and ringOpts[i].awardRef.id == ringAward.id then
+        listed = true
+    end
+end
+assertTrue(listed, "active Ring1 award is listed for empty Ring2")
+local overrideCountBefore = 0
+for _, log in ipairs(moveP:GetLootLogs()) do
+    if log:GetEventType() == "BIS_OVERRIDE" then
+        overrideCountBefore = overrideCountBefore + 1
+    end
+end
+assertTrue(moveP:PlaceGearOverrideAward(ALT_A, "Ring2", { kind = "RC", id = ringAward.id }), "atomic move succeeds")
+moveP:ApplyIdentityProjection({ force = true })
+assertEq(slotState(moveP, ALT_A, "Ring1"), "AVAILABLE", "source ring is vacated")
+assertEq(slotState(moveP, ALT_A, "Ring2"), "ASSIGNED_OVERRIDE", "destination ring is occupied")
+local overrideCountAfter = 0
+local replaceCount = 0
+for _, log in ipairs(moveP:GetLootLogs()) do
+    if log:GetEventType() == "BIS_OVERRIDE" then
+        overrideCountAfter = overrideCountAfter + 1
+        if log:GetEventData().action == "REPLACE" then
+            replaceCount = replaceCount + 1
+        end
+    end
+end
+assertEq(overrideCountAfter, overrideCountBefore + 1, "move writes one override")
+assertEq(replaceCount, 1, "move is a single REPLACE")
+
+-- Import-boundary semantic validation for protocol-3 item-aware types
+resetEnv()
+local importP = makeProfile("ImportSem")
+addMember(importP, ALT_A)
+local badOutcome = {
+    version = 2,
+    _id = PLAYER .. ":90",
+    _timestamp = 1700009000,
+    _author = PLAYER,
+    _counter = 90,
+    _eventType = "BIS_OUTCOME",
+    _data = {
+        sourceLogId = "k",
+        awardKey = "k",
+        awardMember = ALT_A,
+        qualified = true,
+        outcome = "ASSIGNED",
+        assignedSlots = { "Head", "Ring1" },
+        slotBinding = "BOUND",
+        assignmentScopeMembers = { ALT_A },
+        preOpAuthorMax = {},
+    },
+}
+badOutcome._fingerprint = SF.LootLog.ComputeFingerprintFromTable(badOutcome)
+assertFalse(select(1, SF.LootLog.ValidateTable(badOutcome, { profile = importP })), "malformed BIS_OUTCOME fails import validation")
+local badManual = {
+    version = 2,
+    _id = PLAYER .. ":91",
+    _timestamp = 1700009001,
+    _author = PLAYER,
+    _counter = 91,
+    _eventType = "MANUAL_AWARD",
+    _data = { member = ALT_A, itemLink = "", itemString = "", preOpAuthorMax = {} },
+}
+badManual._fingerprint = SF.LootLog.ComputeFingerprintFromTable(badManual)
+assertFalse(select(1, SF.LootLog.ValidateTable(badManual, { profile = importP })), "malformed MANUAL_AWARD fails import validation")
+local badReverse = {
+    version = 2,
+    _id = PLAYER .. ":92",
+    _timestamp = 1700009002,
+    _author = PLAYER,
+    _counter = 92,
+    _eventType = "MANUAL_AWARD_REVERSE",
+    _data = { sourceLogId = "", preOpAuthorMax = {} },
+}
+badReverse._fingerprint = SF.LootLog.ComputeFingerprintFromTable(badReverse)
+assertFalse(select(1, SF.LootLog.ValidateTable(badReverse, { profile = importP })), "malformed MANUAL_AWARD_REVERSE fails import validation")
+local unknownType = {
+    version = 2,
+    _id = PLAYER .. ":93",
+    _timestamp = 1700009003,
+    _author = PLAYER,
+    _counter = 93,
+    _eventType = "FUTURE_EVENT",
+    _data = { ok = true },
+}
+unknownType._fingerprint = SF.LootLog.ComputeFingerprintFromTable(unknownType)
+assertTrue(select(1, SF.LootLog.ValidateTable(unknownType)), "unknown future event types stay forward-compatible")
+
+-- Multi-admin bisResponses: profile snapshot config is not an append-only log
+resetEnv()
+local adminA = makeProfile("AdminA")
+addMember(adminA, ALT_A)
+assertTrue(adminA:AddRCLootCouncilBisResponse({
+    text = "Need",
+    typeCode = "default",
+    responseId = 1,
+    isAwardReason = false,
+}))
+local adminB = makeProfile("AdminB")
+addMember(adminB, ALT_A)
+assertTrue(adminB:AddRCLootCouncilBisResponse({
+    text = "Greed",
+    typeCode = "default",
+    responseId = 2,
+    isAwardReason = false,
+}))
+assertTrue(adminA:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 1, isAwardReason = false }), "admin A qualifies Need")
+assertFalse(adminA:IsBisQualifyingResponse("Greed", { typeCode = "default", responseId = 2, isAwardReason = false }), "admin A does not have Greed")
+assertTrue(adminB:IsBisQualifyingResponse("Greed", { typeCode = "default", responseId = 2, isAwardReason = false }), "admin B qualifies Greed")
+assertFalse(adminB:IsBisQualifyingResponse("Need", { typeCode = "default", responseId = 1, isAwardReason = false }), "admin B does not have Need")
+local snapA = adminA:ExportSnapshot()
+assertTrue(type(snapA.rcLootCouncilIntegration) == "table", "bisResponses travels on the profile snapshot")
+assertEq(snapA.rcLootCouncilIntegration.bisResponses[1].responseId, 1, "snapshot carries admin A's contextual Need")
+end
+extraCorrectnessTests()
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
 end
+

@@ -1209,11 +1209,14 @@ end
 
 local function ExtractOccupancyOrigins(occ)
     local out = {}
-    local function add(rec, displayedSlot)
+    local function add(rec, displayedSlot, isOverflow)
         if type(rec) ~= "table" or type(rec.originLogId) ~= "string" then
             return
         end
         rec.displayedSlot = displayedSlot or rec.displayedSlot or rec.slot
+        if isOverflow then
+            rec.isOverflow = true
+        end
         out[#out + 1] = rec
     end
     for slot, state in pairs(occ.ordinary or {}) do
@@ -1222,7 +1225,7 @@ local function ExtractOccupancyOrigins(occ)
         end
         local overflow = state.overflowOrigins or {}
         for i = 1, #overflow do
-            add(overflow[i], slot)
+            add(overflow[i], slot, true)
         end
     end
     local function addFamily(familyOcc, names)
@@ -1238,7 +1241,7 @@ local function ExtractOccupancyOrigins(occ)
         end
         local overflow = familyOcc.overflowOrigins or {}
         for i = 1, #overflow do
-            add(overflow[i], names[1])
+            add(overflow[i], names[1], true)
         end
     end
     addFamily(occ.ring, { "Ring1", "Ring2" })

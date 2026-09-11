@@ -600,6 +600,18 @@ local function RecordingEnabled()
     return profile:GetRCLootCouncilIntegrationConfig().recordAwards and true or false
 end
 
+local function AwardReasonHistoryResponseId(entry)
+    local sort = tonumber(entry and entry.sort)
+    if not sort then
+        return nil
+    end
+    return sort - 400
+end
+
+function Integration.AwardReasonHistoryResponseId(entry)
+    return AwardReasonHistoryResponseId(entry)
+end
+
 local function GetRCResponseOptions()
     local options = {}
     local seen = {}
@@ -645,16 +657,16 @@ local function GetRCResponseOptions()
     end
     local awardReasons = profile and profile.awardReasons
     if type(awardReasons) == "table" then
-        for id, entry in ipairs(awardReasons) do
+        for _, entry in ipairs(awardReasons) do
             if type(entry) == "table" then
                 local text = entry.text or entry.label
-                if type(text) == "string" and strtrim(text) ~= "" then
+                local responseId = AwardReasonHistoryResponseId(entry)
+                if type(text) == "string" and strtrim(text) ~= "" and responseId ~= nil then
                     add({
-                        key = string.format("ctx:awardReason|%s|1", tostring(id)),
+                        key = string.format("ctx:awardReason|%s|1", tostring(responseId)),
                         text = strtrim(text),
-                        label = string.format("%s (award reason #%s)", strtrim(text), tostring(id)),
-                        typeCode = "awardReason",
-                        responseId = id,
+                        label = string.format("%s (award reason #%s)", strtrim(text), tostring(responseId)),
+                        responseId = responseId,
                         isAwardReason = true,
                     })
                 end
@@ -665,6 +677,10 @@ local function GetRCResponseOptions()
         return tostring(a.text) < tostring(b.text)
     end)
     return options
+end
+
+function Integration.GetRCResponseOptions()
+    return GetRCResponseOptions()
 end
 
 local function SelectedBisOption(key)
@@ -977,8 +993,10 @@ function Integration.RegisterSettingsPage()
                                 local items = {}
                                 for _, value in ipairs(profile:GetRCLootCouncilIntegrationConfig().bisResponses or {}) do
                                     local label = value.text or value.key or tostring(value)
-                                    if value.typeCode and value.responseId ~= nil then
-                                        label = string.format("%s [%s #%s%s]", label, tostring(value.typeCode), tostring(value.responseId), value.isAwardReason and ", award reason" or "")
+                                    if value.isAwardReason then
+                                        label = string.format("%s [award reason #%s]", label, tostring(value.responseId))
+                                    elseif value.typeCode and value.responseId ~= nil then
+                                        label = string.format("%s [%s #%s]", label, tostring(value.typeCode), tostring(value.responseId))
                                     end
                                     items[#items + 1] = { id = value.key or value.text, label = label }
                                 end

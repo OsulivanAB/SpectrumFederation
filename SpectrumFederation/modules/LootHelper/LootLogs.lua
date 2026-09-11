@@ -1011,7 +1011,8 @@ function LootLog.ValidateTable(t, opts)
     end
 
     -- Known item-aware events still fail closed at the import boundary even
-    -- when unknown event types are otherwise permitted.
+    -- when unknown event types are otherwise permitted. Genuinely unknown
+    -- future event types remain forward-compatible when allowUnknownEventType.
     if t._eventType == EVENT_TYPES.SPEC_CHANGE then
         local specId = tonumber(t._data and t._data.specId)
         local SpecWeapons = SF.LootHelperBis and SF.LootHelperBis.SpecWeapons
@@ -1031,6 +1032,24 @@ function LootLog.ValidateTable(t, opts)
             and not SF.LootLogValidators.ValidateBisOverrideData(t._data, opts.profile)
         then
             return false, "BIS_OVERRIDE data is invalid"
+        end
+    elseif t._eventType == EVENT_TYPES.BIS_OUTCOME then
+        if SF.LootLogValidators.ValidateBisOutcomeData
+            and not SF.LootLogValidators.ValidateBisOutcomeData(t._data, opts.profile)
+        then
+            return false, "BIS_OUTCOME data is invalid"
+        end
+    elseif t._eventType == EVENT_TYPES.MANUAL_AWARD then
+        if SF.LootLogValidators.ValidateManualAwardData
+            and not SF.LootLogValidators.ValidateManualAwardData(t._data, opts.profile)
+        then
+            return false, "MANUAL_AWARD data is invalid"
+        end
+    elseif t._eventType == EVENT_TYPES.MANUAL_AWARD_REVERSE then
+        if SF.LootLogValidators.ValidateManualAwardReverseData
+            and not SF.LootLogValidators.ValidateManualAwardReverseData(t._data, opts.profile)
+        then
+            return false, "MANUAL_AWARD_REVERSE data is invalid"
         end
     end
 

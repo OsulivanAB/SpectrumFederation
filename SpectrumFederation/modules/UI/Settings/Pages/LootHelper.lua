@@ -579,49 +579,13 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		return { kind = kind, id = id }
 	end
 
-	local function AwardOwnerSpec(award)
-		local profile = GetProfile()
-		local member = profile and award and award.member and profile.getMemberByID and profile:getMemberByID(award.member)
-		return member and member.GetSpecId and member:GetSpecId() or nil
-	end
-
-	local function AwardFitsSlot(award, slot)
-		if not award or not slot then
-			return false
-		end
-		local Bis = SF.LootHelperBis
-		if not (Bis and Bis.ClassifyItem and Bis.ItemFitsSlot) then
-			return false
-		end
-		local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
-		if not classif then
-			return false
-		end
-		return Bis.ItemFitsSlot(classif, slot, AwardOwnerSpec(award))
-	end
-
 	local function BuildCompatibleAwardOptions(slot)
-		local options = {}
-		if not slot then
-			return options
-		end
 		local profile = GetProfile()
 		local memberId = SelectedGearMember()
-		local result = profile and profile.GetIdentityProjection and profile:GetIdentityProjection()
-		local state = result and result.bis and result.bis.state
-		for _, item in ipairs(BuildAwardPoolItems()) do
-			local award = item.awardRef and state and state.awards and state.awards[SF.LootHelperBis.AwardRefKey(item.awardRef.kind, item.awardRef.id)]
-			if award and AwardFitsSlot(award, slot) then
-				local activeId = state.activeByAward and state.activeByAward[SF.LootHelperBis.AwardRefKey(award.kind, award.id)]
-				local slots = profile.GetIdentityBisSlots and profile:GetIdentityBisSlots(memberId)
-				local cell = slots and slots[slot]
-				local movingSame = activeId and cell and cell.assignmentId == activeId
-				if not activeId or movingSame then
-					options[#options + 1] = { value = item.id, text = item.label }
-				end
-			end
+		if profile and profile.GetGearOverrideCompatibleAwards then
+			return profile:GetGearOverrideCompatibleAwards(memberId, slot)
 		end
-		return options
+		return {}
 	end
 
 	local function CharacterSection()
@@ -634,47 +598,14 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		local slot = panel.__sfGearSlot
 		local ref = ParseAwardRef(panel.__sfGearAward)
 		local sec = CharacterSection()
-		if not (profile and profile.ApplyBisOverride and memberId and slot and ref) then
+		if not (profile and memberId and slot and ref) then
 			return
 		end
-		local slots = profile.GetIdentityBisSlots and profile:GetIdentityBisSlots(memberId)
-		local cell = slots and slots[slot]
 		local ok, err
-		if cell and cell.state == "LEGACY_UNKNOWN" then
-			local origins = profile.GetIdentityLegacyOrigins and profile:GetIdentityLegacyOrigins(memberId) or {}
-			local originId
-			for i = 1, #origins do
-				local displayed = origins[i].displayedSlot or origins[i].slot
-				if displayed == slot or origins[i].slot == slot then
-					originId = origins[i].originLogId
-					break
-				end
-			end
-			if not originId then
-				if sec then sec:SetMessage("No active legacy origin for that slot.", "error") end
-				return
-			end
-			ok, err = profile:ApplyBisOverride("ASSOCIATE_LEGACY", {
-				viewMember = memberId,
-				awardRef = ref,
-				legacyOriginLogId = originId,
-				assignedSlots = { slot },
-			})
-		elseif cell and cell.assignmentId then
-			ok, err = profile:ApplyBisOverride("REPLACE", {
-				viewMember = memberId,
-				targetAssignmentId = cell.assignmentId,
-				awardRef = ref,
-				assignedSlots = { slot },
-				slotBinding = "BOUND",
-			})
+		if profile.PlaceGearOverrideAward then
+			ok, err = profile:PlaceGearOverrideAward(memberId, slot, ref)
 		else
-			ok, err = profile:ApplyBisOverride("ASSIGN", {
-				viewMember = memberId,
-				awardRef = ref,
-				assignedSlots = { slot },
-				slotBinding = "BOUND",
-			})
+			ok, err = false, "Assign failed."
 		end
 		if sec then
 			sec:SetMessage(ok and "Assignment recorded." or (err or "Assign failed."), ok and "success" or "error")
@@ -1238,7 +1169,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			tooltip = "Set a character's persistent spec and correct item-aware BiS assignments for the linked identity.",
 			condition = CanShowAdminTools,
 			items = {
-				{ type = "help", indent = "label", text = "Selecting either linked character shows the shared BiS board and award pool. Award ownership stays with the character who received the loot." },
+				{ type = "help", indent = "label", text = "Selecting either linked character shows the shared BiS board and award pool. Award ownership stays with the character who received the loot. Click an empty compatible slot to move an already-assigned item with one REPLACE." },
 				{
 					type = "dropdown",
 					label = "Character",

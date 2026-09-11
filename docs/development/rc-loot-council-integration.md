@@ -35,9 +35,14 @@ Settings are profile-scoped and admin-editable:
 
 While recording is on, every active BiS-qualified response is always recorded; it cannot also be filtered out of the allow-list. Changing these lists never reinterprets historical `BIS_OUTCOME` rows.
 
-When RC Loot Council is available, the BiS list is filled from configured RC responses using a stable contextual key (`typeCode` / button group, `responseId`, and award-reason vs normal response). Display labels stay user-friendly. If RC is not loaded, admins can still type response labels manually; that text-only fallback remains the compatibility path for older saved lists.
+When RC Loot Council is available, the BiS list is filled from configured RC responses using the same identity RCLC persists in loot history:
 
-These settings sync with the profile snapshot as `snapshot.rcLootCouncilIntegration`, using the same profile-snapshot path as Raid Check. Changing them does not create a visible Loot Log row. Older snapshots may still carry unused `snapshot.rcLootCouncil` metadata; that field remains compatibility-only and is not the live integration.
+- normal responses: `isAwardReason = false`, `typeCode` from the RC button group (or `"default"`), and the actual `responseID`;
+- award reasons: `isAwardReason = true` and `responseID = reason.sort - 400`. Item/session `typeCode` is not part of award-reason identity. Array position is not assumed to equal the persisted ID.
+
+A configured contextual entry never falls back to label-only matching. Historical text-only entries (`text:need`) remain the compatibility path when RC is not loaded or when an admin types a label by hand.
+
+These settings sync with the profile snapshot as `snapshot.rcLootCouncilIntegration`, using the same profile-snapshot path as Raid Check (`NEED_PROFILE` / `PROFILE_SNAPSHOT`). Changing them does not create a visible Loot Log row and does not live-broadcast a new snapshot by itself. Two authorized admins in the same session can therefore have different BiS-qualifying lists until the next snapshot import. Frozen `BIS_OUTCOME` rows still do not reinterpret from later config; the first source-consistent outcome wins. That makes a config disagreement deterministic, not authoritative. The smallest architecture-consistent follow-up is to push the existing profile snapshot when RC integration settings change during an active session, not a new config-log type. Older snapshots may still carry unused `snapshot.rcLootCouncil` metadata; that field remains compatibility-only and is not the live integration.
 
 Defaults fill in for older profiles that have no stored RC configuration.
 

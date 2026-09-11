@@ -145,13 +145,20 @@ local function CopyBisResponses(values)
 				typeCode = strtrim(typeCode)
 			end
 			local isAwardReason = value.isAwardReason and true or false
-			if responseId ~= nil then
+			if isAwardReason and responseId ~= nil then
 				entry = {
-					key = string.format("ctx:%s|%s|%s", tostring(typeCode or "default"), tostring(responseId), isAwardReason and "1" or "0"),
+					key = string.format("ctx:awardReason|%s|1", tostring(responseId)),
+					text = text or tostring(responseId),
+					responseId = responseId,
+					isAwardReason = true,
+				}
+			elseif responseId ~= nil then
+				entry = {
+					key = string.format("ctx:%s|%s|0", tostring(typeCode or "default"), tostring(responseId)),
 					text = text or tostring(responseId),
 					typeCode = typeCode or "default",
 					responseId = responseId,
-					isAwardReason = isAwardReason,
+					isAwardReason = false,
 				}
 			elseif text then
 				entry = {
@@ -180,13 +187,11 @@ local function BisEntryMatchesCanonical(entry, response, meta)
 		return false
 	end
 	meta = meta or {}
-	if entry.responseId ~= nil and meta.responseId ~= nil then
-		if tostring(entry.responseId) ~= tostring(meta.responseId) then
+	if entry.responseId ~= nil then
+		if meta.responseId == nil then
 			return false
 		end
-		local entryCode = entry.typeCode or "default"
-		local metaCode = meta.typeCode or "default"
-		if entryCode ~= metaCode then
+		if tostring(entry.responseId) ~= tostring(meta.responseId) then
 			return false
 		end
 		local entryAward = entry.isAwardReason and true or false
@@ -194,7 +199,12 @@ local function BisEntryMatchesCanonical(entry, response, meta)
 		if entryAward ~= metaAward then
 			return false
 		end
-		return true
+		if entryAward then
+			return true
+		end
+		local entryCode = entry.typeCode or "default"
+		local metaCode = meta.typeCode or "default"
+		return entryCode == metaCode
 	end
 	local text = NormalizeAllowedResponse(response)
 	if not text or type(entry.text) ~= "string" then
@@ -1041,6 +1051,102 @@ function LootProfile:IsItemAwareEquipmentPopup()
         return Bis.IsItemAwarePopup(result and result.bis and result.bis.state, bisConfigured)
     end
     return bisConfigured
+end
+
+function LootProfile:GetGearOverrideCompatibleAwards(memberId, slot)
+    memberId = NormalizeMemberId(memberId)
+    local options = {}
+    if type(slot) ~= "string" or not memberId then
+        return options
+    end
+    local Bis = SF.LootHelperBis
+    if not (Bis and Bis.ClassifyItem and Bis.ItemFitsSlot) then
+        return options
+    end
+    local result = self:GetIdentityProjection()
+    local state = result and result.bis and result.bis.state
+    local board = result and result.bis and result.bis.slotsByMember and result.bis.slotsByMember[memberId]
+    local cell = board and board[slot]
+    local pool = self:GetIdentityAwardPool(memberId) or {}
+    for i = 1, #pool do
+        local award = pool[i]
+        if type(award) == "table" and award.kind and award.id then
+            local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
+            local owner = award.member and self:getMemberByID(award.member)
+            local specId = owner and owner.GetSpecId and owner:GetSpecId() or nil
+            if classif and Bis.ItemFitsSlot(classif, slot, specId) then
+                local key = Bis.AwardRefKey(award.kind, award.id)
+                local activeId = state and state.activeByAward and key and state.activeByAward[key]
+                local occupyingClicked = activeId and cell and cell.assignmentId == activeId
+                local destEmpty = not (cell and cell.state and cell.state ~= "AVAILABLE")
+                if not activeId or occupyingClicked or destEmpty then
+                    options[#options + 1] = {
+                        value = award.kind .. ":" .. award.id,
+                        text = string.format("%s %s (%s)", tostring(award.itemLink or award.itemString or "[item]"), award.kind, award.member or ""),
+                        awardRef = { kind = award.kind, id = award.id },
+                    }
+                end
+            end
+        end
+    end
+    return options
+end
+
+function LootProfile:PlaceGearOverrideAward(memberId, slot, awardRef)
+    memberId = NormalizeMemberId(memberId)
+    if type(slot) ~= "string" or type(awardRef) ~= "table" then
+        return false, "Select loot for an equipment slot."
+    end
+    local result = self:GetIdentityProjection()
+    local state = result and result.bis and result.bis.state
+    local board = self:GetIdentityBisSlots(memberId)
+    local cell = board and board[slot]
+    local key = SF.LootHelperBis and SF.LootHelperBis.AwardRefKey and SF.LootHelperBis.AwardRefKey(awardRef.kind, awardRef.id)
+    local activeId = state and state.activeByAward and key and state.activeByAward[key]
+    if cell and cell.state == "LEGACY_UNKNOWN" then
+        local origins = self:GetIdentityLegacyOrigins(memberId) or {}
+        local originId
+        for i = 1, #origins do
+            local displayed = origins[i].displayedSlot or origins[i].slot
+            if displayed == slot or origins[i].slot == slot then
+                originId = origins[i].originLogId
+                break
+            end
+        end
+        if not originId then
+            return false, "No active legacy origin for that slot."
+        end
+        return self:ApplyBisOverride("ASSOCIATE_LEGACY", {
+            viewMember = memberId,
+            awardRef = awardRef,
+            legacyOriginLogId = originId,
+            assignedSlots = { slot },
+        })
+    end
+    if activeId and (not cell or not cell.assignmentId or cell.assignmentId == activeId or cell.state == "AVAILABLE") then
+        return self:ApplyBisOverride("REPLACE", {
+            viewMember = memberId,
+            targetAssignmentId = activeId,
+            awardRef = awardRef,
+            assignedSlots = { slot },
+            slotBinding = "BOUND",
+        })
+    end
+    if cell and cell.assignmentId then
+        return self:ApplyBisOverride("REPLACE", {
+            viewMember = memberId,
+            targetAssignmentId = cell.assignmentId,
+            awardRef = awardRef,
+            assignedSlots = { slot },
+            slotBinding = "BOUND",
+        })
+    end
+    return self:ApplyBisOverride("ASSIGN", {
+        viewMember = memberId,
+        awardRef = awardRef,
+        assignedSlots = { slot },
+        slotBinding = "BOUND",
+    })
 end
 
 -- Function to get the list of members in this profile
@@ -2192,6 +2298,18 @@ function LootProfile:ApplyBisOverride(action, opts)
             return false, "That item cannot be assigned to the selected slot."
         end
         eventData.assignedSlots = resolved
+        local board = self:GetIdentityBisSlots(ownerMember or opts.viewMember)
+        for i = 1, #resolved do
+            local cell = board and board[resolved[i]]
+            if cell and cell.state and cell.state ~= "AVAILABLE" then
+                local replacingSelf = action == actions.REPLACE
+                    and opts.targetAssignmentId
+                    and cell.assignmentId == opts.targetAssignmentId
+                if not replacingSelf then
+                    return false, "That equipment slot is already occupied."
+                end
+            end
+        end
     end
     if action == actions.ASSOCIATE_LEGACY then
         if type(opts.legacyOriginLogId) ~= "string" or opts.legacyOriginLogId == "" then
@@ -2217,6 +2335,9 @@ function LootProfile:ApplyBisOverride(action, opts)
         end
         if not rec then
             return false, "That legacy opportunity is not active."
+        end
+        if rec.isOverflow then
+            return false, "Overflow origins cannot be associated as a displayed opportunity."
         end
         if state and state.associationByOrigin and state.associationByOrigin[opts.legacyOriginLogId] then
             return false, "That legacy opportunity is already associated."
@@ -2253,6 +2374,17 @@ function LootProfile:ApplyBisOverride(action, opts)
         end
         eventData.assignedSlots = resolved
         eventData.slotBinding = opts.slotBinding or (SF.LootLogBisBindings and SF.LootLogBisBindings.BOUND) or "BOUND"
+        local board = self:GetIdentityBisSlots(ownerMember or opts.viewMember)
+        local originDisplayed = rec.displayedSlot or rec.slot
+        for i = 1, #resolved do
+            local cell = board and board[resolved[i]]
+            if cell and cell.state and cell.state ~= "AVAILABLE" then
+                local originCell = resolved[i] == originDisplayed and cell.state == "LEGACY_UNKNOWN"
+                if not originCell then
+                    return false, "That equipment slot is already occupied."
+                end
+            end
+        end
     end
     local logEntry = SF.LootLog.new(eventType, eventData, {
         profile = self,
