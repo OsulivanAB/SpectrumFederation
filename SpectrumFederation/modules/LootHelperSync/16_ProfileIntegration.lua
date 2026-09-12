@@ -375,7 +375,9 @@ end
 
 -- Apply coordinator-advertised RC config from SES_START / heartbeat /
 -- reannounce after the receiver has accepted the session. Generation is
--- compared with (coordEpoch, seq); missing blobs are not inferred.
+-- compared with (rcConfigEpoch, seq); missing blobs are not inferred.
+-- Equal generations still converge: the advertised accepted blob is canonical,
+-- so unpublished dirty contents cannot remain at the same (epoch, seq).
 function Sync:_ApplyAdvertisedRCConfig(payload)
     if type(payload) ~= "table" then
         return false
@@ -397,10 +399,25 @@ function Sync:_ApplyAdvertisedRCConfig(payload)
     local localEpoch = tonumber(profile._rcConfigEpoch) or 0
     local LootProfile = SF.LootProfile
     local isNewer = incomingSeq > localSeq
+    local isOlder = incomingSeq < localSeq
     if LootProfile and LootProfile.IsNewerRCConfigGeneration then
         isNewer = LootProfile.IsNewerRCConfigGeneration(incomingEpoch, incomingSeq, localEpoch, localSeq)
+        if LootProfile.IsOlderRCConfigGeneration then
+            isOlder = LootProfile.IsOlderRCConfigGeneration(incomingEpoch, incomingSeq, localEpoch, localSeq)
+        end
     end
-    if not isNewer then
+    local unpublished = profile._rcConfigDirty == true or type(profile._pendingRCLootCouncilIntegration) == "table"
+    if isOlder then
+        if unpublished then
+            profile._pendingRCLootCouncilIntegration = nil
+            profile._rcConfigDirty = nil
+        end
+        return false
+    end
+    local accepted = profile.GetRCLootCouncilIntegrationConfig and profile:GetRCLootCouncilIntegrationConfig() or nil
+    local same = LootProfile and LootProfile.RCLootCouncilIntegrationConfigsEqual
+        and LootProfile.RCLootCouncilIntegrationConfigsEqual(accepted, payload.rcLootCouncilIntegration)
+    if not isNewer and not unpublished and same then
         return false
     end
     local applied = profile:ApplyRCLootCouncilIntegrationConfig(payload.rcLootCouncilIntegration, {
@@ -413,6 +430,7 @@ function Sync:_ApplyAdvertisedRCConfig(payload)
     profile._rcConfigSeq = incomingSeq
     profile._rcConfigEpoch = incomingEpoch
     profile._rcConfigDirty = nil
+    profile._pendingRCLootCouncilIntegration = nil
     self.state.rcConfigSeq = incomingSeq
     self.state._rcConfigCatchUpInFlight = nil
     return true
@@ -442,7 +460,7 @@ function Sync:_AdoptNewerAdminAcceptedRCConfig(profile)
     table.sort(names)
     for i = 1, #names do
         local st = self.state.adminStatuses[names[i]]
-        if type(st) == "table" and type(st.rcLootCouncilIntegration) == "table" then
+        if type(st) == "table" and st.rcConfigDirty ~= true and type(st.rcLootCouncilIntegration) == "table" then
             local epoch = math.floor(tonumber(st.rcConfigEpoch) or 0)
             local seq = math.floor(tonumber(st.rcConfigSeq) or 0)
             if LootProfile.IsNewerRCConfigGeneration(epoch, seq, bestEpoch, bestSeq) then
@@ -465,6 +483,7 @@ function Sync:_AdoptNewerAdminAcceptedRCConfig(profile)
     profile._rcConfigSeq = bestSeq
     profile._rcConfigEpoch = bestEpoch
     profile._rcConfigDirty = nil
+    profile._pendingRCLootCouncilIntegration = nil
     self.state.rcConfigSeq = bestSeq
     return true
 end
@@ -479,11 +498,19 @@ function Sync:_MintDirtySessionRCConfig(profile)
     if not profile or profile._rcConfigDirty ~= true then
         return false
     end
+    local pending = profile.GetProposedRCLootCouncilIntegrationConfig and profile:GetProposedRCLootCouncilIntegrationConfig() or nil
+    if type(pending) == "table" and profile.ApplyRCLootCouncilIntegrationConfig then
+        profile:ApplyRCLootCouncilIntegrationConfig(pending, {
+            skipPermission = true,
+            skipSync = true,
+        })
+    end
     local nextSeq = (tonumber(self.state.rcConfigSeq) or tonumber(profile._rcConfigSeq) or 0) + 1
     self.state.rcConfigSeq = nextSeq
     profile._rcConfigSeq = nextSeq
     profile._rcConfigEpoch = tonumber(self.state.coordEpoch) or 0
     profile._rcConfigDirty = nil
+    profile._pendingRCLootCouncilIntegration = nil
     return true
 end
 
@@ -577,7 +604,10 @@ end
 
 -- Function Publish RC integration configuration for the session profile.
 -- Coordinator applies a monotonic session seq and RAID-broadcasts RC_CONFIG_SET
--- from accepted RC config, stamped with coordEpoch.
+-- from accepted RC config. Live SET stamps accepted generation as
+-- (state.coordEpoch, seq) and also carries live coordEpoch for control
+-- admission. replay=true restates the stored accepted (rcConfigEpoch, seq)
+-- without minting; payload.coordEpoch stays the live session epoch.
 -- Non-coordinators WHISPER RC_CONFIG_REQ from the pending proposal when present.
 -- Never sends a full PROFILE_SNAPSHOT.
 -- @param profileId string|nil Session profile id
@@ -634,8 +664,8 @@ function Sync:PublishRCIntegrationConfig(profileId, opts)
         local seq
         local epoch
         if opts.replay == true then
-            seq = math.floor(tonumber(self.state.rcConfigSeq) or tonumber(profile._rcConfigSeq) or 0)
-            epoch = tonumber(self.state.coordEpoch) or 0
+            seq = math.floor(tonumber(profile._rcConfigSeq) or tonumber(self.state.rcConfigSeq) or 0)
+            epoch = math.floor(tonumber(profile._rcConfigEpoch) or 0)
         else
             seq = (tonumber(self.state.rcConfigSeq) or 0) + 1
             self.state.rcConfigSeq = seq
@@ -643,13 +673,14 @@ function Sync:PublishRCIntegrationConfig(profileId, opts)
             profile._rcConfigEpoch = tonumber(self.state.coordEpoch) or 0
             profile._pendingRCLootCouncilIntegration = nil
             profile._rcConfigDirty = nil
-            epoch = tonumber(self.state.coordEpoch) or 0
+            epoch = tonumber(profile._rcConfigEpoch) or 0
         end
         local payload = {
             sessionId = self.state.sessionId,
             profileId = profileId,
             coordinator = self.state.coordinator,
-            coordEpoch = epoch,
+            coordEpoch = tonumber(self.state.coordEpoch) or 0,
+            rcConfigEpoch = epoch,
             seq = seq,
             rcLootCouncilIntegration = config,
         }
@@ -665,7 +696,7 @@ function Sync:PublishRCIntegrationConfig(profileId, opts)
             return false, "send failed"
         end
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "RC_CONFIG_SET seq=%s epoch=%s profile=%s replay=%s", tostring(seq), tostring(payload.coordEpoch), tostring(profileId), tostring(opts.replay == true))
+            SF.Debug:Verbose("SYNC", "RC_CONFIG_SET seq=%s rcConfigEpoch=%s coordEpoch=%s profile=%s replay=%s", tostring(seq), tostring(payload.rcConfigEpoch), tostring(payload.coordEpoch), tostring(profileId), tostring(opts.replay == true))
         end
         return true, payload
     end

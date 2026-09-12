@@ -1737,6 +1737,42 @@ function LootProfile.IsOlderRCConfigGeneration(incomingEpoch, incomingSeq, local
 	return incomingSeq < localSeq
 end
 
+-- Accepted (epoch, seq) identity compares the four RC integration fields only.
+function LootProfile.RCLootCouncilIntegrationConfigsEqual(a, b)
+	if type(a) ~= "table" or type(b) ~= "table" then
+		return a == b
+	end
+	if (a.recordAwards and true or false) ~= (b.recordAwards and true or false) then
+		return false
+	end
+	if (a.recordAllAwardTypes and true or false) ~= (b.recordAllAwardTypes and true or false) then
+		return false
+	end
+	local aAllow, bAllow = a.allowedResponses or {}, b.allowedResponses or {}
+	if #aAllow ~= #bAllow then
+		return false
+	end
+	for i = 1, #aAllow do
+		if aAllow[i] ~= bAllow[i] then
+			return false
+		end
+	end
+	local aBis, bBis = a.bisResponses or {}, b.bisResponses or {}
+	if #aBis ~= #bBis then
+		return false
+	end
+	for i = 1, #aBis do
+		local left, right = aBis[i], bBis[i]
+		if type(left) ~= "table" or type(right) ~= "table" then
+			return false
+		end
+		if (left.key or left.text) ~= (right.key or right.text) then
+			return false
+		end
+	end
+	return true
+end
+
 function LootProfile:_EnsureRCLootCouncilIntegrationConfig()
 	if type(self._rcLootCouncilIntegration) ~= "table" then
 		self._rcLootCouncilIntegration = CopyRCLootCouncilIntegrationDefaults()
@@ -1756,9 +1792,10 @@ function LootProfile:_EnsureRCLootCouncilIntegrationConfig()
 	cfg.bisResponses = CopyBisResponses(cfg.bisResponses)
 end
 
--- Live-session followers keep unaccepted edits on a pending copy. Award
--- recording, BiS qualification, and PROFILE_SNAPSHOT always read accepted
--- `_rcLootCouncilIntegration`. Coordinator / local-only edits write accepted.
+-- Live-session followers and out-of-session editors keep unaccepted edits on
+-- a pending copy. Award recording, BiS qualification, PROFILE_SNAPSHOT, and
+-- advertised (epoch, seq) always read accepted `_rcLootCouncilIntegration`.
+-- Coordinator / skipSync apply write accepted.
 local function IsRCConfigAuthoritativeLocally(self)
 	local Sync = SF.LootHelperSync
 	if not Sync or type(Sync.state) ~= "table" then
@@ -1766,6 +1803,15 @@ local function IsRCConfigAuthoritativeLocally(self)
 	end
 	local state = Sync.state
 	if state.active ~= true then
+		-- Once a generation exists, out-of-session edits stay unpublished so they
+		-- cannot impersonate the accepted blob for that (epoch, seq). Fresh
+		-- profiles still at (0, 0) have no accepted generation yet; local Settings
+		-- write accepted and mark dirty for the first session mint.
+		local seq = tonumber(self._rcConfigSeq) or 0
+		local epoch = tonumber(self._rcConfigEpoch) or 0
+		if seq ~= 0 or epoch ~= 0 then
+			return false, state
+		end
 		return true, state
 	end
 	local profileId = self.GetProfileId and self:GetProfileId() or nil
@@ -1824,17 +1870,16 @@ local function PushRCIntegrationConfig(self)
 		self._rcConfigDirty = nil
 		return true
 	end
+	-- No Spectrum session: keep the unpublished proposal. Do not discard it,
+	-- and do not pretend it is the accepted blob for the current generation.
+	if err == "no session" then
+		self._rcConfigDirty = true
+		return true
+	end
 	if self._pendingRCLootCouncilIntegration then
 		-- Followers must not keep an unaccepted proposal that never left this client.
 		DiscardPendingRCLootCouncilIntegration(self, err)
 		return false, err
-	end
-	-- Coordinator / local-only accepted mutations stay in place when there is
-	-- no session to serialize. "no session" is the expected no-op publish.
-	-- Mark the accepted contents dirty so the next StartSession can mint them
-	-- without treating a merely stale starter as an intentional edit.
-	if err == "no session" then
-		self._rcConfigDirty = true
 	end
 	return true
 end
@@ -1849,6 +1894,15 @@ function LootProfile:GetProposedRCLootCouncilIntegrationConfig()
 		return nil
 	end
 	return CopyRCLootCouncilIntegrationConfig(self._pendingRCLootCouncilIntegration)
+end
+
+-- Settings editors show unpublished out-of-session / follower proposals.
+-- Award-time, snapshots, and advertised generations always use accepted state.
+function LootProfile:GetEditableRCLootCouncilIntegrationConfig()
+	if type(self._pendingRCLootCouncilIntegration) == "table" then
+		return CopyRCLootCouncilIntegrationConfig(self._pendingRCLootCouncilIntegration)
+	end
+	return self:GetRCLootCouncilIntegrationConfig()
 end
 
 -- Apply a strictly validated RC integration config table. Extra keys are ignored.

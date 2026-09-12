@@ -592,12 +592,26 @@ function Integration.AreHooksInstalled()
     return hooksInstalled
 end
 
-local function RecordingEnabled()
-    local profile = Integration.GetSettingsProfile()
-    if not profile or not profile.GetRCLootCouncilIntegrationConfig then
-        return false
+local function GetEditableRCConfig(profile)
+    if not profile then
+        return nil
     end
-    return profile:GetRCLootCouncilIntegrationConfig().recordAwards and true or false
+    if profile.GetEditableRCLootCouncilIntegrationConfig then
+        return profile:GetEditableRCLootCouncilIntegrationConfig()
+    end
+    if profile.GetRCLootCouncilIntegrationConfig then
+        return profile:GetRCLootCouncilIntegrationConfig()
+    end
+    return nil
+end
+
+local function RecordingEnabled()
+    -- Award-time recording uses the accepted config only. Unpublished
+    -- out-of-session drafts must not change recording until they are minted.
+    local profile = Integration.GetSettingsProfile()
+    local cfg = profile and profile.GetRCLootCouncilIntegrationConfig
+        and profile:GetRCLootCouncilIntegrationConfig()
+    return cfg and cfg.recordAwards and true or false
 end
 
 local function AwardReasonHistoryResponseId(entry)
@@ -781,11 +795,11 @@ function Integration.RegisterSettingsPage()
                             adminOnly = true,
                             tooltip = "When enabled, eligible Spectrum admins record finalized RC awards for members of the active profile.",
                             get = function()
-                                local profile = GetProfile()
-                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
                                     return true
                                 end
-                                return profile:GetRCLootCouncilIntegrationConfig().recordAwards
+                                return cfg.recordAwards
                             end,
                             set = function(value)
                                 local profile = GetProfile()
@@ -801,18 +815,18 @@ function Integration.RegisterSettingsPage()
                             adminOnly = true,
                             tooltip = "When enabled, every RC response label is recorded. When disabled, only the custom allow-list is recorded.",
                             visible = function()
-                                local profile = GetProfile()
-                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
                                     return true
                                 end
-                                return profile:GetRCLootCouncilIntegrationConfig().recordAwards
+                                return cfg.recordAwards
                             end,
                             get = function()
-                                local profile = GetProfile()
-                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
                                     return true
                                 end
-                                return profile:GetRCLootCouncilIntegrationConfig().recordAllAwardTypes
+                                return cfg.recordAllAwardTypes
                             end,
                             set = function(value)
                                 local profile = GetProfile()
@@ -828,11 +842,10 @@ function Integration.RegisterSettingsPage()
                     id = "allowList",
                     title = "Allowed Award Types",
                     condition = function()
-                        local profile = GetProfile()
-                        if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                        local cfg = GetEditableRCConfig(GetProfile())
+                        if not cfg then
                             return false
                         end
-                        local cfg = profile:GetRCLootCouncilIntegrationConfig()
                         return cfg.recordAwards and not cfg.recordAllAwardTypes
                     end,
                     items = {
@@ -871,12 +884,12 @@ function Integration.RegisterSettingsPage()
                             removeAtlas = "common-icon-redx",
                             compactColumns = true,
                             getItems = function()
-                                local profile = GetProfile()
-                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
                                     return {}
                                 end
                                 local items = {}
-                                for _, value in ipairs(profile:GetRCLootCouncilIntegrationConfig().allowedResponses) do
+                                for _, value in ipairs(cfg.allowedResponses or {}) do
                                     items[#items + 1] = { id = value, label = value }
                                 end
                                 return items
@@ -986,12 +999,12 @@ function Integration.RegisterSettingsPage()
                                 return RecordingEnabled()
                             end,
                             getItems = function()
-                                local profile = GetProfile()
-                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
                                     return {}
                                 end
                                 local items = {}
-                                for _, value in ipairs(profile:GetRCLootCouncilIntegrationConfig().bisResponses or {}) do
+                                for _, value in ipairs(cfg.bisResponses or {}) do
                                     local label = value.text or value.key or tostring(value)
                                     if value.isAwardReason then
                                         label = string.format("%s [award reason #%s]", label, tostring(value.responseId))

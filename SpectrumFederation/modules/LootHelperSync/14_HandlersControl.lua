@@ -75,8 +75,12 @@ function Sync:BuildAdminStatus(profileId)
     status.hasProfile = true
     status.authorMax = profile:ComputeAuthorMax() or {}
     status.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or {}
+    -- Advertise the accepted blob only. Unpublished out-of-session drafts must
+    -- not impersonate this (epoch, seq). rcConfigDirty tells START convergence
+    -- to ignore this status as an accepted-generation source.
     status.rcConfigSeq = math.floor(tonumber(profile._rcConfigSeq) or 0)
     status.rcConfigEpoch = math.floor(tonumber(profile._rcConfigEpoch) or 0)
+    status.rcConfigDirty = profile._rcConfigDirty == true
     if profile.GetRCLootCouncilIntegrationConfig then
         status.rcLootCouncilIntegration = profile:GetRCLootCouncilIntegrationConfig()
     end
@@ -1145,9 +1149,13 @@ function Sync:HandleRCConfigRequest(sender, payload)
 end
 
 -- Function Handle RC_CONFIG_SET as a session member: apply coordinator-authored
--- RC configuration when (coordEpoch, seq) is newer than the local generation.
+-- RC configuration. Live `coordEpoch` admits the control message; accepted
+-- generation is `rcConfigEpoch` (falling back to `coordEpoch` on older SET).
+-- Older generations are ignored. Equal generations still apply when the
+-- receiver is dirty/unpublished or the accepted blob differs, so a replay of
+-- the coordinator's stored (epoch, seq) cannot leave a divergent blob.
 -- @param sender string "Name-Realm"
--- @param payload table {sessionId, profileId, seq, rcLootCouncilIntegration, coordinator?, coordEpoch?}
+-- @param payload table {sessionId, profileId, seq, rcLootCouncilIntegration, coordinator?, coordEpoch?, rcConfigEpoch?}
 -- @return nil
 function Sync:HandleRCConfigSet(sender, payload)
     if not (self.state and self.state.active) then
@@ -1189,20 +1197,37 @@ function Sync:HandleRCConfigSet(sender, payload)
     end
     local current = tonumber(profile._rcConfigSeq) or 0
     local localEpoch = tonumber(profile._rcConfigEpoch) or 0
-    local incomingEpoch = tonumber(payload.coordEpoch) or 0
-    local LootProfile = SF.LootProfile
-    local isNewer = true
-    if LootProfile and LootProfile.IsNewerRCConfigGeneration then
-        isNewer = LootProfile.IsNewerRCConfigGeneration(incomingEpoch, seq, localEpoch, current)
-    else
-        isNewer = seq > current
-    end
-    if not isNewer then
-        return
+    local incomingEpoch = tonumber(payload.rcConfigEpoch)
+    if incomingEpoch == nil then
+        incomingEpoch = tonumber(payload.coordEpoch) or 0
     end
     local cfg = CopyRCConfigFromPayload(payload.rcLootCouncilIntegration)
     if not cfg then
         return
+    end
+    local LootProfile = SF.LootProfile
+    local isNewer = true
+    local isOlder = false
+    if LootProfile and LootProfile.IsNewerRCConfigGeneration then
+        isNewer = LootProfile.IsNewerRCConfigGeneration(incomingEpoch, seq, localEpoch, current)
+        if LootProfile.IsOlderRCConfigGeneration then
+            isOlder = LootProfile.IsOlderRCConfigGeneration(incomingEpoch, seq, localEpoch, current)
+        end
+    else
+        isNewer = seq > current
+        isOlder = seq < current
+    end
+    if isOlder then
+        return
+    end
+    if not isNewer then
+        local unpublished = profile._rcConfigDirty == true or type(profile._pendingRCLootCouncilIntegration) == "table"
+        local accepted = profile.GetRCLootCouncilIntegrationConfig and profile:GetRCLootCouncilIntegrationConfig() or nil
+        local same = LootProfile and LootProfile.RCLootCouncilIntegrationConfigsEqual
+            and LootProfile.RCLootCouncilIntegrationConfigsEqual(accepted, cfg)
+        if not unpublished and same then
+            return
+        end
     end
     local applied = profile:ApplyRCLootCouncilIntegrationConfig(cfg, {
         skipPermission = true,
@@ -1214,6 +1239,7 @@ function Sync:HandleRCConfigSet(sender, payload)
     profile._rcConfigSeq = seq
     profile._rcConfigEpoch = incomingEpoch
     profile._rcConfigDirty = nil
+    profile._pendingRCLootCouncilIntegration = nil
     self.state.rcConfigSeq = seq
     self.state._rcConfigCatchUpInFlight = nil
     if SF.Debug then

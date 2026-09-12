@@ -2591,7 +2591,17 @@ local function testOutOfSessionRCConfigBecomesSessionAuthoritative()
         responseId = 2,
         isAwardReason = false,
     }), "out-of-session mutator adds Greed as BiS")
-    assertTrue(coord:IsBisQualifyingResponse("Greed", greedMeta()), "coordinator accepted Greed locally")
+    assertEq(coord._rcConfigDirty, true, "starter out-of-session edit is unpublished")
+    assertFalse(coord:IsBisQualifyingResponse("Greed", greedMeta()), "unpublished Greed is not award-time accepted")
+    local proposed = coord:GetProposedRCLootCouncilIntegrationConfig()
+    assertTrue(proposed ~= nil, "starter keeps an unpublished Greed proposal")
+    local proposedGreed = false
+    for _, entry in ipairs((proposed and proposed.bisResponses) or {}) do
+        if entry.responseId == 2 and entry.isAwardReason == false then
+            proposedGreed = true
+        end
+    end
+    assertTrue(proposedGreed, "unpublished proposal includes Greed")
     assertEq(coord._rcConfigSeq, 4, "out-of-session edit does not mint a sequence by itself")
     assertEq(coord._rcConfigEpoch, 100, "out-of-session edit does not change the accepted epoch")
     assertFalse(follower:IsBisQualifyingResponse("Greed", greedMeta()), "Admin B still has the previous accepted config")
@@ -2613,6 +2623,7 @@ local function testOutOfSessionRCConfigBecomesSessionAuthoritative()
         "session start advertises a strictly newer RC generation"
     )
     joinFromStart(coord, follower, captured)
+    assertTrue(coord:IsBisQualifyingResponse("Greed", greedMeta()), "starter minted unpublished Greed at session start")
     assertTrue(follower:IsBisQualifyingResponse("Greed", greedMeta()), "Admin B accepted Greed from session-initial catch-up")
     assertTrue(cfgEqual(coord:GetRCLootCouncilIntegrationConfig(), follower:GetRCLootCouncilIntegrationConfig()), "accepted configs match after StartSession catch-up")
     local laterGreed = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
@@ -3069,6 +3080,493 @@ local function testSessionStartRCAuthorityAndFanout()
     SF.LootHelperComm = nil
 end
 testSessionStartRCAuthorityAndFanout()
+
+local function testRCGenerationIdentityUniqueness()
+    loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
+    loadModule("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
+
+    local ADMIN_C = "AdminC-Garona"
+    local nonce = 0
+    local deferred = {}
+    local captured = {}
+
+    local function greedMeta()
+        return { typeCode = "default", responseId = 2, isAwardReason = false }
+    end
+
+    local function lastOfType(msgType)
+        local found
+        for i = 1, #captured do
+            if captured[i].msgType == msgType then
+                found = captured[i]
+            end
+        end
+        return found
+    end
+
+    local function resetCaptured()
+        captured = {}
+        SF.LootHelperComm = {
+            Send = function(_, channel, msgType, payload, dist, target)
+                captured[#captured + 1] = {
+                    channel = channel,
+                    msgType = msgType,
+                    payload = payload,
+                    dist = dist,
+                    target = target,
+                }
+                return true
+            end,
+        }
+    end
+
+    local function installHarness()
+        nonce = 0
+        deferred = {}
+        function Sync:_NextNonce(tag)
+            nonce = nonce + 1
+            return tostring(tag or "N") .. "-" .. tostring(nonce)
+        end
+        function Sync:_ResetSessionSafeMode()
+        end
+        function Sync:_ResetLocalSafeMode()
+        end
+        function Sync:_ApplySessionSafeModeFromPayload()
+        end
+        function Sync:EnsureHeartbeatMonitor()
+            return false
+        end
+        function Sync:StopHeartbeatSender()
+        end
+        function Sync:NewRequestId()
+            nonce = nonce + 1
+            return "REQ-GEN-" .. tostring(nonce)
+        end
+        function Sync:GetPeer(nameRealm)
+            self.state.peers = self.state.peers or {}
+            local peer = self.state.peers[nameRealm]
+            if not peer then
+                peer = { name = nameRealm, inGroup = true }
+                self.state.peers[nameRealm] = peer
+            end
+            peer.inGroup = true
+            return peer
+        end
+        function Sync:RegisterRequest()
+            return true
+        end
+        function Sync:RunWithJitter(_, _, fn)
+            if type(fn) == "function" then
+                fn()
+            end
+        end
+        function Sync:RunAfter(delaySec, fn)
+            if type(fn) ~= "function" then
+                return
+            end
+            delaySec = tonumber(delaySec) or 0
+            if delaySec <= 0 then
+                fn()
+                return
+            end
+            deferred[#deferred + 1] = fn
+        end
+    end
+
+    local function flushDeferred()
+        local queued = deferred
+        deferred = {}
+        for i = 1, #queued do
+            queued[i]()
+        end
+    end
+
+    local function seedNeedConfig(profile)
+        assertTrue(profile:ApplyRCLootCouncilIntegrationConfig({
+            recordAwards = true,
+            recordAllAwardTypes = false,
+            allowedResponses = { "Need" },
+            bisResponses = {
+                { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+            },
+        }, { skipPermission = true, skipSync = true }), "seed accepted Need-only RC config")
+    end
+
+    local function addGreed(profile)
+        return profile:AddRCLootCouncilBisResponse({
+            text = "Greed",
+            typeCode = "default",
+            responseId = 2,
+            isAwardReason = false,
+        })
+    end
+
+    local function lastGreedOutcome(profile, awardKey)
+        for _, log in ipairs(profile:GetLootLogs() or {}) do
+            local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+            if data and data.awardKey == awardKey then
+                return data.outcome, data.qualified
+            end
+        end
+    end
+
+    local function driveResponderStatuses(starterPlayer, responders)
+        local syncs = {}
+        for i = 1, #captured do
+            if captured[i].msgType == Sync.MSG.ADMIN_SYNC then
+                syncs[#syncs + 1] = captured[i]
+            end
+        end
+        assertTrue(#syncs > 0, "StartSession whispered ADMIN_SYNC")
+        for i = 1, #syncs do
+            local target = syncs[i].target
+            local responder
+            for j = 1, #responders do
+                if responders[j].player == target then
+                    responder = responders[j]
+                    break
+                end
+            end
+            assertTrue(responder ~= nil, "ADMIN_SYNC target is a known admin")
+            local previous = PLAYER
+            PLAYER = responder.player
+            withLocalProfile(responder.profile, function()
+                Sync:HandleAdminSync(starterPlayer, syncs[i].payload)
+            end)
+            PLAYER = starterPlayer
+            local statusMsg = lastOfType(Sync.MSG.ADMIN_STATUS)
+            assertTrue(statusMsg ~= nil, "admin replied ADMIN_STATUS")
+            Sync:HandleAdminStatus(responder.player, statusMsg.payload)
+            PLAYER = previous
+        end
+        flushDeferred()
+    end
+
+    -- Case A: non-starter dirty edit must not share generation G with different contents.
+    resetEnv()
+    installHarness()
+    local clock = 100
+    function Sync:_Now()
+        return clock
+    end
+    local coordA = makeProfile("RC Gen A")
+    addMember(coordA, WINNER)
+    addMember(coordA, ADMIN_B)
+    assertTrue(coordA:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Case A Admin B shares the profile")
+    seedNeedConfig(coordA)
+    setActive(coordA)
+    startSessionOn(coordA)
+    Sync.state.coordinator = PLAYER
+    Sync.state.isCoordinator = true
+    Sync.state.coordEpoch = 100
+    coordA._rcConfigSeq = 4
+    coordA._rcConfigEpoch = 100
+    Sync.state.rcConfigSeq = 4
+    assertTrue(coordA:TryAddRCLootCouncilAward(SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700005101-prior",
+        response = "Need",
+        responseID = 1,
+    }))), "Case A shared logs are complete")
+    local dirtyB = cloneProfileAs("RC Gen Dirty B", coordA)
+    assertTrue(Sync:EndSession("manual", false), "Case A prior session ended")
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[dirtyB:GetProfileId()] = dirtyB
+    setActive(dirtyB)
+    assertTrue(addGreed(dirtyB), "Case A Admin B adds Greed with no session")
+    assertEq(dirtyB._rcConfigDirty, true, "Case A Admin B is dirty")
+    assertEq(dirtyB._rcConfigSeq, 4, "Case A dirty edit stays on seq 4")
+    assertEq(dirtyB._rcConfigEpoch, 100, "Case A dirty edit stays on epoch 100")
+    assertTrue(dirtyB:GetProposedRCLootCouncilIntegrationConfig() ~= nil, "Case A unpublished proposal exists")
+    assertFalse(dirtyB:IsBisQualifyingResponse("Greed", greedMeta()), "unpublished dirty Greed is not award-time accepted")
+    assertFalse(coordA:IsBisQualifyingResponse("Greed", greedMeta()), "Admin A remains Need-only")
+
+    clock = 200
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[coordA:GetProfileId()] = coordA
+    setActive(coordA)
+    installHarness()
+    resetCaptured()
+    assertTrue(Sync:StartSession(coordA:GetProfileId()) ~= nil, "Case A Admin A starts the next session")
+    driveResponderStatuses("Tester-Garona", { { player = ADMIN_B, profile = dirtyB } })
+    local dirtyStatus
+    for i = 1, #captured do
+        if captured[i].msgType == Sync.MSG.ADMIN_STATUS then
+            dirtyStatus = captured[i]
+        end
+    end
+    assertTrue(dirtyStatus ~= nil, "Case A Admin B sent ADMIN_STATUS")
+    assertEq(dirtyStatus.payload.rcConfigDirty, true, "Case A ADMIN_STATUS reports unpublished dirty")
+    local statusGreed = false
+    for _, entry in ipairs((dirtyStatus.payload.rcLootCouncilIntegration and dirtyStatus.payload.rcLootCouncilIntegration.bisResponses) or {}) do
+        if entry.responseId == 2 and entry.isAwardReason == false then
+            statusGreed = true
+        end
+    end
+    assertFalse(statusGreed, "Case A ADMIN_STATUS advertises accepted Need-only, not unpublished Greed")
+    local startMsg = lastOfType(Sync.MSG.SES_START)
+    assertTrue(startMsg ~= nil, "Case A announced SES_START")
+    assertFalse(coordA:IsBisQualifyingResponse("Greed", greedMeta()), "starter who did not edit stays Need-only")
+    PLAYER = ADMIN_B
+    resetCaptured()
+    withLocalProfile(dirtyB, function()
+        Sync.state.active = true
+        Sync.state.sessionId = startMsg.payload.sessionId
+        Sync.state.profileId = startMsg.payload.profileId
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = startMsg.payload.coordEpoch
+        Sync.state.isCoordinator = false
+        Sync.state.heartbeat = { lastCatchupAt = nil }
+        Sync:HandleSessionStart("Tester-Garona", startMsg.payload)
+        Sync:HandleSessionHeartbeat("Tester-Garona", startMsg.payload)
+    end)
+    assertTrue(cfgEqual(coordA:GetRCLootCouncilIntegrationConfig(), dirtyB:GetRCLootCouncilIntegrationConfig()), "Case A accepted configs match after establishment")
+    assertEq(dirtyB._rcConfigEpoch, coordA._rcConfigEpoch, "Case A epochs match")
+    assertEq(dirtyB._rcConfigSeq, coordA._rcConfigSeq, "Case A seqs match")
+    assertFalse(dirtyB._rcConfigDirty == true, "Case A dirty flag cleared after advertised accepted blob")
+    assertEq(dirtyB:GetProposedRCLootCouncilIntegrationConfig(), nil, "Case A unpublished proposal discarded")
+    assertFalse(dirtyB:IsBisQualifyingResponse("Greed", greedMeta()), "dirty follower converged off unpublished Greed")
+    local laterGreed = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700005102-later",
+        response = "Greed",
+        responseID = 2,
+        isAwardReason = false,
+    }))
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[coordA:GetProfileId()] = coordA
+    local recordedA = coordA:TryAddRCLootCouncilAward(laterGreed)
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[dirtyB:GetProfileId()] = dirtyB
+    local recordedB = dirtyB:TryAddRCLootCouncilAward(laterGreed)
+    assertEq(recordedB, recordedA, "Case A both clients record or reject the same Greed award")
+    local outcomeA, qualA = lastGreedOutcome(coordA, laterGreed.awardKey)
+    local outcomeB, qualB = lastGreedOutcome(dirtyB, laterGreed.awardKey)
+    assertEq(qualB, qualA, "Case A Greed qualification matches")
+    assertEq(outcomeB, outcomeA, "Case A Greed BIS_OUTCOME matches")
+
+    -- Case B: stale starter must not treat a dirty blob as the accepted blob of G.
+    resetEnv()
+    installHarness()
+    clock = 100
+    function Sync:_Now()
+        return clock
+    end
+    local cleanC = makeProfile("RC Gen Clean C")
+    addMember(cleanC, WINNER)
+    addMember(cleanC, ADMIN_B)
+    addMember(cleanC, ADMIN_C)
+    assertTrue(cleanC:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Case B Admin B shares the profile")
+    assertTrue(cleanC:AddAdminMemberId(ADMIN_C, { skipPermission = true, skipBroadcast = true }), "Case B Admin C shares the profile")
+    seedNeedConfig(cleanC)
+    setActive(cleanC)
+    startSessionOn(cleanC)
+    Sync.state.coordinator = PLAYER
+    Sync.state.isCoordinator = true
+    Sync.state.coordEpoch = 100
+    cleanC._rcConfigSeq = 4
+    cleanC._rcConfigEpoch = 100
+    Sync.state.rcConfigSeq = 4
+    local dirtyB2 = cloneProfileAs("RC Gen Dirty B2", cleanC)
+    local staleA = cloneProfileAs("RC Gen Stale A", cleanC)
+    staleA._rcConfigSeq = 3
+    staleA._rcConfigEpoch = 100
+    assertTrue(Sync:EndSession("manual", false), "Case B prior session ended")
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[dirtyB2:GetProfileId()] = dirtyB2
+    setActive(dirtyB2)
+    assertTrue(addGreed(dirtyB2), "Case B Admin B dirty-edits Greed")
+    assertEq(dirtyB2._rcConfigSeq, 4, "Case B dirty B remains on generation G")
+    assertEq(cleanC._rcConfigSeq, 4, "Case B clean C remains on generation G")
+    assertFalse(cleanC:IsBisQualifyingResponse("Greed", greedMeta()), "clean C keeps accepted Need-only")
+
+    clock = 200
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[staleA:GetProfileId()] = staleA
+    setActive(staleA)
+    installHarness()
+    resetCaptured()
+    assertTrue(Sync:StartSession(staleA:GetProfileId()) ~= nil, "Case B stale Admin A starts")
+    driveResponderStatuses("Tester-Garona", {
+        { player = ADMIN_B, profile = dirtyB2 },
+        { player = ADMIN_C, profile = cleanC },
+    })
+    startMsg = lastOfType(Sync.MSG.SES_START)
+    assertTrue(startMsg ~= nil, "Case B announced SES_START")
+    assertFalse(staleA:IsBisQualifyingResponse("Greed", greedMeta()), "stale starter did not adopt unpublished Greed as accepted G")
+    assertEq(staleA._rcConfigEpoch, 100, "Case B starter adopted accepted epoch G")
+    assertEq(staleA._rcConfigSeq, 4, "Case B starter adopted accepted seq G")
+    PLAYER = ADMIN_C
+    withLocalProfile(cleanC, function()
+        Sync.state.active = true
+        Sync.state.sessionId = startMsg.payload.sessionId
+        Sync.state.profileId = startMsg.payload.profileId
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = startMsg.payload.coordEpoch
+        Sync.state.isCoordinator = false
+        Sync:HandleSessionStart("Tester-Garona", startMsg.payload)
+    end)
+    PLAYER = ADMIN_B
+    withLocalProfile(dirtyB2, function()
+        Sync.state.active = true
+        Sync.state.sessionId = startMsg.payload.sessionId
+        Sync.state.profileId = startMsg.payload.profileId
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = startMsg.payload.coordEpoch
+        Sync.state.isCoordinator = false
+        Sync:HandleSessionStart("Tester-Garona", startMsg.payload)
+    end)
+    assertTrue(cfgEqual(staleA:GetRCLootCouncilIntegrationConfig(), cleanC:GetRCLootCouncilIntegrationConfig()), "Case B starter matches clean C")
+    assertTrue(cfgEqual(staleA:GetRCLootCouncilIntegrationConfig(), dirtyB2:GetRCLootCouncilIntegrationConfig()), "Case B dirty B converged to accepted G")
+    assertEq(cleanC._rcConfigSeq, staleA._rcConfigSeq, "Case B C seq matches starter")
+    assertEq(dirtyB2._rcConfigSeq, staleA._rcConfigSeq, "Case B B seq matches starter")
+    assertEq(cleanC._rcConfigEpoch, staleA._rcConfigEpoch, "Case B C epoch matches starter")
+    assertEq(dirtyB2._rcConfigEpoch, staleA._rcConfigEpoch, "Case B B epoch matches starter")
+    assertFalse(cleanC:IsBisQualifyingResponse("Greed", greedMeta()), "clean C still Need-only")
+    assertFalse(dirtyB2:IsBisQualifyingResponse("Greed", greedMeta()), "dirty B no longer awards Greed at generation G")
+    local caseBGreed = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700005103-caseb",
+        response = "Greed",
+        responseID = 2,
+        isAwardReason = false,
+    }))
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[staleA:GetProfileId()] = staleA
+    local recA = staleA:TryAddRCLootCouncilAward(caseBGreed)
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[dirtyB2:GetProfileId()] = dirtyB2
+    local recB = dirtyB2:TryAddRCLootCouncilAward(caseBGreed)
+    PLAYER = ADMIN_C
+    SF.lootHelperDB.profiles[cleanC:GetProfileId()] = cleanC
+    local recC = cleanC:TryAddRCLootCouncilAward(caseBGreed)
+    assertEq(recB, recA, "Case B A and B record the same Greed award")
+    assertEq(recC, recA, "Case B A and C record the same Greed award")
+
+    -- Replay must preserve accepted (100, 5), not rewrite it as (liveCoordEpoch, 5).
+    resetEnv()
+    installHarness()
+    clock = 200
+    function Sync:_Now()
+        return clock
+    end
+    local replayCoord = makeProfile("RC Replay Coord")
+    addMember(replayCoord, WINNER)
+    addMember(replayCoord, ADMIN_B)
+    assertTrue(replayCoord:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "replay Admin B shares the profile")
+    seedNeedConfig(replayCoord)
+    assertTrue(replayCoord:ApplyRCLootCouncilIntegrationConfig({
+        recordAwards = true,
+        recordAllAwardTypes = false,
+        allowedResponses = { "Need", "Greed" },
+        bisResponses = {
+            { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+            { text = "Greed", typeCode = "default", responseId = 2, isAwardReason = false },
+        },
+    }, { skipPermission = true, skipSync = true }), "replay coordinator has accepted Greed")
+    replayCoord._rcConfigSeq = 5
+    replayCoord._rcConfigEpoch = 100
+    setActive(replayCoord)
+    startSessionOn(replayCoord)
+    Sync.state.coordinator = PLAYER
+    Sync.state.isCoordinator = true
+    Sync.state.coordEpoch = 200
+    Sync.state.rcConfigSeq = 5
+    local replayB = cloneProfileAs("RC Replay B", replayCoord)
+    replayB._rcConfigSeq = 4
+    replayB._rcConfigEpoch = 100
+    replayB:ApplyRCLootCouncilIntegrationConfig({
+        recordAwards = true,
+        recordAllAwardTypes = false,
+        allowedResponses = { "Need" },
+        bisResponses = {
+            { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+        },
+    }, { skipPermission = true, skipSync = true })
+    replayB._rcConfigSeq = 4
+    replayB._rcConfigEpoch = 100
+    resetCaptured()
+    local hb = {
+        sessionId = Sync.state.sessionId,
+        profileId = replayCoord:GetProfileId(),
+        coordinator = PLAYER,
+        coordEpoch = 200,
+        rcConfigEpoch = 100,
+        rcConfigSeq = 5,
+        authorMax = {},
+        helpers = {},
+        sentAt = clock,
+    }
+    PLAYER = ADMIN_B
+    withLocalProfile(replayB, function()
+        Sync.state.active = true
+        Sync.state.sessionId = hb.sessionId
+        Sync.state.profileId = hb.profileId
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 200
+        Sync.state.isCoordinator = false
+        Sync.state._rcConfigCatchUpInFlight = nil
+        Sync.state.heartbeat = { lastCatchupAt = nil }
+        Sync:HandleSessionHeartbeat("Tester-Garona", hb)
+        Sync:SendJoinStatus()
+    end)
+    local catchReq = lastOfType(Sync.MSG.RC_CONFIG_REQ)
+    assertTrue(catchReq ~= nil, "behind follower used RC-only catchUp")
+    assertEq(catchReq.payload.catchUp, true, "catch-up REQ is not a config proposal")
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[replayCoord:GetProfileId()] = replayCoord
+    Sync.state.active = true
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    Sync.state.sessionId = hb.sessionId
+    Sync.state.profileId = hb.profileId
+    Sync.state.coordEpoch = 200
+    Sync.state.rcConfigSeq = 5
+    resetCaptured()
+    Sync:HandleRCConfigRequest(ADMIN_B, catchReq.payload)
+    local replaySet = lastOfType(Sync.MSG.RC_CONFIG_SET)
+    assertTrue(replaySet ~= nil, "coordinator replayed RC_CONFIG_SET")
+    local replayedEpoch = tonumber(replaySet.payload.rcConfigEpoch)
+    if replayedEpoch == nil then
+        replayedEpoch = tonumber(replaySet.payload.coordEpoch)
+    end
+    assertEq(replayedEpoch, 100, "replay preserves accepted epoch 100")
+    assertEq(replaySet.payload.rcConfigEpoch, 100, "replay rcConfigEpoch is the accepted generation")
+    assertEq(replaySet.payload.coordEpoch, 200, "replay control coordEpoch is the live session epoch")
+    assertEq(replaySet.payload.seq, 5, "replay preserves accepted seq 5")
+    assertEq(replayCoord._rcConfigEpoch, 100, "coordinator accepted epoch stays 100")
+    assertEq(replayCoord._rcConfigSeq, 5, "coordinator accepted seq stays 5")
+    PLAYER = ADMIN_B
+    withLocalProfile(replayB, function()
+        Sync.state.active = true
+        Sync.state.sessionId = hb.sessionId
+        Sync.state.profileId = hb.profileId
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 200
+        Sync.state.isCoordinator = false
+        Sync:HandleRCConfigSet("Tester-Garona", replaySet.payload)
+    end)
+    assertEq(replayB._rcConfigEpoch, replayCoord._rcConfigEpoch, "catch-up receiver stores coordinator accepted epoch")
+    assertEq(replayB._rcConfigSeq, replayCoord._rcConfigSeq, "catch-up receiver stores coordinator accepted seq")
+    assertTrue(cfgEqual(replayCoord:GetRCLootCouncilIntegrationConfig(), replayB:GetRCLootCouncilIntegrationConfig()), "replay contents match")
+    local replayAward = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700005104-replay",
+        response = "Greed",
+        responseID = 2,
+        isAwardReason = false,
+    }))
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[replayCoord:GetProfileId()] = replayCoord
+    assertTrue(replayCoord:TryAddRCLootCouncilAward(replayAward), "coordinator records replay Greed")
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[replayB:GetProfileId()] = replayB
+    assertTrue(replayB:TryAddRCLootCouncilAward(replayAward), "follower records replay Greed")
+    local _, replayQualA = lastGreedOutcome(replayCoord, replayAward.awardKey)
+    local _, replayQualB = lastGreedOutcome(replayB, replayAward.awardKey)
+    assertEq(replayQualA, true, "coordinator qualifies replay Greed")
+    assertEq(replayQualB, true, "follower qualifies replay Greed")
+
+    PLAYER = "Tester-Garona"
+    SF.LootHelperComm = nil
+end
+testRCGenerationIdentityUniqueness()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
