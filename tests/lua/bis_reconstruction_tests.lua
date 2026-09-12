@@ -2838,6 +2838,106 @@ local function reviewFindingTests()
     end
     notBisEquipmentFallback()
 
+    local function recordingOffAfterItemAwareHistory()
+        local function makeBtn(slotKey)
+            local overlay = {}
+            function overlay:Show()
+                self.shown = true
+            end
+            function overlay:Hide()
+                self.shown = false
+            end
+            local icon = { texture = "default" }
+            function icon:SetTexture(tex)
+                self.texture = tex
+            end
+            function icon:GetTexture()
+                return self.texture
+            end
+            function icon:SetDesaturated()
+            end
+            function icon:SetVertexColor()
+            end
+            local btn = {
+                slotKey = slotKey,
+                defaultTexture = "default",
+                scripts = {},
+                Icon = icon,
+                UsedOverlay = overlay,
+            }
+            function btn:SetScript(ev, fn)
+                self.scripts[ev] = fn
+            end
+            function btn:GetScript(ev)
+                return self.scripts[ev]
+            end
+            function btn:EnableMouse(v)
+                self.mouse = v and true or false
+            end
+            return btn
+        end
+
+        loadModule("SpectrumFederation/modules/UI/LootHelper/EquipmentWindow.lua")
+        local EW = SF.LootHelperWindow.EquipmentWindow
+        local head = makeBtn("Head")
+        local neck = makeBtn("Neck")
+        EW._frame = { Content = { SlotButtons = { head, neck } } }
+        EW._canAdmin = true
+
+        local function countArmor(profile, slot)
+            local n = 0
+            for _, log in ipairs(profile:GetLootLogs()) do
+                local data = log:GetEventType() == "ARMOR_CHANGE" and log:GetEventData()
+                if data and data.slot == slot then
+                    n = n + 1
+                end
+            end
+            return n
+        end
+
+        local function wire(profile)
+            profile:ApplyIdentityProjection({ force = true })
+            EW._profile = profile
+            EW._memberObj = profile:getMemberByID(ALT_A)
+            EW._rowModel = { memberId = ALT_A }
+            EW:Refresh()
+        end
+
+        resetEnv()
+        local p = makeProfile("ItemAwareThenRecordOff")
+        addMember(p, ALT_A)
+        assertTrue(p:ApplyRCLootCouncilIntegrationConfig({
+            recordAwards = true,
+            recordAllAwardTypes = false,
+            allowedResponses = { "Need" },
+            bisResponses = {},
+        }, { skipPermission = true, skipSync = true }), "enable recording before item-aware awards")
+        assertTrue(p:AddRCLootCouncilBisResponse("Need"), "Need counts as BiS")
+        local award = makeCanonical(ALT_A, 19001, "Need", "1700033000")
+        assertTrue(p:TryAddRCLootCouncilAward(award), "qualifying helm consumes Head")
+        wire(p)
+        assertTrue(p:IsItemAwareEquipmentPopup(), "item-aware history makes the popup item-aware")
+        assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "Head is assigned from the historical BiS award")
+        assertTrue(head.scripts.OnClick == nil, "item-aware popup disables Head manual clicks")
+        assertTrue(neck.scripts.OnClick == nil, "item-aware popup also disables empty-slot manual clicks")
+        assertTrue(countArmor(p, "Head") == 0, "item-aware assignment did not write ARMOR_CHANGE")
+
+        assertTrue(p:SetRCLootCouncilRecordAwards(false), "disable RC award recording after item-aware history")
+        wire(p)
+        assertTrue(p:IsItemAwareEquipmentPopup(), "recording off after item-aware history keeps the popup item-aware")
+        assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "historical AUTO assignment survives recording off")
+        assertTrue(head.scripts.OnClick == nil, "recording off does not re-enable Head clicks over AUTO occupancy")
+        assertTrue(neck.scripts.OnClick == nil, "recording off does not layer legacy clicks onto empty item-aware slots")
+        assertTrue(countArmor(p, "Head") == 0, "no ARMOR_CHANGE is written while recording is off after item-aware history")
+
+        assertTrue(p:SetRCLootCouncilRecordAwards(true), "re-enable RC award recording")
+        wire(p)
+        assertTrue(p:IsItemAwareEquipmentPopup(), "re-enabling recording keeps the popup item-aware")
+        assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "re-enabling recording reconstructs the same Head assignment")
+        assertTrue(head.scripts.OnClick == nil, "re-enabled automation still does not expose manual Head clicks")
+    end
+    recordingOffAfterItemAwareHistory()
+
     local function mainHandOnlyOffHand()
         resetEnv()
         local mhLink = itemLink(19023, "MainHand")

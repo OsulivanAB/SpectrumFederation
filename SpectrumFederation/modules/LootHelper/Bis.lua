@@ -1957,6 +1957,10 @@ function Bis.DecideAutomaticOutcome(opts)
     }
 end
 
+-- Item-aware when BiS responses are currently configured, or when historical
+-- item-aware events already exist. Recording-off after item-aware history must
+-- keep the popup item-aware so ARMOR_CHANGE clicks cannot double-consume AUTO
+-- slots. Profiles that never used item-aware tracking keep the manual fallback.
 function Bis.IsItemAwarePopup(state, bisResponsesConfigured)
     if bisResponsesConfigured then
         return true
