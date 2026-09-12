@@ -520,6 +520,12 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		return options
 	end
 
+	local function ResetCharacterScopedGearState()
+		panel.__sfGearReverseManual = nil
+		panel.__sfGearAward = nil
+		panel.__sfGearSlot = nil
+	end
+
 	local function SelectedGearMember()
 		local profile = GetProfile()
 		if panel.__sfGearMember then
@@ -527,6 +533,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				return panel.__sfGearMember
 			end
 			panel.__sfGearMember = nil
+			ResetCharacterScopedGearState()
 		end
 		return nil
 	end
@@ -564,6 +571,20 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			}
 		end
 		return items
+	end
+
+	local function SelectedReverseManualId()
+		local reverseId = panel.__sfGearReverseManual
+		if type(reverseId) ~= "string" or reverseId == "" then
+			return nil
+		end
+		for _, item in ipairs(BuildAwardPoolItems()) do
+			if item.awardRef and item.awardRef.kind == "MANUAL" and item.awardRef.id == reverseId then
+				return reverseId
+			end
+		end
+		panel.__sfGearReverseManual = nil
+		return nil
 	end
 
 	local function ParseAwardRef(key)
@@ -1176,7 +1197,15 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					options = function() return BuildCharacterOptions() end,
 					get = function() return SelectedGearMember() end,
 					set = function(value)
+						if panel.__sfGearMember ~= value then
+							ResetCharacterScopedGearState()
+						end
 						panel.__sfGearMember = value
+					end,
+					onValueChanged = function(ctx)
+						if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+							ctx.pageBuilder:Refresh()
+						end
 					end,
 					enabled = function() return ProfileActionsEnabled() end,
 				},
@@ -1259,12 +1288,16 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
 					onClick = function(ctx)
 						local profile = GetProfile()
-						if not (profile and profile.ReverseManualAward and panel.__sfGearReverseManual) then
+						local reverseId = SelectedReverseManualId()
+						if not (profile and profile.ReverseManualAward and SelectedGearMember() and reverseId) then
 							ctx.section:SetMessage("Select manual loot to reverse.", "error")
 							return
 						end
 						dialogs:Confirm("Reverse this manual loot? Any active assignment from it will be cleared.", "Reverse", function()
-							local ok, err = profile:ReverseManualAward(panel.__sfGearReverseManual)
+							local ok, err = profile:ReverseManualAward(reverseId)
+							if ok then
+								panel.__sfGearReverseManual = nil
+							end
 							ctx.section:SetMessage(ok and "Manual loot reversed." or (err or "Reverse failed."), ok and "success" or "error")
 							ctx.pageBuilder:Refresh()
 						end)

@@ -878,6 +878,355 @@ assertTrue(resetChunk:find("previewing as a non%-admin") ~= nil, "stale Reset co
 local toc = io.open("SpectrumFederation/SpectrumFederation.toc", "r"):read("*a")
 assertTrue(toc:find("modules/LootHelper/Impersonation.lua", 1, true) ~= nil, "Impersonation.lua is in parent TOC")
 
+function testCharacterPageRenderedRefreshAndTransientState()
+    GameTooltip = GameTooltip or {
+        Hide = function() end,
+        SetOwner = function() end,
+        SetText = function() end,
+        AddLine = function() end,
+        Show = function() end,
+        SetHyperlink = function() return true end,
+    }
+    function CopyTable(src)
+        if type(src) ~= "table" then
+            return src
+        end
+        local copy = {}
+        for k, v in pairs(src) do
+            if type(v) == "table" then
+                copy[k] = CopyTable(v)
+            else
+                copy[k] = v
+            end
+        end
+        return copy
+    end
+    function Mixin(obj, mixin)
+        for k, v in pairs(mixin or {}) do
+            obj[k] = v
+        end
+        return obj
+    end
+    local timerQueue = {}
+    C_Timer = {
+        After = function(_, fn)
+            if type(fn) == "function" then
+                timerQueue[#timerQueue + 1] = fn
+            end
+        end,
+    }
+    local function flushTimers()
+        local guard = 0
+        while #timerQueue > 0 and guard < 20 do
+            guard = guard + 1
+            local queued = timerQueue
+            timerQueue = {}
+            for i = 1, #queued do
+                queued[i]()
+            end
+        end
+    end
+
+    local function makeRegion(kind, parent, template)
+        local region = {
+            kind = kind or "Frame",
+            parent = parent,
+            shown = true,
+            height = 20,
+            width = 400,
+            alpha = 1,
+            points = {},
+            scripts = {},
+            hooks = {},
+            children = {},
+            text = "",
+            enabled = true,
+        }
+        if parent and parent.children then
+            parent.children[#parent.children + 1] = region
+        end
+        if template == "UIPanelScrollFrameTemplate" then
+            region.ScrollBar = makeRegion("Slider", region)
+        end
+        function region:SetScript(ev, fn) self.scripts[ev] = fn end
+        function region:HookScript(ev, fn)
+            self.hooks[ev] = self.hooks[ev] or {}
+            self.hooks[ev][#self.hooks[ev] + 1] = fn
+        end
+        function region:GetParent() return self.parent end
+        function region:SetParent(p) self.parent = p end
+        function region:SetPoint() end
+        function region:ClearAllPoints() end
+        function region:SetAllPoints() end
+        function region:SetSize(w, h)
+            self.width = tonumber(w) or self.width
+            self.height = tonumber(h) or self.height
+        end
+        function region:SetHeight(h) self.height = tonumber(h) or 0 end
+        function region:GetHeight() return self.height end
+        function region:SetWidth(w) self.width = tonumber(w) or 0 end
+        function region:GetWidth() return self.width end
+        function region:Show() self.shown = true end
+        function region:Hide() self.shown = false end
+        function region:IsShown() return self.shown end
+        function region:SetShown(shown)
+            if shown then self:Show() else self:Hide() end
+        end
+        function region:SetAlpha(a) self.alpha = a end
+        function region:GetAlpha() return self.alpha end
+        function region:EnableMouse() end
+        function region:SetMovable() end
+        function region:SetClampedToScreen() end
+        function region:RegisterForDrag() end
+        function region:SetFrameStrata() end
+        function region:SetHitRectInsets() end
+        function region:SetClipsChildren() end
+        function region:SetEnabled(enabled) self.enabled = enabled and true or false end
+        function region:IsEnabled() return self.enabled end
+        function region:Enable() self.enabled = true end
+        function region:Disable() self.enabled = false end
+        function region:SetText(text) self.text = tostring(text or "") end
+        function region:GetText() return self.text end
+        function region:SetTextColor() end
+        function region:SetJustifyH() end
+        function region:SetJustifyV() end
+        function region:SetWordWrap() end
+        function region:SetFontObject() end
+        function region:SetVertexColor() end
+        function region:SetBlendMode() end
+        function region:SetTexture() end
+        function region:SetColorTexture() end
+        function region:SetAtlas() end
+        function region:SetNormalAtlas() end
+        function region:GetStringWidth() return #self.text * 7 end
+        function region:GetStringHeight() return 14 end
+        function region:SetAutoFocus() end
+        function region:SetMaxLetters() end
+        function region:SetCursorPosition() end
+        function region:ClearFocus() end
+        function region:HighlightText() end
+        function region:SetScrollChild(child) self.scrollChild = child end
+        function region:SetDefaultText(text) self.defaultText = text end
+        function region:SetupMenu(gen) self._menuGen = gen end
+        function region:GenerateMenu()
+            local desc = {
+                radios = {},
+                CreateRadio = function(selfDesc, label, isSelected, setSelected, value)
+                    selfDesc.radios[#selfDesc.radios + 1] = {
+                        label = label,
+                        isSelected = isSelected,
+                        setSelected = setSelected,
+                        value = value,
+                    }
+                end,
+            }
+            if self._menuGen then
+                self._menuGen(self, desc)
+            end
+            self._menu = desc
+        end
+        function region:CreateTexture()
+            return makeRegion("Texture", self)
+        end
+        function region:CreateFontString()
+            return makeRegion("FontString", self)
+        end
+        function region:SetScriptClick()
+            local fn = self.scripts and self.scripts.OnClick
+            if fn then
+                fn(self)
+            end
+        end
+        return region
+    end
+    CreateFrame = function(kind, _name, parent, template)
+        return makeRegion(kind, parent, template)
+    end
+
+    loadModule("SpectrumFederation/modules/UI/Settings/Style.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Widgets/Section.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/PageBuilder.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    loadModule("SpectrumFederation/modules/UI/Settings/DefinitionRenderer.lua")
+
+    Imp:Disable("character-render-setup")
+    resetDB()
+    local renderProfile = makeProfile("Gear Render")
+    assertTrue(renderProfile:AddMember(SF.Member.new("Alice-Garona", "member", "WARRIOR")), "Alice is on the rendered gear profile")
+    assertTrue(renderProfile:AddMember(SF.Member.new("Bob-Garona", "member", "MAGE")), "Bob is on the rendered gear profile")
+    setActive(renderProfile)
+
+    function SF.SettingsUI.Dialogs:Confirm(_message, _acceptText, onAccept)
+        if type(onAccept) == "function" then
+            onAccept()
+        end
+    end
+
+    local panel = makeRegion("Frame")
+    panel:SetSize(700, 900)
+    assertTrue(registeredPages.lootHelperCharacter ~= nil, "Character page registered for render test")
+    registeredPages.lootHelperCharacter:Build(panel)
+    flushTimers()
+    assertTrue(panel.__sfPageBuilder ~= nil, "Character page used the production renderer")
+
+    local characterSection
+    for _, sec in ipairs(panel.__sfPageBuilder.sections or {}) do
+        if sec.title == "Character & Gear Override" then
+            characterSection = sec
+        end
+    end
+    assertTrue(characterSection ~= nil, "Character & Gear Override section was built")
+
+    local function rowByLabel(label)
+        for _, row in ipairs(characterSection._rows or {}) do
+            if row.Label and row.Label.GetText and row.Label:GetText() == label then
+                return row
+            end
+        end
+        return nil
+    end
+    local function findKind(root, kind)
+        if root.kind == kind then
+            return root
+        end
+        for _, child in ipairs(root.children or {}) do
+            local found = findKind(child, kind)
+            if found then
+                return found
+            end
+        end
+        return nil
+    end
+    local function findButtonByText(root, text)
+        if (root.kind == "Button" or root.kind == "button") and root.text == text then
+            return root
+        end
+        for _, child in ipairs(root.children or {}) do
+            local found = findButtonByText(child, text)
+            if found then
+                return found
+            end
+        end
+        return nil
+    end
+
+    local characterRow = rowByLabel("Character")
+    local specRow = rowByLabel("Specialization")
+    local manualRow = rowByLabel("Manually add loot")
+    local reverseRow = rowByLabel("Manual loot to reverse")
+    local reverseButtonRow = rowByLabel("Reverse manual loot")
+    local boardRow
+    for _, row in ipairs(characterSection._rows or {}) do
+        local hasSlot
+        local function hunt(node)
+            if node.slotKey then
+                hasSlot = true
+            end
+            for _, child in ipairs(node.children or {}) do
+                hunt(child)
+            end
+        end
+        hunt(row)
+        if hasSlot then
+            boardRow = row
+            break
+        end
+    end
+    assertTrue(characterRow ~= nil, "rendered Character dropdown row exists")
+    assertTrue(specRow ~= nil, "rendered Specialization dropdown row exists")
+    assertTrue(boardRow ~= nil, "rendered equipment board row exists")
+    assertTrue(manualRow ~= nil, "rendered Manually add loot row exists")
+    assertTrue(reverseRow ~= nil, "rendered Manual loot to reverse row exists")
+    assertTrue(reverseButtonRow ~= nil, "rendered Reverse manual loot row exists")
+
+    local characterDropdown = characterRow.__sfDropdown
+    local specDropdown = specRow.__sfDropdown
+    local reverseDropdown = reverseRow.__sfDropdown
+    local manualEdit = findKind(manualRow, "EditBox")
+    local reverseButton = findButtonByText(reverseButtonRow, "Reverse")
+    assertTrue(characterDropdown ~= nil, "Character dropdown widget exists")
+    assertTrue(specDropdown ~= nil, "Specialization dropdown widget exists")
+    assertEq(panel.__sfGearMember, nil, "opening the rendered page still does not auto-select a character")
+    assertFalse(specDropdown:IsEnabled(), "rendered Specialization dropdown starts disabled")
+    assertEq(boardRow.alpha, 0.45, "rendered equipment board starts disabled")
+    assertTrue(manualEdit ~= nil, "manual loot edit box exists")
+    assertFalse(manualEdit:IsEnabled(), "rendered manual loot edit starts disabled")
+    assertTrue(reverseDropdown ~= nil, "reverse dropdown widget exists")
+    assertFalse(reverseDropdown:IsEnabled(), "rendered reverse dropdown starts disabled")
+    assertTrue(reverseButton ~= nil, "Reverse button widget exists")
+    assertFalse(reverseButton:IsEnabled(), "rendered Reverse button starts disabled")
+
+    characterDropdown:GenerateMenu()
+    local aliceValue
+    for i = 1, #(characterDropdown._menu and characterDropdown._menu.radios or {}) do
+        local radio = characterDropdown._menu.radios[i]
+        if radio.value == "Alice-Garona" then
+            aliceValue = radio.value
+            radio.setSelected(radio.value)
+            break
+        end
+    end
+    assertEq(aliceValue, "Alice-Garona", "Character menu can select Alice")
+    assertEq(panel.__sfGearMember, "Alice-Garona", "selecting Alice through the dropdown callback stores the character")
+    assertTrue(specDropdown:IsEnabled(), "rendered Specialization dropdown enables after Character selection without rebuilding")
+    assertEq(boardRow.alpha, 1, "rendered equipment board enables after Character selection without rebuilding")
+    assertTrue(manualEdit:IsEnabled(), "rendered manual loot edit enables after Character selection without rebuilding")
+    assertTrue(reverseDropdown:IsEnabled(), "rendered reverse dropdown enables after Character selection without rebuilding")
+    assertTrue(reverseButton:IsEnabled(), "rendered Reverse button enables after Character selection without rebuilding")
+
+    panel.__sfGearSlot = "Head"
+    panel.__sfGearAward = "MANUAL:stale"
+    assertTrue(renderProfile:AddManualAward("Alice-Garona", "|cffffffff|Hitem:19001::::::::80:::::::::|h[Helm]|h|r"), "Alice receives a manual award")
+    if panel.__sfPageBuilder.Refresh then
+        panel.__sfPageBuilder:Refresh()
+    end
+    reverseDropdown:GenerateMenu()
+    local aliceManualId
+    for i = 1, #(reverseDropdown._menu and reverseDropdown._menu.radios or {}) do
+        local radio = reverseDropdown._menu.radios[i]
+        if radio.value then
+            aliceManualId = radio.value
+            radio.setSelected(radio.value)
+            break
+        end
+    end
+    assertTrue(aliceManualId ~= nil, "Alice's manual award is selectable in Reverse")
+    assertEq(panel.__sfGearReverseManual, aliceManualId, "reverse dropdown stores Alice's award")
+
+    local reverseBefore = 0
+    for _, log in ipairs(renderProfile:GetLootLogs() or {}) do
+        if log.GetEventType and log:GetEventType() == SF.LootLogEventTypes.MANUAL_AWARD_REVERSE then
+            reverseBefore = reverseBefore + 1
+        end
+    end
+
+    characterDropdown:GenerateMenu()
+    local bobSelected = false
+    for i = 1, #(characterDropdown._menu and characterDropdown._menu.radios or {}) do
+        local radio = characterDropdown._menu.radios[i]
+        if radio.value == "Bob-Garona" then
+            radio.setSelected(radio.value)
+            bobSelected = true
+            break
+        end
+    end
+    assertTrue(bobSelected, "Character menu can select Bob")
+    assertEq(panel.__sfGearMember, "Bob-Garona", "switching Character stores Bob")
+    assertEq(panel.__sfGearReverseManual, nil, "Character change clears the previous reverse selection")
+    assertEq(panel.__sfGearAward, nil, "Character change clears the previous compatible-loot selection")
+    assertEq(panel.__sfGearSlot, nil, "Character change clears the previous slot highlight")
+
+    reverseButton:SetScriptClick()
+    local reverseAfter = 0
+    for _, log in ipairs(renderProfile:GetLootLogs() or {}) do
+        if log.GetEventType and log:GetEventType() == SF.LootLogEventTypes.MANUAL_AWARD_REVERSE then
+            reverseAfter = reverseAfter + 1
+        end
+    end
+    assertEq(reverseAfter, reverseBefore, "Reverse while Bob is selected does not reverse Alice's award")
+end
+testCharacterPageRenderedRefreshAndTransientState()
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

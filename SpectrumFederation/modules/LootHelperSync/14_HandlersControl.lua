@@ -670,11 +670,8 @@ end
 function Sync:HandleHaveProfile(sender, payload)
     self:_RecordHandshakeReply(sender, payload, "HAVE_PROFILE")
     self:_HandlePeerIntegrityAdvertisement(sender, payload)
-    if self._MergeJoinAcceptedRCConfig then
-        self:_MergeJoinAcceptedRCConfig(sender, payload)
-    end
-    if self._AdoptJoinAcceptedRCConfigIfEstablished then
-        self:_AdoptJoinAcceptedRCConfigIfEstablished()
+    if self._ConsiderJoinAcceptedRCConfig then
+        self:_ConsiderJoinAcceptedRCConfig(sender, payload)
     end
 end
 
@@ -812,8 +809,13 @@ function Sync:HandleNeedLogs(sender, payload)
     self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
     self:_HandlePeerIntegrityAdvertisement(sender, payload)
 
-    -- Coordinator handshake visibility without forcing a data response
+    -- Coordinator handshake visibility without forcing a data response.
+    -- Join-status NEED_LOGS still carries accepted RC metadata; log-complete
+    -- HAVE_PROFILE is not required before adopting a newer accepted generation.
     if payload.statusOnly == true then
+        if self._ConsiderJoinAcceptedRCConfig then
+            self:_ConsiderJoinAcceptedRCConfig(sender, payload)
+        end
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedLogs: statusOnly, not serving data (sender=%s)", tostring(sender))
         end

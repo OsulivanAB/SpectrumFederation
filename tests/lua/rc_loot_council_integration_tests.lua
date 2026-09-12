@@ -4135,6 +4135,8 @@ function testTakeoverRCAuthorityWithoutPostEdit()
             peer.inGroup = true
             return peer
         end
+        function Sync:SetPeerSyncState()
+        end
         function Sync:RegisterRequest()
             return true
         end
@@ -4489,6 +4491,175 @@ function testTakeoverRCAuthorityWithoutPostEdit()
     assertTrue(recorded, "Case E Greed records after late convergence")
     assertEq(qualified, true, "Case E Greed qualifies after late convergence")
     assertEq(countOfType(Sync.MSG.PROFILE_SNAPSHOT), 0, "Case E did not fan out PROFILE_SNAPSHOT for RC config")
+
+    local function lastNeedLogs(statusOnly)
+        local found
+        for i = 1, #captured do
+            if captured[i].msgType == Sync.MSG.NEED_LOGS then
+                local so = captured[i].payload and captured[i].payload.statusOnly == true
+                if statusOnly == true then
+                    if so then
+                        found = captured[i]
+                    end
+                elseif not so then
+                    found = captured[i]
+                end
+            end
+        end
+        return found
+    end
+
+    local function payloadHasGreed(blob)
+        if type(blob) ~= "table" or type(blob.bisResponses) ~= "table" then
+            return false
+        end
+        for i = 1, #blob.bisResponses do
+            if blob.bisResponses[i] and blob.bisResponses[i].text == "Greed" then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function installJoinLogRepair()
+        function Sync:RegisterRequest(requestId, kind, target, meta)
+            if type(requestId) ~= "string" or requestId == "" then
+                return false
+            end
+            self.state.requests = self.state.requests or {}
+            meta = type(meta) == "table" and meta or {}
+            self.state.requests[requestId] = {
+                id = requestId,
+                kind = kind,
+                meta = meta,
+                targets = { target },
+            }
+            if kind == "NEED_LOGS" and SF.LootHelperComm then
+                SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, {
+                    sessionId = meta.sessionId or self.state.sessionId,
+                    profileId = meta.profileId or self.state.profileId,
+                    requestId = requestId,
+                    missing = {
+                        {
+                            author = meta.author,
+                            fromCounter = meta.fromCounter,
+                            toCounter = meta.toCounter,
+                            exactAuthor = meta.exactAuthor == true or nil,
+                        },
+                    },
+                    integrityRepair = meta.integrityRepair == true or nil,
+                }, "WHISPER", target, "NORMAL")
+            end
+            return true
+        end
+    end
+
+    local function driveLateJoinNeedLogs(label, mode)
+        resetEnv()
+        installHarness()
+        function Sync:_Now()
+            return 100
+        end
+        coordA = beginSharedG0()
+        staleB = cloneProfileAs(label .. " B", coordA)
+        resetCaptured()
+        assertTrue(addGreed(coordA), label .. " coordinator A accepts Greed as BiS")
+        peerC = cloneProfileAs(label .. " C", coordA)
+        assertTrue(peerC:IsBisQualifyingResponse("Greed", greedMeta()), label .. " Admin C holds G1 before takeover")
+        assertFalse(staleB:IsBisQualifyingResponse("Greed", greedMeta()), label .. " Admin B missed G1")
+
+        local gapCanon
+        if mode == "missing" then
+            PLAYER = ADMIN_B
+            SF.lootHelperDB.profiles[staleB:GetProfileId()] = staleB
+            setActive(staleB)
+            gapCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+                id = "1700006102-gap-" .. label,
+                response = "Need",
+                responseID = 1,
+            }))
+            assertTrue(staleB:TryAddRCLootCouncilAward(gapCanon), label .. " Admin B has one extra Need award C does not have")
+            assertTrue(#(staleB:GetLootLogs() or {}) > #(peerC:GetLootLogs() or {}), label .. " C has a genuine missing-log range vs B")
+        end
+
+        function Sync:_Now()
+            return 200
+        end
+        takeoverAsB(staleB, "coord-offline-need-logs-" .. label)
+        driveAvailableAdminStatuses(ADMIN_B, {})
+        reannounce = lastOfType(Sync.MSG.SES_REANNOUNCE)
+        assertTrue(reannounce ~= nil, label .. " takeover reannounced without Admin C")
+        assertEq(staleB._rcConfigSeq, 4, label .. " coordinator still has G0 before the late join")
+        assertFalse(staleB:IsBisQualifyingResponse("Greed", greedMeta()), label .. " G0 is still Need-only before the late join")
+
+        if mode == "integrity" then
+            reannounce.payload.authorWindowSummary = {
+                ["Tester-Garona"] = {
+                    {
+                        fromCounter = 1,
+                        toCounter = 50,
+                        count = 50,
+                        maxCounter = 50,
+                        checksum = 999999,
+                    },
+                },
+            }
+        end
+
+        installJoinLogRepair()
+        resetCaptured()
+        receiveReannounce(ADMIN_C, peerC, ADMIN_B, reannounce.payload)
+        assertTrue(peerC:IsBisQualifyingResponse("Greed", greedMeta()), label .. " C retained newer accepted G1 after G0 reannounce")
+        assertEq(peerC._rcConfigSeq, 5, label .. " C kept accepted seq 5")
+        local handshakeNeedLogs = lastNeedLogs(true)
+        assertTrue(handshakeNeedLogs ~= nil, label .. " late admin sent NEED_LOGS join status")
+        assertEq(lastOfType(Sync.MSG.HAVE_PROFILE), nil, label .. " log gap/integrity used NEED_LOGS rather than HAVE_PROFILE")
+        assertEq(handshakeNeedLogs.payload.statusOnly, true, label .. " join NEED_LOGS is statusOnly")
+        assertEq(handshakeNeedLogs.payload.rcConfigSeq, 5, label .. " NEED_LOGS advertises accepted seq 5")
+        assertEq(handshakeNeedLogs.payload.rcConfigEpoch, 100, label .. " NEED_LOGS advertises accepted epoch 100")
+        assertEq(handshakeNeedLogs.payload.rcConfigDirty, false, label .. " NEED_LOGS is not a dirty draft")
+        assertTrue(payloadHasGreed(handshakeNeedLogs.payload.rcLootCouncilIntegration), label .. " NEED_LOGS carries accepted Greed blob")
+        local fetchNeedLogs = lastNeedLogs(false)
+        if mode == "missing" then
+            assertTrue(fetchNeedLogs ~= nil, label .. " ordinary log repair requested missing ranges")
+            assertTrue(fetchNeedLogs.payload.statusOnly ~= true, label .. " fetch NEED_LOGS is not join-status")
+        end
+
+        restoreCoordinator(staleB, ADMIN_B)
+        Sync:HandleNeedLogs(ADMIN_C, handshakeNeedLogs.payload)
+        local lateReannounceNeed = lastOfType(Sync.MSG.SES_REANNOUNCE)
+        assertTrue(lateReannounceNeed ~= nil, label .. " coordinator reannounced after adopting NEED_LOGS G1")
+        assertEq(staleB._rcConfigSeq, 5, label .. " coordinator adopted G1 from NEED_LOGS join status")
+        assertEq(staleB._rcConfigEpoch, 100, label .. " adopted accepted epoch 100 rather than minting")
+        assertTrue(staleB:IsBisQualifyingResponse("Greed", greedMeta()), label .. " coordinator now holds G1")
+        assertEq(countOfType(Sync.MSG.PROFILE_SNAPSHOT), 0, label .. " did not fan out PROFILE_SNAPSHOT for RC config")
+        assertEq(countOfType(Sync.MSG.RC_CONFIG_SET), 0, label .. " did not mint a new RC generation to repair authority")
+
+        if fetchNeedLogs then
+            local joinSnapshots = countOfType(Sync.MSG.PROFILE_SNAPSHOT)
+            Sync:HandleNeedLogs(ADMIN_C, fetchNeedLogs.payload)
+            flushDeferred()
+            local authLogs = lastOfType(Sync.MSG.AUTH_LOGS)
+            assertTrue(authLogs ~= nil, label .. " ordinary repair served AUTH_LOGS")
+            PLAYER = ADMIN_C
+            withLocalProfile(peerC, function()
+                Sync.state.active = true
+                Sync.state.isCoordinator = false
+                Sync.state.coordinator = ADMIN_B
+                Sync:HandleAuthLogs(ADMIN_B, authLogs.payload)
+            end)
+            restoreCoordinator(staleB, ADMIN_B)
+            assertEq(countOfType(Sync.MSG.PROFILE_SNAPSHOT), joinSnapshots, label .. " AUTH_LOGS repair did not send PROFILE_SNAPSHOT")
+        end
+
+        assertSameAccepted(staleB, peerC, label .. " after NEED_LOGS join + repair")
+        recorded, qualified = assertSameGreedAward(staleB, peerC, "need-logs-" .. label)
+        assertTrue(recorded, label .. " Greed records after NEED_LOGS convergence")
+        assertEq(qualified, true, label .. " Greed qualifies after NEED_LOGS convergence")
+    end
+
+    driveLateJoinNeedLogs("Case F", "missing")
+    driveLateJoinNeedLogs("Case G", "integrity")
 
     PLAYER = "Tester-Garona"
     SF.LootHelperComm = nil

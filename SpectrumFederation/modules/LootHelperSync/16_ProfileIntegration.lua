@@ -488,8 +488,10 @@ function Sync:_AdoptNewerAdminAcceptedRCConfig(profile)
     return true
 end
 
--- Remember an authorized peer's accepted RC generation from join/HAVE_PROFILE.
--- Dirty/unpublished drafts are recorded so they cannot win adoption.
+-- Remember an authorized peer's accepted RC generation from join status.
+-- HAVE_PROFILE and NEED_LOGS both attach accepted metadata once a local
+-- profile exists; NEED_PROFILE does not. Dirty/unpublished drafts are
+-- recorded so they cannot win adoption.
 function Sync:_MergeJoinAcceptedRCConfig(sender, payload)
     if not (self.state and self.state.active and self.state.isCoordinator) then
         return false
@@ -519,7 +521,19 @@ function Sync:_MergeJoinAcceptedRCConfig(sender, payload)
     return true
 end
 
--- After takeover establishment, a late authorized HAVE_PROFILE can carry a
+-- Consume accepted RC generation/blob from a join-status payload that was
+-- produced with a local profile (HAVE_PROFILE or statusOnly NEED_LOGS).
+function Sync:_ConsiderJoinAcceptedRCConfig(sender, payload)
+    if self._MergeJoinAcceptedRCConfig then
+        self:_MergeJoinAcceptedRCConfig(sender, payload)
+    end
+    if self._AdoptJoinAcceptedRCConfigIfEstablished then
+        return self:_AdoptJoinAcceptedRCConfigIfEstablished()
+    end
+    return false
+end
+
+-- After takeover establishment, a late authorized join-status can carry a
 -- strictly newer previously accepted generation. Adopt it and reannounce so
 -- the raid is not left with coordinator G0 vs follower G1. Skipped while
 -- admin convergence is still running; finish already adopts from statuses.
