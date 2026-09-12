@@ -182,6 +182,7 @@ function Member.new(identifier, role, class)
     
     instance.pointBalance = 0
     instance.attendanceBalance = 0
+    instance.specId = nil
     instance.most_recent_pre_raid_check_whisper = nil
     instance.most_recent_raid_check_whisper = nil
     
@@ -331,6 +332,10 @@ end
 -- @return (number) - Current attendance balance
 function Member:GetAttendanceBalance()
     return tonumber(self.attendanceBalance) or 0
+end
+
+function Member:GetSpecId()
+    return tonumber(self.specId)
 end
 
 function Member:GetMostRecentPreRaidCheckWhisper()

@@ -2195,3 +2195,200 @@ function Controls:AddScrollableText(section, opts)
 		RegisterRefresh(section, Refresh)
 	end)
 end
+
+-- Character-equipment slot board for Gear Override.
+-- luacheck: globals GameTooltip GetItemInfoInstant GetItemIcon
+function Controls:AddEquipmentBoard(section, opts)
+	opts = opts or {}
+	local ICON = tonumber(opts.iconSize) or 36
+	local GAP = 4
+	local leftSlots = opts.leftSlots or {
+		{ key = "Head", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head" },
+		{ key = "Neck", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck" },
+		{ key = "Shoulder", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Shoulder" },
+		{ key = "Back", texture = "Interface\\Icons\\INV_Misc_Cape_01" },
+		{ key = "Chest", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Chest" },
+		{ key = "Bracers", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Wrists" },
+		{ key = "Weapon", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-MainHand" },
+	}
+	local rightSlots = opts.rightSlots or {
+		{ key = "Hands", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Hands" },
+		{ key = "Belt", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Waist" },
+		{ key = "Pants", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Legs" },
+		{ key = "Boots", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Feet" },
+		{ key = "Ring1", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Finger" },
+		{ key = "Ring2", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Finger" },
+		{ key = "Trinket1", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Trinket" },
+		{ key = "Trinket2", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Trinket" },
+		{ key = "OffHand", texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-SecondaryHand" },
+	}
+	local rows = math.max(#leftSlots, #rightSlots)
+	local height = (ICON * rows) + (GAP * (rows - 1)) + 8
+	return section:AddRow(height, function(row)
+		local buttons = {}
+
+		local function ItemIcon(cell)
+			local link = cell and (cell.itemLink or cell.itemString)
+			if not link then
+				return nil
+			end
+			if GetItemInfoInstant then
+				local ok, _, _, _, _, icon = pcall(GetItemInfoInstant, link)
+				if ok and icon then
+					return icon
+				end
+			end
+			if GetItemIcon then
+				local ok, icon = pcall(GetItemIcon, link)
+				if ok then
+					return icon
+				end
+			end
+			return nil
+		end
+
+		local function ShowTooltip(owner, cell)
+			if not GameTooltip or not cell then
+				return
+			end
+			GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+			local link = cell.itemLink or cell.itemString
+			if link and GameTooltip.SetHyperlink then
+				local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, link)
+				if ok then
+					GameTooltip:Show()
+					return
+				end
+			end
+			GameTooltip:SetText(cell.state == "LEGACY_UNKNOWN" and "Legacy unknown usage" or (cell.state or "Empty"))
+			GameTooltip:Show()
+		end
+
+		local function HideTooltip()
+			if GameTooltip then
+				GameTooltip:Hide()
+			end
+		end
+
+		local function MakeSlot(parent, spec)
+			if not spec.key then
+				return
+			end
+			local btn = CreateFrame("Button", nil, parent)
+			btn:SetSize(ICON, ICON)
+			btn:SetAllPoints(parent)
+			local bg = btn:CreateTexture(nil, "BACKGROUND")
+			bg:SetAllPoints()
+			bg:SetTexture(spec.texture)
+			btn.bg = bg
+			local icon = btn:CreateTexture(nil, "ARTWORK")
+			icon:SetAllPoints()
+			btn.icon = icon
+			local glow = btn:CreateTexture(nil, "OVERLAY")
+			glow:SetAllPoints()
+			glow:SetColorTexture(0.85, 0.65, 0.15, 0.35)
+			glow:Hide()
+			btn.legacyGlow = glow
+			local selected = btn:CreateTexture(nil, "OVERLAY")
+			selected:SetAllPoints()
+			selected:SetColorTexture(0.2, 0.55, 1.0, 0.28)
+			selected:Hide()
+			btn.selected = selected
+			local clear = CreateFrame("Button", nil, btn)
+			clear:SetSize(14, 14)
+			clear:SetPoint("TOPRIGHT", btn, "TOPRIGHT", 2, 2)
+			if clear.SetNormalAtlas then
+				pcall(clear.SetNormalAtlas, clear, "common-icon-redx")
+			else
+				local clearTex = clear:CreateTexture(nil, "ARTWORK")
+				clearTex:SetAllPoints()
+				clearTex:SetColorTexture(0.85, 0.15, 0.15, 0.95)
+			end
+			clear:Hide()
+			btn.clear = clear
+			btn.slotKey = spec.key
+			buttons[#buttons + 1] = btn
+			btn:SetScript("OnEnter", function(self)
+				ShowTooltip(self, self.cell)
+			end)
+			btn:SetScript("OnLeave", HideTooltip)
+			btn:SetScript("OnClick", function(self)
+				if type(opts.onSlotClick) == "function" then
+					opts.onSlotClick(self.slotKey, self.cell)
+				end
+			end)
+			clear:SetScript("OnClick", function()
+				if type(opts.onClear) == "function" then
+					opts.onClear(btn.slotKey, btn.cell)
+				end
+			end)
+			return btn
+		end
+
+		local leftCol = CreateFrame("Frame", nil, row)
+		leftCol:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 0)
+		leftCol:SetSize(ICON, height)
+		local rightCol = CreateFrame("Frame", nil, row)
+		rightCol:SetPoint("TOPLEFT", leftCol, "TOPRIGHT", ICON + GAP * 4, 0)
+		rightCol:SetSize(ICON, height)
+
+		for i = 1, #leftSlots do
+			local holder = CreateFrame("Frame", nil, leftCol)
+			holder:SetSize(ICON, ICON)
+			holder:SetPoint("TOPLEFT", leftCol, "TOPLEFT", 0, -((i - 1) * (ICON + GAP)))
+			MakeSlot(holder, leftSlots[i])
+		end
+		for i = 1, #rightSlots do
+			local holder = CreateFrame("Frame", nil, rightCol)
+			holder:SetSize(ICON, ICON)
+			holder:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, -((i - 1) * (ICON + GAP)))
+			MakeSlot(holder, rightSlots[i])
+		end
+
+		local function Refresh()
+			local slots = {}
+			if type(opts.getSlots) == "function" then
+				local ok, result = pcall(opts.getSlots)
+				if ok and type(result) == "table" then
+					slots = result
+				end
+			end
+			local selectedSlot
+			if type(opts.getSelectedSlot) == "function" then
+				selectedSlot = opts.getSelectedSlot()
+			end
+			for i = 1, #buttons do
+				local btn = buttons[i]
+				local cell = slots[btn.slotKey] or { state = "AVAILABLE" }
+				btn.cell = cell
+				local assigned = cell.state and cell.state ~= "AVAILABLE"
+				local iconTex = assigned and ItemIcon(cell)
+				if iconTex then
+					btn.icon:SetTexture(iconTex)
+					btn.icon:Show()
+				else
+					btn.icon:Hide()
+				end
+				if cell.state == "LEGACY_UNKNOWN" then
+					btn.legacyGlow:Show()
+				else
+					btn.legacyGlow:Hide()
+				end
+				if selectedSlot == btn.slotKey then
+					btn.selected:Show()
+				else
+					btn.selected:Hide()
+				end
+				if assigned and cell.assignmentId and cell.state ~= "LEGACY_UNKNOWN" then
+					btn.clear:Show()
+				else
+					btn.clear:Hide()
+				end
+			end
+			self:_ApplyRowState(row, section, opts)
+		end
+
+		Refresh()
+		RegisterRefresh(section, Refresh)
+	end)
+end

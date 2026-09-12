@@ -41,7 +41,8 @@ Profile admins can:
 - add or remove admins;
 - link characters so they share identity-wide points, Attendance, and equipment opportunity state;
 - configure and run Raid Checks;
-- start sync sessions and, when acting as coordinator, end them.
+- start sync sessions and, when acting as coordinator, end them;
+- set a character's persistent spec and correct item-aware BiS assignments from **Loot Helper → Character**.
 
 Only the profile owner can change loot mode.
 
@@ -70,11 +71,19 @@ Select the equipment button on a member row to open the equipment window. It tra
 - weapon and off-hand;
 - two ring uses and two trinket uses.
 
-This is profile history, not a live inspection of equipped items. Admins toggle a category when the member uses or regains that loot opportunity. Toggling creates an equipment-history log entry and does not change loot points or Attendance.
+This is profile history, not a live inspection of currently equipped items.
+
+When the profile has BiS-qualifying RC responses configured **and** `Record RC Loot Council awards` is on, or any item-aware BiS history (`BIS_OUTCOME`, `BIS_OVERRIDE`, `MANUAL_AWARD`, `MANUAL_AWARD_REVERSE`), the popup is **item-aware**: it shows assigned item icons and tooltips, including legacy unknown consumptions. Admins do not click-to-toggle in that mode. Corrections happen in **Loot Helper → Character** (Gear Override). Saved BiS-response configuration is kept while recording is off, but it does not make the popup item-aware by itself.
+
+When recording is off and there is no item-aware history, or when there is no BiS configuration, the popup keeps generic equipment icons and the existing admin click-to-toggle behavior, including identity-wide occupancy from linked characters. The core popup works without the RC Loot Council Integration child addon.
+
+Toggling in manual mode creates an equipment-history log entry and does not change loot points or Attendance.
 
 Linked characters share the projected equipment opportunity state. Unmarked historical equipment changes stay character-local and are aggregated after reconstruction. New shared corrections record the linked membership at write time. They stay active while those original members remain together, including when other characters join or leave. If any original member is split from the others, that correction expires permanently and does not return if the same characters are linked again. A later correction on a newly expanded identity replaces earlier overlapping subset-scope state for that slot. Independent identities that later merge still combine their equipment histories: two scoped ring or trinket uses fill the two shared opportunities before overflowing.
 
-Manual Ring 1 / Ring 2 and Trinket 1 / Trinket 2 clicks target the displayed slot. An empty Ring 1 is not filled automatically by a Ring 2 click.
+Manual Ring 1 / Ring 2 and Trinket 1 / Trinket 2 clicks target the displayed slot. An empty Ring 1 is not filled automatically by a Ring 2 click. Frozen automatic BiS overflow never fills a later hole; Gear Override can assign that loot explicitly.
+
+**Loot Helper → Character** uses a character-equipment layout: empty slots show placeholders, used slots show the item icon (WoW tooltip plus a red X to clear), and clicking a slot offers only loot that fits that slot. An already-assigned item can be selected on another empty compatible slot and moved with one atomic `REPLACE`. Local ASSIGN/REPLACE writers resolve the final slot set and refuse to append when Replay occupancy — including `#278` recorded equipment use under a BiS overlay — would make the correction a no-op. Admins can also assign unused RC or manual loot, replace an occupying assignment, or associate unused loot with a still-active `#278` unknown-usage origin (`LEGACY_UNKNOWN`, gold glow). When a packed origin has a projected `displayedSlot`, that displayed opportunity is the association target; the historical original slot is only a fallback when no displayed slot exists. Overflow ring/trinket `#278` origins stay in provenance for conflict accounting and are not associable displayed opportunities. The selected character's spec editor stays on the same page. Assignments always use the award owner's stored spec, class weapon-subclass proficiency, and spec combat-weapon subclass (fail closed on unknown IDs), and the linked identity's native Ring/Trinket packing scope. Automatic `BIS_OUTCOME ASSIGNED` rows replay frozen award-time classification and must describe the same source RC item; current live classifier or proficiency tables do not reinterpret them. A local Gear Override write is rejected if Replay occupancy, including `#278`, would make it a no-op.
 
 The separate [Raid Check](raid-check.md) **Raid Equipment** page inspects current gear for enchants and gems.
 

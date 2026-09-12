@@ -54,6 +54,8 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
 
         if msgType == self.MSG.SAFE_MODE_REQ then return self:HandleSafeModeRequest(sender, payload) end
         if msgType == self.MSG.SAFE_MODE_SET then return self:HandleSafeModeSet(sender, payload) end
+        if msgType == self.MSG.RC_CONFIG_REQ then return self:HandleRCConfigRequest(sender, payload) end
+        if msgType == self.MSG.RC_CONFIG_SET then return self:HandleRCConfigSet(sender, payload) end
         
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Unknown CONTROL message type (msgType=%s, sender=%s, dist=%s)",

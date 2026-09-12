@@ -47,6 +47,15 @@ local AdminPage = {
 	order = 23,
 }
 
+local CharacterPage = {
+	id = "lootHelperCharacter",
+	parentId = "lootHelper",
+	name = "Character Settings",
+	navLabel = "Character",
+	description = "Set persistent specialization and correct item-aware BiS assignments.",
+	order = 23.5,
+}
+
 local function GetActiveProfileObject(store)
 	if store and store.GetActiveLootHelperProfileObject then
 		return store:GetActiveLootHelperProfileObject()
@@ -490,6 +499,139 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			return tostring(a.name) < tostring(b.name)
 		end)
 		return items
+	end
+
+	local function GetProfile()
+		return GetActiveProfileObject(store)
+	end
+
+	local function BuildCharacterOptions()
+		local profile = GetProfile()
+		if not profile or not profile.GetMemberIds then
+			return {}
+		end
+		local options = {}
+		for _, memberId in ipairs(profile:GetMemberIds() or {}) do
+			options[#options + 1] = { value = memberId, label = memberId }
+		end
+		table.sort(options, function(a, b)
+			return tostring(a.label) < tostring(b.label)
+		end)
+		return options
+	end
+
+	local function ResetCharacterScopedGearState()
+		panel.__sfGearReverseManual = nil
+		panel.__sfGearAward = nil
+		panel.__sfGearSlot = nil
+	end
+
+	local function SelectedGearMember()
+		local profile = GetProfile()
+		if panel.__sfGearMember then
+			if profile and profile.getMemberByID and profile:getMemberByID(panel.__sfGearMember) then
+				return panel.__sfGearMember
+			end
+			panel.__sfGearMember = nil
+			ResetCharacterScopedGearState()
+		end
+		return nil
+	end
+
+	local function BuildSpecOptions(memberId)
+		local profile = GetProfile()
+		local member = profile and profile.getMemberByID and profile:getMemberByID(memberId)
+		local classToken = member and member.GetClass and member:GetClass()
+		local SpecWeapons = SF.LootHelperBis and SF.LootHelperBis.SpecWeapons
+		local specs = SpecWeapons and SpecWeapons.SpecsForClass and SpecWeapons.SpecsForClass(classToken) or {}
+		local options = {}
+		for i = 1, #specs do
+			local specId = specs[i]
+			local name = (SpecWeapons.SpecName and SpecWeapons.SpecName(specId)) or tostring(specId)
+			options[#options + 1] = { value = specId, label = name .. " (" .. tostring(specId) .. ")" }
+		end
+		return options
+	end
+
+	local function BuildAwardPoolItems()
+		local profile = GetProfile()
+		local memberId = SelectedGearMember()
+		if not profile or not memberId or not profile.GetIdentityAwardPool then
+			return {}
+		end
+		local pool = profile:GetIdentityAwardPool(memberId) or {}
+		local items = {}
+		for i = 1, #pool do
+			local award = pool[i]
+			local key = (award.kind or "?") .. ":" .. tostring(award.id)
+			items[#items + 1] = {
+				id = key,
+				label = string.format("%s %s (%s)", tostring(award.itemLink or award.itemString or "[item]"), award.kind or "?", award.member or ""),
+				awardRef = { kind = award.kind, id = award.id },
+			}
+		end
+		return items
+	end
+
+	local function SelectedReverseManualId()
+		local reverseId = panel.__sfGearReverseManual
+		if type(reverseId) ~= "string" or reverseId == "" then
+			return nil
+		end
+		for _, item in ipairs(BuildAwardPoolItems()) do
+			if item.awardRef and item.awardRef.kind == "MANUAL" and item.awardRef.id == reverseId then
+				return reverseId
+			end
+		end
+		panel.__sfGearReverseManual = nil
+		return nil
+	end
+
+	local function ParseAwardRef(key)
+		if type(key) ~= "string" then
+			return nil
+		end
+		local kind, id = key:match("^([^:]+):(.+)$")
+		if not kind or not id then
+			return nil
+		end
+		return { kind = kind, id = id }
+	end
+
+	local function BuildCompatibleAwardOptions(slot)
+		local profile = GetProfile()
+		local memberId = SelectedGearMember()
+		if profile and profile.GetGearOverrideCompatibleAwards then
+			return profile:GetGearOverrideCompatibleAwards(memberId, slot)
+		end
+		return {}
+	end
+
+	local function CharacterSection()
+		return panel.__sfSections and (panel.__sfSections.character)
+	end
+
+	local function TryPlaceSelectedAward()
+		local profile = GetProfile()
+		local memberId = SelectedGearMember()
+		local slot = panel.__sfGearSlot
+		local ref = ParseAwardRef(panel.__sfGearAward)
+		local sec = CharacterSection()
+		if not (profile and memberId and slot and ref) then
+			return
+		end
+		local ok, err
+		if profile.PlaceGearOverrideAward then
+			ok, err = profile:PlaceGearOverrideAward(memberId, slot, ref)
+		else
+			ok, err = false, "Assign failed."
+		end
+		if sec then
+			sec:SetMessage(ok and "Assignment recorded." or (err or "Assign failed."), ok and "success" or "error")
+		end
+		if panel.__sfPageBuilder and panel.__sfPageBuilder.Refresh then
+			panel.__sfPageBuilder:Refresh()
+		end
 	end
 
 	local sectionsById = {
@@ -1040,6 +1182,129 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "button", label = "Link Characters", adminOnly = true, buttonText = "Link", width = 140, tooltip = "Link two profile characters so they share identity-wide points, Attendance, and equipment opportunity state. Both remain on the roster as separate members. There is no Main or Primary character.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if type(ctx.store.LinkCharactersInActiveProfile) ~= "function" then ctx.section:SetMessage("LinkCharactersInActiveProfile() not implemented", "error") return end local memberOptions = BuildAllMemberOptions() if #memberOptions < 2 then ctx.section:SetMessage("Add at least two profile members before linking characters.", "error") return end dialogs:TransferMemberHistory("Link two characters in this profile. They keep separate roster rows and history, and share identity-wide points, Attendance, and equipment opportunity state.", "Link", memberOptions, memberOptions, function(memberA, memberB) local ok, err = ctx.store:LinkCharactersInActiveProfile(memberA, memberB) if not ok then ctx.section:SetMessage(err or "Link failed", "error") return end ctx.section:SetMessage("Characters linked.", "success") ctx.pageBuilder:Refresh() end, { sourceLabel = "Character 1", targetLabel = "Character 2", sameCharacterMessage = "Select two different characters." }) end },
 			},
 		},
+		character = {
+			id = "character",
+			title = "Character & Gear Override",
+			tooltip = "Set a character's persistent spec and correct item-aware BiS assignments for the linked identity.",
+			condition = CanShowAdminTools,
+			items = {
+				{ type = "help", indent = "label", text = "Selecting either linked character shows the shared BiS board and award pool. Award ownership stays with the character who received the loot. Click an empty compatible slot to move an already-assigned item with one REPLACE." },
+				{
+					type = "dropdown",
+					label = "Character",
+					adminOnly = true,
+					defaultText = "Select character",
+					options = function() return BuildCharacterOptions() end,
+					get = function() return SelectedGearMember() end,
+					set = function(value)
+						if panel.__sfGearMember ~= value then
+							ResetCharacterScopedGearState()
+						end
+						panel.__sfGearMember = value
+					end,
+					onValueChanged = function(ctx)
+						if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+							ctx.pageBuilder:Refresh()
+						end
+					end,
+					enabled = function() return ProfileActionsEnabled() end,
+				},
+				{
+					type = "dropdown",
+					label = "Specialization",
+					adminOnly = true,
+					defaultText = "Select spec",
+					options = function() return BuildSpecOptions(SelectedGearMember()) end,
+					get = function()
+						local profile = GetProfile()
+						local memberId = SelectedGearMember()
+						local member = profile and memberId and profile.getMemberByID and profile:getMemberByID(memberId)
+						return member and member.GetSpecId and member:GetSpecId() or nil
+					end,
+					set = function(value)
+						local profile = GetProfile()
+						if profile and profile.SetMemberSpec then
+							profile:SetMemberSpec(SelectedGearMember(), value)
+						end
+					end,
+					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
+				},
+				{ type = "equipmentBoard", adminOnly = true, enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end, getSlots = function() local profile = GetProfile() local memberId = SelectedGearMember() if not (profile and memberId and profile.GetIdentityBisSlots) then return {} end return profile:GetIdentityBisSlots(memberId) or {} end, getSelectedSlot = function() return panel.__sfGearSlot end, onSlotClick = function(ctx, slot) panel.__sfGearSlot = slot if ctx.pageBuilder and ctx.pageBuilder.Refresh then ctx.pageBuilder:Refresh() end end, onClear = function(ctx, _slot, cell) local profile = GetProfile() if not (profile and profile.ApplyBisOverride and cell and cell.assignmentId) then ctx.section:SetMessage("Select an occupied slot to clear.", "error") return end dialogs:Confirm("Clear this assignment? Frozen overflow awards will not backfill the hole.", "Clear", function() local ok, err = profile:ApplyBisOverride("CLEAR", { viewMember = SelectedGearMember(), targetAssignmentId = cell.assignmentId }) ctx.section:SetMessage(ok and "Assignment cleared." or (err or "Clear failed."), ok and "success" or "error") ctx.pageBuilder:Refresh() end) end },
+				{ type = "dropdown", label = "Compatible loot", adminOnly = true, defaultText = "Select loot for the highlighted slot", options = function() return BuildCompatibleAwardOptions(panel.__sfGearSlot) end, get = function() return panel.__sfGearAward end, set = function(value) panel.__sfGearAward = value TryPlaceSelectedAward() end, enabled = function() return ProfileActionsEnabled() and panel.__sfGearSlot ~= nil end },
+				{ type = "help", indent = "label", text = "Click an empty slot to assign compatible loot, or an occupied slot to replace it. Legacy unknown usage is highlighted in gold. The red X clears an assignment." },
+				{
+					type = "editboxButton",
+					label = "Manually add loot",
+					hint = "Item ID or item link",
+					buttonText = "Add",
+					buttonWidth = 80,
+					editWidth = 220,
+					adminOnly = true,
+					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
+					onSubmit = function(ctx, text, editBox)
+						local profile = GetProfile()
+						if not (profile and profile.AddManualAward) then
+							ctx.section:SetMessage("No active profile.", "error")
+							return
+						end
+						if not SelectedGearMember() then
+							ctx.section:SetMessage("Select a character first.", "error")
+							return
+						end
+						local ok, err = profile:AddManualAward(SelectedGearMember(), text)
+						if not ok then
+							ctx.section:SetMessage(err or "Could not add loot.", "error")
+							return
+						end
+						editBox:SetText("")
+						ctx.section:SetMessage("Loot added to the award pool. It did not consume a BiS opportunity.", "success")
+						ctx.pageBuilder:Refresh()
+					end,
+				},
+				{
+					type = "dropdown",
+					label = "Manual loot to reverse",
+					adminOnly = true,
+					defaultText = "Select manual loot",
+					options = function()
+						local options = {}
+						for _, item in ipairs(BuildAwardPoolItems()) do
+							if item.awardRef and item.awardRef.kind == "MANUAL" then
+								options[#options + 1] = { value = item.awardRef.id, label = item.label }
+							end
+						end
+						return options
+					end,
+					get = function() return panel.__sfGearReverseManual end,
+					set = function(value) panel.__sfGearReverseManual = value end,
+					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
+				},
+				{
+					type = "button",
+					label = "Reverse manual loot",
+					adminOnly = true,
+					buttonText = "Reverse",
+					width = 140,
+					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
+					onClick = function(ctx)
+						local profile = GetProfile()
+						local reverseId = SelectedReverseManualId()
+						if not (profile and profile.ReverseManualAward and SelectedGearMember() and reverseId) then
+							ctx.section:SetMessage("Select manual loot to reverse.", "error")
+							return
+						end
+						dialogs:Confirm("Reverse this manual loot? Any active assignment from it will be cleared.", "Reverse", function()
+							local ok, err = profile:ReverseManualAward(reverseId)
+							if ok then
+								panel.__sfGearReverseManual = nil
+							end
+							ctx.section:SetMessage(ok and "Manual loot reversed." or (err or "Reverse failed."), ok and "success" or "error")
+							ctx.pageBuilder:Refresh()
+						end)
+					end,
+				},
+			},
+		},
 	}
 
 	local sections = {}
@@ -1113,8 +1378,17 @@ function AdminPage:Refresh(panel)
 	RefreshPage(panel)
 end
 
+function CharacterPage:Build(panel)
+	BuildPage(panel, self.id, { "character" })
+end
+
+function CharacterPage:Refresh(panel)
+	RefreshPage(panel)
+end
+
 SF.SettingsUI:RegisterPage(RootPage)
 SF.SettingsUI:RegisterPage(GeneralPage)
 SF.SettingsUI:RegisterPage(ProfilePage)
 SF.SettingsUI:RegisterPage(SessionPage)
 SF.SettingsUI:RegisterPage(AdminPage)
+SF.SettingsUI:RegisterPage(CharacterPage)

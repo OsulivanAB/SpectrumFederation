@@ -670,5 +670,238 @@ function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, pro
     return ValidatePreOpAuthorMax(eventData and eventData.preOpAuthorMax)
 end
 
+local function RequirePreOpAuthorMax(eventData)
+    if type(eventData) ~= "table" or eventData.preOpAuthorMax == nil then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "preOpAuthorMax is required")
+        end
+        return false
+    end
+    return ValidatePreOpAuthorMax(eventData.preOpAuthorMax)
+end
+
+local function ValidateSourceLogId(value, fieldName)
+    if type(value) ~= "string" or value == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "%s must be a non-empty string", tostring(fieldName or "sourceLogId"))
+        end
+        return false
+    end
+    return true
+end
+
+function LootLogValidators.ValidateSpecChangeData(eventData, profile)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    if not ValidateStoredNameRealmField(eventData.member, "SPEC_CHANGE.member") then
+        return false
+    end
+    if not LootLogValidators.MemberExistsInProfiles(eventData.member, profile) then
+        return false
+    end
+    local specId = tonumber(eventData.specId)
+    if not specId or specId < 1 or specId ~= math.floor(specId) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "SPEC_CHANGE specId is invalid: %s", tostring(eventData.specId))
+        end
+        return false
+    end
+    local SpecWeapons = SF.LootHelperBis and SF.LootHelperBis.SpecWeapons
+    if not (SpecWeapons and SpecWeapons.IsKnownSpec and SpecWeapons.IsKnownSpec(specId)) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "SPEC_CHANGE specId is not a supported Retail specialization: %s", tostring(specId))
+        end
+        return false
+    end
+    local member = profile and profile.getMemberByID and profile:getMemberByID(eventData.member)
+    local classToken = member and member.GetClass and member:GetClass()
+    if type(classToken) ~= "string" or classToken == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "SPEC_CHANGE member class is unknown")
+        end
+        return false
+    end
+    if not (SpecWeapons.IsSpecValidForClass and SpecWeapons.IsSpecValidForClass(specId, classToken)) then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "SPEC_CHANGE specId %s does not belong to class %s", tostring(specId), tostring(classToken))
+        end
+        return false
+    end
+    return RequirePreOpAuthorMax(eventData)
+end
+
+function LootLogValidators.ValidateBisOutcomeData(eventData, profile)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    if SF.LootHelperBis and SF.LootHelperBis.IsOutcomeSchemaValid then
+        if not SF.LootHelperBis.IsOutcomeSchemaValid(eventData) then
+            return false
+        end
+    end
+    if not ValidateStoredNameRealmField(eventData.awardMember, "BIS_OUTCOME.awardMember") then
+        return false
+    end
+    if not LootLogValidators.MemberExistsInProfiles(eventData.awardMember, profile) then
+        return false
+    end
+    return RequirePreOpAuthorMax(eventData)
+end
+
+local function ValidateAssignmentScopeMembers(value)
+    if type(value) ~= "table" or #value == 0 then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "assignmentScopeMembers must be a non-empty list")
+        end
+        return false
+    end
+    for i = 1, #value do
+        if not ValidateStoredNameRealmField(value[i], "assignmentScopeMembers") then
+            return false
+        end
+    end
+    return true
+end
+
+local function SourceLogIdsContains(eventData, needle)
+    if type(needle) ~= "string" or needle == "" then
+        return false
+    end
+    local list = eventData and eventData.sourceLogIds
+    if type(list) ~= "table" then
+        return false
+    end
+    for i = 1, #list do
+        if list[i] == needle then
+            return true
+        end
+    end
+    return false
+end
+
+function LootLogValidators.ValidateBisOverrideData(eventData, profile)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    local actions = SF.LootLogBisOverrideActions or {}
+    local action = eventData.action
+    if action ~= actions.ASSIGN and action ~= actions.CLEAR
+        and action ~= actions.REPLACE and action ~= actions.ASSOCIATE_LEGACY then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "BIS_OVERRIDE action is invalid: %s", tostring(action))
+        end
+        return false
+    end
+    if not RequirePreOpAuthorMax(eventData) then
+        return false
+    end
+    if eventData.viewMember ~= nil and not ValidateStoredNameRealmField(eventData.viewMember, "BIS_OVERRIDE.viewMember") then
+        return false
+    end
+    if action == actions.CLEAR then
+        if not ValidateSourceLogId(eventData.targetAssignmentId, "targetAssignmentId") then
+            return false
+        end
+        if eventData.assignedSlots ~= nil then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "CLEAR must target an assignment id, not slots")
+            end
+            return false
+        end
+        return true
+    end
+    if action == actions.REPLACE then
+        if not ValidateSourceLogId(eventData.targetAssignmentId, "targetAssignmentId") then
+            return false
+        end
+    end
+    local ref = eventData.awardRef
+    if type(ref) ~= "table" or (ref.kind ~= "RC" and ref.kind ~= "MANUAL")
+        or type(ref.id) ~= "string" or ref.id == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "BIS_OVERRIDE awardRef is invalid")
+        end
+        return false
+    end
+    if not ValidateSourceLogId(eventData.sourceLogId, "sourceLogId") then
+        return false
+    end
+    if eventData.sourceLogId ~= ref.id then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "BIS_OVERRIDE sourceLogId must equal awardRef.id")
+        end
+        return false
+    end
+    if not ValidateAssignmentScopeMembers(eventData.assignmentScopeMembers) then
+        return false
+    end
+    if action == actions.ASSIGN or action == actions.REPLACE then
+        local binding = eventData.slotBinding
+        if binding ~= "PACKABLE" and binding ~= "BOUND" then
+            return false
+        end
+        local slotsValid = SF.LootHelperBis and SF.LootHelperBis.IsLegalSlotShape
+            and SF.LootHelperBis.IsLegalSlotShape(eventData.assignedSlots)
+        if not slotsValid then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "BIS_OVERRIDE assignedSlots shape is invalid")
+            end
+            return false
+        end
+    end
+    if action == actions.ASSOCIATE_LEGACY then
+        if not ValidateSourceLogId(eventData.legacyOriginLogId, "legacyOriginLogId") then
+            return false
+        end
+        if not SourceLogIdsContains(eventData, eventData.legacyOriginLogId) then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "ASSOCIATE_LEGACY sourceLogIds must contain legacyOriginLogId")
+            end
+            return false
+        end
+        if eventData.assignedSlots ~= nil then
+            local slotsValid = SF.LootHelperBis and SF.LootHelperBis.IsLegalSlotShape
+                and SF.LootHelperBis.IsLegalSlotShape(eventData.assignedSlots)
+            if not slotsValid then
+                if SF.Debug then
+                    SF.Debug:Warn("LOOTLOG", "ASSOCIATE_LEGACY assignedSlots shape is invalid")
+                end
+                return false
+            end
+        end
+    end
+    return true
+end
+
+function LootLogValidators.ValidateManualAwardData(eventData, profile)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    if not ValidateStoredNameRealmField(eventData.member, "MANUAL_AWARD.member") then
+        return false
+    end
+    if not LootLogValidators.MemberExistsInProfiles(eventData.member, profile) then
+        return false
+    end
+    if type(eventData.itemLink) ~= "string" or eventData.itemLink == "" then
+        return false
+    end
+    if type(eventData.itemString) ~= "string" or eventData.itemString == "" then
+        return false
+    end
+    return RequirePreOpAuthorMax(eventData)
+end
+
+function LootLogValidators.ValidateManualAwardReverseData(eventData, profile)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    if not ValidateSourceLogId(eventData.sourceLogId, "sourceLogId") then
+        return false
+    end
+    return RequirePreOpAuthorMax(eventData)
+end
+
 -- Export to namespace
 SF.LootLogValidators = LootLogValidators

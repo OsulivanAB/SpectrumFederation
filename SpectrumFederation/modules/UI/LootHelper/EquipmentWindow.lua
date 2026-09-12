@@ -3,6 +3,7 @@ local addonName, SF = ...
 
 -- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET
 -- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
+-- luacheck: globals GameTooltip GetItemInfoInstant GetItemIcon
 
 SF.LootHelperWindow = SF.LootHelperWindow or {}
 local LH = SF.LootHelperWindow
@@ -50,7 +51,7 @@ local LEFT_SLOTS = {
     { key = "Head",      texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Head" },
     { key = "Neck",      texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Neck" },
     { key = "Shoulder",  texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Shoulder" },
-    { key = "Back",      texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Chest" },  -- Using Chest icon as Back doesn't exist
+    { key = "Back",      texture = "Interface\\Icons\\INV_Misc_Cape_01" },
     { key = "Chest",     texture = "Interface\\PaperDoll\\UI-PaperDoll-Slot-Chest" },
     { key = nil,         texture = nil },  -- EMPTY (shirt placeholder)
     { key = nil,         texture = nil },  -- EMPTY (tabard placeholder)
@@ -283,6 +284,7 @@ function EquipmentWindow:_CreateGearGrid(content)
         icon:SetTexture(slotInfo.texture)
         icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)  -- Crop edges
         btn.Icon = icon
+        btn.defaultTexture = slotInfo.texture
 
         -- Hover highlight (shown on mouseover)
         local hl = btn:CreateTexture(nil, "HIGHLIGHT")
@@ -444,6 +446,14 @@ function EquipmentWindow:Refresh()
     if not self._frame or not self._frame.Content then return end
     if not self._memberObj then return end
 
+    local profile = self._profile
+    local itemAware = profile and profile.IsItemAwareEquipmentPopup and profile:IsItemAwareEquipmentPopup()
+    local memberId = self._rowModel and self._rowModel.memberId
+    local bisSlots = nil
+    if itemAware and profile and profile.GetIdentityBisSlots and memberId then
+        bisSlots = profile:GetIdentityBisSlots(memberId)
+    end
+
     local armor = nil
     if self._memberObj.GetArmorStatuses then
         armor = self._memberObj:GetArmorStatuses()
@@ -453,25 +463,97 @@ function EquipmentWindow:Refresh()
 
     if not armor then return end
 
+    local function ItemIcon(link)
+        if type(link) ~= "string" or link == "" then
+            return nil
+        end
+        if GetItemInfoInstant then
+            local ok, _, _, _, _, icon = pcall(GetItemInfoInstant, link)
+            if ok and icon then
+                return icon
+            end
+        end
+        if GetItemIcon then
+            local ok, icon = pcall(GetItemIcon, link)
+            if ok then
+                return icon
+            end
+        end
+        return nil
+    end
+
+    local function SetItemTooltip(btn, itemLink)
+        btn:SetScript("OnEnter", function(selfBtn)
+            if GameTooltip and itemLink then
+                GameTooltip:SetOwner(selfBtn, "ANCHOR_RIGHT")
+                GameTooltip:SetHyperlink(itemLink)
+                GameTooltip:Show()
+            end
+        end)
+        btn:SetScript("OnLeave", function()
+            if GameTooltip then
+                GameTooltip:Hide()
+            end
+        end)
+    end
+
     local buttons = self._frame.Content.SlotButtons or {}
     for _, btn in ipairs(buttons) do
         local slotKey = btn.slotKey
         if slotKey and armor[slotKey] ~= nil then
+            local cell = bisSlots and bisSlots[slotKey]
             local used = armor[slotKey] == true
+            local itemLink = cell and (cell.itemLink or cell.itemString)
+            local itemAwareOccupied = itemAware and cell and cell.state and cell.state ~= "AVAILABLE"
 
-            if used then
-                -- Used: full color, show golden overlay
+            if itemAwareOccupied and itemLink and ItemIcon(itemLink) then
+                btn.Icon:SetTexture(ItemIcon(itemLink))
                 btn.Icon:SetDesaturated(false)
                 btn.Icon:SetVertexColor(1, 1, 1, 1)
                 if btn.UsedOverlay then
                     btn.UsedOverlay:Show()
                 end
-            else
-                -- Not used: desaturated, grey tone, hide overlay
-                btn.Icon:SetDesaturated(true)
-                btn.Icon:SetVertexColor(0.6, 0.6, 0.6, 0.8)
+                SetItemTooltip(btn, itemLink)
+            elseif itemAwareOccupied and cell.state == "LEGACY_UNKNOWN" then
+                btn.Icon:SetTexture(btn.defaultTexture)
+                btn.Icon:SetDesaturated(false)
+                btn.Icon:SetVertexColor(1, 0.82, 0.2, 1)
                 if btn.UsedOverlay then
-                    btn.UsedOverlay:Hide()
+                    btn.UsedOverlay:Show()
+                end
+                btn:SetScript("OnEnter", function(selfBtn)
+                    if GameTooltip then
+                        GameTooltip:SetOwner(selfBtn, "ANCHOR_RIGHT")
+                        GameTooltip:SetText("Legacy consumed opportunity")
+                        GameTooltip:AddLine("Unknown item. Correct this in Gear Override.", 1, 1, 1, true)
+                        GameTooltip:Show()
+                    end
+                end)
+                btn:SetScript("OnLeave", function()
+                    if GameTooltip then
+                        GameTooltip:Hide()
+                    end
+                end)
+            else
+                btn.Icon:SetTexture(btn.defaultTexture or btn.Icon:GetTexture())
+                if used or itemAwareOccupied then
+                    btn.Icon:SetDesaturated(false)
+                    btn.Icon:SetVertexColor(1, 1, 1, 1)
+                    if btn.UsedOverlay then
+                        btn.UsedOverlay:Show()
+                    end
+                else
+                    btn.Icon:SetDesaturated(true)
+                    btn.Icon:SetVertexColor(0.6, 0.6, 0.6, 0.8)
+                    if btn.UsedOverlay then
+                        btn.UsedOverlay:Hide()
+                    end
+                end
+                if itemAwareOccupied and itemLink then
+                    SetItemTooltip(btn, itemLink)
+                else
+                    btn:SetScript("OnEnter", nil)
+                    btn:SetScript("OnLeave", nil)
                 end
             end
 
@@ -479,8 +561,13 @@ function EquipmentWindow:Refresh()
                 SetIssueOverlayShown(btn.IssueOverlay, false)
             end
 
-            -- Set click handler
-            if self._canAdmin then
+            local liveAutomation = profile and profile.IsLiveBisAutomationActive and profile:IsLiveBisAutomationActive()
+            local itemAwareAssigned = SF.LootHelperBis and SF.LootHelperBis.CellHasItemAwareAssignment
+                and SF.LootHelperBis.CellHasItemAwareAssignment(cell)
+            if liveAutomation or itemAwareAssigned then
+                btn:EnableMouse(true)
+                btn:SetScript("OnClick", nil)
+            elseif self._canAdmin then
                 btn:EnableMouse(true)
                 btn:SetScript("OnClick", function()
                     self:_OnSlotClicked(slotKey)
@@ -501,6 +588,20 @@ function EquipmentWindow:_OnSlotClicked(slotKey)
     if SF.Debug then
         SF.Debug:Info("LH_EQUIPMENT", "ToggleSlot: member=%s, slot=%s", 
             tostring(self._rowModel and self._rowModel.memberId), tostring(slotKey))
+    end
+
+    local profile = self._profile
+    if profile and profile.IsLiveBisAutomationActive and profile:IsLiveBisAutomationActive() then
+        return
+    end
+    local memberId = self._rowModel and self._rowModel.memberId
+    if profile and profile.GetIdentityBisSlots and memberId then
+        local board = profile:GetIdentityBisSlots(memberId)
+        local cell = board and board[slotKey]
+        if SF.LootHelperBis and SF.LootHelperBis.CellHasItemAwareAssignment
+            and SF.LootHelperBis.CellHasItemAwareAssignment(cell) then
+            return
+        end
     end
 
     -- Call member toggle

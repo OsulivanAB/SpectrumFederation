@@ -592,6 +592,128 @@ function Integration.AreHooksInstalled()
     return hooksInstalled
 end
 
+local function GetEditableRCConfig(profile)
+    if not profile then
+        return nil
+    end
+    if profile.GetEditableRCLootCouncilIntegrationConfig then
+        return profile:GetEditableRCLootCouncilIntegrationConfig()
+    end
+    if profile.GetRCLootCouncilIntegrationConfig then
+        return profile:GetRCLootCouncilIntegrationConfig()
+    end
+    return nil
+end
+
+local function RecordingEnabled()
+    -- Award-time recording uses the accepted config only. Unpublished
+    -- out-of-session drafts must not change recording until they are minted.
+    local profile = Integration.GetSettingsProfile()
+    local cfg = profile and profile.GetRCLootCouncilIntegrationConfig
+        and profile:GetRCLootCouncilIntegrationConfig()
+    return cfg and cfg.recordAwards and true or false
+end
+
+local function AwardReasonHistoryResponseId(entry)
+    local sort = tonumber(entry and entry.sort)
+    if not sort then
+        return nil
+    end
+    return sort - 400
+end
+
+function Integration.AwardReasonHistoryResponseId(entry)
+    return AwardReasonHistoryResponseId(entry)
+end
+
+local function GetRCResponseOptions()
+    local options = {}
+    local seen = {}
+    local function add(entry)
+        if type(entry) ~= "table" or type(entry.key) ~= "string" or seen[entry.key] then
+            return
+        end
+        seen[entry.key] = true
+        options[#options + 1] = {
+            value = entry.key,
+            text = entry.label or entry.text,
+            typeCode = entry.typeCode,
+            responseId = entry.responseId,
+            isAwardReason = entry.isAwardReason and true or false,
+            textLabel = entry.text,
+        }
+    end
+    local rc = _G.RCLootCouncil
+    local db = rc and rc.Getdb and rc:Getdb() or (rc and rc.db)
+    local profile = db and (db.profile or db)
+    local responses = profile and profile.responses
+    if type(responses) == "table" then
+        for typeCode, group in pairs(responses) do
+            if type(group) == "table" then
+                for id, entry in pairs(group) do
+                    local numericId = tonumber(id)
+                    if type(entry) == "table" and numericId then
+                        local text = entry.text or entry.label or entry.name
+                        if type(text) == "string" and strtrim(text) ~= "" then
+                            add({
+                                key = string.format("ctx:%s|%s|0", tostring(typeCode), tostring(numericId)),
+                                text = strtrim(text),
+                                label = string.format("%s (%s #%s)", strtrim(text), tostring(typeCode), tostring(numericId)),
+                                typeCode = tostring(typeCode),
+                                responseId = numericId,
+                                isAwardReason = false,
+                            })
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local awardReasons = profile and profile.awardReasons
+    if type(awardReasons) == "table" then
+        for _, entry in ipairs(awardReasons) do
+            if type(entry) == "table" then
+                local text = entry.text or entry.label
+                local responseId = AwardReasonHistoryResponseId(entry)
+                if type(text) == "string" and strtrim(text) ~= "" and responseId ~= nil then
+                    add({
+                        key = string.format("ctx:awardReason|%s|1", tostring(responseId)),
+                        text = strtrim(text),
+                        label = string.format("%s (award reason #%s)", strtrim(text), tostring(responseId)),
+                        responseId = responseId,
+                        isAwardReason = true,
+                    })
+                end
+            end
+        end
+    end
+    table.sort(options, function(a, b)
+        return tostring(a.text) < tostring(b.text)
+    end)
+    return options
+end
+
+function Integration.GetRCResponseOptions()
+    return GetRCResponseOptions()
+end
+
+local function SelectedBisOption(key)
+    if type(key) ~= "string" then
+        return nil
+    end
+    for _, option in ipairs(GetRCResponseOptions()) do
+        if option.value == key then
+            return {
+                text = option.textLabel or option.text,
+                typeCode = option.typeCode,
+                responseId = option.responseId,
+                isAwardReason = option.isAwardReason,
+            }
+        end
+    end
+    return key
+end
+
 local function GetProfile()
     return Integration.GetSettingsProfile()
 end
@@ -673,11 +795,11 @@ function Integration.RegisterSettingsPage()
                             adminOnly = true,
                             tooltip = "When enabled, eligible Spectrum admins record finalized RC awards for members of the active profile.",
                             get = function()
-                                local profile = GetProfile()
-                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
                                     return true
                                 end
-                                return profile:GetRCLootCouncilIntegrationConfig().recordAwards
+                                return cfg.recordAwards
                             end,
                             set = function(value)
                                 local profile = GetProfile()
@@ -693,18 +815,18 @@ function Integration.RegisterSettingsPage()
                             adminOnly = true,
                             tooltip = "When enabled, every RC response label is recorded. When disabled, only the custom allow-list is recorded.",
                             visible = function()
-                                local profile = GetProfile()
-                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
                                     return true
                                 end
-                                return profile:GetRCLootCouncilIntegrationConfig().recordAwards
+                                return cfg.recordAwards
                             end,
                             get = function()
-                                local profile = GetProfile()
-                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
                                     return true
                                 end
-                                return profile:GetRCLootCouncilIntegrationConfig().recordAllAwardTypes
+                                return cfg.recordAllAwardTypes
                             end,
                             set = function(value)
                                 local profile = GetProfile()
@@ -720,11 +842,10 @@ function Integration.RegisterSettingsPage()
                     id = "allowList",
                     title = "Allowed Award Types",
                     condition = function()
-                        local profile = GetProfile()
-                        if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                        local cfg = GetEditableRCConfig(GetProfile())
+                        if not cfg then
                             return false
                         end
-                        local cfg = profile:GetRCLootCouncilIntegrationConfig()
                         return cfg.recordAwards and not cfg.recordAllAwardTypes
                     end,
                     items = {
@@ -763,12 +884,12 @@ function Integration.RegisterSettingsPage()
                             removeAtlas = "common-icon-redx",
                             compactColumns = true,
                             getItems = function()
-                                local profile = GetProfile()
-                                if not profile or not profile.GetRCLootCouncilIntegrationConfig then
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
                                     return {}
                                 end
                                 local items = {}
-                                for _, value in ipairs(profile:GetRCLootCouncilIntegrationConfig().allowedResponses) do
+                                for _, value in ipairs(cfg.allowedResponses or {}) do
                                     items[#items + 1] = { id = value, label = value }
                                 end
                                 return items
@@ -784,6 +905,131 @@ function Integration.RegisterSettingsPage()
                                     return
                                 end
                                 ctx.section:SetMessage("Award type removed.", "success")
+                                ctx.pageBuilder:Refresh()
+                            end,
+                        },
+                    },
+                },
+                {
+                    id = "bisResponses",
+                    title = "BiS-Qualifying Responses",
+                    items = {
+                        { type = "help", text = "When recording is on, every BiS-qualified response is recorded. Configuration is kept while recording is off, but it is inactive until recording is turned back on. Only future RC awards use this list. Historical BiS outcomes are never reinterpreted.", indent = "label" },
+                        {
+                            type = "dropdownIconButton",
+                            label = "Add from RC Loot Council",
+                            adminOnly = true,
+                            defaultText = "Select response",
+                            enabled = function()
+                                return RecordingEnabled()
+                            end,
+                            visible = function()
+                                return #GetRCResponseOptions() > 0
+                            end,
+                            options = function()
+                                return GetRCResponseOptions()
+                            end,
+                            get = function() return panel.__sfBisResponseSelected end,
+                            set = function(value) panel.__sfBisResponseSelected = value end,
+                            iconAtlas = "common-icon-plus",
+                            iconToolTip = "Add the selected RC response as BiS-qualifying",
+                            iconEnabled = function()
+                                return RecordingEnabled() and panel.__sfBisResponseSelected ~= nil
+                            end,
+                            onIconClick = function(ctx)
+                                local profile = GetProfile()
+                                if not (profile and profile.AddRCLootCouncilBisResponse) then
+                                    ctx.section:SetMessage("No active profile.", "error")
+                                    return
+                                end
+                                if not RecordingEnabled() then
+                                    ctx.section:SetMessage("Turn on Record RC Loot Council awards before changing BiS responses.", "error")
+                                    return
+                                end
+                                local ok, err = profile:AddRCLootCouncilBisResponse(SelectedBisOption(panel.__sfBisResponseSelected))
+                                if not ok then
+                                    ctx.section:SetMessage(err or "Could not add BiS response.", "error")
+                                    return
+                                end
+                                ctx.section:SetMessage("BiS response added. Future awards only.", "success")
+                                ctx.pageBuilder:Refresh()
+                            end,
+                        },
+                        {
+                            type = "editboxButton",
+                            label = "Add BiS response",
+                            hint = "BiS",
+                            buttonText = "Add",
+                            buttonWidth = 80,
+                            editWidth = 180,
+                            adminOnly = true,
+                            enabled = function()
+                                return RecordingEnabled()
+                            end,
+                            onSubmit = function(ctx, text, editBox)
+                                ctx.section:ClearMessage()
+                                local profile = GetProfile()
+                                if not (profile and profile.AddRCLootCouncilBisResponse) then
+                                    ctx.section:SetMessage("No active profile.", "error")
+                                    return
+                                end
+                                if not RecordingEnabled() then
+                                    ctx.section:SetMessage("Turn on Record RC Loot Council awards before changing BiS responses.", "error")
+                                    return
+                                end
+                                local ok, err = profile:AddRCLootCouncilBisResponse(text)
+                                if not ok then
+                                    ctx.section:SetMessage(err or "Could not add BiS response.", "error")
+                                    return
+                                end
+                                editBox:SetText("")
+                                ctx.section:SetMessage("BiS response added. Future awards only.", "success")
+                                ctx.pageBuilder:Refresh()
+                            end,
+                        },
+                        {
+                            type = "scrollList",
+                            label = "BiS responses",
+                            adminOnly = true,
+                            height = 140,
+                            rowHeight = 20,
+                            removeAtlas = "common-icon-redx",
+                            compactColumns = true,
+                            enabled = function()
+                                return RecordingEnabled()
+                            end,
+                            getItems = function()
+                                local cfg = GetEditableRCConfig(GetProfile())
+                                if not cfg then
+                                    return {}
+                                end
+                                local items = {}
+                                for _, value in ipairs(cfg.bisResponses or {}) do
+                                    local label = value.text or value.key or tostring(value)
+                                    if value.isAwardReason then
+                                        label = string.format("%s [award reason #%s]", label, tostring(value.responseId))
+                                    elseif value.typeCode and value.responseId ~= nil then
+                                        label = string.format("%s [%s #%s]", label, tostring(value.typeCode), tostring(value.responseId))
+                                    end
+                                    items[#items + 1] = { id = value.key or value.text, label = label }
+                                end
+                                return items
+                            end,
+                            onRemove = function(ctx, item)
+                                local profile = GetProfile()
+                                if not (profile and profile.RemoveRCLootCouncilBisResponse) then
+                                    return
+                                end
+                                if not RecordingEnabled() then
+                                    ctx.section:SetMessage("Turn on Record RC Loot Council awards before changing BiS responses.", "error")
+                                    return
+                                end
+                                local ok, err = profile:RemoveRCLootCouncilBisResponse(item.id)
+                                if not ok then
+                                    ctx.section:SetMessage(err or "Could not remove BiS response.", "error")
+                                    return
+                                end
+                                ctx.section:SetMessage("BiS response removed. Future awards only.", "success")
                                 ctx.pageBuilder:Refresh()
                             end,
                         },

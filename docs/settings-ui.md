@@ -103,9 +103,13 @@ Profile admins can add profile members as admins, remove admins other than the o
 
 The owner cannot be removed from the admin list through this page. Only the effective owner may link or unlink characters that belong to the canonical owner's identity. Other admins may manage non-owner identities.
 
+## Loot Helper: Character
+
+Profile admins can choose a character, set that character's persistent specialization, and use Gear Override from a character-equipment board. Empty slots show placeholders; used slots show the item icon, a WoW tooltip, and a red X to clear. Clicking a slot offers only loot that fits that slot, including an already-assigned item that can be moved to another empty compatible slot with one REPLACE. Selecting either linked character shows the shared BiS board and award pool. Award ownership stays with the character who received the loot. Manual loot additions enter the pool without consuming an opportunity. Legacy unknown usage is visually distinct. Overflow `#278` origins are not listed as associable opportunities. Final visual behavior still requires Retail QA.
+
 ## Loot Helper: RC Loot Council
 
-This tab appears only when the optional `SpectrumFederation_RCLootCouncilIntegration` child addon is enabled. Profile admins can choose whether finalized RC Loot Council awards are written to Loot Logs, and which RC response labels to record. Settings belong to the active Loot Helper profile and sync with that profile's snapshot. There is no extra **Optional** sidebar row. See [RC Loot Council Integration](development/rc-loot-council-integration.md).
+This tab appears only when the optional `SpectrumFederation_RCLootCouncilIntegration` child addon is enabled. Profile admins can choose whether finalized RC Loot Council awards are written to Loot Logs, which RC response labels to record, and which recorded responses qualify as BiS for future awards. Settings belong to the active Loot Helper profile and sync with that profile's snapshot. There is no extra **Optional** sidebar row. See [RC Loot Council Integration](development/rc-loot-council-integration.md).
 
 ## Loot Logs
 

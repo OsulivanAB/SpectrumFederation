@@ -6,7 +6,7 @@ local Sync = SF.LootHelperSync
 -- Constants / Message Types
 -- ============================================================================
 
-Sync.PROTO_VERSION = 2
+Sync.PROTO_VERSION = 3
 
 Sync.PREFIX = {
     CONTROL = "SF_LH",
@@ -39,4 +39,8 @@ Sync.MSG = {
     -- Safe Mode
     SAFE_MODE_REQ   = "SAFE_MODE_REQ",
     SAFE_MODE_SET   = "SAFE_MODE_SET",
+
+    -- RC integration config (config-only; never a full profile snapshot)
+    RC_CONFIG_REQ   = "RC_CONFIG_REQ",
+    RC_CONFIG_SET   = "RC_CONFIG_SET",
 }

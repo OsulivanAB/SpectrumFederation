@@ -155,6 +155,7 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         pendingReq      = {}, -- [admin] = true
         pendingCount    = 0,
         finished        = false,
+        mode            = mode,
         onComplete      = opts.onComplete or function() self:BroadcastSessionStart() end,
     }
 
@@ -212,6 +213,14 @@ function Sync:_FinishAdminConvergence(reason)
     
     conv.finished = true
     local onComplete = conv.onComplete
+
+    -- START and takeover/REANNOUNCE both adopt a strictly newer previously
+    -- accepted, non-dirty generation. Takeover must not mint, and must not
+    -- let a new coordEpoch silently publish the takeover client's stale blob.
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if profile and profile._rcConfigDirty ~= true and self._AdoptNewerAdminAcceptedRCConfig then
+        self:_AdoptNewerAdminAcceptedRCConfig(profile)
+    end
     
     -- Clean up convergence state
     self.state._adminConvergence = nil
@@ -578,6 +587,11 @@ function Sync:BroadcastSessionStart()
     -- Temporarily clear helpers list so members don't route to helpers immediately
     self.state.helpers = {}
 
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if self._MintDirtySessionRCConfig then
+        self:_MintDirtySessionRCConfig(profile)
+    end
+
     local payload = {
         sessionId   = self.state.sessionId,
         profileId   = profileId,
@@ -588,6 +602,9 @@ function Sync:BroadcastSessionStart()
         helpers     = chosenHelpers,  -- Broadcast includes helpers for members to know about
         safeMode    = self:_GetSessionSafeModePayload(),
     }
+    if self._AttachRCConfigGeneration then
+        self:_AttachRCConfigGeneration(payload, profileId)
+    end
 
     if SF.Debug then
         local helpersCount = type(chosenHelpers) == "table" and #chosenHelpers or 0

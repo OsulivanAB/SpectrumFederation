@@ -29,6 +29,8 @@ Use this skill when a task is close to done and you need a repo-specific merge-r
    - `python -m pytest tests/test_loot_helper_window.py` when Loot Helper window minimize or positioning changed
    - `python -m pytest tests/test_sync_protocol.py` when SyncProtocol NACK/warning throttling changed
    - `python -m pytest tests/test_settings_window_layout.py` when Settings window content layout or the impersonation banner changed
+   - `python -m pytest tests/test_linked_identity.py` when linked identities changed
+   - `python -m pytest tests/test_bis_reconstruction.py` when item-aware BiS reconstruction changed
    - `python -m pytest tests/test_pr_template.py` when the PR template or `validate_pr_template.py` changed
    - `python -m pytest tests/test_promotion_scope.py` when promotion workflows or `classify_promotion_scope.py` changed
    - `python -m pytest tests/test_check_version_bump.py` when version-bump comparison or `check_version_bump.py` changed

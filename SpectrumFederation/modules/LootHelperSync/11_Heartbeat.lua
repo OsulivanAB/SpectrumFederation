@@ -87,6 +87,13 @@ function Sync:HandleSessionStart(sender, payload)
         self.state.helpers = {}
     end
 
+    if self._RememberAdvertisedRCConfigGeneration then
+        self:_RememberAdvertisedRCConfigGeneration(payload)
+    end
+    if self._ApplyAdvertisedRCConfig then
+        self:_ApplyAdvertisedRCConfig(payload)
+    end
+
     -- Rebuild immediately when we already have the profile to avoid stale point/member UI.
     local profile = self:FindLocalProfileById(payload.profileId)
     if profile then
@@ -469,6 +476,10 @@ function Sync:SendJoinStatus()
 
     local localAuthorMax = profile:ComputeAuthorMax() or {}
     payloadBase.localAuthorMax = localAuthorMax
+    if self._AttachRCConfigGeneration then
+        self:_AttachRCConfigGeneration(payloadBase, profileId)
+    end
+    payloadBase.rcConfigDirty = profile._rcConfigDirty == true
 
     local localContig = self:ComputeContigAuthorMax(profileId)
     local remoteAuthorMax = self.state.authorMax or {}
@@ -557,6 +568,10 @@ function Sync:SendJoinStatus()
 
     if (missing and #missing > 0) or (integrityRanges and #integrityRanges > 0) then
         return
+    end
+
+    if self._CatchUpRCConfigIfNeeded then
+        self:_CatchUpRCConfigIfNeeded(profile, "join-status-rc-config")
     end
 
     if alreadySent("HAVE_PROFILE") then return end

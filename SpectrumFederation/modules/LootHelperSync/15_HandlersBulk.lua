@@ -350,7 +350,9 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.snapshot) ~= "table" then return end
 
-    -- Trust policy: accept from coordinator or helper
+    -- Full snapshots remain coordinator/helper-only. Ordinary admins cannot
+    -- supply owner, roster, logs, loot mode, Reward Pot, Raid Check, or
+    -- equipment state through this path. RC settings use RC_CONFIG_REQ/SET.
     if not self:IsTrustedDataSender(sender) then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not a trusted sender", tostring(sender))
@@ -446,6 +448,8 @@ function Sync:HandleProfileSnapshot(sender, payload)
         end
         return
     end
+
+    self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
 
     -- Store new profile in canonical map (keyed by profileId)
     if isNew then

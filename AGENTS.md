@@ -52,6 +52,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Run Settings window layout tests (production Lua via lua5.1): `python -m pytest tests/test_settings_window_layout.py`
 - Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py`
 - Run linked character identity tests (production Lua via lua5.1): `python -m pytest tests/test_linked_identity.py`
+- Run item-aware BiS reconstruction tests (production Lua via lua5.1): `python -m pytest tests/test_bis_reconstruction.py`
 - Run Raid Equipment policy and check-run tests (production Lua via lua5.1): `python -m pytest tests/test_raid_equipment.py`
 - Run PR template validator tests: `python -m pytest tests/test_pr_template.py`
 - Run promotion-scope classification tests: `python -m pytest tests/test_promotion_scope.py`
@@ -91,6 +92,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Settings window impersonation-banner layout: also run `python -m pytest tests/test_settings_window_layout.py`
 - Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`
 - Linked character identities: also run `python -m pytest tests/test_linked_identity.py`
+- Item-aware BiS reconstruction: also run `python -m pytest tests/test_bis_reconstruction.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`
 - UI layout, timers, listeners, queues, inspection, or sync: prefer the existing Lua 5.1 suite for that area, with assertions that execution stays bounded and converges. See Client Stability in `SpectrumFederation/AGENTS.md`.
 - PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`
