@@ -731,6 +731,22 @@ function Sync:_ResetSessionState(reason)
             tostring(self.state.coordinator), outstandingReqCount)
     end
 
+    -- Unaccepted in-session RC proposals die with the session. Capture the
+    -- profile before session identity is cleared. Dirty out-of-session drafts
+    -- are left in place for the next starter mint / equal-generation converge.
+    do
+        local endingProfileId = self.state.profileId
+        local endingProfile = nil
+        if type(endingProfileId) == "string" and endingProfileId ~= "" and self.FindLocalProfileById then
+            endingProfile = self:FindLocalProfileById(endingProfileId)
+        end
+        if endingProfile and endingProfile.DiscardInSessionRCProposal then
+            endingProfile:DiscardInSessionRCProposal(reason or "session ended")
+        elseif endingProfile and endingProfile._rcConfigDirty ~= true then
+            endingProfile._pendingRCLootCouncilIntegration = nil
+        end
+    end
+
     -- Cancel outstanding request timers and clear requests
     if type(self.state.requests) == "table" then
         for _, req in pairs(self.state.requests) do

@@ -3568,6 +3568,492 @@ local function testRCGenerationIdentityUniqueness()
 end
 testRCGenerationIdentityUniqueness()
 
+local function testPendingRCProposalDoesNotSurviveSessionEnd()
+    loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
+    loadModule("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
+
+    local nonce = 0
+    local deferred = {}
+    local captured = {}
+
+    local function greedMeta()
+        return { typeCode = "default", responseId = 2, isAwardReason = false }
+    end
+
+    local function lastOfType(msgType)
+        local found
+        for i = 1, #captured do
+            if captured[i].msgType == msgType then
+                found = captured[i]
+            end
+        end
+        return found
+    end
+
+    local function resetCaptured()
+        captured = {}
+        SF.LootHelperComm = {
+            Send = function(_, channel, msgType, payload, dist, target)
+                captured[#captured + 1] = {
+                    channel = channel,
+                    msgType = msgType,
+                    payload = payload,
+                    dist = dist,
+                    target = target,
+                }
+                return true
+            end,
+        }
+    end
+
+    local function installHarness()
+        nonce = 0
+        deferred = {}
+        function Sync:_NextNonce(tag)
+            nonce = nonce + 1
+            return tostring(tag or "N") .. "-" .. tostring(nonce)
+        end
+        function Sync:_ResetSessionSafeMode()
+        end
+        function Sync:_ResetLocalSafeMode()
+        end
+        function Sync:_ApplySessionSafeModeFromPayload()
+        end
+        function Sync:EnsureHeartbeatMonitor()
+            return false
+        end
+        function Sync:StopHeartbeatSender()
+        end
+        function Sync:NewRequestId()
+            nonce = nonce + 1
+            return "REQ-PEND-" .. tostring(nonce)
+        end
+        function Sync:GetPeer(nameRealm)
+            self.state.peers = self.state.peers or {}
+            local peer = self.state.peers[nameRealm]
+            if not peer then
+                peer = { name = nameRealm, inGroup = true }
+                self.state.peers[nameRealm] = peer
+            end
+            peer.inGroup = true
+            return peer
+        end
+        function Sync:RegisterRequest()
+            return true
+        end
+        function Sync:RunWithJitter(_, _, fn)
+            if type(fn) == "function" then
+                fn()
+            end
+        end
+        function Sync:RunAfter(delaySec, fn)
+            if type(fn) ~= "function" then
+                return
+            end
+            delaySec = tonumber(delaySec) or 0
+            if delaySec <= 0 then
+                fn()
+                return
+            end
+            deferred[#deferred + 1] = fn
+        end
+        function Sync:_CancelRequestTimer()
+        end
+        function Sync:_GetSessionSafeModePayload()
+            return { enabled = false, rev = 0 }
+        end
+    end
+
+    local function flushDeferred()
+        local queued = deferred
+        deferred = {}
+        for i = 1, #queued do
+            queued[i]()
+        end
+    end
+
+    local function seedNeedConfig(profile)
+        assertTrue(profile:ApplyRCLootCouncilIntegrationConfig({
+            recordAwards = true,
+            recordAllAwardTypes = false,
+            allowedResponses = { "Need" },
+            bisResponses = {
+                { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+            },
+        }, { skipPermission = true, skipSync = true }), "seed accepted Need-only RC config")
+    end
+
+    local function addGreed(profile)
+        return profile:AddRCLootCouncilBisResponse({
+            text = "Greed",
+            typeCode = "default",
+            responseId = 2,
+            isAwardReason = false,
+        })
+    end
+
+    local function hasGreedBis(cfg)
+        for _, entry in ipairs((cfg and cfg.bisResponses) or {}) do
+            if entry.responseId == 2 and entry.isAwardReason == false then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function assertVisibleMatchesAccepted(profile, message)
+        local editable = profile:GetEditableRCLootCouncilIntegrationConfig()
+        local accepted = profile:GetRCLootCouncilIntegrationConfig()
+        assertTrue(cfgEqual(editable, accepted), message .. ": Settings/editable matches accepted")
+        assertEq(profile:GetProposedRCLootCouncilIntegrationConfig(), nil, message .. ": no pending proposal")
+        assertFalse(profile._rcConfigDirty == true, message .. ": not an unpublished out-of-session draft")
+        assertFalse(hasGreedBis(editable), message .. ": visible config is not unpublished Greed")
+        assertFalse(profile:IsBisQualifyingResponse("Greed", greedMeta()), message .. ": award-time Greed is not BiS")
+        assertFalse(profile:ShouldRecordRCResponse("Greed", greedMeta()), message .. ": award-time does not record Greed")
+    end
+
+    local function driveResponderStatuses(starterPlayer, responders)
+        local syncs = {}
+        for i = 1, #captured do
+            if captured[i].msgType == Sync.MSG.ADMIN_SYNC then
+                syncs[#syncs + 1] = captured[i]
+            end
+        end
+        assertTrue(#syncs > 0, "StartSession whispered ADMIN_SYNC")
+        for i = 1, #syncs do
+            local target = syncs[i].target
+            local responder
+            for j = 1, #responders do
+                if responders[j].player == target then
+                    responder = responders[j]
+                    break
+                end
+            end
+            assertTrue(responder ~= nil, "ADMIN_SYNC target is a known admin")
+            local previous = PLAYER
+            PLAYER = responder.player
+            withLocalProfile(responder.profile, function()
+                Sync:HandleAdminSync(starterPlayer, syncs[i].payload)
+            end)
+            PLAYER = starterPlayer
+            local statusMsg = lastOfType(Sync.MSG.ADMIN_STATUS)
+            assertTrue(statusMsg ~= nil, "admin replied ADMIN_STATUS")
+            Sync:HandleAdminStatus(responder.player, statusMsg.payload)
+            PLAYER = previous
+        end
+        flushDeferred()
+    end
+
+    local function beginSharedSession()
+        resetEnv()
+        installHarness()
+        function Sync:_Now()
+            return 100
+        end
+        local coord = makeProfile("RC Pending Lifecycle A")
+        addMember(coord, WINNER)
+        addMember(coord, ADMIN_B)
+        assertTrue(coord:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Admin B shares the profile")
+        seedNeedConfig(coord)
+        setActive(coord)
+        startSessionOn(coord)
+        Sync.state.coordinator = PLAYER
+        Sync.state.isCoordinator = true
+        Sync.state.coordEpoch = 100
+        coord._rcConfigSeq = 4
+        coord._rcConfigEpoch = 100
+        Sync.state.rcConfigSeq = 4
+        local follower = cloneProfileAs("RC Pending Lifecycle B", coord)
+        follower._rcConfigSeq = 4
+        follower._rcConfigEpoch = 100
+        return coord, follower
+    end
+
+    local function proposeGreedAsFollower(coord, follower)
+        resetCaptured()
+        PLAYER = ADMIN_B
+        SF.lootHelperDB.profiles[follower:GetProfileId()] = follower
+        withLocalProfile(follower, function()
+            Sync.state.active = true
+            Sync.state.sessionId = "SES1"
+            Sync.state.profileId = follower:GetProfileId()
+            Sync.state.coordinator = "Tester-Garona"
+            Sync.state.coordEpoch = 100
+            Sync.state.isCoordinator = false
+            assertTrue(addGreed(follower), "follower can propose Greed during the session")
+        end)
+        local req = lastOfType(Sync.MSG.RC_CONFIG_REQ)
+        assertTrue(req ~= nil, "follower sent RC_CONFIG_REQ")
+        assertEq(req.payload.catchUp == true, false, "proposal REQ is not catch-up replay")
+        local proposed = follower:GetProposedRCLootCouncilIntegrationConfig()
+        assertTrue(proposed ~= nil, "follower retained the Greed proposal")
+        assertTrue(hasGreedBis(proposed), "pending proposal includes Greed")
+        assertFalse(hasGreedBis(follower:GetRCLootCouncilIntegrationConfig()), "accepted config remains Need-only")
+        assertFalse(follower._rcConfigDirty == true, "successful in-session REQ is not _rcConfigDirty")
+        assertTrue(hasGreedBis(follower:GetEditableRCLootCouncilIntegrationConfig()), "Settings show the live pending Greed proposal")
+        assertFalse(follower:IsBisQualifyingResponse("Greed", greedMeta()), "award-time stays Need-only before SET")
+        PLAYER = "Tester-Garona"
+        SF.lootHelperDB.profiles[coord:GetProfileId()] = coord
+        Sync.state.active = true
+        Sync.state.isCoordinator = true
+        Sync.state.coordinator = PLAYER
+        Sync.state.sessionId = "SES1"
+        Sync.state.profileId = coord:GetProfileId()
+        Sync.state.coordEpoch = 100
+        return req
+    end
+
+    -- Remote SES_END discards the unaccepted in-session proposal.
+    local coord, follower = beginSharedSession()
+    proposeGreedAsFollower(coord, follower)
+    resetCaptured()
+    assertTrue(Sync:EndSession("manual", true), "coordinator broadcasts SES_END")
+    local endMsg = lastOfType(Sync.MSG.SES_END)
+    assertTrue(endMsg ~= nil, "SES_END was broadcast")
+    PLAYER = ADMIN_B
+    withLocalProfile(follower, function()
+        Sync.state.active = true
+        Sync.state.sessionId = "SES1"
+        Sync.state.profileId = follower:GetProfileId()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 100
+        Sync.state.isCoordinator = false
+        Sync:HandleSessionEnd("Tester-Garona", endMsg.payload)
+    end)
+    assertVisibleMatchesAccepted(follower, "after remote SES_END")
+
+    -- Former proposer starts the next session: visible Settings and award-time agree.
+    function Sync:_Now()
+        return 200
+    end
+    installHarness()
+    resetCaptured()
+    SF.lootHelperDB.profiles[follower:GetProfileId()] = follower
+    setActive(follower)
+    assertTrue(Sync:StartSession(follower:GetProfileId()) ~= nil, "former proposer starts the next session")
+    driveResponderStatuses(ADMIN_B, { { player = "Tester-Garona", profile = coord } })
+    local startAsB = lastOfType(Sync.MSG.SES_START)
+    assertTrue(startAsB ~= nil, "former proposer's StartSession announced SES_START")
+    assertFalse(hasGreedBis(startAsB.payload.rcLootCouncilIntegration), "new session descriptor is Need-only")
+    assertFalse(follower._rcConfigDirty == true, "former proposer did not mint a dead-session proposal")
+    assertVisibleMatchesAccepted(follower, "former proposer new session")
+    assertEq(startAsB.payload.rcConfigSeq, follower._rcConfigSeq, "descriptor seq matches accepted")
+    assertEq(startAsB.payload.rcConfigEpoch, follower._rcConfigEpoch, "descriptor epoch matches accepted")
+
+    -- Another admin starts the next session after the proposal died with SES_END.
+    coord, follower = beginSharedSession()
+    proposeGreedAsFollower(coord, follower)
+    resetCaptured()
+    assertTrue(Sync:EndSession("manual", true), "coordinator broadcasts SES_END for the A-starts case")
+    endMsg = lastOfType(Sync.MSG.SES_END)
+    PLAYER = ADMIN_B
+    withLocalProfile(follower, function()
+        Sync.state.active = true
+        Sync.state.sessionId = "SES1"
+        Sync.state.profileId = follower:GetProfileId()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 100
+        Sync.state.isCoordinator = false
+        Sync:HandleSessionEnd("Tester-Garona", endMsg.payload)
+    end)
+    function Sync:_Now()
+        return 200
+    end
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[coord:GetProfileId()] = coord
+    setActive(coord)
+    installHarness()
+    resetCaptured()
+    assertTrue(Sync:StartSession(coord:GetProfileId()) ~= nil, "Admin A starts the next session")
+    driveResponderStatuses("Tester-Garona", { { player = ADMIN_B, profile = follower } })
+    local startAsA = lastOfType(Sync.MSG.SES_START)
+    assertTrue(startAsA ~= nil, "Admin A announced SES_START")
+    assertFalse(hasGreedBis(startAsA.payload.rcLootCouncilIntegration), "Admin A's descriptor is Need-only")
+    PLAYER = ADMIN_B
+    withLocalProfile(follower, function()
+        Sync:HandleSessionStart("Tester-Garona", startAsA.payload)
+    end)
+    assertVisibleMatchesAccepted(follower, "follower after another admin starts")
+    assertTrue(cfgEqual(coord:GetRCLootCouncilIntegrationConfig(), follower:GetRCLootCouncilIntegrationConfig()), "both accepted configs match")
+
+    -- Session change to a different sessionId discards the old in-session proposal.
+    coord, follower = beginSharedSession()
+    proposeGreedAsFollower(coord, follower)
+    PLAYER = ADMIN_B
+    withLocalProfile(follower, function()
+        Sync.state.active = true
+        Sync.state.sessionId = "SES1"
+        Sync.state.profileId = follower:GetProfileId()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 100
+        Sync.state.isCoordinator = false
+        Sync:HandleSessionStart("Tester-Garona", {
+            sessionId = "SES2",
+            profileId = follower:GetProfileId(),
+            coordinator = "Tester-Garona",
+            coordEpoch = 200,
+            rcConfigEpoch = 100,
+            rcConfigSeq = 4,
+            rcLootCouncilIntegration = coord:GetRCLootCouncilIntegrationConfig(),
+            authorMax = {},
+            helpers = {},
+        })
+    end)
+    assertEq(Sync.state.sessionId, "SES2", "follower accepted the new session")
+    assertVisibleMatchesAccepted(follower, "after session_changed SES_START")
+    assertTrue(Sync.state.active == true, "new session is active")
+    assertTrue(cfgEqual(
+        follower:GetEditableRCLootCouncilIntegrationConfig(),
+        follower:GetRCLootCouncilIntegrationConfig()
+    ), "active new session Settings match accepted Need-only")
+
+    -- Session change without an advertised RC blob still drops the dead proposal.
+    coord, follower = beginSharedSession()
+    proposeGreedAsFollower(coord, follower)
+    PLAYER = ADMIN_B
+    withLocalProfile(follower, function()
+        Sync.state.active = true
+        Sync.state.sessionId = "SES1"
+        Sync.state.profileId = follower:GetProfileId()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 100
+        Sync.state.isCoordinator = false
+        Sync:HandleSessionStart("Tester-Garona", {
+            sessionId = "SES2",
+            profileId = follower:GetProfileId(),
+            coordinator = "Tester-Garona",
+            coordEpoch = 200,
+            authorMax = {},
+            helpers = {},
+        })
+    end)
+    assertEq(Sync.state.sessionId, "SES2", "follower accepted the blob-less new session")
+    assertVisibleMatchesAccepted(follower, "after blob-less session_changed SES_START")
+    assertTrue(Sync.state.active == true, "blob-less new session is active")
+
+    -- Accepted SET before session end remains the live configuration.
+    coord, follower = beginSharedSession()
+    local req = proposeGreedAsFollower(coord, follower)
+    resetCaptured()
+    Sync:HandleRCConfigRequest(ADMIN_B, req.payload)
+    local setMsg = lastOfType(Sync.MSG.RC_CONFIG_SET)
+    assertTrue(setMsg ~= nil, "coordinator serialized RC_CONFIG_SET")
+    PLAYER = ADMIN_B
+    withLocalProfile(follower, function()
+        Sync.state.active = true
+        Sync.state.sessionId = "SES1"
+        Sync.state.profileId = follower:GetProfileId()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 100
+        Sync.state.isCoordinator = false
+        Sync:HandleRCConfigSet("Tester-Garona", setMsg.payload)
+    end)
+    assertTrue(follower:IsBisQualifyingResponse("Greed", greedMeta()), "SET makes Greed award-time BiS")
+    assertEq(follower:GetProposedRCLootCouncilIntegrationConfig(), nil, "SET clears the pending proposal")
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[coord:GetProfileId()] = coord
+    Sync.state.active = true
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    Sync.state.sessionId = "SES1"
+    Sync.state.profileId = coord:GetProfileId()
+    Sync.state.coordEpoch = 100
+    resetCaptured()
+    assertTrue(Sync:EndSession("manual", true), "coordinator ends after accepted SET")
+    endMsg = lastOfType(Sync.MSG.SES_END)
+    PLAYER = ADMIN_B
+    withLocalProfile(follower, function()
+        Sync.state.active = true
+        Sync.state.sessionId = "SES1"
+        Sync.state.profileId = follower:GetProfileId()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 100
+        Sync.state.isCoordinator = false
+        Sync:HandleSessionEnd("Tester-Garona", endMsg.payload)
+    end)
+    assertTrue(follower:IsBisQualifyingResponse("Greed", greedMeta()), "accepted Greed survives session end")
+    assertTrue(hasGreedBis(follower:GetEditableRCLootCouncilIntegrationConfig()), "Settings keep accepted Greed")
+    assertTrue(cfgEqual(
+        follower:GetEditableRCLootCouncilIntegrationConfig(),
+        follower:GetRCLootCouncilIntegrationConfig()
+    ), "accepted Greed Settings match award-time after SES_END")
+    assertEq(follower:GetProposedRCLootCouncilIntegrationConfig(), nil, "no pending remains after accepted SET + SES_END")
+
+    -- Failed RC_CONFIG_REQ still discards immediately, and session end stays empty.
+    coord, follower = beginSharedSession()
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[follower:GetProfileId()] = follower
+    SF.LootHelperComm = {
+        Send = function()
+            return false
+        end,
+    }
+    withLocalProfile(follower, function()
+        Sync.state.active = true
+        Sync.state.sessionId = "SES1"
+        Sync.state.profileId = follower:GetProfileId()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 100
+        Sync.state.isCoordinator = false
+        local ok, err = follower:AddRCLootCouncilBisResponse({
+            text = "Greed",
+            typeCode = "default",
+            responseId = 2,
+            isAwardReason = false,
+        })
+        assertFalse(ok, "failed REQ does not report success")
+        assertEq(err, "send failed", "failed REQ surfaces send failed")
+    end)
+    assertEq(follower:GetProposedRCLootCouncilIntegrationConfig(), nil, "failed REQ discards the proposal")
+    assertFalse(follower:IsBisQualifyingResponse("Greed", greedMeta()), "failed REQ is not award-time Greed")
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[coord:GetProfileId()] = coord
+    installHarness()
+    resetCaptured()
+    Sync.state.active = true
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    Sync.state.sessionId = "SES1"
+    Sync.state.profileId = coord:GetProfileId()
+    Sync.state.coordEpoch = 100
+    assertTrue(Sync:EndSession("manual", true), "session can end after failed REQ")
+    endMsg = lastOfType(Sync.MSG.SES_END)
+    PLAYER = ADMIN_B
+    withLocalProfile(follower, function()
+        Sync.state.active = true
+        Sync.state.sessionId = "SES1"
+        Sync.state.profileId = follower:GetProfileId()
+        Sync.state.coordinator = "Tester-Garona"
+        Sync.state.coordEpoch = 100
+        Sync.state.isCoordinator = false
+        Sync:HandleSessionEnd("Tester-Garona", endMsg.payload)
+    end)
+    assertVisibleMatchesAccepted(follower, "after failed REQ and SES_END")
+
+    -- Intentional out-of-session dirty drafts from the previous pass still survive session reset.
+    coord, follower = beginSharedSession()
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[coord:GetProfileId()] = coord
+    assertTrue(Sync:EndSession("manual", false), "prior session ended before the dirty edit")
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[follower:GetProfileId()] = follower
+    setActive(follower)
+    assertTrue(addGreed(follower), "out-of-session dirty edit still works")
+    assertEq(follower._rcConfigDirty, true, "out-of-session edit is dirty")
+    assertTrue(follower:GetProposedRCLootCouncilIntegrationConfig() ~= nil, "dirty unpublished proposal is kept")
+    assertFalse(follower:IsBisQualifyingResponse("Greed", greedMeta()), "dirty Greed is not award-time accepted")
+    Sync.state.profileId = follower:GetProfileId()
+    Sync.state.active = false
+    Sync:_ResetSessionState("post-dirty-reset")
+    assertEq(follower._rcConfigDirty, true, "session reset does not drop an out-of-session dirty draft")
+    assertTrue(follower:GetProposedRCLootCouncilIntegrationConfig() ~= nil, "dirty proposal survives _ResetSessionState")
+    assertTrue(hasGreedBis(follower:GetEditableRCLootCouncilIntegrationConfig()), "Settings still show the unpublished dirty Greed")
+
+    PLAYER = "Tester-Garona"
+    SF.LootHelperComm = nil
+end
+testPendingRCProposalDoesNotSurviveSessionEnd()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

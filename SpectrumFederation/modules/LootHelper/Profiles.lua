@@ -1905,6 +1905,20 @@ function LootProfile:GetEditableRCLootCouncilIntegrationConfig()
 	return self:GetRCLootCouncilIntegrationConfig()
 end
 
+-- In-session follower proposals belong to the live coordinator pipeline.
+-- When that session ends they must not remain the Settings/editable view of a
+-- later session. Out-of-session `_rcConfigDirty` drafts are kept.
+function LootProfile:DiscardInSessionRCProposal(reason)
+	if self._rcConfigDirty == true then
+		return false
+	end
+	if type(self._pendingRCLootCouncilIntegration) ~= "table" then
+		return false
+	end
+	DiscardPendingRCLootCouncilIntegration(self, reason or "session ended")
+	return true
+end
+
 -- Apply a strictly validated RC integration config table. Extra keys are ignored.
 -- This is the only authority an ordinary admin has over RC settings: the four
 -- RC integration fields, never owner/admins/members/logs/loot mode/Reward Pot/Raid Check.
