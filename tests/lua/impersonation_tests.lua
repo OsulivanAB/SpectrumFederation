@@ -94,6 +94,15 @@ INVSLOT_TRINKET2 = 14
 INVSLOT_MAINHAND = 16
 INVSLOT_OFFHAND = 17
 
+function GetItemInfoInstant(link)
+    local text = tostring(link)
+    local id = text:match("item:(%d+)") or text:match("^(%d+)$")
+    if id == "19001" then
+        return 19001, "Armor", "Plate", "INVTYPE_HEAD", 134400, 4, 4
+    end
+    return nil
+end
+
 CreateFrame = CreateFrame or function()
     local f = {
         shown = false,
@@ -1174,24 +1183,79 @@ function testCharacterPageRenderedRefreshAndTransientState()
     assertTrue(reverseDropdown:IsEnabled(), "rendered reverse dropdown enables after Character selection without rebuilding")
     assertTrue(reverseButton:IsEnabled(), "rendered Reverse button enables after Character selection without rebuilding")
 
-    panel.__sfGearSlot = "Head"
-    panel.__sfGearAward = "MANUAL:stale"
-    assertTrue(renderProfile:AddManualAward("Alice-Garona", "|cffffffff|Hitem:19001::::::::80:::::::::|h[Helm]|h|r"), "Alice receives a manual award")
-    if panel.__sfPageBuilder.Refresh then
-        panel.__sfPageBuilder:Refresh()
-    end
-    reverseDropdown:GenerateMenu()
-    local aliceManualId
-    for i = 1, #(reverseDropdown._menu and reverseDropdown._menu.radios or {}) do
-        local radio = reverseDropdown._menu.radios[i]
-        if radio.value then
-            aliceManualId = radio.value
-            radio.setSelected(radio.value)
-            break
+    local function assertRenderedGearMenuLabels(aliceManualIdOut)
+        specDropdown:GenerateMenu()
+        local specRadios = specDropdown._menu and specDropdown._menu.radios or {}
+        local sawArmsLabel = false
+        local numericOnlySpec = false
+        for i = 1, #specRadios do
+            local radio = specRadios[i]
+            local displayed = tostring(radio.label or "")
+            if radio.value == 71 or tostring(radio.value) == "71" then
+                if displayed:find("Arms", 1, true) then
+                    sawArmsLabel = true
+                end
+                if displayed == "71" then
+                    numericOnlySpec = true
+                end
+            end
         end
+        assertTrue(#specRadios >= 1, "Specialization menu renders options after Character selection")
+        assertTrue(sawArmsLabel, "Specialization menu displays a readable Arms name, not only the spec ID")
+        assertFalse(numericOnlySpec, "Specialization menu does not fall back to the numeric spec ID as the label")
+
+        panel.__sfGearSlot = "Head"
+        panel.__sfGearAward = "MANUAL:stale"
+        assertTrue(renderProfile:AddManualAward("Alice-Garona", "|cffffffff|Hitem:19001::::::::80:::::::::|h[Helm]|h|r"), "Alice receives a manual award")
+        if panel.__sfPageBuilder.Refresh then
+            panel.__sfPageBuilder:Refresh()
+        end
+        reverseDropdown:GenerateMenu()
+        local aliceManualId
+        local reverseLabel
+        for i = 1, #(reverseDropdown._menu and reverseDropdown._menu.radios or {}) do
+            local radio = reverseDropdown._menu.radios[i]
+            if radio.value then
+                aliceManualId = radio.value
+                reverseLabel = tostring(radio.label or "")
+                radio.setSelected(radio.value)
+                break
+            end
+        end
+        assertTrue(aliceManualId ~= nil, "Alice's manual award is selectable in Reverse")
+        assertTrue(reverseLabel:find("Helm", 1, true) or reverseLabel:find("item:19001", 1, true), "Reverse menu displays the readable item description")
+        assertTrue(reverseLabel ~= tostring(aliceManualId), "Reverse menu does not display only the internal award id")
+        assertEq(panel.__sfGearReverseManual, aliceManualId, "reverse dropdown stores Alice's award")
+        aliceManualIdOut.id = aliceManualId
+
+        local compatibleRow = rowByLabel("Compatible loot")
+        assertTrue(compatibleRow ~= nil, "rendered Compatible loot dropdown row exists")
+        local compatibleDropdown = compatibleRow.__sfDropdown
+        assertTrue(compatibleDropdown ~= nil, "Compatible loot dropdown widget exists")
+        compatibleDropdown:GenerateMenu()
+        local compatibleRadios = compatibleDropdown._menu and compatibleDropdown._menu.radios or {}
+        local sawReadableLoot = false
+        local sawInternalKey = false
+        for i = 1, #compatibleRadios do
+            local radio = compatibleRadios[i]
+            local displayed = tostring(radio.label or "")
+            local value = tostring(radio.value or "")
+            if value:find("MANUAL:", 1, true) then
+                if displayed == value then
+                    sawInternalKey = true
+                end
+                if displayed:find("Helm", 1, true) or displayed:find("item:19001", 1, true) then
+                    sawReadableLoot = true
+                end
+            end
+        end
+        assertTrue(#compatibleRadios >= 1, "Compatible loot menu renders Alice's helm")
+        assertTrue(sawReadableLoot, "Compatible loot menu displays the readable item/award description")
+        assertFalse(sawInternalKey, "Compatible loot menu does not display the internal KIND:id key as the label")
     end
-    assertTrue(aliceManualId ~= nil, "Alice's manual award is selectable in Reverse")
-    assertEq(panel.__sfGearReverseManual, aliceManualId, "reverse dropdown stores Alice's award")
+    local aliceManualHolder = {}
+    assertRenderedGearMenuLabels(aliceManualHolder)
+    local aliceManualId = aliceManualHolder.id
 
     local reverseBefore = 0
     for _, log in ipairs(renderProfile:GetLootLogs() or {}) do

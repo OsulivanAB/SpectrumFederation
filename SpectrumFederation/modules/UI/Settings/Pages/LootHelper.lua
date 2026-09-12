@@ -512,10 +512,10 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		end
 		local options = {}
 		for _, memberId in ipairs(profile:GetMemberIds() or {}) do
-			options[#options + 1] = { value = memberId, text = memberId }
+			options[#options + 1] = { value = memberId, label = memberId }
 		end
 		table.sort(options, function(a, b)
-			return tostring(a.text) < tostring(b.text)
+			return tostring(a.label) < tostring(b.label)
 		end)
 		return options
 	end
@@ -548,7 +548,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		for i = 1, #specs do
 			local specId = specs[i]
 			local name = (SpecWeapons.SpecName and SpecWeapons.SpecName(specId)) or tostring(specId)
-			options[#options + 1] = { value = specId, text = name .. " (" .. tostring(specId) .. ")" }
+			options[#options + 1] = { value = specId, label = name .. " (" .. tostring(specId) .. ")" }
 		end
 		return options
 	end
@@ -1270,7 +1270,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 						local options = {}
 						for _, item in ipairs(BuildAwardPoolItems()) do
 							if item.awardRef and item.awardRef.kind == "MANUAL" then
-								options[#options + 1] = { value = item.awardRef.id, text = item.label }
+								options[#options + 1] = { value = item.awardRef.id, label = item.label }
 							end
 						end
 						return options

@@ -1082,7 +1082,7 @@ function LootProfile:GetGearOverrideCompatibleAwards(memberId, slot)
                 if not activeId or occupyingClicked or destEmpty then
                     options[#options + 1] = {
                         value = award.kind .. ":" .. award.id,
-                        text = string.format("%s %s (%s)", tostring(award.itemLink or award.itemString or "[item]"), award.kind, award.member or ""),
+                        label = string.format("%s %s (%s)", tostring(award.itemLink or award.itemString or "[item]"), award.kind, award.member or ""),
                         awardRef = { kind = award.kind, id = award.id },
                     }
                 end
