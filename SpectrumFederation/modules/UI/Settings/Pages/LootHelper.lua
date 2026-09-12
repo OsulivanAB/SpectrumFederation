@@ -522,13 +522,11 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 
 	local function SelectedGearMember()
 		local profile = GetProfile()
-		if panel.__sfGearMember and profile and profile.getMemberByID and profile:getMemberByID(panel.__sfGearMember) then
-			return panel.__sfGearMember
-		end
-		local options = BuildCharacterOptions()
-		if options[1] then
-			panel.__sfGearMember = options[1].value
-			return panel.__sfGearMember
+		if panel.__sfGearMember then
+			if profile and profile.getMemberByID and profile:getMemberByID(panel.__sfGearMember) then
+				return panel.__sfGearMember
+			end
+			panel.__sfGearMember = nil
 		end
 		return nil
 	end
@@ -1213,10 +1211,15 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					buttonWidth = 80,
 					editWidth = 220,
 					adminOnly = true,
+					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
 					onSubmit = function(ctx, text, editBox)
 						local profile = GetProfile()
 						if not (profile and profile.AddManualAward) then
 							ctx.section:SetMessage("No active profile.", "error")
+							return
+						end
+						if not SelectedGearMember() then
+							ctx.section:SetMessage("Select a character first.", "error")
 							return
 						end
 						local ok, err = profile:AddManualAward(SelectedGearMember(), text)
@@ -1245,7 +1248,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					end,
 					get = function() return panel.__sfGearReverseManual end,
 					set = function(value) panel.__sfGearReverseManual = value end,
-					enabled = function() return ProfileActionsEnabled() end,
+					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
 				},
 				{
 					type = "button",
@@ -1253,7 +1256,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					adminOnly = true,
 					buttonText = "Reverse",
 					width = 140,
-					enabled = function() return ProfileActionsEnabled() end,
+					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
 					onClick = function(ctx)
 						local profile = GetProfile()
 						if not (profile and profile.ReverseManualAward and panel.__sfGearReverseManual) then

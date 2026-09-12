@@ -4054,6 +4054,447 @@ local function testPendingRCProposalDoesNotSurviveSessionEnd()
 end
 testPendingRCProposalDoesNotSurviveSessionEnd()
 
+function testTakeoverRCAuthorityWithoutPostEdit()
+    loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
+    loadModule("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
+
+    local ADMIN_C = "AdminC-Garona"
+    local nonce = 0
+    local deferred = {}
+    local captured = {}
+
+    local function greedMeta()
+        return { typeCode = "default", responseId = 2, isAwardReason = false }
+    end
+
+    local function lastOfType(msgType)
+        local found
+        for i = 1, #captured do
+            if captured[i].msgType == msgType then
+                found = captured[i]
+            end
+        end
+        return found
+    end
+
+    local function countOfType(msgType)
+        local n = 0
+        for i = 1, #captured do
+            if captured[i].msgType == msgType then
+                n = n + 1
+            end
+        end
+        return n
+    end
+
+    local function resetCaptured()
+        captured = {}
+        SF.LootHelperComm = {
+            Send = function(_, channel, msgType, payload, dist, target)
+                captured[#captured + 1] = {
+                    channel = channel,
+                    msgType = msgType,
+                    payload = payload,
+                    dist = dist,
+                    target = target,
+                }
+                return true
+            end,
+        }
+    end
+
+    local function installHarness()
+        nonce = 0
+        deferred = {}
+        function Sync:_NextNonce(tag)
+            nonce = nonce + 1
+            return tostring(tag or "N") .. "-" .. tostring(nonce)
+        end
+        function Sync:_ResetSessionSafeMode()
+        end
+        function Sync:_ResetLocalSafeMode()
+        end
+        function Sync:_ApplySessionSafeModeFromPayload()
+        end
+        function Sync:EnsureHeartbeatMonitor()
+            return false
+        end
+        function Sync:StopHeartbeatSender()
+        end
+        function Sync:NewRequestId()
+            nonce = nonce + 1
+            return "REQ-TAKEOVER-" .. tostring(nonce)
+        end
+        function Sync:GetPeer(nameRealm)
+            self.state.peers = self.state.peers or {}
+            local peer = self.state.peers[nameRealm]
+            if not peer then
+                peer = { name = nameRealm, inGroup = true }
+                self.state.peers[nameRealm] = peer
+            end
+            peer.inGroup = true
+            return peer
+        end
+        function Sync:RegisterRequest()
+            return true
+        end
+        function Sync:RunWithJitter(_, _, fn)
+            if type(fn) == "function" then
+                fn()
+            end
+        end
+        function Sync:RunAfter(delaySec, fn)
+            if type(fn) ~= "function" then
+                return
+            end
+            delaySec = tonumber(delaySec) or 0
+            if delaySec <= 0 then
+                fn()
+                return
+            end
+            deferred[#deferred + 1] = fn
+        end
+    end
+
+    local function flushDeferred()
+        local guard = 0
+        while #deferred > 0 and guard < 8 do
+            guard = guard + 1
+            local queued = deferred
+            deferred = {}
+            for i = 1, #queued do
+                queued[i]()
+            end
+        end
+    end
+
+    local function seedNeedConfig(profile)
+        assertTrue(profile:ApplyRCLootCouncilIntegrationConfig({
+            recordAwards = true,
+            recordAllAwardTypes = false,
+            allowedResponses = { "Need" },
+            bisResponses = {
+                { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+            },
+        }, { skipPermission = true, skipSync = true }), "seed accepted Need-only RC config")
+    end
+
+    local function addGreed(profile)
+        return profile:AddRCLootCouncilBisResponse({
+            text = "Greed",
+            typeCode = "default",
+            responseId = 2,
+            isAwardReason = false,
+        })
+    end
+
+    local function lastGreedOutcome(profile, awardKey)
+        for _, log in ipairs(profile:GetLootLogs() or {}) do
+            local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+            if data and data.awardKey == awardKey then
+                return data.outcome, data.qualified
+            end
+        end
+    end
+
+    local function driveAvailableAdminStatuses(coordPlayer, responders)
+        local syncs = {}
+        for i = 1, #captured do
+            if captured[i].msgType == Sync.MSG.ADMIN_SYNC then
+                syncs[#syncs + 1] = captured[i]
+            end
+        end
+        for i = 1, #syncs do
+            local target = syncs[i].target
+            local responder
+            for j = 1, #responders do
+                if responders[j].player == target then
+                    responder = responders[j]
+                    break
+                end
+            end
+            if responder then
+                local previous = PLAYER
+                PLAYER = responder.player
+                withLocalProfile(responder.profile, function()
+                    Sync:HandleAdminSync(coordPlayer, syncs[i].payload)
+                end)
+                PLAYER = coordPlayer
+                local statusMsg = lastOfType(Sync.MSG.ADMIN_STATUS)
+                assertTrue(statusMsg ~= nil, "present admin replied ADMIN_STATUS")
+                Sync:HandleAdminStatus(responder.player, statusMsg.payload)
+                PLAYER = previous
+            end
+        end
+        flushDeferred()
+    end
+
+    local function receiveReannounce(playerId, follower, coordinatorName, payload)
+        local previous = PLAYER
+        PLAYER = playerId
+        withLocalProfile(follower, function()
+            Sync.state.active = true
+            Sync.state.isCoordinator = false
+            Sync.state.coordinator = coordinatorName
+            Sync.state._sentJoinStatusForSessionId = nil
+            Sync.state._sentJoinStatusType = nil
+            Sync.state._profileReqInFlight = nil
+            Sync.state.heartbeat = { lastCatchupAt = nil }
+            Sync:HandleSessionReannounce(coordinatorName, payload)
+        end)
+        PLAYER = previous
+    end
+
+    local function restoreCoordinator(coordProfile, coordPlayer)
+        PLAYER = coordPlayer
+        SF.lootHelperDB.profiles[coordProfile:GetProfileId()] = coordProfile
+        setActive(coordProfile)
+        Sync.state.active = true
+        Sync.state.isCoordinator = true
+        Sync.state.coordinator = coordPlayer
+        Sync.state.profileId = coordProfile:GetProfileId()
+    end
+
+    local function assertSameAccepted(a, b, label)
+        assertEq(a._rcConfigEpoch, b._rcConfigEpoch, label .. " accepted rcConfigEpoch matches")
+        assertEq(a._rcConfigSeq, b._rcConfigSeq, label .. " accepted rcConfigSeq matches")
+        assertTrue(cfgEqual(a:GetRCLootCouncilIntegrationConfig(), b:GetRCLootCouncilIntegrationConfig()), label .. " accepted RC blobs match")
+    end
+
+    local function assertSameGreedAward(a, b, awardKeySuffix)
+        local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+            id = "1700006101-" .. awardKeySuffix,
+            response = "Greed",
+            responseID = 2,
+        }))
+        local okA = a:TryAddRCLootCouncilAward(canon)
+        local okB = b:TryAddRCLootCouncilAward(canon)
+        assertEq(okB, okA, awardKeySuffix .. " recording decision matches")
+        local outcomeA, qualA = lastGreedOutcome(a, canon.awardKey)
+        local outcomeB, qualB = lastGreedOutcome(b, canon.awardKey)
+        assertEq(qualB, qualA, awardKeySuffix .. " qualification matches")
+        assertEq(outcomeB, outcomeA, awardKeySuffix .. " BIS_OUTCOME matches")
+        return okA, qualA
+    end
+
+    local function beginSharedG0()
+        local coordA = makeProfile("RC Takeover Auth A")
+        addMember(coordA, WINNER)
+        addMember(coordA, ADMIN_B)
+        addMember(coordA, ADMIN_C)
+        assertTrue(coordA:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Admin B shares the profile")
+        assertTrue(coordA:AddAdminMemberId(ADMIN_C, { skipPermission = true, skipBroadcast = true }), "Admin C shares the profile")
+        seedNeedConfig(coordA)
+        setActive(coordA)
+        startSessionOn(coordA)
+        Sync.state.coordinator = PLAYER
+        Sync.state.isCoordinator = true
+        Sync.state.coordEpoch = 100
+        coordA._rcConfigSeq = 4
+        coordA._rcConfigEpoch = 100
+        Sync.state.rcConfigSeq = 4
+        assertTrue(coordA:TryAddRCLootCouncilAward(SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+            id = "1700006100-prior",
+            response = "Need",
+            responseID = 1,
+        }))), "shared complete logs include a Need award")
+        return coordA
+    end
+
+    local function takeoverAsB(staleB, reason)
+        PLAYER = ADMIN_B
+        SF.lootHelperDB.profiles[staleB:GetProfileId()] = staleB
+        setActive(staleB)
+        installHarness()
+        resetCaptured()
+        local oldEpoch = tonumber(Sync.state.coordEpoch) or 0
+        assertTrue(Sync:TakeoverSession(Sync.state.sessionId, staleB:GetProfileId(), reason, {
+            rerunAdminConvergence = true,
+        }), "Admin B takes over with admin convergence")
+        assertTrue(Sync.state.isCoordinator, "Admin B is coordinator after takeover")
+        assertTrue(Sync.state.coordEpoch > oldEpoch, "takeover bumps live coordEpoch")
+        return oldEpoch
+    end
+
+    -- Case A: stale takeover coordinator must adopt a newer accepted peer before any new edit.
+    resetEnv()
+    installHarness()
+    function Sync:_Now()
+        return 100
+    end
+    local coordA = beginSharedG0()
+    local staleB = cloneProfileAs("RC Takeover Auth B", coordA)
+    assertEq(staleB._rcConfigSeq, 4, "Case A Admin B cloned at G0 seq 4")
+    resetCaptured()
+    assertTrue(addGreed(coordA), "Case A coordinator A accepts Greed as BiS")
+    local liveSet = lastOfType(Sync.MSG.RC_CONFIG_SET)
+    assertTrue(liveSet ~= nil, "Case A Session 1 published RC_CONFIG_SET G1")
+    assertEq(coordA._rcConfigSeq, 5, "Case A accepted seq advanced to 5")
+    assertEq(coordA._rcConfigEpoch, 100, "Case A accepted epoch stays 100")
+    local peerC = cloneProfileAs("RC Takeover Auth C", coordA)
+    assertTrue(peerC:IsBisQualifyingResponse("Greed", greedMeta()), "Case A Admin C holds G1")
+    assertFalse(staleB:IsBisQualifyingResponse("Greed", greedMeta()), "Case A Admin B missed G1")
+    function Sync:_Now()
+        return 200
+    end
+    local oldEpoch = takeoverAsB(staleB, "coord-offline-stale")
+    driveAvailableAdminStatuses(ADMIN_B, { { player = ADMIN_C, profile = peerC } })
+    local reannounce = lastOfType(Sync.MSG.SES_REANNOUNCE)
+    assertTrue(reannounce ~= nil, "Case A takeover reannounced the session")
+    assertEq(countOfType(Sync.MSG.PROFILE_SNAPSHOT), 0, "Case A did not fan out PROFILE_SNAPSHOT for RC config")
+    assertEq(countOfType(Sync.MSG.RC_CONFIG_SET), 0, "Case A did not mint a new RC SET merely because takeover occurred")
+    assertEq(staleB._rcConfigEpoch, 100, "Case A adopted previously accepted epoch 100")
+    assertEq(staleB._rcConfigSeq, 5, "Case A adopted previously accepted seq 5")
+    assertTrue(staleB:IsBisQualifyingResponse("Greed", greedMeta()), "Case A takeover coordinator now holds G1")
+    receiveReannounce(ADMIN_C, peerC, ADMIN_B, reannounce.payload)
+    restoreCoordinator(staleB, ADMIN_B)
+    assertSameAccepted(staleB, peerC, "Case A after takeover")
+    assertEq(reannounce.payload.rcConfigEpoch, 100, "Case A SES_REANNOUNCE advertises accepted epoch 100")
+    assertEq(reannounce.payload.rcConfigSeq, 5, "Case A SES_REANNOUNCE advertises accepted seq 5")
+    local recorded, qualified = assertSameGreedAward(staleB, peerC, "case-a")
+    assertTrue(recorded, "Case A Greed award records after G1 authority")
+    assertEq(qualified, true, "Case A Greed qualifies after G1 authority")
+
+    -- Case D: after takeover authority, a deliberate coordinator edit still publishes normally.
+    restoreCoordinator(staleB, ADMIN_B)
+    resetCaptured()
+    assertTrue(staleB:AddRCLootCouncilAllowedResponse("Offspec"), "Case D new coordinator deliberately edits RC settings")
+    local postEditSet = lastOfType(Sync.MSG.RC_CONFIG_SET)
+    assertTrue(postEditSet ~= nil, "Case D published RC_CONFIG_SET for the live edit")
+    assertTrue(postEditSet.payload.coordEpoch > oldEpoch, "Case D SET uses the takeover session epoch")
+    assertEq(postEditSet.payload.seq, 6, "Case D increments seq from the adopted generation")
+    PLAYER = ADMIN_C
+    withLocalProfile(peerC, function()
+        Sync:HandleRCConfigSet(ADMIN_B, postEditSet.payload)
+    end)
+    PLAYER = ADMIN_B
+    assertSameAccepted(staleB, peerC, "Case D after live edit")
+    assertEq(peerC._rcConfigEpoch, postEditSet.payload.coordEpoch, "Case D peer stores the new accepted epoch")
+    assertEq(staleB._rcConfigSeq, 6, "Case D coordinator accepted seq is 6")
+
+    -- Case B: takeover does not mint when the new coordinator already holds current G1.
+    resetEnv()
+    installHarness()
+    function Sync:_Now()
+        return 100
+    end
+    coordA = beginSharedG0()
+    resetCaptured()
+    assertTrue(addGreed(coordA), "Case B coordinator A accepts Greed as BiS")
+    local currentB = cloneProfileAs("RC Takeover Current B", coordA)
+    peerC = cloneProfileAs("RC Takeover Current C", coordA)
+    assertEq(currentB._rcConfigSeq, 5, "Case B Admin B already holds G1")
+    function Sync:_Now()
+        return 200
+    end
+    takeoverAsB(currentB, "coord-offline-current")
+    driveAvailableAdminStatuses(ADMIN_B, { { player = ADMIN_C, profile = peerC } })
+    reannounce = lastOfType(Sync.MSG.SES_REANNOUNCE)
+    assertTrue(reannounce ~= nil, "Case B takeover reannounced the session")
+    assertEq(countOfType(Sync.MSG.PROFILE_SNAPSHOT), 0, "Case B did not fan out PROFILE_SNAPSHOT for RC config")
+    assertEq(countOfType(Sync.MSG.RC_CONFIG_SET), 0, "Case B did not mint another RC generation")
+    assertEq(currentB._rcConfigEpoch, 100, "Case B kept accepted epoch 100")
+    assertEq(currentB._rcConfigSeq, 5, "Case B kept accepted seq 5")
+    receiveReannounce(ADMIN_C, peerC, ADMIN_B, reannounce.payload)
+    restoreCoordinator(currentB, ADMIN_B)
+    assertSameAccepted(currentB, peerC, "Case B after takeover")
+    recorded, qualified = assertSameGreedAward(currentB, peerC, "case-b")
+    assertTrue(recorded, "Case B Greed still records")
+    assertEq(qualified, true, "Case B Greed still qualifies")
+
+    -- Case C: unpublished/dirty peer contents are not takeover authority.
+    resetEnv()
+    installHarness()
+    function Sync:_Now()
+        return 100
+    end
+    coordA = beginSharedG0()
+    staleB = cloneProfileAs("RC Takeover Dirty B", coordA)
+    local dirtyC = cloneProfileAs("RC Takeover Dirty C", coordA)
+    PLAYER = ADMIN_C
+    SF.lootHelperDB.profiles[dirtyC:GetProfileId()] = dirtyC
+    setActive(dirtyC)
+    Sync.state.active = false
+    Sync.state.isCoordinator = false
+    assertTrue(addGreed(dirtyC), "Case C Admin C has an unpublished Greed draft")
+    assertEq(dirtyC._rcConfigDirty, true, "Case C Admin C is dirty")
+    assertEq(dirtyC._rcConfigSeq, 4, "Case C dirty draft stays on seq 4")
+    assertFalse(dirtyC:IsBisQualifyingResponse("Greed", greedMeta()), "Case C unpublished Greed is not accepted")
+    function Sync:_Now()
+        return 200
+    end
+    takeoverAsB(staleB, "coord-offline-dirty")
+    driveAvailableAdminStatuses(ADMIN_B, { { player = ADMIN_C, profile = dirtyC } })
+    reannounce = lastOfType(Sync.MSG.SES_REANNOUNCE)
+    assertTrue(reannounce ~= nil, "Case C takeover reannounced the session")
+    assertEq(countOfType(Sync.MSG.RC_CONFIG_SET), 0, "Case C did not mint from a dirty peer")
+    local dirtyStatus
+    for i = 1, #captured do
+        if captured[i].msgType == Sync.MSG.ADMIN_STATUS then
+            dirtyStatus = captured[i]
+        end
+    end
+    assertTrue(dirtyStatus ~= nil, "Case C Admin C sent ADMIN_STATUS")
+    assertEq(dirtyStatus.payload.rcConfigDirty, true, "Case C ADMIN_STATUS reports unpublished dirty")
+    assertEq(staleB._rcConfigSeq, 4, "Case C coordinator stayed on accepted G0")
+    assertFalse(staleB:IsBisQualifyingResponse("Greed", greedMeta()), "Case C dirty peer did not become accepted Greed")
+    receiveReannounce(ADMIN_C, dirtyC, ADMIN_B, reannounce.payload)
+    restoreCoordinator(staleB, ADMIN_B)
+    assertEq(staleB._rcConfigSeq, 4, "Case C accepted seq remains G0 after reannounce")
+    assertFalse(staleB:IsBisQualifyingResponse("Greed", greedMeta()), "Case C award-time still uses accepted Need-only")
+
+    -- Case E: authorized newer holder joining after takeover still converges.
+    resetEnv()
+    installHarness()
+    function Sync:_Now()
+        return 100
+    end
+    coordA = beginSharedG0()
+    staleB = cloneProfileAs("RC Takeover Late B", coordA)
+    resetCaptured()
+    assertTrue(addGreed(coordA), "Case E coordinator A accepts Greed as BiS")
+    peerC = cloneProfileAs("RC Takeover Late C", coordA)
+    assertTrue(peerC:IsBisQualifyingResponse("Greed", greedMeta()), "Case E Admin C holds G1 before takeover")
+    assertFalse(staleB:IsBisQualifyingResponse("Greed", greedMeta()), "Case E Admin B missed G1")
+    function Sync:_Now()
+        return 200
+    end
+    takeoverAsB(staleB, "coord-offline-late")
+    driveAvailableAdminStatuses(ADMIN_B, {})
+    reannounce = lastOfType(Sync.MSG.SES_REANNOUNCE)
+    assertTrue(reannounce ~= nil, "Case E takeover reannounced without Admin C")
+    assertEq(staleB._rcConfigSeq, 4, "Case E coordinator still has G0 before the late join")
+    assertFalse(staleB:IsBisQualifyingResponse("Greed", greedMeta()), "Case E G0 is still Need-only before the late join")
+    resetCaptured()
+    receiveReannounce(ADMIN_C, peerC, ADMIN_B, reannounce.payload)
+    local haveProfile = lastOfType(Sync.MSG.HAVE_PROFILE)
+    assertTrue(haveProfile ~= nil, "Case E late admin sent HAVE_PROFILE on the join path")
+    assertEq(haveProfile and haveProfile.payload and haveProfile.payload.rcConfigSeq, 5, "Case E HAVE_PROFILE advertises accepted seq 5")
+    assertEq(haveProfile and haveProfile.payload and haveProfile.payload.rcConfigEpoch, 100, "Case E HAVE_PROFILE advertises accepted epoch 100")
+    assertEq(haveProfile and haveProfile.payload and haveProfile.payload.rcConfigDirty, false, "Case E HAVE_PROFILE is not a dirty draft")
+    restoreCoordinator(staleB, ADMIN_B)
+    if haveProfile then
+        Sync:HandleHaveProfile(ADMIN_C, haveProfile.payload)
+    end
+    local lateReannounce = lastOfType(Sync.MSG.SES_REANNOUNCE)
+    assertTrue(lateReannounce ~= nil, "Case E coordinator reannounced after adopting the late newer holder")
+    assertEq(staleB._rcConfigSeq, 5, "Case E coordinator adopted G1 from the late join")
+    assertEq(staleB._rcConfigEpoch, 100, "Case E adopted accepted epoch 100 rather than minting")
+    assertTrue(staleB:IsBisQualifyingResponse("Greed", greedMeta()), "Case E coordinator now holds G1")
+    if lateReannounce then
+        receiveReannounce(ADMIN_C, peerC, ADMIN_B, lateReannounce.payload)
+    end
+    assertSameAccepted(staleB, peerC, "Case E after late join")
+    recorded, qualified = assertSameGreedAward(staleB, peerC, "case-e")
+    assertTrue(recorded, "Case E Greed records after late convergence")
+    assertEq(qualified, true, "Case E Greed qualifies after late convergence")
+    assertEq(countOfType(Sync.MSG.PROFILE_SNAPSHOT), 0, "Case E did not fan out PROFILE_SNAPSHOT for RC config")
+
+    PLAYER = "Tester-Garona"
+    SF.LootHelperComm = nil
+end
+testTakeoverRCAuthorityWithoutPostEdit()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

@@ -436,9 +436,9 @@ function Sync:_ApplyAdvertisedRCConfig(payload)
     return true
 end
 
--- START-mode admin convergence: adopt a strictly newer previously accepted
--- generation from participating admins before SES_START. Skipped when the
--- starter deliberately edited RC settings while no session was active.
+-- START and takeover/REANNOUNCE admin convergence: adopt a strictly newer
+-- previously accepted generation from participating admins. Skipped when the
+-- local client has an unpublished dirty draft. Does not mint a generation.
 function Sync:_AdoptNewerAdminAcceptedRCConfig(profile)
     if not profile or not profile.ApplyRCLootCouncilIntegrationConfig then
         return false
@@ -485,6 +485,65 @@ function Sync:_AdoptNewerAdminAcceptedRCConfig(profile)
     profile._rcConfigDirty = nil
     profile._pendingRCLootCouncilIntegration = nil
     self.state.rcConfigSeq = bestSeq
+    return true
+end
+
+-- Remember an authorized peer's accepted RC generation from join/HAVE_PROFILE.
+-- Dirty/unpublished drafts are recorded so they cannot win adoption.
+function Sync:_MergeJoinAcceptedRCConfig(sender, payload)
+    if not (self.state and self.state.active and self.state.isCoordinator) then
+        return false
+    end
+    if type(payload) ~= "table" or type(sender) ~= "string" or sender == "" then
+        return false
+    end
+    if self.ValidateSessionPayload and not self:ValidateSessionPayload(payload) then
+        return false
+    end
+    if self.IsSenderAuthorized and not self:IsSenderAuthorized(self.state.profileId, sender) then
+        return false
+    end
+    self.state.adminStatuses = self.state.adminStatuses or {}
+    local key = sender
+    if self._NormalizeNameRealmForCompare then
+        key = self:_NormalizeNameRealmForCompare(sender) or sender
+    end
+    local st = self.state.adminStatuses[key] or {}
+    st.rcConfigDirty = payload.rcConfigDirty == true
+    st.rcConfigEpoch = math.floor(tonumber(payload.rcConfigEpoch) or 0)
+    st.rcConfigSeq = math.floor(tonumber(payload.rcConfigSeq) or 0)
+    if type(payload.rcLootCouncilIntegration) == "table" then
+        st.rcLootCouncilIntegration = payload.rcLootCouncilIntegration
+    end
+    self.state.adminStatuses[key] = st
+    return true
+end
+
+-- After takeover establishment, a late authorized HAVE_PROFILE can carry a
+-- strictly newer previously accepted generation. Adopt it and reannounce so
+-- the raid is not left with coordinator G0 vs follower G1. Skipped while
+-- admin convergence is still running; finish already adopts from statuses.
+function Sync:_AdoptJoinAcceptedRCConfigIfEstablished()
+    if not (self.state and self.state.active and self.state.isCoordinator) then
+        return false
+    end
+    local conv = self.state._adminConvergence
+    if conv and conv.finished ~= true then
+        return false
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if not profile or profile._rcConfigDirty == true then
+        return false
+    end
+    if not self._AdoptNewerAdminAcceptedRCConfig then
+        return false
+    end
+    if not self:_AdoptNewerAdminAcceptedRCConfig(profile) then
+        return false
+    end
+    if self.ReannounceSession then
+        self:ReannounceSession()
+    end
     return true
 end
 

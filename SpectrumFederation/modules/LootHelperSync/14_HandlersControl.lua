@@ -670,6 +670,12 @@ end
 function Sync:HandleHaveProfile(sender, payload)
     self:_RecordHandshakeReply(sender, payload, "HAVE_PROFILE")
     self:_HandlePeerIntegrityAdvertisement(sender, payload)
+    if self._MergeJoinAcceptedRCConfig then
+        self:_MergeJoinAcceptedRCConfig(sender, payload)
+    end
+    if self._AdoptJoinAcceptedRCConfigIfEstablished then
+        self:_AdoptJoinAcceptedRCConfigIfEstablished()
+    end
 end
 
 -- Function Handle NEED_PROFILE as a helper/coordinator: respond with PROFILE_SNAPSHOT (bulk).

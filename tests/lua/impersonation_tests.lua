@@ -796,6 +796,60 @@ resetConfirm()
 assertTrue(resetCalled, "admin Reset Current Profile confirm can call store reset")
 
 -- ---------------------------------------------------------------------------
+-- Character must be explicitly selected before Specialization
+-- ---------------------------------------------------------------------------
+Imp:Disable("character-select-setup")
+resetDB()
+local gearProfile = makeProfile("Gear Select")
+assertTrue(gearProfile:AddMember(SF.Member.new("Alice-Garona", "member", "WARRIOR")), "Alice is on the gear profile")
+assertTrue(gearProfile:AddMember(SF.Member.new("Bob-Garona", "member", "MAGE")), "Bob is on the gear profile")
+setActive(gearProfile)
+local gearPanel = {}
+local gearDef
+function SF.SettingsUI.DefinitionRenderer:Build(_panel, pageDef)
+    gearDef = pageDef
+end
+assertTrue(registeredPages.lootHelperCharacter ~= nil, "Character page registered")
+registeredPages.lootHelperCharacter:Build(gearPanel)
+assertTrue(gearDef ~= nil, "character page definition captured")
+local characterItem, specItem, boardItem, manualItem
+for _, sec in ipairs(gearDef.sections or {}) do
+    for _, item in ipairs(sec.items or {}) do
+        if item.label == "Character" then
+            characterItem = item
+        elseif item.label == "Specialization" then
+            specItem = item
+        elseif item.type == "equipmentBoard" then
+            boardItem = item
+        elseif item.label == "Manually add loot" then
+            manualItem = item
+        end
+    end
+end
+assertTrue(characterItem ~= nil, "Character dropdown exists")
+assertEq(characterItem.defaultText, "Select character", "Character dropdown keeps its empty-selection label")
+assertEq(characterItem.get(), nil, "opening Character & Gear Override does not auto-select a character")
+assertEq(gearPanel.__sfGearMember, nil, "no implicit __sfGearMember is stored on open")
+assertTrue(specItem ~= nil, "Specialization dropdown exists")
+assertFalse(specItem.enabled(), "Specialization is disabled until a character is selected")
+assertTrue(boardItem ~= nil, "equipment board exists")
+assertFalse(boardItem.enabled(), "equipment board is disabled until a character is selected")
+if manualItem and type(manualItem.enabled) == "function" then
+    assertFalse(manualItem.enabled(), "manual loot add is disabled until a character is selected")
+end
+local characterOptions = characterItem.options()
+assertTrue(characterOptions[1] ~= nil, "Character dropdown has members to select")
+characterItem.set(characterOptions[1].value)
+assertEq(characterItem.get(), characterOptions[1].value, "selecting a character keeps that selection")
+assertTrue(specItem.enabled(), "Specialization enables after a character is selected")
+assertTrue(boardItem.enabled(), "equipment board enables after a character is selected")
+if manualItem and type(manualItem.enabled) == "function" then
+    assertTrue(manualItem.enabled(), "manual loot add enables after a character is selected")
+end
+characterItem.set(characterOptions[2].value)
+assertEq(characterItem.get(), characterOptions[2].value, "a later character selection is preserved")
+
+-- ---------------------------------------------------------------------------
 -- Settings page contract (source-level, production definition)
 -- ---------------------------------------------------------------------------
 local pageFile = io.open("SpectrumFederation/modules/UI/Settings/Pages/LootHelper.lua", "r")

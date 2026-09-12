@@ -214,11 +214,12 @@ function Sync:_FinishAdminConvergence(reason)
     conv.finished = true
     local onComplete = conv.onComplete
 
-    if conv.mode == "START" then
-        local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
-        if profile and profile._rcConfigDirty ~= true and self._AdoptNewerAdminAcceptedRCConfig then
-            self:_AdoptNewerAdminAcceptedRCConfig(profile)
-        end
+    -- START and takeover/REANNOUNCE both adopt a strictly newer previously
+    -- accepted, non-dirty generation. Takeover must not mint, and must not
+    -- let a new coordEpoch silently publish the takeover client's stale blob.
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if profile and profile._rcConfigDirty ~= true and self._AdoptNewerAdminAcceptedRCConfig then
+        self:_AdoptNewerAdminAcceptedRCConfig(profile)
     end
     
     -- Clean up convergence state

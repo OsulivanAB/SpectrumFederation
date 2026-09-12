@@ -476,6 +476,10 @@ function Sync:SendJoinStatus()
 
     local localAuthorMax = profile:ComputeAuthorMax() or {}
     payloadBase.localAuthorMax = localAuthorMax
+    if self._AttachRCConfigGeneration then
+        self:_AttachRCConfigGeneration(payloadBase, profileId)
+    end
+    payloadBase.rcConfigDirty = profile._rcConfigDirty == true
 
     local localContig = self:ComputeContigAuthorMax(profileId)
     local remoteAuthorMax = self.state.authorMax or {}
