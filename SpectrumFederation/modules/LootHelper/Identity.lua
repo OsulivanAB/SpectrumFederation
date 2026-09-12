@@ -1755,6 +1755,9 @@ function Identity.Replay(logs, opts)
     local appliedRelationshipIds = {}
     local impliedAdminSource = {}
     local bisState = (SF.LootHelperBis and SF.LootHelperBis.NewState) and SF.LootHelperBis.NewState() or nil
+    local occupancyOriginMap
+    local occupancyByMember = {}
+    local occupancyInputsDirty = true
     local logById = {}
     local classByMember = {}
     if type(opts.members) == "table" then
@@ -1816,6 +1819,12 @@ function Identity.Replay(logs, opts)
         ensureLocal(owner)
     end
 
+    local function invalidateOccupancyInputs()
+        occupancyInputsDirty = true
+        occupancyOriginMap = nil
+        occupancyByMember = {}
+    end
+
     for i = 1, #ordered do
         local log = ordered[i]
         local eventType = GetLogType(log)
@@ -1841,6 +1850,7 @@ function Identity.Replay(logs, opts)
                     end
                     ensureLocal(source)
                     Union(partition, source, target or source)
+                    invalidateOccupancyInputs()
                 end
             elseif eventType == types.CHARACTER_LINK then
                 local memberA = ensureLocal(data.memberA)
@@ -1896,6 +1906,7 @@ function Identity.Replay(logs, opts)
                             ImplyIdentityAdmins(preA, simulated, owner, impliedAdminSource, linkId)
                         end
                     end
+                    invalidateOccupancyInputs()
                 end
             elseif eventType == types.CHARACTER_UNLINK then
                 if RelationshipAuthorizedAt(log, eventType, data, partition, simulated, auth, owner) then
@@ -1905,6 +1916,7 @@ function Identity.Replay(logs, opts)
                         appliedRelationshipIds[unlinkId] = true
                     end
                     ExpireSplitIdentityEvents(identityArmorEvents, partition)
+                    invalidateOccupancyInputs()
                 end
                 ensureLocal(data.member)
             elseif eventType == types.ADMIN_ADDED then
@@ -1981,18 +1993,23 @@ function Identity.Replay(logs, opts)
                             localOrigin[memberId][data.slot] = log
                         end
                     end
+                    invalidateOccupancyInputs()
                 end
             end
             if bisState and SF.LootHelperBis and SF.LootHelperBis.ApplyLog then
                 if eventType == types.BIS_OVERRIDE or eventType == types.BIS_OUTCOME then
-                    local originMap = OccupancyOriginMap(partition, localArmor, localOrigin, identityArmorEvents)
+                    -- Occupancy origins depend only on armor/identity inputs.
+                    -- Rebuilding them on every BiS event is O(events^2).
+                    if occupancyInputsDirty or occupancyOriginMap == nil then
+                        occupancyOriginMap = OccupancyOriginMap(partition, localArmor, localOrigin, identityArmorEvents)
+                        occupancyInputsDirty = false
+                    end
                     if SF.LootHelperBis.SetOccupancyOrigins then
-                        SF.LootHelperBis.SetOccupancyOrigins(bisState, originMap)
+                        SF.LootHelperBis.SetOccupancyOrigins(bisState, occupancyOriginMap)
                     else
-                        bisState.occupancyOrigins = originMap
+                        bisState.occupancyOrigins = occupancyOriginMap
                     end
                 end
-                local occForMember = {}
                 SF.LootHelperBis.ApplyLog(bisState, log, {
                     rank = i,
                     FindLog = function(id)
@@ -2012,11 +2029,11 @@ function Identity.Replay(logs, opts)
                         if not memberId or type(slot) ~= "string" then
                             return false
                         end
-                        local occ = occForMember[memberId]
+                        local occ = occupancyByMember[memberId]
                         if not occ then
                             local ids = ComponentList(partition, memberId)
                             occ = ProjectIdentityOccupancy(ids, localArmor, localOrigin, identityArmorEvents)
-                            occForMember[memberId] = occ
+                            occupancyByMember[memberId] = occ
                         end
                         return OccupiedBool(occ, slot)
                     end,
