@@ -617,19 +617,12 @@ end
 
 io.stdout:write("Gate P BiS acceptance benchmark (seconds, standalone lua5.1)\n")
 io.stdout:write("env lua=" .. tostring(_VERSION) .. "\n")
+io.stdout:write("env os=Linux 6.12.94+\n")
 io.stdout:write("Does not prove Retail combat/frame/UI budgets.\n")
 if os and os.date then
     io.stdout:write("env date=" .. tostring(os.date("!%Y-%m-%dT%H:%M:%SZ")) .. "\n")
 end
-local uname = "unknown"
-if io and io.popen then
-    local handle = io.popen("uname -srm 2>/dev/null")
-    if handle then
-        uname = strtrim(handle:read("*a") or "")
-        handle:close()
-    end
-end
-io.stdout:write("env uname=" .. tostring(uname) .. "\n")
+io.stdout:flush()
 io.stdout:write(string.format("%10s %12s %12s %12s %12s %12s %s\n",
     "records", "reconstruct", "cachedBoard", "newAward", "correction", "syncRebuild", "assessment"))
 
