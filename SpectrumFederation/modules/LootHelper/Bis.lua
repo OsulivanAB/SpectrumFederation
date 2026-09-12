@@ -929,9 +929,10 @@ local function ProjectOrdinarySlot(assignments)
     return occupant, overflow
 end
 
-function Bis.ProjectComponent(state, memberIds)
+function Bis.ProjectComponent(state, memberIds, opts)
     memberIds = SortedCopy(memberIds)
     local componentSet = ListSet(memberIds)
+    local slotsOnly = type(opts) == "table" and opts.slotsOnly == true
     local slots = {}
     for i = 1, #Bis.SLOTS do
         slots[Bis.SLOTS[i]] = { state = "AVAILABLE" }
@@ -944,14 +945,16 @@ function Bis.ProjectComponent(state, memberIds)
         return owner and componentSet[owner] == true
     end
 
-    for _, award in pairs(state.awards) do
-        if ownerInComponent(award.member) and not award.reversed then
-            pool[#pool + 1] = award
+    if not slotsOnly then
+        for _, award in pairs(state.awards) do
+            if ownerInComponent(award.member) and not award.reversed then
+                pool[#pool + 1] = award
+            end
         end
+        table.sort(pool, function(a, b)
+            return tostring(a.id) < tostring(b.id)
+        end)
     end
-    table.sort(pool, function(a, b)
-        return tostring(a.id) < tostring(b.id)
-    end)
 
     local grouped = {}
     local groupOrder = {}
@@ -1546,7 +1549,7 @@ function Bis.ApplyLog(state, log, ctx)
             slots = { "Weapon", "OffHand" }
         end
         local members = componentOf(data.awardMember)
-        local view = Bis.ProjectComponent(state, members)
+        local view = Bis.ProjectComponent(state, members, { slotsOnly = true })
         for i = 1, #slots do
             local slot = slots[i]
             local cell = view.slots[slot]
@@ -1628,7 +1631,7 @@ function Bis.ApplyLog(state, log, ctx)
                     return
                 end
             end
-            local view = Bis.ProjectComponent(state, members)
+            local view = Bis.ProjectComponent(state, members, { slotsOnly = true })
             for i = 1, #slots do
                 local cell = view.slots[slots[i]]
                 if cell and cell.state and cell.state ~= "AVAILABLE" then
@@ -1685,7 +1688,7 @@ function Bis.ApplyLog(state, log, ctx)
             end
             local members = componentOf(award.member)
             local restore = HypotheticalWithout(state, target)
-            local view = Bis.ProjectComponent(state, members)
+            local view = Bis.ProjectComponent(state, members, { slotsOnly = true })
             local ok = true
             for i = 1, #slots do
                 local cell = view.slots[slots[i]]
