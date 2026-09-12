@@ -561,7 +561,10 @@ function EquipmentWindow:Refresh()
                 SetIssueOverlayShown(btn.IssueOverlay, false)
             end
 
-            if itemAware then
+            local liveAutomation = profile and profile.IsLiveBisAutomationActive and profile:IsLiveBisAutomationActive()
+            local itemAwareAssigned = SF.LootHelperBis and SF.LootHelperBis.CellHasItemAwareAssignment
+                and SF.LootHelperBis.CellHasItemAwareAssignment(cell)
+            if liveAutomation or itemAwareAssigned then
                 btn:EnableMouse(true)
                 btn:SetScript("OnClick", nil)
             elseif self._canAdmin then
@@ -587,8 +590,18 @@ function EquipmentWindow:_OnSlotClicked(slotKey)
             tostring(self._rowModel and self._rowModel.memberId), tostring(slotKey))
     end
 
-    if profile and profile.IsItemAwareEquipmentPopup and profile:IsItemAwareEquipmentPopup() then
+    local profile = self._profile
+    if profile and profile.IsLiveBisAutomationActive and profile:IsLiveBisAutomationActive() then
         return
+    end
+    local memberId = self._rowModel and self._rowModel.memberId
+    if profile and profile.GetIdentityBisSlots and memberId then
+        local board = profile:GetIdentityBisSlots(memberId)
+        local cell = board and board[slotKey]
+        if SF.LootHelperBis and SF.LootHelperBis.CellHasItemAwareAssignment
+            and SF.LootHelperBis.CellHasItemAwareAssignment(cell) then
+            return
+        end
     end
 
     -- Call member toggle

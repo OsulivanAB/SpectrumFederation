@@ -1042,9 +1042,13 @@ function LootProfile:GetIdentityLegacyOrigins(memberId)
     return {}
 end
 
-function LootProfile:IsItemAwareEquipmentPopup()
+function LootProfile:IsLiveBisAutomationActive()
     local cfg = self:GetRCLootCouncilIntegrationConfig()
-    local bisConfigured = cfg.recordAwards and type(cfg.bisResponses) == "table" and #cfg.bisResponses > 0
+    return cfg.recordAwards == true and type(cfg.bisResponses) == "table" and #cfg.bisResponses > 0
+end
+
+function LootProfile:IsItemAwareEquipmentPopup()
+    local bisConfigured = self:IsLiveBisAutomationActive()
     local result = self._identityProjection
     local Bis = SF.LootHelperBis
     if Bis and Bis.IsItemAwarePopup then

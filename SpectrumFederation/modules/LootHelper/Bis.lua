@@ -1957,15 +1957,22 @@ function Bis.DecideAutomaticOutcome(opts)
     }
 end
 
--- Item-aware when BiS responses are currently configured, or when historical
--- item-aware events already exist. Recording-off after item-aware history must
--- keep the popup item-aware so ARMOR_CHANGE clicks cannot double-consume AUTO
--- slots. Profiles that never used item-aware tracking keep the manual fallback.
+-- Display is item-aware when live BiS automation is configured, or when
+-- historical item-aware events already exist. Live automation (recording on
+-- with BiS responses) still locks every raid-popup click. When live automation
+-- is off, AVAILABLE and LEGACY_UNKNOWN cells keep the manual fallback;
+-- ASSIGNED_AUTO / ASSIGNED_OVERRIDE stay non-clickable so ARMOR_CHANGE cannot
+-- double-consume item-aware occupancy.
 function Bis.IsItemAwarePopup(state, bisResponsesConfigured)
     if bisResponsesConfigured then
         return true
     end
     return state and state.hasItemAwareEvents == true
+end
+
+function Bis.CellHasItemAwareAssignment(cell)
+    local state = cell and cell.state
+    return state == "ASSIGNED_AUTO" or state == "ASSIGNED_OVERRIDE"
 end
 
 function Bis.LegacyOriginsForDisplay(state, memberId, identityOf)

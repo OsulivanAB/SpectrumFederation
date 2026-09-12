@@ -2838,7 +2838,7 @@ local function reviewFindingTests()
     end
     notBisEquipmentFallback()
 
-    local function recordingOffAfterItemAwareHistory()
+    local function recordingOffManualFallback()
         local function makeBtn(slotKey)
             local overlay = {}
             function overlay:Show()
@@ -2881,7 +2881,9 @@ local function reviewFindingTests()
         local EW = SF.LootHelperWindow.EquipmentWindow
         local head = makeBtn("Head")
         local neck = makeBtn("Neck")
-        EW._frame = { Content = { SlotButtons = { head, neck } } }
+        local ring1 = makeBtn("Ring1")
+        local ring2 = makeBtn("Ring2")
+        EW._frame = { Content = { SlotButtons = { head, neck, ring1, ring2 } } }
         EW._canAdmin = true
 
         local function countArmor(profile, slot)
@@ -2895,48 +2897,109 @@ local function reviewFindingTests()
             return n
         end
 
-        local function wire(profile)
+        local function lastArmorAction(profile, slot)
+            local last
+            for _, log in ipairs(profile:GetLootLogs()) do
+                local data = log:GetEventType() == "ARMOR_CHANGE" and log:GetEventData()
+                if data and data.slot == slot then
+                    last = data.action
+                end
+            end
+            return last
+        end
+
+        local function wire(profile, memberId)
+            memberId = memberId or ALT_A
             profile:ApplyIdentityProjection({ force = true })
             EW._profile = profile
-            EW._memberObj = profile:getMemberByID(ALT_A)
-            EW._rowModel = { memberId = ALT_A }
+            EW._memberObj = profile:getMemberByID(memberId)
+            EW._rowModel = { memberId = memberId }
             EW:Refresh()
+        end
+
+        local function configureBis(profile)
+            assertTrue(profile:ApplyRCLootCouncilIntegrationConfig({
+                recordAwards = true,
+                recordAllAwardTypes = false,
+                allowedResponses = { "Need" },
+                bisResponses = {},
+            }, { skipPermission = true, skipSync = true }), "enable recording before item-aware awards")
+            assertTrue(profile:AddRCLootCouncilBisResponse("Need"), "Need counts as BiS")
         end
 
         resetEnv()
         local p = makeProfile("ItemAwareThenRecordOff")
         addMember(p, ALT_A)
-        assertTrue(p:ApplyRCLootCouncilIntegrationConfig({
-            recordAwards = true,
-            recordAllAwardTypes = false,
-            allowedResponses = { "Need" },
-            bisResponses = {},
-        }, { skipPermission = true, skipSync = true }), "enable recording before item-aware awards")
-        assertTrue(p:AddRCLootCouncilBisResponse("Need"), "Need counts as BiS")
+        configureBis(p)
         local award = makeCanonical(ALT_A, 19001, "Need", "1700033000")
         assertTrue(p:TryAddRCLootCouncilAward(award), "qualifying helm consumes Head")
         wire(p)
+        assertTrue(p:IsLiveBisAutomationActive(), "live automation is active while recording and BiS responses are configured")
         assertTrue(p:IsItemAwareEquipmentPopup(), "item-aware history makes the popup item-aware")
         assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "Head is assigned from the historical BiS award")
-        assertTrue(head.scripts.OnClick == nil, "item-aware popup disables Head manual clicks")
-        assertTrue(neck.scripts.OnClick == nil, "item-aware popup also disables empty-slot manual clicks")
+        assertTrue(head.scripts.OnClick == nil, "live automation disables Head manual clicks")
+        assertTrue(neck.scripts.OnClick == nil, "live automation also disables empty-slot manual clicks")
         assertTrue(countArmor(p, "Head") == 0, "item-aware assignment did not write ARMOR_CHANGE")
 
         assertTrue(p:SetRCLootCouncilRecordAwards(false), "disable RC award recording after item-aware history")
         wire(p)
-        assertTrue(p:IsItemAwareEquipmentPopup(), "recording off after item-aware history keeps the popup item-aware")
+        assertFalse(p:IsLiveBisAutomationActive(), "recording off disables live automation")
+        assertTrue(p:IsItemAwareEquipmentPopup(), "recording off after item-aware history still displays item-aware icons")
         assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "historical AUTO assignment survives recording off")
         assertTrue(head.scripts.OnClick == nil, "recording off does not re-enable Head clicks over AUTO occupancy")
-        assertTrue(neck.scripts.OnClick == nil, "recording off does not layer legacy clicks onto empty item-aware slots")
-        assertTrue(countArmor(p, "Head") == 0, "no ARMOR_CHANGE is written while recording is off after item-aware history")
+        assertTrue(neck.scripts.OnClick ~= nil, "AVAILABLE Neck keeps the manual fallback while recording is off")
+        EW:_OnSlotClicked("Head")
+        assertTrue(countArmor(p, "Head") == 0, "direct Head click does not write ARMOR_CHANGE over AUTO")
+        neck.scripts.OnClick()
+        assertEq(countArmor(p, "Neck"), 1, "manual Neck toggle writes ARMOR_CHANGE")
+        assertEq(lastArmorAction(p, "Neck"), "USED", "manual Neck fallback marks USED")
+        wire(p)
+        assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "rebuild preserves AUTO Head after manual Neck use")
+        assertEq(p:GetIdentityBisSlots(ALT_A).Neck.state, "LEGACY_UNKNOWN", "rebuild preserves manual Neck occupancy")
+        assertTrue(neck.scripts.OnClick ~= nil, "manually consumed Neck remains reversible through the fallback")
+        neck.scripts.OnClick()
+        assertEq(lastArmorAction(p, "Neck"), "AVAILABLE", "manual Neck toggle returns the slot to AVAILABLE")
+        wire(p)
+        assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "reversing manual Neck does not clear AUTO Head")
+        assertEq(p:GetIdentityBisSlots(ALT_A).Neck.state, "AVAILABLE", "manual Neck fallback restored AVAILABLE")
 
+        neck.scripts.OnClick()
+        wire(p)
+        assertEq(p:GetIdentityBisSlots(ALT_A).Neck.state, "LEGACY_UNKNOWN", "Neck is manually consumed before re-enabling recording")
         assertTrue(p:SetRCLootCouncilRecordAwards(true), "re-enable RC award recording")
         wire(p)
-        assertTrue(p:IsItemAwareEquipmentPopup(), "re-enabling recording keeps the popup item-aware")
-        assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "re-enabling recording reconstructs the same Head assignment")
+        assertTrue(p:IsLiveBisAutomationActive(), "re-enabling recording restores live automation")
+        assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "re-enabling recording keeps AUTO Head")
+        assertEq(p:GetIdentityBisSlots(ALT_A).Neck.state, "LEGACY_UNKNOWN", "re-enabling recording keeps manual Neck occupancy")
+        local secondHelm = makeCanonical(ALT_A, 19010, "Need", "1700033001")
+        assertTrue(p:TryAddRCLootCouncilAward(secondHelm), "second helm records after re-enable")
+        local secondOutcome = lastOutcome(p, secondHelm.awardKey)
+        assertEq(secondOutcome.outcome, "OVERFLOW", "next automatic helm sees combined Head AUTO occupancy")
+        wire(p)
+        assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "overflow does not replace AUTO Head")
+        assertEq(p:GetIdentityBisSlots(ALT_A).Neck.state, "LEGACY_UNKNOWN", "overflow does not manufacture a second Neck opportunity")
         assertTrue(head.scripts.OnClick == nil, "re-enabled automation still does not expose manual Head clicks")
+        assertTrue(neck.scripts.OnClick == nil, "re-enabled automation locks previously fallback-enabled slots")
+
+        resetEnv()
+        local rings = makeProfile("RecordOffRingFallback")
+        addMember(rings, ALT_A)
+        configureBis(rings)
+        assertTrue(rings:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19002, "Need", "1700034000")), "first ring consumes Ring1")
+        wire(rings)
+        assertEq(rings:GetIdentityBisSlots(ALT_A).Ring1.state, "ASSIGNED_AUTO", "Ring1 is AUTO")
+        assertEq(rings:GetIdentityBisSlots(ALT_A).Ring2.state, "AVAILABLE", "Ring2 starts available")
+        assertTrue(rings:SetRCLootCouncilRecordAwards(false), "disable recording with AUTO Ring1")
+        wire(rings)
+        assertTrue(ring1.scripts.OnClick == nil, "AUTO Ring1 is not manually toggleable")
+        assertTrue(ring2.scripts.OnClick ~= nil, "available Ring2 keeps the manual fallback")
+        ring2.scripts.OnClick()
+        wire(rings)
+        assertEq(rings:GetIdentityBisSlots(ALT_A).Ring1.state, "ASSIGNED_AUTO", "manual Ring2 does not hide AUTO Ring1")
+        assertEq(rings:GetIdentityBisSlots(ALT_A).Ring2.state, "LEGACY_UNKNOWN", "manual Ring2 consumes the remaining ring opportunity")
+        assertTrue(countArmor(rings, "Ring1") == 0, "manual Ring2 did not write ARMOR_CHANGE on AUTO Ring1")
     end
-    recordingOffAfterItemAwareHistory()
+    recordingOffManualFallback()
 
     local function mainHandOnlyOffHand()
         resetEnv()
