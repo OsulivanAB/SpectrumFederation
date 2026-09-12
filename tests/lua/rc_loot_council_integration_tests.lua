@@ -2203,29 +2203,8 @@ local function testExistingProfileReconnectCatchesUpRCConfig()
     end
 
     local function settleSnapshot(coordProfile, follower, captured)
-        local need = lastOfType(captured, Sync.MSG.NEED_PROFILE)
-        assertTrue(need ~= nil, "join/catch-up requested NEED_PROFILE without a manual SET")
-        if not need then
-            return
-        end
-        assertTrue(need.payload.statusOnly ~= true, "catch-up NEED_PROFILE asks for a trusted snapshot")
-        local served
-        withLocalProfile(coordProfile, function()
-            Sync.state.isCoordinator = true
-            Sync.state.coordinator = "Tester-Garona"
-            local before = #captured
-            Sync:HandleNeedProfile(ADMIN_B, need.payload)
-            served = captured[#captured]
-            assertTrue(#captured > before, "coordinator served a snapshot for NEED_PROFILE")
-        end)
-        assertEq(served.msgType, Sync.MSG.PROFILE_SNAPSHOT, "trusted catch-up is PROFILE_SNAPSHOT")
-        PLAYER = ADMIN_B
-        withLocalProfile(follower, function()
-            Sync.state.isCoordinator = false
-            Sync.state.coordinator = "Tester-Garona"
-            Sync:HandleProfileSnapshot("Tester-Garona", served.payload)
-        end)
-        PLAYER = "Tester-Garona"
+        assertTrue(lastOfType(captured, Sync.MSG.NEED_PROFILE) == nil, "RC catch-up does not request NEED_PROFILE")
+        assertTrue(lastOfType(captured, Sync.MSG.PROFILE_SNAPSHOT) == nil, "RC catch-up does not require PROFILE_SNAPSHOT")
     end
 
     resetEnv()
@@ -2465,6 +2444,10 @@ local function testOutOfSessionRCConfigBecomesSessionAuthoritative()
         self:BroadcastSessionStart()
     end
     function Sync:BroadcastSessionStart()
+        local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+        if self._MintDirtySessionRCConfig then
+            self:_MintDirtySessionRCConfig(profile)
+        end
         if self._RefreshAdvertisedAuthorMax then
             self:_RefreshAdvertisedAuthorMax(self.state.profileId)
         end
@@ -2521,29 +2504,8 @@ local function testOutOfSessionRCConfigBecomesSessionAuthoritative()
     end
 
     local function settleSnapshot(coordProfile, follower, captured)
-        local need = lastOfType(captured, Sync.MSG.NEED_PROFILE)
-        assertTrue(need ~= nil, "join requested NEED_PROFILE for session-initial RC config")
-        if not need then
-            return
-        end
-        assertTrue(need.payload.statusOnly ~= true, "session-start catch-up NEED_PROFILE asks for a trusted snapshot")
-        local served
-        withLocalProfile(coordProfile, function()
-            Sync.state.isCoordinator = true
-            Sync.state.coordinator = "Tester-Garona"
-            local before = #captured
-            Sync:HandleNeedProfile(ADMIN_B, need.payload)
-            served = captured[#captured]
-            assertTrue(#captured > before, "coordinator served a snapshot for session-initial RC config")
-        end)
-        assertEq(served.msgType, Sync.MSG.PROFILE_SNAPSHOT, "trusted session-start catch-up is PROFILE_SNAPSHOT")
-        PLAYER = ADMIN_B
-        withLocalProfile(follower, function()
-            Sync.state.isCoordinator = false
-            Sync.state.coordinator = "Tester-Garona"
-            Sync:HandleProfileSnapshot("Tester-Garona", served.payload)
-        end)
-        PLAYER = "Tester-Garona"
+        assertTrue(lastOfType(captured, Sync.MSG.NEED_PROFILE) == nil, "session-start RC catch-up does not request NEED_PROFILE")
+        assertTrue(lastOfType(captured, Sync.MSG.PROFILE_SNAPSHOT) == nil, "session-start RC catch-up does not require PROFILE_SNAPSHOT")
     end
 
     local function joinFromStart(coordProfile, follower, startCaptured)
@@ -2674,7 +2636,7 @@ local function testOutOfSessionRCConfigBecomesSessionAuthoritative()
     assertEq(laterQualA, true, "coordinator qualifies later Greed")
     assertEq(laterQualB, true, "follower qualifies later Greed after session-initial catch-up")
     assertEq(laterOutcomeB, laterOutcomeA, "later Greed BIS_OUTCOME matches")
-    assertTrue(setMsg == nil or setMsg.payload.seq ~= nil, "session-initial SET stays on the config channel when published")
+    assertTrue(setMsg == nil, "dirty session-initial config is advertised on SES_START, not RC_CONFIG_SET")
 
     -- Fresh zero-generation profile, out-of-session disable recording, then StartSession.
     resetEnv()
@@ -2709,6 +2671,404 @@ local function testOutOfSessionRCConfigBecomesSessionAuthoritative()
     SF.LootHelperComm = nil
 end
 testOutOfSessionRCConfigBecomesSessionAuthoritative()
+
+local function testSessionStartRCAuthorityAndFanout()
+    loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
+    loadModule("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
+
+    local ADMIN_C = "PeerC-Garona"
+    local ADMIN_D = "PeerD-Garona"
+    local nonce = 0
+    local deferred = {}
+    local captured = {}
+
+    local function greedMeta()
+        return { typeCode = "default", responseId = 2, isAwardReason = false }
+    end
+
+    local function lastOfType(msgType)
+        local found
+        for i = 1, #captured do
+            if captured[i].msgType == msgType then
+                found = captured[i]
+            end
+        end
+        return found
+    end
+
+    local function countOfType(msgType)
+        local n = 0
+        for i = 1, #captured do
+            if captured[i].msgType == msgType then
+                n = n + 1
+            end
+        end
+        return n
+    end
+
+    local function resetCaptured()
+        captured = {}
+        SF.LootHelperComm = {
+            Send = function(_, channel, msgType, payload, dist, target)
+                captured[#captured + 1] = {
+                    channel = channel,
+                    msgType = msgType,
+                    payload = payload,
+                    dist = dist,
+                    target = target,
+                }
+                return true
+            end,
+        }
+    end
+
+    local function installHarness()
+        nonce = 0
+        deferred = {}
+        function Sync:_NextNonce(tag)
+            nonce = nonce + 1
+            return tostring(tag or "N") .. "-" .. tostring(nonce)
+        end
+        function Sync:_ResetSessionSafeMode()
+        end
+        function Sync:_ResetLocalSafeMode()
+        end
+        function Sync:_ApplySessionSafeModeFromPayload()
+        end
+        function Sync:EnsureHeartbeatMonitor()
+            return false
+        end
+        function Sync:StopHeartbeatSender()
+        end
+        function Sync:NewRequestId()
+            nonce = nonce + 1
+            return "REQ-START-" .. tostring(nonce)
+        end
+        function Sync:GetPeer(nameRealm)
+            self.state.peers = self.state.peers or {}
+            local peer = self.state.peers[nameRealm]
+            if not peer then
+                peer = { name = nameRealm, inGroup = true }
+                self.state.peers[nameRealm] = peer
+            end
+            peer.inGroup = true
+            return peer
+        end
+        function Sync:RegisterRequest(requestId, kind, target, meta)
+            self.state.requests = self.state.requests or {}
+            self.state.requests[requestId] = { id = requestId, kind = kind, target = target, meta = meta }
+            if kind == "NEED_PROFILE" and SF.LootHelperComm then
+                SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, {
+                    sessionId = self.state.sessionId,
+                    profileId = self.state.profileId,
+                    requestId = requestId,
+                }, "WHISPER", target, "NORMAL")
+            end
+            return true
+        end
+        function Sync:RunWithJitter(_, _, fn)
+            if type(fn) == "function" then
+                fn()
+            end
+        end
+        function Sync:RunAfter(delaySec, fn)
+            if type(fn) ~= "function" then
+                return
+            end
+            delaySec = tonumber(delaySec) or 0
+            if delaySec <= 0 then
+                fn()
+                return
+            end
+            deferred[#deferred + 1] = fn
+        end
+    end
+
+    local function flushDeferred()
+        local queued = deferred
+        deferred = {}
+        for i = 1, #queued do
+            queued[i]()
+        end
+    end
+
+    local function seedNeedConfig(profile)
+        assertTrue(profile:ApplyRCLootCouncilIntegrationConfig({
+            recordAwards = true,
+            recordAllAwardTypes = false,
+            allowedResponses = { "Need" },
+            bisResponses = {
+                { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+            },
+        }, { skipPermission = true, skipSync = true }), "seed accepted Need-only RC config")
+    end
+
+    local function lastGreedOutcome(profile, awardKey)
+        for _, log in ipairs(profile:GetLootLogs() or {}) do
+            local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+            if data and data.awardKey == awardKey then
+                return data.outcome, data.qualified
+            end
+        end
+    end
+
+    local function driveResponderStatus(starterPlayer, responderPlayer, responderProfile)
+        local syncMsg = lastOfType(Sync.MSG.ADMIN_SYNC)
+        assertTrue(syncMsg ~= nil, "StartSession whispered ADMIN_SYNC to the other admin")
+        local previous = PLAYER
+        PLAYER = responderPlayer
+        withLocalProfile(responderProfile, function()
+            Sync:HandleAdminSync(starterPlayer, syncMsg.payload)
+        end)
+        local statusMsg = lastOfType(Sync.MSG.ADMIN_STATUS)
+        assertTrue(statusMsg ~= nil, "present admin replied ADMIN_STATUS")
+        PLAYER = starterPlayer
+        Sync:HandleAdminStatus(responderPlayer, statusMsg.payload)
+        flushDeferred()
+        PLAYER = previous
+        return statusMsg
+    end
+
+    local function receiveSessionStart(playerId, follower, coordinatorName, startPayload)
+        local previous = PLAYER
+        PLAYER = playerId
+        withLocalProfile(follower, function()
+            Sync.state.active = false
+            Sync.state.isCoordinator = false
+            Sync.state._sentJoinStatusForSessionId = nil
+            Sync.state._sentJoinStatusType = nil
+            Sync.state._profileReqInFlight = nil
+            Sync.state.heartbeat = { lastCatchupAt = nil }
+            Sync:HandleSessionStart(coordinatorName, startPayload)
+        end)
+        PLAYER = previous
+    end
+
+    -- BLOCKER: stale admin B starts Session 2; present admin A still holds (100, 5) Greed.
+    resetEnv()
+    installHarness()
+    local clock = 100
+    function Sync:_Now()
+        return clock
+    end
+    local coordA = makeProfile("RC Stale Starter A")
+    addMember(coordA, WINNER)
+    addMember(coordA, ADMIN_B)
+    assertTrue(coordA:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "Admin B shares the profile")
+    seedNeedConfig(coordA)
+    setActive(coordA)
+    startSessionOn(coordA)
+    Sync.state.coordinator = PLAYER
+    Sync.state.isCoordinator = true
+    Sync.state.coordEpoch = 100
+    coordA._rcConfigSeq = 4
+    coordA._rcConfigEpoch = 100
+    Sync.state.rcConfigSeq = 4
+    assertTrue(coordA:TryAddRCLootCouncilAward(SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700004101-prior",
+        response = "Need",
+        responseID = 1,
+    }))), "shared complete logs include a Need award")
+    local staleB = cloneProfileAs("RC Stale Starter B", coordA)
+    assertEq(staleB._rcConfigSeq, 4, "Admin B cloned at accepted seq 4")
+    assertEq(staleB._rcConfigEpoch, 100, "Admin B cloned at accepted epoch 100")
+    resetCaptured()
+    assertTrue(coordA:AddRCLootCouncilBisResponse({
+        text = "Greed",
+        typeCode = "default",
+        responseId = 2,
+        isAwardReason = false,
+    }), "Session 1 coordinator accepts Greed as BiS")
+    local liveSet = lastOfType(Sync.MSG.RC_CONFIG_SET)
+    assertTrue(liveSet ~= nil, "Session 1 published RC_CONFIG_SET (100, 5)")
+    assertEq(coordA._rcConfigSeq, 5, "accepted seq advanced to 5")
+    assertEq(coordA._rcConfigEpoch, 100, "accepted epoch stays 100")
+    assertTrue(coordA:IsBisQualifyingResponse("Greed", greedMeta()), "Admin A holds Greed")
+    assertFalse(staleB:IsBisQualifyingResponse("Greed", greedMeta()), "Admin B missed the SET")
+    assertEq(staleB._rcConfigSeq, 4, "Admin B remains at seq 4")
+    assertTrue(Sync:EndSession("manual", false), "Session 1 ended")
+    assertEq(Sync.state.active, false, "no session is active before Session 2")
+    assertFalse(staleB._rcConfigDirty == true, "missed SET does not mark the stale starter dirty")
+
+    clock = 200
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[staleB:GetProfileId()] = staleB
+    setActive(staleB)
+    installHarness()
+    resetCaptured()
+    local sessionId = Sync:StartSession(staleB:GetProfileId())
+    assertTrue(sessionId ~= nil, "production StartSession starts Session 2 as stale Admin B")
+    driveResponderStatus(ADMIN_B, "Tester-Garona", coordA)
+    local startMsg = lastOfType(Sync.MSG.SES_START)
+    assertTrue(startMsg ~= nil, "Session 2 announced SES_START after admin convergence")
+    assertTrue(staleB:IsBisQualifyingResponse("Greed", greedMeta()), "stale starter adopted the last accepted Greed configuration")
+    assertEq(staleB._rcConfigEpoch, 100, "stale starter did not mint a new coordEpoch over the last accepted generation")
+    assertEq(staleB._rcConfigSeq, 5, "stale starter adopted accepted seq 5")
+    assertEq(startMsg.payload.rcConfigEpoch, 100, "SES_START advertises the previously accepted epoch")
+    assertEq(startMsg.payload.rcConfigSeq, 5, "SES_START advertises the previously accepted seq")
+    assertTrue(
+        not SF.LootProfile.IsNewerRCConfigGeneration(
+            startMsg.payload.rcConfigEpoch,
+            startMsg.payload.rcConfigSeq,
+            100,
+            5
+        ),
+        "new coordEpoch must not make stale contents a strictly newer generation"
+    )
+    local setBeforeStart = nil
+    for i = 1, #captured do
+        if captured[i].msgType == Sync.MSG.SES_START then
+            break
+        end
+        if captured[i].msgType == Sync.MSG.RC_CONFIG_SET then
+            setBeforeStart = captured[i]
+        end
+    end
+    assertTrue(setBeforeStart == nil, "stale StartSession does not serialize RC_CONFIG_SET before SES_START")
+
+    PLAYER = "Tester-Garona"
+    resetCaptured()
+    receiveSessionStart("Tester-Garona", coordA, ADMIN_B, startMsg.payload)
+    assertTrue(coordA:IsBisQualifyingResponse("Greed", greedMeta()), "present Admin A kept Greed after Session 2 start")
+    assertEq(coordA._rcConfigSeq, 5, "present Admin A kept seq 5")
+    assertEq(countOfType(Sync.MSG.NEED_PROFILE), 0, "present Admin A does not request a profile snapshot")
+    local laterGreed = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700004102-later",
+        response = "Greed",
+        responseID = 2,
+        isAwardReason = false,
+    }))
+    PLAYER = ADMIN_B
+    SF.lootHelperDB.profiles[staleB:GetProfileId()] = staleB
+    assertTrue(staleB:TryAddRCLootCouncilAward(laterGreed), "stale starter records later Greed after adopting")
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[coordA:GetProfileId()] = coordA
+    assertTrue(coordA:TryAddRCLootCouncilAward(laterGreed), "Admin A still records later Greed")
+    local _, laterQualA = lastGreedOutcome(coordA, laterGreed.awardKey)
+    local _, laterQualB = lastGreedOutcome(staleB, laterGreed.awardKey)
+    assertEq(laterQualA, true, "Admin A qualifies later Greed")
+    assertEq(laterQualB, true, "stale starter qualifies later Greed after adopting")
+
+    -- HIGH: unchanged second raid must not fan out PROFILE_SNAPSHOT for RC config.
+    local function runUnchangedStart(peerCount)
+        resetEnv()
+        installHarness()
+        clock = 300
+        function Sync:_Now()
+            return clock
+        end
+        local coord = makeProfile("RC Unchanged Start " .. tostring(peerCount))
+        addMember(coord, WINNER)
+        addMember(coord, ADMIN_B)
+        addMember(coord, ADMIN_C)
+        addMember(coord, ADMIN_D)
+        assertTrue(coord:AddAdminMemberId(ADMIN_B, { skipPermission = true, skipBroadcast = true }), "unchanged-start Admin B shares the profile")
+        seedNeedConfig(coord)
+        setActive(coord)
+        startSessionOn(coord)
+        Sync.state.coordinator = PLAYER
+        Sync.state.isCoordinator = true
+        Sync.state.coordEpoch = 100
+        coord._rcConfigSeq = 4
+        coord._rcConfigEpoch = 100
+        Sync.state.rcConfigSeq = 4
+        assertTrue(coord:TryAddRCLootCouncilAward(SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+            id = "1700004200-shared-" .. tostring(peerCount),
+            response = "Need",
+            responseID = 1,
+        }))), "unchanged-start shared logs are complete")
+        local followerB = cloneProfileAs("RC Unchanged B " .. tostring(peerCount), coord)
+        local extra = {}
+        local extraPlayers = {}
+        if peerCount > 1 then
+            extra[#extra + 1] = cloneProfileAs("RC Unchanged C " .. tostring(peerCount), coord)
+            extraPlayers[#extraPlayers + 1] = ADMIN_C
+            extra[#extra + 1] = cloneProfileAs("RC Unchanged D " .. tostring(peerCount), coord)
+            extraPlayers[#extraPlayers + 1] = ADMIN_D
+        end
+        assertTrue(cfgEqual(coord:GetRCLootCouncilIntegrationConfig(), followerB:GetRCLootCouncilIntegrationConfig()), "peers already share RC config")
+        assertTrue(Sync:EndSession("manual", false), "prior session ended with no RC edits")
+        clock = 400
+        PLAYER = "Tester-Garona"
+        SF.lootHelperDB.profiles[coord:GetProfileId()] = coord
+        setActive(coord)
+        installHarness()
+        resetCaptured()
+        assertTrue(Sync:StartSession(coord:GetProfileId()) ~= nil, "production StartSession starts the next unchanged raid")
+        driveResponderStatus("Tester-Garona", ADMIN_B, followerB)
+        local start = lastOfType(Sync.MSG.SES_START)
+        assertTrue(start ~= nil, "unchanged raid announced SES_START")
+        assertTrue(lastOfType(Sync.MSG.RC_CONFIG_SET) == nil, "unchanged raid does not publish RC_CONFIG_SET")
+        assertEq(start.payload.rcConfigEpoch, 100, "unchanged raid advertises the existing RC epoch")
+        assertEq(start.payload.rcConfigSeq, 4, "unchanged raid advertises the existing RC seq")
+        assertTrue(
+            not SF.LootProfile.IsNewerRCConfigGeneration(
+                start.payload.rcConfigEpoch,
+                start.payload.rcConfigSeq,
+                followerB._rcConfigEpoch,
+                followerB._rcConfigSeq
+            ),
+            "unchanged raid does not advertise a strictly newer RC generation"
+        )
+        local setBeforeStart = nil
+        for i = 1, #captured do
+            if captured[i].msgType == Sync.MSG.SES_START then
+                break
+            end
+            if captured[i].msgType == Sync.MSG.RC_CONFIG_SET then
+                setBeforeStart = captured[i]
+            end
+        end
+        assertTrue(setBeforeStart == nil, "unchanged raid does not send RC_CONFIG_SET before SES_START")
+        PLAYER = "Tester-Garona"
+        SF.lootHelperDB.profiles[coord:GetProfileId()] = coord
+        Sync.state.active = true
+        Sync.state.isCoordinator = true
+        Sync.state.coordinator = PLAYER
+        Sync.state.sessionId = start.payload.sessionId
+        Sync.state.profileId = start.payload.profileId
+        Sync.state.coordEpoch = start.payload.coordEpoch
+        resetCaptured()
+        assertTrue(Sync:BroadcastSessionHeartbeat(), "unchanged raid heartbeat was sent")
+        local heartbeat = lastOfType(Sync.MSG.SES_HEARTBEAT)
+        assertTrue(heartbeat ~= nil, "unchanged raid heartbeat advertised RC generation")
+        local function joinSyncedPeer(playerId, follower)
+            PLAYER = playerId
+            resetCaptured()
+            withLocalProfile(follower, function()
+                Sync.state.active = true
+                Sync.state.sessionId = start.payload.sessionId
+                Sync.state.profileId = start.payload.profileId
+                Sync.state.coordinator = "Tester-Garona"
+                Sync.state.coordEpoch = start.payload.coordEpoch
+                Sync.state.isCoordinator = false
+                Sync.state._sentJoinStatusForSessionId = Sync.state.sessionId
+                Sync.state._sentJoinStatusType = "HAVE_PROFILE"
+                Sync.state._profileReqInFlight = nil
+                Sync.state.heartbeat = { lastCatchupAt = nil }
+                Sync:HandleSessionHeartbeat("Tester-Garona", heartbeat.payload)
+                Sync:SendJoinStatus()
+            end)
+            assertEq(countOfType(Sync.MSG.NEED_PROFILE), 0, "already-synced peer does not send NEED_PROFILE for RC config")
+            assertEq(countOfType(Sync.MSG.PROFILE_SNAPSHOT), 0, "already-synced peer does not receive PROFILE_SNAPSHOT for RC config")
+            assertEq(countOfType(Sync.MSG.RC_CONFIG_REQ), 0, "already-synced unchanged peer does not request RC config catch-up")
+        end
+        joinSyncedPeer(ADMIN_B, followerB)
+        for i = 1, #extra do
+            joinSyncedPeer(extraPlayers[i], extra[i])
+        end
+        assertTrue(cfgEqual(coord:GetRCLootCouncilIntegrationConfig(), followerB:GetRCLootCouncilIntegrationConfig()), "follower still matches coordinator RC config")
+        PLAYER = "Tester-Garona"
+        return start
+    end
+
+    runUnchangedStart(1)
+    runUnchangedStart(3)
+
+    PLAYER = "Tester-Garona"
+    SF.LootHelperComm = nil
+end
+testSessionStartRCAuthorityAndFanout()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

@@ -90,6 +90,9 @@ function Sync:HandleSessionStart(sender, payload)
     if self._RememberAdvertisedRCConfigGeneration then
         self:_RememberAdvertisedRCConfigGeneration(payload)
     end
+    if self._ApplyAdvertisedRCConfig then
+        self:_ApplyAdvertisedRCConfig(payload)
+    end
 
     -- Rebuild immediately when we already have the profile to avoid stale point/member UI.
     local profile = self:FindLocalProfileById(payload.profileId)
@@ -563,8 +566,8 @@ function Sync:SendJoinStatus()
         return
     end
 
-    if self._CatchUpRCConfigIfNeeded and self:_CatchUpRCConfigIfNeeded(profile, "join-status-rc-config") then
-        return
+    if self._CatchUpRCConfigIfNeeded then
+        self:_CatchUpRCConfigIfNeeded(profile, "join-status-rc-config")
     end
 
     if alreadySent("HAVE_PROFILE") then return end

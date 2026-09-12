@@ -712,10 +712,6 @@ function Sync:StartSession(profileId, opts)
     end
     self:LogSessionPointsSummary(profileId, "coordinator_start")
 
-    if self._EstablishSessionRCConfig then
-        self:_EstablishSessionRCConfig(profile)
-    end
-
     self:BeginAdminConvergence(sessionId, profileId)
 
     return sessionId

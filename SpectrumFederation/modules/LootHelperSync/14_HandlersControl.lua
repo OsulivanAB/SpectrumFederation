@@ -75,6 +75,11 @@ function Sync:BuildAdminStatus(profileId)
     status.hasProfile = true
     status.authorMax = profile:ComputeAuthorMax() or {}
     status.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or {}
+    status.rcConfigSeq = math.floor(tonumber(profile._rcConfigSeq) or 0)
+    status.rcConfigEpoch = math.floor(tonumber(profile._rcConfigEpoch) or 0)
+    if profile.GetRCLootCouncilIntegrationConfig then
+        status.rcLootCouncilIntegration = profile:GetRCLootCouncilIntegrationConfig()
+    end
 
     -- hasGaps heuristic: is the logical SameAuthor sequence missing a counter?
     -- Historical alias continuation (owner-Garona:1..6 + Owner-Garona:7) is
@@ -286,6 +291,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     if self._RememberAdvertisedRCConfigGeneration then
         self:_RememberAdvertisedRCConfigGeneration(payload)
     end
+    if self._ApplyAdvertisedRCConfig then
+        self:_ApplyAdvertisedRCConfig(payload)
+    end
 
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
@@ -447,6 +455,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     end
     if self._RememberAdvertisedRCConfigGeneration then
         self:_RememberAdvertisedRCConfigGeneration(payload)
+    end
+    if self._ApplyAdvertisedRCConfig then
+        self:_ApplyAdvertisedRCConfig(payload)
     end
 
     -- Heartbeat bookkeeping
@@ -1105,6 +1116,12 @@ function Sync:HandleRCConfigRequest(sender, payload)
     if self.IsRequesterInGroup and not self:IsRequesterInGroup(sender) then
         return
     end
+    if payload.catchUp == true then
+        if self.PublishRCIntegrationConfig then
+            self:PublishRCIntegrationConfig(self.state.profileId, { replay = true })
+        end
+        return
+    end
     local cfg = CopyRCConfigFromPayload(payload.rcLootCouncilIntegration)
     if not cfg then
         return
@@ -1194,7 +1211,9 @@ function Sync:HandleRCConfigSet(sender, payload)
     end
     profile._rcConfigSeq = seq
     profile._rcConfigEpoch = incomingEpoch
+    profile._rcConfigDirty = nil
     self.state.rcConfigSeq = seq
+    self.state._rcConfigCatchUpInFlight = nil
     if SF.Debug then
         SF.Debug:Verbose("SYNC", "Applied RC_CONFIG_SET seq=%s from %s", tostring(seq), tostring(sender))
     end

@@ -1821,6 +1821,7 @@ local function PushRCIntegrationConfig(self)
 	end
 	local ok, err = Sync:PublishRCIntegrationConfig(self:GetProfileId())
 	if ok then
+		self._rcConfigDirty = nil
 		return true
 	end
 	if self._pendingRCLootCouncilIntegration then
@@ -1830,6 +1831,11 @@ local function PushRCIntegrationConfig(self)
 	end
 	-- Coordinator / local-only accepted mutations stay in place when there is
 	-- no session to serialize. "no session" is the expected no-op publish.
+	-- Mark the accepted contents dirty so the next StartSession can mint them
+	-- without treating a merely stale starter as an intentional edit.
+	if err == "no session" then
+		self._rcConfigDirty = true
+	end
 	return true
 end
 
@@ -3711,6 +3717,7 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		self._rcConfigSeq = incomingSeq
 		self._rcConfigEpoch = incomingEpoch
 		self._pendingRCLootCouncilIntegration = nil
+		self._rcConfigDirty = nil
 	end
 
 	-- Import loot mode / Reward Pot config only when the snapshot actually contains them.

@@ -316,8 +316,9 @@ function Sync:BuildProfileSnapshot(profileId)
     }
 end
 
--- Advertise accepted RC generation on session descriptors so a log-complete
--- reconnect can detect a missed RC_CONFIG_SET without inventing a config log.
+-- Advertise accepted RC generation and the small config blob on session
+-- descriptors. Peers apply this after accepting the session; they must not
+-- need a full PROFILE_SNAPSHOT solely to catch up RC settings.
 function Sync:_AttachRCConfigGeneration(payload, profileId)
     if type(payload) ~= "table" then
         return payload
@@ -336,6 +337,9 @@ function Sync:_AttachRCConfigGeneration(payload, profileId)
     local epoch = tonumber(profile and profile._rcConfigEpoch) or 0
     payload.rcConfigSeq = math.floor(tonumber(seq) or 0)
     payload.rcConfigEpoch = math.floor(epoch)
+    if profile and profile.GetRCLootCouncilIntegrationConfig then
+        payload.rcLootCouncilIntegration = profile:GetRCLootCouncilIntegrationConfig()
+    end
     return payload
 end
 
@@ -369,40 +373,159 @@ function Sync:_NeedsRCConfigCatchUp(profile)
     return LootProfile.IsNewerRCConfigGeneration(advEpoch or 0, advSeq or 0, localEpoch, localSeq)
 end
 
--- Coordinator StartSession serializes the current accepted RC config as this
--- session's initial generation. Out-of-session mutators change accepted fields
--- without bumping (_rcConfigEpoch, _rcConfigSeq); a new coordEpoch alone is
--- not advertised. Publishing SET here (or stamping the generation if comm is
--- unavailable) makes joiners catch up without an extra in-session toggle.
-function Sync:_EstablishSessionRCConfig(profile)
-    if not (self.state and self.state.active and self.state.isCoordinator) then
-        return
+-- Apply coordinator-advertised RC config from SES_START / heartbeat /
+-- reannounce after the receiver has accepted the session. Generation is
+-- compared with (coordEpoch, seq); missing blobs are not inferred.
+function Sync:_ApplyAdvertisedRCConfig(payload)
+    if type(payload) ~= "table" then
+        return false
     end
-    if not profile then
-        return
+    if not (self.state and self.state.active) then
+        return false
     end
-    if self.PublishRCIntegrationConfig then
-        local ok = self:PublishRCIntegrationConfig(profile:GetProfileId())
-        if ok then
-            return
+    local profileId = payload.profileId or self.state.profileId
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if not profile or not profile.ApplyRCLootCouncilIntegrationConfig then
+        return false
+    end
+    if type(payload.rcLootCouncilIntegration) ~= "table" then
+        return false
+    end
+    local incomingSeq = math.floor(tonumber(payload.rcConfigSeq) or 0)
+    local incomingEpoch = math.floor(tonumber(payload.rcConfigEpoch) or 0)
+    local localSeq = tonumber(profile._rcConfigSeq) or 0
+    local localEpoch = tonumber(profile._rcConfigEpoch) or 0
+    local LootProfile = SF.LootProfile
+    local isNewer = incomingSeq > localSeq
+    if LootProfile and LootProfile.IsNewerRCConfigGeneration then
+        isNewer = LootProfile.IsNewerRCConfigGeneration(incomingEpoch, incomingSeq, localEpoch, localSeq)
+    end
+    if not isNewer then
+        return false
+    end
+    local applied = profile:ApplyRCLootCouncilIntegrationConfig(payload.rcLootCouncilIntegration, {
+        skipPermission = true,
+        skipSync = true,
+    })
+    if not applied then
+        return false
+    end
+    profile._rcConfigSeq = incomingSeq
+    profile._rcConfigEpoch = incomingEpoch
+    profile._rcConfigDirty = nil
+    self.state.rcConfigSeq = incomingSeq
+    self.state._rcConfigCatchUpInFlight = nil
+    return true
+end
+
+-- START-mode admin convergence: adopt a strictly newer previously accepted
+-- generation from participating admins before SES_START. Skipped when the
+-- starter deliberately edited RC settings while no session was active.
+function Sync:_AdoptNewerAdminAcceptedRCConfig(profile)
+    if not profile or not profile.ApplyRCLootCouncilIntegrationConfig then
+        return false
+    end
+    if profile._rcConfigDirty == true then
+        return false
+    end
+    local LootProfile = SF.LootProfile
+    if not (LootProfile and LootProfile.IsNewerRCConfigGeneration) then
+        return false
+    end
+    local bestEpoch = tonumber(profile._rcConfigEpoch) or 0
+    local bestSeq = tonumber(profile._rcConfigSeq) or 0
+    local bestCfg = nil
+    local names = {}
+    for name in pairs(self.state.adminStatuses or {}) do
+        names[#names + 1] = name
+    end
+    table.sort(names)
+    for i = 1, #names do
+        local st = self.state.adminStatuses[names[i]]
+        if type(st) == "table" and type(st.rcLootCouncilIntegration) == "table" then
+            local epoch = math.floor(tonumber(st.rcConfigEpoch) or 0)
+            local seq = math.floor(tonumber(st.rcConfigSeq) or 0)
+            if LootProfile.IsNewerRCConfigGeneration(epoch, seq, bestEpoch, bestSeq) then
+                bestEpoch = epoch
+                bestSeq = seq
+                bestCfg = st.rcLootCouncilIntegration
+            end
         end
+    end
+    if not bestCfg then
+        return false
+    end
+    local applied = profile:ApplyRCLootCouncilIntegrationConfig(bestCfg, {
+        skipPermission = true,
+        skipSync = true,
+    })
+    if not applied then
+        return false
+    end
+    profile._rcConfigSeq = bestSeq
+    profile._rcConfigEpoch = bestEpoch
+    profile._rcConfigDirty = nil
+    self.state.rcConfigSeq = bestSeq
+    return true
+end
+
+-- Intentional out-of-session edits mint a new generation under this session's
+-- coordEpoch. Do not RAID RC_CONFIG_SET before SES_START: ordinary peers have
+-- not accepted the session yet, so SET cannot apply through HandleRCConfigSet.
+function Sync:_MintDirtySessionRCConfig(profile)
+    if not (self.state and self.state.active and self.state.isCoordinator) then
+        return false
+    end
+    if not profile or profile._rcConfigDirty ~= true then
+        return false
     end
     local nextSeq = (tonumber(self.state.rcConfigSeq) or tonumber(profile._rcConfigSeq) or 0) + 1
     self.state.rcConfigSeq = nextSeq
     profile._rcConfigSeq = nextSeq
     profile._rcConfigEpoch = tonumber(self.state.coordEpoch) or 0
+    profile._rcConfigDirty = nil
+    return true
+end
+
+function Sync:RequestRCConfigCatchUp(reason)
+    if not (self.state and self.state.active) then
+        return false
+    end
+    if self.state.isCoordinator then
+        return false
+    end
+    if type(self.state.sessionId) ~= "string" or self.state.sessionId == "" then
+        return false
+    end
+    if type(self.state.coordinator) ~= "string" or self.state.coordinator == "" then
+        return false
+    end
+    if self.state._rcConfigCatchUpInFlight == self.state.sessionId then
+        return false
+    end
+    if not (SF.LootHelperComm and SF.LootHelperComm.Send) then
+        return false
+    end
+    local sent = SF.LootHelperComm:Send("CONTROL", self.MSG.RC_CONFIG_REQ, {
+        sessionId = self.state.sessionId,
+        profileId = self.state.profileId,
+        catchUp = true,
+    }, "WHISPER", self.state.coordinator, "NORMAL")
+    if sent == false then
+        return false
+    end
+    self.state._rcConfigCatchUpInFlight = self.state.sessionId
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "RC config catch-up requested (reason=%s)", tostring(reason or "rc-config-catchup"))
+    end
+    return true
 end
 
 function Sync:_CatchUpRCConfigIfNeeded(profile, reason)
     if not self:_NeedsRCConfigCatchUp(profile) then
         return false
     end
-    if self.state._profileReqInFlight == self.state.sessionId then
-        return true
-    end
-    if self.RequestProfileSnapshot then
-        self:RequestProfileSnapshot(reason or "rc-config-catchup")
-    end
+    self:RequestRCConfigCatchUp(reason or "rc-config-catchup")
     return true
 end
 
@@ -460,7 +583,8 @@ end
 -- @param profileId string|nil Session profile id
 -- @return boolean success
 -- @return table|string payloadOrError
-function Sync:PublishRCIntegrationConfig(profileId)
+function Sync:PublishRCIntegrationConfig(profileId, opts)
+    opts = type(opts) == "table" and opts or {}
     if not self.state or not self.state.active then
         return false, "no session"
     end
@@ -507,17 +631,26 @@ function Sync:PublishRCIntegrationConfig(profileId)
         return false, "comm not available"
     end
     if self.state.isCoordinator then
-        local nextSeq = (tonumber(self.state.rcConfigSeq) or 0) + 1
-        self.state.rcConfigSeq = nextSeq
-        profile._rcConfigSeq = nextSeq
-        profile._rcConfigEpoch = tonumber(self.state.coordEpoch) or 0
-        profile._pendingRCLootCouncilIntegration = nil
+        local seq
+        local epoch
+        if opts.replay == true then
+            seq = math.floor(tonumber(self.state.rcConfigSeq) or tonumber(profile._rcConfigSeq) or 0)
+            epoch = tonumber(self.state.coordEpoch) or 0
+        else
+            seq = (tonumber(self.state.rcConfigSeq) or 0) + 1
+            self.state.rcConfigSeq = seq
+            profile._rcConfigSeq = seq
+            profile._rcConfigEpoch = tonumber(self.state.coordEpoch) or 0
+            profile._pendingRCLootCouncilIntegration = nil
+            profile._rcConfigDirty = nil
+            epoch = tonumber(self.state.coordEpoch) or 0
+        end
         local payload = {
             sessionId = self.state.sessionId,
             profileId = profileId,
             coordinator = self.state.coordinator,
-            coordEpoch = self.state.coordEpoch,
-            seq = nextSeq,
+            coordEpoch = epoch,
+            seq = seq,
             rcLootCouncilIntegration = config,
         }
         local sent = SF.LootHelperComm:Send(
@@ -532,7 +665,7 @@ function Sync:PublishRCIntegrationConfig(profileId)
             return false, "send failed"
         end
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "RC_CONFIG_SET seq=%s epoch=%s profile=%s", tostring(nextSeq), tostring(payload.coordEpoch), tostring(profileId))
+            SF.Debug:Verbose("SYNC", "RC_CONFIG_SET seq=%s epoch=%s profile=%s replay=%s", tostring(seq), tostring(payload.coordEpoch), tostring(profileId), tostring(opts.replay == true))
         end
         return true, payload
     end
