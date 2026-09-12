@@ -1110,16 +1110,18 @@ function Sync:HandleRCConfigRequest(sender, payload)
     if not ok then
         return
     end
-    if not self:IsSenderAuthorized(self.state.profileId, sender) then
-        return
-    end
     if self.IsRequesterInGroup and not self:IsRequesterInGroup(sender) then
         return
     end
     if payload.catchUp == true then
+        -- Replay is not a proposal. Ordinary in-group peers may request the
+        -- current accepted SET when a session descriptor omitted the blob.
         if self.PublishRCIntegrationConfig then
             self:PublishRCIntegrationConfig(self.state.profileId, { replay = true })
         end
+        return
+    end
+    if not self:IsSenderAuthorized(self.state.profileId, sender) then
         return
     end
     local cfg = CopyRCConfigFromPayload(payload.rcLootCouncilIntegration)
