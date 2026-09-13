@@ -2907,6 +2907,11 @@ function LootProfile:_InsertLog(lootLog, opts)
             and Identity.FanOutBalance and Identity.FanOutBalance(self, lootLog)
         then
             -- Cached identity totals were updated in O(identity size).
+        elseif appendedInOrder
+            and Identity.CanFanOutItemAware and Identity.CanFanOutItemAware(eventType)
+            and Identity.FanOutItemAware and Identity.FanOutItemAware(self, lootLog)
+        then
+            -- Cached item-aware projection was updated from the appended log.
         else
             self:ApplyIdentityProjection({ force = true })
         end

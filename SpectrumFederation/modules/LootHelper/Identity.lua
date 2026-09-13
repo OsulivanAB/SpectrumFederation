@@ -1615,6 +1615,18 @@ function Identity.CanFanOutBalance(eventType)
         or eventType == (EventTypes().ATTENDANCE_CHANGE)
 end
 
+-- In-order item-aware logs mutate BiS/spec derived state without changing
+-- identity partition or armor occupancy. Full replay remains the fallback
+-- when there is no current projection or the append is out of order.
+function Identity.CanFanOutItemAware(eventType)
+    return eventType == (EventTypes().RC_LOOT_COUNCIL)
+        or eventType == (EventTypes().SPEC_CHANGE)
+        or eventType == (EventTypes().BIS_OUTCOME)
+        or eventType == (EventTypes().BIS_OVERRIDE)
+        or eventType == (EventTypes().MANUAL_AWARD)
+        or eventType == (EventTypes().MANUAL_AWARD_REVERSE)
+end
+
 function Identity.ComponentHasOverflow(result, memberId)
     if type(result) ~= "table" or type(result.identityOf) ~= "table" then
         return false
@@ -1720,11 +1732,57 @@ function Identity.RequiresProfileRebuild(eventType)
     if Identity.CanFanOutBalance(eventType) then
         return false
     end
+    if Identity.CanFanOutItemAware and Identity.CanFanOutItemAware(eventType) then
+        return false
+    end
     return Identity.AffectsProjection(eventType)
         or eventType == (EventTypes().LOOT_MODE_CHANGE)
         or eventType == (EventTypes().REWARD_POT_CONFIG_CHANGE)
         or eventType == (EventTypes().REWARD_POT_CHANGE)
         or eventType == (EventTypes().PROFILE_NAME_CHANGE)
+end
+
+local function RefreshBisDerived(result)
+    if type(result) ~= "table" then
+        return
+    end
+    local bisState = result.bis and result.bis.state
+    local identityOf = result.identityOf or {}
+    local armor = result.armor or {}
+    local specs = (bisState and bisState.specs) or result.specs or {}
+    local slotsByMember, poolByMember = {}, {}
+    if bisState and SF.LootHelperBis and SF.LootHelperBis.BuildMemberSlotMap then
+        slotsByMember, poolByMember = SF.LootHelperBis.BuildMemberSlotMap(bisState, identityOf)
+        for memberId, armorMap in pairs(armor) do
+            local slots = slotsByMember[memberId]
+            if type(slots) ~= "table" then
+                slots = {}
+                slotsByMember[memberId] = slots
+            end
+            for slot, used in pairs(armorMap) do
+                if used then
+                    local cell = slots[slot]
+                    if not cell or not cell.state or cell.state == "AVAILABLE" then
+                        slots[slot] = { state = "LEGACY_UNKNOWN" }
+                    end
+                end
+            end
+        end
+        if SF.LootHelperBis.LegacyOriginsForDisplay then
+            local originsByMember = {}
+            for memberId in pairs(identityOf) do
+                originsByMember[memberId] = SF.LootHelperBis.LegacyOriginsForDisplay(bisState, memberId, identityOf)
+            end
+            bisState.legacyOriginsByMember = originsByMember
+        end
+    end
+    result.specs = specs
+    result.bis = result.bis or {}
+    result.bis.state = bisState
+    result.bis.slotsByMember = slotsByMember
+    result.bis.poolByMember = poolByMember
+    result.bis.legacyOriginsByMember = bisState and bisState.legacyOriginsByMember
+    result.bis.hasItemAwareEvents = bisState and bisState.hasItemAwareEvents == true
 end
 
 function Identity.Replay(logs, opts)
@@ -2099,9 +2157,6 @@ function Identity.Replay(logs, opts)
     table.sort(simulatedList)
 
     causalRank = nil
-    local specs = {}
-    local slotsByMember = {}
-    local poolByMember = {}
     local bisStateOut = bisState
     if bisState and SF.LootHelperBis then
         local originMap = {}
@@ -2120,45 +2175,15 @@ function Identity.Replay(logs, opts)
             bisState.occupancyOrigins = originMap
         end
     end
-    if bisState and SF.LootHelperBis and SF.LootHelperBis.BuildMemberSlotMap then
-        specs = bisState.specs or {}
-        slotsByMember, poolByMember = SF.LootHelperBis.BuildMemberSlotMap(bisState, identityOf)
-        for memberId, armorMap in pairs(armor) do
-            local slots = slotsByMember[memberId]
-            if type(slots) ~= "table" then
-                slots = {}
-                slotsByMember[memberId] = slots
-            end
-            for slot, used in pairs(armorMap) do
-                if used then
-                    local cell = slots[slot]
-                    if not cell or not cell.state or cell.state == "AVAILABLE" then
-                        slots[slot] = { state = "LEGACY_UNKNOWN" }
-                    end
-                end
-            end
-        end
-        if SF.LootHelperBis.LegacyOriginsForDisplay then
-            local originsByMember = {}
-            for memberId in pairs(identityOf) do
-                originsByMember[memberId] = SF.LootHelperBis.LegacyOriginsForDisplay(bisState, memberId, identityOf)
-            end
-            bisState.legacyOriginsByMember = originsByMember
-        end
-    end
-    return {
+    local result = {
         members = members,
         identityOf = identityOf,
         points = points,
         attendance = attendance,
         armor = armor,
-        specs = specs,
+        specs = (bisStateOut and bisStateOut.specs) or {},
         bis = {
             state = bisStateOut,
-            slotsByMember = slotsByMember,
-            poolByMember = poolByMember,
-            legacyOriginsByMember = bisStateOut and bisStateOut.legacyOriginsByMember,
-            hasItemAwareEvents = bisStateOut and bisStateOut.hasItemAwareEvents == true,
         },
         localArmor = localArmor,
         simulatedAdmins = simulated,
@@ -2171,7 +2196,10 @@ function Identity.Replay(logs, opts)
         overflowKeysByIdentity = overflowKeysByIdentity,
         overflowCountsByIdentity = overflowCountsByIdentity,
         partition = partition,
+        bisAppendRank = #ordered,
     }
+    RefreshBisDerived(result)
+    return result
 end
 
 function Identity.ComponentMembers(logs, memberId, result)
@@ -2259,6 +2287,80 @@ function Identity.FanOutBalance(profile, lootLog)
                 member.attendanceBalance = displayed
             end
         end
+    end
+    return true
+end
+
+function Identity.FanOutItemAware(profile, lootLog)
+    if type(profile) ~= "table" or type(lootLog) ~= "table" then
+        return false
+    end
+    local result = profile._identityProjection
+    if type(result) ~= "table" or type(result.identityOf) ~= "table" then
+        return false
+    end
+    local eventType = GetLogType(lootLog)
+    if not Identity.CanFanOutItemAware(eventType) then
+        return false
+    end
+    local Bis = SF.LootHelperBis
+    if not (Bis and Bis.ApplyLog) then
+        return false
+    end
+    result.bis = result.bis or {}
+    local bisState = result.bis.state
+    if not bisState and Bis.NewState then
+        bisState = Bis.NewState()
+        result.bis.state = bisState
+    end
+    if not bisState then
+        return false
+    end
+    local rank = (tonumber(result.bisAppendRank) or #(result.orderedLogs or {})) + 1
+    Bis.ApplyLog(bisState, lootLog, {
+        rank = rank,
+        FindLog = function(id)
+            if type(id) ~= "string" or id == "" then
+                return nil
+            end
+            if profile._logById then
+                return profile._logById[id]
+            end
+            return nil
+        end,
+        GetIdentityMembers = function(memberId)
+            memberId = NormalizeId(memberId)
+            return (memberId and result.identityOf[memberId]) or { memberId }
+        end,
+        GetContributingOrigin = function(originId)
+            return bisState.occupancyOrigins and bisState.occupancyOrigins[originId]
+        end,
+        MemberClass = function(memberId)
+            memberId = NormalizeId(memberId)
+            local member = profile.getMemberByID and profile:getMemberByID(memberId)
+            if member and member.GetClass then
+                return member:GetClass()
+            end
+            return member and member.class
+        end,
+        SlotOccupied = function(memberId, slot)
+            memberId = NormalizeId(memberId)
+            if not memberId or type(slot) ~= "string" then
+                return false
+            end
+            local armor = result.armor and result.armor[memberId]
+            return armor and armor[slot] == true
+        end,
+    })
+    result.bisAppendRank = rank
+    if type(result.orderedLogs) == "table" then
+        result.orderedLogs[#result.orderedLogs + 1] = lootLog
+    end
+    RefreshBisDerived(result)
+    if Identity.WriteProjection then
+        Identity.WriteProjection(profile, result)
+    else
+        profile._identityProjection = result
     end
     return true
 end
