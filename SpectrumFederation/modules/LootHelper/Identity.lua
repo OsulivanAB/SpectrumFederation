@@ -2291,6 +2291,38 @@ function Identity.FanOutBalance(profile, lootLog)
     return true
 end
 
+-- Replay calls ensureLocal for item-aware members so they appear in
+-- identityOf even when they had no prior identity/armor/points logs.
+-- Incremental append must do the same or roster-only characters get an
+-- award in bis.state.awards with no poolByMember/slotsByMember entry.
+local function EnsureProjectionMember(result, memberId)
+    memberId = NormalizeId(memberId)
+    if not memberId or type(result) ~= "table" or type(result.identityOf) ~= "table" then
+        return
+    end
+    if result.identityOf[memberId] then
+        return
+    end
+    result.identityOf[memberId] = { memberId }
+    result.members = result.members or {}
+    result.members[#result.members + 1] = memberId
+    result.armor = result.armor or {}
+    if type(result.armor[memberId]) ~= "table" then
+        result.armor[memberId] = EmptyArmor()
+    end
+    result.points = result.points or {}
+    if result.points[memberId] == nil then
+        result.points[memberId] = 0
+    end
+    result.attendance = result.attendance or {}
+    if result.attendance[memberId] == nil then
+        result.attendance[memberId] = 0
+    end
+    if result.partition then
+        EnsureMember(result.partition, memberId)
+    end
+end
+
 function Identity.FanOutItemAware(profile, lootLog)
     if type(profile) ~= "table" or type(lootLog) ~= "table" then
         return false
@@ -2307,6 +2339,17 @@ function Identity.FanOutItemAware(profile, lootLog)
     if not (Bis and Bis.ApplyLog) then
         return false
     end
+    local data = GetLogData(lootLog)
+    local types = EventTypes()
+    local touchId
+    if eventType == types.SPEC_CHANGE or eventType == types.RC_LOOT_COUNCIL or eventType == types.MANUAL_AWARD then
+        touchId = data and data.member
+    elseif eventType == types.BIS_OUTCOME then
+        touchId = data and data.awardMember
+    elseif eventType == types.BIS_OVERRIDE then
+        touchId = data and data.viewMember
+    end
+    EnsureProjectionMember(result, touchId)
     result.bis = result.bis or {}
     local bisState = result.bis.state
     if not bisState and Bis.NewState then

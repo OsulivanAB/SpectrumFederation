@@ -3034,6 +3034,19 @@ local function reviewFindingTests()
         live = fp(p)
         p:ApplyIdentityProjection({ force = true })
         assertEq(fp(p), live, "full replay matches live CLEAR projection")
+
+        resetEnv()
+        local roster = makeProfile("RosterOnlyFanOut")
+        addMember(roster, ALT_A)
+        roster:ApplyIdentityProjection({ force = true })
+        SF.LootHelperIdentity.replayCount = 0
+        assertTrue(roster:AddManualAward(ALT_A, itemLink(19001, "Helm")), "roster-only live manual records")
+        assertEq(SF.LootHelperIdentity.replayCount, 0, "roster-only live manual does not full-replay")
+        local pool = roster:GetIdentityAwardPool(ALT_A) or {}
+        assertTrue(#pool >= 1, "live manual appears in award pool without prior identity logs")
+        local livePool = #pool
+        roster:ApplyIdentityProjection({ force = true })
+        assertEq(#(roster:GetIdentityAwardPool(ALT_A) or {}), livePool, "full replay keeps roster-only live manual pool")
     end
     liveAppendMatchesReplay()
 
