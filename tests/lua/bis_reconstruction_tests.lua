@@ -3001,6 +3001,42 @@ local function reviewFindingTests()
     end
     recordingOffManualFallback()
 
+    local function liveAppendMatchesReplay()
+        local function fp(profile)
+            local board = profile:GetIdentityBisSlots(ALT_A) or {}
+            local head = board.Head or {}
+            return string.format("%s/%s/%s/%s",
+                tostring(head.state),
+                tostring((board.Back and board.Back.state) or "AVAILABLE"),
+                tostring(head.assignmentId or ""),
+                tostring((board.Back and board.Back.assignmentId) or ""))
+        end
+        resetEnv()
+        local p = makeProfile("LiveAppendEq")
+        addMember(p, ALT_A)
+        assertTrue(p:AddRCLootCouncilBisResponse("Need"))
+        assertTrue(p:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19001, "Need", tostring(GetServerTime()))))
+        p:ApplyIdentityProjection({ force = true })
+        SF.LootHelperIdentity.replayCount = 0
+        assertTrue(p:TryAddRCLootCouncilAward(makeCanonical(ALT_A, 19007, "Need", tostring(GetServerTime()))), "live Back award records")
+        assertEq(SF.LootHelperIdentity.replayCount, 0, "live award does not full-replay cached history")
+        assertEq(slotState(p, ALT_A, "Head"), "ASSIGNED_AUTO", "Head stays AUTO after live Back award")
+        assertEq(slotState(p, ALT_A, "Back"), "ASSIGNED_AUTO", "live Back award occupies Back")
+        local live = fp(p)
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(fp(p), live, "full replay matches live award projection")
+        local headId = p:GetIdentityBisSlots(ALT_A).Head.assignmentId
+        SF.LootHelperIdentity.replayCount = 0
+        assertTrue(p:ApplyBisOverride("CLEAR", { viewMember = ALT_A, targetAssignmentId = headId }), "live CLEAR Head")
+        assertEq(SF.LootHelperIdentity.replayCount, 0, "live CLEAR does not full-replay cached history")
+        assertEq(slotState(p, ALT_A, "Head"), "AVAILABLE", "CLEAR leaves Head available")
+        assertEq(slotState(p, ALT_A, "Back"), "ASSIGNED_AUTO", "CLEAR Head does not drop Back")
+        live = fp(p)
+        p:ApplyIdentityProjection({ force = true })
+        assertEq(fp(p), live, "full replay matches live CLEAR projection")
+    end
+    liveAppendMatchesReplay()
+
     local function mainHandOnlyOffHand()
         resetEnv()
         local mhLink = itemLink(19023, "MainHand")

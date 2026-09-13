@@ -547,6 +547,76 @@ local function setupProfile(count)
     return profile, created
 end
 
+local function fingerprintProjection(profile)
+    local result = profile:GetIdentityProjection()
+    local state = result and result.bis and result.bis.state
+    local parts = {}
+    local function addBoard(memberId)
+        local slots = result and result.bis and result.bis.slotsByMember and result.bis.slotsByMember[memberId] or {}
+        local keys = {}
+        for key in pairs(slots) do
+            keys[#keys + 1] = key
+        end
+        table.sort(keys)
+        for i = 1, #keys do
+            local cell = slots[keys[i]] or {}
+            parts[#parts + 1] = string.format("%s.%s=%s/%s/%s", memberId, keys[i],
+                tostring(cell.state), tostring(cell.assignmentId or ""), tostring(cell.itemString or ""))
+        end
+    end
+    addBoard(ALT_A)
+    addBoard(ALT_B)
+    local ids = {}
+    for id in pairs((state and state.assignments) or {}) do
+        ids[#ids + 1] = id
+    end
+    table.sort(ids)
+    for i = 1, #ids do
+        local asg = state.assignments[ids[i]]
+        parts[#parts + 1] = string.format("asg:%s:%s:%s", ids[i], tostring(asg.active), tostring(asg.source))
+    end
+    local winners = {}
+    for key in pairs((state and state.outcomeWinner) or {}) do
+        winners[#winners + 1] = key
+    end
+    table.sort(winners)
+    parts[#parts + 1] = "ow=" .. table.concat(winners, ",")
+    local reversed = {}
+    for key in pairs((state and state.reversedManual) or {}) do
+        reversed[#reversed + 1] = key
+    end
+    table.sort(reversed)
+    parts[#parts + 1] = "rev=" .. table.concat(reversed, ",")
+    return table.concat(parts, ";")
+end
+
+local function replayCount()
+    return (Identity and Identity.replayCount) or 0
+end
+
+local function resetReplayCount()
+    if Identity then
+        Identity.replayCount = 0
+    end
+end
+
+local function firstAssignmentId(profile)
+    local board = profile:GetIdentityBisSlots(ALT_A) or {}
+    local order = { "Head", "Chest", "Ring1", "Ring2", "Neck", "Back" }
+    for i = 1, #order do
+        local cell = board[order[i]]
+        if cell and cell.assignmentId then
+            return cell.assignmentId
+        end
+    end
+    for _, cell in pairs(board) do
+        if type(cell) == "table" and cell.assignmentId then
+            return cell.assignmentId
+        end
+    end
+    return nil
+end
+
 local function measureSize(count)
     local profile, created = setupProfile(count)
     local logs = profile:GetLootLogs()
@@ -566,25 +636,40 @@ local function measureSize(count)
     local cachedS = clock() - t1
     assertTrue(type(board) == "table", "cached board read returned slots for " .. tostring(count))
 
+    -- Generated history uses 1700002000+index. Live RC ids parse as
+    -- 1700090000+count. Advance the stub clock so BIS_OUTCOME and CLEAR
+    -- append after both, matching production GetServerTime() >= last log.
+    NOW = math.max(NOW, 1700002000 + count, 1700090000 + count) + 10
     local liveCanon = SF.LootLog.BuildRCLootCouncilCanonical(PLAYER, ALT_A, {
         lootWon = itemLink(19010, "Helm2"),
         response = "Need",
-        id = tostring(1700090000 + count) .. "-7",
+        id = tostring(GetServerTime()) .. "-7",
         owner = ALT_A,
     })
     liveCanon.equipLoc = "INVTYPE_HEAD"
+    resetReplayCount()
     local t2 = clock()
     local awarded = profile:TryAddRCLootCouncilAward(liveCanon)
     local awardS = clock() - t2
+    local awardReplays = replayCount()
     assertTrue(awarded, "representative live award processed for " .. tostring(count))
+    assertTrue(awardReplays == 0, "live award did not full-replay history for " .. tostring(count) .. " (replays=" .. tostring(awardReplays) .. ")")
+    local liveAwardFp = fingerprintProjection(profile)
+    profile:ApplyIdentityProjection({ force = true })
+    assertTrue(liveAwardFp == fingerprintProjection(profile), "live award matches clean full replay for " .. tostring(count))
 
-    local assignmentId = profile:GetIdentityBisSlots(ALT_A) and profile:GetIdentityBisSlots(ALT_A).Head and profile:GetIdentityBisSlots(ALT_A).Head.assignmentId
+    local assignmentId = firstAssignmentId(profile)
+    resetReplayCount()
     local t3 = clock()
     if assignmentId then
         profile:ApplyBisOverride("CLEAR", { viewMember = ALT_A, targetAssignmentId = assignmentId })
     end
-    profile:ApplyIdentityProjection({ force = true })
     local correctionS = clock() - t3
+    local correctionReplays = replayCount()
+    assertTrue(correctionReplays == 0, "live correction did not full-replay history for " .. tostring(count) .. " (replays=" .. tostring(correctionReplays) .. ")")
+    local liveCorrectionFp = fingerprintProjection(profile)
+    profile:ApplyIdentityProjection({ force = true })
+    assertTrue(liveCorrectionFp == fingerprintProjection(profile), "live correction matches clean full replay for " .. tostring(count))
 
     profile._identityProjection = nil
     local t4 = clock()
