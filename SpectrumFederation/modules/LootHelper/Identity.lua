@@ -2323,6 +2323,59 @@ local function EnsureProjectionMember(result, memberId)
     end
 end
 
+-- Incremental apply is only safe when CompareLogs order matches causal
+-- OrderLogs order: every sourceLogId / sourceLogIds / targetAssignmentId
+-- predecessor is already stored, and no already-stored log waits on this
+-- one. Otherwise ApplyLog can no-op (missing RC source) and a later
+-- in-order predecessor will not re-reduce the dependent log.
+local function CollectCausalSourceIds(data, out)
+    out = out or {}
+    local function add(id)
+        if type(id) == "string" and id ~= "" then
+            out[#out + 1] = id
+        end
+    end
+    add(data and data.sourceLogId)
+    add(data and data.targetAssignmentId)
+    local list = data and data.sourceLogIds
+    if type(list) == "table" then
+        for i = 1, #list do
+            add(list[i])
+        end
+    end
+    return out
+end
+
+local function ItemAwareFanOutSafe(profile, lootLog)
+    local byId = profile and profile._logById
+    if type(byId) ~= "table" then
+        return false
+    end
+    local preds = CollectCausalSourceIds(GetLogData(lootLog))
+    for i = 1, #preds do
+        if not byId[preds[i]] then
+            return false
+        end
+    end
+    local selfId = GetLogId(lootLog)
+    if type(selfId) ~= "string" or selfId == "" then
+        return false
+    end
+    local logs = profile._lootLogs or {}
+    for i = 1, #logs do
+        local other = logs[i]
+        if other ~= lootLog then
+            local deps = CollectCausalSourceIds(GetLogData(other))
+            for j = 1, #deps do
+                if deps[j] == selfId then
+                    return false
+                end
+            end
+        end
+    end
+    return true
+end
+
 function Identity.FanOutItemAware(profile, lootLog)
     if type(profile) ~= "table" or type(lootLog) ~= "table" then
         return false
@@ -2333,6 +2386,9 @@ function Identity.FanOutItemAware(profile, lootLog)
     end
     local eventType = GetLogType(lootLog)
     if not Identity.CanFanOutItemAware(eventType) then
+        return false
+    end
+    if not ItemAwareFanOutSafe(profile, lootLog) then
         return false
     end
     local Bis = SF.LootHelperBis

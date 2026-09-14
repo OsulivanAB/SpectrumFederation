@@ -3036,6 +3036,30 @@ local function reviewFindingTests()
         assertEq(fp(p), live, "full replay matches live CLEAR projection")
 
         resetEnv()
+        local causal = makeProfile("FanOutCausalPred")
+        addMember(causal, ALT_A)
+        assertTrue(causal:AddRCLootCouncilBisResponse("Need"))
+        causal:ApplyIdentityProjection({ force = true })
+        local tOut = GetServerTime() + 50
+        local lateCanon = makeCanonical(ALT_A, 19007, "Need", tostring(tOut + 100))
+        addLog(causal, SF.LootLogEventTypes.BIS_OUTCOME, withFrozen({
+            sourceLogId = lateCanon.awardKey,
+            awardKey = lateCanon.awardKey,
+            awardMember = ALT_A,
+            qualified = true,
+            outcome = "ASSIGNED",
+            assignedSlots = { "Back" },
+            slotBinding = "BOUND",
+            assignmentScopeMembers = { ALT_A },
+        }, 19007), { timestamp = tOut })
+        assertEq(slotState(causal, ALT_A, "Back"), "AVAILABLE", "outcome without RC source does not occupy Back")
+        insertRC(causal, lateCanon)
+        assertEq(slotState(causal, ALT_A, "Back"), "ASSIGNED_AUTO", "later in-order RC replays waiting outcome")
+        local causalLive = slotState(causal, ALT_A, "Back")
+        causal:ApplyIdentityProjection({ force = true })
+        assertEq(slotState(causal, ALT_A, "Back"), causalLive, "full replay matches causal fallback board")
+
+        resetEnv()
         local roster = makeProfile("RosterOnlyFanOut")
         addMember(roster, ALT_A)
         roster:ApplyIdentityProjection({ force = true })
