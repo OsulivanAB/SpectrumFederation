@@ -568,9 +568,9 @@ function Sync:HandleNewLog(sender, payload)
     local hasGap, gapFrom, gapTo = self:DetectGap(profileId, logTable)
 
     -- Apply a single live log through the profile insert path so in-order
-    -- point/Attendance fan-out matches local writes. Do not use the batch
-    -- merge+rebuild path for every Raid Check award. Relationship logs were
-    -- already strictly deserialized above.
+    -- point/Attendance and item-aware fan-out matches local writes. Do not
+    -- use the batch merge+rebuild path for every Raid Check award.
+    -- Relationship logs were already strictly deserialized above.
     if not isRelationship then
         if SF.LootLog and SF.LootLog.FromTable and getmetatable(logTable) ~= SF.LootLog then
             lootLog = select(1, SF.LootLog.FromTable(logTable, { allowUnknownEventType = true }))

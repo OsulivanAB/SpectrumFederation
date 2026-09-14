@@ -75,6 +75,15 @@ function Sync:BuildAdminStatus(profileId)
     status.hasProfile = true
     status.authorMax = profile:ComputeAuthorMax() or {}
     status.authorWindowSummary = self:ComputeAuthorWindowSummary(profileId) or {}
+    -- Advertise the accepted blob only. Unpublished out-of-session drafts must
+    -- not impersonate this (epoch, seq). rcConfigDirty tells START convergence
+    -- to ignore this status as an accepted-generation source.
+    status.rcConfigSeq = math.floor(tonumber(profile._rcConfigSeq) or 0)
+    status.rcConfigEpoch = math.floor(tonumber(profile._rcConfigEpoch) or 0)
+    status.rcConfigDirty = profile._rcConfigDirty == true
+    if profile.GetRCLootCouncilIntegrationConfig then
+        status.rcLootCouncilIntegration = profile:GetRCLootCouncilIntegrationConfig()
+    end
 
     -- hasGaps heuristic: is the logical SameAuthor sequence missing a counter?
     -- Historical alias continuation (owner-Garona:1..6 + Owner-Garona:7) is
@@ -283,6 +292,12 @@ function Sync:HandleSessionReannounce(sender, payload)
     end
     self.state.authorWindowSummary = (type(payload.authorWindowSummary) == "table") and payload.authorWindowSummary or {}
     self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
+    if self._RememberAdvertisedRCConfigGeneration then
+        self:_RememberAdvertisedRCConfigGeneration(payload)
+    end
+    if self._ApplyAdvertisedRCConfig then
+        self:_ApplyAdvertisedRCConfig(payload)
+    end
 
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
@@ -442,6 +457,12 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     if type(payload.authorWindowSummary) == "table" then
         self.state.authorWindowSummary = payload.authorWindowSummary
     end
+    if self._RememberAdvertisedRCConfigGeneration then
+        self:_RememberAdvertisedRCConfigGeneration(payload)
+    end
+    if self._ApplyAdvertisedRCConfig then
+        self:_ApplyAdvertisedRCConfig(payload)
+    end
 
     -- Heartbeat bookkeeping
     self.state.heartbeat = self.state.heartbeat or {}
@@ -542,6 +563,10 @@ function Sync:HandleSessionHeartbeat(sender, payload)
                     reason = "heartbeat-integrity",
                     preferredTarget = sender,
                 })
+            end
+
+            if self._CatchUpRCConfigIfNeeded then
+                self:_CatchUpRCConfigIfNeeded(profile, "heartbeat-rc-config")
             end
         end
     end
@@ -645,6 +670,9 @@ end
 function Sync:HandleHaveProfile(sender, payload)
     self:_RecordHandshakeReply(sender, payload, "HAVE_PROFILE")
     self:_HandlePeerIntegrityAdvertisement(sender, payload)
+    if self._ConsiderJoinAcceptedRCConfig then
+        self:_ConsiderJoinAcceptedRCConfig(sender, payload)
+    end
 end
 
 -- Function Handle NEED_PROFILE as a helper/coordinator: respond with PROFILE_SNAPSHOT (bulk).
@@ -781,8 +809,13 @@ function Sync:HandleNeedLogs(sender, payload)
     self:_RecordHandshakeReply(sender, payload, "NEED_LOGS")
     self:_HandlePeerIntegrityAdvertisement(sender, payload)
 
-    -- Coordinator handshake visibility without forcing a data response
+    -- Coordinator handshake visibility without forcing a data response.
+    -- Join-status NEED_LOGS still carries accepted RC metadata; log-complete
+    -- HAVE_PROFILE is not required before adopting a newer accepted generation.
     if payload.statusOnly == true then
+        if self._ConsiderJoinAcceptedRCConfig then
+            self:_ConsiderJoinAcceptedRCConfig(sender, payload)
+        end
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedLogs: statusOnly, not serving data (sender=%s)", tostring(sender))
         end
@@ -1057,5 +1090,167 @@ function Sync:_RecordHandshakeReply(sender, payload, status)
     -- Track in handshake table too
     if self.state.handshake and self.state.handshake.replies then
         self.state.handshake.replies[sender] = status
+    end
+end
+
+local function CopyRCConfigFromPayload(src)
+    if type(src) ~= "table" then
+        return nil
+    end
+    return {
+        recordAwards = src.recordAwards,
+        recordAllAwardTypes = src.recordAllAwardTypes,
+        allowedResponses = src.allowedResponses,
+        bisResponses = src.bisResponses,
+    }
+end
+
+-- Function Handle RC_CONFIG_REQ as coordinator: accept config-only RC settings
+-- from an authorized admin, then broadcast RC_CONFIG_SET.
+-- Extra payload keys (snapshot, meta, owner, logs) are ignored.
+-- @param sender string "Name-Realm"
+-- @param payload table {sessionId, profileId, rcLootCouncilIntegration}
+-- @return nil
+function Sync:HandleRCConfigRequest(sender, payload)
+    if not (self.state and self.state.active and self.state.isCoordinator) then
+        return
+    end
+    if type(payload) ~= "table" then
+        return
+    end
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then
+        return
+    end
+    if self.IsRequesterInGroup and not self:IsRequesterInGroup(sender) then
+        return
+    end
+    if payload.catchUp == true then
+        -- Replay is not a proposal. Ordinary in-group peers may request the
+        -- current accepted SET when a session descriptor omitted the blob.
+        if self.PublishRCIntegrationConfig then
+            self:PublishRCIntegrationConfig(self.state.profileId, { replay = true })
+        end
+        return
+    end
+    if not self:IsSenderAuthorized(self.state.profileId, sender) then
+        return
+    end
+    local cfg = CopyRCConfigFromPayload(payload.rcLootCouncilIntegration)
+    if not cfg then
+        return
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if not profile or not profile.ApplyRCLootCouncilIntegrationConfig then
+        return
+    end
+    local applied = profile:ApplyRCLootCouncilIntegrationConfig(cfg, {
+        skipPermission = true,
+        skipSync = true,
+    })
+    if not applied then
+        return
+    end
+    if self.PublishRCIntegrationConfig then
+        self:PublishRCIntegrationConfig(self.state.profileId)
+    end
+end
+
+-- Function Handle RC_CONFIG_SET as a session member: apply coordinator-authored
+-- RC configuration. Live `coordEpoch` admits the control message; accepted
+-- generation is `rcConfigEpoch` (falling back to `coordEpoch` on older SET).
+-- Older generations are ignored. Equal generations still apply when the
+-- receiver is dirty/unpublished or the accepted blob differs, so a replay of
+-- the coordinator's stored (epoch, seq) cannot leave a divergent blob.
+-- @param sender string "Name-Realm"
+-- @param payload table {sessionId, profileId, seq, rcLootCouncilIntegration, coordinator?, coordEpoch?, rcConfigEpoch?}
+-- @return nil
+function Sync:HandleRCConfigSet(sender, payload)
+    if not (self.state and self.state.active) then
+        return
+    end
+    if type(payload) ~= "table" then
+        return
+    end
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then
+        return
+    end
+    if type(self.state.coordinator) ~= "string" or self.state.coordinator == "" then
+        return
+    end
+    if not self:_SamePlayer(sender, self.state.coordinator) then
+        return
+    end
+    if type(payload.coordinator) == "string" and payload.coordinator ~= "" then
+        if not self:_SamePlayer(sender, payload.coordinator) then
+            return
+        end
+    end
+    if not self:IsControlMessageAllowed(payload, sender) then
+        return
+    end
+    local me = self._SelfId and self:_SelfId() or nil
+    if me and self:_SamePlayer(sender, me) then
+        return
+    end
+    local seq = tonumber(payload.seq)
+    if not seq then
+        return
+    end
+    seq = math.floor(seq)
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if not profile or not profile.ApplyRCLootCouncilIntegrationConfig then
+        return
+    end
+    local current = tonumber(profile._rcConfigSeq) or 0
+    local localEpoch = tonumber(profile._rcConfigEpoch) or 0
+    local incomingEpoch = tonumber(payload.rcConfigEpoch)
+    if incomingEpoch == nil then
+        incomingEpoch = tonumber(payload.coordEpoch) or 0
+    end
+    local cfg = CopyRCConfigFromPayload(payload.rcLootCouncilIntegration)
+    if not cfg then
+        return
+    end
+    local LootProfile = SF.LootProfile
+    local isNewer = true
+    local isOlder = false
+    if LootProfile and LootProfile.IsNewerRCConfigGeneration then
+        isNewer = LootProfile.IsNewerRCConfigGeneration(incomingEpoch, seq, localEpoch, current)
+        if LootProfile.IsOlderRCConfigGeneration then
+            isOlder = LootProfile.IsOlderRCConfigGeneration(incomingEpoch, seq, localEpoch, current)
+        end
+    else
+        isNewer = seq > current
+        isOlder = seq < current
+    end
+    if isOlder then
+        return
+    end
+    if not isNewer then
+        local unpublished = profile._rcConfigDirty == true or type(profile._pendingRCLootCouncilIntegration) == "table"
+        local accepted = profile.GetRCLootCouncilIntegrationConfig and profile:GetRCLootCouncilIntegrationConfig() or nil
+        local same = LootProfile and LootProfile.RCLootCouncilIntegrationConfigsEqual
+            and LootProfile.RCLootCouncilIntegrationConfigsEqual(accepted, cfg)
+        if not unpublished and same then
+            return
+        end
+    end
+    local applied = profile:ApplyRCLootCouncilIntegrationConfig(cfg, {
+        skipPermission = true,
+        skipSync = true,
+    })
+    if not applied then
+        return
+    end
+    profile._rcConfigSeq = seq
+    profile._rcConfigEpoch = incomingEpoch
+    profile._rcConfigDirty = nil
+    profile._pendingRCLootCouncilIntegration = nil
+    self.state.rcConfigSeq = seq
+    self.state._rcConfigCatchUpInFlight = nil
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Applied RC_CONFIG_SET seq=%s from %s", tostring(seq), tostring(sender))
     end
 end

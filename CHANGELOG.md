@@ -2,6 +2,24 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.2-beta.1] - 2026-09-11
+
+### Added
+- Item-aware BiS tracking for RC Loot Council awards, including frozen `BIS_OUTCOME` rows (`NOT_BIS`, `ASSIGNED`, `OVERFLOW`, `UNRESOLVED`)
+- Sequential `SPEC_CHANGE`, `BIS_OVERRIDE`, `MANUAL_AWARD`, and `MANUAL_AWARD_REVERSE` loot-log events
+- Gear Override on **Loot Helper → Character**, including persistent spec, assign/clear/replace, legacy association, and manual loot add/reverse
+- `sourceLogIds` and `targetAssignmentId` causal predecessor edges in `Identity.OrderLogs`
+- Spec-keyed weapon compatibility and deterministic item-slot classification
+- BiS-qualifying RC response configuration, distinct from the recorded-award allow-list
+
+### Changed
+- Loot Helper sync protocol version is now 3 so protocol-2 peers cannot share item-aware BiS state
+- RC Loot Council Loot Log actions display `[Item Link] (Response)`
+- Raid equipment popup uses item icons and tooltips in item-aware mode, and a distinct Back fallback icon
+
+### Fixed
+- Back and Chest no longer share the same empty paperdoll fallback icon
+
 ## [1.5.2] - 2026-09-11
 
 ### Changed

@@ -112,6 +112,10 @@ function Sync:TryRestorePersistedSession(reason)
     self.state.coordinator = persisted.coordinator
     self.state.coordEpoch = persisted.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(persisted.coordinator, self:_SelfId())
+    do
+        local restoredProfile = self.FindLocalProfileById and self:FindLocalProfileById(persisted.profileId) or nil
+        self.state.rcConfigSeq = (restoredProfile and tonumber(restoredProfile._rcConfigSeq)) or 0
+    end
     self.state.helpers = CopyStringArray(persisted.helpers)
     self.state.authorMax = {}
     self.state.authorWindowSummary = {}
@@ -540,6 +544,9 @@ function Sync:OnGroupRosterUpdate()
         helpers     = self.state.helpers or {},
         safeMode    = self:_GetSessionSafeModePayload(),
     }
+    if self._AttachRCConfigGeneration then
+        self:_AttachRCConfigGeneration(payload, profileId)
+    end
 
     -- Find targets who are in-group but haven't been announced to for this sessionId
     local targets = {}
@@ -685,6 +692,7 @@ function Sync:StartSession(profileId, opts)
     self.state.coordinator = me
     self.state.coordEpoch = epoch
     self.state.isCoordinator = true
+    self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
     self.state._sessionAnnounced = nil
     self.state._sessionStartFailedFor = nil
     self:_PersistSessionState("StartSession")
@@ -723,6 +731,22 @@ function Sync:_ResetSessionState(reason)
             tostring(self.state.coordinator), outstandingReqCount)
     end
 
+    -- Unaccepted in-session RC proposals die with the session. Capture the
+    -- profile before session identity is cleared. Dirty out-of-session drafts
+    -- are left in place for the next starter mint / equal-generation converge.
+    do
+        local endingProfileId = self.state.profileId
+        local endingProfile = nil
+        if type(endingProfileId) == "string" and endingProfileId ~= "" and self.FindLocalProfileById then
+            endingProfile = self:FindLocalProfileById(endingProfileId)
+        end
+        if endingProfile and endingProfile.DiscardInSessionRCProposal then
+            endingProfile:DiscardInSessionRCProposal(reason or "session ended")
+        elseif endingProfile and endingProfile._rcConfigDirty ~= true then
+            endingProfile._pendingRCLootCouncilIntegration = nil
+        end
+    end
+
     -- Cancel outstanding request timers and clear requests
     if type(self.state.requests) == "table" then
         for _, req in pairs(self.state.requests) do
@@ -744,6 +768,7 @@ function Sync:_ResetSessionState(reason)
     self.state.coordinator = nil
     self.state.coordEpoch = nil
     self.state.isCoordinator = false
+    self.state.rcConfigSeq = nil
     self.state._restoredSessionNeedsReannounce = false
 
     -- Clear session metadata
@@ -907,6 +932,13 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
         newEpoch = oldEpoch + 1
     end
     self.state.coordEpoch = newEpoch
+    -- Adopt this client's last accepted RC seq so the first post-takeover
+    -- SET continues from local accepted state. Peers compare (coordEpoch, seq),
+    -- so a colliding seq after a missed SET is still accepted under the new epoch.
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if profile then
+        self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
+    end
     self:_PersistSessionState("TakeoverSession")
 
     if SF.Debug then
@@ -956,6 +988,9 @@ function Sync:ReannounceSession()
         helpers     = self.state.helpers or {},
         safeMode    = self:_GetSessionSafeModePayload(),
     }
+    if self._AttachRCConfigGeneration then
+        self:_AttachRCConfigGeneration(payload, profileId)
+    end
 
     if SF.Debug then
         local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0
