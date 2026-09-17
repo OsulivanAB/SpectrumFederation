@@ -2,6 +2,12 @@
 
 <!-- Provide a clear and concise description of what this PR accomplishes -->
 
+## Related Ticket
+
+<!-- Optional. If this PR has a related ticket, provide both its Ticket ID and a link to the ticket (for example, [ABC-123](https://example.com/tickets/ABC-123)). Leave this section blank when there is no related ticket. -->
+
+**Ticket ID:**
+
 ## Type of Change
 
 <!-- Mark the relevant option with an "x" -->
