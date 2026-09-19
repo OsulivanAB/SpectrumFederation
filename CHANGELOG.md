@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.2-beta.4] - 2026-09-19
+
+### Fixed
+- Fix WowUp and CurseForge omitting optional child addons
+
 ## [1.5.2-beta.1] - 2026-09-11
 
 ### Added
