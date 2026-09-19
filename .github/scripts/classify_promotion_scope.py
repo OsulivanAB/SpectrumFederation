@@ -33,6 +33,7 @@ DOCS_EXACT_PATHS = frozenset({"mkdocs.yml", "requirements-docs.txt"})
 DOCS_PREFIXES = ("docs/", "overrides/")
 README_PATH = "README.md"
 CHANGELOG_PATH = "CHANGELOG.md"
+PKGMETA_PATH = "pkgmeta.yaml"
 PARENT_TOC_PATH = "SpectrumFederation/SpectrumFederation.toc"
 MAX_FILES_PER_CATEGORY = 40
 STABLE_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
@@ -97,6 +98,16 @@ def is_changelog_path(path):
     return normalize_repo_path(path) == CHANGELOG_PATH
 
 
+def is_release_packaging_path(path):
+    """Return True for CurseForge/WowUp git-packaging metadata.
+
+    `pkgmeta.yaml` does not ship inside the GitHub/Wago zip, but those
+    installers rebuild from git using this file. A standalone change must
+    still validate and publish so CurseForge receives a new package.
+    """
+    return normalize_repo_path(path) == PKGMETA_PATH
+
+
 def path_category(path):
     """Return the primary classification bucket for a changed path.
 
@@ -104,7 +115,7 @@ def path_category(path):
     listing; flags are still computed independently from predicates above.
     """
     normalized = normalize_repo_path(path)
-    if is_packaged_addon_path(normalized):
+    if is_packaged_addon_path(normalized) or is_release_packaging_path(normalized):
         return "addon"
     if is_docs_path(normalized):
         return "docs"
@@ -167,7 +178,7 @@ class PromotionScope:
 
     @property
     def release_required(self):
-        """Stable addon publishing is warranted only for packaged addon changes."""
+        """Publishing is warranted for zip members or CurseForge pkgmeta changes."""
         return self.addon_changed
 
     @property
