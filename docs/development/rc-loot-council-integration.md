@@ -28,13 +28,21 @@ While a Loot Helper session is active, the page shows and edits that session pro
 
 Settings are profile-scoped and admin-editable:
 
-- **Record RC Loot Council Awards in Loot Logs** (default on)
+- **Record RC Loot Council Awards in Loot Logs** (default on) — master switch for live RCLC recording and automatic BiS outcomes. When this is off, no future RC award is recorded or treated as BiS automation. Saved BiS-response configuration is kept so it can return when recording is turned back on, but the BiS UI is inactive.
 - **Record all award types** (default on)
 - **Allowed Award Types** when record-all is off
+- **BiS-Qualifying Responses** for future automatic BiS outcomes
 
-Matching is case-insensitive after trimming. The original RC response text is stored on the Loot Log. Empty and duplicate allow-list entries are rejected.
+While recording is on, every active BiS-qualified response is always recorded; it cannot also be filtered out of the allow-list. Changing these lists never reinterprets historical `BIS_OUTCOME` rows.
 
-These settings sync with the profile snapshot as `snapshot.rcLootCouncilIntegration`, using the same profile-snapshot path as Raid Check. Changing them does not create a visible Loot Log row. Older snapshots may still carry unused `snapshot.rcLootCouncil` metadata; that field remains compatibility-only and is not the live integration.
+When RC Loot Council is available, the BiS list is filled from configured RC responses using the same identity RCLC persists in loot history:
+
+- normal responses: `isAwardReason = false`, `typeCode` from the RC button group (or `"default"`), and the actual `responseID`;
+- award reasons: `isAwardReason = true` and `responseID = reason.sort - 400`. Item/session `typeCode` is not part of award-reason identity. Array position is not assumed to equal the persisted ID.
+
+A configured contextual entry never falls back to label-only matching. Historical text-only entries (`text:need`) remain the compatibility path when RC is not loaded or when an admin types a label by hand.
+
+These settings travel on the profile snapshot as `snapshot.rcLootCouncilIntegration` for trusted full-snapshot joiners (`NEED_PROFILE` / `PROFILE_SNAPSHOT`), using the same snapshot as Raid Check. Live in-session edits do not send that full snapshot. An authorized admin proposes only the RC integration table via `RC_CONFIG_REQ` to the coordinator; the coordinator accepts one proposal at a time, assigns a monotonic session `seq` (not a wall-clock), stamps accepted generation as `(rcConfigEpoch, seq)`, and RAID-broadcasts `RC_CONFIG_SET`. Live SET also carries the live session `coordEpoch` so control admission can accept the message; catch-up `replay=true` restates the stored accepted `(rcConfigEpoch, seq)` and must not rewrite that generation as `(liveCoordEpoch, seq)`. Peers apply a SET only when the accepted generation is newer, or when the local client is unpublished/dirty or already disagrees on contents at the same generation. A later coordinator epoch still wins if `seq` collides after takeover. A non-coordinator edit is a proposal until that SET arrives. Award recording, BiS qualification, advertised session descriptors, helper `PROFILE_SNAPSHOT` export, and `ADMIN_STATUS.rcLootCouncilIntegration` use the last accepted configuration only; an unaccepted local proposal cannot change `RC_LOOT_COUNCIL` / `BIS_OUTCOME` or leak through a trusted snapshot at the current seq. Out-of-session edits on a profile that already has a non-zero accepted generation stay unpublished (`_rcConfigDirty` plus a pending copy). `ADMIN_STATUS` may set `rcConfigDirty` so START convergence never treats that draft as the accepted blob for `(rcConfigEpoch, rcConfigSeq)`. If the starter themselves edited while no session was active, `BroadcastSessionStart` mints a new generation from that unpublished proposal. If a different admin starts the next raid, the starter's accepted blob wins: dirty followers apply the advertised accepted contents even when the generation number is unchanged. Silent same-generation divergence is never left in place after session establishment. An unaccepted in-session follower proposal belongs to that session's coordinator pipeline: `EndSession`, remote `SES_END`, and `session_changed` discard it instead of converting it into `_rcConfigDirty`. Settings and award-time must agree after that session is gone; a later session must not show the dead proposal as the editable/live configuration. If `RC_CONFIG_REQ` fails to send, the in-session proposal is discarded. Ordinary admins therefore have authority over RC integration configuration only: they cannot supply `meta._owner`, `adminUsers`, members, logs, loot mode, Reward Pot, Raid Check, or equipment snapshots through this path. The change still does not create a visible Loot Log row. Frozen `BIS_OUTCOME` rows do not reinterpret from later config; the first source-consistent outcome wins. Automatic BiS evaluation uses the recipient's stored `SPEC_CHANGE` spec only, not live inspect or local player spec. Older snapshots may still carry unused `snapshot.rcLootCouncil` metadata; that field remains compatibility-only and is not the live integration. Missing `rcConfigEpoch` on older snapshots is treated as `0`.
 
 Defaults fill in for older profiles that have no stored RC configuration.
 
@@ -44,7 +52,7 @@ Recorded awards use type `RC_LOOT_COUNCIL`:
 
 - **Type of Change** — RC Loot Council
 - **Member** — loot recipient
-- **Action** — the WoW item link (hoverable and clickable in Loot Logs)
+- **Action** — `[Item Link] (Response)` (hoverable and clickable in Loot Logs)
 - **Author** — RC master looter / awarder
 - persisted audit fields include the original RC response, `history.id`, and the deterministic award key
 

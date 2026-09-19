@@ -83,6 +83,12 @@ function E:_TryHookLootProfile()
     Hook("SetLootMode",     "LP:")
     Hook("SetRewardPotConfig", "LP:")
     Hook("AdjustRewardPot", "LP:")
+    Hook("SetRCLootCouncilRecordAwards", "LP:")
+    Hook("SetRCLootCouncilRecordAllAwardTypes", "LP:")
+    Hook("AddRCLootCouncilAllowedResponse", "LP:")
+    Hook("RemoveRCLootCouncilAllowedResponse", "LP:")
+    Hook("AddRCLootCouncilBisResponse", "LP:")
+    Hook("RemoveRCLootCouncilBisResponse", "LP:")
 
     return okAny
 end

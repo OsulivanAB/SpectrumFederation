@@ -50,6 +50,7 @@ def test_child_toc_declares_parent_metadata_key():
     assert "## X-SpectrumFederation-Parent: SpectrumFederation" in child
     assert "## Group: SpectrumFederation" in child
     assert "## Dependencies: SpectrumFederation" in child
+    assert "## X-Wago-ID: BNBmnlGx" in child
     assert "SpectrumFederation_CursedSurgeTracker" not in parent
     assert "CursedSurgeTracker" not in parent
     assert "modules/UI/Settings/NavigationModel.lua" in parent

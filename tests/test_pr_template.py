@@ -205,6 +205,9 @@ def test_packaged_addon_path_uses_package_membership_not_extension():
     assert validate_pr_template.is_packaged_addon_path(
         "SpectrumFederation_CursedSurgeTracker/Tracker.lua"
     )
+    assert validate_pr_template.is_packaged_addon_path(
+        "SpectrumFederation_RCLootCouncilIntegration/Integration.lua"
+    )
     assert validate_pr_template.is_packaged_addon_path("SpectrumFederation/locale/enUS.lua")
     assert validate_pr_template.is_packaged_addon_path("SpectrumFederation/Foo.xml")
     assert validate_pr_template.is_packaged_addon_path(

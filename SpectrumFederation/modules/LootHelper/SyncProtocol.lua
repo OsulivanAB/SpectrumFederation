@@ -4,9 +4,9 @@ local addonName, SF = ...
 SF.SyncProtocol = SF.SyncProtocol or {}
 local P = SF.SyncProtocol
 
-P.PROTO_MIN     = 2
-P.PROTO_MAX     = 2
-P.PROTO_CURRENT = 2
+P.PROTO_MIN     = 3
+P.PROTO_MAX     = 3
+P.PROTO_CURRENT = 3
 
 -- Encoding constants
 P.ENC_NONE      = "NONE"

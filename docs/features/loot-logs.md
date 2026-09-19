@@ -21,11 +21,15 @@ The log includes:
 - admins added or removed;
 - character links and unlinks;
 - historical Main Swap consolidations;
+- persistent specialization changes;
+- automatic BiS outcomes (assigned, overflow, unresolved, or not BiS);
+- Gear Override assign, clear, replace, and legacy association;
+- manual loot additions and reversals;
 - RC Loot Council awards, when the optional integration child addon is enabled and an active Spectrum session records them.
 
 Each row shows the date, change type, affected member when applicable, a readable action, and the author.
 
-RC Loot Council rows use the loot recipient as the member, the awarded item link as the action (hover the link for the item tooltip), and the RC master looter as the author. The original RC response label is stored with the entry. These rows use an external identity and do not participate in the ordinary sequential author-and-counter repair ranges.
+RC Loot Council rows use the loot recipient as the member, `[Item Link] (Response)` as the action (hover the link for the item tooltip), and the RC master looter as the author. The original RC response label is stored with the entry. These rows use an external identity and do not participate in the ordinary sequential author-and-counter repair ranges.
 
 Reward Pot amounts appear as gold, silver, and copper. A percent Raid Check deduction is stored as the gold amount calculated when the check ran.
 

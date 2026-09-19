@@ -160,7 +160,8 @@ function Identity.CompareLogs(a, b)
 end
 
 -- Causal-then-deterministic order: per-author counters, writer-observed
--- preOpAuthorMax, sourceLogId grant edges, then CompareLogs among ready events.
+-- preOpAuthorMax, sourceLogId / sourceLogIds / targetAssignmentId edges,
+-- then CompareLogs among ready events.
 -- Ready selection is a binary min-heap so the Kahn walk is O(n log n).
 -- SameAuthor aliases share one logical counter stream, but every immutable
 -- historical row at a logical counter stays its own node. Observing frontier N
@@ -299,6 +300,26 @@ function Identity.OrderLogs(logs)
         end
     end
 
+    local function addSourceEdges(data, succLog)
+        local function addOne(sourceId)
+            if type(sourceId) ~= "string" or sourceId == "" then
+                return
+            end
+            local sourceLog = byId[sourceId]
+            if sourceLog then
+                addEdge(sourceLog, succLog)
+            end
+        end
+        addOne(data and data.sourceLogId)
+        addOne(data and data.targetAssignmentId)
+        local sourceLogIds = data and data.sourceLogIds
+        if type(sourceLogIds) == "table" then
+            for j = 1, #sourceLogIds do
+                addOne(sourceLogIds[j])
+            end
+        end
+    end
+
     for i = 1, n do
         local log = logs[i]
         local author = GetLogAuthor(log) or (log and log._author)
@@ -328,13 +349,7 @@ function Identity.OrderLogs(logs)
                 end
             end
         end
-        local sourceLogId = data and data.sourceLogId
-        if type(sourceLogId) == "string" and sourceLogId ~= "" then
-            local sourceLog = byId[sourceLogId]
-            if sourceLog then
-                addEdge(sourceLog, log)
-            end
-        end
+        addSourceEdges(data, log)
     end
 
     local heap = {}
@@ -585,6 +600,8 @@ local function NewFamilyOcc()
     return {
         occupied = { false, false },
         overflow = 0,
+        origins = { nil, nil },
+        overflowOrigins = {},
     }
 end
 
@@ -596,10 +613,23 @@ local function NewIdentityOcc()
     }
 end
 
+local function CopyOriginList(list)
+    local out = {}
+    if type(list) ~= "table" then
+        return out
+    end
+    for i = 1, #list do
+        out[i] = list[i]
+    end
+    return out
+end
+
 local function CloneFamily(family)
     return {
         occupied = { family.occupied[1], family.occupied[2] },
         overflow = family.overflow,
+        origins = { family.origins and family.origins[1], family.origins and family.origins[2] },
+        overflowOrigins = CopyOriginList(family.overflowOrigins),
     }
 end
 
@@ -609,6 +639,8 @@ local function CloneOcc(occ)
         ordinary[slot] = {
             occupied = state.occupied,
             overflow = state.overflow,
+            origin = state.origin,
+            overflowOrigins = CopyOriginList(state.overflowOrigins),
         }
     end
     return {
@@ -633,6 +665,38 @@ local function OccupiedDisplayCount(familyOcc)
     return n
 end
 
+local function CollectFamilyOrigins(familyOcc)
+    local list = {}
+    if familyOcc.origins then
+        if familyOcc.occupied[1] and familyOcc.origins[1] then
+            list[#list + 1] = familyOcc.origins[1]
+        end
+        if familyOcc.occupied[2] and familyOcc.origins[2] then
+            list[#list + 1] = familyOcc.origins[2]
+        end
+    end
+    local overflow = familyOcc.overflowOrigins or {}
+    for i = 1, #overflow do
+        list[#list + 1] = overflow[i]
+    end
+    return list
+end
+
+local function PackFamilyOrigins(familyOcc, originList)
+    familyOcc.origins = { nil, nil }
+    familyOcc.overflowOrigins = {}
+    local displayed = OccupiedDisplayCount(familyOcc)
+    local idx = 0
+    for i = 1, #originList do
+        idx = idx + 1
+        if idx <= displayed and idx <= 2 then
+            familyOcc.origins[idx] = originList[i]
+        else
+            familyOcc.overflowOrigins[#familyOcc.overflowOrigins + 1] = originList[i]
+        end
+    end
+end
+
 local function MergeFamily(dst, src)
     if not FamilyHasOccupancy(src) then
         return
@@ -641,7 +705,14 @@ local function MergeFamily(dst, src)
         dst.occupied[1] = src.occupied[1] and true or false
         dst.occupied[2] = src.occupied[2] and true or false
         dst.overflow = src.overflow or 0
+        dst.origins = { src.origins and src.origins[1], src.origins and src.origins[2] }
+        dst.overflowOrigins = CopyOriginList(src.overflowOrigins)
         return
+    end
+    local originList = CollectFamilyOrigins(dst)
+    local srcOrigins = CollectFamilyOrigins(src)
+    for i = 1, #srcOrigins do
+        originList[#originList + 1] = srcOrigins[i]
     end
     -- Independent scopes combine by packing displayed uses into
     -- opportunity 1, then 2, then overflow. Do not preserve source indices.
@@ -654,6 +725,7 @@ local function MergeFamily(dst, src)
     dst.occupied[1] = displayed >= 1
     dst.occupied[2] = displayed >= 2
     dst.overflow = overflow
+    PackFamilyOrigins(dst, originList)
 end
 
 local function MergeOcc(dst, src)
@@ -672,6 +744,18 @@ local function MergeOcc(dst, src)
         dst.ordinary[slot] = {
             occupied = dstOccupied or srcOccupied,
             overflow = overflow,
+            origin = dstOccupied and (current and current.origin) or (srcOccupied and state.origin) or nil,
+            overflowOrigins = (function()
+                local list = CopyOriginList(current and current.overflowOrigins)
+                local srcOverflow = state.overflowOrigins or {}
+                for i = 1, #srcOverflow do
+                    list[#list + 1] = srcOverflow[i]
+                end
+                if dstOccupied and srcOccupied and state.origin then
+                    list[#list + 1] = state.origin
+                end
+                return list
+            end)(),
         }
     end
 end
@@ -700,6 +784,26 @@ local function CausalBefore(a, b)
         return Identity.CompareLogs(a, b)
     end
     return a and true or false
+end
+
+local function OriginFromLog(log, kind, member, slot, identityMembers, displayedSlot)
+    if not log then
+        return nil
+    end
+    local originLogId = GetLogId(log)
+    if type(originLogId) ~= "string" or originLogId == "" then
+        return nil
+    end
+    return {
+        log = log,
+        originLogId = originLogId,
+        kind = kind,
+        member = member,
+        slot = slot,
+        displayedSlot = displayedSlot or slot,
+        identityMembers = identityMembers,
+        packed = kind == "local" and (displayedSlot ~= nil and displayedSlot ~= slot) or false,
+    }
 end
 
 local function CompareOrigin(a, b)
@@ -748,13 +852,19 @@ local function PackLocals(memberIds, localArmor, localOrigin, familyFilter)
                 elseif family == "ordinary" and packOrdinary then
                     local state = occ.ordinary[slot]
                     if not state then
-                        state = { occupied = false, overflow = 0 }
+                        state = { occupied = false, overflow = 0, overflowOrigins = {} }
                         occ.ordinary[slot] = state
                     end
+                    local originRec = OriginFromLog(origin[slot], "local", memberId, slot, nil, slot)
                     if state.occupied then
                         state.overflow = state.overflow + 1
+                        state.overflowOrigins = state.overflowOrigins or {}
+                        if originRec then
+                            state.overflowOrigins[#state.overflowOrigins + 1] = originRec
+                        end
                     else
                         state.occupied = true
+                        state.origin = originRec
                     end
                 end
             end
@@ -767,24 +877,45 @@ local function PackLocals(memberIds, localArmor, localOrigin, familyFilter)
     local linked = #memberIds >= 2
     local function packFamily(usages, familyOcc, slotIndex)
         table.sort(usages, CompareOrigin)
+        familyOcc.origins = familyOcc.origins or { nil, nil }
+        familyOcc.overflowOrigins = familyOcc.overflowOrigins or {}
+        local RING_NAMES = { "Ring1", "Ring2" }
+        local TRINKET_NAMES = { "Trinket1", "Trinket2" }
+        local names = slotIndex == RING_INDEX and RING_NAMES or TRINKET_NAMES
         if not linked then
             for i = 1, #usages do
                 local preferred = slotIndex[usages[i].slot]
+                local originRec = OriginFromLog(
+                    usages[i].log, "local", usages[i].member, usages[i].slot, nil, usages[i].slot
+                )
                 if preferred and not familyOcc.occupied[preferred] then
                     familyOcc.occupied[preferred] = true
+                    familyOcc.origins[preferred] = originRec
                 elseif preferred then
                     familyOcc.overflow = familyOcc.overflow + 1
+                    if originRec then
+                        familyOcc.overflowOrigins[#familyOcc.overflowOrigins + 1] = originRec
+                    end
                 end
             end
             return
         end
         for i = 1, #usages do
+            local displayed = names[i]
+            local originRec = OriginFromLog(
+                usages[i].log, "local", usages[i].member, usages[i].slot, nil, displayed
+            )
             if i == 1 then
                 familyOcc.occupied[1] = true
+                familyOcc.origins[1] = originRec
             elseif i == 2 then
                 familyOcc.occupied[2] = true
+                familyOcc.origins[2] = originRec
             else
                 familyOcc.overflow = familyOcc.overflow + 1
+                if originRec then
+                    familyOcc.overflowOrigins[#familyOcc.overflowOrigins + 1] = originRec
+                end
             end
         end
     end
@@ -794,39 +925,53 @@ local function PackLocals(memberIds, localArmor, localOrigin, familyFilter)
     return occ
 end
 
-local function ApplyIdentityArmor(occ, slot, action)
+local function ApplyIdentityArmor(occ, slot, action, originRec)
     local family, key = FamilyForSlot(slot)
     if family == "ordinary" then
         local state = occ.ordinary[key]
         if not state then
-            state = { occupied = false, overflow = 0 }
+            state = { occupied = false, overflow = 0, overflowOrigins = {} }
             occ.ordinary[key] = state
         end
         if action == "USED" then
             if state.occupied then
                 state.overflow = state.overflow + 1
+                state.overflowOrigins = state.overflowOrigins or {}
+                if originRec then
+                    state.overflowOrigins[#state.overflowOrigins + 1] = originRec
+                end
             else
                 state.occupied = true
+                state.origin = originRec
             end
         elseif action == "AVAILABLE" then
             -- Ordinary slots have one opportunity. Clearing the recorded
             -- scope suppresses that scope's packed locals, including overflow.
             state.occupied = false
             state.overflow = 0
+            state.origin = nil
+            state.overflowOrigins = {}
         end
         return
     end
 
     local familyOcc = occ[family]
+    familyOcc.origins = familyOcc.origins or { nil, nil }
+    familyOcc.overflowOrigins = familyOcc.overflowOrigins or {}
     local index = key
     if action == "USED" then
         if familyOcc.occupied[index] then
             familyOcc.overflow = familyOcc.overflow + 1
+            if originRec then
+                familyOcc.overflowOrigins[#familyOcc.overflowOrigins + 1] = originRec
+            end
         else
             familyOcc.occupied[index] = true
+            familyOcc.origins[index] = originRec
         end
     elseif action == "AVAILABLE" then
         familyOcc.occupied[index] = false
+        familyOcc.origins[index] = nil
     end
 end
 
@@ -1014,11 +1159,11 @@ local function ProjectFamilyOccupancy(ids, idSet, localArmor, localOrigin, famil
         if #scopeIds > 0 then
             table.sort(scopeIds)
             local packed = PackLocals(scopeIds, localArmor, localOrigin, family)
-            ApplyIdentityArmor(packed, ev.slot, ev.action)
+            ApplyIdentityArmor(packed, ev.slot, ev.action, OriginFromLog(ev.log, "identity", ev.member, ev.slot, ev.identityMembers, ev.slot))
             MergeOcc(occ, packed)
             packedAny = true
         else
-            ApplyIdentityArmor(occ, ev.slot, ev.action)
+            ApplyIdentityArmor(occ, ev.slot, ev.action, OriginFromLog(ev.log, "identity", ev.member, ev.slot, ev.identityMembers, ev.slot))
         end
     end
     local leftover = {}
@@ -1035,7 +1180,7 @@ local function ProjectFamilyOccupancy(ids, idSet, localArmor, localOrigin, famil
         occ = PackLocals(ids, localArmor, localOrigin, family)
     end
     for i = 1, #covering do
-        ApplyIdentityArmor(occ, covering[i].slot, covering[i].action)
+        ApplyIdentityArmor(occ, covering[i].slot, covering[i].action, OriginFromLog(covering[i].log, "identity", covering[i].member, covering[i].slot, covering[i].identityMembers, covering[i].slot))
     end
     return occ
 end
@@ -1060,6 +1205,69 @@ local function ProjectIdentityOccupancy(ids, localArmor, localOrigin, identityAr
         MergeOcc(occ, ProjectFamilyOccupancy(ids, idSet, localArmor, localOrigin, byFamily[family], family))
     end
     return occ
+end
+
+local function ExtractOccupancyOrigins(occ)
+    local out = {}
+    local function add(rec, displayedSlot, isOverflow)
+        if type(rec) ~= "table" or type(rec.originLogId) ~= "string" then
+            return
+        end
+        rec.displayedSlot = displayedSlot or rec.displayedSlot or rec.slot
+        if isOverflow then
+            rec.isOverflow = true
+        end
+        out[#out + 1] = rec
+    end
+    for slot, state in pairs(occ.ordinary or {}) do
+        if state.occupied then
+            add(state.origin, slot)
+        end
+        local overflow = state.overflowOrigins or {}
+        for i = 1, #overflow do
+            add(overflow[i], slot, true)
+        end
+    end
+    local function addFamily(familyOcc, names)
+        if not familyOcc then
+            return
+        end
+        local origins = familyOcc.origins or {}
+        if familyOcc.occupied and familyOcc.occupied[1] then
+            add(origins[1], names[1])
+        end
+        if familyOcc.occupied and familyOcc.occupied[2] then
+            add(origins[2], names[2])
+        end
+        local overflow = familyOcc.overflowOrigins or {}
+        for i = 1, #overflow do
+            add(overflow[i], names[1], true)
+        end
+    end
+    addFamily(occ.ring, { "Ring1", "Ring2" })
+    addFamily(occ.trinket, { "Trinket1", "Trinket2" })
+    return out
+end
+
+local function OccupancyOriginMap(partition, localArmor, localOrigin, identityArmorEvents)
+    local map = {}
+    local processed = {}
+    for memberId in pairs(partition.parent or {}) do
+        local root = FindRoot(partition, memberId)
+        if root and not processed[root] then
+            processed[root] = true
+            local ids = ComponentList(partition, memberId)
+            local occ = ProjectIdentityOccupancy(ids, localArmor, localOrigin, identityArmorEvents)
+            local list = ExtractOccupancyOrigins(occ)
+            for i = 1, #list do
+                local rec = list[i]
+                if rec.originLogId then
+                    map[rec.originLogId] = rec
+                end
+            end
+        end
+    end
+    return map
 end
 
 local function EventTypes()
@@ -1269,13 +1477,16 @@ function Identity.UnrosteredAttributedMembers(logs, rosterSet)
         local data = GetLogData(logs[i])
         local eventType = GetLogType(logs[i])
         if type(data) == "table" then
-            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember }
+            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember, data.awardMember, data.viewMember }
             if eventType == types.RC_LOOT_COUNCIL or eventType == types.POINT_CHANGE
                 or eventType == types.ATTENDANCE_CHANGE or eventType == types.ARMOR_CHANGE
                 or eventType == types.ADMIN_ADDED or eventType == types.ADMIN_REMOVED
-                or eventType == types.ROLE_CHANGE
+                or eventType == types.ROLE_CHANGE or eventType == types.SPEC_CHANGE
+                or eventType == types.BIS_OUTCOME or eventType == types.BIS_OVERRIDE
+                or eventType == types.MANUAL_AWARD or eventType == types.MANUAL_AWARD_REVERSE
             then
                 candidates[#candidates + 1] = data.member
+                candidates[#candidates + 1] = data.awardMember
             end
             for j = 1, #candidates do
                 local id = NormalizeId(candidates[j])
@@ -1298,7 +1509,7 @@ function Identity.AttributedMemberIds(logs)
     for i = 1, #(logs or {}) do
         local data = GetLogData(logs[i])
         if type(data) == "table" then
-            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember }
+            local candidates = { data.member, data.memberA, data.memberB, data.sourceMember, data.awardMember, data.viewMember }
             for j = 1, #candidates do
                 local id = NormalizeId(candidates[j])
                 if id then
@@ -1383,6 +1594,12 @@ function Identity.AffectsProjection(eventType)
         or eventType == (EventTypes().ADMIN_ADDED)
         or eventType == (EventTypes().ADMIN_REMOVED)
         or eventType == (EventTypes().ROLE_CHANGE)
+        or eventType == (EventTypes().RC_LOOT_COUNCIL)
+        or eventType == (EventTypes().SPEC_CHANGE)
+        or eventType == (EventTypes().BIS_OUTCOME)
+        or eventType == (EventTypes().BIS_OVERRIDE)
+        or eventType == (EventTypes().MANUAL_AWARD)
+        or eventType == (EventTypes().MANUAL_AWARD_REVERSE)
 end
 
 local function ClampNonNegative(n)
@@ -1396,6 +1613,18 @@ end
 function Identity.CanFanOutBalance(eventType)
     return eventType == (EventTypes().POINT_CHANGE)
         or eventType == (EventTypes().ATTENDANCE_CHANGE)
+end
+
+-- In-order item-aware logs mutate BiS/spec derived state without changing
+-- identity partition or armor occupancy. Full replay remains the fallback
+-- when there is no current projection or the append is out of order.
+function Identity.CanFanOutItemAware(eventType)
+    return eventType == (EventTypes().RC_LOOT_COUNCIL)
+        or eventType == (EventTypes().SPEC_CHANGE)
+        or eventType == (EventTypes().BIS_OUTCOME)
+        or eventType == (EventTypes().BIS_OVERRIDE)
+        or eventType == (EventTypes().MANUAL_AWARD)
+        or eventType == (EventTypes().MANUAL_AWARD_REVERSE)
 end
 
 function Identity.ComponentHasOverflow(result, memberId)
@@ -1503,11 +1732,57 @@ function Identity.RequiresProfileRebuild(eventType)
     if Identity.CanFanOutBalance(eventType) then
         return false
     end
+    if Identity.CanFanOutItemAware and Identity.CanFanOutItemAware(eventType) then
+        return false
+    end
     return Identity.AffectsProjection(eventType)
         or eventType == (EventTypes().LOOT_MODE_CHANGE)
         or eventType == (EventTypes().REWARD_POT_CONFIG_CHANGE)
         or eventType == (EventTypes().REWARD_POT_CHANGE)
         or eventType == (EventTypes().PROFILE_NAME_CHANGE)
+end
+
+local function RefreshBisDerived(result)
+    if type(result) ~= "table" then
+        return
+    end
+    local bisState = result.bis and result.bis.state
+    local identityOf = result.identityOf or {}
+    local armor = result.armor or {}
+    local specs = (bisState and bisState.specs) or result.specs or {}
+    local slotsByMember, poolByMember = {}, {}
+    if bisState and SF.LootHelperBis and SF.LootHelperBis.BuildMemberSlotMap then
+        slotsByMember, poolByMember = SF.LootHelperBis.BuildMemberSlotMap(bisState, identityOf)
+        for memberId, armorMap in pairs(armor) do
+            local slots = slotsByMember[memberId]
+            if type(slots) ~= "table" then
+                slots = {}
+                slotsByMember[memberId] = slots
+            end
+            for slot, used in pairs(armorMap) do
+                if used then
+                    local cell = slots[slot]
+                    if not cell or not cell.state or cell.state == "AVAILABLE" then
+                        slots[slot] = { state = "LEGACY_UNKNOWN" }
+                    end
+                end
+            end
+        end
+        if SF.LootHelperBis.LegacyOriginsForDisplay then
+            local originsByMember = {}
+            for memberId in pairs(identityOf) do
+                originsByMember[memberId] = SF.LootHelperBis.LegacyOriginsForDisplay(bisState, memberId, identityOf)
+            end
+            bisState.legacyOriginsByMember = originsByMember
+        end
+    end
+    result.specs = specs
+    result.bis = result.bis or {}
+    result.bis.state = bisState
+    result.bis.slotsByMember = slotsByMember
+    result.bis.poolByMember = poolByMember
+    result.bis.legacyOriginsByMember = bisState and bisState.legacyOriginsByMember
+    result.bis.hasItemAwareEvents = bisState and bisState.hasItemAwareEvents == true
 end
 
 function Identity.Replay(logs, opts)
@@ -1537,6 +1812,24 @@ function Identity.Replay(logs, opts)
     local identityArmorEvents = {}
     local appliedRelationshipIds = {}
     local impliedAdminSource = {}
+    local bisState = (SF.LootHelperBis and SF.LootHelperBis.NewState) and SF.LootHelperBis.NewState() or nil
+    local occupancyOriginMap
+    local occupancyByMember = {}
+    local occupancyInputsDirty = true
+    local logById = {}
+    local classByMember = {}
+    if type(opts.members) == "table" then
+        for i = 1, #opts.members do
+            local member = opts.members[i]
+            if type(member) == "table" then
+                local mid = NormalizeId((member.GetFullIdentifier and member:GetFullIdentifier()) or member.identifier)
+                local classToken = member.GetClass and member:GetClass() or member.class
+                if mid and type(classToken) == "string" and classToken ~= "" then
+                    classByMember[mid] = classToken
+                end
+            end
+        end
+    end
 
     if owner then
         EnsureMember(partition, owner)
@@ -1559,6 +1852,10 @@ function Identity.Replay(logs, opts)
     local logRank = {}
     for i = 1, #ordered do
         logRank[ordered[i]] = i
+        local orderedId = GetLogId(ordered[i])
+        if type(orderedId) == "string" then
+            logById[orderedId] = ordered[i]
+        end
     end
     causalRank = logRank
 
@@ -1580,11 +1877,28 @@ function Identity.Replay(logs, opts)
         ensureLocal(owner)
     end
 
+    local function invalidateOccupancyInputs()
+        occupancyInputsDirty = true
+        occupancyOriginMap = nil
+        occupancyByMember = {}
+    end
+
     for i = 1, #ordered do
         local log = ordered[i]
         local eventType = GetLogType(log)
         local data = GetLogData(log)
         if type(eventType) == "string" and type(data) == "table" then
+            if eventType == types.SPEC_CHANGE then
+                ensureLocal(data.member)
+            elseif eventType == types.RC_LOOT_COUNCIL then
+                ensureLocal(data.member)
+            elseif eventType == types.MANUAL_AWARD then
+                ensureLocal(data.member)
+            elseif eventType == types.BIS_OUTCOME then
+                ensureLocal(data.awardMember)
+            elseif eventType == types.BIS_OVERRIDE then
+                ensureLocal(data.viewMember)
+            end
             if eventType == types.MAIN_SWAP then
                 local target = ensureLocal(data.member)
                 local source = NormalizeId(data.sourceMember)
@@ -1594,6 +1908,7 @@ function Identity.Replay(logs, opts)
                     end
                     ensureLocal(source)
                     Union(partition, source, target or source)
+                    invalidateOccupancyInputs()
                 end
             elseif eventType == types.CHARACTER_LINK then
                 local memberA = ensureLocal(data.memberA)
@@ -1649,6 +1964,7 @@ function Identity.Replay(logs, opts)
                             ImplyIdentityAdmins(preA, simulated, owner, impliedAdminSource, linkId)
                         end
                     end
+                    invalidateOccupancyInputs()
                 end
             elseif eventType == types.CHARACTER_UNLINK then
                 if RelationshipAuthorizedAt(log, eventType, data, partition, simulated, auth, owner) then
@@ -1658,6 +1974,7 @@ function Identity.Replay(logs, opts)
                         appliedRelationshipIds[unlinkId] = true
                     end
                     ExpireSplitIdentityEvents(identityArmorEvents, partition)
+                    invalidateOccupancyInputs()
                 end
                 ensureLocal(data.member)
             elseif eventType == types.ADMIN_ADDED then
@@ -1734,7 +2051,51 @@ function Identity.Replay(logs, opts)
                             localOrigin[memberId][data.slot] = log
                         end
                     end
+                    invalidateOccupancyInputs()
                 end
+            end
+            if bisState and SF.LootHelperBis and SF.LootHelperBis.ApplyLog then
+                if eventType == types.BIS_OVERRIDE or eventType == types.BIS_OUTCOME then
+                    -- Occupancy origins depend only on armor/identity inputs.
+                    -- Rebuilding them on every BiS event is O(events^2).
+                    if occupancyInputsDirty or occupancyOriginMap == nil then
+                        occupancyOriginMap = OccupancyOriginMap(partition, localArmor, localOrigin, identityArmorEvents)
+                        occupancyInputsDirty = false
+                    end
+                    if SF.LootHelperBis.SetOccupancyOrigins then
+                        SF.LootHelperBis.SetOccupancyOrigins(bisState, occupancyOriginMap)
+                    else
+                        bisState.occupancyOrigins = occupancyOriginMap
+                    end
+                end
+                SF.LootHelperBis.ApplyLog(bisState, log, {
+                    rank = i,
+                    FindLog = function(id)
+                        return logById[id]
+                    end,
+                    GetIdentityMembers = function(memberId)
+                        return ComponentList(partition, NormalizeId(memberId))
+                    end,
+                    GetContributingOrigin = function(originId)
+                        return bisState.occupancyOrigins and bisState.occupancyOrigins[originId]
+                    end,
+                    MemberClass = function(memberId)
+                        return classByMember[NormalizeId(memberId)]
+                    end,
+                    SlotOccupied = function(memberId, slot)
+                        memberId = NormalizeId(memberId)
+                        if not memberId or type(slot) ~= "string" then
+                            return false
+                        end
+                        local occ = occupancyByMember[memberId]
+                        if not occ then
+                            local ids = ComponentList(partition, memberId)
+                            occ = ProjectIdentityOccupancy(ids, localArmor, localOrigin, identityArmorEvents)
+                            occupancyByMember[memberId] = occ
+                        end
+                        return OccupiedBool(occ, slot)
+                    end,
+                })
             end
         end
     end
@@ -1796,12 +2157,34 @@ function Identity.Replay(logs, opts)
     table.sort(simulatedList)
 
     causalRank = nil
-    return {
+    local bisStateOut = bisState
+    if bisState and SF.LootHelperBis then
+        local originMap = {}
+        for _, occ in pairs(occByRoot) do
+            local list = ExtractOccupancyOrigins(occ)
+            for oi = 1, #list do
+                local rec = list[oi]
+                if rec.originLogId then
+                    originMap[rec.originLogId] = rec
+                end
+            end
+        end
+        if SF.LootHelperBis.SetOccupancyOrigins then
+            SF.LootHelperBis.SetOccupancyOrigins(bisState, originMap)
+        else
+            bisState.occupancyOrigins = originMap
+        end
+    end
+    local result = {
         members = members,
         identityOf = identityOf,
         points = points,
         attendance = attendance,
         armor = armor,
+        specs = (bisStateOut and bisStateOut.specs) or {},
+        bis = {
+            state = bisStateOut,
+        },
         localArmor = localArmor,
         simulatedAdmins = simulated,
         simulatedAdminList = simulatedList,
@@ -1813,7 +2196,10 @@ function Identity.Replay(logs, opts)
         overflowKeysByIdentity = overflowKeysByIdentity,
         overflowCountsByIdentity = overflowCountsByIdentity,
         partition = partition,
+        bisAppendRank = #ordered,
     }
+    RefreshBisDerived(result)
+    return result
 end
 
 function Identity.ComponentMembers(logs, memberId, result)
@@ -1901,6 +2287,179 @@ function Identity.FanOutBalance(profile, lootLog)
                 member.attendanceBalance = displayed
             end
         end
+    end
+    return true
+end
+
+-- Replay calls ensureLocal for item-aware members so they appear in
+-- identityOf even when they had no prior identity/armor/points logs.
+-- Incremental append must do the same or roster-only characters get an
+-- award in bis.state.awards with no poolByMember/slotsByMember entry.
+local function EnsureProjectionMember(result, memberId)
+    memberId = NormalizeId(memberId)
+    if not memberId or type(result) ~= "table" or type(result.identityOf) ~= "table" then
+        return
+    end
+    if result.identityOf[memberId] then
+        return
+    end
+    result.identityOf[memberId] = { memberId }
+    result.members = result.members or {}
+    result.members[#result.members + 1] = memberId
+    result.armor = result.armor or {}
+    if type(result.armor[memberId]) ~= "table" then
+        result.armor[memberId] = EmptyArmor()
+    end
+    result.points = result.points or {}
+    if result.points[memberId] == nil then
+        result.points[memberId] = 0
+    end
+    result.attendance = result.attendance or {}
+    if result.attendance[memberId] == nil then
+        result.attendance[memberId] = 0
+    end
+    if result.partition then
+        EnsureMember(result.partition, memberId)
+    end
+end
+
+-- Incremental apply is only safe when CompareLogs order matches causal
+-- OrderLogs order: every sourceLogId / sourceLogIds / targetAssignmentId
+-- predecessor is already stored, and no already-stored log waits on this
+-- one. Otherwise ApplyLog can no-op (missing RC source) and a later
+-- in-order predecessor will not re-reduce the dependent log.
+local function CollectCausalSourceIds(data, out)
+    out = out or {}
+    local function add(id)
+        if type(id) == "string" and id ~= "" then
+            out[#out + 1] = id
+        end
+    end
+    add(data and data.sourceLogId)
+    add(data and data.targetAssignmentId)
+    local list = data and data.sourceLogIds
+    if type(list) == "table" then
+        for i = 1, #list do
+            add(list[i])
+        end
+    end
+    return out
+end
+
+local function ItemAwareFanOutSafe(profile, lootLog)
+    local byId = profile and profile._logById
+    if type(byId) ~= "table" then
+        return false
+    end
+    local preds = CollectCausalSourceIds(GetLogData(lootLog))
+    for i = 1, #preds do
+        if not byId[preds[i]] then
+            return false
+        end
+    end
+    local selfId = GetLogId(lootLog)
+    if type(selfId) ~= "string" or selfId == "" then
+        return false
+    end
+    local logs = profile._lootLogs or {}
+    for i = 1, #logs do
+        local other = logs[i]
+        if other ~= lootLog then
+            local deps = CollectCausalSourceIds(GetLogData(other))
+            for j = 1, #deps do
+                if deps[j] == selfId then
+                    return false
+                end
+            end
+        end
+    end
+    return true
+end
+
+function Identity.FanOutItemAware(profile, lootLog)
+    if type(profile) ~= "table" or type(lootLog) ~= "table" then
+        return false
+    end
+    local result = profile._identityProjection
+    if type(result) ~= "table" or type(result.identityOf) ~= "table" then
+        return false
+    end
+    local eventType = GetLogType(lootLog)
+    if not Identity.CanFanOutItemAware(eventType) then
+        return false
+    end
+    if not ItemAwareFanOutSafe(profile, lootLog) then
+        return false
+    end
+    local Bis = SF.LootHelperBis
+    if not (Bis and Bis.ApplyLog) then
+        return false
+    end
+    local data = GetLogData(lootLog)
+    local types = EventTypes()
+    local touchId
+    if eventType == types.SPEC_CHANGE or eventType == types.RC_LOOT_COUNCIL or eventType == types.MANUAL_AWARD then
+        touchId = data and data.member
+    elseif eventType == types.BIS_OUTCOME then
+        touchId = data and data.awardMember
+    elseif eventType == types.BIS_OVERRIDE then
+        touchId = data and data.viewMember
+    end
+    EnsureProjectionMember(result, touchId)
+    result.bis = result.bis or {}
+    local bisState = result.bis.state
+    if not bisState and Bis.NewState then
+        bisState = Bis.NewState()
+        result.bis.state = bisState
+    end
+    if not bisState then
+        return false
+    end
+    local rank = (tonumber(result.bisAppendRank) or #(result.orderedLogs or {})) + 1
+    Bis.ApplyLog(bisState, lootLog, {
+        rank = rank,
+        FindLog = function(id)
+            if type(id) ~= "string" or id == "" then
+                return nil
+            end
+            if profile._logById then
+                return profile._logById[id]
+            end
+            return nil
+        end,
+        GetIdentityMembers = function(memberId)
+            memberId = NormalizeId(memberId)
+            return (memberId and result.identityOf[memberId]) or { memberId }
+        end,
+        GetContributingOrigin = function(originId)
+            return bisState.occupancyOrigins and bisState.occupancyOrigins[originId]
+        end,
+        MemberClass = function(memberId)
+            memberId = NormalizeId(memberId)
+            local member = profile.getMemberByID and profile:getMemberByID(memberId)
+            if member and member.GetClass then
+                return member:GetClass()
+            end
+            return member and member.class
+        end,
+        SlotOccupied = function(memberId, slot)
+            memberId = NormalizeId(memberId)
+            if not memberId or type(slot) ~= "string" then
+                return false
+            end
+            local armor = result.armor and result.armor[memberId]
+            return armor and armor[slot] == true
+        end,
+    })
+    result.bisAppendRank = rank
+    if type(result.orderedLogs) == "table" then
+        result.orderedLogs[#result.orderedLogs + 1] = lootLog
+    end
+    RefreshBisDerived(result)
+    if Identity.WriteProjection then
+        Identity.WriteProjection(profile, result)
+    else
+        profile._identityProjection = result
     end
     return true
 end
@@ -2031,7 +2590,7 @@ function Identity.ApplyToProfileMembers(profile)
     local logs = profile.GetLootLogs and profile:GetLootLogs() or profile._lootLogs or {}
     local owner = (profile.GetOwnerId and profile:GetOwnerId()) or profile._owner
     local legacyAdmins = Identity.EnsureLegacyCanonicalAdmins(profile)
-    local result = Identity.Replay(logs, { owner = owner, legacyAdmins = legacyAdmins })
+    local result = Identity.Replay(logs, { owner = owner, legacyAdmins = legacyAdmins, members = profile._members })
 
     local existing = {}
     if type(profile._members) == "table" then
@@ -2086,6 +2645,7 @@ function Identity.ApplyToProfileMembers(profile)
         member.pointBalance = result.points[memberId] or 0
         member.attendanceBalance = ClampNonNegative(result.attendance[memberId])
         member.armor = result.armor[memberId] or EmptyArmor()
+        member.specId = result.specs and result.specs[memberId] or nil
         profile._members[#profile._members + 1] = member
     end
     table.sort(profile._members, function(a, b)
@@ -2128,6 +2688,7 @@ function Identity.WriteProjection(profile, result)
             else
                 member.armor = result.armor[memberId] or EmptyArmor()
             end
+            member.specId = result.specs and result.specs[memberId] or nil
         end
     end
     profile._identityProjection = result

@@ -7,6 +7,12 @@ description: Handles GitHub pull request review comments, including Bugbot. Use 
 
 Use this skill for review comments on the current pull request (human reviews, Bugbot, and inline discussion threads).
 
+## Subscriptions do not backfill
+
+GitHub PR subscriptions (`cursor-subscriptions-subscribe_github_pr`) deliver future events only. Comments, reviews, and review threads that already exist when the subscription's `openTime` is recorded are not delivered.
+
+When a PR subscription starts, or when a user reports a missed review, immediately list unresolved review threads and issue comments on that PR and handle them with this workflow. Do not wait for a subscription delivery.
+
 ## Workflow
 
 Follow this order on every comment. Do not skip the reply, and do not GitHub-resolve a thread just because you replied.
@@ -30,6 +36,7 @@ Follow this order on every comment. Do not skip the reply, and do not GitHub-res
 ## Constraints
 
 - When a comment or requested review covers runtime addon behavior, treat client stability as a top dimension even if the prompt does not mention crashes. Report only credible freeze/hang/runaway mechanisms after tracing callers, lifecycle, bounds, and termination. See `SpectrumFederation/AGENTS.md` Client Stability.
+- When review touches user-visible messages, especially on recurring paths (heartbeats, timers, sync, retries), check for repetition/spam risk per `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition). Treat uncontrolled identical repeats as an implementation-quality issue.
 - Do not reopen settled product or architecture decisions unless current repository evidence makes them impossible.
 - Do not weaken CI, skip validation, or mark in-game testing complete in the PR template. In-game QA is human-owned. You may mark in-game testing N/A only when there are no packaged addon/runtime changes except allowlisted TOC metadata or proven non-shipped files (see `.cursor/rules/pr-template.mdc`).
 - Keep replies factual and specific to the cited code.
