@@ -506,12 +506,56 @@ def test_build_wago_plan_uses_toc_id_and_notes(tmp_path, monkeypatch):
     assert plan.zip_path == zip_path
 
 
-def test_validate_packaging_accepts_parent_wago_id(tmp_path):
+def test_validate_packaging_requires_matching_child_wago_id(tmp_path, capsys):
     parent_toc = tmp_path / "parent.toc"
     child_toc = tmp_path / "child.toc"
     parent_toc.write_text("## X-Wago-ID: BNBmnlGx\n", encoding="utf-8")
     child_toc.write_text("## Version: 1.4.0\n", encoding="utf-8")
+    assert validate_packaging.validate_wago_project_id(parent_toc, child_toc) is False
+    assert "No '## X-Wago-ID:' line found" in capsys.readouterr().out
+
+    child_toc.write_text("## X-Wago-ID: OtherId1\n", encoding="utf-8")
+    assert validate_packaging.validate_wago_project_id(parent_toc, child_toc) is False
+    assert "does not match parent" in capsys.readouterr().out
+
+    child_toc.write_text("## X-Wago-ID: BNBmnlGx\n", encoding="utf-8")
     assert validate_packaging.validate_wago_project_id(parent_toc, child_toc) is True
+
+
+def test_pkgmeta_must_lift_child_addons_to_zip_root(tmp_path, capsys):
+    names = ["SpectrumFederation", *validate_packaging.CHILD_ADDON_NAMES]
+    parent_only = {
+        "SpectrumFederation/SpectrumFederation": "SpectrumFederation",
+    }
+    assert validate_packaging.validate_pkgmeta_move_mapping(parent_only, names) is False
+    output = capsys.readouterr().out
+    for child in validate_packaging.CHILD_ADDON_NAMES:
+        assert f"SpectrumFederation/{child}" in output
+
+    complete = {
+        "SpectrumFederation/SpectrumFederation": "SpectrumFederation",
+        **{
+            f"SpectrumFederation/{child}": child
+            for child in validate_packaging.CHILD_ADDON_NAMES
+        },
+    }
+    assert validate_packaging.validate_pkgmeta_move_mapping(complete, names) is True
+
+
+def test_repo_pkgmeta_lifts_packaged_child_addons():
+    names = validate_packaging.packaged_addon_names("SpectrumFederation")
+    pkgmeta = Path("pkgmeta.yaml")
+    assert validate_packaging.validate_pkgmeta_addon_folders(pkgmeta, names) is True
+    moves = validate_packaging.parse_pkgmeta_move_folders(pkgmeta)
+    for child in names[1:]:
+        assert moves[f"SpectrumFederation/{child}"] == child
+
+
+def test_missing_pkgmeta_is_rejected(tmp_path, capsys):
+    names = ["SpectrumFederation", *validate_packaging.CHILD_ADDON_NAMES]
+    missing = tmp_path / "pkgmeta.yaml"
+    assert validate_packaging.validate_pkgmeta_addon_folders(missing, names) is False
+    assert "pkgmeta.yaml not found" in capsys.readouterr().out
 
 
 def test_legacy_webhook_secret_is_never_read_for_auth():

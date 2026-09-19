@@ -2,12 +2,13 @@
 ## Title: Spectrum Federation: RC Loot Council Integration
 ## Notes: Records RC Loot Council awards in Spectrum Loot Logs during an active Loot Helper session.
 ## Author: OsulivanAB
-## Version: 1.5.2-beta.1
+## Version: 1.5.2-beta.2
 ## Dependencies: SpectrumFederation
 ## OptionalDeps: RCLootCouncil
 ## Group: SpectrumFederation
 ## X-SpectrumFederation-Parent: SpectrumFederation
 ## X-SpectrumFederation-Settings-Host: lootHelper
+## X-Wago-ID: BNBmnlGx
 ## IconTexture: Interface\AddOns\SpectrumFederation\media\Icons\SpectrumFederationIconV2
 
 Integration.lua

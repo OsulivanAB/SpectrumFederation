@@ -60,6 +60,7 @@ def test_child_toc_follows_packaged_child_conventions():
     assert "## OptionalDeps: RCLootCouncil" in child
     assert "## Group: SpectrumFederation" in child
     assert "## X-SpectrumFederation-Parent: SpectrumFederation" in child
+    assert "## X-Wago-ID: BNBmnlGx" in child
     assert "## X-SpectrumFederation-Settings-Host: lootHelper" in child
     assert "## SavedVariables:" not in child
     assert "SpectrumFederation_RCLootCouncilIntegration" not in parent

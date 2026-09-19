@@ -176,7 +176,9 @@ Matching is case-insensitive (`1.5.0-BETA.2` is still a GitHub prerelease and Wa
 
 ### Wago project ID and Retail patch
 
-The public Wago project ID is stored once, as `## X-Wago-ID:` in `SpectrumFederation/SpectrumFederation.toc`. Packaged child addons ship in the same zip and do not get a second Wago ID. The publisher reads that TOC field instead of hard-coding the ID in workflows.
+The public Wago project ID is stored as `## X-Wago-ID:` on the parent TOC and on every packaged child TOC. Child addons reuse that same ID; they do not get a second Wago project. WowUp and Wago use the shared ID to install the sibling folders from one listing. The publisher still reads the parent TOC field instead of hard-coding the ID in workflows.
+
+CurseForge and WowUp also package from git with `pkgmeta.yaml`. That file must `move-folders` each shipped addon to the zip root. A parent-only flatten leaves `SpectrumFederation_CursedSurgeTracker` and `SpectrumFederation_RCLootCouncilIntegration` nested inside `SpectrumFederation/`, which those installers never load as optional AddOns.
 
 The Wago `supported_retail_patch` value is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`). The script requires that exact string to appear in Wago's public catalog at `https://addons.wago.io/api/data/game`. If the catalog cannot be loaded, or Wago does not advertise that patch yet, publishing fails instead of claiming an older patch. On a live run that failure happens after GitHub has already published, so CurseForge still receives the Release event.
 
