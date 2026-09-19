@@ -7,6 +7,12 @@ description: Handles GitHub pull request review comments, including Bugbot. Use 
 
 Use this skill for review comments on the current pull request (human reviews, Bugbot, and inline discussion threads).
 
+## Subscriptions do not backfill
+
+GitHub PR subscriptions (`cursor-subscriptions-subscribe_github_pr`) deliver future events only. Comments, reviews, and review threads that already exist when the subscription's `openTime` is recorded are not delivered.
+
+When a PR subscription starts, or when a user reports a missed review, immediately list unresolved review threads and issue comments on that PR and handle them with this workflow. Do not wait for a subscription delivery.
+
 ## Workflow
 
 Follow this order on every comment. Do not skip the reply, and do not GitHub-resolve a thread just because you replied.
