@@ -8,6 +8,7 @@ on:
       - 'SpectrumFederation/**'
       - 'SpectrumFederation_CursedSurgeTracker/**'
       - 'SpectrumFederation_RCLootCouncilIntegration/**'
+      - 'pkgmeta.yaml'
       - '.github/scripts/**'
       - '.github/workflows/**'
       - '.github/requirements-lint.txt'

@@ -23,11 +23,11 @@ Documentation-only changes do not require an addon version bump. Packaged-addon 
 
 `.github/workflows/pr-template-validation.yml` separately validates pull-request template completion. In-game testing must be either marked complete or explicitly marked not applicable. N/A is rejected when packaged addon files changed, or when a TOC change is runtime-affecting, unknown, or not inspectable. Zip-excluded repository files such as `*/AGENTS.md` may still use N/A.
 
-Both branch-validation workflows include `README.md`, `tests/**`, and MkDocs inputs (`docs/**`, `mkdocs.yml`, `overrides/**`, `requirements-docs.txt`) in their path filters.
+Both branch-validation workflows include `README.md`, `tests/**`, `pkgmeta.yaml`, and MkDocs inputs (`docs/**`, `mkdocs.yml`, `overrides/**`, `requirements-docs.txt`) in their path filters.
 
 ## Post-merge beta release
 
-`.github/workflows/post-merge-beta.yml` is triggered by pushes under the packaged addon trees. Path filters start the workflow; they do not encode individual zip exclusions. The workflow classifies the immutable `github.event.before...github.sha` range with `classify_promotion_scope.py` before any release side effects. Zip-excluded addon-tree files, including `*/AGENTS.md`, do not set `release_required`.
+`.github/workflows/post-merge-beta.yml` is triggered by pushes under the packaged addon trees or `pkgmeta.yaml`. Path filters start the workflow; they do not encode individual zip exclusions. The workflow classifies the immutable `github.event.before...github.sha` range with `classify_promotion_scope.py` before any release side effects. Zip-excluded addon-tree files, including `*/AGENTS.md`, do not set `release_required`. A `pkgmeta.yaml` change does, because CurseForge and WowUp rebuild from that file and need a new GitHub Release to pick it up.
 
 When `release_required` is false, changelog, README badge, GitHub Release, Wago, and CurseForge side effects are skipped. Lint/packaging/docs validation and merged-branch cleanup still run; they do not depend on a successful publish. A guidance-only addon-tree push can therefore start the workflow, classify as `release_required=false`, skip every release/version job, and still run sanity checks plus merged-branch cleanup.
 
@@ -47,7 +47,7 @@ A packaged addon change with a forgotten or invalid version fails the workflow i
 
 Docs-only merges do not trigger a beta addon release.
 
-Parent/child addon membership and zip exclusions live in `.github/scripts/validate_packaging.py`. The validation zip, production zip, and release-scope classifier all consume those definitions.
+Parent/child addon membership and zip exclusions live in `.github/scripts/validate_packaging.py`. The validation zip, production zip, and release-scope classifier all consume those definitions. The classifier also treats `pkgmeta.yaml` as release-relevant even though that file is not a zip member.
 
 ## Changelog automation
 
@@ -105,14 +105,14 @@ The first job captures an immutable range and classifies it with `.github/script
 
 Before the dry-run merge, the real merge, and the final beta sync, the workflow re-fetches `origin/main` and `origin/beta` and verifies them with `classify_promotion_scope.py --verify-refs`. Merge jobs check out `main`, so they copy that helper from a verified git object. The copy must support `--validate-versions` (and therefore `--decide-merge`): the workflow prefers the captured target SHA and falls back to current `main` when leftover beta predates the flag. Fast-forward jobs likewise copy a helper that supports `--verify-refs`, preferring the dispatched workflow commit, then `origin/main`, then the captured target. Git ancestry, via `--decide-merge`, then decides whether a merge commit is required. `has_incoming_changes` is a changed-file classification and is not used as the merge skip switch. When the captured target is not already contained in `main`, merge and file checkouts use that target SHA, not the live `beta` ref. When it is already contained, the workflow does not manufacture an empty merge commit and does not overlay CHANGELOG/README/TOC files from the older beta target. If either branch has moved unexpectedly, the job fails and tells the maintainer to rerun the promotion so scope and mutation stay aligned.
 
-The script is the source of truth for path classification. Update it when packaged addon roots, zip excludes, or MkDocs inputs change. It does not use AI.
+The script is the source of truth for path classification. Update it when packaged addon roots, zip excludes, `pkgmeta.yaml` release membership, or MkDocs inputs change. It does not use AI.
 
 | Flag | Meaning |
 | --- | --- |
-| `addon_changed` | A file that ships in the release zip changed. Addon roots and zip exclusions come from `validate_packaging.py`; `*/AGENTS.md` and `*.git*` are excluded. |
+| `addon_changed` | A file that ships in the release zip changed, or `pkgmeta.yaml` changed. Addon roots and zip exclusions come from `validate_packaging.py`; `*/AGENTS.md` and `*.git*` are excluded. `pkgmeta.yaml` is not a zip member, but CurseForge/WowUp rebuild from it. |
 | `docs_changed` | MkDocs sources changed: `docs/**`, `mkdocs.yml`, `overrides/**`, or `requirements-docs.txt`. |
 | `readme_changed` | `README.md` is in the incoming diff. |
-| `release_required` | Same as `addon_changed`. Incoming packaged addon changes warrant a stable release. Generated TOC/version commits do not create this flag. |
+| `release_required` | Same as `addon_changed`. Incoming packaged addon or `pkgmeta.yaml` changes warrant a stable release. Generated TOC/version commits do not create this flag. |
 | `changelog_required` | Same as `release_required`. AI may write the changelog text; it does not decide whether a changelog is needed. |
 | `documentation_deploy_required` | Same as `docs_changed`. Docs-only promotions deploy MkDocs and do not publish an addon release. |
 | `readme_work_required` | Incoming README change or a stable addon release (badge/version updates). |
@@ -176,7 +176,9 @@ Matching is case-insensitive (`1.5.0-BETA.2` is still a GitHub prerelease and Wa
 
 ### Wago project ID and Retail patch
 
-The public Wago project ID is stored once, as `## X-Wago-ID:` in `SpectrumFederation/SpectrumFederation.toc`. Packaged child addons ship in the same zip and do not get a second Wago ID. The publisher reads that TOC field instead of hard-coding the ID in workflows.
+The public Wago project ID is stored as `## X-Wago-ID:` on the parent TOC and on every packaged child TOC. Child addons reuse that same ID; they do not get a second Wago project. WowUp and Wago use the shared ID to install the sibling folders from one listing. The publisher still reads the parent TOC field instead of hard-coding the ID in workflows.
+
+CurseForge and WowUp also package from git with `pkgmeta.yaml`. That file must `move-folders` each shipped addon to the zip root. A parent-only flatten leaves `SpectrumFederation_CursedSurgeTracker` and `SpectrumFederation_RCLootCouncilIntegration` nested inside `SpectrumFederation/`, which those installers never load as optional AddOns.
 
 The Wago `supported_retail_patch` value is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`). The script requires that exact string to appear in Wago's public catalog at `https://addons.wago.io/api/data/game`. If the catalog cannot be loaded, or Wago does not advertise that patch yet, publishing fails instead of claiming an older patch. On a live run that failure happens after GitHub has already published, so CurseForge still receives the Release event.
 

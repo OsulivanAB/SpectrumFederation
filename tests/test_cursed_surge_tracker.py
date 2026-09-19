@@ -359,5 +359,6 @@ def test_parent_toc_does_not_load_child_files():
     assert "## Dependencies: SpectrumFederation" in child
     assert "## Group: SpectrumFederation" in child
     assert "## X-SpectrumFederation-Parent: SpectrumFederation" in child
+    assert "## X-Wago-ID: BNBmnlGx" in child
     assert "## Title: Spectrum Federation: Cursed Surge Tracker" in child
     assert "## LoadOnDemand:" not in child

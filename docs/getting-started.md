@@ -13,7 +13,7 @@
   </a>
 </div>
 
-Install **Spectrum Federation** with the CurseForge client, WowUp, [Wago Addons](https://addons.wago.io/addons/spectrumfederation), or a release archive from [GitHub Releases](https://github.com/OsulivanAB/SpectrumFederation/releases). Use the icons above to open the WowUp (Wago) or CurseForge listing.
+Install **Spectrum Federation** with the CurseForge client, WowUp, [Wago Addons](https://addons.wago.io/addons/spectrumfederation), or a release archive from [GitHub Releases](https://github.com/OsulivanAB/SpectrumFederation/releases). Use the icons above to open the WowUp (Wago) or CurseForge listing. Those installers should place the parent addon and both optional child addons: Cursed Surge Tracker and RC Loot Council Integration. Disable a child in World of Warcraft's AddOns list if you do not want it; Spectrum Federation cannot enable or disable children from `/sf`.
 
 For a manual installation, extract the archive and place the `SpectrumFederation`, `SpectrumFederation_CursedSurgeTracker`, and `SpectrumFederation_RCLootCouncilIntegration` folders in the Retail AddOns directory:
 

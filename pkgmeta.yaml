@@ -1,10 +1,16 @@
 package-as: SpectrumFederation
 enable-nolib-creation: no
 
+# CurseForge / WowUp use this file. After the packager copies the repo into
+# SpectrumFederation/, lift every shipped addon to the zip root. Without the
+# child moves, optional addons stay nested inside the parent folder and are
+# never installed as separate AddOns.
 move-folders:
   SpectrumFederation/SpectrumFederation: SpectrumFederation
+  SpectrumFederation/SpectrumFederation_CursedSurgeTracker: SpectrumFederation_CursedSurgeTracker
+  SpectrumFederation/SpectrumFederation_RCLootCouncilIntegration: SpectrumFederation_RCLootCouncilIntegration
 
-# Ignore everything at repo root except the SpectrumFederation/ folder
+# Ignore repository files that must not ship inside the parent addon folder.
 ignore:
   - .github
   - .devcontainer

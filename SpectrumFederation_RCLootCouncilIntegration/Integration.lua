@@ -14,6 +14,11 @@ Integration.PARENT_ADDON_NAME = "SpectrumFederation"
 Integration.PAGE_ID = "lootHelperRCLootCouncil"
 Integration.RC_PREFIX = "RCLC"
 Integration.DEBUG_CATEGORY = "RCLC_INTEGRATION"
+-- AceComm delivers the reassembled payload. Bound it before inflate so a
+-- RAID/GUILD sender cannot stall the UI thread with a compression bomb.
+Integration.MAX_COMPRESSED_BYTES = 8192
+Integration.MAX_DECOMPRESSED_BYTES = 32768
+Integration.MAX_HISTORY_DATA_FIELDS = 16
 
 local initialized = false
 local pageRegistered = false
@@ -279,7 +284,10 @@ function Integration.DecodeHistoryPayload(raw, libs, opts)
         winner = nil,
         history = nil,
     }
-    if type(raw) ~= "string" then
+    if type(raw) ~= "string" or raw == "" then
+        return result
+    end
+    if #raw > Integration.MAX_COMPRESSED_BYTES then
         return result
     end
 
@@ -293,8 +301,17 @@ function Integration.DecodeHistoryPayload(raw, libs, opts)
 
     local ok, unpacked = pcall(function()
         local decodedBytes = ld:DecodeForWoWAddonChannel(raw)
+        if type(decodedBytes) ~= "string" or #decodedBytes > Integration.MAX_COMPRESSED_BYTES then
+            return { false }
+        end
+        -- LibDeflate's public DecompressDeflate has no max-output argument.
+        -- Reject after inflate so we never deserialize a bomb. The ML-first
+        -- gate and compressed-size cap are the primary UI-thread defenses.
         local inflated = ld:DecompressDeflate(decodedBytes)
-        return { serializer:Deserialize(inflated or "") }
+        if type(inflated) ~= "string" or #inflated > Integration.MAX_DECOMPRESSED_BYTES then
+            return { false }
+        end
+        return { serializer:Deserialize(inflated) }
     end)
     if not ok or type(unpacked) ~= "table" or unpacked[1] ~= true then
         return result
@@ -306,6 +323,10 @@ function Integration.DecodeHistoryPayload(raw, libs, opts)
     local command = unpacked[2]
     local data = unpacked[3]
     if type(data) ~= "table" then
+        result.command = command
+        return result
+    end
+    if #data > Integration.MAX_HISTORY_DATA_FIELDS then
         result.command = command
         return result
     end
@@ -441,13 +462,21 @@ function Integration.HandleIncomingMessage(prefix, message, _distribution, sende
     if not Integration.IsSpectrumSessionActive() then
         return "no_session"
     end
-    local decoded = Integration.DecodeHistoryPayload(message)
-    if not decoded.ok then
+    if type(message) ~= "string" or message == "" then
         return "ignored"
     end
+    if #message > Integration.MAX_COMPRESSED_BYTES then
+        DebugInfo("Ignoring oversized RC payload from %s (%d bytes)", tostring(sender), #message)
+        return "too_large"
+    end
+    -- Sender is known before decode. Reject non-ML traffic without inflate.
     if not Integration.SenderIsCurrentMasterLooter(sender) then
         DebugInfo("Ignoring RC history from non-ML sender %s", tostring(sender))
         return "not_ml"
+    end
+    local decoded = Integration.DecodeHistoryPayload(message)
+    if not decoded.ok then
+        return "ignored"
     end
     return Integration.HandleHistory(sender, decoded.winner, decoded.history, "acecomm")
 end

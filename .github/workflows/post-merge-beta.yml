@@ -1,7 +1,7 @@
 name: Post-Merge Beta
 
-# Path filters start the workflow for addon-tree pushes. Release side effects
-# still classify github.event.before...github.sha with
+# Path filters start the workflow for addon-tree and pkgmeta.yaml pushes.
+# Release side effects still classify github.event.before...github.sha with
 # classify_promotion_scope.py so zip-excluded files cannot publish a beta
 # release. Do not encode individual ZIP_EXCLUDES here.
 on:
@@ -12,6 +12,7 @@ on:
       - 'SpectrumFederation/**'
       - 'SpectrumFederation_CursedSurgeTracker/**'
       - 'SpectrumFederation_RCLootCouncilIntegration/**'
+      - 'pkgmeta.yaml'
 
 concurrency:
   group: beta-release

@@ -5,7 +5,9 @@ Checks:
 - Parent and child addon directories exist at repo root
 - TOC files exist and are correctly named
 - TOC files have valid Interface fields and matching Version values
-- Test zip has both sibling addon folders at the top level
+- Child TOCs share the parent X-Wago-ID so WowUp/Wago install sibling folders
+- pkgmeta.yaml lifts each shipped addon to the zip root for CurseForge
+- Test zip has sibling addon folders at the top level
 """
 
 import argparse
@@ -20,6 +22,10 @@ CHILD_ADDON_NAMES = (
     "SpectrumFederation_RCLootCouncilIntegration",
 )
 ZIP_EXCLUDES = ["*.git*", "*/AGENTS.md"]
+PKGMETA_PATH = Path("pkgmeta.yaml")
+MOVE_FOLDERS_HEADER_RE = re.compile(r"^move-folders:\s*$")
+MOVE_FOLDERS_ENTRY_RE = re.compile(r"^\s+([^:#]+):\s*(\S+)\s*$")
+TOP_LEVEL_KEY_RE = re.compile(r"^[^\s].*:")
 
 
 def zip_create_command(zip_path, addon_names):
@@ -93,7 +99,7 @@ def validate_interface_field(toc_file):
 
 
 def validate_wago_project_id(parent_toc, child_toc=None):
-    """Verify the parent TOC has a public Wago project ID for direct publishing."""
+    """Verify parent and child TOCs share one public Wago project ID."""
     wago_id = toc_field(parent_toc, "X-Wago-ID")
     if not wago_id:
         print(f"::error ::No '## X-Wago-ID:' line found in {parent_toc}")
@@ -106,14 +112,82 @@ def validate_wago_project_id(parent_toc, child_toc=None):
         return False
     if child_toc is not None:
         child_wago_id = toc_field(child_toc, "X-Wago-ID")
-        if child_wago_id and child_wago_id != wago_id:
+        if not child_wago_id:
+            print(f"::error ::No '## X-Wago-ID:' line found in {child_toc}")
+            print(
+                "          WowUp and Wago install sibling folders that share the parent project ID"
+            )
+            return False
+        if child_wago_id != wago_id:
             print(
                 f"::error ::Child X-Wago-ID '{child_wago_id}' does not match parent '{wago_id}'"
             )
-            print("          Nested child addons share the parent Wago project; do not use a second ID")
+            print("          Child addons share the parent Wago project; do not use a second ID")
             return False
     print(f"[validate-packaging] Parent X-Wago-ID '{wago_id}' looks OK")
     return True
+
+
+def parse_pkgmeta_move_folders(pkgmeta_path):
+    """Return {source: destination} mappings from pkgmeta.yaml move-folders."""
+    moves = {}
+    in_move_folders = False
+    for raw_line in Path(pkgmeta_path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if MOVE_FOLDERS_HEADER_RE.match(line):
+            in_move_folders = True
+            continue
+        if in_move_folders:
+            if TOP_LEVEL_KEY_RE.match(line):
+                in_move_folders = False
+                continue
+            match = MOVE_FOLDERS_ENTRY_RE.match(line)
+            if match:
+                moves[match.group(1).strip()] = match.group(2).strip()
+    return moves
+
+
+def validate_pkgmeta_move_mapping(moves, addon_names):
+    """Require packager move-folders to lift each shipped addon to the zip root."""
+    if not addon_names:
+        print("::error ::No packaged addon names were provided for pkgmeta validation")
+        return False
+
+    parent_name = addon_names[0]
+    ok = True
+    expected_parent_source = f"{parent_name}/{parent_name}"
+    if moves.get(expected_parent_source) != parent_name:
+        print(
+            f"::error ::pkgmeta.yaml must move '{expected_parent_source}' to '{parent_name}'"
+        )
+        ok = False
+
+    for child_name in addon_names[1:]:
+        expected_source = f"{parent_name}/{child_name}"
+        if moves.get(expected_source) != child_name:
+            print(
+                f"::error ::pkgmeta.yaml must move '{expected_source}' to '{child_name}'"
+            )
+            print(
+                "          CurseForge and WowUp nest child addons inside the parent without this"
+            )
+            ok = False
+
+    if ok:
+        print("[validate-packaging] pkgmeta.yaml lifts parent and child addons to the zip root")
+    return ok
+
+
+def validate_pkgmeta_addon_folders(pkgmeta_path, addon_names):
+    """Verify pkgmeta.yaml exists and lifts every packaged addon to the zip root."""
+    pkgmeta = Path(pkgmeta_path)
+    if not pkgmeta.exists():
+        print(f"::error ::pkgmeta.yaml not found at {pkgmeta}")
+        print("          CurseForge and WowUp read this file when packaging from git")
+        return False
+    return validate_pkgmeta_move_mapping(parse_pkgmeta_move_folders(pkgmeta), addon_names)
 
 
 def validate_child_relationship(parent_name, child_name, parent_toc, child_toc):
@@ -248,6 +322,9 @@ def main():
         toc_files.append(toc_file)
 
     if not validate_wago_project_id(toc_files[0]):
+        sys.exit(1)
+
+    if not validate_pkgmeta_addon_folders(PKGMETA_PATH, addon_names):
         sys.exit(1)
 
     for index in range(1, len(addon_names)):

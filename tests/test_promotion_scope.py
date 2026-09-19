@@ -196,6 +196,23 @@ def test_child_addons_are_packaged_release_changes():
     assert scope.docs_changed is False
 
 
+def test_pkgmeta_change_requires_release_but_is_not_a_zip_member():
+    assert scope_mod.is_release_packaging_path("pkgmeta.yaml") is True
+    assert scope_mod.is_packaged_addon_path("pkgmeta.yaml") is False
+    scope = scope_mod.classify_files(["pkgmeta.yaml"])
+    assert flags(scope) == {
+        "addon_changed": True,
+        "docs_changed": False,
+        "readme_changed": False,
+        "changelog_changed": False,
+        "infra_changed": False,
+        "release_required": True,
+        "changelog_required": True,
+        "documentation_deploy_required": False,
+        "readme_work_required": True,
+    }
+
+
 def test_case_c_addon_and_documentation_are_independent_flags():
     scope = scope_mod.classify_files(
         ["SpectrumFederation/modules/core.lua", "docs/index.md"]
@@ -714,6 +731,17 @@ def test_promotion_detect_and_fast_forward_materialize_helper_for_leftover_beta(
     assert 'materialize_scope_helper "$WORKFLOW_SHA" \\\n            || materialize_scope_helper origin/main \\\n            || materialize_scope_helper HEAD' not in detect_block
 
 
+def test_validation_workflows_watch_pkgmeta_yaml():
+    repo = Path(__file__).resolve().parents[1]
+    for relative in (
+        ".github/workflows/pr-beta-validation.yml",
+        ".github/workflows/pr-main-validation.yml",
+        ".github/workflows/post-merge-beta.yml",
+    ):
+        text = (repo / relative).read_text(encoding="utf-8")
+        assert "- 'pkgmeta.yaml'" in text
+
+
 def test_pr_beta_validation_gates_release_checks_on_packaged_scope():
     workflow = (
         Path(__file__).resolve().parents[1]
@@ -763,6 +791,7 @@ def test_post_merge_beta_classifies_push_range_and_keeps_housekeeping():
     assert "git checkout origin/beta -- CHANGELOG.md README.md" in publish_if
     for root in scope_mod.ADDON_ROOTS:
         assert f"- '{root}/**'" in text
+    assert "- 'pkgmeta.yaml'" in text
 
 
 def _repo_beta_equals_main(tmp_path):
