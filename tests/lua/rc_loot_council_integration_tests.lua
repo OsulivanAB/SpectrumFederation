@@ -1073,51 +1073,52 @@ function Sync:IsSessionActive()
 end
 Integration.ClearSessionMemory()
 assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", AWARDER), "recorded", "remote history from the current ML is recorded")
-local decodeCalls = 0
-local originalDecode = Integration.DecodeHistoryPayload
-function Integration.DecodeHistoryPayload(...)
-    decodeCalls = decodeCalls + 1
-    return originalDecode(...)
-end
-assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", "Other-Garona"), "not_ml", "remote history from a non-ML is rejected")
-assertEq(decodeCalls, 0, "non-ML sender does not decode or inflate")
-assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "GUILD", "Guildie-OtherRealm"), "not_ml", "guild-distributed history from a non-ML is rejected")
-assertEq(decodeCalls, 0, "non-ML guild sender does not decode or inflate")
-local oversized = string.rep("x", Integration.MAX_COMPRESSED_BYTES + 1)
-assertEq(Integration.HandleIncomingMessage("RCLC", oversized, "RAID", AWARDER), "too_large", "oversized raw payload is rejected")
-assertEq(decodeCalls, 0, "oversized payload does not decode or inflate")
-Integration.DecodeHistoryPayload = originalDecode
+do
+    local decodeCalls = 0
+    local originalDecode = Integration.DecodeHistoryPayload
+    function Integration.DecodeHistoryPayload(...)
+        decodeCalls = decodeCalls + 1
+        return originalDecode(...)
+    end
+    assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", "Other-Garona"), "not_ml", "remote history from a non-ML is rejected")
+    assertEq(decodeCalls, 0, "non-ML sender does not decode or inflate")
+    assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "GUILD", "Guildie-OtherRealm"), "not_ml", "guild-distributed history from a non-ML is rejected")
+    assertEq(decodeCalls, 0, "non-ML guild sender does not decode or inflate")
+    assertEq(Integration.HandleIncomingMessage("RCLC", string.rep("x", Integration.MAX_COMPRESSED_BYTES + 1), "RAID", AWARDER), "too_large", "oversized raw payload is rejected")
+    assertEq(decodeCalls, 0, "oversized payload does not decode or inflate")
+    Integration.DecodeHistoryPayload = originalDecode
 
-local hugeInflate = passthroughLibs(function(_self)
-    return true, "history", { WINNER, realHistory }
-end)
-hugeInflate.LibDeflate.DecompressDeflate = function(_self, _bytes)
-    return string.rep("y", Integration.MAX_DECOMPRESSED_BYTES + 1)
-end
-assertFalse(Integration.DecodeHistoryPayload("payload", hugeInflate).ok, "over-inflated payload is rejected")
+    local hugeInflate = passthroughLibs(function(_self)
+        return true, "history", { WINNER, realHistory }
+    end)
+    hugeInflate.LibDeflate.DecompressDeflate = function(_self, _bytes)
+        return string.rep("y", Integration.MAX_DECOMPRESSED_BYTES + 1)
+    end
+    assertFalse(Integration.DecodeHistoryPayload("payload", hugeInflate).ok, "over-inflated payload is rejected")
 
-local inflateCalls = 0
-local oversizedRawLibs = passthroughLibs(function(_self)
-    return true, "history", { WINNER, realHistory }
-end)
-oversizedRawLibs.LibDeflate.DecompressDeflate = function(_self, bytes)
-    inflateCalls = inflateCalls + 1
-    return bytes
-end
-assertFalse(
-    Integration.DecodeHistoryPayload(string.rep("x", Integration.MAX_COMPRESSED_BYTES + 1), oversizedRawLibs).ok,
-    "oversized raw is rejected in DecodeHistoryPayload"
-)
-assertEq(inflateCalls, 0, "oversized raw does not inflate in DecodeHistoryPayload")
+    local inflateCalls = 0
+    local oversizedRawLibs = passthroughLibs(function(_self)
+        return true, "history", { WINNER, realHistory }
+    end)
+    oversizedRawLibs.LibDeflate.DecompressDeflate = function(_self, bytes)
+        inflateCalls = inflateCalls + 1
+        return bytes
+    end
+    assertFalse(
+        Integration.DecodeHistoryPayload(string.rep("x", Integration.MAX_COMPRESSED_BYTES + 1), oversizedRawLibs).ok,
+        "oversized raw is rejected in DecodeHistoryPayload"
+    )
+    assertEq(inflateCalls, 0, "oversized raw does not inflate in DecodeHistoryPayload")
 
-local wideData = {}
-for i = 1, Integration.MAX_HISTORY_DATA_FIELDS + 1 do
-    wideData[i] = i
+    local wideData = {}
+    for i = 1, Integration.MAX_HISTORY_DATA_FIELDS + 1 do
+        wideData[i] = i
+    end
+    local wideLibs = passthroughLibs(function(_self)
+        return true, "history", wideData
+    end)
+    assertFalse(Integration.DecodeHistoryPayload("payload", wideLibs).ok, "history data with too many fields is rejected")
 end
-local wideLibs = passthroughLibs(function(_self)
-    return true, "history", wideData
-end)
-assertFalse(Integration.DecodeHistoryPayload("payload", wideLibs).ok, "history data with too many fields is rejected")
 
 local localHistory = historyTable({ id = "1700000900-9" })
 local remoteCanonical = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, localHistory)
