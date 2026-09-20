@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.3-beta.1] - 2026-09-20
+
+### Changed
+- Loot Helper at-a-glance raid columns (#274)
+
 ## [1.5.2] - 2026-09-11
 
 ### Changed
