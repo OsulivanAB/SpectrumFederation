@@ -93,7 +93,7 @@ Profiles are keyed by stable ID and `activeProfileId` stores the local selection
 - current user's admin permission;
 - the **Show Members not in raid** preference.
 
-`RosterView.lua` renders a column roster (name, optional points, attendance percent, preparedness percent, BiS used/possible, readiness, details) and delegates point, add-member, and equipment actions to model/domain methods. The Points column uses the configured point name and is hidden in Reward Pot mode. `EquipmentWindow.lua` renders the profile's loot-category state and optionally overlays current Raid Check issues. The glance list refreshes from `DATA_CHANGED` and in-process troubleshooting listeners while the window is shown; it does not enable background inspect.
+`RosterView.lua` renders a column roster (name, optional points, attendance percent, preparedness percent, BiS used/possible, readiness, details) and delegates add-member and equipment actions to model/domain methods. Manual Attendance-point and loot-point adjustments live on **Loot Helper → Character**, not on roster arrows. The Points column uses the configured point name and is hidden in Reward Pot mode. `EquipmentWindow.lua` renders the profile's loot-category state and optionally overlays current Raid Check issues. The glance list refreshes from `DATA_CHANGED` and in-process troubleshooting listeners while the window is shown; it does not enable background inspect.
 
 Feature updates should fire or reuse `LootHelperEvents` so views refresh without polling.
 

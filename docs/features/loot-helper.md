@@ -36,7 +36,7 @@ Linked characters remain separate rows. When both are visible, identity-wide tot
 
 Profile admins can:
 
-- increase or decrease loot points in half-point steps in Point Based, or Attendance by one in Reward Pot;
+- increase or decrease Attendance points and loot points from **Loot Helper → Character** (these are not the roster Att.% or Prep. columns);
 - add current raid members to the profile;
 - mark equipment categories used or available;
 - create, select, rename, and delete profiles;

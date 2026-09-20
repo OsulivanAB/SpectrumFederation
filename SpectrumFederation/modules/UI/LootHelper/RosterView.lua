@@ -20,8 +20,6 @@ local PREP_WIDTH = 48
 local BIS_WIDTH = 44
 local READY_WIDTH = 18
 local COLUMN_GAP = 8
-local MANUAL_POINT_STEP = 0.5
-local MANUAL_ATTENDANCE_STEP = 1
 local READY_TEXTURE = {
     not_ready = "Interface\\RaidFrame\\ReadyCheck-NotReady",
     unknown = "Interface\\RaidFrame\\ReadyCheck-Waiting",
@@ -49,8 +47,6 @@ function View.GlanceColumns(model)
 end
 
 -- Cropping presets you can tweak quickly:
-local CROP_ICON   = 0.07  -- great for Interface\Icons\
-local CROP_ARROW  = 0.18  -- zooms in UI scrollbar arrows
 local CROP_PLUS   = 0.18  -- plus button has padding too
 local NO_CROP     = false -- special: full texture (0..1)
 
@@ -329,28 +325,7 @@ function View:_EnsureRow(i)
     ready.Icon = readyIcon
     r.Readiness = ready
 
-    -- -- Buttons 
-    -- r.BtnUp = CreateSmallIconButton(actions, "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up", BTN_SIZE)
-    -- r.BtnDown = CreateSmallIconButton(actions, "Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up", BTN_SIZE)
-    -- -- r.BtnHelmet = CreateSmallIconButton(actions, "Interface\\Icons\\INV_HELMET_03", BTN_SIZE)
-    -- r.BtnHelmet = CreateSmallIconButton(actions, "Interface\\PaperDollInfoFrame\\UI-EquipmentManager-Toggle", BTN_SIZE)
-    -- r.BtnPlus = CreateSmallIconButton(actions, "Interface\\Buttons\\UI-PlusButton-Up", BTN_SIZE)
-
-    -- Buttons
-    r.BtnUp = CreateSmallIconButton(actions,
-        "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up",
-        BTN_SIZE,
-        { crop = CROP_ARROW }
-    )
-
-    r.BtnDown = CreateSmallIconButton(actions,
-        "Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up",
-        BTN_SIZE,
-        { crop = CROP_ARROW }
-    )
-
     -- Helmet / equipment toggle: this texture tends to look best without heavy crop.
-    -- Try NO_CROP first; if it looks too small, switch to { crop = 0.10 } or { crop = CROP_ICON }.
     r.BtnHelmet = CreateSmallIconButton(actions,
         "Interface\\PaperDollInfoFrame\\UI-GearManager-Button",
         BTN_SIZE,
@@ -390,58 +365,6 @@ function View:_EnsureRow(i)
     return r
 end
 
--- function View:_LayoutButtons(r, model)
---     local actions = r.Actions
---     local x = 0
-
---     -- Helper to place visible buttons from right to left
---     local function Place(btn)
---         btn:ClearAllPoints()
---         btn:SetPoint("RIGHT", actions, "RIGHT", -x, 0)
---         x = x + BTN_SIZE + BTN_GAP
---     end
-
---     -- Hide all first
---     r.BtnUp:Hide()
---     r.BtnDown:Hide()
---     r.BtnHelmet:Hide()
---     r.BtnPlus:Hide()
-
---     -- Default: points visible only for profile members
---     if model.type == "PROFILE_MEMBER" then
---         r.Points:Show()
---         r.Points:SetText(tostring(model.points or 0))
---     else
---         r.Points:Hide()
---         r.Points:SetText("")
---     end
-
---     -- Buttons depending on row type/admin
---     if model.type == "RAID_NONMEMBER" then
---         if model.canAdmin then
---             r.BtnPlus:Show()
---         end
---     else
---         if model.canAdmin then
---             r.BtnHelmet:Show()
---             Place(r.BtnHelmet)
-
---             r.BtnDown:Show()
---             Place(r.BtnDown)
-
---             r.BtnUp:Show()
---             Place(r.BtnUp)
---         end
---     end
-
---     -- Place points to the left of the button stack
---     r.Points:ClearAllPoints()
---     if r.Points:IsShown() then
---         local rightPad = (x > 0) and (x + 6) or 0
---         r.Points:SetPoint("RIGHT", actions, "RIGHT", -rightPad, 0)
---     end
--- end
-
 function View:_LayoutButtons(r, model)
 	local actions = r.Actions
 	local x = 0
@@ -453,8 +376,6 @@ function View:_LayoutButtons(r, model)
 	end
 
 	-- Hide all first
-	r.BtnUp:Hide()
-	r.BtnDown:Hide()
 	r.BtnHelmet:Hide()
 	r.BtnPlus:Hide()
 
@@ -513,17 +434,6 @@ function View:_LayoutButtons(r, model)
 		r.BtnHelmet:Show()
 		r.BtnHelmet:Enable()
 		Place(r.BtnHelmet)
-
-		-- Up/Down buttons are admin-only (hide for non-admins)
-		if model.canAdmin then
-			r.BtnDown:Show()
-			r.BtnDown:Enable()
-			Place(r.BtnDown)
-
-			r.BtnUp:Show()
-			r.BtnUp:Enable()
-			Place(r.BtnUp)
-		end
 	end
 
 	-- Calculate the real width of the visible button stack
@@ -570,68 +480,11 @@ end
 
 function View:_BindRowActions(r, model)
     -- Clear old scripts
-    r.BtnUp:SetScript("OnClick", nil)
-    r.BtnDown:SetScript("OnClick", nil)
     r.BtnHelmet:SetScript("OnClick", nil)
     r.BtnPlus:SetScript("OnClick", nil)
 
     -- Profile member actions
     if model.type == "PROFILE_MEMBER" then
-        -- Up/Down buttons (admin only)
-        if model.canAdmin and model.member then
-            r.BtnUp:SetScript("OnClick", function()
-                if model.rewardPot then
-                    if model.member.IncrementAttendance then
-                        pcall(function()
-                            model.member:IncrementAttendance({
-                                amount = MANUAL_ATTENDANCE_STEP,
-                                reason = "MANUAL",
-                                profile = model.profile,
-                            })
-                        end)
-                    end
-                elseif model.member.IncrementPoints then
-                    pcall(function()
-                        model.member:IncrementPoints({
-                            amount = MANUAL_POINT_STEP,
-                            reason = "MANUAL",
-                            profile = model.profile,
-                        })
-                    end)
-                end
-                -- DATA_CHANGED event is automatically fired via Events.lua hook
-                if SF.Debug then
-                    SF.Debug:Info("LH_ROSTER_VIEW", "%s: %s", model.rewardPot and "IncrementAttendance" or "IncrementPoints", tostring(model.memberId))
-                end
-            end)
-            
-            r.BtnDown:SetScript("OnClick", function()
-                if model.rewardPot then
-                    if model.member.DecrementAttendance then
-                        pcall(function()
-                            model.member:DecrementAttendance({
-                                amount = MANUAL_ATTENDANCE_STEP,
-                                reason = "MANUAL",
-                                profile = model.profile,
-                            })
-                        end)
-                    end
-                elseif model.member.DecrementPoints then
-                    pcall(function()
-                        model.member:DecrementPoints({
-                            amount = MANUAL_POINT_STEP,
-                            reason = "MANUAL",
-                            profile = model.profile,
-                        })
-                    end)
-                end
-                -- DATA_CHANGED event is automatically fired via Events.lua hook
-                if SF.Debug then
-                    SF.Debug:Info("LH_ROSTER_VIEW", "%s: %s", model.rewardPot and "DecrementAttendance" or "DecrementPoints", tostring(model.memberId))
-                end
-            end)
-        end
-        
         -- Helmet button (visible for everyone)
         r.BtnHelmet:SetScript("OnClick", function()
             if self.controller and self.controller.OnEquipmentClicked then
@@ -693,16 +546,14 @@ function View:_EnsureHeader()
     return h
 end
 
-function View:_LayoutHeader(showPoints, pointName, hasAdmin)
+function View:_LayoutHeader(showPoints, pointName)
     local h = self:_EnsureHeader()
     h:ClearAllPoints()
     h:SetPoint("TOPLEFT", self.child, "TOPLEFT", 0, 0)
     h:SetPoint("TOPRIGHT", self.child, "TOPRIGHT", 0, 0)
 
+    -- Helmet or add-member is the only trailing action on a row.
     local actionWidth = BTN_SIZE
-    if hasAdmin then
-        actionWidth = (3 * BTN_SIZE) + (2 * BTN_GAP)
-    end
     local rightOffset = -(actionWidth + 4)
     local rightAnchor = h
 
@@ -775,7 +626,6 @@ function View:Render(models, meta)
 
     local showPoints = false
     local pointName = "Points"
-    local hasAdmin = false
     for i = 1, #models do
         local model = models[i]
         if model.type == "PROFILE_MEMBER" and model.showPoints then
@@ -784,11 +634,8 @@ function View:Render(models, meta)
                 pointName = model.pointName
             end
         end
-        if model.canAdmin then
-            hasAdmin = true
-        end
     end
-    self:_LayoutHeader(showPoints, pointName, hasAdmin)
+    self:_LayoutHeader(showPoints, pointName)
 
     local y = HEADER_HEIGHT + 2
     for i = 1, #models do

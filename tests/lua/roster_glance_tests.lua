@@ -300,6 +300,10 @@ assertTrue(not nonMemberCols.readiness, "raid non-members do not reserve glance 
 assertTrue(not nonMemberCols.preparedness, "raid non-members do not reserve preparedness")
 local viewSource = (io.open("SpectrumFederation/modules/UI/LootHelper/RosterView.lua", "r")):read("*a")
 assertTrue(viewSource:find('h.Preparedness:SetText("Prep.")', 1, true) ~= nil, "roster header labels preparedness Prep.")
+assertTrue(viewSource:find("r.BtnHelmet", 1, true) ~= nil, "equipment button remains on roster rows")
+assertTrue(viewSource:find("r.BtnUp", 1, true) == nil, "roster no longer creates up-arrow buttons")
+assertTrue(viewSource:find("IncrementAttendance", 1, true) == nil, "roster no longer increments Attendance points")
+assertTrue(viewSource:find("IncrementPoints", 1, true) == nil, "roster no longer increments loot points")
 
 local rosterBuilds = 0
 local readinessCallbacks = {}
