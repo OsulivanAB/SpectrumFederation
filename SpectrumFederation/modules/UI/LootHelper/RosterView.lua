@@ -22,11 +22,14 @@ local READY_WIDTH = 18
 local COLUMN_GAP = 8
 local READY_TEXTURE = {
     not_ready = "Interface\\RaidFrame\\ReadyCheck-NotReady",
-    unknown = "Interface\\RaidFrame\\ReadyCheck-Waiting",
 }
 
--- Ready players show no icon, but the column still occupies READY_WIDTH so
--- Att./BiS/Points stay aligned with not-ready and unknown rows.
+-- Ready and unknown rows show no icon. The column still occupies READY_WIDTH
+-- so Att./BiS/Points stay aligned with not-ready rows.
+function View.ShowsReadinessIcon(state)
+    return state == "not_ready"
+end
+
 function View.GlanceColumns(model)
     if type(model) ~= "table" or model.type ~= "PROFILE_MEMBER" then
         return {
@@ -395,21 +398,31 @@ function View:_LayoutButtons(r, model)
 		r.Preparedness:SetText(model.preparednessText or "—")
 		r.Bis:Show()
 		r.Bis:SetText(model.bisText or "—")
-		r.Readiness.Icon:SetTexture(READY_TEXTURE[model.readinessState])
 		r.Readiness:Show()
-		r.Readiness:SetScript("OnEnter", function(frame)
-			local tooltip = model.readinessTooltip
-			if tooltip and tooltip ~= "" and GameTooltip then
-				GameTooltip:SetOwner(frame, "ANCHOR_RIGHT")
-				GameTooltip:SetText(tooltip, nil, nil, nil, nil, true)
-				GameTooltip:Show()
-			end
-		end)
-		r.Readiness:SetScript("OnLeave", function()
-			if GameTooltip then
-				GameTooltip:Hide()
-			end
-		end)
+		if View.ShowsReadinessIcon(model.readinessState) then
+			r.Readiness.Icon:SetTexture(READY_TEXTURE.not_ready)
+			r.Readiness.Icon:Show()
+			r.Readiness:EnableMouse(true)
+			r.Readiness:SetScript("OnEnter", function(frame)
+				local tooltip = model.readinessTooltip
+				if tooltip and tooltip ~= "" and GameTooltip then
+					GameTooltip:SetOwner(frame, "ANCHOR_RIGHT")
+					GameTooltip:SetText(tooltip, nil, nil, nil, nil, true)
+					GameTooltip:Show()
+				end
+			end)
+			r.Readiness:SetScript("OnLeave", function()
+				if GameTooltip then
+					GameTooltip:Hide()
+				end
+			end)
+		else
+			r.Readiness.Icon:SetTexture(nil)
+			r.Readiness.Icon:Hide()
+			r.Readiness:EnableMouse(false)
+			r.Readiness:SetScript("OnEnter", nil)
+			r.Readiness:SetScript("OnLeave", nil)
+		end
 	else
 		r.Attendance:Hide()
 		r.Attendance:SetText("")

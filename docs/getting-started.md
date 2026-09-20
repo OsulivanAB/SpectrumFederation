@@ -59,7 +59,7 @@ For profile members:
 
 - In Point Based mode, the Points column uses the profile's point name.
 - In Reward Pot mode, the Points column is hidden and the current pot is shown above the list.
-- Each row also shows raid-check presence (Att.), preparedness (Prep.), BiS slots used out of possible slots, and an equipment-readiness icon.
+- Each row also shows raid-check presence (Att.), preparedness (Prep.), BiS slots used out of possible slots, and an equipment-readiness warning only when something is known to be missing.
 - Admins change Attendance points or loot points under **Loot Helper → Character**. Those balances are not the Att.% or Prep. columns.
 - The equipment button opens that member's equipment-category history.
 - Admins can mark equipment categories used or available; all users can view them.

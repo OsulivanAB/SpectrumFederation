@@ -26,7 +26,7 @@ Profile members show their class or specialization icon, class-colored name, gla
 - **Att.** is raid-check presence as a percentage. A player is credited when they were in the group at the start of a Raid Check, whether or not their gear was prepared. Players with no recorded presence opportunities show `—`.
 - **Prep.** is raid-check preparedness as a percentage. A player is credited only when they were present and classified Prepared by the same Raid Check equipment rules (verified enchants and gems). Inspection Failed and out-of-range-without-recent-verify do not count as prepared. Older presence logs that predate this field show `—` rather than inventing a 0% history.
 - **BiS** is slots already used out of the player's possible BiS slots, using the same identity projection as the equipment popup.
-- The readiness icon evaluates current Raid Check enchant/gem rules from cached equipment only. Out of range does not by itself mean Not Ready. Hover a warning for the missing requirements.
+- The readiness icon appears only when cached equipment is known to be missing a Raid Check requirement. Ready and unknown rows leave that space blank. Out of range does not by itself mean Not Ready. Hover a warning for the missing requirements.
 
 When you are in a raid, the window also identifies raid members who are not in the active profile. An admin can add them with the plus button. The **Show Members not in raid** setting controls whether absent profile members remain visible.
 
