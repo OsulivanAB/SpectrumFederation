@@ -10,12 +10,21 @@ View.__index = View
 
 local ROW_HEIGHT = 24
 local ROW_SPACING = 2
+local HEADER_HEIGHT = 18
 local ICON_SIZE = 20
 local BTN_SIZE = 20
 local BTN_GAP = 3
-local POINTS_WIDTH = 32
+local POINTS_WIDTH = 40
+local ATTENDANCE_WIDTH = 48
+local BIS_WIDTH = 44
+local READY_WIDTH = 18
+local COLUMN_GAP = 8
 local MANUAL_POINT_STEP = 0.5
 local MANUAL_ATTENDANCE_STEP = 1
+local READY_TEXTURE = {
+    not_ready = "Interface\\RaidFrame\\ReadyCheck-NotReady",
+    unknown = "Interface\\RaidFrame\\ReadyCheck-Waiting",
+}
 
 -- Cropping presets you can tweak quickly:
 local CROP_ICON   = 0.07  -- great for Interface\Icons\
@@ -226,6 +235,20 @@ function View:ApplyStyle(fontPath, fontSize)
         if r.Points and r.Points.SetFont then
             r.Points:SetFont(fontPath, fontSize, "")
         end
+        if r.Attendance and r.Attendance.SetFont then
+            r.Attendance:SetFont(fontPath, fontSize, "")
+        end
+        if r.Bis and r.Bis.SetFont then
+            r.Bis:SetFont(fontPath, fontSize, "")
+        end
+    end
+
+    if self.header then
+        for _, label in ipairs({ self.header.Name, self.header.Points, self.header.Attendance, self.header.Bis }) do
+            if label and label.SetFont then
+                label:SetFont(fontPath, fontSize, "")
+            end
+        end
     end
 
     if self.emptyText and self.emptyText.SetFont then
@@ -252,11 +275,29 @@ function View:_EnsureRow(i)
     actions:SetWidth(1)
     r.Actions = actions
 
-    -- Points
+    -- Glance columns
     local pts = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     pts:SetJustifyH("RIGHT")
     pts:SetWidth(POINTS_WIDTH)
     r.Points = pts
+
+    local attendance = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    attendance:SetJustifyH("RIGHT")
+    attendance:SetWidth(ATTENDANCE_WIDTH)
+    r.Attendance = attendance
+
+    local bis = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    bis:SetJustifyH("RIGHT")
+    bis:SetWidth(BIS_WIDTH)
+    r.Bis = bis
+
+    local ready = CreateFrame("Frame", nil, r)
+    ready:SetSize(READY_WIDTH, READY_WIDTH)
+    ready:EnableMouse(true)
+    local readyIcon = ready:CreateTexture(nil, "ARTWORK")
+    readyIcon:SetAllPoints(ready)
+    ready.Icon = readyIcon
+    r.Readiness = ready
 
     -- -- Buttons 
     -- r.BtnUp = CreateSmallIconButton(actions, "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up", BTN_SIZE)
@@ -311,6 +352,8 @@ function View:_EnsureRow(i)
     if self.fontPath and self.fontSize then
         r.Name:SetFont(self.fontPath, self.fontSize, "")
         r.Points:SetFont(self.fontPath, self.fontSize, "")
+        r.Attendance:SetFont(self.fontPath, self.fontSize, "")
+        r.Bis:SetFont(self.fontPath, self.fontSize, "")
     end
 
     self.rows[i] = r
@@ -385,13 +428,50 @@ function View:_LayoutButtons(r, model)
 	r.BtnHelmet:Hide()
 	r.BtnPlus:Hide()
 
-	-- Points: only for profile members
-	if model.type == "PROFILE_MEMBER" then
+	local showPoints = model.type == "PROFILE_MEMBER" and model.showPoints
+	if showPoints then
 		r.Points:Show()
 		r.Points:SetText(FormatPointAmount(model.points or 0))
 	else
 		r.Points:Hide()
 		r.Points:SetText("")
+	end
+
+	if model.type == "PROFILE_MEMBER" then
+		r.Attendance:Show()
+		r.Attendance:SetText(model.attendanceText or "—")
+		r.Bis:Show()
+		r.Bis:SetText(model.bisText or "—")
+		local readyState = model.readinessState
+		local readyTex = READY_TEXTURE[readyState]
+		if readyTex then
+			r.Readiness.Icon:SetTexture(readyTex)
+			r.Readiness:Show()
+		else
+			r.Readiness.Icon:SetTexture(nil)
+			r.Readiness:Hide()
+		end
+		r.Readiness:SetScript("OnEnter", function(frame)
+			local tooltip = model.readinessTooltip
+			if tooltip and tooltip ~= "" and GameTooltip then
+				GameTooltip:SetOwner(frame, "ANCHOR_RIGHT")
+				GameTooltip:SetText(tooltip, nil, nil, nil, nil, true)
+				GameTooltip:Show()
+			end
+		end)
+		r.Readiness:SetScript("OnLeave", function()
+			if GameTooltip then
+				GameTooltip:Hide()
+			end
+		end)
+	else
+		r.Attendance:Hide()
+		r.Attendance:SetText("")
+		r.Bis:Hide()
+		r.Bis:SetText("")
+		r.Readiness:Hide()
+		r.Readiness:SetScript("OnEnter", nil)
+		r.Readiness:SetScript("OnLeave", nil)
 	end
 
 	-- Buttons depending on row type/admin
@@ -428,24 +508,33 @@ function View:_LayoutButtons(r, model)
 	-- Make the actions frame only as wide as needed for the buttons
 	actions:SetWidth(math.max(1, buttonsWidth))
 
-	-- Place points relative to either the button stack or the row edge
-	r.Points:ClearAllPoints()
-	if r.Points:IsShown() then
-		if buttonsWidth > 0 then
-			r.Points:SetPoint("RIGHT", actions, "LEFT", -6, 0)
-		else
-			r.Points:SetPoint("RIGHT", r, "RIGHT", -4, 0)
-		end
+	local rightAnchor = r
+	local rightOffset = -4
+	if buttonsWidth > 0 then
+		rightAnchor = actions
+		rightOffset = -6
 	end
 
-	-- IMPORTANT: Anchor the name to the actual right-side content (not the container)
+	local function PlaceColumn(widget, shown, width)
+		widget:ClearAllPoints()
+		if shown then
+			widget:SetPoint("RIGHT", rightAnchor, "LEFT", rightOffset, 0)
+			rightAnchor = widget
+			rightOffset = -COLUMN_GAP
+			return width
+		end
+		return 0
+	end
+
+	PlaceColumn(r.Readiness, r.Readiness:IsShown(), READY_WIDTH)
+	PlaceColumn(r.Bis, r.Bis:IsShown(), BIS_WIDTH)
+	PlaceColumn(r.Attendance, r.Attendance:IsShown(), ATTENDANCE_WIDTH)
+	PlaceColumn(r.Points, r.Points:IsShown(), POINTS_WIDTH)
+
 	r.Name:ClearAllPoints()
 	r.Name:SetPoint("LEFT", r.Icon, "RIGHT", 8, 0)
-
-	if r.Points:IsShown() then
-		r.Name:SetPoint("RIGHT", r.Points, "LEFT", -8, 0)
-	elseif buttonsWidth > 0 then
-		r.Name:SetPoint("RIGHT", actions, "LEFT", -8, 0)
+	if rightAnchor ~= r or buttonsWidth > 0 then
+		r.Name:SetPoint("RIGHT", rightAnchor, "LEFT", -COLUMN_GAP, 0)
 	else
 		r.Name:SetPoint("RIGHT", r, "RIGHT", -4, 0)
 	end
@@ -539,6 +628,83 @@ function View:_BindRowActions(r, model)
     end
 end
 
+function View:_EnsureHeader()
+    if self.header then
+        return self.header
+    end
+
+    local h = CreateFrame("Frame", nil, self.child)
+    h:SetHeight(HEADER_HEIGHT)
+
+    local function MakeLabel(justify)
+        local text = h:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+        text:SetJustifyH(justify or "RIGHT")
+        text:SetTextColor(0.8, 0.8, 0.8)
+        return text
+    end
+
+    h.Name = MakeLabel("LEFT")
+    h.Points = MakeLabel("RIGHT")
+    h.Attendance = MakeLabel("RIGHT")
+    h.Bis = MakeLabel("RIGHT")
+    h.Name:SetText("Raider")
+    h.Attendance:SetText("Att.")
+    h.Bis:SetText("BiS")
+
+    if self.fontPath and self.fontSize then
+        h.Name:SetFont(self.fontPath, self.fontSize, "")
+        h.Points:SetFont(self.fontPath, self.fontSize, "")
+        h.Attendance:SetFont(self.fontPath, self.fontSize, "")
+        h.Bis:SetFont(self.fontPath, self.fontSize, "")
+    end
+
+    self.header = h
+    return h
+end
+
+function View:_LayoutHeader(showPoints, pointName, hasAdmin)
+    local h = self:_EnsureHeader()
+    h:ClearAllPoints()
+    h:SetPoint("TOPLEFT", self.child, "TOPLEFT", 0, 0)
+    h:SetPoint("TOPRIGHT", self.child, "TOPRIGHT", 0, 0)
+
+    local actionWidth = BTN_SIZE
+    if hasAdmin then
+        actionWidth = (3 * BTN_SIZE) + (2 * BTN_GAP)
+    end
+    local rightOffset = -(actionWidth + 4)
+    local rightAnchor = h
+
+    h.Bis:ClearAllPoints()
+    h.Bis:SetWidth(BIS_WIDTH)
+    h.Bis:SetPoint("RIGHT", rightAnchor, "RIGHT", rightOffset - READY_WIDTH - COLUMN_GAP, 0)
+
+    h.Attendance:ClearAllPoints()
+    h.Attendance:SetWidth(ATTENDANCE_WIDTH)
+    h.Attendance:SetPoint("RIGHT", h.Bis, "LEFT", -COLUMN_GAP, 0)
+
+    h.Points:ClearAllPoints()
+    h.Points:SetWidth(POINTS_WIDTH)
+    if showPoints then
+        h.Points:SetText(pointName or "Points")
+        h.Points:Show()
+        h.Points:SetPoint("RIGHT", h.Attendance, "LEFT", -COLUMN_GAP, 0)
+    else
+        h.Points:SetText("")
+        h.Points:Hide()
+    end
+
+    h.Name:ClearAllPoints()
+    h.Name:SetPoint("LEFT", h, "LEFT", 4 + ICON_SIZE + 8, 0)
+    if showPoints then
+        h.Name:SetPoint("RIGHT", h.Points, "LEFT", -COLUMN_GAP, 0)
+    else
+        h.Name:SetPoint("RIGHT", h.Attendance, "LEFT", -COLUMN_GAP, 0)
+    end
+    h:Show()
+    return h
+end
+
 function View:Render(models, meta)
     meta = meta or {}
 
@@ -548,6 +714,9 @@ function View:Render(models, meta)
 
     -- Empty state
     if not models or #models == 0 then
+        if self.header then
+            self.header:Hide()
+        end
         for i = 1, #self.rows do
             self.rows[i]:Hide()
         end
@@ -569,7 +738,24 @@ function View:Render(models, meta)
 
     self.emptyText:Hide()
 
-    local y = 0
+    local showPoints = false
+    local pointName = "Points"
+    local hasAdmin = false
+    for i = 1, #models do
+        local model = models[i]
+        if model.type == "PROFILE_MEMBER" and model.showPoints then
+            showPoints = true
+            if type(model.pointName) == "string" and model.pointName ~= "" then
+                pointName = model.pointName
+            end
+        end
+        if model.canAdmin then
+            hasAdmin = true
+        end
+    end
+    self:_LayoutHeader(showPoints, pointName, hasAdmin)
+
+    local y = HEADER_HEIGHT + 2
     for i = 1, #models do
         local model = models[i]
         local r = self:_EnsureRow(i)

@@ -94,8 +94,10 @@ function Controller:EvaluateVisibility(reason)
         if not f:IsShown() then
             f:Show()
         end
+        self:_BindReadinessListener()
         self:RequestRefresh("Shown")
     else
+        self:_UnbindReadinessListener()
         if f:IsShown() then
             f:Hide()
             -- Also hide equipment window when main window hides
@@ -569,6 +571,32 @@ function Controller:_BindLootHelperEvents()
     end, self)
 
     self._boundLHEvents = true
+end
+
+function Controller:_BindReadinessListener()
+    if self._readinessListenerBound then
+        return
+    end
+    if not (SF.RaidCheck and SF.RaidCheck.RegisterTroubleshootingListener) then
+        return
+    end
+    SF.RaidCheck:RegisterTroubleshootingListener("lootHelperRoster", function()
+        local frame = self:GetFrame()
+        if frame and frame:IsShown() then
+            self:RequestRefresh("EquipmentCache")
+        end
+    end)
+    self._readinessListenerBound = true
+end
+
+function Controller:_UnbindReadinessListener()
+    if not self._readinessListenerBound then
+        return
+    end
+    if SF.RaidCheck and SF.RaidCheck.UnregisterTroubleshootingListener then
+        SF.RaidCheck:UnregisterTroubleshootingListener("lootHelperRoster")
+    end
+    self._readinessListenerBound = false
 end
 
 -- ===================================================

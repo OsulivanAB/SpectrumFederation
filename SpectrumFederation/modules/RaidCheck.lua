@@ -3078,6 +3078,22 @@ function RC:_ApplyCheckConsequences(run)
 		end
 	end
 
+	if mode == "raid" and profile.RecordRaidCheckPresence then
+		local opportunityId = tostring(run.id or "")
+		if type(run.profileId) == "string" and run.profileId ~= "" then
+			opportunityId = run.profileId .. ":" .. opportunityId
+		end
+		if opportunityId ~= "" then
+			profile:RecordRaidCheckPresence({
+				opportunityId = opportunityId,
+				presentMembers = run.groupMemberIds or {},
+				eligibleMembers = run.rosterMemberIds or {},
+				logAuthor = "Raid Check",
+				skipBroadcast = skipBroadcast,
+			})
+		end
+	end
+
 	if mode == "raid" and rewardPot and CheckRun.AnyUnpreparedForPot(results) and profile.AdjustRewardPot then
 		local amount, deductionType, percent = profile:ComputeRewardPotDeductionCopper()
 		if amount and amount > 0 then
@@ -3240,7 +3256,8 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 	if profile.GetMemberIds then
 		memberIds = profile:GetMemberIds() or {}
 	end
-	local targetIds = CheckRun.IntersectMembershipAndGroup(memberIds, CollectGroupMemberIds())
+	local groupMemberIds = CollectGroupMemberIds()
+	local targetIds = CheckRun.IntersectMembershipAndGroup(memberIds, groupMemberIds)
 	local now = GetTime and GetTime() or 0
 	local run = CheckRun.NewRun({
 		id = tostring(now),
@@ -3251,6 +3268,8 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 		startedSessionForCheck = opts.startedSessionForCheck and true or false,
 		sessionMismatch = opts.sessionMismatch and true or false,
 		targetIds = targetIds,
+		groupMemberIds = groupMemberIds,
+		rosterMemberIds = memberIds,
 		now = now,
 	})
 	run.cfg = cfg
@@ -3511,4 +3530,93 @@ function RC:GetTroubleshootingSlotsForUnit(unit, cfg)
 		metaGemPending = metaGemPending,
 		slots = BuildTroubleshootingSlots(inspectState, cfg),
 	}
+end
+
+local READINESS_UNKNOWN_TOOLTIP = "Current equipment readiness could not be determined."
+
+local function FormatReadinessTooltip(readiness)
+	if type(readiness) ~= "table" then
+		return READINESS_UNKNOWN_TOOLTIP
+	end
+	if readiness.state == "not_ready" then
+		local missing = readiness.missing
+		if type(missing) == "table" and #missing > 0 then
+			return table.concat(missing, "\n")
+		end
+		return "Known equipment does not satisfy current Raid Check requirements."
+	end
+	if readiness.state == "ready" then
+		return "Known equipment satisfies current Raid Check requirements."
+	end
+	return READINESS_UNKNOWN_TOOLTIP
+end
+
+local function ReadinessFromPolicyResult(policy)
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if Policy and Policy.ReadinessFromObservation and type(policy) == "table" and policy.complete then
+		local readiness = {
+			state = policy.prepared and "ready" or "not_ready",
+			missing = policy.missing or {},
+			incompleteReason = nil,
+		}
+		readiness.tooltip = FormatReadinessTooltip(readiness)
+		return readiness
+	end
+	return nil
+end
+
+-- Read-only equipment readiness for the Loot Helper glance list.
+-- Uses cached inspect / last-good / local player data only. Does not queue inspects.
+function RC:GetCachedEquipmentReadiness(unit, memberId)
+	local unknown = {
+		state = "unknown",
+		missing = {},
+		incompleteReason = "missing_observation",
+		tooltip = READINESS_UNKNOWN_TOOLTIP,
+	}
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if not (Policy and Policy.ReadinessFromObservation) then
+		return unknown
+	end
+
+	local observation = nil
+	local isSelf = unit and UnitIsUnit and UnitIsUnit(unit, "player")
+	if not isSelf and (not unit or unit == "player") and memberId and SF.NameUtil and SF.NameUtil.GetSelfId and SF.NameUtil.SamePlayer then
+		local selfId = SF.NameUtil.GetSelfId()
+		if selfId and SF.NameUtil.SamePlayer(memberId, selfId) then
+			isSelf = true
+			unit = unit or "player"
+		end
+	end
+
+	if isSelf then
+		local captured = self:_GetLocalTroubleshootingSnapshot()
+		if captured and captured.slotsByInventory then
+			observation = BuildPolicyObservation(captured)
+		end
+	else
+		local state = self:_GetInspectState()
+		local aliases = self:_GetInspectAliases(unit, { id = memberId })
+		local entry = self:_GetInspectCacheEntryByAliases(aliases)
+		if (not entry or not entry.slotsByInventory) and memberId then
+			entry = self:_GetInspectCacheEntryByAliases({ memberId })
+		end
+		if entry and entry.slotsByInventory and HasEquipmentData(entry.slotsByInventory) then
+			observation = BuildPolicyObservation(entry)
+		elseif memberId and state.lastGood and state.lastGood[memberId] then
+			local lastGood = state.lastGood[memberId]
+			if lastGood.observation then
+				observation = lastGood.observation
+			else
+				local fromPolicy = ReadinessFromPolicyResult(lastGood.policy)
+				if fromPolicy then
+					return fromPolicy
+				end
+			end
+		end
+	end
+
+	local readiness = Policy.ReadinessFromObservation(observation)
+	readiness.tooltip = FormatReadinessTooltip(readiness)
+	return readiness
 end

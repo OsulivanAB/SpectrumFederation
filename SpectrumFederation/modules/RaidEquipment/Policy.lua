@@ -384,3 +384,39 @@ function Policy.EvaluateCompleteness(observation)
 		reason = result.incompleteReason,
 	}
 end
+
+-- Map a Policy observation to the Raid Equipment glance readiness states.
+-- Incomplete or missing observations stay Unknown; range/presence is not a Policy concern.
+function Policy.ReadinessFromObservation(observation)
+	if type(observation) ~= "table" then
+		return {
+			state = "unknown",
+			missing = {},
+			incompleteReason = "missing_observation",
+		}
+	end
+	local result = Policy.EvaluateObservation(observation)
+	if not result.complete then
+		return {
+			state = "unknown",
+			missing = {},
+			incompleteReason = result.incompleteReason,
+		}
+	end
+	if result.prepared then
+		return {
+			state = "ready",
+			missing = {},
+			incompleteReason = nil,
+		}
+	end
+	local missing = {}
+	for i = 1, #(result.missing or {}) do
+		missing[i] = result.missing[i]
+	end
+	return {
+		state = "not_ready",
+		missing = missing,
+		incompleteReason = nil,
+	}
+end

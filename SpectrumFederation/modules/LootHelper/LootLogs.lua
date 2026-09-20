@@ -27,6 +27,7 @@ local EVENT_TYPES = {
     REWARD_POT_CONFIG_CHANGE    = "REWARD_POT_CONFIG_CHANGE",
     REWARD_POT_CHANGE           = "REWARD_POT_CHANGE",
     ATTENDANCE_CHANGE           = "ATTENDANCE_CHANGE",
+    RAID_CHECK_PRESENCE         = "RAID_CHECK_PRESENCE",
     RC_LOOT_COUNCIL             = "RC_LOOT_COUNCIL",
     SPEC_CHANGE                = "SPEC_CHANGE",
     BIS_OUTCOME                = "BIS_OUTCOME",
@@ -140,6 +141,11 @@ local EVENT_DATA_TEMPLATES = {
         change = "" -- INCREMENT/DECREMENT
         -- @field amount number|nil positive attendance amount
         -- @field reason string|nil RAID_CHECK or MANUAL
+    },
+    [EVENT_TYPES.RAID_CHECK_PRESENCE] = {
+        opportunityId = "",
+        presentMembers = {},
+        eligibleMembers = {},
     },
     [EVENT_TYPES.RC_LOOT_COUNCIL] = {
         member = "",
@@ -574,6 +580,10 @@ function LootLog.new(eventType, eventData, opts)
         end
     elseif eventType == EVENT_TYPES.ATTENDANCE_CHANGE then
         if not SF.LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_TYPES, owningProfile) then
+            return nil
+        end
+    elseif eventType == EVENT_TYPES.RAID_CHECK_PRESENCE then
+        if not SF.LootLogValidators.ValidateRaidCheckPresenceData(eventData) then
             return nil
         end
     elseif eventType == EVENT_TYPES.RC_LOOT_COUNCIL then

@@ -11,6 +11,7 @@ The log includes:
 - profile creation and renames;
 - loot-point increases and decreases, including Raid Check awards;
 - Attendance increases and decreases, including Raid Check awards;
+- Raid Check presence snapshots used for the roster attendance percentage;
 - loot-mode changes;
 - Reward Pot starting amount and deduction settings;
 - Reward Pot gold added, subtracted, or deducted by Raid Check;

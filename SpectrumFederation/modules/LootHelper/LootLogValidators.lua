@@ -620,6 +620,60 @@ function LootLogValidators.ValidateAttendanceChangeData(eventData, POINT_CHANGE_
     return true
 end
 
+local function NormalizePresenceIdList(list)
+    local out = {}
+    local seen = {}
+    if type(list) ~= "table" then
+        return nil
+    end
+    for i = 1, #list do
+        local id = list[i]
+        if type(id) ~= "string" or id == "" then
+            return nil
+        end
+        local normalized = id
+        if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
+            normalized = SF.NameUtil.NormalizeNameRealm(id) or id
+        end
+        if type(normalized) ~= "string" or normalized == "" then
+            return nil
+        end
+        if not seen[normalized] then
+            seen[normalized] = true
+            out[#out + 1] = normalized
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+-- Function to validate RAID_CHECK_PRESENCE event data.
+-- Presence lists may include raid members who are not yet on the roster.
+-- @param eventData (table) - Event data to validate
+-- @return (boolean) - True if valid, false otherwise
+function LootLogValidators.ValidateRaidCheckPresenceData(eventData)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    if type(eventData.opportunityId) ~= "string" or eventData.opportunityId == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Raid Check presence log is missing opportunityId")
+        end
+        return false
+    end
+    local presentMembers = NormalizePresenceIdList(eventData.presentMembers)
+    local eligibleMembers = NormalizePresenceIdList(eventData.eligibleMembers)
+    if not presentMembers or not eligibleMembers then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Raid Check presence log has invalid member lists")
+        end
+        return false
+    end
+    eventData.presentMembers = presentMembers
+    eventData.eligibleMembers = eligibleMembers
+    return true
+end
+
 -- Function to validate RC_LOOT_COUNCIL event data
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise

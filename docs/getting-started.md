@@ -57,8 +57,9 @@ Join a raid with the people you want to add. In the Loot Helper roster, players 
 
 For profile members:
 
-- In Point Based mode, the up and down buttons adjust the member's loot-point balance in half-point steps.
-- In Reward Pot mode, those buttons adjust Attendance by one, and the current pot is shown above the list.
+- In Point Based mode, the Points column uses the profile's point name, and the up and down buttons adjust that balance in half-point steps.
+- In Reward Pot mode, the Points column is hidden, those buttons adjust Attendance by one, and the current pot is shown above the list.
+- Each row also shows raid-check presence, BiS slots used out of possible slots, and an equipment-readiness icon.
 - The equipment button opens that member's equipment-category history.
 - Admins can mark equipment categories used or available; all users can view them.
 

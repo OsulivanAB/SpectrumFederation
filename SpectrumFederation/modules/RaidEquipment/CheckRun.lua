@@ -166,6 +166,8 @@ function CheckRun.NewRun(opts)
 		startedSessionForCheck = opts.startedSessionForCheck and true or false,
 		sessionMismatch = opts.sessionMismatch and true or false,
 		targetIds = targetIds,
+		groupMemberIds = opts.groupMemberIds or {},
+		rosterMemberIds = opts.rosterMemberIds or {},
 		players = players,
 		pauseReasons = {},
 		activeElapsed = 0,
