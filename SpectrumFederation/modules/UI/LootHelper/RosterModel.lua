@@ -284,14 +284,42 @@ function Model:Build(profile)
             local m = entry.member
             local points = (m and m.GetPointBalance and m:GetPointBalance()) or (m and m.pointBalance) or 0
             if profile.GetIdentityPoints then
-                points = profile:GetIdentityPoints(id)
+                local okPoints, identityPoints = pcall(profile.GetIdentityPoints, profile, id)
+                if okPoints then
+                    points = identityPoints
+                elseif SF.Debug then
+                    SF.Debug:Warn("LH_ROSTER", "GetIdentityPoints failed for %s: %s", tostring(id), tostring(identityPoints))
+                end
             end
             local attendanceText = "—"
             if profile.GetRaidCheckAttendanceDisplay then
-                attendanceText = profile:GetRaidCheckAttendanceDisplay(id)
+                local okAtt, att = pcall(profile.GetRaidCheckAttendanceDisplay, profile, id)
+                if okAtt and type(att) == "string" and att ~= "" then
+                    attendanceText = att
+                elseif not okAtt and SF.Debug then
+                    SF.Debug:Warn("LH_ROSTER", "GetRaidCheckAttendanceDisplay failed for %s: %s", tostring(id), tostring(att))
+                end
             end
-            local bisUsed, bisPossible = CountBisSlots(profile, id)
-            local readiness = BuildReadiness(raidInfo and raidInfo.unit or nil, id)
+            local bisUsed, bisPossible = 0, 16
+            local okBis, used, possible = pcall(CountBisSlots, profile, id)
+            if okBis then
+                bisUsed, bisPossible = used, possible
+            elseif SF.Debug then
+                SF.Debug:Warn("LH_ROSTER", "CountBisSlots failed for %s: %s", tostring(id), tostring(used))
+            end
+            local readiness
+            local okReady, readyResult = pcall(BuildReadiness, raidInfo and raidInfo.unit or nil, id)
+            if okReady and type(readyResult) == "table" then
+                readiness = readyResult
+            else
+                if not okReady and SF.Debug then
+                    SF.Debug:Warn("LH_ROSTER", "BuildReadiness failed for %s: %s", tostring(id), tostring(readyResult))
+                end
+                readiness = {
+                    state = "unknown",
+                    tooltip = "Current equipment readiness could not be determined.",
+                }
+            end
             local resolvedClass = (raidInfo and raidInfo.class) or entry.class or self._classByMemberId[id] or "UNKNOWN"
             if resolvedClass == "UNKNOWN" and SF.Debug then
                 SF.Debug:Warn("LH_ICON", "Unable to resolve class metadata (member=%s classRaw=%s inRaid=%s)",
@@ -306,6 +334,7 @@ function Model:Build(profile)
                 type = "PROFILE_MEMBER",
                 memberId = id,
                 displayName = ShortName(id),
+                sortKey = string.lower(ShortName(id)),
                 class = resolvedClass,
                 unit = raidInfo and raidInfo.unit or nil,
                 points = tonumber(points) or 0,

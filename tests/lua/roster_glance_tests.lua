@@ -195,6 +195,55 @@ assertEq(potRows[1].attendanceText ~= nil and potRows[1].attendanceText ~= "", t
 
 assertEq(inspectQueued, 0, "roster build does not queue inspects")
 
+function IsInRaid()
+    return false
+end
+SF.SettingsStore = {
+    Get = function(_, path)
+        if path == "lootHelper.showMembersNotInRaid" then
+            return true
+        end
+        return nil
+    end,
+}
+local outOfRaidRows, outOfRaidMeta = Model:Build(makeProfile(false))
+assertEq(#outOfRaidRows, 2, "showMembersNotInRaid lists profile members outside a raid")
+assertTrue(outOfRaidRows[1].sortKey ~= nil and outOfRaidRows[1].sortKey ~= "", "out-of-raid rows have a sort key")
+assertTrue(outOfRaidMeta.emptyText == nil, "populated out-of-raid roster has no empty-state copy")
+
+SF.SettingsStore.Get = function()
+    return false
+end
+local hiddenRows, hiddenMeta = Model:Build(makeProfile(false))
+assertEq(#hiddenRows, 0, "setting off hides profile members outside a raid")
+assertTrue(
+    type(hiddenMeta.emptyText) == "string" and hiddenMeta.emptyText:find("Show Members not in raid", 1, true) ~= nil,
+    "empty copy tells the player to enable the setting"
+)
+
+SF.SettingsStore.Get = function()
+    return true
+end
+local boomProfile = makeProfile(false)
+function boomProfile:GetIdentityPoints()
+    error("identity boom")
+end
+function boomProfile:GetRaidCheckAttendanceDisplay()
+    error("attendance boom")
+end
+local originalReady = SF.RaidCheck.GetCachedEquipmentReadiness
+function SF.RaidCheck:GetCachedEquipmentReadiness()
+    error("UnitGUID(): Invalid unit")
+end
+local boomRows = Model:Build(boomProfile)
+assertEq(#boomRows, 2, "glance helper errors do not wipe the out-of-raid roster")
+assertEq(boomRows[1].readinessState, "unknown", "failed readiness falls back to unknown")
+SF.RaidCheck.GetCachedEquipmentReadiness = originalReady
+
+function IsInRaid()
+    return true
+end
+
 local raidCheck = (io.open("SpectrumFederation/modules/RaidCheck.lua", "r")):read("*a")
 assertTrue(raidCheck:find("function RC:GetCachedEquipmentReadiness", 1, true) ~= nil, "read-only readiness API exists")
 local api = raidCheck:match("function RC:GetCachedEquipmentReadiness.-function RC:")
@@ -203,6 +252,8 @@ if not api then
 end
 assertTrue(api and not api:find("_QueueInspectForUnit", 1, true), "cached readiness does not queue inspects")
 assertTrue(raidCheck:find("RecordRaidCheckPresence", 1, true) ~= nil, "Raid Check records presence on raid-mode consequences")
+assertTrue(raidCheck:find('if not unit or type(unit) ~= "string"', 1, true) ~= nil, "UnitGUID helper rejects a nil unit")
+assertTrue(api and api:find("unit and self:_GetInspectAliases", 1, true) ~= nil, "cached readiness does not inspect with a nil unit")
 
 local controllerSource = (io.open("SpectrumFederation/modules/UI/LootHelper/Controller.lua", "r")):read("*a")
 assertTrue(controllerSource:find("RegisterTroubleshootingListener", 1, true) ~= nil, "roster listens for equipment-cache updates")

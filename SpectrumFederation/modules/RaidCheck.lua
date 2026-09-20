@@ -54,7 +54,7 @@ local function CanAccessValue(value)
 end
 
 local function GetAccessibleUnitGUID(unit)
-	if not UnitGUID then
+	if not unit or type(unit) ~= "string" or unit == "" or not UnitGUID then
 		return nil
 	end
 
@@ -3606,7 +3606,10 @@ function RC:GetCachedEquipmentReadiness(unit, memberId)
 		end
 	else
 		local state = self:_GetInspectState()
-		local aliases = self:_GetInspectAliases(unit, { id = memberId })
+		-- Out of raid the glance list has no unit. Do not call inspect
+		-- helpers with a nil unit; Retail UnitGUID(nil) can error and abort
+		-- the whole roster rebuild.
+		local aliases = unit and self:_GetInspectAliases(unit, { id = memberId }) or { memberId }
 		local entry = self:_GetInspectCacheEntryByAliases(aliases)
 		if (not entry or not entry.slotsByInventory) and memberId then
 			entry = self:_GetInspectCacheEntryByAliases({ memberId })
