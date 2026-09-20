@@ -2030,10 +2030,19 @@ function Identity.Replay(logs, opts)
                 end
             elseif eventType == types.RAID_CHECK_PRESENCE then
                 local opportunityId = data.opportunityId
-                if type(opportunityId) == "string" and opportunityId ~= "" and not presenceSeen[opportunityId] then
+                local presentMembers = data.presentMembers
+                local eligibleMembers = data.eligibleMembers
+                -- SortedUnique treats a non-table as empty. Skip malformed
+                -- lists so a string presentMembers cannot invent absences
+                -- against a real eligibleMembers list.
+                if type(opportunityId) == "string" and opportunityId ~= ""
+                    and type(presentMembers) == "table"
+                    and type(eligibleMembers) == "table"
+                    and not presenceSeen[opportunityId]
+                then
                     presenceSeen[opportunityId] = true
-                    local presentSet = ListToSet(SortedUnique(data.presentMembers))
-                    local eligibleSet = ListToSet(SortedUnique(data.eligibleMembers))
+                    local presentSet = ListToSet(SortedUnique(presentMembers))
+                    local eligibleSet = ListToSet(SortedUnique(eligibleMembers))
                     local applicable = {}
                     for id in pairs(eligibleSet) do
                         applicable[id] = true

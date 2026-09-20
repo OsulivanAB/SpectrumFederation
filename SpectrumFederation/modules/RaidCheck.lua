@@ -1251,7 +1251,7 @@ function RC:_GetInspectAliases(unit, info)
 	return aliases, guid, id
 end
 
-function RC:_NotifyTroubleshootingListeners(force)
+function RC:_NotifyTroubleshootingListeners(force, reason)
 	local state = self:_GetInspectState()
 	local version = state.snapshotVersion or 0
 	if not force and state.lastNotifiedVersion == version then
@@ -1260,7 +1260,7 @@ function RC:_NotifyTroubleshootingListeners(force)
 
 	state.lastNotifiedVersion = version
 	for _, callback in pairs(state.listeners) do
-		pcall(callback, version)
+		pcall(callback, version, reason)
 	end
 	return version
 end
@@ -1292,7 +1292,7 @@ function RC:_ScheduleTooltipDataRefresh()
 	if not (C_Timer and C_Timer.After) then
 		self:_ClearPreparedSlotCaches()
 		self:_MarkTroubleshootingDirty()
-		self:_NotifyTroubleshootingListeners()
+		self:_NotifyTroubleshootingListeners(false, "tooltip")
 		return
 	end
 
@@ -1305,7 +1305,7 @@ function RC:_ScheduleTooltipDataRefresh()
 		end
 		self:_ClearPreparedSlotCaches()
 		self:_MarkTroubleshootingDirty()
-		self:_NotifyTroubleshootingListeners()
+		self:_NotifyTroubleshootingListeners(false, "tooltip")
 	end)
 end
 

@@ -147,6 +147,24 @@ local pointsOnly = Identity.Replay({
 }, { owner = ALICE })
 assertEq(Identity.FormatRaidCheckAttendance(pointsOnly, ALICE), "—", "point awards are not used as attendance history")
 
+local malformedPresent = Identity.Replay({
+    presenceLog("bad-present", "Alice-Garona", { ALICE, BOB }, 1),
+}, { owner = ALICE })
+assertEq(Identity.FormatRaidCheckAttendance(malformedPresent, BOB), "—", "string presentMembers does not invent absences")
+assertEq(Identity.FormatRaidCheckAttendance(malformedPresent, ALICE), "—", "string presentMembers is skipped entirely")
+
+local malformedEligible = Identity.Replay({
+    presenceLog("bad-eligible", { ALICE }, "Alice-Garona", 1),
+}, { owner = ALICE })
+assertEq(Identity.FormatRaidCheckAttendance(malformedEligible, ALICE), "—", "string eligibleMembers is skipped entirely")
+
+local malformedThenValid = Identity.Replay({
+    presenceLog("same", "Alice-Garona", { ALICE, BOB }, 1),
+    presenceLog("same", { ALICE }, { ALICE, BOB }, 2),
+}, { owner = ALICE })
+assertEq(Identity.FormatRaidCheckAttendance(malformedThenValid, ALICE), "100%", "malformed first write does not occupy the opportunity id")
+assertEq(Identity.FormatRaidCheckAttendance(malformedThenValid, BOB), "0%", "first valid write still counts the opportunity")
+
 local validatorsChunk = assert(loadfile("SpectrumFederation/modules/LootHelper/LootLogValidators.lua"))
 validatorsChunk("SpectrumFederation", SF)
 local Validators = SF.LootLogValidators
@@ -160,6 +178,48 @@ assertEq(valid.presentMembers[1], ALICE, "validator normalizes and sorts present
 assertEq(#valid.presentMembers, 2, "validator deduplicates present members")
 assertTrue(not Validators.ValidateRaidCheckPresenceData({ opportunityId = "", presentMembers = {}, eligibleMembers = {} }), "empty opportunity id is rejected")
 assertTrue(not Validators.ValidateRaidCheckPresenceData({ opportunityId = "x", presentMembers = { 1 }, eligibleMembers = {} }), "non-string member ids are rejected")
+assertTrue(not Validators.ValidateRaidCheckPresenceData({
+    opportunityId = "x",
+    presentMembers = "Alice-Garona",
+    eligibleMembers = { ALICE },
+}), "string presentMembers is rejected")
+
+local importProbe = {
+    opportunityId = "profile:2",
+    presentMembers = { BOB, ALICE },
+    eligibleMembers = { ALICE, BOB },
+}
+assertTrue(Validators.ValidateRaidCheckPresenceData(importProbe, { mutate = false }), "mutate=false still accepts valid lists")
+assertEq(importProbe.presentMembers[1], BOB, "mutate=false leaves the original present order intact")
+
+local logsChunk = assert(loadfile("SpectrumFederation/modules/LootHelper/LootLogs.lua"))
+logsChunk("SpectrumFederation", SF)
+local function presenceWire(data)
+    local t = {
+        version = 2,
+        _id = "Alice-Garona:40",
+        _timestamp = 1700000040,
+        _author = "Alice-Garona",
+        _counter = 40,
+        _eventType = "RAID_CHECK_PRESENCE",
+        _data = data,
+    }
+    t._fingerprint = SF.LootLog.ComputeFingerprintFromTable(t)
+    return t
+end
+local goodWire = presenceWire({
+    opportunityId = "profile:1",
+    presentMembers = { ALICE },
+    eligibleMembers = { ALICE, BOB },
+})
+assertTrue(select(1, SF.LootLog.ValidateTable(goodWire)), "ValidateTable accepts a well-formed presence log")
+local badWire = presenceWire({
+    opportunityId = "profile:1",
+    presentMembers = "Alice-Garona",
+    eligibleMembers = { ALICE, BOB },
+})
+assertTrue(not select(1, SF.LootLog.ValidateTable(badWire)), "ValidateTable rejects a string presentMembers list")
+assertEq(badWire._data.presentMembers, "Alice-Garona", "ValidateTable does not rewrite rejected presence data")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

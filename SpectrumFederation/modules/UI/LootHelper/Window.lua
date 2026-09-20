@@ -278,6 +278,10 @@ function Window:SetMinimized(minimized)
 
     self:_ApplyMinimizedState()
     self:SaveState()
+
+    if LH.Controller and LH.Controller.OnMinimizedStateChanged then
+        LH.Controller:OnMinimizedStateChanged(minimized)
+    end
 end
 
 function Window:ToggleMinimized()

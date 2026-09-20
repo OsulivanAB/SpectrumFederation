@@ -1061,6 +1061,13 @@ function LootLog.ValidateTable(t, opts)
         then
             return false, "MANUAL_AWARD_REVERSE data is invalid"
         end
+    elseif t._eventType == EVENT_TYPES.RAID_CHECK_PRESENCE then
+        -- Probe a copy so import validation cannot rewrite fingerprinted lists.
+        if SF.LootLogValidators.ValidateRaidCheckPresenceData
+            and not SF.LootLogValidators.ValidateRaidCheckPresenceData(t._data, { mutate = false })
+        then
+            return false, "RAID_CHECK_PRESENCE data is invalid"
+        end
     end
 
     return true, nil

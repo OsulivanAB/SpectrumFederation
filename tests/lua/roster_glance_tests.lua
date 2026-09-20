@@ -204,9 +204,14 @@ end
 assertTrue(api and not api:find("_QueueInspectForUnit", 1, true), "cached readiness does not queue inspects")
 assertTrue(raidCheck:find("RecordRaidCheckPresence", 1, true) ~= nil, "Raid Check records presence on raid-mode consequences")
 
-local controller = (io.open("SpectrumFederation/modules/UI/LootHelper/Controller.lua", "r")):read("*a")
-assertTrue(controller:find("RegisterTroubleshootingListener", 1, true) ~= nil, "roster listens for equipment-cache updates")
-assertTrue(controller:find("SetBackgroundInspectEnabled", 1, true) == nil, "loot helper does not enable background inspect")
+local controllerSource = (io.open("SpectrumFederation/modules/UI/LootHelper/Controller.lua", "r")):read("*a")
+assertTrue(controllerSource:find("RegisterTroubleshootingListener", 1, true) ~= nil, "roster listens for equipment-cache updates")
+assertTrue(controllerSource:find("SetBackgroundInspectEnabled", 1, true) == nil, "loot helper does not enable background inspect")
+assertTrue(controllerSource:find('reason == "tooltip"', 1, true) ~= nil, "roster ignores tooltip-driven troubleshooting notifies")
+assertTrue(controllerSource:find("IsMinimized", 1, true) ~= nil, "roster refresh checks Window:IsMinimized")
+
+local raidCheckSource = raidCheck
+assertTrue(raidCheckSource:find('_NotifyTroubleshootingListeners(false, "tooltip")', 1, true) ~= nil, "tooltip refresh passes a tooltip reason")
 
 local viewChunk = assert(loadfile("SpectrumFederation/modules/UI/LootHelper/RosterView.lua"))
 viewChunk("SpectrumFederation", SF)
@@ -219,6 +224,94 @@ assertTrue(unknownCols.readiness, "unknown rows reserve the same readiness colum
 assertTrue(not unknownCols.points, "reward pot rows still hide points")
 local nonMemberCols = View.GlanceColumns({ type = "RAID_NONMEMBER" })
 assertTrue(not nonMemberCols.readiness, "raid non-members do not reserve glance columns")
+
+local rosterBuilds = 0
+local readinessCallbacks = {}
+local minimized = false
+local shown = true
+SF.RaidCheck.RegisterTroubleshootingListener = function(_, key, callback)
+    readinessCallbacks[key] = callback
+end
+SF.RaidCheck.UnregisterTroubleshootingListener = function(_, key)
+    readinessCallbacks[key] = nil
+end
+SF.LootHelperWindow.RosterModel = {
+    Build = function()
+        rosterBuilds = rosterBuilds + 1
+        return {}, {}
+    end,
+}
+SF.LootHelperWindow.Window = {
+    GetFrame = function()
+        return {
+            IsShown = function()
+                return shown
+            end,
+        }
+    end,
+    IsMinimized = function()
+        return minimized
+    end,
+    ToggleMinimized = function()
+        minimized = not minimized
+        if SF.LootHelperWindow.Controller.OnMinimizedStateChanged then
+            SF.LootHelperWindow.Controller:OnMinimizedStateChanged(minimized)
+        end
+    end,
+    SetProfileName = function() end,
+    SetPointName = function() end,
+    SetRewardPotHeader = function() end,
+    SetPlayButtonVisible = function() end,
+    SetSessionActive = function() end,
+}
+
+local controllerChunk = assert(loadfile("SpectrumFederation/modules/UI/LootHelper/Controller.lua"))
+controllerChunk("SpectrumFederation", SF)
+local Controller = SF.LootHelperWindow.Controller
+
+rosterBuilds = 0
+minimized = false
+shown = true
+Controller:RefreshRoster()
+assertEq(rosterBuilds, 1, "visible expanded roster still builds")
+
+rosterBuilds = 0
+minimized = true
+Controller:RefreshRoster()
+assertEq(rosterBuilds, 0, "minimized window does not rebuild the roster")
+
+rosterBuilds = 0
+minimized = false
+shown = false
+Controller:RefreshRoster()
+assertEq(rosterBuilds, 0, "hidden window still does not rebuild the roster")
+
+shown = true
+minimized = false
+Controller._readinessListenerBound = false
+Controller:_BindReadinessListener()
+assertTrue(readinessCallbacks.lootHelperRoster ~= nil, "readiness listener is registered")
+
+rosterBuilds = 0
+readinessCallbacks.lootHelperRoster(1, "tooltip")
+assertEq(rosterBuilds, 0, "tooltip notify does not rebuild the roster")
+
+rosterBuilds = 0
+readinessCallbacks.lootHelperRoster(2, nil)
+assertEq(rosterBuilds, 1, "equipment-cache notify still rebuilds the roster")
+
+rosterBuilds = 0
+minimized = false
+Controller:OnMinimizeClicked()
+assertTrue(minimized, "minimize click toggles minimized")
+assertTrue(readinessCallbacks.lootHelperRoster == nil, "minimized window unbinds the readiness listener")
+assertEq(rosterBuilds, 0, "minimize does not rebuild the hidden roster")
+
+rosterBuilds = 0
+Controller:OnMinimizeClicked()
+assertTrue(not minimized, "second minimize click restores")
+assertTrue(readinessCallbacks.lootHelperRoster ~= nil, "restore rebinds the readiness listener")
+assertEq(rosterBuilds, 1, "restore rebuilds the roster once")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

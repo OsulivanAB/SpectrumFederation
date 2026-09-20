@@ -651,7 +651,7 @@ end
 -- Presence lists may include raid members who are not yet on the roster.
 -- @param eventData (table) - Event data to validate
 -- @return (boolean) - True if valid, false otherwise
-function LootLogValidators.ValidateRaidCheckPresenceData(eventData)
+function LootLogValidators.ValidateRaidCheckPresenceData(eventData, opts)
     if type(eventData) ~= "table" then
         return false
     end
@@ -669,8 +669,12 @@ function LootLogValidators.ValidateRaidCheckPresenceData(eventData)
         end
         return false
     end
-    eventData.presentMembers = presentMembers
-    eventData.eligibleMembers = eligibleMembers
+    -- LootLog.new normalizes in place. Import ValidateTable must not rewrite
+    -- fingerprinted wire tables, so callers can pass opts.mutate = false.
+    if not (opts and opts.mutate == false) then
+        eventData.presentMembers = presentMembers
+        eventData.eligibleMembers = eligibleMembers
+    end
     return true
 end
 

@@ -94,7 +94,7 @@ function Controller:EvaluateVisibility(reason)
         if not f:IsShown() then
             f:Show()
         end
-        self:_BindReadinessListener()
+        self:_SyncReadinessListener()
         self:RequestRefresh("Shown")
     else
         self:_UnbindReadinessListener()
@@ -407,6 +407,13 @@ function Controller:OnMinimizeClicked()
     end
 end
 
+function Controller:OnMinimizedStateChanged(minimized)
+    self:_SyncReadinessListener()
+    if not minimized then
+        self:RequestRefresh("Restored")
+    end
+end
+
 function Controller:OnPlayClicked()
     if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then
         if SF.PrintError then
@@ -520,12 +527,22 @@ function Controller:_InitRosterView(frame)
     frame.Content.RosterView = self._rosterView -- so Style.lua can reach it
 end
 
-function Controller:RefreshRoster()
+function Controller:_IsRosterContentVisible()
     local f = self:GetFrame()
-    if not f then return end
+    if not f or not f:IsShown() then
+        return false
+    end
+    -- Minimized windows keep the outer frame shown and hide Content.
+    if LH.Window and LH.Window.IsMinimized and LH.Window:IsMinimized() then
+        return false
+    end
+    return true
+end
 
-    -- Don't do heavy work if hidden
-    if not f:IsShown() then return end
+function Controller:RefreshRoster()
+    if not self:_IsRosterContentVisible() then
+        return
+    end
 
     local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
     local rows, meta = LH.RosterModel:Build(profile)
@@ -580,9 +597,14 @@ function Controller:_BindReadinessListener()
     if not (SF.RaidCheck and SF.RaidCheck.RegisterTroubleshootingListener) then
         return
     end
-    SF.RaidCheck:RegisterTroubleshootingListener("lootHelperRoster", function()
-        local frame = self:GetFrame()
-        if frame and frame:IsShown() then
+    SF.RaidCheck:RegisterTroubleshootingListener("lootHelperRoster", function(_, reason)
+        -- TOOLTIP_DATA_UPDATE only invalidates prepared-slot caches for the
+        -- Raid Equipment audit table. Glance readiness reads inspect cache /
+        -- last-good / local player and must not rebuild the roster on hover.
+        if reason == "tooltip" then
+            return
+        end
+        if self:_IsRosterContentVisible() then
             self:RequestRefresh("EquipmentCache")
         end
     end)
@@ -597,6 +619,14 @@ function Controller:_UnbindReadinessListener()
         SF.RaidCheck:UnregisterTroubleshootingListener("lootHelperRoster")
     end
     self._readinessListenerBound = false
+end
+
+function Controller:_SyncReadinessListener()
+    if self:_IsRosterContentVisible() then
+        self:_BindReadinessListener()
+    else
+        self:_UnbindReadinessListener()
+    end
 end
 
 -- ===================================================
