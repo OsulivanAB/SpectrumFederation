@@ -231,6 +231,12 @@ end
 function boomProfile:GetRaidCheckAttendanceDisplay()
     error("attendance boom")
 end
+local reportedErrors = {}
+function geterrorhandler()
+    return function(message)
+        reportedErrors[#reportedErrors + 1] = tostring(message)
+    end
+end
 local originalReady = SF.RaidCheck.GetCachedEquipmentReadiness
 function SF.RaidCheck:GetCachedEquipmentReadiness()
     error("UnitGUID(): Invalid unit")
@@ -238,6 +244,7 @@ end
 local boomRows = Model:Build(boomProfile)
 assertEq(#boomRows, 2, "glance helper errors do not wipe the out-of-raid roster")
 assertEq(boomRows[1].readinessState, "unknown", "failed readiness falls back to unknown")
+assertTrue(#reportedErrors >= 2, "caught glance errors are forwarded to geterrorhandler")
 SF.RaidCheck.GetCachedEquipmentReadiness = originalReady
 
 function IsInRaid()

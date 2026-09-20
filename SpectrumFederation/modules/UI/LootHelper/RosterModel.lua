@@ -222,6 +222,18 @@ local function CountBisSlots(profile, memberId)
 	return used, possible
 end
 
+local function ReportCaughtError(context, err)
+	local message = string.format("%s: %s", tostring(context), tostring(err))
+	if SF.Debug then
+		SF.Debug:Error("LH_ROSTER", "%s", message)
+	end
+	local getHandler = rawget(_G, "geterrorhandler")
+	local handler = type(getHandler) == "function" and getHandler() or nil
+	if type(handler) == "function" then
+		pcall(handler, message)
+	end
+end
+
 local function BuildReadiness(unit, memberId)
 	local unknown = {
 		state = "unknown",
@@ -287,8 +299,8 @@ function Model:Build(profile)
                 local okPoints, identityPoints = pcall(profile.GetIdentityPoints, profile, id)
                 if okPoints then
                     points = identityPoints
-                elseif SF.Debug then
-                    SF.Debug:Warn("LH_ROSTER", "GetIdentityPoints failed for %s: %s", tostring(id), tostring(identityPoints))
+                else
+                    ReportCaughtError("Loot Helper roster GetIdentityPoints(" .. tostring(id) .. ")", identityPoints)
                 end
             end
             local attendanceText = "—"
@@ -296,24 +308,24 @@ function Model:Build(profile)
                 local okAtt, att = pcall(profile.GetRaidCheckAttendanceDisplay, profile, id)
                 if okAtt and type(att) == "string" and att ~= "" then
                     attendanceText = att
-                elseif not okAtt and SF.Debug then
-                    SF.Debug:Warn("LH_ROSTER", "GetRaidCheckAttendanceDisplay failed for %s: %s", tostring(id), tostring(att))
+                elseif not okAtt then
+                    ReportCaughtError("Loot Helper roster GetRaidCheckAttendanceDisplay(" .. tostring(id) .. ")", att)
                 end
             end
             local bisUsed, bisPossible = 0, 16
             local okBis, used, possible = pcall(CountBisSlots, profile, id)
             if okBis then
                 bisUsed, bisPossible = used, possible
-            elseif SF.Debug then
-                SF.Debug:Warn("LH_ROSTER", "CountBisSlots failed for %s: %s", tostring(id), tostring(used))
+            else
+                ReportCaughtError("Loot Helper roster CountBisSlots(" .. tostring(id) .. ")", used)
             end
             local readiness
             local okReady, readyResult = pcall(BuildReadiness, raidInfo and raidInfo.unit or nil, id)
             if okReady and type(readyResult) == "table" then
                 readiness = readyResult
             else
-                if not okReady and SF.Debug then
-                    SF.Debug:Warn("LH_ROSTER", "BuildReadiness failed for %s: %s", tostring(id), tostring(readyResult))
+                if not okReady then
+                    ReportCaughtError("Loot Helper roster BuildReadiness(" .. tostring(id) .. ")", readyResult)
                 end
                 readiness = {
                     state = "unknown",
