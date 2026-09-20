@@ -208,6 +208,18 @@ local controller = (io.open("SpectrumFederation/modules/UI/LootHelper/Controller
 assertTrue(controller:find("RegisterTroubleshootingListener", 1, true) ~= nil, "roster listens for equipment-cache updates")
 assertTrue(controller:find("SetBackgroundInspectEnabled", 1, true) == nil, "loot helper does not enable background inspect")
 
+local viewChunk = assert(loadfile("SpectrumFederation/modules/UI/LootHelper/RosterView.lua"))
+viewChunk("SpectrumFederation", SF)
+local View = SF.LootHelperWindow.RosterView
+local readyCols = View.GlanceColumns({ type = "PROFILE_MEMBER", showPoints = true, readinessState = "ready" })
+assertTrue(readyCols.readiness, "ready rows still reserve the readiness column")
+assertTrue(readyCols.points, "point-based ready rows still reserve the points column")
+local unknownCols = View.GlanceColumns({ type = "PROFILE_MEMBER", showPoints = false, readinessState = "unknown" })
+assertTrue(unknownCols.readiness, "unknown rows reserve the same readiness column")
+assertTrue(not unknownCols.points, "reward pot rows still hide points")
+local nonMemberCols = View.GlanceColumns({ type = "RAID_NONMEMBER" })
+assertTrue(not nonMemberCols.readiness, "raid non-members do not reserve glance columns")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

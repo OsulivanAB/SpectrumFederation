@@ -26,6 +26,25 @@ local READY_TEXTURE = {
     unknown = "Interface\\RaidFrame\\ReadyCheck-Waiting",
 }
 
+-- Ready players show no icon, but the column still occupies READY_WIDTH so
+-- Att./BiS/Points stay aligned with not-ready and unknown rows.
+function View.GlanceColumns(model)
+    if type(model) ~= "table" or model.type ~= "PROFILE_MEMBER" then
+        return {
+            points = false,
+            attendance = false,
+            bis = false,
+            readiness = false,
+        }
+    end
+    return {
+        points = model.showPoints and true or false,
+        attendance = true,
+        bis = true,
+        readiness = true,
+    }
+end
+
 -- Cropping presets you can tweak quickly:
 local CROP_ICON   = 0.07  -- great for Interface\Icons\
 local CROP_ARROW  = 0.18  -- zooms in UI scrollbar arrows
@@ -428,8 +447,8 @@ function View:_LayoutButtons(r, model)
 	r.BtnHelmet:Hide()
 	r.BtnPlus:Hide()
 
-	local showPoints = model.type == "PROFILE_MEMBER" and model.showPoints
-	if showPoints then
+	local columns = View.GlanceColumns(model)
+	if columns.points then
 		r.Points:Show()
 		r.Points:SetText(FormatPointAmount(model.points or 0))
 	else
@@ -437,20 +456,13 @@ function View:_LayoutButtons(r, model)
 		r.Points:SetText("")
 	end
 
-	if model.type == "PROFILE_MEMBER" then
+	if columns.attendance then
 		r.Attendance:Show()
 		r.Attendance:SetText(model.attendanceText or "—")
 		r.Bis:Show()
 		r.Bis:SetText(model.bisText or "—")
-		local readyState = model.readinessState
-		local readyTex = READY_TEXTURE[readyState]
-		if readyTex then
-			r.Readiness.Icon:SetTexture(readyTex)
-			r.Readiness:Show()
-		else
-			r.Readiness.Icon:SetTexture(nil)
-			r.Readiness:Hide()
-		end
+		r.Readiness.Icon:SetTexture(READY_TEXTURE[model.readinessState])
+		r.Readiness:Show()
 		r.Readiness:SetScript("OnEnter", function(frame)
 			local tooltip = model.readinessTooltip
 			if tooltip and tooltip ~= "" and GameTooltip then
@@ -526,10 +538,10 @@ function View:_LayoutButtons(r, model)
 		return 0
 	end
 
-	PlaceColumn(r.Readiness, r.Readiness:IsShown(), READY_WIDTH)
-	PlaceColumn(r.Bis, r.Bis:IsShown(), BIS_WIDTH)
-	PlaceColumn(r.Attendance, r.Attendance:IsShown(), ATTENDANCE_WIDTH)
-	PlaceColumn(r.Points, r.Points:IsShown(), POINTS_WIDTH)
+	PlaceColumn(r.Readiness, columns.readiness, READY_WIDTH)
+	PlaceColumn(r.Bis, columns.bis, BIS_WIDTH)
+	PlaceColumn(r.Attendance, columns.attendance, ATTENDANCE_WIDTH)
+	PlaceColumn(r.Points, columns.points, POINTS_WIDTH)
 
 	r.Name:ClearAllPoints()
 	r.Name:SetPoint("LEFT", r.Icon, "RIGHT", 8, 0)
