@@ -6,7 +6,7 @@ Only the profile owner can switch a profile between Point Based and Reward Pot. 
 
 ## Attendance
 
-The Loot Helper window title shows **Attendance**. Each profile member's row shows their Attendance total.
+The Loot Helper window title shows **Attendance**. The Points column is hidden so the remaining glance columns can use the space. Each profile member's row still shows raid-check presence as a percentage, BiS usage, and equipment readiness. The Reward Pot Attendance counter remains available to admins through the up and down buttons and Loot Logs.
 
 Profile admins can raise or lower Attendance one point at a time. Decreasing Attendance at zero does nothing. Attendance never goes below zero.
 

@@ -264,6 +264,34 @@ assertEq(Policy.RequiresOffHandEnchant(nil), nil, "unresolved offhand type is ni
 local completeness = Policy.EvaluateCompleteness({ slotsByInventory = completeSlots() })
 assertTrue(completeness.complete, "EvaluateCompleteness reports complete for a full observation")
 
+local ready = Policy.ReadinessFromObservation({ slotsByInventory = completeSlots() })
+assertEq(ready.state, "ready", "complete prepared observation is Ready")
+assertEq(#ready.missing, 0, "ready observations have no missing list")
+
+local missingChest = completeSlots({
+    [5] = {
+        empty = false,
+        itemId = 200000,
+        link = "|cffa335ee|Hitem:200000:0:0:0:0:0:0:0:80:::|h[Item]|h|r",
+        texture = "tex",
+        equipLoc = "INVTYPE_CHEST",
+        hasEnchant = false,
+        enchantId = 0,
+        sockets = {},
+    },
+})
+local notReady = Policy.ReadinessFromObservation({ slotsByInventory = missingChest })
+assertEq(notReady.state, "not_ready", "complete unprepared observation is Not Ready")
+assertHas(notReady.missing, "Chest Enchant", "not-ready missing list reuses Policy reasons")
+
+local unknownMissing = Policy.ReadinessFromObservation(nil)
+assertEq(unknownMissing.state, "unknown", "missing observation is Unknown")
+
+local unknownIncomplete = Policy.ReadinessFromObservation({ slotsByInventory = completeSlots({
+    [1] = { empty = false, itemId = 200000, texture = "tex" },
+}) })
+assertEq(unknownIncomplete.state, "unknown", "incomplete observation is Unknown rather than Not Ready")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

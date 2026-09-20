@@ -198,6 +198,45 @@ local function CollectProfileMembers(profile)
 	return members, memberSet
 end
 
+local function CountBisSlots(profile, memberId)
+	local Bis = SF.LootHelperBis
+	local possible = (Bis and Bis.SLOTS and #Bis.SLOTS) or 16
+	local used = 0
+	if profile and Bis and Bis.LiveOccupancyFromProjection then
+		local projection = profile.GetIdentityProjection and profile:GetIdentityProjection() or nil
+		local occupancy = Bis.LiveOccupancyFromProjection(projection, memberId)
+		if Bis.SLOTS then
+			for i = 1, #Bis.SLOTS do
+				if occupancy[Bis.SLOTS[i]] then
+					used = used + 1
+				end
+			end
+		else
+			for _, occupied in pairs(occupancy) do
+				if occupied then
+					used = used + 1
+				end
+			end
+		end
+	end
+	return used, possible
+end
+
+local function BuildReadiness(unit, memberId)
+	local unknown = {
+		state = "unknown",
+		tooltip = "Current equipment readiness could not be determined.",
+	}
+	if not (SF.RaidCheck and SF.RaidCheck.GetCachedEquipmentReadiness) then
+		return unknown
+	end
+	local readiness = SF.RaidCheck:GetCachedEquipmentReadiness(unit, memberId)
+	if type(readiness) ~= "table" or type(readiness.state) ~= "string" then
+		return unknown
+	end
+	return readiness
+end
+
 function Model:Build(profile)
     local rows = {}
     local meta = {}
@@ -243,12 +282,16 @@ function Model:Build(profile)
 
         if showMembersNotInRaid or inRaid then
             local m = entry.member
-            local points = 0
-            if rewardPot then
-                points = (m and m.GetAttendanceBalance and m:GetAttendanceBalance()) or (m and m.attendanceBalance) or 0
-            else
-                points = (m and m.GetPointBalance and m:GetPointBalance()) or (m and m.pointBalance) or 0
+            local points = (m and m.GetPointBalance and m:GetPointBalance()) or (m and m.pointBalance) or 0
+            if profile.GetIdentityPoints then
+                points = profile:GetIdentityPoints(id)
             end
+            local attendanceText = "—"
+            if profile.GetRaidCheckAttendanceDisplay then
+                attendanceText = profile:GetRaidCheckAttendanceDisplay(id)
+            end
+            local bisUsed, bisPossible = CountBisSlots(profile, id)
+            local readiness = BuildReadiness(raidInfo and raidInfo.unit or nil, id)
             local resolvedClass = (raidInfo and raidInfo.class) or entry.class or self._classByMemberId[id] or "UNKNOWN"
             if resolvedClass == "UNKNOWN" and SF.Debug then
                 SF.Debug:Warn("LH_ICON", "Unable to resolve class metadata (member=%s classRaw=%s inRaid=%s)",
@@ -266,6 +309,12 @@ function Model:Build(profile)
                 class = resolvedClass,
                 unit = raidInfo and raidInfo.unit or nil,
                 points = tonumber(points) or 0,
+                showPoints = not rewardPot,
+                pointName = (profile.GetPointName and profile:GetPointName()) or "Points",
+                attendanceText = attendanceText,
+                bisText = string.format("%d/%d", bisUsed, bisPossible),
+                readinessState = readiness.state,
+                readinessTooltip = readiness.tooltip,
                 member = m,
                 profile = profile,
                 canAdmin = canAdmin,

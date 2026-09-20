@@ -1006,6 +1006,88 @@ function LootProfile:GetIdentityAttendance(memberId)
     return 0
 end
 
+function LootProfile:GetRaidCheckAttendanceDisplay(memberId)
+    local Identity = SF.LootHelperIdentity
+    if not (Identity and Identity.FormatRaidCheckAttendance) then
+        return "—"
+    end
+    return Identity.FormatRaidCheckAttendance(self:GetIdentityProjection(), memberId)
+end
+
+function LootProfile:HasRaidCheckPresenceOpportunity(opportunityId)
+    local Identity = SF.LootHelperIdentity
+    if not (Identity and Identity.HasRaidCheckPresenceOpportunity) then
+        return false
+    end
+    return Identity.HasRaidCheckPresenceOpportunity(self:GetIdentityProjection(), opportunityId)
+end
+
+local function CopySortedUniqueIds(ids)
+    local out = {}
+    local seen = {}
+    if type(ids) ~= "table" then
+        return out
+    end
+    for i = 1, #ids do
+        local id = NormalizeMemberId(ids[i])
+        if id and not seen[id] then
+            seen[id] = true
+            out[#out + 1] = id
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+function LootProfile:RecordRaidCheckPresence(opts)
+    opts = opts or {}
+    local opportunityId = opts.opportunityId
+    if type(opportunityId) ~= "string" or opportunityId == "" then
+        return false
+    end
+    if self:HasRaidCheckPresenceOpportunity(opportunityId) then
+        return false
+    end
+    local types = SF.LootLogEventTypes
+    if not (types and types.RAID_CHECK_PRESENCE and SF.LootLog and SF.LootLog.new) then
+        return false
+    end
+    local eventData = SF.LootLog.GetEventDataTemplate(types.RAID_CHECK_PRESENCE)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    eventData.opportunityId = opportunityId
+    eventData.presentMembers = CopySortedUniqueIds(opts.presentMembers)
+    eventData.eligibleMembers = CopySortedUniqueIds(opts.eligibleMembers)
+    local logOpts = {
+        profile = self,
+        skipPermission = opts.skipPermission,
+    }
+    if type(opts.logAuthor) == "string" and opts.logAuthor ~= "" then
+        logOpts.author = opts.logAuthor
+    end
+    local logEntry = SF.LootLog.new(types.RAID_CHECK_PRESENCE, eventData, logOpts)
+    if not logEntry then
+        return false
+    end
+    local ok, err = self:AddLootLog(logEntry, {
+        skipBroadcast = opts.skipBroadcast,
+        skipPermission = opts.skipPermission,
+    })
+    if ok and SF.Debug then
+        SF.Debug:Info(
+            "LootProfile",
+            "Recorded RAID_CHECK_PRESENCE %s (present=%d eligible=%d)",
+            tostring(opportunityId),
+            #eventData.presentMembers,
+            #eventData.eligibleMembers
+        )
+    elseif not ok and SF.Debug then
+        SF.Debug:Warn("LootProfile", "Failed to record RAID_CHECK_PRESENCE %s: %s", tostring(opportunityId), tostring(err))
+    end
+    return ok, err
+end
+
 function LootProfile:GetIdentityArmor(memberId)
     memberId = NormalizeMemberId(memberId)
     local result = self:GetIdentityProjection()
