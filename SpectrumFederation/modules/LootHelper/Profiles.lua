@@ -1070,10 +1070,22 @@ function LootProfile:RecordRaidCheckPresence(opts)
     if not logEntry then
         return false
     end
-    return self:AddLootLog(logEntry, {
+    local ok, err = self:AddLootLog(logEntry, {
         skipBroadcast = opts.skipBroadcast,
         skipPermission = opts.skipPermission,
     })
+    if ok and SF.Debug then
+        SF.Debug:Info(
+            "LootProfile",
+            "Recorded RAID_CHECK_PRESENCE %s (present=%d eligible=%d)",
+            tostring(opportunityId),
+            #eventData.presentMembers,
+            #eventData.eligibleMembers
+        )
+    elseif not ok and SF.Debug then
+        SF.Debug:Warn("LootProfile", "Failed to record RAID_CHECK_PRESENCE %s: %s", tostring(opportunityId), tostring(err))
+    end
+    return ok, err
 end
 
 function LootProfile:GetIdentityArmor(memberId)

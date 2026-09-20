@@ -3084,13 +3084,23 @@ function RC:_ApplyCheckConsequences(run)
 			opportunityId = run.profileId .. ":" .. opportunityId
 		end
 		if opportunityId ~= "" then
-			profile:RecordRaidCheckPresence({
+			local recorded = profile:RecordRaidCheckPresence({
 				opportunityId = opportunityId,
 				presentMembers = run.groupMemberIds or {},
 				eligibleMembers = run.rosterMemberIds or {},
 				logAuthor = "Raid Check",
 				skipBroadcast = skipBroadcast,
 			})
+			if SF.Debug then
+				SF.Debug:Info(
+					"RAID_CHECK",
+					"Raid Check presence %s (present=%d eligible=%d skipBroadcast=%s)",
+					recorded and opportunityId or "skipped",
+					#(run.groupMemberIds or {}),
+					#(run.rosterMemberIds or {}),
+					tostring(skipBroadcast)
+				)
+			end
 		end
 	end
 
