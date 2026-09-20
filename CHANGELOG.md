@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.3-beta.2] - 2026-09-20
+
+### Added
+- Show Loot Helper members outside a raid and add Prep.
+
 ## [1.5.3-beta.1] - 2026-09-20
 
 ### Changed
