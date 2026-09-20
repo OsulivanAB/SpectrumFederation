@@ -312,6 +312,15 @@ function Model:Build(profile)
                     ReportCaughtError("Loot Helper roster GetRaidCheckAttendanceDisplay(" .. tostring(id) .. ")", att)
                 end
             end
+            local preparednessText = "—"
+            if profile.GetRaidCheckPreparednessDisplay then
+                local okPrep, prep = pcall(profile.GetRaidCheckPreparednessDisplay, profile, id)
+                if okPrep and type(prep) == "string" and prep ~= "" then
+                    preparednessText = prep
+                elseif not okPrep then
+                    ReportCaughtError("Loot Helper roster GetRaidCheckPreparednessDisplay(" .. tostring(id) .. ")", prep)
+                end
+            end
             local bisUsed, bisPossible = 0, 16
             local okBis, used, possible = pcall(CountBisSlots, profile, id)
             if okBis then
@@ -353,6 +362,7 @@ function Model:Build(profile)
                 showPoints = not rewardPot,
                 pointName = (profile.GetPointName and profile:GetPointName()) or "Points",
                 attendanceText = attendanceText,
+                preparednessText = preparednessText,
                 bisText = string.format("%d/%d", bisUsed, bisPossible),
                 readinessState = readiness.state,
                 readinessTooltip = readiness.tooltip,

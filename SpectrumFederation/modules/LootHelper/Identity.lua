@@ -1810,6 +1810,8 @@ function Identity.Replay(logs, opts)
     local presenceSeen = {}
     local presencePresent = {}
     local presenceEligible = {}
+    local presencePrepared = {}
+    local presencePreparedEligible = {}
     local auth = {}
     local simulated = {}
     local restoredSources = {}
@@ -2056,6 +2058,18 @@ function Identity.Replay(logs, opts)
                             presencePresent[id] = (presencePresent[id] or 0) + 1
                         end
                     end
+                    -- Old logs omit preparedMembers. Do not invent a 0%
+                    -- preparedness denominator from those opportunities.
+                    local preparedMembers = data.preparedMembers
+                    if type(preparedMembers) == "table" then
+                        local preparedSet = ListToSet(SortedUnique(preparedMembers))
+                        for id in pairs(applicable) do
+                            presencePreparedEligible[id] = (presencePreparedEligible[id] or 0) + 1
+                            if presentSet[id] and preparedSet[id] then
+                                presencePrepared[id] = (presencePrepared[id] or 0) + 1
+                            end
+                        end
+                    end
                 end
             elseif eventType == types.ARMOR_CHANGE then
                 local memberId = ensureLocal(data.member)
@@ -2234,10 +2248,32 @@ function Identity.Replay(logs, opts)
             seen = presenceSeen,
             present = presencePresent,
             eligible = presenceEligible,
+            prepared = presencePrepared,
+            preparedEligible = presencePreparedEligible,
         },
     }
     RefreshBisDerived(result)
     return result
+end
+
+local function PresenceCounts(map, memberId)
+    if type(map) ~= "table" then
+        return 0
+    end
+    return map[memberId] or 0
+end
+
+local function FormatPresencePercent(count, eligible)
+    if eligible <= 0 then
+        return "—"
+    end
+    local pct = math.floor((count / eligible) * 100 + 0.5)
+    if pct < 0 then
+        pct = 0
+    elseif pct > 100 then
+        pct = 100
+    end
+    return string.format("%d%%", pct)
 end
 
 function Identity.RaidCheckAttendanceCounts(result, memberId)
@@ -2249,23 +2285,29 @@ function Identity.RaidCheckAttendanceCounts(result, memberId)
     if type(presence) ~= "table" then
         return 0, 0
     end
-    local present = presence.present and presence.present[memberId] or 0
-    local eligible = presence.eligible and presence.eligible[memberId] or 0
-    return present, eligible
+    return PresenceCounts(presence.present, memberId), PresenceCounts(presence.eligible, memberId)
 end
 
 function Identity.FormatRaidCheckAttendance(result, memberId)
     local present, eligible = Identity.RaidCheckAttendanceCounts(result, memberId)
-    if eligible <= 0 then
-        return "—"
+    return FormatPresencePercent(present, eligible)
+end
+
+function Identity.RaidCheckPreparednessCounts(result, memberId)
+    memberId = NormalizeId(memberId)
+    if type(result) ~= "table" or not memberId then
+        return 0, 0
     end
-    local pct = math.floor((present / eligible) * 100 + 0.5)
-    if pct < 0 then
-        pct = 0
-    elseif pct > 100 then
-        pct = 100
+    local presence = result.raidPresence
+    if type(presence) ~= "table" then
+        return 0, 0
     end
-    return string.format("%d%%", pct)
+    return PresenceCounts(presence.prepared, memberId), PresenceCounts(presence.preparedEligible, memberId)
+end
+
+function Identity.FormatRaidCheckPreparedness(result, memberId)
+    local prepared, eligible = Identity.RaidCheckPreparednessCounts(result, memberId)
+    return FormatPresencePercent(prepared, eligible)
 end
 
 function Identity.HasRaidCheckPresenceOpportunity(result, opportunityId)

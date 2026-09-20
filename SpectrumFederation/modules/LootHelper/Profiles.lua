@@ -1014,6 +1014,14 @@ function LootProfile:GetRaidCheckAttendanceDisplay(memberId)
     return Identity.FormatRaidCheckAttendance(self:GetIdentityProjection(), memberId)
 end
 
+function LootProfile:GetRaidCheckPreparednessDisplay(memberId)
+    local Identity = SF.LootHelperIdentity
+    if not (Identity and Identity.FormatRaidCheckPreparedness) then
+        return "—"
+    end
+    return Identity.FormatRaidCheckPreparedness(self:GetIdentityProjection(), memberId)
+end
+
 function LootProfile:HasRaidCheckPresenceOpportunity(opportunityId)
     local Identity = SF.LootHelperIdentity
     if not (Identity and Identity.HasRaidCheckPresenceOpportunity) then
@@ -1059,6 +1067,7 @@ function LootProfile:RecordRaidCheckPresence(opts)
     eventData.opportunityId = opportunityId
     eventData.presentMembers = CopySortedUniqueIds(opts.presentMembers)
     eventData.eligibleMembers = CopySortedUniqueIds(opts.eligibleMembers)
+    eventData.preparedMembers = CopySortedUniqueIds(opts.preparedMembers)
     local logOpts = {
         profile = self,
         skipPermission = opts.skipPermission,
@@ -1077,10 +1086,11 @@ function LootProfile:RecordRaidCheckPresence(opts)
     if ok and SF.Debug then
         SF.Debug:Info(
             "LootProfile",
-            "Recorded RAID_CHECK_PRESENCE %s (present=%d eligible=%d)",
+            "Recorded RAID_CHECK_PRESENCE %s (present=%d eligible=%d prepared=%d)",
             tostring(opportunityId),
             #eventData.presentMembers,
-            #eventData.eligibleMembers
+            #eventData.eligibleMembers,
+            #eventData.preparedMembers
         )
     elseif not ok and SF.Debug then
         SF.Debug:Warn("LootProfile", "Failed to record RAID_CHECK_PRESENCE %s: %s", tostring(opportunityId), tostring(err))

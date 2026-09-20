@@ -146,6 +146,7 @@ local EVENT_DATA_TEMPLATES = {
         opportunityId = "",
         presentMembers = {},
         eligibleMembers = {},
+        preparedMembers = {},
     },
     [EVENT_TYPES.RC_LOOT_COUNCIL] = {
         member = "",

@@ -24,6 +24,7 @@ Profile members show their class or specialization icon, class-colored name, gla
 - In **Point Based**, the title uses the profile's point name and each row shows that named point balance in its own column.
 - In **Reward Pot**, the title shows Attendance, the Points column is hidden, and the current Reward Pot appears above the list.
 - **Att.** is raid-check presence as a percentage. A player is credited when they were in the group at the start of a Raid Check, whether or not their gear was prepared. Players with no recorded presence opportunities show `—`.
+- **Prep.** is raid-check preparedness as a percentage. A player is credited only when they were present and classified Prepared by the same Raid Check equipment rules (verified enchants and gems). Inspection Failed and out-of-range-without-recent-verify do not count as prepared. Older presence logs that predate this field show `—` rather than inventing a 0% history.
 - **BiS** is slots already used out of the player's possible BiS slots, using the same identity projection as the equipment popup.
 - The readiness icon evaluates current Raid Check enchant/gem rules from cached equipment only. Out of range does not by itself mean Not Ready. Hover a warning for the missing requirements.
 

@@ -361,6 +361,9 @@ local function BuildActionText(eventType, data, author)
 	elseif eventType == "RAID_CHECK_PRESENCE" then
 		local present = type(data.presentMembers) == "table" and #data.presentMembers or 0
 		local eligible = type(data.eligibleMembers) == "table" and #data.eligibleMembers or 0
+		if type(data.preparedMembers) == "table" then
+			return string.format("Raid Check presence %d/%d prepared %d", present, eligible, #data.preparedMembers)
+		end
 		return string.format("Raid Check presence %d/%d", present, eligible)
 	elseif eventType == "RC_LOOT_COUNCIL" then
 		local item = tostring(data.itemLink or "")

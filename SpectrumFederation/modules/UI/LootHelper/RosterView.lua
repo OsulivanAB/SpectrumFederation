@@ -16,6 +16,7 @@ local BTN_SIZE = 20
 local BTN_GAP = 3
 local POINTS_WIDTH = 40
 local ATTENDANCE_WIDTH = 48
+local PREP_WIDTH = 48
 local BIS_WIDTH = 44
 local READY_WIDTH = 18
 local COLUMN_GAP = 8
@@ -33,6 +34,7 @@ function View.GlanceColumns(model)
         return {
             points = false,
             attendance = false,
+            preparedness = false,
             bis = false,
             readiness = false,
         }
@@ -40,6 +42,7 @@ function View.GlanceColumns(model)
     return {
         points = model.showPoints and true or false,
         attendance = true,
+        preparedness = true,
         bis = true,
         readiness = true,
     }
@@ -257,13 +260,16 @@ function View:ApplyStyle(fontPath, fontSize)
         if r.Attendance and r.Attendance.SetFont then
             r.Attendance:SetFont(fontPath, fontSize, "")
         end
+        if r.Preparedness and r.Preparedness.SetFont then
+            r.Preparedness:SetFont(fontPath, fontSize, "")
+        end
         if r.Bis and r.Bis.SetFont then
             r.Bis:SetFont(fontPath, fontSize, "")
         end
     end
 
     if self.header then
-        for _, label in ipairs({ self.header.Name, self.header.Points, self.header.Attendance, self.header.Bis }) do
+        for _, label in ipairs({ self.header.Name, self.header.Points, self.header.Attendance, self.header.Preparedness, self.header.Bis }) do
             if label and label.SetFont then
                 label:SetFont(fontPath, fontSize, "")
             end
@@ -304,6 +310,11 @@ function View:_EnsureRow(i)
     attendance:SetJustifyH("RIGHT")
     attendance:SetWidth(ATTENDANCE_WIDTH)
     r.Attendance = attendance
+
+    local preparedness = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    preparedness:SetJustifyH("RIGHT")
+    preparedness:SetWidth(PREP_WIDTH)
+    r.Preparedness = preparedness
 
     local bis = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     bis:SetJustifyH("RIGHT")
@@ -459,6 +470,8 @@ function View:_LayoutButtons(r, model)
 	if columns.attendance then
 		r.Attendance:Show()
 		r.Attendance:SetText(model.attendanceText or "—")
+		r.Preparedness:Show()
+		r.Preparedness:SetText(model.preparednessText or "—")
 		r.Bis:Show()
 		r.Bis:SetText(model.bisText or "—")
 		r.Readiness.Icon:SetTexture(READY_TEXTURE[model.readinessState])
@@ -479,6 +492,8 @@ function View:_LayoutButtons(r, model)
 	else
 		r.Attendance:Hide()
 		r.Attendance:SetText("")
+		r.Preparedness:Hide()
+		r.Preparedness:SetText("")
 		r.Bis:Hide()
 		r.Bis:SetText("")
 		r.Readiness:Hide()
@@ -540,6 +555,7 @@ function View:_LayoutButtons(r, model)
 
 	PlaceColumn(r.Readiness, columns.readiness, READY_WIDTH)
 	PlaceColumn(r.Bis, columns.bis, BIS_WIDTH)
+	PlaceColumn(r.Preparedness, columns.preparedness, PREP_WIDTH)
 	PlaceColumn(r.Attendance, columns.attendance, ATTENDANCE_WIDTH)
 	PlaceColumn(r.Points, columns.points, POINTS_WIDTH)
 
@@ -658,15 +674,18 @@ function View:_EnsureHeader()
     h.Name = MakeLabel("LEFT")
     h.Points = MakeLabel("RIGHT")
     h.Attendance = MakeLabel("RIGHT")
+    h.Preparedness = MakeLabel("RIGHT")
     h.Bis = MakeLabel("RIGHT")
     h.Name:SetText("Raider")
     h.Attendance:SetText("Att.")
+    h.Preparedness:SetText("Prep.")
     h.Bis:SetText("BiS")
 
     if self.fontPath and self.fontSize then
         h.Name:SetFont(self.fontPath, self.fontSize, "")
         h.Points:SetFont(self.fontPath, self.fontSize, "")
         h.Attendance:SetFont(self.fontPath, self.fontSize, "")
+        h.Preparedness:SetFont(self.fontPath, self.fontSize, "")
         h.Bis:SetFont(self.fontPath, self.fontSize, "")
     end
 
@@ -691,9 +710,13 @@ function View:_LayoutHeader(showPoints, pointName, hasAdmin)
     h.Bis:SetWidth(BIS_WIDTH)
     h.Bis:SetPoint("RIGHT", rightAnchor, "RIGHT", rightOffset - READY_WIDTH - COLUMN_GAP, 0)
 
+    h.Preparedness:ClearAllPoints()
+    h.Preparedness:SetWidth(PREP_WIDTH)
+    h.Preparedness:SetPoint("RIGHT", h.Bis, "LEFT", -COLUMN_GAP, 0)
+
     h.Attendance:ClearAllPoints()
     h.Attendance:SetWidth(ATTENDANCE_WIDTH)
-    h.Attendance:SetPoint("RIGHT", h.Bis, "LEFT", -COLUMN_GAP, 0)
+    h.Attendance:SetPoint("RIGHT", h.Preparedness, "LEFT", -COLUMN_GAP, 0)
 
     h.Points:ClearAllPoints()
     h.Points:SetWidth(POINTS_WIDTH)
