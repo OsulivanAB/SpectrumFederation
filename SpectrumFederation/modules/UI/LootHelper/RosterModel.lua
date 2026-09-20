@@ -222,6 +222,18 @@ local function CountBisSlots(profile, memberId)
 	return used, possible
 end
 
+local function ReportCaughtError(context, err)
+	local message = string.format("%s: %s", tostring(context), tostring(err))
+	if SF.Debug then
+		SF.Debug:Error("LH_ROSTER", "%s", message)
+	end
+	local getHandler = rawget(_G, "geterrorhandler")
+	local handler = type(getHandler) == "function" and getHandler() or nil
+	if type(handler) == "function" then
+		pcall(handler, message)
+	end
+end
+
 local function BuildReadiness(unit, memberId)
 	local unknown = {
 		state = "unknown",
@@ -284,14 +296,51 @@ function Model:Build(profile)
             local m = entry.member
             local points = (m and m.GetPointBalance and m:GetPointBalance()) or (m and m.pointBalance) or 0
             if profile.GetIdentityPoints then
-                points = profile:GetIdentityPoints(id)
+                local okPoints, identityPoints = pcall(profile.GetIdentityPoints, profile, id)
+                if okPoints then
+                    points = identityPoints
+                else
+                    ReportCaughtError("Loot Helper roster GetIdentityPoints(" .. tostring(id) .. ")", identityPoints)
+                end
             end
             local attendanceText = "—"
             if profile.GetRaidCheckAttendanceDisplay then
-                attendanceText = profile:GetRaidCheckAttendanceDisplay(id)
+                local okAtt, att = pcall(profile.GetRaidCheckAttendanceDisplay, profile, id)
+                if okAtt and type(att) == "string" and att ~= "" then
+                    attendanceText = att
+                elseif not okAtt then
+                    ReportCaughtError("Loot Helper roster GetRaidCheckAttendanceDisplay(" .. tostring(id) .. ")", att)
+                end
             end
-            local bisUsed, bisPossible = CountBisSlots(profile, id)
-            local readiness = BuildReadiness(raidInfo and raidInfo.unit or nil, id)
+            local preparednessText = "—"
+            if profile.GetRaidCheckPreparednessDisplay then
+                local okPrep, prep = pcall(profile.GetRaidCheckPreparednessDisplay, profile, id)
+                if okPrep and type(prep) == "string" and prep ~= "" then
+                    preparednessText = prep
+                elseif not okPrep then
+                    ReportCaughtError("Loot Helper roster GetRaidCheckPreparednessDisplay(" .. tostring(id) .. ")", prep)
+                end
+            end
+            local bisUsed, bisPossible = 0, 16
+            local okBis, used, possible = pcall(CountBisSlots, profile, id)
+            if okBis then
+                bisUsed, bisPossible = used, possible
+            else
+                ReportCaughtError("Loot Helper roster CountBisSlots(" .. tostring(id) .. ")", used)
+            end
+            local readiness
+            local okReady, readyResult = pcall(BuildReadiness, raidInfo and raidInfo.unit or nil, id)
+            if okReady and type(readyResult) == "table" then
+                readiness = readyResult
+            else
+                if not okReady then
+                    ReportCaughtError("Loot Helper roster BuildReadiness(" .. tostring(id) .. ")", readyResult)
+                end
+                readiness = {
+                    state = "unknown",
+                    tooltip = "Current equipment readiness could not be determined.",
+                }
+            end
             local resolvedClass = (raidInfo and raidInfo.class) or entry.class or self._classByMemberId[id] or "UNKNOWN"
             if resolvedClass == "UNKNOWN" and SF.Debug then
                 SF.Debug:Warn("LH_ICON", "Unable to resolve class metadata (member=%s classRaw=%s inRaid=%s)",
@@ -306,12 +355,14 @@ function Model:Build(profile)
                 type = "PROFILE_MEMBER",
                 memberId = id,
                 displayName = ShortName(id),
+                sortKey = string.lower(ShortName(id)),
                 class = resolvedClass,
                 unit = raidInfo and raidInfo.unit or nil,
                 points = tonumber(points) or 0,
                 showPoints = not rewardPot,
                 pointName = (profile.GetPointName and profile:GetPointName()) or "Points",
                 attendanceText = attendanceText,
+                preparednessText = preparednessText,
                 bisText = string.format("%d/%d", bisUsed, bisPossible),
                 readinessState = readiness.state,
                 readinessTooltip = readiness.tooltip,

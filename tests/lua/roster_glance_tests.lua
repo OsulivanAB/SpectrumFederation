@@ -151,6 +151,12 @@ local function makeProfile(rewardPot)
             end
             return "—"
         end,
+        GetRaidCheckPreparednessDisplay = function(_, id)
+            if id == "Alice-Garona" then
+                return "80%"
+            end
+            return "—"
+        end,
         getMemberIds = function(self)
             return { "Alice-Garona", "Bob-Garona" }
         end,
@@ -181,10 +187,12 @@ assertTrue(aliceRow.showPoints, "point-based mode shows the Points column")
 assertEq(aliceRow.pointName, "DKP", "point column uses the configured point name")
 assertEq(aliceRow.points, 12, "point-based row shows identity points")
 assertEq(aliceRow.attendanceText, "96%", "attendance percent comes from presence history")
+assertEq(aliceRow.preparednessText, "80%", "preparedness percent comes from prepared-and-present history")
 assertEq(aliceRow.bisText, "5/16", "BiS uses canonical occupied slots out of Bis.SLOTS")
 assertEq(aliceRow.readinessState, "not_ready", "readiness uses cached equipment evaluation")
 assertEq(aliceRow.readinessTooltip, "Chest Enchant", "not-ready tooltip reuses Policy missing reasons")
 assertEq(bobRow.attendanceText, "—", "player with no presence history shows an em dash")
+assertEq(bobRow.preparednessText, "—", "player with no preparedness history shows an em dash")
 assertEq(bobRow.bisText, "0/16", "unused BiS board is 0/16")
 assertEq(bobRow.readinessState, "unknown", "missing cache is Unknown rather than Not Ready")
 
@@ -195,6 +203,65 @@ assertEq(potRows[1].attendanceText ~= nil and potRows[1].attendanceText ~= "", t
 
 assertEq(inspectQueued, 0, "roster build does not queue inspects")
 
+function IsInRaid()
+    return false
+end
+SF.SettingsStore = {
+    Get = function(_, path)
+        if path == "lootHelper.showMembersNotInRaid" then
+            return true
+        end
+        return nil
+    end,
+}
+local outOfRaidRows, outOfRaidMeta = Model:Build(makeProfile(false))
+assertEq(#outOfRaidRows, 2, "showMembersNotInRaid lists profile members outside a raid")
+assertTrue(outOfRaidRows[1].sortKey ~= nil and outOfRaidRows[1].sortKey ~= "", "out-of-raid rows have a sort key")
+assertTrue(outOfRaidMeta.emptyText == nil, "populated out-of-raid roster has no empty-state copy")
+
+SF.SettingsStore.Get = function()
+    return false
+end
+local hiddenRows, hiddenMeta = Model:Build(makeProfile(false))
+assertEq(#hiddenRows, 0, "setting off hides profile members outside a raid")
+assertTrue(
+    type(hiddenMeta.emptyText) == "string" and hiddenMeta.emptyText:find("Show Members not in raid", 1, true) ~= nil,
+    "empty copy tells the player to enable the setting"
+)
+
+SF.SettingsStore.Get = function()
+    return true
+end
+local boomProfile = makeProfile(false)
+function boomProfile:GetIdentityPoints()
+    error("identity boom")
+end
+function boomProfile:GetRaidCheckAttendanceDisplay()
+    error("attendance boom")
+end
+function boomProfile:GetRaidCheckPreparednessDisplay()
+    error("preparedness boom")
+end
+local reportedErrors = {}
+function geterrorhandler()
+    return function(message)
+        reportedErrors[#reportedErrors + 1] = tostring(message)
+    end
+end
+local originalReady = SF.RaidCheck.GetCachedEquipmentReadiness
+function SF.RaidCheck:GetCachedEquipmentReadiness()
+    error("UnitGUID(): Invalid unit")
+end
+local boomRows = Model:Build(boomProfile)
+assertEq(#boomRows, 2, "glance helper errors do not wipe the out-of-raid roster")
+assertEq(boomRows[1].readinessState, "unknown", "failed readiness falls back to unknown")
+assertTrue(#reportedErrors >= 2, "caught glance errors are forwarded to geterrorhandler")
+SF.RaidCheck.GetCachedEquipmentReadiness = originalReady
+
+function IsInRaid()
+    return true
+end
+
 local raidCheck = (io.open("SpectrumFederation/modules/RaidCheck.lua", "r")):read("*a")
 assertTrue(raidCheck:find("function RC:GetCachedEquipmentReadiness", 1, true) ~= nil, "read-only readiness API exists")
 local api = raidCheck:match("function RC:GetCachedEquipmentReadiness.-function RC:")
@@ -203,6 +270,10 @@ if not api then
 end
 assertTrue(api and not api:find("_QueueInspectForUnit", 1, true), "cached readiness does not queue inspects")
 assertTrue(raidCheck:find("RecordRaidCheckPresence", 1, true) ~= nil, "Raid Check records presence on raid-mode consequences")
+assertTrue(raidCheck:find("preparedMembers", 1, true) ~= nil, "Raid Check records prepared members on the same presence log")
+assertTrue(raidCheck:find("classified.class == CheckRun.CLASS.PREPARED", 1, true) ~= nil, "prepared members use CheckRun PREPARED only")
+assertTrue(raidCheck:find('if not unit or type(unit) ~= "string"', 1, true) ~= nil, "UnitGUID helper rejects a nil unit")
+assertTrue(api and api:find("unit and self:_GetInspectAliases", 1, true) ~= nil, "cached readiness does not inspect with a nil unit")
 
 local controllerSource = (io.open("SpectrumFederation/modules/UI/LootHelper/Controller.lua", "r")):read("*a")
 assertTrue(controllerSource:find("RegisterTroubleshootingListener", 1, true) ~= nil, "roster listens for equipment-cache updates")
@@ -219,11 +290,24 @@ local View = SF.LootHelperWindow.RosterView
 local readyCols = View.GlanceColumns({ type = "PROFILE_MEMBER", showPoints = true, readinessState = "ready" })
 assertTrue(readyCols.readiness, "ready rows still reserve the readiness column")
 assertTrue(readyCols.points, "point-based ready rows still reserve the points column")
+assertTrue(readyCols.preparedness, "profile members reserve the preparedness column")
+assertTrue(not View.ShowsReadinessIcon("ready"), "ready rows do not draw a readiness icon")
 local unknownCols = View.GlanceColumns({ type = "PROFILE_MEMBER", showPoints = false, readinessState = "unknown" })
 assertTrue(unknownCols.readiness, "unknown rows reserve the same readiness column")
+assertTrue(unknownCols.preparedness, "reward pot rows still reserve preparedness")
 assertTrue(not unknownCols.points, "reward pot rows still hide points")
+assertTrue(not View.ShowsReadinessIcon("unknown"), "unknown rows do not draw a question-mark icon")
+assertTrue(View.ShowsReadinessIcon("not_ready"), "not-ready rows still draw the missing-requirement icon")
 local nonMemberCols = View.GlanceColumns({ type = "RAID_NONMEMBER" })
 assertTrue(not nonMemberCols.readiness, "raid non-members do not reserve glance columns")
+assertTrue(not nonMemberCols.preparedness, "raid non-members do not reserve preparedness")
+local viewSource = (io.open("SpectrumFederation/modules/UI/LootHelper/RosterView.lua", "r")):read("*a")
+assertTrue(viewSource:find('h.Preparedness:SetText("Prep.")', 1, true) ~= nil, "roster header labels preparedness Prep.")
+assertTrue(viewSource:find("ReadyCheck-Waiting", 1, true) == nil, "roster no longer uses the waiting question-mark texture")
+assertTrue(viewSource:find("r.BtnHelmet", 1, true) ~= nil, "equipment button remains on roster rows")
+assertTrue(viewSource:find("r.BtnUp", 1, true) == nil, "roster no longer creates up-arrow buttons")
+assertTrue(viewSource:find("IncrementAttendance", 1, true) == nil, "roster no longer increments Attendance points")
+assertTrue(viewSource:find("IncrementPoints", 1, true) == nil, "roster no longer increments loot points")
 
 local rosterBuilds = 0
 local readinessCallbacks = {}

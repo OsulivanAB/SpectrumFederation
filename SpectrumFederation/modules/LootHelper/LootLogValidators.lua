@@ -669,11 +669,26 @@ function LootLogValidators.ValidateRaidCheckPresenceData(eventData, opts)
         end
         return false
     end
+    -- Legacy presence logs omit preparedMembers. Missing means "no
+    -- preparedness history for this opportunity", not an empty prepared set.
+    local preparedMembers = nil
+    if eventData.preparedMembers ~= nil then
+        preparedMembers = NormalizePresenceIdList(eventData.preparedMembers)
+        if not preparedMembers then
+            if SF.Debug then
+                SF.Debug:Warn("LOOTLOG", "Raid Check presence log has invalid prepared member list")
+            end
+            return false
+        end
+    end
     -- LootLog.new normalizes in place. Import ValidateTable must not rewrite
     -- fingerprinted wire tables, so callers can pass opts.mutate = false.
     if not (opts and opts.mutate == false) then
         eventData.presentMembers = presentMembers
         eventData.eligibleMembers = eligibleMembers
+        if preparedMembers then
+            eventData.preparedMembers = preparedMembers
+        end
     end
     return true
 end

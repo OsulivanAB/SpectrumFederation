@@ -60,13 +60,14 @@ local chunk = assert(loadfile("SpectrumFederation/modules/LootHelper/Identity.lu
 chunk("SpectrumFederation", SF)
 local Identity = SF.LootHelperIdentity
 
-local function presenceLog(opportunityId, presentMembers, eligibleMembers, rank)
+local function presenceLog(opportunityId, presentMembers, eligibleMembers, rank, preparedMembers)
     return {
         _eventType = "RAID_CHECK_PRESENCE",
         _data = {
             opportunityId = opportunityId,
             presentMembers = presentMembers,
             eligibleMembers = eligibleMembers,
+            preparedMembers = preparedMembers,
         },
         _id = "Raid Check:" .. tostring(rank or 1),
         _timestamp = 1700000000 + (rank or 1),
@@ -97,14 +98,18 @@ local CAROL = "Carol-Garona"
 
 local empty = Identity.Replay({}, { owner = ALICE })
 assertEq(Identity.FormatRaidCheckAttendance(empty, ALICE), "—", "no history displays an em dash")
+assertEq(Identity.FormatRaidCheckPreparedness(empty, ALICE), "—", "no preparedness history displays an em dash")
 assertTrue(Identity.AffectsProjection("RAID_CHECK_PRESENCE"), "presence logs affect projection")
 
 local first = Identity.Replay({
-    presenceLog("p1:1", { ALICE, BOB }, { ALICE, BOB, CAROL }, 1),
+    presenceLog("p1:1", { ALICE, BOB }, { ALICE, BOB, CAROL }, 1, { ALICE }),
 }, { owner = ALICE })
 assertEq(Identity.FormatRaidCheckAttendance(first, ALICE), "100%", "present roster member is 100%")
 assertEq(Identity.FormatRaidCheckAttendance(first, BOB), "100%", "second present member is 100%")
 assertEq(Identity.FormatRaidCheckAttendance(first, CAROL), "0%", "eligible but absent member is 0%")
+assertEq(Identity.FormatRaidCheckPreparedness(first, ALICE), "100%", "present and prepared member is 100% prepared")
+assertEq(Identity.FormatRaidCheckPreparedness(first, BOB), "0%", "present unprepared member is 0% prepared")
+assertEq(Identity.FormatRaidCheckPreparedness(first, CAROL), "0%", "absent member is 0% prepared")
 assertTrue(Identity.HasRaidCheckPresenceOpportunity(first, "p1:1"), "opportunity id is recorded")
 
 local two = Identity.Replay({
@@ -118,6 +123,29 @@ assertEq(aliceEligible, 2, "alice eligible on both opportunities")
 assertEq(bobPresent, 1, "bob present only on the second opportunity")
 assertEq(bobEligible, 2, "bob eligible on both opportunities")
 assertEq(Identity.FormatRaidCheckAttendance(two, BOB), "50%", "bob attendance is 50%")
+assertEq(Identity.FormatRaidCheckPreparedness(two, ALICE), "—", "legacy logs without preparedMembers do not invent preparedness")
+assertEq(Identity.FormatRaidCheckPreparedness(two, BOB), "—", "legacy logs without preparedMembers stay an em dash for bob")
+
+local mixedPrep = Identity.Replay({
+    presenceLog("p1:1", { ALICE }, { ALICE, BOB }, 1),
+    presenceLog("p1:2", { ALICE, BOB }, { ALICE, BOB }, 2, { ALICE }),
+}, { owner = ALICE })
+assertEq(Identity.FormatRaidCheckAttendance(mixedPrep, ALICE), "100%", "mixed history still counts both attendance opportunities")
+assertEq(Identity.FormatRaidCheckAttendance(mixedPrep, BOB), "50%", "mixed history keeps bob attendance at 50%")
+assertEq(Identity.FormatRaidCheckPreparedness(mixedPrep, ALICE), "100%", "only logs with preparedMembers enter the preparedness denominator")
+assertEq(Identity.FormatRaidCheckPreparedness(mixedPrep, BOB), "0%", "present unprepared member on a prepared log is 0%")
+
+local emptyPrepared = Identity.Replay({
+    presenceLog("p1:1", { ALICE }, { ALICE }, 1, {}),
+}, { owner = ALICE })
+assertEq(Identity.FormatRaidCheckAttendance(emptyPrepared, ALICE), "100%", "empty preparedMembers still counts attendance")
+assertEq(Identity.FormatRaidCheckPreparedness(emptyPrepared, ALICE), "0%", "explicit empty preparedMembers is 0% not an em dash")
+
+local preparedAbsent = Identity.Replay({
+    presenceLog("p1:1", { ALICE }, { ALICE, BOB }, 1, { BOB }),
+}, { owner = ALICE })
+assertEq(Identity.FormatRaidCheckPreparedness(preparedAbsent, ALICE), "0%", "present unlisted member is not prepared")
+assertEq(Identity.FormatRaidCheckPreparedness(preparedAbsent, BOB), "0%", "prepared but absent member is not credited")
 
 local lateJoin = Identity.Replay({
     presenceLog("p1:1", { ALICE }, { ALICE }, 1),
@@ -183,6 +211,23 @@ assertTrue(not Validators.ValidateRaidCheckPresenceData({
     presentMembers = "Alice-Garona",
     eligibleMembers = { ALICE },
 }), "string presentMembers is rejected")
+assertTrue(Validators.ValidateRaidCheckPresenceData({
+    opportunityId = "legacy",
+    presentMembers = { ALICE },
+    eligibleMembers = { ALICE },
+}), "validator accepts a legacy log that omits preparedMembers")
+assertTrue(Validators.ValidateRaidCheckPresenceData({
+    opportunityId = "empty-prep",
+    presentMembers = { ALICE },
+    eligibleMembers = { ALICE },
+    preparedMembers = {},
+}), "validator accepts an explicit empty preparedMembers list")
+assertTrue(not Validators.ValidateRaidCheckPresenceData({
+    opportunityId = "x",
+    presentMembers = { ALICE },
+    eligibleMembers = { ALICE },
+    preparedMembers = "Alice-Garona",
+}), "string preparedMembers is rejected")
 
 local importProbe = {
     opportunityId = "profile:2",
@@ -220,6 +265,20 @@ local badWire = presenceWire({
 })
 assertTrue(not select(1, SF.LootLog.ValidateTable(badWire)), "ValidateTable rejects a string presentMembers list")
 assertEq(badWire._data.presentMembers, "Alice-Garona", "ValidateTable does not rewrite rejected presence data")
+local legacyWire = presenceWire({
+    opportunityId = "profile:1",
+    presentMembers = { ALICE },
+    eligibleMembers = { ALICE, BOB },
+})
+assertTrue(select(1, SF.LootLog.ValidateTable(legacyWire)), "ValidateTable accepts a legacy presence log without preparedMembers")
+local badPrepWire = presenceWire({
+    opportunityId = "profile:1",
+    presentMembers = { ALICE },
+    eligibleMembers = { ALICE, BOB },
+    preparedMembers = "Alice-Garona",
+})
+assertTrue(not select(1, SF.LootLog.ValidateTable(badPrepWire)), "ValidateTable rejects a string preparedMembers list")
+assertEq(badPrepWire._data.preparedMembers, "Alice-Garona", "ValidateTable does not rewrite rejected preparedMembers")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

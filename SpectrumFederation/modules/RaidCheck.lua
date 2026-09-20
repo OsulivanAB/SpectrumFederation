@@ -54,7 +54,7 @@ local function CanAccessValue(value)
 end
 
 local function GetAccessibleUnitGUID(unit)
-	if not UnitGUID then
+	if not unit or type(unit) ~= "string" or unit == "" or not UnitGUID then
 		return nil
 	end
 
@@ -3084,20 +3084,37 @@ function RC:_ApplyCheckConsequences(run)
 			opportunityId = run.profileId .. ":" .. opportunityId
 		end
 		if opportunityId ~= "" then
+			local preparedMembers = {}
+			local presentSet = {}
+			for _, memberId in ipairs(run.groupMemberIds or {}) do
+				if type(memberId) == "string" and memberId ~= "" then
+					presentSet[memberId] = true
+				end
+			end
+			for memberId, classified in pairs(results) do
+				if presentSet[memberId]
+					and classified
+					and classified.class == CheckRun.CLASS.PREPARED
+				then
+					preparedMembers[#preparedMembers + 1] = memberId
+				end
+			end
 			local recorded = profile:RecordRaidCheckPresence({
 				opportunityId = opportunityId,
 				presentMembers = run.groupMemberIds or {},
 				eligibleMembers = run.rosterMemberIds or {},
+				preparedMembers = preparedMembers,
 				logAuthor = "Raid Check",
 				skipBroadcast = skipBroadcast,
 			})
 			if SF.Debug then
 				SF.Debug:Info(
 					"RAID_CHECK",
-					"Raid Check presence %s (present=%d eligible=%d skipBroadcast=%s)",
+					"Raid Check presence %s (present=%d eligible=%d prepared=%d skipBroadcast=%s)",
 					recorded and opportunityId or "skipped",
 					#(run.groupMemberIds or {}),
 					#(run.rosterMemberIds or {}),
+					#preparedMembers,
 					tostring(skipBroadcast)
 				)
 			end
@@ -3606,7 +3623,10 @@ function RC:GetCachedEquipmentReadiness(unit, memberId)
 		end
 	else
 		local state = self:_GetInspectState()
-		local aliases = self:_GetInspectAliases(unit, { id = memberId })
+		-- Out of raid the glance list has no unit. Do not call inspect
+		-- helpers with a nil unit; Retail UnitGUID(nil) can error and abort
+		-- the whole roster rebuild.
+		local aliases = unit and self:_GetInspectAliases(unit, { id = memberId }) or { memberId }
 		local entry = self:_GetInspectCacheEntryByAliases(aliases)
 		if (not entry or not entry.slotsByInventory) and memberId then
 			entry = self:_GetInspectCacheEntryByAliases({ memberId })

@@ -16,23 +16,26 @@ local BTN_SIZE = 20
 local BTN_GAP = 3
 local POINTS_WIDTH = 40
 local ATTENDANCE_WIDTH = 48
+local PREP_WIDTH = 48
 local BIS_WIDTH = 44
 local READY_WIDTH = 18
 local COLUMN_GAP = 8
-local MANUAL_POINT_STEP = 0.5
-local MANUAL_ATTENDANCE_STEP = 1
 local READY_TEXTURE = {
     not_ready = "Interface\\RaidFrame\\ReadyCheck-NotReady",
-    unknown = "Interface\\RaidFrame\\ReadyCheck-Waiting",
 }
 
--- Ready players show no icon, but the column still occupies READY_WIDTH so
--- Att./BiS/Points stay aligned with not-ready and unknown rows.
+-- Ready and unknown rows show no icon. The column still occupies READY_WIDTH
+-- so Att./BiS/Points stay aligned with not-ready rows.
+function View.ShowsReadinessIcon(state)
+    return state == "not_ready"
+end
+
 function View.GlanceColumns(model)
     if type(model) ~= "table" or model.type ~= "PROFILE_MEMBER" then
         return {
             points = false,
             attendance = false,
+            preparedness = false,
             bis = false,
             readiness = false,
         }
@@ -40,14 +43,13 @@ function View.GlanceColumns(model)
     return {
         points = model.showPoints and true or false,
         attendance = true,
+        preparedness = true,
         bis = true,
         readiness = true,
     }
 end
 
 -- Cropping presets you can tweak quickly:
-local CROP_ICON   = 0.07  -- great for Interface\Icons\
-local CROP_ARROW  = 0.18  -- zooms in UI scrollbar arrows
 local CROP_PLUS   = 0.18  -- plus button has padding too
 local NO_CROP     = false -- special: full texture (0..1)
 
@@ -257,13 +259,16 @@ function View:ApplyStyle(fontPath, fontSize)
         if r.Attendance and r.Attendance.SetFont then
             r.Attendance:SetFont(fontPath, fontSize, "")
         end
+        if r.Preparedness and r.Preparedness.SetFont then
+            r.Preparedness:SetFont(fontPath, fontSize, "")
+        end
         if r.Bis and r.Bis.SetFont then
             r.Bis:SetFont(fontPath, fontSize, "")
         end
     end
 
     if self.header then
-        for _, label in ipairs({ self.header.Name, self.header.Points, self.header.Attendance, self.header.Bis }) do
+        for _, label in ipairs({ self.header.Name, self.header.Points, self.header.Attendance, self.header.Preparedness, self.header.Bis }) do
             if label and label.SetFont then
                 label:SetFont(fontPath, fontSize, "")
             end
@@ -305,6 +310,11 @@ function View:_EnsureRow(i)
     attendance:SetWidth(ATTENDANCE_WIDTH)
     r.Attendance = attendance
 
+    local preparedness = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    preparedness:SetJustifyH("RIGHT")
+    preparedness:SetWidth(PREP_WIDTH)
+    r.Preparedness = preparedness
+
     local bis = r:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     bis:SetJustifyH("RIGHT")
     bis:SetWidth(BIS_WIDTH)
@@ -318,28 +328,7 @@ function View:_EnsureRow(i)
     ready.Icon = readyIcon
     r.Readiness = ready
 
-    -- -- Buttons 
-    -- r.BtnUp = CreateSmallIconButton(actions, "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up", BTN_SIZE)
-    -- r.BtnDown = CreateSmallIconButton(actions, "Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up", BTN_SIZE)
-    -- -- r.BtnHelmet = CreateSmallIconButton(actions, "Interface\\Icons\\INV_HELMET_03", BTN_SIZE)
-    -- r.BtnHelmet = CreateSmallIconButton(actions, "Interface\\PaperDollInfoFrame\\UI-EquipmentManager-Toggle", BTN_SIZE)
-    -- r.BtnPlus = CreateSmallIconButton(actions, "Interface\\Buttons\\UI-PlusButton-Up", BTN_SIZE)
-
-    -- Buttons
-    r.BtnUp = CreateSmallIconButton(actions,
-        "Interface\\Buttons\\UI-ScrollBar-ScrollUpButton-Up",
-        BTN_SIZE,
-        { crop = CROP_ARROW }
-    )
-
-    r.BtnDown = CreateSmallIconButton(actions,
-        "Interface\\Buttons\\UI-ScrollBar-ScrollDownButton-Up",
-        BTN_SIZE,
-        { crop = CROP_ARROW }
-    )
-
     -- Helmet / equipment toggle: this texture tends to look best without heavy crop.
-    -- Try NO_CROP first; if it looks too small, switch to { crop = 0.10 } or { crop = CROP_ICON }.
     r.BtnHelmet = CreateSmallIconButton(actions,
         "Interface\\PaperDollInfoFrame\\UI-GearManager-Button",
         BTN_SIZE,
@@ -379,58 +368,6 @@ function View:_EnsureRow(i)
     return r
 end
 
--- function View:_LayoutButtons(r, model)
---     local actions = r.Actions
---     local x = 0
-
---     -- Helper to place visible buttons from right to left
---     local function Place(btn)
---         btn:ClearAllPoints()
---         btn:SetPoint("RIGHT", actions, "RIGHT", -x, 0)
---         x = x + BTN_SIZE + BTN_GAP
---     end
-
---     -- Hide all first
---     r.BtnUp:Hide()
---     r.BtnDown:Hide()
---     r.BtnHelmet:Hide()
---     r.BtnPlus:Hide()
-
---     -- Default: points visible only for profile members
---     if model.type == "PROFILE_MEMBER" then
---         r.Points:Show()
---         r.Points:SetText(tostring(model.points or 0))
---     else
---         r.Points:Hide()
---         r.Points:SetText("")
---     end
-
---     -- Buttons depending on row type/admin
---     if model.type == "RAID_NONMEMBER" then
---         if model.canAdmin then
---             r.BtnPlus:Show()
---         end
---     else
---         if model.canAdmin then
---             r.BtnHelmet:Show()
---             Place(r.BtnHelmet)
-
---             r.BtnDown:Show()
---             Place(r.BtnDown)
-
---             r.BtnUp:Show()
---             Place(r.BtnUp)
---         end
---     end
-
---     -- Place points to the left of the button stack
---     r.Points:ClearAllPoints()
---     if r.Points:IsShown() then
---         local rightPad = (x > 0) and (x + 6) or 0
---         r.Points:SetPoint("RIGHT", actions, "RIGHT", -rightPad, 0)
---     end
--- end
-
 function View:_LayoutButtons(r, model)
 	local actions = r.Actions
 	local x = 0
@@ -442,8 +379,6 @@ function View:_LayoutButtons(r, model)
 	end
 
 	-- Hide all first
-	r.BtnUp:Hide()
-	r.BtnDown:Hide()
 	r.BtnHelmet:Hide()
 	r.BtnPlus:Hide()
 
@@ -459,26 +394,40 @@ function View:_LayoutButtons(r, model)
 	if columns.attendance then
 		r.Attendance:Show()
 		r.Attendance:SetText(model.attendanceText or "—")
+		r.Preparedness:Show()
+		r.Preparedness:SetText(model.preparednessText or "—")
 		r.Bis:Show()
 		r.Bis:SetText(model.bisText or "—")
-		r.Readiness.Icon:SetTexture(READY_TEXTURE[model.readinessState])
 		r.Readiness:Show()
-		r.Readiness:SetScript("OnEnter", function(frame)
-			local tooltip = model.readinessTooltip
-			if tooltip and tooltip ~= "" and GameTooltip then
-				GameTooltip:SetOwner(frame, "ANCHOR_RIGHT")
-				GameTooltip:SetText(tooltip, nil, nil, nil, nil, true)
-				GameTooltip:Show()
-			end
-		end)
-		r.Readiness:SetScript("OnLeave", function()
-			if GameTooltip then
-				GameTooltip:Hide()
-			end
-		end)
+		if View.ShowsReadinessIcon(model.readinessState) then
+			r.Readiness.Icon:SetTexture(READY_TEXTURE.not_ready)
+			r.Readiness.Icon:Show()
+			r.Readiness:EnableMouse(true)
+			r.Readiness:SetScript("OnEnter", function(frame)
+				local tooltip = model.readinessTooltip
+				if tooltip and tooltip ~= "" and GameTooltip then
+					GameTooltip:SetOwner(frame, "ANCHOR_RIGHT")
+					GameTooltip:SetText(tooltip, nil, nil, nil, nil, true)
+					GameTooltip:Show()
+				end
+			end)
+			r.Readiness:SetScript("OnLeave", function()
+				if GameTooltip then
+					GameTooltip:Hide()
+				end
+			end)
+		else
+			r.Readiness.Icon:SetTexture(nil)
+			r.Readiness.Icon:Hide()
+			r.Readiness:EnableMouse(false)
+			r.Readiness:SetScript("OnEnter", nil)
+			r.Readiness:SetScript("OnLeave", nil)
+		end
 	else
 		r.Attendance:Hide()
 		r.Attendance:SetText("")
+		r.Preparedness:Hide()
+		r.Preparedness:SetText("")
 		r.Bis:Hide()
 		r.Bis:SetText("")
 		r.Readiness:Hide()
@@ -498,17 +447,6 @@ function View:_LayoutButtons(r, model)
 		r.BtnHelmet:Show()
 		r.BtnHelmet:Enable()
 		Place(r.BtnHelmet)
-
-		-- Up/Down buttons are admin-only (hide for non-admins)
-		if model.canAdmin then
-			r.BtnDown:Show()
-			r.BtnDown:Enable()
-			Place(r.BtnDown)
-
-			r.BtnUp:Show()
-			r.BtnUp:Enable()
-			Place(r.BtnUp)
-		end
 	end
 
 	-- Calculate the real width of the visible button stack
@@ -540,6 +478,7 @@ function View:_LayoutButtons(r, model)
 
 	PlaceColumn(r.Readiness, columns.readiness, READY_WIDTH)
 	PlaceColumn(r.Bis, columns.bis, BIS_WIDTH)
+	PlaceColumn(r.Preparedness, columns.preparedness, PREP_WIDTH)
 	PlaceColumn(r.Attendance, columns.attendance, ATTENDANCE_WIDTH)
 	PlaceColumn(r.Points, columns.points, POINTS_WIDTH)
 
@@ -554,68 +493,11 @@ end
 
 function View:_BindRowActions(r, model)
     -- Clear old scripts
-    r.BtnUp:SetScript("OnClick", nil)
-    r.BtnDown:SetScript("OnClick", nil)
     r.BtnHelmet:SetScript("OnClick", nil)
     r.BtnPlus:SetScript("OnClick", nil)
 
     -- Profile member actions
     if model.type == "PROFILE_MEMBER" then
-        -- Up/Down buttons (admin only)
-        if model.canAdmin and model.member then
-            r.BtnUp:SetScript("OnClick", function()
-                if model.rewardPot then
-                    if model.member.IncrementAttendance then
-                        pcall(function()
-                            model.member:IncrementAttendance({
-                                amount = MANUAL_ATTENDANCE_STEP,
-                                reason = "MANUAL",
-                                profile = model.profile,
-                            })
-                        end)
-                    end
-                elseif model.member.IncrementPoints then
-                    pcall(function()
-                        model.member:IncrementPoints({
-                            amount = MANUAL_POINT_STEP,
-                            reason = "MANUAL",
-                            profile = model.profile,
-                        })
-                    end)
-                end
-                -- DATA_CHANGED event is automatically fired via Events.lua hook
-                if SF.Debug then
-                    SF.Debug:Info("LH_ROSTER_VIEW", "%s: %s", model.rewardPot and "IncrementAttendance" or "IncrementPoints", tostring(model.memberId))
-                end
-            end)
-            
-            r.BtnDown:SetScript("OnClick", function()
-                if model.rewardPot then
-                    if model.member.DecrementAttendance then
-                        pcall(function()
-                            model.member:DecrementAttendance({
-                                amount = MANUAL_ATTENDANCE_STEP,
-                                reason = "MANUAL",
-                                profile = model.profile,
-                            })
-                        end)
-                    end
-                elseif model.member.DecrementPoints then
-                    pcall(function()
-                        model.member:DecrementPoints({
-                            amount = MANUAL_POINT_STEP,
-                            reason = "MANUAL",
-                            profile = model.profile,
-                        })
-                    end)
-                end
-                -- DATA_CHANGED event is automatically fired via Events.lua hook
-                if SF.Debug then
-                    SF.Debug:Info("LH_ROSTER_VIEW", "%s: %s", model.rewardPot and "DecrementAttendance" or "DecrementPoints", tostring(model.memberId))
-                end
-            end)
-        end
-        
         -- Helmet button (visible for everyone)
         r.BtnHelmet:SetScript("OnClick", function()
             if self.controller and self.controller.OnEquipmentClicked then
@@ -658,15 +540,18 @@ function View:_EnsureHeader()
     h.Name = MakeLabel("LEFT")
     h.Points = MakeLabel("RIGHT")
     h.Attendance = MakeLabel("RIGHT")
+    h.Preparedness = MakeLabel("RIGHT")
     h.Bis = MakeLabel("RIGHT")
     h.Name:SetText("Raider")
     h.Attendance:SetText("Att.")
+    h.Preparedness:SetText("Prep.")
     h.Bis:SetText("BiS")
 
     if self.fontPath and self.fontSize then
         h.Name:SetFont(self.fontPath, self.fontSize, "")
         h.Points:SetFont(self.fontPath, self.fontSize, "")
         h.Attendance:SetFont(self.fontPath, self.fontSize, "")
+        h.Preparedness:SetFont(self.fontPath, self.fontSize, "")
         h.Bis:SetFont(self.fontPath, self.fontSize, "")
     end
 
@@ -674,16 +559,14 @@ function View:_EnsureHeader()
     return h
 end
 
-function View:_LayoutHeader(showPoints, pointName, hasAdmin)
+function View:_LayoutHeader(showPoints, pointName)
     local h = self:_EnsureHeader()
     h:ClearAllPoints()
     h:SetPoint("TOPLEFT", self.child, "TOPLEFT", 0, 0)
     h:SetPoint("TOPRIGHT", self.child, "TOPRIGHT", 0, 0)
 
+    -- Helmet or add-member is the only trailing action on a row.
     local actionWidth = BTN_SIZE
-    if hasAdmin then
-        actionWidth = (3 * BTN_SIZE) + (2 * BTN_GAP)
-    end
     local rightOffset = -(actionWidth + 4)
     local rightAnchor = h
 
@@ -691,9 +574,13 @@ function View:_LayoutHeader(showPoints, pointName, hasAdmin)
     h.Bis:SetWidth(BIS_WIDTH)
     h.Bis:SetPoint("RIGHT", rightAnchor, "RIGHT", rightOffset - READY_WIDTH - COLUMN_GAP, 0)
 
+    h.Preparedness:ClearAllPoints()
+    h.Preparedness:SetWidth(PREP_WIDTH)
+    h.Preparedness:SetPoint("RIGHT", h.Bis, "LEFT", -COLUMN_GAP, 0)
+
     h.Attendance:ClearAllPoints()
     h.Attendance:SetWidth(ATTENDANCE_WIDTH)
-    h.Attendance:SetPoint("RIGHT", h.Bis, "LEFT", -COLUMN_GAP, 0)
+    h.Attendance:SetPoint("RIGHT", h.Preparedness, "LEFT", -COLUMN_GAP, 0)
 
     h.Points:ClearAllPoints()
     h.Points:SetWidth(POINTS_WIDTH)
@@ -752,7 +639,6 @@ function View:Render(models, meta)
 
     local showPoints = false
     local pointName = "Points"
-    local hasAdmin = false
     for i = 1, #models do
         local model = models[i]
         if model.type == "PROFILE_MEMBER" and model.showPoints then
@@ -761,11 +647,8 @@ function View:Render(models, meta)
                 pointName = model.pointName
             end
         end
-        if model.canAdmin then
-            hasAdmin = true
-        end
     end
-    self:_LayoutHeader(showPoints, pointName, hasAdmin)
+    self:_LayoutHeader(showPoints, pointName)
 
     local y = HEADER_HEIGHT + 2
     for i = 1, #models do

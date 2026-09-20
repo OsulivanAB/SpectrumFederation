@@ -532,7 +532,11 @@ function Controller:_IsRosterContentVisible()
     if not f or not f:IsShown() then
         return false
     end
-    -- Minimized windows keep the outer frame shown and hide Content.
+    -- Content:IsShown is the real visibility signal. A stale minimized flag
+    -- must not skip roster rebuilds while the list is on-screen.
+    if f.Content and f.Content.IsShown and f.Content:IsShown() then
+        return true
+    end
     if LH.Window and LH.Window.IsMinimized and LH.Window:IsMinimized() then
         return false
     end
