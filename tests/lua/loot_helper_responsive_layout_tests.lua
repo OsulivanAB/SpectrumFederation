@@ -647,6 +647,49 @@ view:ApplyStyle("Fonts\\FRIZQT__.TTF", 16)
 assertEq(view._layoutApplyCount, beforeStyle + 2, "a font size change layouts once")
 assertEq(businessCalls, 0, "font changes do not run roster business callbacks")
 
+local styleChunk = assert(loadfile("SpectrumFederation/modules/UI/LootHelper/Style.lua"))
+styleChunk("SpectrumFederation", SF)
+local Style = SF.LootHelperWindow.Style
+
+local titleLayouts = 0
+local profileFont = { font = nil, size = nil, flags = nil }
+local titleFrame = {
+    Title = {
+        ProfileName = {
+            __sfFullText = "Osulivan-Stormrage",
+            text = "Osuli...",
+        },
+        UpdateTitleLayout = function()
+            titleLayouts = titleLayouts + 1
+        end,
+    },
+}
+function titleFrame:SetBackdrop()
+end
+function titleFrame:SetBackdropColor()
+end
+function titleFrame:SetBackdropBorderColor()
+end
+function titleFrame.Title.ProfileName:SetFont(path, size, flags)
+    profileFont.font = path
+    profileFont.size = size
+    profileFont.flags = flags
+end
+function titleFrame.Title.ProfileName:GetFont()
+    return profileFont.font, profileFont.size, profileFont.flags
+end
+
+Style:Apply(titleFrame)
+assertEq(titleLayouts, 1, "the first profile font apply refreshes title truncation")
+assertEq(profileFont.font, "Fonts\\FRIZQT__.TTF", "profile title uses the resolved font")
+assertEq(profileFont.size, 13, "profile title is one point larger than the roster font")
+Style:Apply(titleFrame)
+assertEq(titleLayouts, 1, "the same profile font does not refresh title truncation again")
+SpectrumFederationDB.global = { fontSize = 18 }
+Style:Apply(titleFrame)
+assertEq(profileFont.size, 19, "a settings font size change reaches the profile title")
+assertEq(titleLayouts, 2, "a profile font change refreshes title truncation")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
