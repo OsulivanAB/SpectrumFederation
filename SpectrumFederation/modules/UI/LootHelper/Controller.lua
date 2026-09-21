@@ -103,12 +103,25 @@ function Controller:_HideEquipmentWindow()
     end
 end
 
+function Controller:_NotifySettingsVisibilityChanged()
+    local win = SF.SettingsWindow
+    if not win or type(win.RefreshCurrentPage) ~= "function" then
+        return
+    end
+    if win.frame and win.frame.IsShown and not win.frame:IsShown() then
+        return
+    end
+    win:RefreshCurrentPage()
+end
+
 function Controller:_ApplyFrameVisibility(shouldShow, reason, why)
     local f = self:GetFrame()
     if not f then return end
 
     -- Keep title accurate even if hidden
     self:RefreshTitle()
+
+    local wasShown = f:IsShown() and true or false
 
     if shouldShow then
         if not f:IsShown() then
@@ -124,6 +137,10 @@ function Controller:_ApplyFrameVisibility(shouldShow, reason, why)
         -- Equipment is subordinate to the main window; hide it whenever the
         -- roster UI is not displayed, even if the main frame was already hidden.
         self:_HideEquipmentWindow()
+    end
+
+    if (f:IsShown() and true or false) ~= wasShown then
+        self:_NotifySettingsVisibilityChanged()
     end
 
     if SF.Debug then

@@ -8,7 +8,7 @@ Each profile uses one loot mode: [Point Based](point-based.md) or [Reward Pot](r
 
 Loot Helper requires the feature to be enabled and an active profile to exist. By default, its window is shown only while you are in a raid. **Show Loot Window outside of Raid** removes the raid-only restriction.
 
-Enable Loot Helper and window visibility are separate. Turning the feature off stops Loot Helper on this client. Closing the window only hides the UI; sessions, sync, heartbeat, Raid Check, and related features keep running.
+Enable Loot Helper and window visibility are separate. Turning Enable off hides the window and keeps it from appearing automatically. Closing the window with X only hides the UI for this session; sessions, sync, heartbeat, Raid Check, and related features keep running.
 
 Enter `/sf loot` to enable Loot Helper if needed and show the window. That command is an explicit Show: it reopens a window you closed and does not toggle a visible window off. **Loot Helper → General → Loot Window** also shows or hides the roster. Eligibility rules still apply, so Show will not appear outside a raid unless **Show Loot Window outside of Raid** is on, and it still requires an active profile.
 

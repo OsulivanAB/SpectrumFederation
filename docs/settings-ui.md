@@ -8,7 +8,7 @@ The left sidebar lists **categories** grouped as Core, Loot Tools, Advanced, and
 
 Installed optional child addons appear under **Optional**. If the add-on is enabled for this character but has no settings pages yet, the category opens to a generic empty state. If an optional add-on is disabled for this character, the row stays visible and greyed; hover explains that it must be enabled in World of Warcraft's AddOns list. Spectrum Federation cannot enable or disable child addons from `/sf`.
 
-**Enable Loot Helper** on the Loot Helper General tab controls whether Loot Helper features run on this client. It does not grey the Loot Helper category, and it is not the control for merely hiding the roster window.
+**Enable Loot Helper** on the Loot Helper General tab controls whether the roster window is allowed to appear. It does not grey the Loot Helper category, and it is not the control for hiding a currently visible window for this session.
 
 The window can be resized from the bottom-right grip. Wide pages such as Raid Equipment and Loot Logs raise the minimum size when needed, but leaving those pages does not shrink the window.
 
@@ -48,7 +48,7 @@ The sliders update the visible trail while you drag them. Copy overwrites every 
 
 ## Loot Helper: General
 
-- **Enable Loot Helper** — turn Loot Helper functionality on or off for this character. Disabling it stops Loot Helper features on this client. This is not the control for merely hiding the roster window.
+- **Enable Loot Helper** — allow the roster window to appear when its other visibility conditions are met. Turning this off hides the window and prevents automatic re-show. Sync and Raid Check still initialize. Use **Loot Window** Show/Hide to hide the UI without changing this setting.
 - **Loot Window** — show or hide the roster window on this client. The button reads **Show Loot Window** or **Hide Loot Window** based on current visibility. Hiding the window does not disable Loot Helper, end a session, or stop synchronization.
 - **Lock Loot Window** — prevent moving and resizing the Loot Helper window. Title-bar Close, Minimize, Settings, and Start/Stop Session still work.
 - **Show Members not in raid** — include profile members who are absent from the current raid.

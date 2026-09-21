@@ -68,6 +68,8 @@ local equipmentHideCount = 0
 local equipmentShown = false
 local listenerCount = 0
 local refreshCount = 0
+local settingsRefreshCount = 0
+local settingsWindowShown = true
 
 local function resetPrints()
     prints = {}
@@ -155,6 +157,18 @@ end
 
 function SF:PrintError(msg)
     prints[#prints + 1] = { "error", tostring(msg) }
+end
+
+SF.SettingsWindow = {
+    frame = {
+        shown = true,
+    },
+    RefreshCurrentPage = function()
+        settingsRefreshCount = settingsRefreshCount + 1
+    end,
+}
+function SF.SettingsWindow.frame:IsShown()
+    return settingsWindowShown
 end
 
 SF.LootHelperSync = {
@@ -365,6 +379,8 @@ local function resetState()
     Controller._readinessListenerBound = false
     Controller._rosterView = nil
     refreshCount = 0
+    settingsRefreshCount = 0
+    settingsWindowShown = true
     equipmentHideCount = 0
     equipmentShown = true
     listenerCount = 0
@@ -413,6 +429,24 @@ assertTrue(equipmentHideCount >= 1, "equipment Hide is invoked")
 assertEq(SpectrumFederationDB.lootHelper.enabled, enabledBefore, "X does not change lootHelper.enabled")
 assertEq(sessionEndCount, 0, "X does not end an active session")
 assertEq(Controller:GetWindowVisibilityActionText(), "Show Loot Window", "settings text is Show when hidden")
+
+resetState()
+Controller:EvaluateVisibility("shown")
+settingsRefreshCount = 0
+Controller:OnCloseClicked()
+assertEq(settingsRefreshCount, 1, "X refreshes the open settings page when visibility changes")
+settingsRefreshCount = 0
+Controller:EvaluateVisibility("Event:GROUP_ROSTER_UPDATE")
+assertEq(settingsRefreshCount, 0, "unchanged hidden reevaluation does not refresh settings")
+Controller:ShowWindow("Slash:/sf loot")
+assertEq(settingsRefreshCount, 1, "/sf loot refreshes settings when it reopens the window")
+
+resetState()
+Controller:EvaluateVisibility("shown")
+settingsWindowShown = false
+settingsRefreshCount = 0
+Controller:HideWindow("CloseButton")
+assertEq(settingsRefreshCount, 0, "settings is not refreshed when the settings window is hidden")
 
 -- GROUP_ROSTER_UPDATE and other automatic reevaluation must not reopen.
 resetState()

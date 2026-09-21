@@ -787,7 +787,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			title = "General Settings",
 			tooltip = "Character-level Loot Helper options for this client, plus global actions such as a full reset.",
 			items = {
-				{ type = "checkbox", label = "Enable Loot Helper", tooltip = "Turn Loot Helper functionality on or off for this character. Disabling it stops Loot Helper features on this client. Use Show/Hide Loot Window if you only want to hide the roster UI.", path = "lootHelper.enabled" },
+				{ type = "checkbox", label = "Enable Loot Helper", tooltip = "Allow the Loot Helper roster window to appear for this character when an active profile and raid conditions are met. Turning this off hides the window and prevents it from coming back automatically. Use Show/Hide Loot Window to hide the UI for this session without changing this setting. Sync and Raid Check still initialize.", path = "lootHelper.enabled" },
 				{
 					type = "button",
 					label = "Loot Window",
