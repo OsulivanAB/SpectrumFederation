@@ -315,10 +315,9 @@ function Integration.DecodeHistoryPayload(raw, libs, opts)
             return { false }
         end
         -- LibDeflate's public DecompressDeflate has no max-output argument.
-        -- Reject after inflate so we never deserialize a bomb. The compressed
-        -- and decompressed size caps are the primary UI-thread defenses.
-        -- Command trust is applied after decode: history and change_response
-        -- still require the current Master Looter.
+        -- Reject after inflate so we never deserialize a bomb. Callers must
+        -- authenticate the sender before this runs. The compressed and
+        -- decompressed size caps bound the work that remains.
         local inflated = ld:DecompressDeflate(decodedBytes)
         if type(inflated) ~= "string" or #inflated > Integration.MAX_DECOMPRESSED_BYTES then
             return { false }
@@ -1007,7 +1006,26 @@ function Integration.HandleAwardSuccess(session, winner, _status, itemLink, resp
     return "popup"
 end
 
-function Integration.HandleIncomingMessage(prefix, message, _distribution, sender)
+-- Direct candidate responses are whispers to the current Master Looter.
+-- Group and guild traffic is inflated only when the sender is that ML.
+local function NonMLMayDecode(distribution, sender)
+    if distribution ~= "WHISPER" then
+        return false, "not_ml"
+    end
+    if not Integration.LocalPlayerIsCurrentMasterLooter() then
+        return false, "not_ml"
+    end
+    local player = Integration.NormalizeRCPlayerId(sender)
+    local profile = Integration.GetSessionProfile()
+    local member = player and profile and profile.getMemberByID and profile:getMemberByID(player) or nil
+    if not member then
+        DebugInfo("Ignoring RC whisper from %s before decode; sender is not a session profile member", tostring(sender))
+        return false, "untrusted"
+    end
+    return true
+end
+
+function Integration.HandleIncomingMessage(prefix, message, distribution, sender)
     if prefix ~= Integration.RC_PREFIX then
         return "ignored"
     end
@@ -1021,10 +1039,24 @@ function Integration.HandleIncomingMessage(prefix, message, _distribution, sende
         DebugInfo("Ignoring oversized RC payload from %s (%d bytes)", tostring(sender), #message)
         return "too_large"
     end
-    -- Size-capped decode classifies the command. History and change_response
-    -- stay Master-Looter-authoritative; candidate responses are not.
+    -- Authenticate before inflate. History, change_response, and session_end
+    -- stay Master-Looter-authoritative. A candidate response is a whisper to
+    -- the current ML from a session-profile member.
+    if not Integration.SenderIsCurrentMasterLooter(sender) then
+        local allowed, reason = NonMLMayDecode(distribution, sender)
+        if not allowed then
+            if reason ~= "untrusted" then
+                DebugInfo("Ignoring RC payload from non-ML sender %s before decode", tostring(sender))
+            end
+            return reason or "not_ml"
+        end
+    end
     local decoded = Integration.DecodeHistoryPayload(message)
     local command = decoded and decoded.command
+    if not Integration.SenderIsCurrentMasterLooter(sender) and command ~= "response" then
+        DebugInfo("Ignoring non-response RC payload from %s", tostring(sender))
+        return "not_ml"
+    end
     if command == "history" then
         if not Integration.SenderIsCurrentMasterLooter(sender) then
             DebugInfo("Ignoring RC history from non-ML sender %s", tostring(sender))

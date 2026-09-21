@@ -1081,12 +1081,29 @@ do
         return originalDecode(...)
     end
     assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", "Other-Garona"), "not_ml", "remote history from a non-ML is rejected")
-    assertEq(decodeCalls, 1, "non-ML history is decoded only to classify the command")
+    assertEq(decodeCalls, 0, "non-ML raid history is rejected before inflate")
     assertEq(countRCLogs(profile), 2, "non-ML history is not recorded")
     assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "GUILD", "Guildie-OtherRealm"), "not_ml", "guild-distributed history from a non-ML is rejected")
-    assertEq(decodeCalls, 2, "non-ML guild history is classified and still not recorded")
+    assertEq(decodeCalls, 0, "non-ML guild history is rejected before inflate")
+    assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "WHISPER", WINNER), "not_ml", "a candidate whisper is ignored when this client is not the ML")
+    assertEq(decodeCalls, 0, "a candidate whisper to a non-ML client does not inflate")
     assertEq(Integration.HandleIncomingMessage("RCLC", string.rep("x", Integration.MAX_COMPRESSED_BYTES + 1), "RAID", AWARDER), "too_large", "oversized raw payload is rejected")
-    assertEq(decodeCalls, 2, "oversized payload does not decode or inflate")
+    assertEq(decodeCalls, 0, "oversized payload does not decode or inflate")
+    _G.RCLootCouncil.masterLooter = PLAYER
+    _G.RCLootCouncil.GetML = function()
+        return true, PLAYER
+    end
+    assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", WINNER), "not_ml", "raid history from a profile member is not inflated")
+    assertEq(decodeCalls, 0, "member raid history does not decode")
+    assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "WHISPER", "Guildie-OtherRealm"), "untrusted", "a non-member whisper is rejected before inflate")
+    assertEq(decodeCalls, 0, "non-member whisper does not decode")
+    assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "WHISPER", WINNER), "not_ml", "a member whisper that is not a response is not recorded as history")
+    assertEq(decodeCalls, 1, "an authenticated candidate whisper is decoded after the membership check")
+    assertEq(countRCLogs(profile), 2, "decoded non-response whisper does not record history")
+    _G.RCLootCouncil.masterLooter = AWARDER
+    _G.RCLootCouncil.GetML = function()
+        return false, AWARDER
+    end
     Integration.DecodeHistoryPayload = originalDecode
 
     local hugeInflate = passthroughLibs(function(_self)
@@ -4824,13 +4841,13 @@ function testDoubleBisRollProtection()
         })
     end
 
-    local function route(command, data, sender)
+    local function route(command, data, sender, distribution)
         function Integration.ResolveLibraries()
             return passthroughLibs(function()
                 return true, command, data
             end)
         end
-        return Integration.HandleIncomingMessage("RCLC", "payload", "RAID", sender or WINNER)
+        return Integration.HandleIncomingMessage("RCLC", "payload", distribution or "RAID", sender or WINNER)
     end
 
     resetEnv()
@@ -4891,15 +4908,25 @@ function testDoubleBisRollProtection()
     assertEq(countEvents(profile, "BIS_OUTCOME"), 1, "read-only conflict checks do not write outcomes")
 
     printed = {}
-    assertEq(route("response", { 1, { response = 1 } }, WINNER), "warned", "candidate response comm warns when Head is already used")
+    local decodeCalls = 0
+    local originalDecode = Integration.DecodeHistoryPayload
+    function Integration.DecodeHistoryPayload(...)
+        decodeCalls = decodeCalls + 1
+        return originalDecode(...)
+    end
+    assertEq(route("response", { 1, { response = 1 } }, WINNER, "RAID"), "not_ml", "a group response from the candidate is rejected before inflate")
+    assertEq(decodeCalls, 0, "candidate group traffic does not inflate")
+    assertEq(route("response", { 1, { response = 1 } }, WINNER, "WHISPER"), "warned", "candidate response comm warns when Head is already used")
+    assertEq(decodeCalls, 1, "the candidate whisper to the ML is decoded once")
     Integration.ClearBisProtectionMemory()
     assertEq(route("response", { 1, WINNER, { response = 1 } }, "Other-Garona"), "not_ml", "a forwarded response from a non-ML is rejected")
+    assertEq(decodeCalls, 1, "a forged group forward does not inflate")
     assertEq(route("response", { 1, WINNER, { response = 1 } }, PLAYER), "warned", "ML-forwarded response warns for the named candidate")
     assertEq(warningCount("selected Need"), 2, "warning uses the configured response name")
     assertEq(warningCount("selected BiS"), 0, "warning does not invent a BiS response name")
     assertTrue(printed[#printed][2]:find("for Head", 1, true) ~= nil, "warning uses the friendly Head label")
     assertTrue(printed[#printed][2]:find(HEAD_LINK, 1, true) ~= nil, "warning keeps the item link")
-    assertEq(route("response", { 1, { response = 1 } }, WINNER), "duplicate", "retransmitted response does not warn again")
+    assertEq(route("response", { 1, { response = 1 } }, WINNER, "WHISPER"), "duplicate", "retransmitted response does not warn again")
     assertEq(warningCount("selected Need"), 2, "duplicate response traffic does not add another warning")
 
     local previousPlayer = PLAYER
@@ -4917,12 +4944,14 @@ function testDoubleBisRollProtection()
     assertEq(warningCount("selected Need"), 3, "ML response change produces one new warning")
 
     assertEq(route("session_end", {}, "Other-Garona"), "not_ml", "session_end from a non-ML does not reset warnings")
-    assertEq(route("response", { 1, { response = 1 } }, WINNER), "duplicate", "warning memory survives a forged session_end")
+    assertEq(route("response", { 1, { response = 1 } }, WINNER, "WHISPER"), "duplicate", "warning memory survives a forged session_end")
     assertEq(route("session_end", {}, PLAYER), "session_end", "ML session_end clears response warning memory")
-    assertEq(route("response", { 1, { response = 1 } }, WINNER), "warned", "a later RC session can warn again")
+    assertEq(route("response", { 1, { response = 1 } }, WINNER, "WHISPER"), "warned", "a later RC session can warn again")
 
-    assertEq(route("response", { 1, { response = 1 } }, "Stranger-Garona"), "untrusted", "unknown sender is not accepted as a candidate")
-    assertEq(route("response", { 9, { response = 1 } }, WINNER), "unresolved", "missing RC session does not warn")
+    assertEq(route("response", { 1, { response = 1 } }, "Stranger-Garona", "WHISPER"), "untrusted", "unknown sender is not accepted as a candidate")
+    assertEq(route("response", { 1, { response = 1 } }, "Stranger-Garona", "RAID"), "not_ml", "unknown group traffic is rejected before it is treated as a response")
+    Integration.DecodeHistoryPayload = originalDecode
+    assertEq(route("response", { 9, { response = 1 } }, WINNER, "WHISPER"), "unresolved", "missing RC session does not warn")
     installCouncil({
         sessionEntry(UNKNOWN_LINK, "default", candidateMap(1)),
     })
