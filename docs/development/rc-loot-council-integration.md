@@ -91,3 +91,17 @@ Mixed-version clients that do not understand `_externalId` drop only the RC row.
 - If RC has both history options off, or `reason.log` is false, there is no history object and Spectrum cannot record the award.
 - If RC history is self-only or guild-only, other Spectrum admins may not observe the remote `history` message. The master looter still has `RCMLLootHistorySend`.
 - The parent addon does nothing RC-specific when this child is absent or disabled.
+
+## Double BiS roll protection
+
+While a Spectrum Loot Helper session is active, the child addon also watches RC candidate `response` traffic and Master Looter `change_response` traffic. A response is BiS-qualified only when it matches the profile's configured **BiS-Qualifying Responses**, using the same identity as automatic BiS awards. Response id `1`, the label `BiS`, and the label `Need` are not special.
+
+The check is read-only. It uses `LootProfile:EvaluateRCBisConflict`, which calls the existing occupancy, specialization, weapon, ring, trinket, and linked-character rules. Selecting or changing a response does not consume an opportunity, write a `BIS_OUTCOME`, or write a loot log.
+
+When that evaluation is confident the opportunity is already consumed, each Spectrum admin shows one local warning. Non-admins do not. Unresolved cases (unknown item, missing stored spec, unknown member, missing RC session) do not warn. The warning names the configured response and a friendly opportunity (`Head`, `Ring`, `Trinket`, `Weapon/Off-Hand`), not an internal slot id.
+
+Repeated RC traffic for the same player, item, and response is deduplicated. `session_end` from the current Master Looter, and the end of the Spectrum session, clear that transient memory.
+
+`history` and `change_response` stay Master-Looter-authoritative. A candidate `response` is accepted only when the live RC loot table contains the session and the sender is that candidate, or the Master Looter is forwarding a named candidate. Payload size and decode limits are unchanged. History from anyone else is still ignored.
+
+On `RCMLAwardSuccess`, the Master Looter client may show an informational popup if the awarded response was BiS-qualified and the opportunity was already consumed before that award. The popup does not cancel the award or change BiS tracking. A win is not compared against the occupancy created by that same award. Other clients do not show the popup. The existing `history` path remains the only writer of `RC_LOOT_COUNCIL` and automatic `BIS_OUTCOME` rows.

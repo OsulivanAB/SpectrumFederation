@@ -1081,11 +1081,12 @@ do
         return originalDecode(...)
     end
     assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "RAID", "Other-Garona"), "not_ml", "remote history from a non-ML is rejected")
-    assertEq(decodeCalls, 0, "non-ML sender does not decode or inflate")
+    assertEq(decodeCalls, 1, "non-ML history is decoded only to classify the command")
+    assertEq(countRCLogs(profile), 2, "non-ML history is not recorded")
     assertEq(Integration.HandleIncomingMessage("RCLC", "payload", "GUILD", "Guildie-OtherRealm"), "not_ml", "guild-distributed history from a non-ML is rejected")
-    assertEq(decodeCalls, 0, "non-ML guild sender does not decode or inflate")
+    assertEq(decodeCalls, 2, "non-ML guild history is classified and still not recorded")
     assertEq(Integration.HandleIncomingMessage("RCLC", string.rep("x", Integration.MAX_COMPRESSED_BYTES + 1), "RAID", AWARDER), "too_large", "oversized raw payload is rejected")
-    assertEq(decodeCalls, 0, "oversized payload does not decode or inflate")
+    assertEq(decodeCalls, 2, "oversized payload does not decode or inflate")
     Integration.DecodeHistoryPayload = originalDecode
 
     local hugeInflate = passthroughLibs(function(_self)
@@ -4709,6 +4710,407 @@ function testTakeoverRCAuthorityWithoutPostEdit()
     SF.LootHelperComm = nil
 end
 testTakeoverRCAuthorityWithoutPostEdit()
+
+-- ---------------------------------------------------------------------------
+-- Double BiS roll protection: response, change_response, award popup
+-- ---------------------------------------------------------------------------
+function testDoubleBisRollProtection()
+    local HEAD_LINK = "|cffa335ee|Hitem:19001::::::::80:71:::::::::|h[Test Helm]|h|r"
+    local RING_LINK = "|cffa335ee|Hitem:19002::::::::80:71:::::::::|h[Test Ring]|h|r"
+    local TRINKET_LINK = "|cffa335ee|Hitem:19003::::::::80:71:::::::::|h[Test Trinket]|h|r"
+    local WEAPON_LINK = "|cffa335ee|Hitem:19019::::::::80:71:::::::::|h[Test Greatsword]|h|r"
+    local UNKNOWN_LINK = "|cffa335ee|Hitem:99999::::::::80:71:::::::::|h[Unknown]|h|r"
+    local ITEM_META = {
+        ["19001"] = { loc = "INVTYPE_HEAD", class = 4, sub = 4 },
+        ["19002"] = { loc = "INVTYPE_FINGER", class = 4, sub = 0 },
+        ["19003"] = { loc = "INVTYPE_TRINKET", class = 4, sub = 0 },
+        ["19019"] = { loc = "INVTYPE_2HWEAPON", class = 2, sub = 1 },
+    }
+
+    function GetItemInfoInstant(link)
+        local text = tostring(link)
+        local id = text:match("item:(%d+)") or text:match("^(%d+)$")
+        local rec = ITEM_META[id]
+        if not rec then
+            return nil
+        end
+        return tonumber(id), "Armor", "Plate", rec.loc, 134400, rec.class, rec.sub
+    end
+
+    local popups = {}
+    StaticPopupDialogs = {}
+    function StaticPopup_Show(key, text)
+        popups[#popups + 1] = { key = key, text = text }
+        return { which = key }
+    end
+
+    local function countEvents(profile, eventType)
+        local n = 0
+        for _, log in ipairs(profile:GetLootLogs() or {}) do
+            if log:GetEventType() == eventType then
+                n = n + 1
+            end
+        end
+        return n
+    end
+
+    local function warningCount(needle)
+        local n = 0
+        for i = 1, #printed do
+            if printed[i][1] == "warn" and printed[i][2]:find(needle, 1, true) then
+                n = n + 1
+            end
+        end
+        return n
+    end
+
+    local lootTable = {}
+    local function installCouncil(entries)
+        lootTable = entries
+        _G.RCLootCouncil = {
+            masterLooter = PLAYER,
+            GetML = function()
+                return true, PLAYER
+            end,
+            GetLootTable = function()
+                return lootTable
+            end,
+            GetResponse = function(_, typeCode, responseId)
+                if tonumber(responseId) == 1 and (typeCode == "default" or typeCode == nil) then
+                    return { text = "Need" }
+                end
+                if tonumber(responseId) == 2 then
+                    return { text = "Upgrade" }
+                end
+                if tonumber(responseId) == 1 and typeCode == "WEAPON" then
+                    return { text = "Weapon Need" }
+                end
+                return { text = "Other" }
+            end,
+            db = {
+                profile = {
+                    awardReasons = {
+                        { text = "Disenchant", sort = 405 },
+                    },
+                },
+            },
+        }
+    end
+
+    local function sessionEntry(link, typeCode, candidates, history)
+        return {
+            link = link,
+            typeCode = typeCode,
+            candidates = candidates,
+            history = history,
+        }
+    end
+
+    local function candidateMap(responseId, realResponse)
+        return {
+            [WINNER] = {
+                response = responseId,
+                real_response = realResponse,
+            },
+        }
+    end
+
+    local function addNeed(profile, typeCode, responseId, text, isAwardReason)
+        return profile:AddRCLootCouncilBisResponse({
+            text = text,
+            typeCode = isAwardReason and nil or (typeCode or "default"),
+            responseId = responseId,
+            isAwardReason = isAwardReason and true or false,
+        })
+    end
+
+    local function route(command, data, sender)
+        function Integration.ResolveLibraries()
+            return passthroughLibs(function()
+                return true, command, data
+            end)
+        end
+        return Integration.HandleIncomingMessage("RCLC", "payload", "RAID", sender or WINNER)
+    end
+
+    resetEnv()
+    local profile = makeProfile("Double Bis")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    assertTrue(addNeed(profile, "default", 1, "Need", false), "Need is the configured BiS response")
+    installCouncil({
+        sessionEntry(HEAD_LINK, "default", candidateMap(1)),
+    })
+    printed = {}
+    popups = {}
+    local logsBefore = countRCLogs(profile) + countEvents(profile, "BIS_OUTCOME")
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "clear", "available Head response does not warn")
+    assertEq(countRCLogs(profile) + countEvents(profile, "BIS_OUTCOME"), logsBefore, "selecting a response does not write BiS or loot logs")
+    assertEq(#popups, 0, "a response does not open the award popup")
+    assertEq(warningCount("selected Need"), 0, "available opportunity stays quiet")
+
+    printed = {}
+    popups = {}
+    assertEq(Integration.HandleAwardSuccess(1, WINNER, "normal", HEAD_LINK, "Need"), "clear", "popup before the award is recorded does not treat the open slot as consumed")
+    assertEq(#popups, 0, "first legitimate Head win does not popup before it is recorded")
+    local firstHistory = historyTable({
+        id = "1700003000-30",
+        lootWon = HEAD_LINK,
+        response = "Need",
+        responseID = 1,
+        typeCode = "default",
+    })
+    assertEq(Integration.HandleHistory(PLAYER, WINNER, firstHistory, "acecomm"), "recorded", "first Head BiS award still records")
+    assertEq(countEvents(profile, "BIS_OUTCOME"), 1, "first award writes one automatic outcome")
+    lootTable[1].history = firstHistory
+    assertEq(Integration.HandleAwardSuccess(1, WINNER, "normal", HEAD_LINK, "Need"), "clear", "recorded award is not a conflict against itself")
+    assertEq(#popups, 0, "first legitimate Head win does not popup after it is recorded")
+    local outcomeBeforeSelfCheck = countEvents(profile, "BIS_OUTCOME")
+    assertEq(outcomeBeforeSelfCheck, 1, "award popup does not write another outcome")
+
+    local direct = profile:EvaluateRCBisConflict({
+        memberId = WINNER,
+        itemLink = HEAD_LINK,
+        response = "Need",
+        responseId = 1,
+        typeCode = "default",
+        isAwardReason = false,
+    })
+    assertTrue(direct.conflict, "without excluding the new award, the same win looks already consumed")
+    local excluded = profile:EvaluateRCBisConflict({
+        memberId = WINNER,
+        itemLink = HEAD_LINK,
+        response = "Need",
+        responseId = 1,
+        typeCode = "default",
+        isAwardReason = false,
+        excludeAwardKey = SF.LootLog.BuildRCLootCouncilCanonical(PLAYER, WINNER, firstHistory).awardKey,
+    })
+    assertFalse(excluded.conflict, "excluding the current award restores the pre-award opportunity")
+    assertEq(countEvents(profile, "BIS_OUTCOME"), 1, "read-only conflict checks do not write outcomes")
+
+    printed = {}
+    assertEq(route("response", { 1, { response = 1 } }, WINNER), "warned", "candidate response comm warns when Head is already used")
+    Integration.ClearBisProtectionMemory()
+    assertEq(route("response", { 1, WINNER, { response = 1 } }, "Other-Garona"), "not_ml", "a forwarded response from a non-ML is rejected")
+    assertEq(route("response", { 1, WINNER, { response = 1 } }, PLAYER), "warned", "ML-forwarded response warns for the named candidate")
+    assertEq(warningCount("selected Need"), 2, "warning uses the configured response name")
+    assertEq(warningCount("selected BiS"), 0, "warning does not invent a BiS response name")
+    assertTrue(printed[#printed][2]:find("for Head", 1, true) ~= nil, "warning uses the friendly Head label")
+    assertTrue(printed[#printed][2]:find(HEAD_LINK, 1, true) ~= nil, "warning keeps the item link")
+    assertEq(route("response", { 1, { response = 1 } }, WINNER), "duplicate", "retransmitted response does not warn again")
+    assertEq(warningCount("selected Need"), 2, "duplicate response traffic does not add another warning")
+
+    local previousPlayer = PLAYER
+    PLAYER = "NotAdmin-Garona"
+    Integration.ClearBisProtectionMemory()
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "not_admin", "non-admins do not receive the response warning")
+    assertEq(warningCount("selected Need"), 2, "non-admin evaluation does not print")
+    PLAYER = previousPlayer
+
+    assertEq(route("change_response", { 1, WINNER, 1 }, "Other-Garona"), "not_ml", "change_response from a candidate is rejected")
+    assertEq(warningCount("selected Need"), 2, "rejected change_response does not warn")
+    Integration.ClearBisProtectionMemory()
+    assertEq(route("change_response", { 1, WINNER, 2 }, PLAYER), "not_bis", "Upgrade is not a configured BiS response")
+    assertEq(route("change_response", { 1, WINNER, 1 }, PLAYER), "warned", "ML change_response to Need warns like a player selection")
+    assertEq(warningCount("selected Need"), 3, "ML response change produces one new warning")
+
+    assertEq(route("session_end", {}, "Other-Garona"), "not_ml", "session_end from a non-ML does not reset warnings")
+    assertEq(route("response", { 1, { response = 1 } }, WINNER), "duplicate", "warning memory survives a forged session_end")
+    assertEq(route("session_end", {}, PLAYER), "session_end", "ML session_end clears response warning memory")
+    assertEq(route("response", { 1, { response = 1 } }, WINNER), "warned", "a later RC session can warn again")
+
+    assertEq(route("response", { 1, { response = 1 } }, "Stranger-Garona"), "untrusted", "unknown sender is not accepted as a candidate")
+    assertEq(route("response", { 9, { response = 1 } }, WINNER), "unresolved", "missing RC session does not warn")
+    installCouncil({
+        sessionEntry(UNKNOWN_LINK, "default", candidateMap(1)),
+    })
+    Integration.ClearBisProtectionMemory()
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "unresolved", "unknown item classification does not warn")
+    assertEq(warningCount("Unknown"), 0, "unresolved classification stays out of chat")
+
+    -- Two copies while the opportunity is still open, then a second award.
+    resetEnv()
+    profile = makeProfile("Double Copy")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    assertTrue(addNeed(profile, "default", 1, "Need", false), "copy test configures Need")
+    installCouncil({
+        sessionEntry(HEAD_LINK, "default", candidateMap(1)),
+        sessionEntry(HEAD_LINK, "default", candidateMap(1)),
+    })
+    printed = {}
+    popups = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "clear", "first copy response does not consume Head")
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 2, { response = 1 } }), "clear", "second copy response does not consume Head")
+    assertEq(warningCount("selected Need"), 0, "simultaneous responses do not warn")
+    assertEq(countEvents(profile, "BIS_OUTCOME"), 0, "simultaneous responses write no outcomes")
+    local copyHistory = historyTable({
+        id = "1700003100-31",
+        lootWon = HEAD_LINK,
+        response = "Need",
+        responseID = 1,
+        typeCode = "default",
+    })
+    assertEq(Integration.HandleHistory(PLAYER, WINNER, copyHistory, "acecomm"), "recorded", "first copy award records")
+    lootTable[1].history = copyHistory
+    assertEq(Integration.HandleAwardSuccess(1, WINNER, "normal", HEAD_LINK, "Need"), "clear", "first copy popup sees the pre-award slot")
+    local secondHistory = historyTable({
+        id = "1700003200-32",
+        lootWon = HEAD_LINK,
+        response = "Need",
+        responseID = 1,
+        typeCode = "default",
+    })
+    local logsAtSecond = countRCLogs(profile)
+    assertEq(Integration.HandleHistory(PLAYER, WINNER, secondHistory, "acecomm"), "recorded", "second copy still records through history")
+    lootTable[2].history = secondHistory
+    popups = {}
+    assertEq(Integration.HandleAwardSuccess(2, WINNER, "normal", HEAD_LINK, "Need"), "popup", "second copy award pops up for the Master Looter")
+    assertEq(#popups, 1, "one popup for the conflicting award")
+    assertTrue(popups[1].text:find("for the Head slot", 1, true) ~= nil, "popup names the Head slot")
+    assertTrue(popups[1].text:find("no action is required", 1, true) ~= nil, "popup is informational")
+    assertEq(countRCLogs(profile), logsAtSecond + 1, "popup does not create an extra RC log")
+    assertEq(Integration.HandleAwardSuccess(2, WINNER, "normal", HEAD_LINK, "Need"), "duplicate", "repeated award success does not popup again")
+    assertEq(#popups, 1, "duplicate award success stays at one popup")
+    _G.RCLootCouncil.masterLooter = "Other-Garona"
+    _G.RCLootCouncil.GetML = function()
+        return false, "Other-Garona"
+    end
+    Integration.ClearBisProtectionMemory()
+    assertEq(Integration.HandleAwardSuccess(2, WINNER, "normal", HEAD_LINK, "Need"), "not_ml", "popup stays on the Master Looter client")
+    assertEq(#popups, 1, "non-ML client does not popup")
+
+    -- Ring / trinket labels and weapon spec rules.
+    resetEnv()
+    profile = makeProfile("Multi Slot")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    assertTrue(addNeed(profile, "default", 1, "Need", false), "multi-slot test configures Need")
+    installCouncil({
+        sessionEntry(RING_LINK, "default", candidateMap(1)),
+        sessionEntry(TRINKET_LINK, "default", candidateMap(1)),
+        sessionEntry(WEAPON_LINK, "default", candidateMap(1)),
+    })
+    local function awardItem(id, link)
+        local history = historyTable({
+            id = id,
+            lootWon = link,
+            response = "Need",
+            responseID = 1,
+            typeCode = "default",
+        })
+        assertEq(Integration.HandleHistory(PLAYER, WINNER, history, "acecomm"), "recorded", "recorded " .. id)
+        return history
+    end
+    awardItem("1700003300-33", RING_LINK)
+    awardItem("1700003400-34", RING_LINK)
+    printed = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "warned", "third ring response warns once both ring opportunities are used")
+    assertTrue(printed[#printed][2]:find("for Ring", 1, true) ~= nil, "ring warning does not name Ring1 or Ring2")
+    assertTrue(printed[#printed][2]:find("Ring1", 1, true) == nil, "ring warning hides the internal slot id")
+    awardItem("1700003500-35", TRINKET_LINK)
+    awardItem("1700003600-36", TRINKET_LINK)
+    Integration.ClearBisProtectionMemory()
+    printed = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 2, { response = 1 } }), "warned", "trinket response warns after both trinket opportunities are used")
+    assertTrue(printed[#printed][2]:find("for Trinket", 1, true) ~= nil, "trinket warning uses the friendly label")
+    assertTrue(printed[#printed][2]:find("Trinket1", 1, true) == nil, "trinket warning hides the internal slot id")
+
+    Integration.ClearBisProtectionMemory()
+    printed = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 3, { response = 1 } }), "unresolved", "weapon response without a stored spec does not warn")
+    assertEq(warningCount("Weapon/Off-Hand"), 0, "missing spec stays silent")
+    assertTrue(profile:SetMemberSpec(WINNER, 71), "Arms spec is stored for the warrior")
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 3, { response = 1 } }), "clear", "Arms can still take one two-hand weapon")
+    awardItem("1700003700-37", WEAPON_LINK)
+    Integration.ClearBisProtectionMemory()
+    printed = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 3, { response = 1 } }), "warned", "second two-hand response warns for Arms")
+    assertTrue(printed[#printed][2]:find("for Weapon/Off-Hand", 1, true) ~= nil, "weapon warning uses the shared weapon label")
+
+    -- Linked identity shares the consumed opportunity.
+    resetEnv()
+    profile = makeProfile("Linked Bis")
+    local alt = "Alt-Garona"
+    addMember(profile, WINNER)
+    addMember(profile, alt)
+    setActive(profile)
+    startSessionOn(profile)
+    assertTrue(addNeed(profile, "default", 1, "Need", false), "linked test configures Need")
+    assertTrue(profile:LinkCharacters(WINNER, alt), "winner and alt share an identity")
+    installCouncil({
+        sessionEntry(HEAD_LINK, "default", {
+            [WINNER] = { response = 1 },
+            [alt] = { response = 1 },
+        }),
+    })
+    awardItem("1700003800-38", HEAD_LINK)
+    -- awardItem records for WINNER because history winner is WINNER from historyTable... 
+    -- HandleHistory uses WINNER. Re-award on the alt explicitly.
+    resetEnv()
+    profile = makeProfile("Linked Bis 2")
+    addMember(profile, WINNER)
+    addMember(profile, alt)
+    setActive(profile)
+    startSessionOn(profile)
+    assertTrue(addNeed(profile, "default", 1, "Need", false), "linked retest configures Need")
+    assertTrue(profile:LinkCharacters(WINNER, alt), "characters link before the award")
+    installCouncil({
+        sessionEntry(HEAD_LINK, "default", {
+            [WINNER] = { response = 1 },
+        }),
+    })
+    local linkedHistory = historyTable({
+        id = "1700003900-39",
+        lootWon = HEAD_LINK,
+        response = "Need",
+        responseID = 1,
+        typeCode = "default",
+    })
+    assertEq(Integration.HandleHistory(PLAYER, alt, linkedHistory, "acecomm"), "recorded", "alt award is recorded on the shared identity")
+    printed = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "warned", "linked main is warned from the alt's consumed Head")
+    assertTrue(printed[#printed][2]:find(WINNER, 1, true) ~= nil, "warning names the responding character")
+
+    -- Button group must match. Award reasons use their own identity.
+    resetEnv()
+    profile = makeProfile("Context Bis")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    assertTrue(addNeed(profile, "WEAPON", 1, "Weapon Need", false), "only the weapon button group is BiS")
+    installCouncil({
+        sessionEntry(HEAD_LINK, "default", candidateMap(1)),
+    })
+    printed = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "not_bis", "default response 1 does not match WEAPON response 1")
+    assertEq(warningCount("selected"), 0, "mismatched button group does not warn")
+    assertTrue(addNeed(profile, "default", 1, "Need", false), "default Need qualifies for the occupancy award")
+    assertTrue(addNeed(profile, nil, 5, "Disenchant", true), "Disenchant award reason is BiS")
+    local contextHistory = historyTable({
+        id = "1700004000-40",
+        lootWon = HEAD_LINK,
+        response = "Need",
+        responseID = 1,
+        typeCode = "default",
+    })
+    assertEq(Integration.HandleHistory(PLAYER, WINNER, contextHistory, "acecomm"), "recorded", "qualifying history award still records")
+    lootTable[1].candidates[WINNER].response = 2
+    popups = {}
+    _G.RCLootCouncil.masterLooter = PLAYER
+    assertEq(Integration.HandleAwardSuccess(1, WINNER, "normal", HEAD_LINK, "Disenchant"), "popup", "award-reason text qualifies without using the candidate button")
+    assertEq(#popups, 1, "award reason popup is shown once")
+    lootTable[1].candidates[WINNER].response = "AWARDED"
+    lootTable[1].candidates[WINNER].real_response = 2
+    Integration.ClearBisProtectionMemory()
+    popups = {}
+    assertEq(Integration.HandleAwardSuccess(1, WINNER, "normal", HEAD_LINK, "Upgrade"), "not_bis", "AWARDED placeholder uses real_response and does not qualify Upgrade")
+end
+testDoubleBisRollProtection()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

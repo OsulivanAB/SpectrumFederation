@@ -1,7 +1,8 @@
 -- Permanent optional child addon.
 -- Records finalized RC Loot Council awards into Spectrum Loot Logs while a
--- Spectrum Loot Helper session is active. No SavedVariables and no raw
--- traffic persistence.
+-- Spectrum Loot Helper session is active, and warns when a BiS-qualified
+-- response conflicts with an already-consumed opportunity.
+-- No SavedVariables and no raw traffic persistence.
 
 local addonName, ns = ...
 
@@ -26,6 +27,9 @@ local hooksInstalled = false
 local settingsPanel = nil
 local seenAwardKeys = {}
 local warnedAwardKeys = {}
+local responseWarningKeys = {}
+local awardPopupKeys = {}
+local POPUP_KEY = "SF_RCLC_BIS_CONFLICT_INFO"
 
 local commReceiver = {
     _registered = false,
@@ -171,9 +175,15 @@ local function WipeTable(t)
     end
 end
 
+function Integration.ClearBisProtectionMemory()
+    WipeTable(responseWarningKeys)
+    WipeTable(awardPopupKeys)
+end
+
 function Integration.ClearSessionMemory()
     WipeTable(seenAwardKeys)
     WipeTable(warnedAwardKeys)
+    Integration.ClearBisProtectionMemory()
 end
 
 function Integration.ResolveLibraries(libStub)
@@ -305,8 +315,10 @@ function Integration.DecodeHistoryPayload(raw, libs, opts)
             return { false }
         end
         -- LibDeflate's public DecompressDeflate has no max-output argument.
-        -- Reject after inflate so we never deserialize a bomb. The ML-first
-        -- gate and compressed-size cap are the primary UI-thread defenses.
+        -- Reject after inflate so we never deserialize a bomb. The compressed
+        -- and decompressed size caps are the primary UI-thread defenses.
+        -- Command trust is applied after decode: history and change_response
+        -- still require the current Master Looter.
         local inflated = ld:DecompressDeflate(decodedBytes)
         if type(inflated) ~= "string" or #inflated > Integration.MAX_DECOMPRESSED_BYTES then
             return { false }
@@ -349,12 +361,17 @@ function Integration.DecodeHistoryPayload(raw, libs, opts)
     end
 
     result.command = command
+    result.data = data
     result.winner = data[1]
     result.history = data[2]
     if command == "history" and type(result.winner) == "string" and type(result.history) == "table" then
         result.ok = true
     end
     return result
+end
+
+function Integration.DecodeRCPayload(raw, libs, opts)
+    return Integration.DecodeHistoryPayload(raw, libs, opts)
 end
 
 function Integration.MarkSeen(awardKey)
@@ -455,6 +472,541 @@ function Integration.HandleHistory(awarder, winner, history, source)
     return Integration.ProcessCanonicalAward(canonical, source or "history")
 end
 
+local function ItemStringFromLink(itemLink)
+    local SF = ParentAddon()
+    if SF and SF.LootLog and SF.LootLog.ExtractItemString then
+        local extracted = SF.LootLog.ExtractItemString(itemLink)
+        if type(extracted) == "string" and extracted ~= "" then
+            return extracted
+        end
+    end
+    return type(itemLink) == "string" and itemLink or ""
+end
+
+local function ResponseWarningKey(player, itemLink, responseId, typeCode, isAwardReason, responseText)
+    return table.concat({
+        tostring(player or ""),
+        ItemStringFromLink(itemLink),
+        tostring(responseId or ""),
+        tostring(typeCode or ""),
+        isAwardReason and "1" or "0",
+        string.lower(type(responseText) == "string" and responseText or ""),
+    }, "|")
+end
+
+local function AwardPopupKey(player, session, itemLink)
+    return table.concat({
+        tostring(player or ""),
+        tostring(session or ""),
+        ItemStringFromLink(itemLink),
+    }, "|")
+end
+
+local function TextsMatch(left, right)
+    if type(left) ~= "string" or type(right) ~= "string" then
+        return false
+    end
+    local a = strtrim(left)
+    local b = strtrim(right)
+    if a == "" or b == "" then
+        return false
+    end
+    return string.lower(a) == string.lower(b)
+end
+
+local function NumericResponseId(value)
+    local number = tonumber(value)
+    if not number or number < 1 or number ~= math.floor(number) then
+        return nil
+    end
+    return number
+end
+
+function Integration.ResolveRCSession(session)
+    local rc = _G.RCLootCouncil
+    if type(rc) ~= "table" or type(rc.GetLootTable) ~= "function" then
+        return nil, "no_loot_table"
+    end
+    local ok, lootTable = pcall(rc.GetLootTable, rc)
+    if not ok or type(lootTable) ~= "table" then
+        return nil, "no_loot_table"
+    end
+    session = tonumber(session)
+    if not session or session < 1 or session ~= math.floor(session) then
+        return nil, "bad_session"
+    end
+    local entry = lootTable[session]
+    if type(entry) ~= "table" then
+        return nil, "bad_session"
+    end
+    local link = entry.link
+    if type(link) ~= "string" or link == "" then
+        return nil, "no_item"
+    end
+    local typeCode = entry.typeCode
+    if type(typeCode) ~= "string" or strtrim(typeCode) == "" then
+        typeCode = "default"
+    else
+        typeCode = strtrim(typeCode)
+    end
+    return {
+        session = session,
+        itemLink = link,
+        typeCode = typeCode,
+        candidates = entry.candidates,
+        entry = entry,
+    }
+end
+
+local function CandidateRecord(candidates, player)
+    if type(candidates) ~= "table" or not player then
+        return nil
+    end
+    if type(candidates[player]) == "table" then
+        return candidates[player]
+    end
+    for name, data in pairs(candidates) do
+        if type(data) == "table" and Integration.SamePlayer(name, player) then
+            return data
+        end
+    end
+    return nil
+end
+
+local function PlayerIsKnownCandidate(sessionInfo, player)
+    return CandidateRecord(sessionInfo and sessionInfo.candidates, player) ~= nil
+end
+
+local function RCResponseText(typeCode, responseId)
+    local rc = _G.RCLootCouncil
+    if type(rc) ~= "table" or type(rc.GetResponse) ~= "function" or responseId == nil then
+        return nil
+    end
+    local ok, response = pcall(rc.GetResponse, rc, typeCode, responseId)
+    if ok and type(response) == "table" and type(response.text) == "string" then
+        local text = strtrim(response.text)
+        if text ~= "" then
+            return text
+        end
+    end
+    return nil
+end
+
+local function MatchingAwardReason(responseText)
+    if type(responseText) ~= "string" or strtrim(responseText) == "" then
+        return nil
+    end
+    local rc = _G.RCLootCouncil
+    local db = rc and ((type(rc.Getdb) == "function" and rc:Getdb()) or rc.db)
+    local profile = db and (db.profile or db)
+    local reasons = profile and profile.awardReasons
+    if type(reasons) ~= "table" then
+        return nil
+    end
+    for _, entry in ipairs(reasons) do
+        if type(entry) == "table" and TextsMatch(entry.text or entry.label, responseText) then
+            local responseId = Integration.AwardReasonHistoryResponseId(entry)
+            if responseId ~= nil then
+                return responseId, strtrim(entry.text or entry.label)
+            end
+        end
+    end
+    return nil
+end
+
+local function CandidateResponseId(record)
+    if type(record) ~= "table" then
+        return nil
+    end
+    local direct = NumericResponseId(record.response)
+    if direct then
+        return direct
+    end
+    return NumericResponseId(record.real_response)
+end
+
+function Integration.ShowInformationalPopup(message)
+    if type(message) ~= "string" or message == "" then
+        return false
+    end
+    if type(StaticPopupDialogs) ~= "table" or type(StaticPopup_Show) ~= "function" then
+        DebugInfo("BiS conflict popup skipped; StaticPopup is unavailable")
+        return false
+    end
+    if not StaticPopupDialogs[POPUP_KEY] then
+        StaticPopupDialogs[POPUP_KEY] = {
+            text = "%s",
+            button1 = _G.OKAY or "OK",
+            timeout = 0,
+            whileDead = true,
+            hideOnEscape = true,
+            preferredIndex = 3,
+        }
+    end
+    local shown = StaticPopup_Show(POPUP_KEY, message)
+    return shown ~= nil
+end
+
+function Integration.LocalPlayerIsCurrentMasterLooter()
+    local localId = GetLocalPlayerId()
+    return localId ~= nil and Integration.SenderIsCurrentMasterLooter(localId)
+end
+
+-- Read-only. Selecting or changing a response never consumes BiS state.
+function Integration.WarnBisResponseConflict(profile, opts)
+    opts = type(opts) == "table" and opts or {}
+    if not profile or type(profile.EvaluateRCBisConflict) ~= "function" then
+        return "unavailable"
+    end
+    if not IsEffectiveAdmin(profile) then
+        return "not_admin"
+    end
+    local player = opts.player
+    if type(player) ~= "string" or player == "" then
+        return "unresolved"
+    end
+    -- Retransmits of a warning already shown must not rebuild BiS state.
+    local key = ResponseWarningKey(
+        player,
+        opts.itemLink,
+        opts.responseId,
+        opts.typeCode,
+        opts.isAwardReason and true or false,
+        opts.response or ""
+    )
+    if responseWarningKeys[key] then
+        return "duplicate"
+    end
+    local evaluation = profile:EvaluateRCBisConflict({
+        memberId = player,
+        itemLink = opts.itemLink,
+        response = opts.response,
+        responseId = opts.responseId,
+        typeCode = opts.typeCode,
+        isAwardReason = opts.isAwardReason,
+    })
+    if type(evaluation) ~= "table" then
+        return "unavailable"
+    end
+    if not evaluation.qualified then
+        return "not_bis"
+    end
+    if evaluation.uncertain or not evaluation.conflict then
+        if evaluation.uncertain then
+            DebugInfo(
+                "Skipping double-BiS response warning for %s; opportunity state is unresolved",
+                tostring(player)
+            )
+            return "unresolved"
+        end
+        return "clear"
+    end
+    local responseLabel = evaluation.responseLabel
+    local slotLabel = evaluation.slotLabel
+    if type(responseLabel) ~= "string" or responseLabel == "" or type(slotLabel) ~= "string" or slotLabel == "" then
+        DebugInfo("Skipping double-BiS response warning for %s; label is unresolved", tostring(player))
+        return "unresolved"
+    end
+    local SF = ParentAddon()
+    local message = string.format(
+        "%s selected %s for %s, but their BiS opportunity for %s has already been used.",
+        player,
+        responseLabel,
+        tostring(opts.itemLink or "[item]"),
+        slotLabel
+    )
+    if not (SF and SF.PrintWarning) then
+        return "unavailable"
+    end
+    responseWarningKeys[key] = true
+    SF:PrintWarning(message)
+    DebugInfo("Warned admins about a conflicting BiS response from %s", player)
+    return "warned"
+end
+
+local function ParseResponseData(data)
+    if type(data) ~= "table" then
+        return nil
+    end
+    local session = tonumber(data[1])
+    if not session then
+        return nil
+    end
+    if type(data[2]) == "table" then
+        return {
+            session = session,
+            responder = nil,
+            responseTable = data[2],
+            forwarded = false,
+        }
+    end
+    if type(data[2]) == "string" and type(data[3]) == "table" then
+        return {
+            session = session,
+            responder = data[2],
+            responseTable = data[3],
+            forwarded = true,
+        }
+    end
+    return nil
+end
+
+local function AcceptResponsePlayer(sender, parsed, sessionInfo, profile)
+    local responder = parsed.forwarded and parsed.responder or sender
+    local player = Integration.NormalizeRCPlayerId(responder)
+    if not player then
+        return nil, "unresolved"
+    end
+    if parsed.forwarded then
+        if not Integration.SenderIsCurrentMasterLooter(sender) then
+            return nil, "not_ml"
+        end
+    elseif not Integration.SamePlayer(sender, player) then
+        return nil, "untrusted"
+    end
+    local member = profile and profile.getMemberByID and profile:getMemberByID(player) or nil
+    local knownCandidate = PlayerIsKnownCandidate(sessionInfo, player)
+    if not member and not knownCandidate then
+        DebugInfo("Ignoring RC response from %s; sender is not in the live session or profile", tostring(player))
+        return nil, "untrusted"
+    end
+    if not member then
+        DebugInfo("Skipping double-BiS response warning for unknown Spectrum member %s", tostring(player))
+        return nil, "unresolved"
+    end
+    return player, nil
+end
+
+function Integration.HandleCandidateResponse(sender, data)
+    if not Integration.IsSpectrumSessionActive() then
+        return "no_session"
+    end
+    local parsed = ParseResponseData(data)
+    if not parsed or type(parsed.responseTable) ~= "table" then
+        return "ignored"
+    end
+    local sessionInfo, sessionErr = Integration.ResolveRCSession(parsed.session)
+    if not sessionInfo then
+        DebugInfo("RC response session unresolved (%s)", tostring(sessionErr))
+        return "unresolved"
+    end
+    local profile = Integration.GetSessionProfile()
+    if not profile then
+        return "no_profile"
+    end
+    local player, trustErr = AcceptResponsePlayer(sender, parsed, sessionInfo, profile)
+    if not player then
+        return trustErr or "untrusted"
+    end
+    local rawResponse = parsed.responseTable.response
+    local responseId = NumericResponseId(rawResponse)
+    local responseText = nil
+    if responseId == nil then
+        if type(rawResponse) ~= "string" or strtrim(rawResponse) == "" then
+            return "ignored"
+        end
+        responseText = strtrim(rawResponse)
+    end
+    return Integration.WarnBisResponseConflict(profile, {
+        player = player,
+        itemLink = sessionInfo.itemLink,
+        session = sessionInfo.session,
+        response = responseText,
+        responseId = responseId,
+        typeCode = responseId and sessionInfo.typeCode or nil,
+        isAwardReason = false,
+    })
+end
+
+function Integration.HandleChangeResponse(sender, data)
+    if not Integration.IsSpectrumSessionActive() then
+        return "no_session"
+    end
+    if not Integration.SenderIsCurrentMasterLooter(sender) then
+        DebugInfo("Ignoring RC change_response from non-ML sender %s", tostring(sender))
+        return "not_ml"
+    end
+    if type(data) ~= "table" then
+        return "ignored"
+    end
+    local session = tonumber(data[1])
+    local name = data[2]
+    local rawResponse = data[3]
+    if not session or type(name) ~= "string" or rawResponse == nil then
+        return "ignored"
+    end
+    local sessionInfo, sessionErr = Integration.ResolveRCSession(session)
+    if not sessionInfo then
+        DebugInfo("RC change_response session unresolved (%s)", tostring(sessionErr))
+        return "unresolved"
+    end
+    local profile = Integration.GetSessionProfile()
+    if not profile then
+        return "no_profile"
+    end
+    local player = Integration.NormalizeRCPlayerId(name)
+    if not player then
+        return "unresolved"
+    end
+    local member = profile.getMemberByID and profile:getMemberByID(player) or nil
+    if not member and not PlayerIsKnownCandidate(sessionInfo, player) then
+        return "untrusted"
+    end
+    if not member then
+        DebugInfo("Skipping double-BiS change_response warning for unknown Spectrum member %s", tostring(player))
+        return "unresolved"
+    end
+    local responseId = NumericResponseId(rawResponse)
+    local responseText = nil
+    if responseId == nil then
+        if type(rawResponse) ~= "string" or strtrim(rawResponse) == "" then
+            return "ignored"
+        end
+        responseText = strtrim(rawResponse)
+    end
+    return Integration.WarnBisResponseConflict(profile, {
+        player = player,
+        itemLink = sessionInfo.itemLink,
+        session = sessionInfo.session,
+        response = responseText,
+        responseId = responseId,
+        typeCode = responseId and sessionInfo.typeCode or nil,
+        isAwardReason = false,
+    })
+end
+
+local function AwardKeyFromSessionHistory(sessionInfo, winner)
+    local history = sessionInfo and sessionInfo.entry and sessionInfo.entry.history
+    if type(history) ~= "table" then
+        return nil
+    end
+    local SF = ParentAddon()
+    if not (SF and SF.LootLog and SF.LootLog.BuildRCLootCouncilCanonical) then
+        return nil
+    end
+    local awarder = Integration.GetCurrentRCMasterLooter() or GetLocalPlayerId()
+    local canonical = SF.LootLog.BuildRCLootCouncilCanonical(awarder, winner, history)
+    return canonical and canonical.awardKey or nil
+end
+
+local function ResolveAwardResponse(sessionInfo, winner, responseText)
+    local record = CandidateRecord(sessionInfo and sessionInfo.candidates, winner)
+    local responseId = CandidateResponseId(record)
+    local typeCode = sessionInfo and sessionInfo.typeCode or "default"
+    local buttonText = RCResponseText(typeCode, responseId)
+    local textGiven = type(responseText) == "string" and strtrim(responseText) ~= ""
+    if responseId and (not textGiven or TextsMatch(buttonText, responseText)) then
+        return {
+            response = buttonText or responseText,
+            responseId = responseId,
+            typeCode = typeCode,
+            isAwardReason = false,
+        }
+    end
+    if textGiven then
+        local reasonId, reasonText = MatchingAwardReason(responseText)
+        if reasonId then
+            return {
+                response = reasonText or responseText,
+                responseId = reasonId,
+                typeCode = nil,
+                isAwardReason = true,
+            }
+        end
+    end
+    if responseId and buttonText == nil then
+        return {
+            response = textGiven and strtrim(responseText) or nil,
+            responseId = responseId,
+            typeCode = typeCode,
+            isAwardReason = false,
+        }
+    end
+    if textGiven then
+        return {
+            response = strtrim(responseText),
+            responseId = nil,
+            typeCode = nil,
+            isAwardReason = false,
+        }
+    end
+    return nil
+end
+
+function Integration.HandleAwardSuccess(session, winner, _status, itemLink, responseText)
+    if not Integration.IsSpectrumSessionActive() then
+        return "no_session"
+    end
+    if not Integration.LocalPlayerIsCurrentMasterLooter() then
+        return "not_ml"
+    end
+    local sessionInfo, sessionErr = Integration.ResolveRCSession(session)
+    if not sessionInfo then
+        DebugInfo("RC award popup session unresolved (%s)", tostring(sessionErr))
+        return "unresolved"
+    end
+    if type(itemLink) == "string" and itemLink ~= "" and ItemStringFromLink(itemLink) ~= ItemStringFromLink(sessionInfo.itemLink) then
+        DebugInfo("RC award popup item does not match session %s", tostring(session))
+        return "unresolved"
+    end
+    local profile = Integration.GetSessionProfile()
+    if not profile or type(profile.EvaluateRCBisConflict) ~= "function" then
+        return profile and "unavailable" or "no_profile"
+    end
+    local player = Integration.NormalizeRCPlayerId(winner)
+    if not player or not (profile.getMemberByID and profile:getMemberByID(player)) then
+        DebugInfo("Skipping double-BiS award popup; winner is unresolved")
+        return "unresolved"
+    end
+    local popupKey = AwardPopupKey(player, sessionInfo.session, sessionInfo.itemLink)
+    if awardPopupKeys[popupKey] then
+        return "duplicate"
+    end
+    local responseMeta = ResolveAwardResponse(sessionInfo, player, responseText)
+    if not responseMeta then
+        return "unresolved"
+    end
+    local evaluation = profile:EvaluateRCBisConflict({
+        memberId = player,
+        itemLink = sessionInfo.itemLink,
+        response = responseMeta.response,
+        responseId = responseMeta.responseId,
+        typeCode = responseMeta.typeCode,
+        isAwardReason = responseMeta.isAwardReason,
+        excludeAwardKey = AwardKeyFromSessionHistory(sessionInfo, player),
+    })
+    if type(evaluation) ~= "table" then
+        return "unavailable"
+    end
+    if not evaluation.qualified then
+        return "not_bis"
+    end
+    if evaluation.uncertain or not evaluation.conflict then
+        if evaluation.uncertain then
+            DebugInfo("Skipping double-BiS award popup for %s; opportunity state is unresolved", player)
+            return "unresolved"
+        end
+        return "clear"
+    end
+    local slotLabel = evaluation.slotLabel
+    if type(slotLabel) ~= "string" or slotLabel == "" then
+        return "unresolved"
+    end
+    local message = string.format(
+        "%s was awarded %s even though they already used their BiS opportunity for the %s slot.\n\nIf this is intentional, no action is required. If their tracked BiS state is incorrect, it can be overridden in the Loot Helper settings.",
+        player,
+        tostring(sessionInfo.itemLink),
+        slotLabel
+    )
+    awardPopupKeys[popupKey] = true
+    if not Integration.ShowInformationalPopup(message) then
+        awardPopupKeys[popupKey] = nil
+        return "unavailable"
+    end
+    DebugInfo("Showed double-BiS award popup for %s", player)
+    return "popup"
+end
+
 function Integration.HandleIncomingMessage(prefix, message, _distribution, sender)
     if prefix ~= Integration.RC_PREFIX then
         return "ignored"
@@ -469,16 +1021,37 @@ function Integration.HandleIncomingMessage(prefix, message, _distribution, sende
         DebugInfo("Ignoring oversized RC payload from %s (%d bytes)", tostring(sender), #message)
         return "too_large"
     end
-    -- Sender is known before decode. Reject non-ML traffic without inflate.
+    -- Size-capped decode classifies the command. History and change_response
+    -- stay Master-Looter-authoritative; candidate responses are not.
+    local decoded = Integration.DecodeHistoryPayload(message)
+    local command = decoded and decoded.command
+    if command == "history" then
+        if not Integration.SenderIsCurrentMasterLooter(sender) then
+            DebugInfo("Ignoring RC history from non-ML sender %s", tostring(sender))
+            return "not_ml"
+        end
+        if not decoded.ok then
+            return "ignored"
+        end
+        return Integration.HandleHistory(sender, decoded.winner, decoded.history, "acecomm")
+    end
+    if command == "response" then
+        return Integration.HandleCandidateResponse(sender, decoded.data)
+    end
+    if command == "change_response" then
+        return Integration.HandleChangeResponse(sender, decoded.data)
+    end
+    if command == "session_end" then
+        if not Integration.SenderIsCurrentMasterLooter(sender) then
+            return "not_ml"
+        end
+        Integration.ClearBisProtectionMemory()
+        return "session_end"
+    end
     if not Integration.SenderIsCurrentMasterLooter(sender) then
-        DebugInfo("Ignoring RC history from non-ML sender %s", tostring(sender))
         return "not_ml"
     end
-    local decoded = Integration.DecodeHistoryPayload(message)
-    if not decoded.ok then
-        return "ignored"
-    end
-    return Integration.HandleHistory(sender, decoded.winner, decoded.history, "acecomm")
+    return "ignored"
 end
 
 function Integration.HandleLocalHistory(history, winner)
@@ -528,6 +1101,10 @@ local function HandleLocalHistoryMessage(_, history, winner)
     Integration.HandleLocalHistory(history, winner)
 end
 
+local function HandleAwardSuccessMessage(_, session, winner, status, itemLink, responseText)
+    Integration.HandleAwardSuccess(session, winner, status, itemLink, responseText)
+end
+
 function Integration.RegisterRCMessages()
     if messageReceiver._registered then
         return false
@@ -548,6 +1125,7 @@ function Integration.RegisterRCMessages()
         end
         if messageReceiver.RegisterMessage then
             messageReceiver:RegisterMessage("RCMLLootHistorySend", HandleLocalHistoryMessage)
+            messageReceiver:RegisterMessage("RCMLAwardSuccess", HandleAwardSuccessMessage)
             messageReceiver._registered = true
             messageReceiver._fallbackOnRC = false
             return true
@@ -561,6 +1139,7 @@ function Integration.RegisterRCMessages()
         return false
     end
     rc:RegisterMessage("RCMLLootHistorySend", HandleLocalHistoryMessage)
+    rc:RegisterMessage("RCMLAwardSuccess", HandleAwardSuccessMessage)
     messageReceiver._registered = true
     messageReceiver._fallbackOnRC = true
     return true
@@ -575,6 +1154,7 @@ function Integration.UnregisterRCMessages()
     end
     if messageReceiver.UnregisterMessage then
         messageReceiver:UnregisterMessage("RCMLLootHistorySend")
+        messageReceiver:UnregisterMessage("RCMLAwardSuccess")
     end
     messageReceiver._registered = false
     return true

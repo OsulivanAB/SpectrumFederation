@@ -110,7 +110,9 @@ Profile admins can choose a character, set that character's persistent specializ
 
 ## Loot Helper: RC Loot Council
 
-This tab appears only when the optional `SpectrumFederation_RCLootCouncilIntegration` child addon is enabled. Profile admins can choose whether finalized RC Loot Council awards are written to Loot Logs, which RC response labels to record, and which recorded responses qualify as BiS for future awards. Settings belong to the active Loot Helper profile and sync with that profile's snapshot. There is no extra **Optional** sidebar row. See [RC Loot Council Integration](development/rc-loot-council-integration.md).
+This tab appears only when the optional `SpectrumFederation_RCLootCouncilIntegration` child addon is enabled. Profile admins can choose whether finalized RC Loot Council awards are written to Loot Logs, which RC response labels to record, and which recorded responses qualify as BiS for future awards. Settings belong to the active Loot Helper profile and sync with that profile's snapshot. There is no extra **Optional** sidebar row.
+
+During a Loot Helper session, admins also get a local warning if a player selects one of those BiS responses after that opportunity is already used. The Master Looter gets an informational popup if the item is awarded anyway. Neither message changes RC Loot Council or the tracked BiS state. See [RC Loot Council Integration](development/rc-loot-council-integration.md).
 
 ## Loot Logs
 
