@@ -49,9 +49,24 @@ function Style:Apply(frame)
 
     local fontPath, fontSize = self:ResolveFont()
 
-    -- Title texts
+    -- Title texts. Re-truncate only when the profile font actually changes so a
+    -- larger face cannot keep a too-wide string, and a smaller face can drop
+    -- an ellipsis that no longer fits the measurement.
     if frame.Title and frame.Title.ProfileName and frame.Title.ProfileName.SetFont then
-        frame.Title.ProfileName:SetFont(fontPath, fontSize + 1, "OUTLINE")
+        local name = frame.Title.ProfileName
+        local oldFont, oldSize, oldFlags
+        if name.GetFont then
+            oldFont, oldSize, oldFlags = name:GetFont()
+        end
+        name:SetFont(fontPath, fontSize + 1, "OUTLINE")
+        local fontChanged = true
+        if name.GetFont and oldFont ~= nil then
+            local newFont, newSize, newFlags = name:GetFont()
+            fontChanged = newFont ~= oldFont or newSize ~= oldSize or newFlags ~= oldFlags
+        end
+        if fontChanged and frame.Title.UpdateTitleLayout then
+            frame.Title.UpdateTitleLayout()
+        end
     end
     if frame.Title and frame.Title.Session and frame.Title.Session.SetFont then
         frame.Title.Session:SetFont(fontPath, math.max(8, fontSize - 1), "OUTLINE")

@@ -24,6 +24,8 @@ Close remains usable while the window is locked. Closing does not change the sav
 
 The window's position, size, and minimized state are saved locally. Minimizing and restoring keep the title bar in place so the window grows and shrinks downward. The close/hidden preference is not saved.
 
+The window can be resized narrower than its default width. As width decreases, the raider name truncates with an ellipsis first and never shorter than the class or spec icon plus about three characters. If the window is still too narrow, **BiS** hides, then **Prep.**, then **Att.** Those columns return in the opposite order as the window gets wider. The equipment button, the Points column in Point Based mode, the readiness indicator, and the title-bar Start/Stop, Settings, Minimize, and Close controls stay available. Profile text in the title may truncate so those controls stay usable. Which glance columns are hidden is not saved; it follows the current width. A saved width above the minimum opens at that width.
+
 ## Understanding the roster
 
 Profile members show their class or specialization icon, class-colored name, glance columns, and an equipment-history button.
