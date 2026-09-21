@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.3-beta.3] - 2026-09-21
+
+### Added
+- Add Loot Helper window close without disabling the feature
+
 ## [1.5.3-beta.2] - 2026-09-20
 
 ### Added
