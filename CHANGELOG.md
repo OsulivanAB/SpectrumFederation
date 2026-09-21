@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.3-beta.4] - 2026-09-21
+
+### Changed
+- Let the Loot Helper window resize narrower
+
 ## [1.5.3-beta.3] - 2026-09-21
 
 ### Added
