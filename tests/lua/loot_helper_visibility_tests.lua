@@ -163,6 +163,7 @@ SF.SettingsWindow = {
     frame = {
         shown = true,
     },
+    currentPageId = "lootHelperGeneral",
     RefreshCurrentPage = function()
         settingsRefreshCount = settingsRefreshCount + 1
     end,
@@ -381,6 +382,7 @@ local function resetState()
     refreshCount = 0
     settingsRefreshCount = 0
     settingsWindowShown = true
+    SF.SettingsWindow.currentPageId = "lootHelperGeneral"
     equipmentHideCount = 0
     equipmentShown = true
     listenerCount = 0
@@ -447,6 +449,15 @@ settingsWindowShown = false
 settingsRefreshCount = 0
 Controller:HideWindow("CloseButton")
 assertEq(settingsRefreshCount, 0, "settings is not refreshed when the settings window is hidden")
+
+resetState()
+Controller:EvaluateVisibility("shown")
+SF.SettingsWindow.currentPageId = "raidEquipment"
+settingsRefreshCount = 0
+Controller:HideWindow("CloseButton")
+assertEq(settingsRefreshCount, 0, "roster hide does not refresh Raid Equipment or other settings pages")
+Controller:ShowWindow("Slash:/sf loot")
+assertEq(settingsRefreshCount, 0, "roster show does not refresh Raid Equipment or other settings pages")
 
 -- GROUP_ROSTER_UPDATE and other automatic reevaluation must not reopen.
 resetState()

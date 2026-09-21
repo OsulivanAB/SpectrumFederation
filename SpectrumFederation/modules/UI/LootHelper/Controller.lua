@@ -111,6 +111,13 @@ function Controller:_NotifySettingsVisibilityChanged()
     if win.frame and win.frame.IsShown and not win.frame:IsShown() then
         return
     end
+    -- Only the Loot Helper General page owns the Show/Hide control. Refreshing
+    -- Raid Equipment or Loot Logs from a roster show/hide can rebuild those
+    -- tables and freeze the client.
+    local pageId = win.currentPageId
+    if pageId ~= "lootHelperGeneral" and pageId ~= "lootHelper" then
+        return
+    end
     win:RefreshCurrentPage()
 end
 
