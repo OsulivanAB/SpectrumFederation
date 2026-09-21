@@ -81,9 +81,9 @@ Profiles are keyed by stable ID and `activeProfileId` stores the local selection
 
 ## UI flow
 
-`UI/LootHelper/Controller.lua` decides window visibility, observes settings/profile/session changes, builds roster models, and connects row actions.
+`UI/LootHelper/Controller.lua` is the authority for roster-window visibility. It combines automatic eligibility (`lootHelper.enabled`, active profile, raid / `showWindowOutsideRaid`) with a runtime-only manual-hidden override. `ShowWindow` / `HideWindow` / `ToggleWindow` / `IsWindowShown` are the public visibility API. Closing the window (title-bar X or Settings **Loot Window**) sets that override and hides `EquipmentWindow`; it does not disable Loot Helper or stop sessions, sync, or heartbeat. `EvaluateVisibility` must not reopen a manually hidden window. `/sf loot` and Settings **Show Loot Window** call `ShowWindow`, which clears the override and then reapplies eligibility. The override is not persisted; `/reload` returns to automatic visibility. Minimize/expanded state is independent of close.
 
-`UI/LootHelper/Window.lua` owns the roster window frame. Minimize and restore re-anchor the frame to its current top-left so height changes expand downward from the title bar instead of growing around a CENTER point.
+`UI/LootHelper/Window.lua` owns the roster window frame. The title bar includes Close, Minimize/Restore, Settings, and Start/Stop Session. Minimize and restore re-anchor the frame to its current top-left so height changes expand downward from the title bar instead of growing around a CENTER point.
 
 `RosterModel.lua` merges:
 
@@ -160,4 +160,4 @@ The standalone **Raid Equipment** settings page consumes versioned troubleshooti
 
 ## Testing changes
 
-For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover session preflight, announce vs consequence apply, frozen joiners/leavers, combat pause, range-only recent-good, Inspection Failed, and incomplete item data. Production-Lua policy and CheckRun coverage is `python -m pytest tests/test_raid_equipment.py`. Item-link parsing remains `python -m pytest tests/test_raid_check_item_links.py`. Settings navigation for the standalone Raid Equipment category is `python -m pytest tests/test_settings_navigation.py`. Minimize/expand anchoring for the roster window is covered by `python -m pytest tests/test_loot_helper_window.py`. Protocol mismatch chat-warning dedupe is `python -m pytest tests/test_sync_protocol.py`.
+For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover session preflight, announce vs consequence apply, frozen joiners/leavers, combat pause, range-only recent-good, Inspection Failed, and incomplete item data. Production-Lua policy and CheckRun coverage is `python -m pytest tests/test_raid_equipment.py`. Item-link parsing remains `python -m pytest tests/test_raid_check_item_links.py`. Settings navigation for the standalone Raid Equipment category is `python -m pytest tests/test_settings_navigation.py`. Minimize/expand anchoring and close/manual-hidden visibility for the roster window are covered by `python -m pytest tests/test_loot_helper_window.py`. Protocol mismatch chat-warning dedupe is `python -m pytest tests/test_sync_protocol.py`.

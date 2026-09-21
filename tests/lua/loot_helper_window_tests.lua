@@ -267,6 +267,14 @@ assertAlmost(Window._frame:GetTop(), clampTop, 1e-6, "ClampSizeToBounds keeps th
 assertAlmost(Window._frame:GetLeft(), clampLeft, 1e-6, "ClampSizeToBounds keeps the left edge")
 assertEq(Window._frame.point, "TOPLEFT", "ClampSizeToBounds re-anchors to TOPLEFT before SetSize")
 
+resetWindowState()
+Window._frame = makeFrame(480, 520)
+Window:SaveState()
+local saved = SpectrumFederationDB.lootHelper.window
+assertTrue(saved.hidden == nil, "SaveState does not persist a hidden flag")
+assertTrue(saved.manuallyHidden == nil, "SaveState does not persist manuallyHidden")
+assertEq(saved.minimized, false, "SaveState keeps minimized=false for an expanded frame")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

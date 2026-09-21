@@ -81,14 +81,34 @@ function Controller:ShouldBeVisible()
     return false, "not_in_raid"
 end
 
-function Controller:EvaluateVisibility(reason)
+function Controller:IsManuallyHidden()
+    return self._manuallyHidden and true or false
+end
+
+function Controller:IsWindowShown()
+    local f = self:GetFrame()
+    return f and f:IsShown() and true or false
+end
+
+function Controller:GetWindowVisibilityActionText()
+    if self:IsWindowShown() then
+        return "Hide Loot Window"
+    end
+    return "Show Loot Window"
+end
+
+function Controller:_HideEquipmentWindow()
+    if LH.EquipmentWindow and LH.EquipmentWindow.Hide then
+        LH.EquipmentWindow:Hide()
+    end
+end
+
+function Controller:_ApplyFrameVisibility(shouldShow, reason, why)
     local f = self:GetFrame()
     if not f then return end
 
     -- Keep title accurate even if hidden
     self:RefreshTitle()
-
-    local shouldShow, why = self:ShouldBeVisible()
 
     if shouldShow then
         if not f:IsShown() then
@@ -100,16 +120,61 @@ function Controller:EvaluateVisibility(reason)
         self:_UnbindReadinessListener()
         if f:IsShown() then
             f:Hide()
-            -- Also hide equipment window when main window hides
-            if LH.EquipmentWindow and LH.EquipmentWindow.Hide then
-                LH.EquipmentWindow:Hide()
-            end
         end
+        -- Equipment is subordinate to the main window; hide it whenever the
+        -- roster UI is not displayed, even if the main frame was already hidden.
+        self:_HideEquipmentWindow()
     end
 
     if SF.Debug then
-        SF.Debug:Verbose("LH_WINDOW", "EvaluateVisibility(%s): show=%s (%s)", tostring(reason), tostring(shouldShow), tostring(why))
+        SF.Debug:Verbose(
+            "LH_WINDOW",
+            "EvaluateVisibility(%s): show=%s why=%s manuallyHidden=%s",
+            tostring(reason),
+            tostring(shouldShow),
+            tostring(why),
+            tostring(self._manuallyHidden and true or false)
+        )
     end
+end
+
+function Controller:EvaluateVisibility(reason)
+    local f = self:GetFrame()
+    if not f then return end
+
+    local eligible, why = self:ShouldBeVisible()
+    local shouldShow = eligible and not self._manuallyHidden
+    self:_ApplyFrameVisibility(shouldShow, reason, why)
+end
+
+-- Explicitly show the main Loot Helper window when automatic eligibility allows
+-- it. Clears the runtime-only manual-hidden override. Does not bypass enabled,
+-- active-profile, or raid/outside-raid rules.
+function Controller:ShowWindow(reason)
+    self._manuallyHidden = false
+    if SF.Debug then
+        SF.Debug:Info("LH_WINDOW", "ShowWindow(%s)", tostring(reason))
+    end
+    self:EvaluateVisibility(reason or "ShowWindow")
+    return self:ShouldBeVisible()
+end
+
+-- Hide the main Loot Helper window for this runtime only. Does not disable
+-- Loot Helper, end sessions, or change persisted window geometry/minimized state.
+function Controller:HideWindow(reason)
+    self._manuallyHidden = true
+    if SF.Debug then
+        SF.Debug:Info("LH_WINDOW", "HideWindow(%s): manuallyHidden=true", tostring(reason))
+    end
+    self:_ApplyFrameVisibility(false, reason or "HideWindow", "manually_hidden")
+end
+
+function Controller:ToggleWindow(reason)
+    if self:IsWindowShown() then
+        self:HideWindow(reason)
+        return false, "manually_hidden"
+    end
+    return self:ShowWindow(reason)
 end
 
 -- ===================================================
@@ -302,6 +367,10 @@ function Controller:Init()
         self:OnMinimizeClicked()
     end
 
+    frame.OnCloseClicked = function()
+        self:OnCloseClicked()
+    end
+
     self:_InitEvents()
     self:_HookSettingsStore()
     self:_HookProfileChanges()
@@ -405,6 +474,10 @@ function Controller:OnMinimizeClicked()
     if LH.Window and LH.Window.ToggleMinimized then
         LH.Window:ToggleMinimized()
     end
+end
+
+function Controller:OnCloseClicked()
+    self:HideWindow("CloseButton")
 end
 
 function Controller:OnMinimizedStateChanged(minimized)

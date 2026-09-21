@@ -386,7 +386,8 @@ function SF:RegisterLootHelperSlashCommands()
             return
         end
         
-        -- Default behavior: enable loot helper (when no subcommand or just "loot")
+        -- Default behavior: enable loot helper if needed, then show the window.
+        -- Bare /sf loot is an explicit Show, not a visibility toggle.
         local store = SF.SettingsStore
 
         local alreadyEnabled = false
@@ -422,27 +423,30 @@ function SF:RegisterLootHelperSlashCommands()
         if c and c.Init then
             c:Init()
         end
-        if c and c.EvaluateVisibility then
+        local ok, why
+        if c and c.ShowWindow then
+            ok, why = c:ShowWindow("Slash:/sf loot")
+        elseif c and c.EvaluateVisibility then
             c:EvaluateVisibility("Slash:/sf loot")
-
             if c.ShouldBeVisible then
-                local ok, why = c:ShouldBeVisible()
-                if not ok then
-                    if why == "no_active_profile" then
-                        if SF.PrintWarning then
-                            SF:PrintWarning("Cannot show Loot Helper window: No active profile set.")
-                        else
-                            print("SpectrumFederation: Cannot show Loot Helper window: No active profile set.")
-                        end
-                    elseif why == "not_in_raid" then
-                        if SF.PrintWarning then
-                            SF:PrintWarning("Cannot show Loot Helper window: You are not in a raid.")
-                        else
-                            print("SpectrumFederation: Cannot show Loot Helper window: You are not in a raid.")
-                        end
-                    end
+                ok, why = c:ShouldBeVisible()
+            end
+        end
+
+        if ok == false then
+            if why == "no_active_profile" then
+                if SF.PrintWarning then
+                    SF:PrintWarning("Cannot show Loot Helper window: No active profile set.")
+                else
+                    print("SpectrumFederation: Cannot show Loot Helper window: No active profile set.")
+                end
+            elseif why == "not_in_raid" then
+                if SF.PrintWarning then
+                    SF:PrintWarning("Cannot show Loot Helper window: You are not in a raid.")
+                else
+                    print("SpectrumFederation: Cannot show Loot Helper window: You are not in a raid.")
                 end
             end
         end
-        end, "Enable Loot Helper or manage sessions (/sf loot session start|end|sync)")
+        end, "Show the Loot Helper window or manage sessions (/sf loot session start|end|sync)")
 end

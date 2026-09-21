@@ -38,8 +38,9 @@ The Loot Helper window appears automatically when all of these conditions are tr
 1. Loot Helper is enabled.
 2. An active profile is selected.
 3. You are in a raid, unless **Show Loot Window outside of Raid** is enabled.
+4. You have not closed the window with the X button or **Hide Loot Window** during this session.
 
-You can also enter `/sf loot` to enable Loot Helper and ask it to show the window.
+You can also enter `/sf loot` to enable Loot Helper if needed and show the window. Closing the window hides the UI only; Loot Helper stays active in the background. A `/reload` restores automatic visibility.
 
 ## Create your first loot profile
 

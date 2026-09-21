@@ -99,7 +99,7 @@ python -m pytest tests/test_settings_navigation.py
 # Mouse Tracer engine (loads production Constants.lua and TrailEngine.lua; requires lua5.1)
 python -m pytest tests/test_mouse_tracer.py
 
-# Loot Helper window minimize/expand anchoring (loads production Window.lua; requires lua5.1)
+# Loot Helper window minimize/expand anchoring and close/manual-hidden visibility (loads production Window.lua and Controller.lua; requires lua5.1)
 python -m pytest tests/test_loot_helper_window.py
 
 # Sync protocol PROTO_NACK / unsupported-protocol warning dedupe (requires lua5.1)

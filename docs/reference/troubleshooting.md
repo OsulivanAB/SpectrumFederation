@@ -4,11 +4,12 @@
 
 Check these conditions:
 
-1. **Loot Helper → General → Enable LootHelper** is enabled.
+1. **Loot Helper → General → Enable Loot Helper** is enabled.
 2. A profile is selected under **Loot Helper → Profile**.
 3. You are in a raid, or **Show Loot Window outside of Raid** is enabled.
+4. The window was not closed with the title-bar X or **Loot Helper → General → Hide Loot Window** during this session.
 
-Enter `/sf loot` to enable the feature and re-evaluate visibility. If it still does not appear, enable diagnostics with `/sf debug on`, repeat the action, then open `/sf debug show`.
+Enter `/sf loot` or **Loot Helper → General → Show Loot Window** to enable the feature if needed and show the window. Closing the window only hides the UI. If it still does not appear, enable diagnostics with `/sf debug on`, repeat the action, then open `/sf debug show`.
 
 ## A profile member is missing from the roster
 
