@@ -122,6 +122,21 @@ local function IsSessionActive()
 	return SF.LootHelperSync and SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive()
 end
 
+local function GetLootHelperWindowController()
+	return SF.LootHelperWindow and SF.LootHelperWindow.Controller or nil
+end
+
+local function LootWindowButtonText()
+	local c = GetLootHelperWindowController()
+	if c and c.GetWindowVisibilityActionText then
+		return c:GetWindowVisibilityActionText()
+	end
+	if c and c.IsWindowShown and c:IsWindowShown() then
+		return "Hide Loot Window"
+	end
+	return "Show Loot Window"
+end
+
 local function IsAdmin()
 	local profile = GetActiveProfileObject(SF.SettingsStore)
 	local Imp = SF.LootHelperImpersonation
@@ -772,7 +787,44 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			title = "General Settings",
 			tooltip = "Character-level Loot Helper options for this client, plus global actions such as a full reset.",
 			items = {
-				{ type = "checkbox", label = "Enable LootHelper", tooltip = "Turn Loot Helper on or off for this character. When it is off, the Loot Helper window and related features stay disabled on this client.", path = "lootHelper.enabled" },
+				{ type = "checkbox", label = "Enable Loot Helper", tooltip = "Allow the Loot Helper roster window to appear for this character when an active profile and raid conditions are met. Turning this off hides the window and prevents it from coming back automatically. Use Show/Hide Loot Window to hide the UI for this session without changing this setting. Sync and Raid Check still initialize.", path = "lootHelper.enabled" },
+				{
+					type = "button",
+					label = "Loot Window",
+					buttonText = LootWindowButtonText,
+					width = 160,
+					tooltip = "Show or hide the Loot Helper roster window on this client. Hiding the window does not disable Loot Helper, end a session, or stop synchronization.",
+					onClick = function(ctx)
+						ctx.section:ClearMessage()
+						local c = GetLootHelperWindowController()
+						if not c then
+							ctx.section:SetMessage("Loot Helper window is not available.", "error")
+							return
+						end
+						if c.Init then
+							c:Init()
+						end
+						if c.IsWindowShown and c:IsWindowShown() then
+							if c.HideWindow then
+								c:HideWindow("Settings:LootWindow")
+							end
+						elseif c.ShowWindow then
+							local ok, why = c:ShowWindow("Settings:LootWindow")
+							if ok == false then
+								if why == "no_active_profile" then
+									ctx.section:SetMessage("Cannot show Loot Helper window: No active profile set.", "warn")
+								elseif why == "not_in_raid" then
+									ctx.section:SetMessage("Cannot show Loot Helper window: You are not in a raid.", "warn")
+								elseif why == "disabled" then
+									ctx.section:SetMessage("Cannot show Loot Helper window: Loot Helper is disabled.", "warn")
+								end
+							end
+						end
+						if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+							ctx.pageBuilder:Refresh()
+						end
+					end,
+				},
 				{ type = "checkbox", label = "Lock Loot Window", tooltip = "Prevent the Loot Helper window from being moved or resized.", path = "lootHelper.lockLootWindow" },
 				{ type = "checkbox", label = "Show Members not in raid", tooltip = "Show profile members even when they are not currently in your raid. Turn this off to focus only on people who are present.", path = "lootHelper.showMembersNotInRaid" },
 				{ type = "checkbox", label = "Show Loot Window outside of Raid", tooltip = "Allow the Loot Helper window to appear even when you are not currently in a raid.", path = "lootHelper.showWindowOutsideRaid" },

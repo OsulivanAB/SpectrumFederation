@@ -25,7 +25,7 @@ Profile names may contain spaces. Profiles created by slash command receive a lo
 
 | Command | Result |
 | --- | --- |
-| `/sf loot` | Enable Loot Helper if needed and re-evaluate roster-window visibility. |
+| `/sf loot` | Enable Loot Helper if needed and show the roster window. Reopens a window closed with X. Does not toggle a visible window off. Eligibility rules still apply. |
 | `/sf loot session start` | Start a sync session for the active profile. Requires a party or raid and profile-admin permission. Denied while Preview as Non-Admin is active. |
 | `/sf loot session end` | End the active session. Only its coordinator can end it explicitly. Denied while Preview as Non-Admin is active. |
 | `/sf loot sync` | Ask the current coordinator to compare and catch up this client. Not available to the coordinator. |

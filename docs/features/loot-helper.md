@@ -8,14 +8,21 @@ Each profile uses one loot mode: [Point Based](point-based.md) or [Reward Pot](r
 
 Loot Helper requires the feature to be enabled and an active profile to exist. By default, its window is shown only while you are in a raid. **Show Loot Window outside of Raid** removes the raid-only restriction.
 
-Enter `/sf loot` to enable Loot Helper and re-evaluate the window. The title bar also provides:
+Enable Loot Helper and window visibility are separate. Turning Enable off hides the window and keeps it from appearing automatically. Closing the window with X only hides the UI for this session; sessions, sync, heartbeat, Raid Check, and related features keep running.
 
+Enter `/sf loot` to enable Loot Helper if needed and show the window. That command is an explicit Show: it reopens a window you closed and does not toggle a visible window off. **Loot Helper → General → Loot Window** also shows or hides the roster. Eligibility rules still apply, so Show will not appear outside a raid unless **Show Loot Window outside of Raid** is on, and it still requires an active profile.
+
+The title bar provides:
+
+- a close (X) button that hides the window for this session;
 - a play/stop button for sync sessions, visible to profile admins;
 - a settings button that opens the Loot Helper settings;
 - a minimize button;
 - drag and resize behavior, unless **Lock Loot Window** is enabled.
 
-The window's position, size, and minimized state are saved locally. Minimizing and restoring keep the title bar in place so the window grows and shrinks downward.
+Close remains usable while the window is locked. Closing does not change the saved minimized or expanded state. A `/reload` or relog clears the hidden override and returns to automatic visibility.
+
+The window's position, size, and minimized state are saved locally. Minimizing and restoring keep the title bar in place so the window grows and shrinks downward. The close/hidden preference is not saved.
 
 ## Understanding the roster
 

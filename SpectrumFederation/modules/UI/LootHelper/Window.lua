@@ -310,7 +310,7 @@ function Window:SetLocked(locked)
 
     -- Dragging (title bar)
     if f.Title then
-        -- Always keep the title mouse-enabled so Gear/Close still work
+        -- Always keep the title mouse-enabled so Gear/Close/Minimize still work
         f.Title:EnableMouse(true)
 
         if locked then
@@ -487,9 +487,18 @@ function Window:Create()
     play.__sfTooltipText = "Start a Loot Helper session for the active profile."
     AttachTooltip(play, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
 
-    -- Minimize/restore button
+    -- Close button (rightmost). Visibility-only; does not disable Loot Helper.
+    local close = CreateFrame("Button", nil, title, "UIPanelCloseButton")
+    close:SetPoint("RIGHT", title, "RIGHT", -4, 0)
+    close:SetSize(20, 20)
+    title.Close = close
+    close.__sfTooltipTitle = "Close"
+    close.__sfTooltipText = "Hide the Loot Helper window. Loot Helper keeps running in the background."
+    AttachTooltip(close, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
+
+    -- Minimize/restore button (left of close)
     local minimize = CreateObjectiveTrackerToggleButton(title)
-    minimize:SetPoint("RIGHT", title, "RIGHT", -4, 0)
+    minimize:SetPoint("RIGHT", close, "LEFT", -4, 0)
     title.Minimize = minimize
     minimize.__sfTooltipTitle = "Minimize"
     minimize.__sfTooltipText = "Collapse the Loot Helper window to its title bar."
@@ -599,6 +608,9 @@ function Window:Create()
     end)
     minimize:SetScript("OnClick", function()
         if frame.OnMinimizeClicked then frame:OnMinimizeClicked() end
+    end)
+    close:SetScript("OnClick", function()
+        if frame.OnCloseClicked then frame:OnCloseClicked() end
     end)
     
     -- =====================================================
