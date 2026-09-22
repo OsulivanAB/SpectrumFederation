@@ -345,6 +345,77 @@ local function RecacheScale()
 	end
 end
 
+-- One next-frame confirmation for a coordinate-space transition. The scale
+-- read inside DISPLAY_SIZE_CHANGED / UI_SCALE_CHANGED can still be the
+-- pre-change value. A resize drag can emit a burst of those events; the
+-- stamp pool and segment arrays are cleared once, not on every event.
+local scaleRefreshPending = false
+
+local function ScalesDiffer(previous, current)
+	previous = previous or 0
+	current = current or 0
+	local diff = previous - current
+	if diff < 0 then
+		diff = -diff
+	end
+	return diff > 0.0001
+end
+
+local function HasLiveTrail()
+	return engine and (engine.count > 0 or (engine.activeSegCount or 0) > 0)
+end
+
+local function DropSamplingBaseline()
+	if engine then
+		engine:InvalidateBaseline()
+	end
+	lastRawX = nil
+	lastRawY = nil
+end
+
+-- Full pool reset only when stamps or segments are actually live. A baseline
+-- alone is an O(1) invalidation. Disabled transitions only refresh the cache:
+-- StopRuntime has already cleared the trail.
+local function ApplyCoordinateDiscontinuity(allowPoolReset)
+	if not cache.enabled or not engine then
+		return
+	end
+	if allowPoolReset and HasLiveTrail() then
+		Tracer:OnDiscontinuity(true)
+	elseif engine.hasBaseline then
+		DropSamplingBaseline()
+	else
+		lastRawX = nil
+		lastRawY = nil
+	end
+end
+
+local function RefreshCoordinateSpace()
+	local previous = cache.scale
+	RecacheScale()
+	local scaleChanged = ScalesDiffer(previous, cache.scale)
+
+	if not scaleRefreshPending then
+		ApplyCoordinateDiscontinuity(true)
+	elseif scaleChanged then
+		ApplyCoordinateDiscontinuity(true)
+	end
+
+	if scaleRefreshPending or not C_Timer or not C_Timer.After then
+		return
+	end
+	scaleRefreshPending = true
+	C_Timer.After(0, function()
+		scaleRefreshPending = false
+		local before = cache.scale
+		RecacheScale()
+		if not ScalesDiffer(before, cache.scale) then
+			return
+		end
+		ApplyCoordinateDiscontinuity(true)
+	end)
+end
+
 local function EnsurePool()
 	if poolReady then
 		return
@@ -688,18 +759,17 @@ function Tracer:Init()
 		events:RegisterEvent("PLAYER_LOGIN")
 		events:RegisterEvent("PLAYER_ENTERING_WORLD")
 		events:RegisterEvent("PLAYER_LOGOUT")
+		events:RegisterEvent("DISPLAY_SIZE_CHANGED")
 		pcall(events.RegisterEvent, events, "UI_SCALE_CHANGED")
 		events:SetScript("OnEvent", function(_, event)
 			if event == "PLAYER_LOGIN" then
 				self:ReloadCacheFromStore()
 				self:ApplyEnabled(cache.enabled)
 				self:FlushSnapshot()
-			elseif event == "PLAYER_ENTERING_WORLD" then
-				RecacheScale()
-				self:OnDiscontinuity(true)
-			elseif event == "UI_SCALE_CHANGED" then
-				RecacheScale()
-				self:OnDiscontinuity(true)
+			elseif event == "PLAYER_ENTERING_WORLD" or event == "UI_SCALE_CHANGED" or event == "DISPLAY_SIZE_CHANGED" then
+				-- Windowed alt-tab and resizes fire DISPLAY_SIZE_CHANGED when
+				-- the cursor-to-UI scale changes without UI_SCALE_CHANGED.
+				RefreshCoordinateSpace()
 			elseif event == "PLAYER_LOGOUT" then
 				self:FlushSnapshot()
 			end
