@@ -17,6 +17,7 @@ RUN_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_run_tests.lua"
 FRESH_SNAPSHOT_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_fresh_snapshot_tests.lua"
 STABILITY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_stability_tests.lua"
 PRESENCE_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_presence_tests.lua"
+ITEM_LEVEL_CONFIG_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_item_level_config_tests.lua"
 GLANCE_TESTS = REPO_ROOT / "tests" / "lua" / "roster_glance_tests.lua"
 SCHEMA = REPO_ROOT / "SpectrumFederation" / "modules" / "Settings" / "Schema.lua"
 RAID_EQUIPMENT_PAGE = (
@@ -68,6 +69,28 @@ def test_raid_equipment_stability_production_lua():
     assert RAID_EQUIPMENT_PAGE.exists()
 
 
+def test_raid_check_item_level_config_production_lua():
+    _run_lua(ITEM_LEVEL_CONFIG_TESTS, "Raid Check item level config")
+    assert ITEM_LEVEL_CONFIG_TESTS.exists()
+
+
+def test_item_level_capture_uses_blizzard_equipped_value():
+    raid_check = (REPO_ROOT / "SpectrumFederation" / "modules" / "RaidCheck.lua").read_text(
+        encoding="utf-8"
+    )
+    page = RAID_EQUIPMENT_PAGE.read_text(encoding="utf-8")
+    assert "C_PaperDollInfo.GetAverageItemLevel" in raid_check
+    assert "C_PaperDollInfo.GetInspectItemLevel" in raid_check
+    assert "CalculateAverageItemLevel" not in raid_check
+    assert "overallEquippedItemLevel" in raid_check
+    assert "ReevaluateFrozenRunPolicies" in raid_check
+    assert "SetAuditItemLevelPulse(dataRow.ItemLevel, belowMinimum)" in page
+    assert "SetAuditItemLevelPulse(dataRow" not in page.replace(
+        "SetAuditItemLevelPulse(dataRow.ItemLevel, belowMinimum)",
+        "",
+    )
+
+
 def test_raid_check_presence_production_lua():
     _run_lua(PRESENCE_TESTS, "Raid Check presence")
     assert PRESENCE_TESTS.exists()
@@ -115,7 +138,8 @@ def test_raid_check_does_not_consume_persisted_equipment_snapshots():
     assert "GetRaidCheckEquipmentSnapshot" not in check_run
     assert "_raidCheckEquipmentSnapshots" not in policy
     assert "_raidCheckEquipmentSnapshots" not in check_run
-    assert "CheckRun.ClassifyRun(run, now, state.lastGood)" in raid_check
+    assert "local frozenLastGood = ReevaluateFrozenRunPolicies(run, state.lastGood)" in raid_check
+    assert "CheckRun.ClassifyRun(run, now, frozenLastGood)" in raid_check
     assert "GetProfileEquipmentSnapshot(" not in raid_check.split(
         "function RC:_SettleAdhocRun", 1
     )[1]

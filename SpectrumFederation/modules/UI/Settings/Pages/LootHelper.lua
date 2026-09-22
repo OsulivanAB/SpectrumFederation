@@ -259,6 +259,20 @@ local function SetRaidCheckPointsAwardPerCheck(value)
 	end
 end
 
+local function SetRaidCheckMinimumItemLevelRequired(value)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckMinimumItemLevelRequired then
+		profile:SetRaidCheckMinimumItemLevelRequired(value and true or false)
+	end
+end
+
+local function SetRaidCheckMinimumItemLevel(value)
+	local profile = GetActiveProfileObject(SF.SettingsStore)
+	if profile and profile.SetRaidCheckMinimumItemLevel then
+		profile:SetRaidCheckMinimumItemLevel(value)
+	end
+end
+
 local function SetRaidCheckWhispers(mode, value)
 	local profile = GetActiveProfileObject(SF.SettingsStore)
 	if profile and profile.SetRaidCheckWhispers then
@@ -1295,11 +1309,13 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "button", label = "Trigger Raid-Wide Sync", adminOnly = true, buttonText = "Sync", width = 120, tooltip = "Planned admin action: ask everyone in the active session to resend their Loot Helper data. This button is not implemented yet.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:SetMessage("Stub: Trigger Raid-Wide Sync (implement later).", "warn") end },
 				{ type = "spacer", height = 12 },
 				{ type = "heading", text = "Raid Check Settings" },
-				{ type = "slider", label = "Points Per Raid Check", adminOnly = true, min = 0, max = 1, step = 0.5, tooltip = "Set how many points each prepared player earns when running a Raid Check. Equipment rules are addon-owned and are not configured here.", visible = function() return HasActiveProfile() and IsPointBasedMode() end, enabled = function() return ProfileActionsEnabled() end, get = function() return GetRaidCheckPointsAwardPerCheck() end, set = function(v) SetRaidCheckPointsAwardPerCheck(v) end },
+				{ type = "slider", label = "Points Per Raid Check", adminOnly = true, min = 0, max = 1, step = 0.5, tooltip = "Set how many points each prepared player earns when running a Raid Check. Enchant and gem rules are addon-owned. Minimum item level is configured below.", visible = function() return HasActiveProfile() and IsPointBasedMode() end, enabled = function() return ProfileActionsEnabled() end, get = function() return GetRaidCheckPointsAwardPerCheck() end, set = function(v) SetRaidCheckPointsAwardPerCheck(v) end },
+				{ type = "checkbox", label = "Require Minimum Item Level", adminOnly = true, tooltip = "When enabled, a player whose overall equipped item level is below the minimum is Unprepared. The value is Blizzard's equipped item level. The requirement starts off and stays off until an admin enables it.", visible = function() return HasActiveProfile() end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.requireMinimumItemLevel or false end, set = function(value) SetRaidCheckMinimumItemLevelRequired(value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end },
+				{ type = "editbox", label = "Minimum Item Level", adminOnly = true, tooltip = "Whole-number overall equipped item level required to pass Raid Check. A player exactly at this value passes. Leave this blank to keep the requirement from failing anyone until a number is set.", visible = function() local cfg = GetRaidCheckConfig() return HasActiveProfile() and cfg and cfg.requireMinimumItemLevel or false end, enabled = function() return ProfileActionsEnabled() end, maxLetters = 5, get = function() local cfg = GetRaidCheckConfig() if cfg and cfg.minimumItemLevel ~= nil then return tostring(cfg.minimumItemLevel) end return "" end, set = function(value) SetRaidCheckMinimumItemLevel(value) end },
 				{ type = "text", text = "Raid Checks..." },
 					{ type = "buttonRow", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, { text = "Pre-Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunPreRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunPreRaidCheck() if status == "prompt" then ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info") elseif status == "started" then ctx.section:SetMessage("Pre-Raid Check started.", "info") elseif status == "busy" then ctx.section:SetMessage("A Raid Check is already in progress.", "warn") end end }, { text = "Raid Check", width = 180, onClick = function(ctx) if not (SF.RaidCheck and SF.RaidCheck.RunRaidCheck) then ctx.section:SetMessage("Raid Check is not available.", "error") return end local status = SF.RaidCheck:RunRaidCheck() if status == "prompt" then ctx.section:SetMessage("Choose Yes to start a session, No to run without one, or Cancel to abort.", "info") elseif status == "started" then ctx.section:SetMessage("Raid Check started.", "info") elseif status == "busy" then ctx.section:SetMessage("A Raid Check is already in progress.", "warn") end end } },
 					{ type = "text", text = "Enable Whispers During..." },
-					{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing required enchants or gems.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end } } },
+					{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Pre-Raid Check", tooltip = "Whisper players after a Pre-Raid Check if they are missing equipment requirements.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersPreRaid or false end, set = function(value) SetRaidCheckWhispers("pre", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end }, { label = "Raid Check", tooltip = "Whisper each player their Raid Check result. Players who are missing requirements are told what to fix; fully prepared players are told they earned a point.", get = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, set = function(value) SetRaidCheckWhispers("raid", value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end } } },
 					{ type = "checkbox", label = "Whisper when a point is earned", adminOnly = true, tooltip = "Only applies when Raid Check whispers are enabled. When checked, prepared players are whispered that they earned a point in Point Based mode, or an Attendance point in Reward Pot mode.", visible = function() local cfg = GetRaidCheckConfig() return cfg and cfg.enableWhispersRaid or false end, enabled = function() return ProfileActionsEnabled() end, get = function() local cfg = GetRaidCheckConfig() if cfg == nil then return true end return cfg.enableWhispersRaidPrepared ~= false end, set = function(value) SetRaidCheckPreparedWhispers(value) if panel and panel.__sfPageBuilder then panel.__sfPageBuilder:Refresh() panel.__sfPageBuilder:Reflow() end end },
 					{
 						type = "spacer",
@@ -1323,7 +1339,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 						keyWidth = 140,
 						items = {
 							{ key = "{player_name}", value = "The name of the player being whispered" },
-							{ key = "{missing}", value = "Comma separated list of missing enchants/gems" },
+							{ key = "{missing}", value = "Comma separated list of missing requirements, including item level when it fails" },
 							{ key = "{point_name}", value = "The profile's point name (Raid Check only)" },
 							{ key = "{points_awarded}", value = "The number of points awarded (Raid Check only)" },
 						},

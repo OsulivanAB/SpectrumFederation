@@ -16,7 +16,7 @@ The roster also shows raid-check presence as a percentage, BiS slots used out of
 
 **Raid Check** inspects only profile members who are currently in the raid. Prepared members receive the profile's **Points Per Raid Check** award (`0`, `0.5`, or `1`). Inspection Failed does not receive points and does not count as Unprepared. Never-inspectable players are Unprepared.
 
-Configure the award and whispers under **Loot Helper → Session**. Equipment rules are addon-owned. Only profile admins can change those settings or run a check.
+Configure the award, whispers, and optional minimum item level under **Loot Helper → Session**. Enchant and gem rules are addon-owned. A player below an enabled minimum item level does not receive the Prepared award. Only profile admins can change those settings or run a check.
 
 ## Equipment history
 

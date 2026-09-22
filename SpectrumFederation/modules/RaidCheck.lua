@@ -3,7 +3,7 @@ local addonName, SF = ...
 
 -- luacheck: globals INVSLOT_HEAD INVSLOT_NECK INVSLOT_SHOULDER INVSLOT_BACK INVSLOT_CHEST INVSLOT_WRIST INVSLOT_HAND INVSLOT_WAIST INVSLOT_LEGS INVSLOT_FEET
 -- luacheck: globals INVSLOT_FINGER1 INVSLOT_FINGER2 INVSLOT_TRINKET1 INVSLOT_TRINKET2 INVSLOT_MAINHAND INVSLOT_OFFHAND
--- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetDetailedItemLevelInfo C_Item
+-- luacheck: globals GetInventoryItemLink GetInventoryItemTexture GetItemInfo GetItemInfoInstant GetItemStats GetItemGem GetDetailedItemLevelInfo C_Item C_PaperDollInfo GetAverageItemLevel
 -- luacheck: globals GetInventoryItemID C_TooltipInfo TooltipUtil Enum
 -- luacheck: globals EMPTY_SOCKET_PRISMATIC EMPTY_SOCKET_META EMPTY_SOCKET_RED EMPTY_SOCKET_YELLOW EMPTY_SOCKET_BLUE
 -- luacheck: globals EMPTY_SOCKET_HYDRAULIC EMPTY_SOCKET_COGWHEEL EMPTY_SOCKET_DOMINATION EMPTY_SOCKET_TINKER EMPTY_SOCKET_PRIMORDIAL
@@ -760,24 +760,47 @@ local function NormalizeSlotData(slotData)
 	return slotData
 end
 
-local function CalculateAverageItemLevel(slotsByInventory)
-	local total = 0
-	local count = 0
-
-	for _, column in ipairs(TROUBLESHOOTING_COLUMNS) do
-		local slotData = slotsByInventory and slotsByInventory[column.inventorySlot]
-		local itemLevel = slotData and slotData.itemLevel or nil
-		if itemLevel and itemLevel > 0 then
-			total = total + itemLevel
-			count = count + 1
-		end
+-- Blizzard's overall equipped item level (character sheet / inspect), not a
+-- Spectrum average of the tracked audit slots.
+local function CanonicalOverallItemLevel(value)
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if Policy and Policy.CanonicalOverallItemLevel then
+		return Policy.CanonicalOverallItemLevel(value)
 	end
+	local number = tonumber(value)
+	if not number or number <= 0 then
+		return nil
+	end
+	return number
+end
 
-	if count == 0 then
+local function ReadAuthoritativeEquippedItemLevel(unit)
+	if IsSelfUnit(unit) then
+		if C_PaperDollInfo and C_PaperDollInfo.GetAverageItemLevel then
+			local ok, _, equipped = pcall(C_PaperDollInfo.GetAverageItemLevel)
+			if ok then
+				local canonical = CanonicalOverallItemLevel(equipped)
+				if canonical then
+					return canonical
+				end
+			end
+		end
+		if GetAverageItemLevel then
+			local ok, _, equipped = pcall(GetAverageItemLevel)
+			if ok then
+				return CanonicalOverallItemLevel(equipped)
+			end
+		end
 		return nil
 	end
 
-	return total / count
+	if C_PaperDollInfo and C_PaperDollInfo.GetInspectItemLevel then
+		local ok, equipped = pcall(C_PaperDollInfo.GetInspectItemLevel, unit)
+		if ok then
+			return CanonicalOverallItemLevel(equipped)
+		end
+	end
+	return nil
 end
 
 local function RecalculateCapturedSummary(captured)
@@ -786,6 +809,7 @@ local function RecalculateCapturedSummary(captured)
 	end
 	if type(captured.slotsByInventory) ~= "table" then
 		captured.sawAnyData = false
+		captured.overallEquippedItemLevel = nil
 		captured.averageItemLevel = nil
 		return captured
 	end
@@ -799,7 +823,10 @@ local function RecalculateCapturedSummary(captured)
 	end
 
 	captured.sawAnyData = sawAnyData
-	captured.averageItemLevel = CalculateAverageItemLevel(captured.slotsByInventory)
+	local overall = CanonicalOverallItemLevel(captured.overallEquippedItemLevel)
+	captured.overallEquippedItemLevel = overall
+	-- Keep the legacy field aligned so display and policy cannot diverge.
+	captured.averageItemLevel = overall
 	return captured
 end
 
@@ -853,6 +880,14 @@ end
 
 local function GetProfile()
 	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
+end
+
+local function GetLiveItemLevelConfig()
+	local profile = GetProfile()
+	if not profile or type(profile.GetRaidCheckConfig) ~= "function" then
+		return nil
+	end
+	return profile:GetRaidCheckConfig()
 end
 
 local function PersistProfileEquipmentSnapshot()
@@ -982,8 +1017,10 @@ local function CaptureTroubleshootingInventory(unit)
 		end
 	end
 
+	local overallEquippedItemLevel = ReadAuthoritativeEquippedItemLevel(unit)
 	return {
-		averageItemLevel = CalculateAverageItemLevel(slotsByInventory),
+		overallEquippedItemLevel = overallEquippedItemLevel,
+		averageItemLevel = overallEquippedItemLevel,
 		slotsByInventory = slotsByInventory,
 		sawAnyData = sawAnyData,
 	}
@@ -1189,7 +1226,8 @@ function RC:_GetLocalTroubleshootingSnapshot()
 	-- Equipment page redraw.
 	local captured = CaptureTroubleshootingInventory("player")
 	state.localSnapshot = {
-		averageItemLevel = captured.averageItemLevel,
+		overallEquippedItemLevel = captured.overallEquippedItemLevel,
+		averageItemLevel = captured.overallEquippedItemLevel,
 		slotsByInventory = captured.slotsByInventory,
 		sawAnyData = captured.sawAnyData,
 		preparedSlotsByConfig = {},
@@ -1743,7 +1781,10 @@ local function BuildPolicyObservation(captured)
 		slotsByInventory[inventorySlot] = mapped
 	end
 
-	return { slotsByInventory = slotsByInventory }
+	return {
+		slotsByInventory = slotsByInventory,
+		overallEquippedItemLevel = captured.overallEquippedItemLevel,
+	}
 end
 
 function RC:_HandleInspectReady(guid)
@@ -1816,13 +1857,15 @@ function RC:_HandleInspectReady(guid)
 		entry.nextRetryAt = nil
 		entry.updatedAt = now
 		entry.capturedAt = GetServerTime and GetServerTime() or nil
-		entry.averageItemLevel = captured.averageItemLevel
+		entry.overallEquippedItemLevel = captured.overallEquippedItemLevel
+		entry.averageItemLevel = captured.overallEquippedItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
 		PersistProfileEquipmentSnapshot(active.id, captured)
 
 		local policyObs = BuildPolicyObservation(captured)
 		local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
-		local policyResult = Policy and policyObs and Policy.EvaluateObservation(policyObs) or nil
+		local policyConfig = (state.adhocRun and state.adhocRun.cfg) or GetLiveItemLevelConfig()
+		local policyResult = Policy and policyObs and Policy.EvaluateObservation(policyObs, policyConfig) or nil
 		if policyResult and policyResult.complete and active.id then
 			state.lastGood = state.lastGood or {}
 			state.lastGood[active.id] = {
@@ -1841,6 +1884,7 @@ function RC:_HandleInspectReady(guid)
 					player.freshObservation = {
 						complete = true,
 						policy = policyResult,
+						observation = policyObs,
 						capturedAt = now,
 					}
 					player.policyResult = policyResult
@@ -2341,7 +2385,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		return {
 			status = "ready",
 			isKnown = true,
-			averageItemLevel = captured.averageItemLevel,
+			overallEquippedItemLevel = captured.overallEquippedItemLevel,
+			averageItemLevel = captured.overallEquippedItemLevel,
 			slotsByInventory = captured.slotsByInventory,
 			message = nil,
 			label = nil,
@@ -2360,7 +2405,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 		return {
 			status = "ready",
 			isKnown = true,
-			averageItemLevel = cacheEntry.averageItemLevel,
+			overallEquippedItemLevel = cacheEntry.overallEquippedItemLevel,
+			averageItemLevel = cacheEntry.overallEquippedItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
 			cacheHolder = cacheEntry,
@@ -2408,7 +2454,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			label = label,
 			message = message,
 			isKnown = true,
-			averageItemLevel = cacheEntry.averageItemLevel,
+			overallEquippedItemLevel = cacheEntry.overallEquippedItemLevel,
+			averageItemLevel = cacheEntry.overallEquippedItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
 			stale = false,
@@ -2427,7 +2474,8 @@ function RC:_GetTroubleshootingInspectState(unit, info)
 			label = nil,
 			message = "Showing older cached inspect data. Background refresh will update when possible.",
 			isKnown = true,
-			averageItemLevel = cacheEntry.averageItemLevel,
+			overallEquippedItemLevel = cacheEntry.overallEquippedItemLevel,
+			averageItemLevel = cacheEntry.overallEquippedItemLevel,
 			slotsByInventory = cacheEntry.slotsByInventory,
 			entry = cacheEntry,
 			stale = true,
@@ -2643,9 +2691,9 @@ local function WhisperMissing(target, cfg, playerName, pointName, list, mode)
 
 	if not message then
 		if mode == "pre" then
-			message = ("Spectrum Federation: You're missing the following enchants/gems: %s."):format(list)
+			message = ("Spectrum Federation: You're missing the following requirements: %s."):format(list)
 		else
-			message = ("Spectrum Federation: You're missing the following enchants/gems: %s. No new %s awarded."):format(list, pointName)
+			message = ("Spectrum Federation: You're missing the following requirements: %s. No new %s awarded."):format(list, pointName)
 		end
 	end
 
@@ -2697,6 +2745,10 @@ local function CollectTroubleshootingUnitsAndMembers()
 end
 
 local function FormatAverageItemLevel(value)
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if Policy and Policy.FormatOverallItemLevel then
+		return Policy.FormatOverallItemLevel(value)
+	end
 	if not value or value <= 0 then
 		return nil
 	end
@@ -2801,7 +2853,7 @@ local function EmitAdminMissingSummary(modeLabel, summaryMissing)
 		return
 	end
 
-	EmitAdminMessage(string.format("[%s] Players missing enchants/gems:", modeLabel))
+	EmitAdminMessage(string.format("[%s] Players missing requirements:", modeLabel))
 	for _, entry in ipairs(summaryMissing) do
 		local suffix = ""
 		if entry.whisperedMissing then
@@ -2918,12 +2970,13 @@ local function QueueFrozenInspectTargets(self, run)
 			if captured and CheckRun and Policy and player then
 				local now = GetTime and GetTime() or 0
 				local observation = BuildPolicyObservation(captured)
-				local policyResult = Policy.EvaluateObservation(observation)
+				local policyResult = Policy.EvaluateObservation(observation, run.cfg)
 				if policyResult and policyResult.complete then
 					CheckRun.MarkAttempt(player, "complete", true)
 					player.freshObservation = {
 						complete = true,
 						policy = policyResult,
+						observation = observation,
 						capturedAt = now,
 					}
 					player.policyResult = policyResult
@@ -3199,6 +3252,40 @@ function RC:OnSessionStartAnnounceFailed(sessionId)
 	self:_TryReleaseCheckConsequences()
 end
 
+local function ReevaluateFrozenRunPolicies(run, lastGoodById)
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	local derived = {}
+	if not Policy or type(run) ~= "table" then
+		return lastGoodById or derived
+	end
+	local cfg = run.cfg
+	for _, id in ipairs(run.targetIds or {}) do
+		local player = run.players and run.players[id]
+		local fresh = player and player.freshObservation
+		if fresh and type(fresh.observation) == "table" then
+			local result = Policy.EvaluateObservation(fresh.observation, cfg)
+			fresh.policy = result
+			fresh.complete = result ~= nil and result.complete == true
+			if fresh.complete then
+				player.policyResult = result
+			end
+		end
+		local good = lastGoodById and lastGoodById[id]
+		if good and type(good.observation) == "table" then
+			local result = Policy.EvaluateObservation(good.observation, cfg)
+			derived[id] = {
+				capturedAt = good.capturedAt,
+				observation = good.observation,
+				policy = result,
+				complete = result ~= nil and result.complete == true,
+			}
+		else
+			derived[id] = good
+		end
+	end
+	return derived
+end
+
 function RC:_SettleAdhocRun(reason)
 	local state = self:_GetInspectState()
 	local run = state.adhocRun
@@ -3210,7 +3297,8 @@ function RC:_SettleAdhocRun(reason)
 		return
 	end
 	local now = GetTime and GetTime() or 0
-	CheckRun.ClassifyRun(run, now, state.lastGood)
+	local frozenLastGood = ReevaluateFrozenRunPolicies(run, state.lastGood)
+	CheckRun.ClassifyRun(run, now, frozenLastGood)
 	if SF.Debug then
 		SF.Debug:Info("RAID_CHECK", "%s classified (%s)", ModeLabel(run.mode), tostring(reason))
 	end
@@ -3501,13 +3589,20 @@ function RC:GetTroubleshootingSnapshot()
 				cfg,
 				inspectState and inspectState.isKnown
 			)
+			local itemLevel = inspectState and inspectState.overallEquippedItemLevel or nil
+			local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+			local itemLevelBelowMinimum = false
+			if inspectState and inspectState.isKnown and Policy and Policy.ShouldWarnItemLevel then
+				itemLevelBelowMinimum = Policy.ShouldWarnItemLevel(itemLevel, GetLiveItemLevelConfig())
+			end
 			rows[#rows + 1] = {
 				unit = info.unit,
 				id = info.id,
 				name = info.short,
 				displayName = info.displayName or info.short,
-				itemLevel = inspectState and inspectState.averageItemLevel or nil,
-				itemLevelText = FormatAverageItemLevel(inspectState and inspectState.averageItemLevel or nil),
+				itemLevel = itemLevel,
+				itemLevelText = FormatAverageItemLevel(itemLevel),
+				itemLevelBelowMinimum = itemLevelBelowMinimum,
 				inspectStatus = inspectState and inspectState.status or "ready",
 				inspectLabel = inspectState and inspectState.label or nil,
 				inspectMessage = inspectState and inspectState.message or nil,
@@ -3638,6 +3733,12 @@ function RC:GetCachedEquipmentReadiness(unit, memberId)
 			if lastGood.observation then
 				observation = lastGood.observation
 			else
+				local liveCfg = GetLiveItemLevelConfig()
+				if Policy.ItemLevelRequirementActive and Policy.ItemLevelRequirementActive(liveCfg) then
+					-- A policy result captured without an observation cannot be
+					-- rechecked against the item-level requirement.
+					return unknown
+				end
 				local fromPolicy = ReadinessFromPolicyResult(lastGood.policy)
 				if fromPolicy then
 					return fromPolicy
@@ -3646,7 +3747,14 @@ function RC:GetCachedEquipmentReadiness(unit, memberId)
 		end
 	end
 
-	local readiness = Policy.ReadinessFromObservation(observation)
+	local readiness = Policy.ReadinessFromObservation(observation, GetLiveItemLevelConfig())
 	readiness.tooltip = FormatReadinessTooltip(readiness)
 	return readiness
+end
+
+function RC:NoteEquipmentPolicyConfigChanged()
+	-- Reevaluate already-captured observations. Do not queue inspects.
+	self:EnsureInspectSupport()
+	self:_MarkTroubleshootingDirty()
+	self:_NotifyTroubleshootingListeners(false, "item_level_config")
 end

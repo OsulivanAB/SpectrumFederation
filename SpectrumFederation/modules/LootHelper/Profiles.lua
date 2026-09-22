@@ -43,12 +43,15 @@ local RAID_CHECK_DEFAULTS = {
 	enableWhispersPreRaid = false,
 	enableWhispersRaid = false,
 	enableWhispersRaidPrepared = true,
-	whisperTemplatePreRaidMissing = "Spectrum Federation: You're missing the following enchants/gems: {missing}.",
-	whisperTemplateRaidMissing = "Spectrum Federation: You're missing the following enchants/gems: {missing}. No new {point_name} awarded.",
+	whisperTemplatePreRaidMissing = "Spectrum Federation: You're missing the following requirements: {missing}.",
+	whisperTemplateRaidMissing = "Spectrum Federation: You're missing the following requirements: {missing}. No new {point_name} awarded.",
 	whisperTemplateRaidPrepared = "Spectrum Federation: You've been awarded {points_awarded} {point_name}. Thanks for showing up prepared and on time!",
 	pointsAwardPerRaidCheck = 0.5,
 	checkGemsInSockets = true,
 	requireMetaGem = false,
+	requireMinimumItemLevel = false,
+	minimumItemLevel = nil,
+	itemLevelWhisperDefaultsApplied = true,
 	slots = RAID_CHECK_SLOT_DEFAULTS,
 }
 
@@ -273,6 +276,32 @@ local function NormalizeCopper(value)
 	return math.floor(NormalizeNonNegativeNumber(value, 0))
 end
 
+local function NormalizeMinimumItemLevel(value)
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if Policy and Policy.NormalizeMinimumItemLevel then
+		return Policy.NormalizeMinimumItemLevel(value)
+	end
+	local amount = tonumber(value)
+	if not amount then
+		return nil
+	end
+	if amount < 0 then
+		amount = 0
+	end
+	amount = math.floor(amount + 0.5)
+	if amount > 99999 then
+		amount = 99999
+	end
+	return amount
+end
+
+local function NoteItemLevelPolicyChanged()
+	local raidCheck = SF.RaidCheck
+	if raidCheck and raidCheck.NoteEquipmentPolicyConfigChanged then
+		raidCheck:NoteEquipmentPolicyConfigChanged()
+	end
+end
+
 local function NormalizeRaidCheckPointsAward(value)
 	local amount = tonumber(value)
 	if amount == nil then
@@ -295,6 +324,9 @@ local function CopyRaidCheckDefaults()
 		pointsAwardPerRaidCheck = RAID_CHECK_DEFAULTS.pointsAwardPerRaidCheck,
 		checkGemsInSockets = RAID_CHECK_DEFAULTS.checkGemsInSockets,
 		requireMetaGem = RAID_CHECK_DEFAULTS.requireMetaGem,
+		requireMinimumItemLevel = RAID_CHECK_DEFAULTS.requireMinimumItemLevel,
+		minimumItemLevel = RAID_CHECK_DEFAULTS.minimumItemLevel,
+		itemLevelWhisperDefaultsApplied = RAID_CHECK_DEFAULTS.itemLevelWhisperDefaultsApplied,
 		slots = CopyTableShallow(RAID_CHECK_DEFAULTS.slots),
 	}
 end
@@ -346,6 +378,21 @@ function LootProfile:_EnsureRaidCheckConfig()
 	cfg.pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(cfg.pointsAwardPerRaidCheck)
 	cfg.checkGemsInSockets = cfg.checkGemsInSockets ~= false
 	cfg.requireMetaGem = cfg.requireMetaGem and true or false
+	cfg.requireMinimumItemLevel = cfg.requireMinimumItemLevel and true or false
+	cfg.minimumItemLevel = NormalizeMinimumItemLevel(cfg.minimumItemLevel)
+	if not cfg.itemLevelWhisperDefaultsApplied then
+		local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+		local isLegacy = Policy and Policy.IsLegacyEnchantGemWhisper
+		if isLegacy then
+			if isLegacy(cfg.whisperTemplatePreRaidMissing, "pre") then
+				cfg.whisperTemplatePreRaidMissing = RAID_CHECK_DEFAULTS.whisperTemplatePreRaidMissing
+			end
+			if isLegacy(cfg.whisperTemplateRaidMissing, "raid") then
+				cfg.whisperTemplateRaidMissing = RAID_CHECK_DEFAULTS.whisperTemplateRaidMissing
+			end
+			cfg.itemLevelWhisperDefaultsApplied = true
+		end
+	end
 end
 
 function LootProfile:_EnsureRewardPotConfig()
@@ -1585,6 +1632,9 @@ function LootProfile:GetRaidCheckConfig()
 		pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(self._raidCheckConfig.pointsAwardPerRaidCheck),
 		checkGemsInSockets = self._raidCheckConfig.checkGemsInSockets ~= false,
 		requireMetaGem = self._raidCheckConfig.requireMetaGem and true or false,
+		requireMinimumItemLevel = self._raidCheckConfig.requireMinimumItemLevel and true or false,
+		minimumItemLevel = NormalizeMinimumItemLevel(self._raidCheckConfig.minimumItemLevel),
+		itemLevelWhisperDefaultsApplied = self._raidCheckConfig.itemLevelWhisperDefaultsApplied and true or false,
 		slots = CopyTableShallow(self._raidCheckConfig.slots),
 	}
 end
@@ -1792,6 +1842,44 @@ function LootProfile:SetRaidCheckMetaGemRequired(enabled)
 
     self._raidCheckConfig.requireMetaGem = enabled and true or false
     return true, nil
+end
+
+function LootProfile:SetRaidCheckMinimumItemLevelRequired(enabled)
+	self:_EnsureRaidCheckConfig()
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
+		return false, "You must be an admin to change Raid Check settings."
+	end
+
+	local nextValue = enabled and true or false
+	if self._raidCheckConfig.requireMinimumItemLevel == nextValue then
+		return true, nil
+	end
+
+	self._raidCheckConfig.requireMinimumItemLevel = nextValue
+	if SF.Debug then
+		SF.Debug:Info("LootProfile", "Minimum item level requirement %s", nextValue and "enabled" or "disabled")
+	end
+	NoteItemLevelPolicyChanged()
+	return true, nil
+end
+
+function LootProfile:SetRaidCheckMinimumItemLevel(amount)
+	self:_EnsureRaidCheckConfig()
+	if not CurrentUserHasEffectiveLocalAdmin(self) then
+		return false, "You must be an admin to change Raid Check settings."
+	end
+
+	local nextValue = NormalizeMinimumItemLevel(amount)
+	if self._raidCheckConfig.minimumItemLevel == nextValue then
+		return true, nil
+	end
+
+	self._raidCheckConfig.minimumItemLevel = nextValue
+	if SF.Debug then
+		SF.Debug:Info("LootProfile", "Minimum item level set to %s", tostring(nextValue))
+	end
+	NoteItemLevelPolicyChanged()
+	return true, nil
 end
 
 local function CopyRCLootCouncilIntegrationConfig(cfg)
@@ -3876,7 +3964,14 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	end
 
 	-- Import raid check settings (if provided)
-	if type(snapshot.raidCheck) == "table" then
+	local previousItemLevelRequired = false
+	local previousMinimumItemLevel = nil
+	if type(self._raidCheckConfig) == "table" then
+		previousItemLevelRequired = self._raidCheckConfig.requireMinimumItemLevel and true or false
+		previousMinimumItemLevel = NormalizeMinimumItemLevel(self._raidCheckConfig.minimumItemLevel)
+	end
+	local importedRaidCheck = type(snapshot.raidCheck) == "table"
+	if importedRaidCheck then
 		self._raidCheckConfig = CopyRaidCheckDefaults()
 
 		if snapshot.raidCheck.enableWhispersPreRaid ~= nil then
@@ -3906,6 +4001,18 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		if snapshot.raidCheck.requireMetaGem ~= nil then
 			self._raidCheckConfig.requireMetaGem = snapshot.raidCheck.requireMetaGem and true or false
 		end
+		if snapshot.raidCheck.requireMinimumItemLevel ~= nil then
+			self._raidCheckConfig.requireMinimumItemLevel = snapshot.raidCheck.requireMinimumItemLevel and true or false
+		end
+		if snapshot.raidCheck.minimumItemLevel ~= nil then
+			self._raidCheckConfig.minimumItemLevel = NormalizeMinimumItemLevel(snapshot.raidCheck.minimumItemLevel)
+		end
+		if snapshot.raidCheck.itemLevelWhisperDefaultsApplied == nil then
+			-- Older snapshots have not been through the default-whisper upgrade.
+			self._raidCheckConfig.itemLevelWhisperDefaultsApplied = nil
+		else
+			self._raidCheckConfig.itemLevelWhisperDefaultsApplied = snapshot.raidCheck.itemLevelWhisperDefaultsApplied and true or false
+		end
 		if type(snapshot.raidCheck.slots) == "table" then
 			for slotKey, enabled in pairs(snapshot.raidCheck.slots) do
 				local normalizedSlotKey = NormalizeSlotKey(slotKey)
@@ -3917,6 +4024,13 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	end
 
 	self:_EnsureRaidCheckConfig()
+	if importedRaidCheck then
+		local nextRequired = self._raidCheckConfig.requireMinimumItemLevel and true or false
+		local nextMinimum = self._raidCheckConfig.minimumItemLevel
+		if nextRequired ~= previousItemLevelRequired or nextMinimum ~= previousMinimumItemLevel then
+			NoteItemLevelPolicyChanged()
+		end
+	end
 	self:_EnsureRewardPotConfig()
 	self:_EnsureRCLootCouncilIntegrationConfig()
 
