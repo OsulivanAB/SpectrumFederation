@@ -1,4 +1,5 @@
--- Current-Retail Raid Equipment policy. Addon-owned; not profile-configured.
+-- Current-Retail Raid Equipment policy.
+-- Enchant and gem rules are addon-owned. Minimum item level is the profile-configured exception.
 -- luacheck: globals GetItemInfoInstant C_Item
 
 local _, SF = ...
@@ -67,6 +68,108 @@ Policy.LIMITED_GEM = {
 		[240983] = true, -- Indecipherable Eversong Diamond (quality variant)
 	},
 }
+
+-- Whole-number raid thresholds. Wide enough that a later season does not overflow the setting.
+local MIN_ITEM_LEVEL = 0
+local MAX_ITEM_LEVEL = 99999
+
+local LEGACY_ENCHANT_GEM_PRE = "Spectrum Federation: You're missing the following enchants/gems: {missing}."
+local LEGACY_ENCHANT_GEM_RAID = "Spectrum Federation: You're missing the following enchants/gems: {missing}. No new {point_name} awarded."
+
+-- One decimal matches the character sheet. Comparison and display both use this
+-- value so a rounded label cannot disagree with Prepared/Unprepared.
+function Policy.CanonicalOverallItemLevel(value)
+	local number = tonumber(value)
+	if not number or number <= 0 then
+		return nil
+	end
+	local scaled = number * 10
+	local rounded
+	if scaled >= 0 then
+		rounded = math.floor(scaled + 0.5)
+	else
+		rounded = math.ceil(scaled - 0.5)
+	end
+	return rounded / 10
+end
+
+-- A later inspect can return gear while GetInspectItemLevel is still missing.
+-- Keep the last known Blizzard overall value in that case. A new positive
+-- reading replaces it. Zero is not a usable item level.
+function Policy.KeepKnownOverallItemLevel(nextValue, previousValue)
+	local nextCanonical = Policy.CanonicalOverallItemLevel(nextValue)
+	if nextCanonical then
+		return nextCanonical
+	end
+	return Policy.CanonicalOverallItemLevel(previousValue)
+end
+
+function Policy.FormatOverallItemLevel(value)
+	local canonical = Policy.CanonicalOverallItemLevel(value)
+	if not canonical then
+		return nil
+	end
+	local nearest = math.floor(canonical + 0.5)
+	if math.abs(canonical - nearest) < 0.001 then
+		return tostring(nearest)
+	end
+	return string.format("%.1f", canonical)
+end
+
+function Policy.NormalizeMinimumItemLevel(value)
+	local number = tonumber(value)
+	if not number then
+		return nil
+	end
+	if number < MIN_ITEM_LEVEL then
+		number = MIN_ITEM_LEVEL
+	end
+	number = math.floor(number + 0.5)
+	if number > MAX_ITEM_LEVEL then
+		number = MAX_ITEM_LEVEL
+	end
+	return number
+end
+
+function Policy.ItemLevelRequirementActive(config)
+	if type(config) ~= "table" or config.requireMinimumItemLevel ~= true then
+		return false
+	end
+	return Policy.NormalizeMinimumItemLevel(config.minimumItemLevel) ~= nil
+end
+
+function Policy.ItemLevelFailureText(itemLevel, minimum)
+	local shown = Policy.FormatOverallItemLevel(itemLevel)
+	local required = Policy.NormalizeMinimumItemLevel(minimum)
+	if not shown or required == nil then
+		return nil
+	end
+	return string.format("Item Level %s (%d required)", shown, required)
+end
+
+-- Live Raid Equipment warning. Unknown values and a disabled requirement do not warn.
+function Policy.ShouldWarnItemLevel(itemLevel, config)
+	if not Policy.ItemLevelRequirementActive(config) then
+		return false
+	end
+	local canonical = Policy.CanonicalOverallItemLevel(itemLevel)
+	if not canonical then
+		return false
+	end
+	local minimum = Policy.NormalizeMinimumItemLevel(config.minimumItemLevel)
+	return canonical < minimum
+end
+
+-- Previous default whispers named only enchants/gems. Exact matches are defaults, not customizations.
+function Policy.IsLegacyEnchantGemWhisper(template, kind)
+	if kind == "pre" then
+		return template == LEGACY_ENCHANT_GEM_PRE
+	end
+	if kind == "raid" then
+		return template == LEGACY_ENCHANT_GEM_RAID
+	end
+	return false
+end
 
 local WEAPON_EQUIP_LOCS = {
 	INVTYPE_WEAPON = true,
@@ -275,7 +378,7 @@ local function CountSocketsAndLimitedGems(slot)
 	return total, filled, limited, nil
 end
 
-function Policy.EvaluateObservation(observation)
+function Policy.EvaluateObservation(observation, config)
 	local result = {
 		complete = false,
 		incompleteReason = nil,
@@ -372,13 +475,28 @@ function Policy.EvaluateObservation(observation)
 		table.insert(result.missing, "Limited Gem")
 	end
 
+	-- Item level is optional profile configuration. A known low value is one more
+	-- missing requirement. An unknown value makes the observation incomplete
+	-- instead of Unprepared, and only when the requirement is actually active.
+	if Policy.ItemLevelRequirementActive(config) then
+		local canonical = Policy.CanonicalOverallItemLevel(observation.overallEquippedItemLevel)
+		if not canonical then
+			result.incompleteReason = "unresolved_item_level"
+			return result
+		end
+		local minimum = Policy.NormalizeMinimumItemLevel(config.minimumItemLevel)
+		if canonical < minimum then
+			table.insert(result.missing, Policy.ItemLevelFailureText(canonical, minimum))
+		end
+	end
+
 	result.complete = true
 	result.prepared = #result.missing == 0
 	return result
 end
 
-function Policy.EvaluateCompleteness(observation)
-	local result = Policy.EvaluateObservation(observation)
+function Policy.EvaluateCompleteness(observation, config)
+	local result = Policy.EvaluateObservation(observation, config)
 	return {
 		complete = result.complete == true,
 		reason = result.incompleteReason,
@@ -387,7 +505,7 @@ end
 
 -- Map a Policy observation to the Raid Equipment glance readiness states.
 -- Incomplete or missing observations stay Unknown; range/presence is not a Policy concern.
-function Policy.ReadinessFromObservation(observation)
+function Policy.ReadinessFromObservation(observation, config)
 	if type(observation) ~= "table" then
 		return {
 			state = "unknown",
@@ -395,7 +513,7 @@ function Policy.ReadinessFromObservation(observation)
 			incompleteReason = "missing_observation",
 		}
 	end
-	local result = Policy.EvaluateObservation(observation)
+	local result = Policy.EvaluateObservation(observation, config)
 	if not result.complete then
 		return {
 			state = "unknown",

@@ -1254,3 +1254,114 @@ function Sync:HandleRCConfigSet(sender, payload)
         SF.Debug:Verbose("SYNC", "Applied RC_CONFIG_SET seq=%s from %s", tostring(seq), tostring(sender))
     end
 end
+
+local function ItemLevelPolicyFromPayload(payload)
+    if type(payload) ~= "table" or payload.requireMinimumItemLevel == nil then
+        return nil
+    end
+    return {
+        requireMinimumItemLevel = payload.requireMinimumItemLevel and true or false,
+        minimumItemLevel = payload.minimumItemLevel,
+    }
+end
+
+-- Coordinator accepts an authorized admin's minimum item level and broadcasts it.
+function Sync:HandleRaidCheckItemLevelRequest(sender, payload)
+    if not (self.state and self.state.active and self.state.isCoordinator) then
+        return
+    end
+    if type(payload) ~= "table" then
+        return
+    end
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then
+        return
+    end
+    if self.IsRequesterInGroup and not self:IsRequesterInGroup(sender) then
+        return
+    end
+    if not self:IsSenderAuthorized(self.state.profileId, sender) then
+        return
+    end
+    local policy = ItemLevelPolicyFromPayload(payload)
+    if not policy then
+        return
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if not profile or not profile.ApplyRaidCheckItemLevelPolicy then
+        return
+    end
+    local applied = profile:ApplyRaidCheckItemLevelPolicy(
+        policy.requireMinimumItemLevel,
+        policy.minimumItemLevel,
+        { skipPermission = true }
+    )
+    if not applied then
+        return
+    end
+    if self.PublishRaidCheckItemLevelPolicy then
+        self:PublishRaidCheckItemLevelPolicy(self.state.profileId)
+    end
+end
+
+-- Session members apply a coordinator-authored minimum item level.
+-- An older (coordEpoch, seq) is ignored so a late message cannot rewind it.
+function Sync:HandleRaidCheckItemLevelSet(sender, payload)
+    if not (self.state and self.state.active) then
+        return
+    end
+    if type(payload) ~= "table" then
+        return
+    end
+    local ok = self:ValidateSessionPayload(payload)
+    if not ok then
+        return
+    end
+    if type(self.state.coordinator) ~= "string" or self.state.coordinator == "" then
+        return
+    end
+    if not self:_SamePlayer(sender, self.state.coordinator) then
+        return
+    end
+    if not self:IsControlMessageAllowed(payload, sender) then
+        return
+    end
+    local me = self._SelfId and self:_SelfId() or nil
+    if me and self:_SamePlayer(sender, me) then
+        return
+    end
+    local seq = tonumber(payload.seq)
+    if not seq then
+        return
+    end
+    seq = math.floor(seq)
+    local incomingEpoch = tonumber(payload.coordEpoch) or 0
+    local policy = ItemLevelPolicyFromPayload(payload)
+    if not policy then
+        return
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if not profile or not profile.ApplyRaidCheckItemLevelPolicy then
+        return
+    end
+    local LootProfile = SF.LootProfile
+    local localSeq = tonumber(profile._itemLevelPolicySeq) or 0
+    local localEpoch = tonumber(profile._itemLevelPolicyEpoch) or 0
+    if LootProfile and LootProfile.IsOlderRCConfigGeneration
+        and LootProfile.IsOlderRCConfigGeneration(incomingEpoch, seq, localEpoch, localSeq) then
+        return
+    end
+    local applied = profile:ApplyRaidCheckItemLevelPolicy(
+        policy.requireMinimumItemLevel,
+        policy.minimumItemLevel,
+        { skipPermission = true }
+    )
+    if not applied then
+        return
+    end
+    profile._itemLevelPolicySeq = seq
+    profile._itemLevelPolicyEpoch = incomingEpoch
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Applied RAID_CHECK_ILVL_SET seq=%s from %s", tostring(seq), tostring(sender))
+    end
+end

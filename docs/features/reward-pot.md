@@ -10,7 +10,7 @@ The Loot Helper window title shows **Attendance**. The Points column is hidden s
 
 Profile admins can raise or lower Attendance points one at a time from that Character page. Decreasing Attendance points at zero does nothing. Attendance points never go below zero. They are not the roster Att.% column.
 
-**Raid Check** awards `1` Attendance to each prepared profile member who is in the raid. **Pre-Raid Check** never changes Attendance.
+**Raid Check** awards `1` Attendance to each prepared profile member who is in the raid. A player below an enabled minimum item level is Unprepared and does not receive that award. Presence (Att.%) still credits them for being in the raid. **Pre-Raid Check** never changes Attendance.
 
 ## The pot
 

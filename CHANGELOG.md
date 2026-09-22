@@ -2,6 +2,16 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.4-beta.2] - 2026-09-22
+
+### Added
+- Add optional minimum item level to Raid Check
+
+## [1.5.4-beta.1] - 2026-09-22
+
+### Changed
+- Keep Mouse Tracer aligned after display size changes
+
 ## [1.5.3] - 2026-09-22
 
 ### Added

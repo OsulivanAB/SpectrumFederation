@@ -69,12 +69,13 @@ Invalidate the sampling baseline, and do not emit a segment from stale coordinat
 - initial enable;
 - `PLAYER_ENTERING_WORLD`;
 - UI scale changes;
+- display-size changes (`DISPLAY_SIZE_CHANGED`), including windowed resizes and window-mode changes that do not also emit `UI_SCALE_CHANGED`;
 - mouselook transitions;
 - teleport or other discontinuity resets.
 
 The first valid cursor sample after a reset establishes position only. Rejected small movements must keep the last **accepted** trail point as the spacing baseline. Do not slide that baseline on every rejected sample.
 
-`PLAYER_ENTERING_WORLD` and `UI_SCALE_CHANGED` also clear the visible trail. Scale changes recache `GetEffectiveScale()` before the next sample.
+`PLAYER_ENTERING_WORLD`, `UI_SCALE_CHANGED`, and `DISPLAY_SIZE_CHANGED` refresh `GetEffectiveScale()` and clear a live trail before the next sample. A burst of those events, such as a window resize drag, clears the stamp pool and segment arrays once. Later events in that burst do not rewrite those pools. While Mouse Tracer is disabled, the same events only refresh the cached scale. The events also schedule one coalesced next-frame scale read. The value observed inside the event can still be the pre-change scale, which is the failure behind a trail that keeps following the cursor from the wrong origin after a windowed alt-tab until `/reload`. The next-frame read clears a live trail again only when the committed scale differs, so a stroke already started in the new coordinate space is kept. The sample hot path does not call `GetEffectiveScale()`.
 
 Cursor coordinates come from `GetCursorPosition()` divided by the host's effective scale. `GetScaledCursorPosition` is not used.
 
