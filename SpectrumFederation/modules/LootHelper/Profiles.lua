@@ -4001,11 +4001,17 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		if snapshot.raidCheck.requireMetaGem ~= nil then
 			self._raidCheckConfig.requireMetaGem = snapshot.raidCheck.requireMetaGem and true or false
 		end
+		-- A snapshot that includes the enabled flag understands this policy.
+		-- Apply that flag and threshold together, including an explicit clear.
+		-- Older clients omit the flag. Keep the local policy so their snapshot
+		-- does not disable a minimum this client already has, and do not invent
+		-- one when this client has none.
 		if snapshot.raidCheck.requireMinimumItemLevel ~= nil then
 			self._raidCheckConfig.requireMinimumItemLevel = snapshot.raidCheck.requireMinimumItemLevel and true or false
-		end
-		if snapshot.raidCheck.minimumItemLevel ~= nil then
 			self._raidCheckConfig.minimumItemLevel = NormalizeMinimumItemLevel(snapshot.raidCheck.minimumItemLevel)
+		else
+			self._raidCheckConfig.requireMinimumItemLevel = previousItemLevelRequired
+			self._raidCheckConfig.minimumItemLevel = previousMinimumItemLevel
 		end
 		if snapshot.raidCheck.itemLevelWhisperDefaultsApplied == nil then
 			-- Older snapshots have not been through the default-whisper upgrade.

@@ -180,10 +180,32 @@ legacy.raidCheck.whisperTemplatePreRaidMissing = "Spectrum Federation: You're mi
 legacy.raidCheck.whisperTemplateRaidMissing = "Custom {missing} template"
 assertTrue(profile:ImportSnapshot(legacy) ~= false, "older snapshot import succeeds")
 local olderCfg = profile:GetRaidCheckConfig()
-assertEq(olderCfg.requireMinimumItemLevel, false, "older snapshot without the fields stays disabled")
-assertEq(olderCfg.minimumItemLevel, nil, "older snapshot does not invent a threshold")
+assertEq(olderCfg.requireMinimumItemLevel, true, "older snapshot keeps a minimum this client already configured")
+assertEq(olderCfg.minimumItemLevel, 640, "older snapshot keeps the configured threshold")
 assertEq(olderCfg.whisperTemplatePreRaidMissing, "Spectrum Federation: You're missing the following requirements: {missing}.", "unmodified default whisper is upgraded")
 assertEq(olderCfg.whisperTemplateRaidMissing, "Custom {missing} template", "custom whisper template is preserved")
+
+local blank = SF.LootProfile.new("Blank")
+local blankSnapshot = blank:ExportSnapshot()
+blankSnapshot.raidCheck.requireMinimumItemLevel = nil
+blankSnapshot.raidCheck.minimumItemLevel = nil
+assertTrue(blank:ImportSnapshot(blankSnapshot) ~= false, "legacy snapshot imports into a profile with no minimum")
+assertEq(blank:GetRaidCheckConfig().requireMinimumItemLevel, false, "legacy snapshot does not enable a requirement")
+assertEq(blank:GetRaidCheckConfig().minimumItemLevel, nil, "legacy snapshot does not invent a threshold")
+
+local cleared = profile:ExportSnapshot()
+cleared.raidCheck.requireMinimumItemLevel = true
+cleared.raidCheck.minimumItemLevel = nil
+assertTrue(profile:ImportSnapshot(cleared) ~= false, "explicit clear imports")
+assertEq(profile:GetRaidCheckConfig().requireMinimumItemLevel, true, "explicit enabled flag still imports")
+assertEq(profile:GetRaidCheckConfig().minimumItemLevel, nil, "a snapshot that knows the field can clear the threshold")
+
+local disabled = profile:ExportSnapshot()
+disabled.raidCheck.requireMinimumItemLevel = false
+disabled.raidCheck.minimumItemLevel = 650
+assertTrue(profile:ImportSnapshot(disabled) ~= false, "explicit disable imports")
+assertEq(profile:GetRaidCheckConfig().requireMinimumItemLevel, false, "explicit false disables the requirement")
+assertEq(profile:GetRaidCheckConfig().minimumItemLevel, 650, "an included threshold still imports with the flag")
 
 local corrupt = profile:ExportSnapshot()
 corrupt.raidCheck.minimumItemLevel = "banana"
