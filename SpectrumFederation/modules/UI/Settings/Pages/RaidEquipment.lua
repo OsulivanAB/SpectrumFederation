@@ -8,7 +8,7 @@ SF.SettingsUI:RegisterCategory({
 	name = "Raid Equipment",
 	navLabel = "Raid Equipment",
 	group = "Loot Tools",
-	description = "Inspect current group equipment against current-Retail enchant and gem rules.",
+	description = "Inspect current group equipment against current-Retail enchant, gem, and item-level rules.",
 	order = 18,
 })
 
@@ -108,6 +108,58 @@ local function SetOverlayToVisibleIconArea(texture, parent)
 	texture:SetAllPoints(parent)
 end
 
+local function EnsureItemLevelPulse(fontString)
+	if fontString.__sfItemLevelPulse then
+		return fontString.__sfItemLevelPulse
+	end
+	if not fontString.CreateAnimationGroup then
+		return nil
+	end
+
+	local pulse = fontString:CreateAnimationGroup()
+	pulse:SetLooping("REPEAT")
+
+	local fadeOut = pulse:CreateAnimation("Alpha")
+	fadeOut:SetOrder(1)
+	fadeOut:SetFromAlpha(1)
+	fadeOut:SetToAlpha(AUDIT_MISSING_OVERLAY_MIN_ALPHA)
+	fadeOut:SetDuration(AUDIT_PULSE_DURATION_SECONDS)
+
+	local fadeIn = pulse:CreateAnimation("Alpha")
+	fadeIn:SetOrder(2)
+	fadeIn:SetFromAlpha(AUDIT_MISSING_OVERLAY_MIN_ALPHA)
+	fadeIn:SetToAlpha(1)
+	fadeIn:SetDuration(AUDIT_PULSE_DURATION_SECONDS)
+
+	fontString.__sfItemLevelPulse = pulse
+	return pulse
+end
+
+local function SetAuditItemLevelPulse(fontString, enabled)
+	if not fontString then
+		return
+	end
+	local pulse = EnsureItemLevelPulse(fontString)
+	if not pulse then
+		return
+	end
+	if enabled then
+		if fontString.SetAlpha then
+			fontString:SetAlpha(1)
+		end
+		if not pulse:IsPlaying() then
+			pulse:Play()
+		end
+		return
+	end
+	if pulse:IsPlaying() then
+		pulse:Stop()
+	end
+	if fontString.SetAlpha then
+		fontString:SetAlpha(1)
+	end
+end
+
 local function SetAuditMissingOverlay(texture, enabled)
 	local pulse = EnsureAuditPulse(texture)
 	if enabled then
@@ -173,6 +225,7 @@ local function BuildAuditRowSignature(rowData)
 		tostring(rowData.id or rowData.name or "?"),
 		tostring(rowData.displayName or rowData.name or "?"),
 		tostring(rowData.itemLevelText or "--"),
+		rowData.itemLevelBelowMinimum and "il1" or "il0",
 		tostring(rowData.inspectStatus or "ready"),
 		tostring(rowData.inspectLabel or ""),
 		tostring(rowData.inspectMessage or ""),
@@ -515,7 +568,7 @@ local function BuildEquipmentPage(panel)
 
 	local tableSection = pageBuilder:AddSection({
 		title = "Current Group Equipment",
-		tooltip = "Shows the last seen gear in each slot for every visible raid member. Slots pulse red when gear, required enchants, or gems are missing.",
+		tooltip = "Shows the last seen gear in each slot for every visible raid member. Slots pulse red when gear, required enchants, or gems are missing. The iLvl value pulses red when it is known and below the active profile's minimum item level.",
 	})
 	tableSection.__sfFillHeight = true
 
@@ -699,11 +752,15 @@ local function BuildEquipmentPage(panel)
 		local function UpdateAuditRowData(dataRow, rowData)
 			dataRow.Name:SetText(FormatAuditRowName(rowData))
 			dataRow.ItemLevel:SetText(rowData.itemLevelText or "--")
-			if rowData.itemLevelText then
+			local belowMinimum = rowData.itemLevelBelowMinimum and true or false
+			if belowMinimum then
+				dataRow.ItemLevel:SetTextColor(1, 0.2, 0.2, 1)
+			elseif rowData.itemLevelText then
 				dataRow.ItemLevel:SetTextColor(1, 0.82, 0.2, 1)
 			else
 				dataRow.ItemLevel:SetTextColor(0.65, 0.65, 0.65, 1)
-		end
+			end
+			SetAuditItemLevelPulse(dataRow.ItemLevel, belowMinimum)
 
 		local knownCount = 0
 		local issueCount = 0

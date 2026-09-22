@@ -50,7 +50,7 @@ WoW throttles inspection and requires other players to be nearby and inspectable
 - Wait for item links and inspection data to populate.
 - Rerun the check after pending statuses resolve.
 
-Incomplete inspects are **Inspection Failed**, not Unprepared. Move closer, refresh the snapshot, then rerun the check.
+Incomplete inspects are **Inspection Failed**, not Unprepared. A missing item level is incomplete only when the profile requires a minimum, and it is not the same as being below that minimum. Move closer, refresh the snapshot, then rerun the check.
 
 ## `/sf version` shows a red X for someone who has the addon
 

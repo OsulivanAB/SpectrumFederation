@@ -212,7 +212,7 @@ local function productionFixture()
         name = "Raid Equipment",
         navLabel = "Raid Equipment",
         group = "Loot Tools",
-        description = "Inspect current group equipment against current-Retail enchant and gem rules.",
+        description = "Inspect current group equipment against current-Retail enchant, gem, and item-level rules.",
         order = 18,
         enabled = true,
         enablementResolved = true,

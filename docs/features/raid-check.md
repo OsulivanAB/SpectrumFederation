@@ -1,8 +1,8 @@
 # Raid Check
 
-Raid Check inspects profile members who are currently in the group against **addon-owned current-Retail** enchant and gem rules, then optionally whispers results and awards loot points or Attendance.
+Raid Check inspects profile members who are currently in the group against **addon-owned current-Retail** enchant and gem rules, plus an optional profile minimum item level, then whispers results and awards loot points or Attendance.
 
-Only an admin of the selected loot profile can run a check. Equipment rules are not configured per profile. Preview as Non-Admin uses the same local non-admin restriction: a check cannot be started while the preview is on. If a run is already in flight when the preview is enabled, its awards, Reward Pot changes, logs, and admin whispers are aborted as a unit and are not replayed after the preview ends.
+Only an admin of the selected loot profile can run a check. Enchant and gem rules are not configured per profile. Minimum item level is. Preview as Non-Admin uses the same local non-admin restriction: a check cannot be started while the preview is on. If a run is already in flight when the preview is enabled, its awards, Reward Pot changes, logs, and admin whispers are aborted as a unit and are not replayed after the preview ends.
 
 ## Where to look
 
@@ -19,13 +19,16 @@ Prepared means a complete inspect of current gear found:
 - an Off Hand enchant only when that item is an actual weapon (`INVTYPE_WEAPON`, `INVTYPE_WEAPONOFFHAND`, or `INVTYPE_WEAPONMAINHAND`);
 - no weapon enchant required for shields, held-in-offhand items, relics, or other non-weapon offhands;
 - every socket filled;
-- if the player has one or more usable sockets, exactly one current-expansion limited gem (Midnight Eversong Diamond family). Zero sockets requires zero limited gems.
+- if the player has one or more usable sockets, exactly one current-expansion limited gem (Midnight Eversong Diamond family). Zero sockets requires zero limited gems;
+- when the active profile has **Require Minimum Item Level** enabled, an overall equipped item level greater than or equal to that whole-number minimum. A player exactly at the minimum passes.
 
-A real empty slot is not the same as unresolved equipment. Missing item links, unresolved offhand type, or an unidentified limited gem make the observation **incomplete**. Incomplete inspects are **Inspection Failed**, not Unprepared.
+The item level is Blizzard's overall equipped value: `C_PaperDollInfo.GetAverageItemLevel` for the local player and `C_PaperDollInfo.GetInspectItemLevel` for inspected players. Spectrum does not average the tracked slots itself. The requirement is off by default, including for existing profiles and older snapshots that do not contain the fields.
+
+A real empty slot is not the same as unresolved equipment. Missing item links, unresolved offhand type, an unidentified limited gem, or a missing item level while the requirement is enabled make the observation **incomplete**. Incomplete inspects are **Inspection Failed**, not Unprepared. A missing item level is never treated as zero or as a failed requirement.
 
 ## Raid Equipment page
 
-Open **Raid Equipment** to review the current group. The page shows each visible member, average item level, last known item in each tracked slot, and pulsing indicators for missing items, required enchants, empty sockets, or a missing limited gem.
+Open **Raid Equipment** to review the current group. The page works with no loot profile and no Loot Helper session. It shows each visible member, Blizzard's overall equipped item level, the last known item in each tracked slot, and pulsing indicators for missing items, required enchants, empty sockets, or a missing limited gem. When an active profile has a minimum item level and the player's known item level is below it, the iLvl value itself pulses red. The rest of the row does not. With no active profile, or with the requirement disabled, item level is shown with no threshold warning.
 
 **Enable Auto Refresh** is off by default and is stored as `lootHelper.raidCheckAuditAutoRefresh`. It does not require a profile. Use **Refresh Snapshot** for a short manual inspect pass. Background inspection runs only while this page is open and auto refresh or a manual refresh window is active.
 
@@ -52,8 +55,10 @@ If the check starts in combat, targets and the selected profile still freeze, th
 
 At run start the addon freezes:
 
-- the selected profile and its consequence settings;
+- the selected profile and its consequence settings, including whether minimum item level is required and the configured minimum;
 - the target set = that profile's members who are currently in the group.
+
+A settings change during the run does not reclassify players against a new threshold. The next run uses the updated profile. Changing the minimum reevaluates cached observations and does not start a new raid-wide inspect when those observations are still authoritative.
 
 Someone who joins after freeze is ignored. Someone who leaves stays in the run and is classified from accumulated inspect evidence. Changing the selected profile mid-run does not redirect the check.
 
@@ -84,7 +89,7 @@ A later out-of-range state does not rewrite Inspection Failed into Unprepared.
 
 Whispers are disabled by default and are configured on **Loot Helper → Session**. They do not control the admin system-message summary.
 
-Templates support `{player_name}`, `{missing}`, `{point_name}`, and `{points_awarded}`. Missing-requirement whispers are suppressed for the same check type on the same calendar day. Inspection Failed does not send a missing-gear whisper.
+Templates support `{player_name}`, `{missing}`, `{point_name}`, and `{points_awarded}`. `{missing}` is the shared list of failed requirements, including item level when that requirement fails. Default missing-result templates refer to requirements rather than only enchants and gems. A template an admin already customized is left unchanged. Missing-requirement whispers are suppressed for the same check type on the same calendar day. Inspection Failed does not send a missing-gear whisper.
 
 ## What gets recorded
 

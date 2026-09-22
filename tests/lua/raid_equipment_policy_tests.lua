@@ -292,6 +292,117 @@ local unknownIncomplete = Policy.ReadinessFromObservation({ slotsByInventory = c
 }) })
 assertEq(unknownIncomplete.state, "unknown", "incomplete observation is Unknown rather than Not Ready")
 
+local function itemLevelConfig(minimum, enabled)
+    return {
+        requireMinimumItemLevel = enabled ~= false,
+        minimumItemLevel = minimum,
+    }
+end
+
+local function observe(slots, itemLevel)
+    local copied = slots
+    for _, slot in pairs(copied) do
+        if type(slot) == "table" then
+            slot.itemLevel = 1
+        end
+    end
+    return {
+        slotsByInventory = copied,
+        overallEquippedItemLevel = itemLevel,
+    }
+end
+
+assertEq(Policy.KeepKnownOverallItemLevel(nil, 642.34), 642.3, "missing inspect item level keeps the last known value")
+assertEq(Policy.KeepKnownOverallItemLevel(0, 650), 650, "API zero does not replace a known item level")
+assertEq(Policy.KeepKnownOverallItemLevel(649.95, 600), 650, "a new reading replaces the cached item level")
+assertEq(Policy.KeepKnownOverallItemLevel(nil, nil), nil, "two missing readings stay unknown")
+assertEq(Policy.KeepKnownOverallItemLevel(nil, 0), nil, "a stored zero is not revived as an item level")
+assertEq(Policy.CanonicalOverallItemLevel(649.94), 649.9, "649.94 canonicalizes to 649.9")
+assertEq(Policy.CanonicalOverallItemLevel(649.95), 650, "649.95 canonicalizes to 650")
+assertEq(Policy.FormatOverallItemLevel(649.94), "649.9", "display uses the same 649.9 canonical value")
+assertEq(Policy.FormatOverallItemLevel(649.95), "650", "display uses the same 650 canonical value")
+assertEq(Policy.CanonicalOverallItemLevel(0), nil, "API zero is not a usable item level")
+assertEq(Policy.CanonicalOverallItemLevel(nil), nil, "missing item level stays nil")
+assertEq(Policy.NormalizeMinimumItemLevel("650"), 650, "numeric strings normalize")
+assertEq(Policy.NormalizeMinimumItemLevel(-4), 0, "negative thresholds clamp to zero")
+assertEq(Policy.NormalizeMinimumItemLevel("nope"), nil, "invalid thresholds become nil")
+assertTrue(not Policy.ItemLevelRequirementActive({ requireMinimumItemLevel = false, minimumItemLevel = 650 }), "disabled requirement is inactive")
+assertTrue(not Policy.ItemLevelRequirementActive({ requireMinimumItemLevel = true }), "enabled requirement without a threshold is inactive")
+
+local below = Policy.EvaluateObservation(observe(completeSlots(), 649.9), itemLevelConfig(650))
+assertTrue(below.complete, "known low item level is a complete observation")
+assertTrue(not below.prepared, "649.9 is Unprepared against 650")
+assertHas(below.missing, "Item Level 649.9 (650 required)", "failure text includes both values")
+
+local exact = Policy.EvaluateObservation(observe(completeSlots(), 650.0), itemLevelConfig(650))
+assertTrue(exact.prepared, "650.0 meets a 650 minimum")
+assertNotHas(exact.missing, "Item Level 650 (650 required)", "equal item level is not a failure")
+
+local above = Policy.EvaluateObservation(observe(completeSlots(), 650.1), itemLevelConfig(650))
+assertTrue(above.prepared, "650.1 meets a 650 minimum")
+
+local roundedPass = Policy.EvaluateObservation(observe(completeSlots(), 649.95), itemLevelConfig(650))
+assertTrue(roundedPass.prepared, "649.95 canonicalizes to 650 and passes")
+local roundedFail = Policy.EvaluateObservation(observe(completeSlots(), 649.94), itemLevelConfig(650))
+assertHas(roundedFail.missing, "Item Level 649.9 (650 required)", "649.94 canonicalizes to 649.9 and fails")
+
+local disabled = Policy.EvaluateObservation(observe(completeSlots(), 100), itemLevelConfig(650, false))
+assertTrue(disabled.prepared, "disabled requirement ignores a stored threshold")
+assertNotHas(disabled.missing, "Item Level 100 (650 required)", "disabled requirement emits no item-level reason")
+
+local unknownLevel = Policy.EvaluateObservation(observe(completeSlots(), nil), itemLevelConfig(650))
+assertTrue(not unknownLevel.complete, "missing item level is incomplete while required")
+assertEq(unknownLevel.incompleteReason, "unresolved_item_level", "missing item level has its own incomplete reason")
+assertNotHas(unknownLevel.missing, "Item Level 0 (650 required)", "missing item level is not invented as zero")
+local unknownReady = Policy.ReadinessFromObservation(observe(completeSlots(), nil), itemLevelConfig(650))
+assertEq(unknownReady.state, "unknown", "missing item level stays Unknown")
+
+local enchantAndLevel = completeSlots({
+    [5] = {
+        empty = false,
+        itemId = 200000,
+        link = "|cffa335ee|Hitem:200000:0:0:0:0:0:0:0:80:::|h[Item]|h|r",
+        texture = "tex",
+        equipLoc = "INVTYPE_CHEST",
+        hasEnchant = false,
+        enchantId = 0,
+        sockets = {},
+        itemLevel = 900,
+    },
+})
+local both = Policy.EvaluateObservation({
+    slotsByInventory = enchantAndLevel,
+    overallEquippedItemLevel = 642.3,
+}, itemLevelConfig(650))
+assertHas(both.missing, "Chest Enchant", "item level does not hide another known failure")
+assertHas(both.missing, "Item Level 642.3 (650 required)", "item level is reported with the other failure")
+
+local highWithEnchant = Policy.EvaluateObservation({
+    slotsByInventory = enchantAndLevel,
+    overallEquippedItemLevel = 680,
+}, itemLevelConfig(650))
+assertHas(highWithEnchant.missing, "Chest Enchant", "meeting item level does not clear a missing enchant")
+assertTrue(not highWithEnchant.prepared, "a missing enchant stays Unprepared")
+
+local ignoredSlots = Policy.EvaluateObservation({
+    slotsByInventory = enchantAndLevel,
+    overallEquippedItemLevel = 680,
+}, itemLevelConfig(650, false))
+assertTrue(not ignoredSlots.prepared, "slot item levels are not an alternate overall item level")
+
+local readyLevel = Policy.ReadinessFromObservation(observe(completeSlots(), 651.2), itemLevelConfig(650))
+assertEq(readyLevel.state, "ready", "readiness is Ready when item level and other rules pass")
+local notReadyLevel = Policy.ReadinessFromObservation(observe(completeSlots(), 642.3), itemLevelConfig(650))
+assertEq(notReadyLevel.state, "not_ready", "readiness is Not Ready for a known low item level")
+assertHas(notReadyLevel.missing, "Item Level 642.3 (650 required)", "readiness tooltip source includes the item-level reason")
+assertTrue(not Policy.ShouldWarnItemLevel(650, itemLevelConfig(650)), "equal item level does not warn")
+assertTrue(Policy.ShouldWarnItemLevel(649.9, itemLevelConfig(650)), "known low item level warns")
+assertTrue(not Policy.ShouldWarnItemLevel(100, itemLevelConfig(650, false)), "disabled requirement does not warn")
+assertTrue(not Policy.ShouldWarnItemLevel(100, nil), "no profile config does not warn")
+assertTrue(not Policy.ShouldWarnItemLevel(nil, itemLevelConfig(650)), "unknown item level does not warn")
+assertTrue(Policy.IsLegacyEnchantGemWhisper("Spectrum Federation: You're missing the following enchants/gems: {missing}.", "pre"), "legacy pre-raid default is recognized")
+assertTrue(not Policy.IsLegacyEnchantGemWhisper("Custom whisper {missing}", "pre"), "custom whispers are not legacy defaults")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

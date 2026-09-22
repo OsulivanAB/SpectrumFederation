@@ -110,6 +110,17 @@ local failedClass = CheckRun.ClassifyPlayer(failed, 10)
 assertEq(failedClass.class, CheckRun.CLASS.INSPECTION_FAILED, "technical failure is Inspection Failed")
 assertTrue(not failedClass.countsForPot, "Inspection Failed is excluded from Reward Pot")
 
+local unresolvedLocal = CheckRun.NewPlayer("L")
+CheckRun.MarkAttempt(unresolvedLocal, "incomplete", true)
+local unresolvedClass = CheckRun.ClassifyPlayer(unresolvedLocal, 10)
+assertEq(unresolvedClass.class, CheckRun.CLASS.INSPECTION_FAILED, "incomplete local capture is Inspection Failed")
+assertTrue(not unresolvedClass.countsForPot, "incomplete local capture does not count for Reward Pot")
+assertTrue(CheckRun.PlayerNeedsMoreInspects(unresolvedLocal), "one incomplete local capture still retries")
+for _ = 2, CheckRun.PER_TARGET_ATTEMPT_CAP do
+    CheckRun.MarkAttempt(unresolvedLocal, "incomplete", true)
+end
+assertTrue(not CheckRun.PlayerNeedsMoreInspects(unresolvedLocal), "local incomplete retries stop at the attempt cap")
+
 failed.currentlyInspectable = false
 failed.rangeOnlyFailure = true
 local failedLaterOor = CheckRun.ClassifyPlayer(failed, 50, {
@@ -129,6 +140,22 @@ local recent = CheckRun.ClassifyPlayer(rangeOnly, 50, {
 })
 assertEq(recent.class, CheckRun.CLASS.PREPARED, "120s range-only recent-good fallback")
 assertEq(recent.verified, CheckRun.VERIFIED.RECENT, "recent-good is Recently Verified")
+
+local lowLevel = CheckRun.ClassifyPlayer(rangeOnly, 50, {
+    complete = true,
+    capturedAt = 10,
+    policy = { prepared = false, missing = { "Item Level 642.3 (650 required)" } },
+})
+assertEq(lowLevel.class, CheckRun.CLASS.UNPREPARED, "recent-good below item level is Unprepared")
+assertEq(lowLevel.missing[1], "Item Level 642.3 (650 required)", "item-level reason is preserved")
+assertTrue(lowLevel.countsForPot, "known low item level counts for Reward Pot")
+
+local oorOnly = CheckRun.NewPlayer("E2")
+oorOnly.rangeOnlyFailure = true
+oorOnly.currentlyInspectable = false
+local oorClass = CheckRun.ClassifyPlayer(oorOnly, 50, nil)
+assertEq(oorClass.class, CheckRun.CLASS.UNPREPARED_AVAILABILITY, "out of range alone is not an item-level failure")
+assertEq(#oorClass.missing, 0, "out of range does not invent an item-level reason")
 
 local stale = CheckRun.ClassifyPlayer(rangeOnly, 200, {
     complete = true,

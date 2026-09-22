@@ -68,7 +68,7 @@ This page selects and manages the active profile. It includes:
 - owner-only loot mode: Point Based or Reward Pot;
 - Reward Pot starting amount, Raid Check deduction, and gold add/subtract controls when Reward Pot is active.
 
-Equipment enchant and gem rules are not profile-configurable; they live on **Raid Equipment**.
+Equipment enchant and gem rules are not profile-configurable; they live on **Raid Equipment**. Minimum item level is the exception and is configured under **Loot Helper → Session**.
 
 Rename and profile-specific configuration are admin-only. Only the profile owner can change loot mode. Creating a profile makes the creator its owner and first admin.
 
@@ -81,6 +81,7 @@ This page includes:
 - a note that syncing between addons only happens during a session, then start/end session control;
 - saved raid-wide safe-mode preferences for all-the-time or combat use;
 - Points Per Raid Check in Point Based mode;
+- Require Minimum Item Level, and the whole-number minimum used when that requirement is on;
 - Pre-Raid Check and Raid Check actions;
 - admin system-message summaries of missing players and Inspection Failed, independent of whisper settings;
 - optional whispers for missing and prepared players;
