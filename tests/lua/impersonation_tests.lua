@@ -821,7 +821,7 @@ end
 assertTrue(registeredPages.lootHelperCharacter ~= nil, "Character page registered")
 registeredPages.lootHelperCharacter:Build(gearPanel)
 assertTrue(gearDef ~= nil, "character page definition captured")
-local characterItem, specItem, boardItem, manualItem
+local characterItem, specItem, boardItem, manualItem, attendanceDisplay, attendanceButtons, lootPointButtons
 for _, sec in ipairs(gearDef.sections or {}) do
     for _, item in ipairs(sec.items or {}) do
         if item.label == "Character" then
@@ -832,6 +832,12 @@ for _, sec in ipairs(gearDef.sections or {}) do
             boardItem = item
         elseif item.label == "Manually add loot" then
             manualItem = item
+        elseif item.label == "Attendance points" then
+            attendanceDisplay = item
+        elseif item.type == "buttonRow" and item[1] and item[1].text == "Add 1 Attendance point" then
+            attendanceButtons = item
+        elseif item.type == "buttonRow" and type(item[1]) == "table" and type(item[1].text) == "function" and tostring(item[1].text()):find("Add 0.5", 1, true) then
+            lootPointButtons = item
         end
     end
 end
@@ -846,6 +852,12 @@ assertFalse(boardItem.enabled(), "equipment board is disabled until a character 
 if manualItem and type(manualItem.enabled) == "function" then
     assertFalse(manualItem.enabled(), "manual loot add is disabled until a character is selected")
 end
+assertTrue(attendanceDisplay ~= nil, "Attendance points display exists")
+assertEq(attendanceDisplay.get(), "—", "Attendance points stay blank until a character is selected")
+assertTrue(attendanceButtons ~= nil, "Attendance point buttons exist")
+assertFalse(attendanceButtons.enabled(), "Attendance point buttons are disabled until a character is selected")
+assertTrue(lootPointButtons ~= nil, "loot-point buttons exist")
+assertFalse(lootPointButtons.enabled(), "loot-point buttons are disabled until a character is selected")
 local characterOptions = characterItem.options()
 assertTrue(characterOptions[1] ~= nil, "Character dropdown has members to select")
 characterItem.set(characterOptions[1].value)
@@ -855,6 +867,9 @@ assertTrue(boardItem.enabled(), "equipment board enables after a character is se
 if manualItem and type(manualItem.enabled) == "function" then
     assertTrue(manualItem.enabled(), "manual loot add enables after a character is selected")
 end
+assertTrue(attendanceButtons.enabled(), "Attendance point buttons enable after a character is selected")
+assertTrue(lootPointButtons.enabled(), "loot-point buttons enable after a character is selected")
+assertTrue(attendanceDisplay.get() ~= "—", "Attendance points show a balance after a character is selected")
 characterItem.set(characterOptions[2].value)
 assertEq(characterItem.get(), characterOptions[2].value, "a later character selection is preserved")
 

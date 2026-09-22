@@ -6,9 +6,9 @@ Existing profiles start in Point Based. Switching to [Reward Pot](reward-pot.md)
 
 ## What you see
 
-The Loot Helper window title uses the profile's point name. Each profile member shows their current loot-point balance. Profile admins can raise or lower that balance in half-point steps.
+The Loot Helper window title uses the profile's point name. Each profile member shows that named point balance in its own column. Profile admins raise or lower that balance in half-point steps from **Loot Helper → Character**.
 
-Attendance is not shown in this mode. If the profile later uses Reward Pot, Attendance already earned there remains stored until you switch back.
+The roster also shows raid-check presence as a percentage, BiS slots used out of possible slots, and an equipment-readiness warning only when something is known to be missing. Reward Pot Attendance points stay stored while Point Based is active and are adjusted from the same Character page. They are not the Att.% column.
 
 ## Raid Check
 
@@ -20,7 +20,7 @@ Configure the award and whispers under **Loot Helper → Session**. Equipment ru
 
 ## Equipment history
 
-The gear button still records whether a loot category has been used. In Point Based, that history is separate from the up and down point controls.
+The gear button still records whether a loot category has been used. In Point Based, that history is separate from the Character-page loot-point controls.
 
 ## Related pages
 

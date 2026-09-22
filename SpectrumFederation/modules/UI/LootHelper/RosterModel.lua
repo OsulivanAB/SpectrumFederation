@@ -198,6 +198,57 @@ local function CollectProfileMembers(profile)
 	return members, memberSet
 end
 
+local function CountBisSlots(profile, memberId)
+	local Bis = SF.LootHelperBis
+	local possible = (Bis and Bis.SLOTS and #Bis.SLOTS) or 16
+	local used = 0
+	if profile and Bis and Bis.LiveOccupancyFromProjection then
+		local projection = profile.GetIdentityProjection and profile:GetIdentityProjection() or nil
+		local occupancy = Bis.LiveOccupancyFromProjection(projection, memberId)
+		if Bis.SLOTS then
+			for i = 1, #Bis.SLOTS do
+				if occupancy[Bis.SLOTS[i]] then
+					used = used + 1
+				end
+			end
+		else
+			for _, occupied in pairs(occupancy) do
+				if occupied then
+					used = used + 1
+				end
+			end
+		end
+	end
+	return used, possible
+end
+
+local function ReportCaughtError(context, err)
+	local message = string.format("%s: %s", tostring(context), tostring(err))
+	if SF.Debug then
+		SF.Debug:Error("LH_ROSTER", "%s", message)
+	end
+	local getHandler = rawget(_G, "geterrorhandler")
+	local handler = type(getHandler) == "function" and getHandler() or nil
+	if type(handler) == "function" then
+		pcall(handler, message)
+	end
+end
+
+local function BuildReadiness(unit, memberId)
+	local unknown = {
+		state = "unknown",
+		tooltip = "Current equipment readiness could not be determined.",
+	}
+	if not (SF.RaidCheck and SF.RaidCheck.GetCachedEquipmentReadiness) then
+		return unknown
+	end
+	local readiness = SF.RaidCheck:GetCachedEquipmentReadiness(unit, memberId)
+	if type(readiness) ~= "table" or type(readiness.state) ~= "string" then
+		return unknown
+	end
+	return readiness
+end
+
 function Model:Build(profile)
     local rows = {}
     local meta = {}
@@ -243,11 +294,52 @@ function Model:Build(profile)
 
         if showMembersNotInRaid or inRaid then
             local m = entry.member
-            local points = 0
-            if rewardPot then
-                points = (m and m.GetAttendanceBalance and m:GetAttendanceBalance()) or (m and m.attendanceBalance) or 0
+            local points = (m and m.GetPointBalance and m:GetPointBalance()) or (m and m.pointBalance) or 0
+            if profile.GetIdentityPoints then
+                local okPoints, identityPoints = pcall(profile.GetIdentityPoints, profile, id)
+                if okPoints then
+                    points = identityPoints
+                else
+                    ReportCaughtError("Loot Helper roster GetIdentityPoints(" .. tostring(id) .. ")", identityPoints)
+                end
+            end
+            local attendanceText = "—"
+            if profile.GetRaidCheckAttendanceDisplay then
+                local okAtt, att = pcall(profile.GetRaidCheckAttendanceDisplay, profile, id)
+                if okAtt and type(att) == "string" and att ~= "" then
+                    attendanceText = att
+                elseif not okAtt then
+                    ReportCaughtError("Loot Helper roster GetRaidCheckAttendanceDisplay(" .. tostring(id) .. ")", att)
+                end
+            end
+            local preparednessText = "—"
+            if profile.GetRaidCheckPreparednessDisplay then
+                local okPrep, prep = pcall(profile.GetRaidCheckPreparednessDisplay, profile, id)
+                if okPrep and type(prep) == "string" and prep ~= "" then
+                    preparednessText = prep
+                elseif not okPrep then
+                    ReportCaughtError("Loot Helper roster GetRaidCheckPreparednessDisplay(" .. tostring(id) .. ")", prep)
+                end
+            end
+            local bisUsed, bisPossible = 0, 16
+            local okBis, used, possible = pcall(CountBisSlots, profile, id)
+            if okBis then
+                bisUsed, bisPossible = used, possible
             else
-                points = (m and m.GetPointBalance and m:GetPointBalance()) or (m and m.pointBalance) or 0
+                ReportCaughtError("Loot Helper roster CountBisSlots(" .. tostring(id) .. ")", used)
+            end
+            local readiness
+            local okReady, readyResult = pcall(BuildReadiness, raidInfo and raidInfo.unit or nil, id)
+            if okReady and type(readyResult) == "table" then
+                readiness = readyResult
+            else
+                if not okReady then
+                    ReportCaughtError("Loot Helper roster BuildReadiness(" .. tostring(id) .. ")", readyResult)
+                end
+                readiness = {
+                    state = "unknown",
+                    tooltip = "Current equipment readiness could not be determined.",
+                }
             end
             local resolvedClass = (raidInfo and raidInfo.class) or entry.class or self._classByMemberId[id] or "UNKNOWN"
             if resolvedClass == "UNKNOWN" and SF.Debug then
@@ -263,9 +355,17 @@ function Model:Build(profile)
                 type = "PROFILE_MEMBER",
                 memberId = id,
                 displayName = ShortName(id),
+                sortKey = string.lower(ShortName(id)),
                 class = resolvedClass,
                 unit = raidInfo and raidInfo.unit or nil,
                 points = tonumber(points) or 0,
+                showPoints = not rewardPot,
+                pointName = (profile.GetPointName and profile:GetPointName()) or "Points",
+                attendanceText = attendanceText,
+                preparednessText = preparednessText,
+                bisText = string.format("%d/%d", bisUsed, bisPossible),
+                readinessState = readiness.state,
+                readinessTooltip = readiness.tooltip,
                 member = m,
                 profile = profile,
                 canAdmin = canAdmin,

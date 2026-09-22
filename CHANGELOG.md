@@ -2,6 +2,31 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.3-beta.5] - 2026-09-22
+
+### Changed
+- Warn when an RC BiS response repeats a used opportunity
+
+## [1.5.3-beta.4] - 2026-09-21
+
+### Changed
+- Let the Loot Helper window resize narrower
+
+## [1.5.3-beta.3] - 2026-09-21
+
+### Added
+- Add Loot Helper window close without disabling the feature
+
+## [1.5.3-beta.2] - 2026-09-20
+
+### Added
+- Show Loot Helper members outside a raid and add Prep.
+
+## [1.5.3-beta.1] - 2026-09-20
+
+### Changed
+- Loot Helper at-a-glance raid columns (#274)
+
 ## [1.5.2] - 2026-09-11
 
 ### Changed

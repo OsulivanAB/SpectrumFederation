@@ -20,15 +20,21 @@ LH.Constants = LH.Constants or {
     DEFAULT_Y = 0,
 
     -- Default size
-    DEFAULT_WIDTH = 480,
+    DEFAULT_WIDTH = 620,
     DEFAULT_HEIGHT = 520,
     MINIMIZED_HEIGHT = 40,
     
-    -- Guardrails
-    MIN_WIDTH = 320,
+    -- Guardrails. MIN_WIDTH is the pre-layout fallback. RosterView replaces it
+    -- with the responsive floor (mandatory roster content vs title-bar controls).
+    MIN_WIDTH = 480,
     MIN_HEIGHT = 260,
     MAX_WIDTH = 1000,
     MAX_HEIGHT = 900,
+
+    -- Scrollbar inset used when the roster actually scrolls. Measured widths
+    -- below SCROLLBAR_MIN_MEASURED fall back to SCROLLBAR_WIDTH.
+    SCROLLBAR_WIDTH = 20,
+    SCROLLBAR_MIN_MEASURED = 16,
 
     -- Title bar visuals
     LOGO_SIZE = 18,

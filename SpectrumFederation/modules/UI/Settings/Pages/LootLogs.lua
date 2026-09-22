@@ -165,6 +165,7 @@ local EVENT_TYPE_COLORS = {
 	REWARD_POT_CONFIG_CHANGE = "|cffffcc66",
 	REWARD_POT_CHANGE = "|cffffd700",
 	ATTENDANCE_CHANGE = "|cff66ccff",
+	RAID_CHECK_PRESENCE = "|cff99cc66",
 	RC_LOOT_COUNCIL = "|cffff99cc",
 	SPEC_CHANGE = "|cff99ccff",
 	BIS_OUTCOME = "|cff66ffcc",
@@ -191,6 +192,7 @@ local EVENT_TYPE_LABELS = {
 	REWARD_POT_CONFIG_CHANGE = "Reward Pot Config",
 	REWARD_POT_CHANGE = "Reward Pot Change",
 	ATTENDANCE_CHANGE = "Attendance Change",
+	RAID_CHECK_PRESENCE = "Raid Check Presence",
 	RC_LOOT_COUNCIL = "RC Loot Council",
 	SPEC_CHANGE = "Spec Change",
 	BIS_OUTCOME = "BiS Outcome",
@@ -356,6 +358,13 @@ local function BuildActionText(eventType, data, author)
 		end
 
 		return FormatLabel(data.change or "?")
+	elseif eventType == "RAID_CHECK_PRESENCE" then
+		local present = type(data.presentMembers) == "table" and #data.presentMembers or 0
+		local eligible = type(data.eligibleMembers) == "table" and #data.eligibleMembers or 0
+		if type(data.preparedMembers) == "table" then
+			return string.format("Raid Check presence %d/%d prepared %d", present, eligible, #data.preparedMembers)
+		end
+		return string.format("Raid Check presence %d/%d", present, eligible)
 	elseif eventType == "RC_LOOT_COUNCIL" then
 		local item = tostring(data.itemLink or "")
 		local response = tostring(data.response or "")

@@ -52,7 +52,7 @@ local CharacterPage = {
 	parentId = "lootHelper",
 	name = "Character Settings",
 	navLabel = "Character",
-	description = "Set persistent specialization and correct item-aware BiS assignments.",
+	description = "Set persistent specialization, correct item-aware BiS assignments, and adjust Attendance points or loot points.",
 	order = 23.5,
 }
 
@@ -120,6 +120,21 @@ end
 
 local function IsSessionActive()
 	return SF.LootHelperSync and SF.LootHelperSync.IsSessionActive and SF.LootHelperSync:IsSessionActive()
+end
+
+local function GetLootHelperWindowController()
+	return SF.LootHelperWindow and SF.LootHelperWindow.Controller or nil
+end
+
+local function LootWindowButtonText()
+	local c = GetLootHelperWindowController()
+	if c and c.GetWindowVisibilityActionText then
+		return c:GetWindowVisibilityActionText()
+	end
+	if c and c.IsWindowShown and c:IsWindowShown() then
+		return "Hide Loot Window"
+	end
+	return "Show Loot Window"
 end
 
 local function IsAdmin()
@@ -538,6 +553,138 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		return nil
 	end
 
+	local function FormatBalanceAmount(amount)
+		amount = tonumber(amount) or 0
+		if amount == math.floor(amount) then
+			return tostring(amount)
+		end
+		local text = string.format("%.2f", amount)
+		return (text:gsub("0+$", ""):gsub("%.$", ""))
+	end
+
+	local function SelectedProfileMember()
+		local profile = GetProfile()
+		local memberId = SelectedGearMember()
+		if not (profile and memberId and profile.getMemberByID) then
+			return nil, nil, nil
+		end
+		return profile, memberId, profile:getMemberByID(memberId)
+	end
+
+	local function CurrentAttendancePointsText()
+		local profile, memberId = SelectedProfileMember()
+		if not (profile and memberId and profile.GetIdentityAttendance) then
+			return "—"
+		end
+		local ok, value = pcall(profile.GetIdentityAttendance, profile, memberId)
+		if not ok then
+			return "—"
+		end
+		return FormatBalanceAmount(value)
+	end
+
+	local function CurrentLootPointsText()
+		local profile, memberId = SelectedProfileMember()
+		if not (profile and memberId and profile.GetIdentityPoints) then
+			return "—"
+		end
+		local ok, value = pcall(profile.GetIdentityPoints, profile, memberId)
+		if not ok then
+			return "—"
+		end
+		return FormatBalanceAmount(value)
+	end
+
+	local function LootPointName()
+		local profile = GetProfile()
+		if profile and type(profile.GetPointName) == "function" then
+			local ok, name = pcall(profile.GetPointName, profile)
+			if ok and type(name) == "string" and name ~= "" then
+				return name
+			end
+		end
+		return "Points"
+	end
+
+	local function AdjustSelectedAttendance(ctx, change)
+		ctx.section:ClearMessage()
+		local profile, memberId, member = SelectedProfileMember()
+		if not (profile and memberId and member) then
+			ctx.section:SetMessage("Select a character first.", "error")
+			return
+		end
+		local ok
+		if change == "INCREMENT" then
+			ok = member.IncrementAttendance and member:IncrementAttendance({
+				amount = 1,
+				reason = "MANUAL",
+				profile = profile,
+			})
+		else
+			ok = member.DecrementAttendance and member:DecrementAttendance({
+				amount = 1,
+				reason = "MANUAL",
+				profile = profile,
+			})
+		end
+		if not ok then
+			if change == "DECREMENT" then
+				ctx.section:SetMessage("Attendance points are already 0.", "warn")
+			else
+				ctx.section:SetMessage("Could not change Attendance points.", "error")
+			end
+			return
+		end
+		if SF.Debug then
+			SF.Debug:Info("LH_SETTINGS", "Manual Attendance %s: %s", change, tostring(memberId))
+		end
+		ctx.section:SetMessage(
+			change == "INCREMENT" and "Added 1 Attendance point." or "Removed 1 Attendance point.",
+			"success"
+		)
+		if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+			ctx.pageBuilder:Refresh()
+		end
+	end
+
+	local function AdjustSelectedLootPoints(ctx, change)
+		ctx.section:ClearMessage()
+		local profile, memberId, member = SelectedProfileMember()
+		if not (profile and memberId and member) then
+			ctx.section:SetMessage("Select a character first.", "error")
+			return
+		end
+		local ok
+		if change == "INCREMENT" then
+			ok = member.IncrementPoints and member:IncrementPoints({
+				amount = 0.5,
+				reason = "MANUAL",
+				profile = profile,
+			})
+		else
+			ok = member.DecrementPoints and member:DecrementPoints({
+				amount = 0.5,
+				reason = "MANUAL",
+				profile = profile,
+			})
+		end
+		if not ok then
+			ctx.section:SetMessage("Could not change " .. LootPointName() .. ".", "error")
+			return
+		end
+		if SF.Debug then
+			SF.Debug:Info("LH_SETTINGS", "Manual %s %s: %s", LootPointName(), change, tostring(memberId))
+		end
+		local pointName = LootPointName()
+		ctx.section:SetMessage(
+			change == "INCREMENT" and ("Added 0.5 " .. pointName .. ".") or ("Removed 0.5 " .. pointName .. "."),
+			"success"
+		)
+		if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+			ctx.pageBuilder:Refresh()
+		end
+	end
+
 	local function BuildSpecOptions(memberId)
 		local profile = GetProfile()
 		local member = profile and profile.getMemberByID and profile:getMemberByID(memberId)
@@ -640,7 +787,44 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 			title = "General Settings",
 			tooltip = "Character-level Loot Helper options for this client, plus global actions such as a full reset.",
 			items = {
-				{ type = "checkbox", label = "Enable LootHelper", tooltip = "Turn Loot Helper on or off for this character. When it is off, the Loot Helper window and related features stay disabled on this client.", path = "lootHelper.enabled" },
+				{ type = "checkbox", label = "Enable Loot Helper", tooltip = "Allow the Loot Helper roster window to appear for this character when an active profile and raid conditions are met. Turning this off hides the window and prevents it from coming back automatically. Use Show/Hide Loot Window to hide the UI for this session without changing this setting. Sync and Raid Check still initialize.", path = "lootHelper.enabled" },
+				{
+					type = "button",
+					label = "Loot Window",
+					buttonText = LootWindowButtonText,
+					width = 160,
+					tooltip = "Show or hide the Loot Helper roster window on this client. Hiding the window does not disable Loot Helper, end a session, or stop synchronization.",
+					onClick = function(ctx)
+						ctx.section:ClearMessage()
+						local c = GetLootHelperWindowController()
+						if not c then
+							ctx.section:SetMessage("Loot Helper window is not available.", "error")
+							return
+						end
+						if c.Init then
+							c:Init()
+						end
+						if c.IsWindowShown and c:IsWindowShown() then
+							if c.HideWindow then
+								c:HideWindow("Settings:LootWindow")
+							end
+						elseif c.ShowWindow then
+							local ok, why = c:ShowWindow("Settings:LootWindow")
+							if ok == false then
+								if why == "no_active_profile" then
+									ctx.section:SetMessage("Cannot show Loot Helper window: No active profile set.", "warn")
+								elseif why == "not_in_raid" then
+									ctx.section:SetMessage("Cannot show Loot Helper window: You are not in a raid.", "warn")
+								elseif why == "disabled" then
+									ctx.section:SetMessage("Cannot show Loot Helper window: Loot Helper is disabled.", "warn")
+								end
+							end
+						end
+						if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+							ctx.pageBuilder:Refresh()
+						end
+					end,
+				},
 				{ type = "checkbox", label = "Lock Loot Window", tooltip = "Prevent the Loot Helper window from being moved or resized.", path = "lootHelper.lockLootWindow" },
 				{ type = "checkbox", label = "Show Members not in raid", tooltip = "Show profile members even when they are not currently in your raid. Turn this off to focus only on people who are present.", path = "lootHelper.showMembersNotInRaid" },
 				{ type = "checkbox", label = "Show Loot Window outside of Raid", tooltip = "Allow the Loot Helper window to appear even when you are not currently in a raid.", path = "lootHelper.showWindowOutsideRaid" },
@@ -1208,6 +1392,61 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 						end
 					end,
 					enabled = function() return ProfileActionsEnabled() end,
+				},
+				{ type = "help", indent = "label", text = "Attendance points are the Reward Pot attendance balance. They are not the roster Att.% or Prep. columns. Loot points use the profile's point name and stay separate." },
+				{
+					type = "display",
+					label = "Attendance points",
+					adminOnly = true,
+					tooltip = "Identity-wide Reward Pot Attendance points for the selected character. This is not raid-check presence (Att.%) or preparedness (Prep.).",
+					get = function() return CurrentAttendancePointsText() end,
+				},
+				{
+					type = "buttonRow",
+					adminOnly = true,
+					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
+					{
+						text = "Add 1 Attendance point",
+						width = 180,
+						onClick = function(ctx)
+							AdjustSelectedAttendance(ctx, "INCREMENT")
+						end,
+					},
+					{
+						text = "Remove 1 Attendance point",
+						width = 200,
+						offsetX = 200,
+						onClick = function(ctx)
+							AdjustSelectedAttendance(ctx, "DECREMENT")
+						end,
+					},
+				},
+				{
+					type = "display",
+					label = "Loot points",
+					adminOnly = true,
+					tooltip = "Identity-wide loot-point balance for the selected character. In Reward Pot this counter stays stored and hidden on the roster.",
+					get = function() return CurrentLootPointsText() end,
+				},
+				{
+					type = "buttonRow",
+					adminOnly = true,
+					enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end,
+					{
+						text = function() return "Add 0.5 " .. LootPointName() end,
+						width = 180,
+						onClick = function(ctx)
+							AdjustSelectedLootPoints(ctx, "INCREMENT")
+						end,
+					},
+					{
+						text = function() return "Remove 0.5 " .. LootPointName() end,
+						width = 200,
+						offsetX = 200,
+						onClick = function(ctx)
+							AdjustSelectedLootPoints(ctx, "DECREMENT")
+						end,
+					},
 				},
 				{
 					type = "dropdown",

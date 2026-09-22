@@ -38,8 +38,9 @@ The Loot Helper window appears automatically when all of these conditions are tr
 1. Loot Helper is enabled.
 2. An active profile is selected.
 3. You are in a raid, unless **Show Loot Window outside of Raid** is enabled.
+4. You have not closed the window with the X button or **Hide Loot Window** during this session.
 
-You can also enter `/sf loot` to enable Loot Helper and ask it to show the window.
+You can also enter `/sf loot` to enable Loot Helper if needed and show the window. Closing the window hides the UI only; Loot Helper stays active in the background. A `/reload` restores automatic visibility.
 
 ## Create your first loot profile
 
@@ -57,8 +58,10 @@ Join a raid with the people you want to add. In the Loot Helper roster, players 
 
 For profile members:
 
-- In Point Based mode, the up and down buttons adjust the member's loot-point balance in half-point steps.
-- In Reward Pot mode, those buttons adjust Attendance by one, and the current pot is shown above the list.
+- In Point Based mode, the Points column uses the profile's point name.
+- In Reward Pot mode, the Points column is hidden and the current pot is shown above the list.
+- Each row also shows raid-check presence (Att.), preparedness (Prep.), BiS slots used out of possible slots, and an equipment-readiness warning only when something is known to be missing.
+- Admins change Attendance points or loot points under **Loot Helper → Character**. Those balances are not the Att.% or Prep. columns.
 - The equipment button opens that member's equipment-category history.
 - Admins can mark equipment categories used or available; all users can view them.
 

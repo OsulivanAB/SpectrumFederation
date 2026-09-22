@@ -16,6 +16,8 @@ POLICY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_policy_tests.lua"
 RUN_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_run_tests.lua"
 FRESH_SNAPSHOT_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_fresh_snapshot_tests.lua"
 STABILITY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_stability_tests.lua"
+PRESENCE_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_presence_tests.lua"
+GLANCE_TESTS = REPO_ROOT / "tests" / "lua" / "roster_glance_tests.lua"
 SCHEMA = REPO_ROOT / "SpectrumFederation" / "modules" / "Settings" / "Schema.lua"
 RAID_EQUIPMENT_PAGE = (
     REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "RaidEquipment.lua"
@@ -64,6 +66,16 @@ def test_raid_equipment_fresh_install_snapshot_production_lua():
 def test_raid_equipment_stability_production_lua():
     _run_lua(STABILITY_TESTS, "Raid Equipment stability")
     assert RAID_EQUIPMENT_PAGE.exists()
+
+
+def test_raid_check_presence_production_lua():
+    _run_lua(PRESENCE_TESTS, "Raid Check presence")
+    assert PRESENCE_TESTS.exists()
+
+
+def test_roster_glance_production_lua():
+    _run_lua(GLANCE_TESTS, "Loot Helper glance roster")
+    assert GLANCE_TESTS.exists()
 
 
 def test_raid_equipment_auto_refresh_defaults_off():

@@ -11,6 +11,22 @@ local STOP_BUTTON_ICON = "Interface\\Buttons\\UI-GroupLoot-Pass-Up"
 LH.Window = LH.Window or {}
 local Window = LH.Window
 
+-- Title-bar geometry shared by anchors and the responsive minimum width.
+-- Positive gaps are distances; anchors apply them toward the left.
+Window.TitleMetrics = {
+    frameInset = 6,
+    closeSize = 20,
+    closeRightOffset = 4,
+    minimizeSize = 16,
+    minimizeGap = 4,
+    gearGap = 6,
+    playGap = 6,
+    leftPad = 8,
+    rightPad = 10,
+    textGap = 10,
+    pointExtra = 6,
+}
+
 local function Clamp(v, minV, maxV)
     v = tonumber(v) or minV
     if v < minV then return minV end
@@ -21,6 +37,80 @@ end
 local function Round(v)
     v = tonumber(v) or 0
     return math.floor(v + 0.5)
+end
+
+-- Smallest window width that keeps the logo and every title-bar control from
+-- overlapping, with minTextWidth reserved for the profile name between them.
+function Window.MinimumTitleWidth(minTextWidth)
+    local m = Window.TitleMetrics
+    minTextWidth = tonumber(minTextWidth) or 0
+    if minTextWidth < 0 then
+        minTextWidth = 0
+    end
+    local textLeft = m.frameInset + C.TITLE_PADDING_X + C.LOGO_SIZE + m.leftPad
+    local controlsFromRight = m.frameInset
+        + m.closeRightOffset + m.closeSize
+        + m.minimizeGap + m.minimizeSize
+        + m.gearGap + C.ICON_BUTTON_SIZE
+        + m.playGap + C.ICON_BUTTON_SIZE
+        + m.rightPad
+    return textLeft + minTextWidth + controlsFromRight
+end
+
+-- Decide whether the point name fits beside the full profile title.
+-- totalW is the pixel gap between the logo and the leftmost visible control.
+function Window.ResolveTitleLayout(totalW, titleStringWidth, pointStringWidth)
+    local m = Window.TitleMetrics
+    totalW = tonumber(totalW) or 0
+    titleStringWidth = tonumber(titleStringWidth) or 0
+    pointStringWidth = tonumber(pointStringWidth) or 0
+    if totalW <= 0 then
+        return { showPointName = false, profileWidth = 0 }
+    end
+    local wantPointW = pointStringWidth + m.pointExtra
+    local showPoint = pointStringWidth > 0
+        and (titleStringWidth + m.textGap + wantPointW) <= totalW
+    local profileWidth = totalW
+    if showPoint then
+        profileWidth = totalW - m.textGap - wantPointW
+        if profileWidth < 0 then
+            profileWidth = 0
+        end
+    end
+    return { showPointName = showPoint, profileWidth = profileWidth }
+end
+
+function Window.ScrollBarInset(measuredWidth)
+    local sbw = tonumber(measuredWidth) or 0
+    local minimum = C.SCROLLBAR_MIN_MEASURED or 16
+    if sbw < minimum then
+        sbw = C.SCROLLBAR_WIDTH or 20
+    end
+    return sbw + (C.SCROLLBAR_GAP or 6)
+end
+
+-- Raise or lower the resize floor when the roster font changes the name minimum.
+-- Does not unlock a locked window. Clamps only when the current width is below
+-- the new floor.
+function Window:RefreshMinimumWidth(minWidth)
+    minWidth = tonumber(minWidth)
+    if not minWidth then return end
+    minWidth = Round(minWidth)
+    if minWidth < 1 or minWidth == C.MIN_WIDTH then return end
+
+    C.MIN_WIDTH = minWidth
+    local f = self._frame
+    if not f then return end
+
+    if not f.__sfLocked and not f.__sfMinimized then
+        self:_ApplyResizeBounds(f)
+    end
+
+    local w = f.GetWidth and f:GetWidth()
+    if w and w + 0.5 < C.MIN_WIDTH then
+        self:ClampSizeToBounds()
+        self:SaveState()
+    end
 end
 
 -- WoW resizes a frame around its current anchor. CENTER (the default, and the
@@ -278,6 +368,10 @@ function Window:SetMinimized(minimized)
 
     self:_ApplyMinimizedState()
     self:SaveState()
+
+    if LH.Controller and LH.Controller.OnMinimizedStateChanged then
+        LH.Controller:OnMinimizedStateChanged(minimized)
+    end
 end
 
 function Window:ToggleMinimized()
@@ -306,7 +400,7 @@ function Window:SetLocked(locked)
 
     -- Dragging (title bar)
     if f.Title then
-        -- Always keep the title mouse-enabled so Gear/Close still work
+        -- Always keep the title mouse-enabled so Gear/Close/Minimize still work
         f.Title:EnableMouse(true)
 
         if locked then
@@ -454,8 +548,9 @@ function Window:Create()
     -- =====================================================
     local title = CreateFrame("Frame", nil, frame)
     title:SetHeight(C.TITLE_HEIGHT)
-    title:SetPoint("TOPLEFT", frame, "TOPLEFT", 6, -6)
-    title:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -6, -6)
+    local titleInset = Window.TitleMetrics.frameInset
+    title:SetPoint("TOPLEFT", frame, "TOPLEFT", titleInset, -titleInset)
+    title:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -titleInset, -titleInset)
     title:EnableMouse(true)
     frame.Title = title
 
@@ -483,20 +578,32 @@ function Window:Create()
     play.__sfTooltipText = "Start a Loot Helper session for the active profile."
     AttachTooltip(play, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
 
-    -- Minimize/restore button
+    -- Close button (rightmost). Visibility-only; does not disable Loot Helper.
+    local titleMetrics = Window.TitleMetrics
+    local close = CreateFrame("Button", nil, title, "UIPanelCloseButton")
+    close:SetPoint("RIGHT", title, "RIGHT", -titleMetrics.closeRightOffset, 0)
+    close:SetSize(titleMetrics.closeSize, titleMetrics.closeSize)
+    title.Close = close
+    close.__sfTooltipTitle = "Close"
+    close.__sfTooltipText = "Hide the Loot Helper window. Loot Helper keeps running in the background."
+    AttachTooltip(close, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
+
+    -- Minimize/restore button (left of close)
     local minimize = CreateObjectiveTrackerToggleButton(title)
-    minimize:SetPoint("RIGHT", title, "RIGHT", -4, 0)
+    minimize:SetSize(titleMetrics.minimizeSize, titleMetrics.minimizeSize)
+    minimize:SetPoint("RIGHT", close, "LEFT", -titleMetrics.minimizeGap, 0)
     title.Minimize = minimize
     minimize.__sfTooltipTitle = "Minimize"
     minimize.__sfTooltipText = "Collapse the Loot Helper window to its title bar."
-    gear:SetPoint("RIGHT", minimize, "LEFT", -6, 0)
-    play:SetPoint("RIGHT", gear, "LEFT", -6, 0)
+    gear:SetPoint("RIGHT", minimize, "LEFT", -titleMetrics.gearGap, 0)
+    play:SetPoint("RIGHT", gear, "LEFT", -titleMetrics.playGap, 0)
     AttachTooltip(minimize, function(self) return self.__sfTooltipTitle end, function(self) return self.__sfTooltipText end)
 
     -- Profile Name
     local profileName = title:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     profileName:SetJustifyH("LEFT")
-    profileName:SetText("No Active Profile")
+    profileName.__sfFullText = "No Active Profile"
+    profileName:SetText(profileName.__sfFullText)
     profileName:SetWordWrap(false)
     profileName:SetMaxLines(1)
     title.ProfileName = profileName
@@ -510,47 +617,56 @@ function Window:Create()
     pointName:SetTextColor(0.82, 0.82, 0.82)
     title.PointName = pointName
     
-    local TITLE_LEFT_PAD = 8    -- between logo and title text
-    local TITLE_RIGHT_PAD = 10  -- between title text and play button
-    local TITLE_GAP = 10    -- gap between title text and point name text
-    local POINT_NAME_EXTRA = 6   -- slight padding so point name doesn't feel cramped
-
     local function UpdateTitleLayout()
-        -- Need actual geometry for this to work reliably
+        -- Need actual geometry for this to work reliably.
+        -- Controls stay anchored from the right. Profile text truncates into
+        -- whatever gap remains; it must not push or cover those controls.
         local logoR = logo:GetRight()
         local actionAnchor = play:IsShown() and play or gear
         local actionL = actionAnchor:GetLeft()
         if not logoR or not actionL then return end
 
-        local leftX = logoR + TITLE_LEFT_PAD
-        local rightX = actionL - TITLE_RIGHT_PAD
+        local metrics = Window.TitleMetrics
+        local leftX = logoR + metrics.leftPad
+        local rightX = actionL - metrics.rightPad
         local totalW = rightX - leftX
-        if totalW < 80 then return end
 
-        -- Measure string widths (true text size)
-        local titleW = profileName:GetStringWidth() or 0
-        local pointW = pointName:GetStringWidth() or 0
-        local wantPointW = pointW + POINT_NAME_EXTRA
+        local fullTitle = profileName.__sfFullText
+        if type(fullTitle) ~= "string" then
+            fullTitle = profileName:GetText() or ""
+            profileName.__sfFullText = fullTitle
+        end
+        profileName:SetText(fullTitle)
 
-        -- Show point name only if both strings fit side-by-side without forcing truncation.
-        local canShowPointName = pointW > 0 and (titleW + TITLE_GAP + wantPointW) <= totalW
+        local titleW = profileName.GetStringWidth and (profileName:GetStringWidth() or 0) or 0
+        local pointW = pointName.GetStringWidth and (pointName:GetStringWidth() or 0) or 0
+        local resolved = Window.ResolveTitleLayout(totalW, titleW, pointW)
+        local wantPointW = pointW + metrics.pointExtra
 
-        -- Reset anchors
         profileName:ClearAllPoints()
         pointName:ClearAllPoints()
+        profileName:SetPoint("LEFT", logo, "RIGHT", metrics.leftPad, 0)
 
-        profileName:SetPoint("LEFT", logo, "RIGHT", TITLE_LEFT_PAD, 0)
-
-        if canShowPointName then
+        if resolved.showPointName then
             pointName:Show()
             pointName:SetWidth(wantPointW)
-            pointName:SetPoint("RIGHT", actionAnchor, "LEFT", -TITLE_RIGHT_PAD, 0)
-
-            profileName:SetPoint("RIGHT", pointName, "LEFT", -TITLE_GAP, 0)
+            pointName:SetPoint("RIGHT", actionAnchor, "LEFT", -metrics.rightPad, 0)
+            profileName:SetPoint("RIGHT", pointName, "LEFT", -metrics.textGap, 0)
         else
             pointName:Hide()
-            profileName:SetPoint("RIGHT", actionAnchor, "LEFT", -TITLE_RIGHT_PAD, 0)
+            profileName:SetPoint("RIGHT", actionAnchor, "LEFT", -metrics.rightPad, 0)
         end
+
+        local shownTitle = fullTitle
+        if resolved.profileWidth <= 0 then
+            shownTitle = ""
+        elseif LH.RosterView and LH.RosterView.TruncateToWidth and profileName.GetStringWidth then
+            shownTitle = LH.RosterView.TruncateToWidth(fullTitle, resolved.profileWidth, function(text)
+                profileName:SetText(text)
+                return profileName:GetStringWidth() or 0
+            end)
+        end
+        profileName:SetText(shownTitle)
     end
 
     -- Expose to setters so changing text triggers a re-layout
@@ -595,6 +711,9 @@ function Window:Create()
     end)
     minimize:SetScript("OnClick", function()
         if frame.OnMinimizeClicked then frame:OnMinimizeClicked() end
+    end)
+    close:SetScript("OnClick", function()
+        if frame.OnCloseClicked then frame:OnCloseClicked() end
     end)
     
     -- =====================================================
@@ -710,7 +829,9 @@ function Window:SetProfileName(name)
     local f = self._frame
     if not f or not f.Title or not f.Title.ProfileName then return end
 
-    f.Title.ProfileName:SetText(tostring(name or "No Active Profile"))
+    local text = tostring(name or "No Active Profile")
+    f.Title.ProfileName.__sfFullText = text
+    f.Title.ProfileName:SetText(text)
 
     if f.Title and f.Title.UpdateTitleLayout then
         if C_Timer and C_Timer.After then
@@ -850,9 +971,7 @@ function Window:UpdateScrollInsets()
 	-- Reserve right inset ONLY if scrollbar is shown
 	local rightInset = 0
 	if needScroll and sb then
-		local sbw = (sb:GetWidth() or 0)
-		if sbw < 16 then sbw = 20 end
-		rightInset = sbw + (C.SCROLLBAR_GAP or 6)
+		rightInset = Window.ScrollBarInset(sb:GetWidth())
 	end
 
 	-- Reserve bottom inset if resize handle is shown (unlocked)

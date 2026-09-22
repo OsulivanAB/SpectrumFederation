@@ -1590,6 +1590,7 @@ function Identity.AffectsProjection(eventType)
         or eventType == (EventTypes().MAIN_SWAP)
         or eventType == (EventTypes().POINT_CHANGE)
         or eventType == (EventTypes().ATTENDANCE_CHANGE)
+        or eventType == (EventTypes().RAID_CHECK_PRESENCE)
         or eventType == (EventTypes().ARMOR_CHANGE)
         or eventType == (EventTypes().ADMIN_ADDED)
         or eventType == (EventTypes().ADMIN_REMOVED)
@@ -1806,6 +1807,11 @@ function Identity.Replay(logs, opts)
     local localOrigin = {}
     local rawPoints = {}
     local rawAttendance = {}
+    local presenceSeen = {}
+    local presencePresent = {}
+    local presenceEligible = {}
+    local presencePrepared = {}
+    local presencePreparedEligible = {}
     local auth = {}
     local simulated = {}
     local restoredSources = {}
@@ -2024,6 +2030,47 @@ function Identity.Replay(logs, opts)
                         rawAttendance[memberId] = (rawAttendance[memberId] or 0) - amount
                     end
                 end
+            elseif eventType == types.RAID_CHECK_PRESENCE then
+                local opportunityId = data.opportunityId
+                local presentMembers = data.presentMembers
+                local eligibleMembers = data.eligibleMembers
+                -- SortedUnique treats a non-table as empty. Skip malformed
+                -- lists so a string presentMembers cannot invent absences
+                -- against a real eligibleMembers list.
+                if type(opportunityId) == "string" and opportunityId ~= ""
+                    and type(presentMembers) == "table"
+                    and type(eligibleMembers) == "table"
+                    and not presenceSeen[opportunityId]
+                then
+                    presenceSeen[opportunityId] = true
+                    local presentSet = ListToSet(SortedUnique(presentMembers))
+                    local eligibleSet = ListToSet(SortedUnique(eligibleMembers))
+                    local applicable = {}
+                    for id in pairs(eligibleSet) do
+                        applicable[id] = true
+                    end
+                    for id in pairs(presentSet) do
+                        applicable[id] = true
+                    end
+                    for id in pairs(applicable) do
+                        presenceEligible[id] = (presenceEligible[id] or 0) + 1
+                        if presentSet[id] then
+                            presencePresent[id] = (presencePresent[id] or 0) + 1
+                        end
+                    end
+                    -- Old logs omit preparedMembers. Do not invent a 0%
+                    -- preparedness denominator from those opportunities.
+                    local preparedMembers = data.preparedMembers
+                    if type(preparedMembers) == "table" then
+                        local preparedSet = ListToSet(SortedUnique(preparedMembers))
+                        for id in pairs(applicable) do
+                            presencePreparedEligible[id] = (presencePreparedEligible[id] or 0) + 1
+                            if presentSet[id] and preparedSet[id] then
+                                presencePrepared[id] = (presencePrepared[id] or 0) + 1
+                            end
+                        end
+                    end
+                end
             elseif eventType == types.ARMOR_CHANGE then
                 local memberId = ensureLocal(data.member)
                 if memberId and type(data.slot) == "string" then
@@ -2197,9 +2244,78 @@ function Identity.Replay(logs, opts)
         overflowCountsByIdentity = overflowCountsByIdentity,
         partition = partition,
         bisAppendRank = #ordered,
+        raidPresence = {
+            seen = presenceSeen,
+            present = presencePresent,
+            eligible = presenceEligible,
+            prepared = presencePrepared,
+            preparedEligible = presencePreparedEligible,
+        },
     }
     RefreshBisDerived(result)
     return result
+end
+
+local function PresenceCounts(map, memberId)
+    if type(map) ~= "table" then
+        return 0
+    end
+    return map[memberId] or 0
+end
+
+local function FormatPresencePercent(count, eligible)
+    if eligible <= 0 then
+        return "—"
+    end
+    local pct = math.floor((count / eligible) * 100 + 0.5)
+    if pct < 0 then
+        pct = 0
+    elseif pct > 100 then
+        pct = 100
+    end
+    return string.format("%d%%", pct)
+end
+
+function Identity.RaidCheckAttendanceCounts(result, memberId)
+    memberId = NormalizeId(memberId)
+    if type(result) ~= "table" or not memberId then
+        return 0, 0
+    end
+    local presence = result.raidPresence
+    if type(presence) ~= "table" then
+        return 0, 0
+    end
+    return PresenceCounts(presence.present, memberId), PresenceCounts(presence.eligible, memberId)
+end
+
+function Identity.FormatRaidCheckAttendance(result, memberId)
+    local present, eligible = Identity.RaidCheckAttendanceCounts(result, memberId)
+    return FormatPresencePercent(present, eligible)
+end
+
+function Identity.RaidCheckPreparednessCounts(result, memberId)
+    memberId = NormalizeId(memberId)
+    if type(result) ~= "table" or not memberId then
+        return 0, 0
+    end
+    local presence = result.raidPresence
+    if type(presence) ~= "table" then
+        return 0, 0
+    end
+    return PresenceCounts(presence.prepared, memberId), PresenceCounts(presence.preparedEligible, memberId)
+end
+
+function Identity.FormatRaidCheckPreparedness(result, memberId)
+    local prepared, eligible = Identity.RaidCheckPreparednessCounts(result, memberId)
+    return FormatPresencePercent(prepared, eligible)
+end
+
+function Identity.HasRaidCheckPresenceOpportunity(result, opportunityId)
+    if type(result) ~= "table" or type(opportunityId) ~= "string" or opportunityId == "" then
+        return false
+    end
+    local seen = result.raidPresence and result.raidPresence.seen
+    return seen and seen[opportunityId] == true
 end
 
 function Identity.ComponentMembers(logs, memberId, result)

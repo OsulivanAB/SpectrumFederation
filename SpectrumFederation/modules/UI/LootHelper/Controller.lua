@@ -81,33 +81,124 @@ function Controller:ShouldBeVisible()
     return false, "not_in_raid"
 end
 
-function Controller:EvaluateVisibility(reason)
+function Controller:IsManuallyHidden()
+    return self._manuallyHidden and true or false
+end
+
+function Controller:IsWindowShown()
+    local f = self:GetFrame()
+    return f and f:IsShown() and true or false
+end
+
+function Controller:GetWindowVisibilityActionText()
+    if self:IsWindowShown() then
+        return "Hide Loot Window"
+    end
+    return "Show Loot Window"
+end
+
+function Controller:_HideEquipmentWindow()
+    if LH.EquipmentWindow and LH.EquipmentWindow.Hide then
+        LH.EquipmentWindow:Hide()
+    end
+end
+
+function Controller:_NotifySettingsVisibilityChanged()
+    local win = SF.SettingsWindow
+    if not win or type(win.RefreshCurrentPage) ~= "function" then
+        return
+    end
+    if win.frame and win.frame.IsShown and not win.frame:IsShown() then
+        return
+    end
+    -- Only the Loot Helper General page owns the Show/Hide control. Refreshing
+    -- Raid Equipment or Loot Logs from a roster show/hide can rebuild those
+    -- tables and freeze the client.
+    local pageId = win.currentPageId
+    if pageId ~= "lootHelperGeneral" and pageId ~= "lootHelper" then
+        return
+    end
+    win:RefreshCurrentPage()
+end
+
+function Controller:_ApplyFrameVisibility(shouldShow, reason, why)
     local f = self:GetFrame()
     if not f then return end
 
     -- Keep title accurate even if hidden
     self:RefreshTitle()
 
-    local shouldShow, why = self:ShouldBeVisible()
+    local wasShown = f:IsShown() and true or false
 
     if shouldShow then
         if not f:IsShown() then
             f:Show()
         end
+        self:_SyncReadinessListener()
         self:RequestRefresh("Shown")
     else
+        self:_UnbindReadinessListener()
         if f:IsShown() then
             f:Hide()
-            -- Also hide equipment window when main window hides
-            if LH.EquipmentWindow and LH.EquipmentWindow.Hide then
-                LH.EquipmentWindow:Hide()
-            end
         end
+        -- Equipment is subordinate to the main window; hide it whenever the
+        -- roster UI is not displayed, even if the main frame was already hidden.
+        self:_HideEquipmentWindow()
+    end
+
+    if (f:IsShown() and true or false) ~= wasShown then
+        self:_NotifySettingsVisibilityChanged()
     end
 
     if SF.Debug then
-        SF.Debug:Verbose("LH_WINDOW", "EvaluateVisibility(%s): show=%s (%s)", tostring(reason), tostring(shouldShow), tostring(why))
+        SF.Debug:Verbose(
+            "LH_WINDOW",
+            "EvaluateVisibility(%s): show=%s why=%s manuallyHidden=%s",
+            tostring(reason),
+            tostring(shouldShow),
+            tostring(why),
+            tostring(self._manuallyHidden and true or false)
+        )
     end
+end
+
+function Controller:EvaluateVisibility(reason)
+    local f = self:GetFrame()
+    if not f then return end
+
+    local eligible, why = self:ShouldBeVisible()
+    local shouldShow = eligible and not self._manuallyHidden
+    self:_ApplyFrameVisibility(shouldShow, reason, why)
+end
+
+-- Explicitly show the main Loot Helper window when automatic eligibility allows
+-- it. Clears the runtime-only manual-hidden override. Does not bypass enabled,
+-- active-profile, or raid/outside-raid rules.
+function Controller:ShowWindow(reason)
+    self._manuallyHidden = false
+    if SF.Debug then
+        SF.Debug:Info("LH_WINDOW", "ShowWindow(%s)", tostring(reason))
+    end
+    self:EvaluateVisibility(reason or "ShowWindow")
+    return self:ShouldBeVisible()
+end
+
+-- Hide the main Loot Helper window for this runtime only. Does not disable
+-- Loot Helper, end sessions, or change persisted window geometry/minimized state.
+function Controller:HideWindow(reason)
+    self._manuallyHidden = true
+    if SF.Debug then
+        SF.Debug:Info("LH_WINDOW", "HideWindow(%s): manuallyHidden=true", tostring(reason))
+    end
+    self:_ApplyFrameVisibility(false, reason or "HideWindow", "manually_hidden")
+end
+
+function Controller:ToggleWindow(reason)
+    if self:IsWindowShown() then
+        self:HideWindow(reason)
+        return false, "manually_hidden"
+    end
+    return self:ShowWindow(reason)
 end
 
 -- ===================================================
@@ -300,6 +391,10 @@ function Controller:Init()
         self:OnMinimizeClicked()
     end
 
+    frame.OnCloseClicked = function()
+        self:OnCloseClicked()
+    end
+
     self:_InitEvents()
     self:_HookSettingsStore()
     self:_HookProfileChanges()
@@ -402,6 +497,17 @@ end
 function Controller:OnMinimizeClicked()
     if LH.Window and LH.Window.ToggleMinimized then
         LH.Window:ToggleMinimized()
+    end
+end
+
+function Controller:OnCloseClicked()
+    self:HideWindow("CloseButton")
+end
+
+function Controller:OnMinimizedStateChanged(minimized)
+    self:_SyncReadinessListener()
+    if not minimized then
+        self:RequestRefresh("Restored")
     end
 end
 
@@ -518,12 +624,26 @@ function Controller:_InitRosterView(frame)
     frame.Content.RosterView = self._rosterView -- so Style.lua can reach it
 end
 
-function Controller:RefreshRoster()
+function Controller:_IsRosterContentVisible()
     local f = self:GetFrame()
-    if not f then return end
+    if not f or not f:IsShown() then
+        return false
+    end
+    -- Content:IsShown is the real visibility signal. A stale minimized flag
+    -- must not skip roster rebuilds while the list is on-screen.
+    if f.Content and f.Content.IsShown and f.Content:IsShown() then
+        return true
+    end
+    if LH.Window and LH.Window.IsMinimized and LH.Window:IsMinimized() then
+        return false
+    end
+    return true
+end
 
-    -- Don't do heavy work if hidden
-    if not f:IsShown() then return end
+function Controller:RefreshRoster()
+    if not self:_IsRosterContentVisible() then
+        return
+    end
 
     local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
     local rows, meta = LH.RosterModel:Build(profile)
@@ -569,6 +689,45 @@ function Controller:_BindLootHelperEvents()
     end, self)
 
     self._boundLHEvents = true
+end
+
+function Controller:_BindReadinessListener()
+    if self._readinessListenerBound then
+        return
+    end
+    if not (SF.RaidCheck and SF.RaidCheck.RegisterTroubleshootingListener) then
+        return
+    end
+    SF.RaidCheck:RegisterTroubleshootingListener("lootHelperRoster", function(_, reason)
+        -- TOOLTIP_DATA_UPDATE only invalidates prepared-slot caches for the
+        -- Raid Equipment audit table. Glance readiness reads inspect cache /
+        -- last-good / local player and must not rebuild the roster on hover.
+        if reason == "tooltip" then
+            return
+        end
+        if self:_IsRosterContentVisible() then
+            self:RequestRefresh("EquipmentCache")
+        end
+    end)
+    self._readinessListenerBound = true
+end
+
+function Controller:_UnbindReadinessListener()
+    if not self._readinessListenerBound then
+        return
+    end
+    if SF.RaidCheck and SF.RaidCheck.UnregisterTroubleshootingListener then
+        SF.RaidCheck:UnregisterTroubleshootingListener("lootHelperRoster")
+    end
+    self._readinessListenerBound = false
+end
+
+function Controller:_SyncReadinessListener()
+    if self:_IsRosterContentVisible() then
+        self:_BindReadinessListener()
+    else
+        self:_UnbindReadinessListener()
+    end
 end
 
 -- ===================================================

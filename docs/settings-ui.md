@@ -8,7 +8,7 @@ The left sidebar lists **categories** grouped as Core, Loot Tools, Advanced, and
 
 Installed optional child addons appear under **Optional**. If the add-on is enabled for this character but has no settings pages yet, the category opens to a generic empty state. If an optional add-on is disabled for this character, the row stays visible and greyed; hover explains that it must be enabled in World of Warcraft's AddOns list. Spectrum Federation cannot enable or disable child addons from `/sf`.
 
-`Enable LootHelper` on the Loot Helper General tab only shows or hides the roster window. It does not grey the Loot Helper category.
+**Enable Loot Helper** on the Loot Helper General tab controls whether the roster window is allowed to appear. It does not grey the Loot Helper category, and it is not the control for hiding a currently visible window for this session.
 
 The window can be resized from the bottom-right grip. Wide pages such as Raid Equipment and Loot Logs raise the minimum size when needed, but leaving those pages does not shrink the window.
 
@@ -48,8 +48,9 @@ The sliders update the visible trail while you drag them. Copy overwrites every 
 
 ## Loot Helper: General
 
-- **Enable LootHelper** — show or hide the roster window when its other visibility conditions are met. Sync and Raid Check still initialize and remain available.
-- **Lock Loot Window** — prevent moving and resizing the Loot Helper window.
+- **Enable Loot Helper** — allow the roster window to appear when its other visibility conditions are met. Turning this off hides the window and prevents automatic re-show. Sync and Raid Check still initialize. Use **Loot Window** Show/Hide to hide the UI without changing this setting.
+- **Loot Window** — show or hide the roster window on this client. The button reads **Show Loot Window** or **Hide Loot Window** based on current visibility. Hiding the window does not disable Loot Helper, end a session, or stop synchronization.
+- **Lock Loot Window** — prevent moving and resizing the Loot Helper window. Title-bar Close, Minimize, Settings, and Start/Stop Session still work.
 - **Show Members not in raid** — include profile members who are absent from the current raid.
 - **Show Loot Window outside of Raid** — allow the roster window while solo or in a party.
 - **Enable Local Safemode** — save the intended local safe-mode preference.
@@ -109,7 +110,9 @@ Profile admins can choose a character, set that character's persistent specializ
 
 ## Loot Helper: RC Loot Council
 
-This tab appears only when the optional `SpectrumFederation_RCLootCouncilIntegration` child addon is enabled. Profile admins can choose whether finalized RC Loot Council awards are written to Loot Logs, which RC response labels to record, and which recorded responses qualify as BiS for future awards. Settings belong to the active Loot Helper profile and sync with that profile's snapshot. There is no extra **Optional** sidebar row. See [RC Loot Council Integration](development/rc-loot-council-integration.md).
+This tab appears only when the optional `SpectrumFederation_RCLootCouncilIntegration` child addon is enabled. Profile admins can choose whether finalized RC Loot Council awards are written to Loot Logs, which RC response labels to record, and which recorded responses qualify as BiS for future awards. Settings belong to the active Loot Helper profile and sync with that profile's snapshot. There is no extra **Optional** sidebar row.
+
+During a Loot Helper session, while RC award recording is on, admins also get a local warning if a player selects one of those BiS responses after that opportunity is already used. The Master Looter gets an informational popup if the item is awarded anyway. Neither message changes RC Loot Council or the tracked BiS state. See [RC Loot Council Integration](development/rc-loot-council-integration.md).
 
 ## Loot Logs
 

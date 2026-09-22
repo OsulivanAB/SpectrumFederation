@@ -57,4 +57,7 @@ read_globals = {
   "WorldMapFrame",
   "SlashCmdList",
   "CooldownFrameTemplate",
+  "StaticPopupDialogs",
+  "StaticPopup_Show",
+  "OKAY",
 }

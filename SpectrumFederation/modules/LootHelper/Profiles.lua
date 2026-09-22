@@ -1006,6 +1006,98 @@ function LootProfile:GetIdentityAttendance(memberId)
     return 0
 end
 
+function LootProfile:GetRaidCheckAttendanceDisplay(memberId)
+    local Identity = SF.LootHelperIdentity
+    if not (Identity and Identity.FormatRaidCheckAttendance) then
+        return "—"
+    end
+    return Identity.FormatRaidCheckAttendance(self:GetIdentityProjection(), memberId)
+end
+
+function LootProfile:GetRaidCheckPreparednessDisplay(memberId)
+    local Identity = SF.LootHelperIdentity
+    if not (Identity and Identity.FormatRaidCheckPreparedness) then
+        return "—"
+    end
+    return Identity.FormatRaidCheckPreparedness(self:GetIdentityProjection(), memberId)
+end
+
+function LootProfile:HasRaidCheckPresenceOpportunity(opportunityId)
+    local Identity = SF.LootHelperIdentity
+    if not (Identity and Identity.HasRaidCheckPresenceOpportunity) then
+        return false
+    end
+    return Identity.HasRaidCheckPresenceOpportunity(self:GetIdentityProjection(), opportunityId)
+end
+
+local function CopySortedUniqueIds(ids)
+    local out = {}
+    local seen = {}
+    if type(ids) ~= "table" then
+        return out
+    end
+    for i = 1, #ids do
+        local id = NormalizeMemberId(ids[i])
+        if id and not seen[id] then
+            seen[id] = true
+            out[#out + 1] = id
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+function LootProfile:RecordRaidCheckPresence(opts)
+    opts = opts or {}
+    local opportunityId = opts.opportunityId
+    if type(opportunityId) ~= "string" or opportunityId == "" then
+        return false
+    end
+    if self:HasRaidCheckPresenceOpportunity(opportunityId) then
+        return false
+    end
+    local types = SF.LootLogEventTypes
+    if not (types and types.RAID_CHECK_PRESENCE and SF.LootLog and SF.LootLog.new) then
+        return false
+    end
+    local eventData = SF.LootLog.GetEventDataTemplate(types.RAID_CHECK_PRESENCE)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    eventData.opportunityId = opportunityId
+    eventData.presentMembers = CopySortedUniqueIds(opts.presentMembers)
+    eventData.eligibleMembers = CopySortedUniqueIds(opts.eligibleMembers)
+    eventData.preparedMembers = CopySortedUniqueIds(opts.preparedMembers)
+    local logOpts = {
+        profile = self,
+        skipPermission = opts.skipPermission,
+    }
+    if type(opts.logAuthor) == "string" and opts.logAuthor ~= "" then
+        logOpts.author = opts.logAuthor
+    end
+    local logEntry = SF.LootLog.new(types.RAID_CHECK_PRESENCE, eventData, logOpts)
+    if not logEntry then
+        return false
+    end
+    local ok, err = self:AddLootLog(logEntry, {
+        skipBroadcast = opts.skipBroadcast,
+        skipPermission = opts.skipPermission,
+    })
+    if ok and SF.Debug then
+        SF.Debug:Info(
+            "LootProfile",
+            "Recorded RAID_CHECK_PRESENCE %s (present=%d eligible=%d prepared=%d)",
+            tostring(opportunityId),
+            #eventData.presentMembers,
+            #eventData.eligibleMembers,
+            #eventData.preparedMembers
+        )
+    elseif not ok and SF.Debug then
+        SF.Debug:Warn("LootProfile", "Failed to record RAID_CHECK_PRESENCE %s: %s", tostring(opportunityId), tostring(err))
+    end
+    return ok, err
+end
+
 function LootProfile:GetIdentityArmor(memberId)
     memberId = NormalizeMemberId(memberId)
     local result = self:GetIdentityProjection()
@@ -2042,7 +2134,7 @@ function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
 	return PushRCIntegrationConfig(self)
 end
 
-function LootProfile:IsBisQualifyingResponse(response, meta)
+function LootProfile:MatchBisQualifyingResponse(response, meta)
 	self:_EnsureRCLootCouncilIntegrationConfig()
 	if type(response) == "table" and meta == nil then
 		meta = response
@@ -2050,10 +2142,14 @@ function LootProfile:IsBisQualifyingResponse(response, meta)
 	end
 	for _, existing in ipairs(self._rcLootCouncilIntegration.bisResponses or {}) do
 		if BisEntryMatchesCanonical(existing, response, meta) then
-			return true
+			return existing
 		end
 	end
-	return false
+	return nil
+end
+
+function LootProfile:IsBisQualifyingResponse(response, meta)
+	return self:MatchBisQualifyingResponse(response, meta) ~= nil
 end
 
 function LootProfile:AddRCLootCouncilBisResponse(value)
@@ -2225,6 +2321,75 @@ local function WarnLiveBisConflict(self, awardKey, message)
     end
 end
 
+-- Read-only BiS opportunity check shared by automatic award recording and
+-- RC double-roll protection. Does not consume a slot, write a log, or mutate
+-- equipment state. excludeAwardKey omits slots assigned by that RC award so
+-- a win is not compared against itself.
+function LootProfile:EvaluateRCBisConflict(opts)
+    opts = type(opts) == "table" and opts or {}
+    local Bis = SF.LootHelperBis
+    if not (Bis and Bis.DecideAutomaticOutcome and Bis.ClassifyItem) then
+        return nil, "unavailable"
+    end
+    local awardMember = opts.memberId or opts.awardMember
+    local response = opts.response
+    local meta = opts.meta
+    if meta == nil and (opts.responseId ~= nil or opts.typeCode ~= nil or opts.isAwardReason ~= nil) then
+        meta = {
+            responseId = opts.responseId,
+            typeCode = opts.typeCode,
+            isAwardReason = opts.isAwardReason and true or false,
+        }
+    end
+    local entry = self:MatchBisQualifyingResponse(response, meta)
+    local qualified = entry ~= nil
+    local classif = Bis.ClassifyItem(opts.itemLink or opts.itemString)
+    local member = awardMember and self.getMemberByID and self:getMemberByID(awardMember) or nil
+    local storedSpec = member and member.GetSpecId and member:GetSpecId() or nil
+    local specId = Bis.ResolveRecipientSpec(awardMember, storedSpec)
+    local identityMembers = {}
+    if awardMember and self.GetIdentityMembers then
+        identityMembers = self:GetIdentityMembers(awardMember)
+    end
+    local occupancy = {}
+    if awardMember and Bis.LiveOccupancyFromProjection then
+        occupancy = Bis.LiveOccupancyFromProjection(
+            self:GetIdentityProjection(),
+            awardMember,
+            opts.excludeAwardKey
+        )
+    end
+    local decided = Bis.DecideAutomaticOutcome({
+        qualified = qualified,
+        classif = classif,
+        specId = specId,
+        occupancy = occupancy,
+        identityMembers = identityMembers,
+        awardMember = awardMember,
+    })
+    local slotLabel = Bis.FriendlyOpportunityLabel and Bis.FriendlyOpportunityLabel(classif) or nil
+    local responseLabel = entry and entry.text or nil
+    if type(responseLabel) ~= "string" or responseLabel == "" then
+        responseLabel = type(response) == "string" and response or nil
+    end
+    local uncertain = member == nil
+        or classif == nil
+        or decided.outcome == Bis.OUTCOME.UNRESOLVED
+        or (decided.outcome == Bis.OUTCOME.OVERFLOW and (type(slotLabel) ~= "string" or slotLabel == ""))
+    local conflict = qualified and decided.outcome == Bis.OUTCOME.OVERFLOW and not uncertain
+    return {
+        qualified = qualified,
+        conflict = conflict,
+        uncertain = uncertain,
+        slotLabel = slotLabel,
+        responseLabel = responseLabel,
+        decided = decided,
+        classif = classif,
+        specId = specId,
+        identityMembers = identityMembers,
+    }
+end
+
 function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical)
     if type(rcLog) ~= "table" or type(canonical) ~= "table" then
         return false, "invalid_award"
@@ -2239,27 +2404,20 @@ function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical)
     local awardKey = canonical.awardKey
     local awardMember = canonical.winner
     local response = canonical.response
-    local qualified = self:IsBisQualifyingResponse(response, canonical)
-    local classif = Bis.ClassifyItem(canonical.itemLink or canonical.itemString)
-    local storedSpec
-    local member = self:getMemberByID(awardMember)
-    if member and member.GetSpecId then
-        storedSpec = member:GetSpecId()
-    end
-    local specId = Bis.ResolveRecipientSpec(awardMember, storedSpec)
-    local identityMembers = self:GetIdentityMembers(awardMember)
-    local occupancy = {}
-    if Bis.LiveOccupancyFromProjection then
-        occupancy = Bis.LiveOccupancyFromProjection(self:GetIdentityProjection(), awardMember)
-    end
-    local decided = Bis.DecideAutomaticOutcome({
-        qualified = qualified,
-        classif = classif,
-        specId = specId,
-        occupancy = occupancy,
-        identityMembers = identityMembers,
-        awardMember = awardMember,
+    local evaluation = self:EvaluateRCBisConflict({
+        memberId = awardMember,
+        itemLink = canonical.itemLink,
+        itemString = canonical.itemString,
+        response = response,
+        responseId = canonical.responseId,
+        typeCode = canonical.typeCode,
+        isAwardReason = canonical.isAwardReason,
     })
+    if not evaluation then
+        return false, "unavailable"
+    end
+    local decided = evaluation.decided
+    local classif = evaluation.classif
     local eventType = SF.LootLogEventTypes.BIS_OUTCOME
     local eventData = SF.LootLog.GetEventDataTemplate(eventType)
     eventData.sourceLogId = awardKey

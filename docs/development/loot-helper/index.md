@@ -46,6 +46,7 @@ Member caches are written by identity projection on the profile. Do not treat th
 - `BIS_OVERRIDE`
 - `MANUAL_AWARD`
 - `MANUAL_AWARD_REVERSE`
+- `RAID_CHECK_PRESENCE`
 
 Each ID is `author:counter`, where the counter is allocated per profile and author. Serialization uses versioned CBOR encoded as Base64. Validation lives in `LootLogValidators.lua`.
 
@@ -80,9 +81,9 @@ Profiles are keyed by stable ID and `activeProfileId` stores the local selection
 
 ## UI flow
 
-`UI/LootHelper/Controller.lua` decides window visibility, observes settings/profile/session changes, builds roster models, and connects row actions.
+`UI/LootHelper/Controller.lua` is the authority for roster-window visibility. It combines automatic eligibility (`lootHelper.enabled`, active profile, raid / `showWindowOutsideRaid`) with a runtime-only manual-hidden override. `ShowWindow` / `HideWindow` / `ToggleWindow` / `IsWindowShown` are the public visibility API. Closing the window (title-bar X or Settings **Loot Window**) sets that override and hides `EquipmentWindow`; it does not disable Loot Helper or stop sessions, sync, or heartbeat. `EvaluateVisibility` must not reopen a manually hidden window. `/sf loot` and Settings **Show Loot Window** call `ShowWindow`, which clears the override and then reapplies eligibility. The override is not persisted; `/reload` returns to automatic visibility. Minimize/expanded state is independent of close.
 
-`UI/LootHelper/Window.lua` owns the roster window frame. Minimize and restore re-anchor the frame to its current top-left so height changes expand downward from the title bar instead of growing around a CENTER point.
+`UI/LootHelper/Window.lua` owns the roster window frame. The title bar includes Close, Minimize/Restore, Settings, and Start/Stop Session. Minimize and restore re-anchor the frame to its current top-left so height changes expand downward from the title bar instead of growing around a CENTER point.
 
 `RosterModel.lua` merges:
 
@@ -92,7 +93,7 @@ Profiles are keyed by stable ID and `activeProfileId` stores the local selection
 - current user's admin permission;
 - the **Show Members not in raid** preference.
 
-`RosterView.lua` renders rows and delegates point, add-member, and equipment actions to model/domain methods. `EquipmentWindow.lua` renders the profile's loot-category state and optionally overlays current Raid Check issues.
+`RosterView.lua` renders a column roster (name, optional points, attendance percent, preparedness percent, BiS used/possible, readiness, details) and delegates add-member and equipment actions to model/domain methods. Manual Attendance-point and loot-point adjustments live on **Loot Helper → Character**, not on roster arrows. The Points column uses the configured point name and is hidden in Reward Pot mode. `EquipmentWindow.lua` renders the profile's loot-category state and optionally overlays current Raid Check issues. The glance list refreshes from `DATA_CHANGED` and in-process troubleshooting listeners while the window is shown; it does not enable background inspect.
 
 Feature updates should fire or reuse `LootHelperEvents` so views refresh without polling.
 
@@ -142,7 +143,9 @@ When adding a new message type, update constants, routing, validation, handler r
 
 ## Raid Check integration
 
-`modules/RaidEquipment/Policy.lua` owns current-Retail completeness and Prepared/Unprepared rules. `modules/RaidEquipment/CheckRun.lua` owns frozen run identity, pause clocks, scaled inspect bounds, inspect-generation tokens, classification, session preflight, and the session-announce gate for consequences. `modules/RaidCheck.lua` owns the shared serial `NotifyInspect` queue, runtime last-good observations, the standalone audit snapshot, and Pre-Raid / Raid Check entry. Consequence application is fail-closed on effective local admin: if Preview as Non-Admin becomes active during an in-flight run, awards, Reward Pot writes, logs, and admin whispers abort as a unit and the run is marked settled so it cannot replay.
+`modules/RaidEquipment/Policy.lua` owns current-Retail completeness and Prepared/Unprepared rules, including `ReadinessFromObservation` for the Loot Helper glance indicator. `modules/RaidEquipment/CheckRun.lua` owns frozen run identity, pause clocks, scaled inspect bounds, inspect-generation tokens, classification, session preflight, and the session-announce gate for consequences. `modules/RaidCheck.lua` owns the shared serial `NotifyInspect` queue, runtime last-good observations, the standalone audit snapshot, and Pre-Raid / Raid Check entry. `GetCachedEquipmentReadiness` reads cache/last-good/local-player data only and does not queue inspects. Consequence application is fail-closed on effective local admin: if Preview as Non-Admin becomes active during an in-flight run, awards, Reward Pot writes, logs, and admin whispers abort as a unit and the run is marked settled so it cannot replay.
+
+Each settled Raid Check (`mode == "raid"`) is one presence opportunity, matching the existing point-award boundary: repeated UI runs create additional opportunities. Presence credit is independent of equipment preparedness. Preparedness credit is the present ∩ `CheckRun.CLASS.PREPARED` subset of the same opportunity and is stored on optional `preparedMembers`. Eligible players are the frozen profile roster at run start; present players are the frozen group. A player who was neither on the roster nor in the group is omitted from that opportunity and is not treated as absent. Players with no applicable opportunities display `—`. Older presence logs that omit `preparedMembers` display `—` for Prep. rather than inventing a 0% history. Do not derive either percentage from `POINT_CHANGE` or Reward Pot `ATTENDANCE_CHANGE` balances.
 
 Acquisition, policy, and consequences are separate:
 
@@ -157,4 +160,4 @@ The standalone **Raid Equipment** settings page consumes versioned troubleshooti
 
 ## Testing changes
 
-For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover session preflight, announce vs consequence apply, frozen joiners/leavers, combat pause, range-only recent-good, Inspection Failed, and incomplete item data. Production-Lua policy and CheckRun coverage is `python -m pytest tests/test_raid_equipment.py`. Item-link parsing remains `python -m pytest tests/test_raid_check_item_links.py`. Settings navigation for the standalone Raid Equipment category is `python -m pytest tests/test_settings_navigation.py`. Minimize/expand anchoring for the roster window is covered by `python -m pytest tests/test_loot_helper_window.py`. Protocol mismatch chat-warning dedupe is `python -m pytest tests/test_sync_protocol.py`.
+For domain changes, test replay from logs and `/reload` metatable restoration. For sync changes, use multiple clients and cover missing-profile, missing-range, duplicate, late-join, coordinator loss, and safe-mode cases. For Raid Check, cover session preflight, announce vs consequence apply, frozen joiners/leavers, combat pause, range-only recent-good, Inspection Failed, and incomplete item data. Production-Lua policy and CheckRun coverage is `python -m pytest tests/test_raid_equipment.py`. Item-link parsing remains `python -m pytest tests/test_raid_check_item_links.py`. Settings navigation for the standalone Raid Equipment category is `python -m pytest tests/test_settings_navigation.py`. Minimize/expand anchoring and close/manual-hidden visibility for the roster window are covered by `python -m pytest tests/test_loot_helper_window.py`. Protocol mismatch chat-warning dedupe is `python -m pytest tests/test_sync_protocol.py`.

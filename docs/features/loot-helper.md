@@ -8,21 +8,34 @@ Each profile uses one loot mode: [Point Based](point-based.md) or [Reward Pot](r
 
 Loot Helper requires the feature to be enabled and an active profile to exist. By default, its window is shown only while you are in a raid. **Show Loot Window outside of Raid** removes the raid-only restriction.
 
-Enter `/sf loot` to enable Loot Helper and re-evaluate the window. The title bar also provides:
+Enable Loot Helper and window visibility are separate. Turning Enable off hides the window and keeps it from appearing automatically. Closing the window with X only hides the UI for this session; sessions, sync, heartbeat, Raid Check, and related features keep running.
 
+Enter `/sf loot` to enable Loot Helper if needed and show the window. That command is an explicit Show: it reopens a window you closed and does not toggle a visible window off. **Loot Helper → General → Loot Window** also shows or hides the roster. Eligibility rules still apply, so Show will not appear outside a raid unless **Show Loot Window outside of Raid** is on, and it still requires an active profile.
+
+The title bar provides:
+
+- a close (X) button that hides the window for this session;
 - a play/stop button for sync sessions, visible to profile admins;
 - a settings button that opens the Loot Helper settings;
 - a minimize button;
 - drag and resize behavior, unless **Lock Loot Window** is enabled.
 
-The window's position, size, and minimized state are saved locally. Minimizing and restoring keep the title bar in place so the window grows and shrinks downward.
+Close remains usable while the window is locked. Closing does not change the saved minimized or expanded state. A `/reload` or relog clears the hidden override and returns to automatic visibility.
+
+The window's position, size, and minimized state are saved locally. Minimizing and restoring keep the title bar in place so the window grows and shrinks downward. The close/hidden preference is not saved.
+
+The window can be resized narrower than its default width. As width decreases, the raider name truncates with an ellipsis first and never shorter than the class or spec icon plus about three characters. If the window is still too narrow, **BiS** hides, then **Prep.**, then **Att.** Those columns return in the opposite order as the window gets wider. The equipment button, the Points column in Point Based mode, the readiness indicator, and the title-bar Start/Stop, Settings, Minimize, and Close controls stay available. Profile text in the title may truncate so those controls stay usable. Which glance columns are hidden is not saved; it follows the current width. A saved width above the minimum opens at that width.
 
 ## Understanding the roster
 
-Profile members show their class or specialization icon, class-colored name, a mode-specific total, and an equipment-history button.
+Profile members show their class or specialization icon, class-colored name, glance columns, and an equipment-history button.
 
-- In **Point Based**, the title uses the profile's point name and each row shows loot points.
-- In **Reward Pot**, the title shows Attendance, each row shows Attendance, and the current Reward Pot appears above the list.
+- In **Point Based**, the title uses the profile's point name and each row shows that named point balance in its own column.
+- In **Reward Pot**, the title shows Attendance, the Points column is hidden, and the current Reward Pot appears above the list.
+- **Att.** is raid-check presence as a percentage. A player is credited when they were in the group at the start of a Raid Check, whether or not their gear was prepared. Players with no recorded presence opportunities show `—`.
+- **Prep.** is raid-check preparedness as a percentage. A player is credited only when they were present and classified Prepared by the same Raid Check equipment rules (verified enchants and gems). Inspection Failed and out-of-range-without-recent-verify do not count as prepared. Older presence logs that predate this field show `—` rather than inventing a 0% history.
+- **BiS** is slots already used out of the player's possible BiS slots, using the same identity projection as the equipment popup.
+- The readiness icon appears only when cached equipment is known to be missing a Raid Check requirement. Ready and unknown rows leave that space blank. Out of range does not by itself mean Not Ready. Hover a warning for the missing requirements.
 
 When you are in a raid, the window also identifies raid members who are not in the active profile. An admin can add them with the plus button. The **Show Members not in raid** setting controls whether absent profile members remain visible.
 
@@ -32,7 +45,7 @@ Linked characters remain separate rows. When both are visible, identity-wide tot
 
 Profile admins can:
 
-- increase or decrease loot points in half-point steps in Point Based, or Attendance by one in Reward Pot;
+- increase or decrease Attendance points and loot points from **Loot Helper → Character** (these are not the roster Att.% or Prep. columns);
 - add current raid members to the profile;
 - mark equipment categories used or available;
 - create, select, rename, and delete profiles;

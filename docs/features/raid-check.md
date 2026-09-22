@@ -88,7 +88,9 @@ Templates support `{player_name}`, `{missing}`, `{point_name}`, and `{points_awa
 
 ## What gets recorded
 
-Point Based awards are loot-point log entries with **Raid Check** as the author. Reward Pot awards are Attendance log entries with the same author. A Reward Pot deduction is a Reward Pot change with **Raid Check** as the author. If there is no matching announced session, those logs are saved locally and are not synchronized.
+Point Based awards are loot-point log entries with **Raid Check** as the author. Reward Pot awards are Attendance log entries with the same author. A Reward Pot deduction is a Reward Pot change with **Raid Check** as the author. Each settled Raid Check also writes one `RAID_CHECK_PRESENCE` log for the frozen group, roster, and players classified Prepared. Presence credit is independent of Prepared/Unprepared. Preparedness credit requires both presence and a Prepared classification from the current Raid Check equipment rules. If there is no matching announced session, those logs are saved locally and are not synchronized.
+
+The Loot Helper roster **Att.** column is that presence history as a percentage. **Prep.** is the prepared-and-present subset of the same opportunities. Neither column is derived from loot points or Reward Pot Attendance. A player who was not on the roster and not in the group for a recorded check is omitted from that opportunity rather than marked absent. No recorded opportunities display as `—`. Presence logs written before preparedness was stored also display `—` in **Prep.** rather than inventing a 0% history.
 
 Run checks from **Loot Helper → Session**, or use `/sf raidcheck pre` and `/sf raidcheck raid`.
 
