@@ -2134,7 +2134,7 @@ function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
 	return PushRCIntegrationConfig(self)
 end
 
-function LootProfile:IsBisQualifyingResponse(response, meta)
+function LootProfile:MatchBisQualifyingResponse(response, meta)
 	self:_EnsureRCLootCouncilIntegrationConfig()
 	if type(response) == "table" and meta == nil then
 		meta = response
@@ -2142,10 +2142,14 @@ function LootProfile:IsBisQualifyingResponse(response, meta)
 	end
 	for _, existing in ipairs(self._rcLootCouncilIntegration.bisResponses or {}) do
 		if BisEntryMatchesCanonical(existing, response, meta) then
-			return true
+			return existing
 		end
 	end
-	return false
+	return nil
+end
+
+function LootProfile:IsBisQualifyingResponse(response, meta)
+	return self:MatchBisQualifyingResponse(response, meta) ~= nil
 end
 
 function LootProfile:AddRCLootCouncilBisResponse(value)
@@ -2317,6 +2321,75 @@ local function WarnLiveBisConflict(self, awardKey, message)
     end
 end
 
+-- Read-only BiS opportunity check shared by automatic award recording and
+-- RC double-roll protection. Does not consume a slot, write a log, or mutate
+-- equipment state. excludeAwardKey omits slots assigned by that RC award so
+-- a win is not compared against itself.
+function LootProfile:EvaluateRCBisConflict(opts)
+    opts = type(opts) == "table" and opts or {}
+    local Bis = SF.LootHelperBis
+    if not (Bis and Bis.DecideAutomaticOutcome and Bis.ClassifyItem) then
+        return nil, "unavailable"
+    end
+    local awardMember = opts.memberId or opts.awardMember
+    local response = opts.response
+    local meta = opts.meta
+    if meta == nil and (opts.responseId ~= nil or opts.typeCode ~= nil or opts.isAwardReason ~= nil) then
+        meta = {
+            responseId = opts.responseId,
+            typeCode = opts.typeCode,
+            isAwardReason = opts.isAwardReason and true or false,
+        }
+    end
+    local entry = self:MatchBisQualifyingResponse(response, meta)
+    local qualified = entry ~= nil
+    local classif = Bis.ClassifyItem(opts.itemLink or opts.itemString)
+    local member = awardMember and self.getMemberByID and self:getMemberByID(awardMember) or nil
+    local storedSpec = member and member.GetSpecId and member:GetSpecId() or nil
+    local specId = Bis.ResolveRecipientSpec(awardMember, storedSpec)
+    local identityMembers = {}
+    if awardMember and self.GetIdentityMembers then
+        identityMembers = self:GetIdentityMembers(awardMember)
+    end
+    local occupancy = {}
+    if awardMember and Bis.LiveOccupancyFromProjection then
+        occupancy = Bis.LiveOccupancyFromProjection(
+            self:GetIdentityProjection(),
+            awardMember,
+            opts.excludeAwardKey
+        )
+    end
+    local decided = Bis.DecideAutomaticOutcome({
+        qualified = qualified,
+        classif = classif,
+        specId = specId,
+        occupancy = occupancy,
+        identityMembers = identityMembers,
+        awardMember = awardMember,
+    })
+    local slotLabel = Bis.FriendlyOpportunityLabel and Bis.FriendlyOpportunityLabel(classif) or nil
+    local responseLabel = entry and entry.text or nil
+    if type(responseLabel) ~= "string" or responseLabel == "" then
+        responseLabel = type(response) == "string" and response or nil
+    end
+    local uncertain = member == nil
+        or classif == nil
+        or decided.outcome == Bis.OUTCOME.UNRESOLVED
+        or (decided.outcome == Bis.OUTCOME.OVERFLOW and (type(slotLabel) ~= "string" or slotLabel == ""))
+    local conflict = qualified and decided.outcome == Bis.OUTCOME.OVERFLOW and not uncertain
+    return {
+        qualified = qualified,
+        conflict = conflict,
+        uncertain = uncertain,
+        slotLabel = slotLabel,
+        responseLabel = responseLabel,
+        decided = decided,
+        classif = classif,
+        specId = specId,
+        identityMembers = identityMembers,
+    }
+end
+
 function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical)
     if type(rcLog) ~= "table" or type(canonical) ~= "table" then
         return false, "invalid_award"
@@ -2331,27 +2404,20 @@ function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical)
     local awardKey = canonical.awardKey
     local awardMember = canonical.winner
     local response = canonical.response
-    local qualified = self:IsBisQualifyingResponse(response, canonical)
-    local classif = Bis.ClassifyItem(canonical.itemLink or canonical.itemString)
-    local storedSpec
-    local member = self:getMemberByID(awardMember)
-    if member and member.GetSpecId then
-        storedSpec = member:GetSpecId()
-    end
-    local specId = Bis.ResolveRecipientSpec(awardMember, storedSpec)
-    local identityMembers = self:GetIdentityMembers(awardMember)
-    local occupancy = {}
-    if Bis.LiveOccupancyFromProjection then
-        occupancy = Bis.LiveOccupancyFromProjection(self:GetIdentityProjection(), awardMember)
-    end
-    local decided = Bis.DecideAutomaticOutcome({
-        qualified = qualified,
-        classif = classif,
-        specId = specId,
-        occupancy = occupancy,
-        identityMembers = identityMembers,
-        awardMember = awardMember,
+    local evaluation = self:EvaluateRCBisConflict({
+        memberId = awardMember,
+        itemLink = canonical.itemLink,
+        itemString = canonical.itemString,
+        response = response,
+        responseId = canonical.responseId,
+        typeCode = canonical.typeCode,
+        isAwardReason = canonical.isAwardReason,
     })
+    if not evaluation then
+        return false, "unavailable"
+    end
+    local decided = evaluation.decided
+    local classif = evaluation.classif
     local eventType = SF.LootLogEventTypes.BIS_OUTCOME
     local eventData = SF.LootLog.GetEventDataTemplate(eventType)
     eventData.sourceLogId = awardKey

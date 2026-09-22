@@ -714,7 +714,18 @@ function Bis.NextPackableSlot(family, occupancy)
     return nil
 end
 
-function Bis.LiveOccupancyFromProjection(result, memberId)
+local function CellBelongsToAward(cell, awardKey)
+    if type(awardKey) ~= "string" or awardKey == "" or type(cell) ~= "table" then
+        return false
+    end
+    local ref = cell.awardRef
+    return type(ref) == "table" and ref.kind == "RC" and ref.id == awardKey
+end
+
+-- Read-only slot occupancy for one member. excludeAwardKey drops slots that
+-- the named RC award itself assigned, so a just-recorded win is not treated
+-- as a pre-existing conflict.
+function Bis.LiveOccupancyFromProjection(result, memberId, excludeAwardKey)
     local occ = {}
     if type(result) ~= "table" or not memberId then
         return occ
@@ -734,10 +745,33 @@ function Bis.LiveOccupancyFromProjection(result, memberId)
     end
     for slot, cell in pairs(slots) do
         if type(cell) == "table" and cell.state and cell.state ~= "AVAILABLE" then
-            occ[slot] = true
+            if not CellBelongsToAward(cell, excludeAwardKey) then
+                occ[slot] = true
+            end
         end
     end
     return occ
+end
+
+-- User-facing opportunity name. Packable and weapon conflicts stay generic
+-- so warnings never expose Ring1/Trinket2 or a single weapon slot id.
+function Bis.FriendlyOpportunityLabel(classif)
+    if type(classif) ~= "table" then
+        return nil
+    end
+    if classif.family == "ring" then
+        return "Ring"
+    end
+    if classif.family == "trinket" then
+        return "Trinket"
+    end
+    if classif.family == "weapon" or classif.family == "offhand" or classif.isWeaponLoc or classif.isOffHandLoc then
+        return "Weapon/Off-Hand"
+    end
+    if type(classif.slot) == "string" and classif.slot ~= "" then
+        return classif.slot
+    end
+    return nil
 end
 
 local function OriginActive(state, originLogId)
