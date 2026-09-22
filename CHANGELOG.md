@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.3-beta.5] - 2026-09-22
+
+### Changed
+- Warn when an RC BiS response repeats a used opportunity
+
 ## [1.5.3-beta.4] - 2026-09-21
 
 ### Changed
