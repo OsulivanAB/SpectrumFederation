@@ -347,7 +347,8 @@ end
 
 -- One next-frame confirmation for a coordinate-space transition. The scale
 -- read inside DISPLAY_SIZE_CHANGED / UI_SCALE_CHANGED can still be the
--- pre-change value. Coalesce so repeated events keep a single callback.
+-- pre-change value. A resize drag can emit a burst of those events; the
+-- stamp pool and segment arrays are cleared once, not on every event.
 local scaleRefreshPending = false
 
 local function ScalesDiffer(previous, current)
@@ -360,22 +361,58 @@ local function ScalesDiffer(previous, current)
 	return diff > 0.0001
 end
 
+local function HasLiveTrail()
+	return engine and (engine.count > 0 or (engine.activeSegCount or 0) > 0)
+end
+
+local function DropSamplingBaseline()
+	if engine then
+		engine:InvalidateBaseline()
+	end
+	lastRawX = nil
+	lastRawY = nil
+end
+
+-- Full pool reset only when stamps or segments are actually live. A baseline
+-- alone is an O(1) invalidation. Disabled transitions only refresh the cache:
+-- StopRuntime has already cleared the trail.
+local function ApplyCoordinateDiscontinuity(allowPoolReset)
+	if not cache.enabled or not engine then
+		return
+	end
+	if allowPoolReset and HasLiveTrail() then
+		Tracer:OnDiscontinuity(true)
+	elseif engine.hasBaseline then
+		DropSamplingBaseline()
+	else
+		lastRawX = nil
+		lastRawY = nil
+	end
+end
+
 local function RefreshCoordinateSpace()
+	local previous = cache.scale
 	RecacheScale()
-	Tracer:OnDiscontinuity(true)
+	local scaleChanged = ScalesDiffer(previous, cache.scale)
+
+	if not scaleRefreshPending then
+		ApplyCoordinateDiscontinuity(true)
+	elseif scaleChanged then
+		ApplyCoordinateDiscontinuity(true)
+	end
+
 	if scaleRefreshPending or not C_Timer or not C_Timer.After then
 		return
 	end
 	scaleRefreshPending = true
 	C_Timer.After(0, function()
 		scaleRefreshPending = false
-		local previous = cache.scale
+		local before = cache.scale
 		RecacheScale()
-		-- Only drop a trail started after the event when the committed scale
-		-- differs from the value captured during the event.
-		if ScalesDiffer(previous, cache.scale) then
-			Tracer:OnDiscontinuity(true)
+		if not ScalesDiffer(before, cache.scale) then
+			return
 		end
+		ApplyCoordinateDiscontinuity(true)
 	end)
 end
 

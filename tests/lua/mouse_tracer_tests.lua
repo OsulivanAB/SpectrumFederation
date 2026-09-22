@@ -835,9 +835,17 @@ pumpCursor(0, 0)
 pumpCursor(80, 0)
 assertStrokeUsesScale(Tracer.engine, "samples after the committed scale")
 
+local resetCount = 0
+local originalReset = getmetatable(Tracer.engine).__index.Reset
+getmetatable(Tracer.engine).__index.Reset = function(self)
+    resetCount = resetCount + 1
+    return originalReset(self)
+end
+
 local framesBeforeRepeat = createdFrames
 local texturesBeforeRepeat = createdTextures
 local scheduledBeforeRepeat = #afterHandles
+resetCount = 0
 for _ = 1, 100 do
     fireTracerEvent("DISPLAY_SIZE_CHANGED")
 end
@@ -845,6 +853,8 @@ assertEq(#afterHandles, scheduledBeforeRepeat + 1, "100 display-size events sche
 assertEq(pendingScaleRefreshes(), 1, "repeated display-size events leave one pending confirmation")
 assertEq(createdFrames, framesBeforeRepeat, "repeated display-size events do not create frames")
 assertEq(createdTextures, texturesBeforeRepeat, "repeated display-size events do not create textures")
+assertEq(resetCount, 1, "a display-size burst resets the trail pool once")
+assertEq(Tracer.engine.count, 0, "the burst still clears the live trail")
 flushScaleRefreshes()
 assertEq(pendingScaleRefreshes(), 0, "flushing the coalesced confirmation leaves none pending")
 scheduledBeforeRepeat = #afterHandles
@@ -873,13 +883,16 @@ Tracer:ApplyEnabled(false)
 assertTrue(host.scripts.OnUpdate == nil, "disabling removes OnUpdate")
 local framesBeforeDisabled = createdFrames
 local scheduledBeforeDisabled = #afterHandles
+resetCount = 0
 for _ = 1, 50 do
     fireTracerEvent("DISPLAY_SIZE_CHANGED")
 end
 assertTrue(host.scripts.OnUpdate == nil, "display-size changes while disabled do not resume sampling")
 assertEq(createdFrames, framesBeforeDisabled, "display-size changes while disabled do not create frames")
 assertEq(#afterHandles, scheduledBeforeDisabled + 1, "display-size changes while disabled still coalesce")
+assertEq(resetCount, 0, "display-size changes while disabled do not reset the trail pool")
 flushScaleRefreshes()
+assertEq(resetCount, 0, "the deferred scale read while disabled does not reset the trail pool")
 
 local framesBeforeReinit = createdFrames
 Tracer:Init()
