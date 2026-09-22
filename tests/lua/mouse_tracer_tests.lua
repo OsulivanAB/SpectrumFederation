@@ -1,4 +1,4 @@
--- Production-Lua tests for MouseTracer Constants + TrailEngine.
+-- Production-Lua tests for MouseTracer Constants, TrailEngine, and display-scale lifecycle.
 -- Run from the repository root: lua5.1 tests/lua/mouse_tracer_tests.lua
 
 local function repoPath(relative)
@@ -655,6 +655,250 @@ local persistAfterDisable = persistCount
 afterHandles[1].fn()
 assertEq(persistCount, persistAfterDisable, "cancelled After fallback callback does not persist after disable")
 assertTrue(persistCount >= persistBeforeAfterFallback, "After fallback disable still flushes or skips leftover work")
+
+-- Runtime coordinate-space lifecycle. Display-size changes must refresh the
+-- cached effective scale, drop the old trail, and must not connect a segment
+-- across the old and new spaces. Repeated events stay bounded.
+local currentScale = 1
+local createdFrames = 0
+local createdTextures = 0
+local frames = {}
+local cursorX, cursorY = 0, 0
+
+local function widget()
+    local w = {
+        scripts = {},
+        events = {},
+        shown = false,
+    }
+    setmetatable(w, {
+        __index = function(self, key)
+            if key == "SetScript" then
+                return function(_, name, fn)
+                    self.scripts[name] = fn
+                end
+            elseif key == "RegisterEvent" then
+                return function(_, event)
+                    self.events[event] = (self.events[event] or 0) + 1
+                end
+            elseif key == "GetEffectiveScale" then
+                return function()
+                    return currentScale
+                end
+            elseif key == "CreateTexture" then
+                return function()
+                    createdTextures = createdTextures + 1
+                    return widget()
+                end
+            elseif key == "IsShown" then
+                return function()
+                    return self.shown
+                end
+            elseif key == "Show" then
+                return function()
+                    self.shown = true
+                end
+            elseif key == "Hide" then
+                return function()
+                    self.shown = false
+                end
+            end
+            return function() end
+        end,
+    })
+    return w
+end
+
+function CreateFrame(_, name)
+    createdFrames = createdFrames + 1
+    local frame = widget()
+    frame.name = name
+    frames[#frames + 1] = frame
+    return frame
+end
+
+UIParent = widget()
+
+function GetCursorPosition()
+    return cursorX, cursorY
+end
+
+local function hostFrame()
+    for i = 1, #frames do
+        if frames[i].name == "SF_MouseTracerHost" then
+            return frames[i]
+        end
+    end
+    return nil
+end
+
+local function pendingScaleRefreshes()
+    local n = 0
+    for i = 1, #afterHandles do
+        local handle = afterHandles[i]
+        if handle.delay == 0 and not handle.fired then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function flushScaleRefreshes()
+    local pending = {}
+    for i = 1, #afterHandles do
+        local handle = afterHandles[i]
+        if handle.delay == 0 and not handle.fired then
+            handle.fired = true
+            pending[#pending + 1] = handle.fn
+        end
+    end
+    for i = 1, #pending do
+        pending[i]()
+    end
+end
+
+local function fireTracerEvent(event)
+    local events = Tracer._eventFrame
+    events.scripts.OnEvent(events, event)
+end
+
+local function pumpCursor(x, y)
+    cursorX, cursorY = x, y
+    local host = hostFrame()
+    host.scripts.OnUpdate(host, 1)
+end
+
+local function assertStrokeUsesScale(engine, message)
+    assertTrue(engine.count > 0, message .. " draws a stroke")
+    local maxY = 0
+    for chrono = 1, engine.count do
+        local _, y = engine:GetPoint(chrono)
+        if y > maxY then
+            maxY = y
+        end
+    end
+    assertTrue(maxY < 1, message .. " does not connect old-space coordinates")
+    local x, y = engine:GetPoint(engine.count)
+    assertAlmost(x, 20, 1e-6, message .. " newest x uses the refreshed scale")
+    assertAlmost(y, 0, 1e-6, message .. " newest y uses the refreshed scale")
+end
+
+Tracer:Init()
+local eventFrame = Tracer._eventFrame
+assertEq(eventFrame.events.DISPLAY_SIZE_CHANGED, 1, "display-size event is registered once")
+assertEq(eventFrame.events.UI_SCALE_CHANGED, 1, "UI-scale event stays registered")
+assertEq(eventFrame.events.PLAYER_ENTERING_WORLD, 1, "world-entry event stays registered")
+assertEq(createdFrames, 1, "init creates only the event frame")
+
+currentScale = 1
+Tracer:ApplyEnabled(true)
+local host = hostFrame()
+assertTrue(host ~= nil, "enabling creates the tracer host")
+assertTrue(host.scripts.OnUpdate ~= nil, "enabling installs one OnUpdate")
+assertEq(createdFrames, 2, "enabling creates one host frame")
+assertEq(createdTextures, C.MAX_POINTS, "stamp pool is allocated once")
+assertEq(Tracer.engine.scale, 1, "enable caches the current effective scale")
+
+pumpCursor(0, 0)
+pumpCursor(40, 0)
+assertTrue(Tracer.engine.count > 0, "movement before a display change draws a trail")
+
+currentScale = 2
+fireTracerEvent("DISPLAY_SIZE_CHANGED")
+assertEq(Tracer.engine.scale, 2, "display-size change refreshes the effective scale")
+assertEq(Tracer.engine.count, 0, "display-size change clears the visible trail")
+assertTrue(not Tracer.engine.hasBaseline, "display-size change invalidates the sampling baseline")
+assertEq(pendingScaleRefreshes(), 1, "display-size change schedules one next-frame scale read")
+
+pumpCursor(0, 0)
+pumpCursor(40, 0)
+local committedCount = Tracer.engine.count
+assertStrokeUsesScale(Tracer.engine, "samples after a committed display-size change")
+flushScaleRefreshes()
+assertEq(Tracer.engine.count, committedCount, "next-frame read keeps a stroke started in the new space")
+assertTrue(Tracer.engine.hasBaseline, "next-frame read keeps the new baseline when scale is unchanged")
+assertEq(pendingScaleRefreshes(), 0, "next-frame scale read runs once")
+
+-- Event observes the pre-change scale. A sample in that stale space must not
+-- survive the committed scale, and must not bridge into the new space.
+fireTracerEvent("DISPLAY_SIZE_CHANGED")
+assertEq(Tracer.engine.scale, 2, "stale display-size handler still reads the pre-change scale")
+pumpCursor(200, 200)
+assertTrue(Tracer.engine.hasBaseline, "a sample before the scale commits establishes a baseline")
+assertEq(Tracer.engine.count, 0, "the first post-reset sample does not emit a segment")
+currentScale = 4
+flushScaleRefreshes()
+assertEq(Tracer.engine.scale, 4, "next-frame read applies the committed scale")
+assertEq(Tracer.engine.count, 0, "committed scale change clears a stale-space stroke")
+assertTrue(not Tracer.engine.hasBaseline, "committed scale change invalidates the stale baseline")
+pumpCursor(0, 0)
+pumpCursor(80, 0)
+assertStrokeUsesScale(Tracer.engine, "samples after the committed scale")
+
+local resetCount = 0
+local originalReset = getmetatable(Tracer.engine).__index.Reset
+getmetatable(Tracer.engine).__index.Reset = function(self)
+    resetCount = resetCount + 1
+    return originalReset(self)
+end
+
+local framesBeforeRepeat = createdFrames
+local texturesBeforeRepeat = createdTextures
+local scheduledBeforeRepeat = #afterHandles
+resetCount = 0
+for _ = 1, 100 do
+    fireTracerEvent("DISPLAY_SIZE_CHANGED")
+end
+assertEq(#afterHandles, scheduledBeforeRepeat + 1, "100 display-size events schedule one confirmation")
+assertEq(pendingScaleRefreshes(), 1, "repeated display-size events leave one pending confirmation")
+assertEq(createdFrames, framesBeforeRepeat, "repeated display-size events do not create frames")
+assertEq(createdTextures, texturesBeforeRepeat, "repeated display-size events do not create textures")
+assertEq(resetCount, 1, "a display-size burst resets the trail pool once")
+assertEq(Tracer.engine.count, 0, "the burst still clears the live trail")
+flushScaleRefreshes()
+assertEq(pendingScaleRefreshes(), 0, "flushing the coalesced confirmation leaves none pending")
+scheduledBeforeRepeat = #afterHandles
+for _ = 1, 100 do
+    fireTracerEvent("UI_SCALE_CHANGED")
+end
+assertEq(#afterHandles, scheduledBeforeRepeat + 1, "100 UI-scale events schedule one confirmation")
+assertEq(createdFrames, framesBeforeRepeat, "repeated UI-scale events do not create frames")
+flushScaleRefreshes()
+
+currentScale = 1.5
+fireTracerEvent("UI_SCALE_CHANGED")
+assertEq(Tracer.engine.scale, 1.5, "UI-scale change still refreshes the effective scale")
+assertEq(Tracer.engine.count, 0, "UI-scale change still clears the trail")
+assertTrue(not Tracer.engine.hasBaseline, "UI-scale change still invalidates the baseline")
+flushScaleRefreshes()
+
+currentScale = 1.25
+fireTracerEvent("PLAYER_ENTERING_WORLD")
+assertEq(Tracer.engine.scale, 1.25, "world entry refreshes the effective scale")
+assertEq(Tracer.engine.count, 0, "world entry still clears the trail")
+assertTrue(not Tracer.engine.hasBaseline, "world entry still invalidates the baseline")
+flushScaleRefreshes()
+
+Tracer:ApplyEnabled(false)
+assertTrue(host.scripts.OnUpdate == nil, "disabling removes OnUpdate")
+local framesBeforeDisabled = createdFrames
+local scheduledBeforeDisabled = #afterHandles
+resetCount = 0
+for _ = 1, 50 do
+    fireTracerEvent("DISPLAY_SIZE_CHANGED")
+end
+assertTrue(host.scripts.OnUpdate == nil, "display-size changes while disabled do not resume sampling")
+assertEq(createdFrames, framesBeforeDisabled, "display-size changes while disabled do not create frames")
+assertEq(#afterHandles, scheduledBeforeDisabled + 1, "display-size changes while disabled still coalesce")
+assertEq(resetCount, 0, "display-size changes while disabled do not reset the trail pool")
+flushScaleRefreshes()
+assertEq(resetCount, 0, "the deferred scale read while disabled does not reset the trail pool")
+
+local framesBeforeReinit = createdFrames
+Tracer:Init()
+assertEq(createdFrames, framesBeforeReinit, "re-init does not create another event frame")
+assertEq(eventFrame.events.DISPLAY_SIZE_CHANGED, 1, "re-init does not register display-size twice")
+assertEq(eventFrame.events.UI_SCALE_CHANGED, 1, "re-init does not register UI-scale twice")
 
 print(string.format("%d passed, %d failed", passes, failures))
 if failures > 0 then
