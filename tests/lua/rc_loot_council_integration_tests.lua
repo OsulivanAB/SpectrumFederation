@@ -5138,6 +5138,53 @@ function testDoubleBisRollProtection()
     Integration.ClearBisProtectionMemory()
     popups = {}
     assertEq(Integration.HandleAwardSuccess(1, WINNER, "normal", HEAD_LINK, "Upgrade"), "not_bis", "AWARDED placeholder uses real_response and does not qualify Upgrade")
+
+    -- Recording off, non-candidates, and text-only BiS entries.
+    assertTrue(profile:SetRCLootCouncilRecordAwards(false), "recording off keeps the saved BiS list")
+    Integration.ClearBisProtectionMemory()
+    printed = {}
+    popups = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "inactive", "response warnings stay off while recording is disabled")
+    assertEq(Integration.HandleAwardSuccess(1, WINNER, "normal", HEAD_LINK, "Need"), "inactive", "award popups stay off while recording is disabled")
+    assertEq(warningCount("selected"), 0, "disabled recording does not warn")
+    assertEq(#popups, 0, "disabled recording does not popup")
+    assertTrue(profile:SetRCLootCouncilRecordAwards(true), "recording can be turned back on")
+
+    installCouncil({
+        sessionEntry(HEAD_LINK, "default", {}),
+    })
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "untrusted", "a profile member who was not offered the item is ignored")
+    assertEq(route("response", { 1, WINNER, { response = 1 } }, PLAYER), "untrusted", "an ML forward for a non-candidate is ignored")
+    assertEq(route("change_response", { 1, WINNER, 1 }, PLAYER), "untrusted", "change_response for a non-candidate is ignored")
+    assertEq(warningCount("selected"), 0, "non-candidates do not warn")
+
+    resetEnv()
+    profile = makeProfile("Legacy Text Bis")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    assertTrue(profile:AddRCLootCouncilBisResponse("Need"), "text-only Need remains a compatibility entry")
+    installCouncil({
+        sessionEntry(HEAD_LINK, "default", candidateMap(1)),
+    })
+    local legacyHistory = historyTable({
+        id = "1700004100-41",
+        lootWon = HEAD_LINK,
+        response = "Need",
+        responseID = 1,
+        typeCode = "default",
+    })
+    assertEq(Integration.HandleHistory(PLAYER, WINNER, legacyHistory, "acecomm"), "recorded", "text-only Need still records from history")
+    printed = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "warned", "numeric response 1 matches text-only Need through the button label")
+    assertTrue(printed[#printed][2]:find("selected Need", 1, true) ~= nil, "text-only warning uses the configured label")
+    _G.RCLootCouncil.GetResponse = function()
+        return nil
+    end
+    Integration.ClearBisProtectionMemory()
+    printed = {}
+    assertEq(Integration.HandleCandidateResponse(WINNER, { 1, { response = 1 } }), "not_bis", "text-only Need does not match when the button label cannot be resolved")
+    assertEq(warningCount("selected"), 0, "unresolved button text does not warn")
 end
 testDoubleBisRollProtection()
 

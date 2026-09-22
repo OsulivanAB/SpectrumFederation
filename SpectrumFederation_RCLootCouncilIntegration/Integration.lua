@@ -660,6 +660,9 @@ function Integration.WarnBisResponseConflict(profile, opts)
     if not IsEffectiveAdmin(profile) then
         return "not_admin"
     end
+    if not profile.IsLiveBisAutomationActive or not profile:IsLiveBisAutomationActive() then
+        return "inactive"
+    end
     local player = opts.player
     if type(player) ~= "string" or player == "" then
         return "unresolved"
@@ -750,6 +753,22 @@ local function ParseResponseData(data)
     return nil
 end
 
+local function AcceptNamedResponder(player, sessionInfo, profile)
+    if not player then
+        return nil, "unresolved"
+    end
+    if not PlayerIsKnownCandidate(sessionInfo, player) then
+        DebugInfo("Ignoring RC response from %s; responder is not a live candidate", tostring(player))
+        return nil, "untrusted"
+    end
+    local member = profile and profile.getMemberByID and profile:getMemberByID(player) or nil
+    if not member then
+        DebugInfo("Skipping double-BiS response warning for unknown Spectrum member %s", tostring(player))
+        return nil, "unresolved"
+    end
+    return player, nil
+end
+
 local function AcceptResponsePlayer(sender, parsed, sessionInfo, profile)
     local responder = parsed.forwarded and parsed.responder or sender
     local player = Integration.NormalizeRCPlayerId(responder)
@@ -763,17 +782,28 @@ local function AcceptResponsePlayer(sender, parsed, sessionInfo, profile)
     elseif not Integration.SamePlayer(sender, player) then
         return nil, "untrusted"
     end
-    local member = profile and profile.getMemberByID and profile:getMemberByID(player) or nil
-    local knownCandidate = PlayerIsKnownCandidate(sessionInfo, player)
-    if not member and not knownCandidate then
-        DebugInfo("Ignoring RC response from %s; sender is not in the live session or profile", tostring(player))
-        return nil, "untrusted"
+    return AcceptNamedResponder(player, sessionInfo, profile)
+end
+
+local function QualifyResponseArgs(rawResponse, typeCode)
+    local responseId = NumericResponseId(rawResponse)
+    if responseId == nil then
+        if type(rawResponse) ~= "string" or strtrim(rawResponse) == "" then
+            return nil
+        end
+        return {
+            response = strtrim(rawResponse),
+            responseId = nil,
+            typeCode = nil,
+            isAwardReason = false,
+        }
     end
-    if not member then
-        DebugInfo("Skipping double-BiS response warning for unknown Spectrum member %s", tostring(player))
-        return nil, "unresolved"
-    end
-    return player, nil
+    return {
+        response = RCResponseText(typeCode, responseId),
+        responseId = responseId,
+        typeCode = typeCode,
+        isAwardReason = false,
+    }
 end
 
 function Integration.HandleCandidateResponse(sender, data)
@@ -797,23 +827,18 @@ function Integration.HandleCandidateResponse(sender, data)
     if not player then
         return trustErr or "untrusted"
     end
-    local rawResponse = parsed.responseTable.response
-    local responseId = NumericResponseId(rawResponse)
-    local responseText = nil
-    if responseId == nil then
-        if type(rawResponse) ~= "string" or strtrim(rawResponse) == "" then
-            return "ignored"
-        end
-        responseText = strtrim(rawResponse)
+    local qualified = QualifyResponseArgs(parsed.responseTable.response, sessionInfo.typeCode)
+    if not qualified then
+        return "ignored"
     end
     return Integration.WarnBisResponseConflict(profile, {
         player = player,
         itemLink = sessionInfo.itemLink,
         session = sessionInfo.session,
-        response = responseText,
-        responseId = responseId,
-        typeCode = responseId and sessionInfo.typeCode or nil,
-        isAwardReason = false,
+        response = qualified.response,
+        responseId = qualified.responseId,
+        typeCode = qualified.typeCode,
+        isAwardReason = qualified.isAwardReason,
     })
 end
 
@@ -843,34 +868,22 @@ function Integration.HandleChangeResponse(sender, data)
     if not profile then
         return "no_profile"
     end
-    local player = Integration.NormalizeRCPlayerId(name)
+    local player, trustErr = AcceptNamedResponder(Integration.NormalizeRCPlayerId(name), sessionInfo, profile)
     if not player then
-        return "unresolved"
+        return trustErr or "untrusted"
     end
-    local member = profile.getMemberByID and profile:getMemberByID(player) or nil
-    if not member and not PlayerIsKnownCandidate(sessionInfo, player) then
-        return "untrusted"
-    end
-    if not member then
-        DebugInfo("Skipping double-BiS change_response warning for unknown Spectrum member %s", tostring(player))
-        return "unresolved"
-    end
-    local responseId = NumericResponseId(rawResponse)
-    local responseText = nil
-    if responseId == nil then
-        if type(rawResponse) ~= "string" or strtrim(rawResponse) == "" then
-            return "ignored"
-        end
-        responseText = strtrim(rawResponse)
+    local qualified = QualifyResponseArgs(rawResponse, sessionInfo.typeCode)
+    if not qualified then
+        return "ignored"
     end
     return Integration.WarnBisResponseConflict(profile, {
         player = player,
         itemLink = sessionInfo.itemLink,
         session = sessionInfo.session,
-        response = responseText,
-        responseId = responseId,
-        typeCode = responseId and sessionInfo.typeCode or nil,
-        isAwardReason = false,
+        response = qualified.response,
+        responseId = qualified.responseId,
+        typeCode = qualified.typeCode,
+        isAwardReason = qualified.isAwardReason,
     })
 end
 
@@ -951,6 +964,9 @@ function Integration.HandleAwardSuccess(session, winner, _status, itemLink, resp
     local profile = Integration.GetSessionProfile()
     if not profile or type(profile.EvaluateRCBisConflict) ~= "function" then
         return profile and "unavailable" or "no_profile"
+    end
+    if not profile.IsLiveBisAutomationActive or not profile:IsLiveBisAutomationActive() then
+        return "inactive"
     end
     local player = Integration.NormalizeRCPlayerId(winner)
     if not player or not (profile.getMemberByID and profile:getMemberByID(player)) then

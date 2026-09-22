@@ -94,7 +94,7 @@ Mixed-version clients that do not understand `_externalId` drop only the RC row.
 
 ## Double BiS roll protection
 
-While a Spectrum Loot Helper session is active, the child addon also watches RC candidate `response` traffic and Master Looter `change_response` traffic. A response is BiS-qualified only when it matches the profile's configured **BiS-Qualifying Responses**, using the same identity as automatic BiS awards. Response id `1`, the label `BiS`, and the label `Need` are not special.
+While a Spectrum Loot Helper session is active and live BiS automation is on (`recordAwards` plus at least one BiS response), the child addon also watches RC candidate `response` traffic and Master Looter `change_response` traffic. A response is BiS-qualified only when it matches the profile's configured **BiS-Qualifying Responses**, using the same identity as automatic BiS awards. A numeric RC response also carries the button label from `GetResponse`, so a historical text-only entry such as `text:need` can match. Response id `1`, the label `BiS`, and the label `Need` are not special. The responder must be a candidate on that live RC session.
 
 The check is read-only. It uses `LootProfile:EvaluateRCBisConflict`, which calls the existing occupancy, specialization, weapon, ring, trinket, and linked-character rules. Selecting or changing a response does not consume an opportunity, write a `BIS_OUTCOME`, or write a loot log.
 
