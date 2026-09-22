@@ -345,6 +345,40 @@ local function RecacheScale()
 	end
 end
 
+-- One next-frame confirmation for a coordinate-space transition. The scale
+-- read inside DISPLAY_SIZE_CHANGED / UI_SCALE_CHANGED can still be the
+-- pre-change value. Coalesce so repeated events keep a single callback.
+local scaleRefreshPending = false
+
+local function ScalesDiffer(previous, current)
+	previous = previous or 0
+	current = current or 0
+	local diff = previous - current
+	if diff < 0 then
+		diff = -diff
+	end
+	return diff > 0.0001
+end
+
+local function RefreshCoordinateSpace()
+	RecacheScale()
+	Tracer:OnDiscontinuity(true)
+	if scaleRefreshPending or not C_Timer or not C_Timer.After then
+		return
+	end
+	scaleRefreshPending = true
+	C_Timer.After(0, function()
+		scaleRefreshPending = false
+		local previous = cache.scale
+		RecacheScale()
+		-- Only drop a trail started after the event when the committed scale
+		-- differs from the value captured during the event.
+		if ScalesDiffer(previous, cache.scale) then
+			Tracer:OnDiscontinuity(true)
+		end
+	end)
+end
+
 local function EnsurePool()
 	if poolReady then
 		return
@@ -688,18 +722,17 @@ function Tracer:Init()
 		events:RegisterEvent("PLAYER_LOGIN")
 		events:RegisterEvent("PLAYER_ENTERING_WORLD")
 		events:RegisterEvent("PLAYER_LOGOUT")
+		events:RegisterEvent("DISPLAY_SIZE_CHANGED")
 		pcall(events.RegisterEvent, events, "UI_SCALE_CHANGED")
 		events:SetScript("OnEvent", function(_, event)
 			if event == "PLAYER_LOGIN" then
 				self:ReloadCacheFromStore()
 				self:ApplyEnabled(cache.enabled)
 				self:FlushSnapshot()
-			elseif event == "PLAYER_ENTERING_WORLD" then
-				RecacheScale()
-				self:OnDiscontinuity(true)
-			elseif event == "UI_SCALE_CHANGED" then
-				RecacheScale()
-				self:OnDiscontinuity(true)
+			elseif event == "PLAYER_ENTERING_WORLD" or event == "UI_SCALE_CHANGED" or event == "DISPLAY_SIZE_CHANGED" then
+				-- Windowed alt-tab and resizes fire DISPLAY_SIZE_CHANGED when
+				-- the cursor-to-UI scale changes without UI_SCALE_CHANGED.
+				RefreshCoordinateSpace()
 			elseif event == "PLAYER_LOGOUT" then
 				self:FlushSnapshot()
 			end
