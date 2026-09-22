@@ -302,6 +302,14 @@ local function NoteItemLevelPolicyChanged()
 	end
 end
 
+-- One control message per actual edit. No session means the local write stands.
+local function PublishRaidCheckItemLevelPolicy(self)
+	local Sync = SF.LootHelperSync
+	if Sync and Sync.PublishRaidCheckItemLevelPolicy and self.GetProfileId then
+		Sync:PublishRaidCheckItemLevelPolicy(self:GetProfileId())
+	end
+end
+
 local function NormalizeRaidCheckPointsAward(value)
 	local amount = tonumber(value)
 	if amount == nil then
@@ -1860,6 +1868,7 @@ function LootProfile:SetRaidCheckMinimumItemLevelRequired(enabled)
 		SF.Debug:Info("LootProfile", "Minimum item level requirement %s", nextValue and "enabled" or "disabled")
 	end
 	NoteItemLevelPolicyChanged()
+	PublishRaidCheckItemLevelPolicy(self)
 	return true, nil
 end
 
@@ -1878,6 +1887,29 @@ function LootProfile:SetRaidCheckMinimumItemLevel(amount)
 	if SF.Debug then
 		SF.Debug:Info("LootProfile", "Minimum item level set to %s", tostring(nextValue))
 	end
+	NoteItemLevelPolicyChanged()
+	PublishRaidCheckItemLevelPolicy(self)
+	return true, nil
+end
+
+-- Inbound session apply. Does not publish, so a SET cannot echo another SET.
+function LootProfile:ApplyRaidCheckItemLevelPolicy(enabled, minimum, options)
+	options = options or {}
+	self:_EnsureRaidCheckConfig()
+	if not options.skipPermission and not CurrentUserHasEffectiveLocalAdmin(self) then
+		return false, "You must be an admin to change Raid Check settings."
+	end
+
+	local nextEnabled = enabled and true or false
+	local nextMinimum = NormalizeMinimumItemLevel(minimum)
+	local changed = (self._raidCheckConfig.requireMinimumItemLevel and true or false) ~= nextEnabled
+		or self._raidCheckConfig.minimumItemLevel ~= nextMinimum
+	if not changed then
+		return true, nil
+	end
+
+	self._raidCheckConfig.requireMinimumItemLevel = nextEnabled
+	self._raidCheckConfig.minimumItemLevel = nextMinimum
 	NoteItemLevelPolicyChanged()
 	return true, nil
 end

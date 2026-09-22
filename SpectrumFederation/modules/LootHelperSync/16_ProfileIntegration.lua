@@ -798,6 +798,106 @@ function Sync:PublishRCIntegrationConfig(profileId, opts)
     return true, req
 end
 
+-- Publish the session profile's minimum item level.
+-- The coordinator broadcasts RAID_CHECK_ILVL_SET. Any other authorized admin
+-- whispers RAID_CHECK_ILVL_REQ. One send per call. Control traffic only, so
+-- safe mode does not pause it, and it does not queue inspects.
+function Sync:PublishRaidCheckItemLevelPolicy(profileId)
+    if not self.state or not self.state.active then
+        return false, "no session"
+    end
+    if type(self.state.sessionId) ~= "string" or self.state.sessionId == "" then
+        return false, "no session"
+    end
+    profileId = profileId or self.state.profileId
+    if type(profileId) ~= "string" or profileId == "" then
+        return false, "missing profileId"
+    end
+    if self.state.profileId and self.state.profileId ~= profileId then
+        return false, "wrong profile for session"
+    end
+    local me = self._SelfId and self:_SelfId() or nil
+    if not me or not self.IsSenderAuthorized or not self:IsSenderAuthorized(profileId, me) then
+        return false, "not authorized"
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if not profile or not profile.GetRaidCheckConfig then
+        return false, "no profile"
+    end
+    local cfg = profile:GetRaidCheckConfig()
+    if type(cfg) ~= "table" then
+        return false, "no config"
+    end
+    if not (SF.LootHelperComm and SF.LootHelperComm.Send) then
+        return false, "unavailable"
+    end
+    local policy = {
+        requireMinimumItemLevel = cfg.requireMinimumItemLevel and true or false,
+        minimumItemLevel = cfg.minimumItemLevel,
+    }
+    if self.state.isCoordinator then
+        local dist = "RAID"
+        if self._EnforceGroupedSessionActive then
+            dist = self:_EnforceGroupedSessionActive("PublishRaidCheckItemLevelPolicy")
+            if not dist then
+                return false, "not in group"
+            end
+        end
+        local seq = (tonumber(profile._itemLevelPolicySeq) or 0) + 1
+        local epoch = tonumber(self.state.coordEpoch) or 0
+        profile._itemLevelPolicySeq = seq
+        profile._itemLevelPolicyEpoch = epoch
+        local payload = {
+            sessionId = self.state.sessionId,
+            profileId = profileId,
+            coordinator = self.state.coordinator,
+            coordEpoch = epoch,
+            seq = seq,
+            requireMinimumItemLevel = policy.requireMinimumItemLevel,
+            minimumItemLevel = policy.minimumItemLevel,
+        }
+        local sent = SF.LootHelperComm:Send(
+            "CONTROL",
+            self.MSG.RAID_CHECK_ILVL_SET,
+            payload,
+            dist,
+            nil,
+            "NORMAL"
+        )
+        if sent == false then
+            return false, "send failed"
+        end
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "RAID_CHECK_ILVL_SET seq=%s epoch=%s profile=%s", tostring(seq), tostring(epoch), tostring(profileId))
+        end
+        return true, payload
+    end
+    if type(self.state.coordinator) ~= "string" or self.state.coordinator == "" then
+        return false, "no coordinator"
+    end
+    local req = {
+        sessionId = self.state.sessionId,
+        profileId = profileId,
+        requireMinimumItemLevel = policy.requireMinimumItemLevel,
+        minimumItemLevel = policy.minimumItemLevel,
+    }
+    local sent = SF.LootHelperComm:Send(
+        "CONTROL",
+        self.MSG.RAID_CHECK_ILVL_REQ,
+        req,
+        "WHISPER",
+        self.state.coordinator,
+        "NORMAL"
+    )
+    if sent == false then
+        return false, "send failed"
+    end
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "RAID_CHECK_ILVL_REQ to %s profile=%s", tostring(self.state.coordinator), tostring(profileId))
+    end
+    return true, req
+end
+
 -- Function Compute authorMax summary from profile's logs.
 -- @param profileId string Stable profile id
 -- @return table snapshotPayload Map [author] = maxCounterSeen

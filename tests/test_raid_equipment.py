@@ -84,6 +84,15 @@ def test_item_level_capture_uses_blizzard_equipped_value():
     assert "CalculateAverageItemLevel" not in raid_check
     assert "overallEquippedItemLevel" in raid_check
     assert "ReevaluateFrozenRunPolicies" in raid_check
+    profiles = (REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "Profiles.lua").read_text(
+        encoding="utf-8"
+    )
+    routing = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "13_Routing.lua"
+    ).read_text(encoding="utf-8")
+    assert "PublishRaidCheckItemLevelPolicy(self)" in profiles
+    assert "RAID_CHECK_ILVL_SET" in routing
+    assert "RAID_CHECK_ILVL_REQ" in routing
     inspect_ready = raid_check.split("function RC:_HandleInspectReady", 1)[1]
     inspect_ready = inspect_ready.split("\nfunction RC:", 1)[0]
     local_capture = raid_check.split("elseif player and IsSelfUnit(unit) then", 1)[1]

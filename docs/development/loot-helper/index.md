@@ -150,6 +150,7 @@ Each settled Raid Check (`mode == "raid"`) is one presence opportunity, matching
 Acquisition, policy, and consequences are separate:
 
 - Acquisition is local to the initiating client. There is no peer-assisted scan and no equipment addon-message protocol.
+- A successful minimum item level edit publishes one control message. The session coordinator broadcasts `RAID_CHECK_ILVL_SET`. Any other authorized admin whispers `RAID_CHECK_ILVL_REQ`, and the coordinator broadcasts the accepted flag and threshold. Safe mode does not pause this control traffic. An in-progress check still uses the config frozen on `run.cfg`. An older `(coordEpoch, seq)` is ignored.
 - Only complete trustworthy observations enter runtime last-good storage. `/reload` blanks them. Legacy `_raidCheckEquipmentSnapshots` remain inert: they are not written, not consumed, and not wiped.
 - Combat and Blizzard Inspect are paused states. Paused time does not consume active acquisition bounds.
 - Target membership is `profile membership ∩ current group` at run start. Roster updates only re-resolve frozen members.

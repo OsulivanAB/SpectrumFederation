@@ -43,4 +43,8 @@ Sync.MSG = {
     -- RC integration config (config-only; never a full profile snapshot)
     RC_CONFIG_REQ   = "RC_CONFIG_REQ",
     RC_CONFIG_SET   = "RC_CONFIG_SET",
+
+    -- Raid Check minimum item level (config-only; not a profile snapshot)
+    RAID_CHECK_ILVL_REQ = "RAID_CHECK_ILVL_REQ",
+    RAID_CHECK_ILVL_SET = "RAID_CHECK_ILVL_SET",
 }

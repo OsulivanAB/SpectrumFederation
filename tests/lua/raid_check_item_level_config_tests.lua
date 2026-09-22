@@ -215,6 +215,23 @@ assertTrue(importOk ~= false, "invalid threshold does not reject the snapshot")
 assertEq(profile:GetRaidCheckConfig().minimumItemLevel, nil, "invalid imported threshold normalizes to nil")
 assertEq(profile:GetRaidCheckConfig().requireMinimumItemLevel, true, "enabled flag still imports")
 
+local publishes = 0
+SF.LootHelperSync = {
+    PublishRaidCheckItemLevelPolicy = function(_, profileId)
+        publishes = publishes + 1
+        assertEq(profileId, profile:GetProfileId(), "item level publish targets this profile")
+    end,
+}
+profile:SetRaidCheckMinimumItemLevel(650)
+assertEq(publishes, 1, "changing the minimum publishes one session update")
+profile:SetRaidCheckMinimumItemLevel(650)
+assertEq(publishes, 1, "an unchanged minimum does not publish again")
+local applied = profile:ApplyRaidCheckItemLevelPolicy(false, nil, { skipPermission = true })
+assertTrue(applied ~= false, "inbound item level apply succeeds")
+assertEq(publishes, 1, "an inbound apply does not publish another update")
+assertEq(profile:GetRaidCheckConfig().requireMinimumItemLevel, false, "inbound apply can disable the requirement")
+assertEq(profile:GetRaidCheckConfig().minimumItemLevel, nil, "inbound apply can clear the threshold")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
