@@ -2982,32 +2982,45 @@ local function QueueFrozenInspectTargets(self, run)
 				self:_QueueInspectForUnit(unit, info, cacheEntry)
 			end
 		elseif player and IsSelfUnit(unit) then
-			local captured = self:_GetLocalTroubleshootingSnapshot()
 			local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
 			local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
-			if captured and CheckRun and Policy and player then
-				local now = GetTime and GetTime() or 0
-				local observation = BuildPolicyObservation(captured)
-				local policyResult = Policy.EvaluateObservation(observation, run.cfg)
-				if policyResult and policyResult.complete then
-					CheckRun.MarkAttempt(player, "complete", true)
-					player.freshObservation = {
-						complete = true,
-						policy = policyResult,
-						observation = observation,
-						capturedAt = now,
-					}
-					player.policyResult = policyResult
-					local state = self:_GetInspectState()
-					state.lastGood = state.lastGood or {}
-					state.lastGood[memberId] = {
-						capturedAt = now,
-						complete = true,
-						policy = policyResult,
-						observation = observation,
-					}
-					player.lastGood = state.lastGood[memberId]
-					CheckRun.NoteProgress(run, now)
+			if CheckRun and CheckRun.PlayerNeedsMoreInspects and not CheckRun.PlayerNeedsMoreInspects(player) then
+				-- Already complete, or this target has used its local capture cap.
+			elseif CheckRun and Policy then
+				local captured = self:_GetLocalTroubleshootingSnapshot()
+				if captured then
+					local now = GetTime and GetTime() or 0
+					local observation = BuildPolicyObservation(captured)
+					local policyResult = Policy.EvaluateObservation(observation, run.cfg)
+					if policyResult and policyResult.complete then
+						CheckRun.MarkAttempt(player, "complete", true)
+						player.freshObservation = {
+							complete = true,
+							policy = policyResult,
+							observation = observation,
+							capturedAt = now,
+						}
+						player.policyResult = policyResult
+						player.technicalFailure = false
+						local state = self:_GetInspectState()
+						state.lastGood = state.lastGood or {}
+						state.lastGood[memberId] = {
+							capturedAt = now,
+							complete = true,
+							policy = policyResult,
+							observation = observation,
+						}
+						player.lastGood = state.lastGood[memberId]
+						CheckRun.NoteProgress(run, now)
+					else
+						-- Incomplete local data, including a missing equipped item
+						-- level while the requirement is active, is an inspect
+						-- failure. Drop the cached capture so a later tick can
+						-- read a usable Blizzard value. The attempt cap bounds it.
+						CheckRun.MarkAttempt(player, "incomplete", true)
+						CheckRun.NoteProgress(run, now)
+						self:_InvalidateLocalTroubleshootingSnapshot()
+					end
 				end
 			end
 		end

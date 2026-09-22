@@ -110,6 +110,17 @@ local failedClass = CheckRun.ClassifyPlayer(failed, 10)
 assertEq(failedClass.class, CheckRun.CLASS.INSPECTION_FAILED, "technical failure is Inspection Failed")
 assertTrue(not failedClass.countsForPot, "Inspection Failed is excluded from Reward Pot")
 
+local unresolvedLocal = CheckRun.NewPlayer("L")
+CheckRun.MarkAttempt(unresolvedLocal, "incomplete", true)
+local unresolvedClass = CheckRun.ClassifyPlayer(unresolvedLocal, 10)
+assertEq(unresolvedClass.class, CheckRun.CLASS.INSPECTION_FAILED, "incomplete local capture is Inspection Failed")
+assertTrue(not unresolvedClass.countsForPot, "incomplete local capture does not count for Reward Pot")
+assertTrue(CheckRun.PlayerNeedsMoreInspects(unresolvedLocal), "one incomplete local capture still retries")
+for _ = 2, CheckRun.PER_TARGET_ATTEMPT_CAP do
+    CheckRun.MarkAttempt(unresolvedLocal, "incomplete", true)
+end
+assertTrue(not CheckRun.PlayerNeedsMoreInspects(unresolvedLocal), "local incomplete retries stop at the attempt cap")
+
 failed.currentlyInspectable = false
 failed.rangeOnlyFailure = true
 local failedLaterOor = CheckRun.ClassifyPlayer(failed, 50, {
