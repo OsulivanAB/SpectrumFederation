@@ -774,6 +774,20 @@ local function CanonicalOverallItemLevel(value)
 	return number
 end
 
+-- Prefer this capture's Blizzard overall item level. When that read is missing,
+-- keep the cache entry's last known overall value. Do not rebuild it from slots.
+local function KeepKnownOverallItemLevel(nextValue, previousValue)
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if Policy and Policy.KeepKnownOverallItemLevel then
+		return Policy.KeepKnownOverallItemLevel(nextValue, previousValue)
+	end
+	local nextCanonical = CanonicalOverallItemLevel(nextValue)
+	if nextCanonical then
+		return nextCanonical
+	end
+	return CanonicalOverallItemLevel(previousValue)
+end
+
 local function ReadAuthoritativeEquippedItemLevel(unit)
 	if IsSelfUnit(unit) then
 		if C_PaperDollInfo and C_PaperDollInfo.GetAverageItemLevel then
@@ -1845,6 +1859,10 @@ function RC:_HandleInspectReady(guid)
 				NormalizeSlotData(slotData)
 			end
 		end
+		captured.overallEquippedItemLevel = KeepKnownOverallItemLevel(
+			captured.overallEquippedItemLevel,
+			entry and entry.overallEquippedItemLevel
+		)
 		RecalculateCapturedSummary(captured)
 	end
 

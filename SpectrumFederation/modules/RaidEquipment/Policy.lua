@@ -93,6 +93,17 @@ function Policy.CanonicalOverallItemLevel(value)
 	return rounded / 10
 end
 
+-- A later inspect can return gear while GetInspectItemLevel is still missing.
+-- Keep the last known Blizzard overall value in that case. A new positive
+-- reading replaces it. Zero is not a usable item level.
+function Policy.KeepKnownOverallItemLevel(nextValue, previousValue)
+	local nextCanonical = Policy.CanonicalOverallItemLevel(nextValue)
+	if nextCanonical then
+		return nextCanonical
+	end
+	return Policy.CanonicalOverallItemLevel(previousValue)
+end
+
 function Policy.FormatOverallItemLevel(value)
 	local canonical = Policy.CanonicalOverallItemLevel(value)
 	if not canonical then

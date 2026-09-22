@@ -312,6 +312,11 @@ local function observe(slots, itemLevel)
     }
 end
 
+assertEq(Policy.KeepKnownOverallItemLevel(nil, 642.34), 642.3, "missing inspect item level keeps the last known value")
+assertEq(Policy.KeepKnownOverallItemLevel(0, 650), 650, "API zero does not replace a known item level")
+assertEq(Policy.KeepKnownOverallItemLevel(649.95, 600), 650, "a new reading replaces the cached item level")
+assertEq(Policy.KeepKnownOverallItemLevel(nil, nil), nil, "two missing readings stay unknown")
+assertEq(Policy.KeepKnownOverallItemLevel(nil, 0), nil, "a stored zero is not revived as an item level")
 assertEq(Policy.CanonicalOverallItemLevel(649.94), 649.9, "649.94 canonicalizes to 649.9")
 assertEq(Policy.CanonicalOverallItemLevel(649.95), 650, "649.95 canonicalizes to 650")
 assertEq(Policy.FormatOverallItemLevel(649.94), "649.9", "display uses the same 649.9 canonical value")

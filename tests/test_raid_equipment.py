@@ -84,6 +84,15 @@ def test_item_level_capture_uses_blizzard_equipped_value():
     assert "CalculateAverageItemLevel" not in raid_check
     assert "overallEquippedItemLevel" in raid_check
     assert "ReevaluateFrozenRunPolicies" in raid_check
+    inspect_ready = raid_check.split("function RC:_HandleInspectReady", 1)[1]
+    inspect_ready = inspect_ready.split("\nfunction RC:", 1)[0]
+    assert "KeepKnownOverallItemLevel(" in inspect_ready
+    assert inspect_ready.index("KeepKnownOverallItemLevel(") < inspect_ready.index(
+        "RecalculateCapturedSummary(captured)"
+    )
+    assert "entry.averageItemLevel" not in inspect_ready.split("KeepKnownOverallItemLevel(", 1)[1].split(
+        ")", 1
+    )[0]
     assert "SetAuditItemLevelPulse(dataRow.ItemLevel, belowMinimum)" in page
     assert "SetAuditItemLevelPulse(dataRow" not in page.replace(
         "SetAuditItemLevelPulse(dataRow.ItemLevel, belowMinimum)",
