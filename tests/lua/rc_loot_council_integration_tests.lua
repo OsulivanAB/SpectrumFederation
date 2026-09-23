@@ -5782,6 +5782,45 @@ function testSingleWriterAndBonusRolls()
     })
     assertTrue(covered:AddLootLog(coveredOutcomeLog, { skipPermission = true, skipBroadcast = true }), "legacy bonus BIS_OUTCOME is stored")
     assertTrue(covered:HasSourceConsistentBisOutcome(coveredCanon.awardKey), "legacy bonus outcome is source-consistent")
+    local realCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006404-12",
+        response = "Need",
+        lootWon = HEAD_LINK,
+        equipLoc = "INVTYPE_HEAD",
+    }))
+    local realRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(realCanon), {
+        profile = covered,
+        author = AWARDER,
+        timestamp = coveredCanon.timestamp + 2,
+        externalId = realCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(covered:AddLootLog(realRc, { skipPermission = true, skipBroadcast = true }), "real helm award is stored beside the bonus roll")
+    local realAssigned = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    realAssigned.sourceLogId = realCanon.awardKey
+    realAssigned.awardKey = realCanon.awardKey
+    realAssigned.awardMember = WINNER
+    realAssigned.qualified = true
+    realAssigned.outcome = "ASSIGNED"
+    realAssigned.assignedSlots = { "Head" }
+    realAssigned.slotBinding = "BOUND"
+    realAssigned.assignmentScopeMembers = { WINNER }
+    realAssigned.equipLoc = "INVTYPE_HEAD"
+    realAssigned.itemFamily = "ordinary"
+    realAssigned.itemLink = HEAD_LINK
+    realAssigned.itemString = SF.LootLog.ExtractItemString(HEAD_LINK)
+    realAssigned.response = "Need"
+    local realAssignedLog = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, realAssigned, {
+        profile = covered,
+        author = owners[1],
+        timestamp = coveredCanon.timestamp + 3,
+        skipPermission = true,
+    })
+    assertTrue(covered:AddLootLog(realAssignedLog, { skipPermission = true, skipBroadcast = true }), "real helm outcome is stored")
+    local bonusReplay = SF.LootHelperIdentity.Replay(covered:GetLootLogs(), { owner = owners[1] })
+    assertEq(bonusReplay.bis.state.outcomeWinner[coveredCanon.awardKey], nil, "bonus-roll outcome does not win a BiS slot")
+    assertEq(bonusReplay.bis.state.outcomeWinner[realCanon.awardKey], realAssignedLog:GetID(), "bonus-roll history does not consume the helm slot")
     local beforeReplace = covered:HiddenLootLogIds()
     assertTrue(beforeReplace[coveredRc:GetID()] ~= true, "legacy bonus RC stays visible until a BONUS_ROLL exists")
     local previousProfileId = Sync.state.profileId
@@ -5822,6 +5861,253 @@ function testSingleWriterAndBonusRolls()
         _data = SF.LootLog.BuildBonusRollEventData(bonusCanon),
     }
     assertFalse(select(1, SF.LootLog.ValidateTable(missingExternal)), "BONUS_ROLL without an external id is rejected")
+
+    -- An occupied slot rejects the first source-consistent ASSIGNED. Replay
+    -- keeps the later OVERFLOW, and Loot Logs follows that winner.
+    local occupied = makeProfile("OccupiedSlot")
+    addMember(occupied, WINNER)
+    local function storeRc(profile, canon, stamp)
+        local row = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(canon), {
+            profile = profile,
+            author = AWARDER,
+            timestamp = stamp,
+            externalId = canon.awardKey,
+            counter = 0,
+            skipPermission = true,
+        })
+        assertTrue(profile:AddLootLog(row, { skipPermission = true, skipBroadcast = true }), "occupied-slot RC row is stored")
+        return row
+    end
+    local function storeOutcome(profile, canon, outcome, counter, stamp)
+        local eventData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+        eventData.sourceLogId = canon.awardKey
+        eventData.awardKey = canon.awardKey
+        eventData.awardMember = WINNER
+        eventData.qualified = outcome ~= "NOT_BIS"
+        eventData.outcome = outcome
+        eventData.itemLink = HEAD_LINK
+        eventData.itemString = SF.LootLog.ExtractItemString(HEAD_LINK)
+        eventData.response = "Need"
+        if outcome == "ASSIGNED" then
+            eventData.assignedSlots = { "Head" }
+            eventData.slotBinding = "BOUND"
+            eventData.assignmentScopeMembers = { WINNER }
+            eventData.equipLoc = "INVTYPE_HEAD"
+            eventData.itemFamily = "ordinary"
+        else
+            eventData.assignedSlots = {}
+        end
+        local row = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, eventData, {
+            profile = profile,
+            author = owners[1],
+            timestamp = stamp,
+            counter = counter,
+            skipPermission = true,
+        })
+        assertTrue(row ~= nil, outcome .. " row is valid")
+        assertTrue(profile:AddLootLog(row, { skipPermission = true, skipBroadcast = true }), outcome .. " row is stored")
+        return row
+    end
+    local firstCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006500-1",
+        response = "Need",
+        lootWon = HEAD_LINK,
+        equipLoc = "INVTYPE_HEAD",
+    }))
+    local secondCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006500-2",
+        response = "Need",
+        lootWon = HEAD_LINK,
+        equipLoc = "INVTYPE_HEAD",
+    }))
+    storeRc(occupied, firstCanon, 1700006500)
+    local firstAssigned = storeOutcome(occupied, firstCanon, "ASSIGNED", 2, 1700006502)
+    storeRc(occupied, secondCanon, 1700006503)
+    local rejectedAssigned = storeOutcome(occupied, secondCanon, "ASSIGNED", 3, 1700006510)
+    local overflowWinner = storeOutcome(occupied, secondCanon, "OVERFLOW", 4, 1700006504)
+    local occupiedReplay = SF.LootHelperIdentity.Replay(occupied:GetLootLogs(), { owner = owners[1] })
+    assertEq(occupiedReplay.bis.state.outcomeWinner[firstCanon.awardKey], firstAssigned:GetID(), "first helm assignment wins its award")
+    assertEq(occupiedReplay.bis.state.outcomeWinner[secondCanon.awardKey], overflowWinner:GetID(), "occupied helm keeps the later OVERFLOW")
+    local occupiedHidden = occupied:HiddenLootLogIds()
+    assertTrue(occupiedHidden[rejectedAssigned:GetID()] == true, "rejected ASSIGNED duplicate is hidden")
+    assertTrue(occupiedHidden[overflowWinner:GetID()] ~= true, "replay OVERFLOW winner stays visible")
+    assertEq(visibleLootEvents(occupied, "BIS_OUTCOME", secondCanon.awardKey), 1, "Loot Logs shows the replay winner only")
+    assertEq(#(occupied:GetLootLogs() or {}) > 0, true, "occupancy filtering does not delete logs")
+    local occupiedStored = #(occupied:GetLootLogs() or {})
+    occupied:HiddenLootLogIds()
+    assertEq(#(occupied:GetLootLogs() or {}), occupiedStored, "a second visibility pass still does not delete logs")
+
+    -- Already-stored 1.5.4 bonus rows are not newly inserted, so followers
+    -- still synthesize one BONUS_ROLL without becoming coordinator.
+    local persisted = makeProfile("PersistedBonus")
+    addMember(persisted, WINNER)
+    Sync.state.isCoordinator = false
+    local persistedCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006600-1",
+        response = "Bonus Loot",
+        responseID = "BONUS_ROLL",
+        lootWon = HEAD_LINK,
+    }))
+    local persistedRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(persistedCanon), {
+        profile = persisted,
+        author = AWARDER,
+        timestamp = persistedCanon.timestamp,
+        externalId = persistedCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(persisted:AddLootLog(persistedRc, { skipPermission = true, skipBroadcast = true }), "persisted legacy bonus RC row is stored")
+    assertEq(persisted:MergeLogTables({ persistedRc:ToTable() }), 0, "merge dedupe does not insert the stored bonus row")
+    assertEq(persisted:NormalizeInsertedLegacyBonusRolls({}), 0, "an empty insert list does not normalize persisted rows")
+    assertEq(countLootEvents(persisted, "BONUS_ROLL", nil), 0, "persisted bonus row is still only an RC award")
+    assertEq(persisted:NormalizePersistedLegacyBonusRolls(), 1, "load scan synthesizes one bonus roll")
+    assertEq(countLootEvents(persisted, "BONUS_ROLL", nil), 1, "follower stores one bonus roll")
+    assertEq(countLootEvents(persisted, "BIS_OUTCOME", nil), 0, "follower scan does not write BIS_OUTCOME")
+    assertEq(persisted:NormalizePersistedLegacyBonusRolls(), 0, "a second persisted scan does not append")
+
+    -- Takeover backfill waits until queued log repairs are gone, then keeps
+    -- a historical outcome instead of appending another.
+    local waiting = makeProfile("WaitingBackfill")
+    addMember(waiting, WINNER)
+    setActive(waiting)
+    startSessionOn(waiting)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = owners[1]
+    Sync.state._adminConvergence = nil
+    Sync.state.requests = {}
+    Sync.state.repairQueue = { order = { "pending-repair" }, items = { ["pending-repair"] = {} } }
+    Sync.state._bisBackfillPendingReason = nil
+    local waitingCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006700-1",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local waitingRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(waitingCanon), {
+        profile = waiting,
+        author = AWARDER,
+        timestamp = waitingCanon.timestamp,
+        externalId = waitingCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(waiting:AddLootLog(waitingRc, { skipPermission = true, skipBroadcast = true }), "waiting profile stores the RC award")
+    assertEq(Sync:_ScheduleAutomaticBisBackfill("TakeoverSession"), 0, "backfill does not scan while repairs are queued")
+    assertEq(countLootEvents(waiting, "BIS_OUTCOME", waitingCanon.awardKey), 0, "queued repairs block the automatic outcome")
+    local historical = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    historical.sourceLogId = waitingCanon.awardKey
+    historical.awardKey = waitingCanon.awardKey
+    historical.awardMember = WINNER
+    historical.qualified = false
+    historical.outcome = "NOT_BIS"
+    historical.assignedSlots = {}
+    historical.itemLink = ITEM_LINK
+    historical.itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+    historical.response = "Greed"
+    local historicalLog = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, historical, {
+        profile = waiting,
+        author = owners[2],
+        timestamp = waitingCanon.timestamp + 1,
+        skipPermission = true,
+    })
+    assertTrue(historicalLog ~= nil, "historical outcome row is valid")
+    assertEq(waiting:MergeLogTables({ historicalLog:ToTable() }, { allowUnknownEventType = true }), 1, "bulk repair imports the historical outcome")
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 0, "backfill stays deferred while the repair queue is non-empty")
+    assertEq(countLootEvents(waiting, "BIS_OUTCOME", waitingCanon.awardKey), 1, "only the imported historical outcome exists")
+    Sync.state.repairQueue = { order = {}, items = {} }
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 0, "backfill does not append after the historical outcome arrives")
+    assertEq(countLootEvents(waiting, "BIS_OUTCOME", waitingCanon.awardKey), 1, "takeover still has one outcome")
+
+    local openAward = makeProfile("OpenBackfill")
+    addMember(openAward, WINNER)
+    setActive(openAward)
+    startSessionOn(openAward)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = owners[1]
+    Sync.state._adminConvergence = nil
+    Sync.state.requests = {
+        req1 = { kind = "ADMIN_LOG_REQ" },
+    }
+    Sync.state.repairQueue = { order = {}, items = {} }
+    Sync.state._bisBackfillPendingReason = nil
+    local openCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006701-2",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local openRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(openCanon), {
+        profile = openAward,
+        author = AWARDER,
+        timestamp = openCanon.timestamp,
+        externalId = openCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(openAward:AddLootLog(openRc, { skipPermission = true, skipBroadcast = true }), "open award RC row is stored")
+    assertEq(Sync:_ScheduleAutomaticBisBackfill("StartSession"), 0, "outstanding log requests block backfill")
+    assertEq(countLootEvents(openAward, "BIS_OUTCOME", openCanon.awardKey), 0, "no outcome is written before repairs finish")
+    Sync.state.requests = {}
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 1, "backfill writes the missing outcome once repairs are done")
+    assertEq(countLootEvents(openAward, "BIS_OUTCOME", openCanon.awardKey), 1, "one outcome after deferred backfill")
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 0, "drained backfill does not scan again")
+
+    -- Live BIS_OUTCOME from a non-coordinator is ignored. Bulk merge still stores it.
+    local live = makeProfile("LiveReject")
+    addMember(live, WINNER)
+    setActive(live)
+    startSessionOn(live)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = owners[1]
+    local liveCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006800-1",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local liveRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(liveCanon), {
+        profile = live,
+        author = AWARDER,
+        timestamp = liveCanon.timestamp,
+        externalId = liveCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(live:AddLootLog(liveRc, { skipPermission = true, skipBroadcast = true }), "live-reject profile stores the RC award")
+    local liveOutcome = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    liveOutcome.sourceLogId = liveCanon.awardKey
+    liveOutcome.awardKey = liveCanon.awardKey
+    liveOutcome.awardMember = WINNER
+    liveOutcome.qualified = false
+    liveOutcome.outcome = "NOT_BIS"
+    liveOutcome.assignedSlots = {}
+    liveOutcome.itemLink = ITEM_LINK
+    liveOutcome.itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+    liveOutcome.response = "Greed"
+    local liveLog = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, liveOutcome, {
+        profile = live,
+        author = owners[2],
+        timestamp = liveCanon.timestamp + 1,
+        skipPermission = true,
+    })
+    assertTrue(liveLog ~= nil, "live BIS_OUTCOME row is valid")
+    local liveWire = liveLog:ToTable()
+    Sync:HandleNewLog(owners[2], {
+        sessionId = Sync.state.sessionId,
+        profileId = live:GetProfileId(),
+        log = liveWire,
+    })
+    assertEq(countLootEvents(live, "BIS_OUTCOME", liveCanon.awardKey), 0, "non-coordinator live BIS_OUTCOME is ignored")
+    assertEq(live:MergeLogTables({ liveWire }, { allowUnknownEventType = true }), 1, "bulk import still stores the historical outcome")
+    local coordLog = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, liveOutcome, {
+        profile = live,
+        author = owners[1],
+        timestamp = liveCanon.timestamp + 2,
+        skipPermission = true,
+    })
+    Sync:HandleNewLog(owners[1], {
+        sessionId = Sync.state.sessionId,
+        profileId = live:GetProfileId(),
+        log = coordLog:ToTable(),
+    })
+    assertEq(countLootEvents(live, "BIS_OUTCOME", liveCanon.awardKey), 2, "coordinator live BIS_OUTCOME is stored beside history")
 end
 testSingleWriterAndBonusRolls()
 

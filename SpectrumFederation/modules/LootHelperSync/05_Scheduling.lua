@@ -346,6 +346,10 @@ function Sync:_ProcessRepairConvergenceTick(trigger)
         SF.Debug:Verbose("SYNC", "Repair convergence tick processed %d queued ranges (trigger=%s)", processed, tostring(trigger or "ticker"))
     end
 
+    if (type(queue.order) ~= "table" or #queue.order == 0) and self._DrainAutomaticBisBackfill then
+        self:_DrainAutomaticBisBackfill()
+    end
+
     return processed > 0
 end
 

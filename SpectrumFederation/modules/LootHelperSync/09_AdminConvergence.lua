@@ -114,6 +114,9 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         end
         local completionHook = opts.onComplete or function() self:BroadcastSessionStart() end
         completionHook()
+        if self._DrainAutomaticBisBackfill then
+            self:_DrainAutomaticBisBackfill()
+        end
         return
     end
 
@@ -259,6 +262,10 @@ function Sync:_FinishAdminConvergence(reason)
     else
         -- Fallback if no valid completion hook
         self:BroadcastSessionStart()
+    end
+
+    if self._DrainAutomaticBisBackfill then
+        self:_DrainAutomaticBisBackfill()
     end
 end
 

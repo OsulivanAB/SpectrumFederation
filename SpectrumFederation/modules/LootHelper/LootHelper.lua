@@ -311,6 +311,11 @@ function SF:RehydrateLootHelperDB()
 			if profile.RebuildLogIndex then
 				profile:RebuildLogIndex()
 			end
+			-- Upgrade path: a 1.5.4 bonus row is already stored, so merge
+			-- dedupe will never insert it again. Followers scan here too.
+			if profile.NormalizePersistedLegacyBonusRolls then
+				profile:NormalizePersistedLegacyBonusRolls()
+			end
 			if profile.ApplyIdentityProjection then
 				profile:ApplyIdentityProjection()
 			end

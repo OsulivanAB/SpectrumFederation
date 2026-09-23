@@ -579,6 +579,19 @@ function Sync:HandleNewLog(sender, payload)
     if not lootLog then
         return
     end
+    -- During a controlling session the coordinator is the only live writer of
+    -- automatic BIS_OUTCOME rows. Older peers still broadcast their own.
+    -- Bulk import keeps historical duplicates; this gate is live NEW_LOG only.
+    if eventType == types.BIS_OUTCOME
+        and profile.SessionControlsAutomaticBis
+        and profile:SessionControlsAutomaticBis()
+        and not self:_SamePlayer(sender, self.state.coordinator)
+    then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Ignoring live BIS_OUTCOME from %s; the session coordinator is the automatic writer", tostring(sender))
+        end
+        return
+    end
     local inserted = profile:AddLootLog(lootLog, { skipPermission = true, skipBroadcast = true })
     if not inserted then
         return

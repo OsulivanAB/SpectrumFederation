@@ -2450,13 +2450,41 @@ function LootProfile:HasSourceConsistentBisOutcome(awardKey)
 	return false
 end
 
--- First source-consistent BIS_OUTCOME in causal OrderLogs order is the
--- replay winner. Timestamp order can list a later observer first.
--- NOT_BIS winners and every later duplicate stay out of the Loot Logs UI.
+-- Replay can reject an earlier source-consistent ASSIGNED when the slot is
+-- already occupied and accept a later OVERFLOW. The visible row is that
+-- outcomeWinner. A fresh identity projection is reused; a stale one is
+-- rebuilt once for this pass. NOT_BIS winners stay stored and hidden.
 -- Historical rows are left in place.
+function LootProfile:_AutomaticBisDisplayWinners()
+	local logs = self._lootLogs or {}
+	local function winnersOf(result)
+		local state = result and result.bis and result.bis.state
+		if state and type(state.outcomeWinner) == "table" then
+			return state.outcomeWinner
+		end
+		return nil
+	end
+	local projection = self._identityProjection
+	local ordered = projection and projection.orderedLogs
+	if type(ordered) == "table" and #ordered == #logs then
+		local winners = winnersOf(projection)
+		if winners then
+			return winners
+		end
+	end
+	if self.ApplyIdentityProjection then
+		return winnersOf(self:ApplyIdentityProjection({ force = true }))
+	end
+	return nil
+end
+
 function LootProfile:HiddenLootLogIds()
 	local hidden = {}
-	local winners = {}
+	local winners = self:_AutomaticBisDisplayWinners()
+	local useReplayWinners = type(winners) == "table"
+	if not useReplayWinners then
+		winners = {}
+	end
 	local rcByKey = {}
 	local replacedBonusKeys = {}
 	local bonusIds = {}
@@ -2507,13 +2535,22 @@ function LootProfile:HiddenLootLogIds()
 			local id = log.GetID and log:GetID() or log._id
 			if type(id) == "string" and type(data) == "table" then
 				local awardKey = data.awardKey
-				if type(awardKey) == "string" and replacedBonusKeys[awardKey] then
+				local rcLog = type(awardKey) == "string" and rcByKey[awardKey] or nil
+				local rcData = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
+				local bonusSource = type(rcData) == "table" and rcData.responseId == "BONUS_ROLL"
+				if type(awardKey) == "string" and (replacedBonusKeys[awardKey] or bonusSource) then
 					hidden[id] = true
 				else
 					local consistent = Bis and Bis.IsOutcomeSourceConsistent
 						and type(awardKey) == "string"
-						and Bis.IsOutcomeSourceConsistent(data, rcByKey[awardKey])
-					if not consistent or winners[awardKey] then
+						and Bis.IsOutcomeSourceConsistent(data, rcLog)
+					if useReplayWinners then
+						-- Only the replay winner is visible. An earlier
+						-- ASSIGNED that lost the slot stays in history.
+						if not consistent or winners[awardKey] ~= id or data.outcome == notBis then
+							hidden[id] = true
+						end
+					elseif not consistent or winners[awardKey] then
 						hidden[id] = true
 					else
 						winners[awardKey] = id
@@ -2795,6 +2832,30 @@ function LootProfile:NormalizeInsertedLegacyBonusRolls(awardKeys)
             if ok then
                 wrote = wrote + 1
             end
+        end
+    end
+    return wrote
+end
+
+-- One pass over rows already stored. Merge dedupe never reports those keys,
+-- and followers are not the automatic BiS writer, so load and session join
+-- both use this scan. A second pass finds the synthesized bonus roll and stops.
+function LootProfile:NormalizePersistedLegacyBonusRolls()
+    local types = SF.LootLogEventTypes or {}
+    local logs = self._lootLogs or {}
+    local pending = {}
+    for i = 1, #logs do
+        local log = logs[i]
+        local eventType = log.GetEventType and log:GetEventType() or log._eventType
+        local data = log.GetEventData and log:GetEventData() or log._data
+        if eventType == types.RC_LOOT_COUNCIL and type(data) == "table" and data.responseId == "BONUS_ROLL" then
+            pending[#pending + 1] = log
+        end
+    end
+    local wrote = 0
+    for i = 1, #pending do
+        if self:NormalizeLegacyBonusRollRC(pending[i]) then
+            wrote = wrote + 1
         end
     end
     return wrote
@@ -4537,6 +4598,9 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		opts.allowMainSwapFingerprintNormalize = true
 	end
 	local inserted = self:MergeLogTables(snapshot.lootLogs, opts)
+	if self.NormalizePersistedLegacyBonusRolls then
+		self:NormalizePersistedLegacyBonusRolls()
+	end
 
 	return true, inserted, nil
 end

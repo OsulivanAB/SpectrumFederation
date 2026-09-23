@@ -328,6 +328,9 @@ function Sync:HandleAuthLogs(sender, payload)
                 end
             end
         end
+        if self._DrainAutomaticBisBackfill then
+            self:_DrainAutomaticBisBackfill()
+        end
     end
 end
 

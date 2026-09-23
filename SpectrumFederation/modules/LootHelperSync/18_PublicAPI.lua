@@ -704,9 +704,11 @@ function Sync:StartSession(profileId, opts)
 
     -- Canonicalize derived member state before announcing session.
     self:RebuildProfile(profileId, "session_start_coordinator")
-    if self.BackfillAutomaticBisOnPromotion then
-        self:BackfillAutomaticBisOnPromotion(false, "StartSession")
+    if profile.NormalizePersistedLegacyBonusRolls then
+        profile:NormalizePersistedLegacyBonusRolls()
     end
+    -- Write missing outcomes only after admin convergence merges peer history.
+    self.state._bisBackfillPendingReason = "StartSession"
 
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
@@ -930,9 +932,6 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self.state.profileId = profileId
     self.state.coordinator = me
     self.state.isCoordinator = true
-    if self.BackfillAutomaticBisOnPromotion then
-        self:BackfillAutomaticBisOnPromotion(false, "TakeoverSession")
-    end
 
     -- Ensure strictly increasing epoch
     local newEpoch = self:_Now()
@@ -946,6 +945,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
     if profile then
         self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
+        if profile.NormalizePersistedLegacyBonusRolls then
+            profile:NormalizePersistedLegacyBonusRolls()
+        end
     end
     self:_PersistSessionState("TakeoverSession")
 
@@ -960,9 +962,15 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self:BroadcastCoordinatorTakeover()
 
     if not opts.rerunAdminConvergence then
+        self.state._bisBackfillPendingReason = nil
+        if self.BackfillAutomaticBisOnPromotion then
+            self:BackfillAutomaticBisOnPromotion(false, "TakeoverSession")
+        end
         self:ReannounceSession()
         return true
     end
+
+    self.state._bisBackfillPendingReason = "TakeoverSession"
 
     -- Rerun admin convergence, but finish with SES_REANNOUNCE instead of SES_START
     self:BeginAdminConvergence(sessionId, profileId, {

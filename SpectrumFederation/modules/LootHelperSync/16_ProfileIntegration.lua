@@ -1699,6 +1699,60 @@ function Sync:MergeLogs(profileId, logs, opts)
     return inserted and inserted > 0, details or { inserted = inserted or 0, replaced = 0, mismatchCount = 0, mismatches = {} }
 end
 
+function Sync:_AutomaticBisBackfillBlocked()
+    local state = self.state
+    if type(state) ~= "table" then
+        return true
+    end
+    local conv = state._adminConvergence
+    if type(conv) == "table" and conv.finished ~= true then
+        return true
+    end
+    local queue = state.repairQueue
+    if type(queue) == "table" and type(queue.order) == "table" and #queue.order > 0 then
+        return true
+    end
+    if type(state.requests) == "table" then
+        for _, req in pairs(state.requests) do
+            local kind = type(req) == "table" and req.kind or nil
+            if kind == "ADMIN_LOG_REQ" or kind == "LOG_REQ" or kind == "NEED_LOGS" then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- One-shot. Repeat calls do not scan until the previous wait has drained.
+function Sync:_ScheduleAutomaticBisBackfill(reason)
+    if not (self.state and self.state.isCoordinator == true) then
+        return 0
+    end
+    if type(self.state._bisBackfillPendingReason) ~= "string" then
+        self.state._bisBackfillPendingReason = reason or "deferred"
+    end
+    return self:_DrainAutomaticBisBackfill()
+end
+
+function Sync:_DrainAutomaticBisBackfill()
+    if not (self.state and type(self.state._bisBackfillPendingReason) == "string") then
+        return 0
+    end
+    if self.state.isCoordinator ~= true then
+        self.state._bisBackfillPendingReason = nil
+        return 0
+    end
+    if self:_AutomaticBisBackfillBlocked() then
+        return 0
+    end
+    local reason = self.state._bisBackfillPendingReason
+    self.state._bisBackfillPendingReason = nil
+    if self.BackfillAutomaticBisOnPromotion then
+        return self:BackfillAutomaticBisOnPromotion(false, reason) or 0
+    end
+    return 0
+end
+
 -- Runs only on the transition into coordinator. Repeat heartbeats pass
 -- wasCoordinator=true and return without scanning logs.
 function Sync:BackfillAutomaticBisOnPromotion(wasCoordinator, reason)
