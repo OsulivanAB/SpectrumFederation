@@ -6172,8 +6172,32 @@ function testBoundedBisBackfill()
     assertEq(countLootEvents(profile, "BIS_OUTCOME", nil), 25, "only the first batch is stored before the timer")
     assertEq(scans, 0, "backfill does not rescan the log once per award")
     assertEq(broadcasts, 0, "historical backfill does not enqueue one sync message per outcome")
+    local job = profile._autoBisBackfill
+    local pendingKey = job and job.keys and job.keys[job.index]
+    assertTrue(type(pendingKey) == "string", "the next backlog award is known")
+    local pendingRc = profile._logById and profile._logById[pendingKey]
+    local pendingData = pendingRc and pendingRc:GetEventData()
+    local arrivedData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    arrivedData.sourceLogId = pendingKey
+    arrivedData.awardKey = pendingKey
+    arrivedData.awardMember = pendingData and pendingData.member or WINNER
+    arrivedData.qualified = false
+    arrivedData.outcome = "NOT_BIS"
+    arrivedData.assignedSlots = {}
+    arrivedData.itemLink = pendingData and pendingData.itemLink or ITEM_LINK
+    arrivedData.itemString = pendingData and pendingData.itemString or SF.LootLog.ExtractItemString(ITEM_LINK)
+    arrivedData.response = pendingData and pendingData.response or "Greed"
+    local arrived = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, arrivedData, {
+        profile = profile,
+        author = AWARDER,
+        timestamp = (pendingData and pendingData.timestamp or 1700000999) + 1,
+        skipPermission = true,
+    })
+    assertTrue(arrived ~= nil, "an outcome that arrives during the wait is valid")
+    assertTrue(profile:AddLootLog(arrived, { skipPermission = true, skipBroadcast = true }), "the arrived outcome is stored before the next batch")
     deferredFn()
-    assertEq(countLootEvents(profile, "BIS_OUTCOME", nil), 30, "the deferred batch writes the remaining outcomes")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", pendingKey), 1, "a yielded batch does not duplicate an outcome that arrived during the wait")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", nil), 30, "the deferred batch writes only the awards still missing an outcome")
     assertEq(profile:ReconcileMissingAutomaticBisOutcomes(), 0, "a finished backfill does not append")
     assertEq(scans, 0, "the second pass still uses the outcome index")
     assertEq(broadcasts, 0, "the deferred batch stays local")
@@ -6192,6 +6216,101 @@ function testBoundedBisBackfill()
     end
 end
 testBoundedBisBackfill()
+
+function testCommQueueWarningLatch()
+    loadModule("SpectrumFederation/modules/LootHelper/Comm.lua")
+    local Comm = SF.LootHelperComm
+    local savedCfg = {
+        maxQueue = Comm.cfg.maxQueue,
+        maxPerTarget = Comm.cfg.maxPerTarget,
+        queueEnabled = Comm.cfg.queueEnabled,
+    }
+    local sends = 0
+    function Comm:SendCommMessage()
+        sends = sends + 1
+    end
+    local function resetQueue()
+        Comm.state.total = 0
+        Comm.state.byKey = {}
+        Comm.state.keys = {}
+        Comm.state.rr = 0
+        Comm.state.lastSent = {}
+        Comm.state.ticker = nil
+        Comm.state._queueFullWarned = nil
+        Comm.state._perTargetWarned = nil
+    end
+    local function warnCount(needle, from)
+        local n = 0
+        for i = from, #printed do
+            local message = printed[i][2] or ""
+            if string.find(message, needle, 1, true) then
+                n = n + 1
+            end
+        end
+        return n
+    end
+    local function drain()
+        local guard = 0
+        while Comm.state.keys and #Comm.state.keys > 0 and guard < 20 do
+            guard = guard + 1
+            local key = Comm.state.keys[1]
+            Comm.state.lastSent[key] = -1
+            Comm:_PumpQueue()
+        end
+        Comm:_PumpQueue()
+    end
+
+    resetQueue()
+    Comm.cfg.queueEnabled = true
+    Comm.cfg.maxQueue = 20
+    Comm.cfg.maxPerTarget = 2
+    local perFrom = #printed
+    assertTrue(Comm:_EnqueueSend("SF_LH", "a", "RAID", nil, "NORMAL"), "first per-target message is queued")
+    assertTrue(Comm:_EnqueueSend("SF_LH", "b", "RAID", nil, "NORMAL"), "second per-target message is queued")
+    assertFalse(Comm:_EnqueueSend("SF_LH", "c", "RAID", nil, "NORMAL"), "a full per-target queue drops the message")
+    assertEq(warnCount("per-target queue full", perFrom + 1), 1, "saturating a per-target queue warns once")
+    local key = Comm.state.keys[1]
+    Comm.state.lastSent[key] = -1
+    Comm:_PumpQueue()
+    assertEq(#Comm.state.byKey[key], 1, "pumping one message leaves the per-target queue occupied")
+    assertTrue(Comm:_EnqueueSend("SF_LH", "d", "RAID", nil, "NORMAL"), "a freed per-target slot accepts another message")
+    assertFalse(Comm:_EnqueueSend("SF_LH", "e", "RAID", nil, "NORMAL"), "refilling the same queue drops again")
+    assertEq(warnCount("per-target queue full", perFrom + 1), 1, "a pump that leaves the queue occupied does not warn again")
+    drain()
+    assertEq(#(Comm.state.keys or {}), 0, "the per-target queue can drain")
+    assertTrue(Comm:_EnqueueSend("SF_LH", "f", "RAID", nil, "NORMAL"), "an empty queue accepts a new message")
+    assertTrue(Comm:_EnqueueSend("SF_LH", "g", "RAID", nil, "NORMAL"), "the second message fills the queue again")
+    assertFalse(Comm:_EnqueueSend("SF_LH", "h", "RAID", nil, "NORMAL"), "a later saturation still drops")
+    assertEq(warnCount("per-target queue full", perFrom + 1), 2, "emptying the queue allows one later warning")
+
+    resetQueue()
+    Comm.cfg.maxPerTarget = 50
+    Comm.cfg.maxQueue = 2
+    local fullFrom = #printed
+    assertTrue(Comm:_EnqueueSend("SF_LH", "a", "RAID", nil, "NORMAL"), "first queued message fits the global cap")
+    assertTrue(Comm:_EnqueueSend("SF_LH", "b", "RAID", nil, "NORMAL"), "second queued message fills the global cap")
+    assertFalse(Comm:_EnqueueSend("SF_LH", "c", "RAID", nil, "NORMAL"), "a full comm queue drops the message")
+    assertEq(warnCount("Comm queue full", fullFrom + 1), 1, "filling the comm queue warns once")
+    key = Comm.state.keys[1]
+    Comm.state.lastSent[key] = -1
+    Comm:_PumpQueue()
+    assertEq(Comm.state.total, 1, "pumping one message leaves the global queue occupied")
+    assertTrue(Comm:_EnqueueSend("SF_LH", "d", "RAID", nil, "NORMAL"), "a freed global slot accepts another message")
+    assertFalse(Comm:_EnqueueSend("SF_LH", "e", "RAID", nil, "NORMAL"), "refilling the global queue drops again")
+    assertEq(warnCount("Comm queue full", fullFrom + 1), 1, "a pump that leaves the global queue occupied does not warn again")
+    drain()
+    assertTrue(Comm:_EnqueueSend("SF_LH", "f", "RAID", nil, "NORMAL"), "an idle queue accepts a new message")
+    assertTrue(Comm:_EnqueueSend("SF_LH", "g", "RAID", nil, "NORMAL"), "the second message fills the global queue again")
+    assertFalse(Comm:_EnqueueSend("SF_LH", "h", "RAID", nil, "NORMAL"), "a later global saturation still drops")
+    assertEq(warnCount("Comm queue full", fullFrom + 1), 2, "an idle queue allows one later warning")
+    assertTrue(sends > 0, "queued messages are sent when the pump runs")
+
+    Comm.cfg.maxQueue = savedCfg.maxQueue
+    Comm.cfg.maxPerTarget = savedCfg.maxPerTarget
+    Comm.cfg.queueEnabled = savedCfg.queueEnabled
+    resetQueue()
+end
+testCommQueueWarningLatch()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

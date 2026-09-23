@@ -2987,6 +2987,17 @@ function LootProfile:_PumpAutomaticBisBackfill()
         end
         local keys = job.keys or {}
         local covered = job.covered or {}
+        -- A yielded batch must see outcomes that arrived while this client waited.
+        -- One index pass per turn, not one full-log scan per award.
+        if job.index > 1 then
+            local fresh = self:_IndexSourceConsistentBisOutcomes()
+            for awardKey, present in pairs(fresh) do
+                if present then
+                    covered[awardKey] = true
+                end
+            end
+        end
+        job.covered = covered
         local opts = job.opts or {}
         local batch = tonumber(self.AUTO_BIS_BACKFILL_BATCH) or 25
         if batch < 1 then

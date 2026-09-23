@@ -322,7 +322,6 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
         end
         return false
     end
-    st._queueFullWarned = nil
 
     local key = self:_TargetKey(distribution, target)
     local q = st.byKey[key]
@@ -340,9 +339,6 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
             SF:PrintWarning(("Comm per-target queue full for %s (%d/%d): dropping message"):format(tostring(key), #q, maxPer))
         end
         return false
-    end
-    if st._perTargetWarned then
-        st._perTargetWarned[key] = nil
     end
 
     table.insert(q, {
