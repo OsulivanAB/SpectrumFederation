@@ -18,7 +18,7 @@ The locally selected Loot Helper profile is not used for live recording. If the 
 
 The Loot Log **Author** is the RC master looter who awarded the item. The Spectrum writer must still be an admin of the session profile. Any eligible Spectrum admin may create the canonical `RC_LOOT_COUNCIL` row. Those rows converge through the deterministic external id, so several observers still produce one award.
 
-Automatic Spectrum-derived `BIS_OUTCOME` rows are different. During an active Loot Helper session, only the session coordinator appends one. Other admins store the canonical RC award and do not write an outcome of their own. If another admin observes the award first, the coordinator writes the outcome once that RC row arrives through normal sync. Before writing, the coordinator checks for an existing source-consistent outcome for the same `awardKey`, so coordinator takeover does not add a second row. Outside an active session, the recording admin remains the writer.
+Automatic Spectrum-derived `BIS_OUTCOME` rows are different. During an active Loot Helper session, only the session coordinator appends one. Other admins store the canonical RC award and do not write an outcome of their own. If another admin observes the award first, the coordinator writes the outcome once that RC row arrives through normal sync. A follower who already stored the RC row and later becomes coordinator writes the missing outcome on that promotion, or when the same award is offered again. Before writing, the coordinator checks for an existing source-consistent outcome for the same `awardKey`, so coordinator takeover does not add a second row. Outside an active session, the recording admin remains the writer.
 
 If the winner is not a member of the session profile, no Loot Log is created. Admins of the session profile see a local warning only. Replay and reload do not repeat that warning for the same award in the same session.
 
@@ -68,7 +68,7 @@ RCLC history with `responseID == "BONUS_ROLL"` is not an RC award. It is recorde
 
 A bonus roll does not create an `RC_LOOT_COUNCIL` row and does not run automatic BiS evaluation. Classification uses the RCLC `responseID` field, not the displayed response text.
 
-`NOT_BIS` is still stored once per award when reconstruction needs a frozen non-BiS decision. Loot Logs hides that row. `ASSIGNED`, `OVERFLOW`, and `UNRESOLVED` stay visible. Older duplicate `BIS_OUTCOME` rows are left in saved history; the log view shows only the first source-consistent outcome for that `awardKey`, and hides it when that outcome is `NOT_BIS`.
+`NOT_BIS` is still stored once per award when reconstruction needs a frozen non-BiS decision. Loot Logs hides that row. `ASSIGNED`, `OVERFLOW`, and `UNRESOLVED` stay visible. Older duplicate `BIS_OUTCOME` rows are left in saved history; the log view shows only the first source-consistent outcome for that `awardKey` in causal replay order, and hides it when that outcome is `NOT_BIS`.
 
 ## Award identity
 

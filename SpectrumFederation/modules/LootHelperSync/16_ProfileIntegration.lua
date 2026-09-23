@@ -1694,6 +1694,26 @@ function Sync:MergeLogs(profileId, logs, opts)
     return inserted and inserted > 0, details or { inserted = inserted or 0, replaced = 0, mismatchCount = 0, mismatches = {} }
 end
 
+-- Runs only on the transition into coordinator. Repeat heartbeats pass
+-- wasCoordinator=true and return without scanning logs.
+function Sync:BackfillAutomaticBisOnPromotion(wasCoordinator, reason)
+    if wasCoordinator == true or not (self.state and self.state.isCoordinator == true) then
+        return 0
+    end
+    if type(self.state.profileId) ~= "string" or not self.FindLocalProfileById then
+        return 0
+    end
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    if not (profile and profile.ReconcileMissingAutomaticBisOutcomes) then
+        return 0
+    end
+    local wrote = profile:ReconcileMissingAutomaticBisOutcomes() or 0
+    if wrote > 0 and SF.Debug then
+        SF.Debug:Info("SYNC", "Coordinator backfill wrote %d automatic BiS outcome(s) (%s)", wrote, tostring(reason or "promotion"))
+    end
+    return wrote
+end
+
 -- Function Rebuild derived state from logs (replay) for the given profile.
 -- @param profileId string Stable profile id
 -- @return nil

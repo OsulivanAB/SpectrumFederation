@@ -2450,7 +2450,8 @@ function LootProfile:HasSourceConsistentBisOutcome(awardKey)
 	return false
 end
 
--- First source-consistent BIS_OUTCOME in log order is the replay winner.
+-- First source-consistent BIS_OUTCOME in causal OrderLogs order is the
+-- replay winner. Timestamp order can list a later observer first.
 -- NOT_BIS winners and every later duplicate stay out of the Loot Logs UI.
 -- Historical rows are left in place.
 function LootProfile:HiddenLootLogIds()
@@ -2461,6 +2462,8 @@ function LootProfile:HiddenLootLogIds()
 	local types = SF.LootLogEventTypes or {}
 	local notBis = Bis and Bis.OUTCOME and Bis.OUTCOME.NOT_BIS or "NOT_BIS"
 	local logs = self._lootLogs or {}
+	local Identity = SF.LootHelperIdentity
+	local ordered = (Identity and Identity.OrderLogs and Identity.OrderLogs(logs)) or logs
 	-- Index every RC source first. Outcome timestamps can sort ahead of the
 	-- history timestamp, and source consistency still has to see that RC row.
 	for i = 1, #logs do
@@ -2471,8 +2474,8 @@ function LootProfile:HiddenLootLogIds()
 			rcByKey[data.awardKey] = log
 		end
 	end
-	for i = 1, #logs do
-		local log = logs[i]
+	for i = 1, #ordered do
+		local log = ordered[i]
 		local eventType = log.GetEventType and log:GetEventType() or log._eventType
 		if eventType == types.BIS_OUTCOME then
 			local data = log.GetEventData and log:GetEventData() or log._data
@@ -2517,10 +2520,14 @@ function LootProfile:TryAddRCLootCouncilAward(canonical)
 	if type(awardKey) ~= "string" or awardKey == "" then
 		return false, "invalid_award"
 	end
-	if self:GetRCAwardLogId(awardKey) then
-		return false, "duplicate"
-	end
-	if self._logIndex and self._logIndex[awardKey] then
+	local existingId = self:GetRCAwardLogId(awardKey)
+	local existing = existingId and self._logById and self._logById[existingId] or nil
+	if existing or (self._logIndex and self._logIndex[awardKey]) then
+		-- A follower may already have stored the RC row. Becoming coordinator
+		-- and seeing the award again still has to freeze the missing outcome.
+		if existing and self:_MaybeWriteAutomaticBisOutcome(existing) then
+			return true, nil
+		end
 		return false, "duplicate"
 	end
 
@@ -2692,7 +2699,7 @@ function LootProfile:EvaluateRCBisConflict(opts)
     }
 end
 
-function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog)
+function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
     if self._writingAutoBis then
         return false, "reentrant"
     end
@@ -2711,12 +2718,12 @@ function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog)
         return false, "outcome_exists"
     end
     self._writingAutoBis = true
-    local ok, err = self:ApplyRCAutoBisOutcome(rcLog, canonical)
+    local ok, err = self:ApplyRCAutoBisOutcome(rcLog, canonical, opts)
     self._writingAutoBis = false
     return ok, err
 end
 
-function LootProfile:ReconcileInsertedRCAwards(awardKeys)
+function LootProfile:ReconcileInsertedRCAwards(awardKeys, opts)
     if self._writingAutoBis or type(awardKeys) ~= "table" then
         return 0
     end
@@ -2730,7 +2737,7 @@ function LootProfile:ReconcileInsertedRCAwards(awardKeys)
             local rcId = self:GetRCAwardLogId(awardKey)
             local rcLog = rcId and self._logById and self._logById[rcId] or nil
             if rcLog then
-                local ok = self:_MaybeWriteAutomaticBisOutcome(rcLog)
+                local ok = self:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
                 if ok then
                     wrote = wrote + 1
                 end
@@ -2740,7 +2747,57 @@ function LootProfile:ReconcileInsertedRCAwards(awardKeys)
     return wrote
 end
 
-function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical)
+-- One pass when this client becomes the session coordinator. Awards that
+-- already have a source-consistent outcome are skipped. The pass is silent
+-- so a backlog does not print one chat line per historical award.
+function LootProfile:ReconcileMissingAutomaticBisOutcomes()
+    if self._writingAutoBis or not self:IsActiveSessionCoordinator() then
+        return 0
+    end
+    local types = SF.LootLogEventTypes or {}
+    local Bis = SF.LootHelperBis
+    local logs = self._lootLogs or {}
+    local rcByKey = {}
+    local covered = {}
+    for i = 1, #logs do
+        local log = logs[i]
+        local eventType = log.GetEventType and log:GetEventType() or log._eventType
+        local data = log.GetEventData and log:GetEventData() or log._data
+        if eventType == types.RC_LOOT_COUNCIL and type(data) == "table" and type(data.awardKey) == "string" and data.awardKey ~= "" then
+            rcByKey[data.awardKey] = log
+        end
+    end
+    for i = 1, #logs do
+        local log = logs[i]
+        local eventType = log.GetEventType and log:GetEventType() or log._eventType
+        if eventType == types.BIS_OUTCOME then
+            local data = log.GetEventData and log:GetEventData() or log._data
+            local awardKey = type(data) == "table" and data.awardKey or nil
+            if type(awardKey) == "string" and not covered[awardKey]
+                and Bis and Bis.IsOutcomeSourceConsistent
+                and Bis.IsOutcomeSourceConsistent(data, rcByKey[awardKey]) then
+                covered[awardKey] = true
+            end
+        end
+    end
+    local Identity = SF.LootHelperIdentity
+    local ordered = (Identity and Identity.OrderLogs and Identity.OrderLogs(logs)) or logs
+    local keys = {}
+    local queued = {}
+    for i = 1, #ordered do
+        local log = ordered[i]
+        local eventType = log.GetEventType and log:GetEventType() or log._eventType
+        local data = log.GetEventData and log:GetEventData() or log._data
+        local awardKey = type(data) == "table" and data.awardKey or nil
+        if eventType == types.RC_LOOT_COUNCIL and type(awardKey) == "string" and not covered[awardKey] and not queued[awardKey] then
+            queued[awardKey] = true
+            keys[#keys + 1] = awardKey
+        end
+    end
+    return self:ReconcileInsertedRCAwards(keys, { silent = true })
+end
+
+function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical, opts)
     if type(rcLog) ~= "table" or type(canonical) ~= "table" then
         return false, "invalid_award"
     end
@@ -2809,7 +2866,7 @@ function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical)
     if not inserted then
         return false, "duplicate"
     end
-    if decided.outcome == Bis.OUTCOME.OVERFLOW or decided.outcome == Bis.OUTCOME.UNRESOLVED then
+    if not (opts and opts.silent) and (decided.outcome == Bis.OUTCOME.OVERFLOW or decided.outcome == Bis.OUTCOME.UNRESOLVED) then
         WarnLiveBisConflict(self, awardKey, string.format(
             "BiS tracking for %s awarded to %s: %s.",
             tostring(canonical.itemLink or "[item]"),

@@ -5539,6 +5539,110 @@ function testSingleWriterAndBonusRolls()
     assertEq(countLootEvents(legacy, "BIS_OUTCOME", assignedCanon.awardKey), 2, "historical ASSIGNED duplicates remain stored")
     assertEq(visibleLootEvents(legacy, "BIS_OUTCOME", assignedCanon.awardKey), 1, "Loot Logs shows one authoritative ASSIGNED row")
 
+    -- Timestamp order can list a later NOT_BIS first. Causal order, which
+    -- replay uses, applies the ASSIGNED row that the later writer observed.
+    local causal = makeProfile("CausalOrder")
+    addMember(causal, WINNER)
+    local causalCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006302-9",
+        response = "Need",
+        lootWon = HEAD_LINK,
+        equipLoc = "INVTYPE_HEAD",
+    }))
+    local causalRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(causalCanon), {
+        profile = causal,
+        author = AWARDER,
+        timestamp = causalCanon.timestamp,
+        externalId = causalCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(causal:AddLootLog(causalRc, { skipPermission = true, skipBroadcast = true }), "causal RC row is stored")
+    local assignedData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    assignedData.sourceLogId = causalCanon.awardKey
+    assignedData.awardKey = causalCanon.awardKey
+    assignedData.awardMember = WINNER
+    assignedData.qualified = true
+    assignedData.outcome = "ASSIGNED"
+    assignedData.assignedSlots = { "Head" }
+    assignedData.slotBinding = "BOUND"
+    assignedData.assignmentScopeMembers = { WINNER }
+    assignedData.equipLoc = "INVTYPE_HEAD"
+    assignedData.itemFamily = "ordinary"
+    assignedData.itemLink = HEAD_LINK
+    assignedData.itemString = SF.LootLog.ExtractItemString(HEAD_LINK)
+    assignedData.response = "Need"
+    local causalAssigned = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, assignedData, {
+        profile = causal,
+        author = owners[1],
+        timestamp = causalCanon.timestamp + 20,
+        skipPermission = true,
+    })
+    assertTrue(causal:AddLootLog(causalAssigned, { skipPermission = true, skipBroadcast = true }), "later ASSIGNED row is stored")
+    local notBisData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    notBisData.sourceLogId = causalCanon.awardKey
+    notBisData.awardKey = causalCanon.awardKey
+    notBisData.awardMember = WINNER
+    notBisData.qualified = false
+    notBisData.outcome = "NOT_BIS"
+    notBisData.assignedSlots = {}
+    notBisData.itemLink = HEAD_LINK
+    notBisData.itemString = SF.LootLog.ExtractItemString(HEAD_LINK)
+    notBisData.response = "Need"
+    notBisData.preOpAuthorMax = {
+        { author = owners[1], counter = causalAssigned:GetCounter() },
+    }
+    local causalNotBis = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, notBisData, {
+        profile = causal,
+        author = owners[2],
+        timestamp = causalCanon.timestamp + 1,
+        skipPermission = true,
+    })
+    assertTrue(causal:AddLootLog(causalNotBis, { skipPermission = true, skipBroadcast = true }), "earlier NOT_BIS row is stored")
+    local firstStoredOutcome
+    for _, log in ipairs(causal:GetLootLogs() or {}) do
+        if log:GetEventType() == "BIS_OUTCOME" and (log:GetEventData() or {}).awardKey == causalCanon.awardKey then
+            firstStoredOutcome = log
+            break
+        end
+    end
+    assertEq(firstStoredOutcome and firstStoredOutcome:GetID(), causalNotBis:GetID(), "timestamp order lists the NOT_BIS row first")
+    local causalStored = #(causal:GetLootLogs() or {})
+    local causalHidden = causal:HiddenLootLogIds()
+    assertTrue(causalHidden[causalNotBis:GetID()] == true, "earlier NOT_BIS duplicate is hidden")
+    assertTrue(causalHidden[causalAssigned:GetID()] ~= true, "causal ASSIGNED winner stays visible")
+    local causalReplay = SF.LootHelperIdentity.Replay(causal:GetLootLogs(), { owner = owners[1] })
+    local causalWinner = causalReplay.bis.state.outcomeWinner[causalCanon.awardKey]
+    assertEq(causalWinner, causalAssigned:GetID(), "visible row is the replay winner")
+    assertEq(#(causal:GetLootLogs() or {}), causalStored, "visibility does not delete the causal-order rows")
+
+    -- A follower who stored only the RC row writes the missing outcome after promotion.
+    coord, peers = newSession("FailoverMissing")
+    local missingCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006303-10",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local promotedOk, promotedErr = observe(peers[2], owners[2], missingCanon, false)
+    assertTrue(promotedOk, "follower records the RC award before promotion (" .. tostring(promotedErr) .. ")")
+    assertEq(countLootEvents(peers[2], "BIS_OUTCOME", missingCanon.awardKey), 0, "follower still has no outcome")
+    PLAYER = owners[2]
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = owners[2]
+    assertEq(peers[2]:ReconcileMissingAutomaticBisOutcomes(), 1, "promotion writes the missing outcome")
+    assertEq(countLootEvents(peers[2], "BIS_OUTCOME", missingCanon.awardKey), 1, "promotion stores one outcome")
+    assertEq(peers[2]:ReconcileMissingAutomaticBisOutcomes(), 0, "a second promotion pass does not append")
+    assertEq(select(2, peers[2]:TryAddRCLootCouncilAward(missingCanon)), "duplicate", "repeat observation after promotion stays duplicate")
+    local seenOnly = peers[3]
+    local seenOk, seenErr = observe(seenOnly, owners[3], missingCanon, false)
+    assertTrue(seenOk, "another follower records the same RC award (" .. tostring(seenErr) .. ")")
+    PLAYER = owners[3]
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = owners[3]
+    assertTrue(seenOnly:TryAddRCLootCouncilAward(missingCanon), "seeing the stored award again writes the missing outcome")
+    assertEq(countLootEvents(seenOnly, "BIS_OUTCOME", missingCanon.awardKey), 1, "repeat observation stores one outcome")
+    assertEq(select(2, seenOnly:TryAddRCLootCouncilAward(missingCanon)), "duplicate", "the written outcome blocks another row")
+
     -- Bonus rolls are their own external event and do not enter the RC/BiS path.
     coord, peers = newSession("Bonus")
     local bonusHistory = historyTable({

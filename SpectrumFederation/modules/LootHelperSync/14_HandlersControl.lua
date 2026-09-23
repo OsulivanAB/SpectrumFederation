@@ -284,6 +284,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
     end
+    if self.BackfillAutomaticBisOnPromotion then
+        self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionReannounce")
+    end
 
     if self._MergeAuthorMaxFrontier then
         self:_MergeAuthorMaxFrontier(payload.authorMax)
@@ -433,6 +436,8 @@ function Sync:HandleSessionHeartbeat(sender, payload)
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via SES_HEARTBEAT")
+    elseif self.BackfillAutomaticBisOnPromotion then
+        self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionHeartbeat")
     end
 
     -- Keep helper list + authorMax current
@@ -614,6 +619,8 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
+    elseif self.BackfillAutomaticBisOnPromotion then
+        self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleCoordinatorTakeover")
     end
 
     -- Allow re-sending join status to the new coordinator

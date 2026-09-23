@@ -147,6 +147,8 @@ function Sync:TryRestorePersistedSession(reason)
 
     if not self.state.isCoordinator then
         self:EnsureHeartbeatMonitor("RestorePersistedSession")
+    elseif self.BackfillAutomaticBisOnPromotion then
+        self:BackfillAutomaticBisOnPromotion(false, "RestorePersistedSession")
     end
 
     RequestLootWindowRefresh("RestorePersistedSession")
@@ -702,6 +704,9 @@ function Sync:StartSession(profileId, opts)
 
     -- Canonicalize derived member state before announcing session.
     self:RebuildProfile(profileId, "session_start_coordinator")
+    if self.BackfillAutomaticBisOnPromotion then
+        self:BackfillAutomaticBisOnPromotion(false, "StartSession")
+    end
 
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
@@ -925,6 +930,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self.state.profileId = profileId
     self.state.coordinator = me
     self.state.isCoordinator = true
+    if self.BackfillAutomaticBisOnPromotion then
+        self:BackfillAutomaticBisOnPromotion(false, "TakeoverSession")
+    end
 
     -- Ensure strictly increasing epoch
     local newEpoch = self:_Now()

@@ -99,6 +99,9 @@ function Sync:HandleSessionStart(sender, payload)
     if profile then
         self:RebuildProfile(payload.profileId, "session_start_member")
     end
+    if self.BackfillAutomaticBisOnPromotion then
+        self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionStart")
+    end
 
     if SF.Debug then
         SF.Debug:Info("SYNC_SESSION", "Session start (role=%s sessionId=%s profileId=%s coordinator=%s pointsSource=derived_logs)",
