@@ -3082,6 +3082,44 @@ function LootProfile:ReconcileInsertedRCAwards(awardKeys, opts)
     return self:_PumpAutomaticBisBackfill()
 end
 
+-- Awards that arrived after a backfill batch started are not in that job yet.
+-- One pass appends them before the next pump. Covered awards stay out.
+function LootProfile:_AppendMissingAwardsToAutomaticBisBackfill()
+    local job = self._autoBisBackfill
+    if not job then
+        return
+    end
+    job.keys = job.keys or {}
+    local seen = {}
+    for i = 1, #job.keys do
+        seen[job.keys[i]] = true
+    end
+    local types = SF.LootLogEventTypes or {}
+    local covered = self:_IndexSourceConsistentBisOutcomes()
+    local logs = self._lootLogs or {}
+    for i = 1, #logs do
+        local log = logs[i]
+        local eventType = log.GetEventType and log:GetEventType() or log._eventType
+        local data = log.GetEventData and log:GetEventData() or log._data
+        local awardKey = type(data) == "table" and data.awardKey or nil
+        local isLegacyBonus = eventType == types.RC_LOOT_COUNCIL and type(data) == "table" and data.responseId == "BONUS_ROLL"
+        if eventType == types.RC_LOOT_COUNCIL and type(awardKey) == "string" and not seen[awardKey]
+            and (isLegacyBonus or not covered[awardKey]) then
+            seen[awardKey] = true
+            job.keys[#job.keys + 1] = awardKey
+        end
+    end
+    if type(job.covered) ~= "table" then
+        job.covered = covered
+    else
+        for awardKey, present in pairs(covered) do
+            if present then
+                job.covered[awardKey] = true
+            end
+        end
+    end
+end
+
 -- One indexed pass when this client becomes the session coordinator. Awards
 -- that already have a source-consistent outcome are skipped. The pass is
 -- silent and does not broadcast one sync message per historical award.
@@ -3090,6 +3128,7 @@ function LootProfile:ReconcileMissingAutomaticBisOutcomes()
         return 0
     end
     if self._autoBisBackfill then
+        self:_AppendMissingAwardsToAutomaticBisBackfill()
         return self:_PumpAutomaticBisBackfill()
     end
     local types = SF.LootLogEventTypes or {}

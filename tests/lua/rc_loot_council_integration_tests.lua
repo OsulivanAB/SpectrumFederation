@@ -6297,6 +6297,97 @@ function testRepairMergeDefersBisOutcome()
 end
 testRepairMergeDefersBisOutcome()
 
+function testOpenRepairKeepsBonusAndLateAwards()
+    resetEnv()
+    PLAYER = "AdminB-Garona"
+    local follower = makeProfile("FollowerBonus")
+    addMember(follower, WINNER)
+    setActive(follower)
+    startSessionOn(follower)
+    Sync.state.isCoordinator = false
+    Sync.state.coordinator = "AdminA-Garona"
+    Sync.state.repairQueue = { order = { "follower-repair" }, items = { ["follower-repair"] = {} } }
+    local bonusCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007100-1",
+        response = "Bonus Loot",
+        responseID = "BONUS_ROLL",
+        lootWon = HEAD_LINK,
+    }))
+    local bonusRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(bonusCanon), {
+        profile = follower,
+        author = AWARDER,
+        timestamp = bonusCanon.timestamp,
+        externalId = bonusCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(bonusRc ~= nil, "live legacy bonus row is valid")
+    Sync:HandleNewLog(AWARDER, {
+        sessionId = Sync.state.sessionId,
+        profileId = follower:GetProfileId(),
+        log = bonusRc:ToTable(),
+    })
+    assertEq(countLootEvents(follower, "BONUS_ROLL", nil), 1, "a follower still synthesizes a bonus roll while repairs are open")
+    assertEq(countLootEvents(follower, "BIS_OUTCOME", nil), 0, "that live bonus roll does not write a BiS outcome")
+
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("LateBackfillAward")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    Sync.state.repairQueue = { order = {}, items = {} }
+    Sync.state.requests = {}
+    Sync.state._adminConvergence = nil
+    Sync.state._bisBackfillPendingReason = nil
+    C_Timer = nil
+    local firstCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007200-1",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local firstRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(firstCanon), {
+        profile = profile,
+        author = AWARDER,
+        timestamp = firstCanon.timestamp,
+        externalId = firstCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(profile:AddLootLog(firstRc, { skipPermission = true, skipBroadcast = true }), "the in-flight backfill award is stored")
+    profile._autoBisBackfill = {
+        keys = { firstCanon.awardKey },
+        covered = {},
+        opts = { silent = true },
+        index = 1,
+        wrote = 0,
+        sessionId = Sync.state.sessionId,
+        profileId = profile:GetProfileId(),
+    }
+    Sync.state.repairQueue = { order = { "late-award" }, items = { ["late-award"] = {} } }
+    local lateCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007200-2",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local lateRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(lateCanon), {
+        profile = profile,
+        author = AWARDER,
+        timestamp = lateCanon.timestamp,
+        externalId = lateCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(Sync:MergeLogs(profile:GetProfileId(), { lateRc:ToTable() }), "a later RC award arrives while repairs are open")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", lateCanon.awardKey), 0, "the late award is not written while repairs are open")
+    Sync.state.repairQueue = { order = {}, items = {} }
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 2, "the deferred scan writes the in-flight award and the late award")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", firstCanon.awardKey), 1, "the original backlog award has one outcome")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", lateCanon.awardKey), 1, "the award that arrived during backfill has one outcome")
+end
+testOpenRepairKeepsBonusAndLateAwards()
+
 function testCommQueueWarningLatch()
     loadModule("SpectrumFederation/modules/LootHelper/Comm.lua")
     local Comm = SF.LootHelperComm

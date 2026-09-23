@@ -597,7 +597,14 @@ function Sync:HandleNewLog(sender, payload)
         return
     end
     if eventType == types.RC_LOOT_COUNCIL and profile._MaybeWriteAutomaticBisOutcome then
-        if self._AutomaticBisBackfillBlocked and self:_AutomaticBisBackfillBlocked() then
+        local rcData = lootLog.GetEventData and lootLog:GetEventData() or lootLog._data
+        local legacyBonus = type(rcData) == "table" and rcData.responseId == "BONUS_ROLL"
+        -- Followers still synthesize a local BONUS_ROLL from a legacy row.
+        -- Only the automatic BIS_OUTCOME waits for outstanding log repairs.
+        local deferBis = not legacyBonus
+            and self._AutomaticBisBackfillBlocked
+            and self:_AutomaticBisBackfillBlocked()
+        if deferBis then
             if self._ScheduleAutomaticBisBackfill then
                 self:_ScheduleAutomaticBisBackfill("HandleNewLog")
             end
