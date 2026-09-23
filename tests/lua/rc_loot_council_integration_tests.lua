@@ -6217,6 +6217,86 @@ function testBoundedBisBackfill()
 end
 testBoundedBisBackfill()
 
+function testRepairMergeDefersBisOutcome()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("RepairMerge")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    Sync.state.requests = {}
+    Sync.state._adminConvergence = nil
+    Sync.state.repairQueue = { order = { "pending-repair" }, items = { ["pending-repair"] = {} } }
+    Sync.state._bisBackfillPendingReason = nil
+    local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007000-1",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local rc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(canon), {
+        profile = profile,
+        author = AWARDER,
+        timestamp = canon.timestamp,
+        externalId = canon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(rc ~= nil, "repair RC row is valid")
+    assertTrue(Sync:MergeLogs(profile:GetProfileId(), { rc:ToTable() }), "repair merge stores the RC award")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", canon.awardKey), 0, "an open repair does not write an outcome for the RC row")
+    assertEq(Sync.state._bisBackfillPendingReason, "MergeLogs", "the outcome waits until the repair finishes")
+    local historical = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    historical.sourceLogId = canon.awardKey
+    historical.awardKey = canon.awardKey
+    historical.awardMember = WINNER
+    historical.qualified = false
+    historical.outcome = "NOT_BIS"
+    historical.assignedSlots = {}
+    historical.itemLink = ITEM_LINK
+    historical.itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+    historical.response = "Greed"
+    local historicalLog = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, historical, {
+        profile = profile,
+        author = "AdminB-Garona",
+        timestamp = canon.timestamp + 1,
+        skipPermission = true,
+    })
+    assertTrue(historicalLog ~= nil, "historical repair outcome is valid")
+    Sync:MergeLogs(profile:GetProfileId(), { historicalLog:ToTable() })
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", canon.awardKey), 1, "the later repair batch keeps the historical outcome")
+    Sync.state.repairQueue = { order = {}, items = {} }
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 0, "finishing the repair does not append a second outcome")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", canon.awardKey), 1, "takeover repair still has one outcome")
+
+    local openProfile = makeProfile("RepairMergeOpen")
+    addMember(openProfile, WINNER)
+    setActive(openProfile)
+    startSessionOn(openProfile)
+    Sync.state.repairQueue = { order = { "still-open" }, items = { ["still-open"] = {} } }
+    Sync.state._bisBackfillPendingReason = nil
+    local openCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007001-2",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local openRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(openCanon), {
+        profile = openProfile,
+        author = AWARDER,
+        timestamp = openCanon.timestamp,
+        externalId = openCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(Sync:MergeLogs(openProfile:GetProfileId(), { openRc:ToTable() }), "a missing outcome can arrive as only the RC row")
+    assertEq(countLootEvents(openProfile, "BIS_OUTCOME", openCanon.awardKey), 0, "the open repair still does not write yet")
+    Sync.state.repairQueue = { order = {}, items = {} }
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 1, "the deferred scan writes the missing outcome after repairs")
+    assertEq(countLootEvents(openProfile, "BIS_OUTCOME", openCanon.awardKey), 1, "one outcome is stored once repairs are finished")
+end
+testRepairMergeDefersBisOutcome()
+
 function testCommQueueWarningLatch()
     loadModule("SpectrumFederation/modules/LootHelper/Comm.lua")
     local Comm = SF.LootHelperComm

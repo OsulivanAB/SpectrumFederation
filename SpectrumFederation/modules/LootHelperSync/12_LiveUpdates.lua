@@ -597,7 +597,13 @@ function Sync:HandleNewLog(sender, payload)
         return
     end
     if eventType == types.RC_LOOT_COUNCIL and profile._MaybeWriteAutomaticBisOutcome then
-        profile:_MaybeWriteAutomaticBisOutcome(lootLog)
+        if self._AutomaticBisBackfillBlocked and self:_AutomaticBisBackfillBlocked() then
+            if self._ScheduleAutomaticBisBackfill then
+                self:_ScheduleAutomaticBisBackfill("HandleNewLog")
+            end
+        else
+            profile:_MaybeWriteAutomaticBisOutcome(lootLog)
+        end
     end
 
     local Identity = SF.LootHelperIdentity

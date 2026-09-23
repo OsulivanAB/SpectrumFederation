@@ -1692,8 +1692,17 @@ function Sync:MergeLogs(profileId, logs, opts)
         if profile.NormalizeInsertedLegacyBonusRolls then
             profile:NormalizeInsertedLegacyBonusRolls(details.insertedRcAwardKeys)
         end
-        if profile.ReconcileInsertedRCAwards then
-            profile:ReconcileInsertedRCAwards(details.insertedRcAwardKeys)
+        local insertedRcAwardKeys = details.insertedRcAwardKeys
+        local hasInsertedRc = type(insertedRcAwardKeys) == "table" and #insertedRcAwardKeys > 0
+        -- A repair response can contain the RC award before a later response
+        -- contains its historical BIS_OUTCOME. Writing now would freeze a
+        -- second outcome. The deferred scan runs after those requests finish.
+        if hasInsertedRc and self._AutomaticBisBackfillBlocked and self:_AutomaticBisBackfillBlocked() then
+            if self._ScheduleAutomaticBisBackfill then
+                self:_ScheduleAutomaticBisBackfill("MergeLogs")
+            end
+        elseif hasInsertedRc and profile.ReconcileInsertedRCAwards then
+            profile:ReconcileInsertedRCAwards(insertedRcAwardKeys)
         end
     end
     return inserted and inserted > 0, details or { inserted = inserted or 0, replaced = 0, mismatchCount = 0, mismatches = {} }
