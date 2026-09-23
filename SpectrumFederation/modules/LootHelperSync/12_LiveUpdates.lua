@@ -599,8 +599,8 @@ function Sync:HandleNewLog(sender, payload)
     elseif SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
         SF.LootHelperEvents:NotifyDataChanged("SYNC:LIVE", { profileId = profileId })
     end
-    if types.ADMIN_REMOVED and eventType == types.ADMIN_REMOVED and self._DropNamedAdminStatus then
-        self:_DropNamedAdminStatus(memberId)
+    if types.ADMIN_REMOVED and eventType == types.ADMIN_REMOVED and self._DropLiveRemovedAdminStatus then
+        self:_DropLiveRemovedAdminStatus(profileId, memberId)
     end
     self:FlushPendingLiveRelationshipLogs(profileId)
     self:LogSessionPointsSummary(profileId, "live_update")

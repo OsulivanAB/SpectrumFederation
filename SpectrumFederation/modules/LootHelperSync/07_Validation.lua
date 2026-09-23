@@ -495,6 +495,20 @@ function Sync:_DropNamedAdminStatus(name)
     end
 end
 
+-- Function Drop a live ADMIN_REMOVED player's status only when they are no longer an admin.
+-- An owner or a later re-grant can remain canonical after the removal log is replayed.
+-- @param profileId string
+-- @param name string "Name-Realm"
+-- @return nil
+function Sync:_DropLiveRemovedAdminStatus(profileId, name)
+    if self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown()
+        and self:IsSenderAuthorized(profileId, name)
+    then
+        return
+    end
+    self:_DropNamedAdminStatus(name)
+end
+
 -- Function Reconcile helper routing, outstanding requests, and coordination with canonical admins.
 -- @param profileId string
 -- @param reason string|nil
