@@ -237,6 +237,13 @@ end
 -- @return string
 function Sync:_ClassifyPrivilegedResponse(sender, profileId, req, opts)
     opts = type(opts) == "table" and opts or {}
+    -- In-flight trust is only for the request that was sent. A log request must
+    -- not authorize a later PROFILE_SNAPSHOT that cites the same id.
+    if type(opts.expectedKinds) == "table" then
+        if type(req) ~= "table" or opts.expectedKinds[req.kind] ~= true then
+            req = nil
+        end
+    end
     if type(req) == "table" and self:_ResponderMapHas(req.revokedResponders, sender) then
         return "stale"
     end

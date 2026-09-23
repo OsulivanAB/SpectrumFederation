@@ -112,6 +112,11 @@ function Sync:HandleAuthLogs(sender, payload)
     if self._ClassifyPrivilegedResponse then
         disposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, req, {
             coordinatorAcceptsAdmins = true,
+            expectedKinds = {
+                NEED_LOGS = true,
+                LOG_REQ = true,
+                ADMIN_LOG_REQ = true,
+            },
         })
     elseif self.state.isCoordinator then
         disposition = self:IsSenderAuthorized(payload.profileId, sender) and "accept" or "unauthorized"
@@ -368,6 +373,7 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if self._ClassifyPrivilegedResponse then
         snapDisposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, snapReq, {
             coordinatorAcceptsAdmins = false,
+            expectedKinds = { NEED_PROFILE = true },
         })
     elseif self:IsSenderAuthorized(payload.profileId, sender) and self:IsTrustedDataSender(sender) then
         snapDisposition = "accept"

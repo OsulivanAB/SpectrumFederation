@@ -646,6 +646,32 @@ Sync:HandleProfileSnapshot(STRANGER, {
 })
 assertEq(warningCount("not a trusted sender"), 1, "untrusted bootstrap snapshot still warns")
 
+-- In-flight trust from a log request does not authorize a profile snapshot.
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+Sync.state.helpers = { COORD }
+local logReq = seedRequest("log-snap", "LOG_REQ", { KINO }, KINO)
+local snapDisposition = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, logReq, {
+    coordinatorAcceptsAdmins = false,
+    expectedKinds = { NEED_PROFILE = true },
+})
+assertEq(snapDisposition, "untrusted", "log-request in-flight trust does not authorize a snapshot")
+Sync:HandleProfileSnapshot(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "log-snap",
+    snapshot = { meta = { _profileId = PROFILE } },
+})
+assertEq(warningCount("not a trusted sender"), 1, "snapshot citing a log request is rejected")
+local profileReq = seedRequest("need-snap", "NEED_PROFILE", { KINO }, KINO)
+snapDisposition = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, profileReq, {
+    coordinatorAcceptsAdmins = false,
+    expectedKinds = { NEED_PROFILE = true },
+})
+assertEq(snapDisposition, "accept", "in-flight NEED_PROFILE response stays accepted")
+
 -- A helper inserted ahead of the previous target must be attempted next.
 reset(MEMBER)
 Sync.state.helpers = {}
