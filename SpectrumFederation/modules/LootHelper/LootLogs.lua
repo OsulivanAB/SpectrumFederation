@@ -1133,6 +1133,12 @@ function LootLog.ValidateTable(t, opts)
         then
             return false, "BIS_OVERRIDE data is invalid"
         end
+    elseif t._eventType == EVENT_TYPES.BONUS_ROLL then
+        if SF.LootLogValidators.ValidateBonusRollData
+            and not SF.LootLogValidators.ValidateBonusRollData(t._data)
+        then
+            return false, "BONUS_ROLL data is invalid"
+        end
     elseif t._eventType == EVENT_TYPES.BIS_OUTCOME then
         if SF.LootLogValidators.ValidateBisOutcomeData
             and not SF.LootLogValidators.ValidateBisOutcomeData(t._data, opts.profile)

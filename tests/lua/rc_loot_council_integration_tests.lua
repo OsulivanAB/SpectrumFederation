@@ -5710,6 +5710,52 @@ function testSingleWriterAndBonusRolls()
     ordinaryWire._counter = 0
     ordinaryWire._fingerprint = nil
     assertFalse(select(1, SF.LootLog.ValidateTable(ordinaryWire)), "ordinary events still cannot use an external id")
+
+    -- A 1.5.4 peer records the same bonus history as RC_LOOT_COUNCIL.
+    local legacyBonusCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006402-9",
+        response = "Bonus Loot",
+        responseID = "BONUS_ROLL",
+        lootWon = HEAD_LINK,
+    }))
+    local legacyBonusRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(legacyBonusCanon), {
+        profile = coord,
+        author = AWARDER,
+        timestamp = legacyBonusCanon.timestamp,
+        externalId = legacyBonusCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(coord:AddLootLog(legacyBonusRc, { skipPermission = true, skipBroadcast = true }), "legacy bonus RC row is stored")
+    Sync.state.isCoordinator = true
+    assertTrue(coord:_MaybeWriteAutomaticBisOutcome(legacyBonusRc), "legacy bonus RC row becomes one BONUS_ROLL")
+    assertEq(countLootEvents(coord, "BIS_OUTCOME", legacyBonusCanon.awardKey), 0, "legacy bonus RC row does not create BIS_OUTCOME")
+    assertEq(countLootEvents(coord, "BONUS_ROLL", nil), 2, "local bonus roll plus the normalized legacy row")
+    local legacyHidden = coord:HiddenLootLogIds()
+    assertTrue(legacyHidden[legacyBonusRc:GetID()] == true, "legacy bonus RC row is hidden")
+    assertEq(select(2, coord:NormalizeLegacyBonusRollRC(legacyBonusRc)), "duplicate", "normalizing the same legacy row does not append")
+    local legacyWire = legacyBonusRc:ToTable()
+    local mergedLegacy, mergeDetails = peers[2]:MergeLogTables({ legacyWire }, { allowUnknownEventType = true })
+    assertEq(mergedLegacy, 1, "a follower can import the legacy bonus RC row")
+    assertEq(peers[2]:NormalizeInsertedLegacyBonusRolls(mergeDetails.insertedRcAwardKeys), 1, "import normalizes the legacy bonus row")
+    assertEq(countLootEvents(peers[2], "BIS_OUTCOME", nil), 0, "follower import does not create BIS_OUTCOME")
+    assertEq(peers[2]:NormalizeInsertedLegacyBonusRolls(mergeDetails.insertedRcAwardKeys), 0, "a second normalize pass does not append")
+
+    local invalidBonus = {
+        version = 2,
+        _id = bonusCanon.awardKey,
+        _externalId = bonusCanon.awardKey,
+        _timestamp = 1700006402,
+        _author = AWARDER,
+        _counter = 0,
+        _eventType = "BONUS_ROLL",
+        _data = {
+            member = WINNER,
+            awardKey = bonusCanon.awardKey,
+            responseId = "Need",
+        },
+    }
+    assertFalse(select(1, SF.LootLog.ValidateTable(invalidBonus)), "synced BONUS_ROLL rows reject an invalid payload")
     local missingExternal = {
         version = 2,
         _id = owners[1] .. ":1",

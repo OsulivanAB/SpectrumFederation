@@ -68,6 +68,8 @@ RCLC history with `responseID == "BONUS_ROLL"` is not an RC award. It is recorde
 
 A bonus roll does not create an `RC_LOOT_COUNCIL` row and does not run automatic BiS evaluation. Classification uses the RCLC `responseID` field, not the displayed response text.
 
+A 1.5.4 peer can still sync the same history as an `RC_LOOT_COUNCIL` row whose `responseId` is `BONUS_ROLL`. New clients keep that row, do not derive a `BIS_OUTCOME` from it, hide it in Loot Logs, and add one local `BONUS_ROLL` row. That synthesized row is not rebroadcast, so older clients are not asked to store an event type they reject.
+
 `NOT_BIS` is still stored once per award when reconstruction needs a frozen non-BiS decision. Loot Logs hides that row. `ASSIGNED`, `OVERFLOW`, and `UNRESOLVED` stay visible. Older duplicate `BIS_OUTCOME` rows are left in saved history; the log view shows only the first source-consistent outcome for that `awardKey` in causal replay order, and hides it when that outcome is `NOT_BIS`.
 
 ## Award identity

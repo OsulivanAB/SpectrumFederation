@@ -2471,7 +2471,14 @@ function LootProfile:HiddenLootLogIds()
 		local eventType = log.GetEventType and log:GetEventType() or log._eventType
 		local data = log.GetEventData and log:GetEventData() or log._data
 		if eventType == types.RC_LOOT_COUNCIL and type(data) == "table" and type(data.awardKey) == "string" then
-			rcByKey[data.awardKey] = log
+			if data.responseId == "BONUS_ROLL" then
+				local id = log.GetID and log:GetID() or log._id
+				if type(id) == "string" then
+					hidden[id] = true
+				end
+			else
+				rcByKey[data.awardKey] = log
+			end
 		end
 	end
 	for i = 1, #ordered do
@@ -2699,6 +2706,78 @@ function LootProfile:EvaluateRCBisConflict(opts)
     }
 end
 
+function LootProfile:NormalizeLegacyBonusRollRC(rcLog)
+    local data = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
+    if type(data) ~= "table" or data.responseId ~= "BONUS_ROLL" then
+        return false, "not_bonus"
+    end
+    local LootLog = SF.LootLog
+    if not (LootLog and LootLog.MakeBonusRollExternalId and LootLog.BuildBonusRollEventData and LootLog.new) then
+        return false, "unavailable"
+    end
+    local author = (rcLog.GetAuthor and rcLog:GetAuthor()) or rcLog._author
+    local itemLink = data.itemLink
+    local itemString = data.itemString
+    if type(itemString) ~= "string" or itemString == "" then
+        itemString = LootLog.ExtractItemString and LootLog.ExtractItemString(itemLink) or nil
+    end
+    local awardKey = LootLog.MakeBonusRollExternalId(author, data.rcAwardId, data.member, itemLink or itemString, data.owner)
+    if type(awardKey) ~= "string" or awardKey == "" then
+        return false, "invalid_award"
+    end
+    if self._logIndex and self._logIndex[awardKey] then
+        return false, "duplicate"
+    end
+    local eventType = SF.LootLogEventTypes and SF.LootLogEventTypes.BONUS_ROLL
+    local eventData = LootLog.BuildBonusRollEventData({
+        winner = data.member,
+        itemLink = itemLink,
+        itemString = itemString,
+        rcAwardId = data.rcAwardId,
+        awardKey = awardKey,
+        owner = data.owner,
+    })
+    if not eventType or not eventData then
+        return false, "invalid_award"
+    end
+    local logEntry = LootLog.new(eventType, eventData, {
+        profile = self,
+        author = author,
+        timestamp = (rcLog.GetTimestamp and rcLog:GetTimestamp()) or rcLog._timestamp,
+        externalId = awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    if not logEntry then
+        return false, "create_failed"
+    end
+    local inserted = self:AddLootLog(logEntry, { skipPermission = true, skipBroadcast = true })
+    if not inserted then
+        return false, "duplicate"
+    end
+    return true, nil
+end
+
+function LootProfile:NormalizeInsertedLegacyBonusRolls(awardKeys)
+    if type(awardKeys) ~= "table" then
+        return 0
+    end
+    local wrote = 0
+    for i = 1, #awardKeys do
+        local awardKey = awardKeys[i]
+        local rcId = self:GetRCAwardLogId(awardKey)
+        local rcLog = rcId and self._logById and self._logById[rcId] or nil
+        local data = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
+        if type(data) == "table" and data.responseId == "BONUS_ROLL" then
+            local ok = self:NormalizeLegacyBonusRollRC(rcLog)
+            if ok then
+                wrote = wrote + 1
+            end
+        end
+    end
+    return wrote
+end
+
 function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
     if self._writingAutoBis then
         return false, "reentrant"
@@ -2706,6 +2785,10 @@ function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
     local eventType = rcLog and ((rcLog.GetEventType and rcLog:GetEventType()) or rcLog._eventType)
     if eventType ~= (SF.LootLogEventTypes and SF.LootLogEventTypes.RC_LOOT_COUNCIL) then
         return false, "not_rc"
+    end
+    local rcData = (rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data
+    if type(rcData) == "table" and rcData.responseId == "BONUS_ROLL" then
+        return self:NormalizeLegacyBonusRollRC(rcLog)
     end
     if not self:MayWriteAutomaticBisOutcome() then
         return false, "not_coordinator"
@@ -2736,7 +2819,10 @@ function LootProfile:ReconcileInsertedRCAwards(awardKeys, opts)
         if not self:HasSourceConsistentBisOutcome(awardKey) then
             local rcId = self:GetRCAwardLogId(awardKey)
             local rcLog = rcId and self._logById and self._logById[rcId] or nil
-            if rcLog then
+            local rcData = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
+            if type(rcData) == "table" and rcData.responseId == "BONUS_ROLL" then
+                self:NormalizeLegacyBonusRollRC(rcLog)
+            elseif rcLog then
                 local ok = self:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
                 if ok then
                     wrote = wrote + 1
