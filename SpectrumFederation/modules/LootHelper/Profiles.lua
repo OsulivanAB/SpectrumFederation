@@ -710,6 +710,7 @@ function LootProfile:_ReplaceLogById(logId, replacementLog)
         return false
     end
 
+    local previous = self._lootLogs[idx]
     self._lootLogs[idx] = replacementLog
     self._logIndex = self._logIndex or {}
     self._logById = self._logById or {}
@@ -717,6 +718,15 @@ function LootProfile:_ReplaceLogById(logId, replacementLog)
     self._logIndex[logId] = true
     self._logById[logId] = replacementLog
     self._logFingerprintIndex[logId] = replacementLog:GetFingerprint()
+    local Identity = SF.LootHelperIdentity
+    if type(self._causalDependents) == "table" and Identity then
+        if Identity.ForgetLogCausalDependents then
+            Identity.ForgetLogCausalDependents(self, previous)
+        end
+        if Identity.NoteLogCausalDependents then
+            Identity.NoteLogCausalDependents(self, replacementLog)
+        end
+    end
     self:_MarkIntegritySummaryDirty()
     return true
 end
@@ -865,6 +875,7 @@ function LootProfile:RebuildLogIndex()
     self._logFingerprintIndex = {}
     self._authorCounters = {}
     self._rcAwardIndex = {}
+    self._causalDependents = nil
 
     local lineage = nil
     if SF.LootHelperIdentity and SF.LootHelperIdentity.BuildMainSwapLineage then
@@ -2811,14 +2822,14 @@ function LootProfile:EvaluateRCBisConflict(opts)
     }
 end
 
-function LootProfile:NormalizeLegacyBonusRollRC(rcLog)
+function LootProfile:_BuildLegacyBonusRollLog(rcLog)
     local data = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
     if type(data) ~= "table" or data.responseId ~= "BONUS_ROLL" then
-        return false, "not_bonus"
+        return nil, "not_bonus"
     end
     local LootLog = SF.LootLog
     if not (LootLog and LootLog.MakeBonusRollExternalId and LootLog.BuildBonusRollEventData and LootLog.new) then
-        return false, "unavailable"
+        return nil, "unavailable"
     end
     local author = (rcLog.GetAuthor and rcLog:GetAuthor()) or rcLog._author
     local itemLink = data.itemLink
@@ -2828,10 +2839,10 @@ function LootProfile:NormalizeLegacyBonusRollRC(rcLog)
     end
     local awardKey = LootLog.MakeBonusRollExternalId(author, data.rcAwardId, data.member, itemLink or itemString, data.owner)
     if type(awardKey) ~= "string" or awardKey == "" then
-        return false, "invalid_award"
+        return nil, "invalid_award"
     end
     if self._logIndex and self._logIndex[awardKey] then
-        return false, "duplicate"
+        return nil, "duplicate"
     end
     local eventType = SF.LootLogEventTypes and SF.LootLogEventTypes.BONUS_ROLL
     local eventData = LootLog.BuildBonusRollEventData({
@@ -2843,7 +2854,7 @@ function LootProfile:NormalizeLegacyBonusRollRC(rcLog)
         owner = data.owner,
     })
     if not eventType or not eventData then
-        return false, "invalid_award"
+        return nil, "invalid_award"
     end
     local logEntry = LootLog.new(eventType, eventData, {
         profile = self,
@@ -2854,57 +2865,108 @@ function LootProfile:NormalizeLegacyBonusRollRC(rcLog)
         skipPermission = true,
     })
     if not logEntry then
-        return false, "create_failed"
+        return nil, "create_failed"
     end
-    local inserted = self:AddLootLog(logEntry, { skipPermission = true, skipBroadcast = true })
-    if not inserted then
+    return logEntry, nil
+end
+
+function LootProfile:_InsertLegacyBonusRollLogs(logs)
+    if type(logs) ~= "table" or #logs == 0 then
+        return 0
+    end
+    if #logs == 1 then
+        local inserted = self:AddLootLog(logs[1], { skipPermission = true, skipBroadcast = true })
+        return inserted and 1 or 0
+    end
+    -- Historical bonus ids sort before the RC rows they replace. One merge
+    -- sorts and reindexes once instead of once per row.
+    local tables = {}
+    local seen = {}
+    for i = 1, #logs do
+        local row = logs[i]
+        local id = row and row.GetID and row:GetID() or nil
+        if row and row.ToTable and type(id) == "string" and not seen[id] then
+            seen[id] = true
+            tables[#tables + 1] = row:ToTable()
+        end
+    end
+    if #tables == 0 then
+        return 0
+    end
+    if #tables == 1 then
+        local inserted = self:AddLootLog(logs[1], { skipPermission = true, skipBroadcast = true })
+        return inserted and 1 or 0
+    end
+    local inserted = self:MergeLogTables(tables)
+    if type(inserted) ~= "number" then
+        return 0
+    end
+    return inserted
+end
+
+function LootProfile:NormalizeLegacyBonusRollRC(rcLog)
+    local logEntry, err = self:_BuildLegacyBonusRollLog(rcLog)
+    if not logEntry then
+        return false, err
+    end
+    local inserted = self:_InsertLegacyBonusRollLogs({ logEntry })
+    if inserted < 1 then
         return false, "duplicate"
     end
     return true, nil
+end
+
+function LootProfile:_CollectLegacyBonusRollLogs(rcLogs)
+    local pending = {}
+    local seen = {}
+    if type(rcLogs) ~= "table" then
+        return pending
+    end
+    for i = 1, #rcLogs do
+        local logEntry = self:_BuildLegacyBonusRollLog(rcLogs[i])
+        local id = logEntry and logEntry.GetID and logEntry:GetID() or nil
+        if logEntry and type(id) == "string" and not seen[id] then
+            seen[id] = true
+            pending[#pending + 1] = logEntry
+        end
+    end
+    return pending
 end
 
 function LootProfile:NormalizeInsertedLegacyBonusRolls(awardKeys)
     if type(awardKeys) ~= "table" then
         return 0
     end
-    local wrote = 0
+    local rcLogs = {}
     for i = 1, #awardKeys do
         local awardKey = awardKeys[i]
         local rcId = self:GetRCAwardLogId(awardKey)
         local rcLog = rcId and self._logById and self._logById[rcId] or nil
         local data = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
         if type(data) == "table" and data.responseId == "BONUS_ROLL" then
-            local ok = self:NormalizeLegacyBonusRollRC(rcLog)
-            if ok then
-                wrote = wrote + 1
-            end
+            rcLogs[#rcLogs + 1] = rcLog
         end
     end
-    return wrote
+    return self:_InsertLegacyBonusRollLogs(self:_CollectLegacyBonusRollLogs(rcLogs))
 end
 
 -- One pass over rows already stored. Merge dedupe never reports those keys,
 -- and followers are not the automatic BiS writer, so load and session join
--- both use this scan. A second pass finds the synthesized bonus roll and stops.
+-- both use this scan. Replacements are inserted together so a large history
+-- is sorted once. A second pass finds the synthesized bonus rolls and stops.
 function LootProfile:NormalizePersistedLegacyBonusRolls()
     local types = SF.LootLogEventTypes or {}
     local logs = self._lootLogs or {}
-    local pending = {}
+    local rcLogs = {}
     for i = 1, #logs do
         local log = logs[i]
         local eventType = log.GetEventType and log:GetEventType() or log._eventType
         local data = log.GetEventData and log:GetEventData() or log._data
         if eventType == types.RC_LOOT_COUNCIL and type(data) == "table" and data.responseId == "BONUS_ROLL" then
-            pending[#pending + 1] = log
+            rcLogs[#rcLogs + 1] = log
         end
     end
-    local wrote = 0
-    for i = 1, #pending do
-        if self:NormalizeLegacyBonusRollRC(pending[i]) then
-            wrote = wrote + 1
-        end
-    end
-    return wrote
+    return self:_InsertLegacyBonusRollLogs(self:_CollectLegacyBonusRollLogs(rcLogs))
 end
 
 function LootProfile:ClearTransientAutomaticBisBackfill()
@@ -3046,6 +3108,7 @@ function LootProfile:_PumpAutomaticBisBackfill()
             batch = 1
         end
         local processed = 0
+        local bonusLogs = {}
         while job.index <= #keys and processed < batch do
             local awardKey = keys[job.index]
             job.index = job.index + 1
@@ -3054,7 +3117,10 @@ function LootProfile:_PumpAutomaticBisBackfill()
             local rcLog = rcId and self._logById and self._logById[rcId] or nil
             local rcData = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
             if type(rcData) == "table" and rcData.responseId == "BONUS_ROLL" then
-                self:NormalizeLegacyBonusRollRC(rcLog)
+                local built = self:_BuildLegacyBonusRollLog(rcLog)
+                if built then
+                    bonusLogs[#bonusLogs + 1] = built
+                end
             elseif rcLog and not covered[awardKey] then
                 local quiet = opts.silent == true or #keys > 1
                 local writeOpts = {
@@ -3069,6 +3135,9 @@ function LootProfile:_PumpAutomaticBisBackfill()
                     wroteNow = wroteNow + 1
                 end
             end
+        end
+        if #bonusLogs > 0 then
+            self:_InsertLegacyBonusRollLogs(bonusLogs)
         end
         if job.index > #keys then
             self._autoBisBackfill = nil
@@ -3864,6 +3933,11 @@ function LootProfile:_InsertLog(lootLog, opts)
         self._rcAwardIndex[data.awardKey] = id
     end
 
+    local Identity = SF.LootHelperIdentity
+    if type(self._causalDependents) == "table" and Identity and Identity.NoteLogCausalDependents then
+        Identity.NoteLogCausalDependents(self, lootLog)
+    end
+
     -- Fan-out is only valid for an in-order append. An out-of-order insert is
     -- sorted back into history, and Attendance floors at zero, so a live delta
     -- on the cached total can diverge from a full chronological replay.
@@ -3878,7 +3952,6 @@ function LootProfile:_InsertLog(lootLog, opts)
         self:_RefreshLogPositionIndex()
     end
     self:_MarkIntegritySummaryDirty()
-    local Identity = SF.LootHelperIdentity
     if Identity and Identity.AffectsProjection and Identity.AffectsProjection(eventType) then
         if appendedInOrder
             and Identity.CanFanOutBalance and Identity.CanFanOutBalance(eventType)
@@ -4892,6 +4965,9 @@ function LootProfile:MergeLogTables(logTables, opts)
     local identityDirty = false
     local mismatches = {}
     local insertedRcAwardKeys = {}
+    -- The batch sort below replaces per-row ordering. Drop the reverse
+    -- index so the next in-order fan-out rebuilds it once from the result.
+    self._causalDependents = nil
 
     for _, t in ipairs(logTables) do
         local log, err = SF.LootLog.FromTable(t, opts)

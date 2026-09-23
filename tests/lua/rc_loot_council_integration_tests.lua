@@ -6616,6 +6616,177 @@ function testCommQueueWarningLatch()
 end
 testCommQueueWarningLatch()
 
+function testBackfillFanOutAndBonusBatch()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("FanOutBackfill")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    for i = 1, 30 do
+        local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+            id = "1000-" .. tostring(i),
+            response = "Greed",
+            responseID = 2,
+        }))
+        local row = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(canon), {
+            profile = profile,
+            author = AWARDER,
+            timestamp = canon.timestamp,
+            externalId = canon.awardKey,
+            counter = 0,
+            skipPermission = true,
+        })
+        assertTrue(profile:AddLootLog(row, { skipPermission = true, skipBroadcast = true }), "in-order RC row " .. tostring(i) .. " is stored")
+    end
+    local Identity = SF.LootHelperIdentity
+    Identity._causalDependentRebuilds = 0
+    Identity._reverseDependencyLogVisits = 0
+    local projections = 0
+    local originalProjection = profile.ApplyIdentityProjection
+    function profile:ApplyIdentityProjection(opts)
+        projections = projections + 1
+        return originalProjection(self, opts)
+    end
+    local reads = 0
+    local originalFanOut = Identity.FanOutItemAware
+    function Identity.FanOutItemAware(target, lootLog)
+        local logs = target._lootLogs or {}
+        local saved = {}
+        for i = 1, #logs do
+            local row = logs[i]
+            if row.GetEventData and not saved[row] then
+                saved[row] = row.GetEventData
+                row.GetEventData = function(self, ...)
+                    reads = reads + 1
+                    return saved[row](self, ...)
+                end
+            end
+        end
+        local ok = originalFanOut(target, lootLog)
+        for row, fn in pairs(saved) do
+            row.GetEventData = fn
+        end
+        return ok
+    end
+    local wrote = profile:ReconcileMissingAutomaticBisOutcomes()
+    Identity.FanOutItemAware = originalFanOut
+    profile.ApplyIdentityProjection = originalProjection
+    assertEq(wrote, 30, "in-order backfill still writes one outcome per award")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", nil), 30, "each in-order award keeps one outcome")
+    assertTrue(type(profile._causalDependents) == "table", "backfill keeps a reverse dependency index")
+    assertTrue((Identity._causalDependentRebuilds or 0) <= 2, "backfill does not rebuild the dependency index once per outcome")
+    assertTrue((Identity._reverseDependencyLogVisits or 0) < 60, "backfill does not walk a dependent edge per stored log")
+    assertTrue(reads < 400, "backfill fan-out does not read every log once per outcome")
+    assertTrue(projections <= 2, "backfill does not replay history once per outcome")
+
+    local blocked = makeProfile("FanOutBlocked")
+    addMember(blocked, WINNER)
+    local blockedCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1000-90",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local blockedOutcome = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    blockedOutcome.sourceLogId = blockedCanon.awardKey
+    blockedOutcome.awardKey = blockedCanon.awardKey
+    blockedOutcome.awardMember = WINNER
+    blockedOutcome.qualified = false
+    blockedOutcome.outcome = "NOT_BIS"
+    blockedOutcome.assignedSlots = {}
+    blockedOutcome.itemLink = ITEM_LINK
+    blockedOutcome.itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+    blockedOutcome.response = "Greed"
+    local blockedRow = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, blockedOutcome, {
+        profile = blocked,
+        author = PLAYER,
+        timestamp = 1001,
+        skipPermission = true,
+    })
+    assertTrue(blockedRow ~= nil, "a dependent outcome is valid")
+    assertTrue(blocked:AddLootLog(blockedRow, { skipPermission = true, skipBroadcast = true }), "the dependent outcome is stored first")
+    local blockedRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(blockedCanon), {
+        profile = blocked,
+        author = AWARDER,
+        timestamp = blockedCanon.timestamp,
+        externalId = blockedCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(blockedRc ~= nil, "the awaited RC row is valid")
+    assertFalse(Identity.ItemAwareFanOutSafe(blocked, blockedRc), "fan-out refuses an id that stored history already cites")
+
+    local bonus = makeProfile("BonusBatch")
+    addMember(bonus, WINNER)
+    local bonusKeys = {}
+    for i = 1, 4 do
+        local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+            id = "1700008000-" .. tostring(i),
+            response = "Bonus Loot",
+            responseID = "BONUS_ROLL",
+            lootWon = HEAD_LINK,
+        }))
+        bonusKeys[#bonusKeys + 1] = canon.awardKey
+        local row = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(canon), {
+            profile = bonus,
+            author = AWARDER,
+            timestamp = canon.timestamp,
+            externalId = canon.awardKey,
+            counter = 0,
+            skipPermission = true,
+        })
+        assertTrue(bonus:AddLootLog(row, { skipPermission = true, skipBroadcast = true }), "legacy bonus RC row " .. tostring(i) .. " is stored")
+    end
+    local originalSort = table.sort
+    local profileSorts = 0
+    local function countProfileSorts(list, comp)
+        local info = debug.getinfo(2, "S")
+        if info and string.find(info.short_src or "", "Profiles.lua", 1, true) then
+            profileSorts = profileSorts + 1
+        end
+        return originalSort(list, comp)
+    end
+    table.sort = countProfileSorts
+    local synthesized = bonus:NormalizePersistedLegacyBonusRolls()
+    table.sort = originalSort
+    assertEq(synthesized, 4, "a persisted scan synthesizes every legacy bonus roll")
+    assertEq(profileSorts, 1, "legacy bonus replacements sort the profile once")
+    assertEq(countLootEvents(bonus, "BONUS_ROLL", nil), 4, "each legacy bonus RC row has one bonus roll")
+    assertEq(bonus:NormalizePersistedLegacyBonusRolls(), 0, "a second persisted scan does not append")
+
+    local inserted = makeProfile("BonusInsertBatch")
+    addMember(inserted, WINNER)
+    local insertedKeys = {}
+    for i = 1, 4 do
+        local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+            id = "1700008100-" .. tostring(i),
+            response = "Bonus Loot",
+            responseID = "BONUS_ROLL",
+            lootWon = HEAD_LINK,
+        }))
+        insertedKeys[#insertedKeys + 1] = canon.awardKey
+        local row = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(canon), {
+            profile = inserted,
+            author = AWARDER,
+            timestamp = canon.timestamp,
+            externalId = canon.awardKey,
+            counter = 0,
+            skipPermission = true,
+        })
+        assertTrue(inserted:AddLootLog(row, { skipPermission = true, skipBroadcast = true }), "inserted legacy bonus RC row " .. tostring(i) .. " is stored")
+    end
+    profileSorts = 0
+    table.sort = countProfileSorts
+    local insertedWrote = inserted:NormalizeInsertedLegacyBonusRolls(insertedKeys)
+    table.sort = originalSort
+    assertEq(insertedWrote, 4, "a multi-row insert list synthesizes every bonus roll")
+    assertEq(profileSorts, 1, "inserted legacy bonus replacements sort the profile once")
+    assertEq(countLootEvents(inserted, "BONUS_ROLL", nil), 4, "each inserted legacy row has one bonus roll")
+end
+testBackfillFanOutAndBonusBatch()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
