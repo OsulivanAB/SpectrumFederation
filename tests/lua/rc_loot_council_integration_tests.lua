@@ -6111,6 +6111,88 @@ function testSingleWriterAndBonusRolls()
 end
 testSingleWriterAndBonusRolls()
 
+function testBoundedBisBackfill()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("BoundedBackfill")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = false
+    Sync.state.coordinator = PLAYER
+    local scans = 0
+    local originalScan = profile.HasSourceConsistentBisOutcome
+    function profile:HasSourceConsistentBisOutcome(awardKey)
+        scans = scans + 1
+        return originalScan(self, awardKey)
+    end
+    local broadcasts = 0
+    function Sync:BroadcastNewLog()
+        broadcasts = broadcasts + 1
+        return true
+    end
+    for i = 1, 30 do
+        local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+            id = "1700006900-" .. tostring(i),
+            response = "Greed",
+            responseID = 2,
+        }))
+        local row = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(canon), {
+            profile = profile,
+            author = AWARDER,
+            timestamp = canon.timestamp,
+            externalId = canon.awardKey,
+            counter = 0,
+            skipPermission = true,
+        })
+        assertTrue(profile:AddLootLog(row, { skipPermission = true, skipBroadcast = true }), "backfill RC row " .. tostring(i) .. " is stored")
+    end
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", nil), 0, "stored RC rows have no outcomes yet")
+    Sync.state.isCoordinator = true
+    local beforePrints = #printed
+    local deferredFn
+    local previousRunAfter = Sync.RunAfter
+    function Sync:RunAfter(delaySec, fn)
+        if (tonumber(delaySec) or 0) > 0 then
+            deferredFn = fn
+            return
+        end
+        return previousRunAfter(self, delaySec, fn)
+    end
+    C_Timer = {
+        NewTimer = function(_, fn)
+            deferredFn = fn
+            return { Cancel = function() end }
+        end,
+    }
+    local firstPass = profile:ReconcileMissingAutomaticBisOutcomes()
+    assertEq(firstPass, 25, "the first backfill turn writes one batch")
+    assertTrue(profile._autoBisBackfill ~= nil, "the remaining backlog stays queued")
+    assertTrue(type(deferredFn) == "function", "the remaining backlog is deferred off this frame")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", nil), 25, "only the first batch is stored before the timer")
+    assertEq(scans, 0, "backfill does not rescan the log once per award")
+    assertEq(broadcasts, 0, "historical backfill does not enqueue one sync message per outcome")
+    deferredFn()
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", nil), 30, "the deferred batch writes the remaining outcomes")
+    assertEq(profile:ReconcileMissingAutomaticBisOutcomes(), 0, "a finished backfill does not append")
+    assertEq(scans, 0, "the second pass still uses the outcome index")
+    assertEq(broadcasts, 0, "the deferred batch stays local")
+    local warned = false
+    for i = beforePrints + 1, #printed do
+        local message = printed[i][2] or ""
+        if string.find(message, "queue full", 1, true) or string.find(message, "not synced", 1, true) then
+            warned = true
+        end
+    end
+    assertFalse(warned, "backfill does not print one warning per historical outcome")
+    C_Timer = nil
+    Sync.RunAfter = previousRunAfter
+    function Sync:BroadcastNewLog()
+        return true
+    end
+end
+testBoundedBisBackfill()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

@@ -2427,6 +2427,38 @@ function LootProfile:_CanonicalFromRCAwardLog(rcLog)
 	}
 end
 
+-- One linear pass. Bulk reconcile must not call HasSourceConsistentBisOutcome
+-- once per award; that rescans the whole log for every missing key.
+function LootProfile:_IndexSourceConsistentBisOutcomes()
+	local types = SF.LootLogEventTypes or {}
+	local Bis = SF.LootHelperBis
+	local logs = self._lootLogs or {}
+	local covered = {}
+	local rcByKey = {}
+	for i = 1, #logs do
+		local log = logs[i]
+		local eventType = log.GetEventType and log:GetEventType() or log._eventType
+		local data = log.GetEventData and log:GetEventData() or log._data
+		if eventType == types.RC_LOOT_COUNCIL and type(data) == "table" and type(data.awardKey) == "string" and data.awardKey ~= "" then
+			rcByKey[data.awardKey] = log
+		end
+	end
+	for i = 1, #logs do
+		local log = logs[i]
+		local eventType = log.GetEventType and log:GetEventType() or log._eventType
+		if eventType == types.BIS_OUTCOME then
+			local data = log.GetEventData and log:GetEventData() or log._data
+			local awardKey = type(data) == "table" and data.awardKey or nil
+			if type(awardKey) == "string" and not covered[awardKey]
+				and Bis and Bis.IsOutcomeSourceConsistent
+				and Bis.IsOutcomeSourceConsistent(data, rcByKey[awardKey]) then
+				covered[awardKey] = true
+			end
+		end
+	end
+	return covered
+end
+
 function LootProfile:HasSourceConsistentBisOutcome(awardKey)
 	if type(awardKey) ~= "string" or awardKey == "" then
 		return false
@@ -2880,7 +2912,12 @@ function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
     if not canonical then
         return false, "invalid_award"
     end
-    if self:HasSourceConsistentBisOutcome(canonical.awardKey) then
+    local covered = opts and opts.covered
+    if type(covered) == "table" then
+        if covered[canonical.awardKey] then
+            return false, "outcome_exists"
+        end
+    elseif self:HasSourceConsistentBisOutcome(canonical.awardKey) then
         return false, "outcome_exists"
     end
     self._writingAutoBis = true
@@ -2889,65 +2926,164 @@ function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
     return ok, err
 end
 
+-- Writes at most one batch per call. A larger backlog continues on a short
+-- timer so session start does not walk and broadcast every historical award
+-- on the UI thread. Without a timer the rest of the backlog still finishes
+-- in this call, bounded by the key list.
+LootProfile.AUTO_BIS_BACKFILL_BATCH = 25
+
+function LootProfile:_AutomaticBisBackfillCanYield()
+    return C_Timer ~= nil and type(C_Timer.NewTimer) == "function"
+end
+
+function LootProfile:_ArmAutomaticBisBackfill()
+    if self._autoBisBackfillArmed or not self._autoBisBackfill then
+        return
+    end
+    if not self:_AutomaticBisBackfillCanYield() then
+        return
+    end
+    self._autoBisBackfillArmed = true
+    local Sync = SF.LootHelperSync
+    local function step()
+        self._autoBisBackfillArmed = false
+        if self._autoBisBackfill then
+            self:_PumpAutomaticBisBackfill()
+        end
+    end
+    if Sync and Sync.RunAfter then
+        Sync:RunAfter(0.05, step)
+    else
+        self._autoBisBackfillArmed = false
+    end
+end
+
+function LootProfile:_PumpAutomaticBisBackfill()
+    if self._autoBisBackfillPumping then
+        return 0
+    end
+    self._autoBisBackfillPumping = true
+    local wroteNow = 0
+    local guard = 0
+    while self._autoBisBackfill do
+        guard = guard + 1
+        if guard > 10000 then
+            self._autoBisBackfill = nil
+            if SF.Debug then
+                SF.Debug:Warn("LootProfile", "Automatic BiS backfill stopped after the batch guard")
+            end
+            break
+        end
+        local job = self._autoBisBackfill
+        local Sync = SF.LootHelperSync
+        local state = Sync and Sync.state
+        if not self:IsActiveSessionCoordinator()
+            or type(state) ~= "table"
+            or state.sessionId ~= job.sessionId
+            or (self.GetProfileId and self:GetProfileId()) ~= job.profileId
+        then
+            self._autoBisBackfill = nil
+            break
+        end
+        local keys = job.keys or {}
+        local covered = job.covered or {}
+        local opts = job.opts or {}
+        local batch = tonumber(self.AUTO_BIS_BACKFILL_BATCH) or 25
+        if batch < 1 then
+            batch = 1
+        end
+        local processed = 0
+        while job.index <= #keys and processed < batch do
+            local awardKey = keys[job.index]
+            job.index = job.index + 1
+            processed = processed + 1
+            local rcId = self:GetRCAwardLogId(awardKey)
+            local rcLog = rcId and self._logById and self._logById[rcId] or nil
+            local rcData = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
+            if type(rcData) == "table" and rcData.responseId == "BONUS_ROLL" then
+                self:NormalizeLegacyBonusRollRC(rcLog)
+            elseif rcLog and not covered[awardKey] then
+                local quiet = opts.silent == true or #keys > 1
+                local writeOpts = {
+                    silent = quiet,
+                    covered = covered,
+                    skipBroadcast = quiet,
+                }
+                local ok = self:_MaybeWriteAutomaticBisOutcome(rcLog, writeOpts)
+                if ok then
+                    covered[awardKey] = true
+                    job.wrote = (job.wrote or 0) + 1
+                    wroteNow = wroteNow + 1
+                end
+            end
+        end
+        if job.index > #keys then
+            self._autoBisBackfill = nil
+            break
+        end
+        if self:_AutomaticBisBackfillCanYield() then
+            self:_ArmAutomaticBisBackfill()
+            break
+        end
+    end
+    self._autoBisBackfillPumping = false
+    return wroteNow
+end
+
 function LootProfile:ReconcileInsertedRCAwards(awardKeys, opts)
-    if self._writingAutoBis or type(awardKeys) ~= "table" then
+    if self._writingAutoBis or self._autoBisBackfillPumping or type(awardKeys) ~= "table" then
         return 0
     end
     if not self:IsActiveSessionCoordinator() then
         return 0
     end
-    local wrote = 0
-    for i = 1, #awardKeys do
-        local awardKey = awardKeys[i]
-        local rcId = self:GetRCAwardLogId(awardKey)
-        local rcLog = rcId and self._logById and self._logById[rcId] or nil
-        local rcData = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
-        if type(rcData) == "table" and rcData.responseId == "BONUS_ROLL" then
-            -- A 1.5.4 BIS_OUTCOME must not block the visible bonus-roll row.
-            self:NormalizeLegacyBonusRollRC(rcLog)
-        elseif rcLog and not self:HasSourceConsistentBisOutcome(awardKey) then
-            local ok = self:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
-            if ok then
-                wrote = wrote + 1
+    if self._autoBisBackfill then
+        local job = self._autoBisBackfill
+        local seen = {}
+        job.keys = job.keys or {}
+        for i = 1, #job.keys do
+            seen[job.keys[i]] = true
+        end
+        for i = 1, #awardKeys do
+            local awardKey = awardKeys[i]
+            if type(awardKey) == "string" and not seen[awardKey] then
+                job.keys[#job.keys + 1] = awardKey
+                seen[awardKey] = true
             end
         end
+        return self:_PumpAutomaticBisBackfill()
     end
-    return wrote
+    opts = type(opts) == "table" and opts or {}
+    local covered = opts.covered
+    if type(covered) ~= "table" then
+        covered = self:_IndexSourceConsistentBisOutcomes()
+    end
+    local Sync = SF.LootHelperSync
+    self._autoBisBackfill = {
+        keys = awardKeys,
+        covered = covered,
+        opts = opts,
+        index = 1,
+        wrote = 0,
+        sessionId = Sync and Sync.state and Sync.state.sessionId,
+        profileId = self.GetProfileId and self:GetProfileId() or nil,
+    }
+    return self:_PumpAutomaticBisBackfill()
 end
 
--- One pass when this client becomes the session coordinator. Awards that
--- already have a source-consistent outcome are skipped. The pass is silent
--- so a backlog does not print one chat line per historical award.
+-- One indexed pass when this client becomes the session coordinator. Awards
+-- that already have a source-consistent outcome are skipped. The pass is
+-- silent and does not broadcast one sync message per historical award.
 function LootProfile:ReconcileMissingAutomaticBisOutcomes()
-    if self._writingAutoBis or not self:IsActiveSessionCoordinator() then
+    if self._writingAutoBis or self._autoBisBackfillPumping or not self:IsActiveSessionCoordinator() then
         return 0
     end
+    if self._autoBisBackfill then
+        return self:_PumpAutomaticBisBackfill()
+    end
     local types = SF.LootLogEventTypes or {}
-    local Bis = SF.LootHelperBis
     local logs = self._lootLogs or {}
-    local rcByKey = {}
-    local covered = {}
-    for i = 1, #logs do
-        local log = logs[i]
-        local eventType = log.GetEventType and log:GetEventType() or log._eventType
-        local data = log.GetEventData and log:GetEventData() or log._data
-        if eventType == types.RC_LOOT_COUNCIL and type(data) == "table" and type(data.awardKey) == "string" and data.awardKey ~= "" then
-            rcByKey[data.awardKey] = log
-        end
-    end
-    for i = 1, #logs do
-        local log = logs[i]
-        local eventType = log.GetEventType and log:GetEventType() or log._eventType
-        if eventType == types.BIS_OUTCOME then
-            local data = log.GetEventData and log:GetEventData() or log._data
-            local awardKey = type(data) == "table" and data.awardKey or nil
-            if type(awardKey) == "string" and not covered[awardKey]
-                and Bis and Bis.IsOutcomeSourceConsistent
-                and Bis.IsOutcomeSourceConsistent(data, rcByKey[awardKey]) then
-                covered[awardKey] = true
-            end
-        end
-    end
+    local covered = self:_IndexSourceConsistentBisOutcomes()
     local Identity = SF.LootHelperIdentity
     local ordered = (Identity and Identity.OrderLogs and Identity.OrderLogs(logs)) or logs
     local keys = {}
@@ -2964,7 +3100,7 @@ function LootProfile:ReconcileMissingAutomaticBisOutcomes()
             keys[#keys + 1] = awardKey
         end
     end
-    return self:ReconcileInsertedRCAwards(keys, { silent = true })
+    return self:ReconcileInsertedRCAwards(keys, { silent = true, covered = covered })
 end
 
 function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical, opts)
@@ -2982,7 +3118,12 @@ function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical, opts)
         return false, "unavailable"
     end
     local awardKey = canonical.awardKey
-    if self:HasSourceConsistentBisOutcome(awardKey) then
+    local covered = opts and opts.covered
+    if type(covered) == "table" then
+        if covered[awardKey] then
+            return false, "outcome_exists"
+        end
+    elseif self:HasSourceConsistentBisOutcome(awardKey) then
         return false, "outcome_exists"
     end
     local awardMember = canonical.winner
@@ -3032,7 +3173,11 @@ function LootProfile:ApplyRCAutoBisOutcome(rcLog, canonical, opts)
     if not logEntry then
         return false, "create_failed"
     end
-    local inserted = self:AddLootLog(logEntry)
+    local insertOpts = nil
+    if opts and (opts.skipBroadcast or opts.silent) then
+        insertOpts = { skipBroadcast = true }
+    end
+    local inserted = self:AddLootLog(logEntry, insertOpts)
     if not inserted then
         return false, "duplicate"
     end
