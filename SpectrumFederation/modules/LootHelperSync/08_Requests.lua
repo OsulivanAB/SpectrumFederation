@@ -238,9 +238,25 @@ function Sync:_SendRequestAttempt(req)
         end
     end
 
+    -- Look at the next peer before the attempt cap. A helper or coordinator added
+    -- after the old budget was spent still gets one send. Peers already contacted
+    -- do not get extra retries. Waiting for a route does not consume an attempt.
+    local target = self:_PickNextTargetForRequest(req)
+    local newRoute = type(target) == "string"
+        and self._RequestAlreadyContacted
+        and not self:_RequestAlreadyContacted(req, target)
+
     local maxAttempts = 1 + (tonumber(req.maxRetries) or tonumber(self.cfg.maxRetries) or 0)
-    if (tonumber(req.attempt) or 0) >= maxAttempts then
+    if (tonumber(req.attempt) or 0) >= maxAttempts and not newRoute then
         self:_FailRequest(req, "max attempts reached")
+        return
+    end
+
+    if not target then
+        if self._DeferRequestForMissingRoute and self:_DeferRequestForMissingRoute(req) then
+            return
+        end
+        self:_FailRequest(req, "no more targets")
         return
     end
 
@@ -249,15 +265,6 @@ function Sync:_SendRequestAttempt(req)
     self:_MInc("sync.req.send_attempt.total", 1)
     self:_MInc("sync.req.send_attempt.kind." .. tostring(req.kind or "UNKNOWN"), 1)
     self:_MObserve("sync.req.attempt_number.kind." .. tostring(req.kind or "UNKNOWN"), tonumber(req.attempt) or 0)
-
-    local target = self:_PickNextTargetForRequest(req)
-    if not target then
-        if self._DeferRequestForMissingRoute and self:_DeferRequestForMissingRoute(req) then
-            return
-        end
-        self:_FailRequest(req, "no more targets")
-        return
-    end
 
     if SF.Debug then
         local targetsRemaining = 0
@@ -581,7 +588,6 @@ function Sync:_DeferRequestForMissingRoute(req)
     local waits = tonumber(req.routeWaits) or 0
     if waits >= 8 then return false end
     req.routeWaits = waits + 1
-    req.attempt = math.max(0, (tonumber(req.attempt) or 1) - 1)
 
     local delay = tonumber(req.timeoutSec) or tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
     if delay < 1 then delay = 1 end

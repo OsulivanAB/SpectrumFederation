@@ -475,8 +475,14 @@ function Sync:FinalizeAdminConvergence()
         end
     end
 
-    -- 6) choose helpers list
-    self.state.helpers = self:ChooseHelpers(self.state.adminStatuses or {})
+    -- 6) choose helpers list. Installing it retargets requests that were held
+    -- while this client had no helper route of its own.
+    local chosenHelpers = self:ChooseHelpers(self.state.adminStatuses or {})
+    if self.ApplyAdvertisedHelpers then
+        self:ApplyAdvertisedHelpers(chosenHelpers, "admin_convergence")
+    else
+        self.state.helpers = chosenHelpers
+    end
 
     if SF.Debug then
         local localMaxCount = 0
@@ -590,8 +596,12 @@ function Sync:BroadcastSessionStart()
     
     -- Store chosen helpers for later activation
     local chosenHelpers = self.state.helpers or {}
-    -- Temporarily clear helpers list so members don't route to helpers immediately
+    -- Temporarily clear helpers list so members don't route to helpers immediately.
+    -- Refresh local requests too, so they do not whisper those helpers early.
     self.state.helpers = {}
+    if self._RefreshOutstandingRequestTargets then
+        self:_RefreshOutstandingRequestTargets()
+    end
 
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
     if self._MintDirtySessionRCConfig then

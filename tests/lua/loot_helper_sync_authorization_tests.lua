@@ -876,6 +876,60 @@ assertTrue(Sync.state.requests["need-takeover"] ~= nil, "missing helper route do
 Sync:OnRequestTimeout("need-takeover")
 assertNil(Sync.state.requests["need-takeover"], "route wait stays capped")
 
+-- A route discovered after the attempt budget is spent still gets one send.
+reset(MEMBER)
+local spent = seedRequest("need-spent", "NEED_LOGS", { COORD }, COORD)
+spent.maxRetries = 0
+spent.attempt = 1
+Sync:OnRequestTimeout("need-spent")
+assertNil(Sync.state.requests["need-spent"], "exhausted request fails when no new route exists")
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = {}
+local late = seedRequest("need-late", "NEED_LOGS", { COORD }, COORD)
+late.maxRetries = 0
+late.attempt = 1
+Sync:ApplyAdvertisedHelpers({ KINO }, "inserted-after-exhausted")
+Sync:OnRequestTimeout("need-late")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 1, "new helper receives an attempt after the old budget is spent")
+assertTrue(Sync.state.requests["need-late"] ~= nil, "request stays open after contacting the new helper")
+Sync:OnRequestTimeout("need-late")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 0, "already contacted coordinator is not retried after the budget")
+assertNil(Sync.state.requests["need-late"], "budget stays closed after the new route is contacted")
+
+-- Takeover convergence installs helpers and retargets a held request.
+reset(KINO)
+setAdmins({ KINO, OWNER })
+Sync.state.isCoordinator = true
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local held = seedRequest("need-conv", "NEED_LOGS", { COORD }, COORD)
+Sync:_RememberRevokedResponder(held, COORD)
+Sync:_RefreshOutstandingRequestTargets()
+held = Sync.state.requests["need-conv"]
+assertTrue(held ~= nil, "request survives refresh before a helper exists")
+assertTrue(not listHas(held.targets, OWNER), "helper is not a target before convergence")
+Sync.state.adminStatuses = {
+    [OWNER] = { hasProfile = true, hasGaps = false, authorMax = {} },
+}
+Sync.state._adminConvergence = {
+    pendingCount = 0,
+    pendingReq = {},
+    expected = {},
+    onComplete = function() end,
+}
+Sync:FinalizeAdminConvergence()
+held = Sync.state.requests["need-conv"]
+assertTrue(held ~= nil, "convergence does not drop the held request")
+assertTrue(listHas(held.targets, OWNER), "convergence helper becomes a request target")
+assertTrue(not listHas(held.targets, COORD), "revoked coordinator is dropped once a helper exists")
+Sync:OnRequestTimeout("need-conv")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, OWNER), 1, "timeout contacts the helper chosen by convergence")
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
