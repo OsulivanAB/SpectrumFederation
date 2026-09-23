@@ -266,6 +266,8 @@ local function reset(selfName)
     Sync.state._reconcilingSessionAuthorization = nil
     Sync.state._relinquishingCoordination = nil
     Sync.state._profileReqInFlight = nil
+    Sync.state._noProfileTargetWarnedFor = nil
+    Sync.state._noLogTargetWarnedFor = nil
     Sync.state._sentJoinStatusForSessionId = nil
     Sync.state._sessionAnnounced = SESSION
     Sync._reconcilingSessionAuthorization = nil
@@ -929,6 +931,43 @@ assertTrue(listHas(held.targets, OWNER), "convergence helper becomes a request t
 assertTrue(not listHas(held.targets, COORD), "revoked coordinator is dropped once a helper exists")
 Sync:OnRequestTimeout("need-conv")
 assertEq(sendCount(Sync.MSG.NEED_LOGS, OWNER), 1, "timeout contacts the helper chosen by convergence")
+
+-- An exhausted request still waits when the coordinator is revoked and no helper remains.
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync.state.helpers = {}
+Sync.state.isCoordinator = false
+local spentWait = seedRequest("need-spent-wait", "NEED_LOGS", { COORD }, COORD)
+spentWait.maxRetries = 0
+spentWait.attempt = 1
+Sync:_RememberRevokedResponder(spentWait, COORD)
+Sync:_RefreshOutstandingRequestTargets()
+Sync:OnRequestTimeout("need-spent-wait")
+assertTrue(Sync.state.requests["need-spent-wait"] ~= nil, "exhausted request waits for a successor")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 0, "exhausted wait does not send to the revoked coordinator")
+
+-- Empty route warnings are once per session, then allowed again after a route exists.
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync.state.helpers = {}
+Sync.state.isCoordinator = false
+assertEq(Sync:RequestProfileSnapshot("no-route"), false, "profile request fails with no route")
+assertEq(Sync:RequestProfileSnapshot("no-route-again"), false, "profile request stays failed with no route")
+assertEq(warningCount("Cannot request profile"), 1, "empty profile route warns once")
+local missing = {
+    { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+}
+Sync:RequestMissingLogs(missing, "no-route")
+Sync:RequestMissingLogs(missing, "no-route-again")
+assertEq(warningCount("Cannot request missing logs"), 1, "empty log route warns once")
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+assertEq(Sync:RequestProfileSnapshot("route-back"), true, "profile request proceeds when a route returns")
+assertEq(warningCount("Cannot request profile"), 1, "restored profile route does not warn")
+Sync:RequestMissingLogs(missing, "route-back")
+assertEq(warningCount("Cannot request missing logs"), 1, "restored log route does not warn")
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

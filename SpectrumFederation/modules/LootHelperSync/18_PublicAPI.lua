@@ -123,6 +123,8 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._sentJoinStatusForSessionId = nil
     self.state._sentJoinStatusType = nil
     self.state._profileReqInFlight = nil
+    self.state._noProfileTargetWarnedFor = nil
+    self.state._noLogTargetWarnedFor = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = self:_Now()
 
@@ -796,6 +798,8 @@ function Sync:_ResetSessionState(reason)
     self.state._sentJoinStatusForSessionId = nil
     self.state._sentJoinStatusType = nil
     self.state._profileReqInFlight = nil
+    self.state._noProfileTargetWarnedFor = nil
+    self.state._noLogTargetWarnedFor = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = nil
 

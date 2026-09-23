@@ -246,6 +246,12 @@ function Sync:_SendRequestAttempt(req)
         and self._RequestAlreadyContacted
         and not self:_RequestAlreadyContacted(req, target)
 
+    -- A revoked coordinator can leave no peer to contact. That wait has its own
+    -- cap and must run even when the retry budget is already spent.
+    if not target and self._DeferRequestForMissingRoute and self:_DeferRequestForMissingRoute(req) then
+        return
+    end
+
     local maxAttempts = 1 + (tonumber(req.maxRetries) or tonumber(self.cfg.maxRetries) or 0)
     if (tonumber(req.attempt) or 0) >= maxAttempts and not newRoute then
         self:_FailRequest(req, "max attempts reached")
@@ -253,9 +259,6 @@ function Sync:_SendRequestAttempt(req)
     end
 
     if not target then
-        if self._DeferRequestForMissingRoute and self:_DeferRequestForMissingRoute(req) then
-            return
-        end
         self:_FailRequest(req, "no more targets")
         return
     end

@@ -249,6 +249,31 @@ function Sync:GetRequestTargets(helpers, coordinator, opts)
     return targets
 end
 
+-- Function Warn once while this session has no profile or log route.
+-- The same empty-target condition can be observed from every NEW_LOG or repair pass.
+-- @param flag string State field holding the session id already warned
+-- @param message string
+-- @return nil
+function Sync:_WarnMissingRouteOnce(flag, message)
+    local sessionId = self.state and self.state.sessionId
+    if type(flag) ~= "string" or type(sessionId) ~= "string" or sessionId == "" then
+        if SF.PrintWarning and type(message) == "string" then
+            SF:PrintWarning(message)
+        end
+        return
+    end
+    if self.state[flag] == sessionId then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Suppressed repeat missing-route warning: %s", tostring(message))
+        end
+        return
+    end
+    self.state[flag] = sessionId
+    if SF.PrintWarning and type(message) == "string" then
+        SF:PrintWarning(message)
+    end
+end
+
 -- Function Request profile snapshot from helpers (preferred) or coordinator (fallback).
 -- @param reason string Reason for request (for logging)
 -- @return boolean True if request was registered, false otherwise
@@ -267,11 +292,10 @@ function Sync:RequestProfileSnapshot(reason)
     local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
         or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
     if not targets or #targets == 0 then
-        if SF.PrintWarning then
-            SF:PrintWarning("Cannot request profile: no targets available")
-        end
+        self:_WarnMissingRouteOnce("_noProfileTargetWarnedFor", "Cannot request profile: no targets available")
         return false
     end
+    self.state._noProfileTargetWarnedFor = nil
 
     local requestId = self:NewRequestId()
     local ok = self:RegisterRequest(requestId, "NEED_PROFILE", targets[1], {
@@ -344,11 +368,10 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
             local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets(targetOpts))
                 or self:GetRequestTargets(self.state.helpers, self.state.coordinator, targetOpts)
             if not targets or #targets == 0 then
-                if SF.PrintWarning then
-                    SF:PrintWarning("Cannot request missing logs: no targets available")
-                end
+                self:_WarnMissingRouteOnce("_noLogTargetWarnedFor", "Cannot request missing logs: no targets available")
                 return count > 0
             end
+            self.state._noLogTargetWarnedFor = nil
 
             local requestId = self:NewRequestId()
             local ok = self:RegisterRequest(requestId, "NEED_LOGS", targets[1], self:_CopyExpectedWindowEvidence(range, {
