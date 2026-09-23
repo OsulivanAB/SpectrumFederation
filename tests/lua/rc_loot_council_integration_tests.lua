@@ -6919,6 +6919,111 @@ function testRepairSkipsCurrentSessionBisOutcome()
 end
 testRepairSkipsCurrentSessionBisOutcome()
 
+function testRepairProofAcceptsSuppressedBis()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local author = "AdminB-Garona"
+    local receiver = makeProfile("RepairProof")
+    addMember(receiver, WINNER)
+    setActive(receiver)
+    startSessionOn(receiver)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    Sync.state.coordEpoch = 1700000000
+    Sync.state.requests = {}
+    local profileId = receiver:GetProfileId()
+
+    local function pointWire(counter)
+        local log = SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
+            member = WINNER,
+            change = SF.LootLogPointChangeTypes.INCREMENT,
+            amount = 1,
+        }, {
+            profile = receiver,
+            author = author,
+            counter = counter,
+            timestamp = 1700001000 + counter,
+            skipPermission = true,
+        })
+        assertTrue(log ~= nil, "point log " .. tostring(counter) .. " is valid")
+        return log:ToTable()
+    end
+
+    local kept = pointWire(1)
+    local extra = pointWire(2)
+    local data = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    data.sourceLogId = "award-proof"
+    data.awardKey = "award-proof"
+    data.awardMember = WINNER
+    data.qualified = false
+    data.outcome = "NOT_BIS"
+    data.assignedSlots = {}
+    data.itemLink = ITEM_LINK
+    data.itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+    data.response = "Greed"
+    local bisLog = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, data, {
+        profile = receiver,
+        author = author,
+        counter = 3,
+        timestamp = 1700005000,
+        skipPermission = true,
+    })
+    assertTrue(bisLog ~= nil, "suppressed proof outcome is valid")
+    local bisWire = bisLog:ToTable()
+
+    assertEq(receiver:MergeLogTables({ kept, extra }, { allowUnknownEventType = true }), 2, "receiver keeps the advertised row and an extra row")
+    local advertiser = makeProfile("RepairProofAdvertiser")
+    addMember(advertiser, WINNER)
+    assertEq(advertiser:MergeLogTables({ kept, bisWire }, { allowUnknownEventType = true }), 2, "advertiser window is the kept row plus the outcome")
+    local advCount, advMax, advChecksum = Sync:_ScanExactAuthorRange(advertiser:GetProfileId(), author, 1, 3)
+    assertEq(advCount, 2, "advertised window has two rows")
+    assertEq(advMax, 3, "advertised frontier is the outcome counter")
+
+    local window = {
+        fromCounter = 1,
+        toCounter = 3,
+        count = advCount,
+        maxCounter = advMax,
+        checksum = advChecksum,
+    }
+    Sync.state.requests["REQ-PROOF"] = {
+        kind = "LOG_REQ",
+        meta = {
+            profileId = profileId,
+            author = author,
+            fromCounter = 1,
+            toCounter = 3,
+            exactAuthor = true,
+            expectedCount = advCount,
+            expectedChecksum = advChecksum,
+            expectedMaxCounter = advMax,
+            expectedFromCounter = 1,
+            expectedToCounter = 3,
+        },
+    }
+    Sync:HandleAuthLogs(PLAYER, {
+        sessionId = Sync.state.sessionId,
+        profileId = profileId,
+        requestId = "REQ-PROOF",
+        author = author,
+        fromCounter = 1,
+        toCounter = 3,
+        logs = { kept, bisWire },
+    })
+    assertEq(countLootEvents(receiver, "BIS_OUTCOME", "award-proof"), 0, "exact repair still does not store the current-session outcome")
+    assertFalse(Sync:_LocalFrontierMatchesAdvertisedWindow(profileId, author, window), "the extra local row keeps the compact frontier from matching")
+    assertTrue(Sync:_ExactAuthorRangeSatisfied(profileId, author, 1, 3, {
+        exactAuthor = true,
+        expectedCount = advCount,
+        expectedChecksum = advChecksum,
+        expectedMaxCounter = advMax,
+        expectedFromCounter = 1,
+        expectedToCounter = 3,
+    }), "exact repair is satisfied through the remembered outcome")
+    assertTrue(Sync:_HasContainedExactWindowProof(profileId, author, window), "the remembered fingerprint keeps the window proof")
+end
+testRepairProofAcceptsSuppressedBis()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

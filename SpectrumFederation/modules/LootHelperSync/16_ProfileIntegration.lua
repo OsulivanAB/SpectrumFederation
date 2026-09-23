@@ -1440,12 +1440,15 @@ function Sync:_HasContainedExactWindowProof(profileId, author, window)
         end
         local expectedFp = tonumber(row.fingerprint)
         local log = profile.GetLogById and profile:GetLogById(row.id)
-        if not log or not expectedFp then
-            contained[key] = nil
-            return false
+        local localFp = nil
+        if log then
+            localFp = tonumber((log.GetFingerprint and log:GetFingerprint()) or log._fingerprint)
+        else
+            -- A current-session non-coordinator BIS_OUTCOME is remembered
+            -- instead of stored. That id still proves the advertised row.
+            localFp = self:_SuppressedBisFingerprint(profileId, row.id)
         end
-        local localFp = tonumber((log.GetFingerprint and log:GetFingerprint()) or log._fingerprint)
-        if not localFp or localFp ~= expectedFp then
+        if not expectedFp or not localFp or localFp ~= expectedFp then
             contained[key] = nil
             return false
         end
@@ -1553,10 +1556,15 @@ function Sync:_AuthLogsProveAdvertisedWindow(profileId, author, window, payloadL
     for i = 1, #evidence do
         local row = evidence[i]
         local localLog = byId[row.id]
-        if not localLog then
-            return nil
+        local localFp = nil
+        if localLog then
+            localFp = tonumber((localLog.GetFingerprint and localLog:GetFingerprint()) or localLog._fingerprint)
+        else
+            -- The repair filter omitted this current-session outcome. The
+            -- remembered fingerprint still accounts for the advertised row,
+            -- including when other local rows make the compact checksum differ.
+            localFp = self:_SuppressedBisFingerprint(profileId, row.id)
         end
-        local localFp = tonumber((localLog.GetFingerprint and localLog:GetFingerprint()) or localLog._fingerprint)
         if not localFp or localFp ~= row.fingerprint then
             return nil
         end
@@ -2528,6 +2536,22 @@ function Sync:_SuppressedBisRows(profileId)
         return nil
     end
     return rows
+end
+
+function Sync:_SuppressedBisFingerprint(profileId, logId)
+    if type(logId) ~= "string" or logId == "" then
+        return nil
+    end
+    local rows = self:_SuppressedBisRows(profileId)
+    if not rows then
+        return nil
+    end
+    for _, row in pairs(rows) do
+        if type(row) == "table" and row.id == logId then
+            return tonumber(row.fingerprint)
+        end
+    end
+    return nil
 end
 
 function Sync:_FoldSuppressedIntoAuthorMax(exactSource)
