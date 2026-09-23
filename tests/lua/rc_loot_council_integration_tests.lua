@@ -6802,6 +6802,123 @@ function testBackfillFanOutAndBonusBatch()
 end
 testBackfillFanOutAndBonusBatch()
 
+function testRepairSkipsCurrentSessionBisOutcome()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local owners = {
+        "AdminA-Garona",
+        "AdminB-Garona",
+        "AdminC-Garona",
+    }
+    local profile = makeProfile("RepairBis")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = owners[1]
+    Sync.state.coordEpoch = 1700000000
+    Sync.state.requests = {}
+    local profileId = profile:GetProfileId()
+
+    local function outcomeWire(author, timestamp, awardKey)
+        local data = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+        data.sourceLogId = awardKey
+        data.awardKey = awardKey
+        data.awardMember = WINNER
+        data.qualified = false
+        data.outcome = "NOT_BIS"
+        data.assignedSlots = {}
+        data.itemLink = ITEM_LINK
+        data.itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+        data.response = "Greed"
+        local log = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, data, {
+            profile = profile,
+            author = author,
+            timestamp = timestamp,
+            skipPermission = true,
+        })
+        assertTrue(log ~= nil, "outcome wire for " .. author .. " is valid")
+        return log:ToTable()
+    end
+
+    local currentWire = outcomeWire(owners[2], 1700005000, "award-current")
+    local historicalWire = outcomeWire(owners[3], 1000, "award-historical")
+    local coordinatorWire = outcomeWire(owners[1], 1700005001, "award-coordinator")
+    local missingTimestamp = outcomeWire(owners[2], 1700005002, "award-missing-time")
+    missingTimestamp._timestamp = nil
+
+    local function deliver(requestId, author, wire, fromCounter, toCounter)
+        Sync.state.requests[requestId] = {
+            kind = "LOG_REQ",
+            meta = {
+                profileId = profileId,
+                author = author,
+                fromCounter = fromCounter,
+                toCounter = toCounter,
+            },
+        }
+        Sync:HandleAuthLogs(owners[1], {
+            sessionId = Sync.state.sessionId,
+            profileId = profileId,
+            requestId = requestId,
+            author = author,
+            fromCounter = fromCounter,
+            toCounter = toCounter,
+            logs = { wire },
+        })
+    end
+
+    deliver("REQ-CURRENT", owners[2], currentWire, currentWire._counter, currentWire._counter)
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", "award-current"), 0, "repair does not store a current-session non-coordinator outcome")
+    assertEq(Sync:_ComputeContigCounter(profileId, owners[2]), currentWire._counter, "the suppressed counter still fills the author prefix")
+    assertFalse(Sync:DetectGap(profileId, { _author = owners[2], _counter = currentWire._counter + 1 }), "the next counter is not a gap")
+    local advertised = Sync:ComputeAuthorMax(profileId)
+    assertEq(tonumber(advertised[owners[2]]) or 0, 0, "a suppressed outcome is not advertised")
+    local contig = Sync:ComputeContigAuthorMax(profileId)
+    local remote = {}
+    remote[owners[2]] = currentWire._counter
+    local missing = Sync:ComputeMissingLogRequests(contig, remote, advertised)
+    local requested = false
+    for _, range in ipairs(missing) do
+        if range.author == owners[2] then
+            requested = true
+        end
+    end
+    assertFalse(requested, "catch-up does not request the suppressed counter again")
+    deliver("REQ-CURRENT-AGAIN", owners[2], currentWire, currentWire._counter, currentWire._counter)
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", "award-current"), 0, "a second repair still does not store the outcome")
+
+    local repairCount, repairMax, repairChecksum = Sync:_ScanExactAuthorRange(profileId, owners[2], currentWire._counter, currentWire._counter)
+    local stored = makeProfile("RepairBisStored")
+    addMember(stored, WINNER)
+    assertEq(stored:MergeLogTables({ currentWire }, { allowUnknownEventType = true }), 1, "direct merge still stores the same wire")
+    local storedCount, storedMax, storedChecksum = Sync:_ScanExactAuthorRange(stored:GetProfileId(), owners[2], currentWire._counter, currentWire._counter)
+    assertEq(repairCount, storedCount, "the remembered row counts toward the exact window")
+    assertEq(repairMax, storedMax, "the remembered row supplies the exact window max")
+    assertEq(repairChecksum, storedChecksum, "the remembered fingerprint matches a stored copy")
+
+    deliver("REQ-HISTORICAL", owners[3], historicalWire, historicalWire._counter, historicalWire._counter)
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", "award-historical"), 1, "repair still stores an outcome from before coordEpoch")
+    deliver("REQ-COORDINATOR", owners[1], coordinatorWire, coordinatorWire._counter, coordinatorWire._counter)
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", "award-coordinator"), 1, "repair stores the coordinator's current-session outcome")
+    assertFalse(Sync:_ShouldSuppressRepairBisOutcome(profile, missingTimestamp), "a missing timestamp stays importable")
+
+    local beforeLive = Sync:_ComputeContigCounter(profileId, owners[2])
+    Sync:HandleNewLog(owners[2], {
+        sessionId = Sync.state.sessionId,
+        profileId = profileId,
+        log = currentWire,
+    })
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", "award-current"), 0, "live NEW_LOG still ignores the non-coordinator outcome")
+    assertEq(Sync:_ComputeContigCounter(profileId, owners[2]), beforeLive, "live rejection keeps the suppressed counter")
+
+    function Sync:_ResetSessionSafeMode() end
+    function Sync:_ResetLocalSafeMode() end
+    Sync:_ResetSessionState("repair-bis-test")
+    assertEq(Sync:_ComputeContigCounter(profileId, owners[2]), 0, "ending the session drops suppressed counters")
+end
+testRepairSkipsCurrentSessionBisOutcome()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

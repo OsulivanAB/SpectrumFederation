@@ -581,12 +581,19 @@ function Sync:HandleNewLog(sender, payload)
     end
     -- During a controlling session the coordinator is the only live writer of
     -- automatic BIS_OUTCOME rows. Older peers still broadcast their own.
-    -- Bulk import keeps historical duplicates; this gate is live NEW_LOG only.
+    -- Remember a current-session row so the next counter is not a permanent
+    -- gap. Historical rows stay unremembered so a later repair can store them.
     if eventType == types.BIS_OUTCOME
         and profile.SessionControlsAutomaticBis
         and profile:SessionControlsAutomaticBis()
         and not self:_SamePlayer(sender, self.state.coordinator)
     then
+        if self._ShouldSuppressRepairBisOutcome
+            and self._RememberSuppressedAutomaticBisOutcome
+            and self:_ShouldSuppressRepairBisOutcome(profile, logTable)
+        then
+            self:_RememberSuppressedAutomaticBisOutcome(profileId, logTable)
+        end
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Ignoring live BIS_OUTCOME from %s; the session coordinator is the automatic writer", tostring(sender))
         end

@@ -198,7 +198,14 @@ function Sync:HandleAuthLogs(sender, payload)
             (self.state.isCoordinator and self:IsSenderAuthorized(payload.profileId, sender))
             or self:_SamePlayer(sender, self.state.coordinator)
         )
-    local changed, mergeDetails = self:MergeLogs(payload.profileId, payload.logs, {
+    -- Current-session non-coordinator BIS_OUTCOME rows are not stored. Their
+    -- counters stay in session memory so this repair can still complete.
+    -- Historical rows and direct MergeLogTables / snapshot import are kept.
+    local logsToMerge = payload.logs
+    if self._PartitionRepairBisOutcomes then
+        logsToMerge = self:_PartitionRepairBisOutcomes(payload.profileId, payload.logs)
+    end
+    local changed, mergeDetails = self:MergeLogs(payload.profileId, logsToMerge, {
         allowReplaceExisting = allowReplaceExisting,
         allowMainSwapFingerprintNormalize = true,
     })
