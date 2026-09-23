@@ -221,6 +221,9 @@ function Sync:_RetargetRequestList(req, targets)
     else
         req.targetIdx = #targets
     end
+    if #targets > 0 then
+        req.routeWaits = nil
+    end
 end
 
 -- Function Classify a privileged sync response against current auth and this request.
@@ -256,6 +259,35 @@ function Sync:_ClassifyPrivilegedResponse(sender, profileId, req, opts)
     return "untrusted"
 end
 
+-- Function Routing options that created this request, when it has any.
+-- Exact and integrity repairs keep preferredTarget and coordinator-first order.
+-- @param req table
+-- @return table|nil
+function Sync:_RequestRoutingOpts(req)
+    local meta = type(req) == "table" and type(req.meta) == "table" and req.meta or nil
+    if not meta then return nil end
+    local exact = meta.exactAuthor == true or meta.integrityRepair == true
+    if not exact then return nil end
+    local opts = { preferCoordinatorFirst = true }
+    if type(meta.preferredTarget) == "string" and meta.preferredTarget ~= "" then
+        opts.preferredTarget = meta.preferredTarget
+    end
+    return opts
+end
+
+-- Function True when the stored coordinator is still someone requests may route to.
+-- Unknown profiles stay routable so bootstrap does not clear targets early.
+-- @param none
+-- @return boolean
+function Sync:_CoordinatorIsCurrentRoute()
+    if not (self.state and type(self.state.coordinator) == "string" and self.state.coordinator ~= "") then
+        return false
+    end
+    if not self:_ProfileAuthorizationKnown() then return true end
+    return self:IsSenderAuthorized(self.state.profileId, self.state.coordinator)
+        and self:IsTrustedDataSender(self.state.coordinator)
+end
+
 -- Function Refresh outstanding request targets based on current helpers/coordinator.
 -- Canonical admin revocation removes targets. Routing-only changes keep already-sent
 -- responders acceptable until that response arrives, but future sends use the new list.
@@ -264,7 +296,7 @@ end
 function Sync:_RefreshOutstandingRequestTargets()
     if not self.state or not self.state.requests then return end
 
-    local routingTargets = self:_CurrentAuthorizedRoutingTargets()
+    local defaultRoutes = self:_CurrentAuthorizedRoutingTargets()
     local profileKnown = self:_ProfileAuthorizationKnown()
     local me = self:_SelfId()
     local selfAuthorized = (not profileKnown) or self:IsSenderAuthorized(self.state.profileId, me)
@@ -296,10 +328,15 @@ function Sync:_RefreshOutstandingRequestTargets()
                         self:_RememberRevokedResponder(req, name)
                     end
                 end
-                if profileKnown or #routingTargets > 0 then
-                    if not self:_SamePlayerList(oldTargets, routingTargets) then
-                        self:_RetargetRequestList(req, self:_CopyPlayerList(routingTargets))
-                    end
+                local routeOpts = self:_RequestRoutingOpts(req)
+                local nextTargets = routeOpts and self:_CurrentAuthorizedRoutingTargets(routeOpts) or defaultRoutes
+                -- An empty route before a successor is stored would fail the request
+                -- on the next send. Hold the existing list until takeover or a
+                -- heartbeat names someone requests can use.
+                local holdForSuccessor = #nextTargets == 0
+                    and (not profileKnown or not self:_CoordinatorIsCurrentRoute())
+                if not holdForSuccessor and not self:_SamePlayerList(oldTargets, nextTargets) then
+                    self:_RetargetRequestList(req, self:_CopyPlayerList(nextTargets))
                 end
             elseif req.kind == "LOG_REQ" or req.kind == "ADMIN_LOG_REQ" then
                 local oldTargets = req.targets or {}

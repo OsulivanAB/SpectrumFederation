@@ -705,6 +705,64 @@ assertEq(restored, true, "authorized coordinator session restores")
 assertEq(Sync.state.isCoordinator, true, "authorized coordinator resumes after reload")
 assertEq(Sync.state._restoredSessionNeedsReannounce, true, "authorized coordinator schedules one reannounce")
 
+-- Exact repairs keep the advertiser ahead of the default helper route.
+reset(MEMBER)
+Sync.state.helpers = { OWNER, KINO }
+local preferredReq = seedRequest("need-pref", "NEED_LOGS", { COORD }, nil)
+preferredReq.meta.exactAuthor = true
+preferredReq.meta.integrityRepair = true
+preferredReq.meta.preferredTarget = KINO
+Sync:_RefreshOutstandingRequestTargets()
+preferredReq = Sync.state.requests["need-pref"]
+assertEq(preferredReq.targets[1], KINO, "exact repair keeps the preferred advertiser first")
+assertEq(preferredReq.targets[2], COORD, "exact repair still falls back to the coordinator")
+assertTrue(listHas(preferredReq.targets, OWNER), "exact repair keeps other helpers as later fallbacks")
+
+-- Empty routes wait for a successor instead of failing the request.
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync.state.helpers = {}
+Sync.state.isCoordinator = false
+local waiting = seedRequest("need-wait", "NEED_LOGS", { COORD }, COORD)
+Sync:_RefreshOutstandingRequestTargets()
+waiting = Sync.state.requests["need-wait"]
+assertTrue(waiting ~= nil, "request survives refresh with no current route")
+assertTrue(listHas(waiting.targets, COORD), "request holds its targets until a successor is stored")
+Sync:OnRequestTimeout("need-wait")
+assertTrue(Sync.state.requests["need-wait"] ~= nil, "timeout waits instead of failing with no route")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 0, "timeout does not send to the revoked coordinator")
+Sync:HandleCoordinatorTakeover(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+waiting = Sync.state.requests["need-wait"]
+assertTrue(waiting ~= nil, "request survives coordinator takeover")
+assertTrue(listHas(waiting.targets, KINO), "takeover retargets the request to the new coordinator")
+assertTrue(not listHas(waiting.targets, COORD), "takeover drops the revoked coordinator target")
+
+-- The client that assumes coordination refreshes the same empty route.
+reset(KINO)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync.state.isCoordinator = false
+Sync.state.helpers = {}
+seedRequest("need-takeover", "NEED_LOGS", { COORD }, COORD)
+Sync:_RefreshOutstandingRequestTargets()
+local took = Sync:TakeoverSession(SESSION, PROFILE, "coordinator-removed", { rerunAdminConvergence = false })
+assertEq(took, true, "eligible admin takeover succeeds")
+assertEq(Sync.state.coordinator, KINO, "takeover stores the successor before routing")
+assertTrue(Sync.state.requests["need-takeover"] ~= nil, "takeover does not drop the outstanding request")
+for _ = 1, 8 do
+    if not Sync.state.requests["need-takeover"] then break end
+    Sync:OnRequestTimeout("need-takeover")
+end
+assertTrue(Sync.state.requests["need-takeover"] ~= nil, "missing helper route does not fail the request immediately")
+Sync:OnRequestTimeout("need-takeover")
+assertNil(Sync.state.requests["need-takeover"], "route wait stays capped")
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

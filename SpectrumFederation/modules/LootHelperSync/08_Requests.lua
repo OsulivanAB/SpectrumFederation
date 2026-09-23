@@ -88,17 +88,26 @@ function Sync:_PickNextTargetForRequest(req)
         return nil
     end
 
-    -- Single target: keep retrying the same peer
+    -- Single target: keep retrying the same peer unless that peer was revoked.
     if #req.targets == 1 then
+        if self._ResponderMapHas and self:_ResponderMapHas(req.revokedResponders, req.targets[1]) then
+            return nil
+        end
         req.targetIdx = 1
         return req.targets[1]
     end
 
-    -- Multi target: walk the list once (no wrap)
+    -- Multi target: walk the list once (no wrap), skipping revoked peers.
     local idx = (tonumber(req.targetIdx) or 0) + 1
-    if idx > #req.targets then return nil end
-    req.targetIdx = idx
-    return req.targets[idx]
+    while idx <= #req.targets do
+        local name = req.targets[idx]
+        req.targetIdx = idx
+        if not (self._ResponderMapHas and self:_ResponderMapHas(req.revokedResponders, name)) then
+            return name
+        end
+        idx = idx + 1
+    end
+    return nil
 end
 
 -- Function Send a LOG_REQ to a target peer.
@@ -243,6 +252,9 @@ function Sync:_SendRequestAttempt(req)
 
     local target = self:_PickNextTargetForRequest(req)
     if not target then
+        if self._DeferRequestForMissingRoute and self:_DeferRequestForMissingRoute(req) then
+            return
+        end
         self:_FailRequest(req, "no more targets")
         return
     end
@@ -546,6 +558,48 @@ function Sync:OnRequestTimeout(requestId)
 
     req.timer = nil
     self:_SendRequestAttempt(req)
+end
+
+-- Function Wait briefly when a member request has no route yet.
+-- This covers the gap before a successor is stored, and the gap after this
+-- client becomes coordinator but before any helper route exists.
+-- The wait is capped so a request cannot retry forever.
+-- @param req table
+-- @return boolean True when the attempt was deferred
+function Sync:_DeferRequestForMissingRoute(req)
+    if type(req) ~= "table" then return false end
+    if req.kind ~= "NEED_PROFILE" and req.kind ~= "NEED_LOGS" then return false end
+    if not (self.state and self.state.active) then return false end
+
+    local routes = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets(self:_RequestRoutingOpts(req))) or {}
+    if #routes > 0 then return false end
+
+    local waitingForSuccessor = self._CoordinatorIsCurrentRoute and not self:_CoordinatorIsCurrentRoute()
+    local waitingAsCoordinator = self.state.isCoordinator == true
+    if not waitingForSuccessor and not waitingAsCoordinator then return false end
+
+    local waits = tonumber(req.routeWaits) or 0
+    if waits >= 8 then return false end
+    req.routeWaits = waits + 1
+    req.attempt = math.max(0, (tonumber(req.attempt) or 1) - 1)
+
+    local delay = tonumber(req.timeoutSec) or tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    if delay < 1 then delay = 1 end
+    self:_CancelRequestTimer(req)
+    if self.RunAfter then
+        local requestId = req.id
+        req.timer = self:RunAfter(delay, function()
+            if self.OnRequestTimeout then
+                self:OnRequestTimeout(requestId)
+            end
+        end)
+    end
+
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Deferring request %s until a route exists (wait=%d, kind=%s)",
+            tostring(req.id), tonumber(req.routeWaits) or 0, tostring(req.kind))
+    end
+    return true
 end
 
 -- Function: Retry a request soon after receiving a bad/partial response.

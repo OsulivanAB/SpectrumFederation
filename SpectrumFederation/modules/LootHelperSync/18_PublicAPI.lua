@@ -961,6 +961,12 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
 
+    -- Member requests may have been holding an empty route while the previous
+    -- coordinator was still stored. Rebuild targets now that this client is coordinator.
+    if self._RefreshOutstandingRequestTargets then
+        self:_RefreshOutstandingRequestTargets()
+    end
+
     self:BroadcastCoordinatorTakeover()
 
     if not opts.rerunAdminConvergence then
