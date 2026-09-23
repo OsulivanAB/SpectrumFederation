@@ -480,7 +480,14 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if not self:_ProfileAuthorizationKnown() then return end
 
     self._reconcilingSessionAuthorization = true
-    self:_DropUnauthorizedAdminStatuses()
+    -- Log replay recomputes _adminUsers before this runs. Peers can disappear
+    -- from that list while their ADMIN_STATUS windows are still the evidence
+    -- that identity-admin reconcile must wait on. Only an explicit admin
+    -- change should discard that evidence.
+    local reasonText = tostring(reason or "")
+    if reasonText:sub(1, 8) ~= "rebuild:" then
+        self:_DropUnauthorizedAdminStatuses()
+    end
 
     local changed = false
     if self.ApplyAdvertisedHelpers then

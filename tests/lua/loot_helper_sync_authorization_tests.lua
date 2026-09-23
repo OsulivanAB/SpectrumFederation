@@ -675,6 +675,17 @@ local providers = Sync:_ProvidersAdvertisingAuthorMax(MEMBER, 1, 9)
 assertTrue(not listHas(providers, SUSPENDERS), "revoked admin is not selected as a provider")
 assertTrue(listHas(providers, KINO), "remaining admin can still be selected")
 
+reset(COORD)
+Sync.state.isCoordinator = true
+Sync.state.helpers = { KINO }
+Sync.state.adminStatuses = {
+    [SUSPENDERS] = { authorMax = { [MEMBER] = 9 } },
+}
+setAdmins({ COORD, KINO, OWNER })
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:auth_logs")
+assertTrue(type(Sync.state.adminStatuses[SUSPENDERS]) == "table",
+    "log rebuild keeps advertiser status for identity reconcile")
+
 -- Reload must not resume coordination from a stale persisted coordinator.
 reset(COORD)
 Sync.state.isCoordinator = true
