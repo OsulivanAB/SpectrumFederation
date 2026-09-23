@@ -593,14 +593,14 @@ function Sync:HandleNewLog(sender, payload)
         needsRebuild = not Identity.CanFanOutBalance(eventType)
     end
     if needsRebuild then
-        local rebuildReason = "live_update"
-        local removedType = SF.LootLogEventTypes and SF.LootLogEventTypes.ADMIN_REMOVED
-        if removedType and eventType == removedType then
-            rebuildReason = "live_admin_removed"
-        end
-        self:RebuildProfile(profileId, rebuildReason)
+        -- Stay on live_update so a gapped removal does not schedule identity
+        -- reconcile or purge every advertiser missing from the replayed admin list.
+        self:RebuildProfile(profileId, "live_update")
     elseif SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
         SF.LootHelperEvents:NotifyDataChanged("SYNC:LIVE", { profileId = profileId })
+    end
+    if types.ADMIN_REMOVED and eventType == types.ADMIN_REMOVED and self._DropNamedAdminStatus then
+        self:_DropNamedAdminStatus(memberId)
     end
     self:FlushPendingLiveRelationshipLogs(profileId)
     self:LogSessionPointsSummary(profileId, "live_update")

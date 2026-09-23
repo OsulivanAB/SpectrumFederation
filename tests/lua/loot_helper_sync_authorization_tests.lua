@@ -714,9 +714,10 @@ assertTrue(type(Sync.state.adminStatuses[SUSPENDERS]) == "table",
 Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_update")
 assertTrue(type(Sync.state.adminStatuses[SUSPENDERS]) == "table",
     "ordinary live rebuild keeps advertiser status")
-Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_admin_removed")
-assertNil(Sync.state.adminStatuses[SUSPENDERS],
-    "live ADMIN_REMOVED rebuild drops the revoked admin status")
+Sync.state.adminStatuses[KINO] = { authorMax = { [MEMBER] = 4 } }
+Sync:_DropNamedAdminStatus(SUSPENDERS)
+assertNil(Sync.state.adminStatuses[SUSPENDERS], "live ADMIN_REMOVED drops only the named player")
+assertTrue(type(Sync.state.adminStatuses[KINO]) == "table", "other advertiser status survives a live removal")
 
 -- Reload must not resume coordination from a stale persisted coordinator.
 reset(COORD)

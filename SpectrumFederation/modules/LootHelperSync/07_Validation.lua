@@ -475,6 +475,26 @@ function Sync:_DropUnauthorizedAdminStatuses()
     end
 end
 
+-- Function Drop one player's convergence evidence without touching other advertisers.
+-- Used when a live ADMIN_REMOVED names that player. A gapped rebuild must not
+-- discard every status that the recomputed admin list does not yet contain.
+-- @param name string "Name-Realm"
+-- @return nil
+function Sync:_DropNamedAdminStatus(name)
+    if type(name) ~= "string" or name == "" then return end
+    local statuses = self.state and self.state.adminStatuses
+    if type(statuses) ~= "table" then return end
+    local drop = {}
+    for key, _ in pairs(statuses) do
+        if type(key) == "string" and self:_SamePlayer(key, name) then
+            drop[#drop + 1] = key
+        end
+    end
+    for i = 1, #drop do
+        statuses[drop[i]] = nil
+    end
+end
+
 -- Function Reconcile helper routing, outstanding requests, and coordination with canonical admins.
 -- @param profileId string
 -- @param reason string|nil
@@ -487,14 +507,13 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if not self:_ProfileAuthorizationKnown() then return end
 
     self._reconcilingSessionAuthorization = true
-    -- History replay recomputes _adminUsers before this runs. Peers can
-    -- disappear from that list while their ADMIN_STATUS windows are still the
-    -- evidence that identity-admin reconcile must wait on. A live ADMIN_REMOVED
-    -- is an explicit revocation, so that rebuild still drops the revoked entry.
+    -- History replay, including a live NEW_LOG rebuild, recomputes _adminUsers
+    -- before this runs. Peers can disappear from that incomplete list while
+    -- their ADMIN_STATUS windows are still the evidence that identity-admin
+    -- reconcile must wait on. An explicit admin-list change still drops every
+    -- revoked entry. A single live ADMIN_REMOVED drops only that player.
     local reasonText = tostring(reason or "")
-    local isHistoryReplay = reasonText:sub(1, 8) == "rebuild:"
-        and reasonText ~= "rebuild:live_admin_removed"
-    if not isHistoryReplay then
+    if reasonText:sub(1, 8) ~= "rebuild:" then
         self:_DropUnauthorizedAdminStatuses()
     end
 
