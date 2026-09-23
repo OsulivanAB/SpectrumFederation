@@ -1688,6 +1688,9 @@ function Sync:MergeLogs(profileId, logs, opts)
     opts.allowUnknownEventType = true
 
     local inserted, details = profile:MergeLogTables(logs, opts)
+    if profile.ReconcileInsertedRCAwards and type(details) == "table" then
+        profile:ReconcileInsertedRCAwards(details.insertedRcAwardKeys)
+    end
     return inserted and inserted > 0, details or { inserted = inserted or 0, replaced = 0, mismatchCount = 0, mismatches = {} }
 end
 

@@ -23,14 +23,17 @@ The log includes:
 - character links and unlinks;
 - historical Main Swap consolidations;
 - persistent specialization changes;
-- automatic BiS outcomes (assigned, overflow, unresolved, or not BiS);
+- automatic BiS outcomes that need attention (assigned, overflow, or unresolved). A frozen not-BiS result is kept for reconstruction and omitted from this list;
 - Gear Override assign, clear, replace, and legacy association;
 - manual loot additions and reversals;
-- RC Loot Council awards, when the optional integration child addon is enabled and an active Spectrum session records them.
+- RC Loot Council awards, when the optional integration child addon is enabled and an active Spectrum session records them;
+- bonus rolls that RC Loot Council reports in its history. Those rows are Bonus Roll, not RC Loot Council awards.
 
 Each row shows the date, change type, affected member when applicable, a readable action, and the author.
 
-RC Loot Council rows use the loot recipient as the member, `[Item Link] (Response)` as the action (hover the link for the item tooltip), and the RC master looter as the author. The original RC response label is stored with the entry. These rows use an external identity and do not participate in the ordinary sequential author-and-counter repair ranges.
+RC Loot Council rows use the loot recipient as the member, `[Item Link] (Response)` as the action (hover the link for the item tooltip), and the RC master looter as the author. The original RC response label is stored with the entry. These rows use an external identity and do not participate in the ordinary sequential author-and-counter repair ranges. Several admins can observe the same award; Spectrum keeps one RC row. The session coordinator writes one automatic BiS outcome for that award. If the outcome is not BiS, it is stored and hidden here.
+
+Bonus Roll rows use the recipient as the member and the item link as the action. They use their own external identity, so several observers still produce one row, and they do not create an RC Loot Council row or a BiS outcome.
 
 Reward Pot amounts appear as gold, silver, and copper. A percent Raid Check deduction is stored as the gold amount calculated when the check ran.
 

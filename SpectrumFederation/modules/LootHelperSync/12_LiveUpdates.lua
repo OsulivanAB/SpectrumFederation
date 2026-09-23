@@ -583,6 +583,9 @@ function Sync:HandleNewLog(sender, payload)
     if not inserted then
         return
     end
+    if eventType == types.RC_LOOT_COUNCIL and profile._MaybeWriteAutomaticBisOutcome then
+        profile:_MaybeWriteAutomaticBisOutcome(lootLog)
+    end
 
     local Identity = SF.LootHelperIdentity
     local needsRebuild = true

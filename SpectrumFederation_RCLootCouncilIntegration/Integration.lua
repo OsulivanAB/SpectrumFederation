@@ -423,6 +423,39 @@ function Integration.WarnNonMember(canonical, profile)
     return false
 end
 
+function Integration.ProcessBonusRoll(canonical, source)
+    if type(canonical) ~= "table" then
+        return "invalid"
+    end
+    if not Integration.IsSpectrumSessionActive() then
+        return "no_session"
+    end
+    if Integration.WasSeen(canonical.awardKey) then
+        return "seen"
+    end
+
+    local profile, profileErr = Integration.GetSessionProfile()
+    if not profile then
+        return profileErr or "no_profile"
+    end
+
+    local member = profile.getMemberByID and profile:getMemberByID(canonical.winner)
+    if not member then
+        Integration.WarnNonMember(canonical, profile)
+        Integration.MarkSeen(canonical.awardKey)
+        return "not_member"
+    end
+
+    local ok, err = profile.TryAddBonusRoll and profile:TryAddBonusRoll(canonical)
+    Integration.MarkSeen(canonical.awardKey)
+    if ok then
+        DebugInfo("Recorded bonus roll %s from %s", tostring(canonical.awardKey), tostring(source))
+        return "recorded"
+    end
+    DebugInfo("Skipped bonus roll %s from %s (%s)", tostring(canonical.awardKey), tostring(source), tostring(err))
+    return err or "skipped"
+end
+
 function Integration.ProcessCanonicalAward(canonical, source)
     if type(canonical) ~= "table" then
         return "invalid"
@@ -463,6 +496,16 @@ function Integration.HandleHistory(awarder, winner, history, source)
     local SF = ParentAddon()
     if not (SF and SF.LootLog and SF.LootLog.BuildRCLootCouncilCanonical) then
         return "unavailable"
+    end
+    if SF.LootLog.IsBonusRollHistory and SF.LootLog.IsBonusRollHistory(history) then
+        if not SF.LootLog.BuildBonusRollCanonical then
+            return "unavailable"
+        end
+        local bonus = SF.LootLog.BuildBonusRollCanonical(awarder, winner, history)
+        if not bonus then
+            return "invalid"
+        end
+        return Integration.ProcessBonusRoll(bonus, source or "history")
     end
     local canonical = SF.LootLog.BuildRCLootCouncilCanonical(awarder, winner, history)
     if not canonical then

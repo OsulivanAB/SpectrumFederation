@@ -16,7 +16,9 @@ Recording requires all of the following:
 
 The locally selected Loot Helper profile is not used for live recording. If the session `profileId` cannot be resolved locally, the award is ignored rather than written to another profile.
 
-The Loot Log **Author** is the RC master looter who awarded the item. The Spectrum writer must still be an admin of the session profile. Any eligible Spectrum admin may create the log; there is no coordinator-only writer restriction.
+The Loot Log **Author** is the RC master looter who awarded the item. The Spectrum writer must still be an admin of the session profile. Any eligible Spectrum admin may create the canonical `RC_LOOT_COUNCIL` row. Those rows converge through the deterministic external id, so several observers still produce one award.
+
+Automatic Spectrum-derived `BIS_OUTCOME` rows are different. During an active Loot Helper session, only the session coordinator appends one. Other admins store the canonical RC award and do not write an outcome of their own. If another admin observes the award first, the coordinator writes the outcome once that RC row arrives through normal sync. Before writing, the coordinator checks for an existing source-consistent outcome for the same `awardKey`, so coordinator takeover does not add a second row. Outside an active session, the recording admin remains the writer.
 
 If the winner is not a member of the session profile, no Loot Log is created. Admins of the session profile see a local warning only. Replay and reload do not repeat that warning for the same award in the same session.
 
@@ -56,6 +58,18 @@ Recorded awards use type `RC_LOOT_COUNCIL`:
 - **Author** — RC master looter / awarder
 - persisted audit fields include the original RC response, `history.id`, and the deterministic award key
 
+RCLC history with `responseID == "BONUS_ROLL"` is not an RC award. It is recorded as `BONUS_ROLL` instead:
+
+- **Type of Change** — Bonus Roll
+- **Member** — loot recipient
+- **Action** — `[Item Link]` (hoverable and clickable in Loot Logs)
+- **Author** — the history awarder, so every observer stores the same row
+- persisted fields include the recipient, item link, item string, history id, and deterministic bonus-roll key
+
+A bonus roll does not create an `RC_LOOT_COUNCIL` row and does not run automatic BiS evaluation. Classification uses the RCLC `responseID` field, not the displayed response text.
+
+`NOT_BIS` is still stored once per award when reconstruction needs a frozen non-BiS decision. Loot Logs hides that row. `ASSIGNED`, `OVERFLOW`, and `UNRESOLVED` stay visible. Older duplicate `BIS_OUTCOME` rows are left in saved history; the log view shows only the first source-consistent outcome for that `awardKey`, and hides it when that outcome is `NOT_BIS`.
+
 ## Award identity
 
 The primary finalized RC signal is the RC `history` payload. RCLootCouncil2 serializes `command` plus one `data` table (`Serialize(command, data)`). For `Send(..., "history", winner, history_table)` that is `command = "history"` and `data = { winner, history_table }`. Cross-realm wraps that as `command = "xrealm"` and `data = { target, "history", winner, history_table }`; Spectrum unwraps the inner command only when the target is the local player.
@@ -66,13 +80,17 @@ Identity is derived from finalized history data available to every observer:
 
 `RCLootCouncil|<normalizedAwarder>|<history.id>|<normalizedWinner>|<itemString>|<normalizedOwner or "">`
 
+Bonus rolls use the same history fields with a distinct prefix:
+
+`BonusRoll|<normalizedAwarder>|<history.id>|<normalizedWinner>|<itemString>|<normalizedOwner or "">`
+
 The human-readable response label is audit data only and is not part of the key. Spectrum ignores RC `delete_history`; a new `history.id` is a new Spectrum event.
 
 ## Sync isolation
 
-External IDs and sentinel counter `0` are a narrow `RC_LOOT_COUNCIL` exception. Ordinary event types must keep `_id == author:counter` with a positive sequential counter and must not carry `_externalId`.
+External IDs and sentinel counter `0` are a narrow exception for `RC_LOOT_COUNCIL` and `BONUS_ROLL`. Ordinary event types, including `BIS_OUTCOME`, must keep `_id == author:counter` with a positive sequential counter and must not carry `_externalId`.
 
-Valid RC external rows require all of:
+Valid RC and Bonus Roll external rows require all of:
 
 - `_externalId` is the canonical award key
 - `_id` equals `_externalId`
@@ -104,4 +122,4 @@ Repeated RC traffic for the same player, item, and response is deduplicated. `se
 
 `history` and `change_response` stay Master-Looter-authoritative. Their payloads are inflated only when the AceComm sender is the current Master Looter. A direct candidate `response` is a whisper to that Master Looter from a member of the session profile; only the Master Looter client inflates it, and only a `response` command is handled afterward. Group or guild traffic from anyone else is rejected before decode. A Master Looter group forward is accepted because that sender is the Master Looter, and the named candidate must still match the live session. Payload size and decode limits are unchanged.
 
-On `RCMLAwardSuccess`, the Master Looter client may show an informational popup if the awarded response was BiS-qualified and the opportunity was already consumed before that award. The popup does not cancel the award or change BiS tracking. A win is not compared against the occupancy created by that same award. Other clients do not show the popup. The existing `history` path remains the only writer of `RC_LOOT_COUNCIL` and automatic `BIS_OUTCOME` rows.
+On `RCMLAwardSuccess`, the Master Looter client may show an informational popup if the awarded response was BiS-qualified and the opportunity was already consumed before that award. The popup does not cancel the award or change BiS tracking. A win is not compared against the occupancy created by that same award. Other clients do not show the popup. The existing `history` path remains the only writer of `RC_LOOT_COUNCIL` rows and, on the active session coordinator, of automatic `BIS_OUTCOME` rows. Bonus-roll history is classified before that path and never becomes either row.

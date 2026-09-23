@@ -164,6 +164,22 @@ function Sync:IsSessionActive()
     return self.state and self.state.active == true
 end
 
+-- Award-qualification checks evaluate the automatic outcome on a profile.
+-- An active session otherwise reserves that write for the coordinator, so
+-- these comparisons temporarily take the writer role and then restore it.
+function runAsAutomaticBisWriter(fn)
+    local state = Sync.state
+    local previous = state and state.isCoordinator
+    if state then
+        state.isCoordinator = true
+    end
+    local ok, err = fn()
+    if state then
+        state.isCoordinator = previous
+    end
+    return ok, err
+end
+
 function Sync:GetSessionProfileId()
     return self:IsSessionActive() and self.state.profileId or nil
 end
@@ -2400,16 +2416,40 @@ local function testExistingProfileReconnectCatchesUpRCConfig()
     SF.lootHelperDB.activeProfileId = follower:GetProfileId()
     SF.lootHelperDB.activeProfile = follower
     assertTrue(follower:TryAddRCLootCouncilAward(greedCanon), "Admin B records a Greed award after catch-up")
+    local followerOutcomes = 0
+    local followerRc
+    for _, log in ipairs(follower:GetLootLogs() or {}) do
+        local data = log:GetEventData()
+        if log:GetEventType() == "BIS_OUTCOME" and data and data.awardKey == greedCanon.awardKey then
+            followerOutcomes = followerOutcomes + 1
+        elseif log:GetEventType() == "RC_LOOT_COUNCIL" and data and data.awardKey == greedCanon.awardKey then
+            followerRc = log
+        end
+    end
+    assertEq(followerOutcomes, 0, "non-coordinator does not write the automatic BIS_OUTCOME")
+    assertTrue(followerRc ~= nil, "Admin B stored the canonical RC award")
+    PLAYER = "Tester-Garona"
+    SF.lootHelperDB.profiles[coord:GetProfileId()] = coord
+    SF.lootHelperDB.activeProfileId = coord:GetProfileId()
+    SF.lootHelperDB.activeProfile = coord
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = "Tester-Garona"
+    local delivered = SF.LootLog.FromTable(followerRc:ToTable())
+    assertTrue(coord:AddLootLog(delivered, { skipPermission = true, skipBroadcast = true }), "coordinator receives the RC award through sync")
+    coord:_MaybeWriteAutomaticBisOutcome(delivered)
     local qualified
     local outcome
-    for _, log in ipairs(follower:GetLootLogs() or {}) do
+    local coordOutcomes = 0
+    for _, log in ipairs(coord:GetLootLogs() or {}) do
         local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
         if data and data.awardKey == greedCanon.awardKey then
             qualified = data.qualified
             outcome = data.outcome
+            coordOutcomes = coordOutcomes + 1
         end
     end
-    assertEq(qualified, true, "Greed is qualified BiS on Admin B after reconnect catch-up")
+    assertEq(coordOutcomes, 1, "coordinator writes one automatic BIS_OUTCOME")
+    assertEq(qualified, true, "Greed is qualified BiS after reconnect catch-up")
     assertTrue(outcome ~= "NOT_BIS", "caught-up Greed is not recorded as NOT_BIS")
     PLAYER = "Tester-Garona"
 
@@ -2694,8 +2734,12 @@ local function testOutOfSessionRCConfigBecomesSessionAuthoritative()
         responseID = 2,
         isAwardReason = false,
     }))
-    assertTrue(coord:TryAddRCLootCouncilAward(laterGreed), "coordinator records later Greed")
-    assertTrue(follower:TryAddRCLootCouncilAward(laterGreed), "follower records later Greed after catch-up")
+    assertTrue(runAsAutomaticBisWriter(function()
+        return coord:TryAddRCLootCouncilAward(laterGreed)
+    end), "coordinator records later Greed")
+    assertTrue(runAsAutomaticBisWriter(function()
+        return follower:TryAddRCLootCouncilAward(laterGreed)
+    end), "follower records later Greed after catch-up")
     local function lastGreedOutcome(profile)
         for _, log in ipairs(profile:GetLootLogs() or {}) do
             local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
@@ -3013,10 +3057,14 @@ local function testSessionStartRCAuthorityAndFanout()
     }))
     PLAYER = ADMIN_B
     SF.lootHelperDB.profiles[staleB:GetProfileId()] = staleB
-    assertTrue(staleB:TryAddRCLootCouncilAward(laterGreed), "stale starter records later Greed after adopting")
+    assertTrue(runAsAutomaticBisWriter(function()
+        return staleB:TryAddRCLootCouncilAward(laterGreed)
+    end), "stale starter records later Greed after adopting")
     PLAYER = "Tester-Garona"
     SF.lootHelperDB.profiles[coordA:GetProfileId()] = coordA
-    assertTrue(coordA:TryAddRCLootCouncilAward(laterGreed), "Admin A still records later Greed")
+    assertTrue(runAsAutomaticBisWriter(function()
+        return coordA:TryAddRCLootCouncilAward(laterGreed)
+    end), "Admin A still records later Greed")
     local _, laterQualA = lastGreedOutcome(coordA, laterGreed.awardKey)
     local _, laterQualB = lastGreedOutcome(staleB, laterGreed.awardKey)
     assertEq(laterQualA, true, "Admin A qualifies later Greed")
@@ -3616,10 +3664,14 @@ local function testRCGenerationIdentityUniqueness()
     }))
     PLAYER = "Tester-Garona"
     SF.lootHelperDB.profiles[replayCoord:GetProfileId()] = replayCoord
-    assertTrue(replayCoord:TryAddRCLootCouncilAward(replayAward), "coordinator records replay Greed")
+    assertTrue(runAsAutomaticBisWriter(function()
+        return replayCoord:TryAddRCLootCouncilAward(replayAward)
+    end), "coordinator records replay Greed")
     PLAYER = ADMIN_B
     SF.lootHelperDB.profiles[replayB:GetProfileId()] = replayB
-    assertTrue(replayB:TryAddRCLootCouncilAward(replayAward), "follower records replay Greed")
+    assertTrue(runAsAutomaticBisWriter(function()
+        return replayB:TryAddRCLootCouncilAward(replayAward)
+    end), "follower records replay Greed")
     local _, replayQualA = lastGreedOutcome(replayCoord, replayAward.awardKey)
     local _, replayQualB = lastGreedOutcome(replayB, replayAward.awardKey)
     assertEq(replayQualA, true, "coordinator qualifies replay Greed")
@@ -4331,8 +4383,12 @@ function testTakeoverRCAuthorityWithoutPostEdit()
             response = "Greed",
             responseID = 2,
         }))
-        local okA = a:TryAddRCLootCouncilAward(canon)
-        local okB = b:TryAddRCLootCouncilAward(canon)
+        local okA = runAsAutomaticBisWriter(function()
+            return a:TryAddRCLootCouncilAward(canon)
+        end)
+        local okB = runAsAutomaticBisWriter(function()
+            return b:TryAddRCLootCouncilAward(canon)
+        end)
         assertEq(okB, okA, awardKeySuffix .. " recording decision matches")
         local outcomeA, qualA = lastGreedOutcome(a, canon.awardKey)
         local outcomeB, qualB = lastGreedOutcome(b, canon.awardKey)
@@ -5187,6 +5243,381 @@ function testDoubleBisRollProtection()
     assertEq(warningCount("selected"), 0, "unresolved button text does not warn")
 end
 testDoubleBisRollProtection()
+
+-- ---------------------------------------------------------------------------
+-- Single coordinator BiS writer, hidden NOT_BIS, and bonus rolls
+-- ---------------------------------------------------------------------------
+function countLootEvents(profile, eventType, awardKey)
+    local count = 0
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        if log:GetEventType() == eventType then
+            local data = log:GetEventData() or {}
+            if awardKey == nil or data.awardKey == awardKey then
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+
+function visibleLootEvents(profile, eventType, awardKey)
+    local hidden = profile:HiddenLootLogIds()
+    local count = 0
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        if log:GetEventType() == eventType and not hidden[log:GetID()] then
+            local data = log:GetEventData() or {}
+            if awardKey == nil or data.awardKey == awardKey then
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+
+function outcomeForAward(profile, awardKey)
+    for _, log in ipairs(profile:GetLootLogs() or {}) do
+        local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+        if data and data.awardKey == awardKey then
+            return data.outcome, log
+        end
+    end
+    return nil, nil
+end
+
+function deliverLootLog(profile, log)
+    local copy = SF.LootLog.FromTable(log:ToTable())
+    local ok = profile:AddLootLog(copy, { skipPermission = true, skipBroadcast = true })
+    if ok and copy:GetEventType() == "RC_LOOT_COUNCIL" and profile._MaybeWriteAutomaticBisOutcome then
+        profile:_MaybeWriteAutomaticBisOutcome(copy)
+    end
+    return ok
+end
+
+function GetItemInfoInstant(link)
+    local text = tostring(link or "")
+    local id = text:match("item:(%d+)")
+    if id == "19001" then
+        return 19001, "Armor", "Plate", "INVTYPE_HEAD", 134400, 4, 4
+    end
+    return nil
+end
+
+function testSingleWriterAndBonusRolls()
+    local HEAD_LINK = "|cffa335ee|Hitem:19001::::::::80:71:::::::::|h[Test Helm]|h|r"
+    local owners = {
+        "AdminA-Garona",
+        "AdminB-Garona",
+        "AdminC-Garona",
+        "AdminD-Garona",
+    }
+
+    local function newSession(label)
+        resetEnv()
+        PLAYER = owners[1]
+        local coord = makeProfile(label)
+        addMember(coord, WINNER)
+        for i = 2, #owners do
+            addMember(coord, owners[i])
+            assertTrue(coord:AddAdminMemberId(owners[i], { skipPermission = true, skipBroadcast = true }), label .. " adds " .. owners[i])
+        end
+        setActive(coord)
+        startSessionOn(coord)
+        Sync.state.coordinator = owners[1]
+        Sync.state.isCoordinator = false
+        local peers = { coord }
+        for i = 2, #owners do
+            peers[i] = cloneProfileAs(label .. " " .. tostring(i), coord)
+        end
+        return coord, peers
+    end
+
+    local function observe(profile, owner, canonical, asCoordinator)
+        local previous = PLAYER
+        PLAYER = owner
+        Sync.state.isCoordinator = asCoordinator == true
+        Sync.state.coordinator = owners[1]
+        local ok, err = profile:TryAddRCLootCouncilAward(canonical)
+        PLAYER = previous
+        return ok, err
+    end
+
+    -- Four admins, non-BiS. Only the coordinator persists one hidden NOT_BIS.
+    local coord, peers = newSession("NotBis")
+    local notBisCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006100-1",
+        response = "Greed",
+        responseID = 2,
+    }))
+    for i = 2, 4 do
+        local ok, err = observe(peers[i], owners[i], notBisCanon, false)
+        assertTrue(ok, "admin " .. tostring(i) .. " records the non-BiS RC award (" .. tostring(err) .. ")")
+        assertEq(countLootEvents(peers[i], "RC_LOOT_COUNCIL", notBisCanon.awardKey), 1, "observer stores one RC row")
+        assertEq(countLootEvents(peers[i], "BIS_OUTCOME", notBisCanon.awardKey), 0, "observer does not write BIS_OUTCOME")
+    end
+    PLAYER = owners[1]
+    Sync.state.isCoordinator = true
+    local peerRc
+    for _, log in ipairs(peers[2]:GetLootLogs() or {}) do
+        if log:GetEventType() == "RC_LOOT_COUNCIL" and log:GetEventData().awardKey == notBisCanon.awardKey then
+            peerRc = log
+        end
+    end
+    assertTrue(deliverLootLog(coord, peerRc), "coordinator receives the RC award through sync")
+    assertEq(countLootEvents(coord, "RC_LOOT_COUNCIL", notBisCanon.awardKey), 1, "coordinator stores one RC row")
+    assertEq(countLootEvents(coord, "BIS_OUTCOME", notBisCanon.awardKey), 1, "coordinator stores one NOT_BIS outcome")
+    assertEq(outcomeForAward(coord, notBisCanon.awardKey), "NOT_BIS", "automatic non-BiS outcome is NOT_BIS")
+    assertEq(visibleLootEvents(coord, "BIS_OUTCOME", notBisCanon.awardKey), 0, "NOT_BIS is hidden in Loot Logs")
+    local beforeLogs = #(coord:GetLootLogs() or {})
+    assertEq(coord:ReconcileInsertedRCAwards({ notBisCanon.awardKey }), 0, "reconcile does not append a second outcome")
+    assertEq(#(coord:GetLootLogs() or {}), beforeLogs, "reconcile leaves historical rows untouched")
+
+    -- Failover reprocess keeps the original outcome.
+    local successor = cloneProfileAs("NotBis Successor", coord)
+    PLAYER = owners[2]
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = owners[2]
+    assertEq(select(2, successor:TryAddRCLootCouncilAward(notBisCanon)), "duplicate", "successor does not create a second RC row")
+    local rcLog
+    for _, log in ipairs(successor:GetLootLogs() or {}) do
+        if log:GetEventType() == "RC_LOOT_COUNCIL" then
+            rcLog = log
+        end
+    end
+    assertEq(select(2, successor:ApplyRCAutoBisOutcome(rcLog, notBisCanon)), "outcome_exists", "takeover does not append another outcome")
+    assertEq(countLootEvents(successor, "BIS_OUTCOME", notBisCanon.awardKey), 1, "failover keeps one BIS_OUTCOME")
+
+    -- BiS award: coordinator differs from the RC master looter and writes one ASSIGNED row.
+    coord, peers = newSession("BisAward")
+    Sync.state.isCoordinator = true
+    assertTrue(coord:ApplyRCLootCouncilIntegrationConfig({
+        recordAwards = true,
+        recordAllAwardTypes = true,
+        allowedResponses = {},
+        bisResponses = {
+            { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+        },
+    }, { skipPermission = true, skipSync = true }), "Need qualifies as BiS")
+    for i = 2, 4 do
+        peers[i] = cloneProfileAs("BisAward " .. tostring(i), coord)
+    end
+    local bisCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006200-2",
+        response = "Need",
+        responseID = 1,
+        lootWon = HEAD_LINK,
+        equipLoc = "INVTYPE_HEAD",
+    }))
+    for i = 2, 4 do
+        assertTrue(observe(peers[i], owners[i], bisCanon, false), "admin " .. tostring(i) .. " records the BiS RC award")
+        assertEq(countLootEvents(peers[i], "BIS_OUTCOME", bisCanon.awardKey), 0, "non-coordinator skips the BiS outcome")
+    end
+    PLAYER = owners[1]
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = owners[1]
+    peerRc = nil
+    for _, log in ipairs(peers[4]:GetLootLogs() or {}) do
+        if log:GetEventType() == "RC_LOOT_COUNCIL" and log:GetEventData().awardKey == bisCanon.awardKey then
+            peerRc = log
+        end
+    end
+    assertTrue(deliverLootLog(coord, peerRc), "coordinator derives the BiS outcome from the synced RC award")
+    assertEq(countLootEvents(coord, "RC_LOOT_COUNCIL", bisCanon.awardKey), 1, "one RC row for the BiS award")
+    assertEq(countLootEvents(coord, "BIS_OUTCOME", bisCanon.awardKey), 1, "one BIS_OUTCOME for the BiS award")
+    local bisOutcome, bisLog = outcomeForAward(coord, bisCanon.awardKey)
+    assertEq(bisOutcome, "ASSIGNED", "coordinator assigns the BiS item")
+    assertTrue(bisLog:GetAuthor() ~= AWARDER, "BiS outcome author is the Spectrum coordinator, not the RC master looter")
+    assertEq(visibleLootEvents(coord, "BIS_OUTCOME", bisCanon.awardKey), 1, "ASSIGNED stays visible")
+
+    local overflowCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006201-3",
+        response = "Need",
+        responseID = 1,
+        lootWon = HEAD_LINK,
+        equipLoc = "INVTYPE_HEAD",
+    }))
+    assertTrue(observe(coord, owners[1], overflowCanon, true), "coordinator records the overflow helm")
+    assertEq(outcomeForAward(coord, overflowCanon.awardKey), "OVERFLOW", "second helm is overflow")
+    assertEq(visibleLootEvents(coord, "BIS_OUTCOME", overflowCanon.awardKey), 1, "OVERFLOW stays visible")
+
+    local unknownCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006202-4",
+        response = "Need",
+        responseID = 1,
+        lootWon = "|cffa335ee|Hitem:99999::::::::80:71:::::::::|h[Unknown]|h|r",
+    }))
+    assertTrue(observe(coord, owners[1], unknownCanon, true), "coordinator records the unresolved item")
+    assertEq(outcomeForAward(coord, unknownCanon.awardKey), "UNRESOLVED", "unknown item is unresolved")
+    assertEq(visibleLootEvents(coord, "BIS_OUTCOME", unknownCanon.awardKey), 1, "UNRESOLVED stays visible")
+
+    -- Legacy duplicate rows stay stored and collapse in the log view.
+    resetEnv()
+    PLAYER = owners[1]
+    local legacy = makeProfile("Legacy Dupes")
+    addMember(legacy, WINNER)
+    setActive(legacy)
+    startSessionOn(legacy)
+    Sync.state.isCoordinator = false
+    local legacyCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006300-5",
+        response = "Greed",
+    }))
+    local legacyRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(legacyCanon), {
+        profile = legacy,
+        author = AWARDER,
+        timestamp = legacyCanon.timestamp,
+        externalId = legacyCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(legacy:AddLootLog(legacyRc, { skipPermission = true, skipBroadcast = true }), "legacy RC row is stored")
+    assertEq(countLootEvents(legacy, "BIS_OUTCOME", legacyCanon.awardKey), 0, "non-coordinator import does not invent an outcome")
+    local itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+    for i = 1, 3 do
+        local eventData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+        eventData.sourceLogId = legacyCanon.awardKey
+        eventData.awardKey = legacyCanon.awardKey
+        eventData.awardMember = WINNER
+        eventData.qualified = false
+        eventData.outcome = "NOT_BIS"
+        eventData.assignedSlots = {}
+        eventData.itemLink = ITEM_LINK
+        eventData.itemString = itemString
+        eventData.response = "Greed"
+        local row = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, eventData, {
+            profile = legacy,
+            author = owners[i],
+            timestamp = legacyCanon.timestamp + i,
+            skipPermission = true,
+        })
+        assertTrue(row ~= nil, "legacy NOT_BIS row " .. tostring(i) .. " is valid")
+        assertTrue(legacy:AddLootLog(row, { skipPermission = true, skipBroadcast = true }), "legacy NOT_BIS row is retained")
+    end
+    local stored = #(legacy:GetLootLogs() or {})
+    assertEq(countLootEvents(legacy, "BIS_OUTCOME", legacyCanon.awardKey), 3, "historical duplicate NOT_BIS rows remain stored")
+    assertEq(visibleLootEvents(legacy, "BIS_OUTCOME", legacyCanon.awardKey), 0, "historical NOT_BIS rows are all hidden")
+    assertEq(#(legacy:GetLootLogs() or {}), stored, "visibility filtering does not delete logs")
+
+    local assignedCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006301-6",
+        response = "Need",
+        lootWon = HEAD_LINK,
+        equipLoc = "INVTYPE_HEAD",
+    }))
+    local assignedRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(assignedCanon), {
+        profile = legacy,
+        author = AWARDER,
+        timestamp = assignedCanon.timestamp,
+        externalId = assignedCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(legacy:AddLootLog(assignedRc, { skipPermission = true, skipBroadcast = true }), "legacy assigned RC row is stored")
+    for i = 1, 2 do
+        local eventData = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+        eventData.sourceLogId = assignedCanon.awardKey
+        eventData.awardKey = assignedCanon.awardKey
+        eventData.awardMember = WINNER
+        eventData.qualified = true
+        eventData.outcome = "ASSIGNED"
+        eventData.assignedSlots = { "Head" }
+        eventData.slotBinding = "BOUND"
+        eventData.assignmentScopeMembers = { WINNER }
+        eventData.equipLoc = "INVTYPE_HEAD"
+        eventData.itemFamily = "ordinary"
+        eventData.itemLink = HEAD_LINK
+        eventData.itemString = SF.LootLog.ExtractItemString(HEAD_LINK)
+        eventData.response = "Need"
+        local row = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, eventData, {
+            profile = legacy,
+            author = owners[i],
+            timestamp = assignedCanon.timestamp + i,
+            skipPermission = true,
+        })
+        assertTrue(row ~= nil, "legacy ASSIGNED row " .. tostring(i) .. " is valid")
+        assertTrue(legacy:AddLootLog(row, { skipPermission = true, skipBroadcast = true }), "legacy ASSIGNED row is retained")
+    end
+    assertEq(countLootEvents(legacy, "BIS_OUTCOME", assignedCanon.awardKey), 2, "historical ASSIGNED duplicates remain stored")
+    assertEq(visibleLootEvents(legacy, "BIS_OUTCOME", assignedCanon.awardKey), 1, "Loot Logs shows one authoritative ASSIGNED row")
+
+    -- Bonus rolls are their own external event and do not enter the RC/BiS path.
+    coord, peers = newSession("Bonus")
+    local bonusHistory = historyTable({
+        id = "1700006400-7",
+        response = "Bonus Loot",
+        responseID = "BONUS_ROLL",
+        lootWon = HEAD_LINK,
+    })
+    local bonusCanon = SF.LootLog.BuildBonusRollCanonical(AWARDER, WINNER, bonusHistory)
+    assertTrue(bonusCanon ~= nil, "bonus roll canonical identity is built from responseID")
+    assertTrue(string.sub(bonusCanon.awardKey, 1, 9) == "BonusRoll", "bonus roll key is distinct from RC awards")
+    assertTrue(SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, bonusHistory) ~= nil, "response text alone would still look like an RC award")
+    PLAYER = owners[1]
+    SF.lootHelperDB.profiles[coord:GetProfileId()] = coord
+    Sync.state.isCoordinator = true
+    assertEq(Integration.HandleHistory(AWARDER, WINNER, bonusHistory, "test"), "recorded", "history responseID BONUS_ROLL is recorded")
+    assertEq(countLootEvents(coord, "BONUS_ROLL", bonusCanon.awardKey), 1, "one BONUS_ROLL row")
+    assertEq(countLootEvents(coord, "RC_LOOT_COUNCIL", nil), 0, "bonus roll does not create RC_LOOT_COUNCIL")
+    assertEq(countLootEvents(coord, "BIS_OUTCOME", nil), 0, "bonus roll does not create BIS_OUTCOME")
+    assertEq(Integration.HandleHistory(AWARDER, WINNER, bonusHistory, "test"), "seen", "repeat bonus roll observation is ignored")
+    local awarderMax = coord:ComputeAuthorMax()
+    assertEq(awarderMax[AWARDER], nil, "bonus roll does not advance the awarder counter")
+    for i = 2, 4 do
+        PLAYER = owners[i]
+        local ok, err = peers[i]:TryAddBonusRoll(bonusCanon)
+        assertTrue(ok, "admin " .. tostring(i) .. " records the same bonus roll (" .. tostring(err) .. ")")
+        assertEq(countLootEvents(peers[i], "BONUS_ROLL", bonusCanon.awardKey), 1, "each observer stores one bonus roll")
+        assertEq(countLootEvents(peers[i], "RC_LOOT_COUNCIL", nil), 0, "observer bonus roll is not an RC award")
+    end
+    local bonusWire
+    for _, log in ipairs(peers[3]:GetLootLogs() or {}) do
+        if log:GetEventType() == "BONUS_ROLL" then
+            bonusWire = log:ToTable()
+        end
+    end
+    local merged = coord:MergeLogTables({ bonusWire })
+    assertEq(merged, 0, "merging the same bonus roll inserts nothing")
+    assertEq(countLootEvents(coord, "BONUS_ROLL", bonusCanon.awardKey), 1, "synchronized bonus roll stays singular")
+
+    assertTrue(coord:ApplyRCLootCouncilIntegrationConfig({
+        recordAwards = false,
+        recordAllAwardTypes = true,
+        allowedResponses = {},
+        bisResponses = {},
+    }, { skipPermission = true, skipSync = true }), "recording can be disabled")
+    local blocked = SF.LootLog.BuildBonusRollCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006401-8",
+        response = "Bonus Loot",
+        responseID = "BONUS_ROLL",
+    }))
+    PLAYER = owners[1]
+    assertEq(select(2, coord:TryAddBonusRoll(blocked)), "filtered", "bonus rolls follow the recording master switch")
+
+    local ordinary = SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = WINNER,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+    }, {
+        profile = coord,
+        author = owners[1],
+        skipPermission = true,
+    })
+    local ordinaryWire = ordinary:ToTable()
+    ordinaryWire._externalId = bonusCanon.awardKey
+    ordinaryWire._id = bonusCanon.awardKey
+    ordinaryWire._counter = 0
+    ordinaryWire._fingerprint = nil
+    assertFalse(select(1, SF.LootLog.ValidateTable(ordinaryWire)), "ordinary events still cannot use an external id")
+    local missingExternal = {
+        version = 2,
+        _id = owners[1] .. ":1",
+        _timestamp = 1700006402,
+        _author = owners[1],
+        _counter = 1,
+        _eventType = "BONUS_ROLL",
+        _data = SF.LootLog.BuildBonusRollEventData(bonusCanon),
+    }
+    assertFalse(select(1, SF.LootLog.ValidateTable(missingExternal)), "BONUS_ROLL without an external id is rejected")
+end
+testSingleWriterAndBonusRolls()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

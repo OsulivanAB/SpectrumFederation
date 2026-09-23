@@ -735,6 +735,49 @@ function LootLogValidators.ValidateRCLootCouncilData(eventData)
     return true
 end
 
+function LootLogValidators.ValidateBonusRollData(eventData)
+    if type(eventData) ~= "table" then
+        return false
+    end
+    if type(eventData.member) ~= "string" or eventData.member == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Bonus Roll log is missing member")
+        end
+        return false
+    end
+    if type(eventData.itemLink) ~= "string" or eventData.itemLink == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Bonus Roll log is missing itemLink")
+        end
+        return false
+    end
+    if type(eventData.itemString) ~= "string" or eventData.itemString == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Bonus Roll log is missing itemString")
+        end
+        return false
+    end
+    if type(eventData.rcAwardId) ~= "string" or eventData.rcAwardId == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Bonus Roll log is missing rcAwardId")
+        end
+        return false
+    end
+    if type(eventData.awardKey) ~= "string" or eventData.awardKey == "" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Bonus Roll log is missing awardKey")
+        end
+        return false
+    end
+    if eventData.responseId ~= nil and eventData.responseId ~= "BONUS_ROLL" then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "Bonus Roll log responseId must be BONUS_ROLL")
+        end
+        return false
+    end
+    return true
+end
+
 local _ValidateArmorChangeData = LootLogValidators.ValidateArmorChangeData
 function LootLogValidators.ValidateArmorChangeData(eventData, ARMOR_ACTIONS, profile)
     if not _ValidateArmorChangeData(eventData, ARMOR_ACTIONS, profile) then
