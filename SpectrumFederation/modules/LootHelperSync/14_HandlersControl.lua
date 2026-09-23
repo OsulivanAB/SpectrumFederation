@@ -291,7 +291,11 @@ function Sync:HandleSessionReannounce(sender, payload)
         self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
     end
     self.state.authorWindowSummary = (type(payload.authorWindowSummary) == "table") and payload.authorWindowSummary or {}
-    self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
+    if self.ApplyAdvertisedHelpers then
+        self:ApplyAdvertisedHelpers((type(payload.helpers) == "table") and payload.helpers or {}, "session_reannounce")
+    else
+        self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
+    end
     if self._RememberAdvertisedRCConfigGeneration then
         self:_RememberAdvertisedRCConfigGeneration(payload)
     end
@@ -435,9 +439,14 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         self:StopHeartbeatSender("lost coordinator via SES_HEARTBEAT")
     end
 
-    -- Keep helper list + authorMax current
+    -- Keep helper list + authorMax current. Helper-only changes must retarget
+    -- outstanding requests even when session, coordinator, and epoch are unchanged.
     if type(payload.helpers) == "table" then
-        self.state.helpers = payload.helpers
+        if self.ApplyAdvertisedHelpers then
+            self:ApplyAdvertisedHelpers(payload.helpers, "heartbeat")
+        else
+            self.state.helpers = payload.helpers
+        end
     end
     if type(payload.authorMax) == "table" then
         -- Exact-key max only: retain local NEW_LOG progress and previously
@@ -722,7 +731,8 @@ function Sync:HandleNeedProfile(sender, payload)
         return
     end
     
-    -- Verify we're still authorized for this profile (Issue #9 fix)
+    -- Verify we're still authorized for this profile (Issue #9 fix).
+    -- Cached coordinator/helper role is not an authorization grant.
     if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Not authorized to serve profile (no longer admin)")
@@ -766,6 +776,7 @@ function Sync:HandleNeedProfile(sender, payload)
     self:RunWithJitter(0, 250, function()
         if not self.state.active then return end
         if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
+        if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
         if not SF.LootHelperComm then return end
 
         if enc then
@@ -842,6 +853,14 @@ function Sync:HandleNeedLogs(sender, payload)
         end
         return
     end
+    -- Cached helper/coordinator role must not keep serving after admin revocation.
+    if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "HandleNeedLogs: not authorized to serve logs (no longer admin, sender=%s)",
+                tostring(sender))
+        end
+        return
+    end
 
     -- Safety: only send to group members
     self:UpdatePeersFromRoster()
@@ -890,6 +909,7 @@ function Sync:HandleNeedLogs(sender, payload)
             self:RunAfter(delay, function()
                 if not self.state.active then return end
                 if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
+                if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
                 if not SF.LootHelperComm then return end
 
                 -- Build inside callback to spread CPU cost too
@@ -961,6 +981,14 @@ function Sync:HandleLogRequest(sender, payload)
         end
         if SF.PrintWarning then
             SF:PrintWarning(("Ignoring LOG_REQ from %s for profile %s: not an admin."):format(sender, payload.profileId))
+        end
+        return
+    end
+    -- The responder must still be an admin. Requester authorization is not enough.
+    if not self:IsSenderAuthorized(payload.profileId, self:_SelfId()) then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "HandleLogRequest: responder no longer authorized (self=%s, profileId=%s)",
+                tostring(self:_SelfId()), tostring(payload.profileId))
         end
         return
     end

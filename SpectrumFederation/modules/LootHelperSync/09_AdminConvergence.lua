@@ -520,7 +520,13 @@ function Sync:ChooseHelpers(adminStatuses)
     local candidates = {}
 
     for name, st in pairs(adminStatuses) do
-        if name ~= me and type(st) == "table" and st.hasProfile then
+        local stillAdmin = true
+        if self.IsSenderAuthorized and self.state and type(self.state.profileId) == "string"
+            and self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId)
+        then
+            stillAdmin = self:IsSenderAuthorized(self.state.profileId, name) == true
+        end
+        if name ~= me and stillAdmin and type(st) == "table" and st.hasProfile then
             local peer = self:GetPeer(name) -- may exist from roster or be created
             local score = 0
 
@@ -654,7 +660,11 @@ function Sync:BroadcastSessionStart()
         if self.state.sessionId ~= sid then return end
         
         -- Now activate helpers - members can route requests to them
-        self.state.helpers = chosenHelpers
+        if self.ApplyAdvertisedHelpers then
+            self:ApplyAdvertisedHelpers(chosenHelpers, "helpers_ready")
+        else
+            self.state.helpers = chosenHelpers
+        end
         self:_PersistSessionState("BroadcastSessionStart:HelpersReady")
         
         if SF.Debug then

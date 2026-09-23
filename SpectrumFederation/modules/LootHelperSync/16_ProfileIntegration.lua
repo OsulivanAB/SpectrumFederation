@@ -1952,6 +1952,10 @@ function Sync:RebuildProfile(profileId, reason)
         self:ScheduleIdentityAdminReconcile(profileId)
     end
 
+    if self.ReconcileSessionAuthorization then
+        self:ReconcileSessionAuthorization(profileId, "rebuild:" .. rebuildReason)
+    end
+
     return true, nil
 end
 
@@ -2316,6 +2320,9 @@ function Sync:ConsiderIdentityAdminSideEffects(profileId)
     local profile = self:FindLocalProfileById(profileId)
     if profile and profile.ReconcileIdentityAdmins then
         profile:ReconcileIdentityAdmins()
+    end
+    if self.ReconcileSessionAuthorization then
+        self:ReconcileSessionAuthorization(profileId, "identity_admin_reconcile")
     end
     finish()
 end

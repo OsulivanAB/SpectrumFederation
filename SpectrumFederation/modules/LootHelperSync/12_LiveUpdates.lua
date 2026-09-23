@@ -508,7 +508,8 @@ function Sync:HandleNewLog(sender, payload)
             end
             return
         end
-    elseif not isRelationship and not self:_SamePlayer(sender, self.state.coordinator) then
+    elseif not isRelationship then
+        -- Coordinator routing does not bypass canonical admin authorization.
         if not self:IsSenderAuthorized(profileId, sender) then
             if SF.PrintWarning then
                 SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))

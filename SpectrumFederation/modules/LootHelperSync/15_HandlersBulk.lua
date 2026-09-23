@@ -104,51 +104,57 @@ function Sync:HandleAuthLogs(sender, payload)
         return
     end
 
-    -- Trust validation: Path-specific checks BEFORE merge
-    if self.state.isCoordinator then
-        -- Coordinator path: require sender is authorized admin
-        if not self:IsSenderAuthorized(payload.profileId, sender) then
-            if SF.Debug then
-                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not authorized for profile %s (coordinator path)",
-                    tostring(sender), tostring(payload.profileId))
-            end
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not an admin of profile."):format(sender))
-            end
-            return
-        end
-        if SF.Debug then
-            SF.Debug:Info("SYNC", "Accepting AUTH_LOGS from authorized admin %s (%d logs for %s [%d-%d])",
-                tostring(sender), #payload.logs, tostring(payload.author),
-                tonumber(payload.fromCounter) or 0, tonumber(payload.toCounter) or 0)
-        end
+    -- Trust validation: Path-specific checks BEFORE merge.
+    -- Revoked responders already removed from a live request are stale, not a new incident.
+    -- A still-authorized responder who was sent this request remains acceptable after a
+    -- routing-only helper change. Future sends use the refreshed target list.
+    local disposition = "unauthorized"
+    if self._ClassifyPrivilegedResponse then
+        disposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, req, {
+            coordinatorAcceptsAdmins = true,
+        })
+    elseif self.state.isCoordinator then
+        disposition = self:IsSenderAuthorized(payload.profileId, sender) and "accept" or "unauthorized"
+    elseif not self:IsTrustedDataSender(sender) then
+        disposition = "untrusted"
+    elseif not self:IsSenderAuthorized(payload.profileId, sender) then
+        disposition = "unauthorized"
     else
-        -- Member path: require sender is coordinator or helper
-        if not self:IsTrustedDataSender(sender) then
-            if SF.Debug then
-                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not a trusted sender (member path)", tostring(sender))
-            end
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not a trusted sender."):format(sender))
-            end
-            return
-        end
-        -- Additional check: sender must be authorized admin
-        if not self:IsSenderAuthorized(payload.profileId, sender) then
-            if SF.Debug then
-                SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not an admin of profile (member path)", tostring(sender))
-            end
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not an admin of profile."):format(sender))
-            end
-            return
-        end
+        disposition = "accept"
+    end
+
+    if disposition == "stale" then
         if SF.Debug then
-            local senderRole = (sender == self.state.coordinator) and "coordinator" or (self:IsHelper(sender) and "helper" or "unknown")
-            SF.Debug:Info("SYNC", "Accepting AUTH_LOGS from %s as %s (%d logs for %s [%d-%d])",
-                tostring(sender), senderRole, #payload.logs, tostring(payload.author),
-                tonumber(payload.fromCounter) or 0, tonumber(payload.toCounter) or 0)
+            SF.Debug:Verbose("SYNC", "Ignoring stale AUTH_LOGS from %s for request %s after authorization reconcile",
+                tostring(sender), tostring(payload.requestId))
         end
+        return
+    end
+    if disposition == "unauthorized" then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not an admin of profile %s",
+                tostring(sender), tostring(payload.profileId))
+        end
+        if SF.PrintWarning then
+            SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not an admin of profile."):format(sender))
+        end
+        return
+    end
+    if disposition == "untrusted" then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not a trusted sender (member path)", tostring(sender))
+        end
+        if SF.PrintWarning then
+            SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not a trusted sender."):format(sender))
+        end
+        return
+    end
+    if SF.Debug then
+        local senderRole = (self:_SamePlayer(sender, self.state.coordinator) and "coordinator")
+            or (self:IsHelper(sender) and "helper" or "inflight")
+        SF.Debug:Info("SYNC", "Accepting AUTH_LOGS from %s as %s (%d logs for %s [%d-%d])",
+            tostring(sender), senderRole, #payload.logs, tostring(payload.author),
+            tonumber(payload.fromCounter) or 0, tonumber(payload.toCounter) or 0)
     end
 
     -- All validation passed; proceed with merge
@@ -353,12 +359,43 @@ function Sync:HandleProfileSnapshot(sender, payload)
     -- Full snapshots remain coordinator/helper-only. Ordinary admins cannot
     -- supply owner, roster, logs, loot mode, Reward Pot, Raid Check, or
     -- equipment state through this path. RC settings use RC_CONFIG_REQ/SET.
-    if not self:IsTrustedDataSender(sender) then
+    -- Canonical admin revocation outranks a cached helper or in-flight request.
+    local snapReq = nil
+    if type(payload.requestId) == "string" and self.state.requests then
+        snapReq = self.state.requests[payload.requestId]
+    end
+    local snapDisposition = "untrusted"
+    if self._ClassifyPrivilegedResponse then
+        snapDisposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, snapReq, {
+            coordinatorAcceptsAdmins = false,
+        })
+    elseif self:IsSenderAuthorized(payload.profileId, sender) and self:IsTrustedDataSender(sender) then
+        snapDisposition = "accept"
+    elseif not self:IsSenderAuthorized(payload.profileId, sender) then
+        snapDisposition = "unauthorized"
+    end
+    if snapDisposition == "stale" then
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not a trusted sender", tostring(sender))
+            SF.Debug:Verbose("SYNC", "Ignoring stale PROFILE_SNAPSHOT from %s after authorization reconcile",
+                tostring(sender))
         end
-        if SF.PrintWarning then
-            SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not a trusted sender."):format(sender))
+        return
+    end
+    if snapDisposition ~= "accept" then
+        if snapDisposition == "unauthorized" then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not an admin of profile", tostring(sender))
+            end
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not an admin of profile."):format(sender))
+            end
+        else
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not a trusted sender", tostring(sender))
+            end
+            if SF.PrintWarning then
+                SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not a trusted sender."):format(sender))
+            end
         end
         return
     end

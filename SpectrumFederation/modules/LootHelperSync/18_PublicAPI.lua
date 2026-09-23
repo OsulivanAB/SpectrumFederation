@@ -117,6 +117,9 @@ function Sync:TryRestorePersistedSession(reason)
         self.state.rcConfigSeq = (restoredProfile and tonumber(restoredProfile._rcConfigSeq)) or 0
     end
     self.state.helpers = CopyStringArray(persisted.helpers)
+    if self.ApplyAdvertisedHelpers then
+        self:ApplyAdvertisedHelpers(self.state.helpers, "restore")
+    end
     self.state.authorMax = {}
     self.state.authorWindowSummary = {}
     self.state._sentJoinStatusForSessionId = nil

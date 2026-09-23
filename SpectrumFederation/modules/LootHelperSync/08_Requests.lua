@@ -113,6 +113,11 @@ function Sync:_SendAdminLogReq(req, target)
     local meta = req and req.meta or nil
     if type(meta) ~= "table" then return false end
 
+    local profileId = meta.profileId or self.state.profileId
+    if not self:IsSenderAuthorized(profileId, self:_SelfId()) then
+        return false
+    end
+
     local payload = {
         sessionId   = meta.sessionId,
         profileId   = meta.profileId,
@@ -269,6 +274,9 @@ function Sync:_SendRequestAttempt(req)
     if ok then
         self:_MInc("sync.req.send_ok.total", 1)
         self:_MInc("sync.req.send_ok.kind." .. tostring(req.kind or "UNKNOWN"), 1)
+        if self._RememberInflightResponder then
+            self:_RememberInflightResponder(req, target)
+        end
     else
         self:_MInc("sync.req.send_fail.total", 1)
         self:_MInc("sync.req.send_fail.kind." .. tostring(req.kind or "UNKNOWN"), 1)

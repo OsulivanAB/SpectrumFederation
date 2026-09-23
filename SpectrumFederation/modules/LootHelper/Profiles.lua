@@ -3435,6 +3435,11 @@ function LootProfile:AddAdminMemberId(memberId, opts)
             tostring(memberId), tostring(self._profileName))
     end
 
+    local sync = SF.LootHelperSync
+    if sync and sync.ReconcileSessionAuthorization and self.GetProfileId then
+        sync:ReconcileSessionAuthorization(self:GetProfileId(), "local_admin_added")
+    end
+
     return self:IsAdminMemberId(memberId)
 end
 
@@ -3498,6 +3503,11 @@ function LootProfile:RemoveAdminMemberId(memberId)
         SF.Debug:Info("LootProfile", "Removed admin: %s", tostring(memberId))
         SF.Debug:Info("ADMIN_STATUS", "User %s admin revoked in profile %s",
             tostring(memberId), tostring(self._profileName))
+    end
+
+    local sync = SF.LootHelperSync
+    if sync and sync.ReconcileSessionAuthorization and self.GetProfileId then
+        sync:ReconcileSessionAuthorization(self:GetProfileId(), "local_admin_removed")
     end
 
     return true

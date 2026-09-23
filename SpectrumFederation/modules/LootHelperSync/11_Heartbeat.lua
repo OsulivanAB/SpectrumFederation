@@ -82,7 +82,11 @@ function Sync:HandleSessionStart(sender, payload)
     end
 
     if type(payload.helpers) == "table" then
-        self.state.helpers = payload.helpers
+        if self.ApplyAdvertisedHelpers then
+            self:ApplyAdvertisedHelpers(payload.helpers, "session_start")
+        else
+            self.state.helpers = payload.helpers
+        end
     else
         self.state.helpers = {}
     end
@@ -258,8 +262,10 @@ function Sync:RequestProfileSnapshot(reason)
         return false
     end
 
-    -- Build ordered target list: helpers first, coordinator fallback
-    local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    -- Build ordered target list: helpers first, coordinator fallback.
+    -- Once the profile is local, drop targets who are no longer canonical admins.
+    local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
+        or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
     if not targets or #targets == 0 then
         if SF.PrintWarning then
             SF:PrintWarning("Cannot request profile: no targets available")
@@ -335,7 +341,8 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
                     preferredTarget = preferredTarget,
                 }
             end
-            local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator, targetOpts)
+            local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets(targetOpts))
+                or self:GetRequestTargets(self.state.helpers, self.state.coordinator, targetOpts)
             if not targets or #targets == 0 then
                 if SF.PrintWarning then
                     SF:PrintWarning("Cannot request missing logs: no targets available")

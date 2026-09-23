@@ -1,0 +1,628 @@
+-- Production-Lua tests for Loot Helper sync authorization and request routing.
+-- Run from the repository root: lua5.1 tests/lua/loot_helper_sync_authorization_tests.lua
+
+local failures = 0
+local passes = 0
+
+local function fail(message)
+    failures = failures + 1
+    io.stderr:write("FAIL: " .. message .. "\n")
+end
+
+local function pass(message)
+    passes = passes + 1
+    io.stdout:write("ok: " .. message .. "\n")
+end
+
+local function assertTrue(cond, message)
+    if cond then
+        pass(message)
+    else
+        fail(message)
+    end
+end
+
+local function assertEq(actual, expected, message)
+    if actual == expected then
+        pass(message)
+    else
+        fail(string.format("%s (expected %s, got %s)", message, tostring(expected), tostring(actual)))
+    end
+end
+
+local function assertNil(actual, message)
+    if actual == nil then
+        pass(message)
+    else
+        fail(string.format("%s (expected nil, got %s)", message, tostring(actual)))
+    end
+end
+
+function GetServerTime()
+    return 1700000000
+end
+
+function GetTime()
+    return 0
+end
+
+function time()
+    return 1700000000
+end
+
+function GetRealmName()
+    return "Realm"
+end
+
+function UnitFullName()
+    return "Coord", "Realm"
+end
+
+function IsInRaid()
+    return true
+end
+
+function IsInGroup()
+    return true
+end
+
+function GetNumGroupMembers()
+    return 0
+end
+
+function strsplit(delim, text)
+    local left, right = string.match(text, "^(.-)" .. delim .. "(.*)$")
+    return left, right
+end
+
+local timers = {}
+C_Timer = {
+    NewTimer = function(_, fn)
+        local handle = { cancelled = false, fn = fn }
+        function handle:Cancel()
+            self.cancelled = true
+        end
+        timers[#timers + 1] = handle
+        return handle
+    end,
+    NewTicker = function()
+        local handle = { cancelled = false }
+        function handle:Cancel()
+            self.cancelled = true
+        end
+        return handle
+    end,
+}
+
+local SF = {}
+local warnings = {}
+local infos = {}
+local sends = {}
+local currentSelf = "Member-Realm"
+
+function SF:PrintWarning(message)
+    warnings[#warnings + 1] = tostring(message)
+end
+
+function SF:PrintInfo(message)
+    infos[#infos + 1] = tostring(message)
+end
+
+function SF:PrintError(message)
+    warnings[#warnings + 1] = tostring(message)
+end
+
+SF.Debug = setmetatable({}, {
+    __index = function()
+        return function() end
+    end,
+})
+
+SF.NameUtil = {
+    GetSelfId = function()
+        return currentSelf
+    end,
+}
+
+SF.LootHelperComm = {
+    Send = function(_, _, msgType, payload, dist, target)
+        sends[#sends + 1] = {
+            msgType = msgType,
+            payload = payload,
+            dist = dist,
+            target = target,
+        }
+        return true
+    end,
+}
+
+local function loadModule(path)
+    local chunk, err = loadfile(path)
+    if not chunk then
+        error(err)
+    end
+    chunk("SpectrumFederation", SF)
+end
+
+loadModule("SpectrumFederation/modules/LootHelperSync/00_Namespace.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/01_Constants.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/02_State.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/03_Metrics.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/04_SafeMode.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/05_Scheduling.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/06_Peers.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/08_Requests.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/10_Handshake.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/12_LiveUpdates.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/15_HandlersBulk.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/16_ProfileIntegration.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua")
+
+local Sync = SF.LootHelperSync
+local PROFILE = "profile-1"
+local SESSION = "session-1"
+local COORD = "Coord-Realm"
+local SUSPENDERS = "Suspenders-Realm"
+local KINO = "Kino-Realm"
+local OWNER = "Owner-Realm"
+local MEMBER = "Member-Realm"
+local STRANGER = "Stranger-Realm"
+
+local admins = {}
+
+local function listHas(list, name)
+    if type(list) ~= "table" then
+        return false
+    end
+    for _, existing in ipairs(list) do
+        if existing == name then
+            return true
+        end
+    end
+    return false
+end
+
+local function warningCount(fragment)
+    local n = 0
+    for _, message in ipairs(warnings) do
+        if string.find(message, fragment, 1, true) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function sendCount(msgType, target)
+    local n = 0
+    for _, sent in ipairs(sends) do
+        if sent.msgType == msgType and (target == nil or sent.target == target) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local profile
+
+local function setAdmins(list)
+    admins = {}
+    for _, name in ipairs(list) do
+        admins[#admins + 1] = name
+    end
+    profile._adminUsers = admins
+end
+
+local function reset(selfName)
+    currentSelf = selfName or MEMBER
+    warnings = {}
+    infos = {}
+    sends = {}
+    for i = #timers, 1, -1 do
+        timers[i] = nil
+    end
+    admins = { COORD, SUSPENDERS, KINO, OWNER }
+    profile = {
+        _profileId = PROFILE,
+        _lootLogs = {},
+        _members = {},
+        _adminUsers = admins,
+        GetProfileId = function(self)
+            return self._profileId
+        end,
+        GetAdminUsers = function()
+            return admins
+        end,
+        GetLootLogs = function(self)
+            return self._lootLogs
+        end,
+        AddLootLog = function()
+            return false
+        end,
+    }
+    SF.lootHelperDB = { profiles = { [PROFILE] = profile } }
+    Sync.state.active = true
+    Sync.state.sessionId = SESSION
+    Sync.state.profileId = PROFILE
+    Sync.state.coordinator = COORD
+    Sync.state.coordEpoch = 10
+    Sync.state.isCoordinator = currentSelf == COORD
+    Sync.state.helpers = { SUSPENDERS, KINO }
+    Sync.state.authorMax = {}
+    Sync.state.authorWindowSummary = {}
+    Sync.state.requests = {}
+    Sync.state.peers = {
+        [COORD] = { inGroup = true, online = true },
+        [SUSPENDERS] = { inGroup = true, online = true },
+        [KINO] = { inGroup = true, online = true },
+        [OWNER] = { inGroup = true, online = true },
+        [MEMBER] = { inGroup = true, online = true },
+    }
+    Sync.state.heartbeat = {}
+    Sync.state._unauthorizedCoordTakeoverFor = nil
+    Sync.state._reconcilingSessionAuthorization = nil
+    Sync.state._relinquishingCoordination = nil
+    Sync.state._profileReqInFlight = nil
+    Sync.state._sentJoinStatusForSessionId = nil
+    Sync.state._sessionAnnounced = SESSION
+    Sync._reconcilingSessionAuthorization = nil
+    Sync._relinquishingCoordination = nil
+end
+
+Sync._EnforceGroupedSessionActive = function()
+    return "RAID"
+end
+Sync.UpdatePeersFromRoster = function() end
+Sync.BeginAdminConvergence = function()
+    return true
+end
+Sync.IsRequesterInGroup = function()
+    return true
+end
+Sync.EnsureRepairConvergence = function()
+    return false
+end
+Sync.SendJoinStatus = function() end
+Sync.QueueRepairRanges = function()
+    return false
+end
+Sync.ComputeContigAuthorMax = function()
+    return {}
+end
+Sync.ComputeAuthorMax = function()
+    return {}
+end
+Sync.ComputeMissingLogRequests = function()
+    return {}
+end
+Sync.ComputeWindowMismatchRequests = function()
+    return {}
+end
+Sync._ComputeContigCounter = function()
+    return 99
+end
+Sync.MergeLogs = function()
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+
+local function seedRequest(id, kind, targets, lastTarget)
+    local req = {
+        id = id,
+        kind = kind,
+        attempt = lastTarget and 1 or 0,
+        maxRetries = 2,
+        timeoutSec = 5,
+        createdAt = Sync:_Now(),
+        lastSentAt = lastTarget and Sync:_Now() or nil,
+        lastTarget = lastTarget,
+        targets = targets,
+        targetIdx = lastTarget and 1 or 0,
+        meta = {
+            sessionId = SESSION,
+            profileId = PROFILE,
+            author = "Author-Realm",
+            fromCounter = 1,
+            toCounter = 2,
+        },
+        timer = nil,
+    }
+    if lastTarget then
+        Sync:_RememberInflightResponder(req, lastTarget)
+    end
+    Sync.state.requests[id] = req
+    return req
+end
+
+local function authPayload(requestId, sender)
+    return {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        requestId = requestId,
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+        logs = {},
+    }, sender
+end
+
+reset(MEMBER)
+
+-- 1. Remove an active helper from canonical admins.
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { SUSPENDERS, KINO }
+seedRequest("need-1", "NEED_LOGS", { SUSPENDERS, COORD }, SUSPENDERS)
+Sync:ReconcileSessionAuthorization(PROFILE, "remove-helper")
+assertTrue(not listHas(Sync.state.helpers, SUSPENDERS), "removed helper leaves the helper list")
+assertTrue(listHas(Sync.state.helpers, KINO), "unrelated helper stays in the helper list")
+local need = Sync.state.requests["need-1"]
+assertTrue(need ~= nil, "outstanding need-logs request remains")
+assertTrue(not listHas(need.targets, SUSPENDERS), "future targets drop the removed helper")
+assertTrue(Sync:_ResponderMapHas(need.revokedResponders, SUSPENDERS), "removed helper is marked revoked for the request")
+
+currentSelf = SUSPENDERS
+Sync.state.isCoordinator = false
+Sync.state.helpers = { SUSPENDERS }
+local beforeSends = #sends
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "serve-1",
+    missing = {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+    },
+})
+assertEq(sendCount(Sync.MSG.AUTH_LOGS, MEMBER), 0, "removed helper does not serve NEED_LOGS")
+assertEq(#sends, beforeSends, "removed helper sends no privileged sync traffic")
+Sync:HandleLogRequest(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "logreq-1",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+})
+assertEq(sendCount(Sync.MSG.AUTH_LOGS), 0, "removed admin does not serve LOG_REQ")
+Sync.state.isCoordinator = true
+Sync.state.active = true
+local adminSend = Sync:_SendAdminLogReq({
+    id = "admin-req",
+    meta = { sessionId = SESSION, profileId = PROFILE, author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+}, COORD)
+assertEq(adminSend, false, "removed coordinator cannot send ADMIN LOG_REQ")
+
+-- 2. Outstanding request stops retrying the revoked admin.
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+seedRequest("need-2", "NEED_LOGS", { SUSPENDERS }, SUSPENDERS)
+Sync:ReconcileSessionAuthorization(PROFILE, "revoke-outstanding")
+need = Sync.state.requests["need-2"]
+assertTrue(not listHas(need.targets, SUSPENDERS), "revoked admin is not a retry target")
+local warnBefore = #warnings
+Sync:OnRequestTimeout("need-2")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, SUSPENDERS), 0, "timeout does not retry the revoked admin")
+assertEq(warningCount("not a trusted sender"), 0, "retarget does not warn about trust")
+assertEq(#warnings, warnBefore, "retarget does not add a user warning")
+
+-- 3. Helper rotation while the admin is still valid.
+reset(MEMBER)
+seedRequest("need-3", "NEED_LOGS", { KINO, COORD }, KINO)
+Sync:ApplyAdvertisedHelpers({ OWNER }, "rotation")
+need = Sync.state.requests["need-3"]
+assertTrue(not listHas(need.targets, KINO), "rotated helper is not a future target")
+assertTrue(Sync:_ResponderMapHas(need.inflightResponders, KINO), "in-flight responder grant remains")
+assertTrue(not Sync:_ResponderMapHas(need.revokedResponders, KINO), "still-authorized helper is not revoked")
+local payload, sender = authPayload("need-3", KINO)
+Sync:HandleAuthLogs(sender, payload)
+assertEq(warningCount("not a trusted sender"), 0, "in-flight authorized response is not a trust warning")
+assertEq(warningCount("not an admin"), 0, "in-flight authorized response is not an admin warning")
+assertNil(Sync.state.requests["need-3"], "in-flight authorized response completes the request")
+
+-- 4. Removing a non-helper admin leaves helper routing alone.
+reset(MEMBER)
+local beforeHelpers = { SUSPENDERS, KINO }
+Sync.state.helpers = { SUSPENDERS, KINO }
+setAdmins({ COORD, SUSPENDERS, KINO })
+Sync:ReconcileSessionAuthorization(PROFILE, "remove-non-helper")
+assertTrue(Sync:_SamePlayerList(Sync.state.helpers, beforeHelpers), "non-helper admin removal keeps helpers")
+
+-- 5. Remove then re-add does not revive stale request authority.
+reset(MEMBER)
+seedRequest("need-5", "NEED_LOGS", { SUSPENDERS, COORD }, SUSPENDERS)
+setAdmins({ COORD, KINO, OWNER })
+Sync:ReconcileSessionAuthorization(PROFILE, "remove-for-readd")
+setAdmins({ COORD, SUSPENDERS, KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync:ReconcileSessionAuthorization(PROFILE, "readd")
+need = Sync.state.requests["need-5"]
+assertTrue(need ~= nil, "request survives re-add")
+assertTrue(not listHas(need.targets, SUSPENDERS), "re-add does not restore a stale target")
+payload, sender = authPayload("need-5", SUSPENDERS)
+Sync:HandleAuthLogs(sender, payload)
+assertEq(warningCount("not a trusted sender"), 0, "re-added stale responder does not warn")
+assertEq(warningCount("not an admin"), 0, "re-added stale responder is not treated as a new admin failure")
+assertTrue(Sync.state.requests["need-5"] ~= nil, "stale response after re-add does not regain authority")
+
+-- 6. Removing the active coordinator.
+reset(COORD)
+Sync.state.isCoordinator = true
+setAdmins({ KINO, OWNER })
+Sync.state.helpers = { KINO }
+seedRequest("admin-6", "ADMIN_LOG_REQ", { KINO }, nil)
+Sync:ReconcileSessionAuthorization(PROFILE, "coordinator-removed")
+assertEq(Sync.state.isCoordinator, false, "removed coordinator stops acting as coordinator")
+assertEq(Sync.state.active, true, "session stays up for an eligible successor")
+assertEq(sendCount(Sync.MSG.SES_END), 0, "eligible successor path does not end the session")
+assertEq(sendCount(Sync.MSG.SES_HEARTBEAT), 0, "removed coordinator does not keep heartbeating")
+assertNil(Sync.state.requests["admin-6"], "admin log requests stop after coordinator revocation")
+
+currentSelf = KINO
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+Sync.state.active = true
+Sync.state.sessionId = SESSION
+Sync.state.profileId = PROFILE
+setAdmins({ KINO, OWNER })
+Sync:_MaybeAssumeCoordinationAfterAdminChange("coordinator-removed")
+assertEq(Sync.state.isCoordinator, true, "eligible admin takes over")
+assertEq(Sync.state.coordinator, KINO, "takeover coordinator is the eligible admin")
+assertEq(sendCount(Sync.MSG.COORD_TAKEOVER), 1, "takeover reuses COORD_TAKEOVER")
+
+reset(COORD)
+Sync.state.isCoordinator = true
+setAdmins({})
+Sync.state.peers[KINO].inGroup = false
+Sync.state.peers[OWNER].inGroup = false
+Sync.state.peers[SUSPENDERS].inGroup = false
+Sync.state.peers[COORD].inGroup = true
+Sync:ReconcileSessionAuthorization(PROFILE, "coordinator-removed-no-successor")
+assertEq(Sync.state.active, false, "session ends when no eligible admin remains")
+assertEq(sendCount(Sync.MSG.SES_END), 1, "coordinator broadcasts session end")
+
+-- 7. Outstanding request across coordinator takeover.
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+seedRequest("need-7", "NEED_LOGS", { COORD }, COORD)
+Sync.state.coordinator = KINO
+Sync.state.coordEpoch = 11
+Sync.state.helpers = { OWNER }
+Sync:_RefreshOutstandingRequestTargets()
+need = Sync.state.requests["need-7"]
+assertTrue(not listHas(need.targets, COORD), "old coordinator is not a future target after takeover")
+assertTrue(listHas(need.targets, KINO), "new coordinator is a request target")
+payload, sender = authPayload("need-7", COORD)
+Sync:HandleAuthLogs(sender, payload)
+assertEq(warningCount("not a trusted sender"), 0, "old coordinator in-flight response is not a trust warning")
+assertNil(Sync.state.requests["need-7"], "still-authorized previous coordinator response can complete")
+
+reset(MEMBER)
+seedRequest("need-7b", "NEED_LOGS", { KINO }, nil)
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync:_RefreshOutstandingRequestTargets()
+payload, sender = authPayload("need-7b", KINO)
+Sync:HandleAuthLogs(sender, payload)
+assertEq(warningCount("not a trusted sender"), 0, "new coordinator response is accepted")
+assertEq(warningCount("not an admin"), 0, "new coordinator response is authorized")
+
+-- 8. Valid admin left on an older target list.
+reset(MEMBER)
+seedRequest("need-8", "NEED_LOGS", { KINO, COORD }, KINO)
+Sync:ApplyAdvertisedHelpers({ OWNER }, "stale-valid-admin")
+assertTrue(not listHas(Sync.state.requests["need-8"].targets, KINO), "stale valid admin is not asked again")
+payload, sender = authPayload("need-8", KINO)
+Sync:HandleAuthLogs(sender, payload)
+assertEq(warningCount("not a trusted sender"), 0, "valid admin answering the original request is not rejected")
+
+-- 9. Unauthorized unsolicited traffic is still rejected.
+reset(MEMBER)
+seedRequest("need-9", "NEED_LOGS", { COORD }, COORD)
+payload, sender = authPayload("need-9", STRANGER)
+Sync:HandleAuthLogs(sender, payload)
+assertEq(warningCount("not an admin of profile"), 1, "stranger AUTH_LOGS is rejected")
+assertTrue(Sync.state.requests["need-9"] ~= nil, "unsolicited response does not complete the request")
+
+Sync:HandleProfileSnapshot(STRANGER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-9",
+    snapshot = {},
+})
+assertEq(warningCount("PROFILE_SNAPSHOT"), 1, "stranger snapshot is rejected")
+
+Sync:HandleNewLog(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    log = { _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
+})
+-- COORD is still an admin in this reset, so swap to a revoked coordinator sender.
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = SUSPENDERS
+Sync:HandleNewLog(SUSPENDERS, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    log = { _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
+})
+assertTrue(warningCount("not an admin") >= 1, "revoked coordinator NEW_LOG is rejected")
+
+-- 10. Repeated reconcile, heartbeat, and stale responses do not regenerate warnings.
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { SUSPENDERS, KINO }
+seedRequest("need-10", "NEED_LOGS", { SUSPENDERS, COORD }, SUSPENDERS)
+Sync:ReconcileSessionAuthorization(PROFILE, "spam-setup")
+local baseline = #warnings
+for _ = 1, 20 do
+    Sync:ReconcileSessionAuthorization(PROFILE, "spam-reconcile")
+    Sync:ApplyAdvertisedHelpers({ KINO }, "spam-heartbeat")
+end
+payload, sender = authPayload("need-10", SUSPENDERS)
+for _ = 1, 8 do
+    Sync:HandleAuthLogs(sender, payload)
+end
+assertEq(#warnings, baseline, "repeated stale authorization traffic does not warn")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, SUSPENDERS), 0, "repeated refresh does not retry the revoked admin")
+
+-- Heartbeat helper-only change retargets without a coordinator/epoch change.
+reset(MEMBER)
+seedRequest("need-hb", "NEED_LOGS", { SUSPENDERS, COORD }, SUSPENDERS)
+local epoch = Sync.state.coordEpoch
+local coord = Sync.state.coordinator
+Sync:HandleSessionHeartbeat(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = epoch,
+    helpers = { KINO },
+    authorMax = {},
+    sentAt = 50,
+})
+assertEq(Sync.state.coordinator, coord, "helper heartbeat keeps the coordinator")
+assertEq(Sync.state.coordEpoch, epoch, "helper heartbeat keeps the epoch")
+assertTrue(not listHas(Sync.state.helpers, SUSPENDERS), "heartbeat helper list drops the old helper")
+assertTrue(not listHas(Sync.state.requests["need-hb"].targets, SUSPENDERS), "heartbeat retargets outstanding requests")
+
+-- ChooseHelpers will not select a revoked admin.
+reset(COORD)
+Sync.state.isCoordinator = true
+setAdmins({ COORD, KINO })
+Sync:UpdatePeersFromRoster()
+Sync.state.peers[SUSPENDERS] = { inGroup = true, online = true }
+Sync.state.peers[KINO] = { inGroup = true, online = true }
+local chosen = Sync:ChooseHelpers({
+    [SUSPENDERS] = { hasProfile = true, hasGaps = false },
+    [KINO] = { hasProfile = true, hasGaps = false },
+})
+assertTrue(not listHas(chosen, SUSPENDERS), "ChooseHelpers skips a revoked admin")
+assertTrue(listHas(chosen, KINO), "ChooseHelpers keeps an authorized admin")
+
+-- A still-valid admin who is only an old preferred target is not a new route.
+reset(MEMBER)
+Sync.state.helpers = { SUSPENDERS }
+local preferredTargets = Sync:_CurrentAuthorizedRoutingTargets({ preferredTarget = KINO })
+assertTrue(not listHas(preferredTargets, KINO), "former helper preferred target is not a new route")
+assertTrue(listHas(preferredTargets, SUSPENDERS), "current helper remains a route")
+assertTrue(listHas(preferredTargets, COORD), "current coordinator remains a route")
+
+-- Authorized coordinator NEW_LOG is not rejected as unauthorized.
+reset(MEMBER)
+local before = warningCount("not an admin")
+Sync:HandleNewLog(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    log = {
+        _eventType = "POINT_CHANGE",
+        _author = COORD,
+        _counter = 1,
+        _data = { member = MEMBER },
+    },
+})
+assertEq(warningCount("not an admin"), before, "authorized coordinator NEW_LOG is allowed")
+
+io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
+if failures > 0 then
+    os.exit(1)
+end
