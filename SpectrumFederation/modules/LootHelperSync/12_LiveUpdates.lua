@@ -593,7 +593,12 @@ function Sync:HandleNewLog(sender, payload)
         needsRebuild = not Identity.CanFanOutBalance(eventType)
     end
     if needsRebuild then
-        self:RebuildProfile(profileId, "live_update")
+        local rebuildReason = "live_update"
+        local removedType = SF.LootLogEventTypes and SF.LootLogEventTypes.ADMIN_REMOVED
+        if removedType and eventType == removedType then
+            rebuildReason = "live_admin_removed"
+        end
+        self:RebuildProfile(profileId, rebuildReason)
     elseif SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
         SF.LootHelperEvents:NotifyDataChanged("SYNC:LIVE", { profileId = profileId })
     end

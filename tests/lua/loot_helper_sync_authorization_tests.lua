@@ -685,6 +685,12 @@ setAdmins({ COORD, KINO, OWNER })
 Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:auth_logs")
 assertTrue(type(Sync.state.adminStatuses[SUSPENDERS]) == "table",
     "log rebuild keeps advertiser status for identity reconcile")
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_update")
+assertTrue(type(Sync.state.adminStatuses[SUSPENDERS]) == "table",
+    "ordinary live rebuild keeps advertiser status")
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_admin_removed")
+assertNil(Sync.state.adminStatuses[SUSPENDERS],
+    "live ADMIN_REMOVED rebuild drops the revoked admin status")
 
 -- Reload must not resume coordination from a stale persisted coordinator.
 reset(COORD)
@@ -715,6 +721,22 @@ restored = Sync:TryRestorePersistedSession("reload-authorized")
 assertEq(restored, true, "authorized coordinator session restores")
 assertEq(Sync.state.isCoordinator, true, "authorized coordinator resumes after reload")
 assertEq(Sync.state._restoredSessionNeedsReannounce, true, "authorized coordinator schedules one reannounce")
+
+reset(KINO)
+setAdmins({ KINO, OWNER })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+Sync.state.helpers = {}
+Sync:_PersistSessionState("before-successor-reload")
+Sync.state.active = false
+Sync.state.isCoordinator = false
+restored = Sync:TryRestorePersistedSession("reload-successor")
+assertEq(restored, true, "successor restores the revoked coordinator session")
+assertEq(Sync.state.isCoordinator, true, "first eligible successor takes over during restore")
+assertEq(Sync.state._restoredSessionNeedsReannounce, false,
+    "restore takeover waits for convergence before reannounce")
+Sync:_ReannounceRestoredSessionIfNeeded()
+assertEq(sendCount(Sync.MSG.SES_REANNOUNCE), 0, "restore takeover does not reannounce immediately")
 
 -- Exact repairs keep the advertiser ahead of the default helper route.
 reset(MEMBER)

@@ -112,6 +112,7 @@ function Sync:TryRestorePersistedSession(reason)
     self.state.coordinator = persisted.coordinator
     self.state.coordEpoch = persisted.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(persisted.coordinator, self:_SelfId())
+    local wasPersistedCoordinator = self.state.isCoordinator == true
     do
         local restoredProfile = self.FindLocalProfileById and self:FindLocalProfileById(persisted.profileId) or nil
         self.state.rcConfigSeq = (restoredProfile and tonumber(restoredProfile._rcConfigSeq)) or 0
@@ -148,8 +149,11 @@ function Sync:TryRestorePersistedSession(reason)
         return false
     end
 
-    -- One-shot marker so restored coordinators re-announce exactly once when world/group events settle.
-    self.state._restoredSessionNeedsReannounce = self.state.isCoordinator == true
+    -- One-shot marker so the persisted coordinator re-announces once when
+    -- world/group events settle. A successor who takes over during this
+    -- restore already reannounces after admin convergence, so an earlier
+    -- marker would publish pre-convergence helpers and frontiers.
+    self.state._restoredSessionNeedsReannounce = wasPersistedCoordinator and self.state.isCoordinator == true
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Restored persisted session state (reason=%s, sessionId=%s, profileId=%s, coordinator=%s, isCoordinator=%s)",

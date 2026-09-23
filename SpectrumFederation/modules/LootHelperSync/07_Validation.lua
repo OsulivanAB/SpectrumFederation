@@ -480,12 +480,14 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if not self:_ProfileAuthorizationKnown() then return end
 
     self._reconcilingSessionAuthorization = true
-    -- Log replay recomputes _adminUsers before this runs. Peers can disappear
-    -- from that list while their ADMIN_STATUS windows are still the evidence
-    -- that identity-admin reconcile must wait on. Only an explicit admin
-    -- change should discard that evidence.
+    -- History replay recomputes _adminUsers before this runs. Peers can
+    -- disappear from that list while their ADMIN_STATUS windows are still the
+    -- evidence that identity-admin reconcile must wait on. A live ADMIN_REMOVED
+    -- is an explicit revocation, so that rebuild still drops the revoked entry.
     local reasonText = tostring(reason or "")
-    if reasonText:sub(1, 8) ~= "rebuild:" then
+    local isHistoryReplay = reasonText:sub(1, 8) == "rebuild:"
+        and reasonText ~= "rebuild:live_admin_removed"
+    if not isHistoryReplay then
         self:_DropUnauthorizedAdminStatuses()
     end
 
