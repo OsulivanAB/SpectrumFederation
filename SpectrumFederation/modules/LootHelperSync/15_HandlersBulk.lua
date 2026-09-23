@@ -128,6 +128,11 @@ function Sync:HandleAuthLogs(sender, payload)
         disposition = "accept"
     end
 
+    if disposition == "mismatch" then
+        self:_NoteResponseKindMismatch(req, sender,
+            ("Ignoring AUTH_LOGS from %s: response does not match the request."):format(tostring(sender)))
+        return
+    end
     if disposition == "stale" then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Ignoring stale AUTH_LOGS from %s for request %s after authorization reconcile",
@@ -379,6 +384,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
         snapDisposition = "accept"
     elseif not self:IsSenderAuthorized(payload.profileId, sender) then
         snapDisposition = "unauthorized"
+    end
+    if snapDisposition == "mismatch" then
+        self:_NoteResponseKindMismatch(snapReq, sender,
+            ("Ignoring PROFILE_SNAPSHOT from %s: response does not match the request."):format(tostring(sender)))
+        return
     end
     if snapDisposition == "stale" then
         if SF.Debug then

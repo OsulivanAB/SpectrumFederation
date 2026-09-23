@@ -227,20 +227,26 @@ function Sync:_RetargetRequestList(req, targets)
 end
 
 -- Function Classify a privileged sync response against current auth and this request.
--- Returns "accept", "stale", "unauthorized", or "untrusted".
+-- Returns "accept", "stale", "unauthorized", "untrusted", or "mismatch".
 -- Canonical admin checks wait until a local copy of the profile exists. Joining
 -- members import PROFILE_SNAPSHOT before that copy exists.
+-- A cited request of the wrong kind is a mismatch even when the sender is a
+-- coordinator or helper. Missing requests stay on the trusted-sender path so a
+-- snapshot can still bootstrap a profile.
 -- @param sender string
 -- @param profileId string
 -- @param req table|nil
--- @param opts table|nil { coordinatorAcceptsAdmins = bool }
+-- @param opts table|nil { coordinatorAcceptsAdmins = bool, expectedKinds = table }
 -- @return string
 function Sync:_ClassifyPrivilegedResponse(sender, profileId, req, opts)
     opts = type(opts) == "table" and opts or {}
-    -- In-flight trust is only for the request that was sent. A log request must
-    -- not authorize a later PROFILE_SNAPSHOT that cites the same id.
+    -- In-flight trust is only for the request that was sent. A cited request of
+    -- another kind must not fall through to coordinator/helper trust either.
     if type(opts.expectedKinds) == "table" then
-        if type(req) ~= "table" or opts.expectedKinds[req.kind] ~= true then
+        if type(req) == "table" and opts.expectedKinds[req.kind] ~= true then
+            return "mismatch"
+        end
+        if type(req) ~= "table" then
             req = nil
         end
     end
@@ -264,6 +270,32 @@ function Sync:_ClassifyPrivilegedResponse(sender, profileId, req, opts)
         return "accept"
     end
     return "untrusted"
+end
+
+-- Function Warn once when a response cites a request of the wrong kind.
+-- Retries of the same sender and request stay in debug. The request is left open.
+-- @param req table|nil
+-- @param sender string
+-- @param message string
+-- @return nil
+function Sync:_NoteResponseKindMismatch(req, sender, message)
+    local key = tostring(sender or "")
+    if type(req) == "table" then
+        if type(req.kindMismatchWarned) ~= "table" then
+            req.kindMismatchWarned = {}
+        end
+        if req.kindMismatchWarned[key] then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Repeat kind mismatch from %s for request %s",
+                    key, tostring(req.id))
+            end
+            return
+        end
+        req.kindMismatchWarned[key] = true
+    end
+    if SF.PrintWarning and type(message) == "string" and message ~= "" then
+        SF:PrintWarning(message)
+    end
 end
 
 -- Function Routing options that created this request, when it has any.

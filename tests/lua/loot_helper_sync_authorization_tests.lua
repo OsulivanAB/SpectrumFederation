@@ -657,14 +657,62 @@ local snapDisposition = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, logReq, 
     coordinatorAcceptsAdmins = false,
     expectedKinds = { NEED_PROFILE = true },
 })
-assertEq(snapDisposition, "untrusted", "log-request in-flight trust does not authorize a snapshot")
+assertEq(snapDisposition, "mismatch", "snapshot citing a log request is a kind mismatch")
+Sync.state.helpers = { KINO }
+snapDisposition = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, logReq, {
+    coordinatorAcceptsAdmins = false,
+    expectedKinds = { NEED_PROFILE = true },
+})
+assertEq(snapDisposition, "mismatch", "helper trust does not accept a snapshot for a log request")
 Sync:HandleProfileSnapshot(KINO, {
     sessionId = SESSION,
     profileId = PROFILE,
     requestId = "log-snap",
     snapshot = { meta = { _profileId = PROFILE } },
 })
-assertEq(warningCount("not a trusted sender"), 1, "snapshot citing a log request is rejected")
+assertEq(warningCount("not a trusted sender"), 0, "kind mismatch is not reported as untrusted")
+assertEq(warningCount("does not match the request"), 1, "mismatched snapshot warns once")
+assertTrue(Sync.state.requests["log-snap"] ~= nil, "mismatched snapshot does not complete the log request")
+Sync:HandleProfileSnapshot(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "log-snap",
+    snapshot = { meta = { _profileId = PROFILE } },
+})
+assertEq(warningCount("does not match the request"), 1, "repeat mismatched snapshot does not warn again")
+local profileReq = seedRequest("need-kind", "NEED_PROFILE", { COORD }, COORD)
+Sync.state._profileReqInFlight = SESSION
+local logsDisposition = Sync:_ClassifyPrivilegedResponse(COORD, PROFILE, profileReq, {
+    coordinatorAcceptsAdmins = true,
+    expectedKinds = {
+        NEED_LOGS = true,
+        LOG_REQ = true,
+        ADMIN_LOG_REQ = true,
+    },
+})
+assertEq(logsDisposition, "mismatch", "AUTH_LOGS citing NEED_PROFILE is a kind mismatch")
+Sync:HandleAuthLogs(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-kind",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    logs = { { _author = "Author-Realm", _counter = 1 } },
+})
+assertTrue(Sync.state.requests["need-kind"] ~= nil, "mismatched AUTH_LOGS does not complete NEED_PROFILE")
+assertEq(Sync.state._profileReqInFlight, SESSION, "mismatched AUTH_LOGS leaves the profile request marker")
+local mismatchWarnings = warningCount("AUTH_LOGS")
+Sync:HandleAuthLogs(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-kind",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    logs = { { _author = "Author-Realm", _counter = 1 } },
+})
+assertEq(warningCount("AUTH_LOGS"), mismatchWarnings, "repeat mismatched AUTH_LOGS does not warn again")
 local profileReq = seedRequest("need-snap", "NEED_PROFILE", { KINO }, KINO)
 snapDisposition = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, profileReq, {
     coordinatorAcceptsAdmins = false,
