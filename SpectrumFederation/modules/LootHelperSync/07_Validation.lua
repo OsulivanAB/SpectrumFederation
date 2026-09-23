@@ -190,26 +190,43 @@ function Sync:_CurrentAuthorizedRoutingTargets(opts)
     return out
 end
 
--- Function Align targetIdx with lastTarget inside the replacement list.
+-- Function True when this request already contacted the named peer.
+-- @param req table
+-- @param name string
+-- @return boolean
+function Sync:_RequestAlreadyContacted(req, name)
+    if type(req) ~= "table" or type(name) ~= "string" then return false end
+    if self:_SamePlayer(name, req.lastTarget) then return true end
+    return self:_ResponderMapHas(req.inflightResponders, name)
+end
+
+-- Function Replace request targets without treating newly inserted peers as attempted.
+-- targetIdx stays one before the first peer this request has not contacted, so
+-- the next _PickNextTargetForRequest tries that peer. Peers already contacted
+-- stay acceptable in-flight responders.
 -- @param req table
 -- @param targets table
 -- @return nil
 function Sync:_RetargetRequestList(req, targets)
     req.targets = targets
-    local idx = 0
-    if type(req.lastTarget) == "string" then
-        for i, name in ipairs(targets) do
-            if self:_SamePlayer(name, req.lastTarget) then
-                idx = i
-                break
-            end
+    local firstUnattempted = nil
+    for i, name in ipairs(targets) do
+        if not self:_RequestAlreadyContacted(req, name) then
+            firstUnattempted = i
+            break
         end
     end
-    req.targetIdx = idx
+    if firstUnattempted then
+        req.targetIdx = firstUnattempted - 1
+    else
+        req.targetIdx = #targets
+    end
 end
 
 -- Function Classify a privileged sync response against current auth and this request.
 -- Returns "accept", "stale", "unauthorized", or "untrusted".
+-- Canonical admin checks wait until a local copy of the profile exists. Joining
+-- members import PROFILE_SNAPSHOT before that copy exists.
 -- @param sender string
 -- @param profileId string
 -- @param req table|nil
@@ -220,7 +237,11 @@ function Sync:_ClassifyPrivilegedResponse(sender, profileId, req, opts)
     if type(req) == "table" and self:_ResponderMapHas(req.revokedResponders, sender) then
         return "stale"
     end
-    if not self:IsSenderAuthorized(profileId, sender) then
+    local profileKnown = false
+    if type(profileId) == "string" and profileId ~= "" and type(self.FindLocalProfileById) == "function" then
+        profileKnown = self:FindLocalProfileById(profileId) ~= nil
+    end
+    if profileKnown and not self:IsSenderAuthorized(profileId, sender) then
         return "unauthorized"
     end
     if opts.coordinatorAcceptsAdmins and self.state and self.state.isCoordinator then
@@ -391,6 +412,25 @@ function Sync:_MaybeAssumeCoordinationAfterAdminChange(reason)
     return took == true
 end
 
+-- Function Drop convergence evidence from players who are no longer canonical admins.
+-- @param none
+-- @return nil
+function Sync:_DropUnauthorizedAdminStatuses()
+    if not self:_ProfileAuthorizationKnown() then return end
+    local statuses = self.state and self.state.adminStatuses
+    if type(statuses) ~= "table" then return end
+    local profileId = self.state.profileId
+    local drop = {}
+    for name, _ in pairs(statuses) do
+        if type(name) == "string" and not self:IsSenderAuthorized(profileId, name) then
+            drop[#drop + 1] = name
+        end
+    end
+    for i = 1, #drop do
+        statuses[drop[i]] = nil
+    end
+end
+
 -- Function Reconcile helper routing, outstanding requests, and coordination with canonical admins.
 -- @param profileId string
 -- @param reason string|nil
@@ -403,6 +443,7 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if not self:_ProfileAuthorizationKnown() then return end
 
     self._reconcilingSessionAuthorization = true
+    self:_DropUnauthorizedAdminStatuses()
 
     local changed = false
     if self.ApplyAdvertisedHelpers then

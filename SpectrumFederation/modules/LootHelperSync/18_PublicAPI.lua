@@ -117,9 +117,6 @@ function Sync:TryRestorePersistedSession(reason)
         self.state.rcConfigSeq = (restoredProfile and tonumber(restoredProfile._rcConfigSeq)) or 0
     end
     self.state.helpers = CopyStringArray(persisted.helpers)
-    if self.ApplyAdvertisedHelpers then
-        self:ApplyAdvertisedHelpers(self.state.helpers, "restore")
-    end
     self.state.authorMax = {}
     self.state.authorWindowSummary = {}
     self.state._sentJoinStatusForSessionId = nil
@@ -139,8 +136,20 @@ function Sync:TryRestorePersistedSession(reason)
     hb.missedHeartbeats = 0
     hb.lastTakeoverRound = nil
 
+    -- Canonical admin changes can land before this client reloads. Reconcile
+    -- before scheduling a reannounce so a revoked coordinator cannot advertise
+    -- the stale persisted coordinator identity.
+    if self.ReconcileSessionAuthorization and self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown() then
+        self:ReconcileSessionAuthorization(self.state.profileId, "restore:" .. tostring(reason or "unknown"))
+    elseif self.ApplyAdvertisedHelpers then
+        self:ApplyAdvertisedHelpers(self.state.helpers, "restore")
+    end
+    if not (self.state and self.state.active) then
+        return false
+    end
+
     -- One-shot marker so restored coordinators re-announce exactly once when world/group events settle.
-    self.state._restoredSessionNeedsReannounce = self.state.isCoordinator
+    self.state._restoredSessionNeedsReannounce = self.state.isCoordinator == true
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Restored persisted session state (reason=%s, sessionId=%s, profileId=%s, coordinator=%s, isCoordinator=%s)",
@@ -974,6 +983,14 @@ end
 -- @return nil
 function Sync:ReannounceSession()
     if not self.state.active or not self.state.isCoordinator then return end
+    if self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown()
+        and not self:IsSenderAuthorized(self.state.profileId, self:_SelfId())
+    then
+        if self.RelinquishUnauthorizedCoordination then
+            self:RelinquishUnauthorizedCoordination("reannounce_not_authorized")
+        end
+        return
+    end
 
     local dist = self:_EnforceGroupedSessionActive("ReannounceSession")
     if not dist then return end

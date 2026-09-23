@@ -622,6 +622,89 @@ Sync:HandleNewLog(COORD, {
 })
 assertEq(warningCount("not an admin"), before, "authorized coordinator NEW_LOG is allowed")
 
+-- Trusted PROFILE_SNAPSHOT can bootstrap a profile that does not exist locally yet.
+reset(MEMBER)
+SF.lootHelperDB.profiles = {}
+SF.lootHelperDB.activeProfileId = nil
+local bootReq = seedRequest("need-boot", "NEED_PROFILE", { COORD }, COORD)
+local bootDisposition = Sync:_ClassifyPrivilegedResponse(COORD, PROFILE, bootReq)
+assertEq(bootDisposition, "accept", "trusted snapshot is accepted before the local profile exists")
+local strangerDisposition = Sync:_ClassifyPrivilegedResponse(STRANGER, PROFILE, bootReq)
+assertEq(strangerDisposition, "untrusted", "unknown profile does not make a stranger trusted")
+Sync:HandleProfileSnapshot(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-boot",
+    snapshot = {},
+})
+assertEq(warningCount("PROFILE_SNAPSHOT"), 0, "bootstrap snapshot does not warn")
+Sync:HandleProfileSnapshot(STRANGER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-boot",
+    snapshot = {},
+})
+assertEq(warningCount("not a trusted sender"), 1, "untrusted bootstrap snapshot still warns")
+
+-- A helper inserted ahead of the previous target must be attempted next.
+reset(MEMBER)
+Sync.state.helpers = {}
+seedRequest("need-insert", "NEED_LOGS", { COORD }, COORD)
+Sync:ApplyAdvertisedHelpers({ KINO }, "heartbeat-added-helper")
+need = Sync.state.requests["need-insert"]
+assertEq(need.targets[1], KINO, "inserted helper precedes the previous target")
+assertEq(need.targets[2], COORD, "previous coordinator target stays on the list")
+assertEq(need.targetIdx, 0, "inserted helper is not treated as already attempted")
+Sync:OnRequestTimeout("need-insert")
+assertEq(sendCount(Sync.MSG.NEED_LOGS, KINO), 1, "timeout retries the newly inserted helper")
+assertTrue(Sync.state.requests["need-insert"] ~= nil, "request does not fail before the new helper is tried")
+
+-- Revoked admins cannot keep contributing convergence evidence.
+reset(COORD)
+Sync.state.isCoordinator = true
+Sync.state.helpers = { KINO }
+Sync.state.adminStatuses = {
+    [SUSPENDERS] = { authorMax = { [MEMBER] = 9 } },
+    [KINO] = { authorMax = { [MEMBER] = 9 } },
+}
+setAdmins({ COORD, KINO, OWNER })
+Sync:ReconcileSessionAuthorization(PROFILE, "status-purge")
+assertNil(Sync.state.adminStatuses[SUSPENDERS], "revoked admin status is removed")
+assertTrue(type(Sync.state.adminStatuses[KINO]) == "table", "remaining admin status is kept")
+local providers = Sync:_ProvidersAdvertisingAuthorMax(MEMBER, 1, 9)
+assertTrue(not listHas(providers, SUSPENDERS), "revoked admin is not selected as a provider")
+assertTrue(listHas(providers, KINO), "remaining admin can still be selected")
+
+-- Reload must not resume coordination from a stale persisted coordinator.
+reset(COORD)
+Sync.state.isCoordinator = true
+Sync.state.coordinator = COORD
+Sync.state.helpers = { KINO }
+setAdmins({ KINO, OWNER })
+Sync:_PersistSessionState("before-reload")
+Sync.state.active = false
+Sync.state.isCoordinator = false
+local restored = Sync:TryRestorePersistedSession("reload")
+assertEq(restored, true, "revoked coordinator still restores the session")
+assertEq(Sync.state.active, true, "restored session stays active for a successor")
+assertEq(Sync.state.isCoordinator, false, "reload does not resume a revoked coordinator")
+assertEq(Sync.state._restoredSessionNeedsReannounce, false, "revoked coordinator does not schedule reannounce")
+Sync:_ReannounceRestoredSessionIfNeeded()
+assertEq(sendCount(Sync.MSG.SES_REANNOUNCE), 0, "revoked coordinator does not reannounce after reload")
+
+reset(COORD)
+Sync.state.isCoordinator = true
+Sync.state.coordinator = COORD
+Sync.state.helpers = { KINO }
+setAdmins({ COORD, KINO, OWNER })
+Sync:_PersistSessionState("before-authorized-reload")
+Sync.state.active = false
+Sync.state.isCoordinator = false
+restored = Sync:TryRestorePersistedSession("reload-authorized")
+assertEq(restored, true, "authorized coordinator session restores")
+assertEq(Sync.state.isCoordinator, true, "authorized coordinator resumes after reload")
+assertEq(Sync.state._restoredSessionNeedsReannounce, true, "authorized coordinator schedules one reannounce")
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
