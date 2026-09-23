@@ -594,6 +594,14 @@ function Sync:HandleNewLog(sender, payload)
         then
             self:_RememberSuppressedAutomaticBisOutcome(profileId, logTable)
         end
+        -- The rejected row can sit above a hole in this author's earlier
+        -- counters. Remembering this counter does not fill those rows.
+        if hasGap and type(gapFrom) == "number" and type(gapTo) == "number" and self.RequestGapRepair then
+            local author = (self:_ExtractAuthorCounter(logTable))
+            if type(author) == "string" and author ~= "" then
+                self:RequestGapRepair(profileId, author, gapFrom, gapTo, "new-log-gap")
+            end
+        end
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Ignoring live BIS_OUTCOME from %s; the session coordinator is the automatic writer", tostring(sender))
         end

@@ -7024,6 +7024,72 @@ function testRepairProofAcceptsSuppressedBis()
 end
 testRepairProofAcceptsSuppressedBis()
 
+function testRejectedBisOutcomeStillRequestsGap()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local author = "AdminB-Garona"
+    local profile = makeProfile("GapBeforeReject")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    Sync.state.coordEpoch = 1700000000
+    Sync.state.requests = {}
+    Sync.state.repairQueue = { order = {}, items = {} }
+    Sync.cfg = Sync.cfg or {}
+    local profileId = profile:GetProfileId()
+
+    local prior = SF.LootLog.new(SF.LootLogEventTypes.POINT_CHANGE, {
+        member = WINNER,
+        change = SF.LootLogPointChangeTypes.INCREMENT,
+        amount = 1,
+    }, {
+        profile = profile,
+        author = author,
+        counter = 1,
+        timestamp = 1700001001,
+        skipPermission = true,
+    })
+    assertTrue(prior ~= nil, "preceding point log is valid")
+    assertEq(profile:MergeLogTables({ prior:ToTable() }, { allowUnknownEventType = true }), 1, "counter 1 is stored")
+
+    local data = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    data.sourceLogId = "award-gap"
+    data.awardKey = "award-gap"
+    data.awardMember = WINNER
+    data.qualified = false
+    data.outcome = "NOT_BIS"
+    data.assignedSlots = {}
+    data.itemLink = ITEM_LINK
+    data.itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+    data.response = "Greed"
+    local bisLog = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, data, {
+        profile = profile,
+        author = author,
+        counter = 3,
+        timestamp = 1700005000,
+        skipPermission = true,
+    })
+    assertTrue(bisLog ~= nil, "gapped outcome is valid")
+    Sync:HandleNewLog(author, {
+        sessionId = Sync.state.sessionId,
+        profileId = profileId,
+        log = bisLog:ToTable(),
+    })
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", "award-gap"), 0, "the gapped non-coordinator outcome is not stored")
+    assertEq(Sync:_ComputeContigCounter(profileId, author), 1, "remembering counter 3 does not fill counter 2")
+    local queued = false
+    for _, key in ipairs(Sync.state.repairQueue.order or {}) do
+        local entry = Sync.state.repairQueue.items[key]
+        if type(entry) == "table" and entry.author == author and entry.fromCounter == 2 and entry.toCounter == 2 then
+            queued = true
+        end
+    end
+    assertTrue(queued, "rejecting the outcome still requests the missing earlier counter")
+end
+testRejectedBisOutcomeStillRequestsGap()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
