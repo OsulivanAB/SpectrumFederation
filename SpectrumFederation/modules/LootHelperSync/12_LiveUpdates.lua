@@ -633,6 +633,12 @@ function Sync:HandleNewLog(sender, payload)
     end
     if types.ADMIN_REMOVED and eventType == types.ADMIN_REMOVED and self._DropLiveRemovedAdminStatus then
         self:_DropLiveRemovedAdminStatus(profileId, memberId)
+        -- Rebuild reconcile already ran against the replayed admin list and
+        -- deferred role changes. Apply only the named revocation now that the
+        -- rebuilt profile shows whether this player is still an admin.
+        if self._ApplyExplicitRevocationRouting then
+            self:_ApplyExplicitRevocationRouting("live_admin_removed")
+        end
     end
     self:FlushPendingLiveRelationshipLogs(profileId)
     self:LogSessionPointsSummary(profileId, "live_update")

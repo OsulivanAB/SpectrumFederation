@@ -185,6 +185,11 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
         local toCounter = type(range) == "table" and tonumber(range.toCounter) or nil
         local mode = (type(range) == "table" and range.mode) or opts.mode or "missing"
         local preferredTarget = opts.preferredTarget or (type(range) == "table" and range.preferredTarget) or nil
+        if type(preferredTarget) == "string" and self._PreferredRepairTargetRoutable
+            and not self:_PreferredRepairTargetRoutable(preferredTarget)
+        then
+            preferredTarget = nil
+        end
         local exactAuthor = (mode == "integrity")
             or (type(range) == "table" and range.exactAuthor == true)
             or (opts.exactAuthor == true)
@@ -232,7 +237,14 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                     end
                 else
                     entry.reason = opts.reason or entry.reason
-                    entry.preferredTarget = preferredTarget or entry.preferredTarget
+                    if self._PreferredRepairTargetRoutable and type(entry.preferredTarget) == "string"
+                        and not self:_PreferredRepairTargetRoutable(entry.preferredTarget)
+                    then
+                        entry.preferredTarget = nil
+                    end
+                    if type(preferredTarget) == "string" and preferredTarget ~= "" then
+                        entry.preferredTarget = preferredTarget
+                    end
                     if exactAuthor then
                         entry.exactAuthor = true
                     end
@@ -265,6 +277,11 @@ end
 
 function Sync:_DispatchQueuedRepair(entry)
     if type(entry) ~= "table" then return false end
+    if type(entry.preferredTarget) == "string" and self._PreferredRepairTargetRoutable
+        and not self:_PreferredRepairTargetRoutable(entry.preferredTarget)
+    then
+        entry.preferredTarget = nil
+    end
     if entry.mode == "integrity" then
         local integrityRange = {
             author = entry.author,

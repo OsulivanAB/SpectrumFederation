@@ -996,7 +996,11 @@ end
 assertTrue(catchUpReq ~= nil, "catch-up profile request is outstanding")
 assertEq(Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, catchUpReq, {
     expectedKinds = { NEED_PROFILE = true },
-}), "accept", "in-flight catch-up snapshot is accepted")
+}), "unproven", "in-flight catch-up snapshot without a grant is not accepted")
+assertEq(Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, catchUpReq, {
+    expectedKinds = { NEED_PROFILE = true },
+    catchUpProven = true,
+}), "accept", "in-flight catch-up snapshot is accepted once the grant is proven")
 assertEq(Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, nil, {
     expectedKinds = { NEED_PROFILE = true },
 }), "unauthorized", "unsolicited catch-up snapshot is rejected")
@@ -1035,6 +1039,242 @@ Sync:HandleNewLog(COORD, {
     },
 })
 assertEq(warningCount("not an admin"), 1, "revoked coordinator NEW_LOG warns once")
+
+-- Catch-up replies must prove the sender's grant before any merge.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.helpers = {}
+Sync.state.coordinator = KINO
+Sync.state._coordinatorCatchUp = KINO
+local catchLogs = seedRequest("need-catch-logs", "NEED_LOGS", { KINO }, KINO)
+catchLogs.meta.integrityRepair = true
+local mergeOpts = nil
+local mergeCalls = 0
+Sync.MergeLogs = function(_, _, _, opts)
+    mergeCalls = mergeCalls + 1
+    mergeOpts = opts
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+local function catchLogsPayload(logs)
+    return {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        requestId = "need-catch-logs",
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+        logs = logs,
+    }
+end
+Sync:HandleAuthLogs(KINO, catchLogsPayload({
+    { _author = "Author-Realm", _counter = 1, _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
+}))
+assertEq(mergeCalls, 0, "catch-up AUTH_LOGS without a grant is not merged")
+assertTrue(Sync.state.requests["need-catch-logs"] ~= nil, "unproven catch-up leaves the log request open")
+assertEq(warningCount("coordinator authority is not established yet"), 1, "unproven catch-up warns once")
+Sync:HandleAuthLogs(KINO, catchLogsPayload({
+    { _author = "Author-Realm", _counter = 1, _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
+}))
+assertEq(warningCount("coordinator authority is not established yet"), 1, "repeat unproven catch-up does not warn again")
+Sync:HandleAuthLogs(KINO, catchLogsPayload({
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+    {
+        _author = "Author-Realm",
+        _counter = 2,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}))
+assertEq(mergeCalls, 0, "catch-up AUTH_LOGS that ends in removal is not merged")
+Sync:HandleAuthLogs(KINO, catchLogsPayload({
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}))
+assertEq(mergeCalls, 1, "catch-up AUTH_LOGS with ADMIN_ADDED is merged")
+assertEq(mergeOpts.allowReplaceExisting, false, "unproven canonical admin cannot replace existing rows")
+profile.ImportSnapshot = function(_, _, opts)
+    mergeOpts = opts
+    return false, 0, "stop-before-rebuild"
+end
+local catchSnap = seedRequest("need-catch-snap", "NEED_PROFILE", { KINO }, KINO)
+local function catchSnapPayload(admins, logs)
+    return {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        requestId = "need-catch-snap",
+        snapshot = {
+            meta = { _profileId = PROFILE },
+            adminUsers = admins,
+            lootLogs = logs,
+        },
+    }
+end
+mergeOpts = nil
+Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ OWNER }, nil))
+assertNil(mergeOpts, "catch-up snapshot without the sender in adminUsers is not imported")
+assertTrue(Sync.state.requests["need-catch-snap"] ~= nil, "unproven snapshot leaves the profile request open")
+Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, {
+    {
+        _eventType = "ADMIN_REMOVED",
+        _author = KINO,
+        _counter = 1,
+        _data = { member = KINO },
+    },
+}))
+assertNil(mergeOpts, "catch-up snapshot whose logs revoke the sender is not imported")
+Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, nil))
+assertEq(mergeOpts and mergeOpts.allowReplaceExisting, false, "catch-up snapshot does not replace rows before the grant is local")
+assertTrue(Sync.state.requests["need-catch-snap"] ~= nil, "failed catch-up import leaves the profile request open")
+Sync.MergeLogs = function()
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+
+-- A gapped rebuild must not relinquish, take over, or drop helper routes.
+reset(KINO)
+setAdmins({ KINO })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+Sync.state.helpers = { OWNER }
+local gapReq = seedRequest("need-gap", "NEED_LOGS", { OWNER, COORD }, nil)
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_update")
+assertEq(Sync.state.isCoordinator, false, "gapped rebuild does not take over coordination")
+assertEq(Sync.state.coordinator, COORD, "gapped rebuild keeps the advertised coordinator")
+assertTrue(listHas(Sync.state.helpers, OWNER), "gapped rebuild keeps helper routes")
+gapReq = Sync.state.requests["need-gap"]
+assertTrue(listHas(gapReq.targets, OWNER), "gapped rebuild keeps the helper request target")
+assertTrue(listHas(gapReq.targets, COORD), "gapped rebuild keeps the coordinator request target")
+Sync:ReconcileSessionAuthorization(PROFILE, "admin-list-complete")
+assertEq(Sync.state.isCoordinator, true, "non-rebuild reconcile still lets the remaining admin take over")
+
+reset(COORD)
+Sync.state.isCoordinator = true
+setAdmins({ KINO, OWNER })
+Sync.state.helpers = { KINO }
+local announced = false
+Sync.state._adminConvergence = {
+    pendingCount = 0,
+    pendingReq = {},
+    expected = {},
+    finished = false,
+    onComplete = function()
+        announced = true
+    end,
+}
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_update")
+assertEq(Sync.state.isCoordinator, true, "gapped rebuild does not relinquish the coordinator")
+assertEq(announced, false, "gapped rebuild does not finish admin convergence")
+assertTrue(type(Sync.state._adminConvergence) == "table", "gapped rebuild keeps convergence state")
+assertTrue(listHas(Sync.state.helpers, KINO), "gapped rebuild keeps the helper list")
+
+reset(MEMBER)
+setAdmins({ COORD })
+Sync.state.helpers = { SUSPENDERS, KINO }
+Sync:_RememberRevokedRoute(SUSPENDERS)
+local explicitReq = seedRequest("need-explicit", "NEED_LOGS", { SUSPENDERS, KINO, COORD }, SUSPENDERS)
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_update")
+assertTrue(not listHas(Sync.state.helpers, SUSPENDERS), "explicit revocation drops that helper during rebuild")
+assertTrue(listHas(Sync.state.helpers, KINO), "gapped helper stays when only someone else was revoked")
+explicitReq = Sync.state.requests["need-explicit"]
+assertTrue(not listHas(explicitReq.targets, SUSPENDERS), "explicit revocation drops that request target")
+assertTrue(listHas(explicitReq.targets, KINO), "gapped request target stays during rebuild")
+
+-- Losing admin must not finish convergence and announce before relinquish.
+reset(COORD)
+Sync.state.isCoordinator = true
+setAdmins({ KINO, OWNER })
+Sync.state.helpers = { KINO }
+announced = false
+local convReq = seedRequest("admin-conv", "ADMIN_LOG_REQ", { KINO }, nil)
+Sync.state._adminConvergence = {
+    pendingCount = 1,
+    pendingReq = { ["admin-conv"] = true },
+    expected = {},
+    finished = false,
+    onComplete = function()
+        announced = true
+    end,
+}
+Sync:ReconcileSessionAuthorization(PROFILE, "coordinator-removed")
+assertEq(announced, false, "revocation does not run the convergence completion hook")
+assertNil(Sync.state._adminConvergence, "revocation abandons admin convergence")
+assertNil(Sync.state.requests["admin-conv"], "revocation fails the admin log request")
+assertEq(Sync.state.isCoordinator, false, "revocation stops coordination")
+assertEq(sendCount(Sync.MSG.SES_START), 0, "revocation does not broadcast session start")
+assertEq(sendCount(Sync.MSG.SES_REANNOUNCE), 0, "revocation does not reannounce")
+assertTrue(convReq ~= nil, "admin request object was created")
+
+-- Queued integrity repairs drop a revoked preferred target.
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.repairQueue = {
+    order = { "repair-1" },
+    items = {
+        ["repair-1"] = {
+            key = "repair-1",
+            profileId = PROFILE,
+            author = "Author-Realm",
+            fromCounter = 1,
+            toCounter = 2,
+            mode = "integrity",
+            exactAuthor = true,
+            preferredTarget = SUSPENDERS,
+        },
+    },
+}
+Sync:ReconcileSessionAuthorization(PROFILE, "drop-repair-target")
+assertNil(Sync.state.repairQueue.items["repair-1"].preferredTarget, "reconcile clears a revoked repair target")
+local dispatchedOk = Sync:_DispatchQueuedRepair(Sync.state.repairQueue.items["repair-1"])
+assertEq(dispatchedOk, true, "repair dispatch falls back after the preferred target is cleared")
+local dispatched = nil
+for _, req in pairs(Sync.state.requests) do
+    dispatched = req
+end
+assertTrue(dispatched ~= nil, "fallback repair request is registered")
+assertTrue(not listHas(dispatched.targets, SUSPENDERS), "dispatch does not target the revoked player")
+assertEq(dispatched.targets[1], COORD, "dispatch falls back to the coordinator")
+local queuedPreferred = "unset"
+Sync.QueueRepairRanges = function(_, _, _, opts)
+    queuedPreferred = opts and opts.preferredTarget or nil
+    return true
+end
+local requeueReq = seedRequest("need-requeue", "NEED_LOGS", { SUSPENDERS }, SUSPENDERS)
+requeueReq.meta.backgroundRepair = true
+requeueReq.meta.integrityRepair = true
+requeueReq.meta.exactAuthor = true
+requeueReq.meta.preferredTarget = SUSPENDERS
+Sync:_FailRequest(requeueReq, "revoked-target")
+assertNil(queuedPreferred, "failed repair does not requeue the revoked preferred target")
+Sync.QueueRepairRanges = function()
+    return false
+end
+
+-- Re-granting an admin clears the request tombstone once they are a target again.
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+local regrant = seedRequest("need-regrant", "NEED_LOGS", { SUSPENDERS, COORD }, SUSPENDERS)
+Sync:ReconcileSessionAuthorization(PROFILE, "revoke-for-regrant")
+regrant = Sync.state.requests["need-regrant"]
+assertTrue(Sync:_ResponderMapHas(regrant.revokedResponders, SUSPENDERS), "removed admin is tombstoned")
+setAdmins({ COORD, SUSPENDERS, KINO, OWNER })
+Sync.state.helpers = { SUSPENDERS, KINO }
+Sync:ReconcileSessionAuthorization(PROFILE, "regrant-admin")
+regrant = Sync.state.requests["need-regrant"]
+assertTrue(listHas(regrant.targets, SUSPENDERS), "re-granted admin is a target again")
+assertTrue(not Sync:_ResponderMapHas(regrant.revokedResponders, SUSPENDERS), "re-grant clears the responder tombstone")
+assertEq(Sync:_ClassifyPrivilegedResponse(SUSPENDERS, PROFILE, regrant, {
+    expectedKinds = { NEED_LOGS = true, LOG_REQ = true, ADMIN_LOG_REQ = true },
+}), "accept", "re-granted admin response is accepted")
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

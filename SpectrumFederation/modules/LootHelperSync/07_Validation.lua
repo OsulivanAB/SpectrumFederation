@@ -224,6 +224,12 @@ end
 function Sync:_RememberInflightResponder(req, name)
     if type(req) ~= "table" then return end
     req.inflightResponders = req.inflightResponders or {}
+    -- A re-granted admin can be contacted again. The old revocation tombstone
+    -- must not discard that later response. A gapped rebuild must not clear it
+    -- merely because the route has not been explicitly revoked yet.
+    if self:_IsKnownAuthorizedTarget(name) then
+        self:_ForgetResponder(req.revokedResponders, name)
+    end
     self:_RememberResponder(req.inflightResponders, name)
 end
 
@@ -296,17 +302,138 @@ function Sync:_RetargetRequestList(req, targets)
     end
 end
 
+-- Function Read the admin-grant effect of one log for a player.
+-- @param logTable table
+-- @param name string "Name-Realm"
+-- @return string|nil "grant", "revoke", or nil when the log does not change this player
+function Sync:_LogAdminGrantState(logTable, name)
+    if type(logTable) ~= "table" or type(name) ~= "string" or name == "" then return nil end
+    local eventType = logTable._eventType or logTable.eventType
+    local data = logTable._data or logTable.data
+    if type(data) ~= "table" or type(data.member) ~= "string" then return nil end
+    if not self:_SamePlayer(data.member, name) then return nil end
+    local types = SF.LootLogEventTypes or {}
+    local added = types.ADMIN_ADDED or "ADMIN_ADDED"
+    local removed = types.ADMIN_REMOVED or "ADMIN_REMOVED"
+    local roleChange = types.ROLE_CHANGE or "ROLE_CHANGE"
+    local adminRole = (SF.MemberRoles and SF.MemberRoles.ADMIN) or "ADMIN"
+    local memberRole = (SF.MemberRoles and SF.MemberRoles.MEMBER) or "MEMBER"
+    if eventType == added then return "grant" end
+    if eventType == removed then return "revoke" end
+    if eventType == roleChange and data.newRole == adminRole then return "grant" end
+    if eventType == roleChange and data.newRole == memberRole then return "revoke" end
+    return nil
+end
+
+-- Function True when ordered logs end with this player granted admin.
+-- A later ADMIN_REMOVED in the same payload cancels an earlier grant.
+-- @param logs table
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_LogsEstablishAdminGrant(logs, name)
+    if type(logs) ~= "table" then return false end
+    local granted = false
+    for _, logTable in ipairs(logs) do
+        local state = self:_LogAdminGrantState(logTable, name)
+        if state == "grant" then
+            granted = true
+        elseif state == "revoke" then
+            granted = false
+        end
+    end
+    return granted
+end
+
+-- Function True when a snapshot's admin list names this player.
+-- @param snapshot table
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_SnapshotListsAdmin(snapshot, name)
+    local admins = type(snapshot) == "table" and snapshot.adminUsers or nil
+    if type(admins) ~= "table" then return false end
+    for _, admin in ipairs(admins) do
+        if self:_SamePlayer(admin, name) then return true end
+    end
+    return false
+end
+
+-- Function Catch-up snapshots must list the sender as an admin before import.
+-- When the snapshot also carries admin-grant logs, those logs must still end
+-- with the sender granted. Unrelated history does not cancel a listed admin.
+-- @param sender string "Name-Realm"
+-- @param snapshot table
+-- @return boolean
+function Sync:_CatchUpSnapshotProvesGrant(sender, snapshot)
+    if not self:_SnapshotListsAdmin(snapshot, sender) then return false end
+    local logs = nil
+    if type(snapshot) == "table" then
+        logs = snapshot.logs or snapshot.lootLogs or snapshot._lootLogs
+    end
+    if type(logs) ~= "table" or #logs == 0 then return true end
+    local mentioned = false
+    for _, logTable in ipairs(logs) do
+        if self:_LogAdminGrantState(logTable, sender) then
+            mentioned = true
+            break
+        end
+    end
+    if not mentioned then return true end
+    return self:_LogsEstablishAdminGrant(logs, sender)
+end
+
+-- Function True when an exact-repair preferred target is still a live route.
+-- Canonical admins who are no longer coordinator or helper are not routes.
+-- An advertised catch-up coordinator remains routable. Revoked players do not.
+-- @param name string|nil "Name-Realm"
+-- @return boolean
+function Sync:_PreferredRepairTargetRoutable(name)
+    if type(name) ~= "string" or name == "" then return false end
+    if self:_RouteWasRevoked(name) then return false end
+    if type(self._CurrentAuthorizedRoutingTargets) ~= "function" then return false end
+    local routes = self:_CurrentAuthorizedRoutingTargets({
+        preferCoordinatorFirst = true,
+        preferredTarget = name,
+    })
+    for _, route in ipairs(routes) do
+        if self:_SamePlayer(route, name) then return true end
+    end
+    return false
+end
+
+-- Function Drop queued repair targets that are no longer allowed to answer.
+-- @param explicitOnly boolean|nil When true, clear only players already revoked
+-- @return nil
+function Sync:_SanitizeQueuedRepairTargets(explicitOnly)
+    local queue = self.state and self.state.repairQueue
+    if type(queue) ~= "table" or type(queue.items) ~= "table" then return end
+    for _, entry in pairs(queue.items) do
+        if type(entry) == "table" and type(entry.preferredTarget) == "string" then
+            local drop = false
+            if explicitOnly then
+                drop = self:_RouteWasRevoked(entry.preferredTarget)
+            else
+                drop = not self:_PreferredRepairTargetRoutable(entry.preferredTarget)
+            end
+            if drop then
+                entry.preferredTarget = nil
+            end
+        end
+    end
+end
+
 -- Function Classify a privileged sync response against current auth and this request.
--- Returns "accept", "stale", "unauthorized", "untrusted", or "mismatch".
+-- Returns "accept", "stale", "unauthorized", "untrusted", "unproven", or "mismatch".
 -- Canonical admin checks wait until a local copy of the profile exists. Joining
 -- members import PROFILE_SNAPSHOT before that copy exists.
 -- A cited request of the wrong kind is a mismatch even when the sender is a
 -- coordinator or helper. Missing requests stay on the trusted-sender path so a
 -- snapshot can still bootstrap a profile.
+-- Catch-up from an advertised coordinator is accepted only when opts.catchUpProven
+-- is true. Callers set that after the payload itself grants the sender.
 -- @param sender string
 -- @param profileId string
 -- @param req table|nil
--- @param opts table|nil { coordinatorAcceptsAdmins = bool, expectedKinds = table }
+-- @param opts table|nil { coordinatorAcceptsAdmins = bool, expectedKinds = table, catchUpProven = bool }
 -- @return string
 function Sync:_ClassifyPrivilegedResponse(sender, profileId, req, opts)
     opts = type(opts) == "table" and opts or {}
@@ -333,6 +460,11 @@ function Sync:_ClassifyPrivilegedResponse(sender, profileId, req, opts)
             and self:_ResponderMapHas(req.inflightResponders, sender)
         if not catchUp then
             return "unauthorized"
+        end
+        -- Correlation alone is not a grant. The payload must show this sender
+        -- becoming an admin before any of its other rows are merged.
+        if opts.catchUpProven ~= true then
+            return "unproven"
         end
     end
     if opts.coordinatorAcceptsAdmins and self.state and self.state.isCoordinator then
@@ -373,6 +505,32 @@ function Sync:_NoteResponseKindMismatch(req, sender, message)
     end
 end
 
+-- Function Warn once when a catch-up response does not prove the sender's grant.
+-- The request stays open so a later proof-bearing response can still land.
+-- @param req table|nil
+-- @param sender string
+-- @param message string
+-- @return nil
+function Sync:_NoteUnprovenCatchUp(req, sender, message)
+    local key = tostring(sender or "")
+    if type(req) == "table" then
+        if type(req.unprovenCatchUpWarned) ~= "table" then
+            req.unprovenCatchUpWarned = {}
+        end
+        if req.unprovenCatchUpWarned[key] then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "Repeat unproven catch-up from %s for request %s",
+                    key, tostring(req.id))
+            end
+            return
+        end
+        req.unprovenCatchUpWarned[key] = true
+    end
+    if SF.PrintWarning and type(message) == "string" and message ~= "" then
+        SF:PrintWarning(message)
+    end
+end
+
 -- Function Routing options that created this request, when it has any.
 -- Exact and integrity repairs keep preferredTarget and coordinator-first order.
 -- @param req table
@@ -406,29 +564,53 @@ end
 -- Function Refresh outstanding request targets based on current helpers/coordinator.
 -- Canonical admin revocation removes targets. Routing-only changes keep already-sent
 -- responders acceptable until that response arrives, but future sends use the new list.
--- @param none
+-- explicitRevocationsOnly keeps targets that a gapped rebuild merely cannot see yet,
+-- and drops players already recorded in revokedRoutes.
+-- @param opts table|nil { explicitRevocationsOnly = bool }
 -- @return nil
-function Sync:_RefreshOutstandingRequestTargets()
+function Sync:_RefreshOutstandingRequestTargets(opts)
     if not self.state or not self.state.requests then return end
+    opts = type(opts) == "table" and opts or {}
+    local explicitOnly = opts.explicitRevocationsOnly == true
 
-    local defaultRoutes = self:_CurrentAuthorizedRoutingTargets()
+    local defaultRoutes = explicitOnly and nil or self:_CurrentAuthorizedRoutingTargets()
     local profileKnown = self:_ProfileAuthorizationKnown()
     local me = self:_SelfId()
     local selfAuthorized = (not profileKnown) or self:IsSenderAuthorized(self.state.profileId, me)
     local toFail = {}
 
+    local function targetRevoked(name)
+        if explicitOnly then
+            return self:_RouteWasRevoked(name)
+        end
+        return not self:_IsKnownAuthorizedTarget(name)
+    end
+
+    local function clearRestoredTombstone(req, name)
+        if type(name) ~= "string" or name == "" then return end
+        if targetRevoked(name) then return end
+        if not self:_IsKnownAuthorizedTarget(name) then return end
+        self:_ForgetResponder(req.revokedResponders, name)
+    end
+
     for _, req in pairs(self.state.requests) do
         if type(req) == "table" then
             if type(req.lastTarget) == "string" and (tonumber(req.attempt) or 0) > 0 then
-                if self:_IsKnownAuthorizedTarget(req.lastTarget) then
-                    self:_RememberInflightResponder(req, req.lastTarget)
-                else
+                if targetRevoked(req.lastTarget) then
                     self:_RememberRevokedResponder(req, req.lastTarget)
+                elseif not self:_ResponderMapHas(req.revokedResponders, req.lastTarget) then
+                    self:_RememberInflightResponder(req, req.lastTarget)
                 end
             end
 
             local failReason = nil
-            if req.kind == "ADMIN_LOG_REQ" and not self.state.isCoordinator then
+            if explicitOnly then
+                if (req.kind == "ADMIN_LOG_REQ" or req.kind == "LOG_REQ") and self:_RouteWasRevoked(me) then
+                    failReason = "no longer authorized"
+                elseif req.kind == "ADMIN_LOG_REQ" and not self.state.isCoordinator then
+                    failReason = "no longer coordinator"
+                end
+            elseif req.kind == "ADMIN_LOG_REQ" and not self.state.isCoordinator then
                 failReason = "no longer coordinator"
             elseif (req.kind == "ADMIN_LOG_REQ" or req.kind == "LOG_REQ") and not selfAuthorized then
                 failReason = "no longer authorized"
@@ -439,16 +621,31 @@ function Sync:_RefreshOutstandingRequestTargets()
             elseif req.kind == "NEED_PROFILE" or req.kind == "NEED_LOGS" then
                 local oldTargets = req.targets or {}
                 for _, name in ipairs(oldTargets) do
-                    if not self:_IsKnownAuthorizedTarget(name) then
+                    if targetRevoked(name) then
                         self:_RememberRevokedResponder(req, name)
+                    else
+                        clearRestoredTombstone(req, name)
                     end
                 end
-                local routeOpts = self:_RequestRoutingOpts(req)
-                local nextTargets = routeOpts and self:_CurrentAuthorizedRoutingTargets(routeOpts) or defaultRoutes
+                local nextTargets = oldTargets
+                if not explicitOnly then
+                    local routeOpts = self:_RequestRoutingOpts(req)
+                    nextTargets = routeOpts and self:_CurrentAuthorizedRoutingTargets(routeOpts) or defaultRoutes
+                else
+                    nextTargets = {}
+                    for _, name in ipairs(oldTargets) do
+                        if not targetRevoked(name) then
+                            table.insert(nextTargets, name)
+                        end
+                    end
+                end
+                for _, name in ipairs(nextTargets) do
+                    clearRestoredTombstone(req, name)
+                end
                 -- An empty route before a successor is stored would fail the request
                 -- on the next send. Hold the existing list until takeover or a
                 -- heartbeat names someone requests can use.
-                local holdForSuccessor = #nextTargets == 0
+                local holdForSuccessor = (not explicitOnly) and #nextTargets == 0
                     and (not profileKnown or not self:_CoordinatorIsCurrentRoute())
                 if not holdForSuccessor and not self:_SamePlayerList(oldTargets, nextTargets) then
                     self:_RetargetRequestList(req, self:_CopyPlayerList(nextTargets))
@@ -457,10 +654,11 @@ function Sync:_RefreshOutstandingRequestTargets()
                 local oldTargets = req.targets or {}
                 local kept = {}
                 for _, name in ipairs(oldTargets) do
-                    if self:_IsKnownAuthorizedTarget(name) then
-                        table.insert(kept, name)
-                    else
+                    if targetRevoked(name) then
                         self:_RememberRevokedResponder(req, name)
+                    else
+                        clearRestoredTombstone(req, name)
+                        table.insert(kept, name)
                     end
                 end
                 if not self:_SamePlayerList(oldTargets, kept) then
@@ -477,24 +675,48 @@ function Sync:_RefreshOutstandingRequestTargets()
     end
 end
 
+-- Function Drop an in-progress convergence without running its announce hook.
+-- Request failure during revocation must not broadcast a session this client
+-- is no longer allowed to coordinate.
+-- @param reason string|nil
+-- @return nil
+function Sync:_AbandonAdminConvergence(reason)
+    local conv = self.state and self.state._adminConvergence
+    if type(conv) ~= "table" then return end
+    conv.finished = true
+    conv.onComplete = nil
+    self.state._adminConvergence = nil
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Abandoned admin convergence without announcing (reason=%s)",
+            tostring(reason or "unknown"))
+    end
+end
+
 -- Function Stop privileged coordination after this client loses canonical admin.
 -- Another in-group admin takes over through the existing takeover path.
 -- With no eligible replacement, the session ends.
+-- Convergence is abandoned before outstanding admin requests fail, so the
+-- completion hook cannot announce a session this client no longer coordinates.
 -- @param reason string|nil
+-- @param opts table|nil { explicitRevocationsOnly = bool }
 -- @return boolean True when coordination was relinquished
-function Sync:RelinquishUnauthorizedCoordination(reason)
+function Sync:RelinquishUnauthorizedCoordination(reason, opts)
     if not (self.state and self.state.active and self.state.isCoordinator) then return false end
     local profileId = self.state.profileId
     if not self:_ProfileAuthorizationKnown() then return false end
     if self:IsSenderAuthorized(profileId, self:_SelfId()) then return false end
     if self._relinquishingCoordination then return false end
+    opts = type(opts) == "table" and opts or {}
     self._relinquishingCoordination = true
 
+    self:_AbandonAdminConvergence(reason)
     if self.StopHeartbeatSender then
         self:StopHeartbeatSender("coordinator_lost_admin:" .. tostring(reason or "unknown"))
     end
     if self._RefreshOutstandingRequestTargets then
-        self:_RefreshOutstandingRequestTargets()
+        self:_RefreshOutstandingRequestTargets({
+            explicitRevocationsOnly = opts.explicitRevocationsOnly == true,
+        })
     end
 
     local candidates = {}
@@ -622,6 +844,47 @@ function Sync:_DropLiveRemovedAdminStatus(profileId, name)
     end
 end
 
+-- Function Apply revocations already recorded, without reading a gapped admin list.
+-- A rebuild can omit ADMIN_ADDED for peers who are still canonical. Only players
+-- in revokedRoutes lose routes here. Takeover waits for a non-rebuild reconcile
+-- so candidate order is not chosen from that incomplete list.
+-- @param reason string|nil
+-- @return nil
+function Sync:_ApplyExplicitRevocationRouting(reason)
+    if not self.state then return end
+    local me = self:_SelfId()
+    if self.state.isCoordinator and self:_RouteWasRevoked(me) then
+        self:RelinquishUnauthorizedCoordination(reason or "admin_removed", {
+            explicitRevocationsOnly = true,
+        })
+        if not (self.state and self.state.active) then return end
+    end
+
+    local helpers = self:_CopyPlayerList(self.state.helpers)
+    local kept = {}
+    local changed = false
+    for _, name in ipairs(helpers) do
+        if self:_RouteWasRevoked(name) then
+            changed = true
+        else
+            table.insert(kept, name)
+        end
+    end
+    if changed then
+        self.state.helpers = kept
+        if SF.Debug then
+            SF.Debug:Info("SYNC", "Helper routing dropped explicit revocations (%s, count=%d)",
+                tostring(reason or "update"), #kept)
+        end
+    end
+    if self._RefreshOutstandingRequestTargets then
+        self:_RefreshOutstandingRequestTargets({ explicitRevocationsOnly = true })
+    end
+    if self._SanitizeQueuedRepairTargets then
+        self:_SanitizeQueuedRepairTargets(true)
+    end
+end
+
 -- Function Reconcile helper routing, outstanding requests, and coordination with canonical admins.
 -- @param profileId string
 -- @param reason string|nil
@@ -639,16 +902,33 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     -- their ADMIN_STATUS windows are still the evidence that identity-admin
     -- reconcile must wait on. An explicit admin-list change still drops every
     -- revoked entry. A single live ADMIN_REMOVED drops only that player.
+    -- Rebuilds defer helper filtering, request retarget, relinquish, and
+    -- takeover unless a player was already recorded in revokedRoutes.
     local reasonText = tostring(reason or "")
-        if reasonText:sub(1, 8) ~= "rebuild:" then
-            self:_DropUnauthorizedAdminStatuses()
-            local coordinator = self.state.coordinator
-            if type(coordinator) == "string" and coordinator ~= ""
-                and not self:IsSenderAuthorized(profileId, coordinator)
-            then
-                self:_RememberRevokedRoute(coordinator)
-            end
-        end
+    if reasonText:sub(1, 8) == "rebuild:" then
+        self:_ApplyExplicitRevocationRouting(reasonText)
+        self._reconcilingSessionAuthorization = nil
+        return
+    end
+
+    self:_DropUnauthorizedAdminStatuses()
+    local coordinator = self.state.coordinator
+    if type(coordinator) == "string" and coordinator ~= ""
+        and not self:IsSenderAuthorized(profileId, coordinator)
+    then
+        self:_RememberRevokedRoute(coordinator)
+    end
+
+    local me = self:_SelfId()
+    local selfAuthorized = self:IsSenderAuthorized(profileId, me)
+    -- Abandon convergence before request refresh can finish it and announce.
+    if self.state.isCoordinator and not selfAuthorized then
+        self:RelinquishUnauthorizedCoordination(reason or "admin_removed")
+    end
+    if not (self.state and self.state.active) then
+        self._reconcilingSessionAuthorization = nil
+        return
+    end
 
     local changed = false
     if self.ApplyAdvertisedHelpers then
@@ -657,12 +937,11 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if not changed and self._RefreshOutstandingRequestTargets then
         self:_RefreshOutstandingRequestTargets()
     end
+    if self._SanitizeQueuedRepairTargets then
+        self:_SanitizeQueuedRepairTargets(false)
+    end
 
-    local me = self:_SelfId()
-    local selfAuthorized = self:IsSenderAuthorized(profileId, me)
-    if self.state.isCoordinator and not selfAuthorized then
-        self:RelinquishUnauthorizedCoordination(reason or "admin_removed")
-    elseif changed and self.state.isCoordinator and selfAuthorized and self.BroadcastSessionHeartbeat then
+    if changed and self.state.isCoordinator and selfAuthorized and self.BroadcastSessionHeartbeat then
         self:BroadcastSessionHeartbeat()
     elseif (not self.state.isCoordinator) and self._MaybeAssumeCoordinationAfterAdminChange then
         self:_MaybeAssumeCoordinationAfterAdminChange(reason or "admin_removed")

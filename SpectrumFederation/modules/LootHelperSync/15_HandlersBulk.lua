@@ -110,14 +110,20 @@ function Sync:HandleAuthLogs(sender, payload)
     -- routing-only helper change. Future sends use the refreshed target list.
     local disposition = "unauthorized"
     if self._ClassifyPrivilegedResponse then
-        disposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, req, {
+        local classifyOpts = {
             coordinatorAcceptsAdmins = true,
             expectedKinds = {
                 NEED_LOGS = true,
                 LOG_REQ = true,
                 ADMIN_LOG_REQ = true,
             },
-        })
+        }
+        if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
+            and self._LogsEstablishAdminGrant
+        then
+            classifyOpts.catchUpProven = self:_LogsEstablishAdminGrant(payload.logs, sender) == true
+        end
+        disposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, req, classifyOpts)
     elseif self.state.isCoordinator then
         disposition = self:IsSenderAuthorized(payload.profileId, sender) and "accept" or "unauthorized"
     elseif not self:IsTrustedDataSender(sender) then
@@ -131,6 +137,11 @@ function Sync:HandleAuthLogs(sender, payload)
     if disposition == "mismatch" then
         self:_NoteResponseKindMismatch(req, sender,
             ("Ignoring AUTH_LOGS from %s: response does not match the request."):format(tostring(sender)))
+        return
+    end
+    if disposition == "unproven" then
+        self:_NoteUnprovenCatchUp(req, sender,
+            ("Ignoring AUTH_LOGS from %s: coordinator authority is not established yet."):format(tostring(sender)))
         return
     end
     if disposition == "stale" then
@@ -209,9 +220,14 @@ function Sync:HandleAuthLogs(sender, payload)
 
     -- Metrics: measure merge duration
     local t0 = debugprofilestop and debugprofilestop() or nil
+    -- Stored coordinator is not enough. Replacing rows requires a canonical admin.
+    -- A catch-up packet may insert the grant, but it must not overwrite history
+    -- until that grant is already in the local profile.
+    local senderIsCanonicalAdmin = self:IsSenderAuthorized(payload.profileId, sender) == true
     local allowReplaceExisting = (req.meta and req.meta.integrityRepair == true)
+        and senderIsCanonicalAdmin
         and (
-            (self.state.isCoordinator and self:IsSenderAuthorized(payload.profileId, sender))
+            self.state.isCoordinator
             or self:_SamePlayer(sender, self.state.coordinator)
         )
     local changed, mergeDetails = self:MergeLogs(payload.profileId, payload.logs, {
@@ -376,10 +392,16 @@ function Sync:HandleProfileSnapshot(sender, payload)
     end
     local snapDisposition = "untrusted"
     if self._ClassifyPrivilegedResponse then
-        snapDisposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, snapReq, {
+        local classifyOpts = {
             coordinatorAcceptsAdmins = false,
             expectedKinds = { NEED_PROFILE = true },
-        })
+        }
+        if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
+            and self._CatchUpSnapshotProvesGrant
+        then
+            classifyOpts.catchUpProven = self:_CatchUpSnapshotProvesGrant(sender, payload.snapshot) == true
+        end
+        snapDisposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, snapReq, classifyOpts)
     elseif self:IsSenderAuthorized(payload.profileId, sender) and self:IsTrustedDataSender(sender) then
         snapDisposition = "accept"
     elseif not self:IsSenderAuthorized(payload.profileId, sender) then
@@ -388,6 +410,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if snapDisposition == "mismatch" then
         self:_NoteResponseKindMismatch(snapReq, sender,
             ("Ignoring PROFILE_SNAPSHOT from %s: response does not match the request."):format(tostring(sender)))
+        return
+    end
+    if snapDisposition == "unproven" then
+        self:_NoteUnprovenCatchUp(snapReq, sender,
+            ("Ignoring PROFILE_SNAPSHOT from %s: coordinator authority is not established yet."):format(tostring(sender)))
         return
     end
     if snapDisposition == "stale" then
@@ -487,9 +514,13 @@ function Sync:HandleProfileSnapshot(sender, payload)
 
     -- Metrics: measure import duration
     local t0 = debugprofilestop and debugprofilestop() or nil
+    local replaceExisting = true
+    if self:_ProfileAuthorizationKnown() and not self:IsSenderAuthorized(profileId, sender) then
+        replaceExisting = false
+    end
     local okImport, inserted, importErr = profile:ImportSnapshot(payload.snapshot, {
         allowUnknownEventType = true,
-        allowReplaceExisting = true,
+        allowReplaceExisting = replaceExisting,
     })
     if t0 then
         self:_MObserve("sync.merge.profile_snapshot.import_ms", debugprofilestop() - t0)

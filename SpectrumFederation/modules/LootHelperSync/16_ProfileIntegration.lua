@@ -2678,6 +2678,12 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
     self:_BindSessionWindowEvidence(ranges)
 
     local targets = nil
+    if type(preferredTarget) == "string" and preferredTarget ~= ""
+        and self._PreferredRepairTargetRoutable
+        and not self:_PreferredRepairTargetRoutable(preferredTarget)
+    then
+        preferredTarget = nil
+    end
     if type(preferredTarget) == "string" and preferredTarget ~= "" then
         targets = { preferredTarget }
     elseif self.state.isCoordinator then
