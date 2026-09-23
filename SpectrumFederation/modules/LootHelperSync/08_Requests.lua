@@ -139,6 +139,9 @@ function Sync:_SendAdminLogReq(req, target)
         exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
         integrityRepair = meta.integrityRepair == true or nil,
     }
+    if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(target) then
+        payload.needsAdminGrant = true
+    end
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.LOG_REQ, payload, "WHISPER", target, "NORMAL")
 end
@@ -215,6 +218,12 @@ function Sync:_SendNeedLogsReq(req, target)
                             and SF.SyncProtocol.GetSupportedEncodings()
                             or nil,
     }
+    -- Only a catch-up coordinator is asked to attach an admin grant. Other
+    -- peers keep the historical requested-window payload so older receivers
+    -- do not reject the repair.
+    if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(target) then
+        payload.needsAdminGrant = true
+    end
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, payload, "WHISPER", target, "NORMAL")
 end

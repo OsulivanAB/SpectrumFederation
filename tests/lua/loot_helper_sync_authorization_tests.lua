@@ -1392,6 +1392,142 @@ local revokedServe = {}
 Sync:_AppendSelfAdminGrantEvidence(revokedServe, profile)
 assertEq(#revokedServe, 0, "a later removal does not attach a stale grant")
 
+-- Ordinary repairs keep the requested window. Only catch-up asks for the grant.
+reset(KINO)
+profile._lootLogs = {
+    {
+        _author = "Other-Realm",
+        _counter = 4,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}
+local function lastAuthLogs()
+    local found = nil
+    for _, sent in ipairs(sends) do
+        if sent.msgType == Sync.MSG.AUTH_LOGS then
+            found = sent
+        end
+    end
+    return found
+end
+local function authLogHasGrant(sent)
+    local logs = sent and sent.payload and sent.payload.logs or {}
+    for _, logTable in ipairs(logs) do
+        if logTable._eventType == "ADMIN_ADDED" then
+            return true
+        end
+    end
+    return false
+end
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "window-only",
+    missing = {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+    },
+})
+local windowOnly = lastAuthLogs()
+assertTrue(windowOnly ~= nil, "ordinary NEED_LOGS still serves the requested window")
+assertTrue(not authLogHasGrant(windowOnly), "ordinary NEED_LOGS does not attach an out-of-range grant")
+sends = {}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "catch-up-serve",
+    needsAdminGrant = true,
+    missing = {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+    },
+})
+local catchUpServe = lastAuthLogs()
+assertTrue(authLogHasGrant(catchUpServe), "catch-up NEED_LOGS attaches the sender admin grant")
+sends = {}
+Sync:HandleLogRequest(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "logreq-window",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+})
+assertTrue(not authLogHasGrant(lastAuthLogs()), "ordinary LOG_REQ does not attach an out-of-range grant")
+sends = {}
+Sync:HandleLogRequest(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "logreq-catch",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    needsAdminGrant = true,
+})
+assertTrue(authLogHasGrant(lastAuthLogs()), "catch-up LOG_REQ attaches the sender admin grant")
+reset(MEMBER)
+setAdmins({ OWNER })
+local plainNeed = Sync:_SendNeedLogsReq({
+    id = "plain-need",
+    meta = {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+    },
+}, KINO)
+assertEq(plainNeed, true, "ordinary NEED_LOGS send succeeds")
+assertNil(sends[#sends].payload.needsAdminGrant, "ordinary NEED_LOGS does not ask for an admin grant")
+Sync.state.coordinator = KINO
+Sync.state._coordinatorCatchUp = KINO
+local catchNeed = Sync:_SendNeedLogsReq({
+    id = "catch-need",
+    meta = {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+    },
+}, KINO)
+assertEq(catchNeed, true, "catch-up NEED_LOGS send succeeds")
+assertEq(sends[#sends].payload.needsAdminGrant, true, "catch-up NEED_LOGS asks for an admin grant")
+reset(KINO)
+setAdmins({ KINO, OWNER })
+Sync.state.isCoordinator = false
+local plainLog = Sync:_SendLogReq({
+    id = "plain-log",
+    meta = {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+    },
+}, COORD)
+assertEq(plainLog, true, "ordinary LOG_REQ send succeeds")
+assertNil(sends[#sends].payload.needsAdminGrant, "ordinary LOG_REQ does not ask for an admin grant")
+Sync.state.coordinator = COORD
+Sync.state._coordinatorCatchUp = COORD
+local catchLog = Sync:_SendLogReq({
+    id = "catch-log",
+    meta = {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+    },
+}, COORD)
+assertEq(catchLog, true, "catch-up LOG_REQ send succeeds")
+assertEq(sends[#sends].payload.needsAdminGrant, true, "catch-up LOG_REQ asks for an admin grant")
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

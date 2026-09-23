@@ -2587,6 +2587,9 @@ function Sync:_SendLogReq(req, target)
         exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
         integrityRepair = meta.integrityRepair == true or nil,
     }
+    if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(target) then
+        payload.needsAdminGrant = true
+    end
 
     return SF.LootHelperComm:Send(
         "CONTROL",

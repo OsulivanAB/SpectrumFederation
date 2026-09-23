@@ -192,12 +192,10 @@ function Sync:HandleAuthLogs(sender, payload)
             
             -- Verify all received logs are for the correct author and within requested range
             local exactRepair = self:_IsExactAuthorRepair(req.meta)
-            local catchUpSender = self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
             for _, logTable in ipairs(payload.logs) do
-                -- The serving coordinator may attach the admin grant that proves
-                -- catch-up. That log is often a different author than the gap.
-                local grantProof = catchUpSender and self._LogAdminGrantState
-                    and self:_LogAdminGrantState(logTable, sender)
+                -- An attached admin grant may name another author. It is proof,
+                -- not a reason to reject the requested window.
+                local grantProof = self._LogAdminGrantState and self:_LogAdminGrantState(logTable, sender)
                 if not grantProof then
                     local logAuthor = logTable._author or logTable.author
                     local logCounter = logTable._counter or logTable.counter
@@ -208,7 +206,9 @@ function Sync:HandleAuthLogs(sender, payload)
                             SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log author %s doesn't match requested %s (exactAuthor=%s)",
                                 tostring(logAuthor), tostring(requestedAuthor), tostring(exactRepair))
                         end
-                        self:_RetryRequestSoon(req)
+                        if self._RetryRequestSoon then
+                            self:_RetryRequestSoon(req)
+                        end
                         return
                     end
 
@@ -217,7 +217,9 @@ function Sync:HandleAuthLogs(sender, payload)
                             SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log counter %d outside requested range [%d-%d]",
                                 logCounter, requestedFrom, requestedTo)
                         end
-                        self:_RetryRequestSoon(req)
+                        if self._RetryRequestSoon then
+                            self:_RetryRequestSoon(req)
+                        end
                         return
                     end
                 end
@@ -240,7 +242,24 @@ function Sync:HandleAuthLogs(sender, payload)
             )
     end
     local allowReplaceExisting = replaceAllowed()
-    local logsToMerge = payload.logs
+    local logsToMerge = {}
+    for _, logTable in ipairs(payload.logs) do
+        local logAuthor = logTable._author or logTable.author
+        local logCounter = tonumber(logTable._counter or logTable.counter)
+        local inRange = true
+        if req.meta and type(req.meta.author) == "string"
+            and type(req.meta.fromCounter) == "number" and type(req.meta.toCounter) == "number"
+            and self._AuthorMatchesRepairRequest
+        then
+            local exactRepair = self:_IsExactAuthorRepair(req.meta)
+            inRange = self:_AuthorMatchesRepairRequest(logAuthor, req.meta.author, exactRepair)
+                and not (type(logCounter) == "number"
+                    and (logCounter < req.meta.fromCounter or logCounter > req.meta.toCounter))
+        end
+        if inRange then
+            logsToMerge[#logsToMerge + 1] = logTable
+        end
+    end
     local grantChanged = false
     local catchUpMerge = (not senderIsCanonicalAdmin)
         and self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)

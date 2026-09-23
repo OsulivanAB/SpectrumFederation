@@ -937,7 +937,7 @@ function Sync:HandleNeedLogs(sender, payload)
                     end
                 end
 
-                if self._AppendSelfAdminGrantEvidence then
+                if payload.needsAdminGrant == true and self._AppendSelfAdminGrantEvidence then
                     self:_AppendSelfAdminGrantEvidence(out, profile)
                 end
 
@@ -1039,7 +1039,7 @@ function Sync:HandleLogRequest(sender, payload)
         end
     end
 
-    if self._AppendSelfAdminGrantEvidence then
+    if payload.needsAdminGrant == true and self._AppendSelfAdminGrantEvidence then
         self:_AppendSelfAdminGrantEvidence(out, profile)
     end
 
