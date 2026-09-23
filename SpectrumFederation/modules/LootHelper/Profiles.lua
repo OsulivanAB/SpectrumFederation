@@ -2458,24 +2458,42 @@ function LootProfile:HiddenLootLogIds()
 	local hidden = {}
 	local winners = {}
 	local rcByKey = {}
+	local replacedBonusKeys = {}
+	local bonusIds = {}
 	local Bis = SF.LootHelperBis
 	local types = SF.LootLogEventTypes or {}
 	local notBis = Bis and Bis.OUTCOME and Bis.OUTCOME.NOT_BIS or "NOT_BIS"
 	local logs = self._lootLogs or {}
 	local Identity = SF.LootHelperIdentity
+	local LootLog = SF.LootLog
 	local ordered = (Identity and Identity.OrderLogs and Identity.OrderLogs(logs)) or logs
 	-- Index every RC source first. Outcome timestamps can sort ahead of the
 	-- history timestamp, and source consistency still has to see that RC row.
 	for i = 1, #logs do
 		local log = logs[i]
 		local eventType = log.GetEventType and log:GetEventType() or log._eventType
+		local id = log.GetID and log:GetID() or log._id
+		if eventType == types.BONUS_ROLL and type(id) == "string" then
+			bonusIds[id] = true
+		end
+	end
+	for i = 1, #logs do
+		local log = logs[i]
+		local eventType = log.GetEventType and log:GetEventType() or log._eventType
 		local data = log.GetEventData and log:GetEventData() or log._data
 		if eventType == types.RC_LOOT_COUNCIL and type(data) == "table" and type(data.awardKey) == "string" then
-			if data.responseId == "BONUS_ROLL" then
+			local replaced = false
+			if data.responseId == "BONUS_ROLL" and LootLog and LootLog.MakeBonusRollExternalId then
+				local author = (log.GetAuthor and log:GetAuthor()) or log._author
+				local replacement = LootLog.MakeBonusRollExternalId(author, data.rcAwardId, data.member, data.itemLink or data.itemString, data.owner)
+				replaced = type(replacement) == "string" and bonusIds[replacement] == true
+			end
+			if replaced then
 				local id = log.GetID and log:GetID() or log._id
 				if type(id) == "string" then
 					hidden[id] = true
 				end
+				replacedBonusKeys[data.awardKey] = true
 			else
 				rcByKey[data.awardKey] = log
 			end
@@ -2489,15 +2507,19 @@ function LootProfile:HiddenLootLogIds()
 			local id = log.GetID and log:GetID() or log._id
 			if type(id) == "string" and type(data) == "table" then
 				local awardKey = data.awardKey
-				local consistent = Bis and Bis.IsOutcomeSourceConsistent
-					and type(awardKey) == "string"
-					and Bis.IsOutcomeSourceConsistent(data, rcByKey[awardKey])
-				if not consistent or winners[awardKey] then
+				if type(awardKey) == "string" and replacedBonusKeys[awardKey] then
 					hidden[id] = true
 				else
-					winners[awardKey] = id
-					if data.outcome == notBis then
+					local consistent = Bis and Bis.IsOutcomeSourceConsistent
+						and type(awardKey) == "string"
+						and Bis.IsOutcomeSourceConsistent(data, rcByKey[awardKey])
+					if not consistent or winners[awardKey] then
 						hidden[id] = true
+					else
+						winners[awardKey] = id
+						if data.outcome == notBis then
+							hidden[id] = true
+						end
 					end
 				end
 			end
@@ -2816,17 +2838,16 @@ function LootProfile:ReconcileInsertedRCAwards(awardKeys, opts)
     local wrote = 0
     for i = 1, #awardKeys do
         local awardKey = awardKeys[i]
-        if not self:HasSourceConsistentBisOutcome(awardKey) then
-            local rcId = self:GetRCAwardLogId(awardKey)
-            local rcLog = rcId and self._logById and self._logById[rcId] or nil
-            local rcData = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
-            if type(rcData) == "table" and rcData.responseId == "BONUS_ROLL" then
-                self:NormalizeLegacyBonusRollRC(rcLog)
-            elseif rcLog then
-                local ok = self:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
-                if ok then
-                    wrote = wrote + 1
-                end
+        local rcId = self:GetRCAwardLogId(awardKey)
+        local rcLog = rcId and self._logById and self._logById[rcId] or nil
+        local rcData = rcLog and ((rcLog.GetEventData and rcLog:GetEventData()) or rcLog._data)
+        if type(rcData) == "table" and rcData.responseId == "BONUS_ROLL" then
+            -- A 1.5.4 BIS_OUTCOME must not block the visible bonus-roll row.
+            self:NormalizeLegacyBonusRollRC(rcLog)
+        elseif rcLog and not self:HasSourceConsistentBisOutcome(awardKey) then
+            local ok = self:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
+            if ok then
+                wrote = wrote + 1
             end
         end
     end
@@ -2875,7 +2896,9 @@ function LootProfile:ReconcileMissingAutomaticBisOutcomes()
         local eventType = log.GetEventType and log:GetEventType() or log._eventType
         local data = log.GetEventData and log:GetEventData() or log._data
         local awardKey = type(data) == "table" and data.awardKey or nil
-        if eventType == types.RC_LOOT_COUNCIL and type(awardKey) == "string" and not covered[awardKey] and not queued[awardKey] then
+        local isLegacyBonus = eventType == types.RC_LOOT_COUNCIL and type(data) == "table" and data.responseId == "BONUS_ROLL"
+        if eventType == types.RC_LOOT_COUNCIL and type(awardKey) == "string" and not queued[awardKey]
+            and (isLegacyBonus or not covered[awardKey]) then
             queued[awardKey] = true
             keys[#keys + 1] = awardKey
         end

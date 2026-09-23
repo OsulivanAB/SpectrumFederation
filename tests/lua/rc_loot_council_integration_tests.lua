@@ -5741,6 +5741,62 @@ function testSingleWriterAndBonusRolls()
     assertEq(countLootEvents(peers[2], "BIS_OUTCOME", nil), 0, "follower import does not create BIS_OUTCOME")
     assertEq(peers[2]:NormalizeInsertedLegacyBonusRolls(mergeDetails.insertedRcAwardKeys), 0, "a second normalize pass does not append")
 
+    -- A 1.5.4 BIS_OUTCOME must not keep the bonus roll hidden with no replacement.
+    local covered = makeProfile("CoveredBonus")
+    addMember(covered, WINNER)
+    local coveredCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700006403-11",
+        response = "Bonus Loot",
+        responseID = "BONUS_ROLL",
+        lootWon = HEAD_LINK,
+        equipLoc = "INVTYPE_HEAD",
+    }))
+    local coveredRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(coveredCanon), {
+        profile = covered,
+        author = AWARDER,
+        timestamp = coveredCanon.timestamp,
+        externalId = coveredCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(covered:AddLootLog(coveredRc, { skipPermission = true, skipBroadcast = true }), "covered legacy bonus RC row is stored")
+    local coveredOutcome = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    coveredOutcome.sourceLogId = coveredCanon.awardKey
+    coveredOutcome.awardKey = coveredCanon.awardKey
+    coveredOutcome.awardMember = WINNER
+    coveredOutcome.qualified = true
+    coveredOutcome.outcome = "ASSIGNED"
+    coveredOutcome.assignedSlots = { "Head" }
+    coveredOutcome.slotBinding = "BOUND"
+    coveredOutcome.assignmentScopeMembers = { WINNER }
+    coveredOutcome.equipLoc = "INVTYPE_HEAD"
+    coveredOutcome.itemFamily = "ordinary"
+    coveredOutcome.itemLink = HEAD_LINK
+    coveredOutcome.itemString = SF.LootLog.ExtractItemString(HEAD_LINK)
+    coveredOutcome.response = "Bonus Loot"
+    local coveredOutcomeLog = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, coveredOutcome, {
+        profile = covered,
+        author = owners[1],
+        timestamp = coveredCanon.timestamp + 1,
+        skipPermission = true,
+    })
+    assertTrue(covered:AddLootLog(coveredOutcomeLog, { skipPermission = true, skipBroadcast = true }), "legacy bonus BIS_OUTCOME is stored")
+    assertTrue(covered:HasSourceConsistentBisOutcome(coveredCanon.awardKey), "legacy bonus outcome is source-consistent")
+    local beforeReplace = covered:HiddenLootLogIds()
+    assertTrue(beforeReplace[coveredRc:GetID()] ~= true, "legacy bonus RC stays visible until a BONUS_ROLL exists")
+    local previousProfileId = Sync.state.profileId
+    Sync.state.profileId = covered:GetProfileId()
+    Sync.state.active = true
+    Sync.state.isCoordinator = true
+    assertEq(covered:ReconcileMissingAutomaticBisOutcomes(), 0, "promotion does not append another BIS_OUTCOME")
+    Sync.state.profileId = previousProfileId
+    assertEq(countLootEvents(covered, "BONUS_ROLL", nil), 1, "promotion still synthesizes the bonus roll")
+    assertEq(countLootEvents(covered, "BIS_OUTCOME", coveredCanon.awardKey), 1, "the stored BIS_OUTCOME is left in place")
+    local afterReplace = covered:HiddenLootLogIds()
+    assertTrue(afterReplace[coveredRc:GetID()] == true, "legacy bonus RC is hidden once the bonus roll exists")
+    assertTrue(afterReplace[coveredOutcomeLog:GetID()] == true, "legacy bonus BIS_OUTCOME is hidden once the bonus roll exists")
+    assertEq(visibleLootEvents(covered, "BONUS_ROLL", nil), 1, "Loot Logs shows the replacement bonus roll")
+
     local invalidBonus = {
         version = 2,
         _id = bonusCanon.awardKey,
