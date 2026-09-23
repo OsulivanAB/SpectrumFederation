@@ -42,7 +42,74 @@ end
 function Sync:_IsKnownAuthorizedTarget(name)
     if type(name) ~= "string" or name == "" then return false end
     if not self:_ProfileAuthorizationKnown() then return true end
-    return self:IsSenderAuthorized(self.state.profileId, name) == true
+    if self:IsSenderAuthorized(self.state.profileId, name) == true then return true end
+    return self:_CoordinatorNeedsCatchUp(name) == true
+end
+
+-- Function Remember a player whose admin route was explicitly revoked.
+-- A later re-grant clears this when authorization is checked.
+-- @param name string "Name-Realm"
+-- @return nil
+function Sync:_RememberRevokedRoute(name)
+    if type(name) ~= "string" or name == "" or not self.state then return end
+    self.state.revokedRoutes = self.state.revokedRoutes or {}
+    self:_RememberResponder(self.state.revokedRoutes, name)
+    if type(self.state._coordinatorCatchUp) == "string" and self:_SamePlayer(self.state._coordinatorCatchUp, name) then
+        self.state._coordinatorCatchUp = nil
+    end
+end
+
+-- Function True when this player was explicitly removed and is not an admin again.
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_RouteWasRevoked(name)
+    if not (self.state and type(self.state.revokedRoutes) == "table") then return false end
+    if self:_ProfileAuthorizationKnown() and self:IsSenderAuthorized(self.state.profileId, name) then
+        self:_ForgetResponder(self.state.revokedRoutes, name)
+        return false
+    end
+    return self:_ResponderMapHas(self.state.revokedRoutes, name)
+end
+
+-- Function Allow catch-up only for an advertised coordinator the local profile has not revoked.
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_CoordinatorNeedsCatchUp(name)
+    if not (self.state and type(name) == "string") then return false end
+    if type(self.state._coordinatorCatchUp) ~= "string" or not self:_SamePlayer(self.state._coordinatorCatchUp, name) then
+        return false
+    end
+    if not self:_SamePlayer(name, self.state.coordinator) then return false end
+    if self:_RouteWasRevoked(name) then
+        self.state._coordinatorCatchUp = nil
+        return false
+    end
+    if self:_ProfileAuthorizationKnown() and self:IsSenderAuthorized(self.state.profileId, name) then
+        self.state._coordinatorCatchUp = nil
+        return false
+    end
+    return true
+end
+
+-- Function Record whether the coordinator just advertised still needs a catch-up request.
+-- Revoked coordinators stay blocked. A coordinator the local admin list has not seen yet
+-- remains routable until a correlated snapshot or log response arrives.
+-- @param name string "Name-Realm"
+-- @return nil
+function Sync:_NoteAdvertisedCoordinator(name)
+    if not self.state or type(name) ~= "string" or name == "" then return end
+    if not self:_SamePlayer(name, self.state.coordinator) then return end
+    local previous = self.state._coordinatorCatchUp
+    if self:_RouteWasRevoked(name) or not self:_ProfileAuthorizationKnown()
+        or self:IsSenderAuthorized(self.state.profileId, name)
+    then
+        self.state._coordinatorCatchUp = nil
+    else
+        self.state._coordinatorCatchUp = name
+    end
+    if self.state._coordinatorCatchUp ~= previous and self._RefreshOutstandingRequestTargets then
+        self:_RefreshOutstandingRequestTargets()
+    end
 end
 
 -- Function Compare two ordered player lists.
@@ -183,7 +250,10 @@ function Sync:_CurrentAuthorizedRoutingTargets(opts)
     for _, name in ipairs(targets) do
         -- Preferred repair targets must still be a current coordinator or helper.
         -- A former helper who remains an admin is not a new request target.
-        if self:IsSenderAuthorized(profileId, name) and self:IsTrustedDataSender(name) then
+        local authorized = self:IsSenderAuthorized(profileId, name) and self:IsTrustedDataSender(name)
+        -- The advertised coordinator can still be asked for the log or snapshot that
+        -- proves a missed ADMIN_ADDED. A coordinator this client already revoked cannot.
+        if authorized or self:_CoordinatorNeedsCatchUp(name) then
             table.insert(out, name)
         end
     end
@@ -258,7 +328,12 @@ function Sync:_ClassifyPrivilegedResponse(sender, profileId, req, opts)
         profileKnown = self:FindLocalProfileById(profileId) ~= nil
     end
     if profileKnown and not self:IsSenderAuthorized(profileId, sender) then
-        return "unauthorized"
+        local catchUp = self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
+            and type(req) == "table"
+            and self:_ResponderMapHas(req.inflightResponders, sender)
+        if not catchUp then
+            return "unauthorized"
+        end
     end
     if opts.coordinatorAcceptsAdmins and self.state and self.state.isCoordinator then
         return "accept"
@@ -323,6 +398,7 @@ function Sync:_CoordinatorIsCurrentRoute()
         return false
     end
     if not self:_ProfileAuthorizationKnown() then return true end
+    if self:_CoordinatorNeedsCatchUp(self.state.coordinator) then return true end
     return self:IsSenderAuthorized(self.state.profileId, self.state.coordinator)
         and self:IsTrustedDataSender(self.state.coordinator)
 end
@@ -504,6 +580,7 @@ function Sync:_DropUnauthorizedAdminStatuses()
     end
     for i = 1, #drop do
         statuses[drop[i]] = nil
+        self:_RememberRevokedRoute(drop[i])
     end
 end
 
@@ -524,6 +601,7 @@ function Sync:_DropNamedAdminStatus(name)
     end
     for i = 1, #drop do
         statuses[drop[i]] = nil
+        self:_RememberRevokedRoute(drop[i])
     end
 end
 
@@ -539,6 +617,9 @@ function Sync:_DropLiveRemovedAdminStatus(profileId, name)
         return
     end
     self:_DropNamedAdminStatus(name)
+    if self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown() then
+        self:_RememberRevokedRoute(name)
+    end
 end
 
 -- Function Reconcile helper routing, outstanding requests, and coordination with canonical admins.
@@ -559,9 +640,15 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     -- reconcile must wait on. An explicit admin-list change still drops every
     -- revoked entry. A single live ADMIN_REMOVED drops only that player.
     local reasonText = tostring(reason or "")
-    if reasonText:sub(1, 8) ~= "rebuild:" then
-        self:_DropUnauthorizedAdminStatuses()
-    end
+        if reasonText:sub(1, 8) ~= "rebuild:" then
+            self:_DropUnauthorizedAdminStatuses()
+            local coordinator = self.state.coordinator
+            if type(coordinator) == "string" and coordinator ~= ""
+                and not self:IsSenderAuthorized(profileId, coordinator)
+            then
+                self:_RememberRevokedRoute(coordinator)
+            end
+        end
 
     local changed = false
     if self.ApplyAdvertisedHelpers then

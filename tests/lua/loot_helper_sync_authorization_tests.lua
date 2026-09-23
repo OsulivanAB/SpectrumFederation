@@ -268,6 +268,9 @@ local function reset(selfName)
     Sync.state._profileReqInFlight = nil
     Sync.state._noProfileTargetWarnedFor = nil
     Sync.state._noLogTargetWarnedFor = nil
+    Sync.state._coordinatorCatchUp = nil
+    Sync.state.revokedRoutes = nil
+    Sync.state._newLogUnauthorizedWarned = nil
     Sync.state._sentJoinStatusForSessionId = nil
     Sync.state._sessionAnnounced = SESSION
     Sync._reconcilingSessionAuthorization = nil
@@ -968,6 +971,70 @@ assertEq(Sync:RequestProfileSnapshot("route-back"), true, "profile request proce
 assertEq(warningCount("Cannot request profile"), 1, "restored profile route does not warn")
 Sync:RequestMissingLogs(missing, "route-back")
 assertEq(warningCount("Cannot request missing logs"), 1, "restored log route does not warn")
+
+-- A successor the local profile has not yet recorded stays routable until their response arrives.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.helpers = {}
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+Sync:HandleCoordinatorTakeover(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+local catchUpRoutes = Sync:_CurrentAuthorizedRoutingTargets()
+assertTrue(listHas(catchUpRoutes, KINO), "unknown successor coordinator remains a catch-up route")
+assertEq(Sync:RequestProfileSnapshot("catch-up"), true, "profile request can target the unknown coordinator")
+local catchUpReq = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.kind == "NEED_PROFILE" then
+        catchUpReq = req
+    end
+end
+assertTrue(catchUpReq ~= nil, "catch-up profile request is outstanding")
+assertEq(Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, catchUpReq, {
+    expectedKinds = { NEED_PROFILE = true },
+}), "accept", "in-flight catch-up snapshot is accepted")
+assertEq(Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, nil, {
+    expectedKinds = { NEED_PROFILE = true },
+}), "unauthorized", "unsolicited catch-up snapshot is rejected")
+
+-- A coordinator this client already revoked does not become a catch-up route.
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync.state.helpers = {}
+Sync:ReconcileSessionAuthorization(PROFILE, "remove-coordinator")
+Sync:_NoteAdvertisedCoordinator(COORD)
+assertNil(Sync.state._coordinatorCatchUp, "revoked coordinator is not marked for catch-up")
+assertTrue(not listHas(Sync:_CurrentAuthorizedRoutingTargets(), COORD), "revoked coordinator is not routed")
+
+-- Repeated NEW_LOG from a revoked coordinator warns once.
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync:HandleNewLog(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    log = {
+        _eventType = "POINT_CHANGE",
+        _author = COORD,
+        _counter = 1,
+        _data = { member = MEMBER },
+    },
+})
+Sync:HandleNewLog(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    log = {
+        _eventType = "POINT_CHANGE",
+        _author = COORD,
+        _counter = 2,
+        _data = { member = MEMBER },
+    },
+})
+assertEq(warningCount("not an admin"), 1, "revoked coordinator NEW_LOG warns once")
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

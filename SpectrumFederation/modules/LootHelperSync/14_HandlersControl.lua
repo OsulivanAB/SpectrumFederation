@@ -275,6 +275,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
     self.state._sessionDescriptorAt = self:_Now()
+    if self._NoteAdvertisedCoordinator then
+        self:_NoteAdvertisedCoordinator(payload.coordinator)
+    end
     self:_PersistSessionState("HandleSessionReannounce")
 
     if type(payload.safeMode) == "table" then
@@ -430,6 +433,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
+    if self._NoteAdvertisedCoordinator then
+        self:_NoteAdvertisedCoordinator(payload.coordinator)
+    end
     if not sameStream then
         self.state._sessionDescriptorAt = self:_Now()
         self:_PersistSessionState("HandleSessionHeartbeat")
@@ -620,6 +626,9 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
+    if self._NoteAdvertisedCoordinator then
+        self:_NoteAdvertisedCoordinator(payload.coordinator)
+    end
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")

@@ -398,6 +398,40 @@ function Sync:BroadcastNewLog(profileId, logTable)
     return true, nil
 end
 
+-- Function Warn once while this sender remains unauthorized for the session profile.
+-- Later packets stay in debug until authorization changes.
+-- @param sender string
+-- @param profileId string
+-- @return nil
+function Sync:_WarnUnauthorizedNewLog(sender, profileId)
+    local sessionId = (self.state and self.state.sessionId) or ""
+    local key = tostring(sessionId) .. "\0" .. tostring(profileId) .. "\0" .. tostring(sender)
+    self.state._newLogUnauthorizedWarned = self.state._newLogUnauthorizedWarned or {}
+    if self.state._newLogUnauthorizedWarned[key] then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting NEW_LOG from %s for profile %s: not an admin.",
+                tostring(sender), tostring(profileId))
+        end
+        return
+    end
+    self.state._newLogUnauthorizedWarned[key] = true
+    if SF.PrintWarning then
+        SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
+    end
+end
+
+-- Function Allow a later revocation to warn again after this sender is authorized.
+-- @param sender string
+-- @param profileId string
+-- @return nil
+function Sync:_ClearUnauthorizedNewLogWarning(sender, profileId)
+    local warned = self.state and self.state._newLogUnauthorizedWarned
+    if type(warned) ~= "table" then return end
+    local sessionId = (self.state and self.state.sessionId) or ""
+    local key = tostring(sessionId) .. "\0" .. tostring(profileId) .. "\0" .. tostring(sender)
+    warned[key] = nil
+end
+
 -- Function Handle NEW_LOG message; dedupe/apply and request gaps if needed.
 -- @param sender string "Name-Realm" of sender
 -- @param payload table Decoded message payload
@@ -478,11 +512,10 @@ function Sync:HandleNewLog(sender, payload)
             return
         end
         if not self:IsSenderAuthorized(profileId, sender) then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
-            end
+            self:_WarnUnauthorizedNewLog(sender, profileId)
             return
         end
+        self:_ClearUnauthorizedNewLogWarning(sender, profileId)
         local ready, missing, hasPredGap, predFrom, predTo = self:_LiveRelationshipPredecessorState(profileId, logTable)
         if not ready then
             self:_QueuePendingLiveRelationship(profileId, sender, logTable)
@@ -511,11 +544,10 @@ function Sync:HandleNewLog(sender, payload)
     elseif not isRelationship then
         -- Coordinator routing does not bypass canonical admin authorization.
         if not self:IsSenderAuthorized(profileId, sender) then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
-            end
+            self:_WarnUnauthorizedNewLog(sender, profileId)
             return
         end
+        self:_ClearUnauthorizedNewLogWarning(sender, profileId)
     end
     
     -- Dedupe by logId

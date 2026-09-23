@@ -125,6 +125,9 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._profileReqInFlight = nil
     self.state._noProfileTargetWarnedFor = nil
     self.state._noLogTargetWarnedFor = nil
+    self.state._coordinatorCatchUp = nil
+    self.state.revokedRoutes = nil
+    self.state._newLogUnauthorizedWarned = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = self:_Now()
 
@@ -800,6 +803,9 @@ function Sync:_ResetSessionState(reason)
     self.state._profileReqInFlight = nil
     self.state._noProfileTargetWarnedFor = nil
     self.state._noLogTargetWarnedFor = nil
+    self.state._coordinatorCatchUp = nil
+    self.state.revokedRoutes = nil
+    self.state._newLogUnauthorizedWarned = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = nil
 
