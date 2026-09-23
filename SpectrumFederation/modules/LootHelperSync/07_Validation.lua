@@ -950,7 +950,7 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     -- before this runs. Peers can disappear from that incomplete list while
     -- their ADMIN_STATUS windows are still the evidence that identity-admin
     -- reconcile must wait on. An explicit admin-list change still drops every
-    -- revoked entry. A single live ADMIN_REMOVED drops only that player.
+    -- revoked entry. A live ADMIN_REMOVED or ROLE_CHANGE to member drops only that player.
     -- A live NEW_LOG rebuild can omit ADMIN_ADDED rows that are still in
     -- flight. Defer helper filtering, retarget, relinquish, and takeover
     -- unless a player was already recorded in revokedRoutes.

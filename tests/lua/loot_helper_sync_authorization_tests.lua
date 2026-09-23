@@ -777,6 +777,90 @@ Sync:_DropLiveRemovedAdminStatus(PROFILE, SUSPENDERS)
 assertNil(Sync.state.adminStatuses[SUSPENDERS], "live ADMIN_REMOVED drops only a player who lost admin")
 assertTrue(type(Sync.state.adminStatuses[KINO]) == "table", "other advertiser status survives a live removal")
 
+-- A live ROLE_CHANGE to member is the same named revocation. A promotion is not.
+reset(MEMBER)
+setAdmins({ COORD, SUSPENDERS, KINO, OWNER })
+Sync.state.helpers = { SUSPENDERS, KINO }
+Sync.state.adminStatuses = {
+    [SUSPENDERS] = { authorMax = { [MEMBER] = 3 } },
+    [KINO] = { authorMax = { [MEMBER] = 3 } },
+}
+seedRequest("need-demote", "NEED_LOGS", { SUSPENDERS, KINO, COORD }, SUSPENDERS)
+profile.AddLootLog = function()
+    return true
+end
+Sync.RebuildProfile = function(self, profileId, reason)
+    setAdmins({ COORD, KINO, OWNER })
+    self:ReconcileSessionAuthorization(profileId, "rebuild:" .. reason)
+    return true
+end
+Sync:HandleNewLog(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    log = {
+        _eventType = "ROLE_CHANGE",
+        _author = COORD,
+        _counter = 1,
+        _data = { member = SUSPENDERS, newRole = "MEMBER" },
+    },
+})
+assertTrue(not listHas(Sync.state.helpers, SUSPENDERS), "live member demotion drops that helper")
+assertTrue(listHas(Sync.state.helpers, KINO), "live member demotion keeps other helpers")
+assertTrue(not listHas(Sync.state.requests["need-demote"].targets, SUSPENDERS),
+    "live member demotion drops that request target")
+assertNil(Sync.state.adminStatuses[SUSPENDERS], "live member demotion drops that advertiser status")
+assertTrue(type(Sync.state.adminStatuses[KINO]) == "table", "live member demotion keeps other advertiser status")
+
+reset(MEMBER)
+setAdmins({ COORD, SUSPENDERS, KINO, OWNER })
+Sync.state.helpers = { SUSPENDERS }
+Sync.state.adminStatuses = {
+    [SUSPENDERS] = { authorMax = { [MEMBER] = 3 } },
+}
+seedRequest("need-promote", "NEED_LOGS", { SUSPENDERS, COORD }, SUSPENDERS)
+profile.AddLootLog = function()
+    return true
+end
+Sync.RebuildProfile = function(self, profileId, reason)
+    self:ReconcileSessionAuthorization(profileId, "rebuild:" .. reason)
+    return true
+end
+Sync:HandleNewLog(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    log = {
+        _eventType = "ROLE_CHANGE",
+        _author = COORD,
+        _counter = 2,
+        _data = { member = SUSPENDERS, newRole = "ADMIN" },
+    },
+})
+assertTrue(listHas(Sync.state.helpers, SUSPENDERS), "live admin promotion does not drop that helper")
+assertTrue(type(Sync.state.adminStatuses[SUSPENDERS]) == "table", "live admin promotion keeps advertiser status")
+
+reset(MEMBER)
+setAdmins({ COORD, SUSPENDERS, OWNER })
+Sync.state.helpers = { SUSPENDERS }
+seedRequest("need-owner-demote", "NEED_LOGS", { SUSPENDERS, COORD }, SUSPENDERS)
+profile.AddLootLog = function()
+    return true
+end
+Sync.RebuildProfile = function(self, profileId, reason)
+    self:ReconcileSessionAuthorization(profileId, "rebuild:" .. reason)
+    return true
+end
+Sync:HandleNewLog(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    log = {
+        _eventType = "ROLE_CHANGE",
+        _author = COORD,
+        _counter = 3,
+        _data = { member = SUSPENDERS, newRole = "MEMBER" },
+    },
+})
+assertTrue(listHas(Sync.state.helpers, SUSPENDERS), "live demotion keeps a player the rebuild still lists as admin")
+
 -- Reload must not resume coordination from a stale persisted coordinator.
 reset(COORD)
 Sync.state.isCoordinator = true

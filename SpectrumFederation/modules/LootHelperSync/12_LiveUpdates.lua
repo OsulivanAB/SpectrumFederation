@@ -631,11 +631,15 @@ function Sync:HandleNewLog(sender, payload)
     elseif SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
         SF.LootHelperEvents:NotifyDataChanged("SYNC:LIVE", { profileId = profileId })
     end
-    if types.ADMIN_REMOVED and eventType == types.ADMIN_REMOVED and self._DropLiveRemovedAdminStatus then
+    -- Rebuild reconcile already ran against the replayed admin list and
+    -- deferred role changes. A live ADMIN_REMOVED or ROLE_CHANGE to member
+    -- names one player. Drop that player only when the rebuilt profile no
+    -- longer lists them, then apply that revocation without a takeover.
+    if type(memberId) == "string" and memberId ~= ""
+        and self._LogAdminGrantState and self:_LogAdminGrantState(logTable, memberId) == "revoke"
+        and self._DropLiveRemovedAdminStatus
+    then
         self:_DropLiveRemovedAdminStatus(profileId, memberId)
-        -- Rebuild reconcile already ran against the replayed admin list and
-        -- deferred role changes. Apply only the named revocation now that the
-        -- rebuilt profile shows whether this player is still an admin.
         if self._ApplyExplicitRevocationRouting then
             self:_ApplyExplicitRevocationRouting("live_admin_removed")
         end
