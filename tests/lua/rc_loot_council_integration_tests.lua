@@ -6507,17 +6507,32 @@ function testRepairsDeferLocalRestoreAndYieldedBackfill()
     assertTrue(Sync:TryRestorePersistedSession("test"), "the coordinator session restores")
     assertEq(countLootEvents(restored, "BIS_OUTCOME", restoredCanon.awardKey), 0, "restore does not freeze an outcome before convergence")
     assertEq(Sync.state._bisBackfillPendingReason, "RestorePersistedSession", "restore keeps the backfill pending")
+    assertTrue(Sync:_AutomaticBisBackfillBlocked(), "restore blocks automatic BiS until convergence starts")
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 0, "a drain before reannounce does not freeze an outcome")
+    local duringCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007303-4",
+        response = "Need",
+    }))
+    assertTrue(restored:TryAddRCLootCouncilAward(duringCanon), "a local award during restore is stored")
+    assertEq(countLootEvents(restored, "BIS_OUTCOME", duringCanon.awardKey), 0, "a local award during restore does not freeze an outcome")
+    assertEq(Sync.state._bisBackfillPendingReason, "RestorePersistedSession", "a deferred local award keeps the restore wait")
     local convergenceCalls = 0
     function Sync:BeginAdminConvergence()
         convergenceCalls = convergenceCalls + 1
+        self.state._adminConvergence = { finished = false }
     end
     Sync:_ReannounceRestoredSessionIfNeeded()
     assertEq(convergenceCalls, 1, "a restored coordinator converges before reannouncing")
+    assertEq(Sync.state._bisRestoreBackfillHold, nil, "open convergence replaces the restore hold")
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 0, "open convergence still defers the restored scan")
     assertEq(countLootEvents(restored, "BIS_OUTCOME", restoredCanon.awardKey), 0, "reannounce does not write before convergence finishes")
+    assertEq(countLootEvents(restored, "BIS_OUTCOME", duringCanon.awardKey), 0, "the local restore award waits for convergence")
+    Sync.state._adminConvergence = nil
     Sync.BeginAdminConvergence = nil
     Sync.GetGroupDistribution = previousGroupDistribution
-    assertEq(Sync:_DrainAutomaticBisBackfill(), 1, "the restored scan writes the missing outcome after convergence")
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 2, "the restored scan writes the missing outcomes after convergence")
     assertEq(countLootEvents(restored, "BIS_OUTCOME", restoredCanon.awardKey), 1, "the restored award has one outcome")
+    assertEq(countLootEvents(restored, "BIS_OUTCOME", duringCanon.awardKey), 1, "the local restore award has one outcome")
 end
 testRepairsDeferLocalRestoreAndYieldedBackfill()
 

@@ -146,11 +146,15 @@ function Sync:TryRestorePersistedSession(reason)
     end
 
     if not self.state.isCoordinator then
+        self.state._bisRestoreBackfillHold = nil
         self:EnsureHeartbeatMonitor("RestorePersistedSession")
     else
         -- Local history may be missing peer logs from before the reload.
         -- Reannounce runs admin convergence, which drains this after repairs.
+        -- The hold blocks writes until that convergence starts. Enable restores
+        -- the session before PLAYER_ENTERING_WORLD or a roster event.
         self.state._bisBackfillPendingReason = "RestorePersistedSession"
+        self.state._bisRestoreBackfillHold = true
     end
 
     RequestLootWindowRefresh("RestorePersistedSession")
@@ -172,9 +176,18 @@ function Sync:_ReannounceRestoredSessionIfNeeded()
                 self:ReannounceSession()
             end,
         })
-        return
+        local conv = self.state._adminConvergence
+        if type(conv) == "table" and conv.finished ~= true then
+            -- Convergence itself now blocks. Drop the restore hold so the
+            -- completion drain is not stuck after the requests finish.
+            self.state._bisRestoreBackfillHold = nil
+            return
+        end
     end
-    self:ReannounceSession()
+    self.state._bisRestoreBackfillHold = nil
+    if not self.BeginAdminConvergence then
+        self:ReannounceSession()
+    end
     if self._DrainAutomaticBisBackfill then
         self:_DrainAutomaticBisBackfill()
     end
@@ -701,6 +714,7 @@ function Sync:StartSession(profileId, opts)
     -- Reset state
     self.state.adminStatuses = {}
     self.state._adminConvergence = nil
+    self.state._bisRestoreBackfillHold = nil
     self.state.handshake = nil
     self.state.helpers = {}
 
@@ -793,6 +807,7 @@ function Sync:_ResetSessionState(reason)
     self.state.isCoordinator = false
     self.state.rcConfigSeq = nil
     self.state._restoredSessionNeedsReannounce = false
+    self.state._bisRestoreBackfillHold = nil
 
     -- Clear session metadata
     self.state.helpers = {}
@@ -936,6 +951,7 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     -- Clear convergence state so we don't inherit stale admin statuses / pending convergence
     self.state.adminStatuses = {}
     self.state._adminConvergence = nil
+    self.state._bisRestoreBackfillHold = nil
     self.state.handshake = nil
     self.state._sessionAnnounced = nil
     self.state.containedExactWindows = {}

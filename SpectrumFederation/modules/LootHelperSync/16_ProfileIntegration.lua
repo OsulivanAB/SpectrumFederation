@@ -1713,6 +1713,10 @@ function Sync:_AutomaticBisBackfillBlocked()
     if type(state) ~= "table" then
         return true
     end
+    -- Restore runs from Enable, before world or roster events start convergence.
+    if state._bisRestoreBackfillHold == true then
+        return true
+    end
     local conv = state._adminConvergence
     if type(conv) == "table" and conv.finished ~= true then
         return true
