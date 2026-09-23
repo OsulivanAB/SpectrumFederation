@@ -147,8 +147,10 @@ function Sync:TryRestorePersistedSession(reason)
 
     if not self.state.isCoordinator then
         self:EnsureHeartbeatMonitor("RestorePersistedSession")
-    elseif self.BackfillAutomaticBisOnPromotion then
-        self:BackfillAutomaticBisOnPromotion(false, "RestorePersistedSession")
+    else
+        -- Local history may be missing peer logs from before the reload.
+        -- Reannounce runs admin convergence, which drains this after repairs.
+        self.state._bisBackfillPendingReason = "RestorePersistedSession"
     end
 
     RequestLootWindowRefresh("RestorePersistedSession")
@@ -161,7 +163,21 @@ function Sync:_ReannounceRestoredSessionIfNeeded()
     end
 
     self.state._restoredSessionNeedsReannounce = false
+    if type(self.state._bisBackfillPendingReason) ~= "string" then
+        self.state._bisBackfillPendingReason = "RestorePersistedSession"
+    end
+    if self.BeginAdminConvergence then
+        self:BeginAdminConvergence(self.state.sessionId, self.state.profileId, {
+            onComplete = function()
+                self:ReannounceSession()
+            end,
+        })
+        return
+    end
     self:ReannounceSession()
+    if self._DrainAutomaticBisBackfill then
+        self:_DrainAutomaticBisBackfill()
+    end
 end
 
 

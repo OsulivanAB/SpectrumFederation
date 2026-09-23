@@ -167,6 +167,20 @@ end
 -- Award-qualification checks evaluate the automatic outcome on a profile.
 -- An active session otherwise reserves that write for the coordinator, so
 -- these comparisons temporarily take the writer role and then restore it.
+function releaseAutomaticBisRepairs()
+    local state = Sync and Sync.state
+    if type(state) ~= "table" then
+        return
+    end
+    state.requests = {}
+    if type(state.repairQueue) == "table" then
+        state.repairQueue.order = {}
+    end
+    if type(state._adminConvergence) == "table" then
+        state._adminConvergence.finished = true
+    end
+end
+
 function runAsAutomaticBisWriter(fn)
     local state = Sync.state
     local previous = state and state.isCoordinator
@@ -2734,6 +2748,7 @@ local function testOutOfSessionRCConfigBecomesSessionAuthoritative()
         responseID = 2,
         isAwardReason = false,
     }))
+    releaseAutomaticBisRepairs()
     assertTrue(runAsAutomaticBisWriter(function()
         return coord:TryAddRCLootCouncilAward(laterGreed)
     end), "coordinator records later Greed")
@@ -3057,6 +3072,7 @@ local function testSessionStartRCAuthorityAndFanout()
     }))
     PLAYER = ADMIN_B
     SF.lootHelperDB.profiles[staleB:GetProfileId()] = staleB
+    releaseAutomaticBisRepairs()
     assertTrue(runAsAutomaticBisWriter(function()
         return staleB:TryAddRCLootCouncilAward(laterGreed)
     end), "stale starter records later Greed after adopting")
@@ -4378,6 +4394,7 @@ function testTakeoverRCAuthorityWithoutPostEdit()
     end
 
     local function assertSameGreedAward(a, b, awardKeySuffix)
+        releaseAutomaticBisRepairs()
         local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
             id = "1700006101-" .. awardKeySuffix,
             response = "Greed",
@@ -6387,6 +6404,122 @@ function testOpenRepairKeepsBonusAndLateAwards()
     assertEq(countLootEvents(profile, "BIS_OUTCOME", lateCanon.awardKey), 1, "the award that arrived during backfill has one outcome")
 end
 testOpenRepairKeepsBonusAndLateAwards()
+
+function testRepairsDeferLocalRestoreAndYieldedBackfill()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("LocalRepairDefer")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    Sync.state.requests = {}
+    Sync.state._adminConvergence = nil
+    Sync.state.repairQueue = { order = { "local-repair" }, items = { ["local-repair"] = {} } }
+    Sync.state._bisBackfillPendingReason = nil
+    local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007300-1",
+        response = "Need",
+    }))
+    assertTrue(profile:TryAddRCLootCouncilAward(canon), "a local award is stored while repairs are open")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", canon.awardKey), 0, "a local award does not freeze an outcome while repairs are open")
+    assertEq(Sync.state._bisBackfillPendingReason, "TryAddRCLootCouncilAward", "the local award waits for the repair to finish")
+    Sync.state.repairQueue = { order = {}, items = {} }
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 1, "the deferred scan writes the local award after repairs")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", canon.awardKey), 1, "the local award has one outcome")
+
+    local yielded = makeProfile("YieldedPause")
+    addMember(yielded, WINNER)
+    setActive(yielded)
+    startSessionOn(yielded)
+    local lateCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007301-2",
+        response = "Need",
+    }))
+    local lateRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(lateCanon), {
+        profile = yielded,
+        author = AWARDER,
+        timestamp = lateCanon.timestamp,
+        externalId = lateCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(yielded:AddLootLog(lateRc, { skipPermission = true, skipBroadcast = true }), "the yielded award is stored")
+    yielded._autoBisBackfill = {
+        keys = { "already-written", lateCanon.awardKey },
+        covered = {},
+        opts = { silent = true },
+        index = 2,
+        wrote = 0,
+        sessionId = Sync.state.sessionId,
+        profileId = yielded:GetProfileId(),
+    }
+    Sync.state.repairQueue = { order = { "yield-repair" }, items = { ["yield-repair"] = {} } }
+    Sync.state._bisBackfillPendingReason = nil
+    C_Timer = { NewTimer = function() return { Cancel = function() end } end }
+    assertEq(yielded:_PumpAutomaticBisBackfill(), 0, "a yielded batch does not write while repairs are open")
+    assertTrue(yielded._autoBisBackfill ~= nil, "the yielded backlog stays queued")
+    assertEq(yielded._autoBisBackfill.index, 2, "the paused batch does not skip the waiting award")
+    assertEq(countLootEvents(yielded, "BIS_OUTCOME", lateCanon.awardKey), 0, "the paused award has no outcome yet")
+    assertEq(Sync.state._bisBackfillPendingReason, "BackfillPaused", "the paused batch resumes through the deferred scan")
+    C_Timer = nil
+    Sync.state.repairQueue = { order = {}, items = {} }
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 1, "the deferred scan writes the paused award")
+    assertEq(countLootEvents(yielded, "BIS_OUTCOME", lateCanon.awardKey), 1, "the paused award has one outcome")
+
+    yielded._autoBisBackfill = { keys = { lateCanon.awardKey }, index = 2 }
+    yielded._autoBisBackfillArmed = true
+    SF:RehydrateLootHelperDB()
+    assertEq(yielded._autoBisBackfill, nil, "reload drops the in-memory backfill job")
+    assertEq(yielded._autoBisBackfillArmed, nil, "reload drops the armed timer flag")
+
+    local restored = makeProfile("RestoredCoordinator")
+    addMember(restored, WINNER)
+    setActive(restored)
+    local restoredCanon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007302-3",
+        response = "Need",
+    }))
+    local restoredRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(restoredCanon), {
+        profile = restored,
+        author = AWARDER,
+        timestamp = restoredCanon.timestamp,
+        externalId = restoredCanon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(restored:AddLootLog(restoredRc, { skipPermission = true, skipBroadcast = true }), "the restored profile stores the RC award")
+    Sync.state.active = false
+    Sync.state._bisBackfillPendingReason = nil
+    local previousGroupDistribution = Sync.GetGroupDistribution
+    function Sync:GetGroupDistribution()
+        return "RAID"
+    end
+    SF.lootHelperDB.syncSession = {
+        active = true,
+        sessionId = "SES-RESTORE",
+        profileId = restored:GetProfileId(),
+        coordinator = PLAYER,
+        coordEpoch = 2,
+        helpers = {},
+    }
+    assertTrue(Sync:TryRestorePersistedSession("test"), "the coordinator session restores")
+    assertEq(countLootEvents(restored, "BIS_OUTCOME", restoredCanon.awardKey), 0, "restore does not freeze an outcome before convergence")
+    assertEq(Sync.state._bisBackfillPendingReason, "RestorePersistedSession", "restore keeps the backfill pending")
+    local convergenceCalls = 0
+    function Sync:BeginAdminConvergence()
+        convergenceCalls = convergenceCalls + 1
+    end
+    Sync:_ReannounceRestoredSessionIfNeeded()
+    assertEq(convergenceCalls, 1, "a restored coordinator converges before reannouncing")
+    assertEq(countLootEvents(restored, "BIS_OUTCOME", restoredCanon.awardKey), 0, "reannounce does not write before convergence finishes")
+    Sync.BeginAdminConvergence = nil
+    Sync.GetGroupDistribution = previousGroupDistribution
+    assertEq(Sync:_DrainAutomaticBisBackfill(), 1, "the restored scan writes the missing outcome after convergence")
+    assertEq(countLootEvents(restored, "BIS_OUTCOME", restoredCanon.awardKey), 1, "the restored award has one outcome")
+end
+testRepairsDeferLocalRestoreAndYieldedBackfill()
 
 function testCommQueueWarningLatch()
     loadModule("SpectrumFederation/modules/LootHelper/Comm.lua")

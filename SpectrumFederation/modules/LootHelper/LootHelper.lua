@@ -176,6 +176,9 @@ function SF:RehydrateLootHelperDB()
 			if self.LootProfile and getmetatable(profile) ~= self.LootProfile then
 				setmetatable(profile, self.LootProfile)
 			end
+			if type(profile.ClearTransientAutomaticBisBackfill) == "function" then
+				profile:ClearTransientAutomaticBisBackfill()
+			end
 
 			if type(profile._EnsureRaidCheckConfig) == "function" then
 				profile:_EnsureRaidCheckConfig()

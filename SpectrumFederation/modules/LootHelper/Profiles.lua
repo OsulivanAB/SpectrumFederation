@@ -2623,7 +2623,19 @@ function LootProfile:TryAddRCLootCouncilAward(canonical)
 	if existing or (self._logIndex and self._logIndex[awardKey]) then
 		-- A follower may already have stored the RC row. Becoming coordinator
 		-- and seeing the award again still has to freeze the missing outcome.
-		if existing and self:_MaybeWriteAutomaticBisOutcome(existing) then
+		-- Open log repairs defer that freeze until the missing history arrives.
+		if existing and existing.GetEventData then
+			local existingData = existing:GetEventData()
+			if type(existingData) == "table" and existingData.responseId == "BONUS_ROLL" then
+				if self:_MaybeWriteAutomaticBisOutcome(existing) then
+					return true, nil
+				end
+			elseif self:_DeferAutomaticBisWhileRepairsOpen("TryAddRCLootCouncilAward") then
+				return false, "duplicate"
+			elseif self:_MaybeWriteAutomaticBisOutcome(existing) then
+				return true, nil
+			end
+		elseif existing and self:_MaybeWriteAutomaticBisOutcome(existing) then
 			return true, nil
 		end
 		return false, "duplicate"
@@ -2663,7 +2675,9 @@ function LootProfile:TryAddRCLootCouncilAward(canonical)
 	if not inserted then
 		return false, "duplicate"
 	end
-	self:_MaybeWriteAutomaticBisOutcome(logEntry)
+	if eventData.responseId == "BONUS_ROLL" or not self:_DeferAutomaticBisWhileRepairsOpen("TryAddRCLootCouncilAward") then
+		self:_MaybeWriteAutomaticBisOutcome(logEntry)
+	end
 	return true, nil
 end
 
@@ -2893,6 +2907,26 @@ function LootProfile:NormalizePersistedLegacyBonusRolls()
     return wrote
 end
 
+function LootProfile:ClearTransientAutomaticBisBackfill()
+    -- The yielded timer does not survive /reload. A saved armed flag would
+    -- block the next batch forever, so reload rebuilds the scan from logs.
+    self._autoBisBackfill = nil
+    self._autoBisBackfillArmed = nil
+    self._autoBisBackfillPumping = nil
+    self._writingAutoBis = nil
+end
+
+function LootProfile:_DeferAutomaticBisWhileRepairsOpen(reason)
+    local Sync = SF.LootHelperSync
+    if not (Sync and Sync._AutomaticBisBackfillBlocked and Sync:_AutomaticBisBackfillBlocked()) then
+        return false
+    end
+    if Sync._ScheduleAutomaticBisBackfill then
+        Sync:_ScheduleAutomaticBisBackfill(reason or "deferred")
+    end
+    return true
+end
+
 function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
     if self._writingAutoBis then
         return false, "reentrant"
@@ -2983,6 +3017,14 @@ function LootProfile:_PumpAutomaticBisBackfill()
             or (self.GetProfileId and self:GetProfileId()) ~= job.profileId
         then
             self._autoBisBackfill = nil
+            break
+        end
+        -- A repair can open between batches. Do not freeze the next batch
+        -- against incomplete history. The deferred drain resumes this job.
+        if Sync._AutomaticBisBackfillBlocked and Sync:_AutomaticBisBackfillBlocked() then
+            if Sync._ScheduleAutomaticBisBackfill then
+                Sync:_ScheduleAutomaticBisBackfill("BackfillPaused")
+            end
             break
         end
         local keys = job.keys or {}
