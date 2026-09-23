@@ -1101,6 +1101,62 @@ Sync:HandleAuthLogs(KINO, catchLogsPayload({
 }))
 assertEq(mergeCalls, 1, "catch-up AUTH_LOGS with ADMIN_ADDED is merged")
 assertEq(mergeOpts.allowReplaceExisting, false, "unproven canonical admin cannot replace existing rows")
+mergeCalls = 0
+Sync:HandleAuthLogs(KINO, catchLogsPayload({
+    {
+        _author = "Other-Realm",
+        _counter = 9,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}))
+assertEq(mergeCalls, 1, "grant outside the requested window does not reject the catch-up reply")
+assertTrue(Sync.state.requests["need-catch-logs"] ~= nil, "unapplied gap rows leave the catch-up request open")
+local originalRebuild = Sync.RebuildProfile
+local phases = {}
+Sync.RebuildProfile = function()
+    return true
+end
+Sync.MergeLogs = function(_, _, logs, opts)
+    phases[#phases + 1] = {
+        event = logs[1] and logs[1]._eventType or nil,
+        replace = opts and opts.allowReplaceExisting,
+    }
+    if logs[1] and logs[1]._eventType == "ADMIN_ADDED" then
+        setAdmins({ OWNER, KINO })
+    end
+    return true, { inserted = #logs, replaced = 0, mismatchCount = 0 }
+end
+Sync:HandleAuthLogs(KINO, catchLogsPayload({
+    {
+        _author = "Other-Realm",
+        _counter = 9,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}))
+assertEq(phases[1] and phases[1].event, "ADMIN_ADDED", "catch-up merges the grant before the requested rows")
+assertEq(phases[1] and phases[1].replace, false, "grant merge does not replace existing rows")
+assertEq(phases[2] and phases[2].event, "POINT_CHANGE", "requested rows merge after the grant is local")
+assertEq(phases[2] and phases[2].replace, true, "canonical coordinator can replace rows after the grant sticks")
+Sync.RebuildProfile = originalRebuild
+Sync.MergeLogs = function()
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+setAdmins({ OWNER })
+Sync.state._coordinatorCatchUp = KINO
 profile.ImportSnapshot = function(_, _, opts)
     mergeOpts = opts
     return false, 0, "stop-before-rebuild"
@@ -1275,6 +1331,66 @@ assertTrue(not Sync:_ResponderMapHas(regrant.revokedResponders, SUSPENDERS), "re
 assertEq(Sync:_ClassifyPrivilegedResponse(SUSPENDERS, PROFILE, regrant, {
     expectedKinds = { NEED_LOGS = true, LOG_REQ = true, ADMIN_LOG_REQ = true },
 }), "accept", "re-granted admin response is accepted")
+
+-- Repaired history updates routes. A live gap does not.
+reset(MEMBER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.adminStatuses = {
+    [KINO] = { authorMax = { [MEMBER] = 3 } },
+}
+local repaired = seedRequest("need-repaired", "NEED_LOGS", { KINO, COORD }, nil)
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:auth_logs")
+assertTrue(not listHas(Sync.state.helpers, KINO), "auth_logs rebuild drops a helper removed by repaired history")
+repaired = Sync.state.requests["need-repaired"]
+assertTrue(not listHas(repaired.targets, KINO), "auth_logs rebuild drops that helper from outstanding requests")
+assertTrue(type(Sync.state.adminStatuses[KINO]) == "table", "auth_logs rebuild keeps advertiser status")
+reset(MEMBER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { KINO }
+seedRequest("need-live-gap", "NEED_LOGS", { KINO, COORD }, nil)
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_update")
+assertTrue(listHas(Sync.state.helpers, KINO), "live rebuild keeps a helper missing from a gapped admin list")
+assertTrue(listHas(Sync.state.requests["need-live-gap"].targets, KINO),
+    "live rebuild keeps that helper on the outstanding request")
+
+-- A served log window can carry the sender's latest admin grant.
+reset(KINO)
+profile._lootLogs = {
+    {
+        _author = "Other-Realm",
+        _counter = 4,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}
+local served = {
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}
+Sync:_AppendSelfAdminGrantEvidence(served, profile)
+assertEq(#served, 2, "served logs include one admin-grant row")
+assertEq(served[2]._eventType, "ADMIN_ADDED", "served grant is the latest ADMIN_ADDED for the sender")
+assertEq(served[2]._author, "Other-Realm", "served grant keeps the author outside the requested window")
+profile._lootLogs[#profile._lootLogs + 1] = {
+    _author = "Other-Realm",
+    _counter = 5,
+    _eventType = "ADMIN_REMOVED",
+    _data = { member = KINO },
+}
+local revokedServe = {}
+Sync:_AppendSelfAdminGrantEvidence(revokedServe, profile)
+assertEq(#revokedServe, 0, "a later removal does not attach a stale grant")
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

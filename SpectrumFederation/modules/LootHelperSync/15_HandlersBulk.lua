@@ -192,27 +192,34 @@ function Sync:HandleAuthLogs(sender, payload)
             
             -- Verify all received logs are for the correct author and within requested range
             local exactRepair = self:_IsExactAuthorRepair(req.meta)
+            local catchUpSender = self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
             for _, logTable in ipairs(payload.logs) do
-                local logAuthor = logTable._author or logTable.author
-                local logCounter = logTable._counter or logTable.counter
-                
-                local authorMatches = self:_AuthorMatchesRepairRequest(logAuthor, requestedAuthor, exactRepair)
-                if not authorMatches then
-                    if SF.Debug then
-                        SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log author %s doesn't match requested %s (exactAuthor=%s)",
-                            tostring(logAuthor), tostring(requestedAuthor), tostring(exactRepair))
+                -- The serving coordinator may attach the admin grant that proves
+                -- catch-up. That log is often a different author than the gap.
+                local grantProof = catchUpSender and self._LogAdminGrantState
+                    and self:_LogAdminGrantState(logTable, sender)
+                if not grantProof then
+                    local logAuthor = logTable._author or logTable.author
+                    local logCounter = logTable._counter or logTable.counter
+
+                    local authorMatches = self:_AuthorMatchesRepairRequest(logAuthor, requestedAuthor, exactRepair)
+                    if not authorMatches then
+                        if SF.Debug then
+                            SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log author %s doesn't match requested %s (exactAuthor=%s)",
+                                tostring(logAuthor), tostring(requestedAuthor), tostring(exactRepair))
+                        end
+                        self:_RetryRequestSoon(req)
+                        return
                     end
-                    self:_RetryRequestSoon(req)
-                    return
-                end
-                
-                if type(logCounter) == "number" and (logCounter < requestedFrom or logCounter > requestedTo) then
-                    if SF.Debug then
-                        SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log counter %d outside requested range [%d-%d]",
-                            logCounter, requestedFrom, requestedTo)
+
+                    if type(logCounter) == "number" and (logCounter < requestedFrom or logCounter > requestedTo) then
+                        if SF.Debug then
+                            SF.Debug:Warn("SYNC", "Rejecting AUTH_LOGS: log counter %d outside requested range [%d-%d]",
+                                logCounter, requestedFrom, requestedTo)
+                        end
+                        self:_RetryRequestSoon(req)
+                        return
                     end
-                    self:_RetryRequestSoon(req)
-                    return
                 end
             end
         end
@@ -224,16 +231,59 @@ function Sync:HandleAuthLogs(sender, payload)
     -- A catch-up packet may insert the grant, but it must not overwrite history
     -- until that grant is already in the local profile.
     local senderIsCanonicalAdmin = self:IsSenderAuthorized(payload.profileId, sender) == true
-    local allowReplaceExisting = (req.meta and req.meta.integrityRepair == true)
-        and senderIsCanonicalAdmin
-        and (
-            self.state.isCoordinator
-            or self:_SamePlayer(sender, self.state.coordinator)
-        )
-    local changed, mergeDetails = self:MergeLogs(payload.profileId, payload.logs, {
-        allowReplaceExisting = allowReplaceExisting,
-        allowMainSwapFingerprintNormalize = true,
-    })
+    local function replaceAllowed()
+        return (req.meta and req.meta.integrityRepair == true)
+            and senderIsCanonicalAdmin
+            and (
+                self.state.isCoordinator
+                or self:_SamePlayer(sender, self.state.coordinator)
+            )
+    end
+    local allowReplaceExisting = replaceAllowed()
+    local logsToMerge = payload.logs
+    local grantChanged = false
+    local catchUpMerge = (not senderIsCanonicalAdmin)
+        and self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
+    if catchUpMerge and self._LogAdminGrantState then
+        local grantLogs, contentLogs = {}, {}
+        for _, logTable in ipairs(payload.logs) do
+            if self:_LogAdminGrantState(logTable, sender) then
+                grantLogs[#grantLogs + 1] = logTable
+            else
+                contentLogs[#contentLogs + 1] = logTable
+            end
+        end
+        if #grantLogs > 0 then
+            local changedGrant = self:MergeLogs(payload.profileId, grantLogs, {
+                allowReplaceExisting = false,
+                allowMainSwapFingerprintNormalize = true,
+            })
+            grantChanged = changedGrant and true or false
+            if changedGrant and self.RebuildProfile then
+                self:RebuildProfile(payload.profileId, "auth_logs")
+            end
+        end
+        -- The requested window is merged only after the grant is local.
+        -- Until then this packet cannot insert or replace the gap rows.
+        if self:IsSenderAuthorized(payload.profileId, sender) then
+            senderIsCanonicalAdmin = true
+            allowReplaceExisting = replaceAllowed()
+            logsToMerge = contentLogs
+        else
+            logsToMerge = {}
+            allowReplaceExisting = false
+        end
+    end
+    local changed, mergeDetails = false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+    if type(logsToMerge) == "table" and #logsToMerge > 0 then
+        changed, mergeDetails = self:MergeLogs(payload.profileId, logsToMerge, {
+            allowReplaceExisting = allowReplaceExisting,
+            allowMainSwapFingerprintNormalize = true,
+        })
+    end
+    if grantChanged then
+        changed = true
+    end
     if t0 then
         self:_MObserve("sync.merge.auth_logs.merge_ms", debugprofilestop() - t0)
     end

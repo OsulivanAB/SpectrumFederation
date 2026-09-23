@@ -363,6 +363,55 @@ end
 -- @param sender string "Name-Realm"
 -- @param snapshot table
 -- @return boolean
+function Sync:_SameLogTable(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then return false end
+    local aId = a._logId or a.logId or a._id or a.id
+    local bId = b._logId or b.logId or b._id or b.id
+    if type(aId) == "string" and aId ~= "" and aId == bId then return true end
+    local aAuthor = a._author or a.author
+    local bAuthor = b._author or b.author
+    local aCounter = tonumber(a._counter or a.counter)
+    local bCounter = tonumber(b._counter or b.counter)
+    local aType = a._eventType or a.eventType
+    local bType = b._eventType or b.eventType
+    if aType ~= bType or aCounter ~= bCounter then return false end
+    if type(aAuthor) ~= "string" or type(bAuthor) ~= "string" then return false end
+    return self:_SamePlayer(aAuthor, bAuthor)
+end
+
+-- Function Attach this client's latest admin grant when serving logs.
+-- Gap replies only contain the requested window. The grant often lives on
+-- another author, so the receiver can prove catch-up without failing that window.
+-- A later removal clears the evidence. One log is appended at most.
+-- @param out table Response log list
+-- @param profile table
+-- @return nil
+function Sync:_AppendSelfAdminGrantEvidence(out, profile)
+    if type(out) ~= "table" or type(profile) ~= "table" then return end
+    if type(self._GetProfileLootLogs) ~= "function" then return end
+    local me = self:_SelfId()
+    if type(me) ~= "string" or me == "" then return end
+    local latest = nil
+    local logs = self:_GetProfileLootLogs(profile)
+    for _, log in ipairs(logs) do
+        local logTable = log
+        if type(log) == "table" and type(log.ToTable) == "function" then
+            logTable = log:ToTable()
+        end
+        local state = self:_LogAdminGrantState(logTable, me)
+        if state == "grant" then
+            latest = logTable
+        elseif state == "revoke" then
+            latest = nil
+        end
+    end
+    if type(latest) ~= "table" then return end
+    for _, existing in ipairs(out) do
+        if self:_SameLogTable(existing, latest) then return end
+    end
+    out[#out + 1] = latest
+end
+
 function Sync:_CatchUpSnapshotProvesGrant(sender, snapshot)
     if not self:_SnapshotListsAdmin(snapshot, sender) then return false end
     local logs = nil
@@ -902,16 +951,23 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     -- their ADMIN_STATUS windows are still the evidence that identity-admin
     -- reconcile must wait on. An explicit admin-list change still drops every
     -- revoked entry. A single live ADMIN_REMOVED drops only that player.
-    -- Rebuilds defer helper filtering, request retarget, relinquish, and
-    -- takeover unless a player was already recorded in revokedRoutes.
+    -- A live NEW_LOG rebuild can omit ADMIN_ADDED rows that are still in
+    -- flight. Defer helper filtering, retarget, relinquish, and takeover
+    -- unless a player was already recorded in revokedRoutes.
+    -- auth_logs, profile_snapshot, and session-start rebuilds replay repaired
+    -- history, so they update routes. They still keep advertiser statuses for
+    -- identity reconcile.
     local reasonText = tostring(reason or "")
-    if reasonText:sub(1, 8) == "rebuild:" then
+    if reasonText == "rebuild:live_update" then
         self:_ApplyExplicitRevocationRouting(reasonText)
         self._reconcilingSessionAuthorization = nil
         return
     end
 
-    self:_DropUnauthorizedAdminStatuses()
+    local isRebuild = reasonText:sub(1, 8) == "rebuild:"
+    if not isRebuild then
+        self:_DropUnauthorizedAdminStatuses()
+    end
     local coordinator = self.state.coordinator
     if type(coordinator) == "string" and coordinator ~= ""
         and not self:IsSenderAuthorized(profileId, coordinator)

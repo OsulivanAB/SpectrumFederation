@@ -937,6 +937,10 @@ function Sync:HandleNeedLogs(sender, payload)
                     end
                 end
 
+                if self._AppendSelfAdminGrantEvidence then
+                    self:_AppendSelfAdminGrantEvidence(out, profile)
+                end
+
                 local resp = {
                     sessionId   = self.state.sessionId,
                     profileId   = self.state.profileId,
@@ -1033,6 +1037,10 @@ function Sync:HandleLogRequest(sender, payload)
                 table.insert(out, log)
             end
         end
+    end
+
+    if self._AppendSelfAdminGrantEvidence then
+        self:_AppendSelfAdminGrantEvidence(out, profile)
     end
 
     local resp = {
