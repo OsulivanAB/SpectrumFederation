@@ -909,6 +909,12 @@ function LootLogValidators.ValidateBisOverrideData(eventData, profile)
         end
         return false
     end
+    if eventData.forced ~= nil and eventData.forced ~= true and eventData.forced ~= false then
+        if SF.Debug then
+            SF.Debug:Warn("LOOTLOG", "BIS_OVERRIDE forced flag must be boolean")
+        end
+        return false
+    end
     if not RequirePreOpAuthorMax(eventData) then
         return false
     end

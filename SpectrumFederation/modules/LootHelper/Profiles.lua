@@ -1236,16 +1236,26 @@ function LootProfile:GetGearOverrideCompatibleAwards(memberId, slot)
             local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
             local owner = award.member and self:getMemberByID(award.member)
             local specId = owner and owner.GetSpecId and owner:GetSpecId() or nil
-            if classif and Bis.ItemFitsSlot(classif, slot, specId) then
+            local fits = classif and Bis.ItemFitsSlot(classif, slot, specId)
+            local forceAssignment = not classif
+            if fits or forceAssignment then
                 local key = Bis.AwardRefKey(award.kind, award.id)
                 local activeId = state and state.activeByAward and key and state.activeByAward[key]
                 local occupyingClicked = activeId and cell and cell.assignmentId == activeId
                 local destEmpty = not (cell and cell.state and cell.state ~= "AVAILABLE")
                 if not activeId or occupyingClicked or destEmpty then
+                    local display = tostring(award.itemLink or award.itemString or "[item]")
+                    local label
+                    if forceAssignment then
+                        label = string.format("%s — Unresolved / Force Assignment", display)
+                    else
+                        label = string.format("%s %s (%s)", display, award.kind, award.member or "")
+                    end
                     options[#options + 1] = {
                         value = award.kind .. ":" .. award.id,
-                        label = string.format("%s %s (%s)", tostring(award.itemLink or award.itemString or "[item]"), award.kind, award.member or ""),
+                        label = label,
                         awardRef = { kind = award.kind, id = award.id },
+                        forceAssignment = forceAssignment or nil,
                     }
                 end
             end
@@ -1304,6 +1314,48 @@ function LootProfile:PlaceGearOverrideAward(memberId, slot, awardRef)
         assignedSlots = { slot },
         slotBinding = "BOUND",
     })
+end
+
+-- Consume or restore an opportunity when the awarded item is unknown.
+-- This writes ARMOR_CHANGE only. It does not invent a loot award.
+function LootProfile:SetOpportunityConsumedUnknown(memberId, slot, consumed)
+    memberId = NormalizeMemberId(memberId)
+    if type(memberId) ~= "string" or memberId == "" or type(slot) ~= "string" or slot == "" then
+        return false, "Select an equipment slot."
+    end
+    if not CurrentUserHasEffectiveLocalAdmin(self) then
+        return false, "You must be an admin to change Gear Override."
+    end
+    local member = self:getMemberByID(memberId)
+    if not member or not member.ToggleEquipment or not member.armor or member.armor[slot] == nil then
+        return false, "Select a character."
+    end
+    local board = self:GetIdentityBisSlots(memberId)
+    local cell = board and board[slot]
+    local state = cell and cell.state or "AVAILABLE"
+    if consumed then
+        if state ~= "AVAILABLE" or member.armor[slot] == true then
+            return false, "That equipment slot is already occupied."
+        end
+    else
+        if state ~= "LEGACY_UNKNOWN" or member.armor[slot] ~= true then
+            return false, "That slot is not an unknown consumed opportunity."
+        end
+    end
+    local ok = member:ToggleEquipment(slot, { profile = self })
+    if not ok then
+        return false, "Could not update equipment history."
+    end
+    if SF.Debug then
+        SF.Debug:Info(
+            "LootProfile",
+            "Unknown consumption %s for %s %s",
+            consumed and "USED" or "AVAILABLE",
+            tostring(memberId),
+            tostring(slot)
+        )
+    end
+    return true, nil
 end
 
 -- Function to get the list of members in this profile
@@ -3573,8 +3625,14 @@ function LootProfile:ApplyBisOverride(action, opts)
         if owner and owner.GetSpecId then
             specId = owner:GetSpecId()
         end
-        local resolved, resolveErr
-        if SF.LootHelperBis.ResolveOverrideSlots then
+        local resolved, resolveErr, forcedAssign
+        if SF.LootHelperBis.ResolveGearOverrideSlots then
+            resolved, resolveErr, forcedAssign = SF.LootHelperBis.ResolveGearOverrideSlots(
+                eventData.assignedSlots,
+                award and (award.itemLink or award.itemString),
+                specId
+            )
+        elseif SF.LootHelperBis.ResolveOverrideSlots then
             resolved, resolveErr = SF.LootHelperBis.ResolveOverrideSlots(
                 eventData.assignedSlots,
                 award and (award.itemLink or award.itemString),
@@ -3615,6 +3673,17 @@ function LootProfile:ApplyBisOverride(action, opts)
             end
             if armor and armor[slot] then
                 return false, "That equipment slot already has a recorded equipment use."
+            end
+        end
+        if forcedAssign then
+            eventData.forced = true
+            if SF.Debug then
+                SF.Debug:Info(
+                    "LootProfile",
+                    "Gear Override force-assign %s:%s",
+                    tostring(opts.awardRef and opts.awardRef.kind),
+                    tostring(opts.awardRef and opts.awardRef.id)
+                )
             end
         end
     end
@@ -3668,8 +3737,14 @@ function LootProfile:ApplyBisOverride(action, opts)
         if owner and owner.GetSpecId then
             specId = owner:GetSpecId()
         end
-        local resolved, resolveErr
-        if SF.LootHelperBis and SF.LootHelperBis.ResolveOverrideSlots then
+        local resolved, resolveErr, forcedAssign
+        if SF.LootHelperBis and SF.LootHelperBis.ResolveGearOverrideSlots then
+            resolved, resolveErr, forcedAssign = SF.LootHelperBis.ResolveGearOverrideSlots(
+                assigned,
+                award and (award.itemLink or award.itemString),
+                specId
+            )
+        elseif SF.LootHelperBis and SF.LootHelperBis.ResolveOverrideSlots then
             resolved, resolveErr = SF.LootHelperBis.ResolveOverrideSlots(
                 assigned,
                 award and (award.itemLink or award.itemString),
@@ -3679,9 +3754,17 @@ function LootProfile:ApplyBisOverride(action, opts)
             resolved = assigned
         end
         if not resolved then
-            return false, "That item does not fit the selected legacy opportunity."
+            return false, resolveErr == "UNKNOWN_COMPAT"
+                and "That item cannot be assigned to the selected slot for this specialization."
+                or "That item does not fit the selected legacy opportunity."
         end
         eventData.assignedSlots = resolved
+        if forcedAssign then
+            eventData.forced = true
+            if SF.Debug then
+                SF.Debug:Info("LootProfile", "Gear Override force-associate %s:%s", tostring(opts.awardRef and opts.awardRef.kind), tostring(opts.awardRef and opts.awardRef.id))
+            end
+        end
         eventData.slotBinding = opts.slotBinding or (SF.LootLogBisBindings and SF.LootLogBisBindings.BOUND) or "BOUND"
         local board = self:GetIdentityBisSlots(ownerMember or opts.viewMember)
         local originDisplayed = originSlot

@@ -190,6 +190,7 @@ local EVENT_DATA_TEMPLATES = {
     [EVENT_TYPES.BIS_OVERRIDE] = {
         action = "",
         preOpAuthorMax = {},
+        -- @field forced boolean|nil explicit force-assignment; logged slots stay authoritative
     },
     [EVENT_TYPES.MANUAL_AWARD] = {
         member = "",
