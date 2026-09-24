@@ -7499,6 +7499,12 @@ function testLateBackfillAwardKeepsCausalOrder()
     function Sync:BroadcastSessionHeartbeat()
         return true
     end
+    local orderCalls = 0
+    local previousOrder = profile._OrderUnprocessedAutomaticBisAwardKeys
+    function profile:_OrderUnprocessedAutomaticBisAwardKeys(keys, startIndex)
+        orderCalls = orderCalls + 1
+        return previousOrder(self, keys, startIndex)
+    end
     profile.AUTO_BIS_BACKFILL_BATCH = 1
     local deferred = nil
     local previousRunAfter = Sync.RunAfter
@@ -7515,6 +7521,7 @@ function testLateBackfillAwardKeepsCausalOrder()
         end,
     }
     assertEq(profile:_PumpAutomaticBisBackfill(), 1, "the first batch writes the earlier non-BiS award")
+    assertEq(orderCalls, 0, "the first batch does not sort an already ordered list")
     assertEq(outcomeForAward(profile, filler.awardKey), "NOT_BIS", "the earlier award does not take the helm slot")
     assertEq(countLootEvents(profile, "BIS_OUTCOME", newer.awardKey), 0, "the newer helm stays queued")
     local older = canon("1700007600-3", "Need", 1, headLink)
@@ -7526,6 +7533,7 @@ function testLateBackfillAwardKeepsCausalOrder()
     deferred = nil
     assertTrue(type(step) == "function", "the remaining backfill stays on a timer")
     step()
+    assertEq(orderCalls, 1, "the continuation batch sorts only because a new award was appended")
     assertEq(outcomeForAward(profile, older.awardKey), "ASSIGNED", "the older helm is evaluated before the newer queued helm")
     assertEq(countLootEvents(profile, "BIS_OUTCOME", newer.awardKey), 0, "the newer helm remains queued after the older award")
     assertEq(profile._autoBisBackfill.keys[1], filler.awardKey, "reordering does not move an already processed award")
@@ -7539,6 +7547,7 @@ function testLateBackfillAwardKeepsCausalOrder()
     end
     assertEq(profile._autoBisBackfill, nil, "the backfill finishes the queued helm")
     assertEq(outcomeForAward(profile, newer.awardKey), "OVERFLOW", "the newer helm is overflow after the delayed older award")
+    assertEq(orderCalls, 1, "a later batch does not sort the tail again")
     Sync.BroadcastSessionHeartbeat = previousHeartbeat
     Sync.RunAfter = previousRunAfter
     C_Timer = nil
@@ -7596,6 +7605,64 @@ function testBackfillFrontierOnSessionEnd()
     SF.LootHelperComm.Send = previousSend
 end
 testBackfillFrontierOnSessionEnd()
+
+function testStaleBonusProjectionIsDropped()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("StaleBonusProjection")
+    addMember(profile, WINNER)
+    local headLink = "|cffa335ee|Hitem:19001::::::::80:71:::::::::|h[Test Helm]|h|r"
+    local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007800-1",
+        response = "Bonus Loot",
+        responseID = "BONUS_ROLL",
+        lootWon = headLink,
+    }))
+    local rc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(canon), {
+        profile = profile,
+        author = AWARDER,
+        timestamp = canon.timestamp,
+        externalId = canon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(profile:AddLootLog(rc, { skipPermission = true, skipBroadcast = true }), "the legacy bonus RC row is stored")
+    profile._identityProjection = {
+        bis = {
+            state = {
+                outcomeWinner = {
+                    [canon.awardKey] = "stale-bonus-outcome",
+                },
+            },
+            slotsByMember = {
+                [WINNER] = {
+                    Head = { state = "ASSIGNED" },
+                },
+            },
+        },
+    }
+    assertEq(profile:NormalizePersistedLegacyBonusRolls(), 1, "load normalization synthesizes the bonus roll")
+    assertEq(profile._identityProjection, nil, "the saved projection that counted the bonus outcome is dropped")
+    local rebuilt = profile:ApplyIdentityProjection()
+    local occupied = SF.LootHelperBis.LiveOccupancyFromProjection(rebuilt, WINNER)
+    assertEq(occupied.Head, nil, "the rebuilt projection does not keep the bonus helm")
+    assertEq(profile:NormalizePersistedLegacyBonusRolls(), 0, "a second normalization does not append")
+    assertTrue(type(profile._identityProjection) == "table", "the rebuilt projection stays cached")
+    local unrelated = makeProfile("UnrelatedProjection")
+    unrelated._identityProjection = {
+        bis = {
+            state = {
+                outcomeWinner = {
+                    ["some-other-award"] = "kept-outcome",
+                },
+            },
+        },
+    }
+    unrelated._logById = {}
+    assertEq(unrelated:NormalizePersistedLegacyBonusRolls(), 0, "a profile without a legacy bonus row inserts nothing")
+    assertEq(unrelated._identityProjection.bis.state.outcomeWinner["some-other-award"], "kept-outcome", "an unrelated cached projection stays")
+end
+testStaleBonusProjectionIsDropped()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

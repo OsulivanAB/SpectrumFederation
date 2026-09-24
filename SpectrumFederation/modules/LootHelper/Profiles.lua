@@ -3018,7 +3018,39 @@ function LootProfile:NormalizePersistedLegacyBonusRolls()
             rcLogs[#rcLogs + 1] = log
         end
     end
-    return self:_InsertLegacyBonusRollLogs(self:_CollectLegacyBonusRollLogs(rcLogs))
+    local inserted = self:_InsertLegacyBonusRollLogs(self:_CollectLegacyBonusRollLogs(rcLogs))
+    self:_DropProjectionThatKeepsBonusRollOutcome()
+    return inserted
+end
+
+-- A 1.5.4 SavedVariables projection can still count a bonus-roll BIS_OUTCOME
+-- as the slot winner. BONUS_ROLL inserts do not replay that cache. Drop it
+-- so the next projection rebuild skips the bonus source. One pass over the
+-- cached winners, not a full log replay, and only from the normalize callers.
+function LootProfile:_DropProjectionThatKeepsBonusRollOutcome()
+    local projection = self._identityProjection
+    local state = projection and projection.bis and projection.bis.state
+    local winners = state and state.outcomeWinner
+    if type(winners) ~= "table" or type(self._logById) ~= "table" then
+        return false
+    end
+    for awardKey, logId in pairs(winners) do
+        local source = self._logById[awardKey]
+        if type(source) ~= "table" and type(logId) == "string" then
+            local outcome = self._logById[logId]
+            local outcomeData = outcome and ((outcome.GetEventData and outcome:GetEventData()) or outcome._data)
+            local sourceId = type(outcomeData) == "table" and outcomeData.sourceLogId or nil
+            if type(sourceId) == "string" then
+                source = self._logById[sourceId]
+            end
+        end
+        local sourceData = source and ((source.GetEventData and source:GetEventData()) or source._data)
+        if type(sourceData) == "table" and sourceData.responseId == "BONUS_ROLL" then
+            self._identityProjection = nil
+            return true
+        end
+    end
+    return false
 end
 
 function LootProfile:ClearTransientAutomaticBisBackfill()
@@ -3065,6 +3097,7 @@ function LootProfile:_QueueAwardBehindAutomaticBisBackfill(awardKey)
         end
     end
     keys[#keys + 1] = awardKey
+    job._awardTailDirty = true
     return true
 end
 
@@ -3113,8 +3146,8 @@ function LootProfile:_RCLogForAutomaticBisAwardKey(awardKey)
 end
 
 -- Orders only the unprocessed tail. Keys before startIndex were already
--- evaluated and must stay put. One sort per continuation batch uses the
--- same timestamp, author, counter, and id order as Identity.CompareLogs.
+-- evaluated and must stay put. Called once after a new key is appended,
+-- using the same timestamp, author, counter, and id order as Identity.CompareLogs.
 function LootProfile:_OrderUnprocessedAutomaticBisAwardKeys(keys, startIndex)
     local n = type(keys) == "table" and #keys or 0
     startIndex = tonumber(startIndex) or 1
@@ -3220,9 +3253,12 @@ function LootProfile:_PumpAutomaticBisBackfill()
                     covered[awardKey] = true
                 end
             end
-            -- A delayed award is appended at the end. Order the remaining
-            -- tail once so an older history row is evaluated first.
-            self:_OrderUnprocessedAutomaticBisAwardKeys(keys, job.index)
+            -- A delayed award is appended at the end. Order that tail once,
+            -- then leave later batches alone until another key is appended.
+            if job._awardTailDirty then
+                self:_OrderUnprocessedAutomaticBisAwardKeys(keys, job.index)
+                job._awardTailDirty = nil
+            end
         end
         job.covered = covered
         local opts = job.opts or {}
@@ -3339,6 +3375,7 @@ function LootProfile:ReconcileInsertedRCAwards(awardKeys, opts)
             if type(awardKey) == "string" and not seen[awardKey] then
                 job.keys[#job.keys + 1] = awardKey
                 seen[awardKey] = true
+                job._awardTailDirty = true
             end
         end
         return self:_PumpAutomaticBisBackfill()
@@ -3386,6 +3423,7 @@ function LootProfile:_AppendMissingAwardsToAutomaticBisBackfill()
             and (isLegacyBonus or not covered[awardKey]) then
             seen[awardKey] = true
             job.keys[#job.keys + 1] = awardKey
+            job._awardTailDirty = true
         end
     end
     if type(job.covered) ~= "table" then
