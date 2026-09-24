@@ -282,6 +282,21 @@ function Sync:_RememberCoordinatorKeepalive(name, baseline)
     hb.missedHeartbeats = 0
 end
 
+-- Function Any packet from the coordinator counts as liveness.
+-- Revoked routes and unproven catch-up do not. Those peers can send control
+-- or bulk traffic that handlers reject, and that traffic must not restart
+-- the takeover clock ahead of validation.
+-- @param sender string "Name-Realm"
+-- @return nil
+function Sync:_NoteCoordinatorTransportActivity(sender)
+    if not (self.state and self.state.active and self.state.coordinator) then return end
+    if not self:_SamePlayer(sender, self.state.coordinator) then return end
+    if self._RouteWasRevoked and self:_RouteWasRevoked(sender) then return end
+    if self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(sender) then return end
+    self.state.heartbeat = self.state.heartbeat or {}
+    self.state.heartbeat.lastCoordMessageAt = self:_Now()
+end
+
 -- Function Record whether the coordinator just advertised still needs a catch-up request.
 -- Revoked coordinators stay blocked. A coordinator the local admin list has not seen yet
 -- remains routable until a correlated snapshot or log response arrives.

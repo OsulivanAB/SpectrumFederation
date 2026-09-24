@@ -3631,6 +3631,11 @@ Sync:HandleSessionHeartbeat(KINO, {
 assertEq(Sync.state.coordEpoch, 12, "a same-session unproven heartbeat still applies a newer epoch")
 assertEq(Sync.state.heartbeat.lastCoordMessageAt, 5000,
     "an unproven heartbeat does not refresh the coordinator timer")
+catchNow = 8500
+Sync:OnControlMessage(KINO, "NOT_A_MESSAGE", {})
+Sync:OnBulkMessage(KINO, "NOT_A_BULK", {})
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 5000,
+    "unproven coordinator transport does not refresh the takeover clock")
 Sync:HandleSessionStart(KINO, {
     sessionId = "session-unproven-2",
     profileId = PROFILE,
@@ -3651,6 +3656,10 @@ Sync:HandleSessionHeartbeat(KINO, {
 })
 assertEq(Sync.state.heartbeat.lastCoordMessageAt, 9000,
     "a coordinator who is an admin refreshes the timer")
+catchNow = 9500
+Sync:OnControlMessage(KINO, "NOT_A_MESSAGE", {})
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 9500,
+    "proven coordinator transport still refreshes the takeover clock")
 Sync._Now = originalCatchNow
 
 -- Ending the session for a pending BiS frontier must not re-enter relinquish.

@@ -29,11 +29,8 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
         end
     end
 
-    if self.state and self.state.active and self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator) then
-        if not (self._RouteWasRevoked and self:_RouteWasRevoked(sender)) then
-            self.state.heartbeat = self.state.heartbeat or {}
-            self.state.heartbeat.lastCoordMessageAt = self:_Now()
-        end
+    if self._NoteCoordinatorTransportActivity then
+        self:_NoteCoordinatorTransportActivity(sender)
     end
 
     local t0 = debugprofilestop and debugprofilestop() or nil
@@ -102,11 +99,8 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
         end
     end
 
-    if self.state and self.state.active and self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator) then
-        if not (self._RouteWasRevoked and self:_RouteWasRevoked(sender)) then
-            self.state.heartbeat = self.state.heartbeat or {}
-            self.state.heartbeat.lastCoordMessageAt = self:_Now()
-        end
+    if self._NoteCoordinatorTransportActivity then
+        self:_NoteCoordinatorTransportActivity(sender)
     end
 
     if self:IsSafeModeEnabled() then
