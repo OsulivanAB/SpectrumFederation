@@ -115,6 +115,29 @@ function Sync:_ClearRevocationForIncomingScope(incomingSessionId, incomingProfil
     self.state._coordinatorCatchUp = nil
 end
 
+-- Function True when a new session id for this same profile must not be adopted.
+-- Heartbeat, reannounce, and takeover do not rebuild history. A coordinator
+-- local history already removed would otherwise clear the tombstone and stay
+-- on catch-up. Session start still applies the descriptor and reconciles.
+-- @param payload table
+-- @return boolean
+function Sync:_IncomingSameProfileHistoryRevoked(payload)
+    if type(payload) ~= "table" or not self.state then return false end
+    if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return false end
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return false end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return false end
+    if payload.profileId ~= self.state.profileId then return false end
+    if payload.sessionId == self.state.sessionId then return false end
+    if not (self._LocalHistoryRevokesAdmin and self:_LocalHistoryRevokesAdmin(payload.coordinator)) then
+        return false
+    end
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Ignoring new session from %s; local history revoked that coordinator",
+            tostring(payload.coordinator))
+    end
+    return true
+end
+
 -- Function True when privileged control from this coordinator must be ignored.
 -- Explicit revocation outranks the stored coordinator and epoch. Debug only, so
 -- heartbeats and retries do not repeat a chat warning.
@@ -876,13 +899,16 @@ end
 -- Function True when a repair may still be asked of this preferred provider.
 -- LOG_REQ is admin-to-admin. A canonical admin who advertised the window stays
 -- a target even when they were not selected as a Helper. Revoked players and
--- players who are not admins do not. An advertised catch-up coordinator remains.
+-- players who are not admins do not. A catch-up coordinator remains only
+-- after the proving grant is already stored.
 -- @param name string|nil "Name-Realm"
 -- @return boolean
 function Sync:_PreferredRepairTargetRoutable(name)
     if type(name) ~= "string" or name == "" then return false end
     if self:_RouteWasRevoked(name) then return false end
-    if self:_CoordinatorNeedsCatchUp(name) then return true end
+    if self:_CoordinatorNeedsCatchUp(name) then
+        return self:_LocalCatchUpGrantStored(name) == true
+    end
     if self:_ProfileAuthorizationKnown() then
         return self:IsSenderAuthorized(self.state.profileId, name) == true
     end

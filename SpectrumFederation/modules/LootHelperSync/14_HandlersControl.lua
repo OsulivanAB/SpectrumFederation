@@ -247,6 +247,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
         return
     end
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
+        return
+    end
 
     -- If we're in a different session, require strictly newer epoch
     if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
@@ -365,6 +368,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     -- A coordinator this client already removed must not refresh the takeover
     -- timer or reapply its descriptor. A later re-grant clears that revocation.
     if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
+        return
+    end
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
         return
     end
 
@@ -620,6 +626,9 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
         return
     end
     if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
+        return
+    end
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
         return
     end
 

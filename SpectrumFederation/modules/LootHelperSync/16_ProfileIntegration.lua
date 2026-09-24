@@ -3068,20 +3068,14 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
     end
     if type(preferredTarget) == "string" and preferredTarget ~= "" then
         targets = { preferredTarget }
-    elseif self.state.isCoordinator then
-        -- The preferred advertiser was revoked. Ask a current helper instead of
-        -- leaving the queued integrity range to retry with no route.
-        local helperTargets = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
-        if type(helperTargets) ~= "table" or #helperTargets == 0 then
-            return false
-        end
-        targets = helperTargets
     else
-        local coord = self.state.coordinator
-        if type(coord) ~= "string" or coord == "" then
+        -- The preferred advertiser is not a current route. Ask whoever is
+        -- still authorized instead of a revoked or unproven coordinator.
+        local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
+        if type(routes) ~= "table" or #routes == 0 then
             return false
         end
-        targets = { coord }
+        targets = routes
     end
 
     local supportsEnc =

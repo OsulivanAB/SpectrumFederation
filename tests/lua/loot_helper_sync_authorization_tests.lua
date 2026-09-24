@@ -1571,7 +1571,8 @@ for _, req in pairs(Sync.state.requests) do
 end
 assertTrue(dispatched ~= nil, "fallback repair request is registered")
 assertTrue(not listHas(dispatched.targets, SUSPENDERS), "dispatch does not target the revoked player")
-assertEq(dispatched.targets[1], COORD, "dispatch falls back to the coordinator")
+assertTrue(listHas(dispatched.targets, COORD), "dispatch keeps the authorized coordinator")
+assertTrue(listHas(dispatched.targets, KINO), "dispatch keeps the authorized helper")
 reset(COORD)
 Sync.state.isCoordinator = true
 setAdmins({ COORD, KINO, OWNER })
@@ -1603,6 +1604,39 @@ assertTrue(coordReq ~= nil, "coordinator fallback repair request is registered")
 assertTrue(not listHas(coordReq.targets, SUSPENDERS), "coordinator fallback does not target the revoked player")
 assertEq(coordReq.targets[1], KINO, "coordinator fallback targets the remaining helper")
 assertEq(coordReq.kind, "LOG_REQ", "coordinator fallback uses an admin log request")
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.coordinator = COORD
+Sync:_RememberRevokedRoute(COORD)
+local revokedCoordOk = Sync:RequestIntegrityRepairRanges(PROFILE, {
+    { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+}, "revoked-coordinator-fallback", COORD)
+assertEq(revokedCoordOk, true, "revoked coordinator integrity repair uses an authorized route")
+local revokedCoordReq = nil
+for _, req in pairs(Sync.state.requests) do
+    revokedCoordReq = req
+end
+assertTrue(revokedCoordReq ~= nil, "revoked coordinator integrity repair is registered")
+assertTrue(not listHas(revokedCoordReq.targets, COORD), "revoked coordinator is not the integrity fallback")
+assertEq(revokedCoordReq.targets[1], KINO, "revoked coordinator integrity repair asks the helper")
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.helpers = {}
+Sync.state.coordinator = KINO
+Sync.state._coordinatorCatchUp = KINO
+assertEq(Sync:_PreferredRepairTargetRoutable(KINO), false, "unproven catch-up coordinator is not an integrity target")
+local catchUpRepairOk = Sync:RequestIntegrityRepairRanges(PROFILE, {
+    { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+}, "catch-up-integrity", KINO)
+assertEq(catchUpRepairOk, true, "missing grant integrity repair is requested from a trusted admin")
+local catchUpRepair = nil
+for _, req in pairs(Sync.state.requests) do
+    catchUpRepair = req
+end
+assertTrue(catchUpRepair ~= nil, "missing grant integrity repair is registered")
+assertEq(catchUpRepair.targets[1], OWNER, "missing grant integrity repair asks a trusted admin")
+assertTrue(not listHas(catchUpRepair.targets, KINO), "missing grant integrity repair does not ask the successor")
 local queuedPreferred = "unset"
 Sync.QueueRepairRanges = function(_, _, _, opts)
     queuedPreferred = opts and opts.preferredTarget or nil
@@ -2527,6 +2561,50 @@ Sync:HandleSessionStart(COORD, {
 })
 assertEq(Sync.state.sessionId, "session-2", "a newer session still escapes the old revocation")
 assertEq(Sync:_RouteWasRevoked(COORD), false, "a newer session clears the old revocation")
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = COORD
+Sync.state.helpers = { KINO }
+Sync.state.coordEpoch = 10
+Sync.state.heartbeat.lastHeartbeatAt = 40
+Sync.state.heartbeat.lastCoordMessageAt = 40
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = COORD },
+    },
+}
+Sync:_RememberRevokedRoute(COORD)
+Sync:HandleSessionHeartbeat(COORD, {
+    sessionId = "session-same-profile",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 12,
+    sentAt = 80,
+})
+assertEq(Sync.state.sessionId, SESSION, "same-profile heartbeat does not adopt a locally revoked coordinator")
+assertEq(Sync.state.coordEpoch, 10, "same-profile revoked heartbeat does not advance the epoch")
+assertEq(Sync:_RouteWasRevoked(COORD), true, "same-profile revoked heartbeat keeps the revocation")
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 40, "same-profile revoked heartbeat does not refresh the coordinator timer")
+Sync:HandleSessionReannounce(COORD, {
+    sessionId = "session-same-profile",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 12,
+    helpers = { OWNER },
+})
+assertEq(Sync.state.sessionId, SESSION, "same-profile reannounce does not adopt a locally revoked coordinator")
+assertTrue(not listHas(Sync.state.helpers, OWNER), "same-profile revoked reannounce does not apply helpers")
+Sync:HandleCoordinatorTakeover(COORD, {
+    sessionId = "session-same-profile",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 12,
+})
+assertEq(Sync.state.sessionId, SESSION, "same-profile takeover does not adopt a locally revoked coordinator")
+assertEq(Sync.state.coordinator, COORD, "same-profile revoked takeover keeps the coordinator")
 
 -- An authorized admin who is not a Helper can still be the integrity provider.
 reset(COORD)
