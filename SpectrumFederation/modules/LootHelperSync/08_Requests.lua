@@ -88,17 +88,26 @@ function Sync:_PickNextTargetForRequest(req)
         return nil
     end
 
-    -- Single target: keep retrying the same peer
+    -- Single target: keep retrying the same peer unless that peer was revoked.
     if #req.targets == 1 then
+        if self._ResponderMapHas and self:_ResponderMapHas(req.revokedResponders, req.targets[1]) then
+            return nil
+        end
         req.targetIdx = 1
         return req.targets[1]
     end
 
-    -- Multi target: walk the list once (no wrap)
+    -- Multi target: walk the list once (no wrap), skipping revoked peers.
     local idx = (tonumber(req.targetIdx) or 0) + 1
-    if idx > #req.targets then return nil end
-    req.targetIdx = idx
-    return req.targets[idx]
+    while idx <= #req.targets do
+        local name = req.targets[idx]
+        req.targetIdx = idx
+        if not (self._ResponderMapHas and self:_ResponderMapHas(req.revokedResponders, name)) then
+            return name
+        end
+        idx = idx + 1
+    end
+    return nil
 end
 
 -- Function Send a LOG_REQ to a target peer.
@@ -113,6 +122,11 @@ function Sync:_SendAdminLogReq(req, target)
     local meta = req and req.meta or nil
     if type(meta) ~= "table" then return false end
 
+    local profileId = meta.profileId or self.state.profileId
+    if not self:IsSenderAuthorized(profileId, self:_SelfId()) then
+        return false
+    end
+
     local payload = {
         sessionId   = meta.sessionId,
         profileId   = meta.profileId,
@@ -125,6 +139,15 @@ function Sync:_SendAdminLogReq(req, target)
         exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
         integrityRepair = meta.integrityRepair == true or nil,
     }
+    local grantFields = self._CatchUpRequestGrantFields and self:_CatchUpRequestGrantFields(target) or nil
+    if type(grantFields) == "table" then
+        if grantFields.needsAdminGrant then
+            payload.needsAdminGrant = true
+        end
+        if type(grantFields.adminGrantMember) == "string" then
+            payload.adminGrantMember = grantFields.adminGrantMember
+        end
+    end
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.LOG_REQ, payload, "WHISPER", target, "NORMAL")
 end
@@ -155,6 +178,10 @@ function Sync:_SendNeedProfileReq(req, target)
                             and SF.SyncProtocol.GetSupportedEncodings()
                             or nil,
     }
+    local grantFields = self._CatchUpRequestGrantFields and self:_CatchUpRequestGrantFields(target) or nil
+    if type(grantFields) == "table" and type(grantFields.adminGrantMember) == "string" then
+        payload.adminGrantMember = grantFields.adminGrantMember
+    end
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, payload, "WHISPER", target, "NORMAL")
 end
@@ -201,6 +228,18 @@ function Sync:_SendNeedLogsReq(req, target)
                             and SF.SyncProtocol.GetSupportedEncodings()
                             or nil,
     }
+    -- A stored grant is confirmed by the catch-up coordinator. A missing grant
+    -- is requested from an admin this profile already trusts. Other repairs
+    -- keep the historical requested-window payload.
+    local grantFields = self._CatchUpRequestGrantFields and self:_CatchUpRequestGrantFields(target) or nil
+    if type(grantFields) == "table" then
+        if grantFields.needsAdminGrant then
+            payload.needsAdminGrant = true
+        end
+        if type(grantFields.adminGrantMember) == "string" then
+            payload.adminGrantMember = grantFields.adminGrantMember
+        end
+    end
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, payload, "WHISPER", target, "NORMAL")
 end
@@ -224,9 +263,28 @@ function Sync:_SendRequestAttempt(req)
         end
     end
 
+    -- Look at the next peer before the attempt cap. A helper or coordinator added
+    -- after the old budget was spent still gets one send. Peers already contacted
+    -- do not get extra retries. Waiting for a route does not consume an attempt.
+    local target = self:_PickNextTargetForRequest(req)
+    local newRoute = type(target) == "string"
+        and self._RequestAlreadyContacted
+        and not self:_RequestAlreadyContacted(req, target)
+
+    -- A revoked coordinator can leave no peer to contact. That wait has its own
+    -- cap and must run even when the retry budget is already spent.
+    if not target and self._DeferRequestForMissingRoute and self:_DeferRequestForMissingRoute(req) then
+        return
+    end
+
     local maxAttempts = 1 + (tonumber(req.maxRetries) or tonumber(self.cfg.maxRetries) or 0)
-    if (tonumber(req.attempt) or 0) >= maxAttempts then
+    if (tonumber(req.attempt) or 0) >= maxAttempts and not newRoute then
         self:_FailRequest(req, "max attempts reached")
+        return
+    end
+
+    if not target then
+        self:_FailRequest(req, "no more targets")
         return
     end
 
@@ -235,12 +293,6 @@ function Sync:_SendRequestAttempt(req)
     self:_MInc("sync.req.send_attempt.total", 1)
     self:_MInc("sync.req.send_attempt.kind." .. tostring(req.kind or "UNKNOWN"), 1)
     self:_MObserve("sync.req.attempt_number.kind." .. tostring(req.kind or "UNKNOWN"), tonumber(req.attempt) or 0)
-
-    local target = self:_PickNextTargetForRequest(req)
-    if not target then
-        self:_FailRequest(req, "no more targets")
-        return
-    end
 
     if SF.Debug then
         local targetsRemaining = 0
@@ -269,6 +321,9 @@ function Sync:_SendRequestAttempt(req)
     if ok then
         self:_MInc("sync.req.send_ok.total", 1)
         self:_MInc("sync.req.send_ok.kind." .. tostring(req.kind or "UNKNOWN"), 1)
+        if self._RememberInflightResponder then
+            self:_RememberInflightResponder(req, target)
+        end
     else
         self:_MInc("sync.req.send_fail.total", 1)
         self:_MInc("sync.req.send_fail.kind." .. tostring(req.kind or "UNKNOWN"), 1)
@@ -341,12 +396,18 @@ function Sync:_FailRequest(req, reason)
         and self.QueueRepairRanges
     then
         local nextQueueAttempts = math.max(0, tonumber(req.meta.queueAttempts) or 0) + 1
+        local retryPreferred = req.meta.preferredTarget or req.lastTarget
+        if self._PreferredRepairTargetRoutable
+            and not self:_PreferredRepairTargetRoutable(retryPreferred)
+        then
+            retryPreferred = nil
+        end
         local retryRange = {
             author = req.meta.author,
             fromCounter = req.meta.fromCounter,
             toCounter = req.meta.toCounter,
             mode = req.meta.integrityRepair == true and "integrity" or "missing",
-            preferredTarget = req.meta.preferredTarget or req.lastTarget,
+            preferredTarget = retryPreferred,
             exactAuthor = self:_IsExactAuthorRepair(req.meta),
         }
         self:_CopyExpectedWindowEvidence(req.meta, retryRange)
@@ -355,7 +416,7 @@ function Sync:_FailRequest(req, reason)
         }, {
             mode = req.meta.integrityRepair == true and "integrity" or "missing",
             reason = req.meta.reason or reason or "background-retry",
-            preferredTarget = req.meta.preferredTarget or req.lastTarget,
+            preferredTarget = retryPreferred,
             delaySec = self:_ComputeQueuedRepairBackoffSec(nextQueueAttempts),
             queueAttempts = nextQueueAttempts,
             exactAuthor = self:_IsExactAuthorRepair(req.meta),
@@ -398,6 +459,10 @@ function Sync:_FailRequest(req, reason)
         if type(profileId) == "string" and profileId ~= "" then
             self:ConsiderIdentityAdminSideEffects(profileId)
         end
+    end
+
+    if self._DrainAutomaticBisBackfill then
+        self:_DrainAutomaticBisBackfill()
     end
 end
 
@@ -538,6 +603,47 @@ function Sync:OnRequestTimeout(requestId)
 
     req.timer = nil
     self:_SendRequestAttempt(req)
+end
+
+-- Function Wait briefly when a member request has no route yet.
+-- This covers the gap before a successor is stored, and the gap after this
+-- client becomes coordinator but before any helper route exists.
+-- The wait is capped so a request cannot retry forever.
+-- @param req table
+-- @return boolean True when the attempt was deferred
+function Sync:_DeferRequestForMissingRoute(req)
+    if type(req) ~= "table" then return false end
+    if req.kind ~= "NEED_PROFILE" and req.kind ~= "NEED_LOGS" then return false end
+    if not (self.state and self.state.active) then return false end
+
+    local routes = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets(self:_RequestRoutingOpts(req))) or {}
+    if #routes > 0 then return false end
+
+    local waitingForSuccessor = self._CoordinatorIsCurrentRoute and not self:_CoordinatorIsCurrentRoute()
+    local waitingAsCoordinator = self.state.isCoordinator == true
+    if not waitingForSuccessor and not waitingAsCoordinator then return false end
+
+    local waits = tonumber(req.routeWaits) or 0
+    if waits >= 8 then return false end
+    req.routeWaits = waits + 1
+
+    local delay = tonumber(req.timeoutSec) or tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    if delay < 1 then delay = 1 end
+    self:_CancelRequestTimer(req)
+    if self.RunAfter then
+        local requestId = req.id
+        req.timer = self:RunAfter(delay, function()
+            if self.OnRequestTimeout then
+                self:OnRequestTimeout(requestId)
+            end
+        end)
+    end
+
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Deferring request %s until a route exists (wait=%d, kind=%s)",
+            tostring(req.id), tonumber(req.routeWaits) or 0, tostring(req.kind))
+    end
+    return true
 end
 
 -- Function: Retry a request soon after receiving a bad/partial response.

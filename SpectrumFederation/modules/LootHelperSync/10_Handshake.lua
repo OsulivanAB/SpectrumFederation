@@ -23,9 +23,9 @@ end
 
 -- Function Broadcast a lightweight session heartbeat
 -- Coordinator-only. Does NOT restart handshake bookkeeping
--- @param none
+-- @param opts table|nil Optional { prio = "ALERT"|"NORMAL"|"BULK" }. Unknown values stay NORMAL.
 -- @return boolean ok True if sent, false otherwise
-function Sync:BroadcastSessionHeartbeat()
+function Sync:BroadcastSessionHeartbeat(opts)
     if not (self.state and self.state.active and self.state.isCoordinator) then return false end
     if not SF.LootHelperComm then return false end
 
@@ -36,6 +36,18 @@ function Sync:BroadcastSessionHeartbeat()
     local profileId = self.state.profileId
     if type(sid) ~= "string" or sid == "" then return false end 
     if type(profileId) ~= "string" or profileId == "" then return false end
+
+    -- A revoked admin must not keep the session alive by heartbeating as coordinator.
+    if self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown()
+        and not self:IsSenderAuthorized(profileId, self:_SelfId())
+    then
+        if self.RelinquishUnauthorizedCoordination then
+            self:RelinquishUnauthorizedCoordination("heartbeat_not_authorized")
+        elseif self.StopHeartbeatSender then
+            self:StopHeartbeatSender("heartbeat_not_authorized")
+        end
+        return false
+    end
 
     -- Keep authorMax fresh so reconnecting clients can catch up, without
     -- lowering a previously advertised raw spelling or copying a logical
@@ -58,7 +70,16 @@ function Sync:BroadcastSessionHeartbeat()
         self:_AttachRCConfigGeneration(payload, profileId)
     end
 
-    local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, "NORMAL")
+    -- Session end uses ALERT so this heartbeat stays ahead of SES_END.
+    -- Different AceComm priorities can be delivered out of send order.
+    local prio = "NORMAL"
+    if type(opts) == "table" then
+        local requested = opts.prio
+        if requested == "ALERT" or requested == "NORMAL" or requested == "BULK" then
+            prio = requested
+        end
+    end
+    local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, prio)
     
     if SF.Debug then
         local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0
@@ -87,6 +108,12 @@ function Sync:_ShouldRunHeartbeatSender()
     local pid = self.state.profileId
     if type(sid) ~= "string" or sid == "" then return false end
     if type(pid) ~= "string" or pid == "" then return false end
+
+    if self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown()
+        and not self:IsSenderAuthorized(pid, self:_SelfId())
+    then
+        return false
+    end
 
     -- Gate: don't heartbeat during admin convergence before the session is announced
     if self.state._sessionAnnounced ~= sid then return false end

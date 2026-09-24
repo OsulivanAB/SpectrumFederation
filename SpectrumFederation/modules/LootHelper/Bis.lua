@@ -62,6 +62,57 @@ local EQUIP_TO_SLOT = {
     INVTYPE_HOLDABLE = "offhand",
 }
 
+local SLOT_TO_EQUIP = {
+    Head = "INVTYPE_HEAD",
+    Neck = "INVTYPE_NECK",
+    Shoulder = "INVTYPE_SHOULDER",
+    Back = "INVTYPE_CLOAK",
+    Chest = "INVTYPE_CHEST",
+    Bracers = "INVTYPE_WRIST",
+    Hands = "INVTYPE_HAND",
+    Belt = "INVTYPE_WAIST",
+    Pants = "INVTYPE_LEGS",
+    Boots = "INVTYPE_FEET",
+}
+
+-- Known items whose resulting opportunity is not a native equipLoc.
+-- Match the base item ID only. Append a new season; do not delete older
+-- rows, because historical awards still need Gear Override later.
+-- Midnight Season 2 — The Venomous Abyss. These IDs cover Raid Finder,
+-- Normal, Heroic, and Mythic.
+local SPECIAL_ITEM_SLOT = {
+    -- Hands
+    [270910] = "Hands", -- Venomwoven Idol (cloth)
+    [270911] = "Hands", -- Venomcured Idol (leather)
+    [270912] = "Hands", -- Venomcast Idol (mail)
+    [270913] = "Hands", -- Venomforged Idol (plate)
+    -- Head
+    [270914] = "Head", -- Venomwoven Effigy (cloth)
+    [270915] = "Head", -- Venomcured Effigy (leather)
+    [270916] = "Head", -- Venomcast Effigy (mail)
+    [270917] = "Head", -- Venomforged Effigy (plate)
+    -- Pants (Spectrum's legs opportunity)
+    [270918] = "Pants", -- Venomwoven Relic (cloth)
+    [270919] = "Pants", -- Venomcured Relic (leather)
+    [270920] = "Pants", -- Venomcast Relic (mail)
+    [270921] = "Pants", -- Venomforged Relic (plate)
+    -- Shoulder
+    [270922] = "Shoulder", -- Venomwoven Remnant (cloth)
+    [270923] = "Shoulder", -- Venomcured Remnant (leather)
+    [270924] = "Shoulder", -- Venomcast Remnant (mail)
+    [270925] = "Shoulder", -- Venomforged Remnant (plate)
+    -- Chest
+    [270926] = "Chest", -- Venomwoven Icon (cloth)
+    [270927] = "Chest", -- Venomcured Icon (leather)
+    [270928] = "Chest", -- Venomcast Icon (mail)
+    [270929] = "Chest", -- Venomforged Icon (plate)
+}
+
+-- Intentionally ambiguous. Do not auto-assign a slot.
+local AMBIGUOUS_SPECIAL_ITEM = {
+    [270909] = true, -- Slumbering Coil Curio
+}
+
 local VALID_SLOT = {}
 for i = 1, #Bis.SLOTS do
     VALID_SLOT[Bis.SLOTS[i]] = true
@@ -185,19 +236,38 @@ function Bis.ParseAwardRef(ref)
     return { kind = ref.kind, id = ref.id }
 end
 
-function Bis.ClassifyItem(itemLinkOrString)
-    if itemLinkOrString == nil then
+function Bis.BaseItemId(itemLinkOrString)
+    if type(itemLinkOrString) == "number" then
+        if itemLinkOrString >= 1 and itemLinkOrString == math.floor(itemLinkOrString) then
+            return itemLinkOrString
+        end
         return nil
     end
-    local equipLoc, classId, subClassId
-    if GetItemInfoInstant then
-        local ok, _, _, _, loc, _, class, sub = pcall(GetItemInfoInstant, itemLinkOrString)
-        if ok then
-            equipLoc = loc
-            classId = class
-            subClassId = sub
-        end
+    if type(itemLinkOrString) ~= "string" or itemLinkOrString == "" then
+        return nil
     end
+    local idText = itemLinkOrString:match("item:(%d+)") or itemLinkOrString:match("^(%d+)$")
+    local itemId = tonumber(idText)
+    if not itemId or itemId < 1 or itemId ~= math.floor(itemId) then
+        return nil
+    end
+    return itemId
+end
+
+function Bis.IsKnownSpecialItem(itemId)
+    itemId = tonumber(itemId)
+    if not itemId then
+        return false
+    end
+    return SPECIAL_ITEM_SLOT[itemId] ~= nil or AMBIGUOUS_SPECIAL_ITEM[itemId] == true
+end
+
+function Bis.IsAmbiguousSpecialItem(itemLinkOrString)
+    local itemId = Bis.BaseItemId(itemLinkOrString)
+    return itemId ~= nil and AMBIGUOUS_SPECIAL_ITEM[itemId] == true
+end
+
+local function ClassifFromMappedEquip(equipLoc, classId, subClassId)
     if type(equipLoc) ~= "string" or equipLoc == "" then
         return nil
     end
@@ -219,6 +289,52 @@ function Bis.ClassifyItem(itemLinkOrString)
         isOffHandLoc = mapped == "offhand",
         isWeaponLoc = mapped == "weapon",
     }
+end
+
+local function ClassifFromSpecialSlot(slot, itemId)
+    local equipLoc = SLOT_TO_EQUIP[slot]
+    if not equipLoc or not VALID_SLOT[slot] then
+        return nil
+    end
+    return {
+        equipLoc = equipLoc,
+        family = "ordinary",
+        slot = slot,
+        itemClass = nil,
+        itemSubClass = nil,
+        isTwoHand = false,
+        isOffHandLoc = false,
+        isWeaponLoc = false,
+        specialItemId = itemId,
+    }
+end
+
+function Bis.ClassifyItem(itemLinkOrString)
+    if itemLinkOrString == nil then
+        return nil
+    end
+    local itemId = Bis.BaseItemId(itemLinkOrString)
+    -- Ambiguous tokens can become several tier slots. Never guess.
+    if itemId and AMBIGUOUS_SPECIAL_ITEM[itemId] then
+        return nil
+    end
+    local equipLoc, classId, subClassId
+    if GetItemInfoInstant then
+        local ok, _, _, _, loc, _, class, sub = pcall(GetItemInfoInstant, itemLinkOrString)
+        if ok then
+            equipLoc = loc
+            classId = class
+            subClassId = sub
+        end
+    end
+    local fromEquip = ClassifFromMappedEquip(equipLoc, classId, subClassId)
+    if fromEquip then
+        return fromEquip
+    end
+    if itemId and SPECIAL_ITEM_SLOT[itemId] then
+        return ClassifFromSpecialSlot(SPECIAL_ITEM_SLOT[itemId], itemId)
+    end
+    return nil
 end
 
 function Bis.FamilyForSlot(slot)
@@ -520,6 +636,28 @@ function Bis.NormalizeOverrideSlots(assignedSlots, itemLinkOrString, specId)
     return slots, nil
 end
 
+-- Classified items keep normal compatibility, including two-hand expansion.
+-- An item with no specific slot is an explicit force assignment: the admin's
+-- recorded slots stay authoritative and are not re-resolved later.
+function Bis.ResolveGearOverrideSlots(assignedSlots, itemLinkOrClassif, specId)
+    local classif = itemLinkOrClassif
+    if type(classif) ~= "table" or not classif.family then
+        classif = Bis.ClassifyItem(itemLinkOrClassif)
+    end
+    if classif then
+        local slots, err = Bis.ResolveOverrideSlots(assignedSlots, classif, specId)
+        return slots, err, false
+    end
+    local slots = CopySlots(assignedSlots)
+    if not Bis.IsLegalSlotShape(slots) then
+        return nil, "INVALID_SLOTS", false
+    end
+    if #slots == 2 then
+        slots = { "Weapon", "OffHand" }
+    end
+    return slots, nil, true
+end
+
 function Bis.ItemFitsSlots(classif, slots, specId)
     if type(classif) ~= "table" then
         return false, "UNKNOWN_SLOT"
@@ -694,7 +832,7 @@ function Bis.NormalizeAwardItemInput(text)
     if not itemId then
         return nil, nil, nil, "Enter a valid item ID or item link."
     end
-    if GetItemInfoInstant then
+    if GetItemInfoInstant and not Bis.IsKnownSpecialItem(itemId) then
         local ok, instantId = pcall(GetItemInfoInstant, itemId)
         if not ok or instantId == nil then
             return nil, nil, nil, "That item ID is not recognized."
@@ -1198,7 +1336,11 @@ local function CreateAssignment(state, opts)
         slots = { "Weapon", "OffHand" }
     end
     local classif
-    if opts.replayFrozen then
+    if opts.forced == true then
+        if not Bis.IsLegalSlotShape(slots) then
+            return nil
+        end
+    elseif opts.replayFrozen then
         classif = opts.frozenClassif
         if not classif then
             return nil
@@ -1229,6 +1371,7 @@ local function CreateAssignment(state, opts)
         source = opts.source or "AUTO",
         legacyOriginLogId = opts.legacyOriginLogId,
         legacyOriginKind = opts.legacyOriginKind,
+        forced = opts.forced == true,
         active = true,
         rank = opts.rank or 0,
     }
@@ -1456,6 +1599,34 @@ function Bis.IsOutcomeSourceConsistent(data, rcLog)
     return true
 end
 
+-- Forced overrides keep the logged slots even if a later classifier learns
+-- a different opportunity. Unforced overrides still re-check compatibility.
+local function ReplayOverrideSlots(data, award, specId)
+    local requested = data and data.assignedSlots
+    if data and data.forced == true then
+        local slots = CopySlots(requested)
+        if #slots == 2 then
+            slots = { "Weapon", "OffHand" }
+        end
+        if not Bis.IsLegalSlotShape(slots) then
+            return nil, false
+        end
+        return slots, true
+    end
+    local classif = Bis.ClassifyItem(award and (award.itemLink or award.itemString))
+    if classif then
+        local slots = select(1, Bis.ResolveOverrideSlots(requested, classif, specId))
+        if not slots then
+            return nil, false
+        end
+        return slots, false
+    end
+    if not Bis.IsLegalSlotShape(requested or {}) then
+        return nil, false
+    end
+    return CopySlots(requested), false
+end
+
 function Bis.ApplyLog(state, log, ctx)
     ctx = ctx or {}
     local eventType = GetLogType(log)
@@ -1464,6 +1635,15 @@ function Bis.ApplyLog(state, log, ctx)
     local logId = GetLogId(log)
     local rank = ctx.rank or 0
     state.rank[logId] = rank
+    -- Legacy bonus history is not an RC award. A 1.5.4 BIS_OUTCOME that
+    -- points at that row must not occupy a slot or become outcomeWinner.
+    if eventType == types.BIS_OUTCOME and data then
+        local sourceLog = ctx.FindLog and ctx.FindLog(data.sourceLogId)
+        local sourceData = sourceLog and GetLogData(sourceLog)
+        if type(sourceData) == "table" and sourceData.responseId == "BONUS_ROLL" then
+            return
+        end
+    end
     if eventType == types.BIS_OVERRIDE
         or eventType == types.MANUAL_AWARD or eventType == types.MANUAL_AWARD_REVERSE then
         state.hasItemAwareEvents = true
@@ -1506,6 +1686,9 @@ function Bis.ApplyLog(state, log, ctx)
     end
 
     if eventType == types.RC_LOOT_COUNCIL and data then
+        if data.responseId == "BONUS_ROLL" then
+            return
+        end
         local awardKey = data.awardKey
         if type(awardKey) == "string" and awardKey ~= "" then
             local key = Bis.AwardRefKey("RC", awardKey)
@@ -1657,13 +1840,9 @@ function Bis.ApplyLog(state, log, ctx)
             end
             local members = componentOf(award.member)
             local specId = award.member and state.specs[award.member]
-            local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
-            local slots = data.assignedSlots
-            if classif then
-                slots = select(1, Bis.ResolveOverrideSlots(data.assignedSlots, classif, specId))
-                if not slots then
-                    return
-                end
+            local slots, forced = ReplayOverrideSlots(data, award, specId)
+            if not slots then
+                return
             end
             local view = Bis.ProjectComponent(state, members, { slotsOnly = true })
             for i = 1, #slots do
@@ -1684,6 +1863,7 @@ function Bis.ApplyLog(state, log, ctx)
                 source = "OVERRIDE",
                 specId = specId,
                 rank = rank,
+                forced = forced,
             })
             return
         end
@@ -1710,14 +1890,8 @@ function Bis.ApplyLog(state, log, ctx)
                 return
             end
             local specId = award.member and state.specs[award.member]
-            local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
-            local slots = data.assignedSlots
-            if classif then
-                slots = select(1, Bis.ResolveOverrideSlots(data.assignedSlots, classif, specId))
-                if not slots then
-                    return
-                end
-            elseif not Bis.IsLegalSlotShape(data.assignedSlots or {}) then
+            local slots, forced = ReplayOverrideSlots(data, award, specId)
+            if not slots then
                 return
             end
             local members = componentOf(award.member)
@@ -1750,6 +1924,7 @@ function Bis.ApplyLog(state, log, ctx)
                 source = "OVERRIDE",
                 specId = specId,
                 rank = rank,
+                forced = forced,
             })
             if not created then
                 RestoreDeactivatedAssignment(state, target)
@@ -1790,12 +1965,15 @@ function Bis.ApplyLog(state, log, ctx)
             local members = componentOf(award.member)
             local stored = data.assignedSlots
             local specId = award.member and state.specs[award.member]
-            local classif = Bis.ClassifyItem(award.itemLink or award.itemString)
+            local forced = data.forced == true
+            local classif = (not forced) and Bis.ClassifyItem(award.itemLink or award.itemString) or nil
             local slots
             if originSlot then
                 -- Writer may store either the clicked origin or ResolveOverrideSlots
                 -- output (a Weapon/OffHand pair for a normal two-hand). Replay
                 -- accepts only those canonical forms, then applies the resolved set.
+                -- A forced association keeps the origin slot even if a later
+                -- classifier learns a different opportunity for the item.
                 local fromOrigin = { originSlot }
                 if classif then
                     fromOrigin = select(1, Bis.ResolveOverrideSlots(fromOrigin, classif, specId))
@@ -1850,6 +2028,7 @@ function Bis.ApplyLog(state, log, ctx)
                 legacyOriginLogId = originId,
                 legacyOriginKind = rec.kind,
                 rank = rank,
+                forced = forced,
             })
         end
     end
@@ -1995,11 +2174,9 @@ function Bis.DecideAutomaticOutcome(opts)
 end
 
 -- Display is item-aware when live BiS automation is configured, or when
--- historical item-aware events already exist. Live automation (recording on
--- with BiS responses) still locks every raid-popup click. When live automation
--- is off, AVAILABLE and LEGACY_UNKNOWN cells keep the manual fallback;
--- ASSIGNED_AUTO / ASSIGNED_OVERRIDE stay non-clickable so ARMOR_CHANGE cannot
--- double-consume item-aware occupancy.
+-- historical item-aware events already exist. In that mode an admin click
+-- opens Gear Override instead of writing ARMOR_CHANGE. Manual mode, with
+-- recording off and no item-aware history, keeps direct click-to-toggle.
 function Bis.IsItemAwarePopup(state, bisResponsesConfigured)
     if bisResponsesConfigured then
         return true
@@ -2010,6 +2187,44 @@ end
 function Bis.CellHasItemAwareAssignment(cell)
     local state = cell and cell.state
     return state == "ASSIGNED_AUTO" or state == "ASSIGNED_OVERRIDE"
+end
+
+function Bis.RequestGearOverrideFocus(memberId, slot)
+    memberId = NormalizeId(memberId)
+    if not memberId or type(slot) ~= "string" or not VALID_SLOT[slot] then
+        return false
+    end
+    Bis._gearOverrideFocus = { memberId = memberId, slot = slot }
+    return true
+end
+
+function Bis.ConsumeGearOverrideFocus()
+    local focus = Bis._gearOverrideFocus
+    Bis._gearOverrideFocus = nil
+    if type(focus) ~= "table" or type(focus.memberId) ~= "string" or not VALID_SLOT[focus.slot] then
+        return nil
+    end
+    return { memberId = focus.memberId, slot = focus.slot }
+end
+
+-- Pure selection update used by Loot Helper → Character. Adding loot does not
+-- call this, so the highlighted character and slot stay put.
+function Bis.ApplyGearOverrideSelection(state, focus)
+    state = type(state) == "table" and state or {}
+    if type(focus) ~= "table" or type(focus.memberId) ~= "string" or focus.memberId == "" then
+        return state
+    end
+    if type(focus.slot) ~= "string" or not VALID_SLOT[focus.slot] then
+        return state
+    end
+    if state.memberId ~= focus.memberId then
+        state.reverseManualId = nil
+        state.awardKey = nil
+    end
+    state.memberId = focus.memberId
+    state.slot = focus.slot
+    state.awardKey = nil
+    return state
 end
 
 function Bis.LegacyOriginsForDisplay(state, memberId, identityOf)

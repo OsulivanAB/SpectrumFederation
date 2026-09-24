@@ -555,6 +555,38 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 		panel.__sfGearSlot = nil
 	end
 
+	local function ApplyPendingGearFocus()
+		local Bis = SF.LootHelperBis
+		if not (Bis and Bis.ConsumeGearOverrideFocus and Bis.ApplyGearOverrideSelection) then
+			return
+		end
+		local focus = Bis.ConsumeGearOverrideFocus()
+		if not focus then
+			return
+		end
+		local selection = Bis.ApplyGearOverrideSelection({
+			memberId = panel.__sfGearMember,
+			slot = panel.__sfGearSlot,
+			awardKey = panel.__sfGearAward,
+			reverseManualId = panel.__sfGearReverseManual,
+		}, focus)
+		panel.__sfGearMember = selection.memberId
+		panel.__sfGearSlot = selection.slot
+		panel.__sfGearAward = selection.awardKey
+		panel.__sfGearReverseManual = selection.reverseManualId
+	end
+
+	local buildsCharacter = false
+	for _, sectionId in ipairs(sectionIds or {}) do
+		if sectionId == "character" then
+			buildsCharacter = true
+		end
+	end
+	if buildsCharacter then
+		panel.__sfApplyGearFocus = ApplyPendingGearFocus
+		ApplyPendingGearFocus()
+	end
+
 	local function SelectedGearMember()
 		local profile = GetProfile()
 		if panel.__sfGearMember then
@@ -1486,7 +1518,61 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				},
 				{ type = "equipmentBoard", adminOnly = true, enabled = function() return ProfileActionsEnabled() and SelectedGearMember() ~= nil end, getSlots = function() local profile = GetProfile() local memberId = SelectedGearMember() if not (profile and memberId and profile.GetIdentityBisSlots) then return {} end return profile:GetIdentityBisSlots(memberId) or {} end, getSelectedSlot = function() return panel.__sfGearSlot end, onSlotClick = function(ctx, slot) panel.__sfGearSlot = slot if ctx.pageBuilder and ctx.pageBuilder.Refresh then ctx.pageBuilder:Refresh() end end, onClear = function(ctx, _slot, cell) local profile = GetProfile() if not (profile and profile.ApplyBisOverride and cell and cell.assignmentId) then ctx.section:SetMessage("Select an occupied slot to clear.", "error") return end dialogs:Confirm("Clear this assignment? Frozen overflow awards will not backfill the hole.", "Clear", function() local ok, err = profile:ApplyBisOverride("CLEAR", { viewMember = SelectedGearMember(), targetAssignmentId = cell.assignmentId }) ctx.section:SetMessage(ok and "Assignment cleared." or (err or "Clear failed."), ok and "success" or "error") ctx.pageBuilder:Refresh() end) end },
 				{ type = "dropdown", label = "Compatible loot", adminOnly = true, defaultText = "Select loot for the highlighted slot", options = function() return BuildCompatibleAwardOptions(panel.__sfGearSlot) end, get = function() return panel.__sfGearAward end, set = function(value) panel.__sfGearAward = value TryPlaceSelectedAward() end, enabled = function() return ProfileActionsEnabled() and panel.__sfGearSlot ~= nil end },
-				{ type = "help", indent = "label", text = "Click an empty slot to assign compatible loot, or an occupied slot to replace it. Legacy unknown usage is highlighted in gold. The red X clears an assignment." },
+				{
+					type = "button",
+					label = "Unknown consumption",
+					adminOnly = true,
+					width = 320,
+					buttonText = function()
+						local profile = GetProfile()
+						local memberId = SelectedGearMember()
+						local slot = panel.__sfGearSlot
+						local board = profile and memberId and slot and profile.GetIdentityBisSlots and profile:GetIdentityBisSlots(memberId)
+						local cell = board and board[slot]
+						if cell and cell.state == "LEGACY_UNKNOWN" then
+							return "Clear unknown consumption"
+						end
+						return "Mark opportunity consumed — item unknown"
+					end,
+					tooltip = "Consume this BiS opportunity when the awarded item is unknown, or return that opportunity to available. This does not create a loot award.",
+					visible = function()
+						local profile = GetProfile()
+						local memberId = SelectedGearMember()
+						local slot = panel.__sfGearSlot
+						if not (profile and memberId and slot and profile.GetIdentityBisSlots) then
+							return false
+						end
+						local board = profile:GetIdentityBisSlots(memberId)
+						local cell = board and board[slot]
+						local state = cell and cell.state or "AVAILABLE"
+						return state == "AVAILABLE" or state == "LEGACY_UNKNOWN"
+					end,
+					enabled = function()
+						return ProfileActionsEnabled() and SelectedGearMember() ~= nil and panel.__sfGearSlot ~= nil
+					end,
+					onClick = function(ctx)
+						local profile = GetProfile()
+						local memberId = SelectedGearMember()
+						local slot = panel.__sfGearSlot
+						if not (profile and profile.SetOpportunityConsumedUnknown and memberId and slot) then
+							ctx.section:SetMessage("Select an available equipment slot.", "error")
+							return
+						end
+						local board = profile.GetIdentityBisSlots and profile:GetIdentityBisSlots(memberId)
+						local cell = board and board[slot]
+						local markConsumed = not (cell and cell.state == "LEGACY_UNKNOWN")
+						local ok, err = profile:SetOpportunityConsumedUnknown(memberId, slot, markConsumed)
+						ctx.section:SetMessage(
+							ok and (markConsumed and "Opportunity marked consumed — item unknown." or "Opportunity returned to available.")
+								or (err or "Could not update equipment history."),
+							ok and "success" or "error"
+						)
+						if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+							ctx.pageBuilder:Refresh()
+						end
+					end,
+				},
+				{ type = "help", indent = "label", text = "Click an empty slot to assign compatible loot, or an occupied slot to replace it. Unresolved loot can be force-assigned. Consumed opportunity — item unknown is highlighted in gold. An administrator may associate an awarded item later through Gear Override. The red X clears an item assignment." },
 				{
 					type = "editboxButton",
 					label = "Manually add loot",
@@ -1638,6 +1724,9 @@ function CharacterPage:Build(panel)
 end
 
 function CharacterPage:Refresh(panel)
+	if panel and panel.__sfApplyGearFocus then
+		panel.__sfApplyGearFocus()
+	end
 	RefreshPage(panel)
 end
 

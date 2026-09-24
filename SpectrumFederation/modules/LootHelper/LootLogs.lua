@@ -29,6 +29,7 @@ local EVENT_TYPES = {
     ATTENDANCE_CHANGE           = "ATTENDANCE_CHANGE",
     RAID_CHECK_PRESENCE         = "RAID_CHECK_PRESENCE",
     RC_LOOT_COUNCIL             = "RC_LOOT_COUNCIL",
+    BONUS_ROLL                  = "BONUS_ROLL",
     SPEC_CHANGE                = "SPEC_CHANGE",
     BIS_OUTCOME                = "BIS_OUTCOME",
     BIS_OVERRIDE              = "BIS_OVERRIDE",
@@ -161,6 +162,15 @@ local EVENT_DATA_TEMPLATES = {
         -- @field typeCode string|nil RCLC button-group / response context
         -- @field equipLoc string|nil RC item equip loc when provided
     },
+    [EVENT_TYPES.BONUS_ROLL] = {
+        member = "",
+        itemLink = "",
+        itemString = "",
+        rcAwardId = "",
+        awardKey = ""
+        -- @field owner string|nil RC history owner when provided
+        -- @field responseId string|nil always BONUS_ROLL for this event
+    },
     [EVENT_TYPES.SPEC_CHANGE] = {
         member = "",
         specId = 0,
@@ -180,6 +190,7 @@ local EVENT_DATA_TEMPLATES = {
     [EVENT_TYPES.BIS_OVERRIDE] = {
         action = "",
         preOpAuthorMax = {},
+        -- @field forced boolean|nil explicit force-assignment; logged slots stay authoritative
     },
     [EVENT_TYPES.MANUAL_AWARD] = {
         member = "",
@@ -323,22 +334,39 @@ function LootLog.NormalizePlayerId(nameOrNameRealm)
     return strtrim(nameOrNameRealm)
 end
 
-function LootLog.MakeRCAwardExternalId(awarder, historyId, winner, itemLink, owner)
+-- External history identities are a narrow exception for RC awards and
+-- RCLC bonus rolls. Other event types stay on author:counter ids.
+function LootLog.IsExternalHistoryEvent(eventType)
+    return eventType == EVENT_TYPES.RC_LOOT_COUNCIL or eventType == EVENT_TYPES.BONUS_ROLL
+end
+
+function LootLog.MakeHistoryExternalId(prefix, awarder, historyId, winner, itemLink, owner)
     local normalizedAwarder = LootLog.NormalizePlayerId(awarder)
     local normalizedWinner = LootLog.NormalizePlayerId(winner)
     local itemString = LootLog.ExtractItemString(itemLink)
     local normalizedOwner = LootLog.NormalizePlayerId(owner) or ""
-    if not normalizedAwarder or not normalizedWinner or type(historyId) ~= "string" or historyId == "" or not itemString then
+    if type(prefix) ~= "string" or prefix == ""
+        or not normalizedAwarder or not normalizedWinner
+        or type(historyId) ~= "string" or historyId == ""
+        or not itemString then
         return nil
     end
     return table.concat({
-        "RCLootCouncil",
+        prefix,
         normalizedAwarder,
         historyId,
         normalizedWinner,
         itemString,
         normalizedOwner,
     }, "|")
+end
+
+function LootLog.MakeRCAwardExternalId(awarder, historyId, winner, itemLink, owner)
+    return LootLog.MakeHistoryExternalId("RCLootCouncil", awarder, historyId, winner, itemLink, owner)
+end
+
+function LootLog.MakeBonusRollExternalId(awarder, historyId, winner, itemLink, owner)
+    return LootLog.MakeHistoryExternalId("BonusRoll", awarder, historyId, winner, itemLink, owner)
 end
 
 function LootLog.BuildRCLootCouncilCanonical(awarder, winner, history)
@@ -400,6 +428,64 @@ function LootLog.BuildRCLootCouncilEventData(canonical)
         isAwardReason = canonical.isAwardReason and true or false,
         typeCode = canonical.typeCode,
         equipLoc = canonical.equipLoc,
+    }
+end
+
+function LootLog.IsBonusRollHistory(history)
+    return type(history) == "table" and history.responseID == "BONUS_ROLL"
+end
+
+function LootLog.BuildBonusRollCanonical(awarder, winner, history)
+    if type(history) ~= "table" or not LootLog.IsBonusRollHistory(history) then
+        return nil
+    end
+    local normalizedAwarder = LootLog.NormalizePlayerId(awarder)
+    local normalizedWinner = LootLog.NormalizePlayerId(winner)
+    local itemLink = history.lootWon
+    if type(itemLink) ~= "string" or itemLink == "" then
+        return nil
+    end
+    local rcAwardId = history.id
+    if type(rcAwardId) ~= "string" or rcAwardId == "" then
+        return nil
+    end
+    local awardKey = LootLog.MakeBonusRollExternalId(normalizedAwarder, rcAwardId, normalizedWinner, itemLink, history.owner)
+    if not awardKey then
+        return nil
+    end
+    local timestamp = LootLog.ParseHistoryTimestamp(rcAwardId)
+    if not timestamp then
+        return nil
+    end
+    local itemString = LootLog.ExtractItemString(itemLink)
+    if type(itemString) ~= "string" or itemString == "" then
+        return nil
+    end
+    return {
+        awarder = normalizedAwarder,
+        winner = normalizedWinner,
+        itemLink = itemLink,
+        itemString = itemString,
+        rcAwardId = rcAwardId,
+        owner = LootLog.NormalizePlayerId(history.owner),
+        responseId = "BONUS_ROLL",
+        timestamp = timestamp,
+        awardKey = awardKey,
+    }
+end
+
+function LootLog.BuildBonusRollEventData(canonical)
+    if type(canonical) ~= "table" then
+        return nil
+    end
+    return {
+        member = canonical.winner,
+        itemLink = canonical.itemLink,
+        itemString = canonical.itemString,
+        rcAwardId = canonical.rcAwardId,
+        awardKey = canonical.awardKey,
+        owner = canonical.owner,
+        responseId = "BONUS_ROLL",
     }
 end
 
@@ -591,6 +677,10 @@ function LootLog.new(eventType, eventData, opts)
         if not SF.LootLogValidators.ValidateRCLootCouncilData(eventData) then
             return nil
         end
+    elseif eventType == EVENT_TYPES.BONUS_ROLL then
+        if not SF.LootLogValidators.ValidateBonusRollData(eventData) then
+            return nil
+        end
     elseif eventType == EVENT_TYPES.SPEC_CHANGE then
         if not SF.LootLogValidators.ValidateSpecChangeData(eventData, owningProfile) then
             return nil
@@ -672,29 +762,29 @@ function LootLog.new(eventType, eventData, opts)
     local externalId = opts.externalId
     local isExternal = type(externalId) == "string" and externalId ~= ""
 
-    -- External IDs are a narrow RC_LOOT_COUNCIL audit exception.
+    -- External IDs are a narrow exception for RC awards and RCLC bonus rolls.
     if isExternal then
-        if eventType ~= EVENT_TYPES.RC_LOOT_COUNCIL then
+        if not LootLog.IsExternalHistoryEvent(eventType) then
             if SF.Debug then
-                SF.Debug:Warn("LOOTLOG", "externalId is only valid for RC_LOOT_COUNCIL")
+                SF.Debug:Warn("LOOTLOG", "externalId is only valid for RC_LOOT_COUNCIL and BONUS_ROLL")
             end
             return nil
         end
         if type(eventData.awardKey) ~= "string" or eventData.awardKey == "" then
             if SF.Debug then
-                SF.Debug:Warn("LOOTLOG", "RC external logs require data.awardKey")
+                SF.Debug:Warn("LOOTLOG", "external history logs require data.awardKey")
             end
             return nil
         end
         if externalId ~= eventData.awardKey then
             if SF.Debug then
-                SF.Debug:Warn("LOOTLOG", "RC externalId must match data.awardKey")
+                SF.Debug:Warn("LOOTLOG", "externalId must match data.awardKey")
             end
             return nil
         end
-    elseif eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+    elseif LootLog.IsExternalHistoryEvent(eventType) then
         if SF.Debug then
-            SF.Debug:Warn("LOOTLOG", "RC_LOOT_COUNCIL logs require an externalId")
+            SF.Debug:Warn("LOOTLOG", "RC_LOOT_COUNCIL and BONUS_ROLL logs require an externalId")
         end
         return nil
     end
@@ -962,8 +1052,8 @@ function LootLog.ValidateTable(t, opts)
 
     local isExternal = LootLog.IsExternalLogTable(t)
     if isExternal then
-        if t._eventType ~= EVENT_TYPES.RC_LOOT_COUNCIL then
-            return false, "external logs are only valid for RC_LOOT_COUNCIL"
+        if not LootLog.IsExternalHistoryEvent(t._eventType) then
+            return false, "external logs are only valid for RC_LOOT_COUNCIL and BONUS_ROLL"
         end
         if t._id ~= t._externalId then
             return false, "log._id must match _externalId"
@@ -972,14 +1062,14 @@ function LootLog.ValidateTable(t, opts)
             return false, "external log._counter must be 0"
         end
         if type(t._data.awardKey) ~= "string" or t._data.awardKey == "" then
-            return false, "RC external log requires data.awardKey"
+            return false, "external history log requires data.awardKey"
         end
         if t._externalId ~= t._data.awardKey then
             return false, "log._externalId must match data.awardKey"
         end
     else
-        if t._eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
-            return false, "RC_LOOT_COUNCIL logs must use an external id"
+        if LootLog.IsExternalHistoryEvent(t._eventType) then
+            return false, "RC_LOOT_COUNCIL and BONUS_ROLL logs must use an external id"
         end
         if type(t._counter) ~= "number" or t._counter < 1 or t._counter ~= math.floor(t._counter) then
             return false, "log._counter must be a positive integer"
@@ -1043,6 +1133,12 @@ function LootLog.ValidateTable(t, opts)
             and not SF.LootLogValidators.ValidateBisOverrideData(t._data, opts.profile)
         then
             return false, "BIS_OVERRIDE data is invalid"
+        end
+    elseif t._eventType == EVENT_TYPES.BONUS_ROLL then
+        if SF.LootLogValidators.ValidateBonusRollData
+            and not SF.LootLogValidators.ValidateBonusRollData(t._data)
+        then
+            return false, "BONUS_ROLL data is invalid"
         end
     elseif t._eventType == EVENT_TYPES.BIS_OUTCOME then
         if SF.LootLogValidators.ValidateBisOutcomeData
@@ -1126,7 +1222,7 @@ function LootLog.TryNormalizeMainSwapStaleFingerprintTable(t, lineage)
     if type(t) ~= "table" then
         return false
     end
-    if LootLog.IsExternalLogTable(t) or t._eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+    if LootLog.IsExternalLogTable(t) or LootLog.IsExternalHistoryEvent(t._eventType) then
         return false
     end
     if type(t._fingerprint) ~= "number" then
@@ -1170,7 +1266,7 @@ function LootLog.TryNormalizeMainSwapStaleFingerprint(log, lineage)
         return false
     end
     local eventType = log.GetEventType and log:GetEventType() or log._eventType
-    if eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+    if LootLog.IsExternalHistoryEvent(eventType) then
         return false
     end
     if type(log._fingerprint) ~= "number" then
@@ -1217,7 +1313,7 @@ function LootLog.TryNormalizeOrphanRewriteStaleFingerprintTable(t, candidates)
     if type(t) ~= "table" then
         return false
     end
-    if LootLog.IsExternalLogTable(t) or t._eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+    if LootLog.IsExternalLogTable(t) or LootLog.IsExternalHistoryEvent(t._eventType) then
         return false
     end
     if type(t._fingerprint) ~= "number" then
@@ -1269,7 +1365,7 @@ function LootLog.TryNormalizeOrphanRewriteStaleFingerprint(log, candidates)
         return false
     end
     local eventType = log.GetEventType and log:GetEventType() or log._eventType
-    if eventType == EVENT_TYPES.RC_LOOT_COUNCIL then
+    if LootLog.IsExternalHistoryEvent(eventType) then
         return false
     end
     local t = {

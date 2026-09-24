@@ -114,7 +114,14 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         end
         local completionHook = opts.onComplete or function() self:BroadcastSessionStart() end
         completionHook()
+        if self._DrainAutomaticBisBackfill then
+            self:_DrainAutomaticBisBackfill()
+        end
         return
+    end
+
+    if type(self.state._adminConvergence) == "table" then
+        self:_CancelAdminConvergenceTimers(self.state._adminConvergence)
     end
 
     local adminSyncId = self:_NextNonce("AS")
@@ -184,15 +191,18 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         end
     end
 
-    -- After collection window, finalize no matter what
+    -- After collection window, finalize no matter what.
+    -- The id check ignores a timer left behind by an abandoned convergence.
     local sid = sessionId
-    self:RunAfter(self.cfg.adminConvergenceCollectSec or 1.5, function()
+    local collectSyncId = adminSyncId
+    local collectHandle = self:RunAfter(self.cfg.adminConvergenceCollectSec or 1.5, function()
         if not self.state.active or not self.state.isCoordinator then return end
         if self.state.sessionId ~= sid then return end
         local conv = self.state._adminConvergence
-        if not conv or conv.finished or conv.finalizeStarted then return end
+        if not conv or conv.adminSyncId ~= collectSyncId or conv.finished or conv.finalizeStarted then return end
         self:FinalizeAdminConvergence()
     end)
+    self:_TrackAdminConvergenceTimer(collectHandle)
 end
 
 -- Function Finish admin convergence by calling the completion hook (BroadcastSessionStart or ReannounceSession).
@@ -212,6 +222,7 @@ function Sync:_FinishAdminConvergence(reason)
     end
     
     conv.finished = true
+    self:_CancelAdminConvergenceTimers(conv)
     local onComplete = conv.onComplete
 
     -- START and takeover/REANNOUNCE both adopt a strictly newer previously
@@ -259,6 +270,10 @@ function Sync:_FinishAdminConvergence(reason)
     else
         -- Fallback if no valid completion hook
         self:BroadcastSessionStart()
+    end
+
+    if self._DrainAutomaticBisBackfill then
+        self:_DrainAutomaticBisBackfill()
     end
 end
 
@@ -475,8 +490,14 @@ function Sync:FinalizeAdminConvergence()
         end
     end
 
-    -- 6) choose helpers list
-    self.state.helpers = self:ChooseHelpers(self.state.adminStatuses or {})
+    -- 6) choose helpers list. Installing it retargets requests that were held
+    -- while this client had no helper route of its own.
+    local chosenHelpers = self:ChooseHelpers(self.state.adminStatuses or {})
+    if self.ApplyAdvertisedHelpers then
+        self:ApplyAdvertisedHelpers(chosenHelpers, "admin_convergence")
+    else
+        self.state.helpers = chosenHelpers
+    end
 
     if SF.Debug then
         local localMaxCount = 0
@@ -495,13 +516,19 @@ function Sync:FinalizeAdminConvergence()
         return
     end
 
-    -- Otherwise, wait a bit for AUTH_LOGS, then proceed even if some time out
+    -- Otherwise, wait a bit for AUTH_LOGS, then proceed even if some time out.
+    -- A replacement convergence has a different adminSyncId, so this timer
+    -- must not finish that later round.
     local sid = self.state.sessionId
-    self:RunAfter(self.cfg.adminLogSyncTimeoutSec or 4.0, function()
+    local logSyncId = conv.adminSyncId
+    local logSyncHandle = self:RunAfter(self.cfg.adminLogSyncTimeoutSec or 4.0, function()
         if not self.state.active or not self.state.isCoordinator then return end
         if self.state.sessionId ~= sid then return end
+        local current = self.state._adminConvergence
+        if not current or current.adminSyncId ~= logSyncId or current.finished then return end
         self:_FinishAdminConvergence("timeout")
     end)
+    self:_TrackAdminConvergenceTimer(logSyncHandle)
 end
 
 -- Function Choose helpers list from known admin statuses (middle-ground "helpers list" approach).
@@ -520,7 +547,13 @@ function Sync:ChooseHelpers(adminStatuses)
     local candidates = {}
 
     for name, st in pairs(adminStatuses) do
-        if name ~= me and type(st) == "table" and st.hasProfile then
+        local stillAdmin = true
+        if self.IsSenderAuthorized and self.state and type(self.state.profileId) == "string"
+            and self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId)
+        then
+            stillAdmin = self:IsSenderAuthorized(self.state.profileId, name) == true
+        end
+        if name ~= me and stillAdmin and type(st) == "table" and st.hasProfile then
             local peer = self:GetPeer(name) -- may exist from roster or be created
             local score = 0
 
@@ -584,8 +617,12 @@ function Sync:BroadcastSessionStart()
     
     -- Store chosen helpers for later activation
     local chosenHelpers = self.state.helpers or {}
-    -- Temporarily clear helpers list so members don't route to helpers immediately
+    -- Temporarily clear helpers list so members don't route to helpers immediately.
+    -- Refresh local requests too, so they do not whisper those helpers early.
     self.state.helpers = {}
+    if self._RefreshOutstandingRequestTargets then
+        self:_RefreshOutstandingRequestTargets()
+    end
 
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
     if self._MintDirtySessionRCConfig then
@@ -654,7 +691,11 @@ function Sync:BroadcastSessionStart()
         if self.state.sessionId ~= sid then return end
         
         -- Now activate helpers - members can route requests to them
-        self.state.helpers = chosenHelpers
+        if self.ApplyAdvertisedHelpers then
+            self:ApplyAdvertisedHelpers(chosenHelpers, "helpers_ready")
+        else
+            self.state.helpers = chosenHelpers
+        end
         self:_PersistSessionState("BroadcastSessionStart:HelpersReady")
         
         if SF.Debug then
