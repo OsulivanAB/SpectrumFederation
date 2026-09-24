@@ -98,6 +98,12 @@ function Sync:HandleSessionStart(sender, payload)
     local profile = self:FindLocalProfileById(payload.profileId)
     if profile then
         self:RebuildProfile(payload.profileId, "session_start_member")
+        if profile.NormalizePersistedLegacyBonusRolls then
+            profile:NormalizePersistedLegacyBonusRolls()
+        end
+    end
+    if self.BackfillAutomaticBisOnPromotion then
+        self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionStart")
     end
 
     if SF.Debug then

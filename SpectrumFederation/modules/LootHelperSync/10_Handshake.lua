@@ -23,9 +23,9 @@ end
 
 -- Function Broadcast a lightweight session heartbeat
 -- Coordinator-only. Does NOT restart handshake bookkeeping
--- @param none
+-- @param opts table|nil Optional { prio = "ALERT"|"NORMAL"|"BULK" }. Unknown values stay NORMAL.
 -- @return boolean ok True if sent, false otherwise
-function Sync:BroadcastSessionHeartbeat()
+function Sync:BroadcastSessionHeartbeat(opts)
     if not (self.state and self.state.active and self.state.isCoordinator) then return false end
     if not SF.LootHelperComm then return false end
 
@@ -58,7 +58,16 @@ function Sync:BroadcastSessionHeartbeat()
         self:_AttachRCConfigGeneration(payload, profileId)
     end
 
-    local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, "NORMAL")
+    -- Session end uses ALERT so this heartbeat stays ahead of SES_END.
+    -- Different AceComm priorities can be delivered out of send order.
+    local prio = "NORMAL"
+    if type(opts) == "table" then
+        local requested = opts.prio
+        if requested == "ALERT" or requested == "NORMAL" or requested == "BULK" then
+            prio = requested
+        end
+    end
+    local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_HEARTBEAT, payload, dist, nil, prio)
     
     if SF.Debug then
         local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0

@@ -1635,6 +1635,15 @@ function Bis.ApplyLog(state, log, ctx)
     local logId = GetLogId(log)
     local rank = ctx.rank or 0
     state.rank[logId] = rank
+    -- Legacy bonus history is not an RC award. A 1.5.4 BIS_OUTCOME that
+    -- points at that row must not occupy a slot or become outcomeWinner.
+    if eventType == types.BIS_OUTCOME and data then
+        local sourceLog = ctx.FindLog and ctx.FindLog(data.sourceLogId)
+        local sourceData = sourceLog and GetLogData(sourceLog)
+        if type(sourceData) == "table" and sourceData.responseId == "BONUS_ROLL" then
+            return
+        end
+    end
     if eventType == types.BIS_OVERRIDE
         or eventType == types.MANUAL_AWARD or eventType == types.MANUAL_AWARD_REVERSE then
         state.hasItemAwareEvents = true
@@ -1677,6 +1686,9 @@ function Bis.ApplyLog(state, log, ctx)
     end
 
     if eventType == types.RC_LOOT_COUNCIL and data then
+        if data.responseId == "BONUS_ROLL" then
+            return
+        end
         local awardKey = data.awardKey
         if type(awardKey) == "string" and awardKey ~= "" then
             local key = Bis.AwardRefKey("RC", awardKey)

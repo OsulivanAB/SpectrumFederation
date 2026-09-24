@@ -1077,6 +1077,7 @@ function Sync:_ScanExactAuthorRange(profileId, author, fromCounter, toCounter)
         return 0, 0, ExactRangeFingerprintRollup(rows)
     end
 
+    local seenIds = {}
     for _, log in ipairs(self:_GetProfileLootLogs(profile)) do
         local a = (log and log.GetAuthor and log:GetAuthor()) or (log and log._author)
         if a == author then
@@ -1091,7 +1092,31 @@ function Sync:_ScanExactAuthorRange(profileId, author, fromCounter, toCounter)
                     end
                     local id = (log.GetID and log:GetID()) or log._id or ""
                     local fingerprint = (log.GetFingerprint and log:GetFingerprint()) or log._fingerprint or 0
+                    if id ~= "" then
+                        seenIds[id] = true
+                    end
                     rows[#rows + 1] = ("%s=%s"):format(id, tostring(fingerprint))
+                end
+            end
+        end
+    end
+
+    -- Current-session non-coordinator BIS_OUTCOME rows are not stored, but
+    -- their id and fingerprint still belong to the advertiser's window.
+    local suppressed = self:_SuppressedBisRows(profileId)
+    if suppressed then
+        for _, row in pairs(suppressed) do
+            if type(row) == "table" and row.author == author and not seenIds[row.id] then
+                local c = tonumber(row.counter)
+                if c and type(row.id) == "string" and row.id ~= "" then
+                    c = math.floor(c)
+                    if c >= fromCounter and c <= toCounter then
+                        count = count + 1
+                        if c > maxInRange then
+                            maxInRange = c
+                        end
+                        rows[#rows + 1] = ("%s=%s"):format(row.id, tostring(row.fingerprint or 0))
+                    end
                 end
             end
         end
@@ -1415,12 +1440,15 @@ function Sync:_HasContainedExactWindowProof(profileId, author, window)
         end
         local expectedFp = tonumber(row.fingerprint)
         local log = profile.GetLogById and profile:GetLogById(row.id)
-        if not log or not expectedFp then
-            contained[key] = nil
-            return false
+        local localFp = nil
+        if log then
+            localFp = tonumber((log.GetFingerprint and log:GetFingerprint()) or log._fingerprint)
+        else
+            -- A current-session non-coordinator BIS_OUTCOME is remembered
+            -- instead of stored. That id still proves the advertised row.
+            localFp = self:_SuppressedBisFingerprint(profileId, row.id)
         end
-        local localFp = tonumber((log.GetFingerprint and log:GetFingerprint()) or log._fingerprint)
-        if not localFp or localFp ~= expectedFp then
+        if not expectedFp or not localFp or localFp ~= expectedFp then
             contained[key] = nil
             return false
         end
@@ -1528,10 +1556,15 @@ function Sync:_AuthLogsProveAdvertisedWindow(profileId, author, window, payloadL
     for i = 1, #evidence do
         local row = evidence[i]
         local localLog = byId[row.id]
-        if not localLog then
-            return nil
+        local localFp = nil
+        if localLog then
+            localFp = tonumber((localLog.GetFingerprint and localLog:GetFingerprint()) or localLog._fingerprint)
+        else
+            -- The repair filter omitted this current-session outcome. The
+            -- remembered fingerprint still accounts for the advertised row,
+            -- including when other local rows make the compact checksum differ.
+            localFp = self:_SuppressedBisFingerprint(profileId, row.id)
         end
-        local localFp = tonumber((localLog.GetFingerprint and localLog:GetFingerprint()) or localLog._fingerprint)
         if not localFp or localFp ~= row.fingerprint then
             return nil
         end
@@ -1634,6 +1667,10 @@ function Sync:ComputeMissingLogRequests(localAuthorMax, remoteAuthorMax, localRa
     if type(remoteAuthorMax) ~= "table" then return missing end
     localAuthorMax = localAuthorMax or {}
     local exactSource = type(localRawAuthorMax) == "table" and localRawAuthorMax or localAuthorMax
+    -- Suppressed current-session outcomes count as possessed for catch-up.
+    -- ComputeAuthorMax itself stays stored-logs-only so we do not advertise
+    -- a counter we cannot serve.
+    exactSource = self:_FoldSuppressedIntoAuthorMax(exactSource)
 
     local localLogical = CollapseAuthorCounterMap(localAuthorMax)
     local remoteLogical = CollapseAuthorCounterMap(remoteAuthorMax)
@@ -1688,7 +1725,102 @@ function Sync:MergeLogs(profileId, logs, opts)
     opts.allowUnknownEventType = true
 
     local inserted, details = profile:MergeLogTables(logs, opts)
+    if type(details) == "table" then
+        if profile.NormalizeInsertedLegacyBonusRolls then
+            profile:NormalizeInsertedLegacyBonusRolls(details.insertedRcAwardKeys)
+        end
+        local insertedRcAwardKeys = details.insertedRcAwardKeys
+        local hasInsertedRc = type(insertedRcAwardKeys) == "table" and #insertedRcAwardKeys > 0
+        -- A repair response can contain the RC award before a later response
+        -- contains its historical BIS_OUTCOME. Writing now would freeze a
+        -- second outcome. The deferred scan runs after those requests finish.
+        if hasInsertedRc and self._AutomaticBisBackfillBlocked and self:_AutomaticBisBackfillBlocked() then
+            if self._ScheduleAutomaticBisBackfill then
+                self:_ScheduleAutomaticBisBackfill("MergeLogs")
+            end
+        elseif hasInsertedRc and profile.ReconcileInsertedRCAwards then
+            profile:ReconcileInsertedRCAwards(insertedRcAwardKeys)
+        end
+    end
     return inserted and inserted > 0, details or { inserted = inserted or 0, replaced = 0, mismatchCount = 0, mismatches = {} }
+end
+
+function Sync:_AutomaticBisBackfillBlocked()
+    local state = self.state
+    if type(state) ~= "table" then
+        return true
+    end
+    -- Restore runs from Enable, before world or roster events start convergence.
+    if state._bisRestoreBackfillHold == true then
+        return true
+    end
+    local conv = state._adminConvergence
+    if type(conv) == "table" and conv.finished ~= true then
+        return true
+    end
+    local queue = state.repairQueue
+    if type(queue) == "table" and type(queue.order) == "table" and #queue.order > 0 then
+        return true
+    end
+    if type(state.requests) == "table" then
+        for _, req in pairs(state.requests) do
+            local kind = type(req) == "table" and req.kind or nil
+            if kind == "ADMIN_LOG_REQ" or kind == "LOG_REQ" or kind == "NEED_LOGS" then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- One-shot. Repeat calls do not scan until the previous wait has drained.
+function Sync:_ScheduleAutomaticBisBackfill(reason)
+    if not (self.state and self.state.isCoordinator == true) then
+        return 0
+    end
+    if type(self.state._bisBackfillPendingReason) ~= "string" then
+        self.state._bisBackfillPendingReason = reason or "deferred"
+    end
+    return self:_DrainAutomaticBisBackfill()
+end
+
+function Sync:_DrainAutomaticBisBackfill()
+    if not (self.state and type(self.state._bisBackfillPendingReason) == "string") then
+        return 0
+    end
+    if self.state.isCoordinator ~= true then
+        self.state._bisBackfillPendingReason = nil
+        return 0
+    end
+    if self:_AutomaticBisBackfillBlocked() then
+        return 0
+    end
+    local reason = self.state._bisBackfillPendingReason
+    self.state._bisBackfillPendingReason = nil
+    if self.BackfillAutomaticBisOnPromotion then
+        return self:BackfillAutomaticBisOnPromotion(false, reason) or 0
+    end
+    return 0
+end
+
+-- Runs only on the transition into coordinator. Repeat heartbeats pass
+-- wasCoordinator=true and return without scanning logs.
+function Sync:BackfillAutomaticBisOnPromotion(wasCoordinator, reason)
+    if wasCoordinator == true or not (self.state and self.state.isCoordinator == true) then
+        return 0
+    end
+    if type(self.state.profileId) ~= "string" or not self.FindLocalProfileById then
+        return 0
+    end
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    if not (profile and profile.ReconcileMissingAutomaticBisOutcomes) then
+        return 0
+    end
+    local wrote = profile:ReconcileMissingAutomaticBisOutcomes() or 0
+    if wrote > 0 and SF.Debug then
+        SF.Debug:Info("SYNC", "Coordinator backfill wrote %d automatic BiS outcome(s) (%s)", wrote, tostring(reason or "promotion"))
+    end
+    return wrote
 end
 
 -- Function Rebuild derived state from logs (replay) for the given profile.
@@ -2387,6 +2519,211 @@ function Sync:_ExtractAuthorCounter(t)
     return author, counter
 end
 
+-- Session-only memory for BIS_OUTCOME rows that a controlling session refused
+-- to store. The author's counter still advanced, so repair has to treat the
+-- row as present or it will request the same hole for the rest of the session.
+-- This is not SavedVariables and is not part of the advertised author frontier.
+function Sync:_SuppressedBisRows(profileId)
+    local state = self.state
+    if type(state) ~= "table" or type(state._suppressedBisOutcomes) ~= "table" then
+        return nil
+    end
+    if type(profileId) ~= "string" or profileId == "" then
+        return nil
+    end
+    local rows = state._suppressedBisOutcomes[profileId]
+    if type(rows) ~= "table" then
+        return nil
+    end
+    return rows
+end
+
+function Sync:_SuppressedBisFingerprint(profileId, logId)
+    if type(logId) ~= "string" or logId == "" then
+        return nil
+    end
+    if type(profileId) ~= "string" or profileId == "" then
+        return nil
+    end
+    local state = self.state
+    local byProfile = state and state._suppressedBisByLogId
+    local byId = type(byProfile) == "table" and byProfile[profileId] or nil
+    if type(byId) ~= "table" then
+        return nil
+    end
+    return tonumber(byId[logId])
+end
+
+function Sync:_FoldSuppressedIntoAuthorMax(exactSource)
+    local state = Sync.state
+    local profileId = type(state) == "table" and state.profileId or nil
+    local rows = Sync:_SuppressedBisRows(profileId)
+    if not rows then
+        return exactSource
+    end
+    local folded = nil
+    for _, row in pairs(rows) do
+        if type(row) == "table" and type(row.author) == "string" and row.author ~= "" then
+            local counter = tonumber(row.counter)
+            if counter and counter >= 1 then
+                counter = math.floor(counter)
+                if not folded then
+                    folded = {}
+                    if type(exactSource) == "table" then
+                        for author, existing in pairs(exactSource) do
+                            folded[author] = existing
+                        end
+                    end
+                end
+                local prev = tonumber(folded[row.author]) or 0
+                if counter > prev then
+                    folded[row.author] = counter
+                end
+            end
+        end
+    end
+    return folded or exactSource
+end
+
+-- Current-session repair rows only. A missing timestamp or epoch stays
+-- importable. Takeover sets coordEpoch to oldEpoch + 1 when that is still
+-- ahead of server time, so a same-second row would look historical. Only
+-- that one-second lead uses server time as the cutoff. A larger gap stays
+-- on coordEpoch so older history is not reclassified.
+function Sync:_ShouldSuppressRepairBisOutcome(profile, logTable)
+    if type(logTable) ~= "table" or type(self.state) ~= "table" then
+        return false
+    end
+    local types = SF.LootLogEventTypes
+    local eventType = logTable._eventType or logTable.eventType
+    if not types or eventType ~= types.BIS_OUTCOME then
+        return false
+    end
+    if not profile or not profile.SessionControlsAutomaticBis or not profile:SessionControlsAutomaticBis() then
+        return false
+    end
+    local coordinator = self.state.coordinator
+    if type(coordinator) ~= "string" or coordinator == "" then
+        return false
+    end
+    local epoch = tonumber(self.state.coordEpoch)
+    if not epoch then
+        return false
+    end
+    local now = self._Now and tonumber(self:_Now())
+    if type(now) == "number" and epoch > now and (epoch - now) <= 1 then
+        epoch = now
+    end
+    local timestamp = tonumber(logTable._timestamp or logTable.timestamp)
+    if not timestamp or timestamp < epoch then
+        return false
+    end
+    local author = logTable._author or logTable.author
+    if self:_SamePlayer(author, coordinator) then
+        return false
+    end
+    return true
+end
+
+function Sync:_RememberSuppressedAutomaticBisOutcome(profileId, logTable)
+    if type(self.state) ~= "table" or type(profileId) ~= "string" or profileId == "" then
+        return false
+    end
+    if type(logTable) ~= "table" then
+        return false
+    end
+    local author = logTable._author or logTable.author
+    local counter = tonumber(logTable._counter or logTable.counter)
+    local id = logTable._id or logTable.id
+    if type(author) ~= "string" or author == "" or not counter then
+        return false
+    end
+    if type(id) ~= "string" or id == "" then
+        return false
+    end
+    counter = math.floor(counter)
+    if counter < 1 then
+        return false
+    end
+    local fingerprint = tonumber(logTable._fingerprint or logTable.fingerprint)
+    if not fingerprint and SF.LootLog and SF.LootLog.ComputeFingerprintFromTable then
+        fingerprint = tonumber(SF.LootLog.ComputeFingerprintFromTable(logTable))
+    end
+    if not fingerprint then
+        return false
+    end
+    self.state._suppressedBisOutcomes = self.state._suppressedBisOutcomes or {}
+    local byProfile = self.state._suppressedBisOutcomes[profileId]
+    if not byProfile then
+        byProfile = {}
+        self.state._suppressedBisOutcomes[profileId] = byProfile
+    end
+    local rowKey = author .. "\0" .. tostring(counter)
+    local previous = byProfile[rowKey]
+    byProfile[rowKey] = {
+        author = author,
+        counter = counter,
+        id = id,
+        fingerprint = fingerprint,
+    }
+    self.state._suppressedBisByLogId = self.state._suppressedBisByLogId or {}
+    local byId = self.state._suppressedBisByLogId[profileId]
+    if not byId then
+        byId = {}
+        self.state._suppressedBisByLogId[profileId] = byId
+    end
+    if type(previous) == "table" and type(previous.id) == "string" and previous.id ~= id then
+        byId[previous.id] = nil
+    end
+    byId[id] = fingerprint
+    return true
+end
+
+-- Structural validation only. An invalid repair row is left for MergeLogs,
+-- which rejects it, instead of being remembered as a counter we never stored.
+function Sync:_RepairBisOutcomeWireValid(profile, logTable)
+    if not (SF.LootLog and SF.LootLog.ValidateTable) then
+        return false
+    end
+    return SF.LootLog.ValidateTable(logTable, {
+        allowUnknownEventType = false,
+        profile = profile,
+    }) == true
+end
+
+-- Drop current-session non-coordinator BIS_OUTCOME rows from an AUTH_LOGS
+-- batch. Remember each dropped counter so the repair can complete. Direct
+-- MergeLogTables and snapshot import are unchanged.
+function Sync:_PartitionRepairBisOutcomes(profileId, logs)
+    if type(logs) ~= "table" then
+        return logs
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    local kept = nil
+    for i = 1, #logs do
+        local row = logs[i]
+        local suppress = self:_ShouldSuppressRepairBisOutcome(profile, row)
+            and self:_RepairBisOutcomeWireValid(profile, row)
+            and self:_RememberSuppressedAutomaticBisOutcome(profileId, row)
+        if suppress then
+            if not kept then
+                kept = {}
+                for j = 1, i - 1 do
+                    kept[j] = logs[j]
+                end
+            end
+            if SF.Debug then
+                local author, counter = self:_ExtractAuthorCounter(row)
+                SF.Debug:Verbose("SYNC", "Ignoring repair BIS_OUTCOME from %s counter %s; the session coordinator is the automatic writer",
+                    tostring(author), tostring(counter))
+            end
+        elseif kept then
+            kept[#kept + 1] = row
+        end
+    end
+    return kept or logs
+end
+
 -- Function Compute highest contiguous counter prefix we have for an author (1..N with no gaps)
 -- @param profileId string Stable profile id
 -- @param author string Author name
@@ -2409,6 +2746,18 @@ function Sync:_ComputeContigCounter(profileId, author)
                 c = math.floor(c)
                 if c >= 1 then
                     seen[c] = true
+                end
+            end
+        end
+    end
+
+    local suppressed = self:_SuppressedBisRows(profileId)
+    if suppressed then
+        for _, row in pairs(suppressed) do
+            if type(row) == "table" and AuthorsMatch(row.author, author) then
+                local c = tonumber(row.counter)
+                if c and c >= 1 then
+                    seen[math.floor(c)] = true
                 end
             end
         end
@@ -2451,6 +2800,30 @@ function Sync:ComputeContigAuthorMax(profileId)
             end
             set[c] = true
             aliasesByKey[key][a] = true
+        end
+    end
+
+    local suppressed = self:_SuppressedBisRows(profileId)
+    if suppressed then
+        for _, row in pairs(suppressed) do
+            local a = type(row) == "table" and row.author or nil
+            local c = type(row) == "table" and tonumber(row.counter) or nil
+            if type(a) == "string" and a ~= "" and c and c >= 1 then
+                c = math.floor(c)
+                local key = a
+                local Identity = SF.LootHelperIdentity
+                if Identity and Identity.CanonicalAuthorKey then
+                    key = Identity.CanonicalAuthorKey(a) or a
+                end
+                local set = seenByAuthor[key]
+                if not set then
+                    set = {}
+                    seenByAuthor[key] = set
+                    aliasesByKey[key] = {}
+                end
+                set[c] = true
+                aliasesByKey[key][a] = true
+            end
         end
     end
 
