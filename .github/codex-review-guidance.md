@@ -18,10 +18,62 @@ Act as a senior engineer protecting production quality, not as a style checker.
 - Verify important claims against the repository rather than trusting the PR description, implementation summary, comments, or passing tests.
 - Trace important behavior to its source of truth.
 - Review impact across subsystem boundaries when a change can affect callers, consumers, persisted data, synchronization, settings, UI, tests, packaging, release behavior, or documentation.
-- Prefer a small number of well-supported findings over a large list of weak possibilities.
+- Prefer well-supported findings over a long list of weak possibilities. Finish the current review scope before submitting feedback. Discovering the first actionable defect is not a reason to stop. See [Exhaust the Current Review Scope](#exhaust-the-current-review-scope).
 - If there are no meaningful findings, say so. Do not manufacture issues to produce review output.
 - Do not ignore a real defect because the review is late or because an earlier fix caused it.
 - Do not treat every theoretical improvement as mandatory scope for the PR under review.
+
+---
+
+## Exhaust the Current Review Scope
+
+Within the scope of the current review, discovering an actionable defect is not a stopping condition. Finish examining that scope before submitting feedback. Report the distinct, high-confidence actionable defects found there, so related problems can be fixed together.
+
+Do not maximize comment count. There is no numeric minimum or maximum for findings. Every finding must still be high-confidence, actionable, and inside the current review scope. Do not manufacture speculative issues to fill the review. A later review may still find a bug that a previous fix introduced. Exhausting the current scope is how already-existing defects in that scope get reported together. It is not a promise that new code can never contain a new bug.
+
+### When an invariant is broken
+
+If a defect shows that an underlying invariant or policy is broken, inspect the other paths in the current review scope that the same invariant governs before finishing. Where the change actually reaches them, that includes:
+
+- authorization and trust decisions
+- coordinator or owner transitions
+- state-machine transitions
+- synchronization
+- persistence
+- request routing
+- retry behavior
+- cache creation and invalidation
+- lifecycle handling
+- restore and reload
+- cleanup
+- privilege changes
+- UI-thread or performance-sensitive processing
+
+If an authorization bug appears in one way of becoming coordinator, consider the sibling coordinator entry points in scope where the same authorization rule is expected to hold.
+
+### Lifecycle counterparts
+
+For newly changed machinery, consider the parts of its lifecycle that the change actually affects: creation, mutation, use, invalidation, reset, restore, timeout, cleanup, and failure handling. This matters most for state machines, caches, sync state, retry bookkeeping, authorization state, persistence, and addon-message protocols.
+
+### Sibling entry points
+
+If several entry points perform materially equivalent operations, and those siblings are inside the current review's impact surface, a defect in one is a reason to inspect the others in the same review. Do not leave an obvious sibling inside that surface for a later review request.
+
+### Related tests
+
+When a defect is found, inspect the relevant tests for other variants of the same rule. Consider whether the tests demonstrate the invariant across the materially affected paths, not only the exact case that triggered the finding. A missing variant belongs with that finding. It is not, by itself, a second defect.
+
+### One cause, one finding
+
+If several symptoms are one underlying defect, prefer one well-supported root-cause finding that names the affected paths. Use separate findings when the defects have different causes, need materially different fixes, or have independently important consequences. Do not collapse unrelated defects into one comment to reduce the count, and do not split one cause into several comments to increase it.
+
+### Stay inside the scope
+
+Exhaust the current review scope, then stop at its boundary.
+
+An incremental review's scope is the new commits since the last reliably reviewed state, whether prior findings were actually fixed, regressions those fixes introduced, the callers and consumers they affect, relevant shared state, the lifecycle and state transitions they directly affect, and integration assumptions the change invalidates. It does not automatically include unrelated unchanged portions of the PR.
+
+A full review's scope is the entire PR against its merge base: the changed subsystems and the integration paths those changes can reach. Finding an actionable defect is not a reason to stop before the remaining changed subsystems and affected integration paths have been examined. It is not a reason to audit unrelated unchanged code outside that impact. Reporting several findings does not, by itself, schedule another whole-PR review.
 
 ---
 
@@ -42,6 +94,8 @@ The initial review stays broad. Include the related ticket, production behavior,
 
 Do not limit the initial review to the newest commit or the files emphasized by the PR description.
 
+A full review continues across the changed subsystems and the integration paths they can reach even after an actionable defect has already been found. Finish that scope before submitting the review. See [Exhaust the Current Review Scope](#exhaust-the-current-review-scope).
+
 If the initial full review has no actionable findings, no additional full review is required solely for process reasons. Complete the applicable automated verification and document any remaining Retail QA.
 
 ### Subsequent Reviews
@@ -57,7 +111,9 @@ After fixes or other new commits are pushed, review incrementally and by impact:
 - Do **not** routinely restart an unrestricted audit of unrelated, unchanged portions of the PR.
 - Do not restrict investigation to changed lines. Inspect unchanged code when that is what it takes to understand the consequences.
 
-If an actionable issue is found during the incremental reviews that follow the initial review, report it and repeat incremental review after the next fix. Do not start the final integration review until one of those incremental reviews is clean.
+When reviewing a fix, exhaust the affected invariant and integration surface before submitting feedback. If the change fixes one entry point, inspect sibling entry points governed by the same rule when they are inside this incremental scope. See [Exhaust the Current Review Scope](#exhaust-the-current-review-scope). Reporting several findings from that pass does not turn the incremental review into an unrestricted audit, and it does not by itself schedule another whole-PR review.
+
+If actionable issues are found during the incremental reviews that follow the initial review, report the distinct high-confidence defects in that scope, then repeat incremental review after they are fixed. Do not start the final integration review until one of those incremental reviews is clean.
 
 A fix found by the final integration review does not, by itself, schedule another final review. Follow [When the Final Integration Review Finds an Issue](#when-the-final-integration-review-finds-an-issue).
 
@@ -67,21 +123,24 @@ After the incremental-review cycle is clean, perform **one** fresh review of the
 
 This is the final integration and regression sweep. Judge the final state of the PR as a whole rather than merely confirming individual fixes.
 
+A full integration review continues across the changed subsystems and the integration paths they can reach even after an actionable defect has already been found. Finish that scope before submitting the review. See [Exhaust the Current Review Scope](#exhaust-the-current-review-scope). Several findings from that sweep still follow [When the Final Integration Review Finds an Issue](#when-the-final-integration-review-finds-an-issue). They do not, by themselves, schedule another unrestricted review of the entire PR.
+
 If that review is clean, the automated review cycle can complete once applicable verification and any required Retail QA are documented. See Completion Standard.
 
 ### When the Final Integration Review Finds an Issue
 
-Report and fix a real issue normally. It is not optional because it appeared during the final sweep, because an earlier fix introduced it, or because the PR has already been reviewed several times.
+Report and fix real issues normally. They are not optional because they appeared during the final sweep, because an earlier fix introduced them, or because the PR has already been reviewed several times.
 
-After that fix:
+After those fixes:
 
-- Review the fix incrementally.
-- Inspect the callers, consumers, and state transitions the fix directly affects.
-- Perform the targeted integration sweep that change requires.
+- Review the fixes incrementally.
+- Inspect the callers, consumers, and state transitions the fixes directly affect.
+- Perform the targeted integration sweep those changes require.
+- Exhaust that incremental scope before submitting the re-review. See [Exhaust the Current Review Scope](#exhaust-the-current-review-scope).
 
-Do **not** automatically require another unrestricted review of the entire PR merely because the previous final review found an issue.
+Do **not** automatically require another unrestricted review of the entire PR merely because the previous final review found one or more issues.
 
-Require another full review of the PR against its merge base only when the new fix materially invalidates previous review coverage. Use the same conditions as [Fall Back to a Full Review When Review History Is Unreliable](#fall-back-to-a-full-review-when-review-history-is-unreliable). A narrow, well-tested fix discovered during the final sweep normally receives the targeted re-review above, not a restart of the whole review lifecycle.
+Require another full review of the PR against its merge base only when the new fixes materially invalidate previous review coverage. Use the same conditions as [Fall Back to a Full Review When Review History Is Unreliable](#fall-back-to-a-full-review-when-review-history-is-unreliable). A narrow, well-tested fix discovered during the final sweep normally receives the targeted re-review above, not a restart of the whole review lifecycle.
 
 There is no numeric cap on review rounds. Stop only when the applicable case in the Completion Standard is met. Do not stop because a defect was found late.
 
@@ -428,7 +487,7 @@ If the same underlying defect has regressed, report the regression. If the lates
 
 ## Review Output
 
-Lead with **actionable findings**, ordered by severity. Those are what must be fixed before the automated review cycle can complete.
+Lead with **actionable findings**, ordered by severity. Those are what must be fixed before the automated review cycle can complete. Submit the distinct high-confidence findings from the completed review scope together. Do not withhold an in-scope defect because another finding has already been written. See [Exhaust the Current Review Scope](#exhaust-the-current-review-scope).
 
 For each actionable finding include:
 
@@ -470,7 +529,7 @@ Do not inflate severity. A severe-sounding hypothetical is not high severity unl
 
 ## Completion Standard
 
-The automated review cycle is complete in one of these cases. There is no numeric limit on rounds, and a real defect does not expire.
+The automated review cycle is complete in one of these cases. There is no numeric limit on rounds, and a real defect does not expire. Several actionable findings in one review do not change these cases. Fix them, then continue with the incremental or targeted review the case already requires. Do not schedule another whole-PR review only because more than one finding was reported.
 
 ### Case A — The initial review is clean
 
@@ -488,11 +547,11 @@ The automated review cycle is complete in one of these cases. There is no numeri
 
 ### Case C — The final full integration review finds an issue
 
-- Fix the issue.
-- Incrementally review that fix, including a targeted integration sweep of the behavior it affects.
+- Fix the actionable issues found in that review.
+- Incrementally review those fixes, including a targeted integration sweep of the behavior they affect.
 - If that review is clean, document verification and any required Retail QA. The automated review cycle may then complete.
-- If that targeted review finds another actionable issue, fix it and repeat the targeted review. Do not schedule another whole-PR review unless the latest fix materially invalidated prior review coverage.
-- Require another whole-PR review only when that fix materially invalidated prior review coverage, using the conditions in [Fall Back to a Full Review When Review History Is Unreliable](#fall-back-to-a-full-review-when-review-history-is-unreliable).
+- If that targeted review finds further actionable issues, fix them and repeat the targeted review of that new scope. Do not schedule another whole-PR review unless the latest fixes materially invalidated prior review coverage.
+- Require another whole-PR review only when those fixes materially invalidated prior review coverage, using the conditions in [Fall Back to a Full Review When Review History Is Unreliable](#fall-back-to-a-full-review-when-review-history-is-unreliable).
 
 In every case:
 
