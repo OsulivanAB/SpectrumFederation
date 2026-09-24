@@ -176,6 +176,9 @@ function SF:RehydrateLootHelperDB()
 			if self.LootProfile and getmetatable(profile) ~= self.LootProfile then
 				setmetatable(profile, self.LootProfile)
 			end
+			if type(profile.ClearTransientAutomaticBisBackfill) == "function" then
+				profile:ClearTransientAutomaticBisBackfill()
+			end
 
 			if type(profile._EnsureRaidCheckConfig) == "function" then
 				profile:_EnsureRaidCheckConfig()
@@ -310,6 +313,11 @@ function SF:RehydrateLootHelperDB()
 			-- Rebuild indexes/counters if available
 			if profile.RebuildLogIndex then
 				profile:RebuildLogIndex()
+			end
+			-- Upgrade path: a 1.5.4 bonus row is already stored, so merge
+			-- dedupe will never insert it again. Followers scan here too.
+			if profile.NormalizePersistedLegacyBonusRolls then
+				profile:NormalizePersistedLegacyBonusRolls()
 			end
 			if profile.ApplyIdentityProjection then
 				profile:ApplyIdentityProjection()

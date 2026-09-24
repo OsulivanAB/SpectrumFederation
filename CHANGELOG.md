@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.5-beta.2] - 2026-09-24
+
+### Changed
+- Dedupe Loot Log BiS outcomes and record bonus rolls separately
+
 ## [1.5.5-beta.1] - 2026-09-24
 
 ### Fixed

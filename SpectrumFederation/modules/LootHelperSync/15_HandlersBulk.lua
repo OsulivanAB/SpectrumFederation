@@ -333,6 +333,12 @@ function Sync:HandleAuthLogs(sender, payload)
             allowReplaceExisting = false
         end
     end
+    -- Current-session non-coordinator BIS_OUTCOME rows are not stored. Their
+    -- counters stay in session memory so this repair can still complete.
+    -- Historical rows and direct MergeLogTables / snapshot import are kept.
+    if self._PartitionRepairBisOutcomes and type(logsToMerge) == "table" and #logsToMerge > 0 then
+        logsToMerge = self:_PartitionRepairBisOutcomes(payload.profileId, logsToMerge)
+    end
     local changed, mergeDetails = false, { inserted = 0, replaced = 0, mismatchCount = 0 }
     if type(logsToMerge) == "table" and #logsToMerge > 0 then
         changed, mergeDetails = self:MergeLogs(payload.profileId, logsToMerge, {
@@ -468,6 +474,9 @@ function Sync:HandleAuthLogs(sender, payload)
                     end
                 end
             end
+        end
+        if self._DrainAutomaticBisBackfill then
+            self:_DrainAutomaticBisBackfill()
         end
     end
 end

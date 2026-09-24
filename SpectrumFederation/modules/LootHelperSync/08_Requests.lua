@@ -460,6 +460,10 @@ function Sync:_FailRequest(req, reason)
             self:ConsiderIdentityAdminSideEffects(profileId)
         end
     end
+
+    if self._DrainAutomaticBisBackfill then
+        self:_DrainAutomaticBisBackfill()
+    end
 end
 
 -- Function Register an outstanding request so it can timeout / retry / be matched.

@@ -167,6 +167,7 @@ local EVENT_TYPE_COLORS = {
 	ATTENDANCE_CHANGE = "|cff66ccff",
 	RAID_CHECK_PRESENCE = "|cff99cc66",
 	RC_LOOT_COUNCIL = "|cffff99cc",
+	BONUS_ROLL = "|cffcc99ff",
 	SPEC_CHANGE = "|cff99ccff",
 	BIS_OUTCOME = "|cff66ffcc",
 	BIS_OVERRIDE = "|cffffcc66",
@@ -194,6 +195,7 @@ local EVENT_TYPE_LABELS = {
 	ATTENDANCE_CHANGE = "Attendance Change",
 	RAID_CHECK_PRESENCE = "Raid Check Presence",
 	RC_LOOT_COUNCIL = "RC Loot Council",
+	BONUS_ROLL = "Bonus Roll",
 	SPEC_CHANGE = "Spec Change",
 	BIS_OUTCOME = "BiS Outcome",
 	BIS_OVERRIDE = "Gear Override",
@@ -372,6 +374,8 @@ local function BuildActionText(eventType, data, author)
 			return string.format("%s (%s)", item, response)
 		end
 		return item
+	elseif eventType == "BONUS_ROLL" then
+		return tostring(data.itemLink or "")
 	elseif eventType == "SPEC_CHANGE" then
 		local spec = data.specName or data.specId or "?"
 		return string.format("Spec -> %s", tostring(spec))
@@ -462,6 +466,8 @@ function Page:Build(panel)
 		local logs = GetAllLogs()
 		local filtered = {}
 		
+		local profile = SF:GetActiveProfile()
+		local hidden = (profile and profile.HiddenLootLogIds and profile:HiddenLootLogIds()) or {}
 		for _, log in ipairs(logs) do
 			-- Safety check: ensure log is a valid object with required methods
 			if type(log) == "table" and 
@@ -470,6 +476,10 @@ function Page:Build(panel)
 			   type(log.GetTimestamp) == "function" then
 				
 				local include = true
+				local logId = type(log.GetID) == "function" and log:GetID() or nil
+				if type(logId) == "string" and hidden[logId] then
+					include = false
+				end
 				
 				-- Filter by event type
 				if panel.__sfSelectedEventType and log:GetEventType() ~= panel.__sfSelectedEventType then

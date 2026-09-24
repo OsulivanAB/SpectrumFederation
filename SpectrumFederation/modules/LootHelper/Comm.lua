@@ -316,7 +316,8 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
     local st = self.state
     local maxQ = tonumber(self.cfg.maxQueue) or 200
     if (st.total or 0) >= maxQ then
-        if SF and SF.PrintWarning then
+        if not st._queueFullWarned and SF and SF.PrintWarning then
+            st._queueFullWarned = true
             SF:PrintWarning(("Comm queue full (%d/%d): dropping message"):format(st.total, maxQ))
         end
         return false
@@ -332,7 +333,9 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
 
     local maxPer = tonumber(self.cfg.maxPerTarget) or 50
     if #q >= maxPer then
-        if SF and SF.PrintWarning then
+        st._perTargetWarned = st._perTargetWarned or {}
+        if not st._perTargetWarned[key] and SF and SF.PrintWarning then
+            st._perTargetWarned[key] = true
             SF:PrintWarning(("Comm per-target queue full for %s (%d/%d): dropping message"):format(tostring(key), #q, maxPer))
         end
         return false
@@ -363,7 +366,10 @@ function Comm:_PumpQueue()
         if st and st.ticker and st.ticker.Cancel then
             pcall(function() st.ticker:Cancel() end)
         end
-        if st then st.ticker = nil end
+        if st then
+            st.ticker = nil
+            st._queueFullWarned = nil
+        end
         return
     end
 
@@ -389,6 +395,9 @@ function Comm:_PumpQueue()
             -- Clean up empty queue state
             st.byKey[key] = nil
             st.lastSent[key] = nil
+            if st._perTargetWarned then
+                st._perTargetWarned[key] = nil
+            end
             table.remove(st.keys, st.rr)
             st.rr = st.rr - 1
         else
@@ -397,6 +406,16 @@ function Comm:_PumpQueue()
                 local item = table.remove(q, 1)
                 st.total = math.max(0, (st.total or 1) - 1)
                 st.lastSent[key] = now
+                -- Recovery is falling below the cap, not waiting until empty.
+                -- The next time that queue fills and drops, warn once.
+                local maxQ = tonumber(self.cfg.maxQueue) or 200
+                if (st.total or 0) < maxQ then
+                    st._queueFullWarned = nil
+                end
+                local maxPer = tonumber(self.cfg.maxPerTarget) or 50
+                if #q < maxPer and st._perTargetWarned then
+                    st._perTargetWarned[key] = nil
+                end
 
                 self:SendCommMessage(item.prefix, item.msg, item.dist, item.target, item.prio, item.callback)
                 sent = sent + 1
@@ -405,6 +424,9 @@ function Comm:_PumpQueue()
                 if #q == 0 then
                     st.byKey[key] = nil
                     st.lastSent[key] = nil
+                    if st._perTargetWarned then
+                        st._perTargetWarned[key] = nil
+                    end
                     table.remove(st.keys, st.rr)
                     st.rr = st.rr - 1
                 end

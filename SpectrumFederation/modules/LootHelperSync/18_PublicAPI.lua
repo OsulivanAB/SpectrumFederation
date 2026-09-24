@@ -169,7 +169,15 @@ function Sync:TryRestorePersistedSession(reason)
     end
 
     if not self.state.isCoordinator then
+        self.state._bisRestoreBackfillHold = nil
         self:EnsureHeartbeatMonitor("RestorePersistedSession")
+    else
+        -- Local history may be missing peer logs from before the reload.
+        -- Reannounce runs admin convergence, which drains this after repairs.
+        -- The hold blocks writes until that convergence starts. Enable restores
+        -- the session before PLAYER_ENTERING_WORLD or a roster event.
+        self.state._bisBackfillPendingReason = "RestorePersistedSession"
+        self.state._bisRestoreBackfillHold = true
     end
 
     RequestLootWindowRefresh("RestorePersistedSession")
@@ -182,7 +190,30 @@ function Sync:_ReannounceRestoredSessionIfNeeded()
     end
 
     self.state._restoredSessionNeedsReannounce = false
-    self:ReannounceSession()
+    if type(self.state._bisBackfillPendingReason) ~= "string" then
+        self.state._bisBackfillPendingReason = "RestorePersistedSession"
+    end
+    if self.BeginAdminConvergence then
+        self:BeginAdminConvergence(self.state.sessionId, self.state.profileId, {
+            onComplete = function()
+                self:ReannounceSession()
+            end,
+        })
+        local conv = self.state._adminConvergence
+        if type(conv) == "table" and conv.finished ~= true then
+            -- Convergence itself now blocks. Drop the restore hold so the
+            -- completion drain is not stuck after the requests finish.
+            self.state._bisRestoreBackfillHold = nil
+            return
+        end
+    end
+    self.state._bisRestoreBackfillHold = nil
+    if not self.BeginAdminConvergence then
+        self:ReannounceSession()
+    end
+    if self._DrainAutomaticBisBackfill then
+        self:_DrainAutomaticBisBackfill()
+    end
 end
 
 
@@ -706,6 +737,9 @@ function Sync:StartSession(profileId, opts)
     -- Reset state
     self.state.adminStatuses = {}
     self.state._adminConvergence = nil
+    self.state._bisRestoreBackfillHold = nil
+    self.state._suppressedBisOutcomes = nil
+    self.state._suppressedBisByLogId = nil
     self.state.handshake = nil
     self.state.helpers = {}
 
@@ -725,6 +759,11 @@ function Sync:StartSession(profileId, opts)
 
     -- Canonicalize derived member state before announcing session.
     self:RebuildProfile(profileId, "session_start_coordinator")
+    if profile.NormalizePersistedLegacyBonusRolls then
+        profile:NormalizePersistedLegacyBonusRolls()
+    end
+    -- Write missing outcomes only after admin convergence merges peer history.
+    self.state._bisBackfillPendingReason = "StartSession"
 
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
@@ -768,6 +807,12 @@ function Sync:_ResetSessionState(reason)
         elseif endingProfile and endingProfile._rcConfigDirty ~= true then
             endingProfile._pendingRCLootCouncilIntegration = nil
         end
+        -- A paused backfill job belongs to this session. Leaving it on the
+        -- profile makes the next session reuse it, discard it for the old
+        -- session id, and never build a replacement scan.
+        if endingProfile and endingProfile.ClearTransientAutomaticBisBackfill then
+            endingProfile:ClearTransientAutomaticBisBackfill()
+        end
     end
 
     -- Cancel outstanding request timers and clear requests
@@ -793,6 +838,10 @@ function Sync:_ResetSessionState(reason)
     self.state.isCoordinator = false
     self.state.rcConfigSeq = nil
     self.state._restoredSessionNeedsReannounce = false
+    self.state._bisRestoreBackfillHold = nil
+    self.state._bisBackfillPendingReason = nil
+    self.state._suppressedBisOutcomes = nil
+    self.state._suppressedBisByLogId = nil
 
     -- Clear session metadata
     self.state.helpers = {}
@@ -895,6 +944,18 @@ function Sync:EndSession(reason, broadcast)
             tostring(reason), tostring(broadcast), tostring(self.state.isCoordinator))
     end
 
+    -- A backfill may have written outcomes and yielded before this end.
+    -- Advertise that frontier once, while this client is still coordinator,
+    -- at the same ALERT priority as SES_END so the heartbeat cannot be
+    -- overtaken and resurrect the session.
+    if self.state.isCoordinator and SF.LootHelperComm and self.BroadcastSessionHeartbeat then
+        local endingProfile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+        if endingProfile and endingProfile._autoBisFrontierPending then
+            self:BroadcastSessionHeartbeat({ prio = "ALERT" })
+            endingProfile._autoBisFrontierPending = nil
+        end
+    end
+
     local dist = self:_EnforceGroupedSessionActive("EndSession")
 
     if broadcast and self.state.isCoordinator and dist and SF.LootHelperComm then
@@ -943,6 +1004,7 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     -- Clear convergence state so we don't inherit stale admin statuses / pending convergence
     self.state.adminStatuses = {}
     self.state._adminConvergence = nil
+    self.state._bisRestoreBackfillHold = nil
     self.state.handshake = nil
     self.state._sessionAnnounced = nil
     self.state.containedExactWindows = {}
@@ -968,6 +1030,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
     if profile then
         self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
+        if profile.NormalizePersistedLegacyBonusRolls then
+            profile:NormalizePersistedLegacyBonusRolls()
+        end
     end
     self:_PersistSessionState("TakeoverSession")
 
@@ -988,9 +1053,15 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self:BroadcastCoordinatorTakeover()
 
     if not opts.rerunAdminConvergence then
+        self.state._bisBackfillPendingReason = nil
+        if self.BackfillAutomaticBisOnPromotion then
+            self:BackfillAutomaticBisOnPromotion(false, "TakeoverSession")
+        end
         self:ReannounceSession()
         return true
     end
+
+    self.state._bisBackfillPendingReason = "TakeoverSession"
 
     -- Rerun admin convergence, but finish with SES_REANNOUNCE instead of SES_START
     self:BeginAdminConvergence(sessionId, profileId, {

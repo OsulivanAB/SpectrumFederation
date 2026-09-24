@@ -612,9 +612,53 @@ function Sync:HandleNewLog(sender, payload)
     if not lootLog then
         return
     end
+    -- During a controlling session the coordinator is the only live writer of
+    -- automatic BIS_OUTCOME rows. Older peers still broadcast their own.
+    -- Remember a current-session row so the next counter is not a permanent
+    -- gap. Historical rows stay unremembered so a later repair can store them.
+    if eventType == types.BIS_OUTCOME
+        and profile.SessionControlsAutomaticBis
+        and profile:SessionControlsAutomaticBis()
+        and not self:_SamePlayer(sender, self.state.coordinator)
+    then
+        if self._ShouldSuppressRepairBisOutcome
+            and self._RememberSuppressedAutomaticBisOutcome
+            and self:_ShouldSuppressRepairBisOutcome(profile, logTable)
+        then
+            self:_RememberSuppressedAutomaticBisOutcome(profileId, logTable)
+        end
+        -- The rejected row can sit above a hole in this author's earlier
+        -- counters. Remembering this counter does not fill those rows.
+        if hasGap and type(gapFrom) == "number" and type(gapTo) == "number" and self.RequestGapRepair then
+            local author = (self:_ExtractAuthorCounter(logTable))
+            if type(author) == "string" and author ~= "" then
+                self:RequestGapRepair(profileId, author, gapFrom, gapTo, "new-log-gap")
+            end
+        end
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Ignoring live BIS_OUTCOME from %s; the session coordinator is the automatic writer", tostring(sender))
+        end
+        return
+    end
     local inserted = profile:AddLootLog(lootLog, { skipPermission = true, skipBroadcast = true })
     if not inserted then
         return
+    end
+    if eventType == types.RC_LOOT_COUNCIL and profile._MaybeWriteAutomaticBisOutcome then
+        local rcData = lootLog.GetEventData and lootLog:GetEventData() or lootLog._data
+        local legacyBonus = type(rcData) == "table" and rcData.responseId == "BONUS_ROLL"
+        -- Followers still synthesize a local BONUS_ROLL from a legacy row.
+        -- Only the automatic BIS_OUTCOME waits for outstanding log repairs.
+        local deferBis = not legacyBonus
+            and self._AutomaticBisBackfillBlocked
+            and self:_AutomaticBisBackfillBlocked()
+        if deferBis then
+            if self._ScheduleAutomaticBisBackfill then
+                self:_ScheduleAutomaticBisBackfill("HandleNewLog")
+            end
+        else
+            profile:_MaybeWriteAutomaticBisOutcome(lootLog)
+        end
     end
 
     local Identity = SF.LootHelperIdentity

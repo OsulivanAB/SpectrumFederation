@@ -2462,6 +2462,68 @@ local function CollectCausalSourceIds(data, out)
     return out
 end
 
+-- profile._causalDependents[targetId][dependentId] = true.
+-- Built once, then each insert records only that log's outgoing edges.
+-- A full walk of history here is quadratic when a coordinator backfills
+-- one outcome per award.
+local function IndexCausalLog(index, lootLog)
+    local id = GetLogId(lootLog)
+    if type(index) ~= "table" or type(id) ~= "string" or id == "" then
+        return
+    end
+    local preds = CollectCausalSourceIds(GetLogData(lootLog))
+    for i = 1, #preds do
+        local pred = preds[i]
+        local bucket = index[pred]
+        if not bucket then
+            bucket = {}
+            index[pred] = bucket
+        end
+        bucket[id] = true
+    end
+end
+
+local function UnindexCausalLog(index, lootLog)
+    local id = GetLogId(lootLog)
+    if type(index) ~= "table" or type(id) ~= "string" or id == "" then
+        return
+    end
+    local preds = CollectCausalSourceIds(GetLogData(lootLog))
+    for i = 1, #preds do
+        local bucket = index[preds[i]]
+        if bucket then
+            bucket[id] = nil
+        end
+    end
+end
+
+function Identity.NoteLogCausalDependents(profile, lootLog)
+    if type(profile) ~= "table" or type(profile._causalDependents) ~= "table" then
+        return
+    end
+    IndexCausalLog(profile._causalDependents, lootLog)
+end
+
+function Identity.ForgetLogCausalDependents(profile, lootLog)
+    if type(profile) ~= "table" or type(profile._causalDependents) ~= "table" then
+        return
+    end
+    UnindexCausalLog(profile._causalDependents, lootLog)
+end
+
+function Identity.RebuildCausalDependents(profile)
+    local index = {}
+    if type(profile) == "table" then
+        local logs = profile._lootLogs or {}
+        for i = 1, #logs do
+            IndexCausalLog(index, logs[i])
+        end
+        profile._causalDependents = index
+        Identity._causalDependentRebuilds = (Identity._causalDependentRebuilds or 0) + 1
+    end
+    return index
+end
+
 local function ItemAwareFanOutSafe(profile, lootLog)
     local byId = profile and profile._logById
     if type(byId) ~= "table" then
@@ -2477,20 +2539,22 @@ local function ItemAwareFanOutSafe(profile, lootLog)
     if type(selfId) ~= "string" or selfId == "" then
         return false
     end
-    local logs = profile._lootLogs or {}
-    for i = 1, #logs do
-        local other = logs[i]
-        if other ~= lootLog then
-            local deps = CollectCausalSourceIds(GetLogData(other))
-            for j = 1, #deps do
-                if deps[j] == selfId then
-                    return false
-                end
+    if type(profile._causalDependents) ~= "table" then
+        Identity.RebuildCausalDependents(profile)
+    end
+    local dependents = profile._causalDependents and profile._causalDependents[selfId]
+    if dependents then
+        for dependentId in pairs(dependents) do
+            Identity._reverseDependencyLogVisits = (Identity._reverseDependencyLogVisits or 0) + 1
+            if dependentId ~= selfId and byId[dependentId] and byId[dependentId] ~= lootLog then
+                return false
             end
         end
     end
     return true
 end
+
+Identity.ItemAwareFanOutSafe = ItemAwareFanOutSafe
 
 function Identity.FanOutItemAware(profile, lootLog)
     if type(profile) ~= "table" or type(lootLog) ~= "table" then
