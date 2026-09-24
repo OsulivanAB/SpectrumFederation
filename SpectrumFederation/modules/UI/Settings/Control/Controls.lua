@@ -2260,7 +2260,14 @@ function Controls:AddEquipmentBoard(section, opts)
 					return
 				end
 			end
-			GameTooltip:SetText(cell.state == "LEGACY_UNKNOWN" and "Legacy unknown usage" or (cell.state or "Empty"))
+			if cell.state == "LEGACY_UNKNOWN" then
+				GameTooltip:SetText("Consumed opportunity — item unknown")
+				if GameTooltip.AddLine then
+					GameTooltip:AddLine("An administrator may associate an awarded item later through Gear Override.", 1, 1, 1, true)
+				end
+			else
+				GameTooltip:SetText(cell.state or "Empty")
+			end
 			GameTooltip:Show()
 		end
 

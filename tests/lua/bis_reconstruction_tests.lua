@@ -737,10 +737,11 @@ local fallback = makeProfile("Fallback")
 addMember(fallback, ALT_A)
 assertFalse(fallback:IsItemAwareEquipmentPopup(), "no BiS config or events keeps manual popup")
 
--- Protocol 2 rejected, 3 accepted
-assertEq(SF.SyncProtocol.PROTO_CURRENT, 3, "protocol is 3")
-assertFalse(select(1, SF.SyncProtocol.ValidateProtocolVersion(2)), "protocol 2 is rejected")
-assertTrue(SF.SyncProtocol.ValidateProtocolVersion(3), "protocol 3 is accepted")
+-- Protocol 3 rejected, 4 accepted. Tier-token classification and forced
+-- Gear Override assignments are not safe to mix with protocol 3 clients.
+assertEq(SF.SyncProtocol.PROTO_CURRENT, 4, "protocol is 4")
+assertFalse(select(1, SF.SyncProtocol.ValidateProtocolVersion(3)), "protocol 3 is rejected")
+assertTrue(SF.SyncProtocol.ValidateProtocolVersion(4), "protocol 4 is accepted")
 
 -- Back icon is distinct from Chest
 local eqSource = io.open("SpectrumFederation/modules/UI/LootHelper/EquipmentWindow.lua"):read("*a")
@@ -2933,37 +2934,50 @@ local function reviewFindingTests()
         configureBis(p)
         local award = makeCanonical(ALT_A, 19001, "Need", "1700033000")
         assertTrue(p:TryAddRCLootCouncilAward(award), "qualifying helm consumes Head")
+        local openedPage = nil
+        SF.SettingsWindow = {
+            ShowPage = function(_, pageId)
+                openedPage = pageId
+            end,
+        }
         wire(p)
         assertTrue(p:IsLiveBisAutomationActive(), "live automation is active while recording and BiS responses are configured")
         assertTrue(p:IsItemAwareEquipmentPopup(), "item-aware history makes the popup item-aware")
         assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "Head is assigned from the historical BiS award")
-        assertTrue(head.scripts.OnClick == nil, "live automation disables Head manual clicks")
-        assertTrue(neck.scripts.OnClick == nil, "live automation also disables empty-slot manual clicks")
+        assertTrue(head.scripts.OnClick ~= nil, "item-aware Head click opens Gear Override")
+        assertTrue(neck.scripts.OnClick ~= nil, "item-aware empty-slot click opens Gear Override")
+        openedPage = nil
+        head.scripts.OnClick()
+        assertEq(openedPage, "lootHelperCharacter", "live Head click opens Character")
+        local focus = SF.LootHelperBis.ConsumeGearOverrideFocus()
+        assertEq(focus and focus.memberId, ALT_A, "live Head click selects the member")
+        assertEq(focus and focus.slot, "Head", "live Head click selects Head")
         assertTrue(countArmor(p, "Head") == 0, "item-aware assignment did not write ARMOR_CHANGE")
+        neck.scripts.OnClick()
+        assertEq(countArmor(p, "Neck"), 0, "item-aware empty click does not write ARMOR_CHANGE")
 
         assertTrue(p:SetRCLootCouncilRecordAwards(false), "disable RC award recording after item-aware history")
         wire(p)
         assertFalse(p:IsLiveBisAutomationActive(), "recording off disables live automation")
         assertTrue(p:IsItemAwareEquipmentPopup(), "recording off after item-aware history still displays item-aware icons")
         assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "historical AUTO assignment survives recording off")
-        assertTrue(head.scripts.OnClick == nil, "recording off does not re-enable Head clicks over AUTO occupancy")
-        assertTrue(neck.scripts.OnClick ~= nil, "AVAILABLE Neck keeps the manual fallback while recording is off")
+        assertTrue(head.scripts.OnClick ~= nil, "recording off still opens Gear Override for AUTO Head")
+        assertTrue(neck.scripts.OnClick ~= nil, "recording off still opens Gear Override for available Neck")
         EW:_OnSlotClicked("Head")
         assertTrue(countArmor(p, "Head") == 0, "direct Head click does not write ARMOR_CHANGE over AUTO")
-        neck.scripts.OnClick()
+        assertTrue(p:getMemberByID(ALT_A):ToggleEquipment("Neck", { profile = p }), "equipment history can still mark Neck")
         assertEq(countArmor(p, "Neck"), 1, "manual Neck toggle writes ARMOR_CHANGE")
         assertEq(lastArmorAction(p, "Neck"), "USED", "manual Neck fallback marks USED")
         wire(p)
         assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "rebuild preserves AUTO Head after manual Neck use")
         assertEq(p:GetIdentityBisSlots(ALT_A).Neck.state, "LEGACY_UNKNOWN", "rebuild preserves manual Neck occupancy")
-        assertTrue(neck.scripts.OnClick ~= nil, "manually consumed Neck remains reversible through the fallback")
-        neck.scripts.OnClick()
+        assertTrue(p:getMemberByID(ALT_A):ToggleEquipment("Neck", { profile = p }), "equipment history can clear Neck")
         assertEq(lastArmorAction(p, "Neck"), "AVAILABLE", "manual Neck toggle returns the slot to AVAILABLE")
         wire(p)
         assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "reversing manual Neck does not clear AUTO Head")
         assertEq(p:GetIdentityBisSlots(ALT_A).Neck.state, "AVAILABLE", "manual Neck fallback restored AVAILABLE")
 
-        neck.scripts.OnClick()
+        assertTrue(p:getMemberByID(ALT_A):ToggleEquipment("Neck", { profile = p }), "mark Neck before re-enabling recording")
         wire(p)
         assertEq(p:GetIdentityBisSlots(ALT_A).Neck.state, "LEGACY_UNKNOWN", "Neck is manually consumed before re-enabling recording")
         assertTrue(p:SetRCLootCouncilRecordAwards(true), "re-enable RC award recording")
@@ -2978,8 +2992,14 @@ local function reviewFindingTests()
         wire(p)
         assertEq(p:GetIdentityBisSlots(ALT_A).Head.state, "ASSIGNED_AUTO", "overflow does not replace AUTO Head")
         assertEq(p:GetIdentityBisSlots(ALT_A).Neck.state, "LEGACY_UNKNOWN", "overflow does not manufacture a second Neck opportunity")
-        assertTrue(head.scripts.OnClick == nil, "re-enabled automation still does not expose manual Head clicks")
-        assertTrue(neck.scripts.OnClick == nil, "re-enabled automation locks previously fallback-enabled slots")
+        local neckArmor = countArmor(p, "Neck")
+        neck.scripts.OnClick()
+        assertEq(countArmor(p, "Neck"), neckArmor, "re-enabled automation does not toggle unknown consumption")
+        assertTrue(head.scripts.OnClick ~= nil, "re-enabled automation opens Gear Override for Head")
+        EW._canAdmin = false
+        wire(p)
+        assertTrue(head.scripts.OnClick == nil, "non-admins cannot open Gear Override from the popup")
+        EW._canAdmin = true
 
         resetEnv()
         local rings = makeProfile("RecordOffRingFallback")
@@ -2991,9 +3011,9 @@ local function reviewFindingTests()
         assertEq(rings:GetIdentityBisSlots(ALT_A).Ring2.state, "AVAILABLE", "Ring2 starts available")
         assertTrue(rings:SetRCLootCouncilRecordAwards(false), "disable recording with AUTO Ring1")
         wire(rings)
-        assertTrue(ring1.scripts.OnClick == nil, "AUTO Ring1 is not manually toggleable")
-        assertTrue(ring2.scripts.OnClick ~= nil, "available Ring2 keeps the manual fallback")
-        ring2.scripts.OnClick()
+        assertTrue(ring1.scripts.OnClick ~= nil, "item-aware Ring1 opens Gear Override")
+        assertTrue(ring2.scripts.OnClick ~= nil, "item-aware Ring2 opens Gear Override")
+        assertTrue(rings:getMemberByID(ALT_A):ToggleEquipment("Ring2", { profile = rings }), "equipment history can still mark Ring2")
         wire(rings)
         assertEq(rings:GetIdentityBisSlots(ALT_A).Ring1.state, "ASSIGNED_AUTO", "manual Ring2 does not hide AUTO Ring1")
         assertEq(rings:GetIdentityBisSlots(ALT_A).Ring2.state, "LEGACY_UNKNOWN", "manual Ring2 consumes the remaining ring opportunity")
@@ -3140,6 +3160,246 @@ local function reviewFindingTests()
     mainHandOnlyOffHand()
 end
 reviewFindingTests()
+
+local function tierTokenTests()
+    local function outcomeFor(profile, awardKey)
+        local found
+        for _, log in ipairs(profile:GetLootLogs()) do
+            local data = log:GetEventType() == "BIS_OUTCOME" and log:GetEventData()
+            if data and data.awardKey == awardKey then
+                found = data
+            end
+        end
+        return found
+    end
+
+    local function overrideFor(profile, action)
+        local found
+        for _, log in ipairs(profile:GetLootLogs()) do
+            local data = log:GetEventType() == "BIS_OVERRIDE" and log:GetEventData()
+            if data and data.action == action then
+                found = data
+            end
+        end
+        return found
+    end
+
+    local function awardCount(profile, eventType)
+        local n = 0
+        for _, log in ipairs(profile:GetLootLogs()) do
+            if log:GetEventType() == eventType then
+                n = n + 1
+            end
+        end
+        return n
+    end
+
+    local function optionsInclude(list, awardKey)
+        for i = 1, #(list or {}) do
+            local ref = list[i].awardRef
+            if ref and ref.id == awardKey then
+                return list[i]
+            end
+        end
+        return nil
+    end
+
+    local families = {
+        { slot = "Hands", ids = { 270910, 270911, 270912, 270913 } },
+        { slot = "Head", ids = { 270914, 270915, 270916, 270917 } },
+        { slot = "Pants", ids = { 270918, 270919, 270920, 270921 } },
+        { slot = "Shoulder", ids = { 270922, 270923, 270924, 270925 } },
+        { slot = "Chest", ids = { 270926, 270927, 270928, 270929 } },
+    }
+    local equipFor = {
+        Hands = "INVTYPE_HAND",
+        Head = "INVTYPE_HEAD",
+        Pants = "INVTYPE_LEGS",
+        Shoulder = "INVTYPE_SHOULDER",
+        Chest = "INVTYPE_CHEST",
+    }
+
+    assertTrue(_G.RCLootCouncil == nil, "token classification does not require RCLootCouncil")
+    for _, family in ipairs(families) do
+        for _, itemId in ipairs(family.ids) do
+            local plain = SF.LootHelperBis.ClassifyItem(tostring(itemId))
+            assertEq(plain and plain.slot, family.slot, "item id " .. tostring(itemId) .. " classifies as " .. family.slot)
+            local lfr = string.format("|cffa335ee|Hitem:%d::::::::80:270::1:1:111::::::|h[Token]|h|r", itemId)
+            local mythic = string.format("|cffa335ee|Hitem:%d::::::::80:270::4:2:222:333::::::|h[Token]|h|r", itemId)
+            assertEq(SF.LootHelperBis.BaseItemId(lfr), itemId, "LFR link keeps base id " .. tostring(itemId))
+            assertEq(SF.LootHelperBis.ClassifyItem(lfr).slot, family.slot, "LFR link " .. tostring(itemId) .. " classifies as " .. family.slot)
+            assertEq(SF.LootHelperBis.ClassifyItem(mythic).slot, family.slot, "Mythic link " .. tostring(itemId) .. " classifies as " .. family.slot)
+            assertEq(SF.LootHelperBis.ClassifyItem(lfr).equipLoc, equipFor[family.slot], "token equipLoc is frozen-replay compatible")
+        end
+    end
+
+    local named = "|cffa335ee|Hitem:19998::::::::80:270:::::::::|h[Venomwoven Idol]|h|r"
+    assertTrue(SF.LootHelperBis.ClassifyItem(named) == nil, "item names do not classify unknown ids")
+    ITEM_META["270909"] = { loc = "INVTYPE_HEAD", class = 4, sub = 1 }
+    assertTrue(SF.LootHelperBis.ClassifyItem(itemLink(270909, "Slumbering Coil Curio")) == nil, "curio stays unresolved even with an equip loc")
+    ITEM_META["270909"] = nil
+
+    resetEnv()
+    local auto = makeProfile("TierAuto")
+    addMember(auto, ALT_A)
+    assertTrue(auto:AddRCLootCouncilBisResponse("Need"), "Need is BiS for tier tokens")
+    local hands = makeCanonical(ALT_A, 270910, "Need", "1700050001")
+    assertTrue(auto:TryAddRCLootCouncilAward(hands), "qualifying Hands token records")
+    auto:ApplyIdentityProjection({ force = true })
+    local handsOutcome = outcomeFor(auto, hands.awardKey)
+    assertEq(handsOutcome and handsOutcome.outcome, "ASSIGNED", "Hands token is ASSIGNED")
+    assertEq(handsOutcome.assignedSlots[1], "Hands", "Hands token assignedSlots is Hands")
+    assertEq(handsOutcome.equipLoc, "INVTYPE_HAND", "Hands token outcome stores frozen equipLoc")
+    assertEq(#handsOutcome.assignedSlots, 1, "Hands token assigns one slot")
+    assertEq(slotState(auto, ALT_A, "Hands"), "ASSIGNED_AUTO", "Hands opportunity is consumed")
+    local rcData
+    for _, log in ipairs(auto:GetLootLogs()) do
+        local data = log:GetEventType() == "RC_LOOT_COUNCIL" and log:GetEventData()
+        if data and data.awardKey == hands.awardKey then
+            rcData = data
+        end
+    end
+    assertEq(rcData and rcData.equipLoc, "INVTYPE_HAND", "RC award stores the same frozen equipLoc")
+
+    local again = makeCanonical(ALT_A, 270911, "Need", "1700050002")
+    assertTrue(auto:TryAddRCLootCouncilAward(again), "second Hands token records")
+    local againOutcome = outcomeFor(auto, again.awardKey)
+    assertEq(againOutcome and againOutcome.outcome, "OVERFLOW", "second Hands token is OVERFLOW")
+    auto:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(auto, ALT_A, "Hands"), "ASSIGNED_AUTO", "overflow does not replace the first Hands token")
+
+    local curio = makeCanonical(ALT_A, 270909, "Need", "1700050003")
+    assertTrue(auto:TryAddRCLootCouncilAward(curio), "curio records")
+    local curioOutcome = outcomeFor(auto, curio.awardKey)
+    assertEq(curioOutcome and curioOutcome.outcome, "UNRESOLVED", "curio stays UNRESOLVED")
+    auto:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(auto, ALT_A, "Head"), "AVAILABLE", "curio does not consume Head")
+    assertEq(slotState(auto, ALT_A, "Chest"), "AVAILABLE", "curio does not consume Chest")
+    local headOpts = auto:GetGearOverrideCompatibleAwards(ALT_A, "Head")
+    local curioOpt = optionsInclude(headOpts, curio.awardKey)
+    assertTrue(curioOpt ~= nil, "curio is offered for Head")
+    assertTrue(curioOpt.forceAssignment == true, "curio option is a force assignment")
+    assertTrue(tostring(curioOpt.label):find("Unresolved / Force Assignment", 1, true) ~= nil, "curio label marks force assignment")
+    assertTrue(optionsInclude(auto:GetGearOverrideCompatibleAwards(ALT_A, "Chest"), curio.awardKey) ~= nil, "curio is offered for Chest")
+    assertFalse(auto:ApplyBisOverride("ASSIGN", {
+        viewMember = ALT_A,
+        awardRef = { kind = "RC", id = curio.awardKey },
+        assignedSlots = { "Hands" },
+        slotBinding = "BOUND",
+    }), "force assignment does not occupy an already consumed slot")
+    assertEq(slotState(auto, ALT_A, "Hands"), "ASSIGNED_AUTO", "failed force assignment leaves Hands alone")
+    assertTrue(auto:PlaceGearOverrideAward(ALT_A, "Chest", { kind = "RC", id = curio.awardKey }), "admin force-assigns curio to Chest")
+    auto:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(auto, ALT_A, "Chest"), "ASSIGNED_OVERRIDE", "forced curio consumes Chest")
+    local forcedLog = overrideFor(auto, "ASSIGN")
+    assertTrue(forcedLog and forcedLog.forced == true, "force assignment is stored on the override log")
+    assertFalse(auto:ApplyBisOverride("ASSIGN", {
+        viewMember = ALT_A,
+        awardRef = { kind = "RC", id = curio.awardKey },
+        assignedSlots = { "Head" },
+        slotBinding = "BOUND",
+    }), "already-assigned curio cannot be assigned a second time")
+    assertEq(slotState(auto, ALT_A, "Head"), "AVAILABLE", "second assign does not consume Head")
+    assertEq(slotState(auto, ALT_A, "Chest"), "ASSIGNED_OVERRIDE", "original forced Chest assignment remains")
+
+    local origClassify = SF.LootHelperBis.ClassifyItem
+    SF.LootHelperBis.ClassifyItem = function(link)
+        local id = SF.LootHelperBis.BaseItemId(link)
+        if id == 270909 then
+            return origClassify(itemLink(19001, "Helm"))
+        end
+        return origClassify(link)
+    end
+    auto:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(auto, ALT_A, "Chest"), "ASSIGNED_OVERRIDE", "later classification does not move a forced assignment")
+    assertEq(slotState(auto, ALT_A, "Head"), "AVAILABLE", "later classification does not retarget the forced curio")
+    SF.LootHelperBis.ClassifyItem = origClassify
+
+    resetEnv()
+    local frozen = makeProfile("FrozenUnresolved")
+    addMember(frozen, ALT_A)
+    assertTrue(frozen:AddRCLootCouncilBisResponse("Need"))
+    local historical = makeCanonical(ALT_A, 270910, "Need", "1700051001")
+    insertRC(frozen, historical)
+    addLog(frozen, "BIS_OUTCOME", {
+        sourceLogId = historical.awardKey,
+        awardKey = historical.awardKey,
+        awardMember = ALT_A,
+        qualified = true,
+        outcome = "UNRESOLVED",
+        assignedSlots = {},
+        unresolvedReason = "UNKNOWN_SLOT",
+        itemLink = historical.itemLink,
+        itemString = historical.itemString,
+    })
+    frozen:ApplyIdentityProjection({ force = true })
+    assertEq(outcomeFor(frozen, historical.awardKey).outcome, "UNRESOLVED", "historical UNRESOLVED outcome is not rewritten")
+    assertEq(slotState(frozen, ALT_A, "Hands"), "AVAILABLE", "historical UNRESOLVED does not auto-consume Hands")
+    local repair = optionsInclude(frozen:GetGearOverrideCompatibleAwards(ALT_A, "Hands"), historical.awardKey)
+    assertTrue(repair ~= nil, "historical Venomwoven Idol is selectable for Hands")
+    assertTrue(repair.forceAssignment == nil, "recognized token is a normal Hands option")
+    assertFalse(optionsInclude(frozen:GetGearOverrideCompatibleAwards(ALT_A, "Head"), historical.awardKey) ~= nil, "Hands token is not offered for Head")
+    assertTrue(frozen:PlaceGearOverrideAward(ALT_A, "Hands", { kind = "RC", id = historical.awardKey }), "admin assigns the historical token")
+    frozen:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(frozen, ALT_A, "Hands"), "ASSIGNED_OVERRIDE", "manual correction consumes Hands")
+    assertEq(outcomeFor(frozen, historical.awardKey).outcome, "UNRESOLVED", "manual correction leaves the historical outcome frozen")
+    local handsCell = frozen:GetIdentityBisSlots(ALT_A).Hands
+    assertTrue(tostring(handsCell.itemLink or handsCell.itemString):find("270910", 1, true) ~= nil, "Hands cell keeps the token link")
+
+    resetEnv()
+    local unknown = makeProfile("UnknownConsumption")
+    addMember(unknown, ALT_A)
+    assertTrue(unknown:AddRCLootCouncilBisResponse("Need"))
+    local manualBefore = awardCount(unknown, "MANUAL_AWARD")
+    assertTrue(unknown:SetOpportunityConsumedUnknown(ALT_A, "Shoulder", true), "mark Shoulder consumed with item unknown")
+    unknown:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(unknown, ALT_A, "Shoulder"), "LEGACY_UNKNOWN", "unknown consumption uses legacy occupancy state")
+    assertEq(awardCount(unknown, "MANUAL_AWARD"), manualBefore, "unknown consumption does not create a loot award")
+    assertEq(awardCount(unknown, "ARMOR_CHANGE"), 1, "unknown consumption writes ARMOR_CHANGE")
+    local curioManual = makeCanonical(ALT_A, 270909, "Need", "1700052001")
+    assertTrue(unknown:TryAddRCLootCouncilAward(curioManual), "curio enters the pool beside unknown consumption")
+    assertTrue(unknown:PlaceGearOverrideAward(ALT_A, "Shoulder", { kind = "RC", id = curioManual.awardKey }), "associate unresolved curio onto unknown consumption")
+    unknown:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(unknown, ALT_A, "Shoulder"), "ASSIGNED_OVERRIDE", "association replaces unknown consumption without a second opportunity")
+    assertEq(slotState(unknown, ALT_A, "Chest"), "AVAILABLE", "association does not consume a second slot")
+
+    resetEnv()
+    local clearUnknown = makeProfile("ClearUnknown")
+    addMember(clearUnknown, ALT_A)
+    assertTrue(clearUnknown:SetOpportunityConsumedUnknown(ALT_A, "Belt", true), "mark Belt unknown")
+    clearUnknown:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(clearUnknown, ALT_A, "Belt"), "LEGACY_UNKNOWN", "Belt starts unknown-consumed")
+    assertTrue(clearUnknown:SetOpportunityConsumedUnknown(ALT_A, "Belt", false), "clear unknown consumption")
+    clearUnknown:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(clearUnknown, ALT_A, "Belt"), "AVAILABLE", "clearing unknown consumption returns Available")
+
+    resetEnv()
+    local manual = makeProfile("ManualToken")
+    addMember(manual, ALT_A)
+    assertTrue(manual:AddManualAward(ALT_A, "270926"), "manual add accepts a tier token id without the client item cache")
+    manual:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(manual, ALT_A, "Chest"), "AVAILABLE", "manual add does not consume the opportunity")
+    local pool = manual:GetIdentityAwardPool(ALT_A)
+    assertTrue(#pool >= 1, "manual token enters the award pool")
+    local manualOpt = optionsInclude(manual:GetGearOverrideCompatibleAwards(ALT_A, "Chest"), pool[1].id)
+    assertTrue(manualOpt ~= nil, "manual token is compatible with Chest")
+    local selection = SF.LootHelperBis.ApplyGearOverrideSelection({}, { memberId = ALT_A, slot = "Chest" })
+    assertTrue(manual:AddManualAward(ALT_A, itemLink(270910, "Venomwoven Idol")), "adding more loot does not require clearing selection")
+    assertEq(selection.memberId, ALT_A, "adding loot keeps the selected character")
+    assertEq(selection.slot, "Chest", "adding loot keeps the selected slot")
+
+    resetEnv()
+    local linked = makeProfile("LinkedToken")
+    addMember(linked, ALT_A)
+    addMember(linked, ALT_B)
+    assertTrue(linked:LinkCharacters(ALT_A, ALT_B), "link characters before a token award")
+    assertTrue(linked:AddRCLootCouncilBisResponse("Need"))
+    assertTrue(linked:TryAddRCLootCouncilAward(makeCanonical(ALT_B, 270914, "Need", "1700053001")), "linked alt receives a Head token")
+    linked:ApplyIdentityProjection({ force = true })
+    assertEq(slotState(linked, ALT_A, "Head"), "ASSIGNED_AUTO", "linked identity shares the token's Head consumption")
+    assertEq(slotState(linked, ALT_B, "Head"), "ASSIGNED_AUTO", "award owner also shows the Head token")
+end
+tierTokenTests()
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

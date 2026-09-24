@@ -524,8 +524,8 @@ function EquipmentWindow:Refresh()
                 btn:SetScript("OnEnter", function(selfBtn)
                     if GameTooltip then
                         GameTooltip:SetOwner(selfBtn, "ANCHOR_RIGHT")
-                        GameTooltip:SetText("Legacy consumed opportunity")
-                        GameTooltip:AddLine("Unknown item. Correct this in Gear Override.", 1, 1, 1, true)
+                        GameTooltip:SetText("Consumed opportunity — item unknown")
+                        GameTooltip:AddLine("An administrator may associate an awarded item later through Gear Override.", 1, 1, 1, true)
                         GameTooltip:Show()
                     end
                 end)
@@ -561,12 +561,15 @@ function EquipmentWindow:Refresh()
                 SetIssueOverlayShown(btn.IssueOverlay, false)
             end
 
-            local liveAutomation = profile and profile.IsLiveBisAutomationActive and profile:IsLiveBisAutomationActive()
-            local itemAwareAssigned = SF.LootHelperBis and SF.LootHelperBis.CellHasItemAwareAssignment
-                and SF.LootHelperBis.CellHasItemAwareAssignment(cell)
-            if liveAutomation or itemAwareAssigned then
+            if itemAware then
                 btn:EnableMouse(true)
-                btn:SetScript("OnClick", nil)
+                if self._canAdmin then
+                    btn:SetScript("OnClick", function()
+                        self:_OpenGearOverride(slotKey)
+                    end)
+                else
+                    btn:SetScript("OnClick", nil)
+                end
             elseif self._canAdmin then
                 btn:EnableMouse(true)
                 btn:SetScript("OnClick", function()
@@ -580,28 +583,44 @@ function EquipmentWindow:Refresh()
     end
 end
 
--- Handle slot click (toggle equipment)
+function EquipmentWindow:_OpenGearOverride(slotKey)
+    if not self._canAdmin or not slotKey then
+        return false
+    end
+    local memberId = self._rowModel and self._rowModel.memberId
+    if type(memberId) ~= "string" or memberId == "" then
+        return false
+    end
+    local requested = false
+    if SF.LootHelperBis and SF.LootHelperBis.RequestGearOverrideFocus then
+        requested = SF.LootHelperBis.RequestGearOverrideFocus(memberId, slotKey) and true or false
+    end
+    if not requested then
+        return false
+    end
+    if SF.Debug then
+        SF.Debug:Info("LH_EQUIPMENT", "Open Gear Override: member=%s slot=%s", tostring(memberId), tostring(slotKey))
+    end
+    if SF.SettingsWindow and SF.SettingsWindow.ShowPage then
+        SF.SettingsWindow:ShowPage("lootHelperCharacter")
+    end
+    return true
+end
+
+-- Handle slot click (toggle equipment in manual mode, Gear Override when item-aware)
 function EquipmentWindow:_OnSlotClicked(slotKey)
     if not self._memberObj or not self._canAdmin then return end
     if not slotKey then return end
 
+    local profile = self._profile
+    if profile and profile.IsItemAwareEquipmentPopup and profile:IsItemAwareEquipmentPopup() then
+        self:_OpenGearOverride(slotKey)
+        return
+    end
+
     if SF.Debug then
         SF.Debug:Info("LH_EQUIPMENT", "ToggleSlot: member=%s, slot=%s", 
             tostring(self._rowModel and self._rowModel.memberId), tostring(slotKey))
-    end
-
-    local profile = self._profile
-    if profile and profile.IsLiveBisAutomationActive and profile:IsLiveBisAutomationActive() then
-        return
-    end
-    local memberId = self._rowModel and self._rowModel.memberId
-    if profile and profile.GetIdentityBisSlots and memberId then
-        local board = profile:GetIdentityBisSlots(memberId)
-        local cell = board and board[slotKey]
-        if SF.LootHelperBis and SF.LootHelperBis.CellHasItemAwareAssignment
-            and SF.LootHelperBis.CellHasItemAwareAssignment(cell) then
-            return
-        end
     end
 
     -- Call member toggle
