@@ -270,7 +270,7 @@ function Sync:HandleAuthLogs(sender, payload)
         local provenGrant = self._CatchUpProvenGrantLog and self:_CatchUpProvenGrantLog(sender, payload.logs) or nil
         for _, logTable in ipairs(payload.logs) do
             if self:_LogAdminGrantState(logTable, sender) then
-                if provenGrant and self:_SameLogTable(logTable, provenGrant) then
+                if provenGrant and self:_GrantRowsMatch(logTable, provenGrant) then
                     grantLogs[#grantLogs + 1] = logTable
                 end
             else

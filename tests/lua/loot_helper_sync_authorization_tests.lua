@@ -293,6 +293,7 @@ Sync.EnsureRepairConvergence = function()
     return false
 end
 Sync.SendJoinStatus = function() end
+local productionQueueRepairRanges = Sync.QueueRepairRanges
 Sync.QueueRepairRanges = function()
     return false
 end
@@ -2022,6 +2023,152 @@ assertTrue(Sync.state.requests["need-extra-grant"] ~= nil, "extra grant leaves t
 Sync.MergeLogs = function()
     return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
 end
+
+-- Reusing a local row id does not prove a rewritten ADMIN_ADDED.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+profile._lootLogs = {
+    {
+        _id = "Owner-Realm:4",
+        _author = OWNER,
+        _counter = 4,
+        _timestamp = 10,
+        _eventType = "POINT_CHANGE",
+        _fingerprint = 111,
+        _data = { member = KINO, amount = 1 },
+    },
+}
+local forgedId = seedRequest("need-forged-id", "NEED_LOGS", { KINO }, KINO)
+forgedId.meta.integrityRepair = true
+local forgedMerges = 0
+Sync.MergeLogs = function()
+    forgedMerges = forgedMerges + 1
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+Sync:HandleAuthLogs(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-forged-id",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    logs = {
+        {
+            _id = "Owner-Realm:4",
+            _author = OWNER,
+            _counter = 4,
+            _timestamp = 11,
+            _eventType = "ADMIN_ADDED",
+            _fingerprint = 222,
+            _data = { member = KINO },
+        },
+    },
+})
+assertEq(forgedMerges, 0, "catch-up AUTH_LOGS rejects an ADMIN_ADDED that reuses a local row id")
+assertTrue(Sync.state.requests["need-forged-id"] ~= nil, "rewritten grant id leaves the catch-up request open")
+local forgedImported = false
+profile.ImportSnapshot = function()
+    forgedImported = true
+    return true, 1
+end
+local forgedSnap = seedRequest("need-forged-snap", "NEED_PROFILE", { KINO }, KINO)
+Sync:HandleProfileSnapshot(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = forgedSnap.id,
+    snapshot = {
+        meta = { _profileId = PROFILE },
+        adminUsers = { KINO, OWNER },
+        lootLogs = {
+            {
+                _id = "Owner-Realm:4",
+                _author = OWNER,
+                _counter = 4,
+                _timestamp = 11,
+                _eventType = "ADMIN_ADDED",
+                _fingerprint = 222,
+                _data = { member = KINO },
+            },
+        },
+    },
+})
+assertEq(forgedImported, false, "catch-up snapshot rejects an ADMIN_ADDED that reuses a local row id")
+Sync.MergeLogs = function()
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+
+-- Session start must not revoke a coordinator whose grant is only missing locally.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = OWNER
+Sync.state.helpers = {}
+Sync.state.coordEpoch = 3
+profile._lootLogs = {}
+Sync.RebuildProfile = function(self, profileId, reason)
+    self:ReconcileSessionAuthorization(profileId, "rebuild:" .. reason)
+    return true
+end
+Sync:HandleSessionStart(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 4,
+    helpers = {},
+})
+assertEq(Sync.state._coordinatorCatchUp, KINO, "session start keeps a missing coordinator on catch-up")
+assertEq(Sync:_RouteWasRevoked(KINO), false, "session start does not revoke a coordinator local history still grants")
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 2,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}
+Sync:HandleSessionStart(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 5,
+    helpers = {},
+})
+assertEq(Sync.state._coordinatorCatchUp, nil, "session start clears catch-up when local history revoked the coordinator")
+assertEq(Sync:_RouteWasRevoked(KINO), true, "session start revokes a coordinator local history removed")
+
+-- An authorized admin who is not a Helper can still be the integrity provider.
+reset(COORD)
+Sync.state.isCoordinator = true
+Sync.state.helpers = { KINO }
+setAdmins({ COORD, KINO, OWNER })
+assertEq(Sync:_PreferredRepairTargetRoutable(OWNER), true, "authorized non-helper stays a repair target")
+assertEq(Sync:_PreferredRepairTargetRoutable(SUSPENDERS), false, "unauthorized preferred provider is not a repair target")
+Sync:_RememberRevokedRoute(OWNER)
+setAdmins({ COORD, KINO })
+assertEq(Sync:_PreferredRepairTargetRoutable(OWNER), false, "revoked preferred provider is not a repair target")
+setAdmins({ COORD, KINO, OWNER })
+local queued = productionQueueRepairRanges(Sync, PROFILE, {
+    {
+        author = OWNER,
+        fromCounter = 1,
+        toCounter = 2,
+        mode = "integrity",
+    },
+}, {
+    mode = "integrity",
+    preferredTarget = OWNER,
+    reason = "peer-mutation",
+})
+assertEq(queued, true, "integrity repair from an authorized non-helper is queued")
+local repairItem = nil
+for _, item in pairs(Sync.state.repairQueue.items) do
+    if item.author == OWNER then
+        repairItem = item
+    end
+end
+assertEq(repairItem and repairItem.preferredTarget, OWNER, "integrity queue keeps the advertising admin")
 
 -- Abandoned convergence timers must not finalize a replacement round.
 reset(COORD)

@@ -463,7 +463,7 @@ function Sync:_CatchUpProvenGrantLog(sender, logs)
 
     for _, logTable in ipairs(logs) do
         local state = self:_LogAdminGrantState(logTable, sender)
-        if state and not self:_SameLogTable(logTable, grantLog) then
+        if state and not self:_GrantRowsMatch(logTable, grantLog) then
             return nil
         end
     end
@@ -471,21 +471,13 @@ function Sync:_CatchUpProvenGrantLog(sender, logs)
     local profile = self:FindLocalProfileById(self.state.profileId)
     local localLogs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
     if type(localLogs) ~= "table" then return nil end
-    local remoteData = grantLog._data or grantLog.data
-    local remoteMember = type(remoteData) == "table" and remoteData.member or nil
     for _, localLog in ipairs(localLogs) do
         local localTable = localLog
         if type(localLog) == "table" and type(localLog.ToTable) == "function" then
             localTable = localLog:ToTable()
         end
-        if type(localTable) == "table" and self:_SameLogTable(localTable, grantLog) then
-            local localData = localTable._data or localTable.data
-            local localMember = type(localData) == "table" and localData.member or nil
-            if type(localMember) == "string" and type(remoteMember) == "string"
-                and self:_SamePlayer(localMember, remoteMember)
-            then
-                return grantLog
-            end
+        if self:_GrantRowsMatch(localTable, grantLog) then
+            return grantLog
         end
     end
     return nil
@@ -512,7 +504,40 @@ function Sync:_SnapshotListsAdmin(snapshot, name)
     return false
 end
 
+-- Function Read one wire field under either its stored or plain name.
+-- @param row table
+-- @param stored string
+-- @param plain string
+-- @return any
+local function _LogField(row, stored, plain)
+    local value = row[stored]
+    if value == nil then
+        value = row[plain]
+    end
+    return value
+end
+
+-- Function True when two plain values are the same, including nested log data.
+-- @param a any
+-- @param b any
+-- @param depth number
+-- @return boolean
+function Sync:_SamePlainValue(a, b, depth)
+    if a == b then return true end
+    if type(a) ~= "table" or type(b) ~= "table" then return false end
+    if (tonumber(depth) or 0) > 6 then return false end
+    local nextDepth = (tonumber(depth) or 0) + 1
+    for key, value in pairs(a) do
+        if not self:_SamePlainValue(value, b[key], nextDepth) then return false end
+    end
+    for key in pairs(b) do
+        if a[key] == nil then return false end
+    end
+    return true
+end
+
 -- Function True when two log tables are the same row.
+-- A shared _id is not enough. A sender can reuse that id on a different event.
 -- @param a table
 -- @param b table
 -- @return boolean
@@ -520,7 +545,9 @@ function Sync:_SameLogTable(a, b)
     if type(a) ~= "table" or type(b) ~= "table" then return false end
     local aId = a._logId or a.logId or a._id or a.id
     local bId = b._logId or b.logId or b._id or b.id
-    if type(aId) == "string" and aId ~= "" and aId == bId then return true end
+    if type(aId) == "string" and aId ~= "" and type(bId) == "string" and bId ~= "" and aId ~= bId then
+        return false
+    end
     local aAuthor = a._author or a.author
     local bAuthor = b._author or b.author
     local aCounter = tonumber(a._counter or a.counter)
@@ -530,6 +557,40 @@ function Sync:_SameLogTable(a, b)
     if aType ~= bType or aCounter ~= bCounter then return false end
     if type(aAuthor) ~= "string" or type(bAuthor) ~= "string" then return false end
     return self:_SamePlayer(aAuthor, bAuthor)
+end
+
+-- Function True when a remote grant is the same stored row, not a rewrite of its id.
+-- Author, counter, event, data, and any fingerprint must all agree. A newly
+-- computed fingerprint on an ADMIN_ADDED that reuses a local _id is not proof.
+-- @param localTable table
+-- @param remoteTable table
+-- @return boolean
+function Sync:_GrantRowsMatch(localTable, remoteTable)
+    if not self:_SameLogTable(localTable, remoteTable) then return false end
+    local localData = _LogField(localTable, "_data", "data")
+    local remoteData = _LogField(remoteTable, "_data", "data")
+    if type(localData) ~= "table" or type(remoteData) ~= "table" then return false end
+    if not self:_SamePlainValue(localData, remoteData, 0) then return false end
+    local localTs = _LogField(localTable, "_timestamp", "timestamp")
+    local remoteTs = _LogField(remoteTable, "_timestamp", "timestamp")
+    if localTs ~= nil and remoteTs ~= nil and localTs ~= remoteTs then return false end
+    local localFp = _LogField(localTable, "_fingerprint", "fingerprint")
+    local remoteFp = _LogField(remoteTable, "_fingerprint", "fingerprint")
+    if (localFp ~= nil or remoteFp ~= nil) and localFp ~= remoteFp then return false end
+    if SF.LootLog and type(SF.LootLog.ComputeFingerprintFromTable) == "function" then
+        local computedLocal = SF.LootLog.ComputeFingerprintFromTable(localTable)
+        local computedRemote = SF.LootLog.ComputeFingerprintFromTable(remoteTable)
+        if computedLocal ~= nil and computedRemote ~= nil and computedLocal ~= computedRemote then
+            return false
+        end
+        if type(localFp) == "number" and computedLocal ~= nil and localFp ~= computedLocal then
+            return false
+        end
+        if type(remoteFp) == "number" and computedRemote ~= nil and remoteFp ~= computedRemote then
+            return false
+        end
+    end
+    return true
 end
 
 -- Function Attach this client's latest admin grant when serving logs.
@@ -580,14 +641,19 @@ function Sync:_CatchUpSnapshotProvesGrant(sender, snapshot)
     return self:_CatchUpLogsProveGrant(sender, logs)
 end
 
--- Function True when an exact-repair preferred target is still a live route.
--- Canonical admins who are no longer coordinator or helper are not routes.
--- An advertised catch-up coordinator remains routable. Revoked players do not.
+-- Function True when a repair may still be asked of this preferred provider.
+-- LOG_REQ is admin-to-admin. A canonical admin who advertised the window stays
+-- a target even when they were not selected as a Helper. Revoked players and
+-- players who are not admins do not. An advertised catch-up coordinator remains.
 -- @param name string|nil "Name-Realm"
 -- @return boolean
 function Sync:_PreferredRepairTargetRoutable(name)
     if type(name) ~= "string" or name == "" then return false end
     if self:_RouteWasRevoked(name) then return false end
+    if self:_CoordinatorNeedsCatchUp(name) then return true end
+    if self:_ProfileAuthorizationKnown() then
+        return self:IsSenderAuthorized(self.state.profileId, name) == true
+    end
     if type(self._CurrentAuthorizedRoutingTargets) ~= "function" then return false end
     local routes = self:_CurrentAuthorizedRoutingTargets({
         preferCoordinatorFirst = true,
@@ -1143,11 +1209,12 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if type(coordinator) == "string" and coordinator ~= ""
         and not self:IsSenderAuthorized(profileId, coordinator)
     then
-        -- A reload can restore a successor the local admin list has not absorbed yet.
-        -- That absence is catch-up, not an explicit removal. A local ADMIN_REMOVED
-        -- or role demotion is still a revocation.
+        -- A reload or session start can name a successor the local admin list has
+        -- not absorbed yet. That absence is catch-up, not an explicit removal.
+        -- A local ADMIN_REMOVED or role demotion is still a revocation.
         local restoring = reasonText:sub(1, 8) == "restore:"
-        if restoring and not self:_LocalHistoryRevokesAdmin(coordinator) then
+        local sessionStartMember = reasonText == "rebuild:session_start_member"
+        if (restoring or sessionStartMember) and not self:_LocalHistoryRevokesAdmin(coordinator) then
             if self._NoteAdvertisedCoordinator then
                 self:_NoteAdvertisedCoordinator(coordinator)
             end
