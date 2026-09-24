@@ -273,6 +273,7 @@ local function reset(selfName)
     Sync.state.revokedRoutes = nil
     Sync.state._adminGrantServe = nil
     Sync.state._newLogUnauthorizedWarned = nil
+    Sync.state._unprovenCatchUpWarned = nil
     Sync.state._sentJoinStatusForSessionId = nil
     Sync.state._sessionAnnounced = SESSION
     Sync._reconcilingSessionAuthorization = nil
@@ -1220,6 +1221,39 @@ Sync:HandleAuthLogs(KINO, catchLogsPayload({
     { _author = "Author-Realm", _counter = 1, _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
 }))
 assertEq(warningCount("coordinator authority is not established yet"), 1, "repeat unproven catch-up does not warn again")
+local replacementCatch = seedRequest("need-catch-logs-2", "NEED_LOGS", { KINO }, KINO)
+replacementCatch.meta.integrityRepair = true
+Sync:HandleAuthLogs(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-catch-logs-2",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    logs = {
+        { _author = "Author-Realm", _counter = 1, _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
+    },
+})
+assertEq(warningCount("coordinator authority is not established yet"), 1, "replacement unproven catch-up request does not warn again")
+setAdmins({ KINO, OWNER })
+assertEq(Sync:_CoordinatorNeedsCatchUp(KINO), false, "authorization clears catch-up for the warned sender")
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state._coordinatorCatchUp = KINO
+local warnedAgain = seedRequest("need-catch-logs-3", "NEED_LOGS", { KINO }, KINO)
+warnedAgain.meta.integrityRepair = true
+Sync:HandleAuthLogs(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-catch-logs-3",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    logs = {
+        { _author = "Author-Realm", _counter = 1, _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
+    },
+})
+assertEq(warningCount("coordinator authority is not established yet"), 2, "unproven catch-up warns again after authorization changes")
 Sync:HandleAuthLogs(KINO, catchLogsPayload({
     {
         _author = "Author-Realm",

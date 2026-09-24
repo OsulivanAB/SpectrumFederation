@@ -57,6 +57,9 @@ function Sync:_RememberRevokedRoute(name)
     if type(self.state._coordinatorCatchUp) == "string" and self:_SamePlayer(self.state._coordinatorCatchUp, name) then
         self.state._coordinatorCatchUp = nil
     end
+    if self._ClearUnprovenCatchUpWarning then
+        self:_ClearUnprovenCatchUpWarning(name)
+    end
 end
 
 -- Function True when this player was explicitly removed and is not an admin again.
@@ -142,10 +145,16 @@ function Sync:_CoordinatorNeedsCatchUp(name)
     if not self:_SamePlayer(name, self.state.coordinator) then return false end
     if self:_RouteWasRevoked(name) then
         self.state._coordinatorCatchUp = nil
+        if self._ClearUnprovenCatchUpWarning then
+            self:_ClearUnprovenCatchUpWarning(name)
+        end
         return false
     end
     if self:_ProfileAuthorizationKnown() and self:IsSenderAuthorized(self.state.profileId, name) then
         self.state._coordinatorCatchUp = nil
+        if self._ClearUnprovenCatchUpWarning then
+            self:_ClearUnprovenCatchUpWarning(name)
+        end
         return false
     end
     return true
@@ -970,27 +979,48 @@ function Sync:_NoteResponseKindMismatch(req, sender, message)
     end
 end
 
--- Function Warn once when a catch-up response does not prove the sender's grant.
--- The request stays open so a later proof-bearing response can still land.
+-- Function Session key for one sender's unproven catch-up warning.
+-- @param sender string
+-- @param profileId string|nil
+-- @return string
+function Sync:_UnprovenCatchUpWarningKey(sender, profileId)
+    local sessionId = (self.state and self.state.sessionId) or ""
+    local profile = profileId
+    if type(profile) ~= "string" or profile == "" then
+        profile = (self.state and self.state.profileId) or ""
+    end
+    return tostring(sessionId) .. "\0" .. tostring(profile) .. "\0" .. tostring(sender)
+end
+
+-- Function Allow the warning again after this sender's authorization changes.
+-- @param sender string
+-- @param profileId string|nil
+-- @return nil
+function Sync:_ClearUnprovenCatchUpWarning(sender, profileId)
+    local warned = self.state and self.state._unprovenCatchUpWarned
+    if type(warned) ~= "table" or type(sender) ~= "string" or sender == "" then return end
+    warned[self:_UnprovenCatchUpWarningKey(sender, profileId)] = nil
+end
+
+-- Function Warn once per session, profile, and sender when catch-up is unproven.
+-- A replacement request for the same sender stays in debug. Authorization
+-- changes clear the marker so a later failure can warn again.
 -- @param req table|nil
 -- @param sender string
 -- @param message string
 -- @return nil
 function Sync:_NoteUnprovenCatchUp(req, sender, message)
-    local key = tostring(sender or "")
-    if type(req) == "table" then
-        if type(req.unprovenCatchUpWarned) ~= "table" then
-            req.unprovenCatchUpWarned = {}
+    if not self.state then return end
+    local key = self:_UnprovenCatchUpWarningKey(sender)
+    self.state._unprovenCatchUpWarned = self.state._unprovenCatchUpWarned or {}
+    if self.state._unprovenCatchUpWarned[key] then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Repeat unproven catch-up from %s for request %s",
+                tostring(sender), tostring(req and req.id))
         end
-        if req.unprovenCatchUpWarned[key] then
-            if SF.Debug then
-                SF.Debug:Verbose("SYNC", "Repeat unproven catch-up from %s for request %s",
-                    key, tostring(req.id))
-            end
-            return
-        end
-        req.unprovenCatchUpWarned[key] = true
+        return
     end
+    self.state._unprovenCatchUpWarned[key] = true
     if SF.PrintWarning and type(message) == "string" and message ~= "" then
         SF:PrintWarning(message)
     end

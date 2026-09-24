@@ -129,6 +129,7 @@ function Sync:TryRestorePersistedSession(reason)
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
     self.state._newLogUnauthorizedWarned = nil
+    self.state._unprovenCatchUpWarned = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = self:_Now()
 
@@ -808,6 +809,7 @@ function Sync:_ResetSessionState(reason)
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
     self.state._newLogUnauthorizedWarned = nil
+    self.state._unprovenCatchUpWarned = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = nil
 
