@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.5-beta.1] - 2026-09-24
+
+### Fixed
+- Fix tier-token BiS classification and Gear Override repair
+
 ## [1.5.4] - 2026-09-22
 
 ### Added
