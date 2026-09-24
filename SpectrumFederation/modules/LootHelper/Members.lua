@@ -243,10 +243,12 @@ local function SortedHistoryGrantsAdmin(profile, memberId, candidateLog)
     return granted
 end
 
--- AddLootLog inserts the ROLE_CHANGE. A same-second grant can sort after it.
--- Session reconcile reads _adminUsers, so apply the last effect in history
--- order rather than treating the new row as final. The profile owner stays
--- an admin.
+-- Fallback when identity projection is not loaded. AddLootLog inserts the
+-- ROLE_CHANGE and, in production, replays canonical admins first. A same-second
+-- grant can sort after the new row. Session reconcile reads _adminUsers, so
+-- this fallback applies the last effect in history order rather than treating
+-- the new row as final. The profile owner stays an admin. Do not use it to
+-- overwrite a projection: a sourced ADMIN_ADDED is conditional there.
 local function ApplyRoleChangeToCanonicalAdmins(profile, memberId, newRole, candidateLog)
     if type(profile) ~= "table" or type(memberId) ~= "string" or memberId == "" then
         return
@@ -416,7 +418,13 @@ function Member:SetRole(newRole, opts)
         end
 
         local oldRole = self.role
-        ApplyRoleChangeToCanonicalAdmins(opts.profile, self:GetFullIdentifier(), newRole, logEntry)
+        -- Production AddLootLog already ran Identity.ApplyCanonicalAdmins,
+        -- which honors sourced grants. A second grant/revoke scan would put
+        -- a rejected ADMIN_ADDED back into _adminUsers.
+        local identity = SF.LootHelperIdentity
+        if not (type(identity) == "table" and type(identity.ApplyCanonicalAdmins) == "function") then
+            ApplyRoleChangeToCanonicalAdmins(opts.profile, self:GetFullIdentifier(), newRole, logEntry)
+        end
         local stillAdmin = false
         local admins = opts.profile and opts.profile._adminUsers
         if type(admins) == "table" then
@@ -427,7 +435,7 @@ function Member:SetRole(newRole, opts)
                 end
             end
         end
-        self.role = stillAdmin and MEMBER_ROLES.ADMIN or newRole
+        self.role = stillAdmin and MEMBER_ROLES.ADMIN or MEMBER_ROLES.MEMBER
 
         -- The writer does not receive its own NEW_LOG, and a duplicate echo
         -- returns before live revocation routing. Reconcile here, as local
@@ -438,12 +446,12 @@ function Member:SetRole(newRole, opts)
         if sync and type(sync.ReconcileSessionAuthorization) == "function"
             and profile and type(profile.GetProfileId) == "function"
         then
-            local reason = (newRole == MEMBER_ROLES.MEMBER) and "local_role_demoted" or "local_role_promoted"
+            local reason = stillAdmin and "local_role_promoted" or "local_role_demoted"
             sync:ReconcileSessionAuthorization(profile:GetProfileId(), reason)
         end
 
         if SF.Debug then
-            SF.Debug:Info("MEMBER", "%s role changed: %s -> %s", self:GetFullIdentifier(), oldRole, newRole)
+            SF.Debug:Info("MEMBER", "%s role changed: %s -> %s", self:GetFullIdentifier(), oldRole, self.role)
         end
         return true
     else

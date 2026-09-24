@@ -120,15 +120,16 @@ function Sync:_ClearRevocationForIncomingScope(incomingSessionId, incomingProfil
 end
 
 -- Function True when a new session id for this same profile must not be adopted.
--- Heartbeat, reannounce, and takeover do not rebuild history. A coordinator
--- local history already removed would otherwise clear the tombstone and stay
--- on catch-up. Current canonical admin status outranks that history, including
--- a cached scan: the profile owner can be demoted in a role log and still be
--- an admin. Session start still applies the descriptor and reconciles.
--- Call this only after epoch gating. One scan per request timeout is reused
--- for a coordinator who is not a current admin; a different name waits
--- instead of walking history again. The cached result is dropped when that
--- history changes or an explicit revocation is recorded.
+-- Heartbeat, reannounce, takeover, and session start call this after epoch
+-- gating and before replacing session state. A coordinator local history
+-- already removed would otherwise clear the tombstone, reset takeover timing,
+-- apply advertised configuration, and rebuild the profile. Current canonical
+-- admin status outranks that history, including a cached scan: the profile
+-- owner can be demoted in a role log and still be an admin.
+-- One scan per request timeout is reused for a coordinator who is not a
+-- current admin; a different name waits instead of walking history again.
+-- The cached result is dropped when that history changes or an explicit
+-- revocation is recorded.
 -- @param payload table
 -- @return boolean
 function Sync:_SameProfileRevokeScanCurrent(cache)

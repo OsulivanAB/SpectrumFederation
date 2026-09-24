@@ -2684,6 +2684,123 @@ Sync:HandleCoordinatorTakeover(COORD, {
 })
 assertEq(Sync.state.sessionId, SESSION, "same-profile takeover does not adopt a locally revoked coordinator")
 assertEq(Sync.state.coordinator, COORD, "same-profile revoked takeover keeps the coordinator")
+
+-- A fresh session id must not reset a same-profile removal before reconcile.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = COORD
+Sync.state.helpers = { KINO }
+Sync.state.coordEpoch = 10
+Sync.state.heartbeat.lastHeartbeatAt = 40
+Sync.state.heartbeat.lastCoordMessageAt = 40
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = COORD },
+    },
+}
+Sync:_RememberRevokedRoute(COORD)
+local startRebuilds = 0
+local originalStartRebuild = Sync.RebuildProfile
+Sync.RebuildProfile = function()
+    startRebuilds = startRebuilds + 1
+    return true
+end
+local startRcApplied = false
+local originalStartRc = Sync._ApplyAdvertisedRCConfig
+Sync._ApplyAdvertisedRCConfig = function()
+    startRcApplied = true
+end
+local startSafeApplied = false
+local originalStartSafe = Sync._ApplySessionSafeModeFromPayload
+Sync._ApplySessionSafeModeFromPayload = function()
+    startSafeApplied = true
+end
+local startScans = 0
+local originalStartHistory = Sync._LocalHistoryRevokesAdmin
+Sync._LocalHistoryRevokesAdmin = function(self, name)
+    startScans = startScans + 1
+    return originalStartHistory(self, name)
+end
+local startNow = 12000
+local originalStartNow = Sync._Now
+Sync._Now = function()
+    return startNow
+end
+Sync:HandleSessionStart(COORD, {
+    sessionId = "session-restart",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 12,
+    helpers = { OWNER },
+    safeMode = { enabled = true, rev = 1, setBy = COORD, reason = "revoked" },
+    rcLootCouncilIntegration = { recordAwards = true },
+})
+assertEq(Sync.state.sessionId, SESSION, "same-profile session start does not adopt a locally revoked coordinator")
+assertEq(Sync.state.coordEpoch, 10, "same-profile revoked session start does not advance the epoch")
+assertEq(Sync:_RouteWasRevoked(COORD), true, "same-profile revoked session start keeps the revocation")
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 40, "same-profile revoked session start does not refresh the coordinator timer")
+assertTrue(not listHas(Sync.state.helpers, OWNER), "same-profile revoked session start does not apply helpers")
+assertEq(startRebuilds, 0, "rejected session start does not rebuild the profile")
+assertEq(startRcApplied, false, "rejected session start does not persist RC config")
+assertEq(startSafeApplied, false, "rejected session start does not apply safe mode")
+assertEq(startScans, 1, "the first rejected session start scans history once")
+Sync:HandleSessionStart(COORD, {
+    sessionId = "session-restart-2",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 13,
+    helpers = { OWNER },
+})
+assertEq(startScans, 1, "repeat rejected session starts do not rescan history inside the timeout")
+assertEq(startRebuilds, 0, "repeat rejected session starts do not rebuild the profile")
+assertEq(Sync.state.sessionId, SESSION, "a second new session id stays rejected")
+Sync:HandleSessionStart(COORD, {
+    sessionId = "session-restart-old",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 1,
+})
+assertEq(startScans, 1, "an older session start does not scan revocation history")
+Sync.RebuildProfile = originalStartRebuild
+Sync._ApplyAdvertisedRCConfig = originalStartRc
+Sync._ApplySessionSafeModeFromPayload = originalStartSafe
+Sync._LocalHistoryRevokesAdmin = originalStartHistory
+Sync._Now = originalStartNow
+
+reset(MEMBER)
+setAdmins({ OWNER, KINO })
+profile._owner = OWNER
+profile.GetOwnerId = function()
+    return OWNER
+end
+profile._lootLogs = {
+    {
+        _author = KINO,
+        _counter = 4,
+        _eventType = "ROLE_CHANGE",
+        _data = { member = OWNER, newRole = "MEMBER" },
+    },
+}
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+Sync.RebuildProfile = function()
+    return true
+end
+Sync:HandleSessionStart(OWNER, {
+    sessionId = "session-owner-start",
+    profileId = PROFILE,
+    coordinator = OWNER,
+    coordEpoch = 12,
+    helpers = { KINO },
+})
+assertEq(Sync.state.sessionId, "session-owner-start",
+    "still-authorized owner session start adopts the new session")
+assertEq(Sync.state.coordEpoch, 12, "still-authorized owner session start advances the epoch")
+assertEq(Sync.state.coordinator, OWNER, "still-authorized owner session start keeps that coordinator")
+Sync.RebuildProfile = originalStartRebuild
 reset(MEMBER)
 setAdmins({ OWNER })
 Sync.state.coordinator = COORD
@@ -3148,6 +3265,106 @@ assertTrue(listHas(profile._adminUsers, COORD),
     "a later same-second grant keeps the demoted member authorized")
 assertEq(Sync:_RouteWasRevoked(COORD), false, "sorted history does not revoke that coordinator")
 assertEq(sortedTakeovers, 0, "sorted history does not take over from that coordinator")
+Sync.TakeoverSession = originalTakeover
+
+-- A promotion that sorts before a same-second removal is not an admin role.
+reset(OWNER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+Sync.state.helpers = { COORD }
+profile.IsCurrentUserAdmin = function()
+    return true
+end
+profile._lootLogs = {
+    {
+        _timestamp = 50,
+        _author = "Zulu-Realm",
+        _counter = 2,
+        _id = "remove-after-promote",
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}
+SF.LootLogEventTypes.ADMIN_REMOVED = "ADMIN_REMOVED"
+SF.LootLog.new = function()
+    return {
+        _timestamp = 50,
+        _author = "Alpha-Realm",
+        _counter = 1,
+        _id = "local-promote",
+        _eventType = "ROLE_CHANGE",
+        _data = { member = KINO, newRole = SF.MemberRoles.ADMIN },
+    }
+end
+profile.AddLootLog = function()
+    return true
+end
+local rejectedPromotion = SF.Member.new(KINO, SF.MemberRoles.MEMBER)
+assertEq(rejectedPromotion:SetRole(SF.MemberRoles.ADMIN, { profile = profile }), true,
+    "local promotion still commits the role log")
+assertEq(rejectedPromotion.role, SF.MemberRoles.MEMBER,
+    "a later same-second removal keeps the member role")
+assertEq(rejectedPromotion:IsAdmin(), false, "a rejected promotion does not report admin")
+assertTrue(not listHas(profile._adminUsers, KINO),
+    "a later same-second removal leaves the member unauthorized")
+
+-- Identity projection ignores a sourced grant. The role scan must not undo it.
+SF.LootHelperIdentity = {
+    ApplyCanonicalAdmins = function()
+        return true
+    end,
+}
+reset(KINO)
+setAdmins({ COORD, KINO, OWNER })
+profile._owner = OWNER
+profile.GetOwnerId = function()
+    return OWNER
+end
+profile.IsCurrentUserAdmin = function()
+    return true
+end
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+Sync.state.helpers = { COORD }
+profile._lootLogs = {
+    {
+        _timestamp = 50,
+        _author = "Zulu-Realm",
+        _counter = 2,
+        _id = "sourced-grant",
+        _eventType = "ADMIN_ADDED",
+        _data = { member = COORD, sourceLogId = "missing-link" },
+    },
+}
+SF.LootLog.new = function()
+    return {
+        _timestamp = 50,
+        _author = "Alpha-Realm",
+        _counter = 1,
+        _id = "local-demote-sourced",
+        _eventType = "ROLE_CHANGE",
+        _data = { member = COORD, newRole = SF.MemberRoles.MEMBER },
+    }
+end
+profile.AddLootLog = function()
+    setAdmins({ KINO, OWNER })
+    return true
+end
+Sync.TakeoverSession = function()
+    return true
+end
+local sourcedDemotion = SF.Member.new(COORD, SF.MemberRoles.ADMIN)
+assertEq(sourcedDemotion:SetRole(SF.MemberRoles.MEMBER, { profile = profile }), true,
+    "sourced-grant demotion still commits the role log")
+assertTrue(not listHas(profile._adminUsers, COORD),
+    "a missing relationship source does not restore the demoted member")
+assertEq(sourcedDemotion.role, SF.MemberRoles.MEMBER,
+    "a rejected sourced grant keeps the member role")
+assertEq(sourcedDemotion:IsAdmin(), false, "a rejected sourced grant does not report admin")
+assertEq(Sync:_RouteWasRevoked(COORD), true,
+    "a rejected sourced grant still revokes the coordinator route")
+SF.LootHelperIdentity = nil
 Sync.TakeoverSession = originalTakeover
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

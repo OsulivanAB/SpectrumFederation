@@ -46,6 +46,12 @@ function Sync:HandleSessionStart(sender, payload)
         end
     end
 
+    -- Same-profile history that ends in removal rejects the new session id
+    -- before reset. Reset would drop the tombstone and then rebuild.
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
+        return
+    end
+
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
 
