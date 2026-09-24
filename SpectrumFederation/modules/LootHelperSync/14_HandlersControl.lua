@@ -694,6 +694,12 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     local oldSid = self.state.sessionId
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
+    -- A different session clears catch-up inside the scope reset. Record the
+    -- unproven coordinator first, or that reset hides the failure and a later
+    -- higher epoch can adopt them again.
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+    end
     if self._ClearRevocationForIncomingScope then
         self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
     end

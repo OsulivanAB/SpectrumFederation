@@ -311,7 +311,8 @@ end
 
 -- Function True when this player already lost an unproven catch-up on this profile.
 -- The marker is profile-scoped. A stored grant or canonical admin status on
--- that same profile clears it. Another profile is not blocked by it.
+-- the incoming profile clears it, including when that profile is not the
+-- active session yet. Another profile is not blocked by it.
 -- @param name string "Name-Realm"
 -- @param profileId string|nil Incoming profile id. Defaults to the active profile.
 -- @return boolean
@@ -324,15 +325,13 @@ function Sync:_FailedCatchUpBlocks(name, profileId)
     if type(book) ~= "table" then return false end
     local key = self:_FailedCatchUpKey(profileId, name)
     if not key or book[key] ~= true then return false end
-    if self.state.profileId == profileId then
-        if self._LocalCatchUpGrantStored and self:_LocalCatchUpGrantStored(name) == true then
-            book[key] = nil
-            return false
-        end
-        if self:_ProfileAuthorizationKnown() and self:IsSenderAuthorized(self.state.profileId, name) then
-            book[key] = nil
-            return false
-        end
+    if self:IsSenderAuthorized(profileId, name) then
+        book[key] = nil
+        return false
+    end
+    if self._LocalCatchUpGrantStored and self:_LocalCatchUpGrantStored(name, profileId) == true then
+        book[key] = nil
+        return false
     end
     return true
 end
@@ -579,8 +578,11 @@ end
 -- Function True when local history already stores a current grant for this player.
 -- The row must be authored by a different canonical admin. A missing row is not
 -- proof, and it is not a revocation. One walk per player is reused until the
--- log list, its revision, or the canonical admin list changes.
+-- log list, its revision, or the canonical admin list changes. A profile other
+-- than the active session uses its own cache so that scan does not replace
+-- the active profile's result.
 -- @param name string "Name-Realm"
+-- @param profileId string|nil Profile to read. Defaults to the active profile.
 -- @return boolean
 function Sync:_CatchUpGrantAdminToken(profile)
     local admins = self._GetProfileAdminUsers and self:_GetProfileAdminUsers(profile) or nil
@@ -592,38 +594,45 @@ function Sync:_CatchUpGrantAdminToken(profile)
     return table.concat(parts, "\0")
 end
 
-function Sync:_LocalCatchUpGrantStored(name)
+function Sync:_LocalCatchUpGrantStored(name, profileId)
     if type(name) ~= "string" or name == "" or not self.state then return false end
+    if type(profileId) ~= "string" or profileId == "" then
+        profileId = self.state.profileId
+    end
+    if type(profileId) ~= "string" or profileId == "" then return false end
     if type(self.FindLocalProfileById) ~= "function" or type(self._GetProfileLootLogs) ~= "function" then
         return false
     end
     if type(self._LogAdminGrantState) ~= "function" then return false end
-    local profile = self:FindLocalProfileById(self.state.profileId)
+    local profile = self:FindLocalProfileById(profileId)
     local logs = profile and self:_GetProfileLootLogs(profile) or nil
     if type(logs) ~= "table" then return false end
     local rev = type(profile) == "table" and (tonumber(profile._lootLogRevision) or 0) or 0
     local adminToken = self:_CatchUpGrantAdminToken(profile)
-    local cache = self.state._catchUpGrantScan
+    local foreign = profileId ~= self.state.profileId
+    local cacheField = foreign and "_catchUpGrantScanOther" or "_catchUpGrantScan"
+    local cache = self.state[cacheField]
     local cacheKey = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(name)) or name
+    local applied = (type(profile) == "table" and profile._identityProjection and profile._identityProjection.appliedRelationshipIds) or nil
     if type(cache) ~= "table"
-        or cache.profileId ~= self.state.profileId
+        or cache.profileId ~= profileId
         or cache.logs ~= logs
         or cache.count ~= #logs
         or cache.rev ~= rev
         or cache.admins ~= adminToken
-        or cache.applied ~= ((type(profile) == "table" and profile._identityProjection and profile._identityProjection.appliedRelationshipIds) or nil)
+        or cache.applied ~= applied
         or type(cache.byName) ~= "table"
     then
         cache = {
-            profileId = self.state.profileId,
+            profileId = profileId,
             logs = logs,
             count = #logs,
             rev = rev,
             admins = adminToken,
-            applied = (type(profile) == "table" and profile._identityProjection and profile._identityProjection.appliedRelationshipIds) or nil,
+            applied = applied,
             byName = {},
         }
-        self.state._catchUpGrantScan = cache
+        self.state[cacheField] = cache
     end
     local cached = cache.byName[cacheKey]
     if cached ~= nil then
@@ -646,7 +655,7 @@ function Sync:_LocalCatchUpGrantStored(name)
     if type(grantLog) == "table" then
         local author = grantLog._author or grantLog.author
         if type(author) == "string" and author ~= "" and not self:_SamePlayer(author, name) then
-            stored = self:IsSenderAuthorized(self.state.profileId, author) == true
+            stored = self:IsSenderAuthorized(profileId, author) == true
         end
     end
     local storedNames = 0
@@ -1944,12 +1953,17 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if type(coordinator) == "string" and coordinator ~= ""
         and not self:IsSenderAuthorized(profileId, coordinator)
     then
-        -- A reload or session start can name a successor the local admin list has
-        -- not absorbed yet. That absence is catch-up, not an explicit removal.
-        -- A local ADMIN_REMOVED or role demotion is still a revocation.
+        -- A reload, session start, or coordinator already on catch-up can name a
+        -- successor the local admin list has not absorbed yet. Ordinary AUTH_LOGS
+        -- rebuilds must not turn that absence into a revocation before the grant
+        -- request finishes. A local ADMIN_REMOVED or role demotion still revokes.
         local restoring = reasonText:sub(1, 8) == "restore:"
         local sessionStartMember = reasonText == "rebuild:session_start_member"
-        if (restoring or sessionStartMember) and not self:_LocalHistoryRevokesAdmin(coordinator) then
+        local existingCatchUp = self._CoordinatorNeedsCatchUp
+            and self:_CoordinatorNeedsCatchUp(coordinator)
+        if (restoring or sessionStartMember or existingCatchUp)
+            and not self:_LocalHistoryRevokesAdmin(coordinator)
+        then
             if self._NoteAdvertisedCoordinator then
                 self:_NoteAdvertisedCoordinator(coordinator)
             end

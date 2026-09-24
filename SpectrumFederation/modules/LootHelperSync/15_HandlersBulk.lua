@@ -499,6 +499,18 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return end
     if type(payload.snapshot) ~= "table" then return end
 
+    -- Departed senders must not reach catch-up proof. Snapshots larger than the
+    -- proof cache walk local history on every repeat.
+    if not self:IsRequesterInGroup(sender) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not in group", tostring(sender))
+        end
+        if SF.PrintWarning then
+            SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not in group."):format(sender))
+        end
+        return
+    end
+
     -- Full snapshots remain coordinator/helper-only. Ordinary admins cannot
     -- supply owner, roster, logs, loot mode, Reward Pot, Raid Check, or
     -- equipment state through this path. RC settings use RC_CONFIG_REQ/SET.
@@ -556,17 +568,6 @@ function Sync:HandleProfileSnapshot(sender, payload)
             if SF.PrintWarning then
                 SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not a trusted sender."):format(sender))
             end
-        end
-        return
-    end
-
-    -- Safety: sender must be in group
-    if not self:IsRequesterInGroup(sender) then
-        if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not in group", tostring(sender))
-        end
-        if SF.PrintWarning then
-            SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not in group."):format(sender))
         end
         return
     end

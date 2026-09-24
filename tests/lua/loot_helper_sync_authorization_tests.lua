@@ -276,6 +276,7 @@ local function reset(selfName)
     Sync.state._unprovenCatchUpWarned = nil
     Sync.state._sameProfileRevokeScan = nil
     Sync.state._catchUpGrantScan = nil
+    Sync.state._catchUpGrantScanOther = nil
     Sync.state._catchUpProofScan = nil
     Sync.state._failedCatchUp = nil
     Sync.state._sentJoinStatusForSessionId = nil
@@ -3868,6 +3869,219 @@ assertTrue(Sync.state.requests["need-mismatched-grant"] ~= nil, "the mismatched 
 sendMismatched(100)
 assertEq(proofScans, 2, "a different mismatched grant scans history once")
 Sync._LocalHistoryRevokesAdmin = originalProofHistory
+end)()
+
+-- An ordinary AUTH_LOGS rebuild keeps a catch-up coordinator whose history
+-- does not revoke them. A cross-session takeover records that failure before
+-- the old scope is cleared. A later grant on the blocked profile is visible
+-- while another profile is active. Departed snapshot senders do not scan proof.
+;(function()
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+profile._lootLogs = {}
+assertEq(Sync:_CatchUpRequestGrantFields(OWNER).adminGrantMember, KINO,
+    "a missing catch-up grant is requested from a trusted admin")
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:auth_logs")
+assertEq(Sync.state._coordinatorCatchUp, KINO, "auth_logs rebuild keeps an unrevoked catch-up coordinator")
+assertEq(Sync:_RouteWasRevoked(KINO), false, "auth_logs rebuild does not revoke a missing grant")
+assertEq(Sync.state.coordinator, KINO, "auth_logs rebuild does not take over from catch-up")
+assertEq(Sync.state.isCoordinator, false, "the admin receiver stays a member during catch-up")
+assertEq(Sync:_CatchUpRequestGrantFields(OWNER).adminGrantMember, KINO,
+    "the grant request still names the catch-up coordinator after auth_logs")
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:auth_logs")
+assertEq(Sync:_RouteWasRevoked(KINO), true, "auth_logs rebuild still revokes a coordinator history removed")
+assertNil(Sync.state._coordinatorCatchUp, "a history removal clears catch-up on auth_logs rebuild")
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 10
+Sync.state.isCoordinator = false
+local crossNow = 5000
+local originalCrossNow = Sync._Now
+Sync._Now = function()
+    return crossNow
+end
+Sync:HandleCoordinatorTakeover(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+assertEq(Sync.state._coordinatorCatchUp, KINO, "the unproven coordinator is on catch-up before the new session")
+Sync:HandleCoordinatorTakeover(OWNER, {
+    sessionId = "session-legit",
+    profileId = PROFILE,
+    coordinator = OWNER,
+    coordEpoch = 12,
+})
+assertEq(Sync.state.sessionId, "session-legit", "a different admin can take a new session")
+assertEq(Sync.state.coordinator, OWNER, "the new session stores the authorized coordinator")
+assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
+    "cross-session takeover records the unproven coordinator before catch-up is cleared")
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-again",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 13,
+})
+assertEq(Sync.state.sessionId, "session-legit", "the recorded failure rejects a later higher-epoch session")
+assertEq(Sync.state.coordinator, OWNER, "the recorded failure leaves the authorized coordinator in place")
+Sync._Now = originalCrossNow
+
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 10
+Sync.state.isCoordinator = true
+local otherProfileNow = 5000
+local originalOtherProfileNow = Sync._Now
+Sync._Now = function()
+    return otherProfileNow
+end
+Sync:HandleCoordinatorTakeover(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+otherProfileNow = 9000
+assertEq(Sync:TakeoverSession(SESSION, PROFILE, "heartbeat-timeout"), true,
+    "a proven admin takes the failed catch-up session back")
+local profile2Admins = { OWNER }
+local profile2 = {
+    _profileId = "profile-2",
+    _lootLogs = {
+        {
+            _author = OWNER,
+            _counter = 1,
+            _eventType = "POINT_CHANGE",
+            _data = { member = MEMBER },
+        },
+    },
+    _adminUsers = profile2Admins,
+    GetProfileId = function(self)
+        return self._profileId
+    end,
+    GetAdminUsers = function()
+        return profile2Admins
+    end,
+    GetLootLogs = function(self)
+        return self._lootLogs
+    end,
+}
+SF.lootHelperDB.profiles["profile-2"] = profile2
+Sync.state.profileId = "profile-2"
+Sync.state.sessionId = "session-other"
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 20
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}
+local grantScans = 0
+local originalGrantState = Sync._LogAdminGrantState
+Sync._LogAdminGrantState = function(self, logTable, who)
+    grantScans = grantScans + 1
+    return originalGrantState(self, logTable, who)
+end
+assertEq(Sync:_LocalCatchUpGrantStored(OWNER), false, "the active profile has no catch-up grant")
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-profile-1-blocked",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 21,
+})
+assertEq(Sync.state.sessionId, "session-other", "the failed profile stays blocked before its grant arrives")
+assertEq(Sync.state.profileId, "profile-2", "the blocked descriptor does not switch profiles")
+assertEq(Sync.state._catchUpGrantScan.profileId, "profile-2",
+    "checking another profile does not replace the active grant cache")
+local afterForeignScan = grantScans
+Sync:_LocalCatchUpGrantStored(OWNER)
+assertEq(grantScans, afterForeignScan, "the active profile grant cache is reused after the other profile is checked")
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 2,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local beforeGrantScan = grantScans
+assertEq(Sync:_LocalCatchUpGrantStored(KINO, PROFILE), true, "the inactive profile stores the coordinator grant")
+local grantedScans = grantScans
+assertTrue(grantedScans > beforeGrantScan, "the inactive profile grant is scanned once")
+assertEq(Sync:_LocalCatchUpGrantStored(KINO, PROFILE), true, "the inactive profile grant stays stored")
+assertEq(grantScans, grantedScans, "a repeated inactive-profile grant check does not walk history again")
+otherProfileNow = 9500
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-profile-1-granted",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 22,
+})
+assertEq(Sync.state.sessionId, "session-profile-1-granted",
+    "a grant stored on the incoming profile clears that profile's failed catch-up")
+assertEq(Sync.state.profileId, PROFILE, "the granted profile becomes the active session")
+assertEq(Sync.state.coordinator, KINO, "that coordinator is adopted for the profile that stores the grant")
+Sync._LogAdminGrantState = originalGrantState
+Sync._Now = originalOtherProfileNow
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+local proofCalls = 0
+local originalSnapshotProof = Sync._CatchUpSnapshotProvesGrant
+Sync._CatchUpSnapshotProvesGrant = function(self, sender, snapshot)
+    proofCalls = proofCalls + 1
+    return originalSnapshotProof(self, sender, snapshot)
+end
+local originalGroup = Sync.IsRequesterInGroup
+Sync.IsRequesterInGroup = function(_, sender)
+    return sender ~= KINO
+end
+local departed = seedRequest("need-left-group", "NEED_PROFILE", { KINO }, KINO)
+local departedPayload = {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = departed.id,
+    snapshot = {
+        meta = { _profileId = PROFILE },
+        adminUsers = { KINO, OWNER },
+        lootLogs = {
+            {
+                _author = OWNER,
+                _counter = 4,
+                _eventType = "ADMIN_ADDED",
+                _data = { member = KINO },
+            },
+        },
+    },
+}
+Sync:HandleProfileSnapshot(KINO, departedPayload)
+Sync:HandleProfileSnapshot(KINO, departedPayload)
+assertEq(proofCalls, 0, "repeated out-of-group snapshots do not scan catch-up proof")
+assertTrue(warningCount("not in group") >= 1, "an out-of-group snapshot is rejected")
+Sync._CatchUpSnapshotProvesGrant = originalSnapshotProof
+Sync.IsRequesterInGroup = originalGroup
 end)()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
