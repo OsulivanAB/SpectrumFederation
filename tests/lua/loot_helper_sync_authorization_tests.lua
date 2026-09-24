@@ -276,6 +276,7 @@ local function reset(selfName)
     Sync.state._unprovenCatchUpWarned = nil
     Sync.state._sameProfileRevokeScan = nil
     Sync.state._catchUpGrantScan = nil
+    Sync.state._failedCatchUp = nil
     Sync.state._sentJoinStatusForSessionId = nil
     Sync.state._sessionAnnounced = SESSION
     Sync._reconcilingSessionAuthorization = nil
@@ -3711,6 +3712,80 @@ assertEq(Sync.state.active, false, "an aborted start does not leave the session 
 assertEq(startConvergence, 0, "an aborted start does not begin admin convergence")
 Sync.BeginAdminConvergence = originalBegin
 Sync.RebuildProfile = originalStartRebuild
+
+-- A same-session successor whose grant is missing gets one catch-up window.
+-- After a proven admin takes over, that unproven identity cannot reclaim the
+-- session until the grant is stored.
+;(function()
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 10
+Sync.state.isCoordinator = true
+Sync.state.heartbeat.lastCoordMessageAt = 1000
+local successorNow = 5000
+local originalSuccessorNow = Sync._Now
+Sync._Now = function()
+    return successorNow
+end
+Sync:HandleCoordinatorTakeover(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+assertEq(Sync.state.coordinator, KINO, "same-session successor takeover is adopted")
+assertEq(Sync.state._coordinatorCatchUp, KINO, "a successor without a grant stays on catch-up")
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 5000,
+    "same-session successor catch-up baselines the takeover clock")
+successorNow = 8000
+Sync:HandleCoordinatorTakeover(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 12,
+})
+assertEq(Sync.state.coordEpoch, 12, "a later same-session unproven takeover still applies")
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 5000,
+    "a later same-session unproven takeover does not refresh the clock")
+successorNow = 9000
+local tookOver = Sync:TakeoverSession(SESSION, PROFILE, "heartbeat-timeout")
+assertEq(tookOver, true, "a proven admin takes over from the unproven coordinator")
+assertEq(Sync.state.coordinator, OWNER, "takeover stores the proven admin")
+local reclaimEpoch = (tonumber(Sync.state.coordEpoch) or 0) + 1
+Sync:HandleCoordinatorTakeover(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = reclaimEpoch,
+})
+assertEq(Sync.state.coordinator, OWNER, "a failed catch-up coordinator cannot take the same session back")
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-reclaim",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = reclaimEpoch + 1,
+})
+assertEq(Sync.state.sessionId, SESSION, "a failed catch-up coordinator cannot reclaim with a new session")
+assertEq(Sync.state.coordinator, OWNER, "a failed catch-up reclaim leaves the proven admin in place")
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+successorNow = 10000
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-proven",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = reclaimEpoch + 2,
+})
+assertEq(Sync.state.sessionId, "session-proven", "a stored grant lets that coordinator adopt a new session")
+Sync._Now = originalSuccessorNow
+end)()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

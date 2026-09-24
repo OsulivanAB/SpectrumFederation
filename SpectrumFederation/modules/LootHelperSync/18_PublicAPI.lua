@@ -747,6 +747,9 @@ function Sync:StartSession(profileId, opts)
     local me = self:_SelfId()
     local sessionId = self:_NextNonce("SES")
     local epoch = self:_Now()
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(self.state.coordinator, me)
+    end
 
     -- Reset state
     self.state.adminStatuses = {}
@@ -1039,6 +1042,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
 
     local me = self:_SelfId()
     local oldEpoch = tonumber(self.state.coordEpoch) or 0
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(self.state.coordinator, me)
+    end
 
     self.state.active = true
     self.state.sessionId = sessionId

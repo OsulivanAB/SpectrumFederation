@@ -265,6 +265,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
         return
     end
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator) then
+        return
+    end
 
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
@@ -274,6 +277,9 @@ function Sync:HandleSessionReannounce(sender, payload)
 
     -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor.
     if oldSid and oldSid ~= payload.sessionId then
+        if self._RememberUnprovenCatchUpRelease then
+            self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+        end
         self:_ResetSessionState("session_changed")
     elseif self._ClearRevocationForIncomingScope then
         self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
@@ -282,6 +288,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     self.state.active = true
     self.state.sessionId = payload.sessionId
     self.state.profileId = payload.profileId
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+    end
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
@@ -323,7 +332,10 @@ function Sync:HandleSessionReannounce(sender, payload)
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
     if self._RememberCoordinatorKeepalive then
-        self:_RememberCoordinatorKeepalive(self.state.coordinator, oldSid ~= payload.sessionId)
+        self:_RememberCoordinatorKeepalive(
+            self.state.coordinator,
+            self:_CoordinatorKeepaliveBaseline(oldSid, payload.sessionId, oldCoord, self.state.coordinator)
+        )
     else
         hb.lastCoordMessageAt = self:_Now()
         hb.missedHeartbeats = 0
@@ -404,6 +416,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
         return
     end
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator) then
+        return
+    end
 
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
@@ -412,6 +427,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     local oldEpoch = self.state.coordEpoch
 
     if oldSid and oldSid ~= payload.sessionId then
+        if self._RememberUnprovenCatchUpRelease then
+            self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+        end
         self:_ResetSessionState("session_changed")
     elseif self._ClearRevocationForIncomingScope then
         self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
@@ -461,6 +479,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     self.state.active   = true
     self.state.sessionId = payload.sessionId
     self.state.profileId = payload.profileId
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+    end
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
@@ -517,7 +538,10 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
     if self._RememberCoordinatorKeepalive then
-        self:_RememberCoordinatorKeepalive(self.state.coordinator, oldSid ~= payload.sessionId)
+        self:_RememberCoordinatorKeepalive(
+            self.state.coordinator,
+            self:_CoordinatorKeepaliveBaseline(oldSid, payload.sessionId, oldCoord, self.state.coordinator)
+        )
     else
         hb.lastHeartbeatAt = self:_Now()
         hb.lastCoordMessageAt = self:_Now()
@@ -661,6 +685,9 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
         return
     end
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator) then
+        return
+    end
 
     local wasCoordinator = (self.state.isCoordinator == true)
 
@@ -674,6 +701,9 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     self.state.active = true
     self.state.sessionId = payload.sessionId
     self.state.profileId = payload.profileId
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+    end
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
@@ -693,7 +723,10 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
     if self._RememberCoordinatorKeepalive then
-        self:_RememberCoordinatorKeepalive(self.state.coordinator, oldSid ~= payload.sessionId)
+        self:_RememberCoordinatorKeepalive(
+            self.state.coordinator,
+            self:_CoordinatorKeepaliveBaseline(oldSid, payload.sessionId, oldCoord, self.state.coordinator)
+        )
     else
         hb.lastCoordMessageAt = self:_Now()
         hb.missedHeartbeats = 0

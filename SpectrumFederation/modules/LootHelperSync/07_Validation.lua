@@ -259,6 +259,69 @@ function Sync:_UnprovenCatchUpBlocksNewSession(payload)
     return self:_UnprovenCatchUpKeepalive(payload.coordinator) == true
 end
 
+-- Function True when this descriptor is the first keepalive for a coordinator.
+-- A new session id is one. Replacing the coordinator on the same session is
+-- the other: the successor's grant may still be in flight, and the expired
+-- clock of the coordinator that just timed out must not start a new takeover.
+-- @param oldSessionId string|nil
+-- @param newSessionId string|nil
+-- @param oldCoordinator string|nil
+-- @param newCoordinator string|nil
+-- @return boolean
+function Sync:_CoordinatorKeepaliveBaseline(oldSessionId, newSessionId, oldCoordinator, newCoordinator)
+    if oldSessionId ~= newSessionId then return true end
+    if type(oldCoordinator) ~= "string" or oldCoordinator == "" then return true end
+    if type(newCoordinator) ~= "string" or newCoordinator == "" then return false end
+    return not self:_SamePlayer(oldCoordinator, newCoordinator)
+end
+
+-- Function Remember an unproven catch-up coordinator who lost the role.
+-- A later descriptor from that player is ignored until local history stores
+-- their grant or the profile lists them as an admin. Otherwise a fresh
+-- session id after takeover resets the clock and the loop repeats.
+-- @param previous string|nil "Name-Realm"
+-- @param nextName string|nil "Name-Realm"
+-- @return nil
+function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
+    if not self.state or type(previous) ~= "string" or previous == "" then return end
+    if type(nextName) == "string" and nextName ~= "" and self:_SamePlayer(previous, nextName) then
+        return
+    end
+    if not (self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(previous)) then
+        return
+    end
+    self.state._failedCatchUp = self.state._failedCatchUp or {}
+    local key = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(previous)) or previous
+    if self.state._failedCatchUp[key] == true then return end
+    local count = 0
+    for _ in pairs(self.state._failedCatchUp) do
+        count = count + 1
+        if count >= 32 then return end
+    end
+    self.state._failedCatchUp[key] = true
+end
+
+-- Function True when this player already lost an unproven catch-up and is still unproven.
+-- A stored grant or canonical admin status clears the block.
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_FailedCatchUpBlocks(name)
+    if not self.state or type(name) ~= "string" or name == "" then return false end
+    local book = self.state._failedCatchUp
+    if type(book) ~= "table" then return false end
+    local key = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(name)) or name
+    if book[key] ~= true then return false end
+    if self._LocalCatchUpGrantStored and self:_LocalCatchUpGrantStored(name) == true then
+        book[key] = nil
+        return false
+    end
+    if self:_ProfileAuthorizationKnown() and self:IsSenderAuthorized(self.state.profileId, name) then
+        book[key] = nil
+        return false
+    end
+    return true
+end
+
 -- Function Record coordinator liveness.
 -- A proven coordinator refreshes the takeover clock. An unproven catch-up
 -- coordinator refreshes it only when this descriptor is the first baseline
