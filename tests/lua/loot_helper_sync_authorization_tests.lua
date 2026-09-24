@@ -1811,7 +1811,7 @@ assertEq(#revokedServe, 0, "a later removal does not attach a stale grant")
 reset(KINO)
 profile._lootLogs = {
     {
-        _author = "Other-Realm",
+        _author = OWNER,
         _counter = 4,
         _eventType = "ADMIN_ADDED",
         _data = { member = KINO },
@@ -1853,6 +1853,8 @@ local windowOnly = lastAuthLogs()
 assertTrue(windowOnly ~= nil, "ordinary NEED_LOGS still serves the requested window")
 assertTrue(not authLogHasGrant(windowOnly), "ordinary NEED_LOGS does not attach an out-of-range grant")
 sends = {}
+Sync.state.coordinator = KINO
+Sync.state.isCoordinator = true
 Sync:HandleNeedLogs(MEMBER, {
     sessionId = SESSION,
     profileId = PROFILE,
@@ -2124,6 +2126,184 @@ requestMissingGrant("grant-arrived")
 assertEq(sendCount(Sync.MSG.AUTH_LOGS), 1, "grant reply is sent after the row arrives")
 Sync._Now = originalGrantNow
 Sync._AppendAdminGrantEvidence = originalAppendGrant
+
+-- A bulk helper serves ranges without walking history for an arbitrary grant
+-- name. A correlated coordinator grant is scanned once for every range, and a
+-- repeat inside the request timeout does not scan again.
+;(function()
+reset(KINO)
+setAdmins({ KINO, OWNER, COORD })
+Sync.state.isCoordinator = false
+Sync.state.helpers = { KINO }
+Sync.state.coordinator = COORD
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 4,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = COORD },
+    },
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}
+local bulkScans = 0
+local originalBulkAppend = Sync._AppendAdminGrantEvidence
+Sync._AppendAdminGrantEvidence = function(self, out, grantProfile, member)
+    bulkScans = bulkScans + 1
+    return originalBulkAppend(self, out, grantProfile, member)
+end
+local function flushSyncTimers()
+    local pending = {}
+    for i = 1, #timers do
+        pending[i] = timers[i]
+        timers[i] = nil
+    end
+    for _, handle in ipairs(pending) do
+        if handle and not handle.cancelled and type(handle.fn) == "function" then
+            handle.fn()
+        end
+    end
+end
+local missingRanges = {}
+for i = 1, 8 do
+    missingRanges[i] = { author = "Author-Realm", fromCounter = i, toCounter = i }
+end
+local function countGrantPackets()
+    local n = 0
+    for _, sent in ipairs(sends) do
+        if sent.msgType == Sync.MSG.AUTH_LOGS and authLogHasGrant(sent) then
+            n = n + 1
+        end
+    end
+    return n
+end
+sends = {}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "bulk-stranger-grant",
+    adminGrantMember = "Other-Realm",
+    missing = missingRanges,
+})
+flushSyncTimers()
+assertEq(bulkScans, 0, "arbitrary adminGrantMember does not scan history on a bulk serve")
+assertEq(sendCount(Sync.MSG.AUTH_LOGS), 8, "bulk ranges are still served without a grant scan")
+assertEq(countGrantPackets(), 0, "arbitrary adminGrantMember is not attached to bulk replies")
+sends = {}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "bulk-helper-self-flag",
+    needsAdminGrant = true,
+    missing = {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 1 },
+    },
+})
+assertEq(bulkScans, 0, "needsAdminGrant does not scan when this client is not the coordinator")
+sends = {}
+bulkScans = 0
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "bulk-coordinator-grant",
+    adminGrantMember = COORD,
+    missing = missingRanges,
+})
+flushSyncTimers()
+assertEq(bulkScans, 1, "a coordinator grant on eight ranges scans history once")
+assertEq(sendCount(Sync.MSG.AUTH_LOGS), 8, "each requested bulk range is still served")
+assertEq(countGrantPackets(), 8, "each bulk range reply carries the one scanned grant")
+sends = {}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "bulk-coordinator-grant-repeat",
+    adminGrantMember = COORD,
+    missing = missingRanges,
+})
+flushSyncTimers()
+assertEq(bulkScans, 1, "a repeat bulk grant request does not scan again inside the timeout")
+assertEq(countGrantPackets(), 0, "a repeat inside the timeout does not attach the grant again")
+sends = {}
+Sync:HandleLogRequest(OWNER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "logreq-stranger-grant",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 1,
+    adminGrantMember = "Other-Realm",
+})
+assertEq(bulkScans, 1, "LOG_REQ with an arbitrary adminGrantMember does not scan history")
+assertTrue(not authLogHasGrant(lastAuthLogs()), "LOG_REQ does not attach an arbitrary grant")
+reset(COORD)
+setAdmins({ COORD, OWNER })
+Sync.state.isCoordinator = true
+Sync.state.coordinator = COORD
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 4,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = COORD },
+    },
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}
+bulkScans = 0
+sends = {}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "bulk-self-grant",
+    needsAdminGrant = true,
+    missing = missingRanges,
+})
+flushSyncTimers()
+assertEq(bulkScans, 1, "coordinator needsAdminGrant scans the stored self grant once for eight ranges")
+assertEq(countGrantPackets(), 8, "coordinator needsAdminGrant is attached to each range reply")
+sends = {}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "bulk-self-grant-repeat",
+    needsAdminGrant = true,
+    missing = {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 1 },
+    },
+})
+assertEq(bulkScans, 1, "a repeat coordinator needsAdminGrant does not scan again inside the timeout")
+Sync:HandleLogRequest(OWNER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "logreq-self-grant",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 1,
+    needsAdminGrant = true,
+})
+assertEq(bulkScans, 2, "LOG_REQ needsAdminGrant scans once for a different admin sender")
+assertTrue(authLogHasGrant(lastAuthLogs()), "coordinator LOG_REQ needsAdminGrant attaches the stored self grant")
+Sync:HandleLogRequest(OWNER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "logreq-self-grant-repeat",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 1,
+    needsAdminGrant = true,
+})
+assertEq(bulkScans, 2, "a repeat LOG_REQ needsAdminGrant does not scan again inside the timeout")
+Sync._AppendAdminGrantEvidence = originalBulkAppend
+end)()
 
 reset(MEMBER)
 setAdmins({ OWNER })

@@ -1019,6 +1019,13 @@ function Sync:HandleNeedLogs(sender, payload)
         enc = SF.SyncProtocol.PickBestBulkEncoding(payload.supportsEnc)
     end
 
+    -- One correlated grant scan for the whole packet. Each range reuses the row.
+    -- An arbitrary adminGrantMember never walks history.
+    local grantEvidence = nil
+    if self._AdminGrantEvidenceForRequest then
+        grantEvidence = self:_AdminGrantEvidenceForRequest(sender, profile, payload)
+    end
+
     for i, req in ipairs(payload.missing) do
         if i > maxRanges then break end
 
@@ -1055,10 +1062,8 @@ function Sync:HandleNeedLogs(sender, payload)
                     end
                 end
 
-                if payload.needsAdminGrant == true and self._AppendSelfAdminGrantEvidence then
-                    self:_AppendSelfAdminGrantEvidence(out, profile)
-                elseif type(payload.adminGrantMember) == "string" and self._AppendAdminGrantEvidence then
-                    self:_AppendAdminGrantEvidence(out, profile, payload.adminGrantMember)
+                if self._AttachAdminGrantEvidence then
+                    self:_AttachAdminGrantEvidence(out, grantEvidence)
                 end
 
                 local resp = {
@@ -1159,10 +1164,8 @@ function Sync:HandleLogRequest(sender, payload)
         end
     end
 
-    if payload.needsAdminGrant == true and self._AppendSelfAdminGrantEvidence then
-        self:_AppendSelfAdminGrantEvidence(out, profile)
-    elseif type(payload.adminGrantMember) == "string" and self._AppendAdminGrantEvidence then
-        self:_AppendAdminGrantEvidence(out, profile, payload.adminGrantMember)
+    if self._AdminGrantEvidenceForRequest and self._AttachAdminGrantEvidence then
+        self:_AttachAdminGrantEvidence(out, self:_AdminGrantEvidenceForRequest(sender, profile, payload))
     end
 
     local resp = {

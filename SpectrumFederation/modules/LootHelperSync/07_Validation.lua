@@ -1051,6 +1051,83 @@ function Sync:_AppendSelfAdminGrantEvidence(out, profile)
     self:_AppendAdminGrantEvidence(out, profile, self:_SelfId())
 end
 
+-- Function Copy one already-scanned grant into a reply unless that row is present.
+-- @param out table Response log list
+-- @param grant table|nil
+-- @return nil
+function Sync:_AttachAdminGrantEvidence(out, grant)
+    if type(out) ~= "table" or type(grant) ~= "table" then return end
+    for _, existing in ipairs(out) do
+        if self:_SameLogTable(existing, grant) then return end
+    end
+    out[#out + 1] = grant
+end
+
+-- Function The member whose grant this request may attach, or nil.
+-- needsAdminGrant is only asked of the current coordinator and names that client.
+-- adminGrantMember is only the current coordinator, and only when this client
+-- may serve that grant. Any other name is ignored before history is read.
+-- @param payload table|nil
+-- @return string|nil
+function Sync:_AdminGrantMemberForRequest(payload)
+    if type(payload) ~= "table" or not self.state then return nil end
+    if payload.needsAdminGrant == true then
+        local selfId = self:_SelfId()
+        local coordinator = self.state.coordinator
+        if type(selfId) ~= "string" or selfId == "" then return nil end
+        if type(coordinator) ~= "string" or not self:_SamePlayer(selfId, coordinator) then
+            return nil
+        end
+        return selfId
+    end
+    local member = payload.adminGrantMember
+    if type(member) ~= "string" or member == "" then return nil end
+    if not (self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)) then
+        return nil
+    end
+    return member
+end
+
+-- Function One grant row for this request, scanned at most once per timeout.
+-- Callers attach the returned row to every range they serve. A repeat inside
+-- the request timeout, a miss, and more than four sent replies do not walk
+-- history again. A name this client may not serve does not walk history at all.
+-- @param sender string "Name-Realm"
+-- @param profile table
+-- @param payload table|nil
+-- @return table|nil
+function Sync:_AdminGrantEvidenceForRequest(sender, profile, payload)
+    if type(profile) ~= "table" then return nil end
+    local member = self:_AdminGrantMemberForRequest(payload)
+    if type(member) ~= "string" then return nil end
+    if not (self._AdminGrantServeAllowed and self:_AdminGrantServeAllowed(sender, member)) then
+        return nil
+    end
+    if type(payload) == "table" and payload.needsAdminGrant == true then
+        if not (self._LocalCatchUpGrantStored and self:_LocalCatchUpGrantStored(member)) then
+            if self._NoteAdminGrantMiss then
+                self:_NoteAdminGrantMiss(sender, member)
+            end
+            return nil
+        end
+    end
+    local out = {}
+    if self._AppendAdminGrantEvidence then
+        self:_AppendAdminGrantEvidence(out, profile, member)
+    end
+    local grant = out[1]
+    if type(grant) ~= "table" then
+        if self._NoteAdminGrantMiss then
+            self:_NoteAdminGrantMiss(sender, member)
+        end
+        return nil
+    end
+    if self._NoteAdminGrantServe then
+        self:_NoteAdminGrantServe(sender, member)
+    end
+    return grant
+end
+
 -- Function Catch-up snapshots must prove the sender's grant from local history.
 -- Empty history is not proof. The establishing grant must already be stored,
 -- authored by someone this profile authorizes, and must name the same member.
