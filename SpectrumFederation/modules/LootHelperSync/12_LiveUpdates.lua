@@ -398,6 +398,65 @@ function Sync:BroadcastNewLog(profileId, logTable)
     return true, nil
 end
 
+-- Function Warn once while this sender remains unauthorized for the session profile.
+-- Later packets stay in debug until authorization changes.
+-- @param sender string
+-- @param profileId string
+-- @return nil
+function Sync:_WarnUnauthorizedNewLog(sender, profileId)
+    local sessionId = (self.state and self.state.sessionId) or ""
+    local key = tostring(sessionId) .. "\0" .. tostring(profileId) .. "\0" .. tostring(sender)
+    self.state._newLogUnauthorizedWarned = self.state._newLogUnauthorizedWarned or {}
+    if self.state._newLogUnauthorizedWarned[key] then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Rejecting NEW_LOG from %s for profile %s: not an admin.",
+                tostring(sender), tostring(profileId))
+        end
+        return
+    end
+    self.state._newLogUnauthorizedWarned[key] = true
+    if SF.PrintWarning then
+        SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
+    end
+end
+
+-- Function Allow a later revocation to warn again after this sender is authorized.
+-- @param sender string
+-- @param profileId string
+-- @return nil
+function Sync:_ClearUnauthorizedNewLogWarning(sender, profileId)
+    local warned = self.state and self.state._newLogUnauthorizedWarned
+    if type(warned) ~= "table" then return end
+    local sessionId = (self.state and self.state.sessionId) or ""
+    local key = tostring(sessionId) .. "\0" .. tostring(profileId) .. "\0" .. tostring(sender)
+    warned[key] = nil
+end
+
+-- Function Drop NEW_LOG warning markers for senders who are admins again.
+-- Reconciliation sees the re-grant even when that player sent nothing.
+-- @param profileId string
+-- @return nil
+function Sync:_ClearAuthorizedNewLogWarnings(profileId)
+    local warned = self.state and self.state._newLogUnauthorizedWarned
+    if type(warned) ~= "table" then return end
+    if type(profileId) ~= "string" or profileId == "" then return end
+    local sessionId = (self.state and self.state.sessionId) or ""
+    local prefix = tostring(sessionId) .. "\0" .. tostring(profileId) .. "\0"
+    local prefixLen = #prefix
+    local clear = {}
+    for key in pairs(warned) do
+        if type(key) == "string" and key:sub(1, prefixLen) == prefix then
+            local sender = key:sub(prefixLen + 1)
+            if sender ~= "" and self:IsSenderAuthorized(profileId, sender) then
+                clear[#clear + 1] = key
+            end
+        end
+    end
+    for i = 1, #clear do
+        warned[clear[i]] = nil
+    end
+end
+
 -- Function Handle NEW_LOG message; dedupe/apply and request gaps if needed.
 -- @param sender string "Name-Realm" of sender
 -- @param payload table Decoded message payload
@@ -478,11 +537,10 @@ function Sync:HandleNewLog(sender, payload)
             return
         end
         if not self:IsSenderAuthorized(profileId, sender) then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
-            end
+            self:_WarnUnauthorizedNewLog(sender, profileId)
             return
         end
+        self:_ClearUnauthorizedNewLogWarning(sender, profileId)
         local ready, missing, hasPredGap, predFrom, predTo = self:_LiveRelationshipPredecessorState(profileId, logTable)
         if not ready then
             self:_QueuePendingLiveRelationship(profileId, sender, logTable)
@@ -508,13 +566,13 @@ function Sync:HandleNewLog(sender, payload)
             end
             return
         end
-    elseif not isRelationship and not self:_SamePlayer(sender, self.state.coordinator) then
+    elseif not isRelationship then
+        -- Coordinator routing does not bypass canonical admin authorization.
         if not self:IsSenderAuthorized(profileId, sender) then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
-            end
+            self:_WarnUnauthorizedNewLog(sender, profileId)
             return
         end
+        self:_ClearUnauthorizedNewLogWarning(sender, profileId)
     end
     
     -- Dedupe by logId
@@ -636,9 +694,24 @@ function Sync:HandleNewLog(sender, payload)
         needsRebuild = not Identity.CanFanOutBalance(eventType)
     end
     if needsRebuild then
+        -- Stay on live_update so a gapped removal does not schedule identity
+        -- reconcile or purge every advertiser missing from the replayed admin list.
         self:RebuildProfile(profileId, "live_update")
     elseif SF.LootHelperEvents and SF.LootHelperEvents.NotifyDataChanged then
         SF.LootHelperEvents:NotifyDataChanged("SYNC:LIVE", { profileId = profileId })
+    end
+    -- Rebuild reconcile already ran against the replayed admin list and
+    -- deferred role changes. A live ADMIN_REMOVED or ROLE_CHANGE to member
+    -- names one player. Drop that player only when the rebuilt profile no
+    -- longer lists them, then apply that revocation without a takeover.
+    if type(memberId) == "string" and memberId ~= ""
+        and self._LogAdminGrantState and self:_LogAdminGrantState(logTable, memberId) == "revoke"
+        and self._DropLiveRemovedAdminStatus
+    then
+        self:_DropLiveRemovedAdminStatus(profileId, memberId)
+        if self._ApplyExplicitRevocationRouting then
+            self:_ApplyExplicitRevocationRouting("live_admin_removed")
+        end
     end
     self:FlushPendingLiveRelationshipLogs(profileId)
     self:LogSessionPointsSummary(profileId, "live_update")

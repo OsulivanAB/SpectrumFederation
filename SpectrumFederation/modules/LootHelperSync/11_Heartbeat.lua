@@ -21,6 +21,9 @@ function Sync:HandleSessionStart(sender, payload)
     if not self:_SamePlayer(sender, payload.coordinator) then
         return
     end
+    if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
+        return
+    end
 
     local incomingEpoch = payload.coordEpoch
     local incomingCoord = payload.coordinator
@@ -43,21 +46,46 @@ function Sync:HandleSessionStart(sender, payload)
         end
     end
 
+    -- Same-profile history that ends in removal rejects the new session id
+    -- before reset. Reset would drop the tombstone and then rebuild.
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
+        return
+    end
+    if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
+        return
+    end
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator, payload.profileId) then
+        return
+    end
+
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
+    local oldCoord = self.state.coordinator
 
-    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor
+    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor.
+    -- A profile change inside that reset, or without a session-id change, drops the old revocation scope.
     if oldSid and oldSid ~= payload.sessionId then
+        if self._RememberUnprovenCatchUpRelease then
+            self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+        end
         self:_ResetSessionState("session_changed")
+    elseif self._ClearRevocationForIncomingScope then
+        self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
     end
 
     self.state.active = true
     self.state.sessionId = payload.sessionId
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+    end
     self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
     self.state._sessionDescriptorAt = self:_Now()
+    if self._NoteAdvertisedCoordinator then
+        self:_NoteAdvertisedCoordinator(payload.coordinator)
+    end
     self:_PersistSessionState("HandleSessionStart")
 
     if type(payload.safeMode) == "table" then
@@ -82,7 +110,11 @@ function Sync:HandleSessionStart(sender, payload)
     end
 
     if type(payload.helpers) == "table" then
-        self.state.helpers = payload.helpers
+        if self.ApplyAdvertisedHelpers then
+            self:ApplyAdvertisedHelpers(payload.helpers, "session_start")
+        else
+            self.state.helpers = payload.helpers
+        end
     else
         self.state.helpers = {}
     end
@@ -119,8 +151,15 @@ function Sync:HandleSessionStart(sender, payload)
 
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
-    hb.lastCoordMessageAt = self:_Now()
-    hb.missedHeartbeats = 0
+    if self._RememberCoordinatorKeepalive then
+        self:_RememberCoordinatorKeepalive(
+            self.state.coordinator,
+            self:_CoordinatorKeepaliveBaseline(oldSid, payload.sessionId, oldCoord, self.state.coordinator)
+        )
+    else
+        hb.lastCoordMessageAt = self:_Now()
+        hb.missedHeartbeats = 0
+    end
     hb.lastTakeoverRound = nil
 
     self:EnsureHeartbeatMonitor("HandleSessionStart")
@@ -159,6 +198,12 @@ function Sync:HandleSessionEnd(sender, payload)
     if not self:IsControlMessageAllowed(payload, sender) then
         return        
     end
+    if self._IgnoreRevokedCoordinatorControl
+        and not (self._OwnerlessRevokedCoordinatorEnd and self:_OwnerlessRevokedCoordinatorEnd(sender, payload.coordinator))
+        and self:_IgnoreRevokedCoordinatorControl(sender, payload.coordinator)
+    then
+        return
+    end
 
     local reason = payload.reason
 
@@ -193,13 +238,17 @@ end
 -- @param opts table|nil { preferCoordinatorFirst=bool, preferredTarget=string }
 -- @return table targets Ordered list of targets "Name-Realm" to try
 function Sync:GetRequestTargets(helpers, coordinator, opts)
+    if self._CapUniqueHelpers then
+        helpers = self:_CapUniqueHelpers(helpers)
+    end
     local targets, seen = {}, {}
     
     local function add(t)
-        if type(t) == "string" and t ~= "" and not seen[t] then
-            seen[t] = true
-            table.insert(targets, t)
-        end
+        if type(t) ~= "string" or t == "" then return end
+        local key = (self._PlayerIdentityKey and self:_PlayerIdentityKey(t)) or t
+        if seen[key] then return end
+        seen[key] = true
+        table.insert(targets, t)
     end
 
     -- Simplify: no need for redundant conditional assignment
@@ -251,6 +300,31 @@ function Sync:GetRequestTargets(helpers, coordinator, opts)
     return targets
 end
 
+-- Function Warn once while this session has no profile or log route.
+-- The same empty-target condition can be observed from every NEW_LOG or repair pass.
+-- @param flag string State field holding the session id already warned
+-- @param message string
+-- @return nil
+function Sync:_WarnMissingRouteOnce(flag, message)
+    local sessionId = self.state and self.state.sessionId
+    if type(flag) ~= "string" or type(sessionId) ~= "string" or sessionId == "" then
+        if SF.PrintWarning and type(message) == "string" then
+            SF:PrintWarning(message)
+        end
+        return
+    end
+    if self.state[flag] == sessionId then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Suppressed repeat missing-route warning: %s", tostring(message))
+        end
+        return
+    end
+    self.state[flag] = sessionId
+    if SF.PrintWarning and type(message) == "string" then
+        SF:PrintWarning(message)
+    end
+end
+
 -- Function Request profile snapshot from helpers (preferred) or coordinator (fallback).
 -- @param reason string Reason for request (for logging)
 -- @return boolean True if request was registered, false otherwise
@@ -264,14 +338,15 @@ function Sync:RequestProfileSnapshot(reason)
         return false
     end
 
-    -- Build ordered target list: helpers first, coordinator fallback
-    local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    -- Build ordered target list: helpers first, coordinator fallback.
+    -- Once the profile is local, drop targets who are no longer canonical admins.
+    local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
+        or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
     if not targets or #targets == 0 then
-        if SF.PrintWarning then
-            SF:PrintWarning("Cannot request profile: no targets available")
-        end
+        self:_WarnMissingRouteOnce("_noProfileTargetWarnedFor", "Cannot request profile: no targets available")
         return false
     end
+    self.state._noProfileTargetWarnedFor = nil
 
     local requestId = self:NewRequestId()
     local ok = self:RegisterRequest(requestId, "NEED_PROFILE", targets[1], {
@@ -341,13 +416,13 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
                     preferredTarget = preferredTarget,
                 }
             end
-            local targets = self:GetRequestTargets(self.state.helpers, self.state.coordinator, targetOpts)
+            local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets(targetOpts))
+                or self:GetRequestTargets(self.state.helpers, self.state.coordinator, targetOpts)
             if not targets or #targets == 0 then
-                if SF.PrintWarning then
-                    SF:PrintWarning("Cannot request missing logs: no targets available")
-                end
+                self:_WarnMissingRouteOnce("_noLogTargetWarnedFor", "Cannot request missing logs: no targets available")
                 return count > 0
             end
+            self.state._noLogTargetWarnedFor = nil
 
             local requestId = self:NewRequestId()
             local ok = self:RegisterRequest(requestId, "NEED_LOGS", targets[1], self:_CopyExpectedWindowEvidence(range, {

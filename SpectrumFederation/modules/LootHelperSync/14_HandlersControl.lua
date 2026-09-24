@@ -244,6 +244,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     if not self:_SamePlayer(sender, payload.coordinator) then
         return
     end
+    if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
+        return
+    end
 
     -- If we're in a different session, require strictly newer epoch
     if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
@@ -256,6 +259,15 @@ function Sync:HandleSessionReannounce(sender, payload)
             return
         end
     end
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
+        return
+    end
+    if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
+        return
+    end
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator, payload.profileId) then
+        return
+    end
 
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
@@ -263,18 +275,29 @@ function Sync:HandleSessionReannounce(sender, payload)
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
 
-    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor
+    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor.
     if oldSid and oldSid ~= payload.sessionId then
+        if self._RememberUnprovenCatchUpRelease then
+            self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+        end
         self:_ResetSessionState("session_changed")
+    elseif self._ClearRevocationForIncomingScope then
+        self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
     end
 
     self.state.active = true
     self.state.sessionId = payload.sessionId
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+    end
     self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
     self.state._sessionDescriptorAt = self:_Now()
+    if self._NoteAdvertisedCoordinator then
+        self:_NoteAdvertisedCoordinator(payload.coordinator)
+    end
     self:_PersistSessionState("HandleSessionReannounce")
 
     if type(payload.safeMode) == "table" then
@@ -294,7 +317,11 @@ function Sync:HandleSessionReannounce(sender, payload)
         self.state.authorMax = (type(payload.authorMax) == "table") and payload.authorMax or {}
     end
     self.state.authorWindowSummary = (type(payload.authorWindowSummary) == "table") and payload.authorWindowSummary or {}
-    self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
+    if self.ApplyAdvertisedHelpers then
+        self:ApplyAdvertisedHelpers((type(payload.helpers) == "table") and payload.helpers or {}, "session_reannounce")
+    else
+        self.state.helpers = (type(payload.helpers) == "table") and payload.helpers or {}
+    end
     if self._RememberAdvertisedRCConfigGeneration then
         self:_RememberAdvertisedRCConfigGeneration(payload)
     end
@@ -304,8 +331,15 @@ function Sync:HandleSessionReannounce(sender, payload)
 
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
-    hb.lastCoordMessageAt = self:_Now()
-    hb.missedHeartbeats = 0
+    if self._RememberCoordinatorKeepalive then
+        self:_RememberCoordinatorKeepalive(
+            self.state.coordinator,
+            self:_CoordinatorKeepaliveBaseline(oldSid, payload.sessionId, oldCoord, self.state.coordinator)
+        )
+    else
+        hb.lastCoordMessageAt = self:_Now()
+        hb.missedHeartbeats = 0
+    end
     hb.lastTakeoverRound = nil
 
     self:EnsureHeartbeatMonitor("HandleSessionReannounce")
@@ -350,6 +384,11 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         end
         return
     end
+    -- A coordinator this client already removed must not refresh the takeover
+    -- timer or reapply its descriptor. A later re-grant clears that revocation.
+    if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
+        return
+    end
 
     -- Epoch gating:
     -- - If different sessionId, accept only if strictly newer epoch
@@ -371,6 +410,15 @@ function Sync:HandleSessionHeartbeat(sender, payload)
             return
         end
     end
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
+        return
+    end
+    if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
+        return
+    end
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator, payload.profileId) then
+        return
+    end
 
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
@@ -379,7 +427,12 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     local oldEpoch = self.state.coordEpoch
 
     if oldSid and oldSid ~= payload.sessionId then
+        if self._RememberUnprovenCatchUpRelease then
+            self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+        end
         self:_ResetSessionState("session_changed")
+    elseif self._ClearRevocationForIncomingScope then
+        self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
     end
 
     if type(payload.safeMode) == "table" then
@@ -425,10 +478,16 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     -- We want to keep this lightweight, so we will not touch handshake bookkeeping
     self.state.active   = true
     self.state.sessionId = payload.sessionId
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+    end
     self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
+    if self._NoteAdvertisedCoordinator then
+        self:_NoteAdvertisedCoordinator(payload.coordinator)
+    end
     if not sameStream then
         self.state._sessionDescriptorAt = self:_Now()
         self:_PersistSessionState("HandleSessionHeartbeat")
@@ -440,9 +499,14 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleSessionHeartbeat")
     end
 
-    -- Keep helper list + authorMax current
+    -- Keep helper list + authorMax current. Helper-only changes must retarget
+    -- outstanding requests even when session, coordinator, and epoch are unchanged.
     if type(payload.helpers) == "table" then
-        self.state.helpers = payload.helpers
+        if self.ApplyAdvertisedHelpers then
+            self:ApplyAdvertisedHelpers(payload.helpers, "heartbeat")
+        else
+            self.state.helpers = payload.helpers
+        end
     end
     if type(payload.authorMax) == "table" then
         -- Exact-key max only: retain local NEW_LOG progress and previously
@@ -469,12 +533,20 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         self:_ApplyAdvertisedRCConfig(payload)
     end
 
-    -- Heartbeat bookkeeping
+    -- Heartbeat bookkeeping. An unproven catch-up coordinator does not extend
+    -- the takeover clock after the descriptor that adopted them.
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
-    hb.lastHeartbeatAt = self:_Now()
-    hb.lastCoordMessageAt = self:_Now()
-    hb.missedHeartbeats = 0
+    if self._RememberCoordinatorKeepalive then
+        self:_RememberCoordinatorKeepalive(
+            self.state.coordinator,
+            self:_CoordinatorKeepaliveBaseline(oldSid, payload.sessionId, oldCoord, self.state.coordinator)
+        )
+    else
+        hb.lastHeartbeatAt = self:_Now()
+        hb.lastCoordMessageAt = self:_Now()
+        hb.missedHeartbeats = 0
+    end
 
     self:EnsureHeartbeatMonitor("HandleSessionHeartbeat")
     self:EnsureRepairConvergence("HandleSessionHeartbeat")
@@ -592,6 +664,9 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     if not self:_SamePlayer(sender, payload.coordinator) then
         return
     end
+    if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
+        return
+    end
 
     -- If we're in a different active session, only accept if epoch is strictly newer
     if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
@@ -604,18 +679,43 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     if not self:IsControlMessageAllowed(payload, sender) then
         return
     end
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
+        return
+    end
+    if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
+        return
+    end
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator, payload.profileId) then
+        return
+    end
 
     local wasCoordinator = (self.state.isCoordinator == true)
 
+    local oldSid = self.state.sessionId
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
+    -- A different session clears catch-up inside the scope reset. Record the
+    -- unproven coordinator first, or that reset hides the failure and a later
+    -- higher epoch can adopt them again.
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+    end
+    if self._ClearRevocationForIncomingScope then
+        self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
+    end
 
     self.state.active = true
     self.state.sessionId = payload.sessionId
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
+    end
     self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
+    if self._NoteAdvertisedCoordinator then
+        self:_NoteAdvertisedCoordinator(payload.coordinator)
+    end
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
@@ -628,8 +728,15 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
-    hb.lastCoordMessageAt = self:_Now()
-    hb.missedHeartbeats = 0
+    if self._RememberCoordinatorKeepalive then
+        self:_RememberCoordinatorKeepalive(
+            self.state.coordinator,
+            self:_CoordinatorKeepaliveBaseline(oldSid, payload.sessionId, oldCoord, self.state.coordinator)
+        )
+    else
+        hb.lastCoordMessageAt = self:_Now()
+        hb.missedHeartbeats = 0
+    end
     hb.lastTakeoverRound = nil
 
     self:EnsureHeartbeatMonitor("HandleSessionStart")
@@ -715,7 +822,8 @@ function Sync:HandleNeedProfile(sender, payload)
         return false, "safe mode (bulk disabled)"
     end
 
-    -- Serve eligibility: coordinator OR helper
+    -- Serve eligibility: coordinator or helper. A missed grant is a log reply,
+    -- not a reason for a non-helper admin to export the profile.
     if not self.state.active then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedProfile: no active session (sender=%s)", tostring(sender))
@@ -729,7 +837,8 @@ function Sync:HandleNeedProfile(sender, payload)
         return
     end
     
-    -- Verify we're still authorized for this profile (Issue #9 fix)
+    -- Verify we're still authorized for this profile (Issue #9 fix).
+    -- Cached coordinator/helper role is not an authorization grant.
     if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Not authorized to serve profile (no longer admin)")
@@ -773,6 +882,7 @@ function Sync:HandleNeedProfile(sender, payload)
     self:RunWithJitter(0, 250, function()
         if not self.state.active then return end
         if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
+        if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
         if not SF.LootHelperComm then return end
 
         if enc then
@@ -836,16 +946,26 @@ function Sync:HandleNeedLogs(sender, payload)
         return false, "safe mode (bulk disabled)"
     end
 
-    -- Serve eligibility: coordinator OR helper
+    -- Serve eligibility: coordinator, helper, or an admin asked for a missed grant.
     if not self.state.active then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedLogs: no active session (sender=%s)", tostring(sender))
         end
         return
     end
-    if not (self.state.isCoordinator or self:IsSelfHelper()) then
+    local grantServe = self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)
+    local bulkServe = (self.state.isCoordinator or self:IsSelfHelper()) and true or false
+    if not (bulkServe or grantServe) then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedLogs: not coordinator/helper (sender=%s)", tostring(sender))
+        end
+        return
+    end
+    -- Cached helper/coordinator role must not keep serving after admin revocation.
+    if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "HandleNeedLogs: not authorized to serve logs (no longer admin, sender=%s)",
+                tostring(sender))
         end
         return
     end
@@ -860,10 +980,68 @@ function Sync:HandleNeedLogs(sender, payload)
         return
     end
 
-    if type(payload) ~= "table" or type(payload.missing) ~= "table" then return end
-
     local profile = self:FindLocalProfileById(self.state.profileId)
     if not profile then return end
+
+    -- Non-helpers answer a coordinator-grant request with that one row.
+    -- They do not scan or return the caller's missing ranges.
+    if not bulkServe then
+        local member = payload.adminGrantMember
+        if not (self._AdminGrantServeAllowed and self:_AdminGrantServeAllowed(sender, member)) then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "HandleNeedLogs: grant reply already served to %s", tostring(sender))
+            end
+            return
+        end
+        -- HandleAuthLogs checks these fields against the request before it
+        -- accepts an out-of-range grant row. Echo the requested range.
+        local reqRange = type(payload.missing) == "table" and payload.missing[1] or nil
+        if type(reqRange) ~= "table"
+            or type(reqRange.author) ~= "string" or reqRange.author == ""
+            or type(reqRange.fromCounter) ~= "number"
+            or type(reqRange.toCounter) ~= "number"
+        then
+            return
+        end
+        local out = {}
+        if self._AppendAdminGrantEvidence then
+            self:_AppendAdminGrantEvidence(out, profile, member)
+        end
+        local grant = out[1]
+        if type(grant) ~= "table" then
+            if self._NoteAdminGrantMiss then
+                self:_NoteAdminGrantMiss(sender, member)
+            end
+            return
+        end
+        if not SF.LootHelperComm then return end
+        if self._NoteAdminGrantServe then
+            self:_NoteAdminGrantServe(sender, member)
+        end
+        local resp = {
+            sessionId   = self.state.sessionId,
+            profileId   = self.state.profileId,
+            author      = reqRange.author,
+            fromCounter = reqRange.fromCounter,
+            toCounter   = reqRange.toCounter,
+            logs        = out,
+        }
+        if type(payload.requestId) == "string" and payload.requestId ~= "" then
+            resp.requestId = payload.requestId
+        end
+        local grantEnc = nil
+        if SF.SyncProtocol and SF.SyncProtocol.PickBestBulkEncoding then
+            grantEnc = SF.SyncProtocol.PickBestBulkEncoding(payload.supportsEnc)
+        end
+        if grantEnc then
+            SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK", { enc = grantEnc })
+        else
+            SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK")
+        end
+        return
+    end
+
+    if type(payload.missing) ~= "table" then return end
 
     local serveRole = self.state.isCoordinator and "coordinator" or "helper"
     if SF.Debug then
@@ -878,6 +1056,13 @@ function Sync:HandleNeedLogs(sender, payload)
     local enc = nil
     if SF.SyncProtocol and SF.SyncProtocol.PickBestBulkEncoding then
         enc = SF.SyncProtocol.PickBestBulkEncoding(payload.supportsEnc)
+    end
+
+    -- One correlated grant scan for the whole packet. Each range reuses the row.
+    -- An arbitrary adminGrantMember never walks history.
+    local grantEvidence = nil
+    if self._AdminGrantEvidenceForRequest then
+        grantEvidence = self:_AdminGrantEvidenceForRequest(sender, profile, payload)
     end
 
     for i, req in ipairs(payload.missing) do
@@ -897,6 +1082,7 @@ function Sync:HandleNeedLogs(sender, payload)
             self:RunAfter(delay, function()
                 if not self.state.active then return end
                 if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
+                if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
                 if not SF.LootHelperComm then return end
 
                 -- Build inside callback to spread CPU cost too
@@ -913,6 +1099,10 @@ function Sync:HandleNeedLogs(sender, payload)
                             table.insert(out, log)
                         end
                     end
+                end
+
+                if self._AttachAdminGrantEvidence then
+                    self:_AttachAdminGrantEvidence(out, grantEvidence)
                 end
 
                 local resp = {
@@ -971,6 +1161,14 @@ function Sync:HandleLogRequest(sender, payload)
         end
         return
     end
+    -- The responder must still be an admin. Requester authorization is not enough.
+    if not self:IsSenderAuthorized(payload.profileId, self:_SelfId()) then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "HandleLogRequest: responder no longer authorized (self=%s, profileId=%s)",
+                tostring(self:_SelfId()), tostring(payload.profileId))
+        end
+        return
+    end
 
     local profile = self:FindLocalProfileById(payload.profileId)
     if not profile then
@@ -1003,6 +1201,10 @@ function Sync:HandleLogRequest(sender, payload)
                 table.insert(out, log)
             end
         end
+    end
+
+    if self._AdminGrantEvidenceForRequest and self._AttachAdminGrantEvidence then
+        self:_AttachAdminGrantEvidence(out, self:_AdminGrantEvidenceForRequest(sender, profile, payload))
     end
 
     local resp = {
@@ -1057,6 +1259,9 @@ function Sync:HandleSafeModeSet(sender, payload)
 
     -- Anti-spoof: must come from coordinator
     if not self:_SamePlayer(sender, payload.coordinator) then return end
+    if self._IgnoreRevokedCoordinatorControl and self:_IgnoreRevokedCoordinatorControl(sender, payload.coordinator) then
+        return
+    end
 
     -- Epoch gating
     if not self:IsControlMessageAllowed(payload, sender) then return end
@@ -1187,6 +1392,9 @@ function Sync:HandleRCConfigSet(sender, payload)
         return
     end
     if not self:_SamePlayer(sender, self.state.coordinator) then
+        return
+    end
+    if self._IgnoreRevokedCoordinatorControl and self:_IgnoreRevokedCoordinatorControl(sender, self.state.coordinator) then
         return
     end
     if type(payload.coordinator) == "string" and payload.coordinator ~= "" then
@@ -1328,6 +1536,9 @@ function Sync:HandleRaidCheckItemLevelSet(sender, payload)
         return
     end
     if not self:_SamePlayer(sender, self.state.coordinator) then
+        return
+    end
+    if self._IgnoreRevokedCoordinatorControl and self:_IgnoreRevokedCoordinatorControl(sender, self.state.coordinator) then
         return
     end
     if not self:IsControlMessageAllowed(payload, sender) then

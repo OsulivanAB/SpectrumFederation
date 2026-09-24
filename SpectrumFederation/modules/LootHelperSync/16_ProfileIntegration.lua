@@ -2084,6 +2084,10 @@ function Sync:RebuildProfile(profileId, reason)
         self:ScheduleIdentityAdminReconcile(profileId)
     end
 
+    if self.ReconcileSessionAuthorization then
+        self:ReconcileSessionAuthorization(profileId, "rebuild:" .. rebuildReason)
+    end
+
     return true, nil
 end
 
@@ -2448,6 +2452,9 @@ function Sync:ConsiderIdentityAdminSideEffects(profileId)
     local profile = self:FindLocalProfileById(profileId)
     if profile and profile.ReconcileIdentityAdmins then
         profile:ReconcileIdentityAdmins()
+    end
+    if self.ReconcileSessionAuthorization then
+        self:ReconcileSessionAuthorization(profileId, "identity_admin_reconcile")
     end
     finish()
 end
@@ -2953,6 +2960,15 @@ function Sync:_SendLogReq(req, target)
         exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
         integrityRepair = meta.integrityRepair == true or nil,
     }
+    local grantFields = self._CatchUpRequestGrantFields and self:_CatchUpRequestGrantFields(target) or nil
+    if type(grantFields) == "table" then
+        if grantFields.needsAdminGrant then
+            payload.needsAdminGrant = true
+        end
+        if type(grantFields.adminGrantMember) == "string" then
+            payload.adminGrantMember = grantFields.adminGrantMember
+        end
+    end
 
     return SF.LootHelperComm:Send(
         "CONTROL",
@@ -3044,16 +3060,22 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
     self:_BindSessionWindowEvidence(ranges)
 
     local targets = nil
+    if type(preferredTarget) == "string" and preferredTarget ~= ""
+        and self._PreferredRepairTargetRoutable
+        and not self:_PreferredRepairTargetRoutable(preferredTarget)
+    then
+        preferredTarget = nil
+    end
     if type(preferredTarget) == "string" and preferredTarget ~= "" then
         targets = { preferredTarget }
-    elseif self.state.isCoordinator then
-        return false
     else
-        local coord = self.state.coordinator
-        if type(coord) ~= "string" or coord == "" then
+        -- The preferred advertiser is not a current route. Ask whoever is
+        -- still authorized instead of a revoked or unproven coordinator.
+        local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
+        if type(routes) ~= "table" or #routes == 0 then
             return false
         end
-        targets = { coord }
+        targets = routes
     end
 
     local supportsEnc =

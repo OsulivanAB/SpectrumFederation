@@ -37,6 +37,18 @@ function Sync:BroadcastSessionHeartbeat(opts)
     if type(sid) ~= "string" or sid == "" then return false end 
     if type(profileId) ~= "string" or profileId == "" then return false end
 
+    -- A revoked admin must not keep the session alive by heartbeating as coordinator.
+    if self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown()
+        and not self:IsSenderAuthorized(profileId, self:_SelfId())
+    then
+        if self.RelinquishUnauthorizedCoordination then
+            self:RelinquishUnauthorizedCoordination("heartbeat_not_authorized")
+        elseif self.StopHeartbeatSender then
+            self:StopHeartbeatSender("heartbeat_not_authorized")
+        end
+        return false
+    end
+
     -- Keep authorMax fresh so reconnecting clients can catch up, without
     -- lowering a previously advertised raw spelling or copying a logical
     -- maximum onto a different historical alias.
@@ -96,6 +108,12 @@ function Sync:_ShouldRunHeartbeatSender()
     local pid = self.state.profileId
     if type(sid) ~= "string" or sid == "" then return false end
     if type(pid) ~= "string" or pid == "" then return false end
+
+    if self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown()
+        and not self:IsSenderAuthorized(pid, self:_SelfId())
+    then
+        return false
+    end
 
     -- Gate: don't heartbeat during admin convergence before the session is announced
     if self.state._sessionAnnounced ~= sid then return false end

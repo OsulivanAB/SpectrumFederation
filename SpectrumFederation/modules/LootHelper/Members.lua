@@ -118,6 +118,171 @@ local function AddLootLogToActiveProfile(logEntry, opts)
     return false
 end
 
+local function SameMemberId(a, b)
+    if type(a) ~= "string" or type(b) ~= "string" then return false end
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+    return a == b
+end
+
+local function ProfileOwnerId(profile)
+    if type(profile) ~= "table" then return nil end
+    if type(profile.GetOwnerId) == "function" then
+        return profile:GetOwnerId()
+    end
+    return profile._owner
+end
+
+local function LogNumber(log, getter, field)
+    if type(log) ~= "table" then return 0 end
+    local value = log[field]
+    if type(log[getter]) == "function" then
+        value = log[getter](log)
+    end
+    return tonumber(value) or 0
+end
+
+local function LogText(log, getter, field)
+    if type(log) ~= "table" then return "" end
+    local value = log[field]
+    if type(log[getter]) == "function" then
+        value = log[getter](log)
+    end
+    if value == nil then return "" end
+    return tostring(value)
+end
+
+-- Same order as LootProfile:_CompareLogs: timestamp, author, counter, id.
+local function CompareHistoryLogs(a, b)
+    local aTime = LogNumber(a, "GetTimestamp", "_timestamp")
+    local bTime = LogNumber(b, "GetTimestamp", "_timestamp")
+    if aTime ~= bTime then
+        return aTime < bTime
+    end
+    local aAuthor = LogText(a, "GetAuthor", "_author")
+    local bAuthor = LogText(b, "GetAuthor", "_author")
+    if aAuthor ~= bAuthor then
+        return aAuthor < bAuthor
+    end
+    local aCounter = LogNumber(a, "GetCounter", "_counter")
+    local bCounter = LogNumber(b, "GetCounter", "_counter")
+    if aCounter ~= bCounter then
+        return aCounter < bCounter
+    end
+    return LogText(a, "GetID", "_id") < LogText(b, "GetID", "_id")
+end
+
+local function LogEventData(log)
+    if type(log) ~= "table" then return nil end
+    if type(log.GetEventData) == "function" then
+        local data = log:GetEventData()
+        if type(data) == "table" then
+            return data
+        end
+    end
+    if type(log._data) == "table" then
+        return log._data
+    end
+    return nil
+end
+
+local function HistoryAdminEffect(log, memberId)
+    local data = LogEventData(log)
+    if type(data) ~= "table" or type(data.member) ~= "string" then return nil end
+    if not SameMemberId(data.member, memberId) then return nil end
+    local eventType = LogText(log, "GetEventType", "_eventType")
+    local types = SF.LootLogEventTypes or {}
+    local added = types.ADMIN_ADDED or "ADMIN_ADDED"
+    local removed = types.ADMIN_REMOVED or "ADMIN_REMOVED"
+    local roleChange = types.ROLE_CHANGE or "ROLE_CHANGE"
+    if eventType == added then return "grant" end
+    if eventType == removed then return "revoke" end
+    if eventType == roleChange and data.newRole == MEMBER_ROLES.ADMIN then return "grant" end
+    if eventType == roleChange and data.newRole == MEMBER_ROLES.MEMBER then return "revoke" end
+    return nil
+end
+
+-- True when sorted history, including this new row, ends by granting admin.
+-- False when it ends in a revoke. Nil when this row is not an admin effect.
+local function SortedHistoryGrantsAdmin(profile, memberId, candidateLog)
+    if HistoryAdminEffect(candidateLog, memberId) == nil then return nil end
+    local source = nil
+    if type(profile.GetLootLogs) == "function" then
+        source = profile:GetLootLogs()
+    elseif type(profile._lootLogs) == "table" then
+        source = profile._lootLogs
+    end
+    local logs = {}
+    local included = false
+    if type(source) == "table" then
+        for i = 1, #source do
+            logs[#logs + 1] = source[i]
+            if source[i] == candidateLog then
+                included = true
+            end
+        end
+    end
+    if not included then
+        logs[#logs + 1] = candidateLog
+    end
+    table.sort(logs, CompareHistoryLogs)
+    local saw = false
+    local granted = false
+    for i = 1, #logs do
+        local state = HistoryAdminEffect(logs[i], memberId)
+        if state == "grant" then
+            saw = true
+            granted = true
+        elseif state == "revoke" then
+            saw = true
+            granted = false
+        end
+    end
+    if not saw then return nil end
+    return granted
+end
+
+-- Fallback when identity projection is not loaded. AddLootLog inserts the
+-- ROLE_CHANGE and, in production, replays canonical admins first. A same-second
+-- grant can sort after the new row. Session reconcile reads _adminUsers, so
+-- this fallback applies the last effect in history order rather than treating
+-- the new row as final. The profile owner stays an admin. Do not use it to
+-- overwrite a projection: a sourced ADMIN_ADDED is conditional there.
+local function ApplyRoleChangeToCanonicalAdmins(profile, memberId, newRole, candidateLog)
+    if type(profile) ~= "table" or type(memberId) ~= "string" or memberId == "" then
+        return
+    end
+    local owner = ProfileOwnerId(profile)
+    if newRole == MEMBER_ROLES.MEMBER and type(owner) == "string" and SameMemberId(owner, memberId) then
+        return
+    end
+    local granted = SortedHistoryGrantsAdmin(profile, memberId, candidateLog)
+    if granted == nil then
+        granted = (newRole == MEMBER_ROLES.ADMIN)
+    end
+    local admins = profile._adminUsers
+    if type(admins) ~= "table" then
+        admins = {}
+        profile._adminUsers = admins
+    end
+    if not granted then
+        for i = #admins, 1, -1 do
+            if SameMemberId(admins[i], memberId) then
+                table.remove(admins, i)
+            end
+        end
+        return
+    end
+    for i = 1, #admins do
+        if SameMemberId(admins[i], memberId) then
+            return
+        end
+    end
+    admins[#admins + 1] = memberId
+    table.sort(admins)
+end
+
 local function AttachIdentityArmorScope(profile, eventData)
     if type(profile) ~= "table" or type(eventData) ~= "table" then
         return
@@ -253,10 +418,40 @@ function Member:SetRole(newRole, opts)
         end
 
         local oldRole = self.role
-        self.role = newRole
+        -- Production AddLootLog already ran Identity.ApplyCanonicalAdmins,
+        -- which honors sourced grants. A second grant/revoke scan would put
+        -- a rejected ADMIN_ADDED back into _adminUsers.
+        local identity = SF.LootHelperIdentity
+        if not (type(identity) == "table" and type(identity.ApplyCanonicalAdmins) == "function") then
+            ApplyRoleChangeToCanonicalAdmins(opts.profile, self:GetFullIdentifier(), newRole, logEntry)
+        end
+        local stillAdmin = false
+        local admins = opts.profile and opts.profile._adminUsers
+        if type(admins) == "table" then
+            for i = 1, #admins do
+                if SameMemberId(admins[i], self:GetFullIdentifier()) then
+                    stillAdmin = true
+                    break
+                end
+            end
+        end
+        self.role = stillAdmin and MEMBER_ROLES.ADMIN or MEMBER_ROLES.MEMBER
+
+        -- The writer does not receive its own NEW_LOG, and a duplicate echo
+        -- returns before live revocation routing. Reconcile here, as local
+        -- admin add and remove already do, so helper routes and revoked
+        -- coordinators update on this client.
+        local sync = SF.LootHelperSync
+        local profile = opts.profile
+        if sync and type(sync.ReconcileSessionAuthorization) == "function"
+            and profile and type(profile.GetProfileId) == "function"
+        then
+            local reason = stillAdmin and "local_role_promoted" or "local_role_demoted"
+            sync:ReconcileSessionAuthorization(profile:GetProfileId(), reason)
+        end
 
         if SF.Debug then
-            SF.Debug:Info("MEMBER", "%s role changed: %s -> %s", self:GetFullIdentifier(), oldRole, newRole)
+            SF.Debug:Info("MEMBER", "%s role changed: %s -> %s", self:GetFullIdentifier(), oldRole, self.role)
         end
         return true
     else

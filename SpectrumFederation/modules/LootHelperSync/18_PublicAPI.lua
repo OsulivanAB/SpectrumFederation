@@ -112,6 +112,7 @@ function Sync:TryRestorePersistedSession(reason)
     self.state.coordinator = persisted.coordinator
     self.state.coordEpoch = persisted.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(persisted.coordinator, self:_SelfId())
+    local wasPersistedCoordinator = self.state.isCoordinator == true
     do
         local restoredProfile = self.FindLocalProfileById and self:FindLocalProfileById(persisted.profileId) or nil
         self.state.rcConfigSeq = (restoredProfile and tonumber(restoredProfile._rcConfigSeq)) or 0
@@ -122,6 +123,17 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._sentJoinStatusForSessionId = nil
     self.state._sentJoinStatusType = nil
     self.state._profileReqInFlight = nil
+    self.state._noProfileTargetWarnedFor = nil
+    self.state._noLogTargetWarnedFor = nil
+    self.state._coordinatorCatchUp = nil
+    self.state.revokedRoutes = nil
+    self.state._adminGrantServe = nil
+    self.state._newLogUnauthorizedWarned = nil
+    self.state._unprovenCatchUpWarned = nil
+    self.state._sameProfileRevokeScan = nil
+    self.state._catchUpGrantScan = nil
+    self.state._catchUpGrantScanOther = nil
+    self.state._catchUpProofScan = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = self:_Now()
 
@@ -136,8 +148,23 @@ function Sync:TryRestorePersistedSession(reason)
     hb.missedHeartbeats = 0
     hb.lastTakeoverRound = nil
 
-    -- One-shot marker so restored coordinators re-announce exactly once when world/group events settle.
-    self.state._restoredSessionNeedsReannounce = self.state.isCoordinator
+    -- Canonical admin changes can land before this client reloads. Reconcile
+    -- before scheduling a reannounce so a revoked coordinator cannot advertise
+    -- the stale persisted coordinator identity.
+    if self.ReconcileSessionAuthorization and self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown() then
+        self:ReconcileSessionAuthorization(self.state.profileId, "restore:" .. tostring(reason or "unknown"))
+    elseif self.ApplyAdvertisedHelpers then
+        self:ApplyAdvertisedHelpers(self.state.helpers, "restore")
+    end
+    if not (self.state and self.state.active) then
+        return false
+    end
+
+    -- One-shot marker so the persisted coordinator re-announces once when
+    -- world/group events settle. A successor who takes over during this
+    -- restore already reannounces after admin convergence, so an earlier
+    -- marker would publish pre-convergence helpers and frontiers.
+    self.state._restoredSessionNeedsReannounce = wasPersistedCoordinator and self.state.isCoordinator == true
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Restored persisted session state (reason=%s, sessionId=%s, profileId=%s, coordinator=%s, isCoordinator=%s)",
@@ -148,6 +175,18 @@ function Sync:TryRestorePersistedSession(reason)
     if not self.state.isCoordinator then
         self.state._bisRestoreBackfillHold = nil
         self:EnsureHeartbeatMonitor("RestorePersistedSession")
+    elseif not wasPersistedCoordinator then
+        -- Reconciliation already promoted this client. TakeoverSession started
+        -- convergence and cleared the hold. Putting the hold back would block
+        -- the drain that runs when that convergence finishes.
+        if type(self.state._bisBackfillPendingReason) ~= "string" then
+            self.state._bisBackfillPendingReason = "RestorePersistedSession"
+        end
+        self.state._bisRestoreBackfillHold = nil
+        local conv = self.state._adminConvergence
+        if not (type(conv) == "table" and conv.finished ~= true) and self._DrainAutomaticBisBackfill then
+            self:_DrainAutomaticBisBackfill()
+        end
     else
         -- Local history may be missing peer logs from before the reload.
         -- Reannounce runs admin convergence, which drains this after repairs.
@@ -710,6 +749,9 @@ function Sync:StartSession(profileId, opts)
     local me = self:_SelfId()
     local sessionId = self:_NextNonce("SES")
     local epoch = self:_Now()
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(self.state.coordinator, me)
+    end
 
     -- Reset state
     self.state.adminStatuses = {}
@@ -736,6 +778,18 @@ function Sync:StartSession(profileId, opts)
 
     -- Canonicalize derived member state before announcing session.
     self:RebuildProfile(profileId, "session_start_coordinator")
+    -- A stale admin list can pass CanSelfCoordinate and then lose that
+    -- authority when history is rebuilt. The session has not been announced.
+    -- Do not mark backfill, record this peer as an admin, or start convergence.
+    if not (self.state.active and self.state.sessionId == sessionId and self.state.isCoordinator == true) then
+        if self.state.active then
+            self:_ResetSessionState("start_authorization_revoked")
+        end
+        if SF.PrintError then
+            SF:PrintError("Cannot start session: you are not an admin for this profile")
+        end
+        return nil
+    end
     if profile.NormalizePersistedLegacyBonusRolls then
         profile:NormalizePersistedLegacyBonusRolls()
     end
@@ -829,6 +883,17 @@ function Sync:_ResetSessionState(reason)
     self.state._sentJoinStatusForSessionId = nil
     self.state._sentJoinStatusType = nil
     self.state._profileReqInFlight = nil
+    self.state._noProfileTargetWarnedFor = nil
+    self.state._noLogTargetWarnedFor = nil
+    self.state._coordinatorCatchUp = nil
+    self.state.revokedRoutes = nil
+    self.state._adminGrantServe = nil
+    self.state._newLogUnauthorizedWarned = nil
+    self.state._unprovenCatchUpWarned = nil
+    self.state._sameProfileRevokeScan = nil
+    self.state._catchUpGrantScan = nil
+    self.state._catchUpGrantScanOther = nil
+    self.state._catchUpProofScan = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = nil
 
@@ -960,9 +1025,9 @@ end
 function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     opts = opts or {}
 
-    local ok, why = self:CanSelfCoordinate(profileId)
-    if not ok then
-        if SF.PrintError then SF:PrintError("Cannot takeover session: %s", tostring(why or "unknown reason")) end
+    -- Replay from this function calls TakeoverSession again. That nested call
+    -- must not publish a second takeover; the outer call commits after replay.
+    if self._takeoverAuthRebuild then
         return false
     end
 
@@ -970,6 +1035,21 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     if not dist then return false end
     if type(sessionId) ~= "string" or sessionId == "" then return false end
     if type(profileId) ~= "string" or profileId == "" then return false end
+
+    -- CanSelfCoordinate reads the persisted admin list. History can already
+    -- have demoted this client. Replay before coordinator state or
+    -- COORD_TAKEOVER is published, and abort if that replay removes self.
+    self._takeoverAuthRebuild = true
+    if self.RebuildProfile then
+        self:RebuildProfile(profileId, "takeover")
+    end
+    self._takeoverAuthRebuild = nil
+
+    local ok, why = self:CanSelfCoordinate(profileId)
+    if not ok then
+        if SF.PrintError then SF:PrintError("Cannot takeover session: %s", tostring(why or "unknown reason")) end
+        return false
+    end
 
     -- Clear convergence state so we don't inherit stale admin statuses / pending convergence
     self.state.adminStatuses = {}
@@ -981,6 +1061,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
 
     local me = self:_SelfId()
     local oldEpoch = tonumber(self.state.coordEpoch) or 0
+    if self._RememberUnprovenCatchUpRelease then
+        self:_RememberUnprovenCatchUpRelease(self.state.coordinator, me)
+    end
 
     self.state.active = true
     self.state.sessionId = sessionId
@@ -1014,6 +1097,12 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
 
+    -- Member requests may have been holding an empty route while the previous
+    -- coordinator was still stored. Rebuild targets now that this client is coordinator.
+    if self._RefreshOutstandingRequestTargets then
+        self:_RefreshOutstandingRequestTargets()
+    end
+
     self:BroadcastCoordinatorTakeover()
 
     if not opts.rerunAdminConvergence then
@@ -1042,6 +1131,14 @@ end
 -- @return nil
 function Sync:ReannounceSession()
     if not self.state.active or not self.state.isCoordinator then return end
+    if self._ProfileAuthorizationKnown and self:_ProfileAuthorizationKnown()
+        and not self:IsSenderAuthorized(self.state.profileId, self:_SelfId())
+    then
+        if self.RelinquishUnauthorizedCoordination then
+            self:RelinquishUnauthorizedCoordination("reannounce_not_authorized")
+        end
+        return
+    end
 
     local dist = self:_EnforceGroupedSessionActive("ReannounceSession")
     if not dist then return end
