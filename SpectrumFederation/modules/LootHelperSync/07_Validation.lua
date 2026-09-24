@@ -231,6 +231,57 @@ function Sync:_CoordinatorNeedsCatchUp(name)
     return true
 end
 
+-- Function True when this catch-up coordinator still has no stored grant.
+-- Their packets may be adopted once. Repeats must not extend the takeover
+-- timer, or a peer with no grant can hold coordination indefinitely.
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_UnprovenCatchUpKeepalive(name)
+    if type(name) ~= "string" or name == "" then return false end
+    if not (self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(name)) then
+        return false
+    end
+    if self._LocalCatchUpGrantStored and self:_LocalCatchUpGrantStored(name) == true then
+        return false
+    end
+    return true
+end
+
+-- Function True when a new session id from the current unproven catch-up
+-- coordinator must be ignored. Adopting it would reset the keepalive clock.
+-- @param payload table
+-- @return boolean
+function Sync:_UnprovenCatchUpBlocksNewSession(payload)
+    if type(payload) ~= "table" or not (self.state and self.state.active) then return false end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == self.state.sessionId then
+        return false
+    end
+    return self:_UnprovenCatchUpKeepalive(payload.coordinator) == true
+end
+
+-- Function Record coordinator liveness.
+-- A proven coordinator refreshes the takeover clock. An unproven catch-up
+-- coordinator refreshes it only when this descriptor is the first baseline
+-- or the clock was cleared. Later keepalives leave the clock alone so the
+-- heartbeat monitor can take over if the grant never arrives.
+-- @param name string "Name-Realm"
+-- @param baseline boolean|nil True for the descriptor that first adopts this coordinator
+-- @return nil
+function Sync:_RememberCoordinatorKeepalive(name, baseline)
+    if not self.state then return end
+    self.state.heartbeat = self.state.heartbeat or {}
+    local hb = self.state.heartbeat
+    local unproven = self:_UnprovenCatchUpKeepalive(name)
+    if unproven and baseline ~= true and (tonumber(hb.lastCoordMessageAt) or 0) > 0 then
+        return
+    end
+    if not unproven then
+        hb.lastHeartbeatAt = self:_Now()
+    end
+    hb.lastCoordMessageAt = self:_Now()
+    hb.missedHeartbeats = 0
+end
+
 -- Function Record whether the coordinator just advertised still needs a catch-up request.
 -- Revoked coordinators stay blocked. A coordinator the local admin list has not seen yet
 -- remains routable until a correlated snapshot or log response arrives.
@@ -467,6 +518,7 @@ function Sync:_LocalCatchUpGrantStored(name)
         or cache.count ~= #logs
         or cache.rev ~= rev
         or cache.admins ~= adminToken
+        or cache.applied ~= ((type(profile) == "table" and profile._identityProjection and profile._identityProjection.appliedRelationshipIds) or nil)
         or type(cache.byName) ~= "table"
     then
         cache = {
@@ -475,6 +527,7 @@ function Sync:_LocalCatchUpGrantStored(name)
             count = #logs,
             rev = rev,
             admins = adminToken,
+            applied = (type(profile) == "table" and profile._identityProjection and profile._identityProjection.appliedRelationshipIds) or nil,
             byName = {},
         }
         self.state._catchUpGrantScan = cache
@@ -715,11 +768,32 @@ function Sync:_LogAdminGrantState(logTable, name)
     local roleChange = types.ROLE_CHANGE or "ROLE_CHANGE"
     local adminRole = (SF.MemberRoles and SF.MemberRoles.ADMIN) or "ADMIN"
     local memberRole = (SF.MemberRoles and SF.MemberRoles.MEMBER) or "MEMBER"
-    if eventType == added then return "grant" end
+    if eventType == added then
+        -- Identity ignores ADMIN_ADDED when sourceLogId is not an applied
+        -- relationship. That row must not cancel a removal or prove catch-up.
+        if not self:_SourcedAdminGrantApplies(data) then return nil end
+        return "grant"
+    end
     if eventType == removed then return "revoke" end
     if eventType == roleChange and data.newRole == adminRole then return "grant" end
     if eventType == roleChange and data.newRole == memberRole then return "revoke" end
     return nil
+end
+
+-- Function True when an ADMIN_ADDED row is current authority.
+-- No sourceLogId is unconditional. A sourceLogId counts only when identity
+-- projection applied that relationship log.
+-- @param data table|nil
+-- @return boolean
+function Sync:_SourcedAdminGrantApplies(data)
+    local sourceLogId = type(data) == "table" and data.sourceLogId or nil
+    if type(sourceLogId) ~= "string" or sourceLogId == "" then
+        return true
+    end
+    local profile = (self.state and self.FindLocalProfileById) and self:FindLocalProfileById(self.state.profileId) or nil
+    local projection = type(profile) == "table" and profile._identityProjection or nil
+    local applied = type(projection) == "table" and projection.appliedRelationshipIds or nil
+    return type(applied) == "table" and applied[sourceLogId] == true
 end
 
 -- Function True when ordered logs end with this player granted admin.
@@ -1388,13 +1462,17 @@ function Sync:RelinquishUnauthorizedCoordination(reason, opts)
     end
 
     if #candidates == 0 then
-        self._relinquishingCoordination = nil
+        -- Keep the guard until EndSession returns. A pending BiS frontier
+        -- makes EndSession broadcast a heartbeat, and that heartbeat calls
+        -- this function again. Clearing the guard first recurses on the UI
+        -- thread until the frontier flag is cleared.
         if self.EndSession then
             self:EndSession("coordinator_lost_admin", true)
         else
             self.state.isCoordinator = false
             self.state.active = false
         end
+        self._relinquishingCoordination = nil
         return true
     end
 

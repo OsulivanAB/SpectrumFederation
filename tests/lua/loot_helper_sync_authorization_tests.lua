@@ -3367,6 +3367,162 @@ assertEq(Sync:_RouteWasRevoked(COORD), true,
 SF.LootHelperIdentity = nil
 Sync.TakeoverSession = originalTakeover
 
+-- A sourced ADMIN_ADDED is authority only when identity applied that relationship.
+reset(MEMBER)
+setAdmins({ OWNER })
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+    {
+        _author = OWNER,
+        _counter = 2,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO, sourceLogId = "missing-link" },
+    },
+}
+assertEq(Sync:_LocalHistoryRevokesAdmin(KINO), true,
+    "a missing relationship source does not cancel a removal")
+assertEq(Sync:_LocalCatchUpGrantStored(KINO), false,
+    "a missing relationship source is not a stored grant")
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 10
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-sourced",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+assertEq(Sync.state.sessionId, SESSION, "an invalid sourced grant does not adopt a new session")
+profile._identityProjection = {
+    appliedRelationshipIds = { ["link-1"] = true },
+}
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+    {
+        _author = OWNER,
+        _counter = 2,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO, sourceLogId = "link-1" },
+    },
+}
+assertEq(Sync:_LocalHistoryRevokesAdmin(KINO), false,
+    "an applied relationship source restores the grant")
+assertEq(Sync:_LocalCatchUpGrantStored(KINO), true,
+    "an applied relationship source is a stored grant")
+
+-- Unproven catch-up may be adopted once. Later keepalives must not extend the clock.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 10
+Sync.state.heartbeat.lastCoordMessageAt = 40
+local catchNow = 5000
+local originalCatchNow = Sync._Now
+Sync._Now = function()
+    return catchNow
+end
+Sync:HandleSessionHeartbeat(KINO, {
+    sessionId = "session-unproven",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+    sentAt = 1,
+})
+assertEq(Sync.state.sessionId, "session-unproven", "the first unproven descriptor is adopted")
+assertEq(Sync.state._coordinatorCatchUp, KINO, "a missing coordinator stays on catch-up")
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 5000, "the adopting heartbeat baselines the coordinator timer")
+catchNow = 8000
+Sync:HandleSessionHeartbeat(KINO, {
+    sessionId = "session-unproven",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 12,
+    sentAt = 2,
+})
+assertEq(Sync.state.coordEpoch, 12, "a same-session unproven heartbeat still applies a newer epoch")
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 5000,
+    "an unproven heartbeat does not refresh the coordinator timer")
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-unproven-2",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 13,
+})
+assertEq(Sync.state.sessionId, "session-unproven", "a new session id does not reset an unproven catch-up")
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 5000,
+    "a rejected session id does not refresh the coordinator timer")
+setAdmins({ OWNER, KINO })
+catchNow = 9000
+Sync:HandleSessionHeartbeat(KINO, {
+    sessionId = "session-unproven",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 12,
+    sentAt = 3,
+})
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 9000,
+    "a coordinator who is an admin refreshes the timer")
+Sync._Now = originalCatchNow
+
+-- Ending the session for a pending BiS frontier must not re-enter relinquish.
+reset(COORD)
+setAdmins({})
+Sync.state.isCoordinator = true
+Sync.state.coordinator = COORD
+profile._autoBisFrontierPending = true
+local originalComm = SF.LootHelperComm
+SF.LootHelperComm = {
+    Send = function()
+        return true
+    end,
+}
+local endCalls = 0
+local originalEnd = Sync.EndSession
+Sync.EndSession = function(self, reason, broadcast)
+    endCalls = endCalls + 1
+    if endCalls > 2 then
+        return false
+    end
+    return originalEnd(self, reason, broadcast)
+end
+Sync:RelinquishUnauthorizedCoordination("frontier-recursion")
+assertEq(endCalls, 1, "relinquish ends the session once when a BiS frontier is pending")
+assertEq(Sync.state.active, false, "relinquish with no successor ends the session")
+assertEq(profile._autoBisFrontierPending, nil, "the pending frontier is cleared while ending")
+SF.LootHelperComm = originalComm
+Sync.EndSession = originalEnd
+
+-- Startup rebuild can remove the coordinator before the session is announced.
+reset(COORD)
+setAdmins({ COORD })
+local startConvergence = 0
+local originalBegin = Sync.BeginAdminConvergence
+Sync.BeginAdminConvergence = function()
+    startConvergence = startConvergence + 1
+    return true
+end
+local originalStartRebuild = Sync.RebuildProfile
+Sync.RebuildProfile = function(self, profileId, reason)
+    setAdmins({})
+    self:RelinquishUnauthorizedCoordination("rebuild:" .. tostring(reason))
+    return true
+end
+local started = Sync:StartSession(PROFILE)
+assertNil(started, "start aborts when rebuild removes this coordinator")
+assertEq(Sync.state.active, false, "an aborted start does not leave the session active")
+assertEq(startConvergence, 0, "an aborted start does not begin admin convergence")
+Sync.BeginAdminConvergence = originalBegin
+Sync.RebuildProfile = originalStartRebuild
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

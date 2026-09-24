@@ -51,6 +51,9 @@ function Sync:HandleSessionStart(sender, payload)
     if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
         return
     end
+    if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
+        return
+    end
 
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
@@ -138,8 +141,12 @@ function Sync:HandleSessionStart(sender, payload)
 
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
-    hb.lastCoordMessageAt = self:_Now()
-    hb.missedHeartbeats = 0
+    if self._RememberCoordinatorKeepalive then
+        self:_RememberCoordinatorKeepalive(self.state.coordinator, oldSid ~= payload.sessionId)
+    else
+        hb.lastCoordMessageAt = self:_Now()
+        hb.missedHeartbeats = 0
+    end
     hb.lastTakeoverRound = nil
 
     self:EnsureHeartbeatMonitor("HandleSessionStart")

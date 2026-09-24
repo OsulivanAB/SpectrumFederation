@@ -262,6 +262,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
         return
     end
+    if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
+        return
+    end
 
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
@@ -319,8 +322,12 @@ function Sync:HandleSessionReannounce(sender, payload)
 
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
-    hb.lastCoordMessageAt = self:_Now()
-    hb.missedHeartbeats = 0
+    if self._RememberCoordinatorKeepalive then
+        self:_RememberCoordinatorKeepalive(self.state.coordinator, oldSid ~= payload.sessionId)
+    else
+        hb.lastCoordMessageAt = self:_Now()
+        hb.missedHeartbeats = 0
+    end
     hb.lastTakeoverRound = nil
 
     self:EnsureHeartbeatMonitor("HandleSessionReannounce")
@@ -392,6 +399,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         end
     end
     if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
+        return
+    end
+    if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
         return
     end
 
@@ -502,12 +512,17 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         self:_ApplyAdvertisedRCConfig(payload)
     end
 
-    -- Heartbeat bookkeeping
+    -- Heartbeat bookkeeping. An unproven catch-up coordinator does not extend
+    -- the takeover clock after the descriptor that adopted them.
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
-    hb.lastHeartbeatAt = self:_Now()
-    hb.lastCoordMessageAt = self:_Now()
-    hb.missedHeartbeats = 0
+    if self._RememberCoordinatorKeepalive then
+        self:_RememberCoordinatorKeepalive(self.state.coordinator, oldSid ~= payload.sessionId)
+    else
+        hb.lastHeartbeatAt = self:_Now()
+        hb.lastCoordMessageAt = self:_Now()
+        hb.missedHeartbeats = 0
+    end
 
     self:EnsureHeartbeatMonitor("HandleSessionHeartbeat")
     self:EnsureRepairConvergence("HandleSessionHeartbeat")
@@ -643,9 +658,13 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
         return
     end
+    if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
+        return
+    end
 
     local wasCoordinator = (self.state.isCoordinator == true)
 
+    local oldSid = self.state.sessionId
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
     if self._ClearRevocationForIncomingScope then
@@ -673,8 +692,12 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
-    hb.lastCoordMessageAt = self:_Now()
-    hb.missedHeartbeats = 0
+    if self._RememberCoordinatorKeepalive then
+        self:_RememberCoordinatorKeepalive(self.state.coordinator, oldSid ~= payload.sessionId)
+    else
+        hb.lastCoordMessageAt = self:_Now()
+        hb.missedHeartbeats = 0
+    end
     hb.lastTakeoverRound = nil
 
     self:EnsureHeartbeatMonitor("HandleSessionStart")

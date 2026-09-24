@@ -773,6 +773,18 @@ function Sync:StartSession(profileId, opts)
 
     -- Canonicalize derived member state before announcing session.
     self:RebuildProfile(profileId, "session_start_coordinator")
+    -- A stale admin list can pass CanSelfCoordinate and then lose that
+    -- authority when history is rebuilt. The session has not been announced.
+    -- Do not mark backfill, record this peer as an admin, or start convergence.
+    if not (self.state.active and self.state.sessionId == sessionId and self.state.isCoordinator == true) then
+        if self.state.active then
+            self:_ResetSessionState("start_authorization_revoked")
+        end
+        if SF.PrintError then
+            SF:PrintError("Cannot start session: you are not an admin for this profile")
+        end
+        return nil
+    end
     if profile.NormalizePersistedLegacyBonusRolls then
         profile:NormalizePersistedLegacyBonusRolls()
     end
