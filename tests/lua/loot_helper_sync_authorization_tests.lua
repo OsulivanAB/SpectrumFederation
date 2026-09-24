@@ -4140,6 +4140,133 @@ assertTrue(#targets <= 3, "capped helpers do not expand the target list")
 Sync._RefreshOutstandingRequestTargets = originalRefresh
 end)()
 
+-- Case variants share one failed-catch-up block. An oversized catch-up snapshot
+-- scans local history once. An ownerless revoked coordinator can still end the
+-- session; a revoked coordinator with a successor cannot.
+;(function()
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 10
+Sync.state.isCoordinator = true
+local caseNow = 5000
+local originalCaseNow = Sync._Now
+Sync._Now = function()
+    return caseNow
+end
+Sync:HandleCoordinatorTakeover(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+caseNow = 9000
+assertEq(Sync:TakeoverSession(SESSION, PROFILE, "heartbeat-timeout"), true,
+    "a proven admin records the unproven catch-up failure")
+assertEq(Sync:_FailedCatchUpKey(PROFILE, KINO), Sync:_FailedCatchUpKey(PROFILE, "kIno-Realm"),
+    "failed catch-up keys ignore coordinator capitalization")
+assertTrue(Sync:_FailedCatchUpBlocks("kIno-Realm", PROFILE),
+    "a case variant is blocked by the recorded catch-up failure")
+local book = Sync.state._failedCatchUp
+local stored = 0
+for _ in pairs(book) do
+    stored = stored + 1
+end
+for i = stored + 1, 32 do
+    book[PROFILE .. "\0other-" .. i] = true
+end
+Sync:HandleSessionStart("kIno-Realm", {
+    sessionId = "session-case",
+    profileId = PROFILE,
+    coordinator = "kIno-Realm",
+    coordEpoch = (tonumber(Sync.state.coordEpoch) or 0) + 1,
+})
+assertEq(Sync.state.sessionId, SESSION, "a full book still rejects a case variant of the failed coordinator")
+assertEq(Sync.state.coordinator, OWNER, "the case variant does not replace the proven coordinator")
+Sync._Now = originalCaseNow
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 3,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local wideReq = seedRequest("need-wide-snap", "NEED_PROFILE", { KINO }, KINO)
+wideReq.inflightResponders = { [KINO] = KINO }
+local wideScans = 0
+local originalWideHistory = Sync._LocalHistoryRevokesAdmin
+Sync._LocalHistoryRevokesAdmin = function(self, name)
+    wideScans = wideScans + 1
+    return originalWideHistory(self, name)
+end
+local function wideSnapshot(counterOffset)
+    local logs = {}
+    for i = 1, 18 do
+        logs[i] = {
+            _author = "Author-Realm",
+            _counter = i + counterOffset,
+            _eventType = "POINT_CHANGE",
+            _data = { member = MEMBER },
+        }
+    end
+    logs[19] = {
+        _author = OWNER,
+        _counter = 99,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    }
+    return {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        requestId = "need-wide-snap",
+        snapshot = {
+            meta = { _profileId = PROFILE },
+            adminUsers = { KINO, OWNER },
+            lootLogs = logs,
+        },
+    }
+end
+Sync:HandleProfileSnapshot(KINO, wideSnapshot(0))
+Sync:HandleProfileSnapshot(KINO, wideSnapshot(0))
+assertEq(wideScans, 1, "a repeated oversized catch-up snapshot does not scan local history again")
+Sync:HandleProfileSnapshot(KINO, wideSnapshot(50))
+assertEq(wideScans, 2, "a different oversized catch-up snapshot scans local history once")
+Sync._LocalHistoryRevokesAdmin = originalWideHistory
+
+reset(MEMBER)
+setAdmins({})
+Sync.state.coordinator = COORD
+Sync:_RememberRevokedRoute(COORD)
+Sync:HandleSessionEnd(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 10,
+    reason = "coordinator_lost_admin",
+})
+assertEq(Sync.state.active, false, "an ownerless revoked coordinator can end the session")
+
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync:_RememberRevokedRoute(COORD)
+Sync:HandleSessionEnd(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 10,
+    reason = "revoked",
+})
+assertEq(Sync.state.active, true, "a revoked coordinator with a successor still cannot end the session")
+end)()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

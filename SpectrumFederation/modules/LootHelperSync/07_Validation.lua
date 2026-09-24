@@ -205,6 +205,34 @@ function Sync:_IgnoreRevokedCoordinatorControl(sender, coordinator)
     return true
 end
 
+-- Function True when this SES_END is the current coordinator shutting down an ownerless session.
+-- Peers may already have recorded the revocation from NEW_LOG. With no in-group
+-- successor, the heartbeat monitor never runs for a non-admin, so this end is
+-- the only way those peers leave the session. A revoked coordinator who still
+-- has an eligible successor cannot end it.
+-- @param sender string "Name-Realm"
+-- @param coordinator string|nil Claimed coordinator
+-- @return boolean
+function Sync:_OwnerlessRevokedCoordinatorEnd(sender, coordinator)
+    if not (self.state and self.state.active and type(self.state.coordinator) == "string") then
+        return false
+    end
+    if type(sender) ~= "string" or not self:_SamePlayer(sender, self.state.coordinator) then
+        return false
+    end
+    if type(coordinator) ~= "string" or not self:_SamePlayer(coordinator, self.state.coordinator) then
+        return false
+    end
+    if not (self._RouteWasRevoked and self:_RouteWasRevoked(self.state.coordinator)) then
+        return false
+    end
+    if type(self._ComputeTakeoverCandidates) ~= "function" then
+        return true
+    end
+    local candidates = self:_ComputeTakeoverCandidates(self.state.profileId) or {}
+    return #candidates == 0
+end
+
 -- Function Allow catch-up only for an advertised coordinator the local profile has not revoked.
 -- @param name string "Name-Realm"
 -- @return boolean
@@ -286,7 +314,10 @@ function Sync:_FailedCatchUpKey(profileId, name)
     if type(profileId) ~= "string" or profileId == "" then return nil end
     if type(name) ~= "string" or name == "" then return nil end
     local normalized = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(name)) or name
-    return profileId .. "\0" .. normalized
+    if type(normalized) ~= "string" or normalized == "" then return nil end
+    -- SamePlayer compares case-insensitively. The block must too, or a
+    -- different capitalization is a new key and can fill the 32-entry book.
+    return profileId .. "\0" .. normalized:lower()
 end
 
 function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
@@ -990,25 +1021,25 @@ end
 
 -- Function Identity of the local history a catch-up proof walk would read.
 -- A repeat of the same remote logs skips that walk until this identity changes.
--- More than 16 remote rows are not cached; those packets still scan once.
+-- Up to 16 remote rows use their exact fields. Larger snapshots use a fixed-size
+-- hash so a repeat does not walk local history again.
 -- @param sender string "Name-Realm"
 -- @param logs table
 -- @return table|nil
 function Sync:_CatchUpProofToken(sender, logs)
     if not self.state or type(sender) ~= "string" or sender == "" then return nil end
-    if type(logs) ~= "table" or #logs == 0 or #logs > 16 then return nil end
+    if type(logs) ~= "table" or #logs == 0 then return nil end
     if type(self.FindLocalProfileById) ~= "function" or type(self._GetProfileLootLogs) ~= "function" then
         return nil
     end
     local profile = self:FindLocalProfileById(self.state.profileId)
     local localLogs = profile and self:_GetProfileLootLogs(profile) or nil
     if type(localLogs) ~= "table" then return nil end
-    local remote = {}
-    for i, row in ipairs(logs) do
+    local function rowKey(row)
         if type(row) ~= "table" then return nil end
         local data = row._data or row.data
         local member = type(data) == "table" and data.member or ""
-        remote[i] = table.concat({
+        return table.concat({
             tostring(row._id or row.id or ""),
             tostring(row._author or row.author or ""),
             tostring(row._counter or row.counter or ""),
@@ -1018,13 +1049,37 @@ function Sync:_CatchUpProofToken(sender, logs)
             tostring(member),
         }, "\1")
     end
+    local remoteKey
+    if #logs > 16 then
+        local hashA = 5381
+        local hashB = 7919
+        for _, row in ipairs(logs) do
+            local key = rowKey(row)
+            if not key then return nil end
+            for i = 1, #key do
+                local byte = key:byte(i)
+                hashA = (hashA * 33 + byte) % 2147483647
+                hashB = (hashB * 31 + byte) % 2147483647
+            end
+        end
+        local firstKey = rowKey(logs[1])
+        local lastKey = rowKey(logs[#logs])
+        remoteKey = table.concat({ "wide", tostring(#logs), tostring(hashA), tostring(hashB), firstKey, lastKey }, "\0")
+    else
+        local remote = {}
+        for i, row in ipairs(logs) do
+            remote[i] = rowKey(row)
+            if not remote[i] then return nil end
+        end
+        remoteKey = table.concat(remote, "\0")
+    end
     local senderKey = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(sender)) or sender
     return {
         profileId = self.state.profileId,
         logs = localLogs,
         count = #localLogs,
         rev = (type(profile) == "table" and tonumber(profile._lootLogRevision)) or 0,
-        key = senderKey .. "\0" .. table.concat(remote, "\0"),
+        key = senderKey .. "\0" .. remoteKey,
     }
 end
 

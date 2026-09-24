@@ -198,7 +198,10 @@ function Sync:HandleSessionEnd(sender, payload)
     if not self:IsControlMessageAllowed(payload, sender) then
         return        
     end
-    if self._IgnoreRevokedCoordinatorControl and self:_IgnoreRevokedCoordinatorControl(sender, payload.coordinator) then
+    if self._IgnoreRevokedCoordinatorControl
+        and not (self._OwnerlessRevokedCoordinatorEnd and self:_OwnerlessRevokedCoordinatorEnd(sender, payload.coordinator))
+        and self:_IgnoreRevokedCoordinatorControl(sender, payload.coordinator)
+    then
         return
     end
 
