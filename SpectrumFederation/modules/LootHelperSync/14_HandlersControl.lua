@@ -247,9 +247,6 @@ function Sync:HandleSessionReannounce(sender, payload)
     if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
         return
     end
-    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
-        return
-    end
 
     -- If we're in a different session, require strictly newer epoch
     if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
@@ -261,6 +258,9 @@ function Sync:HandleSessionReannounce(sender, payload)
         if not self:IsControlMessageAllowed(payload, sender) then
             return
         end
+    end
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
+        return
     end
 
     local wasCoordinator = (self.state.isCoordinator == true)
@@ -370,9 +370,6 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
         return
     end
-    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
-        return
-    end
 
     -- Epoch gating:
     -- - If different sessionId, accept only if strictly newer epoch
@@ -393,6 +390,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
             end
             return
         end
+    end
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
+        return
     end
 
     local wasCoordinator = (self.state.isCoordinator == true)
@@ -628,9 +628,6 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
         return
     end
-    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
-        return
-    end
 
     -- If we're in a different active session, only accept if epoch is strictly newer
     if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
@@ -641,6 +638,9 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     -- Ignore older epochs (same-session or takeover races)
     if not self:IsControlMessageAllowed(payload, sender) then
+        return
+    end
+    if self._IncomingSameProfileHistoryRevoked and self:_IncomingSameProfileHistoryRevoked(payload) then
         return
     end
 

@@ -119,6 +119,8 @@ end
 -- Heartbeat, reannounce, and takeover do not rebuild history. A coordinator
 -- local history already removed would otherwise clear the tombstone and stay
 -- on catch-up. Session start still applies the descriptor and reconciles.
+-- Call this only after epoch gating. One scan per request timeout is reused
+-- for that coordinator; a different name waits instead of walking history again.
 -- @param payload table
 -- @return boolean
 function Sync:_IncomingSameProfileHistoryRevoked(payload)
@@ -128,14 +130,31 @@ function Sync:_IncomingSameProfileHistoryRevoked(payload)
     if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return false end
     if payload.profileId ~= self.state.profileId then return false end
     if payload.sessionId == self.state.sessionId then return false end
-    if not (self._LocalHistoryRevokesAdmin and self:_LocalHistoryRevokesAdmin(payload.coordinator)) then
-        return false
+    local now = self:_Now()
+    local cooldown = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    local cache = self.state._sameProfileRevokeScan
+    if type(cache) == "table" and cache.profileId == payload.profileId then
+        local age = now - (tonumber(cache.at) or 0)
+        if age >= 0 and age < cooldown then
+            if self:_SamePlayer(cache.name, payload.coordinator) then
+                return cache.revoked == true
+            end
+            return true
+        end
     end
-    if SF.Debug then
+    if not self._LocalHistoryRevokesAdmin then return false end
+    local revoked = self:_LocalHistoryRevokesAdmin(payload.coordinator) == true
+    self.state._sameProfileRevokeScan = {
+        name = payload.coordinator,
+        profileId = payload.profileId,
+        at = now,
+        revoked = revoked,
+    }
+    if revoked and SF.Debug then
         SF.Debug:Verbose("SYNC", "Ignoring new session from %s; local history revoked that coordinator",
             tostring(payload.coordinator))
     end
-    return true
+    return revoked
 end
 
 -- Function True when privileged control from this coordinator must be ignored.

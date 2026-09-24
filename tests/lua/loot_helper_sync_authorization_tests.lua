@@ -274,6 +274,7 @@ local function reset(selfName)
     Sync.state._adminGrantServe = nil
     Sync.state._newLogUnauthorizedWarned = nil
     Sync.state._unprovenCatchUpWarned = nil
+    Sync.state._sameProfileRevokeScan = nil
     Sync.state._sentJoinStatusForSessionId = nil
     Sync.state._sessionAnnounced = SESSION
     Sync._reconcilingSessionAuthorization = nil
@@ -2605,6 +2606,59 @@ Sync:HandleCoordinatorTakeover(COORD, {
 })
 assertEq(Sync.state.sessionId, SESSION, "same-profile takeover does not adopt a locally revoked coordinator")
 assertEq(Sync.state.coordinator, COORD, "same-profile revoked takeover keeps the coordinator")
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = COORD },
+    },
+}
+local historyScans = 0
+local originalHistoryRevoke = Sync._LocalHistoryRevokesAdmin
+Sync._LocalHistoryRevokesAdmin = function(self, name)
+    historyScans = historyScans + 1
+    return originalHistoryRevoke(self, name)
+end
+local historyNow = 8000
+local originalHistoryNow = Sync._Now
+Sync._Now = function()
+    return historyNow
+end
+for i = 1, 4 do
+    Sync:HandleSessionHeartbeat(COORD, {
+        sessionId = "session-scan-" .. tostring(i),
+        profileId = PROFILE,
+        coordinator = COORD,
+        coordEpoch = 12 + i,
+        sentAt = 90 + i,
+    })
+end
+assertEq(historyScans, 1, "repeat new-session heartbeats do not rescan history inside the timeout")
+assertEq(Sync.state.sessionId, SESSION, "cached revocation still rejects the new session")
+Sync:HandleSessionHeartbeat(COORD, {
+    sessionId = "session-old-epoch",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 1,
+    sentAt = 1,
+})
+assertEq(historyScans, 1, "an older epoch does not scan revocation history")
+historyNow = historyNow + 5
+Sync:HandleSessionHeartbeat(COORD, {
+    sessionId = "session-scan-later",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 20,
+    sentAt = 200,
+})
+assertEq(historyScans, 2, "revocation history is scanned again after the timeout")
+Sync._LocalHistoryRevokesAdmin = originalHistoryRevoke
+Sync._Now = originalHistoryNow
 
 -- An authorized admin who is not a Helper can still be the integrity provider.
 reset(COORD)
