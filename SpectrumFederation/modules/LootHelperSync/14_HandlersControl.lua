@@ -929,11 +929,11 @@ function Sync:HandleNeedLogs(sender, payload)
         if self._AppendAdminGrantEvidence then
             self:_AppendAdminGrantEvidence(out, profile, member)
         end
+        local grant = out[1]
+        if type(grant) ~= "table" or not SF.LootHelperComm then return end
         if self._NoteAdminGrantServe then
             self:_NoteAdminGrantServe(sender, member)
         end
-        local grant = out[1]
-        if type(grant) ~= "table" or not SF.LootHelperComm then return end
         local resp = {
             sessionId   = self.state.sessionId,
             profileId   = self.state.profileId,

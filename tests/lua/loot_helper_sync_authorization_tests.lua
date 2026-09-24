@@ -1953,6 +1953,49 @@ Sync:HandleNeedProfile(MEMBER, {
 })
 assertEq(sendCount(Sync.MSG.PROFILE_SNAPSHOT), 0, "non-helper grant request does not export the profile")
 
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.isCoordinator = false
+Sync.state.helpers = {}
+Sync.state.coordinator = KINO
+profile._lootLogs = {
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}
+sends = {}
+for i = 1, 4 do
+    Sync:HandleNeedLogs(MEMBER, {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        requestId = "grant-missing-" .. tostring(i),
+        adminGrantMember = KINO,
+        missing = {
+            { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+        },
+    })
+end
+assertEq(sendCount(Sync.MSG.AUTH_LOGS), 0, "missing grant does not consume a grant reply")
+profile._lootLogs[#profile._lootLogs + 1] = {
+    _author = OWNER,
+    _counter = 4,
+    _eventType = "ADMIN_ADDED",
+    _data = { member = KINO },
+}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "grant-arrived",
+    adminGrantMember = KINO,
+    missing = {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+    },
+})
+assertEq(sendCount(Sync.MSG.AUTH_LOGS), 1, "grant reply is sent after the row arrives")
+
 reset(MEMBER)
 setAdmins({ OWNER })
 Sync.state.coordinator = KINO
