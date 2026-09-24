@@ -287,10 +287,9 @@ function Sync:HandleAuthLogs(sender, payload)
                 allowReplaceExisting = false,
                 allowMainSwapFingerprintNormalize = true,
             })
+            -- The shared rebuild below runs when this insert changes history.
+            -- Rebuilding here as well replays the whole profile twice.
             grantChanged = changedGrant and true or false
-            if self.RebuildProfile then
-                self:RebuildProfile(payload.profileId, "auth_logs")
-            end
         end
     end
     local catchUpMerge = (not senderIsCanonicalAdmin)

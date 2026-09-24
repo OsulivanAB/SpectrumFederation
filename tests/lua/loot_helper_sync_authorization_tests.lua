@@ -2132,11 +2132,13 @@ Sync.state.helpers = {}
 Sync.state._coordinatorCatchUp = KINO
 seedRequest("need-trusted-grant", "NEED_LOGS", { OWNER }, OWNER)
 local trustedMerges = 0
+local trustedRebuilds = 0
 Sync.MergeLogs = function(_, _, logs)
     trustedMerges = trustedMerges + 1
     return true, { inserted = #logs, replaced = 0, mismatchCount = 0 }
 end
 Sync.RebuildProfile = function()
+    trustedRebuilds = trustedRebuilds + 1
     return true
 end
 Sync:HandleAuthLogs(OWNER, {
@@ -2149,6 +2151,7 @@ Sync:HandleAuthLogs(OWNER, {
     logs = echoedGrant.logs,
 })
 assertEq(trustedMerges, 1, "trusted admin can insert the coordinator grant the member missed")
+assertEq(trustedRebuilds, 1, "trusted grant rebuilds the profile once")
 assertTrue(Sync.state.requests["need-trusted-grant"] == nil, "trusted grant response completes the request")
 local successorReq = seedRequest("need-successor-grant", "NEED_LOGS", { KINO }, KINO)
 successorReq.meta.integrityRepair = true
@@ -3098,6 +3101,54 @@ assertTrue(not listHas(Sync.state.helpers, KINO), "local helper demotion drops t
 assertTrue(not listHas(Sync.state.requests["need-local-helper"].targets, KINO),
     "local helper demotion drops that request target")
 assertEq(Sync.state.coordinator, COORD, "local helper demotion keeps the authorized coordinator")
+
+-- A same-second grant that sorts after the demotion remains the last effect.
+reset(KINO)
+setAdmins({ COORD, KINO, OWNER })
+profile._owner = OWNER
+profile.GetOwnerId = function()
+    return OWNER
+end
+profile.IsCurrentUserAdmin = function()
+    return true
+end
+profile._lootLogs = {
+    {
+        _timestamp = 50,
+        _author = "Zulu-Realm",
+        _counter = 2,
+        _id = "grant-after",
+        _eventType = "ADMIN_ADDED",
+        _data = { member = COORD },
+    },
+}
+SF.LootLogEventTypes.ADMIN_ADDED = "ADMIN_ADDED"
+SF.LootLog.new = function()
+    return {
+        _timestamp = 50,
+        _author = "Alpha-Realm",
+        _counter = 1,
+        _id = "local-demote",
+        _eventType = "ROLE_CHANGE",
+        _data = { member = COORD, newRole = SF.MemberRoles.MEMBER },
+    }
+end
+profile.AddLootLog = function()
+    return true
+end
+local sortedTakeovers = 0
+Sync.TakeoverSession = function()
+    sortedTakeovers = sortedTakeovers + 1
+    return true
+end
+local sortedDemotion = SF.Member.new(COORD, SF.MemberRoles.ADMIN)
+assertEq(sortedDemotion:SetRole(SF.MemberRoles.MEMBER, { profile = profile }), true,
+    "same-second demotion still commits the role log")
+assertTrue(listHas(profile._adminUsers, COORD),
+    "a later same-second grant keeps the demoted member authorized")
+assertEq(Sync:_RouteWasRevoked(COORD), false, "sorted history does not revoke that coordinator")
+assertEq(sortedTakeovers, 0, "sorted history does not take over from that coordinator")
+Sync.TakeoverSession = originalTakeover
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
