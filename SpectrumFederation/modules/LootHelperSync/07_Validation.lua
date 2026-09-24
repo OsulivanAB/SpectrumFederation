@@ -118,9 +118,12 @@ end
 -- Function True when a new session id for this same profile must not be adopted.
 -- Heartbeat, reannounce, and takeover do not rebuild history. A coordinator
 -- local history already removed would otherwise clear the tombstone and stay
--- on catch-up. Session start still applies the descriptor and reconciles.
+-- on catch-up. Current canonical admin status outranks that history, including
+-- a cached scan: the profile owner can be demoted in a role log and still be
+-- an admin. Session start still applies the descriptor and reconciles.
 -- Call this only after epoch gating. One scan per request timeout is reused
--- for that coordinator; a different name waits instead of walking history again.
+-- for a coordinator who is not a current admin; a different name waits
+-- instead of walking history again.
 -- @param payload table
 -- @return boolean
 function Sync:_IncomingSameProfileHistoryRevoked(payload)
@@ -130,6 +133,9 @@ function Sync:_IncomingSameProfileHistoryRevoked(payload)
     if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return false end
     if payload.profileId ~= self.state.profileId then return false end
     if payload.sessionId == self.state.sessionId then return false end
+    if self.IsSenderAuthorized and self:IsSenderAuthorized(self.state.profileId, payload.coordinator) then
+        return false
+    end
     local now = self:_Now()
     local cooldown = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
     local cache = self.state._sameProfileRevokeScan

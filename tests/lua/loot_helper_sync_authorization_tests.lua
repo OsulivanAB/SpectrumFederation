@@ -2660,6 +2660,128 @@ assertEq(historyScans, 2, "revocation history is scanned again after the timeout
 Sync._LocalHistoryRevokesAdmin = originalHistoryRevoke
 Sync._Now = originalHistoryNow
 
+-- The profile owner stays a canonical admin after a role change to member.
+-- That log is still a historical revoke, and it must not hide a newer session.
+reset(MEMBER)
+setAdmins({ OWNER, KINO })
+profile._owner = OWNER
+profile.GetOwnerId = function()
+    return OWNER
+end
+profile._lootLogs = {
+    {
+        _author = KINO,
+        _counter = 4,
+        _eventType = "ROLE_CHANGE",
+        _data = { member = OWNER, newRole = "MEMBER" },
+    },
+}
+assertEq(Sync:_LocalHistoryRevokesAdmin(OWNER), true,
+    "owner role change to member is still a historical revoke")
+assertEq(Sync:IsSenderAuthorized(PROFILE, OWNER), true,
+    "owner remains a canonical admin after that role change")
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+Sync.state.heartbeat.lastHeartbeatAt = 40
+Sync.state.heartbeat.lastCoordMessageAt = 40
+Sync:HandleSessionHeartbeat(OWNER, {
+    sessionId = "session-owner-still-admin",
+    profileId = PROFILE,
+    coordinator = OWNER,
+    coordEpoch = 12,
+    sentAt = 80,
+})
+assertEq(Sync.state.sessionId, "session-owner-still-admin",
+    "still-authorized owner heartbeat adopts the new session")
+assertEq(Sync.state.coordEpoch, 12, "still-authorized owner heartbeat advances the epoch")
+assertEq(Sync.state.coordinator, OWNER, "still-authorized owner heartbeat keeps that coordinator")
+reset(MEMBER)
+setAdmins({ OWNER, KINO })
+profile._owner = OWNER
+profile._lootLogs = {
+    {
+        _author = KINO,
+        _counter = 4,
+        _eventType = "ROLE_CHANGE",
+        _data = { member = OWNER, newRole = "MEMBER" },
+    },
+}
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+Sync:HandleSessionReannounce(OWNER, {
+    sessionId = "session-owner-reannounce",
+    profileId = PROFILE,
+    coordinator = OWNER,
+    coordEpoch = 12,
+    helpers = { KINO },
+})
+assertEq(Sync.state.sessionId, "session-owner-reannounce",
+    "still-authorized owner reannounce adopts the new session")
+assertTrue(listHas(Sync.state.helpers, KINO), "still-authorized owner reannounce applies helpers")
+reset(MEMBER)
+setAdmins({ OWNER, KINO })
+profile._owner = OWNER
+profile._lootLogs = {
+    {
+        _author = KINO,
+        _counter = 4,
+        _eventType = "ROLE_CHANGE",
+        _data = { member = OWNER, newRole = "MEMBER" },
+    },
+}
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+Sync:HandleCoordinatorTakeover(OWNER, {
+    sessionId = "session-owner-takeover",
+    profileId = PROFILE,
+    coordinator = OWNER,
+    coordEpoch = 12,
+})
+assertEq(Sync.state.sessionId, "session-owner-takeover",
+    "still-authorized owner takeover adopts the new session")
+assertEq(Sync.state.coordinator, OWNER, "still-authorized owner takeover replaces the coordinator")
+
+-- A cached historical revoke must not outlive a re-grant inside the scan timeout.
+reset(MEMBER)
+setAdmins({ KINO })
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = COORD },
+    },
+}
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+local regrantNow = 9000
+local originalRegrantNow = Sync._Now
+Sync._Now = function()
+    return regrantNow
+end
+Sync:HandleSessionHeartbeat(COORD, {
+    sessionId = "session-cached-revoke",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 12,
+    sentAt = 90,
+})
+assertEq(Sync.state.sessionId, SESSION, "historical removal still rejects a new session")
+assertEq(Sync.state._sameProfileRevokeScan and Sync.state._sameProfileRevokeScan.revoked, true,
+    "revocation scan is cached")
+setAdmins({ KINO, COORD })
+Sync:HandleSessionHeartbeat(COORD, {
+    sessionId = "session-regranted",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 13,
+    sentAt = 91,
+})
+assertEq(Sync.state.sessionId, "session-regranted",
+    "current admin status adopts a new session inside the scan cooldown")
+assertEq(Sync.state.coordEpoch, 13, "regranted coordinator heartbeat advances the epoch")
+Sync._Now = originalRegrantNow
+
 -- An authorized admin who is not a Helper can still be the integrity provider.
 reset(COORD)
 Sync.state.isCoordinator = true
