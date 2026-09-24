@@ -275,6 +275,7 @@ local function reset(selfName)
     Sync.state._newLogUnauthorizedWarned = nil
     Sync.state._unprovenCatchUpWarned = nil
     Sync.state._sameProfileRevokeScan = nil
+    Sync.state._catchUpGrantScan = nil
     Sync.state._sentJoinStatusForSessionId = nil
     Sync.state._sessionAnnounced = SESSION
     Sync._reconcilingSessionAuthorization = nil
@@ -920,6 +921,46 @@ assertEq(Sync.state._restoredSessionNeedsReannounce, false,
     "restore takeover waits for convergence before reannounce")
 Sync:_ReannounceRestoredSessionIfNeeded()
 assertEq(sendCount(Sync.MSG.SES_REANNOUNCE), 0, "restore takeover does not reannounce immediately")
+
+-- A successor takeover during restore must not leave the BiS hold set.
+-- Convergence is already running, and only its completion drains the backfill.
+reset(KINO)
+setAdmins({ KINO, OWNER })
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = COORD },
+    },
+}
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+Sync.state.helpers = {}
+Sync:_PersistSessionState("before-successor-bis-reload")
+Sync.state.active = false
+Sync.state.isCoordinator = false
+local bisWrites = 0
+local originalBisBackfill = Sync.BackfillAutomaticBisOnPromotion
+Sync.BackfillAutomaticBisOnPromotion = function()
+    bisWrites = bisWrites + 1
+    return 1
+end
+local restoreBegin = Sync.BeginAdminConvergence
+Sync.BeginAdminConvergence = originalBeginAdminConvergence
+restored = Sync:TryRestorePersistedSession("reload-successor-bis")
+assertEq(restored, true, "successor BiS restore still restores the session")
+assertEq(Sync.state.isCoordinator, true, "successor BiS restore takes over")
+assertEq(Sync.state._bisRestoreBackfillHold, nil, "successor takeover does not restore the BiS hold")
+assertTrue(type(Sync.state._adminConvergence) == "table", "successor takeover leaves convergence running")
+assertEq(Sync.state._adminConvergence.finished, false, "successor takeover convergence is not already finished")
+assertTrue(type(Sync.state._bisBackfillPendingReason) == "string", "successor takeover keeps a BiS backfill pending")
+assertEq(bisWrites, 0, "successor takeover does not write BiS outcomes before convergence finishes")
+Sync:_FinishAdminConvergence("test-complete")
+assertEq(bisWrites, 1, "convergence completion drains the restore BiS backfill")
+assertEq(Sync.state._bisRestoreBackfillHold, nil, "BiS hold stays clear after the drain")
+Sync.BackfillAutomaticBisOnPromotion = originalBisBackfill
+Sync.BeginAdminConvergence = restoreBegin
 
 -- Exact repairs keep the advertiser ahead of the default helper route.
 reset(MEMBER)
@@ -1627,6 +1668,40 @@ Sync.state.helpers = {}
 Sync.state.coordinator = KINO
 Sync.state._coordinatorCatchUp = KINO
 assertEq(Sync:_PreferredRepairTargetRoutable(KINO), false, "unproven catch-up coordinator is not an integrity target")
+reset(MEMBER)
+setAdmins({ OWNER })
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+Sync.state.coordinator = KINO
+Sync.state._coordinatorCatchUp = KINO
+Sync.state.helpers = {}
+local grantStateCalls = 0
+local originalGrantState = Sync._LogAdminGrantState
+Sync._LogAdminGrantState = function(self, logTable, who)
+    grantStateCalls = grantStateCalls + 1
+    return originalGrantState(self, logTable, who)
+end
+assertEq(Sync:_LocalCatchUpGrantStored(KINO), true, "stored catch-up grant is found")
+local grantStateAfterFirst = grantStateCalls
+for _ = 1, 4 do
+    assertEq(Sync:_LocalCatchUpGrantStored(KINO), true, "repeat catch-up grant check stays stored")
+end
+assertEq(grantStateCalls, grantStateAfterFirst, "repeat catch-up grant checks do not rescan history")
+table.insert(profile._lootLogs, {
+    _author = OWNER,
+    _counter = 2,
+    _eventType = "ADMIN_REMOVED",
+    _data = { member = KINO },
+})
+assertEq(Sync:_LocalCatchUpGrantStored(KINO), false, "a later removal clears the cached catch-up grant")
+assertTrue(grantStateCalls > grantStateAfterFirst, "a history change scans the catch-up grant again")
+Sync._LogAdminGrantState = originalGrantState
 local catchUpRepairOk = Sync:RequestIntegrityRepairRanges(PROFILE, {
     { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
 }, "catch-up-integrity", KINO)
@@ -2782,12 +2857,78 @@ assertEq(Sync.state.sessionId, "session-regranted",
 assertEq(Sync.state.coordEpoch, 13, "regranted coordinator heartbeat advances the epoch")
 Sync._Now = originalRegrantNow
 
+-- A negative same-profile scan must not survive a later removal.
+reset(MEMBER)
+setAdmins({ OWNER })
+profile._lootLogs = {}
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+local negativeNow = 11000
+local originalNegativeNow = Sync._Now
+Sync._Now = function()
+    return negativeNow
+end
+Sync:HandleCoordinatorTakeover(COORD, {
+    sessionId = "session-negative-cache",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 12,
+})
+assertEq(Sync.state.sessionId, "session-negative-cache", "history that does not revoke still adopts the new session")
+assertEq(Sync.state._sameProfileRevokeScan and Sync.state._sameProfileRevokeScan.revoked, false,
+    "a negative revocation scan is cached")
+table.insert(profile._lootLogs, {
+    _author = OWNER,
+    _counter = 1,
+    _eventType = "ADMIN_REMOVED",
+    _data = { member = COORD },
+})
+Sync:HandleCoordinatorTakeover(COORD, {
+    sessionId = "session-after-removal",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 13,
+})
+assertEq(Sync.state.sessionId, "session-negative-cache",
+    "a log removal invalidates the negative scan and keeps the old session")
+assertEq(Sync.state._sameProfileRevokeScan and Sync.state._sameProfileRevokeScan.revoked, true,
+    "the removal is cached as revoked")
+Sync.state._sameProfileRevokeScan.revoked = false
+Sync:_RememberRevokedRoute(COORD)
+assertEq(Sync.state._sameProfileRevokeScan, nil, "an explicit revocation drops the negative scan")
+Sync:HandleCoordinatorTakeover(COORD, {
+    sessionId = "session-after-remember",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 14,
+})
+assertEq(Sync.state.sessionId, "session-negative-cache",
+    "the remembered removal still rejects the next new session")
+assertEq(Sync:_RouteWasRevoked(COORD), true, "rejecting that session keeps the revocation")
+Sync._Now = originalNegativeNow
+
 -- An authorized admin who is not a Helper can still be the integrity provider.
 reset(COORD)
 Sync.state.isCoordinator = true
 Sync.state.helpers = { KINO }
 setAdmins({ COORD, KINO, OWNER })
 assertEq(Sync:_PreferredRepairTargetRoutable(OWNER), true, "authorized non-helper stays a repair target")
+Sync.state.peers[OWNER].inGroup = false
+assertEq(Sync:_PreferredRepairTargetRoutable(OWNER), false, "out-of-group admin is not an integrity target")
+local outsideOk = Sync:RequestIntegrityRepairRanges(PROFILE, {
+    { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+}, "outside-admin", OWNER)
+assertEq(outsideOk, true, "out-of-group preferred admin falls back to an in-group route")
+local outsideReq = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.meta and req.meta.integrityRepair then
+        outsideReq = req
+    end
+end
+assertTrue(outsideReq ~= nil, "out-of-group fallback repair is registered")
+assertTrue(not listHas(outsideReq.targets, OWNER), "out-of-group admin is not the repair target")
+assertTrue(listHas(outsideReq.targets, KINO), "out-of-group fallback asks the in-group helper")
+Sync.state.peers[OWNER].inGroup = true
 assertEq(Sync:_PreferredRepairTargetRoutable(SUSPENDERS), false, "unauthorized preferred provider is not a repair target")
 Sync:_RememberRevokedRoute(OWNER)
 setAdmins({ COORD, KINO })

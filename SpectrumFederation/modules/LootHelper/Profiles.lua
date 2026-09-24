@@ -587,6 +587,12 @@ function LootProfile:_MarkIntegritySummaryDirty()
     self._authorWindowSummaryDirty = true
 end
 
+-- Bump when log contents change so sync can drop a cached history scan.
+-- Index rebuilds do not call this. A replaced row and an appended row do.
+function LootProfile:_NoteLootLogMutation()
+    self._lootLogRevision = (tonumber(self._lootLogRevision) or 0) + 1
+end
+
 function LootProfile:_RefreshLogPositionIndex()
     self._logPositionIndex = {}
     for i, log in ipairs(self._lootLogs or {}) do
@@ -728,6 +734,7 @@ function LootProfile:_ReplaceLogById(logId, replacementLog)
         end
     end
     self:_MarkIntegritySummaryDirty()
+    self:_NoteLootLogMutation()
     return true
 end
 
@@ -4190,6 +4197,7 @@ function LootProfile:_InsertLog(lootLog, opts)
         self:_RefreshLogPositionIndex()
     end
     self:_MarkIntegritySummaryDirty()
+    self:_NoteLootLogMutation()
     if Identity and Identity.AffectsProjection and Identity.AffectsProjection(eventType) then
         if appendedInOrder
             and Identity.CanFanOutBalance and Identity.CanFanOutBalance(eventType)
@@ -5293,6 +5301,7 @@ function LootProfile:MergeLogTables(logTables, opts)
         table.sort(self._lootLogs, function(a, b) return self:_CompareLogs(a, b) end)
         self:_RefreshLogPositionIndex()
         self:_MarkIntegritySummaryDirty()
+        self:_NoteLootLogMutation()
         if identityDirty then
             self:ApplyIdentityProjection({ force = true })
         end

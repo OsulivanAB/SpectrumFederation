@@ -54,6 +54,10 @@ function Sync:_RememberRevokedRoute(name)
     if type(name) ~= "string" or name == "" or not self.state then return end
     self.state.revokedRoutes = self.state.revokedRoutes or {}
     self:_RememberResponder(self.state.revokedRoutes, name)
+    -- A negative same-profile scan must not outlive this tombstone. The next
+    -- descriptor walks history again instead of adopting a session that then
+    -- clears the revocation.
+    self.state._sameProfileRevokeScan = nil
     if type(self.state._coordinatorCatchUp) == "string" and self:_SamePlayer(self.state._coordinatorCatchUp, name) then
         self.state._coordinatorCatchUp = nil
     end
@@ -123,9 +127,22 @@ end
 -- an admin. Session start still applies the descriptor and reconciles.
 -- Call this only after epoch gating. One scan per request timeout is reused
 -- for a coordinator who is not a current admin; a different name waits
--- instead of walking history again.
+-- instead of walking history again. The cached result is dropped when that
+-- history changes or an explicit revocation is recorded.
 -- @param payload table
 -- @return boolean
+function Sync:_SameProfileRevokeScanCurrent(cache)
+    if type(cache) ~= "table" or not self.state then return false end
+    if cache.profileId ~= self.state.profileId then return false end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    local logs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
+    if cache.logs ~= logs then return false end
+    local count = type(logs) == "table" and #logs or 0
+    if cache.count ~= count then return false end
+    local rev = type(profile) == "table" and (tonumber(profile._lootLogRevision) or 0) or 0
+    return cache.rev == rev
+end
+
 function Sync:_IncomingSameProfileHistoryRevoked(payload)
     if type(payload) ~= "table" or not self.state then return false end
     if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return false end
@@ -139,7 +156,7 @@ function Sync:_IncomingSameProfileHistoryRevoked(payload)
     local now = self:_Now()
     local cooldown = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
     local cache = self.state._sameProfileRevokeScan
-    if type(cache) == "table" and cache.profileId == payload.profileId then
+    if self:_SameProfileRevokeScanCurrent(cache) then
         local age = now - (tonumber(cache.at) or 0)
         if age >= 0 and age < cooldown then
             if self:_SamePlayer(cache.name, payload.coordinator) then
@@ -150,11 +167,16 @@ function Sync:_IncomingSameProfileHistoryRevoked(payload)
     end
     if not self._LocalHistoryRevokesAdmin then return false end
     local revoked = self:_LocalHistoryRevokesAdmin(payload.coordinator) == true
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    local logs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
     self.state._sameProfileRevokeScan = {
         name = payload.coordinator,
         profileId = payload.profileId,
         at = now,
         revoked = revoked,
+        logs = logs,
+        count = type(logs) == "table" and #logs or 0,
+        rev = type(profile) == "table" and (tonumber(profile._lootLogRevision) or 0) or 0,
     }
     if revoked and SF.Debug then
         SF.Debug:Verbose("SYNC", "Ignoring new session from %s; local history revoked that coordinator",
@@ -411,12 +433,22 @@ end
 
 -- Function True when local history already stores a current grant for this player.
 -- The row must be authored by a different canonical admin. A missing row is not
--- proof, and it is not a revocation.
+-- proof, and it is not a revocation. One walk per player is reused until the
+-- log list, its revision, or the canonical admin list changes.
 -- @param name string "Name-Realm"
 -- @return boolean
+function Sync:_CatchUpGrantAdminToken(profile)
+    local admins = self._GetProfileAdminUsers and self:_GetProfileAdminUsers(profile) or nil
+    if type(admins) ~= "table" then return "" end
+    local parts = {}
+    for i = 1, #admins do
+        parts[i] = tostring(admins[i])
+    end
+    return table.concat(parts, "\0")
+end
+
 function Sync:_LocalCatchUpGrantStored(name)
     if type(name) ~= "string" or name == "" or not self.state then return false end
-    if self._LocalHistoryRevokesAdmin and self:_LocalHistoryRevokesAdmin(name) then return false end
     if type(self.FindLocalProfileById) ~= "function" or type(self._GetProfileLootLogs) ~= "function" then
         return false
     end
@@ -424,6 +456,32 @@ function Sync:_LocalCatchUpGrantStored(name)
     local profile = self:FindLocalProfileById(self.state.profileId)
     local logs = profile and self:_GetProfileLootLogs(profile) or nil
     if type(logs) ~= "table" then return false end
+    local rev = type(profile) == "table" and (tonumber(profile._lootLogRevision) or 0) or 0
+    local adminToken = self:_CatchUpGrantAdminToken(profile)
+    local cache = self.state._catchUpGrantScan
+    local cacheKey = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(name)) or name
+    if type(cache) ~= "table"
+        or cache.profileId ~= self.state.profileId
+        or cache.logs ~= logs
+        or cache.count ~= #logs
+        or cache.rev ~= rev
+        or cache.admins ~= adminToken
+        or type(cache.byName) ~= "table"
+    then
+        cache = {
+            profileId = self.state.profileId,
+            logs = logs,
+            count = #logs,
+            rev = rev,
+            admins = adminToken,
+            byName = {},
+        }
+        self.state._catchUpGrantScan = cache
+    end
+    local cached = cache.byName[cacheKey]
+    if cached ~= nil then
+        return cached == true
+    end
     local grantLog = nil
     for _, log in ipairs(logs) do
         local logTable = log
@@ -437,10 +495,22 @@ function Sync:_LocalCatchUpGrantStored(name)
             grantLog = nil
         end
     end
-    if type(grantLog) ~= "table" then return false end
-    local author = grantLog._author or grantLog.author
-    if type(author) ~= "string" or author == "" or self:_SamePlayer(author, name) then return false end
-    return self:IsSenderAuthorized(self.state.profileId, author) == true
+    local stored = false
+    if type(grantLog) == "table" then
+        local author = grantLog._author or grantLog.author
+        if type(author) == "string" and author ~= "" and not self:_SamePlayer(author, name) then
+            stored = self:IsSenderAuthorized(self.state.profileId, author) == true
+        end
+    end
+    local storedNames = 0
+    for _ in pairs(cache.byName) do
+        storedNames = storedNames + 1
+    end
+    if storedNames >= 32 then
+        cache.byName = {}
+    end
+    cache.byName[cacheKey] = stored
+    return stored
 end
 
 -- Function In-group canonical admins who can serve a coordinator grant this client missed.
@@ -923,7 +993,8 @@ end
 
 -- Function True when a repair may still be asked of this preferred provider.
 -- LOG_REQ is admin-to-admin. A canonical admin who advertised the window stays
--- a target even when they were not selected as a Helper. Revoked players and
+-- a target even when they were not selected as a Helper, but only while they
+-- are still in the group. Revoked players, players who left the group, and
 -- players who are not admins do not. A catch-up coordinator remains only
 -- after the proving grant is already stored.
 -- @param name string|nil "Name-Realm"
@@ -931,6 +1002,7 @@ end
 function Sync:_PreferredRepairTargetRoutable(name)
     if type(name) ~= "string" or name == "" then return false end
     if self:_RouteWasRevoked(name) then return false end
+    if self._PeerInGroup and not self:_PeerInGroup(name) then return false end
     if self:_CoordinatorNeedsCatchUp(name) then
         return self:_LocalCatchUpGrantStored(name) == true
     end

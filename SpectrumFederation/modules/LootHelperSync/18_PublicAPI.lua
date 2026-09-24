@@ -131,6 +131,7 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
+    self.state._catchUpGrantScan = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = self:_Now()
 
@@ -172,6 +173,18 @@ function Sync:TryRestorePersistedSession(reason)
     if not self.state.isCoordinator then
         self.state._bisRestoreBackfillHold = nil
         self:EnsureHeartbeatMonitor("RestorePersistedSession")
+    elseif not wasPersistedCoordinator then
+        -- Reconciliation already promoted this client. TakeoverSession started
+        -- convergence and cleared the hold. Putting the hold back would block
+        -- the drain that runs when that convergence finishes.
+        if type(self.state._bisBackfillPendingReason) ~= "string" then
+            self.state._bisBackfillPendingReason = "RestorePersistedSession"
+        end
+        self.state._bisRestoreBackfillHold = nil
+        local conv = self.state._adminConvergence
+        if not (type(conv) == "table" and conv.finished ~= true) and self._DrainAutomaticBisBackfill then
+            self:_DrainAutomaticBisBackfill()
+        end
     else
         -- Local history may be missing peer logs from before the reload.
         -- Reannounce runs admin convergence, which drains this after repairs.
@@ -861,6 +874,7 @@ function Sync:_ResetSessionState(reason)
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
+    self.state._catchUpGrantScan = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = nil
 
