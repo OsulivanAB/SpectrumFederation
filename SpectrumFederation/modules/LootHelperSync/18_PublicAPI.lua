@@ -783,6 +783,12 @@ function Sync:_ResetSessionState(reason)
         elseif endingProfile and endingProfile._rcConfigDirty ~= true then
             endingProfile._pendingRCLootCouncilIntegration = nil
         end
+        -- A paused backfill job belongs to this session. Leaving it on the
+        -- profile makes the next session reuse it, discard it for the old
+        -- session id, and never build a replacement scan.
+        if endingProfile and endingProfile.ClearTransientAutomaticBisBackfill then
+            endingProfile:ClearTransientAutomaticBisBackfill()
+        end
     end
 
     -- Cancel outstanding request timers and clear requests
@@ -809,6 +815,7 @@ function Sync:_ResetSessionState(reason)
     self.state.rcConfigSeq = nil
     self.state._restoredSessionNeedsReannounce = false
     self.state._bisRestoreBackfillHold = nil
+    self.state._bisBackfillPendingReason = nil
     self.state._suppressedBisOutcomes = nil
 
     -- Clear session metadata

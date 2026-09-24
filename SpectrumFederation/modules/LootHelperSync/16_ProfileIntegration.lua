@@ -2586,7 +2586,10 @@ function Sync:_FoldSuppressedIntoAuthorMax(exactSource)
 end
 
 -- Current-session repair rows only. A missing timestamp or epoch stays
--- importable, and anything strictly before coordEpoch is historical.
+-- importable. Takeover sets coordEpoch to oldEpoch + 1 when that is still
+-- ahead of server time, so a same-second row would look historical. Only
+-- that one-second lead uses server time as the cutoff. A larger gap stays
+-- on coordEpoch so older history is not reclassified.
 function Sync:_ShouldSuppressRepairBisOutcome(profile, logTable)
     if type(logTable) ~= "table" or type(self.state) ~= "table" then
         return false
@@ -2606,6 +2609,10 @@ function Sync:_ShouldSuppressRepairBisOutcome(profile, logTable)
     local epoch = tonumber(self.state.coordEpoch)
     if not epoch then
         return false
+    end
+    local now = self._Now and tonumber(self:_Now())
+    if type(now) == "number" and epoch > now and (epoch - now) <= 1 then
+        epoch = now
     end
     local timestamp = tonumber(logTable._timestamp or logTable.timestamp)
     if not timestamp or timestamp < epoch then
@@ -2660,6 +2667,18 @@ function Sync:_RememberSuppressedAutomaticBisOutcome(profileId, logTable)
     return true
 end
 
+-- Structural validation only. An invalid repair row is left for MergeLogs,
+-- which rejects it, instead of being remembered as a counter we never stored.
+function Sync:_RepairBisOutcomeWireValid(profile, logTable)
+    if not (SF.LootLog and SF.LootLog.ValidateTable) then
+        return false
+    end
+    return SF.LootLog.ValidateTable(logTable, {
+        allowUnknownEventType = false,
+        profile = profile,
+    }) == true
+end
+
 -- Drop current-session non-coordinator BIS_OUTCOME rows from an AUTH_LOGS
 -- batch. Remember each dropped counter so the repair can complete. Direct
 -- MergeLogTables and snapshot import are unchanged.
@@ -2672,6 +2691,7 @@ function Sync:_PartitionRepairBisOutcomes(profileId, logs)
     for i = 1, #logs do
         local row = logs[i]
         local suppress = self:_ShouldSuppressRepairBisOutcome(profile, row)
+            and self:_RepairBisOutcomeWireValid(profile, row)
             and self:_RememberSuppressedAutomaticBisOutcome(profileId, row)
         if suppress then
             if not kept then

@@ -7090,6 +7090,185 @@ function testRejectedBisOutcomeStillRequestsGap()
 end
 testRejectedBisOutcomeStillRequestsGap()
 
+function testStaleAutomaticBisBackfill()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("StaleBackfill")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    local canon = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007401-1",
+        response = "Greed",
+        responseID = 2,
+    }))
+    local row = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(canon), {
+        profile = profile,
+        author = AWARDER,
+        timestamp = canon.timestamp,
+        externalId = canon.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(profile:AddLootLog(row, { skipPermission = true, skipBroadcast = true }), "stale-backfill RC row is stored")
+    profile._autoBisBackfill = {
+        sessionId = "OLD",
+        profileId = profile:GetProfileId(),
+        keys = {},
+        index = 1,
+        covered = {},
+    }
+    Sync.state._bisBackfillPendingReason = "BackfillPaused"
+    assertEq(profile:ReconcileMissingAutomaticBisOutcomes(), 1, "a stale backfill job does not swallow the new scan")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", canon.awardKey), 1, "the replacement scan writes the missing outcome")
+
+    profile._autoBisBackfill = {
+        sessionId = Sync.state.sessionId,
+        profileId = profile:GetProfileId(),
+        keys = { canon.awardKey },
+        index = 1,
+        covered = {},
+    }
+    profile._autoBisBackfillArmed = true
+    Sync.state._bisBackfillPendingReason = "BackfillPaused"
+    Sync:_ResetSessionState("test")
+    assertEq(profile._autoBisBackfill, nil, "session reset drops the backfill job")
+    assertEq(profile._autoBisBackfillArmed, nil, "session reset drops the armed backfill flag")
+    assertEq(Sync.state._bisBackfillPendingReason, nil, "session reset drops the pending backfill reason")
+end
+testStaleAutomaticBisBackfill()
+
+function testFutureEpochSuppressesSameSecondOutcome()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("FutureEpoch")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    local now = 1700000500
+    local previousNow = Sync._Now
+    function Sync:_Now()
+        return now
+    end
+    Sync.state.coordEpoch = now + 1
+    local profileId = profile:GetProfileId()
+    local author = "AdminB-Garona"
+    local function outcomeWire(awardKey, timestamp, counter)
+        local data = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+        data.sourceLogId = awardKey
+        data.awardKey = awardKey
+        data.awardMember = WINNER
+        data.qualified = false
+        data.outcome = "NOT_BIS"
+        data.assignedSlots = {}
+        data.itemLink = ITEM_LINK
+        data.itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+        data.response = "Greed"
+        local log = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, data, {
+            profile = profile,
+            author = author,
+            timestamp = timestamp,
+            counter = counter,
+            skipPermission = true,
+        })
+        assertTrue(log ~= nil, "future-epoch outcome wire is valid")
+        return log:ToTable()
+    end
+    local function deliver(requestId, wire)
+        Sync.state.requests[requestId] = {
+            kind = "LOG_REQ",
+            meta = {
+                profileId = profileId,
+                author = author,
+                fromCounter = wire._counter,
+                toCounter = wire._counter,
+            },
+        }
+        Sync:HandleAuthLogs(PLAYER, {
+            sessionId = Sync.state.sessionId,
+            profileId = profileId,
+            requestId = requestId,
+            author = author,
+            fromCounter = wire._counter,
+            toCounter = wire._counter,
+            logs = { wire },
+        })
+    end
+    local current = outcomeWire("award-same-second", now, 1)
+    deliver("REQ-FUTURE", current)
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", "award-same-second"), 0, "a same-second outcome is not historical when the epoch is one second ahead")
+    assertEq(Sync:_ComputeContigCounter(profileId, author), 1, "the same-second outcome still closes the author prefix")
+    local older = outcomeWire("award-before-now", now - 1, 2)
+    deliver("REQ-OLDER", older)
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", "award-before-now"), 1, "a row from before server time stays importable")
+    Sync._Now = previousNow
+end
+testFutureEpochSuppressesSameSecondOutcome()
+
+function testMalformedRepairBisOutcomeIsNotRemembered()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("MalformedRepair")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    Sync.state.coordEpoch = 1700000000
+    local profileId = profile:GetProfileId()
+    local author = "AdminB-Garona"
+    local data = SF.LootLog.GetEventDataTemplate(SF.LootLogEventTypes.BIS_OUTCOME)
+    data.sourceLogId = "award-malformed"
+    data.awardKey = "award-malformed"
+    data.awardMember = WINNER
+    data.qualified = false
+    data.outcome = "NOT_BIS"
+    data.assignedSlots = {}
+    data.itemLink = ITEM_LINK
+    data.itemString = SF.LootLog.ExtractItemString(ITEM_LINK)
+    data.response = "Greed"
+    local log = SF.LootLog.new(SF.LootLogEventTypes.BIS_OUTCOME, data, {
+        profile = profile,
+        author = author,
+        timestamp = 1700005000,
+        counter = 2,
+        skipPermission = true,
+    })
+    assertTrue(log ~= nil, "malformed repair starts from a valid outcome")
+    local wire = log:ToTable()
+    wire._id = "bogus"
+    wire._fingerprint = 1
+    function Sync:_RetryRequestSoon()
+    end
+    Sync.state.requests["REQ-BAD"] = {
+        kind = "LOG_REQ",
+        meta = {
+            profileId = profileId,
+            author = author,
+            fromCounter = 2,
+            toCounter = 2,
+        },
+    }
+    Sync:HandleAuthLogs(PLAYER, {
+        sessionId = Sync.state.sessionId,
+        profileId = profileId,
+        requestId = "REQ-BAD",
+        author = author,
+        fromCounter = 2,
+        toCounter = 2,
+        logs = { wire },
+    })
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", "award-malformed"), 0, "an invalid repair outcome is not stored")
+    assertEq(Sync:_ComputeContigCounter(profileId, author), 0, "an invalid repair outcome does not advance the author prefix")
+    local remembered = Sync.state._suppressedBisOutcomes and Sync.state._suppressedBisOutcomes[profileId]
+    assertTrue(remembered == nil or next(remembered) == nil, "an invalid repair outcome is not remembered")
+end
+testMalformedRepairBisOutcomeIsNotRemembered()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

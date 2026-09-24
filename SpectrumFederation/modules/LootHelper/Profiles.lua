@@ -3204,6 +3204,31 @@ function LootProfile:_PumpAutomaticBisBackfill()
     return wroteNow
 end
 
+function LootProfile:_AutomaticBisBackfillJobIsCurrent()
+    local job = self._autoBisBackfill
+    if type(job) ~= "table" then
+        return false
+    end
+    local Sync = SF.LootHelperSync
+    local state = Sync and Sync.state
+    if not self:IsActiveSessionCoordinator() or type(state) ~= "table" then
+        return false
+    end
+    if state.sessionId ~= job.sessionId then
+        return false
+    end
+    local profileId = self.GetProfileId and self:GetProfileId() or nil
+    return profileId == job.profileId
+end
+
+function LootProfile:_ClearStaleAutomaticBisBackfill()
+    if not self._autoBisBackfill or self:_AutomaticBisBackfillJobIsCurrent() then
+        return false
+    end
+    self:ClearTransientAutomaticBisBackfill()
+    return true
+end
+
 function LootProfile:ReconcileInsertedRCAwards(awardKeys, opts)
     if self._writingAutoBis or self._autoBisBackfillPumping or type(awardKeys) ~= "table" then
         return 0
@@ -3211,6 +3236,7 @@ function LootProfile:ReconcileInsertedRCAwards(awardKeys, opts)
     if not self:IsActiveSessionCoordinator() then
         return 0
     end
+    self:_ClearStaleAutomaticBisBackfill()
     if self._autoBisBackfill then
         local job = self._autoBisBackfill
         local seen = {}
@@ -3290,6 +3316,7 @@ function LootProfile:ReconcileMissingAutomaticBisOutcomes()
     if self._writingAutoBis or self._autoBisBackfillPumping or not self:IsActiveSessionCoordinator() then
         return 0
     end
+    self:_ClearStaleAutomaticBisBackfill()
     if self._autoBisBackfill then
         self:_AppendMissingAwardsToAutomaticBisBackfill()
         return self:_PumpAutomaticBisBackfill()
