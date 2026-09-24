@@ -5051,6 +5051,103 @@ assertEq(compared, beforeLong, "an overlong grant field is not deeply compared")
 Sync._SamePlainValue = originalSame
 end)()
 
+-- A re-grant clears the NEW_LOG warning without a packet from that player.
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = COORD
+local function newLog(counter)
+    Sync:HandleNewLog(COORD, {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        log = {
+            _eventType = "POINT_CHANGE",
+            _author = COORD,
+            _counter = counter,
+            _data = { member = MEMBER },
+        },
+    })
+end
+newLog(1)
+newLog(2)
+assertEq(warningCount("not an admin"), 1, "the first revocation warns once")
+setAdmins({ OWNER, COORD })
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_update")
+setAdmins({ OWNER })
+local beforeSecond = warningCount("not an admin")
+newLog(3)
+assertEq(warningCount("not an admin"), beforeSecond + 1,
+    "a later removal warns again after the re-grant")
+end)()
+
+-- The packet that proves a catch-up coordinator refreshes the takeover clock.
+-- An unproven reply does not.
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+Sync.state.heartbeat.lastCoordMessageAt = 40
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 9,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local req = seedRequest("need-proof-clock", "NEED_LOGS", { KINO }, KINO)
+local originalNow = Sync._Now
+Sync._Now = function()
+    return 9000
+end
+local originalRebuild = Sync.RebuildProfile
+Sync.RebuildProfile = function()
+    setAdmins({ OWNER, KINO })
+    return true
+end
+local function logsPayload(logs)
+    return {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        requestId = req.id,
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+        logs = logs,
+    }
+end
+Sync:HandleAuthLogs(KINO, logsPayload({
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}))
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 40,
+    "an unproven catch-up reply does not refresh the coordinator timer")
+Sync:HandleAuthLogs(KINO, logsPayload({
+    {
+        _author = OWNER,
+        _counter = 9,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}))
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 9000,
+    "the packet that proves the coordinator refreshes the timer")
+Sync.RebuildProfile = originalRebuild
+Sync._Now = originalNow
+end)()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

@@ -432,6 +432,31 @@ function Sync:_ClearUnauthorizedNewLogWarning(sender, profileId)
     warned[key] = nil
 end
 
+-- Function Drop NEW_LOG warning markers for senders who are admins again.
+-- Reconciliation sees the re-grant even when that player sent nothing.
+-- @param profileId string
+-- @return nil
+function Sync:_ClearAuthorizedNewLogWarnings(profileId)
+    local warned = self.state and self.state._newLogUnauthorizedWarned
+    if type(warned) ~= "table" then return end
+    if type(profileId) ~= "string" or profileId == "" then return end
+    local sessionId = (self.state and self.state.sessionId) or ""
+    local prefix = tostring(sessionId) .. "\0" .. tostring(profileId) .. "\0"
+    local prefixLen = #prefix
+    local clear = {}
+    for key in pairs(warned) do
+        if type(key) == "string" and key:sub(1, prefixLen) == prefix then
+            local sender = key:sub(prefixLen + 1)
+            if sender ~= "" and self:IsSenderAuthorized(profileId, sender) then
+                clear[#clear + 1] = key
+            end
+        end
+    end
+    for i = 1, #clear do
+        warned[clear[i]] = nil
+    end
+end
+
 -- Function Handle NEW_LOG message; dedupe/apply and request gaps if needed.
 -- @param sender string "Name-Realm" of sender
 -- @param payload table Decoded message payload

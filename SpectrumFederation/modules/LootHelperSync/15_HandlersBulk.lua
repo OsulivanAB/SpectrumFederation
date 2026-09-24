@@ -332,6 +332,11 @@ function Sync:HandleAuthLogs(sender, payload)
             logsToMerge = {}
             allowReplaceExisting = false
         end
+        -- Routing saw this sender as unproven and did not refresh the takeover
+        -- clock. The grant is now local, so this packet is liveness.
+        if self._NoteCoordinatorTransportActivity then
+            self:_NoteCoordinatorTransportActivity(sender)
+        end
     end
     -- Current-session non-coordinator BIS_OUTCOME rows are not stored. Their
     -- counters stay in session memory so this repair can still complete.
@@ -676,6 +681,12 @@ function Sync:HandleProfileSnapshot(sender, payload)
     -- catch-up, the same as session start. A later snapshot uses the ordinary
     -- reason and still revokes when catch-up was never established.
     self:RebuildProfile(profileId, isNew and "profile_snapshot_new" or "profile_snapshot")
+    -- A catch-up snapshot is admitted only after this rebuild. Refresh the
+    -- takeover clock once the sender is a canonical admin. An unproven import
+    -- still leaves the clock alone.
+    if self._NoteCoordinatorTransportActivity then
+        self:_NoteCoordinatorTransportActivity(sender)
+    end
     self:LogSessionPointsSummary(profileId, "profile_snapshot_import")
     if t1 then
         self:_MObserve("sync.merge.profile_snapshot.rebuild_ms", debugprofilestop() - t1)

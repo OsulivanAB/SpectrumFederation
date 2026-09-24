@@ -2267,6 +2267,13 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if self.state.profileId ~= profileId then return end
     if not self:_ProfileAuthorizationKnown() then return end
 
+    -- A re-grant can arrive as another admin's log. The warned player may not
+    -- send NEW_LOG while authorized. Clear the marker now so a later removal
+    -- can warn again.
+    if self._ClearAuthorizedNewLogWarnings then
+        self:_ClearAuthorizedNewLogWarnings(profileId)
+    end
+
     self._reconcilingSessionAuthorization = true
     -- History replay, including a live NEW_LOG rebuild, recomputes _adminUsers
     -- before this runs. Peers can disappear from that incomplete list while
