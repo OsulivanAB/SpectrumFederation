@@ -4525,6 +4525,150 @@ assertEq(updateReason, "profile_snapshot", "an existing profile keeps the ordina
 Sync.RebuildProfile = originalRebuild
 end)()
 
+-- A full failed-catch-up book still blocks a coordinator who was never recorded.
+-- Proof and grant caches drop the oldest entry instead of forgetting every result.
+;(function()
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 10
+Sync.state.isCoordinator = true
+Sync.state._failedCatchUp = {}
+for i = 1, 32 do
+    Sync.state._failedCatchUp[PROFILE .. "\0other-" .. i] = true
+end
+assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
+    "a full book blocks an unrecorded unproven coordinator")
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-overflow",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+assertEq(Sync.state.sessionId, SESSION, "a full book rejects a new unproven coordinator")
+assertEq(Sync.state.coordinator, OWNER, "the unrecorded coordinator does not take the session")
+setAdmins({ OWNER, KINO })
+assertEq(Sync:_FailedCatchUpBlocks(KINO, PROFILE), false,
+    "a canonical admin is not blocked by a full catch-up book")
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-admin",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 12,
+})
+assertEq(Sync.state.coordinator, KINO, "a canonical admin can still start a session when the book is full")
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = OWNER
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+Sync.state._failedCatchUp = {}
+for i = 1, 32 do
+    Sync.state._failedCatchUp[PROFILE .. "\0filled-" .. i] = true
+end
+assertEq(Sync:_FailedCatchUpBlocks(KINO, PROFILE), false,
+    "a stored grant is not blocked by a full catch-up book")
+
+reset(MEMBER)
+setAdmins({ OWNER })
+profile._lootLogs = {
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}
+local grantWalks = 0
+local originalGrantState = Sync._LogAdminGrantState
+Sync._LogAdminGrantState = function(self, logTable, who, scannedProfile)
+    grantWalks = grantWalks + 1
+    return originalGrantState(self, logTable, who, scannedProfile)
+end
+local grantFilled = true
+for n = 1, 32 do
+    if Sync:_LocalCatchUpGrantStored("Player" .. n .. "-Realm") ~= false then
+        grantFilled = false
+    end
+end
+assertTrue(grantFilled, "the grant cache stores each of the first 32 misses")
+local afterGrantFill = grantWalks
+assertEq(Sync:_LocalCatchUpGrantStored("Player2-Realm"), false,
+    "an older grant-cache entry is still a hit")
+assertEq(grantWalks, afterGrantFill, "filling the grant cache does not drop the older names")
+assertEq(Sync:_LocalCatchUpGrantStored("Player33-Realm"), false,
+    "the grant cache accepts one more name by dropping the oldest")
+assertTrue(grantWalks > afterGrantFill, "the new grant-cache name walks history once")
+local afterGrantEvict = grantWalks
+assertEq(Sync:_LocalCatchUpGrantStored("Player2-Realm"), false,
+    "the retained grant-cache name stays cached")
+assertEq(grantWalks, afterGrantEvict, "evicting the oldest grant-cache name keeps the rest")
+assertEq(Sync:_LocalCatchUpGrantStored("Player1-Realm"), false,
+    "the evicted grant-cache name is scanned again")
+assertTrue(grantWalks > afterGrantEvict, "the evicted grant-cache name walks history once")
+Sync._LogAdminGrantState = originalGrantState
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state._coordinatorCatchUp = KINO
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 3,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local proofScans = 0
+local originalHistory = Sync._LocalHistoryRevokesAdmin
+Sync._LocalHistoryRevokesAdmin = function(self, name)
+    proofScans = proofScans + 1
+    return originalHistory(self, name)
+end
+local function rejectedProof(n)
+    return {
+        {
+            _author = OWNER,
+            _counter = 100 + n,
+            _eventType = "ADMIN_ADDED",
+            _data = { member = KINO },
+        },
+    }
+end
+local proofsRejected = true
+for n = 1, 32 do
+    if Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(n)) ~= nil then
+        proofsRejected = false
+    end
+end
+assertTrue(proofsRejected, "the first 32 unmatched catch-up proofs are rejected")
+local afterProofFill = proofScans
+assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(2)),
+    "a cached rejection is reused")
+assertEq(proofScans, afterProofFill, "a cached rejection does not walk local history again")
+assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(33)),
+    "the proof cache keeps a new rejection by dropping the oldest")
+assertEq(proofScans, afterProofFill + 1, "the new proof walks local history once")
+assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(2)),
+    "a retained rejection stays cached after eviction")
+assertEq(proofScans, afterProofFill + 1, "evicting the oldest proof keeps the other rejections")
+assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(1)),
+    "the evicted proof is rejected again")
+assertEq(proofScans, afterProofFill + 2, "the evicted proof walks local history once")
+assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(1)),
+    "the reinserted proof stays cached")
+assertEq(proofScans, afterProofFill + 2, "the reinserted proof does not walk local history again")
+Sync._LocalHistoryRevokesAdmin = originalHistory
+end)()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

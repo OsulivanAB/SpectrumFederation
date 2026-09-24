@@ -349,10 +349,26 @@ function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
     self.state._failedCatchUp[key] = true
 end
 
+-- Function How many failed catch-up markers are stored, capped at the book limit.
+-- @param book table|nil
+-- @return number
+function Sync:_FailedCatchUpCount(book)
+    local count = 0
+    if type(book) ~= "table" then return 0 end
+    for _ in pairs(book) do
+        count = count + 1
+        if count >= 32 then return count end
+    end
+    return count
+end
+
 -- Function True when this player already lost an unproven catch-up on this profile.
 -- The marker is profile-scoped. A stored grant or canonical admin status on
 -- the incoming profile clears it, including when that profile is not the
--- active session yet. Another profile is not blocked by it.
+-- active session yet. Another profile is not blocked by it. Once the book
+-- holds 32 identities, an unmarked player is blocked too. Recording stops,
+-- and dropping the whole book would let the next unproven coordinator reclaim
+-- with a new session id. A canonical admin or a stored grant still passes.
 -- @param name string "Name-Realm"
 -- @param profileId string|nil Incoming profile id. Defaults to the active profile.
 -- @return boolean
@@ -364,13 +380,15 @@ function Sync:_FailedCatchUpBlocks(name, profileId)
     local book = self.state._failedCatchUp
     if type(book) ~= "table" then return false end
     local key = self:_FailedCatchUpKey(profileId, name)
-    if not key or book[key] ~= true then return false end
+    if not key then return false end
+    local marked = book[key] == true
+    if not marked and self:_FailedCatchUpCount(book) < 32 then return false end
     if self:IsSenderAuthorized(profileId, name) then
-        book[key] = nil
+        if marked then book[key] = nil end
         return false
     end
     if self._LocalCatchUpGrantStored and self:_LocalCatchUpGrantStored(name, profileId) == true then
-        book[key] = nil
+        if marked then book[key] = nil end
         return false
     end
     return true
@@ -711,6 +729,7 @@ function Sync:_LocalCatchUpGrantStored(name, profileId)
             admins = adminToken,
             applied = applied,
             byName = {},
+            order = {},
         }
         self.state[cacheField] = cache
     end
@@ -742,8 +761,25 @@ function Sync:_LocalCatchUpGrantStored(name, profileId)
     for _ in pairs(cache.byName) do
         storedNames = storedNames + 1
     end
-    if storedNames >= 32 then
-        cache.byName = {}
+    if type(cache.order) ~= "table" then
+        cache.order = {}
+    end
+    -- A full clear would make the next 32 names walk history again. Drop the
+    -- oldest identity instead, and refresh a name that is already stored.
+    if cache.byName[cacheKey] == nil and storedNames >= 32 then
+        local oldest = table.remove(cache.order, 1)
+        if oldest == nil then
+            for key in pairs(cache.byName) do
+                oldest = key
+                break
+            end
+        end
+        if oldest ~= nil then
+            cache.byName[oldest] = nil
+        end
+    end
+    if cache.byName[cacheKey] == nil then
+        cache.order[#cache.order + 1] = cacheKey
     end
     cache.byName[cacheKey] = stored
     return stored
@@ -1202,16 +1238,31 @@ function Sync:_StoreCatchUpProof(token, proven)
             count = token.count,
             rev = token.rev,
             byKey = {},
+            order = {},
         }
         self.state._catchUpProofScan = cache
     end
     local stored = 0
-    for _ in pairs(cache.byKey) do
+    local oldest = nil
+    for key in pairs(cache.byKey) do
         stored = stored + 1
-        if stored >= 32 then
-            cache.byKey = {}
-            break
+        if oldest == nil then oldest = key end
+    end
+    if type(cache.order) ~= "table" then
+        cache.order = {}
+    end
+    -- Replacing the map drops every negative result. The sender can then
+    -- resubmit those proofs and walk local history once per payload. Keep the
+    -- other rejections and drop only the oldest key.
+    if cache.byKey[token.key] == nil and (stored >= 32 or #cache.order >= 32) then
+        local evict = table.remove(cache.order, 1)
+        if evict == nil then evict = oldest end
+        if evict ~= nil then
+            cache.byKey[evict] = nil
         end
+    end
+    if cache.byKey[token.key] == nil then
+        cache.order[#cache.order + 1] = token.key
     end
     cache.byKey[token.key] = proven == true
 end
