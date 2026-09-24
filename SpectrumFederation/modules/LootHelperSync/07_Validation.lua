@@ -448,7 +448,8 @@ function Sync:_CatchUpRequestGrantFields(target)
     return fields
 end
 
--- Function True when this authorized admin may serve another member's grant.
+-- Function True when this authorized admin may serve the current coordinator's grant.
+-- An arbitrary adminGrantMember does not opt this client into bulk serving.
 -- The unproven coordinator does not serve the grant this client has not stored.
 -- @param payload table|nil
 -- @return boolean
@@ -457,11 +458,58 @@ function Sync:_CanServeAdminGrantRequest(payload)
     if type(payload) ~= "table" then return false end
     local member = payload.adminGrantMember
     if type(member) ~= "string" or member == "" then return false end
+    local coordinator = self.state.coordinator
+    if type(coordinator) ~= "string" or not self:_SamePlayer(member, coordinator) then return false end
     if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return false end
     if self:_SamePlayer(member, self:_SelfId()) and not self:_LocalCatchUpGrantStored(self:_SelfId()) then
         return false
     end
     return true
+end
+
+-- Function True when this sender may receive another grant-only reply.
+-- Repeats inside one request timeout, and more than four replies per sender
+-- in this session, do not scan or send again.
+-- @param sender string "Name-Realm"
+-- @param member string "Name-Realm"
+-- @return boolean
+function Sync:_AdminGrantServeAllowed(sender, member)
+    if type(sender) ~= "string" or sender == "" then return false end
+    if type(member) ~= "string" or member == "" then return false end
+    local book = self.state and self.state._adminGrantServe
+    if type(book) ~= "table" then return true end
+    local record = book[sender]
+    if type(record) ~= "table" or not self:_SamePlayer(record.member, member) then
+        local count = 0
+        for _ in pairs(book) do
+            count = count + 1
+            if count >= 64 then return false end
+        end
+        return true
+    end
+    if (tonumber(record.count) or 0) >= 4 then return false end
+    local cooldown = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    local at = tonumber(record.at)
+    if at and (self:_Now() - at) < cooldown then return false end
+    return true
+end
+
+-- Function Remember one grant-only reply so repeats stay bounded.
+-- @param sender string "Name-Realm"
+-- @param member string "Name-Realm"
+-- @return nil
+function Sync:_NoteAdminGrantServe(sender, member)
+    if not self.state or type(sender) ~= "string" or sender == "" then return end
+    if type(member) ~= "string" or member == "" then return end
+    self.state._adminGrantServe = self.state._adminGrantServe or {}
+    local record = self.state._adminGrantServe[sender]
+    if type(record) ~= "table" or not self:_SamePlayer(record.member, member) then
+        record = { member = member, count = 0 }
+    end
+    record.member = member
+    record.count = (tonumber(record.count) or 0) + 1
+    record.at = self:_Now()
+    self.state._adminGrantServe[sender] = record
 end
 
 -- Function True when this request already contacted the named peer.

@@ -271,6 +271,7 @@ local function reset(selfName)
     Sync.state._noLogTargetWarnedFor = nil
     Sync.state._coordinatorCatchUp = nil
     Sync.state.revokedRoutes = nil
+    Sync.state._adminGrantServe = nil
     Sync.state._newLogUnauthorizedWarned = nil
     Sync.state._sentJoinStatusForSessionId = nil
     Sync.state._sessionAnnounced = SESSION
@@ -1879,6 +1880,40 @@ for _, logTable in ipairs(servedGrant and servedGrant.payload.logs or {}) do
     end
 end
 assertEq(servedMember, KINO, "served grant names the catch-up coordinator")
+assertEq(#(servedGrant.payload.logs or {}), 1, "non-helper grant reply does not include the requested window")
+local grantSends = sendCount(Sync.MSG.AUTH_LOGS)
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "grant-from-admin-repeat",
+    adminGrantMember = KINO,
+    missing = {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 99 },
+    },
+})
+assertEq(sendCount(Sync.MSG.AUTH_LOGS), grantSends, "repeat grant request does not scan or send again")
+Sync.state._adminGrantServe = nil
+sends = {}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "grant-for-stranger",
+    adminGrantMember = "Other-Realm",
+    missing = {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+    },
+})
+assertEq(sendCount(Sync.MSG.AUTH_LOGS), 0, "arbitrary adminGrantMember does not serve logs")
+Sync.BuildProfileSnapshot = function()
+    return { meta = { _profileId = PROFILE }, lootLogs = profile._lootLogs }
+end
+Sync:HandleNeedProfile(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "grant-profile",
+    adminGrantMember = KINO,
+})
+assertEq(sendCount(Sync.MSG.PROFILE_SNAPSHOT), 0, "non-helper grant request does not export the profile")
 
 reset(MEMBER)
 setAdmins({ OWNER })

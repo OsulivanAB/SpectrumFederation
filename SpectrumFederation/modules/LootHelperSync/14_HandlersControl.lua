@@ -744,15 +744,15 @@ function Sync:HandleNeedProfile(sender, payload)
         return false, "safe mode (bulk disabled)"
     end
 
-    -- Serve eligibility: coordinator, helper, or an admin asked for a missed grant.
+    -- Serve eligibility: coordinator or helper. A missed grant is a log reply,
+    -- not a reason for a non-helper admin to export the profile.
     if not self.state.active then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedProfile: no active session (sender=%s)", tostring(sender))
         end
         return
     end
-    local grantServe = self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)
-    if not (self.state.isCoordinator or self:IsSelfHelper() or grantServe) then
+    if not (self.state.isCoordinator or self:IsSelfHelper()) then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedProfile: not coordinator/helper (sender=%s)", tostring(sender))
         end
@@ -803,8 +803,7 @@ function Sync:HandleNeedProfile(sender, payload)
     -- Small jitter in case multiple people need it at once
     self:RunWithJitter(0, 250, function()
         if not self.state.active then return end
-        local stillGrantServe = self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)
-        if not (self.state.isCoordinator or self:IsSelfHelper() or stillGrantServe) then return end
+        if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
         if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
         if not SF.LootHelperComm then return end
 
@@ -877,7 +876,8 @@ function Sync:HandleNeedLogs(sender, payload)
         return
     end
     local grantServe = self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)
-    if not (self.state.isCoordinator or self:IsSelfHelper() or grantServe) then
+    local bulkServe = (self.state.isCoordinator or self:IsSelfHelper()) and true or false
+    if not (bulkServe or grantServe) then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedLogs: not coordinator/helper (sender=%s)", tostring(sender))
         end
@@ -902,10 +902,53 @@ function Sync:HandleNeedLogs(sender, payload)
         return
     end
 
-    if type(payload) ~= "table" or type(payload.missing) ~= "table" then return end
-
     local profile = self:FindLocalProfileById(self.state.profileId)
     if not profile then return end
+
+    -- Non-helpers answer a coordinator-grant request with that one row.
+    -- They do not scan or return the caller's missing ranges.
+    if not bulkServe then
+        local member = payload.adminGrantMember
+        if not (self._AdminGrantServeAllowed and self:_AdminGrantServeAllowed(sender, member)) then
+            if SF.Debug then
+                SF.Debug:Verbose("SYNC", "HandleNeedLogs: grant reply already served to %s", tostring(sender))
+            end
+            return
+        end
+        local out = {}
+        if self._AppendAdminGrantEvidence then
+            self:_AppendAdminGrantEvidence(out, profile, member)
+        end
+        if self._NoteAdminGrantServe then
+            self:_NoteAdminGrantServe(sender, member)
+        end
+        local grant = out[1]
+        if type(grant) ~= "table" or not SF.LootHelperComm then return end
+        local counter = tonumber(grant._counter or grant.counter) or 1
+        local resp = {
+            sessionId   = self.state.sessionId,
+            profileId   = self.state.profileId,
+            author      = grant._author or grant.author or member,
+            fromCounter = counter,
+            toCounter   = counter,
+            logs        = out,
+        }
+        if type(payload.requestId) == "string" and payload.requestId ~= "" then
+            resp.requestId = payload.requestId
+        end
+        local grantEnc = nil
+        if SF.SyncProtocol and SF.SyncProtocol.PickBestBulkEncoding then
+            grantEnc = SF.SyncProtocol.PickBestBulkEncoding(payload.supportsEnc)
+        end
+        if grantEnc then
+            SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK", { enc = grantEnc })
+        else
+            SF.LootHelperComm:Send("BULK", self.MSG.AUTH_LOGS, resp, "WHISPER", sender, "BULK")
+        end
+        return
+    end
+
+    if type(payload.missing) ~= "table" then return end
 
     local serveRole = self.state.isCoordinator and "coordinator" or "helper"
     if SF.Debug then
@@ -938,8 +981,7 @@ function Sync:HandleNeedLogs(sender, payload)
 
             self:RunAfter(delay, function()
                 if not self.state.active then return end
-                local stillGrantServe = self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)
-                if not (self.state.isCoordinator or self:IsSelfHelper() or stillGrantServe) then return end
+                if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
                 if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
                 if not SF.LootHelperComm then return end
 
