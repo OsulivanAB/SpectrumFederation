@@ -1881,6 +1881,10 @@ for _, logTable in ipairs(servedGrant and servedGrant.payload.logs or {}) do
 end
 assertEq(servedMember, KINO, "served grant names the catch-up coordinator")
 assertEq(#(servedGrant.payload.logs or {}), 1, "non-helper grant reply does not include the requested window")
+assertEq(servedGrant.payload.author, "Author-Realm", "grant-only reply keeps the requested author")
+assertEq(servedGrant.payload.fromCounter, 1, "grant-only reply keeps the requested start")
+assertEq(servedGrant.payload.toCounter, 2, "grant-only reply keeps the requested end")
+local echoedGrant = servedGrant.payload
 local grantSends = sendCount(Sync.MSG.AUTH_LOGS)
 Sync:HandleNeedLogs(MEMBER, {
     sessionId = SESSION,
@@ -1930,20 +1934,13 @@ Sync.RebuildProfile = function()
     return true
 end
 Sync:HandleAuthLogs(OWNER, {
-    sessionId = SESSION,
-    profileId = PROFILE,
+    sessionId = echoedGrant.sessionId,
+    profileId = echoedGrant.profileId,
     requestId = "need-trusted-grant",
-    author = "Author-Realm",
-    fromCounter = 1,
-    toCounter = 2,
-    logs = {
-        {
-            _author = OWNER,
-            _counter = 4,
-            _eventType = "ADMIN_ADDED",
-            _data = { member = KINO },
-        },
-    },
+    author = echoedGrant.author,
+    fromCounter = echoedGrant.fromCounter,
+    toCounter = echoedGrant.toCounter,
+    logs = echoedGrant.logs,
 })
 assertEq(trustedMerges, 1, "trusted admin can insert the coordinator grant the member missed")
 assertTrue(Sync.state.requests["need-trusted-grant"] == nil, "trusted grant response completes the request")

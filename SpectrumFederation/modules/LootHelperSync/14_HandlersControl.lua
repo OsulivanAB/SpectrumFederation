@@ -915,6 +915,16 @@ function Sync:HandleNeedLogs(sender, payload)
             end
             return
         end
+        -- HandleAuthLogs checks these fields against the request before it
+        -- accepts an out-of-range grant row. Echo the requested range.
+        local reqRange = type(payload.missing) == "table" and payload.missing[1] or nil
+        if type(reqRange) ~= "table"
+            or type(reqRange.author) ~= "string" or reqRange.author == ""
+            or type(reqRange.fromCounter) ~= "number"
+            or type(reqRange.toCounter) ~= "number"
+        then
+            return
+        end
         local out = {}
         if self._AppendAdminGrantEvidence then
             self:_AppendAdminGrantEvidence(out, profile, member)
@@ -924,13 +934,12 @@ function Sync:HandleNeedLogs(sender, payload)
         end
         local grant = out[1]
         if type(grant) ~= "table" or not SF.LootHelperComm then return end
-        local counter = tonumber(grant._counter or grant.counter) or 1
         local resp = {
             sessionId   = self.state.sessionId,
             profileId   = self.state.profileId,
-            author      = grant._author or grant.author or member,
-            fromCounter = counter,
-            toCounter   = counter,
+            author      = reqRange.author,
+            fromCounter = reqRange.fromCounter,
+            toCounter   = reqRange.toCounter,
             logs        = out,
         }
         if type(payload.requestId) == "string" and payload.requestId ~= "" then
