@@ -1344,7 +1344,7 @@ function Sync:_AppendAdminGrantEvidence(out, profile, member)
         if type(log) == "table" and type(log.ToTable) == "function" then
             logTable = log:ToTable()
         end
-        local state = self:_LogAdminGrantState(logTable, member)
+        local state = self:_LogAdminGrantState(logTable, member, profile)
         if state == "grant" then
             latest = logTable
         elseif state == "revoke" then

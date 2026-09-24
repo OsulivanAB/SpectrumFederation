@@ -4399,6 +4399,25 @@ assertEq(Sync:_FailedCatchUpBlocks(KINO, "profile-2"), false,
 assertEq(Sync:_LocalCatchUpGrantStored(KINO, "profile-2"), true,
     "the incoming profile stores the sourced grant")
 assertEq(Sync.state.profileId, PROFILE, "the grant lookup does not switch the active profile")
+profile2._identityProjection = {
+    appliedRelationshipIds = {},
+}
+profile._identityProjection = {
+    appliedRelationshipIds = { ["rel-1"] = true },
+}
+local served = {}
+Sync:_AppendAdminGrantEvidence(served, profile2, KINO)
+assertEq(#served, 0, "a served grant uses the scanned profile's applied relationship")
+profile2._identityProjection = {
+    appliedRelationshipIds = { ["rel-1"] = true },
+}
+profile._identityProjection = {
+    appliedRelationshipIds = {},
+}
+served = {}
+Sync:_AppendAdminGrantEvidence(served, profile2, KINO)
+assertEq(#served, 1, "a sourced grant is served when the scanned profile applied it")
+assertEq(Sync.state.profileId, PROFILE, "serving the grant does not switch the active profile")
 end)()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
