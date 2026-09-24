@@ -406,6 +406,16 @@ function Comm:_PumpQueue()
                 local item = table.remove(q, 1)
                 st.total = math.max(0, (st.total or 1) - 1)
                 st.lastSent[key] = now
+                -- Recovery is falling below the cap, not waiting until empty.
+                -- The next time that queue fills and drops, warn once.
+                local maxQ = tonumber(self.cfg.maxQueue) or 200
+                if (st.total or 0) < maxQ then
+                    st._queueFullWarned = nil
+                end
+                local maxPer = tonumber(self.cfg.maxPerTarget) or 50
+                if #q < maxPer and st._perTargetWarned then
+                    st._perTargetWarned[key] = nil
+                end
 
                 self:SendCommMessage(item.prefix, item.msg, item.dist, item.target, item.prio, item.callback)
                 sent = sent + 1

@@ -2542,16 +2542,16 @@ function Sync:_SuppressedBisFingerprint(profileId, logId)
     if type(logId) ~= "string" or logId == "" then
         return nil
     end
-    local rows = self:_SuppressedBisRows(profileId)
-    if not rows then
+    if type(profileId) ~= "string" or profileId == "" then
         return nil
     end
-    for _, row in pairs(rows) do
-        if type(row) == "table" and row.id == logId then
-            return tonumber(row.fingerprint)
-        end
+    local state = self.state
+    local byProfile = state and state._suppressedBisByLogId
+    local byId = type(byProfile) == "table" and byProfile[profileId] or nil
+    if type(byId) ~= "table" then
+        return nil
     end
-    return nil
+    return tonumber(byId[logId])
 end
 
 function Sync:_FoldSuppressedIntoAuthorMax(exactSource)
@@ -2658,12 +2658,24 @@ function Sync:_RememberSuppressedAutomaticBisOutcome(profileId, logTable)
         byProfile = {}
         self.state._suppressedBisOutcomes[profileId] = byProfile
     end
-    byProfile[author .. "\0" .. tostring(counter)] = {
+    local rowKey = author .. "\0" .. tostring(counter)
+    local previous = byProfile[rowKey]
+    byProfile[rowKey] = {
         author = author,
         counter = counter,
         id = id,
         fingerprint = fingerprint,
     }
+    self.state._suppressedBisByLogId = self.state._suppressedBisByLogId or {}
+    local byId = self.state._suppressedBisByLogId[profileId]
+    if not byId then
+        byId = {}
+        self.state._suppressedBisByLogId[profileId] = byId
+    end
+    if type(previous) == "table" and type(previous.id) == "string" and previous.id ~= id then
+        byId[previous.id] = nil
+    end
+    byId[id] = fingerprint
     return true
 end
 

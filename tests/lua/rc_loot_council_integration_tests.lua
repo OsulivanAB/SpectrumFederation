@@ -6589,18 +6589,23 @@ function testCommQueueWarningLatch()
     assertFalse(Comm:_EnqueueSend("SF_LH", "c", "RAID", nil, "NORMAL"), "a full per-target queue drops the message")
     assertEq(warnCount("per-target queue full", perFrom + 1), 1, "saturating a per-target queue warns once")
     local key = Comm.state.keys[1]
+    Comm.state.lastSent[key] = 0
+    Comm:_PumpQueue()
+    assertEq(#Comm.state.byKey[key], 2, "a pump inside the spacing gap leaves the per-target queue full")
+    assertFalse(Comm:_EnqueueSend("SF_LH", "still", "RAID", nil, "NORMAL"), "a still-full per-target queue drops again")
+    assertEq(warnCount("per-target queue full", perFrom + 1), 1, "a per-target queue that stays full does not warn again")
     Comm.state.lastSent[key] = -1
     Comm:_PumpQueue()
-    assertEq(#Comm.state.byKey[key], 1, "pumping one message leaves the per-target queue occupied")
+    assertEq(#Comm.state.byKey[key], 1, "pumping one message leaves the per-target queue below the limit")
     assertTrue(Comm:_EnqueueSend("SF_LH", "d", "RAID", nil, "NORMAL"), "a freed per-target slot accepts another message")
     assertFalse(Comm:_EnqueueSend("SF_LH", "e", "RAID", nil, "NORMAL"), "refilling the same queue drops again")
-    assertEq(warnCount("per-target queue full", perFrom + 1), 1, "a pump that leaves the queue occupied does not warn again")
+    assertEq(warnCount("per-target queue full", perFrom + 1), 2, "falling below the limit re-arms one warning for the next drop")
     drain()
     assertEq(#(Comm.state.keys or {}), 0, "the per-target queue can drain")
     assertTrue(Comm:_EnqueueSend("SF_LH", "f", "RAID", nil, "NORMAL"), "an empty queue accepts a new message")
     assertTrue(Comm:_EnqueueSend("SF_LH", "g", "RAID", nil, "NORMAL"), "the second message fills the queue again")
     assertFalse(Comm:_EnqueueSend("SF_LH", "h", "RAID", nil, "NORMAL"), "a later saturation still drops")
-    assertEq(warnCount("per-target queue full", perFrom + 1), 2, "emptying the queue allows one later warning")
+    assertEq(warnCount("per-target queue full", perFrom + 1), 3, "emptying the queue allows one later warning")
 
     resetQueue()
     Comm.cfg.maxPerTarget = 50
@@ -6611,17 +6616,22 @@ function testCommQueueWarningLatch()
     assertFalse(Comm:_EnqueueSend("SF_LH", "c", "RAID", nil, "NORMAL"), "a full comm queue drops the message")
     assertEq(warnCount("Comm queue full", fullFrom + 1), 1, "filling the comm queue warns once")
     key = Comm.state.keys[1]
+    Comm.state.lastSent[key] = 0
+    Comm:_PumpQueue()
+    assertEq(Comm.state.total, 2, "a pump inside the spacing gap leaves the global queue full")
+    assertFalse(Comm:_EnqueueSend("SF_LH", "still", "RAID", nil, "NORMAL"), "a still-full global queue drops again")
+    assertEq(warnCount("Comm queue full", fullFrom + 1), 1, "a global queue that stays full does not warn again")
     Comm.state.lastSent[key] = -1
     Comm:_PumpQueue()
-    assertEq(Comm.state.total, 1, "pumping one message leaves the global queue occupied")
+    assertEq(Comm.state.total, 1, "pumping one message leaves the global queue below the limit")
     assertTrue(Comm:_EnqueueSend("SF_LH", "d", "RAID", nil, "NORMAL"), "a freed global slot accepts another message")
     assertFalse(Comm:_EnqueueSend("SF_LH", "e", "RAID", nil, "NORMAL"), "refilling the global queue drops again")
-    assertEq(warnCount("Comm queue full", fullFrom + 1), 1, "a pump that leaves the global queue occupied does not warn again")
+    assertEq(warnCount("Comm queue full", fullFrom + 1), 2, "falling below the global limit re-arms one warning for the next drop")
     drain()
     assertTrue(Comm:_EnqueueSend("SF_LH", "f", "RAID", nil, "NORMAL"), "an idle queue accepts a new message")
     assertTrue(Comm:_EnqueueSend("SF_LH", "g", "RAID", nil, "NORMAL"), "the second message fills the global queue again")
     assertFalse(Comm:_EnqueueSend("SF_LH", "h", "RAID", nil, "NORMAL"), "a later global saturation still drops")
-    assertEq(warnCount("Comm queue full", fullFrom + 1), 2, "an idle queue allows one later warning")
+    assertEq(warnCount("Comm queue full", fullFrom + 1), 3, "an idle queue allows one later warning")
     assertTrue(sends > 0, "queued messages are sent when the pump runs")
 
     Comm.cfg.maxQueue = savedCfg.maxQueue
@@ -7268,6 +7278,167 @@ function testMalformedRepairBisOutcomeIsNotRemembered()
     assertTrue(remembered == nil or next(remembered) == nil, "an invalid repair outcome is not remembered")
 end
 testMalformedRepairBisOutcomeIsNotRemembered()
+
+function testLiveAwardWaitsForYieldedBackfill()
+    resetEnv()
+    C_Timer = nil
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("YieldedOrder")
+    addMember(profile, WINNER)
+    assertTrue(profile:SetMemberSpec(WINNER, 71), "Arms spec is stored for the yielded backfill")
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    local headLink = "|cffa335ee|Hitem:19001::::::::80:71:::::::::|h[Test Helm]|h|r"
+    assertTrue(profile:ApplyRCLootCouncilIntegrationConfig({
+        recordAwards = true,
+        recordAllAwardTypes = true,
+        allowedResponses = {},
+        bisResponses = {
+            { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+        },
+    }, { skipPermission = true, skipSync = true }), "Need qualifies during a yielded backfill")
+    local function helmCanon(historyId)
+        return SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+            id = historyId,
+            response = "Need",
+            responseID = 1,
+            lootWon = headLink,
+            equipLoc = "INVTYPE_HEAD",
+        }))
+    end
+    local older = helmCanon("1700007600-1")
+    local olderRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(older), {
+        profile = profile,
+        author = AWARDER,
+        timestamp = older.timestamp,
+        externalId = older.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    assertTrue(profile:AddLootLog(olderRc, { skipPermission = true, skipBroadcast = true }), "the older helm is stored before backfill")
+    profile._autoBisBackfill = {
+        keys = { older.awardKey },
+        covered = {},
+        opts = { silent = true },
+        index = 1,
+        wrote = 0,
+        sessionId = Sync.state.sessionId,
+        profileId = profile:GetProfileId(),
+    }
+    local heartbeats = 0
+    local previousHeartbeat = Sync.BroadcastSessionHeartbeat
+    function Sync:BroadcastSessionHeartbeat()
+        heartbeats = heartbeats + 1
+        return true
+    end
+    local newer = helmCanon("1700007601-2")
+    assertTrue(profile:TryAddRCLootCouncilAward(newer), "a live helm during backfill is stored")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", newer.awardKey), 0, "the live helm waits behind the queued award")
+    assertEq(profile._autoBisBackfill.keys[#profile._autoBisBackfill.keys], newer.awardKey, "the live helm is appended to the backfill")
+    assertTrue(profile:TryAddRCLootCouncilAward(newer) == false, "seeing the live helm again does not write it")
+    assertEq(#profile._autoBisBackfill.keys, 2, "the live helm is queued once")
+    local third = helmCanon("1700007602-3")
+    local thirdRc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(third), {
+        profile = profile,
+        author = AWARDER,
+        timestamp = third.timestamp,
+        externalId = third.awardKey,
+        counter = 0,
+        skipPermission = true,
+    })
+    Sync:HandleNewLog(AWARDER, {
+        sessionId = Sync.state.sessionId,
+        profileId = profile:GetProfileId(),
+        log = thirdRc:ToTable(),
+    })
+    assertEq(countLootEvents(profile, "RC_LOOT_COUNCIL", third.awardKey), 1, "a synced helm during backfill is stored")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", third.awardKey), 0, "a synced helm waits behind the queued award")
+    assertEq(profile._autoBisBackfill.keys[#profile._autoBisBackfill.keys], third.awardKey, "the synced helm is appended to the backfill")
+    local bonus = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007603-4",
+        response = "Bonus Loot",
+        responseID = "BONUS_ROLL",
+        lootWon = headLink,
+    }))
+    assertTrue(profile:TryAddRCLootCouncilAward(bonus), "a bonus roll during backfill is stored")
+    assertEq(countLootEvents(profile, "BONUS_ROLL", nil), 1, "a bonus roll is synthesized without waiting for the backfill")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", bonus.awardKey), 0, "that bonus roll does not write a BiS outcome")
+    profile.AUTO_BIS_BACKFILL_BATCH = 1
+    local deferred = nil
+    local previousRunAfter = Sync.RunAfter
+    function Sync:RunAfter(delaySec, fn)
+        if (tonumber(delaySec) or 0) > 0 then
+            deferred = fn
+            return
+        end
+        return previousRunAfter(self, delaySec, fn)
+    end
+    C_Timer = {
+        NewTimer = function()
+            return { Cancel = function() end }
+        end,
+    }
+    assertEq(profile:_PumpAutomaticBisBackfill(), 1, "the first backfill batch writes the older helm")
+    assertEq(heartbeats, 1, "a silent batch sends one heartbeat")
+    assertEq(outcomeForAward(profile, older.awardKey), "ASSIGNED", "the older helm keeps the slot")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", newer.awardKey), 0, "the live helm is still waiting after the first batch")
+    local guard = 0
+    while profile._autoBisBackfill and guard < 5 do
+        guard = guard + 1
+        local step = deferred
+        deferred = nil
+        assertTrue(type(step) == "function", "the remaining backfill stays on a timer")
+        step()
+    end
+    assertEq(profile._autoBisBackfill, nil, "the backfill finishes the queued helms")
+    assertEq(outcomeForAward(profile, newer.awardKey), "OVERFLOW", "the live helm is overflow after the older award")
+    assertEq(outcomeForAward(profile, third.awardKey), "OVERFLOW", "the synced helm is overflow after the older award")
+    assertEq(heartbeats, 3, "each batch that writes sends one heartbeat")
+    assertEq(profile:_PumpAutomaticBisBackfill(), 0, "a finished backfill does not send another heartbeat")
+    assertEq(heartbeats, 3, "a batch that writes nothing does not heartbeat")
+    local immediate = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+        id = "1700007604-5",
+        response = "Greed",
+        responseID = 2,
+    }))
+    assertTrue(profile:TryAddRCLootCouncilAward(immediate), "an award after the backfill is stored")
+    assertEq(outcomeForAward(profile, immediate.awardKey), "NOT_BIS", "an award with no queued backfill still writes immediately")
+    Sync.BroadcastSessionHeartbeat = previousHeartbeat
+    Sync.RunAfter = previousRunAfter
+    C_Timer = nil
+end
+testLiveAwardWaitsForYieldedBackfill()
+
+function testSuppressedBisFingerprintIndex()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("FingerprintIndex")
+    setActive(profile)
+    startSessionOn(profile)
+    local profileId = profile:GetProfileId()
+    local function row(author, counter, id, fingerprint)
+        return {
+            _author = author,
+            _counter = counter,
+            _id = id,
+            _fingerprint = fingerprint,
+        }
+    end
+    assertTrue(Sync:_RememberSuppressedAutomaticBisOutcome(profileId, row("AdminB-Garona", 1, "AdminB-Garona:1", 11)), "the first suppressed outcome is remembered")
+    assertTrue(Sync:_RememberSuppressedAutomaticBisOutcome(profileId, row("AdminC-Garona", 2, "AdminC-Garona:2", 22)), "the second suppressed outcome is remembered")
+    assertEq(Sync:_SuppressedBisFingerprint(profileId, "AdminB-Garona:1"), 11, "fingerprint lookup uses the log id")
+    assertEq(Sync:_SuppressedBisFingerprint(profileId, "AdminC-Garona:2"), 22, "a second log id has its own fingerprint")
+    assertEq(Sync:_SuppressedBisFingerprint(profileId, "missing"), nil, "an unknown log id has no fingerprint")
+    assertTrue(Sync:_RememberSuppressedAutomaticBisOutcome(profileId, row("AdminB-Garona", 1, "AdminB-Garona:9", 33)), "replacing a counter updates the log id")
+    assertEq(Sync:_SuppressedBisFingerprint(profileId, "AdminB-Garona:1"), nil, "the replaced log id is dropped")
+    assertEq(Sync:_SuppressedBisFingerprint(profileId, "AdminB-Garona:9"), 33, "the replacement log id is indexed")
+    Sync:_ResetSessionState("test")
+    assertEq(Sync.state._suppressedBisOutcomes, nil, "session reset drops suppressed outcomes")
+    assertEq(Sync.state._suppressedBisByLogId, nil, "session reset drops the fingerprint index")
+end
+testSuppressedBisFingerprintIndex()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

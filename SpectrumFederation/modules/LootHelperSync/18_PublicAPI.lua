@@ -716,6 +716,7 @@ function Sync:StartSession(profileId, opts)
     self.state._adminConvergence = nil
     self.state._bisRestoreBackfillHold = nil
     self.state._suppressedBisOutcomes = nil
+    self.state._suppressedBisByLogId = nil
     self.state.handshake = nil
     self.state.helpers = {}
 
@@ -817,6 +818,7 @@ function Sync:_ResetSessionState(reason)
     self.state._bisRestoreBackfillHold = nil
     self.state._bisBackfillPendingReason = nil
     self.state._suppressedBisOutcomes = nil
+    self.state._suppressedBisByLogId = nil
 
     -- Clear session metadata
     self.state.helpers = {}

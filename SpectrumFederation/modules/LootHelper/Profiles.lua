@@ -3041,6 +3041,31 @@ function LootProfile:_DeferAutomaticBisWhileRepairsOpen(reason)
     return true
 end
 
+-- A yielded promotion backfill still has older awards queued. A live award
+-- has to wait behind those keys so it cannot take a BiS slot first.
+-- Already queued keys are left in place. The pump itself is the writer.
+function LootProfile:_QueueAwardBehindAutomaticBisBackfill(awardKey)
+    if self._autoBisBackfillPumping or type(awardKey) ~= "string" or awardKey == "" then
+        return false
+    end
+    if not self:_AutomaticBisBackfillJobIsCurrent() then
+        return false
+    end
+    local job = self._autoBisBackfill
+    local keys = job.keys
+    if type(keys) ~= "table" then
+        keys = {}
+        job.keys = keys
+    end
+    for i = 1, #keys do
+        if keys[i] == awardKey then
+            return true
+        end
+    end
+    keys[#keys + 1] = awardKey
+    return true
+end
+
 function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
     if self._writingAutoBis then
         return false, "reentrant"
@@ -3067,6 +3092,9 @@ function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
         end
     elseif self:HasSourceConsistentBisOutcome(canonical.awardKey) then
         return false, "outcome_exists"
+    end
+    if self:_QueueAwardBehindAutomaticBisBackfill(canonical.awardKey) then
+        return false, "queued_behind_backfill"
     end
     self._writingAutoBis = true
     local ok, err = self:ApplyRCAutoBisOutcome(rcLog, canonical, opts)
@@ -3198,6 +3226,14 @@ function LootProfile:_PumpAutomaticBisBackfill()
         if self:_AutomaticBisBackfillCanYield() then
             self:_ArmAutomaticBisBackfill()
             break
+        end
+    end
+    -- Silent batches skip NEW_LOG. One heartbeat publishes the new author
+    -- frontier, including a yielded batch, without one message per award.
+    if wroteNow > 0 then
+        local heartbeatSync = SF.LootHelperSync
+        if heartbeatSync and heartbeatSync.BroadcastSessionHeartbeat and SF.LootHelperComm then
+            heartbeatSync:BroadcastSessionHeartbeat()
         end
     end
     self._autoBisBackfillPumping = false
