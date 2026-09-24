@@ -139,8 +139,14 @@ function Sync:_SendAdminLogReq(req, target)
         exactAuthor = self:_IsExactAuthorRepair(meta) or nil,
         integrityRepair = meta.integrityRepair == true or nil,
     }
-    if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(target) then
-        payload.needsAdminGrant = true
+    local grantFields = self._CatchUpRequestGrantFields and self:_CatchUpRequestGrantFields(target) or nil
+    if type(grantFields) == "table" then
+        if grantFields.needsAdminGrant then
+            payload.needsAdminGrant = true
+        end
+        if type(grantFields.adminGrantMember) == "string" then
+            payload.adminGrantMember = grantFields.adminGrantMember
+        end
     end
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.LOG_REQ, payload, "WHISPER", target, "NORMAL")
@@ -172,6 +178,10 @@ function Sync:_SendNeedProfileReq(req, target)
                             and SF.SyncProtocol.GetSupportedEncodings()
                             or nil,
     }
+    local grantFields = self._CatchUpRequestGrantFields and self:_CatchUpRequestGrantFields(target) or nil
+    if type(grantFields) == "table" and type(grantFields.adminGrantMember) == "string" then
+        payload.adminGrantMember = grantFields.adminGrantMember
+    end
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_PROFILE, payload, "WHISPER", target, "NORMAL")
 end
@@ -218,11 +228,17 @@ function Sync:_SendNeedLogsReq(req, target)
                             and SF.SyncProtocol.GetSupportedEncodings()
                             or nil,
     }
-    -- Only a catch-up coordinator is asked to attach an admin grant. Other
-    -- peers keep the historical requested-window payload so older receivers
-    -- do not reject the repair.
-    if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(target) then
-        payload.needsAdminGrant = true
+    -- A stored grant is confirmed by the catch-up coordinator. A missing grant
+    -- is requested from an admin this profile already trusts. Other repairs
+    -- keep the historical requested-window payload.
+    local grantFields = self._CatchUpRequestGrantFields and self:_CatchUpRequestGrantFields(target) or nil
+    if type(grantFields) == "table" then
+        if grantFields.needsAdminGrant then
+            payload.needsAdminGrant = true
+        end
+        if type(grantFields.adminGrantMember) == "string" then
+            payload.adminGrantMember = grantFields.adminGrantMember
+        end
     end
 
     return SF.LootHelperComm:Send("CONTROL", self.MSG.NEED_LOGS, payload, "WHISPER", target, "NORMAL")

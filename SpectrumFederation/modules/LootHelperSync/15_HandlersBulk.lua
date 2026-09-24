@@ -194,8 +194,16 @@ function Sync:HandleAuthLogs(sender, payload)
             local exactRepair = self:_IsExactAuthorRepair(req.meta)
             for _, logTable in ipairs(payload.logs) do
                 -- An attached admin grant may name another author. It is proof,
-                -- not a reason to reject the requested window.
+                -- not a reason to reject the requested window. A trusted admin
+                -- may also attach the catch-up coordinator's grant outside that window.
                 local grantProof = self._LogAdminGrantState and self:_LogAdminGrantState(logTable, sender)
+                if not grantProof and self._CoordinatorNeedsCatchUp and self.state
+                    and self:_CoordinatorNeedsCatchUp(self.state.coordinator)
+                    and self:IsSenderAuthorized(payload.profileId, sender)
+                    and not self:_CoordinatorNeedsCatchUp(sender)
+                then
+                    grantProof = self:_LogAdminGrantState(logTable, self.state.coordinator) ~= nil
+                end
                 if not grantProof then
                     local logAuthor = logTable._author or logTable.author
                     local logCounter = logTable._counter or logTable.counter
@@ -261,6 +269,30 @@ function Sync:HandleAuthLogs(sender, payload)
         end
     end
     local grantChanged = false
+    -- A canonical admin can insert the coordinator grant this client missed.
+    -- The successor still cannot supply that missing row as their own proof.
+    if senderIsCanonicalAdmin and self._LogAdminGrantState and self._CoordinatorNeedsCatchUp
+        and self.state and self:_CoordinatorNeedsCatchUp(self.state.coordinator)
+        and not self:_CoordinatorNeedsCatchUp(sender)
+        and self._LocalCatchUpGrantStored and not self:_LocalCatchUpGrantStored(self.state.coordinator)
+    then
+        local trustedGrantLogs = {}
+        for _, logTable in ipairs(payload.logs) do
+            if self:_LogAdminGrantState(logTable, self.state.coordinator) then
+                trustedGrantLogs[#trustedGrantLogs + 1] = logTable
+            end
+        end
+        if #trustedGrantLogs > 0 then
+            local changedGrant = self:MergeLogs(payload.profileId, trustedGrantLogs, {
+                allowReplaceExisting = false,
+                allowMainSwapFingerprintNormalize = true,
+            })
+            grantChanged = changedGrant and true or false
+            if self.RebuildProfile then
+                self:RebuildProfile(payload.profileId, "auth_logs")
+            end
+        end
+    end
     local catchUpMerge = (not senderIsCanonicalAdmin)
         and self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
     if catchUpMerge and self._LogAdminGrantState then

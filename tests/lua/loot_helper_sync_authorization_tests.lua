@@ -1072,8 +1072,9 @@ Sync:HandleCoordinatorTakeover(KINO, {
     coordEpoch = 11,
 })
 local catchUpRoutes = Sync:_CurrentAuthorizedRoutingTargets()
-assertTrue(listHas(catchUpRoutes, KINO), "unknown successor coordinator remains a catch-up route")
-assertEq(Sync:RequestProfileSnapshot("catch-up"), true, "profile request can target the unknown coordinator")
+assertTrue(not listHas(catchUpRoutes, KINO), "missing coordinator grant is not requested from the successor")
+assertTrue(listHas(catchUpRoutes, OWNER), "missing coordinator grant is requested from a trusted admin")
+assertEq(Sync:RequestProfileSnapshot("catch-up"), true, "profile request targets a trusted admin")
 local catchUpReq = nil
 for _, req in pairs(Sync.state.requests) do
     if req.kind == "NEED_PROFILE" then
@@ -1081,16 +1082,25 @@ for _, req in pairs(Sync.state.requests) do
     end
 end
 assertTrue(catchUpReq ~= nil, "catch-up profile request is outstanding")
-assertEq(Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, catchUpReq, {
-    expectedKinds = { NEED_PROFILE = true },
-}), "unproven", "in-flight catch-up snapshot without a grant is not accepted")
+assertTrue(listHas(catchUpReq.targets, OWNER), "catch-up profile request asks the trusted admin")
+assertTrue(not listHas(catchUpReq.targets, KINO), "catch-up profile request does not ask the successor")
 assertEq(Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, catchUpReq, {
     expectedKinds = { NEED_PROFILE = true },
     catchUpProven = true,
-}), "accept", "in-flight catch-up snapshot is accepted once the grant is proven")
+}), "unauthorized", "successor snapshot is not accepted before the grant is stored")
 assertEq(Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, nil, {
     expectedKinds = { NEED_PROFILE = true },
 }), "unauthorized", "unsolicited catch-up snapshot is rejected")
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 3,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local storedRoutes = Sync:_CurrentAuthorizedRoutingTargets()
+assertTrue(listHas(storedRoutes, KINO), "stored grant keeps the successor routable for confirmation")
 
 -- A coordinator this client already revoked does not become a catch-up route.
 reset(MEMBER)
@@ -1737,9 +1747,23 @@ local plainNeed = Sync:_SendNeedLogsReq({
 assertEq(plainNeed, true, "ordinary NEED_LOGS send succeeds")
 assertNil(sends[#sends].payload.needsAdminGrant, "ordinary NEED_LOGS does not ask for an admin grant")
 Sync.state.coordinator = KINO
+Sync.state.helpers = {}
 Sync.state._coordinatorCatchUp = KINO
-local catchNeed = Sync:_SendNeedLogsReq({
-    id = "catch-need",
+local trustedNeed = Sync:_SendNeedLogsReq({
+    id = "trusted-need",
+    meta = {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+    },
+}, OWNER)
+assertEq(trustedNeed, true, "missing-grant NEED_LOGS send succeeds")
+assertEq(sends[#sends].payload.adminGrantMember, KINO, "missing grant is requested from a trusted admin")
+assertNil(sends[#sends].payload.needsAdminGrant, "trusted admin is not asked for their own grant")
+local successorNeed = Sync:_SendNeedLogsReq({
+    id = "successor-need",
     meta = {
         sessionId = SESSION,
         profileId = PROFILE,
@@ -1748,8 +1772,28 @@ local catchNeed = Sync:_SendNeedLogsReq({
         toCounter = 2,
     },
 }, KINO)
-assertEq(catchNeed, true, "catch-up NEED_LOGS send succeeds")
-assertEq(sends[#sends].payload.needsAdminGrant, true, "catch-up NEED_LOGS asks for an admin grant")
+assertEq(successorNeed, true, "successor NEED_LOGS send succeeds")
+assertNil(sends[#sends].payload.needsAdminGrant, "missing grant is not requested from the successor")
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 3,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local storedNeed = Sync:_SendNeedLogsReq({
+    id = "stored-need",
+    meta = {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+    },
+}, KINO)
+assertEq(storedNeed, true, "stored-grant NEED_LOGS send succeeds")
+assertEq(sends[#sends].payload.needsAdminGrant, true, "stored grant asks the successor to attach that row")
 reset(KINO)
 setAdmins({ KINO, OWNER })
 Sync.state.isCoordinator = false
@@ -1767,6 +1811,14 @@ assertEq(plainLog, true, "ordinary LOG_REQ send succeeds")
 assertNil(sends[#sends].payload.needsAdminGrant, "ordinary LOG_REQ does not ask for an admin grant")
 Sync.state.coordinator = COORD
 Sync.state._coordinatorCatchUp = COORD
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 2,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = COORD },
+    },
+}
 local catchLog = Sync:_SendLogReq({
     id = "catch-log",
     meta = {
@@ -1778,7 +1830,108 @@ local catchLog = Sync:_SendLogReq({
     },
 }, COORD)
 assertEq(catchLog, true, "catch-up LOG_REQ send succeeds")
-assertEq(sends[#sends].payload.needsAdminGrant, true, "catch-up LOG_REQ asks for an admin grant")
+assertEq(sends[#sends].payload.needsAdminGrant, true, "stored grant asks the successor to attach that row")
+
+-- A trusted admin who is not a Helper can serve the missed coordinator grant.
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.isCoordinator = false
+Sync.state.helpers = {}
+Sync.state.coordinator = KINO
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 4,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+    {
+        _author = "Author-Realm",
+        _counter = 1,
+        _eventType = "POINT_CHANGE",
+        _data = { member = MEMBER },
+    },
+}
+sends = {}
+Sync:HandleNeedLogs(MEMBER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "grant-from-admin",
+    adminGrantMember = KINO,
+    missing = {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+    },
+})
+local servedGrant = lastAuthLogs()
+assertTrue(servedGrant ~= nil, "trusted admin serves the missed coordinator grant")
+local servedMember = nil
+for _, logTable in ipairs(servedGrant and servedGrant.payload.logs or {}) do
+    if logTable._eventType == "ADMIN_ADDED" then
+        servedMember = logTable._data and logTable._data.member or nil
+    end
+end
+assertEq(servedMember, KINO, "served grant names the catch-up coordinator")
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+seedRequest("need-trusted-grant", "NEED_LOGS", { OWNER }, OWNER)
+local trustedMerges = 0
+Sync.MergeLogs = function(_, _, logs)
+    trustedMerges = trustedMerges + 1
+    return true, { inserted = #logs, replaced = 0, mismatchCount = 0 }
+end
+Sync.RebuildProfile = function()
+    return true
+end
+Sync:HandleAuthLogs(OWNER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-trusted-grant",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    logs = {
+        {
+            _author = OWNER,
+            _counter = 4,
+            _eventType = "ADMIN_ADDED",
+            _data = { member = KINO },
+        },
+    },
+})
+assertEq(trustedMerges, 1, "trusted admin can insert the coordinator grant the member missed")
+assertTrue(Sync.state.requests["need-trusted-grant"] == nil, "trusted grant response completes the request")
+local successorReq = seedRequest("need-successor-grant", "NEED_LOGS", { KINO }, KINO)
+successorReq.meta.integrityRepair = true
+local successorMerges = 0
+Sync.MergeLogs = function()
+    successorMerges = successorMerges + 1
+    return true, { inserted = 1, replaced = 0, mismatchCount = 0 }
+end
+Sync:HandleAuthLogs(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-successor-grant",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    logs = {
+        {
+            _author = OWNER,
+            _counter = 4,
+            _eventType = "ADMIN_ADDED",
+            _data = { member = KINO },
+        },
+    },
+})
+assertEq(successorMerges, 0, "successor still cannot supply a grant that is not already stored")
+assertTrue(Sync.state.requests["need-successor-grant"] ~= nil, "unproven successor grant leaves the request open")
+Sync.MergeLogs = function()
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
 
 -- A revoked coordinator cannot end the session or persist configuration.
 reset(MEMBER)

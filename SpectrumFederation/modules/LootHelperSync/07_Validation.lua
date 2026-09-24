@@ -309,17 +309,155 @@ function Sync:_CurrentAuthorizedRoutingTargets(opts)
     if not self:_ProfileAuthorizationKnown() then return targets end
     local out = {}
     local profileId = self.state.profileId
+    local catchUpName = self.state._coordinatorCatchUp
+    local grantStored = type(catchUpName) == "string" and self:_LocalCatchUpGrantStored(catchUpName)
     for _, name in ipairs(targets) do
         -- Preferred repair targets must still be a current coordinator or helper.
         -- A former helper who remains an admin is not a new request target.
         local authorized = self:IsSenderAuthorized(profileId, name) and self:IsTrustedDataSender(name)
-        -- The advertised coordinator can still be asked for the log or snapshot that
-        -- proves a missed ADMIN_ADDED. A coordinator this client already revoked cannot.
-        if authorized or self:_CoordinatorNeedsCatchUp(name) then
+        -- A catch-up coordinator is asked only when the proving grant is already
+        -- stored. A missing grant is fetched from another canonical admin.
+        local catchUp = self:_CoordinatorNeedsCatchUp(name) and grantStored
+        if authorized or catchUp then
             table.insert(out, name)
         end
     end
+    if type(catchUpName) == "string" and self:_CoordinatorNeedsCatchUp(catchUpName) and not grantStored then
+        for _, name in ipairs(self:_TrustedAdminGrantProviders(catchUpName)) do
+            local seen = false
+            for _, existing in ipairs(out) do
+                if self:_SamePlayer(existing, name) then
+                    seen = true
+                    break
+                end
+            end
+            if not seen then
+                table.insert(out, name)
+            end
+        end
+    end
     return out
+end
+
+-- Function True when this peer is currently in the group.
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_PeerInGroup(name)
+    if type(name) ~= "string" or name == "" or type(self.GetPeer) ~= "function" then return false end
+    local peer = self:GetPeer(name)
+    return type(peer) == "table" and peer.inGroup == true
+end
+
+-- Function True when local history already stores a current grant for this player.
+-- The row must be authored by a different canonical admin. A missing row is not
+-- proof, and it is not a revocation.
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_LocalCatchUpGrantStored(name)
+    if type(name) ~= "string" or name == "" or not self.state then return false end
+    if self._LocalHistoryRevokesAdmin and self:_LocalHistoryRevokesAdmin(name) then return false end
+    if type(self.FindLocalProfileById) ~= "function" or type(self._GetProfileLootLogs) ~= "function" then
+        return false
+    end
+    if type(self._LogAdminGrantState) ~= "function" then return false end
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    local logs = profile and self:_GetProfileLootLogs(profile) or nil
+    if type(logs) ~= "table" then return false end
+    local grantLog = nil
+    for _, log in ipairs(logs) do
+        local logTable = log
+        if type(log) == "table" and type(log.ToTable) == "function" then
+            logTable = log:ToTable()
+        end
+        local state = self:_LogAdminGrantState(logTable, name)
+        if state == "grant" then
+            grantLog = logTable
+        elseif state == "revoke" then
+            grantLog = nil
+        end
+    end
+    if type(grantLog) ~= "table" then return false end
+    local author = grantLog._author or grantLog.author
+    if type(author) ~= "string" or author == "" or self:_SamePlayer(author, name) then return false end
+    return self:IsSenderAuthorized(self.state.profileId, author) == true
+end
+
+-- Function In-group canonical admins who can serve a coordinator grant this client missed.
+-- Helpers come first. The catch-up coordinator is not a provider of their own missing grant.
+-- @param exclude string|nil "Name-Realm"
+-- @return table
+function Sync:_TrustedAdminGrantProviders(exclude)
+    local out = {}
+    local function add(name)
+        if type(name) ~= "string" or name == "" then return end
+        if self:_SamePlayer(name, self:_SelfId()) then return end
+        if type(exclude) == "string" and self:_SamePlayer(name, exclude) then return end
+        for _, existing in ipairs(out) do
+            if self:_SamePlayer(existing, name) then return end
+        end
+        if self:_RouteWasRevoked(name) then return end
+        if not self:IsSenderAuthorized(self.state.profileId, name) then return end
+        if not self:_PeerInGroup(name) then return end
+        table.insert(out, name)
+    end
+    if type(self.state.helpers) == "table" then
+        for _, name in ipairs(self.state.helpers) do
+            add(name)
+        end
+    end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    local admins = (profile and self._GetProfileAdminUsers) and self:_GetProfileAdminUsers(profile) or nil
+    if type(admins) == "table" then
+        local rest = {}
+        for _, name in ipairs(admins) do
+            if type(name) == "string" then
+                table.insert(rest, name)
+            end
+        end
+        table.sort(rest)
+        for _, name in ipairs(rest) do
+            add(name)
+        end
+    end
+    return out
+end
+
+-- Function Payload fields that ask the selected peer for a coordinator grant.
+-- A stored grant is confirmed by the catch-up coordinator. A missing grant is
+-- requested from someone this profile already authorizes.
+-- @param target string "Name-Realm"
+-- @return table
+function Sync:_CatchUpRequestGrantFields(target)
+    local fields = {}
+    local coordinator = self.state and self.state.coordinator
+    if type(coordinator) ~= "string" or coordinator == "" then return fields end
+    if not (self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(coordinator)) then
+        return fields
+    end
+    if self:_LocalCatchUpGrantStored(coordinator) then
+        if self:_CoordinatorNeedsCatchUp(target) then
+            fields.needsAdminGrant = true
+        end
+    elseif not self:_CoordinatorNeedsCatchUp(target) then
+        fields.adminGrantMember = coordinator
+    end
+    return fields
+end
+
+-- Function True when this authorized admin may serve another member's grant.
+-- The unproven coordinator does not serve the grant this client has not stored.
+-- @param payload table|nil
+-- @return boolean
+function Sync:_CanServeAdminGrantRequest(payload)
+    if not (self.state and self.state.active) then return false end
+    if type(payload) ~= "table" then return false end
+    local member = payload.adminGrantMember
+    if type(member) ~= "string" or member == "" then return false end
+    if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return false end
+    if self:_SamePlayer(member, self:_SelfId()) and not self:_LocalCatchUpGrantStored(self:_SelfId()) then
+        return false
+    end
+    return true
 end
 
 -- Function True when this request already contacted the named peer.
@@ -593,18 +731,17 @@ function Sync:_GrantRowsMatch(localTable, remoteTable)
     return true
 end
 
--- Function Attach this client's latest admin grant when serving logs.
+-- Function Attach one player's latest admin grant when serving logs.
 -- Gap replies only contain the requested window. The grant often lives on
--- another author, so the receiver can prove catch-up without failing that window.
--- A later removal clears the evidence. One log is appended at most.
+-- another author. A later removal clears the evidence. One log is appended at most.
 -- @param out table Response log list
 -- @param profile table
+-- @param member string "Name-Realm"
 -- @return nil
-function Sync:_AppendSelfAdminGrantEvidence(out, profile)
+function Sync:_AppendAdminGrantEvidence(out, profile, member)
     if type(out) ~= "table" or type(profile) ~= "table" then return end
+    if type(member) ~= "string" or member == "" then return end
     if type(self._GetProfileLootLogs) ~= "function" then return end
-    local me = self:_SelfId()
-    if type(me) ~= "string" or me == "" then return end
     local latest = nil
     local logs = self:_GetProfileLootLogs(profile)
     for _, log in ipairs(logs) do
@@ -612,7 +749,7 @@ function Sync:_AppendSelfAdminGrantEvidence(out, profile)
         if type(log) == "table" and type(log.ToTable) == "function" then
             logTable = log:ToTable()
         end
-        local state = self:_LogAdminGrantState(logTable, me)
+        local state = self:_LogAdminGrantState(logTable, member)
         if state == "grant" then
             latest = logTable
         elseif state == "revoke" then
@@ -624,6 +761,17 @@ function Sync:_AppendSelfAdminGrantEvidence(out, profile)
         if self:_SameLogTable(existing, latest) then return end
     end
     out[#out + 1] = latest
+end
+
+-- Function Attach this client's latest admin grant when serving logs.
+-- Gap replies only contain the requested window. The grant often lives on
+-- another author, so the receiver can prove catch-up without failing that window.
+-- A later removal clears the evidence. One log is appended at most.
+-- @param out table Response log list
+-- @param profile table
+-- @return nil
+function Sync:_AppendSelfAdminGrantEvidence(out, profile)
+    self:_AppendAdminGrantEvidence(out, profile, self:_SelfId())
 end
 
 -- Function Catch-up snapshots must prove the sender's grant from local history.

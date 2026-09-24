@@ -744,14 +744,15 @@ function Sync:HandleNeedProfile(sender, payload)
         return false, "safe mode (bulk disabled)"
     end
 
-    -- Serve eligibility: coordinator OR helper
+    -- Serve eligibility: coordinator, helper, or an admin asked for a missed grant.
     if not self.state.active then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedProfile: no active session (sender=%s)", tostring(sender))
         end
         return
     end
-    if not (self.state.isCoordinator or self:IsSelfHelper()) then
+    local grantServe = self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)
+    if not (self.state.isCoordinator or self:IsSelfHelper() or grantServe) then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedProfile: not coordinator/helper (sender=%s)", tostring(sender))
         end
@@ -802,7 +803,8 @@ function Sync:HandleNeedProfile(sender, payload)
     -- Small jitter in case multiple people need it at once
     self:RunWithJitter(0, 250, function()
         if not self.state.active then return end
-        if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
+        local stillGrantServe = self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)
+        if not (self.state.isCoordinator or self:IsSelfHelper() or stillGrantServe) then return end
         if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
         if not SF.LootHelperComm then return end
 
@@ -867,14 +869,15 @@ function Sync:HandleNeedLogs(sender, payload)
         return false, "safe mode (bulk disabled)"
     end
 
-    -- Serve eligibility: coordinator OR helper
+    -- Serve eligibility: coordinator, helper, or an admin asked for a missed grant.
     if not self.state.active then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedLogs: no active session (sender=%s)", tostring(sender))
         end
         return
     end
-    if not (self.state.isCoordinator or self:IsSelfHelper()) then
+    local grantServe = self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)
+    if not (self.state.isCoordinator or self:IsSelfHelper() or grantServe) then
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "HandleNeedLogs: not coordinator/helper (sender=%s)", tostring(sender))
         end
@@ -935,7 +938,8 @@ function Sync:HandleNeedLogs(sender, payload)
 
             self:RunAfter(delay, function()
                 if not self.state.active then return end
-                if not (self.state.isCoordinator or self:IsSelfHelper()) then return end
+                local stillGrantServe = self._CanServeAdminGrantRequest and self:_CanServeAdminGrantRequest(payload)
+                if not (self.state.isCoordinator or self:IsSelfHelper() or stillGrantServe) then return end
                 if not self:IsSenderAuthorized(self.state.profileId, self:_SelfId()) then return end
                 if not SF.LootHelperComm then return end
 
@@ -957,6 +961,8 @@ function Sync:HandleNeedLogs(sender, payload)
 
                 if payload.needsAdminGrant == true and self._AppendSelfAdminGrantEvidence then
                     self:_AppendSelfAdminGrantEvidence(out, profile)
+                elseif type(payload.adminGrantMember) == "string" and self._AppendAdminGrantEvidence then
+                    self:_AppendAdminGrantEvidence(out, profile, payload.adminGrantMember)
                 end
 
                 local resp = {
@@ -1059,6 +1065,8 @@ function Sync:HandleLogRequest(sender, payload)
 
     if payload.needsAdminGrant == true and self._AppendSelfAdminGrantEvidence then
         self:_AppendSelfAdminGrantEvidence(out, profile)
+    elseif type(payload.adminGrantMember) == "string" and self._AppendAdminGrantEvidence then
+        self:_AppendAdminGrantEvidence(out, profile, payload.adminGrantMember)
     end
 
     local resp = {
