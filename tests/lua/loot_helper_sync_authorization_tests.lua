@@ -4767,15 +4767,21 @@ Sync.state._failedCatchUp = {}
 for i = 1, 32 do
     Sync.state._failedCatchUp["profile-other\0filled-" .. i] = true
 end
-assertEq(Sync:_FailedCatchUpBlocks(KINO, PROFILE), false,
-    "a full book of another profile does not block this profile")
+assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
+    "a full book fail-closes an unmarked coordinator on another profile")
 Sync:HandleSessionStart(KINO, {
     sessionId = "session-other-book",
     profileId = PROFILE,
     coordinator = KINO,
     coordEpoch = 11,
 })
-assertEq(Sync.state.coordinator, KINO, "another profile's full book does not reject this coordinator")
+assertEq(Sync.state.coordinator, COORD, "another profile's full book does not adopt this coordinator")
+Sync.state._failedCatchUp = {}
+for i = 1, 16 do
+    Sync.state._failedCatchUp["profile-other\0partial-" .. i] = true
+end
+assertEq(Sync:_FailedCatchUpBlocks(KINO, PROFILE), false,
+    "a partial book on another profile does not block this profile")
 Sync.state._failedCatchUp = {}
 for i = 1, 32 do
     Sync.state._failedCatchUp[PROFILE .. "\0filled-" .. i] = true
@@ -4874,8 +4880,8 @@ local known = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, knownReq, {
 assertEq(known, "accept", "an in-flight admin can still answer once the profile exists")
 end)()
 
--- A book split across profiles still records the next failed coordinator.
--- The insert drops one other profile's marker instead of leaving this one unmarked.
+-- A full book split across profiles keeps every stored failure. The next
+-- unmarked coordinator is fail-closed without deleting an earlier marker.
 ;(function()
 reset(OWNER)
 setAdmins({ OWNER })
@@ -4886,20 +4892,21 @@ for i = 1, 16 do
     Sync.state._failedCatchUp[PROFILE .. "\0a-" .. i] = true
     Sync.state._failedCatchUp["profile-b\0b-" .. i] = true
 end
+local kept = Sync.state._failedCatchUp["profile-b\0b-1"]
 local originalKeepalive = Sync._UnprovenCatchUpKeepalive
 Sync._UnprovenCatchUpKeepalive = function()
     return true
 end
 Sync:_RememberUnprovenCatchUpRelease(KINO, OWNER)
 Sync._UnprovenCatchUpKeepalive = originalKeepalive
-assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
-    "a mixed full book records the next failed coordinator")
+assertEq(Sync.state._failedCatchUp["profile-b\0b-1"], kept,
+    "a full mixed book does not drop an earlier failure")
 assertEq(Sync:_FailedCatchUpCount(Sync.state._failedCatchUp), 32,
-    "recording a mixed-book failure stays at 32 entries")
-assertEq(Sync:_FailedCatchUpBlocks("Fresh-Realm", "profile-b"), false,
-    "the other profile does not fail closed because one of its markers was dropped")
+    "a full mixed book does not grow past 32")
 assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
-    "the recorded coordinator cannot reclaim on the same profile")
+    "a full mixed book fail-closes the next unmarked coordinator")
+assertTrue(Sync:_FailedCatchUpBlocks("b-1", "profile-b"),
+    "the earlier failure stays blocked")
 end)()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
