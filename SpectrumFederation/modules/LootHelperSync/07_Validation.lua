@@ -1172,7 +1172,8 @@ end
 -- It must already be stored, authored by another canonical admin, and still be
 -- the latest local admin effect. Any other grant or revocation in the payload
 -- is not proof and must not be merged. The same sender and remote rows reuse
--- that result until local history changes.
+-- that result until local history changes. Once 32 results are stored for
+-- this history, a new payload is unproven and does not walk history again.
 -- @param sender string "Name-Realm"
 -- @param logs table
 -- @return table|nil
@@ -1194,6 +1195,15 @@ function Sync:_CatchUpProvenGrantLog(sender, logs)
                 end
             end
             return cachedGrant
+        end
+        -- A new key must not evict a stored rejection. Cycling one extra
+        -- payload would otherwise walk local history on every packet.
+        local stored = 0
+        for _ in pairs(proofCache.byKey) do
+            stored = stored + 1
+            if stored >= 32 then
+                return nil
+            end
         end
     end
     if not self:_LogsEstablishAdminGrant(logs, sender) then return nil end
@@ -1267,26 +1277,18 @@ function Sync:_StoreCatchUpProof(token, proven)
         }
         self.state._catchUpProofScan = cache
     end
-    local stored = 0
-    local oldest = nil
-    for key in pairs(cache.byKey) do
-        stored = stored + 1
-        if oldest == nil then oldest = key end
-    end
     if type(cache.order) ~= "table" then
         cache.order = {}
     end
-    -- Replacing the map drops every negative result. The sender can then
-    -- resubmit those proofs and walk local history once per payload. Keep the
-    -- other rejections and drop only the oldest key.
-    if cache.byKey[token.key] == nil and (stored >= 32 or #cache.order >= 32) then
-        local evict = table.remove(cache.order, 1)
-        if evict == nil then evict = oldest end
-        if evict ~= nil then
-            cache.byKey[evict] = nil
-        end
-    end
+    -- Keep stored rejections until history changes. Evicting one lets the
+    -- sender cycle 33 payloads and walk local history on every packet.
     if cache.byKey[token.key] == nil then
+        local stored = 0
+        for _ in pairs(cache.byKey) do
+            stored = stored + 1
+            if stored >= 32 then return end
+        end
+        if #cache.order >= 32 then return end
         cache.order[#cache.order + 1] = token.key
     end
     cache.byKey[token.key] = proven == true
@@ -1590,7 +1592,9 @@ end
 -- Function Classify a privileged sync response against current auth and this request.
 -- Returns "accept", "stale", "unauthorized", "untrusted", "unproven", or "mismatch".
 -- Canonical admin checks wait until a local copy of the profile exists. Joining
--- members import PROFILE_SNAPSHOT before that copy exists.
+-- members import PROFILE_SNAPSHOT before that copy exists, but only from the
+-- current coordinator or helper. An in-flight responder is accepted only once
+-- that profile can be checked.
 -- A cited request of the wrong kind is a mismatch even when the sender is a
 -- coordinator or helper. Missing requests stay on the trusted-sender path so a
 -- snapshot can still bootstrap a profile.
@@ -1639,7 +1643,9 @@ function Sync:_ClassifyPrivilegedResponse(sender, profileId, req, opts)
     if self:IsTrustedDataSender(sender) then
         return "accept"
     end
-    if type(req) == "table" and self:_ResponderMapHas(req.inflightResponders, sender) then
+    -- Before a local profile exists, helper rotation cannot be checked against
+    -- canonical admins. A retained in-flight answer must not create that profile.
+    if profileKnown and type(req) == "table" and self:_ResponderMapHas(req.inflightResponders, sender) then
         return "accept"
     end
     return "untrusted"

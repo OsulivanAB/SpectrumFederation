@@ -4655,17 +4655,14 @@ assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(2)),
     "a cached rejection is reused")
 assertEq(proofScans, afterProofFill, "a cached rejection does not walk local history again")
 assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(33)),
-    "the proof cache keeps a new rejection by dropping the oldest")
-assertEq(proofScans, afterProofFill + 1, "the new proof walks local history once")
-assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(2)),
-    "a retained rejection stays cached after eviction")
-assertEq(proofScans, afterProofFill + 1, "evicting the oldest proof keeps the other rejections")
+    "a full proof cache rejects a new payload without evicting")
+assertEq(proofScans, afterProofFill, "a full proof cache does not walk history for a new payload")
 assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(1)),
-    "the evicted proof is rejected again")
-assertEq(proofScans, afterProofFill + 2, "the evicted proof walks local history once")
-assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(1)),
-    "the reinserted proof stays cached")
-assertEq(proofScans, afterProofFill + 2, "the reinserted proof does not walk local history again")
+    "a cached rejection stays cached when the book is full")
+assertEq(proofScans, afterProofFill, "a full proof cache does not rescan a cached rejection")
+assertNil(Sync:_CatchUpProvenGrantLog(KINO, rejectedProof(33)),
+    "repeating an uncached proof still does not walk history")
+assertEq(proofScans, afterProofFill, "cycling proofs does not rescan local history")
 Sync._LocalHistoryRevokesAdmin = originalHistory
 end)()
 
@@ -4831,6 +4828,50 @@ assertEq(rebuilds, 1, "takeover replays the profile once")
 assertEq(Sync.state.coordinator, KINO, "the authorized client becomes coordinator")
 assertEq(sendCount(Sync.MSG.COORD_TAKEOVER), allowedSends + 1, "the authorized takeover broadcasts once")
 Sync.RebuildProfile = originalTakeoverRebuild
+end)()
+
+-- A helper rotated off the session cannot bootstrap a missing profile from the
+-- request they already received. Once the profile exists, that same in-flight
+-- admin can still answer.
+;(function()
+reset(MEMBER)
+SF.lootHelperDB.profiles = {}
+SF.lootHelperDB.activeProfileId = nil
+local bootReq = seedRequest("need-rotated", "NEED_PROFILE", { KINO }, KINO)
+Sync.state.helpers = { OWNER }
+Sync.state.coordinator = COORD
+local rotated = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, bootReq, {
+    coordinatorAcceptsAdmins = false,
+    expectedKinds = { NEED_PROFILE = true },
+})
+assertEq(rotated, "untrusted", "a rotated helper cannot bootstrap from an old in-flight request")
+Sync:HandleProfileSnapshot(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-rotated",
+    snapshot = {
+        meta = { _profileId = PROFILE },
+        adminUsers = { KINO },
+    },
+})
+assertNil(SF.lootHelperDB.profiles[PROFILE], "a rotated helper snapshot does not create a profile")
+assertTrue(Sync.state.requests["need-rotated"] ~= nil, "the rejected bootstrap leaves the profile request open")
+local trusted = Sync:_ClassifyPrivilegedResponse(COORD, PROFILE, bootReq, {
+    coordinatorAcceptsAdmins = false,
+    expectedKinds = { NEED_PROFILE = true },
+})
+assertEq(trusted, "accept", "the current coordinator can still bootstrap before the profile exists")
+
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { OWNER }
+Sync.state.coordinator = COORD
+local knownReq = seedRequest("need-known", "NEED_PROFILE", { KINO }, KINO)
+local known = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, knownReq, {
+    coordinatorAcceptsAdmins = false,
+    expectedKinds = { NEED_PROFILE = true },
+})
+assertEq(known, "accept", "an in-flight admin can still answer once the profile exists")
 end)()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
