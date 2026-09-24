@@ -4669,6 +4669,170 @@ assertEq(proofScans, afterProofFill + 2, "the reinserted proof does not walk loc
 Sync._LocalHistoryRevokesAdmin = originalHistory
 end)()
 
+-- A reset clears the active profile id and keeps that profile's removal history.
+-- A new session for the removed coordinator is still rejected. A different
+-- active profile is not this check. A full book of another profile does not
+-- fail-close this one. Takeover replays history before it broadcasts.
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}
+Sync:_ResetSessionState("inactive-profile")
+assertNil(Sync.state.profileId, "reset clears the active profile id")
+assertEq(SF.lootHelperDB.profiles[PROFILE], profile, "reset keeps the stored profile")
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-after-reset",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+    helpers = { OWNER },
+})
+assertEq(Sync.state.active, false, "a removed coordinator does not start a session with no active profile id")
+assertNil(Sync.state.sessionId, "the removed coordinator does not adopt a session id")
+assertTrue(not listHas(Sync.state.helpers, OWNER), "the removed coordinator does not apply advertised helpers")
+Sync:HandleSessionHeartbeat(KINO, {
+    sessionId = "session-after-reset",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+    sentAt = 80,
+})
+assertEq(Sync.state.active, false, "a removed coordinator heartbeat does not activate a reset session")
+Sync:HandleSessionReannounce(KINO, {
+    sessionId = "session-after-reset",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+    helpers = { OWNER },
+})
+assertEq(Sync.state.active, false, "a removed coordinator reannounce does not activate a reset session")
+
+setAdmins({ OWNER, KINO })
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-still-admin",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 12,
+})
+assertEq(Sync.state.sessionId, "session-still-admin",
+    "a current admin is accepted after reset even when history removed them")
+assertEq(Sync.state.coordinator, KINO, "the current admin becomes coordinator after reset")
+
+reset(MEMBER)
+setAdmins({ OWNER })
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}
+local otherProfileId = "profile-other"
+local otherAdmins = { KINO }
+local otherProfile = {
+    _profileId = otherProfileId,
+    _lootLogs = {},
+    _adminUsers = otherAdmins,
+    GetProfileId = function(self)
+        return self._profileId
+    end,
+    GetAdminUsers = function()
+        return otherAdmins
+    end,
+    GetLootLogs = function(self)
+        return self._lootLogs
+    end,
+}
+SF.lootHelperDB.profiles[otherProfileId] = otherProfile
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 10
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-other-profile",
+    profileId = otherProfileId,
+    coordinator = KINO,
+    coordEpoch = 12,
+})
+assertEq(Sync.state.sessionId, "session-other-profile",
+    "an active session does not apply another profile's removal to a new profile")
+assertEq(Sync.state.profileId, otherProfileId, "the new profile is adopted")
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state._failedCatchUp = {}
+for i = 1, 32 do
+    Sync.state._failedCatchUp["profile-other\0filled-" .. i] = true
+end
+assertEq(Sync:_FailedCatchUpBlocks(KINO, PROFILE), false,
+    "a full book of another profile does not block this profile")
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-other-book",
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+assertEq(Sync.state.coordinator, KINO, "another profile's full book does not reject this coordinator")
+Sync.state._failedCatchUp = {}
+for i = 1, 32 do
+    Sync.state._failedCatchUp[PROFILE .. "\0filled-" .. i] = true
+end
+assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
+    "a full book of this profile still blocks an unmarked coordinator")
+
+reset(KINO)
+setAdmins({ KINO })
+Sync.state.coordinator = COORD
+Sync.state.isCoordinator = false
+Sync.state.coordEpoch = 10
+local takeoverSends = sendCount(Sync.MSG.COORD_TAKEOVER)
+local originalTakeoverRebuild = Sync.RebuildProfile
+local rebuildCoordinator = nil
+local rebuildReason = nil
+Sync.RebuildProfile = function(self, profileId, reason)
+    rebuildCoordinator = self.state.coordinator
+    rebuildReason = reason
+    setAdmins({})
+    return true
+end
+local denied = Sync:TakeoverSession(SESSION, PROFILE, "heartbeat-timeout", { rerunAdminConvergence = false })
+assertEq(denied, false, "takeover aborts when replay removes self")
+assertEq(rebuildReason, "takeover", "takeover replays the profile before committing")
+assertEq(rebuildCoordinator, COORD, "replay runs before this client becomes coordinator")
+assertEq(Sync.state.coordinator, COORD, "an aborted takeover leaves the previous coordinator")
+assertEq(Sync.state.isCoordinator, false, "an aborted takeover does not mark this client coordinator")
+assertEq(sendCount(Sync.MSG.COORD_TAKEOVER), takeoverSends, "an aborted takeover does not broadcast")
+Sync.RebuildProfile = originalTakeoverRebuild
+
+reset(KINO)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync.state.isCoordinator = false
+local allowedSends = sendCount(Sync.MSG.COORD_TAKEOVER)
+local rebuilds = 0
+local nested = nil
+Sync.RebuildProfile = function(self, profileId, reason)
+    rebuilds = rebuilds + 1
+    assertEq(self.state.coordinator, COORD, "a successful takeover also replays before commit")
+    assertEq(reason, "takeover", "the successful takeover uses the takeover rebuild reason")
+    nested = self:TakeoverSession(self.state.sessionId, profileId, "rebuild-nested", { rerunAdminConvergence = false })
+    return true
+end
+local allowed = Sync:TakeoverSession(SESSION, PROFILE, "heartbeat-timeout", { rerunAdminConvergence = false })
+assertEq(nested, false, "replay does not commit a nested takeover")
+assertEq(allowed, true, "takeover still commits when replay leaves self authorized")
+assertEq(rebuilds, 1, "takeover replays the profile once")
+assertEq(Sync.state.coordinator, KINO, "the authorized client becomes coordinator")
+assertEq(sendCount(Sync.MSG.COORD_TAKEOVER), allowedSends + 1, "the authorized takeover broadcasts once")
+Sync.RebuildProfile = originalTakeoverRebuild
+end)()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

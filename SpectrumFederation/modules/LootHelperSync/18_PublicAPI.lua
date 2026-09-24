@@ -1025,9 +1025,9 @@ end
 function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     opts = opts or {}
 
-    local ok, why = self:CanSelfCoordinate(profileId)
-    if not ok then
-        if SF.PrintError then SF:PrintError("Cannot takeover session: %s", tostring(why or "unknown reason")) end
+    -- Replay from this function calls TakeoverSession again. That nested call
+    -- must not publish a second takeover; the outer call commits after replay.
+    if self._takeoverAuthRebuild then
         return false
     end
 
@@ -1035,6 +1035,21 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     if not dist then return false end
     if type(sessionId) ~= "string" or sessionId == "" then return false end
     if type(profileId) ~= "string" or profileId == "" then return false end
+
+    -- CanSelfCoordinate reads the persisted admin list. History can already
+    -- have demoted this client. Replay before coordinator state or
+    -- COORD_TAKEOVER is published, and abort if that replay removes self.
+    self._takeoverAuthRebuild = true
+    if self.RebuildProfile then
+        self:RebuildProfile(profileId, "takeover")
+    end
+    self._takeoverAuthRebuild = nil
+
+    local ok, why = self:CanSelfCoordinate(profileId)
+    if not ok then
+        if SF.PrintError then SF:PrintError("Cannot takeover session: %s", tostring(why or "unknown reason")) end
+        return false
+    end
 
     -- Clear convergence state so we don't inherit stale admin statuses / pending convergence
     self.state.adminStatuses = {}

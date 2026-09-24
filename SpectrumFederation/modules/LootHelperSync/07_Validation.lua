@@ -130,12 +130,16 @@ end
 -- current admin; a different name waits instead of walking history again.
 -- The cached result is dropped when that history changes or an explicit
 -- revocation is recorded.
+-- A reset clears the active profile id and keeps the stored profile. With no
+-- active profile, the payload's profile id is the history to read. An active
+-- session does not apply that check to a different profile.
 -- @param payload table
 -- @return boolean
-function Sync:_SameProfileRevokeScanCurrent(cache)
+function Sync:_SameProfileRevokeScanCurrent(cache, scopeProfileId)
     if type(cache) ~= "table" or not self.state then return false end
-    if cache.profileId ~= self.state.profileId then return false end
-    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    if type(scopeProfileId) ~= "string" or scopeProfileId == "" then return false end
+    if cache.profileId ~= scopeProfileId then return false end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(scopeProfileId) or nil
     local logs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
     if cache.logs ~= logs then return false end
     local count = type(logs) == "table" and #logs or 0
@@ -149,15 +153,24 @@ function Sync:_IncomingSameProfileHistoryRevoked(payload)
     if type(payload.coordinator) ~= "string" or payload.coordinator == "" then return false end
     if type(payload.profileId) ~= "string" or payload.profileId == "" then return false end
     if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return false end
-    if payload.profileId ~= self.state.profileId then return false end
-    if payload.sessionId == self.state.sessionId then return false end
-    if self.IsSenderAuthorized and self:IsSenderAuthorized(self.state.profileId, payload.coordinator) then
+    -- No active profile (including after reset) still has the payload's stored
+    -- profile. An active session only applies this rule to its own profile.
+    local scopeProfileId = payload.profileId
+    local activeProfileId = self.state.profileId
+    if self.state.active == true and type(activeProfileId) == "string" and activeProfileId ~= "" then
+        if payload.profileId ~= activeProfileId then return false end
+        scopeProfileId = activeProfileId
+    end
+    if type(self.state.sessionId) == "string" and payload.sessionId == self.state.sessionId then
+        return false
+    end
+    if self.IsSenderAuthorized and self:IsSenderAuthorized(scopeProfileId, payload.coordinator) then
         return false
     end
     local now = self:_Now()
     local cooldown = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
     local cache = self.state._sameProfileRevokeScan
-    if self:_SameProfileRevokeScanCurrent(cache) then
+    if self:_SameProfileRevokeScanCurrent(cache, scopeProfileId) then
         local age = now - (tonumber(cache.at) or 0)
         if age >= 0 and age < cooldown then
             if self:_SamePlayer(cache.name, payload.coordinator) then
@@ -167,8 +180,8 @@ function Sync:_IncomingSameProfileHistoryRevoked(payload)
         end
     end
     if not self._LocalHistoryRevokesAdmin then return false end
-    local revoked = self:_LocalHistoryRevokesAdmin(payload.coordinator) == true
-    local profile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+    local revoked = self:_LocalHistoryRevokesAdmin(payload.coordinator, scopeProfileId) == true
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(scopeProfileId) or nil
     local logs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
     self.state._sameProfileRevokeScan = {
         name = payload.coordinator,
@@ -341,23 +354,30 @@ function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
     if not key then return end
     self.state._failedCatchUp = self.state._failedCatchUp or {}
     if self.state._failedCatchUp[key] == true then return end
-    local count = 0
-    for _ in pairs(self.state._failedCatchUp) do
-        count = count + 1
-        if count >= 32 then return end
-    end
+    -- Stop at 32 names for this profile, and at 32 names in the whole book.
+    -- Another profile's entries do not count toward this profile's cap.
+    if self:_FailedCatchUpCount(self.state._failedCatchUp, self.state.profileId) >= 32 then return end
+    if self:_FailedCatchUpCount(self.state._failedCatchUp) >= 32 then return end
     self.state._failedCatchUp[key] = true
 end
 
 -- Function How many failed catch-up markers are stored, capped at the book limit.
+-- A profile id counts only that profile's keys. The total omits the profile id.
 -- @param book table|nil
+-- @param profileId string|nil
 -- @return number
-function Sync:_FailedCatchUpCount(book)
+function Sync:_FailedCatchUpCount(book, profileId)
     local count = 0
     if type(book) ~= "table" then return 0 end
-    for _ in pairs(book) do
-        count = count + 1
-        if count >= 32 then return count end
+    local prefix = nil
+    if type(profileId) == "string" and profileId ~= "" then
+        prefix = profileId .. "\0"
+    end
+    for key in pairs(book) do
+        if not prefix or (type(key) == "string" and key:sub(1, #prefix) == prefix) then
+            count = count + 1
+            if count >= 32 then return count end
+        end
     end
     return count
 end
@@ -365,10 +385,11 @@ end
 -- Function True when this player already lost an unproven catch-up on this profile.
 -- The marker is profile-scoped. A stored grant or canonical admin status on
 -- the incoming profile clears it, including when that profile is not the
--- active session yet. Another profile is not blocked by it. Once the book
--- holds 32 identities, an unmarked player is blocked too. Recording stops,
--- and dropping the whole book would let the next unproven coordinator reclaim
--- with a new session id. A canonical admin or a stored grant still passes.
+-- active session yet. Another profile is not blocked by it. Once this profile
+-- holds 32 identities, an unmarked player on that profile is blocked too.
+-- Entries stored for a different profile do not saturate this one. Recording
+-- still stops at 32 total so the book stays bounded. A canonical admin or a
+-- stored grant still passes.
 -- @param name string "Name-Realm"
 -- @param profileId string|nil Incoming profile id. Defaults to the active profile.
 -- @return boolean
@@ -382,7 +403,7 @@ function Sync:_FailedCatchUpBlocks(name, profileId)
     local key = self:_FailedCatchUpKey(profileId, name)
     if not key then return false end
     local marked = book[key] == true
-    if not marked and self:_FailedCatchUpCount(book) < 32 then return false end
+    if not marked and self:_FailedCatchUpCount(book, profileId) < 32 then return false end
     if self:IsSenderAuthorized(profileId, name) then
         if marked then book[key] = nil end
         return false
@@ -1041,13 +1062,17 @@ end
 -- Function True when local history's last admin effect for this player is a revoke.
 -- Missing history is not a revocation. A later grant clears an earlier removal.
 -- @param name string "Name-Realm"
+-- @param profileId string|nil Profile to read. Defaults to the active profile.
 -- @return boolean
-function Sync:_LocalHistoryRevokesAdmin(name)
+function Sync:_LocalHistoryRevokesAdmin(name, profileId)
     if type(name) ~= "string" or name == "" or not self.state then return false end
     if type(self.FindLocalProfileById) ~= "function" or type(self._GetProfileLootLogs) ~= "function" then
         return false
     end
-    local profile = self:FindLocalProfileById(self.state.profileId)
+    if type(profileId) ~= "string" or profileId == "" then
+        profileId = self.state.profileId
+    end
+    local profile = self:FindLocalProfileById(profileId)
     local logs = profile and self:_GetProfileLootLogs(profile) or nil
     if type(logs) ~= "table" then return false end
     local revoked = false
