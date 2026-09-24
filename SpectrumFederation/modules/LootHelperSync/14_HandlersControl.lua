@@ -937,7 +937,13 @@ function Sync:HandleNeedLogs(sender, payload)
             self:_AppendAdminGrantEvidence(out, profile, member)
         end
         local grant = out[1]
-        if type(grant) ~= "table" or not SF.LootHelperComm then return end
+        if type(grant) ~= "table" then
+            if self._NoteAdminGrantMiss then
+                self:_NoteAdminGrantMiss(sender, member)
+            end
+            return
+        end
+        if not SF.LootHelperComm then return end
         if self._NoteAdminGrantServe then
             self:_NoteAdminGrantServe(sender, member)
         end

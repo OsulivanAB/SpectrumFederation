@@ -1967,34 +1967,53 @@ profile._lootLogs = {
     },
 }
 sends = {}
-for i = 1, 4 do
+local grantScans = 0
+local originalAppendGrant = Sync._AppendAdminGrantEvidence
+Sync._AppendAdminGrantEvidence = function(self, out, grantProfile, member)
+    grantScans = grantScans + 1
+    return originalAppendGrant(self, out, grantProfile, member)
+end
+local grantNow = 1000
+local originalGrantNow = Sync._Now
+Sync._Now = function()
+    return grantNow
+end
+local function requestMissingGrant(requestId)
     Sync:HandleNeedLogs(MEMBER, {
         sessionId = SESSION,
         profileId = PROFILE,
-        requestId = "grant-missing-" .. tostring(i),
+        requestId = requestId,
         adminGrantMember = KINO,
         missing = {
             { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
         },
     })
 end
+for i = 1, 4 do
+    requestMissingGrant("grant-missing-" .. tostring(i))
+end
 assertEq(sendCount(Sync.MSG.AUTH_LOGS), 0, "missing grant does not consume a grant reply")
+assertEq(grantScans, 1, "repeat missing-grant requests do not rescan inside the timeout")
+local missRecord = Sync.state._adminGrantServe and Sync.state._adminGrantServe[MEMBER]
+assertEq(missRecord and missRecord.count or 0, 0, "missing grant does not consume the sent-reply cap")
+for i = 1, 6 do
+    grantNow = grantNow + 5
+    requestMissingGrant("grant-missing-later-" .. tostring(i))
+end
+assertEq(sendCount(Sync.MSG.AUTH_LOGS), 0, "later missing-grant scans still send nothing")
+missRecord = Sync.state._adminGrantServe and Sync.state._adminGrantServe[MEMBER]
+assertEq(missRecord and missRecord.count or 0, 0, "repeated misses stay off the sent-reply cap")
+grantNow = grantNow + 5
 profile._lootLogs[#profile._lootLogs + 1] = {
     _author = OWNER,
     _counter = 4,
     _eventType = "ADMIN_ADDED",
     _data = { member = KINO },
 }
-Sync:HandleNeedLogs(MEMBER, {
-    sessionId = SESSION,
-    profileId = PROFILE,
-    requestId = "grant-arrived",
-    adminGrantMember = KINO,
-    missing = {
-        { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
-    },
-})
+requestMissingGrant("grant-arrived")
 assertEq(sendCount(Sync.MSG.AUTH_LOGS), 1, "grant reply is sent after the row arrives")
+Sync._Now = originalGrantNow
+Sync._AppendAdminGrantEvidence = originalAppendGrant
 
 reset(MEMBER)
 setAdmins({ OWNER })

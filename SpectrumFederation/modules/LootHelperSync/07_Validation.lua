@@ -477,8 +477,9 @@ function Sync:_CanServeAdminGrantRequest(payload)
 end
 
 -- Function True when this sender may receive another grant-only reply.
--- Repeats inside one request timeout, and more than four replies per sender
--- in this session, do not scan or send again.
+-- A sent reply and a miss that found no grant both wait one request timeout
+-- before the history is scanned again. More than four sent replies per sender
+-- in this session do not scan or send again. Misses do not use that cap.
 -- @param sender string "Name-Realm"
 -- @param member string "Name-Realm"
 -- @return boolean
@@ -498,8 +499,11 @@ function Sync:_AdminGrantServeAllowed(sender, member)
     end
     if (tonumber(record.count) or 0) >= 4 then return false end
     local cooldown = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    local now = self:_Now()
     local at = tonumber(record.at)
-    if at and (self:_Now() - at) < cooldown then return false end
+    if at and (now - at) < cooldown then return false end
+    local missAt = tonumber(record.missAt)
+    if missAt and (now - missAt) < cooldown then return false end
     return true
 end
 
@@ -518,6 +522,25 @@ function Sync:_NoteAdminGrantServe(sender, member)
     record.member = member
     record.count = (tonumber(record.count) or 0) + 1
     record.at = self:_Now()
+    self.state._adminGrantServe[sender] = record
+end
+
+-- Function Remember a grant scan that found no row.
+-- The next scan waits one request timeout. The sent-reply cap stays unchanged
+-- so a later grant can still be served.
+-- @param sender string "Name-Realm"
+-- @param member string "Name-Realm"
+-- @return nil
+function Sync:_NoteAdminGrantMiss(sender, member)
+    if not self.state or type(sender) ~= "string" or sender == "" then return end
+    if type(member) ~= "string" or member == "" then return end
+    self.state._adminGrantServe = self.state._adminGrantServe or {}
+    local record = self.state._adminGrantServe[sender]
+    if type(record) ~= "table" or not self:_SamePlayer(record.member, member) then
+        record = { member = member, count = 0 }
+    end
+    record.member = member
+    record.missAt = self:_Now()
     self.state._adminGrantServe[sender] = record
 end
 
