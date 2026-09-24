@@ -916,11 +916,12 @@ function Sync:EndSession(reason, broadcast)
 
     -- A backfill may have written outcomes and yielded before this end.
     -- Advertise that frontier once, while this client is still coordinator,
-    -- instead of once per batch.
+    -- at the same ALERT priority as SES_END so the heartbeat cannot be
+    -- overtaken and resurrect the session.
     if self.state.isCoordinator and SF.LootHelperComm and self.BroadcastSessionHeartbeat then
         local endingProfile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
         if endingProfile and endingProfile._autoBisFrontierPending then
-            self:BroadcastSessionHeartbeat()
+            self:BroadcastSessionHeartbeat({ prio = "ALERT" })
             endingProfile._autoBisFrontierPending = nil
         end
     end

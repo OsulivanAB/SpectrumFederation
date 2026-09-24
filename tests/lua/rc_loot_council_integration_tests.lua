@@ -7442,6 +7442,109 @@ function testSuppressedBisFingerprintIndex()
 end
 testSuppressedBisFingerprintIndex()
 
+function testLateBackfillAwardKeepsCausalOrder()
+    resetEnv()
+    C_Timer = nil
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("LateOrder")
+    addMember(profile, WINNER)
+    assertTrue(profile:SetMemberSpec(WINNER, 71), "Arms spec is stored for the late award")
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    local headLink = "|cffa335ee|Hitem:19001::::::::80:71:::::::::|h[Test Helm]|h|r"
+    assertTrue(profile:ApplyRCLootCouncilIntegrationConfig({
+        recordAwards = true,
+        recordAllAwardTypes = true,
+        allowedResponses = {},
+        bisResponses = {
+            { text = "Need", typeCode = "default", responseId = 1, isAwardReason = false },
+        },
+    }, { skipPermission = true, skipSync = true }), "Need qualifies for the late award")
+    local function canon(historyId, response, responseId, link)
+        return SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
+            id = historyId,
+            response = response,
+            responseID = responseId,
+            lootWon = link,
+            equipLoc = link == headLink and "INVTYPE_HEAD" or nil,
+        }))
+    end
+    local function storeRc(canonical, label)
+        local rc = SF.LootLog.new(SF.LootLogEventTypes.RC_LOOT_COUNCIL, SF.LootLog.BuildRCLootCouncilEventData(canonical), {
+            profile = profile,
+            author = AWARDER,
+            timestamp = canonical.timestamp,
+            externalId = canonical.awardKey,
+            counter = 0,
+            skipPermission = true,
+        })
+        assertTrue(profile:AddLootLog(rc, { skipPermission = true, skipBroadcast = true }), label)
+    end
+    local filler = canon("1700007500-1", "Greed", 2, ITEM_LINK)
+    local newer = canon("1700007700-2", "Need", 1, headLink)
+    storeRc(filler, "the earlier non-BiS award is stored")
+    storeRc(newer, "the newer helm is stored before the delayed award")
+    profile._autoBisBackfill = {
+        keys = { filler.awardKey, newer.awardKey },
+        covered = {},
+        opts = { silent = true },
+        index = 1,
+        wrote = 0,
+        sessionId = Sync.state.sessionId,
+        profileId = profile:GetProfileId(),
+    }
+    local previousHeartbeat = Sync.BroadcastSessionHeartbeat
+    function Sync:BroadcastSessionHeartbeat()
+        return true
+    end
+    profile.AUTO_BIS_BACKFILL_BATCH = 1
+    local deferred = nil
+    local previousRunAfter = Sync.RunAfter
+    function Sync:RunAfter(delaySec, fn)
+        if (tonumber(delaySec) or 0) > 0 then
+            deferred = fn
+            return
+        end
+        return previousRunAfter(self, delaySec, fn)
+    end
+    C_Timer = {
+        NewTimer = function()
+            return { Cancel = function() end }
+        end,
+    }
+    assertEq(profile:_PumpAutomaticBisBackfill(), 1, "the first batch writes the earlier non-BiS award")
+    assertEq(outcomeForAward(profile, filler.awardKey), "NOT_BIS", "the earlier award does not take the helm slot")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", newer.awardKey), 0, "the newer helm stays queued")
+    local older = canon("1700007600-3", "Need", 1, headLink)
+    assertTrue(profile:TryAddRCLootCouncilAward(older), "a delayed older helm is stored")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", older.awardKey), 0, "the delayed helm waits for the backfill")
+    assertEq(profile._autoBisBackfill.keys[1], filler.awardKey, "the processed award stays at the front")
+    assertEq(profile._autoBisBackfill.keys[#profile._autoBisBackfill.keys], older.awardKey, "the delayed helm is appended behind the queued helm")
+    local step = deferred
+    deferred = nil
+    assertTrue(type(step) == "function", "the remaining backfill stays on a timer")
+    step()
+    assertEq(outcomeForAward(profile, older.awardKey), "ASSIGNED", "the older helm is evaluated before the newer queued helm")
+    assertEq(countLootEvents(profile, "BIS_OUTCOME", newer.awardKey), 0, "the newer helm remains queued after the older award")
+    assertEq(profile._autoBisBackfill.keys[1], filler.awardKey, "reordering does not move an already processed award")
+    local guard = 0
+    while profile._autoBisBackfill and guard < 5 do
+        guard = guard + 1
+        step = deferred
+        deferred = nil
+        assertTrue(type(step) == "function", "the last queued helm stays on a timer")
+        step()
+    end
+    assertEq(profile._autoBisBackfill, nil, "the backfill finishes the queued helm")
+    assertEq(outcomeForAward(profile, newer.awardKey), "OVERFLOW", "the newer helm is overflow after the delayed older award")
+    Sync.BroadcastSessionHeartbeat = previousHeartbeat
+    Sync.RunAfter = previousRunAfter
+    C_Timer = nil
+end
+testLateBackfillAwardKeepsCausalOrder()
+
 function testBackfillFrontierOnSessionEnd()
     resetEnv()
     PLAYER = "AdminA-Garona"
@@ -7453,22 +7556,44 @@ function testBackfillFrontierOnSessionEnd()
     Sync.state.coordinator = PLAYER
     profile._autoBisFrontierPending = true
     local heartbeats = 0
+    local lastPrio = nil
     local previousHeartbeat = Sync.BroadcastSessionHeartbeat
-    function Sync:BroadcastSessionHeartbeat()
+    function Sync:BroadcastSessionHeartbeat(opts)
         heartbeats = heartbeats + 1
+        lastPrio = type(opts) == "table" and opts.prio or nil
         return true
     end
     assertTrue(Sync:EndSession("test"), "the coordinator can end the session")
     assertEq(heartbeats, 1, "ending the session advertises a pending backfill frontier once")
+    assertEq(lastPrio, "ALERT", "ending the session sends that heartbeat at ALERT")
     assertEq(profile._autoBisFrontierPending, nil, "session end clears the pending frontier")
     heartbeats = 0
+    lastPrio = nil
     profile._autoBisFrontierPending = true
     startSessionOn(profile)
     Sync.state.isCoordinator = true
     Sync.state.coordinator = PLAYER
     assertTrue(Sync:EndSession("test-again"), "the coordinator can end a second session")
     assertEq(heartbeats, 1, "a second end advertises only that session's pending frontier")
+    assertEq(lastPrio, "ALERT", "a second end also uses ALERT")
     Sync.BroadcastSessionHeartbeat = previousHeartbeat
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    local sentPrio = nil
+    local previousSend = SF.LootHelperComm and SF.LootHelperComm.Send
+    assertTrue(type(previousSend) == "function", "the heartbeat test can capture Comm:Send")
+    function SF.LootHelperComm:Send(channelKey, msgType, payload, distribution, target, prio)
+        sentPrio = prio
+        return true
+    end
+    assertTrue(Sync:BroadcastSessionHeartbeat(), "a normal heartbeat still sends")
+    assertEq(sentPrio, "NORMAL", "a heartbeat without a priority stays NORMAL")
+    assertTrue(Sync:BroadcastSessionHeartbeat({ prio = "ALERT" }), "an alert heartbeat sends")
+    assertEq(sentPrio, "ALERT", "BroadcastSessionHeartbeat forwards ALERT")
+    assertTrue(Sync:BroadcastSessionHeartbeat({ prio = "WHATEVER" }), "an unknown priority still sends")
+    assertEq(sentPrio, "NORMAL", "an unknown priority stays NORMAL")
+    SF.LootHelperComm.Send = previousSend
 end
 testBackfillFrontierOnSessionEnd()
 

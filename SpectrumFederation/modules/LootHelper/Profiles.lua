@@ -3044,7 +3044,8 @@ end
 
 -- A yielded promotion backfill still has older awards queued. A live award
 -- has to wait behind those keys so it cannot take a BiS slot first.
--- Already queued keys are left in place. The pump itself is the writer.
+-- The key is appended here. The next continuation batch orders the
+-- unprocessed tail before it writes. The pump itself is the writer.
 function LootProfile:_QueueAwardBehindAutomaticBisBackfill(awardKey)
     if self._autoBisBackfillPumping or type(awardKey) ~= "string" or awardKey == "" then
         return false
@@ -3101,6 +3102,44 @@ function LootProfile:_MaybeWriteAutomaticBisOutcome(rcLog, opts)
     local ok, err = self:ApplyRCAutoBisOutcome(rcLog, canonical, opts)
     self._writingAutoBis = false
     return ok, err
+end
+
+function LootProfile:_RCLogForAutomaticBisAwardKey(awardKey)
+    local rcId = self.GetRCAwardLogId and self:GetRCAwardLogId(awardKey) or nil
+    if type(rcId) ~= "string" or type(self._logById) ~= "table" then
+        return nil
+    end
+    return self._logById[rcId]
+end
+
+-- Orders only the unprocessed tail. Keys before startIndex were already
+-- evaluated and must stay put. One sort per continuation batch uses the
+-- same timestamp, author, counter, and id order as Identity.CompareLogs.
+function LootProfile:_OrderUnprocessedAutomaticBisAwardKeys(keys, startIndex)
+    local n = type(keys) == "table" and #keys or 0
+    startIndex = tonumber(startIndex) or 1
+    if startIndex < 1 or startIndex >= n then
+        return
+    end
+    local identity = SF.LootHelperIdentity
+    local compare = identity and identity.CompareLogs
+    if type(compare) ~= "function" then
+        return
+    end
+    local tail = {}
+    for i = startIndex, n do
+        tail[#tail + 1] = keys[i]
+    end
+    local profile = self
+    table.sort(tail, function(a, b)
+        return compare(
+            profile:_RCLogForAutomaticBisAwardKey(a),
+            profile:_RCLogForAutomaticBisAwardKey(b)
+        )
+    end)
+    for i = 1, #tail do
+        keys[startIndex + i - 1] = tail[i]
+    end
 end
 
 -- Writes at most one batch per call. A larger backlog continues on a short
@@ -3181,6 +3220,9 @@ function LootProfile:_PumpAutomaticBisBackfill()
                     covered[awardKey] = true
                 end
             end
+            -- A delayed award is appended at the end. Order the remaining
+            -- tail once so an older history row is evaluated first.
+            self:_OrderUnprocessedAutomaticBisAwardKeys(keys, job.index)
         end
         job.covered = covered
         local opts = job.opts or {}
