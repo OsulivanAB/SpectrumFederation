@@ -2062,15 +2062,19 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if type(coordinator) == "string" and coordinator ~= ""
         and not self:IsSenderAuthorized(profileId, coordinator)
     then
-        -- A reload, session start, or coordinator already on catch-up can name a
-        -- successor the local admin list has not absorbed yet. Ordinary AUTH_LOGS
-        -- rebuilds must not turn that absence into a revocation before the grant
-        -- request finishes. A local ADMIN_REMOVED or role demotion still revokes.
+        -- A reload, session start, bootstrap snapshot, or coordinator already on
+        -- catch-up can name a successor the local admin list has not absorbed yet.
+        -- The first snapshot is that list: a helper copy can omit the grant
+        -- without containing a removal. Ordinary later snapshots and AUTH_LOGS
+        -- rebuilds must not turn an existing catch-up into a revocation before
+        -- the grant request finishes. A local ADMIN_REMOVED or role demotion
+        -- still revokes.
         local restoring = reasonText:sub(1, 8) == "restore:"
         local sessionStartMember = reasonText == "rebuild:session_start_member"
+        local bootstrapSnapshot = reasonText == "rebuild:profile_snapshot_new"
         local existingCatchUp = self._CoordinatorNeedsCatchUp
             and self:_CoordinatorNeedsCatchUp(coordinator)
-        if (restoring or sessionStartMember or existingCatchUp)
+        if (restoring or sessionStartMember or bootstrapSnapshot or existingCatchUp)
             and not self:_LocalHistoryRevokesAdmin(coordinator)
         then
             if self._NoteAdvertisedCoordinator then

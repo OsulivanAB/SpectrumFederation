@@ -669,7 +669,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
 
     -- Metrics: measure rebuild duration
     local t1 = debugprofilestop and debugprofilestop() or nil
-    self:RebuildProfile(profileId, "profile_snapshot")
+    -- The first import is the only local history. A helper snapshot can omit
+    -- the coordinator's grant without a removal. That rebuild must stay on
+    -- catch-up, the same as session start. A later snapshot uses the ordinary
+    -- reason and still revokes when catch-up was never established.
+    self:RebuildProfile(profileId, isNew and "profile_snapshot_new" or "profile_snapshot")
     self:LogSessionPointsSummary(profileId, "profile_snapshot_import")
     if t1 then
         self:_MObserve("sync.merge.profile_snapshot.rebuild_ms", debugprofilestop() - t1)

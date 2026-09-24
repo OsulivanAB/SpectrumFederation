@@ -4420,6 +4420,111 @@ assertEq(#served, 1, "a sourced grant is served when the scanned profile applied
 assertEq(Sync.state.profileId, PROFILE, "serving the grant does not switch the active profile")
 end)()
 
+-- The first profile snapshot is the local history. A helper copy that omits
+-- the coordinator grant must not revoke that coordinator or start a takeover.
+;(function()
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = KINO
+Sync.state.helpers = { OWNER }
+Sync.state.coordEpoch = 4
+profile._lootLogs = {}
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:profile_snapshot_new")
+assertEq(Sync.state._coordinatorCatchUp, KINO, "a bootstrap snapshot keeps a missing coordinator on catch-up")
+assertEq(Sync:_RouteWasRevoked(KINO), false, "a bootstrap snapshot does not revoke a coordinator history did not remove")
+assertEq(Sync.state.coordinator, KINO, "an admin does not take over after a bootstrap snapshot with no removal")
+assertEq(Sync.state.isCoordinator, false, "the admin receiver stays a member during bootstrap catch-up")
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:profile_snapshot_new")
+assertEq(Sync:_RouteWasRevoked(KINO), true, "a bootstrap snapshot still revokes a coordinator history removed")
+assertNil(Sync.state._coordinatorCatchUp, "a bootstrap removal does not stay on catch-up")
+
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+profile._lootLogs = {}
+Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:profile_snapshot")
+assertEq(Sync:_RouteWasRevoked(KINO), true, "a later snapshot still revokes a coordinator who is not on catch-up")
+assertNil(Sync.state._coordinatorCatchUp, "a later snapshot does not invent catch-up")
+
+reset(MEMBER)
+SF.lootHelperDB.profiles = {}
+Sync.state.coordinator = KINO
+Sync.state.helpers = { OWNER }
+local bootReason = nil
+local originalCreate = Sync.CreateProfileFromMeta
+local originalRebuild = Sync.RebuildProfile
+Sync.CreateProfileFromMeta = function()
+    return {
+        _rcConfigSeq = 0,
+        GetProfileName = function()
+            return "Imported"
+        end,
+        ImportSnapshot = function()
+            return true, 0
+        end,
+    }
+end
+Sync.RebuildProfile = function(_, _, reason)
+    bootReason = reason
+    return true
+end
+local bootReq = seedRequest("need-boot-new", "NEED_PROFILE", { OWNER }, OWNER)
+Sync:HandleProfileSnapshot(OWNER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = bootReq.id,
+    snapshot = {
+        meta = { _profileId = PROFILE },
+    },
+})
+assertEq(bootReason, "profile_snapshot_new", "the first snapshot rebuild is the bootstrap reason")
+Sync.CreateProfileFromMeta = originalCreate
+Sync.RebuildProfile = originalRebuild
+
+reset(MEMBER)
+setAdmins({ OWNER, KINO })
+Sync.state.coordinator = KINO
+Sync.state.helpers = { OWNER }
+local updateReason = nil
+profile.ImportSnapshot = function()
+    return true, 0
+end
+profile.GetProfileName = function()
+    return "Existing"
+end
+Sync.RebuildProfile = function(_, _, reason)
+    updateReason = reason
+    return true
+end
+local updateReq = seedRequest("need-boot-existing", "NEED_PROFILE", { OWNER }, OWNER)
+Sync:HandleProfileSnapshot(OWNER, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = updateReq.id,
+    snapshot = {
+        meta = { _profileId = PROFILE },
+    },
+})
+assertEq(updateReason, "profile_snapshot", "an existing profile keeps the ordinary snapshot rebuild")
+Sync.RebuildProfile = originalRebuild
+end)()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
