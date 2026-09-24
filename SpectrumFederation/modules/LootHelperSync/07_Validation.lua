@@ -433,7 +433,8 @@ end
 
 -- Function True when catch-up logs cite a grant this profile already trusts.
 -- The establishing row must already be in local history, authored by a canonical
--- admin other than the sender. A sender-supplied ADMIN_ADDED is not that evidence.
+-- admin other than the sender, and local history must still end with that grant.
+-- A sender-supplied ADMIN_ADDED is not that evidence. A later local removal wins.
 -- @param sender string "Name-Realm"
 -- @param logs table
 -- @return boolean
@@ -456,6 +457,9 @@ function Sync:_CatchUpLogsProveGrant(sender, logs)
     if type(grantAuthor) ~= "string" or grantAuthor == "" then return false end
     if self:_SamePlayer(grantAuthor, sender) then return false end
     if not self:IsSenderAuthorized(self.state.profileId, grantAuthor) then return false end
+    -- A stored grant that local history later revoked is not current authority.
+    -- The response can omit that removal after a session reset cleared revokedRoutes.
+    if self:_LocalHistoryRevokesAdmin(sender) then return false end
 
     local profile = self:FindLocalProfileById(self.state.profileId)
     local localLogs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
@@ -860,9 +864,30 @@ end
 -- is no longer allowed to coordinate.
 -- @param reason string|nil
 -- @return nil
+function Sync:_CancelAdminConvergenceTimers(conv)
+    if type(conv) ~= "table" or type(conv.timerHandles) ~= "table" then return end
+    for i = 1, #conv.timerHandles do
+        local handle = conv.timerHandles[i]
+        if type(handle) == "table" and type(handle.Cancel) == "function" then
+            pcall(function()
+                handle:Cancel()
+            end)
+        end
+    end
+    conv.timerHandles = nil
+end
+
+function Sync:_TrackAdminConvergenceTimer(handle)
+    local conv = self.state and self.state._adminConvergence
+    if type(conv) ~= "table" or handle == nil then return end
+    conv.timerHandles = conv.timerHandles or {}
+    conv.timerHandles[#conv.timerHandles + 1] = handle
+end
+
 function Sync:_AbandonAdminConvergence(reason)
     local conv = self.state and self.state._adminConvergence
     if type(conv) ~= "table" then return end
+    self:_CancelAdminConvergenceTimers(conv)
     conv.finished = true
     conv.onComplete = nil
     self.state._adminConvergence = nil

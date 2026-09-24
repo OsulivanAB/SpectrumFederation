@@ -282,6 +282,7 @@ Sync._EnforceGroupedSessionActive = function()
     return "RAID"
 end
 Sync.UpdatePeersFromRoster = function() end
+local originalBeginAdminConvergence = Sync.BeginAdminConvergence
 Sync.BeginAdminConvergence = function()
     return true
 end
@@ -1392,6 +1393,23 @@ Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, {
 }))
 assertEq(mergeOpts and mergeOpts.allowReplaceExisting, false, "catch-up snapshot imports a grant already in local history")
 assertTrue(Sync.state.requests["need-catch-snap"] ~= nil, "failed catch-up import leaves the profile request open")
+mergeOpts = nil
+profile._lootLogs[#profile._lootLogs + 1] = {
+    _eventType = "ADMIN_REMOVED",
+    _author = OWNER,
+    _counter = 4,
+    _data = { member = KINO },
+}
+Sync.state._coordinatorCatchUp = KINO
+Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, {
+    {
+        _eventType = "ADMIN_ADDED",
+        _author = OWNER,
+        _counter = 3,
+        _data = { member = KINO },
+    },
+}))
+assertNil(mergeOpts, "catch-up snapshot ignores a grant that local history later revoked")
 Sync.MergeLogs = function()
     return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
 end
@@ -1907,6 +1925,194 @@ Sync:HandleSessionHeartbeat(KINO, {
     sentAt = 12,
 })
 assertEq(Sync.state.coordEpoch, epochBefore, "explicitly revoked successor heartbeat is ignored after restore")
+
+-- A superseded local grant is not catch-up proof, even when the response omits the removal.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 3,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+    {
+        _author = OWNER,
+        _counter = 4,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}
+local superseded = seedRequest("need-superseded", "NEED_LOGS", { KINO }, KINO)
+superseded.meta.integrityRepair = true
+local supersededMerges = 0
+Sync.MergeLogs = function()
+    supersededMerges = supersededMerges + 1
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+Sync:HandleAuthLogs(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-superseded",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    logs = {
+        {
+            _author = OWNER,
+            _counter = 3,
+            _eventType = "ADMIN_ADDED",
+            _data = { member = KINO },
+        },
+    },
+})
+assertEq(supersededMerges, 0, "catch-up AUTH_LOGS ignores a grant that local history later revoked")
+Sync.MergeLogs = function()
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+
+-- Abandoned convergence timers must not finalize a replacement round.
+reset(COORD)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.isCoordinator = true
+local convergenceFinishes = 0
+local originalBroadcast = Sync.BroadcastSessionStart
+Sync.BroadcastSessionStart = function()
+    convergenceFinishes = convergenceFinishes + 1
+end
+local timerCount = #timers
+originalBeginAdminConvergence(Sync, SESSION, PROFILE, {
+    onComplete = function()
+        convergenceFinishes = convergenceFinishes + 1
+    end,
+})
+assertTrue(#timers > timerCount, "admin convergence schedules a collection timer")
+local firstCollect = timers[#timers]
+local firstSyncId = Sync.state._adminConvergence and Sync.state._adminConvergence.adminSyncId
+assertTrue(type(firstSyncId) == "string", "admin convergence records an id")
+Sync:_AbandonAdminConvergence("lost-admin")
+assertEq(firstCollect.cancelled, true, "abandon cancels the collection timer")
+assertNil(Sync.state._adminConvergence, "abandon clears convergence state")
+originalBeginAdminConvergence(Sync, SESSION, PROFILE, {
+    onComplete = function()
+        convergenceFinishes = convergenceFinishes + 1
+    end,
+})
+local secondSyncId = Sync.state._adminConvergence and Sync.state._adminConvergence.adminSyncId
+assertTrue(secondSyncId ~= firstSyncId, "replacement convergence uses a new id")
+firstCollect.fn()
+assertEq(Sync.state._adminConvergence.adminSyncId, secondSyncId, "old collection timer leaves the replacement in place")
+assertTrue(Sync.state._adminConvergence.finalizeStarted ~= true, "old collection timer does not finalize the replacement")
+assertEq(convergenceFinishes, 0, "old collection timer does not announce")
+
+profile.ComputeAuthorMax = function()
+    return {}
+end
+Sync.state.adminStatuses = {
+    [KINO] = { hasProfile = true, authorMax = { ["Author-Realm"] = 2 } },
+}
+local originalMissing = Sync.ComputeMissingLogRequests
+local originalRegister = Sync.RegisterRequest
+Sync.ComputeMissingLogRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
+    }
+end
+Sync.RegisterRequest = function()
+    return true
+end
+timerCount = #timers
+Sync:FinalizeAdminConvergence()
+assertTrue(#timers > timerCount, "log sync schedules a timeout")
+local logTimer = timers[#timers]
+local logSyncId = Sync.state._adminConvergence and Sync.state._adminConvergence.adminSyncId
+Sync:_AbandonAdminConvergence("lost-admin-during-logs")
+assertEq(logTimer.cancelled, true, "abandon cancels the log sync timer")
+originalBeginAdminConvergence(Sync, SESSION, PROFILE, {
+    onComplete = function()
+        convergenceFinishes = convergenceFinishes + 1
+    end,
+})
+local replacementId = Sync.state._adminConvergence.adminSyncId
+logTimer.fn()
+assertEq(Sync.state._adminConvergence.adminSyncId, replacementId, "old log timer does not finish the replacement")
+assertEq(convergenceFinishes, 0, "old log timer does not run the replacement hook")
+Sync.ComputeMissingLogRequests = originalMissing
+Sync.RegisterRequest = originalRegister
+Sync.BroadcastSessionStart = originalBroadcast
+
+-- A local role demotion updates routes on the writer. Its own NEW_LOG is not required.
+loadModule("SpectrumFederation/modules/LootHelper/Members.lua")
+SF.LootLogEventTypes = SF.LootLogEventTypes or {}
+SF.LootLogEventTypes.ROLE_CHANGE = "ROLE_CHANGE"
+SF.LootLog = {
+    GetEventDataTemplate = function()
+        return {}
+    end,
+    new = function()
+        return {}
+    end,
+}
+reset(KINO)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+Sync.state.helpers = { COORD }
+seedRequest("need-local-coord", "NEED_LOGS", { COORD }, COORD)
+profile.IsCurrentUserAdmin = function()
+    return true
+end
+profile.AddLootLog = function()
+    setAdmins({ KINO, OWNER })
+    return true
+end
+local originalTakeover = Sync.TakeoverSession
+Sync.TakeoverSession = function()
+    return true
+end
+local demotedCoordinator = SF.Member.new(COORD, SF.MemberRoles.ADMIN)
+assertEq(demotedCoordinator:SetRole(SF.MemberRoles.MEMBER, { profile = profile }), true,
+    "local coordinator demotion commits")
+assertEq(Sync:_RouteWasRevoked(COORD), true, "local coordinator demotion records the revocation")
+assertTrue(not listHas(Sync.state.helpers, COORD), "local coordinator demotion drops that helper")
+assertTrue(Sync:_ResponderMapHas(Sync.state.requests["need-local-coord"].revokedResponders, COORD),
+    "local coordinator demotion tombstones that responder")
+assertTrue(listHas(Sync.state.requests["need-local-coord"].targets, COORD),
+    "outstanding request stays held until a successor is stored")
+local demotedEpoch = Sync.state.coordEpoch
+Sync:HandleSessionHeartbeat(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = demotedEpoch + 1,
+    sentAt = 20,
+})
+assertEq(Sync.state.coordEpoch, demotedEpoch, "locally demoted coordinator heartbeat does not advance the epoch")
+Sync.TakeoverSession = originalTakeover
+
+reset(COORD)
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.isCoordinator = true
+Sync.state.coordinator = COORD
+Sync.state.helpers = { KINO }
+seedRequest("need-local-helper", "NEED_LOGS", { KINO, COORD }, KINO)
+profile.IsCurrentUserAdmin = function()
+    return true
+end
+profile.AddLootLog = function()
+    setAdmins({ COORD, OWNER })
+    return true
+end
+local demotedHelper = SF.Member.new(KINO, SF.MemberRoles.ADMIN)
+assertEq(demotedHelper:SetRole(SF.MemberRoles.MEMBER, { profile = profile }), true,
+    "local helper demotion commits")
+assertTrue(not listHas(Sync.state.helpers, KINO), "local helper demotion drops that helper")
+assertTrue(not listHas(Sync.state.requests["need-local-helper"].targets, KINO),
+    "local helper demotion drops that request target")
+assertEq(Sync.state.coordinator, COORD, "local helper demotion keeps the authorized coordinator")
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

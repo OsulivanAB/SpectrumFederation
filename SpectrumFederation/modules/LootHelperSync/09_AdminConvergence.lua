@@ -117,6 +117,10 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         return
     end
 
+    if type(self.state._adminConvergence) == "table" then
+        self:_CancelAdminConvergenceTimers(self.state._adminConvergence)
+    end
+
     local adminSyncId = self:_NextNonce("AS")
     local mode = (opts.onComplete and "REANNOUNCE") or "START"
     
@@ -184,15 +188,18 @@ function Sync:BeginAdminConvergence(sessionId, profileId, opts)
         end
     end
 
-    -- After collection window, finalize no matter what
+    -- After collection window, finalize no matter what.
+    -- The id check ignores a timer left behind by an abandoned convergence.
     local sid = sessionId
-    self:RunAfter(self.cfg.adminConvergenceCollectSec or 1.5, function()
+    local collectSyncId = adminSyncId
+    local collectHandle = self:RunAfter(self.cfg.adminConvergenceCollectSec or 1.5, function()
         if not self.state.active or not self.state.isCoordinator then return end
         if self.state.sessionId ~= sid then return end
         local conv = self.state._adminConvergence
-        if not conv or conv.finished or conv.finalizeStarted then return end
+        if not conv or conv.adminSyncId ~= collectSyncId or conv.finished or conv.finalizeStarted then return end
         self:FinalizeAdminConvergence()
     end)
+    self:_TrackAdminConvergenceTimer(collectHandle)
 end
 
 -- Function Finish admin convergence by calling the completion hook (BroadcastSessionStart or ReannounceSession).
@@ -212,6 +219,7 @@ function Sync:_FinishAdminConvergence(reason)
     end
     
     conv.finished = true
+    self:_CancelAdminConvergenceTimers(conv)
     local onComplete = conv.onComplete
 
     -- START and takeover/REANNOUNCE both adopt a strictly newer previously
@@ -501,13 +509,19 @@ function Sync:FinalizeAdminConvergence()
         return
     end
 
-    -- Otherwise, wait a bit for AUTH_LOGS, then proceed even if some time out
+    -- Otherwise, wait a bit for AUTH_LOGS, then proceed even if some time out.
+    -- A replacement convergence has a different adminSyncId, so this timer
+    -- must not finish that later round.
     local sid = self.state.sessionId
-    self:RunAfter(self.cfg.adminLogSyncTimeoutSec or 4.0, function()
+    local logSyncId = conv.adminSyncId
+    local logSyncHandle = self:RunAfter(self.cfg.adminLogSyncTimeoutSec or 4.0, function()
         if not self.state.active or not self.state.isCoordinator then return end
         if self.state.sessionId ~= sid then return end
+        local current = self.state._adminConvergence
+        if not current or current.adminSyncId ~= logSyncId or current.finished then return end
         self:_FinishAdminConvergence("timeout")
     end)
+    self:_TrackAdminConvergenceTimer(logSyncHandle)
 end
 
 -- Function Choose helpers list from known admin statuses (middle-ground "helpers list" approach).

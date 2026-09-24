@@ -255,6 +255,19 @@ function Member:SetRole(newRole, opts)
         local oldRole = self.role
         self.role = newRole
 
+        -- The writer does not receive its own NEW_LOG, and a duplicate echo
+        -- returns before live revocation routing. Reconcile here, as local
+        -- admin add and remove already do, so helper routes and revoked
+        -- coordinators update on this client.
+        local sync = SF.LootHelperSync
+        local profile = opts.profile
+        if sync and type(sync.ReconcileSessionAuthorization) == "function"
+            and profile and type(profile.GetProfileId) == "function"
+        then
+            local reason = (newRole == MEMBER_ROLES.MEMBER) and "local_role_demoted" or "local_role_promoted"
+            sync:ReconcileSessionAuthorization(profile:GetProfileId(), reason)
+        end
+
         if SF.Debug then
             SF.Debug:Info("MEMBER", "%s role changed: %s -> %s", self:GetFullIdentifier(), oldRole, newRole)
         end
