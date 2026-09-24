@@ -279,6 +279,7 @@ local function reset(selfName)
     Sync.state._catchUpGrantScanOther = nil
     Sync.state._catchUpProofScan = nil
     Sync.state._failedCatchUp = nil
+    Sync.state._failedCatchUpOverflow = nil
     Sync.state._sentJoinStatusForSessionId = nil
     Sync.state._sessionAnnounced = SESSION
     Sync._reconcilingSessionAuthorization = nil
@@ -4767,15 +4768,16 @@ Sync.state._failedCatchUp = {}
 for i = 1, 32 do
     Sync.state._failedCatchUp["profile-other\0filled-" .. i] = true
 end
-assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
-    "a full book fail-closes an unmarked coordinator on another profile")
+assertEq(Sync:_FailedCatchUpBlocks(KINO, PROFILE), false,
+    "another profile's full book does not block this profile")
 Sync:HandleSessionStart(KINO, {
     sessionId = "session-other-book",
     profileId = PROFILE,
     coordinator = KINO,
     coordEpoch = 11,
 })
-assertEq(Sync.state.coordinator, COORD, "another profile's full book does not adopt this coordinator")
+assertEq(Sync.state.coordinator, KINO, "another profile's full book still allows this profile's catch-up")
+assertEq(Sync.state.sessionId, "session-other-book", "that catch-up adopts the new session")
 Sync.state._failedCatchUp = {}
 for i = 1, 16 do
     Sync.state._failedCatchUp["profile-other\0partial-" .. i] = true
@@ -4903,10 +4905,14 @@ assertEq(Sync.state._failedCatchUp["profile-b\0b-1"], kept,
     "a full mixed book does not drop an earlier failure")
 assertEq(Sync:_FailedCatchUpCount(Sync.state._failedCatchUp), 32,
     "a full mixed book does not grow past 32")
+assertEq(Sync.state._failedCatchUpOverflow[PROFILE], true,
+    "a full mixed book marks this profile instead of dropping a marker")
 assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
-    "a full mixed book fail-closes the next unmarked coordinator")
+    "this profile fail-closes after a failure cannot be stored")
 assertTrue(Sync:_FailedCatchUpBlocks("b-1", "profile-b"),
     "the earlier failure stays blocked")
+assertEq(Sync:_FailedCatchUpBlocks("c-1", "profile-c"), false,
+    "a profile that has not overflowed stays open")
 end)()
 
 -- Uncorrelated catch-up snapshots are classified without proof work.
@@ -5008,6 +5014,41 @@ assertEq(logCalls, 0, "an oversized admin list does not read snapshot logs")
 Sync._CatchUpLogsProveGrant = originalLogsProve
 Sync._CatchUpSnapshotProvesGrant = originalSnapshotProof
 Sync._LocalHistoryRevokesAdmin = originalHistory
+end)()
+
+-- Extra grant-data keys are rejected before the deep compare.
+;(function()
+reset(MEMBER)
+local compared = 0
+local originalSame = Sync._SamePlainValue
+Sync._SamePlainValue = function(self, a, b, depth)
+    compared = compared + 1
+    return originalSame(self, a, b, depth)
+end
+local function row(data)
+    return {
+        _author = OWNER,
+        _counter = 3,
+        _eventType = "ADMIN_ADDED",
+        _data = data,
+    }
+end
+local stored = row({ member = KINO, sourceLogId = "log-1" })
+assertEq(Sync:_GrantRowsMatch(stored, row({ member = KINO, sourceLogId = "log-1" })), true,
+    "a short admin grant still matches")
+assertTrue(compared > 0, "a short admin grant is compared")
+local bulky = { member = KINO }
+for i = 1, 8 do
+    bulky["extra" .. i] = "v"
+end
+local beforeBulky = compared
+assertEq(Sync:_GrantRowsMatch(stored, row(bulky)), false, "grant data past 8 keys is not proof")
+assertEq(compared, beforeBulky, "grant data past 8 keys is not deeply compared")
+local beforeLong = compared
+assertEq(Sync:_GrantRowsMatch(stored, row({ member = string.rep("m", 241) })), false,
+    "an overlong grant field is not proof")
+assertEq(compared, beforeLong, "an overlong grant field is not deeply compared")
+Sync._SamePlainValue = originalSame
 end)()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

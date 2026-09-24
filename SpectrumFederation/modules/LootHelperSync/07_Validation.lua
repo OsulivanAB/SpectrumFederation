@@ -355,11 +355,46 @@ function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
     self.state._failedCatchUp = self.state._failedCatchUp or {}
     if self.state._failedCatchUp[key] == true then return end
     -- Stop at 32 names for this profile and for the whole book. Dropping a
-    -- stored marker would let that coordinator reclaim. A full book fail-closes
-    -- instead of forgetting an earlier failure.
-    if self:_FailedCatchUpCount(self.state._failedCatchUp, self.state.profileId) >= 32 then return end
-    if self:_FailedCatchUpCount(self.state._failedCatchUp) >= 32 then return end
+    -- stored marker would let that coordinator reclaim. A full profile already
+    -- fail-closes. A full book does not. This profile is marked instead, so
+    -- the failure cannot be replayed and other profiles stay open.
+    local profileId = self.state.profileId
+    if self:_FailedCatchUpCount(self.state._failedCatchUp, profileId) >= 32 then return end
+    if self:_FailedCatchUpCount(self.state._failedCatchUp) >= 32 then
+        self:_NoteFailedCatchUpOverflow(profileId)
+        return
+    end
     self.state._failedCatchUp[key] = true
+end
+
+-- Function Remember that this profile could not store another failed catch-up.
+-- The marker book stays intact. Only this profile fail-closes afterward.
+-- @param profileId string
+-- @return nil
+function Sync:_NoteFailedCatchUpOverflow(profileId)
+    if not self.state or type(profileId) ~= "string" or profileId == "" then return end
+    self.state._failedCatchUpOverflow = self.state._failedCatchUpOverflow or {}
+    if self.state._failedCatchUpOverflow[profileId] == true then return end
+    if self:_FailedCatchUpCount(self.state._failedCatchUpOverflow) >= 32 then return end
+    self.state._failedCatchUpOverflow[profileId] = true
+end
+
+-- Function True when this profile must fail-close because a failure could not be stored.
+-- Overflow applies only while the shared book is still full. A grant that frees
+-- a slot clears it. Thirty-two overflowed profiles close any further profile.
+-- @param profileId string
+-- @return boolean
+function Sync:_FailedCatchUpOverflowBlocks(profileId)
+    if not self.state or type(profileId) ~= "string" or profileId == "" then return false end
+    local book = self.state._failedCatchUp
+    if self:_FailedCatchUpCount(book) < 32 then
+        self.state._failedCatchUpOverflow = nil
+        return false
+    end
+    local overflow = self.state._failedCatchUpOverflow
+    if type(overflow) ~= "table" then return false end
+    if overflow[profileId] == true then return true end
+    return self:_FailedCatchUpCount(overflow) >= 32
 end
 
 -- Function How many failed catch-up markers are stored, capped at the book limit.
@@ -386,11 +421,10 @@ end
 -- Function True when this player already lost an unproven catch-up on this profile.
 -- The marker is profile-scoped. A stored grant or canonical admin status on
 -- the incoming profile clears it, including when that profile is not the
--- active session yet. Another profile is not blocked by it. Once this profile
--- holds 32 identities, an unmarked player on that profile is blocked too.
--- A book that already holds 32 identities fail-closes an unmarked player on
--- any profile. Stored markers stay until a grant or canonical admin clears
--- them. A canonical admin or a stored grant still passes.
+-- active session yet. Markers from another profile do not block this one.
+-- Once this profile holds 32 identities, an unmarked player on it is blocked.
+-- A profile that could not store a failure while the book was full is blocked
+-- the same way. A canonical admin or a stored grant still passes.
 -- @param name string "Name-Realm"
 -- @param profileId string|nil Incoming profile id. Defaults to the active profile.
 -- @return boolean
@@ -404,10 +438,9 @@ function Sync:_FailedCatchUpBlocks(name, profileId)
     local key = self:_FailedCatchUpKey(profileId, name)
     if not key then return false end
     local marked = book[key] == true
-    if not marked
-        and self:_FailedCatchUpCount(book, profileId) < 32
-        and self:_FailedCatchUpCount(book) < 32
-    then
+    local profileFull = self:_FailedCatchUpCount(book, profileId) >= 32
+    local overflow = self:_FailedCatchUpOverflowBlocks(profileId)
+    if not marked and not profileFull and not overflow then
         return false
     end
     if self:IsSenderAuthorized(profileId, name) then
@@ -1106,6 +1139,7 @@ end
 local CATCH_UP_PROOF_MAX_ROWS = 8192
 local CATCH_UP_PROOF_MAX_FIELD_BYTES = 240
 local CATCH_UP_PROOF_MAX_KEY_BYTES = 1048576
+local CATCH_UP_PROOF_MAX_DATA_KEYS = 8
 
 -- Function True when these logs can be hashed for catch-up proof.
 -- The row cap is an index check. An overlong field uses string length, so
@@ -1387,6 +1421,41 @@ local function _LogField(row, stored, plain)
     return value
 end
 
+-- Function True when grant data is small enough for proof to compare.
+-- Counting stops at the key budget, so a larger table is not walked.
+-- @param value any
+-- @param depth number
+-- @param seen number
+-- @return boolean
+-- @return number
+function Sync:_CatchUpProofDataBounded(value, depth, seen)
+    seen = tonumber(seen) or 0
+    if seen > CATCH_UP_PROOF_MAX_DATA_KEYS then return false, seen end
+    local valueType = type(value)
+    if valueType == "string" then
+        if #value > CATCH_UP_PROOF_MAX_FIELD_BYTES then return false, seen end
+        return true, seen
+    end
+    if valueType == "number" or valueType == "boolean" then
+        return true, seen
+    end
+    if valueType ~= "table" then return false, seen end
+    if (tonumber(depth) or 0) >= 2 then return false, seen end
+    for key, child in pairs(value) do
+        seen = seen + 1
+        if seen > CATCH_UP_PROOF_MAX_DATA_KEYS then return false, seen end
+        if type(key) == "string" then
+            if #key > CATCH_UP_PROOF_MAX_FIELD_BYTES then return false, seen end
+        elseif type(key) ~= "number" then
+            return false, seen
+        end
+        local ok, nextSeen = self:_CatchUpProofDataBounded(child, (tonumber(depth) or 0) + 1, seen)
+        if not ok then return false, nextSeen end
+        seen = nextSeen
+    end
+    return true, seen
+end
+
 -- Function True when two plain values are the same, including nested log data.
 -- @param a any
 -- @param b any
@@ -1440,6 +1509,10 @@ function Sync:_GrantRowsMatch(localTable, remoteTable)
     local localData = _LogField(localTable, "_data", "data")
     local remoteData = _LogField(remoteTable, "_data", "data")
     if type(localData) ~= "table" or type(remoteData) ~= "table" then return false end
+    -- Proof compares the whole data table. Stop before a hostile key set or
+    -- nested value is walked. Real admin grants are a few short fields.
+    if not self:_CatchUpProofDataBounded(localData, 0, 0) then return false end
+    if not self:_CatchUpProofDataBounded(remoteData, 0, 0) then return false end
     if not self:_SamePlainValue(localData, remoteData, 0) then return false end
     local localTs = _LogField(localTable, "_timestamp", "timestamp")
     local remoteTs = _LogField(remoteTable, "_timestamp", "timestamp")
