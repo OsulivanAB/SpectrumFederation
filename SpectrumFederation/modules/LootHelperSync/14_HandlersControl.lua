@@ -244,6 +244,12 @@ function Sync:HandleSessionReannounce(sender, payload)
     if not self:_SamePlayer(sender, payload.coordinator) then
         return
     end
+    if self._RouteWasRevoked and self:_RouteWasRevoked(payload.coordinator) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Ignoring reannounce from revoked coordinator %s", tostring(payload.coordinator))
+        end
+        return
+    end
 
     -- If we're in a different session, require strictly newer epoch
     if self.state.active and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
@@ -351,6 +357,14 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Rejecting heartbeat: sender=%s != coordinator=%s (anti-spoof)",
                 tostring(sender), tostring(payload.coordinator))
+        end
+        return
+    end
+    -- A coordinator this client already removed must not refresh the takeover
+    -- timer or reapply its descriptor. A later re-grant clears that revocation.
+    if self._RouteWasRevoked and self:_RouteWasRevoked(payload.coordinator) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Ignoring heartbeat from revoked coordinator %s", tostring(payload.coordinator))
         end
         return
     end
@@ -600,6 +614,12 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     -- Anti-spoof: sender must equal the coordinator they claim to be
     if not self:_SamePlayer(sender, payload.coordinator) then
+        return
+    end
+    if self._RouteWasRevoked and self:_RouteWasRevoked(payload.coordinator) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Ignoring takeover from revoked coordinator %s", tostring(payload.coordinator))
+        end
         return
     end
 

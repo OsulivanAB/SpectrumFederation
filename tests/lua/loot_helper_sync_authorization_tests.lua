@@ -157,6 +157,7 @@ loadModule("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/10_Handshake.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/12_LiveUpdates.lua")
+loadModule("SpectrumFederation/modules/LootHelperSync/13_Routing.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/15_HandlersBulk.lua")
 loadModule("SpectrumFederation/modules/LootHelperSync/16_ProfileIntegration.lua")
@@ -1124,6 +1125,44 @@ Sync:HandleNewLog(COORD, {
 })
 assertEq(warningCount("not an admin"), 1, "revoked coordinator NEW_LOG warns once")
 
+-- Heartbeats from an explicitly revoked coordinator must not refresh takeover.
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+Sync.state.helpers = { KINO }
+Sync:_RememberRevokedRoute(COORD)
+Sync.state.heartbeat.lastHeartbeatAt = 40
+Sync.state.heartbeat.lastCoordMessageAt = 40
+local originalNow = Sync._Now
+Sync._Now = function()
+    return 500
+end
+Sync:OnControlMessage(COORD, Sync.MSG.SES_HEARTBEAT, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 11,
+    helpers = {},
+    sentAt = 500,
+}, "RAID")
+assertEq(Sync.state.coordEpoch, 10, "revoked coordinator heartbeat does not advance the epoch")
+assertTrue(listHas(Sync.state.helpers, KINO), "revoked coordinator heartbeat does not clear helpers")
+assertEq(Sync.state.heartbeat.lastHeartbeatAt, 40, "revoked coordinator heartbeat does not refresh lastHeartbeatAt")
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 40, "revoked coordinator heartbeat does not refresh lastCoordMessageAt")
+setAdmins({ COORD, KINO, OWNER })
+Sync:HandleSessionHeartbeat(COORD, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 11,
+    helpers = { KINO },
+    sentAt = 500,
+})
+assertEq(Sync.state.coordEpoch, 11, "reauthorized coordinator heartbeat is accepted")
+assertEq(Sync.state.heartbeat.lastHeartbeatAt, 500, "reauthorized coordinator heartbeat refreshes lastHeartbeatAt")
+Sync._Now = originalNow
+
 -- Catch-up replies must prove the sender's grant before any merge.
 reset(MEMBER)
 setAdmins({ OWNER })
@@ -1272,7 +1311,26 @@ Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, {
 }))
 assertNil(mergeOpts, "catch-up snapshot whose logs revoke the sender is not imported")
 Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, nil))
-assertEq(mergeOpts and mergeOpts.allowReplaceExisting, false, "catch-up snapshot does not replace rows before the grant is local")
+assertNil(mergeOpts, "catch-up snapshot with empty history is not imported")
+assertTrue(Sync.state.requests["need-catch-snap"] ~= nil, "empty catch-up snapshot leaves the profile request open")
+Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, {
+    {
+        _eventType = "ADMIN_ADDED",
+        _author = KINO,
+        _counter = 2,
+        _data = { member = KINO },
+    },
+}))
+assertNil(mergeOpts, "catch-up snapshot cannot prove a grant the sender wrote")
+Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, {
+    {
+        _eventType = "ADMIN_ADDED",
+        _author = OWNER,
+        _counter = 3,
+        _data = { member = KINO },
+    },
+}))
+assertEq(mergeOpts and mergeOpts.allowReplaceExisting, false, "catch-up snapshot imports after a trusted admin's grant")
 assertTrue(Sync.state.requests["need-catch-snap"] ~= nil, "failed catch-up import leaves the profile request open")
 Sync.MergeLogs = function()
     return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
@@ -1382,6 +1440,37 @@ end
 assertTrue(dispatched ~= nil, "fallback repair request is registered")
 assertTrue(not listHas(dispatched.targets, SUSPENDERS), "dispatch does not target the revoked player")
 assertEq(dispatched.targets[1], COORD, "dispatch falls back to the coordinator")
+reset(COORD)
+Sync.state.isCoordinator = true
+setAdmins({ COORD, KINO, OWNER })
+Sync.state.helpers = { KINO }
+Sync.state.repairQueue = {
+    order = { "repair-coord" },
+    items = {
+        ["repair-coord"] = {
+            key = "repair-coord",
+            profileId = PROFILE,
+            author = "Author-Realm",
+            fromCounter = 1,
+            toCounter = 2,
+            mode = "integrity",
+            exactAuthor = true,
+            preferredTarget = SUSPENDERS,
+        },
+    },
+}
+Sync:ReconcileSessionAuthorization(PROFILE, "drop-coordinator-repair-target")
+assertNil(Sync.state.repairQueue.items["repair-coord"].preferredTarget, "coordinator reconcile clears a revoked repair target")
+local coordDispatch = Sync:_DispatchQueuedRepair(Sync.state.repairQueue.items["repair-coord"])
+assertEq(coordDispatch, true, "coordinator repair dispatch falls back to a helper")
+local coordReq = nil
+for _, req in pairs(Sync.state.requests) do
+    coordReq = req
+end
+assertTrue(coordReq ~= nil, "coordinator fallback repair request is registered")
+assertTrue(not listHas(coordReq.targets, SUSPENDERS), "coordinator fallback does not target the revoked player")
+assertEq(coordReq.targets[1], KINO, "coordinator fallback targets the remaining helper")
+assertEq(coordReq.kind, "LOG_REQ", "coordinator fallback uses an admin log request")
 local queuedPreferred = "unset"
 Sync.QueueRepairRanges = function(_, _, _, opts)
     queuedPreferred = opts and opts.preferredTarget or nil

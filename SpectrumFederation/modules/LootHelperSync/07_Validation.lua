@@ -357,11 +357,9 @@ function Sync:_SnapshotListsAdmin(snapshot, name)
     return false
 end
 
--- Function Catch-up snapshots must list the sender as an admin before import.
--- When the snapshot also carries admin-grant logs, those logs must still end
--- with the sender granted. Unrelated history does not cancel a listed admin.
--- @param sender string "Name-Realm"
--- @param snapshot table
+-- Function True when two log tables are the same row.
+-- @param a table
+-- @param b table
 -- @return boolean
 function Sync:_SameLogTable(a, b)
     if type(a) ~= "table" or type(b) ~= "table" then return false end
@@ -412,22 +410,75 @@ function Sync:_AppendSelfAdminGrantEvidence(out, profile)
     out[#out + 1] = latest
 end
 
+-- Function Catch-up snapshots must prove the sender's grant from trusted history.
+-- Empty history is not proof. The logs must end with a grant authored by
+-- someone the local profile already authorizes, and that grant must not
+-- rewrite a local log at the same author and counter.
+-- @param sender string "Name-Realm"
+-- @param snapshot table
+-- @return boolean
 function Sync:_CatchUpSnapshotProvesGrant(sender, snapshot)
     if not self:_SnapshotListsAdmin(snapshot, sender) then return false end
     local logs = nil
     if type(snapshot) == "table" then
         logs = snapshot.logs or snapshot.lootLogs or snapshot._lootLogs
     end
-    if type(logs) ~= "table" or #logs == 0 then return true end
-    local mentioned = false
+    -- An empty history plus a sender-written admin list is not a grant.
+    -- The snapshot must include logs that end with this sender granted.
+    if type(logs) ~= "table" or #logs == 0 then return false end
+    if not self:_LogsEstablishAdminGrant(logs, sender) then return false end
+    if not (self.state and self:_ProfileAuthorizationKnown()) then return false end
+
+    local grantAuthor = nil
     for _, logTable in ipairs(logs) do
-        if self:_LogAdminGrantState(logTable, sender) then
-            mentioned = true
-            break
+        local state = self:_LogAdminGrantState(logTable, sender)
+        if state == "grant" then
+            grantAuthor = logTable._author or logTable.author
+        elseif state == "revoke" then
+            grantAuthor = nil
         end
     end
-    if not mentioned then return true end
-    return self:_LogsEstablishAdminGrant(logs, sender)
+    -- The establishing grant has to come from someone this profile already
+    -- trusts. The catch-up sender cannot prove itself by writing its own grant.
+    if type(grantAuthor) ~= "string" or grantAuthor == "" then return false end
+    if self:_SamePlayer(grantAuthor, sender) then return false end
+    if not self:IsSenderAuthorized(self.state.profileId, grantAuthor) then return false end
+
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    local localLogs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
+    if type(localLogs) == "table" then
+        for _, logTable in ipairs(logs) do
+            if self:_LogAdminGrantState(logTable, sender) == "grant" then
+                local author = logTable._author or logTable.author
+                local counter = tonumber(logTable._counter or logTable.counter)
+                for _, localLog in ipairs(localLogs) do
+                    local localTable = localLog
+                    if type(localLog) == "table" and type(localLog.ToTable) == "function" then
+                        localTable = localLog:ToTable()
+                    end
+                    if type(localTable) == "table" then
+                        local localAuthor = localTable._author or localTable.author
+                        local localCounter = tonumber(localTable._counter or localTable.counter)
+                        if type(author) == "string" and localCounter == counter and self:_SamePlayer(localAuthor, author) then
+                            if not self:_SameLogTable(localTable, logTable) then
+                                return false
+                            end
+                            local localData = localTable._data or localTable.data
+                            local remoteData = logTable._data or logTable.data
+                            local localMember = type(localData) == "table" and localData.member or nil
+                            local remoteMember = type(remoteData) == "table" and remoteData.member or nil
+                            if type(localMember) == "string" and type(remoteMember) == "string"
+                                and not self:_SamePlayer(localMember, remoteMember)
+                            then
+                                return false
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return true
 end
 
 -- Function True when an exact-repair preferred target is still a live route.

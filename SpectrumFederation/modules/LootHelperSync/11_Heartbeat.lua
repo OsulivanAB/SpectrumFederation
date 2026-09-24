@@ -21,6 +21,12 @@ function Sync:HandleSessionStart(sender, payload)
     if not self:_SamePlayer(sender, payload.coordinator) then
         return
     end
+    if self._RouteWasRevoked and self:_RouteWasRevoked(payload.coordinator) then
+        if SF.Debug then
+            SF.Debug:Verbose("SYNC", "Ignoring session start from revoked coordinator %s", tostring(payload.coordinator))
+        end
+        return
+    end
 
     local incomingEpoch = payload.coordEpoch
     local incomingCoord = payload.coordinator
