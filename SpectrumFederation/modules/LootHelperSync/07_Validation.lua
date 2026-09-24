@@ -1100,16 +1100,62 @@ function Sync:_LocalHistoryRevokesAdmin(name, profileId)
     return saw and revoked
 end
 
+-- Catch-up proof reads sender-supplied rows on the UI thread. These bounds
+-- reject a payload before that work. Real grant rows are short. A longer
+-- field, or a list past the row cap, is not proof.
+local CATCH_UP_PROOF_MAX_ROWS = 8192
+local CATCH_UP_PROOF_MAX_FIELD_BYTES = 240
+local CATCH_UP_PROOF_MAX_KEY_BYTES = 1048576
+
+-- Function True when these logs can be hashed for catch-up proof.
+-- The row cap is an index check. An overlong field uses string length, so
+-- the bytes of a hostile value are not scanned.
+-- @param logs table
+-- @return boolean
+function Sync:_CatchUpProofPayloadBounded(logs)
+    if type(logs) ~= "table" or logs[1] == nil then return false end
+    if logs[CATCH_UP_PROOF_MAX_ROWS + 1] ~= nil then return false end
+    local bytes = 0
+    for i = 1, CATCH_UP_PROOF_MAX_ROWS do
+        local row = logs[i]
+        if row == nil then break end
+        if type(row) ~= "table" then return false end
+        local data = row._data or row.data
+        local member = type(data) == "table" and data.member or ""
+        local fields = {
+            row._id or row.id or "",
+            row._author or row.author or "",
+            row._counter or row.counter or "",
+            row._eventType or row.eventType or "",
+            row._timestamp or row.timestamp or "",
+            row._fingerprint or row.fingerprint or "",
+            member,
+        }
+        for f = 1, 7 do
+            local text = fields[f]
+            if type(text) ~= "string" then
+                text = tostring(text)
+            end
+            local n = #text
+            if n > CATCH_UP_PROOF_MAX_FIELD_BYTES then return false end
+            bytes = bytes + n
+            if bytes > CATCH_UP_PROOF_MAX_KEY_BYTES then return false end
+        end
+    end
+    return true
+end
+
 -- Function Identity of the local history a catch-up proof walk would read.
 -- A repeat of the same remote logs skips that walk until this identity changes.
 -- Up to 16 remote rows use their exact fields. Larger snapshots use a fixed-size
--- hash so a repeat does not walk local history again.
+-- hash so a repeat does not walk local history again. Payloads past the row,
+-- field, or key budget are not hashed.
 -- @param sender string "Name-Realm"
 -- @param logs table
 -- @return table|nil
 function Sync:_CatchUpProofToken(sender, logs)
     if not self.state or type(sender) ~= "string" or sender == "" then return nil end
-    if type(logs) ~= "table" or #logs == 0 then return nil end
+    if not self:_CatchUpProofPayloadBounded(logs) then return nil end
     if type(self.FindLocalProfileById) ~= "function" or type(self._GetProfileLootLogs) ~= "function" then
         return nil
     end
@@ -1184,7 +1230,7 @@ end
 -- @param logs table
 -- @return table|nil
 function Sync:_CatchUpProvenGrantLog(sender, logs)
-    if type(logs) ~= "table" or #logs == 0 then return nil end
+    if not self:_CatchUpProofPayloadBounded(logs) then return nil end
     local token = self._CatchUpProofToken and self:_CatchUpProofToken(sender, logs) or nil
     local proofCache = self.state and self.state._catchUpProofScan or nil
     if token and self:_CatchUpProofTokenCurrent(proofCache, token) then
@@ -1315,7 +1361,14 @@ end
 function Sync:_SnapshotListsAdmin(snapshot, name)
     local admins = type(snapshot) == "table" and snapshot.adminUsers or nil
     if type(admins) ~= "table" then return false end
-    for _, admin in ipairs(admins) do
+    -- One past the officer list we will scan. A longer list is not proof.
+    if admins[129] ~= nil then return false end
+    for i = 1, 128 do
+        local admin = admins[i]
+        if admin == nil then break end
+        if type(admin) == "string" and #admin > CATCH_UP_PROOF_MAX_FIELD_BYTES then
+            return false
+        end
         if self:_SamePlayer(admin, name) then return true end
     end
     return false
@@ -1593,6 +1646,24 @@ function Sync:_SanitizeQueuedRepairTargets(explicitOnly)
             end
         end
     end
+end
+
+-- Function True when catch-up proof is worth reading for this response.
+-- Proof hashes sender-supplied rows. It runs only for the in-flight request
+-- this client actually sent. A missing request, the wrong kind, or a sender
+-- who was not a target is classified without that work.
+-- @param sender string "Name-Realm"
+-- @param req table|nil
+-- @param expectedKinds table
+-- @return boolean
+function Sync:_CatchUpResponseCanProve(sender, req, expectedKinds)
+    if not (self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)) then
+        return false
+    end
+    if type(req) ~= "table" or type(expectedKinds) ~= "table" or expectedKinds[req.kind] ~= true then
+        return false
+    end
+    return self:_ResponderMapHas(req.inflightResponders, sender) == true
 end
 
 -- Function Classify a privileged sync response against current auth and this request.

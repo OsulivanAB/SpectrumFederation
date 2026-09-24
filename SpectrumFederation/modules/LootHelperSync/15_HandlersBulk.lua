@@ -118,7 +118,8 @@ function Sync:HandleAuthLogs(sender, payload)
                 ADMIN_LOG_REQ = true,
             },
         }
-        if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
+        if self._CatchUpResponseCanProve
+            and self:_CatchUpResponseCanProve(sender, req, classifyOpts.expectedKinds)
             and self._CatchUpLogsProveGrant
         then
             classifyOpts.catchUpProven = self:_CatchUpLogsProveGrant(sender, payload.logs) == true
@@ -525,7 +526,8 @@ function Sync:HandleProfileSnapshot(sender, payload)
             coordinatorAcceptsAdmins = false,
             expectedKinds = { NEED_PROFILE = true },
         }
-        if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
+        if self._CatchUpResponseCanProve
+            and self:_CatchUpResponseCanProve(sender, snapReq, classifyOpts.expectedKinds)
             and self._CatchUpSnapshotProvesGrant
         then
             classifyOpts.catchUpProven = self:_CatchUpSnapshotProvesGrant(sender, payload.snapshot) == true

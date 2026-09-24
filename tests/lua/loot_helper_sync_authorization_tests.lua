@@ -4909,6 +4909,107 @@ assertTrue(Sync:_FailedCatchUpBlocks("b-1", "profile-b"),
     "the earlier failure stays blocked")
 end)()
 
+-- Uncorrelated catch-up snapshots are classified without proof work.
+-- Oversized proof input fails closed before local history is scanned.
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 3,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local proofCalls = 0
+local originalSnapshotProof = Sync._CatchUpSnapshotProvesGrant
+Sync._CatchUpSnapshotProvesGrant = function(self, sender, snapshot)
+    proofCalls = proofCalls + 1
+    return originalSnapshotProof(self, sender, snapshot)
+end
+local historyScans = 0
+local originalHistory = Sync._LocalHistoryRevokesAdmin
+Sync._LocalHistoryRevokesAdmin = function(self, name, profileId)
+    historyScans = historyScans + 1
+    return originalHistory(self, name, profileId)
+end
+local function snap(requestId, logs, admins)
+    return {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        requestId = requestId,
+        snapshot = {
+            meta = { _profileId = PROFILE },
+            adminUsers = admins or { KINO, OWNER },
+            lootLogs = logs,
+        },
+    }
+end
+local grantLog = {
+    _author = OWNER,
+    _counter = 3,
+    _eventType = "ADMIN_ADDED",
+    _data = { member = KINO },
+}
+Sync:HandleProfileSnapshot(KINO, snap(nil, { grantLog }))
+assertEq(proofCalls, 0, "a snapshot with no request does not run catch-up proof")
+local other = seedRequest("need-other-kind", "NEED_LOGS", { KINO }, KINO)
+Sync:HandleProfileSnapshot(KINO, snap(other.id, { grantLog }))
+assertEq(proofCalls, 0, "a snapshot citing another request kind does not run catch-up proof")
+local idle = seedRequest("need-idle", "NEED_PROFILE", { OWNER }, OWNER)
+Sync:HandleProfileSnapshot(KINO, snap(idle.id, { grantLog }))
+assertEq(proofCalls, 0, "a snapshot from a sender who was not targeted does not run catch-up proof")
+local correlated = seedRequest("need-correlated", "NEED_PROFILE", { KINO }, KINO)
+profile.ImportSnapshot = function()
+    return false, 0, "stop-before-import"
+end
+Sync:HandleProfileSnapshot(KINO, snap(correlated.id, { grantLog }))
+assertEq(proofCalls, 1, "an in-flight profile snapshot still runs catch-up proof")
+local longId = {
+    _id = string.rep("x", 241),
+    _author = OWNER,
+    _counter = 3,
+    _eventType = "ADMIN_ADDED",
+    _data = { member = KINO },
+}
+local beforeLong = historyScans
+assertEq(Sync:_CatchUpProofPayloadBounded({ longId }), false,
+    "a proof field longer than 240 bytes is over the budget")
+assertNil(Sync:_CatchUpProvenGrantLog(KINO, { longId }),
+    "an overlong proof field is not a grant")
+assertEq(historyScans, beforeLong, "an overlong proof field does not scan local history")
+local tooMany = { grantLog }
+tooMany[8193] = { _eventType = "POINT_CHANGE", _author = OWNER, _counter = 1, _data = { member = MEMBER } }
+assertEq(Sync:_CatchUpProofPayloadBounded(tooMany), false,
+    "a proof list past 8192 rows is over the budget")
+assertNil(Sync:_CatchUpProvenGrantLog(KINO, tooMany),
+    "a proof list past 8192 rows is not a grant")
+assertEq(historyScans, beforeLong, "a proof list past the row cap does not scan local history")
+local wideAdmins = {}
+for i = 1, 129 do
+    wideAdmins[i] = "Admin" .. i .. "-Realm"
+end
+wideAdmins[1] = KINO
+local logCalls = 0
+local originalLogsProve = Sync._CatchUpLogsProveGrant
+Sync._CatchUpLogsProveGrant = function()
+    logCalls = logCalls + 1
+    return true
+end
+assertEq(Sync:_CatchUpSnapshotProvesGrant(KINO, {
+    adminUsers = wideAdmins,
+    lootLogs = { grantLog },
+}), false, "an admin list past 128 names does not prove catch-up")
+assertEq(logCalls, 0, "an oversized admin list does not read snapshot logs")
+Sync._CatchUpLogsProveGrant = originalLogsProve
+Sync._CatchUpSnapshotProvesGrant = originalSnapshotProof
+Sync._LocalHistoryRevokesAdmin = originalHistory
+end)()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)
