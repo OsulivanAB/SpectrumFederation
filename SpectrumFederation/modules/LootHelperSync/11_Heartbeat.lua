@@ -244,10 +244,11 @@ function Sync:GetRequestTargets(helpers, coordinator, opts)
     local targets, seen = {}, {}
     
     local function add(t)
-        if type(t) == "string" and t ~= "" and not seen[t] then
-            seen[t] = true
-            table.insert(targets, t)
-        end
+        if type(t) ~= "string" or t == "" then return end
+        local key = (self._PlayerIdentityKey and self:_PlayerIdentityKey(t)) or t
+        if seen[key] then return end
+        seen[key] = true
+        table.insert(targets, t)
     end
 
     -- Simplify: no need for redundant conditional assignment

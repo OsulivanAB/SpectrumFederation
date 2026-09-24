@@ -4267,6 +4267,140 @@ Sync:HandleSessionEnd(COORD, {
 assertEq(Sync.state.active, true, "a revoked coordinator with a successor still cannot end the session")
 end)()
 
+-- Case-folded helper slots, grant cache keys, and sourced grants on the
+-- profile being scanned.
+;(function()
+local originalSame = Sync._SamePlayer
+Sync._SamePlayer = function(self, a, b)
+    if type(a) ~= "string" or type(b) ~= "string" then return false end
+    return a:lower() == b:lower()
+end
+
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+assertEq(Sync:ApplyAdvertisedHelpers({ "kIno-Realm", KINO, OWNER }, "case-helpers"), true,
+    "case-variant helpers install the capped list")
+assertEq(#Sync.state.helpers, 2, "two spellings of one helper consume one slot")
+assertEq(Sync.state.helpers[1], "kIno-Realm", "the first spelling of a helper is kept")
+assertEq(Sync.state.helpers[2], OWNER, "the next distinct helper is kept")
+local targets = Sync:GetRequestTargets({ "kIno-Realm", KINO, OWNER }, COORD)
+local kinoSpellings = 0
+local hasOwner = false
+for _, name in ipairs(targets) do
+    if type(name) == "string" and name:lower() == KINO:lower() then
+        kinoSpellings = kinoSpellings + 1
+    end
+    if name == OWNER then
+        hasOwner = true
+    end
+end
+assertEq(kinoSpellings, 1, "request targets keep one spelling of a helper")
+assertTrue(hasOwner, "request targets keep the next helper")
+
+reset(MEMBER)
+setAdmins({ OWNER })
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local grantScans = 0
+local originalGrantState = Sync._LogAdminGrantState
+Sync._LogAdminGrantState = function(self, logTable, who, scannedProfile)
+    grantScans = grantScans + 1
+    return originalGrantState(self, logTable, who, scannedProfile)
+end
+assertEq(Sync:_LocalCatchUpGrantStored(KINO), true, "the canonical spelling stores the catch-up grant")
+local afterFirst = grantScans
+assertEq(Sync:_LocalCatchUpGrantStored("kIno-Realm"), true,
+    "a capitalization variant reuses the stored catch-up grant")
+assertEq(grantScans, afterFirst, "a capitalization variant does not walk history again")
+local function caseVariant(n)
+    local src = KINO
+    local out = {}
+    local bit = n
+    for i = 1, #src do
+        local ch = src:sub(i, i)
+        if string.match(ch, "%a") then
+            if math.fmod(bit, 2) == 1 then
+                ch = string.lower(ch)
+            else
+                ch = string.upper(ch)
+            end
+            bit = math.floor(bit / 2)
+        end
+        out[#out + 1] = ch
+    end
+    return table.concat(out)
+end
+local allCached = true
+for n = 0, 39 do
+    if Sync:_LocalCatchUpGrantStored(caseVariant(n)) ~= true then
+        allCached = false
+    end
+end
+assertTrue(allCached, "forty capitalization variants reuse the stored catch-up grant")
+assertEq(grantScans, afterFirst, "forty capitalization variants share one grant scan")
+local storedNames = 0
+for _ in pairs(Sync.state._catchUpGrantScan.byName) do
+    storedNames = storedNames + 1
+end
+assertEq(storedNames, 1, "capitalization variants share one catch-up grant cache key")
+Sync._LogAdminGrantState = originalGrantState
+Sync._SamePlayer = originalSame
+
+reset(MEMBER)
+setAdmins({ OWNER })
+profile._identityProjection = {
+    appliedRelationshipIds = { ["rel-1"] = true },
+}
+local profile2Admins = { OWNER }
+local profile2 = {
+    _profileId = "profile-2",
+    _lootLogs = {
+        {
+            _author = OWNER,
+            _counter = 1,
+            _eventType = "ADMIN_ADDED",
+            _data = { member = KINO, sourceLogId = "rel-1" },
+        },
+    },
+    _adminUsers = profile2Admins,
+    _identityProjection = {
+        appliedRelationshipIds = {},
+    },
+    GetProfileId = function(self)
+        return self._profileId
+    end,
+    GetAdminUsers = function()
+        return profile2Admins
+    end,
+    GetLootLogs = function(self)
+        return self._lootLogs
+    end,
+}
+SF.lootHelperDB.profiles["profile-2"] = profile2
+local blockedKey = Sync:_FailedCatchUpKey("profile-2", KINO)
+Sync.state._failedCatchUp = { [blockedKey] = true }
+assertEq(Sync.state.profileId, PROFILE, "the active profile stays profile-1")
+assertTrue(Sync:_FailedCatchUpBlocks(KINO, "profile-2"),
+    "an applied relationship on the active profile does not clear another profile")
+profile2._identityProjection = {
+    appliedRelationshipIds = { ["rel-1"] = true },
+}
+profile._identityProjection = {
+    appliedRelationshipIds = {},
+}
+assertEq(Sync:_FailedCatchUpBlocks(KINO, "profile-2"), false,
+    "a grant applied on the incoming profile clears its failed catch-up")
+assertEq(Sync:_LocalCatchUpGrantStored(KINO, "profile-2"), true,
+    "the incoming profile stores the sourced grant")
+assertEq(Sync.state.profileId, PROFILE, "the grant lookup does not switch the active profile")
+end)()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

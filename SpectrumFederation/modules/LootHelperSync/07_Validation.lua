@@ -303,6 +303,25 @@ function Sync:_CoordinatorKeepaliveBaseline(oldSessionId, newSessionId, oldCoord
     return not self:_SamePlayer(oldCoordinator, newCoordinator)
 end
 
+-- Function Case-folded identity for maps that must agree with SamePlayer.
+-- @param name string "Name-Realm"
+-- @return string|nil
+function Sync:_PlayerIdentityKey(name)
+    if type(name) ~= "string" or name == "" then return nil end
+    local normalized = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(name)) or name
+    if type(normalized) ~= "string" or normalized == "" then return nil end
+    return normalized:lower()
+end
+
+function Sync:_FailedCatchUpKey(profileId, name)
+    if type(profileId) ~= "string" or profileId == "" then return nil end
+    local identity = self:_PlayerIdentityKey(name)
+    if not identity then return nil end
+    -- SamePlayer compares case-insensitively. The block must too, or a
+    -- different capitalization is a new key and can fill the 32-entry book.
+    return profileId .. "\0" .. identity
+end
+
 -- Function Remember an unproven catch-up coordinator who lost the role.
 -- A later descriptor from that player is ignored until local history stores
 -- their grant or the profile lists them as an admin. Otherwise a fresh
@@ -310,16 +329,6 @@ end
 -- @param previous string|nil "Name-Realm"
 -- @param nextName string|nil "Name-Realm"
 -- @return nil
-function Sync:_FailedCatchUpKey(profileId, name)
-    if type(profileId) ~= "string" or profileId == "" then return nil end
-    if type(name) ~= "string" or name == "" then return nil end
-    local normalized = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(name)) or name
-    if type(normalized) ~= "string" or normalized == "" then return nil end
-    -- SamePlayer compares case-insensitively. The block must too, or a
-    -- different capitalization is a new key and can fill the 32-entry book.
-    return profileId .. "\0" .. normalized:lower()
-end
-
 function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
     if not self.state or type(previous) ~= "string" or previous == "" then return end
     if type(nextName) == "string" and nextName ~= "" and self:_SamePlayer(previous, nextName) then
@@ -491,8 +500,8 @@ function Sync:_CapUniqueHelpers(helpers, opts)
         if type(name) == "string" and name ~= "" then
             local allowed = (not profileKnown) or self:IsSenderAuthorized(profileId, name)
             if allowed then
-                local key = self:_NormalizeNameRealmForCompare(name) or name
-                if not seen[key] then
+                local key = self:_PlayerIdentityKey(name)
+                if key and not seen[key] then
                     seen[key] = true
                     table.insert(out, name)
                 end
@@ -683,7 +692,7 @@ function Sync:_LocalCatchUpGrantStored(name, profileId)
     local foreign = profileId ~= self.state.profileId
     local cacheField = foreign and "_catchUpGrantScanOther" or "_catchUpGrantScan"
     local cache = self.state[cacheField]
-    local cacheKey = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(name)) or name
+    local cacheKey = self:_PlayerIdentityKey(name)
     local applied = (type(profile) == "table" and profile._identityProjection and profile._identityProjection.appliedRelationshipIds) or nil
     if type(cache) ~= "table"
         or cache.profileId ~= profileId
@@ -715,7 +724,7 @@ function Sync:_LocalCatchUpGrantStored(name, profileId)
         if type(log) == "table" and type(log.ToTable) == "function" then
             logTable = log:ToTable()
         end
-        local state = self:_LogAdminGrantState(logTable, name)
+        local state = self:_LogAdminGrantState(logTable, name, profile)
         if state == "grant" then
             grantLog = logTable
         elseif state == "revoke" then
@@ -928,8 +937,10 @@ end
 -- Function Read the admin-grant effect of one log for a player.
 -- @param logTable table
 -- @param name string "Name-Realm"
+-- @param profile table|nil Profile whose applied relationships prove a sourced grant.
+--        Defaults to the active session profile.
 -- @return string|nil "grant", "revoke", or nil when the log does not change this player
-function Sync:_LogAdminGrantState(logTable, name)
+function Sync:_LogAdminGrantState(logTable, name, profile)
     if type(logTable) ~= "table" or type(name) ~= "string" or name == "" then return nil end
     local eventType = logTable._eventType or logTable.eventType
     local data = logTable._data or logTable.data
@@ -944,7 +955,7 @@ function Sync:_LogAdminGrantState(logTable, name)
     if eventType == added then
         -- Identity ignores ADMIN_ADDED when sourceLogId is not an applied
         -- relationship. That row must not cancel a removal or prove catch-up.
-        if not self:_SourcedAdminGrantApplies(data) then return nil end
+        if not self:_SourcedAdminGrantApplies(data, profile) then return nil end
         return "grant"
     end
     if eventType == removed then return "revoke" end
@@ -957,13 +968,16 @@ end
 -- No sourceLogId is unconditional. A sourceLogId counts only when identity
 -- projection applied that relationship log.
 -- @param data table|nil
+-- @param profile table|nil Profile whose applied relationships count. Defaults to the active profile.
 -- @return boolean
-function Sync:_SourcedAdminGrantApplies(data)
+function Sync:_SourcedAdminGrantApplies(data, profile)
     local sourceLogId = type(data) == "table" and data.sourceLogId or nil
     if type(sourceLogId) ~= "string" or sourceLogId == "" then
         return true
     end
-    local profile = (self.state and self.FindLocalProfileById) and self:FindLocalProfileById(self.state.profileId) or nil
+    if type(profile) ~= "table" then
+        profile = (self.state and self.FindLocalProfileById) and self:FindLocalProfileById(self.state.profileId) or nil
+    end
     local projection = type(profile) == "table" and profile._identityProjection or nil
     local applied = type(projection) == "table" and projection.appliedRelationshipIds or nil
     return type(applied) == "table" and applied[sourceLogId] == true
