@@ -2,7 +2,11 @@
 
 This document defines the expected behavior for Codex pull request reviews in this repository.
 
-The goal is to determine whether a pull request is safe to become the new production state of the repository without creating unnecessary review churn. Prioritize correctness, regressions, integration risk, runtime behavior, persistence, synchronization, performance, release safety, and meaningful verification over cosmetic preferences.
+The goal is to determine whether a pull request is safe to become the new production state of the repository. Reviews should converge. They should not become an open-ended cycle of full review, fix, and another unrestricted full review.
+
+Convergence does not lower the quality bar. A real defect stays actionable when it is found late, when a previous review fix introduced it, when the PR has already been reviewed several times, or when fixing it is inconvenient. Repeated rounds should not keep expanding the PR into adjacent hardening, unrelated edge cases, or increasingly elaborate machinery unless the finding is a credible defect in the production state this PR would create.
+
+Prioritize correctness, regressions, integration risk, runtime behavior, persistence, synchronization, performance, security, release safety, and meaningful verification over cosmetic preferences.
 
 ---
 
@@ -16,6 +20,8 @@ Act as a senior engineer protecting production quality, not as a style checker.
 - Review impact across subsystem boundaries when a change can affect callers, consumers, persisted data, synchronization, settings, UI, tests, packaging, release behavior, or documentation.
 - Prefer a small number of well-supported findings over a large list of weak possibilities.
 - If there are no meaningful findings, say so. Do not manufacture issues to produce review output.
+- Do not ignore a real defect because the review is late or because an earlier fix caused it.
+- Do not treat every theoretical improvement as mandatory scope for the PR under review.
 
 ---
 
@@ -32,48 +38,68 @@ On the first review of a PR:
 - Review the related ticket when one is provided.
 - Establish the initial set of actionable findings.
 
+The initial review stays broad. Include the related ticket, production behavior, integration points, persistence, synchronization, performance, security and trust boundaries, tests, packaging and release behavior, and other subsystem effects the change can reach.
+
 Do not limit the initial review to the newest commit or the files emphasized by the PR description.
 
 If the initial full review has no actionable findings, no additional full review is required solely for process reasons. Complete the applicable automated verification and document any remaining Retail QA.
 
 ### Subsequent Reviews
 
-After fixes or other new commits are pushed:
+After fixes or other new commits are pushed, review incrementally and by impact:
 
 - Identify the last commit that was reliably reviewed.
 - Review the commits added since that point.
 - Verify that previous findings were actually resolved.
-- Follow changed behavior through callers, consumers, shared state, persistence, communications, and other affected code as needed.
-- Do **not** routinely re-audit unrelated unchanged portions of the PR.
-- Do not restrict investigation to changed lines when understanding their consequences requires inspecting code elsewhere.
+- Look for regressions introduced by those fixes.
+- Follow changed behavior through the callers, consumers, shared state, persistence, communications, and state transitions the fix directly affects.
+- Check assumptions the new change invalidates.
+- Do **not** routinely restart an unrestricted audit of unrelated, unchanged portions of the PR.
+- Do not restrict investigation to changed lines. Inspect unchanged code when that is what it takes to understand the consequences.
 
-If an actionable issue is found, report it and repeat incremental review after the next fix.
+If an actionable issue is found during the incremental reviews that follow the initial review, report it and repeat incremental review after the next fix. Do not start the final integration review until one of those incremental reviews is clean.
 
-### Final Full Review
+A fix found by the final integration review does not, by itself, schedule another final review. Follow [When the Final Integration Review Finds an Issue](#when-the-final-integration-review-finds-an-issue).
 
-After an incremental review finds **no actionable issues**, perform a fresh review of the **entire PR against its merge base**.
+### Final Full Integration Review
+
+After the incremental-review cycle is clean, perform **one** fresh review of the **entire PR against its merge base**.
 
 This is the final integration and regression sweep. Judge the final state of the PR as a whole rather than merely confirming individual fixes.
 
-If the final full review finds an actionable issue:
+If that review is clean, the automated review cycle can complete once applicable verification and any required Retail QA are documented. See Completion Standard.
 
-1. report it normally
-2. after it is fixed, return to incremental review
-3. once the incremental review is clean, perform another final full review
+### When the Final Integration Review Finds an Issue
 
-The cycle is complete when the required full review is clean and applicable verification has been accounted for.
+Report and fix a real issue normally. It is not optional because it appeared during the final sweep, because an earlier fix introduced it, or because the PR has already been reviewed several times.
+
+After that fix:
+
+- Review the fix incrementally.
+- Inspect the callers, consumers, and state transitions the fix directly affects.
+- Perform the targeted integration sweep that change requires.
+
+Do **not** automatically require another unrestricted review of the entire PR merely because the previous final review found an issue.
+
+Require another full review of the PR against its merge base only when the new fix materially invalidates previous review coverage. Use the same conditions as [Fall Back to a Full Review When Review History Is Unreliable](#fall-back-to-a-full-review-when-review-history-is-unreliable). A narrow, well-tested fix discovered during the final sweep normally receives the targeted re-review above, not a restart of the whole review lifecycle.
+
+There is no numeric cap on review rounds. Stop only when the applicable case in the Completion Standard is met. Do not stop because a defect was found late.
 
 ### Fall Back to a Full Review When Review History Is Unreliable
 
-Do not guess about previously reviewed state. Perform a full review when:
+Do not guess about previously reviewed state. Perform a full review of the PR against its merge base when previous coverage can no longer reasonably be trusted, including when:
 
 - the last reliably reviewed commit cannot be identified
 - branch history was rewritten or force-pushed
 - the merge base changed materially
 - prior review context is unavailable or ambiguous
-- a cross-cutting change invalidates assumptions made during earlier reviews
+- the new work is a substantial architectural rewrite
+- the new work adds a broad abstraction or state machine
+- behavior changes are widespread
+- the change crosses subsystems in a way that invalidates earlier conclusions
+- another change invalidates assumptions made during earlier reviews
 
-Incremental review is an efficiency optimization, not a reason to accept uncertainty about what has actually been reviewed.
+Incremental review is an efficiency optimization, not a reason to accept uncertainty about what has actually been reviewed. It is also not a reason to restart that full review after every fix.
 
 ---
 
@@ -135,12 +161,90 @@ Focus findings on concrete, actionable problems such as:
 - CI, packaging, versioning, release, or documentation-deployment errors
 - tests that do not actually prove the behavior they claim to cover
 
-Do not report:
+Do not report these as actionable findings:
 
 - cosmetic style preferences
 - speculative concerns without a realistic failure path
 - refactoring opportunities with no meaningful correctness or maintenance impact
 - theoretical edge cases that cannot occur under the repository's actual constraints
+
+When one of those is still worth tracking, label it as a follow-up consideration under [Actionable Findings and Follow-up Work](#actionable-findings-and-follow-up-work). Do not silently drop a useful observation, and do not promote it into mandatory PR scope.
+
+---
+
+## Actionable Findings and Follow-up Work
+
+A review primarily evaluates the production state this PR would create. Separate defects that should block the PR from concerns that should normally become follow-up work.
+
+### Actionable findings
+
+Report these as blocking findings, including when they are found late or were introduced by a previous review fix:
+
+- failure to satisfy the linked ticket or its acceptance criteria
+- behavior the PR breaks
+- regressions caused by the PR
+- defects introduced by a previous review fix
+- reachable invalid state transitions
+- persistence or synchronization corruption
+- authorization or trust-boundary failures
+- privilege escalation
+- credible data-integrity problems
+- crashes, freezes, runaway execution, or meaningful UI-thread availability risks
+- plausible user-facing failures
+- other production-safety problems the PR causes or materially worsens
+
+Do not downgrade one of these because the review round is late, because a previous fix caused it, or because repairing it is inconvenient. Severity still follows the impact table below. Review age is not a severity input.
+
+### Follow-up considerations
+
+These are normally not blocking requirements of the current PR:
+
+- unrelated defects that clearly predate the PR and that the PR does not worsen or newly expose
+- optional architecture cleanup
+- refactoring with no concrete correctness consequence
+- purely defensive hardening against scenarios with no credible impact
+- speculative state combinations the repository and runtime cannot actually reach
+- improvements that are useful but outside the problem this PR is changing
+
+Do not drop them silently. When they are useful, identify them separately as follow-up work rather than mandatory PR scope.
+
+A pre-existing problem becomes an actionable finding when the PR materially worsens it, newly exposes it, or cannot meet the requested change safely without fixing it.
+
+---
+
+## Credible Reachability
+
+Every actionable finding needs a realistic failure path. A rare transition can still be a defect. A combination that cannot occur is not.
+
+For a late-stage finding in particular, establish:
+
+1. how the state is reached
+2. which actor, event, or message triggers it
+3. what incorrect behavior follows
+4. whether repository and runtime constraints actually allow it
+5. why the consequence matters
+
+Do not reject a bug only because it is rare. Do distinguish a rare but credible production transition from a hypothetical combination that cannot happen.
+
+---
+
+## Review-Induced Complexity
+
+Watch for a review process whose fixes add substantial new machinery, and whose later findings are mostly about that new machinery rather than the original implementation.
+
+This matters most for state machines, synchronization, authorization, retries, caches, lifecycle handling, routing, persistence, and addon-message protocols.
+
+When successive fixes keep creating new correctness issues inside the mitigation just added, consider whether the repair strategy itself has become too complicated. Evaluate whether a simpler approach would be safer, such as:
+
+- simplifying the implementation
+- consolidating duplicated state
+- returning to an authoritative source of truth
+- replacing layered special cases with a clearer invariant
+- rolling back an overcomplicated mitigation
+- splitting genuinely separate hardening into follow-up work
+- documenting an architectural refactor for a later PR
+
+This rule does not suppress a real defect. If the current code is wrong, report it. The rule is a reason not to answer every new finding by adding another guard, cache, tombstone, exception, or state variable onto an already unstable design.
 
 ---
 
@@ -201,6 +305,10 @@ Where relevant, verify:
 - a remote client cannot overwrite authoritative local or coordinator state merely by sending a plausible message
 
 Do not assume a message is valid simply because it arrived through the expected addon prefix or channel.
+
+A finding can still block the PR when an intentionally malformed or hostile addon message can cause meaningful privilege escalation, unauthorized state mutation, data corruption, session-integrity failure, unbounded or repeatedly amplifiable UI-thread work, client freezing, or another meaningful availability impact.
+
+Not every theoretical hostile-input hardening opportunity belongs in the current feature PR. Before treating adversarial behavior as a blocking defect, show the sender's actual capability, the reachable code, and the meaningful impact. Hardening with no demonstrated capability or impact is a follow-up consideration, not automatic scope.
 
 ---
 
@@ -304,13 +412,25 @@ Before reinforcing a previous finding or recommending its fix:
 
 If prior feedback is technically incorrect, stale, or incompatible with the repository's actual design, explain why rather than repeating it.
 
+### Late findings must be new
+
+Before reporting a finding on a PR that has already been reviewed, confirm it is genuinely new. Check whether it is:
+
+- already fixed
+- stale
+- a duplicate of a resolved finding
+- a restatement of a previously accepted design decision
+- based on an assumption the current code contradicts
+
+If the same underlying defect has regressed, report the regression. If the latest fix created a new failure mode, report that failure mode. Do not produce a "new" finding by reframing an issue that was already settled.
+
 ---
 
 ## Review Output
 
-Lead with actionable findings, ordered by severity.
+Lead with **actionable findings**, ordered by severity. Those are what must be fixed before the automated review cycle can complete.
 
-For each finding include:
+For each actionable finding include:
 
 1. **What is wrong**
 2. **Where it occurs**
@@ -319,6 +439,8 @@ For each finding include:
 5. **The expected behavior or fix direction**
 
 Reference the relevant file, function, workflow, state transition, or code path when possible.
+
+A **follow-up consideration** is optional and comes after the actionable findings. Use it for a credible improvement or a problem worth tracking that this PR did not cause or materially worsen, and that is not required for the PR to be safe. Label it as follow-up. Do not mix it into the actionable list, and do not turn the review into an architecture report.
 
 Keep these separate from findings:
 
@@ -329,7 +451,7 @@ Keep these separate from findings:
 
 Do not repeatedly report resolved findings unless they have regressed.
 
-If there are no actionable findings, say so directly and summarize only the verification status that matters. Avoid padding a clean review with speculative suggestions or an unnecessary restatement of the PR.
+If there are no actionable findings, say so directly and summarize only the verification status that matters. A follow-up consideration may still be listed. Avoid padding a clean review with speculative suggestions or an unnecessary restatement of the PR.
 
 ---
 
@@ -342,24 +464,43 @@ If there are no actionable findings, say so directly and summarize only the veri
 | **Medium** | Real defects with narrower impact, less common triggers, recoverable state problems, or meaningful non-critical workflow failures |
 | **Low** | Concrete limited-impact defects or narrow maintainability risks with a realistic consequence |
 
-Do not inflate severity. A severe-sounding hypothetical is not high severity unless its triggering conditions are plausible in this repository.
+Do not inflate severity. A severe-sounding hypothetical is not high severity unless its triggering conditions are plausible in this repository. Do not lower severity because a defect was found late, because a previous review fix introduced it, or because the PR has already had several reviews.
 
 ---
 
 ## Completion Standard
 
-The automated review cycle is complete when either:
+The automated review cycle is complete in one of these cases. There is no numeric limit on rounds, and a real defect does not expire.
 
-- the **initial full review** has no actionable findings; or
-- after fixes, the latest **incremental review is clean** and the subsequent **final full review is clean**.
+### Case A — The initial review is clean
 
-In either case:
+- The initial full review finds no actionable findings.
+- Applicable automated checks have been run, or unavailable checks are explicitly identified.
+- Any required Retail QA is documented.
+- The automated review cycle is complete.
+
+### Case B — The initial review finds issues
+
+- Fix the actionable findings.
+- Repeat incremental review until an incremental review is clean.
+- Perform one final full integration review.
+- If that final review is clean, document verification and any required Retail QA. The automated review cycle may then complete.
+
+### Case C — The final full integration review finds an issue
+
+- Fix the issue.
+- Incrementally review that fix, including a targeted integration sweep of the behavior it affects.
+- If that review is clean, document verification and any required Retail QA. The automated review cycle may then complete.
+- If that targeted review finds another actionable issue, fix it and repeat the targeted review. Do not schedule another whole-PR review unless the latest fix materially invalidated prior review coverage.
+- Require another whole-PR review only when that fix materially invalidated prior review coverage, using the conditions in [Fall Back to a Full Review When Review History Is Unreliable](#fall-back-to-a-full-review-when-review-history-is-unreliable).
+
+In every case:
 
 - applicable automated checks must have been run, or unavailable checks must be explicitly identified
 - any required Retail-only verification must be clearly documented
 - unresolved verification gaps must not be presented as verified behavior
 
-Automated review completion does not by itself mean the PR is merge-ready when required Retail QA remains.
+Automated review completion does not by itself mean the PR is merge-ready when required Retail QA remains. Retail QA stays required whenever the repository's existing policy requires it.
 
 The purpose of this process is to provide a disciplined, evidence-based answer to one question:
 
