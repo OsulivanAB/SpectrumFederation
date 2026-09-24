@@ -1974,6 +1974,55 @@ Sync.MergeLogs = function()
     return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
 end
 
+-- An extra grant beside the locally proven row is not merged.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 3,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local extraGrant = seedRequest("need-extra-grant", "NEED_LOGS", { KINO }, KINO)
+extraGrant.meta.integrityRepair = true
+local extraMerges = 0
+Sync.MergeLogs = function()
+    extraMerges = extraMerges + 1
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+Sync:HandleAuthLogs(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    requestId = "need-extra-grant",
+    author = "Author-Realm",
+    fromCounter = 1,
+    toCounter = 2,
+    logs = {
+        {
+            _author = OWNER,
+            _counter = 99,
+            _eventType = "ADMIN_ADDED",
+            _data = { member = KINO },
+        },
+        {
+            _author = OWNER,
+            _counter = 3,
+            _eventType = "ADMIN_ADDED",
+            _data = { member = KINO },
+        },
+    },
+})
+assertEq(extraMerges, 0, "catch-up AUTH_LOGS does not merge a forged grant beside the proven row")
+assertTrue(Sync.state.requests["need-extra-grant"] ~= nil, "extra grant leaves the catch-up request open")
+Sync.MergeLogs = function()
+    return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
+end
+
 -- Abandoned convergence timers must not finalize a replacement round.
 reset(COORD)
 setAdmins({ COORD, KINO, OWNER })

@@ -431,17 +431,17 @@ function Sync:_LocalHistoryRevokesAdmin(name)
     return saw and revoked
 end
 
--- Function True when catch-up logs cite a grant this profile already trusts.
--- The establishing row must already be in local history, authored by a canonical
--- admin other than the sender, and local history must still end with that grant.
--- A sender-supplied ADMIN_ADDED is not that evidence. A later local removal wins.
+-- Function The one local grant row that proves this catch-up sender.
+-- It must already be stored, authored by another canonical admin, and still be
+-- the latest local admin effect. Any other grant or revocation in the payload
+-- is not proof and must not be merged.
 -- @param sender string "Name-Realm"
 -- @param logs table
--- @return boolean
-function Sync:_CatchUpLogsProveGrant(sender, logs)
-    if type(logs) ~= "table" or #logs == 0 then return false end
-    if not self:_LogsEstablishAdminGrant(logs, sender) then return false end
-    if not (self.state and self:_ProfileAuthorizationKnown()) then return false end
+-- @return table|nil
+function Sync:_CatchUpProvenGrantLog(sender, logs)
+    if type(logs) ~= "table" or #logs == 0 then return nil end
+    if not self:_LogsEstablishAdminGrant(logs, sender) then return nil end
+    if not (self.state and self:_ProfileAuthorizationKnown()) then return nil end
 
     local grantLog = nil
     for _, logTable in ipairs(logs) do
@@ -452,18 +452,25 @@ function Sync:_CatchUpLogsProveGrant(sender, logs)
             grantLog = nil
         end
     end
-    if type(grantLog) ~= "table" then return false end
+    if type(grantLog) ~= "table" then return nil end
     local grantAuthor = grantLog._author or grantLog.author
-    if type(grantAuthor) ~= "string" or grantAuthor == "" then return false end
-    if self:_SamePlayer(grantAuthor, sender) then return false end
-    if not self:IsSenderAuthorized(self.state.profileId, grantAuthor) then return false end
+    if type(grantAuthor) ~= "string" or grantAuthor == "" then return nil end
+    if self:_SamePlayer(grantAuthor, sender) then return nil end
+    if not self:IsSenderAuthorized(self.state.profileId, grantAuthor) then return nil end
     -- A stored grant that local history later revoked is not current authority.
     -- The response can omit that removal after a session reset cleared revokedRoutes.
-    if self:_LocalHistoryRevokesAdmin(sender) then return false end
+    if self:_LocalHistoryRevokesAdmin(sender) then return nil end
+
+    for _, logTable in ipairs(logs) do
+        local state = self:_LogAdminGrantState(logTable, sender)
+        if state and not self:_SameLogTable(logTable, grantLog) then
+            return nil
+        end
+    end
 
     local profile = self:FindLocalProfileById(self.state.profileId)
     local localLogs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
-    if type(localLogs) ~= "table" then return false end
+    if type(localLogs) ~= "table" then return nil end
     local remoteData = grantLog._data or grantLog.data
     local remoteMember = type(remoteData) == "table" and remoteData.member or nil
     for _, localLog in ipairs(localLogs) do
@@ -477,11 +484,19 @@ function Sync:_CatchUpLogsProveGrant(sender, logs)
             if type(localMember) == "string" and type(remoteMember) == "string"
                 and self:_SamePlayer(localMember, remoteMember)
             then
-                return true
+                return grantLog
             end
         end
     end
-    return false
+    return nil
+end
+
+-- Function True when catch-up logs cite exactly one grant this profile already trusts.
+-- @param sender string "Name-Realm"
+-- @param logs table
+-- @return boolean
+function Sync:_CatchUpLogsProveGrant(sender, logs)
+    return self:_CatchUpProvenGrantLog(sender, logs) ~= nil
 end
 
 -- Function True when a snapshot's admin list names this player.

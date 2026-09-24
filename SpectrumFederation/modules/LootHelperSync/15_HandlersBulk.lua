@@ -265,9 +265,14 @@ function Sync:HandleAuthLogs(sender, payload)
         and self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
     if catchUpMerge and self._LogAdminGrantState then
         local grantLogs, contentLogs = {}, {}
+        -- Only the locally matched grant may be merged. A second grant or
+        -- revocation in the same payload is sender-supplied and is dropped.
+        local provenGrant = self._CatchUpProvenGrantLog and self:_CatchUpProvenGrantLog(sender, payload.logs) or nil
         for _, logTable in ipairs(payload.logs) do
             if self:_LogAdminGrantState(logTable, sender) then
-                grantLogs[#grantLogs + 1] = logTable
+                if provenGrant and self:_SameLogTable(logTable, provenGrant) then
+                    grantLogs[#grantLogs + 1] = logTable
+                end
             else
                 contentLogs[#contentLogs + 1] = logTable
             end
