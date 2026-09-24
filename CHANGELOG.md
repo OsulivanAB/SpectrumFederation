@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.5-beta.3] - 2026-09-24
+
+### Fixed
+- Fix stale Loot Helper sync roles after admin changes
+
 ## [1.5.5-beta.2] - 2026-09-24
 
 ### Changed
