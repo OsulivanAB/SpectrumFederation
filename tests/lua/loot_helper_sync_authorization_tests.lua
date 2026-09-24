@@ -4084,6 +4084,62 @@ Sync._CatchUpSnapshotProvesGrant = originalSnapshotProof
 Sync.IsRequesterInGroup = originalGroup
 end)()
 
+-- Advertised helpers are deduplicated and capped before routing. A longer
+-- copy of the same list must not retarget, and request sorting must not see
+-- the inbound array.
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, KINO, OWNER, SUSPENDERS })
+local refreshes = 0
+local originalRefresh = Sync._RefreshOutstandingRequestTargets
+Sync._RefreshOutstandingRequestTargets = function(self, opts)
+    refreshes = refreshes + 1
+    return originalRefresh(self, opts)
+end
+local huge = {}
+for i = 1, 200 do
+    huge[i] = KINO
+end
+assertEq(Sync:ApplyAdvertisedHelpers(huge, "duplicate-helpers"), true,
+    "the first capped helper list is installed")
+assertEq(#Sync.state.helpers, 1, "duplicate advertised helpers collapse to one")
+assertEq(Sync.state.helpers[1], KINO, "the authorized helper is kept")
+local installedRefreshes = refreshes
+huge[201] = KINO
+assertEq(Sync:ApplyAdvertisedHelpers(huge, "duplicate-helpers-again"), false,
+    "a longer duplicate helper list does not change routing")
+assertEq(#Sync.state.helpers, 1, "the stored helper list stays capped")
+assertEq(refreshes, installedRefreshes, "duplicate helper advertisements do not retarget requests")
+local padded = { STRANGER, STRANGER }
+for i = 1, 80 do
+    padded[#padded + 1] = STRANGER
+end
+padded[#padded + 1] = KINO
+assertEq(#Sync:_FilterHelpersToAuthorized(padded), 0,
+    "helpers past the scan cap are not read")
+Sync:ApplyAdvertisedHelpers({ STRANGER, KINO, OWNER, SUSPENDERS }, "mixed-helpers")
+assertEq(#Sync.state.helpers, 2, "advertised helpers are capped at maxHelpers")
+assertEq(Sync.state.helpers[1], KINO, "unauthorized names do not consume the helper cap")
+assertEq(Sync.state.helpers[2], OWNER, "the cap keeps the second authorized helper")
+local sortSizes = {}
+local originalSort = table.sort
+table.sort = function(list, comp)
+    sortSizes[#sortSizes + 1] = #list
+    return originalSort(list, comp)
+end
+local targets = Sync:GetRequestTargets(huge, COORD)
+table.sort = originalSort
+local largestSort = 0
+for _, size in ipairs(sortSizes) do
+    if size > largestSort then
+        largestSort = size
+    end
+end
+assertTrue(largestSort <= 2, "request target sorting stays within maxHelpers")
+assertTrue(#targets <= 3, "capped helpers do not expand the target list")
+Sync._RefreshOutstandingRequestTargets = originalRefresh
+end)()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

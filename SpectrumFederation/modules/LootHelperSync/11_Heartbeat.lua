@@ -235,6 +235,9 @@ end
 -- @param opts table|nil { preferCoordinatorFirst=bool, preferredTarget=string }
 -- @return table targets Ordered list of targets "Name-Realm" to try
 function Sync:GetRequestTargets(helpers, coordinator, opts)
+    if self._CapUniqueHelpers then
+        helpers = self:_CapUniqueHelpers(helpers)
+    end
     local targets, seen = {}, {}
     
     local function add(t)

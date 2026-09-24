@@ -422,20 +422,60 @@ function Sync:_CopyPlayerList(list)
     return out
 end
 
--- Function Drop helpers who are no longer canonical admins.
+-- Function Configured helper cap. A negative config is treated as none.
+-- @param none
+-- @return number
+function Sync:_AdvertisedHelperCap()
+    local maxHelpers = tonumber(self.cfg and self.cfg.maxHelpers) or 2
+    if maxHelpers < 0 then maxHelpers = 0 end
+    return maxHelpers
+end
+
+-- Function Deduplicate and cap a helper list before comparison or routing.
+-- A catch-up coordinator can advertise thousands of copies of one admin.
+-- Alternating lengths must not retarget, and request routing must not sort
+-- that array. The walk stops at the cap, or after 64 entries when the cap is
+-- smaller, so one descriptor cannot scan an unbounded list.
+-- When requireAuthorized is set and the profile is loaded, names that are not
+-- canonical admins do not consume the cap.
+-- @param helpers table|nil
+-- @param opts table|nil { requireAuthorized = bool }
+-- @return table
+function Sync:_CapUniqueHelpers(helpers, opts)
+    local out = {}
+    local maxHelpers = self:_AdvertisedHelperCap()
+    if type(helpers) ~= "table" or maxHelpers == 0 then return out end
+    opts = type(opts) == "table" and opts or {}
+    local requireAuthorized = opts.requireAuthorized == true
+    local scanCap = maxHelpers
+    if scanCap < 64 then scanCap = 64 end
+    local seen = {}
+    local scanned = 0
+    local profileId = self.state and self.state.profileId
+    local profileKnown = requireAuthorized and self:_ProfileAuthorizationKnown()
+    for _, name in ipairs(helpers) do
+        if #out >= maxHelpers then break end
+        scanned = scanned + 1
+        if scanned > scanCap then break end
+        if type(name) == "string" and name ~= "" then
+            local allowed = (not profileKnown) or self:IsSenderAuthorized(profileId, name)
+            if allowed then
+                local key = self:_NormalizeNameRealmForCompare(name) or name
+                if not seen[key] then
+                    seen[key] = true
+                    table.insert(out, name)
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- Function Drop helpers who are no longer canonical admins, then cap the list.
 -- @param helpers table|nil Advertised helper names
 -- @return table
 function Sync:_FilterHelpersToAuthorized(helpers)
-    local out = self:_CopyPlayerList(helpers)
-    if not self:_ProfileAuthorizationKnown() then return out end
-    local filtered = {}
-    local profileId = self.state.profileId
-    for _, name in ipairs(out) do
-        if self:IsSenderAuthorized(profileId, name) then
-            table.insert(filtered, name)
-        end
-    end
-    return filtered
+    return self:_CapUniqueHelpers(helpers, { requireAuthorized = true })
 end
 
 -- Function Install the effective helper list and retarget requests when it changes.
