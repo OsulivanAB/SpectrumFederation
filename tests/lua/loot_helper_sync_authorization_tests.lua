@@ -4874,6 +4874,34 @@ local known = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, knownReq, {
 assertEq(known, "accept", "an in-flight admin can still answer once the profile exists")
 end)()
 
+-- A book split across profiles still records the next failed coordinator.
+-- The insert drops one other profile's marker instead of leaving this one unmarked.
+;(function()
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state._coordinatorCatchUp = KINO
+Sync.state._failedCatchUp = {}
+for i = 1, 16 do
+    Sync.state._failedCatchUp[PROFILE .. "\0a-" .. i] = true
+    Sync.state._failedCatchUp["profile-b\0b-" .. i] = true
+end
+local originalKeepalive = Sync._UnprovenCatchUpKeepalive
+Sync._UnprovenCatchUpKeepalive = function()
+    return true
+end
+Sync:_RememberUnprovenCatchUpRelease(KINO, OWNER)
+Sync._UnprovenCatchUpKeepalive = originalKeepalive
+assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
+    "a mixed full book records the next failed coordinator")
+assertEq(Sync:_FailedCatchUpCount(Sync.state._failedCatchUp), 32,
+    "recording a mixed-book failure stays at 32 entries")
+assertEq(Sync:_FailedCatchUpBlocks("Fresh-Realm", "profile-b"), false,
+    "the other profile does not fail closed because one of its markers was dropped")
+assertTrue(Sync:_FailedCatchUpBlocks(KINO, PROFILE),
+    "the recorded coordinator cannot reclaim on the same profile")
+end)()
+
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

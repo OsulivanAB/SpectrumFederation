@@ -354,11 +354,40 @@ function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
     if not key then return end
     self.state._failedCatchUp = self.state._failedCatchUp or {}
     if self.state._failedCatchUp[key] == true then return end
-    -- Stop at 32 names for this profile, and at 32 names in the whole book.
-    -- Another profile's entries do not count toward this profile's cap.
+    -- This profile stops at 32 names. A full book still records this failure
+    -- by dropping one entry from another profile. Refusing the insert would
+    -- leave the coordinator unmarked, so a new session id could reclaim it.
     if self:_FailedCatchUpCount(self.state._failedCatchUp, self.state.profileId) >= 32 then return end
-    if self:_FailedCatchUpCount(self.state._failedCatchUp) >= 32 then return end
+    if self:_FailedCatchUpCount(self.state._failedCatchUp) >= 32 then
+        self:_EvictFailedCatchUpEntry(self.state._failedCatchUp, self.state.profileId)
+    end
     self.state._failedCatchUp[key] = true
+end
+
+-- Function Drop one catch-up marker so a new failure can be stored.
+-- Prefer a different profile. This profile's own cap is handled by the caller.
+-- @param book table
+-- @param keepProfileId string|nil
+-- @return nil
+function Sync:_EvictFailedCatchUpEntry(book, keepProfileId)
+    if type(book) ~= "table" then return end
+    local prefix = nil
+    if type(keepProfileId) == "string" and keepProfileId ~= "" then
+        prefix = keepProfileId .. "\0"
+    end
+    local fallback = nil
+    for key in pairs(book) do
+        if type(key) == "string" then
+            if prefix and key:sub(1, #prefix) ~= prefix then
+                book[key] = nil
+                return
+            end
+            if fallback == nil then fallback = key end
+        end
+    end
+    if fallback ~= nil then
+        book[fallback] = nil
+    end
 end
 
 -- Function How many failed catch-up markers are stored, capped at the book limit.
@@ -387,9 +416,9 @@ end
 -- the incoming profile clears it, including when that profile is not the
 -- active session yet. Another profile is not blocked by it. Once this profile
 -- holds 32 identities, an unmarked player on that profile is blocked too.
--- Entries stored for a different profile do not saturate this one. Recording
--- still stops at 32 total so the book stays bounded. A canonical admin or a
--- stored grant still passes.
+-- Entries stored for a different profile do not saturate this one. A full
+-- book drops one other entry so this failure is still recorded. A canonical
+-- admin or a stored grant still passes.
 -- @param name string "Name-Realm"
 -- @param profileId string|nil Incoming profile id. Defaults to the active profile.
 -- @return boolean
