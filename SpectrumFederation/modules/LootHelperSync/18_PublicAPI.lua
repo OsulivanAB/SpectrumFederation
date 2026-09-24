@@ -132,6 +132,7 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
     self.state._catchUpGrantScan = nil
+    self.state._catchUpProofScan = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = self:_Now()
 
@@ -890,6 +891,7 @@ function Sync:_ResetSessionState(reason)
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
     self.state._catchUpGrantScan = nil
+    self.state._catchUpProofScan = nil
     self.state._sessionAnnounced = nil
     self.state._sessionDescriptorAt = nil
 

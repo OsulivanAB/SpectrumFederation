@@ -282,6 +282,13 @@ end
 -- @param previous string|nil "Name-Realm"
 -- @param nextName string|nil "Name-Realm"
 -- @return nil
+function Sync:_FailedCatchUpKey(profileId, name)
+    if type(profileId) ~= "string" or profileId == "" then return nil end
+    if type(name) ~= "string" or name == "" then return nil end
+    local normalized = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(name)) or name
+    return profileId .. "\0" .. normalized
+end
+
 function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
     if not self.state or type(previous) ~= "string" or previous == "" then return end
     if type(nextName) == "string" and nextName ~= "" and self:_SamePlayer(previous, nextName) then
@@ -290,8 +297,9 @@ function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
     if not (self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(previous)) then
         return
     end
+    local key = self:_FailedCatchUpKey(self.state.profileId, previous)
+    if not key then return end
     self.state._failedCatchUp = self.state._failedCatchUp or {}
-    local key = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(previous)) or previous
     if self.state._failedCatchUp[key] == true then return end
     local count = 0
     for _ in pairs(self.state._failedCatchUp) do
@@ -301,23 +309,30 @@ function Sync:_RememberUnprovenCatchUpRelease(previous, nextName)
     self.state._failedCatchUp[key] = true
 end
 
--- Function True when this player already lost an unproven catch-up and is still unproven.
--- A stored grant or canonical admin status clears the block.
+-- Function True when this player already lost an unproven catch-up on this profile.
+-- The marker is profile-scoped. A stored grant or canonical admin status on
+-- that same profile clears it. Another profile is not blocked by it.
 -- @param name string "Name-Realm"
+-- @param profileId string|nil Incoming profile id. Defaults to the active profile.
 -- @return boolean
-function Sync:_FailedCatchUpBlocks(name)
+function Sync:_FailedCatchUpBlocks(name, profileId)
     if not self.state or type(name) ~= "string" or name == "" then return false end
+    if type(profileId) ~= "string" or profileId == "" then
+        profileId = self.state.profileId
+    end
     local book = self.state._failedCatchUp
     if type(book) ~= "table" then return false end
-    local key = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(name)) or name
-    if book[key] ~= true then return false end
-    if self._LocalCatchUpGrantStored and self:_LocalCatchUpGrantStored(name) == true then
-        book[key] = nil
-        return false
-    end
-    if self:_ProfileAuthorizationKnown() and self:IsSenderAuthorized(self.state.profileId, name) then
-        book[key] = nil
-        return false
+    local key = self:_FailedCatchUpKey(profileId, name)
+    if not key or book[key] ~= true then return false end
+    if self.state.profileId == profileId then
+        if self._LocalCatchUpGrantStored and self:_LocalCatchUpGrantStored(name) == true then
+            book[key] = nil
+            return false
+        end
+        if self:_ProfileAuthorizationKnown() and self:IsSenderAuthorized(self.state.profileId, name) then
+            book[key] = nil
+            return false
+        end
     end
     return true
 end
@@ -924,15 +939,84 @@ function Sync:_LocalHistoryRevokesAdmin(name)
     return saw and revoked
 end
 
+-- Function Identity of the local history a catch-up proof walk would read.
+-- A repeat of the same remote logs skips that walk until this identity changes.
+-- More than 16 remote rows are not cached; those packets still scan once.
+-- @param sender string "Name-Realm"
+-- @param logs table
+-- @return table|nil
+function Sync:_CatchUpProofToken(sender, logs)
+    if not self.state or type(sender) ~= "string" or sender == "" then return nil end
+    if type(logs) ~= "table" or #logs == 0 or #logs > 16 then return nil end
+    if type(self.FindLocalProfileById) ~= "function" or type(self._GetProfileLootLogs) ~= "function" then
+        return nil
+    end
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    local localLogs = profile and self:_GetProfileLootLogs(profile) or nil
+    if type(localLogs) ~= "table" then return nil end
+    local remote = {}
+    for i, row in ipairs(logs) do
+        if type(row) ~= "table" then return nil end
+        local data = row._data or row.data
+        local member = type(data) == "table" and data.member or ""
+        remote[i] = table.concat({
+            tostring(row._id or row.id or ""),
+            tostring(row._author or row.author or ""),
+            tostring(row._counter or row.counter or ""),
+            tostring(row._eventType or row.eventType or ""),
+            tostring(row._timestamp or row.timestamp or ""),
+            tostring(row._fingerprint or row.fingerprint or ""),
+            tostring(member),
+        }, "\1")
+    end
+    local senderKey = (self._NormalizeNameRealmForCompare and self:_NormalizeNameRealmForCompare(sender)) or sender
+    return {
+        profileId = self.state.profileId,
+        logs = localLogs,
+        count = #localLogs,
+        rev = (type(profile) == "table" and tonumber(profile._lootLogRevision)) or 0,
+        key = senderKey .. "\0" .. table.concat(remote, "\0"),
+    }
+end
+
+function Sync:_CatchUpProofTokenCurrent(cache, token)
+    return type(cache) == "table"
+        and type(token) == "table"
+        and cache.profileId == token.profileId
+        and cache.logs == token.logs
+        and cache.count == token.count
+        and cache.rev == token.rev
+        and type(cache.byKey) == "table"
+end
+
 -- Function The one local grant row that proves this catch-up sender.
 -- It must already be stored, authored by another canonical admin, and still be
 -- the latest local admin effect. Any other grant or revocation in the payload
--- is not proof and must not be merged.
+-- is not proof and must not be merged. The same sender and remote rows reuse
+-- that result until local history changes.
 -- @param sender string "Name-Realm"
 -- @param logs table
 -- @return table|nil
 function Sync:_CatchUpProvenGrantLog(sender, logs)
     if type(logs) ~= "table" or #logs == 0 then return nil end
+    local token = self._CatchUpProofToken and self:_CatchUpProofToken(sender, logs) or nil
+    local proofCache = self.state and self.state._catchUpProofScan or nil
+    if token and self:_CatchUpProofTokenCurrent(proofCache, token) then
+        local cached = proofCache.byKey[token.key]
+        if cached == false then return nil end
+        if cached == true then
+            local cachedGrant = nil
+            for _, logTable in ipairs(logs) do
+                local state = self:_LogAdminGrantState(logTable, sender)
+                if state == "grant" then
+                    cachedGrant = logTable
+                elseif state == "revoke" then
+                    cachedGrant = nil
+                end
+            end
+            return cachedGrant
+        end
+    end
     if not self:_LogsEstablishAdminGrant(logs, sender) then return nil end
     if not (self.state and self:_ProfileAuthorizationKnown()) then return nil end
 
@@ -952,11 +1036,19 @@ function Sync:_CatchUpProvenGrantLog(sender, logs)
     if not self:IsSenderAuthorized(self.state.profileId, grantAuthor) then return nil end
     -- A stored grant that local history later revoked is not current authority.
     -- The response can omit that removal after a session reset cleared revokedRoutes.
-    if self:_LocalHistoryRevokesAdmin(sender) then return nil end
+    if self:_LocalHistoryRevokesAdmin(sender) then
+        if token then
+            self:_StoreCatchUpProof(token, false)
+        end
+        return nil
+    end
 
     for _, logTable in ipairs(logs) do
         local state = self:_LogAdminGrantState(logTable, sender)
         if state and not self:_GrantRowsMatch(logTable, grantLog) then
+            if token then
+                self:_StoreCatchUpProof(token, false)
+            end
             return nil
         end
     end
@@ -970,10 +1062,40 @@ function Sync:_CatchUpProvenGrantLog(sender, logs)
             localTable = localLog:ToTable()
         end
         if self:_GrantRowsMatch(localTable, grantLog) then
+            if token then
+                self:_StoreCatchUpProof(token, true)
+            end
             return grantLog
         end
     end
+    if token then
+        self:_StoreCatchUpProof(token, false)
+    end
     return nil
+end
+
+function Sync:_StoreCatchUpProof(token, proven)
+    if type(token) ~= "table" or not self.state then return end
+    local cache = self.state._catchUpProofScan
+    if not self:_CatchUpProofTokenCurrent(cache, token) then
+        cache = {
+            profileId = token.profileId,
+            logs = token.logs,
+            count = token.count,
+            rev = token.rev,
+            byKey = {},
+        }
+        self.state._catchUpProofScan = cache
+    end
+    local stored = 0
+    for _ in pairs(cache.byKey) do
+        stored = stored + 1
+        if stored >= 32 then
+            cache.byKey = {}
+            break
+        end
+    end
+    cache.byKey[token.key] = proven == true
 end
 
 -- Function True when catch-up logs cite exactly one grant this profile already trusts.

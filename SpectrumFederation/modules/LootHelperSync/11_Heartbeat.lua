@@ -54,7 +54,7 @@ function Sync:HandleSessionStart(sender, payload)
     if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
         return
     end
-    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator) then
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator, payload.profileId) then
         return
     end
 
@@ -75,10 +75,10 @@ function Sync:HandleSessionStart(sender, payload)
 
     self.state.active = true
     self.state.sessionId = payload.sessionId
-    self.state.profileId = payload.profileId
     if self._RememberUnprovenCatchUpRelease then
         self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
     end
+    self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())

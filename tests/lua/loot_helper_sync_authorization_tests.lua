@@ -276,6 +276,7 @@ local function reset(selfName)
     Sync.state._unprovenCatchUpWarned = nil
     Sync.state._sameProfileRevokeScan = nil
     Sync.state._catchUpGrantScan = nil
+    Sync.state._catchUpProofScan = nil
     Sync.state._failedCatchUp = nil
     Sync.state._sentJoinStatusForSessionId = nil
     Sync.state._sessionAnnounced = SESSION
@@ -3785,6 +3786,88 @@ Sync:HandleSessionStart(KINO, {
 })
 assertEq(Sync.state.sessionId, "session-proven", "a stored grant lets that coordinator adopt a new session")
 Sync._Now = originalSuccessorNow
+end)()
+
+-- A failed catch-up on one profile does not block that player on another profile.
+-- A repeated mismatched catch-up reply does not walk local history again.
+;(function()
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.coordinator = OWNER
+Sync.state.coordEpoch = 10
+Sync.state.isCoordinator = true
+Sync.state.heartbeat.lastCoordMessageAt = 1000
+local otherNow = 5000
+local originalOtherNow = Sync._Now
+Sync._Now = function()
+    return otherNow
+end
+Sync:HandleCoordinatorTakeover(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 11,
+})
+otherNow = 9000
+Sync:TakeoverSession(SESSION, PROFILE, "heartbeat-timeout")
+local blockedEpoch = (tonumber(Sync.state.coordEpoch) or 0) + 1
+Sync:HandleSessionStart(KINO, {
+    sessionId = "session-other-profile",
+    profileId = "profile-2",
+    coordinator = KINO,
+    coordEpoch = blockedEpoch,
+})
+assertEq(Sync.state.profileId, "profile-2", "a failed catch-up on another profile does not block this profile")
+assertEq(Sync.state.coordinator, KINO, "that player can coordinate a profile they have not failed")
+assertEq(Sync.state.sessionId, "session-other-profile", "the other profile's session is adopted")
+Sync._Now = originalOtherNow
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state._coordinatorCatchUp = KINO
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 3,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local mismatched = seedRequest("need-mismatched-grant", "NEED_LOGS", { KINO }, KINO)
+mismatched.meta.integrityRepair = true
+local proofScans = 0
+local originalProofHistory = Sync._LocalHistoryRevokesAdmin
+Sync._LocalHistoryRevokesAdmin = function(self, name)
+    proofScans = proofScans + 1
+    return originalProofHistory(self, name)
+end
+local function sendMismatched(counter, requestId)
+    Sync:HandleAuthLogs(KINO, {
+        sessionId = SESSION,
+        profileId = PROFILE,
+        requestId = requestId or "need-mismatched-grant",
+        author = "Author-Realm",
+        fromCounter = 1,
+        toCounter = 2,
+        logs = {
+            {
+                _author = OWNER,
+                _counter = counter,
+                _eventType = "ADMIN_ADDED",
+                _data = { member = KINO },
+            },
+        },
+    })
+end
+sendMismatched(99)
+sendMismatched(99)
+assertEq(proofScans, 1, "a repeated mismatched catch-up grant does not scan history again")
+assertTrue(Sync.state.requests["need-mismatched-grant"] ~= nil, "the mismatched grant leaves the request open")
+sendMismatched(100)
+assertEq(proofScans, 2, "a different mismatched grant scans history once")
+Sync._LocalHistoryRevokesAdmin = originalProofHistory
 end)()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

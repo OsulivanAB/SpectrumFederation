@@ -265,7 +265,7 @@ function Sync:HandleSessionReannounce(sender, payload)
     if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
         return
     end
-    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator) then
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator, payload.profileId) then
         return
     end
 
@@ -287,10 +287,10 @@ function Sync:HandleSessionReannounce(sender, payload)
 
     self.state.active = true
     self.state.sessionId = payload.sessionId
-    self.state.profileId = payload.profileId
     if self._RememberUnprovenCatchUpRelease then
         self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
     end
+    self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
@@ -416,7 +416,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
         return
     end
-    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator) then
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator, payload.profileId) then
         return
     end
 
@@ -478,10 +478,10 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     -- We want to keep this lightweight, so we will not touch handshake bookkeeping
     self.state.active   = true
     self.state.sessionId = payload.sessionId
-    self.state.profileId = payload.profileId
     if self._RememberUnprovenCatchUpRelease then
         self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
     end
+    self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
@@ -685,7 +685,7 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     if self._UnprovenCatchUpBlocksNewSession and self:_UnprovenCatchUpBlocksNewSession(payload) then
         return
     end
-    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator) then
+    if self._FailedCatchUpBlocks and self:_FailedCatchUpBlocks(payload.coordinator, payload.profileId) then
         return
     end
 
@@ -700,10 +700,10 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     self.state.active = true
     self.state.sessionId = payload.sessionId
-    self.state.profileId = payload.profileId
     if self._RememberUnprovenCatchUpRelease then
         self:_RememberUnprovenCatchUpRelease(oldCoord, payload.coordinator)
     end
+    self.state.profileId = payload.profileId
     self.state.coordinator = payload.coordinator
     self.state.coordEpoch = payload.coordEpoch
     self.state.isCoordinator = self:_SamePlayer(payload.coordinator, self:_SelfId())
