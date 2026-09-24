@@ -3027,6 +3027,7 @@ function LootProfile:ClearTransientAutomaticBisBackfill()
     self._autoBisBackfill = nil
     self._autoBisBackfillArmed = nil
     self._autoBisBackfillPumping = nil
+    self._autoBisFrontierPending = nil
     self._writingAutoBis = nil
 end
 
@@ -3228,13 +3229,24 @@ function LootProfile:_PumpAutomaticBisBackfill()
             break
         end
     end
-    -- Silent batches skip NEW_LOG. One heartbeat publishes the new author
-    -- frontier, including a yielded batch, without one message per award.
-    if wroteNow > 0 then
+    -- Silent batches skip NEW_LOG. Publishing every batch recomputes author
+    -- maxima and integrity windows over the whole history. One heartbeat when
+    -- the job finishes is enough for peers to request the new counters.
+    -- A yielded job only marks the frontier pending.
+    local jobRemains = self._autoBisBackfill ~= nil
+    if wroteNow > 0 and jobRemains then
+        self._autoBisFrontierPending = true
+    end
+    if not jobRemains and self:IsActiveSessionCoordinator()
+        and (wroteNow > 0 or self._autoBisFrontierPending)
+    then
         local heartbeatSync = SF.LootHelperSync
         if heartbeatSync and heartbeatSync.BroadcastSessionHeartbeat and SF.LootHelperComm then
             heartbeatSync:BroadcastSessionHeartbeat()
         end
+        self._autoBisFrontierPending = nil
+    elseif not jobRemains then
+        self._autoBisFrontierPending = nil
     end
     self._autoBisBackfillPumping = false
     return wroteNow

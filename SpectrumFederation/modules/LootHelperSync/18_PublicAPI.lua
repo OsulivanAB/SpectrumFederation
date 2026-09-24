@@ -914,6 +914,17 @@ function Sync:EndSession(reason, broadcast)
             tostring(reason), tostring(broadcast), tostring(self.state.isCoordinator))
     end
 
+    -- A backfill may have written outcomes and yielded before this end.
+    -- Advertise that frontier once, while this client is still coordinator,
+    -- instead of once per batch.
+    if self.state.isCoordinator and SF.LootHelperComm and self.BroadcastSessionHeartbeat then
+        local endingProfile = self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) or nil
+        if endingProfile and endingProfile._autoBisFrontierPending then
+            self:BroadcastSessionHeartbeat()
+            endingProfile._autoBisFrontierPending = nil
+        end
+    end
+
     local dist = self:_EnforceGroupedSessionActive("EndSession")
 
     if broadcast and self.state.isCoordinator and dist and SF.LootHelperComm then

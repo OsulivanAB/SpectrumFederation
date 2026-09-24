@@ -7381,7 +7381,8 @@ function testLiveAwardWaitsForYieldedBackfill()
         end,
     }
     assertEq(profile:_PumpAutomaticBisBackfill(), 1, "the first backfill batch writes the older helm")
-    assertEq(heartbeats, 1, "a silent batch sends one heartbeat")
+    assertEq(heartbeats, 0, "a yielded batch does not send a full heartbeat")
+    assertTrue(profile._autoBisFrontierPending == true, "a yielded batch leaves the frontier pending")
     assertEq(outcomeForAward(profile, older.awardKey), "ASSIGNED", "the older helm keeps the slot")
     assertEq(countLootEvents(profile, "BIS_OUTCOME", newer.awardKey), 0, "the live helm is still waiting after the first batch")
     local guard = 0
@@ -7395,9 +7396,10 @@ function testLiveAwardWaitsForYieldedBackfill()
     assertEq(profile._autoBisBackfill, nil, "the backfill finishes the queued helms")
     assertEq(outcomeForAward(profile, newer.awardKey), "OVERFLOW", "the live helm is overflow after the older award")
     assertEq(outcomeForAward(profile, third.awardKey), "OVERFLOW", "the synced helm is overflow after the older award")
-    assertEq(heartbeats, 3, "each batch that writes sends one heartbeat")
+    assertEq(heartbeats, 1, "finishing the backfill sends one heartbeat")
+    assertEq(profile._autoBisFrontierPending, nil, "the finished backfill clears the pending frontier")
     assertEq(profile:_PumpAutomaticBisBackfill(), 0, "a finished backfill does not send another heartbeat")
-    assertEq(heartbeats, 3, "a batch that writes nothing does not heartbeat")
+    assertEq(heartbeats, 1, "a batch that writes nothing does not heartbeat")
     local immediate = SF.LootLog.BuildRCLootCouncilCanonical(AWARDER, WINNER, historyTable({
         id = "1700007604-5",
         response = "Greed",
@@ -7439,6 +7441,36 @@ function testSuppressedBisFingerprintIndex()
     assertEq(Sync.state._suppressedBisByLogId, nil, "session reset drops the fingerprint index")
 end
 testSuppressedBisFingerprintIndex()
+
+function testBackfillFrontierOnSessionEnd()
+    resetEnv()
+    PLAYER = "AdminA-Garona"
+    local profile = makeProfile("FrontierEnd")
+    addMember(profile, WINNER)
+    setActive(profile)
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    profile._autoBisFrontierPending = true
+    local heartbeats = 0
+    local previousHeartbeat = Sync.BroadcastSessionHeartbeat
+    function Sync:BroadcastSessionHeartbeat()
+        heartbeats = heartbeats + 1
+        return true
+    end
+    assertTrue(Sync:EndSession("test"), "the coordinator can end the session")
+    assertEq(heartbeats, 1, "ending the session advertises a pending backfill frontier once")
+    assertEq(profile._autoBisFrontierPending, nil, "session end clears the pending frontier")
+    heartbeats = 0
+    profile._autoBisFrontierPending = true
+    startSessionOn(profile)
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = PLAYER
+    assertTrue(Sync:EndSession("test-again"), "the coordinator can end a second session")
+    assertEq(heartbeats, 1, "a second end advertises only that session's pending frontier")
+    Sync.BroadcastSessionHeartbeat = previousHeartbeat
+end
+testBackfillFrontierOnSessionEnd()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then
