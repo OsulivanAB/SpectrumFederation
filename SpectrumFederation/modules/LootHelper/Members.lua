@@ -118,6 +118,58 @@ local function AddLootLogToActiveProfile(logEntry, opts)
     return false
 end
 
+local function SameMemberId(a, b)
+    if type(a) ~= "string" or type(b) ~= "string" then return false end
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b)
+    end
+    return a == b
+end
+
+local function ProfileOwnerId(profile)
+    if type(profile) ~= "table" then return nil end
+    if type(profile.GetOwnerId) == "function" then
+        return profile:GetOwnerId()
+    end
+    return profile._owner
+end
+
+-- AddLootLog inserts the ROLE_CHANGE and does not refresh _adminUsers.
+-- Session reconcile reads that list, so apply the same grant or revoke a
+-- full log replay would. The profile owner stays an admin.
+local function ApplyRoleChangeToCanonicalAdmins(profile, memberId, newRole)
+    if type(profile) ~= "table" or type(memberId) ~= "string" or memberId == "" then
+        return
+    end
+    local owner = ProfileOwnerId(profile)
+    if newRole == MEMBER_ROLES.MEMBER and type(owner) == "string" and SameMemberId(owner, memberId) then
+        return
+    end
+    local admins = profile._adminUsers
+    if type(admins) ~= "table" then
+        admins = {}
+        profile._adminUsers = admins
+    end
+    if newRole == MEMBER_ROLES.MEMBER then
+        for i = #admins, 1, -1 do
+            if SameMemberId(admins[i], memberId) then
+                table.remove(admins, i)
+            end
+        end
+        return
+    end
+    if newRole ~= MEMBER_ROLES.ADMIN then
+        return
+    end
+    for i = 1, #admins do
+        if SameMemberId(admins[i], memberId) then
+            return
+        end
+    end
+    admins[#admins + 1] = memberId
+    table.sort(admins)
+end
+
 local function AttachIdentityArmorScope(profile, eventData)
     if type(profile) ~= "table" or type(eventData) ~= "table" then
         return
@@ -254,6 +306,7 @@ function Member:SetRole(newRole, opts)
 
         local oldRole = self.role
         self.role = newRole
+        ApplyRoleChangeToCanonicalAdmins(opts.profile, self:GetFullIdentifier(), newRole)
 
         -- The writer does not receive its own NEW_LOG, and a duplicate echo
         -- returns before live revocation routing. Reconcile here, as local

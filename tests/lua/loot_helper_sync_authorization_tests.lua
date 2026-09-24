@@ -896,6 +896,14 @@ assertEq(Sync.state._restoredSessionNeedsReannounce, true, "authorized coordinat
 
 reset(KINO)
 setAdmins({ KINO, OWNER })
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = COORD },
+    },
+}
 Sync.state.isCoordinator = false
 Sync.state.coordinator = COORD
 Sync.state.helpers = {}
@@ -2291,6 +2299,107 @@ Sync:HandleSessionStart(KINO, {
 assertEq(Sync.state._coordinatorCatchUp, nil, "session start clears catch-up when local history revoked the coordinator")
 assertEq(Sync:_RouteWasRevoked(KINO), true, "session start revokes a coordinator local history removed")
 
+-- An admin receiver must not take over from a successor whose grant is only missing.
+reset(OWNER)
+setAdmins({ OWNER })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state.coordEpoch = 4
+profile._lootLogs = {}
+Sync:_PersistSessionState("before-admin-catchup-reload")
+Sync.state.active = false
+local restoredAdminCatch = Sync:TryRestorePersistedSession("reload-admin-catchup")
+assertEq(restoredAdminCatch, true, "admin restores a successor session before the grant arrives")
+assertEq(Sync.state._coordinatorCatchUp, KINO, "admin restore keeps the missing successor on catch-up")
+assertEq(Sync.state.coordinator, KINO, "admin restore does not take over from a catch-up coordinator")
+assertEq(Sync.state.isCoordinator, false, "admin restore stays a member while the grant is missing")
+assertEq(sendCount(Sync.MSG.COORD_TAKEOVER), 0, "admin restore does not broadcast takeover during catch-up")
+
+local catchUpTakeovers = 0
+local originalCatchTakeover = Sync.TakeoverSession
+Sync.TakeoverSession = function()
+    catchUpTakeovers = catchUpTakeovers + 1
+    return true
+end
+local originalCatchRebuild = Sync.RebuildProfile
+Sync.RebuildProfile = function(self, profileId, reason)
+    self:ReconcileSessionAuthorization(profileId, "rebuild:" .. reason)
+    return true
+end
+Sync:HandleSessionStart(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 5,
+    helpers = {},
+})
+assertEq(catchUpTakeovers, 0, "admin session start does not take over from a catch-up coordinator")
+assertEq(Sync.state.coordinator, KINO, "admin session start keeps the catch-up coordinator")
+assertEq(Sync.state._coordinatorCatchUp, KINO, "admin session start keeps catch-up")
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 2,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}
+Sync:ReconcileSessionAuthorization(PROFILE, "coordinator-removed")
+assertEq(catchUpTakeovers, 1, "explicit coordinator removal still lets an eligible admin take over")
+Sync.TakeoverSession = originalCatchTakeover
+Sync.RebuildProfile = originalCatchRebuild
+
+-- A revoked coordinator cannot leave the session by changing only the profile id.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = COORD
+Sync.state.helpers = { KINO }
+Sync.state.coordEpoch = 10
+Sync.state.heartbeat.lastHeartbeatAt = 40
+Sync.state.heartbeat.lastCoordMessageAt = 40
+Sync:_RememberRevokedRoute(COORD)
+local otherProfile = "profile-other"
+Sync:HandleSessionHeartbeat(COORD, {
+    sessionId = SESSION,
+    profileId = otherProfile,
+    coordinator = COORD,
+    coordEpoch = 11,
+    sentAt = 50,
+})
+assertEq(Sync.state.profileId, PROFILE, "revoked heartbeat cannot retarget the session profile")
+assertEq(Sync.state.coordEpoch, 10, "revoked same-session profile change does not advance the epoch")
+assertEq(Sync:_RouteWasRevoked(COORD), true, "revoked heartbeat keeps the revocation")
+assertEq(Sync.state.heartbeat.lastCoordMessageAt, 40, "revoked profile-change heartbeat does not refresh the coordinator timer")
+Sync:HandleSessionReannounce(COORD, {
+    sessionId = SESSION,
+    profileId = otherProfile,
+    coordinator = COORD,
+    coordEpoch = 11,
+    helpers = { OWNER },
+})
+assertEq(Sync.state.profileId, PROFILE, "revoked reannounce cannot retarget the session profile")
+assertTrue(not listHas(Sync.state.helpers, OWNER), "revoked reannounce does not apply helpers")
+assertEq(Sync:_RouteWasRevoked(COORD), true, "revoked reannounce keeps the revocation")
+Sync:HandleCoordinatorTakeover(COORD, {
+    sessionId = SESSION,
+    profileId = otherProfile,
+    coordinator = COORD,
+    coordEpoch = 11,
+})
+assertEq(Sync.state.profileId, PROFILE, "revoked takeover cannot retarget the session profile")
+assertEq(Sync.state.coordinator, COORD, "revoked takeover does not replace the coordinator")
+assertEq(Sync:_RouteWasRevoked(COORD), true, "revoked takeover keeps the revocation")
+Sync:HandleSessionStart(COORD, {
+    sessionId = "session-2",
+    profileId = otherProfile,
+    coordinator = COORD,
+    coordEpoch = 12,
+    helpers = { KINO },
+})
+assertEq(Sync.state.sessionId, "session-2", "a newer session still escapes the old revocation")
+assertEq(Sync:_RouteWasRevoked(COORD), false, "a newer session clears the old revocation")
+
 -- An authorized admin who is not a Helper can still be the integrity provider.
 reset(COORD)
 Sync.state.isCoordinator = true
@@ -2414,8 +2523,9 @@ seedRequest("need-local-coord", "NEED_LOGS", { COORD }, COORD)
 profile.IsCurrentUserAdmin = function()
     return true
 end
+local roleLogs = 0
 profile.AddLootLog = function()
-    setAdmins({ KINO, OWNER })
+    roleLogs = roleLogs + 1
     return true
 end
 local originalTakeover = Sync.TakeoverSession
@@ -2425,6 +2535,8 @@ end
 local demotedCoordinator = SF.Member.new(COORD, SF.MemberRoles.ADMIN)
 assertEq(demotedCoordinator:SetRole(SF.MemberRoles.MEMBER, { profile = profile }), true,
     "local coordinator demotion commits")
+assertEq(roleLogs, 1, "local coordinator demotion records a role log")
+assertTrue(not listHas(profile._adminUsers, COORD), "local coordinator demotion updates the canonical admin list")
 assertEq(Sync:_RouteWasRevoked(COORD), true, "local coordinator demotion records the revocation")
 assertTrue(not listHas(Sync.state.helpers, COORD), "local coordinator demotion drops that helper")
 assertTrue(Sync:_ResponderMapHas(Sync.state.requests["need-local-coord"].revokedResponders, COORD),
@@ -2452,12 +2564,13 @@ profile.IsCurrentUserAdmin = function()
     return true
 end
 profile.AddLootLog = function()
-    setAdmins({ COORD, OWNER })
     return true
 end
 local demotedHelper = SF.Member.new(KINO, SF.MemberRoles.ADMIN)
 assertEq(demotedHelper:SetRole(SF.MemberRoles.MEMBER, { profile = profile }), true,
     "local helper demotion commits")
+assertTrue(not listHas(profile._adminUsers, KINO), "local helper demotion updates the canonical admin list")
+assertTrue(listHas(profile._adminUsers, COORD), "local helper demotion keeps the coordinator admin")
 assertTrue(not listHas(Sync.state.helpers, KINO), "local helper demotion drops that helper")
 assertTrue(not listHas(Sync.state.requests["need-local-helper"].targets, KINO),
     "local helper demotion drops that request target")

@@ -72,18 +72,15 @@ function Sync:_RouteWasRevoked(name)
 end
 
 -- Function True when this revoked coordinator is still the coordinator of the current session.
--- A newer session or profile is a different scope. Its SES_START is not blocked by the old tombstone.
+-- A newer session is a different scope. Its SES_START is not blocked by the old tombstone.
+-- A different profileId on this same session is not a new scope. ValidateSessionPayload
+-- rejects that change, and it must not clear the revocation either.
 -- @param payload table
 -- @return boolean
 function Sync:_RevokedRouteBlocksIncomingSession(payload)
     if type(payload) ~= "table" or type(payload.coordinator) ~= "string" then return false end
     if not (self.state and self.state.active and self._RouteWasRevoked) then return false end
     if type(self.state.sessionId) == "string" and payload.sessionId ~= self.state.sessionId then
-        return false
-    end
-    if type(self.state.profileId) == "string" and self.state.profileId ~= ""
-        and type(payload.profileId) == "string" and payload.profileId ~= self.state.profileId
-    then
         return false
     end
     if not self:_RouteWasRevoked(payload.coordinator) then return false end
@@ -93,17 +90,24 @@ function Sync:_RevokedRouteBlocksIncomingSession(payload)
     return true
 end
 
--- Function Drop revocation bookkeeping when the incoming descriptor is a different session or profile.
--- Same-session traffic keeps its tombstones. A full session reset already clears them.
+-- Function Drop revocation bookkeeping when the incoming descriptor is a different session.
+-- Same-session traffic keeps its tombstones, including a profileId that does not match.
+-- A full session reset already clears them.
 -- @param incomingSessionId string|nil
--- @param incomingProfileId string|nil
+-- @param incomingProfileId string|nil Ignored. A profile change is not a new session.
 -- @return nil
 function Sync:_ClearRevocationForIncomingScope(incomingSessionId, incomingProfileId)
     if not self.state then return end
     local sessionChanged = type(self.state.sessionId) == "string" and self.state.sessionId ~= incomingSessionId
-    local profileChanged = type(self.state.profileId) == "string" and self.state.profileId ~= ""
-        and type(incomingProfileId) == "string" and self.state.profileId ~= incomingProfileId
-    if not (sessionChanged or profileChanged) then return end
+    if not sessionChanged then
+        if SF.Debug and type(incomingProfileId) == "string" and type(self.state.profileId) == "string"
+            and self.state.profileId ~= "" and incomingProfileId ~= self.state.profileId
+        then
+            SF.Debug:Verbose("SYNC", "Keeping revocation for same-session profile change %s -> %s",
+                tostring(self.state.profileId), tostring(incomingProfileId))
+        end
+        return
+    end
     self.state.revokedRoutes = nil
     self.state._coordinatorCatchUp = nil
 end
@@ -1187,6 +1191,8 @@ function Sync:RelinquishUnauthorizedCoordination(reason, opts)
 end
 
 -- Function Eligible admins assume coordination when the current coordinator is no longer an admin.
+-- A coordinator recorded for catch-up is missing locally, not removed. Taking over
+-- would split that session before the grant is fetched.
 -- @param reason string|nil
 -- @return boolean
 function Sync:_MaybeAssumeCoordinationAfterAdminChange(reason)
@@ -1195,6 +1201,7 @@ function Sync:_MaybeAssumeCoordinationAfterAdminChange(reason)
     if type(profileId) ~= "string" or type(self.state.coordinator) ~= "string" then return false end
     if not self:_ProfileAuthorizationKnown() then return false end
     if self:IsSenderAuthorized(profileId, self.state.coordinator) then return false end
+    if self:_CoordinatorNeedsCatchUp(self.state.coordinator) then return false end
     if type(self.CanSelfCoordinate) == "function" and not self:CanSelfCoordinate(profileId) then
         return false
     end
