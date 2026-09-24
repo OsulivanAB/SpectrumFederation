@@ -1222,12 +1222,58 @@ Sync:HandleAuthLogs(KINO, catchLogsPayload({
         _data = { member = KINO },
     },
 }))
-assertEq(mergeCalls, 1, "catch-up AUTH_LOGS with ADMIN_ADDED is merged")
-assertEq(mergeOpts.allowReplaceExisting, false, "unproven canonical admin cannot replace existing rows")
-mergeCalls = 0
+assertEq(mergeCalls, 0, "catch-up AUTH_LOGS does not trust a grant from an unauthorized author")
 Sync:HandleAuthLogs(KINO, catchLogsPayload({
     {
-        _author = "Other-Realm",
+        _author = KINO,
+        _counter = 2,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}))
+assertEq(mergeCalls, 0, "catch-up AUTH_LOGS does not trust a grant the sender wrote")
+Sync:HandleAuthLogs(KINO, catchLogsPayload({
+    {
+        _author = OWNER,
+        _counter = 8,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}))
+assertEq(mergeCalls, 0, "catch-up AUTH_LOGS ignores a trusted author grant that is not already local")
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 9,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = MEMBER },
+    },
+}
+Sync:HandleAuthLogs(KINO, catchLogsPayload({
+    {
+        _author = OWNER,
+        _counter = 9,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}))
+assertEq(mergeCalls, 0, "catch-up AUTH_LOGS rejects a grant that rewrites a local row")
+mergeCalls = 0
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 9,
+        _eventType = "ADMIN_ADDED",
+        _data = { member = KINO },
+    },
+}
+local originalRebuild = Sync.RebuildProfile
+Sync.RebuildProfile = function()
+    return true
+end
+Sync:HandleAuthLogs(KINO, catchLogsPayload({
+    {
+        _author = OWNER,
         _counter = 9,
         _eventType = "ADMIN_ADDED",
         _data = { member = KINO },
@@ -1239,13 +1285,9 @@ Sync:HandleAuthLogs(KINO, catchLogsPayload({
         _data = { member = MEMBER },
     },
 }))
-assertEq(mergeCalls, 1, "grant outside the requested window does not reject the catch-up reply")
+assertEq(mergeCalls, 1, "a local trusted grant does not reject the catch-up reply")
 assertTrue(Sync.state.requests["need-catch-logs"] ~= nil, "unapplied gap rows leave the catch-up request open")
-local originalRebuild = Sync.RebuildProfile
 local phases = {}
-Sync.RebuildProfile = function()
-    return true
-end
 Sync.MergeLogs = function(_, _, logs, opts)
     phases[#phases + 1] = {
         event = logs[1] and logs[1]._eventType or nil,
@@ -1258,7 +1300,7 @@ Sync.MergeLogs = function(_, _, logs, opts)
 end
 Sync:HandleAuthLogs(KINO, catchLogsPayload({
     {
-        _author = "Other-Realm",
+        _author = OWNER,
         _counter = 9,
         _eventType = "ADMIN_ADDED",
         _data = { member = KINO },
@@ -1270,7 +1312,7 @@ Sync:HandleAuthLogs(KINO, catchLogsPayload({
         _data = { member = MEMBER },
     },
 }))
-assertEq(phases[1] and phases[1].event, "ADMIN_ADDED", "catch-up merges the grant before the requested rows")
+assertEq(phases[1] and phases[1].event, "ADMIN_ADDED", "catch-up merges the stored grant before the requested rows")
 assertEq(phases[1] and phases[1].replace, false, "grant merge does not replace existing rows")
 assertEq(phases[2] and phases[2].event, "POINT_CHANGE", "requested rows merge after the grant is local")
 assertEq(phases[2] and phases[2].replace, true, "canonical coordinator can replace rows after the grant sticks")
@@ -1279,6 +1321,7 @@ Sync.MergeLogs = function()
     return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
 end
 setAdmins({ OWNER })
+profile._lootLogs = {}
 Sync.state._coordinatorCatchUp = KINO
 profile.ImportSnapshot = function(_, _, opts)
     mergeOpts = opts
@@ -1330,7 +1373,24 @@ Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, {
         _data = { member = KINO },
     },
 }))
-assertEq(mergeOpts and mergeOpts.allowReplaceExisting, false, "catch-up snapshot imports after a trusted admin's grant")
+assertNil(mergeOpts, "catch-up snapshot cannot prove a grant that is not already local")
+profile._lootLogs = {
+    {
+        _eventType = "ADMIN_ADDED",
+        _author = OWNER,
+        _counter = 3,
+        _data = { member = KINO },
+    },
+}
+Sync:HandleProfileSnapshot(KINO, catchSnapPayload({ KINO, OWNER }, {
+    {
+        _eventType = "ADMIN_ADDED",
+        _author = OWNER,
+        _counter = 3,
+        _data = { member = KINO },
+    },
+}))
+assertEq(mergeOpts and mergeOpts.allowReplaceExisting, false, "catch-up snapshot imports a grant already in local history")
 assertTrue(Sync.state.requests["need-catch-snap"] ~= nil, "failed catch-up import leaves the profile request open")
 Sync.MergeLogs = function()
     return false, { inserted = 0, replaced = 0, mismatchCount = 0 }
@@ -1700,6 +1760,153 @@ local catchLog = Sync:_SendLogReq({
 }, COORD)
 assertEq(catchLog, true, "catch-up LOG_REQ send succeeds")
 assertEq(sends[#sends].payload.needsAdminGrant, true, "catch-up LOG_REQ asks for an admin grant")
+
+-- A revoked coordinator cannot end the session or persist configuration.
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync:_RememberRevokedRoute(COORD)
+local rcApplied = false
+local ilvlApplied = false
+profile.ApplyRCLootCouncilIntegrationConfig = function()
+    rcApplied = true
+    return true
+end
+profile.GetRCLootCouncilIntegrationConfig = function()
+    return nil
+end
+profile.ApplyRaidCheckItemLevelPolicy = function()
+    ilvlApplied = true
+    return true
+end
+Sync:OnControlMessage(COORD, Sync.MSG.SES_END, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 10,
+    reason = "revoked",
+}, "RAID")
+assertEq(Sync.state.active, true, "revoked coordinator cannot end the session")
+Sync:OnControlMessage(COORD, Sync.MSG.SAFE_MODE_SET, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 10,
+    safeMode = { enabled = true, rev = 1, setBy = COORD, reason = "revoked" },
+}, "RAID")
+assertEq(Sync:IsSafeModeEnabled(), false, "revoked coordinator cannot enable safe mode")
+Sync:OnControlMessage(COORD, Sync.MSG.RC_CONFIG_SET, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 10,
+    seq = 1,
+    rcLootCouncilIntegration = { recordAwards = true },
+}, "RAID")
+assertEq(rcApplied, false, "revoked coordinator cannot persist RC config")
+Sync:OnControlMessage(COORD, Sync.MSG.RAID_CHECK_ILVL_SET, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 10,
+    seq = 1,
+    requireMinimumItemLevel = true,
+    minimumItemLevel = 600,
+}, "RAID")
+assertEq(ilvlApplied, false, "revoked coordinator cannot persist item level policy")
+setAdmins({ COORD, KINO, OWNER })
+Sync:OnControlMessage(COORD, Sync.MSG.SES_END, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 10,
+    reason = "reauthorized",
+}, "RAID")
+assertEq(Sync.state.active, false, "reauthorized coordinator can end the session")
+
+-- Revocation belongs to the current session. A newer session from that player is accepted.
+reset(MEMBER)
+setAdmins({ KINO, OWNER })
+Sync.state.coordinator = COORD
+Sync.state.coordEpoch = 10
+Sync:_RememberRevokedRoute(COORD)
+local scopedRebuild = Sync.RebuildProfile
+Sync.RebuildProfile = function()
+    return true
+end
+Sync:HandleSessionStart(COORD, {
+    sessionId = "session-2",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 11,
+    helpers = { KINO },
+})
+assertEq(Sync.state.sessionId, "session-2", "newer session from a revoked coordinator is accepted")
+assertEq(Sync:_RouteWasRevoked(COORD), false, "session change clears the old revocation")
+Sync:_RememberRevokedRoute(COORD)
+Sync.state.coordEpoch = 11
+Sync:HandleSessionStart(COORD, {
+    sessionId = "session-2",
+    profileId = PROFILE,
+    coordinator = COORD,
+    coordEpoch = 12,
+    helpers = { OWNER },
+})
+assertEq(Sync.state.coordEpoch, 11, "same-session start from a revoked coordinator is ignored")
+assertTrue(not listHas(Sync.state.helpers, OWNER), "same-session revoked start does not apply helpers")
+Sync.RebuildProfile = scopedRebuild
+
+-- Reload after a successor takeover must not record missing authority as a revocation.
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.isCoordinator = false
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync.state.coordEpoch = 4
+Sync:_PersistSessionState("before-catchup-reload")
+Sync.state.active = false
+local restoredCatch = Sync:TryRestorePersistedSession("reload-catchup")
+assertEq(restoredCatch, true, "member restores a successor session before the grant arrives")
+assertEq(Sync.state._coordinatorCatchUp, KINO, "restore keeps the missing successor on catch-up")
+assertEq(Sync:_RouteWasRevoked(KINO), false, "missing authority is not an explicit revocation")
+Sync:HandleSessionHeartbeat(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = 4,
+    sentAt = 9,
+})
+assertEq(Sync.state.coordinator, KINO, "catch-up successor heartbeat is accepted after restore")
+assertEq(Sync.state.sessionId, SESSION, "catch-up successor heartbeat stays on the restored session")
+
+reset(MEMBER)
+setAdmins({ OWNER })
+profile._lootLogs = {
+    {
+        _author = OWNER,
+        _counter = 1,
+        _eventType = "ADMIN_REMOVED",
+        _data = { member = KINO },
+    },
+}
+Sync.state.isCoordinator = false
+Sync.state.coordinator = KINO
+Sync.state.helpers = {}
+Sync:_PersistSessionState("before-revoked-successor-reload")
+Sync.state.active = false
+local restoredRevoke = Sync:TryRestorePersistedSession("reload-explicit-revoke")
+assertEq(restoredRevoke, true, "member restores a session whose coordinator was removed")
+assertEq(Sync:_RouteWasRevoked(KINO), true, "restore still revokes a coordinator the local history removed")
+assertNil(Sync.state._coordinatorCatchUp, "explicit revocation is not catch-up")
+local epochBefore = Sync.state.coordEpoch
+Sync:HandleSessionHeartbeat(KINO, {
+    sessionId = SESSION,
+    profileId = PROFILE,
+    coordinator = KINO,
+    coordEpoch = (epochBefore or 10) + 1,
+    sentAt = 12,
+})
+assertEq(Sync.state.coordEpoch, epochBefore, "explicitly revoked successor heartbeat is ignored after restore")
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))
 if failures > 0 then

@@ -71,6 +71,62 @@ function Sync:_RouteWasRevoked(name)
     return self:_ResponderMapHas(self.state.revokedRoutes, name)
 end
 
+-- Function True when this revoked coordinator is still the coordinator of the current session.
+-- A newer session or profile is a different scope. Its SES_START is not blocked by the old tombstone.
+-- @param payload table
+-- @return boolean
+function Sync:_RevokedRouteBlocksIncomingSession(payload)
+    if type(payload) ~= "table" or type(payload.coordinator) ~= "string" then return false end
+    if not (self.state and self.state.active and self._RouteWasRevoked) then return false end
+    if type(self.state.sessionId) == "string" and payload.sessionId ~= self.state.sessionId then
+        return false
+    end
+    if type(self.state.profileId) == "string" and self.state.profileId ~= ""
+        and type(payload.profileId) == "string" and payload.profileId ~= self.state.profileId
+    then
+        return false
+    end
+    if not self:_RouteWasRevoked(payload.coordinator) then return false end
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Ignoring session traffic from revoked coordinator %s", tostring(payload.coordinator))
+    end
+    return true
+end
+
+-- Function Drop revocation bookkeeping when the incoming descriptor is a different session or profile.
+-- Same-session traffic keeps its tombstones. A full session reset already clears them.
+-- @param incomingSessionId string|nil
+-- @param incomingProfileId string|nil
+-- @return nil
+function Sync:_ClearRevocationForIncomingScope(incomingSessionId, incomingProfileId)
+    if not self.state then return end
+    local sessionChanged = type(self.state.sessionId) == "string" and self.state.sessionId ~= incomingSessionId
+    local profileChanged = type(self.state.profileId) == "string" and self.state.profileId ~= ""
+        and type(incomingProfileId) == "string" and self.state.profileId ~= incomingProfileId
+    if not (sessionChanged or profileChanged) then return end
+    self.state.revokedRoutes = nil
+    self.state._coordinatorCatchUp = nil
+end
+
+-- Function True when privileged control from this coordinator must be ignored.
+-- Explicit revocation outranks the stored coordinator and epoch. Debug only, so
+-- heartbeats and retries do not repeat a chat warning.
+-- @param sender string "Name-Realm"
+-- @param coordinator string|nil Claimed coordinator, or nil to use the sender
+-- @return boolean
+function Sync:_IgnoreRevokedCoordinatorControl(sender, coordinator)
+    local name = coordinator
+    if type(name) ~= "string" or name == "" then
+        name = sender
+    end
+    if type(name) ~= "string" or name == "" or not self._RouteWasRevoked then return false end
+    if not self:_RouteWasRevoked(name) then return false end
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Ignoring privileged control from revoked coordinator %s", tostring(name))
+    end
+    return true
+end
+
 -- Function Allow catch-up only for an advertised coordinator the local profile has not revoked.
 -- @param name string "Name-Realm"
 -- @return boolean
@@ -344,6 +400,86 @@ function Sync:_LogsEstablishAdminGrant(logs, name)
     return granted
 end
 
+-- Function True when local history's last admin effect for this player is a revoke.
+-- Missing history is not a revocation. A later grant clears an earlier removal.
+-- @param name string "Name-Realm"
+-- @return boolean
+function Sync:_LocalHistoryRevokesAdmin(name)
+    if type(name) ~= "string" or name == "" or not self.state then return false end
+    if type(self.FindLocalProfileById) ~= "function" or type(self._GetProfileLootLogs) ~= "function" then
+        return false
+    end
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    local logs = profile and self:_GetProfileLootLogs(profile) or nil
+    if type(logs) ~= "table" then return false end
+    local revoked = false
+    local saw = false
+    for _, log in ipairs(logs) do
+        local logTable = log
+        if type(log) == "table" and type(log.ToTable) == "function" then
+            logTable = log:ToTable()
+        end
+        local state = self:_LogAdminGrantState(logTable, name)
+        if state == "grant" then
+            saw = true
+            revoked = false
+        elseif state == "revoke" then
+            saw = true
+            revoked = true
+        end
+    end
+    return saw and revoked
+end
+
+-- Function True when catch-up logs cite a grant this profile already trusts.
+-- The establishing row must already be in local history, authored by a canonical
+-- admin other than the sender. A sender-supplied ADMIN_ADDED is not that evidence.
+-- @param sender string "Name-Realm"
+-- @param logs table
+-- @return boolean
+function Sync:_CatchUpLogsProveGrant(sender, logs)
+    if type(logs) ~= "table" or #logs == 0 then return false end
+    if not self:_LogsEstablishAdminGrant(logs, sender) then return false end
+    if not (self.state and self:_ProfileAuthorizationKnown()) then return false end
+
+    local grantLog = nil
+    for _, logTable in ipairs(logs) do
+        local state = self:_LogAdminGrantState(logTable, sender)
+        if state == "grant" then
+            grantLog = logTable
+        elseif state == "revoke" then
+            grantLog = nil
+        end
+    end
+    if type(grantLog) ~= "table" then return false end
+    local grantAuthor = grantLog._author or grantLog.author
+    if type(grantAuthor) ~= "string" or grantAuthor == "" then return false end
+    if self:_SamePlayer(grantAuthor, sender) then return false end
+    if not self:IsSenderAuthorized(self.state.profileId, grantAuthor) then return false end
+
+    local profile = self:FindLocalProfileById(self.state.profileId)
+    local localLogs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
+    if type(localLogs) ~= "table" then return false end
+    local remoteData = grantLog._data or grantLog.data
+    local remoteMember = type(remoteData) == "table" and remoteData.member or nil
+    for _, localLog in ipairs(localLogs) do
+        local localTable = localLog
+        if type(localLog) == "table" and type(localLog.ToTable) == "function" then
+            localTable = localLog:ToTable()
+        end
+        if type(localTable) == "table" and self:_SameLogTable(localTable, grantLog) then
+            local localData = localTable._data or localTable.data
+            local localMember = type(localData) == "table" and localData.member or nil
+            if type(localMember) == "string" and type(remoteMember) == "string"
+                and self:_SamePlayer(localMember, remoteMember)
+            then
+                return true
+            end
+        end
+    end
+    return false
+end
+
 -- Function True when a snapshot's admin list names this player.
 -- @param snapshot table
 -- @param name string "Name-Realm"
@@ -410,10 +546,9 @@ function Sync:_AppendSelfAdminGrantEvidence(out, profile)
     out[#out + 1] = latest
 end
 
--- Function Catch-up snapshots must prove the sender's grant from trusted history.
--- Empty history is not proof. The logs must end with a grant authored by
--- someone the local profile already authorizes, and that grant must not
--- rewrite a local log at the same author and counter.
+-- Function Catch-up snapshots must prove the sender's grant from local history.
+-- Empty history is not proof. The establishing grant must already be stored,
+-- authored by someone this profile authorizes, and must name the same member.
 -- @param sender string "Name-Realm"
 -- @param snapshot table
 -- @return boolean
@@ -423,62 +558,7 @@ function Sync:_CatchUpSnapshotProvesGrant(sender, snapshot)
     if type(snapshot) == "table" then
         logs = snapshot.logs or snapshot.lootLogs or snapshot._lootLogs
     end
-    -- An empty history plus a sender-written admin list is not a grant.
-    -- The snapshot must include logs that end with this sender granted.
-    if type(logs) ~= "table" or #logs == 0 then return false end
-    if not self:_LogsEstablishAdminGrant(logs, sender) then return false end
-    if not (self.state and self:_ProfileAuthorizationKnown()) then return false end
-
-    local grantAuthor = nil
-    for _, logTable in ipairs(logs) do
-        local state = self:_LogAdminGrantState(logTable, sender)
-        if state == "grant" then
-            grantAuthor = logTable._author or logTable.author
-        elseif state == "revoke" then
-            grantAuthor = nil
-        end
-    end
-    -- The establishing grant has to come from someone this profile already
-    -- trusts. The catch-up sender cannot prove itself by writing its own grant.
-    if type(grantAuthor) ~= "string" or grantAuthor == "" then return false end
-    if self:_SamePlayer(grantAuthor, sender) then return false end
-    if not self:IsSenderAuthorized(self.state.profileId, grantAuthor) then return false end
-
-    local profile = self:FindLocalProfileById(self.state.profileId)
-    local localLogs = (profile and self._GetProfileLootLogs) and self:_GetProfileLootLogs(profile) or nil
-    if type(localLogs) == "table" then
-        for _, logTable in ipairs(logs) do
-            if self:_LogAdminGrantState(logTable, sender) == "grant" then
-                local author = logTable._author or logTable.author
-                local counter = tonumber(logTable._counter or logTable.counter)
-                for _, localLog in ipairs(localLogs) do
-                    local localTable = localLog
-                    if type(localLog) == "table" and type(localLog.ToTable) == "function" then
-                        localTable = localLog:ToTable()
-                    end
-                    if type(localTable) == "table" then
-                        local localAuthor = localTable._author or localTable.author
-                        local localCounter = tonumber(localTable._counter or localTable.counter)
-                        if type(author) == "string" and localCounter == counter and self:_SamePlayer(localAuthor, author) then
-                            if not self:_SameLogTable(localTable, logTable) then
-                                return false
-                            end
-                            local localData = localTable._data or localTable.data
-                            local remoteData = logTable._data or logTable.data
-                            local localMember = type(localData) == "table" and localData.member or nil
-                            local remoteMember = type(remoteData) == "table" and remoteData.member or nil
-                            if type(localMember) == "string" and type(remoteMember) == "string"
-                                and not self:_SamePlayer(localMember, remoteMember)
-                            then
-                                return false
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    return true
+    return self:_CatchUpLogsProveGrant(sender, logs)
 end
 
 -- Function True when an exact-repair preferred target is still a live route.
@@ -529,7 +609,7 @@ end
 -- coordinator or helper. Missing requests stay on the trusted-sender path so a
 -- snapshot can still bootstrap a profile.
 -- Catch-up from an advertised coordinator is accepted only when opts.catchUpProven
--- is true. Callers set that after the payload itself grants the sender.
+-- is true. Callers set that only when the grant is already in trusted local history.
 -- @param sender string
 -- @param profileId string
 -- @param req table|nil
@@ -1023,7 +1103,17 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     if type(coordinator) == "string" and coordinator ~= ""
         and not self:IsSenderAuthorized(profileId, coordinator)
     then
-        self:_RememberRevokedRoute(coordinator)
+        -- A reload can restore a successor the local admin list has not absorbed yet.
+        -- That absence is catch-up, not an explicit removal. A local ADMIN_REMOVED
+        -- or role demotion is still a revocation.
+        local restoring = reasonText:sub(1, 8) == "restore:"
+        if restoring and not self:_LocalHistoryRevokesAdmin(coordinator) then
+            if self._NoteAdvertisedCoordinator then
+                self:_NoteAdvertisedCoordinator(coordinator)
+            end
+        else
+            self:_RememberRevokedRoute(coordinator)
+        end
     end
 
     local me = self:_SelfId()

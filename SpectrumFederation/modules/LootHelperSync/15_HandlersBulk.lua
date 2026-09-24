@@ -119,9 +119,9 @@ function Sync:HandleAuthLogs(sender, payload)
             },
         }
         if self._CoordinatorNeedsCatchUp and self:_CoordinatorNeedsCatchUp(sender)
-            and self._LogsEstablishAdminGrant
+            and self._CatchUpLogsProveGrant
         then
-            classifyOpts.catchUpProven = self:_LogsEstablishAdminGrant(payload.logs, sender) == true
+            classifyOpts.catchUpProven = self:_CatchUpLogsProveGrant(sender, payload.logs) == true
         end
         disposition = self:_ClassifyPrivilegedResponse(sender, payload.profileId, req, classifyOpts)
     elseif self.state.isCoordinator then
@@ -278,9 +278,12 @@ function Sync:HandleAuthLogs(sender, payload)
                 allowMainSwapFingerprintNormalize = true,
             })
             grantChanged = changedGrant and true or false
-            if changedGrant and self.RebuildProfile then
-                self:RebuildProfile(payload.profileId, "auth_logs")
-            end
+        end
+        -- The grant used as proof is already local. Rebuild even when the merge
+        -- inserts nothing, so a stale admin list can absorb that stored row
+        -- before this packet's other logs are considered.
+        if self.RebuildProfile then
+            self:RebuildProfile(payload.profileId, "auth_logs")
         end
         -- The requested window is merged only after the grant is local.
         -- Until then this packet cannot insert or replace the gap rows.

@@ -244,10 +244,7 @@ function Sync:HandleSessionReannounce(sender, payload)
     if not self:_SamePlayer(sender, payload.coordinator) then
         return
     end
-    if self._RouteWasRevoked and self:_RouteWasRevoked(payload.coordinator) then
-        if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Ignoring reannounce from revoked coordinator %s", tostring(payload.coordinator))
-        end
+    if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
         return
     end
 
@@ -269,9 +266,11 @@ function Sync:HandleSessionReannounce(sender, payload)
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
 
-    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor
+    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor.
     if oldSid and oldSid ~= payload.sessionId then
         self:_ResetSessionState("session_changed")
+    elseif self._ClearRevocationForIncomingScope then
+        self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
     end
 
     self.state.active = true
@@ -362,10 +361,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     end
     -- A coordinator this client already removed must not refresh the takeover
     -- timer or reapply its descriptor. A later re-grant clears that revocation.
-    if self._RouteWasRevoked and self:_RouteWasRevoked(payload.coordinator) then
-        if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Ignoring heartbeat from revoked coordinator %s", tostring(payload.coordinator))
-        end
+    if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
         return
     end
 
@@ -398,6 +394,8 @@ function Sync:HandleSessionHeartbeat(sender, payload)
 
     if oldSid and oldSid ~= payload.sessionId then
         self:_ResetSessionState("session_changed")
+    elseif self._ClearRevocationForIncomingScope then
+        self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
     end
 
     if type(payload.safeMode) == "table" then
@@ -616,10 +614,7 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     if not self:_SamePlayer(sender, payload.coordinator) then
         return
     end
-    if self._RouteWasRevoked and self:_RouteWasRevoked(payload.coordinator) then
-        if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Ignoring takeover from revoked coordinator %s", tostring(payload.coordinator))
-        end
+    if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
         return
     end
 
@@ -639,6 +634,9 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     local oldCoord = self.state.coordinator
     local oldEpoch = self.state.coordEpoch
+    if self._ClearRevocationForIncomingScope then
+        self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
+    end
 
     self.state.active = true
     self.state.sessionId = payload.sessionId
@@ -1115,6 +1113,9 @@ function Sync:HandleSafeModeSet(sender, payload)
 
     -- Anti-spoof: must come from coordinator
     if not self:_SamePlayer(sender, payload.coordinator) then return end
+    if self._IgnoreRevokedCoordinatorControl and self:_IgnoreRevokedCoordinatorControl(sender, payload.coordinator) then
+        return
+    end
 
     -- Epoch gating
     if not self:IsControlMessageAllowed(payload, sender) then return end
@@ -1245,6 +1246,9 @@ function Sync:HandleRCConfigSet(sender, payload)
         return
     end
     if not self:_SamePlayer(sender, self.state.coordinator) then
+        return
+    end
+    if self._IgnoreRevokedCoordinatorControl and self:_IgnoreRevokedCoordinatorControl(sender, self.state.coordinator) then
         return
     end
     if type(payload.coordinator) == "string" and payload.coordinator ~= "" then
@@ -1386,6 +1390,9 @@ function Sync:HandleRaidCheckItemLevelSet(sender, payload)
         return
     end
     if not self:_SamePlayer(sender, self.state.coordinator) then
+        return
+    end
+    if self._IgnoreRevokedCoordinatorControl and self:_IgnoreRevokedCoordinatorControl(sender, self.state.coordinator) then
         return
     end
     if not self:IsControlMessageAllowed(payload, sender) then

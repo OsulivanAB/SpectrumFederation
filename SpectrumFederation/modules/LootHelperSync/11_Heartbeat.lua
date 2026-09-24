@@ -21,10 +21,7 @@ function Sync:HandleSessionStart(sender, payload)
     if not self:_SamePlayer(sender, payload.coordinator) then
         return
     end
-    if self._RouteWasRevoked and self:_RouteWasRevoked(payload.coordinator) then
-        if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Ignoring session start from revoked coordinator %s", tostring(payload.coordinator))
-        end
+    if self._RevokedRouteBlocksIncomingSession and self:_RevokedRouteBlocksIncomingSession(payload) then
         return
     end
 
@@ -52,9 +49,12 @@ function Sync:HandleSessionStart(sender, payload)
     local wasCoordinator = (self.state.isCoordinator == true)
     local oldSid = self.state.sessionId
 
-    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor
+    -- If switching to a different sessionId, wipe old session state BEFORE applying new session descriptor.
+    -- A profile change inside that reset, or without a session-id change, drops the old revocation scope.
     if oldSid and oldSid ~= payload.sessionId then
         self:_ResetSessionState("session_changed")
+    elseif self._ClearRevocationForIncomingScope then
+        self:_ClearRevocationForIncomingScope(payload.sessionId, payload.profileId)
     end
 
     self.state.active = true
@@ -165,6 +165,9 @@ function Sync:HandleSessionEnd(sender, payload)
     if type(payload.coordEpoch) ~= "number" then return end
     if not self:IsControlMessageAllowed(payload, sender) then
         return        
+    end
+    if self._IgnoreRevokedCoordinatorControl and self:_IgnoreRevokedCoordinatorControl(sender, payload.coordinator) then
+        return
     end
 
     local reason = payload.reason
