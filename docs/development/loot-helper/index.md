@@ -79,6 +79,18 @@ Fingerprint repair may normalize a sequential log only when a batch/import/snaps
 
 Profiles are keyed by stable ID and `activeProfileId` stores the local selection. Snapshot import/export on `LootProfile` is the boundary used by sync; it validates metadata, logs, Raid Check config, and equipment snapshots before applying data.
 
+## Raid Consumables
+
+`modules/LootHelper/Consumables.lua` owns profile configuration, the append-only ledger, and projections. State lives on the profile as `_consumables` plus `_consumableEvents`. Receipts, contributions, and custody are derived from events. They are not saved as separate counters.
+
+Events are `CONSUMABLE_DONATION`, `CONSUMABLE_CRAFTER_RECEIPT`, `CONSUMABLE_CUSTODY`, `CONSUMABLE_CUSTODY_RESOLVE`, and `CONSUMABLE_CONFIG_RESET`. One client writes each operation: the receiving client for a direct trade, the depositor for a guild bank deposit, the withdrawing character for a withdrawal, and the resolving admin for custody resolve. Replay is idempotent by event id.
+
+`ConsumablesRouting.lua` and `ConsumablesWorkflow.lua` are pure. `ConsumablesSync.lua` authorizes remote config and events. `modules/LootHelperSync/19_Consumables.lua` carries `CONSUMABLES_OP`, `CONSUMABLES_CONFIG`, and `CONSUMABLES_EVENT` on the existing bulk channel. Protocol version stays 4. Older clients ignore the new message types. Snapshots gain an optional `consumables` field; the snapshot version stays 1.
+
+`ConsumablesRuntime.lua` listens for bag, group, trade, and guild bank events. It does not scan bags from a frame update. A half-second range ticker runs only while a selected recipient is out of range and the reminder or review is visible. The reminder is local (`lootHelper.showRaidSupplyReminders`) and is not part of the profile. Clearing configuration keeps the ledger and that personal setting. Deleting a profile deletes its consumables data with the profile object. Copying configuration creates a new profile with the guild, tab, Crafters, and current assignments only.
+
+Retail trade completion is inferred from both sides accepting and then `TRADE_CLOSED`. There is no completion event. The runtime must not accept a trade. Slot filling uses container pickup and `ClickTradeButton` from the trade-open handler. Guild bank identity uses `C_Club.GetGuildClubId()`. Mobile Banking is resolved by spell name at runtime and is omitted when that spell is unknown.
+
 ## UI flow
 
 `UI/LootHelper/Controller.lua` is the authority for roster-window visibility. It combines automatic eligibility (`lootHelper.enabled`, active profile, raid / `showWindowOutsideRaid`) with a runtime-only manual-hidden override. `ShowWindow` / `HideWindow` / `ToggleWindow` / `IsWindowShown` are the public visibility API. Closing the window (title-bar X or Settings **Loot Window**) sets that override and hides `EquipmentWindow`; it does not disable Loot Helper or stop sessions, sync, or heartbeat. `EvaluateVisibility` must not reopen a manually hidden window. `/sf loot` and Settings **Show Loot Window** call `ShowWindow`, which clears the override and then reapplies eligibility. The override is not persisted; `/reload` returns to automatic visibility. Minimize/expanded state is independent of close.

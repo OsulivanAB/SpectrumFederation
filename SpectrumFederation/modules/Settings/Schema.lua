@@ -18,6 +18,7 @@ SF.SettingsSchema = {
 			enabled = true,
 			localSafeMode = false,
 			localSafeModeOnCombat = false,
+			showRaidSupplyReminders = true,
 			raidCheckAuditAutoRefresh = false,
 
 			-- Profile system

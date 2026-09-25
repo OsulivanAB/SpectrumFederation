@@ -1142,31 +1142,64 @@ function C.RevalidateDonation(profile, line, ctx, inventoryQty)
     return true
 end
 
+function C.ItemIdFromText(text)
+    local id = nil
+    if type(text) == "number" then
+        id = text
+    elseif type(text) == "string" then
+        id = tonumber(text)
+        if not IsItemId(id) then
+            id = tonumber(text:match("item:(%d+)"))
+        end
+    end
+    if not IsItemId(id) then return nil end
+    return id
+end
+
 function C.FreezeTrade(profile, donor, receiver, lines, token)
     donor = Norm(donor)
     receiver = Norm(receiver)
     local cfg = C.Ensure(profile)
     local custody = C.Project(profile).custody
-    local items = {}
+    local wanted = {}
+    local function mark(itemId)
+        itemId = tonumber(itemId)
+        if IsItemId(itemId) then
+            wanted[itemId] = true
+        end
+    end
+    local requested = C.RequestedItemIds(profile)
+    for i = 1, #requested do
+        mark(requested[i])
+    end
+    for c = 1, #custody do
+        local entry = custody[c]
+        if Same(entry.holder, donor) then
+            mark(entry.itemId)
+        end
+    end
     for i = 1, #(lines or {}) do
         local line = lines[i]
-        local itemId = tonumber(line.itemId)
-        if itemId then
-            local custodyQty = 0
-            for c = 1, #custody do
-                local entry = custody[c]
-                if entry.itemId == itemId and Same(entry.holder, donor) then
-                    custodyQty = entry.quantity
-                end
-            end
-            local assignment = cfg.assignments[tostring(itemId)]
-            items[itemId] = {
-                assignedToReceiver = C.CrafterHasItem(profile, receiver, itemId),
-                donorAssigned = C.CrafterHasItem(profile, donor, itemId),
-                epoch = assignment and tonumber(assignment.epoch) or 0,
-                custodyQty = custodyQty,
-            }
+        if type(line) == "table" then
+            mark(line.itemId)
         end
+    end
+    local items = {}
+    for itemId in pairs(wanted) do
+        local custodyQty = 0
+        for c = 1, #custody do
+            local entry = custody[c]
+            if entry.itemId == itemId and Same(entry.holder, donor) then
+                custodyQty = entry.quantity
+            end
+        end
+        local assignment = cfg.assignments[tostring(itemId)]
+        items[itemId] = {
+            assignedToReceiver = C.CrafterHasItem(profile, receiver, itemId),
+            donorAssigned = C.CrafterHasItem(profile, donor, itemId),
+            epoch = assignment and tonumber(assignment.epoch) or 0,
+            custodyQty = custodyQty,
+        }
     end
     return {
         profileId = profile._profileId,

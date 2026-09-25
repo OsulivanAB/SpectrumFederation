@@ -876,6 +876,7 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 				{ type = "checkbox", label = "Show Loot Window outside of Raid", tooltip = "Allow the Loot Helper window to appear even when you are not currently in a raid.", path = "lootHelper.showWindowOutsideRaid" },
 				{ type = "checkbox", label = "Enable Local Safemode", tooltip = "Pause bulk sync and profile transfer work on your client. Use this if you want to avoid large data updates locally; it does not affect other players.", path = "lootHelper.localSafeMode" },
 				{ type = "checkbox", label = "Enable Local Safemode on Combat", tooltip = "Automatically turn on local safemode when you enter combat so bulk sync and profile transfers pause on your client.", path = "lootHelper.localSafeModeOnCombat" },
+				{ type = "checkbox", label = "Show Raid Supply Reminders", tooltip = "Show the Raid supplies reminder and open the donation review when you interact with the configured guild bank. This does not turn off donation or custody accounting.", path = "lootHelper.showRaidSupplyReminders" },
 				{ type = "spacer", height = 10 },
 				{
 					type = "button",

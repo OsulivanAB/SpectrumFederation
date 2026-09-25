@@ -665,6 +665,9 @@ function Sync:OnGroupRosterUpdate()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
+    end
 
     -- Find targets who are in-group but haven't been announced to for this sessionId
     local targets = {}
@@ -1219,6 +1222,9 @@ function Sync:ReannounceSession()
     }
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
+    end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
     end
 
     if SF.Debug then

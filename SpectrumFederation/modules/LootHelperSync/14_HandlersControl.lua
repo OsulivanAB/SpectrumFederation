@@ -531,6 +531,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     if self._ApplyAdvertisedRCConfig then
         self:_ApplyAdvertisedRCConfig(payload)
     end
+    if self._ConsiderConsumablesCatchUp then
+        self:_ConsiderConsumablesCatchUp(payload)
+    end
 
     -- Heartbeat bookkeeping. An unproven catch-up coordinator does not extend
     -- the takeover clock after the descriptor that adopted them.

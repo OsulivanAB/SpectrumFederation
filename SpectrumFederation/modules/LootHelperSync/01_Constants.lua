@@ -47,4 +47,9 @@ Sync.MSG = {
     -- Raid Check minimum item level (config-only; not a profile snapshot)
     RAID_CHECK_ILVL_REQ = "RAID_CHECK_ILVL_REQ",
     RAID_CHECK_ILVL_SET = "RAID_CHECK_ILVL_SET",
+
+    -- Raid Consumables config and append-only accounting
+    CONSUMABLES_OP = "CONSUMABLES_OP",
+    CONSUMABLES_CONFIG = "CONSUMABLES_CONFIG",
+    CONSUMABLES_EVENT = "CONSUMABLES_EVENT",
 }

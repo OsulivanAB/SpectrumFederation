@@ -521,6 +521,32 @@ assertTrue(kept, "old generation donations remain in the log")
 unchanged(p, "domain")
 assertEq(#W.EventsFromUnsupportedInventoryDecrease(), 0, "unsupported exits stay empty")
 
+assertEq(C.ItemIdFromText(190000), 190000, "item id accepts a number")
+assertEq(C.ItemIdFromText("190000"), 190000, "item id accepts digits")
+assertEq(C.ItemIdFromText("|cff0070dd|Hitem:190001::::::::80:::::|h[Aqirite]|h|r"), 190001, "item id accepts an item link")
+assertEq(C.ItemIdFromText("not-an-item"), nil, "item id rejects prose")
+
+local freezeP = profile("freeze-set", admin)
+assertTrue(select(1, C.AddCrafter(freezeP, admin, sully, { asAdmin = true })))
+assertTrue(select(1, C.AddAssignment(freezeP, admin, aqirite, sully, { asAdmin = true })))
+assertTrue(select(1, C.AddAssignment(freezeP, admin, aqiriteRank2, sully, { asAdmin = true })))
+C.CommitEvents(freezeP, "freeze-custody", W.WithdrawEvents({
+    requested = true, withdrawerIsAdmin = true, withdrawer = admin,
+    generation = freezeP._consumables.generation,
+    epoch = freezeP._consumables.assignments[tostring(aqirite)].epoch,
+    timestamp = C.Now(),
+}, aqirite, 4))
+local wide = C.FreezeTrade(freezeP, admin, sully, { { itemId = aqirite } }, "wide")
+assertTrue(wide.items[aqirite] ~= nil, "freeze includes the hinted item")
+assertTrue(wide.items[aqiriteRank2] ~= nil, "freeze includes other requested items")
+assertEq(wide.items[aqirite].custodyQty, 4, "freeze records donor custody")
+local extra = W.TradeEvents(wide, { [aqirite] = 4 }, true)
+local sawRank = false
+for i = 1, #extra do
+    if extra[i].itemId == aqiriteRank2 then sawRank = true end
+end
+assertFalse(sawRank, "frozen untraded items do not create events")
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)
