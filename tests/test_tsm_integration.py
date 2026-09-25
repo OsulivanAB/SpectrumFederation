@@ -65,11 +65,11 @@ def test_tsm_adapter_stays_read_only_and_idle():
         assert forbidden not in text
 
 
-def test_feature_modules_do_not_call_tsm_directly():
+def test_feature_modules_do_not_call_tsm_api_directly():
+    """Feature modules may call SF.TSM. Only the adapter may call TSM_API."""
     for root in ADDON_ROOTS:
         for path in root.rglob("*.lua"):
             if path.resolve() == ADAPTER.resolve():
                 continue
             text = path.read_text(encoding="utf-8")
             assert "TSM_API" not in text
-            assert "SF.TSM" not in text
