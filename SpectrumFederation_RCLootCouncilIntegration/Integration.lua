@@ -1326,6 +1326,56 @@ function Integration.AwardReasonHistoryResponseId(entry)
     return AwardReasonHistoryResponseId(entry)
 end
 
+-- RCLootCouncil v3 stores the active button count on each button group
+-- (`profile.buttons[typeCode].numButtons`). A flat `profile.numButtons` is
+-- only a fallback. Unused rows stay in `profile.responses` up to maxButtons,
+-- including placeholder "ButtonN" text and names that used to be active.
+local function NormalizeSliderCount(count)
+    count = tonumber(count)
+    if not count then
+        return nil
+    end
+    if count < 0 then
+        count = 0
+    end
+    return math.floor(count)
+end
+
+local function ActiveButtonCount(profile, typeCode)
+    local buttons = profile and profile.buttons
+    if type(buttons) == "table" then
+        local group = buttons[typeCode]
+        if type(group) == "table" then
+            local nested = NormalizeSliderCount(group.numButtons)
+            if nested ~= nil then
+                return nested
+            end
+        end
+    end
+    return NormalizeSliderCount(profile and profile.numButtons)
+end
+
+-- The default group is always active. Extra groups are listed only when RC
+-- has enabled that button set. Profiles with no enabledButtons table keep
+-- every stored group, which is how older fixtures describe their buttons.
+local function ResponseGroupIsListed(profile, typeCode)
+    if tostring(typeCode) == "default" then
+        return true
+    end
+    local enabled = profile and profile.enabledButtons
+    if type(enabled) ~= "table" then
+        return true
+    end
+    return enabled[typeCode] == true
+end
+
+-- RC pads unused slots as "Button6" / "Button 6" and "Reason 4" / "Reason4".
+local function IsPlaceholderResponseText(text)
+    local lowered = string.lower(strtrim(text))
+    return lowered:match("^button%s*%d+$") ~= nil
+        or lowered:match("^reason%s*%d+$") ~= nil
+end
+
 local function GetRCResponseOptions()
     local options = {}
     local seen = {}
@@ -1334,9 +1384,13 @@ local function GetRCResponseOptions()
             return
         end
         seen[entry.key] = true
+        -- Settings dropdowns render `label`. Show only the RC response text.
+        -- `value` stays the ctx key used for award matching.
+        local displayLabel = entry.text
         options[#options + 1] = {
             value = entry.key,
-            text = entry.label or entry.text,
+            label = displayLabel,
+            text = displayLabel,
             typeCode = entry.typeCode,
             responseId = entry.responseId,
             isAwardReason = entry.isAwardReason and true or false,
@@ -1349,20 +1403,24 @@ local function GetRCResponseOptions()
     local responses = profile and profile.responses
     if type(responses) == "table" then
         for typeCode, group in pairs(responses) do
-            if type(group) == "table" then
+            if type(group) == "table" and ResponseGroupIsListed(profile, typeCode) then
+                local activeButtons = ActiveButtonCount(profile, typeCode)
                 for id, entry in pairs(group) do
                     local numericId = tonumber(id)
-                    if type(entry) == "table" and numericId then
+                    local withinActiveButtons = (not activeButtons) or (numericId and numericId >= 1 and numericId <= activeButtons)
+                    if type(entry) == "table" and numericId and withinActiveButtons then
                         local text = entry.text or entry.label or entry.name
-                        if type(text) == "string" and strtrim(text) ~= "" then
-                            add({
-                                key = string.format("ctx:%s|%s|0", tostring(typeCode), tostring(numericId)),
-                                text = strtrim(text),
-                                label = string.format("%s (%s #%s)", strtrim(text), tostring(typeCode), tostring(numericId)),
-                                typeCode = tostring(typeCode),
-                                responseId = numericId,
-                                isAwardReason = false,
-                            })
+                        if type(text) == "string" then
+                            text = strtrim(text)
+                            if text ~= "" and not IsPlaceholderResponseText(text) then
+                                add({
+                                    key = string.format("ctx:%s|%s|0", tostring(typeCode), tostring(numericId)),
+                                    text = text,
+                                    typeCode = tostring(typeCode),
+                                    responseId = numericId,
+                                    isAwardReason = false,
+                                })
+                            end
                         end
                     end
                 end
@@ -1370,19 +1428,25 @@ local function GetRCResponseOptions()
         end
     end
     local awardReasons = profile and profile.awardReasons
+    local activeReasons = NormalizeSliderCount(profile and profile.numAwardReasons)
     if type(awardReasons) == "table" then
-        for _, entry in ipairs(awardReasons) do
+        for index, entry in ipairs(awardReasons) do
+            if activeReasons and index > activeReasons then
+                break
+            end
             if type(entry) == "table" then
                 local text = entry.text or entry.label
                 local responseId = AwardReasonHistoryResponseId(entry)
-                if type(text) == "string" and strtrim(text) ~= "" and responseId ~= nil then
-                    add({
-                        key = string.format("ctx:awardReason|%s|1", tostring(responseId)),
-                        text = strtrim(text),
-                        label = string.format("%s (award reason #%s)", strtrim(text), tostring(responseId)),
-                        responseId = responseId,
-                        isAwardReason = true,
-                    })
+                if type(text) == "string" and responseId ~= nil then
+                    text = strtrim(text)
+                    if text ~= "" and not IsPlaceholderResponseText(text) then
+                        add({
+                            key = string.format("ctx:awardReason|%s|1", tostring(responseId)),
+                            text = text,
+                            responseId = responseId,
+                            isAwardReason = true,
+                        })
+                    end
                 end
             end
         end
@@ -1411,7 +1475,9 @@ local function SelectedBisOption(key)
             }
         end
     end
-    return key
+    -- A key that the current filters no longer offer must not be stored as
+    -- a text-only label. Award matching would never see that ctx string.
+    return nil
 end
 
 local function GetProfile()
@@ -1590,7 +1656,11 @@ function Integration.RegisterSettingsPage()
                                 end
                                 local items = {}
                                 for _, value in ipairs(cfg.allowedResponses or {}) do
-                                    items[#items + 1] = { id = value, label = value }
+                                    items[#items + 1] = {
+                                        id = value,
+                                        text = value,
+                                        canRemove = true,
+                                    }
                                 end
                                 return items
                             end,
@@ -1627,7 +1697,21 @@ function Integration.RegisterSettingsPage()
                                 return #GetRCResponseOptions() > 0
                             end,
                             options = function()
-                                return GetRCResponseOptions()
+                                local choices = GetRCResponseOptions()
+                                local selected = panel.__sfBisResponseSelected
+                                if type(selected) == "string" then
+                                    local stillOffered = false
+                                    for i = 1, #choices do
+                                        if choices[i].value == selected then
+                                            stillOffered = true
+                                            break
+                                        end
+                                    end
+                                    if not stillOffered then
+                                        panel.__sfBisResponseSelected = nil
+                                    end
+                                end
+                                return choices
                             end,
                             get = function() return panel.__sfBisResponseSelected end,
                             set = function(value) panel.__sfBisResponseSelected = value end,
@@ -1646,7 +1730,19 @@ function Integration.RegisterSettingsPage()
                                     ctx.section:SetMessage("Turn on Record RC Loot Council awards before changing BiS responses.", "error")
                                     return
                                 end
-                                local ok, err = profile:AddRCLootCouncilBisResponse(SelectedBisOption(panel.__sfBisResponseSelected))
+                                local selectedKey = panel.__sfBisResponseSelected
+                                local selected = SelectedBisOption(selectedKey)
+                                if type(selected) ~= "table" then
+                                    panel.__sfBisResponseSelected = nil
+                                    if type(selectedKey) == "string" then
+                                        ctx.section:SetMessage("That RC response is no longer available.", "error")
+                                    else
+                                        ctx.section:SetMessage("Select an RC response first.", "error")
+                                    end
+                                    ctx.pageBuilder:Refresh()
+                                    return
+                                end
+                                local ok, err = profile:AddRCLootCouncilBisResponse(selected)
                                 if not ok then
                                     ctx.section:SetMessage(err or "Could not add BiS response.", "error")
                                     return
@@ -1705,13 +1801,11 @@ function Integration.RegisterSettingsPage()
                                 end
                                 local items = {}
                                 for _, value in ipairs(cfg.bisResponses or {}) do
-                                    local label = value.text or value.key or tostring(value)
-                                    if value.isAwardReason then
-                                        label = string.format("%s [award reason #%s]", label, tostring(value.responseId))
-                                    elseif value.typeCode and value.responseId ~= nil then
-                                        label = string.format("%s [%s #%s]", label, tostring(value.typeCode), tostring(value.responseId))
-                                    end
-                                    items[#items + 1] = { id = value.key or value.text, label = label }
+                                    items[#items + 1] = {
+                                        id = value.key or value.text,
+                                        text = value.text or value.key or tostring(value),
+                                        canRemove = true,
+                                    }
                                 end
                                 return items
                             end,
