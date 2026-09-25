@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.6-beta.1] - 2026-09-25
+
+### Fixed
+- Fix ranged hunter weapons flagged as missing an off hand
+
 ## [1.5.5] - 2026-09-24
 
 ### Changed
