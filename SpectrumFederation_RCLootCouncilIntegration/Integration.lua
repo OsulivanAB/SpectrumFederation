@@ -1326,11 +1326,12 @@ function Integration.AwardReasonHistoryResponseId(entry)
     return AwardReasonHistoryResponseId(entry)
 end
 
--- The Master Looter "Number of buttons" / "Number of reasons" sliders only
--- enable the leading rows. RC still stores the unused rows, including names
--- that were removed from the active set, so the dropdown must not list them.
-local function ActiveSliderCount(profile, key)
-    local count = tonumber(profile and profile[key])
+-- RCLootCouncil v3 stores the active button count on each button group
+-- (`profile.buttons[typeCode].numButtons`). A flat `profile.numButtons` is
+-- only a fallback. Unused rows stay in `profile.responses` up to maxButtons,
+-- including placeholder "ButtonN" text and names that used to be active.
+local function NormalizeSliderCount(count)
+    count = tonumber(count)
     if not count then
         return nil
     end
@@ -1338,6 +1339,41 @@ local function ActiveSliderCount(profile, key)
         count = 0
     end
     return math.floor(count)
+end
+
+local function ActiveButtonCount(profile, typeCode)
+    local buttons = profile and profile.buttons
+    if type(buttons) == "table" then
+        local group = buttons[typeCode]
+        if type(group) == "table" then
+            local nested = NormalizeSliderCount(group.numButtons)
+            if nested ~= nil then
+                return nested
+            end
+        end
+    end
+    return NormalizeSliderCount(profile and profile.numButtons)
+end
+
+-- The default group is always active. Extra groups are listed only when RC
+-- has enabled that button set. Profiles with no enabledButtons table keep
+-- every stored group, which is how older fixtures describe their buttons.
+local function ResponseGroupIsListed(profile, typeCode)
+    if tostring(typeCode) == "default" then
+        return true
+    end
+    local enabled = profile and profile.enabledButtons
+    if type(enabled) ~= "table" then
+        return true
+    end
+    return enabled[typeCode] == true
+end
+
+-- RC pads unused slots as "Button6" / "Button 6" and "Reason 4" / "Reason4".
+local function IsPlaceholderResponseText(text)
+    local lowered = string.lower(strtrim(text))
+    return lowered:match("^button%s*%d+$") ~= nil
+        or lowered:match("^reason%s*%d+$") ~= nil
 end
 
 local function GetRCResponseOptions()
@@ -1348,9 +1384,9 @@ local function GetRCResponseOptions()
             return
         end
         seen[entry.key] = true
-        -- Settings dropdowns render `label`. `value` stays the ctx key used
-        -- for award matching, and `textLabel` is the raw RC response text.
-        local displayLabel = entry.label or entry.text
+        -- Settings dropdowns render `label`. Show only the RC response text.
+        -- `value` stays the ctx key used for award matching.
+        local displayLabel = entry.text
         options[#options + 1] = {
             value = entry.key,
             label = displayLabel,
@@ -1365,24 +1401,26 @@ local function GetRCResponseOptions()
     local db = rc and rc.Getdb and rc:Getdb() or (rc and rc.db)
     local profile = db and (db.profile or db)
     local responses = profile and profile.responses
-    local activeButtons = ActiveSliderCount(profile, "numButtons")
     if type(responses) == "table" then
         for typeCode, group in pairs(responses) do
-            if type(group) == "table" then
+            if type(group) == "table" and ResponseGroupIsListed(profile, typeCode) then
+                local activeButtons = ActiveButtonCount(profile, typeCode)
                 for id, entry in pairs(group) do
                     local numericId = tonumber(id)
                     local withinActiveButtons = (not activeButtons) or (numericId and numericId >= 1 and numericId <= activeButtons)
                     if type(entry) == "table" and numericId and withinActiveButtons then
                         local text = entry.text or entry.label or entry.name
-                        if type(text) == "string" and strtrim(text) ~= "" then
-                            add({
-                                key = string.format("ctx:%s|%s|0", tostring(typeCode), tostring(numericId)),
-                                text = strtrim(text),
-                                label = string.format("%s (%s #%s)", strtrim(text), tostring(typeCode), tostring(numericId)),
-                                typeCode = tostring(typeCode),
-                                responseId = numericId,
-                                isAwardReason = false,
-                            })
+                        if type(text) == "string" then
+                            text = strtrim(text)
+                            if text ~= "" and not IsPlaceholderResponseText(text) then
+                                add({
+                                    key = string.format("ctx:%s|%s|0", tostring(typeCode), tostring(numericId)),
+                                    text = text,
+                                    typeCode = tostring(typeCode),
+                                    responseId = numericId,
+                                    isAwardReason = false,
+                                })
+                            end
                         end
                     end
                 end
@@ -1390,7 +1428,7 @@ local function GetRCResponseOptions()
         end
     end
     local awardReasons = profile and profile.awardReasons
-    local activeReasons = ActiveSliderCount(profile, "numAwardReasons")
+    local activeReasons = NormalizeSliderCount(profile and profile.numAwardReasons)
     if type(awardReasons) == "table" then
         for index, entry in ipairs(awardReasons) do
             if activeReasons and index > activeReasons then
@@ -1399,14 +1437,16 @@ local function GetRCResponseOptions()
             if type(entry) == "table" then
                 local text = entry.text or entry.label
                 local responseId = AwardReasonHistoryResponseId(entry)
-                if type(text) == "string" and strtrim(text) ~= "" and responseId ~= nil then
-                    add({
-                        key = string.format("ctx:awardReason|%s|1", tostring(responseId)),
-                        text = strtrim(text),
-                        label = string.format("%s (award reason #%s)", strtrim(text), tostring(responseId)),
-                        responseId = responseId,
-                        isAwardReason = true,
-                    })
+                if type(text) == "string" and responseId ~= nil then
+                    text = strtrim(text)
+                    if text ~= "" and not IsPlaceholderResponseText(text) then
+                        add({
+                            key = string.format("ctx:awardReason|%s|1", tostring(responseId)),
+                            text = text,
+                            responseId = responseId,
+                            isAwardReason = true,
+                        })
+                    end
                 end
             end
         end
@@ -1733,15 +1773,9 @@ function Integration.RegisterSettingsPage()
                                 end
                                 local items = {}
                                 for _, value in ipairs(cfg.bisResponses or {}) do
-                                    local label = value.text or value.key or tostring(value)
-                                    if value.isAwardReason then
-                                        label = string.format("%s [award reason #%s]", label, tostring(value.responseId))
-                                    elseif value.typeCode and value.responseId ~= nil then
-                                        label = string.format("%s [%s #%s]", label, tostring(value.typeCode), tostring(value.responseId))
-                                    end
                                     items[#items + 1] = {
                                         id = value.key or value.text,
-                                        text = label,
+                                        text = value.text or value.key or tostring(value),
                                         canRemove = true,
                                     }
                                 end

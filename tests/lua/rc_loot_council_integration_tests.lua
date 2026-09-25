@@ -1450,6 +1450,15 @@ function testRcSettingsControlContract()
         return nil
     end
 
+    local function findRowById(items, id)
+        for i = 1, #(items or {}) do
+            if items[i].id == id then
+                return items[i]
+            end
+        end
+        return nil
+    end
+
     local bisSec = findSection(capturedDef, "bisResponses")
     local addFromRc = findItem(bisSec, "Add from RC Loot Council")
     local addBis = findItem(bisSec, "Add BiS response")
@@ -1496,18 +1505,18 @@ function testRcSettingsControlContract()
         assertTrue(shown ~= tostring(opt.value), "dropdown shows the readable label rather than the value")
         assertEq(opt.label, shown, "shared dropdown contract reads opt.label")
         if opt.typeCode == "default" and opt.responseId == 1 and opt.textLabel == "Need" then
-            assertEq(shown, "Need (default #1)", "default Need is disambiguated in the dropdown")
+            assertEq(shown, "Need", "dropdown shows the raw default response text")
             assertEq(opt.value, "ctx:default|1|0", "default Need keeps its contextual value")
             sawDefaultNeedLabel = true
         end
         if opt.typeCode == "WEAPON" and opt.responseId == 1 and opt.textLabel == "Need" then
-            assertEq(shown, "Need (WEAPON #1)", "weapon Need stays distinct from default Need")
+            assertEq(shown, "Need", "dropdown shows the raw weapon response text")
             assertEq(opt.value, "ctx:WEAPON|1|0", "weapon Need keeps its contextual value")
             weaponNeedValue = opt.value
             sawWeaponNeedLabel = true
         end
         if opt.isAwardReason and opt.responseId == 5 and opt.textLabel == "Disenchant" then
-            assertEq(shown, "Disenchant (award reason #5)", "award reason uses a readable dropdown label")
+            assertEq(shown, "Disenchant", "award reason dropdown shows the raw reason text")
             assertEq(opt.value, "ctx:awardReason|5|1", "award reason keeps its contextual value")
             disenchantValue = opt.value
             sawDisenchantLabel = true
@@ -1577,10 +1586,98 @@ function testRcSettingsControlContract()
         Getdb = function()
             return {
                 profile = {
+                    numButtons = 10,
+                    numAwardReasons = 10,
+                    buttons = {
+                        default = { numButtons = 4 },
+                        WEAPON = { numButtons = 4 },
+                    },
+                    enabledButtons = {
+                        WEAPON = false,
+                    },
+                    responses = {
+                        default = {
+                            [1] = { text = "Need" },
+                            [2] = { text = "Want" },
+                            [3] = { text = "Alt Spec" },
+                            [4] = { text = "Button4" },
+                            [5] = { text = "MOG BABY!" },
+                            [10] = { text = "Button10" },
+                        },
+                        WEAPON = {
+                            [1] = { text = "Need" },
+                        },
+                    },
+                    awardReasons = {
+                        { text = "Disenchant", sort = 401 },
+                        { text = "Reason4", sort = 404 },
+                        { text = "Reason 7", sort = 407 },
+                    },
+                },
+            }
+        end,
+    }
+    local realFieldOptions = Integration.GetRCResponseOptions()
+    assertEq(#realFieldOptions, 4, "group slider and placeholder text leave three buttons and one reason")
+    assertTrue(optionTextSeen(realFieldOptions, "Need"), "active default button stays when the group slider is used")
+    assertTrue(optionTextSeen(realFieldOptions, "Want"), "second active default button stays")
+    assertTrue(optionTextSeen(realFieldOptions, "Alt Spec"), "third active default button stays")
+    assertTrue(optionTextSeen(realFieldOptions, "Disenchant"), "active award reason stays when the reason slider is high")
+    assertFalse(optionTextSeen(realFieldOptions, "Button4"), "placeholder ButtonN text inside the slider is hidden")
+    assertFalse(optionTextSeen(realFieldOptions, "MOG BABY!"), "rows past buttons[type].numButtons stay hidden when profile.numButtons is higher")
+    assertFalse(optionTextSeen(realFieldOptions, "Button10"), "padded ButtonN rows stay hidden when the group slider is lower")
+    assertFalse(optionTextSeen(realFieldOptions, "Reason4"), "placeholder ReasonN text is hidden inside the reason slider")
+    assertFalse(optionTextSeen(realFieldOptions, "Reason 7"), "spaced Reason N text is hidden inside the reason slider")
+    local sawWeaponFromRealField = false
+    for i = 1, #realFieldOptions do
+        if realFieldOptions[i].typeCode == "WEAPON" then
+            sawWeaponFromRealField = true
+        end
+    end
+    assertFalse(sawWeaponFromRealField, "a disabled extra button group is not listed")
+
+    _G.RCLootCouncil = {
+        Getdb = function()
+            return {
+                profile = {
+                    numButtons = 10,
+                    buttons = {
+                        default = { numButtons = 1 },
+                        WEAPON = { numButtons = 1 },
+                    },
+                    enabledButtons = {
+                        WEAPON = true,
+                    },
+                    responses = {
+                        default = {
+                            [1] = { text = "Need" },
+                            [2] = { text = "Want" },
+                        },
+                        WEAPON = {
+                            [1] = { text = "Greed" },
+                            [2] = { text = "Offspec" },
+                        },
+                    },
+                },
+            }
+        end,
+    }
+    local perGroupOptions = Integration.GetRCResponseOptions()
+    assertEq(#perGroupOptions, 2, "each enabled group uses its own numButtons")
+    assertTrue(optionTextSeen(perGroupOptions, "Need"), "default group keeps its active button")
+    assertTrue(optionTextSeen(perGroupOptions, "Greed"), "an enabled extra group keeps its active button")
+    assertFalse(optionTextSeen(perGroupOptions, "Want"), "default rows past that group's slider are hidden")
+    assertFalse(optionTextSeen(perGroupOptions, "Offspec"), "extra-group rows past that group's slider are hidden")
+
+    _G.RCLootCouncil = {
+        Getdb = function()
+            return {
+                profile = {
                     responses = {
                         default = {
                             [1] = { text = "Need" },
                             [5] = { text = "MOG BABY!" },
+                            [10] = { text = "Button 10" },
                         },
                     },
                     awardReasons = {
@@ -1593,7 +1690,9 @@ function testRcSettingsControlContract()
     }
     local storedRows = Integration.GetRCResponseOptions()
     assertTrue(optionTextSeen(storedRows, "MOG BABY!"), "without a button slider, stored response rows stay available")
-    assertTrue(optionTextSeen(storedRows, "Reason 4"), "without a reason slider, stored award reasons stay available")
+    assertTrue(optionTextSeen(storedRows, "Disenchant"), "without a reason slider, named award reasons stay available")
+    assertFalse(optionTextSeen(storedRows, "Button 10"), "placeholder Button N text is hidden even without a button slider")
+    assertFalse(optionTextSeen(storedRows, "Reason 4"), "placeholder Reason N text is hidden even without a reason slider")
     _G.RCLootCouncil = limitedRc
 
     assertTrue(settingsProfile:AddRCLootCouncilBisResponse("Need"), "stored text-only Need is already configured")
@@ -1604,10 +1703,12 @@ function testRcSettingsControlContract()
         isAwardReason = false,
     }), "stored contextual Need is already configured")
     local seededRows = bisList.getItems()
-    local seededText = findRowByText(seededRows, "Need")
-    local seededDefault = findRowByText(seededRows, "Need [default #1]")
+    local seededText = findRowById(seededRows, "text:need")
+    local seededDefault = findRowById(seededRows, "ctx:default|1|0")
     assertTrue(seededText ~= nil, "previously stored text-only BiS response is visible")
     assertTrue(seededDefault ~= nil, "previously stored contextual BiS response is visible")
+    assertEq(seededText.text, "Need", "text-only BiS row shows the stored label")
+    assertEq(seededDefault.text, "Need", "contextual BiS row shows the raw response text")
     assertTrue(seededText.canRemove and seededDefault.canRemove, "stored BiS responses expose remove controls")
     assertEq(seededText.id, "text:need", "text-only row id is the stored text key")
     assertEq(seededDefault.id, "ctx:default|1|0", "contextual row id preserves the stored key")
@@ -1649,8 +1750,9 @@ function testRcSettingsControlContract()
     uiRefresh = 0
     addFromRc.onIconClick(uiCtx)
     assertEq(uiRefresh, 1, "dropdown add refreshes the settings page")
-    local weaponRow = findRowByText(bisList.getItems(), "Need [WEAPON #1]")
+    local weaponRow = findRowById(bisList.getItems(), "ctx:WEAPON|1|0")
     assertTrue(weaponRow ~= nil and weaponRow.canRemove, "dropdown-added contextual response is visible and removable")
+    assertEq(weaponRow.text, "Need", "dropdown add lists the raw response text")
     assertEq(#bisList.getItems(), beforeWeapon + 1, "dropdown add appends one visible row")
     local storedWeapon
     for _, entry in ipairs(settingsProfile:GetRCLootCouncilIntegrationConfig().bisResponses) do
@@ -1677,16 +1779,17 @@ function testRcSettingsControlContract()
     assertEq(storedDisenchant.responseId, 5, "award-reason responseId stays sort-400")
     assertTrue(storedDisenchant.isAwardReason, "award-reason flag stays set")
     assertEq(storedDisenchant.typeCode, nil, "award-reason storage does not invent a typeCode")
-    local disenchantRow = findRowByText(bisList.getItems(), "Disenchant [award reason #5]")
+    local disenchantRow = findRowById(bisList.getItems(), "ctx:awardReason|5|1")
     assertTrue(disenchantRow ~= nil and disenchantRow.canRemove, "award-reason BiS row is visible and removable")
+    assertEq(disenchantRow.text, "Disenchant", "award-reason row shows the raw reason text")
 
     uiRefresh = 0
     bisList.onRemove(uiCtx, greedRow)
     assertEq(uiRefresh, 1, "removing a BiS response refreshes the settings page")
     assertEq(findRowByText(bisList.getItems(), "Greed"), nil, "removed BiS response disappears immediately")
-    assertTrue(findRowByText(bisList.getItems(), "Need") ~= nil, "removing one response leaves the text-only entry")
-    assertTrue(findRowByText(bisList.getItems(), "Need [default #1]") ~= nil, "removing one response leaves the other Need context")
-    assertTrue(findRowByText(bisList.getItems(), "Need [WEAPON #1]") ~= nil, "removing one response leaves the weapon Need")
+    assertEq(findRowById(bisList.getItems(), "text:need").text, "Need", "removing one response leaves the text-only entry")
+    assertEq(findRowById(bisList.getItems(), "ctx:default|1|0").text, "Need", "removing one response leaves the other Need context")
+    assertEq(findRowById(bisList.getItems(), "ctx:WEAPON|1|0").text, "Need", "removing one response leaves the weapon Need")
 
     local beforeOffspec = #listItem.getItems()
     assertTrue(settingsProfile:AddRCLootCouncilAllowedResponse("Offspec"), "admin can add another allowed type")
