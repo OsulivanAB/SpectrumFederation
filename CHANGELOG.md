@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.6-beta.6] - 2026-09-25
+
+### Added
+- Add a read-only TradeSkillMaster adapter
+
 ## [1.5.6-beta.4] - 2026-09-25
 
 ### Fixed
