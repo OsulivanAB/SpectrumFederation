@@ -4067,6 +4067,9 @@ function LootProfile:SetOwner(newOwner)
     end
 end
 
+-- Runtime-only notice latch. Kept off the profile table so it is not saved.
+local unsyncedChangeNoted = {}
+
 -- Function to add a loot log entry to this profile
 -- @param LootLog lootLog Instance of LootLog to add
 -- @return boolean success
@@ -4089,9 +4092,17 @@ function LootProfile:AddLootLog(lootLog, opts)
         then
             local broadcastOk, broadcastErr = SF.LootHelperSync:BroadcastNewLog(self:GetProfileId(), lootLog:ToTable())
             if not broadcastOk then
-                if SF.PrintWarning then
-                    SF:PrintWarning("Change saved locally but not synced to raid: " .. tostring(broadcastErr or "unknown error"))
+                local profileId = self.GetProfileId and self:GetProfileId() or ""
+                unsyncedChangeNoted[profileId] = unsyncedChangeNoted[profileId] or false
+                if not unsyncedChangeNoted[profileId] and SF.PrintWarning then
+                    unsyncedChangeNoted[profileId] = true
+                    SF:PrintWarning("Change saved locally, but it could not be synchronized to the raid.")
                 end
+                if SF.Debug then
+                    SF.Debug:Warn("LootProfile", "Local change was not broadcast: %s", tostring(broadcastErr or "unknown error"))
+                end
+            elseif self.GetProfileId then
+                unsyncedChangeNoted[self:GetProfileId() or ""] = nil
             end
         end
     end

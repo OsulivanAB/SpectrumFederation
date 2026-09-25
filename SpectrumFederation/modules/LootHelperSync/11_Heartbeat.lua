@@ -210,7 +210,7 @@ function Sync:HandleSessionEnd(sender, payload)
     self:_ResetSessionState("remote_end:" .. tostring(reason or "unknown"))
 
     if SF.PrintInfo then
-        SF:PrintInfo("Loot Helper session ended by coordinator (%s).", tostring(reason or "no reason given"))
+        SF:PrintInfo(("Loot Helper session ended by coordinator (%s)."):format(tostring(reason or "no reason given")))
     end
 end
 
@@ -300,28 +300,33 @@ function Sync:GetRequestTargets(helpers, coordinator, opts)
     return targets
 end
 
--- Function Warn once while this session has no profile or log route.
--- The same empty-target condition can be observed from every NEW_LOG or repair pass.
--- @param flag string State field holding the session id already warned
+-- Function Record once per session that profile or log sync has no route.
+-- Retries keep running. Only the diagnostic is deduplicated, and it stays in debug.
+-- @param flag string State field holding the session id already recorded
 -- @param message string
+-- @param reason string|nil Caller reason
 -- @return nil
-function Sync:_WarnMissingRouteOnce(flag, message)
+function Sync:_NoteMissingRoute(flag, message, reason)
     local sessionId = self.state and self.state.sessionId
+    local detail = tostring(message)
+        .. " (sessionId=" .. tostring(sessionId)
+        .. " profileId=" .. tostring(self.state and self.state.profileId)
+        .. " reason=" .. tostring(reason) .. ")"
     if type(flag) ~= "string" or type(sessionId) ~= "string" or sessionId == "" then
-        if SF.PrintWarning and type(message) == "string" then
-            SF:PrintWarning(message)
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "%s", detail)
         end
         return
     end
     if self.state[flag] == sessionId then
         if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Suppressed repeat missing-route warning: %s", tostring(message))
+            SF.Debug:Verbose("SYNC", "Suppressed repeat missing-route diagnostic: %s", tostring(message))
         end
         return
     end
     self.state[flag] = sessionId
-    if SF.PrintWarning and type(message) == "string" then
-        SF:PrintWarning(message)
+    if SF.Debug then
+        SF.Debug:Warn("SYNC", "%s", detail)
     end
 end
 
@@ -343,15 +348,22 @@ function Sync:RequestProfileSnapshot(reason)
     local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
         or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
     if not targets or #targets == 0 then
-        self:_WarnMissingRouteOnce("_noProfileTargetWarnedFor", "Cannot request profile: no targets available")
+        self:_NoteMissingRoute("_noProfileTargetWarnedFor", "Cannot request profile: no targets available", reason)
+        local profileMissing = not (self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId))
+        if profileMissing and self._RememberPendingProfileSnapshot then
+            self:_RememberPendingProfileSnapshot(reason)
+        end
         return false
     end
     self.state._noProfileTargetWarnedFor = nil
+    self.state.pendingProfileSnapshot = nil
 
     local requestId = self:NewRequestId()
     local ok = self:RegisterRequest(requestId, "NEED_PROFILE", targets[1], {
         sessionId   = self.state.sessionId,
         targets     = targets,  -- fallback list
+        reason      = reason,
+        userInitiated = self.state._userInitiatedSync == true,
     })
 
     if ok then
@@ -419,7 +431,31 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
             local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets(targetOpts))
                 or self:GetRequestTargets(self.state.helpers, self.state.coordinator, targetOpts)
             if not targets or #targets == 0 then
-                self:_WarnMissingRouteOnce("_noLogTargetWarnedFor", "Cannot request missing logs: no targets available")
+                self:_NoteMissingRoute("_noLogTargetWarnedFor", "Cannot request missing logs: no targets available", reason)
+                if opts.backgroundRepair == true then
+                    return false, "no_targets"
+                end
+                if self.QueueRepairRanges then
+                    local rest = {}
+                    for j = i, #missingRanges do
+                        local candidate = missingRanges[j]
+                        if type(candidate) == "table"
+                            and type(candidate.author) == "string"
+                            and type(candidate.fromCounter) == "number"
+                            and type(candidate.toCounter) == "number"
+                        then
+                            rest[#rest + 1] = candidate
+                        end
+                        if #rest >= maxRanges then break end
+                    end
+                    if #rest > 0 then
+                        self:QueueRepairRanges(self.state.profileId, rest, {
+                            mode = "missing",
+                            reason = reason or "no-route",
+                            preferredTarget = preferredTarget,
+                        })
+                    end
+                end
                 return count > 0
             end
             self.state._noLogTargetWarnedFor = nil
@@ -437,6 +473,7 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
                 reason = reason,
                 exactAuthor = exactAuthor,
                 preferredTarget = preferredTarget,
+                userInitiated = self.state._userInitiatedSync == true,
             }))
 
             if ok then

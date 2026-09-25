@@ -444,14 +444,20 @@ function Sync:_FailRequest(req, reason)
         end
     end
 
-    if SF.PrintWarning and req.meta and req.meta.backgroundRepair ~= true and not requeued then
-        local guidance = "Synchronization request did not complete."
-        if req.kind == "NEED_PROFILE" then
-            guidance = "Profile sync is still in progress; keep raid session active and it will retry automatically."
-        elseif req.kind == "NEED_LOGS" then
-            guidance = "Log sync is still in progress; totals may be temporarily incomplete."
+    if req.meta and req.meta.userInitiated == true and req.meta.backgroundRepair ~= true and not requeued and SF.PrintWarning then
+        local kind = tostring(req.kind or "SYNC")
+        local sessionId = self.state and self.state.sessionId
+        self.state._userSyncFailureNoted = self.state._userSyncFailureNoted or {}
+        if self.state._userSyncFailureNoted[kind] ~= sessionId then
+            self.state._userSyncFailureNoted[kind] = sessionId
+            local guidance = "Synchronization did not finish. It will retry while the session stays active."
+            if kind == "NEED_PROFILE" then
+                guidance = "Profile sync did not finish. Keep the raid session active and it will retry automatically."
+            elseif kind == "NEED_LOGS" then
+                guidance = "Log sync did not finish. Totals may stay incomplete until synchronization retries."
+            end
+            SF:PrintWarning(guidance)
         end
-        SF:PrintWarning(("Sync request failed (%s). %s"):format(tostring(reason or "unknown"), guidance))
     end
 
     if type(self.ConsiderIdentityAdminSideEffects) == "function" then
@@ -485,8 +491,8 @@ function Sync:RegisterRequest(requestId, kind, target, meta)
     local n = 0
     for _ in pairs(self.state.requests) do n = n + 1 end
     if n >= maxOut then
-        if SF.PrintWarning then
-            SF:PrintWarning(("Too many outstanding requests (%d/%d); dropping %s"):format(n, maxOut, tostring(requestId)))
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Too many outstanding requests (%d/%d); dropping %s", n, maxOut, tostring(requestId))
         end
         return false
     end

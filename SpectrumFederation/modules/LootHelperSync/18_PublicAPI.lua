@@ -125,6 +125,11 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._profileReqInFlight = nil
     self.state._noProfileTargetWarnedFor = nil
     self.state._noLogTargetWarnedFor = nil
+    self.state._noIntegrityTargetWarnedFor = nil
+    self.state.pendingProfileSnapshot = nil
+    self.state._userSyncFailureNoted = nil
+    self.state._userInitiatedSync = nil
+    self.state._diagOnce = nil
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
@@ -456,7 +461,9 @@ function Sync:RequestManualSync(reason)
 
     self.state._sentJoinStatusForSessionId = nil
     self.state._sentJoinStatusType = nil
+    self.state._userInitiatedSync = true
     self:SendJoinStatus()
+    self.state._userInitiatedSync = nil
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Manual sync requested with coordinator (profileId=%s, outcome=%s, reason=%s)",
@@ -733,7 +740,9 @@ function Sync:StartSession(profileId, opts)
 
     local ok, why = self:CanSelfCoordinate(profileId)
     if not ok then
-        if SF.PrintError then SF:PrintError("Cannot start session: %s", tostring(why or "unknown reason")) end
+        if SF.PrintError then
+            SF:PrintError(("Cannot start session: %s"):format(tostring(why or "unknown reason")))
+        end
         return nil
     end
 
@@ -885,6 +894,11 @@ function Sync:_ResetSessionState(reason)
     self.state._profileReqInFlight = nil
     self.state._noProfileTargetWarnedFor = nil
     self.state._noLogTargetWarnedFor = nil
+    self.state._noIntegrityTargetWarnedFor = nil
+    self.state.pendingProfileSnapshot = nil
+    self.state._userSyncFailureNoted = nil
+    self.state._userInitiatedSync = nil
+    self.state._diagOnce = nil
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
@@ -1010,7 +1024,7 @@ function Sync:EndSession(reason, broadcast)
     self:_ResetSessionState("local_end" .. tostring(reason))
 
     if SF.PrintInfo then
-        SF:PrintInfo("Loot Helper session ended (%s).", tostring(reason))
+        SF:PrintInfo(("Loot Helper session ended (%s)."):format(tostring(reason)))
     end
 
     return true
@@ -1047,7 +1061,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
 
     local ok, why = self:CanSelfCoordinate(profileId)
     if not ok then
-        if SF.PrintError then SF:PrintError("Cannot takeover session: %s", tostring(why or "unknown reason")) end
+        if SF.PrintError then
+            SF:PrintError(("Cannot takeover session: %s"):format(tostring(why or "unknown reason")))
+        end
         return false
     end
 

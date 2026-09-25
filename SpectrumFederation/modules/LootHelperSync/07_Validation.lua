@@ -607,6 +607,12 @@ function Sync:ApplyAdvertisedHelpers(helpers, reason)
     if changed and self._RefreshOutstandingRequestTargets then
         self:_RefreshOutstandingRequestTargets()
     end
+    if changed and self._ExpediteNoRouteSynchronization then
+        local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
+        if type(routes) == "table" and #routes > 0 then
+            self:_ExpediteNoRouteSynchronization("helpers_updated")
+        end
+    end
     if changed and SF.Debug then
         SF.Debug:Info("SYNC", "Helper routing updated (%s, count=%d)", tostring(reason or "update"), #filtered)
     end
@@ -1822,8 +1828,8 @@ function Sync:_NoteResponseKindMismatch(req, sender, message)
         end
         req.kindMismatchWarned[key] = true
     end
-    if SF.PrintWarning and type(message) == "string" and message ~= "" then
-        SF:PrintWarning(message)
+    if SF.Debug and type(message) == "string" and message ~= "" then
+        SF.Debug:Warn("SYNC", "%s", message)
     end
 end
 
@@ -1869,8 +1875,34 @@ function Sync:_NoteUnprovenCatchUp(req, sender, message)
         return
     end
     self.state._unprovenCatchUpWarned[key] = true
-    if SF.PrintWarning and type(message) == "string" and message ~= "" then
-        SF:PrintWarning(message)
+    if SF.Debug and type(message) == "string" and message ~= "" then
+        SF.Debug:Warn("SYNC", "%s", message)
+    end
+end
+
+-- Function Record one rejection diagnostic per session, sender, and code.
+-- Repeats stay silent so packet storms do not flood debug or chat.
+-- @param code string Stable rejection code
+-- @param sender string
+-- @param message string
+-- @return nil
+function Sync:_DebugDiagOnce(code, sender, message)
+    if type(message) ~= "string" or message == "" then return end
+    if not self.state then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "%s", message)
+        end
+        return
+    end
+    local sessionId = self.state.sessionId or ""
+    local key = tostring(code) .. "\0" .. tostring(sessionId) .. "\0" .. tostring(sender)
+    self.state._diagOnce = self.state._diagOnce or {}
+    if self.state._diagOnce[key] then
+        return
+    end
+    self.state._diagOnce[key] = true
+    if SF.Debug then
+        SF.Debug:Warn("SYNC", "%s", message)
     end
 end
 

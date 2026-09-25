@@ -167,8 +167,8 @@ function Sync:CreateProfileFromMeta(profileMeta)
     if SF.LootProfile.ValidateMeta then
         local ok, err = SF.LootProfile.ValidateMeta(profileMeta)
         if not ok then
-            if SF.PrintWarning then
-                SF:PrintWarning(("CreateProfileFromMeta: invalid meta: %s"):format(err or "unknown"))
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "CreateProfileFromMeta: invalid meta: %s", tostring(err or "unknown"))
             end
             return nil
         end
@@ -3073,7 +3073,13 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
         -- still authorized instead of a revoked or unproven coordinator.
         local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
         if type(routes) ~= "table" or #routes == 0 then
-            return false
+            if self._NoteMissingRoute then
+                self:_NoteMissingRoute("_noIntegrityTargetWarnedFor", "Cannot request integrity repair: no targets available", reason)
+            elseif SF.Debug then
+                SF.Debug:Warn("SYNC", "Cannot request integrity repair: no targets available (profileId=%s reason=%s)",
+                    tostring(profileId), tostring(reason))
+            end
+            return false, "no_targets"
         end
         targets = routes
     end

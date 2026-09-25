@@ -415,8 +415,9 @@ function Sync:_WarnUnauthorizedNewLog(sender, profileId)
         return
     end
     self.state._newLogUnauthorizedWarned[key] = true
-    if SF.PrintWarning then
-        SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not an admin."):format(tostring(sender), tostring(profileId)))
+    if SF.Debug then
+        SF.Debug:Warn("SYNC", "Ignoring NEW_LOG from %s for profile %s: not an admin.",
+            tostring(sender), tostring(profileId))
     end
 end
 
@@ -512,8 +513,9 @@ function Sync:HandleNewLog(sender, payload)
             }))
         end
         if not lootLog then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: invalid relationship log."):format(tostring(sender), tostring(profileId)))
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "Ignoring NEW_LOG from %s for profile %s: invalid relationship log.",
+                    tostring(sender), tostring(profileId))
             end
             return
         end
@@ -524,15 +526,17 @@ function Sync:HandleNewLog(sender, payload)
         eventData = GetLogEventData(logTable)
         memberId = eventData.member or memberId
         if not self:_LiveRelationshipDomainValid(profile, eventType, eventData, logTable) then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: invalid relationship payload."):format(tostring(sender), tostring(profileId)))
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "Ignoring NEW_LOG from %s for profile %s: invalid relationship payload.",
+                    tostring(sender), tostring(profileId))
             end
             return
         end
         local logAuthor = self:_ExtractAuthorCounter(logTable)
         if not self:_SamePlayer(sender, logAuthor) then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: relationship author must match sender."):format(tostring(sender), tostring(profileId)))
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "Ignoring NEW_LOG from %s for profile %s: relationship author must match sender.",
+                    tostring(sender), tostring(profileId))
             end
             return
         end
@@ -561,8 +565,9 @@ function Sync:HandleNewLog(sender, payload)
 
     if eventType == types.LOOT_MODE_CHANGE then
         if not SenderIsEffectiveOwner(profile, sender) then
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring NEW_LOG from %s for profile %s: not the owner."):format(tostring(sender), tostring(profileId)))
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "Ignoring NEW_LOG from %s for profile %s: not the owner.",
+                    tostring(sender), tostring(profileId))
             end
             return
         end
