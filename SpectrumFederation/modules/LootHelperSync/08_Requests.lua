@@ -446,16 +446,18 @@ function Sync:_FailRequest(req, reason)
 
     if req.meta and req.meta.userInitiated == true and req.meta.backgroundRepair ~= true and not requeued and SF.PrintWarning then
         local kind = tostring(req.kind or "SYNC")
+        -- NEED_LOGS and LOG_REQ are both log catch-up. One manual sync can create both.
+        local warningKind = (kind == "NEED_LOGS" or kind == "LOG_REQ") and "LOG_SYNC" or kind
         local sessionId = self.state and self.state.sessionId
         local generation = tonumber(req.meta.userSyncGeneration)
         local latchValue = generation or sessionId
         self.state._userSyncFailureNoted = self.state._userSyncFailureNoted or {}
-        if latchValue ~= nil and self.state._userSyncFailureNoted[kind] ~= latchValue then
-            self.state._userSyncFailureNoted[kind] = latchValue
+        if latchValue ~= nil and self.state._userSyncFailureNoted[warningKind] ~= latchValue then
+            self.state._userSyncFailureNoted[warningKind] = latchValue
             local guidance = "Synchronization did not finish. It will retry while the session stays active."
             if kind == "NEED_PROFILE" then
                 guidance = "Profile sync did not finish. Keep the raid session active and it will retry automatically."
-            elseif kind == "NEED_LOGS" then
+            elseif warningKind == "LOG_SYNC" then
                 guidance = "Log sync did not finish. Totals may stay incomplete until synchronization retries."
             end
             SF:PrintWarning(guidance)

@@ -5436,6 +5436,52 @@ Sync.SendJoinStatus = savedSend
 end)()
 
 ;(function()
+reset(OWNER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { COORD }
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local savedMissing = Sync.ComputeMissingLogRequests
+local savedMismatch = Sync.ComputeWindowMismatchRequests
+local savedSend = Sync.SendJoinStatus
+Sync.SendJoinStatus = productionSendJoinStatus
+Sync.ComputeMissingLogRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 3, toCounter = 4 },
+    }
+end
+Sync.ComputeWindowMismatchRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 8, toCounter = 9 },
+    }
+end
+local ok, status = Sync:RequestManualSync("mixed-log")
+assertEq(ok, true, "a mixed log sync can start")
+assertEq(status, "log_sync_requested", "a mixed log sync is one user action")
+local needLogs = nil
+local logReq = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.kind == "NEED_LOGS" and req.meta and req.meta.integrityRepair ~= true then
+        needLogs = req
+    elseif req.kind == "LOG_REQ" and req.meta and req.meta.integrityRepair == true then
+        logReq = req
+    end
+end
+assertTrue(needLogs ~= nil, "ordinary missing logs stay NEED_LOGS")
+assertTrue(logReq ~= nil, "an admin integrity repair uses LOG_REQ")
+Sync:_FailRequest(needLogs, "timeout")
+Sync:_FailRequest(logReq, "timeout")
+assertEq(warningCount("Log sync did not finish"), 1, "mixed log kinds share one manual warning")
+assertEq(warningCount("Synchronization did not finish"), 0, "an integrity failure uses the log-sync guidance")
+Sync.ComputeMissingLogRequests = savedMissing
+Sync.ComputeWindowMismatchRequests = savedMismatch
+Sync.SendJoinStatus = savedSend
+end)()
+
+;(function()
 reset(MEMBER)
 setAdmins({ COORD, OWNER })
 Sync.state.helpers = { COORD }
