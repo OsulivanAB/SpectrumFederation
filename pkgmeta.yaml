@@ -1,10 +1,15 @@
 package-as: SpectrumFederation
 enable-nolib-creation: no
 
-# CurseForge / WowUp use this file. After the packager copies the repo into
-# SpectrumFederation/, lift every shipped addon to the zip root. Without the
-# child moves, optional addons stay nested inside the parent folder and are
-# never installed as separate AddOns.
+# Git packagers and repository package validation use this file. After a
+# packager copies the repo into SpectrumFederation/, lift every shipped addon
+# to the zip root. Without the child moves, optional addons stay nested inside
+# the parent folder and are never installed as separate AddOns.
+#
+# CurseForge releases are uploaded directly by publish_release.py as the
+# canonical zip. After automatic packaging is disabled, CurseForge no longer
+# builds from this file. Keep it: validation still requires move-folders, and
+# WowUp's git packaging path still reads it.
 move-folders:
   SpectrumFederation/SpectrumFederation: SpectrumFederation
   SpectrumFederation/SpectrumFederation_CursedSurgeTracker: SpectrumFederation_CursedSurgeTracker

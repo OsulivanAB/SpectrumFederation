@@ -99,11 +99,13 @@ def is_changelog_path(path):
 
 
 def is_release_packaging_path(path):
-    """Return True for CurseForge/WowUp git-packaging metadata.
+    """Return True for git-packaging metadata that can change installed layout.
 
-    `pkgmeta.yaml` does not ship inside the GitHub/Wago zip, but those
-    installers rebuild from git using this file. A standalone change must
-    still validate and publish so CurseForge receives a new package.
+    `pkgmeta.yaml` does not ship inside the canonical release zip. Package
+    validation still requires its move-folders map, and WowUp's git packaging
+    path still reads it. CurseForge releases are uploaded directly and do not
+    rebuild this file, but a pkgmeta change can still alter what a git packager
+    installs, so it remains release-relevant.
     """
     return normalize_repo_path(path) == PKGMETA_PATH
 
