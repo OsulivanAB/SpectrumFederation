@@ -5376,6 +5376,9 @@ reset(MEMBER)
 setAdmins({ COORD, OWNER })
 Sync.state.helpers = { COORD }
 Sync.state.isCoordinator = false
+profile.ComputeAuthorMax = function()
+    return {}
+end
 local savedMissing = Sync.ComputeMissingLogRequests
 local savedMismatch = Sync.ComputeWindowMismatchRequests
 local savedSend = Sync.SendJoinStatus
