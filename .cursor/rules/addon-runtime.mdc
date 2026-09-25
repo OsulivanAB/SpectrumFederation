@@ -14,6 +14,7 @@ alwaysApply: false
 - Proactively evaluate user-visible output for repetition/spam risk, especially on recurring paths (heartbeats, timers, sync, retries). One useful notification is information; repeated identical notifications are spam. Full guidance: `SpectrumFederation/AGENTS.md` (User-visible messaging → Anti-spam and repetition).
 - Guard protected UI changes with `InCombatLockdown()` when relevant and prefer `hooksecurefunc` over replacing Blizzard functions.
 - Check `locale/enUS.lua` before introducing new user-facing strings.
+- TradeSkillMaster reads go through `SF.TSM` (`modules/Integrations/TSM.lua`). Follow `.cursor/skills/tsm-integration/SKILL.md` and do not call `TSM_API` from feature code.
 - Inspect existing architecture, callers, and lifecycle before assuming a runtime change is local or safe.
 
 ## Client Stability

@@ -46,6 +46,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Run Interface badge formatting tests: `python -m pytest tests/test_interface_badge.py`
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
 - Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
+- Run TradeSkillMaster adapter tests (production Lua via lua5.1): `python -m pytest tests/test_tsm_integration.py`
 - Run Loot Helper window tests (production Lua via lua5.1): `python -m pytest tests/test_loot_helper_window.py`
 - Run Sync protocol warning-dedupe tests (production Lua via lua5.1): `python -m pytest tests/test_sync_protocol.py`
 - Run RC Loot Council Integration tests (production Lua via lua5.1): `python -m pytest tests/test_rc_loot_council_integration.py`
@@ -72,6 +73,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Runtime freeze, hang, callback, layout, timer, queue, inspect, or sync work: read the Client Stability section in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc` before changing the code.
 - Settings work: start with `SpectrumFederation/modules/Settings/` and `SpectrumFederation/modules/UI/Settings/`, then read `docs/development/settings-ui/`. Shared Settings/UI infrastructure (`Section`, `PageBuilder`, Controls, ScrollFrames, layout helpers, shared refresh) needs extra re-entrancy and consumer review.
 - Mouse Tracer work: start with `SpectrumFederation/modules/MouseTracer/` and `docs/development/mouse-tracer.md`.
+- TradeSkillMaster reads: use `SF.TSM` in `SpectrumFederation/modules/Integrations/TSM.lua` and follow `.cursor/skills/tsm-integration/SKILL.md`. Do not call `TSM_API` from feature code.
 - Loot Helper or sync work: inspect `SpectrumFederation/modules/LootHelper/`, `SpectrumFederation/modules/LootHelperSync/`, and the related docs under `docs/development/loot-helper/`.
 - Workflow or CI script work: inspect the matching file under `.github/workflows/` or `.github/scripts/` first, then use `.github/instructions/` as supplemental guidance.
 - Docs work: start with `mkdocs.yml` for nav/build behavior, then edit files in `docs/`.
@@ -88,6 +90,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - README Interface badge formatting or `blizzard_api.py` display conversion: also run `python -m pytest tests/test_interface_badge.py`
 - Settings navigation or Registry helpers: also run `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer constants or trail engine: also run `python -m pytest tests/test_mouse_tracer.py`
+- TradeSkillMaster adapter: also run `python -m pytest tests/test_tsm_integration.py`
 - Loot Helper window minimize/positioning: also run `python -m pytest tests/test_loot_helper_window.py`
 - Sync protocol NACK/warning throttling: also run `python -m pytest tests/test_sync_protocol.py`
 - RC Loot Council Integration child addon: also run `python -m pytest tests/test_rc_loot_council_integration.py`
