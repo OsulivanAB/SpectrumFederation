@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib import error as urllib_error
@@ -73,7 +74,28 @@ CURSEFORGE_DUPLICATE_PHRASES = (
     "same file",
 )
 # Names that are not the Retail release track, even when they contain "retail".
-CURSEFORGE_NON_RETAIL_TYPE_MARKERS = ("classic", "ptr", "beta", "arena", "season")
+CURSEFORGE_NON_RETAIL_TYPE_MARKERS = (
+    "classic",
+    "ptr",
+    "public test",
+    "beta",
+    "arena",
+    "season",
+)
+# The author API names live Retail "World of Warcraft" / "world-of-warcraft".
+CURSEFORGE_RETAIL_TYPE_LABEL = "world of warcraft"
+CURSEFORGE_RELEASE_TYPE_VALUES = {
+    1: "release",
+    2: "beta",
+    3: "alpha",
+    "1": "release",
+    "2": "beta",
+    "3": "alpha",
+    "release": "release",
+    "beta": "beta",
+    "alpha": "alpha",
+}
+CURSEFORGE_USABLE_FILE_STATUSES = {4, 10, "4", "10", "approved", "released"}
 _CURSEFORGE_CATALOG_CACHE = {
     "loaded": False,
     "versions": None,
@@ -533,6 +555,38 @@ def packaged_parent_toc_version(addon_name):
     if not version:
         raise RuntimeError(f"No '## Version:' line in {toc_file}")
     return version
+
+
+def packaged_parent_toc_interface(addon_name, zip_path):
+    """Return the ## Interface integer from the parent TOC inside the release zip."""
+    toc_name = f"{addon_name}/{addon_name}.toc"
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            text = archive.read(toc_name).decode("utf-8")
+    except KeyError as error:
+        raise RuntimeError(f"Release zip is missing {toc_name}") from error
+    except (OSError, zipfile.BadZipFile, UnicodeError) as error:
+        raise RuntimeError(f"Could not read {toc_name} from the release zip: {error}") from error
+    match = re.search(
+        r"^## Interface:\s*([0-9]{6})\s*$",
+        text.replace("\r\n", "\n"),
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not match:
+        raise RuntimeError(f"Release zip TOC {toc_name} has no 6-digit ## Interface value")
+    return int(match.group(1))
+
+
+def curseforge_interface_from_package(addon_name, zip_path, requested_interface):
+    """Use the packaged TOC Interface and reject a different requested value."""
+    packaged = packaged_parent_toc_interface(addon_name, zip_path)
+    if int(requested_interface) != packaged:
+        raise ValueError(
+            "CurseForge compatibility must use the packaged parent TOC Interface "
+            f"{packaged}, not requested Interface {requested_interface}. "
+            "Refusing to claim a Retail patch the packaged addon does not declare."
+        )
+    return packaged
 
 
 def requested_version_matches_packaged_toc(addon_name, version):
@@ -1114,14 +1168,29 @@ def _curseforge_type_id(version):
     return version.get("gameVersionTypeID", version.get("gameVersionTypeId"))
 
 
+def _normalize_curseforge_type_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
 def is_curseforge_retail_version_type(item):
-    """Return True for a Retail version type, excluding Classic/PTR/beta tracks."""
+    """Return True for the live Retail version type.
+
+    The author catalog names that type "World of Warcraft" / "world-of-warcraft".
+    Labels that contain "retail" are also accepted. Classic, PTR, public-test,
+    and other non-Retail tracks are excluded. The numeric type ID is not hard-coded.
+    """
     if not isinstance(item, dict):
         return False
-    label = f"{item.get('name') or ''} {item.get('slug') or ''}".lower()
-    if "retail" not in label:
+    name = _normalize_curseforge_type_text(item.get("name"))
+    slug = _normalize_curseforge_type_text(item.get("slug"))
+    label = f"{name} {slug}".strip()
+    if not label:
         return False
-    return not any(marker in label for marker in CURSEFORGE_NON_RETAIL_TYPE_MARKERS)
+    if any(marker in label for marker in CURSEFORGE_NON_RETAIL_TYPE_MARKERS):
+        return False
+    if "retail" in label:
+        return True
+    return name == CURSEFORGE_RETAIL_TYPE_LABEL or slug == CURSEFORGE_RETAIL_TYPE_LABEL
 
 
 def curseforge_retail_type_ids(version_types):
@@ -1211,6 +1280,101 @@ def curseforge_file_is_exact_release(file_obj, *, version, zip_name):
     return False
 
 
+def _curseforge_release_type_value(value):
+    if isinstance(value, str):
+        value = value.strip().lower()
+    return CURSEFORGE_RELEASE_TYPE_VALUES.get(value)
+
+
+def _curseforge_file_game_tokens(file_obj):
+    """Return game-version IDs and names advertised on a listed file."""
+    tokens = set()
+    saw_field = False
+    for key in ("gameVersions", "gameVersionNames", "gameVersionIds"):
+        if key not in file_obj:
+            continue
+        saw_field = True
+        value = file_obj.get(key)
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            if isinstance(item, bool) or not isinstance(item, (str, int)):
+                continue
+            text = str(item).strip()
+            if text:
+                tokens.add(text)
+    if "sortableGameVersions" in file_obj:
+        saw_field = True
+        sortable = file_obj.get("sortableGameVersions")
+        if isinstance(sortable, list):
+            for item in sortable:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("gameVersionName", "gameVersion"):
+                    name = item.get(key)
+                    if isinstance(name, str) and name.strip():
+                        tokens.add(name.strip())
+    return saw_field, tokens
+
+
+def _curseforge_file_is_usable(file_obj):
+    """Return match, mismatch, or unverified for the listed file's usable state."""
+    saw_field = False
+    if "isAvailable" in file_obj:
+        saw_field = True
+        if file_obj.get("isAvailable") is False:
+            return "mismatch", "file is not available"
+    status = None
+    for key in ("fileStatus", "status"):
+        if key in file_obj:
+            saw_field = True
+            status = file_obj.get(key)
+            break
+    if status is not None:
+        normalized = status.strip().lower() if isinstance(status, str) else status
+        if normalized not in CURSEFORGE_USABLE_FILE_STATUSES:
+            return "mismatch", f"file status {status} is not a usable release"
+    if not saw_field:
+        return "unverified", "file omitted its usable state"
+    return "match", None
+
+
+def curseforge_listed_file_agreement(
+    file_obj,
+    *,
+    version,
+    zip_name,
+    release_type,
+    game_version_id,
+    game_version_name,
+):
+    """Classify a name match against release type, game version, and usable state.
+
+    Returns "different", "match", "mismatch", or "unverified".
+    """
+    if not curseforge_file_is_exact_release(file_obj, version=version, zip_name=zip_name):
+        return "different", None
+
+    if "releaseType" not in file_obj:
+        return "unverified", "file omitted releaseType"
+    listed_type = _curseforge_release_type_value(file_obj.get("releaseType"))
+    if listed_type != release_type:
+        return "mismatch", (
+            f"release type {file_obj.get('releaseType')!r} does not match {release_type}"
+        )
+
+    saw_versions, tokens = _curseforge_file_game_tokens(file_obj)
+    if not saw_versions:
+        return "unverified", "file omitted game versions"
+    expected = {str(game_version_id), str(game_version_name)}
+    if tokens.isdisjoint(expected):
+        return "mismatch", (
+            "game versions "
+            f"{sorted(tokens)} do not include {game_version_name} ({game_version_id})"
+        )
+
+    return _curseforge_file_is_usable(file_obj)
+
+
 def is_existing_curseforge_release(status, body):
     """Return True only when the response clearly says this file already exists.
 
@@ -1222,11 +1386,23 @@ def is_existing_curseforge_release(status, body):
     return any(phrase in text for phrase in CURSEFORGE_DUPLICATE_PHRASES)
 
 
-def find_existing_curseforge_release(project_id, version, zip_name, token, *, opener=None):
+def find_existing_curseforge_release(
+    project_id,
+    version,
+    zip_name,
+    token,
+    *,
+    release_type,
+    game_version_id,
+    game_version_name,
+    opener=None,
+):
     """Look for an exact existing file before uploading.
 
     Returns one of:
-    - ("found", file)
+    - ("found", file) when name, release type, game version, and usable state match
+    - ("mismatch", reason) when the name matches but that metadata does not
+    - ("unverified", reason) when the name matches but metadata was omitted
     - ("absent", None)
     - ("unavailable", reason) when the list cannot be used
 
@@ -1250,9 +1426,27 @@ def find_existing_curseforge_release(project_id, version, zip_name, token, *, op
     files = curseforge_object_list(payload)
     if files is None:
         return "unavailable", "file list response was not a list"
+    mismatches = []
+    unverified = []
     for file_obj in files:
-        if curseforge_file_is_exact_release(file_obj, version=version, zip_name=zip_name):
+        agreement, reason = curseforge_listed_file_agreement(
+            file_obj,
+            version=version,
+            zip_name=zip_name,
+            release_type=release_type,
+            game_version_id=game_version_id,
+            game_version_name=game_version_name,
+        )
+        if agreement == "match":
             return "found", file_obj
+        if agreement == "mismatch":
+            mismatches.append(reason)
+        elif agreement == "unverified":
+            unverified.append(reason)
+    if mismatches:
+        return "mismatch", "; ".join(mismatches)
+    if unverified:
+        return "unverified", "; ".join(unverified)
     return "absent", None
 
 
@@ -1362,7 +1556,17 @@ def resolve_curseforge_publish_plan(
     dry_run,
     opener=None,
 ):
-    """Build a CurseForge plan. Live runs resolve the Retail game version; dry-run does not call CurseForge."""
+    """Build a CurseForge plan. Live runs resolve the Retail game version; dry-run does not call CurseForge.
+
+    Compatibility comes from the parent TOC inside the zip. A requested Interface
+    that disagrees with that manifest fails the CurseForge plan.
+    """
+    try:
+        interface = curseforge_interface_from_package(addon_name, zip_path, interface)
+    except (RuntimeError, ValueError, TypeError) as error:
+        print(f"::error ::{error}")
+        return None
+
     if dry_run:
         return build_curseforge_publish_plan(
             version=version,
@@ -1442,6 +1646,9 @@ def publish_to_curseforge(plan, *, dry_run=False, opener=None):
         plan.version,
         plan.zip_path.name,
         token,
+        release_type=plan.release_type,
+        game_version_id=plan.game_version_id,
+        game_version_name=plan.game_version_name,
         opener=opener,
     )
     if lookup == "found":
@@ -1450,12 +1657,25 @@ def publish_to_curseforge(plan, *, dry_run=False, opener=None):
             "treating as success without uploading a duplicate"
         )
         return "already-exists"
+    if lookup == "mismatch":
+        print(
+            "::error ::CurseForge already lists this file name, but its release "
+            f"metadata does not match this publish ({detail}). "
+            "Not uploading another copy and not treating the existing file as success."
+        )
+        return None
     if lookup == "unavailable":
         print(
             "[publish-release] CurseForge file list is unavailable "
             f"({detail}). The documented Upload API has no guaranteed list-files "
             "call, so an exact existing file is also recognized from an explicit "
             "duplicate upload response. A generic conflict is still a failure."
+        )
+    elif lookup == "unverified":
+        print(
+            "[publish-release] CurseForge lists this file name without enough "
+            f"release metadata to verify it ({detail}). Continuing to the documented "
+            "Upload API. An explicit duplicate response is success; a generic conflict is not."
         )
 
     try:

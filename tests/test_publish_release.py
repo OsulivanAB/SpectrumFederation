@@ -9,6 +9,7 @@ import io
 import json
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from urllib import error as urllib_error
 
@@ -950,9 +951,9 @@ def _curseforge_versions():
 
 def _curseforge_version_types():
     return [
-        {"id": 517, "name": "Retail", "slug": "wow-retail"},
-        {"id": 67408, "name": "Classic", "slug": "wow-classic"},
-        {"id": 900, "name": "Retail PTR", "slug": "wow-retail-ptr"},
+        {"id": 517, "name": "World of Warcraft", "slug": "world-of-warcraft"},
+        {"id": 67408, "name": "WoW Classic", "slug": "wow-classic"},
+        {"id": 900, "name": "World of Warcraft Public Test", "slug": "world-of-warcraft-public-test"},
     ]
 
 
@@ -1053,6 +1054,19 @@ def test_select_curseforge_retail_game_version_rejects_name_without_retail_type(
     ]
     with pytest.raises(ValueError, match="Retail version type could not be identified"):
         publish.select_curseforge_retail_game_version("12.1.0", versions, None)
+
+
+def test_select_curseforge_retail_game_version_accepts_retail_label():
+    types = [
+        {"id": 517, "name": "Retail", "slug": "wow_retail"},
+        {"id": 900, "name": "Retail PTR", "slug": "wow-retail-ptr"},
+    ]
+    selected = publish.select_curseforge_retail_game_version(
+        "12.1.0",
+        _curseforge_versions(),
+        types,
+    )
+    assert selected == (16519, "12.1.0", "exact")
 
 
 def test_select_curseforge_retail_game_version_rejects_unique_ptr_name():
@@ -1243,7 +1257,14 @@ def test_exact_existing_curseforge_file_skips_upload(tmp_path, monkeypatch, caps
         body = json.dumps(
             [
                 {"fileName": "SpectrumFederation-1.6.0-beta.10.zip", "displayName": "1.6.0-beta.10"},
-                {"fileName": "SpectrumFederation-1.6.0-beta.1.zip", "displayName": "1.6.0-beta.1"},
+                {
+                    "fileName": "SpectrumFederation-1.6.0-beta.1.zip",
+                    "displayName": "1.6.0-beta.1",
+                    "releaseType": 2,
+                    "gameVersions": [16519],
+                    "isAvailable": True,
+                    "fileStatus": 10,
+                },
             ]
         ).encode()
         return FakeResponse(200, body)
@@ -1253,6 +1274,87 @@ def test_exact_existing_curseforge_file_skips_upload(tmp_path, monkeypatch, caps
     assert result == "already-exists"
     assert methods == ["GET"]
     assert "without uploading a duplicate" in output
+
+
+def test_mismatched_existing_curseforge_file_is_not_success(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+    methods = []
+
+    def opener(request, timeout=None):
+        methods.append(request.get_method())
+        body = json.dumps(
+            [
+                {
+                    "fileName": "SpectrumFederation-1.6.0-beta.1.zip",
+                    "displayName": "1.6.0-beta.1",
+                    "releaseType": "release",
+                    "gameVersions": ["12.1.0"],
+                    "isAvailable": True,
+                    "fileStatus": "approved",
+                }
+            ]
+        ).encode()
+        return FakeResponse(200, body)
+
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener)
+    output = capsys.readouterr().out
+    assert result is None
+    assert methods == ["GET"]
+    assert "does not match this publish" in output
+    assert "without uploading a duplicate" not in output
+
+
+def test_rejected_existing_curseforge_file_is_not_success(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+
+    def opener(request, timeout=None):
+        body = json.dumps(
+            [
+                {
+                    "fileName": "SpectrumFederation-1.6.0-beta.1.zip",
+                    "releaseType": "beta",
+                    "gameVersionNames": ["12.1.0"],
+                    "isAvailable": False,
+                    "fileStatus": 5,
+                }
+            ]
+        ).encode()
+        return FakeResponse(200, body)
+
+    assert publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener) is None
+    assert "does not match this publish" in capsys.readouterr().out
+
+
+def _interface_zip(tmp_path, interface):
+    zip_path = tmp_path / "SpectrumFederation-1.6.0-beta.1.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr(
+            "SpectrumFederation/SpectrumFederation.toc",
+            f"## Interface: {interface}\n## Version: 1.6.0-beta.1\n",
+        )
+    return zip_path
+
+
+def test_curseforge_interface_uses_packaged_toc(tmp_path):
+    zip_path = _interface_zip(tmp_path, "120100")
+    assert publish.curseforge_interface_from_package("SpectrumFederation", zip_path, 120100) == 120100
+
+
+def test_curseforge_interface_rejects_requested_mismatch(tmp_path, capsys):
+    zip_path = _interface_zip(tmp_path, "120100")
+    with pytest.raises(ValueError, match="not requested Interface 120200"):
+        publish.curseforge_interface_from_package("SpectrumFederation", zip_path, 120200)
+    result = publish.resolve_curseforge_publish_plan(
+        version="1.6.0-beta.1",
+        classification=publish.classify_release("1.6.0-beta.1"),
+        addon_name="SpectrumFederation",
+        interface=120200,
+        zip_path=zip_path,
+        changelog="notes",
+        dry_run=True,
+    )
+    assert result is None
+    assert "packaged parent TOC Interface 120100" in capsys.readouterr().out
 
 
 def test_nearby_curseforge_version_is_not_an_exact_duplicate(tmp_path, monkeypatch):
