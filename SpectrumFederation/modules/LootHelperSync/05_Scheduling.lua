@@ -176,6 +176,8 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
 
     local queue = self:_EnsureRepairQueueState()
     local added = 0
+    local dropped = 0
+    local retained = 0
     local now = self:_Now()
     local limit = tonumber(self.cfg and self.cfg.maxQueuedRepairRanges) or 96
 
@@ -211,6 +213,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                 local entry = queue.items[key]
                 if not entry then
                     if #queue.order >= limit then
+                        dropped = dropped + 1
                         if SF.Debug then
                             SF.Debug:Warn("SYNC", "Dropping queued repair (queue full profileId=%s author=%s range=%d-%d mode=%s)",
                                 tostring(profileId), tostring(author), fromCounter, toCounter, tostring(mode))
@@ -236,6 +239,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                         added = added + 1
                     end
                 else
+                    retained = retained + 1
                     entry.reason = opts.reason or entry.reason
                     if self._PreferredRepairTargetRoutable and type(entry.preferredTarget) == "string"
                         and not self:_PreferredRepairTargetRoutable(entry.preferredTarget)
@@ -272,7 +276,106 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
         self:_KickRepairConvergence("queued_repair")
     end
 
-    return added > 0
+    return added > 0, dropped, retained
+end
+
+function Sync:_RememberPendingProfileSnapshot(reason)
+    if not (self.state and self.state.active) then return false end
+    if type(self.state.sessionId) ~= "string" or self.state.sessionId == "" then return false end
+    if type(self.state.profileId) ~= "string" or self.state.profileId == "" then return false end
+
+    local now = self:_Now()
+    local pending = self.state.pendingProfileSnapshot
+    if type(pending) ~= "table"
+        or pending.sessionId ~= self.state.sessionId
+        or pending.profileId ~= self.state.profileId
+    then
+        pending = {
+            sessionId = self.state.sessionId,
+            profileId = self.state.profileId,
+            reason = reason,
+            queueAttempts = 0,
+            nextAttemptAt = now,
+            lastQueuedAt = now,
+        }
+        self.state.pendingProfileSnapshot = pending
+    else
+        pending.reason = reason or pending.reason
+    end
+
+    if self.EnsureRepairConvergence then
+        self:EnsureRepairConvergence("pending_profile")
+    end
+    return true
+end
+
+function Sync:_ProcessPendingProfileSnapshot()
+    local pending = self.state and self.state.pendingProfileSnapshot
+    if type(pending) ~= "table" then return false end
+    if not self:_ShouldRunRepairConvergence() then return false end
+    if pending.sessionId ~= self.state.sessionId or pending.profileId ~= self.state.profileId then
+        self.state.pendingProfileSnapshot = nil
+        return false
+    end
+    if self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId) then
+        self.state.pendingProfileSnapshot = nil
+        return false
+    end
+
+    local now = self:_Now()
+    if type(pending.nextAttemptAt) == "number" and pending.nextAttemptAt > now then
+        return false
+    end
+
+    local ok = false
+    if self.RequestProfileSnapshot then
+        ok = self:RequestProfileSnapshot(pending.reason or "pending-profile")
+    end
+    if ok then
+        self.state.pendingProfileSnapshot = nil
+        return true
+    end
+
+    pending = self.state.pendingProfileSnapshot
+    if type(pending) ~= "table" then return false end
+    pending.queueAttempts = math.max(0, tonumber(pending.queueAttempts) or 0) + 1
+    pending.lastQueueFailure = "no_targets"
+    pending.nextAttemptAt = now + self:_ComputeQueuedRepairBackoffSec(pending.queueAttempts)
+    pending.lastQueuedAt = now
+    if SF.Debug then
+        SF.Debug:Verbose("SYNC", "Pending profile snapshot delayed (profileId=%s attempt=%d nextAt=%.2f)",
+            tostring(pending.profileId), tonumber(pending.queueAttempts) or 0, tonumber(pending.nextAttemptAt) or 0)
+    end
+    return true
+end
+
+-- Function Bring no-route profile and log work forward once a route exists.
+-- @param reason string|nil Diagnostic reason
+-- @return boolean True when pending work was made due
+function Sync:_ExpediteNoRouteSynchronization(reason)
+    if not self.state then return false end
+    local now = self:_Now()
+    local expedited = false
+    local pending = self.state.pendingProfileSnapshot
+    if type(pending) == "table" then
+        pending.nextAttemptAt = now
+        expedited = true
+    end
+
+    local queue = self.state.repairQueue
+    if type(queue) == "table" and type(queue.items) == "table" then
+        for _, entry in pairs(queue.items) do
+            if type(entry) == "table" and entry.lastQueueFailure == "no_targets" then
+                entry.nextAttemptAt = now
+                expedited = true
+            end
+        end
+    end
+
+    if expedited and self._KickRepairConvergence then
+        self:_KickRepairConvergence(reason or "route_available")
+    end
+    return expedited
 end
 
 function Sync:_DispatchQueuedRepair(entry)
@@ -291,12 +394,14 @@ function Sync:_DispatchQueuedRepair(entry)
             exactAuthor = true,
         }
         self:_CopyExpectedWindowEvidence(entry, integrityRange)
-        return self:RequestIntegrityRepairRanges(entry.profileId, {
+        local ok, failReason = self:RequestIntegrityRepairRanges(entry.profileId, {
             integrityRange
         }, entry.reason or "queued-integrity", entry.preferredTarget, {
             backgroundRepair = true,
             queueAttempts = entry.queueAttempts,
         })
+        if ok then return true end
+        return false, failReason or "dispatch_failed"
     end
 
     local missingRange = {
@@ -307,7 +412,7 @@ function Sync:_DispatchQueuedRepair(entry)
         preferredTarget = entry.preferredTarget,
     }
     self:_CopyExpectedWindowEvidence(entry, missingRange)
-    return self:RequestMissingLogs({
+    local ok, failReason = self:RequestMissingLogs({
         missingRange
     }, entry.reason or "queued-missing", {
         backgroundRepair = true,
@@ -315,6 +420,8 @@ function Sync:_DispatchQueuedRepair(entry)
         preferredTarget = entry.preferredTarget,
         exactAuthor = entry.exactAuthor == true,
     })
+    if ok then return true end
+    return false, failReason or "dispatch_failed"
 end
 
 function Sync:_ProcessRepairConvergenceTick(trigger)
@@ -325,6 +432,9 @@ function Sync:_ProcessRepairConvergenceTick(trigger)
 
     local queue = self:_EnsureRepairQueueState()
     local now = self:_Now()
+    if self._ProcessPendingProfileSnapshot then
+        self:_ProcessPendingProfileSnapshot()
+    end
     local processed = 0
     local batchSize = tonumber(self.cfg and self.cfg.convergenceBatchSize) or 2
     local idx = 1
@@ -342,13 +452,13 @@ function Sync:_ProcessRepairConvergenceTick(trigger)
         elseif type(entry.nextAttemptAt) == "number" and entry.nextAttemptAt > now then
             idx = idx + 1
         else
-            local ok = self:_DispatchQueuedRepair(entry)
+            local ok, failReason = self:_DispatchQueuedRepair(entry)
             if ok then
                 processed = processed + 1
                 self:_RemoveQueuedRepair(key)
             else
                 processed = processed + 1
-                self:_ScheduleQueuedRepairRetry(entry, "dispatch_failed")
+                self:_ScheduleQueuedRepairRetry(entry, failReason or "dispatch_failed")
                 idx = idx + 1
             end
         end

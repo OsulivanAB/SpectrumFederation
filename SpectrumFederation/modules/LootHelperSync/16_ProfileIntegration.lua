@@ -167,8 +167,8 @@ function Sync:CreateProfileFromMeta(profileMeta)
     if SF.LootProfile.ValidateMeta then
         local ok, err = SF.LootProfile.ValidateMeta(profileMeta)
         if not ok then
-            if SF.PrintWarning then
-                SF:PrintWarning(("CreateProfileFromMeta: invalid meta: %s"):format(err or "unknown"))
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "CreateProfileFromMeta: invalid meta: %s", tostring(err or "unknown"))
             end
             return nil
         end
@@ -3073,7 +3073,49 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
         -- still authorized instead of a revoked or unproven coordinator.
         local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
         if type(routes) ~= "table" or #routes == 0 then
-            return false
+            if self._NoteMissingRoute then
+                self:_NoteMissingRoute("_noIntegrityTargetWarnedFor", "Cannot request integrity repair: no targets available", reason)
+            elseif SF.Debug then
+                SF.Debug:Warn("SYNC", "Cannot request integrity repair: no targets available (profileId=%s reason=%s)",
+                    tostring(profileId), tostring(reason))
+            end
+            if opts.backgroundRepair == true then
+                return false, "no_targets"
+            end
+            if self.QueueRepairRanges then
+                local rest = {}
+                local maxRanges = tonumber(self.cfg and self.cfg.maxMissingRangesPerNeededLogs) or 8
+                for _, range in ipairs(ranges) do
+                    if type(range) == "table"
+                        and type(range.author) == "string"
+                        and type(range.fromCounter) == "number"
+                        and type(range.toCounter) == "number"
+                        and range.fromCounter >= 1
+                        and range.toCounter >= 1
+                    then
+                        range.mode = range.mode or "integrity"
+                        range.exactAuthor = true
+                        rest[#rest + 1] = range
+                    end
+                    if #rest >= maxRanges then break end
+                end
+                if #rest > 0 then
+                    local queued, dropped, retained = self:QueueRepairRanges(profileId, rest, {
+                        mode = "integrity",
+                        reason = reason or "no-route",
+                        preferredTarget = preferredTarget,
+                        exactAuthor = true,
+                    })
+                    if self.state and self.state._userInitiatedSync == true
+                        and (tonumber(dropped) or 0) > 0
+                        and not queued
+                        and (tonumber(retained) or 0) == 0
+                    then
+                        self.state._userSyncRegisterRejected = true
+                    end
+                end
+            end
+            return false, "no_targets"
         end
         targets = routes
     end
@@ -3130,6 +3172,9 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
                 backgroundRepair = opts.backgroundRepair == true,
                 queueAttempts = tonumber(opts.queueAttempts) or 0,
             }
+            if self._StampUserInitiatedRequest then
+                self:_StampUserInitiatedRequest(meta)
+            end
             self:_CopyExpectedWindowEvidence(range, meta)
             local ok = self:RegisterRequest(requestId, kind, targets[1], meta)
             if ok then
