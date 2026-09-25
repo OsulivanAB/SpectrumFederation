@@ -320,6 +320,17 @@ function SpecWeapons.IsRangedEquipLoc(equipLoc)
     return equipLoc == "INVTYPE_RANGED" or equipLoc == "INVTYPE_RANGEDRIGHT"
 end
 
+-- Bow, gun, and crossbow occupy the weapon slot and leave Off Hand empty.
+-- Wands can share a ranged equip location and do not. False means the
+-- resolved class/subclass is not one of those three weapons.
+function SpecWeapons.IsTwoHandRangedWeapon(itemClass, itemSubClass)
+    if tonumber(itemClass) ~= ITEM_CLASS_WEAPON then
+        return false
+    end
+    local subClass = tonumber(itemSubClass)
+    return subClass == BOW or subClass == GUN or subClass == CROSSBOW
+end
+
 -- Fail-closed subclass/proficiency check for another profile character.
 -- Shields and holdables are slot-flag questions, not weapon-subclass questions.
 function SpecWeapons.IsItemAllowedForSpec(specId, classif)
