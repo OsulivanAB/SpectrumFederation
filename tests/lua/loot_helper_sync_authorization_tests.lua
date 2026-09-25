@@ -5577,6 +5577,87 @@ assertTrue(type(entry) == "table" and entry.nextAttemptAt <= now,
 end)()
 
 ;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.helpers = {}
+Sync.state.coordinator = COORD
+Sync.state.isCoordinator = false
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local savedMissing = Sync.ComputeMissingLogRequests
+local savedMismatch = Sync.ComputeWindowMismatchRequests
+local savedSend = Sync.SendJoinStatus
+local savedQueue = Sync.QueueRepairRanges
+Sync.SendJoinStatus = productionSendJoinStatus
+Sync.QueueRepairRanges = productionQueueRepairRanges
+Sync.ComputeMissingLogRequests = function()
+    return {}
+end
+Sync.ComputeWindowMismatchRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 8, toCounter = 9 },
+    }
+end
+local ok, status = Sync:RequestManualSync("integrity-no-route")
+assertEq(ok, true, "an integrity mismatch with no route still starts manual sync")
+assertEq(status, "log_sync_requested", "queued integrity work is a log sync request")
+assertEq(warningCount("Cannot request integrity repair"), 0, "a no-route integrity repair stays out of chat")
+local queued = Sync.state.repairQueue and Sync.state.repairQueue.items or {}
+local held = nil
+for _, item in pairs(queued) do
+    if type(item) == "table" and item.mode == "integrity" and item.fromCounter == 8 then
+        held = item
+    end
+end
+assertTrue(held ~= nil, "a no-route integrity repair is queued")
+local before = #(Sync.state.repairQueue.order or {})
+assertEq(Sync:RequestIntegrityRepairRanges(PROFILE, {
+    { author = "Author-Realm", fromCounter = 8, toCounter = 9 },
+}, "queued-integrity", nil, { backgroundRepair = true }), false, "a background integrity retry does not register without a route")
+assertEq(#(Sync.state.repairQueue.order or {}), before, "a background integrity retry leaves the queued entry in place")
+setAdmins({ COORD, OWNER })
+Sync:ApplyAdvertisedHelpers({}, "integrity-route")
+Sync:_ProcessRepairConvergenceTick("integrity-route")
+local resumed = false
+for _, req in pairs(Sync.state.requests) do
+    if req.meta and req.meta.integrityRepair == true then
+        resumed = true
+    end
+end
+assertTrue(resumed, "queued integrity work is requested after the route returns")
+assertEq(warningCount("Cannot request integrity repair"), 0, "integrity route recovery stays out of chat")
+Sync.ComputeMissingLogRequests = savedMissing
+Sync.ComputeWindowMismatchRequests = savedMismatch
+Sync.SendJoinStatus = savedSend
+Sync.QueueRepairRanges = savedQueue
+end)()
+
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { COORD }
+Sync.state.isCoordinator = false
+SF.lootHelperDB.profiles = {}
+local previousMax = Sync.cfg.maxOutstandingRequests
+Sync.cfg.maxOutstandingRequests = 0
+Sync.state.pendingProfileSnapshot = {
+    sessionId = Sync.state.sessionId,
+    profileId = PROFILE,
+    reason = "no-route",
+    queueAttempts = 0,
+    nextAttemptAt = Sync:_Now(),
+}
+assertEq(Sync:RequestProfileSnapshot("route-returned"), false, "a full request table rejects the profile request")
+assertTrue(type(Sync.state.pendingProfileSnapshot) == "table", "a rejected profile request keeps the pending snapshot")
+assertTrue(Sync:_ProcessPendingProfileSnapshot(), "pending profile work stays on the repair tick")
+assertEq(Sync.state.pendingProfileSnapshot.queueAttempts, 1, "a rejected profile request backs off instead of disappearing")
+Sync.cfg.maxOutstandingRequests = previousMax
+assertEq(Sync:RequestProfileSnapshot("route-open"), true, "the profile request registers once a slot is free")
+assertEq(Sync.state.pendingProfileSnapshot, nil, "a registered profile request clears the pending snapshot")
+end)()
+
+;(function()
 reset(COORD)
 local originalSend = SF.LootHelperComm.Send
 SF.LootHelperComm.Send = function()

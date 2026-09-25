@@ -3079,6 +3079,42 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
                 SF.Debug:Warn("SYNC", "Cannot request integrity repair: no targets available (profileId=%s reason=%s)",
                     tostring(profileId), tostring(reason))
             end
+            if opts.backgroundRepair == true then
+                return false, "no_targets"
+            end
+            if self.QueueRepairRanges then
+                local rest = {}
+                local maxRanges = tonumber(self.cfg and self.cfg.maxMissingRangesPerNeededLogs) or 8
+                for _, range in ipairs(ranges) do
+                    if type(range) == "table"
+                        and type(range.author) == "string"
+                        and type(range.fromCounter) == "number"
+                        and type(range.toCounter) == "number"
+                        and range.fromCounter >= 1
+                        and range.toCounter >= 1
+                    then
+                        range.mode = range.mode or "integrity"
+                        range.exactAuthor = true
+                        rest[#rest + 1] = range
+                    end
+                    if #rest >= maxRanges then break end
+                end
+                if #rest > 0 then
+                    local queued, dropped, retained = self:QueueRepairRanges(profileId, rest, {
+                        mode = "integrity",
+                        reason = reason or "no-route",
+                        preferredTarget = preferredTarget,
+                        exactAuthor = true,
+                    })
+                    if self.state and self.state._userInitiatedSync == true
+                        and (tonumber(dropped) or 0) > 0
+                        and not queued
+                        and (tonumber(retained) or 0) == 0
+                    then
+                        self.state._userSyncRegisterRejected = true
+                    end
+                end
+            end
             return false, "no_targets"
         end
         targets = routes

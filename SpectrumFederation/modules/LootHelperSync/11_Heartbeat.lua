@@ -356,7 +356,6 @@ function Sync:RequestProfileSnapshot(reason)
         return false
     end
     self.state._noProfileTargetWarnedFor = nil
-    self.state.pendingProfileSnapshot = nil
 
     local requestId = self:NewRequestId()
     local profileMeta = {
@@ -370,6 +369,7 @@ function Sync:RequestProfileSnapshot(reason)
     local ok = self:RegisterRequest(requestId, "NEED_PROFILE", targets[1], profileMeta)
 
     if ok then
+        self.state.pendingProfileSnapshot = nil
         self.state._profileReqInFlight = self.state.sessionId
         if SF.Debug then
             SF.Debug:Verbose("SYNC", "Requesting profile snapshot (reason: %s) from initial target %s (%d targets total: %s)", 
