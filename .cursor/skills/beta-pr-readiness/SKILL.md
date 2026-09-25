@@ -26,6 +26,7 @@ Use this skill when a task is close to done and you need a repo-specific merge-r
    - `python -m pytest tests/test_interface_badge.py` when README badges or `blizzard_api.py` display conversion changed
    - `python -m pytest tests/test_settings_navigation.py` when Settings navigation/Registry/TOC metadata changed
    - `python -m pytest tests/test_mouse_tracer.py` when Mouse Tracer constants, engine, or runtime tests changed
+   - `python -m pytest tests/test_tsm_integration.py` when the TradeSkillMaster adapter or its tests changed
    - `python -m pytest tests/test_loot_helper_window.py` when Loot Helper window minimize or positioning changed
    - `python -m pytest tests/test_sync_protocol.py` when SyncProtocol NACK/warning throttling changed
    - `python -m pytest tests/test_settings_window_layout.py` when Settings window content layout or the impersonation banner changed
