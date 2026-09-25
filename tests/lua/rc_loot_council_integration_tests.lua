@@ -1783,6 +1783,32 @@ function testRcSettingsControlContract()
     assertTrue(disenchantRow ~= nil and disenchantRow.canRemove, "award-reason BiS row is visible and removable")
     assertEq(disenchantRow.text, "Disenchant", "award-reason row shows the raw reason text")
 
+    addFromRc.set("ctx:default|5|0")
+    local beforeFiltered = #settingsProfile:GetRCLootCouncilIntegrationConfig().bisResponses
+    uiMessages = {}
+    uiRefresh = 0
+    addFromRc.onIconClick(uiCtx)
+    assertEq(uiRefresh, 1, "rejecting a filtered selection still refreshes the page")
+    assertEq(#settingsProfile:GetRCLootCouncilIntegrationConfig().bisResponses, beforeFiltered, "a filtered selection is not stored")
+    assertEq(settingsPanel.__sfBisResponseSelected, nil, "clicking add clears a filtered selection")
+    assertEq(uiMessages[#uiMessages], "That RC response is no longer available.", "filtered selection reports that it is unavailable")
+    local storedCtxText = false
+    for _, entry in ipairs(settingsProfile:GetRCLootCouncilIntegrationConfig().bisResponses) do
+        if type(entry.text) == "string" and string.find(entry.text, "ctx:", 1, true) then
+            storedCtxText = true
+        end
+    end
+    assertFalse(storedCtxText, "a filtered selection is not stored as a text-only ctx key")
+
+    addFromRc.set("ctx:default|10|0")
+    assertTrue(addFromRc.iconEnabled(), "a stored selection enables the plus button before the dropdown rebuilds")
+    addFromRc.options()
+    assertEq(settingsPanel.__sfBisResponseSelected, nil, "rebuilding the dropdown clears a response the filters removed")
+    assertFalse(addFromRc.iconEnabled(), "the plus button disables after that selection is cleared")
+    addFromRc.set(weaponNeedValue)
+    addFromRc.options()
+    assertEq(settingsPanel.__sfBisResponseSelected, weaponNeedValue, "rebuilding the dropdown keeps a response that is still offered")
+
     uiRefresh = 0
     bisList.onRemove(uiCtx, greedRow)
     assertEq(uiRefresh, 1, "removing a BiS response refreshes the settings page")

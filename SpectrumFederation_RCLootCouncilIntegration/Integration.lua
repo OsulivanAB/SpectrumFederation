@@ -1475,7 +1475,9 @@ local function SelectedBisOption(key)
             }
         end
     end
-    return key
+    -- A key that the current filters no longer offer must not be stored as
+    -- a text-only label. Award matching would never see that ctx string.
+    return nil
 end
 
 local function GetProfile()
@@ -1695,7 +1697,21 @@ function Integration.RegisterSettingsPage()
                                 return #GetRCResponseOptions() > 0
                             end,
                             options = function()
-                                return GetRCResponseOptions()
+                                local choices = GetRCResponseOptions()
+                                local selected = panel.__sfBisResponseSelected
+                                if type(selected) == "string" then
+                                    local stillOffered = false
+                                    for i = 1, #choices do
+                                        if choices[i].value == selected then
+                                            stillOffered = true
+                                            break
+                                        end
+                                    end
+                                    if not stillOffered then
+                                        panel.__sfBisResponseSelected = nil
+                                    end
+                                end
+                                return choices
                             end,
                             get = function() return panel.__sfBisResponseSelected end,
                             set = function(value) panel.__sfBisResponseSelected = value end,
@@ -1714,7 +1730,19 @@ function Integration.RegisterSettingsPage()
                                     ctx.section:SetMessage("Turn on Record RC Loot Council awards before changing BiS responses.", "error")
                                     return
                                 end
-                                local ok, err = profile:AddRCLootCouncilBisResponse(SelectedBisOption(panel.__sfBisResponseSelected))
+                                local selectedKey = panel.__sfBisResponseSelected
+                                local selected = SelectedBisOption(selectedKey)
+                                if type(selected) ~= "table" then
+                                    panel.__sfBisResponseSelected = nil
+                                    if type(selectedKey) == "string" then
+                                        ctx.section:SetMessage("That RC response is no longer available.", "error")
+                                    else
+                                        ctx.section:SetMessage("Select an RC response first.", "error")
+                                    end
+                                    ctx.pageBuilder:Refresh()
+                                    return
+                                end
+                                local ok, err = profile:AddRCLootCouncilBisResponse(selected)
                                 if not ok then
                                     ctx.section:SetMessage(err or "Could not add BiS response.", "error")
                                     return
