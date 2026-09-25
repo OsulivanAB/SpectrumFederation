@@ -150,6 +150,7 @@ Do not turn expected runtime conditions into fatal errors merely for observabili
   - Schema/Store/Apply: `SpectrumFederation/modules/Settings/`
   - Settings UI framework + pages: `SpectrumFederation/modules/UI/Settings/`
 - Mouse Tracer: `SpectrumFederation/modules/MouseTracer/` (constants, pure trail engine, runtime host). The Gameplay / UI Enhancements page lives in `modules/UI/Settings/Pages/NicheFeatures.lua`.
+- Read-only TradeSkillMaster access: `modules/Integrations/TSM.lua` (`SF.TSM`). Follow `.cursor/skills/tsm-integration/SKILL.md`. Do not call `TSM_API` from feature modules.
 
 ## Adding a new setting (correct, minimal workflow)
 When you need a new toggle/option:
@@ -228,6 +229,7 @@ For sync/comm warning deduplication patterns, see `tests/test_sync_protocol.py` 
 - Settings navigation changes: `python -m pytest tests/test_settings_navigation.py`
 - Settings window content layout / impersonation banner: `python -m pytest tests/test_settings_window_layout.py`
 - Mouse Tracer engine or constants changes: `python -m pytest tests/test_mouse_tracer.py`
+- TradeSkillMaster adapter: `python -m pytest tests/test_tsm_integration.py`
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle changes: `python -m pytest tests/test_raid_equipment.py`
 - Loot Helper impersonation / Preview as Non-Admin: `python -m pytest tests/test_impersonation.py`
 - Linked character identities: `python -m pytest tests/test_linked_identity.py`
