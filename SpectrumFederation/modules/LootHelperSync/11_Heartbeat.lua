@@ -359,12 +359,15 @@ function Sync:RequestProfileSnapshot(reason)
     self.state.pendingProfileSnapshot = nil
 
     local requestId = self:NewRequestId()
-    local ok = self:RegisterRequest(requestId, "NEED_PROFILE", targets[1], {
+    local profileMeta = {
         sessionId   = self.state.sessionId,
         targets     = targets,  -- fallback list
         reason      = reason,
-        userInitiated = self.state._userInitiatedSync == true,
-    })
+    }
+    if self._StampUserInitiatedRequest then
+        self:_StampUserInitiatedRequest(profileMeta)
+    end
+    local ok = self:RegisterRequest(requestId, "NEED_PROFILE", targets[1], profileMeta)
 
     if ok then
         self.state._profileReqInFlight = self.state.sessionId
@@ -461,7 +464,7 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
             self.state._noLogTargetWarnedFor = nil
 
             local requestId = self:NewRequestId()
-            local ok = self:RegisterRequest(requestId, "NEED_LOGS", targets[1], self:_CopyExpectedWindowEvidence(range, {
+            local logMeta = self:_CopyExpectedWindowEvidence(range, {
                 sessionId   = self.state.sessionId,
                 profileId   = self.state.profileId,
                 author      = range.author,
@@ -473,8 +476,11 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
                 reason = reason,
                 exactAuthor = exactAuthor,
                 preferredTarget = preferredTarget,
-                userInitiated = self.state._userInitiatedSync == true,
-            }))
+            })
+            if self._StampUserInitiatedRequest then
+                self:_StampUserInitiatedRequest(logMeta)
+            end
+            local ok = self:RegisterRequest(requestId, "NEED_LOGS", targets[1], logMeta)
 
             if ok then
                 count = count + 1

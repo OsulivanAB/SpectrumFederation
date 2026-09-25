@@ -394,7 +394,10 @@ function Sync:BroadcastNewLog(profileId, logTable)
         opts = { enc = SF.SyncProtocol.ENC_B64CBOR }
     end
 
-    SF.LootHelperComm:Send("BULK", self.MSG.NEW_LOG, payload, dist, nil, "NORMAL", opts)
+    local sent = SF.LootHelperComm:Send("BULK", self.MSG.NEW_LOG, payload, dist, nil, "NORMAL", opts)
+    if sent == false then
+        return fail("comm send dropped")
+    end
     return true, nil
 end
 

@@ -3136,6 +3136,9 @@ function Sync:RequestIntegrityRepairRanges(profileId, ranges, reason, preferredT
                 backgroundRepair = opts.backgroundRepair == true,
                 queueAttempts = tonumber(opts.queueAttempts) or 0,
             }
+            if self._StampUserInitiatedRequest then
+                self:_StampUserInitiatedRequest(meta)
+            end
             self:_CopyExpectedWindowEvidence(range, meta)
             local ok = self:RegisterRequest(requestId, kind, targets[1], meta)
             if ok then

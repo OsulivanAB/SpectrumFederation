@@ -314,6 +314,9 @@ local function reset(selfName)
     Sync.state.pendingProfileSnapshot = nil
     Sync.state._userSyncFailureNoted = nil
     Sync.state._userInitiatedSync = nil
+    Sync.state._userSyncGeneration = nil
+    Sync.state._userSyncRegisteredCount = nil
+    Sync.state._userSyncRegisterRejected = nil
     Sync.state._diagOnce = nil
     Sync.state.repairQueue = { order = {}, items = {} }
     Sync.state._coordinatorCatchUp = nil
@@ -5367,6 +5370,109 @@ reset(COORD)
 assertEq(Sync:EndSession("manual", false), true, "coordinator can end the session")
 assertTrue(infos[#infos] ~= nil and string.find(infos[#infos], "Loot Helper session ended (manual).", 1, true) ~= nil,
     "session end formats the reason")
+
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { COORD }
+Sync.state.isCoordinator = false
+local savedMissing = Sync.ComputeMissingLogRequests
+local savedMismatch = Sync.ComputeWindowMismatchRequests
+local savedSend = Sync.SendJoinStatus
+Sync.SendJoinStatus = productionSendJoinStatus
+Sync.ComputeMissingLogRequests = function()
+    return {}
+end
+Sync.ComputeWindowMismatchRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 8, toCounter = 9 },
+    }
+end
+local ok, status = Sync:RequestManualSync("integrity")
+assertEq(ok, true, "an integrity mismatch can start a manual sync")
+assertEq(status, "log_sync_requested", "an integrity mismatch is not reported as already synced")
+local generation = Sync.state._userSyncGeneration
+local integrityReq = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.meta and req.meta.integrityRepair == true then
+        integrityReq = req
+    end
+end
+assertTrue(integrityReq ~= nil, "manual sync registers the integrity request")
+assertEq(integrityReq and integrityReq.meta.userInitiated, true, "the integrity request keeps manual intent")
+assertEq(integrityReq and integrityReq.meta.userSyncGeneration, generation, "the integrity request keeps this sync generation")
+Sync:_FailRequest(integrityReq, "timeout")
+assertEq(warningCount("Log sync did not finish"), 1, "a failed manual integrity request warns once")
+Sync.state._userInitiatedSync = true
+Sync.state._userSyncGeneration = generation
+assertTrue(Sync:RequestIntegrityRepairRanges(PROFILE, {
+    { author = "Author-Realm", fromCounter = 2, toCounter = 2 },
+}, "join-status"), "a sibling integrity request registers")
+local sibling = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.meta and req.meta.fromCounter == 2 then
+        sibling = req
+    end
+end
+Sync:_FailRequest(sibling, "timeout")
+assertEq(warningCount("Log sync did not finish"), 1, "retries of the same manual sync do not warn again")
+local againOk, againStatus = Sync:RequestManualSync("integrity-again")
+assertEq(againOk, true, "a later manual sync can start")
+assertEq(againStatus, "log_sync_requested", "a later integrity mismatch is still a sync request")
+local later = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.meta and req.meta.userSyncGeneration == Sync.state._userSyncGeneration and req.meta.integrityRepair == true then
+        later = req
+    end
+end
+Sync:_FailRequest(later, "timeout")
+assertEq(warningCount("Log sync did not finish"), 2, "a new manual sync warns when it fails")
+Sync.ComputeMissingLogRequests = savedMissing
+Sync.ComputeWindowMismatchRequests = savedMismatch
+Sync.SendJoinStatus = savedSend
+end)()
+
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { COORD }
+Sync.state.isCoordinator = false
+SF.lootHelperDB.profiles = {}
+local savedSend = Sync.SendJoinStatus
+Sync.SendJoinStatus = productionSendJoinStatus
+local previousMax = Sync.cfg.maxOutstandingRequests
+Sync.cfg.maxOutstandingRequests = 0
+local ok, status = Sync:RequestManualSync("cap")
+assertEq(ok, false, "a full request table does not report manual sync success")
+assertEq(status, "sync_busy", "a full request table reports sync_busy")
+assertEq(warningCount("Synchronization did not start"), 1, "a full request table warns the manual caller")
+assertEq(warningCount("Profile sync did not finish"), 0, "a rejected manual sync has no request to fail later")
+Sync.cfg.maxOutstandingRequests = previousMax
+Sync.SendJoinStatus = savedSend
+end)()
+
+;(function()
+reset(COORD)
+local originalSend = SF.LootHelperComm.Send
+SF.LootHelperComm.Send = function()
+    return false
+end
+local broadcastOk, broadcastErr = Sync:BroadcastNewLog(PROFILE, {
+    _eventType = "POINT_CHANGE",
+    _data = {},
+})
+assertEq(broadcastOk, false, "a dropped NEW_LOG send fails the broadcast")
+assertEq(broadcastErr, "comm send dropped", "a dropped NEW_LOG send keeps the reason")
+SF.LootHelperComm.Send = function()
+    return true
+end
+local sentOk = Sync:BroadcastNewLog(PROFILE, {
+    _eventType = "POINT_CHANGE",
+    _data = {},
+})
+assertEq(sentOk, true, "an accepted NEW_LOG send still broadcasts")
+SF.LootHelperComm.Send = originalSend
+end)()
 
 ;(function()
 local function scanFile(path)
