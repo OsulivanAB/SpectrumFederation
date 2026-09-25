@@ -6,6 +6,7 @@ uploads that same zip to CurseForge and Wago independently.
 """
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -927,7 +928,7 @@ def publish_to_wago(plan, *, dry_run=False, opener=None):
         else:
             print(f"::error ::Wago upload failed ({summary})")
         return None
-    except (urllib_error.URLError, TimeoutError, OSError) as error:
+    except (urllib_error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
         print(f"::error ::Wago upload failed: {sanitize_output(str(error))}")
         return None
 
@@ -1033,7 +1034,7 @@ def fetch_curseforge_json(path, token, *, timeout, opener=None):
             body = response.read().decode("utf-8", errors="replace")
     except urllib_error.HTTPError as error:
         return error.code, read_http_error_body(error), None
-    except (urllib_error.URLError, TimeoutError, OSError) as error:
+    except (urllib_error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
         return None, sanitize_output(str(error)), None
 
     try:
@@ -1230,8 +1231,11 @@ def find_existing_curseforge_release(project_id, version, zip_name, token, *, op
     Returns one of:
     - ("found", file)
     - ("absent", None)
-    - ("unavailable", reason) when the author API does not provide a usable list
-    - ("error", summary) for authentication failures
+    - ("unavailable", reason) when the list cannot be used
+
+    This route is not part of the documented Upload API. A forbidden list
+    response does not prove the upload token is invalid, so 401/403 is treated
+    as unavailable and the documented upload endpoint remains authoritative.
     """
     status, body, payload = fetch_curseforge_json(
         f"projects/{project_id}/files",
@@ -1244,8 +1248,6 @@ def find_existing_curseforge_release(project_id, version, zip_name, token, *, op
         if status is None
         else summarize_wago_http_error(status, body)
     )
-    if status in (401, 403):
-        return "error", summary
     if status != 200 or payload is None:
         return "unavailable", summary
     files = curseforge_object_list(payload)
@@ -1445,9 +1447,6 @@ def publish_to_curseforge(plan, *, dry_run=False, opener=None):
         token,
         opener=opener,
     )
-    if lookup == "error":
-        print(f"::error ::CurseForge authentication failed while checking existing files ({detail})")
-        return None
     if lookup == "found":
         print(
             "[publish-release] ✓ CurseForge already has this exact version; "
@@ -1505,7 +1504,7 @@ def publish_to_curseforge(plan, *, dry_run=False, opener=None):
             )
             return "already-exists"
         return None
-    except (urllib_error.URLError, TimeoutError, OSError) as error:
+    except (urllib_error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
         print(f"::error ::CurseForge network error ({sanitize_output(str(error))})")
         return None
 
@@ -1547,6 +1546,18 @@ def log_destination_results(*, github_ok, curseforge_ok, wago_ok):
         "An exact existing CurseForge or Wago release is treated as success and is not uploaded again. "
         "Do not delete GitHub, CurseForge, or Wago releases that already succeeded."
     )
+
+
+def _run_downstream_attempt(destination, attempt):
+    """Run one downstream publisher without letting its failure skip the other."""
+    try:
+        return bool(attempt())
+    except Exception as error:  # noqa: BLE001 - one downstream failure must not skip the other
+        print(
+            f"::error ::{destination} publication failed unexpectedly: "
+            f"{sanitize_output(str(error))}"
+        )
+        return False
 
 
 def _attempt_curseforge(
@@ -1684,21 +1695,27 @@ def publish_github_then_external(
         return False
     print(f"[publish-release] GitHub release action: {github_action}")
 
-    curseforge_ok = _attempt_curseforge(
-        version=version,
-        classification=classification,
-        addon_name=addon_name,
-        interface=interface,
-        zip_path=zip_path,
-        changelog=notes,
+    curseforge_ok = _run_downstream_attempt(
+        "CurseForge",
+        lambda: _attempt_curseforge(
+            version=version,
+            classification=classification,
+            addon_name=addon_name,
+            interface=interface,
+            zip_path=zip_path,
+            changelog=notes,
+        ),
     )
-    wago_ok = _attempt_wago(
-        version=version,
-        classification=classification,
-        addon_name=addon_name,
-        interface=interface,
-        zip_path=zip_path,
-        changelog=notes,
+    wago_ok = _run_downstream_attempt(
+        "Wago",
+        lambda: _attempt_wago(
+            version=version,
+            classification=classification,
+            addon_name=addon_name,
+            interface=interface,
+            zip_path=zip_path,
+            changelog=notes,
+        ),
     )
     log_destination_results(
         github_ok=True,

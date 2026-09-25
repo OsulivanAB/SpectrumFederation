@@ -237,7 +237,8 @@ The promotion workflow already runs this with `--dry-run` during its validation 
 - If GitHub succeeds and Wago fails, CurseForge is still attempted. Keep the GitHub Release and any CurseForge file that succeeded. Fix the Wago error and rerun the same version.
 - Do not delete a GitHub Release, CurseForge file, or Wago version because a different destination failed.
 - A Wago or CurseForge HTTP 409 is treated as success only when the response body clearly says this exact version or file already exists. An empty or generic 409 is a visible failure.
-- Before uploading, the publisher also checks `GET /api/projects/{projectId}/files` on the CurseForge author API for an exact zip name or display name. That list call is not part of the documented Upload API. If it is unavailable, duplicate safety falls back to the explicit upload response described above. A generic conflict is still a failure.
+- Before uploading, the publisher also checks `GET /api/projects/{projectId}/files` on the CurseForge author API for an exact zip name or display name. That list call is not part of the documented Upload API. A missing, forbidden, or otherwise unusable list response is treated as unavailable and does not block the upload. The documented upload endpoint decides authentication. Duplicate safety then falls back to the explicit upload response described above. A generic conflict is still a failure.
+- An unexpected error in the CurseForge attempt does not skip Wago, and an unexpected error in the Wago attempt does not discard a CurseForge result that already succeeded.
 - If the GitHub Release already exists, the existing update/reuse path is preserved, and CurseForge and Wago are still attempted afterward.
 
 ### Tests

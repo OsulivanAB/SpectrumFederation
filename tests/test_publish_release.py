@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import inspect
 import io
@@ -1397,12 +1398,68 @@ def test_github_failure_skips_curseforge_and_wago(tmp_path, monkeypatch, capsys)
     assert "CurseForge and Wago were not attempted" in output
 
 
-def test_file_list_auth_failure_does_not_upload(tmp_path, monkeypatch, capsys):
+def test_file_list_forbidden_still_uploads(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+    methods = []
 
     def opener(request, timeout=None):
-        assert request.get_method() == "GET"
-        raise _http_error(request, 401, b'{"message":"unauthorized"}')
+        methods.append(request.get_method())
+        if request.get_method() == "GET":
+            raise _http_error(request, 403, b'{"message":"forbidden"}')
+        return FakeResponse(200, b'{"id": 9}')
+
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener)
+    output = capsys.readouterr().out
+    assert result == "uploaded"
+    assert methods == ["GET", "POST"]
+    assert "file list is unavailable" in output
+    assert "authentication failed while checking existing files" not in output
+
+
+def test_truncated_curseforge_upload_is_a_destination_failure(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+
+    class TruncatedResponse(FakeResponse):
+        def read(self):
+            raise http.client.IncompleteRead(b"partial")
+
+    def opener(request, timeout=None):
+        if request.get_method() == "GET":
+            return FakeResponse(200, b"[]")
+        return TruncatedResponse()
 
     assert publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener) is None
-    assert "authentication failed while checking existing files" in capsys.readouterr().out
+    assert "CurseForge network error" in capsys.readouterr().out
+
+
+def test_unexpected_curseforge_error_still_attempts_wago(tmp_path, monkeypatch, capsys):
+    order = []
+
+    def fake_github(*args, **kwargs):
+        order.append("github")
+        return "created"
+
+    def upload_curseforge(plan, **kwargs):
+        order.append("curseforge-upload")
+        raise RuntimeError("truncated response")
+
+    def resolve_wago(**kwargs):
+        order.append("wago-plan")
+        return _plan(tmp_path)
+
+    def upload_wago(plan, **kwargs):
+        order.append("wago-upload")
+        return "uploaded"
+
+    monkeypatch.setattr(publish, "create_github_release", fake_github)
+    monkeypatch.setattr(publish, "resolve_curseforge_publish_plan", lambda **kwargs: _curseforge_plan(tmp_path))
+    monkeypatch.setattr(publish, "publish_to_curseforge", upload_curseforge)
+    monkeypatch.setattr(publish, "resolve_wago_publish_plan", resolve_wago)
+    monkeypatch.setattr(publish, "publish_to_wago", upload_wago)
+
+    result = publish.publish_github_then_external(**_orchestrator_args(tmp_path), dry_run=False)
+    output = capsys.readouterr().out
+    assert result is False
+    assert order == ["github", "curseforge-upload", "wago-plan", "wago-upload"]
+    assert "CurseForge publication failed unexpectedly" in output
+    assert "CurseForge failed, Wago succeeded" in output
