@@ -1326,6 +1326,20 @@ function Integration.AwardReasonHistoryResponseId(entry)
     return AwardReasonHistoryResponseId(entry)
 end
 
+-- The Master Looter "Number of buttons" / "Number of reasons" sliders only
+-- enable the leading rows. RC still stores the unused rows, including names
+-- that were removed from the active set, so the dropdown must not list them.
+local function ActiveSliderCount(profile, key)
+    local count = tonumber(profile and profile[key])
+    if not count then
+        return nil
+    end
+    if count < 0 then
+        count = 0
+    end
+    return math.floor(count)
+end
+
 local function GetRCResponseOptions()
     local options = {}
     local seen = {}
@@ -1351,12 +1365,14 @@ local function GetRCResponseOptions()
     local db = rc and rc.Getdb and rc:Getdb() or (rc and rc.db)
     local profile = db and (db.profile or db)
     local responses = profile and profile.responses
+    local activeButtons = ActiveSliderCount(profile, "numButtons")
     if type(responses) == "table" then
         for typeCode, group in pairs(responses) do
             if type(group) == "table" then
                 for id, entry in pairs(group) do
                     local numericId = tonumber(id)
-                    if type(entry) == "table" and numericId then
+                    local withinActiveButtons = (not activeButtons) or (numericId and numericId >= 1 and numericId <= activeButtons)
+                    if type(entry) == "table" and numericId and withinActiveButtons then
                         local text = entry.text or entry.label or entry.name
                         if type(text) == "string" and strtrim(text) ~= "" then
                             add({
@@ -1374,8 +1390,12 @@ local function GetRCResponseOptions()
         end
     end
     local awardReasons = profile and profile.awardReasons
+    local activeReasons = ActiveSliderCount(profile, "numAwardReasons")
     if type(awardReasons) == "table" then
-        for _, entry in ipairs(awardReasons) do
+        for index, entry in ipairs(awardReasons) do
+            if activeReasons and index > activeReasons then
+                break
+            end
             if type(entry) == "table" then
                 local text = entry.text or entry.label
                 local responseId = AwardReasonHistoryResponseId(entry)

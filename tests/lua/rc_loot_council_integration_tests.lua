@@ -1461,16 +1461,23 @@ function testRcSettingsControlContract()
         Getdb = function()
             return {
                 profile = {
+                    numButtons = 1,
+                    numAwardReasons = 1,
                     responses = {
                         default = {
                             [1] = { text = "Need" },
+                            [5] = { text = "MOG BABY!" },
+                            [10] = { text = "Button10" },
                         },
                         WEAPON = {
                             [1] = { text = "Need" },
+                            [6] = { text = "Button6" },
                         },
                     },
                     awardReasons = {
                         { text = "Disenchant", sort = 405, log = true },
+                        { text = "Reason 4", sort = 404, log = true },
+                        { text = "Reason 10", sort = 410, log = true },
                     },
                 },
             }
@@ -1507,6 +1514,87 @@ function testRcSettingsControlContract()
         end
     end
     assertTrue(sawDefaultNeedLabel and sawWeaponNeedLabel and sawDisenchantLabel, "dropdown covers both Need contexts and the award reason")
+    local function optionTextSeen(options, text)
+        for i = 1, #options do
+            if options[i].textLabel == text then
+                return true
+            end
+        end
+        return false
+    end
+    assertFalse(optionTextSeen(dropdownOptions, "MOG BABY!"), "retired button text beyond the button slider is hidden")
+    assertFalse(optionTextSeen(dropdownOptions, "Button10"), "unused default button slots beyond the slider are hidden")
+    assertFalse(optionTextSeen(dropdownOptions, "Button6"), "unused slots in another button group are hidden")
+    assertFalse(optionTextSeen(dropdownOptions, "Reason 4"), "award reasons beyond the reason slider are hidden")
+    assertFalse(optionTextSeen(dropdownOptions, "Reason 10"), "trailing default award reasons are hidden")
+    assertEq(#dropdownOptions, 3, "active sliders leave the two Need buttons and one award reason")
+
+    local limitedRc = _G.RCLootCouncil
+    _G.RCLootCouncil = {
+        Getdb = function()
+            return {
+                profile = {
+                    numButtons = 4,
+                    numAwardReasons = 3,
+                    responses = {
+                        default = {
+                            [1] = { text = "Need" },
+                            [2] = { text = "Want" },
+                            [3] = { text = "Alt Spec" },
+                            [4] = { text = "Transmog" },
+                            [5] = { text = "MOG BABY!" },
+                            [6] = { text = "Button6" },
+                            [10] = { text = "Button10" },
+                        },
+                    },
+                    awardReasons = {
+                        { text = "Disenchant", sort = 401, log = true },
+                        { text = "Banking", sort = 402, log = true },
+                        { text = "Free", sort = 403, log = false },
+                        { text = "Reason 4", sort = 404, log = true },
+                        { text = "Reason 10", sort = 410, log = true },
+                    },
+                },
+            }
+        end,
+    }
+    local configuredOptions = Integration.GetRCResponseOptions()
+    assertEq(#configuredOptions, 7, "four active buttons plus three active award reasons")
+    assertTrue(optionTextSeen(configuredOptions, "Need"), "active button 1 stays listed")
+    assertTrue(optionTextSeen(configuredOptions, "Want"), "active button 2 stays listed")
+    assertTrue(optionTextSeen(configuredOptions, "Alt Spec"), "active button 3 stays listed")
+    assertTrue(optionTextSeen(configuredOptions, "Transmog"), "active button 4 stays listed")
+    assertTrue(optionTextSeen(configuredOptions, "Disenchant"), "active award reason text is listed")
+    assertTrue(optionTextSeen(configuredOptions, "Banking"), "active award reason uses its text, not Reason2")
+    assertTrue(optionTextSeen(configuredOptions, "Free"), "active award reason with logging off stays listed")
+    assertFalse(optionTextSeen(configuredOptions, "MOG BABY!"), "a former button past the slider is not offered")
+    assertFalse(optionTextSeen(configuredOptions, "Button6"), "default button rows past the slider are not offered")
+    assertFalse(optionTextSeen(configuredOptions, "Button10"), "the last unused button row is not offered")
+    assertFalse(optionTextSeen(configuredOptions, "Reason 4"), "default reason rows past the slider are not offered")
+    assertFalse(optionTextSeen(configuredOptions, "Reason 10"), "the last unused reason row is not offered")
+
+    _G.RCLootCouncil = {
+        Getdb = function()
+            return {
+                profile = {
+                    responses = {
+                        default = {
+                            [1] = { text = "Need" },
+                            [5] = { text = "MOG BABY!" },
+                        },
+                    },
+                    awardReasons = {
+                        { text = "Disenchant", sort = 401 },
+                        { text = "Reason 4", sort = 404 },
+                    },
+                },
+            }
+        end,
+    }
+    local storedRows = Integration.GetRCResponseOptions()
+    assertTrue(optionTextSeen(storedRows, "MOG BABY!"), "without a button slider, stored response rows stay available")
+    assertTrue(optionTextSeen(storedRows, "Reason 4"), "without a reason slider, stored award reasons stay available")
+    _G.RCLootCouncil = limitedRc
 
     assertTrue(settingsProfile:AddRCLootCouncilBisResponse("Need"), "stored text-only Need is already configured")
     assertTrue(settingsProfile:AddRCLootCouncilBisResponse({
