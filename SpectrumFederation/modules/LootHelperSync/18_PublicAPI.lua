@@ -132,6 +132,7 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._userSyncGeneration = nil
     self.state._userSyncRegisteredCount = nil
     self.state._userSyncRegisterRejected = nil
+    self.state._hadAuthorizedRoute = nil
     self.state._diagOnce = nil
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
@@ -941,6 +942,7 @@ function Sync:_ResetSessionState(reason)
     self.state._userSyncGeneration = nil
     self.state._userSyncRegisteredCount = nil
     self.state._userSyncRegisterRejected = nil
+    self.state._hadAuthorizedRoute = nil
     self.state._diagOnce = nil
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil

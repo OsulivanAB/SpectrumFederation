@@ -452,11 +452,18 @@ function Sync:RequestMissingLogs(missingRanges, reason, opts)
                         if #rest >= maxRanges then break end
                     end
                     if #rest > 0 then
-                        self:QueueRepairRanges(self.state.profileId, rest, {
+                        local queued, dropped, retained = self:QueueRepairRanges(self.state.profileId, rest, {
                             mode = "missing",
                             reason = reason or "no-route",
                             preferredTarget = preferredTarget,
                         })
+                        if self.state._userInitiatedSync == true
+                            and (tonumber(dropped) or 0) > 0
+                            and not queued
+                            and (tonumber(retained) or 0) == 0
+                        then
+                            self.state._userSyncRegisterRejected = true
+                        end
                     end
                 end
                 return count > 0

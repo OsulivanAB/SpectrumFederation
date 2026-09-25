@@ -317,6 +317,7 @@ local function reset(selfName)
     Sync.state._userSyncGeneration = nil
     Sync.state._userSyncRegisteredCount = nil
     Sync.state._userSyncRegisterRejected = nil
+    Sync.state._hadAuthorizedRoute = nil
     Sync.state._diagOnce = nil
     Sync.state.repairQueue = { order = {}, items = {} }
     Sync.state._coordinatorCatchUp = nil
@@ -5498,6 +5499,81 @@ assertEq(warningCount("Synchronization did not start"), 1, "a full request table
 assertEq(warningCount("Profile sync did not finish"), 0, "a rejected manual sync has no request to fail later")
 Sync.cfg.maxOutstandingRequests = previousMax
 Sync.SendJoinStatus = savedSend
+end)()
+
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.helpers = {}
+Sync.state.coordinator = COORD
+Sync.state.isCoordinator = false
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local savedMissing = Sync.ComputeMissingLogRequests
+local savedMismatch = Sync.ComputeWindowMismatchRequests
+local savedSend = Sync.SendJoinStatus
+local savedQueue = Sync.QueueRepairRanges
+Sync.SendJoinStatus = productionSendJoinStatus
+Sync.QueueRepairRanges = productionQueueRepairRanges
+Sync.ComputeMissingLogRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 3, toCounter = 4 },
+    }
+end
+Sync.ComputeWindowMismatchRequests = function()
+    return {}
+end
+Sync.cfg.maxQueuedRepairRanges = 1
+Sync.state.repairQueue = {
+    order = { "held" },
+    items = {
+        held = {
+            key = "held",
+            profileId = PROFILE,
+            author = "Other-Realm",
+            fromCounter = 1,
+            toCounter = 1,
+            mode = "missing",
+        },
+    },
+}
+local ok, status = Sync:RequestManualSync("queue-full")
+assertEq(ok, false, "a full repair queue does not report manual sync success")
+assertEq(status, "sync_busy", "a full repair queue reports sync_busy")
+assertEq(warningCount("Synchronization did not start"), 1, "a full repair queue warns the manual caller")
+assertEq(#(Sync.state.repairQueue.order or {}), 1, "a full repair queue does not keep the new range")
+Sync.cfg.maxQueuedRepairRanges = nil
+Sync.ComputeMissingLogRequests = savedMissing
+Sync.ComputeWindowMismatchRequests = savedMismatch
+Sync.SendJoinStatus = savedSend
+Sync.QueueRepairRanges = savedQueue
+end)()
+
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.helpers = {}
+Sync.state.coordinator = COORD
+Sync.state.isCoordinator = false
+Sync:ApplyAdvertisedHelpers({}, "no-route")
+assertEq(Sync.state._hadAuthorizedRoute, false, "a coordinator who is not an admin is not a route")
+local now = Sync:_Now()
+Sync.state.repairQueue = {
+    order = { "pending" },
+    items = {
+        pending = {
+            lastQueueFailure = "no_targets",
+            nextAttemptAt = now + 500,
+        },
+    },
+}
+setAdmins({ COORD, OWNER })
+local changed = Sync:ApplyAdvertisedHelpers({}, "grant-without-helper-change")
+assertEq(changed, false, "restoring the coordinator does not change the helper list")
+local entry = Sync.state.repairQueue.items.pending
+assertTrue(type(entry) == "table" and entry.nextAttemptAt <= now,
+    "a restored coordinator route makes no-target work due")
 end)()
 
 ;(function()

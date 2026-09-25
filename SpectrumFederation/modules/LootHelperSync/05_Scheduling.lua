@@ -176,6 +176,8 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
 
     local queue = self:_EnsureRepairQueueState()
     local added = 0
+    local dropped = 0
+    local retained = 0
     local now = self:_Now()
     local limit = tonumber(self.cfg and self.cfg.maxQueuedRepairRanges) or 96
 
@@ -211,6 +213,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                 local entry = queue.items[key]
                 if not entry then
                     if #queue.order >= limit then
+                        dropped = dropped + 1
                         if SF.Debug then
                             SF.Debug:Warn("SYNC", "Dropping queued repair (queue full profileId=%s author=%s range=%d-%d mode=%s)",
                                 tostring(profileId), tostring(author), fromCounter, toCounter, tostring(mode))
@@ -236,6 +239,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
                         added = added + 1
                     end
                 else
+                    retained = retained + 1
                     entry.reason = opts.reason or entry.reason
                     if self._PreferredRepairTargetRoutable and type(entry.preferredTarget) == "string"
                         and not self:_PreferredRepairTargetRoutable(entry.preferredTarget)
@@ -272,7 +276,7 @@ function Sync:QueueRepairRanges(profileId, ranges, opts)
         self:_KickRepairConvergence("queued_repair")
     end
 
-    return added > 0
+    return added > 0, dropped, retained
 end
 
 function Sync:_RememberPendingProfileSnapshot(reason)

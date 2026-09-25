@@ -596,6 +596,23 @@ function Sync:_FilterHelpersToAuthorized(helpers)
     return self:_CapUniqueHelpers(helpers, { requireAuthorized = true })
 end
 
+-- Function Remember whether an authorized route exists, and wake no-route work when one appears.
+-- Helper-list edits can also force that wake while a route is already present.
+-- @param reason string|nil Diagnostic reason
+-- @param force boolean|nil True when the caller changed routing and wants due work retried
+-- @return boolean True when no-route work was made due
+function Sync:_NoteAuthorizedRouteTransition(reason, force)
+    if not self.state then return false end
+    local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
+    local hasRoutes = type(routes) == "table" and #routes > 0
+    local hadRoutes = self.state._hadAuthorizedRoute == true
+    self.state._hadAuthorizedRoute = hasRoutes
+    if hasRoutes and self._ExpediteNoRouteSynchronization and (force == true or not hadRoutes) then
+        return self:_ExpediteNoRouteSynchronization(reason or "route_restored") == true
+    end
+    return false
+end
+
 -- Function Install the effective helper list and retarget requests when it changes.
 -- @param helpers table|nil Advertised helper names
 -- @param reason string|nil Diagnostic reason
@@ -607,11 +624,8 @@ function Sync:ApplyAdvertisedHelpers(helpers, reason)
     if changed and self._RefreshOutstandingRequestTargets then
         self:_RefreshOutstandingRequestTargets()
     end
-    if changed and self._ExpediteNoRouteSynchronization then
-        local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
-        if type(routes) == "table" and #routes > 0 then
-            self:_ExpediteNoRouteSynchronization("helpers_updated")
-        end
+    if self._NoteAuthorizedRouteTransition then
+        self:_NoteAuthorizedRouteTransition(changed and "helpers_updated" or "route_restored", changed)
     end
     if changed and SF.Debug then
         SF.Debug:Info("SYNC", "Helper routing updated (%s, count=%d)", tostring(reason or "update"), #filtered)
@@ -2321,6 +2335,9 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     local reasonText = tostring(reason or "")
     if reasonText == "rebuild:live_update" then
         self:_ApplyExplicitRevocationRouting(reasonText)
+        if self._NoteAuthorizedRouteTransition then
+            self:_NoteAuthorizedRouteTransition("admin_reconcile", false)
+        end
         self._reconcilingSessionAuthorization = nil
         return
     end
