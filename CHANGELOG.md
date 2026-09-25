@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.6-beta.4] - 2026-09-25
+
+### Fixed
+- Fix RC Loot Council BiS response labels and list rows
+
 ## [1.5.6-beta.3] - 2026-09-25
 
 ### Changed
