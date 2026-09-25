@@ -645,7 +645,7 @@ function Page:Build(panel)
 							},
 							{
 								type = "dropdown",
-								tooltip = "Show only log entries whose Author is a specific player.",
+								tooltip = "Show only log entries created by a specific player.",
 								defaultText = "All Authors",
 								width = 190,
 								options = function()
