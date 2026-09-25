@@ -1334,9 +1334,13 @@ local function GetRCResponseOptions()
             return
         end
         seen[entry.key] = true
+        -- Settings dropdowns render `label`. `value` stays the ctx key used
+        -- for award matching, and `textLabel` is the raw RC response text.
+        local displayLabel = entry.label or entry.text
         options[#options + 1] = {
             value = entry.key,
-            text = entry.label or entry.text,
+            label = displayLabel,
+            text = displayLabel,
             typeCode = entry.typeCode,
             responseId = entry.responseId,
             isAwardReason = entry.isAwardReason and true or false,
@@ -1590,7 +1594,11 @@ function Integration.RegisterSettingsPage()
                                 end
                                 local items = {}
                                 for _, value in ipairs(cfg.allowedResponses or {}) do
-                                    items[#items + 1] = { id = value, label = value }
+                                    items[#items + 1] = {
+                                        id = value,
+                                        text = value,
+                                        canRemove = true,
+                                    }
                                 end
                                 return items
                             end,
@@ -1711,7 +1719,11 @@ function Integration.RegisterSettingsPage()
                                     elseif value.typeCode and value.responseId ~= nil then
                                         label = string.format("%s [%s #%s]", label, tostring(value.typeCode), tostring(value.responseId))
                                     end
-                                    items[#items + 1] = { id = value.key or value.text, label = label }
+                                    items[#items + 1] = {
+                                        id = value.key or value.text,
+                                        text = label,
+                                        canRemove = true,
+                                    }
                                 end
                                 return items
                             end,

@@ -1412,13 +1412,15 @@ assertEq(
     "Need",
     "hidden allow-list keeps stored values"
 )
-assertEq(listItem.getItems()[1].label, "Need", "getItems still returns stored types while hidden")
+assertEq(listItem.getItems()[1].text, "Need", "getItems still returns stored types while hidden")
+assertTrue(listItem.getItems()[1].canRemove, "hidden allowed types still expose a remove control")
 
 refreshCount = 0
 recordAllItem.set(false)
 assertTrue(refreshCount >= 1, "toggling record-all back on calls DefinitionRenderer:Refresh")
 assertTrue(lastAllowCondition, "record-all true→false immediately shows Allowed Award Types")
-assertEq(listItem.getItems()[1].label, "Need", "stored allowed types reappear after the section is shown")
+assertEq(listItem.getItems()[1].text, "Need", "stored allowed types reappear after the section is shown")
+assertTrue(listItem.getItems()[1].canRemove, "shown allowed types expose a remove control")
 
 refreshCount = 0
 recordAwardsItem.set(false)
@@ -1429,6 +1431,191 @@ assertFalse(lastAllowCondition, "recordAwards false hides Allowed Award Types")
 recordAwardsItem.set(true)
 assertTrue(lastRecordAllVisible, "recordAwards true shows Record all award types")
 assertTrue(lastAllowCondition, "recordAwards true shows Allowed Award Types when record-all is false")
+
+-- Global on purpose: this chunk is already at Lua 5.1's 200-local limit.
+function testRcSettingsControlContract()
+    local function displayedDropdownLabel(opt)
+        if type(opt) == "table" then
+            return tostring(opt.label or opt.value)
+        end
+        return tostring(opt)
+    end
+
+    local function findRowByText(items, text)
+        for i = 1, #(items or {}) do
+            if items[i].text == text then
+                return items[i]
+            end
+        end
+        return nil
+    end
+
+    local bisSec = findSection(capturedDef, "bisResponses")
+    local addFromRc = findItem(bisSec, "Add from RC Loot Council")
+    local addBis = findItem(bisSec, "Add BiS response")
+    local bisList = findItem(bisSec, "BiS responses")
+    assertTrue(addFromRc ~= nil and addBis ~= nil and bisList ~= nil, "BiS dropdown, manual add, and list exist")
+
+    local previousRc = _G.RCLootCouncil
+    _G.RCLootCouncil = {
+        Getdb = function()
+            return {
+                profile = {
+                    responses = {
+                        default = {
+                            [1] = { text = "Need" },
+                        },
+                        WEAPON = {
+                            [1] = { text = "Need" },
+                        },
+                    },
+                    awardReasons = {
+                        { text = "Disenchant", sort = 405, log = true },
+                    },
+                },
+            }
+        end,
+    }
+
+    local dropdownOptions = addFromRc.options()
+    assertTrue(#dropdownOptions >= 3, "RC dropdown enumerates configured responses")
+    local sawDefaultNeedLabel, sawWeaponNeedLabel, sawDisenchantLabel = false, false, false
+    local weaponNeedValue, disenchantValue
+    for i = 1, #dropdownOptions do
+        local opt = dropdownOptions[i]
+        local shown = displayedDropdownLabel(opt)
+        assertTrue(type(opt.value) == "string" and opt.value:match("^ctx:"), "dropdown value keeps the ctx identity")
+        assertFalse(shown:match("^ctx:"), "dropdown label does not expose the ctx key")
+        assertTrue(shown ~= tostring(opt.value), "dropdown shows the readable label rather than the value")
+        assertEq(opt.label, shown, "shared dropdown contract reads opt.label")
+        if opt.typeCode == "default" and opt.responseId == 1 and opt.textLabel == "Need" then
+            assertEq(shown, "Need (default #1)", "default Need is disambiguated in the dropdown")
+            assertEq(opt.value, "ctx:default|1|0", "default Need keeps its contextual value")
+            sawDefaultNeedLabel = true
+        end
+        if opt.typeCode == "WEAPON" and opt.responseId == 1 and opt.textLabel == "Need" then
+            assertEq(shown, "Need (WEAPON #1)", "weapon Need stays distinct from default Need")
+            assertEq(opt.value, "ctx:WEAPON|1|0", "weapon Need keeps its contextual value")
+            weaponNeedValue = opt.value
+            sawWeaponNeedLabel = true
+        end
+        if opt.isAwardReason and opt.responseId == 5 and opt.textLabel == "Disenchant" then
+            assertEq(shown, "Disenchant (award reason #5)", "award reason uses a readable dropdown label")
+            assertEq(opt.value, "ctx:awardReason|5|1", "award reason keeps its contextual value")
+            disenchantValue = opt.value
+            sawDisenchantLabel = true
+        end
+    end
+    assertTrue(sawDefaultNeedLabel and sawWeaponNeedLabel and sawDisenchantLabel, "dropdown covers both Need contexts and the award reason")
+
+    assertTrue(settingsProfile:AddRCLootCouncilBisResponse("Need"), "stored text-only Need is already configured")
+    assertTrue(settingsProfile:AddRCLootCouncilBisResponse({
+        text = "Need",
+        typeCode = "default",
+        responseId = 1,
+        isAwardReason = false,
+    }), "stored contextual Need is already configured")
+    local seededRows = bisList.getItems()
+    local seededText = findRowByText(seededRows, "Need")
+    local seededDefault = findRowByText(seededRows, "Need [default #1]")
+    assertTrue(seededText ~= nil, "previously stored text-only BiS response is visible")
+    assertTrue(seededDefault ~= nil, "previously stored contextual BiS response is visible")
+    assertTrue(seededText.canRemove and seededDefault.canRemove, "stored BiS responses expose remove controls")
+    assertEq(seededText.id, "text:need", "text-only row id is the stored text key")
+    assertEq(seededDefault.id, "ctx:default|1|0", "contextual row id preserves the stored key")
+    assertFalse(tostring(seededText.text):match("^ctx:") or tostring(seededDefault.text):match("^ctx:"), "BiS list text does not expose ctx keys")
+
+    local uiRefresh = 0
+    local uiMessages = {}
+    local uiCtx = {
+        section = {
+            ClearMessage = function() end,
+            SetMessage = function(_, text, _kind)
+                uiMessages[#uiMessages + 1] = tostring(text)
+            end,
+        },
+        pageBuilder = {
+            Refresh = function()
+                uiRefresh = uiRefresh + 1
+            end,
+        },
+    }
+    local bisEdit = { text = "Greed", SetText = function(self, value) self.text = value end }
+    local beforeManual = #bisList.getItems()
+    addBis.onSubmit(uiCtx, "Greed", bisEdit)
+    assertEq(uiRefresh, 1, "adding a BiS response refreshes the settings page")
+    assertEq(bisEdit.text, "", "successful manual add clears the edit box")
+    local greedRow = findRowByText(bisList.getItems(), "Greed")
+    assertTrue(greedRow ~= nil and greedRow.canRemove, "manually added BiS response is visible and removable")
+    assertEq(#bisList.getItems(), beforeManual + 1, "manual add appends one visible row")
+
+    uiMessages = {}
+    addBis.onSubmit(uiCtx, "Greed", bisEdit)
+    assertEq(uiMessages[#uiMessages], "That BiS response is already in the list.", "duplicate BiS add reports the existing entry")
+    assertEq(#bisList.getItems(), beforeManual + 1, "duplicate BiS add leaves the visible list unchanged")
+    assertTrue(findRowByText(bisList.getItems(), "Greed") ~= nil, "duplicate rejection does not hide the existing row")
+
+    addFromRc.set(weaponNeedValue)
+    assertEq(settingsPanel.__sfBisResponseSelected, weaponNeedValue, "dropdown selection stores the ctx value")
+    local beforeWeapon = #bisList.getItems()
+    uiRefresh = 0
+    addFromRc.onIconClick(uiCtx)
+    assertEq(uiRefresh, 1, "dropdown add refreshes the settings page")
+    local weaponRow = findRowByText(bisList.getItems(), "Need [WEAPON #1]")
+    assertTrue(weaponRow ~= nil and weaponRow.canRemove, "dropdown-added contextual response is visible and removable")
+    assertEq(#bisList.getItems(), beforeWeapon + 1, "dropdown add appends one visible row")
+    local storedWeapon
+    for _, entry in ipairs(settingsProfile:GetRCLootCouncilIntegrationConfig().bisResponses) do
+        if entry.key == "ctx:WEAPON|1|0" then
+            storedWeapon = entry
+        end
+    end
+    assertTrue(storedWeapon ~= nil, "dropdown add persists the contextual response")
+    assertEq(storedWeapon.text, "Need", "persisted text is the raw RC label, not the dropdown decoration")
+    assertEq(storedWeapon.typeCode, "WEAPON", "persisted typeCode distinguishes the weapon context")
+    assertEq(storedWeapon.responseId, 1, "persisted responseId is unchanged")
+    assertFalse(storedWeapon.isAwardReason, "normal response is not stored as an award reason")
+
+    addFromRc.set(disenchantValue)
+    addFromRc.onIconClick(uiCtx)
+    local storedDisenchant
+    for _, entry in ipairs(settingsProfile:GetRCLootCouncilIntegrationConfig().bisResponses) do
+        if entry.key == "ctx:awardReason|5|1" then
+            storedDisenchant = entry
+        end
+    end
+    assertTrue(storedDisenchant ~= nil, "award-reason dropdown add persists contextual identity")
+    assertEq(storedDisenchant.text, "Disenchant", "award-reason text stays the raw RC label")
+    assertEq(storedDisenchant.responseId, 5, "award-reason responseId stays sort-400")
+    assertTrue(storedDisenchant.isAwardReason, "award-reason flag stays set")
+    assertEq(storedDisenchant.typeCode, nil, "award-reason storage does not invent a typeCode")
+    local disenchantRow = findRowByText(bisList.getItems(), "Disenchant [award reason #5]")
+    assertTrue(disenchantRow ~= nil and disenchantRow.canRemove, "award-reason BiS row is visible and removable")
+
+    uiRefresh = 0
+    bisList.onRemove(uiCtx, greedRow)
+    assertEq(uiRefresh, 1, "removing a BiS response refreshes the settings page")
+    assertEq(findRowByText(bisList.getItems(), "Greed"), nil, "removed BiS response disappears immediately")
+    assertTrue(findRowByText(bisList.getItems(), "Need") ~= nil, "removing one response leaves the text-only entry")
+    assertTrue(findRowByText(bisList.getItems(), "Need [default #1]") ~= nil, "removing one response leaves the other Need context")
+    assertTrue(findRowByText(bisList.getItems(), "Need [WEAPON #1]") ~= nil, "removing one response leaves the weapon Need")
+
+    local beforeOffspec = #listItem.getItems()
+    assertTrue(settingsProfile:AddRCLootCouncilAllowedResponse("Offspec"), "admin can add another allowed type")
+    local offspecRow = findRowByText(listItem.getItems(), "Offspec")
+    assertTrue(offspecRow ~= nil and offspecRow.canRemove, "allowed award type is visible and removable")
+    assertEq(offspecRow.id, "Offspec", "allowed award type id is the stored text")
+    assertEq(#listItem.getItems(), beforeOffspec + 1, "allowed award type add appends one visible row")
+    uiRefresh = 0
+    listItem.onRemove(uiCtx, offspecRow)
+    assertEq(uiRefresh, 1, "removing an allowed award type refreshes the settings page")
+    assertEq(findRowByText(listItem.getItems(), "Offspec"), nil, "removed allowed award type disappears immediately")
+    assertTrue(findRowByText(listItem.getItems(), "Need") ~= nil, "removing one allowed type leaves the other")
+
+    _G.RCLootCouncil = previousRc
+end
+testRcSettingsControlContract()
+testRcSettingsControlContract = nil
 
 assertTrue(capturedDef.isAdmin(), "admin user evaluates as admin for the renderer")
 
