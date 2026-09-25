@@ -14,6 +14,7 @@ local Page = {
 	},
 }
 local GetEventTypeLabel
+local DisplayAuthor
 
 -- ==================================================================
 -- Helpers
@@ -35,11 +36,9 @@ end
 local function GetUniqueAuthors(logs)
 	local authorsSet = {}
 	for _, log in ipairs(logs) do
-		if type(log.GetAuthor) == "function" then
-			local author = log:GetAuthor()
-			if author then
-				authorsSet[author] = true
-			end
+		local author = DisplayAuthor(log)
+		if type(author) == "string" and author ~= "" then
+			authorsSet[author] = true
 		end
 	end
 	
@@ -108,7 +107,11 @@ local function GetEventTypeOptions()
 	
 	local options = {}
 	for _, eventType in pairs(SF.LootLogEventTypes) do
-		table.insert(options, { value = eventType, label = GetEventTypeLabel(eventType) })
+		-- BIS_OUTCOME is grouped into the RC Loot Council filter. A second
+		-- option with the same label would look like a duplicate category.
+		if eventType ~= "BIS_OUTCOME" then
+			table.insert(options, { value = eventType, label = GetEventTypeLabel(eventType) })
+		end
 	end
 	
 	table.sort(options, function(a, b) return a.label < b.label end)
@@ -169,7 +172,6 @@ local EVENT_TYPE_COLORS = {
 	RC_LOOT_COUNCIL = "|cffff99cc",
 	BONUS_ROLL = "|cffcc99ff",
 	SPEC_CHANGE = "|cff99ccff",
-	BIS_OUTCOME = "|cff66ffcc",
 	BIS_OVERRIDE = "|cffffcc66",
 	MANUAL_AWARD = "|cffccff66",
 	MANUAL_AWARD_REVERSE = "|cffff9966",
@@ -197,14 +199,87 @@ local EVENT_TYPE_LABELS = {
 	RC_LOOT_COUNCIL = "RC Loot Council",
 	BONUS_ROLL = "Bonus Roll",
 	SPEC_CHANGE = "Spec Change",
-	BIS_OUTCOME = "BiS Outcome",
 	BIS_OVERRIDE = "Gear Override",
 	MANUAL_AWARD = "Manual Award",
 	MANUAL_AWARD_REVERSE = "Manual Award Reverse",
 }
 
+-- Visible BIS_OUTCOME rows share the RC Loot Council category and color.
+-- The stored event type stays BIS_OUTCOME. NOT_BIS remains hidden by
+-- HiddenLootLogIds and never becomes its own filter option.
 function GetEventTypeLabel(eventType)
+	if eventType == "BIS_OUTCOME" then
+		return EVENT_TYPE_LABELS.RC_LOOT_COUNCIL
+	end
 	return EVENT_TYPE_LABELS[eventType] or tostring(eventType or "Unknown")
+end
+
+local function GetEventTypeColor(eventType)
+	if eventType == "BIS_OUTCOME" then
+		return EVENT_TYPE_COLORS.RC_LOOT_COUNCIL
+	end
+	return EVENT_TYPE_COLORS[eventType] or "|cffffffff"
+end
+
+local function LogMatchesEventTypeFilter(eventType, selected)
+	if selected == nil or selected == "" then
+		return true
+	end
+	if selected == "BIS_OUTCOME" then
+		selected = "RC_LOOT_COUNCIL"
+	end
+	if selected == "RC_LOOT_COUNCIL" then
+		return eventType == "RC_LOOT_COUNCIL" or eventType == "BIS_OUTCOME"
+	end
+	return eventType == selected
+end
+
+local function PersistedAuthor(log)
+	if type(log) == "table" and type(log.GetAuthor) == "function" then
+		return log:GetAuthor()
+	end
+	return nil
+end
+
+-- Display-only. Does not read or write log._author except through GetAuthor.
+-- A missing or inconsistent source RC award falls back to the stored writer.
+local function SourceAwardAuthor(log)
+	if type(log) ~= "table" or type(log.GetEventType) ~= "function" or log:GetEventType() ~= "BIS_OUTCOME" then
+		return nil
+	end
+	local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
+	if type(profile) ~= "table" or type(profile.GetLogById) ~= "function" then
+		return nil
+	end
+	local data = type(log.GetEventData) == "function" and log:GetEventData() or nil
+	if type(data) ~= "table" then
+		return nil
+	end
+	local sourceId = data.sourceLogId
+	if type(sourceId) ~= "string" or sourceId == "" then
+		return nil
+	end
+	local Bis = SF.LootHelperBis
+	if not (Bis and type(Bis.IsOutcomeSourceConsistent) == "function") then
+		return nil
+	end
+	local rcLog = profile:GetLogById(sourceId)
+	if type(rcLog) ~= "table" or not Bis.IsOutcomeSourceConsistent(data, rcLog) then
+		return nil
+	end
+	if type(rcLog.GetAuthor) ~= "function" then
+		return nil
+	end
+	local author = rcLog:GetAuthor()
+	if type(author) ~= "string" or author == "" then
+		return nil
+	end
+	return author
+end
+
+function DisplayAuthor(log)
+	local persisted = PersistedAuthor(log)
+	return SourceAwardAuthor(log) or persisted
 end
 
 local function ColorizeName(name)
@@ -420,11 +495,10 @@ local function BuildLogRow(log)
 	end
 
 	local timestamp = log:GetTimestamp()
-	local rawAuthor = log:GetAuthor() or "Unknown"
 	local eventType = log:GetEventType() or "Unknown"
 	local data = type(log.GetEventData) == "function" and (log:GetEventData() or {}) or {}
-	local author = rawAuthor
-	local eventColor = EVENT_TYPE_COLORS[eventType] or "|cffffffff"
+	local author = DisplayAuthor(log) or "Unknown"
+	local eventColor = GetEventTypeColor(eventType)
 	local reset = "|r"
 
 	local dateText = type(SF.FormatTimestampForUser) == "function"
@@ -481,13 +555,14 @@ function Page:Build(panel)
 					include = false
 				end
 				
-				-- Filter by event type
-				if panel.__sfSelectedEventType and log:GetEventType() ~= panel.__sfSelectedEventType then
+				-- RC Loot Council also includes visible BIS_OUTCOME rows.
+				-- Hidden NOT_BIS and duplicate outcomes are already excluded.
+				if not LogMatchesEventTypeFilter(log:GetEventType(), panel.__sfSelectedEventType) then
 					include = false
 				end
 				
-				-- Filter by author
-				if panel.__sfSelectedAuthor and log:GetAuthor() ~= panel.__sfSelectedAuthor then
+				-- Filter by the author shown in the table.
+				if include and panel.__sfSelectedAuthor and DisplayAuthor(log) ~= panel.__sfSelectedAuthor then
 					include = false
 				end
 				
@@ -553,7 +628,11 @@ function Page:Build(panel)
 									return GetEventTypeOptions()
 								end,
 								get = function()
-									return panel.__sfSelectedEventType
+									local selected = panel.__sfSelectedEventType
+									if selected == "BIS_OUTCOME" then
+										return "RC_LOOT_COUNCIL"
+									end
+									return selected
 								end,
 								set = function(value)
 									panel.__sfSelectedEventType = value
@@ -644,6 +723,15 @@ function Page:Build(panel)
 
 	renderer:Build(panel, def)
 end
+
+SF.LootLogsView = {
+	EventTypeLabel = GetEventTypeLabel,
+	EventTypeColor = GetEventTypeColor,
+	EventTypeOptions = GetEventTypeOptions,
+	MatchesEventTypeFilter = LogMatchesEventTypeFilter,
+	DisplayAuthor = DisplayAuthor,
+	BuildRow = BuildLogRow,
+}
 
 function Page:Refresh(panel)
 	SF.SettingsUI.DefinitionRenderer:Refresh(panel)
