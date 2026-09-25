@@ -51,9 +51,11 @@ local function assertNotHas(list, value, message)
 end
 
 local SF = {}
+assert(loadfile("SpectrumFederation/modules/LootHelper/SpecWeapons.lua"))("SpectrumFederation", SF)
 local chunk = assert(loadfile("SpectrumFederation/modules/RaidEquipment/Policy.lua"))
 chunk("SpectrumFederation", SF)
 local Policy = SF.RaidEquipment.Policy
+local SpecWeapons = SF.LootHelperBis.SpecWeapons
 
 local function equipped(opts)
     opts = opts or {}
@@ -63,6 +65,8 @@ local function equipped(opts)
         link = opts.link or "|cffa335ee|Hitem:200000:1:0:0:0:0:0:0:80:::|h[Item]|h|r",
         texture = "tex",
         equipLoc = opts.equipLoc,
+        itemClass = opts.itemClass,
+        itemSubClass = opts.itemSubClass,
         hasEnchant = opts.hasEnchant,
         enchantId = opts.enchantId,
         sockets = opts.sockets or {},
@@ -166,6 +170,100 @@ local twoHand = eval(completeSlots({
 }))
 assertTrue(twoHand.prepared, "empty offhand with 2H main hand is prepared")
 assertNotHas(twoHand.missing, "Off Hand Item", "2H empty offhand is not a missing item")
+
+assertEq(SpecWeapons.IsTwoHandRangedWeapon(2, 2), true, "bow subclass occupies the off hand")
+assertEq(SpecWeapons.IsTwoHandRangedWeapon(2, 3), true, "gun subclass occupies the off hand")
+assertEq(SpecWeapons.IsTwoHandRangedWeapon(2, 18), true, "crossbow subclass occupies the off hand")
+assertEq(SpecWeapons.IsTwoHandRangedWeapon(2, 19), false, "wand subclass does not occupy the off hand")
+assertEq(SpecWeapons.IsTwoHandRangedWeapon(2, 16), false, "thrown subclass does not occupy the off hand")
+assertEq(SpecWeapons.IsTwoHandRangedWeapon(4, 2), false, "armor class is not a two-hand ranged weapon")
+
+local function rangedMainHand(subClass, equipLoc)
+    return equipped({
+        equipLoc = equipLoc,
+        itemClass = 2,
+        itemSubClass = subClass,
+    })
+end
+
+local function assertEmptyOffHandPrepared(subClass, equipLoc, label)
+    local result = eval(completeSlots({
+        [16] = rangedMainHand(subClass, equipLoc),
+        [17] = emptySlot(),
+    }))
+    assertTrue(result.complete, label .. " observation is complete")
+    assertTrue(result.prepared, label .. " with an empty off hand is prepared")
+    assertNotHas(result.missing, "Off Hand Item", label .. " does not report a missing off hand")
+    assertNotHas(result.missing, "Off Hand Enchant", label .. " does not require an off-hand enchant")
+    local readiness = Policy.ReadinessFromObservation({ slotsByInventory = completeSlots({
+        [16] = rangedMainHand(subClass, equipLoc),
+        [17] = emptySlot(),
+    }) })
+    assertEq(readiness.state, "ready", label .. " readiness is ready")
+end
+
+assertEmptyOffHandPrepared(2, "INVTYPE_RANGED", "hunter bow")
+assertEmptyOffHandPrepared(3, "INVTYPE_RANGEDRIGHT", "hunter gun")
+assertEmptyOffHandPrepared(18, "INVTYPE_RANGED", "hunter crossbow")
+assertEmptyOffHandPrepared(2, "INVTYPE_RANGEDRIGHT", "hunter bow on ranged-right")
+
+local wand = eval(completeSlots({
+    [16] = rangedMainHand(19, "INVTYPE_RANGEDRIGHT"),
+    [17] = emptySlot(),
+}))
+assertTrue(wand.complete, "wand identity is a complete observation")
+assertTrue(not wand.prepared, "wand with an empty off hand is unprepared")
+assertHas(wand.missing, "Off Hand Item", "wand does not consume the off hand")
+
+local thrown = eval(completeSlots({
+    [16] = rangedMainHand(16, "INVTYPE_RANGED"),
+    [17] = emptySlot(),
+}))
+assertHas(thrown.missing, "Off Hand Item", "thrown weapon is not treated as a two-hand ranged weapon")
+
+local unresolvedRanged = eval(completeSlots({
+    [16] = equipped({ equipLoc = "INVTYPE_RANGEDRIGHT" }),
+    [17] = emptySlot(),
+}))
+assertTrue(not unresolvedRanged.complete, "ranged equip location without subclass is incomplete")
+assertEq(unresolvedRanged.incompleteReason, "unresolved_mainhand_weapon", "unresolved ranged weapon has its own incomplete reason")
+assertNotHas(unresolvedRanged.missing, "Off Hand Item", "unresolved ranged identity is not a missing off hand")
+local unresolvedReady = Policy.ReadinessFromObservation({ slotsByInventory = completeSlots({
+    [16] = equipped({ equipLoc = "INVTYPE_RANGED" }),
+    [17] = emptySlot(),
+}) })
+assertEq(unresolvedReady.state, "unknown", "unresolved ranged weapon stays unknown")
+
+local savedSpecWeapons = SF.LootHelperBis.SpecWeapons
+SF.LootHelperBis.SpecWeapons = nil
+local withoutClassifier = eval(completeSlots({
+    [16] = rangedMainHand(2, "INVTYPE_RANGED"),
+    [17] = emptySlot(),
+}))
+assertTrue(not withoutClassifier.complete, "ranged weapon without the shared classifier stays incomplete")
+assertNotHas(withoutClassifier.missing, "Off Hand Item", "missing classifier does not invent a missing off hand")
+SF.LootHelperBis.SpecWeapons = savedSpecWeapons
+
+local oneHand = eval(completeSlots({
+    [16] = equipped({ equipLoc = "INVTYPE_WEAPONMAINHAND" }),
+    [17] = emptySlot(),
+}))
+assertTrue(oneHand.complete, "one-hand main hand with an empty off hand is complete")
+assertHas(oneHand.missing, "Off Hand Item", "one-hand main hand still requires an off hand")
+
+local wandAndWeapon = eval(completeSlots({
+    [16] = rangedMainHand(19, "INVTYPE_RANGEDRIGHT"),
+    [17] = equipped({ equipLoc = "INVTYPE_WEAPONOFFHAND", hasEnchant = false, enchantId = 0 }),
+}))
+assertHas(wandAndWeapon.missing, "Off Hand Enchant", "off-hand weapon enchant is unchanged beside a wand")
+assertNotHas(wandAndWeapon.missing, "Off Hand Item", "an equipped off hand beside a wand is not missing")
+
+local bowAndShield = eval(completeSlots({
+    [16] = rangedMainHand(2, "INVTYPE_RANGED"),
+    [17] = equipped({ equipLoc = "INVTYPE_SHIELD", hasEnchant = false, enchantId = 0 }),
+}))
+assertTrue(bowAndShield.prepared, "a shield off hand still skips the weapon enchant")
+assertNotHas(bowAndShield.missing, "Off Hand Enchant", "shield enchant rule is unchanged")
 
 -- Sockets
 local emptySocket = eval(completeSlots({

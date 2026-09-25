@@ -14,7 +14,7 @@ Only an admin of the selected loot profile can run a check. Enchant and gem rule
 
 Prepared means a complete inspect of current gear found:
 
-- an item in every tracked slot, except a legitimate empty Off Hand when Main Hand is a two-handed weapon;
+- an item in every tracked slot, except a legitimate empty Off Hand when Main Hand is a two-handed weapon (`INVTYPE_2HWEAPON`) or a bow, gun, or crossbow. A ranged equip location alone is not enough: wands and other ranged-style weapons still require an Off Hand. If that weapon identity has not resolved, the observation stays incomplete instead of reporting a missing Off Hand;
 - enchants on Head, Shoulders, Chest, Legs, Boots, both rings, and Main Hand;
 - an Off Hand enchant only when that item is an actual weapon (`INVTYPE_WEAPON`, `INVTYPE_WEAPONOFFHAND`, or `INVTYPE_WEAPONMAINHAND`);
 - no weapon enchant required for shields, held-in-offhand items, relics, or other non-weapon offhands;
