@@ -27,7 +27,7 @@ Both branch-validation workflows include `README.md`, `tests/**`, `pkgmeta.yaml`
 
 ## Post-merge beta release
 
-`.github/workflows/post-merge-beta.yml` is triggered by pushes under the packaged addon trees or `pkgmeta.yaml`. Path filters start the workflow; they do not encode individual zip exclusions. The workflow classifies the immutable `github.event.before...github.sha` range with `classify_promotion_scope.py` before any release side effects. Zip-excluded addon-tree files, including `*/AGENTS.md`, do not set `release_required`. A `pkgmeta.yaml` change does, because CurseForge and WowUp rebuild from that file and need a new GitHub Release to pick it up.
+`.github/workflows/post-merge-beta.yml` is triggered by pushes under the packaged addon trees or `pkgmeta.yaml`. Path filters start the workflow; they do not encode individual zip exclusions. The workflow classifies the immutable `github.event.before...github.sha` range with `classify_promotion_scope.py` before any release side effects. Zip-excluded addon-tree files, including `*/AGENTS.md`, do not set `release_required`. A `pkgmeta.yaml` change does, because package validation and WowUp's git packaging path still read that file. CurseForge no longer rebuilds releases from it once automatic packaging is disabled.
 
 When `release_required` is false, changelog, README badge, GitHub Release, Wago, and CurseForge side effects are skipped. Lint/packaging/docs validation and merged-branch cleanup still run; they do not depend on a successful publish. A guidance-only addon-tree push can therefore start the workflow, classify as `release_required=false`, skip every release/version job, and still run sanity checks plus merged-branch cleanup.
 
@@ -109,7 +109,7 @@ The script is the source of truth for path classification. Update it when packag
 
 | Flag | Meaning |
 | --- | --- |
-| `addon_changed` | A file that ships in the release zip changed, or `pkgmeta.yaml` changed. Addon roots and zip exclusions come from `validate_packaging.py`; `*/AGENTS.md` and `*.git*` are excluded. `pkgmeta.yaml` is not a zip member, but CurseForge/WowUp rebuild from it. |
+| `addon_changed` | A file that ships in the release zip changed, or `pkgmeta.yaml` changed. Addon roots and zip exclusions come from `validate_packaging.py`; `*/AGENTS.md` and `*.git*` are excluded. `pkgmeta.yaml` is not a zip member. Package validation and WowUp's git packaging path still read it. CurseForge direct publishing uploads the canonical zip instead of rebuilding from this file. |
 | `docs_changed` | MkDocs sources changed: `docs/**`, `mkdocs.yml`, `overrides/**`, or `requirements-docs.txt`. |
 | `readme_changed` | `README.md` is in the incoming diff. |
 | `release_required` | Same as `addon_changed`. Incoming packaged addon or `pkgmeta.yaml` changes warrant a stable release. Generated TOC/version commits do not create this flag. |
@@ -147,65 +147,80 @@ When a dry-run README job runs, it uploads its simulated stable badge output to 
 
 ## GitHub, CurseForge, and Wago publishing
 
-`.github/scripts/publish_release.py` is the shared publisher for beta and stable addon releases. GitHub Releases remain part of the pipeline. Do not replace them with Wago-only publishing.
+`.github/scripts/publish_release.py` is the shared publisher for beta and stable addon releases. GitHub Releases remain part of the pipeline. CurseForge and Wago are explicit downstream destinations. Do not replace GitHub Releases with either external publisher.
 
-A live publish does the following, in order:
+A live publish does the following:
 
 1. Build the existing release artifacts: the addon zip (parent plus packaged child addons from `validate_packaging.py` at the zip root) and WowUp Hub `release.json`. The publisher refuses to zip when the requested version does not match the packaged TOC versions.
 2. Build release notes from `CHANGELOG.md`.
 3. Create or update the GitHub Release (prerelease for `-beta`, `-alpha`, and `-rc` versions).
-4. After GitHub succeeds, load Wago's catalog, require an exact Retail patch match, and validate Wago project metadata.
-5. Upload the same addon zip to Wago Addons with an explicit stability value.
+4. After GitHub succeeds, attempt CurseForge and Wago independently. Neither destination waits on the other, and neither deletes a destination that already succeeded.
 
-Wago catalog, metadata, authentication, and upload failures happen after the GitHub Release exists. They fail the workflow visibly and do not delete the GitHub Release or roll back CurseForge. Dry-run may resolve and validate Wago before printing the simulated GitHub and Wago actions because dry-run performs no external mutations.
+```text
+Build/Validate -> GitHub -> CurseForge
+                         -> Wago
+```
 
-GitHub Release events still fire. CurseForge continues to receive releases through its existing GitHub Release webhook. WowUp continues to use `release.json`. Changelog text is reused for both GitHub release notes and the Wago changelog; there is no second changelog generator.
+If GitHub fails before a release exists, CurseForge and Wago are not attempted. If GitHub succeeds and one downstream destination fails, the workflow fails after the other destination has been attempted. The GitHub Release, and any downstream publish that succeeded, stay in place.
+
+WowUp continues to use GitHub `release.json` and the canonical zip. Changelog text is reused for GitHub release notes, the CurseForge changelog, and the Wago changelog. There is no second changelog generator.
 
 ### Version mapping
 
 Classification comes from the version string, not from the current git branch:
 
-| Version | GitHub | Wago stability |
-| --- | --- | --- |
-| `1.4.0` | Release | `stable` |
-| `1.5.0-beta.1` | Prerelease | `beta` |
-| `1.5.0-alpha.1` | Prerelease | `alpha` |
-| `1.5.0-rc.1` | Prerelease | `beta` |
+| Version | GitHub | Wago stability | CurseForge release type |
+| --- | --- | --- | --- |
+| `1.4.0` | Release | `stable` | `release` |
+| `1.5.0-beta.1` | Prerelease | `beta` | `beta` |
+| `1.5.0-alpha.1` | Prerelease | `alpha` | `alpha` |
+| `1.5.0-rc.1` | Prerelease | `beta` | `beta` |
 
-Matching is case-insensitive (`1.5.0-BETA.2` is still a GitHub prerelease and Wago `beta`).
+Matching is case-insensitive (`1.5.0-BETA.2` is a GitHub prerelease, Wago `beta`, and CurseForge `beta`).
 
-### Wago project ID and Retail patch
+### Project IDs and Retail patch
 
-The public Wago project ID is stored as `## X-Wago-ID:` on the parent TOC and on every packaged child TOC. Child addons reuse that same ID; they do not get a second Wago project. WowUp and Wago use the shared ID to install the sibling folders from one listing. The publisher still reads the parent TOC field instead of hard-coding the ID in workflows.
+The public Wago project ID is stored as `## X-Wago-ID:` on the parent TOC and on every packaged child TOC. Child addons reuse that same ID; they do not get a second Wago project. WowUp and Wago use the shared ID to install the sibling folders from one listing. The publisher reads the parent TOC field instead of hard-coding the ID in workflows.
 
-CurseForge and WowUp also package from git with `pkgmeta.yaml`. That file must `move-folders` each shipped addon to the zip root. A parent-only flatten leaves `SpectrumFederation_CursedSurgeTracker` and `SpectrumFederation_RCLootCouncilIntegration` nested inside `SpectrumFederation/`, which those installers never load as optional AddOns.
+The public CurseForge project ID is `## X-Curse-Project-ID:` on the parent TOC only. It is not a secret. Direct publishing reads that field and refuses to upload when it is missing or not a positive integer. The current project ID is `1445757`.
 
-The Wago `supported_retail_patch` value is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`). The script requires that exact string to appear in Wago's public catalog at `https://addons.wago.io/api/data/game`. If the catalog cannot be loaded, or Wago does not advertise that patch yet, publishing fails instead of claiming an older patch. On a live run that failure happens after GitHub has already published, so CurseForge still receives the Release event.
+`pkgmeta.yaml` still lifts each shipped addon to the zip root for git packagers and for package validation. A parent-only flatten leaves `SpectrumFederation_CursedSurgeTracker` and `SpectrumFederation_RCLootCouncilIntegration` nested inside `SpectrumFederation/`, which installers never load as optional AddOns. CurseForge direct publishing uploads the canonical zip produced by `publish_release.py`. It does not ask CurseForge to rebuild the addon from `pkgmeta.yaml`. Keep `pkgmeta.yaml`; WowUp's git packaging path and `validate_packaging.py` still depend on it.
+
+The Retail patch sent to Wago and used to select the CurseForge game version is the human-readable form of the 6-digit Interface number already used for releases (`120100` → `12.1.0`).
+
+- Wago requires that exact string in `https://addons.wago.io/api/data/game`. The script does not claim an older patch.
+- CurseForge requires that exact Retail name from the documented Game Versions API at `https://wow.curseforge.com/api/game/versions`. The numeric game-version ID is resolved from that catalog and is not hard-coded. Classic, PTR, and other non-Retail version types are ignored. If the exact Retail patch cannot be identified, CurseForge publishing fails. The catalog result is reused for the rest of that release process.
 
 Release notes reuse `CHANGELOG.md`. Beta versions look for `## [X.Y.Z-beta.N]` and then `## [Unreleased - Beta]`. Stable, alpha, and RC versions use exact-heading lookup only; current changelog automation does not create alpha/RC sections, and the publisher does not invent them.
 
 ### Credentials
 
-There are two Wago-related GitHub repository secrets with different purposes:
-
 - `WAGO_API_KEY` is the Wago developer API credential. Direct publishing uses only this value, as `Authorization: Bearer …` according to [Wago's API docs](https://docs.wago.io/).
-- `WAGO_API_SECRET` is the signing secret from the old GitHub Release webhook. The new publisher does not read or send it.
+- `WAGO_API_SECRET` is the signing secret from the old Wago GitHub Release webhook. The publisher does not read or send it.
+- `CURSEFORGE_API_TOKEN` is the CurseForge author Upload API token. Direct publishing sends it only as the `X-Api-Token` header, per the [CurseForge Upload API](https://support.curseforge.com/support/solutions/articles/9000197321-curseforge-upload-api). It is not placed in the request body or query string.
 
-Never log either secret, Authorization headers, or tokens.
+Never log these secrets, Authorization headers, `X-Api-Token` values, or the legacy CurseForge webhook token. The publisher does not read the legacy webhook token.
 
-### Migration: disable only the old Wago webhook
+### Migration: CurseForge automatic packaging
 
-Historically Wago imported GitHub Release events through a repository webhook. That import classified beta GitHub prereleases as Wago Stable.
+Wago's old GitHub Release webhook should already be disabled. Leave `WAGO_API_SECRET` unused.
 
-**Disable/remove ONLY the old Wago GitHub Release webhook before enabling direct Wago publishing in production.**
+CurseForge automatic packaging may still be enabled when this publisher first ships, so beta releases are not lost before the replacement is in production. Do not disable it before the direct publisher is merged and the repository secret exists. After that, complete this one-time manual migration. Repository code does not change CurseForge account settings or revoke tokens.
 
-**DO NOT disable the CurseForge Release webhook.**
+1. Confirm `CURSEFORGE_API_TOKEN` exists in repository Actions secrets.
+2. Validate the direct publisher with dry-run and `tests/test_publish_release.py`.
+3. Merge and deploy the direct publisher.
+4. Disable CurseForge repository **Automatic Packaging**.
+5. Remove or disable the CurseForge GitHub webhook.
+6. Revoke the old CurseForge token labeled `Webhooks` once nothing uses it.
+7. Keep `CURSEFORGE_API_TOKEN`.
+8. Verify the next beta release on GitHub, CurseForge as Beta, Wago as Beta, and WowUp.
 
-Leave every other GitHub Release consumer untouched. After the Wago webhook is removed, `WAGO_API_SECRET` may remain in repository Secrets; the new code does not use it.
+The first release that includes this publisher can race the still-enabled automatic packager. Disable automatic packaging as soon as the direct publisher is deployed. If both paths upload the same version, remove the extra CurseForge file manually. A later rerun treats an exact existing file or an explicit duplicate response as success and does not upload another copy.
 
 ### Dry-run
 
-A dry-run must not create a GitHub Release, upload to Wago, or mutate any external release service. It may resolve the Wago catalog and validate project metadata before printing the simulated GitHub and Wago actions. It still prints version, GitHub prerelease classification, Wago stability, Wago project ID, supported Retail patch, artifact filename, and the Wago `POST` endpoint.
+A dry-run must not create a GitHub Release, upload to CurseForge, upload to Wago, or mutate any external release service. It validates the CurseForge project ID, release type, and Retail patch locally, and it may resolve the public Wago catalog before printing the simulated actions. It does not send `CURSEFORGE_API_TOKEN`. The numeric CurseForge game-version ID is resolved during a live publish, when that token is available.
 
 From the repository root, after substituting the version and Interface values you intend to publish:
 
@@ -213,17 +228,21 @@ From the repository root, after substituting the version and Interface values yo
 python3 .github/scripts/publish_release.py 1.5.0-beta.1 --interface 120100 --dry-run
 ```
 
-The promotion workflow already runs this with `--dry-run` during its validation phase. Dry-run does not require `WAGO_API_KEY` or a GitHub token.
+The promotion workflow already runs this with `--dry-run` during its validation phase. Dry-run does not require `WAGO_API_KEY`, `CURSEFORGE_API_TOKEN`, or a GitHub token.
 
 ### Retry when one destination fails
 
-- If GitHub succeeds and Wago fails, CurseForge may already have the GitHub Release. Do not delete that GitHub Release and do not roll back CurseForge. Fix the Wago error and rerun `publish_release.py` for the same version. The GitHub side updates the existing release; Wago is retried independently.
-- A Wago HTTP 409 is treated as success only when the response body clearly says this exact version or label already exists. An empty or generic 409 is a visible failure, not an automatic retry success.
-- If the GitHub Release already exists, the existing update/reuse path is preserved, and Wago publishing still runs afterward.
+- If GitHub fails, CurseForge and Wago are not attempted.
+- If GitHub succeeds and CurseForge fails, Wago is still attempted. Keep the GitHub Release and any Wago release that succeeded. Fix the CurseForge error and rerun `publish_release.py` for the same version.
+- If GitHub succeeds and Wago fails, CurseForge is still attempted. Keep the GitHub Release and any CurseForge file that succeeded. Fix the Wago error and rerun the same version.
+- Do not delete a GitHub Release, CurseForge file, or Wago version because a different destination failed.
+- A Wago or CurseForge HTTP 409 is treated as success only when the response body clearly says this exact version or file already exists. An empty or generic 409 is a visible failure.
+- Before uploading, the publisher also checks `GET /api/projects/{projectId}/files` on the CurseForge author API for an exact zip name or display name. That list call is not part of the documented Upload API. If it is unavailable, duplicate safety falls back to the explicit upload response described above. A generic conflict is still a failure.
+- If the GitHub Release already exists, the existing update/reuse path is preserved, and CurseForge and Wago are still attempted afterward.
 
 ### Tests
 
-Release classification, Wago metadata, credential handling, and mocked HTTP behavior are covered by `tests/test_publish_release.py`.
+Release classification, CurseForge and Wago metadata, credential handling, and mocked HTTP behavior are covered by `tests/test_publish_release.py`.
 
 ## Roll back a release
 
@@ -261,7 +280,7 @@ python -m pytest tests/test_interface_badge.py
 | `validate_docs.py` | Repository-specific documentation guardrails plus `mkdocs build --clean --strict`. |
 | `check_version_bump.py` | Compare TOC versions against a base branch. |
 | `check_duplicate_release.py` | Reject an existing release version. |
-| `publish_release.py` | Build release artifacts, create or update the GitHub Release, and publish the same zip to Wago. |
+| `publish_release.py` | Build release artifacts, create or update the GitHub Release, then publish the same zip to CurseForge and Wago. |
 | `update_changelog.py` | Update the beta changelog after merge, or consolidate the main changelog during promotion. |
 | `classify_promotion_scope.py` | Classify a git range or file list into addon/docs/README/infra flags used by promotion and PR addon detection. |
 | `cleanup_merged_branch.py` | Remove the merged source branch after beta release. |
