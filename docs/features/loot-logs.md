@@ -23,7 +23,7 @@ The log includes:
 - character links and unlinks;
 - historical Main Swap consolidations;
 - persistent specialization changes;
-- automatic BiS outcomes that need attention (assigned, overflow, or unresolved). A frozen not-BiS result is kept for reconstruction and omitted from this list;
+- automatic BiS results that need attention (assigned, overflow, or unresolved). These rows use the RC Loot Council type. A frozen not-BiS result is kept for reconstruction and omitted from this list;
 - Gear Override assign, clear, replace, and legacy association;
 - manual loot additions and reversals;
 - RC Loot Council awards, when the optional integration child addon is enabled and an active Spectrum session records them;
@@ -32,6 +32,8 @@ The log includes:
 Each row shows the date, change type, affected member when applicable, a readable action, and the author.
 
 RC Loot Council rows use the loot recipient as the member, `[Item Link] (Response)` as the action (hover the link for the item tooltip), and the RC master looter as the author. The original RC response label is stored with the entry. These rows use an external identity and do not participate in the ordinary sequential author-and-counter repair ranges. Several admins can observe the same award; Spectrum keeps one RC row. The session coordinator writes one automatic BiS outcome for that award. If the outcome is not BiS, it is stored and hidden here.
+
+Assigned, overflow, and unresolved BiS results stay in that same RC Loot Council category and use its color. There is no separate BiS Outcome category. The action text still says whether the result was assigned, overflow, or unresolved. The Author column shows the master looter from the source RC award when that award can be resolved. If it cannot, the column shows the Spectrum officer who stored the outcome. The stored author on the BiS row remains that officer.
 
 Bonus Roll rows use the recipient as the member and the item link as the action. They use their own external identity, so several observers still produce one row, and they do not create an RC Loot Council row or a BiS outcome.
 
@@ -44,6 +46,8 @@ Use the controls above the table to filter by:
 - change type;
 - author;
 - affected member.
+
+The change-type list has one **RC Loot Council** option. Choosing it shows RC awards together with visible BiS results (assigned, overflow, and unresolved). It does not show Bonus Roll, and it does not offer a separate BiS Outcome type. The author filter matches the Author column, including a BiS row that displays its source RC awarder.
 
 Filters apply together. Select **Clear** to return to the complete history. The newest matching entries appear first.
 
