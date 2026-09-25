@@ -1046,25 +1046,22 @@ def test_select_curseforge_retail_game_version_requires_exact_retail_patch():
         )
 
 
-def test_select_curseforge_retail_game_version_rejects_ambiguous_name_without_types():
+def test_select_curseforge_retail_game_version_rejects_name_without_retail_type():
     versions = [
         {"id": 1, "gameVersionTypeID": 10, "name": "12.1.0"},
         {"id": 2, "gameVersionTypeID": 11, "name": "12.1.0"},
     ]
-    with pytest.raises(ValueError, match="multiple game version types"):
+    with pytest.raises(ValueError, match="Retail version type could not be identified"):
         publish.select_curseforge_retail_game_version("12.1.0", versions, None)
 
 
-def test_select_curseforge_retail_game_version_accepts_unique_name_without_types():
-    versions = [
-        {"id": 16519, "gameVersionTypeID": 517, "name": "12.1.0"},
-        {"id": 14029, "gameVersionTypeID": 67408, "name": "1.15.8"},
-    ]
-    assert publish.select_curseforge_retail_game_version("12.1.0", versions, None) == (
-        16519,
-        "12.1.0",
-        "exact",
-    )
+def test_select_curseforge_retail_game_version_rejects_unique_ptr_name():
+    versions = [{"id": 17000, "gameVersionTypeID": 900, "name": "12.2.0"}]
+    ptr_types = [{"id": 900, "name": "Retail PTR", "slug": "wow-retail-ptr"}]
+    with pytest.raises(ValueError, match="Retail version type could not be identified"):
+        publish.select_curseforge_retail_game_version("12.2.0", versions, None)
+    with pytest.raises(ValueError, match="Retail version type could not be identified"):
+        publish.select_curseforge_retail_game_version("12.2.0", versions, ptr_types)
 
 
 def test_build_curseforge_plan_does_not_fall_back_to_older_patch(tmp_path, monkeypatch, capsys):

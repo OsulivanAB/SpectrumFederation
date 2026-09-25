@@ -1047,9 +1047,9 @@ def fetch_curseforge_json(path, token, *, timeout, opener=None):
 def load_curseforge_catalog(token, *, opener=None):
     """Load game versions once per process, plus version types when that endpoint exists.
 
-    The documented Game Versions API is required. Version types are used to
-    ignore Classic/PTR entries. A missing version-types endpoint does not by
-    itself fail the catalog; selection then requires an unambiguous patch name.
+    The documented Game Versions API is required. Version types are required
+    to identify the Retail game version. A missing version-types endpoint
+    does not discard the versions catalog; selection then fails closed.
     """
     if _CURSEFORGE_CATALOG_CACHE["loaded"]:
         return (
@@ -1090,7 +1090,7 @@ def load_curseforge_catalog(token, *, opener=None):
         if type_status == 404:
             print(
                 "[publish-release] CurseForge version-types endpoint is unavailable. "
-                "Retail resolution will require one unambiguous exact patch name."
+                "Retail resolution will fail until a Retail version type can be identified."
             )
         else:
             summary = (
@@ -1100,7 +1100,8 @@ def load_curseforge_catalog(token, *, opener=None):
             )
             print(
                 "[publish-release] Warning: Could not load CurseForge version types "
-                f"({summary}). Retail resolution will require an unambiguous patch name."
+                f"({summary}). Retail resolution will fail until a Retail version type "
+                "can be identified."
             )
 
     _CURSEFORGE_CATALOG_CACHE["loaded"] = True
@@ -1136,13 +1137,19 @@ def select_curseforge_retail_game_version(desired_patch, versions, version_types
     """Require the exact Retail CurseForge game version for this Interface patch.
 
     Classic, PTR, and other flavors are ignored. An older patch is never used
-    as a fallback. When version types are unavailable, multiple type IDs for
-    the same patch name fail closed.
+    as a fallback. A patch name is Retail only when its type ID is a positively
+    identified Retail version type. A unique name is not proof of Retail.
     """
     if parse_patch_tuple(desired_patch) is None:
         raise ValueError(f"Invalid retail patch '{desired_patch}'")
 
     retail_type_ids = curseforge_retail_type_ids(version_types)
+    if not retail_type_ids:
+        raise ValueError(
+            f"CurseForge Retail version type could not be identified for '{desired_patch}'. "
+            "Refusing to treat an exact patch name as Retail without a recognized Retail type."
+        )
+
     candidates = []
     for version in versions or []:
         if not isinstance(version, dict):
@@ -1151,7 +1158,7 @@ def select_curseforge_retail_game_version(desired_patch, versions, version_types
         if name != desired_patch:
             continue
         type_id = _curseforge_type_id(version)
-        if retail_type_ids and type_id not in retail_type_ids:
+        if type_id not in retail_type_ids:
             continue
         if version.get("id") is None:
             continue
@@ -1163,16 +1170,6 @@ def select_curseforge_retail_game_version(desired_patch, versions, version_types
             "Live publishing requires an exact Retail catalog match and will not "
             "claim compatibility with an older patch or a Classic/PTR version."
         )
-
-    if not retail_type_ids:
-        type_ids = {_curseforge_type_id(version) for version in candidates}
-        if len(type_ids) > 1:
-            rendered = ", ".join(str(type_id) for type_id in sorted(type_ids, key=str))
-            raise ValueError(
-                f"CurseForge advertises '{desired_patch}' under multiple game version types "
-                f"({rendered}) and the Retail type could not be identified. "
-                "Refusing to publish incorrect compatibility metadata."
-            )
 
     ids = {version.get("id") for version in candidates}
     if len(ids) != 1:
