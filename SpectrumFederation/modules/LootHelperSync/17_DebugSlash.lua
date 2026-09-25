@@ -70,7 +70,7 @@ do
 
         -- Prefer SF print helpers if available (chat colored + consistent)
         if SF and type(SF.PrintInfo) == "function" then
-            SF:PrintInfo("%s", line)
+            SF:PrintInfo(line)
             return
         end
 
@@ -370,7 +370,7 @@ do
             end)
             if not ok then
                 if SF and type(SF.PrintWarning) == "function" then
-                    SF:PrintWarning("LootHelper Sync debug slash error: %s", tostring(err))
+                    SF:PrintWarning(("LootHelper Sync debug slash error: %s"):format(tostring(err)))
                 else
                     print("LootHelper Sync debug slash error: " .. tostring(err))
                 end

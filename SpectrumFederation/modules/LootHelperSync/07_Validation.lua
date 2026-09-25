@@ -596,6 +596,23 @@ function Sync:_FilterHelpersToAuthorized(helpers)
     return self:_CapUniqueHelpers(helpers, { requireAuthorized = true })
 end
 
+-- Function Remember whether an authorized route exists, and wake no-route work when one appears.
+-- Helper-list edits can also force that wake while a route is already present.
+-- @param reason string|nil Diagnostic reason
+-- @param force boolean|nil True when the caller changed routing and wants due work retried
+-- @return boolean True when no-route work was made due
+function Sync:_NoteAuthorizedRouteTransition(reason, force)
+    if not self.state then return false end
+    local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
+    local hasRoutes = type(routes) == "table" and #routes > 0
+    local hadRoutes = self.state._hadAuthorizedRoute == true
+    self.state._hadAuthorizedRoute = hasRoutes
+    if hasRoutes and self._ExpediteNoRouteSynchronization and (force == true or not hadRoutes) then
+        return self:_ExpediteNoRouteSynchronization(reason or "route_restored") == true
+    end
+    return false
+end
+
 -- Function Install the effective helper list and retarget requests when it changes.
 -- @param helpers table|nil Advertised helper names
 -- @param reason string|nil Diagnostic reason
@@ -606,6 +623,9 @@ function Sync:ApplyAdvertisedHelpers(helpers, reason)
     self.state.helpers = filtered
     if changed and self._RefreshOutstandingRequestTargets then
         self:_RefreshOutstandingRequestTargets()
+    end
+    if self._NoteAuthorizedRouteTransition then
+        self:_NoteAuthorizedRouteTransition(changed and "helpers_updated" or "route_restored", changed)
     end
     if changed and SF.Debug then
         SF.Debug:Info("SYNC", "Helper routing updated (%s, count=%d)", tostring(reason or "update"), #filtered)
@@ -1822,8 +1842,8 @@ function Sync:_NoteResponseKindMismatch(req, sender, message)
         end
         req.kindMismatchWarned[key] = true
     end
-    if SF.PrintWarning and type(message) == "string" and message ~= "" then
-        SF:PrintWarning(message)
+    if SF.Debug and type(message) == "string" and message ~= "" then
+        SF.Debug:Warn("SYNC", "%s", message)
     end
 end
 
@@ -1869,8 +1889,34 @@ function Sync:_NoteUnprovenCatchUp(req, sender, message)
         return
     end
     self.state._unprovenCatchUpWarned[key] = true
-    if SF.PrintWarning and type(message) == "string" and message ~= "" then
-        SF:PrintWarning(message)
+    if SF.Debug and type(message) == "string" and message ~= "" then
+        SF.Debug:Warn("SYNC", "%s", message)
+    end
+end
+
+-- Function Record one rejection diagnostic per session, sender, and code.
+-- Repeats stay silent so packet storms do not flood debug or chat.
+-- @param code string Stable rejection code
+-- @param sender string
+-- @param message string
+-- @return nil
+function Sync:_DebugDiagOnce(code, sender, message)
+    if type(message) ~= "string" or message == "" then return end
+    if not self.state then
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "%s", message)
+        end
+        return
+    end
+    local sessionId = self.state.sessionId or ""
+    local key = tostring(code) .. "\0" .. tostring(sessionId) .. "\0" .. tostring(sender)
+    self.state._diagOnce = self.state._diagOnce or {}
+    if self.state._diagOnce[key] then
+        return
+    end
+    self.state._diagOnce[key] = true
+    if SF.Debug then
+        SF.Debug:Warn("SYNC", "%s", message)
     end
 end
 
@@ -2289,6 +2335,9 @@ function Sync:ReconcileSessionAuthorization(profileId, reason)
     local reasonText = tostring(reason or "")
     if reasonText == "rebuild:live_update" then
         self:_ApplyExplicitRevocationRouting(reasonText)
+        if self._NoteAuthorizedRouteTransition then
+            self:_NoteAuthorizedRouteTransition("admin_reconcile", false)
+        end
         self._reconcilingSessionAuthorization = nil
         return
     end

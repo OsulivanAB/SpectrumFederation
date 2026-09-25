@@ -125,6 +125,15 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._profileReqInFlight = nil
     self.state._noProfileTargetWarnedFor = nil
     self.state._noLogTargetWarnedFor = nil
+    self.state._noIntegrityTargetWarnedFor = nil
+    self.state.pendingProfileSnapshot = nil
+    self.state._userSyncFailureNoted = nil
+    self.state._userInitiatedSync = nil
+    self.state._userSyncGeneration = nil
+    self.state._userSyncRegisteredCount = nil
+    self.state._userSyncRegisterRejected = nil
+    self.state._hadAuthorizedRoute = nil
+    self.state._diagOnce = nil
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
@@ -452,11 +461,50 @@ function Sync:RequestManualSync(reason)
 
             outcome = hasNewRequests and "log_sync_requested" or "log_sync_in_progress"
         end
+
+        if self.ComputeWindowMismatchRequests then
+            local integrity = self:ComputeWindowMismatchRequests(profileId, self.state.authorWindowSummary or {}, localContig) or {}
+            local integrityNew = false
+            local integrityAny = false
+            for _, range in ipairs(integrity) do
+                if type(range) == "table"
+                    and type(range.author) == "string"
+                    and type(range.fromCounter) == "number"
+                    and type(range.toCounter) == "number"
+                then
+                    integrityAny = true
+                    if not self:_HasOutstandingLogRangeRequest(profileId, range.author, range.fromCounter, range.toCounter, true, true) then
+                        integrityNew = true
+                        break
+                    end
+                end
+            end
+            if integrityNew then
+                outcome = "log_sync_requested"
+            elseif integrityAny and outcome == "already_synced" then
+                outcome = "log_sync_in_progress"
+            end
+        end
     end
 
     self.state._sentJoinStatusForSessionId = nil
     self.state._sentJoinStatusType = nil
+    self.state._userSyncGeneration = (tonumber(self.state._userSyncGeneration) or 0) + 1
+    self.state._userSyncRegisteredCount = 0
+    self.state._userSyncRegisterRejected = nil
+    self.state._userInitiatedSync = true
     self:SendJoinStatus()
+    self.state._userInitiatedSync = nil
+
+    if (outcome == "profile_sync_requested" or outcome == "log_sync_requested")
+        and (tonumber(self.state._userSyncRegisteredCount) or 0) == 0
+        and self.state._userSyncRegisterRejected == true
+    then
+        if SF.PrintWarning then
+            SF:PrintWarning("Synchronization did not start. Too many sync requests are already in progress.")
+        end
+        return false, "sync_busy"
+    end
 
     if SF.Debug then
         SF.Debug:Info("SYNC", "Manual sync requested with coordinator (profileId=%s, outcome=%s, reason=%s)",
@@ -733,7 +781,9 @@ function Sync:StartSession(profileId, opts)
 
     local ok, why = self:CanSelfCoordinate(profileId)
     if not ok then
-        if SF.PrintError then SF:PrintError("Cannot start session: %s", tostring(why or "unknown reason")) end
+        if SF.PrintError then
+            SF:PrintError(("Cannot start session: %s"):format(tostring(why or "unknown reason")))
+        end
         return nil
     end
 
@@ -885,6 +935,15 @@ function Sync:_ResetSessionState(reason)
     self.state._profileReqInFlight = nil
     self.state._noProfileTargetWarnedFor = nil
     self.state._noLogTargetWarnedFor = nil
+    self.state._noIntegrityTargetWarnedFor = nil
+    self.state.pendingProfileSnapshot = nil
+    self.state._userSyncFailureNoted = nil
+    self.state._userInitiatedSync = nil
+    self.state._userSyncGeneration = nil
+    self.state._userSyncRegisteredCount = nil
+    self.state._userSyncRegisterRejected = nil
+    self.state._hadAuthorizedRoute = nil
+    self.state._diagOnce = nil
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
@@ -1010,7 +1069,7 @@ function Sync:EndSession(reason, broadcast)
     self:_ResetSessionState("local_end" .. tostring(reason))
 
     if SF.PrintInfo then
-        SF:PrintInfo("Loot Helper session ended (%s).", tostring(reason))
+        SF:PrintInfo(("Loot Helper session ended (%s)."):format(tostring(reason)))
     end
 
     return true
@@ -1047,7 +1106,9 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
 
     local ok, why = self:CanSelfCoordinate(profileId)
     if not ok then
-        if SF.PrintError then SF:PrintError("Cannot takeover session: %s", tostring(why or "unknown reason")) end
+        if SF.PrintError then
+            SF:PrintError(("Cannot takeover session: %s"):format(tostring(why or "unknown reason")))
+        end
         return false
     end
 

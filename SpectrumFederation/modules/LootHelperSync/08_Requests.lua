@@ -444,14 +444,24 @@ function Sync:_FailRequest(req, reason)
         end
     end
 
-    if SF.PrintWarning and req.meta and req.meta.backgroundRepair ~= true and not requeued then
-        local guidance = "Synchronization request did not complete."
-        if req.kind == "NEED_PROFILE" then
-            guidance = "Profile sync is still in progress; keep raid session active and it will retry automatically."
-        elseif req.kind == "NEED_LOGS" then
-            guidance = "Log sync is still in progress; totals may be temporarily incomplete."
+    if req.meta and req.meta.userInitiated == true and req.meta.backgroundRepair ~= true and not requeued and SF.PrintWarning then
+        local kind = tostring(req.kind or "SYNC")
+        -- NEED_LOGS and LOG_REQ are both log catch-up. One manual sync can create both.
+        local warningKind = (kind == "NEED_LOGS" or kind == "LOG_REQ") and "LOG_SYNC" or kind
+        local sessionId = self.state and self.state.sessionId
+        local generation = tonumber(req.meta.userSyncGeneration)
+        local latchValue = generation or sessionId
+        self.state._userSyncFailureNoted = self.state._userSyncFailureNoted or {}
+        if latchValue ~= nil and self.state._userSyncFailureNoted[warningKind] ~= latchValue then
+            self.state._userSyncFailureNoted[warningKind] = latchValue
+            local guidance = "Synchronization did not finish. It will retry while the session stays active."
+            if kind == "NEED_PROFILE" then
+                guidance = "Profile sync did not finish. Keep the raid session active and it will retry automatically."
+            elseif warningKind == "LOG_SYNC" then
+                guidance = "Log sync did not finish. Totals may stay incomplete until synchronization retries."
+            end
+            SF:PrintWarning(guidance)
         end
-        SF:PrintWarning(("Sync request failed (%s). %s"):format(tostring(reason or "unknown"), guidance))
     end
 
     if type(self.ConsiderIdentityAdminSideEffects) == "function" then
@@ -464,6 +474,19 @@ function Sync:_FailRequest(req, reason)
     if self._DrainAutomaticBisBackfill then
         self:_DrainAutomaticBisBackfill()
     end
+end
+
+-- Function Copy the current manual-sync generation onto a request.
+-- Automatic traffic leaves the table unchanged.
+-- @param meta table Request metadata
+-- @return table The same metadata table
+function Sync:_StampUserInitiatedRequest(meta)
+    if type(meta) ~= "table" then return meta end
+    if self.state and self.state._userInitiatedSync == true then
+        meta.userInitiated = true
+        meta.userSyncGeneration = tonumber(self.state._userSyncGeneration) or 0
+    end
+    return meta
 end
 
 -- Function Register an outstanding request so it can timeout / retry / be matched.
@@ -485,8 +508,11 @@ function Sync:RegisterRequest(requestId, kind, target, meta)
     local n = 0
     for _ in pairs(self.state.requests) do n = n + 1 end
     if n >= maxOut then
-        if SF.PrintWarning then
-            SF:PrintWarning(("Too many outstanding requests (%d/%d); dropping %s"):format(n, maxOut, tostring(requestId)))
+        if self.state and self.state._userInitiatedSync == true then
+            self.state._userSyncRegisterRejected = true
+        end
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Too many outstanding requests (%d/%d); dropping %s", n, maxOut, tostring(requestId))
         end
         return false
     end
@@ -511,6 +537,9 @@ function Sync:RegisterRequest(requestId, kind, target, meta)
     }
 
     self.state.requests[requestId] = req
+    if self.state._userInitiatedSync == true then
+        self.state._userSyncRegisteredCount = (tonumber(self.state._userSyncRegisteredCount) or 0) + 1
+    end
 
     self:_MInc("sync.req.created.total", 1)
     self:_MInc("sync.req.created.kind." .. tostring(kind), 1)

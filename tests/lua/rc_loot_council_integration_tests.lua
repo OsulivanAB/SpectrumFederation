@@ -6813,6 +6813,17 @@ testRepairsDeferLocalRestoreAndYieldedBackfill()
 
 function testCommQueueWarningLatch()
     loadModule("SpectrumFederation/modules/LootHelper/Comm.lua")
+    local previousDebug = SF.Debug
+    local debugNotes = {}
+    SF.Debug = {
+        Warn = function(_, _, fmt, ...)
+            local ok, message = pcall(string.format, fmt, ...)
+            debugNotes[#debugNotes + 1] = ok and message or tostring(fmt)
+        end,
+        Info = function() end,
+        Verbose = function() end,
+        Error = function() end,
+    }
     local Comm = SF.LootHelperComm
     local savedCfg = {
         maxQueue = Comm.cfg.maxQueue,
@@ -6833,7 +6844,17 @@ function testCommQueueWarningLatch()
         Comm.state._queueFullWarned = nil
         Comm.state._perTargetWarned = nil
     end
-    local function warnCount(needle, from)
+    local function warnCount(needle)
+        local n = 0
+        for i = 1, #debugNotes do
+            local message = debugNotes[i] or ""
+            if string.find(message, needle, 1, true) then
+                n = n + 1
+            end
+        end
+        return n
+    end
+    local function chatCount(needle, from)
         local n = 0
         for i = from, #printed do
             local message = printed[i][2] or ""
@@ -6862,25 +6883,26 @@ function testCommQueueWarningLatch()
     assertTrue(Comm:_EnqueueSend("SF_LH", "a", "RAID", nil, "NORMAL"), "first per-target message is queued")
     assertTrue(Comm:_EnqueueSend("SF_LH", "b", "RAID", nil, "NORMAL"), "second per-target message is queued")
     assertFalse(Comm:_EnqueueSend("SF_LH", "c", "RAID", nil, "NORMAL"), "a full per-target queue drops the message")
-    assertEq(warnCount("per-target queue full", perFrom + 1), 1, "saturating a per-target queue warns once")
+    assertEq(chatCount("queue full", perFrom + 1), 0, "per-target queue pressure stays out of chat")
+    assertEq(warnCount("per-target queue full"), 1, "saturating a per-target queue is recorded once in debug")
     local key = Comm.state.keys[1]
     Comm.state.lastSent[key] = 0
     Comm:_PumpQueue()
     assertEq(#Comm.state.byKey[key], 2, "a pump inside the spacing gap leaves the per-target queue full")
     assertFalse(Comm:_EnqueueSend("SF_LH", "still", "RAID", nil, "NORMAL"), "a still-full per-target queue drops again")
-    assertEq(warnCount("per-target queue full", perFrom + 1), 1, "a per-target queue that stays full does not warn again")
+    assertEq(warnCount("per-target queue full"), 1, "a per-target queue that stays full does not record again")
     Comm.state.lastSent[key] = -1
     Comm:_PumpQueue()
     assertEq(#Comm.state.byKey[key], 1, "pumping one message leaves the per-target queue below the limit")
     assertTrue(Comm:_EnqueueSend("SF_LH", "d", "RAID", nil, "NORMAL"), "a freed per-target slot accepts another message")
     assertFalse(Comm:_EnqueueSend("SF_LH", "e", "RAID", nil, "NORMAL"), "refilling the same queue drops again")
-    assertEq(warnCount("per-target queue full", perFrom + 1), 2, "falling below the limit re-arms one warning for the next drop")
+    assertEq(warnCount("per-target queue full"), 2, "falling below the limit records one warning for the next drop")
     drain()
     assertEq(#(Comm.state.keys or {}), 0, "the per-target queue can drain")
     assertTrue(Comm:_EnqueueSend("SF_LH", "f", "RAID", nil, "NORMAL"), "an empty queue accepts a new message")
     assertTrue(Comm:_EnqueueSend("SF_LH", "g", "RAID", nil, "NORMAL"), "the second message fills the queue again")
     assertFalse(Comm:_EnqueueSend("SF_LH", "h", "RAID", nil, "NORMAL"), "a later saturation still drops")
-    assertEq(warnCount("per-target queue full", perFrom + 1), 3, "emptying the queue allows one later warning")
+    assertEq(warnCount("per-target queue full"), 3, "emptying the queue allows one later debug record")
 
     resetQueue()
     Comm.cfg.maxPerTarget = 50
@@ -6889,30 +6911,32 @@ function testCommQueueWarningLatch()
     assertTrue(Comm:_EnqueueSend("SF_LH", "a", "RAID", nil, "NORMAL"), "first queued message fits the global cap")
     assertTrue(Comm:_EnqueueSend("SF_LH", "b", "RAID", nil, "NORMAL"), "second queued message fills the global cap")
     assertFalse(Comm:_EnqueueSend("SF_LH", "c", "RAID", nil, "NORMAL"), "a full comm queue drops the message")
-    assertEq(warnCount("Comm queue full", fullFrom + 1), 1, "filling the comm queue warns once")
+    assertEq(chatCount("queue full", fullFrom + 1), 0, "global queue pressure stays out of chat")
+    assertEq(warnCount("Comm queue full"), 1, "filling the comm queue is recorded once in debug")
     key = Comm.state.keys[1]
     Comm.state.lastSent[key] = 0
     Comm:_PumpQueue()
     assertEq(Comm.state.total, 2, "a pump inside the spacing gap leaves the global queue full")
     assertFalse(Comm:_EnqueueSend("SF_LH", "still", "RAID", nil, "NORMAL"), "a still-full global queue drops again")
-    assertEq(warnCount("Comm queue full", fullFrom + 1), 1, "a global queue that stays full does not warn again")
+    assertEq(warnCount("Comm queue full"), 1, "a global queue that stays full does not record again")
     Comm.state.lastSent[key] = -1
     Comm:_PumpQueue()
     assertEq(Comm.state.total, 1, "pumping one message leaves the global queue below the limit")
     assertTrue(Comm:_EnqueueSend("SF_LH", "d", "RAID", nil, "NORMAL"), "a freed global slot accepts another message")
     assertFalse(Comm:_EnqueueSend("SF_LH", "e", "RAID", nil, "NORMAL"), "refilling the global queue drops again")
-    assertEq(warnCount("Comm queue full", fullFrom + 1), 2, "falling below the global limit re-arms one warning for the next drop")
+    assertEq(warnCount("Comm queue full"), 2, "falling below the global limit records one warning for the next drop")
     drain()
     assertTrue(Comm:_EnqueueSend("SF_LH", "f", "RAID", nil, "NORMAL"), "an idle queue accepts a new message")
     assertTrue(Comm:_EnqueueSend("SF_LH", "g", "RAID", nil, "NORMAL"), "the second message fills the global queue again")
     assertFalse(Comm:_EnqueueSend("SF_LH", "h", "RAID", nil, "NORMAL"), "a later global saturation still drops")
-    assertEq(warnCount("Comm queue full", fullFrom + 1), 3, "an idle queue allows one later warning")
+    assertEq(warnCount("Comm queue full"), 3, "an idle queue allows one later debug record")
     assertTrue(sends > 0, "queued messages are sent when the pump runs")
 
     Comm.cfg.maxQueue = savedCfg.maxQueue
     Comm.cfg.maxPerTarget = savedCfg.maxPerTarget
     Comm.cfg.queueEnabled = savedCfg.queueEnabled
     resetQueue()
+    SF.Debug = previousDebug
 end
 testCommQueueWarningLatch()
 

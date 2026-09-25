@@ -19,9 +19,8 @@ function Sync:HandleAdminSync(sender, payload)
 
     -- Only respond to authorized admins (no leaking logs to non-admins)
     if not self:IsSenderAuthorized(payload.profileId, sender) then
-        if SF.PrintWarning then
-            SF:PrintWarning(("Ignoring ADMIN_SYNC from %s for profile %s: not an admin."):format(sender, payload.profileId))
-        end
+        self:_DebugDiagOnce("admin_sync_unauthorized", sender,
+            ("Ignoring ADMIN_SYNC from %s for profile %s: not an admin."):format(tostring(sender), tostring(payload.profileId)))
         return
     end
 
@@ -556,6 +555,12 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         or (oldEpoch ~= self.state.coordEpoch)
         or (oldSid ~= self.state.sessionId)
     then
+        if self._ExpediteNoRouteSynchronization then
+            local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
+            if type(routes) == "table" and #routes > 0 then
+                self:_ExpediteNoRouteSynchronization("heartbeat_descriptor")
+            end
+        end
         -- Let join-status happen again if needed
         self.state._sentJoinStatusForSessionId = nil
         self.state._sentJoinStatusType = nil
@@ -745,6 +750,12 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
     if self._RefreshOutstandingRequestTargets then
         self:_RefreshOutstandingRequestTargets()
     end
+    if self._ExpediteNoRouteSynchronization then
+        local routes = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets() or nil
+        if type(routes) == "table" and #routes > 0 then
+            self:_ExpediteNoRouteSynchronization("coordinator_takeover")
+        end
+    end
 
     -- As a member, re-announce status after jitter so the new coordinator learns about us
     if self.state.active and not self.state.isCoordinator then
@@ -863,8 +874,9 @@ function Sync:HandleNeedProfile(sender, payload)
 
     local snapPayload = self:BuildProfileSnapshot(self.state.profileId)
     if not snapPayload then
-        if SF.PrintWarning then
-            SF:PrintWarning(("Cannot send PROFILE_SNAPSHOT to %s: no local profile %s."):format(sender, tostring(self.state.profileId)))
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "Cannot send PROFILE_SNAPSHOT to %s: no local profile %s.",
+                tostring(sender), tostring(self.state.profileId))
         end
         return
     end
@@ -1156,9 +1168,8 @@ function Sync:HandleLogRequest(sender, payload)
             SF.Debug:Verbose("SYNC", "HandleLogRequest: sender not authorized (sender=%s, profileId=%s)",
                 tostring(sender), tostring(payload.profileId))
         end
-        if SF.PrintWarning then
-            SF:PrintWarning(("Ignoring LOG_REQ from %s for profile %s: not an admin."):format(sender, payload.profileId))
-        end
+        self:_DebugDiagOnce("log_req_unauthorized", sender,
+            ("Ignoring LOG_REQ from %s for profile %s: not an admin."):format(tostring(sender), tostring(payload.profileId)))
         return
     end
     -- The responder must still be an admin. Requester authorization is not enough.
@@ -1266,11 +1277,13 @@ function Sync:HandleSafeModeSet(sender, payload)
     -- Epoch gating
     if not self:IsControlMessageAllowed(payload, sender) then return end
 
-    self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SAFE_MODE_SET")
+    local safeModeChanged = self:_ApplySessionSafeModeFromPayload(payload.safeMode, "SAFE_MODE_SET")
 
-    if SF.PrintInfo and type(payload.safeMode) == "table" then
+    if safeModeChanged and SF.PrintInfo and type(payload.safeMode) == "table" then
         local e = payload.safeMode.enabled == true
-        SF:PrintInfo("Session safe mode %s (set by %s).", e and "ENABLED" or "DISABLED", tostring(payload.safeMode.setBy or payload.coordinator))
+        SF:PrintInfo(("Session safe mode %s (set by %s)."):format(
+            e and "ENABLED" or "DISABLED",
+            tostring(payload.safeMode.setBy or payload.coordinator)))
     end
 end
 

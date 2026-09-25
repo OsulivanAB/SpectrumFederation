@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.6-beta.3] - 2026-09-25
+
+### Changed
+- Keep recoverable sync diagnostics out of chat
+
 ## [1.5.6-beta.2] - 2026-09-25
 
 ### Changed

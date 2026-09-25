@@ -286,9 +286,9 @@ end
 -- Function Apply session safe mode state from incoming payload.
 -- @param smPayload table Incoming safe mode payload.
 -- @param reason string|nil Human-readable reason for applying.
--- @return nil
+-- @return boolean True when enabled state or revision changed
 function Sync:_ApplySessionSafeModeFromPayload(smPayload, reason)
-    if type(smPayload) ~= "table" then return end
+    if type(smPayload) ~= "table" then return false end
     local enabled = (smPayload.enabled == true)
     local incRev = tonumber(smPayload.rev) or 0
 
@@ -296,7 +296,7 @@ function Sync:_ApplySessionSafeModeFromPayload(smPayload, reason)
     local curRev = tonumber(sm.sessionRev) or 0
     local curEnabled = (sm.sessionEnabled == true)
 
-    if incRev < curRev then return end
+    if incRev < curRev then return false end
 
     if incRev > curRev or enabled ~= curEnabled then
         sm.sessionEnabled = enabled
@@ -306,7 +306,9 @@ function Sync:_ApplySessionSafeModeFromPayload(smPayload, reason)
         sm.sessionReason = smPayload.reason
 
         self:_RecomputeSafeMode("session_apply:" .. tostring(reason or "unknown"))
+        return true
     end
+    return false
 end
 
 -- Function Build session safe mode payload for outbound messages.
