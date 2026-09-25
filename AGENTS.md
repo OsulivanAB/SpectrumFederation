@@ -49,6 +49,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Run Loot Helper window tests (production Lua via lua5.1): `python -m pytest tests/test_loot_helper_window.py`
 - Run Sync protocol warning-dedupe tests (production Lua via lua5.1): `python -m pytest tests/test_sync_protocol.py`
 - Run RC Loot Council Integration tests (production Lua via lua5.1): `python -m pytest tests/test_rc_loot_council_integration.py`
+- Run Loot Logs view tests (production Lua via lua5.1): `python -m pytest tests/test_loot_logs_view.py`
 - Run Settings window layout tests (production Lua via lua5.1): `python -m pytest tests/test_settings_window_layout.py`
 - Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py`
 - Run linked character identity tests (production Lua via lua5.1): `python -m pytest tests/test_linked_identity.py`
@@ -90,6 +91,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Loot Helper window minimize/positioning: also run `python -m pytest tests/test_loot_helper_window.py`
 - Sync protocol NACK/warning throttling: also run `python -m pytest tests/test_sync_protocol.py`
 - RC Loot Council Integration child addon: also run `python -m pytest tests/test_rc_loot_council_integration.py`
+- Loot Logs RC category grouping or BiS outcome display author: also run `python -m pytest tests/test_loot_logs_view.py`
 - Settings window impersonation-banner layout: also run `python -m pytest tests/test_settings_window_layout.py`
 - Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`
 - Linked character identities: also run `python -m pytest tests/test_linked_identity.py`

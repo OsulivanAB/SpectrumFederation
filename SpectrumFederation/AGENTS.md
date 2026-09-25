@@ -234,3 +234,4 @@ For sync/comm warning deduplication patterns, see `tests/test_sync_protocol.py` 
 - Item-aware BiS reconstruction: `python -m pytest tests/test_bis_reconstruction.py`
 - Sync protocol NACK/warning throttling: `python -m pytest tests/test_sync_protocol.py`
 - RC Loot Council Integration child addon: `python -m pytest tests/test_rc_loot_council_integration.py`
+- Loot Logs RC category grouping or BiS outcome display author: `python -m pytest tests/test_loot_logs_view.py`
