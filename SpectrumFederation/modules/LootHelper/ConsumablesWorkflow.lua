@@ -217,12 +217,19 @@ end
 
 function W.InterpretWithdraw(intent)
     intent = intent or {}
+    if intent.localPickup ~= true then
+        return 0
+    end
     if tonumber(intent.observedTab) ~= tonumber(intent.configuredTab) then
         return 0
     end
     local tabLoss = math.max(0, FloorQty(intent.beforeTab) - FloorQty(intent.afterTab))
     local bagGain = math.max(0, FloorQty(intent.afterBags) - FloorQty(intent.beforeBags))
-    return math.min(tabLoss, bagGain)
+    local qty = math.min(tabLoss, bagGain)
+    if intent.intendedQty ~= nil then
+        qty = math.min(qty, FloorQty(intent.intendedQty))
+    end
+    return qty
 end
 
 function W.EventsFromUnsupportedInventoryDecrease()

@@ -1313,6 +1313,9 @@ function Sync:_RecordHandshakeReply(sender, payload, status)
         peer.addonVersion = payload.addonVersion
         peer.localAuthorMax = payload.localAuthorMax
         peer.missing = payload.missing
+        if self._NoteConsumablesCapability then
+            self:_NoteConsumablesCapability(sender, payload)
+        end
     end
 
     -- Track in handshake table too

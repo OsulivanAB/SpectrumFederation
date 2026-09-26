@@ -51,3 +51,16 @@ def test_consumables_trade_never_auto_accepts():
         runtime = RUNTIME.read_text(encoding="utf-8")
         assert "AcceptTrade" not in runtime
         assert "OnUpdate" not in runtime
+
+
+def test_consumables_snapshot_merge_is_inside_import():
+    profiles = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "Profiles.lua"
+    ).read_text(encoding="utf-8")
+    import_at = profiles.find("function LootProfile:ImportSnapshot")
+    merge_at = profiles.find("function LootProfile:MergeLogTables")
+    assert import_at != -1 and merge_at > import_at
+    import_body = profiles[import_at:merge_at]
+    merge_body = profiles[merge_at:]
+    assert "snapshot.consumables" in import_body
+    assert "snapshot.consumables" not in merge_body

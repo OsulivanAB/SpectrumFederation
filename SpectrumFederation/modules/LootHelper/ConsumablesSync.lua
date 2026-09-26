@@ -27,6 +27,21 @@ function S.AuthorizeOp(profile, op, sender)
     return false
 end
 
+function S.SessionEnvelopeOk(state, payload)
+    state = state or {}
+    if state.active ~= true then return false end
+    if type(payload) ~= "table" then return false end
+    if type(payload.sessionId) ~= "string" or payload.sessionId == "" then return false end
+    if payload.sessionId ~= state.sessionId then return false end
+    if type(payload.profileId) ~= "string" or payload.profileId == "" then return false end
+    if payload.profileId ~= state.profileId then return false end
+    return true
+end
+
+function S.RemoteConfigSenderOk(coordinator, sender)
+    return Same(coordinator, sender)
+end
+
 function S.ApplyRemoteConfig(profile, payload, sender)
     if type(payload) ~= "table" then
         return false, "invalid"
@@ -54,6 +69,37 @@ local function TradeWriter(event, sender)
     return event.source == "trade" and event.crafter and Same(event.crafter, sender)
 end
 
+local function PositiveQuantity(event)
+    local qty = tonumber(event.quantity) or 0
+    local itemId = tonumber(event.itemId)
+    if not itemId or itemId <= 0 or itemId ~= math.floor(itemId) then return false end
+    if qty <= 0 then return false end
+    if type(event.generation) ~= "number" then return false end
+    return true
+end
+
+local function CustodyWriterOk(profile, event, sender)
+    if not PositiveQuantity(event) then return false end
+    local action = event.action
+    if action == C.ACTION.WITHDRAW or action == C.ACTION.RETURN then
+        return event.holder and Same(event.actor, sender) and Same(event.holder, sender)
+            and C.IsCanonicalAdmin(profile, sender)
+    end
+    if action == C.ACTION.TRANSFER then
+        return event.toHolder and event.fromHolder
+            and Same(event.actor, sender) and Same(event.toHolder, sender)
+            and C.IsCanonicalAdmin(profile, event.fromHolder)
+            and C.IsCanonicalAdmin(profile, event.toHolder)
+    end
+    if action == C.ACTION.DELIVER then
+        local crafter = event.toHolder or event.crafter
+        return crafter and event.fromHolder
+            and Same(event.actor, sender) and Same(crafter, sender)
+            and C.CrafterHasItem(profile, sender, tonumber(event.itemId))
+    end
+    return false
+end
+
 function S.ApplyRemoteEvent(profile, event, sender)
     if type(event) ~= "table" or type(event.id) ~= "string" or type(event.type) ~= "string" then
         return false, "invalid"
@@ -67,8 +113,12 @@ function S.ApplyRemoteEvent(profile, event, sender)
         if not allowed then
             return false, "unauthorized"
         end
-    elseif event.type == C.EVENT.RECEIPT or event.type == C.EVENT.CUSTODY then
+    elseif event.type == C.EVENT.RECEIPT then
         if not (event.actor and Same(event.actor, sender)) then
+            return false, "unauthorized"
+        end
+    elseif event.type == C.EVENT.CUSTODY then
+        if not CustodyWriterOk(profile, event, sender) then
             return false, "unauthorized"
         end
     else
@@ -88,5 +138,10 @@ function S.NeedsCatchUp(localDesc, remote)
     if remoteGen and remoteGen > (localDesc.generation or 1) then return true end
     if remoteSeq and remoteSeq > (localDesc.configSeq or 0) then return true end
     if remoteEvents and remoteEvents > (localDesc.eventCount or 0) then return true end
+    local remoteFingerprint = tonumber(remote.eventFingerprint)
+    local localFingerprint = tonumber(localDesc.eventFingerprint)
+    if remoteFingerprint and localFingerprint and remoteFingerprint ~= localFingerprint then
+        return true
+    end
     return false
 end

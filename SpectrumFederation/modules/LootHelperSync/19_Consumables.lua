@@ -35,15 +35,64 @@ local function SessionFor(profile)
     return ProfileIdOf(profile) == Sync.state.profileId
 end
 
+local MAX_CAPABLE_PEERS = 40
+local MAX_EVENT_FLUSH = 8
+local MAX_EVENT_SCAN = 64
+
+function Sync:_ConsumablesCapablePeers()
+    local names = {}
+    local seen = {}
+    local function add(name)
+        if type(name) ~= "string" or name == "" or seen[name] or #names >= MAX_CAPABLE_PEERS then
+            return
+        end
+        seen[name] = true
+        names[#names + 1] = name
+    end
+    if self._SelfId then
+        add(self:_SelfId())
+    end
+    local peers = self.state and self.state.peers
+    if type(peers) == "table" then
+        for name, peer in pairs(peers) do
+            if type(peer) == "table" and peer.consumablesCapable == true and peer.inGroup == true then
+                add(name)
+            end
+        end
+    end
+    return names
+end
+
+function Sync:_NoteConsumablesCapability(sender, payload)
+    if type(payload) ~= "table" or not self.TouchPeer then return end
+    if payload.consumablesCapable == true and type(sender) == "string" and sender ~= "" then
+        self:TouchPeer(sender, { consumablesCapable = true })
+    end
+    local peers = payload.consumablesCapablePeers
+    if type(peers) ~= "table" then return end
+    local limit = #peers
+    if limit > MAX_CAPABLE_PEERS then limit = MAX_CAPABLE_PEERS end
+    for i = 1, limit do
+        local name = peers[i]
+        if type(name) == "string" and name ~= "" then
+            self:TouchPeer(name, { consumablesCapable = true })
+        end
+    end
+end
+
 function Sync:_AttachConsumablesDescriptor(payload, profileId)
     local C = Consumables()
     if not C or type(payload) ~= "table" then return end
+    payload.consumablesCapable = true
+    payload.consumablesCapablePeers = self:_ConsumablesCapablePeers()
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
     if not profile then return end
     local desc = C.Descriptor(profile)
     payload.consumablesGeneration = desc.generation
     payload.consumablesConfigSeq = desc.configSeq
     payload.consumablesEventCount = desc.eventCount
+    payload.consumablesEventFingerprint = desc.eventFingerprint
+    self:_FlushUnsentConsumablesEvents(profile)
 end
 
 function Sync:_ConsiderConsumablesCatchUp(payload)
@@ -51,6 +100,7 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     local S = Rules()
     if not C or not S or type(payload) ~= "table" then return end
     if not (self.state and self.state.active) then return end
+    self:_NoteConsumablesCapability(payload.coordinator, payload)
     if payload.profileId ~= self.state.profileId then return end
     if payload.sessionId and self.state.sessionId and payload.sessionId ~= self.state.sessionId then
         return
@@ -62,11 +112,25 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         end
         return
     end
-    if not S.NeedsCatchUp(C.Descriptor(profile), {
+    local remote = {
         generation = payload.consumablesGeneration,
         configSeq = payload.consumablesConfigSeq,
         eventCount = payload.consumablesEventCount,
-    }) then
+        eventFingerprint = payload.consumablesEventFingerprint,
+    }
+    local localDesc = C.Descriptor(profile)
+    local fingerprintsDiffer = tonumber(remote.eventFingerprint) and tonumber(localDesc.eventFingerprint)
+        and tonumber(remote.eventFingerprint) ~= tonumber(localDesc.eventFingerprint)
+    if fingerprintsDiffer then
+        local key = tostring(localDesc.eventFingerprint) .. ":" .. tostring(remote.eventFingerprint)
+        if profile._consumablesResendKey ~= key then
+            profile._consumablesResendKey = key
+            profile._consumablesResendCursor = 1
+        end
+        self:_QueueUnsequencedConsumablesEvents(profile)
+    end
+    self:_FlushUnsentConsumablesEvents(profile)
+    if not S.NeedsCatchUp(localDesc, remote) then
         return
     end
     local key = table.concat({
@@ -74,6 +138,7 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         tostring(payload.consumablesGeneration),
         tostring(payload.consumablesConfigSeq),
         tostring(payload.consumablesEventCount),
+        tostring(payload.consumablesEventFingerprint),
     }, ":")
     if self._consumablesCatchUpKey == key then
         return
@@ -84,14 +149,66 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     end
 end
 
-local function SessionPayloadOk(payload)
-    if type(payload) ~= "table" then return false end
-    if not (Sync.state and Sync.state.active) then return false end
-    if payload.profileId ~= Sync.state.profileId then return false end
-    if payload.sessionId and Sync.state.sessionId and payload.sessionId ~= Sync.state.sessionId then
-        return false
-    end
+local function SessionPayloadOk(payload, sender)
+    local S = Rules()
+    if not S or not S.SessionEnvelopeOk(Sync.state, payload) then return false end
+    if type(sender) ~= "string" or sender == "" then return false end
+    if not (Sync.IsRequesterInGroup and Sync:IsRequesterInGroup(sender)) then return false end
     return true
+end
+
+function Sync:_QueueUnsentConsumablesEvent(profile, eventId)
+    if type(profile) ~= "table" or type(eventId) ~= "string" or eventId == "" then return end
+    local queue = profile._consumablesUnsent
+    if type(queue) ~= "table" then
+        queue = {}
+        profile._consumablesUnsent = queue
+    end
+    for i = 1, #queue do
+        if queue[i] == eventId then return end
+    end
+    queue[#queue + 1] = eventId
+end
+
+function Sync:_QueueUnsequencedConsumablesEvents(profile)
+    local events = profile and profile._consumableEvents
+    if type(events) ~= "table" or profile._consumablesResendCursor == nil then return end
+    local index = profile._consumablesResendCursor
+    if type(index) ~= "number" or index < 1 then index = 1 end
+    local queued = 0
+    local scanned = 0
+    while index <= #events and queued < MAX_EVENT_FLUSH and scanned < MAX_EVENT_SCAN do
+        local event = events[index]
+        if type(event) == "table" and type(event.id) == "string" and tonumber(event.order) == nil then
+            self:_QueueUnsentConsumablesEvent(profile, event.id)
+            queued = queued + 1
+        end
+        index = index + 1
+        scanned = scanned + 1
+    end
+    if index > #events then
+        profile._consumablesResendCursor = nil
+    else
+        profile._consumablesResendCursor = index
+    end
+end
+
+function Sync:_FlushUnsentConsumablesEvents(profile)
+    if self._consumablesFlushing then return end
+    if self.IsSafeModeEnabled and self:IsSafeModeEnabled() then return end
+    local queue = profile and profile._consumablesUnsent
+    if type(queue) ~= "table" or #queue == 0 then return end
+    self._consumablesFlushing = true
+    local sent = 0
+    while sent < MAX_EVENT_FLUSH and #queue > 0 do
+        local eventId = table.remove(queue, 1)
+        sent = sent + 1
+        local stored = profile._consumableEventIds and profile._consumableEventIds[eventId]
+        if type(stored) == "table" then
+            self:BroadcastConsumablesEvent(profile, stored)
+        end
+    end
+    self._consumablesFlushing = false
 end
 
 local function EventIdSet(profile)
@@ -152,7 +269,7 @@ function Sync:CommitConsumablesOp(profile, op, actor, opts)
 end
 
 function Sync:HandleConsumablesOp(sender, payload)
-    if not SessionPayloadOk(payload) then return end
+    if not SessionPayloadOk(payload, sender) then return end
     if not (self.state and self.state.isCoordinator) then return end
     local C = Consumables()
     local S = Rules()
@@ -194,10 +311,14 @@ function Sync:BroadcastConsumablesConfig(profile)
 end
 
 function Sync:HandleConsumablesConfig(sender, payload)
-    if not SessionPayloadOk(payload) then return end
+    if not SessionPayloadOk(payload, sender) then return end
     local C = Consumables()
     local S = Rules()
     if not C or not S then return end
+    if not S.RemoteConfigSenderOk(self.state and self.state.coordinator, sender) then
+        Debug("Verbose", "Ignored consumables config from non-coordinator %s", tostring(sender))
+        return
+    end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then
         if self.RequestProfileSnapshot then
@@ -218,17 +339,40 @@ function Sync:HandleConsumablesConfig(sender, payload)
 end
 
 function Sync:BroadcastConsumablesEvent(profile, event)
-    if type(event) ~= "table" then return end
-    if not (self.state and self.state.active and SF.LootHelperComm and self.MSG) then return end
-    if self.IsSafeModeEnabled and self:IsSafeModeEnabled() then return end
+    if type(event) ~= "table" or type(event.id) ~= "string" then return end
+    if not (self.state and self.state.active and SF.LootHelperComm and self.MSG) then
+        self:_QueueUnsentConsumablesEvent(profile, event.id)
+        return
+    end
     if not SessionFor(profile) then return end
-    local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("BroadcastConsumablesEvent")
-    if not dist then return end
-    SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_EVENT, {
+    if self.IsSafeModeEnabled and self:IsSafeModeEnabled() then
+        self:_QueueUnsentConsumablesEvent(profile, event.id)
+        return
+    end
+    local payload = {
         sessionId = self.state.sessionId,
         profileId = ProfileIdOf(profile),
         event = event,
-    }, dist, nil, "NORMAL")
+    }
+    if not (self.state and self.state.isCoordinator) then
+        local coordinator = self.state and self.state.coordinator
+        if type(coordinator) ~= "string" or coordinator == "" then
+            self:_QueueUnsentConsumablesEvent(profile, event.id)
+            return
+        end
+        SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_EVENT, payload, "WHISPER", coordinator, "NORMAL")
+        return
+    end
+    local C = Consumables()
+    if C and C.StampOrder then
+        C.StampOrder(profile, event)
+    end
+    local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("BroadcastConsumablesEvent")
+    if not dist then
+        self:_QueueUnsentConsumablesEvent(profile, event.id)
+        return
+    end
+    SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_EVENT, payload, dist, nil, "NORMAL")
 end
 
 function Sync:CommitConsumablesEvents(profile, token, events)
@@ -256,12 +400,22 @@ function Sync:PublishConsumablesResolve(profile, actor, holder, itemId, reason, 
 end
 
 function Sync:HandleConsumablesEvent(sender, payload)
-    if not SessionPayloadOk(payload) then return end
+    if not SessionPayloadOk(payload, sender) then return end
+    local C = Consumables()
     local S = Rules()
-    if not S or type(payload.event) ~= "table" then return end
+    if not S or not C or type(payload.event) ~= "table" then return end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then return end
-    local ok, status = S.ApplyRemoteEvent(profile, payload.event, sender)
+    local event = payload.event
+    local needsOrder = self.state and self.state.isCoordinator and tonumber(event.order) == nil
+    local stored = profile._consumableEventIds and event.id and profile._consumableEventIds[event.id]
+    local hadOrder = type(stored) == "table" and tonumber(stored.order) ~= nil
+    local ok, status = S.ApplyRemoteEvent(profile, event, sender)
+    if needsOrder and ok and not hadOrder and C.StampOrder then
+        C.StampOrder(profile, event)
+        self:BroadcastConsumablesEvent(profile, event)
+        return
+    end
     if not ok and status ~= "duplicate" then
         Debug("Verbose", "Ignored consumables event from %s (%s)", tostring(sender), tostring(status))
     end

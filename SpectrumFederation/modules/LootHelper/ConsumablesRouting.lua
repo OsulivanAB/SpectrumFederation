@@ -4,6 +4,11 @@ local _, SF = ...
 SF.ConsumablesRouting = SF.ConsumablesRouting or {}
 local R = SF.ConsumablesRouting
 
+function R.PeerCompatible(peer, isSelf)
+    if isSelf then return true end
+    return type(peer) == "table" and peer.consumablesCapable == true
+end
+
 function R.IsCarriedBag(bagId)
     bagId = tonumber(bagId)
     return bagId ~= nil and bagId >= 0 and bagId <= 5

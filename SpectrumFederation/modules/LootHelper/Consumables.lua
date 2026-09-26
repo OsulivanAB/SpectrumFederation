@@ -139,23 +139,65 @@ local function Invalidate(profile)
     projectionCache[profile] = nil
 end
 
+local FINGERPRINT_MOD = 1000000007
+
+local function Xor32(a, b)
+    a = math.floor((tonumber(a) or 0) % 4294967296)
+    b = math.floor((tonumber(b) or 0) % 4294967296)
+    local result = 0
+    local bitValue = 1
+    for _ = 1, 32 do
+        if (a % 2) ~= (b % 2) then
+            result = result + bitValue
+        end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bitValue = bitValue * 2
+    end
+    return result
+end
+
+local function IdHash(id)
+    local hash = 2166136261 % FINGERPRINT_MOD
+    for i = 1, #id do
+        hash = (hash * 131 + string.byte(id, i)) % FINGERPRINT_MOD
+    end
+    return hash
+end
+
+local function MixFingerprint(current, id)
+    if type(id) ~= "string" or id == "" then return tonumber(current) or 0 end
+    return Xor32(current or 0, IdHash(id))
+end
+
 local function RebuildIndex(profile)
     local index = {}
     local events = profile._consumableEvents or {}
     local maxSeq = 0
+    local maxOrder = 0
+    local fingerprint = 0
     for i = 1, #events do
         local event = events[i]
         if type(event) == "table" and type(event.id) == "string" then
-            index[event.id] = true
+            index[event.id] = event
             local seq = tonumber(event.id:match(":(%d+)$"))
             if seq and seq > maxSeq then maxSeq = seq end
+            local order = tonumber(event.order)
+            if order and order > maxOrder then maxOrder = order end
+            fingerprint = MixFingerprint(fingerprint, event.id)
         end
     end
     profile._consumableEventIds = index
     profile._consumableIndexCount = #events
     local cfg = profile._consumables
-    if cfg and maxSeq > (tonumber(cfg.eventSeq) or 0) then
-        cfg.eventSeq = maxSeq
+    if cfg then
+        if maxSeq > (tonumber(cfg.eventSeq) or 0) then
+            cfg.eventSeq = maxSeq
+        end
+        if maxOrder > (tonumber(cfg.ledgerSeq) or 0) then
+            cfg.ledgerSeq = maxOrder
+        end
+        cfg.eventFingerprint = fingerprint
     end
 end
 
@@ -176,6 +218,7 @@ function C.Ensure(profile)
     if type(cfg.generation) ~= "number" or cfg.generation < 1 then cfg.generation = 1 end
     if type(cfg.configSeq) ~= "number" or cfg.configSeq < 0 then cfg.configSeq = 0 end
     if type(cfg.eventSeq) ~= "number" or cfg.eventSeq < 0 then cfg.eventSeq = 0 end
+    if type(cfg.ledgerSeq) ~= "number" or cfg.ledgerSeq < 0 then cfg.ledgerSeq = 0 end
     if type(cfg.crafters) ~= "table" then cfg.crafters = {} end
     if type(cfg.assignments) ~= "table" then cfg.assignments = {} end
     if cfg.guild ~= nil and type(cfg.guild) ~= "table" then cfg.guild = nil end
@@ -194,6 +237,7 @@ function C.Descriptor(profile)
         generation = cfg.generation,
         configSeq = cfg.configSeq,
         eventCount = #(profile._consumableEvents or {}),
+        eventFingerprint = tonumber(cfg.eventFingerprint) or 0,
     }
 end
 
@@ -455,7 +499,28 @@ local function CopyEvent(event)
         fromHolder = event.fromHolder,
         toHolder = event.toHolder,
         reason = event.reason,
+        order = tonumber(event.order),
     }
+end
+
+function C.StampOrder(profile, event)
+    if type(event) ~= "table" then return nil end
+    local cfg = C.Ensure(profile)
+    local existing = tonumber(event.order)
+    if existing and existing > 0 then
+        if existing > (tonumber(cfg.ledgerSeq) or 0) then
+            cfg.ledgerSeq = existing
+        end
+        return existing
+    end
+    cfg.ledgerSeq = (tonumber(cfg.ledgerSeq) or 0) + 1
+    event.order = cfg.ledgerSeq
+    local stored = profile._consumableEventIds and profile._consumableEventIds[event.id]
+    if type(stored) == "table" and stored ~= event then
+        stored.order = event.order
+        Invalidate(profile)
+    end
+    return event.order
 end
 
 function C.NextEventId(profile, actor)
@@ -474,7 +539,17 @@ function C.AppendEvent(profile, event, opts)
     if type(event.id) ~= "string" or event.id == "" then
         event.id = C.NextEventId(profile, event.actor)
     end
-    if profile._consumableEventIds[event.id] then
+    local stored = profile._consumableEventIds[event.id]
+    if stored then
+        local incoming = tonumber(event.order)
+        if incoming and type(stored) == "table" and tonumber(stored.order) == nil then
+            stored.order = incoming
+            local cfg = profile._consumables
+            if incoming > (tonumber(cfg.ledgerSeq) or 0) then
+                cfg.ledgerSeq = incoming
+            end
+            Invalidate(profile)
+        end
         return true, "duplicate"
     end
     event.timestamp = tonumber(event.timestamp) or Now()
@@ -484,11 +559,17 @@ function C.AppendEvent(profile, event, opts)
     if event.holder then event.holder = Norm(event.holder) or event.holder end
     if event.fromHolder then event.fromHolder = Norm(event.fromHolder) or event.fromHolder end
     if event.toHolder then event.toHolder = Norm(event.toHolder) or event.toHolder end
-    profile._consumableEvents[#profile._consumableEvents + 1] = CopyEvent(event)
-    profile._consumableEventIds[event.id] = true
+    local record = CopyEvent(event)
+    profile._consumableEvents[#profile._consumableEvents + 1] = record
+    profile._consumableEventIds[event.id] = record
     profile._consumableIndexCount = #profile._consumableEvents
-    local seq = tonumber(event.id:match(":(%d+)$"))
     local cfg = profile._consumables
+    cfg.eventFingerprint = MixFingerprint(cfg.eventFingerprint, event.id)
+    local order = tonumber(record.order)
+    if order and order > (tonumber(cfg.ledgerSeq) or 0) then
+        cfg.ledgerSeq = order
+    end
+    local seq = tonumber(event.id:match(":(%d+)$"))
     if seq and seq > (tonumber(cfg.eventSeq) or 0) then
         cfg.eventSeq = seq
     end
@@ -528,6 +609,9 @@ function C.Clear(profile, actor, opts)
 end
 
 local function EventLess(a, b)
+    local oa = tonumber(a.order)
+    local ob = tonumber(b.order)
+    if oa and ob and oa ~= ob then return oa < ob end
     local ta = tonumber(a.timestamp) or 0
     local tb = tonumber(b.timestamp) or 0
     if ta ~= tb then return ta < tb end
@@ -816,6 +900,7 @@ function C.ExportSnapshot(profile)
         generation = cfg.generation,
         configSeq = cfg.configSeq,
         eventSeq = cfg.eventSeq,
+        ledgerSeq = tonumber(cfg.ledgerSeq) or 0,
         guild = CopyGuild(cfg.guild),
         bankTab = cfg.bankTab,
         crafters = SortedCopy(cfg.crafters),
@@ -860,6 +945,7 @@ function C.ReplaceConfig(profile, payload)
     cfg.generation = tonumber(payload.generation) or cfg.generation or 1
     cfg.configSeq = tonumber(payload.configSeq) or cfg.configSeq or 0
     cfg.eventSeq = math.max(tonumber(cfg.eventSeq) or 0, tonumber(payload.eventSeq) or 0)
+    cfg.ledgerSeq = math.max(tonumber(cfg.ledgerSeq) or 0, tonumber(payload.ledgerSeq) or 0)
     cfg.guild = CopyGuild(payload.guild)
     cfg.bankTab = tonumber(payload.bankTab)
     if not IsBankTab(cfg.bankTab) then cfg.bankTab = nil end
@@ -925,6 +1011,7 @@ function C.CopyConfiguration(source, dest)
         generation = 1,
         configSeq = 0,
         eventSeq = 0,
+        ledgerSeq = 0,
         guild = CopyGuild(src.guild),
         bankTab = src.bankTab,
         crafters = SortedCopy(src.crafters),

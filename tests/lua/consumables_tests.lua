@@ -297,8 +297,18 @@ local cooldown = R.GuildBankAccess({ configured = true, sameGuild = true, bankOp
 assertEq(cooldown.reason, "cooldown", "mobile banking cooldown is represented")
 assertFalse(R.GuildBankUsable(cooldown), "cooldown is not an actionable bank route")
 
-local withdrawQty = W.InterpretWithdraw({ configuredTab = 2, observedTab = 2, beforeTab = 50, afterTab = 30, beforeBags = 0, afterBags = 20 })
-assertEq(withdrawQty, 20, "withdrawal uses the observed tab and bag delta")
+local unrelated = W.InterpretWithdraw({ configuredTab = 2, observedTab = 2, beforeTab = 50, afterTab = 30, beforeBags = 0, afterBags = 20 })
+assertEq(unrelated, 0, "a tab and bag delta without a local pickup records nothing")
+local withdrawQty = W.InterpretWithdraw({
+    localPickup = true, configuredTab = 2, observedTab = 2, intendedQty = 20,
+    beforeTab = 50, afterTab = 30, beforeBags = 0, afterBags = 20,
+})
+assertEq(withdrawQty, 20, "a local pickup records the matching tab and bag delta")
+local capped = W.InterpretWithdraw({
+    localPickup = true, configuredTab = 2, observedTab = 2, intendedQty = 5,
+    beforeTab = 50, afterTab = 30, beforeBags = 0, afterBags = 20,
+})
+assertEq(capped, 5, "a local pickup does not record more than the picked-up stack")
 local epoch = bankP._consumables.assignments[tostring(aqirite)].epoch
 C.CommitEvents(bankP, "withdraw-admin", W.WithdrawEvents({
     requested = true, withdrawerIsAdmin = true, withdrawer = admin, generation = bankP._consumables.generation, epoch = epoch, timestamp = C.Now(),
@@ -470,6 +480,49 @@ assertTrue(select(1, S.ApplyRemoteEvent(peer, forged, sully)), "the depositor ca
 assertTrue(select(2, S.ApplyRemoteEvent(peer, forged, sully)) == "duplicate", "event replay is a duplicate")
 assertEq(C.ContributionTotal(peer, sully, aqirite), 9, "one donation survives replay")
 
+local function custodyEvent(id, action, actor, extra)
+    local event = {
+        id = id,
+        type = C.EVENT.CUSTODY,
+        action = action,
+        actor = actor,
+        itemId = aqirite,
+        quantity = 4,
+        generation = peer._consumables.generation,
+        timestamp = C.Now(),
+    }
+    for key, value in pairs(extra or {}) do
+        event[key] = value
+    end
+    return event
+end
+assertFalse(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:1", C.ACTION.WITHDRAW, donor, { holder = donor }), donor)), "a non-admin cannot record custody")
+assertFalse(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:2", C.ACTION.WITHDRAW, admin, { holder = donor }), admin)), "custody withdraw writer must be the holder")
+assertTrue(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:3", C.ACTION.WITHDRAW, admin, { holder = admin }), admin)), "an admin can record their own withdrawal")
+assertFalse(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:4", "steal", admin, { holder = admin }), admin)), "an unknown custody action is rejected")
+peer._adminUsers[#peer._adminUsers + 1] = vann
+assertFalse(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:5", C.ACTION.TRANSFER, admin, { fromHolder = admin, toHolder = vann }), admin)), "custody transfer is written by the receiver")
+assertTrue(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:6", C.ACTION.TRANSFER, vann, { fromHolder = admin, toHolder = vann }), vann)), "the receiving admin can record a custody transfer")
+assertTrue(select(1, C.AddCrafter(peer, admin, sully, { asAdmin = true })))
+assertTrue(select(1, C.AddAssignment(peer, admin, aqirite, sully, { asAdmin = true })))
+assertFalse(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:7", C.ACTION.DELIVER, donor, { fromHolder = admin, toHolder = donor }), donor)), "delivery requires the assigned crafter")
+assertTrue(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:8", C.ACTION.DELIVER, sully, { fromHolder = admin, crafter = sully }), sully)), "the assigned crafter can record delivery")
+
+local state = { active = true, sessionId = "session-1", profileId = "peer" }
+assertFalse(S.SessionEnvelopeOk(state, { profileId = "peer" }), "a missing session id is rejected")
+assertFalse(S.SessionEnvelopeOk(state, { sessionId = "other", profileId = "peer" }), "a different session id is rejected")
+assertTrue(S.SessionEnvelopeOk(state, { sessionId = "session-1", profileId = "peer" }), "the current session envelope is accepted")
+assertFalse(S.RemoteConfigSenderOk("Coord-Realm", donor), "config is not accepted from a non-coordinator")
+assertTrue(S.RemoteConfigSenderOk("Coord-Realm", "Coord-Realm"), "config is accepted from the coordinator")
+local sameLedger = { generation = 1, configSeq = 0, eventCount = 2, eventFingerprint = 11 }
+assertFalse(S.NeedsCatchUp(sameLedger, sameLedger), "matching fingerprints do not catch up")
+assertTrue(S.NeedsCatchUp(sameLedger, { generation = 1, configSeq = 0, eventCount = 2, eventFingerprint = 22 }), "a different fingerprint catches up")
+assertFalse(S.NeedsCatchUp(sameLedger, { generation = 1, configSeq = 0, eventCount = 2 }), "an older client without a fingerprint stays on the count check")
+
+assertFalse(R.PeerCompatible({ proto = 4, addonVersion = "1.5.6" }, false), "protocol and version do not make a peer consumables-capable")
+assertTrue(R.PeerCompatible({ consumablesCapable = true }, false), "an explicit capability flag makes a peer compatible")
+assertTrue(R.PeerCompatible(nil, true), "the local player is consumables-capable")
+
 -- Linked identity totals stay character-specific for operations
 local linkP = profile("link", admin)
 linkP._identity[donor] = { donor, "Alt-Realm" }
@@ -546,6 +599,56 @@ for i = 1, #extra do
     if extra[i].itemId == aqiriteRank2 then sawRank = true end
 end
 assertFalse(sawRank, "frozen untraded items do not create events")
+
+local orderP = profile("order", admin)
+orderP._adminUsers = { admin, vann }
+C.AppendEvent(orderP, {
+    id = "ce:order:withdraw",
+    type = C.EVENT.CUSTODY,
+    action = C.ACTION.WITHDRAW,
+    holder = admin,
+    actor = admin,
+    itemId = aqirite,
+    quantity = 10,
+    generation = 1,
+    timestamp = 500,
+    order = 1,
+}, { silent = true })
+C.AppendEvent(orderP, {
+    id = "ce:order:transfer",
+    type = C.EVENT.CUSTODY,
+    action = C.ACTION.TRANSFER,
+    fromHolder = admin,
+    toHolder = vann,
+    actor = vann,
+    itemId = aqirite,
+    quantity = 10,
+    generation = 1,
+    timestamp = 100,
+    order = 2,
+}, { silent = true })
+local transferred = C.CustodyFor(orderP, vann, aqirite)
+assertEq(transferred and transferred.quantity, 10, "coordinator order applies a withdrawal before a later transfer")
+assertEq(C.CustodyFor(orderP, admin, aqirite), nil, "ordered transfer moves the withdrawn stack")
+assertEq(orderP._consumables.ledgerSeq, 2, "appended coordinator order raises the ledger high water")
+local nextEvent = { id = "ce:order:next", type = C.EVENT.RESET, actor = admin, generation = 1 }
+assertEq(C.StampOrder(orderP, nextEvent), 3, "the next coordinator order follows the imported high water")
+local beforePatch = C.Descriptor(orderP).eventFingerprint
+C.AppendEvent(orderP, {
+    id = "ce:order:withdraw",
+    type = C.EVENT.CUSTODY,
+    action = C.ACTION.WITHDRAW,
+    holder = admin,
+    actor = admin,
+    itemId = aqirite,
+    quantity = 10,
+    generation = 1,
+    timestamp = 500,
+    order = 1,
+}, { silent = true })
+assertEq(orderP._consumableEvents[1].order, 1, "a sequenced replay keeps the stored order")
+assertEq(C.Descriptor(orderP).eventFingerprint, beforePatch, "replaying an event does not change the fingerprint")
+assertTrue(beforePatch ~= 0, "the ledger fingerprint changes once events exist")
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

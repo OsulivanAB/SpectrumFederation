@@ -5185,6 +5185,10 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	end
 	self:_EnsureRewardPotConfig()
 
+	if SF.Consumables and SF.Consumables.MergeSnapshot and snapshot.consumables ~= nil then
+		SF.Consumables.MergeSnapshot(self, snapshot.consumables)
+	end
+
 	-- Merge Logs
 	opts = opts or {}
 	if opts.allowMainSwapFingerprintNormalize == nil then
@@ -5333,10 +5337,6 @@ function LootProfile:MergeLogTables(logTables, opts)
         if identityDirty then
             self:ApplyIdentityProjection({ force = true })
         end
-    end
-
-    if SF.Consumables and SF.Consumables.MergeSnapshot and snapshot.consumables ~= nil then
-        SF.Consumables.MergeSnapshot(self, snapshot.consumables)
     end
 
     return inserted, {
