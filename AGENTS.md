@@ -78,8 +78,7 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Workflow or CI script work: inspect the matching file under `.github/workflows/` or `.github/scripts/` first, then use `.github/instructions/` as supplemental guidance.
 - Docs work: start with `mkdocs.yml` for nav/build behavior, then edit files in `docs/`.
 - PR descriptions: follow `.cursor/rules/pr-template.mdc`. Never check **I have tested these changes in-game**. You may check **In-game testing is not applicable** only when there are no packaged addon/runtime changes, except allowlisted TOC metadata or files proven not to ship. Always check **WoW Client Type → Retail**. Leave linked issues to the human unless they provided the link.
-- Codex PR reviews: read and follow `.github/codex-review-guidance.md`. When the PR template provides a linked Ticket ID, review the ticket as part of the PR context; if it is absent or inaccessible, follow the guidance without inventing requirements.
-- PR review comments: follow `.cursor/skills/pr-review-comments/SKILL.md`.
+- Pull request reviews: use **Pull request review instructions** below.
 
 ## Validation By Change Area
 
@@ -145,5 +144,12 @@ Mechanical formatting and deterministic checks belong in CI. Passing tests do
 not prove WoW runtime correctness, and automated review must never claim that
 in-game testing occurred without human test evidence.
 
-For the detailed Codex review lifecycle and convergence procedure, follow
-`.github/codex-review-guidance.md`.
+## Pull request review instructions
+
+Three files divide pull-request review work. Open the file that owns the task. Do not copy a full procedure into this guide, and do not send the same decision through more than one of them.
+
+- **Round coordination:** `.cursor/skills/ai-review-loop/SKILL.md` owns reviewer sequencing, round state, completion handling, finding batches, and when to push.
+- **Individual findings:** `.cursor/skills/pr-review-comments/SKILL.md` owns investigating one finding, replying on its thread, and deciding whether that thread may be resolved. It does not commit, push, or request another review.
+- **Codex lifecycle:** `.github/codex-review-guidance.md` owns Codex review scope, the final integration sweep, and when previous coverage must be reconsidered. When a linked Ticket ID is present, that document requires reviewing the ticket. If the ticket is inaccessible, do not invent requirements.
+
+Humans retain final review, required in-game verification, and merging.
