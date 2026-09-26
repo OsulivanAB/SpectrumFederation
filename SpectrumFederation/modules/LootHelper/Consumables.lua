@@ -21,6 +21,7 @@ C.ACTION = {
 }
 
 C.MAX_ASSIGNMENT_PAIRS = 256
+C.MAX_ASSIGNMENT_HISTORY = 8
 C.MAX_LEDGER_EVENTS = 4096
 C.MAX_ARCHIVED_EVENTS = 4096
 C.MAX_VISIBLE_HISTORY = 200
@@ -175,14 +176,30 @@ local function MixFingerprint(current, id)
     return Xor32(current or 0, IdHash(id))
 end
 
--- The index is rebuilt once per login. SavedVariables restore the ledger and the
--- index as separate copies, so a persisted index must not be trusted until it
--- aliases the ledger records again.
+-- The index is rebuilt once per login and kept beside the profile. Saving it on
+-- the profile would write a second copy of every ledger record.
+local eventIndexes = setmetatable({}, { __mode = "k" })
 local indexBound = setmetatable({}, { __mode = "k" })
+
+local function EventIds(profile)
+    local bound = eventIndexes[profile]
+    if not bound then
+        bound = { ids = {}, count = 0 }
+        eventIndexes[profile] = bound
+    end
+    return bound
+end
+
+function C.EventIndex(profile)
+    if type(profile) ~= "table" then return {} end
+    C.Ensure(profile)
+    return EventIds(profile).ids
+end
 
 function C.InvalidateEventIndex(profile)
     if type(profile) == "table" then
         indexBound[profile] = nil
+        eventIndexes[profile] = nil
     end
 end
 
@@ -212,8 +229,11 @@ local function RebuildIndex(profile)
             end
         end
     end
-    profile._consumableEventIds = index
-    profile._consumableIndexCount = #events
+    local bound = EventIds(profile)
+    bound.ids = index
+    bound.count = #events
+    profile._consumableEventIds = nil
+    profile._consumableIndexCount = nil
     local cfg = profile._consumables
     if cfg then
         if maxSeq > (tonumber(cfg.eventSeq) or 0) then
@@ -250,9 +270,10 @@ function C.Ensure(profile)
     if type(profile._consumableEvents) ~= "table" then
         profile._consumableEvents = {}
     end
-    if not indexBound[profile]
-        or type(profile._consumableEventIds) ~= "table"
-        or profile._consumableIndexCount ~= #profile._consumableEvents then
+    profile._consumableEventIds = nil
+    profile._consumableIndexCount = nil
+    local bound = eventIndexes[profile]
+    if not indexBound[profile] or not bound or bound.count ~= #profile._consumableEvents then
         RebuildIndex(profile)
     end
     indexBound[profile] = true
@@ -367,6 +388,27 @@ function C.CrafterHasItem(profile, crafterName, itemId)
     return Contains(C.AssignedCrafters(profile, itemId), Norm(crafterName))
 end
 
+function C.CrafterAssignedAtEpoch(profile, crafterName, itemId, epoch)
+    crafterName = Norm(crafterName)
+    epoch = tonumber(epoch)
+    itemId = tonumber(itemId)
+    if not crafterName or not epoch or not IsItemId(itemId) then return false end
+    local row = Assignment(C.Ensure(profile), itemId)
+    if not row then return false end
+    if epoch == (tonumber(row.epoch) or 0) then
+        return Contains(row.crafters or {}, crafterName)
+    end
+    local history = row.history
+    if type(history) ~= "table" then return false end
+    for i = 1, #history do
+        local prior = history[i]
+        if type(prior) == "table" and tonumber(prior.epoch) == epoch then
+            return Contains(prior.crafters or {}, crafterName)
+        end
+    end
+    return false
+end
+
 function C.RequestedItemIds(profile)
     local cfg = C.Ensure(profile)
     local ids = {}
@@ -385,6 +427,38 @@ local function BumpConfig(profile)
     Invalidate(profile)
 end
 
+local function CopyHistory(history)
+    if type(history) ~= "table" then return nil end
+    local out = {}
+    local count = #history
+    local startAt = 1
+    if count > C.MAX_ASSIGNMENT_HISTORY then
+        startAt = count - C.MAX_ASSIGNMENT_HISTORY + 1
+    end
+    for i = startAt, count do
+        local row = history[i]
+        if type(row) == "table" then
+            local epoch = tonumber(row.epoch)
+            if epoch and epoch >= 1 and epoch == math.floor(epoch) then
+                local crafters = {}
+                local names = row.crafters
+                if type(names) == "table" then
+                    local limit = #names
+                    if limit > 64 then limit = 64 end
+                    for n = 1, limit do
+                        local name = Norm(names[n])
+                        if name then crafters[#crafters + 1] = name end
+                    end
+                    table.sort(crafters)
+                end
+                out[#out + 1] = { epoch = epoch, crafters = crafters }
+            end
+        end
+    end
+    if #out == 0 then return nil end
+    return out
+end
+
 local function CommitSet(cfg, itemId, nextCrafters)
     local key = ItemKey(itemId)
     local current = cfg.assignments[key]
@@ -394,10 +468,18 @@ local function CommitSet(cfg, itemId, nextCrafters)
         return false
     end
     local epoch = current and tonumber(current.epoch) or 0
+    local history = CopyHistory(current and current.history) or {}
+    if current and epoch >= 1 then
+        history[#history + 1] = { epoch = epoch, crafters = before }
+        while #history > C.MAX_ASSIGNMENT_HISTORY do
+            table.remove(history, 1)
+        end
+    end
     cfg.assignments[key] = {
         itemId = itemId,
         epoch = epoch + 1,
         crafters = after,
+        history = #history > 0 and history or nil,
     }
     return true
 end
@@ -590,13 +672,14 @@ function C.AppendArchivedEvent(profile, event)
     if type(event.id) ~= "string" or event.id == "" then
         event.id = C.NextEventId(profile, event.actor)
     end
-    if profile._consumableEventIds[event.id] then
+    local bound = EventIds(profile)
+    if bound.ids[event.id] then
         return true, "duplicate"
     end
     local record = CopyEvent(event)
     local archive = ArchiveList(profile)
     archive[#archive + 1] = record
-    profile._consumableEventIds[record.id] = record
+    bound.ids[record.id] = record
     TrimArchive(profile)
     return true, "archived"
 end
@@ -613,7 +696,8 @@ function C.StampOrder(profile, event)
     end
     cfg.ledgerSeq = (tonumber(cfg.ledgerSeq) or 0) + 1
     event.order = cfg.ledgerSeq
-    local stored = profile._consumableEventIds and profile._consumableEventIds[event.id]
+    local bound = EventIds(profile)
+    local stored = bound.ids[event.id]
     if type(stored) == "table" and stored ~= event then
         stored.order = event.order
     end
@@ -637,7 +721,8 @@ function C.AppendEvent(profile, event, opts)
     if type(event.id) ~= "string" or event.id == "" then
         event.id = C.NextEventId(profile, event.actor)
     end
-    local stored = profile._consumableEventIds[event.id]
+    local bound = EventIds(profile)
+    local stored = bound.ids[event.id]
     if stored then
         local incoming = tonumber(event.order)
         if incoming and type(stored) == "table" and tonumber(stored.order) == nil then
@@ -670,8 +755,8 @@ function C.AppendEvent(profile, event, opts)
     if event.toHolder then event.toHolder = Norm(event.toHolder) or event.toHolder end
     local record = CopyEvent(event)
     profile._consumableEvents[#profile._consumableEvents + 1] = record
-    profile._consumableEventIds[event.id] = record
-    profile._consumableIndexCount = #profile._consumableEvents
+    bound.ids[event.id] = record
+    bound.count = #profile._consumableEvents
     local cfg = profile._consumables
     cfg.eventFingerprint = MixFingerprint(cfg.eventFingerprint, event.id)
     local order = tonumber(record.order)
@@ -710,7 +795,7 @@ function C.Clear(profile, actor, opts)
     cfg.generation = generation + 1
     if not resetOk then
         C.ShelvePriorGenerations(profile)
-        if not (profile._consumableEventIds and profile._consumableEventIds[reset.id]) then
+        if not EventIds(profile).ids[reset.id] then
             C.AppendArchivedEvent(profile, reset)
         end
     end
@@ -1017,6 +1102,7 @@ function C.ExportSnapshot(profile, opts)
                 itemId = tonumber(row.itemId),
                 epoch = tonumber(row.epoch) or 1,
                 crafters = SortedCopy(row.crafters),
+                history = CopyHistory(row.history),
             }
         end
     end
@@ -1097,6 +1183,7 @@ function C.ReplaceConfig(profile, payload)
                         itemId = itemId,
                         epoch = tonumber(row.epoch) or 1,
                         crafters = SortedCopy(row.crafters),
+                        history = CopyHistory(row.history),
                     }
                 end
             end
@@ -1112,22 +1199,30 @@ function C.MergeSnapshot(profile, data)
     if data == nil then return true end
     local ok, err = C.ValidateSnapshot(data)
     if not ok then return false, err end
+    local localDesc = C.Descriptor(profile)
+    local remoteGen = tonumber(data.generation) or 1
+    local remoteSeq = tonumber(data.configSeq) or 0
+    local adoptSession = profile._consumablesAdoptNextSnapshot
+    local epoch = 0
+    local syncState = SF.LootHelperSync and SF.LootHelperSync.state
+    if adoptSession and type(syncState) == "table" and syncState.active then
+        epoch = tonumber(syncState.coordEpoch) or 0
+    end
+    local snapshotCurrent = true
+    if SF.ConsumablesSync and SF.ConsumablesSync.WatermarkAdmits then
+        snapshotCurrent = SF.ConsumablesSync.WatermarkAdmits(profile, remoteGen, remoteSeq, epoch)
+    end
+    local replace = remoteGen > localDesc.generation
+        or (remoteGen == localDesc.generation and remoteSeq >= localDesc.configSeq)
+        or (adoptSession and remoteGen >= localDesc.generation and snapshotCurrent)
+    if replace and remoteGen > (tonumber(profile._consumables.generation) or 1) then
+        profile._consumables.generation = remoteGen
+    end
     if type(data.events) == "table" then
         for i = 1, #data.events do
             C.AppendEvent(profile, data.events[i], { silent = true })
         end
     end
-    local localDesc = C.Descriptor(profile)
-    local remoteGen = tonumber(data.generation) or 1
-    local remoteSeq = tonumber(data.configSeq) or 0
-    local adoptSession = profile._consumablesAdoptNextSnapshot
-    local noted = SF.ConsumablesSync and SF.ConsumablesSync.CoordinatorWatermark
-        and SF.ConsumablesSync.CoordinatorWatermark(profile)
-    local snapshotCurrent = not noted or remoteGen > noted.generation
-        or (remoteGen == noted.generation and remoteSeq >= noted.configSeq)
-    local replace = remoteGen > localDesc.generation
-        or (remoteGen == localDesc.generation and remoteSeq >= localDesc.configSeq)
-        or (adoptSession and remoteGen >= localDesc.generation and snapshotCurrent)
     profile._consumablesAdoptNextSnapshot = nil
     if replace then
         C.ReplaceConfig(profile, data)
@@ -1135,7 +1230,7 @@ function C.MergeSnapshot(profile, data)
             profile._consumablesConfigAdoptedSession = adoptSession
         end
         if SF.ConsumablesSync and SF.ConsumablesSync.NoteCoordinatorWatermark then
-            SF.ConsumablesSync.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq)
+            SF.ConsumablesSync.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq, epoch)
         end
     else
         Notify()
@@ -1148,8 +1243,9 @@ function C.CopyConfiguration(source, dest)
     C.Ensure(dest)
     dest._consumableEvents = {}
     dest._consumableEventArchive = {}
-    dest._consumableEventIds = {}
-    dest._consumableIndexCount = 0
+    dest._consumableEventIds = nil
+    dest._consumableIndexCount = nil
+    C.InvalidateEventIndex(dest)
     local assignments = {}
     for key, row in pairs(src.assignments) do
         if type(row) == "table" and type(row.crafters) == "table" and #row.crafters > 0 then

@@ -764,10 +764,11 @@ assertEq(orderP._consumableEvents[1].order, 1, "a sequenced replay keeps the sto
 assertEq(C.Descriptor(orderP).eventFingerprint, beforePatch, "replaying an event does not change the fingerprint")
 assertTrue(beforePatch ~= 0, "the ledger fingerprint changes once events exist")
 local listed = orderP._consumableEvents[1]
-orderP._consumableEventIds[listed.id] = { id = listed.id }
+orderP._consumableEventIds = { [listed.id] = { id = listed.id } }
 C.InvalidateEventIndex(orderP)
 C.Ensure(orderP)
-assertTrue(orderP._consumableEventIds[listed.id] == listed, "loading rebinds the event index to the saved ledger")
+assertTrue(C.EventIndex(orderP)[listed.id] == listed, "loading rebinds the event index to the saved ledger")
+assertEq(orderP._consumableEventIds, nil, "the event index is not stored on the saved profile")
 
 local fullP = profile("commit-full", admin)
 local commitCap = C.MAX_LEDGER_EVENTS
@@ -809,7 +810,7 @@ assertEq(C.CustodyFor(stampP, admin, aqirite) and C.CustodyFor(stampP, admin, aq
 assertEq(C.CustodyFor(stampP, vann, aqirite), nil, "an earlier timestamp cannot transfer stock that is not yet withdrawn")
 local withdrawStored = stampP._consumableEvents[1]
 local transferStored = stampP._consumableEvents[2]
-assertTrue(stampP._consumableEventIds[withdrawStored.id] == withdrawStored, "the withdrawal stamp uses the stored record")
+assertTrue(C.EventIndex(stampP)[withdrawStored.id] == withdrawStored, "the withdrawal stamp uses the stored record")
 assertEq(C.StampOrder(stampP, withdrawStored), 1, "the stored withdrawal receives the first order")
 assertEq(C.StampOrder(stampP, transferStored), 2, "the stored transfer receives the next order")
 assertEq(C.CustodyFor(stampP, vann, aqirite) and C.CustodyFor(stampP, vann, aqirite).quantity, 10, "assigning order rebuilds custody even when the stored table is stamped directly")
@@ -909,6 +910,19 @@ assertTrue(RT.pendingTrade ~= nil, "the donation stays pending until the trade o
 assertTrue(type(tradeTimer) == "function", "a pending donation expires if the trade window never opens")
 RT:OnEvent("TRADE_REQUEST_CANCEL")
 assertEq(RT.pendingTrade, nil, "cancelling the trade request drops the pending donation")
+RT.openTrade = { both = true, target = { [aqirite] = 4 }, role = "receiver" }
+RT:OnEvent("TRADE_REQUEST_CANCEL")
+assertEq(RT.openTrade.both, false, "cancelling an open trade drops the accepted snapshot")
+assertEq(RT.openTrade.target[aqirite], nil, "cancelling an open trade drops the captured target items")
+RT.openTrade.both = true
+RT.openTrade.target = { [aqirite] = 4 }
+ERR_TRADE_BAG_FULL = "bag full"
+RT:OnEvent("UI_ERROR_MESSAGE", 0, ERR_TRADE_BAG_FULL)
+assertEq(RT.openTrade.both, false, "a failed accepted trade drops the accepted snapshot")
+assertEq(RT.openTrade.target[aqirite], nil, "a failed accepted trade drops the captured target items")
+RT.openTrade.both = true
+RT:OnEvent("UI_ERROR_MESSAGE", 0, "You are too far away.")
+assertEq(RT.openTrade.both, true, "an unrelated error leaves an accepted trade snapshot in place")
 RT.pendingTrade = { recipient = "Crafter-Realm" }
 RT.openTrade = { role = "donor" }
 RT:ArmPendingTradeTimer()
@@ -1019,6 +1033,239 @@ assertEq(recoverP._consumableEvents[1].order, 4, "the local ledger keeps the coo
 local queuedOnce = #recoverQueue
 Sync:_QueueAuthoredOrderedConsumablesEvents(recoverP, 1)
 assertEq(#(recoverP._consumablesUnsent or {}), queuedOnce, "ordered recovery walks the ledger once per coordinator")
+
+local importCap = C.MAX_LEDGER_EVENTS
+local importArchiveCap = C.MAX_ARCHIVED_EVENTS
+C.MAX_LEDGER_EVENTS = 2
+C.MAX_ARCHIVED_EVENTS = 8
+local function snapEvent(id, generation)
+    return {
+        id = id,
+        type = C.EVENT.DONATION,
+        generation = generation,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        timestamp = generation,
+    }
+end
+local function hasEvent(list, id)
+    if type(list) ~= "table" then return false end
+    for i = 1, #list do
+        if type(list[i]) == "table" and list[i].id == id then return true end
+    end
+    return false
+end
+local crowded = {
+    generation = 2,
+    configSeq = 1,
+    crafters = {},
+    assignments = {},
+    events = {
+        snapEvent("ce:snap:old1", 1),
+        snapEvent("ce:snap:old2", 1),
+        snapEvent("ce:snap:old3", 1),
+        snapEvent("ce:snap:new", 2),
+    },
+}
+local crowdedJoiner = profile("snapshot-full", admin)
+assertTrue(C.MergeSnapshot(crowdedJoiner, crowded), "a snapshot with archived history still imports")
+assertEq(crowdedJoiner._consumables.generation, 2, "snapshot import installs the remote generation")
+assertTrue(hasEvent(crowdedJoiner._consumableEvents, "ce:snap:new"), "current-generation snapshot events survive a full archive import")
+assertFalse(hasEvent(crowdedJoiner._consumableEvents, "ce:snap:old1"), "archived snapshot history does not fill the live ledger")
+C.MAX_LEDGER_EVENTS = importCap
+C.MAX_ARCHIVED_EVENTS = importArchiveCap
+
+S.ClearCoordinatorWatermarks()
+local takeoverP = profile("takeover-config", admin)
+assertEq(select(2, S.ApplyRemoteConfig(takeoverP, {
+    generation = 1, configSeq = 5, crafters = { vann }, assignments = {},
+}, admin, { coordinatorAuthoritative = true, coordEpoch = 1 })), "applied", "the first coordinator config is applied")
+assertEq(select(2, S.ApplyRemoteConfig(takeoverP, {
+    generation = 1, configSeq = 4, crafters = { sully }, assignments = {},
+}, admin, { coordinatorAuthoritative = true, coordEpoch = 2 })), "applied", "a new coordinator epoch applies a lower config sequence")
+assertEq(takeoverP._consumables.crafters[1], sully, "the new coordinator's crafters replace the previous list")
+assertEq(select(2, S.ApplyRemoteConfig(takeoverP, {
+    generation = 1, configSeq = 9, crafters = { donor }, assignments = {},
+}, admin, { coordinatorAuthoritative = true, coordEpoch = 1 })), "stale", "an older coordinator epoch cannot override the new one")
+assertEq(takeoverP._consumables.crafters[1], sully, "the new coordinator's config stays in place")
+
+local frozenP = profile("frozen-trade", admin)
+assertTrue(select(1, C.AddCrafter(frozenP, admin, vann, { asAdmin = true })))
+assertTrue(select(1, C.AddAssignment(frozenP, admin, aqirite, vann, { asAdmin = true })))
+local frozenEpoch = frozenP._consumables.assignments[tostring(aqirite)].epoch
+local frozenTrade = C.FreezeTrade(frozenP, donor, vann, { { itemId = aqirite } }, "frozen")
+assertTrue(select(1, C.RemoveAssignment(frozenP, admin, aqirite, vann, { asAdmin = true })))
+assertFalse(C.CrafterHasItem(frozenP, vann, aqirite), "the live assignment is gone after the trade opened")
+local frozenDonation = {
+    id = "ce:frozen:" .. vann .. ":donation",
+    type = C.EVENT.DONATION,
+    source = "trade",
+    actor = donor,
+    crafter = vann,
+    itemId = aqirite,
+    quantity = 3,
+    generation = frozenP._consumables.generation,
+    epoch = frozenEpoch,
+    timestamp = C.Now(),
+}
+assertTrue(select(1, S.ApplyRemoteEvent(frozenP, frozenDonation, vann)), "a trade donation keeps the assignment frozen at trade open")
+local liveDonation = {
+    id = "ce:frozen:" .. vann .. ":live",
+    type = C.EVENT.DONATION,
+    source = "trade",
+    actor = donor,
+    crafter = vann,
+    itemId = aqirite,
+    quantity = 1,
+    generation = frozenP._consumables.generation,
+    timestamp = C.Now(),
+}
+assertFalse(select(1, S.ApplyRemoteEvent(frozenP, liveDonation, vann)), "a trade donation without a frozen epoch still requires the live assignment")
+local frozenReceipt = {
+    id = "ce:frozen:" .. vann .. ":receipt",
+    type = C.EVENT.RECEIPT,
+    actor = vann,
+    crafter = vann,
+    itemId = aqirite,
+    quantity = 3,
+    generation = frozenP._consumables.generation,
+    epoch = frozenEpoch,
+    source = "trade",
+    timestamp = C.Now(),
+}
+assertTrue(select(1, S.ApplyRemoteEvent(frozenP, frozenReceipt, vann)), "a trade receipt keeps the assignment frozen at trade open")
+local forgedEpoch = {
+    id = "ce:frozen:" .. vann .. ":forged",
+    type = C.EVENT.RECEIPT,
+    actor = vann,
+    crafter = vann,
+    itemId = aqirite,
+    quantity = 1,
+    generation = frozenP._consumables.generation,
+    epoch = 99,
+    source = "trade",
+    timestamp = C.Now(),
+}
+assertFalse(select(1, S.ApplyRemoteEvent(frozenP, forgedEpoch, vann)), "an unknown assignment epoch does not authorize a trade")
+local tradeEvents = W.TradeEvents(frozenTrade, { [aqirite] = 3 }, true)
+local sawFrozenEpoch = false
+for i = 1, #tradeEvents do
+    if tradeEvents[i].type == C.EVENT.DONATION and tradeEvents[i].epoch == frozenEpoch then
+        sawFrozenEpoch = true
+    end
+end
+assertTrue(sawFrozenEpoch, "trade donations carry the epoch captured when the trade opened")
+local frozenExport = C.ExportSnapshot(frozenP, { omitEvents = true })
+local frozenFollower = profile("frozen-follower", admin)
+C.ReplaceConfig(frozenFollower, frozenExport)
+assertTrue(C.CrafterAssignedAtEpoch(frozenFollower, vann, aqirite, frozenEpoch), "assignment history survives a config broadcast")
+assertTrue(select(1, S.ApplyRemoteEvent(frozenFollower, frozenReceipt, vann)), "a follower can accept a frozen trade from broadcast history")
+
+local fractional = {
+    id = "ce:qty:" .. sully .. ":fraction",
+    type = C.EVENT.DONATION,
+    actor = sully,
+    itemId = aqirite,
+    quantity = 0.5,
+    generation = peer._consumables.generation,
+    source = "guildbank",
+    timestamp = C.Now(),
+}
+assertFalse(select(1, S.ApplyRemoteEvent(peer, fractional, sully)), "a fractional remote quantity is rejected")
+fractional.id = "ce:qty:" .. sully .. ":nan"
+fractional.quantity = 0 / 0
+assertFalse(select(1, S.ApplyRemoteEvent(peer, fractional, sully)), "a non-finite remote quantity is rejected")
+fractional.id = "ce:qty:" .. sully .. ":huge"
+fractional.quantity = S.MAX_EVENT_QUANTITY + 1
+assertFalse(select(1, S.ApplyRemoteEvent(peer, fractional, sully)), "a remote quantity above the limit is rejected")
+fractional.id = "ce:qty:" .. sully .. ":ok"
+fractional.quantity = 2
+assertTrue(select(1, S.ApplyRemoteEvent(peer, fractional, sully)), "an integer remote quantity within the limit is accepted")
+
+local snapshotReasons = {}
+local savedSyncState = Sync.state
+local savedFind = Sync.FindLocalProfileById
+local savedRequest = Sync.RequestProfileSnapshot
+local savedGroup = Sync.IsRequesterInGroup
+Sync.RequestProfileSnapshot = function(_, reason)
+    snapshotReasons[#snapshotReasons + 1] = reason
+    return true
+end
+Sync.FindLocalProfileById = function() return nil end
+Sync.IsRequesterInGroup = function() return true end
+Sync.state = {
+    active = true,
+    profileId = "missing-profile",
+    sessionId = "missing-session",
+    coordinator = "Coord-Realm",
+    coordEpoch = 2,
+}
+Sync:_ConsiderConsumablesCatchUp({
+    profileId = "missing-profile",
+    sessionId = "missing-session",
+    coordinator = "Coord-Realm",
+})
+assertEq(#snapshotReasons, 0, "a missing profile does not request a snapshot from consumables catch-up")
+
+local catchP = profile("catch-epoch", admin)
+Sync.FindLocalProfileById = function(_, id)
+    if id == catchP._profileId then return catchP end
+    return nil
+end
+Sync.state = {
+    active = true,
+    isCoordinator = false,
+    profileId = catchP._profileId,
+    sessionId = "catch-session",
+    coordinator = "Old-Realm",
+    coordEpoch = 1,
+}
+Sync:_ConsiderConsumablesCatchUp({
+    profileId = catchP._profileId,
+    sessionId = "catch-session",
+    coordinator = "Old-Realm",
+    consumablesGeneration = 1,
+    consumablesConfigSeq = 3,
+    consumablesEventCount = 0,
+})
+local firstCatch = #snapshotReasons
+assertTrue(firstCatch >= 1, "a config difference requests one snapshot")
+Sync:_ConsiderConsumablesCatchUp({
+    profileId = catchP._profileId,
+    sessionId = "catch-session",
+    coordinator = "Old-Realm",
+    consumablesGeneration = 1,
+    consumablesConfigSeq = 3,
+    consumablesEventCount = 0,
+})
+assertEq(#snapshotReasons, firstCatch, "the same coordinator does not request config catch-up again")
+Sync.state.coordEpoch = 2
+Sync.state.coordinator = admin
+Sync:_ConsiderConsumablesCatchUp({
+    profileId = catchP._profileId,
+    sessionId = "catch-session",
+    coordinator = admin,
+    consumablesGeneration = 1,
+    consumablesConfigSeq = 1,
+    consumablesEventCount = 0,
+})
+assertTrue(#snapshotReasons > firstCatch, "a new coordinator epoch can request config catch-up again")
+S.NoteCoordinatorWatermark(catchP, 1, 8, 1)
+Sync:HandleConsumablesConfig(admin, {
+    sessionId = "catch-session",
+    profileId = catchP._profileId,
+    generation = 1,
+    configSeq = 2,
+    crafters = { vann },
+    assignments = {},
+})
+assertEq(catchP._consumables.configSeq, 2, "a later coordinator epoch applies a lower config sequence")
+assertEq(catchP._consumables.crafters[1], vann, "the later coordinator's crafters are stored")
+Sync.RequestProfileSnapshot = savedRequest
+Sync.FindLocalProfileById = savedFind
+Sync.IsRequesterInGroup = savedGroup
+Sync.state = savedSyncState
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

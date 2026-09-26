@@ -949,6 +949,22 @@ function Runtime:OnTradeAccept(playerAccepted, targetAccepted)
     end
 end
 
+-- luacheck: globals ERR_TRADE_BAG_FULL ERR_TRADE_TARGET_BAG_FULL ERR_TRADE_MAX_COUNT_EXCEEDED
+function Runtime:ReleaseAcceptedTrade()
+    local open = self.openTrade
+    if not open then return end
+    open.both = false
+    open.target = {}
+end
+
+local function TradeAcceptanceFailed(message)
+    if type(message) ~= "string" or message == "" then return false end
+    if type(ERR_TRADE_BAG_FULL) == "string" and message == ERR_TRADE_BAG_FULL then return true end
+    if type(ERR_TRADE_TARGET_BAG_FULL) == "string" and message == ERR_TRADE_TARGET_BAG_FULL then return true end
+    if type(ERR_TRADE_MAX_COUNT_EXCEEDED) == "string" and message == ERR_TRADE_MAX_COUNT_EXCEEDED then return true end
+    return false
+end
+
 function Runtime:OnTradeClosed()
     local open = self.openTrade
     local pending = self.pendingTrade
@@ -1415,8 +1431,14 @@ function Runtime:OnEvent(event, arg1, arg2)
     elseif event == "TRADE_SHOW" then
         self:OnTradeShow()
     elseif event == "TRADE_REQUEST_CANCEL" then
-        if not self.openTrade then
+        if self.openTrade then
+            self:ReleaseAcceptedTrade()
+        else
             self:ClearPendingTrade()
+        end
+    elseif event == "UI_ERROR_MESSAGE" then
+        if TradeAcceptanceFailed(arg2) then
+            self:ReleaseAcceptedTrade()
         end
     elseif event == "TRADE_CLOSED" then
         self:OnTradeClosed()
@@ -1464,6 +1486,7 @@ function Runtime:Init()
     TryRegister(frame, "ITEM_DATA_LOAD_RESULT")
     TryRegister(frame, "TRADE_SHOW")
     TryRegister(frame, "TRADE_REQUEST_CANCEL")
+    TryRegister(frame, "UI_ERROR_MESSAGE")
     TryRegister(frame, "TRADE_CLOSED")
     TryRegister(frame, "TRADE_ACCEPT_UPDATE")
     TryRegister(frame, "TRADE_PLAYER_ITEM_CHANGED")

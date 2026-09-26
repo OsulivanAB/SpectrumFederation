@@ -87,18 +87,37 @@ function S.CoordinatorWatermark(profile)
     return coordinatorWatermark[profile]
 end
 
-function S.NoteCoordinatorWatermark(profile, generation, configSeq)
+function S.NoteCoordinatorWatermark(profile, generation, configSeq, epoch)
     if type(profile) ~= "table" then return end
     coordinatorWatermark[profile] = {
         generation = tonumber(generation) or 1,
         configSeq = tonumber(configSeq) or 0,
+        epoch = tonumber(epoch) or 0,
     }
 end
 
-local function WatermarkIsNewer(remoteGen, remoteSeq, noted)
+local function WatermarkIsNewer(remoteGen, remoteSeq, noted, epoch)
     if not noted then return true end
+    local notedEpoch = tonumber(noted.epoch) or 0
+    local incomingEpoch = tonumber(epoch) or 0
+    if incomingEpoch ~= notedEpoch then
+        return incomingEpoch > notedEpoch
+    end
     if remoteGen > noted.generation then return true end
     if remoteGen == noted.generation and remoteSeq > noted.configSeq then return true end
+    return false
+end
+
+function S.WatermarkAdmits(profile, remoteGen, remoteSeq, epoch)
+    local noted = coordinatorWatermark[profile]
+    if not noted then return true end
+    local notedEpoch = tonumber(noted.epoch) or 0
+    local incomingEpoch = tonumber(epoch) or 0
+    if incomingEpoch ~= notedEpoch then
+        return incomingEpoch > notedEpoch
+    end
+    if remoteGen > noted.generation then return true end
+    if remoteGen == noted.generation and remoteSeq >= noted.configSeq then return true end
     return false
 end
 
@@ -116,12 +135,13 @@ function S.ApplyRemoteConfig(profile, payload, sender, opts)
     if remoteGen < localDesc.generation then
         return true, "stale"
     end
+    local epoch = opts.coordEpoch
     if opts.coordinatorAuthoritative then
-        if not WatermarkIsNewer(remoteGen, remoteSeq, coordinatorWatermark[profile]) then
+        if not WatermarkIsNewer(remoteGen, remoteSeq, coordinatorWatermark[profile], epoch) then
             return true, "stale"
         end
         C.ReplaceConfig(profile, payload)
-        S.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq)
+        S.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq, epoch)
         return true, "applied"
     end
     if remoteGen == localDesc.generation and remoteSeq <= localDesc.configSeq then
@@ -131,7 +151,7 @@ function S.ApplyRemoteConfig(profile, payload, sender, opts)
         return false, "gap"
     end
     C.ReplaceConfig(profile, payload)
-    S.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq)
+    S.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq, epoch)
     return true, "applied"
 end
 
@@ -156,20 +176,32 @@ function S.CatchUpKind(localDesc, remote)
     return "fingerprint"
 end
 
+S.MAX_EVENT_QUANTITY = 100000
+
 local function PositiveQuantity(event)
-    local qty = tonumber(event.quantity) or 0
+    local qty = tonumber(event.quantity)
     local itemId = tonumber(event.itemId)
     if not itemId or itemId <= 0 or itemId ~= math.floor(itemId) then return false end
-    if qty <= 0 then return false end
+    if not qty or qty ~= qty or qty < 1 or qty > S.MAX_EVENT_QUANTITY or qty ~= math.floor(qty) then
+        return false
+    end
     if type(event.generation) ~= "number" then return false end
     return true
+end
+
+local function FrozenAssignmentOk(profile, crafter, itemId, epoch)
+    epoch = tonumber(epoch)
+    if epoch and epoch > 0 then
+        return C.CrafterAssignedAtEpoch(profile, crafter, itemId, epoch)
+    end
+    return C.CrafterHasItem(profile, crafter, itemId)
 end
 
 local function TradeWriter(profile, event, sender)
     if event.source ~= "trade" or not PositiveQuantity(event) then return false end
     if not (event.crafter and Same(event.crafter, sender)) then return false end
     if not (event.actor and not Same(event.actor, sender)) then return false end
-    return C.CrafterHasItem(profile, sender, tonumber(event.itemId))
+    return FrozenAssignmentOk(profile, sender, tonumber(event.itemId), event.epoch)
 end
 
 local function CustodyWriterOk(profile, event, sender)
@@ -189,7 +221,7 @@ local function CustodyWriterOk(profile, event, sender)
         local crafter = event.toHolder or event.crafter
         return crafter and event.fromHolder
             and Same(event.actor, sender) and Same(crafter, sender)
-            and C.CrafterHasItem(profile, sender, tonumber(event.itemId))
+            and FrozenAssignmentOk(profile, sender, tonumber(event.itemId), event.epoch)
     end
     return false
 end
@@ -257,7 +289,8 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
         end
     elseif event.type == C.EVENT.RECEIPT then
         if not (event.actor and Same(event.actor, writer) and event.crafter and Same(event.crafter, writer)
-            and PositiveQuantity(event) and C.CrafterHasItem(profile, writer, tonumber(event.itemId))) then
+            and PositiveQuantity(event)
+            and FrozenAssignmentOk(profile, writer, tonumber(event.itemId), event.epoch)) then
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.CUSTODY then

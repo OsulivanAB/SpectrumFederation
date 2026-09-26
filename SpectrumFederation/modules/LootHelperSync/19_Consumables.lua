@@ -124,9 +124,6 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then
-        if self.RequestProfileSnapshot then
-            self:RequestProfileSnapshot("consumables-missing-profile")
-        end
         return
     end
     local remote = {
@@ -148,9 +145,14 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     end
     self:_QueueAuthoredOrderedConsumablesEvents(profile, remote.eventCount)
     self:_FlushUnsentConsumablesEvents(profile)
+    local authority = table.concat({
+        tostring(self.state.sessionId),
+        tostring(self.state.coordEpoch),
+        tostring(self.state.coordinator),
+    }, ":")
     if S.CoordinatorConfigDiffers and S.CoordinatorConfigDiffers(localDesc, remote)
-        and profile._consumablesConfigCatchUpSession ~= self.state.sessionId then
-        profile._consumablesConfigCatchUpSession = self.state.sessionId
+        and profile._consumablesConfigCatchUpSession ~= authority then
+        profile._consumablesConfigCatchUpSession = authority
         profile._consumablesAdoptNextSnapshot = self.state.sessionId
         if self.RequestProfileSnapshot then
             self:RequestProfileSnapshot("consumables-config")
@@ -269,10 +271,12 @@ function Sync:_FlushUnsentConsumablesEvents(profile)
     if type(queue) ~= "table" or #queue == 0 then return end
     self._consumablesFlushing = true
     local sent = 0
+    local C = Consumables()
+    local ids = C and C.EventIndex and C.EventIndex(profile)
     while sent < MAX_EVENT_FLUSH and #queue > 0 do
         local eventId = table.remove(queue, 1)
         sent = sent + 1
-        local stored = profile._consumableEventIds and profile._consumableEventIds[eventId]
+        local stored = ids and ids[eventId]
         if type(stored) == "table" then
             self:BroadcastConsumablesEvent(profile, stored)
         end
@@ -403,7 +407,10 @@ function Sync:HandleConsumablesConfig(sender, payload)
         end
         return
     end
-    local ok, status = S.ApplyRemoteConfig(profile, payload, sender, { coordinatorAuthoritative = true })
+    local ok, status = S.ApplyRemoteConfig(profile, payload, sender, {
+        coordinatorAuthoritative = true,
+        coordEpoch = self.state and self.state.coordEpoch,
+    })
     if (not ok) and status == "gap" then
         if self.RequestProfileSnapshot then
             self:RequestProfileSnapshot("consumables-gap")
@@ -499,7 +506,8 @@ function Sync:HandleConsumablesEvent(sender, payload)
             return
         end
     end
-    local stored = profile._consumableEventIds and event.id and profile._consumableEventIds[event.id]
+    local ids = C.EventIndex and C.EventIndex(profile)
+    local stored = ids and event.id and ids[event.id]
     local hadOrder = type(stored) == "table" and tonumber(stored.order) ~= nil
     local ok, status = S.ApplyRemoteEvent(profile, event, sender, relay and { coordinatorRelay = true } or nil)
     if isCoordinator and ok and not hadOrder and C.StampOrder then

@@ -77,6 +77,7 @@ function W.TradeEvents(frozen, actual, completed)
                     type = C.EVENT.CUSTODY,
                     action = C.ACTION.DELIVER,
                     generation = frozen.generation,
+                    epoch = info.epoch,
                     itemId = itemId,
                     quantity = fromCustody,
                     holder = frozen.donor,
@@ -102,6 +103,7 @@ function W.TradeEvents(frozen, actual, completed)
                 events[#events + 1] = {
                     type = C.EVENT.DONATION,
                     generation = frozen.generation,
+                    epoch = info.epoch,
                     itemId = itemId,
                     quantity = fresh,
                     actor = frozen.donor,
