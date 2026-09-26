@@ -215,8 +215,24 @@ function W.InterpretDeposit(intent)
     return actual, nil
 end
 
+function W.DepositDisposition(actual, intended, fromTimer)
+    actual = FloorQty(actual)
+    intended = FloorQty(intended)
+    if intended > 0 and actual >= intended then
+        return "commit"
+    end
+    if fromTimer then
+        if actual > 0 then return "commit" end
+        return "drop"
+    end
+    return "wait"
+end
+
 function W.InterpretWithdraw(intent)
     intent = intent or {}
+    if intent.guildOk == false then
+        return 0
+    end
     if intent.localPickup ~= true then
         return 0
     end

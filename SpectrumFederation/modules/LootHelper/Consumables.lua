@@ -172,6 +172,17 @@ local function MixFingerprint(current, id)
     return Xor32(current or 0, IdHash(id))
 end
 
+-- The index is rebuilt once per login. SavedVariables restore the ledger and the
+-- index as separate copies, so a persisted index must not be trusted until it
+-- aliases the ledger records again.
+local indexBound = setmetatable({}, { __mode = "k" })
+
+function C.InvalidateEventIndex(profile)
+    if type(profile) == "table" then
+        indexBound[profile] = nil
+    end
+end
+
 local function RebuildIndex(profile)
     local index = {}
     local events = profile._consumableEvents or {}
@@ -227,9 +238,12 @@ function C.Ensure(profile)
     if type(profile._consumableEvents) ~= "table" then
         profile._consumableEvents = {}
     end
-    if type(profile._consumableEventIds) ~= "table" or profile._consumableIndexCount ~= #profile._consumableEvents then
+    if not indexBound[profile]
+        or type(profile._consumableEventIds) ~= "table"
+        or profile._consumableIndexCount ~= #profile._consumableEvents then
         RebuildIndex(profile)
     end
+    indexBound[profile] = true
     return cfg
 end
 

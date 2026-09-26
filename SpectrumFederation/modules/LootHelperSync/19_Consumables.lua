@@ -39,6 +39,13 @@ local MAX_CAPABLE_PEERS = 40
 local MAX_EVENT_FLUSH = 8
 local MAX_EVENT_SCAN = 64
 
+function Sync:_ClearConsumablesCapability()
+    local S = Rules()
+    if S and S.ClearCapabilityFlags then
+        S.ClearCapabilityFlags(self.state and self.state.peers)
+    end
+end
+
 function Sync:_ConsumablesCapablePeers()
     local names = {}
     local seen = {}
@@ -412,10 +419,20 @@ function Sync:HandleConsumablesEvent(sender, payload)
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then return end
     local event = payload.event
+    local coordinator = self.state and self.state.coordinator
+    local relay = tonumber(event.order) ~= nil and type(coordinator) == "string"
+        and self:_SamePlayer(sender, coordinator)
+    if not relay and S.AllowRemoteOp then
+        self._consumablesEventLimits = self._consumablesEventLimits or {}
+        local now = (C and C.Now and C.Now()) or 0
+        if not S.AllowRemoteOp(self._consumablesEventLimits, sender, now) then
+            return
+        end
+    end
     local needsOrder = self.state and self.state.isCoordinator and tonumber(event.order) == nil
     local stored = profile._consumableEventIds and event.id and profile._consumableEventIds[event.id]
     local hadOrder = type(stored) == "table" and tonumber(stored.order) ~= nil
-    local ok, status = S.ApplyRemoteEvent(profile, event, sender)
+    local ok, status = S.ApplyRemoteEvent(profile, event, sender, relay and { coordinatorRelay = true } or nil)
     if needsOrder and ok and not hadOrder and C.StampOrder then
         C.StampOrder(profile, event)
         self:BroadcastConsumablesEvent(profile, event)

@@ -851,6 +851,9 @@ function Sync:StartSession(profileId, opts)
 
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
+    if self._ClearConsumablesCapability then
+        self:_ClearConsumablesCapability()
+    end
 
     if SF.Debug then
         SF.Debug:Info("SYNC_SESSION", "Session start (role=coordinator sessionId=%s profileId=%s coordinator=%s pointsSource=derived_logs)",
@@ -912,6 +915,10 @@ function Sync:_ResetSessionState(reason)
     self.state._adminConvergence = nil
     self.state.adminStatuses = {}
     self.state.handshake = nil
+
+    if self._ClearConsumablesCapability then
+        self:_ClearConsumablesCapability()
+    end
 
     -- Clear session identity
     self.state.active = false

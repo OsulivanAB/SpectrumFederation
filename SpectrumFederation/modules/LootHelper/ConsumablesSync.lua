@@ -129,29 +129,56 @@ local function CustodyWriterOk(profile, event, sender)
     return false
 end
 
-function S.ApplyRemoteEvent(profile, event, sender)
+function S.RelayWriter(event)
+    if type(event) ~= "table" then return nil end
+    local names = { event.actor, event.crafter, event.holder, event.toHolder }
+    for i = 1, #names do
+        if type(names[i]) == "string" and S.RemoteEventIdOk(event.id, names[i]) then
+            return names[i]
+        end
+    end
+    return nil
+end
+
+function S.ClearCapabilityFlags(peers)
+    if type(peers) ~= "table" then return end
+    for _, peer in pairs(peers) do
+        if type(peer) == "table" then
+            peer.consumablesCapable = nil
+        end
+    end
+end
+
+function S.ApplyRemoteEvent(profile, event, sender, opts)
     if type(event) ~= "table" or type(event.id) ~= "string" or type(event.type) ~= "string" then
         return false, "invalid"
     end
-    if not S.RemoteEventIdOk(event.id, sender) then
+    opts = type(opts) == "table" and opts or {}
+    local writer = sender
+    if opts.coordinatorRelay then
+        writer = S.RelayWriter(event)
+        if not writer then
+            return false, "unauthorized"
+        end
+    elseif not S.RemoteEventIdOk(event.id, sender) then
         return false, "unauthorized"
     end
     if event.type == C.EVENT.RESET or event.type == C.EVENT.RESOLVE then
-        if not (event.actor and Same(event.actor, sender) and C.IsCanonicalAdmin(profile, sender)) then
+        if not (event.actor and Same(event.actor, writer) and C.IsCanonicalAdmin(profile, writer)) then
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.DONATION then
-        local allowed = (event.actor and Same(event.actor, sender)) or TradeWriter(event, sender)
+        local allowed = (event.actor and Same(event.actor, writer)) or TradeWriter(event, writer)
         if not allowed then
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.RECEIPT then
-        if not (event.actor and Same(event.actor, sender) and event.crafter and Same(event.crafter, sender)
-            and PositiveQuantity(event) and C.CrafterHasItem(profile, sender, tonumber(event.itemId))) then
+        if not (event.actor and Same(event.actor, writer) and event.crafter and Same(event.crafter, writer)
+            and PositiveQuantity(event) and C.CrafterHasItem(profile, writer, tonumber(event.itemId))) then
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.CUSTODY then
-        if not CustodyWriterOk(profile, event, sender) then
+        if not CustodyWriterOk(profile, event, writer) then
             return false, "unauthorized"
         end
     else

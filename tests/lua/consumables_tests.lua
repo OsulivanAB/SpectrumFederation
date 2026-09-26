@@ -309,6 +309,14 @@ local capped = W.InterpretWithdraw({
     beforeTab = 50, afterTab = 30, beforeBags = 0, afterBags = 20,
 })
 assertEq(capped, 5, "a local pickup does not record more than the picked-up stack")
+assertEq(W.InterpretWithdraw({
+    localPickup = true, guildOk = false, configuredTab = 2, observedTab = 2, intendedQty = 20,
+    beforeTab = 50, afterTab = 30, beforeBags = 0, afterBags = 20,
+}), 0, "a withdrawal from another guild records nothing")
+assertEq(W.DepositDisposition(4, 10, false), "wait", "a partial deposit waits for the rest")
+assertEq(W.DepositDisposition(10, 10, false), "commit", "a complete deposit commits immediately")
+assertEq(W.DepositDisposition(4, 10, true), "commit", "the deposit deadline commits the partial amount")
+assertEq(W.DepositDisposition(0, 10, true), "drop", "an empty deposit deadline records nothing")
 local epoch = bankP._consumables.assignments[tostring(aqirite)].epoch
 C.CommitEvents(bankP, "withdraw-admin", W.WithdrawEvents({
     requested = true, withdrawerIsAdmin = true, withdrawer = admin, generation = bankP._consumables.generation, epoch = epoch, timestamp = C.Now(),
@@ -530,6 +538,23 @@ local claimed = {
     timestamp = C.Now(),
 }
 assertFalse(select(1, S.ApplyRemoteEvent(peer, claimed, sully)), "an event id must belong to the sending character")
+local relayed = {
+    id = "ce:relay:" .. sully .. ":1",
+    type = C.EVENT.RECEIPT,
+    actor = sully,
+    crafter = sully,
+    itemId = aqirite,
+    quantity = 2,
+    generation = peer._consumables.generation,
+    epoch = peer._consumables.assignments[tostring(aqirite)].epoch,
+    timestamp = C.Now(),
+    order = 4,
+}
+assertFalse(select(1, S.ApplyRemoteEvent(peer, relayed, admin)), "a coordinator broadcast is not treated as the coordinator's own event")
+assertTrue(select(1, S.ApplyRemoteEvent(peer, relayed, admin, { coordinatorRelay = true })), "a coordinator relay is authorized as the original writer")
+local flags = { Vann = { consumablesCapable = true, inGroup = true } }
+S.ClearCapabilityFlags(flags)
+assertEq(flags.Vann.consumablesCapable, nil, "a new session forgets consumables capability")
 local opBucket = {}
 for _ = 1, S.MAX_REMOTE_OPS do
     assertTrue(S.AllowRemoteOp(opBucket, donor, 1000), "remote ops are allowed inside the window")
@@ -686,6 +711,11 @@ C.AppendEvent(orderP, {
 assertEq(orderP._consumableEvents[1].order, 1, "a sequenced replay keeps the stored order")
 assertEq(C.Descriptor(orderP).eventFingerprint, beforePatch, "replaying an event does not change the fingerprint")
 assertTrue(beforePatch ~= 0, "the ledger fingerprint changes once events exist")
+local listed = orderP._consumableEvents[1]
+orderP._consumableEventIds[listed.id] = { id = listed.id }
+C.InvalidateEventIndex(orderP)
+C.Ensure(orderP)
+assertTrue(orderP._consumableEventIds[listed.id] == listed, "loading rebinds the event index to the saved ledger")
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

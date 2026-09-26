@@ -962,12 +962,20 @@ function Runtime:BeginDeposit(line, collected)
         Warn("Could not deposit into the configured guild bank tab.")
         return
     end
+    local selfId = self:SelfId()
+    local custody = C.CustodyFor(profile, selfId, line.itemId)
     self.depositIntent = {
         itemId = line.itemId,
         tab = tab,
+        guildGuid = cfg.guild and cfg.guild.guid or nil,
+        generation = cfg.generation,
+        requested = C.IsRequested(profile, line.itemId) == true,
+        donorAssigned = C.CrafterHasItem(profile, selfId, line.itemId) == true,
+        custodyQty = custody and custody.quantity or 0,
         intended = line.quantity - remaining,
         beforeTab = beforeTab,
         beforeBags = beforeBags,
+        bestActual = 0,
         token = self:NextToken("deposit"),
         profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId,
     }
@@ -999,12 +1007,11 @@ function Runtime:FinishDeposit(fromTimer)
     end
     self:ScanBags()
     local guild = self:CurrentGuild()
-    local cfg = C.Ensure(profile)
     local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
     local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
     local actual, reason = Workflow.InterpretDeposit({
-        guildOk = guild and cfg.guild and guild.guid == cfg.guild.guid,
-        configuredTab = cfg.bankTab,
+        guildOk = guild and intent.guildGuid and guild.guid == intent.guildGuid,
+        configuredTab = intent.tab,
         observedTab = intent.tab,
         intendedQty = intent.intended,
         beforeTab = intent.beforeTab,
@@ -1021,14 +1028,11 @@ function Runtime:FinishDeposit(fromTimer)
         Warn("That deposit was not in the configured guild bank tab.")
         return
     end
-    if actual <= 0 then
-        if fromTimer then
-            self.depositIntent = nil
-            if self.depositTimer and self.depositTimer.Cancel then
-                self.depositTimer:Cancel()
-                self.depositTimer = nil
-            end
-        end
+    if actual > (intent.bestActual or 0) then
+        intent.bestActual = actual
+    end
+    local action = Workflow.DepositDisposition(intent.bestActual, intent.intended, fromTimer)
+    if action == "wait" then
         return
     end
     self.depositIntent = nil
@@ -1036,14 +1040,17 @@ function Runtime:FinishDeposit(fromTimer)
         self.depositTimer:Cancel()
         self.depositTimer = nil
     end
-    local custody = C.CustodyFor(profile, self:SelfId(), intent.itemId)
+    if action == "drop" then
+        return
+    end
+    actual = intent.bestActual or actual
     local events = Workflow.DepositEvents({
-        generation = cfg.generation,
+        generation = intent.generation,
         itemId = intent.itemId,
         donor = self:SelfId(),
-        donorAssigned = C.CrafterHasItem(profile, self:SelfId(), intent.itemId),
-        requested = C.IsRequested(profile, intent.itemId),
-        custodyQty = custody and custody.quantity or 0,
+        donorAssigned = intent.donorAssigned == true,
+        requested = intent.requested == true,
+        custodyQty = intent.custodyQty or 0,
         timestamp = C.Now and C.Now() or nil,
     }, actual)
     self:Commit(profile, intent.token, events)
@@ -1073,6 +1080,14 @@ function Runtime:CaptureBaseline(silent)
     end
 end
 
+function Runtime:CursorItemId()
+    if type(GetCursorInfo) ~= "function" then return nil end
+    local kind, itemId, link = GetCursorInfo()
+    if kind ~= "item" then return nil end
+    local C = SF.Consumables
+    return tonumber(itemId) or (C and C.ItemIdFromText(link))
+end
+
 function Runtime:NoteGuildBankPickup(tab, slot)
     if self.placingDeposit then return end
     local C = SF.Consumables
@@ -1081,23 +1096,45 @@ function Runtime:NoteGuildBankPickup(tab, slot)
     local cfg = C.Ensure(profile)
     tab = tonumber(tab)
     slot = tonumber(slot)
-    if not tab or tab ~= tonumber(cfg.bankTab) then return end
+    local guild = self:CurrentGuild()
+    if not tab or tab ~= tonumber(cfg.bankTab) or not cfg.guild or not guild or guild.guid ~= cfg.guild.guid then
+        return
+    end
     local itemId = C.ItemIdFromText(GetGuildBankItemLink(tab, slot))
-    if not itemId or not C.IsRequested(profile, itemId) then return end
     local count = 0
-    if GetGuildBankItemInfo then
+    local slotStillOccupied = false
+    if itemId and GetGuildBankItemInfo then
         local _, itemCount = GetGuildBankItemInfo(tab, slot)
         count = tonumber(itemCount) or 0
+        slotStillOccupied = count > 0
     end
-    if count <= 0 then return end
-    self:ScanBags()
-    local beforeTab = (self:TabItemCounts(tab)[itemId]) or count
+    if not slotStillOccupied then
+        itemId = self:CursorItemId()
+        count = itemId and self.bankBaseline and self.bankBaseline[itemId] or 0
+    end
+    if not itemId or count <= 0 or not C.IsRequested(profile, itemId) then return end
+    local beforeTab, beforeBags
+    if slotStillOccupied then
+        self:ScanBags()
+        beforeTab = (self:TabItemCounts(tab)[itemId]) or count
+        beforeBags = (self.bagCounts and self.bagCounts[itemId]) or 0
+    else
+        beforeTab = (self.bankBaseline and self.bankBaseline[itemId]) or count
+        beforeBags = (self.bankBaselineBags and self.bankBaselineBags[itemId]) or 0
+    end
+    local selfId = self:SelfId()
+    local assignment = cfg.assignments[tostring(itemId)]
     self.withdrawIntent = {
         tab = tab,
+        guildGuid = cfg.guild.guid,
         itemId = itemId,
         intended = count,
         beforeTab = beforeTab,
-        beforeBags = (self.bagCounts and self.bagCounts[itemId]) or 0,
+        beforeBags = beforeBags,
+        generation = cfg.generation,
+        epoch = assignment and assignment.epoch or 0,
+        assigned = C.CrafterHasItem(profile, selfId, itemId) == true,
+        admin = C.IsCanonicalAdmin(profile, selfId) == true,
         profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId,
         token = self:NextToken("withdraw"),
     }
@@ -1127,12 +1164,21 @@ function Runtime:FinishWithdraw(fromTimer)
         return
     end
     self:ScanBags()
-    local cfg = C.Ensure(profile)
+    local guild = self:CurrentGuild()
+    if not intent.guildGuid or not guild or guild.guid ~= intent.guildGuid then
+        self.withdrawIntent = nil
+        if self.withdrawTimer and self.withdrawTimer.Cancel then
+            self.withdrawTimer:Cancel()
+            self.withdrawTimer = nil
+        end
+        return
+    end
     local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
     local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
     local qty = Workflow.InterpretWithdraw({
         localPickup = true,
-        configuredTab = cfg.bankTab,
+        guildOk = true,
+        configuredTab = intent.tab,
         observedTab = intent.tab,
         intendedQty = intent.intended,
         beforeTab = intent.beforeTab,
@@ -1155,15 +1201,13 @@ function Runtime:FinishWithdraw(fromTimer)
         self.withdrawTimer:Cancel()
         self.withdrawTimer = nil
     end
-    local selfId = self:SelfId()
-    local assignment = cfg.assignments[tostring(intent.itemId)]
     local events = Workflow.WithdrawEvents({
         requested = true,
-        withdrawerIsAssignedCrafter = C.CrafterHasItem(profile, selfId, intent.itemId),
-        withdrawerIsAdmin = C.IsCanonicalAdmin(profile, selfId),
-        withdrawer = selfId,
-        generation = cfg.generation,
-        epoch = assignment and assignment.epoch or 0,
+        withdrawerIsAssignedCrafter = intent.assigned == true,
+        withdrawerIsAdmin = intent.admin == true,
+        withdrawer = self:SelfId(),
+        generation = intent.generation,
+        epoch = intent.epoch or 0,
         timestamp = C.Now and C.Now() or nil,
     }, intent.itemId, qty)
     if #events > 0 then
@@ -1267,6 +1311,8 @@ function Runtime:OnEvent(event, arg1, arg2)
             self:FinishDeposit(false)
         elseif self.withdrawIntent then
             self:FinishWithdraw(false)
+        elseif self.bankOpen then
+            self:CaptureBaseline(true)
         end
     end
 end
@@ -1298,13 +1344,11 @@ function Runtime:Init()
     TryRegister(frame, "PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
     TryRegister(frame, "PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
     TryRegister(frame, "PLAYER_REGEN_ENABLED")
-    if not self.pickupHooked and type(PickupGuildBankItem) == "function" then
+    if not self.pickupHooked and type(hooksecurefunc) == "function" then
         self.pickupHooked = true
-        local originalPickup = PickupGuildBankItem
-        PickupGuildBankItem = function(tab, slot)
+        hooksecurefunc("PickupGuildBankItem", function(tab, slot)
             self:NoteGuildBankPickup(tab, slot)
-            return originalPickup(tab, slot)
-        end
+        end)
     end
     if SF.SettingsStore and SF.SettingsStore.RegisterCallback then
         SF.SettingsStore:RegisterCallback("lootHelper.showRaidSupplyReminders", function()
