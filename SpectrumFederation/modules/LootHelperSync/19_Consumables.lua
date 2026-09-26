@@ -44,6 +44,9 @@ function Sync:_ClearConsumablesCapability()
     if S and S.ClearCapabilityFlags then
         S.ClearCapabilityFlags(self.state and self.state.peers)
     end
+    if S and S.ClearCoordinatorWatermarks then
+        S.ClearCoordinatorWatermarks()
+    end
 end
 
 function Sync:_ConsumablesCapablePeers()
@@ -72,8 +75,15 @@ end
 
 function Sync:_NoteConsumablesCapability(sender, payload)
     if type(payload) ~= "table" or not self.TouchPeer then return end
-    if payload.consumablesCapable == true and type(sender) == "string" and sender ~= "" then
+    local function inGroup(name)
+        return self.IsRequesterInGroup and self:IsRequesterInGroup(name) and true or false
+    end
+    if payload.consumablesCapable == true and type(sender) == "string" and sender ~= "" and inGroup(sender) then
         self:TouchPeer(sender, { consumablesCapable = true })
+    end
+    local coordinator = self.state and self.state.coordinator
+    if not (type(coordinator) == "string" and self._SamePlayer and self:_SamePlayer(sender, coordinator)) then
+        return
     end
     local peers = payload.consumablesCapablePeers
     if type(peers) ~= "table" then return end
@@ -81,7 +91,7 @@ function Sync:_NoteConsumablesCapability(sender, payload)
     if limit > MAX_CAPABLE_PEERS then limit = MAX_CAPABLE_PEERS end
     for i = 1, limit do
         local name = peers[i]
-        if type(name) == "string" and name ~= "" then
+        if type(name) == "string" and name ~= "" and inGroup(name) then
             self:TouchPeer(name, { consumablesCapable = true })
         end
     end
@@ -137,8 +147,28 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         self:_QueueUnsequencedConsumablesEvents(profile)
     end
     self:_FlushUnsentConsumablesEvents(profile)
+    if S.CoordinatorConfigDiffers and S.CoordinatorConfigDiffers(localDesc, remote)
+        and profile._consumablesConfigCatchUpSession ~= self.state.sessionId then
+        profile._consumablesConfigCatchUpSession = self.state.sessionId
+        profile._consumablesAdoptNextSnapshot = self.state.sessionId
+        if self.RequestProfileSnapshot then
+            self:RequestProfileSnapshot("consumables-config")
+        end
+    end
     if not S.NeedsCatchUp(localDesc, remote) then
         return
+    end
+    local fingerprintOnly = S.CatchUpKind and S.CatchUpKind(localDesc, remote) == "fingerprint"
+    if fingerprintOnly then
+        local now = self._Now and self:_Now() or 0
+        if self._consumablesFpSnapshotSession ~= self.state.sessionId then
+            self._consumablesFpSnapshotSession = self.state.sessionId
+            self._consumablesFpSnapshotAt = nil
+        end
+        if self._consumablesFpSnapshotAt and now - self._consumablesFpSnapshotAt < 120 then
+            return
+        end
+        self._consumablesFpSnapshotAt = now
     end
     local key = table.concat({
         tostring(payload.sessionId),
@@ -250,6 +280,9 @@ function Sync:CommitConsumablesOp(profile, op, actor, opts)
     end
     opts = opts or {}
     local inSession = SessionFor(profile)
+    if inSession and self.IsSafeModeEnabled and self:IsSafeModeEnabled() then
+        return false, "Raid supplies changes wait until safe mode ends."
+    end
     if not inSession or (self.state and self.state.isCoordinator) then
         local seen = EventIdSet(profile)
         local ok, err = C.ApplyOp(profile, op, actor, opts)
@@ -338,7 +371,7 @@ function Sync:HandleConsumablesConfig(sender, payload)
         end
         return
     end
-    local ok, status = S.ApplyRemoteConfig(profile, payload, sender)
+    local ok, status = S.ApplyRemoteConfig(profile, payload, sender, { coordinatorAuthoritative = true })
     if (not ok) and status == "gap" then
         if self.RequestProfileSnapshot then
             self:RequestProfileSnapshot("consumables-gap")

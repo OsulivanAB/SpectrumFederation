@@ -78,9 +78,9 @@ end
 local function ItemLabel(itemId)
 	local name = nil
 	if C_Item and C_Item.GetItemInfo then
-		local info = C_Item.GetItemInfo(itemId)
-		if type(info) == "table" then
-			name = info.itemName or info.name
+		name = C_Item.GetItemInfo(itemId)
+		if type(name) ~= "string" then
+			name = nil
 		end
 	end
 	if type(name) ~= "string" and GetItemInfo then

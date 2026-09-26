@@ -22,6 +22,7 @@ C.ACTION = {
 
 C.MAX_ASSIGNMENT_PAIRS = 256
 C.MAX_LEDGER_EVENTS = 4096
+C.MAX_VISIBLE_HISTORY = 200
 
 C.RESOLVE_REASONS = {
     "Used",
@@ -544,8 +545,8 @@ function C.StampOrder(profile, event)
     local stored = profile._consumableEventIds and profile._consumableEventIds[event.id]
     if type(stored) == "table" and stored ~= event then
         stored.order = event.order
-        Invalidate(profile)
     end
+    Invalidate(profile)
     return event.order
 end
 
@@ -864,15 +865,20 @@ function C.FormatEvent(event, itemName)
     return ""
 end
 
-function C.HistoryRows(profile, nameForItem)
+function C.HistoryRows(profile, nameForItem, limit)
     C.Ensure(profile)
     local ordered = {}
     for i = 1, #profile._consumableEvents do
         ordered[i] = profile._consumableEvents[i]
     end
     table.sort(ordered, function(a, b) return EventLess(b, a) end)
+    local count = #ordered
+    limit = tonumber(limit)
+    if limit and limit >= 0 and limit < count then
+        count = math.floor(limit)
+    end
     local rows = {}
-    for i = 1, #ordered do
+    for i = 1, count do
         local event = ordered[i]
         local itemName = nil
         if type(nameForItem) == "function" then
@@ -1016,8 +1022,23 @@ function C.MergeSnapshot(profile, data)
     local localDesc = C.Descriptor(profile)
     local remoteGen = tonumber(data.generation) or 1
     local remoteSeq = tonumber(data.configSeq) or 0
-    if remoteGen > localDesc.generation or (remoteGen == localDesc.generation and remoteSeq >= localDesc.configSeq) then
+    local adoptSession = profile._consumablesAdoptNextSnapshot
+    local noted = SF.ConsumablesSync and SF.ConsumablesSync.CoordinatorWatermark
+        and SF.ConsumablesSync.CoordinatorWatermark(profile)
+    local snapshotCurrent = not noted or remoteGen > noted.generation
+        or (remoteGen == noted.generation and remoteSeq >= noted.configSeq)
+    local replace = remoteGen > localDesc.generation
+        or (remoteGen == localDesc.generation and remoteSeq >= localDesc.configSeq)
+        or (adoptSession and remoteGen >= localDesc.generation and snapshotCurrent)
+    profile._consumablesAdoptNextSnapshot = nil
+    if replace then
         C.ReplaceConfig(profile, data)
+        if adoptSession then
+            profile._consumablesConfigAdoptedSession = adoptSession
+        end
+        if SF.ConsumablesSync and SF.ConsumablesSync.NoteCoordinatorWatermark then
+            SF.ConsumablesSync.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq)
+        end
     else
         Notify()
     end
@@ -1082,12 +1103,16 @@ function C.CommitEvents(profile, token, events)
         return false, "Missing transaction id."
     end
     local wrote = false
+    local failed = nil
     for i = 1, #(events or {}) do
         local event = events[i]
         if type(event) == "table" then
             event.id = string.format("ce:%s:%s:%d", tostring(profile._profileId or "profile"), token, i)
             local ok, status = C.AppendEvent(profile, event, { silent = true })
-            if ok and status ~= "duplicate" then
+            if not ok then
+                failed = status or "Could not record that raid supplies change."
+                break
+            elseif status ~= "duplicate" then
                 wrote = true
             end
         end
@@ -1095,6 +1120,12 @@ function C.CommitEvents(profile, token, events)
     if wrote then
         Debug("Info", "Committed transaction %s", token)
         Notify()
+    end
+    if failed == "full" then
+        return false, "The raid supplies ledger is full. Older entries stay in the log."
+    end
+    if failed then
+        return false, failed
     end
     return true
 end

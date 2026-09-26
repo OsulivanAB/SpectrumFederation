@@ -93,9 +93,9 @@ end
 
 function Runtime:ItemName(itemId)
     if C_Item and C_Item.GetItemInfo then
-        local info = C_Item.GetItemInfo(itemId)
-        if type(info) == "table" and type(info.itemName or info.name) == "string" then
-            return info.itemName or info.name
+        local name = C_Item.GetItemInfo(itemId)
+        if type(name) == "string" and name ~= "" then
+            return name
         end
     end
     if GetItemInfo then
@@ -109,9 +109,9 @@ end
 
 function Runtime:BindType(itemId)
     if C_Item and C_Item.GetItemInfo then
-        local info = C_Item.GetItemInfo(itemId)
-        if type(info) == "table" and info.bindType ~= nil then
-            return tonumber(info.bindType)
+        local bindType = select(14, C_Item.GetItemInfo(itemId))
+        if bindType ~= nil then
+            return tonumber(bindType)
         end
     end
     if GetItemInfo then
@@ -143,7 +143,12 @@ function Runtime:Transferable(itemId)
         end
         return nil, "Item data is not ready. Try again."
     end
-    if bindType == 1 or bindType == 4 then
+    local Routing = SF.ConsumablesRouting
+    local transferable = Routing and Routing.TransferableBindType and Routing.TransferableBindType(bindType)
+    if transferable == nil then
+        transferable = not (bindType == 1 or bindType == 4 or bindType == 7 or bindType == 8 or bindType == 9)
+    end
+    if not transferable then
         return false, "That item is not transferable."
     end
     return true
@@ -234,7 +239,7 @@ function Runtime:IsCompatible(name)
 end
 
 function Runtime:IsInRange(unit)
-    if not unit then return false end
+    if not unit or InCombat() then return false end
     if not CheckInteractDistance then return true end
     return CheckInteractDistance(unit, 2) and true or false
 end
@@ -501,6 +506,14 @@ function Runtime:SyncRangeTicker()
 end
 
 function Runtime:OnRangeTick()
+    if InCombat() then
+        if self.rangeTicker then
+            self.rangeTicker:Cancel()
+            self.rangeTicker = nil
+        end
+        self.reviewRefreshPending = true
+        return
+    end
     self:UpdateTradeButtons()
     if not self:ShouldPoll() then
         self:SyncRangeTicker()
@@ -534,6 +547,7 @@ function Runtime:EnsureReview()
     frame:SetScript("OnDragStop", function(selfFrame) selfFrame:StopMovingOrSizing() end)
     frame:SetScript("OnHide", function()
         self:SyncRangeTicker()
+        self:SyncMobileButton()
     end)
     if frame.SetBackdrop then
         frame:SetBackdrop({
@@ -562,29 +576,52 @@ function Runtime:EnsureReview()
     scroll:SetScrollChild(child)
     frame.Child = child
     frame.Rows = {}
-    local mobile = CreateFrame("Button", nil, frame, "SecureActionButtonTemplate,UIPanelButtonTemplate")
+    self.review = frame
+    self.reviewButtons = {}
+    self:EnsureMobileButton()
+    return frame
+end
+
+function Runtime:EnsureMobileButton()
+    local frame = self.review
+    if not frame then return nil end
+    if frame.Mobile then return frame.Mobile end
+    if InCombat() then
+        self.mobileButtonPending = true
+        return nil
+    end
+    self.mobileButtonPending = nil
+    local mobileParent = self.mobileParent
+    if not mobileParent then
+        mobileParent = CreateFrame("Frame", "SpectrumFederationRaidSuppliesMobile", UIParent)
+        mobileParent:SetSize(1, 1)
+        self.mobileParent = mobileParent
+    end
+    local mobile = CreateFrame("Button", nil, mobileParent, "SecureActionButtonTemplate,UIPanelButtonTemplate")
     mobile:SetSize(160, 22)
     mobile:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 16, 14)
     mobile:SetText("Mobile Banking")
     mobile:Hide()
     frame.Mobile = mobile
-    self.review = frame
-    self.reviewButtons = {}
-    return frame
+    return mobile
 end
 
 function Runtime:SyncMobileButton()
     local frame = self.review
-    if not frame or not frame.Mobile then return end
+    if not frame then return end
     if InCombat() then
         self.mobileButtonPending = true
+        return
+    end
+    if not frame.Mobile and not self:EnsureMobileButton() then
         return
     end
     self.mobileButtonPending = nil
     local button = frame.Mobile
     local spell = self:MobileSpell()
     local access = self.lastAccess
-    local show = access and access.action == "mobile" and spell ~= nil
+    local reviewShown = frame.IsShown and frame:IsShown()
+    local show = reviewShown and access and access.action == "mobile" and spell ~= nil
     button:SetShown(show and true or false)
     if not show then return end
     button:SetAttribute("type", "spell")
@@ -749,10 +786,16 @@ end
 
 function Runtime:Commit(profile, token, events)
     local sync = SF.LootHelperSync
+    local ok, err
     if sync and sync.CommitConsumablesEvents then
-        return sync:CommitConsumablesEvents(profile, token, events)
+        ok, err = sync:CommitConsumablesEvents(profile, token, events)
+    else
+        ok, err = SF.Consumables.CommitEvents(profile, token, events)
     end
-    return SF.Consumables.CommitEvents(profile, token, events)
+    if not ok and err then
+        Warn(err)
+    end
+    return ok, err
 end
 
 function Runtime:NextToken(kind)
@@ -792,7 +835,31 @@ function Runtime:BeginTrade(line, collected)
         recipient = line.recipient,
         token = self:NextToken("trade"),
     }
+    self:ArmPendingTradeTimer()
     InitiateTrade(unit)
+end
+
+function Runtime:CancelPendingTradeTimer()
+    if self.pendingTradeTimer and self.pendingTradeTimer.Cancel then
+        self.pendingTradeTimer:Cancel()
+    end
+    self.pendingTradeTimer = nil
+end
+
+function Runtime:ClearPendingTrade()
+    self:CancelPendingTradeTimer()
+    self.pendingTrade = nil
+end
+
+function Runtime:ArmPendingTradeTimer()
+    self:CancelPendingTradeTimer()
+    if not (C_Timer and C_Timer.NewTimer) then return end
+    self.pendingTradeTimer = C_Timer.NewTimer(8, function()
+        self.pendingTradeTimer = nil
+        if self.pendingTrade and not self.openTrade then
+            self.pendingTrade = nil
+        end
+    end)
 end
 
 function Runtime:PlacePendingTrade()
@@ -847,6 +914,7 @@ function Runtime:CaptureTargetSlots()
 end
 
 function Runtime:OnTradeShow()
+    self:CancelPendingTradeTimer()
     local profile = self:Profile()
     local C = SF.Consumables
     if not profile or not C then return end
@@ -885,7 +953,7 @@ function Runtime:OnTradeClosed()
     local open = self.openTrade
     local pending = self.pendingTrade
     self.openTrade = nil
-    self.pendingTrade = nil
+    self:ClearPendingTrade()
     if not open then return end
     if open.role == "receiver" and open.both then
         local Workflow = SF.ConsumablesWorkflow
@@ -1053,8 +1121,8 @@ function Runtime:FinishDeposit(fromTimer)
         custodyQty = intent.custodyQty or 0,
         timestamp = C.Now and C.Now() or nil,
     }, actual)
-    self:Commit(profile, intent.token, events)
-    if actual < intent.intended then
+    local committed = self:Commit(profile, intent.token, events)
+    if committed and actual < intent.intended then
         Info(string.format("Deposited %d. The rest is still in your bags.", actual))
     end
     self:CaptureBaseline(false)
@@ -1088,7 +1156,27 @@ function Runtime:CursorItemId()
     return tonumber(itemId) or (C and C.ItemIdFromText(link))
 end
 
-function Runtime:NoteGuildBankPickup(tab, slot)
+function Runtime:AutoStoreLoss(tab)
+    local C = SF.Consumables
+    local profile = self:Profile()
+    if not C or not profile or type(self.bankBaseline) ~= "table" then return nil, 0 end
+    local after = self:TabItemCounts(tab)
+    local foundId, foundLoss, matches = nil, 0, 0
+    for itemId, before in pairs(self.bankBaseline) do
+        if C.IsRequested(profile, itemId) then
+            local loss = (tonumber(before) or 0) - (tonumber(after[itemId]) or 0)
+            if loss > 0 then
+                matches = matches + 1
+                foundId = itemId
+                foundLoss = loss
+            end
+        end
+    end
+    if matches ~= 1 then return nil, 0 end
+    return foundId, foundLoss
+end
+
+function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
     if self.placingDeposit then return end
     local C = SF.Consumables
     local profile = self:Profile()
@@ -1112,6 +1200,9 @@ function Runtime:NoteGuildBankPickup(tab, slot)
         itemId = self:CursorItemId()
         count = itemId and self.bankBaseline and self.bankBaseline[itemId] or 0
     end
+    if (not itemId or count <= 0) and fromAutoStore then
+        itemId, count = self:AutoStoreLoss(tab)
+    end
     if not itemId or count <= 0 or not C.IsRequested(profile, itemId) then return end
     local beforeTab, beforeBags
     if slotStillOccupied then
@@ -1124,6 +1215,7 @@ function Runtime:NoteGuildBankPickup(tab, slot)
     end
     local selfId = self:SelfId()
     local assignment = cfg.assignments[tostring(itemId)]
+    local now = GetTime and GetTime() or 0
     self.withdrawIntent = {
         tab = tab,
         guildGuid = cfg.guild.guid,
@@ -1137,7 +1229,12 @@ function Runtime:NoteGuildBankPickup(tab, slot)
         admin = C.IsCanonicalAdmin(profile, selfId) == true,
         profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId,
         token = self:NextToken("withdraw"),
+        startedAt = now,
     }
+    self:ArmWithdrawTimer()
+end
+
+function Runtime:ArmWithdrawTimer()
     if self.withdrawTimer and self.withdrawTimer.Cancel then
         self.withdrawTimer:Cancel()
     end
@@ -1147,6 +1244,13 @@ function Runtime:NoteGuildBankPickup(tab, slot)
             self:FinishWithdraw(true)
         end)
     end
+end
+
+function Runtime:WithdrawStillOnCursor(intent)
+    if not intent or self:CursorItemId() ~= intent.itemId then return false end
+    local now = GetTime and GetTime() or 0
+    local started = tonumber(intent.startedAt) or now
+    return now - started < 8
 end
 
 function Runtime:FinishWithdraw(fromTimer)
@@ -1187,6 +1291,10 @@ function Runtime:FinishWithdraw(fromTimer)
         afterBags = afterBags,
     })
     if qty <= 0 then
+        if fromTimer and self:WithdrawStillOnCursor(intent) then
+            self:ArmWithdrawTimer()
+            return
+        end
         if fromTimer then
             self.withdrawIntent = nil
             if self.withdrawTimer and self.withdrawTimer.Cancel then
@@ -1235,6 +1343,13 @@ function Runtime:OnBankClosed()
     self.bankBaseline = nil
     self.bankBaselineBags = nil
     self.autoReviewedThisOpen = false
+    if self.withdrawIntent then
+        if self:WithdrawStillOnCursor(self.withdrawIntent) then
+            self:ArmWithdrawTimer()
+        else
+            self:FinishWithdraw(true)
+        end
+    end
     self:RefreshReminder()
 end
 
@@ -1269,6 +1384,13 @@ function Runtime:OnEvent(event, arg1, arg2)
         if self.mobileButtonPending then
             self:SyncMobileButton()
         end
+        if self.reviewRefreshPending then
+            self.reviewRefreshPending = nil
+            self:RefreshReminder()
+            if self.review and self.review:IsShown() then
+                self:RebuildReview()
+            end
+        end
         return
     end
     if event == "BAG_UPDATE_DELAYED" or event == "GROUP_ROSTER_UPDATE" then
@@ -1276,6 +1398,10 @@ function Runtime:OnEvent(event, arg1, arg2)
             self:FinishDeposit(false)
         elseif event == "BAG_UPDATE_DELAYED" and self.withdrawIntent then
             self:FinishWithdraw(false)
+        end
+        if InCombat() then
+            self.reviewRefreshPending = true
+            return
         end
         self:RefreshReminder()
         if self.review and self.review:IsShown() then
@@ -1288,6 +1414,10 @@ function Runtime:OnEvent(event, arg1, arg2)
         end
     elseif event == "TRADE_SHOW" then
         self:OnTradeShow()
+    elseif event == "TRADE_REQUEST_CANCEL" then
+        if not self.openTrade then
+            self:ClearPendingTrade()
+        end
     elseif event == "TRADE_CLOSED" then
         self:OnTradeClosed()
     elseif event == "TRADE_ACCEPT_UPDATE" then
@@ -1333,6 +1463,7 @@ function Runtime:Init()
     TryRegister(frame, "GROUP_ROSTER_UPDATE")
     TryRegister(frame, "ITEM_DATA_LOAD_RESULT")
     TryRegister(frame, "TRADE_SHOW")
+    TryRegister(frame, "TRADE_REQUEST_CANCEL")
     TryRegister(frame, "TRADE_CLOSED")
     TryRegister(frame, "TRADE_ACCEPT_UPDATE")
     TryRegister(frame, "TRADE_PLAYER_ITEM_CHANGED")
@@ -1349,6 +1480,11 @@ function Runtime:Init()
         hooksecurefunc("PickupGuildBankItem", function(tab, slot)
             self:NoteGuildBankPickup(tab, slot)
         end)
+        if type(AutoStoreGuildBankItem) == "function" then
+            hooksecurefunc("AutoStoreGuildBankItem", function(tab, slot)
+                self:NoteGuildBankPickup(tab, slot, true)
+            end)
+        end
     end
     if SF.SettingsStore and SF.SettingsStore.RegisterCallback then
         SF.SettingsStore:RegisterCallback("lootHelper.showRaidSupplyReminders", function()

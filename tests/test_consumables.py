@@ -51,6 +51,7 @@ def test_consumables_trade_never_auto_accepts():
         runtime = RUNTIME.read_text(encoding="utf-8")
         assert "AcceptTrade" not in runtime
         assert "OnUpdate" not in runtime
+        assert 'TryRegister(frame, "TRADE_REQUEST_CANCEL")' in runtime
 
 
 def test_consumables_snapshot_merge_is_inside_import():

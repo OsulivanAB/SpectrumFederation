@@ -4,6 +4,16 @@ local _, SF = ...
 SF.ConsumablesRouting = SF.ConsumablesRouting or {}
 local R = SF.ConsumablesRouting
 
+function R.TransferableBindType(bindType)
+    bindType = tonumber(bindType)
+    if bindType == nil then return nil end
+    -- 1 On Acquire, 4 Quest, 7 Account, 8 Battle.net account, 9 Warbound until equipped.
+    if bindType == 1 or bindType == 4 or bindType == 7 or bindType == 8 or bindType == 9 then
+        return false
+    end
+    return true
+end
+
 function R.PeerCompatible(peer, isSelf)
     if isSelf then return true end
     return type(peer) == "table" and peer.consumablesCapable == true

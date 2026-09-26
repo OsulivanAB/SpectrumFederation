@@ -71,18 +71,58 @@ function S.RemoteConfigSenderOk(coordinator, sender)
     return Same(coordinator, sender)
 end
 
-function S.ApplyRemoteConfig(profile, payload, sender)
+local coordinatorWatermark = setmetatable({}, { __mode = "k" })
+
+function S.ClearCoordinatorWatermarks()
+    local stale = {}
+    for profile in pairs(coordinatorWatermark) do
+        stale[#stale + 1] = profile
+    end
+    for i = 1, #stale do
+        coordinatorWatermark[stale[i]] = nil
+    end
+end
+
+function S.CoordinatorWatermark(profile)
+    return coordinatorWatermark[profile]
+end
+
+function S.NoteCoordinatorWatermark(profile, generation, configSeq)
+    if type(profile) ~= "table" then return end
+    coordinatorWatermark[profile] = {
+        generation = tonumber(generation) or 1,
+        configSeq = tonumber(configSeq) or 0,
+    }
+end
+
+local function WatermarkIsNewer(remoteGen, remoteSeq, noted)
+    if not noted then return true end
+    if remoteGen > noted.generation then return true end
+    if remoteGen == noted.generation and remoteSeq > noted.configSeq then return true end
+    return false
+end
+
+function S.ApplyRemoteConfig(profile, payload, sender, opts)
     if type(payload) ~= "table" then
         return false, "invalid"
     end
     if not C.IsCanonicalAdmin(profile, sender) then
         return false, "unauthorized"
     end
+    opts = type(opts) == "table" and opts or {}
     local localDesc = C.Descriptor(profile)
     local remoteGen = tonumber(payload.generation) or 1
     local remoteSeq = tonumber(payload.configSeq) or 0
     if remoteGen < localDesc.generation then
         return true, "stale"
+    end
+    if opts.coordinatorAuthoritative then
+        if not WatermarkIsNewer(remoteGen, remoteSeq, coordinatorWatermark[profile]) then
+            return true, "stale"
+        end
+        C.ReplaceConfig(profile, payload)
+        S.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq)
+        return true, "applied"
     end
     if remoteGen == localDesc.generation and remoteSeq <= localDesc.configSeq then
         return true, "stale"
@@ -91,7 +131,29 @@ function S.ApplyRemoteConfig(profile, payload, sender)
         return false, "gap"
     end
     C.ReplaceConfig(profile, payload)
+    S.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq)
     return true, "applied"
+end
+
+function S.CoordinatorConfigDiffers(localDesc, remote)
+    remote = remote or {}
+    localDesc = localDesc or {}
+    local remoteGen = tonumber(remote.generation)
+    local remoteSeq = tonumber(remote.configSeq)
+    if remoteGen and remoteGen ~= (localDesc.generation or 1) then return true end
+    if remoteSeq and remoteSeq ~= (localDesc.configSeq or 0) then return true end
+    return false
+end
+
+function S.CatchUpKind(localDesc, remote)
+    if not S.NeedsCatchUp(localDesc, remote) then return "none" end
+    remote = remote or {}
+    localDesc = localDesc or {}
+    local ahead = (tonumber(remote.generation) or 0) > (localDesc.generation or 1)
+        or (tonumber(remote.configSeq) or 0) > (localDesc.configSeq or 0)
+        or (tonumber(remote.eventCount) or 0) > (localDesc.eventCount or 0)
+    if ahead then return "ahead" end
+    return "fingerprint"
 end
 
 local function PositiveQuantity(event)

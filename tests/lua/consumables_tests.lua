@@ -296,6 +296,12 @@ assertFalse(hidden.visible, "another guild hides bank actions")
 local cooldown = R.GuildBankAccess({ configured = true, sameGuild = true, bankOpen = false, mobileKnown = true, mobileCooldown = true })
 assertEq(cooldown.reason, "cooldown", "mobile banking cooldown is represented")
 assertFalse(R.GuildBankUsable(cooldown), "cooldown is not an actionable bank route")
+assertFalse(R.TransferableBindType(1), "soulbound items are not transferable")
+assertFalse(R.TransferableBindType(4), "quest items are not transferable")
+assertFalse(R.TransferableBindType(7), "account-bound items are not transferable")
+assertFalse(R.TransferableBindType(8), "Battle.net-bound items are not transferable")
+assertFalse(R.TransferableBindType(9), "warbound items are not transferable")
+assertTrue(R.TransferableBindType(2), "bind on equip items can be traded")
 
 local unrelated = W.InterpretWithdraw({ configuredTab = 2, observedTab = 2, beforeTab = 50, afterTab = 30, beforeBags = 0, afterBags = 20 })
 assertEq(unrelated, 0, "a tab and bag delta without a local pickup records nothing")
@@ -606,9 +612,25 @@ assertFalse(S.SessionEnvelopeOk(state, { sessionId = "other", profileId = "peer"
 assertTrue(S.SessionEnvelopeOk(state, { sessionId = "session-1", profileId = "peer" }), "the current session envelope is accepted")
 assertFalse(S.RemoteConfigSenderOk("Coord-Realm", donor), "config is not accepted from a non-coordinator")
 assertTrue(S.RemoteConfigSenderOk("Coord-Realm", "Coord-Realm"), "config is accepted from the coordinator")
+local offline = profile("offline-config", admin)
+C.ReplaceConfig(offline, { generation = 1, configSeq = 7, crafters = { donor }, assignments = {} })
+local coordinatorConfig = { generation = 1, configSeq = 3, crafters = { vann }, assignments = {} }
+assertEq(select(2, S.ApplyRemoteConfig(offline, coordinatorConfig, admin, { coordinatorAuthoritative = true })), "applied", "a session coordinator replaces a higher local config sequence")
+assertEq(offline._consumables.crafters[1], vann, "coordinator crafters replace the offline list")
+assertEq(select(2, S.ApplyRemoteConfig(offline, coordinatorConfig, admin, { coordinatorAuthoritative = true })), "stale", "an older coordinator config is not applied twice")
+assertEq(select(2, S.ApplyRemoteConfig(offline, { generation = 1, configSeq = 4, crafters = { sully }, assignments = {} }, admin, { coordinatorAuthoritative = true })), "applied", "a newer coordinator config still applies")
+S.ClearCoordinatorWatermarks()
+C.ReplaceConfig(offline, { generation = 1, configSeq = 7, crafters = { donor }, assignments = {} })
+offline._consumablesAdoptNextSnapshot = "session-9"
+assertTrue(select(1, C.MergeSnapshot(offline, { generation = 1, configSeq = 1, crafters = { donor }, assignments = {} })), "session snapshot adoption succeeds")
+assertEq(offline._consumables.configSeq, 1, "the first session snapshot adopts the coordinator config")
+assertEq(offline._consumablesConfigAdoptedSession, "session-9", "session config adoption is recorded once")
 local sameLedger = { generation = 1, configSeq = 0, eventCount = 2, eventFingerprint = 11 }
 assertFalse(S.NeedsCatchUp(sameLedger, sameLedger), "matching fingerprints do not catch up")
 assertTrue(S.NeedsCatchUp(sameLedger, { generation = 1, configSeq = 0, eventCount = 2, eventFingerprint = 22 }), "a different fingerprint catches up")
+assertEq(S.CatchUpKind(sameLedger, { generation = 1, configSeq = 0, eventCount = 2, eventFingerprint = 22 }), "fingerprint", "a fingerprint-only difference is not an ahead catch-up")
+assertEq(S.CatchUpKind(sameLedger, { generation = 1, configSeq = 0, eventCount = 3, eventFingerprint = 22 }), "ahead", "a higher event count catches up immediately")
+assertTrue(S.CoordinatorConfigDiffers(sameLedger, { generation = 1, configSeq = 4 }), "a different config sequence is a coordinator config difference")
 assertFalse(S.NeedsCatchUp(sameLedger, { generation = 1, configSeq = 0, eventCount = 2 }), "an older client without a fingerprint stays on the count check")
 
 assertFalse(R.PeerCompatible({ proto = 4, addonVersion = "1.5.6" }, false), "protocol and version do not make a peer consumables-capable")
@@ -746,6 +768,170 @@ orderP._consumableEventIds[listed.id] = { id = listed.id }
 C.InvalidateEventIndex(orderP)
 C.Ensure(orderP)
 assertTrue(orderP._consumableEventIds[listed.id] == listed, "loading rebinds the event index to the saved ledger")
+
+local fullP = profile("commit-full", admin)
+local commitCap = C.MAX_LEDGER_EVENTS
+C.MAX_LEDGER_EVENTS = 0
+local fullOk, fullErr = C.CommitEvents(fullP, "full-token", {
+    { type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1 },
+})
+assertFalse(fullOk, "a full ledger does not report a successful commit")
+assertTrue(type(fullErr) == "string" and fullErr:find("full") ~= nil, "a full ledger explains why the commit failed")
+assertEq(#fullP._consumableEvents, 0, "a rejected commit does not append an event")
+C.MAX_LEDGER_EVENTS = commitCap
+
+local stampP = profile("stamp-cache", admin)
+stampP._adminUsers = { admin, vann }
+C.AppendEvent(stampP, {
+    id = "ce:stamp:withdraw",
+    type = C.EVENT.CUSTODY,
+    action = C.ACTION.WITHDRAW,
+    holder = admin,
+    actor = admin,
+    itemId = aqirite,
+    quantity = 10,
+    generation = 1,
+    timestamp = 200,
+}, { silent = true })
+C.AppendEvent(stampP, {
+    id = "ce:stamp:transfer",
+    type = C.EVENT.CUSTODY,
+    action = C.ACTION.TRANSFER,
+    fromHolder = admin,
+    toHolder = vann,
+    actor = vann,
+    itemId = aqirite,
+    quantity = 10,
+    generation = 1,
+    timestamp = 100,
+}, { silent = true })
+assertEq(C.CustodyFor(stampP, admin, aqirite) and C.CustodyFor(stampP, admin, aqirite).quantity, 10, "before an order, timestamp puts the withdrawal last")
+assertEq(C.CustodyFor(stampP, vann, aqirite), nil, "an earlier timestamp cannot transfer stock that is not yet withdrawn")
+local withdrawStored = stampP._consumableEvents[1]
+local transferStored = stampP._consumableEvents[2]
+assertTrue(stampP._consumableEventIds[withdrawStored.id] == withdrawStored, "the withdrawal stamp uses the stored record")
+assertEq(C.StampOrder(stampP, withdrawStored), 1, "the stored withdrawal receives the first order")
+assertEq(C.StampOrder(stampP, transferStored), 2, "the stored transfer receives the next order")
+assertEq(C.CustodyFor(stampP, vann, aqirite) and C.CustodyFor(stampP, vann, aqirite).quantity, 10, "assigning order rebuilds custody even when the stored table is stamped directly")
+assertEq(C.CustodyFor(stampP, admin, aqirite), nil, "the rebuilt projection applies the withdrawal before the transfer")
+local visible = C.HistoryRows(stampP, nil, 1)
+assertEq(#visible, 1, "history display can stop after the newest rows")
+assertTrue(#C.HistoryRows(stampP) >= 2, "an unlimited history request still returns the ledger")
+
+load("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
+local Sync = SF.LootHelperSync
+local safeP = profile("safe-op", admin)
+Sync.state = {
+    active = true,
+    isCoordinator = false,
+    coordinator = "Coord-Realm",
+    sessionId = "session",
+    profileId = safeP._profileId,
+}
+Sync.MSG = { CONSUMABLES_OP = "CONSUMABLES_OP" }
+Sync.IsSafeModeEnabled = function() return true end
+local opSent = false
+SF.LootHelperComm = {
+    Send = function()
+        opSent = true
+    end,
+}
+local safeOk, safeErr = Sync:CommitConsumablesOp(safeP, { name = "set_bank_tab", bankTab = 2 }, admin, { asAdmin = true })
+assertFalse(safeOk, "a follower does not treat a safe-mode config edit as pending")
+assertFalse(opSent, "a follower does not whisper a config edit while safe mode drops bulk messages")
+assertTrue(type(safeErr) == "string" and safeErr:find("safe mode") ~= nil, "safe mode tells the player to retry")
+assertEq(safeP._consumables.bankTab, nil, "a rejected safe-mode edit does not change the follower")
+Sync.state.isCoordinator = true
+local coordOk = Sync:CommitConsumablesOp(safeP, { name = "set_bank_tab", bankTab = 3 }, admin, { asAdmin = true })
+assertFalse(coordOk, "the coordinator does not apply a config edit that safe mode would drop")
+assertEq(safeP._consumables.bankTab, nil, "a rejected coordinator edit stays unchanged during safe mode")
+Sync.state.isCoordinator = false
+Sync.IsSafeModeEnabled = function() return false end
+local openOk = Sync:CommitConsumablesOp(safeP, { name = "set_bank_tab", bankTab = 2 }, admin, { asAdmin = true })
+assertTrue(openOk, "a follower can send a config edit after safe mode ends")
+assertTrue(opSent, "the config edit is whispered once safe mode is off")
+
+local secureTemplates = {}
+local function FrameMock()
+    local frame = {}
+    function frame:SetSize() end
+    function frame:SetPoint() end
+    function frame:SetFrameStrata() end
+    function frame:EnableMouse() end
+    function frame:SetMovable() end
+    function frame:RegisterForDrag() end
+    function frame:SetScript() end
+    function frame:SetBackdrop() end
+    function frame:SetText() end
+    function frame:SetJustifyH() end
+    function frame:Hide() end
+    function frame:Show() end
+    function frame:SetScrollChild() end
+    function frame:SetShown() end
+    function frame:SetAttribute() end
+    function frame:Enable() end
+    function frame:Disable() end
+    function frame:IsShown() return false end
+    function frame:CreateFontString() return FrameMock() end
+    return frame
+end
+function CreateFrame(_, _, _, template)
+    if type(template) == "string" and template:find("SecureActionButtonTemplate", 1, true) then
+        secureTemplates[#secureTemplates + 1] = template
+    end
+    return FrameMock()
+end
+UIParent = {}
+function InCombatLockdown() return false end
+load("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
+local RT = SF.ConsumablesRuntime
+C.RevalidateDonation = function() return true end
+RT.bagCounts = { [aqirite] = 5 }
+RT.groupMap = { ["Crafter-Realm"] = "raid1" }
+local initiated = false
+function InitiateTrade()
+    initiated = true
+end
+local tradeTimer = nil
+C_Timer = {
+    NewTimer = function(_, fn)
+        tradeTimer = fn
+        return {
+            Cancel = function()
+                tradeTimer = nil
+            end,
+        }
+    end,
+}
+RT:BeginTrade({ itemId = aqirite, quantity = 1, recipient = "Crafter-Realm" }, {})
+assertTrue(initiated, "a reviewed donation still starts the trade")
+assertTrue(RT.pendingTrade ~= nil, "the donation stays pending until the trade opens or fails")
+assertTrue(type(tradeTimer) == "function", "a pending donation expires if the trade window never opens")
+RT:OnEvent("TRADE_REQUEST_CANCEL")
+assertEq(RT.pendingTrade, nil, "cancelling the trade request drops the pending donation")
+RT.pendingTrade = { recipient = "Crafter-Realm" }
+RT.openTrade = { role = "donor" }
+RT:ArmPendingTradeTimer()
+assertTrue(type(tradeTimer) == "function", "the expiry timer is armed again")
+tradeTimer()
+assertTrue(RT.pendingTrade ~= nil, "an open trade is not cleared by the request timeout")
+RT.openTrade = nil
+RT:ArmPendingTradeTimer()
+tradeTimer()
+assertEq(RT.pendingTrade, nil, "the request timeout clears a donation that never opened")
+
+function InCombatLockdown() return true end
+RT.review = nil
+RT.mobileParent = nil
+RT.mobileButtonPending = nil
+RT:EnsureReview()
+assertEq(#secureTemplates, 0, "opening the review during combat does not create the secure banking button")
+assertTrue(RT.review ~= nil, "the non-secure review frame can still be created during combat")
+assertTrue(RT.mobileButtonPending == true, "the banking button waits until combat ends")
+function InCombatLockdown() return false end
+local mobile = RT:EnsureMobileButton()
+assertTrue(mobile ~= nil, "the banking button is created once combat ends")
+assertEq(#secureTemplates, 1, "the secure button is created only outside combat")
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
