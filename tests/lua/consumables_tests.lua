@@ -465,7 +465,7 @@ gap.configSeq = peer._consumables.configSeq + 5
 okApply, status = S.ApplyRemoteConfig(peer, gap, admin)
 assertEq(status, "gap", "a skipped config sequence requests catch-up")
 local forged = {
-    id = "ce:forged:1",
+    id = "ce:forged:" .. sully .. ":1",
     type = C.EVENT.DONATION,
     actor = donor,
     itemId = aqirite,
@@ -482,7 +482,7 @@ assertEq(C.ContributionTotal(peer, sully, aqirite), 9, "one donation survives re
 
 local function custodyEvent(id, action, actor, extra)
     local event = {
-        id = id,
+        id = "ce:" .. actor .. ":" .. id,
         type = C.EVENT.CUSTODY,
         action = action,
         actor = actor,
@@ -507,6 +507,43 @@ assertTrue(select(1, C.AddCrafter(peer, admin, sully, { asAdmin = true })))
 assertTrue(select(1, C.AddAssignment(peer, admin, aqirite, sully, { asAdmin = true })))
 assertFalse(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:7", C.ACTION.DELIVER, donor, { fromHolder = admin, toHolder = donor }), donor)), "delivery requires the assigned crafter")
 assertTrue(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:8", C.ACTION.DELIVER, sully, { fromHolder = admin, crafter = sully }), sully)), "the assigned crafter can record delivery")
+local foreignReceipt = {
+    id = "ce:forged:" .. donor .. ":receipt",
+    type = C.EVENT.RECEIPT,
+    actor = donor,
+    crafter = donor,
+    itemId = aqirite,
+    quantity = 3,
+    generation = peer._consumables.generation,
+    epoch = 1,
+    timestamp = C.Now(),
+}
+assertFalse(select(1, S.ApplyRemoteEvent(peer, foreignReceipt, donor)), "a receipt requires the assigned crafter")
+local claimed = {
+    id = "ce:forged:" .. vann .. ":claimed",
+    type = C.EVENT.DONATION,
+    actor = sully,
+    itemId = aqirite,
+    quantity = 1,
+    generation = peer._consumables.generation,
+    source = "guildbank",
+    timestamp = C.Now(),
+}
+assertFalse(select(1, S.ApplyRemoteEvent(peer, claimed, sully)), "an event id must belong to the sending character")
+local opBucket = {}
+for _ = 1, S.MAX_REMOTE_OPS do
+    assertTrue(S.AllowRemoteOp(opBucket, donor, 1000), "remote ops are allowed inside the window")
+end
+assertFalse(S.AllowRemoteOp(opBucket, donor, 1000), "remote ops past the window cap are throttled")
+assertTrue(S.AllowRemoteOp(opBucket, donor, 1000 + S.REMOTE_OP_WINDOW), "the remote op window resets")
+local capped = profile("cap", admin)
+assertTrue(select(1, C.AddCrafter(capped, admin, vann, { asAdmin = true })))
+C.MAX_ASSIGNMENT_PAIRS = 1
+assertTrue(select(1, C.AddAssignment(capped, admin, aqirite, vann, { asAdmin = true })))
+assertFalse(select(1, C.AddAssignment(capped, admin, aqiriteRank2, vann, { asAdmin = true })), "assignment growth stops at the stability cap")
+C.MAX_ASSIGNMENT_PAIRS = 256
+local configOnly = C.ExportSnapshot(capped, { omitEvents = true })
+assertEq(configOnly.events, nil, "config broadcast export skips the event ledger")
 
 local state = { active = true, sessionId = "session-1", profileId = "peer" }
 assertFalse(S.SessionEnvelopeOk(state, { profileId = "peer" }), "a missing session id is rejected")

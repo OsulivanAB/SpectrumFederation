@@ -20,6 +20,8 @@ C.ACTION = {
     DELIVER = "deliver",
 }
 
+C.MAX_ASSIGNMENT_PAIRS = 256
+
 C.RESOLVE_REASONS = {
     "Used",
     "Lost/Destroyed",
@@ -402,6 +404,15 @@ function C.AddAssignment(profile, actor, itemId, crafterName, opts)
         return false, "That Crafter already requests this exact item."
     end
     local cfg = C.Ensure(profile)
+    local pairCount = 0
+    for _, row in pairs(cfg.assignments) do
+        if type(row) == "table" and type(row.crafters) == "table" then
+            pairCount = pairCount + #row.crafters
+        end
+    end
+    if pairCount >= C.MAX_ASSIGNMENT_PAIRS then
+        return false, "Raid Consumables already has the maximum number of assignments."
+    end
     local nextCrafters = C.AssignedCrafters(profile, itemId)
     nextCrafters[#nextCrafters + 1] = crafterName
     CommitSet(cfg, itemId, nextCrafters)
@@ -880,8 +891,9 @@ local function CopyGuild(guild)
     }
 end
 
-function C.ExportSnapshot(profile)
+function C.ExportSnapshot(profile, opts)
     local cfg = C.Ensure(profile)
+    opts = opts or {}
     local assignments = {}
     for key, row in pairs(cfg.assignments) do
         if type(row) == "table" then
@@ -892,9 +904,12 @@ function C.ExportSnapshot(profile)
             }
         end
     end
-    local events = {}
-    for i = 1, #profile._consumableEvents do
-        events[i] = CopyEvent(profile._consumableEvents[i])
+    local events = nil
+    if not opts.omitEvents then
+        events = {}
+        for i = 1, #profile._consumableEvents do
+            events[i] = CopyEvent(profile._consumableEvents[i])
+        end
     end
     return {
         generation = cfg.generation,

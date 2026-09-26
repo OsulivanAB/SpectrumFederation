@@ -12,6 +12,35 @@ local function Same(a, b)
     return a ~= nil and a == b
 end
 
+S.MAX_REMOTE_OPS = 20
+S.REMOTE_OP_WINDOW = 10
+
+function S.AllowRemoteOp(bucket, sender, now)
+    if type(bucket) ~= "table" or type(sender) ~= "string" or sender == "" then
+        return false
+    end
+    now = tonumber(now) or 0
+    local row = bucket[sender]
+    if type(row) ~= "table" or now - (tonumber(row.start) or 0) >= S.REMOTE_OP_WINDOW then
+        bucket[sender] = { start = now, count = 1 }
+        return true
+    end
+    if (tonumber(row.count) or 0) >= S.MAX_REMOTE_OPS then
+        return false
+    end
+    row.count = row.count + 1
+    return true
+end
+
+function S.RemoteEventIdOk(eventId, sender)
+    if type(eventId) ~= "string" or type(sender) ~= "string" or sender == "" then
+        return false
+    end
+    if eventId:find(":" .. sender .. ":", 1, true) then return true end
+    if eventId:find("-" .. sender .. "-", 1, true) then return true end
+    return false
+end
+
 function S.AuthorizeOp(profile, op, sender)
     if type(op) ~= "table" then return false end
     if op.name == "add_assignment" or op.name == "remove_assignment" then
@@ -104,6 +133,9 @@ function S.ApplyRemoteEvent(profile, event, sender)
     if type(event) ~= "table" or type(event.id) ~= "string" or type(event.type) ~= "string" then
         return false, "invalid"
     end
+    if not S.RemoteEventIdOk(event.id, sender) then
+        return false, "unauthorized"
+    end
     if event.type == C.EVENT.RESET or event.type == C.EVENT.RESOLVE then
         if not (event.actor and Same(event.actor, sender) and C.IsCanonicalAdmin(profile, sender)) then
             return false, "unauthorized"
@@ -114,7 +146,8 @@ function S.ApplyRemoteEvent(profile, event, sender)
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.RECEIPT then
-        if not (event.actor and Same(event.actor, sender)) then
+        if not (event.actor and Same(event.actor, sender) and event.crafter and Same(event.crafter, sender)
+            and PositiveQuantity(event) and C.CrafterHasItem(profile, sender, tonumber(event.itemId))) then
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.CUSTODY then

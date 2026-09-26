@@ -409,6 +409,10 @@ function Runtime:Collect()
 end
 
 function Runtime:ReminderState()
+    local reviewShown = self.review and self.review.IsShown and self.review:IsShown()
+    if not self:WindowShown() and not reviewShown then
+        return false
+    end
     local Routing = SF.ConsumablesRouting
     local C = SF.Consumables
     local collected = self:Collect()
@@ -753,7 +757,11 @@ end
 
 function Runtime:NextToken(kind)
     self.tokenSeq = (self.tokenSeq or 0) + 1
-    return string.format("%s-%s-%d", kind, tostring(GetTime and GetTime() or self.tokenSeq), self.tokenSeq)
+    local who = self:SelfId()
+    if type(who) ~= "string" or who == "" then
+        who = "player"
+    end
+    return string.format("%s-%s-%s-%d", kind, who, tostring(GetTime and GetTime() or self.tokenSeq), self.tokenSeq)
 end
 
 function Runtime:BeginTrade(line, collected)
@@ -821,9 +829,8 @@ end
 
 function Runtime:CaptureTargetSlots()
     local open = self.openTrade
-    if not open or not SF.Consumables then return end
+    if not open or not SF.Consumables or open.both then return end
     local actual = {}
-    local any = false
     for i = 1, MAX_TRADE_SLOTS do
         local link = GetTradeTargetItemLink and GetTradeTargetItemLink(i) or nil
         local qty = 0
@@ -834,12 +841,9 @@ function Runtime:CaptureTargetSlots()
         local itemId = SF.Consumables.ItemIdFromText(link)
         if itemId and qty > 0 then
             actual[itemId] = (actual[itemId] or 0) + qty
-            any = true
         end
     end
-    if any then
-        open.target = actual
-    end
+    open.target = actual
 end
 
 function Runtime:OnTradeShow()
@@ -872,8 +876,8 @@ function Runtime:OnTradeAccept(playerAccepted, targetAccepted)
     local open = self.openTrade
     if not open then return end
     if tonumber(playerAccepted) == 1 and tonumber(targetAccepted) == 1 then
-        open.both = true
         self:CaptureTargetSlots()
+        open.both = true
     end
 end
 
@@ -927,12 +931,22 @@ function Runtime:BeginDeposit(line, collected)
     local remaining = line.quantity
     local placed = 0
     local stacks = (self.bagStacks and self.bagStacks[line.itemId]) or {}
+    local empties = {}
+    if GetGuildBankNumSlots and GetGuildBankItemLink then
+        local slotCount = GetGuildBankNumSlots(tab) or 0
+        for slot = 1, slotCount do
+            if #empties >= MAX_DEPOSIT_PLACES then break end
+            if not GetGuildBankItemLink(tab, slot) then
+                empties[#empties + 1] = slot
+            end
+        end
+    end
     self.placingDeposit = true
     for i = 1, #stacks do
         if remaining <= 0 or placed >= MAX_DEPOSIT_PLACES then break end
         local stack = stacks[i]
         local take = math.min(remaining, stack.count)
-        local empty = self:FirstEmptySlot(tab)
+        local empty = empties[placed + 1]
         if not empty or take <= 0 then break end
         if take < stack.count and container.SplitContainerItem then
             container.SplitContainerItem(stack.bag, stack.slot, take)

@@ -247,6 +247,9 @@ local function Definition(panel)
 						tooltip = "The one guild bank tab used for this profile. Changing the tab does not change the locked guild.",
 						get = function()
 							local model = Model()
+							if model and model.guildLocked and model.bankTab then
+								return tostring(model.bankTab)
+							end
 							if panel.__sfConsumableTab ~= nil then return tostring(panel.__sfConsumableTab) end
 							if model and model.bankTab then return tostring(model.bankTab) end
 							return "1"
@@ -262,6 +265,7 @@ local function Definition(panel)
 							end
 							local model = Model()
 							if model and model.guildLocked then
+								panel.__sfConsumableTab = nil
 								Commit(ctx, { name = "set_bank_tab", bankTab = tab })
 							end
 						end,
@@ -278,6 +282,7 @@ local function Definition(panel)
 							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 							if not (model and dialogs and dialogs.Confirm) then return end
 							dialogs:Confirm(model.clearWarning, "Clear", function()
+								panel.__sfConsumableTab = nil
 								Commit(ctx, { name = "clear" })
 							end)
 						end,

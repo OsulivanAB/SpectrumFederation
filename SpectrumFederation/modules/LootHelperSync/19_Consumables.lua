@@ -284,6 +284,12 @@ function Sync:HandleConsumablesOp(sender, payload)
         Debug("Warn", "Unauthorized consumables op %s from %s", tostring(payload.op.name), tostring(sender))
         return
     end
+    self._consumablesOpWindow = self._consumablesOpWindow or {}
+    local now = self._Now and self:_Now() or 0
+    if not S.AllowRemoteOp(self._consumablesOpWindow, sender, now) then
+        Debug("Verbose", "Throttled consumables op %s from %s", tostring(payload.op.name), tostring(sender))
+        return
+    end
     local seen = EventIdSet(profile)
     local ok, err = C.ApplyOp(profile, payload.op, sender, {
         asAdmin = C.IsCanonicalAdmin(profile, sender),
@@ -303,8 +309,7 @@ function Sync:BroadcastConsumablesConfig(profile)
     if not SessionFor(profile) then return end
     local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("BroadcastConsumablesConfig")
     if not dist then return end
-    local snap = C.ExportSnapshot(profile)
-    snap.events = nil
+    local snap = C.ExportSnapshot(profile, { omitEvents = true })
     snap.profileId = ProfileIdOf(profile)
     snap.sessionId = self.state.sessionId
     SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_CONFIG, snap, dist, nil, "BULK")
