@@ -120,6 +120,9 @@ function Sync:OnBulkMessage(sender, msgType, payload, distribution)
         if msgType == self.MSG.AUTH_LOGS then return self:HandleAuthLogs(sender, payload) end
         if msgType == self.MSG.PROFILE_SNAPSHOT then return self:HandleProfileSnapshot(sender, payload) end
         if msgType == self.MSG.NEW_LOG then return self:HandleNewLog(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_CONFIG then return self:HandleConsumablesConfig(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_EVENT then return self:HandleConsumablesEvent(sender, payload) end
+        if msgType == self.MSG.CONSUMABLES_OP then return self:HandleConsumablesOp(sender, payload) end
         
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Unknown BULK message type (msgType=%s, sender=%s, dist=%s)",

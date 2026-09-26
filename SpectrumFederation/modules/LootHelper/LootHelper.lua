@@ -330,6 +330,9 @@ function SF:RehydrateLootHelperDB()
 			if profile._EnsureRewardPotConfig then
 				profile:_EnsureRewardPotConfig()
 			end
+			if profile.EnsureConsumables then
+				profile:EnsureConsumables()
+			end
 		end
 	end
 
@@ -388,6 +391,10 @@ function SF:SetActiveProfileById(profileId)
     if SF.Debug then
         SF.Debug:Info("DATABASE", "Set loot profile '%s' (ID: %s) as active", 
             profile:GetProfileName() or "Unknown", profileId)
+    end
+
+    if SF.ConsumablesRuntime and SF.ConsumablesRuntime.OnProfileChanged then
+        SF.ConsumablesRuntime:OnProfileChanged(profile)
     end
 
     return true
@@ -552,6 +559,54 @@ function SF:CreateLootHelperProfile(profileName)
 		SF.Debug:Info("DATABASE", "Created new profile: %s (ID: %s)", profileName, p:GetProfileId())
 	end
 
+	return true
+end
+
+-- Copy the active profile's Raid Consumables configuration onto a new profile.
+-- Members, loot logs, points, and other profile history stay on the source.
+-- @param newName string Name for the new profile
+-- @return boolean success
+-- @return string|nil errMsg
+function SF:DuplicateLootHelperProfile(newName)
+	local source = self:GetActiveProfile()
+	if not source then
+		return false, "No active profile."
+	end
+
+	local Imp = SF.LootHelperImpersonation
+	local allowed = false
+	if Imp and Imp.IsEffectiveLocalAdmin then
+		allowed = Imp:IsEffectiveLocalAdmin(source) and true or false
+	elseif source.IsCurrentUserAdmin then
+		allowed = source:IsCurrentUserAdmin() and true or false
+	end
+	if not allowed then
+		return false, "Only a profile admin can copy Raid Consumables configuration."
+	end
+
+	local trimmed = tostring(newName or ""):match("^%s*(.-)%s*$")
+	local ok, err = self:CreateLootHelperProfile(trimmed)
+	if not ok then
+		return false, err
+	end
+
+	local created = nil
+	for _, prof in pairs(self.lootHelperDB.profiles or {}) do
+		local name = prof.GetProfileName and prof:GetProfileName()
+		if name == trimmed then
+			created = prof
+		end
+	end
+	if not created then
+		return false, "Failed to find the new profile."
+	end
+
+	if SF.Consumables and SF.Consumables.CopyConfiguration then
+		SF.Consumables.CopyConfiguration(source, created)
+	end
+	if created.GetProfileId then
+		self:SetActiveProfileById(created:GetProfileId())
+	end
 	return true
 end
 

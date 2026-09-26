@@ -642,6 +642,9 @@ function Sync:BroadcastSessionStart()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
+    end
 
     if SF.Debug then
         local helpersCount = type(chosenHelpers) == "table" and #chosenHelpers or 0

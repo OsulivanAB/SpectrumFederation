@@ -138,6 +138,14 @@ Singleton characters keep their local Ring1/Ring2 and Trinket1/Trinket2. Linked 
 
 Historical **Main Swap** entries remain in Loot Logs as lineage. They are not offered as a live transfer action.
 
+## Raid Consumables
+
+Loot Helper → Consumables is shared profile configuration for raid supplies. An admin locks one guild, using a stable guild id, and one guild bank tab. Crafters are individual characters. Each assignment is one exact item; a different quality is a different item. The same item can be assigned to more than one Crafter. The addon routes a carried stack to one of them.
+
+Loot Helper → General → Show Raid Supply Reminders is personal. It only controls the reminder and the automatic donation review at the guild bank. Turning it off does not stop accounting. Configured Crafters do not get that reminder.
+
+Direct trades are started by you and are never accepted automatically. The receiving Crafter's client records the quantities that actually moved. Guild bank deposits and withdrawals are recorded only for the configured guild and tab. Historical Raid Consumable Logs stay when an admin clears the current configuration.
+
 ## Related pages
 
 - [Point Based](point-based.md)

@@ -830,6 +830,10 @@ function LootProfile.new(profileName)
 
     instance:_EnsureOwnerIsAdmin()
 
+    if instance.EnsureConsumables then
+        instance:EnsureConsumables()
+    end
+
     return instance
 end
 
@@ -4802,6 +4806,7 @@ function LootProfile:ExportSnapshot()
 		rcLootCouncilIntegration = self:GetRCLootCouncilIntegrationConfig(),
 		rcConfigSeq     = tonumber(self._rcConfigSeq) or 0,
 		rcConfigEpoch   = tonumber(self._rcConfigEpoch) or 0,
+		consumables     = (SF.Consumables and SF.Consumables.ExportSnapshot and SF.Consumables.ExportSnapshot(self)) or nil,
 	}
 end
 
@@ -4948,6 +4953,18 @@ function LootProfile.ValidateSnapshot(snapshot)
 
 	if snapshot.rcConfigSeq ~= nil and type(snapshot.rcConfigSeq) ~= "number" then
 		return false, "snapshot.rcConfigSeq must be a number when provided"
+	end
+
+	if snapshot.consumables ~= nil then
+		if type(snapshot.consumables) ~= "table" then
+			return false, "snapshot.consumables must be a table or nil"
+		end
+		if SF.Consumables and SF.Consumables.ValidateSnapshot then
+			local consumablesOk, consumablesErr = SF.Consumables.ValidateSnapshot(snapshot.consumables)
+			if not consumablesOk then
+				return false, consumablesErr
+			end
+		end
 	end
 
 	return true, nil
@@ -5167,6 +5184,10 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 		end
 	end
 	self:_EnsureRewardPotConfig()
+
+	if SF.Consumables and SF.Consumables.MergeSnapshot and snapshot.consumables ~= nil then
+		SF.Consumables.MergeSnapshot(self, snapshot.consumables)
+	end
 
 	-- Merge Logs
 	opts = opts or {}

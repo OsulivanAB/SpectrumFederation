@@ -125,6 +125,9 @@ function Sync:HandleSessionStart(sender, payload)
     if self._ApplyAdvertisedRCConfig then
         self:_ApplyAdvertisedRCConfig(payload)
     end
+    if self._ConsiderConsumablesCatchUp then
+        self:_ConsiderConsumablesCatchUp(payload)
+    end
 
     -- Rebuild immediately when we already have the profile to avoid stale point/member UI.
     local profile = self:FindLocalProfileById(payload.profileId)
@@ -609,6 +612,9 @@ function Sync:SendJoinStatus()
     payloadBase.localAuthorMax = localAuthorMax
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payloadBase, profileId)
+    end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payloadBase, profileId)
     end
     payloadBase.rcConfigDirty = profile._rcConfigDirty == true
 
