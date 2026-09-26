@@ -420,8 +420,13 @@ function Sync:HandleConsumablesEvent(sender, payload)
     if not profile then return end
     local event = payload.event
     local coordinator = self.state and self.state.coordinator
-    local relay = tonumber(event.order) ~= nil and type(coordinator) == "string"
-        and self:_SamePlayer(sender, coordinator)
+    local isCoordinator = self.state and self.state.isCoordinator == true
+    local fromCoordinator = false
+    if type(coordinator) == "string" and type(self._SamePlayer) == "function" then
+        fromCoordinator = self:_SamePlayer(sender, coordinator) and true or false
+    end
+    local accept, relay = S.RemoteEventAdmission(isCoordinator, fromCoordinator, event)
+    if not accept then return end
     if not relay and S.AllowRemoteOp then
         self._consumablesEventLimits = self._consumablesEventLimits or {}
         local now = (C and C.Now and C.Now()) or 0
@@ -429,11 +434,10 @@ function Sync:HandleConsumablesEvent(sender, payload)
             return
         end
     end
-    local needsOrder = self.state and self.state.isCoordinator and tonumber(event.order) == nil
     local stored = profile._consumableEventIds and event.id and profile._consumableEventIds[event.id]
     local hadOrder = type(stored) == "table" and tonumber(stored.order) ~= nil
     local ok, status = S.ApplyRemoteEvent(profile, event, sender, relay and { coordinatorRelay = true } or nil)
-    if needsOrder and ok and not hadOrder and C.StampOrder then
+    if isCoordinator and ok and not hadOrder and C.StampOrder then
         C.StampOrder(profile, event)
         self:BroadcastConsumablesEvent(profile, event)
         return

@@ -538,6 +538,36 @@ local claimed = {
     timestamp = C.Now(),
 }
 assertFalse(select(1, S.ApplyRemoteEvent(peer, claimed, sully)), "an event id must belong to the sending character")
+local tradeDonation = {
+    id = "ce:trade:" .. vann .. ":1",
+    type = C.EVENT.DONATION,
+    source = "trade",
+    actor = donor,
+    crafter = vann,
+    itemId = aqirite,
+    quantity = 4,
+    generation = peer._consumables.generation,
+    timestamp = C.Now(),
+}
+assertFalse(select(1, S.ApplyRemoteEvent(peer, tradeDonation, vann)), "a trade donation requires the assigned Crafter")
+assertTrue(select(1, C.AddAssignment(peer, admin, aqirite, vann, { asAdmin = true })), "the attesting Crafter is assigned the item")
+assertTrue(select(1, S.ApplyRemoteEvent(peer, tradeDonation, vann)), "the assigned Crafter can attest a trade donation")
+local peerOrder = { id = "ce:ordered", order = 1 }
+assertTrue(select(1, S.RemoteEventAdmission(true, false, peerOrder)), "the coordinator accepts a peer event")
+assertEq(peerOrder.order, nil, "the coordinator strips a peer-supplied ledger order")
+assertFalse(select(1, S.RemoteEventAdmission(false, false, { order = 1 })), "a follower ignores an event that did not come from the coordinator")
+local _, followerRelay = S.RemoteEventAdmission(false, true, { order = 2 })
+assertTrue(followerRelay, "a follower accepts a coordinator-stamped event")
+local cappedLedger = profile("ledger-cap", admin)
+local previousCap = C.MAX_LEDGER_EVENTS
+C.MAX_LEDGER_EVENTS = 1
+assertTrue(select(1, C.AppendEvent(cappedLedger, {
+    id = "ce:cap:1", type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1,
+}, { silent = true })), "the first ledger event is stored")
+assertFalse(select(1, C.AppendEvent(cappedLedger, {
+    id = "ce:cap:2", type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1,
+}, { silent = true })), "the ledger stops accepting events at its cap")
+C.MAX_LEDGER_EVENTS = previousCap
 local relayed = {
     id = "ce:relay:" .. sully .. ":1",
     type = C.EVENT.RECEIPT,

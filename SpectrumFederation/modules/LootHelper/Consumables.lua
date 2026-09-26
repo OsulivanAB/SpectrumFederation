@@ -21,6 +21,7 @@ C.ACTION = {
 }
 
 C.MAX_ASSIGNMENT_PAIRS = 256
+C.MAX_LEDGER_EVENTS = 4096
 
 C.RESOLVE_REASONS = {
     "Used",
@@ -576,6 +577,9 @@ function C.AppendEvent(profile, event, opts)
             Invalidate(profile)
         end
         return true, "duplicate"
+    end
+    if #profile._consumableEvents >= C.MAX_LEDGER_EVENTS then
+        return false, "full"
     end
     event.timestamp = tonumber(event.timestamp) or Now()
     event.generation = tonumber(event.generation) or C.Ensure(profile).generation

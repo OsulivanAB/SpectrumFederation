@@ -94,10 +94,6 @@ function S.ApplyRemoteConfig(profile, payload, sender)
     return true, "applied"
 end
 
-local function TradeWriter(event, sender)
-    return event.source == "trade" and event.crafter and Same(event.crafter, sender)
-end
-
 local function PositiveQuantity(event)
     local qty = tonumber(event.quantity) or 0
     local itemId = tonumber(event.itemId)
@@ -105,6 +101,13 @@ local function PositiveQuantity(event)
     if qty <= 0 then return false end
     if type(event.generation) ~= "number" then return false end
     return true
+end
+
+local function TradeWriter(profile, event, sender)
+    if event.source ~= "trade" or not PositiveQuantity(event) then return false end
+    if not (event.crafter and Same(event.crafter, sender)) then return false end
+    if not (event.actor and not Same(event.actor, sender)) then return false end
+    return C.CrafterHasItem(profile, sender, tonumber(event.itemId))
 end
 
 local function CustodyWriterOk(profile, event, sender)
@@ -140,6 +143,19 @@ function S.RelayWriter(event)
     return nil
 end
 
+function S.RemoteEventAdmission(isCoordinator, fromCoordinator, event)
+    if type(event) ~= "table" then return false, false end
+    if isCoordinator == true then
+        event.order = nil
+        return true, false
+    end
+    local order = tonumber(event.order)
+    if fromCoordinator == true and order and order > 0 then
+        return true, true
+    end
+    return false, false
+end
+
 function S.ClearCapabilityFlags(peers)
     if type(peers) ~= "table" then return end
     for _, peer in pairs(peers) do
@@ -168,7 +184,12 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.DONATION then
-        local allowed = (event.actor and Same(event.actor, writer)) or TradeWriter(event, writer)
+        local allowed
+        if event.source == "trade" then
+            allowed = TradeWriter(profile, event, writer)
+        else
+            allowed = event.actor and Same(event.actor, writer) and PositiveQuantity(event)
+        end
         if not allowed then
             return false, "unauthorized"
         end
