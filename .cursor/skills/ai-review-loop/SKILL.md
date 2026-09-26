@@ -189,7 +189,11 @@ At the final checkpoint for a production-affecting pull request, post one top-le
 
 Verify that Bugbot accepts the request and that the check or review finishes for this head. The comment itself is not a completed review. A `Cursor Bugbot` result for an older head does not cover later commits.
 
-After a Bugbot finding is fixed, prefer the installation's configured review of new commits. Request another manual Bugbot run only when that incremental behavior will not cover the fix and the fix still needs Bugbot verification. Do not restart an entire review cycle automatically. Do not enable or imitate Bugbot Autofix. Cursor remains the code-writing agent.
+Bugbot is configured to run only when mentioned. Incremental Review controls the scope of a requested review; it does not automatically start a review after a push.
+
+When a fix to a valid Bugbot finding needs Bugbot verification, request one manual Bugbot review after the fix batch is pushed and the applicable Codex verification is complete. Check first whether a Bugbot review covering that head is already requested, running, or completed, and do not create a duplicate request.
+
+Use the configured incremental scope for that verification. Do not enable automatic every-push Bugbot reviews or Bugbot Autofix. Cursor remains the code-writing agent.
 
 ### Blocked checkpoints
 
