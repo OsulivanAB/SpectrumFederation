@@ -206,6 +206,10 @@ function S.ClearTradeGrants()
     for i = 1, #stale do
         tradeGrants[stale[i]] = nil
     end
+    local sync = SF.LootHelperSync
+    if sync and sync._ClearPendingTradeFreezes then
+        sync:_ClearPendingTradeFreezes()
+    end
 end
 
 local function PlayerNameOk(name)
@@ -526,7 +530,9 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
         return false, "invalid"
     end
     event.writer = writer
-    local ok, status = C.AppendEvent(profile, event)
+    local ok, status = C.AppendEvent(profile, event, {
+        replaceOrder = opts.coordinatorRelay == true,
+    })
     if ok and status ~= "duplicate" then
         S.NoteTradeGrantUse(profile, event)
     end

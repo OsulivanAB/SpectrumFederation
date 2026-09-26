@@ -290,12 +290,20 @@ end
 local function TrimArchive(profile)
     local archive = ArchiveList(profile)
     local overflow = #archive - C.MAX_ARCHIVED_EVENTS
-    if overflow <= 0 then return end
+    if overflow <= 0 then return false end
+    local bound = EventIds(profile)
+    for i = 1, overflow do
+        local evicted = archive[i]
+        if type(evicted) == "table" and type(evicted.id) == "string" and bound.ids[evicted.id] == evicted then
+            bound.ids[evicted.id] = nil
+        end
+    end
     local kept = {}
     for i = overflow + 1, #archive do
         kept[#kept + 1] = archive[i]
     end
     profile._consumableEventArchive = kept
+    return true
 end
 
 local function ShelveEvents(profile, shouldArchive)
@@ -741,7 +749,9 @@ function C.AppendEvent(profile, event, opts)
     local stored = bound.ids[event.id]
     if stored then
         local incoming = tonumber(event.order)
-        if incoming and type(stored) == "table" and tonumber(stored.order) == nil then
+        local storedOrder = type(stored) == "table" and tonumber(stored.order) or nil
+        local replaceOrder = opts.replaceOrder and incoming and storedOrder and storedOrder ~= incoming
+        if incoming and type(stored) == "table" and (storedOrder == nil or replaceOrder) then
             stored.order = incoming
             local cfg = profile._consumables
             if incoming > (tonumber(cfg.ledgerSeq) or 0) then
@@ -753,6 +763,9 @@ function C.AppendEvent(profile, event, opts)
     end
     local eventGen = tonumber(event.generation)
     local currentGen = tonumber(profile._consumables.generation) or 1
+    if eventGen and eventGen > currentGen then
+        return false, "future"
+    end
     if eventGen and eventGen < currentGen then
         return C.AppendArchivedEvent(profile, event)
     end
@@ -809,11 +822,9 @@ function C.Clear(profile, actor, opts)
     }
     local resetOk = C.AppendEvent(profile, reset, { silent = true })
     cfg.generation = generation + 1
-    if not resetOk then
-        C.ShelvePriorGenerations(profile)
-        if not EventIds(profile).ids[reset.id] then
-            C.AppendArchivedEvent(profile, reset)
-        end
+    C.ShelvePriorGenerations(profile)
+    if not resetOk and not EventIds(profile).ids[reset.id] then
+        C.AppendArchivedEvent(profile, reset)
     end
     cfg.guild = nil
     cfg.bankTab = nil

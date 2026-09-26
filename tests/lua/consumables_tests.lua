@@ -414,7 +414,8 @@ assertTrue(select(1, C.Clear(clearP, admin, { asAdmin = true })), "admin can cle
 assertEq(clearP._consumables.guild, nil, "clear removes guild configuration")
 assertEq(#clearP._consumables.crafters, 0, "clear removes crafters")
 assertEq(#C.Project(clearP).custody, 0, "clear removes current custody")
-assertTrue(#clearP._consumableEvents > beforeLogs, "clear keeps historical events and adds a reset")
+assertEq(#clearP._consumableEvents, 0, "clear moves the previous generation out of the live ledger")
+assertTrue(#C.HistoryRows(clearP) > beforeLogs, "clear keeps historical events and adds a reset")
 local sawReset = false
 for i = 1, #C.HistoryRows(clearP) do
     if C.HistoryRows(clearP)[i].text:find("cleared the Raid Consumables configuration") then
@@ -680,6 +681,8 @@ assertTrue(select(1, C.AddAssignment(genP, admin, aqirite, vann, { asAdmin = tru
 local genFrozen = C.FreezeTrade(genP, donor, vann, { { itemId = aqirite } }, "gen")
 C.CommitEvents(genP, "gen", W.TradeEvents(genFrozen, { [aqirite] = 6 }, true))
 assertTrue(select(1, C.Clear(genP, admin, { asAdmin = true })))
+assertEq(#genP._consumableEvents, 0, "clear moves the previous generation out of the live ledger")
+assertEq(C.Descriptor(genP).eventCount, 0, "clear advertises an empty live ledger")
 assertEq(C.ContributionTotal(genP, donor, aqirite), 0, "old generation contributions are not active")
 local kept = false
 for i = 1, #C.HistoryRows(genP) do
@@ -1544,6 +1547,187 @@ local function checkCoordinatorFollowups()
     Sync.IsSafeModeEnabled = savedSafe
 end
 checkCoordinatorFollowups()
+
+local function checkReviewRound()
+    local roundP = profile("review-round", admin)
+    roundP._consumables.generation = 2
+    local archiveCap = C.MAX_ARCHIVED_EVENTS
+    C.MAX_ARCHIVED_EVENTS = 2
+    for i = 1, 3 do
+        assertTrue(select(1, C.AppendEvent(roundP, {
+            id = "ce:archive-trim:" .. i,
+            type = C.EVENT.DONATION,
+            actor = admin,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            timestamp = i,
+        }, { silent = true })), "an older event is archived")
+    end
+    assertEq(C.EventIndex(roundP)["ce:archive-trim:1"], nil, "trimming the archive drops the evicted id")
+    assertTrue(C.EventIndex(roundP)["ce:archive-trim:3"] ~= nil, "a retained archive id stays in the index")
+    C.MAX_ARCHIVED_EVENTS = archiveCap
+    assertFalse(select(1, C.AppendEvent(roundP, {
+        id = "ce:future:1",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 3,
+        timestamp = 4,
+    }, { silent = true })), "a future generation is not stored in the live ledger")
+    assertEq(C.EventIndex(roundP)["ce:future:1"], nil, "a rejected future event is not indexed")
+
+    local restampId = "ce:restamp:" .. donor .. ":1"
+    assertTrue(select(1, C.AppendEvent(roundP, {
+        id = restampId,
+        type = C.EVENT.DONATION,
+        actor = donor,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 2,
+        timestamp = 5,
+        order = 4,
+        source = "guildbank",
+    }, { silent = true })))
+    assertTrue(select(1, S.ApplyRemoteEvent(roundP, {
+        id = restampId,
+        type = C.EVENT.DONATION,
+        actor = donor,
+        writer = donor,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 2,
+        timestamp = 5,
+        order = 9,
+        source = "guildbank",
+    }, admin, { coordinatorRelay = true })), "a coordinator relay can update an existing event")
+    assertEq(C.EventIndex(roundP)[restampId].order, 9, "a coordinator relay replaces a stored order")
+    assertTrue(select(1, S.ApplyRemoteEvent(roundP, {
+        id = restampId,
+        type = C.EVENT.DONATION,
+        actor = donor,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 2,
+        timestamp = 5,
+        order = 1,
+        source = "guildbank",
+    }, donor)), "a direct replay is still a duplicate")
+    assertEq(C.EventIndex(roundP)[restampId].order, 9, "a direct replay does not replace a stored order")
+
+    local writer = "Writer-Realm"
+    local resendP = profile("resend-own", admin)
+    C.AppendEvent(resendP, {
+        id = "ce:resend:" .. writer .. ":1",
+        type = C.EVENT.DONATION,
+        actor = writer,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        timestamp = 1,
+    }, { silent = true })
+    C.AppendEvent(resendP, {
+        id = "ce:resend:Other-Realm:1",
+        type = C.EVENT.DONATION,
+        actor = "Other-Realm",
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        timestamp = 2,
+    }, { silent = true })
+    C.AppendEvent(resendP, {
+        id = "ce:resend:" .. writer .. ":2",
+        type = C.EVENT.DONATION,
+        actor = writer,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        timestamp = 3,
+        order = 2,
+    }, { silent = true })
+    local savedSelf = Sync._SelfId
+    local savedState = Sync.state
+    Sync._SelfId = function() return writer end
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "NewCoord-Realm",
+        sessionId = "resend-session",
+        profileId = resendP._profileId,
+    }
+    resendP._consumablesResendCursor = 1
+    Sync:_QueueUnsequencedConsumablesEvents(resendP)
+    local unsequenced = resendP._consumablesUnsent or {}
+    local sawOwn, sawOther = false, false
+    for i = 1, #unsequenced do
+        if unsequenced[i] == "ce:resend:" .. writer .. ":1" then sawOwn = true end
+        if unsequenced[i] == "ce:resend:Other-Realm:1" then sawOther = true end
+    end
+    assertTrue(sawOwn, "an unsequenced resend keeps this client's event")
+    assertFalse(sawOther, "an unsequenced resend skips another client's event")
+    resendP._consumablesUnsent = {}
+    Sync:_QueueAuthoredOrderedConsumablesEvents(resendP, #resendP._consumableEvents)
+    assertEq(#(resendP._consumablesUnsent or {}), 0, "matching counts do not upload ordered events")
+    Sync:_QueueAuthoredOrderedConsumablesEvents(resendP, #resendP._consumableEvents, true)
+    local sawOrdered = false
+    for i = 1, #(resendP._consumablesUnsent or {}) do
+        if resendP._consumablesUnsent[i] == "ce:resend:" .. writer .. ":2" then sawOrdered = true end
+    end
+    assertTrue(sawOrdered, "a fingerprint mismatch uploads this client's ordered event when counts match")
+
+    local freezeP = profile("freeze-retry", admin)
+    assertTrue(select(1, C.AddCrafter(freezeP, admin, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(freezeP, admin, aqirite, vann, { asAdmin = true })))
+    local freezeToken = "trade-" .. vann .. "-7-7"
+    local opened = C.FreezeTrade(freezeP, donor, vann, { { itemId = aqirite } }, freezeToken)
+    local savedComm = SF.LootHelperComm
+    local savedSafe = Sync.IsSafeModeEnabled
+    local sends = 0
+    local allowSend = false
+    Sync.MSG.CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE"
+    Sync.IsSafeModeEnabled = function() return false end
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = admin,
+        sessionId = "freeze-retry",
+        profileId = freezeP._profileId,
+    }
+    SF.LootHelperComm = {
+        Send = function()
+            sends = sends + 1
+            if not allowSend then return false end
+            return true
+        end,
+    }
+    assertTrue(Sync:PublishTradeFreeze(freezeP, opened) == false, "a dropped trade freeze is not reported as delivered")
+    assertEq(sends, 1, "the dropped trade freeze was offered to the bulk queue once")
+    Sync:_FlushUnsentConsumablesEvents(freezeP)
+    assertEq(sends, 2, "the next flush retries the dropped trade freeze")
+    allowSend = true
+    Sync:_FlushUnsentConsumablesEvents(freezeP)
+    assertEq(sends, 3, "the retry sends the trade freeze once the queue accepts it")
+    Sync:_FlushUnsentConsumablesEvents(freezeP)
+    assertEq(sends, 3, "a delivered trade freeze is not sent again")
+    Sync._SelfId = savedSelf
+    Sync.state = savedState
+    SF.LootHelperComm = savedComm
+    Sync.IsSafeModeEnabled = savedSafe
+
+    local savedSpell = C_Spell
+    local seenSpell = nil
+    C_Spell = {
+        GetSpellInfo = function(spellId)
+            seenSpell = spellId
+            return { name = "Banque mobile" }
+        end,
+    }
+    assertEq(RT:MobileSpell(), "Banque mobile", "mobile banking uses the localized spell name")
+    assertEq(seenSpell, 83958, "mobile banking resolves spell id 83958")
+    C_Spell = savedSpell
+end
+checkReviewRound()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

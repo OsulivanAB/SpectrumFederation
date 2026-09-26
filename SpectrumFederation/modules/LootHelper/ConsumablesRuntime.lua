@@ -249,17 +249,18 @@ function Runtime:RecipientInRange(name)
     return self:IsInRange(group[name])
 end
 
+local MOBILE_BANKING_SPELL_ID = 83958
+
 function Runtime:MobileSpell()
-    local name = "Mobile Banking"
     if C_Spell and C_Spell.GetSpellInfo then
-        local info = C_Spell.GetSpellInfo(name)
+        local info = C_Spell.GetSpellInfo(MOBILE_BANKING_SPELL_ID)
         if type(info) == "table" and type(info.name) == "string" and info.name ~= "" then
             return info.name
         end
         if not info then return nil end
     end
     if GetSpellInfo then
-        local spellName = GetSpellInfo(name)
+        local spellName = GetSpellInfo(MOBILE_BANKING_SPELL_ID)
         if type(spellName) == "string" and spellName ~= "" then
             return spellName
         end
