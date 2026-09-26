@@ -934,7 +934,12 @@ function Runtime:OnTradeShow()
         both = false,
         target = {},
     }
-    if role == "donor" then
+    if role == "receiver" then
+        local sync = SF.LootHelperSync
+        if sync and sync.PublishTradeFreeze then
+            sync:PublishTradeFreeze(profile, self.openTrade.frozen)
+        end
+    elseif role == "donor" then
         self:PlacePendingTrade()
     end
     Debug("Info", "Trade opened donor=%s receiver=%s", tostring(donor), tostring(receiver))

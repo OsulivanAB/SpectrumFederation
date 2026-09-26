@@ -298,9 +298,7 @@ local function TrimArchive(profile)
     profile._consumableEventArchive = kept
 end
 
-function C.ShelvePriorGenerations(profile)
-    local cfg = C.Ensure(profile)
-    local generation = tonumber(cfg.generation) or 1
+local function ShelveEvents(profile, shouldArchive)
     local kept = {}
     local archive = ArchiveList(profile)
     local moved = false
@@ -308,7 +306,7 @@ function C.ShelvePriorGenerations(profile)
     for i = 1, #events do
         local event = events[i]
         local eventGen = type(event) == "table" and tonumber(event.generation) or nil
-        if eventGen and eventGen < generation then
+        if shouldArchive(eventGen) then
             archive[#archive + 1] = event
             moved = true
         else
@@ -320,6 +318,22 @@ function C.ShelvePriorGenerations(profile)
     TrimArchive(profile)
     RebuildIndex(profile)
     return true
+end
+
+function C.ShelvePriorGenerations(profile)
+    local cfg = C.Ensure(profile)
+    local generation = tonumber(cfg.generation) or 1
+    return ShelveEvents(profile, function(eventGen)
+        return eventGen and eventGen < generation
+    end)
+end
+
+function C.RetainCurrentGeneration(profile)
+    local cfg = C.Ensure(profile)
+    local generation = tonumber(cfg.generation) or 1
+    return ShelveEvents(profile, function(eventGen)
+        return eventGen ~= generation
+    end)
 end
 
 function C.Descriptor(profile)
@@ -661,6 +675,8 @@ local function CopyEvent(event)
         toHolder = event.toHolder,
         reason = event.reason,
         order = tonumber(event.order),
+        tradeToken = type(event.tradeToken) == "string" and #event.tradeToken <= 128 and event.tradeToken or nil,
+        writer = type(event.writer) == "string" and event.writer ~= "" and #event.writer <= 64 and event.writer or nil,
     }
 end
 
@@ -735,12 +751,12 @@ function C.AppendEvent(profile, event, opts)
         end
         return true, "duplicate"
     end
+    local eventGen = tonumber(event.generation)
+    local currentGen = tonumber(profile._consumables.generation) or 1
+    if eventGen and eventGen < currentGen then
+        return C.AppendArchivedEvent(profile, event)
+    end
     if #profile._consumableEvents >= C.MAX_LEDGER_EVENTS then
-        local eventGen = tonumber(event.generation)
-        local currentGen = tonumber(profile._consumables.generation) or 1
-        if eventGen and eventGen < currentGen then
-            return C.AppendArchivedEvent(profile, event)
-        end
         local madeRoom = C.ShelvePriorGenerations(profile) and #profile._consumableEvents < C.MAX_LEDGER_EVENTS
         if not madeRoom then
             return false, "full"
@@ -812,7 +828,11 @@ end
 local function EventLess(a, b)
     local oa = tonumber(a.order)
     local ob = tonumber(b.order)
-    if oa and ob and oa ~= ob then return oa < ob end
+    if oa and ob then
+        if oa ~= ob then return oa < ob end
+    elseif oa or ob then
+        return oa ~= nil
+    end
     local ta = tonumber(a.timestamp) or 0
     local tb = tonumber(b.timestamp) or 0
     if ta ~= tb then return ta < tb end
@@ -1190,11 +1210,12 @@ function C.ReplaceConfig(profile, payload)
         end
     end
     Invalidate(profile)
+    C.RetainCurrentGeneration(profile)
     Notify()
     return true
 end
 
-function C.MergeSnapshot(profile, data)
+function C.MergeSnapshot(profile, data, opts)
     C.Ensure(profile)
     if data == nil then return true end
     local ok, err = C.ValidateSnapshot(data)
@@ -1202,20 +1223,37 @@ function C.MergeSnapshot(profile, data)
     local localDesc = C.Descriptor(profile)
     local remoteGen = tonumber(data.generation) or 1
     local remoteSeq = tonumber(data.configSeq) or 0
+    opts = type(opts) == "table" and opts or {}
+    local fromCoordinator = opts.consumablesFromCoordinator == true
     local adoptSession = profile._consumablesAdoptNextSnapshot
     local epoch = 0
     local syncState = SF.LootHelperSync and SF.LootHelperSync.state
-    if adoptSession and type(syncState) == "table" and syncState.active then
+    local sessionActive = type(syncState) == "table" and syncState.active == true
+    if opts.consumablesFromCoordinator == false then
+        if type(data.events) == "table" then
+            for i = 1, #data.events do
+                C.AppendEvent(profile, data.events[i], { silent = true })
+            end
+        end
+        Notify()
+        return true
+    end
+    if fromCoordinator and sessionActive then
         epoch = tonumber(syncState.coordEpoch) or 0
     end
     local snapshotCurrent = true
     if SF.ConsumablesSync and SF.ConsumablesSync.WatermarkAdmits then
         snapshotCurrent = SF.ConsumablesSync.WatermarkAdmits(profile, remoteGen, remoteSeq, epoch)
     end
-    local replace = remoteGen > localDesc.generation
-        or (remoteGen == localDesc.generation and remoteSeq >= localDesc.configSeq)
-        or (adoptSession and remoteGen >= localDesc.generation and snapshotCurrent)
-    if replace and remoteGen > (tonumber(profile._consumables.generation) or 1) then
+    local replace
+    if fromCoordinator then
+        replace = snapshotCurrent
+    else
+        replace = remoteGen > localDesc.generation
+            or (remoteGen == localDesc.generation and remoteSeq >= localDesc.configSeq)
+            or (adoptSession and remoteGen >= localDesc.generation and snapshotCurrent)
+    end
+    if replace and remoteGen ~= (tonumber(profile._consumables.generation) or 1) then
         profile._consumables.generation = remoteGen
     end
     if type(data.events) == "table" then

@@ -81,6 +81,9 @@ function S.ClearCoordinatorWatermarks()
     for i = 1, #stale do
         coordinatorWatermark[stale[i]] = nil
     end
+    if S.ClearTradeGrants then
+        S.ClearTradeGrants()
+    end
 end
 
 function S.CoordinatorWatermark(profile)
@@ -132,9 +135,6 @@ function S.ApplyRemoteConfig(profile, payload, sender, opts)
     local localDesc = C.Descriptor(profile)
     local remoteGen = tonumber(payload.generation) or 1
     local remoteSeq = tonumber(payload.configSeq) or 0
-    if remoteGen < localDesc.generation then
-        return true, "stale"
-    end
     local epoch = opts.coordEpoch
     if opts.coordinatorAuthoritative then
         if not WatermarkIsNewer(remoteGen, remoteSeq, coordinatorWatermark[profile], epoch) then
@@ -143,6 +143,9 @@ function S.ApplyRemoteConfig(profile, payload, sender, opts)
         C.ReplaceConfig(profile, payload)
         S.NoteCoordinatorWatermark(profile, remoteGen, remoteSeq, epoch)
         return true, "applied"
+    end
+    if remoteGen < localDesc.generation then
+        return true, "stale"
     end
     if remoteGen == localDesc.generation and remoteSeq <= localDesc.configSeq then
         return true, "stale"
@@ -189,19 +192,243 @@ local function PositiveQuantity(event)
     return true
 end
 
-local function FrozenAssignmentOk(profile, crafter, itemId, epoch)
-    epoch = tonumber(epoch)
-    if epoch and epoch > 0 then
-        return C.CrafterAssignedAtEpoch(profile, crafter, itemId, epoch)
+S.TRADE_GRANT_TTL = 120
+S.MAX_TRADE_GRANTS = 32
+S.MAX_TRADE_GRANT_ITEMS = 32
+
+local tradeGrants = setmetatable({}, { __mode = "k" })
+
+function S.ClearTradeGrants()
+    local stale = {}
+    for profile in pairs(tradeGrants) do
+        stale[#stale + 1] = profile
     end
-    return C.CrafterHasItem(profile, crafter, itemId)
+    for i = 1, #stale do
+        tradeGrants[stale[i]] = nil
+    end
+end
+
+local function PlayerNameOk(name)
+    return type(name) == "string" and name ~= "" and #name <= 64 and not name:find("[%c]")
+end
+
+local function TokenOk(token, receiver)
+    if type(token) ~= "string" or #token < 8 or #token > 128 then return false end
+    if token:find("[%c]") then return false end
+    if type(receiver) == "string" and receiver ~= "" and not token:find(receiver, 1, true) then
+        return false
+    end
+    return true
+end
+
+local function GrantState(profile)
+    local state = tradeGrants[profile]
+    if not state then
+        state = { byToken = {}, byReceiver = {} }
+        tradeGrants[profile] = state
+    end
+    return state
+end
+
+local function GrantCount(state)
+    local count = 0
+    for _ in pairs(state.byToken) do
+        count = count + 1
+    end
+    return count
+end
+
+local function DropGrant(state, token)
+    local grant = state.byToken[token]
+    state.byToken[token] = nil
+    if grant and state.byReceiver[grant.receiver] == token then
+        state.byReceiver[grant.receiver] = nil
+    end
+end
+
+local function PurgeGrants(state, now)
+    local stale = {}
+    for token, grant in pairs(state.byToken) do
+        if type(grant) ~= "table" or now >= (tonumber(grant.expiresAt) or 0) then
+            stale[#stale + 1] = token
+        end
+    end
+    for i = 1, #stale do
+        DropGrant(state, stale[i])
+    end
+end
+
+local function CopyGrantItems(profile, receiver, items, liveCheck)
+    if type(items) ~= "table" then return nil end
+    local count = #items
+    if count < 1 or count > S.MAX_TRADE_GRANT_ITEMS then return nil end
+    local copied = {}
+    local cfg = liveCheck and C.Ensure(profile) or nil
+    for i = 1, count do
+        local row = items[i]
+        if type(row) ~= "table" then return nil end
+        local itemId = tonumber(row.itemId)
+        local epoch = tonumber(row.epoch)
+        if not itemId or itemId <= 0 or itemId ~= math.floor(itemId) then return nil end
+        if not epoch or epoch < 1 or epoch ~= math.floor(epoch) then return nil end
+        if copied[itemId] then return nil end
+        if liveCheck then
+            local assignment = cfg.assignments[tostring(itemId)]
+            if type(assignment) ~= "table" or tonumber(assignment.epoch) ~= epoch then return nil end
+            if not C.CrafterHasItem(profile, receiver, itemId) then return nil end
+        end
+        copied[itemId] = epoch
+    end
+    return copied
+end
+
+local function StoreTradeGrant(profile, grant, now, liveCheck)
+    if type(profile) ~= "table" or type(grant) ~= "table" then return false end
+    now = tonumber(now) or 0
+    local receiver = grant.receiver
+    local donor = grant.donor
+    if not PlayerNameOk(receiver) or not PlayerNameOk(donor) or Same(donor, receiver) then return false end
+    if not TokenOk(grant.token, receiver) then return false end
+    local generation = tonumber(grant.generation)
+    if not generation or generation < 1 or generation ~= math.floor(generation) then return false end
+    local items = CopyGrantItems(profile, receiver, grant.items, liveCheck)
+    if not items then return false end
+    local state = GrantState(profile)
+    PurgeGrants(state, now)
+    local previous = state.byReceiver[receiver]
+    if previous and previous ~= grant.token then
+        DropGrant(state, previous)
+    end
+    local existing = state.byToken[grant.token]
+    if not existing and GrantCount(state) >= S.MAX_TRADE_GRANTS then
+        return false
+    end
+    state.byToken[grant.token] = {
+        token = grant.token,
+        donor = donor,
+        receiver = receiver,
+        generation = generation,
+        items = items,
+        used = existing and existing.used or {},
+        expiresAt = existing and existing.expiresAt or (now + S.TRADE_GRANT_TTL),
+    }
+    state.byReceiver[receiver] = grant.token
+    return true
+end
+
+function S.RegisterTradeGrant(profile, grant, now)
+    return StoreTradeGrant(profile, grant, now, true)
+end
+
+function S.AcceptCoordinatorTradeGrant(profile, grant, now)
+    return StoreTradeGrant(profile, grant, now, false)
+end
+
+function S.TradeFreezePayload(frozen)
+    if type(frozen) ~= "table" or type(frozen.items) ~= "table" then return nil end
+    if not TokenOk(frozen.token, frozen.receiver) then return nil end
+    if not PlayerNameOk(frozen.donor) or not PlayerNameOk(frozen.receiver) then return nil end
+    if Same(frozen.donor, frozen.receiver) then return nil end
+    local generation = tonumber(frozen.generation)
+    if not generation or generation < 1 or generation ~= math.floor(generation) then return nil end
+    local items = {}
+    for key, info in pairs(frozen.items) do
+        if #items >= S.MAX_TRADE_GRANT_ITEMS then break end
+        if type(info) == "table" and info.assignedToReceiver then
+            local itemId = tonumber(info.itemId) or tonumber(key)
+            local epoch = tonumber(info.epoch)
+            if itemId and epoch and epoch >= 1 and itemId == math.floor(itemId) and epoch == math.floor(epoch) then
+                items[#items + 1] = { itemId = itemId, epoch = epoch }
+            end
+        end
+    end
+    if #items == 0 then return nil end
+    table.sort(items, function(a, b) return a.itemId < b.itemId end)
+    return {
+        token = frozen.token,
+        donor = frozen.donor,
+        receiver = frozen.receiver,
+        generation = generation,
+        items = items,
+    }
+end
+
+local function GrantSlot(grant, event, writer)
+    if type(event) ~= "table" or event.tradeToken ~= grant.token then return nil end
+    if type(event.id) ~= "string" or not event.id:find(grant.token, 1, true) then return nil end
+    if not Same(writer, grant.receiver) then return nil end
+    if tonumber(event.generation) ~= grant.generation then return nil end
+    local itemId = tonumber(event.itemId)
+    local epoch = tonumber(event.epoch)
+    if not itemId or grant.items[itemId] ~= epoch then return nil end
+    local kind
+    if event.type == C.EVENT.DONATION then
+        if event.source ~= "trade" or not Same(event.actor, grant.donor) or not Same(event.crafter, grant.receiver) then
+            return nil
+        end
+        kind = "donation"
+    elseif event.type == C.EVENT.RECEIPT then
+        if not Same(event.actor, grant.receiver) or not Same(event.crafter, grant.receiver) then
+            return nil
+        end
+        kind = "receipt"
+    elseif event.type == C.EVENT.CUSTODY and event.action == C.ACTION.DELIVER then
+        if not Same(event.actor, grant.receiver) or not Same(event.toHolder, grant.receiver) or not Same(event.fromHolder, grant.donor) then
+            return nil
+        end
+        kind = "deliver"
+    else
+        return nil
+    end
+    local slot = tostring(itemId) .. ":" .. kind
+    local used = grant.used and grant.used[slot]
+    if used and used ~= event.id then return nil end
+    return slot
+end
+
+function S.TradeGrantMatches(profile, event, writer, now)
+    if type(profile) ~= "table" or type(event) ~= "table" then return false end
+    now = tonumber(now) or 0
+    local state = tradeGrants[profile]
+    if not state then return false end
+    PurgeGrants(state, now)
+    local grant = state.byToken[event.tradeToken]
+    if not grant then return false end
+    return GrantSlot(grant, event, writer) ~= nil
+end
+
+function S.NoteTradeGrantUse(profile, event)
+    if type(profile) ~= "table" or type(event) ~= "table" then return end
+    local state = tradeGrants[profile]
+    local grant = state and state.byToken[event.tradeToken]
+    if not grant then return end
+    local slot = GrantSlot(grant, event, grant.receiver)
+    if not slot then return end
+    grant.used = grant.used or {}
+    grant.used[slot] = event.id
+end
+
+local function CurrentAssignmentOk(profile, crafter, itemId, epoch)
+    if not C.CrafterHasItem(profile, crafter, itemId) then return false end
+    epoch = tonumber(epoch)
+    if not epoch or epoch <= 0 then return true end
+    local cfg = profile._consumables
+    local row = cfg and cfg.assignments and cfg.assignments[tostring(itemId)]
+    return type(row) == "table" and tonumber(row.epoch) == epoch
+end
+
+local function FrozenAssignmentOk(profile, crafter, itemId, epoch, event)
+    if CurrentAssignmentOk(profile, crafter, itemId, epoch) then return true end
+    epoch = tonumber(epoch)
+    if not epoch or epoch <= 0 then return false end
+    return S.TradeGrantMatches(profile, event, crafter, C.Now())
 end
 
 local function TradeWriter(profile, event, sender)
     if event.source ~= "trade" or not PositiveQuantity(event) then return false end
     if not (event.crafter and Same(event.crafter, sender)) then return false end
     if not (event.actor and not Same(event.actor, sender)) then return false end
-    return FrozenAssignmentOk(profile, sender, tonumber(event.itemId), event.epoch)
+    return FrozenAssignmentOk(profile, sender, tonumber(event.itemId), event.epoch, event)
 end
 
 local function CustodyWriterOk(profile, event, sender)
@@ -221,18 +448,15 @@ local function CustodyWriterOk(profile, event, sender)
         local crafter = event.toHolder or event.crafter
         return crafter and event.fromHolder
             and Same(event.actor, sender) and Same(crafter, sender)
-            and FrozenAssignmentOk(profile, sender, tonumber(event.itemId), event.epoch)
+            and FrozenAssignmentOk(profile, sender, tonumber(event.itemId), event.epoch, event)
     end
     return false
 end
 
 function S.RelayWriter(event)
     if type(event) ~= "table" then return nil end
-    local names = { event.actor, event.crafter, event.holder, event.toHolder }
-    for i = 1, #names do
-        if type(names[i]) == "string" and S.RemoteEventIdOk(event.id, names[i]) then
-            return names[i]
-        end
+    if type(event.writer) == "string" and event.writer ~= "" and S.RemoteEventIdOk(event.id, event.writer) then
+        return event.writer
     end
     return nil
 end
@@ -241,6 +465,7 @@ function S.RemoteEventAdmission(isCoordinator, fromCoordinator, event)
     if type(event) ~= "table" then return false, false end
     if isCoordinator == true then
         event.order = nil
+        event.writer = nil
         return true, false
     end
     local order = tonumber(event.order)
@@ -290,7 +515,7 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
     elseif event.type == C.EVENT.RECEIPT then
         if not (event.actor and Same(event.actor, writer) and event.crafter and Same(event.crafter, writer)
             and PositiveQuantity(event)
-            and FrozenAssignmentOk(profile, writer, tonumber(event.itemId), event.epoch)) then
+            and FrozenAssignmentOk(profile, writer, tonumber(event.itemId), event.epoch, event)) then
             return false, "unauthorized"
         end
     elseif event.type == C.EVENT.CUSTODY then
@@ -300,7 +525,12 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
     else
         return false, "invalid"
     end
-    return C.AppendEvent(profile, event)
+    event.writer = writer
+    local ok, status = C.AppendEvent(profile, event)
+    if ok and status ~= "duplicate" then
+        S.NoteTradeGrantUse(profile, event)
+    end
+    return ok, status
 end
 
 function S.NeedsCatchUp(localDesc, remote)

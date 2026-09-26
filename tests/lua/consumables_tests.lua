@@ -558,9 +558,10 @@ local tradeDonation = {
 assertFalse(select(1, S.ApplyRemoteEvent(peer, tradeDonation, vann)), "a trade donation requires the assigned Crafter")
 assertTrue(select(1, C.AddAssignment(peer, admin, aqirite, vann, { asAdmin = true })), "the attesting Crafter is assigned the item")
 assertTrue(select(1, S.ApplyRemoteEvent(peer, tradeDonation, vann)), "the assigned Crafter can attest a trade donation")
-local peerOrder = { id = "ce:ordered", order = 1 }
+local peerOrder = { id = "ce:ordered", order = 1, writer = donor }
 assertTrue(select(1, S.RemoteEventAdmission(true, false, peerOrder)), "the coordinator accepts a peer event")
 assertEq(peerOrder.order, nil, "the coordinator strips a peer-supplied ledger order")
+assertEq(peerOrder.writer, nil, "the coordinator strips a peer-supplied writer")
 assertFalse(select(1, S.RemoteEventAdmission(false, false, { order = 1 })), "a follower ignores an event that did not come from the coordinator")
 local _, followerRelay = S.RemoteEventAdmission(false, true, { order = 2 })
 assertTrue(followerRelay, "a follower accepts a coordinator-stamped event")
@@ -585,6 +586,7 @@ local relayed = {
     epoch = peer._consumables.assignments[tostring(aqirite)].epoch,
     timestamp = C.Now(),
     order = 4,
+    writer = sully,
 }
 assertFalse(select(1, S.ApplyRemoteEvent(peer, relayed, admin)), "a coordinator broadcast is not treated as the coordinator's own event")
 assertTrue(select(1, S.ApplyRemoteEvent(peer, relayed, admin, { coordinatorRelay = true })), "a coordinator relay is authorized as the original writer")
@@ -818,6 +820,24 @@ assertEq(C.CustodyFor(stampP, admin, aqirite), nil, "the rebuilt projection appl
 local visible = C.HistoryRows(stampP, nil, 1)
 assertEq(#visible, 1, "history display can stop after the newest rows")
 assertTrue(#C.HistoryRows(stampP) >= 2, "an unlimited history request still returns the ledger")
+local cycleP = profile("event-order", admin)
+C.AppendEvent(cycleP, {
+    id = "ce:cycle:a", type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1,
+    generation = 1, timestamp = 100, order = 1,
+}, { silent = true })
+C.AppendEvent(cycleP, {
+    id = "ce:cycle:b", type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 2,
+    generation = 1, timestamp = 50,
+}, { silent = true })
+C.AppendEvent(cycleP, {
+    id = "ce:cycle:c", type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 3,
+    generation = 1, timestamp = 10, order = 2,
+}, { silent = true })
+local cycleRows = C.HistoryRows(cycleP)
+assertEq(#cycleRows, 3, "mixed stamped and unstamped events still sort")
+assertTrue(cycleRows[1].text:find("donated 2") ~= nil, "an unstamped event sorts after stamped events")
+assertTrue(cycleRows[2].text:find("donated 3") ~= nil, "a later order sorts ahead of an earlier order in history")
+assertTrue(cycleRows[3].text:find("donated 1") ~= nil, "the earliest order is the oldest history row")
 
 load("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
 local Sync = SF.LootHelperSync
@@ -1075,6 +1095,16 @@ assertTrue(hasEvent(crowdedJoiner._consumableEvents, "ce:snap:new"), "current-ge
 assertFalse(hasEvent(crowdedJoiner._consumableEvents, "ce:snap:old1"), "archived snapshot history does not fill the live ledger")
 C.MAX_LEDGER_EVENTS = importCap
 C.MAX_ARCHIVED_EVENTS = importArchiveCap
+local roomP = profile("archive-room", admin)
+roomP._consumables.generation = 2
+local roomBefore = C.Descriptor(roomP)
+assertTrue(select(1, C.AppendEvent(roomP, snapEvent("ce:room:old", 1), { silent = true })), "an older event is accepted while the live ledger has room")
+assertFalse(hasEvent(roomP._consumableEvents, "ce:room:old"), "an older event does not enter the live ledger")
+assertTrue(hasEvent(roomP._consumableEventArchive, "ce:room:old"), "an older event is archived before the capacity check")
+assertEq(C.Descriptor(roomP).eventCount, roomBefore.eventCount, "an archived event does not change the live event count")
+assertEq(C.Descriptor(roomP).eventFingerprint, roomBefore.eventFingerprint, "an archived event does not change the live fingerprint")
+assertTrue(select(1, C.AppendEvent(roomP, snapEvent("ce:room:new", 2), { silent = true })), "the current generation still appends while the ledger has room")
+assertTrue(hasEvent(roomP._consumableEvents, "ce:room:new"), "the current generation stays on the live ledger")
 
 S.ClearCoordinatorWatermarks()
 local takeoverP = profile("takeover-config", admin)
@@ -1094,22 +1124,42 @@ local frozenP = profile("frozen-trade", admin)
 assertTrue(select(1, C.AddCrafter(frozenP, admin, vann, { asAdmin = true })))
 assertTrue(select(1, C.AddAssignment(frozenP, admin, aqirite, vann, { asAdmin = true })))
 local frozenEpoch = frozenP._consumables.assignments[tostring(aqirite)].epoch
-local frozenTrade = C.FreezeTrade(frozenP, donor, vann, { { itemId = aqirite } }, "frozen")
+local frozenToken = "trade-" .. vann .. "-1-1"
+local frozenTrade = C.FreezeTrade(frozenP, donor, vann, { { itemId = aqirite } }, frozenToken)
+local frozenGrant = S.TradeFreezePayload(frozenTrade)
+local frozenNow = C.Now()
+assertTrue(S.RegisterTradeGrant(frozenP, frozenGrant, frozenNow), "an open trade is granted while the Crafter is still assigned")
 assertTrue(select(1, C.RemoveAssignment(frozenP, admin, aqirite, vann, { asAdmin = true })))
 assertFalse(C.CrafterHasItem(frozenP, vann, aqirite), "the live assignment is gone after the trade opened")
-local frozenDonation = {
-    id = "ce:frozen:" .. vann .. ":donation",
-    type = C.EVENT.DONATION,
-    source = "trade",
-    actor = donor,
-    crafter = vann,
-    itemId = aqirite,
-    quantity = 3,
-    generation = frozenP._consumables.generation,
-    epoch = frozenEpoch,
-    timestamp = C.Now(),
-}
+assertFalse(S.RegisterTradeGrant(frozenP, frozenGrant, C.Now()), "a removed Crafter cannot register another trade grant")
+local function frozenEvent(id, typeName, extra)
+    local event = {
+        id = "ce:" .. frozenP._profileId .. ":" .. frozenToken .. ":" .. id,
+        type = typeName,
+        itemId = aqirite,
+        quantity = 3,
+        generation = frozenP._consumables.generation,
+        epoch = frozenEpoch,
+        tradeToken = frozenToken,
+        timestamp = C.Now(),
+    }
+    for key, value in pairs(extra or {}) do
+        event[key] = value
+    end
+    return event
+end
+local frozenDonation = frozenEvent("donation", C.EVENT.DONATION, {
+    source = "trade", actor = donor, crafter = vann,
+})
 assertTrue(select(1, S.ApplyRemoteEvent(frozenP, frozenDonation, vann)), "a trade donation keeps the assignment frozen at trade open")
+local reusedDonation = frozenEvent("again", C.EVENT.DONATION, {
+    source = "trade", actor = donor, crafter = vann,
+})
+assertFalse(select(1, S.ApplyRemoteEvent(frozenP, reusedDonation, vann)), "a trade grant cannot authorize a second donation")
+local victimDonation = frozenEvent("victim", C.EVENT.DONATION, {
+    source = "trade", actor = sully, crafter = vann,
+})
+assertFalse(select(1, S.ApplyRemoteEvent(frozenP, victimDonation, vann)), "a trade grant cannot name a different donor")
 local liveDonation = {
     id = "ce:frozen:" .. vann .. ":live",
     type = C.EVENT.DONATION,
@@ -1122,36 +1172,23 @@ local liveDonation = {
     timestamp = C.Now(),
 }
 assertFalse(select(1, S.ApplyRemoteEvent(frozenP, liveDonation, vann)), "a trade donation without a frozen epoch still requires the live assignment")
-local frozenReceipt = {
-    id = "ce:frozen:" .. vann .. ":receipt",
-    type = C.EVENT.RECEIPT,
-    actor = vann,
-    crafter = vann,
-    itemId = aqirite,
-    quantity = 3,
-    generation = frozenP._consumables.generation,
-    epoch = frozenEpoch,
-    source = "trade",
-    timestamp = C.Now(),
-}
+local frozenReceipt = frozenEvent("receipt", C.EVENT.RECEIPT, {
+    actor = vann, crafter = vann, source = "trade",
+})
 assertTrue(select(1, S.ApplyRemoteEvent(frozenP, frozenReceipt, vann)), "a trade receipt keeps the assignment frozen at trade open")
-local forgedEpoch = {
-    id = "ce:frozen:" .. vann .. ":forged",
-    type = C.EVENT.RECEIPT,
-    actor = vann,
-    crafter = vann,
-    itemId = aqirite,
-    quantity = 1,
-    generation = frozenP._consumables.generation,
-    epoch = 99,
-    source = "trade",
-    timestamp = C.Now(),
-}
+local frozenDeliver = frozenEvent("deliver", C.EVENT.CUSTODY, {
+    action = C.ACTION.DELIVER, actor = vann, crafter = vann, fromHolder = donor, toHolder = vann, quantity = 1,
+})
+assertTrue(select(1, S.ApplyRemoteEvent(frozenP, frozenDeliver, vann)), "a trade delivery shares the open trade grant")
+local forgedEpoch = frozenEvent("forged", C.EVENT.RECEIPT, {
+    actor = vann, crafter = vann, source = "trade", epoch = 99, quantity = 1,
+})
 assertFalse(select(1, S.ApplyRemoteEvent(frozenP, forgedEpoch, vann)), "an unknown assignment epoch does not authorize a trade")
+assertFalse(S.TradeGrantMatches(frozenP, frozenDonation, vann, frozenNow + S.TRADE_GRANT_TTL), "a trade grant expires")
 local tradeEvents = W.TradeEvents(frozenTrade, { [aqirite] = 3 }, true)
 local sawFrozenEpoch = false
 for i = 1, #tradeEvents do
-    if tradeEvents[i].type == C.EVENT.DONATION and tradeEvents[i].epoch == frozenEpoch then
+    if tradeEvents[i].type == C.EVENT.DONATION and tradeEvents[i].epoch == frozenEpoch and tradeEvents[i].tradeToken == frozenToken then
         sawFrozenEpoch = true
     end
 end
@@ -1160,7 +1197,96 @@ local frozenExport = C.ExportSnapshot(frozenP, { omitEvents = true })
 local frozenFollower = profile("frozen-follower", admin)
 C.ReplaceConfig(frozenFollower, frozenExport)
 assertTrue(C.CrafterAssignedAtEpoch(frozenFollower, vann, aqirite, frozenEpoch), "assignment history survives a config broadcast")
-assertTrue(select(1, S.ApplyRemoteEvent(frozenFollower, frozenReceipt, vann)), "a follower can accept a frozen trade from broadcast history")
+assertFalse(select(1, S.ApplyRemoteEvent(frozenFollower, frozenReceipt, vann)), "assignment history alone does not authorize a removed Crafter")
+assertTrue(S.AcceptCoordinatorTradeGrant(frozenFollower, frozenGrant, C.Now()), "a follower stores the coordinator's trade grant")
+assertTrue(select(1, S.ApplyRemoteEvent(frozenFollower, frozenReceipt, vann)), "a follower can accept a frozen trade that the coordinator granted")
+local function checkTradeFreezeSync()
+local savedFreezeState = Sync.state
+local savedFreezeFind = Sync.FindLocalProfileById
+local savedFreezeGroup = Sync.IsRequesterInGroup
+local savedFreezeSame = Sync._SamePlayer
+local savedFreezeEnforce = Sync._EnforceGroupedSessionActive
+local savedFreezeComm = SF.LootHelperComm
+Sync.MSG.CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE"
+Sync._SamePlayer = function(_, a, b) return a == b end
+Sync.IsRequesterInGroup = function() return true end
+Sync._EnforceGroupedSessionActive = function() return "RAID" end
+local freezeSent = nil
+SF.LootHelperComm = {
+    Send = function(_, _, msgType, payload)
+        freezeSent = { msgType = msgType, payload = payload }
+    end,
+}
+local freezeProfile = profile("freeze-sync", admin)
+assertTrue(select(1, C.AddCrafter(freezeProfile, admin, vann, { asAdmin = true })))
+assertTrue(select(1, C.AddAssignment(freezeProfile, admin, aqirite, vann, { asAdmin = true })))
+local freezeEpoch = freezeProfile._consumables.assignments[tostring(aqirite)].epoch
+local freezeToken = "trade-" .. vann .. "-9-9"
+local opened = C.FreezeTrade(freezeProfile, donor, vann, { { itemId = aqirite } }, freezeToken)
+Sync.state = {
+    active = true,
+    isCoordinator = true,
+    coordinator = admin,
+    sessionId = "freeze-session",
+    profileId = freezeProfile._profileId,
+}
+Sync.FindLocalProfileById = function(_, id)
+    if id == freezeProfile._profileId then return freezeProfile end
+    return nil
+end
+Sync:HandleConsumablesTradeFreeze(vann, {
+    sessionId = "freeze-session",
+    profileId = freezeProfile._profileId,
+    token = freezeToken,
+    donor = donor,
+    receiver = vann,
+    generation = freezeProfile._consumables.generation,
+    items = { { itemId = aqirite, epoch = freezeEpoch } },
+})
+assertEq(freezeSent and freezeSent.msgType, "CONSUMABLES_TRADE_FREEZE", "the coordinator rebroadcasts one accepted trade freeze")
+assertTrue(select(1, C.RemoveAssignment(freezeProfile, admin, aqirite, vann, { asAdmin = true })))
+Sync:HandleConsumablesTradeFreeze(vann, {
+    sessionId = "freeze-session",
+    profileId = freezeProfile._profileId,
+    token = "trade-" .. vann .. "-8-8",
+    donor = sully,
+    receiver = vann,
+    generation = freezeProfile._consumables.generation,
+    items = { { itemId = aqirite, epoch = freezeEpoch } },
+})
+assertFalse(S.TradeGrantMatches(freezeProfile, {
+    id = "ce:" .. freezeProfile._profileId .. ":trade-" .. vann .. "-8-8:1",
+    type = C.EVENT.DONATION,
+    source = "trade",
+    actor = sully,
+    crafter = vann,
+    itemId = aqirite,
+    quantity = 1,
+    generation = freezeProfile._consumables.generation,
+    epoch = freezeEpoch,
+    tradeToken = "trade-" .. vann .. "-8-8",
+}, vann, C.Now()), "a freeze after removal does not create a grant")
+assertTrue(S.TradeGrantMatches(freezeProfile, {
+    id = "ce:" .. freezeProfile._profileId .. ":" .. freezeToken .. ":1",
+    type = C.EVENT.DONATION,
+    source = "trade",
+    actor = donor,
+    crafter = vann,
+    itemId = aqirite,
+    quantity = 1,
+    generation = freezeProfile._consumables.generation,
+    epoch = freezeEpoch,
+    tradeToken = freezeToken,
+}, vann, C.Now()), "the grant registered at trade open still matches")
+assertTrue(Sync:PublishTradeFreeze(freezeProfile, opened) == false, "the coordinator does not publish a freeze after the Crafter is removed")
+Sync.state = savedFreezeState
+Sync.FindLocalProfileById = savedFreezeFind
+Sync.IsRequesterInGroup = savedFreezeGroup
+Sync._SamePlayer = savedFreezeSame
+Sync._EnforceGroupedSessionActive = savedFreezeEnforce
+SF.LootHelperComm = savedFreezeComm
+end
+checkTradeFreezeSync()
 
 local fractional = {
     id = "ce:qty:" .. sully .. ":fraction",
@@ -1266,6 +1392,158 @@ Sync.RequestProfileSnapshot = savedRequest
 Sync.FindLocalProfileById = savedFind
 Sync.IsRequesterInGroup = savedGroup
 Sync.state = savedSyncState
+
+local function checkSettingsRefresh()
+local refreshQueued = {}
+local refreshCount = 0
+C_Timer = {
+    After = function(_, fn)
+        refreshQueued[#refreshQueued + 1] = fn
+    end,
+}
+local capturedPage = nil
+SF.SettingsUI = {
+    RegisterPage = function(_, page)
+        capturedPage = page
+    end,
+    DefinitionRenderer = {
+        Refresh = function()
+            refreshCount = refreshCount + 1
+        end,
+    },
+}
+load("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua")
+capturedPage.panel = {
+    IsShown = function() return true end,
+}
+local refreshProfile = profile("settings-refresh", admin)
+C.AppendEvent(refreshProfile, {
+    type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1,
+})
+C.AppendEvent(refreshProfile, {
+    type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1,
+})
+assertEq(#refreshQueued, 1, "an open consumables page queues one refresh per frame")
+assertEq(refreshCount, 0, "the queued refresh waits for the timer")
+refreshQueued[1]()
+assertEq(refreshCount, 1, "the timer runs one consumables page refresh")
+capturedPage.panel = {
+    IsShown = function() return false end,
+}
+local queuedBefore = #refreshQueued
+C.AppendEvent(refreshProfile, {
+    type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1,
+})
+assertEq(#refreshQueued, queuedBefore, "a hidden consumables page does not queue a refresh")
+end
+checkSettingsRefresh()
+
+local function checkCoordinatorFollowups()
+    local genP = profile("epoch-gen", admin)
+    genP._consumables.generation = 2
+    assertTrue(select(1, C.AppendEvent(genP, {
+        id = "ce:epoch-gen:old", type = C.EVENT.DONATION, actor = admin, itemId = aqirite,
+        quantity = 1, generation = 2, timestamp = 1,
+    }, { silent = true })), "the higher generation has a live event")
+    S.NoteCoordinatorWatermark(genP, 2, 4, 1)
+    assertEq(select(2, S.ApplyRemoteConfig(genP, {
+        generation = 1, configSeq = 1, crafters = { sully }, assignments = {},
+    }, admin, { coordinatorAuthoritative = true, coordEpoch = 2 })), "applied", "a newer coordinator epoch can install a lower generation")
+    assertEq(genP._consumables.generation, 1, "the new coordinator generation replaces the higher one")
+    assertEq(genP._consumables.crafters[1], sully, "the new coordinator crafters replace the higher generation")
+    assertFalse(hasEvent(genP._consumableEvents, "ce:epoch-gen:old"), "the previous generation leaves the live ledger")
+    assertTrue(hasEvent(genP._consumableEventArchive, "ce:epoch-gen:old"), "the previous generation stays in the archive")
+    local savedState = SF.LootHelperSync and SF.LootHelperSync.state
+    SF.LootHelperSync.state = { active = true, coordEpoch = 2, sessionId = "helper-session", coordinator = admin }
+    local helperP = profile("helper-snap", admin)
+    C.ReplaceConfig(helperP, { generation = 1, configSeq = 2, crafters = { vann }, assignments = {} })
+    S.NoteCoordinatorWatermark(helperP, 1, 2, 2)
+    helperP._consumablesAdoptNextSnapshot = "helper-session"
+    assertTrue(C.MergeSnapshot(helperP, {
+        generation = 1, configSeq = 9, crafters = { donor }, assignments = {},
+        events = {
+            { id = "ce:helper:1", type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1, timestamp = 1 },
+        },
+    }, { consumablesFromCoordinator = false }), "a helper snapshot still imports")
+    assertEq(helperP._consumables.configSeq, 2, "a helper snapshot does not replace coordinator config")
+    assertEq(helperP._consumables.crafters[1], vann, "a helper snapshot keeps the coordinator crafters")
+    assertTrue(hasEvent(helperP._consumableEvents, "ce:helper:1"), "a helper snapshot still merges events")
+    assertEq(helperP._consumablesAdoptNextSnapshot, "helper-session", "a helper snapshot leaves coordinator adoption pending")
+    assertTrue(C.MergeSnapshot(helperP, {
+        generation = 1, configSeq = 3, crafters = { sully }, assignments = {},
+    }, { consumablesFromCoordinator = true }), "the coordinator snapshot imports")
+    assertEq(helperP._consumables.crafters[1], sully, "the coordinator snapshot replaces config")
+    assertEq(helperP._consumables.configSeq, 3, "the coordinator snapshot installs its sequence")
+    local both = {
+        id = "ce:both:" .. donor .. ":" .. vann .. ":1",
+        type = C.EVENT.DONATION,
+        source = "trade",
+        actor = donor,
+        crafter = vann,
+        writer = vann,
+        itemId = aqirite,
+        quantity = 1,
+        generation = peer._consumables.generation,
+        timestamp = C.Now(),
+    }
+    assertTrue(select(1, S.ApplyRemoteEvent(peer, both, admin, { coordinatorRelay = true })), "a relay uses the stamped writer when the id names two characters")
+    both.writer = nil
+    both.id = "ce:both:" .. donor .. ":" .. vann .. ":2"
+    assertFalse(select(1, S.ApplyRemoteEvent(peer, both, admin, { coordinatorRelay = true })), "a relay without a stamped writer is not guessed from name order")
+    local busyP = profile("busy-sync", admin)
+    local savedSync = Sync.state
+    local savedComm = SF.LootHelperComm
+    local savedSafe = Sync.IsSafeModeEnabled
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = admin,
+        sessionId = "busy-session",
+        profileId = busyP._profileId,
+    }
+    Sync.IsSafeModeEnabled = function() return false end
+    Sync.MSG.CONSUMABLES_EVENT = "CONSUMABLES_EVENT"
+    SF.LootHelperComm = { Send = function() return false end }
+    local busyOk, busyErr = Sync:CommitConsumablesOp(busyP, { name = "set_bank_tab", bankTab = 2 }, admin, { asAdmin = true })
+    assertFalse(busyOk, "a full bulk queue does not report a pending config edit")
+    assertTrue(type(busyErr) == "string" and busyErr:find("busy") ~= nil, "a dropped config edit tells the player to retry")
+    assertEq(busyP._consumables.bankTab, nil, "a dropped config edit does not change the profile")
+    assertTrue(select(1, C.AppendEvent(busyP, {
+        id = "ce:busy:1", type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1,
+    }, { silent = true })))
+    busyP._consumablesUnsent = { "ce:busy:1" }
+    Sync:_FlushUnsentConsumablesEvents(busyP)
+    assertEq(busyP._consumablesUnsent[1], "ce:busy:1", "a dropped event broadcast stays queued")
+    local savedSelf = Sync._SelfId
+    local savedEnforce = Sync._EnforceGroupedSessionActive
+    Sync.state.isCoordinator = true
+    Sync._SelfId = function() return vann end
+    Sync._EnforceGroupedSessionActive = function() return "RAID" end
+    local stamped = nil
+    SF.LootHelperComm = {
+        Send = function(_, _, _, payload)
+            stamped = payload
+            return true
+        end,
+    }
+    local authored = {
+        id = "ce:busy:" .. vann .. ":1",
+        type = C.EVENT.DONATION,
+        actor = vann,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+    }
+    assertTrue(Sync:BroadcastConsumablesEvent(busyP, authored), "the coordinator can broadcast an event it authored")
+    assertEq(stamped and stamped.event and stamped.event.writer, vann, "a coordinator broadcast stamps the author as the relay writer")
+    Sync._SelfId = savedSelf
+    Sync._EnforceGroupedSessionActive = savedEnforce
+    SF.LootHelperSync.state = savedState
+    Sync.state = savedSync
+    SF.LootHelperComm = savedComm
+    Sync.IsSafeModeEnabled = savedSafe
+end
+checkCoordinatorFollowups()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

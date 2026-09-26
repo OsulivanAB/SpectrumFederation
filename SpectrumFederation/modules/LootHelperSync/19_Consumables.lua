@@ -274,12 +274,18 @@ function Sync:_FlushUnsentConsumablesEvents(profile)
     local C = Consumables()
     local ids = C and C.EventIndex and C.EventIndex(profile)
     while sent < MAX_EVENT_FLUSH and #queue > 0 do
-        local eventId = table.remove(queue, 1)
-        sent = sent + 1
+        local eventId = queue[1]
         local stored = ids and ids[eventId]
-        if type(stored) == "table" then
-            self:BroadcastConsumablesEvent(profile, stored)
+        if type(stored) ~= "table" then
+            table.remove(queue, 1)
+        else
+            local delivered = self:BroadcastConsumablesEvent(profile, stored)
+            if delivered == false then
+                break
+            end
+            table.remove(queue, 1)
         end
+        sent = sent + 1
     end
     self._consumablesFlushing = false
 end
@@ -335,12 +341,15 @@ function Sync:CommitConsumablesOp(profile, op, actor, opts)
     if type(coordinator) ~= "string" or coordinator == "" then
         return false, "No session coordinator."
     end
-    SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OP, {
+    local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OP, {
         sessionId = self.state.sessionId,
         profileId = ProfileIdOf(profile),
         actor = actor,
         op = op,
     }, "WHISPER", coordinator, "BULK")
+    if sent == false then
+        return false, "Raid supplies sync is busy. Try again."
+    end
     return true, "pending"
 end
 
@@ -423,40 +432,53 @@ function Sync:HandleConsumablesConfig(sender, payload)
 end
 
 function Sync:BroadcastConsumablesEvent(profile, event)
-    if type(event) ~= "table" or type(event.id) ~= "string" then return end
+    if type(event) ~= "table" or type(event.id) ~= "string" then return false end
     if not (self.state and self.state.active and SF.LootHelperComm and self.MSG) then
         self:_QueueUnsentConsumablesEvent(profile, event.id)
-        return
+        return false
     end
-    if not SessionFor(profile) then return end
+    if not SessionFor(profile) then return false end
     if self.IsSafeModeEnabled and self:IsSafeModeEnabled() then
         self:_QueueUnsentConsumablesEvent(profile, event.id)
-        return
+        return false
     end
     local payload = {
         sessionId = self.state.sessionId,
         profileId = ProfileIdOf(profile),
         event = event,
     }
+    local sent
     if not (self.state and self.state.isCoordinator) then
         local coordinator = self.state and self.state.coordinator
         if type(coordinator) ~= "string" or coordinator == "" then
             self:_QueueUnsentConsumablesEvent(profile, event.id)
-            return
+            return false
         end
-        SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_EVENT, payload, "WHISPER", coordinator, "NORMAL")
-        return
+        sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_EVENT, payload, "WHISPER", coordinator, "NORMAL")
+    else
+        local C = Consumables()
+        local S = Rules()
+        if C and C.StampOrder then
+            C.StampOrder(profile, event)
+        end
+        if S and type(event.writer) ~= "string" then
+            local who = self._SelfId and self:_SelfId() or nil
+            if type(who) == "string" and S.RemoteEventIdOk(event.id, who) then
+                event.writer = who
+            end
+        end
+        local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("BroadcastConsumablesEvent")
+        if not dist then
+            self:_QueueUnsentConsumablesEvent(profile, event.id)
+            return false
+        end
+        sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_EVENT, payload, dist, nil, "NORMAL")
     end
-    local C = Consumables()
-    if C and C.StampOrder then
-        C.StampOrder(profile, event)
-    end
-    local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("BroadcastConsumablesEvent")
-    if not dist then
+    if sent == false then
         self:_QueueUnsentConsumablesEvent(profile, event.id)
-        return
+        return false
     end
-    SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_EVENT, payload, dist, nil, "NORMAL")
+    return true
 end
 
 function Sync:CommitConsumablesEvents(profile, token, events)
@@ -517,5 +539,88 @@ function Sync:HandleConsumablesEvent(sender, payload)
     end
     if not ok and status ~= "duplicate" then
         Debug("Verbose", "Ignored consumables event from %s (%s)", tostring(sender), tostring(status))
+    end
+end
+
+function Sync:BroadcastTradeFreeze(profile, grant)
+    if type(grant) ~= "table" or not (self.state and self.state.active and self.state.isCoordinator) then return end
+    if not SF.LootHelperComm or not self.MSG then return end
+    if not SessionFor(profile) then return end
+    local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("BroadcastTradeFreeze")
+    if not dist then return end
+    SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, {
+        sessionId = self.state.sessionId,
+        profileId = ProfileIdOf(profile),
+        token = grant.token,
+        donor = grant.donor,
+        receiver = grant.receiver,
+        generation = grant.generation,
+        items = grant.items,
+    }, dist, nil, "NORMAL")
+end
+
+function Sync:PublishTradeFreeze(profile, frozen)
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S or type(frozen) ~= "table" then return false end
+    local grant = S.TradeFreezePayload(frozen)
+    if not grant then return false end
+    local now = C.Now and C.Now() or 0
+    if not (self.state and self.state.active) then
+        return S.RegisterTradeGrant(profile, grant, now)
+    end
+    if not SessionFor(profile) then return false end
+    if self.state.isCoordinator then
+        if not S.RegisterTradeGrant(profile, grant, now) then return false end
+        self:BroadcastTradeFreeze(profile, grant)
+        return true
+    end
+    if not SF.LootHelperComm or not self.MSG then return false end
+    local coordinator = self.state.coordinator
+    if type(coordinator) ~= "string" or coordinator == "" then return false end
+    SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, {
+        sessionId = self.state.sessionId,
+        profileId = ProfileIdOf(profile),
+        token = grant.token,
+        donor = grant.donor,
+        receiver = grant.receiver,
+        generation = grant.generation,
+        items = grant.items,
+    }, "WHISPER", coordinator, "NORMAL")
+    return true
+end
+
+function Sync:HandleConsumablesTradeFreeze(sender, payload)
+    if not SessionPayloadOk(payload, sender) then return end
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S or type(payload.token) ~= "string" then return end
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
+    if not profile then return end
+    local coordinator = self.state and self.state.coordinator
+    local isCoordinator = self.state and self.state.isCoordinator == true
+    local fromCoordinator = false
+    if type(coordinator) == "string" and type(self._SamePlayer) == "function" then
+        fromCoordinator = self:_SamePlayer(sender, coordinator) and true or false
+    end
+    local now = C.Now and C.Now() or 0
+    if isCoordinator and not fromCoordinator then
+        if not (self._SamePlayer and self:_SamePlayer(sender, payload.receiver)) then
+            Debug("Warn", "Rejected trade freeze from %s for %s", tostring(sender), tostring(payload.receiver))
+            return
+        end
+        self._consumablesFreezeLimits = self._consumablesFreezeLimits or {}
+        if S.AllowRemoteOp and not S.AllowRemoteOp(self._consumablesFreezeLimits, sender, now) then
+            return
+        end
+        if not S.RegisterTradeGrant(profile, payload, now) then
+            Debug("Verbose", "Rejected trade freeze from %s", tostring(sender))
+            return
+        end
+        self:BroadcastTradeFreeze(profile, payload)
+        return
+    end
+    if fromCoordinator and not isCoordinator then
+        S.AcceptCoordinatorTradeGrant(profile, payload, now)
     end
 end

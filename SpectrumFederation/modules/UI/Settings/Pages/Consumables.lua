@@ -496,12 +496,29 @@ function Page:Refresh(panel)
 	end
 end
 
-if SF.Consumables and SF.Consumables.RegisterUIListener then
-	SF.Consumables.RegisterUIListener(function()
+local refreshQueued = false
+
+local function QueueRefresh()
+	local panel = Page.panel
+	if not panel or not Page.Refresh then return end
+	if panel.IsShown and not panel:IsShown() then return end
+	if refreshQueued then return end
+	refreshQueued = true
+	local function run()
+		refreshQueued = false
 		if Page.panel and Page.Refresh then
 			Page:Refresh(Page.panel)
 		end
-	end)
+	end
+	if C_Timer and C_Timer.After then
+		C_Timer.After(0, run)
+	else
+		run()
+	end
+end
+
+if SF.Consumables and SF.Consumables.RegisterUIListener then
+	SF.Consumables.RegisterUIListener(QueueRefresh)
 end
 
 SF.SettingsUI:RegisterPage(Page)

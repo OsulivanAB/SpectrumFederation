@@ -5186,7 +5186,7 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	self:_EnsureRewardPotConfig()
 
 	if SF.Consumables and SF.Consumables.MergeSnapshot and snapshot.consumables ~= nil then
-		SF.Consumables.MergeSnapshot(self, snapshot.consumables)
+		SF.Consumables.MergeSnapshot(self, snapshot.consumables, opts)
 	end
 
 	-- Merge Logs
