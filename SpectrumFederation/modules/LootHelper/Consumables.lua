@@ -271,18 +271,23 @@ local function EventQuotaKey(event)
     return key
 end
 
-local function ActorLiveCount(profile, actor, generation)
-    local events = profile._consumableEvents
-    local count = 0
-    if type(events) ~= "table" then return 0 end
-    for i = 1, #events do
-        local event = events[i]
-        local key = EventQuotaKey(event)
-        if key == actor and tonumber(event.generation) == generation then
-            count = count + 1
-        end
+local ANON_QUOTA = {}
+
+local function QuotaBucket(event)
+    return EventQuotaKey(event) or ANON_QUOTA
+end
+
+local function NoteQuota(counts, event)
+    if type(event) ~= "table" then return end
+    local gen = tonumber(event.generation)
+    if not gen then return end
+    local row = counts[gen]
+    if not row then
+        row = {}
+        counts[gen] = row
     end
-    return count
+    local key = QuotaBucket(event)
+    row[key] = (row[key] or 0) + 1
 end
 
 local function IsLiveRecord(profile, stored)
@@ -324,6 +329,7 @@ end
 
 local function RebuildIndex(profile)
     local index = {}
+    local actorCounts = {}
     local events = profile._consumableEvents or {}
     local maxSeq = 0
     local maxOrder = 0
@@ -332,6 +338,7 @@ local function RebuildIndex(profile)
         local event = events[i]
         if type(event) == "table" and type(event.id) == "string" then
             index[event.id] = event
+            NoteQuota(actorCounts, event)
             local seq = AdoptedEventSeq(event.id)
             if seq and seq > maxSeq then maxSeq = seq end
             local order = tonumber(event.order)
@@ -339,6 +346,7 @@ local function RebuildIndex(profile)
             fingerprint = MixFingerprint(fingerprint, event.id, event.order)
         end
     end
+    local archiveCounts = {}
     local archive = profile._consumableEventArchive
     if type(archive) == "table" then
         for i = 1, #archive do
@@ -347,11 +355,15 @@ local function RebuildIndex(profile)
                 index[archived.id] = archived
                 local seq = AdoptedEventSeq(archived.id)
                 if seq and seq > maxSeq then maxSeq = seq end
+                local key = QuotaBucket(archived)
+                archiveCounts[key] = (archiveCounts[key] or 0) + 1
             end
         end
     end
     local bound = EventIds(profile)
     bound.ids = index
+    bound.actorCounts = actorCounts
+    bound.archiveCounts = archiveCounts
     bound.count = #events
     profile._consumableEventIds = nil
     profile._consumableIndexCount = nil
@@ -430,6 +442,15 @@ local function TrimArchive(profile)
     end
     profile._consumableEventArchive = kept
     StoreArchiveStats(profile)
+    local counts = {}
+    for i = 1, #kept do
+        local archived = kept[i]
+        if type(archived) == "table" then
+            local key = QuotaBucket(archived)
+            counts[key] = (counts[key] or 0) + 1
+        end
+    end
+    EventIds(profile).archiveCounts = counts
     return true
 end
 
@@ -471,11 +492,59 @@ function C.RetainCurrentGeneration(profile)
     end)
 end
 
+local function MixConfigText(hash, text)
+    return Xor32(hash, IdHash(text))
+end
+
+local function ConfigFingerprint(cfg)
+    local guid = ""
+    if type(cfg.guild) == "table" and type(cfg.guild.guid) == "string" then
+        guid = cfg.guild.guid
+    end
+    local hash = MixConfigText(0, "g:" .. guid)
+    hash = MixConfigText(hash, "t:" .. tostring(tonumber(cfg.bankTab) or 0))
+    local crafters = SortedCopy(cfg.crafters)
+    local crafterCount = #crafters
+    if crafterCount > C.MAX_ASSIGNMENT_PAIRS then
+        crafterCount = C.MAX_ASSIGNMENT_PAIRS
+    end
+    hash = MixConfigText(hash, "c:" .. tostring(#crafters))
+    for i = 1, crafterCount do
+        hash = MixConfigText(hash, tostring(i) .. ":" .. crafters[i])
+    end
+    local keys = {}
+    for key, row in pairs(cfg.assignments or {}) do
+        if type(row) == "table" and type(row.crafters) == "table" and #row.crafters > 0 then
+            keys[#keys + 1] = key
+        end
+    end
+    table.sort(keys)
+    local keyCount = #keys
+    if keyCount > C.MAX_ASSIGNMENT_PAIRS then
+        keyCount = C.MAX_ASSIGNMENT_PAIRS
+    end
+    hash = MixConfigText(hash, "a:" .. tostring(#keys))
+    local mixed = 0
+    for i = 1, keyCount do
+        local row = cfg.assignments[keys[i]]
+        hash = MixConfigText(hash, tostring(row.itemId) .. ":" .. tostring(tonumber(row.epoch) or 0))
+        local names = SortedCopy(row.crafters)
+        for n = 1, #names do
+            if mixed >= C.MAX_ASSIGNMENT_PAIRS then break end
+            hash = MixConfigText(hash, tostring(row.itemId) .. ":" .. tostring(n) .. ":" .. names[n])
+            mixed = mixed + 1
+        end
+        if mixed >= C.MAX_ASSIGNMENT_PAIRS then break end
+    end
+    return hash
+end
+
 function C.Descriptor(profile)
     local cfg = C.Ensure(profile)
     return {
         generation = cfg.generation,
         configSeq = cfg.configSeq,
+        configFingerprint = ConfigFingerprint(cfg),
         eventCount = #(profile._consumableEvents or {}),
         eventFingerprint = tonumber(cfg.eventFingerprint) or 0,
         archiveCount = tonumber(cfg.archiveCount) or #(profile._consumableEventArchive or {}),
@@ -610,6 +679,28 @@ local function CopyHistory(history)
     return out
 end
 
+local function PruneRetiredAssignments(cfg)
+    local retired = {}
+    for key, row in pairs(cfg.assignments) do
+        local crafters = type(row) == "table" and row.crafters or nil
+        if type(crafters) ~= "table" or #crafters == 0 then
+            retired[#retired + 1] = {
+                key = key,
+                epoch = type(row) == "table" and tonumber(row.epoch) or 0,
+            }
+        end
+    end
+    if #retired <= C.MAX_ASSIGNMENT_HISTORY then return end
+    table.sort(retired, function(a, b)
+        if a.epoch ~= b.epoch then return a.epoch < b.epoch end
+        return tostring(a.key) < tostring(b.key)
+    end)
+    local extra = #retired - C.MAX_ASSIGNMENT_HISTORY
+    for i = 1, extra do
+        cfg.assignments[retired[i].key] = nil
+    end
+end
+
 local function CommitSet(cfg, itemId, nextCrafters)
     local key = ItemKey(itemId)
     local current = cfg.assignments[key]
@@ -632,6 +723,7 @@ local function CommitSet(cfg, itemId, nextCrafters)
         crafters = after,
         history = #history > 0 and history or nil,
     }
+    PruneRetiredAssignments(cfg)
     return true
 end
 
@@ -670,9 +762,17 @@ function C.RemoveCrafter(profile, actor, crafterName, opts)
     end
     local cfg = C.Ensure(profile)
     cfg.crafters = Without(cfg.crafters, crafterName)
+    local pending = {}
     for _, row in pairs(cfg.assignments) do
         if type(row) == "table" and Contains(row.crafters or {}, crafterName) then
-            CommitSet(cfg, tonumber(row.itemId), Without(row.crafters, crafterName))
+            pending[#pending + 1] = tonumber(row.itemId)
+        end
+    end
+    for i = 1, #pending do
+        local itemId = pending[i]
+        local row = cfg.assignments[ItemKey(itemId)]
+        if type(row) == "table" then
+            CommitSet(cfg, itemId, Without(row.crafters, crafterName))
         end
     end
     BumpConfig(profile)
@@ -838,6 +938,7 @@ local function CopyEvent(event)
         reason = BoundedReason(event.reason),
         order = tonumber(event.order),
         tradeToken = type(event.tradeToken) == "string" and #event.tradeToken <= 128 and event.tradeToken or nil,
+        withdrawToken = type(event.withdrawToken) == "string" and #event.withdrawToken <= 128 and event.withdrawToken or nil,
         writer = type(event.writer) == "string" and event.writer ~= "" and #event.writer <= C.MAX_EVENT_NAME and event.writer or nil,
     }
 end
@@ -857,7 +958,16 @@ function C.AppendArchivedEvent(profile, event)
     if bound.ids[event.id] then
         return true, "duplicate"
     end
+    local generation = tonumber(event.generation)
+    if not generation or generation ~= math.floor(generation) or generation < 1 then
+        return false, "invalid"
+    end
     local record = CopyEvent(event)
+    local quotaKey = QuotaBucket(record)
+    bound.archiveCounts = bound.archiveCounts or {}
+    if (bound.archiveCounts[quotaKey] or 0) >= C.MAX_EVENTS_PER_ACTOR then
+        return false, "quota"
+    end
     local archive = ArchiveList(profile)
     archive[#archive + 1] = record
     bound.ids[record.id] = record
@@ -865,6 +975,7 @@ function C.AppendArchivedEvent(profile, event)
         local cfg = profile._consumables
         cfg.archiveCount = #profile._consumableEventArchive
         cfg.archiveFingerprint = MixFingerprint(cfg.archiveFingerprint, record.id, record.order)
+        bound.archiveCounts[quotaKey] = (bound.archiveCounts[quotaKey] or 0) + 1
     end
     return true, "archived"
 end
@@ -953,6 +1064,9 @@ function C.AppendEvent(profile, event, opts)
     end
     local eventGen = tonumber(event.generation)
     local currentGen = tonumber(profile._consumables.generation) or 1
+    if eventGen and (eventGen ~= math.floor(eventGen) or eventGen < 1) then
+        return false, "invalid"
+    end
     if eventGen and eventGen > currentGen then
         return false, "future"
     end
@@ -966,7 +1080,9 @@ function C.AppendEvent(profile, event, opts)
         end
     end
     local actorKey = EventQuotaKey(event)
-    if ActorLiveCount(profile, actorKey, currentGen) >= C.MAX_EVENTS_PER_ACTOR then
+    local quotaKey = actorKey or ANON_QUOTA
+    local quotaRow = bound.actorCounts and bound.actorCounts[currentGen]
+    if (quotaRow and quotaRow[quotaKey] or 0) >= C.MAX_EVENTS_PER_ACTOR then
         return false, "quota"
     end
     event.timestamp = tonumber(event.timestamp) or Now()
@@ -980,6 +1096,14 @@ function C.AppendEvent(profile, event, opts)
     profile._consumableEvents[#profile._consumableEvents + 1] = record
     bound.ids[event.id] = record
     bound.count = #profile._consumableEvents
+    bound.actorCounts = bound.actorCounts or {}
+    local storedGen = tonumber(record.generation) or currentGen
+    local storedRow = bound.actorCounts[storedGen]
+    if not storedRow then
+        storedRow = {}
+        bound.actorCounts[storedGen] = storedRow
+    end
+    storedRow[quotaKey] = (storedRow[quotaKey] or 0) + 1
     local cfg = profile._consumables
     cfg.eventFingerprint = MixFingerprint(cfg.eventFingerprint, event.id, record.order)
     local order = tonumber(record.order)
@@ -1423,6 +1547,7 @@ function C.ReplaceConfig(profile, payload)
             end
         end
     end
+    PruneRetiredAssignments(cfg)
     Invalidate(profile)
     C.RetainCurrentGeneration(profile)
     Notify()
@@ -1545,16 +1670,24 @@ function C.ApplyOp(profile, op, actor, opts)
     return false, "Unknown configuration change."
 end
 
-function C.CommitEvents(profile, token, events)
+function C.CommitEvents(profile, token, events, opts)
     if type(token) ~= "string" or token == "" then
         return false, "Missing transaction id."
     end
+    opts = type(opts) == "table" and opts or {}
+    local writer = opts.writer
+    local Rules = SF.ConsumablesSync
     local wrote = false
     local failed = nil
     for i = 1, #(events or {}) do
         local event = events[i]
         if type(event) == "table" then
             event.id = string.format("ce:%s:%s:%d", tostring(profile._profileId or "profile"), token, i)
+            if type(writer) == "string" and writer ~= "" and type(event.writer) ~= "string" then
+                if Rules and Rules.RemoteEventIdOk and Rules.RemoteEventIdOk(event.id, writer) then
+                    event.writer = writer
+                end
+            end
             local ok, status = C.AppendEvent(profile, event, { silent = true })
             if not ok then
                 failed = status or "Could not record that raid supplies change."

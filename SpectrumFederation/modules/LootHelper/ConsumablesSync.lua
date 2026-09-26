@@ -165,6 +165,9 @@ function S.CoordinatorConfigDiffers(localDesc, remote)
     local remoteSeq = tonumber(remote.configSeq)
     if remoteGen and remoteGen ~= (localDesc.generation or 1) then return true end
     if remoteSeq and remoteSeq ~= (localDesc.configSeq or 0) then return true end
+    local remoteFp = tonumber(remote.configFingerprint)
+    local localFp = tonumber(localDesc.configFingerprint)
+    if remoteFp and localFp and remoteFp ~= localFp then return true end
     return false
 end
 
@@ -205,6 +208,9 @@ function S.ClearTradeGrants()
     end
     for i = 1, #stale do
         tradeGrants[stale[i]] = nil
+    end
+    if S.ClearWithdrawGrants then
+        S.ClearWithdrawGrants()
     end
     local sync = SF.LootHelperSync
     if sync and sync._ClearPendingTradeFreezes then
@@ -299,10 +305,6 @@ local function StoreTradeGrant(profile, grant, now, liveCheck)
     if not items then return false end
     local state = GrantState(profile)
     PurgeGrants(state, now)
-    local previous = state.byReceiver[receiver]
-    if previous and previous ~= grant.token then
-        DropGrant(state, previous)
-    end
     local existing = state.byToken[grant.token]
     if not existing and GrantCount(state) >= S.MAX_TRADE_GRANTS then
         return false
@@ -412,6 +414,118 @@ function S.NoteTradeGrantUse(profile, event)
     grant.used[slot] = event.id
 end
 
+local withdrawGrants = setmetatable({}, { __mode = "k" })
+
+function S.ClearWithdrawGrants()
+    local stale = {}
+    for profile in pairs(withdrawGrants) do
+        stale[#stale + 1] = profile
+    end
+    for i = 1, #stale do
+        withdrawGrants[stale[i]] = nil
+    end
+end
+
+local function WithdrawState(profile)
+    local state = withdrawGrants[profile]
+    if not state then
+        state = { byToken = {} }
+        withdrawGrants[profile] = state
+    end
+    return state
+end
+
+local function WithdrawCount(state)
+    local count = 0
+    for _ in pairs(state.byToken) do
+        count = count + 1
+    end
+    return count
+end
+
+local function PurgeWithdrawGrants(state, now)
+    local stale = {}
+    for token, grant in pairs(state.byToken) do
+        if type(grant) ~= "table" or now >= (tonumber(grant.expiresAt) or 0) then
+            stale[#stale + 1] = token
+        end
+    end
+    for i = 1, #stale do
+        state.byToken[stale[i]] = nil
+    end
+end
+
+local function StoreWithdrawGrant(profile, grant, now, liveCheck)
+    if type(profile) ~= "table" or type(grant) ~= "table" then return false end
+    now = tonumber(now) or 0
+    local receiver = grant.receiver
+    if not PlayerNameOk(receiver) or not TokenOk(grant.token, receiver) then return false end
+    local itemId = tonumber(grant.itemId)
+    local epoch = tonumber(grant.epoch)
+    local generation = tonumber(grant.generation)
+    if not itemId or itemId <= 0 or itemId ~= math.floor(itemId) then return false end
+    if not epoch or epoch < 1 or epoch ~= math.floor(epoch) then return false end
+    if not generation or generation < 1 or generation ~= math.floor(generation) then return false end
+    if liveCheck then
+        local cfg = C.Ensure(profile)
+        if generation ~= (tonumber(cfg.generation) or 1) then return false end
+        local assignment = cfg.assignments and cfg.assignments[tostring(itemId)]
+        if type(assignment) ~= "table" or tonumber(assignment.epoch) ~= epoch then return false end
+        if not C.CrafterHasItem(profile, receiver, itemId) then return false end
+    end
+    local state = WithdrawState(profile)
+    PurgeWithdrawGrants(state, now)
+    local existing = state.byToken[grant.token]
+    if not existing and WithdrawCount(state) >= S.MAX_TRADE_GRANTS then
+        return false
+    end
+    state.byToken[grant.token] = {
+        token = grant.token,
+        receiver = receiver,
+        itemId = itemId,
+        epoch = epoch,
+        generation = generation,
+        used = existing and existing.used or nil,
+        expiresAt = existing and existing.expiresAt or (now + S.TRADE_GRANT_TTL),
+    }
+    return true
+end
+
+function S.RegisterWithdrawGrant(profile, grant, now)
+    return StoreWithdrawGrant(profile, grant, now, true)
+end
+
+function S.AcceptCoordinatorWithdrawGrant(profile, grant, now)
+    return StoreWithdrawGrant(profile, grant, now, false)
+end
+
+function S.WithdrawGrantMatches(profile, event, writer, now)
+    if type(profile) ~= "table" or type(event) ~= "table" then return false end
+    if event.type ~= C.EVENT.RECEIPT or event.source ~= "guildbank" then return false end
+    now = tonumber(now) or 0
+    local state = withdrawGrants[profile]
+    if not state then return false end
+    PurgeWithdrawGrants(state, now)
+    local token = event.withdrawToken
+    local grant = type(token) == "string" and state.byToken[token] or nil
+    if not grant then return false end
+    if type(event.id) ~= "string" or not event.id:find(grant.token, 1, true) then return false end
+    if not Same(writer, grant.receiver) then return false end
+    if not Same(event.actor, grant.receiver) or not Same(event.crafter, grant.receiver) then return false end
+    if tonumber(event.generation) ~= grant.generation then return false end
+    if tonumber(event.itemId) ~= grant.itemId or tonumber(event.epoch) ~= grant.epoch then return false end
+    if grant.used and grant.used ~= event.id then return false end
+    return true
+end
+
+function S.NoteWithdrawGrantUse(profile, event)
+    if type(profile) ~= "table" or type(event) ~= "table" then return end
+    local state = withdrawGrants[profile]
+    local grant = state and type(event.withdrawToken) == "string" and state.byToken[event.withdrawToken] or nil
+    if not grant or not S.WithdrawGrantMatches(profile, event, grant.receiver, C.Now()) then return end
+    grant.used = event.id
+end
+
 local function CurrentAssignmentOk(profile, crafter, itemId, epoch)
     if not C.CrafterHasItem(profile, crafter, itemId) then return false end
     epoch = tonumber(epoch)
@@ -425,7 +539,9 @@ local function FrozenAssignmentOk(profile, crafter, itemId, epoch, event)
     if CurrentAssignmentOk(profile, crafter, itemId, epoch) then return true end
     epoch = tonumber(epoch)
     if not epoch or epoch <= 0 then return false end
-    return S.TradeGrantMatches(profile, event, crafter, C.Now())
+    local now = C.Now()
+    if S.TradeGrantMatches(profile, event, crafter, now) then return true end
+    return S.WithdrawGrantMatches(profile, event, crafter, now)
 end
 
 local function TradeWriter(profile, event, sender)
@@ -535,6 +651,7 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
     })
     if ok and status ~= "duplicate" then
         S.NoteTradeGrantUse(profile, event)
+        S.NoteWithdrawGrantUse(profile, event)
     end
     return ok, status
 end

@@ -190,6 +190,7 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     local desc = C.Descriptor(profile)
     payload.consumablesGeneration = desc.generation
     payload.consumablesConfigSeq = desc.configSeq
+    payload.consumablesConfigFingerprint = desc.configFingerprint
     payload.consumablesEventCount = desc.eventCount
     payload.consumablesEventFingerprint = desc.eventFingerprint
     payload.consumablesArchiveCount = desc.archiveCount
@@ -214,6 +215,7 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     local remote = {
         generation = payload.consumablesGeneration,
         configSeq = payload.consumablesConfigSeq,
+        configFingerprint = payload.consumablesConfigFingerprint,
         eventCount = payload.consumablesEventCount,
         eventFingerprint = payload.consumablesEventFingerprint,
         archiveCount = payload.consumablesArchiveCount,
@@ -390,6 +392,25 @@ function Sync:_QueueUnsequencedConsumablesEvents(profile)
     end
 end
 
+local function FreezeWirePayload(profile, grant)
+    local payload = {
+        sessionId = Sync.state and Sync.state.sessionId or nil,
+        profileId = ProfileIdOf(profile),
+        token = grant.token,
+        receiver = grant.receiver,
+        generation = grant.generation,
+    }
+    if grant.kind == "withdraw" then
+        payload.kind = "withdraw"
+        payload.itemId = grant.itemId
+        payload.epoch = grant.epoch
+    else
+        payload.donor = grant.donor
+        payload.items = grant.items
+    end
+    return payload
+end
+
 function Sync:_FlushPendingTradeFreeze(profile)
     local list = pendingFreezes[profile]
     if type(list) ~= "table" then return end
@@ -408,7 +429,13 @@ function Sync:_FlushPendingTradeFreeze(profile)
             local now = 0
             local C = Consumables()
             if C and C.Now then now = C.Now() end
-            if S and S.RegisterTradeGrant and not S.RegisterTradeGrant(profile, grant, now) then
+            local registered = false
+            if grant.kind == "withdraw" then
+                registered = S and S.RegisterWithdrawGrant and S.RegisterWithdrawGrant(profile, grant, now)
+            else
+                registered = S and S.RegisterTradeGrant and S.RegisterTradeGrant(profile, grant, now)
+            end
+            if not registered then
                 table.remove(list, 1)
             elseif self:BroadcastTradeFreeze(profile, grant) == false then
                 break
@@ -417,15 +444,7 @@ function Sync:_FlushPendingTradeFreeze(profile)
             if not SF.LootHelperComm or not self.MSG then return end
             local coordinator = self.state.coordinator
             if type(coordinator) ~= "string" or coordinator == "" then return end
-            local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, {
-                sessionId = self.state.sessionId,
-                profileId = ProfileIdOf(profile),
-                token = grant.token,
-                donor = grant.donor,
-                receiver = grant.receiver,
-                generation = grant.generation,
-                items = grant.items,
-            }, "WHISPER", coordinator, "NORMAL")
+            local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, FreezeWirePayload(profile, grant), "WHISPER", coordinator, "NORMAL")
             if sent == false then
                 return
             end
@@ -481,14 +500,19 @@ local function EventIdSet(profile)
     return seen
 end
 
-function Sync:_BroadcastNewConsumablesEvents(profile, seenBefore)
+function Sync:_BroadcastNewConsumablesEvents(profile, seenBefore, writer)
     if type(profile) ~= "table" then return end
     seenBefore = seenBefore or {}
+    local S = Rules()
     local function sendNew(list)
         if type(list) ~= "table" then return end
         for i = 1, #list do
             local event = list[i]
             if type(event) == "table" and type(event.id) == "string" and not seenBefore[event.id] then
+                if type(writer) == "string" and type(event.writer) ~= "string"
+                    and S and S.RemoteEventIdOk and S.RemoteEventIdOk(event.id, writer) then
+                    event.writer = writer
+                end
                 self:BroadcastConsumablesEvent(profile, event)
             end
         end
@@ -565,7 +589,7 @@ function Sync:HandleConsumablesOp(sender, payload)
         Debug("Warn", "Consumables op failed: %s", tostring(err))
         return
     end
-    self:_BroadcastNewConsumablesEvents(profile, seen)
+    self:_BroadcastNewConsumablesEvents(profile, seen, sender)
     self:BroadcastConsumablesConfig(profile)
 end
 
@@ -615,9 +639,15 @@ end
 
 function Sync:BroadcastConsumablesEvent(profile, event)
     if type(event) ~= "table" or type(event.id) ~= "string" then return false end
-    if type(event.tradeToken) == "string" and PendingFreezeFor(profile, event.tradeToken) then
+    local waitToken = nil
+    if type(event.tradeToken) == "string" then
+        waitToken = event.tradeToken
+    elseif type(event.withdrawToken) == "string" then
+        waitToken = event.withdrawToken
+    end
+    if waitToken and PendingFreezeFor(profile, waitToken) then
         self:_FlushPendingTradeFreeze(profile)
-        if PendingFreezeFor(profile, event.tradeToken) then
+        if PendingFreezeFor(profile, waitToken) then
             self:_QueueUnsentConsumablesEvent(profile, event.id)
             return false
         end
@@ -674,7 +704,8 @@ function Sync:CommitConsumablesEvents(profile, token, events)
     local C = Consumables()
     if not C then return false, "Raid Consumables is unavailable." end
     local seen = EventIdSet(profile)
-    local ok, err = C.CommitEvents(profile, token, events)
+    local writer = self._SelfId and self:_SelfId() or nil
+    local ok, err = C.CommitEvents(profile, token, events, { writer = writer })
     if not ok then return false, err end
     if SessionFor(profile) then
         self:_BroadcastNewConsumablesEvents(profile, seen)
@@ -750,15 +781,7 @@ function Sync:BroadcastTradeFreeze(profile, grant)
     if not dist then
         return RememberTradeFreeze(profile, grant, false)
     end
-    local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, {
-        sessionId = self.state.sessionId,
-        profileId = ProfileIdOf(profile),
-        token = grant.token,
-        donor = grant.donor,
-        receiver = grant.receiver,
-        generation = grant.generation,
-        items = grant.items,
-    }, dist, nil, "NORMAL")
+    local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, FreezeWirePayload(profile, grant), dist, nil, "NORMAL")
     return RememberTradeFreeze(profile, grant, sent)
 end
 
@@ -784,15 +807,32 @@ function Sync:PublishTradeFreeze(profile, frozen)
     if type(coordinator) ~= "string" or coordinator == "" then
         return RememberTradeFreeze(profile, grant, false)
     end
-    local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, {
-        sessionId = self.state.sessionId,
-        profileId = ProfileIdOf(profile),
-        token = grant.token,
-        donor = grant.donor,
-        receiver = grant.receiver,
-        generation = grant.generation,
-        items = grant.items,
-    }, "WHISPER", coordinator, "NORMAL")
+    local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, FreezeWirePayload(profile, grant), "WHISPER", coordinator, "NORMAL")
+    return RememberTradeFreeze(profile, grant, sent)
+end
+
+function Sync:PublishWithdrawGrant(profile, grant)
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S or type(grant) ~= "table" then return false end
+    grant.kind = "withdraw"
+    local now = C.Now and C.Now() or 0
+    if not (self.state and self.state.active) then
+        return S.RegisterWithdrawGrant(profile, grant, now)
+    end
+    if not SessionFor(profile) then return false end
+    if self.state.isCoordinator then
+        if not S.RegisterWithdrawGrant(profile, grant, now) then return false end
+        return self:BroadcastTradeFreeze(profile, grant)
+    end
+    if not SF.LootHelperComm or not self.MSG then
+        return RememberTradeFreeze(profile, grant, false)
+    end
+    local coordinator = self.state.coordinator
+    if type(coordinator) ~= "string" or coordinator == "" then
+        return RememberTradeFreeze(profile, grant, false)
+    end
+    local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, FreezeWirePayload(profile, grant), "WHISPER", coordinator, "NORMAL")
     return RememberTradeFreeze(profile, grant, sent)
 end
 
@@ -819,7 +859,13 @@ function Sync:HandleConsumablesTradeFreeze(sender, payload)
         if S.AllowRemoteOp and not S.AllowRemoteOp(self._consumablesFreezeLimits, sender, now) then
             return
         end
-        if not S.RegisterTradeGrant(profile, payload, now) then
+        local accepted
+        if payload.kind == "withdraw" then
+            accepted = S.RegisterWithdrawGrant and S.RegisterWithdrawGrant(profile, payload, now)
+        else
+            accepted = S.RegisterTradeGrant(profile, payload, now)
+        end
+        if not accepted then
             Debug("Verbose", "Rejected trade freeze from %s", tostring(sender))
             return
         end
@@ -827,6 +873,12 @@ function Sync:HandleConsumablesTradeFreeze(sender, payload)
         return
     end
     if fromCoordinator and not isCoordinator then
-        S.AcceptCoordinatorTradeGrant(profile, payload, now)
+        if payload.kind == "withdraw" then
+            if S.AcceptCoordinatorWithdrawGrant then
+                S.AcceptCoordinatorWithdrawGrant(profile, payload, now)
+            end
+        else
+            S.AcceptCoordinatorTradeGrant(profile, payload, now)
+        end
     end
 end

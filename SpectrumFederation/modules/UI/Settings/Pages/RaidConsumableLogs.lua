@@ -118,11 +118,7 @@ local function Definition()
 						buttonText = "Older",
 						width = 100,
 						enabled = function()
-							local C = SF.Consumables
-							local profile = ActiveProfile()
-							if not C or not profile or not C.HistoryRows then return false end
-							local _, total = C.HistoryRows(profile, ItemName, PageSize(), historyOffset)
-							return historyOffset + PageSize() < (tonumber(total) or 0)
+							return historyOffset + PageSize() < (Page.historyTotal or 0)
 						end,
 						onClick = function()
 							ShiftHistory(1)
@@ -157,6 +153,7 @@ function Page:Refresh(panel)
 	if panel and panel.IsShown and not panel:IsShown() then
 		return
 	end
+	LogItems()
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if renderer then
 		renderer:Refresh(panel)

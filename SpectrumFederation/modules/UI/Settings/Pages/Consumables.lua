@@ -450,6 +450,10 @@ local function Definition(panel)
 								return
 							end
 							local profile = ActiveProfile()
+							if not profile then
+								ctx.section:SetMessage("No active profile.", "error")
+								return
+							end
 							local sync = SF.LootHelperSync
 							local ok, err
 							local reason = panel.__sfCustodyReason or "Other"

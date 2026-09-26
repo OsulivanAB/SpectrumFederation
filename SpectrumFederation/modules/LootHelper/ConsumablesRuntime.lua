@@ -1378,6 +1378,16 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
     }
     self.withdrawIntent = queue[1]
     self:ArmWithdrawTimer()
+    local created = queue[#queue]
+    if created.assigned and SF.LootHelperSync and SF.LootHelperSync.PublishWithdrawGrant then
+        SF.LootHelperSync:PublishWithdrawGrant(profile, {
+            token = created.token,
+            receiver = selfId,
+            itemId = itemId,
+            epoch = tonumber(created.epoch) or 0,
+            generation = created.generation,
+        })
+    end
 end
 
 function Runtime:ArmWithdrawTimer()
@@ -1464,6 +1474,11 @@ function Runtime:FinishWithdraw(fromTimer)
                     timestamp = C.Now and C.Now() or nil,
                 }, intent.itemId, qty)
                 if #events > 0 then
+                    for eventIndex = 1, #events do
+                        if events[eventIndex].type == C.EVENT.RECEIPT then
+                            events[eventIndex].withdrawToken = intent.token
+                        end
+                    end
                     self:Commit(profile, intent.token, events)
                 end
                 committed = true

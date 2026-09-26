@@ -2269,13 +2269,15 @@ local function checkFollowupRound()
     }
     assertTrue(select(1, C.AppendEvent(plain, shared, { silent = true })), "the plain archive fixture stores the live event")
     assertTrue(select(1, C.AppendEvent(extra, shared, { silent = true })), "the extra archive fixture stores the same live event")
+    extra._consumables.generation = 2
+    plain._consumables.generation = 2
     assertTrue(select(1, C.AppendEvent(extra, {
         id = "ce:archfp:" .. admin .. ":old",
         type = C.EVENT.DONATION,
         actor = admin,
         itemId = aqirite,
         quantity = 4,
-        generation = 0,
+        generation = 1,
         source = "guildbank",
         timestamp = 1,
     }, { silent = true })), "an older event is archived beside the same live ledger")
@@ -2349,6 +2351,8 @@ local function checkFollowupRound()
         if not ok then quotaOk = false end
     end
     assertTrue(quotaOk, "a character can record the per-character budget")
+    C.InvalidateEventIndex(quotaP)
+    C.Ensure(quotaP)
     local blocked, quotaStatus = C.AppendEvent(quotaP, {
         id = "ce:quota:" .. admin .. ":over",
         type = C.EVENT.DONATION,
@@ -2504,6 +2508,112 @@ local function checkFollowupRound()
     end
     assertTrue(sawA and sawB, "both dropped trade freezes are retried")
 
+    local officer = "Officer-Realm"
+    local clearP = profile("remote-clear", admin, { admin, officer })
+    assertTrue(select(1, C.AppendEvent(clearP, {
+        id = "ce:remote-clear:" .. admin .. ":1",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })), "the remote clear fixture stores one donation")
+    local clearSends = {}
+    Sync.MSG.CONSUMABLES_EVENT = "CONSUMABLES_EVENT"
+    Sync.MSG.CONSUMABLES_CONFIG = "CONSUMABLES_CONFIG"
+    Sync._SamePlayer = function(_, a, b) return a == b end
+    Sync.IsRequesterInGroup = function() return true end
+    Sync.FindLocalProfileById = function() return clearP end
+    Sync._EnforceGroupedSessionActive = function() return "RAID" end
+    Sync._SelfId = function() return admin end
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "remote-clear",
+        profileId = clearP._profileId,
+    }
+    SF.LootHelperComm = {
+        Send = function(_, _, msg, body)
+            if msg == "CONSUMABLES_EVENT" then
+                clearSends[#clearSends + 1] = body and body.event
+            end
+            return true
+        end,
+    }
+    Sync:HandleConsumablesOp(officer, {
+        sessionId = "remote-clear",
+        profileId = clearP._profileId,
+        actor = officer,
+        op = { name = "clear" },
+    })
+    assertEq(#clearSends, 1, "a remote clear broadcasts the reset")
+    assertEq(clearSends[1] and clearSends[1].writer, officer, "the reset names the admin who requested the clear")
+    assertEq(clearSends[1] and clearSends[1].actor, officer, "the reset actor is that admin")
+    local followP = profile("remote-clear-follow", admin, { admin, officer })
+    followP._consumables.generation = 2
+    assertTrue(select(1, S.ApplyRemoteEvent(followP, clearSends[1], admin, { coordinatorRelay = true })), "a follower accepts the other admin's reset")
+    local sawOfficer = false
+    local followRows = C.HistoryRows(followP)
+    for i = 1, #followRows do
+        if followRows[i].text:find(officer, 1, true) then sawOfficer = true end
+    end
+    assertTrue(sawOfficer, "the follower log names the admin who cleared")
+
+    local archP = profile("archive-quota", admin)
+    archP._consumables.generation = 3
+    local archivedBudget = true
+    for i = 1, C.MAX_EVENTS_PER_ACTOR do
+        local ok = C.AppendEvent(archP, {
+            id = "ce:aq:" .. admin .. ":" .. tostring(i),
+            type = C.EVENT.DONATION,
+            actor = admin,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            source = "guildbank",
+            timestamp = i,
+        }, { silent = true })
+        if not ok then archivedBudget = false end
+    end
+    assertTrue(archivedBudget, "a writer can archive the per-writer budget")
+    local overArchive, overStatus = C.AppendEvent(archP, {
+        id = "ce:aq:" .. admin .. ":over",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })
+    assertFalse(overArchive, "another older event from that writer is rejected")
+    assertEq(overStatus, "quota", "the archive rejection names the per-writer budget")
+    assertTrue(select(1, C.AppendEvent(archP, {
+        id = "ce:aq:" .. donor .. ":1",
+        type = C.EVENT.DONATION,
+        actor = donor,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })), "another writer can still archive an older event")
+    local zeroOk, zeroStatus = C.AppendEvent(archP, {
+        id = "ce:aq:zero",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 0,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })
+    assertFalse(zeroOk, "generation 0 is not archived")
+    assertEq(zeroStatus, "invalid", "a generation below 1 is invalid")
+
     SF.GetActiveProfile = savedGet
     SF.lootHelperDB = savedDb
     SF.PrintInfo = savedInfo
@@ -2516,6 +2626,328 @@ local function checkFollowupRound()
     RT.qtyOverrides = {}
 end
 checkFollowupRound()
+
+local function checkCodexRound()
+    local stampP = profile("writer-stamp", admin)
+    assertTrue(select(1, C.AddCrafter(stampP, admin, vann, { asAdmin = true })), "writer stamp can add a crafter")
+    local token = "trade-" .. vann .. "-4-4"
+    local events = {
+        {
+            type = C.EVENT.DONATION,
+            actor = donor,
+            crafter = vann,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            source = "trade",
+        },
+        {
+            type = C.EVENT.RECEIPT,
+            actor = vann,
+            crafter = vann,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            epoch = 1,
+        },
+    }
+    assertTrue(C.CommitEvents(stampP, token, events, { writer = vann }), "a local commit can name its writer")
+    assertEq(events[1].writer, vann, "a donation is charged to the observing writer")
+    assertEq(events[2].writer, vann, "a receipt is charged to the same observing writer")
+    local unnamed = {
+        {
+            type = C.EVENT.DONATION,
+            actor = donor,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            source = "guildbank",
+        },
+    }
+    assertTrue(C.CommitEvents(stampP, "no-name-token", unnamed, { writer = vann }), "a commit without the writer in the id still stores")
+    assertEq(unnamed[1].writer, nil, "a writer is not stamped unless the event id names them")
+    local savedSelf = Sync._SelfId
+    local savedState = Sync.state
+    Sync._SelfId = function() return vann end
+    Sync.state = nil
+    local synced = {
+        {
+            type = C.EVENT.DONATION,
+            actor = donor,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            source = "guildbank",
+        },
+    }
+    assertTrue(Sync:CommitConsumablesEvents(stampP, "guild-" .. vann .. "-8-8", synced), "session commit stamps through sync")
+    assertEq(synced[1].writer, vann, "sync uses the local character as the writer")
+    Sync._SelfId = savedSelf
+    Sync.state = savedState
+
+    local quotaW = profile("writer-quota", admin)
+    local filled = true
+    for i = 1, C.MAX_EVENTS_PER_ACTOR do
+        local ok = C.AppendEvent(quotaW, {
+            id = "ce:wq:" .. admin .. ":" .. tostring(i),
+            type = C.EVENT.DONATION,
+            actor = donor,
+            writer = admin,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            source = "guildbank",
+            timestamp = i,
+        }, { silent = true })
+        if not ok then filled = false end
+    end
+    assertTrue(filled, "mixed actors still fill the observing writer's budget")
+    local blocked, blockedStatus = C.AppendEvent(quotaW, {
+        id = "ce:wq:" .. admin .. ":over",
+        type = C.EVENT.DONATION,
+        actor = "Other-Realm",
+        writer = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })
+    assertFalse(blocked, "the next event for that writer is rejected")
+    assertEq(blockedStatus, "quota", "the writer budget does not follow the donor")
+    assertTrue(select(1, C.AppendEvent(quotaW, {
+        id = "ce:wq:" .. donor .. ":free",
+        type = C.EVENT.DONATION,
+        actor = donor,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })), "an unstamped donor still has a separate budget")
+
+    local grantP = profile("grant-keep", admin)
+    assertTrue(select(1, C.AddCrafter(grantP, admin, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(grantP, admin, aqirite, vann, { asAdmin = true })))
+    local grantEpoch = grantP._consumables.assignments[tostring(aqirite)].epoch
+    local grantNow = 5000
+    local token1 = "trade-" .. vann .. "-1-1"
+    local token2 = "trade-" .. vann .. "-2-2"
+    local function tradeGrant(which, generation)
+        return {
+            token = which,
+            donor = donor,
+            receiver = vann,
+            generation = generation or 1,
+            items = { { itemId = aqirite, epoch = grantEpoch } },
+        }
+    end
+    local function tradeEvent(which, suffix)
+        return {
+            id = "ce:grant-keep:" .. which .. ":" .. suffix,
+            type = C.EVENT.DONATION,
+            source = "trade",
+            actor = donor,
+            crafter = vann,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            epoch = grantEpoch,
+            tradeToken = which,
+        }
+    end
+    assertTrue(S.RegisterTradeGrant(grantP, tradeGrant(token1), grantNow), "the first trade grant is stored")
+    assertTrue(S.RegisterTradeGrant(grantP, tradeGrant(token2), grantNow + 10), "a second trade grant does not replace the first")
+    assertTrue(S.TradeGrantMatches(grantP, tradeEvent(token1, "1"), vann, grantNow + 10), "the earlier trade grant is still authorized")
+    assertTrue(S.TradeGrantMatches(grantP, tradeEvent(token2, "1"), vann, grantNow + 10), "the later trade grant is authorized too")
+    S.NoteTradeGrantUse(grantP, tradeEvent(token1, "1"))
+    assertTrue(S.RegisterTradeGrant(grantP, tradeGrant(token1), grantNow + S.TRADE_GRANT_TTL - 1), "refreshing a grant keeps its original expiry")
+    assertFalse(S.TradeGrantMatches(grantP, tradeEvent(token1, "2"), vann, grantNow + 10), "a used trade slot cannot authorize a second event")
+    assertFalse(S.TradeGrantMatches(grantP, tradeEvent(token1, "1"), vann, grantNow + S.TRADE_GRANT_TTL + 1), "refreshing a grant does not extend its expiry")
+    assertTrue(S.TradeGrantMatches(grantP, tradeEvent(token2, "1"), vann, grantNow + S.TRADE_GRANT_TTL + 1), "the later grant keeps the expiry from when it was stored")
+
+    local left = profile("config-fp-left", admin)
+    local right = profile("config-fp-right", admin)
+    assertTrue(select(1, C.AddCrafter(right, admin, vann, { asAdmin = true })))
+    left._consumables.configSeq = 3
+    right._consumables.configSeq = 3
+    local leftDesc = C.Descriptor(left)
+    local rightDesc = C.Descriptor(right)
+    assertTrue(leftDesc.configFingerprint ~= rightDesc.configFingerprint, "different crafters change the config fingerprint")
+    assertFalse(S.CoordinatorConfigDiffers(leftDesc, {
+        generation = 1,
+        configSeq = 3,
+    }), "a peer that omits the config fingerprint is not a fork")
+    assertFalse(S.CoordinatorConfigDiffers(leftDesc, {
+        generation = 1,
+        configSeq = 3,
+        configFingerprint = leftDesc.configFingerprint,
+    }), "the same config fingerprint is not a fork")
+    assertTrue(S.CoordinatorConfigDiffers(leftDesc, {
+        generation = 1,
+        configSeq = 3,
+        configFingerprint = rightDesc.configFingerprint,
+    }), "the same sequence with a different config fingerprint needs the coordinator")
+    local savedFind = Sync.FindLocalProfileById
+    local savedRequest = Sync.RequestProfileSnapshot
+    savedState = Sync.state
+    local configCalls = {}
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "Coord-Realm",
+        sessionId = "config-fp",
+        profileId = left._profileId,
+        coordEpoch = 1,
+    }
+    Sync.FindLocalProfileById = function() return left end
+    Sync.RequestProfileSnapshot = function(_, reason, opts)
+        configCalls[#configCalls + 1] = {
+            reason = reason,
+            coordinatorOnly = opts and opts.coordinatorOnly or false,
+        }
+        return true
+    end
+    Sync._consumablesCatchUpKey = nil
+    left._consumablesConfigCatchUpSession = nil
+    Sync:_ConsiderConsumablesCatchUp({
+        coordinator = "Coord-Realm",
+        profileId = left._profileId,
+        sessionId = "config-fp",
+        consumablesGeneration = 1,
+        consumablesConfigSeq = 3,
+        consumablesEventCount = 0,
+        consumablesEventFingerprint = leftDesc.eventFingerprint,
+        consumablesConfigFingerprint = rightDesc.configFingerprint,
+    })
+    assertEq(configCalls[1] and configCalls[1].reason, "consumables-config", "a config fingerprint fork requests configuration")
+    assertEq(configCalls[1] and configCalls[1].coordinatorOnly, true, "that configuration request goes to the coordinator")
+    Sync.FindLocalProfileById = savedFind
+    Sync.RequestProfileSnapshot = savedRequest
+    Sync.state = savedState
+
+    local retired = profile("retired-cap", admin)
+    assertTrue(select(1, C.AddCrafter(retired, admin, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(retired, admin, aqirite, vann, { asAdmin = true })))
+    local keptEpoch = retired._consumables.assignments[tostring(aqirite)].epoch
+    assertTrue(select(1, C.RemoveAssignment(retired, admin, aqirite, vann, { asAdmin = true })))
+    assertTrue(retired._consumables.assignments[tostring(aqirite)] ~= nil, "the newest empty assignment row is kept")
+    assertTrue(C.CrafterAssignedAtEpoch(retired, vann, aqirite, keptEpoch), "kept rows still remember the prior epoch")
+    assertTrue(select(1, C.AddAssignment(retired, admin, aqirite, vann, { asAdmin = true })))
+    assertTrue(retired._consumables.assignments[tostring(aqirite)].epoch > keptEpoch, "restoring a kept row uses a newer epoch")
+    for i = 1, C.MAX_ASSIGNMENT_HISTORY + 3 do
+        local itemId = 210000 + i
+        assertTrue(select(1, C.AddAssignment(retired, admin, itemId, vann, { asAdmin = true })))
+        assertTrue(select(1, C.RemoveAssignment(retired, admin, itemId, vann, { asAdmin = true })))
+    end
+    local emptyRows = 0
+    for _, row in pairs(retired._consumables.assignments) do
+        if type(row) ~= "table" or type(row.crafters) ~= "table" or #row.crafters == 0 then
+            emptyRows = emptyRows + 1
+        end
+    end
+    assertEq(emptyRows, C.MAX_ASSIGNMENT_HISTORY, "empty assignment rows stay within the history cap")
+
+    local withdrawP = profile("withdraw-grant", admin)
+    assertTrue(select(1, C.SetGuild(withdrawP, admin, { guid = "club-grant", name = "Spectrum", realm = "Realm" }, 2, { asAdmin = true })))
+    assertTrue(select(1, C.AddCrafter(withdrawP, admin, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(withdrawP, admin, aqirite, vann, { asAdmin = true })))
+    local withdrawEpoch = withdrawP._consumables.assignments[tostring(aqirite)].epoch
+    local savedProfileFn = RT.Profile
+    local savedGuildFn = RT.CurrentGuild
+    local savedScan = RT.ScanBags
+    local savedTabs = RT.TabItemCounts
+    local savedCapture = RT.CaptureBaseline
+    local savedSelfFn = RT.SelfId
+    local savedCommit = RT.Commit
+    local savedBags = RT.bagCounts
+    local savedLink = GetGuildBankItemLink
+    local savedInfo = GetGuildBankItemInfo
+    local savedWithdrawFind = Sync.FindLocalProfileById
+    savedState = Sync.state
+    Sync.state = nil
+    Sync.FindLocalProfileById = function(_, id)
+        if id == withdrawP._profileId then return withdrawP end
+        return nil
+    end
+    GetGuildBankItemLink = function()
+        return "item:" .. tostring(aqirite)
+    end
+    GetGuildBankItemInfo = function()
+        return nil, 5
+    end
+    RT.Profile = function() return withdrawP end
+    RT.CurrentGuild = function() return { guid = "club-grant" } end
+    RT.ScanBags = function() end
+    RT.CaptureBaseline = function() end
+    RT.SelfId = function() return vann end
+    RT.TabItemCounts = function()
+        return { [aqirite] = 20 }
+    end
+    RT.bagCounts = { [aqirite] = 0 }
+    RT.withdrawIntent = nil
+    RT.withdrawIntents = nil
+    local captured = nil
+    RT.Commit = function(_, _, commitToken, commitEvents)
+        captured = { token = commitToken, events = commitEvents }
+        return true
+    end
+    RT:NoteGuildBankPickup(2, 1, false)
+    local withdrawToken = RT.withdrawIntents[1].token
+    assertTrue(select(1, C.RemoveAssignment(withdrawP, admin, aqirite, vann, { asAdmin = true })))
+    RT.bagCounts = { [aqirite] = 5 }
+    RT.TabItemCounts = function()
+        return { [aqirite] = 15 }
+    end
+    RT:FinishWithdraw(false)
+    assertEq(captured and captured.token, withdrawToken, "the withdrawal still commits on its original token")
+    assertEq(captured.events[1].withdrawToken, withdrawToken, "the receipt names the frozen withdrawal")
+    assertEq(captured.events[1].epoch, withdrawEpoch, "the receipt keeps the epoch from the pickup")
+    local receipt = {
+        id = "ce:" .. withdrawP._profileId .. ":" .. withdrawToken .. ":1",
+        type = C.EVENT.RECEIPT,
+        source = "guildbank",
+        actor = vann,
+        crafter = vann,
+        itemId = aqirite,
+        quantity = 5,
+        generation = withdrawP._consumables.generation,
+        epoch = withdrawEpoch,
+        withdrawToken = withdrawToken,
+    }
+    assertTrue(select(1, S.ApplyRemoteEvent(withdrawP, receipt, vann)), "a frozen withdrawal is accepted after the assignment changes")
+    local unfrozen = {
+        id = "ce:" .. withdrawP._profileId .. ":guild-" .. vann .. "-9-9:1",
+        type = C.EVENT.RECEIPT,
+        source = "guildbank",
+        actor = vann,
+        crafter = vann,
+        itemId = aqirite,
+        quantity = 1,
+        generation = withdrawP._consumables.generation,
+        epoch = withdrawEpoch,
+    }
+    assertFalse(select(1, S.ApplyRemoteEvent(withdrawP, unfrozen, vann)), "a withdrawal without that grant is rejected")
+    RT.Profile = savedProfileFn
+    RT.CurrentGuild = savedGuildFn
+    RT.ScanBags = savedScan
+    RT.TabItemCounts = savedTabs
+    RT.CaptureBaseline = savedCapture
+    RT.SelfId = savedSelfFn
+    RT.Commit = savedCommit
+    RT.bagCounts = savedBags
+    if RT.withdrawTimer and RT.withdrawTimer.Cancel then
+        RT.withdrawTimer:Cancel()
+    end
+    RT.withdrawTimer = nil
+    RT.withdrawIntent = nil
+    RT.withdrawIntents = nil
+    Sync.state = savedState
+    Sync.FindLocalProfileById = savedWithdrawFind
+    GetGuildBankItemLink = savedLink
+    GetGuildBankItemInfo = savedInfo
+end
+checkCodexRound()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
