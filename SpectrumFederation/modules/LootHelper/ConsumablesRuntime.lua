@@ -7,6 +7,8 @@ local Runtime = SF.ConsumablesRuntime
 
 local MAX_TRADE_SLOTS = 6
 local MAX_DEPOSIT_PLACES = 6
+local MAX_WITHDRAW_INTENTS = 8
+local MAX_GUILD_BANK_SLOTS = 98
 local REMINDER_TEXT = "Raid supplies available"
 
 local function Debug(level, fmt, ...)
@@ -310,6 +312,66 @@ function Runtime:TabItemCounts(tab)
     return counts
 end
 
+function Runtime:ItemStackLimit(itemId)
+    itemId = tonumber(itemId)
+    if not itemId then return nil end
+    if C_Item and type(C_Item.GetItemMaxStackSizeByID) == "function" then
+        local maxStack = tonumber(C_Item.GetItemMaxStackSizeByID(itemId))
+        if maxStack and maxStack > 1 then
+            return math.floor(maxStack)
+        end
+    end
+    if type(GetItemInfo) ~= "function" then return nil end
+    local first, _, _, _, _, _, _, stack = GetItemInfo(itemId)
+    if type(first) == "table" then
+        stack = first.stackCount
+    end
+    stack = tonumber(stack)
+    if stack and stack > 1 then
+        return math.floor(stack)
+    end
+    return nil
+end
+
+function Runtime:DepositTargets(tab, itemId, limit)
+    local targets = {}
+    tab = tonumber(tab)
+    itemId = tonumber(itemId)
+    limit = tonumber(limit) or MAX_DEPOSIT_PLACES
+    if limit < 1 then limit = 1 end
+    if limit > MAX_DEPOSIT_PLACES then limit = MAX_DEPOSIT_PLACES end
+    if not tab or not itemId or not GetGuildBankNumSlots or not GetGuildBankItemLink then
+        return targets
+    end
+    local C = SF.Consumables
+    local maxStack = self:ItemStackLimit(itemId)
+    local slotCount = GetGuildBankNumSlots(tab) or 0
+    if slotCount > MAX_GUILD_BANK_SLOTS then slotCount = MAX_GUILD_BANK_SLOTS end
+    if slotCount < 0 then slotCount = 0 end
+    if maxStack then
+        for slot = 1, slotCount do
+            if #targets >= limit then break end
+            local link = GetGuildBankItemLink(tab, slot)
+            local slotItem = link and C and C.ItemIdFromText and C.ItemIdFromText(link) or nil
+            if slotItem == itemId and GetGuildBankItemInfo then
+                local _, count = GetGuildBankItemInfo(tab, slot)
+                count = tonumber(count) or 0
+                local room = maxStack - count
+                if room > 0 then
+                    targets[#targets + 1] = { slot = slot, room = room }
+                end
+            end
+        end
+    end
+    for slot = 1, slotCount do
+        if #targets >= limit then break end
+        if not GetGuildBankItemLink(tab, slot) then
+            targets[#targets + 1] = { slot = slot, room = maxStack }
+        end
+    end
+    return targets
+end
+
 function Runtime:FreeSlots(tab)
     if not tab or not GetGuildBankNumSlots or not GetGuildBankItemLink then return 0 end
     local slots = GetGuildBankNumSlots(tab) or 0
@@ -347,6 +409,23 @@ function Runtime:BankAccess(profile)
         canDeposit = deposit and true or false
         freeSlots = self:FreeSlots(cfg.bankTab)
     end
+    local mergeRoom = false
+    if bankOpen and cfg.bankTab and freeSlots <= 0 and type(self.bagCounts) == "table" then
+        local ids = C.RequestedItemIds(profile)
+        local limit = #ids
+        if limit > 64 then limit = 64 end
+        for i = 1, limit do
+            local itemId = ids[i]
+            if (tonumber(self.bagCounts[itemId]) or 0) > 0 then
+                local targets = self:DepositTargets(cfg.bankTab, itemId, 1)
+                local room = targets[1] and tonumber(targets[1].room) or 0
+                if room > 0 then
+                    mergeRoom = true
+                    break
+                end
+            end
+        end
+    end
     local spell = self:MobileSpell()
     return Routing.GuildBankAccess({
         configured = cfg.guild ~= nil and cfg.bankTab ~= nil,
@@ -354,6 +433,7 @@ function Runtime:BankAccess(profile)
         bankOpen = bankOpen,
         canDeposit = canDeposit,
         freeSlots = freeSlots,
+        mergeRoom = mergeRoom,
         mobileKnown = spell ~= nil,
         mobileCooldown = spell ~= nil and self:MobileOnCooldown(spell) or false,
     })
@@ -1021,29 +1101,24 @@ function Runtime:BeginDeposit(line, collected)
     local remaining = line.quantity
     local placed = 0
     local stacks = (self.bagStacks and self.bagStacks[line.itemId]) or {}
-    local empties = {}
-    if GetGuildBankNumSlots and GetGuildBankItemLink then
-        local slotCount = GetGuildBankNumSlots(tab) or 0
-        for slot = 1, slotCount do
-            if #empties >= MAX_DEPOSIT_PLACES then break end
-            if not GetGuildBankItemLink(tab, slot) then
-                empties[#empties + 1] = slot
-            end
-        end
-    end
+    local targets = self:DepositTargets(tab, line.itemId, MAX_DEPOSIT_PLACES)
     self.placingDeposit = true
     for i = 1, #stacks do
         if remaining <= 0 or placed >= MAX_DEPOSIT_PLACES then break end
         local stack = stacks[i]
         local take = math.min(remaining, stack.count)
-        local empty = empties[placed + 1]
-        if not empty or take <= 0 then break end
+        local target = targets[placed + 1]
+        if not target or take <= 0 then break end
+        if type(target.room) == "number" and take > target.room then
+            take = target.room
+        end
+        if take <= 0 then break end
         if take < stack.count and container.SplitContainerItem then
             container.SplitContainerItem(stack.bag, stack.slot, take)
         elseif container.PickupContainerItem then
             container.PickupContainerItem(stack.bag, stack.slot)
         end
-        PickupGuildBankItem(tab, empty)
+        PickupGuildBankItem(tab, target.slot)
         remaining = remaining - take
         placed = placed + 1
     end
@@ -1238,7 +1313,26 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
     local selfId = self:SelfId()
     local assignment = cfg.assignments[tostring(itemId)]
     local now = GetTime and GetTime() or 0
-    self.withdrawIntent = {
+    if type(self.withdrawIntents) ~= "table" then
+        self.withdrawIntents = {}
+        if type(self.withdrawIntent) == "table" then
+            self.withdrawIntents[1] = self.withdrawIntent
+        end
+    end
+    local queue = self.withdrawIntents
+    for i = 1, #queue do
+        local existing = queue[i]
+        if existing.itemId == itemId and existing.tab == tab then
+            existing.intended = (tonumber(existing.intended) or 0) + count
+            self.withdrawIntent = queue[1]
+            self:ArmWithdrawTimer()
+            return
+        end
+    end
+    if #queue >= MAX_WITHDRAW_INTENTS then
+        return
+    end
+    queue[#queue + 1] = {
         tab = tab,
         guildGuid = cfg.guild.guid,
         itemId = itemId,
@@ -1253,6 +1347,7 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
         token = self:NextToken("withdraw"),
         startedAt = now,
     }
+    self.withdrawIntent = queue[1]
     self:ArmWithdrawTimer()
 end
 
@@ -1276,74 +1371,86 @@ function Runtime:WithdrawStillOnCursor(intent)
 end
 
 function Runtime:FinishWithdraw(fromTimer)
-    local intent = self.withdrawIntent
-    if not intent or self.depositIntent then return end
-    local profile = self:ProfileById(intent.profileId)
+    local queue = self.withdrawIntents
+    if type(queue) ~= "table" then
+        queue = {}
+        if type(self.withdrawIntent) == "table" then
+            queue[1] = self.withdrawIntent
+        end
+        self.withdrawIntents = queue
+    end
+    if #queue == 0 or self.depositIntent then return end
     local C = SF.Consumables
     local Workflow = SF.ConsumablesWorkflow
-    if not profile or not C or not Workflow then
-        self.withdrawIntent = nil
+    local function clearTimer()
         if self.withdrawTimer and self.withdrawTimer.Cancel then
             self.withdrawTimer:Cancel()
             self.withdrawTimer = nil
         end
+    end
+    if not C or not Workflow then
+        self.withdrawIntents = {}
+        self.withdrawIntent = nil
+        clearTimer()
         return
     end
     self:ScanBags()
     local guild = self:CurrentGuild()
-    if not intent.guildGuid or not guild or guild.guid ~= intent.guildGuid then
-        self.withdrawIntent = nil
-        if self.withdrawTimer and self.withdrawTimer.Cancel then
-            self.withdrawTimer:Cancel()
-            self.withdrawTimer = nil
-        end
-        return
-    end
-    local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
-    local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
-    local qty = Workflow.InterpretWithdraw({
-        localPickup = true,
-        guildOk = true,
-        configuredTab = intent.tab,
-        observedTab = intent.tab,
-        intendedQty = intent.intended,
-        beforeTab = intent.beforeTab,
-        afterTab = afterTab,
-        beforeBags = intent.beforeBags,
-        afterBags = afterBags,
-    })
-    if qty <= 0 then
-        if fromTimer and self:WithdrawStillOnCursor(intent) then
-            self:ArmWithdrawTimer()
-            return
-        end
-        if fromTimer then
-            self.withdrawIntent = nil
-            if self.withdrawTimer and self.withdrawTimer.Cancel then
-                self.withdrawTimer:Cancel()
-                self.withdrawTimer = nil
+    local kept = {}
+    local rearm = false
+    local committed = false
+    for i = 1, #queue do
+        local intent = queue[i]
+        local profile = self:ProfileById(intent.profileId)
+        local guildOk = intent.guildGuid and guild and guild.guid == intent.guildGuid
+        if profile and guildOk then
+            local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
+            local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
+            local qty = Workflow.InterpretWithdraw({
+                localPickup = true,
+                guildOk = true,
+                configuredTab = intent.tab,
+                observedTab = intent.tab,
+                intendedQty = intent.intended,
+                beforeTab = intent.beforeTab,
+                afterTab = afterTab,
+                beforeBags = intent.beforeBags,
+                afterBags = afterBags,
+            })
+            if qty <= 0 then
+                if fromTimer and self:WithdrawStillOnCursor(intent) then
+                    kept[#kept + 1] = intent
+                    rearm = true
+                elseif not fromTimer then
+                    kept[#kept + 1] = intent
+                end
+            else
+                local events = Workflow.WithdrawEvents({
+                    requested = true,
+                    withdrawerIsAssignedCrafter = intent.assigned == true,
+                    withdrawerIsAdmin = intent.admin == true,
+                    withdrawer = self:SelfId(),
+                    generation = intent.generation,
+                    epoch = intent.epoch or 0,
+                    timestamp = C.Now and C.Now() or nil,
+                }, intent.itemId, qty)
+                if #events > 0 then
+                    self:Commit(profile, intent.token, events)
+                end
+                committed = true
             end
         end
-        return
     end
-    self.withdrawIntent = nil
-    if self.withdrawTimer and self.withdrawTimer.Cancel then
-        self.withdrawTimer:Cancel()
-        self.withdrawTimer = nil
+    self.withdrawIntents = kept
+    self.withdrawIntent = kept[1]
+    if #kept == 0 then
+        clearTimer()
+    elseif rearm then
+        self:ArmWithdrawTimer()
     end
-    local events = Workflow.WithdrawEvents({
-        requested = true,
-        withdrawerIsAssignedCrafter = intent.assigned == true,
-        withdrawerIsAdmin = intent.admin == true,
-        withdrawer = self:SelfId(),
-        generation = intent.generation,
-        epoch = intent.epoch or 0,
-        timestamp = C.Now and C.Now() or nil,
-    }, intent.itemId, qty)
-    if #events > 0 then
-        self:Commit(profile, intent.token, events)
+    if committed then
+        self:CaptureBaseline(true)
     end
-    self:CaptureBaseline(true)
 end
 
 function Runtime:OnBankOpened()
@@ -1365,12 +1472,8 @@ function Runtime:OnBankClosed()
     self.bankBaseline = nil
     self.bankBaselineBags = nil
     self.autoReviewedThisOpen = false
-    if self.withdrawIntent then
-        if self:WithdrawStillOnCursor(self.withdrawIntent) then
-            self:ArmWithdrawTimer()
-        else
-            self:FinishWithdraw(true)
-        end
+    if (type(self.withdrawIntents) == "table" and self.withdrawIntents[1]) or self.withdrawIntent then
+        self:FinishWithdraw(true)
     end
     self:RefreshReminder()
 end
@@ -1393,7 +1496,20 @@ function Runtime:MaybeAutoReview()
     self:ShowReview()
 end
 
-function Runtime:OnProfileChanged()
+function Runtime:OnProfileChanged(profile)
+    local id = nil
+    if type(profile) == "table" then
+        if profile.GetProfileId then
+            id = profile:GetProfileId()
+        else
+            id = profile._profileId
+        end
+    end
+    if id ~= nil and id == self._seenProfileId then
+        self:RefreshReminder()
+        return
+    end
+    self._seenProfileId = id
     if not self.openTrade and self.review then
         self.review:Hide()
     end

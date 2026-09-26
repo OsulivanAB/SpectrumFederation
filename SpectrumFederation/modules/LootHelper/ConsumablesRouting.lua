@@ -74,7 +74,7 @@ function R.GuildBankAccess(opts)
         if not opts.canDeposit then
             return { visible = true, enabled = false, action = "deposit", reason = "no_permission" }
         end
-        if (tonumber(opts.freeSlots) or 0) <= 0 then
+        if (tonumber(opts.freeSlots) or 0) <= 0 and not opts.mergeRoom then
             return { visible = true, enabled = false, action = "deposit", reason = "tab_full" }
         end
         return { visible = true, enabled = true, action = "deposit" }

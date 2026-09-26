@@ -172,10 +172,13 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     }, ":")
     if S.CoordinatorConfigDiffers and S.CoordinatorConfigDiffers(localDesc, remote)
         and profile._consumablesConfigCatchUpSession ~= authority then
-        profile._consumablesConfigCatchUpSession = authority
-        profile._consumablesAdoptNextSnapshot = self.state.sessionId
+        local requested = false
         if self.RequestProfileSnapshot then
-            self:RequestProfileSnapshot("consumables-config")
+            requested = self:RequestProfileSnapshot("consumables-config", { coordinatorOnly = true }) and true or false
+        end
+        if requested then
+            profile._consumablesConfigCatchUpSession = authority
+            profile._consumablesAdoptNextSnapshot = self.state.sessionId
         end
     end
     if not S.NeedsCatchUp(localDesc, remote) then
@@ -351,27 +354,35 @@ end
 
 local function EventIdSet(profile)
     local seen = {}
-    local events = profile and profile._consumableEvents
-    if type(events) ~= "table" then return seen end
-    for i = 1, #events do
-        local id = events[i] and events[i].id
-        if type(id) == "string" then
-            seen[id] = true
+    local function mark(list)
+        if type(list) ~= "table" then return end
+        for i = 1, #list do
+            local id = list[i] and list[i].id
+            if type(id) == "string" then
+                seen[id] = true
+            end
         end
     end
+    if type(profile) ~= "table" then return seen end
+    mark(profile._consumableEventArchive)
+    mark(profile._consumableEvents)
     return seen
 end
 
 function Sync:_BroadcastNewConsumablesEvents(profile, seenBefore)
-    local events = profile and profile._consumableEvents
-    if type(events) ~= "table" then return end
+    if type(profile) ~= "table" then return end
     seenBefore = seenBefore or {}
-    for i = 1, #events do
-        local event = events[i]
-        if type(event) == "table" and type(event.id) == "string" and not seenBefore[event.id] then
-            self:BroadcastConsumablesEvent(profile, event)
+    local function sendNew(list)
+        if type(list) ~= "table" then return end
+        for i = 1, #list do
+            local event = list[i]
+            if type(event) == "table" and type(event.id) == "string" and not seenBefore[event.id] then
+                self:BroadcastConsumablesEvent(profile, event)
+            end
         end
     end
+    sendNew(profile._consumableEventArchive)
+    sendNew(profile._consumableEvents)
 end
 
 function Sync:CommitConsumablesOp(profile, op, actor, opts)
@@ -492,6 +503,13 @@ end
 
 function Sync:BroadcastConsumablesEvent(profile, event)
     if type(event) ~= "table" or type(event.id) ~= "string" then return false end
+    if type(event.tradeToken) == "string" and pendingFreezes[profile] then
+        self:_FlushPendingTradeFreeze(profile)
+        if pendingFreezes[profile] then
+            self:_QueueUnsentConsumablesEvent(profile, event.id)
+            return false
+        end
+    end
     if not (self.state and self.state.active and SF.LootHelperComm and self.MSG) then
         self:_QueueUnsentConsumablesEvent(profile, event.id)
         return false
@@ -594,6 +612,14 @@ function Sync:HandleConsumablesEvent(sender, payload)
     if isCoordinator and ok and not hadOrder and C.StampOrder then
         C.StampOrder(profile, event)
         self:BroadcastConsumablesEvent(profile, event)
+        return
+    end
+    if isCoordinator and ok and hadOrder and status == "duplicate" and not fromCoordinator
+        and S.RemoteEventIdOk and S.RemoteEventIdOk(event.id, sender) then
+        local stamped = type(stored) == "table" and stored or nil
+        if type(stamped) == "table" and tonumber(stamped.order) ~= nil then
+            self:BroadcastConsumablesEvent(profile, stamped)
+        end
         return
     end
     if not ok and status ~= "duplicate" then

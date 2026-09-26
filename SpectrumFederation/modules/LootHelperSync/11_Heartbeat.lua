@@ -335,11 +335,13 @@ end
 
 -- Function Request profile snapshot from helpers (preferred) or coordinator (fallback).
 -- @param reason string Reason for request (for logging)
+-- @param opts table|nil coordinatorOnly asks the session coordinator and no helper
 -- @return boolean True if request was registered, false otherwise
-function Sync:RequestProfileSnapshot(reason)
+function Sync:RequestProfileSnapshot(reason, opts)
     if not self.state.active then return false end
     if not self.state.sessionId then return false end
     if type(self.state.profileId) ~= "string" or self.state.profileId == "" then return false end
+    opts = type(opts) == "table" and opts or {}
 
     -- Lightweight dedupe: don't spam profile requests for same session
     if self.state._profileReqInFlight == self.state.sessionId then
@@ -347,9 +349,20 @@ function Sync:RequestProfileSnapshot(reason)
     end
 
     -- Build ordered target list: helpers first, coordinator fallback.
+    -- Consumables configuration asks the coordinator only, because a helper snapshot merges events and does not replace config.
     -- Once the profile is local, drop targets who are no longer canonical admins.
-    local targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
-        or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    local targets
+    if opts.coordinatorOnly then
+        local coordinator = self.state.coordinator
+        if type(coordinator) ~= "string" or coordinator == "" then
+            self:_NoteMissingRoute("_noProfileTargetWarnedFor", "Cannot request profile: no targets available", reason)
+            return false
+        end
+        targets = { coordinator }
+    else
+        targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())
+            or self:GetRequestTargets(self.state.helpers, self.state.coordinator)
+    end
     if not targets or #targets == 0 then
         self:_NoteMissingRoute("_noProfileTargetWarnedFor", "Cannot request profile: no targets available", reason)
         local profileMissing = not (self.FindLocalProfileById and self:FindLocalProfileById(self.state.profileId))

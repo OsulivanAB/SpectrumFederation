@@ -1729,6 +1729,510 @@ local function checkReviewRound()
 end
 checkReviewRound()
 
+local function checkConvergenceRound()
+    local plainP = profile("fp-plain", admin)
+    local stampedP = profile("fp-stamped", admin)
+    local fpId = "ce:fp:" .. admin .. ":1"
+    assertTrue(select(1, C.AppendEvent(plainP, {
+        id = fpId,
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })), "an unstamped event is stored")
+    local plainFp = C.Descriptor(plainP).eventFingerprint
+    assertTrue(select(1, C.AppendEvent(stampedP, {
+        id = fpId,
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+        order = 1,
+    }, { silent = true })), "the same event can be stored with an order")
+    local stampedFp = C.Descriptor(stampedP).eventFingerprint
+    assertTrue(plainFp ~= stampedFp, "a stamped ledger fingerprints differently from the same ids without orders")
+    local plainStored = plainP._consumableEvents[1]
+    assertEq(C.StampOrder(plainP, plainStored), 1, "stamping the unstamped copy assigns the first order")
+    assertEq(C.Descriptor(plainP).eventFingerprint, stampedFp, "stamping retargets the fingerprint to the ordered token")
+    C.InvalidateEventIndex(plainP)
+    C.Ensure(plainP)
+    assertEq(C.Descriptor(plainP).eventFingerprint, stampedFp, "rebuilding the index keeps the ordered fingerprint")
+
+    local capP = profile("id-cap", admin)
+    local hugeId = string.rep("a", C.MAX_EVENT_ID + 1)
+    assertFalse(select(1, C.AppendEvent(capP, {
+        id = hugeId,
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        timestamp = 1,
+    }, { silent = true })), "an overlong event id is rejected")
+    assertEq(#capP._consumableEvents, 0, "a rejected id is not stored")
+    assertEq(C.EventIndex(capP)[hugeId], nil, "a rejected id is not indexed")
+    assertTrue(select(1, C.AppendEvent(capP, {
+        id = "ce:source:huge",
+        type = C.EVENT.DONATION,
+        actor = string.rep("N", C.MAX_EVENT_NAME + 8),
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = string.rep("s", 5000),
+        action = "hack",
+        reason = string.rep("r", C.MAX_EVENT_REASON + 40),
+        timestamp = 2,
+    }, { silent = true })), "optional overlong fields do not reject the event")
+    local capped = C.EventIndex(capP)["ce:source:huge"]
+    assertEq(capped.source, nil, "an unknown source is not stored")
+    assertEq(capped.action, nil, "an unknown action is not stored")
+    assertEq(capped.actor, nil, "an overlong name is not stored")
+    assertEq(#capped.reason, C.MAX_EVENT_REASON, "a reason is capped before it is stored")
+    assertTrue(select(1, C.AppendEvent(capP, {
+        id = "ce:source:trade",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "trade",
+        timestamp = 3,
+    }, { silent = true })))
+    assertEq(C.EventIndex(capP)["ce:source:trade"].source, "trade", "a trade source is stored")
+
+    local savedRefresh = RT.RefreshReminder
+    local hidden = 0
+    RT.RefreshReminder = function() end
+    RT.review = { Hide = function() hidden = hidden + 1 end }
+    RT.openTrade = nil
+    RT.qtyOverrides = { [aqirite] = 2 }
+    RT._seenProfileId = nil
+    RT:OnProfileChanged({ _profileId = "profile-a" })
+    assertEq(hidden, 1, "the first profile selection closes an open review")
+    assertEq(RT.qtyOverrides[aqirite], nil, "the first profile selection clears edited quantities")
+    RT.qtyOverrides = { [aqirite] = 4 }
+    RT:OnProfileChanged({ _profileId = "profile-a" })
+    assertEq(hidden, 1, "selecting the same profile leaves the review open")
+    assertEq(RT.qtyOverrides[aqirite], 4, "selecting the same profile keeps edited quantities")
+    RT:OnProfileChanged({ _profileId = "profile-b" })
+    assertEq(hidden, 2, "selecting a different profile closes the review")
+    assertEq(RT.qtyOverrides[aqirite], nil, "selecting a different profile clears edited quantities")
+    RT.RefreshReminder = savedRefresh
+    RT.review = nil
+    RT.openTrade = nil
+    RT.qtyOverrides = {}
+    RT._seenProfileId = nil
+
+    local merged = R.GuildBankAccess({
+        configured = true, sameGuild = true, bankOpen = true, canDeposit = true, freeSlots = 0, mergeRoom = true,
+    })
+    assertTrue(merged.enabled, "a full tab with stack room can still accept a deposit")
+    assertEq(merged.reason, nil, "stack room is not reported as a full tab")
+    local stillFull = R.GuildBankAccess({
+        configured = true, sameGuild = true, bankOpen = true, canDeposit = true, freeSlots = 0,
+    })
+    assertEq(stillFull.reason, "tab_full", "a full tab without stack room stays closed")
+
+    local savedNum = GetGuildBankNumSlots
+    local savedLink = GetGuildBankItemLink
+    local savedInfo = GetGuildBankItemInfo
+    local savedItemApi = C_Item
+    local savedGetItemInfo = GetItemInfo
+    GetGuildBankNumSlots = function() return 3 end
+    GetGuildBankItemLink = function(_, slot)
+        if slot == 1 then return "item:" .. tostring(aqirite) end
+        return nil
+    end
+    GetGuildBankItemInfo = function(_, slot)
+        if slot == 1 then return nil, 4 end
+        return nil, 0
+    end
+    C_Item = { GetItemMaxStackSizeByID = function() return 20 end }
+    local targets = RT:DepositTargets(1, aqirite, 6)
+    assertEq(targets[1] and targets[1].slot, 1, "a deposit prefers the partial stack")
+    assertEq(targets[1] and targets[1].room, 16, "partial stack room is the unused portion of the max stack")
+    assertEq(targets[2] and targets[2].slot, 2, "empty slots follow the partial stack")
+    C_Item = nil
+    GetItemInfo = nil
+    local emptiesOnly = RT:DepositTargets(1, aqirite, 6)
+    assertEq(emptiesOnly[1] and emptiesOnly[1].slot, 2, "an unknown stack size uses empty slots only")
+
+    local bankP = profile("merge-bank", admin)
+    assertTrue(select(1, C.SetGuild(bankP, admin, { guid = "club-merge", name = "Spectrum", realm = "Realm" }, 1, { asAdmin = true })))
+    assertTrue(select(1, C.AddCrafter(bankP, admin, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(bankP, admin, aqirite, vann, { asAdmin = true })))
+    local savedBankOpen = RT.BankIsOpen
+    local savedBags = RT.bagCounts
+    local savedTabInfo = GetGuildBankTabInfo
+    local savedMergeGuild = RT.CurrentGuild
+    RT.BankIsOpen = function() return true end
+    RT.CurrentGuild = function() return { guid = "club-merge" } end
+    RT.bagCounts = { [aqirite] = 3 }
+    GetGuildBankNumSlots = function() return 1 end
+    GetGuildBankTabInfo = function() return nil, nil, nil, true end
+    C_Item = { GetItemMaxStackSizeByID = function() return 20 end }
+    local access = RT:BankAccess(bankP)
+    assertTrue(access.enabled, "bank access stays enabled when a carried item can merge")
+    assertEq(access.reason, nil, "a mergeable tab is not marked full")
+    RT.bagCounts = {}
+    local blocked = RT:BankAccess(bankP)
+    assertEq(blocked.reason, "tab_full", "a full tab with nothing to merge stays closed")
+    RT.BankIsOpen = savedBankOpen
+    RT.CurrentGuild = savedMergeGuild
+    RT.bagCounts = savedBags
+    GetGuildBankNumSlots = savedNum
+    GetGuildBankItemLink = savedLink
+    GetGuildBankItemInfo = savedInfo
+    GetGuildBankTabInfo = savedTabInfo
+    C_Item = savedItemApi
+    GetItemInfo = savedGetItemInfo
+
+    local withdrawP = profile("withdraw-queue", admin)
+    assertTrue(select(1, C.SetGuild(withdrawP, admin, { guid = "club-w", name = "Spectrum", realm = "Realm" }, 2, { asAdmin = true })))
+    assertTrue(select(1, C.AddCrafter(withdrawP, admin, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(withdrawP, admin, aqirite, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(withdrawP, admin, aqiriteRank2, vann, { asAdmin = true })))
+    local savedProfileFn = RT.Profile
+    local savedGuildFn = RT.CurrentGuild
+    local savedScan = RT.ScanBags
+    local savedTabs = RT.TabItemCounts
+    local savedCapture = RT.CaptureBaseline
+    local savedSelfFn = RT.SelfId
+    local savedCommit = RT.Commit
+    local savedFind = Sync.FindLocalProfileById
+    local slotItem = aqirite
+    GetGuildBankItemLink = function()
+        return "item:" .. tostring(slotItem)
+    end
+    GetGuildBankItemInfo = function()
+        return nil, 5
+    end
+    RT.Profile = function() return withdrawP end
+    RT.CurrentGuild = function() return { guid = "club-w" } end
+    RT.ScanBags = function() end
+    RT.CaptureBaseline = function() end
+    RT.SelfId = function() return admin end
+    RT.TabItemCounts = function()
+        return { [aqirite] = 20, [aqiriteRank2] = 20 }
+    end
+    RT.bagCounts = { [aqirite] = 0, [aqiriteRank2] = 0 }
+    RT.withdrawIntent = nil
+    RT.withdrawIntents = nil
+    local commits = 0
+    RT.Commit = function()
+        commits = commits + 1
+        return true
+    end
+    Sync.FindLocalProfileById = function(_, id)
+        if id == withdrawP._profileId then return withdrawP end
+        return nil
+    end
+    RT:NoteGuildBankPickup(2, 1, false)
+    RT:NoteGuildBankPickup(2, 1, false)
+    assertEq(#RT.withdrawIntents, 1, "a second pickup of the same item stays one intent")
+    assertEq(RT.withdrawIntents[1].intended, 10, "a repeated pickup adds to the intended quantity")
+    slotItem = aqiriteRank2
+    RT:NoteGuildBankPickup(2, 1, false)
+    assertEq(#RT.withdrawIntents, 2, "a second requested item is queued")
+    assertEq(RT.withdrawIntents[1].itemId, aqirite, "the first withdrawal stays at the head of the queue")
+    RT.bagCounts = { [aqirite] = 5, [aqiriteRank2] = 5 }
+    RT.TabItemCounts = function()
+        return { [aqirite] = 15, [aqiriteRank2] = 15 }
+    end
+    RT:FinishWithdraw(false)
+    assertEq(commits, 2, "both queued withdrawals commit")
+    assertEq(RT.withdrawIntent, nil, "a finished queue clears the active withdrawal")
+    RT.withdrawIntents = {}
+    for i = 1, 8 do
+        RT.withdrawIntents[i] = { itemId = 1000 + i, tab = 2 }
+    end
+    RT.withdrawIntent = RT.withdrawIntents[1]
+    slotItem = aqirite
+    RT:NoteGuildBankPickup(2, 1, false)
+    assertEq(#RT.withdrawIntents, 8, "the withdrawal queue does not grow past eight intents")
+    assertEq(RT.withdrawIntents[1].itemId, 1001, "a full queue keeps the first intent")
+    RT.Profile = savedProfileFn
+    RT.CurrentGuild = savedGuildFn
+    RT.ScanBags = savedScan
+    RT.TabItemCounts = savedTabs
+    RT.CaptureBaseline = savedCapture
+    RT.SelfId = savedSelfFn
+    RT.Commit = savedCommit
+    RT.bagCounts = savedBags
+    RT.withdrawIntent = nil
+    RT.withdrawIntents = nil
+    Sync.FindLocalProfileById = savedFind
+    GetGuildBankItemLink = savedLink
+    GetGuildBankItemInfo = savedInfo
+
+    local clearP = profile("clear-broadcast", admin)
+    assertTrue(select(1, C.AppendEvent(clearP, {
+        id = "ce:clear-broadcast:" .. admin .. ":1",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })), "the clear fixture stores one donation")
+    local savedState = Sync.state
+    local savedComm = SF.LootHelperComm
+    local savedSafe = Sync.IsSafeModeEnabled
+    local savedEnforce = Sync._EnforceGroupedSessionActive
+    local savedSelf = Sync._SelfId
+    local messages = {}
+    Sync.MSG = Sync.MSG or {}
+    Sync.MSG.CONSUMABLES_EVENT = "CONSUMABLES_EVENT"
+    Sync.MSG.CONSUMABLES_CONFIG = "CONSUMABLES_CONFIG"
+    Sync.IsSafeModeEnabled = function() return false end
+    Sync._EnforceGroupedSessionActive = function() return "RAID" end
+    Sync._SelfId = function() return admin end
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "clear-session",
+        profileId = clearP._profileId,
+    }
+    SF.LootHelperComm = {
+        Send = function(_, _, msg, payload)
+            messages[#messages + 1] = { msg = msg, event = payload and payload.event }
+            return true
+        end,
+    }
+    assertTrue(select(1, Sync:CommitConsumablesOp(clearP, { name = "clear" }, admin, { asAdmin = true })), "the coordinator can clear raid supplies")
+    local resetEvent = nil
+    local eventMessages = 0
+    for i = 1, #messages do
+        if messages[i].msg == "CONSUMABLES_EVENT" then
+            eventMessages = eventMessages + 1
+            resetEvent = messages[i].event
+        end
+    end
+    assertEq(eventMessages, 1, "clear broadcasts the archived reset and not the older donation")
+    assertEq(resetEvent and resetEvent.type, C.EVENT.RESET, "the broadcast event is the configuration reset")
+    assertTrue(resetEvent and tonumber(resetEvent.order) ~= nil and resetEvent.order > 0, "the reset carries a coordinator order")
+    assertEq(#clearP._consumableEvents, 0, "the reset stays out of the live ledger")
+    assertEq(C.Descriptor(clearP).eventFingerprint, 0, "stamping the archived reset does not change the live fingerprint")
+    local followP = profile("clear-follow", admin)
+    followP._consumables.generation = 2
+    assertTrue(select(1, S.ApplyRemoteEvent(followP, resetEvent, admin, { coordinatorRelay = true })), "a follower accepts the broadcast reset")
+    local sawClear = false
+    local rows = C.HistoryRows(followP)
+    for i = 1, #rows do
+        if rows[i].text:find("cleared", 1, true) then sawClear = true end
+    end
+    assertTrue(sawClear, "the follower log shows who cleared")
+    assertEq(#followP._consumableEvents, 0, "the follower keeps the reset in the archive")
+
+    local tokenP = profile("token-wait", admin)
+    assertTrue(select(1, C.AddCrafter(tokenP, admin, vann, { asAdmin = true })), "the trade fixture can add a crafter")
+    assertTrue(select(1, C.AddAssignment(tokenP, admin, aqirite, vann, { asAdmin = true })), "the trade fixture can assign an item")
+    local tradeToken = "trade-" .. vann .. "-9-9"
+    local opened = C.FreezeTrade(tokenP, donor, vann, { { itemId = aqirite } }, tradeToken)
+    local tokenEventId = "ce:token:" .. donor .. ":1"
+    assertTrue(select(1, C.AppendEvent(tokenP, {
+        id = tokenEventId,
+        type = C.EVENT.DONATION,
+        actor = donor,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "trade",
+        tradeToken = tradeToken,
+        timestamp = 4,
+    }, { silent = true })), "the trade event is stored locally")
+    local allowSend = false
+    local sentKinds = {}
+    Sync.MSG.CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE"
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = admin,
+        sessionId = "token-session",
+        profileId = tokenP._profileId,
+    }
+    Sync._SelfId = function() return donor end
+    SF.LootHelperComm = {
+        Send = function(_, _, msg)
+            sentKinds[#sentKinds + 1] = msg
+            if not allowSend then return false end
+            return true
+        end,
+    }
+    assertTrue(Sync:PublishTradeFreeze(tokenP, opened) == false, "the trade freeze stays pending when the queue rejects it")
+    local sentBefore = #sentKinds
+    assertTrue(Sync:BroadcastConsumablesEvent(tokenP, C.EventIndex(tokenP)[tokenEventId]) == false, "a trade event waits while its freeze is pending")
+    local sawEventEarly = false
+    for i = 1, #sentKinds do
+        if sentKinds[i] == "CONSUMABLES_EVENT" then sawEventEarly = true end
+    end
+    assertFalse(sawEventEarly, "the trade event is not sent before the freeze")
+    assertTrue(#sentKinds > sentBefore, "the pending freeze is offered again before the trade event")
+    allowSend = true
+    Sync:_FlushUnsentConsumablesEvents(tokenP)
+    local freezeAt, eventAt = nil, nil
+    for i = 1, #sentKinds do
+        if sentKinds[i] == "CONSUMABLES_TRADE_FREEZE" and allowSend then
+            freezeAt = i
+        end
+        if sentKinds[i] == "CONSUMABLES_EVENT" then
+            eventAt = i
+        end
+    end
+    assertTrue(freezeAt ~= nil and eventAt ~= nil and freezeAt < eventAt, "the flush delivers the freeze before the trade event")
+    Sync:_ClearPendingTradeFreezes()
+
+    local writer = "Writer-Realm"
+    local repairP = profile("order-repair", admin)
+    local repairId = "ce:repair:" .. writer .. ":1"
+    assertTrue(select(1, C.AppendEvent(repairP, {
+        id = repairId,
+        type = C.EVENT.DONATION,
+        actor = writer,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 5,
+        order = 4,
+    }, { silent = true })), "the coordinator already stamped the writer's event")
+    local repairSends = {}
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "repair-session",
+        profileId = repairP._profileId,
+    }
+    Sync._SamePlayer = function(_, a, b) return a == b end
+    Sync.IsRequesterInGroup = function() return true end
+    Sync.FindLocalProfileById = function() return repairP end
+    SF.LootHelperComm = {
+        Send = function(_, _, _, payload)
+            repairSends[#repairSends + 1] = payload and payload.event
+            return true
+        end,
+    }
+    Sync:HandleConsumablesEvent(writer, {
+        sessionId = "repair-session",
+        profileId = repairP._profileId,
+        event = {
+            id = repairId,
+            type = C.EVENT.DONATION,
+            actor = writer,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            source = "guildbank",
+            timestamp = 5,
+        },
+    })
+    assertEq(#repairSends, 1, "the coordinator rebroadcasts one stored stamp to its author")
+    assertEq(repairSends[1] and repairSends[1].order, 4, "the rebroadcast keeps the stored order")
+    Sync:HandleConsumablesEvent("Stranger-Realm", {
+        sessionId = "repair-session",
+        profileId = repairP._profileId,
+        event = {
+            id = repairId,
+            type = C.EVENT.DONATION,
+            actor = writer,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            source = "guildbank",
+            timestamp = 5,
+        },
+    })
+    assertEq(#repairSends, 1, "a non-author duplicate does not rebroadcast the stamp")
+
+    local cfgP = profile("cfg-catch", admin)
+    cfgP._consumables.configSeq = 5
+    local cfgCalls = 0
+    local cfgOpts = nil
+    local allowCfg = false
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "Coord-Realm",
+        coordEpoch = 3,
+        sessionId = "cfg-session",
+        profileId = cfgP._profileId,
+    }
+    Sync.FindLocalProfileById = function() return cfgP end
+    Sync.RequestProfileSnapshot = function(_, _, opts)
+        cfgCalls = cfgCalls + 1
+        cfgOpts = opts
+        return allowCfg
+    end
+    local cfgPayload = {
+        coordinator = "Coord-Realm",
+        profileId = cfgP._profileId,
+        sessionId = "cfg-session",
+        consumablesGeneration = 1,
+        consumablesConfigSeq = 0,
+        consumablesEventCount = 0,
+        consumablesEventFingerprint = 0,
+    }
+    Sync:_ConsiderConsumablesCatchUp(cfgPayload)
+    assertEq(cfgCalls, 1, "a config difference asks for a snapshot")
+    assertEq(cfgP._consumablesConfigCatchUpSession, nil, "a snapshot request that is not registered does not latch")
+    assertEq(cfgOpts and cfgOpts.coordinatorOnly, true, "the config snapshot asks only the coordinator")
+    allowCfg = true
+    Sync:_ConsiderConsumablesCatchUp(cfgPayload)
+    assertEq(cfgCalls, 2, "the next heartbeat retries the config snapshot")
+    assertTrue(type(cfgP._consumablesConfigCatchUpSession) == "string", "a registered config snapshot latches that coordinator epoch")
+    Sync:_ConsiderConsumablesCatchUp(cfgPayload)
+    assertEq(cfgCalls, 2, "a latched config snapshot is not requested again")
+
+    local loaded, loadErr = pcall(function()
+        load("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
+    end)
+    assertTrue(loaded, "the heartbeat snapshot request loads: " .. tostring(loadErr))
+    if loaded then
+        local recordedTargets = nil
+        Sync.state = {
+            active = true,
+            sessionId = "snap-session",
+            profileId = "snap-profile",
+            coordinator = "Coord-Realm",
+            helpers = { "Helper-Realm" },
+        }
+        Sync.NewRequestId = function() return "req-cfg" end
+        Sync.RegisterRequest = function(_, _, _, _, meta)
+            recordedTargets = meta and meta.targets
+            return true
+        end
+        Sync._CurrentAuthorizedRoutingTargets = function()
+            return { "Helper-Realm", "Coord-Realm" }
+        end
+        Sync._NoteMissingRoute = function() end
+        Sync.FindLocalProfileById = function() return cfgP end
+        assertTrue(Sync:RequestProfileSnapshot("consumables-config", { coordinatorOnly = true }), "a coordinator-only snapshot request is registered")
+        assertEq(recordedTargets and recordedTargets[1], "Coord-Realm", "the config snapshot target is the coordinator")
+        assertEq(recordedTargets and #recordedTargets, 1, "a coordinator-only snapshot has no helper target")
+        Sync.state._profileReqInFlight = nil
+        recordedTargets = nil
+        assertTrue(Sync:RequestProfileSnapshot("ordinary"), "an ordinary snapshot request still registers")
+        assertEq(recordedTargets and recordedTargets[1], "Helper-Realm", "an ordinary snapshot still prefers a helper")
+    end
+
+    Sync.state = savedState
+    SF.LootHelperComm = savedComm
+    Sync.IsSafeModeEnabled = savedSafe
+    Sync._EnforceGroupedSessionActive = savedEnforce
+    Sync._SelfId = savedSelf
+    Sync.FindLocalProfileById = savedFind
+end
+checkConvergenceRound()
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)

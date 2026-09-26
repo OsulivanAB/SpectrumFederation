@@ -25,6 +25,9 @@ C.MAX_ASSIGNMENT_HISTORY = 8
 C.MAX_LEDGER_EVENTS = 4096
 C.MAX_ARCHIVED_EVENTS = 4096
 C.MAX_VISIBLE_HISTORY = 200
+C.MAX_EVENT_ID = 192
+C.MAX_EVENT_NAME = 64
+C.MAX_EVENT_REASON = 128
 
 C.RESOLVE_REASONS = {
     "Used",
@@ -163,17 +166,53 @@ local function Xor32(a, b)
     return result
 end
 
+local HASH_BYTES = 256
+
 local function IdHash(id)
+    if type(id) ~= "string" or id == "" then return 0 end
     local hash = 2166136261 % FINGERPRINT_MOD
-    for i = 1, #id do
+    local limit = #id
+    if limit > HASH_BYTES then limit = HASH_BYTES end
+    for i = 1, limit do
         hash = (hash * 131 + string.byte(id, i)) % FINGERPRINT_MOD
     end
     return hash
 end
 
-local function MixFingerprint(current, id)
-    if type(id) ~= "string" or id == "" then return tonumber(current) or 0 end
-    return Xor32(current or 0, IdHash(id))
+local function FingerprintToken(id, order)
+    if type(id) ~= "string" or id == "" then return nil end
+    order = tonumber(order)
+    if order and order > 0 then
+        return id .. "\0" .. tostring(math.floor(order))
+    end
+    return id
+end
+
+local function MixFingerprint(current, id, order)
+    local token = FingerprintToken(id, order)
+    if not token then return tonumber(current) or 0 end
+    return Xor32(current or 0, IdHash(token))
+end
+
+local function RetargetFingerprint(cfg, id, oldOrder, newOrder)
+    if type(cfg) ~= "table" then return end
+    local oldToken = FingerprintToken(id, oldOrder)
+    local newToken = FingerprintToken(id, newOrder)
+    if oldToken == newToken then return end
+    local fingerprint = tonumber(cfg.eventFingerprint) or 0
+    if oldToken then fingerprint = Xor32(fingerprint, IdHash(oldToken)) end
+    if newToken then fingerprint = Xor32(fingerprint, IdHash(newToken)) end
+    cfg.eventFingerprint = fingerprint
+end
+
+local function IsLiveRecord(profile, stored)
+    if type(profile) ~= "table" or type(stored) ~= "table" then return false end
+    local events = profile._consumableEvents
+    if type(events) ~= "table" then return false end
+    for i = 1, #events do
+        if events[i] == stored then return true end
+    end
+    return false
 end
 
 -- The index is rebuilt once per login and kept beside the profile. Saving it on
@@ -217,7 +256,7 @@ local function RebuildIndex(profile)
             if seq and seq > maxSeq then maxSeq = seq end
             local order = tonumber(event.order)
             if order and order > maxOrder then maxOrder = order end
-            fingerprint = MixFingerprint(fingerprint, event.id)
+            fingerprint = MixFingerprint(fingerprint, event.id, event.order)
         end
     end
     local archive = profile._consumableEventArchive
@@ -665,26 +704,51 @@ function C.SetBankTab(profile, actor, bankTab, opts)
     return true
 end
 
+local function BoundedName(value)
+    value = Norm(value)
+    if type(value) ~= "string" or #value > C.MAX_EVENT_NAME then
+        return nil
+    end
+    return value
+end
+
+local function BoundedReason(value)
+    if type(value) ~= "string" or value == "" then return nil end
+    if #value > C.MAX_EVENT_REASON then
+        return value:sub(1, C.MAX_EVENT_REASON)
+    end
+    return value
+end
+
 local function CopyEvent(event)
+    local source = event.source
+    if source ~= "trade" and source ~= "guildbank" then
+        source = nil
+    end
+    local action = event.action
+    if action ~= C.ACTION.WITHDRAW and action ~= C.ACTION.TRANSFER
+        and action ~= C.ACTION.RETURN and action ~= C.ACTION.DELIVER then
+        action = nil
+    end
     return {
         id = event.id,
         type = event.type,
         generation = tonumber(event.generation),
         timestamp = tonumber(event.timestamp),
-        actor = event.actor,
+        actor = BoundedName(event.actor),
         itemId = tonumber(event.itemId),
         quantity = tonumber(event.quantity),
-        source = event.source,
-        crafter = event.crafter,
+        source = source,
+        crafter = BoundedName(event.crafter),
         epoch = tonumber(event.epoch),
-        action = event.action,
-        holder = event.holder,
-        fromHolder = event.fromHolder,
-        toHolder = event.toHolder,
-        reason = event.reason,
+        action = action,
+        holder = BoundedName(event.holder),
+        fromHolder = BoundedName(event.fromHolder),
+        toHolder = BoundedName(event.toHolder),
+        reason = BoundedReason(event.reason),
         order = tonumber(event.order),
         tradeToken = type(event.tradeToken) == "string" and #event.tradeToken <= 128 and event.tradeToken or nil,
-        writer = type(event.writer) == "string" and event.writer ~= "" and #event.writer <= 64 and event.writer or nil,
+        writer = type(event.writer) == "string" and event.writer ~= "" and #event.writer <= C.MAX_EVENT_NAME and event.writer or nil,
     }
 end
 
@@ -692,6 +756,9 @@ function C.AppendArchivedEvent(profile, event)
     C.Ensure(profile)
     if type(event) ~= "table" or type(event.type) ~= "string" then
         return false, "Invalid accounting event."
+    end
+    if type(event.id) == "string" and #event.id > C.MAX_EVENT_ID then
+        return false, "invalid"
     end
     if type(event.id) ~= "string" or event.id == "" then
         event.id = C.NextEventId(profile, event.actor)
@@ -718,12 +785,24 @@ function C.StampOrder(profile, event)
         end
         return existing
     end
+    local bound = EventIds(profile)
+    local stored = type(event.id) == "string" and bound.ids[event.id] or nil
+    local previous = type(stored) == "table" and tonumber(stored.order) or nil
+    if previous and previous > 0 then
+        event.order = previous
+        if previous > (tonumber(cfg.ledgerSeq) or 0) then
+            cfg.ledgerSeq = previous
+        end
+        return previous
+    end
     cfg.ledgerSeq = (tonumber(cfg.ledgerSeq) or 0) + 1
     event.order = cfg.ledgerSeq
-    local bound = EventIds(profile)
-    local stored = bound.ids[event.id]
     if type(stored) == "table" and stored ~= event then
         stored.order = event.order
+    end
+    local live = type(stored) == "table" and stored or event
+    if IsLiveRecord(profile, live) then
+        RetargetFingerprint(cfg, event.id, nil, event.order)
     end
     Invalidate(profile)
     return event.order
@@ -733,7 +812,14 @@ function C.NextEventId(profile, actor)
     local cfg = C.Ensure(profile)
     cfg.eventSeq = (tonumber(cfg.eventSeq) or 0) + 1
     actor = Norm(actor) or "unknown"
-    return string.format("ce:%s:%s:%d", tostring(profile._profileId or "profile"), actor, cfg.eventSeq)
+    if #actor > C.MAX_EVENT_NAME then
+        actor = actor:sub(1, C.MAX_EVENT_NAME)
+    end
+    local profileId = tostring(profile._profileId or "profile")
+    if #profileId > C.MAX_EVENT_NAME then
+        profileId = profileId:sub(1, C.MAX_EVENT_NAME)
+    end
+    return string.format("ce:%s:%s:%d", profileId, actor, cfg.eventSeq)
 end
 
 function C.AppendEvent(profile, event, opts)
@@ -742,6 +828,9 @@ function C.AppendEvent(profile, event, opts)
         return false, "Invalid accounting event."
     end
     C.Ensure(profile)
+    if type(event.id) == "string" and #event.id > C.MAX_EVENT_ID then
+        return false, "invalid"
+    end
     if type(event.id) ~= "string" or event.id == "" then
         event.id = C.NextEventId(profile, event.actor)
     end
@@ -752,6 +841,9 @@ function C.AppendEvent(profile, event, opts)
         local storedOrder = type(stored) == "table" and tonumber(stored.order) or nil
         local replaceOrder = opts.replaceOrder and incoming and storedOrder and storedOrder ~= incoming
         if incoming and type(stored) == "table" and (storedOrder == nil or replaceOrder) then
+            if IsLiveRecord(profile, stored) then
+                RetargetFingerprint(profile._consumables, event.id, storedOrder, incoming)
+            end
             stored.order = incoming
             local cfg = profile._consumables
             if incoming > (tonumber(cfg.ledgerSeq) or 0) then
@@ -787,7 +879,7 @@ function C.AppendEvent(profile, event, opts)
     bound.ids[event.id] = record
     bound.count = #profile._consumableEvents
     local cfg = profile._consumables
-    cfg.eventFingerprint = MixFingerprint(cfg.eventFingerprint, event.id)
+    cfg.eventFingerprint = MixFingerprint(cfg.eventFingerprint, event.id, record.order)
     local order = tonumber(record.order)
     if order and order > (tonumber(cfg.ledgerSeq) or 0) then
         cfg.ledgerSeq = order
