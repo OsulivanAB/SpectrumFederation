@@ -25,6 +25,8 @@ C.MAX_ASSIGNMENT_HISTORY = 8
 C.MAX_LEDGER_EVENTS = 4096
 C.MAX_ARCHIVED_EVENTS = 4096
 C.MAX_VISIBLE_HISTORY = 200
+C.MAX_EVENTS_PER_ACTOR = 512
+C.MAX_EVENT_SEQ = 2147483647
 C.MAX_EVENT_ID = 192
 C.MAX_EVENT_NAME = 64
 C.MAX_EVENT_REASON = 128
@@ -205,6 +207,84 @@ local function RetargetFingerprint(cfg, id, oldOrder, newOrder)
     cfg.eventFingerprint = fingerprint
 end
 
+local function AdoptedEventSeq(id)
+    if type(id) ~= "string" then return nil end
+    local digits = id:match(":(%d+)$")
+    if not digits then return nil end
+    local seq = tonumber(digits)
+    if not seq or seq ~= math.floor(seq) or seq < 1 or seq > C.MAX_EVENT_SEQ then
+        return nil
+    end
+    return seq
+end
+
+local function ArchiveStats(profile)
+    local archive = profile._consumableEventArchive
+    local fingerprint = 0
+    local count = 0
+    if type(archive) == "table" then
+        count = #archive
+        for i = 1, count do
+            local archived = archive[i]
+            if type(archived) == "table" then
+                fingerprint = MixFingerprint(fingerprint, archived.id, archived.order)
+            end
+        end
+    end
+    return count, fingerprint
+end
+
+local function StoreArchiveStats(profile)
+    local cfg = profile._consumables
+    if type(cfg) ~= "table" then return end
+    local count, fingerprint = ArchiveStats(profile)
+    cfg.archiveCount = count
+    cfg.archiveFingerprint = fingerprint
+end
+
+local function RetargetArchiveFingerprint(cfg, id, oldOrder, newOrder)
+    if type(cfg) ~= "table" then return end
+    local oldToken = FingerprintToken(id, oldOrder)
+    local newToken = FingerprintToken(id, newOrder)
+    if oldToken == newToken then return end
+    local fingerprint = tonumber(cfg.archiveFingerprint) or 0
+    if oldToken then fingerprint = Xor32(fingerprint, IdHash(oldToken)) end
+    if newToken then fingerprint = Xor32(fingerprint, IdHash(newToken)) end
+    cfg.archiveFingerprint = fingerprint
+end
+
+local function IsArchivedRecord(profile, stored)
+    if type(profile) ~= "table" or type(stored) ~= "table" then return false end
+    local archive = profile._consumableEventArchive
+    if type(archive) ~= "table" then return false end
+    for i = 1, #archive do
+        if archive[i] == stored then return true end
+    end
+    return false
+end
+
+local function EventQuotaKey(event)
+    if type(event) ~= "table" then return nil end
+    local key = Norm(event.writer)
+    if not key then key = Norm(event.actor) end
+    if key and #key > C.MAX_EVENT_NAME then return nil end
+    return key
+end
+
+local function ActorLiveCount(profile, actor, generation)
+    local events = profile._consumableEvents
+    local count = 0
+    if type(events) ~= "table" then return 0 end
+    for i = 1, #events do
+        local event = events[i]
+        local key = EventQuotaKey(event)
+        if key == actor and tonumber(event.generation) == generation then
+            count = count + 1
+        end
+    end
+    return count
+end
+
 local function IsLiveRecord(profile, stored)
     if type(profile) ~= "table" or type(stored) ~= "table" then return false end
     local events = profile._consumableEvents
@@ -252,7 +332,7 @@ local function RebuildIndex(profile)
         local event = events[i]
         if type(event) == "table" and type(event.id) == "string" then
             index[event.id] = event
-            local seq = tonumber(event.id:match(":(%d+)$"))
+            local seq = AdoptedEventSeq(event.id)
             if seq and seq > maxSeq then maxSeq = seq end
             local order = tonumber(event.order)
             if order and order > maxOrder then maxOrder = order end
@@ -265,6 +345,8 @@ local function RebuildIndex(profile)
             local archived = archive[i]
             if type(archived) == "table" and type(archived.id) == "string" then
                 index[archived.id] = archived
+                local seq = AdoptedEventSeq(archived.id)
+                if seq and seq > maxSeq then maxSeq = seq end
             end
         end
     end
@@ -282,6 +364,7 @@ local function RebuildIndex(profile)
             cfg.ledgerSeq = maxOrder
         end
         cfg.eventFingerprint = fingerprint
+        StoreArchiveStats(profile)
     end
 end
 
@@ -301,7 +384,11 @@ function C.Ensure(profile)
     local cfg = profile._consumables
     if type(cfg.generation) ~= "number" or cfg.generation < 1 then cfg.generation = 1 end
     if type(cfg.configSeq) ~= "number" or cfg.configSeq < 0 then cfg.configSeq = 0 end
-    if type(cfg.eventSeq) ~= "number" or cfg.eventSeq < 0 then cfg.eventSeq = 0 end
+    if type(cfg.eventSeq) ~= "number" or cfg.eventSeq < 0 or cfg.eventSeq ~= math.floor(cfg.eventSeq) then
+        cfg.eventSeq = 0
+    elseif cfg.eventSeq >= 9007199254740992 then
+        cfg.eventSeq = C.MAX_EVENT_SEQ
+    end
     if type(cfg.ledgerSeq) ~= "number" or cfg.ledgerSeq < 0 then cfg.ledgerSeq = 0 end
     if type(cfg.crafters) ~= "table" then cfg.crafters = {} end
     if type(cfg.assignments) ~= "table" then cfg.assignments = {} end
@@ -342,6 +429,7 @@ local function TrimArchive(profile)
         kept[#kept + 1] = archive[i]
     end
     profile._consumableEventArchive = kept
+    StoreArchiveStats(profile)
     return true
 end
 
@@ -390,6 +478,8 @@ function C.Descriptor(profile)
         configSeq = cfg.configSeq,
         eventCount = #(profile._consumableEvents or {}),
         eventFingerprint = tonumber(cfg.eventFingerprint) or 0,
+        archiveCount = tonumber(cfg.archiveCount) or #(profile._consumableEventArchive or {}),
+        archiveFingerprint = tonumber(cfg.archiveFingerprint) or 0,
     }
 end
 
@@ -771,7 +861,11 @@ function C.AppendArchivedEvent(profile, event)
     local archive = ArchiveList(profile)
     archive[#archive + 1] = record
     bound.ids[record.id] = record
-    TrimArchive(profile)
+    if not TrimArchive(profile) then
+        local cfg = profile._consumables
+        cfg.archiveCount = #profile._consumableEventArchive
+        cfg.archiveFingerprint = MixFingerprint(cfg.archiveFingerprint, record.id, record.order)
+    end
     return true, "archived"
 end
 
@@ -803,6 +897,8 @@ function C.StampOrder(profile, event)
     local live = type(stored) == "table" and stored or event
     if IsLiveRecord(profile, live) then
         RetargetFingerprint(cfg, event.id, nil, event.order)
+    elseif IsArchivedRecord(profile, live) then
+        RetargetArchiveFingerprint(cfg, event.id, nil, event.order)
     end
     Invalidate(profile)
     return event.order
@@ -843,6 +939,8 @@ function C.AppendEvent(profile, event, opts)
         if incoming and type(stored) == "table" and (storedOrder == nil or replaceOrder) then
             if IsLiveRecord(profile, stored) then
                 RetargetFingerprint(profile._consumables, event.id, storedOrder, incoming)
+            else
+                RetargetArchiveFingerprint(profile._consumables, event.id, storedOrder, incoming)
             end
             stored.order = incoming
             local cfg = profile._consumables
@@ -867,6 +965,10 @@ function C.AppendEvent(profile, event, opts)
             return false, "full"
         end
     end
+    local actorKey = EventQuotaKey(event)
+    if ActorLiveCount(profile, actorKey, currentGen) >= C.MAX_EVENTS_PER_ACTOR then
+        return false, "quota"
+    end
     event.timestamp = tonumber(event.timestamp) or Now()
     event.generation = tonumber(event.generation) or C.Ensure(profile).generation
     if event.actor then event.actor = Norm(event.actor) or event.actor end
@@ -884,7 +986,7 @@ function C.AppendEvent(profile, event, opts)
     if order and order > (tonumber(cfg.ledgerSeq) or 0) then
         cfg.ledgerSeq = order
     end
-    local seq = tonumber(event.id:match(":(%d+)$"))
+    local seq = AdoptedEventSeq(event.id)
     if seq and seq > (tonumber(cfg.eventSeq) or 0) then
         cfg.eventSeq = seq
     end
@@ -1159,7 +1261,7 @@ function C.FormatEvent(event, itemName)
     return ""
 end
 
-function C.HistoryRows(profile, nameForItem, limit)
+function C.HistoryRows(profile, nameForItem, limit, offset)
     C.Ensure(profile)
     local ordered = {}
     local archive = profile._consumableEventArchive
@@ -1172,13 +1274,18 @@ function C.HistoryRows(profile, nameForItem, limit)
         ordered[#ordered + 1] = profile._consumableEvents[i]
     end
     table.sort(ordered, function(a, b) return EventLess(b, a) end)
-    local count = #ordered
+    local total = #ordered
+    offset = math.floor(tonumber(offset) or 0)
+    if offset < 0 then offset = 0 end
+    if offset > total then offset = total end
+    local last = total
     limit = tonumber(limit)
-    if limit and limit >= 0 and limit < count then
-        count = math.floor(limit)
+    if limit and limit >= 0 then
+        last = offset + math.floor(limit)
+        if last > total then last = total end
     end
     local rows = {}
-    for i = 1, count do
+    for i = offset + 1, last do
         local event = ordered[i]
         local itemName = nil
         if type(nameForItem) == "function" then
@@ -1193,7 +1300,7 @@ function C.HistoryRows(profile, nameForItem, limit)
             }
         end
     end
-    return rows
+    return rows, total
 end
 
 function C.ClearConfirmation(profile)
@@ -1290,7 +1397,11 @@ function C.ReplaceConfig(profile, payload)
     local cfg = C.Ensure(profile)
     cfg.generation = tonumber(payload.generation) or cfg.generation or 1
     cfg.configSeq = tonumber(payload.configSeq) or cfg.configSeq or 0
-    cfg.eventSeq = math.max(tonumber(cfg.eventSeq) or 0, tonumber(payload.eventSeq) or 0)
+    local remoteEventSeq = tonumber(payload.eventSeq)
+    if remoteEventSeq and remoteEventSeq == math.floor(remoteEventSeq)
+        and remoteEventSeq > (tonumber(cfg.eventSeq) or 0) and remoteEventSeq <= C.MAX_EVENT_SEQ then
+        cfg.eventSeq = remoteEventSeq
+    end
     cfg.ledgerSeq = math.max(tonumber(cfg.ledgerSeq) or 0, tonumber(payload.ledgerSeq) or 0)
     cfg.guild = CopyGuild(payload.guild)
     cfg.bankTab = tonumber(payload.bankTab)
@@ -1459,6 +1570,9 @@ function C.CommitEvents(profile, token, events)
     end
     if failed == "full" then
         return false, "The raid supplies ledger is full. Older entries stay in the log."
+    end
+    if failed == "quota" then
+        return false, "That character has reached the raid-supply event limit for this configuration."
     end
     if failed then
         return false, failed

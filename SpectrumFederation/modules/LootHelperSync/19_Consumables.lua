@@ -38,6 +38,7 @@ end
 local MAX_CAPABLE_PEERS = 40
 local MAX_EVENT_FLUSH = 8
 local MAX_EVENT_SCAN = 64
+local MAX_FREEZE_FLUSH = 4
 local pendingFreezes = setmetatable({}, { __mode = "k" })
 
 function Sync:_ClearPendingTradeFreezes()
@@ -50,12 +51,74 @@ function Sync:_ClearPendingTradeFreezes()
     end
 end
 
+local function PendingFreezeCap()
+    local S = Rules()
+    local cap = S and tonumber(S.MAX_TRADE_GRANTS) or 32
+    if not cap or cap < 1 then cap = 32 end
+    return cap
+end
+
+local function FreezeList(profile)
+    local stored = pendingFreezes[profile]
+    if type(stored) ~= "table" then
+        stored = {}
+        pendingFreezes[profile] = stored
+        return stored
+    end
+    if type(stored.token) == "string" then
+        stored = { stored }
+        pendingFreezes[profile] = stored
+    end
+    return stored
+end
+
+local function PendingFreezeFor(profile, token)
+    if type(token) ~= "string" then return nil end
+    local stored = pendingFreezes[profile]
+    if type(stored) ~= "table" then return nil end
+    if type(stored.token) == "string" then
+        if stored.token == token then return stored end
+        return nil
+    end
+    for i = 1, #stored do
+        local grant = stored[i]
+        if type(grant) == "table" and grant.token == token then
+            return grant
+        end
+    end
+    return nil
+end
+
 local function RememberTradeFreeze(profile, grant, sent)
+    if type(grant) ~= "table" or type(grant.token) ~= "string" then
+        return sent ~= false
+    end
+    local list = FreezeList(profile)
+    local index = nil
+    for i = 1, #list do
+        if type(list[i]) == "table" and list[i].token == grant.token then
+            index = i
+            break
+        end
+    end
     if sent == false then
-        pendingFreezes[profile] = grant
+        if index then
+            list[index] = grant
+        else
+            list[#list + 1] = grant
+            local cap = PendingFreezeCap()
+            while #list > cap do
+                table.remove(list, 1)
+            end
+        end
         return false
     end
-    pendingFreezes[profile] = nil
+    if index then
+        table.remove(list, index)
+    end
+    if #list == 0 then
+        pendingFreezes[profile] = nil
+    end
     return true
 end
 
@@ -129,6 +192,8 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     payload.consumablesConfigSeq = desc.configSeq
     payload.consumablesEventCount = desc.eventCount
     payload.consumablesEventFingerprint = desc.eventFingerprint
+    payload.consumablesArchiveCount = desc.archiveCount
+    payload.consumablesArchiveFingerprint = desc.archiveFingerprint
     self:_FlushUnsentConsumablesEvents(profile)
 end
 
@@ -151,6 +216,8 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         configSeq = payload.consumablesConfigSeq,
         eventCount = payload.consumablesEventCount,
         eventFingerprint = payload.consumablesEventFingerprint,
+        archiveCount = payload.consumablesArchiveCount,
+        archiveFingerprint = payload.consumablesArchiveFingerprint,
     }
     local localDesc = C.Descriptor(profile)
     local fingerprintsDiffer = tonumber(remote.eventFingerprint) and tonumber(localDesc.eventFingerprint)
@@ -202,14 +269,46 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         tostring(payload.consumablesConfigSeq),
         tostring(payload.consumablesEventCount),
         tostring(payload.consumablesEventFingerprint),
+        tostring(payload.consumablesArchiveCount),
+        tostring(payload.consumablesArchiveFingerprint),
     }, ":")
     if self._consumablesCatchUpKey == key then
         return
     end
-    self._consumablesCatchUpKey = key
+    local requested = false
     if self.RequestProfileSnapshot then
-        self:RequestProfileSnapshot("consumables-catchup")
+        local opts = nil
+        if profile._consumablesCatchUpWantCoordinator then
+            opts = { coordinatorOnly = true }
+        end
+        requested = self:RequestProfileSnapshot("consumables-catchup", opts) and true or false
     end
+    if not requested then
+        return
+    end
+    self._consumablesCatchUpKey = key
+    profile._consumablesCatchUpRemote = remote
+end
+
+function Sync:_NoteConsumablesSnapshot(profile, fromCoordinator)
+    local C = Consumables()
+    local S = Rules()
+    if not C or not S or type(profile) ~= "table" then return end
+    if not (self.state and self.state.active) then return end
+    if ProfileIdOf(profile) ~= self.state.profileId then return end
+    local remote = profile._consumablesCatchUpRemote
+    if type(remote) ~= "table" then return end
+    if not S.NeedsCatchUp(C.Descriptor(profile), remote) then
+        self._consumablesCatchUpKey = nil
+        profile._consumablesCatchUpRemote = nil
+        profile._consumablesCatchUpWantCoordinator = nil
+        return
+    end
+    if fromCoordinator or profile._consumablesCatchUpWantCoordinator then
+        return
+    end
+    self._consumablesCatchUpKey = nil
+    profile._consumablesCatchUpWantCoordinator = true
 end
 
 local function SessionPayloadOk(payload, sender)
@@ -292,36 +391,49 @@ function Sync:_QueueUnsequencedConsumablesEvents(profile)
 end
 
 function Sync:_FlushPendingTradeFreeze(profile)
-    local grant = pendingFreezes[profile]
-    if type(grant) ~= "table" then return end
+    local list = pendingFreezes[profile]
+    if type(list) ~= "table" then return end
+    if type(list.token) == "string" then
+        pendingFreezes[profile] = { list }
+        list = pendingFreezes[profile]
+    end
+    if #list == 0 then return end
     if not (self.state and self.state.active) or not SessionFor(profile) then return end
-    local sent
-    if self.state.isCoordinator then
-        local S = Rules()
-        local now = 0
-        local C = Consumables()
-        if C and C.Now then now = C.Now() end
-        if S and S.RegisterTradeGrant and not S.RegisterTradeGrant(profile, grant, now) then
-            pendingFreezes[profile] = nil
-            return
+    local flushed = 0
+    while flushed < MAX_FREEZE_FLUSH and type(list[1]) == "table" do
+        local grant = list[1]
+        flushed = flushed + 1
+        if self.state.isCoordinator then
+            local S = Rules()
+            local now = 0
+            local C = Consumables()
+            if C and C.Now then now = C.Now() end
+            if S and S.RegisterTradeGrant and not S.RegisterTradeGrant(profile, grant, now) then
+                table.remove(list, 1)
+            elseif self:BroadcastTradeFreeze(profile, grant) == false then
+                break
+            end
+        else
+            if not SF.LootHelperComm or not self.MSG then return end
+            local coordinator = self.state.coordinator
+            if type(coordinator) ~= "string" or coordinator == "" then return end
+            local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, {
+                sessionId = self.state.sessionId,
+                profileId = ProfileIdOf(profile),
+                token = grant.token,
+                donor = grant.donor,
+                receiver = grant.receiver,
+                generation = grant.generation,
+                items = grant.items,
+            }, "WHISPER", coordinator, "NORMAL")
+            if sent == false then
+                return
+            end
+            RememberTradeFreeze(profile, grant, true)
         end
-        self:BroadcastTradeFreeze(profile, grant)
-    else
-        if not SF.LootHelperComm or not self.MSG then return end
-        local coordinator = self.state.coordinator
-        if type(coordinator) ~= "string" or coordinator == "" then return end
-        sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, {
-            sessionId = self.state.sessionId,
-            profileId = ProfileIdOf(profile),
-            token = grant.token,
-            donor = grant.donor,
-            receiver = grant.receiver,
-            generation = grant.generation,
-            items = grant.items,
-        }, "WHISPER", coordinator, "NORMAL")
-        if sent ~= false then
-            pendingFreezes[profile] = nil
-        end
+    end
+    if type(pendingFreezes[profile]) == "table" and #pendingFreezes[profile] == 0 then
+        pendingFreezes[profile] = nil
     end
 end
 
@@ -503,9 +615,9 @@ end
 
 function Sync:BroadcastConsumablesEvent(profile, event)
     if type(event) ~= "table" or type(event.id) ~= "string" then return false end
-    if type(event.tradeToken) == "string" and pendingFreezes[profile] then
+    if type(event.tradeToken) == "string" and PendingFreezeFor(profile, event.tradeToken) then
         self:_FlushPendingTradeFreeze(profile)
-        if pendingFreezes[profile] then
+        if PendingFreezeFor(profile, event.tradeToken) then
             self:_QueueUnsentConsumablesEvent(profile, event.id)
             return false
         end
@@ -666,13 +778,11 @@ function Sync:PublishTradeFreeze(profile, frozen)
         return self:BroadcastTradeFreeze(profile, grant)
     end
     if not SF.LootHelperComm or not self.MSG then
-        pendingFreezes[profile] = grant
-        return false
+        return RememberTradeFreeze(profile, grant, false)
     end
     local coordinator = self.state.coordinator
     if type(coordinator) ~= "string" or coordinator == "" then
-        pendingFreezes[profile] = grant
-        return false
+        return RememberTradeFreeze(profile, grant, false)
     end
     local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, {
         sessionId = self.state.sessionId,

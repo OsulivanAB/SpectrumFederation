@@ -48,6 +48,35 @@ function Runtime:Profile()
     return nil
 end
 
+function Runtime:AccountingProfile()
+    local active = self:Profile()
+    local sync = SF.LootHelperSync
+    local state = sync and sync.state
+    if not (state and state.active and type(state.profileId) == "string" and state.profileId ~= "") then
+        return active
+    end
+    local sessionProfile = self:ProfileById(state.profileId)
+    if not sessionProfile then
+        return active
+    end
+    local activeId = nil
+    if type(active) == "table" then
+        if active.GetProfileId then
+            activeId = active:GetProfileId()
+        else
+            activeId = active._profileId
+        end
+    end
+    if activeId ~= state.profileId then
+        local key = tostring(state.sessionId or "") .. ":" .. state.profileId
+        if self._sessionProfileNotice ~= key then
+            self._sessionProfileNotice = key
+            Info("Raid supplies in this session are recorded on the session profile.")
+        end
+    end
+    return sessionProfile
+end
+
 function Runtime:ProfileById(profileId)
     if type(profileId) ~= "string" or profileId == "" then return nil end
     local db = SF.lootHelperDB
@@ -442,7 +471,7 @@ end
 function Runtime:Collect()
     local C = SF.Consumables
     local Routing = SF.ConsumablesRouting
-    local profile = self:Profile()
+    local profile = self:AccountingProfile()
     if not C or not Routing or not profile then return nil end
     self:ScanBags()
     local group = self:GroupMap()
@@ -996,7 +1025,7 @@ end
 
 function Runtime:OnTradeShow()
     self:CancelPendingTradeTimer()
-    local profile = self:Profile()
+    local profile = self:AccountingProfile()
     local C = SF.Consumables
     if not profile or not C then return end
     local partner = self:UnitId("npc")
@@ -1226,7 +1255,7 @@ function Runtime:FinishDeposit(fromTimer)
 end
 
 function Runtime:CaptureBaseline(silent)
-    local profile = self:Profile()
+    local profile = self:AccountingProfile()
     local C = SF.Consumables
     if not profile or not C then return end
     local cfg = C.Ensure(profile)
@@ -1255,7 +1284,7 @@ end
 
 function Runtime:AutoStoreLoss(tab)
     local C = SF.Consumables
-    local profile = self:Profile()
+    local profile = self:AccountingProfile()
     if not C or not profile or type(self.bankBaseline) ~= "table" then return nil, 0 end
     local after = self:TabItemCounts(tab)
     local foundId, foundLoss, matches = nil, 0, 0
@@ -1276,7 +1305,7 @@ end
 function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
     if self.placingDeposit then return end
     local C = SF.Consumables
-    local profile = self:Profile()
+    local profile = self:AccountingProfile()
     if not C or not profile or not GetGuildBankItemLink then return end
     local cfg = C.Ensure(profile)
     tab = tonumber(tab)

@@ -2233,6 +2233,290 @@ local function checkConvergenceRound()
 end
 checkConvergenceRound()
 
+local function checkFollowupRound()
+    local hist = profile("history-page", admin)
+    for i = 1, 3 do
+        assertTrue(select(1, C.AppendEvent(hist, {
+            id = "ce:hist:" .. admin .. ":" .. tostring(i),
+            type = C.EVENT.DONATION,
+            actor = admin,
+            itemId = aqirite,
+            quantity = i,
+            generation = 1,
+            source = "guildbank",
+            timestamp = i,
+        }, { silent = true })), "history fixture stores event " .. tostring(i))
+    end
+    local newest = C.HistoryRows(hist, nil, 1)
+    assertEq(#newest, 1, "a limit without an offset still returns the newest row")
+    assertTrue(newest[1].text:find("donated 3", 1, true) ~= nil, "the first history page starts with the newest event")
+    local older, total = C.HistoryRows(hist, nil, 1, 1)
+    assertEq(total, 3, "history reports how many retained rows exist")
+    assertEq(#older, 1, "an offset returns the next history page")
+    assertTrue(older[1].text:find("donated 2", 1, true) ~= nil, "the next page is the next newest event")
+
+    local plain = profile("archive-fp-plain", admin)
+    local extra = profile("archive-fp-extra", admin)
+    local shared = {
+        id = "ce:archfp:" .. admin .. ":1",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }
+    assertTrue(select(1, C.AppendEvent(plain, shared, { silent = true })), "the plain archive fixture stores the live event")
+    assertTrue(select(1, C.AppendEvent(extra, shared, { silent = true })), "the extra archive fixture stores the same live event")
+    assertTrue(select(1, C.AppendEvent(extra, {
+        id = "ce:archfp:" .. admin .. ":old",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 4,
+        generation = 0,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })), "an older event is archived beside the same live ledger")
+    local plainDesc = C.Descriptor(plain)
+    local extraDesc = C.Descriptor(extra)
+    assertEq(plainDesc.eventFingerprint, extraDesc.eventFingerprint, "the same live ledger keeps the same live fingerprint")
+    assertTrue(plainDesc.archiveFingerprint ~= extraDesc.archiveFingerprint, "the archive fingerprint changes when the archive differs")
+    local remoteArchive = {
+        generation = extraDesc.generation,
+        configSeq = extraDesc.configSeq,
+        eventCount = extraDesc.eventCount,
+        eventFingerprint = extraDesc.eventFingerprint,
+        archiveCount = extraDesc.archiveCount,
+        archiveFingerprint = extraDesc.archiveFingerprint,
+    }
+    assertTrue(S.NeedsCatchUp(plainDesc, remoteArchive), "a different archive needs catch-up when the peer advertises it")
+    assertEq(S.CatchUpKind(plainDesc, remoteArchive), "fingerprint", "an archive-only mismatch uses the fingerprint cooldown")
+    local remoteWithoutArchive = {
+        generation = extraDesc.generation,
+        configSeq = extraDesc.configSeq,
+        eventCount = extraDesc.eventCount,
+        eventFingerprint = extraDesc.eventFingerprint,
+    }
+    assertFalse(S.NeedsCatchUp(plainDesc, remoteWithoutArchive), "a peer that omits archive fields is not an archive mismatch")
+
+    local seqP = profile("seq-cap", admin)
+    local bigId = "ce:seq:" .. admin .. ":9007199254740992"
+    assertTrue(select(1, C.AppendEvent(seqP, {
+        id = bigId,
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })), "a long event id is still stored for dedupe")
+    assertEq(seqP._consumables.eventSeq, 0, "a remote id past 2^31-1 does not move the local sequence")
+    C.InvalidateEventIndex(seqP)
+    C.Ensure(seqP)
+    assertEq(seqP._consumables.eventSeq, 0, "rebuilding the index does not adopt that sequence")
+    local nextId = C.NextEventId(seqP, admin)
+    assertTrue(nextId ~= bigId and nextId:find(":1$") ~= nil, "the next local id stays unique")
+    local adoptP = profile("seq-adopt", admin)
+    assertTrue(select(1, C.AppendEvent(adoptP, {
+        id = "ce:seq:" .. admin .. ":10",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })), "a normal event id suffix is stored")
+    assertEq(adoptP._consumables.eventSeq, 10, "a sequence at or below 2^31-1 is adopted")
+    assertTrue(C.NextEventId(adoptP, admin):find(":11$") ~= nil, "the next local id follows the adopted sequence")
+
+    local quotaP = profile("quota", admin)
+    local quotaOk = true
+    for i = 1, C.MAX_EVENTS_PER_ACTOR do
+        local ok = C.AppendEvent(quotaP, {
+            id = "ce:quota:" .. admin .. ":" .. tostring(i),
+            type = C.EVENT.DONATION,
+            actor = admin,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            source = "guildbank",
+            timestamp = i,
+        }, { silent = true })
+        if not ok then quotaOk = false end
+    end
+    assertTrue(quotaOk, "a character can record the per-character budget")
+    local blocked, quotaStatus = C.AppendEvent(quotaP, {
+        id = "ce:quota:" .. admin .. ":over",
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })
+    assertFalse(blocked, "the next event from that character is rejected")
+    assertEq(quotaStatus, "quota", "the rejection names the per-character budget")
+    assertTrue(select(1, C.AppendEvent(quotaP, {
+        id = "ce:quota:" .. donor .. ":1",
+        type = C.EVENT.DONATION,
+        actor = donor,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "guildbank",
+        timestamp = 1,
+    }, { silent = true })), "another character can still record an event")
+
+    RT._seenProfileId = "profile-a"
+    RT.qtyOverrides = { [aqirite] = 2 }
+    RT.openTrade = nil
+    RT.review = {
+        shown = true,
+        Hide = function(self) self.shown = false end,
+        IsShown = function(self) return self.shown end,
+    }
+    RT:OnProfileChanged(nil)
+    assertFalse(RT.review.shown, "clearing the active profile closes an open review")
+    assertEq(RT._seenProfileId, nil, "the review is no longer bound to the deleted profile")
+
+    local visible = profile("visible-profile", admin)
+    local sessionP = profile("session-profile", admin)
+    local savedGet = SF.GetActiveProfile
+    local savedDb = SF.lootHelperDB
+    local savedInfo = SF.PrintInfo
+    local savedState = Sync.state
+    local savedFind = Sync.FindLocalProfileById
+    local savedRequest = Sync.RequestProfileSnapshot
+    local savedComm = SF.LootHelperComm
+    local savedSafe = Sync.IsSafeModeEnabled
+    local notices = 0
+    SF.GetActiveProfile = function() return visible end
+    SF.lootHelperDB = { profiles = { ["session-profile"] = sessionP } }
+    SF.PrintInfo = function() notices = notices + 1 end
+    Sync.state = { active = true, profileId = "session-profile", sessionId = "acct-session" }
+    assertTrue(RT:Profile() == visible, "the visible profile helper still returns the active profile")
+    assertTrue(RT:AccountingProfile() == sessionP, "new accounting uses the session profile")
+    assertEq(notices, 1, "a different visible profile is reported once")
+    assertTrue(RT:AccountingProfile() == sessionP, "later accounting stays on the session profile")
+    assertEq(notices, 1, "the same session does not repeat that notice")
+
+    local catchP = profile("event-catch", admin)
+    local calls = {}
+    Sync._consumablesCatchUpKey = nil
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "Coord-Realm",
+        sessionId = "event-catch",
+        profileId = catchP._profileId,
+        coordEpoch = 1,
+    }
+    Sync.FindLocalProfileById = function() return catchP end
+    Sync.IsSafeModeEnabled = function() return false end
+    local payload = {
+        coordinator = "Coord-Realm",
+        profileId = catchP._profileId,
+        sessionId = "event-catch",
+        consumablesGeneration = 1,
+        consumablesConfigSeq = 0,
+        consumablesEventCount = 2,
+        consumablesEventFingerprint = 9,
+    }
+    Sync.RequestProfileSnapshot = function(_, reason, opts)
+        calls[#calls + 1] = { reason = reason, coordinatorOnly = opts and opts.coordinatorOnly or false }
+        return false
+    end
+    Sync:_ConsiderConsumablesCatchUp(payload)
+    assertEq(#calls, 1, "a ledger mismatch asks for a snapshot")
+    assertEq(Sync._consumablesCatchUpKey, nil, "a snapshot request that is not registered does not latch")
+    Sync.RequestProfileSnapshot = function(_, reason, opts)
+        calls[#calls + 1] = { reason = reason, coordinatorOnly = opts and opts.coordinatorOnly or false }
+        return true
+    end
+    Sync:_ConsiderConsumablesCatchUp(payload)
+    assertTrue(Sync._consumablesCatchUpKey ~= nil, "a registered ledger snapshot latches that descriptor")
+    assertEq(calls[#calls].coordinatorOnly, false, "the first ledger snapshot can use a helper")
+    Sync:_NoteConsumablesSnapshot(catchP, false)
+    assertEq(Sync._consumablesCatchUpKey, nil, "a helper snapshot that still differs clears the latch")
+    assertEq(catchP._consumablesCatchUpWantCoordinator, true, "the next ledger snapshot asks the coordinator")
+    Sync:_ConsiderConsumablesCatchUp(payload)
+    assertEq(calls[#calls].coordinatorOnly, true, "the follow-up snapshot target is the coordinator")
+    local callsBefore = #calls
+    Sync:_NoteConsumablesSnapshot(catchP, true)
+    Sync:_ConsiderConsumablesCatchUp(payload)
+    assertEq(#calls, callsBefore, "a coordinator snapshot that still differs is not requested again")
+
+    local freezeP = profile("freeze-queue", admin)
+    assertTrue(select(1, C.AddCrafter(freezeP, admin, vann, { asAdmin = true })), "the freeze queue can add a crafter")
+    assertTrue(select(1, C.AddAssignment(freezeP, admin, aqirite, vann, { asAdmin = true })), "the freeze queue can assign an item")
+    local tokenA = "trade-" .. vann .. "-11-11"
+    local tokenB = "trade-" .. vann .. "-12-12"
+    local openedA = C.FreezeTrade(freezeP, donor, vann, { { itemId = aqirite } }, tokenA)
+    local openedB = C.FreezeTrade(freezeP, donor, vann, { { itemId = aqirite } }, tokenB)
+    local sentTokens = {}
+    local allowSend = false
+    Sync.MSG = Sync.MSG or {}
+    Sync.MSG.CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE"
+    Sync.MSG.CONSUMABLES_EVENT = "CONSUMABLES_EVENT"
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = admin,
+        sessionId = "freeze-queue",
+        profileId = freezeP._profileId,
+    }
+    SF.LootHelperComm = {
+        Send = function(_, _, msg, body)
+            if msg == "CONSUMABLES_TRADE_FREEZE" and not allowSend then return false end
+            if msg == "CONSUMABLES_TRADE_FREEZE" then
+                sentTokens[#sentTokens + 1] = body and body.token
+            end
+            return true
+        end,
+    }
+    assertTrue(Sync:PublishTradeFreeze(freezeP, openedA) == false, "the first dropped freeze stays pending")
+    assertTrue(Sync:PublishTradeFreeze(freezeP, openedB) == false, "a second dropped freeze stays pending too")
+    local otherId = "ce:other-token:" .. donor .. ":1"
+    local otherToken = "trade-" .. vann .. "-99-99"
+    assertTrue(select(1, C.AppendEvent(freezeP, {
+        id = otherId,
+        type = C.EVENT.DONATION,
+        actor = donor,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+        source = "trade",
+        tradeToken = otherToken,
+        timestamp = 4,
+    }, { silent = true })), "an unrelated trade event is stored")
+    assertTrue(Sync:BroadcastConsumablesEvent(freezeP, C.EventIndex(freezeP)[otherId]) == true, "a trade event does not wait for a different freeze")
+    allowSend = true
+    Sync:_FlushUnsentConsumablesEvents(freezeP)
+    local sawA, sawB = false, false
+    for i = 1, #sentTokens do
+        if sentTokens[i] == tokenA then sawA = true end
+        if sentTokens[i] == tokenB then sawB = true end
+    end
+    assertTrue(sawA and sawB, "both dropped trade freezes are retried")
+
+    SF.GetActiveProfile = savedGet
+    SF.lootHelperDB = savedDb
+    SF.PrintInfo = savedInfo
+    Sync.state = savedState
+    Sync.FindLocalProfileById = savedFind
+    Sync.RequestProfileSnapshot = savedRequest
+    SF.LootHelperComm = savedComm
+    Sync.IsSafeModeEnabled = savedSafe
+    RT.review = nil
+    RT.qtyOverrides = {}
+end
+checkFollowupRound()
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)

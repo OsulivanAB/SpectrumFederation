@@ -368,6 +368,9 @@ function SF:SetActiveProfileById(profileId)
             SF.Debug:Warn("DATABASE", "No loot profile found with ID '%s' to set as active", profileId)
         end
         SF.lootHelperDB.activeProfile = nil
+        if SF.ConsumablesRuntime and SF.ConsumablesRuntime.OnProfileChanged then
+            SF.ConsumablesRuntime:OnProfileChanged(nil)
+        end
         return false
     end
 
@@ -413,6 +416,10 @@ function SF:ClearActiveProfile()
     -- Clear both fields
     SF.lootHelperDB.activeProfileId = nil
     SF.lootHelperDB.activeProfile = nil
+
+    if SF.ConsumablesRuntime and SF.ConsumablesRuntime.OnProfileChanged then
+        SF.ConsumablesRuntime:OnProfileChanged(nil)
+    end
     
     if SF.Debug then
         SF.Debug:Info("DATABASE", "Cleared active profile")

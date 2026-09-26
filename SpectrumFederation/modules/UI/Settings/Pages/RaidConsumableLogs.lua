@@ -26,13 +26,47 @@ local function ItemName(itemId)
 	return nil
 end
 
+local historyOffset = 0
+local historyProfileId = nil
+
+local function ActiveProfile()
+	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
+end
+
+local function ProfileKey(profile)
+	if type(profile) ~= "table" then return nil end
+	if profile.GetProfileId then
+		local ok, id = pcall(profile.GetProfileId, profile)
+		if ok and type(id) == "string" then return id end
+	end
+	return profile._profileId
+end
+
+local function PageSize()
+	return (SF.Consumables and SF.Consumables.MAX_VISIBLE_HISTORY) or 200
+end
+
 local function LogItems()
 	local C = SF.Consumables
-	local profile = SF.GetActiveProfile and SF:GetActiveProfile() or nil
+	local profile = ActiveProfile()
 	if not C or not profile or not C.HistoryRows then
+		Page.historyTotal = 0
 		return {}
 	end
-	local rows = C.HistoryRows(profile, ItemName, C.MAX_VISIBLE_HISTORY or 200)
+	local profileId = ProfileKey(profile)
+	if profileId ~= historyProfileId then
+		historyProfileId = profileId
+		historyOffset = 0
+	end
+	local limit = PageSize()
+	local rows, total = C.HistoryRows(profile, ItemName, limit, historyOffset)
+	total = tonumber(total) or #rows
+	if historyOffset > 0 and historyOffset >= total then
+		historyOffset = 0
+		rows, total = C.HistoryRows(profile, ItemName, limit, 0)
+		total = tonumber(total) or #rows
+	end
+	Page.historyTotal = total
 	local items = {}
 	for i = 1, #rows do
 		items[i] = { text = rows[i].text, canRemove = false }
@@ -40,10 +74,22 @@ local function LogItems()
 	return items
 end
 
+local function ShiftHistory(delta)
+	local limit = PageSize()
+	local total = Page.historyTotal or 0
+	local nextOffset = historyOffset + (delta * limit)
+	if nextOffset < 0 then nextOffset = 0 end
+	if nextOffset > 0 and nextOffset >= total then return end
+	historyOffset = nextOffset
+	if Page.Refresh and Page.panel then
+		Page:Refresh(Page.panel)
+	end
+end
+
 local function HistoryHelp()
-	local limit = (SF.Consumables and SF.Consumables.MAX_VISIBLE_HISTORY) or 200
+	local limit = PageSize()
 	return string.format(
-		"Newest entries are first. This list shows the latest %d entries and stays read-only across every generation. Clearing the configuration keeps the full ledger.",
+		"Newest entries are first. Each page shows up to %d entries, including custody and configuration clears from every generation. Older pages stay available.",
 		limit
 	)
 end
@@ -56,6 +102,32 @@ local function Definition()
 				title = "Raid Consumable Logs",
 				items = {
 					{ type = "help", indent = "label", text = HistoryHelp() },
+					{
+						type = "button",
+						label = "Newer entries",
+						buttonText = "Newer",
+						width = 100,
+						enabled = function() return historyOffset > 0 end,
+						onClick = function()
+							ShiftHistory(-1)
+						end,
+					},
+					{
+						type = "button",
+						label = "Older entries",
+						buttonText = "Older",
+						width = 100,
+						enabled = function()
+							local C = SF.Consumables
+							local profile = ActiveProfile()
+							if not C or not profile or not C.HistoryRows then return false end
+							local _, total = C.HistoryRows(profile, ItemName, PageSize(), historyOffset)
+							return historyOffset + PageSize() < (tonumber(total) or 0)
+						end,
+						onClick = function()
+							ShiftHistory(1)
+						end,
+					},
 					{
 						type = "scrollList",
 						label = "History",

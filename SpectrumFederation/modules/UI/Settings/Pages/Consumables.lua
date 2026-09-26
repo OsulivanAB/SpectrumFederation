@@ -17,6 +17,26 @@ local function ActiveProfile()
 	return SF.lootHelperDB and SF.lootHelperDB.activeProfile or nil
 end
 
+local function ProfileKey(profile)
+	if type(profile) ~= "table" then return nil end
+	if profile.GetProfileId then
+		local ok, id = pcall(profile.GetProfileId, profile)
+		if ok and type(id) == "string" and id ~= "" then return id end
+	end
+	if type(profile._profileId) == "string" and profile._profileId ~= "" then
+		return profile._profileId
+	end
+	return nil
+end
+
+local function ProfileChanged(ctx, originId, action)
+	if ProfileKey(ActiveProfile()) == originId then return false end
+	if ctx and ctx.section and ctx.section.SetMessage then
+		ctx.section:SetMessage("The active profile changed, so " .. action .. " was not applied.", "error")
+	end
+	return true
+end
+
 local function Actor()
 	if SF.NameUtil and SF.NameUtil.GetSelfId then
 		return SF.NameUtil.GetSelfId()
@@ -281,7 +301,9 @@ local function Definition(panel)
 							local model = Model()
 							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 							if not (model and dialogs and dialogs.Confirm) then return end
+							local originId = ProfileKey(ActiveProfile())
 							dialogs:Confirm(model.clearWarning, "Clear", function()
+								if ProfileChanged(ctx, originId, "Clear") then return end
 								panel.__sfConsumableTab = nil
 								Commit(ctx, { name = "clear" })
 							end)
@@ -452,7 +474,9 @@ local function Definition(panel)
 								ctx.section:SetMessage("Copy is unavailable.", "error")
 								return
 							end
+							local originId = ProfileKey(ActiveProfile())
 							dialogs:Prompt("Name for the new profile. Only the current Raid Consumables configuration is copied.", "Copy", "", function(name)
+								if ProfileChanged(ctx, originId, "Copy") then return end
 								local ok, err = SF:DuplicateLootHelperProfile(name)
 								ctx.section:SetMessage(ok and "Profile created from the current Raid Consumables configuration." or (err or "Could not copy the configuration."), ok and "success" or "error")
 								if ctx.pageBuilder and ctx.pageBuilder.Refresh then

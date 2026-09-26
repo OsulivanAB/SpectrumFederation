@@ -544,7 +544,10 @@ function S.NeedsCatchUp(localDesc, remote)
     local remoteGen = tonumber(remote.generation)
     local remoteSeq = tonumber(remote.configSeq)
     local remoteEvents = tonumber(remote.eventCount)
-    if not remoteGen and not remoteSeq and not remoteEvents then
+    local remoteArchiveCount = tonumber(remote.archiveCount)
+    local remoteArchiveFingerprint = tonumber(remote.archiveFingerprint)
+    if not remoteGen and not remoteSeq and not remoteEvents
+        and not remoteArchiveCount and not remoteArchiveFingerprint then
         return false
     end
     if remoteGen and remoteGen > (localDesc.generation or 1) then return true end
@@ -553,6 +556,13 @@ function S.NeedsCatchUp(localDesc, remote)
     local remoteFingerprint = tonumber(remote.eventFingerprint)
     local localFingerprint = tonumber(localDesc.eventFingerprint)
     if remoteFingerprint and localFingerprint and remoteFingerprint ~= localFingerprint then
+        return true
+    end
+    if remoteArchiveCount and remoteArchiveCount ~= (tonumber(localDesc.archiveCount) or 0) then
+        return true
+    end
+    local localArchiveFingerprint = tonumber(localDesc.archiveFingerprint)
+    if remoteArchiveFingerprint and localArchiveFingerprint and remoteArchiveFingerprint ~= localArchiveFingerprint then
         return true
     end
     return false

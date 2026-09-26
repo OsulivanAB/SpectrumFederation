@@ -634,6 +634,9 @@ function Sync:HandleProfileSnapshot(sender, payload)
         end
         return
     end
+    if self._NoteConsumablesSnapshot then
+        self:_NoteConsumablesSnapshot(profile, fromCoordinator)
+    end
 
     self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0
 
