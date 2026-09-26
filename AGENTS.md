@@ -105,3 +105,45 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Promotion-scope classification or `classify_promotion_scope.py`: also run `python -m pytest tests/test_promotion_scope.py`
 - Version bump comparison or `check_version_bump.py`: also run `python -m pytest tests/test_check_version_bump.py`
 - Release classification or Wago publishing: also run `python -m pytest tests/test_publish_release.py`
+
+## Code Review Rules
+
+### Runtime stability
+
+For shipped World of Warcraft addon code, treat client freezes, severe UI
+stalls, runaway execution, event/callback/layout feedback loops, timer or
+`OnUpdate` work that fails to become idle, retry/message storms, and
+long-session resource growth as correctness defects.
+
+When reporting one of these issues, establish a credible triggering path,
+frequency/lifecycle, and failure to terminate, drain, or clean up. Recurring
+work is not inherently defective.
+
+### State and compatibility
+
+Changes to persistent, synchronized, or shared state must preserve installed
+user data and converge under realistic lifecycle behavior.
+
+Review SavedVariables/defaults/migrations/profile operations, asynchronous game
+data, sender authorization and identity, deduplication, ordering, stale state,
+duplicate events/messages, optional integration boundaries, and repeated UI
+lifecycle operations when relevant to the changed code.
+
+Prefer backward-compatible handling or an explicit migration when existing
+persisted data or external behavior would otherwise break.
+
+### Review discipline
+
+Report consequential, actionable defects rather than style preferences,
+cosmetic cleanup, speculative refactors, or unrelated pre-existing issues.
+
+Trace affected callers, consumers, shared state, persistence, communications,
+and lifecycle behavior far enough to substantiate a finding. Consolidate
+multiple symptoms with one root cause.
+
+Mechanical formatting and deterministic checks belong in CI. Passing tests do
+not prove WoW runtime correctness, and automated review must never claim that
+in-game testing occurred without human test evidence.
+
+For the detailed Codex review lifecycle and convergence procedure, follow
+`.github/codex-review-guidance.md`.
