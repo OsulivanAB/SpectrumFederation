@@ -214,7 +214,21 @@ function W.InterpretDeposit(intent)
     if tonumber(intent.observedTab) ~= tonumber(intent.configuredTab) then
         return 0, "wrong_tab"
     end
-    local appeared = math.max(0, FloorQty(intent.afterTab) - FloorQty(intent.beforeTab))
+    local appeared
+    if intent.placedSlots ~= nil then
+        appeared = 0
+        if type(intent.placedSlots) == "table" then
+            for i = 1, #intent.placedSlots do
+                local row = intent.placedSlots[i]
+                if type(row) == "table" then
+                    local gain = FloorQty(row.after) - FloorQty(row.before)
+                    if gain > 0 then appeared = appeared + gain end
+                end
+            end
+        end
+    else
+        appeared = math.max(0, FloorQty(intent.afterTab) - FloorQty(intent.beforeTab))
+    end
     local left = math.max(0, FloorQty(intent.beforeBags) - FloorQty(intent.afterBags))
     local actual = math.min(FloorQty(intent.intendedQty), appeared, left)
     return actual, nil
@@ -244,7 +258,12 @@ function W.InterpretWithdraw(intent)
     if tonumber(intent.observedTab) ~= tonumber(intent.configuredTab) then
         return 0
     end
-    local tabLoss = math.max(0, FloorQty(intent.beforeTab) - FloorQty(intent.afterTab))
+    local tabLoss
+    if intent.slotLoss ~= nil then
+        tabLoss = math.max(0, FloorQty(intent.slotLoss))
+    else
+        tabLoss = math.max(0, FloorQty(intent.beforeTab) - FloorQty(intent.afterTab))
+    end
     local bagGain = math.max(0, FloorQty(intent.afterBags) - FloorQty(intent.beforeBags))
     local qty = math.min(tabLoss, bagGain)
     if intent.intendedQty ~= nil then

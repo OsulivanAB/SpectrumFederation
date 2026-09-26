@@ -682,6 +682,12 @@ function Sync:BroadcastSessionStart()
         return
     end
     self:_MarkRosterAnnounced(self.state.sessionId)
+    if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
+        local announcedProfile = self:FindLocalProfileById(profileId)
+        if announcedProfile then
+            self:_FlushUnsentConsumablesEvents(announcedProfile)
+        end
+    end
 
     -- Start coordinator heartbeat sender (ticker)
     self:EnsureHeartbeatSender("BroadcastSessionStart")

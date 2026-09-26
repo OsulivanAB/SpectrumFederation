@@ -1261,6 +1261,12 @@ function Sync:ReannounceSession()
     -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
     self.state._sessionAnnounced = self.state.sessionId
     self:_MarkRosterAnnounced(self.state.sessionId)
+    if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
+        local announcedProfile = self:FindLocalProfileById(profileId)
+        if announcedProfile then
+            self:_FlushUnsentConsumablesEvents(announcedProfile)
+        end
+    end
 
     -- Start/re-ensure coordinator heartbeat sender (ticker)
     self:EnsureHeartbeatSender("ReannounceSession")

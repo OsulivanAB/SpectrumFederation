@@ -277,6 +277,16 @@ local function QuotaBucket(event)
     return EventQuotaKey(event) or ANON_QUOTA
 end
 
+local function ArchiveQuotaExempt(event)
+    return type(event) == "table" and event.type == C.EVENT.RESET
+end
+
+local function NoteArchiveQuota(counts, event)
+    if ArchiveQuotaExempt(event) then return end
+    local key = QuotaBucket(event)
+    counts[key] = (counts[key] or 0) + 1
+end
+
 local function NoteQuota(counts, event)
     if type(event) ~= "table" then return end
     local gen = tonumber(event.generation)
@@ -355,8 +365,7 @@ local function RebuildIndex(profile)
                 index[archived.id] = archived
                 local seq = AdoptedEventSeq(archived.id)
                 if seq and seq > maxSeq then maxSeq = seq end
-                local key = QuotaBucket(archived)
-                archiveCounts[key] = (archiveCounts[key] or 0) + 1
+                NoteArchiveQuota(archiveCounts, archived)
             end
         end
     end
@@ -446,8 +455,7 @@ local function TrimArchive(profile)
     for i = 1, #kept do
         local archived = kept[i]
         if type(archived) == "table" then
-            local key = QuotaBucket(archived)
-            counts[key] = (counts[key] or 0) + 1
+            NoteArchiveQuota(counts, archived)
         end
     end
     EventIds(profile).archiveCounts = counts
@@ -459,11 +467,29 @@ local function ShelveEvents(profile, shouldArchive)
     local archive = ArchiveList(profile)
     local moved = false
     local events = profile._consumableEvents
+    local bound = EventIds(profile)
+    local counts = bound.archiveCounts
+    if type(counts) ~= "table" then
+        counts = {}
+        bound.archiveCounts = counts
+    end
     for i = 1, #events do
         local event = events[i]
         local eventGen = type(event) == "table" and tonumber(event.generation) or nil
         if shouldArchive(eventGen) then
-            archive[#archive + 1] = event
+            local archiveIt = true
+            if type(event) == "table" and not ArchiveQuotaExempt(event) then
+                local key = QuotaBucket(event)
+                local used = counts[key] or 0
+                if used >= C.MAX_EVENTS_PER_ACTOR then
+                    archiveIt = false
+                else
+                    counts[key] = used + 1
+                end
+            end
+            if archiveIt then
+                archive[#archive + 1] = event
+            end
             moved = true
         else
             kept[#kept + 1] = event
@@ -964,8 +990,9 @@ function C.AppendArchivedEvent(profile, event)
     end
     local record = CopyEvent(event)
     local quotaKey = QuotaBucket(record)
+    local exempt = ArchiveQuotaExempt(record)
     bound.archiveCounts = bound.archiveCounts or {}
-    if (bound.archiveCounts[quotaKey] or 0) >= C.MAX_EVENTS_PER_ACTOR then
+    if not exempt and (bound.archiveCounts[quotaKey] or 0) >= C.MAX_EVENTS_PER_ACTOR then
         return false, "quota"
     end
     local archive = ArchiveList(profile)
@@ -975,7 +1002,9 @@ function C.AppendArchivedEvent(profile, event)
         local cfg = profile._consumables
         cfg.archiveCount = #profile._consumableEventArchive
         cfg.archiveFingerprint = MixFingerprint(cfg.archiveFingerprint, record.id, record.order)
-        bound.archiveCounts[quotaKey] = (bound.archiveCounts[quotaKey] or 0) + 1
+        if not exempt then
+            bound.archiveCounts[quotaKey] = (bound.archiveCounts[quotaKey] or 0) + 1
+        end
     end
     return true, "archived"
 end

@@ -849,6 +849,7 @@ Sync.state = {
     active = true,
     isCoordinator = false,
     coordinator = "Coord-Realm",
+    peers = { ["Coord-Realm"] = { consumablesCapable = true } },
     sessionId = "session",
     profileId = safeP._profileId,
 }
@@ -1501,6 +1502,7 @@ local function checkCoordinatorFollowups()
         active = true,
         isCoordinator = false,
         coordinator = admin,
+        peers = { [admin] = { consumablesCapable = true } },
         sessionId = "busy-session",
         profileId = busyP._profileId,
     }
@@ -1691,6 +1693,7 @@ local function checkReviewRound()
         active = true,
         isCoordinator = false,
         coordinator = admin,
+        peers = { [admin] = { consumablesCapable = true } },
         sessionId = "freeze-retry",
         profileId = freezeP._profileId,
     }
@@ -1945,6 +1948,8 @@ local function checkConvergenceRound()
     RT.TabItemCounts = function()
         return { [aqirite] = 15, [aqiriteRank2] = 15 }
     end
+    GetGuildBankItemLink = function() return nil end
+    GetGuildBankItemInfo = function() return nil, 0 end
     RT:FinishWithdraw(false)
     assertEq(commits, 2, "both queued withdrawals commit")
     assertEq(RT.withdrawIntent, nil, "a finished queue clears the active withdrawal")
@@ -2056,6 +2061,7 @@ local function checkConvergenceRound()
         active = true,
         isCoordinator = false,
         coordinator = admin,
+        peers = { [admin] = { consumablesCapable = true } },
         sessionId = "token-session",
         profileId = tokenP._profileId,
     }
@@ -2471,6 +2477,7 @@ local function checkFollowupRound()
         active = true,
         isCoordinator = false,
         coordinator = admin,
+        peers = { [admin] = { consumablesCapable = true } },
         sessionId = "freeze-queue",
         profileId = freezeP._profileId,
     }
@@ -2899,6 +2906,8 @@ local function checkCodexRound()
     RT.TabItemCounts = function()
         return { [aqirite] = 15 }
     end
+    GetGuildBankItemLink = function() return nil end
+    GetGuildBankItemInfo = function() return nil, 0 end
     RT:FinishWithdraw(false)
     assertEq(captured and captured.token, withdrawToken, "the withdrawal still commits on its original token")
     assertEq(captured.events[1].withdrawToken, withdrawToken, "the receipt names the frozen withdrawal")
@@ -2948,6 +2957,184 @@ local function checkCodexRound()
     GetGuildBankItemInfo = savedInfo
 end
 checkCodexRound()
+
+local function checkShelveAndCapability()
+    local shelveP = profile("shelve-quota", admin)
+    local function donate(gen, n, who)
+        return {
+            id = string.format("ce:shelve:%s:%d:%d", who, gen, n),
+            type = C.EVENT.DONATION,
+            actor = who,
+            writer = who,
+            itemId = aqirite,
+            quantity = 1,
+            generation = gen,
+            timestamp = n,
+        }
+    end
+    local function archiveCounts()
+        local donations, resets = 0, 0
+        local archive = shelveP._consumableEventArchive or {}
+        for i = 1, #archive do
+            local ev = archive[i]
+            if type(ev) == "table" and ev.type == C.EVENT.RESET then
+                resets = resets + 1
+            elseif type(ev) == "table" and ev.type == C.EVENT.DONATION and ev.writer == admin then
+                donations = donations + 1
+            end
+        end
+        return donations, resets
+    end
+    for i = 1, C.MAX_EVENTS_PER_ACTOR do
+        assertTrue(select(1, C.AppendEvent(shelveP, donate(1, i, admin), { silent = true })), "shelve quota fills the live ledger")
+    end
+    assertTrue(select(1, C.Clear(shelveP, admin, { asAdmin = true })), "the first clear archives within the writer budget")
+    assertEq(#shelveP._consumableEvents, 0, "the first clear leaves the live ledger empty")
+    local donations, resets = archiveCounts()
+    assertEq(donations, C.MAX_EVENTS_PER_ACTOR, "the first clear archives that writer's donations")
+    assertEq(resets, 1, "the first clear archives the reset")
+    local generation = shelveP._consumables.generation
+    for i = 1, C.MAX_EVENTS_PER_ACTOR do
+        assertTrue(select(1, C.AppendEvent(shelveP, donate(generation, i, admin), { silent = true })), "the next generation can fill the live ledger again")
+    end
+    assertTrue(select(1, C.Clear(shelveP, admin, { asAdmin = true })), "a second clear still succeeds")
+    assertEq(#shelveP._consumableEvents, 0, "the second clear leaves the live ledger empty")
+    donations, resets = archiveCounts()
+    assertEq(donations, C.MAX_EVENTS_PER_ACTOR, "a second clear does not archive more of that writer's donations")
+    assertEq(resets, 2, "each clear still archives its reset")
+    local sawReset = false
+    local rows = C.HistoryRows(shelveP)
+    for i = 1, #rows do
+        if rows[i].text:find("cleared the Raid Consumables configuration", 1, true) then sawReset = true end
+    end
+    assertTrue(sawReset, "the archived reset stays in the log")
+    assertTrue(select(1, C.AppendEvent(shelveP, donate(1, 1, "Other-Realm"), { silent = true })), "another writer can still archive an older donation")
+    assertEq(select(1, W.InterpretDeposit({
+        guildOk = true, configuredTab = 2, observedTab = 2,
+        intendedQty = 20,
+        beforeTab = 100, afterTab = 100,
+        beforeBags = 20, afterBags = 0,
+        placedSlots = { { before = 10, after = 30 } },
+    })), 20, "a deposit records the slots this client filled")
+    assertEq(W.InterpretWithdraw({
+        localPickup = true, configuredTab = 2, observedTab = 2, intendedQty = 20,
+        beforeTab = 50, afterTab = 70,
+        beforeBags = 0, afterBags = 20,
+        slotLoss = 20,
+    }), 20, "a withdrawal records the slot this client emptied")
+
+    local capP = profile("incapable-coord", admin)
+    local savedState = Sync.state
+    local savedComm = SF.LootHelperComm
+    local savedSafe = Sync.IsSafeModeEnabled
+    local savedMsg = Sync.MSG
+    local sent = 0
+    Sync.MSG = {
+        CONSUMABLES_OP = "CONSUMABLES_OP",
+        CONSUMABLES_EVENT = "CONSUMABLES_EVENT",
+        CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE",
+    }
+    Sync.IsSafeModeEnabled = function() return false end
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "Old-Realm",
+        sessionId = "old-session",
+        profileId = capP._profileId,
+        peers = { ["Old-Realm"] = {} },
+    }
+    SF.LootHelperComm = {
+        Send = function()
+            sent = sent + 1
+            return true
+        end,
+    }
+    local blockedOk, blockedErr = Sync:CommitConsumablesOp(capP, { name = "set_bank_tab", bankTab = 2 }, admin, { asAdmin = true })
+    assertFalse(blockedOk, "an incapable coordinator does not accept a config edit")
+    assertTrue(type(blockedErr) == "string" and blockedErr:find("coordinator") ~= nil, "the player is told the coordinator cannot record raid supplies")
+    assertEq(sent, 0, "the config edit is not whispered")
+    assertTrue(Sync:CommitConsumablesEvents(capP, "guild-" .. admin .. "-1-1", {
+        {
+            type = C.EVENT.DONATION,
+            actor = admin,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+        },
+    }), "the local ledger still records the event")
+    assertEq(sent, 0, "the event is not whispered to an incapable coordinator")
+    assertTrue(type(capP._consumablesUnsent) == "table" and capP._consumablesUnsent[1] ~= nil, "the event stays queued")
+    Sync.state.peers["Old-Realm"].consumablesCapable = true
+    Sync:_FlushUnsentConsumablesEvents(capP)
+    assertEq(sent, 1, "the queued event is sent once the coordinator is capable")
+    assertEq(capP._consumablesUnsent[1], nil, "a delivered event leaves the queue")
+
+    local announceP = profile("announce-flush", admin)
+    local announceId = "ce:announce:" .. admin .. ":1"
+    assertTrue(select(1, C.AppendEvent(announceP, {
+        id = announceId,
+        type = C.EVENT.DONATION,
+        actor = admin,
+        itemId = aqirite,
+        quantity = 1,
+        generation = 1,
+    }, { silent = true })), "an announcement fixture can store one donation")
+    announceP._consumablesUnsent = { announceId }
+    sent = 0
+    local savedFind = Sync.FindLocalProfileById
+    Sync.FindLocalProfileById = function(_, id)
+        if id == announceP._profileId then return announceP end
+        return nil
+    end
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "new-session",
+        profileId = announceP._profileId,
+    }
+    Sync:_AttachConsumablesDescriptor({ sessionId = "new-session" }, announceP._profileId)
+    assertEq(sent, 0, "building a session announcement does not send queued raid supplies")
+    assertEq(announceP._consumablesUnsent[1], announceId, "the queued event stays queued until the session is announced")
+    Sync.state._sessionAnnounced = "new-session"
+    Sync:_FlushUnsentConsumablesEvents(announceP)
+    assertEq(sent, 1, "queued raid supplies send after the session announcement is accepted")
+    Sync.FindLocalProfileById = savedFind
+    Sync.state = savedState
+    SF.LootHelperComm = savedComm
+    Sync.IsSafeModeEnabled = savedSafe
+    Sync.MSG = savedMsg
+
+    local savedReview = RT.review
+    local savedButtons = RT.reviewButtons
+    local savedReminder = RT.reminderShown
+    local savedMap = RT.groupMap
+    RT.review = { IsShown = function() return false end }
+    RT.reviewButtons = { { recipient = vann, IsShown = function() return true end } }
+    RT.reminderShown = true
+    RT.groupMap = {}
+    assertFalse(RT:ShouldPoll(), "a hidden review does not keep range polling alive")
+    RT.review = { IsShown = function() return true end }
+    assertTrue(RT:ShouldPoll(), "an open review polls while the selected crafter is out of range")
+    RT.review = savedReview
+    RT.reviewButtons = savedButtons
+    RT.reminderShown = savedReminder
+    RT.groupMap = savedMap
+
+    local savedSpell = C_Spell
+    local savedBook = C_SpellBook
+    local savedEnum = Enum
+    C_Spell = { GetSpellInfo = function() return { name = "Mobile Banking" } end }
+    C_SpellBook = { IsSpellInSpellBook = function() return false end }
+    Enum = { SpellBookSpellBank = { Player = 1 } }
+    assertEq(RT:MobileSpell(), nil, "an unknown mobile banking spell does not expose a secure name")
+    C_SpellBook = { IsSpellInSpellBook = function() return true end }
+    assertEq(RT:MobileSpell(), "Mobile Banking", "a known mobile banking spell uses its spell name")
+    C_Spell = savedSpell
+    C_SpellBook = savedBook
+    Enum = savedEnum
+end
+checkShelveAndCapability()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

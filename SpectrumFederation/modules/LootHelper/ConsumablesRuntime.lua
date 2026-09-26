@@ -8,6 +8,7 @@ local Runtime = SF.ConsumablesRuntime
 local MAX_TRADE_SLOTS = 6
 local MAX_DEPOSIT_PLACES = 6
 local MAX_WITHDRAW_INTENTS = 8
+local MAX_WITHDRAW_SLOTS = 8
 local MAX_GUILD_BANK_SLOTS = 98
 local REMINDER_TEXT = "Raid supplies available"
 
@@ -283,6 +284,16 @@ end
 local MOBILE_BANKING_SPELL_ID = 83958
 
 function Runtime:MobileSpell()
+    local known = nil
+    if C_SpellBook and C_SpellBook.IsSpellInSpellBook and Enum and Enum.SpellBookSpellBank
+        and Enum.SpellBookSpellBank.Player ~= nil then
+        known = C_SpellBook.IsSpellInSpellBook(MOBILE_BANKING_SPELL_ID, Enum.SpellBookSpellBank.Player) and true or false
+    elseif type(IsPlayerSpell) == "function" then
+        known = IsPlayerSpell(MOBILE_BANKING_SPELL_ID) and true or false
+    elseif type(IsSpellKnown) == "function" then
+        known = IsSpellKnown(MOBILE_BANKING_SPELL_ID) and true or false
+    end
+    if known == false then return nil end
     if C_Spell and C_Spell.GetSpellInfo then
         local info = C_Spell.GetSpellInfo(MOBILE_BANKING_SPELL_ID)
         if type(info) == "table" and type(info.name) == "string" and info.name ~= "" then
@@ -339,6 +350,20 @@ function Runtime:TabItemCounts(tab)
         end
     end
     return counts
+end
+
+function Runtime:SlotItemCount(tab, slot, itemId)
+    tab = tonumber(tab)
+    slot = tonumber(slot)
+    itemId = tonumber(itemId)
+    if not tab or not slot or not itemId or not GetGuildBankItemLink then return 0 end
+    local link = GetGuildBankItemLink(tab, slot)
+    local C = SF.Consumables
+    local slotItem = link and C and C.ItemIdFromText and C.ItemIdFromText(link) or nil
+    if slotItem ~= itemId then return 0 end
+    if not GetGuildBankItemInfo then return 1 end
+    local _, stack = GetGuildBankItemInfo(tab, slot)
+    return tonumber(stack) or 1
 end
 
 function Runtime:ItemStackLimit(itemId)
@@ -586,12 +611,15 @@ function Runtime:ShouldPoll()
     if not Routing then return false end
     local selected = nil
     local outOfRange = false
-    for i = 1, #(self.reviewButtons or {}) do
-        local button = self.reviewButtons[i]
-        if button.recipient and button.IsShown and button:IsShown() then
-            selected = button.recipient
-            if not self:RecipientInRange(button.recipient) then
-                outOfRange = true
+    local reviewShown = self.review and self.review.IsShown and self.review:IsShown()
+    if reviewShown then
+        for i = 1, #(self.reviewButtons or {}) do
+            local button = self.reviewButtons[i]
+            if button.recipient and button.IsShown and button:IsShown() then
+                selected = button.recipient
+                if not self:RecipientInRange(button.recipient) then
+                    outOfRange = true
+                end
             end
         end
     end
@@ -1129,6 +1157,7 @@ function Runtime:BeginDeposit(line, collected)
     local beforeBags = have
     local remaining = line.quantity
     local placed = 0
+    local places = {}
     local stacks = (self.bagStacks and self.bagStacks[line.itemId]) or {}
     local targets = self:DepositTargets(tab, line.itemId, MAX_DEPOSIT_PLACES)
     self.placingDeposit = true
@@ -1147,6 +1176,10 @@ function Runtime:BeginDeposit(line, collected)
         elseif container.PickupContainerItem then
             container.PickupContainerItem(stack.bag, stack.slot)
         end
+        places[#places + 1] = {
+            slot = target.slot,
+            before = self:SlotItemCount(tab, target.slot, line.itemId),
+        }
         PickupGuildBankItem(tab, target.slot)
         remaining = remaining - take
         placed = placed + 1
@@ -1169,6 +1202,7 @@ function Runtime:BeginDeposit(line, collected)
         intended = line.quantity - remaining,
         beforeTab = beforeTab,
         beforeBags = beforeBags,
+        places = places,
         bestActual = 0,
         token = self:NextToken("deposit"),
         profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId,
@@ -1203,6 +1237,15 @@ function Runtime:FinishDeposit(fromTimer)
     local guild = self:CurrentGuild()
     local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
     local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
+    local placedSlots = intent.places
+    if type(placedSlots) == "table" then
+        for i = 1, #placedSlots do
+            local row = placedSlots[i]
+            if type(row) == "table" then
+                row.after = self:SlotItemCount(intent.tab, row.slot, intent.itemId)
+            end
+        end
+    end
     local actual, reason = Workflow.InterpretDeposit({
         guildOk = guild and intent.guildGuid and guild.guid == intent.guildGuid,
         configuredTab = intent.tab,
@@ -1212,6 +1255,7 @@ function Runtime:FinishDeposit(fromTimer)
         afterTab = afterTab,
         beforeBags = intent.beforeBags,
         afterBags = afterBags,
+        placedSlots = placedSlots,
     })
     if reason == "wrong_guild" or reason == "wrong_tab" then
         self.depositIntent = nil
@@ -1353,6 +1397,14 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
         local existing = queue[i]
         if existing.itemId == itemId and existing.tab == tab then
             existing.intended = (tonumber(existing.intended) or 0) + count
+            if slotStillOccupied then
+                if type(existing.slots) ~= "table" then
+                    existing.slots = {}
+                end
+                if #existing.slots < MAX_WITHDRAW_SLOTS then
+                    existing.slots[#existing.slots + 1] = { slot = slot, before = count }
+                end
+            end
             self.withdrawIntent = queue[1]
             self:ArmWithdrawTimer()
             return
@@ -1368,6 +1420,7 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
         intended = count,
         beforeTab = beforeTab,
         beforeBags = beforeBags,
+        slots = slotStillOccupied and { { slot = slot, before = count } } or nil,
         generation = cfg.generation,
         epoch = assignment and assignment.epoch or 0,
         assigned = C.CrafterHasItem(profile, selfId, itemId) == true,
@@ -1445,6 +1498,20 @@ function Runtime:FinishWithdraw(fromTimer)
         if profile and guildOk then
             local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
             local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
+            local slotLoss = nil
+            if type(intent.slots) == "table" then
+                slotLoss = 0
+                for slotIndex = 1, #intent.slots do
+                    local row = intent.slots[slotIndex]
+                    if type(row) == "table" then
+                        local before = tonumber(row.before) or 0
+                        local after = self:SlotItemCount(intent.tab, row.slot, intent.itemId)
+                        if before > after then
+                            slotLoss = slotLoss + (before - after)
+                        end
+                    end
+                end
+            end
             local qty = Workflow.InterpretWithdraw({
                 localPickup = true,
                 guildOk = true,
@@ -1455,6 +1522,7 @@ function Runtime:FinishWithdraw(fromTimer)
                 afterTab = afterTab,
                 beforeBags = intent.beforeBags,
                 afterBags = afterBags,
+                slotLoss = slotLoss,
             })
             if qty <= 0 then
                 if fromTimer and self:WithdrawStillOnCursor(intent) then

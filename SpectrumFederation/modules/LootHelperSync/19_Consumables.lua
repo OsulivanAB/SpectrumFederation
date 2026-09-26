@@ -35,6 +35,16 @@ local function SessionFor(profile)
     return ProfileIdOf(profile) == Sync.state.profileId
 end
 
+function Sync:_ConsumablesCoordinatorAccepts()
+    if not (self.state and self.state.active) then return true end
+    if self.state.isCoordinator then return true end
+    local coordinator = self.state.coordinator
+    if type(coordinator) ~= "string" or coordinator == "" then return false end
+    local peers = self.state.peers
+    local peer = type(peers) == "table" and peers[coordinator] or nil
+    return type(peer) == "table" and peer.consumablesCapable == true
+end
+
 local MAX_CAPABLE_PEERS = 40
 local MAX_EVENT_FLUSH = 8
 local MAX_EVENT_SCAN = 64
@@ -195,6 +205,9 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     payload.consumablesEventFingerprint = desc.eventFingerprint
     payload.consumablesArchiveCount = desc.archiveCount
     payload.consumablesArchiveFingerprint = desc.archiveFingerprint
+    if self.state and self.state.isCoordinator and self.state._sessionAnnounced ~= self.state.sessionId then
+        return
+    end
     self:_FlushUnsentConsumablesEvents(profile)
 end
 
@@ -444,6 +457,7 @@ function Sync:_FlushPendingTradeFreeze(profile)
             if not SF.LootHelperComm or not self.MSG then return end
             local coordinator = self.state.coordinator
             if type(coordinator) ~= "string" or coordinator == "" then return end
+            if not self:_ConsumablesCoordinatorAccepts() then return end
             local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, FreezeWirePayload(profile, grant), "WHISPER", coordinator, "NORMAL")
             if sent == false then
                 return
@@ -546,6 +560,9 @@ function Sync:CommitConsumablesOp(profile, op, actor, opts)
     local coordinator = self.state.coordinator
     if type(coordinator) ~= "string" or coordinator == "" then
         return false, "No session coordinator."
+    end
+    if not self:_ConsumablesCoordinatorAccepts() then
+        return false, "The session coordinator does not support raid supplies yet."
     end
     local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OP, {
         sessionId = self.state.sessionId,
@@ -670,6 +687,10 @@ function Sync:BroadcastConsumablesEvent(profile, event)
     if not (self.state and self.state.isCoordinator) then
         local coordinator = self.state and self.state.coordinator
         if type(coordinator) ~= "string" or coordinator == "" then
+            self:_QueueUnsentConsumablesEvent(profile, event.id)
+            return false
+        end
+        if not self:_ConsumablesCoordinatorAccepts() then
             self:_QueueUnsentConsumablesEvent(profile, event.id)
             return false
         end
@@ -807,6 +828,9 @@ function Sync:PublishTradeFreeze(profile, frozen)
     if type(coordinator) ~= "string" or coordinator == "" then
         return RememberTradeFreeze(profile, grant, false)
     end
+    if not self:_ConsumablesCoordinatorAccepts() then
+        return RememberTradeFreeze(profile, grant, false)
+    end
     local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, FreezeWirePayload(profile, grant), "WHISPER", coordinator, "NORMAL")
     return RememberTradeFreeze(profile, grant, sent)
 end
@@ -830,6 +854,9 @@ function Sync:PublishWithdrawGrant(profile, grant)
     end
     local coordinator = self.state.coordinator
     if type(coordinator) ~= "string" or coordinator == "" then
+        return RememberTradeFreeze(profile, grant, false)
+    end
+    if not self:_ConsumablesCoordinatorAccepts() then
         return RememberTradeFreeze(profile, grant, false)
     end
     local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, FreezeWirePayload(profile, grant), "WHISPER", coordinator, "NORMAL")
