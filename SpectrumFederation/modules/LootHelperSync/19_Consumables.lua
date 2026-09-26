@@ -146,6 +146,7 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         end
         self:_QueueUnsequencedConsumablesEvents(profile)
     end
+    self:_QueueAuthoredOrderedConsumablesEvents(profile, remote.eventCount)
     self:_FlushUnsentConsumablesEvents(profile)
     if S.CoordinatorConfigDiffers and S.CoordinatorConfigDiffers(localDesc, remote)
         and profile._consumablesConfigCatchUpSession ~= self.state.sessionId then
@@ -205,6 +206,37 @@ function Sync:_QueueUnsentConsumablesEvent(profile, eventId)
         if queue[i] == eventId then return end
     end
     queue[#queue + 1] = eventId
+end
+
+function Sync:_QueueAuthoredOrderedConsumablesEvents(profile, remoteEventCount)
+    if self.state and self.state.isCoordinator then return end
+    local events = profile and profile._consumableEvents
+    if type(events) ~= "table" then return end
+    if #events <= (tonumber(remoteEventCount) or 0) then return end
+    local S = Rules()
+    local who = self._SelfId and self:_SelfId() or nil
+    if not S or type(who) ~= "string" or who == "" then return end
+    local key = tostring(self.state and self.state.sessionId) .. ":" .. tostring(self.state and self.state.coordinator)
+    if profile._consumablesOrderedResendKey ~= key then
+        profile._consumablesOrderedResendKey = key
+        profile._consumablesOrderedResendCursor = 1
+    end
+    local index = profile._consumablesOrderedResendCursor
+    if type(index) ~= "number" or index < 1 then index = 1 end
+    if index > #events then return end
+    local queued = 0
+    local scanned = 0
+    while index <= #events and queued < MAX_EVENT_FLUSH and scanned < MAX_EVENT_SCAN do
+        local event = events[index]
+        if type(event) == "table" and type(event.id) == "string"
+            and tonumber(event.order) and S.RemoteEventIdOk(event.id, who) then
+            self:_QueueUnsentConsumablesEvent(profile, event.id)
+            queued = queued + 1
+        end
+        index = index + 1
+        scanned = scanned + 1
+    end
+    profile._consumablesOrderedResendCursor = index
 end
 
 function Sync:_QueueUnsequencedConsumablesEvents(profile)

@@ -22,6 +22,7 @@ C.ACTION = {
 
 C.MAX_ASSIGNMENT_PAIRS = 256
 C.MAX_LEDGER_EVENTS = 4096
+C.MAX_ARCHIVED_EVENTS = 4096
 C.MAX_VISIBLE_HISTORY = 200
 
 C.RESOLVE_REASONS = {
@@ -202,6 +203,15 @@ local function RebuildIndex(profile)
             fingerprint = MixFingerprint(fingerprint, event.id)
         end
     end
+    local archive = profile._consumableEventArchive
+    if type(archive) == "table" then
+        for i = 1, #archive do
+            local archived = archive[i]
+            if type(archived) == "table" and type(archived.id) == "string" then
+                index[archived.id] = archived
+            end
+        end
+    end
     profile._consumableEventIds = index
     profile._consumableIndexCount = #events
     local cfg = profile._consumables
@@ -247,6 +257,48 @@ function C.Ensure(profile)
     end
     indexBound[profile] = true
     return cfg
+end
+
+local function ArchiveList(profile)
+    if type(profile._consumableEventArchive) ~= "table" then
+        profile._consumableEventArchive = {}
+    end
+    return profile._consumableEventArchive
+end
+
+local function TrimArchive(profile)
+    local archive = ArchiveList(profile)
+    local overflow = #archive - C.MAX_ARCHIVED_EVENTS
+    if overflow <= 0 then return end
+    local kept = {}
+    for i = overflow + 1, #archive do
+        kept[#kept + 1] = archive[i]
+    end
+    profile._consumableEventArchive = kept
+end
+
+function C.ShelvePriorGenerations(profile)
+    local cfg = C.Ensure(profile)
+    local generation = tonumber(cfg.generation) or 1
+    local kept = {}
+    local archive = ArchiveList(profile)
+    local moved = false
+    local events = profile._consumableEvents
+    for i = 1, #events do
+        local event = events[i]
+        local eventGen = type(event) == "table" and tonumber(event.generation) or nil
+        if eventGen and eventGen < generation then
+            archive[#archive + 1] = event
+            moved = true
+        else
+            kept[#kept + 1] = event
+        end
+    end
+    if not moved then return false end
+    profile._consumableEvents = kept
+    TrimArchive(profile)
+    RebuildIndex(profile)
+    return true
 end
 
 function C.Descriptor(profile)
@@ -530,6 +582,25 @@ local function CopyEvent(event)
     }
 end
 
+function C.AppendArchivedEvent(profile, event)
+    C.Ensure(profile)
+    if type(event) ~= "table" or type(event.type) ~= "string" then
+        return false, "Invalid accounting event."
+    end
+    if type(event.id) ~= "string" or event.id == "" then
+        event.id = C.NextEventId(profile, event.actor)
+    end
+    if profile._consumableEventIds[event.id] then
+        return true, "duplicate"
+    end
+    local record = CopyEvent(event)
+    local archive = ArchiveList(profile)
+    archive[#archive + 1] = record
+    profile._consumableEventIds[record.id] = record
+    TrimArchive(profile)
+    return true, "archived"
+end
+
 function C.StampOrder(profile, event)
     if type(event) ~= "table" then return nil end
     local cfg = C.Ensure(profile)
@@ -580,7 +651,15 @@ function C.AppendEvent(profile, event, opts)
         return true, "duplicate"
     end
     if #profile._consumableEvents >= C.MAX_LEDGER_EVENTS then
-        return false, "full"
+        local eventGen = tonumber(event.generation)
+        local currentGen = tonumber(profile._consumables.generation) or 1
+        if eventGen and eventGen < currentGen then
+            return C.AppendArchivedEvent(profile, event)
+        end
+        local madeRoom = C.ShelvePriorGenerations(profile) and #profile._consumableEvents < C.MAX_LEDGER_EVENTS
+        if not madeRoom then
+            return false, "full"
+        end
     end
     event.timestamp = tonumber(event.timestamp) or Now()
     event.generation = tonumber(event.generation) or C.Ensure(profile).generation
@@ -621,13 +700,20 @@ function C.Clear(profile, actor, opts)
     end
     local cfg = C.Ensure(profile)
     local generation = cfg.generation
-    C.AppendEvent(profile, {
+    local reset = {
         type = C.EVENT.RESET,
         generation = generation,
         actor = actor,
         timestamp = Now(),
-    }, { silent = true })
+    }
+    local resetOk = C.AppendEvent(profile, reset, { silent = true })
     cfg.generation = generation + 1
+    if not resetOk then
+        C.ShelvePriorGenerations(profile)
+        if not (profile._consumableEventIds and profile._consumableEventIds[reset.id]) then
+            C.AppendArchivedEvent(profile, reset)
+        end
+    end
     cfg.guild = nil
     cfg.bankTab = nil
     cfg.crafters = {}
@@ -868,8 +954,14 @@ end
 function C.HistoryRows(profile, nameForItem, limit)
     C.Ensure(profile)
     local ordered = {}
+    local archive = profile._consumableEventArchive
+    if type(archive) == "table" then
+        for i = 1, #archive do
+            ordered[#ordered + 1] = archive[i]
+        end
+    end
     for i = 1, #profile._consumableEvents do
-        ordered[i] = profile._consumableEvents[i]
+        ordered[#ordered + 1] = profile._consumableEvents[i]
     end
     table.sort(ordered, function(a, b) return EventLess(b, a) end)
     local count = #ordered
@@ -931,8 +1023,14 @@ function C.ExportSnapshot(profile, opts)
     local events = nil
     if not opts.omitEvents then
         events = {}
+        local archive = profile._consumableEventArchive
+        if type(archive) == "table" then
+            for i = 1, #archive do
+                events[#events + 1] = CopyEvent(archive[i])
+            end
+        end
         for i = 1, #profile._consumableEvents do
-            events[i] = CopyEvent(profile._consumableEvents[i])
+            events[#events + 1] = CopyEvent(profile._consumableEvents[i])
         end
     end
     return {
@@ -1049,6 +1147,7 @@ function C.CopyConfiguration(source, dest)
     local src = C.Ensure(source)
     C.Ensure(dest)
     dest._consumableEvents = {}
+    dest._consumableEventArchive = {}
     dest._consumableEventIds = {}
     dest._consumableIndexCount = 0
     local assignments = {}

@@ -933,6 +933,93 @@ local mobile = RT:EnsureMobileButton()
 assertTrue(mobile ~= nil, "the banking button is created once combat ends")
 assertEq(#secureTemplates, 1, "the secure button is created only outside combat")
 
+local archiveCap = C.MAX_LEDGER_EVENTS
+C.MAX_LEDGER_EVENTS = 1
+local archiveP = profile("archive", admin)
+assertTrue(select(1, C.AppendEvent(archiveP, {
+    id = "ce:archive:old",
+    type = C.EVENT.DONATION,
+    actor = admin,
+    itemId = aqirite,
+    quantity = 1,
+    generation = 1,
+    timestamp = 1,
+}, { silent = true })), "the live ledger stores the current-generation event")
+assertTrue(select(1, C.Clear(archiveP, admin, { asAdmin = true })), "clear still succeeds when the live ledger is full")
+assertEq(archiveP._consumables.generation, 2, "clear advances the generation when history is archived")
+assertTrue(select(1, C.AppendEvent(archiveP, {
+    id = "ce:archive:new",
+    type = C.EVENT.DONATION,
+    actor = admin,
+    itemId = aqirite,
+    quantity = 2,
+    generation = 2,
+    timestamp = 2,
+}, { silent = true })), "a later generation can record after prior history is archived")
+assertEq(#archiveP._consumableEvents, 1, "the live ledger keeps only the current generation")
+local sawClear, sawNew = false, false
+local archivedRows = C.HistoryRows(archiveP)
+for i = 1, #archivedRows do
+    if archivedRows[i].text:find("cleared the Raid Consumables configuration") then sawClear = true end
+    if archivedRows[i].text:find("donated 2") then sawNew = true end
+end
+assertTrue(sawClear, "the clear entry stays visible after the live ledger makes room")
+assertTrue(sawNew, "the new donation stays visible with archived history")
+assertFalse(select(1, C.AppendEvent(archiveP, {
+    id = "ce:archive:overflow",
+    type = C.EVENT.DONATION,
+    actor = admin,
+    itemId = aqirite,
+    quantity = 1,
+    generation = 2,
+    timestamp = 3,
+}, { silent = true })), "the current generation still stops at the live ledger cap")
+C.MAX_LEDGER_EVENTS = archiveCap
+
+local writer = "Writer-Realm"
+local recoverP = profile("recover-order", admin)
+C.AppendEvent(recoverP, {
+    id = "ce:recover:" .. writer .. ":1",
+    type = C.EVENT.DONATION,
+    actor = writer,
+    itemId = aqirite,
+    quantity = 1,
+    generation = 1,
+    timestamp = 10,
+    order = 4,
+}, { silent = true })
+C.AppendEvent(recoverP, {
+    id = "ce:recover:Other-Realm:1",
+    type = C.EVENT.DONATION,
+    actor = "Other-Realm",
+    itemId = aqirite,
+    quantity = 1,
+    generation = 1,
+    timestamp = 11,
+    order = 5,
+}, { silent = true })
+Sync.state = {
+    active = true,
+    isCoordinator = false,
+    coordinator = "NewCoord-Realm",
+    sessionId = "recover-session",
+    profileId = recoverP._profileId,
+}
+Sync._SelfId = function() return writer end
+Sync:_QueueAuthoredOrderedConsumablesEvents(recoverP, 1)
+local recoverQueue = recoverP._consumablesUnsent or {}
+local sawWriter, sawOther = false, false
+for i = 1, #recoverQueue do
+    if recoverQueue[i] == "ce:recover:" .. writer .. ":1" then sawWriter = true end
+    if recoverQueue[i] == "ce:recover:Other-Realm:1" then sawOther = true end
+end
+assertTrue(sawWriter, "a writer resends an already ordered event the new coordinator lacks")
+assertFalse(sawOther, "a client does not upload another writer's ordered event")
+assertEq(recoverP._consumableEvents[1].order, 4, "the local ledger keeps the coordinator order it already stored")
+local queuedOnce = #recoverQueue
+Sync:_QueueAuthoredOrderedConsumablesEvents(recoverP, 1)
+assertEq(#(recoverP._consumablesUnsent or {}), queuedOnce, "ordered recovery walks the ledger once per coordinator")
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)
