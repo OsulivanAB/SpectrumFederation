@@ -18,6 +18,7 @@ RUN_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_run_tests.lua"
 FRESH_SNAPSHOT_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_fresh_snapshot_tests.lua"
 STABILITY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_stability_tests.lua"
 EARLY_PREP_TESTS = REPO_ROOT / "tests" / "lua" / "early_preparation_tests.lua"
+BACKGROUND_QUEUE_TESTS = REPO_ROOT / "tests" / "lua" / "background_inspect_queue_tests.lua"
 EARLY_PREP = REPO_ROOT / "SpectrumFederation" / "modules" / "RaidEquipment" / "EarlyPreparation.lua"
 PRESENCE_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_presence_tests.lua"
 ITEM_LEVEL_CONFIG_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_item_level_config_tests.lua"
@@ -135,6 +136,10 @@ def test_roster_glance_production_lua():
 def test_raid_equipment_auto_refresh_defaults_off():
     schema = SCHEMA.read_text(encoding="utf-8")
     assert "raidCheckAuditAutoRefresh = false" in schema
+
+
+def test_background_inspect_queue_stops_with_last_consumer():
+    _run_lua(BACKGROUND_QUEUE_TESTS, "background inspect queue")
 
 
 def test_early_preparation_whispers_production_lua():

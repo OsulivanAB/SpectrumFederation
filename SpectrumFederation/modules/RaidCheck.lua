@@ -1159,7 +1159,43 @@ function RC:SetBackgroundInspectEnabled(enabled, reason, opts)
 	if state.backgroundInspectEnabled then
 		self:_StartBackgroundInspectMonitor()
 		self:_RunBackgroundInspectPass()
+	else
+		self:_DiscardQueuedBackgroundInspects()
 	end
+end
+
+-- Pending background scans belong to the shared consumer flag. Once the last
+-- consumer is gone, those queue entries must not keep calling NotifyInspect.
+function RC:_DiscardQueuedBackgroundInspects()
+	local state = self:_GetInspectState()
+	local queue = state.queue
+	if type(queue) ~= "table" then
+		return 0
+	end
+	local head = state.queueHead or 1
+	if head < 1 then
+		head = 1
+	end
+	local kept = {}
+	local removed = 0
+	for i = head, #queue do
+		local item = queue[i]
+		if type(item) == "table" and item.key then
+			if item.source == "background" then
+				if type(state.queued) == "table" then
+					state.queued[item.key] = nil
+				end
+				removed = removed + 1
+			else
+				kept[#kept + 1] = item
+			end
+		end
+	end
+	if removed > 0 then
+		state.queue = kept
+		state.queueHead = 1
+	end
+	return removed
 end
 
 function RC:_IsInspectPausedForManual(now)
@@ -2142,8 +2178,10 @@ function RC:_ProcessInspectQueue()
 			state.queued[item.key] = nil
 		end
 
-		if state.adhocRun and item and item.source ~= "adhoc" then
-			-- Drop background work while an ad-hoc check owns the inspect pipeline.
+		local backgroundStopped = item and item.source == "background" and not state.backgroundInspectEnabled
+		if backgroundStopped or (state.adhocRun and item and item.source ~= "adhoc") then
+			-- Drop background work once no consumer still wants it, and drop
+			-- non-adhoc work while an ad-hoc check owns the inspect pipeline.
 		else
 			local unit = item and FindUnitByGuidOrId(item.guid, item.id) or nil
 			if CanInspectUnitNow(unit) then

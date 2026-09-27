@@ -1,0 +1,172 @@
+-- Production-Lua tests for shared background inspect queue ownership.
+-- Run from the repository root: lua5.1 tests/lua/background_inspect_queue_tests.lua
+
+local failures = 0
+local passes = 0
+
+local function fail(message)
+	failures = failures + 1
+	io.stderr:write("FAIL: " .. message .. "\n")
+end
+
+local function pass(message)
+	passes = passes + 1
+	io.stdout:write("ok: " .. message .. "\n")
+end
+
+local function assertTrue(cond, message)
+	if cond then
+		pass(message)
+	else
+		fail(message)
+	end
+end
+
+local function assertEq(actual, expected, message)
+	if actual == expected then
+		pass(message)
+	else
+		fail(string.format("%s (expected %s, got %s)", message, tostring(expected), tostring(actual)))
+	end
+end
+
+CreateFrame = function()
+	return {
+		RegisterEvent = function() end,
+		SetScript = function() end,
+	}
+end
+
+local inspects = 0
+NotifyInspect = function()
+	inspects = inspects + 1
+end
+UnitExists = function()
+	return true
+end
+CanInspect = function()
+	return true
+end
+CheckInteractDistance = function()
+	return true
+end
+IsInRaid = function()
+	return true
+end
+GetNumGroupMembers = function()
+	return 1
+end
+UnitGUID = function(unit)
+	if unit == "raid1" then
+		return "guid-a"
+	end
+	return nil
+end
+GetTime = function()
+	return 1000
+end
+UnitFullName = function()
+	return "A", "Realm"
+end
+UnitClass = function()
+	return nil, nil
+end
+
+local SF = {}
+assert(loadfile("SpectrumFederation/modules/RaidEquipment/EarlyPreparation.lua"))("SpectrumFederation", SF)
+assert(loadfile("SpectrumFederation/modules/RaidCheck.lua"))("SpectrumFederation", SF)
+
+local RC = SF.RaidCheck
+
+local function resetQueue(items)
+	local state = RC:_GetInspectState()
+	state.queue = items
+	state.queueHead = 1
+	state.queued = {}
+	state.active = nil
+	state.adhocRun = nil
+	state.inspectPausedForCombat = false
+	for _, item in ipairs(items) do
+		if type(item) == "table" and item.key then
+			state.queued[item.key] = true
+		end
+	end
+	return state
+end
+
+local function countSource(queue, source)
+	local count = 0
+	for _, item in ipairs(queue or {}) do
+		if type(item) == "table" and item.source == source then
+			count = count + 1
+		end
+	end
+	return count
+end
+
+RC:SetBackgroundInspectEnabled(true, "early_preparation")
+RC:SetBackgroundInspectEnabled(true, "equipment page shown", { consumerId = "equipment page" })
+local state = resetQueue({
+	{ key = "bg-1", guid = "guid-a", id = "A-Realm", source = "background" },
+	{ key = "ad-1", guid = "guid-b", id = "B-Realm", source = "adhoc" },
+})
+inspects = 0
+RC:SetBackgroundInspectEnabled(false, "early_preparation")
+assertEq(countSource(state.queue, "background"), 1, "another consumer keeps queued background scans")
+assertEq(countSource(state.queue, "adhoc"), 1, "another consumer keeps a queued ad-hoc scan")
+assertEq(inspects, 0, "turning off one consumer does not inspect")
+assertTrue(state.backgroundInspectEnabled == true, "inspection stays on while a consumer remains")
+
+inspects = 0
+RC:SetBackgroundInspectEnabled(false, "equipment page hidden", { consumerId = "equipment page" })
+assertEq(countSource(state.queue, "background"), 0, "the last consumer drops queued background scans")
+assertEq(countSource(state.queue, "adhoc"), 1, "the last consumer keeps a queued ad-hoc scan")
+assertEq(state.queued["bg-1"], nil, "a dropped background scan clears its queued flag")
+assertEq(state.queued["ad-1"], true, "an ad-hoc scan keeps its queued flag")
+assertEq(inspects, 0, "dropping the background queue does not call NotifyInspect")
+assertTrue(state.backgroundInspectEnabled ~= true, "the last consumer turns background inspection off")
+
+local flooded = {}
+for i = 1, 40 do
+	flooded[i] = {
+		key = "flood-" .. i,
+		guid = "guid-a",
+		id = "Member-Realm",
+		source = "background",
+	}
+end
+flooded[#flooded + 1] = { key = "ad-keep", id = "Keep-Realm", source = "adhoc" }
+state = resetQueue(flooded)
+state.backgroundInspectEnabled = true
+state.backgroundInspectConsumers = { early_preparation = {} }
+inspects = 0
+local removed = RC:_DiscardQueuedBackgroundInspects()
+assertEq(removed, 40, "one disable pass removes a full background queue")
+assertEq(#state.queue, 1, "the ad-hoc scan is the only queue entry left")
+assertEq(inspects, 0, "discarding a full queue does not inspect")
+
+state = resetQueue({
+	{ key = "guid-a", guid = "guid-a", id = "A-Realm", source = "background" },
+	{ key = "guid-b", guid = "guid-b", id = "B-Realm", source = "background" },
+})
+state.backgroundInspectEnabled = false
+inspects = 0
+RC:_ProcessInspectQueue()
+assertEq(inspects, 0, "the processor does not inspect background work after it is stopped")
+assertEq(#state.queue, 0, "the processor drains stopped background work in one pass")
+assertEq(state.queued["guid-a"], nil, "the processor clears the first stopped queued flag")
+assertEq(state.queued["guid-b"], nil, "the processor clears the second stopped queued flag")
+
+state = resetQueue({
+	{ key = "guid-a", guid = "guid-a", id = "A-Realm", source = "background" },
+})
+state.backgroundInspectEnabled = true
+inspects = 0
+RC:_ProcessInspectQueue()
+assertEq(inspects, 1, "an enabled background scan still calls NotifyInspect once")
+assertTrue(state.active ~= nil, "an enabled background scan becomes the active inspect")
+
+io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
+if failures > 0 then
+	os.exit(1)
+end
