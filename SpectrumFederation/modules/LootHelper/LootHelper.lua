@@ -502,15 +502,17 @@ function SF:GetLootHelperProfileOptions()
 	if not db or type(db.profiles) ~= "table" then return out end
 
 	for id, profile in pairs(db.profiles) do
-		local name = id
-		if type(profile) == "table" then
-			if profile.GetProfileName then
-				name = profile:GetProfileName()
-			elseif profile._profileName then
-				name = profile._profileName
+		if type(profile) ~= "table" or not profile._sfConsumablesDeleteAfter then
+			local name = id
+			if type(profile) == "table" then
+				if profile.GetProfileName then
+					name = profile:GetProfileName()
+				elseif profile._profileName then
+					name = profile._profileName
+				end
 			end
+			table.insert(out, { value = id, label = tostring(name) })
 		end
-		table.insert(out, { value = id, label = tostring(name) })
 	end
 
 	table.sort(out, function(a, b)
@@ -636,7 +638,23 @@ function SF:DeleteLootHelperProfile(profileId)
 		return false, "Profile not found."
 	end
 
-	local profileName = db.profiles[profileId]:GetProfileName()
+	local profile = db.profiles[profileId]
+	local runtime = SF.ConsumablesRuntime
+	if runtime and runtime.DeferProfileDelete and runtime:DeferProfileDelete(profile) then
+		if db.activeProfileId == profileId then
+			self:ClearActiveProfile()
+			local opts = self:GetLootHelperProfileOptions()
+			if #opts > 0 then
+				self:SetActiveProfileById(opts[1].value)
+			end
+		end
+		if SF.Debug then
+			SF.Debug:Info("DATABASE", "Deferred profile delete until raid supplies finish: %s", profileId)
+		end
+		return true
+	end
+
+	local profileName = profile:GetProfileName()
 	db.profiles[profileId] = nil
 
 	if SF.Debug then

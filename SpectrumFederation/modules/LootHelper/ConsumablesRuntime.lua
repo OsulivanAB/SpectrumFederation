@@ -27,6 +27,13 @@ local function Warn(text)
     end
 end
 
+local function SameUnit(a, b)
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b) and true or false
+    end
+    return a ~= nil and a == b
+end
+
 local function Info(text)
     Debug("Info", "%s", tostring(text))
     if SF.PrintInfo then
@@ -232,6 +239,71 @@ function Runtime:ScanBags()
                 end
             end
         end
+    end
+end
+
+function Runtime:GroupUnit(name)
+    local map = self.groupMap
+    if type(map) ~= "table" or type(name) ~= "string" then return nil end
+    if map[name] then return map[name] end
+    for key, unit in pairs(map) do
+        if SameUnit(key, name) then return unit end
+    end
+    return nil
+end
+
+function Runtime:ProfileOperationPending(profileId)
+    if type(profileId) ~= "string" or profileId == "" then return false end
+    if type(self.depositIntent) == "table" and self.depositIntent.profileId == profileId then
+        return true
+    end
+    if type(self.pendingTrade) == "table" and self.pendingTrade.profileId == profileId then
+        return true
+    end
+    local frozen = type(self.openTrade) == "table" and self.openTrade.frozen or nil
+    if type(frozen) == "table" and frozen.profileId == profileId then
+        return true
+    end
+    local queue = self.withdrawIntents
+    if type(queue) ~= "table" and type(self.withdrawIntent) == "table" then
+        queue = { self.withdrawIntent }
+    end
+    if type(queue) == "table" then
+        for i = 1, #queue do
+            local intent = queue[i]
+            if type(intent) == "table" and intent.profileId == profileId then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function Runtime:DeferProfileDelete(profile)
+    if type(profile) ~= "table" then return false end
+    local profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId
+    if not self:ProfileOperationPending(profileId) then return false end
+    profile._sfConsumablesDeleteAfter = true
+    return true
+end
+
+function Runtime:CompleteDeferredProfileDeletes()
+    local db = SF.lootHelperDB
+    if type(db) ~= "table" or type(db.profiles) ~= "table" then return end
+    if type(SF.DeleteLootHelperProfile) ~= "function" then return end
+    local pending = {}
+    for id, profile in pairs(db.profiles) do
+        if type(profile) == "table" and profile._sfConsumablesDeleteAfter and not self:ProfileOperationPending(id) then
+            pending[#pending + 1] = id
+        end
+    end
+    for i = 1, #pending do
+        local id = pending[i]
+        local profile = db.profiles[id]
+        if type(profile) == "table" then
+            profile._sfConsumablesDeleteAfter = nil
+        end
+        SF:DeleteLootHelperProfile(id)
     end
 end
 
@@ -464,18 +536,35 @@ function Runtime:BankAccess(profile)
         freeSlots = self:FreeSlots(cfg.bankTab)
     end
     local mergeRoom = false
-    if bankOpen and cfg.bankTab and freeSlots <= 0 and type(self.bagCounts) == "table" then
+    if bankOpen and cfg.bankTab and freeSlots <= 0 and type(self.bagCounts) == "table"
+        and GetGuildBankNumSlots and GetGuildBankItemLink then
+        local carried = {}
+        local carriedCount = 0
         local ids = C.RequestedItemIds(profile)
-        local limit = #ids
-        if limit > 64 then limit = 64 end
-        for i = 1, limit do
+        for i = 1, #ids do
+            if carriedCount >= C.MAX_ASSIGNMENT_PAIRS then break end
             local itemId = ids[i]
             if (tonumber(self.bagCounts[itemId]) or 0) > 0 then
-                local targets = self:DepositTargets(cfg.bankTab, itemId, 1)
-                local room = targets[1] and tonumber(targets[1].room) or 0
-                if room > 0 then
-                    mergeRoom = true
-                    break
+                carried[itemId] = true
+                carriedCount = carriedCount + 1
+            end
+        end
+        if carriedCount > 0 then
+            local slotCount = GetGuildBankNumSlots(cfg.bankTab) or 0
+            if slotCount > MAX_GUILD_BANK_SLOTS then slotCount = MAX_GUILD_BANK_SLOTS end
+            if slotCount < 0 then slotCount = 0 end
+            for slot = 1, slotCount do
+                local link = GetGuildBankItemLink(cfg.bankTab, slot)
+                local slotItem = link and C.ItemIdFromText and C.ItemIdFromText(link) or nil
+                if slotItem and carried[slotItem] and GetGuildBankItemInfo then
+                    local maxStack = self:ItemStackLimit(slotItem)
+                    if maxStack then
+                        local _, count = GetGuildBankItemInfo(cfg.bankTab, slot)
+                        if maxStack - (tonumber(count) or 0) > 0 then
+                            mergeRoom = true
+                            break
+                        end
+                    end
                 end
             end
         end
@@ -963,15 +1052,21 @@ function Runtime:BeginTrade(line, collected)
         Warn("Leave combat before trading raid supplies.")
         return
     end
-    local unit = self.groupMap and self.groupMap[line.recipient]
+    local unit = self:GroupUnit(line.recipient)
     if not unit or not InitiateTrade then
         Warn("Could not start a trade with that Crafter.")
         return
+    end
+    local tradeProfile = collected and collected.profile
+    local tradeProfileId = nil
+    if type(tradeProfile) == "table" then
+        tradeProfileId = tradeProfile.GetProfileId and tradeProfile:GetProfileId() or tradeProfile._profileId
     end
     self.pendingTrade = {
         line = line,
         recipient = line.recipient,
         token = self:NextToken("trade"),
+        profileId = tradeProfileId,
     }
     self:ArmPendingTradeTimer()
     InitiateTrade(unit)
@@ -987,6 +1082,7 @@ end
 function Runtime:ClearPendingTrade()
     self:CancelPendingTradeTimer()
     self.pendingTrade = nil
+    self:CompleteDeferredProfileDeletes()
 end
 
 function Runtime:ArmPendingTradeTimer()
@@ -996,6 +1092,7 @@ function Runtime:ArmPendingTradeTimer()
         self.pendingTradeTimer = nil
         if self.pendingTrade and not self.openTrade then
             self.pendingTrade = nil
+            self:CompleteDeferredProfileDeletes()
         end
     end)
 end
@@ -1060,7 +1157,7 @@ function Runtime:OnTradeShow()
     local selfId = self:SelfId()
     local pending = self.pendingTrade
     local donor, receiver, role
-    if pending and partner and pending.recipient == partner then
+    if pending and partner and SameUnit(pending.recipient, partner) then
         donor, receiver, role = selfId, partner, "donor"
     else
         donor, receiver, role = partner, selfId, "receiver"
@@ -1112,9 +1209,9 @@ function Runtime:OnTradeClosed()
     local open = self.openTrade
     local pending = self.pendingTrade
     self.openTrade = nil
-    self:ClearPendingTrade()
-    if not open then return end
-    if open.role == "receiver" and open.both then
+    self:CancelPendingTradeTimer()
+    self.pendingTrade = nil
+    if open and open.role == "receiver" and open.both then
         local Workflow = SF.ConsumablesWorkflow
         local events = Workflow and Workflow.TradeEvents(open.frozen, open.target or {}, true) or {}
         local profile = self:ProfileById(open.frozen and open.frozen.profileId)
@@ -1123,9 +1220,10 @@ function Runtime:OnTradeClosed()
         elseif not profile and #events > 0 then
             Debug("Warn", "Skipped trade commit because profile %s is gone", tostring(open.frozen and open.frozen.profileId))
         end
-    elseif open.role == "donor" and pending and type(pending.remainder) == "table" and #pending.remainder > 0 then
+    elseif open and open.role == "donor" and pending and type(pending.remainder) == "table" and #pending.remainder > 0 then
         Info("Some raid supplies did not fit in this trade. Trade again to hand over the rest.")
     end
+    self:CompleteDeferredProfileDeletes()
 end
 
 function Runtime:BeginDeposit(line, collected)
@@ -1231,6 +1329,7 @@ function Runtime:FinishDeposit(fromTimer)
             self.depositTimer = nil
         end
         Debug("Warn", "Skipped deposit commit because profile %s is gone", tostring(intent.profileId))
+        self:CompleteDeferredProfileDeletes()
         return
     end
     self:ScanBags()
@@ -1264,6 +1363,7 @@ function Runtime:FinishDeposit(fromTimer)
             self.depositTimer = nil
         end
         Warn("That deposit was not in the configured guild bank tab.")
+        self:CompleteDeferredProfileDeletes()
         return
     end
     if actual > (intent.bestActual or 0) then
@@ -1279,6 +1379,7 @@ function Runtime:FinishDeposit(fromTimer)
         self.depositTimer = nil
     end
     if action == "drop" then
+        self:CompleteDeferredProfileDeletes()
         return
     end
     actual = intent.bestActual or actual
@@ -1296,6 +1397,7 @@ function Runtime:FinishDeposit(fromTimer)
         Info(string.format("Deposited %d. The rest is still in your bags.", actual))
     end
     self:CaptureBaseline(false)
+    self:CompleteDeferredProfileDeletes()
 end
 
 function Runtime:CaptureBaseline(silent)
@@ -1484,6 +1586,7 @@ function Runtime:FinishWithdraw(fromTimer)
         self.withdrawIntents = {}
         self.withdrawIntent = nil
         clearTimer()
+        self:CompleteDeferredProfileDeletes()
         return
     end
     self:ScanBags()
@@ -1562,6 +1665,9 @@ function Runtime:FinishWithdraw(fromTimer)
     end
     if committed then
         self:CaptureBaseline(true)
+    end
+    if #kept == 0 then
+        self:CompleteDeferredProfileDeletes()
     end
 end
 
@@ -1754,5 +1860,6 @@ function Runtime:Init()
             self:RefreshReminder()
         end)
     end
+    self:CompleteDeferredProfileDeletes()
     Debug("Info", "Raid Consumables runtime initialized")
 end

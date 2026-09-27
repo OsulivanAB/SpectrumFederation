@@ -730,6 +730,18 @@ function Sync:CommitConsumablesEvents(profile, token, events)
     if not ok then return false, err end
     if SessionFor(profile) then
         self:_BroadcastNewConsumablesEvents(profile, seen)
+    else
+        local function queueNew(list)
+            if type(list) ~= "table" then return end
+            for i = 1, #list do
+                local event = list[i]
+                if type(event) == "table" and type(event.id) == "string" and not seen[event.id] then
+                    self:_QueueUnsentConsumablesEvent(profile, event.id)
+                end
+            end
+        end
+        queueNew(profile._consumableEventArchive)
+        queueNew(profile._consumableEvents)
     end
     return true
 end

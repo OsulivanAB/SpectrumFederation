@@ -41,14 +41,30 @@ function R.Choose(candidates, totals)
     return bestName
 end
 
+local function SamePlayer(a, b)
+    if SF.NameUtil and SF.NameUtil.SamePlayer then
+        return SF.NameUtil.SamePlayer(a, b) and true or false
+    end
+    return type(a) == "string" and a == b
+end
+
+function R.Flag(map, name)
+    if type(map) ~= "table" or type(name) ~= "string" then return false end
+    if map[name] then return true end
+    for key, value in pairs(map) do
+        if value and SamePlayer(key, name) then return true end
+    end
+    return false
+end
+
 function R.RouteItem(crafters, totals, inGroup, compatible)
     local candidates = {}
     for i = 1, #(crafters or {}) do
         local name = crafters[i]
         candidates[#candidates + 1] = {
             name = name,
-            inGroup = inGroup and inGroup[name] and true or false,
-            compatible = compatible and compatible[name] and true or false,
+            inGroup = R.Flag(inGroup, name),
+            compatible = R.Flag(compatible, name),
         }
     end
     return R.Choose(candidates, totals)

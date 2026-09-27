@@ -3136,6 +3136,231 @@ local function checkShelveAndCapability()
 end
 checkShelveAndCapability()
 
+function checkAdoptedLedgerRound()
+    local restoreP = profile("restore-gen", admin)
+    local donationId = "ce:restore-gen:" .. admin .. ":1"
+    assertTrue(select(1, C.AppendEvent(restoreP, {
+        id = donationId, type = C.EVENT.DONATION, actor = admin, itemId = aqirite,
+        quantity = 4, generation = 1, timestamp = 1,
+    }, { silent = true })), "the generation being cleared has a donation")
+    assertTrue(select(1, C.Clear(restoreP, admin, { asAdmin = true })), "clear archives that generation")
+    assertEq(restoreP._consumables.generation, 2, "clear advances the generation")
+    assertTrue(hasEvent(restoreP._consumableEventArchive, donationId), "the cleared donation is archived")
+    local resetId = nil
+    for i = 1, #restoreP._consumableEventArchive do
+        local archived = restoreP._consumableEventArchive[i]
+        if archived.type == C.EVENT.RESET then resetId = archived.id end
+    end
+    assertTrue(resetId ~= nil, "the clear reset stays in the archive")
+    S.NoteCoordinatorWatermark(restoreP, 2, restoreP._consumables.configSeq, 1)
+    assertEq(select(2, S.ApplyRemoteConfig(restoreP, {
+        generation = 1, configSeq = 1, crafters = {}, assignments = {},
+    }, admin, { coordinatorAuthoritative = true, coordEpoch = 2 })), "applied", "a coordinator can adopt generation 1 again")
+    assertTrue(hasEvent(restoreP._consumableEvents, donationId), "the adopted generation returns to the live ledger")
+    assertFalse(hasEvent(restoreP._consumableEvents, resetId), "the local reset does not return to the live ledger")
+    assertTrue(hasEvent(restoreP._consumableEventArchive, resetId), "the local reset stays archived until a snapshot omits it")
+    assertEq(C.ContributionTotal(restoreP, admin, aqirite), 4, "the restored donation is projected")
+    assertEq(select(2, C.AppendEvent(restoreP, {
+        id = donationId, type = C.EVENT.DONATION, actor = admin, itemId = aqirite,
+        quantity = 4, generation = 1, timestamp = 1,
+    }, { silent = true })), "duplicate", "restoring an archived id does not duplicate it")
+    assertEq(#restoreP._consumableEvents, 1, "the restored donation is stored once")
+    local savedState = Sync.state
+    Sync.state = { active = true, coordEpoch = 2, sessionId = "restore", coordinator = admin, profileId = restoreP._profileId }
+    assertTrue(C.MergeSnapshot(restoreP, {
+        generation = 1, configSeq = 1, crafters = {}, assignments = {},
+        events = {
+            { id = donationId, type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 4, generation = 1, timestamp = 1 },
+        },
+    }, { consumablesFromCoordinator = true }), "the coordinator snapshot imports after the generation restore")
+    assertFalse(hasEvent(restoreP._consumableEventArchive, resetId), "a coordinator snapshot drops a local reset it does not contain")
+    assertTrue(hasEvent(restoreP._consumableEvents, donationId), "the coordinator snapshot keeps the shared donation")
+
+    local rejectP = profile("reject-local", admin)
+    local rejectedId = "ce:reject-local:local:1"
+    local queuedId = "ce:reject-local:queued:1"
+    assertTrue(select(1, C.AppendEvent(rejectP, {
+        id = rejectedId, type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+        quantity = 1, generation = 1, timestamp = 1,
+    }, { silent = true })), "a rejected local event is stored before the snapshot")
+    assertTrue(select(1, C.AppendEvent(rejectP, {
+        id = queuedId, type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+        quantity = 2, generation = 1, timestamp = 2,
+    }, { silent = true })), "an unsent local event is stored before the snapshot")
+    rejectP._consumablesUnsent = { queuedId }
+    Sync.state = { active = true, coordEpoch = 1, sessionId = "reject", coordinator = admin, profileId = rejectP._profileId }
+    assertTrue(C.MergeSnapshot(rejectP, {
+        generation = 1, configSeq = 1, crafters = {}, assignments = {},
+        events = {
+            { id = "ce:reject-local:remote:1", type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 3, generation = 1, timestamp = 3 },
+        },
+    }, { consumablesFromCoordinator = true }), "an authoritative snapshot reconciles local rows")
+    assertFalse(hasEvent(rejectP._consumableEvents, rejectedId), "a sent event the coordinator omitted is removed")
+    assertTrue(hasEvent(rejectP._consumableEvents, queuedId), "an event still queued to send is kept")
+    assertTrue(hasEvent(rejectP._consumableEvents, "ce:reject-local:remote:1"), "the coordinator event is stored")
+    local helperExtra = "ce:reject-local:helper-extra:1"
+    assertTrue(select(1, C.AppendEvent(rejectP, {
+        id = helperExtra, type = C.EVENT.DONATION, actor = admin, itemId = aqirite,
+        quantity = 1, generation = 1, timestamp = 4,
+    }, { silent = true })), "a helper snapshot starts with a local extra event")
+    assertTrue(C.MergeSnapshot(rejectP, {
+        generation = 9, configSeq = 9, crafters = { donor }, assignments = {},
+        events = {
+            { id = "ce:reject-local:helper:1", type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1, timestamp = 5 },
+        },
+    }, { consumablesFromCoordinator = false }), "a helper snapshot still merges")
+    assertTrue(hasEvent(rejectP._consumableEvents, helperExtra), "a helper snapshot does not drop local events")
+    assertEq(rejectP._consumables.crafters[1], nil, "a helper snapshot does not replace the roster")
+
+    local offlineP = profile("offline-q", admin)
+    Sync.state = nil
+    assertTrue(select(1, Sync:CommitConsumablesEvents(offlineP, "offline-1", {
+        { type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1 },
+    })), "an offline commit is stored")
+    local offlineId = "ce:offline-q:offline-1:1"
+    assertEq(offlineP._consumablesUnsent and offlineP._consumablesUnsent[1], offlineId, "an offline commit stays queued until it can be sent")
+    Sync.state = savedState
+
+    local rosterP = profile("roster-cap", admin)
+    local longName = string.rep("A", 65) .. "-Realm"
+    assertFalse(select(1, C.AddCrafter(rosterP, admin, longName, { asAdmin = true })), "a Crafter name longer than 64 characters is rejected")
+    for i = 1, C.MAX_ASSIGNMENT_PAIRS do
+        C.AddCrafter(rosterP, admin, "Crafter" .. i .. "-Realm", { asAdmin = true })
+    end
+    assertFalse(select(1, C.AddCrafter(rosterP, admin, "Overflow-Realm", { asAdmin = true })), "the Crafter roster stops at its cap")
+    assertEq(#rosterP._consumables.crafters, C.MAX_ASSIGNMENT_PAIRS, "the stored roster stays at the cap")
+
+    local savedNameUtil = SF.NameUtil
+    SF.NameUtil = {
+        NormalizeNameRealm = function(name) return name end,
+        SamePlayer = function(a, b)
+            if type(a) ~= "string" or type(b) ~= "string" then return false end
+            return a:lower() == b:lower()
+        end,
+    }
+    local caseP = profile("case-route", admin)
+    assertTrue(select(1, C.AddCrafter(caseP, admin, "Vann-Realm", { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(caseP, admin, aqirite, "Vann-Realm", { asAdmin = true })))
+    local epoch = caseP._consumables.assignments[tostring(aqirite)].epoch
+    assertTrue(select(1, C.AppendEvent(caseP, {
+        id = "ce:case-route:receipt:1", type = C.EVENT.RECEIPT, actor = "vann-realm", crafter = "vann-realm",
+        itemId = aqirite, quantity = 9, generation = 1, epoch = epoch, timestamp = 1,
+    }, { silent = true })), "a differently capitalized receipt is stored")
+    assertEq(C.ReceiptTotal(caseP, aqirite, "Vann-Realm"), 9, "receipt totals match a Crafter regardless of capitalization")
+    local casePlan = C.BuildDonationPlan(caseP, { { itemId = aqirite, quantity = 1 } }, {
+        inGroup = { ["vann-realm"] = true },
+        compatible = { ["vann-realm"] = true },
+        inRange = { ["vann-realm"] = true },
+        guildBankUsable = false,
+    })
+    assertEq(casePlan.lines[1].recipient, "Vann-Realm", "routing finds the roster entry for a differently capitalized Crafter")
+    assertEq(casePlan.lines[1].inRange, true, "range follows the same Crafter despite capitalization")
+    SF.NameUtil = savedNameUtil
+
+    local mergeP = profile("merge-scan", admin)
+    assertTrue(select(1, C.SetGuild(mergeP, admin, { guid = "club-merge", name = "Spectrum", realm = "Realm" }, 1, { asAdmin = true })))
+    assertTrue(select(1, C.AddCrafter(mergeP, admin, vann, { asAdmin = true })))
+    local carriedId = 300000 + 70
+    for i = 1, 70 do
+        C.AddAssignment(mergeP, admin, 300000 + i, vann, { asAdmin = true })
+    end
+    assertEq(#C.RequestedItemIds(mergeP), 70, "the merge scan has more requested items than the old 64-item cutoff")
+    local savedBankOpen = RT.BankIsOpen
+    local savedGuild = RT.CurrentGuild
+    local savedBags = RT.bagCounts
+    local savedNum = GetGuildBankNumSlots
+    local savedLink = GetGuildBankItemLink
+    local savedInfo = GetGuildBankItemInfo
+    local savedTabInfo = GetGuildBankTabInfo
+    local savedItemApi = C_Item
+    RT.BankIsOpen = function() return true end
+    RT.CurrentGuild = function() return { guid = "club-merge" } end
+    RT.bagCounts = { [carriedId] = 4 }
+    GetGuildBankNumSlots = function() return 98 end
+    GetGuildBankTabInfo = function() return nil, nil, nil, true end
+    GetGuildBankItemLink = function(_, slot)
+        if slot == 1 then return "item:" .. tostring(carriedId) end
+        return "item:1"
+    end
+    GetGuildBankItemInfo = function(_, slot)
+        if slot == 1 then return nil, 5 end
+        return nil, 20
+    end
+    C_Item = { GetItemMaxStackSizeByID = function() return 20 end }
+    local mergeAccess = RT:BankAccess(mergeP)
+    assertTrue(mergeAccess.enabled, "a carried item past the first 64 requested ids can still merge")
+    assertEq(mergeAccess.reason, nil, "that partial stack does not report a full tab")
+    RT.BankIsOpen = savedBankOpen
+    RT.CurrentGuild = savedGuild
+    RT.bagCounts = savedBags
+    GetGuildBankNumSlots = savedNum
+    GetGuildBankItemLink = savedLink
+    GetGuildBankItemInfo = savedInfo
+    GetGuildBankTabInfo = savedTabInfo
+    C_Item = savedItemApi
+
+    local deferP = profile("defer-del", admin)
+    local savedDb = SF.lootHelperDB
+    local savedDelete = SF.DeleteLootHelperProfile
+    local savedIntent = RT.depositIntent
+    local savedScan = RT.ScanBags
+    local savedTabs = RT.TabItemCounts
+    local savedSlot = RT.SlotItemCount
+    local savedCommit = RT.Commit
+    local savedCapture = RT.CaptureBaseline
+    local savedSelf = RT.SelfId
+    SF.lootHelperDB = { profiles = { ["defer-del"] = deferP }, activeProfileId = "defer-del" }
+    RT.depositIntent = {
+        profileId = "defer-del",
+        itemId = aqirite,
+        tab = 1,
+        guildGuid = "club-defer",
+        intended = 1,
+        beforeTab = 0,
+        beforeBags = 1,
+        places = { { slot = 1, before = 0 } },
+        bestActual = 0,
+        token = "dep-defer",
+        generation = 1,
+    }
+    assertTrue(RT:DeferProfileDelete(deferP), "an in-flight deposit defers profile deletion")
+    assertTrue(deferP._sfConsumablesDeleteAfter, "the deferred profile is marked")
+    local deletedId = nil
+    local committedProfile = nil
+    SF.DeleteLootHelperProfile = function(_, id)
+        deletedId = id
+        SF.lootHelperDB.profiles[id] = nil
+        return true
+    end
+    RT:CompleteDeferredProfileDeletes()
+    assertEq(deletedId, nil, "the profile stays until the deposit commits")
+    RT.ScanBags = function() end
+    RT.CurrentGuild = function() return { guid = "club-defer" } end
+    RT.TabItemCounts = function() return {} end
+    RT.SlotItemCount = function() return 1 end
+    RT.bagCounts = { [aqirite] = 0 }
+    RT.CaptureBaseline = function() end
+    RT.SelfId = function() return admin end
+    RT.Commit = function(_, committed)
+        committedProfile = committed
+        return true
+    end
+    RT:FinishDeposit(true)
+    assertEq(committedProfile, deferP, "the deposit commits on the profile that was being deleted")
+    assertEq(deletedId, "defer-del", "the delete finishes after the deposit is recorded")
+    RT.depositIntent = savedIntent
+    RT.ScanBags = savedScan
+    RT.TabItemCounts = savedTabs
+    RT.SlotItemCount = savedSlot
+    RT.Commit = savedCommit
+    RT.CaptureBaseline = savedCapture
+    RT.SelfId = savedSelf
+    RT.CurrentGuild = savedGuild
+    SF.DeleteLootHelperProfile = savedDelete
+    SF.lootHelperDB = savedDb
+end
+checkAdoptedLedgerRound()
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)

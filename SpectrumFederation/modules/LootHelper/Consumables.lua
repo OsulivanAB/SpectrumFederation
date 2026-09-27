@@ -125,6 +125,19 @@ local function Without(list, name)
     return out
 end
 
+local function CopyCrafterRoster(list)
+    local sorted = SortedCopy(list)
+    local out = {}
+    for i = 1, #sorted do
+        local name = sorted[i]
+        if #name <= C.MAX_EVENT_NAME and not Contains(out, name) then
+            out[#out + 1] = name
+        end
+        if #out >= C.MAX_ASSIGNMENT_PAIRS then break end
+    end
+    return out
+end
+
 local function Notify()
     if notifying then return end
     notifying = true
@@ -518,6 +531,34 @@ function C.RetainCurrentGeneration(profile)
     end)
 end
 
+local function RestoreAdoptedGeneration(profile)
+    local archive = profile._consumableEventArchive
+    if type(archive) ~= "table" or #archive == 0 then return false end
+    local generation = tonumber(profile._consumables.generation) or 1
+    local live = profile._consumableEvents
+    if type(live) ~= "table" then
+        live = {}
+        profile._consumableEvents = live
+    end
+    local kept = {}
+    local moved = false
+    for i = 1, #archive do
+        local event = archive[i]
+        local eventGen = type(event) == "table" and tonumber(event.generation) or nil
+        if type(event) == "table" and eventGen == generation and event.type ~= C.EVENT.RESET
+            and #live < C.MAX_LEDGER_EVENTS then
+            live[#live + 1] = event
+            moved = true
+        else
+            kept[#kept + 1] = event
+        end
+    end
+    if not moved then return false end
+    profile._consumableEventArchive = kept
+    RebuildIndex(profile)
+    return true
+end
+
 local function MixConfigText(hash, text)
     return Xor32(hash, IdHash(text))
 end
@@ -762,10 +803,16 @@ function C.AddCrafter(profile, actor, crafterName, opts)
     if not AllowAdmin(profile, actor, opts) then
         return false, "Only a profile admin can add a Crafter."
     end
+    if #crafterName > C.MAX_EVENT_NAME then
+        return false, "That character name is too long."
+    end
     if C.IsCrafter(profile, crafterName) then
         return false, "That character is already a Crafter."
     end
     local cfg = C.Ensure(profile)
+    if #cfg.crafters >= C.MAX_ASSIGNMENT_PAIRS then
+        return false, "The Crafter list is full."
+    end
     cfg.crafters[#cfg.crafters + 1] = crafterName
     table.sort(cfg.crafters)
     BumpConfig(profile)
@@ -1301,7 +1348,13 @@ function C.ReceiptTotal(profile, itemId, crafterName)
     local receipts = C.Project(profile).receipts
     local byItem = receipts[itemId]
     if not byItem or not crafterName then return 0 end
-    return byItem[crafterName] or 0
+    local total = 0
+    for key, qty in pairs(byItem) do
+        if Same(key, crafterName) then
+            total = total + (tonumber(qty) or 0)
+        end
+    end
+    return total
 end
 
 function C.ContributionTotal(profile, memberId, itemId)
@@ -1509,7 +1562,7 @@ function C.ExportSnapshot(profile, opts)
         ledgerSeq = tonumber(cfg.ledgerSeq) or 0,
         guild = CopyGuild(cfg.guild),
         bankTab = cfg.bankTab,
-        crafters = SortedCopy(cfg.crafters),
+        crafters = CopyCrafterRoster(cfg.crafters),
         assignments = assignments,
         events = events,
     }
@@ -1559,7 +1612,7 @@ function C.ReplaceConfig(profile, payload)
     cfg.guild = CopyGuild(payload.guild)
     cfg.bankTab = tonumber(payload.bankTab)
     if not IsBankTab(cfg.bankTab) then cfg.bankTab = nil end
-    cfg.crafters = SortedCopy(payload.crafters)
+    cfg.crafters = CopyCrafterRoster(payload.crafters)
     cfg.assignments = {}
     if type(payload.assignments) == "table" then
         for key, row in pairs(payload.assignments) do
@@ -1578,7 +1631,58 @@ function C.ReplaceConfig(profile, payload)
     end
     PruneRetiredAssignments(cfg)
     Invalidate(profile)
+    RestoreAdoptedGeneration(profile)
     C.RetainCurrentGeneration(profile)
+    Notify()
+    return true
+end
+
+local function ReconcileAuthoritativeEvents(profile, events)
+    local keep = {}
+    local limit = #events
+    local maxEvents = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
+    if limit > maxEvents then limit = maxEvents end
+    for i = 1, limit do
+        local event = events[i]
+        if type(event) == "table" and type(event.id) == "string" and event.id ~= "" then
+            keep[event.id] = true
+        end
+    end
+    local unsent = {}
+    local queue = profile._consumablesUnsent
+    if type(queue) == "table" then
+        local queued = #queue
+        if queued > maxEvents then queued = maxEvents end
+        for i = 1, queued do
+            if type(queue[i]) == "string" then
+                unsent[queue[i]] = true
+            end
+        end
+    end
+    local function keepEvent(event)
+        if type(event) ~= "table" or type(event.id) ~= "string" then return false end
+        return keep[event.id] or unsent[event.id] or false
+    end
+    local function filterList(list)
+        local keptRows = {}
+        local removed = false
+        if type(list) ~= "table" then return keptRows, false end
+        for i = 1, #list do
+            if keepEvent(list[i]) then
+                keptRows[#keptRows + 1] = list[i]
+            else
+                removed = true
+            end
+        end
+        return keptRows, removed
+    end
+    local live, liveRemoved = filterList(profile._consumableEvents)
+    local archive, archiveRemoved = filterList(profile._consumableEventArchive)
+    if not liveRemoved and not archiveRemoved then return false end
+    profile._consumableEvents = live
+    profile._consumableEventArchive = archive
+    RebuildIndex(profile)
+    Invalidate(profile)
     Notify()
     return true
 end
@@ -1632,6 +1736,9 @@ function C.MergeSnapshot(profile, data, opts)
     profile._consumablesAdoptNextSnapshot = nil
     if replace then
         C.ReplaceConfig(profile, data)
+        if fromCoordinator and type(data.events) == "table" then
+            ReconcileAuthoritativeEvents(profile, data.events)
+        end
         if adoptSession then
             profile._consumablesConfigAdoptedSession = adoptSession
         end
@@ -1833,7 +1940,7 @@ function C.BuildDonationPlan(profile, carried, ctx)
                 quality = row.quality,
                 name = row.name,
                 recipient = recipient,
-                inRange = recipient and ctx.inRange and ctx.inRange[recipient] and true or false,
+                inRange = recipient and Routing.Flag(ctx.inRange, recipient) or false,
                 epoch = assignment and tonumber(assignment.epoch) or 0,
                 generation = cfg.generation,
                 guildBank = ctx.guildBankUsable and true or false,
@@ -1893,10 +2000,10 @@ function C.RevalidateDonation(profile, line, ctx, inventoryQty)
         if recipient ~= line.recipient then
             return false, "The recipient changed. Review the donation again."
         end
-        if not (ctx and ctx.inRange and ctx.inRange[line.recipient]) then
+        if not (ctx and Routing and Routing.Flag(ctx.inRange, line.recipient)) then
             return false, "That Crafter is out of trade range."
         end
-        if not (ctx and ctx.compatible and ctx.compatible[line.recipient]) then
+        if not (ctx and Routing and Routing.Flag(ctx.compatible, line.recipient)) then
             return false, "That Crafter is not running a compatible client."
         end
     elseif not (ctx and ctx.guildBankUsable) then
