@@ -4406,6 +4406,82 @@ function checkWriterFingerprint()
 end
 checkWriterFingerprint()
 
+function checkSnapshotServeLimit()
+    load("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
+    load("SpectrumFederation/modules/LootHelperSync/14_HandlersControl.lua")
+    local savedState = Sync.state
+    local savedNow = Sync._Now
+    local savedBuild = Sync.BuildProfileSnapshot
+    local savedValidate = Sync.ValidateSessionPayload
+    local savedReply = Sync._RecordHandshakeReply
+    local savedIntegrity = Sync._HandlePeerIntegrityAdvertisement
+    local savedBulk = Sync.IsBulkTransferAllowed
+    local savedHelper = Sync.IsSelfHelper
+    local savedAuth = Sync.IsSenderAuthorized
+    local savedRoster = Sync.UpdatePeersFromRoster
+    local savedPeer = Sync.GetPeer
+    local savedSelf = Sync._SelfId
+    local savedJitter = Sync.RunWithJitter
+    local savedCfg = Sync.cfg
+    local now = 5000
+    local builds = 0
+    Sync.cfg = { requestTimeoutSec = 5 }
+    Sync._Now = function() return now end
+    Sync._SelfId = function() return admin end
+    Sync.ValidateSessionPayload = function() return true end
+    Sync._RecordHandshakeReply = function() end
+    Sync._HandlePeerIntegrityAdvertisement = function() end
+    Sync.IsBulkTransferAllowed = function() return true end
+    Sync.IsSelfHelper = function() return false end
+    Sync.IsSenderAuthorized = function() return true end
+    Sync.UpdatePeersFromRoster = function() end
+    Sync.GetPeer = function() return { inGroup = true } end
+    Sync.RunWithJitter = function() end
+    Sync.BuildProfileSnapshot = function()
+        builds = builds + 1
+        return { snapshot = {} }
+    end
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        sessionId = "snap-serve",
+        profileId = "snap-serve-profile",
+        _profileSnapshotServe = nil,
+    }
+    local payload = { sessionId = "snap-serve", profileId = "snap-serve-profile", requestId = "req-1" }
+    Sync:HandleNeedProfile("Member-Realm", payload)
+    Sync:HandleNeedProfile("Member-Realm", payload)
+    assertEq(builds, 1, "a second profile request does not copy the snapshot inside the timeout")
+    now = 5004
+    Sync:HandleNeedProfile("Member-Realm", { sessionId = "snap-serve", profileId = "snap-serve-profile", requestId = "req-2" })
+    assertEq(builds, 1, "the snapshot serve stays closed until the request timeout elapses")
+    now = 5005
+    Sync:HandleNeedProfile("Member-Realm", { sessionId = "snap-serve", profileId = "snap-serve-profile", requestId = "req-3" })
+    assertEq(builds, 2, "a later profile request can copy the snapshot after the timeout")
+    local book = {}
+    for i = 1, 64 do
+        book["Peer-" .. tostring(i)] = now
+    end
+    Sync.state._profileSnapshotServe = book
+    Sync:HandleNeedProfile("New-Realm", { sessionId = "snap-serve", profileId = "snap-serve-profile", requestId = "req-full" })
+    assertEq(builds, 2, "a full recent serve book does not copy another snapshot")
+    Sync.state = savedState
+    Sync._Now = savedNow
+    Sync.BuildProfileSnapshot = savedBuild
+    Sync.ValidateSessionPayload = savedValidate
+    Sync._RecordHandshakeReply = savedReply
+    Sync._HandlePeerIntegrityAdvertisement = savedIntegrity
+    Sync.IsBulkTransferAllowed = savedBulk
+    Sync.IsSelfHelper = savedHelper
+    Sync.IsSenderAuthorized = savedAuth
+    Sync.UpdatePeersFromRoster = savedRoster
+    Sync.GetPeer = savedPeer
+    Sync._SelfId = savedSelf
+    Sync.RunWithJitter = savedJitter
+    Sync.cfg = savedCfg
+end
+checkSnapshotServeLimit()
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)

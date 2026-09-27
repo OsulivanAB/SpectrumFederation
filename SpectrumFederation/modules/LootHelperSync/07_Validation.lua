@@ -1001,6 +1001,44 @@ end
 -- @param sender string "Name-Realm"
 -- @param member string "Name-Realm"
 -- @return nil
+-- Function True when this sender may receive another full profile snapshot.
+-- The build copies the consumables ledger, so one member cannot request it
+-- again until a request timeout has elapsed. The book stays bounded by
+-- dropping timestamps that are already outside that window.
+-- @param sender string "Name-Realm"
+-- @return boolean
+function Sync:_ProfileSnapshotServeAllowed(sender)
+    if type(sender) ~= "string" or sender == "" then return false end
+    if not self.state then return false end
+    local book = self.state._profileSnapshotServe
+    if type(book) ~= "table" then return true end
+    local window = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    local now = self:_Now()
+    local at = tonumber(book[sender])
+    if at and at <= now and (now - at) < window then return false end
+    if book[sender] ~= nil then return true end
+    local count = 0
+    for name, stamped in pairs(book) do
+        local stampedAt = tonumber(stamped)
+        if not stampedAt or stampedAt > now or (now - stampedAt) >= window then
+            book[name] = nil
+        else
+            count = count + 1
+            if count >= 64 then return false end
+        end
+    end
+    return true
+end
+
+-- Function Remember that this sender was given a profile snapshot.
+-- @param sender string "Name-Realm"
+-- @return nil
+function Sync:_NoteProfileSnapshotServe(sender)
+    if not self.state or type(sender) ~= "string" or sender == "" then return end
+    self.state._profileSnapshotServe = self.state._profileSnapshotServe or {}
+    self.state._profileSnapshotServe[sender] = self:_Now()
+end
+
 function Sync:_NoteAdminGrantMiss(sender, member)
     if not self.state or type(sender) ~= "string" or sender == "" then return end
     if type(member) ~= "string" or member == "" then return end

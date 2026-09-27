@@ -874,6 +874,10 @@ function Sync:HandleNeedProfile(sender, payload)
     end
 
     local serveRole = self.state.isCoordinator and "coordinator" or "helper"
+    if not self:_ProfileSnapshotServeAllowed(sender) then
+        return
+    end
+    self:_NoteProfileSnapshotServe(sender)
     if SF.Debug then
         SF.Debug:Info("SYNC", "Serving profile snapshot as %s to %s", serveRole, tostring(sender))
     end

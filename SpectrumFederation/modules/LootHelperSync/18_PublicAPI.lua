@@ -137,6 +137,7 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
+    self.state._profileSnapshotServe = nil
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
@@ -957,6 +958,7 @@ function Sync:_ResetSessionState(reason)
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
+    self.state._profileSnapshotServe = nil
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
