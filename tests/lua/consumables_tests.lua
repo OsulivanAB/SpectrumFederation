@@ -2221,16 +2221,32 @@ local function checkConvergenceRound()
         consumablesEventCount = 0,
         consumablesEventFingerprint = 0,
     }
+    local savedNow = Sync._Now
+    local nowCfg = 1000
+    Sync._Now = function() return nowCfg end
     Sync:_ConsiderConsumablesCatchUp(cfgPayload)
     assertEq(cfgCalls, 1, "a config difference asks for a snapshot")
     assertEq(cfgP._consumablesConfigCatchUpSession, nil, "a snapshot request that is not registered does not latch")
+    assertEq(cfgP._consumablesConfigCatchUpAt, nil, "a snapshot request that is not registered does not record an attempt")
     assertEq(cfgOpts and cfgOpts.coordinatorOnly, true, "the config snapshot asks only the coordinator")
     allowCfg = true
     Sync:_ConsiderConsumablesCatchUp(cfgPayload)
     assertEq(cfgCalls, 2, "the next heartbeat retries the config snapshot")
     assertTrue(type(cfgP._consumablesConfigCatchUpSession) == "string", "a registered config snapshot latches that coordinator epoch")
+    assertEq(cfgP._consumablesConfigCatchUpAt, 1000, "a registered config snapshot records the attempt time")
     Sync:_ConsiderConsumablesCatchUp(cfgPayload)
-    assertEq(cfgCalls, 2, "a latched config snapshot is not requested again")
+    nowCfg = 1119
+    Sync:_ConsiderConsumablesCatchUp(cfgPayload)
+    assertEq(cfgCalls, 2, "a latched config snapshot is not requested again inside the cooldown")
+    nowCfg = 1120
+    Sync:_ConsiderConsumablesCatchUp(cfgPayload)
+    assertEq(cfgCalls, 3, "a latched config snapshot is requested again after 120 seconds")
+    assertEq(cfgP._consumablesConfigCatchUpAt, 1120, "the retry records the new attempt time")
+    cfgP._consumables.configSeq = 0
+    Sync:_ConsiderConsumablesCatchUp(cfgPayload)
+    assertEq(cfgP._consumablesConfigCatchUpAt, nil, "a matching configuration clears the attempt time")
+    assertEq(cfgCalls, 3, "a matching configuration does not request another snapshot")
+    Sync._Now = savedNow
 
     local loaded, loadErr = pcall(function()
         load("SpectrumFederation/modules/LootHelperSync/11_Heartbeat.lua")
@@ -3333,9 +3349,28 @@ function checkAdoptedLedgerRound()
     GetGuildBankTabInfo = savedTabInfo
     C_Item = savedItemApi
 
-    local deferP = profile("defer-del", admin)
+    local early = profile("defer-early", admin)
+    early._sfConsumablesDeleteAfter = true
     local savedDb = SF.lootHelperDB
     local savedDelete = SF.DeleteLootHelperProfile
+    SF.lootHelperDB = nil
+    RT:CompleteDeferredProfileDeletes()
+    assertTrue(early._sfConsumablesDeleteAfter, "cleanup waits until the loot helper database exists")
+    local earlyDeleted = nil
+    SF.lootHelperDB = { profiles = { ["defer-early"] = early } }
+    SF.DeleteLootHelperProfile = function(_, id)
+        earlyDeleted = id
+        SF.lootHelperDB.profiles[id] = nil
+        return true
+    end
+    RT:CompleteDeferredProfileDeletes()
+    assertEq(earlyDeleted, "defer-early", "cleanup deletes a marked profile once the database exists")
+    SF.lootHelperDB = savedDb
+    SF.DeleteLootHelperProfile = savedDelete
+
+    local deferP = profile("defer-del", admin)
+    savedDb = SF.lootHelperDB
+    savedDelete = SF.DeleteLootHelperProfile
     local savedIntent = RT.depositIntent
     local savedScan = RT.ScanBags
     local savedTabs = RT.TabItemCounts

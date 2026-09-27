@@ -316,14 +316,21 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         tostring(self.state.coordEpoch),
         tostring(self.state.coordinator),
     }, ":")
-    if S.CoordinatorConfigDiffers and S.CoordinatorConfigDiffers(localDesc, remote)
-        and profile._consumablesConfigCatchUpSession ~= authority then
+    local configDiffers = S.CoordinatorConfigDiffers and S.CoordinatorConfigDiffers(localDesc, remote)
+    local nowCfg = self._Now and self:_Now() or 0
+    if not configDiffers then
+        profile._consumablesConfigCatchUpAt = nil
+    end
+    local catchUpAt = tonumber(profile._consumablesConfigCatchUpAt)
+    local configRetryDue = (not catchUpAt) or catchUpAt > nowCfg or (nowCfg - catchUpAt) >= 120
+    if configDiffers and (profile._consumablesConfigCatchUpSession ~= authority or configRetryDue) then
         local requested = false
         if self.RequestProfileSnapshot then
             requested = self:RequestProfileSnapshot("consumables-config", { coordinatorOnly = true }) and true or false
         end
         if requested then
             profile._consumablesConfigCatchUpSession = authority
+            profile._consumablesConfigCatchUpAt = nowCfg
             profile._consumablesAdoptNextSnapshot = self.state.sessionId
         end
     end

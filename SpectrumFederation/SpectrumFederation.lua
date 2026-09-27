@@ -30,6 +30,10 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
         -- Initialize Loot Helper Database
         if SF.InitializeLootHelperDatabase then
             SF:InitializeLootHelperDatabase()
+            -- ADDON_LOADED starts the consumables runtime before this database exists.
+            if SF.ConsumablesRuntime and SF.ConsumablesRuntime.CompleteDeferredProfileDeletes then
+                SF.ConsumablesRuntime:CompleteDeferredProfileDeletes()
+            end
         end
 
         -- Enable Loot Helper Sync system (registers slash commands and event handlers)
