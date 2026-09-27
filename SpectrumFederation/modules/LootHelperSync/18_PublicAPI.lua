@@ -1272,7 +1272,16 @@ function Sync:ReannounceSession()
     }
 
     local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_REANNOUNCE, payload, dist, nil, "ALERT") and true or false
-    if not Sync.ApplySesStartSendResult(self.state, self.state.sessionId, sendOk) then
+    local accepted = false
+    if type(Sync.ApplySesStartSendResult) == "function" then
+        accepted = Sync.ApplySesStartSendResult(self.state, self.state.sessionId, sendOk) and true or false
+    elseif sendOk and self.state and self.state.active == true and type(self.state.sessionId) == "string" and self.state.sessionId ~= "" then
+        -- The shared helper is loaded with admin convergence. Keep the same
+        -- send-accepted boundary if this file is exercised before that module.
+        self.state._sessionAnnounced = self.state.sessionId
+        accepted = true
+    end
+    if not accepted then
         if SF.Debug then
             SF.Debug:Error("SYNC", "SES_REANNOUNCE send was not accepted (sessionId=%s); early preparation stays closed",
                 tostring(self.state.sessionId))
