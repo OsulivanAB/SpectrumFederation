@@ -650,8 +650,9 @@ function S.ApplyRemoteEvent(profile, event, sender, opts)
     event.writer = writer
     local ok, status = C.AppendEvent(profile, event, {
         replaceOrder = opts.coordinatorRelay == true,
+        silent = opts.silent == true,
     })
-    if ok and status ~= "duplicate" then
+    if ok and status ~= "duplicate" and status ~= "replaced" and not opts.skipGrantUse then
         S.NoteTradeGrantUse(profile, event)
         S.NoteWithdrawGrantUse(profile, event)
     end

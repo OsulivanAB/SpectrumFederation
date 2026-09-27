@@ -1421,9 +1421,26 @@ function Runtime:CaptureBaseline(silent)
     local cfg = C.Ensure(profile)
     if not cfg.bankTab then
         self.bankBaseline = nil
+        self.bankSlotBaseline = nil
+        self.bankSlotBaselineTab = nil
         return
     end
     self.bankBaseline = self:TabItemCounts(cfg.bankTab)
+    self.bankSlotBaseline = {}
+    self.bankSlotBaselineTab = cfg.bankTab
+    local slotCount = GetGuildBankNumSlots and GetGuildBankNumSlots(cfg.bankTab) or 0
+    if slotCount > 98 then slotCount = 98 end
+    for slot = 1, slotCount do
+        local link = GetGuildBankItemLink and GetGuildBankItemLink(cfg.bankTab, slot) or nil
+        local slotItem = C.ItemIdFromText and C.ItemIdFromText(link) or nil
+        if slotItem and GetGuildBankItemInfo then
+            local _, stack = GetGuildBankItemInfo(cfg.bankTab, slot)
+            local stackCount = tonumber(stack) or 0
+            if stackCount > 0 then
+                self.bankSlotBaseline[slot] = { itemId = slotItem, count = stackCount }
+            end
+        end
+    end
     self.bankBaselineBags = {}
     self:ScanBags()
     for itemId, qty in pairs(self.bagCounts or {}) do
@@ -1482,9 +1499,16 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
         count = tonumber(itemCount) or 0
         slotStillOccupied = count > 0
     end
+    local emptiedBefore = nil
     if not slotStillOccupied then
         itemId = self:CursorItemId()
         count = itemId and self.bankBaseline and self.bankBaseline[itemId] or 0
+        local baseline = self.bankSlotBaseline
+        local row = self.bankSlotBaselineTab == tab and type(baseline) == "table" and baseline[slot] or nil
+        if itemId and type(row) == "table" and row.itemId == itemId then
+            emptiedBefore = tonumber(row.count) or 0
+            if emptiedBefore <= 0 then emptiedBefore = nil end
+        end
     end
     if (not itemId or count <= 0) and fromAutoStore then
         itemId, count = self:AutoStoreLoss(tab)
@@ -1502,6 +1526,18 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
     local selfId = self:SelfId()
     local assignment = cfg.assignments[tostring(itemId)]
     local now = GetTime and GetTime() or 0
+    local profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId
+    local epoch = assignment and tonumber(assignment.epoch) or 0
+    local assigned = C.CrafterHasItem(profile, selfId, itemId) == true
+    local admin = C.IsCanonicalAdmin(profile, selfId) == true
+    local function rememberSlot(intent, before)
+        before = tonumber(before) or 0
+        if before <= 0 then return end
+        if type(intent.slots) ~= "table" then intent.slots = {} end
+        if #intent.slots < MAX_WITHDRAW_SLOTS then
+            intent.slots[#intent.slots + 1] = { slot = slot, before = before }
+        end
+    end
     if type(self.withdrawIntents) ~= "table" then
         self.withdrawIntents = {}
         if type(self.withdrawIntent) == "table" then
@@ -1511,15 +1547,17 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
     local queue = self.withdrawIntents
     for i = 1, #queue do
         local existing = queue[i]
-        if existing.itemId == itemId and existing.tab == tab then
+        if existing.itemId == itemId and existing.tab == tab
+            and existing.profileId == profileId
+            and existing.generation == cfg.generation
+            and (tonumber(existing.epoch) or 0) == epoch
+            and existing.assigned == assigned
+            and existing.admin == admin then
             existing.intended = (tonumber(existing.intended) or 0) + count
             if slotStillOccupied then
-                if type(existing.slots) ~= "table" then
-                    existing.slots = {}
-                end
-                if #existing.slots < MAX_WITHDRAW_SLOTS then
-                    existing.slots[#existing.slots + 1] = { slot = slot, before = count }
-                end
+                rememberSlot(existing, count)
+            else
+                rememberSlot(existing, emptiedBefore)
             end
             self.withdrawIntent = queue[1]
             self:ArmWithdrawTimer()
@@ -1536,15 +1574,21 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
         intended = count,
         beforeTab = beforeTab,
         beforeBags = beforeBags,
-        slots = slotStillOccupied and { { slot = slot, before = count } } or nil,
+        slots = nil,
         generation = cfg.generation,
-        epoch = assignment and assignment.epoch or 0,
-        assigned = C.CrafterHasItem(profile, selfId, itemId) == true,
-        admin = C.IsCanonicalAdmin(profile, selfId) == true,
-        profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId,
+        epoch = epoch,
+        assigned = assigned,
+        admin = admin,
+        profileId = profileId,
         token = self:NextToken("withdraw"),
         startedAt = now,
     }
+    local createdIntent = queue[#queue]
+    if slotStillOccupied then
+        rememberSlot(createdIntent, count)
+    else
+        rememberSlot(createdIntent, emptiedBefore)
+    end
     self.withdrawIntent = queue[1]
     self:ArmWithdrawTimer()
     local created = queue[#queue]
