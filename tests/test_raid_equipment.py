@@ -173,12 +173,12 @@ def test_early_preparation_whispers_production_lua():
     assert public_api.count("AttachToPayload") >= 2
     reannounce_fn = reannounce.split("function Sync:HandleSessionReannounce", 1)[1]
     reannounce_fn = reannounce_fn.split("\nfunction ", 1)[0]
-    assert "ApplyHeartbeat" in reannounce_fn
-    assert "IsSenderAuthorized" in reannounce_fn
+    assert "AcceptRemotePrepNotice" in reannounce_fn
     heartbeat_fn = reannounce.split("function Sync:HandleSessionHeartbeat", 1)[1]
     heartbeat_fn = heartbeat_fn.split("\nfunction ", 1)[0]
-    apply_at = heartbeat_fn.index(":ApplyHeartbeat")
-    assert "IsSenderAuthorized" in heartbeat_fn[:apply_at]
+    assert "AcceptRemotePrepNotice" in heartbeat_fn
+    assert "ApplySesStartSendResult" in public_api
+    assert "entry.blended" in raid_check
     evaluate = source.split("function EarlyPrep:EvaluateMember", 1)[1]
     evaluate = evaluate.split("\nfunction ", 1)[0]
     assert evaluate.count(":GetAuthoritativePreparation") == 1

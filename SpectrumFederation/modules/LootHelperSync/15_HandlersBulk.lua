@@ -690,6 +690,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
     -- Now that we actually have the profile, run the normal sync assessment path:
     -- - if missing logs, it will Request MissingLogs()
     -- - if fully synced, it will whisper HAVE_PROFILE to coordinator
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.FlushDeferredPrepNotice then
+        earlyPrep:FlushDeferredPrepNotice()
+    end
+
     self:RunAfter(0, function()
        if not self.state.active then return end
        if self.state.sessionId ~= payload.sessionId then return end

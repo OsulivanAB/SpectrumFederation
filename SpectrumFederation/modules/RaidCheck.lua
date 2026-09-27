@@ -1946,6 +1946,13 @@ function RC:GetAuthoritativePreparation(memberId, cfg)
 	if entry.status ~= "ready" then
 		return nil, "incomplete"
 	end
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	if earlyPrep and earlyPrep.ObservationAuthoritative and not earlyPrep.ObservationAuthoritative(entry) then
+		return nil, "incomplete"
+	end
+	if entry.blended == true then
+		return nil, "incomplete"
+	end
 	return PreparationFromCaptured(entry, cfg)
 end
 
@@ -1983,6 +1990,7 @@ function RC:_HandleInspectReady(guid)
 		-- slots missing link/texture temporarily). Prefer the new snapshot where
 		-- it has real data, but do not overwrite a previously-known slot with a
 		-- completely blank result.
+		local blended = false
 		local fallbackSlots = entry and entry.slotsByInventory or nil
 		if type(fallbackSlots) == "table" then
 			for inventorySlot, fallbackSlot in pairs(fallbackSlots) do
@@ -1991,6 +1999,7 @@ function RC:_HandleInspectReady(guid)
 					local hasNext = SlotHasAnyItemData(nextSlot) or (type(nextSlot) == "table" and nextSlot.texture) or false
 					local hasFallback = SlotHasAnyItemData(fallbackSlot) or fallbackSlot.texture or false
 					if (not hasNext) and hasFallback then
+						blended = true
 						local copy = {}
 						for key, value in pairs(fallbackSlot) do
 							copy[key] = value
@@ -2007,10 +2016,15 @@ function RC:_HandleInspectReady(guid)
 				NormalizeSlotData(slotData)
 			end
 		end
+		local freshItemLevel = CanonicalOverallItemLevel(captured.overallEquippedItemLevel)
 		captured.overallEquippedItemLevel = KeepKnownOverallItemLevel(
 			captured.overallEquippedItemLevel,
 			entry and entry.overallEquippedItemLevel
 		)
+		if not freshItemLevel and CanonicalOverallItemLevel(captured.overallEquippedItemLevel) then
+			blended = true
+		end
+		captured.blended = blended
 		RecalculateCapturedSummary(captured)
 	end
 
@@ -2026,6 +2040,7 @@ function RC:_HandleInspectReady(guid)
 		entry.overallEquippedItemLevel = captured.overallEquippedItemLevel
 		entry.averageItemLevel = captured.overallEquippedItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
+		entry.blended = captured.blended == true
 		PersistProfileEquipmentSnapshot(active.id, captured)
 
 		local policyObs = BuildPolicyObservation(captured)

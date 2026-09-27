@@ -1271,7 +1271,14 @@ function Sync:ReannounceSession()
         replies     = {},
     }
 
-    SF.LootHelperComm:Send("CONTROL", self.MSG.SES_REANNOUNCE, payload, dist, nil, "ALERT")
+    local sendOk = SF.LootHelperComm:Send("CONTROL", self.MSG.SES_REANNOUNCE, payload, dist, nil, "ALERT") and true or false
+    if not Sync.ApplySesStartSendResult(self.state, self.state.sessionId, sendOk) then
+        if SF.Debug then
+            SF.Debug:Error("SYNC", "SES_REANNOUNCE send was not accepted (sessionId=%s); early preparation stays closed",
+                tostring(self.state.sessionId))
+        end
+        return
+    end
 
     -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
     self.state._sessionAnnounced = self.state.sessionId

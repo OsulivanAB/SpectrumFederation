@@ -210,6 +210,9 @@ function EarlyPrep.WindowOpen(ctx)
 	if ctx.profileReady ~= true then
 		return false, "profile"
 	end
+	if ctx.groupIsRaid ~= true then
+		return false, "party"
+	end
 	if ctx.raidCheckBegun == true then
 		return false, "raid_check"
 	end
@@ -495,6 +498,7 @@ function EarlyPrep:ComputeWindow()
 		isCoordinator = true
 	end
 	local profile = self:GetSessionProfile()
+	local groupIsRaid = IsInRaid and IsInRaid() and true or false
 	local raidCheckBegun = false
 	if self.notice and self.notice.sessionId and self.notice.raidCheckBegun == true then
 		raidCheckBegun = true
@@ -506,6 +510,7 @@ function EarlyPrep:ComputeWindow()
 		isCoordinator = isCoordinator,
 		isEffectiveAdmin = self:IsEffectiveAdmin(profile),
 		profileReady = profile ~= nil,
+		groupIsRaid = groupIsRaid,
 		raidCheckBegun = raidCheckBegun,
 	})
 	return open and true or false
@@ -573,6 +578,7 @@ function EarlyPrep:OnSessionReset(reason)
 	self._windowOpen = false
 	self._wasCoordinator = false
 	self._rejectLogged = {}
+	self._deferredNotice = nil
 	local raidCheck = SF.RaidCheck
 	if raidCheck and type(raidCheck.SetBackgroundInspectEnabled) == "function" then
 		raidCheck:SetBackgroundInspectEnabled(false, self.CONSUMER_REASON)
@@ -619,6 +625,104 @@ function EarlyPrep:HeartbeatPayload()
 		raidCheckBegun = self.notice.raidCheckBegun and true or false,
 		warned = EarlyPrep.WarnedArray(self.notice),
 	}
+end
+
+-- A missing local profile is not the same as a known unauthorized sender.
+-- "defer" keeps the snapshot until that profile can prove the sender.
+function EarlyPrep.PrepNoticeSenderState(profilePresent, authorized)
+	if profilePresent ~= true then
+		return "defer"
+	end
+	if authorized == true then
+		return "apply"
+	end
+	return "reject"
+end
+
+-- A cache entry that reused an older slot or item level is not a fresh observation.
+function EarlyPrep.ObservationAuthoritative(entry)
+	if type(entry) ~= "table" then
+		return false
+	end
+	return entry.blended ~= true
+end
+
+function EarlyPrep:DeferPrepNotice(sessionId, profileId, sender, prepNotice)
+	if type(prepNotice) ~= "table" or type(sessionId) ~= "string" or sessionId == "" then
+		return false
+	end
+	if type(profileId) ~= "string" or profileId == "" then
+		return false
+	end
+	local deferred = self._deferredNotice
+	if type(deferred) ~= "table" or deferred.sessionId ~= sessionId or deferred.profileId ~= profileId then
+		deferred = {
+			sessionId = sessionId,
+			profileId = profileId,
+			sender = sender,
+			notice = EarlyPrep.NewNotice(),
+		}
+		deferred.notice.sessionId = sessionId
+		deferred.notice.profileId = profileId
+		self._deferredNotice = deferred
+	end
+	if type(sender) == "string" and sender ~= "" then
+		deferred.sender = sender
+	end
+	EarlyPrep.ApplyNotice(deferred.notice, sessionId, profileId, {
+		sessionId = sessionId,
+		profileId = profileId,
+		memberId = prepNotice.memberId,
+		warned = prepNotice.warned,
+		raidCheckBegun = prepNotice.raidCheckBegun == true,
+	})
+	return true
+end
+
+function EarlyPrep:FlushDeferredPrepNotice()
+	local deferred = self._deferredNotice
+	if type(deferred) ~= "table" then
+		return false
+	end
+	local sync = SF.LootHelperSync
+	if not sync or not sync.state or sync.state.active ~= true
+		or sync.state.sessionId ~= deferred.sessionId
+		or sync.state.profileId ~= deferred.profileId
+	then
+		self._deferredNotice = nil
+		return false
+	end
+	local profilePresent = type(sync.FindLocalProfileById) == "function" and sync:FindLocalProfileById(deferred.profileId) ~= nil
+	local authorized = profilePresent and type(sync.IsSenderAuthorized) == "function" and sync:IsSenderAuthorized(deferred.profileId, deferred.sender) == true
+	local decision = EarlyPrep.PrepNoticeSenderState(profilePresent, authorized)
+	if decision == "defer" then
+		return false
+	end
+	self._deferredNotice = nil
+	if decision ~= "apply" then
+		return false
+	end
+	return self:ApplyHeartbeat(deferred.sessionId, deferred.profileId, {
+		warned = EarlyPrep.WarnedArray(deferred.notice),
+		raidCheckBegun = deferred.notice.raidCheckBegun == true,
+	})
+end
+
+function EarlyPrep:AcceptRemotePrepNotice(sender, sessionId, profileId, prepNotice)
+	if type(prepNotice) ~= "table" then
+		return false
+	end
+	local sync = SF.LootHelperSync
+	local profilePresent = sync and type(sync.FindLocalProfileById) == "function" and sync:FindLocalProfileById(profileId) ~= nil
+	local authorized = profilePresent and sync and type(sync.IsSenderAuthorized) == "function" and sync:IsSenderAuthorized(profileId, sender) == true
+	local decision = EarlyPrep.PrepNoticeSenderState(profilePresent, authorized)
+	if decision == "defer" then
+		return self:DeferPrepNotice(sessionId, profileId, sender, prepNotice)
+	end
+	if decision ~= "apply" then
+		return false
+	end
+	return self:ApplyHeartbeat(sessionId, profileId, prepNotice)
 end
 
 function EarlyPrep:ApplyHeartbeat(sessionId, profileId, prepNotice)
@@ -854,6 +958,7 @@ function EarlyPrep:Refresh(reason)
 	end
 	self._refreshing = true
 	self:Install()
+	self:FlushDeferredPrepNotice()
 	self:SyncNoticeToSession()
 
 	local open = self:ComputeWindow()

@@ -42,6 +42,7 @@ local openCtx = {
 	isCoordinator = true,
 	isEffectiveAdmin = true,
 	profileReady = true,
+	groupIsRaid = true,
 	raidCheckBegun = false,
 	eligible = true,
 	inRaid = true,
@@ -78,6 +79,13 @@ assertEq(why, "coordinator", "coordinator reason")
 closed.isCoordinator = true
 closed.settingEnabled = false
 assertTrue(not EarlyPrep.WindowOpen(closed), "disabled setting keeps the window closed")
+
+closed.settingEnabled = true
+closed.groupIsRaid = false
+open, why = EarlyPrep.WindowOpen(closed)
+assertTrue(not open, "a party does not open early preparation")
+assertEq(why, "party", "party reason")
+closed.groupIsRaid = true
 
 closed.settingEnabled = true
 closed.isEffectiveAdmin = false
@@ -356,6 +364,35 @@ assertEq(recorded, EarlyPrep.MAX_NOTICE_MEMBERS, "warnings fit under the cap")
 assertTrue(not EarlyPrep.WarningRecordable(fullNotice, "Extra-Realm"), "a full warning list cannot record another player")
 assertTrue(not EarlyPrep.MarkWarned(fullNotice, "Extra-Realm"), "the cap rejects another warning")
 assertTrue(EarlyPrep.IsWarned(fullNotice, "Member01-Realm"), "the cap does not drop an existing warning")
+
+assertEq(EarlyPrep.PrepNoticeSenderState(false, false), "defer", "a missing profile defers the snapshot")
+assertEq(EarlyPrep.PrepNoticeSenderState(true, true), "apply", "an authorized sender applies the snapshot")
+assertEq(EarlyPrep.PrepNoticeSenderState(true, false), "reject", "a known non-admin is rejected")
+assertTrue(not EarlyPrep.ObservationAuthoritative({ blended = true }), "a blended inspect is not authoritative")
+assertTrue(EarlyPrep.ObservationAuthoritative({ status = "ready" }), "an unblended inspect stays authoritative")
+
+EarlyPrep._deferredNotice = nil
+EarlyPrep.notice = EarlyPrep.NewNotice()
+SF.LootHelperSync.FindLocalProfileById = function()
+	return nil
+end
+SF.LootHelperSync.IsSenderAuthorized = function()
+	return false
+end
+EarlyPrep:AcceptRemotePrepNotice("Admin-Realm", "session-a", "profile-a", {
+	warned = { "Bob-Realm" },
+	raidCheckBegun = true,
+})
+assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "a deferred snapshot is not applied before the profile exists")
+SF.LootHelperSync.FindLocalProfileById = function()
+	return { id = "profile-a" }
+end
+SF.LootHelperSync.IsSenderAuthorized = function()
+	return true
+end
+assertTrue(EarlyPrep:FlushDeferredPrepNotice(), "the deferred snapshot applies once the sender is authorized")
+assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "the applied snapshot records Bob")
+assertTrue(EarlyPrep.notice.raidCheckBegun == true, "the applied snapshot keeps raid check begun")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
