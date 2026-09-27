@@ -463,7 +463,10 @@ function C.Ensure(profile)
         }
     end
     local cfg = profile._consumables
-    if type(cfg.generation) ~= "number" or cfg.generation < 1 then cfg.generation = 1 end
+    if type(cfg.generation) ~= "number" or cfg.generation < 1
+        or cfg.generation ~= math.floor(cfg.generation) or cfg.generation > C.MAX_EVENT_SEQ then
+        cfg.generation = 1
+    end
     if type(cfg.configSeq) ~= "number" or cfg.configSeq < 0 then cfg.configSeq = 0 end
     if type(cfg.eventSeq) ~= "number" or cfg.eventSeq < 0 or cfg.eventSeq ~= math.floor(cfg.eventSeq) then
         cfg.eventSeq = 0
@@ -812,7 +815,7 @@ local function BumpConfig(profile)
     Invalidate(profile)
 end
 
-local function CopyHistory(history)
+local function CopyHistory(history, nameBudget)
     if type(history) ~= "table" then return nil end
     local out = {}
     local count = #history
@@ -832,7 +835,13 @@ local function CopyHistory(history)
                     if limit > 64 then limit = 64 end
                     for n = 1, limit do
                         local name = Norm(names[n])
-                        if name then crafters[#crafters + 1] = name end
+                        if name and #name <= C.MAX_EVENT_NAME then
+                            if nameBudget then
+                                if nameBudget.left <= 0 then break end
+                                nameBudget.left = nameBudget.left - 1
+                            end
+                            crafters[#crafters + 1] = name
+                        end
                     end
                     table.sort(crafters)
                 end
@@ -1789,9 +1798,20 @@ function C.ValidateSnapshot(data)
     return true
 end
 
+function C.ValidGeneration(value)
+    local generation = tonumber(value)
+    if not generation or generation ~= math.floor(generation) or generation < 1 or generation > C.MAX_EVENT_SEQ then
+        return nil
+    end
+    return generation
+end
+
 function C.ReplaceConfig(profile, payload)
     local cfg = C.Ensure(profile)
-    cfg.generation = tonumber(payload.generation) or cfg.generation or 1
+    local generation = C.ValidGeneration(payload.generation)
+    if generation then
+        cfg.generation = generation
+    end
     cfg.configSeq = tonumber(payload.configSeq) or cfg.configSeq or 0
     local remoteEventSeq = tonumber(payload.eventSeq)
     if remoteEventSeq and remoteEventSeq == math.floor(remoteEventSeq)
@@ -1804,6 +1824,7 @@ function C.ReplaceConfig(profile, payload)
     if not IsBankTab(cfg.bankTab) then cfg.bankTab = nil end
     cfg.crafters = CopyCrafterRoster(payload.crafters)
     cfg.assignments = {}
+    local historyNames = { left = C.MAX_ASSIGNMENT_PAIRS * C.MAX_ASSIGNMENT_HISTORY }
     if type(payload.assignments) == "table" then
         local visits = 0
         local pairsLeft = C.MAX_ASSIGNMENT_PAIRS
@@ -1834,7 +1855,7 @@ function C.ReplaceConfig(profile, payload)
                             itemId = itemId,
                             epoch = epoch,
                             crafters = crafters,
-                            history = CopyHistory(row.history),
+                            history = CopyHistory(row.history, historyNames),
                         }
                     end
                 end
@@ -1987,7 +2008,14 @@ function C.MergeSnapshot(profile, data, opts)
     local ok, err = C.ValidateSnapshot(data)
     if not ok then return false, err end
     local localDesc = C.Descriptor(profile)
-    local remoteGen = tonumber(data.generation) or 1
+    local remoteGen = C.ValidGeneration(data.generation)
+    if not remoteGen then
+        if data.generation == nil then
+            remoteGen = 1
+        else
+            remoteGen = tonumber(profile._consumables.generation) or 1
+        end
+    end
     local remoteSeq = tonumber(data.configSeq) or 0
     opts = type(opts) == "table" and opts or {}
     local fromCoordinator = opts.consumablesFromCoordinator == true

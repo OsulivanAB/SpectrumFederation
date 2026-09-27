@@ -4517,6 +4517,12 @@ function checkCodexSnapshotRound()
     RT.openTrade = open
     local savedLink = GetTradeTargetItemLink
     local savedInfo = GetTradeTargetItemInfo
+    local savedAcceptTimer = C_Timer
+    local acceptQueued = {}
+    C_Timer = {
+        After = function(_, fn) acceptQueued[#acceptQueued + 1] = fn end,
+        NewTimer = savedAcceptTimer and savedAcceptTimer.NewTimer,
+    }
     GetTradeTargetItemLink = function(slot)
         if slot == 1 then return "item:" .. tostring(aqirite) end
         return nil
@@ -4528,9 +4534,38 @@ function checkCodexSnapshotRound()
     RT:OnTradeAccept(1, 1)
     assertTrue(open.both, "both sides accepting captures the trade")
     assertEq(open.target[aqirite], 4, "the first acceptance records the offered quantity")
+    RT:OnTradeAccept(0, 0)
+    assertTrue(open.both, "a completion reset keeps the accepted trade")
+    assertEq(open.target[aqirite], 4, "a completion reset keeps the captured offer")
+    local savedCommit = RT.Commit
+    local savedById = RT.ProfileById
+    local commits = 0
+    RT.Commit = function() commits = commits + 1 end
+    RT.ProfileById = function() return {} end
+    open.role = "receiver"
+    open.frozen = {
+        items = { [aqirite] = { assignedToReceiver = true, epoch = 1, custodyQty = 0 } },
+        generation = 1,
+        token = "trade-close",
+        donor = admin,
+        receiver = vann,
+        timestamp = 1,
+    }
+    RT:OnTradeClosed()
+    assertEq(commits, 1, "closing before the reset frame still records the accepted trade")
+    assertEq(#acceptQueued, 1, "the completion reset was deferred one frame")
+    acceptQueued[1]()
+    open = { both = false, target = {} }
+    RT.openTrade = open
+    acceptQueued = {}
+    RT:OnTradeAccept(1, 1)
+    assertEq(open.target[aqirite], 4, "a new trade can capture an offer again")
     RT:OnTradeAccept(1, 0)
-    assertFalse(open.both, "clearing one acceptance forgets that both sides accepted")
-    assertEq(open.target[aqirite], nil, "clearing acceptance drops the captured offer")
+    assertTrue(open.both, "an acceptance reset keeps the offer until the trade stays open")
+    assertEq(#acceptQueued, 1, "an acceptance reset is checked on the next frame")
+    acceptQueued[1]()
+    assertFalse(open.both, "a reset that leaves the trade open forgets that both sides accepted")
+    assertEq(open.target[aqirite], nil, "that reset drops the captured offer")
     GetTradeTargetItemInfo = function(slot)
         if slot == 1 then return nil, nil, 2 end
         return nil, nil, 0
@@ -4539,6 +4574,9 @@ function checkCodexSnapshotRound()
     assertTrue(open.both, "the next acceptance can capture the trade again")
     assertEq(open.target[aqirite], 2, "the next acceptance records the new quantity")
     RT.openTrade = nil
+    RT.Commit = savedCommit
+    RT.ProfileById = savedById
+    C_Timer = savedAcceptTimer
     GetTradeTargetItemLink = savedLink
     GetTradeTargetItemInfo = savedInfo
 
@@ -4677,6 +4715,159 @@ function checkCodexSnapshotRound()
     Sync.FindLocalProfileById = nil
 end
 checkCodexSnapshotRound()
+
+function checkReviewHeadRound()
+    local savedState = Sync.state
+    local genP = profile("bad-gen", admin)
+    local keptId = "ce:bad-gen:" .. admin .. ":1"
+    assertTrue(select(1, C.AppendEvent(genP, {
+        id = keptId, type = C.EVENT.DONATION, actor = admin, writer = admin,
+        itemId = aqirite, quantity = 1, generation = 1, timestamp = 1, order = 1,
+    }, { silent = true })), "the generation fixture stores a current event")
+    Sync.state = { active = true, isCoordinator = false, coordEpoch = 1 }
+    assertTrue(C.MergeSnapshot(genP, {
+        generation = 1.5,
+        configSeq = genP._consumables.configSeq,
+        crafters = {},
+        assignments = {},
+    }, { consumablesFromCoordinator = true }), "a fractional generation snapshot is applied")
+    assertEq(genP._consumables.generation, 1, "a fractional snapshot generation is not stored")
+    assertTrue(hasEvent(genP._consumableEvents, keptId), "a fractional generation does not archive the current ledger")
+    assertTrue(select(1, C.ReplaceConfig(genP, {
+        generation = 0, configSeq = 1, crafters = {}, assignments = {},
+    })), "generation zero is still a config payload")
+    assertEq(genP._consumables.generation, 1, "generation zero is not stored")
+    assertTrue(select(1, C.ReplaceConfig(genP, {
+        generation = 2, configSeq = 1, crafters = {}, assignments = {},
+    })), "a whole generation is a config payload")
+    assertEq(genP._consumables.generation, 2, "a positive whole generation is stored")
+    local rejected = S.ApplyRemoteConfig(genP, { generation = -3, configSeq = 2 }, admin, { coordinatorAuthoritative = true })
+    assertFalse(rejected, "a negative coordinator generation is rejected")
+    assertEq(genP._consumables.generation, 2, "a rejected generation leaves the stored generation")
+
+    local longName = string.rep("A", 80) .. "-Realm"
+    local historyNames = {}
+    for i = 1, 3 do
+        historyNames[i] = "Crafter" .. tostring(i) .. "-Realm"
+    end
+    historyNames[#historyNames + 1] = longName
+    assertTrue(select(1, C.ReplaceConfig(genP, {
+        generation = 2,
+        configSeq = 2,
+        assignments = {
+            ["10"] = {
+                itemId = aqirite,
+                epoch = 2,
+                crafters = { vann },
+                history = { { epoch = 1, crafters = historyNames } },
+            },
+        },
+    })), "assignment history is imported")
+    local imported = genP._consumables.assignments[tostring(aqirite)]
+    local sawLong = false
+    local sawShort = false
+    local prior = imported and imported.history and imported.history[1]
+    if prior and type(prior.crafters) == "table" then
+        for i = 1, #prior.crafters do
+            if prior.crafters[i] == longName then sawLong = true end
+            if prior.crafters[i] == historyNames[1] then sawShort = true end
+        end
+    end
+    assertFalse(sawLong, "a history name past the name limit is not stored")
+    assertTrue(sawShort, "a history name within the name limit is stored")
+
+    local archiveP = profile("archive-again", admin)
+    local firstId = "ce:archive-again:" .. admin .. ":1"
+    local secondId = "ce:archive-again:" .. admin .. ":2"
+    archiveP._consumableEventArchive = {
+        { id = firstId, type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+          quantity = 1, generation = 1, timestamp = 1, order = 4 },
+    }
+    C.InvalidateEventIndex(archiveP)
+    local firstFp = C.Descriptor(archiveP).archiveFingerprint
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "Coord-Realm",
+        sessionId = "archive-again",
+        profileId = archiveP._profileId,
+        peers = { ["Coord-Realm"] = { consumablesCapable = true } },
+    }
+    Sync.FindLocalProfileById = function() return archiveP end
+    local savedSafe = Sync.IsSafeModeEnabled
+    local savedRequest = Sync.RequestProfileSnapshot
+    Sync.IsSafeModeEnabled = function() return true end
+    Sync.RequestProfileSnapshot = function() return false end
+    local function catchUp(count, fingerprint)
+        Sync:_ConsiderConsumablesCatchUp({
+            coordinator = "Coord-Realm",
+            profileId = archiveP._profileId,
+            sessionId = "archive-again",
+            consumablesGeneration = 1,
+            consumablesConfigSeq = archiveP._consumables.configSeq,
+            consumablesEventCount = 0,
+            consumablesEventFingerprint = C.Descriptor(archiveP).eventFingerprint,
+            consumablesArchiveCount = count,
+            consumablesArchiveFingerprint = fingerprint,
+        })
+    end
+    catchUp(0, (tonumber(firstFp) or 0) + 1)
+    archiveP._consumableEventArchive[#archiveP._consumableEventArchive + 1] = {
+        id = secondId, type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+        quantity = 2, generation = 1, timestamp = 2, order = 5,
+    }
+    C.InvalidateEventIndex(archiveP)
+    local secondFp = C.Descriptor(archiveP).archiveFingerprint
+    catchUp(0, (tonumber(secondFp) or 0) + 1)
+    local sawFirst, sawSecond = false, false
+    for i = 1, #(archiveP._consumablesUnsent or {}) do
+        if archiveP._consumablesUnsent[i] == firstId then sawFirst = true end
+        if archiveP._consumablesUnsent[i] == secondId then sawSecond = true end
+    end
+    assertTrue(sawFirst, "the first archive mismatch queues the stamped event")
+    assertTrue(sawSecond, "a later archive fingerprint queues the new stamped event")
+    Sync.IsSafeModeEnabled = savedSafe
+    Sync.RequestProfileSnapshot = savedRequest
+    Sync.FindLocalProfileById = nil
+    Sync.state = savedState
+
+    local refreshes = 0
+    local queued = {}
+    local savedTimer = C_Timer
+    local savedSettings = SF.SettingsUI
+    local savedProfile = SF.GetActiveProfile
+    C_Timer = { After = function(_, fn) queued[#queued + 1] = fn end }
+    SF.GetActiveProfile = function() return genP end
+    local page
+    SF.SettingsUI = {
+        RegisterPage = function(_, registered) page = registered end,
+        DefinitionRenderer = {
+            Build = function() end,
+            Refresh = function() refreshes = refreshes + 1 end,
+        },
+    }
+    load("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
+    local panel = { IsShown = function() return true end }
+    page:Build(panel)
+    local before = #queued
+    assertTrue(select(1, C.AppendEvent(genP, {
+        id = "ce:log-refresh:" .. admin .. ":1",
+        type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+        quantity = 1, generation = genP._consumables.generation, timestamp = 3,
+    }, { silent = false })), "a log event notifies the visible log")
+    assertTrue(select(1, C.AppendEvent(genP, {
+        id = "ce:log-refresh:" .. admin .. ":2",
+        type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+        quantity = 1, generation = genP._consumables.generation, timestamp = 4,
+    }, { silent = false })), "a second log event arrives before the refresh")
+    assertEq(#queued - before, 1, "two log events schedule one refresh")
+    queued[#queued]()
+    assertTrue(refreshes >= 1, "the deferred log refresh sorts once")
+    C_Timer = savedTimer
+    SF.SettingsUI = savedSettings
+    SF.GetActiveProfile = savedProfile
+end
+checkReviewHeadRound()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

@@ -133,7 +133,12 @@ function S.ApplyRemoteConfig(profile, payload, sender, opts)
     end
     opts = type(opts) == "table" and opts or {}
     local localDesc = C.Descriptor(profile)
-    local remoteGen = tonumber(payload.generation) or 1
+    local remoteGen = C.ValidGeneration(payload.generation)
+    if payload.generation == nil then
+        remoteGen = 1
+    elseif not remoteGen then
+        return false, "invalid"
+    end
     local remoteSeq = tonumber(payload.configSeq) or 0
     local epoch = opts.coordEpoch
     if opts.coordinatorAuthoritative then

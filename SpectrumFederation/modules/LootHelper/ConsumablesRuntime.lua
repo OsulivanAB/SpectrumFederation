@@ -1184,6 +1184,35 @@ function Runtime:CaptureTargetSlots()
     open.target = actual
 end
 
+function Runtime:InvalidateAcceptReset()
+    self.acceptResetToken = (tonumber(self.acceptResetToken) or 0) + 1
+    self.acceptResetQueued = false
+end
+
+function Runtime:ApplyAcceptReset(token)
+    if token ~= self.acceptResetToken then return end
+    self.acceptResetQueued = false
+    local open = self.openTrade
+    if not open or not open.both then return end
+    open.both = false
+    open.target = {}
+end
+
+-- A completion reset and a real unaccept look the same in this event.
+-- Keep the capture through the rest of this frame so TRADE_CLOSED can record it.
+function Runtime:ScheduleAcceptReset()
+    if self.acceptResetQueued then return end
+    local token = tonumber(self.acceptResetToken) or 0
+    if not (C_Timer and C_Timer.After) then
+        self:ApplyAcceptReset(token)
+        return
+    end
+    self.acceptResetQueued = true
+    C_Timer.After(0, function()
+        self:ApplyAcceptReset(token)
+    end)
+end
+
 function Runtime:OnTradeShow()
     self:CancelPendingTradeTimer()
     local profile = self:AccountingProfile()
@@ -1199,6 +1228,7 @@ function Runtime:OnTradeShow()
         donor, receiver, role = partner, selfId, "receiver"
     end
     if not donor or not receiver then return end
+    self:InvalidateAcceptReset()
     self.openTrade = {
         role = role,
         frozen = C.FreezeTrade(profile, donor, receiver, pending and { pending.line } or nil, pending and pending.token or self:NextToken("trade")),
@@ -1220,16 +1250,21 @@ function Runtime:OnTradeAccept(playerAccepted, targetAccepted)
     local open = self.openTrade
     if not open then return end
     if tonumber(playerAccepted) == 1 and tonumber(targetAccepted) == 1 then
+        self:InvalidateAcceptReset()
         self:CaptureTargetSlots()
         open.both = true
         return
     end
-    open.both = false
+    if open.both then
+        self:ScheduleAcceptReset()
+        return
+    end
     open.target = {}
 end
 
 -- luacheck: globals ERR_TRADE_BAG_FULL ERR_TRADE_TARGET_BAG_FULL ERR_TRADE_MAX_COUNT_EXCEEDED
 function Runtime:ReleaseAcceptedTrade()
+    self:InvalidateAcceptReset()
     local open = self.openTrade
     if not open then return end
     open.both = false
@@ -1245,6 +1280,7 @@ local function TradeAcceptanceFailed(message)
 end
 
 function Runtime:OnTradeClosed()
+    self:InvalidateAcceptReset()
     local open = self.openTrade
     local pending = self.pendingTrade
     self.openTrade = nil

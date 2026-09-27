@@ -185,8 +185,9 @@ local function QueueRefresh()
 			Page:Refresh(Page.panel)
 		end
 	end
+	-- One sort per quarter second while events arrive, not one sort per frame.
 	if C_Timer and C_Timer.After then
-		C_Timer.After(0, run)
+		C_Timer.After(0.25, run)
 	else
 		run()
 	end

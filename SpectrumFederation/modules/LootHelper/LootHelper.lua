@@ -330,8 +330,12 @@ function SF:RehydrateLootHelperDB()
 			if profile._EnsureRewardPotConfig then
 				profile:_EnsureRewardPotConfig()
 			end
-			if profile.EnsureConsumables then
+			if id == db.activeProfileId and profile.EnsureConsumables then
 				profile:EnsureConsumables()
+			else
+				-- Inactive profiles are indexed the first time they are used.
+				profile._consumableEventIds = nil
+				profile._consumableIndexCount = nil
 			end
 		end
 	end

@@ -325,7 +325,8 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     local localArchiveFingerprint = tonumber(localDesc.archiveFingerprint)
     local archiveDiffers = (remoteArchiveCount and remoteArchiveCount ~= (tonumber(localDesc.archiveCount) or 0))
         or (remoteArchiveFingerprint and localArchiveFingerprint and remoteArchiveFingerprint ~= localArchiveFingerprint)
-    self:_QueueAuthoredArchivedConsumablesEvents(profile, archiveDiffers and true or false)
+    local archiveDescriptor = tostring(remoteArchiveCount) .. ":" .. tostring(remoteArchiveFingerprint)
+    self:_QueueAuthoredArchivedConsumablesEvents(profile, archiveDiffers and true or false, archiveDescriptor)
     self:_FlushUnsentConsumablesEvents(profile)
     local authority = table.concat({
         tostring(self.state.sessionId),
@@ -502,7 +503,7 @@ function Sync:_QueueAuthoredOrderedConsumablesEvents(profile, remoteEventCount, 
     profile._consumablesOrderedResendCursor = index
 end
 
-function Sync:_QueueAuthoredArchivedConsumablesEvents(profile, archiveDiffers)
+function Sync:_QueueAuthoredArchivedConsumablesEvents(profile, archiveDiffers, archiveDescriptor)
     if not archiveDiffers then return end
     if self.state and self.state.isCoordinator then return end
     local archive = profile and profile._consumableEventArchive
@@ -510,7 +511,7 @@ function Sync:_QueueAuthoredArchivedConsumablesEvents(profile, archiveDiffers)
     local S = Rules()
     local who = self._SelfId and self:_SelfId() or nil
     if not S or type(who) ~= "string" or who == "" then return end
-    local key = tostring(self.state and self.state.sessionId) .. ":" .. tostring(self.state and self.state.coordinator)
+    local key = tostring(self.state and self.state.sessionId) .. ":" .. tostring(self.state and self.state.coordinator) .. ":" .. tostring(archiveDescriptor)
     if profile._consumablesArchiveResendKey == key then return end
     profile._consumablesArchiveResendKey = key
     local C = Consumables()
