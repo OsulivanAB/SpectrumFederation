@@ -1091,23 +1091,34 @@ function RC:_GetInspectState()
 	return self._inspectState
 end
 
--- Multiple features can require the shared scanner at once. `reason` is the
--- consumer id. One consumer turning off does not stop inspection still
--- required by another. `opts.filter` limits which units that consumer needs;
--- a consumer without a filter requests the whole group.
+-- Multiple features can require the shared scanner at once. `opts.consumerId`
+-- is the stable consumer id; `reason` is only the diagnostic label. One
+-- consumer turning off does not stop inspection still required by another.
+-- `opts.filter` limits which units that consumer needs; a consumer without a
+-- filter requests the whole group.
 function RC:SetBackgroundInspectEnabled(enabled, reason, opts)
 	self:EnsureInspectSupport()
 
 	local state = self:_GetInspectState()
 	state.backgroundInspectConsumers = state.backgroundInspectConsumers or {}
-	reason = (type(reason) == "string" and reason ~= "") and reason or "default"
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	local consumerId
+	if earlyPrep and earlyPrep.ConsumerId then
+		consumerId = earlyPrep.ConsumerId(reason, opts)
+	else
+		consumerId = (type(reason) == "string" and reason ~= "") and reason or "default"
+		if type(opts) == "table" and type(opts.consumerId) == "string" and opts.consumerId ~= "" then
+			consumerId = opts.consumerId
+		end
+	end
+	reason = (type(reason) == "string" and reason ~= "") and reason or consumerId
 	enabled = enabled and true or false
 	local filter = nil
 	if enabled and type(opts) == "table" then
 		filter = opts.filter
 	end
 
-	local prev = state.backgroundInspectConsumers[reason]
+	local prev = state.backgroundInspectConsumers[consumerId]
 	if enabled and prev and prev.filter == filter and state.backgroundInspectEnabled then
 		return
 	end
@@ -1116,19 +1127,18 @@ function RC:SetBackgroundInspectEnabled(enabled, reason, opts)
 	end
 
 	local consumers, any
-	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
 	if earlyPrep and earlyPrep.MutateConsumers then
 		local spec = nil
 		if enabled then
 			spec = { filter = filter }
 		end
-		consumers, any = earlyPrep.MutateConsumers(state.backgroundInspectConsumers, reason, enabled, spec)
+		consumers, any = earlyPrep.MutateConsumers(state.backgroundInspectConsumers, consumerId, enabled, spec)
 		state.backgroundInspectConsumers = consumers
 	else
 		if enabled then
-			state.backgroundInspectConsumers[reason] = { filter = filter }
+			state.backgroundInspectConsumers[consumerId] = { filter = filter }
 		else
-			state.backgroundInspectConsumers[reason] = nil
+			state.backgroundInspectConsumers[consumerId] = nil
 		end
 		any = next(state.backgroundInspectConsumers) ~= nil
 	end
@@ -3142,8 +3152,20 @@ local function CurrentSessionSnapshot()
 		if sync.GetSessionProfileId then
 			profileId = sync:GetSessionProfileId()
 		end
+		local sendAccepted = false
 		if sync.HasAnnouncedCurrentSession then
-			announced = sync:HasAnnouncedCurrentSession(sessionId) and true or false
+			sendAccepted = sync:HasAnnouncedCurrentSession(sessionId) and true or false
+		end
+		local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+		if earlyPrep and earlyPrep.SessionAnnouncedForDedupe then
+			announced = earlyPrep.SessionAnnouncedForDedupe(
+				true,
+				sendAccepted,
+				sync.state and sync.state.isCoordinator,
+				sessionId
+			)
+		else
+			announced = sendAccepted
 		end
 	end
 	return {

@@ -254,6 +254,23 @@ function EarlyPrep.ShouldNoteRaidCheckBegun(mode, opts)
 	return true
 end
 
+-- The coordinator's send-accepted flag is not set on clients that joined
+-- through SES_START or SES_REANNOUNCE. Their active session descriptor is
+-- still the session that shares missing-whisper dedupe. A coordinator who has
+-- not successfully announced yet does not.
+function EarlyPrep.SessionAnnouncedForDedupe(sessionActive, sendAccepted, isCoordinator, sessionId)
+	if sessionActive ~= true then
+		return false
+	end
+	if type(sessionId) ~= "string" or sessionId == "" then
+		return false
+	end
+	if sendAccepted == true then
+		return true
+	end
+	return isCoordinator ~= true
+end
+
 function EarlyPrep.SessionDedupeApplies(run, session)
 	if type(run) ~= "table" or type(session) ~= "table" then
 		return false
@@ -299,6 +316,18 @@ end
 
 function EarlyPrep.PreparedWhisperSuppressedByMissingWarning()
 	return false
+end
+
+-- Diagnostic labels such as "equipment page shown" and "equipment page hidden"
+-- must not become separate consumers. opts.consumerId is the stable key.
+function EarlyPrep.ConsumerId(reason, opts)
+	if type(opts) == "table" and type(opts.consumerId) == "string" and opts.consumerId ~= "" then
+		return opts.consumerId
+	end
+	if type(reason) == "string" and reason ~= "" then
+		return reason
+	end
+	return "default"
 end
 
 function EarlyPrep.MutateConsumers(consumers, reason, enabled, spec)
@@ -559,6 +588,17 @@ function EarlyPrep:NoteReject(sender, reason)
 	end
 	self._rejectLogged[key] = true
 	DebugVerbose("Ignored preparation notice from %s (%s)", tostring(sender), tostring(reason))
+end
+
+function EarlyPrep:AttachToPayload(payload)
+	if type(payload) ~= "table" then
+		return payload
+	end
+	local prepNotice = self:HeartbeatPayload()
+	if type(prepNotice) == "table" then
+		payload.prepNotice = prepNotice
+	end
+	return payload
 end
 
 function EarlyPrep:HeartbeatPayload()

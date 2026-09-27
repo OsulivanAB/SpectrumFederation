@@ -699,6 +699,11 @@ function Sync:OnGroupRosterUpdate()
             if self.state.sessionId ~= sid then return end
             if not SF.LootHelperComm then return end
 
+            local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+            if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
+                earlyPrepAttach:AttachToPayload(payload)
+            end
+
             local okSend = SF.LootHelperComm:Send(
                 "CONTROL",
                 self.MSG.SES_REANNOUNCE,
@@ -1238,6 +1243,10 @@ function Sync:ReannounceSession()
     }
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
+    end
+    local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
+        earlyPrepAttach:AttachToPayload(payload)
     end
 
     if SF.Debug then

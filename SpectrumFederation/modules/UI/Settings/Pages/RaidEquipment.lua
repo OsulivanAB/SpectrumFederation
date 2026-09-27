@@ -461,7 +461,9 @@ local function BuildEquipmentPage(panel)
 		local now = GetTime and GetTime() or 0
 		local manualWindowActive = now <= manualRefreshUntil
 		local enabled = IsEquipmentPageActive() and (IsEquipmentAutoRefreshEnabled() or manualWindowActive) and true or false
-		SF.RaidCheck:SetBackgroundInspectEnabled(enabled, reason or "equipment page")
+		SF.RaidCheck:SetBackgroundInspectEnabled(enabled, reason or "equipment page", {
+			consumerId = "equipment page",
+		})
 	end
 
 	local function ReflowEquipmentPage()

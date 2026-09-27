@@ -158,6 +158,22 @@ def test_early_preparation_whispers_production_lua():
     assert "WasWarned" in unprepared
     assert "WasWarned" not in prepared
     assert "WhisperPrepared" in prepared
+    equipment = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "RaidEquipment.lua"
+    ).read_text(encoding="utf-8")
+    public_api = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "18_PublicAPI.lua"
+    ).read_text(encoding="utf-8")
+    reannounce = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "14_HandlersControl.lua"
+    ).read_text(encoding="utf-8")
+    assert 'consumerId = "equipment page"' in equipment
+    assert "EarlyPrep.ConsumerId" in raid_check or "opts.consumerId" in raid_check
+    assert "SessionAnnouncedForDedupe" in raid_check
+    assert public_api.count("AttachToPayload") >= 2
+    reannounce_fn = reannounce.split("function Sync:HandleSessionReannounce", 1)[1]
+    reannounce_fn = reannounce_fn.split("\nfunction ", 1)[0]
+    assert "ApplyHeartbeat" in reannounce_fn
 
 
 def test_parent_toc_loads_raid_equipment_modules():

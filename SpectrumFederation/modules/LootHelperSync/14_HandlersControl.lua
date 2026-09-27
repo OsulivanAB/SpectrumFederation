@@ -328,6 +328,16 @@ function Sync:HandleSessionReannounce(sender, payload)
         self:_ApplyAdvertisedRCConfig(payload)
     end
 
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if type(payload.prepNotice) == "table" and earlyPrep then
+        if earlyPrep.ApplyHeartbeat then
+            earlyPrep:ApplyHeartbeat(payload.sessionId, payload.profileId, payload.prepNotice)
+        end
+        if earlyPrep.Notify then
+            earlyPrep:Notify("session_reannounce")
+        end
+    end
+
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
     if self._RememberCoordinatorKeepalive then

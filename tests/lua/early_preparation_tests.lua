@@ -307,6 +307,42 @@ end
 assertTrue(refreshes <= 50, "inactive refresh stays bounded")
 assertTrue(not EarlyPrep._windowOpen, "disabled setting leaves the window closed")
 
+local shownId = EarlyPrep.ConsumerId("equipment page shown", { consumerId = "equipment page" })
+local hiddenId = EarlyPrep.ConsumerId("equipment page hidden", { consumerId = "equipment page" })
+assertEq(shownId, "equipment page", "show uses the stable equipment consumer")
+assertEq(hiddenId, shownId, "hide uses the same equipment consumer")
+local pageConsumers = {}
+pageConsumers = EarlyPrep.MutateConsumers(pageConsumers, shownId, true, {})
+pageConsumers = EarlyPrep.MutateConsumers(pageConsumers, EarlyPrep.ConsumerId("auto refresh toggle", { consumerId = "equipment page" }), true, {})
+local pageCount = 0
+for _ in pairs(pageConsumers) do
+	pageCount = pageCount + 1
+end
+assertEq(pageCount, 1, "diagnostic reasons do not create extra equipment consumers")
+pageConsumers = EarlyPrep.MutateConsumers(pageConsumers, hiddenId, false)
+assertEq(next(pageConsumers), nil, "hiding the equipment page removes its consumer")
+
+assertTrue(not EarlyPrep.SessionAnnouncedForDedupe(true, false, true, "session-a"), "unannounced coordinator does not use session dedupe")
+assertTrue(EarlyPrep.SessionAnnouncedForDedupe(true, false, false, "session-a"), "a joined client uses session dedupe")
+assertTrue(EarlyPrep.SessionAnnouncedForDedupe(true, true, true, "session-a"), "an announced coordinator uses session dedupe")
+assertTrue(not EarlyPrep.SessionAnnouncedForDedupe(false, false, false, "session-a"), "an inactive session does not use session dedupe")
+
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+EarlyPrep.MarkWarned(EarlyPrep.notice, "Bob-Realm")
+EarlyPrep.notice.raidCheckBegun = true
+local reannounce = { sessionId = "session-a", profileId = "profile-a" }
+EarlyPrep:AttachToPayload(reannounce)
+assertTrue(type(reannounce.prepNotice) == "table", "reannounce payload includes the preparation snapshot")
+assertEq(reannounce.prepNotice.warned[1], "Bob-Realm", "reannounce snapshot includes Bob")
+assertTrue(reannounce.prepNotice.raidCheckBegun == true, "reannounce snapshot includes raid check begun")
+
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep:ApplyHeartbeat("session-a", "profile-a", reannounce.prepNotice)
+assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "a received reannounce records Bob")
+assertTrue(EarlyPrep.notice.raidCheckBegun == true, "a received reannounce records raid check begun")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
 	os.exit(1)
