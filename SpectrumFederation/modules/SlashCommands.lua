@@ -129,6 +129,8 @@ function SF:RegisterLootHelperSlashCommands()
                 SF:PrintError("No session coordinator is available.")
             elseif status == "no profile" then
                 SF:PrintError("The active session does not have a valid profile selected.")
+            elseif status == "sync_busy" then
+                return
             else
                 SF:PrintError(tostring(status or "Manual sync failed."))
             end

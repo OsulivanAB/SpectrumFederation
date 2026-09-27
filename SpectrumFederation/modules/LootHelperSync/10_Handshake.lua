@@ -566,11 +566,6 @@ function Sync:FinalizeHandshakeWindow()
         end
     end
 
-    if SF.PrintInfo then
-        SF:PrintInfo(("Handshake complete: %d have, %d need profile, %d need logs, %d no response"):
-            format(have, needProf, needLogs, noResp))
-    end
-
     if SF.Debug then
         SF.Debug:Info("SYNC", "Finalized handshake window (sessionId=%s, profileId=%s, have=%d, needProfile=%d, needLogs=%d, noResponse=%d)",
             tostring(self.state.sessionId), tostring(self.state.profileId), have, needProf, needLogs, noResp)

@@ -95,12 +95,8 @@ function Sync:HandleAuthLogs(sender, payload)
 
     -- Trust validation: ALWAYS check sender is in group (both coordinator and member)
     if not self:IsRequesterInGroup(sender) then
-        if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not in group", tostring(sender))
-        end
-        if SF.PrintWarning then
-            SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not in group."):format(sender))
-        end
+        self:_DebugDiagOnce("auth_logs_not_in_group", sender,
+            ("Ignoring AUTH_LOGS from %s: not in group."):format(tostring(sender)))
         return
     end
 
@@ -153,22 +149,13 @@ function Sync:HandleAuthLogs(sender, payload)
         return
     end
     if disposition == "unauthorized" then
-        if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not an admin of profile %s",
-                tostring(sender), tostring(payload.profileId))
-        end
-        if SF.PrintWarning then
-            SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not an admin of profile."):format(sender))
-        end
+        self:_DebugDiagOnce("auth_logs_unauthorized", sender,
+            ("Ignoring AUTH_LOGS from %s: not an admin of profile."):format(tostring(sender)))
         return
     end
     if disposition == "untrusted" then
-        if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Rejecting AUTH_LOGS from %s: not a trusted sender (member path)", tostring(sender))
-        end
-        if SF.PrintWarning then
-            SF:PrintWarning(("Ignoring AUTH_LOGS from %s: not a trusted sender."):format(sender))
-        end
+        self:_DebugDiagOnce("auth_logs_untrusted", sender,
+            ("Ignoring AUTH_LOGS from %s: not a trusted sender."):format(tostring(sender)))
         return
     end
     if SF.Debug then
@@ -508,12 +495,8 @@ function Sync:HandleProfileSnapshot(sender, payload)
     -- Departed senders must not reach catch-up proof. Snapshots larger than the
     -- proof cache walk local history on every repeat.
     if not self:IsRequesterInGroup(sender) then
-        if SF.Debug then
-            SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not in group", tostring(sender))
-        end
-        if SF.PrintWarning then
-            SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not in group."):format(sender))
-        end
+        self:_DebugDiagOnce("snapshot_not_in_group", sender,
+            ("Ignoring PROFILE_SNAPSHOT from %s: not in group."):format(tostring(sender)))
         return
     end
 
@@ -562,19 +545,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
     end
     if snapDisposition ~= "accept" then
         if snapDisposition == "unauthorized" then
-            if SF.Debug then
-                SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not an admin of profile", tostring(sender))
-            end
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not an admin of profile."):format(sender))
-            end
+            self:_DebugDiagOnce("snapshot_unauthorized", sender,
+                ("Ignoring PROFILE_SNAPSHOT from %s: not an admin of profile."):format(tostring(sender)))
         else
-            if SF.Debug then
-                SF.Debug:Verbose("SYNC", "Rejecting PROFILE_SNAPSHOT from %s: not a trusted sender", tostring(sender))
-            end
-            if SF.PrintWarning then
-                SF:PrintWarning(("Ignoring PROFILE_SNAPSHOT from %s: not a trusted sender."):format(sender))
-            end
+            self:_DebugDiagOnce("snapshot_untrusted", sender,
+                ("Ignoring PROFILE_SNAPSHOT from %s: not a trusted sender."):format(tostring(sender)))
         end
         return
     end
@@ -600,8 +575,8 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if SF.LootProfile and SF.LootProfile.ValidateSnapshot then
         local okSnap, snapErr = SF.LootProfile.ValidateSnapshot(payload.snapshot)
         if not okSnap then
-            if SF.PrintWarning then
-                SF:PrintWarning(("PROFILE_SNAPSHOT invalid: %s"):format(snapErr or "unknown"))
+            if SF.Debug then
+                SF.Debug:Warn("SYNC", "PROFILE_SNAPSHOT invalid: %s", tostring(snapErr or "unknown"))
             end
             return
         end
@@ -611,9 +586,9 @@ function Sync:HandleProfileSnapshot(sender, payload)
     local meta = payload.snapshot.meta
     if not meta or type(meta._profileId) ~= "string" then return end
     if payload.profileId ~= meta._profileId then
-        if SF.PrintWarning then
-            SF:PrintWarning(("PROFILE_SNAPSHOT mismatch: payload.profileId=%s meta._profileId=%s"):format(
-                tostring(payload.profileId), tostring(meta._profileId)))
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "PROFILE_SNAPSHOT mismatch: payload.profileId=%s meta._profileId=%s",
+                tostring(payload.profileId), tostring(meta._profileId))
         end
         return
     end
@@ -652,8 +627,8 @@ function Sync:HandleProfileSnapshot(sender, payload)
     end
 
     if not okImport then
-        if SF.PrintWarning then
-            SF:PrintWarning(("PROFILE_SNAPSHOT import failed: %s"):format(importErr or "unknown"))
+        if SF.Debug then
+            SF.Debug:Warn("SYNC", "PROFILE_SNAPSHOT import failed: %s", tostring(importErr or "unknown"))
         end
         return
     end
@@ -705,11 +680,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if self.state._profileReqInFlight == self.state.sessionId then
         self.state._profileReqInFlight = nil
     end
+    self.state.pendingProfileSnapshot = nil
 
-    if SF.PrintInfo then
-        SF:PrintInfo(("Imported PROFILE_SNAPSHOT %s (%d new logs)"):format(
-            profile:GetProfileName() or profileId,
-            inserted or 0))
+    if SF.Debug then
+        SF.Debug:Info("SYNC", "Imported PROFILE_SNAPSHOT %s (%d new logs)",
+            tostring(profile:GetProfileName() or profileId), inserted or 0)
     end
 
     -- Now that we actually have the profile, run the normal sync assessment path:

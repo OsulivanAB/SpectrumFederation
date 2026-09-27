@@ -46,9 +46,11 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Run Interface badge formatting tests: `python -m pytest tests/test_interface_badge.py`
 - Run Settings navigation tests (production Lua via lua5.1): `python -m pytest tests/test_settings_navigation.py`
 - Run Mouse Tracer engine tests (production Lua via lua5.1): `python -m pytest tests/test_mouse_tracer.py`
+- Run TradeSkillMaster adapter tests (production Lua via lua5.1): `python -m pytest tests/test_tsm_integration.py`
 - Run Loot Helper window tests (production Lua via lua5.1): `python -m pytest tests/test_loot_helper_window.py`
 - Run Sync protocol warning-dedupe tests (production Lua via lua5.1): `python -m pytest tests/test_sync_protocol.py`
 - Run RC Loot Council Integration tests (production Lua via lua5.1): `python -m pytest tests/test_rc_loot_council_integration.py`
+- Run Loot Logs view tests (production Lua via lua5.1): `python -m pytest tests/test_loot_logs_view.py`
 - Run Settings window layout tests (production Lua via lua5.1): `python -m pytest tests/test_settings_window_layout.py`
 - Run impersonation tests (production Lua via lua5.1): `python -m pytest tests/test_impersonation.py`
 - Run linked character identity tests (production Lua via lua5.1): `python -m pytest tests/test_linked_identity.py`
@@ -71,12 +73,12 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Runtime freeze, hang, callback, layout, timer, queue, inspect, or sync work: read the Client Stability section in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc` before changing the code.
 - Settings work: start with `SpectrumFederation/modules/Settings/` and `SpectrumFederation/modules/UI/Settings/`, then read `docs/development/settings-ui/`. Shared Settings/UI infrastructure (`Section`, `PageBuilder`, Controls, ScrollFrames, layout helpers, shared refresh) needs extra re-entrancy and consumer review.
 - Mouse Tracer work: start with `SpectrumFederation/modules/MouseTracer/` and `docs/development/mouse-tracer.md`.
+- TradeSkillMaster reads: use `SF.TSM` in `SpectrumFederation/modules/Integrations/TSM.lua` and follow `.cursor/skills/tsm-integration/SKILL.md`. Do not call `TSM_API` from feature code.
 - Loot Helper or sync work: inspect `SpectrumFederation/modules/LootHelper/`, `SpectrumFederation/modules/LootHelperSync/`, and the related docs under `docs/development/loot-helper/`.
 - Workflow or CI script work: inspect the matching file under `.github/workflows/` or `.github/scripts/` first, then use `.github/instructions/` as supplemental guidance.
 - Docs work: start with `mkdocs.yml` for nav/build behavior, then edit files in `docs/`.
 - PR descriptions: follow `.cursor/rules/pr-template.mdc`. Never check **I have tested these changes in-game**. You may check **In-game testing is not applicable** only when there are no packaged addon/runtime changes, except allowlisted TOC metadata or files proven not to ship. Always check **WoW Client Type → Retail**. Leave linked issues to the human unless they provided the link.
-- Codex PR reviews: read and follow `.github/codex-review-guidance.md`. When the PR template provides a linked Ticket ID, review the ticket as part of the PR context; if it is absent or inaccessible, follow the guidance without inventing requirements.
-- PR review comments: follow `.cursor/skills/pr-review-comments/SKILL.md`.
+- Pull request reviews: use **Pull request review instructions** below.
 
 ## Validation By Change Area
 
@@ -87,9 +89,11 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - README Interface badge formatting or `blizzard_api.py` display conversion: also run `python -m pytest tests/test_interface_badge.py`
 - Settings navigation or Registry helpers: also run `python -m pytest tests/test_settings_navigation.py`
 - Mouse Tracer constants or trail engine: also run `python -m pytest tests/test_mouse_tracer.py`
+- TradeSkillMaster adapter: also run `python -m pytest tests/test_tsm_integration.py`
 - Loot Helper window minimize/positioning: also run `python -m pytest tests/test_loot_helper_window.py`
 - Sync protocol NACK/warning throttling: also run `python -m pytest tests/test_sync_protocol.py`
 - RC Loot Council Integration child addon: also run `python -m pytest tests/test_rc_loot_council_integration.py`
+- Loot Logs RC category grouping or BiS outcome display author: also run `python -m pytest tests/test_loot_logs_view.py`
 - Settings window impersonation-banner layout: also run `python -m pytest tests/test_settings_window_layout.py`
 - Loot Helper impersonation / Preview as Non-Admin: also run `python -m pytest tests/test_impersonation.py`
 - Linked character identities: also run `python -m pytest tests/test_linked_identity.py`
@@ -100,3 +104,52 @@ When asked for a code review, technical audit, pre-release review, or architectu
 - Promotion-scope classification or `classify_promotion_scope.py`: also run `python -m pytest tests/test_promotion_scope.py`
 - Version bump comparison or `check_version_bump.py`: also run `python -m pytest tests/test_check_version_bump.py`
 - Release classification or Wago publishing: also run `python -m pytest tests/test_publish_release.py`
+
+## Code Review Rules
+
+### Runtime stability
+
+For shipped World of Warcraft addon code, treat client freezes, severe UI
+stalls, runaway execution, event/callback/layout feedback loops, timer or
+`OnUpdate` work that fails to become idle, retry/message storms, and
+long-session resource growth as correctness defects.
+
+When reporting one of these issues, establish a credible triggering path,
+frequency/lifecycle, and failure to terminate, drain, or clean up. Recurring
+work is not inherently defective.
+
+### State and compatibility
+
+Changes to persistent, synchronized, or shared state must preserve installed
+user data and converge under realistic lifecycle behavior.
+
+Review SavedVariables/defaults/migrations/profile operations, asynchronous game
+data, sender authorization and identity, deduplication, ordering, stale state,
+duplicate events/messages, optional integration boundaries, and repeated UI
+lifecycle operations when relevant to the changed code.
+
+Prefer backward-compatible handling or an explicit migration when existing
+persisted data or external behavior would otherwise break.
+
+### Review discipline
+
+Report consequential, actionable defects rather than style preferences,
+cosmetic cleanup, speculative refactors, or unrelated pre-existing issues.
+
+Trace affected callers, consumers, shared state, persistence, communications,
+and lifecycle behavior far enough to substantiate a finding. Consolidate
+multiple symptoms with one root cause.
+
+Mechanical formatting and deterministic checks belong in CI. Passing tests do
+not prove WoW runtime correctness, and automated review must never claim that
+in-game testing occurred without human test evidence.
+
+## Pull request review instructions
+
+Three files divide pull-request review work. Open the file that owns the task. Do not copy a full procedure into this guide, and do not send the same decision through more than one of them.
+
+- **Round coordination:** `.cursor/skills/ai-review-loop/SKILL.md` owns reviewer sequencing, round state, completion handling, finding batches, and when to push.
+- **Individual findings:** `.cursor/skills/pr-review-comments/SKILL.md` owns investigating one finding, replying on its thread, and deciding whether that thread may be resolved. It does not commit, push, or request another review.
+- **Codex lifecycle:** `.github/codex-review-guidance.md` owns Codex review scope, the final integration sweep, and when previous coverage must be reconsidered. When a linked Ticket ID is present, that document requires reviewing the ticket. If the ticket is inaccessible, do not invent requirements.
+
+Humans retain final review, required in-game verification, and merging.

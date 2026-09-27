@@ -2,6 +2,31 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.6-beta.6] - 2026-09-25
+
+### Added
+- Add a read-only TradeSkillMaster adapter
+
+## [1.5.6-beta.4] - 2026-09-25
+
+### Fixed
+- Fix RC Loot Council BiS response labels and list rows
+
+## [1.5.6-beta.3] - 2026-09-25
+
+### Changed
+- Keep recoverable sync diagnostics out of chat
+
+## [1.5.6-beta.2] - 2026-09-25
+
+### Changed
+- Show BiS outcomes under RC Loot Council in Loot Logs
+
+## [1.5.6-beta.1] - 2026-09-25
+
+### Fixed
+- Fix ranged hunter weapons flagged as missing an off hand
+
 ## [1.5.5] - 2026-09-24
 
 ### Changed

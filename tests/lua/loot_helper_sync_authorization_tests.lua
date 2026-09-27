@@ -112,7 +112,35 @@ function SF:PrintError(message)
     warnings[#warnings + 1] = tostring(message)
 end
 
-SF.Debug = setmetatable({}, {
+SF._testDebugLogs = {}
+
+function recordDebug(level, message, ...)
+    local formatted = tostring(message)
+    if select("#", ...) > 0 then
+        local ok, result = pcall(string.format, tostring(message), ...)
+        formatted = ok and result or tostring(message)
+    end
+    SF._testDebugLogs[#SF._testDebugLogs + 1] = { level = level, message = formatted }
+end
+
+SF.Debug = setmetatable({
+    Verbose = function(_, _, message, ...)
+        recordDebug("VERBOSE", message, ...)
+    end,
+    Info = function(_, _, message, ...)
+        recordDebug("INFO", message, ...)
+    end,
+    Warn = function(_, _, message, ...)
+        recordDebug("WARN", message, ...)
+    end,
+    Error = function(_, _, message, ...)
+        recordDebug("ERROR", message, ...)
+    end,
+    Log = function(_, level, _, message, ...)
+        recordDebug(level or "INFO", message, ...)
+    end,
+}, {
+    __call = function() end,
     __index = function()
         return function() end
     end,
@@ -197,6 +225,18 @@ local function warningCount(fragment)
     return n
 end
 
+function debugCount(fragment)
+    local n = 0
+    for _, entry in ipairs(SF._testDebugLogs) do
+        if (entry.level == "WARN" or entry.level == "ERROR")
+            and string.find(entry.message, fragment, 1, true)
+        then
+            n = n + 1
+        end
+    end
+    return n
+end
+
 local function sendCount(msgType, target)
     local n = 0
     for _, sent in ipairs(sends) do
@@ -222,6 +262,7 @@ local function reset(selfName)
     warnings = {}
     infos = {}
     sends = {}
+    SF._testDebugLogs = {}
     for i = #timers, 1, -1 do
         timers[i] = nil
     end
@@ -269,6 +310,16 @@ local function reset(selfName)
     Sync.state._profileReqInFlight = nil
     Sync.state._noProfileTargetWarnedFor = nil
     Sync.state._noLogTargetWarnedFor = nil
+    Sync.state._noIntegrityTargetWarnedFor = nil
+    Sync.state.pendingProfileSnapshot = nil
+    Sync.state._userSyncFailureNoted = nil
+    Sync.state._userInitiatedSync = nil
+    Sync.state._userSyncGeneration = nil
+    Sync.state._userSyncRegisteredCount = nil
+    Sync.state._userSyncRegisterRejected = nil
+    Sync.state._hadAuthorizedRoute = nil
+    Sync.state._diagOnce = nil
+    Sync.state.repairQueue = { order = {}, items = {} }
     Sync.state._coordinatorCatchUp = nil
     Sync.state.revokedRoutes = nil
     Sync.state._adminGrantServe = nil
@@ -300,6 +351,7 @@ end
 Sync.EnsureRepairConvergence = function()
     return false
 end
+productionSendJoinStatus = Sync.SendJoinStatus
 Sync.SendJoinStatus = function() end
 local productionQueueRepairRanges = Sync.QueueRepairRanges
 Sync.QueueRepairRanges = function()
@@ -538,7 +590,8 @@ reset(MEMBER)
 seedRequest("need-9", "NEED_LOGS", { COORD }, COORD)
 payload, sender = authPayload("need-9", STRANGER)
 Sync:HandleAuthLogs(sender, payload)
-assertEq(warningCount("not an admin of profile"), 1, "stranger AUTH_LOGS is rejected")
+assertEq(debugCount("not an admin of profile"), 1, "stranger AUTH_LOGS is rejected in debug")
+assertEq(warningCount("not an admin of profile"), 0, "stranger AUTH_LOGS stays out of chat")
 assertTrue(Sync.state.requests["need-9"] ~= nil, "unsolicited response does not complete the request")
 
 Sync:HandleProfileSnapshot(STRANGER, {
@@ -547,7 +600,8 @@ Sync:HandleProfileSnapshot(STRANGER, {
     requestId = "need-9",
     snapshot = {},
 })
-assertEq(warningCount("PROFILE_SNAPSHOT"), 1, "stranger snapshot is rejected")
+assertEq(debugCount("PROFILE_SNAPSHOT"), 1, "stranger snapshot is rejected in debug")
+assertEq(warningCount("PROFILE_SNAPSHOT"), 0, "stranger snapshot stays out of chat")
 
 Sync:HandleNewLog(COORD, {
     sessionId = SESSION,
@@ -562,7 +616,8 @@ Sync:HandleNewLog(SUSPENDERS, {
     profileId = PROFILE,
     log = { _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
 })
-assertTrue(warningCount("not an admin") >= 1, "revoked coordinator NEW_LOG is rejected")
+assertTrue(debugCount("not an admin") >= 1, "revoked coordinator NEW_LOG is rejected in debug")
+assertEq(warningCount("not an admin"), 0, "revoked coordinator NEW_LOG stays out of chat")
 
 -- 10. Repeated reconcile, heartbeat, and stale responses do not regenerate warnings.
 reset(MEMBER)
@@ -660,7 +715,8 @@ Sync:HandleProfileSnapshot(STRANGER, {
     requestId = "need-boot",
     snapshot = {},
 })
-assertEq(warningCount("not a trusted sender"), 1, "untrusted bootstrap snapshot still warns")
+assertEq(debugCount("not a trusted sender"), 1, "untrusted bootstrap snapshot is recorded in debug")
+assertEq(warningCount("not a trusted sender"), 0, "untrusted bootstrap snapshot stays out of chat")
 
 -- In-flight trust from a log request does not authorize a profile snapshot.
 reset(MEMBER)
@@ -687,7 +743,8 @@ Sync:HandleProfileSnapshot(KINO, {
     snapshot = { meta = { _profileId = PROFILE } },
 })
 assertEq(warningCount("not a trusted sender"), 0, "kind mismatch is not reported as untrusted")
-assertEq(warningCount("does not match the request"), 1, "mismatched snapshot warns once")
+assertEq(debugCount("does not match the request"), 1, "mismatched snapshot is recorded once in debug")
+assertEq(warningCount("does not match the request"), 0, "mismatched snapshot stays out of chat")
 assertTrue(Sync.state.requests["log-snap"] ~= nil, "mismatched snapshot does not complete the log request")
 Sync:HandleProfileSnapshot(KINO, {
     sessionId = SESSION,
@@ -695,7 +752,7 @@ Sync:HandleProfileSnapshot(KINO, {
     requestId = "log-snap",
     snapshot = { meta = { _profileId = PROFILE } },
 })
-assertEq(warningCount("does not match the request"), 1, "repeat mismatched snapshot does not warn again")
+assertEq(debugCount("does not match the request"), 1, "repeat mismatched snapshot does not log again")
 local profileReq = seedRequest("need-kind", "NEED_PROFILE", { COORD }, COORD)
 Sync.state._profileReqInFlight = SESSION
 local logsDisposition = Sync:_ClassifyPrivilegedResponse(COORD, PROFILE, profileReq, {
@@ -718,7 +775,9 @@ Sync:HandleAuthLogs(COORD, {
 })
 assertTrue(Sync.state.requests["need-kind"] ~= nil, "mismatched AUTH_LOGS does not complete NEED_PROFILE")
 assertEq(Sync.state._profileReqInFlight, SESSION, "mismatched AUTH_LOGS leaves the profile request marker")
-local mismatchWarnings = warningCount("AUTH_LOGS")
+local mismatchWarnings = debugCount("AUTH_LOGS")
+assertEq(mismatchWarnings, 1, "mismatched AUTH_LOGS is recorded once in debug")
+assertEq(warningCount("AUTH_LOGS"), 0, "mismatched AUTH_LOGS stays out of chat")
 Sync:HandleAuthLogs(COORD, {
     sessionId = SESSION,
     profileId = PROFILE,
@@ -728,7 +787,7 @@ Sync:HandleAuthLogs(COORD, {
     toCounter = 2,
     logs = { { _author = "Author-Realm", _counter = 1 } },
 })
-assertEq(warningCount("AUTH_LOGS"), mismatchWarnings, "repeat mismatched AUTH_LOGS does not warn again")
+assertEq(debugCount("AUTH_LOGS"), mismatchWarnings, "repeat mismatched AUTH_LOGS does not log again")
 local profileReq = seedRequest("need-snap", "NEED_PROFILE", { KINO }, KINO)
 snapDisposition = Sync:_ClassifyPrivilegedResponse(KINO, PROFILE, profileReq, {
     coordinatorAcceptsAdmins = false,
@@ -1093,7 +1152,8 @@ Sync:OnRequestTimeout("need-spent-wait")
 assertTrue(Sync.state.requests["need-spent-wait"] ~= nil, "exhausted request waits for a successor")
 assertEq(sendCount(Sync.MSG.NEED_LOGS, COORD), 0, "exhausted wait does not send to the revoked coordinator")
 
--- Empty route warnings are once per session, then allowed again after a route exists.
+-- Empty routes stay out of chat, keep the work, and resume when a route returns.
+;(function()
 reset(MEMBER)
 setAdmins({ KINO, OWNER })
 Sync.state.coordinator = COORD
@@ -1101,19 +1161,89 @@ Sync.state.helpers = {}
 Sync.state.isCoordinator = false
 assertEq(Sync:RequestProfileSnapshot("no-route"), false, "profile request fails with no route")
 assertEq(Sync:RequestProfileSnapshot("no-route-again"), false, "profile request stays failed with no route")
-assertEq(warningCount("Cannot request profile"), 1, "empty profile route warns once")
+assertEq(warningCount("Cannot request profile"), 0, "empty profile route stays out of chat")
+assertEq(debugCount("Cannot request profile: no targets available"), 1, "empty profile route is recorded once in debug")
 local missing = {
     { author = "Author-Realm", fromCounter = 1, toCounter = 2 },
 }
+local savedQueueRepair = Sync.QueueRepairRanges
+Sync.QueueRepairRanges = productionQueueRepairRanges
 Sync:RequestMissingLogs(missing, "no-route")
 Sync:RequestMissingLogs(missing, "no-route-again")
-assertEq(warningCount("Cannot request missing logs"), 1, "empty log route warns once")
+assertEq(warningCount("Cannot request missing logs"), 0, "empty log route stays out of chat")
+assertEq(debugCount("Cannot request missing logs: no targets available"), 1, "empty log route is recorded once in debug")
+local queuedLogs = Sync.state.repairQueue and Sync.state.repairQueue.order and #Sync.state.repairQueue.order or 0
+assertEq(queuedLogs, 1, "missing log work is queued once")
+local clock = 1700000000
+local originalRouteNow = Sync._Now
+Sync._Now = function()
+    return clock
+end
+local attemptsBefore = 0
+for _ = 1, 6 do
+    clock = clock + 120
+    Sync:_ProcessRepairConvergenceTick("test-no-route")
+    local entry = Sync.state.repairQueue.items[Sync.state.repairQueue.order[1]]
+    attemptsBefore = entry and entry.queueAttempts or attemptsBefore
+end
+assertEq(#Sync.state.repairQueue.order, 1, "no-route retries do not grow the repair queue")
+assertTrue(attemptsBefore >= 1 and attemptsBefore <= 6, "no-route log retries stay bounded")
+assertEq(warningCount("Cannot request"), 0, "background retries do not print chat warnings")
 setAdmins({ COORD, KINO, OWNER })
-Sync.state.helpers = { KINO }
-assertEq(Sync:RequestProfileSnapshot("route-back"), true, "profile request proceeds when a route returns")
-assertEq(warningCount("Cannot request profile"), 1, "restored profile route does not warn")
-Sync:RequestMissingLogs(missing, "route-back")
-assertEq(warningCount("Cannot request missing logs"), 1, "restored log route does not warn")
+Sync:ApplyAdvertisedHelpers({ KINO }, "route-restored")
+clock = clock + 1
+Sync:_ProcessRepairConvergenceTick("test-route-back")
+assertEq(warningCount("Cannot request missing logs"), 0, "restored log route does not chat")
+assertEq(warningCount("recovered"), 0, "route recovery does not announce itself in chat")
+local logRequest = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.kind == "NEED_LOGS" or req.kind == "LOG_REQ" then
+        logRequest = req
+    end
+end
+assertTrue(logRequest ~= nil, "queued logs are requested after the route returns")
+Sync.QueueRepairRanges = savedQueueRepair
+Sync._Now = originalRouteNow
+end)()
+
+-- A missing profile with nobody to ask is retained and resumes without chat.
+;(function()
+reset(MEMBER)
+Sync.state.coordinator = MEMBER
+Sync.state.helpers = {}
+Sync.state.isCoordinator = false
+SF.lootHelperDB.profiles = {}
+assertEq(Sync:RequestProfileSnapshot("missing-profile"), false, "missing profile has no route when the only name is self")
+assertEq(warningCount("Cannot request profile"), 0, "missing profile route stays out of chat")
+assertEq(debugCount("Cannot request profile: no targets available"), 1, "missing profile route is recorded in debug")
+assertTrue(type(Sync.state.pendingProfileSnapshot) == "table", "missing profile work is retained")
+local clock = 1700000000
+local originalProfileNow = Sync._Now
+Sync._Now = function()
+    return clock
+end
+for _ = 1, 4 do
+    clock = clock + 120
+    Sync:_ProcessRepairConvergenceTick("test-missing-profile")
+end
+assertTrue(type(Sync.state.pendingProfileSnapshot) == "table", "missing profile stays pending with no route")
+assertTrue((Sync.state.pendingProfileSnapshot.queueAttempts or 0) <= 4, "missing profile retries stay bounded")
+assertEq(warningCount("Cannot request profile"), 0, "missing profile retries stay out of chat")
+Sync.state.coordinator = COORD
+clock = clock + 1
+Sync:_ExpediteNoRouteSynchronization("profile-route")
+Sync:_ProcessRepairConvergenceTick("profile-route")
+assertTrue(Sync.state.pendingProfileSnapshot == nil, "profile recovery clears after a route returns")
+local profileRequest = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.kind == "NEED_PROFILE" then
+        profileRequest = req
+    end
+end
+assertTrue(profileRequest ~= nil, "missing profile is requested when a route returns")
+assertEq(warningCount("Cannot request profile"), 0, "profile recovery does not chat")
+Sync._Now = originalProfileNow
+end)()
 
 -- A successor the local profile has not yet recorded stays routable until their response arrives.
 reset(MEMBER)
@@ -1191,7 +1321,8 @@ Sync:HandleNewLog(COORD, {
         _data = { member = MEMBER },
     },
 })
-assertEq(warningCount("not an admin"), 1, "revoked coordinator NEW_LOG warns once")
+assertEq(debugCount("not an admin"), 1, "revoked coordinator NEW_LOG is recorded once in debug")
+assertEq(warningCount("not an admin"), 0, "revoked coordinator NEW_LOG stays out of chat")
 
 -- Heartbeats from an explicitly revoked coordinator must not refresh takeover.
 reset(MEMBER)
@@ -1262,11 +1393,12 @@ Sync:HandleAuthLogs(KINO, catchLogsPayload({
 }))
 assertEq(mergeCalls, 0, "catch-up AUTH_LOGS without a grant is not merged")
 assertTrue(Sync.state.requests["need-catch-logs"] ~= nil, "unproven catch-up leaves the log request open")
-assertEq(warningCount("coordinator authority is not established yet"), 1, "unproven catch-up warns once")
+assertEq(debugCount("coordinator authority is not established yet"), 1, "unproven catch-up is recorded once in debug")
+assertEq(warningCount("coordinator authority is not established yet"), 0, "unproven catch-up stays out of chat")
 Sync:HandleAuthLogs(KINO, catchLogsPayload({
     { _author = "Author-Realm", _counter = 1, _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
 }))
-assertEq(warningCount("coordinator authority is not established yet"), 1, "repeat unproven catch-up does not warn again")
+assertEq(debugCount("coordinator authority is not established yet"), 1, "repeat unproven catch-up does not log again")
 local replacementCatch = seedRequest("need-catch-logs-2", "NEED_LOGS", { KINO }, KINO)
 replacementCatch.meta.integrityRepair = true
 Sync:HandleAuthLogs(KINO, {
@@ -1280,7 +1412,7 @@ Sync:HandleAuthLogs(KINO, {
         { _author = "Author-Realm", _counter = 1, _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
     },
 })
-assertEq(warningCount("coordinator authority is not established yet"), 1, "replacement unproven catch-up request does not warn again")
+assertEq(debugCount("coordinator authority is not established yet"), 1, "replacement unproven catch-up request does not log again")
 setAdmins({ KINO, OWNER })
 assertEq(Sync:_CoordinatorNeedsCatchUp(KINO), false, "authorization clears catch-up for the warned sender")
 setAdmins({ OWNER })
@@ -1299,7 +1431,8 @@ Sync:HandleAuthLogs(KINO, {
         { _author = "Author-Realm", _counter = 1, _eventType = "POINT_CHANGE", _data = { member = MEMBER } },
     },
 })
-assertEq(warningCount("coordinator authority is not established yet"), 2, "unproven catch-up warns again after authorization changes")
+assertEq(debugCount("coordinator authority is not established yet"), 2, "unproven catch-up is recorded again after authorization changes")
+assertEq(warningCount("coordinator authority is not established yet"), 0, "unproven catch-up stays out of chat after authorization changes")
 Sync:HandleAuthLogs(KINO, catchLogsPayload({
     {
         _author = "Author-Realm",
@@ -4080,7 +4213,8 @@ local departedPayload = {
 Sync:HandleProfileSnapshot(KINO, departedPayload)
 Sync:HandleProfileSnapshot(KINO, departedPayload)
 assertEq(proofCalls, 0, "repeated out-of-group snapshots do not scan catch-up proof")
-assertTrue(warningCount("not in group") >= 1, "an out-of-group snapshot is rejected")
+assertTrue(debugCount("not in group") >= 1, "an out-of-group snapshot is rejected in debug")
+assertEq(warningCount("not in group"), 0, "an out-of-group snapshot stays out of chat")
 Sync._CatchUpSnapshotProvesGrant = originalSnapshotProof
 Sync.IsRequesterInGroup = originalGroup
 end)()
@@ -5070,14 +5204,16 @@ local function newLog(counter)
 end
 newLog(1)
 newLog(2)
-assertEq(warningCount("not an admin"), 1, "the first revocation warns once")
+assertEq(debugCount("not an admin"), 1, "the first revocation is recorded once in debug")
+assertEq(warningCount("not an admin"), 0, "the first revocation stays out of chat")
 setAdmins({ OWNER, COORD })
 Sync:ReconcileSessionAuthorization(PROFILE, "rebuild:live_update")
 setAdmins({ OWNER })
-local beforeSecond = warningCount("not an admin")
+local beforeSecond = debugCount("not an admin")
 newLog(3)
-assertEq(warningCount("not an admin"), beforeSecond + 1,
-    "a later removal warns again after the re-grant")
+assertEq(debugCount("not an admin"), beforeSecond + 1,
+    "a later removal is recorded again after the re-grant")
+assertEq(warningCount("not an admin"), 0, "a later removal stays out of chat")
 end)()
 
 -- The packet that proves a catch-up coordinator refreshes the takeover clock.
@@ -5146,6 +5282,485 @@ assertEq(Sync.state.heartbeat.lastCoordMessageAt, 9000,
     "the packet that proves the coordinator refreshes the timer")
 Sync.RebuildProfile = originalRebuild
 Sync._Now = originalNow
+end)()
+
+-- Initial join-status keeps missing logs queued without chat, then resumes on a route.
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.coordinator = COORD
+Sync.state.helpers = {}
+Sync.state.isCoordinator = false
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local savedMissing = Sync.ComputeMissingLogRequests
+local savedSend = Sync.SendJoinStatus
+local savedQueue = Sync.QueueRepairRanges
+Sync.ComputeMissingLogRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 3, toCounter = 4 },
+    }
+end
+Sync.QueueRepairRanges = productionQueueRepairRanges
+Sync.SendJoinStatus = productionSendJoinStatus
+productionSendJoinStatus(Sync)
+assertEq(warningCount("Cannot request missing logs"), 0, "join-status with no route stays out of chat")
+assertTrue(#(Sync.state.repairQueue.order or {}) >= 1, "join-status queues missing logs without another event")
+setAdmins({ COORD, OWNER })
+Sync:ApplyAdvertisedHelpers({ COORD }, "join-route")
+Sync:_ProcessRepairConvergenceTick("join-route")
+local joined = false
+for _, req in pairs(Sync.state.requests) do
+    if req.kind == "NEED_LOGS" or req.kind == "LOG_REQ" then
+        joined = true
+    end
+end
+assertTrue(joined, "join-status logs are requested when a route returns")
+assertEq(warningCount("Cannot request missing logs"), 0, "join-status recovery stays out of chat")
+Sync.ComputeMissingLogRequests = savedMissing
+Sync.SendJoinStatus = savedSend
+Sync.QueueRepairRanges = savedQueue
+end)()
+
+-- A user-started sync still explains the consequence. Automatic failures do not.
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { COORD }
+SF.lootHelperDB.profiles = {}
+Sync.state._userInitiatedSync = true
+assertEq(Sync:RequestProfileSnapshot("manual"), true, "manual profile request registers")
+Sync.state._userInitiatedSync = nil
+local manualReq = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.kind == "NEED_PROFILE" then
+        manualReq = req
+    end
+end
+assertTrue(manualReq ~= nil, "manual profile request is outstanding")
+Sync:_FailRequest(manualReq, "timeout")
+assertEq(warningCount("Profile sync did not finish"), 1, "a user-started profile sync reports the consequence")
+assertTrue(string.find(warnings[#warnings], "timeout", 1, true) == nil, "chat omits the timeout reason")
+local sawTimeout = false
+for _, entry in ipairs(SF._testDebugLogs) do
+    if string.find(entry.message, "reason=timeout", 1, true) then
+        sawTimeout = true
+    end
+end
+assertTrue(sawTimeout, "the timeout reason is recorded in debug")
+local before = warningCount("Profile sync did not finish")
+Sync.state._userInitiatedSync = false
+local again = {
+    id = "auto-fail",
+    kind = "NEED_PROFILE",
+    meta = { userInitiated = false, backgroundRepair = false },
+}
+Sync:_FailRequest(again, "timeout")
+assertEq(warningCount("Profile sync did not finish"), before, "an automatic profile failure stays out of chat")
+end)()
+
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync:StartSession(PROFILE)
+assertEq(warningCount("Cannot start session: You are not an admin for the selected profile"), 1,
+    "starting a session without permission stays user-facing")
+assertEq(warningCount("%s"), 0, "session start does not show a format placeholder")
+
+reset(COORD)
+assertEq(Sync:EndSession("manual", false), true, "coordinator can end the session")
+assertTrue(infos[#infos] ~= nil and string.find(infos[#infos], "Loot Helper session ended (manual).", 1, true) ~= nil,
+    "session end formats the reason")
+
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { COORD }
+Sync.state.isCoordinator = false
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local savedMissing = Sync.ComputeMissingLogRequests
+local savedMismatch = Sync.ComputeWindowMismatchRequests
+local savedSend = Sync.SendJoinStatus
+Sync.SendJoinStatus = productionSendJoinStatus
+Sync.ComputeMissingLogRequests = function()
+    return {}
+end
+Sync.ComputeWindowMismatchRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 8, toCounter = 9 },
+    }
+end
+local ok, status = Sync:RequestManualSync("integrity")
+assertEq(ok, true, "an integrity mismatch can start a manual sync")
+assertEq(status, "log_sync_requested", "an integrity mismatch is not reported as already synced")
+local generation = Sync.state._userSyncGeneration
+local integrityReq = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.meta and req.meta.integrityRepair == true then
+        integrityReq = req
+    end
+end
+assertTrue(integrityReq ~= nil, "manual sync registers the integrity request")
+assertEq(integrityReq and integrityReq.meta.userInitiated, true, "the integrity request keeps manual intent")
+assertEq(integrityReq and integrityReq.meta.userSyncGeneration, generation, "the integrity request keeps this sync generation")
+Sync:_FailRequest(integrityReq, "timeout")
+assertEq(warningCount("Log sync did not finish"), 1, "a failed manual integrity request warns once")
+Sync.state._userInitiatedSync = true
+Sync.state._userSyncGeneration = generation
+assertTrue(Sync:RequestIntegrityRepairRanges(PROFILE, {
+    { author = "Author-Realm", fromCounter = 2, toCounter = 2 },
+}, "join-status"), "a sibling integrity request registers")
+local sibling = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.meta and req.meta.fromCounter == 2 then
+        sibling = req
+    end
+end
+Sync:_FailRequest(sibling, "timeout")
+assertEq(warningCount("Log sync did not finish"), 1, "retries of the same manual sync do not warn again")
+local againOk, againStatus = Sync:RequestManualSync("integrity-again")
+assertEq(againOk, true, "a later manual sync can start")
+assertEq(againStatus, "log_sync_requested", "a later integrity mismatch is still a sync request")
+local later = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.meta and req.meta.userSyncGeneration == Sync.state._userSyncGeneration and req.meta.integrityRepair == true then
+        later = req
+    end
+end
+Sync:_FailRequest(later, "timeout")
+assertEq(warningCount("Log sync did not finish"), 2, "a new manual sync warns when it fails")
+Sync.ComputeMissingLogRequests = savedMissing
+Sync.ComputeWindowMismatchRequests = savedMismatch
+Sync.SendJoinStatus = savedSend
+end)()
+
+;(function()
+reset(OWNER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { COORD }
+Sync.state.isCoordinator = false
+Sync.state.coordinator = COORD
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local savedMissing = Sync.ComputeMissingLogRequests
+local savedMismatch = Sync.ComputeWindowMismatchRequests
+local savedSend = Sync.SendJoinStatus
+Sync.SendJoinStatus = productionSendJoinStatus
+Sync.ComputeMissingLogRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 3, toCounter = 4 },
+    }
+end
+Sync.ComputeWindowMismatchRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 8, toCounter = 9 },
+    }
+end
+local ok, status = Sync:RequestManualSync("mixed-log")
+assertEq(ok, true, "a mixed log sync can start")
+assertEq(status, "log_sync_requested", "a mixed log sync is one user action")
+local needLogs = nil
+local logReq = nil
+for _, req in pairs(Sync.state.requests) do
+    if req.kind == "NEED_LOGS" and req.meta and req.meta.integrityRepair ~= true then
+        needLogs = req
+    elseif req.kind == "LOG_REQ" and req.meta and req.meta.integrityRepair == true then
+        logReq = req
+    end
+end
+assertTrue(needLogs ~= nil, "ordinary missing logs stay NEED_LOGS")
+assertTrue(logReq ~= nil, "an admin integrity repair uses LOG_REQ")
+Sync:_FailRequest(needLogs, "timeout")
+Sync:_FailRequest(logReq, "timeout")
+assertEq(warningCount("Log sync did not finish"), 1, "mixed log kinds share one manual warning")
+assertEq(warningCount("Synchronization did not finish"), 0, "an integrity failure uses the log-sync guidance")
+Sync.ComputeMissingLogRequests = savedMissing
+Sync.ComputeWindowMismatchRequests = savedMismatch
+Sync.SendJoinStatus = savedSend
+end)()
+
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { COORD }
+Sync.state.isCoordinator = false
+SF.lootHelperDB.profiles = {}
+local savedSend = Sync.SendJoinStatus
+Sync.SendJoinStatus = productionSendJoinStatus
+local previousMax = Sync.cfg.maxOutstandingRequests
+Sync.cfg.maxOutstandingRequests = 0
+local ok, status = Sync:RequestManualSync("cap")
+assertEq(ok, false, "a full request table does not report manual sync success")
+assertEq(status, "sync_busy", "a full request table reports sync_busy")
+assertEq(warningCount("Synchronization did not start"), 1, "a full request table warns the manual caller")
+assertEq(warningCount("Profile sync did not finish"), 0, "a rejected manual sync has no request to fail later")
+Sync.cfg.maxOutstandingRequests = previousMax
+Sync.SendJoinStatus = savedSend
+end)()
+
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.helpers = {}
+Sync.state.coordinator = COORD
+Sync.state.isCoordinator = false
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local savedMissing = Sync.ComputeMissingLogRequests
+local savedMismatch = Sync.ComputeWindowMismatchRequests
+local savedSend = Sync.SendJoinStatus
+local savedQueue = Sync.QueueRepairRanges
+Sync.SendJoinStatus = productionSendJoinStatus
+Sync.QueueRepairRanges = productionQueueRepairRanges
+Sync.ComputeMissingLogRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 3, toCounter = 4 },
+    }
+end
+Sync.ComputeWindowMismatchRequests = function()
+    return {}
+end
+Sync.cfg.maxQueuedRepairRanges = 1
+Sync.state.repairQueue = {
+    order = { "held" },
+    items = {
+        held = {
+            key = "held",
+            profileId = PROFILE,
+            author = "Other-Realm",
+            fromCounter = 1,
+            toCounter = 1,
+            mode = "missing",
+        },
+    },
+}
+local ok, status = Sync:RequestManualSync("queue-full")
+assertEq(ok, false, "a full repair queue does not report manual sync success")
+assertEq(status, "sync_busy", "a full repair queue reports sync_busy")
+assertEq(warningCount("Synchronization did not start"), 1, "a full repair queue warns the manual caller")
+assertEq(#(Sync.state.repairQueue.order or {}), 1, "a full repair queue does not keep the new range")
+Sync.cfg.maxQueuedRepairRanges = nil
+Sync.ComputeMissingLogRequests = savedMissing
+Sync.ComputeWindowMismatchRequests = savedMismatch
+Sync.SendJoinStatus = savedSend
+Sync.QueueRepairRanges = savedQueue
+end)()
+
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.helpers = {}
+Sync.state.coordinator = COORD
+Sync.state.isCoordinator = false
+Sync:ApplyAdvertisedHelpers({}, "no-route")
+assertEq(Sync.state._hadAuthorizedRoute, false, "a coordinator who is not an admin is not a route")
+local now = Sync:_Now()
+Sync.state.repairQueue = {
+    order = { "pending" },
+    items = {
+        pending = {
+            lastQueueFailure = "no_targets",
+            nextAttemptAt = now + 500,
+        },
+    },
+}
+setAdmins({ COORD, OWNER })
+local changed = Sync:ApplyAdvertisedHelpers({}, "grant-without-helper-change")
+assertEq(changed, false, "restoring the coordinator does not change the helper list")
+local entry = Sync.state.repairQueue.items.pending
+assertTrue(type(entry) == "table" and entry.nextAttemptAt <= now,
+    "a restored coordinator route makes no-target work due")
+end)()
+
+;(function()
+reset(MEMBER)
+setAdmins({ OWNER })
+Sync.state.helpers = {}
+Sync.state.coordinator = COORD
+Sync.state.isCoordinator = false
+profile.ComputeAuthorMax = function()
+    return {}
+end
+local savedMissing = Sync.ComputeMissingLogRequests
+local savedMismatch = Sync.ComputeWindowMismatchRequests
+local savedSend = Sync.SendJoinStatus
+local savedQueue = Sync.QueueRepairRanges
+Sync.SendJoinStatus = productionSendJoinStatus
+Sync.QueueRepairRanges = productionQueueRepairRanges
+Sync.ComputeMissingLogRequests = function()
+    return {}
+end
+Sync.ComputeWindowMismatchRequests = function()
+    return {
+        { author = "Author-Realm", fromCounter = 8, toCounter = 9 },
+    }
+end
+local ok, status = Sync:RequestManualSync("integrity-no-route")
+assertEq(ok, true, "an integrity mismatch with no route still starts manual sync")
+assertEq(status, "log_sync_requested", "queued integrity work is a log sync request")
+assertEq(warningCount("Cannot request integrity repair"), 0, "a no-route integrity repair stays out of chat")
+local queued = Sync.state.repairQueue and Sync.state.repairQueue.items or {}
+local held = nil
+for _, item in pairs(queued) do
+    if type(item) == "table" and item.mode == "integrity" and item.fromCounter == 8 then
+        held = item
+    end
+end
+assertTrue(held ~= nil, "a no-route integrity repair is queued")
+local before = #(Sync.state.repairQueue.order or {})
+assertEq(Sync:RequestIntegrityRepairRanges(PROFILE, {
+    { author = "Author-Realm", fromCounter = 8, toCounter = 9 },
+}, "queued-integrity", nil, { backgroundRepair = true }), false, "a background integrity retry does not register without a route")
+assertEq(#(Sync.state.repairQueue.order or {}), before, "a background integrity retry leaves the queued entry in place")
+setAdmins({ COORD, OWNER })
+Sync:ApplyAdvertisedHelpers({}, "integrity-route")
+Sync:_ProcessRepairConvergenceTick("integrity-route")
+local resumed = false
+for _, req in pairs(Sync.state.requests) do
+    if req.meta and req.meta.integrityRepair == true then
+        resumed = true
+    end
+end
+assertTrue(resumed, "queued integrity work is requested after the route returns")
+assertEq(warningCount("Cannot request integrity repair"), 0, "integrity route recovery stays out of chat")
+Sync.ComputeMissingLogRequests = savedMissing
+Sync.ComputeWindowMismatchRequests = savedMismatch
+Sync.SendJoinStatus = savedSend
+Sync.QueueRepairRanges = savedQueue
+end)()
+
+;(function()
+reset(MEMBER)
+setAdmins({ COORD, OWNER })
+Sync.state.helpers = { COORD }
+Sync.state.isCoordinator = false
+SF.lootHelperDB.profiles = {}
+local previousMax = Sync.cfg.maxOutstandingRequests
+Sync.cfg.maxOutstandingRequests = 0
+Sync.state.pendingProfileSnapshot = {
+    sessionId = Sync.state.sessionId,
+    profileId = PROFILE,
+    reason = "no-route",
+    queueAttempts = 0,
+    nextAttemptAt = Sync:_Now(),
+}
+assertEq(Sync:RequestProfileSnapshot("route-returned"), false, "a full request table rejects the profile request")
+assertTrue(type(Sync.state.pendingProfileSnapshot) == "table", "a rejected profile request keeps the pending snapshot")
+assertTrue(Sync:_ProcessPendingProfileSnapshot(), "pending profile work stays on the repair tick")
+assertEq(Sync.state.pendingProfileSnapshot.queueAttempts, 1, "a rejected profile request backs off instead of disappearing")
+Sync.cfg.maxOutstandingRequests = previousMax
+assertEq(Sync:RequestProfileSnapshot("route-open"), true, "the profile request registers once a slot is free")
+assertEq(Sync.state.pendingProfileSnapshot, nil, "a registered profile request clears the pending snapshot")
+end)()
+
+;(function()
+reset(COORD)
+local originalSend = SF.LootHelperComm.Send
+SF.LootHelperComm.Send = function()
+    return false
+end
+local broadcastOk, broadcastErr = Sync:BroadcastNewLog(PROFILE, {
+    _eventType = "POINT_CHANGE",
+    _data = {},
+})
+assertEq(broadcastOk, false, "a dropped NEW_LOG send fails the broadcast")
+assertEq(broadcastErr, "comm send dropped", "a dropped NEW_LOG send keeps the reason")
+SF.LootHelperComm.Send = function()
+    return true
+end
+local sentOk = Sync:BroadcastNewLog(PROFILE, {
+    _eventType = "POINT_CHANGE",
+    _data = {},
+})
+assertEq(sentOk, true, "an accepted NEW_LOG send still broadcasts")
+SF.LootHelperComm.Send = originalSend
+end)()
+
+;(function()
+local function scanFile(path)
+    local handle = io.open(path, "r")
+    if not handle then
+        return "unreadable " .. path
+    end
+    local src = handle:read("*a")
+    handle:close()
+    local i = 1
+    while true do
+        local startAt, parenAt, name = string.find(src, "SF:Print(%a+)%s*%(", i)
+        if not startAt then
+            return nil
+        end
+        local depth = 0
+        local j = parenAt
+        local finish = nil
+        while j <= #src do
+            local ch = src:sub(j, j)
+            if ch == "(" then
+                depth = depth + 1
+            elseif ch == ")" then
+                depth = depth - 1
+                if depth == 0 then
+                    finish = j
+                    break
+                end
+            elseif ch == '"' or ch == "'" then
+                local quote = ch
+                j = j + 1
+                while j <= #src and src:sub(j, j) ~= quote do
+                    if src:sub(j, j) == "\\" then
+                        j = j + 1
+                    end
+                    j = j + 1
+                end
+            elseif ch == "-" and src:sub(j, j + 1) == "--" then
+                local newline = string.find(src, "\n", j, true)
+                j = newline or #src
+            end
+            j = j + 1
+        end
+        if not finish then
+            return path .. ": unterminated " .. tostring(name)
+        end
+        local inner = src:sub(parenAt + 1, finish - 1)
+        local trimmed = inner:match("^%s*(.*)$") or ""
+        local quote = trimmed:sub(1, 1)
+        if quote == '"' or quote == "'" then
+            local k = 2
+            while k <= #trimmed do
+                if trimmed:sub(k, k) == "\\" then
+                    k = k + 1
+                elseif trimmed:sub(k, k) == quote then
+                    break
+                end
+                k = k + 1
+            end
+            local literal = trimmed:sub(2, k - 1)
+            local rest = trimmed:sub(k + 1):match("^%s*(.*)$") or ""
+            if rest:sub(1, 1) == "," and string.find(literal, "%%", 1, true) then
+                return path .. ": SF:Print" .. tostring(name) .. " passes extra arguments to " .. literal
+            end
+        end
+        i = finish + 1
+    end
+end
+
+local scan = io.popen("find SpectrumFederation SpectrumFederation_RCLootCouncilIntegration SpectrumFederation_CursedSurgeTracker -name '*.lua' -not -path '*/Libs/*'")
+assertTrue(scan ~= nil, "message scan can list addon sources")
+if scan then
+    local misuse = nil
+    for path in scan:lines() do
+        misuse = scanFile(path)
+        if misuse then
+            break
+        end
+    end
+    scan:close()
+    assertTrue(misuse == nil, misuse or "print helpers are not called with printf arguments")
+end
 end)()
 
 io.stdout:write(string.format("\n%d passed, %d failed\n", passes, failures))

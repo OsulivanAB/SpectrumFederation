@@ -128,6 +128,23 @@ def validate_wago_project_id(parent_toc, child_toc=None):
     return True
 
 
+def validate_curseforge_project_id(parent_toc):
+    """Verify the parent TOC has the public CurseForge project ID used for direct upload."""
+    project_id = toc_field(parent_toc, "X-Curse-Project-ID")
+    if not project_id:
+        print(f"::error ::No '## X-Curse-Project-ID:' line found in {parent_toc}")
+        print("          Direct CurseForge publishing reads the project ID from the parent TOC")
+        return False
+    if not re.fullmatch(r"[1-9][0-9]{0,11}", project_id):
+        print(
+            f"::error ::X-Curse-Project-ID '{project_id}' in {parent_toc} "
+            "is not a numeric CurseForge project ID"
+        )
+        return False
+    print(f"[validate-packaging] Parent X-Curse-Project-ID '{project_id}' looks OK")
+    return True
+
+
 def parse_pkgmeta_move_folders(pkgmeta_path):
     """Return {source: destination} mappings from pkgmeta.yaml move-folders."""
     moves = {}
@@ -322,6 +339,9 @@ def main():
         toc_files.append(toc_file)
 
     if not validate_wago_project_id(toc_files[0]):
+        sys.exit(1)
+
+    if not validate_curseforge_project_id(toc_files[0]):
         sys.exit(1)
 
     if not validate_pkgmeta_addon_folders(PKGMETA_PATH, addon_names):

@@ -1,0 +1,226 @@
+language: en-US
+early_access: false
+enable_free_tier: true
+
+tone_instructions: >-
+  Be concise and evidence-driven. Report actionable defects with a concrete
+  triggering condition and practical impact. Avoid praise, jokes, emojis,
+  style-only feedback, speculative refactors, and repetitive summaries.
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  high_level_summary_instructions: >-
+    Briefly explain the user-visible change and the main implementation areas.
+    Mention compatibility, persistence, synchronization, performance, or
+    release implications only when relevant. Distinguish verified testing from
+    testing still needed. Never claim in-game verification without evidence.
+    Avoid repeating the PR description or presenting speculative risks as facts.
+
+  review_status: true
+  review_details: true
+  review_progress: true
+
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: true
+  estimate_code_review_effort: false
+  assess_linked_issues: true
+  related_issues: false
+  related_prs: true
+  suggested_labels: false
+  auto_apply_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+
+  in_progress_fortune: false
+  poem: false
+  enable_prompt_for_ai_agents: true
+
+  # Do not exclude bundled libraries from checkout/context. They can be needed
+  # to understand integration behavior even when they should not be critiqued.
+  path_filters: []
+
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        Review independently. Prioritize actionable correctness, reliability,
+        compatibility, security, data integrity, performance, and integration
+        defects.
+
+        Read the linked ticket when available. Check the implementation against
+        its requirements without inventing requirements or expanding unrelated
+        scope.
+
+        Trace affected callers, consumers, persisted state, and lifecycle
+        behavior when needed to substantiate a finding. Do not stop after the
+        first defect; finish the affected review scope.
+
+        For each finding, establish a concrete triggering condition, resulting
+        failure or user impact, and affected code. Consolidate symptoms that
+        share one root cause.
+
+        Do not report formatting preferences, naming preferences, cosmetic
+        changes, speculative refactors, or unrelated cleanup as defects.
+
+        Do not audit unrelated unchanged code. Inspect third-party libraries
+        when necessary to understand integration behavior, but do not critique
+        unchanged vendored code as part of an unrelated PR.
+
+        On subsequent reviews, verify fixes and inspect affected integration
+        paths. Do not repeat an existing finding unless it remains unresolved
+        or new evidence materially changes the conclusion.
+
+        Require credible reachability. A theoretically possible problem is not
+        actionable unless the changed code can realistically trigger it.
+
+        Passing tests do not prove runtime correctness. Never claim that
+        World of Warcraft in-game testing occurred unless the PR contains
+        evidence that a human performed it.
+
+    - path: "SpectrumFederation*/**/*.lua"
+      instructions: |
+        This is World of Warcraft Retail addon code running in Blizzard's
+        embedded Lua 5.1 environment.
+
+        Do not recommend Lua 5.2+ syntax or APIs, filesystem access, sockets,
+        external processes, or standard-library facilities unavailable to WoW
+        addons.
+
+        Treat client freezes, UI stalls, runaway execution, repeated callbacks,
+        message storms, and long-session resource growth as major correctness
+        concerns.
+
+        Trace event handlers, timers, tickers, OnUpdate handlers, callbacks,
+        layout refreshes, inspection queues, retries, and addon-message
+        processing for credible feedback loops, duplicate registration,
+        unbounded work, amplification, or failure to become idle.
+
+        Recurring code is not inherently defective. Establish its triggering
+        path, frequency, lifecycle, termination conditions, and cleanup before
+        reporting a problem.
+
+        Check asynchronous game data for delayed availability, stale callbacks,
+        identity changes, invalidated state, retries, and cancellation where
+        relevant.
+
+        For SavedVariables, profiles, and persistent state, check compatibility
+        with existing saved data, defaults, migrations, profile switching,
+        deletion, serialization boundaries, and stale values.
+
+        For synchronization and addon communications, check authorization,
+        sender identity, deduplication, ordering, stale state, retries, message
+        amplification, and authoritative-record creation. Duplicate events or
+        messages must not create duplicate authoritative records.
+
+        For UI changes, inspect shared consumers, re-entrancy, repeated
+        open/close cycles, layout feedback, cleanup, and applicable combat or
+        protected-UI restrictions. Avoid recommendations that introduce taint.
+
+        For recurring user-visible output, check whether an unchanged condition
+        can repeatedly emit the same message. Prefer state-transition-based or
+        appropriately rate-limited behavior without hiding useful errors.
+
+        Keep optional integrations optional. Prefer established repository
+        adapters, helpers, and lifecycle patterns over parallel implementations.
+
+    - path: "**/*.toc"
+      instructions: |
+        Check addon metadata and release compatibility. When shipped behavior,
+        UI, settings, or other user-visible addon functionality changes, verify
+        the repository's versioning requirements are satisfied and related
+        parent/child TOC versions remain consistent where required.
+
+    - path: ".github/workflows/**"
+      instructions: |
+        Prioritize release safety, branch targeting, permissions, artifact
+        correctness, version propagation, beta-versus-main behavior, rollback
+        safety, and conditions that could publish or promote the wrong state.
+        Treat deterministic workflow validation as complementary to review,
+        not a replacement for reasoning about release behavior.
+
+    - path: ".github/scripts/**"
+      instructions: |
+        Prioritize correctness of release automation, version manipulation,
+        validation, packaging, branch assumptions, failure handling, and data
+        transformations. Check that failure modes cannot silently produce a
+        misleading successful release state.
+
+    - path: "tests/**"
+      instructions: |
+        Evaluate whether tests meaningfully exercise production behavior and
+        bounded/convergent execution. Prefer tests that load production Lua and
+        assert lifecycle, state-transition, persistence, synchronization, and
+        termination behavior over tests that merely duplicate implementation
+        logic.
+
+  auto_review:
+    enabled: false
+    auto_incremental_review: false
+    auto_pause_after_reviewed_commits: 2
+    drafts: false
+    base_branches:
+      - "^beta$"
+    labels: []
+    ignore_title_keywords: []
+    ignore_usernames: []
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+    custom: []
+
+  pre_merge_checks:
+    docstrings:
+      mode: off
+    title:
+      mode: off
+    description:
+      mode: off
+    issue_assessment:
+      mode: warning
+    custom_checks: []
+
+  post_merge_actions: []
+
+  tools:
+    luacheck:
+      enabled: true
+    ruff:
+      enabled: true
+    shellcheck:
+      enabled: true
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    github-checks:
+      enabled: true
+
+    # Avoid low-value style/prose noise for this repository.
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+    pylint:
+      enabled: false
+
+chat:
+  art: false
+
+knowledge_base:
+  code_guidelines:
+    enabled: true

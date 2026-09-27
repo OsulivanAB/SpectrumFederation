@@ -13,6 +13,7 @@ PARENT_TOC = REPO_ROOT / "SpectrumFederation" / "SpectrumFederation.toc"
 POLICY = REPO_ROOT / "SpectrumFederation" / "modules" / "RaidEquipment" / "Policy.lua"
 CHECK_RUN = REPO_ROOT / "SpectrumFederation" / "modules" / "RaidEquipment" / "CheckRun.lua"
 POLICY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_policy_tests.lua"
+RANGED_OFFHAND_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_ranged_offhand_tests.lua"
 RUN_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_run_tests.lua"
 FRESH_SNAPSHOT_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_fresh_snapshot_tests.lua"
 STABILITY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_stability_tests.lua"
@@ -52,6 +53,11 @@ def _run_lua(test_file: Path, label: str) -> None:
 def test_raid_equipment_policy_production_lua():
     _run_lua(POLICY_TESTS, "Raid Equipment Policy")
     assert POLICY.exists()
+
+
+def test_raid_equipment_ranged_offhand_production_lua():
+    _run_lua(RANGED_OFFHAND_TESTS, "Raid Equipment ranged off hand")
+    assert RANGED_OFFHAND_TESTS.exists()
 
 
 def test_raid_check_run_production_lua():

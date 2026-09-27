@@ -186,21 +186,49 @@ local NONWEAPON_OFFHAND_LOCS = {
 	INVTYPE_RELIC = true,
 }
 
+function Policy.GetItemIdentity(linkOrId)
+	if linkOrId == nil or not GetItemInfoInstant then
+		return nil, nil, nil
+	end
+	local ok, _, _, _, equipLoc, _, classID, subClassID = pcall(GetItemInfoInstant, linkOrId)
+	if not ok then
+		return nil, nil, nil
+	end
+	if type(equipLoc) ~= "string" or equipLoc == "" then
+		equipLoc = nil
+	end
+	return equipLoc, tonumber(classID), tonumber(subClassID)
+end
+
 function Policy.GetItemEquipLocation(linkOrId)
-	if linkOrId == nil then
-		return nil
-	end
-	if GetItemInfoInstant then
-		local ok, _, _, _, equipLoc = pcall(GetItemInfoInstant, linkOrId)
-		if ok and type(equipLoc) == "string" and equipLoc ~= "" then
-			return equipLoc
-		end
-	end
-	return nil
+	local equipLoc = Policy.GetItemIdentity(linkOrId)
+	return equipLoc
 end
 
 function Policy.IsTwoHandWeapon(equipLoc)
 	return equipLoc == "INVTYPE_2HWEAPON"
+end
+
+local function RangedEquipLoc(equipLoc)
+	local SpecWeapons = SF.LootHelperBis and SF.LootHelperBis.SpecWeapons
+	if SpecWeapons and SpecWeapons.IsRangedEquipLoc then
+		return SpecWeapons.IsRangedEquipLoc(equipLoc) and true or false
+	end
+	return equipLoc == "INVTYPE_RANGED" or equipLoc == "INVTYPE_RANGEDRIGHT"
+end
+
+-- True when this subclass is a bow, gun, or crossbow.
+-- False when the subclass is resolved and is not one of those weapons.
+-- Nil when SpecWeapons or the subclass identity is unavailable.
+local function ConsumingRangedWeapon(itemClass, itemSubClass)
+	local SpecWeapons = SF.LootHelperBis and SF.LootHelperBis.SpecWeapons
+	if not (SpecWeapons and SpecWeapons.IsTwoHandRangedWeapon) then
+		return nil
+	end
+	if itemClass == nil or itemSubClass == nil then
+		return nil
+	end
+	return SpecWeapons.IsTwoHandRangedWeapon(itemClass, itemSubClass) and true or false
 end
 
 function Policy.IsWeaponEquipLoc(equipLoc)
@@ -278,6 +306,67 @@ function Policy.DescribeSlotPresence(slot)
 		return "unresolved", "incomplete_link"
 	end
 	return "equipped", nil
+end
+
+-- Does this equipped Main Hand make an empty Off Hand legitimate?
+-- True: INVTYPE_2HWEAPON, or a bow, gun, or crossbow.
+-- False: the item is known not to occupy the Off Hand.
+-- Nil: weapon identity has not resolved. Callers must stay incomplete.
+-- INVTYPE_2HWEAPON stays spec-agnostic, including Fury Titan's Grip. A ranged
+-- equip location alone is not enough, because wands use that location too.
+function Policy.MainHandAllowsEmptyOffHand(slot, knownEquipLoc)
+	if type(slot) ~= "table" then
+		if Policy.IsTwoHandWeapon(knownEquipLoc) then
+			return true
+		end
+		return false
+	end
+
+	local presence = Policy.DescribeSlotPresence(slot)
+	if presence == "empty" then
+		return false
+	end
+	if presence == "unresolved" then
+		return nil
+	end
+
+	local equipLoc = knownEquipLoc
+	if type(equipLoc) ~= "string" or equipLoc == "" then
+		equipLoc = slot.equipLoc
+	end
+	local itemClass = tonumber(slot.itemClass)
+	local itemSubClass = tonumber(slot.itemSubClass)
+	if equipLoc == nil or itemClass == nil or itemSubClass == nil then
+		local lookedLoc, lookedClass, lookedSub = Policy.GetItemIdentity(SlotLink(slot) or slot.itemId)
+		if equipLoc == nil then
+			equipLoc = lookedLoc
+		end
+		if itemClass == nil then
+			itemClass = lookedClass
+		end
+		if itemSubClass == nil then
+			itemSubClass = lookedSub
+		end
+	end
+
+	if Policy.IsTwoHandWeapon(equipLoc) then
+		return true
+	end
+
+	local consuming = ConsumingRangedWeapon(itemClass, itemSubClass)
+	if consuming == true then
+		return true
+	end
+	if RangedEquipLoc(equipLoc) then
+		if consuming == nil then
+			return nil
+		end
+		return false
+	end
+	if equipLoc == nil then
+		return nil
+	end
+	return false
 end
 
 function Policy.IsQualifyingLimitedGem(gemId, uniqueness)
@@ -412,8 +501,15 @@ function Policy.EvaluateObservation(observation, config)
 		end
 
 		if presence == "empty" then
-			local twoHandExempt = def.key == "offHand" and Policy.IsTwoHandWeapon(mainHandLoc)
-			if not twoHandExempt then
+			local allowsEmptyOffHand = false
+			if def.key == "offHand" then
+				allowsEmptyOffHand = Policy.MainHandAllowsEmptyOffHand(mainHand, mainHandLoc)
+				if allowsEmptyOffHand == nil then
+					result.incompleteReason = "unresolved_mainhand_weapon"
+					return result
+				end
+			end
+			if not allowsEmptyOffHand then
 				table.insert(result.missing, def.label .. " Item")
 			end
 		else

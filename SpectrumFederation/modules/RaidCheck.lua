@@ -180,13 +180,20 @@ local function HasEnchant(link)
 	return false
 end
 
-local function GetItemEquipLocation(link)
-	if type(link) ~= "string" then return nil end
-	local _, _, _, equipLoc = GetItemInfoInstant(link)
-	if type(equipLoc) == "string" and equipLoc ~= "" then
-		return equipLoc
+local function GetItemIdentity(link)
+	if type(link) ~= "string" or not GetItemInfoInstant then
+		return nil, nil, nil
 	end
-	return nil
+	local _, _, _, equipLoc, _, classID, subClassID = GetItemInfoInstant(link)
+	if type(equipLoc) ~= "string" or equipLoc == "" then
+		equipLoc = nil
+	end
+	return equipLoc, tonumber(classID), tonumber(subClassID)
+end
+
+local function GetItemEquipLocation(link)
+	local equipLoc = GetItemIdentity(link)
+	return equipLoc
 end
 
 local function GetItemStatsSafe(link)
@@ -479,8 +486,23 @@ local function HasEquippedMetaGem(unit)
 	return false
 end
 
-local function IsTwoHandWeapon(link)
-	if type(link) ~= "string" then return false end
+-- Tri-state from RaidEquipment.Policy: true exempt, false missing, nil unresolved.
+-- Nil must not become a missing Off Hand. Policy owns that verdict.
+local function MainHandAllowsEmptyOffHand(link)
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if Policy and Policy.MainHandAllowsEmptyOffHand then
+		if type(link) ~= "string" or link == "" then
+			return false
+		end
+		return Policy.MainHandAllowsEmptyOffHand({
+			empty = false,
+			link = link,
+			linkComplete = true,
+		})
+	end
+	if type(link) ~= "string" then
+		return false
+	end
 	return GetItemEquipLocation(link) == "INVTYPE_2HWEAPON"
 end
 
@@ -1775,7 +1797,9 @@ local function BuildPolicyObservation(captured)
 			itemId = slotData and slotData.itemId or nil,
 			link = link,
 			texture = slotData and slotData.texture or nil,
-			equipLoc = (type(link) == "string" and GetItemEquipLocation(link)) or nil,
+			equipLoc = nil,
+			itemClass = nil,
+			itemSubClass = nil,
 			linkComplete = not pending,
 		}
 		if hasItem and (not link or link == "") then
@@ -1783,6 +1807,10 @@ local function BuildPolicyObservation(captured)
 			mapped.linkComplete = false
 		end
 		if type(link) == "string" and link ~= "" then
+			local equipLoc, itemClass, itemSubClass = GetItemIdentity(link)
+			mapped.equipLoc = equipLoc
+			mapped.itemClass = itemClass
+			mapped.itemSubClass = itemSubClass
 			local enchantId = tonumber(ParseEnchantIdFromLink(link))
 			mapped.enchantId = enchantId
 			mapped.hasEnchant = HasEnchant(link)
@@ -2119,7 +2147,7 @@ local function BuildMissingForSlot(unit, slotKey, slotDef, idx, mainHandLink, cf
 	end
 
 	if not link then
-		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
+		if slotDef == SLOT_DEFS.offHand and mainHandLink and MainHandAllowsEmptyOffHand(mainHandLink) ~= false then
 			return {}
 		end
 		-- Empty slots use their physical slot toggle. For offhand specifically,
@@ -2167,8 +2195,14 @@ local function BuildMissingForSlotSnapshot(slotsByInventory, slotKey, slotDef, i
 	end
 
 	if not link then
-		if slotDef == SLOT_DEFS.offHand and mainHandLink and IsTwoHandWeapon(mainHandLink) then
-			return {}, false
+		if slotDef == SLOT_DEFS.offHand and mainHandLink then
+			local allowsEmpty = MainHandAllowsEmptyOffHand(mainHandLink)
+			if allowsEmpty == true then
+				return {}, false
+			end
+			if allowsEmpty == nil then
+				return {}, true
+			end
 		end
 		if not IsSlotEnabledInConfig(cfg, slotKey, nil) then
 			return {}, false
@@ -2288,7 +2322,12 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 		-- offhand toggle or the logical weapon toggle is enabled.
 		configEnabled = (cfg.slots.offHand or cfg.slots.weapon) and true or false
 	end
-	local twoHandExempt = isKnown and (slotKey == "offHand") and (not hasItem) and mainHandLink and IsTwoHandWeapon(mainHandLink) or false
+	local allowsEmptyOffHand = nil
+	if isKnown and slotKey == "offHand" and not hasItem and mainHandLink then
+		allowsEmptyOffHand = MainHandAllowsEmptyOffHand(mainHandLink)
+	end
+	local twoHandExempt = allowsEmptyOffHand == true
+	local offHandIdentityPending = isKnown and slotKey == "offHand" and not hasItem and mainHandLink and allowsEmptyOffHand == nil
 	local shouldCheckEnchant = isKnown and link and configEnabled and ShouldCheckTroubleshootingEnchant(slotKey, link) or false
 	local hasEnchant = isKnown and link and HasEnchant(link) or false
 
@@ -2306,9 +2345,9 @@ local function BuildTroubleshootingSlotBase(column, mainHandLink, cfg, sourceSlo
 	-- inspect stubs to resolve. Bonus IDs / itemContext mark unenchanted
 	-- empty-socket items as complete so they can blink for missing gems.
 	local missingGems = isKnown and link and not linkIncomplete and cfg and cfg.checkGemsInSockets ~= false and HasMissingGems(link) or false
-	local missingItem = isKnown and (not hasItem) and configEnabled and not twoHandExempt
+	local missingItem = isKnown and (not hasItem) and configEnabled and not twoHandExempt and not offHandIdentityPending
 	local skippedEnchant = isKnown and link and configEnabled and not shouldCheckEnchant
-	local itemDataPending = ((isKnown and hasItem and not link) or linkIncomplete) and true or false
+	local itemDataPending = ((isKnown and hasItem and not link) or linkIncomplete or offHandIdentityPending) and true or false
 
 	return {
 		key = slotKey,

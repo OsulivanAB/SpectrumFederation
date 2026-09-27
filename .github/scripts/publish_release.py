@@ -1,11 +1,12 @@
 """
-Package addon and create GitHub and Wago releases.
+Package addon and create GitHub, CurseForge, and Wago releases.
 
-Creates a zip file with proper structure, publishes to GitHub Releases,
-and uploads the same zip to Wago Addons with an explicit stability value.
+Creates one canonical zip, publishes it to GitHub Releases first, then
+uploads that same zip to CurseForge and Wago independently.
 """
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import uuid
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib import error as urllib_error
@@ -47,27 +49,99 @@ WAGO_DUPLICATE_PHRASES = (
     "label has already",
     "release already",
 )
+CURSEFORGE_API_BASE = "https://wow.curseforge.com/api"
+CURSEFORGE_API_TOKEN_ENV = "CURSEFORGE_API_TOKEN"
+CURSEFORGE_USER_AGENT = (
+    "SpectrumFederation-PublishRelease/1.0 "
+    "(+https://github.com/OsulivanAB/SpectrumFederation)"
+)
+CURSEFORGE_UPLOAD_TIMEOUT_SECONDS = 60
+CURSEFORGE_CATALOG_TIMEOUT_SECONDS = 15
+CURSEFORGE_RELEASE_TYPES = ("alpha", "beta", "release")
+CURSEFORGE_PROJECT_ID_RE = re.compile(r"^[1-9][0-9]{0,11}$")
+CURSEFORGE_CHANGELOG_SOURCE = "CHANGELOG.md"
+CURSEFORGE_DUPLICATE_PHRASES = (
+    "already exists",
+    "already been uploaded",
+    "already been published",
+    "duplicate file",
+    "duplicate version",
+    "file already",
+    "filename already",
+    "file name already",
+    "version already",
+    "display name already",
+    "same file",
+)
+# Names that are not the Retail release track, even when they contain "retail".
+CURSEFORGE_NON_RETAIL_TYPE_MARKERS = (
+    "classic",
+    "ptr",
+    "public test",
+    "beta",
+    "arena",
+    "season",
+)
+# The author API names live Retail "World of Warcraft" / "world-of-warcraft".
+CURSEFORGE_RETAIL_TYPE_LABEL = "world of warcraft"
+CURSEFORGE_RELEASE_TYPE_VALUES = {
+    1: "release",
+    2: "beta",
+    3: "alpha",
+    "1": "release",
+    "2": "beta",
+    "3": "alpha",
+    "release": "release",
+    "beta": "beta",
+    "alpha": "alpha",
+}
+CURSEFORGE_USABLE_FILE_STATUSES = {4, 10, "4", "10", "approved", "released"}
+_CURSEFORGE_CATALOG_CACHE = {
+    "loaded": False,
+    "versions": None,
+    "version_types": None,
+}
 PRERELEASE_MARKER_RE = re.compile(
     r"-(alpha|beta|rc)(?=[.\-]|$)",
     re.IGNORECASE,
 )
 SECRET_LIKE_RE = re.compile(
     r"(authorization:\s*(?:token|bearer|basic)\s+)\S+"
+    r"|(x-api-token:\s*)\S+"
     r"|(bearer\s+)[A-Za-z0-9._\-]+"
     r"|\b(gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b"
-    r"|(\b(?:WAGO_API_KEY|WAGO_API_SECRET|GH_TOKEN|GITHUB_TOKEN)\s*[:=]\s*)\S+",
+    r"|(\b(?:WAGO_API_KEY|WAGO_API_SECRET|GH_TOKEN|GITHUB_TOKEN|CURSEFORGE_API_TOKEN)\s*[:=]\s*)\S+",
     re.IGNORECASE,
 )
 
 
 @dataclass(frozen=True)
 class ReleaseClassification:
-    """Shared GitHub/Wago release classification derived from the version string."""
+    """Shared GitHub/Wago/CurseForge classification derived from the version string."""
 
     version: str
     is_prerelease: bool
     wago_stability: str
     github_release_kind: str
+    curseforge_release_type: str
+
+
+@dataclass(frozen=True)
+class CurseForgePublishPlan:
+    """Non-secret CurseForge upload plan used by dry-run logging and live publishing."""
+
+    project_id: str
+    version: str
+    release_type: str
+    retail_patch: str
+    game_version_id: int | None
+    game_version_name: str | None
+    patch_match: str | None
+    changelog: str
+    changelog_source: str
+    zip_path: Path
+    endpoint: str
+    action: str
 
 
 @dataclass(frozen=True)
@@ -84,11 +158,21 @@ class WagoPublishPlan:
     endpoint: str
 
 
+def curseforge_release_type_for_stability(wago_stability):
+    """Map the shared stability value onto CurseForge's releaseType enum."""
+    if wago_stability == "stable":
+        return "release"
+    if wago_stability in ("alpha", "beta"):
+        return wago_stability
+    raise ValueError(f"Invalid release stability '{wago_stability}'")
+
+
 def classify_release(version):
-    """Classify a version for GitHub prerelease flags and Wago stability.
+    """Classify a version for GitHub, Wago, and CurseForge.
 
     Matching is case-insensitive and looks for `-alpha`, `-beta`, and `-rc`
-    prerelease identifiers. `-rc` maps to Wago `beta`.
+    prerelease identifiers. `-rc` maps to Wago `beta` and CurseForge `beta`.
+    Stable versions map to CurseForge `release`.
     """
     version = version or ""
     match = PRERELEASE_MARKER_RE.search(version)
@@ -98,6 +182,7 @@ def classify_release(version):
             is_prerelease=False,
             wago_stability="stable",
             github_release_kind="release",
+            curseforge_release_type="release",
         )
 
     marker = match.group(1).lower()
@@ -107,6 +192,7 @@ def classify_release(version):
         is_prerelease=True,
         wago_stability=stability,
         github_release_kind="prerelease",
+        curseforge_release_type=curseforge_release_type_for_stability(stability),
     )
 
 
@@ -263,12 +349,23 @@ def sanitize_output(text):
         return text
 
     def _redact(match):
-        prefix = match.group(1) or match.group(2) or match.group(4) or ""
+        prefix = match.group(1) or match.group(2) or match.group(3) or match.group(5) or ""
         if prefix:
             return f"{prefix}***"
         return "***"
 
-    return SECRET_LIKE_RE.sub(_redact, str(text))
+    redacted = SECRET_LIKE_RE.sub(_redact, str(text))
+    for env_name in (
+        WAGO_API_KEY_ENV,
+        WAGO_LEGACY_WEBHOOK_SECRET_ENV,
+        CURSEFORGE_API_TOKEN_ENV,
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ):
+        secret = os.environ.get(env_name) or ""
+        if len(secret) >= 8 and secret in redacted:
+            redacted = redacted.replace(secret, "***")
+    return redacted
 
 
 def format_command(cmd):
@@ -458,6 +555,38 @@ def packaged_parent_toc_version(addon_name):
     if not version:
         raise RuntimeError(f"No '## Version:' line in {toc_file}")
     return version
+
+
+def packaged_parent_toc_interface(addon_name, zip_path):
+    """Return the ## Interface integer from the parent TOC inside the release zip."""
+    toc_name = f"{addon_name}/{addon_name}.toc"
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            text = archive.read(toc_name).decode("utf-8")
+    except KeyError as error:
+        raise RuntimeError(f"Release zip is missing {toc_name}") from error
+    except (OSError, zipfile.BadZipFile, UnicodeError) as error:
+        raise RuntimeError(f"Could not read {toc_name} from the release zip: {error}") from error
+    match = re.search(
+        r"^## Interface:\s*([0-9]{6})\s*$",
+        text.replace("\r\n", "\n"),
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not match:
+        raise RuntimeError(f"Release zip TOC {toc_name} has no 6-digit ## Interface value")
+    return int(match.group(1))
+
+
+def curseforge_interface_from_package(addon_name, zip_path, requested_interface):
+    """Use the packaged TOC Interface and reject a different requested value."""
+    packaged = packaged_parent_toc_interface(addon_name, zip_path)
+    if int(requested_interface) != packaged:
+        raise ValueError(
+            "CurseForge compatibility must use the packaged parent TOC Interface "
+            f"{packaged}, not requested Interface {requested_interface}. "
+            "Refusing to claim a Retail patch the packaged addon does not declare."
+        )
+    return packaged
 
 
 def requested_version_matches_packaged_toc(addon_name, version):
@@ -738,15 +867,6 @@ def build_wago_publish_plan(
     )
 
 
-def log_github_succeeded_wago_failed():
-    """Explain that CurseForge is intact and Wago can be retried."""
-    print(
-        "[publish-release] GitHub release succeeded, but Wago publication failed. "
-        "Rerun this script to retry Wago without deleting the GitHub Release. "
-        "Do not roll back CurseForge."
-    )
-
-
 def resolve_wago_publish_plan(
     *,
     version,
@@ -776,84 +896,6 @@ def log_wago_summary(plan):
         f"[publish-release] Supported retail patch: {plan.supported_retail_patch} "
         f"({plan.patch_match})"
     )
-
-
-def publish_github_then_wago(
-    *,
-    version,
-    classification,
-    addon_name,
-    interface,
-    zip_path,
-    json_path,
-    notes,
-    notes_path,
-    repo,
-    dry_run,
-):
-    """Publish GitHub first on live runs; validate Wago first only for dry-run.
-
-    Live Wago catalog, metadata, auth, and upload failures happen after the
-    GitHub Release exists so CurseForge still receives the Release event.
-    """
-    def resolve_plan():
-        return resolve_wago_publish_plan(
-            version=version,
-            classification=classification,
-            addon_name=addon_name,
-            interface=interface,
-            zip_path=zip_path,
-            changelog=notes,
-        )
-
-    if dry_run:
-        wago_plan = resolve_plan()
-        if not wago_plan:
-            return False
-        log_wago_summary(wago_plan)
-        github_action = create_github_release(
-            version,
-            zip_path,
-            json_path,
-            repo,
-            classification,
-            notes_path,
-            dry_run=True,
-        )
-        if not github_action:
-            return False
-        print(f"[publish-release] GitHub release action: {github_action}")
-        wago_action = publish_to_wago(wago_plan, dry_run=True)
-        if not wago_action:
-            return False
-        print(f"[publish-release] Wago publication action: {wago_action}")
-        return True
-
-    github_action = create_github_release(
-        version,
-        zip_path,
-        json_path,
-        repo,
-        classification,
-        notes_path,
-        dry_run=False,
-    )
-    if not github_action:
-        return False
-    print(f"[publish-release] GitHub release action: {github_action}")
-
-    wago_plan = resolve_plan()
-    if not wago_plan:
-        log_github_succeeded_wago_failed()
-        return False
-    log_wago_summary(wago_plan)
-
-    wago_action = publish_to_wago(wago_plan, dry_run=False)
-    if not wago_action:
-        log_github_succeeded_wago_failed()
-        return False
-    print(f"[publish-release] Wago publication action: {wago_action}")
-    return True
 
 
 def log_wago_plan(plan, *, dry_run=False):
@@ -940,7 +982,7 @@ def publish_to_wago(plan, *, dry_run=False, opener=None):
         else:
             print(f"::error ::Wago upload failed ({summary})")
         return None
-    except (urllib_error.URLError, TimeoutError, OSError) as error:
+    except (urllib_error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
         print(f"::error ::Wago upload failed: {sanitize_output(str(error))}")
         return None
 
@@ -960,9 +1002,949 @@ def publish_to_wago(plan, *, dry_run=False, opener=None):
     return None
 
 
+def clear_curseforge_catalog_cache():
+    """Drop the per-process CurseForge catalog cache."""
+    _CURSEFORGE_CATALOG_CACHE["loaded"] = False
+    _CURSEFORGE_CATALOG_CACHE["versions"] = None
+    _CURSEFORGE_CATALOG_CACHE["version_types"] = None
+
+
+def get_curseforge_project_id(addon_name):
+    """Read the public CurseForge project ID from the parent addon's TOC."""
+    toc_file = toc_path_for_addon(addon_name)
+    project_id = read_toc_field(toc_file, "X-Curse-Project-ID")
+    if not project_id:
+        print(f"::error ::Missing ## X-Curse-Project-ID in {toc_file}")
+        print("          Add the public CurseForge project ID to the parent TOC.")
+        return None
+    if not CURSEFORGE_PROJECT_ID_RE.fullmatch(project_id):
+        print(
+            f"::error ::X-Curse-Project-ID '{project_id}' in {toc_file} "
+            "is not a numeric CurseForge project ID"
+        )
+        return None
+    return project_id
+
+
+def curseforge_upload_endpoint(project_id):
+    """Return the documented CurseForge project upload URL."""
+    return f"{CURSEFORGE_API_BASE}/projects/{project_id}/upload-file"
+
+
+def curseforge_auth_headers(token):
+    """Build CurseForge author-API headers. The token stays out of the body and URL."""
+    return {
+        "X-Api-Token": token,
+        "Accept": "application/json",
+        "User-Agent": CURSEFORGE_USER_AGENT,
+    }
+
+
+def get_curseforge_api_token(*, required):
+    """Return the CurseForge Upload API token."""
+    raw_token = os.environ.get(CURSEFORGE_API_TOKEN_ENV)
+    token = raw_token.strip() if raw_token else ""
+    if token:
+        return token
+    if required:
+        print(
+            f"::error ::{CURSEFORGE_API_TOKEN_ENV} is not set. "
+            "Direct CurseForge publishing requires the CurseForge author API token."
+        )
+        print(
+            "[publish-release] Do not reuse the legacy CurseForge webhook token. "
+            f"{CURSEFORGE_API_TOKEN_ENV} is the Upload API credential."
+        )
+    return None
+
+
+def curseforge_object_list(payload):
+    """Return a list from a bare array or a common object wrapper."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("data", "files", "versionTypes", "versions"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return None
+
+
+def fetch_curseforge_json(path, token, *, timeout, opener=None):
+    """GET a CurseForge author-API path. Returns (status, body, payload).
+
+    status is None for timeout/network failures. payload is None when the
+    body is not JSON. The token is sent only as the X-Api-Token header.
+    """
+    request = urllib_request.Request(
+        f"{CURSEFORGE_API_BASE}/{path.lstrip('/')}",
+        headers=curseforge_auth_headers(token),
+        method="GET",
+    )
+    urlopen = opener or urllib_request.urlopen
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            status = getattr(response, "status", 200)
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib_error.HTTPError as error:
+        return error.code, read_http_error_body(error), None
+    except (urllib_error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
+        return None, sanitize_output(str(error)), None
+
+    try:
+        payload = json.loads(body) if body else None
+    except json.JSONDecodeError:
+        return status, body, None
+    return status, body, payload
+
+
+def load_curseforge_catalog(token, *, opener=None):
+    """Load game versions once per process, plus version types when that endpoint exists.
+
+    The documented Game Versions API is required. Version types are required
+    to identify the Retail game version. A missing version-types endpoint
+    does not discard the versions catalog; selection then fails closed.
+    """
+    if _CURSEFORGE_CATALOG_CACHE["loaded"]:
+        return (
+            _CURSEFORGE_CATALOG_CACHE["versions"],
+            _CURSEFORGE_CATALOG_CACHE["version_types"],
+        )
+
+    status, body, payload = fetch_curseforge_json(
+        "game/versions",
+        token,
+        timeout=CURSEFORGE_CATALOG_TIMEOUT_SECONDS,
+        opener=opener,
+    )
+    versions = curseforge_object_list(payload) if status == 200 else None
+    if versions is None:
+        summary = (
+            sanitize_output(body or "network error")
+            if status is None
+            else summarize_wago_http_error(status, body)
+        )
+        if status in (401, 403):
+            print(f"::error ::CurseForge authentication failed while loading game versions ({summary})")
+        else:
+            print(f"::error ::Could not load CurseForge game versions from {CURSEFORGE_API_BASE}/game/versions ({summary})")
+        _CURSEFORGE_CATALOG_CACHE["loaded"] = True
+        _CURSEFORGE_CATALOG_CACHE["versions"] = None
+        _CURSEFORGE_CATALOG_CACHE["version_types"] = None
+        return None, None
+
+    type_status, type_body, type_payload = fetch_curseforge_json(
+        "game/version-types",
+        token,
+        timeout=CURSEFORGE_CATALOG_TIMEOUT_SECONDS,
+        opener=opener,
+    )
+    version_types = curseforge_object_list(type_payload) if type_status == 200 else None
+    if version_types is None:
+        if type_status == 404:
+            print(
+                "[publish-release] CurseForge version-types endpoint is unavailable. "
+                "Retail resolution will fail until a Retail version type can be identified."
+            )
+        else:
+            summary = (
+                sanitize_output(type_body or "network error")
+                if type_status is None
+                else summarize_wago_http_error(type_status, type_body)
+            )
+            print(
+                "[publish-release] Warning: Could not load CurseForge version types "
+                f"({summary}). Retail resolution will fail until a Retail version type "
+                "can be identified."
+            )
+
+    _CURSEFORGE_CATALOG_CACHE["loaded"] = True
+    _CURSEFORGE_CATALOG_CACHE["versions"] = versions
+    _CURSEFORGE_CATALOG_CACHE["version_types"] = version_types
+    return versions, version_types
+
+
+def _curseforge_type_id(version):
+    return version.get("gameVersionTypeID", version.get("gameVersionTypeId"))
+
+
+def _normalize_curseforge_type_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def is_curseforge_retail_version_type(item):
+    """Return True for the live Retail version type.
+
+    The author catalog names that type "World of Warcraft" / "world-of-warcraft".
+    Labels that contain "retail" are also accepted. Classic, PTR, public-test,
+    and other non-Retail tracks are excluded. The numeric type ID is not hard-coded.
+    """
+    if not isinstance(item, dict):
+        return False
+    name = _normalize_curseforge_type_text(item.get("name"))
+    slug = _normalize_curseforge_type_text(item.get("slug"))
+    label = f"{name} {slug}".strip()
+    if not label:
+        return False
+    if any(marker in label for marker in CURSEFORGE_NON_RETAIL_TYPE_MARKERS):
+        return False
+    if "retail" in label:
+        return True
+    return name == CURSEFORGE_RETAIL_TYPE_LABEL or slug == CURSEFORGE_RETAIL_TYPE_LABEL
+
+
+def curseforge_retail_type_ids(version_types):
+    """Return Retail gameVersionTypeID values from the version-types catalog."""
+    ids = set()
+    for item in version_types or []:
+        if is_curseforge_retail_version_type(item) and item.get("id") is not None:
+            ids.add(item.get("id"))
+    return ids
+
+
+def select_curseforge_retail_game_version(desired_patch, versions, version_types=None):
+    """Require the exact Retail CurseForge game version for this Interface patch.
+
+    Classic, PTR, and other flavors are ignored. An older patch is never used
+    as a fallback. A patch name is Retail only when its type ID is a positively
+    identified Retail version type. A unique name is not proof of Retail.
+    """
+    if parse_patch_tuple(desired_patch) is None:
+        raise ValueError(f"Invalid retail patch '{desired_patch}'")
+
+    retail_type_ids = curseforge_retail_type_ids(version_types)
+    if not retail_type_ids:
+        raise ValueError(
+            f"CurseForge Retail version type could not be identified for '{desired_patch}'. "
+            "Refusing to treat an exact patch name as Retail without a recognized Retail type."
+        )
+
+    candidates = []
+    for version in versions or []:
+        if not isinstance(version, dict):
+            continue
+        name = str(version.get("name") or "").strip()
+        if name != desired_patch:
+            continue
+        type_id = _curseforge_type_id(version)
+        if type_id not in retail_type_ids:
+            continue
+        if version.get("id") is None:
+            continue
+        candidates.append(version)
+
+    if not candidates:
+        raise ValueError(
+            f"CurseForge does not currently advertise Retail patch '{desired_patch}'. "
+            "Live publishing requires an exact Retail catalog match and will not "
+            "claim compatibility with an older patch or a Classic/PTR version."
+        )
+
+    ids = {version.get("id") for version in candidates}
+    if len(ids) != 1:
+        raise ValueError(
+            f"CurseForge returned multiple Retail game version IDs for '{desired_patch}'. "
+            "Refusing to guess."
+        )
+    chosen = candidates[0]
+    return int(chosen["id"]), str(chosen["name"]), "exact"
+
+
+def build_curseforge_metadata(version, release_type, changelog, game_version_id, game_version_name):
+    """Build the JSON object CurseForge expects in the multipart metadata field."""
+    if release_type not in CURSEFORGE_RELEASE_TYPES:
+        raise ValueError(f"Invalid CurseForge release type '{release_type}'")
+    if type(game_version_id) is not int or game_version_id <= 0:
+        raise ValueError(f"Invalid CurseForge game version ID '{game_version_id}'")
+    if not game_version_name:
+        raise ValueError("CurseForge game version name is required")
+    return {
+        "changelog": changelog or "",
+        "changelogType": "markdown",
+        "displayName": version,
+        "gameVersions": [game_version_id],
+        "gameVersionNames": [game_version_name],
+        "releaseType": release_type,
+    }
+
+
+def curseforge_file_is_exact_release(file_obj, *, version, zip_name):
+    """Return True when a listed file is this exact Spectrum version or zip name."""
+    if not isinstance(file_obj, dict):
+        return False
+    exact = {version, zip_name}
+    for key in ("fileName", "filename", "name", "displayName"):
+        value = file_obj.get(key)
+        if isinstance(value, str) and value.strip() in exact:
+            return True
+    return False
+
+
+def _curseforge_release_type_value(value):
+    if isinstance(value, str):
+        value = value.strip().lower()
+    return CURSEFORGE_RELEASE_TYPE_VALUES.get(value)
+
+
+def _curseforge_file_game_tokens(file_obj):
+    """Return game-version IDs and names advertised on a listed file."""
+    tokens = set()
+    saw_field = False
+    for key in ("gameVersions", "gameVersionNames", "gameVersionIds"):
+        if key not in file_obj:
+            continue
+        saw_field = True
+        value = file_obj.get(key)
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            if isinstance(item, bool) or not isinstance(item, (str, int)):
+                continue
+            text = str(item).strip()
+            if text:
+                tokens.add(text)
+    if "sortableGameVersions" in file_obj:
+        saw_field = True
+        sortable = file_obj.get("sortableGameVersions")
+        if isinstance(sortable, list):
+            for item in sortable:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("gameVersionName", "gameVersion"):
+                    name = item.get(key)
+                    if isinstance(name, str) and name.strip():
+                        tokens.add(name.strip())
+    return saw_field, tokens
+
+
+def _curseforge_file_is_usable(file_obj):
+    """Return match, mismatch, or unverified for the listed file's usable state."""
+    saw_field = False
+    if "isAvailable" in file_obj:
+        saw_field = True
+        if file_obj.get("isAvailable") is False:
+            return "mismatch", "file is not available"
+    status = None
+    for key in ("fileStatus", "status"):
+        if key in file_obj:
+            saw_field = True
+            status = file_obj.get(key)
+            break
+    if status is not None:
+        normalized = status.strip().lower() if isinstance(status, str) else status
+        if normalized not in CURSEFORGE_USABLE_FILE_STATUSES:
+            return "mismatch", f"file status {status} is not a usable release"
+    if not saw_field:
+        return "unverified", "file omitted its usable state"
+    return "match", None
+
+
+def curseforge_listed_file_agreement(
+    file_obj,
+    *,
+    version,
+    zip_name,
+    release_type,
+    game_version_id,
+    game_version_name,
+):
+    """Classify a name match against release type, game version, and usable state.
+
+    Returns "different", "match", "mismatch", or "unverified".
+    """
+    if not curseforge_file_is_exact_release(file_obj, version=version, zip_name=zip_name):
+        return "different", None
+
+    if "releaseType" not in file_obj:
+        return "unverified", "file omitted releaseType"
+    listed_type = _curseforge_release_type_value(file_obj.get("releaseType"))
+    if listed_type != release_type:
+        return "mismatch", (
+            f"release type {file_obj.get('releaseType')!r} does not match {release_type}"
+        )
+
+    saw_versions, tokens = _curseforge_file_game_tokens(file_obj)
+    if not saw_versions:
+        return "unverified", "file omitted game versions"
+    expected = {str(game_version_id), str(game_version_name)}
+    if tokens.isdisjoint(expected):
+        return "mismatch", (
+            "game versions "
+            f"{sorted(tokens)} do not include {game_version_name} ({game_version_id})"
+        )
+
+    return _curseforge_file_is_usable(file_obj)
+
+
+def is_existing_curseforge_release(status, body):
+    """Return True only when the response clearly says this file already exists.
+
+    A generic HTTP 409 is not treated as proof of an existing release.
+    """
+    if status not in (400, 409, 422):
+        return False
+    text = (body or "").lower()
+    return any(phrase in text for phrase in CURSEFORGE_DUPLICATE_PHRASES)
+
+
+def find_existing_curseforge_release(
+    project_id,
+    version,
+    zip_name,
+    token,
+    *,
+    release_type,
+    game_version_id,
+    game_version_name,
+    opener=None,
+):
+    """Look for an exact existing file before uploading.
+
+    Returns one of:
+    - ("found", file) when name, release type, game version, and usable state match
+    - ("mismatch", reason) when the name matches but that metadata does not
+    - ("unverified", reason) when the name matches but metadata was omitted
+    - ("absent", None)
+    - ("unavailable", reason) when the list cannot be used
+
+    This route is not part of the documented Upload API. A forbidden list
+    response does not prove the upload token is invalid, so 401/403 is treated
+    as unavailable and the documented upload endpoint remains authoritative.
+    """
+    status, body, payload = fetch_curseforge_json(
+        f"projects/{project_id}/files",
+        token,
+        timeout=CURSEFORGE_CATALOG_TIMEOUT_SECONDS,
+        opener=opener,
+    )
+    summary = (
+        sanitize_output(body or "network error")
+        if status is None
+        else summarize_wago_http_error(status, body)
+    )
+    if status != 200 or payload is None:
+        return "unavailable", summary
+    files = curseforge_object_list(payload)
+    if files is None:
+        return "unavailable", "file list response was not a list"
+    mismatches = []
+    unverified = []
+    for file_obj in files:
+        agreement, reason = curseforge_listed_file_agreement(
+            file_obj,
+            version=version,
+            zip_name=zip_name,
+            release_type=release_type,
+            game_version_id=game_version_id,
+            game_version_name=game_version_name,
+        )
+        if agreement == "match":
+            return "found", file_obj
+        if agreement == "mismatch":
+            mismatches.append(reason)
+        elif agreement == "unverified":
+            unverified.append(reason)
+    if mismatches:
+        return "mismatch", "; ".join(mismatches)
+    if unverified:
+        return "unverified", "; ".join(unverified)
+    return "absent", None
+
+
+def report_curseforge_upload_failure(status, body, project_id):
+    """Print a credential-free CurseForge upload failure. Return 'duplicate' when proven."""
+    if is_existing_curseforge_release(status, body):
+        return "duplicate"
+    summary = (
+        sanitize_output(body or "network error")
+        if status is None
+        else summarize_wago_http_error(status, body)
+    )
+    if status is None:
+        print(f"::error ::CurseForge network error ({summary})")
+    elif status in (401, 403):
+        print(f"::error ::CurseForge authentication failed ({summary})")
+    elif status == 404:
+        print(
+            f"::error ::CurseForge project '{project_id}' was not found or is not authorized ({summary})"
+        )
+    elif status == 409:
+        print(
+            "::error ::CurseForge returned HTTP 409 without a clear already-exists "
+            f"indication ({summary})"
+        )
+    elif status in (400, 422):
+        print(f"::error ::CurseForge rejected the release metadata or file ({summary})")
+    elif status >= 500:
+        print(f"::error ::CurseForge server error ({summary})")
+    else:
+        print(f"::error ::CurseForge upload returned unexpected status ({summary})")
+    return None
+
+
+def build_curseforge_publish_plan(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    changelog,
+    require_game_version,
+    versions=None,
+    version_types=None,
+):
+    """Build a CurseForge upload plan from local release metadata."""
+    project_id = get_curseforge_project_id(addon_name)
+    if not project_id:
+        return None
+
+    release_type = classification.curseforge_release_type
+    if release_type not in CURSEFORGE_RELEASE_TYPES:
+        print(f"::error ::Invalid CurseForge release type '{release_type}'")
+        return None
+
+    try:
+        retail_patch = interface_to_retail_patch(interface)
+    except ValueError as error:
+        print(f"::error ::{error}")
+        return None
+
+    game_version_id = None
+    game_version_name = None
+    patch_match = None
+    if require_game_version:
+        if versions is None:
+            print(
+                "::error ::Could not load CurseForge's Retail game-version catalog. "
+                f"Requested patch '{retail_patch}' cannot be verified."
+            )
+            return None
+        try:
+            game_version_id, game_version_name, patch_match = select_curseforge_retail_game_version(
+                retail_patch,
+                versions,
+                version_types,
+            )
+        except ValueError as error:
+            print(f"::error ::{error}")
+            return None
+
+    return CurseForgePublishPlan(
+        project_id=project_id,
+        version=version,
+        release_type=release_type,
+        retail_patch=retail_patch,
+        game_version_id=game_version_id,
+        game_version_name=game_version_name,
+        patch_match=patch_match,
+        changelog=changelog,
+        changelog_source=CURSEFORGE_CHANGELOG_SOURCE,
+        zip_path=Path(zip_path),
+        endpoint=curseforge_upload_endpoint(project_id),
+        action="upload",
+    )
+
+
+def resolve_curseforge_publish_plan(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    changelog,
+    dry_run,
+    opener=None,
+):
+    """Build a CurseForge plan. Live runs resolve the Retail game version; dry-run does not call CurseForge.
+
+    Compatibility comes from the parent TOC inside the zip. A requested Interface
+    that disagrees with that manifest fails the CurseForge plan.
+    """
+    try:
+        interface = curseforge_interface_from_package(addon_name, zip_path, interface)
+    except (RuntimeError, ValueError, TypeError) as error:
+        print(f"::error ::{error}")
+        return None
+
+    if dry_run:
+        return build_curseforge_publish_plan(
+            version=version,
+            classification=classification,
+            addon_name=addon_name,
+            interface=interface,
+            zip_path=zip_path,
+            changelog=changelog,
+            require_game_version=False,
+        )
+
+    token = get_curseforge_api_token(required=True)
+    if not token:
+        return None
+    versions, version_types = load_curseforge_catalog(token, opener=opener)
+    if versions is None:
+        return None
+    return build_curseforge_publish_plan(
+        version=version,
+        classification=classification,
+        addon_name=addon_name,
+        interface=interface,
+        zip_path=zip_path,
+        changelog=changelog,
+        require_game_version=True,
+        versions=versions,
+        version_types=version_types,
+    )
+
+
+def log_curseforge_plan(plan, *, dry_run=False):
+    """Log non-secret CurseForge publish state."""
+    prefix = (
+        "[publish-release] DRY RUN - Would upload to CurseForge:"
+        if dry_run
+        else "[publish-release] CurseForge upload:"
+    )
+    print(prefix)
+    print(f"  CurseForge project: {plan.project_id}")
+    print(f"  Release type: {plan.release_type}")
+    print(f"  Retail version: {plan.retail_patch}")
+    if plan.game_version_id is None:
+        print("  CurseForge game version: resolved during live publish")
+    else:
+        print(
+            f"  CurseForge game version: {plan.game_version_name} "
+            f"(id {plan.game_version_id}, {plan.patch_match})"
+        )
+    print(f"  Artifact: {plan.zip_path.name}")
+    print(f"  Changelog source: {plan.changelog_source}")
+    print(f"  Action: {plan.action}")
+    if dry_run:
+        print("  Authorization: not sent (dry-run)")
+    else:
+        print(f"  Endpoint: POST {plan.endpoint}")
+        print("  Authorization: X-Api-Token <redacted>")
+
+
+def publish_to_curseforge(plan, *, dry_run=False, opener=None):
+    """Upload the canonical zip with CurseForge's documented multipart Upload API."""
+    if dry_run:
+        log_curseforge_plan(plan, dry_run=True)
+        return "dry-run"
+
+    token = get_curseforge_api_token(required=True)
+    if not token:
+        return None
+    if plan.game_version_id is None or not plan.game_version_name:
+        print("::error ::CurseForge Retail game version was not resolved")
+        return None
+    if not plan.zip_path.exists():
+        print(f"::error ::CurseForge artifact does not exist: {plan.zip_path}")
+        return None
+
+    lookup, detail = find_existing_curseforge_release(
+        plan.project_id,
+        plan.version,
+        plan.zip_path.name,
+        token,
+        release_type=plan.release_type,
+        game_version_id=plan.game_version_id,
+        game_version_name=plan.game_version_name,
+        opener=opener,
+    )
+    if lookup == "found":
+        print(
+            "[publish-release] ✓ CurseForge already has this exact version; "
+            "treating as success without uploading a duplicate"
+        )
+        return "already-exists"
+    if lookup == "mismatch":
+        print(
+            "::error ::CurseForge already lists this file name, but its release "
+            f"metadata does not match this publish ({detail}). "
+            "Not uploading another copy and not treating the existing file as success."
+        )
+        return None
+    if lookup == "unavailable":
+        print(
+            "[publish-release] CurseForge file list is unavailable "
+            f"({detail}). The documented Upload API has no guaranteed list-files "
+            "call, so an exact existing file is also recognized from an explicit "
+            "duplicate upload response. A generic conflict is still a failure."
+        )
+    elif lookup == "unverified":
+        print(
+            "[publish-release] CurseForge lists this file name without enough "
+            f"release metadata to verify it ({detail}). Continuing to the documented "
+            "Upload API. An explicit duplicate response is success; a generic conflict is not."
+        )
+
+    try:
+        metadata = build_curseforge_metadata(
+            plan.version,
+            plan.release_type,
+            plan.changelog,
+            plan.game_version_id,
+            plan.game_version_name,
+        )
+    except ValueError as error:
+        print(f"::error ::{error}")
+        return None
+
+    body, content_type = encode_multipart_form(
+        {"metadata": json.dumps(metadata)},
+        {"file": plan.zip_path},
+    )
+    headers = curseforge_auth_headers(token)
+    headers["Content-Type"] = content_type
+    request = urllib_request.Request(
+        plan.endpoint,
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    log_curseforge_plan(plan, dry_run=False)
+    urlopen = opener or urllib_request.urlopen
+
+    try:
+        with urlopen(request, timeout=CURSEFORGE_UPLOAD_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", 200)
+            response_body = response.read().decode("utf-8", errors="replace")
+    except urllib_error.HTTPError as error:
+        status = error.code
+        response_body = read_http_error_body(error)
+        outcome = report_curseforge_upload_failure(status, response_body, plan.project_id)
+        if outcome == "duplicate":
+            summary = summarize_wago_http_error(status, response_body)
+            print(
+                "[publish-release] ✓ CurseForge already has this version; "
+                f"treating as success ({summary})"
+            )
+            return "already-exists"
+        return None
+    except (urllib_error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
+        print(f"::error ::CurseForge network error ({sanitize_output(str(error))})")
+        return None
+
+    if status in (200, 201):
+        print(f"[publish-release] ✓ CurseForge publication succeeded (HTTP {status})")
+        return "uploaded"
+
+    outcome = report_curseforge_upload_failure(status, response_body, plan.project_id)
+    if outcome == "duplicate":
+        summary = summarize_wago_http_error(status, response_body)
+        print(
+            "[publish-release] ✓ CurseForge already has this version; "
+            f"treating as success ({summary})"
+        )
+        return "already-exists"
+    return None
+
+
+def log_destination_results(*, github_ok, curseforge_ok, wago_ok):
+    """Report which release destinations succeeded. Successful publishes stay published."""
+    if not github_ok:
+        print(
+            "[publish-release] GitHub release failed. "
+            "CurseForge and Wago were not attempted."
+        )
+        return
+
+    curseforge_state = "succeeded" if curseforge_ok else "failed"
+    wago_state = "succeeded" if wago_ok else "failed"
+    print(
+        "[publish-release] Destination results: "
+        f"GitHub succeeded, CurseForge {curseforge_state}, Wago {wago_state}."
+    )
+    if curseforge_ok and wago_ok:
+        return
+    print(
+        "[publish-release] Successful destinations were kept. "
+        "Rerun this script for the same version to retry the failed destination. "
+        "An exact existing CurseForge or Wago release is treated as success and is not uploaded again. "
+        "Do not delete GitHub, CurseForge, or Wago releases that already succeeded."
+    )
+
+
+def _run_downstream_attempt(destination, attempt):
+    """Run one downstream publisher without letting its failure skip the other."""
+    try:
+        return bool(attempt())
+    except Exception as error:  # noqa: BLE001 - one downstream failure must not skip the other
+        print(
+            f"::error ::{destination} publication failed unexpectedly: "
+            f"{sanitize_output(str(error))}"
+        )
+        return False
+
+
+def _attempt_curseforge(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    changelog,
+):
+    plan = resolve_curseforge_publish_plan(
+        version=version,
+        classification=classification,
+        addon_name=addon_name,
+        interface=interface,
+        zip_path=zip_path,
+        changelog=changelog,
+        dry_run=False,
+    )
+    if not plan:
+        return False
+    action = publish_to_curseforge(plan, dry_run=False)
+    if not action:
+        return False
+    print(f"[publish-release] CurseForge publication action: {action}")
+    return True
+
+
+def _attempt_wago(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    changelog,
+):
+    plan = resolve_wago_publish_plan(
+        version=version,
+        classification=classification,
+        addon_name=addon_name,
+        interface=interface,
+        zip_path=zip_path,
+        changelog=changelog,
+    )
+    if not plan:
+        return False
+    log_wago_summary(plan)
+    action = publish_to_wago(plan, dry_run=False)
+    if not action:
+        return False
+    print(f"[publish-release] Wago publication action: {action}")
+    return True
+
+
+def publish_github_then_external(
+    *,
+    version,
+    classification,
+    addon_name,
+    interface,
+    zip_path,
+    json_path,
+    notes,
+    notes_path,
+    repo,
+    dry_run,
+):
+    """Publish GitHub first. CurseForge and Wago then run independently.
+
+    A failure at either downstream destination does not delete another
+    successful destination and does not skip the other downstream attempt.
+    Dry-run validates both external plans before simulating GitHub and does
+    not send CurseForge or Wago credentials.
+    """
+    if dry_run:
+        curseforge_plan = resolve_curseforge_publish_plan(
+            version=version,
+            classification=classification,
+            addon_name=addon_name,
+            interface=interface,
+            zip_path=zip_path,
+            changelog=notes,
+            dry_run=True,
+        )
+        wago_plan = resolve_wago_publish_plan(
+            version=version,
+            classification=classification,
+            addon_name=addon_name,
+            interface=interface,
+            zip_path=zip_path,
+            changelog=notes,
+        )
+        if curseforge_plan:
+            print(f"[publish-release] CurseForge project ID: {curseforge_plan.project_id}")
+            print(f"[publish-release] CurseForge release type: {curseforge_plan.release_type}")
+            print(f"[publish-release] Retail version: {curseforge_plan.retail_patch}")
+        if wago_plan:
+            log_wago_summary(wago_plan)
+        if not curseforge_plan or not wago_plan:
+            return False
+
+        github_action = create_github_release(
+            version,
+            zip_path,
+            json_path,
+            repo,
+            classification,
+            notes_path,
+            dry_run=True,
+        )
+        if not github_action:
+            return False
+        print(f"[publish-release] GitHub release action: {github_action}")
+        curseforge_action = publish_to_curseforge(curseforge_plan, dry_run=True)
+        wago_action = publish_to_wago(wago_plan, dry_run=True)
+        if not curseforge_action or not wago_action:
+            return False
+        print(f"[publish-release] CurseForge publication action: {curseforge_action}")
+        print(f"[publish-release] Wago publication action: {wago_action}")
+        return True
+
+    github_action = create_github_release(
+        version,
+        zip_path,
+        json_path,
+        repo,
+        classification,
+        notes_path,
+        dry_run=False,
+    )
+    if not github_action:
+        log_destination_results(github_ok=False, curseforge_ok=False, wago_ok=False)
+        return False
+    print(f"[publish-release] GitHub release action: {github_action}")
+
+    curseforge_ok = _run_downstream_attempt(
+        "CurseForge",
+        lambda: _attempt_curseforge(
+            version=version,
+            classification=classification,
+            addon_name=addon_name,
+            interface=interface,
+            zip_path=zip_path,
+            changelog=notes,
+        ),
+    )
+    wago_ok = _run_downstream_attempt(
+        "Wago",
+        lambda: _attempt_wago(
+            version=version,
+            classification=classification,
+            addon_name=addon_name,
+            interface=interface,
+            zip_path=zip_path,
+            changelog=notes,
+        ),
+    )
+    log_destination_results(
+        github_ok=True,
+        curseforge_ok=curseforge_ok,
+        wago_ok=wago_ok,
+    )
+    return curseforge_ok and wago_ok
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Package addon and create GitHub and Wago releases"
+        description="Package addon and create GitHub, CurseForge, and Wago releases"
     )
     parser.add_argument(
         "version",
@@ -999,6 +1981,7 @@ def main():
     print(f"[publish-release] GitHub classification: {classification.github_release_kind}")
     print(f"[publish-release] GitHub prerelease: {classification.is_prerelease}")
     print(f"[publish-release] Wago stability: {classification.wago_stability}")
+    print(f"[publish-release] CurseForge release type: {classification.curseforge_release_type}")
     
     # Construct zip filename
     zip_filename = f"{args.addon_name}-{args.version}.zip"
@@ -1023,7 +2006,7 @@ def main():
     notes_path = write_release_notes(notes)
     print(f"[publish-release] ZIP artifact: {zip_path.name}")
 
-    published = publish_github_then_wago(
+    published = publish_github_then_external(
         version=args.version,
         classification=classification,
         addon_name=args.addon_name,

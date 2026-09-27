@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import inspect
 import io
 import json
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 from urllib import error as urllib_error
 
@@ -62,26 +64,35 @@ def _plan(tmp_path, **overrides):
 
 
 @pytest.mark.parametrize(
-    ("version", "stability", "is_prerelease", "github_kind"),
+    ("version", "stability", "is_prerelease", "github_kind", "curseforge_type"),
     [
-        ("1.4.0", "stable", False, "release"),
-        ("1.5.0-beta.1", "beta", True, "prerelease"),
-        ("1.5.0-BETA.2", "beta", True, "prerelease"),
-        ("1.5.0-alpha.1", "alpha", True, "prerelease"),
-        ("1.5.0-rc.1", "beta", True, "prerelease"),
+        ("1.4.0", "stable", False, "release", "release"),
+        ("1.6.0", "stable", False, "release", "release"),
+        ("1.5.0-beta.1", "beta", True, "prerelease", "beta"),
+        ("1.6.0-beta.1", "beta", True, "prerelease", "beta"),
+        ("1.5.0-BETA.2", "beta", True, "prerelease", "beta"),
+        ("1.6.0-BETA.2", "beta", True, "prerelease", "beta"),
+        ("1.5.0-alpha.1", "alpha", True, "prerelease", "alpha"),
+        ("1.6.0-alpha.1", "alpha", True, "prerelease", "alpha"),
+        ("1.5.0-rc.1", "beta", True, "prerelease", "beta"),
+        ("1.6.0-rc.1", "beta", True, "prerelease", "beta"),
     ],
 )
-def test_classify_release_maps_version_to_github_and_wago(version, stability, is_prerelease, github_kind):
+def test_classify_release_maps_version_to_github_wago_and_curseforge(
+    version, stability, is_prerelease, github_kind, curseforge_type
+):
     classification = publish.classify_release(version)
     assert classification.wago_stability == stability
     assert classification.is_prerelease is is_prerelease
     assert classification.github_release_kind == github_kind
+    assert classification.curseforge_release_type == curseforge_type
 
 
 def test_classify_release_does_not_treat_alphabet_as_alpha():
     classification = publish.classify_release("1.5.0-alphabet.1")
     assert classification.wago_stability == "stable"
     assert classification.is_prerelease is False
+    assert classification.curseforge_release_type == "release"
 
 
 def test_wago_metadata_includes_required_fields(tmp_path):
@@ -338,13 +349,18 @@ def test_logged_failures_redact_credentials():
         "authorization: Bearer developer-key-123\n"
         "WAGO_API_KEY=developer-key-123\n"
         "WAGO_API_SECRET=legacy-webhook-secret\n"
-        "Bearer developer-key-123"
+        "Bearer developer-key-123\n"
+        "X-Api-Token: curse-token-123\n"
+        "CURSEFORGE_API_TOKEN=curse-token-123"
     )
     sanitized = publish.sanitize_output(leaked)
     assert "developer-key-123" not in sanitized
     assert "legacy-webhook-secret" not in sanitized
+    assert "curse-token-123" not in sanitized
     assert "Bearer ***" in sanitized
+    assert "X-Api-Token: ***" in sanitized or "x-api-token: ***" in sanitized.lower()
     assert "WAGO_API_KEY=" in sanitized
+    assert "CURSEFORGE_API_TOKEN=" in sanitized
 
 
 def test_github_dry_run_does_not_invoke_gh(monkeypatch, tmp_path):
@@ -688,11 +704,11 @@ def _orchestrator_args(tmp_path, *, version="1.5.0-beta.1"):
     }
 
 
-def test_live_github_runs_before_wago_catalog_lookup(tmp_path, monkeypatch, capsys):
+def test_live_github_runs_before_external_catalog_lookup(tmp_path, monkeypatch, capsys):
     addon = tmp_path / "SpectrumFederation"
     addon.mkdir()
     (addon / "SpectrumFederation.toc").write_text(
-        "## X-Wago-ID: BNBmnlGx\n",
+        "## X-Wago-ID: BNBmnlGx\n## X-Curse-Project-ID: 1445757\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(tmp_path)
@@ -702,23 +718,29 @@ def test_live_github_runs_before_wago_catalog_lookup(tmp_path, monkeypatch, caps
         order.append("github")
         return "created"
 
+    def fake_curseforge(**kwargs):
+        order.append("curseforge")
+        return None
+
     def fake_catalog():
         order.append("wago-catalog")
         return None
 
     def fail_upload(*args, **kwargs):
-        raise AssertionError("Wago upload must not run")
+        raise AssertionError("external upload must not run when plan resolution fails")
 
     monkeypatch.setattr(publish, "create_github_release", fake_github)
+    monkeypatch.setattr(publish, "resolve_curseforge_publish_plan", fake_curseforge)
     monkeypatch.setattr(publish, "fetch_wago_game_data", fake_catalog)
     monkeypatch.setattr(publish, "publish_to_wago", fail_upload)
+    monkeypatch.setattr(publish, "publish_to_curseforge", fail_upload)
 
-    result = publish.publish_github_then_wago(**_orchestrator_args(tmp_path), dry_run=False)
+    result = publish.publish_github_then_external(**_orchestrator_args(tmp_path), dry_run=False)
     captured = capsys.readouterr()
     assert result is False
-    assert order == ["github", "wago-catalog"]
-    assert "GitHub release succeeded, but Wago publication failed" in captured.out
-    assert "Do not roll back CurseForge" in captured.out
+    assert order == ["github", "curseforge", "wago-catalog"]
+    assert "Destination results: GitHub succeeded, CurseForge failed, Wago failed." in captured.out
+    assert "Do not delete GitHub, CurseForge, or Wago releases" in captured.out
 
 
 def test_live_wago_plan_failure_does_not_block_github(tmp_path, monkeypatch, capsys):
@@ -735,20 +757,30 @@ def test_live_wago_plan_failure_does_not_block_github(tmp_path, monkeypatch, cap
     def fail_upload(*args, **kwargs):
         raise AssertionError("Wago upload must not run")
 
+    def fake_curseforge(**kwargs):
+        return None
+
     monkeypatch.setattr(publish, "create_github_release", fake_github)
+    monkeypatch.setattr(publish, "resolve_curseforge_publish_plan", fake_curseforge)
     monkeypatch.setattr(publish, "resolve_wago_publish_plan", fail_plan)
     monkeypatch.setattr(publish, "publish_to_wago", fail_upload)
+    monkeypatch.setattr(publish, "publish_to_curseforge", fail_upload)
 
-    result = publish.publish_github_then_wago(**_orchestrator_args(tmp_path), dry_run=False)
+    result = publish.publish_github_then_external(**_orchestrator_args(tmp_path), dry_run=False)
     captured = capsys.readouterr()
     assert result is False
     assert github_calls == [False]
     assert "GitHub release action: updated" in captured.out
-    assert "GitHub release succeeded, but Wago publication failed" in captured.out
+    assert "Destination results: GitHub succeeded, CurseForge failed, Wago failed." in captured.out
+    assert "Do not delete GitHub, CurseForge, or Wago releases" in captured.out
 
 
-def test_dry_run_validates_wago_before_simulated_github(tmp_path, monkeypatch, capsys):
+def test_dry_run_validates_external_plans_before_simulated_github(tmp_path, monkeypatch, capsys):
     order = []
+
+    def curseforge_plan(**kwargs):
+        order.append("curseforge-plan")
+        return None
 
     def fail_plan(**kwargs):
         order.append("wago-plan")
@@ -758,14 +790,15 @@ def test_dry_run_validates_wago_before_simulated_github(tmp_path, monkeypatch, c
         order.append("github")
         return "dry-run"
 
+    monkeypatch.setattr(publish, "resolve_curseforge_publish_plan", curseforge_plan)
     monkeypatch.setattr(publish, "resolve_wago_publish_plan", fail_plan)
     monkeypatch.setattr(publish, "create_github_release", fake_github)
 
-    result = publish.publish_github_then_wago(**_orchestrator_args(tmp_path), dry_run=True)
+    result = publish.publish_github_then_external(**_orchestrator_args(tmp_path), dry_run=True)
     captured = capsys.readouterr()
     assert result is False
-    assert order == ["wago-plan"]
-    assert "GitHub release succeeded, but Wago publication failed" not in captured.out
+    assert order == ["curseforge-plan", "wago-plan"]
+    assert "GitHub release succeeded" not in captured.out
 
 
 def _write_packaged_tocs(root, version):
@@ -883,3 +916,649 @@ def test_publisher_does_not_hardcode_child_addons_or_zip_excludes():
     assert "RCLootCouncilIntegration" not in create_zip_src
     assert "AGENTS.md" not in create_zip_src
     assert "*.git*" not in create_zip_src
+
+
+def _curseforge_plan(tmp_path, **overrides):
+    zip_path = tmp_path / "SpectrumFederation-1.6.0-beta.1.zip"
+    zip_path.write_bytes(b"zip-bytes")
+    values = {
+        "project_id": "1445757",
+        "version": "1.6.0-beta.1",
+        "release_type": "beta",
+        "retail_patch": "12.1.0",
+        "game_version_id": 16519,
+        "game_version_name": "12.1.0",
+        "patch_match": "exact",
+        "changelog": "Beta release 1.6.0-beta.1\n",
+        "changelog_source": "CHANGELOG.md",
+        "zip_path": zip_path,
+        "endpoint": "https://wow.curseforge.com/api/projects/1445757/upload-file",
+        "action": "upload",
+    }
+    values.update(overrides)
+    return publish.CurseForgePublishPlan(**values)
+
+
+def _curseforge_versions():
+    return [
+        {"id": 11, "gameVersionTypeID": 67408, "name": "12.1.0"},
+        {"id": 22, "gameVersionTypeID": 900, "name": "12.1.0"},
+        {"id": 16519, "gameVersionTypeID": 517, "name": "12.1.0"},
+        {"id": 16984, "gameVersionTypeID": 517, "name": "12.1.5"},
+        {"id": 14029, "gameVersionTypeID": 67408, "name": "1.15.8"},
+    ]
+
+
+def _curseforge_version_types():
+    return [
+        {"id": 517, "name": "World of Warcraft", "slug": "world-of-warcraft"},
+        {"id": 67408, "name": "WoW Classic", "slug": "wow-classic"},
+        {"id": 900, "name": "World of Warcraft Public Test", "slug": "world-of-warcraft-public-test"},
+    ]
+
+
+def _write_curseforge_toc(tmp_path, project_id="1445757"):
+    addon = tmp_path / "SpectrumFederation"
+    addon.mkdir()
+    (addon / "SpectrumFederation.toc").write_text(
+        f"## Version: 1.6.0-beta.1\n## X-Wago-ID: BNBmnlGx\n## X-Curse-Project-ID: {project_id}\n",
+        encoding="utf-8",
+    )
+
+
+def _http_error(request, status, body):
+    payload = body if isinstance(body, bytes) else body.encode()
+    return urllib_error.HTTPError(
+        request.full_url,
+        status,
+        "error",
+        hdrs=None,
+        fp=io.BytesIO(payload),
+    )
+
+
+def test_parent_toc_declares_curseforge_project_id():
+    text = Path("SpectrumFederation/SpectrumFederation.toc").read_text(encoding="utf-8")
+    assert "## X-Curse-Project-ID: 1445757" in text
+
+
+def test_release_workflows_pass_curseforge_token():
+    beta = Path(".github/workflows/post-merge-beta.yml").read_text(encoding="utf-8")
+    promote = Path(".github/workflows/promote-beta-to-main.yml").read_text(encoding="utf-8")
+    secret = "CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_API_TOKEN }}"
+    assert beta.count(secret) == 1
+    assert promote.count(secret) == 1
+    assert "--dry-run" in promote
+
+
+def test_publisher_does_not_hardcode_curseforge_game_version_id():
+    source = Path(".github/scripts/publish_release.py").read_text(encoding="utf-8")
+    assert "16519" not in source
+    assert "CURSEFORGE_API_TOKEN" in source
+    assert source.count("CURSEFORGE_API_TOKEN") >= 1
+    assert "x-api-key" not in source.lower()
+
+
+def test_get_curseforge_project_id_reads_parent_toc(tmp_path, monkeypatch):
+    _write_curseforge_toc(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    assert publish.get_curseforge_project_id("SpectrumFederation") == "1445757"
+
+
+def test_missing_curseforge_project_id_fails(tmp_path, monkeypatch, capsys):
+    addon = tmp_path / "SpectrumFederation"
+    addon.mkdir()
+    (addon / "SpectrumFederation.toc").write_text("## X-Wago-ID: BNBmnlGx\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert publish.get_curseforge_project_id("SpectrumFederation") is None
+    assert "Missing ## X-Curse-Project-ID" in capsys.readouterr().out
+
+
+def test_invalid_curseforge_project_id_fails(tmp_path, monkeypatch, capsys):
+    _write_curseforge_toc(tmp_path, project_id="BNBmnlGx")
+    monkeypatch.chdir(tmp_path)
+    assert publish.get_curseforge_project_id("SpectrumFederation") is None
+    assert "not a numeric CurseForge project ID" in capsys.readouterr().out
+
+
+def test_validate_curseforge_project_id_rules(tmp_path, capsys):
+    toc = tmp_path / "SpectrumFederation.toc"
+    toc.write_text("## X-Wago-ID: BNBmnlGx\n", encoding="utf-8")
+    assert validate_packaging.validate_curseforge_project_id(toc) is False
+    assert "X-Curse-Project-ID" in capsys.readouterr().out
+    toc.write_text("## X-Curse-Project-ID: 0\n", encoding="utf-8")
+    assert validate_packaging.validate_curseforge_project_id(toc) is False
+    toc.write_text("## X-Curse-Project-ID: 1445757\n", encoding="utf-8")
+    assert validate_packaging.validate_curseforge_project_id(toc) is True
+
+
+def test_select_curseforge_retail_game_version_requires_exact_retail_patch():
+    selected = publish.select_curseforge_retail_game_version(
+        "12.1.0",
+        _curseforge_versions(),
+        _curseforge_version_types(),
+    )
+    assert selected == (16519, "12.1.0", "exact")
+    with pytest.raises(ValueError, match="does not currently advertise Retail patch '12.1.7'"):
+        publish.select_curseforge_retail_game_version(
+            "12.1.7",
+            _curseforge_versions(),
+            _curseforge_version_types(),
+        )
+
+
+def test_select_curseforge_retail_game_version_rejects_name_without_retail_type():
+    versions = [
+        {"id": 1, "gameVersionTypeID": 10, "name": "12.1.0"},
+        {"id": 2, "gameVersionTypeID": 11, "name": "12.1.0"},
+    ]
+    with pytest.raises(ValueError, match="Retail version type could not be identified"):
+        publish.select_curseforge_retail_game_version("12.1.0", versions, None)
+
+
+def test_select_curseforge_retail_game_version_accepts_retail_label():
+    types = [
+        {"id": 517, "name": "Retail", "slug": "wow_retail"},
+        {"id": 900, "name": "Retail PTR", "slug": "wow-retail-ptr"},
+    ]
+    selected = publish.select_curseforge_retail_game_version(
+        "12.1.0",
+        _curseforge_versions(),
+        types,
+    )
+    assert selected == (16519, "12.1.0", "exact")
+
+
+def test_select_curseforge_retail_game_version_rejects_unique_ptr_name():
+    versions = [{"id": 17000, "gameVersionTypeID": 900, "name": "12.2.0"}]
+    ptr_types = [{"id": 900, "name": "Retail PTR", "slug": "wow-retail-ptr"}]
+    with pytest.raises(ValueError, match="Retail version type could not be identified"):
+        publish.select_curseforge_retail_game_version("12.2.0", versions, None)
+    with pytest.raises(ValueError, match="Retail version type could not be identified"):
+        publish.select_curseforge_retail_game_version("12.2.0", versions, ptr_types)
+
+
+def test_build_curseforge_plan_does_not_fall_back_to_older_patch(tmp_path, monkeypatch, capsys):
+    _write_curseforge_toc(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    zip_path = tmp_path / "addon.zip"
+    zip_path.write_bytes(b"zip")
+    plan = publish.build_curseforge_publish_plan(
+        version="1.6.0-beta.1",
+        classification=publish.classify_release("1.6.0-beta.1"),
+        addon_name="SpectrumFederation",
+        interface=120100,
+        zip_path=zip_path,
+        changelog="notes",
+        require_game_version=True,
+        versions=[{"id": 13924, "gameVersionTypeID": 517, "name": "12.0.0"}],
+        version_types=[{"id": 517, "name": "Retail", "slug": "wow-retail"}],
+    )
+    assert plan is None
+    assert "does not currently advertise Retail patch '12.1.0'" in capsys.readouterr().out
+
+
+def test_curseforge_metadata_uses_canonical_zip_fields(tmp_path):
+    plan = _curseforge_plan(tmp_path)
+    metadata = publish.build_curseforge_metadata(
+        plan.version,
+        plan.release_type,
+        plan.changelog,
+        plan.game_version_id,
+        plan.game_version_name,
+    )
+    assert metadata == {
+        "changelog": "Beta release 1.6.0-beta.1\n",
+        "changelogType": "markdown",
+        "displayName": "1.6.0-beta.1",
+        "gameVersions": [16519],
+        "gameVersionNames": ["12.1.0"],
+        "releaseType": "beta",
+    }
+
+
+def test_missing_curseforge_token_fails_live_upload(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("CURSEFORGE_API_TOKEN", raising=False)
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), dry_run=False)
+    captured = capsys.readouterr()
+    assert result is None
+    assert "CURSEFORGE_API_TOKEN is not set" in captured.out
+    assert "legacy CurseForge webhook token" in captured.out
+
+
+def test_curseforge_dry_run_does_not_send_token(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("CURSEFORGE_API_TOKEN", raising=False)
+    called = {"urlopen": False}
+
+    def opener(request, timeout=None):
+        called["urlopen"] = True
+        raise AssertionError("dry-run must not call CurseForge")
+
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), dry_run=True, opener=opener)
+    output = capsys.readouterr().out
+    assert result == "dry-run"
+    assert called["urlopen"] is False
+    assert "CurseForge project: 1445757" in output
+    assert "Release type: beta" in output
+    assert "Retail version: 12.1.0" in output
+    assert "Artifact: SpectrumFederation-1.6.0-beta.1.zip" in output
+    assert "Changelog source: CHANGELOG.md" in output
+    assert "Action: upload" in output
+    assert "Authorization: not sent (dry-run)" in output
+
+
+def test_curseforge_auth_header_and_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+    captured = {}
+
+    def opener(request, timeout=None):
+        if request.get_method() == "GET":
+            assert request.get_header("X-api-token") == "curse-token-123"
+            assert "curse-token-123" not in request.full_url
+            assert "token=" not in request.full_url
+            return FakeResponse(200, b"[]")
+        captured["authorization"] = request.get_header("X-api-token")
+        captured["body"] = request.data
+        captured["url"] = request.full_url
+        return FakeResponse(200, b'{"id": 42}')
+
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener)
+    assert result == "uploaded"
+    assert captured["authorization"] == "curse-token-123"
+    assert captured["url"].endswith("/projects/1445757/upload-file")
+    assert b"curse-token-123" not in captured["body"]
+    metadata = json.loads(captured["body"].split(b"\r\n\r\n", 1)[1].split(b"\r\n")[0])
+    assert metadata["releaseType"] == "beta"
+    assert metadata["changelog"] == "Beta release 1.6.0-beta.1\n"
+    assert metadata["gameVersions"] == [16519]
+    assert metadata["gameVersionNames"] == ["12.1.0"]
+    assert b'filename="SpectrumFederation-1.6.0-beta.1.zip"' in captured["body"]
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected", "message"),
+    [
+        (401, b'{"message":"unauthorized"}', None, "authentication failed"),
+        (403, b'{"message":"forbidden"}', None, "authentication failed"),
+        (422, b'{"message":"game version is invalid"}', None, "rejected the release metadata"),
+        (404, b'{"message":"project not found"}', None, "was not found or is not authorized"),
+        (409, b'{"message":"file already exists"}', "already-exists", "already has this version"),
+        (409, b"", None, "without a clear already-exists"),
+        (409, b'{"message":"conflict"}', None, "without a clear already-exists"),
+        (400, b'{"message":"malformed metadata"}', None, "rejected the release metadata"),
+        (500, b'{"message":"server error"}', None, "server error"),
+        (418, b'{"message":"teapot"}', None, "unexpected status"),
+    ],
+)
+def test_curseforge_http_responses(tmp_path, monkeypatch, capsys, status, body, expected, message):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+
+    def opener(request, timeout=None):
+        if request.get_method() == "GET":
+            return FakeResponse(200, b"[]")
+        raise _http_error(request, status, body)
+
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener)
+    output = capsys.readouterr().out
+    assert result == expected
+    assert message in output
+    assert "curse-token-123" not in output
+
+
+def test_curseforge_error_body_redacts_token(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+
+    def opener(request, timeout=None):
+        if request.get_method() == "GET":
+            return FakeResponse(200, b"[]")
+        raise _http_error(request, 400, b'{"message":"rejected curse-token-123"}')
+
+    assert publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener) is None
+    captured = capsys.readouterr()
+    assert "curse-token-123" not in captured.out
+    assert "curse-token-123" not in captured.err
+
+
+def test_curseforge_timeout_and_network_errors(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+
+    def timeout_opener(request, timeout=None):
+        if request.get_method() == "GET":
+            return FakeResponse(200, b"[]")
+        raise TimeoutError("timed out")
+
+    assert publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=timeout_opener) is None
+    assert "network error" in capsys.readouterr().out
+
+    def network_opener(request, timeout=None):
+        if request.get_method() == "GET":
+            return FakeResponse(200, b"[]")
+        raise urllib_error.URLError("network down")
+
+    assert publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=network_opener) is None
+    assert "network error" in capsys.readouterr().out
+
+
+def test_curseforge_missing_artifact_fails(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+    plan = _curseforge_plan(tmp_path)
+    plan.zip_path.unlink()
+    assert publish.publish_to_curseforge(plan) is None
+    assert "artifact does not exist" in capsys.readouterr().out
+
+
+def test_exact_existing_curseforge_file_skips_upload(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+    methods = []
+
+    def opener(request, timeout=None):
+        methods.append(request.get_method())
+        assert request.get_method() == "GET"
+        body = json.dumps(
+            [
+                {"fileName": "SpectrumFederation-1.6.0-beta.10.zip", "displayName": "1.6.0-beta.10"},
+                {
+                    "fileName": "SpectrumFederation-1.6.0-beta.1.zip",
+                    "displayName": "1.6.0-beta.1",
+                    "releaseType": 2,
+                    "gameVersions": [16519],
+                    "isAvailable": True,
+                    "fileStatus": 10,
+                },
+            ]
+        ).encode()
+        return FakeResponse(200, body)
+
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener)
+    output = capsys.readouterr().out
+    assert result == "already-exists"
+    assert methods == ["GET"]
+    assert "without uploading a duplicate" in output
+
+
+def test_mismatched_existing_curseforge_file_is_not_success(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+    methods = []
+
+    def opener(request, timeout=None):
+        methods.append(request.get_method())
+        body = json.dumps(
+            [
+                {
+                    "fileName": "SpectrumFederation-1.6.0-beta.1.zip",
+                    "displayName": "1.6.0-beta.1",
+                    "releaseType": "release",
+                    "gameVersions": ["12.1.0"],
+                    "isAvailable": True,
+                    "fileStatus": "approved",
+                }
+            ]
+        ).encode()
+        return FakeResponse(200, body)
+
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener)
+    output = capsys.readouterr().out
+    assert result is None
+    assert methods == ["GET"]
+    assert "does not match this publish" in output
+    assert "without uploading a duplicate" not in output
+
+
+def test_rejected_existing_curseforge_file_is_not_success(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+
+    def opener(request, timeout=None):
+        body = json.dumps(
+            [
+                {
+                    "fileName": "SpectrumFederation-1.6.0-beta.1.zip",
+                    "releaseType": "beta",
+                    "gameVersionNames": ["12.1.0"],
+                    "isAvailable": False,
+                    "fileStatus": 5,
+                }
+            ]
+        ).encode()
+        return FakeResponse(200, body)
+
+    assert publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener) is None
+    assert "does not match this publish" in capsys.readouterr().out
+
+
+def _interface_zip(tmp_path, interface):
+    zip_path = tmp_path / "SpectrumFederation-1.6.0-beta.1.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr(
+            "SpectrumFederation/SpectrumFederation.toc",
+            f"## Interface: {interface}\n## Version: 1.6.0-beta.1\n",
+        )
+    return zip_path
+
+
+def test_curseforge_interface_uses_packaged_toc(tmp_path):
+    zip_path = _interface_zip(tmp_path, "120100")
+    assert publish.curseforge_interface_from_package("SpectrumFederation", zip_path, 120100) == 120100
+
+
+def test_curseforge_interface_rejects_requested_mismatch(tmp_path, capsys):
+    zip_path = _interface_zip(tmp_path, "120100")
+    with pytest.raises(ValueError, match="not requested Interface 120200"):
+        publish.curseforge_interface_from_package("SpectrumFederation", zip_path, 120200)
+    result = publish.resolve_curseforge_publish_plan(
+        version="1.6.0-beta.1",
+        classification=publish.classify_release("1.6.0-beta.1"),
+        addon_name="SpectrumFederation",
+        interface=120200,
+        zip_path=zip_path,
+        changelog="notes",
+        dry_run=True,
+    )
+    assert result is None
+    assert "packaged parent TOC Interface 120100" in capsys.readouterr().out
+
+
+def test_nearby_curseforge_version_is_not_an_exact_duplicate(tmp_path, monkeypatch):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+    methods = []
+
+    def opener(request, timeout=None):
+        methods.append(request.get_method())
+        if request.get_method() == "GET":
+            body = json.dumps(
+                [{"fileName": "SpectrumFederation-1.6.0-beta.10.zip", "displayName": "1.6.0-beta.10"}]
+            ).encode()
+            return FakeResponse(200, body)
+        return FakeResponse(200, b'{"id": 7}')
+
+    assert publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener) == "uploaded"
+    assert methods == ["GET", "POST"]
+
+
+def test_unavailable_curseforge_file_list_still_uploads(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+
+    def opener(request, timeout=None):
+        if request.get_method() == "GET":
+            raise _http_error(request, 404, b'{"message":"not found"}')
+        return FakeResponse(200, b'{"id": 8}')
+
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener)
+    output = capsys.readouterr().out
+    assert result == "uploaded"
+    assert "file list is unavailable" in output
+
+
+def test_curseforge_catalog_is_reused_within_one_invocation(monkeypatch):
+    publish.clear_curseforge_catalog_cache()
+    calls = []
+
+    def opener(request, timeout=None):
+        calls.append(request.full_url)
+        if request.full_url.endswith("/game/versions"):
+            return FakeResponse(200, json.dumps(_curseforge_versions()).encode())
+        if request.full_url.endswith("/game/version-types"):
+            return FakeResponse(200, json.dumps(_curseforge_version_types()).encode())
+        raise AssertionError(request.full_url)
+
+    first = publish.load_curseforge_catalog("curse-token-123", opener=opener)
+    second = publish.load_curseforge_catalog("curse-token-123", opener=opener)
+    assert first == second
+    assert len(calls) == 2
+    publish.clear_curseforge_catalog_cache()
+
+
+def test_curseforge_failure_still_attempts_wago(tmp_path, monkeypatch, capsys):
+    order = []
+
+    def fake_github(*args, **kwargs):
+        order.append("github")
+        return "created"
+
+    def resolve_curseforge(**kwargs):
+        order.append("curseforge-plan")
+        return _curseforge_plan(tmp_path)
+
+    def upload_curseforge(plan, **kwargs):
+        order.append("curseforge-upload")
+        return None
+
+    def resolve_wago(**kwargs):
+        order.append("wago-plan")
+        return _plan(tmp_path)
+
+    def upload_wago(plan, **kwargs):
+        order.append("wago-upload")
+        return "uploaded"
+
+    monkeypatch.setattr(publish, "create_github_release", fake_github)
+    monkeypatch.setattr(publish, "resolve_curseforge_publish_plan", resolve_curseforge)
+    monkeypatch.setattr(publish, "publish_to_curseforge", upload_curseforge)
+    monkeypatch.setattr(publish, "resolve_wago_publish_plan", resolve_wago)
+    monkeypatch.setattr(publish, "publish_to_wago", upload_wago)
+
+    result = publish.publish_github_then_external(**_orchestrator_args(tmp_path), dry_run=False)
+    output = capsys.readouterr().out
+    assert result is False
+    assert order == ["github", "curseforge-plan", "curseforge-upload", "wago-plan", "wago-upload"]
+    assert "CurseForge failed, Wago succeeded" in output
+    assert "Do not delete GitHub, CurseForge, or Wago releases" in output
+
+
+def test_wago_failure_still_attempts_curseforge(tmp_path, monkeypatch, capsys):
+    order = []
+
+    def fake_github(*args, **kwargs):
+        order.append("github")
+        return "created"
+
+    def resolve_curseforge(**kwargs):
+        order.append("curseforge-plan")
+        return _curseforge_plan(tmp_path)
+
+    def upload_curseforge(plan, **kwargs):
+        order.append("curseforge-upload")
+        return "already-exists"
+
+    def resolve_wago(**kwargs):
+        order.append("wago-plan")
+        return _plan(tmp_path)
+
+    def upload_wago(plan, **kwargs):
+        order.append("wago-upload")
+        return None
+
+    monkeypatch.setattr(publish, "create_github_release", fake_github)
+    monkeypatch.setattr(publish, "resolve_curseforge_publish_plan", resolve_curseforge)
+    monkeypatch.setattr(publish, "publish_to_curseforge", upload_curseforge)
+    monkeypatch.setattr(publish, "resolve_wago_publish_plan", resolve_wago)
+    monkeypatch.setattr(publish, "publish_to_wago", upload_wago)
+
+    result = publish.publish_github_then_external(**_orchestrator_args(tmp_path), dry_run=False)
+    output = capsys.readouterr().out
+    assert result is False
+    assert order == ["github", "curseforge-plan", "curseforge-upload", "wago-plan", "wago-upload"]
+    assert "CurseForge succeeded, Wago failed" in output
+
+
+def test_github_failure_skips_curseforge_and_wago(tmp_path, monkeypatch, capsys):
+    def fake_github(*args, **kwargs):
+        return None
+
+    def fail_external(**kwargs):
+        raise AssertionError("downstream publishing must not run")
+
+    monkeypatch.setattr(publish, "create_github_release", fake_github)
+    monkeypatch.setattr(publish, "resolve_curseforge_publish_plan", fail_external)
+    monkeypatch.setattr(publish, "resolve_wago_publish_plan", fail_external)
+
+    result = publish.publish_github_then_external(**_orchestrator_args(tmp_path), dry_run=False)
+    output = capsys.readouterr().out
+    assert result is False
+    assert "CurseForge and Wago were not attempted" in output
+
+
+def test_file_list_forbidden_still_uploads(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+    methods = []
+
+    def opener(request, timeout=None):
+        methods.append(request.get_method())
+        if request.get_method() == "GET":
+            raise _http_error(request, 403, b'{"message":"forbidden"}')
+        return FakeResponse(200, b'{"id": 9}')
+
+    result = publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener)
+    output = capsys.readouterr().out
+    assert result == "uploaded"
+    assert methods == ["GET", "POST"]
+    assert "file list is unavailable" in output
+    assert "authentication failed while checking existing files" not in output
+
+
+def test_truncated_curseforge_upload_is_a_destination_failure(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CURSEFORGE_API_TOKEN", "curse-token-123")
+
+    class TruncatedResponse(FakeResponse):
+        def read(self):
+            raise http.client.IncompleteRead(b"partial")
+
+    def opener(request, timeout=None):
+        if request.get_method() == "GET":
+            return FakeResponse(200, b"[]")
+        return TruncatedResponse()
+
+    assert publish.publish_to_curseforge(_curseforge_plan(tmp_path), opener=opener) is None
+    assert "CurseForge network error" in capsys.readouterr().out
+
+
+def test_unexpected_curseforge_error_still_attempts_wago(tmp_path, monkeypatch, capsys):
+    order = []
+
+    def fake_github(*args, **kwargs):
+        order.append("github")
+        return "created"
+
+    def upload_curseforge(plan, **kwargs):
+        order.append("curseforge-upload")
+        raise RuntimeError("truncated response")
+
+    def resolve_wago(**kwargs):
+        order.append("wago-plan")
+        return _plan(tmp_path)
+
+    def upload_wago(plan, **kwargs):
+        order.append("wago-upload")
+        return "uploaded"
+
+    monkeypatch.setattr(publish, "create_github_release", fake_github)
+    monkeypatch.setattr(publish, "resolve_curseforge_publish_plan", lambda **kwargs: _curseforge_plan(tmp_path))
+    monkeypatch.setattr(publish, "publish_to_curseforge", upload_curseforge)
+    monkeypatch.setattr(publish, "resolve_wago_publish_plan", resolve_wago)
+    monkeypatch.setattr(publish, "publish_to_wago", upload_wago)
+
+    result = publish.publish_github_then_external(**_orchestrator_args(tmp_path), dry_run=False)
+    output = capsys.readouterr().out
+    assert result is False
+    assert order == ["github", "curseforge-upload", "wago-plan", "wago-upload"]
+    assert "CurseForge publication failed unexpectedly" in output
+    assert "CurseForge failed, Wago succeeded" in output

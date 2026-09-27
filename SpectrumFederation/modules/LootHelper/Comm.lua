@@ -212,9 +212,6 @@ function Comm:Send(channelKey, msgType, payload, distribution, target, prio, opt
 
     local SP = SF and SF.SyncProtocol
     if not SP then
-        if SF and SF.PrintWarning then
-            SF:PrintWarning("Cannot send message: SyncProtocol not initialized")
-        end
         DError("Cannot send: SF.SyncProtocol missing")
         return false
     end
@@ -316,9 +313,9 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
     local st = self.state
     local maxQ = tonumber(self.cfg.maxQueue) or 200
     if (st.total or 0) >= maxQ then
-        if not st._queueFullWarned and SF and SF.PrintWarning then
+        if not st._queueFullWarned then
             st._queueFullWarned = true
-            SF:PrintWarning(("Comm queue full (%d/%d): dropping message"):format(st.total, maxQ))
+            DWarn("Comm queue full (%d/%d): dropping message", st.total, maxQ)
         end
         return false
     end
@@ -334,9 +331,9 @@ function Comm:_EnqueueSend(prefix, msg, distribution, target, prio, callback)
     local maxPer = tonumber(self.cfg.maxPerTarget) or 50
     if #q >= maxPer then
         st._perTargetWarned = st._perTargetWarned or {}
-        if not st._perTargetWarned[key] and SF and SF.PrintWarning then
+        if not st._perTargetWarned[key] then
             st._perTargetWarned[key] = true
-            SF:PrintWarning(("Comm per-target queue full for %s (%d/%d): dropping message"):format(tostring(key), #q, maxPer))
+            DWarn("Comm per-target queue full for %s (%d/%d): dropping message", tostring(key), #q, maxPer)
         end
         return false
     end
