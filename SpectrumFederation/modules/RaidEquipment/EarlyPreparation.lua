@@ -788,7 +788,14 @@ function EarlyPrep:HandlePrepNotice(sender, payload)
 		self:NoteReject(sender, "session")
 		return
 	end
-	if type(sync.IsSenderAuthorized) ~= "function" or not sync:IsSenderAuthorized(payload.profileId, sender) then
+	local profilePresent = type(sync.FindLocalProfileById) == "function" and sync:FindLocalProfileById(payload.profileId) ~= nil
+	local authorized = profilePresent and type(sync.IsSenderAuthorized) == "function" and sync:IsSenderAuthorized(payload.profileId, sender) == true
+	local decision = EarlyPrep.PrepNoticeSenderState(profilePresent, authorized)
+	if decision == "defer" then
+		self:DeferPrepNotice(payload.sessionId, payload.profileId, sender, payload)
+		return
+	end
+	if decision ~= "apply" then
 		self:NoteReject(sender, "unauthorized")
 		return
 	end
