@@ -776,7 +776,6 @@ function EarlyPrep:EvaluateMember(memberId)
 	if not self:ComputeWindow() or self:WasWarned(memberId) or not self:IsEligibleTarget(memberId) then
 		return false
 	end
-	result, why = raidCheck:GetAuthoritativePreparation(memberId, cfg)
 	if why ~= "fresh" or type(result) ~= "table" or result.complete ~= true or result.prepared == true then
 		return false
 	end

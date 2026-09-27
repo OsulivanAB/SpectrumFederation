@@ -329,7 +329,7 @@ function Sync:HandleSessionReannounce(sender, payload)
     end
 
     local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
-    if type(payload.prepNotice) == "table" and earlyPrep then
+    if type(payload.prepNotice) == "table" and earlyPrep and self:IsSenderAuthorized(payload.profileId, sender) then
         if earlyPrep.ApplyHeartbeat then
             earlyPrep:ApplyHeartbeat(payload.sessionId, payload.profileId, payload.prepNotice)
         end
@@ -543,7 +543,7 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     end
 
     local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
-    if earlyPrep and earlyPrep.ApplyHeartbeat then
+    if earlyPrep and earlyPrep.ApplyHeartbeat and self:IsSenderAuthorized(payload.profileId, sender) then
         earlyPrep:ApplyHeartbeat(payload.sessionId, payload.profileId, payload.prepNotice)
     end
     if earlyPrep and earlyPrep.Notify then

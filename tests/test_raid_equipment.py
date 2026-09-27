@@ -174,6 +174,14 @@ def test_early_preparation_whispers_production_lua():
     reannounce_fn = reannounce.split("function Sync:HandleSessionReannounce", 1)[1]
     reannounce_fn = reannounce_fn.split("\nfunction ", 1)[0]
     assert "ApplyHeartbeat" in reannounce_fn
+    assert "IsSenderAuthorized" in reannounce_fn
+    heartbeat_fn = reannounce.split("function Sync:HandleSessionHeartbeat", 1)[1]
+    heartbeat_fn = heartbeat_fn.split("\nfunction ", 1)[0]
+    apply_at = heartbeat_fn.index(":ApplyHeartbeat")
+    assert "IsSenderAuthorized" in heartbeat_fn[:apply_at]
+    evaluate = source.split("function EarlyPrep:EvaluateMember", 1)[1]
+    evaluate = evaluate.split("\nfunction ", 1)[0]
+    assert evaluate.count(":GetAuthoritativePreparation") == 1
 
 
 def test_parent_toc_loads_raid_equipment_modules():
