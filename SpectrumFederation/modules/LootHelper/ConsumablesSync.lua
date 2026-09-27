@@ -197,7 +197,7 @@ end
 
 S.TRADE_GRANT_TTL = 120
 S.MAX_TRADE_GRANTS = 32
-S.MAX_TRADE_GRANT_ITEMS = 32
+S.MAX_TRADE_GRANT_ITEMS = C.MAX_ASSIGNMENT_PAIRS
 
 local tradeGrants = setmetatable({}, { __mode = "k" })
 
@@ -565,6 +565,8 @@ local function CustodyWriterOk(profile, event, sender)
             and C.IsCanonicalAdmin(profile, event.toHolder)
     end
     if action == C.ACTION.DELIVER then
+        if event.crafter ~= nil and not Same(event.crafter, sender) then return false end
+        if event.toHolder ~= nil and not Same(event.toHolder, sender) then return false end
         local crafter = event.toHolder or event.crafter
         return crafter and event.fromHolder
             and Same(event.actor, sender) and Same(crafter, sender)

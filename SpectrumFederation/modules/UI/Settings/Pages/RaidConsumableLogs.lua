@@ -28,6 +28,8 @@ end
 
 local historyOffset = 0
 local historyProfileId = nil
+local reuseHistory = false
+local reusedHistory = nil
 
 local function ActiveProfile()
 	return SF.GetActiveProfile and SF:GetActiveProfile() or nil
@@ -47,6 +49,9 @@ local function PageSize()
 end
 
 local function LogItems()
+	if reuseHistory and reusedHistory then
+		return reusedHistory
+	end
 	local C = SF.Consumables
 	local profile = ActiveProfile()
 	if not C or not profile or not C.HistoryRows then
@@ -71,6 +76,7 @@ local function LogItems()
 	for i = 1, #rows do
 		items[i] = { text = rows[i].text, canRemove = false }
 	end
+	reusedHistory = items
 	return items
 end
 
@@ -153,11 +159,16 @@ function Page:Refresh(panel)
 	if panel and panel.IsShown and not panel:IsShown() then
 		return
 	end
+	reuseHistory = false
+	reusedHistory = nil
 	LogItems()
+	reuseHistory = true
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer
 	if renderer then
 		renderer:Refresh(panel)
 	end
+	reuseHistory = false
+	reusedHistory = nil
 end
 
 local refreshQueued = false

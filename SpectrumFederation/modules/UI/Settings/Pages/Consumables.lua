@@ -256,6 +256,7 @@ local function Definition(panel)
 								return
 							end
 							local bankTab = tonumber(panel.__sfConsumableTab) or tab or 1
+							panel.__sfConsumableTab = nil
 							Commit(ctx, { name = "set_guild", guild = guild, bankTab = bankTab })
 						end,
 					},

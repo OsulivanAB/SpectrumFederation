@@ -522,6 +522,9 @@ assertTrue(select(1, C.AddCrafter(peer, admin, sully, { asAdmin = true })))
 assertTrue(select(1, C.AddAssignment(peer, admin, aqirite, sully, { asAdmin = true })))
 assertFalse(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:7", C.ACTION.DELIVER, donor, { fromHolder = admin, toHolder = donor }), donor)), "delivery requires the assigned crafter")
 assertTrue(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:8", C.ACTION.DELIVER, sully, { fromHolder = admin, crafter = sully }), sully)), "the assigned crafter can record delivery")
+assertFalse(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:9", C.ACTION.DELIVER, sully, { fromHolder = admin, toHolder = sully, crafter = donor }), sully)), "a delivery cannot name a different crafter")
+assertFalse(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:10", C.ACTION.DELIVER, sully, { fromHolder = admin, crafter = sully, toHolder = donor }), sully)), "a delivery cannot name a different holder")
+assertTrue(select(1, S.ApplyRemoteEvent(peer, custodyEvent("ce:cw:11", C.ACTION.DELIVER, sully, { fromHolder = admin, crafter = sully, toHolder = sully }), sully)), "a delivery that names the sender as crafter and holder is accepted")
 local foreignReceipt = {
     id = "ce:forged:" .. donor .. ":receipt",
     type = C.EVENT.RECEIPT,
@@ -885,10 +888,23 @@ local function FrameMock()
     function frame:EnableMouse() end
     function frame:SetMovable() end
     function frame:RegisterForDrag() end
-    function frame:SetScript() end
+    function frame:SetScript(name, handler)
+        self.scripts = self.scripts or {}
+        self.scripts[name] = handler
+    end
+    function frame:StartMoving()
+        self.startedMoving = (self.startedMoving or 0) + 1
+    end
+    function frame:StopMovingOrSizing()
+        self.stoppedMoving = (self.stoppedMoving or 0) + 1
+    end
     function frame:SetBackdrop() end
     function frame:SetText() end
     function frame:SetJustifyH() end
+    function frame:SetWidth() end
+    function frame:SetHeight() end
+    function frame:SetAutoFocus() end
+    function frame:SetNumeric() end
     function frame:Hide() end
     function frame:Show() end
     function frame:SetScrollChild() end
@@ -966,7 +982,15 @@ RT:EnsureReview()
 assertEq(#secureTemplates, 0, "opening the review during combat does not create the secure banking button")
 assertTrue(RT.review ~= nil, "the non-secure review frame can still be created during combat")
 assertTrue(RT.mobileButtonPending == true, "the banking button waits until combat ends")
+RT.review.scripts.OnDragStart(RT.review)
+RT.review.scripts.OnDragStop(RT.review)
+assertEq(RT.review.startedMoving, nil, "dragging the review during combat does not start moving")
+assertEq(RT.review.stoppedMoving, nil, "releasing the review during combat does not stop moving")
 function InCombatLockdown() return false end
+RT.review.scripts.OnDragStart(RT.review)
+RT.review.scripts.OnDragStop(RT.review)
+assertEq(RT.review.startedMoving, 1, "dragging the review out of combat starts moving")
+assertEq(RT.review.stoppedMoving, 1, "releasing the review out of combat stops moving")
 local mobile = RT:EnsureMobileButton()
 assertTrue(mobile ~= nil, "the banking button is created once combat ends")
 assertEq(#secureTemplates, 1, "the secure button is created only outside combat")
@@ -3360,6 +3384,236 @@ function checkAdoptedLedgerRound()
     SF.lootHelperDB = savedDb
 end
 checkAdoptedLedgerRound()
+
+function checkGuildTabDraft()
+    local guildP = profile("guild-tab", admin)
+    function guildP:IsCurrentUserAdmin() return true end
+    local savedGet = SF.GetActiveProfile
+    local savedName = SF.NameUtil
+    local savedGuild = RT.CurrentGuild
+    local savedUI = SF.SettingsUI
+    SF.GetActiveProfile = function() return guildP end
+    SF.NameUtil = {
+        GetSelfId = function() return admin end,
+        NormalizeNameRealm = function(name) return name end,
+        SamePlayer = function(a, b) return a ~= nil and a == b end,
+    }
+    RT.CurrentGuild = function()
+        return { guid = "club-guild-tab", name = "Guild", realm = "Realm" }, 1
+    end
+    local captured = nil
+    SF.SettingsUI = {
+        RegisterPage = function(_, page)
+            captured = page
+        end,
+        DefinitionRenderer = {
+            Build = function() end,
+            Refresh = function() end,
+        },
+    }
+    load("SpectrumFederation/modules/UI/Settings/Pages/Consumables.lua")
+    local built = nil
+    SF.SettingsUI.DefinitionRenderer.Build = function(_, _, definition)
+        built = definition
+    end
+    local panel = {
+        IsShown = function() return false end,
+        EnableMouse = function() end,
+        SetScript = function() end,
+    }
+    captured:Build(panel)
+    local click = nil
+    local items = built.sections[1].items
+    for i = 1, #items do
+        if items[i].buttonText == "Set to My Guild" then
+            click = items[i].onClick
+        end
+    end
+    local messages = {}
+    local ctx = {
+        panel = panel,
+        section = {
+            SetMessage = function(_, text, kind)
+                messages[#messages + 1] = { text = text, kind = kind }
+            end,
+            ClearMessage = function() end,
+        },
+    }
+    panel.__sfConsumableTab = "9"
+    click(ctx)
+    assertEq(panel.__sfConsumableTab, nil, "a rejected bank tab draft is cleared")
+    assertEq(guildP._consumables.guild, nil, "tab 9 does not lock the guild")
+    assertTrue(messages[#messages] and messages[#messages].text:find("1 to 8", 1, true) ~= nil, "tab 9 is rejected")
+    panel.__sfConsumableTab = "2"
+    click(ctx)
+    assertEq(guildP._consumables.bankTab, 2, "the next click uses the new bank tab")
+    assertEq(panel.__sfConsumableTab, nil, "a saved bank tab draft is cleared")
+    assertEq(guildP._consumables.guild.guid, "club-guild-tab", "the guild locks from the fresh tab")
+    SF.GetActiveProfile = savedGet
+    SF.NameUtil = savedName
+    RT.CurrentGuild = savedGuild
+    SF.SettingsUI = savedUI
+end
+checkGuildTabDraft()
+
+function checkCodexTradeRound()
+    local savedName = SF.NameUtil
+    local savedProfile = RT.AccountingProfile
+    local savedScan = RT.ScanBags
+    local savedGroup = RT.GroupMap
+    local savedCompat = RT.IsCompatible
+    local savedRange = RT.IsInRange
+    local review = RT:EnsureReview()
+    local savedShown = review.IsShown
+    SF.NameUtil = {
+        GetSelfId = function() return admin end,
+        NormalizeNameRealm = function(name) return name end,
+        SamePlayer = function(a, b)
+            return type(a) == "string" and type(b) == "string" and a:lower() == b:lower()
+        end,
+    }
+    local rangeP = profile("range-case", admin)
+    assertTrue(select(1, C.AddCrafter(rangeP, admin, sully, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(rangeP, admin, aqirite, sully, { asAdmin = true })))
+    RT.AccountingProfile = function() return rangeP end
+    RT.ScanBags = function()
+        RT.bagCounts = { [aqirite] = 1 }
+        RT.bagStacks = { [aqirite] = { { bag = 0, slot = 1, count = 1 } } }
+    end
+    RT.GroupMap = function()
+        return { ["sully-realm"] = "raid1" }
+    end
+    RT.IsCompatible = function() return true end
+    RT.IsInRange = function(_, unit) return unit == "raid1" end
+    review.IsShown = function() return true end
+    local savedAction = R.TradeAction
+    local sawRange = nil
+    R.TradeAction = function(recipient, inRange)
+        sawRange = inRange
+        return savedAction(recipient, inRange)
+    end
+    RT:RebuildReview()
+    assertEq(sawRange, true, "the trade button uses the case-insensitive range flag")
+    assertTrue(RT:RecipientInRange(sully), "later range checks find the roster despite capitalization")
+    R.TradeAction = savedAction
+    RT.AccountingProfile = savedProfile
+    RT.ScanBags = savedScan
+    RT.GroupMap = savedGroup
+    RT.IsCompatible = savedCompat
+    RT.IsInRange = savedRange
+    review.IsShown = savedShown
+    SF.NameUtil = savedName
+
+    local savedContainer = C_Container
+    local savedClick = ClickTradeButton
+    local picked = nil
+    C_Container = {
+        GetContainerNumSlots = function() return 1 end,
+        GetContainerItemInfo = function(bag, slot)
+            if bag == 0 and slot == 1 then
+                return { itemID = aqirite, stackCount = 5 }
+            end
+            return nil
+        end,
+        PickupContainerItem = function(bag, slot)
+            picked = { bag = bag, slot = slot }
+        end,
+    }
+    ClickTradeButton = function() end
+    RT.pendingTrade = {
+        line = { itemId = aqirite, quantity = 5 },
+    }
+    RT.bagStacks = { [aqirite] = { { bag = 4, slot = 9, count = 5 } } }
+    RT:PlacePendingTrade()
+    assertEq(picked and picked.bag, 0, "an opened trade scans bags before choosing a slot")
+    assertEq(picked and picked.slot, 1, "an opened trade does not reuse a stale bag slot")
+    picked = nil
+    C_Container.GetContainerItemInfo = function() return nil end
+    RT.pendingTrade = {
+        line = { itemId = aqirite, quantity = 5 },
+    }
+    RT.bagStacks = { [aqirite] = { { bag = 4, slot = 9, count = 5 } } }
+    RT:PlacePendingTrade()
+    assertEq(picked, nil, "an opened trade does not pick up a slot after the item is gone")
+    RT.pendingTrade = nil
+    C_Container = savedContainer
+    ClickTradeButton = savedClick
+
+    local grantP = profile("grant-cap", admin)
+    assertTrue(select(1, C.AddCrafter(grantP, admin, vann, { asAdmin = true })))
+    local firstId = 210000
+    local added = 0
+    for i = 1, 33 do
+        if select(1, C.AddAssignment(grantP, admin, firstId + i, vann, { asAdmin = true })) then
+            added = added + 1
+        end
+    end
+    assertEq(added, 33, "thirty-three assignments are stored before the trade opens")
+    local wideToken = "trade-" .. vann .. "-wide-1"
+    local wide = C.FreezeTrade(grantP, donor, vann, nil, wideToken)
+    local wideGrant = S.TradeFreezePayload(wide)
+    assertEq(wideGrant and #wideGrant.items, 33, "a trade freeze keeps every assigned item past the old 32-item cutoff")
+    local lastId = firstId + 33
+    local lastEpoch = grantP._consumables.assignments[tostring(lastId)].epoch
+    assertTrue(S.RegisterTradeGrant(grantP, wideGrant, C.Now()), "the wider trade freeze can be granted")
+    assertTrue(select(1, C.RemoveAssignment(grantP, admin, lastId, vann, { asAdmin = true })))
+    assertTrue(select(1, S.ApplyRemoteEvent(grantP, {
+        id = "ce:" .. grantP._profileId .. ":" .. wideToken .. ":late",
+        type = C.EVENT.RECEIPT,
+        actor = vann,
+        crafter = vann,
+        itemId = lastId,
+        quantity = 1,
+        generation = grantP._consumables.generation,
+        epoch = lastEpoch,
+        tradeToken = wideToken,
+        source = "trade",
+        timestamp = C.Now(),
+    }, vann)), "an item past the old freeze cutoff still matches the open trade")
+
+    local calls = 0
+    local savedRows = C.HistoryRows
+    C.HistoryRows = function(...)
+        calls = calls + 1
+        return savedRows(...)
+    end
+    local savedGet = SF.GetActiveProfile
+    local savedUI = SF.SettingsUI
+    local logP = profile("log-once", admin)
+    SF.GetActiveProfile = function() return logP end
+    local logPage = nil
+    SF.SettingsUI = {
+        RegisterPage = function(_, page)
+            logPage = page
+        end,
+        DefinitionRenderer = {
+            Build = function(_, panel, definition)
+                panel.__sfPageDef = definition
+            end,
+            Refresh = function(_, panel)
+                local items = panel.__sfPageDef.sections[1].items
+                for i = 1, #items do
+                    if items[i].getItems then
+                        items[i].getItems()
+                    end
+                end
+            end,
+        },
+    }
+    load("SpectrumFederation/modules/UI/Settings/Pages/RaidConsumableLogs.lua")
+    local panel = {
+        IsShown = function() return true end,
+        HookScript = function() end,
+    }
+    calls = 0
+    logPage:Build(panel)
+    logPage:Refresh(panel)
+    assertEq(calls, 1, "a visible consumable log sorts its history once per refresh")
+    C.HistoryRows = savedRows
+    SF.GetActiveProfile = savedGet
+    SF.SettingsUI = savedUI
+end
+checkCodexTradeRound()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

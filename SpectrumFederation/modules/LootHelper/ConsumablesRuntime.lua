@@ -349,8 +349,10 @@ function Runtime:IsInRange(unit)
 end
 
 function Runtime:RecipientInRange(name)
-    local group = self.groupMap or self:GroupMap()
-    return self:IsInRange(group[name])
+    if type(self.groupMap) ~= "table" then
+        self.groupMap = self:GroupMap()
+    end
+    return self:IsInRange(self:GroupUnit(name))
 end
 
 local MOBILE_BANKING_SPELL_ID = 83958
@@ -770,8 +772,14 @@ function Runtime:EnsureReview()
     frame:EnableMouse(true)
     frame:SetMovable(true)
     frame:RegisterForDrag("LeftButton")
-    frame:SetScript("OnDragStart", function(selfFrame) selfFrame:StartMoving() end)
-    frame:SetScript("OnDragStop", function(selfFrame) selfFrame:StopMovingOrSizing() end)
+    frame:SetScript("OnDragStart", function(selfFrame)
+        if InCombat() then return end
+        selfFrame:StartMoving()
+    end)
+    frame:SetScript("OnDragStop", function(selfFrame)
+        if InCombat() then return end
+        selfFrame:StopMovingOrSizing()
+    end)
     frame:SetScript("OnHide", function()
         self:SyncRangeTicker()
         self:SyncMobileButton()
@@ -977,7 +985,7 @@ function Runtime:RebuildReview()
                 button.recipient = line.recipient
                 button:SetText("Trade")
                 local Routing = SF.ConsumablesRouting
-                local action = Routing.TradeAction(line.recipient, collected.inRange[line.recipient])
+                local action = Routing.TradeAction(line.recipient, line.inRange)
                 if action.enabled then button:Enable() else button:Disable() end
                 button:SetScript("OnClick", function()
                     self:BeginTrade(line, collected)
@@ -1106,7 +1114,13 @@ function Runtime:PlacePendingTrade()
         Warn("Leave combat before trading raid supplies.")
         return
     end
+    self:ScanBags()
     local line = pending.line
+    local have = (self.bagCounts and self.bagCounts[line.itemId]) or 0
+    if have < math.floor(tonumber(line.quantity) or 0) then
+        Warn("You no longer have that many.")
+        return
+    end
     local stacks = {}
     local rows = (self.bagStacks and self.bagStacks[line.itemId]) or {}
     for i = 1, #rows do
