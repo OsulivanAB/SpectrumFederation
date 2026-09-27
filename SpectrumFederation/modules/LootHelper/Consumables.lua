@@ -635,6 +635,25 @@ local function MixConfigText(hash, text)
     return Xor32(hash, IdHash(text))
 end
 
+local function ItemEpochRows(cfg)
+    local rows = {}
+    if type(cfg) ~= "table" or type(cfg.itemEpochs) ~= "table" then return rows end
+    local visits = 0
+    local cap = C.MAX_ASSIGNMENT_PAIRS * 4
+    for key, epoch in pairs(cfg.itemEpochs) do
+        visits = visits + 1
+        if visits > cap then break end
+        local itemId = tonumber(key)
+        epoch = tonumber(epoch)
+        if itemId and itemId >= 1 and itemId == math.floor(itemId) and itemId <= C.MAX_EVENT_SEQ
+            and epoch and epoch >= 1 and epoch == math.floor(epoch) and epoch <= C.MAX_EVENT_SEQ then
+            rows[#rows + 1] = { itemId = itemId, epoch = epoch }
+        end
+    end
+    table.sort(rows, function(a, b) return a.itemId < b.itemId end)
+    return rows
+end
+
 local function ConfigFingerprint(cfg)
     local guid = ""
     if type(cfg.guild) == "table" and type(cfg.guild.guid) == "string" then
@@ -674,6 +693,13 @@ local function ConfigFingerprint(cfg)
             mixed = mixed + 1
         end
         if mixed >= C.MAX_ASSIGNMENT_PAIRS then break end
+    end
+    local epochs = ItemEpochRows(cfg)
+    if #epochs > 0 then
+        hash = MixConfigText(hash, "e:" .. tostring(#epochs))
+        for i = 1, #epochs do
+            hash = MixConfigText(hash, tostring(epochs[i].itemId) .. ":" .. tostring(epochs[i].epoch))
+        end
     end
     return hash
 end
@@ -829,6 +855,7 @@ local function NoteItemEpoch(cfg, itemId, epoch)
     if type(cfg.itemEpochs) ~= "table" then cfg.itemEpochs = {} end
     local key = ItemKey(itemId)
     local current = tonumber(cfg.itemEpochs[key]) or 0
+    if epoch > C.MAX_EVENT_SEQ then return end
     if epoch <= current then return end
     if current == 0 then
         local count = 0
@@ -1704,6 +1731,7 @@ function C.ExportSnapshot(profile, opts)
         crafters = CopyCrafterRoster(cfg.crafters),
         assignments = assignments,
         events = events,
+        itemEpochs = ItemEpochRows(cfg),
     }
 end
 
@@ -1783,6 +1811,18 @@ function C.ReplaceConfig(profile, payload)
         end
     end
     PruneRetiredAssignments(cfg)
+    if type(payload.itemEpochs) == "table" then
+        local visits = 0
+        local cap = C.MAX_ASSIGNMENT_PAIRS * 4
+        for i = 1, #payload.itemEpochs do
+            visits = visits + 1
+            if visits > cap then break end
+            local row = payload.itemEpochs[i]
+            if type(row) == "table" then
+                NoteItemEpoch(cfg, row.itemId, row.epoch)
+            end
+        end
+    end
     Invalidate(profile)
     RestoreAdoptedGeneration(profile)
     C.RetainCurrentGeneration(profile)

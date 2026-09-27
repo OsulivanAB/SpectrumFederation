@@ -82,21 +82,79 @@ local function FreezeList(profile)
     return stored
 end
 
+local function CurrentFreezeAuthority()
+    local state = Sync.state or {}
+    return state.coordinator, tonumber(state.coordEpoch) or 0
+end
+
+-- A freeze the queue accepted still belongs to this coordinator until that
+-- coordinator relays it or authority changes.
+local function FreezeInflight(grant)
+    if type(grant) ~= "table" then return false end
+    local coordinator, epoch = CurrentFreezeAuthority()
+    if type(coordinator) ~= "string" or coordinator == "" then return false end
+    return grant.inflightCoordinator == coordinator and tonumber(grant.inflightEpoch) == epoch
+end
+
+local function FreezeExpired(grant, now)
+    if type(grant) ~= "table" then return false end
+    local at = tonumber(grant.inflightAt)
+    if not at or at <= 0 then return false end
+    local S = Rules()
+    local ttl = S and tonumber(S.TRADE_GRANT_TTL) or 120
+    if not ttl or ttl < 1 then ttl = 120 end
+    return (tonumber(now) or 0) >= at + ttl
+end
+
+local function MarkFreezeInflight(grant)
+    local coordinator, epoch = CurrentFreezeAuthority()
+    grant.inflightCoordinator = coordinator
+    grant.inflightEpoch = epoch
+    if not tonumber(grant.inflightAt) or tonumber(grant.inflightAt) <= 0 then
+        local C = Consumables()
+        grant.inflightAt = C and C.Now and C.Now() or 0
+    end
+end
+
 local function PendingFreezeFor(profile, token)
     if type(token) ~= "string" then return nil end
     local stored = pendingFreezes[profile]
     if type(stored) ~= "table" then return nil end
+    local function blocking(grant)
+        return type(grant) == "table" and grant.token == token and not FreezeInflight(grant)
+    end
     if type(stored.token) == "string" then
-        if stored.token == token then return stored end
+        if blocking(stored) then return stored end
         return nil
     end
     for i = 1, #stored do
-        local grant = stored[i]
-        if type(grant) == "table" and grant.token == token then
-            return grant
-        end
+        if blocking(stored[i]) then return stored[i] end
     end
     return nil
+end
+
+local function ReleaseAckedFreeze(profile, token)
+    if type(token) ~= "string" or token == "" then return end
+    local stored = pendingFreezes[profile]
+    if type(stored) ~= "table" then return end
+    if type(stored.token) == "string" then
+        if stored.token == token then
+            pendingFreezes[profile] = nil
+        end
+        return
+    end
+    local kept = {}
+    for i = 1, #stored do
+        local grant = stored[i]
+        if not (type(grant) == "table" and grant.token == token) then
+            kept[#kept + 1] = grant
+        end
+    end
+    if #kept == 0 then
+        pendingFreezes[profile] = nil
+    else
+        pendingFreezes[profile] = kept
+    end
 end
 
 local function RememberTradeFreeze(profile, grant, sent)
@@ -112,6 +170,8 @@ local function RememberTradeFreeze(profile, grant, sent)
         end
     end
     if sent == false then
+        grant.inflightCoordinator = nil
+        grant.inflightEpoch = nil
         if index then
             list[index] = grant
         else
@@ -123,11 +183,15 @@ local function RememberTradeFreeze(profile, grant, sent)
         end
         return false
     end
+    MarkFreezeInflight(grant)
     if index then
-        table.remove(list, index)
-    end
-    if #list == 0 then
-        pendingFreezes[profile] = nil
+        list[index] = grant
+    else
+        list[#list + 1] = grant
+        local cap = PendingFreezeCap()
+        while #list > cap do
+            table.remove(list, 1)
+        end
     end
     return true
 end
@@ -433,15 +497,21 @@ function Sync:_FlushPendingTradeFreeze(profile)
     end
     if #list == 0 then return end
     if not (self.state and self.state.active) or not SessionFor(profile) then return end
+    local C = Consumables()
+    local now = C and C.Now and C.Now() or 0
     local flushed = 0
-    while flushed < MAX_FREEZE_FLUSH and type(list[1]) == "table" do
-        local grant = list[1]
-        flushed = flushed + 1
-        if self.state.isCoordinator then
+    local index = 1
+    local scanned = 0
+    local guard = #list
+    while flushed < MAX_FREEZE_FLUSH and scanned < guard and index <= #list do
+        local grant = list[index]
+        scanned = scanned + 1
+        if type(grant) ~= "table" or FreezeExpired(grant, now) then
+            table.remove(list, index)
+        elseif FreezeInflight(grant) then
+            index = index + 1
+        elseif self.state.isCoordinator then
             local S = Rules()
-            local now = 0
-            local C = Consumables()
-            if C and C.Now then now = C.Now() end
             local registered = false
             if grant.kind == "withdraw" then
                 registered = S and S.RegisterWithdrawGrant and S.RegisterWithdrawGrant(profile, grant, now)
@@ -449,9 +519,12 @@ function Sync:_FlushPendingTradeFreeze(profile)
                 registered = S and S.RegisterTradeGrant and S.RegisterTradeGrant(profile, grant, now)
             end
             if not registered then
-                table.remove(list, 1)
+                table.remove(list, index)
             elseif self:BroadcastTradeFreeze(profile, grant) == false then
                 break
+            else
+                flushed = flushed + 1
+                index = index + 1
             end
         else
             if not SF.LootHelperComm or not self.MSG then return end
@@ -463,6 +536,8 @@ function Sync:_FlushPendingTradeFreeze(profile)
                 return
             end
             RememberTradeFreeze(profile, grant, true)
+            flushed = flushed + 1
+            index = index + 1
         end
     end
     if type(pendingFreezes[profile]) == "table" and #pendingFreezes[profile] == 0 then
@@ -919,5 +994,6 @@ function Sync:HandleConsumablesTradeFreeze(sender, payload)
         else
             S.AcceptCoordinatorTradeGrant(profile, payload, now)
         end
+        ReleaseAckedFreeze(profile, payload.token)
     end
 end

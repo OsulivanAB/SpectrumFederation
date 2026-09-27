@@ -3936,6 +3936,193 @@ function checkHeadReviewRound()
 end
 checkHeadReviewRound()
 
+function checkCodexHeadRound()
+    local savedProfile = RT.AccountingProfile
+    local savedScan = RT.ScanBags
+    local savedGroup = RT.GroupMap
+    local savedCompat = RT.IsCompatible
+    local savedRange = RT.IsInRange
+    local savedGuild = RT.CurrentGuild
+    local savedSelf = RT.SelfId
+    local savedLink = GetGuildBankItemLink
+    local savedInfo = GetGuildBankItemInfo
+    local savedState = Sync.state
+    local savedComm = SF.LootHelperComm
+    local savedFind = Sync.FindLocalProfileById
+    local savedGroupCheck = Sync.IsRequesterInGroup
+    local savedSame = Sync._SamePlayer
+    local savedSelfSync = Sync._SelfId
+    local hooks = {}
+    function hooksecurefunc(name, fn)
+        hooks[name] = fn
+    end
+    SplitGuildBankItem = function() end
+    RT.frame = nil
+    RT.pickupHooked = nil
+    RT:Init()
+    assertEq(type(hooks.SplitGuildBankItem), "function", "guild bank splits use the same pickup hook")
+
+    local review = RT:EnsureReview()
+    local savedShown = review.IsShown
+    review.IsShown = function() return false end
+    local rebuilds = 0
+    local savedRebuild = RT.RebuildReview
+    RT.RebuildReview = function(self, ...)
+        rebuilds = rebuilds + 1
+        return savedRebuild(self, ...)
+    end
+    local listenP = profile("review-refresh", admin)
+    RT.AccountingProfile = function() return listenP end
+    RT.ScanBags = function() end
+    assertTrue(select(1, C.AddCrafter(listenP, admin, vann, { asAdmin = true })), "the review refresh fixture has a Crafter")
+    review.IsShown = function() return true end
+    rebuilds = 0
+    assertTrue(select(1, C.AddAssignment(listenP, admin, aqirite, vann, { asAdmin = true })), "the review refresh fixture assigns an item")
+    assertTrue(rebuilds >= 1, "a configuration change rebuilds a visible donation review")
+    RT.RebuildReview = savedRebuild
+
+    local many = profile("review-rows", admin)
+    RT.AccountingProfile = function() return many end
+    RT.GroupMap = function() return { [vann] = "raid1" } end
+    RT.IsCompatible = function() return true end
+    RT.IsInRange = function() return true end
+    review.IsShown = function() return false end
+    assertTrue(select(1, C.AddCrafter(many, admin, vann, { asAdmin = true })), "the long review has a Crafter")
+    RT.bagCounts = {}
+    for i = 1, 45 do
+        local itemId = 810000 + i
+        assertTrue(select(1, C.AddAssignment(many, admin, itemId, vann, { asAdmin = true })), "the long review assigns item " .. tostring(i))
+        RT.bagCounts[itemId] = 1
+    end
+    local acquired = 0
+    local savedAcquire = RT.AcquireRow
+    RT.AcquireRow = function(self, index)
+        if index > acquired then acquired = index end
+        return savedAcquire(self, index)
+    end
+    review.IsShown = function() return true end
+    RT:RebuildReview()
+    assertTrue(acquired > 40, "a donation review keeps lines past the old 40-row cutoff")
+    RT.AcquireRow = savedAcquire
+    review.IsShown = savedShown
+
+    local splitP = profile("split-withdraw", admin)
+    assertTrue(select(1, C.SetGuild(splitP, admin, { guid = "club-split", name = "Spectrum", realm = "Realm" }, 2, { asAdmin = true })), "the split fixture locks a guild")
+    assertTrue(select(1, C.AddCrafter(splitP, admin, vann, { asAdmin = true })), "the split fixture has a Crafter")
+    assertTrue(select(1, C.AddAssignment(splitP, admin, aqirite, vann, { asAdmin = true })), "the split fixture assigns the item")
+    RT.AccountingProfile = function() return splitP end
+    RT.CurrentGuild = function() return { guid = "club-split" } end
+    RT.SelfId = function() return vann end
+    RT.bagCounts = { [aqirite] = 0 }
+    RT.bankBaseline = { [aqirite] = 20 }
+    RT.bankBaselineBags = { [aqirite] = 0 }
+    RT.bankSlotBaselineTab = 2
+    RT.bankSlotBaseline = { [1] = { itemId = aqirite, count = 20 } }
+    RT.withdrawIntents = nil
+    RT.withdrawIntent = nil
+    Sync.state = { active = false }
+    GetGuildBankItemLink = function() return "item:" .. tostring(aqirite) end
+    GetGuildBankItemInfo = function() return nil, 20 end
+    hooks.SplitGuildBankItem(2, 1, 5)
+    assertEq(RT.withdrawIntents and RT.withdrawIntents[1] and RT.withdrawIntents[1].intended, 5, "a split withdrawal records the split amount")
+    assertEq(RT.withdrawIntents[1].slots and RT.withdrawIntents[1].slots[1].before, 20, "a split withdrawal keeps the pre-split slot count")
+
+    local epochP = profile("epoch-wire", admin)
+    local epochItem = 4242
+    assertTrue(select(1, C.AddCrafter(epochP, admin, vann, { asAdmin = true })), "the watermark fixture has a Crafter")
+    assertTrue(select(1, C.AddAssignment(epochP, admin, epochItem, vann, { asAdmin = true })), "the watermark fixture assigns the item")
+    local firstEpoch = epochP._consumables.assignments[tostring(epochItem)].epoch
+    assertTrue(select(1, C.RemoveAssignment(epochP, admin, epochItem, vann, { asAdmin = true })), "the watermark fixture retires the item")
+    for i = 1, C.MAX_ASSIGNMENT_HISTORY + 1 do
+        local other = 4300 + i
+        C.AddAssignment(epochP, admin, other, vann, { asAdmin = true })
+        C.RemoveAssignment(epochP, admin, other, vann, { asAdmin = true })
+    end
+    assertEq(epochP._consumables.assignments[tostring(epochItem)], nil, "the watermark fixture prunes the retired item")
+    local snap = C.ExportSnapshot(epochP, { omitEvents = true })
+    local wired = nil
+    for i = 1, #(snap.itemEpochs or {}) do
+        if snap.itemEpochs[i].itemId == epochItem then wired = snap.itemEpochs[i].epoch end
+    end
+    assertTrue(wired and wired >= firstEpoch, "a configuration snapshot includes the pruned item epoch")
+    local peer = profile("epoch-peer", admin)
+    assertTrue(select(1, C.ReplaceConfig(peer, snap)), "a peer imports the watermark snapshot")
+    assertEq(C.Descriptor(peer).configFingerprint, C.Descriptor(epochP).configFingerprint, "imported watermarks keep the configuration fingerprint")
+    assertTrue(select(1, C.AddAssignment(peer, admin, epochItem, vann, { asAdmin = true })), "the peer can assign the pruned item")
+    assertTrue(peer._consumables.assignments[tostring(epochItem)].epoch > firstEpoch, "the peer does not restart the pruned item at epoch 1")
+
+    load("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
+    local freezeP = profile("freeze-ack", admin)
+    assertTrue(select(1, C.AddCrafter(freezeP, admin, vann, { asAdmin = true })), "the freeze fixture has a Crafter")
+    assertTrue(select(1, C.AddAssignment(freezeP, admin, aqirite, vann, { asAdmin = true })), "the freeze fixture assigns an item")
+    local opened = C.FreezeTrade(freezeP, donor, vann, { { itemId = aqirite } }, "trade-" .. vann .. "-4-4")
+    local sends = 0
+    Sync.MSG = Sync.MSG or {}
+    Sync.MSG.CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE"
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = admin,
+        coordEpoch = 1,
+        sessionId = "freeze-ack",
+        profileId = freezeP._profileId,
+        peers = { [admin] = { consumablesCapable = true, inGroup = true } },
+    }
+    Sync._SelfId = function() return donor end
+    Sync._SamePlayer = function(_, a, b) return a == b end
+    Sync.IsRequesterInGroup = function() return true end
+    Sync.FindLocalProfileById = function(_, id)
+        if id == freezeP._profileId then return freezeP end
+        return nil
+    end
+    SF.LootHelperComm = {
+        Send = function()
+            sends = sends + 1
+            return true
+        end,
+    }
+    assertTrue(Sync:PublishTradeFreeze(freezeP, opened) == true, "a delivered freeze whisper is accepted")
+    assertEq(sends, 1, "the freeze is whispered once")
+    Sync:_FlushPendingTradeFreeze(freezeP)
+    assertEq(sends, 1, "the same coordinator does not receive that freeze again")
+    Sync.state.coordinator = "New-Realm"
+    Sync.state.coordEpoch = 2
+    Sync.state.peers["New-Realm"] = { consumablesCapable = true, inGroup = true }
+    Sync:_FlushPendingTradeFreeze(freezeP)
+    assertEq(sends, 2, "a new coordinator receives the unacknowledged freeze")
+    local epoch = freezeP._consumables.assignments[tostring(aqirite)].epoch
+    Sync:HandleConsumablesTradeFreeze("New-Realm", {
+        sessionId = "freeze-ack",
+        profileId = freezeP._profileId,
+        token = opened.token,
+        receiver = vann,
+        donor = donor,
+        generation = freezeP._consumables.generation,
+        items = { { itemId = aqirite, epoch = epoch } },
+    })
+    Sync:_FlushPendingTradeFreeze(freezeP)
+    assertEq(sends, 2, "the coordinator relay retires the pending freeze")
+
+    RT.AccountingProfile = savedProfile
+    RT.ScanBags = savedScan
+    RT.GroupMap = savedGroup
+    RT.IsCompatible = savedCompat
+    RT.IsInRange = savedRange
+    RT.CurrentGuild = savedGuild
+    RT.SelfId = savedSelf
+    GetGuildBankItemLink = savedLink
+    GetGuildBankItemInfo = savedInfo
+    Sync.state = savedState
+    SF.LootHelperComm = savedComm
+    Sync.FindLocalProfileById = savedFind
+    Sync.IsRequesterInGroup = savedGroupCheck
+    Sync._SamePlayer = savedSame
+    Sync._SelfId = savedSelfSync
+    RT.withdrawIntents = nil
+    RT.withdrawIntent = nil
+end
+checkCodexHeadRound()
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)

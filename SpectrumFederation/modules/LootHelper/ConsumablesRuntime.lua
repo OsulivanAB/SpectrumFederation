@@ -949,7 +949,14 @@ function Runtime:RebuildReview()
     local y = 0
     local index = 0
     local groups = collected.plan.groups or {}
+    local maxRows = 512
+    local pairsCap = SF.Consumables and tonumber(SF.Consumables.MAX_ASSIGNMENT_PAIRS) or nil
+    if pairsCap and pairsCap >= 1 then
+        maxRows = pairsCap * 2
+    end
+    local stop = false
     for g = 1, #groups do
+        if index >= maxRows then break end
         local group = groups[g]
         index = index + 1
         local header = self:AcquireRow(index)
@@ -959,7 +966,10 @@ function Runtime:RebuildReview()
         header.Button:Hide()
         y = y + 22
         for i = 1, #group.lines do
-            if index >= 40 then break end
+            if index >= maxRows then
+                stop = true
+                break
+            end
             local line = group.lines[i]
             index = index + 1
             local row = self:AcquireRow(index)
@@ -1004,6 +1014,7 @@ function Runtime:RebuildReview()
             end
             y = y + 26
         end
+        if stop then break end
     end
     if index == 0 then
         index = 1
@@ -1479,7 +1490,7 @@ function Runtime:AutoStoreLoss(tab)
     return foundId, foundLoss
 end
 
-function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
+function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore, splitAmount)
     if self.placingDeposit then return end
     local C = SF.Consumables
     local profile = self:AccountingProfile()
@@ -1509,6 +1520,29 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
             emptiedBefore = tonumber(row.count) or 0
             if emptiedBefore <= 0 then emptiedBefore = nil end
         end
+    end
+    local splitBefore = nil
+    splitAmount = tonumber(splitAmount)
+    if splitAmount and (splitAmount < 1 or splitAmount ~= math.floor(splitAmount) or splitAmount > C.MAX_EVENT_SEQ) then
+        splitAmount = nil
+    end
+    if splitAmount then
+        local baseline = self.bankSlotBaseline
+        local row = self.bankSlotBaselineTab == tab and type(baseline) == "table" and baseline[slot] or nil
+        if not itemId and type(row) == "table" then
+            itemId = tonumber(row.itemId)
+        end
+        local base = 0
+        if itemId and type(row) == "table" and row.itemId == itemId then
+            base = tonumber(row.count) or 0
+        end
+        local live = slotStillOccupied and count or 0
+        splitBefore = math.max(base, live)
+        if splitBefore < splitAmount then
+            splitBefore = live + splitAmount
+        end
+        count = splitAmount
+        slotStillOccupied = splitBefore > 0
     end
     if (not itemId or count <= 0) and fromAutoStore then
         itemId, count = self:AutoStoreLoss(tab)
@@ -1554,7 +1588,9 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
             and existing.assigned == assigned
             and existing.admin == admin then
             existing.intended = (tonumber(existing.intended) or 0) + count
-            if slotStillOccupied then
+            if splitBefore then
+                rememberSlot(existing, splitBefore)
+            elseif slotStillOccupied then
                 rememberSlot(existing, count)
             else
                 rememberSlot(existing, emptiedBefore)
@@ -1584,7 +1620,9 @@ function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore)
         startedAt = now,
     }
     local createdIntent = queue[#queue]
-    if slotStillOccupied then
+    if splitBefore then
+        rememberSlot(createdIntent, splitBefore)
+    elseif slotStillOccupied then
         rememberSlot(createdIntent, count)
     else
         rememberSlot(createdIntent, emptiedBefore)
@@ -1906,6 +1944,23 @@ function Runtime:Init()
                 self:NoteGuildBankPickup(tab, slot, true)
             end)
         end
+        if type(SplitGuildBankItem) == "function" then
+            hooksecurefunc("SplitGuildBankItem", function(tab, slot, amount)
+                self:NoteGuildBankPickup(tab, slot, false, amount)
+            end)
+        end
+    end
+    if SF.Consumables and SF.Consumables.RegisterUIListener then
+        SF.Consumables.RegisterUIListener(function()
+            if InCombat() then
+                self.reviewRefreshPending = true
+                return
+            end
+            self:RefreshReminder()
+            if self.review and self.review.IsShown and self.review:IsShown() then
+                self:RebuildReview()
+            end
+        end)
     end
     if SF.SettingsStore and SF.SettingsStore.RegisterCallback then
         SF.SettingsStore:RegisterCallback("lootHelper.showRaidSupplyReminders", function()
