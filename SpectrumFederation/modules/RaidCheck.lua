@@ -1654,6 +1654,7 @@ function RC:_PauseInspectForCombat()
 				guid = active.guid,
 				id = active.id,
 				aliases = active.aliases,
+				source = active.source,
 			})
 		end
 

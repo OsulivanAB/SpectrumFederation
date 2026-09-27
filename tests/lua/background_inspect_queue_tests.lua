@@ -200,6 +200,38 @@ assertEq(inspects, 1, "the processor issues only the member the remaining filter
 assertEq(state.active and state.active.id, "Profile-Realm", "the issued scan is the profile member")
 assertEq(state.queued.stranger, nil, "the processor clears the rejected member")
 
+state = resetQueue({})
+state.backgroundInspectEnabled = true
+state.active = {
+	key = "guid-a",
+	guid = "guid-a",
+	id = "A-Realm",
+	source = "background",
+}
+state.inspectPausedForCombat = false
+RC:_PauseInspectForCombat()
+assertEq(state.queue[1] and state.queue[1].source, "background", "combat requeue keeps the background source")
+assertEq(state.active, nil, "combat pause clears the active inspect")
+state.backgroundInspectEnabled = false
+inspects = 0
+RC:_DiscardQueuedBackgroundInspects()
+RC:_ResumeInspectAfterCombat()
+assertEq(inspects, 0, "a background inspect paused for combat is not sent after the feature stops")
+assertEq(#state.queue, 0, "the combat-requeued background scan is gone after the feature stops")
+
+state = resetQueue({})
+state.active = {
+	key = "ad-1",
+	guid = "guid-b",
+	id = "B-Realm",
+	source = "adhoc",
+}
+state.inspectPausedForCombat = false
+RC:_PauseInspectForCombat()
+assertEq(state.queue[1] and state.queue[1].source, "adhoc", "combat requeue keeps the ad-hoc source")
+RC:_DiscardQueuedBackgroundInspects()
+assertEq(state.queue[1] and state.queue[1].source, "adhoc", "discarding background scans leaves the combat-requeued ad-hoc scan")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
 	os.exit(1)
