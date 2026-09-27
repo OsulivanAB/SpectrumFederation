@@ -594,6 +594,7 @@ function Sync:_BroadcastNewConsumablesEvents(profile, seenBefore, writer)
     if type(profile) ~= "table" then return end
     seenBefore = seenBefore or {}
     local S = Rules()
+    local C = Consumables()
     local function sendNew(list)
         if type(list) ~= "table" then return end
         for i = 1, #list do
@@ -601,7 +602,11 @@ function Sync:_BroadcastNewConsumablesEvents(profile, seenBefore, writer)
             if type(event) == "table" and type(event.id) == "string" and not seenBefore[event.id] then
                 if type(writer) == "string" and type(event.writer) ~= "string"
                     and S and S.RemoteEventIdOk and S.RemoteEventIdOk(event.id, writer) then
-                    event.writer = writer
+                    if C and C.NoteStoredWriter then
+                        C.NoteStoredWriter(profile, event, writer)
+                    else
+                        event.writer = writer
+                    end
                 end
                 self:BroadcastConsumablesEvent(profile, event)
             end
@@ -780,7 +785,11 @@ function Sync:BroadcastConsumablesEvent(profile, event)
         if S and type(event.writer) ~= "string" then
             local who = self._SelfId and self:_SelfId() or nil
             if type(who) == "string" and S.RemoteEventIdOk(event.id, who) then
-                event.writer = who
+                if C and C.NoteStoredWriter then
+                    C.NoteStoredWriter(profile, event, who)
+                else
+                    event.writer = who
+                end
             end
         end
         local dist = self._EnforceGroupedSessionActive and self:_EnforceGroupedSessionActive("BroadcastConsumablesEvent")

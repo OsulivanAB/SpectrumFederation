@@ -4305,6 +4305,72 @@ function checkA839ReviewRound()
 end
 checkA839ReviewRound()
 
+function checkWriterFingerprint()
+    local savedState = Sync.state
+    local savedComm = SF.LootHelperComm
+    local savedEnforce = Sync._EnforceGroupedSessionActive
+    local savedSelf = Sync._SelfId
+    local savedSafe = Sync.IsSafeModeEnabled
+    local messages = {}
+    Sync.MSG = Sync.MSG or {}
+    Sync.MSG.CONSUMABLES_EVENT = "CONSUMABLES_EVENT"
+    Sync.MSG.CONSUMABLES_CONFIG = "CONSUMABLES_CONFIG"
+    Sync.IsSafeModeEnabled = function() return false end
+    Sync._EnforceGroupedSessionActive = function() return "RAID" end
+    Sync._SelfId = function() return admin end
+    local coord = profile("writer-fp", admin)
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "writer-fp",
+        profileId = coord._profileId,
+    }
+    SF.LootHelperComm = {
+        Send = function(_, _, msg, payload)
+            messages[#messages + 1] = { msg = msg, event = payload and payload.event }
+            return true
+        end,
+    }
+    assertTrue(select(1, Sync:CommitConsumablesOp(coord, { name = "clear" }, admin, { asAdmin = true })), "the writer fixture clears")
+    local reset = nil
+    for i = 1, #messages do
+        if messages[i].msg == "CONSUMABLES_EVENT" then reset = messages[i].event end
+    end
+    assertEq(reset and reset.writer, admin, "the broadcast reset names the writer")
+    local follow = profile("writer-fp-follow", admin)
+    follow._consumables.generation = 2
+    assertTrue(select(1, S.ApplyRemoteEvent(follow, reset, admin, {
+        coordinatorRelay = true,
+        silent = true,
+    })), "the follower stores the broadcast reset")
+    assertEq(C.Descriptor(coord).archiveFingerprint, C.Descriptor(follow).archiveFingerprint, "the archived reset fingerprint includes the writer")
+
+    local live = profile("writer-fp-live", admin)
+    local id = "ce:writer-live:" .. admin .. ":1"
+    assertTrue(select(1, C.AppendEvent(live, {
+        id = id, type = C.EVENT.RESOLVE, actor = admin, holder = donor, itemId = aqirite,
+        quantity = 1, reason = "Other", generation = 1, timestamp = 1,
+    }, { silent = true })), "a resolve is stored without a writer")
+    local stored = C.EventIndex(live)[id]
+    C.StampOrder(live, stored)
+    assertTrue(C.NoteStoredWriter(live, stored, admin), "the resolve writer is stored after the stamp")
+    local peer = profile("writer-fp-live-peer", admin)
+    assertTrue(select(1, C.AppendEvent(peer, {
+        id = id, type = C.EVENT.RESOLVE, actor = admin, holder = donor, itemId = aqirite,
+        quantity = 1, reason = "Other", generation = 1, timestamp = 1,
+        writer = admin, order = stored.order,
+    }, { silent = true })), "the peer stores the same resolve with its writer")
+    assertEq(C.Descriptor(live).eventFingerprint, C.Descriptor(peer).eventFingerprint, "the live resolve fingerprint includes the writer")
+
+    Sync.state = savedState
+    SF.LootHelperComm = savedComm
+    Sync._EnforceGroupedSessionActive = savedEnforce
+    Sync._SelfId = savedSelf
+    Sync.IsSafeModeEnabled = savedSafe
+end
+checkWriterFingerprint()
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)

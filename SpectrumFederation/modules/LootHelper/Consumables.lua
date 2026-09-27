@@ -1226,6 +1226,29 @@ function C.StampOrder(profile, event)
     return event.order
 end
 
+function C.NoteStoredWriter(profile, event, writer)
+    if type(profile) ~= "table" or type(event) ~= "table" then return false end
+    if type(writer) ~= "string" or writer == "" or #writer > C.MAX_EVENT_NAME then return false end
+    if type(event.writer) == "string" and event.writer ~= "" then return false end
+    local before = BodyToken(event)
+    event.writer = writer
+    local after = BodyToken(event)
+    if before == after then return true end
+    local cfg = profile._consumables
+    if type(cfg) ~= "table" then return true end
+    local oldHash = before and HashText(before, BODY_HASH_BYTES) or 0
+    local newHash = after and HashText(after, BODY_HASH_BYTES) or 0
+    local function remix(field)
+        cfg[field] = Xor32(Xor32(tonumber(cfg[field]) or 0, oldHash), newHash)
+    end
+    if IsLiveRecord(profile, event) then
+        remix("eventFingerprint")
+    elseif IsArchivedRecord(profile, event) then
+        remix("archiveFingerprint")
+    end
+    return true
+end
+
 function C.NextEventId(profile, actor)
     local cfg = C.Ensure(profile)
     cfg.eventSeq = (tonumber(cfg.eventSeq) or 0) + 1
