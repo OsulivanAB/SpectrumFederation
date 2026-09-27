@@ -23,6 +23,9 @@ local EarlyPrep = {
 	SETTING_PATH = "lootHelper.earlyPreparationWhispers",
 	CONSUMER_REASON = "early_preparation",
 	MAX_NOTICE_MEMBERS = 80,
+	-- One slot per comms sender. A sender name comes from the client, so one
+	-- character cannot fill the map by forging other names.
+	MAX_DEFERRED_SENDERS = 40,
 }
 SF.RaidEquipment.EarlyPreparation = EarlyPrep
 
@@ -578,7 +581,7 @@ function EarlyPrep:OnSessionReset(reason)
 	self._windowOpen = false
 	self._wasCoordinator = false
 	self._rejectLogged = {}
-	self._deferredNotice = nil
+	self._deferredNotices = nil
 	local raidCheck = SF.RaidCheck
 	if raidCheck and type(raidCheck.SetBackgroundInspectEnabled) == "function" then
 		raidCheck:SetBackgroundInspectEnabled(false, self.CONSUMER_REASON)
@@ -654,22 +657,34 @@ function EarlyPrep:DeferPrepNotice(sessionId, profileId, sender, prepNotice)
 	if type(profileId) ~= "string" or profileId == "" then
 		return false
 	end
-	local deferred = self._deferredNotice
+	-- Authorization happens later, so a notice with no sender can never be applied.
+	if type(sender) ~= "string" or sender == "" then
+		return false
+	end
+	local deferred = self._deferredNotices
 	if type(deferred) ~= "table" or deferred.sessionId ~= sessionId or deferred.profileId ~= profileId then
 		deferred = {
 			sessionId = sessionId,
 			profileId = profileId,
-			sender = sender,
-			notice = EarlyPrep.NewNotice(),
+			bySender = {},
 		}
-		deferred.notice.sessionId = sessionId
-		deferred.notice.profileId = profileId
-		self._deferredNotice = deferred
+		self._deferredNotices = deferred
 	end
-	if type(sender) == "string" and sender ~= "" then
-		deferred.sender = sender
+	local notice = deferred.bySender[sender]
+	if type(notice) ~= "table" then
+		local count = 0
+		for _ in pairs(deferred.bySender) do
+			count = count + 1
+		end
+		if count >= EarlyPrep.MAX_DEFERRED_SENDERS then
+			return false
+		end
+		notice = EarlyPrep.NewNotice()
+		notice.sessionId = sessionId
+		notice.profileId = profileId
+		deferred.bySender[sender] = notice
 	end
-	EarlyPrep.ApplyNotice(deferred.notice, sessionId, profileId, {
+	EarlyPrep.ApplyNotice(notice, sessionId, profileId, {
 		sessionId = sessionId,
 		profileId = profileId,
 		memberId = prepNotice.memberId,
@@ -680,8 +695,8 @@ function EarlyPrep:DeferPrepNotice(sessionId, profileId, sender, prepNotice)
 end
 
 function EarlyPrep:FlushDeferredPrepNotice()
-	local deferred = self._deferredNotice
-	if type(deferred) ~= "table" then
+	local deferred = self._deferredNotices
+	if type(deferred) ~= "table" or type(deferred.bySender) ~= "table" then
 		return false
 	end
 	local sync = SF.LootHelperSync
@@ -689,23 +704,38 @@ function EarlyPrep:FlushDeferredPrepNotice()
 		or sync.state.sessionId ~= deferred.sessionId
 		or sync.state.profileId ~= deferred.profileId
 	then
-		self._deferredNotice = nil
+		self._deferredNotices = nil
 		return false
 	end
 	local profilePresent = type(sync.FindLocalProfileById) == "function" and sync:FindLocalProfileById(deferred.profileId) ~= nil
-	local authorized = profilePresent and type(sync.IsSenderAuthorized) == "function" and sync:IsSenderAuthorized(deferred.profileId, deferred.sender) == true
-	local decision = EarlyPrep.PrepNoticeSenderState(profilePresent, authorized)
-	if decision == "defer" then
+	if EarlyPrep.PrepNoticeSenderState(profilePresent, false) == "defer" then
 		return false
 	end
-	self._deferredNotice = nil
-	if decision ~= "apply" then
-		return false
+	local pending = {}
+	for sender, notice in pairs(deferred.bySender) do
+		pending[#pending + 1] = {
+			sender = sender,
+			notice = notice,
+		}
 	end
-	return self:ApplyHeartbeat(deferred.sessionId, deferred.profileId, {
-		warned = EarlyPrep.WarnedArray(deferred.notice),
-		raidCheckBegun = deferred.notice.raidCheckBegun == true,
-	})
+	self._deferredNotices = nil
+	local applied = false
+	for i = 1, #pending do
+		local item = pending[i]
+		local authorized = type(sync.IsSenderAuthorized) == "function" and sync:IsSenderAuthorized(deferred.profileId, item.sender) == true
+		if EarlyPrep.PrepNoticeSenderState(true, authorized) == "apply" then
+			local changed = self:ApplyHeartbeat(deferred.sessionId, deferred.profileId, {
+				warned = EarlyPrep.WarnedArray(item.notice),
+				raidCheckBegun = item.notice.raidCheckBegun == true,
+			})
+			if changed then
+				applied = true
+			end
+		else
+			self:NoteReject(item.sender, "unauthorized")
+		end
+	end
+	return applied
 end
 
 function EarlyPrep:AcceptRemotePrepNotice(sender, sessionId, profileId, prepNotice)

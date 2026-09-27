@@ -282,7 +282,7 @@ EarlyPrep:HandlePrepNotice("Stranger-Realm", {
 	memberId = "Bob-Realm",
 })
 assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "unauthorized sender cannot mark a warning")
-assertEq(EarlyPrep._deferredNotice, nil, "a known non-admin notice is not deferred")
+assertEq(EarlyPrep._deferredNotices, nil, "a known non-admin notice is not deferred")
 EarlyPrep:HandlePrepNotice("Admin-Realm", {
 	sessionId = "other-session",
 	profileId = "profile-a",
@@ -375,7 +375,7 @@ assertEq(EarlyPrep.PrepNoticeSenderState(true, false), "reject", "a known non-ad
 assertTrue(not EarlyPrep.ObservationAuthoritative({ blended = true }), "a blended inspect is not authoritative")
 assertTrue(EarlyPrep.ObservationAuthoritative({ status = "ready" }), "an unblended inspect stays authoritative")
 
-EarlyPrep._deferredNotice = nil
+EarlyPrep._deferredNotices = nil
 EarlyPrep.notice = EarlyPrep.NewNotice()
 SF.LootHelperSync.FindLocalProfileById = function()
 	return nil
@@ -398,7 +398,7 @@ assertTrue(EarlyPrep:FlushDeferredPrepNotice(), "the deferred snapshot applies o
 assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "the applied snapshot records Bob")
 assertTrue(EarlyPrep.notice.raidCheckBegun == true, "the applied snapshot keeps raid check begun")
 
-EarlyPrep._deferredNotice = nil
+EarlyPrep._deferredNotices = nil
 EarlyPrep.notice = EarlyPrep.NewNotice()
 SF.LootHelperSync.FindLocalProfileById = function()
 	return nil
@@ -421,6 +421,115 @@ SF.LootHelperSync.IsSenderAuthorized = function(_, _, sender)
 end
 assertTrue(EarlyPrep:FlushDeferredPrepNotice(), "a deferred direct notice applies after import")
 assertTrue(EarlyPrep:WasWarned("Cara-Realm"), "the deferred direct notice records Cara")
+
+EarlyPrep._deferredNotices = nil
+EarlyPrep.notice = EarlyPrep.NewNotice()
+SF.LootHelperSync.FindLocalProfileById = function()
+	return nil
+end
+EarlyPrep:AcceptRemotePrepNotice("Stranger-Realm", "session-a", "profile-a", {
+	warned = { "Bob-Realm" },
+	raidCheckBegun = true,
+})
+EarlyPrep:HandlePrepNotice("Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Cara-Realm",
+})
+assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "a forged deferred warning stays unapplied")
+assertTrue(not EarlyPrep:WasWarned("Cara-Realm"), "an authorized deferred warning stays unapplied until import")
+SF.LootHelperSync.FindLocalProfileById = function()
+	return { id = "profile-a" }
+end
+SF.LootHelperSync.IsSenderAuthorized = function(_, _, sender)
+	return sender == "Admin-Realm"
+end
+assertTrue(EarlyPrep:FlushDeferredPrepNotice(), "flush applies only the authorized sender")
+assertTrue(EarlyPrep:WasWarned("Cara-Realm"), "the authorized sender's warning is applied")
+assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "a non-admin warning is not applied with the authorized sender")
+assertTrue(EarlyPrep.notice.raidCheckBegun ~= true, "a non-admin raid-check flag is not applied with the authorized sender")
+assertEq(EarlyPrep._deferredNotices, nil, "flush drops every deferred sender")
+
+EarlyPrep._deferredNotices = nil
+EarlyPrep.notice = EarlyPrep.NewNotice()
+SF.LootHelperSync.FindLocalProfileById = function()
+	return nil
+end
+EarlyPrep:HandlePrepNotice("Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Cara-Realm",
+})
+EarlyPrep:AcceptRemotePrepNotice("Stranger-Realm", "session-a", "profile-a", {
+	warned = { "Bob-Realm" },
+	raidCheckBegun = true,
+})
+SF.LootHelperSync.FindLocalProfileById = function()
+	return { id = "profile-a" }
+end
+SF.LootHelperSync.IsSenderAuthorized = function(_, _, sender)
+	return sender == "Admin-Realm"
+end
+assertTrue(EarlyPrep:FlushDeferredPrepNotice(), "a later forged notice does not replace the authorized sender")
+assertTrue(EarlyPrep:WasWarned("Cara-Realm"), "the earlier authorized warning still applies")
+assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "the later forged warning stays dropped")
+assertTrue(EarlyPrep.notice.raidCheckBegun ~= true, "the later forged raid-check flag stays dropped")
+
+EarlyPrep._deferredNotices = nil
+EarlyPrep.notice = EarlyPrep.NewNotice()
+SF.LootHelperSync.FindLocalProfileById = function()
+	return nil
+end
+assertTrue(EarlyPrep:DeferPrepNotice("session-a", "profile-a", "Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	warned = { "Bob-Realm" },
+}), "the first notice from a sender is deferred")
+assertTrue(EarlyPrep:DeferPrepNotice("session-a", "profile-a", "Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	raidCheckBegun = true,
+}), "a later notice from the same sender stays on that sender")
+SF.LootHelperSync.FindLocalProfileById = function()
+	return { id = "profile-a" }
+end
+SF.LootHelperSync.IsSenderAuthorized = function(_, _, sender)
+	return sender == "Admin-Realm"
+end
+assertTrue(EarlyPrep:FlushDeferredPrepNotice(), "one authorized sender's own notices merge")
+assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "the sender's earlier warning is kept")
+assertTrue(EarlyPrep.notice.raidCheckBegun == true, "the sender's later raid-check flag is kept")
+
+EarlyPrep._deferredNotices = nil
+SF.LootHelperSync.FindLocalProfileById = function()
+	return nil
+end
+local storedSenders = 0
+for i = 1, EarlyPrep.MAX_DEFERRED_SENDERS do
+	if EarlyPrep:DeferPrepNotice("session-a", "profile-a", string.format("Sender%02d-Realm", i), {
+		sessionId = "session-a",
+		profileId = "profile-a",
+		memberId = "Bob-Realm",
+	}) then
+		storedSenders = storedSenders + 1
+	end
+end
+assertEq(storedSenders, EarlyPrep.MAX_DEFERRED_SENDERS, "deferred senders fit under the cap")
+assertTrue(not EarlyPrep:DeferPrepNotice("session-a", "profile-a", "Overflow-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Cara-Realm",
+}), "a new sender is rejected once the deferred map is full")
+assertTrue(EarlyPrep:DeferPrepNotice("session-a", "profile-a", "Sender01-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	raidCheckBegun = true,
+}), "an existing sender can still update after the cap")
+assertTrue(not EarlyPrep:DeferPrepNotice("session-a", "profile-a", "", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Cara-Realm",
+}), "a notice with no sender is not deferred")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
