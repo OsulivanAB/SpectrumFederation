@@ -3974,6 +3974,12 @@ function checkCodexHeadRound()
     local listenP = profile("review-refresh", admin)
     RT.AccountingProfile = function() return listenP end
     RT.ScanBags = function() end
+    local savedTimer = C_Timer
+    C_Timer = {
+        After = function(_, fn) fn() end,
+        NewTimer = savedTimer and savedTimer.NewTimer,
+        NewTicker = savedTimer and savedTimer.NewTicker,
+    }
     assertTrue(select(1, C.AddCrafter(listenP, admin, vann, { asAdmin = true })), "the review refresh fixture has a Crafter")
     review.IsShown = function() return true end
     rebuilds = 0
@@ -4120,8 +4126,184 @@ function checkCodexHeadRound()
     Sync._SelfId = savedSelfSync
     RT.withdrawIntents = nil
     RT.withdrawIntent = nil
+    C_Timer = savedTimer
 end
 checkCodexHeadRound()
+
+function checkA839ReviewRound()
+    local savedCap = C.MAX_ARCHIVED_EVENTS
+    local savedState = Sync.state
+    local savedGet = SF.GetActiveProfile
+    local savedDb = SF.lootHelperDB
+    local savedFind = Sync.FindLocalProfileById
+    local savedTimer = C_Timer
+    local savedCombat = InCombatLockdown
+    local savedProfile = RT.AccountingProfile
+    local savedScan = RT.ScanBags
+    local savedRebuild = RT.RebuildReview
+    local savedComm = SF.LootHelperComm
+    local savedSame = Sync._SamePlayer
+    local savedSelfSync = Sync._SelfId
+    local savedGroup = Sync.IsRequesterInGroup
+    local savedEnforce = Sync._EnforceGroupedSessionActive
+    C_Timer = {
+        After = function(_, fn) fn() end,
+        NewTimer = savedTimer and savedTimer.NewTimer,
+        NewTicker = savedTimer and savedTimer.NewTicker,
+    }
+
+    C.MAX_ARCHIVED_EVENTS = 2
+    local arch = profile("archive-repair", admin)
+    arch._consumables.generation = 2
+    local idA = "ce:repair:keep:1"
+    local idL = "ce:repair:local:1"
+    local idM = "ce:repair:missing:1"
+    local function archived(id, order)
+        return {
+            id = id, type = C.EVENT.DONATION, actor = admin, itemId = aqirite,
+            quantity = 1, generation = 1, timestamp = 1, order = order,
+        }
+    end
+    assertTrue(select(1, C.AppendEvent(arch, archived(idA, 1), { silent = true })), "the kept archive row is stored")
+    assertTrue(select(1, C.AppendEvent(arch, archived(idL, 2), { silent = true })), "the local-only archive row is stored")
+    assertEq(arch._consumableEventArchive[1].id, idA, "the authoritative row starts at the front of a full archive")
+    Sync.state = { active = true, coordEpoch = 4, sessionId = "repair", coordinator = "Coord-Realm", profileId = arch._profileId }
+    assertTrue(C.MergeSnapshot(arch, {
+        generation = 2, configSeq = 1, crafters = {}, assignments = {},
+        events = { archived(idA, 1), archived(idM, 3) },
+    }, { consumablesFromCoordinator = true }), "the full-archive coordinator snapshot is applied")
+    assertTrue(hasEvent(arch._consumableEventArchive, idA), "a full archive keeps the authoritative row")
+    assertTrue(hasEvent(arch._consumableEventArchive, idM), "a full archive stores the missing authoritative row")
+    assertFalse(hasEvent(arch._consumableEventArchive, idL), "a full archive drops the row the snapshot does not contain")
+    assertTrue(#arch._consumableEventArchive <= 2, "the archive cap still holds")
+    C.MAX_ARCHIVED_EVENTS = savedCap
+
+    local stamped = profile("epoch-replace", admin)
+    stamped._consumables.itemEpochs = { ["999"] = 4, ["4242"] = 1 }
+    assertTrue(select(1, C.ReplaceConfig(stamped, {
+        generation = 1, configSeq = 1, crafters = {}, assignments = {},
+        itemEpochs = { { itemId = 4242, epoch = 2 } },
+    })), "an authoritative watermark array is imported")
+    assertEq(stamped._consumables.itemEpochs["999"], nil, "a local-only watermark is removed")
+    assertEq(stamped._consumables.itemEpochs["4242"], 2, "the snapshot watermark replaces the lower local epoch")
+    local keptEpochs = profile("epoch-omit", admin)
+    keptEpochs._consumables.itemEpochs = { ["999"] = 4 }
+    assertTrue(select(1, C.ReplaceConfig(keptEpochs, {
+        generation = 1, configSeq = 1, crafters = {}, assignments = {},
+    })), "a snapshot without the watermark field is imported")
+    assertEq(keptEpochs._consumables.itemEpochs["999"], 4, "a missing watermark field keeps stored watermarks")
+
+    local review = RT:EnsureReview()
+    local savedShown = review.IsShown
+    local queued = {}
+    local rebuilds = 0
+    C_Timer = {
+        After = function(_, fn) queued[#queued + 1] = fn end,
+        NewTimer = savedTimer and savedTimer.NewTimer,
+        NewTicker = savedTimer and savedTimer.NewTicker,
+    }
+    RT.RebuildReview = function(self, ...)
+        rebuilds = rebuilds + 1
+        return savedRebuild(self, ...)
+    end
+    RT.ScanBags = function() end
+    local burst = profile("review-burst", admin)
+    RT.AccountingProfile = function() return burst end
+    review.IsShown = function() return true end
+    for i = 1, 3 do
+        assertTrue(select(1, C.AppendEvent(burst, {
+            id = "ce:burst:" .. tostring(i),
+            type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1,
+            generation = 1, timestamp = i,
+        })), "burst event " .. tostring(i) .. " is stored")
+    end
+    assertEq(#queued, 1, "a burst of ledger updates schedules one review refresh")
+    queued[1]()
+    assertEq(rebuilds, 1, "that refresh rebuilds the visible review once")
+    InCombatLockdown = function() return true end
+    local queuedBefore = #queued
+    assertTrue(select(1, C.AppendEvent(burst, {
+        id = "ce:burst:combat",
+        type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1,
+        generation = 1, timestamp = 4,
+    })), "a combat ledger event is stored")
+    assertEq(#queued, queuedBefore, "combat does not schedule another review refresh")
+    assertEq(RT.reviewRefreshPending, true, "combat defers the review refresh")
+    InCombatLockdown = savedCombat
+    review.IsShown = savedShown
+
+    RT.AccountingProfile = savedProfile
+    local visible = profile("visible-wait", admin)
+    SF.GetActiveProfile = function() return visible end
+    SF.lootHelperDB = { profiles = {} }
+    Sync.FindLocalProfileById = function() return nil end
+    Sync.state = { active = true, profileId = "missing-session", sessionId = "wait" }
+    assertEq(RT:AccountingProfile(), nil, "accounting waits until the session profile is loaded")
+    visible._profileId = "missing-session"
+    assertTrue(RT:AccountingProfile() == visible, "accounting uses the active profile when it is the session profile")
+
+    load("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
+    local freezeP = profile("freeze-takeover", admin)
+    assertTrue(select(1, C.AddCrafter(freezeP, admin, vann, { asAdmin = true })), "the takeover freeze has a Crafter")
+    assertTrue(select(1, C.AddAssignment(freezeP, admin, aqirite, vann, { asAdmin = true })), "the takeover freeze assigns an item")
+    local epoch = freezeP._consumables.assignments[tostring(aqirite)].epoch
+    local opened = C.FreezeTrade(freezeP, donor, vann, { { itemId = aqirite } }, "trade-" .. vann .. "-9-9")
+    local sends = 0
+    Sync.MSG = Sync.MSG or {}
+    Sync.MSG.CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE"
+    Sync.state = {
+        active = true, isCoordinator = false, coordinator = admin, coordEpoch = 1,
+        sessionId = "freeze-takeover", profileId = freezeP._profileId,
+        peers = { [admin] = { consumablesCapable = true, inGroup = true } },
+    }
+    Sync._SelfId = function() return donor end
+    Sync._SamePlayer = function(_, a, b) return a == b end
+    Sync.IsRequesterInGroup = function() return true end
+    Sync.FindLocalProfileById = function(_, id)
+        if id == freezeP._profileId then return freezeP end
+        return nil
+    end
+    Sync._EnforceGroupedSessionActive = function() return "RAID" end
+    SF.LootHelperComm = { Send = function() sends = sends + 1 return true end }
+    assertTrue(Sync:PublishTradeFreeze(freezeP, opened) == true, "the takeover fixture whispers the freeze")
+    assertTrue(select(1, C.RemoveAssignment(freezeP, admin, aqirite, vann, { asAdmin = true })), "the assignment changes before takeover")
+    local wire = S.TradeFreezePayload(opened)
+    assertFalse(S.RegisterTradeGrant(freezeP, wire, C.Now()), "a new whisper still requires the live assignment")
+    Sync.state.isCoordinator = true
+    Sync.state.coordinator = donor
+    Sync.state.coordEpoch = 2
+    Sync:_FlushPendingTradeFreeze(freezeP)
+    assertTrue(sends >= 1, "takeover rebroadcasts the captured freeze")
+    assertTrue(S.TradeGrantMatches(freezeP, {
+        tradeToken = opened.token,
+        id = opened.token .. ":donation",
+        type = C.EVENT.DONATION,
+        source = "trade",
+        actor = donor,
+        crafter = vann,
+        generation = freezeP._consumables.generation,
+        itemId = aqirite,
+        epoch = epoch,
+    }, vann, C.Now()), "takeover keeps the captured trade grant")
+
+    C.MAX_ARCHIVED_EVENTS = savedCap
+    Sync.state = savedState
+    SF.GetActiveProfile = savedGet
+    SF.lootHelperDB = savedDb
+    Sync.FindLocalProfileById = savedFind
+    C_Timer = savedTimer
+    InCombatLockdown = savedCombat
+    RT.AccountingProfile = savedProfile
+    RT.ScanBags = savedScan
+    RT.RebuildReview = savedRebuild
+    SF.LootHelperComm = savedComm
+    Sync._SamePlayer = savedSame
+    Sync._SelfId = savedSelfSync
+    Sync.IsRequesterInGroup = savedGroup
+    Sync._EnforceGroupedSessionActive = savedEnforce
+    RT.reviewRefreshPending = nil
+end
+checkA839ReviewRound()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

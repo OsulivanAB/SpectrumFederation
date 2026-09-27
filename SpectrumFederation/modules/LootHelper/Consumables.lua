@@ -1812,14 +1812,26 @@ function C.ReplaceConfig(profile, payload)
     end
     PruneRetiredAssignments(cfg)
     if type(payload.itemEpochs) == "table" then
-        local visits = 0
         local cap = C.MAX_ASSIGNMENT_PAIRS * 4
-        for i = 1, #payload.itemEpochs do
-            visits = visits + 1
-            if visits > cap then break end
-            local row = payload.itemEpochs[i]
-            if type(row) == "table" then
-                NoteItemEpoch(cfg, row.itemId, row.epoch)
+        local count = 0
+        local array = true
+        for key in pairs(payload.itemEpochs) do
+            count = count + 1
+            if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then
+                array = false
+                break
+            end
+            if count > cap then break end
+        end
+        if array and (count > cap or count == #payload.itemEpochs) then
+            cfg.itemEpochs = {}
+            local limit = count
+            if limit > cap then limit = cap end
+            for i = 1, limit do
+                local row = payload.itemEpochs[i]
+                if type(row) == "table" then
+                    NoteItemEpoch(cfg, row.itemId, row.epoch)
+                end
             end
         end
     end
@@ -1905,6 +1917,39 @@ local function ReconcileAuthoritativeEvents(profile, events)
     return true
 end
 
+local function PreferEvictableArchiveRows(profile, preserveIds)
+    if type(preserveIds) ~= "table" then return end
+    local archive = ArchiveList(profile)
+    local count = #archive
+    if count == 0 then return end
+    local maxScan = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
+    local limit = count
+    if limit > maxScan then limit = maxScan end
+    local evictable = {}
+    local kept = {}
+    for i = 1, limit do
+        local row = archive[i]
+        local id = type(row) == "table" and row.id or nil
+        if type(id) == "string" and preserveIds[id] then
+            kept[#kept + 1] = row
+        else
+            evictable[#evictable + 1] = row
+        end
+    end
+    if #evictable == 0 then return end
+    local ordered = {}
+    for i = 1, #evictable do
+        ordered[#ordered + 1] = evictable[i]
+    end
+    for i = 1, #kept do
+        ordered[#ordered + 1] = kept[i]
+    end
+    for i = limit + 1, count do
+        ordered[#ordered + 1] = archive[i]
+    end
+    profile._consumableEventArchive = ordered
+end
+
 function C.MergeSnapshot(profile, data, opts)
     C.Ensure(profile)
     if data == nil then return true end
@@ -1960,6 +2005,19 @@ function C.MergeSnapshot(profile, data, opts)
         C.RetainCurrentGeneration(profile)
     end
     local replacedBody = false
+    if fromCoordinator and replace and type(data.events) == "table" then
+        local preserveIds = {}
+        local preserveLimit = #data.events
+        local maxEvents = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
+        if preserveLimit > maxEvents then preserveLimit = maxEvents end
+        for i = 1, preserveLimit do
+            local event = data.events[i]
+            if type(event) == "table" and type(event.id) == "string" and event.id ~= "" then
+                preserveIds[event.id] = true
+            end
+        end
+        PreferEvictableArchiveRows(profile, preserveIds)
+    end
     if type(data.events) == "table" then
         local limit = #data.events
         local maxEvents = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS

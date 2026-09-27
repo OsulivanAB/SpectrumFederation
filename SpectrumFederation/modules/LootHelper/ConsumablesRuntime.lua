@@ -65,7 +65,18 @@ function Runtime:AccountingProfile()
     end
     local sessionProfile = self:ProfileById(state.profileId)
     if not sessionProfile then
-        return active
+        local activeId = nil
+        if type(active) == "table" then
+            if active.GetProfileId then
+                activeId = active:GetProfileId()
+            else
+                activeId = active._profileId
+            end
+        end
+        if activeId == state.profileId then
+            return active
+        end
+        return nil
     end
     local activeId = nil
     if type(active) == "table" then
@@ -1951,14 +1962,29 @@ function Runtime:Init()
         end
     end
     if SF.Consumables and SF.Consumables.RegisterUIListener then
+        local reviewUiQueued = false
         SF.Consumables.RegisterUIListener(function()
             if InCombat() then
                 self.reviewRefreshPending = true
                 return
             end
-            self:RefreshReminder()
-            if self.review and self.review.IsShown and self.review:IsShown() then
-                self:RebuildReview()
+            if reviewUiQueued then return end
+            reviewUiQueued = true
+            local function run()
+                reviewUiQueued = false
+                if InCombat() then
+                    self.reviewRefreshPending = true
+                    return
+                end
+                self:RefreshReminder()
+                if self.review and self.review.IsShown and self.review:IsShown() then
+                    self:RebuildReview()
+                end
+            end
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0, run)
+            else
+                run()
             end
         end)
     end

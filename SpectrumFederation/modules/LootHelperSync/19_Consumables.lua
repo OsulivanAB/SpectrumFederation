@@ -513,10 +513,11 @@ function Sync:_FlushPendingTradeFreeze(profile)
         elseif self.state.isCoordinator then
             local S = Rules()
             local registered = false
+            -- This grant was captured on this client. Takeover must keep it even if the live assignment changed.
             if grant.kind == "withdraw" then
-                registered = S and S.RegisterWithdrawGrant and S.RegisterWithdrawGrant(profile, grant, now)
+                registered = S and S.AcceptCoordinatorWithdrawGrant and S.AcceptCoordinatorWithdrawGrant(profile, grant, now)
             else
-                registered = S and S.RegisterTradeGrant and S.RegisterTradeGrant(profile, grant, now)
+                registered = S and S.AcceptCoordinatorTradeGrant and S.AcceptCoordinatorTradeGrant(profile, grant, now)
             end
             if not registered then
                 table.remove(list, index)
