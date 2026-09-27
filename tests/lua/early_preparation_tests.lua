@@ -343,6 +343,20 @@ EarlyPrep:ApplyHeartbeat("session-a", "profile-a", reannounce.prepNotice)
 assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "a received reannounce records Bob")
 assertTrue(EarlyPrep.notice.raidCheckBegun == true, "a received reannounce records raid check begun")
 
+local fullNotice = EarlyPrep.NewNotice()
+fullNotice.sessionId = "session-a"
+fullNotice.profileId = "profile-a"
+local recorded = 0
+for i = 1, EarlyPrep.MAX_NOTICE_MEMBERS do
+	if EarlyPrep.MarkWarned(fullNotice, string.format("Member%02d-Realm", i)) then
+		recorded = recorded + 1
+	end
+end
+assertEq(recorded, EarlyPrep.MAX_NOTICE_MEMBERS, "warnings fit under the cap")
+assertTrue(not EarlyPrep.WarningRecordable(fullNotice, "Extra-Realm"), "a full warning list cannot record another player")
+assertTrue(not EarlyPrep.MarkWarned(fullNotice, "Extra-Realm"), "the cap rejects another warning")
+assertTrue(EarlyPrep.IsWarned(fullNotice, "Member01-Realm"), "the cap does not drop an existing warning")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
 	os.exit(1)

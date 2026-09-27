@@ -182,6 +182,9 @@ def test_early_preparation_whispers_production_lua():
     evaluate = source.split("function EarlyPrep:EvaluateMember", 1)[1]
     evaluate = evaluate.split("\nfunction ", 1)[0]
     assert evaluate.count(":GetAuthoritativePreparation") == 1
+    record_at = evaluate.index("WarningRecordable")
+    deliver_at = evaluate.index(":DeliverMissingRequirementsWhisper")
+    assert record_at < deliver_at
 
 
 def test_parent_toc_loads_raid_equipment_modules():

@@ -3357,6 +3357,14 @@ function RC:_ApplyCheckConsequences(run)
 				elseif HasBeenWhisperedToday(member, mode) then
 					action = "today"
 				end
+				if action == "send" and sessionDedupe and earlyPrep and earlyPrep.WarningRecordable then
+					if earlyPrep.SyncNoticeToSession then
+						earlyPrep:SyncNoticeToSession()
+					end
+					if not earlyPrep.WarningRecordable(earlyPrep.notice, memberId) then
+						action = "cap"
+					end
+				end
 				if action == "send" then
 					WhisperMissing(memberId, cfg, info.short or ShortName(memberId), whisperPointName, list, mode)
 					entry.whisperedMissing = true
@@ -3366,6 +3374,8 @@ function RC:_ApplyCheckConsequences(run)
 					end
 				elseif action == "session_contacted" then
 					entry.alreadyContacted = true
+				elseif action == "cap" then
+					-- The session warning list is full, so this whisper cannot be recorded.
 				else
 					entry.alreadyWhispered = true
 				end

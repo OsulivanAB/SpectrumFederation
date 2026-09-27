@@ -112,21 +112,27 @@ function EarlyPrep.IsWarned(notice, memberId)
 	return false
 end
 
-function EarlyPrep.MarkWarned(notice, memberId)
+function EarlyPrep.WarningRecordable(notice, memberId)
 	if type(notice) ~= "table" or not EarlyPrep.ValidMemberId(memberId) then
 		return false
 	end
-	notice.warned = notice.warned or {}
 	if EarlyPrep.IsWarned(notice, memberId) then
 		return false
 	end
 	local count = 0
-	for _ in pairs(notice.warned) do
-		count = count + 1
+	if type(notice.warned) == "table" then
+		for _ in pairs(notice.warned) do
+			count = count + 1
+		end
 	end
-	if count >= EarlyPrep.MAX_NOTICE_MEMBERS then
+	return count < EarlyPrep.MAX_NOTICE_MEMBERS
+end
+
+function EarlyPrep.MarkWarned(notice, memberId)
+	if not EarlyPrep.WarningRecordable(notice, memberId) then
 		return false
 	end
+	notice.warned = notice.warned or {}
 	notice.warned[memberId] = true
 	return true
 end
@@ -780,6 +786,10 @@ function EarlyPrep:EvaluateMember(memberId)
 		return false
 	end
 	if type(raidCheck.DeliverMissingRequirementsWhisper) ~= "function" then
+		return false
+	end
+	self:SyncNoticeToSession()
+	if not EarlyPrep.WarningRecordable(self.notice, memberId) then
 		return false
 	end
 	local sent = raidCheck:DeliverMissingRequirementsWhisper(memberId, cfg, result.missing, profile, "pre")
