@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,7 +36,7 @@ def test_consumables_production_lua():
             f"stdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}"
         )
-    assert "0 failed" in result.stdout
+    assert re.search(r"(?m)^\d+ passed, 0 failed$", result.stdout), result.stdout
 
 
 def test_consumables_trade_never_auto_accepts():

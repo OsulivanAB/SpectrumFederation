@@ -3899,6 +3899,40 @@ function checkHeadReviewRound()
     RT.withdrawIntents = nil
     RT.withdrawIntent = nil
     RT.bankSlotBaseline = nil
+
+    local savedArchiveCap = C.MAX_ARCHIVED_EVENTS
+    local savedActorCap = C.MAX_EVENTS_PER_ACTOR
+    C.MAX_ARCHIVED_EVENTS = 3
+    C.MAX_EVENTS_PER_ACTOR = 4
+    local function archivedDonation(id, qty)
+        return {
+            id = id, type = C.EVENT.DONATION, actor = admin, writer = admin,
+            itemId = aqirite, quantity = qty, generation = 1, timestamp = 1, order = qty,
+        }
+    end
+    local trimP = profile("archive-trim", admin)
+    local survivor = profile("archive-survivor", admin)
+    trimP._consumables.generation = 2
+    survivor._consumables.generation = 2
+    local ids = {
+        "ce:archive-trim:1",
+        "ce:archive-trim:2",
+        "ce:archive-trim:3",
+        "ce:archive-trim:4",
+    }
+    for i = 1, 3 do
+        assertEq(select(2, C.AppendEvent(trimP, archivedDonation(ids[i], i), { silent = true })), "archived", "the archive cap fixture stores an older event")
+        assertEq(select(2, C.AppendEvent(survivor, archivedDonation(ids[i + 1], i + 1), { silent = true })), "archived", "the survivor archive stores the rows that should remain")
+    end
+    assertEq(select(2, C.AppendEvent(trimP, archivedDonation(ids[4], 4), { silent = true })), "archived", "one more archived event evicts the oldest")
+    assertEq(#trimP._consumableEventArchive, 3, "a full archive stays at the cap")
+    assertEq(C.EventIndex(trimP)[ids[1]], nil, "the evicted archive id leaves the index")
+    assertEq(type(C.EventIndex(trimP)[ids[4]]), "table", "the newest archived event stays indexed")
+    assertEq(trimP._consumables.archiveFingerprint, survivor._consumables.archiveFingerprint, "evicting the oldest row leaves the same archive fingerprint as storing only the survivors")
+    assertEq(trimP._consumables.archiveCount, 3, "the archive count follows the capped list")
+    assertEq(select(2, C.AppendEvent(trimP, archivedDonation("ce:archive-trim:5", 5), { silent = true })), "archived", "evicting the oldest row frees that writer's archive budget")
+    C.MAX_ARCHIVED_EVENTS = savedArchiveCap
+    C.MAX_EVENTS_PER_ACTOR = savedActorCap
 end
 checkHeadReviewRound()
 

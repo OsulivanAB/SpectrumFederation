@@ -494,6 +494,31 @@ local function ArchiveList(profile)
     return profile._consumableEventArchive
 end
 
+-- XOR is its own inverse, so mixing a stored row again removes it.
+local function ReleaseArchivedRecord(profile, evicted)
+    if type(evicted) ~= "table" then return end
+    local cfg = profile._consumables
+    if type(cfg) == "table" then
+        cfg.archiveFingerprint = MixFingerprint(cfg.archiveFingerprint, evicted.id, evicted.order, evicted)
+    end
+    local bound = EventIds(profile)
+    if type(evicted.id) == "string" and bound.ids[evicted.id] == evicted then
+        bound.ids[evicted.id] = nil
+    end
+    if not ArchiveQuotaExempt(evicted) and type(bound.archiveCounts) == "table" then
+        local key = QuotaBucket(evicted)
+        bound.archiveCounts[key] = math.max(0, (bound.archiveCounts[key] or 1) - 1)
+    end
+end
+
+local function EvictArchivedAt(profile, index)
+    local archive = ArchiveList(profile)
+    if type(index) ~= "number" or index < 1 or index > #archive then return nil end
+    local evicted = table.remove(archive, index)
+    ReleaseArchivedRecord(profile, evicted)
+    return evicted
+end
+
 local function TrimArchive(profile)
     local archive = ArchiveList(profile)
     local overflow = #archive - C.MAX_ARCHIVED_EVENTS
@@ -1124,14 +1149,15 @@ function C.AppendArchivedEvent(profile, event, opts)
     local archive = ArchiveList(profile)
     archive[#archive + 1] = record
     bound.ids[record.id] = record
-    if not TrimArchive(profile) then
-        local cfg = profile._consumables
-        cfg.archiveCount = #profile._consumableEventArchive
-        cfg.archiveFingerprint = MixFingerprint(cfg.archiveFingerprint, record.id, record.order, record)
-        if not exempt then
-            bound.archiveCounts[quotaKey] = (bound.archiveCounts[quotaKey] or 0) + 1
-        end
+    local cfg = profile._consumables
+    cfg.archiveFingerprint = MixFingerprint(cfg.archiveFingerprint, record.id, record.order, record)
+    if not exempt then
+        bound.archiveCounts[quotaKey] = (bound.archiveCounts[quotaKey] or 0) + 1
     end
+    while #archive > C.MAX_ARCHIVED_EVENTS do
+        if not EvictArchivedAt(profile, 1) then break end
+    end
+    cfg.archiveCount = #archive
     if not (opts and opts.silent) then
         Notify()
     end
