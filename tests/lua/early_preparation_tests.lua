@@ -350,6 +350,17 @@ assertTrue(type(reannounce.prepNotice) == "table", "reannounce payload includes 
 assertEq(reannounce.prepNotice.warned[1], "Bob-Realm", "reannounce snapshot includes Bob")
 assertTrue(reannounce.prepNotice.raidCheckBegun == true, "reannounce snapshot includes raid check begun")
 
+local sessionStart = { sessionId = "session-a", profileId = "profile-a" }
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+EarlyPrep.notice.raidCheckBegun = true
+EarlyPrep:AttachToPayload(sessionStart)
+assertTrue(sessionStart.prepNotice and sessionStart.prepNotice.raidCheckBegun == true, "session start payload includes raid check begun")
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep:ApplyHeartbeat("session-a", "profile-a", sessionStart.prepNotice)
+assertTrue(EarlyPrep.notice.raidCheckBegun == true, "a received session start records raid check begun")
+
 EarlyPrep.notice = EarlyPrep.NewNotice()
 EarlyPrep:ApplyHeartbeat("session-a", "profile-a", reannounce.prepNotice)
 assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "a received reannounce records Bob")

@@ -642,6 +642,12 @@ function Sync:BroadcastSessionStart()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    -- A Raid Check can begin during admin convergence, before this announcement.
+    -- Peers must see that snapshot even if the coordinator never sends a heartbeat.
+    local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
+        earlyPrepAttach:AttachToPayload(payload)
+    end
 
     if SF.Debug then
         local helpersCount = type(chosenHelpers) == "table" and #chosenHelpers or 0

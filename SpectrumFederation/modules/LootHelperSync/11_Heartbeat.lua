@@ -86,6 +86,10 @@ function Sync:HandleSessionStart(sender, payload)
     if self._NoteAdvertisedCoordinator then
         self:_NoteAdvertisedCoordinator(payload.coordinator)
     end
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if type(payload.prepNotice) == "table" and earlyPrep and earlyPrep.AcceptRemotePrepNotice then
+        earlyPrep:AcceptRemotePrepNotice(sender, payload.sessionId, payload.profileId, payload.prepNotice)
+    end
     self:_PersistSessionState("HandleSessionStart")
 
     if type(payload.safeMode) == "table" then

@@ -172,6 +172,12 @@ def test_early_preparation_whispers_production_lua():
     reannounce = (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "14_HandlersControl.lua"
     ).read_text(encoding="utf-8")
+    session_start = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "09_AdminConvergence.lua"
+    ).read_text(encoding="utf-8")
+    session_start_handler = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "11_Heartbeat.lua"
+    ).read_text(encoding="utf-8")
     assert 'consumerId = "equipment page"' in equipment
     assert "EarlyPrep.ConsumerId" in raid_check or "opts.consumerId" in raid_check
     assert "SessionAnnouncedForDedupe" in raid_check
@@ -182,6 +188,13 @@ def test_early_preparation_whispers_production_lua():
     heartbeat_fn = reannounce.split("function Sync:HandleSessionHeartbeat", 1)[1]
     heartbeat_fn = heartbeat_fn.split("\nfunction ", 1)[0]
     assert "AcceptRemotePrepNotice" in heartbeat_fn
+    start_fn = session_start.split("function Sync:BroadcastSessionStart", 1)[1]
+    start_fn = start_fn.split("\nfunction ", 1)[0]
+    assert start_fn.index("AttachToPayload") < start_fn.index("SES_START")
+    start_handler = session_start_handler.split("function Sync:HandleSessionStart", 1)[1]
+    start_handler = start_handler.split("\nfunction ", 1)[0]
+    assert "AcceptRemotePrepNotice" in start_handler
+    assert start_handler.index("AcceptRemotePrepNotice") < start_handler.index('_PersistSessionState("HandleSessionStart")')
     assert "ApplySesStartSendResult" in public_api
     assert "entry.blended" in raid_check
     evaluate = source.split("function EarlyPrep:EvaluateMember", 1)[1]
