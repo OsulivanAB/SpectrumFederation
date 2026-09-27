@@ -161,10 +161,44 @@ state = resetQueue({
 	{ key = "guid-a", guid = "guid-a", id = "A-Realm", source = "background" },
 })
 state.backgroundInspectEnabled = true
+state.backgroundInspectConsumers = { equipment = {} }
 inspects = 0
 RC:_ProcessInspectQueue()
 assertEq(inspects, 1, "an enabled background scan still calls NotifyInspect once")
 assertTrue(state.active ~= nil, "an enabled background scan becomes the active inspect")
+
+RC:SetBackgroundInspectEnabled(false, "equipment", { consumerId = "equipment" })
+RC:SetBackgroundInspectEnabled(true, "early_preparation", {
+	filter = function(info)
+		return info and info.id == "Profile-Realm"
+	end,
+})
+RC:SetBackgroundInspectEnabled(true, "equipment page shown", { consumerId = "equipment page" })
+state = resetQueue({
+	{ key = "stranger", guid = "guid-a", id = "Stranger-Realm", source = "background" },
+	{ key = "profile", guid = "guid-a", id = "Profile-Realm", source = "background" },
+	{ key = "ad-keep", id = "Other-Realm", source = "adhoc" },
+})
+inspects = 0
+RC:SetBackgroundInspectEnabled(false, "equipment page hidden", { consumerId = "equipment page" })
+assertEq(countSource(state.queue, "background"), 1, "a filtered sole consumer drops the rest of a whole-raid queue")
+assertEq(state.queue[1] and state.queue[1].id, "Profile-Realm", "the filtered consumer keeps its own queued member")
+assertEq(countSource(state.queue, "adhoc"), 1, "hiding the equipment page keeps a queued ad-hoc scan")
+assertEq(state.queued.stranger, nil, "a non-profile background scan clears its queued flag")
+assertEq(state.queued.profile, true, "a profile background scan keeps its queued flag")
+assertEq(inspects, 0, "hiding the equipment page does not inspect the leftover queue")
+assertTrue(state.backgroundInspectEnabled == true, "early preparation keeps background inspection enabled")
+
+state = resetQueue({
+	{ key = "stranger", guid = "guid-a", id = "Stranger-Realm", source = "background" },
+	{ key = "profile", guid = "guid-a", id = "Profile-Realm", source = "background" },
+})
+state.backgroundInspectEnabled = true
+inspects = 0
+RC:_ProcessInspectQueue()
+assertEq(inspects, 1, "the processor issues only the member the remaining filter wants")
+assertEq(state.active and state.active.id, "Profile-Realm", "the issued scan is the profile member")
+assertEq(state.queued.stranger, nil, "the processor clears the rejected member")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

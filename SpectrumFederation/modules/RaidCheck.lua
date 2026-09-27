@@ -1144,6 +1144,9 @@ function RC:SetBackgroundInspectEnabled(enabled, reason, opts)
 	end
 
 	if state.backgroundInspectEnabled == any then
+		-- A removed unfiltered consumer can leave a whole-raid queue behind a
+		-- filtered one. Drop entries that consumer no longer wants.
+		self:_PruneQueuedBackgroundInspects(false)
 		if enabled then
 			self:_RunBackgroundInspectPass()
 		end
@@ -1164,9 +1167,25 @@ function RC:SetBackgroundInspectEnabled(enabled, reason, opts)
 	end
 end
 
+function RC:_QueuedBackgroundInspectWanted(item)
+	if type(item) ~= "table" or item.source ~= "background" then
+		return true
+	end
+	local state = self:_GetInspectState()
+	if not state.backgroundInspectEnabled then
+		return false
+	end
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	if not earlyPrep or type(earlyPrep.ConsumerWantsUnit) ~= "function" then
+		return true
+	end
+	return earlyPrep.ConsumerWantsUnit(state.backgroundInspectConsumers, { id = item.id }) and true or false
+end
+
 -- Pending background scans belong to the shared consumer flag. Once the last
 -- consumer is gone, those queue entries must not keep calling NotifyInspect.
-function RC:_DiscardQueuedBackgroundInspects()
+-- While a consumer remains, drop only the entries its filter no longer wants.
+function RC:_PruneQueuedBackgroundInspects(dropAll)
 	local state = self:_GetInspectState()
 	local queue = state.queue
 	if type(queue) ~= "table" then
@@ -1181,7 +1200,8 @@ function RC:_DiscardQueuedBackgroundInspects()
 	for i = head, #queue do
 		local item = queue[i]
 		if type(item) == "table" and item.key then
-			if item.source == "background" then
+			local drop = item.source == "background" and (dropAll or not self:_QueuedBackgroundInspectWanted(item))
+			if drop then
 				if type(state.queued) == "table" then
 					state.queued[item.key] = nil
 				end
@@ -1196,6 +1216,10 @@ function RC:_DiscardQueuedBackgroundInspects()
 		state.queueHead = 1
 	end
 	return removed
+end
+
+function RC:_DiscardQueuedBackgroundInspects()
+	return self:_PruneQueuedBackgroundInspects(true)
 end
 
 function RC:_IsInspectPausedForManual(now)
@@ -2178,9 +2202,9 @@ function RC:_ProcessInspectQueue()
 			state.queued[item.key] = nil
 		end
 
-		local backgroundStopped = item and item.source == "background" and not state.backgroundInspectEnabled
-		if backgroundStopped or (state.adhocRun and item and item.source ~= "adhoc") then
-			-- Drop background work once no consumer still wants it, and drop
+		local backgroundUnwanted = item and item.source == "background" and not self:_QueuedBackgroundInspectWanted(item)
+		if backgroundUnwanted or (state.adhocRun and item and item.source ~= "adhoc") then
+			-- Drop background work no remaining consumer wants, and drop
 			-- non-adhoc work while an ad-hoc check owns the inspect pipeline.
 		else
 			local unit = item and FindUnitByGuidOrId(item.guid, item.id) or nil
