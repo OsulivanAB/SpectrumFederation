@@ -916,11 +916,13 @@ local function FrameMock()
     function frame:CreateFontString() return FrameMock() end
     return frame
 end
-function CreateFrame(_, _, _, template)
+function CreateFrame(_, _, parent, template)
+    local frame = FrameMock()
+    frame.parent = parent
     if type(template) == "string" and template:find("SecureActionButtonTemplate", 1, true) then
         secureTemplates[#secureTemplates + 1] = template
     end
-    return FrameMock()
+    return frame
 end
 UIParent = {}
 function InCombatLockdown() return false end
@@ -983,17 +985,28 @@ assertEq(#secureTemplates, 0, "opening the review during combat does not create 
 assertTrue(RT.review ~= nil, "the non-secure review frame can still be created during combat")
 assertTrue(RT.mobileButtonPending == true, "the banking button waits until combat ends")
 RT.review.scripts.OnDragStart(RT.review)
-RT.review.scripts.OnDragStop(RT.review)
 assertEq(RT.review.startedMoving, nil, "dragging the review during combat does not start moving")
-assertEq(RT.review.stoppedMoving, nil, "releasing the review during combat does not stop moving")
 function InCombatLockdown() return false end
 RT.review.scripts.OnDragStart(RT.review)
-RT.review.scripts.OnDragStop(RT.review)
 assertEq(RT.review.startedMoving, 1, "dragging the review out of combat starts moving")
-assertEq(RT.review.stoppedMoving, 1, "releasing the review out of combat stops moving")
+function InCombatLockdown() return true end
+RT.review.scripts.OnDragStop(RT.review)
+assertEq(RT.review.stoppedMoving, 1, "releasing a drag that started before combat still stops moving")
+function InCombatLockdown() return false end
+RT.review.scripts.OnDragStop(RT.review)
+assertEq(RT.review.stoppedMoving, 2, "releasing the review out of combat stops moving")
 local mobile = RT:EnsureMobileButton()
 assertTrue(mobile ~= nil, "the banking button is created once combat ends")
 assertEq(#secureTemplates, 1, "the secure button is created only outside combat")
+assertTrue(mobile.parent == RT.review, "the secure banking button is a child of the review")
+mobile.shownCalls = 0
+mobile.SetShown = function(self)
+    self.shownCalls = (self.shownCalls or 0) + 1
+end
+function InCombatLockdown() return true end
+RT.review.scripts.OnHide()
+assertEq(mobile.shownCalls, 0, "closing the review during combat does not show or hide the secure button")
+function InCombatLockdown() return false end
 
 local archiveCap = C.MAX_LEDGER_EVENTS
 C.MAX_LEDGER_EVENTS = 1
@@ -1375,6 +1388,19 @@ Sync.state = {
     coordinator = "Old-Realm",
     coordEpoch = 1,
 }
+Sync._catchNowSaved = Sync._Now
+catchNow = 2000
+Sync._Now = function() return catchNow end
+Sync:_ConsiderConsumablesCatchUp({
+    profileId = catchP._profileId,
+    sessionId = "catch-session",
+    coordinator = "Old-Realm",
+    consumablesGeneration = 1,
+    consumablesConfigSeq = 3,
+    consumablesEventCount = 0,
+})
+assertEq(#snapshotReasons, 0, "a new config difference waits before requesting a snapshot")
+catchNow = 2015
 Sync:_ConsiderConsumablesCatchUp({
     profileId = catchP._profileId,
     sessionId = "catch-session",
@@ -1404,7 +1430,19 @@ Sync:_ConsiderConsumablesCatchUp({
     consumablesConfigSeq = 1,
     consumablesEventCount = 0,
 })
+assertEq(#snapshotReasons, firstCatch, "a new coordinator epoch waits before requesting again")
+catchNow = 2030
+Sync:_ConsiderConsumablesCatchUp({
+    profileId = catchP._profileId,
+    sessionId = "catch-session",
+    coordinator = admin,
+    consumablesGeneration = 1,
+    consumablesConfigSeq = 1,
+    consumablesEventCount = 0,
+})
 assertTrue(#snapshotReasons > firstCatch, "a new coordinator epoch can request config catch-up again")
+Sync._Now = Sync._catchNowSaved
+Sync._catchNowSaved = nil
 S.NoteCoordinatorWatermark(catchP, 1, 8, 1)
 Sync:HandleConsumablesConfig(admin, {
     sessionId = "catch-session",
@@ -2225,7 +2263,19 @@ local function checkConvergenceRound()
     local nowCfg = 1000
     Sync._Now = function() return nowCfg end
     Sync:_ConsiderConsumablesCatchUp(cfgPayload)
-    assertEq(cfgCalls, 1, "a config difference asks for a snapshot")
+    assertEq(cfgCalls, 0, "a new config difference waits before asking for a snapshot")
+    cfgP._consumables.configSeq = 4
+    cfgPayload.consumablesConfigSeq = 6
+    Sync:_ConsiderConsumablesCatchUp(cfgPayload)
+    assertEq(cfgCalls, 0, "a config-only ledger match also waits before requesting a snapshot")
+    cfgP._consumables.configSeq = 5
+    cfgPayload.consumablesConfigSeq = 0
+    nowCfg = 1014
+    Sync:_ConsiderConsumablesCatchUp(cfgPayload)
+    assertEq(cfgCalls, 0, "the config snapshot waits through the grace period")
+    nowCfg = 1015
+    Sync:_ConsiderConsumablesCatchUp(cfgPayload)
+    assertEq(cfgCalls, 1, "a config difference asks for a snapshot after the grace period")
     assertEq(cfgP._consumablesConfigCatchUpSession, nil, "a snapshot request that is not registered does not latch")
     assertEq(cfgP._consumablesConfigCatchUpAt, nil, "a snapshot request that is not registered does not record an attempt")
     assertEq(cfgOpts and cfgOpts.coordinatorOnly, true, "the config snapshot asks only the coordinator")
@@ -2233,18 +2283,19 @@ local function checkConvergenceRound()
     Sync:_ConsiderConsumablesCatchUp(cfgPayload)
     assertEq(cfgCalls, 2, "the next heartbeat retries the config snapshot")
     assertTrue(type(cfgP._consumablesConfigCatchUpSession) == "string", "a registered config snapshot latches that coordinator epoch")
-    assertEq(cfgP._consumablesConfigCatchUpAt, 1000, "a registered config snapshot records the attempt time")
+    assertEq(cfgP._consumablesConfigCatchUpAt, 1015, "a registered config snapshot records the attempt time")
     Sync:_ConsiderConsumablesCatchUp(cfgPayload)
-    nowCfg = 1119
+    nowCfg = 1134
     Sync:_ConsiderConsumablesCatchUp(cfgPayload)
     assertEq(cfgCalls, 2, "a latched config snapshot is not requested again inside the cooldown")
-    nowCfg = 1120
+    nowCfg = 1135
     Sync:_ConsiderConsumablesCatchUp(cfgPayload)
     assertEq(cfgCalls, 3, "a latched config snapshot is requested again after 120 seconds")
-    assertEq(cfgP._consumablesConfigCatchUpAt, 1120, "the retry records the new attempt time")
+    assertEq(cfgP._consumablesConfigCatchUpAt, 1135, "the retry records the new attempt time")
     cfgP._consumables.configSeq = 0
     Sync:_ConsiderConsumablesCatchUp(cfgPayload)
     assertEq(cfgP._consumablesConfigCatchUpAt, nil, "a matching configuration clears the attempt time")
+    assertEq(cfgP._consumablesConfigDiffSince, nil, "a matching configuration clears the grace timer")
     assertEq(cfgCalls, 3, "a matching configuration does not request another snapshot")
     Sync._Now = savedNow
 
@@ -2867,7 +2918,10 @@ local function checkCodexRound()
     end
     Sync._consumablesCatchUpKey = nil
     left._consumablesConfigCatchUpSession = nil
-    Sync:_ConsiderConsumablesCatchUp({
+    local savedFpNow = Sync._Now
+    local fpNow = 50
+    Sync._Now = function() return fpNow end
+    local fpPayload = {
         coordinator = "Coord-Realm",
         profileId = left._profileId,
         sessionId = "config-fp",
@@ -2876,8 +2930,13 @@ local function checkCodexRound()
         consumablesEventCount = 0,
         consumablesEventFingerprint = leftDesc.eventFingerprint,
         consumablesConfigFingerprint = rightDesc.configFingerprint,
-    })
+    }
+    Sync:_ConsiderConsumablesCatchUp(fpPayload)
+    assertEq(#configCalls, 0, "a new config fingerprint waits before requesting a snapshot")
+    fpNow = 65
+    Sync:_ConsiderConsumablesCatchUp(fpPayload)
     assertEq(configCalls[1] and configCalls[1].reason, "consumables-config", "a config fingerprint fork requests configuration")
+    Sync._Now = savedFpNow
     assertEq(configCalls[1] and configCalls[1].coordinatorOnly, true, "that configuration request goes to the coordinator")
     Sync.FindLocalProfileById = savedFind
     Sync.RequestProfileSnapshot = savedRequest
@@ -4868,6 +4927,86 @@ function checkReviewHeadRound()
     SF.GetActiveProfile = savedProfile
 end
 checkReviewHeadRound()
+
+function checkTradeRangeAndAnnounce()
+    local seenRange = nil
+    C.RevalidateDonation = function(_, line, ctx)
+        seenRange = ctx and ctx.inRange and ctx.inRange[line.recipient]
+        return true
+    end
+    RT.RecipientInRange = function() return true end
+    RT.GroupUnit = function() return "raid1" end
+    local started = false
+    InitiateTrade = function()
+        started = true
+    end
+    local collected = { inRange = { ["Crafter-Realm"] = false }, profile = {} }
+    RT:BeginTrade({ itemId = aqirite, quantity = 1, recipient = "Crafter-Realm" }, collected)
+    assertEq(seenRange, true, "a trade click revalidates the Crafter's current range")
+    assertEq(collected.inRange["Crafter-Realm"], true, "the captured review range is updated before revalidation")
+    assertTrue(started, "a Crafter who is in range now can be traded with")
+
+    local order = {}
+    local savedState = Sync.state
+    local savedFind = Sync.FindLocalProfileById
+    local savedEnforce = Sync._EnforceGroupedSessionActive
+    local savedComm = SF.LootHelperComm
+    local savedBroadcast = Sync.BroadcastConsumablesConfig
+    local savedFlush = Sync._FlushUnsentConsumablesEvents
+    load("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua")
+    load("SpectrumFederation/modules/LootHelperSync/18_PublicAPI.lua")
+    local announced = profile("announce-cfg", admin)
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        sessionId = "announce-session",
+        profileId = announced._profileId,
+        coordinator = admin,
+        coordEpoch = 1,
+        helpers = {},
+    }
+    Sync.cfg = Sync.cfg or {}
+    Sync.MSG = Sync.MSG or {}
+    Sync.MSG.SES_START = Sync.MSG.SES_START or "SES_START"
+    Sync.MSG.SES_REANNOUNCE = Sync.MSG.SES_REANNOUNCE or "SES_REANNOUNCE"
+    Sync._EnforceGroupedSessionActive = function() return "RAID" end
+    Sync.FindLocalProfileById = function() return announced end
+    Sync._RefreshAdvertisedAuthorMax = function() end
+    Sync.ComputeAuthorWindowSummary = function() return {} end
+    Sync._RefreshOutstandingRequestTargets = function() end
+    Sync._GetSessionSafeModePayload = function() return nil end
+    Sync._MarkRosterAnnounced = function() end
+    Sync._PersistSessionState = function() end
+    Sync.EnsureHeartbeatSender = function() end
+    Sync.RunAfter = function() end
+    Sync.IsSessionSafeModeEnabled = function() return false end
+    Sync._Now = function() return 10 end
+    Sync._SelfId = function() return admin end
+    Sync.IsSenderAuthorized = function() return true end
+    Sync.BroadcastConsumablesConfig = function()
+        order[#order + 1] = "config"
+    end
+    Sync._FlushUnsentConsumablesEvents = function()
+        order[#order + 1] = "flush"
+    end
+    SF.LootHelperComm = {
+        Send = function() return true end,
+    }
+    Sync:BroadcastSessionStart()
+    assertEq(order[1], "config", "session start broadcasts configuration before queued events")
+    assertEq(order[2], "flush", "session start still flushes queued events")
+    order = {}
+    Sync:ReannounceSession()
+    assertEq(order[1], "config", "a reannounce broadcasts configuration before queued events")
+    assertEq(order[2], "flush", "a reannounce still flushes queued events")
+    Sync.state = savedState
+    Sync.FindLocalProfileById = savedFind
+    Sync._EnforceGroupedSessionActive = savedEnforce
+    SF.LootHelperComm = savedComm
+    Sync.BroadcastConsumablesConfig = savedBroadcast
+    Sync._FlushUnsentConsumablesEvents = savedFlush
+end
+checkTradeRangeAndAnnounce()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

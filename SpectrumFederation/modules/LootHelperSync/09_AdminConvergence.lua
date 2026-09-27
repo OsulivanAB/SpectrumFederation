@@ -685,6 +685,9 @@ function Sync:BroadcastSessionStart()
     if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
         local announcedProfile = self:FindLocalProfileById(profileId)
         if announcedProfile then
+            if self.BroadcastConsumablesConfig then
+                self:BroadcastConsumablesConfig(announcedProfile)
+            end
             self:_FlushUnsentConsumablesEvents(announcedProfile)
         end
     end

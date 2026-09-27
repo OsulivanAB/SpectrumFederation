@@ -1232,6 +1232,10 @@ function Sync:ReannounceSession()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    local announcedProfile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if announcedProfile and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(announcedProfile)
+    end
     if self._AttachConsumablesDescriptor then
         self:_AttachConsumablesDescriptor(payload, profileId)
     end

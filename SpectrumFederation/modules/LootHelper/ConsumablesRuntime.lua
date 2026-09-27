@@ -788,7 +788,6 @@ function Runtime:EnsureReview()
         selfFrame:StartMoving()
     end)
     frame:SetScript("OnDragStop", function(selfFrame)
-        if InCombat() then return end
         selfFrame:StopMovingOrSizing()
     end)
     frame:SetScript("OnHide", function()
@@ -837,13 +836,7 @@ function Runtime:EnsureMobileButton()
         return nil
     end
     self.mobileButtonPending = nil
-    local mobileParent = self.mobileParent
-    if not mobileParent then
-        mobileParent = CreateFrame("Frame", "SpectrumFederationRaidSuppliesMobile", UIParent)
-        mobileParent:SetSize(1, 1)
-        self.mobileParent = mobileParent
-    end
-    local mobile = CreateFrame("Button", nil, mobileParent, "SecureActionButtonTemplate,UIPanelButtonTemplate")
+    local mobile = CreateFrame("Button", nil, frame, "SecureActionButtonTemplate,UIPanelButtonTemplate")
     mobile:SetSize(160, 22)
     mobile:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 16, 14)
     mobile:SetText("Mobile Banking")
@@ -1067,6 +1060,9 @@ end
 function Runtime:BeginTrade(line, collected)
     local C = SF.Consumables
     local have = (self.bagCounts and self.bagCounts[line.itemId]) or 0
+    if type(collected) == "table" and type(collected.inRange) == "table" and line and line.recipient then
+        collected.inRange[line.recipient] = self:RecipientInRange(line.recipient)
+    end
     local ok, err = C.RevalidateDonation(collected.profile, line, {
         inGroup = collected.inGroup,
         compatible = collected.compatible,

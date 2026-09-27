@@ -35,6 +35,33 @@ local function SessionFor(profile)
     return ProfileIdOf(profile) == Sync.state.profileId
 end
 
+local CONFIG_CATCHUP_GRACE = 15
+
+local function LedgerMatches(localDesc, remote)
+    localDesc = localDesc or {}
+    remote = remote or {}
+    local remoteEvents = tonumber(remote.eventCount)
+    if remoteEvents and remoteEvents ~= (tonumber(localDesc.eventCount) or 0) then
+        return false
+    end
+    local remoteFingerprint = tonumber(remote.eventFingerprint)
+    local localFingerprint = tonumber(localDesc.eventFingerprint)
+    if remoteFingerprint and localFingerprint and remoteFingerprint ~= localFingerprint then
+        return false
+    end
+    local remoteArchive = tonumber(remote.archiveCount)
+    if remoteArchive and remoteArchive ~= (tonumber(localDesc.archiveCount) or 0) then
+        return false
+    end
+    local remoteArchiveFingerprint = tonumber(remote.archiveFingerprint)
+    local localArchiveFingerprint = tonumber(localDesc.archiveFingerprint)
+    if remoteArchiveFingerprint and localArchiveFingerprint
+        and remoteArchiveFingerprint ~= localArchiveFingerprint then
+        return false
+    end
+    return true
+end
+
 function Sync:_ConsumablesCoordinatorAccepts()
     if not (self.state and self.state.active) then return true end
     if self.state.isCoordinator then return true end
@@ -337,10 +364,17 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     local nowCfg = self._Now and self:_Now() or 0
     if not configDiffers then
         profile._consumablesConfigCatchUpAt = nil
+        profile._consumablesConfigDiffSince = nil
+        profile._consumablesConfigDiffAuthority = nil
+    elseif profile._consumablesConfigDiffAuthority ~= authority or not tonumber(profile._consumablesConfigDiffSince) then
+        profile._consumablesConfigDiffAuthority = authority
+        profile._consumablesConfigDiffSince = nowCfg
     end
+    local diffSince = tonumber(profile._consumablesConfigDiffSince)
+    local graceOver = diffSince and (nowCfg - diffSince) >= CONFIG_CATCHUP_GRACE
     local catchUpAt = tonumber(profile._consumablesConfigCatchUpAt)
     local configRetryDue = (not catchUpAt) or catchUpAt > nowCfg or (nowCfg - catchUpAt) >= 120
-    if configDiffers and (profile._consumablesConfigCatchUpSession ~= authority or configRetryDue) then
+    if configDiffers and graceOver and (profile._consumablesConfigCatchUpSession ~= authority or configRetryDue) then
         local requested = false
         if self.RequestProfileSnapshot then
             requested = self:RequestProfileSnapshot("consumables-config", { coordinatorOnly = true }) and true or false
@@ -352,6 +386,9 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         end
     end
     if not S.NeedsCatchUp(localDesc, remote) then
+        return
+    end
+    if configDiffers and LedgerMatches(localDesc, remote) and not graceOver then
         return
     end
     local fingerprintOnly = S.CatchUpKind and S.CatchUpKind(localDesc, remote) == "fingerprint"
