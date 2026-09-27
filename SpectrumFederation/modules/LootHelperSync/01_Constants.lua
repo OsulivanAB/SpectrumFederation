@@ -47,4 +47,7 @@ Sync.MSG = {
     -- Raid Check minimum item level (config-only; not a profile snapshot)
     RAID_CHECK_ILVL_REQ = "RAID_CHECK_ILVL_REQ",
     RAID_CHECK_ILVL_SET = "RAID_CHECK_ILVL_SET",
+
+    -- Session-scoped missing-requirements warning dedupe. Not profile history.
+    PREP_NOTICE = "PREP_NOTICE",
 }

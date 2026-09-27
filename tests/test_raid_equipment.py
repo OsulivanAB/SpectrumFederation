@@ -17,6 +17,8 @@ RANGED_OFFHAND_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_ranged_offh
 RUN_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_run_tests.lua"
 FRESH_SNAPSHOT_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_fresh_snapshot_tests.lua"
 STABILITY_TESTS = REPO_ROOT / "tests" / "lua" / "raid_equipment_stability_tests.lua"
+EARLY_PREP_TESTS = REPO_ROOT / "tests" / "lua" / "early_preparation_tests.lua"
+EARLY_PREP = REPO_ROOT / "SpectrumFederation" / "modules" / "RaidEquipment" / "EarlyPreparation.lua"
 PRESENCE_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_presence_tests.lua"
 ITEM_LEVEL_CONFIG_TESTS = REPO_ROOT / "tests" / "lua" / "raid_check_item_level_config_tests.lua"
 GLANCE_TESTS = REPO_ROOT / "tests" / "lua" / "roster_glance_tests.lua"
@@ -133,6 +135,29 @@ def test_roster_glance_production_lua():
 def test_raid_equipment_auto_refresh_defaults_off():
     schema = SCHEMA.read_text(encoding="utf-8")
     assert "raidCheckAuditAutoRefresh = false" in schema
+
+
+def test_early_preparation_whispers_production_lua():
+    _run_lua(EARLY_PREP_TESTS, "Early Preparation")
+    source = EARLY_PREP.read_text(encoding="utf-8")
+    raid_check = (REPO_ROOT / "SpectrumFederation" / "modules" / "RaidCheck.lua").read_text(encoding="utf-8")
+    routing = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "13_Routing.lua"
+    ).read_text(encoding="utf-8")
+    parent = PARENT_TOC.read_text(encoding="utf-8")
+    assert "C_Timer" not in source
+    assert "CreateFrame" not in source
+    assert "NotifyInspect(" not in source
+    assert "Policy.EvaluateObservation" in raid_check
+    assert "PREP_NOTICE" in routing
+    assert "modules/RaidEquipment/EarlyPreparation.lua" in parent
+    assert parent.index("modules/RaidCheck.lua") < parent.index("modules/RaidEquipment/EarlyPreparation.lua")
+    consequences = raid_check.split("function RC:_ApplyCheckConsequences", 1)[1]
+    consequences = consequences.split("\nfunction RC:_TryReleaseCheckConsequences", 1)[0]
+    unprepared, prepared = consequences.split("elseif classId == CheckRun.CLASS.PREPARED then", 1)
+    assert "WasWarned" in unprepared
+    assert "WasWarned" not in prepared
+    assert "WhisperPrepared" in prepared
 
 
 def test_parent_toc_loads_raid_equipment_modules():

@@ -679,6 +679,10 @@ function Sync:BroadcastSessionStart()
         return
     end
     self:_MarkRosterAnnounced(self.state.sessionId)
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("session_announced")
+    end
 
     -- Start coordinator heartbeat sender (ticker)
     self:EnsureHeartbeatSender("BroadcastSessionStart")

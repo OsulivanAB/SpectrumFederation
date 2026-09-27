@@ -173,6 +173,11 @@ function Sync:HandleSessionStart(sender, payload)
     end)
 
     self:TouchPeer(sender, { inGroup = true })
+
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("session_start")
+    end
 end
 
 -- Function Handle session end announcement (SES_END).

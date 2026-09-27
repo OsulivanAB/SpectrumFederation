@@ -30,7 +30,7 @@ A real empty slot is not the same as unresolved equipment. Missing item links, u
 
 Open **Raid Equipment** to review the current group. The page works with no loot profile and no Loot Helper session. It shows each visible member, Blizzard's overall equipped item level, the last known item in each tracked slot, and pulsing indicators for missing items, required enchants, empty sockets, or a missing limited gem. When an active profile has a minimum item level and the player's known item level is below it, the iLvl value itself pulses red. The rest of the row does not. With no active profile, or with the requirement disabled, item level is shown with no threshold warning.
 
-**Enable Auto Refresh** is off by default and is stored as `lootHelper.raidCheckAuditAutoRefresh`. It does not require a profile. Use **Refresh Snapshot** for a short manual inspect pass. Background inspection runs only while this page is open and auto refresh or a manual refresh window is active.
+**Enable Auto Refresh** is off by default and is stored as `lootHelper.raidCheckAuditAutoRefresh`. It does not require a profile. Use **Refresh Snapshot** for a short manual inspect pass. Raid Equipment background inspection runs while this page is open and auto refresh or a manual refresh window is active. Early Preparation Whispers can keep the same shared inspect pipeline running while that page is closed. Turning one of those consumers off does not stop inspection the other one still needs.
 
 Equipment observations are runtime-only. `/reload` clears them. Older SavedVariables equipment snapshots, if present, stay on disk and are not used.
 
@@ -87,9 +87,19 @@ A later out-of-range state does not rewrite Inspection Failed into Unprepared.
 
 ## Whispers
 
-Whispers are disabled by default and are configured on **Loot Helper → Session**. They do not control the admin system-message summary.
+Profile whisper toggles are disabled by default and are configured on **Loot Helper → Session**. They do not control the admin system-message summary.
 
-Templates support `{player_name}`, `{missing}`, `{point_name}`, and `{points_awarded}`. `{missing}` is the shared list of failed requirements, including item level when that requirement fails. Default missing-result templates refer to requirements rather than only enchants and gems. A template an admin already customized is left unchanged. Missing-requirement whispers are suppressed for the same check type on the same calendar day. Inspection Failed does not send a missing-gear whisper.
+Templates support `{player_name}`, `{missing}`, `{point_name}`, and `{points_awarded}`. `{missing}` is the shared list of failed requirements, including item level when that requirement fails. Default missing-result templates refer to requirements rather than only enchants and gems. A template an admin already customized is left unchanged. With no active Loot Helper session, missing-requirement whispers are suppressed for the same check type on the same calendar day. During an announced session, Early Preparation, Pre-Raid Check, and Raid Check share one missing-requirements warning per profile member for that session. A prepared or point-award whisper is separate and is not suppressed by that warning. Inspection Failed does not send a missing-gear whisper.
+
+## Early Preparation Whispers
+
+**Enable Early Preparation Whispers** is a local setting on **Loot Helper → Session**. It defaults to on, including when an older saved settings database has no value for it. It is not stored on the loot profile and is not synchronized as profile data.
+
+While you are the coordinator of an announced Loot Helper session, and no Raid Check has successfully started for that session, Spectrum inspects profile members who are in the raid. A complete, current observation that the shared preparation policy classifies as Unprepared sends the Pre-Raid Check missing-requirements whisper. That send does not depend on **Enable Whispers During… → Pre-Raid Check**. Prepared players, incomplete inspects, and stale observations do not send a whisper.
+
+The warning is recorded only after it is sent. Other admins learn about it through a session notice and the coordinator heartbeat, so a later coordinator does not whisper that player again. A new session starts with a clear warning list. Pre-Raid Check does not stop the background scan. The first Raid Check that successfully begins for the session does, and the scan stays off for the rest of that session. Combat pauses new inspect acquisition the same way Raid Check does; it does not by itself turn Early Preparation off or relax the complete-observation rule.
+
+Early Preparation does not award points, Attendance, or Reward Pot changes, and it does not write a Raid Check presence log.
 
 ## What gets recorded
 

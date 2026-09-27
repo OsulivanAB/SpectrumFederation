@@ -1,0 +1,313 @@
+-- Production-Lua tests for Early Preparation whisper decisions, session dedupe, and inspect consumers.
+-- Run from the repository root: lua5.1 tests/lua/early_preparation_tests.lua
+
+local failures = 0
+local passes = 0
+
+local function fail(message)
+	failures = failures + 1
+	io.stderr:write("FAIL: " .. message .. "\n")
+end
+
+local function pass(message)
+	passes = passes + 1
+	io.stdout:write("ok: " .. message .. "\n")
+end
+
+local function assertTrue(cond, message)
+	if cond then
+		pass(message)
+	else
+		fail(message)
+	end
+end
+
+local function assertEq(actual, expected, message)
+	if actual == expected then
+		pass(message)
+	else
+		fail(string.format("%s (expected %s, got %s)", message, tostring(expected), tostring(actual)))
+	end
+end
+
+local SF = {}
+assert(loadfile("SpectrumFederation/modules/Settings/Schema.lua"))("SpectrumFederation", SF)
+assert(loadfile("SpectrumFederation/modules/RaidEquipment/EarlyPreparation.lua"))("SpectrumFederation", SF)
+
+local EarlyPrep = SF.RaidEquipment.EarlyPreparation
+local openCtx = {
+	settingEnabled = true,
+	sessionActive = true,
+	announced = true,
+	isCoordinator = true,
+	isEffectiveAdmin = true,
+	profileReady = true,
+	raidCheckBegun = false,
+	eligible = true,
+	inRaid = true,
+	fresh = true,
+	complete = true,
+	prepared = false,
+	alreadyWarned = false,
+}
+
+assertEq(SF.SettingsSchema.DEFAULTS.lootHelper.earlyPreparationWhispers, true, "schema default is enabled")
+assertTrue(EarlyPrep.IsSettingEnabled(nil), "missing saved value is enabled")
+assertTrue(EarlyPrep.IsSettingEnabled(true), "explicit true stays enabled")
+assertTrue(not EarlyPrep.IsSettingEnabled(false), "explicit false stays disabled")
+
+local open, why = EarlyPrep.WindowOpen(openCtx)
+assertTrue(open, "window is open for an announced coordinator")
+assertEq(why, "open", "open window reason")
+
+local closed = {}
+for key, value in pairs(openCtx) do
+	closed[key] = value
+end
+closed.announced = false
+open, why = EarlyPrep.WindowOpen(closed)
+assertTrue(not open, "unannounced session does not open the window")
+assertEq(why, "announced", "unannounced reason")
+
+closed.announced = true
+closed.isCoordinator = false
+open, why = EarlyPrep.WindowOpen(closed)
+assertTrue(not open, "non-coordinator does not scan")
+assertEq(why, "coordinator", "coordinator reason")
+
+closed.isCoordinator = true
+closed.settingEnabled = false
+assertTrue(not EarlyPrep.WindowOpen(closed), "disabled setting keeps the window closed")
+
+closed.settingEnabled = true
+closed.isEffectiveAdmin = false
+open, why = EarlyPrep.WindowOpen(closed)
+assertTrue(not open, "preview or lost admin fails closed")
+assertEq(why, "admin", "admin reason")
+
+closed.isEffectiveAdmin = true
+closed.raidCheckBegun = true
+closed.inCombat = true
+open, why = EarlyPrep.WindowOpen(closed)
+assertTrue(not open, "raid check begun closes the window")
+assertEq(why, "raid_check", "raid check reason")
+
+local combatOpen = {}
+for key, value in pairs(openCtx) do
+	combatOpen[key] = value
+end
+combatOpen.inCombat = true
+assertTrue(EarlyPrep.WindowOpen(combatOpen), "combat does not close the window")
+
+local send, sendWhy = EarlyPrep.ShouldWarn(openCtx)
+assertTrue(send, "complete unprepared observation may whisper")
+assertEq(sendWhy, "send", "send reason")
+
+local prepared = {}
+for key, value in pairs(openCtx) do
+	prepared[key] = value
+end
+prepared.prepared = true
+send, sendWhy = EarlyPrep.ShouldWarn(prepared)
+assertTrue(not send, "prepared observation does not whisper")
+assertEq(sendWhy, "prepared", "prepared reason")
+
+local incomplete = {}
+for key, value in pairs(openCtx) do
+	incomplete[key] = value
+end
+incomplete.complete = false
+send, sendWhy = EarlyPrep.ShouldWarn(incomplete)
+assertTrue(not send, "incomplete observation does not whisper")
+assertEq(sendWhy, "incomplete", "incomplete reason")
+
+local stale = {}
+for key, value in pairs(openCtx) do
+	stale[key] = value
+end
+stale.fresh = false
+send, sendWhy = EarlyPrep.ShouldWarn(stale)
+assertTrue(not send, "stale observation does not whisper")
+assertEq(sendWhy, "stale", "stale reason")
+
+local noticed = EarlyPrep.NewNotice()
+assertTrue(EarlyPrep.BindNotice(noticed, "session-a", "profile-a"), "first bind adopts the session")
+assertTrue(EarlyPrep.MarkWarned(noticed, "Bob-Realm"), "first unprepared result is recorded")
+assertTrue(EarlyPrep.IsWarned(noticed, "Bob-Realm"), "recorded member is warned")
+assertTrue(not EarlyPrep.MarkWarned(noticed, "Bob-Realm"), "second unprepared result does not record again")
+
+local later = {}
+for key, value in pairs(openCtx) do
+	later[key] = value
+end
+later.alreadyWarned = true
+assertTrue(not EarlyPrep.ShouldWarn(later), "already warned member is not whispered again")
+
+assertTrue(not EarlyPrep.BindNotice(noticed, "session-a", "profile-a"), "same session keeps warning state")
+assertTrue(EarlyPrep.IsWarned(noticed, "Bob-Realm"), "coordinator change on the same session keeps warnings")
+assertTrue(EarlyPrep.BindNotice(noticed, "session-b", "profile-a"), "new session id resets warnings")
+assertTrue(not EarlyPrep.IsWarned(noticed, "Bob-Realm"), "new session can warn again")
+
+local dedupe = EarlyPrep.NewNotice()
+EarlyPrep.BindNotice(dedupe, "session-a", "profile-a")
+local accepted, changed = EarlyPrep.ApplyNotice(dedupe, "session-a", "profile-a", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Bob-Realm",
+})
+assertTrue(accepted and changed, "authorized matching notice records Bob")
+accepted, changed = EarlyPrep.ApplyNotice(dedupe, "session-a", "profile-a", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Bob-Realm",
+	raidCheckBegun = false,
+})
+assertTrue(accepted and not changed, "duplicate and false raid-begun notice are harmless")
+accepted, changed = EarlyPrep.ApplyNotice(dedupe, "session-a", "profile-a", {
+	sessionId = "session-old",
+	profileId = "profile-a",
+	memberId = "Cara-Realm",
+})
+assertTrue(not accepted and not changed, "stale session notice is ignored")
+assertTrue(not EarlyPrep.IsWarned(dedupe, "Cara-Realm"), "stale notice did not warn Cara")
+accepted, changed = EarlyPrep.ApplyNotice(dedupe, "session-a", "profile-a", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	warned = { "Cara-Realm", "Bob-Realm" },
+	raidCheckBegun = true,
+})
+assertTrue(accepted and changed, "snapshot adds Cara and raid check begun")
+assertTrue(EarlyPrep.IsWarned(dedupe, "Cara-Realm"), "snapshot warned Cara")
+assertTrue(dedupe.raidCheckBegun, "raid check begun sticks")
+accepted, changed = EarlyPrep.ApplyNotice(dedupe, "session-a", "profile-a", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	raidCheckBegun = false,
+	warned = {},
+})
+assertTrue(accepted and not changed, "later empty snapshot does not clear warnings or raid check")
+assertTrue(dedupe.raidCheckBegun, "raid check begun stays set")
+assertTrue(EarlyPrep.IsWarned(dedupe, "Bob-Realm"), "empty snapshot does not unwarn Bob")
+
+assertTrue(not EarlyPrep.ShouldNoteRaidCheckBegun("pre", { expectedSessionId = "session-a" }), "pre-raid check does not stop early preparation")
+assertTrue(not EarlyPrep.ShouldNoteRaidCheckBegun("raid", { sessionMismatch = true, expectedSessionId = "session-a" }), "mismatched raid check does not stop the session")
+assertTrue(not EarlyPrep.ShouldNoteRaidCheckBegun("raid", {}), "raid check without a session id does not stop early preparation")
+assertTrue(EarlyPrep.ShouldNoteRaidCheckBegun("raid", { expectedSessionId = "session-a" }), "matching raid check start stops early preparation")
+
+local session = { active = true, announced = true, sessionId = "session-a", profileId = "profile-a" }
+local matchingRun = { expectedSessionId = "session-a", expectedSessionProfileId = "profile-a" }
+assertTrue(EarlyPrep.SessionDedupeApplies(matchingRun, session), "matching announced session uses session dedupe")
+local quiet = { active = false, announced = false, sessionId = nil }
+assertTrue(not EarlyPrep.SessionDedupeApplies(matchingRun, quiet), "no session keeps the day-based fallback")
+assertTrue(not EarlyPrep.SessionDedupeApplies({ expectedSessionId = "session-a", sessionMismatch = true }, session), "mismatched run does not use this session's dedupe")
+
+assertEq(EarlyPrep.MissingWhisperAction({
+	whispersEnabled = true,
+	sessionDedupe = true,
+	alreadyWarned = true,
+	alreadyToday = false,
+}), "session_contacted", "session dedupe suppresses a second missing whisper")
+assertEq(EarlyPrep.MissingWhisperAction({
+	whispersEnabled = true,
+	sessionDedupe = true,
+	alreadyWarned = false,
+	alreadyToday = true,
+}), "send", "a new session warning is not blocked by an older same-day whisper")
+assertEq(EarlyPrep.MissingWhisperAction({
+	whispersEnabled = true,
+	sessionDedupe = false,
+	alreadyWarned = false,
+	alreadyToday = true,
+}), "today", "no-session checks keep the calendar-day fallback")
+assertTrue(not EarlyPrep.PreparedWhisperSuppressedByMissingWarning(true), "prepared whispers stay independent")
+
+local consumers = {}
+local any = false
+for _ = 1, 100 do
+	consumers, any = EarlyPrep.MutateConsumers(consumers, "equipment page", true, {})
+	consumers, any = EarlyPrep.MutateConsumers(consumers, "early_preparation", true, {
+		filter = function()
+			return false
+		end,
+	})
+	consumers, any = EarlyPrep.MutateConsumers(consumers, "equipment page", false)
+end
+local count = 0
+for _ in pairs(consumers) do
+	count = count + 1
+end
+assertEq(count, 1, "repeated enable and disable leaves one consumer")
+assertTrue(any, "early preparation consumer still requires inspection")
+assertTrue(not EarlyPrep.ConsumerWantsUnit(consumers, { id = "Eve-Realm" }), "filtered consumer skips non-matching units")
+consumers, any = EarlyPrep.MutateConsumers(consumers, "equipment page", true, {})
+assertTrue(EarlyPrep.ConsumerWantsUnit(consumers, { id = "Eve-Realm" }), "equipment page consumer still inspects the whole group")
+consumers, any = EarlyPrep.MutateConsumers(consumers, "equipment page", false)
+consumers, any = EarlyPrep.MutateConsumers(consumers, "early_preparation", false)
+assertTrue(not any, "disabling the last consumer stops shared inspection")
+assertEq(next(consumers), nil, "consumer map is empty after the last disable")
+
+SF.LootHelperSync = {
+	state = { active = true, sessionId = "session-a", profileId = "profile-a", isCoordinator = false },
+	IsSessionActive = function()
+		return true
+	end,
+	GetSessionId = function()
+		return "session-a"
+	end,
+	GetSessionProfileId = function()
+		return "profile-a"
+	end,
+	HasAnnouncedCurrentSession = function()
+		return true
+	end,
+	IsSenderAuthorized = function(_, profileId, sender)
+		return profileId == "profile-a" and sender == "Admin-Realm"
+	end,
+}
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep:HandlePrepNotice("Stranger-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Bob-Realm",
+})
+assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "unauthorized sender cannot mark a warning")
+EarlyPrep:HandlePrepNotice("Admin-Realm", {
+	sessionId = "other-session",
+	profileId = "profile-a",
+	memberId = "Bob-Realm",
+})
+assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "wrong session notice is ignored")
+EarlyPrep:HandlePrepNotice("Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Bob-Realm",
+})
+assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "authorized admin notice marks Bob")
+EarlyPrep:HandlePrepNotice("Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Bob-Realm",
+})
+assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "duplicate authorized notice stays marked once")
+
+local refreshes = 0
+SF.RaidCheck = {
+	SetBackgroundInspectEnabled = function()
+		refreshes = refreshes + 1
+	end,
+}
+SF.SettingsStore = {
+	Get = function()
+		return false
+	end,
+}
+for _ = 1, 50 do
+	EarlyPrep:Refresh("test")
+end
+assertTrue(refreshes <= 50, "inactive refresh stays bounded")
+assertTrue(not EarlyPrep._windowOpen, "disabled setting leaves the window closed")
+
+io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
+if failures > 0 then
+	os.exit(1)
+end

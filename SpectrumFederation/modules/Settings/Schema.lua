@@ -19,6 +19,8 @@ SF.SettingsSchema = {
 			localSafeMode = false,
 			localSafeModeOnCombat = false,
 			raidCheckAuditAutoRefresh = false,
+			-- Missing values merge to true so existing users start enabled.
+			earlyPreparationWhispers = true,
 
 			-- Profile system
 			activeProfileId = nil,

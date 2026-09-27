@@ -69,6 +69,13 @@ function Sync:BroadcastSessionHeartbeat(opts)
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.HeartbeatPayload then
+        local prepNotice = earlyPrep:HeartbeatPayload()
+        if type(prepNotice) == "table" then
+            payload.prepNotice = prepNotice
+        end
+    end
 
     -- Session end uses ALERT so this heartbeat stays ahead of SES_END.
     -- Different AceComm priorities can be delivered out of send order.

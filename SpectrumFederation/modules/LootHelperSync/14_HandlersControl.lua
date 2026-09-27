@@ -532,6 +532,14 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         self:_ApplyAdvertisedRCConfig(payload)
     end
 
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.ApplyHeartbeat then
+        earlyPrep:ApplyHeartbeat(payload.sessionId, payload.profileId, payload.prepNotice)
+    end
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("heartbeat")
+    end
+
     -- Heartbeat bookkeeping. An unproven catch-up coordinator does not extend
     -- the takeover clock after the descriptor that adopted them.
     self.state.heartbeat = self.state.heartbeat or {}

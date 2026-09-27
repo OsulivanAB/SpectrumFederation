@@ -45,6 +45,7 @@ function Sync:_PersistSessionState(reason)
         persisted.coordinator = nil
         persisted.coordEpoch = nil
         persisted.helpers = nil
+        persisted.prepNotice = nil
         return
     end
 
@@ -54,6 +55,10 @@ function Sync:_PersistSessionState(reason)
     persisted.coordinator = self.state.coordinator
     persisted.coordEpoch = tonumber(self.state.coordEpoch)
     persisted.helpers = CopyStringArray(self.state.helpers)
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.WritePersisted then
+        earlyPrep:WritePersisted(persisted)
+    end
 
     if SF.Debug then
         SF.Debug:Verbose("SYNC", "Persisted active session state (reason=%s, sessionId=%s, profileId=%s, coordinator=%s)",
@@ -118,6 +123,10 @@ function Sync:TryRestorePersistedSession(reason)
         self.state.rcConfigSeq = (restoredProfile and tonumber(restoredProfile._rcConfigSeq)) or 0
     end
     self.state.helpers = CopyStringArray(persisted.helpers)
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.RestorePersisted then
+        earlyPrep:RestorePersisted(persisted)
+    end
     self.state.authorMax = {}
     self.state.authorWindowSummary = {}
     self.state._sentJoinStatusForSessionId = nil
@@ -864,6 +873,11 @@ end
 -- @param reason string|nil Human-readable reason for reset.
 -- @return nil
 function Sync:_ResetSessionState(reason)
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.OnSessionReset then
+        earlyPrep:OnSessionReset(reason)
+    end
+
     if SF.Debug then
         local outstandingReqCount = 0
         if type(self.state.requests) == "table" then
@@ -1132,6 +1146,11 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self.state.coordinator = me
     self.state.isCoordinator = true
 
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("takeover")
+    end
+
     -- Ensure strictly increasing epoch
     local newEpoch = self:_Now()
     if newEpoch <= oldEpoch then
@@ -1248,6 +1267,10 @@ function Sync:ReannounceSession()
     -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
     self.state._sessionAnnounced = self.state.sessionId
     self:_MarkRosterAnnounced(self.state.sessionId)
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("session_reannounced")
+    end
 
     -- Start/re-ensure coordinator heartbeat sender (ticker)
     self:EnsureHeartbeatSender("ReannounceSession")

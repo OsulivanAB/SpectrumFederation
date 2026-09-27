@@ -57,6 +57,7 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
         if msgType == self.MSG.RC_CONFIG_SET then return self:HandleRCConfigSet(sender, payload) end
         if msgType == self.MSG.RAID_CHECK_ILVL_REQ then return self:HandleRaidCheckItemLevelRequest(sender, payload) end
         if msgType == self.MSG.RAID_CHECK_ILVL_SET then return self:HandleRaidCheckItemLevelSet(sender, payload) end
+        if msgType == self.MSG.PREP_NOTICE then return self:HandlePrepNotice(sender, payload) end
         
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Unknown CONTROL message type (msgType=%s, sender=%s, dist=%s)",
