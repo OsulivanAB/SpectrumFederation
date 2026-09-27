@@ -1222,7 +1222,10 @@ function Runtime:OnTradeAccept(playerAccepted, targetAccepted)
     if tonumber(playerAccepted) == 1 and tonumber(targetAccepted) == 1 then
         self:CaptureTargetSlots()
         open.both = true
+        return
     end
+    open.both = false
+    open.target = {}
 end
 
 -- luacheck: globals ERR_TRADE_BAG_FULL ERR_TRADE_TARGET_BAG_FULL ERR_TRADE_MAX_COUNT_EXCEEDED
@@ -1805,12 +1808,16 @@ end
 
 function Runtime:MaybeAutoReview()
     if self.autoReviewedThisOpen then return end
-    self.autoReviewedThisOpen = true
-    if not self:RemindersEnabled() then return end
+    if not self:RemindersEnabled() then
+        self.autoReviewedThisOpen = true
+        return
+    end
     local C = SF.Consumables
     local Routing = SF.ConsumablesRouting
+    if not C or not Routing then return end
     local collected = self:Collect()
-    if not C or not Routing or not collected then return end
+    if not collected then return end
+    self.autoReviewedThisOpen = true
     if C.IsCrafter(collected.profile, self:SelfId()) then return end
     local carries = false
     for i = 1, #collected.plan.lines do
@@ -1850,6 +1857,9 @@ function Runtime:OnEvent(event, arg1, arg2)
         if self.reviewRefreshPending then
             self.reviewRefreshPending = nil
             self:RefreshReminder()
+            if self.bankOpen then
+                self:MaybeAutoReview()
+            end
             if self.review and self.review:IsShown() then
                 self:RebuildReview()
             end
@@ -1977,6 +1987,9 @@ function Runtime:Init()
                     return
                 end
                 self:RefreshReminder()
+                if self.bankOpen then
+                    self:MaybeAutoReview()
+                end
                 if self.review and self.review.IsShown and self.review:IsShown() then
                     self:RebuildReview()
                 end

@@ -1823,12 +1823,20 @@ function C.ReplaceConfig(profile, payload)
                             pairsLeft = pairsLeft - 1
                         end
                     end
-                    cfg.assignments[ItemKey(itemId)] = {
-                        itemId = itemId,
-                        epoch = tonumber(row.epoch) or 1,
-                        crafters = crafters,
-                        history = CopyHistory(row.history),
-                    }
+                    local epoch = tonumber(row.epoch)
+                    if row.epoch == nil then
+                        epoch = 1
+                    elseif not epoch or epoch < 1 or epoch ~= math.floor(epoch) or epoch > C.MAX_EVENT_SEQ then
+                        epoch = nil
+                    end
+                    if epoch then
+                        cfg.assignments[ItemKey(itemId)] = {
+                            itemId = itemId,
+                            epoch = epoch,
+                            crafters = crafters,
+                            history = CopyHistory(row.history),
+                        }
+                    end
                 end
             end
         end
@@ -2041,6 +2049,7 @@ function C.MergeSnapshot(profile, data, opts)
         end
         PreferEvictableArchiveRows(profile, preserveIds)
     end
+    local deferred = nil
     if type(data.events) == "table" then
         local limit = #data.events
         local maxEvents = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
@@ -2051,6 +2060,12 @@ function C.MergeSnapshot(profile, data, opts)
                 replaceBody = fromCoordinator and replace,
             })
             if status == "replaced" then replacedBody = true end
+            if fromCoordinator and replace and (status == "full" or status == "quota") then
+                deferred = deferred or {}
+                if #deferred < C.MAX_LEDGER_EVENTS then
+                    deferred[#deferred + 1] = data.events[i]
+                end
+            end
         end
     end
     if replacedBody then RebuildIndex(profile) end
@@ -2059,6 +2074,18 @@ function C.MergeSnapshot(profile, data, opts)
         C.ReplaceConfig(profile, data)
         if fromCoordinator and type(data.events) == "table" then
             ReconcileAuthoritativeEvents(profile, data.events)
+        end
+        if fromCoordinator and type(deferred) == "table" then
+            local retryLimit = #deferred
+            if retryLimit > C.MAX_LEDGER_EVENTS then retryLimit = C.MAX_LEDGER_EVENTS end
+            for i = 1, retryLimit do
+                local _, status = C.AppendEvent(profile, deferred[i], {
+                    silent = true,
+                    replaceBody = true,
+                })
+                if status == "replaced" then replacedBody = true end
+            end
+            if replacedBody then RebuildIndex(profile) end
         end
         if adoptSession then
             profile._consumablesConfigAdoptedSession = adoptSession

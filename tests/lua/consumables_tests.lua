@@ -4482,6 +4482,202 @@ function checkSnapshotServeLimit()
 end
 checkSnapshotServeLimit()
 
+function checkCodexSnapshotRound()
+    local savedCollect = RT.Collect
+    local savedShow = RT.ShowReview
+    local savedCrafter = C.IsCrafter
+    local savedPath = R.HasActionablePath
+    local savedRemind = RT.RemindersEnabled
+    local shown = false
+    local collects = 0
+    RT.autoReviewedThisOpen = false
+    RT.RemindersEnabled = function() return true end
+    RT.ShowReview = function() shown = true end
+    C.IsCrafter = function() return false end
+    R.HasActionablePath = function() return true end
+    RT.Collect = function()
+        collects = collects + 1
+        if collects == 1 then return nil end
+        return { profile = {}, plan = { lines = { { quantity = 1 } } }, usable = true }
+    end
+    RT:MaybeAutoReview()
+    assertFalse(RT.autoReviewedThisOpen, "a bank visit stays unreviewed until a profile can be evaluated")
+    assertFalse(shown, "the review stays closed while the session profile is missing")
+    RT:MaybeAutoReview()
+    assertTrue(RT.autoReviewedThisOpen, "the visit is reviewed once a profile can be evaluated")
+    assertTrue(shown, "the automatic review opens after the session profile arrives")
+    RT.Collect = savedCollect
+    RT.ShowReview = savedShow
+    C.IsCrafter = savedCrafter
+    R.HasActionablePath = savedPath
+    RT.RemindersEnabled = savedRemind
+    RT.autoReviewedThisOpen = false
+
+    local open = { both = false, target = {} }
+    RT.openTrade = open
+    local savedLink = GetTradeTargetItemLink
+    local savedInfo = GetTradeTargetItemInfo
+    GetTradeTargetItemLink = function(slot)
+        if slot == 1 then return "item:" .. tostring(aqirite) end
+        return nil
+    end
+    GetTradeTargetItemInfo = function(slot)
+        if slot == 1 then return nil, nil, 4 end
+        return nil, nil, 0
+    end
+    RT:OnTradeAccept(1, 1)
+    assertTrue(open.both, "both sides accepting captures the trade")
+    assertEq(open.target[aqirite], 4, "the first acceptance records the offered quantity")
+    RT:OnTradeAccept(1, 0)
+    assertFalse(open.both, "clearing one acceptance forgets that both sides accepted")
+    assertEq(open.target[aqirite], nil, "clearing acceptance drops the captured offer")
+    GetTradeTargetItemInfo = function(slot)
+        if slot == 1 then return nil, nil, 2 end
+        return nil, nil, 0
+    end
+    RT:OnTradeAccept(1, 1)
+    assertTrue(open.both, "the next acceptance can capture the trade again")
+    assertEq(open.target[aqirite], 2, "the next acceptance records the new quantity")
+    RT.openTrade = nil
+    GetTradeTargetItemLink = savedLink
+    GetTradeTargetItemInfo = savedInfo
+
+    local savedLedger = C.MAX_LEDGER_EVENTS
+    C.MAX_LEDGER_EVENTS = 1
+    local fullP = profile("full-same-gen", admin)
+    local extraId = "ce:full-extra:other:1"
+    local missingId = "ce:full-missing:other:1"
+    assertTrue(select(1, C.AppendEvent(fullP, {
+        id = extraId, type = C.EVENT.DONATION, actor = "Other-Realm", writer = "Other-Realm",
+        itemId = aqirite, quantity = 1, generation = 1, timestamp = 1, order = 1,
+    }, { silent = true })), "the full ledger holds one local extra")
+    assertTrue(C.MergeSnapshot(fullP, {
+        generation = 1, configSeq = fullP._consumables.configSeq, crafters = {}, assignments = {},
+        events = {
+            { id = missingId, type = C.EVENT.DONATION, actor = "Other-Realm", writer = "Other-Realm",
+              itemId = aqirite, quantity = 1, generation = 1, timestamp = 2, order = 2 },
+        },
+    }, { consumablesFromCoordinator = true }), "the same-generation snapshot is applied")
+    assertTrue(hasEvent(fullP._consumableEvents, missingId), "reconciliation makes room for the missing authoritative row")
+    assertFalse(hasEvent(fullP._consumableEvents, extraId), "the local extra is not kept after reconciliation")
+    C.MAX_LEDGER_EVENTS = savedLedger
+
+    local epochP = profile("epoch-import", admin)
+    C.ReplaceConfig(epochP, {
+        generation = 1,
+        configSeq = 1,
+        assignments = {
+            ["10"] = { itemId = aqirite, epoch = 0, crafters = { vann } },
+            ["11"] = { itemId = 4242, epoch = 1.5, crafters = { vann } },
+            ["12"] = { itemId = 4243, epoch = 2, crafters = { vann } },
+        },
+    })
+    assertTrue(epochP._consumables.assignments[tostring(aqirite)] == nil, "a zero assignment epoch is not stored")
+    assertTrue(epochP._consumables.assignments["4242"] == nil, "a fractional assignment epoch is not stored")
+    assertEq(epochP._consumables.assignments["4243"].epoch, 2, "a positive whole assignment epoch is stored")
+
+    local savedClock = C._clock
+    local now = 2000
+    C._clock = function() return now end
+    local freezeP = profile("freeze-unsent", admin)
+    local savedState = Sync.state
+    local savedComm = SF.LootHelperComm
+    local sends = 0
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = nil,
+        sessionId = "freeze-session",
+        profileId = freezeP._profileId,
+    }
+    SF.LootHelperComm = { Send = function() sends = sends + 1 return true end }
+    Sync.MSG = Sync.MSG or {}
+    Sync.MSG.CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE"
+    local published = Sync:PublishTradeFreeze(freezeP, {
+        token = "trade-" .. vann .. "-1",
+        donor = admin,
+        receiver = vann,
+        generation = 1,
+        items = { [aqirite] = { itemId = aqirite, epoch = 1, assignedToReceiver = true } },
+    })
+    assertFalse(published, "a freeze without a coordinator is not sent")
+    now = 2120
+    Sync.state.coordinator = "Coord-Realm"
+    Sync.state.peers = { ["Coord-Realm"] = { consumablesCapable = true } }
+    Sync:_FlushPendingTradeFreeze(freezeP)
+    assertEq(sends, 0, "a freeze that was never sent expires from the time it was captured")
+    C._clock = savedClock
+    Sync.state = savedState
+    SF.LootHelperComm = savedComm
+
+    local archiveP = profile("archive-resend", admin)
+    local archivedId = "ce:archive-resend:" .. admin .. ":1"
+    archiveP._consumableEventArchive = {
+        { id = archivedId, type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+          quantity = 1, generation = 1, timestamp = 1, order = 4 },
+    }
+    C.InvalidateEventIndex(archiveP)
+    local localArchive = C.Descriptor(archiveP).archiveFingerprint
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "Coord-Realm",
+        sessionId = "archive-resend",
+        profileId = archiveP._profileId,
+        peers = { ["Coord-Realm"] = { consumablesCapable = true } },
+    }
+    Sync.FindLocalProfileById = function() return archiveP end
+    local savedSafe = Sync.IsSafeModeEnabled
+    local savedRequest = Sync.RequestProfileSnapshot
+    Sync.IsSafeModeEnabled = function() return true end
+    Sync.RequestProfileSnapshot = function() return false end
+    Sync:_ConsiderConsumablesCatchUp({
+        coordinator = "Coord-Realm",
+        profileId = archiveP._profileId,
+        sessionId = "archive-resend",
+        consumablesGeneration = 1,
+        consumablesConfigSeq = archiveP._consumables.configSeq,
+        consumablesEventCount = 0,
+        consumablesEventFingerprint = C.Descriptor(archiveP).eventFingerprint,
+        consumablesArchiveCount = 0,
+        consumablesArchiveFingerprint = (tonumber(localArchive) or 0) + 1,
+    })
+    local queuedArchive = false
+    for i = 1, #(archiveP._consumablesUnsent or {}) do
+        if archiveP._consumablesUnsent[i] == archivedId then queuedArchive = true end
+    end
+    assertTrue(queuedArchive, "an archive mismatch queues this client's stamped archived event")
+    Sync.IsSafeModeEnabled = savedSafe
+    Sync.RequestProfileSnapshot = savedRequest
+
+    local pruneP = profile("unsent-cap", admin)
+    local keptId = "ce:unsent-cap:" .. admin .. ":1"
+    assertTrue(select(1, C.AppendEvent(pruneP, {
+        id = keptId, type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+        quantity = 1, generation = 1, timestamp = 1,
+    }, { silent = true })), "the prune fixture stores one event")
+    local cap = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
+    local huge = {}
+    for i = 1, cap + 10 do
+        huge[i] = "missing-" .. tostring(i)
+    end
+    huge[#huge] = keptId
+    pruneP._consumablesUnsent = huge
+    Sync:_PruneUnsentConsumablesEvents(pruneP)
+    assertTrue(#pruneP._consumablesUnsent <= cap, "the unsent queue is cut down to the ledger plus archive cap")
+    local keptQueued = false
+    local staleQueued = false
+    for i = 1, #pruneP._consumablesUnsent do
+        if pruneP._consumablesUnsent[i] == keptId then keptQueued = true end
+        if pruneP._consumablesUnsent[i] == "missing-1" then staleQueued = true end
+    end
+    assertTrue(keptQueued, "a stored event id is kept in the unsent queue")
+    assertFalse(staleQueued, "an id that is no longer stored is removed from the unsent queue")
+    Sync.state = savedState
+    Sync.FindLocalProfileById = nil
+end
+checkCodexSnapshotRound()
+
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
     os.exit(1)

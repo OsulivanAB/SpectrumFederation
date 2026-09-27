@@ -96,9 +96,18 @@ local function FreezeInflight(grant)
     return grant.inflightCoordinator == coordinator and tonumber(grant.inflightEpoch) == epoch
 end
 
+local function NoteFreezeCreated(grant)
+    if tonumber(grant.createdAt) and tonumber(grant.createdAt) > 0 then return end
+    local C = Consumables()
+    grant.createdAt = C and C.Now and C.Now() or 0
+end
+
 local function FreezeExpired(grant, now)
     if type(grant) ~= "table" then return false end
-    local at = tonumber(grant.inflightAt)
+    local at = tonumber(grant.createdAt)
+    if not at or at <= 0 then
+        at = tonumber(grant.inflightAt)
+    end
     if not at or at <= 0 then return false end
     local S = Rules()
     local ttl = S and tonumber(S.TRADE_GRANT_TTL) or 120
@@ -161,6 +170,7 @@ local function RememberTradeFreeze(profile, grant, sent)
     if type(grant) ~= "table" or type(grant.token) ~= "string" then
         return sent ~= false
     end
+    NoteFreezeCreated(grant)
     local list = FreezeList(profile)
     local index = nil
     for i = 1, #list do
@@ -310,6 +320,12 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         self:_QueueUnsequencedConsumablesEvents(profile)
     end
     self:_QueueAuthoredOrderedConsumablesEvents(profile, remote.eventCount, fingerprintsDiffer)
+    local remoteArchiveCount = tonumber(remote.archiveCount)
+    local remoteArchiveFingerprint = tonumber(remote.archiveFingerprint)
+    local localArchiveFingerprint = tonumber(localDesc.archiveFingerprint)
+    local archiveDiffers = (remoteArchiveCount and remoteArchiveCount ~= (tonumber(localDesc.archiveCount) or 0))
+        or (remoteArchiveFingerprint and localArchiveFingerprint and remoteArchiveFingerprint ~= localArchiveFingerprint)
+    self:_QueueAuthoredArchivedConsumablesEvents(profile, archiveDiffers and true or false)
     self:_FlushUnsentConsumablesEvents(profile)
     local authority = table.concat({
         tostring(self.state.sessionId),
@@ -405,12 +421,49 @@ local function SessionPayloadOk(payload, sender)
     return true
 end
 
+function Sync:_PruneUnsentConsumablesEvents(profile)
+    if type(profile) ~= "table" or type(profile._consumablesUnsent) ~= "table" then return end
+    local C = Consumables()
+    local cap = 8192
+    if C and C.MAX_LEDGER_EVENTS and C.MAX_ARCHIVED_EVENTS then
+        cap = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
+    end
+    local queue = profile._consumablesUnsent
+    if #queue > cap then
+        local tail = {}
+        local startAt = #queue - cap + 1
+        for i = startAt, #queue do
+            tail[#tail + 1] = queue[i]
+        end
+        queue = tail
+        profile._consumablesUnsent = queue
+    end
+    local index = C and C.EventIndex and C.EventIndex(profile)
+    if type(index) ~= "table" then return end
+    local kept = {}
+    for i = 1, #queue do
+        local id = queue[i]
+        if type(id) == "string" and index[id] then
+            kept[#kept + 1] = id
+        end
+    end
+    profile._consumablesUnsent = kept
+end
+
 function Sync:_QueueUnsentConsumablesEvent(profile, eventId)
     if type(profile) ~= "table" or type(eventId) ~= "string" or eventId == "" then return end
     local queue = profile._consumablesUnsent
     if type(queue) ~= "table" then
         queue = {}
         profile._consumablesUnsent = queue
+    end
+    local C = Consumables()
+    local cap = C and C.MAX_LEDGER_EVENTS and C.MAX_ARCHIVED_EVENTS and (C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS) or 8192
+    if #queue >= cap then
+        self:_PruneUnsentConsumablesEvents(profile)
+        queue = profile._consumablesUnsent
+        if type(queue) ~= "table" then return end
+        if #queue >= cap then return end
     end
     for i = 1, #queue do
         if queue[i] == eventId then return end
@@ -447,6 +500,34 @@ function Sync:_QueueAuthoredOrderedConsumablesEvents(profile, remoteEventCount, 
         scanned = scanned + 1
     end
     profile._consumablesOrderedResendCursor = index
+end
+
+function Sync:_QueueAuthoredArchivedConsumablesEvents(profile, archiveDiffers)
+    if not archiveDiffers then return end
+    if self.state and self.state.isCoordinator then return end
+    local archive = profile and profile._consumableEventArchive
+    if type(archive) ~= "table" then return end
+    local S = Rules()
+    local who = self._SelfId and self:_SelfId() or nil
+    if not S or type(who) ~= "string" or who == "" then return end
+    local key = tostring(self.state and self.state.sessionId) .. ":" .. tostring(self.state and self.state.coordinator)
+    if profile._consumablesArchiveResendKey == key then return end
+    profile._consumablesArchiveResendKey = key
+    local C = Consumables()
+    local cap = C and C.MAX_EVENTS_PER_ACTOR or 512
+    local maxScan = (C and C.MAX_LEDGER_EVENTS or 4096) + (C and C.MAX_ARCHIVED_EVENTS or 4096)
+    local limit = #archive
+    if limit > maxScan then limit = maxScan end
+    local queued = 0
+    for i = 1, limit do
+        if queued >= cap then break end
+        local event = archive[i]
+        if type(event) == "table" and type(event.id) == "string"
+            and tonumber(event.order) and S.RemoteEventIdOk(event.id, who) then
+            self:_QueueUnsentConsumablesEvent(profile, event.id)
+            queued = queued + 1
+        end
+    end
 end
 
 function Sync:_QueueUnsequencedConsumablesEvents(profile)
@@ -559,9 +640,17 @@ function Sync:_FlushUnsentConsumablesEvents(profile)
     self:_FlushPendingTradeFreeze(profile)
     local queue = profile and profile._consumablesUnsent
     if type(queue) ~= "table" or #queue == 0 then return end
+    local C = Consumables()
+    local cap = C and C.MAX_LEDGER_EVENTS and C.MAX_ARCHIVED_EVENTS and (C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS) or 8192
+    if #queue > cap then
+        self:_PruneUnsentConsumablesEvents(profile)
+        queue = profile._consumablesUnsent
+        if type(queue) ~= "table" or #queue == 0 then
+            return
+        end
+    end
     self._consumablesFlushing = true
     local sent = 0
-    local C = Consumables()
     local ids = C and C.EventIndex and C.EventIndex(profile)
     while sent < MAX_EVENT_FLUSH and #queue > 0 do
         local eventId = queue[1]
