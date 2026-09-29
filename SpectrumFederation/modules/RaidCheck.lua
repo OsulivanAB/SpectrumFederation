@@ -7,7 +7,7 @@ local addonName, SF = ...
 -- luacheck: globals GetInventoryItemID C_TooltipInfo TooltipUtil Enum
 -- luacheck: globals EMPTY_SOCKET_PRISMATIC EMPTY_SOCKET_META EMPTY_SOCKET_RED EMPTY_SOCKET_YELLOW EMPTY_SOCKET_BLUE
 -- luacheck: globals EMPTY_SOCKET_HYDRAULIC EMPTY_SOCKET_COGWHEEL EMPTY_SOCKET_DOMINATION EMPTY_SOCKET_TINKER EMPTY_SOCKET_PRIMORDIAL
--- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
+-- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage C_ChatInfo UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
 -- luacheck: globals InspectFrame InspectUnit hooksecurefunc canaccessvalue
 
@@ -1567,27 +1567,41 @@ function RC:_PrimeBackgroundInspectQueue()
 	end
 
 	local now = GetTime and GetTime() or 0
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	local openedPass = false
+	if earlyPrep and type(earlyPrep.BeginMembershipPass) == "function" then
+		earlyPrep:BeginMembershipPass()
+		openedPass = true
+	end
 
-	for _, unit in ipairs(CollectUnits()) do
-		if not IsSelfUnit(unit) then
-			local info = BuildUnitInfo(unit)
-			local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
-			local wanted = true
-			if earlyPrep and earlyPrep.ConsumerWantsUnit then
-				wanted = earlyPrep.ConsumerWantsUnit(state.backgroundInspectConsumers, info)
-			end
-			if info.id and wanted then
-				local aliases = self:_GetInspectAliases(unit, info)
-				local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
-				local hasFreshData = cacheEntry
-					and cacheEntry.updatedAt
-					and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
+	-- End the membership pass even when queueing throws, then surface the error.
+	local ok, err = pcall(function()
+		for _, unit in ipairs(CollectUnits()) do
+			if not IsSelfUnit(unit) then
+				local info = BuildUnitInfo(unit)
+				local wanted = true
+				if earlyPrep and earlyPrep.ConsumerWantsUnit then
+					wanted = earlyPrep.ConsumerWantsUnit(state.backgroundInspectConsumers, info)
+				end
+				if info.id and wanted then
+					local aliases = self:_GetInspectAliases(unit, info)
+					local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+					local hasFreshData = cacheEntry
+						and cacheEntry.updatedAt
+						and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
 
-				if not hasFreshData then
-					self:_QueueInspectForUnit(unit, info, cacheEntry)
+					if not hasFreshData then
+						self:_QueueInspectForUnit(unit, info, cacheEntry)
+					end
 				end
 			end
 		end
+	end)
+	if openedPass and type(earlyPrep.EndMembershipPass) == "function" then
+		earlyPrep:EndMembershipPass()
+	end
+	if not ok then
+		error(err, 0)
 	end
 end
 
@@ -1974,6 +1988,85 @@ local function PreparationFromCaptured(captured, cfg)
 	return result, "fresh"
 end
 
+local PREPARATION_STAMP_SLOT_LIMIT = 32
+
+local function PreparationConfigStamp(cfg)
+	if type(cfg) ~= "table" then
+		return "-"
+	end
+	local slotParts = {}
+	if type(cfg.slots) == "table" then
+		local keys = {}
+		local count = 0
+		for key in pairs(cfg.slots) do
+			count = count + 1
+			if count > PREPARATION_STAMP_SLOT_LIMIT then
+				break
+			end
+			keys[count] = tostring(key)
+		end
+		table.sort(keys)
+		for i = 1, #keys do
+			local key = keys[i]
+			slotParts[i] = key .. (cfg.slots[key] and "1" or "0")
+		end
+	end
+	return table.concat({
+		cfg.checkGemsInSockets ~= false and "1" or "0",
+		cfg.requireMetaGem and "1" or "0",
+		cfg.requireMinimumItemLevel and "1" or "0",
+		tostring(tonumber(cfg.minimumItemLevel) or 0),
+		table.concat(slotParts, ","),
+	}, "|")
+end
+
+local function IsSelfMemberId(memberId)
+	local selfId = SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier() or nil
+	if selfId == memberId then
+		return true
+	end
+	if selfId and SF.NameUtil and SF.NameUtil.SamePlayer then
+		return SF.NameUtil.SamePlayer(selfId, memberId) and true or false
+	end
+	return false
+end
+
+-- Cheap identity of the observation GetAuthoritativePreparation would read.
+-- It does not build a policy result or read item tooltips. Callers use it to
+-- skip that work when an unchanged observation already produced no warning.
+function RC:GetPreparationObservationStamp(memberId, cfg)
+	if type(memberId) ~= "string" or memberId == "" then
+		return nil
+	end
+	local configStamp = PreparationConfigStamp(cfg)
+	if IsSelfMemberId(memberId) then
+		return table.concat({
+			"self",
+			tostring(self:GetTroubleshootingVersion()),
+			configStamp,
+		}, "|")
+	end
+
+	local state = self:_GetInspectState()
+	local entry = state.cache and state.cache[memberId] or nil
+	if not entry then
+		entry = self:_GetInspectCacheEntryByAliases({ memberId })
+	end
+	local now = GetTime and GetTime() or 0
+	local updatedAt = type(entry) == "table" and tonumber(entry.updatedAt) or nil
+	local fresh = updatedAt and (now - updatedAt) <= INSPECT_CACHE_TTL_SECONDS
+	local status = type(entry) == "table" and entry.status or ""
+	local blended = type(entry) == "table" and entry.blended == true
+	return table.concat({
+		"remote",
+		tostring(updatedAt or ""),
+		tostring(status),
+		fresh and "1" or "0",
+		blended and "1" or "0",
+		configStamp,
+	}, "|")
+end
+
 -- Newest cache entry only. An older complete last-good result is not a whisper
 -- source when the latest observation is incomplete, failed, or outside the
 -- shared inspect freshness window.
@@ -1982,12 +2075,7 @@ function RC:GetAuthoritativePreparation(memberId, cfg)
 		return nil, "missing"
 	end
 
-	local selfId = SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier() or nil
-	local isSelf = selfId == memberId
-	if not isSelf and selfId and SF.NameUtil and SF.NameUtil.SamePlayer then
-		isSelf = SF.NameUtil.SamePlayer(selfId, memberId) and true or false
-	end
-	if isSelf then
+	if IsSelfMemberId(memberId) then
 		local captured = self:_GetLocalTroubleshootingSnapshot()
 		if type(captured) ~= "table" or not captured.sawAnyData then
 			return nil, "incomplete"
@@ -3099,6 +3187,10 @@ end
 
 function RC:DeliverMissingRequirementsWhisper(target, cfg, missingList, profile, mode)
 	if type(target) ~= "string" or target == "" or type(SendChatMessage) ~= "function" then
+		return false
+	end
+	-- A lockdown send does not arrive. Leave the warning unrecorded so a later pass can retry.
+	if C_ChatInfo and type(C_ChatInfo.InChatMessagingLockdown) == "function" and C_ChatInfo.InChatMessagingLockdown() then
 		return false
 	end
 	mode = (mode == "raid") and "raid" or "pre"

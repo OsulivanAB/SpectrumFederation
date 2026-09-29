@@ -542,6 +542,109 @@ assertTrue(not EarlyPrep:DeferPrepNotice("session-a", "profile-a", "", {
 	memberId = "Cara-Realm",
 }), "a notice with no sender is not deferred")
 
+IsInRaid = function()
+	return true
+end
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.HasAnnouncedCurrentSession = function()
+	return true
+end
+SF.SettingsStore = {
+	Get = function()
+		return true
+	end,
+}
+local prepCalls = 0
+local scans = 0
+local whispers = 0
+local observationStamp = "remote|1|ready|1|0|cfg"
+SF.RaidCheck = {
+	SetBackgroundInspectEnabled = function() end,
+	CollectGroupMemberIds = function()
+		scans = scans + 1
+		return { "Bob-Realm", "Cara-Realm" }
+	end,
+	IsGroupMember = function()
+		scans = scans + 100
+		return true
+	end,
+	GetPreparationObservationStamp = function()
+		return observationStamp
+	end,
+	GetAuthoritativePreparation = function()
+		prepCalls = prepCalls + 1
+		return { complete = true, prepared = true, missing = {} }, "fresh"
+	end,
+	DeliverMissingRequirementsWhisper = function()
+		whispers = whispers + 1
+		return false
+	end,
+}
+SF.LootHelperSync.FindLocalProfileById = function()
+	return {
+		id = "profile-a",
+		IsCurrentUserAdmin = function()
+			return true
+		end,
+		GetMemberByID = function(_, memberId)
+			if memberId == "Bob-Realm" or memberId == "Cara-Realm" then
+				return { id = memberId }
+			end
+			return nil
+		end,
+		GetRaidCheckConfig = function()
+			return { checkGemsInSockets = true, slots = { head = true } }
+		end,
+	}
+end
+EarlyPrep:OnSessionReset("test-reset")
+scans = 0
+prepCalls = 0
+EarlyPrep:Refresh("setting")
+assertEq(scans, 1, "opening the window scans the roster once")
+assertEq(prepCalls, 2, "the first pass evaluates each eligible member")
+prepCalls = 0
+scans = 0
+for _ = 1, 20 do
+	EarlyPrep:OnBackgroundPass()
+end
+assertEq(prepCalls, 0, "twenty unchanged passes do not rebuild policy")
+assertEq(scans, 20, "each later pass scans the roster once")
+observationStamp = "remote|2|ready|1|0|cfg"
+SF.RaidCheck.GetAuthoritativePreparation = function()
+	prepCalls = prepCalls + 1
+	return { complete = true, prepared = false, missing = { "gem" } }, "fresh"
+end
+prepCalls = 0
+whispers = 0
+EarlyPrep:OnBackgroundPass()
+assertEq(prepCalls, 2, "a changed observation is evaluated")
+assertEq(whispers, 2, "a blocked whisper is still attempted")
+assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "a blocked whisper is not recorded")
+prepCalls = 0
+whispers = 0
+EarlyPrep:OnBackgroundPass()
+assertEq(prepCalls, 2, "a blocked whisper is evaluated again")
+assertEq(whispers, 2, "a blocked whisper is retried")
+scans = 0
+EarlyPrep:Refresh("heartbeat")
+EarlyPrep:Refresh("roster")
+assertEq(scans, 0, "heartbeat and roster refreshes do not scan an open window")
+EarlyPrep._windowOpen = false
+scans = 0
+EarlyPrep:Refresh("roster")
+assertEq(scans, 1, "a roster refresh scans when the window has just opened")
+
+local SyncSF = {}
+assert(loadfile("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.lua"))("SpectrumFederation", SyncSF)
+local RetrySync = SyncSF.LootHelperSync
+assertEq(RetrySync.ReannounceRetryDecision(true, true, "session-a", nil, 0, false, 3), "schedule", "a failed reannounce can retry")
+assertEq(RetrySync.ReannounceRetryDecision(true, true, "session-a", nil, 0, true, 3), "wait", "a pending reannounce retry does not stack")
+assertEq(RetrySync.ReannounceRetryDecision(true, true, "session-a", nil, 3, false, 3), "stop", "reannounce retries stop at the cap")
+assertEq(RetrySync.ReannounceRetryDecision(true, true, "session-a", "session-a", 0, false, 3), "stop", "an announced session does not retry reannounce")
+assertEq(RetrySync.ReannounceRetryDecision(true, false, "session-a", nil, 0, false, 3), "stop", "a non-coordinator does not retry reannounce")
+assertEq(RetrySync.ReannounceRetryDecision(false, true, "session-a", nil, 0, false, 3), "stop", "an inactive session does not retry reannounce")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
 	os.exit(1)

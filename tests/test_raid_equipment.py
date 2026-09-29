@@ -200,9 +200,19 @@ def test_early_preparation_whispers_production_lua():
     evaluate = source.split("function EarlyPrep:EvaluateMember", 1)[1]
     evaluate = evaluate.split("\nfunction ", 1)[0]
     assert evaluate.count(":GetAuthoritativePreparation") == 1
+    assert evaluate.index("GetPreparationObservationStamp") < evaluate.index(":GetAuthoritativePreparation")
     record_at = evaluate.index("WarningRecordable")
     deliver_at = evaluate.index(":DeliverMissingRequirementsWhisper")
     assert record_at < deliver_at
+    deliver = raid_check.split("function RC:DeliverMissingRequirementsWhisper", 1)[1]
+    deliver = deliver.split("\nfunction ", 1)[0]
+    assert deliver.index("InChatMessagingLockdown") < deliver.index("WhisperMissing")
+    stamp = raid_check.split("function RC:GetPreparationObservationStamp", 1)[1]
+    stamp = stamp.split("\nfunction ", 1)[0]
+    assert "PreparationFromCaptured" not in stamp
+    reannounce_send = public_api.split("function Sync:ReannounceSession", 1)[1]
+    assert reannounce_send.index("if not accepted") < reannounce_send.index("_ScheduleReannounceRetry")
+    assert "function Sync.ReannounceRetryDecision" in session_start
 
 
 def test_parent_toc_loads_raid_equipment_modules():

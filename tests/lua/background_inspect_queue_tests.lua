@@ -232,6 +232,58 @@ assertEq(state.queue[1] and state.queue[1].source, "adhoc", "combat requeue keep
 RC:_DiscardQueuedBackgroundInspects()
 assertEq(state.queue[1] and state.queue[1].source, "adhoc", "discarding background scans leaves the combat-requeued ad-hoc scan")
 
+local whispers = 0
+SendChatMessage = function()
+	whispers = whispers + 1
+end
+C_ChatInfo = {
+	InChatMessagingLockdown = function()
+		return true
+	end,
+}
+local sent = RC:DeliverMissingRequirementsWhisper("A-Realm", {}, { "gem" }, nil, "pre")
+assertTrue(not sent, "chat lockdown does not accept a missing whisper")
+assertEq(whispers, 0, "chat lockdown does not call SendChatMessage")
+C_ChatInfo.InChatMessagingLockdown = function()
+	return false
+end
+sent = RC:DeliverMissingRequirementsWhisper("A-Realm", {}, { "gem" }, nil, "pre")
+assertTrue(sent == true, "an open chat accepts a missing whisper")
+assertEq(whispers, 1, "an open chat calls SendChatMessage once")
+
+local tooltipCalls = 0
+C_TooltipInfo = {
+	GetHyperlink = function()
+		tooltipCalls = tooltipCalls + 1
+		return nil
+	end,
+}
+local inspectState = RC:_GetInspectState()
+inspectState.cache["A-Realm"] = {
+	updatedAt = GetTime(),
+	status = "ready",
+	blended = false,
+}
+local stamp = RC:GetPreparationObservationStamp("A-Realm", {
+	checkGemsInSockets = true,
+	requireMetaGem = false,
+	slots = { head = true },
+})
+assertTrue(type(stamp) == "string" and string.find(stamp, "ready", 1, true) ~= nil, "the observation stamp includes cache status")
+assertEq(tooltipCalls, 0, "an observation stamp does not read item tooltips")
+local sameStamp = RC:GetPreparationObservationStamp("A-Realm", {
+	checkGemsInSockets = true,
+	requireMetaGem = false,
+	slots = { head = true },
+})
+assertEq(sameStamp, stamp, "the same cache and policy produce the same stamp")
+local changedStamp = RC:GetPreparationObservationStamp("A-Realm", {
+	checkGemsInSockets = false,
+	requireMetaGem = false,
+	slots = { head = true },
+})
+assertTrue(changedStamp ~= stamp, "a policy change changes the observation stamp")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
 	os.exit(1)

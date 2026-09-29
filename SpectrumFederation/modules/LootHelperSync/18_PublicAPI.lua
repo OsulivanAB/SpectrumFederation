@@ -973,6 +973,7 @@ function Sync:_ResetSessionState(reason)
     self.state._catchUpGrantScanOther = nil
     self.state._catchUpProofScan = nil
     self.state._sessionAnnounced = nil
+    self.state._reannounceRetry = nil
     self.state._sessionDescriptorAt = nil
 
     -- Clear gap repair cooldowns
@@ -1211,6 +1212,68 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     return true
 end
 
+local REANNOUNCE_RETRY_MAX = 3
+local REANNOUNCE_RETRY_DELAY = 2
+
+-- Arm one retry after a rejected SES_REANNOUNCE. One timer at a time, and only
+-- while this client is still coordinator of that unannounced session.
+-- @param sessionId string
+-- @return string "schedule"|"wait"|"stop"
+function Sync:_ScheduleReannounceRetry(sessionId)
+    if type(sessionId) ~= "string" or sessionId == "" or type(self.RunAfter) ~= "function" then
+        return "stop"
+    end
+    self.state = self.state or {}
+    local retry = self.state._reannounceRetry
+    local attempts = 0
+    local pending = false
+    if type(retry) == "table" and retry.sessionId == sessionId then
+        attempts = tonumber(retry.attempts) or 0
+        pending = retry.pending == true
+    end
+    local decision = "stop"
+    if type(Sync.ReannounceRetryDecision) == "function" then
+        decision = Sync.ReannounceRetryDecision(
+            self.state.active == true,
+            self.state.isCoordinator == true,
+            sessionId,
+            self.state._sessionAnnounced,
+            attempts,
+            pending,
+            REANNOUNCE_RETRY_MAX
+        )
+    end
+    if decision ~= "schedule" then
+        return decision
+    end
+    local scheduledAttempt = attempts + 1
+    self.state._reannounceRetry = {
+        sessionId = sessionId,
+        attempts = scheduledAttempt,
+        pending = true,
+    }
+    self:RunAfter(REANNOUNCE_RETRY_DELAY, function()
+        local state = self.state
+        local current = state and state._reannounceRetry
+        if type(current) ~= "table" or current.sessionId ~= sessionId or current.attempts ~= scheduledAttempt then
+            return
+        end
+        current.pending = false
+        if state.active ~= true or state.isCoordinator ~= true or state.sessionId ~= sessionId then
+            state._reannounceRetry = nil
+            return
+        end
+        if state._sessionAnnounced == sessionId then
+            state._reannounceRetry = nil
+            return
+        end
+        if self.ReannounceSession then
+            self:ReannounceSession()
+        end
+    end)
+    return "schedule"
+end
+
 -- Function Re-announce session state to raid (typically after takeover or helper refresh).
 -- @param none
 -- @return nil
@@ -1286,9 +1349,13 @@ function Sync:ReannounceSession()
             SF.Debug:Error("SYNC", "SES_REANNOUNCE send was not accepted (sessionId=%s); early preparation stays closed",
                 tostring(self.state.sessionId))
         end
+        if self._ScheduleReannounceRetry then
+            self:_ScheduleReannounceRetry(self.state.sessionId)
+        end
         return
     end
 
+    self.state._reannounceRetry = nil
     -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
     self.state._sessionAnnounced = self.state.sessionId
     self:_MarkRosterAnnounced(self.state.sessionId)

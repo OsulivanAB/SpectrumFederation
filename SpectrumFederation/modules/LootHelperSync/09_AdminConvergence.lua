@@ -26,6 +26,37 @@ function Sync.ApplySesStartSendResult(state, sessionId, sendOk)
     return true
 end
 
+-- Decide whether a rejected SES_REANNOUNCE should arm one more retry.
+-- A pending timer is left alone. Success, lost coordination, or the attempt cap stops it.
+-- @param active boolean
+-- @param isCoordinator boolean
+-- @param sessionId string
+-- @param announcedSessionId string|nil
+-- @param attempts number
+-- @param pending boolean
+-- @param maxAttempts number
+-- @return string "schedule"|"wait"|"stop"
+function Sync.ReannounceRetryDecision(active, isCoordinator, sessionId, announcedSessionId, attempts, pending, maxAttempts)
+    if active ~= true or isCoordinator ~= true then
+        return "stop"
+    end
+    if type(sessionId) ~= "string" or sessionId == "" then
+        return "stop"
+    end
+    if announcedSessionId == sessionId then
+        return "stop"
+    end
+    if pending == true then
+        return "wait"
+    end
+    attempts = tonumber(attempts) or 0
+    maxAttempts = tonumber(maxAttempts) or 0
+    if attempts >= maxAttempts then
+        return "stop"
+    end
+    return "schedule"
+end
+
 -- Classify a failed initial SES_START against coordinator session state.
 -- @param state table Sync state
 -- @param sessionId string

@@ -441,6 +441,69 @@ function EarlyPrep:IsProfileMember(profile, memberId)
 	return self:FindProfileMember(profile, memberId) ~= nil
 end
 
+function EarlyPrep:BeginMembershipPass()
+	local depth = self._membershipDepth or 0
+	self._membershipDepth = depth + 1
+	if depth > 0 then
+		return
+	end
+	local set = self._membershipSet
+	if type(set) ~= "table" then
+		set = {}
+		self._membershipSet = set
+	else
+		for key in pairs(set) do
+			set[key] = nil
+		end
+	end
+	local raidCheck = SF.RaidCheck
+	local ids = {}
+	if raidCheck and type(raidCheck.CollectGroupMemberIds) == "function" then
+		ids = raidCheck:CollectGroupMemberIds() or {}
+	end
+	for i = 1, #ids do
+		local id = ids[i]
+		if type(id) == "string" and id ~= "" then
+			set[id] = true
+		end
+	end
+	self._membershipPass = true
+end
+
+function EarlyPrep:EndMembershipPass()
+	local depth = self._membershipDepth or 0
+	if depth > 1 then
+		self._membershipDepth = depth - 1
+		return
+	end
+	self._membershipDepth = 0
+	self._membershipPass = false
+	local set = self._membershipSet
+	if type(set) == "table" then
+		for key in pairs(set) do
+			set[key] = nil
+		end
+	end
+end
+
+function EarlyPrep:MemberInCurrentPass(memberId)
+	local set = self._membershipSet
+	if type(set) ~= "table" then
+		return false
+	end
+	if set[memberId] then
+		return true
+	end
+	if SF.NameUtil and type(SF.NameUtil.SamePlayer) == "function" then
+		for id in pairs(set) do
+			if SF.NameUtil.SamePlayer(id, memberId) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 function EarlyPrep:IsEligibleTarget(memberId)
 	if not EarlyPrep.ValidMemberId(memberId) then
 		return false
@@ -448,6 +511,9 @@ function EarlyPrep:IsEligibleTarget(memberId)
 	local profile = self:GetSessionProfile()
 	if not self:IsProfileMember(profile, memberId) then
 		return false
+	end
+	if self._membershipPass then
+		return self:MemberInCurrentPass(memberId)
 	end
 	local raidCheck = SF.RaidCheck
 	if not raidCheck or type(raidCheck.IsGroupMember) ~= "function" then
@@ -471,6 +537,7 @@ function EarlyPrep:SyncNoticeToSession()
 	self.notice = self.notice or EarlyPrep.NewNotice()
 	if EarlyPrep.BindNotice(self.notice, sessionId, profileId) then
 		self._rejectLogged = {}
+		self._skipStamp = nil
 	end
 end
 
@@ -582,6 +649,7 @@ function EarlyPrep:OnSessionReset(reason)
 	self._wasCoordinator = false
 	self._rejectLogged = {}
 	self._deferredNotices = nil
+	self._skipStamp = nil
 	local raidCheck = SF.RaidCheck
 	if raidCheck and type(raidCheck.SetBackgroundInspectEnabled) == "function" then
 		raidCheck:SetBackgroundInspectEnabled(false, self.CONSUMER_REASON)
@@ -875,14 +943,45 @@ function EarlyPrep:NoteRaidCheckBegun(sessionId, profileId)
 	return changed
 end
 
-function EarlyPrep:CollectEligibleIds()
-	local raidCheck = SF.RaidCheck
-	local ids = {}
-	if not raidCheck or type(raidCheck.CollectGroupMemberIds) ~= "function" then
-		return ids
+function EarlyPrep:RememberNonWarning(memberId, stamp)
+	if type(stamp) ~= "string" or stamp == "" or not EarlyPrep.ValidMemberId(memberId) then
+		return
 	end
+	local skips = self._skipStamp
+	if type(skips) ~= "table" then
+		skips = {}
+		self._skipStamp = skips
+	end
+	if skips[memberId] ~= nil then
+		skips[memberId] = stamp
+		return
+	end
+	local count = 0
+	for _ in pairs(skips) do
+		count = count + 1
+		if count >= EarlyPrep.MAX_NOTICE_MEMBERS then
+			return
+		end
+	end
+	skips[memberId] = stamp
+end
+
+function EarlyPrep:CollectEligibleIds()
+	local ids = {}
 	local profile = self:GetSessionProfile()
-	local groupIds = raidCheck:CollectGroupMemberIds() or {}
+	local groupIds
+	if self._membershipPass and type(self._membershipSet) == "table" then
+		groupIds = {}
+		for id in pairs(self._membershipSet) do
+			groupIds[#groupIds + 1] = id
+		end
+	else
+		local raidCheck = SF.RaidCheck
+		if not raidCheck or type(raidCheck.CollectGroupMemberIds) ~= "function" then
+			return ids
+		end
+		groupIds = raidCheck:CollectGroupMemberIds() or {}
+	end
 	local seen = {}
 	for i = 1, #groupIds do
 		local id = groupIds[i]
@@ -908,6 +1007,13 @@ function EarlyPrep:EvaluateMember(memberId)
 	end
 	local profile = self:GetSessionProfile()
 	local cfg = profile and type(profile.GetRaidCheckConfig) == "function" and profile:GetRaidCheckConfig() or nil
+	local stamp = nil
+	if type(raidCheck.GetPreparationObservationStamp) == "function" then
+		stamp = raidCheck:GetPreparationObservationStamp(memberId, cfg)
+		if type(stamp) == "string" and self._skipStamp and self._skipStamp[memberId] == stamp then
+			return false
+		end
+	end
 	local result, why = raidCheck:GetAuthoritativePreparation(memberId, cfg)
 	local decision = EarlyPrep.ObservationShouldWarn({
 		eligible = true,
@@ -918,12 +1024,14 @@ function EarlyPrep:EvaluateMember(memberId)
 		alreadyWarned = false,
 	})
 	if not decision then
+		self:RememberNonWarning(memberId, stamp)
 		return false
 	end
 	if not self:ComputeWindow() or self:WasWarned(memberId) or not self:IsEligibleTarget(memberId) then
 		return false
 	end
 	if why ~= "fresh" or type(result) ~= "table" or result.complete ~= true or result.prepared == true then
+		self:RememberNonWarning(memberId, stamp)
 		return false
 	end
 	if type(raidCheck.DeliverMissingRequirementsWhisper) ~= "function" then
@@ -931,6 +1039,7 @@ function EarlyPrep:EvaluateMember(memberId)
 	end
 	self:SyncNoticeToSession()
 	if not EarlyPrep.WarningRecordable(self.notice, memberId) then
+		self:RememberNonWarning(memberId, stamp)
 		return false
 	end
 	local sent = raidCheck:DeliverMissingRequirementsWhisper(memberId, cfg, result.missing, profile, "pre")
@@ -955,17 +1064,26 @@ function EarlyPrep:OnBackgroundPass()
 		return 0
 	end
 	self._evaluating = true
-	local ids = self:CollectEligibleIds()
-	local evaluated = 0
-	for i = 1, #ids do
-		if not self:ComputeWindow() or evaluated >= EarlyPrep.MAX_NOTICE_MEMBERS then
-			break
+	self:BeginMembershipPass()
+	-- End the membership pass even when evaluation throws, then surface the error.
+	local ok, evaluatedOrErr = pcall(function()
+		local ids = self:CollectEligibleIds()
+		local evaluated = 0
+		for i = 1, #ids do
+			if not self:ComputeWindow() or evaluated >= EarlyPrep.MAX_NOTICE_MEMBERS then
+				break
+			end
+			evaluated = evaluated + 1
+			self:EvaluateMember(ids[i])
 		end
-		evaluated = evaluated + 1
-		self:EvaluateMember(ids[i])
-	end
+		return evaluated
+	end)
+	self:EndMembershipPass()
 	self._evaluating = false
-	return evaluated
+	if not ok then
+		error(evaluatedOrErr, 0)
+	end
+	return evaluatedOrErr
 end
 
 function EarlyPrep:Install()
@@ -1025,7 +1143,11 @@ function EarlyPrep:Refresh(reason)
 	if isCoordinator and not wasCoordinator and self:HasShareableNotice() then
 		self:BroadcastNotice("snapshot")
 	end
-	if open then
+	-- Roster and heartbeat refreshes keep the window in sync. The inspect tick
+	-- and a newly ready observation still evaluate members, so an already-open
+	-- window does not scan the raid again on those reasons.
+	local rosterOrHeartbeat = reason == "roster" or reason == "heartbeat"
+	if open and (not wasOpen or not rosterOrHeartbeat) then
 		self:OnBackgroundPass()
 	end
 	self._refreshing = false
