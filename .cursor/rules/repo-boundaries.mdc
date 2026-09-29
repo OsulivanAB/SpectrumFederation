@@ -10,10 +10,12 @@ alwaysApply: true
 - Prefer existing repo scripts and workflow files over inventing new commands or pipelines.
 - When prose docs disagree with workflow/script behavior, trust `.github/workflows/` and `.github/scripts/` first, then update docs if needed.
 - Use root `AGENTS.md` for repo orientation and `SpectrumFederation/AGENTS.md` for addon-specific implementation detail.
-- Review work requires a current human request for exactly one operation:
-  assess/triage, repair one batch, request one named review/checkpoint, or
-  evaluate readiness. Review/CI events, pushes, clean results, thread
-  resolution, session restarts, and old blanket continuation instructions do
-  not start or renew work. Do not subscribe, poll, wait, schedule continuation,
-  or request another reviewer automatically. After delivery, report and stop.
+- Review authorization is layered: (1) findings from an intentionally active
+  review subscription authorize evidence-based triage and one disposition
+  reply per delivered finding, then stop; (2) a current human request
+  authorizes exactly one of assess/triage, repair one batch, request one named
+  review/checkpoint, or evaluate readiness; (3) unsolicited CI/push/session
+  events and old blanket continuation do not start repair or another review.
+  Recommendation is never repair authorization. Do not create new
+  subscriptions, poll, wait, auto-resolve, or auto-request another reviewer.
   Details: `.cursor/skills/ai-review-loop/SKILL.md`.

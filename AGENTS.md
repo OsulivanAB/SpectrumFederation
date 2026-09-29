@@ -114,15 +114,24 @@ When asked for a code review, technical audit, pre-release review, or architectu
 
 ### Human authorization boundary
 
-Review work is human-directed. A review or CI event, clean result, push,
-thread resolution, session restart, or old blanket “keep going” instruction
-does not authorize another assessment, repair batch, review request, or
-readiness evaluation. Do not subscribe, poll, wait, or schedule continuation.
-A clear owner request for one operation is sufficient, and normal debugging
-inside an authorized repair batch does not need approval per edit. After the
-authorized delivery, report and stop. The canonical procedure is
-`.cursor/skills/ai-review-loop/SKILL.md`; Codex coverage rules remain in
-`.github/codex-review-guidance.md`.
+Distinguish authorization carefully:
+
+- A review finding delivered through an intentionally active review
+  subscription authorizes assessment, recommendation, and one disposition
+  reply to that finding only. It does not authorize code changes, commits,
+  pushes, thread resolution, another review, or continuation into repair.
+- A clear owner request authorizes exactly one named operation (repair batch,
+  review request, readiness evaluation, or a broader assessment).
+  Recommendation is not repair authorization. Normal debugging inside an
+  authorized repair batch does not need approval per edit.
+- Unsolicited CI/push/session events and old “keep going” instructions do not
+  authorize work. Do not create new subscriptions, poll, or wait after
+  handling an authorized event. After the authorized delivery, report and
+  stop.
+
+Canonical procedure: `.cursor/skills/ai-review-loop/SKILL.md`. Finding triage
+and thread replies: `.cursor/skills/pr-review-comments/SKILL.md`. Codex
+coverage: `.github/codex-review-guidance.md`.
 
 ### Runtime stability
 
@@ -165,8 +174,8 @@ in-game testing occurred without human test evidence.
 
 Three files divide pull-request review work. Open the file that owns the task. Do not copy a full procedure into this guide, and do not send the same decision through more than one of them.
 
-- **Human-directed operations and repair batches:** `.cursor/skills/ai-review-loop/SKILL.md` separates assessment, one repair batch, one review request, and readiness evaluation. It owns authorization boundaries, batching, escalation, checkpoint recommendations, and delivery timing.
-- **Individual findings:** `.cursor/skills/pr-review-comments/SKILL.md` owns investigating one finding, replying on its thread, and deciding whether that thread may be resolved. It does not commit, push, or request another review.
-- **Codex coverage:** `.github/codex-review-guidance.md` owns Codex review scope, the final integration checkpoint, and when previous coverage must be reconsidered. It recommends coverage; only a current owner request authorizes initiating it. When a linked Ticket ID is present, that document requires reviewing the ticket. If the ticket is inaccessible, do not invent requirements.
+- **Round coordination:** `.cursor/skills/ai-review-loop/SKILL.md` owns subscription-event triage versus repair batches, review requests, readiness evaluation, authorization boundaries, batching, escalation, checkpoint recommendations, and delivery timing. Subscribed finding → assess + recommend + reply → stop. Owner repair authorization → implement once → stop.
+- **Individual findings:** `.cursor/skills/pr-review-comments/SKILL.md` owns investigating one finding, classifying it, recommending IMPLEMENT / DO NOT IMPLEMENT / OWNER DECISION, and posting the disposition reply when subscription triage or an owner request authorizes that write. It does not commit, push, auto-resolve, or request another review.
+- **Codex coverage:** `.github/codex-review-guidance.md` owns Codex review scope, the final integration checkpoint, and when previous coverage must be reconsidered. It recommends coverage; only a current owner request authorizes initiating a review. Finding discovery is not repair authorization; an intentionally subscribed Cursor agent may still assess and reply under the skills above. When a linked Ticket ID is present, that document requires reviewing the ticket. If the ticket is inaccessible, do not invent requirements.
 
-Humans retain final review, required in-game verification, and merging.
+Humans retain final review, required in-game verification, repair-batch authorization, and merging.
