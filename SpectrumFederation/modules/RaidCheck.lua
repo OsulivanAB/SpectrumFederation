@@ -1467,18 +1467,26 @@ function RC:_ClearPreparedSlotCaches()
 
 end
 
+function RC:_ApplyTooltipDataRefresh()
+	self:_ClearPreparedSlotCaches()
+	self:_MarkTroubleshootingDirty()
+	-- Early Preparation memoizes non-warning observations by stamp. Item and
+	-- tooltip resolution can make the same cache entry evaluable later, so
+	-- drop those skips even when no Equipment-page listener is registered.
+	RC.CallEarlyPrep("InvalidateObservationSkips", "tooltip")
+	local state = self:_GetInspectState()
+	if next(state.listeners) then
+		self:_NotifyTroubleshootingListeners(false, "tooltip")
+	end
+end
+
 function RC:_ScheduleTooltipDataRefresh()
 	local state = self:_GetInspectState()
-	if not next(state.listeners) then
-		return
-	end
 	if state.tooltipRefreshScheduled then
 		return
 	end
 	if not (C_Timer and C_Timer.After) then
-		self:_ClearPreparedSlotCaches()
-		self:_MarkTroubleshootingDirty()
-		self:_NotifyTroubleshootingListeners(false, "tooltip")
+		self:_ApplyTooltipDataRefresh()
 		return
 	end
 
@@ -1486,12 +1494,7 @@ function RC:_ScheduleTooltipDataRefresh()
 	C_Timer.After(0.25, function()
 		local current = self:_GetInspectState()
 		current.tooltipRefreshScheduled = false
-		if not next(current.listeners) then
-			return
-		end
-		self:_ClearPreparedSlotCaches()
-		self:_MarkTroubleshootingDirty()
-		self:_NotifyTroubleshootingListeners(false, "tooltip")
+		self:_ApplyTooltipDataRefresh()
 	end)
 end
 
@@ -2080,12 +2083,15 @@ function RC:GetPreparationObservationStamp(memberId, cfg)
 	local fresh = updatedAt and (now - updatedAt) <= INSPECT_CACHE_TTL_SECONDS
 	local status = type(entry) == "table" and entry.status or ""
 	local blended = type(entry) == "table" and entry.blended == true
+	-- Include troubleshooting generation so TOOLTIP_DATA_UPDATE / item-data
+	-- resolution invalidates Early Preparation non-warning memoization.
 	return table.concat({
 		"remote",
 		tostring(updatedAt or ""),
 		tostring(status),
 		fresh and "1" or "0",
 		blended and "1" or "0",
+		tostring(self:GetTroubleshootingVersion()),
 		configStamp,
 	}, "|")
 end

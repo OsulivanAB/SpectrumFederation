@@ -659,6 +659,30 @@ function EarlyPrep:PersistActive()
 	self:WritePersisted(db.syncSession)
 end
 
+-- A restored shareable notice may never have reached the coordinator. Keep the
+-- non-coordinator publish obligation until a covering heartbeat arrives.
+function EarlyPrep:RestoreOutboundPending()
+	self:ClearOutboundPending()
+	if not self:HasShareableNotice() then
+		return false
+	end
+	local sync = SF.LootHelperSync
+	if sync and sync.state and sync.state.isCoordinator == true then
+		return false
+	end
+	self:MarkOutboundPending()
+	return true
+end
+
+function EarlyPrep:InvalidateObservationSkips(reason)
+	if self._skipStamp == nil then
+		return false
+	end
+	self._skipStamp = nil
+	DebugVerbose("Cleared preparation observation skips (%s)", tostring(reason or "item_data"))
+	return true
+end
+
 function EarlyPrep:RestorePersisted(persisted)
 	if type(persisted) ~= "table" then
 		return
@@ -681,40 +705,41 @@ function EarlyPrep:RestorePersisted(persisted)
 
 	local savedDeferred = persisted.deferredPrepNotices
 	self._deferredNotices = nil
-	if type(savedDeferred) ~= "table"
-		or savedDeferred.sessionId ~= persisted.sessionId
-		or savedDeferred.profileId ~= persisted.profileId
-		or type(savedDeferred.bySender) ~= "table"
+	if type(savedDeferred) == "table"
+		and savedDeferred.sessionId == persisted.sessionId
+		and savedDeferred.profileId == persisted.profileId
+		and type(savedDeferred.bySender) == "table"
 	then
-		return
-	end
-	local restored = {
-		sessionId = persisted.sessionId,
-		profileId = persisted.profileId,
-		bySender = {},
-	}
-	local count = 0
-	for sender, snap in pairs(savedDeferred.bySender) do
-		if type(sender) == "string" and sender ~= "" and type(snap) == "table" then
-			count = count + 1
-			if count > EarlyPrep.MAX_DEFERRED_SENDERS then
-				break
+		local restored = {
+			sessionId = persisted.sessionId,
+			profileId = persisted.profileId,
+			bySender = {},
+		}
+		local count = 0
+		for sender, snap in pairs(savedDeferred.bySender) do
+			if type(sender) == "string" and sender ~= "" and type(snap) == "table" then
+				count = count + 1
+				if count > EarlyPrep.MAX_DEFERRED_SENDERS then
+					break
+				end
+				local notice = EarlyPrep.NewNotice()
+				notice.sessionId = persisted.sessionId
+				notice.profileId = persisted.profileId
+				EarlyPrep.ApplyNotice(notice, persisted.sessionId, persisted.profileId, {
+					sessionId = persisted.sessionId,
+					profileId = persisted.profileId,
+					warned = snap.warned,
+					raidCheckBegun = snap.raidCheckBegun == true,
+				})
+				restored.bySender[sender] = notice
 			end
-			local notice = EarlyPrep.NewNotice()
-			notice.sessionId = persisted.sessionId
-			notice.profileId = persisted.profileId
-			EarlyPrep.ApplyNotice(notice, persisted.sessionId, persisted.profileId, {
-				sessionId = persisted.sessionId,
-				profileId = persisted.profileId,
-				warned = snap.warned,
-				raidCheckBegun = snap.raidCheckBegun == true,
-			})
-			restored.bySender[sender] = notice
+		end
+		if next(restored.bySender) ~= nil then
+			self._deferredNotices = restored
 		end
 	end
-	if next(restored.bySender) ~= nil then
-		self._deferredNotices = restored
-	end
+
+	self:RestoreOutboundPending()
 end
 
 function EarlyPrep:OnSessionReset(reason)

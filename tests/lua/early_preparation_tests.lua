@@ -675,6 +675,35 @@ EarlyPrep:ObserveRemoteCoverage({
 })
 assertTrue(not EarlyPrep._outboundPending, "a covering coordinator snapshot clears outbound pending")
 
+SF.LootHelperSync.state.isCoordinator = false
+EarlyPrep:ClearOutboundPending()
+EarlyPrep.notice = EarlyPrep.NewNotice()
+local restoreNotice = {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	prepNotice = {
+		sessionId = "session-a",
+		profileId = "profile-a",
+		warned = { "Bob-Realm" },
+		raidCheckBegun = true,
+	},
+}
+EarlyPrep:RestorePersisted(restoreNotice)
+assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "restore rebuilds the warned set")
+assertTrue(EarlyPrep.notice.raidCheckBegun == true, "restore rebuilds raid check begun")
+assertTrue(EarlyPrep._outboundPending == true, "restore keeps non-coordinator publication pending")
+SF.LootHelperSync.state.isCoordinator = true
+EarlyPrep:ClearOutboundPending()
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep:RestorePersisted(restoreNotice)
+assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "coordinator restore still rebuilds the warned set")
+assertTrue(not EarlyPrep._outboundPending, "a restored coordinator does not keep outbound pending")
+SF.LootHelperSync.state.isCoordinator = false
+EarlyPrep._skipStamp = { ["Bob-Realm"] = "remote|1|ready|1|0|0|cfg" }
+assertTrue(EarlyPrep:InvalidateObservationSkips("tooltip"), "observation skips can be cleared")
+assertEq(EarlyPrep._skipStamp, nil, "invalidate clears every observation skip")
+assertTrue(not EarlyPrep:InvalidateObservationSkips("tooltip"), "a second invalidate is a no-op")
+
 IsInRaid = function()
 	return true
 end

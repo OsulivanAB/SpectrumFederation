@@ -240,6 +240,12 @@ def test_early_preparation_whispers_production_lua():
     assert "RC.InspectFallbackEntry(entry)" in inspect_ready_fn
     assert "entry and entry.slotsByInventory" not in inspect_ready_fn
     assert "entry and entry.overallEquippedItemLevel" not in inspect_ready_fn
+    stamp_fn = raid_check.split("function RC:GetPreparationObservationStamp", 1)[1]
+    stamp_fn = stamp_fn.split("\nfunction RC:", 1)[0]
+    assert "GetTroubleshootingVersion()" in stamp_fn
+    assert 'RC.CallEarlyPrep("InvalidateObservationSkips"' in raid_check
+    assert "function EarlyPrep:RestoreOutboundPending" in source
+    assert "function EarlyPrep:InvalidateObservationSkips" in source
 
 
 def test_parent_toc_loads_raid_equipment_modules():
