@@ -67,6 +67,11 @@ function Sync:_ConsumablesCoordinatorAccepts()
     if self.state.isCoordinator then return true end
     local coordinator = self.state.coordinator
     if type(coordinator) ~= "string" or coordinator == "" then return false end
+    -- An unproven catch-up coordinator has no stored grant. Do not ask them to
+    -- stamp events or grants until local history can authenticate them.
+    if self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(coordinator) then
+        return false
+    end
     local peers = self.state.peers
     local peer = type(peers) == "table" and peers[coordinator] or nil
     return type(peer) == "table" and peer.consumablesCapable == true
@@ -991,6 +996,13 @@ function Sync:HandleConsumablesEvent(sender, payload)
     if type(coordinator) == "string" and type(self._SamePlayer) == "function" then
         fromCoordinator = self:_SamePlayer(sender, coordinator) and true or false
     end
+    -- Relays from an unproven catch-up coordinator skip the member rate limit
+    -- and trust attacker-chosen writer fields. Quarantine until that sender is
+    -- canonical or their catch-up grant is stored locally.
+    if fromCoordinator and self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(sender) then
+        Debug("Verbose", "Ignored consumables event from unproven coordinator %s", tostring(sender))
+        return
+    end
     local accept, relay = S.RemoteEventAdmission(isCoordinator, fromCoordinator, event)
     if not accept then return end
     if not relay and S.AllowRemoteOp then
@@ -1106,6 +1118,10 @@ function Sync:HandleConsumablesTradeFreeze(sender, payload)
     local fromCoordinator = false
     if type(coordinator) == "string" and type(self._SamePlayer) == "function" then
         fromCoordinator = self:_SamePlayer(sender, coordinator) and true or false
+    end
+    if fromCoordinator and self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(sender) then
+        Debug("Verbose", "Ignored trade freeze from unproven coordinator %s", tostring(sender))
+        return
     end
     local now = C.Now and C.Now() or 0
     if isCoordinator and not fromCoordinator then

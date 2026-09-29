@@ -11,6 +11,7 @@ local Page = {
 }
 
 local function ItemName(itemId)
+	if itemId == nil then return nil end
 	if C_Item and C_Item.GetItemInfo then
 		local name = C_Item.GetItemInfo(itemId)
 		if type(name) == "string" and name ~= "" then

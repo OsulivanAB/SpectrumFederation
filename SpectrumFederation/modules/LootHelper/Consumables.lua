@@ -686,9 +686,15 @@ local function ConfigFingerprint(cfg)
     end
     hash = MixConfigText(hash, "a:" .. tostring(#keys))
     local mixed = 0
+    local assignedEpoch = {}
     for i = 1, keyCount do
         local row = cfg.assignments[keys[i]]
-        hash = MixConfigText(hash, tostring(row.itemId) .. ":" .. tostring(tonumber(row.epoch) or 0))
+        local itemId = tonumber(row.itemId)
+        local epoch = tonumber(row.epoch) or 0
+        hash = MixConfigText(hash, "ae:" .. tostring(row.itemId) .. ":" .. tostring(epoch))
+        if itemId then
+            assignedEpoch[itemId] = epoch
+        end
         local names = SortedCopy(row.crafters)
         for n = 1, #names do
             if mixed >= C.MAX_ASSIGNMENT_PAIRS then break end
@@ -697,11 +703,23 @@ local function ConfigFingerprint(cfg)
         end
         if mixed >= C.MAX_ASSIGNMENT_PAIRS then break end
     end
+    -- Active assignment epochs already mixed above. itemEpochs for those same
+    -- values would XOR-cancel under MixConfigText even with distinct prefixes,
+    -- because the weak hash keeps a near-constant XOR across matching suffixes.
+    -- Keep only watermarks that are not already represented by an active row.
     local epochs = ItemEpochRows(cfg)
-    if #epochs > 0 then
-        hash = MixConfigText(hash, "e:" .. tostring(#epochs))
-        for i = 1, #epochs do
-            hash = MixConfigText(hash, tostring(epochs[i].itemId) .. ":" .. tostring(epochs[i].epoch))
+    local extra = {}
+    for i = 1, #epochs do
+        local itemId = epochs[i].itemId
+        local epoch = epochs[i].epoch
+        if assignedEpoch[itemId] ~= epoch then
+            extra[#extra + 1] = epochs[i]
+        end
+    end
+    if #extra > 0 then
+        hash = MixConfigText(hash, "e:" .. tostring(#extra))
+        for i = 1, #extra do
+            hash = MixConfigText(hash, "ie:" .. tostring(extra[i].itemId) .. ":" .. tostring(extra[i].epoch))
         end
     end
     return hash
@@ -1190,14 +1208,51 @@ function C.AppendArchivedEvent(profile, event, opts)
     if not exempt then
         bound.archiveCounts[quotaKey] = (bound.archiveCounts[quotaKey] or 0) + 1
     end
+    local evicted = nil
     while #archive > C.MAX_ARCHIVED_EVENTS do
-        if not EvictArchivedAt(profile, 1) then break end
+        local dropped = EvictArchivedAt(profile, 1)
+        if not dropped then break end
+        if opts and opts.collectEvicted then
+            evicted = evicted or {}
+            evicted[#evicted + 1] = dropped
+        end
     end
     cfg.archiveCount = #archive
     if not (opts and opts.silent) then
         Notify()
     end
-    return true, "archived"
+    return true, "archived", evicted
+end
+
+local function RestoreArchivedFront(profile, record)
+    if type(record) ~= "table" or type(record.id) ~= "string" or record.id == "" then
+        return false
+    end
+    local bound = EventIds(profile)
+    if bound.ids[record.id] then
+        return false
+    end
+    local archive = ArchiveList(profile)
+    table.insert(archive, 1, record)
+    bound.ids[record.id] = record
+    local cfg = profile._consumables
+    if type(cfg) == "table" then
+        cfg.archiveFingerprint = MixFingerprint(cfg.archiveFingerprint, record.id, record.order, record)
+        cfg.archiveCount = #archive
+    end
+    if not ArchiveQuotaExempt(record) then
+        bound.archiveCounts = bound.archiveCounts or {}
+        local key = QuotaBucket(record)
+        bound.archiveCounts[key] = (bound.archiveCounts[key] or 0) + 1
+    end
+    return true
+end
+
+local function NoteCollectedEvictions(into, dropped)
+    if type(dropped) ~= "table" or type(into) ~= "table" then return end
+    for i = 1, #dropped do
+        into[#into + 1] = dropped[i]
+    end
 end
 
 function C.StampOrder(profile, event)
@@ -2090,7 +2145,8 @@ function C.MergeSnapshot(profile, data, opts)
             if status == "replaced" then replacedBody = true end
             if fromCoordinator and replace and (status == "full" or status == "quota") then
                 deferred = deferred or {}
-                if #deferred < C.MAX_LEDGER_EVENTS then
+                local deferredCap = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
+                if #deferred < deferredCap then
                     deferred[#deferred + 1] = data.events[i]
                 end
             end
@@ -2105,7 +2161,8 @@ function C.MergeSnapshot(profile, data, opts)
         end
         if fromCoordinator and type(deferred) == "table" then
             local retryLimit = #deferred
-            if retryLimit > C.MAX_LEDGER_EVENTS then retryLimit = C.MAX_LEDGER_EVENTS end
+            local deferredCap = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
+            if retryLimit > deferredCap then retryLimit = deferredCap end
             for i = 1, retryLimit do
                 local _, status = C.AppendEvent(profile, deferred[i], {
                     silent = true,
@@ -2192,6 +2249,7 @@ function C.CommitEvents(profile, token, events, opts)
     local wrote = false
     local failed = nil
     local added = {}
+    local evicted = {}
     for i = 1, #(events or {}) do
         local event = events[i]
         if type(event) == "table" then
@@ -2201,7 +2259,11 @@ function C.CommitEvents(profile, token, events, opts)
                     event.writer = writer
                 end
             end
-            local ok, status = C.AppendEvent(profile, event, { silent = true })
+            local ok, status, dropped = C.AppendEvent(profile, event, {
+                silent = true,
+                collectEvicted = true,
+            })
+            NoteCollectedEvictions(evicted, dropped)
             if not ok then
                 failed = status or "Could not record that raid supplies change."
                 break
@@ -2211,7 +2273,7 @@ function C.CommitEvents(profile, token, events, opts)
             end
         end
     end
-    if failed and #added > 0 then
+    if failed and (#added > 0 or #evicted > 0) then
         local drop = {}
         for i = 1, #added do
             drop[added[i]] = true
@@ -2229,6 +2291,12 @@ function C.CommitEvents(profile, token, events, opts)
         end
         profile._consumableEvents = keepRows(profile._consumableEvents)
         profile._consumableEventArchive = keepRows(profile._consumableEventArchive)
+        -- AppendArchivedEvent may have evicted unrelated oldest rows before a
+        -- later event failed. Restore those rows so a rejected batch leaves
+        -- historical accounting intact.
+        for i = #evicted, 1, -1 do
+            RestoreArchivedFront(profile, evicted[i])
+        end
         RebuildIndex(profile)
         Invalidate(profile)
         wrote = false

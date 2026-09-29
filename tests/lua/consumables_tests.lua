@@ -883,7 +883,29 @@ local secureTemplates = {}
 local function FrameMock()
     local frame = {}
     function frame:SetSize() end
-    function frame:SetPoint() end
+    function frame:SetPoint(point, relativeTo, relativePoint, x, y)
+        self.anchorPoint = point
+        self.anchorTo = relativeTo
+        self.anchorRelative = relativePoint
+        self.anchorX = x
+        self.anchorY = y
+    end
+    function frame:ClearAllPoints()
+        self.anchorPoint = nil
+        self.anchorTo = nil
+        self.anchorRelative = nil
+        self.anchorX = nil
+        self.anchorY = nil
+    end
+    function frame:SetAllPoints(relativeTo)
+        self.allPointsTo = relativeTo
+    end
+    function frame:GetLeft()
+        return self.left or 100
+    end
+    function frame:GetBottom()
+        return self.bottom or 200
+    end
     function frame:SetFrameStrata() end
     function frame:EnableMouse() end
     function frame:SetMovable() end
@@ -905,14 +927,23 @@ local function FrameMock()
     function frame:SetHeight() end
     function frame:SetAutoFocus() end
     function frame:SetNumeric() end
-    function frame:Hide() end
-    function frame:Show() end
+    function frame:Hide()
+        self.hideCalls = (self.hideCalls or 0) + 1
+        self.shown = false
+    end
+    function frame:Show()
+        self.showCalls = (self.showCalls or 0) + 1
+        self.shown = true
+    end
     function frame:SetScrollChild() end
-    function frame:SetShown() end
+    function frame:SetShown(shown)
+        self.shownCalls = (self.shownCalls or 0) + 1
+        self.shown = shown and true or false
+    end
     function frame:SetAttribute() end
     function frame:Enable() end
     function frame:Disable() end
-    function frame:IsShown() return false end
+    function frame:IsShown() return self.shown == true end
     function frame:CreateFontString() return FrameMock() end
     return frame
 end
@@ -998,15 +1029,30 @@ assertEq(RT.review.stoppedMoving, 2, "releasing the review out of combat stops m
 local mobile = RT:EnsureMobileButton()
 assertTrue(mobile ~= nil, "the banking button is created once combat ends")
 assertEq(#secureTemplates, 1, "the secure button is created only outside combat")
-assertTrue(mobile.parent == RT.review, "the secure banking button is a child of the review")
+assertTrue(mobile.parent ~= RT.review, "the secure banking button is not a child of the review")
+assertTrue(mobile.parent == RT.mobileHolder, "the secure banking button is a child of the UIParent holder")
+assertTrue(RT.mobileHolder.parent == UIParent, "the banking holder is parented to UIParent")
+RT:PlaceMobileHolder()
+assertEq(RT.mobileHolder.anchorTo, UIParent, "the banking holder anchors to UIParent, not the review")
+assertTrue(RT.mobileHolder.anchorTo ~= RT.review, "the banking holder is not anchored to the review")
 mobile.shownCalls = 0
 mobile.SetShown = function(self)
     self.shownCalls = (self.shownCalls or 0) + 1
 end
+holderHideBefore = RT.mobileHolder.hideCalls or 0
 function InCombatLockdown() return true end
 RT.review.scripts.OnHide()
 assertEq(mobile.shownCalls, 0, "closing the review during combat does not show or hide the secure button")
+assertEq(RT.mobileHolder.hideCalls or 0, holderHideBefore, "closing the review during combat does not hide the banking holder")
 function InCombatLockdown() return false end
+RT.review.shown = false
+RT.lastAccess = { action = "mobile" }
+savedMobileSpell = RT.MobileSpell
+RT.MobileSpell = function() return "Mobile Banking" end
+RT:SyncMobileButton()
+assertTrue((RT.mobileHolder.hideCalls or 0) > holderHideBefore, "out of combat, Sync hides the holder when the review is not shown")
+RT.MobileSpell = savedMobileSpell
+RT.lastAccess = nil
 
 local archiveCap = C.MAX_LEDGER_EVENTS
 C.MAX_LEDGER_EVENTS = 1
@@ -3067,7 +3113,7 @@ local function checkCodexRound()
 end
 checkCodexRound()
 
-local function checkShelveAndCapability()
+function checkShelveAndCapability()
     local shelveP = profile("shelve-quota", admin)
     local function donate(gen, n, who)
         return {
@@ -5007,6 +5053,197 @@ function checkTradeRangeAndAnnounce()
     Sync._FlushUnsentConsumablesEvents = savedFlush
 end
 checkTradeRangeAndAnnounce()
+
+function checkSecureAndFingerprintRound()
+    -- Active assignment epochs must not XOR-cancel against itemEpochs watermarks.
+    local left = profile("fp-epoch-left", admin)
+    local right = profile("fp-epoch-right", admin)
+    assertTrue(select(1, C.AddCrafter(left, admin, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddCrafter(right, admin, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(left, admin, aqirite, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(right, admin, aqirite, vann, { asAdmin = true })))
+    left._consumables.assignments[tostring(aqirite)].epoch = 3
+    right._consumables.assignments[tostring(aqirite)].epoch = 7
+    left._consumables.itemEpochs = { [aqirite] = 3, [aqiriteRank2] = 5 }
+    right._consumables.itemEpochs = { [aqirite] = 7, [aqiriteRank2] = 5 }
+    left._consumables.configSeq = 4
+    right._consumables.configSeq = 4
+    local leftFp = C.Descriptor(left).configFingerprint
+    local rightFp = C.Descriptor(right).configFingerprint
+    assertTrue(leftFp ~= rightFp, "matching configSeq still differs when active assignment epochs differ")
+    local sameActive = profile("fp-epoch-same", admin)
+    assertTrue(select(1, C.AddCrafter(sameActive, admin, vann, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(sameActive, admin, aqirite, vann, { asAdmin = true })))
+    sameActive._consumables.assignments[tostring(aqirite)].epoch = 3
+    sameActive._consumables.itemEpochs = { [aqirite] = 3, [aqiriteRank2] = 9 }
+    sameActive._consumables.configSeq = 4
+    local withMark = C.Descriptor(sameActive).configFingerprint
+    sameActive._consumables.itemEpochs = { [aqirite] = 3, [aqiriteRank2] = 4 }
+    local otherMark = C.Descriptor(sameActive).configFingerprint
+    assertTrue(withMark ~= otherMark, "a retired item watermark still changes the configuration fingerprint")
+
+    -- Configuration-reset rows have no item id; logs must not call GetItemInfo(nil).
+    local logP = profile("reset-log", admin)
+    assertTrue(select(1, C.AppendEvent(logP, {
+        id = "ce:reset-log:" .. admin .. ":1",
+        type = C.EVENT.RESET,
+        actor = admin,
+        writer = admin,
+        generation = 1,
+        timestamp = 1,
+    }, { silent = true })), "a configuration reset can be stored")
+    local savedItem = C_Item
+    local nilLookup = false
+    C_Item = {
+        GetItemInfo = function(itemId)
+            if itemId == nil then
+                nilLookup = true
+                error("itemInfo is non-nilable")
+            end
+            return "Aqirite"
+        end,
+    }
+    local rowsOk, rows = pcall(C.HistoryRows, logP)
+    C_Item = savedItem
+    assertTrue(rowsOk, "history rows tolerate a configuration reset with no item id")
+    assertFalse(nilLookup, "configuration-reset history does not look up a nil item id")
+
+    -- A rejected multi-event archive batch must restore rows it evicted.
+    local savedArchiveCap = C.MAX_ARCHIVED_EVENTS
+    local savedActorCap = C.MAX_EVENTS_PER_ACTOR
+    C.MAX_ARCHIVED_EVENTS = 2
+    C.MAX_EVENTS_PER_ACTOR = 2
+    local rollP = profile("archive-roll", admin)
+    rollP._consumables.generation = 2
+    local keepId = "ce:archive-roll:keep:1"
+    local otherId = "ce:archive-roll:other:1"
+    assertTrue(select(1, C.AppendArchivedEvent(rollP, {
+        id = keepId, type = C.EVENT.DONATION, actor = "Other-Realm", writer = "Other-Realm",
+        itemId = aqirite, quantity = 1, generation = 1, timestamp = 1,
+    }, { silent = true })), "the archive fixture stores an unrelated older row")
+    assertTrue(select(1, C.AppendArchivedEvent(rollP, {
+        id = otherId, type = C.EVENT.DONATION, actor = admin, writer = admin,
+        itemId = aqirite, quantity = 1, generation = 1, timestamp = 2,
+    }, { silent = true })), "the archive fixture stores one row for this writer")
+    local batchOk = C.CommitEvents(rollP, "trade-" .. admin .. "-archive", {
+        { type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1 },
+        { type = C.EVENT.DONATION, actor = admin, itemId = aqirite, quantity = 1, generation = 1 },
+    }, { writer = admin })
+    assertFalse(batchOk, "a batch that exceeds the archive writer quota is rejected")
+    assertTrue(hasEvent(rollP._consumableEventArchive, keepId), "a rejected archive batch restores the unrelated eviction")
+    assertTrue(hasEvent(rollP._consumableEventArchive, otherId), "a rejected archive batch keeps the prior writer row")
+    C.MAX_ARCHIVED_EVENTS = savedArchiveCap
+    C.MAX_EVENTS_PER_ACTOR = savedActorCap
+
+    -- Split deposits reuse the residual source stack across target slots.
+    local depositP = profile("deposit-split", admin)
+    assertTrue(select(1, C.SetGuild(depositP, admin, { guid = "club-split", name = "Spectrum", realm = "Realm" }, 1, { asAdmin = true })))
+    assertTrue(select(1, C.AddCrafter(depositP, admin, admin, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(depositP, admin, aqirite, admin, { asAdmin = true })))
+    local savedContainer = C_Container
+    local savedPickup = PickupGuildBankItem
+    local savedNum = GetGuildBankNumSlots
+    local savedLink = GetGuildBankItemLink
+    local savedInfo = GetGuildBankItemInfo
+    local savedItemApi = C_Item
+    local savedBankOpen = RT.BankIsOpen
+    local savedGuild = RT.CurrentGuild
+    local savedBags = RT.bagCounts
+    local savedStacks = RT.bagStacks
+    local splits = {}
+    local places = {}
+    C_Container = {
+        SplitContainerItem = function(bag, slot, take)
+            splits[#splits + 1] = { bag = bag, slot = slot, take = take }
+        end,
+        PickupContainerItem = function() end,
+    }
+    PickupGuildBankItem = function(tab, slot)
+        places[#places + 1] = { tab = tab, slot = slot }
+    end
+    GetGuildBankNumSlots = function() return 3 end
+    GetGuildBankItemLink = function(_, slot)
+        if slot == 1 or slot == 2 then return "item:" .. tostring(aqirite) end
+        return nil
+    end
+    GetGuildBankItemInfo = function(_, slot)
+        if slot == 1 then return nil, 18 end
+        if slot == 2 then return nil, 18 end
+        return nil, 0
+    end
+    C_Item = { GetItemMaxStackSizeByID = function() return 20 end }
+    RT.BankIsOpen = function() return true end
+    RT.CurrentGuild = function() return { guid = "club-split" } end
+    RT.bagCounts = { [aqirite] = 5 }
+    RT.bagStacks = { [aqirite] = { { bag = 0, slot = 1, count = 5 } } }
+    RT:BeginDeposit({ itemId = aqirite, quantity = 5, recipient = "guildbank" }, {
+        profile = depositP,
+        inGroup = {},
+        compatible = {},
+        inRange = {},
+        usable = true,
+    })
+    assertEq(#places, 3, "a large source stack continues into later deposit targets")
+    assertEq(#splits, 2, "partial fills split; the final residual pickup uses the whole remainder")
+    assertEq(splits[1].take, 2, "the first deposit takes only the first target's room")
+    assertEq(splits[2].take, 2, "the second deposit continues with residual stack room")
+    assertEq(places[3] and places[3].slot, 3, "the final residual stack fills the next empty target")
+    C_Container = savedContainer
+    PickupGuildBankItem = savedPickup
+    GetGuildBankNumSlots = savedNum
+    GetGuildBankItemLink = savedLink
+    GetGuildBankItemInfo = savedInfo
+    C_Item = savedItemApi
+    RT.BankIsOpen = savedBankOpen
+    RT.CurrentGuild = savedGuild
+    RT.bagCounts = savedBags
+    RT.bagStacks = savedStacks
+
+    -- Unproven catch-up coordinators cannot inject stamped relays.
+    local savedState = Sync.state
+    local savedUnproven = Sync._UnprovenCatchUpKeepalive
+    local relayP = profile("unproven-relay", admin)
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "FakeCoord-Realm",
+        sessionId = "unproven-session",
+        profileId = relayP._profileId,
+        peers = { ["FakeCoord-Realm"] = { consumablesCapable = true } },
+    }
+    Sync._UnprovenCatchUpKeepalive = function(_, name)
+        return name == "FakeCoord-Realm"
+    end
+    Sync.FindLocalProfileById = function() return relayP end
+    local savedGroup = Sync.IsRequesterInGroup
+    local savedSame = Sync._SamePlayer
+    Sync.IsRequesterInGroup = function() return true end
+    Sync._SamePlayer = function(_, a, b) return a == b end
+    local beforeCount = #(relayP._consumableEvents or {})
+    Sync:HandleConsumablesEvent("FakeCoord-Realm", {
+        sessionId = "unproven-session",
+        profileId = relayP._profileId,
+        event = {
+            id = "ce:unproven:" .. admin .. ":1",
+            type = C.EVENT.DONATION,
+            actor = admin,
+            writer = admin,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            timestamp = 1,
+            order = 9,
+        },
+    })
+    assertEq(#(relayP._consumableEvents or {}), beforeCount, "an unproven coordinator relay is not admitted")
+    assertFalse(Sync:_ConsumablesCoordinatorAccepts(), "an unproven coordinator is not asked to stamp consumables")
+    Sync.IsRequesterInGroup = savedGroup
+    Sync._SamePlayer = savedSame
+    Sync._UnprovenCatchUpKeepalive = savedUnproven
+    Sync.FindLocalProfileById = nil
+    Sync.state = savedState
+end
+checkSecureAndFingerprintRound()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

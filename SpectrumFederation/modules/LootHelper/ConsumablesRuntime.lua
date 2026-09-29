@@ -789,6 +789,11 @@ function Runtime:EnsureReview()
     end)
     frame:SetScript("OnDragStop", function(selfFrame)
         selfFrame:StopMovingOrSizing()
+        if InCombat() then
+            self.mobileButtonPending = true
+            return
+        end
+        self:PlaceMobileHolder()
     end)
     frame:SetScript("OnHide", function()
         self:SyncRangeTicker()
@@ -827,6 +832,18 @@ function Runtime:EnsureReview()
     return frame
 end
 
+function Runtime:PlaceMobileHolder()
+    local frame = self.review
+    local holder = frame and frame.MobileHolder
+    if not frame or not holder or InCombat() then return end
+    local left = frame.GetLeft and frame:GetLeft()
+    local bottom = frame.GetBottom and frame:GetBottom()
+    if not left or not bottom then return end
+    if holder.ClearAllPoints then holder:ClearAllPoints() end
+    -- Screen coordinates only. Anchoring to the review would protect it in combat.
+    holder:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", left + 16, bottom + 14)
+end
+
 function Runtime:EnsureMobileButton()
     local frame = self.review
     if not frame then return nil end
@@ -836,12 +853,22 @@ function Runtime:EnsureMobileButton()
         return nil
     end
     self.mobileButtonPending = nil
-    local mobile = CreateFrame("Button", nil, frame, "SecureActionButtonTemplate,UIPanelButtonTemplate")
+    local holder = self.mobileHolder
+    if not holder then
+        holder = CreateFrame("Frame", "SpectrumFederationRaidSuppliesMobile", UIParent)
+        holder:SetSize(160, 22)
+        if holder.SetFrameStrata then holder:SetFrameStrata("DIALOG") end
+        holder:Hide()
+        self.mobileHolder = holder
+    end
+    local mobile = CreateFrame("Button", nil, holder, "SecureActionButtonTemplate,UIPanelButtonTemplate")
     mobile:SetSize(160, 22)
-    mobile:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 16, 14)
+    if mobile.SetAllPoints then mobile:SetAllPoints(holder) end
     mobile:SetText("Mobile Banking")
     mobile:Hide()
     frame.Mobile = mobile
+    frame.MobileHolder = holder
+    self:PlaceMobileHolder()
     return mobile
 end
 
@@ -856,11 +883,16 @@ function Runtime:SyncMobileButton()
         return
     end
     self.mobileButtonPending = nil
+    self:PlaceMobileHolder()
     local button = frame.Mobile
+    local holder = frame.MobileHolder
     local spell = self:MobileSpell()
     local access = self.lastAccess
     local reviewShown = frame.IsShown and frame:IsShown()
     local show = reviewShown and access and access.action == "mobile" and spell ~= nil
+    if holder then
+        if show then holder:Show() else holder:Hide() end
+    end
     button:SetShown(show and true or false)
     if not show then return end
     button:SetAttribute("type", "spell")
@@ -1333,25 +1365,29 @@ function Runtime:BeginDeposit(line, collected)
     for i = 1, #stacks do
         if remaining <= 0 or placed >= MAX_DEPOSIT_PLACES then break end
         local stack = stacks[i]
-        local take = math.min(remaining, stack.count)
-        local target = targets[placed + 1]
-        if not target or take <= 0 then break end
-        if type(target.room) == "number" and take > target.room then
-            take = target.room
+        local stackLeft = tonumber(stack.count) or 0
+        while stackLeft > 0 and remaining > 0 and placed < MAX_DEPOSIT_PLACES do
+            local take = math.min(remaining, stackLeft)
+            local target = targets[placed + 1]
+            if not target or take <= 0 then break end
+            if type(target.room) == "number" and take > target.room then
+                take = target.room
+            end
+            if take <= 0 then break end
+            if take < stackLeft and container.SplitContainerItem then
+                container.SplitContainerItem(stack.bag, stack.slot, take)
+            elseif container.PickupContainerItem then
+                container.PickupContainerItem(stack.bag, stack.slot)
+            end
+            places[#places + 1] = {
+                slot = target.slot,
+                before = self:SlotItemCount(tab, target.slot, line.itemId),
+            }
+            PickupGuildBankItem(tab, target.slot)
+            remaining = remaining - take
+            stackLeft = stackLeft - take
+            placed = placed + 1
         end
-        if take <= 0 then break end
-        if take < stack.count and container.SplitContainerItem then
-            container.SplitContainerItem(stack.bag, stack.slot, take)
-        elseif container.PickupContainerItem then
-            container.PickupContainerItem(stack.bag, stack.slot)
-        end
-        places[#places + 1] = {
-            slot = target.slot,
-            before = self:SlotItemCount(tab, target.slot, line.itemId),
-        }
-        PickupGuildBankItem(tab, target.slot)
-        remaining = remaining - take
-        placed = placed + 1
     end
     self.placingDeposit = false
     if placed <= 0 then
