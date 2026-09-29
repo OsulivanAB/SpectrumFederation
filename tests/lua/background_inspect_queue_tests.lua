@@ -284,6 +284,35 @@ local changedStamp = RC:GetPreparationObservationStamp("A-Realm", {
 })
 assertTrue(changedStamp ~= stamp, "a policy change changes the observation stamp")
 
+assertEq(RC.InspectFallbackEntry(nil), nil, "a missing cache entry is not a fallback")
+assertEq(RC.InspectFallbackEntry({ blended = true, slotsByInventory = {} }), nil, "a blended entry is not a fallback")
+local unblended = { blended = false, slotsByInventory = { [1] = { link = "item" } }, overallEquippedItemLevel = 700 }
+assertEq(RC.InspectFallbackEntry(unblended), unblended, "an unblended entry remains a fallback")
+local unmarked = { slotsByInventory = { [1] = { link = "item" } } }
+assertEq(RC.InspectFallbackEntry(unmarked), unmarked, "an unmarked entry remains a fallback source")
+
+local handlerErrors = {}
+geterrorhandler = function()
+	return function(err)
+		handlerErrors[#handlerErrors + 1] = err
+	end
+end
+SF.RaidEquipment = SF.RaidEquipment or {}
+SF.RaidEquipment.EarlyPreparation = {
+	OnBackgroundPass = function()
+		error("background boom")
+	end,
+	Notify = function()
+		error("notify boom")
+	end,
+}
+RC.CallEarlyPrep("OnBackgroundPass")
+assertEq(#handlerErrors, 1, "CallEarlyPrep reports OnBackgroundPass errors")
+RC.CallEarlyPrep("Notify", "roster")
+assertEq(#handlerErrors, 2, "CallEarlyPrep reports Notify errors")
+RC.CallEarlyPrep("MissingMethod")
+assertEq(#handlerErrors, 2, "a missing Early Preparation method is a no-op")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
 	os.exit(1)

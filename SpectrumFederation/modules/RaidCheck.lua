@@ -9,7 +9,7 @@ local addonName, SF = ...
 -- luacheck: globals EMPTY_SOCKET_HYDRAULIC EMPTY_SOCKET_COGWHEEL EMPTY_SOCKET_DOMINATION EMPTY_SOCKET_TINKER EMPTY_SOCKET_PRIMORDIAL
 -- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage C_ChatInfo UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
--- luacheck: globals InspectFrame InspectUnit hooksecurefunc canaccessvalue
+-- luacheck: globals InspectFrame InspectUnit hooksecurefunc canaccessvalue geterrorhandler
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -1553,6 +1553,36 @@ function RC:_InvalidateInspectUnit(unit)
 	self:_NotifyTroubleshootingListeners()
 end
 
+-- A blended cache entry already reused older slots or item level. Copying from
+-- it again can keep the next inspect incomplete forever.
+function RC.InspectFallbackEntry(entry)
+	if type(entry) ~= "table" or entry.blended == true then
+		return nil
+	end
+	return entry
+end
+
+-- Early Preparation evaluation must not stop the shared inspect monitor or
+-- skip remaining roster/combat work. Keep unexpected errors observable.
+function RC.CallEarlyPrep(method, ...)
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	if not (earlyPrep and type(earlyPrep[method]) == "function") then
+		return
+	end
+	local ok, err = pcall(earlyPrep[method], earlyPrep, ...)
+	if ok then
+		return
+	end
+	local handler = geterrorhandler and geterrorhandler()
+	if type(handler) == "function" then
+		handler(err)
+		return
+	end
+	if SF.Debug then
+		SF.Debug:Error("RAID_CHECK", "Early preparation %s failed: %s", tostring(method), tostring(err))
+	end
+end
+
 function RC:_PrimeBackgroundInspectQueue()
 	local state = self:_GetInspectState()
 	if not state.backgroundInspectEnabled then
@@ -1629,10 +1659,7 @@ function RC:_StartBackgroundInspectMonitor()
 		end
 
 		self:_RunBackgroundInspectPass()
-		local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
-		if earlyPrep and earlyPrep.OnBackgroundPass then
-			earlyPrep:OnBackgroundPass()
-		end
+		RC.CallEarlyPrep("OnBackgroundPass")
 		C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, BackgroundInspectTick)
 	end
 
@@ -1698,10 +1725,7 @@ function RC:_ResumeInspectAfterCombat()
 	end
 	self:_ProcessInspectQueue()
 	self:_RunBackgroundInspectPass()
-	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
-	if earlyPrep and earlyPrep.OnBackgroundPass then
-		earlyPrep:OnBackgroundPass()
-	end
+	RC.CallEarlyPrep("OnBackgroundPass")
 	self:_MarkTroubleshootingDirty()
 	self:_NotifyTroubleshootingListeners()
 end
@@ -1765,10 +1789,7 @@ function RC:EnsureInspectSupport()
 			self:_NotifyTroubleshootingListeners()
 			-- Close or reopen the raid-only Early Preparation window before any
 			-- retained queue work or background pass can inspect a party member.
-			local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
-			if earlyPrep and earlyPrep.Notify then
-				earlyPrep:Notify("roster")
-			end
+			RC.CallEarlyPrep("Notify", "roster")
 			self:_ProcessInspectQueue()
 			self:_RunBackgroundInspectPass()
 		end
@@ -2142,7 +2163,8 @@ function RC:_HandleInspectReady(guid)
 		-- it has real data, but do not overwrite a previously-known slot with a
 		-- completely blank result.
 		local blended = false
-		local fallbackSlots = entry and entry.slotsByInventory or nil
+		local fallbackEntry = RC.InspectFallbackEntry(entry)
+		local fallbackSlots = fallbackEntry and fallbackEntry.slotsByInventory or nil
 		if type(fallbackSlots) == "table" then
 			for inventorySlot, fallbackSlot in pairs(fallbackSlots) do
 				if type(inventorySlot) == "number" and type(fallbackSlot) == "table" then
@@ -2170,7 +2192,7 @@ function RC:_HandleInspectReady(guid)
 		local freshItemLevel = CanonicalOverallItemLevel(captured.overallEquippedItemLevel)
 		captured.overallEquippedItemLevel = KeepKnownOverallItemLevel(
 			captured.overallEquippedItemLevel,
-			entry and entry.overallEquippedItemLevel
+			fallbackEntry and fallbackEntry.overallEquippedItemLevel
 		)
 		if not freshItemLevel and CanonicalOverallItemLevel(captured.overallEquippedItemLevel) then
 			blended = true

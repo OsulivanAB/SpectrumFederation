@@ -227,9 +227,19 @@ def test_early_preparation_whispers_production_lua():
     assert "RetryOutboundNotice" in source
     roster = raid_check.split('elseif event == "GROUP_ROSTER_UPDATE" then', 1)[1]
     roster = roster.split("\n\tend)", 1)[0]
-    assert roster.index('earlyPrep:Notify("roster")') < roster.index("self:_ProcessInspectQueue()")
-    assert roster.index('earlyPrep:Notify("roster")') < roster.index("self:_RunBackgroundInspectPass()")
+    assert roster.index('RC.CallEarlyPrep("Notify", "roster")') < roster.index("self:_ProcessInspectQueue()")
+    assert roster.index('RC.CallEarlyPrep("Notify", "roster")') < roster.index("self:_RunBackgroundInspectPass()")
     assert "deferredPrepNotices" in public_api
+    assert "function RC.CallEarlyPrep" in raid_check
+    assert "function RC.InspectFallbackEntry" in raid_check
+    tick = raid_check.split("local function BackgroundInspectTick()", 1)[1]
+    tick = tick.split("\n\tend", 1)[0]
+    assert tick.index('RC.CallEarlyPrep("OnBackgroundPass")') < tick.index("C_Timer.After")
+    inspect_ready_fn = raid_check.split("function RC:_HandleInspectReady", 1)[1]
+    inspect_ready_fn = inspect_ready_fn.split("\nfunction RC:", 1)[0]
+    assert "RC.InspectFallbackEntry(entry)" in inspect_ready_fn
+    assert "entry and entry.slotsByInventory" not in inspect_ready_fn
+    assert "entry and entry.overallEquippedItemLevel" not in inspect_ready_fn
 
 
 def test_parent_toc_loads_raid_equipment_modules():
