@@ -650,6 +650,8 @@ function EarlyPrep:OnSessionReset(reason)
 	self._rejectLogged = {}
 	self._deferredNotices = nil
 	self._skipStamp = nil
+	self._evaluating = false
+	self._refreshing = false
 	local raidCheck = SF.RaidCheck
 	if raidCheck and type(raidCheck.SetBackgroundInspectEnabled) == "function" then
 		raidCheck:SetBackgroundInspectEnabled(false, self.CONSUMER_REASON)
@@ -1055,8 +1057,11 @@ function EarlyPrep:OnMemberObserved(memberId)
 		return
 	end
 	self._evaluating = true
-	self:EvaluateMember(memberId)
+	local ok, err = pcall(self.EvaluateMember, self, memberId)
 	self._evaluating = false
+	if not ok then
+		error(err, 0)
+	end
 end
 
 function EarlyPrep:OnBackgroundPass()
@@ -1112,45 +1117,51 @@ function EarlyPrep:Refresh(reason)
 		return
 	end
 	self._refreshing = true
-	self:Install()
-	self:FlushDeferredPrepNotice()
-	self:SyncNoticeToSession()
+	-- Clear the refresh guard even when install, flush, or evaluation raises.
+	local ok, err = pcall(function()
+		self:Install()
+		self:FlushDeferredPrepNotice()
+		self:SyncNoticeToSession()
 
-	local open = self:ComputeWindow()
-	local wasOpen = self._windowOpen and true or false
-	local sync = SF.LootHelperSync
-	local isCoordinator = sync and sync.state and sync.state.active == true and sync.state.isCoordinator == true
-	local wasCoordinator = self._wasCoordinator and true or false
-	self._windowOpen = open
-	self._wasCoordinator = isCoordinator and true or false
+		local open = self:ComputeWindow()
+		local wasOpen = self._windowOpen and true or false
+		local sync = SF.LootHelperSync
+		local isCoordinator = sync and sync.state and sync.state.active == true and sync.state.isCoordinator == true
+		local wasCoordinator = self._wasCoordinator and true or false
+		self._windowOpen = open
+		self._wasCoordinator = isCoordinator and true or false
 
-	if open ~= wasOpen then
-		DebugInfo("Early preparation %s (%s)", open and "active" or "inactive", tostring(reason or "refresh"))
-	end
-	if isCoordinator ~= wasCoordinator then
-		DebugInfo("Coordinator responsibility %s (%s)", isCoordinator and "gained" or "lost", tostring(reason or "refresh"))
-	end
-
-	local raidCheck = SF.RaidCheck
-	if raidCheck and type(raidCheck.SetBackgroundInspectEnabled) == "function" then
-		local opts = nil
-		if open then
-			opts = { filter = EarlyPrep.EligibleFilter }
+		if open ~= wasOpen then
+			DebugInfo("Early preparation %s (%s)", open and "active" or "inactive", tostring(reason or "refresh"))
 		end
-		raidCheck:SetBackgroundInspectEnabled(open, self.CONSUMER_REASON, opts)
-	end
+		if isCoordinator ~= wasCoordinator then
+			DebugInfo("Coordinator responsibility %s (%s)", isCoordinator and "gained" or "lost", tostring(reason or "refresh"))
+		end
 
-	if isCoordinator and not wasCoordinator and self:HasShareableNotice() then
-		self:BroadcastNotice("snapshot")
-	end
-	-- Roster and heartbeat refreshes keep the window in sync. The inspect tick
-	-- and a newly ready observation still evaluate members, so an already-open
-	-- window does not scan the raid again on those reasons.
-	local rosterOrHeartbeat = reason == "roster" or reason == "heartbeat"
-	if open and (not wasOpen or not rosterOrHeartbeat) then
-		self:OnBackgroundPass()
-	end
+		local raidCheck = SF.RaidCheck
+		if raidCheck and type(raidCheck.SetBackgroundInspectEnabled) == "function" then
+			local opts = nil
+			if open then
+				opts = { filter = EarlyPrep.EligibleFilter }
+			end
+			raidCheck:SetBackgroundInspectEnabled(open, self.CONSUMER_REASON, opts)
+		end
+
+		if isCoordinator and not wasCoordinator and self:HasShareableNotice() then
+			self:BroadcastNotice("snapshot")
+		end
+		-- Roster and heartbeat refreshes keep the window in sync. The inspect tick
+		-- and a newly ready observation still evaluate members, so an already-open
+		-- window does not scan the raid again on those reasons.
+		local rosterOrHeartbeat = reason == "roster" or reason == "heartbeat"
+		if open and (not wasOpen or not rosterOrHeartbeat) then
+			self:OnBackgroundPass()
+		end
+	end)
 	self._refreshing = false
+	if not ok then
+		error(err, 0)
+	end
 end
 
 function EarlyPrep:Notify(reason)

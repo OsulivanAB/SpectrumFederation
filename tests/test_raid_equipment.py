@@ -163,6 +163,8 @@ def test_early_preparation_whispers_production_lua():
     assert "WasWarned" in unprepared
     assert "WasWarned" not in prepared
     assert "WhisperPrepared" in prepared
+    assert "DeliverMissingRequirementsWhisper" in unprepared
+    assert unprepared.index("DeliverMissingRequirementsWhisper") < unprepared.index("CommitWarned")
     equipment = (
         REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "RaidEquipment.lua"
     ).read_text(encoding="utf-8")
@@ -212,7 +214,13 @@ def test_early_preparation_whispers_production_lua():
     assert "PreparationFromCaptured" not in stamp
     reannounce_send = public_api.split("function Sync:ReannounceSession", 1)[1]
     assert reannounce_send.index("if not accepted") < reannounce_send.index("_ScheduleReannounceRetry")
+    assert "_HandleExhaustedReannounce" in reannounce_send
     assert "function Sync.ReannounceRetryDecision" in session_start
+    assert "coordinator_lost" in reannounce
+    reset = source.split("function EarlyPrep:OnSessionReset", 1)[1]
+    reset = reset.split("\nfunction ", 1)[0]
+    assert "_evaluating = false" in reset
+    assert "_refreshing = false" in reset
 
 
 def test_parent_toc_loads_raid_equipment_modules():

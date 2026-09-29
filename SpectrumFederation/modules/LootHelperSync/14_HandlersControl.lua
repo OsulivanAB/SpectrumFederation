@@ -740,6 +740,10 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
+        local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+        if earlyPrep and earlyPrep.Notify then
+            earlyPrep:Notify("coordinator_lost")
+        end
     elseif self.BackfillAutomaticBisOnPromotion then
         self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleCoordinatorTakeover")
     end

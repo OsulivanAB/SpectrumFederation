@@ -640,10 +640,40 @@ assert(loadfile("SpectrumFederation/modules/LootHelperSync/09_AdminConvergence.l
 local RetrySync = SyncSF.LootHelperSync
 assertEq(RetrySync.ReannounceRetryDecision(true, true, "session-a", nil, 0, false, 3), "schedule", "a failed reannounce can retry")
 assertEq(RetrySync.ReannounceRetryDecision(true, true, "session-a", nil, 0, true, 3), "wait", "a pending reannounce retry does not stack")
-assertEq(RetrySync.ReannounceRetryDecision(true, true, "session-a", nil, 3, false, 3), "stop", "reannounce retries stop at the cap")
+assertEq(RetrySync.ReannounceRetryDecision(true, true, "session-a", nil, 3, false, 3), "exhausted", "reannounce retries exhaust at the cap")
 assertEq(RetrySync.ReannounceRetryDecision(true, true, "session-a", "session-a", 0, false, 3), "stop", "an announced session does not retry reannounce")
 assertEq(RetrySync.ReannounceRetryDecision(true, false, "session-a", nil, 0, false, 3), "stop", "a non-coordinator does not retry reannounce")
 assertEq(RetrySync.ReannounceRetryDecision(false, true, "session-a", nil, 0, false, 3), "stop", "an inactive session does not retry reannounce")
+
+-- A stuck _evaluating / _refreshing guard must not disable Early Preparation forever.
+EarlyPrep._evaluating = true
+EarlyPrep._refreshing = true
+EarlyPrep:OnSessionReset("guard-reset")
+assertTrue(not EarlyPrep._evaluating, "session reset clears the evaluating guard")
+assertTrue(not EarlyPrep._refreshing, "session reset clears the refreshing guard")
+local boomCalls = 0
+SF.RaidCheck.GetAuthoritativePreparation = function()
+	boomCalls = boomCalls + 1
+	error("evaluate boom")
+end
+SF.RaidCheck.GetPreparationObservationStamp = function()
+	return "remote|boom|ready|1|0|cfg"
+end
+EarlyPrep._skipStamp = nil
+EarlyPrep._windowOpen = true
+EarlyPrep._evaluating = false
+local observedOk, observedErr = pcall(function()
+	EarlyPrep:OnMemberObserved("Bob-Realm")
+end)
+assertTrue(not observedOk, "OnMemberObserved surfaces evaluation errors")
+assertTrue(not EarlyPrep._evaluating, "OnMemberObserved clears evaluating after an error")
+assertTrue(boomCalls >= 1, "OnMemberObserved evaluated before raising")
+EarlyPrep._refreshing = false
+local refreshOk = pcall(function()
+	EarlyPrep:Refresh("setting")
+end)
+assertTrue(not refreshOk, "Refresh surfaces evaluation errors")
+assertTrue(not EarlyPrep._refreshing, "Refresh clears refreshing after an error")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

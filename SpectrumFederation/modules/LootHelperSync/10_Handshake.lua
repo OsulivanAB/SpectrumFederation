@@ -122,8 +122,11 @@ function Sync:_ShouldRunHeartbeatSender()
         return false
     end
 
-    -- Gate: don't heartbeat during admin convergence before the session is announced
-    if self.state._sessionAnnounced ~= sid then return false end
+    -- Gate: don't heartbeat during admin convergence before the session is announced.
+    -- An exhausted reannounce retry keeps the session alive without claiming send acceptance.
+    if self.state._sessionAnnounced ~= sid and self.state._reannounceExhaustedFor ~= sid then
+        return false
+    end
 
     -- Must still be in PARTY/RAID
     if not self:_EnforceGroupedSessionActive("ShouldRunHeartbeatSender") then return false end

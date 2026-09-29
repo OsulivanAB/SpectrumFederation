@@ -3536,11 +3536,14 @@ function RC:_ApplyCheckConsequences(run)
 					end
 				end
 				if action == "send" then
-					WhisperMissing(memberId, cfg, info.short or ShortName(memberId), whisperPointName, list, mode)
-					entry.whisperedMissing = true
-					MarkWhisperSent(member, mode, time())
-					if sessionDedupe and earlyPrep and earlyPrep.CommitWarned then
-						earlyPrep:CommitWarned(memberId, mode)
+					-- Use the lockdown-aware sender. A blocked whisper must not
+					-- mark daily/session dedupe as delivered.
+					local sent = self:DeliverMissingRequirementsWhisper(memberId, cfg, missing, profile, mode)
+					if sent then
+						entry.whisperedMissing = true
+						if sessionDedupe and earlyPrep and earlyPrep.CommitWarned then
+							earlyPrep:CommitWarned(memberId, mode)
+						end
 					end
 				elseif action == "session_contacted" then
 					entry.alreadyContacted = true

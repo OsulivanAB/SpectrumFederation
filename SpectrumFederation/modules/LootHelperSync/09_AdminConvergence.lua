@@ -27,7 +27,9 @@ function Sync.ApplySesStartSendResult(state, sessionId, sendOk)
 end
 
 -- Decide whether a rejected SES_REANNOUNCE should arm one more retry.
--- A pending timer is left alone. Success, lost coordination, or the attempt cap stops it.
+-- A pending timer is left alone. Success or lost coordination stops it.
+-- Hitting the attempt cap returns "exhausted" so the caller can finalize
+-- handshake and keep heartbeat without opening Early Preparation.
 -- @param active boolean
 -- @param isCoordinator boolean
 -- @param sessionId string
@@ -35,7 +37,7 @@ end
 -- @param attempts number
 -- @param pending boolean
 -- @param maxAttempts number
--- @return string "schedule"|"wait"|"stop"
+-- @return string "schedule"|"wait"|"stop"|"exhausted"
 function Sync.ReannounceRetryDecision(active, isCoordinator, sessionId, announcedSessionId, attempts, pending, maxAttempts)
     if active ~= true or isCoordinator ~= true then
         return "stop"
@@ -52,7 +54,7 @@ function Sync.ReannounceRetryDecision(active, isCoordinator, sessionId, announce
     attempts = tonumber(attempts) or 0
     maxAttempts = tonumber(maxAttempts) or 0
     if attempts >= maxAttempts then
-        return "stop"
+        return "exhausted"
     end
     return "schedule"
 end
