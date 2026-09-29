@@ -271,6 +271,9 @@ SF.LootHelperSync = {
 	IsSenderAuthorized = function(_, profileId, sender)
 		return profileId == "profile-a" and sender == "Admin-Realm"
 	end,
+	IsRequesterInGroup = function(_, sender)
+		return sender == "Admin-Realm" or sender == "Helper-Realm"
+	end,
 	FindLocalProfileById = function()
 		return { id = "profile-a" }
 	end,
@@ -301,6 +304,34 @@ EarlyPrep:HandlePrepNotice("Admin-Realm", {
 	memberId = "Bob-Realm",
 })
 assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "duplicate authorized notice stays marked once")
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+SF.LootHelperSync.IsRequesterInGroup = function(_, sender)
+	return sender == "Admin-Realm"
+end
+SF.LootHelperSync.IsSenderAuthorized = function(_, profileId, sender)
+	return profileId == "profile-a" and sender == "LeftAdmin-Realm"
+end
+EarlyPrep:HandlePrepNotice("LeftAdmin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Bob-Realm",
+	raidCheckBegun = true,
+})
+assertTrue(not EarlyPrep:WasWarned("Bob-Realm"), "an out-of-group admin cannot mark a warning")
+assertTrue(EarlyPrep.notice.raidCheckBegun ~= true, "an out-of-group admin cannot set raid check begun")
+assertEq(EarlyPrep._deferredNotices, nil, "an out-of-group admin notice is not deferred")
+assertTrue(not EarlyPrep:AcceptRemotePrepNotice("LeftAdmin-Realm", "session-a", "profile-a", {
+	warned = { "Bob-Realm" },
+	raidCheckBegun = true,
+}), "an out-of-group admin snapshot is rejected")
+SF.LootHelperSync.IsSenderAuthorized = function(_, profileId, sender)
+	return profileId == "profile-a" and sender == "Admin-Realm"
+end
+SF.LootHelperSync.IsRequesterInGroup = function(_, sender)
+	return sender == "Admin-Realm" or sender == "Helper-Realm"
+end
 
 local refreshes = 0
 SF.RaidCheck = {
@@ -541,6 +572,108 @@ assertTrue(not EarlyPrep:DeferPrepNotice("session-a", "profile-a", "", {
 	profileId = "profile-a",
 	memberId = "Cara-Realm",
 }), "a notice with no sender is not deferred")
+
+EarlyPrep._deferredNotices = nil
+EarlyPrep.notice = EarlyPrep.NewNotice()
+SF.LootHelperSync.FindLocalProfileById = function()
+	return nil
+end
+assertTrue(EarlyPrep:DeferPrepNotice("session-a", "profile-a", "Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	warned = { "Bob-Realm" },
+	raidCheckBegun = true,
+}), "a deferred notice is retained for persistence")
+local persisted = {
+	sessionId = "session-a",
+	profileId = "profile-a",
+}
+EarlyPrep:WritePersisted(persisted)
+assertTrue(type(persisted.deferredPrepNotices) == "table", "deferred notices are written to the session record")
+assertTrue(type(persisted.deferredPrepNotices.bySender["Admin-Realm"]) == "table", "deferred persistence keeps the sender")
+assertEq(persisted.deferredPrepNotices.bySender["Admin-Realm"].warned[1], "Bob-Realm", "deferred persistence keeps Bob")
+assertTrue(persisted.deferredPrepNotices.bySender["Admin-Realm"].raidCheckBegun == true, "deferred persistence keeps raid check begun")
+EarlyPrep._deferredNotices = nil
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep:RestorePersisted(persisted)
+assertTrue(type(EarlyPrep._deferredNotices) == "table", "restore rebuilds deferred notices")
+assertTrue(type(EarlyPrep._deferredNotices.bySender["Admin-Realm"]) == "table", "restore keeps the deferred sender")
+SF.LootHelperSync.FindLocalProfileById = function()
+	return { id = "profile-a" }
+end
+SF.LootHelperSync.IsSenderAuthorized = function(_, _, sender)
+	return sender == "Admin-Realm"
+end
+assertTrue(EarlyPrep:FlushDeferredPrepNotice(), "a restored deferred notice applies after import")
+assertTrue(EarlyPrep:WasWarned("Bob-Realm"), "the restored deferred notice records Bob")
+assertTrue(EarlyPrep.notice.raidCheckBegun == true, "the restored deferred notice keeps raid check begun")
+
+local coverLocal = EarlyPrep.NewNotice()
+coverLocal.sessionId = "session-a"
+coverLocal.profileId = "profile-a"
+EarlyPrep.MarkWarned(coverLocal, "Bob-Realm")
+coverLocal.raidCheckBegun = true
+assertTrue(EarlyPrep.RemoteCoversLocal(coverLocal, {
+	warned = { "Bob-Realm", "Cara-Realm" },
+	raidCheckBegun = true,
+}), "a covering remote snapshot matches local state")
+assertTrue(not EarlyPrep.RemoteCoversLocal(coverLocal, {
+	warned = { "Bob-Realm" },
+	raidCheckBegun = false,
+}), "a remote snapshot without raid check begun does not cover local")
+assertTrue(not EarlyPrep.RemoteCoversLocal(coverLocal, {
+	warned = { "Cara-Realm" },
+	raidCheckBegun = true,
+}), "a remote snapshot missing a warned member does not cover local")
+
+local sentKinds = {}
+SF.LootHelperComm = {
+	Send = function(_, _, msgType, payload)
+		sentKinds[#sentKinds + 1] = {
+			msgType = msgType,
+			kind = payload and payload.kind,
+		}
+		return true
+	end,
+}
+SF.LootHelperSync.MSG = { PREP_NOTICE = "PREP_NOTICE" }
+SF.LootHelperSync.GetGroupDistribution = function()
+	return "RAID"
+end
+SF.LootHelperSync._SelfId = function()
+	return "Helper-Realm"
+end
+SF.LootHelperSync.IsSenderAuthorized = function(_, profileId, sender)
+	return profileId == "profile-a" and (sender == "Admin-Realm" or sender == "Helper-Realm")
+end
+SF.LootHelperSync.state.isCoordinator = false
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+EarlyPrep:ClearOutboundPending()
+assertTrue(EarlyPrep:CommitWarned("Bob-Realm", "pre"), "a non-coordinator warning records Bob")
+assertTrue(EarlyPrep._outboundPending == true, "a non-coordinator warning stays pending until covered")
+sentKinds = {}
+EarlyPrep:RetryOutboundNotice("heartbeat")
+assertEq(#sentKinds, 1, "a pending non-coordinator notice retries once")
+assertEq(sentKinds[1].kind, "snapshot", "the outbound retry publishes a snapshot")
+EarlyPrep:ObserveRemoteCoverage({
+	warned = { "Cara-Realm" },
+	raidCheckBegun = false,
+})
+assertTrue(EarlyPrep._outboundPending == true, "a coordinator heartbeat missing Bob keeps outbound pending")
+assertTrue(EarlyPrep:NoteRaidCheckBegun("session-a", "profile-a"), "a non-coordinator can note raid check begun")
+assertTrue(EarlyPrep._outboundPending == true, "raid check begun stays pending until covered")
+EarlyPrep:ObserveRemoteCoverage({
+	warned = { "Bob-Realm" },
+	raidCheckBegun = false,
+})
+assertTrue(EarlyPrep._outboundPending == true, "a partial coordinator heartbeat keeps the outbound pending")
+EarlyPrep:ObserveRemoteCoverage({
+	warned = { "Bob-Realm" },
+	raidCheckBegun = true,
+})
+assertTrue(not EarlyPrep._outboundPending, "a covering coordinator snapshot clears outbound pending")
 
 IsInRaid = function()
 	return true

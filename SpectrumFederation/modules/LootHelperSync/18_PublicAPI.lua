@@ -46,6 +46,7 @@ function Sync:_PersistSessionState(reason)
         persisted.coordEpoch = nil
         persisted.helpers = nil
         persisted.prepNotice = nil
+        persisted.deferredPrepNotices = nil
         return
     end
 

@@ -1763,12 +1763,14 @@ function RC:EnsureInspectSupport()
 			self:_ReconcileFrozenTargets()
 			self:_MarkTroubleshootingDirty()
 			self:_NotifyTroubleshootingListeners()
-			self:_ProcessInspectQueue()
-			self:_RunBackgroundInspectPass()
+			-- Close or reopen the raid-only Early Preparation window before any
+			-- retained queue work or background pass can inspect a party member.
 			local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
 			if earlyPrep and earlyPrep.Notify then
 				earlyPrep:Notify("roster")
 			end
+			self:_ProcessInspectQueue()
+			self:_RunBackgroundInspectPass()
 		end
 	end)
 

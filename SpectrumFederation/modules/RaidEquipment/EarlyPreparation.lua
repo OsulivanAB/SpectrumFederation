@@ -26,6 +26,9 @@ local EarlyPrep = {
 	-- One slot per comms sender. A sender name comes from the client, so one
 	-- character cannot fill the map by forging other names.
 	MAX_DEFERRED_SENDERS = 40,
+	-- Non-coordinator admins retry PREP_NOTICE until a coordinator heartbeat
+	-- covers their local warned / raid-check state.
+	MAX_OUTBOUND_RETRIES = 12,
 }
 SF.RaidEquipment.EarlyPreparation = EarlyPrep
 
@@ -599,19 +602,52 @@ function EarlyPrep:WritePersisted(persisted)
 		return
 	end
 	local notice = self.notice
-	if type(notice) ~= "table" or notice.sessionId ~= persisted.sessionId or notice.profileId ~= persisted.profileId then
+	if type(notice) == "table"
+		and notice.sessionId == persisted.sessionId
+		and notice.profileId == persisted.profileId
+		and self:HasShareableNotice()
+	then
+		persisted.prepNotice = {
+			sessionId = notice.sessionId,
+			profileId = notice.profileId,
+			raidCheckBegun = notice.raidCheckBegun and true or false,
+			warned = EarlyPrep.WarnedArray(notice),
+		}
+	else
 		persisted.prepNotice = nil
+	end
+
+	local deferred = self._deferredNotices
+	if type(deferred) ~= "table"
+		or deferred.sessionId ~= persisted.sessionId
+		or deferred.profileId ~= persisted.profileId
+		or type(deferred.bySender) ~= "table"
+	then
+		persisted.deferredPrepNotices = nil
 		return
 	end
-	if not self:HasShareableNotice() then
-		persisted.prepNotice = nil
+	local bySender = {}
+	local count = 0
+	for sender, senderNotice in pairs(deferred.bySender) do
+		if type(sender) == "string" and sender ~= "" and type(senderNotice) == "table" then
+			count = count + 1
+			if count > EarlyPrep.MAX_DEFERRED_SENDERS then
+				break
+			end
+			bySender[sender] = {
+				raidCheckBegun = senderNotice.raidCheckBegun and true or false,
+				warned = EarlyPrep.WarnedArray(senderNotice),
+			}
+		end
+	end
+	if next(bySender) == nil then
+		persisted.deferredPrepNotices = nil
 		return
 	end
-	persisted.prepNotice = {
-		sessionId = notice.sessionId,
-		profileId = notice.profileId,
-		raidCheckBegun = notice.raidCheckBegun and true or false,
-		warned = EarlyPrep.WarnedArray(notice),
+	persisted.deferredPrepNotices = {
+		sessionId = deferred.sessionId,
+		profileId = deferred.profileId,
+		bySender = bySender,
 	}
 end
 
@@ -624,22 +660,61 @@ function EarlyPrep:PersistActive()
 end
 
 function EarlyPrep:RestorePersisted(persisted)
-	if type(persisted) ~= "table" or type(persisted.prepNotice) ~= "table" then
+	if type(persisted) ~= "table" then
 		return
 	end
 	local saved = persisted.prepNotice
-	if saved.sessionId ~= persisted.sessionId or saved.profileId ~= persisted.profileId then
+	if type(saved) == "table"
+		and saved.sessionId == persisted.sessionId
+		and saved.profileId == persisted.profileId
+	then
+		self.notice = EarlyPrep.NewNotice()
+		self.notice.sessionId = persisted.sessionId
+		self.notice.profileId = persisted.profileId
+		EarlyPrep.ApplyNotice(self.notice, persisted.sessionId, persisted.profileId, {
+			sessionId = persisted.sessionId,
+			profileId = persisted.profileId,
+			warned = saved.warned,
+			raidCheckBegun = saved.raidCheckBegun == true,
+		})
+	end
+
+	local savedDeferred = persisted.deferredPrepNotices
+	self._deferredNotices = nil
+	if type(savedDeferred) ~= "table"
+		or savedDeferred.sessionId ~= persisted.sessionId
+		or savedDeferred.profileId ~= persisted.profileId
+		or type(savedDeferred.bySender) ~= "table"
+	then
 		return
 	end
-	self.notice = EarlyPrep.NewNotice()
-	self.notice.sessionId = persisted.sessionId
-	self.notice.profileId = persisted.profileId
-	EarlyPrep.ApplyNotice(self.notice, persisted.sessionId, persisted.profileId, {
+	local restored = {
 		sessionId = persisted.sessionId,
 		profileId = persisted.profileId,
-		warned = saved.warned,
-		raidCheckBegun = saved.raidCheckBegun == true,
-	})
+		bySender = {},
+	}
+	local count = 0
+	for sender, snap in pairs(savedDeferred.bySender) do
+		if type(sender) == "string" and sender ~= "" and type(snap) == "table" then
+			count = count + 1
+			if count > EarlyPrep.MAX_DEFERRED_SENDERS then
+				break
+			end
+			local notice = EarlyPrep.NewNotice()
+			notice.sessionId = persisted.sessionId
+			notice.profileId = persisted.profileId
+			EarlyPrep.ApplyNotice(notice, persisted.sessionId, persisted.profileId, {
+				sessionId = persisted.sessionId,
+				profileId = persisted.profileId,
+				warned = snap.warned,
+				raidCheckBegun = snap.raidCheckBegun == true,
+			})
+			restored.bySender[sender] = notice
+		end
+	end
+	if next(restored.bySender) ~= nil then
+		self._deferredNotices = restored
+	end
 end
 
 function EarlyPrep:OnSessionReset(reason)
@@ -649,6 +724,8 @@ function EarlyPrep:OnSessionReset(reason)
 	self._wasCoordinator = false
 	self._rejectLogged = {}
 	self._deferredNotices = nil
+	self._outboundPending = false
+	self._outboundAttempts = 0
 	self._skipStamp = nil
 	self._evaluating = false
 	self._refreshing = false
@@ -720,6 +797,91 @@ function EarlyPrep.ObservationAuthoritative(entry)
 	return entry.blended ~= true
 end
 
+-- True when the remote payload already contains every local warned id and the
+-- raid-check-begun flag. Used so a non-coordinator can stop retrying PREP_NOTICE.
+function EarlyPrep.RemoteCoversLocal(localNotice, remotePayload)
+	if type(localNotice) ~= "table" or type(remotePayload) ~= "table" then
+		return false
+	end
+	local sessionId = localNotice.sessionId
+	local profileId = localNotice.profileId
+	if type(sessionId) ~= "string" or sessionId == "" or type(profileId) ~= "string" or profileId == "" then
+		return false
+	end
+	if localNotice.raidCheckBegun == true and remotePayload.raidCheckBegun ~= true then
+		return false
+	end
+	local cover = EarlyPrep.NewNotice()
+	cover.sessionId = sessionId
+	cover.profileId = profileId
+	EarlyPrep.ApplyNotice(cover, sessionId, profileId, {
+		sessionId = sessionId,
+		profileId = profileId,
+		memberId = remotePayload.memberId,
+		warned = remotePayload.warned,
+		raidCheckBegun = remotePayload.raidCheckBegun == true,
+	})
+	if type(localNotice.warned) ~= "table" then
+		return true
+	end
+	for id in pairs(localNotice.warned) do
+		if not EarlyPrep.IsWarned(cover, id) then
+			return false
+		end
+	end
+	return true
+end
+
+function EarlyPrep:SenderInGroup(sender)
+	local sync = SF.LootHelperSync
+	if not sync or type(sync.IsRequesterInGroup) ~= "function" then
+		return false
+	end
+	return sync:IsRequesterInGroup(sender) == true
+end
+
+function EarlyPrep:ClearOutboundPending()
+	self._outboundPending = false
+	self._outboundAttempts = 0
+end
+
+function EarlyPrep:MarkOutboundPending()
+	self._outboundPending = true
+	self._outboundAttempts = 0
+end
+
+function EarlyPrep:ObserveRemoteCoverage(prepNotice)
+	if not self._outboundPending then
+		return
+	end
+	if not self:HasShareableNotice() then
+		self:ClearOutboundPending()
+		return
+	end
+	if EarlyPrep.RemoteCoversLocal(self.notice, prepNotice) then
+		self:ClearOutboundPending()
+	end
+end
+
+function EarlyPrep:RetryOutboundNotice(reason)
+	if not self._outboundPending or not self:HasShareableNotice() then
+		return false
+	end
+	local sync = SF.LootHelperSync
+	if sync and sync.state and sync.state.isCoordinator == true then
+		-- Coordinator heartbeats already carry the shareable snapshot.
+		self:ClearOutboundPending()
+		return false
+	end
+	local attempts = tonumber(self._outboundAttempts) or 0
+	if attempts >= EarlyPrep.MAX_OUTBOUND_RETRIES then
+		return false
+	end
+	self._outboundAttempts = attempts + 1
+	DebugVerbose("Retrying preparation notice publish (%s, attempt=%s)", tostring(reason or "retry"), tostring(self._outboundAttempts))
+	return self:BroadcastNotice("snapshot")
+end
+
 function EarlyPrep:DeferPrepNotice(sessionId, profileId, sender, prepNotice)
 	if type(prepNotice) ~= "table" or type(sessionId) ~= "string" or sessionId == "" then
 		return false
@@ -761,6 +923,7 @@ function EarlyPrep:DeferPrepNotice(sessionId, profileId, sender, prepNotice)
 		warned = prepNotice.warned,
 		raidCheckBegun = prepNotice.raidCheckBegun == true,
 	})
+	self:PersistActive()
 	return true
 end
 
@@ -775,6 +938,7 @@ function EarlyPrep:FlushDeferredPrepNotice()
 		or sync.state.profileId ~= deferred.profileId
 	then
 		self._deferredNotices = nil
+		self:PersistActive()
 		return false
 	end
 	local profilePresent = type(sync.FindLocalProfileById) == "function" and sync:FindLocalProfileById(deferred.profileId) ~= nil
@@ -792,24 +956,33 @@ function EarlyPrep:FlushDeferredPrepNotice()
 	local applied = false
 	for i = 1, #pending do
 		local item = pending[i]
-		local authorized = type(sync.IsSenderAuthorized) == "function" and sync:IsSenderAuthorized(deferred.profileId, item.sender) == true
-		if EarlyPrep.PrepNoticeSenderState(true, authorized) == "apply" then
-			local changed = self:ApplyHeartbeat(deferred.sessionId, deferred.profileId, {
-				warned = EarlyPrep.WarnedArray(item.notice),
-				raidCheckBegun = item.notice.raidCheckBegun == true,
-			})
-			if changed then
-				applied = true
-			end
+		if not self:SenderInGroup(item.sender) then
+			self:NoteReject(item.sender, "not_in_group")
 		else
-			self:NoteReject(item.sender, "unauthorized")
+			local authorized = type(sync.IsSenderAuthorized) == "function" and sync:IsSenderAuthorized(deferred.profileId, item.sender) == true
+			if EarlyPrep.PrepNoticeSenderState(true, authorized) == "apply" then
+				local changed = self:ApplyHeartbeat(deferred.sessionId, deferred.profileId, {
+					warned = EarlyPrep.WarnedArray(item.notice),
+					raidCheckBegun = item.notice.raidCheckBegun == true,
+				})
+				if changed then
+					applied = true
+				end
+			else
+				self:NoteReject(item.sender, "unauthorized")
+			end
 		end
 	end
+	self:PersistActive()
 	return applied
 end
 
 function EarlyPrep:AcceptRemotePrepNotice(sender, sessionId, profileId, prepNotice)
 	if type(prepNotice) ~= "table" then
+		return false
+	end
+	if not self:SenderInGroup(sender) then
+		self:NoteReject(sender, "not_in_group")
 		return false
 	end
 	local sync = SF.LootHelperSync
@@ -822,7 +995,9 @@ function EarlyPrep:AcceptRemotePrepNotice(sender, sessionId, profileId, prepNoti
 	if decision ~= "apply" then
 		return false
 	end
-	return self:ApplyHeartbeat(sessionId, profileId, prepNotice)
+	local changed = self:ApplyHeartbeat(sessionId, profileId, prepNotice)
+	self:ObserveRemoteCoverage(prepNotice)
+	return changed
 end
 
 function EarlyPrep:ApplyHeartbeat(sessionId, profileId, prepNotice)
@@ -888,6 +1063,10 @@ function EarlyPrep:HandlePrepNotice(sender, payload)
 		self:NoteReject(sender, "session")
 		return
 	end
+	if not self:SenderInGroup(sender) then
+		self:NoteReject(sender, "not_in_group")
+		return
+	end
 	local profilePresent = type(sync.FindLocalProfileById) == "function" and sync:FindLocalProfileById(payload.profileId) ~= nil
 	local authorized = profilePresent and type(sync.IsSenderAuthorized) == "function" and sync:IsSenderAuthorized(payload.profileId, sender) == true
 	local decision = EarlyPrep.PrepNoticeSenderState(profilePresent, authorized)
@@ -904,6 +1083,7 @@ function EarlyPrep:HandlePrepNotice(sender, payload)
 	if not accepted then
 		return
 	end
+	self:ObserveRemoteCoverage(payload)
 	if changed then
 		self:PersistActive()
 		DebugVerbose("Applied preparation notice from %s (kind=%s)", tostring(sender), tostring(payload.kind))
@@ -919,6 +1099,12 @@ function EarlyPrep:CommitWarned(memberId, source)
 	self:PersistActive()
 	DebugInfo("Recorded missing-requirements warning for %s (%s)", tostring(memberId), tostring(source or "unknown"))
 	self:BroadcastNotice("warn", memberId)
+	local sync = SF.LootHelperSync
+	if not (sync and sync.state and sync.state.isCoordinator == true) then
+		self:MarkOutboundPending()
+	else
+		self:ClearOutboundPending()
+	end
 	return true
 end
 
@@ -940,6 +1126,12 @@ function EarlyPrep:NoteRaidCheckBegun(sessionId, profileId)
 		self:PersistActive()
 		DebugInfo("Raid Check began; early preparation stopped for session %s", tostring(sessionId))
 		self:BroadcastNotice("raid_begun")
+		local sync = SF.LootHelperSync
+		if not (sync and sync.state and sync.state.isCoordinator == true) then
+			self:MarkOutboundPending()
+		else
+			self:ClearOutboundPending()
+		end
 	end
 	self:Refresh("raid_check_begun")
 	return changed
@@ -1148,7 +1340,11 @@ function EarlyPrep:Refresh(reason)
 		end
 
 		if isCoordinator and not wasCoordinator and self:HasShareableNotice() then
-			self:BroadcastNotice("snapshot")
+			if self:BroadcastNotice("snapshot") then
+				self:ClearOutboundPending()
+			end
+		elseif self._outboundPending and reason == "heartbeat" then
+			self:RetryOutboundNotice(reason)
 		end
 		-- Roster and heartbeat refreshes keep the window in sync. The inspect tick
 		-- and a newly ready observation still evaluate members, so an already-open

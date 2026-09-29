@@ -221,6 +221,15 @@ def test_early_preparation_whispers_production_lua():
     reset = reset.split("\nfunction ", 1)[0]
     assert "_evaluating = false" in reset
     assert "_refreshing = false" in reset
+    assert "IsRequesterInGroup" in source
+    assert "deferredPrepNotices" in source
+    assert "function EarlyPrep.RemoteCoversLocal" in source
+    assert "RetryOutboundNotice" in source
+    roster = raid_check.split('elseif event == "GROUP_ROSTER_UPDATE" then', 1)[1]
+    roster = roster.split("\n\tend)", 1)[0]
+    assert roster.index('earlyPrep:Notify("roster")') < roster.index("self:_ProcessInspectQueue()")
+    assert roster.index('earlyPrep:Notify("roster")') < roster.index("self:_RunBackgroundInspectPass()")
+    assert "deferredPrepNotices" in public_api
 
 
 def test_parent_toc_loads_raid_equipment_modules():
