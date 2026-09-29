@@ -95,15 +95,18 @@ Follow this order for each finding.
 
 Be technically meaningful without turning triage into an implementation cycle.
 
-Allowed: read current code; inspect relevant callers and sibling paths;
-inspect tests/docs/task context; inspect recent relevant history when needed;
-reason through state/lifecycle behavior; use existing evidence and inexpensive
-read-only diagnostics.
+Allowed **non-executing inspection** only: read current code; inspect relevant
+callers and sibling paths; inspect tests/docs/task context as source text;
+inspect recent relevant history when needed; reason through state/lifecycle
+behavior from that evidence.
 
 Do not automatically: modify production code or tests; prototype a repair;
-redesign the subsystem; perform a broad unrelated audit; run every repository
-test suite merely to classify one comment; commission another AI reviewer; or
-request another review.
+redesign the subsystem; perform a broad unrelated audit; run repository tests
+or other PR-controlled scripts/diagnostics (including helpers that
+`import`/`loadfile`/`exec` checked-out code); commission another AI reviewer;
+or request another review. Running PR-controlled tests or scripts during
+automatic subscription triage requires a separate owner authorization or an
+immutable isolated sandbox provided by external infrastructure.
 
 If validity needs substantial experimentation, Retail testing, a redesign, or
 expensive investigation, classify as “needs more evidence” or

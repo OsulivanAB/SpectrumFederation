@@ -129,7 +129,8 @@ When a subscribed PR review finding arrives, automatically:
    out the recommendation.
 8. Reply directly on that review thread with a concise evidence-based
    disposition (see `.cursor/skills/pr-review-comments/SKILL.md`).
-9. Stop and wait for owner direction.
+9. Report the disposition and stop. Do not poll, wait, keep a listener or
+   session open for a follow-up event, or continue into repair.
 
 ### Investigation depth and cost control
 
@@ -137,16 +138,19 @@ The assessment must be technically meaningful, not a superficial acceptance or
 rejection of reviewer text. Do not turn triage into another expensive
 implementation cycle.
 
-During subscription-event triage, allowed work includes reading current code,
-inspecting relevant callers and sibling paths, inspecting tests/docs/task
-context, inspecting recent relevant history when needed, reasoning through
-state/lifecycle behavior, and using existing evidence or inexpensive read-only
-diagnostics.
+During subscription-event triage, allowed work is **non-executing inspection**
+only: reading current code; inspecting relevant callers and sibling paths;
+inspecting tests/docs/task context as source text; inspecting recent relevant
+history when needed; and reasoning through state/lifecycle behavior from that
+evidence.
 
 Do **not** automatically modify production code or tests, prototype a repair,
-redesign the subsystem, perform a broad unrelated audit, run every repository
-test suite merely to classify one comment, commission another AI reviewer, or
-request another review.
+redesign the subsystem, perform a broad unrelated audit, run repository tests
+or other PR-controlled scripts/diagnostics (including helpers that
+`import`/`loadfile`/`exec` checked-out code), commission another AI reviewer,
+or request another review. Running PR-controlled tests or scripts during
+automatic subscription triage requires a separate owner authorization or an
+immutable isolated sandbox provided by external infrastructure.
 
 If determining validity would require substantial experimentation, Retail
 testing, a redesign, or expensive investigation, classify as “needs more
