@@ -280,7 +280,7 @@ local function Definition(panel)
 						end,
 						onCommit = function(ctx, text)
 							local tab = tonumber(text)
-							if not tab then
+							if not tab or tab < 1 or tab > 8 or tab ~= math.floor(tab) then
 								ctx.section:SetMessage("Enter a bank tab from 1 to 8.", "error")
 								return
 							end

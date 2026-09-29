@@ -3599,6 +3599,24 @@ function checkGuildTabDraft()
     assertEq(guildP._consumables.bankTab, 2, "the next click uses the new bank tab")
     assertEq(panel.__sfConsumableTab, nil, "a saved bank tab draft is cleared")
     assertEq(guildP._consumables.guild.guid, "club-guild-tab", "the guild locks from the fresh tab")
+
+    local commit = nil
+    for i = 1, #items do
+        if items[i].label == "Bank Tab" and items[i].onCommit then
+            commit = items[i].onCommit
+            break
+        end
+    end
+    assertTrue(type(commit) == "function", "the bank tab field has an onCommit handler")
+    local beforeTab = guildP._consumables.bankTab
+    messages = {}
+    commit(ctx, "9")
+    assertEq(guildP._consumables.bankTab, beforeTab, "an out-of-range bank tab commit is rejected")
+    assertTrue(messages[#messages] and messages[#messages].text:find("1 to 8", 1, true) ~= nil, "an out-of-range bank tab shows the range error")
+    messages = {}
+    commit(ctx, "3")
+    assertEq(guildP._consumables.bankTab, 3, "a valid bank tab commit updates the locked guild tab")
+
     SF.GetActiveProfile = savedGet
     SF.NameUtil = savedName
     RT.CurrentGuild = savedGuild
