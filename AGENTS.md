@@ -24,6 +24,11 @@ SpectrumFederation is a single-product repository for a World of Warcraft addon,
 - Inspect existing architecture, callers, lifecycle, and persisted data before assuming a change is local, safe, or complete.
 - Understand the current pattern before introducing a new one. Prefer extending existing systems over inventing a parallel path.
 - Keep changes targeted. Do not refactor unrelated systems while you are here.
+- Before a large cross-subsystem feature, briefly identify source-of-truth
+  ownership, durable state, lifecycle risks, and verification, then propose
+  coherent implementation milestones. Do not impose this ceremony on a small
+  local fix. Bring forward targeted in-game checks before later implementation
+  depends on uncertain trade, bank, combat, or WoW API behavior.
 
 ## Quality Priorities
 
@@ -107,6 +112,18 @@ When asked for a code review, technical audit, pre-release review, or architectu
 
 ## Code Review Rules
 
+### Human authorization boundary
+
+Review work is human-directed. A review or CI event, clean result, push,
+thread resolution, session restart, or old blanket “keep going” instruction
+does not authorize another assessment, repair batch, review request, or
+readiness evaluation. Do not subscribe, poll, wait, or schedule continuation.
+A clear owner request for one operation is sufficient, and normal debugging
+inside an authorized repair batch does not need approval per edit. After the
+authorized delivery, report and stop. The canonical procedure is
+`.cursor/skills/ai-review-loop/SKILL.md`; Codex coverage rules remain in
+`.github/codex-review-guidance.md`.
+
 ### Runtime stability
 
 For shipped World of Warcraft addon code, treat client freezes, severe UI
@@ -148,8 +165,8 @@ in-game testing occurred without human test evidence.
 
 Three files divide pull-request review work. Open the file that owns the task. Do not copy a full procedure into this guide, and do not send the same decision through more than one of them.
 
-- **Round coordination:** `.cursor/skills/ai-review-loop/SKILL.md` owns reviewer sequencing, round state, completion handling, finding batches, and when to push.
+- **Human-directed operations and repair batches:** `.cursor/skills/ai-review-loop/SKILL.md` separates assessment, one repair batch, one review request, and readiness evaluation. It owns authorization boundaries, batching, escalation, checkpoint recommendations, and delivery timing.
 - **Individual findings:** `.cursor/skills/pr-review-comments/SKILL.md` owns investigating one finding, replying on its thread, and deciding whether that thread may be resolved. It does not commit, push, or request another review.
-- **Codex lifecycle:** `.github/codex-review-guidance.md` owns Codex review scope, the final integration sweep, and when previous coverage must be reconsidered. When a linked Ticket ID is present, that document requires reviewing the ticket. If the ticket is inaccessible, do not invent requirements.
+- **Codex coverage:** `.github/codex-review-guidance.md` owns Codex review scope, the final integration checkpoint, and when previous coverage must be reconsidered. It recommends coverage; only a current owner request authorizes initiating it. When a linked Ticket ID is present, that document requires reviewing the ticket. If the ticket is inaccessible, do not invent requirements.
 
 Humans retain final review, required in-game verification, and merging.
