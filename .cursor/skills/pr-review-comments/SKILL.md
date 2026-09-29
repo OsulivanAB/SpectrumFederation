@@ -40,7 +40,9 @@ This skill must **not** independently:
 - resolve a thread without explicit resolution authorization;
 - request another review or another reviewer;
 - start a repair batch;
-- create new subscriptions, poll, wait, or schedule follow-up;
+- create unrelated subscriptions, poll, wait in-session, or schedule follow-up
+  (maintaining the current PR-scoped subscription is required policy; see
+  `.cursor/skills/ai-review-loop/SKILL.md`);
 - investigate unrelated findings outside the delivered or owner-named set.
 
 Recommendation and authorization are separate. An IMPLEMENT recommendation is

@@ -32,7 +32,9 @@ CI-only completion, pushes, clean results, thread resolution by others,
 session restarts, scheduled noise, and old “keep going” instructions do **not**
 authorize assessment, repair, replies, review requests, or readiness work
 unless some other authorization already applies. Report them only when asked.
-Do not create new subscriptions, poll, wait, or schedule continuation.
+Do not poll, wait in-session, or schedule continuation. Keep the PR-scoped
+subscription for the PR under work per the subscription policy below; do not
+create unrelated subscriptions.
 
 ### B. Subscribed review findings
 
@@ -166,8 +168,10 @@ disposition reply.
 
 That event does **not** authorize code changes, repair-oriented test changes,
 commits, pushes, thread resolution, another review request, another reviewer,
-merge, unrelated PR-body edits, polling/waiting, creation of new subscriptions,
+merge, unrelated PR-body edits, polling/waiting, unrelated subscriptions,
 continuation into another event, or investigation of unrelated findings.
+Maintaining the existing PR-scoped subscription for the PR under work remains
+required policy and is not a new authorization.
 
 Continue using `ManagePullRequest` for the reply. Do not weaken tool or
 permission restrictions. If the authorized writer is unavailable, report that
@@ -182,13 +186,28 @@ implement. Thread resolution remains governed by
 authorization. The automatic subscription operation ends with the disposition
 reply.
 
-### Creating subscriptions
+### PR subscription policy
 
-Do not reintroduce broad automatic subscriptions. Reacting to an intentionally
-existing/owner-authorized review subscription is allowed under this section.
-Creating a new subscription remains owner-directed unless existing repository
-policy explicitly establishes that subscription as part of the requested
-operation. Do not poll or wait after handling an event.
+While working on a pull request—creating it, delivering commits to it, running
+an authorized review operation on it, or handling subscribed findings for
+it—**always keep a PR-scoped review subscription active** for that PR.
+
+- Use the repository’s subscription mechanism (for example
+  `cursor-subscriptions` `subscribe_github_pr` with `scope: pr`).
+- List existing subscriptions first and reuse an active match; do not create
+  duplicates.
+- Keep the subscription for the open PR under work. PR-scoped subscriptions
+  normally close themselves when the PR is merged or closed; do not unsubscribe
+  early while the PR remains open and this agent is responsible for it.
+- Re-subscribe if the subscription expired while the PR is still open and work
+  continues.
+- Do not create broad, unrelated, or account-wide subscriptions. Do not
+  subscribe to other PRs unless the current owner request covers them.
+
+A PR subscription exists so review findings can wake triage (section B). It does
+**not** authorize repair, resolution, another review, polling, or in-session
+waiting. After handling a delivered event: report/stop; leave the subscription
+in place for later wakes.
 
 ## Choose exactly one human-authorized operation
 
@@ -216,7 +235,8 @@ An agent’s IMPLEMENT recommendation is never repair authorization.
 
 ## Start an authorized operation
 
-Refresh the branch and identify, in a few sentences:
+Ensure a PR-scoped subscription is active for the PR under work (see PR
+subscription policy). Refresh the branch and identify, in a few sentences:
 
 - pull request and current head SHA, plus merge base or base SHA when relevant;
 - completed reviews and exact commit or range each result covers;
@@ -297,8 +317,9 @@ When delivery is authorized, make at most one push for the batch. Do not push
 per finding. Do not create an artificial commit when nothing changed. Thread
 replies and resolutions remain governed by
 `.cursor/skills/pr-review-comments/SKILL.md` and require authorization for
-external writes. Do not wait for or act on reviews or CI triggered by the push
-as if they renewed repair authorization. A later subscribed finding may wake
+external writes. Confirm the PR-scoped subscription remains active after
+delivery. Do not wait for or act on reviews or CI triggered by the push as if
+they renewed repair authorization. A later subscribed finding may wake
 subscription triage (section B) only.
 
 Keep routine handoffs short: scope/head, meaningful fixes, validation evidence,
@@ -384,8 +405,8 @@ These are owner actions outside repository instruction edits:
 - stop or pause active feature agents separately;
 - disable or pause Cursor automations that start **repairs** or unsolicited
   reviews from PR, comment, review, CI, or scheduled events; retain
-  deterministic CI; intentionally authorized review subscriptions that only
-  wake triage/reply remain allowed under section B;
+  deterministic CI; PR-scoped subscriptions that wake triage/reply for the PR
+  under work are required repository policy under the PR subscription section;
 - set Codex automatic and Security Review triggers to the owner’s manual-review
   policy while retaining desired manual review capability;
 - set Bugbot to manual triggering and Autofix off, including personal and

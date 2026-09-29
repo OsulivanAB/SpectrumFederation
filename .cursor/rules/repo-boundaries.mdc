@@ -16,6 +16,7 @@ alwaysApply: true
   authorizes exactly one of assess/triage, repair one batch, request one named
   review/checkpoint, or evaluate readiness; (3) unsolicited CI/push/session
   events and old blanket continuation do not start repair or another review.
-  Recommendation is never repair authorization. Do not create new
-  subscriptions, poll, wait, auto-resolve, or auto-request another reviewer.
-  Details: `.cursor/skills/ai-review-loop/SKILL.md`.
+  Recommendation is never repair authorization. While working on a PR, always
+  keep a PR-scoped subscription active for that PR; do not poll, wait
+  in-session, auto-resolve, or auto-request another reviewer. Details:
+  `.cursor/skills/ai-review-loop/SKILL.md`.
