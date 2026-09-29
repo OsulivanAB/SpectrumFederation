@@ -3,6 +3,14 @@
 Review this repository as a World of Warcraft Retail addon where client
 stability and bounded execution are first-class correctness requirements.
 
+Bugbot is an owner-selected review checkpoint, not a repair agent or automatic
+continuation signal. Run only when explicitly requested through Bugbot's
+manual trigger. Do not apply fixes, invoke another reviewer, request a rerun,
+or treat findings and check completion as authorization for follow-up work.
+Bugbot Autofix and automatic triggering are external settings and should
+remain off; this file supplies review guidance but cannot enforce those
+settings.
+
 Prioritize real production defects. Do not spend findings on style, naming,
 formatting, cosmetic cleanup, speculative refactors, or unrelated unchanged
 code.

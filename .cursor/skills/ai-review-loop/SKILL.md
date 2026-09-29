@@ -1,262 +1,228 @@
 ---
 name: ai-review-loop
 description: >-
-  Coordinates SpectrumFederation pull-request review rounds from initial
-  handoff through human handoff. Use when implementation is ready for review,
-  when review findings arrive, when a review completes with no findings, when
-  relevant CI completes or fails, when resuming an existing PR, and at final
-  review checkpoints. Owns reviewer sequencing, round state, batching, and
-  push timing. Does not replace per-finding replies or the Codex lifecycle
-  document.
+  Runs one owner-authorized SpectrumFederation pull-request assessment, repair
+  batch, review request, or readiness evaluation. Use only when a person
+  clearly requests that operation; events and prior blanket instructions do
+  not authorize continuation.
+disable-model-invocation: true
 ---
 
-# AI Review Loop
+# Human-Directed Review Batches
 
-Coordinate automated review as a convergence process. Cursor implements and fixes code. Reviewers identify possible problems; they do not decide what code should change.
+This is the canonical procedure for review-related work. Despite the stable
+`ai-review-loop` path, it is not an autonomous loop. A clear natural-language
+owner request such as “address the current review comments in one batch” is
+sufficient; the owner does not need to invoke a slash command.
 
-This skill owns round coordination, reviewer sequencing, completion handling, finding batches, and push timing. Triage each finding with `.cursor/skills/pr-review-comments/SKILL.md`. Codex review scope, the final integration sweep, and when previous coverage must be reconsidered stay in `.github/codex-review-guidance.md`. Follow that document for those decisions. Do not restate it here.
+Review comments, CI or review completion, clean reviews, thread resolution,
+pushes, session restarts, scheduled events, and old “keep going” instructions
+never start, expand, or renew authorization. Do not subscribe to review or CI
+events, poll or wait for them, schedule continuation, or automatically request
+another reviewer. After the authorized operation is delivered, report and stop.
 
-These files guide the agent that is running now. They do not start a background worker, and they do not guarantee that a later event will be delivered to this session.
+Triage individual findings with
+`.cursor/skills/pr-review-comments/SKILL.md`. Review scope and coverage rules
+stay in `.github/codex-review-guidance.md`. Preserve repository tool
+permissions: use `ManagePullRequest` for authorized GitHub writes, never use
+`gh` for writes, and never merge unless separately and explicitly authorized.
 
-## When to start
+## Choose exactly one authorized operation
 
-Start this skill at each of these transitions, including when the pull request has no findings yet:
+- **Assess/triage:** inspect current findings and report classifications. Do not
+  change code, resolve threads, or request a review.
+- **Repair one batch:** investigate and fix the findings named or clearly
+  included by the request and their directly affected behavior; validate,
+  deliver once, and stop. Straightforward edits and debugging inside that batch
+  need no redundant approval.
+- **Request a review:** initiate only the explicitly named reviewer or
+  checkpoint, once, through an authorized available tool. This operation does
+  not authorize later repairs, waiting, or another request.
+- **Evaluate readiness:** report coverage, unresolved findings, CI state,
+  required manual QA, and conflicts with required checks. Do not initiate
+  missing checks, modify code, resolve threads, request reviews, or merge.
 
-- initial handoff after implementation is ready for review
-- arrival of review findings
-- completion of a review that reports no findings
-- relevant CI completion or failure
-- resuming work on an existing pull request
-- final-review checkpoints and human handoff
+Explicit limits in the current owner request take precedence. If the request is
+only an assessment, observation of a credible bug is not repair authorization.
+If an external event arrives without a new owner request, report it only when
+asked; do not start this procedure.
 
-A clean review is a transition. Read the result and decide the next checkpoint. Do not wait for a finding that will not arrive.
+## Start an authorized operation
 
-## Continuation
+Refresh the branch and identify, in a few sentences:
 
-When this run exposes `cursor-subscriptions` tools, read each tool's schema and use the tool that matches the event:
+- pull request and current head SHA, plus merge base or base SHA when relevant;
+- completed reviews and exact commit or range each result covers;
+- findings and affected production behavior included in the authorization;
+- a proportionate validation plan.
 
-- `cursor-subscriptions-subscribe_github_pr` for later pull-request comments, reviews, and thread updates. It delivers events after the subscription `openTime`. It does not backfill comments that already exist. Fetch the current comments, reviews, threads, and checks immediately when the subscription starts and whenever work resumes.
-- `cursor-subscriptions-subscribe_github_ci` for CI completion on the pull request.
+On resume, refresh HEAD and load only relevant new findings and reliable prior
+context. Do not repeatedly load every historical discussion. If another actor
+changed the branch, reassess before writing and never overwrite their work.
+Missing, skipped, rate-limited, failed, canceled, or running reviews are not
+clean results.
 
-These tools are absent on some runs, including a Cloud Agent automation running as a team service account. If a required tool is missing or the subscribe call fails, stop and give this handoff:
+For future large cross-subsystem features, make a short initial assessment of
+source-of-truth ownership, durable state, lifecycle risks, and verification,
+then propose coherent implementation milestones before building a large
+dependency chain. Skip that ceremony for small local fixes. Bring forward
+targeted Retail checks before later work depends on uncertain trade, bank,
+combat, or WoW API behavior.
 
-```text
-This session cannot resume on its own when <event> arrives. Start a new session at that point. The new session must read .cursor/skills/ai-review-loop/SKILL.md, then load the current PR head SHA, merge base, review comments, review status, and checks before it acts.
-```
+## Investigate findings by root cause
 
-Replace `<event>` with the specific review result or CI result being waited on. Do not invent a polling daemon or a second scheduler. A bounded status read is allowed before concluding that an expected review did not start: read the reviewer summary, check, or reply once. If it is still running, subscribe or hand off. Do not post another request while it is running.
+For every candidate finding, establish current-HEAD evidence of the triggering
+condition, reachable failure path, practical impact, and violated requirement
+or invariant. Prefer reproduction or a regression test when practical. A
+well-supported code trace is acceptable when the real environment cannot be
+reproduced; do not dismiss a credible defect solely for lacking automated
+reproduction.
 
-On resume, fetch existing findings and review state before waiting for a future event.
+Classify each finding as:
 
-## Start each round
+- **confirmed/open**
+- **already fixed**
+- **duplicate**
+- **unsupported**
+- **needs more evidence**
+- **product/architecture decision**
 
-Keep this state in the session notes. On resume, reconstruct it from the current head, review comments, checks, and reviewer summaries. Do not commit a bookkeeping file, and do not post a status comment that mentions a reviewer. A committed status file or an accidental reviewer mention can itself trigger a review.
+Consolidate symptoms with one root cause without concealing distinct defects.
+Where readily established from recent commits or tests, distinguish an
+original defect from a regression introduced by a prior fix. Otherwise mark
+attribution unknown; do not perform an expensive historical audit solely to
+assign blame.
 
-Record:
+For each confirmed defect:
 
-- current pull-request head SHA
-- merge base, or the base branch SHA used for the diff
-- reviews expected for this round
-- each expected review's state: requested, running, completed, or blocked
-- the commit or commit range each available result covers
+1. Briefly state the behavior that must remain true.
+2. Inspect sibling entry points, callers, shared state, and lifecycle
+   transitions governed by that rule within the affected scope.
+3. Choose the smallest coherent repair, not necessarily the fewest changed
+   lines.
+4. Test the production behavior and relevant boundaries rather than
+   duplicating implementation logic in tests.
+5. Run affected validation and inspect the resulting diff.
 
-Read the current PR requirements, the applicable `AGENTS.md` files, and `.github/codex-review-guidance.md` before editing. Inspect current HEAD. A review comment can describe an older commit.
+Newly discovered defects in the same approved root-cause and impact surface may
+be repaired in the batch. Report unrelated discoveries without silently
+expanding scope. If a dependency makes the repair unsafe or substantially
+larger, stop for a scope decision.
 
-A reviewer that was not scheduled for the round is not a reviewer to wait for.
+## Implement and deliver one repair batch
 
-### Which reviews belong in the round
-
-| Round | Wait for | Do not request |
-| --- | --- | --- |
-| Initial handoff | Configured Codex review of this head, including Security Review when the Codex summary lists it, plus one accepted CodeRabbit full review of this head, plus relevant CI | Bugbot; a second Codex request while Codex is already queued, running, or completed for this head |
-| Ordinary fix batch | Configured automatic Codex review of the new head, plus relevant CI | CodeRabbit; Bugbot; an immediate manual `@codex review` for the same push |
-| Final Codex integration | The one explicit final whole-PR integration review | CodeRabbit and Bugbot until that Codex lifecycle step is complete |
-| Final independent checkpoints | One CodeRabbit full review when its allowance is available and this head lacks equivalent completed coverage; Bugbot only for a production-affecting PR | Another Codex full review solely because this checkpoint started |
-| Narrow fix after a final checkpoint | Targeted verification of the behavior that fix affects | A new unrestricted whole-PR review from every reviewer |
-
-A pull request is production-affecting when it changes packaged addon or runtime files, or release, packaging, or workflow behavior that can publish or promote a release. Reviewer instructions alone do not make it production-affecting. When it is unclear whether a changed file ships or changes release behavior, treat the pull request as production-affecting.
-
-At the start of the initial round, request the CodeRabbit full review and let the configured Codex review run. Do not wait for one of those reviews to finish before requesting the other. Do not post a separate `@codex security review` when the summary already includes that review for this head.
-
-## What counts as reviewed
-
-A result is clean only when the reviewer finished a review of the code being accepted, and that review reported no actionable findings still open against current HEAD.
-
-These are not a clean review:
-
-- no comments yet
-- a review still running
-- a skipped review
-- a rate-limited review
-- a failed or canceled review
-- a generic green status with no evidence that the review occurred
-- a clean result for an older head, unless the applicable incremental-review rules in `.github/codex-review-guidance.md` still cover the later commits
-
-Before advancing a checkpoint, verify that the required coverage applies to the current code. Preserve an earlier review when that Codex document allows an incremental review. Do not require every reviewer to repeat a full review after a narrow fix.
-
-This repository disables CodeRabbit automatic review in `.coderabbit.yaml` (`reviews.auto_review.enabled: false`). A CodeRabbit comment that says auto-review was skipped is the idle state. It is not a completed review and it is not an exhausted allowance. The checkpoint still requires an accepted manual request.
-
-Codex completion evidence is the summary comment from `chatgpt-codex-connector`: its status, commit, and trigger, plus a 👀 reaction while a review is running and a 👍 reaction when the finished reviews have no findings. A 👍 counts only for the commit named in that summary. Bugbot completion evidence is a finished `Cursor Bugbot` check, or Bugbot's own review comment, for that head. `success` means Bugbot found no issues and left no unresolved earlier Bugbot comments. `neutral` and `failure` are not clean: `neutral` can mean findings, cancellation by a newer commit, or an internal error.
-
-## Run the round
-
-1. Collect review comments and relevant CI results for the current head.
-2. Investigate findings that are already available while other expected reviews are still running. Use `.cursor/skills/pr-review-comments/SKILL.md` for each finding. Do not push yet.
-3. Before finalizing the batch, confirm that every review expected for this round has completed or has a documented unavailable outcome.
-4. Fetch findings again so results that arrived during investigation are included.
-5. Validate and deduplicate the complete set against current HEAD.
-6. Fix legitimate issues, run the applicable validation, and push once if the batch changes code.
-
-If another push lands during the round, refresh the head SHA and merge base, then reassess findings and coverage. Do not implement a stale finding against the new code. An in-flight clean result for the previous head does not cover the new head.
-
-No code change is required when every finding is already fixed, duplicated, or unsupported. Do not create a commit or push only to give a reviewer something new to look at.
-
-### Classify every finding
-
-Classify each finding as one of:
-
-- **valid/open** — the defect is reachable and remains present in current HEAD
-- **already fixed** — current HEAD no longer contains the reported problem
-- **duplicate** — another finding describes the same root cause
-- **incorrect/missing context** — the finding does not hold after tracing the actual code and lifecycle
-- **follow-up/out of scope** — potentially useful work, but not a defect caused by this PR and not required by the ticket
-
-Do not modify production code merely because a reviewer suggested a change. For a valid finding, establish the triggering path and root cause before choosing a fix.
-
-### Batch the round
-
-After classification:
-
-1. Consolidate findings that share a root cause.
-2. Design the smallest coherent fix for all valid/open findings.
-3. Check affected callers, consumers, shared state, persistence, synchronization, and lifecycle behavior.
-4. Implement the complete batch.
-5. Add or update tests when they can meaningfully protect the behavior.
-6. Run the applicable repository validation.
-7. Re-inspect the resulting diff for review-induced complexity.
-8. Push once for the entire review round.
+Normal local engineering autonomy remains intact: inspect affected
+dependencies, run tests, debug failures caused by the batch, and revise the fix
+until supportable. A batch may contain several edits and test runs, but it does
+not permit indefinite architectural expansion.
 
 Use this sequence:
 
 ```text
-collect -> validate -> deduplicate -> fix batch -> test -> one push
+refresh -> investigate -> classify -> consolidate -> repair -> validate -> inspect -> deliver once -> stop
 ```
 
-A push can trigger another paid or limited review. Replying to one thread does not push and does not start another review. Thread replies and resolution stay in `.cursor/skills/pr-review-comments/SKILL.md`.
+When delivery is authorized, make at most one push for the batch. Do not push
+per finding. Do not create an artificial commit when nothing changed. Thread
+replies and resolutions remain governed by
+`.cursor/skills/pr-review-comments/SKILL.md` and require authorization for
+external writes. Do not wait for or act on reviews or CI triggered by the push.
 
-## Request a checkpoint
+Keep routine handoffs short: scope/head, meaningful fixes, validation evidence,
+unresolved decisions or manual QA, and a recommended next action. Do not commit
+round bookkeeping or generate elaborate reports by default.
 
-Post a checkpoint as a new top-level pull-request comment with `ManagePullRequest` `post_comment`, omitting `in_reply_to`. Do not use `gh` to write comments. Do not post the request as a reply on a review thread. Do not treat a comment authored by another bot as a request those reviewers will accept.
+## Pause for a decision
 
-If `ManagePullRequest` is unavailable, the checkpoint is blocked. Report the exact comment a person must post from an account the reviewer accepts. Do not claim the review was requested.
+Pause the affected work when:
 
-After posting, verify that the reviewer accepted the request and that a review then finished. The comment's presence is not acceptance, and acceptance is not a completed review.
+- repairs repeatedly break the same invariant or would reverse an accepted fix;
+- reviewers disagree about required behavior, retention, compatibility, or
+  authority;
+- repair changes a product contract, requires a substantial new state machine,
+  or expands across unrelated subsystems;
+- reliable resolution needs Retail evidence unavailable in the environment.
 
-### CodeRabbit
+Report the conflict, evidence, remaining risk, and a bounded recommended next
+step. Do not automatically redesign, split the PR, revert work, or commission
+an unrestricted audit. A directly understood local correction or an ordinary
+test failure does not require escalation.
 
-Command reference: `@coderabbitai full review` reviews the whole pull request, and `@coderabbitai review` reviews incrementally since the last CodeRabbit review.
+Real data loss, incorrect accounting, authorization failures, crashes/freezes,
+serious regressions, and broken required behavior remain blockers. Do not
+suppress credible P2 findings or demote a defect because it is old, rare,
+expensive, or inconvenient. There is no numeric cap on legitimate findings
+within an authorized review. Low-impact limitations need explicit owner
+acceptance before deferral. A budget pause leaves a defect open; it does not
+make the PR ready. Optional polish, speculative hardening, and unrelated
+cleanup are not mandatory repair scope.
 
-- Initial checkpoint: post `@coderabbitai full review` once for the initial completed pull-request state.
-- Final checkpoint: post `@coderabbitai full review` once for the final checkpoint state when the allowance is available.
-- Targeted follow-up: post `@coderabbitai review` when an incremental recheck of a narrow fix is appropriate.
-- Do not request CodeRabbit after every ordinary Codex fix push.
+## Human-selected review checkpoints
 
-Skip a full-review request when this head already has an equivalent completed CodeRabbit full review, or when that full review is already requested or running for this head. Wait for the in-flight review instead of posting another. If it is unclear whether the existing result is a full review of this head, it is not equivalent coverage. Do not request another CodeRabbit review merely to consume remaining quota. If the only result for this unchanged head is a rate limit, record that unavailable outcome once. Do not post the final full-review request as an immediate retry.
+Recommend checkpoints; never schedule them automatically:
 
-After the manual request, a rate-limited, failed, canceled, or other non-review result is an unavailable checkpoint. Say that. Do not label it clean, do not waive a known valid finding, and do not enable a paid continuation. The configured auto-review skip, before any manual request, is not this outcome.
+- **Codex:** primary code reviewer. Initial review covers the whole PR and
+  affected integrations. Ordinary rechecks focus on fixes and their impact,
+  including relevant unchanged callers and shared state.
+- **CodeRabbit:** independent checkpoint for substantial or high-risk changes.
+  It is not required after every ordinary fix. Recommend an early checkpoint
+  only when it can validate a consequential design before later work depends
+  on it.
+- **Bugbot:** optional independent check when requested or justified by a
+  distinct risk; never mandatory merely because an older process used three
+  reviewers.
 
-### Codex
+For substantial changes after the initial review, retain the final whole-PR
+integration checkpoint in `.github/codex-review-guidance.md`. A clean initial
+whole-PR review does not need an identical repeat for ceremony. After a
+final-checkpoint finding, recommend targeted coverage unless the repair
+materially invalidates previous coverage.
 
-During ordinary iterations, let the configured automatic review run after a substantive fix push. Check the Codex summary for a queued or running review before requesting anything. Do not immediately add `@codex review` for that same round.
+All review requests require a current owner authorization naming the reviewer
+or checkpoint. If recommending a broad review, identify the uncovered gap or
+invalidated assumption. Remaining quota is not a reason to request a review.
+Instructions about incremental scope do not guarantee provider token use or
+execution details.
 
-If the expected automatic review does not start, read the summary status, commit, and trigger, and check for a 👀 reaction. When nothing is queued or running for the current head, one plain `@codex review` comment is allowed. If that comment is accepted, do not post it again. If it is not accepted, mark Codex blocked and tell a human to check the Codex GitHub connection.
+Keep SHA, base, and range coverage explicit. Reuse earlier coverage only when
+later changes do not invalidate it, and explain why. A required GitHub check
+still applies even when this guidance calls that reviewer optional: flag the
+policy conflict and do not bypass it or call the PR merge-ready.
 
-When `.github/codex-review-guidance.md` requires the final integration review, and that review is not already queued or running, post this once:
-
-```text
-@codex review
-
-Perform the final whole-PR integration sweep required by .github/codex-review-guidance.md. Review the entire pull request against its merge base. This is the final integration review, not an incremental fix review.
-```
-
-Do not create an empty commit to trigger that review. If Codex does not accept the request, mark the final sweep blocked and report that a human must confirm it. Do not post a second copy.
-
-### Bugbot
-
-Do not invoke Bugbot during ordinary Codex iterations.
-
-At the final checkpoint for a production-affecting pull request, post one top-level comment containing exactly `cursor review` or exactly `bugbot run`. Post only one of them. If a Bugbot run is already queued, or the `Cursor Bugbot` check is in progress for this head, do not post the other.
-
-Verify that Bugbot accepts the request and that the check or review finishes for this head. The comment itself is not a completed review. A `Cursor Bugbot` result for an older head does not cover later commits.
-
-Bugbot is configured to run only when mentioned. Incremental Review controls the scope of a requested review; it does not automatically start a review after a push.
-
-When a fix to a valid Bugbot finding needs Bugbot verification, request one manual Bugbot review after the fix batch is pushed and the applicable Codex verification is complete. Check first whether a Bugbot review covering that head is already requested, running, or completed, and do not create a duplicate request.
-
-Use the configured incremental scope for that verification. Do not enable automatic every-push Bugbot reviews or Bugbot Autofix. Cursor remains the code-writing agent.
-
-### Blocked checkpoints
-
-If a required checkpoint cannot run because of permissions, an unavailable tool, a service failure, or an exhausted paid allowance, mark it blocked. Name the reviewer, the head SHA, the evidence, and the exact next human action. Do not treat the checkpoint as passed.
-
-## Codex lifecycle
-
-Use the transitions below only to choose which part of `.github/codex-review-guidance.md` applies. That document remains the definition of Codex completion.
-
-- **Initial whole-PR review.** The first Codex review of the pull request. If it is clean for the current head, Case A applies: do not request another full Codex review only to satisfy this process.
-- **Incremental fix review.** After a fix batch, review the new commits as that document describes for subsequent reviews. A clean incremental result does not replace the final integration sweep in Case B.
-- **Final whole-PR integration review.** After an incremental review is clean, request the one final sweep above. Advance to the CodeRabbit and Bugbot final checkpoints only after the applicable Codex case is complete.
-- **Targeted verification.** When the final integration review finds an issue, fix it and follow Case C: incremental review of that fix, including the targeted integration sweep it requires. A narrow fix does not restart an unrestricted whole-PR review. A broad change that makes earlier coverage unreliable follows that document's full-review fallback rules.
+An authorized review request is one external write. Request it once through an
+available authorized tool, report whether the request was made, and stop. Do
+not wait for acceptance or completion.
 
 ## WoW-specific validation
 
-For changes to shipped addon behavior, explicitly inspect relevant risks from the applicable repository instructions, including:
+For shipped addon behavior, inspect applicable Lua 5.1, persistence,
+synchronization, authorization, optional-integration, client-stability,
+bounded-execution, and lifecycle risks in the repository instructions. Use
+targeted tests that exercise production behavior and convergence. Preserve
+human-owned Retail QA and never fabricate in-game evidence.
 
-- Lua 5.1 compatibility
-- UI-thread stalls or freezes
-- callbacks, events, timers, tickers, and `OnUpdate`
-- feedback loops and re-entrancy
-- queues and retry convergence
-- cleanup and duplicate registration
-- long-session resource growth
-- asynchronous item, inspection, and game data
-- SavedVariables and profile compatibility
-- synchronization authorization, identity, deduplication, ordering, and amplification
-- addon-message storms
-- protected UI, combat restrictions, and taint
-- optional integration boundaries
-- TOC, version, and release correctness
+Do not weaken tests, CI, branch protection, required checks, review quality, or
+error visibility to make a PR look clean.
 
-Do not claim that in-game testing occurred unless a human performed it. Do not weaken tests, CI, review requirements, or error visibility to make a pull request look clean. Do not spend a round on speculative or style-only churn.
+## External owner settings — not changed by this procedure
 
-## Convergence safety valve
+These are owner actions outside repository instruction edits:
 
-A real defect remains actionable regardless of how many rounds have occurred.
+- stop or pause active feature agents separately;
+- disable or pause Cursor automations that start repairs or reviews from PR,
+  comment, review, CI, or scheduled events; retain deterministic CI;
+- set Codex automatic and Security Review triggers to the owner’s manual-review
+  policy while retaining desired manual review capability;
+- set Bugbot to manual triggering and Autofix off, including personal and
+  installation overrides;
+- keep unrequested paid continuation and agent fixing disabled in CodeRabbit
+  account settings;
+- set an owner-chosen service-level spending limit;
+- inspect required-review rules before treating optional reviewers as
+  skippable;
+- after merge, bring these instruction changes into active feature branches
+  and explicitly restart or resume agents under the new policy.
 
-Count a non-clean fix round only when a coordinated batch is pushed because at least one finding was valid and open. Individual comments and findings do not increment the count. Resuming the session does not reset it. A different reviewer reporting the next issue does not reset it. A round that pushes nothing does not increment it.
-
-Keep the count in the session notes. On resume, reconstruct it from the pull request's review-fix commits and prior discussion. If earlier fix rounds are visible, do not start the count at zero.
-
-After five consecutive non-clean fix rounds, pause autonomous rewriting. Summarize:
-
-- unresolved defects
-- reviewer disagreements
-- areas repeatedly rewritten
-- tests currently covering the behavior
-- suspected requirement or architectural ambiguity
-
-Ask a human for direction. The pause is not permission to merge or to ignore a defect.
-
-## Completion
-
-Automated review is ready for human handoff only when:
-
-- applicable CI checks are green, or an unavailable check is explicitly identified
-- the applicable Codex lifecycle in `.github/codex-review-guidance.md` is complete for the current head
-- reported Security Review findings are resolved or explicitly dispositioned
-- the final CodeRabbit checkpoint completed for this head, or its unavailable outcome is recorded without calling it clean
-- Bugbot completed for this head on a production-affecting pull request, or that required checkpoint is recorded as blocked
-- no known valid review finding remains unresolved
-- human-only WoW Retail verification is clearly identified when the change requires it
-
-Do not merge on the user's behalf unless explicitly instructed and authorized.
+Instruction text cannot enforce a per-PR dollar budget. Report actual spend
+only from a trustworthy usage source; otherwise say it is unavailable and do
+not estimate it from time, commits, or findings.

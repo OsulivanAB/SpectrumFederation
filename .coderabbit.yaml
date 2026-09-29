@@ -158,12 +158,15 @@ reviews:
         logic.
 
   auto_review:
+    # Reviews are owner-requested. Keep every automatic or opt-in shortcut off.
     enabled: false
     auto_incremental_review: false
+    description_keyword: ""
     auto_pause_after_reviewed_commits: 2
     drafts: false
     base_branches:
       - "^beta$"
+    # Positive labels trigger reviews even when enabled is false.
     labels: []
     ignore_title_keywords: []
     ignore_usernames: []
