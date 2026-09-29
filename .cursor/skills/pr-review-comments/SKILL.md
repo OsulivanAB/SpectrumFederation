@@ -50,9 +50,11 @@ explicitly authorizes the corresponding external write.
 4. **If replies were authorized:** reply factually after the disposition is
    known. For a batch fix, reply after its single delivery so the response can
    name the fixing commit.
-5. **If thread resolution was authorized:** resolve only when a confirmed
-   finding is actually fixed in current HEAD. Leave unsupported, disputed,
-   decision-dependent, or unresolved findings open for human consideration.
+5. **If thread resolution was authorized:** resolve a confirmed finding when it
+   is fixed in current HEAD, including an `already fixed` finding whose
+   original defect was confirmed and whose fix remains in current HEAD. Leave
+   unsupported, disputed, decision-dependent, or unresolved findings open for
+   human consideration.
 
 ## Reply and resolve
 
