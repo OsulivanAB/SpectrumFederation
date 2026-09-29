@@ -89,7 +89,11 @@ function Sync:_ClearPendingTradeFreezes()
         stale[#stale + 1] = profile
     end
     for i = 1, #stale do
-        pendingFreezes[stale[i]] = nil
+        local profile = stale[i]
+        pendingFreezes[profile] = nil
+        if type(profile) == "table" then
+            profile._consumablesPendingFreezes = nil
+        end
     end
 end
 
@@ -100,10 +104,55 @@ local function PendingFreezeCap()
     return cap
 end
 
+local function PersistPendingFreezes(profile, list)
+    if type(profile) ~= "table" then return end
+    if type(list) ~= "table" or #list == 0 then
+        profile._consumablesPendingFreezes = nil
+        return
+    end
+    local stored = {}
+    local cap = PendingFreezeCap()
+    local startAt = 1
+    if #list > cap then startAt = #list - cap + 1 end
+    for i = startAt, #list do
+        local grant = list[i]
+        if type(grant) == "table" and type(grant.token) == "string" then
+            stored[#stored + 1] = {
+                token = grant.token,
+                donor = grant.donor,
+                receiver = grant.receiver,
+                generation = grant.generation,
+                items = grant.items,
+                kind = grant.kind,
+                itemId = grant.itemId,
+                epoch = grant.epoch,
+                createdAt = grant.createdAt,
+            }
+        end
+    end
+    if #stored == 0 then
+        profile._consumablesPendingFreezes = nil
+    else
+        profile._consumablesPendingFreezes = stored
+    end
+end
+
 local function FreezeList(profile)
     local stored = pendingFreezes[profile]
     if type(stored) ~= "table" then
         stored = {}
+        local persisted = type(profile) == "table" and profile._consumablesPendingFreezes or nil
+        if type(persisted) == "table" then
+            local cap = PendingFreezeCap()
+            local limit = #persisted
+            if limit > cap then limit = cap end
+            for i = 1, limit do
+                local grant = persisted[i]
+                if type(grant) == "table" and type(grant.token) == "string" then
+                    stored[#stored + 1] = grant
+                end
+            end
+        end
         pendingFreezes[profile] = stored
         return stored
     end
@@ -177,10 +226,18 @@ end
 local function ReleaseAckedFreeze(profile, token)
     if type(token) ~= "string" or token == "" then return end
     local stored = pendingFreezes[profile]
-    if type(stored) ~= "table" then return end
+    if type(stored) ~= "table" then
+        -- Still clear a persisted copy when the weak map was emptied by GC.
+        if type(profile) == "table" and type(profile._consumablesPendingFreezes) == "table" then
+            stored = FreezeList(profile)
+        else
+            return
+        end
+    end
     if type(stored.token) == "string" then
         if stored.token == token then
             pendingFreezes[profile] = nil
+            PersistPendingFreezes(profile, nil)
         end
         return
     end
@@ -193,8 +250,10 @@ local function ReleaseAckedFreeze(profile, token)
     end
     if #kept == 0 then
         pendingFreezes[profile] = nil
+        PersistPendingFreezes(profile, nil)
     else
         pendingFreezes[profile] = kept
+        PersistPendingFreezes(profile, kept)
     end
 end
 
@@ -223,6 +282,7 @@ local function RememberTradeFreeze(profile, grant, sent)
                 table.remove(list, 1)
             end
         end
+        PersistPendingFreezes(profile, list)
         return false
     end
     MarkFreezeInflight(grant)
@@ -235,6 +295,7 @@ local function RememberTradeFreeze(profile, grant, sent)
             table.remove(list, 1)
         end
     end
+    PersistPendingFreezes(profile, list)
     return true
 end
 
@@ -318,7 +379,7 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     payload.consumablesArchiveFingerprint = desc.archiveFingerprint
 end
 
-function Sync:_ConsiderConsumablesCatchUp(payload)
+function Sync:_ConsiderConsumablesCatchUp(payload, opts)
     local C = Consumables()
     local S = Rules()
     if not C or not S or type(payload) ~= "table" then return end
@@ -391,10 +452,30 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
             profile._consumablesAdoptNextSnapshot = self.state.sessionId
         end
     end
+    -- SES_START / SES_REANNOUNCE advertise before the NORMAL event flush. Record
+    -- capability and config above; leave ledger catch-up to the heartbeat.
+    if type(opts) == "table" and opts.deferLedgerCatchUp then
+        return
+    end
     if not S.NeedsCatchUp(localDesc, remote) then
         return
     end
     if configDiffers and LedgerMatches(localDesc, remote) and not graceOver then
+        return
+    end
+    -- Do not request an authoritative snapshot while this client's ordered or
+    -- unsequenced resend cursor still has authored rows to queue. Reconciliation
+    -- would drop ordered local rows that are not yet on _consumablesUnsent.
+    local events = profile._consumableEvents
+    local orderedKey = tostring(self.state.sessionId) .. ":" .. tostring(self.state.coordinator)
+    if profile._consumablesOrderedResendKey == orderedKey then
+        local cursor = tonumber(profile._consumablesOrderedResendCursor)
+        if type(events) == "table" and cursor and cursor <= #events then
+            return
+        end
+    end
+    if type(profile._consumablesResendCursor) == "number" and type(events) == "table"
+        and profile._consumablesResendCursor <= #events then
         return
     end
     local fingerprintOnly = S.CatchUpKind and S.CatchUpKind(localDesc, remote) == "fingerprint"
@@ -423,11 +504,11 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     end
     local requested = false
     if self.RequestProfileSnapshot then
-        local opts = nil
+        local snapOpts = nil
         if profile._consumablesCatchUpWantCoordinator then
-            opts = { coordinatorOnly = true }
+            snapOpts = { coordinatorOnly = true }
         end
-        requested = self:RequestProfileSnapshot("consumables-catchup", opts) and true or false
+        requested = self:RequestProfileSnapshot("consumables-catchup", snapOpts) and true or false
     end
     if not requested then
         return
@@ -626,13 +707,11 @@ local function FreezeWirePayload(profile, grant)
 end
 
 function Sync:_FlushPendingTradeFreeze(profile)
-    local list = pendingFreezes[profile]
-    if type(list) ~= "table" then return end
-    if type(list.token) == "string" then
-        pendingFreezes[profile] = { list }
-        list = pendingFreezes[profile]
+    local list = FreezeList(profile)
+    if type(list) ~= "table" or #list == 0 then
+        PersistPendingFreezes(profile, nil)
+        return
     end
-    if #list == 0 then return end
     if not (self.state and self.state.active) or not SessionFor(profile) then return end
     local C = Consumables()
     local now = C and C.Now and C.Now() or 0
@@ -665,12 +744,22 @@ function Sync:_FlushPendingTradeFreeze(profile)
                 index = index + 1
             end
         else
-            if not SF.LootHelperComm or not self.MSG then return end
+            if not SF.LootHelperComm or not self.MSG then
+                PersistPendingFreezes(profile, list)
+                return
+            end
             local coordinator = self.state.coordinator
-            if type(coordinator) ~= "string" or coordinator == "" then return end
-            if not self:_ConsumablesCoordinatorAccepts() then return end
+            if type(coordinator) ~= "string" or coordinator == "" then
+                PersistPendingFreezes(profile, list)
+                return
+            end
+            if not self:_ConsumablesCoordinatorAccepts() then
+                PersistPendingFreezes(profile, list)
+                return
+            end
             local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_TRADE_FREEZE, FreezeWirePayload(profile, grant), "WHISPER", coordinator, "NORMAL")
             if sent == false then
+                PersistPendingFreezes(profile, list)
                 return
             end
             RememberTradeFreeze(profile, grant, true)
@@ -680,6 +769,9 @@ function Sync:_FlushPendingTradeFreeze(profile)
     end
     if type(pendingFreezes[profile]) == "table" and #pendingFreezes[profile] == 0 then
         pendingFreezes[profile] = nil
+        PersistPendingFreezes(profile, nil)
+    else
+        PersistPendingFreezes(profile, pendingFreezes[profile])
     end
 end
 

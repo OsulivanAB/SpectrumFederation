@@ -467,7 +467,14 @@ function C.Ensure(profile)
         or cfg.generation ~= math.floor(cfg.generation) or cfg.generation > C.MAX_EVENT_SEQ then
         cfg.generation = 1
     end
-    if type(cfg.configSeq) ~= "number" or cfg.configSeq < 0 then cfg.configSeq = 0 end
+    do
+        local seq = tonumber(cfg.configSeq)
+        if not seq or seq ~= seq or seq ~= math.floor(seq) or seq < 0 or seq > C.MAX_EVENT_SEQ then
+            cfg.configSeq = 0
+        else
+            cfg.configSeq = seq
+        end
+    end
     if type(cfg.eventSeq) ~= "number" or cfg.eventSeq < 0 or cfg.eventSeq ~= math.floor(cfg.eventSeq) then
         cfg.eventSeq = 0
     elseif cfg.eventSeq >= 9007199254740992 then
@@ -1861,13 +1868,27 @@ function C.ValidGeneration(value)
     return generation
 end
 
+function C.ValidConfigSeq(value)
+    local seq = tonumber(value)
+    if not seq or seq ~= seq or seq == math.huge or seq == -math.huge then
+        return nil
+    end
+    if seq ~= math.floor(seq) or seq < 0 or seq > C.MAX_EVENT_SEQ then
+        return nil
+    end
+    return seq
+end
+
 function C.ReplaceConfig(profile, payload)
     local cfg = C.Ensure(profile)
     local generation = C.ValidGeneration(payload.generation)
     if generation then
         cfg.generation = generation
     end
-    cfg.configSeq = tonumber(payload.configSeq) or cfg.configSeq or 0
+    local configSeq = C.ValidConfigSeq(payload.configSeq)
+    if configSeq then
+        cfg.configSeq = configSeq
+    end
     local remoteEventSeq = tonumber(payload.eventSeq)
     if remoteEventSeq and remoteEventSeq == math.floor(remoteEventSeq)
         and remoteEventSeq > (tonumber(cfg.eventSeq) or 0) and remoteEventSeq <= C.MAX_EVENT_SEQ then
@@ -2071,7 +2092,7 @@ function C.MergeSnapshot(profile, data, opts)
             remoteGen = tonumber(profile._consumables.generation) or 1
         end
     end
-    local remoteSeq = tonumber(data.configSeq) or 0
+    local remoteSeq = C.ValidConfigSeq(data.configSeq) or 0
     opts = type(opts) == "table" and opts or {}
     local fromCoordinator = opts.consumablesFromCoordinator == true
     local adoptSession = profile._consumablesAdoptNextSnapshot

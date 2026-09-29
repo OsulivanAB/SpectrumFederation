@@ -328,7 +328,7 @@ function Sync:HandleSessionReannounce(sender, payload)
         self:_ApplyAdvertisedRCConfig(payload)
     end
     if self._ConsiderConsumablesCatchUp then
-        self:_ConsiderConsumablesCatchUp(payload)
+        self:_ConsiderConsumablesCatchUp(payload, { deferLedgerCatchUp = true })
     end
 
     self.state.heartbeat = self.state.heartbeat or {}

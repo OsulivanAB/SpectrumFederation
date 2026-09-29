@@ -5170,9 +5170,13 @@ function checkSecureAndFingerprintRound()
     local savedBags = RT.bagCounts
     local savedStacks = RT.bagStacks
     local savedDepositTimer = C_Timer
+    local savedCurrentTab = GetCurrentGuildBankTab
+    local savedCursor = GetCursorInfo
     local splits = {}
     local places = {}
     local deferred = {}
+    GetCurrentGuildBankTab = function() return 1 end
+    GetCursorInfo = function() return "item", aqirite end
     C_Timer = {
         After = function(_, fn) deferred[#deferred + 1] = fn end,
         NewTimer = function(_, fn) return { Cancel = function() end } end,
@@ -5182,6 +5186,7 @@ function checkSecureAndFingerprintRound()
             splits[#splits + 1] = { bag = bag, slot = slot, take = take }
         end,
         PickupContainerItem = function() end,
+        GetContainerItemInfo = function() return { isLocked = false } end,
     }
     PickupGuildBankItem = function(tab, slot)
         places[#places + 1] = { tab = tab, slot = slot }
@@ -5222,6 +5227,63 @@ function checkSecureAndFingerprintRound()
     assertEq(places[3] and places[3].slot, 3, "the final residual stack fills the next empty target")
     assertTrue(type(RT.depositIntent) == "table", "deferred places still finalize a deposit intent")
     assertEq(#(RT.depositIntent.places or {}), 3, "the deposit intent records every deferred place")
+    assertEq(RT.depositIntent.observedTab, 1, "the deposit records the displayed guild bank tab")
+
+    -- Wrong displayed tab blocks deposits before reading slots.
+    places = {}
+    GetCurrentGuildBankTab = function() return 2 end
+    RT.depositIntent = nil
+    RT.depositWork = nil
+    RT:BeginDeposit({ itemId = aqirite, quantity = 5, recipient = "guildbank" }, {
+        profile = depositP,
+        inGroup = {},
+        compatible = {},
+        inRange = {},
+        usable = true,
+    })
+    assertEq(#places, 0, "a deposit does not place when the configured tab is not open")
+    assertTrue(RT.depositIntent == nil, "a wrong-tab deposit does not create an intent")
+
+    -- Locked source stacks wait; an empty cursor never picks a bank slot.
+    GetCurrentGuildBankTab = function() return 1 end
+    places = {}
+    deferred = {}
+    local lockCalls = 0
+    C_Container.GetContainerItemInfo = function()
+        lockCalls = lockCalls + 1
+        return { isLocked = lockCalls < 3 }
+    end
+    GetCursorInfo = function() return "item", aqirite end
+    RT:BeginDeposit({ itemId = aqirite, quantity = 2, recipient = "guildbank" }, {
+        profile = depositP,
+        inGroup = {},
+        compatible = {},
+        inRange = {},
+        usable = true,
+    })
+    assertEq(#places, 0, "a locked source stack does not place immediately")
+    assertTrue(#deferred >= 1, "a locked source stack schedules a retry")
+    local lockGuard = 0
+    while #deferred > 0 and lockGuard < 8 do
+        lockGuard = lockGuard + 1
+        local fn = table.remove(deferred, 1)
+        fn()
+    end
+    assertTrue(#places >= 1, "an unlocked source stack places after waiting")
+    places = {}
+    deferred = {}
+    RT.depositIntent = nil
+    RT.depositWork = nil
+    C_Container.GetContainerItemInfo = function() return { isLocked = false } end
+    GetCursorInfo = function() return nil end
+    RT:BeginDeposit({ itemId = aqirite, quantity = 2, recipient = "guildbank" }, {
+        profile = depositP,
+        inGroup = {},
+        compatible = {},
+        inRange = {},
+        usable = true,
+    })
+    assertEq(#places, 0, "an empty cursor does not pick up a guild bank slot")
     C_Container = savedContainer
     PickupGuildBankItem = savedPickup
     GetGuildBankNumSlots = savedNum
@@ -5229,6 +5291,8 @@ function checkSecureAndFingerprintRound()
     GetGuildBankItemInfo = savedInfo
     C_Item = savedItemApi
     C_Timer = savedDepositTimer
+    GetCurrentGuildBankTab = savedCurrentTab
+    GetCursorInfo = savedCursor
     RT.BankIsOpen = savedBankOpen
     RT.CurrentGuild = savedGuild
     RT.bagCounts = savedBags
@@ -5441,6 +5505,194 @@ function checkSecureAndFingerprintRound()
     assertTrue(flushed, "an offline trade freeze is flushed when a session starts")
     Sync.BroadcastTradeFreeze = savedBroadcast
     Sync.state = savedOfflineState
+
+    -- Offline freezes survive a weak-map clear via the profile-persisted copy.
+    local persistP = profile("persist-freeze", admin)
+    assertTrue(select(1, C.AddCrafter(persistP, admin, admin, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(persistP, admin, aqirite, admin, { asAdmin = true })))
+    local persistEpoch = persistP._consumables.assignments[tostring(aqirite)].epoch
+    Sync.state = { active = false }
+    assertTrue(Sync:PublishTradeFreeze(persistP, {
+        token = "trade-" .. admin .. "-persist-1",
+        donor = "Donor-Realm",
+        receiver = admin,
+        generation = persistP._consumables.generation,
+        items = {
+            [aqirite] = { itemId = aqirite, epoch = persistEpoch, assignedToReceiver = true },
+        },
+    }) == true, "a persisted offline freeze registers")
+    assertTrue(type(persistP._consumablesPendingFreezes) == "table"
+        and persistP._consumablesPendingFreezes[1]
+        and persistP._consumablesPendingFreezes[1].token == "trade-" .. admin .. "-persist-1",
+        "an offline freeze is stored on the profile")
+    Sync:_ClearPendingTradeFreezes()
+    -- ClearPending also clears the profile key; re-seed as a reload would leave SavedVariables.
+    persistP._consumablesPendingFreezes = {
+        {
+            token = "trade-" .. admin .. "-persist-1",
+            donor = "Donor-Realm",
+            receiver = admin,
+            generation = persistP._consumables.generation,
+            items = { { itemId = aqirite, epoch = persistEpoch } },
+            createdAt = C.Now(),
+        },
+    }
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "persist-flush",
+        profileId = persistP._profileId,
+        coordEpoch = 1,
+    }
+    local persistedFlush = false
+    Sync.BroadcastTradeFreeze = function(_, profile, grant)
+        persistedFlush = type(grant) == "table" and grant.token == "trade-" .. admin .. "-persist-1"
+        return true
+    end
+    Sync:_FlushPendingTradeFreeze(persistP)
+    assertTrue(persistedFlush, "a profile-persisted freeze flushes after reload")
+    Sync.BroadcastTradeFreeze = savedBroadcast
+    Sync.state = savedOfflineState
+
+    -- Invalid imported config sequences do not pin the watermark.
+    local seqP = profile("config-seq", admin)
+    C.ReplaceConfig(seqP, { generation = 1, configSeq = 3, crafters = { admin }, assignments = {} })
+    assertEq(seqP._consumables.configSeq, 3, "a valid config sequence is stored")
+    C.ReplaceConfig(seqP, { generation = 1, configSeq = (0/0), crafters = { admin }, assignments = {} })
+    assertEq(seqP._consumables.configSeq, 3, "NaN configSeq does not replace the stored sequence")
+    C.ReplaceConfig(seqP, { generation = 1, configSeq = 1.5, crafters = { admin }, assignments = {} })
+    assertEq(seqP._consumables.configSeq, 3, "a fractional configSeq is rejected")
+    C.ReplaceConfig(seqP, { generation = 1, configSeq = C.MAX_EVENT_SEQ + 1, crafters = { admin }, assignments = {} })
+    assertEq(seqP._consumables.configSeq, 3, "an oversized configSeq is rejected")
+    C.ReplaceConfig(seqP, { generation = 1, configSeq = 9, crafters = { admin }, assignments = {} })
+    assertEq(seqP._consumables.configSeq, 9, "a bounded whole configSeq replaces the watermark")
+
+    -- SES_START defers ledger snapshot requests until heartbeat.
+    local deferP = profile("defer-catchup", admin)
+    local savedDeferState = Sync.state
+    local savedDeferRequest = Sync.RequestProfileSnapshot
+    local savedDeferFind = Sync.FindLocalProfileById
+    local savedDeferGroup = Sync.IsRequesterInGroup
+    local deferRequests = 0
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = admin,
+        sessionId = "defer-session",
+        profileId = deferP._profileId,
+        peers = { [admin] = { consumablesCapable = true } },
+    }
+    Sync.IsRequesterInGroup = function() return true end
+    Sync.FindLocalProfileById = function() return deferP end
+    Sync.RequestProfileSnapshot = function()
+        deferRequests = deferRequests + 1
+        return true
+    end
+    local deferDesc = C.Descriptor(deferP)
+    local deferPayload = {
+        sessionId = "defer-session",
+        profileId = deferP._profileId,
+        coordinator = admin,
+        consumablesGeneration = deferDesc.generation,
+        consumablesConfigSeq = deferDesc.configSeq,
+        consumablesConfigFingerprint = deferDesc.configFingerprint,
+        consumablesEventCount = (deferDesc.eventCount or 0) + 3,
+        consumablesEventFingerprint = (tonumber(deferDesc.eventFingerprint) or 0) + 1,
+        consumablesArchiveCount = deferDesc.archiveCount,
+        consumablesArchiveFingerprint = deferDesc.archiveFingerprint,
+        consumablesCapable = true,
+    }
+    Sync:_ConsiderConsumablesCatchUp(deferPayload, { deferLedgerCatchUp = true })
+    assertEq(deferRequests, 0, "session-start catch-up does not request a ledger snapshot")
+    Sync:_ConsiderConsumablesCatchUp(deferPayload)
+    assertEq(deferRequests, 1, "heartbeat catch-up still requests a ledger snapshot")
+    Sync.RequestProfileSnapshot = savedDeferRequest
+    Sync.FindLocalProfileById = savedDeferFind
+    Sync.IsRequesterInGroup = savedDeferGroup
+    Sync.state = savedDeferState
+    Sync._consumablesCatchUpKey = nil
+
+    -- Ordered resend must finish before an authoritative snapshot is requested.
+    local resendP = profile("ordered-resend", admin)
+    for i = 1, 70 do
+        assertTrue(select(1, C.AppendEvent(resendP, {
+            id = "ce:ordered-resend:" .. admin .. ":" .. i,
+            type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+            quantity = 1, generation = 1, timestamp = i, order = i,
+        }, { silent = true })), "ordered resend fixture stores event " .. i)
+    end
+    local savedResendState = Sync.state
+    local savedResendRequest = Sync.RequestProfileSnapshot
+    local savedResendFind = Sync.FindLocalProfileById
+    local savedResendGroup = Sync.IsRequesterInGroup
+    local savedResendSelf = Sync._SelfId
+    local resendRequests = 0
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "Coord-Realm",
+        sessionId = "resend-session",
+        profileId = resendP._profileId,
+        peers = { ["Coord-Realm"] = { consumablesCapable = true } },
+    }
+    Sync._SelfId = function() return admin end
+    Sync.IsRequesterInGroup = function() return true end
+    Sync.FindLocalProfileById = function() return resendP end
+    Sync.RequestProfileSnapshot = function()
+        resendRequests = resendRequests + 1
+        return true
+    end
+    local localResend = C.Descriptor(resendP)
+    local resendPayload = {
+        sessionId = "resend-session",
+        profileId = resendP._profileId,
+        coordinator = "Coord-Realm",
+        consumablesGeneration = localResend.generation,
+        consumablesConfigSeq = localResend.configSeq,
+        consumablesConfigFingerprint = localResend.configFingerprint,
+        consumablesEventCount = localResend.eventCount,
+        consumablesEventFingerprint = (tonumber(localResend.eventFingerprint) or 0) + 7,
+        consumablesArchiveCount = localResend.archiveCount,
+        consumablesArchiveFingerprint = localResend.archiveFingerprint,
+        consumablesCapable = true,
+    }
+    Sync._consumablesCatchUpKey = nil
+    Sync:_ConsiderConsumablesCatchUp(resendPayload)
+    assertEq(resendRequests, 0, "a snapshot waits while ordered resend still has rows")
+    assertTrue(tonumber(resendP._consumablesOrderedResendCursor) ~= nil
+        and resendP._consumablesOrderedResendCursor <= #resendP._consumableEvents,
+        "the ordered resend cursor is still incomplete")
+    -- Advance the cursor to the end so heartbeat can snapshot.
+    while tonumber(resendP._consumablesOrderedResendCursor)
+        and resendP._consumablesOrderedResendCursor <= #resendP._consumableEvents do
+        Sync:_QueueAuthoredOrderedConsumablesEvents(resendP, localResend.eventCount, true)
+    end
+    Sync._consumablesCatchUpKey = nil
+    Sync:_ConsiderConsumablesCatchUp(resendPayload)
+    assertEq(resendRequests, 1, "a snapshot is requested after ordered resend completes")
+    Sync.RequestProfileSnapshot = savedResendRequest
+    Sync.FindLocalProfileById = savedResendFind
+    Sync.IsRequesterInGroup = savedResendGroup
+    Sync._SelfId = savedResendSelf
+    Sync.state = savedResendState
+    Sync._consumablesCatchUpKey = nil
+
+    -- Canceling multi-place deposit work finishes deferred profile deletes.
+    local delP = profile("deposit-delete", admin)
+    delP._sfConsumablesDeleteAfter = true
+    SF.lootHelperDB = SF.lootHelperDB or { profiles = {} }
+    SF.lootHelperDB.profiles[delP._profileId] = delP
+    local deleted = nil
+    local savedDelete = SF.DeleteLootHelperProfile
+    SF.DeleteLootHelperProfile = function(_, id) deleted = id end
+    RT.depositWork = { profileId = delP._profileId, placed = 0 }
+    RT:CancelDepositWork()
+    assertEq(deleted, delP._profileId, "canceling deposit work completes a deferred profile delete")
+    SF.DeleteLootHelperProfile = savedDelete
+    if SF.lootHelperDB and SF.lootHelperDB.profiles then
+        SF.lootHelperDB.profiles[delP._profileId] = nil
+    end
 
     -- Descriptor attachment flushes before copying ledger watermarks.
     local descP = profile("desc-flush", admin)

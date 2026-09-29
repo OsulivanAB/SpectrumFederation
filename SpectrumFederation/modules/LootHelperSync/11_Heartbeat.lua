@@ -126,7 +126,7 @@ function Sync:HandleSessionStart(sender, payload)
         self:_ApplyAdvertisedRCConfig(payload)
     end
     if self._ConsiderConsumablesCatchUp then
-        self:_ConsiderConsumablesCatchUp(payload)
+        self:_ConsiderConsumablesCatchUp(payload, { deferLedgerCatchUp = true })
     end
 
     -- Rebuild immediately when we already have the profile to avoid stale point/member UI.
