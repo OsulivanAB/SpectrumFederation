@@ -415,8 +415,20 @@ local function Definition(panel)
 							end
 							return options
 						end,
-						get = function() return panel.__sfCustodyEntry end,
-						set = function(value) panel.__sfCustodyEntry = value end,
+						get = function()
+							local activeId = ProfileKey(ActiveProfile())
+							if panel.__sfCustodyProfileId and panel.__sfCustodyProfileId ~= activeId then
+								panel.__sfCustodyEntry = nil
+								panel.__sfCustodyProfileId = nil
+								panel.__sfCustodyReason = nil
+								return nil
+							end
+							return panel.__sfCustodyEntry
+						end,
+						set = function(value)
+							panel.__sfCustodyEntry = value
+							panel.__sfCustodyProfileId = ProfileKey(ActiveProfile())
+						end,
 					},
 					{
 						type = "dropdown",
@@ -441,6 +453,7 @@ local function Definition(panel)
 						buttonText = "Resolve",
 						width = 120,
 						onClick = function(ctx)
+							local originId = ProfileKey(ActiveProfile())
 							local value = panel.__sfCustodyEntry
 							local holder, itemId = nil, nil
 							if type(value) == "string" then
@@ -453,6 +466,13 @@ local function Definition(panel)
 							local profile = ActiveProfile()
 							if not profile then
 								ctx.section:SetMessage("No active profile.", "error")
+								return
+							end
+							if ProfileChanged(ctx, originId, "Resolve") then return end
+							if panel.__sfCustodyProfileId and panel.__sfCustodyProfileId ~= originId then
+								ctx.section:SetMessage("The active profile changed, so Resolve was not applied.", "error")
+								panel.__sfCustodyEntry = nil
+								panel.__sfCustodyProfileId = nil
 								return
 							end
 							local sync = SF.LootHelperSync

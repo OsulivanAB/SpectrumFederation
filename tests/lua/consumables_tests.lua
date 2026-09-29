@@ -5135,7 +5135,8 @@ function checkSecureAndFingerprintRound()
     C.MAX_ARCHIVED_EVENTS = savedArchiveCap
     C.MAX_EVENTS_PER_ACTOR = savedActorCap
 
-    -- Split deposits reuse the residual source stack across target slots.
+    -- Split deposits reuse the residual source stack across target slots, one
+    -- place per frame so Retail can unlock the source after each move.
     local depositP = profile("deposit-split", admin)
     assertTrue(select(1, C.SetGuild(depositP, admin, { guid = "club-split", name = "Spectrum", realm = "Realm" }, 1, { asAdmin = true })))
     assertTrue(select(1, C.AddCrafter(depositP, admin, admin, { asAdmin = true })))
@@ -5150,8 +5151,14 @@ function checkSecureAndFingerprintRound()
     local savedGuild = RT.CurrentGuild
     local savedBags = RT.bagCounts
     local savedStacks = RT.bagStacks
+    local savedDepositTimer = C_Timer
     local splits = {}
     local places = {}
+    local deferred = {}
+    C_Timer = {
+        After = function(_, fn) deferred[#deferred + 1] = fn end,
+        NewTimer = function(_, fn) return { Cancel = function() end } end,
+    }
     C_Container = {
         SplitContainerItem = function(bag, slot, take)
             splits[#splits + 1] = { bag = bag, slot = slot, take = take }
@@ -5183,21 +5190,58 @@ function checkSecureAndFingerprintRound()
         inRange = {},
         usable = true,
     })
+    assertEq(#places, 1, "the first deposit places only one target per frame")
+    local guard = 0
+    while #deferred > 0 and guard < 8 do
+        guard = guard + 1
+        local fn = table.remove(deferred, 1)
+        fn()
+    end
     assertEq(#places, 3, "a large source stack continues into later deposit targets")
     assertEq(#splits, 2, "partial fills split; the final residual pickup uses the whole remainder")
     assertEq(splits[1].take, 2, "the first deposit takes only the first target's room")
     assertEq(splits[2].take, 2, "the second deposit continues with residual stack room")
     assertEq(places[3] and places[3].slot, 3, "the final residual stack fills the next empty target")
+    assertTrue(type(RT.depositIntent) == "table", "deferred places still finalize a deposit intent")
+    assertEq(#(RT.depositIntent.places or {}), 3, "the deposit intent records every deferred place")
     C_Container = savedContainer
     PickupGuildBankItem = savedPickup
     GetGuildBankNumSlots = savedNum
     GetGuildBankItemLink = savedLink
     GetGuildBankItemInfo = savedInfo
     C_Item = savedItemApi
+    C_Timer = savedDepositTimer
     RT.BankIsOpen = savedBankOpen
     RT.CurrentGuild = savedGuild
     RT.bagCounts = savedBags
     RT.bagStacks = savedStacks
+    RT.depositIntent = nil
+    RT.depositWork = nil
+
+    -- Withdrawals blocked by a deposit rearm instead of going idle.
+    local rearmP = profile("withdraw-rearm", admin)
+    assertTrue(select(1, C.SetGuild(rearmP, admin, { guid = "club-rearm", name = "Spectrum", realm = "Realm" }, 1, { asAdmin = true })))
+    local savedRearmTimer = C_Timer
+    local rearmCount = 0
+    C_Timer = {
+        NewTimer = function(_, fn)
+            rearmCount = rearmCount + 1
+            return { Cancel = function() end }
+        end,
+    }
+    RT.withdrawIntents = {
+        { itemId = aqirite, tab = 1, profileId = rearmP._profileId, intended = 1, startedAt = 0 },
+    }
+    RT.withdrawIntent = RT.withdrawIntents[1]
+    RT.depositIntent = { profileId = rearmP._profileId, itemId = aqirite }
+    local beforeRearm = rearmCount
+    RT:FinishWithdraw(true)
+    assertTrue(rearmCount > beforeRearm, "a deposit-blocked withdrawal rearms its timer")
+    assertEq(#RT.withdrawIntents, 1, "a deposit-blocked withdrawal keeps its queued intent")
+    RT.depositIntent = nil
+    RT.withdrawIntents = nil
+    RT.withdrawIntent = nil
+    C_Timer = savedRearmTimer
 
     -- Unproven catch-up coordinators cannot inject stamped relays.
     local savedState = Sync.state
@@ -5237,11 +5281,191 @@ function checkSecureAndFingerprintRound()
     })
     assertEq(#(relayP._consumableEvents or {}), beforeCount, "an unproven coordinator relay is not admitted")
     assertFalse(Sync:_ConsumablesCoordinatorAccepts(), "an unproven coordinator is not asked to stamp consumables")
+
+    -- Revoked coordinators are also rejected even when catch-up is clear.
+    local revokedP = profile("revoked-relay", admin)
+    local savedRevoked = Sync._RouteWasRevoked
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = "RevokedCoord-Realm",
+        sessionId = "revoked-session",
+        profileId = revokedP._profileId,
+        peers = { ["RevokedCoord-Realm"] = { consumablesCapable = true } },
+        revokedRoutes = {},
+    }
+    Sync._UnprovenCatchUpKeepalive = function() return false end
+    Sync._RouteWasRevoked = function(_, name) return name == "RevokedCoord-Realm" end
+    Sync.FindLocalProfileById = function() return revokedP end
+    local beforeRevoked = #(revokedP._consumableEvents or {})
+    Sync:HandleConsumablesEvent("RevokedCoord-Realm", {
+        sessionId = "revoked-session",
+        profileId = revokedP._profileId,
+        event = {
+            id = "ce:revoked:" .. admin .. ":1",
+            type = C.EVENT.CUSTODY,
+            action = C.ACTION.RESOLVE,
+            actor = admin,
+            writer = admin,
+            holder = admin,
+            itemId = aqirite,
+            quantity = 1,
+            generation = 1,
+            timestamp = 1,
+            order = 3,
+        },
+    })
+    assertEq(#(revokedP._consumableEvents or {}), beforeRevoked, "a revoked coordinator relay is not admitted")
+    Sync._RouteWasRevoked = savedRevoked
     Sync.IsRequesterInGroup = savedGroup
     Sync._SamePlayer = savedSame
     Sync._UnprovenCatchUpKeepalive = savedUnproven
     Sync.FindLocalProfileById = nil
     Sync.state = savedState
+
+    -- Fingerprint catch-up throttle starts only after a successful request.
+    local fpP = profile("fp-throttle", admin)
+    local savedFpState = Sync.state
+    local savedRequest = Sync.RequestProfileSnapshot
+    local savedNow = Sync._Now
+    local savedFpFind = Sync.FindLocalProfileById
+    local savedFpGroup = Sync.IsRequesterInGroup
+    local requestCalls = 0
+    Sync.state = {
+        active = true,
+        isCoordinator = false,
+        coordinator = admin,
+        sessionId = "fp-session",
+        profileId = fpP._profileId,
+        peers = { [admin] = { consumablesCapable = true } },
+    }
+    Sync._Now = function() return 1000 end
+    Sync.IsRequesterInGroup = function() return true end
+    Sync.RequestProfileSnapshot = function()
+        requestCalls = requestCalls + 1
+        return false
+    end
+    Sync.FindLocalProfileById = function() return fpP end
+    Sync._consumablesCatchUpKey = nil
+    Sync._consumablesFpSnapshotAt = nil
+    Sync._consumablesFpSnapshotSession = nil
+    local localDesc = C.Descriptor(fpP)
+    local fpPayload = {
+        sessionId = "fp-session",
+        profileId = fpP._profileId,
+        coordinator = admin,
+        consumablesGeneration = localDesc.generation,
+        consumablesConfigSeq = localDesc.configSeq,
+        consumablesConfigFingerprint = localDesc.configFingerprint,
+        consumablesEventCount = localDesc.eventCount,
+        consumablesEventFingerprint = (tonumber(localDesc.eventFingerprint) or 0) + 99,
+        consumablesArchiveCount = localDesc.archiveCount,
+        consumablesArchiveFingerprint = localDesc.archiveFingerprint,
+        consumablesCapable = true,
+    }
+    assertEq(S.CatchUpKind(localDesc, {
+        generation = fpPayload.consumablesGeneration,
+        configSeq = fpPayload.consumablesConfigSeq,
+        eventCount = fpPayload.consumablesEventCount,
+        eventFingerprint = fpPayload.consumablesEventFingerprint,
+    }), "fingerprint", "the fp fixture is fingerprint-only")
+    Sync:_ConsiderConsumablesCatchUp(fpPayload)
+    assertEq(requestCalls, 1, "a fingerprint mismatch attempts a snapshot request")
+    assertTrue(Sync._consumablesFpSnapshotAt == nil, "a failed fingerprint request does not start the throttle")
+    Sync.RequestProfileSnapshot = function()
+        requestCalls = requestCalls + 1
+        return true
+    end
+    Sync:_ConsiderConsumablesCatchUp(fpPayload)
+    assertEq(requestCalls, 2, "a later heartbeat retries after a failed fingerprint request")
+    assertEq(Sync._consumablesFpSnapshotAt, 1000, "a successful fingerprint request starts the throttle")
+    Sync.RequestProfileSnapshot = savedRequest
+    Sync._Now = savedNow
+    Sync.FindLocalProfileById = savedFpFind
+    Sync.IsRequesterInGroup = savedFpGroup
+    Sync.state = savedFpState
+    Sync._consumablesFpSnapshotAt = nil
+    Sync._consumablesFpSnapshotSession = nil
+    Sync._consumablesCatchUpKey = nil
+
+    -- Offline trade freezes stay queued for a later session flush.
+    local offlineFreezeP = profile("offline-freeze", admin)
+    assertTrue(select(1, C.AddCrafter(offlineFreezeP, admin, admin, { asAdmin = true })))
+    assertTrue(select(1, C.AddAssignment(offlineFreezeP, admin, aqirite, admin, { asAdmin = true })))
+    local offlineEpoch = offlineFreezeP._consumables.assignments[tostring(aqirite)].epoch
+    local savedOfflineState = Sync.state
+    Sync.state = { active = false }
+    local offlineOk = Sync:PublishTradeFreeze(offlineFreezeP, {
+        token = "trade-" .. admin .. "-offline-1",
+        donor = "Donor-Realm",
+        receiver = admin,
+        generation = offlineFreezeP._consumables.generation,
+        items = {
+            [aqirite] = { itemId = aqirite, epoch = offlineEpoch, assignedToReceiver = true },
+        },
+    })
+    assertTrue(offlineOk == true, "an offline trade freeze registers locally")
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "offline-flush",
+        profileId = offlineFreezeP._profileId,
+        coordEpoch = 1,
+    }
+    local savedBroadcast = Sync.BroadcastTradeFreeze
+    local flushed = false
+    Sync.BroadcastTradeFreeze = function(_, profile, grant)
+        flushed = type(grant) == "table" and grant.token == "trade-" .. admin .. "-offline-1"
+        return true
+    end
+    Sync:_FlushPendingTradeFreeze(offlineFreezeP)
+    assertTrue(flushed, "an offline trade freeze is flushed when a session starts")
+    Sync.BroadcastTradeFreeze = savedBroadcast
+    Sync.state = savedOfflineState
+
+    -- Descriptor attachment flushes before copying ledger watermarks.
+    local descP = profile("desc-flush", admin)
+    assertTrue(select(1, C.AppendEvent(descP, {
+        id = "ce:desc-flush:" .. admin .. ":1",
+        type = C.EVENT.DONATION, actor = admin, writer = admin, itemId = aqirite,
+        quantity = 1, generation = 1, timestamp = 1,
+    }, { silent = true })), "descriptor flush fixture stores an event")
+    descP._consumablesUnsent = { "ce:desc-flush:" .. admin .. ":1" }
+    local savedDescState = Sync.state
+    local savedBroadcastEvent = Sync.BroadcastConsumablesEvent
+    local savedDescFind = Sync.FindLocalProfileById
+    local ops = {}
+    Sync.state = {
+        active = true,
+        isCoordinator = true,
+        coordinator = admin,
+        sessionId = "desc-session",
+        profileId = descP._profileId,
+        _sessionAnnounced = "desc-session",
+    }
+    Sync.FindLocalProfileById = function() return descP end
+    Sync.BroadcastConsumablesEvent = function(_, profile, event)
+        ops[#ops + 1] = "flush-broadcast"
+        if C.StampOrder then
+            C.StampOrder(profile, event)
+        end
+        return true
+    end
+    local realDescriptor = C.Descriptor
+    C.Descriptor = function(profile)
+        ops[#ops + 1] = "descriptor"
+        return realDescriptor(profile)
+    end
+    local payload = {}
+    Sync:_AttachConsumablesDescriptor(payload, descP._profileId)
+    C.Descriptor = realDescriptor
+    assertEq(ops[1], "flush-broadcast", "descriptor attach flushes queued events first")
+    assertEq(ops[2], "descriptor", "descriptor is computed after the flush")
+    assertEq(payload.consumablesEventFingerprint, realDescriptor(descP).eventFingerprint, "advertised fingerprint matches the post-flush ledger")
+    Sync.BroadcastConsumablesEvent = savedBroadcastEvent
+    Sync.FindLocalProfileById = savedDescFind
+    Sync.state = savedDescState
 end
 checkSecureAndFingerprintRound()
 

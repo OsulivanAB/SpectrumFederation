@@ -268,6 +268,9 @@ function Runtime:ProfileOperationPending(profileId)
     if type(self.depositIntent) == "table" and self.depositIntent.profileId == profileId then
         return true
     end
+    if type(self.depositWork) == "table" and self.depositWork.profileId == profileId then
+        return true
+    end
     if type(self.pendingTrade) == "table" and self.pendingTrade.profileId == profileId then
         return true
     end
@@ -1329,6 +1332,134 @@ function Runtime:OnTradeClosed()
     self:CompleteDeferredProfileDeletes()
 end
 
+function Runtime:CancelDepositWork()
+    self.depositContinueGen = (self.depositContinueGen or 0) + 1
+    self.depositWork = nil
+    self.placingDeposit = false
+end
+
+function Runtime:ScheduleDepositContinue()
+    self.depositContinueGen = (self.depositContinueGen or 0) + 1
+    local gen = self.depositContinueGen
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, function()
+            if self.depositContinueGen ~= gen then return end
+            self:PlaceNextDeposit()
+        end)
+        return
+    end
+    self:PlaceNextDeposit()
+end
+
+function Runtime:FinalizeDepositWork()
+    local work = self.depositWork
+    self.depositWork = nil
+    self.placingDeposit = false
+    if type(work) ~= "table" or (tonumber(work.placed) or 0) <= 0 then
+        Warn("Could not deposit into the configured guild bank tab.")
+        return
+    end
+    local C = SF.Consumables
+    local profile = work.profile
+    local line = work.line
+    local selfId = self:SelfId()
+    local custody = C and C.CustodyFor and C.CustodyFor(profile, selfId, line.itemId)
+    self.depositIntent = {
+        itemId = line.itemId,
+        tab = work.tab,
+        guildGuid = work.guildGuid,
+        generation = work.generation,
+        requested = work.requested == true,
+        donorAssigned = work.donorAssigned == true,
+        custodyQty = custody and custody.quantity or 0,
+        intended = work.intended - (tonumber(work.remaining) or 0),
+        beforeTab = work.beforeTab,
+        beforeBags = work.beforeBags,
+        places = work.places,
+        bestActual = 0,
+        token = self:NextToken("deposit"),
+        profileId = work.profileId,
+    }
+    if self.depositTimer and self.depositTimer.Cancel then
+        self.depositTimer:Cancel()
+    end
+    if C_Timer and C_Timer.NewTimer then
+        self.depositTimer = C_Timer.NewTimer(1.5, function()
+            self.depositTimer = nil
+            self:FinishDeposit(true)
+        end)
+    end
+end
+
+function Runtime:PlaceNextDeposit()
+    local work = self.depositWork
+    if type(work) ~= "table" then return end
+    local container = C_Container
+    if not container or not PickupGuildBankItem then
+        self:FinalizeDepositWork()
+        return
+    end
+    local remaining = tonumber(work.remaining) or 0
+    local placed = tonumber(work.placed) or 0
+    local stacks = work.stacks
+    local targets = work.targets
+    if remaining <= 0 or placed >= MAX_DEPOSIT_PLACES or type(stacks) ~= "table" or type(targets) ~= "table" then
+        self:FinalizeDepositWork()
+        return
+    end
+    local stackIndex = tonumber(work.stackIndex) or 1
+    local stackLeft = tonumber(work.stackLeft)
+    while stackIndex <= #stacks do
+        local stack = stacks[stackIndex]
+        if stackLeft == nil then
+            stackLeft = tonumber(stack and stack.count) or 0
+        end
+        if stackLeft > 0 and remaining > 0 and placed < MAX_DEPOSIT_PLACES then
+            local take = math.min(remaining, stackLeft)
+            local target = targets[placed + 1]
+            if not target or take <= 0 then
+                break
+            end
+            if type(target.room) == "number" and take > target.room then
+                take = target.room
+            end
+            if take <= 0 then
+                break
+            end
+            -- One place per frame: Retail can lock the source slot until the
+            -- server confirms. Residual targets continue on the next tick.
+            if take < stackLeft and container.SplitContainerItem then
+                container.SplitContainerItem(stack.bag, stack.slot, take)
+            elseif container.PickupContainerItem then
+                container.PickupContainerItem(stack.bag, stack.slot)
+            end
+            work.places[#work.places + 1] = {
+                slot = target.slot,
+                before = self:SlotItemCount(work.tab, target.slot, work.line.itemId),
+            }
+            PickupGuildBankItem(work.tab, target.slot)
+            remaining = remaining - take
+            stackLeft = stackLeft - take
+            placed = placed + 1
+            work.remaining = remaining
+            work.placed = placed
+            work.stackIndex = stackIndex
+            work.stackLeft = stackLeft
+            if remaining > 0 and placed < MAX_DEPOSIT_PLACES and (stackLeft > 0 or stackIndex < #stacks) then
+                self:ScheduleDepositContinue()
+                return
+            end
+            self:FinalizeDepositWork()
+            return
+        end
+        stackIndex = stackIndex + 1
+        stackLeft = nil
+        work.stackIndex = stackIndex
+        work.stackLeft = nil
+    end
+    self:FinalizeDepositWork()
+end
+
 function Runtime:BeginDeposit(line, collected)
     local C = SF.Consumables
     local profile = collected.profile
@@ -1354,73 +1485,39 @@ function Runtime:BeginDeposit(line, collected)
         Warn("The configured guild bank tab is not available.")
         return
     end
-    local beforeTab = (self:TabItemCounts(tab)[line.itemId]) or 0
-    local beforeBags = have
-    local remaining = line.quantity
-    local placed = 0
-    local places = {}
-    local stacks = (self.bagStacks and self.bagStacks[line.itemId]) or {}
-    local targets = self:DepositTargets(tab, line.itemId, MAX_DEPOSIT_PLACES)
-    self.placingDeposit = true
-    for i = 1, #stacks do
-        if remaining <= 0 or placed >= MAX_DEPOSIT_PLACES then break end
-        local stack = stacks[i]
-        local stackLeft = tonumber(stack.count) or 0
-        while stackLeft > 0 and remaining > 0 and placed < MAX_DEPOSIT_PLACES do
-            local take = math.min(remaining, stackLeft)
-            local target = targets[placed + 1]
-            if not target or take <= 0 then break end
-            if type(target.room) == "number" and take > target.room then
-                take = target.room
-            end
-            if take <= 0 then break end
-            if take < stackLeft and container.SplitContainerItem then
-                container.SplitContainerItem(stack.bag, stack.slot, take)
-            elseif container.PickupContainerItem then
-                container.PickupContainerItem(stack.bag, stack.slot)
-            end
-            places[#places + 1] = {
-                slot = target.slot,
-                before = self:SlotItemCount(tab, target.slot, line.itemId),
-            }
-            PickupGuildBankItem(tab, target.slot)
-            remaining = remaining - take
-            stackLeft = stackLeft - take
-            placed = placed + 1
-        end
-    end
-    self.placingDeposit = false
-    if placed <= 0 then
-        Warn("Could not deposit into the configured guild bank tab.")
+    if self.depositIntent or self.depositWork then
+        Warn("A deposit is already in progress.")
         return
     end
+    local beforeTab = (self:TabItemCounts(tab)[line.itemId]) or 0
+    local beforeBags = have
+    local stacks = (self.bagStacks and self.bagStacks[line.itemId]) or {}
+    local targets = self:DepositTargets(tab, line.itemId, MAX_DEPOSIT_PLACES)
+    local profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId
     local selfId = self:SelfId()
-    local custody = C.CustodyFor(profile, selfId, line.itemId)
-    self.depositIntent = {
-        itemId = line.itemId,
+    self:CancelDepositWork()
+    self.placingDeposit = true
+    self.depositWork = {
+        line = line,
+        profile = profile,
+        profileId = profileId,
         tab = tab,
         guildGuid = cfg.guild and cfg.guild.guid or nil,
         generation = cfg.generation,
         requested = C.IsRequested(profile, line.itemId) == true,
         donorAssigned = C.CrafterHasItem(profile, selfId, line.itemId) == true,
-        custodyQty = custody and custody.quantity or 0,
-        intended = line.quantity - remaining,
+        intended = line.quantity,
+        remaining = line.quantity,
         beforeTab = beforeTab,
         beforeBags = beforeBags,
-        places = places,
-        bestActual = 0,
-        token = self:NextToken("deposit"),
-        profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId,
+        places = {},
+        placed = 0,
+        stacks = stacks,
+        stackIndex = 1,
+        stackLeft = nil,
+        targets = targets,
     }
-    if self.depositTimer and self.depositTimer.Cancel then
-        self.depositTimer:Cancel()
-    end
-    if C_Timer and C_Timer.NewTimer then
-        self.depositTimer = C_Timer.NewTimer(1.5, function()
-            self.depositTimer = nil
-            self:FinishDeposit(true)
-        end)
-    end
+    self:PlaceNextDeposit()
 end
 
 function Runtime:FinishDeposit(fromTimer)
@@ -1429,6 +1526,15 @@ function Runtime:FinishDeposit(fromTimer)
     local profile = self:ProfileById(intent.profileId)
     local C = SF.Consumables
     local Workflow = SF.ConsumablesWorkflow
+    local function rearmWithdraw()
+        local queue = self.withdrawIntents
+        if type(queue) ~= "table" and type(self.withdrawIntent) == "table" then
+            queue = { self.withdrawIntent }
+        end
+        if type(queue) == "table" and #queue > 0 then
+            self:ArmWithdrawTimer()
+        end
+    end
     if not profile or not C or not Workflow then
         self.depositIntent = nil
         if self.depositTimer and self.depositTimer.Cancel then
@@ -1437,6 +1543,7 @@ function Runtime:FinishDeposit(fromTimer)
         end
         Debug("Warn", "Skipped deposit commit because profile %s is gone", tostring(intent.profileId))
         self:CompleteDeferredProfileDeletes()
+        rearmWithdraw()
         return
     end
     self:ScanBags()
@@ -1471,6 +1578,7 @@ function Runtime:FinishDeposit(fromTimer)
         end
         Warn("That deposit was not in the configured guild bank tab.")
         self:CompleteDeferredProfileDeletes()
+        rearmWithdraw()
         return
     end
     if actual > (intent.bestActual or 0) then
@@ -1487,6 +1595,7 @@ function Runtime:FinishDeposit(fromTimer)
     end
     if action == "drop" then
         self:CompleteDeferredProfileDeletes()
+        rearmWithdraw()
         return
     end
     actual = intent.bestActual or actual
@@ -1505,6 +1614,7 @@ function Runtime:FinishDeposit(fromTimer)
     end
     self:CaptureBaseline(false)
     self:CompleteDeferredProfileDeletes()
+    rearmWithdraw()
 end
 
 function Runtime:CaptureBaseline(silent)
@@ -1751,7 +1861,12 @@ function Runtime:FinishWithdraw(fromTimer)
         end
         self.withdrawIntents = queue
     end
-    if #queue == 0 or self.depositIntent then return end
+    if #queue == 0 then return end
+    if self.depositIntent or self.depositWork then
+        -- Timer already cleared itself. Rearm so withdrawals resume after deposit.
+        self:ArmWithdrawTimer()
+        return
+    end
     local C = SF.Consumables
     local Workflow = SF.ConsumablesWorkflow
     local function clearTimer()
@@ -1868,6 +1983,9 @@ function Runtime:OnBankClosed()
     self.bankBaseline = nil
     self.bankBaselineBags = nil
     self.autoReviewedThisOpen = false
+    if self.depositWork then
+        self:CancelDepositWork()
+    end
     if (type(self.withdrawIntents) == "table" and self.withdrawIntents[1]) or self.withdrawIntent then
         self:FinishWithdraw(true)
     end
@@ -1935,7 +2053,9 @@ function Runtime:OnEvent(event, arg1, arg2)
         return
     end
     if event == "BAG_UPDATE_DELAYED" or event == "GROUP_ROSTER_UPDATE" then
-        if event == "BAG_UPDATE_DELAYED" and self.depositIntent then
+        if event == "BAG_UPDATE_DELAYED" and self.depositWork then
+            -- Multi-place deposit still moving source stacks.
+        elseif event == "BAG_UPDATE_DELAYED" and self.depositIntent then
             self:FinishDeposit(false)
         elseif event == "BAG_UPDATE_DELAYED" and self.withdrawIntent then
             self:FinishWithdraw(false)
@@ -1984,7 +2104,9 @@ function Runtime:OnEvent(event, arg1, arg2)
             self:OnBankClosed()
         end
     elseif event == "GUILDBANKBAGSLOTS_CHANGED" then
-        if self.depositIntent then
+        if self.depositWork then
+            -- Multi-place deposit still moving source stacks.
+        elseif self.depositIntent then
             self:FinishDeposit(false)
         elseif self.withdrawIntent then
             self:FinishWithdraw(false)

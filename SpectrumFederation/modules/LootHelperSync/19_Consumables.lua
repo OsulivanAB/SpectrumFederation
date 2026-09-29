@@ -303,6 +303,11 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     payload.consumablesCapablePeers = self:_ConsumablesCapablePeers()
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
     if not profile then return end
+    -- Flush before Descriptor so heartbeats advertise the stamped ledger fingerprint,
+    -- not a stale pre-flush watermark that forces follower snapshot storms.
+    if not (self.state and self.state.isCoordinator and self.state._sessionAnnounced ~= self.state.sessionId) then
+        self:_FlushUnsentConsumablesEvents(profile)
+    end
     local desc = C.Descriptor(profile)
     payload.consumablesGeneration = desc.generation
     payload.consumablesConfigSeq = desc.configSeq
@@ -311,10 +316,6 @@ function Sync:_AttachConsumablesDescriptor(payload, profileId)
     payload.consumablesEventFingerprint = desc.eventFingerprint
     payload.consumablesArchiveCount = desc.archiveCount
     payload.consumablesArchiveFingerprint = desc.archiveFingerprint
-    if self.state and self.state.isCoordinator and self.state._sessionAnnounced ~= self.state.sessionId then
-        return
-    end
-    self:_FlushUnsentConsumablesEvents(profile)
 end
 
 function Sync:_ConsiderConsumablesCatchUp(payload)
@@ -397,16 +398,16 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
         return
     end
     local fingerprintOnly = S.CatchUpKind and S.CatchUpKind(localDesc, remote) == "fingerprint"
+    local nowFp = nil
     if fingerprintOnly then
-        local now = self._Now and self:_Now() or 0
+        nowFp = self._Now and self:_Now() or 0
         if self._consumablesFpSnapshotSession ~= self.state.sessionId then
             self._consumablesFpSnapshotSession = self.state.sessionId
             self._consumablesFpSnapshotAt = nil
         end
-        if self._consumablesFpSnapshotAt and now - self._consumablesFpSnapshotAt < 120 then
+        if self._consumablesFpSnapshotAt and nowFp - self._consumablesFpSnapshotAt < 120 then
             return
         end
-        self._consumablesFpSnapshotAt = now
     end
     local key = table.concat({
         tostring(payload.sessionId),
@@ -430,6 +431,11 @@ function Sync:_ConsiderConsumablesCatchUp(payload)
     end
     if not requested then
         return
+    end
+    -- Start the fingerprint retry window only after a real request so a busy
+    -- route or in-flight profile request does not suppress later heartbeats.
+    if fingerprintOnly then
+        self._consumablesFpSnapshotAt = nowFp or (self._Now and self:_Now() or 0)
     end
     self._consumablesCatchUpKey = key
     profile._consumablesCatchUpRemote = remote
@@ -1003,6 +1009,12 @@ function Sync:HandleConsumablesEvent(sender, payload)
         Debug("Verbose", "Ignored consumables event from unproven coordinator %s", tostring(sender))
         return
     end
+    -- Explicit admin revocation clears catch-up, so the unproven guard above is
+    -- false. Still reject relays from a revoked coordinator route.
+    if fromCoordinator and self._RouteWasRevoked and self:_RouteWasRevoked(sender) then
+        Debug("Verbose", "Ignored consumables event from revoked coordinator %s", tostring(sender))
+        return
+    end
     local accept, relay = S.RemoteEventAdmission(isCoordinator, fromCoordinator, event)
     if not accept then return end
     if not relay and S.AllowRemoteOp then
@@ -1057,7 +1069,11 @@ function Sync:PublishTradeFreeze(profile, frozen)
     if not grant then return false end
     local now = C.Now and C.Now() or 0
     if not (self.state and self.state.active) then
-        return S.RegisterTradeGrant(profile, grant, now)
+        -- Keep local FrozenAssignmentOk authorization and queue the freeze so a
+        -- later session can deliver it even if the live assignment changes.
+        if not S.RegisterTradeGrant(profile, grant, now) then return false end
+        RememberTradeFreeze(profile, grant, false)
+        return true
     end
     if not SessionFor(profile) then return false end
     if self.state.isCoordinator then
@@ -1085,7 +1101,9 @@ function Sync:PublishWithdrawGrant(profile, grant)
     grant.kind = "withdraw"
     local now = C.Now and C.Now() or 0
     if not (self.state and self.state.active) then
-        return S.RegisterWithdrawGrant(profile, grant, now)
+        if not S.RegisterWithdrawGrant(profile, grant, now) then return false end
+        RememberTradeFreeze(profile, grant, false)
+        return true
     end
     if not SessionFor(profile) then return false end
     if self.state.isCoordinator then
@@ -1121,6 +1139,10 @@ function Sync:HandleConsumablesTradeFreeze(sender, payload)
     end
     if fromCoordinator and self._UnprovenCatchUpKeepalive and self:_UnprovenCatchUpKeepalive(sender) then
         Debug("Verbose", "Ignored trade freeze from unproven coordinator %s", tostring(sender))
+        return
+    end
+    if fromCoordinator and self._RouteWasRevoked and self:_RouteWasRevoked(sender) then
+        Debug("Verbose", "Ignored trade freeze from revoked coordinator %s", tostring(sender))
         return
     end
     local now = C.Now and C.Now() or 0
