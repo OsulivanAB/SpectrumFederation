@@ -10,3 +10,10 @@ alwaysApply: true
 - Prefer existing repo scripts and workflow files over inventing new commands or pipelines.
 - When prose docs disagree with workflow/script behavior, trust `.github/workflows/` and `.github/scripts/` first, then update docs if needed.
 - Use root `AGENTS.md` for repo orientation and `SpectrumFederation/AGENTS.md` for addon-specific implementation detail.
+- Review work requires a current human request for exactly one operation:
+  assess/triage, repair one batch, request one named review/checkpoint, or
+  evaluate readiness. Review/CI events, pushes, clean results, thread
+  resolution, session restarts, and old blanket continuation instructions do
+  not start or renew work. Do not subscribe, poll, wait, schedule continuation,
+  or request another reviewer automatically. After delivery, report and stop.
+  Details: `.cursor/skills/ai-review-loop/SKILL.md`.
