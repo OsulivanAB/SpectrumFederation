@@ -6,7 +6,7 @@ local Page = {
 	parentId = "lootHelper",
 	name = "Raid Consumables",
 	navLabel = "Consumables",
-	description = "Choose the guild bank, Crafters, and exact items requested for raid supplies.",
+	description = "Configure the guild bank and exact items members can donate as raid supplies.",
 	order = 23.6,
 }
 
@@ -112,54 +112,19 @@ local function ItemLabel(itemId)
 	return "item " .. tostring(itemId)
 end
 
-local function AssignmentItems()
+local function RequestedItems()
 	local model = Model()
 	local items = {}
 	if not model then return items end
-	for i = 1, #model.assignments do
-		local row = model.assignments[i]
+	for i = 1, #(model.requestedItems or {}) do
+		local row = model.requestedItems[i]
 		items[i] = {
-			text = string.format("%s → %s", ItemLabel(row.itemId), tostring(row.crafter)),
+			text = ItemLabel(row.itemId),
 			canRemove = row.canRemove,
 			itemId = row.itemId,
-			crafter = row.crafter,
 		}
 	end
 	return items
-end
-
-local function CrafterItems()
-	local model = Model()
-	return (model and model.crafters) or {}
-end
-
-local function CustodyItems()
-	local model = Model()
-	local items = {}
-	if not model then return items end
-	for i = 1, #model.custody do
-		local row = model.custody[i]
-		items[i] = {
-			text = string.format("%s · %s · %d%s", row.holder, ItemLabel(row.itemId), row.quantity, row.retired and " · retired" or ""),
-			canRemove = false,
-			holder = row.holder,
-			itemId = row.itemId,
-		}
-	end
-	return items
-end
-
-local function SelectedCrafter(panel)
-	local model = Model()
-	if model and model.selfCrafter and not model.isAdmin then
-		return model.selfCrafter
-	end
-	local name = panel and panel.__sfConsumableCrafter
-	if type(name) == "string" then
-		name = name:match("^%s*(.-)%s*$")
-	end
-	if name == "" then return nil end
-	return name
 end
 
 local function AddItem(ctx, itemId)
@@ -170,6 +135,7 @@ local function AddItem(ctx, itemId)
 		return
 	end
 	local runtime = SF.ConsumablesRuntime
+	local opts = { asAdmin = true }
 	if runtime and runtime.Transferable then
 		local ok, err = runtime:Transferable(itemId)
 		if ok == nil then
@@ -180,13 +146,26 @@ local function AddItem(ctx, itemId)
 			ctx.section:SetMessage(err or "That item is not transferable.", "error")
 			return
 		end
+		opts.transferable = true
+		opts.requireTransferable = true
 	end
-	local crafter = SelectedCrafter(ctx.panel)
-	if not crafter then
-		ctx.section:SetMessage("Choose the Crafter this item is for.", "error")
+	local profile = ActiveProfile()
+	local C = SF.Consumables
+	if not C or not profile then
+		ctx.section:SetMessage("No active profile.", "error")
 		return
 	end
-	Commit(ctx, { name = "add_assignment", itemId = itemId, crafter = crafter })
+	ctx.section:ClearMessage()
+	local sync = SF.LootHelperSync
+	local applyOpts = { asAdmin = IsEffectiveAdmin(profile), transferable = opts.transferable, requireTransferable = opts.requireTransferable }
+	local ok, err
+	local op = { name = "add_item", itemId = itemId }
+	if sync and sync.CommitConsumablesOp then
+		ok, err = sync:CommitConsumablesOp(profile, op, Actor(), applyOpts)
+	else
+		ok, err = C.ApplyOp(profile, op, Actor(), applyOpts)
+	end
+	Report(ctx, ok, err)
 end
 
 local function CursorItemId()
@@ -232,7 +211,7 @@ local function Definition(panel)
 				title = "Raid Consumables",
 				tooltip = "Exact item IDs are requested. A different quality is a different item.",
 				items = {
-					{ type = "help", indent = "label", text = "Assignments request one exact item. Re-adding an item starts a new routing epoch. Historical receipts stay in Raid Consumable Logs." },
+					{ type = "help", indent = "label", text = "Members deposit requested materials into the configured Guild Bank tab. Spectrum records only successful deposits." },
 					{ type = "display", label = "Guild", get = function() local model = Model() return model and model.guildText or "No active profile." end },
 					{
 						type = "button",
@@ -312,44 +291,11 @@ local function Definition(panel)
 					},
 					{
 						type = "editboxButton",
-						label = "Add Crafter",
-						adminOnly = true,
-						hint = "Name-Realm",
-						buttonText = "Add",
-						buttonWidth = 80,
-						onSubmit = function(ctx, text, editBox)
-							Commit(ctx, { name = "add_crafter", crafter = text })
-							if editBox then editBox:SetText("") end
-						end,
-					},
-					{
-						type = "scrollList",
-						label = "Crafters",
-						adminOnly = true,
-						height = 120,
-						getItems = CrafterItems,
-						onRemove = function(ctx, item)
-							Commit(ctx, { name = "remove_crafter", crafter = item.crafter or item.text })
-						end,
-					},
-					{
-						type = "editbox",
-						label = "Crafter",
-						adminOnly = true,
-						hint = "Name-Realm",
-						get = function() return panel.__sfConsumableCrafter or "" end,
-						set = function(value) panel.__sfConsumableCrafter = value end,
-					},
-					{
-						type = "editboxButton",
 						label = "Add Item",
+						adminOnly = true,
 						hint = "Item ID or link",
 						buttonText = "Add",
 						buttonWidth = 80,
-						visible = function()
-							local model = Model()
-							return model and (model.isAdmin or model.isCrafter)
-						end,
 						onSubmit = function(ctx, text, editBox)
 							AddItem(ctx, text)
 							if editBox then editBox:SetText("") end
@@ -358,12 +304,9 @@ local function Definition(panel)
 					{
 						type = "button",
 						label = "Cursor Item",
+						adminOnly = true,
 						buttonText = "Add Item on Cursor",
 						width = 180,
-						visible = function()
-							local model = Model()
-							return model and (model.isAdmin or model.isCrafter)
-						end,
 						onClick = function(ctx)
 							local itemId = CursorItemId()
 							if not itemId then
@@ -376,114 +319,17 @@ local function Definition(panel)
 					},
 					{
 						type = "scrollList",
-						label = "Assignments",
+						label = "Requested Items",
+						adminOnly = false,
 						height = 180,
-						visible = function()
-							local model = Model()
-							return model and (model.isAdmin or model.isCrafter)
-						end,
-						getItems = AssignmentItems,
+						getItems = RequestedItems,
 						onRemove = function(ctx, item)
-							Commit(ctx, { name = "remove_assignment", itemId = item.itemId, crafter = item.crafter })
-						end,
-					},
-					{
-						type = "help",
-						adminOnly = true,
-						indent = "label",
-						text = "Resolve removes one whole custody entry. It does not create a contribution or a Crafter receipt.",
-					},
-					{
-						type = "scrollList",
-						label = "Custody",
-						adminOnly = true,
-						height = 140,
-						getItems = CustodyItems,
-					},
-					{
-						type = "dropdown",
-						label = "Custody Entry",
-						adminOnly = true,
-						defaultText = "Select custody",
-						options = function()
-							local options = {}
-							for _, item in ipairs(CustodyItems()) do
-								options[#options + 1] = {
-									value = tostring(item.holder) .. "|" .. tostring(item.itemId),
-									label = item.text,
-								}
-							end
-							return options
-						end,
-						get = function()
-							local activeId = ProfileKey(ActiveProfile())
-							if panel.__sfCustodyProfileId and panel.__sfCustodyProfileId ~= activeId then
-								panel.__sfCustodyEntry = nil
-								panel.__sfCustodyProfileId = nil
-								panel.__sfCustodyReason = nil
-								return nil
-							end
-							return panel.__sfCustodyEntry
-						end,
-						set = function(value)
-							panel.__sfCustodyEntry = value
-							panel.__sfCustodyProfileId = ProfileKey(ActiveProfile())
-						end,
-					},
-					{
-						type = "dropdown",
-						label = "Resolve Reason",
-						adminOnly = true,
-						defaultText = "Other",
-						options = function()
-							local options = {}
-							local reasons = (SF.Consumables and SF.Consumables.RESOLVE_REASONS) or {}
-							for i = 1, #reasons do
-								options[i] = { value = reasons[i], label = reasons[i] }
-							end
-							return options
-						end,
-						get = function() return panel.__sfCustodyReason or "Other" end,
-						set = function(value) panel.__sfCustodyReason = value end,
-					},
-					{
-						type = "button",
-						label = "Resolve Custody",
-						adminOnly = true,
-						buttonText = "Resolve",
-						width = 120,
-						onClick = function(ctx)
-							local originId = ProfileKey(ActiveProfile())
-							local value = panel.__sfCustodyEntry
-							local holder, itemId = nil, nil
-							if type(value) == "string" then
-								holder, itemId = value:match("^(.-)|(%d+)$")
-							end
-							if not holder or not itemId then
-								ctx.section:SetMessage("Select a custody entry.", "error")
+							local model = Model()
+							if not (model and model.canManageItems) then
+								ctx.section:SetMessage("Only a profile admin can remove requested items.", "error")
 								return
 							end
-							local profile = ActiveProfile()
-							if not profile then
-								ctx.section:SetMessage("No active profile.", "error")
-								return
-							end
-							if ProfileChanged(ctx, originId, "Resolve") then return end
-							if panel.__sfCustodyProfileId and panel.__sfCustodyProfileId ~= originId then
-								ctx.section:SetMessage("The active profile changed, so Resolve was not applied.", "error")
-								panel.__sfCustodyEntry = nil
-								panel.__sfCustodyProfileId = nil
-								return
-							end
-							local sync = SF.LootHelperSync
-							local ok, err
-							local reason = panel.__sfCustodyReason or "Other"
-							if sync and sync.PublishConsumablesResolve then
-								ok, err = sync:PublishConsumablesResolve(profile, Actor(), holder, tonumber(itemId), reason, { asAdmin = IsEffectiveAdmin(profile) })
-							elseif SF.Consumables then
-								ok, err = SF.Consumables.ResolveCustody(profile, Actor(), holder, tonumber(itemId), reason, { asAdmin = IsEffectiveAdmin(profile) })
-							end
-							Report(ctx, ok, err)
+							Commit(ctx, { name = "remove_item", itemId = item.itemId })
 						end,
 					},
 					{
@@ -492,7 +338,7 @@ local function Definition(panel)
 						adminOnly = true,
 						buttonText = "Copy to New Profile",
 						width = 180,
-						tooltip = "Creates a new profile with this guild, tab, Crafters, and current assignments. Receipts, custody, and logs are not copied.",
+						tooltip = "Creates a new profile with this guild, tab, and requested items. Contribution history and logs are not copied.",
 						onClick = function(ctx)
 							local dialogs = SF.SettingsUI and SF.SettingsUI.Dialogs
 							if not (dialogs and dialogs.Prompt and SF.DuplicateLootHelperProfile) then
@@ -515,6 +361,7 @@ local function Definition(panel)
 		},
 	}
 end
+
 
 function Page:Build(panel)
 	local renderer = SF.SettingsUI and SF.SettingsUI.DefinitionRenderer

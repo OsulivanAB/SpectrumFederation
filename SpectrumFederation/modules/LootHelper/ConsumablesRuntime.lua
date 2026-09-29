@@ -1,14 +1,11 @@
--- Event-driven Raid Consumables reminder, review, trade, and guild bank actions.
+-- Event-driven Raid Consumables reminder, review, and guild bank deposit actions.
 -- Accounting stays in the domain. This file only observes WoW and asks the domain to record it.
 local _, SF = ...
 
 SF.ConsumablesRuntime = SF.ConsumablesRuntime or {}
 local Runtime = SF.ConsumablesRuntime
 
-local MAX_TRADE_SLOTS = 6
 local MAX_DEPOSIT_PLACES = 6
-local MAX_WITHDRAW_INTENTS = 8
-local MAX_WITHDRAW_SLOTS = 8
 local MAX_GUILD_BANK_SLOTS = 98
 local REMINDER_TEXT = "Raid supplies available"
 
@@ -25,13 +22,6 @@ local function Warn(text)
     if SF.PrintWarning then
         SF:PrintWarning(text)
     end
-end
-
-local function SameUnit(a, b)
-    if SF.NameUtil and SF.NameUtil.SamePlayer then
-        return SF.NameUtil.SamePlayer(a, b) and true or false
-    end
-    return a ~= nil and a == b
 end
 
 local function Info(text)
@@ -114,15 +104,6 @@ function Runtime:SelfId()
         return SF.NameUtil.GetSelfId()
     end
     return nil
-end
-
-function Runtime:UnitId(unit)
-    if not unit or not UnitExists or not UnitExists(unit) then return nil end
-    local name, realm = UnitFullName(unit)
-    if SF.NameUtil and SF.NameUtil.NormalizeNameRealm then
-        return SF.NameUtil.NormalizeNameRealm(name, realm)
-    end
-    return name
 end
 
 function Runtime:RemindersEnabled()
@@ -253,16 +234,6 @@ function Runtime:ScanBags()
     end
 end
 
-function Runtime:GroupUnit(name)
-    local map = self.groupMap
-    if type(map) ~= "table" or type(name) ~= "string" then return nil end
-    if map[name] then return map[name] end
-    for key, unit in pairs(map) do
-        if SameUnit(key, name) then return unit end
-    end
-    return nil
-end
-
 function Runtime:ProfileOperationPending(profileId)
     if type(profileId) ~= "string" or profileId == "" then return false end
     if type(self.depositIntent) == "table" and self.depositIntent.profileId == profileId then
@@ -270,25 +241,6 @@ function Runtime:ProfileOperationPending(profileId)
     end
     if type(self.depositWork) == "table" and self.depositWork.profileId == profileId then
         return true
-    end
-    if type(self.pendingTrade) == "table" and self.pendingTrade.profileId == profileId then
-        return true
-    end
-    local frozen = type(self.openTrade) == "table" and self.openTrade.frozen or nil
-    if type(frozen) == "table" and frozen.profileId == profileId then
-        return true
-    end
-    local queue = self.withdrawIntents
-    if type(queue) ~= "table" and type(self.withdrawIntent) == "table" then
-        queue = { self.withdrawIntent }
-    end
-    if type(queue) == "table" then
-        for i = 1, #queue do
-            local intent = queue[i]
-            if type(intent) == "table" and intent.profileId == profileId then
-                return true
-            end
-        end
     end
     return false
 end
@@ -319,54 +271,6 @@ function Runtime:CompleteDeferredProfileDeletes()
         end
         SF:DeleteLootHelperProfile(id)
     end
-end
-
-function Runtime:GroupMap()
-    local map = {}
-    local function add(unit)
-        local id = self:UnitId(unit)
-        if id then map[id] = unit end
-    end
-    if IsInRaid and IsInRaid() then
-        local n = GetNumGroupMembers and GetNumGroupMembers() or 0
-        for i = 1, n do
-            add("raid" .. i)
-        end
-    elseif IsInGroup and IsInGroup() then
-        add("player")
-        local n = GetNumSubgroupMembers and GetNumSubgroupMembers() or 0
-        for i = 1, n do
-            add("party" .. i)
-        end
-    end
-    return map
-end
-
-function Runtime:IsCompatible(name)
-    local selfId = self:SelfId()
-    local isSelf = name ~= nil and (name == selfId or (SF.NameUtil and SF.NameUtil.SamePlayer and SF.NameUtil.SamePlayer(name, selfId)))
-    if isSelf then return true end
-    local sync = SF.LootHelperSync
-    if not sync or not sync.GetPeer then return false end
-    local peer = sync:GetPeer(name)
-    local Routing = SF.ConsumablesRouting
-    if Routing and Routing.PeerCompatible then
-        return Routing.PeerCompatible(peer, false)
-    end
-    return type(peer) == "table" and peer.consumablesCapable == true
-end
-
-function Runtime:IsInRange(unit)
-    if not unit or InCombat() then return false end
-    if not CheckInteractDistance then return true end
-    return CheckInteractDistance(unit, 2) and true or false
-end
-
-function Runtime:RecipientInRange(name)
-    if type(self.groupMap) ~= "table" then
-        self.groupMap = self:GroupMap()
-    end
-    return self:IsInRange(self:GroupUnit(name))
 end
 
 local MOBILE_BANKING_SPELL_ID = 83958
@@ -575,7 +479,7 @@ function Runtime:BankAccess(profile)
         local carriedCount = 0
         local ids = C.RequestedItemIds(profile)
         for i = 1, #ids do
-            if carriedCount >= C.MAX_ASSIGNMENT_PAIRS then break end
+            if carriedCount >= C.MAX_REQUESTED_ITEMS then break end
             local itemId = ids[i]
             if (tonumber(self.bagCounts[itemId]) or 0) > 0 then
                 carried[itemId] = true
@@ -621,14 +525,6 @@ function Runtime:Collect()
     local profile = self:AccountingProfile()
     if not C or not Routing or not profile then return nil end
     self:ScanBags()
-    local group = self:GroupMap()
-    self.groupMap = group
-    local inGroup, compatible, inRange = {}, {}, {}
-    for name, unit in pairs(group) do
-        inGroup[name] = true
-        compatible[name] = self:IsCompatible(name)
-        inRange[name] = self:IsInRange(unit)
-    end
     local access = self:BankAccess(profile)
     local usable = Routing.GuildBankUsable(access)
     local carried = {}
@@ -654,9 +550,6 @@ function Runtime:Collect()
         end
     end
     local plan = C.BuildDonationPlan(profile, carried, {
-        inGroup = inGroup,
-        compatible = compatible,
-        inRange = inRange,
         guildBankUsable = usable,
     })
     return {
@@ -664,9 +557,6 @@ function Runtime:Collect()
         access = access,
         usable = usable,
         plan = plan,
-        inGroup = inGroup,
-        compatible = compatible,
-        inRange = inRange,
     }
 end
 
@@ -676,19 +566,16 @@ function Runtime:ReminderState()
         return false
     end
     local Routing = SF.ConsumablesRouting
-    local C = SF.Consumables
     local collected = self:Collect()
     if not collected then return false end
-    local profile = collected.profile
     local carries = false
     for i = 1, #collected.plan.lines do
         if collected.plan.lines[i].quantity > 0 then
             carries = true
         end
     end
-    local path = Routing.HasActionablePath(collected.plan.lines, collected.usable)
+    local path = Routing.HasActionablePath(collected.usable)
     local visible = Routing.ReminderVisible({
-        isCrafter = C.IsCrafter(profile, self:SelfId()),
         remindersEnabled = self:RemindersEnabled(),
         windowAllowed = self:WindowShown(),
         dismissed = self.dismissed and true or false,
@@ -711,7 +598,6 @@ function Runtime:RefreshReminder()
             self:RefreshReminder()
         end)
     end
-    self:SyncRangeTicker()
 end
 
 function Runtime:WatchWindow()
@@ -724,74 +610,7 @@ function Runtime:WatchWindow()
     end)
     frame:HookScript("OnHide", function()
         self.reminderShown = false
-        self:SyncRangeTicker()
     end)
-end
-
-function Runtime:ShouldPoll()
-    local Routing = SF.ConsumablesRouting
-    if not Routing then return false end
-    local selected = nil
-    local outOfRange = false
-    local reviewShown = self.review and self.review.IsShown and self.review:IsShown()
-    if reviewShown then
-        for i = 1, #(self.reviewButtons or {}) do
-            local button = self.reviewButtons[i]
-            if button.recipient and button.IsShown and button:IsShown() then
-                selected = button.recipient
-                if not self:RecipientInRange(button.recipient) then
-                    outOfRange = true
-                end
-            end
-        end
-    end
-    return Routing.ShouldPollRange({
-        selectedRecipient = outOfRange and selected or nil,
-        inRange = not outOfRange,
-        reminderVisible = self.reminderShown and true or false,
-        reviewVisible = self.review and self.review:IsShown() and true or false,
-    })
-end
-
-function Runtime:SyncRangeTicker()
-    local want = self:ShouldPoll()
-    if want and not self.rangeTicker and C_Timer and C_Timer.NewTicker then
-        self.rangeTicker = C_Timer.NewTicker(0.5, function()
-            self:OnRangeTick()
-        end)
-    elseif (not want) and self.rangeTicker then
-        self.rangeTicker:Cancel()
-        self.rangeTicker = nil
-    end
-end
-
-function Runtime:OnRangeTick()
-    if InCombat() then
-        if self.rangeTicker then
-            self.rangeTicker:Cancel()
-            self.rangeTicker = nil
-        end
-        self.reviewRefreshPending = true
-        return
-    end
-    self:UpdateTradeButtons()
-    if not self:ShouldPoll() then
-        self:SyncRangeTicker()
-    end
-end
-
-function Runtime:UpdateTradeButtons()
-    for i = 1, #(self.reviewButtons or {}) do
-        local button = self.reviewButtons[i]
-        if button.recipient and button.Enable and button.Disable then
-            if self:RecipientInRange(button.recipient) then
-                button:Enable()
-            else
-                button:Disable()
-            end
-        end
-    end
-    self:SyncMobileButton()
 end
 
 function Runtime:EnsureReview()
@@ -816,7 +635,6 @@ function Runtime:EnsureReview()
         self:PlaceMobileHolder()
     end)
     frame:SetScript("OnHide", function()
-        self:SyncRangeTicker()
         self:SyncMobileButton()
     end)
     if frame.SetBackdrop then
@@ -847,7 +665,6 @@ function Runtime:EnsureReview()
     frame.Child = child
     frame.Rows = {}
     self.review = frame
-    self.reviewButtons = {}
     self:EnsureMobileButton()
     return frame
 end
@@ -957,7 +774,6 @@ function Runtime:ClearRows()
     for i = 1, #frame.Rows do
         frame.Rows[i]:Hide()
     end
-    self.reviewButtons = {}
 end
 
 function Runtime:AcquireRow(index)
@@ -1004,11 +820,18 @@ function Runtime:RebuildReview()
     frame.Status:SetText(StatusText(collected.access))
     local y = 0
     local index = 0
-    local groups = collected.plan.groups or {}
+    local groups = {}
+    local planGroups = collected.plan.groups or {}
+    for g = 1, #planGroups do
+        local group = planGroups[g]
+        if type(group) == "table" and type(group.lines) == "table" and #group.lines > 0 then
+            groups[#groups + 1] = group
+        end
+    end
     local maxRows = 512
-    local pairsCap = SF.Consumables and tonumber(SF.Consumables.MAX_ASSIGNMENT_PAIRS) or nil
-    if pairsCap and pairsCap >= 1 then
-        maxRows = pairsCap * 2
+    local itemCap = SF.Consumables and tonumber(SF.Consumables.MAX_REQUESTED_ITEMS) or nil
+    if itemCap and itemCap >= 1 then
+        maxRows = itemCap * 2
     end
     local stop = false
     for g = 1, #groups do
@@ -1046,28 +869,15 @@ function Runtime:RebuildReview()
             end)
             local button = row.Button
             button:Show()
-            button.recipient = nil
-            if line.recipient then
-                button.recipient = line.recipient
-                button:SetText("Trade")
-                local Routing = SF.ConsumablesRouting
-                local action = Routing.TradeAction(line.recipient, line.inRange)
-                if action.enabled then button:Enable() else button:Disable() end
-                button:SetScript("OnClick", function()
-                    self:BeginTrade(line, collected)
-                end)
-                self.reviewButtons[#self.reviewButtons + 1] = button
+            button:SetText("Deposit")
+            if collected.access and collected.access.action == "deposit" and collected.access.enabled then
+                button:Enable()
             else
-                button:SetText("Deposit")
-                if collected.access and collected.access.action == "deposit" and collected.access.enabled then
-                    button:Enable()
-                else
-                    button:Disable()
-                end
-                button:SetScript("OnClick", function()
-                    self:BeginDeposit(line, collected)
-                end)
+                button:Disable()
             end
+            button:SetScript("OnClick", function()
+                self:BeginDeposit(line, collected)
+            end)
             y = y + 26
         end
         if stop then break end
@@ -1076,14 +886,13 @@ function Runtime:RebuildReview()
         index = 1
         local empty = self:AcquireRow(index)
         empty:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 0, 0)
-        empty.Text:SetText("No raid supplies to hand in.")
+        empty.Text:SetText("No raid supplies to deposit.")
         empty.Edit:Hide()
         empty.Button:Hide()
         y = 24
     end
     frame.Child:SetHeight(math.max(1, y))
     self:SyncMobileButton()
-    self:SyncRangeTicker()
 end
 
 function Runtime:Commit(profile, token, events)
@@ -1109,251 +918,10 @@ function Runtime:NextToken(kind)
     return string.format("%s-%s-%s-%d", kind, who, tostring(GetTime and GetTime() or self.tokenSeq), self.tokenSeq)
 end
 
-function Runtime:BeginTrade(line, collected)
-    local C = SF.Consumables
-    local have = (self.bagCounts and self.bagCounts[line.itemId]) or 0
-    if type(collected) == "table" and type(collected.inRange) == "table" and line and line.recipient then
-        collected.inRange[line.recipient] = self:RecipientInRange(line.recipient)
-    end
-    local ok, err = C.RevalidateDonation(collected.profile, line, {
-        inGroup = collected.inGroup,
-        compatible = collected.compatible,
-        inRange = collected.inRange,
-        guildBankUsable = collected.usable,
-    }, have)
-    if not ok then
-        Warn(err or "Review the donation again.")
-        self:RebuildReview()
-        return
-    end
-    if InCombat() then
-        Warn("Leave combat before trading raid supplies.")
-        return
-    end
-    local unit = self:GroupUnit(line.recipient)
-    if not unit or not InitiateTrade then
-        Warn("Could not start a trade with that Crafter.")
-        return
-    end
-    local tradeProfile = collected and collected.profile
-    local tradeProfileId = nil
-    if type(tradeProfile) == "table" then
-        tradeProfileId = tradeProfile.GetProfileId and tradeProfile:GetProfileId() or tradeProfile._profileId
-    end
-    self.pendingTrade = {
-        line = line,
-        recipient = line.recipient,
-        token = self:NextToken("trade"),
-        profileId = tradeProfileId,
-    }
-    self:ArmPendingTradeTimer()
-    InitiateTrade(unit)
-end
-
-function Runtime:CancelPendingTradeTimer()
-    if self.pendingTradeTimer and self.pendingTradeTimer.Cancel then
-        self.pendingTradeTimer:Cancel()
-    end
-    self.pendingTradeTimer = nil
-end
-
-function Runtime:ClearPendingTrade()
-    self:CancelPendingTradeTimer()
-    self.pendingTrade = nil
-    self:CompleteDeferredProfileDeletes()
-end
-
-function Runtime:ArmPendingTradeTimer()
-    self:CancelPendingTradeTimer()
-    if not (C_Timer and C_Timer.NewTimer) then return end
-    self.pendingTradeTimer = C_Timer.NewTimer(8, function()
-        self.pendingTradeTimer = nil
-        if self.pendingTrade and not self.openTrade then
-            self.pendingTrade = nil
-            self:CompleteDeferredProfileDeletes()
-        end
-    end)
-end
-
-function Runtime:PlacePendingTrade()
-    local pending = self.pendingTrade
-    local container = C_Container
-    local Workflow = SF.ConsumablesWorkflow
-    if not pending or not container or not Workflow then return end
-    if InCombat() then
-        Warn("Leave combat before trading raid supplies.")
-        return
-    end
-    self:ScanBags()
-    local line = pending.line
-    local have = (self.bagCounts and self.bagCounts[line.itemId]) or 0
-    if have < math.floor(tonumber(line.quantity) or 0) then
-        Warn("You no longer have that many.")
-        return
-    end
-    local stacks = {}
-    local rows = (self.bagStacks and self.bagStacks[line.itemId]) or {}
-    for i = 1, #rows do
-        stacks[i] = rows[i]
-    end
-    local plan = Workflow.PlanTradeSlots({
-        { itemId = line.itemId, quantity = line.quantity, stacks = stacks },
-    }, MAX_TRADE_SLOTS)
-    pending.remainder = plan.remainder
-    for i = 1, #plan.placements do
-        local place = plan.placements[i]
-        if place.split and container.SplitContainerItem then
-            container.SplitContainerItem(place.bag, place.slot, place.quantity)
-        elseif container.PickupContainerItem then
-            container.PickupContainerItem(place.bag, place.slot)
-        end
-        if ClickTradeButton then
-            ClickTradeButton(place.tradeSlot)
-        end
-    end
-end
-
-function Runtime:CaptureTargetSlots()
-    local open = self.openTrade
-    if not open or not SF.Consumables or open.both then return end
-    local actual = {}
-    for i = 1, MAX_TRADE_SLOTS do
-        local link = GetTradeTargetItemLink and GetTradeTargetItemLink(i) or nil
-        local qty = 0
-        if GetTradeTargetItemInfo then
-            local _, _, count = GetTradeTargetItemInfo(i)
-            qty = tonumber(count) or 0
-        end
-        local itemId = SF.Consumables.ItemIdFromText(link)
-        if itemId and qty > 0 then
-            actual[itemId] = (actual[itemId] or 0) + qty
-        end
-    end
-    open.target = actual
-end
-
-function Runtime:InvalidateAcceptReset()
-    self.acceptResetToken = (tonumber(self.acceptResetToken) or 0) + 1
-    self.acceptResetQueued = false
-end
-
-function Runtime:ApplyAcceptReset(token)
-    if token ~= self.acceptResetToken then return end
-    self.acceptResetQueued = false
-    local open = self.openTrade
-    if not open or not open.both then return end
-    open.both = false
-    open.target = {}
-end
-
--- A completion reset and a real unaccept look the same in this event.
--- Keep the capture through the rest of this frame so TRADE_CLOSED can record it.
-function Runtime:ScheduleAcceptReset()
-    if self.acceptResetQueued then return end
-    local token = tonumber(self.acceptResetToken) or 0
-    if not (C_Timer and C_Timer.After) then
-        self:ApplyAcceptReset(token)
-        return
-    end
-    self.acceptResetQueued = true
-    C_Timer.After(0, function()
-        self:ApplyAcceptReset(token)
-    end)
-end
-
-function Runtime:OnTradeShow()
-    self:CancelPendingTradeTimer()
-    local profile = self:AccountingProfile()
-    local C = SF.Consumables
-    if not profile or not C then return end
-    local partner = self:UnitId("npc")
-    local selfId = self:SelfId()
-    local pending = self.pendingTrade
-    local donor, receiver, role
-    if pending and partner and SameUnit(pending.recipient, partner) then
-        donor, receiver, role = selfId, partner, "donor"
-    else
-        donor, receiver, role = partner, selfId, "receiver"
-    end
-    if not donor or not receiver then return end
-    self:InvalidateAcceptReset()
-    self.openTrade = {
-        role = role,
-        frozen = C.FreezeTrade(profile, donor, receiver, pending and { pending.line } or nil, pending and pending.token or self:NextToken("trade")),
-        both = false,
-        target = {},
-    }
-    if role == "receiver" then
-        local sync = SF.LootHelperSync
-        if sync and sync.PublishTradeFreeze then
-            sync:PublishTradeFreeze(profile, self.openTrade.frozen)
-        end
-    elseif role == "donor" then
-        self:PlacePendingTrade()
-    end
-    Debug("Info", "Trade opened donor=%s receiver=%s", tostring(donor), tostring(receiver))
-end
-
-function Runtime:OnTradeAccept(playerAccepted, targetAccepted)
-    local open = self.openTrade
-    if not open then return end
-    if tonumber(playerAccepted) == 1 and tonumber(targetAccepted) == 1 then
-        self:InvalidateAcceptReset()
-        self:CaptureTargetSlots()
-        open.both = true
-        return
-    end
-    if open.both then
-        self:ScheduleAcceptReset()
-        return
-    end
-    open.target = {}
-end
-
--- luacheck: globals ERR_TRADE_BAG_FULL ERR_TRADE_TARGET_BAG_FULL ERR_TRADE_MAX_COUNT_EXCEEDED
-function Runtime:ReleaseAcceptedTrade()
-    self:InvalidateAcceptReset()
-    local open = self.openTrade
-    if not open then return end
-    open.both = false
-    open.target = {}
-end
-
-local function TradeAcceptanceFailed(message)
-    if type(message) ~= "string" or message == "" then return false end
-    if type(ERR_TRADE_BAG_FULL) == "string" and message == ERR_TRADE_BAG_FULL then return true end
-    if type(ERR_TRADE_TARGET_BAG_FULL) == "string" and message == ERR_TRADE_TARGET_BAG_FULL then return true end
-    if type(ERR_TRADE_MAX_COUNT_EXCEEDED) == "string" and message == ERR_TRADE_MAX_COUNT_EXCEEDED then return true end
-    return false
-end
-
-function Runtime:OnTradeClosed()
-    self:InvalidateAcceptReset()
-    local open = self.openTrade
-    local pending = self.pendingTrade
-    self.openTrade = nil
-    self:CancelPendingTradeTimer()
-    self.pendingTrade = nil
-    if open and open.role == "receiver" and open.both then
-        local Workflow = SF.ConsumablesWorkflow
-        local events = Workflow and Workflow.TradeEvents(open.frozen, open.target or {}, true) or {}
-        local profile = self:ProfileById(open.frozen and open.frozen.profileId)
-        if profile and #events > 0 then
-            self:Commit(profile, open.frozen.token or self:NextToken("trade"), events)
-        elseif not profile and #events > 0 then
-            Debug("Warn", "Skipped trade commit because profile %s is gone", tostring(open.frozen and open.frozen.profileId))
-        end
-    elseif open and open.role == "donor" and pending and type(pending.remainder) == "table" and #pending.remainder > 0 then
-        Info("Some raid supplies did not fit in this trade. Trade again to hand over the rest.")
-    end
-    self:CompleteDeferredProfileDeletes()
-end
-
 function Runtime:CancelDepositWork()
     local hadWork = self.depositWork ~= nil
     self.depositContinueGen = (self.depositContinueGen or 0) + 1
     self.depositWork = nil
-    self.placingDeposit = false
     if hadWork then
         self:CompleteDeferredProfileDeletes()
     end
@@ -1377,17 +945,12 @@ end
 function Runtime:FinalizeDepositWork()
     local work = self.depositWork
     self.depositWork = nil
-    self.placingDeposit = false
     if type(work) ~= "table" or (tonumber(work.placed) or 0) <= 0 then
         Warn("Could not deposit into the configured guild bank tab.")
         self:CompleteDeferredProfileDeletes()
         return
     end
-    local C = SF.Consumables
-    local profile = work.profile
     local line = work.line
-    local selfId = self:SelfId()
-    local custody = C and C.CustodyFor and C.CustodyFor(profile, selfId, line.itemId)
     self.depositIntent = {
         itemId = line.itemId,
         tab = work.tab,
@@ -1395,8 +958,6 @@ function Runtime:FinalizeDepositWork()
         guildGuid = work.guildGuid,
         generation = work.generation,
         requested = work.requested == true,
-        donorAssigned = work.donorAssigned == true,
-        custodyQty = custody and custody.quantity or 0,
         intended = work.intended - (tonumber(work.remaining) or 0),
         beforeTab = work.beforeTab,
         beforeBags = work.beforeBags,
@@ -1508,9 +1069,6 @@ function Runtime:BeginDeposit(line, collected)
     local profile = collected.profile
     local have = (self.bagCounts and self.bagCounts[line.itemId]) or 0
     local ok, err = C.RevalidateDonation(profile, line, {
-        inGroup = collected.inGroup,
-        compatible = collected.compatible,
-        inRange = collected.inRange,
         guildBankUsable = collected.usable,
     }, have)
     if not ok then
@@ -1542,9 +1100,7 @@ function Runtime:BeginDeposit(line, collected)
     local stacks = (self.bagStacks and self.bagStacks[line.itemId]) or {}
     local targets = self:DepositTargets(tab, line.itemId, MAX_DEPOSIT_PLACES)
     local profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId
-    local selfId = self:SelfId()
     self:CancelDepositWork()
-    self.placingDeposit = true
     self.depositWork = {
         line = line,
         profile = profile,
@@ -1554,7 +1110,6 @@ function Runtime:BeginDeposit(line, collected)
         guildGuid = cfg.guild and cfg.guild.guid or nil,
         generation = cfg.generation,
         requested = C.IsRequested(profile, line.itemId) == true,
-        donorAssigned = C.CrafterHasItem(profile, selfId, line.itemId) == true,
         intended = line.quantity,
         remaining = line.quantity,
         beforeTab = beforeTab,
@@ -1576,15 +1131,6 @@ function Runtime:FinishDeposit(fromTimer)
     local profile = self:ProfileById(intent.profileId)
     local C = SF.Consumables
     local Workflow = SF.ConsumablesWorkflow
-    local function rearmWithdraw()
-        local queue = self.withdrawIntents
-        if type(queue) ~= "table" and type(self.withdrawIntent) == "table" then
-            queue = { self.withdrawIntent }
-        end
-        if type(queue) == "table" and #queue > 0 then
-            self:ArmWithdrawTimer()
-        end
-    end
     if not profile or not C or not Workflow then
         self.depositIntent = nil
         if self.depositTimer and self.depositTimer.Cancel then
@@ -1593,7 +1139,6 @@ function Runtime:FinishDeposit(fromTimer)
         end
         Debug("Warn", "Skipped deposit commit because profile %s is gone", tostring(intent.profileId))
         self:CompleteDeferredProfileDeletes()
-        rearmWithdraw()
         return
     end
     self:ScanBags()
@@ -1628,7 +1173,6 @@ function Runtime:FinishDeposit(fromTimer)
         end
         Warn("That deposit was not in the configured guild bank tab.")
         self:CompleteDeferredProfileDeletes()
-        rearmWithdraw()
         return
     end
     if actual > (intent.bestActual or 0) then
@@ -1645,7 +1189,6 @@ function Runtime:FinishDeposit(fromTimer)
     end
     if action == "drop" then
         self:CompleteDeferredProfileDeletes()
-        rearmWithdraw()
         return
     end
     actual = intent.bestActual or actual
@@ -1653,55 +1196,14 @@ function Runtime:FinishDeposit(fromTimer)
         generation = intent.generation,
         itemId = intent.itemId,
         donor = self:SelfId(),
-        donorAssigned = intent.donorAssigned == true,
         requested = intent.requested == true,
-        custodyQty = intent.custodyQty or 0,
         timestamp = C.Now and C.Now() or nil,
     }, actual)
     local committed = self:Commit(profile, intent.token, events)
     if committed and actual < intent.intended then
         Info(string.format("Deposited %d. The rest is still in your bags.", actual))
     end
-    self:CaptureBaseline(false)
     self:CompleteDeferredProfileDeletes()
-    rearmWithdraw()
-end
-
-function Runtime:CaptureBaseline(silent)
-    local profile = self:AccountingProfile()
-    local C = SF.Consumables
-    if not profile or not C then return end
-    local cfg = C.Ensure(profile)
-    if not cfg.bankTab then
-        self.bankBaseline = nil
-        self.bankSlotBaseline = nil
-        self.bankSlotBaselineTab = nil
-        return
-    end
-    self.bankBaseline = self:TabItemCounts(cfg.bankTab)
-    self.bankSlotBaseline = {}
-    self.bankSlotBaselineTab = cfg.bankTab
-    local slotCount = GetGuildBankNumSlots and GetGuildBankNumSlots(cfg.bankTab) or 0
-    if slotCount > 98 then slotCount = 98 end
-    for slot = 1, slotCount do
-        local link = GetGuildBankItemLink and GetGuildBankItemLink(cfg.bankTab, slot) or nil
-        local slotItem = C.ItemIdFromText and C.ItemIdFromText(link) or nil
-        if slotItem and GetGuildBankItemInfo then
-            local _, stack = GetGuildBankItemInfo(cfg.bankTab, slot)
-            local stackCount = tonumber(stack) or 0
-            if stackCount > 0 then
-                self.bankSlotBaseline[slot] = { itemId = slotItem, count = stackCount }
-            end
-        end
-    end
-    self.bankBaselineBags = {}
-    self:ScanBags()
-    for itemId, qty in pairs(self.bagCounts or {}) do
-        self.bankBaselineBags[itemId] = qty
-    end
-    if silent then
-        Debug("Verbose", "Guild bank baseline captured")
-    end
 end
 
 function Runtime:CursorItemId()
@@ -1712,312 +1214,9 @@ function Runtime:CursorItemId()
     return tonumber(itemId) or (C and C.ItemIdFromText(link))
 end
 
-function Runtime:AutoStoreLoss(tab)
-    local C = SF.Consumables
-    local profile = self:AccountingProfile()
-    if not C or not profile or type(self.bankBaseline) ~= "table" then return nil, 0 end
-    local after = self:TabItemCounts(tab)
-    local foundId, foundLoss, matches = nil, 0, 0
-    for itemId, before in pairs(self.bankBaseline) do
-        if C.IsRequested(profile, itemId) then
-            local loss = (tonumber(before) or 0) - (tonumber(after[itemId]) or 0)
-            if loss > 0 then
-                matches = matches + 1
-                foundId = itemId
-                foundLoss = loss
-            end
-        end
-    end
-    if matches ~= 1 then return nil, 0 end
-    return foundId, foundLoss
-end
-
-function Runtime:NoteGuildBankPickup(tab, slot, fromAutoStore, splitAmount)
-    if self.placingDeposit then return end
-    local C = SF.Consumables
-    local profile = self:AccountingProfile()
-    if not C or not profile or not GetGuildBankItemLink then return end
-    local cfg = C.Ensure(profile)
-    tab = tonumber(tab)
-    slot = tonumber(slot)
-    local guild = self:CurrentGuild()
-    if not tab or tab ~= tonumber(cfg.bankTab) or not cfg.guild or not guild or guild.guid ~= cfg.guild.guid then
-        return
-    end
-    local itemId = C.ItemIdFromText(GetGuildBankItemLink(tab, slot))
-    local count = 0
-    local slotStillOccupied = false
-    if itemId and GetGuildBankItemInfo then
-        local _, itemCount = GetGuildBankItemInfo(tab, slot)
-        count = tonumber(itemCount) or 0
-        slotStillOccupied = count > 0
-    end
-    local emptiedBefore = nil
-    if not slotStillOccupied then
-        itemId = self:CursorItemId()
-        count = itemId and self.bankBaseline and self.bankBaseline[itemId] or 0
-        local baseline = self.bankSlotBaseline
-        local row = self.bankSlotBaselineTab == tab and type(baseline) == "table" and baseline[slot] or nil
-        if itemId and type(row) == "table" and row.itemId == itemId then
-            emptiedBefore = tonumber(row.count) or 0
-            if emptiedBefore <= 0 then emptiedBefore = nil end
-        end
-    end
-    local splitBefore = nil
-    splitAmount = tonumber(splitAmount)
-    if splitAmount and (splitAmount < 1 or splitAmount ~= math.floor(splitAmount) or splitAmount > C.MAX_EVENT_SEQ) then
-        splitAmount = nil
-    end
-    if splitAmount then
-        local baseline = self.bankSlotBaseline
-        local row = self.bankSlotBaselineTab == tab and type(baseline) == "table" and baseline[slot] or nil
-        if not itemId and type(row) == "table" then
-            itemId = tonumber(row.itemId)
-        end
-        local base = 0
-        if itemId and type(row) == "table" and row.itemId == itemId then
-            base = tonumber(row.count) or 0
-        end
-        local live = slotStillOccupied and count or 0
-        splitBefore = math.max(base, live)
-        if splitBefore < splitAmount then
-            splitBefore = live + splitAmount
-        end
-        count = splitAmount
-        slotStillOccupied = splitBefore > 0
-    end
-    if (not itemId or count <= 0) and fromAutoStore then
-        itemId, count = self:AutoStoreLoss(tab)
-    end
-    if not itemId or count <= 0 or not C.IsRequested(profile, itemId) then return end
-    local beforeTab, beforeBags
-    if slotStillOccupied then
-        self:ScanBags()
-        beforeTab = (self:TabItemCounts(tab)[itemId]) or count
-        beforeBags = (self.bagCounts and self.bagCounts[itemId]) or 0
-    else
-        beforeTab = (self.bankBaseline and self.bankBaseline[itemId]) or count
-        beforeBags = (self.bankBaselineBags and self.bankBaselineBags[itemId]) or 0
-    end
-    local selfId = self:SelfId()
-    local assignment = cfg.assignments[tostring(itemId)]
-    local now = GetTime and GetTime() or 0
-    local profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId
-    local epoch = assignment and tonumber(assignment.epoch) or 0
-    local assigned = C.CrafterHasItem(profile, selfId, itemId) == true
-    local admin = C.IsCanonicalAdmin(profile, selfId) == true
-    local function rememberSlot(intent, before)
-        before = tonumber(before) or 0
-        if before <= 0 then return end
-        if type(intent.slots) ~= "table" then intent.slots = {} end
-        if #intent.slots < MAX_WITHDRAW_SLOTS then
-            intent.slots[#intent.slots + 1] = { slot = slot, before = before }
-        end
-    end
-    if type(self.withdrawIntents) ~= "table" then
-        self.withdrawIntents = {}
-        if type(self.withdrawIntent) == "table" then
-            self.withdrawIntents[1] = self.withdrawIntent
-        end
-    end
-    local queue = self.withdrawIntents
-    for i = 1, #queue do
-        local existing = queue[i]
-        if existing.itemId == itemId and existing.tab == tab
-            and existing.profileId == profileId
-            and existing.generation == cfg.generation
-            and (tonumber(existing.epoch) or 0) == epoch
-            and existing.assigned == assigned
-            and existing.admin == admin then
-            existing.intended = (tonumber(existing.intended) or 0) + count
-            if splitBefore then
-                rememberSlot(existing, splitBefore)
-            elseif slotStillOccupied then
-                rememberSlot(existing, count)
-            else
-                rememberSlot(existing, emptiedBefore)
-            end
-            self.withdrawIntent = queue[1]
-            self:ArmWithdrawTimer()
-            return
-        end
-    end
-    if #queue >= MAX_WITHDRAW_INTENTS then
-        return
-    end
-    queue[#queue + 1] = {
-        tab = tab,
-        guildGuid = cfg.guild.guid,
-        itemId = itemId,
-        intended = count,
-        beforeTab = beforeTab,
-        beforeBags = beforeBags,
-        slots = nil,
-        generation = cfg.generation,
-        epoch = epoch,
-        assigned = assigned,
-        admin = admin,
-        profileId = profileId,
-        token = self:NextToken("withdraw"),
-        startedAt = now,
-    }
-    local createdIntent = queue[#queue]
-    if splitBefore then
-        rememberSlot(createdIntent, splitBefore)
-    elseif slotStillOccupied then
-        rememberSlot(createdIntent, count)
-    else
-        rememberSlot(createdIntent, emptiedBefore)
-    end
-    self.withdrawIntent = queue[1]
-    self:ArmWithdrawTimer()
-    local created = queue[#queue]
-    if created.assigned and SF.LootHelperSync and SF.LootHelperSync.PublishWithdrawGrant then
-        SF.LootHelperSync:PublishWithdrawGrant(profile, {
-            token = created.token,
-            receiver = selfId,
-            itemId = itemId,
-            epoch = tonumber(created.epoch) or 0,
-            generation = created.generation,
-        })
-    end
-end
-
-function Runtime:ArmWithdrawTimer()
-    if self.withdrawTimer and self.withdrawTimer.Cancel then
-        self.withdrawTimer:Cancel()
-    end
-    if C_Timer and C_Timer.NewTimer then
-        self.withdrawTimer = C_Timer.NewTimer(1.5, function()
-            self.withdrawTimer = nil
-            self:FinishWithdraw(true)
-        end)
-    end
-end
-
-function Runtime:WithdrawStillOnCursor(intent)
-    if not intent or self:CursorItemId() ~= intent.itemId then return false end
-    local now = GetTime and GetTime() or 0
-    local started = tonumber(intent.startedAt) or now
-    return now - started < 8
-end
-
-function Runtime:FinishWithdraw(fromTimer)
-    local queue = self.withdrawIntents
-    if type(queue) ~= "table" then
-        queue = {}
-        if type(self.withdrawIntent) == "table" then
-            queue[1] = self.withdrawIntent
-        end
-        self.withdrawIntents = queue
-    end
-    if #queue == 0 then return end
-    if self.depositIntent or self.depositWork then
-        -- Timer already cleared itself. Rearm so withdrawals resume after deposit.
-        self:ArmWithdrawTimer()
-        return
-    end
-    local C = SF.Consumables
-    local Workflow = SF.ConsumablesWorkflow
-    local function clearTimer()
-        if self.withdrawTimer and self.withdrawTimer.Cancel then
-            self.withdrawTimer:Cancel()
-            self.withdrawTimer = nil
-        end
-    end
-    if not C or not Workflow then
-        self.withdrawIntents = {}
-        self.withdrawIntent = nil
-        clearTimer()
-        self:CompleteDeferredProfileDeletes()
-        return
-    end
-    self:ScanBags()
-    local guild = self:CurrentGuild()
-    local kept = {}
-    local rearm = false
-    local committed = false
-    for i = 1, #queue do
-        local intent = queue[i]
-        local profile = self:ProfileById(intent.profileId)
-        local guildOk = intent.guildGuid and guild and guild.guid == intent.guildGuid
-        if profile and guildOk then
-            local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
-            local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
-            local slotLoss = nil
-            if type(intent.slots) == "table" then
-                slotLoss = 0
-                for slotIndex = 1, #intent.slots do
-                    local row = intent.slots[slotIndex]
-                    if type(row) == "table" then
-                        local before = tonumber(row.before) or 0
-                        local after = self:SlotItemCount(intent.tab, row.slot, intent.itemId)
-                        if before > after then
-                            slotLoss = slotLoss + (before - after)
-                        end
-                    end
-                end
-            end
-            local qty = Workflow.InterpretWithdraw({
-                localPickup = true,
-                guildOk = true,
-                configuredTab = intent.tab,
-                observedTab = intent.tab,
-                intendedQty = intent.intended,
-                beforeTab = intent.beforeTab,
-                afterTab = afterTab,
-                beforeBags = intent.beforeBags,
-                afterBags = afterBags,
-                slotLoss = slotLoss,
-            })
-            if qty <= 0 then
-                if fromTimer and self:WithdrawStillOnCursor(intent) then
-                    kept[#kept + 1] = intent
-                    rearm = true
-                elseif not fromTimer then
-                    kept[#kept + 1] = intent
-                end
-            else
-                local events = Workflow.WithdrawEvents({
-                    requested = true,
-                    withdrawerIsAssignedCrafter = intent.assigned == true,
-                    withdrawerIsAdmin = intent.admin == true,
-                    withdrawer = self:SelfId(),
-                    generation = intent.generation,
-                    epoch = intent.epoch or 0,
-                    timestamp = C.Now and C.Now() or nil,
-                }, intent.itemId, qty)
-                if #events > 0 then
-                    for eventIndex = 1, #events do
-                        if events[eventIndex].type == C.EVENT.RECEIPT then
-                            events[eventIndex].withdrawToken = intent.token
-                        end
-                    end
-                    self:Commit(profile, intent.token, events)
-                end
-                committed = true
-            end
-        end
-    end
-    self.withdrawIntents = kept
-    self.withdrawIntent = kept[1]
-    if #kept == 0 then
-        clearTimer()
-    elseif rearm then
-        self:ArmWithdrawTimer()
-    end
-    if committed then
-        self:CaptureBaseline(true)
-    end
-    if #kept == 0 then
-        self:CompleteDeferredProfileDeletes()
-    end
-end
-
 function Runtime:OnBankOpened()
     local first = not self.bankOpen
     self.bankOpen = true
-    self:CaptureBaseline(true)
     if first then
         self.autoReviewedThisOpen = false
         self:MaybeAutoReview()
@@ -2030,14 +1229,9 @@ end
 
 function Runtime:OnBankClosed()
     self.bankOpen = false
-    self.bankBaseline = nil
-    self.bankBaselineBags = nil
     self.autoReviewedThisOpen = false
     if self.depositWork then
         self:CancelDepositWork()
-    end
-    if (type(self.withdrawIntents) == "table" and self.withdrawIntents[1]) or self.withdrawIntent then
-        self:FinishWithdraw(true)
     end
     self:RefreshReminder()
 end
@@ -2048,19 +1242,17 @@ function Runtime:MaybeAutoReview()
         self.autoReviewedThisOpen = true
         return
     end
-    local C = SF.Consumables
     local Routing = SF.ConsumablesRouting
-    if not C or not Routing then return end
+    if not SF.Consumables or not Routing then return end
     local collected = self:Collect()
     if not collected then return end
     self.autoReviewedThisOpen = true
-    if C.IsCrafter(collected.profile, self:SelfId()) then return end
     local carries = false
     for i = 1, #collected.plan.lines do
         if collected.plan.lines[i].quantity > 0 then carries = true end
     end
     if not carries then return end
-    if not Routing.HasActionablePath(collected.plan.lines, collected.usable) then return end
+    if not Routing.HasActionablePath(collected.usable) then return end
     self:ShowReview()
 end
 
@@ -2078,14 +1270,14 @@ function Runtime:OnProfileChanged(profile)
         return
     end
     self._seenProfileId = id
-    if not self.openTrade and self.review then
+    if self.review then
         self.review:Hide()
     end
     self.qtyOverrides = {}
     self:RefreshReminder()
 end
 
-function Runtime:OnEvent(event, arg1, arg2)
+function Runtime:OnEvent(event, arg1)
     if event == "PLAYER_REGEN_ENABLED" then
         if self.mobileButtonPending then
             self:SyncMobileButton()
@@ -2107,8 +1299,6 @@ function Runtime:OnEvent(event, arg1, arg2)
             -- Multi-place deposit still moving source stacks.
         elseif event == "BAG_UPDATE_DELAYED" and self.depositIntent then
             self:FinishDeposit(false)
-        elseif event == "BAG_UPDATE_DELAYED" and self.withdrawIntent then
-            self:FinishWithdraw(false)
         end
         if InCombat() then
             self.reviewRefreshPending = true
@@ -2123,24 +1313,6 @@ function Runtime:OnEvent(event, arg1, arg2)
         if itemId then
             self.pendingItemLoads[itemId] = nil
         end
-    elseif event == "TRADE_SHOW" then
-        self:OnTradeShow()
-    elseif event == "TRADE_REQUEST_CANCEL" then
-        if self.openTrade then
-            self:ReleaseAcceptedTrade()
-        else
-            self:ClearPendingTrade()
-        end
-    elseif event == "UI_ERROR_MESSAGE" then
-        if TradeAcceptanceFailed(arg2) then
-            self:ReleaseAcceptedTrade()
-        end
-    elseif event == "TRADE_CLOSED" then
-        self:OnTradeClosed()
-    elseif event == "TRADE_ACCEPT_UPDATE" then
-        self:OnTradeAccept(arg1, arg2)
-    elseif event == "TRADE_TARGET_ITEM_CHANGED" or event == "TRADE_UPDATE" or event == "TRADE_PLAYER_ITEM_CHANGED" then
-        self:CaptureTargetSlots()
     elseif event == "GUILDBANKFRAME_OPENED" then
         self:OnBankOpened()
     elseif event == "GUILDBANKFRAME_CLOSED" then
@@ -2158,10 +1330,6 @@ function Runtime:OnEvent(event, arg1, arg2)
             -- Multi-place deposit still moving source stacks.
         elseif self.depositIntent then
             self:FinishDeposit(false)
-        elseif self.withdrawIntent then
-            self:FinishWithdraw(false)
-        elseif self.bankOpen then
-            self:CaptureBaseline(true)
         end
     end
 end
@@ -2181,36 +1349,12 @@ function Runtime:Init()
     TryRegister(frame, "BAG_UPDATE_DELAYED")
     TryRegister(frame, "GROUP_ROSTER_UPDATE")
     TryRegister(frame, "ITEM_DATA_LOAD_RESULT")
-    TryRegister(frame, "TRADE_SHOW")
-    TryRegister(frame, "TRADE_REQUEST_CANCEL")
-    TryRegister(frame, "UI_ERROR_MESSAGE")
-    TryRegister(frame, "TRADE_CLOSED")
-    TryRegister(frame, "TRADE_ACCEPT_UPDATE")
-    TryRegister(frame, "TRADE_PLAYER_ITEM_CHANGED")
-    TryRegister(frame, "TRADE_TARGET_ITEM_CHANGED")
-    TryRegister(frame, "TRADE_UPDATE")
     TryRegister(frame, "GUILDBANKFRAME_OPENED")
     TryRegister(frame, "GUILDBANKFRAME_CLOSED")
     TryRegister(frame, "GUILDBANKBAGSLOTS_CHANGED")
     TryRegister(frame, "PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
     TryRegister(frame, "PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
     TryRegister(frame, "PLAYER_REGEN_ENABLED")
-    if not self.pickupHooked and type(hooksecurefunc) == "function" then
-        self.pickupHooked = true
-        hooksecurefunc("PickupGuildBankItem", function(tab, slot)
-            self:NoteGuildBankPickup(tab, slot)
-        end)
-        if type(AutoStoreGuildBankItem) == "function" then
-            hooksecurefunc("AutoStoreGuildBankItem", function(tab, slot)
-                self:NoteGuildBankPickup(tab, slot, true)
-            end)
-        end
-        if type(SplitGuildBankItem) == "function" then
-            hooksecurefunc("SplitGuildBankItem", function(tab, slot, amount)
-                self:NoteGuildBankPickup(tab, slot, false, amount)
-            end)
-        end
-    end
     if SF.Consumables and SF.Consumables.RegisterUIListener then
         local reviewUiQueued = false
         SF.Consumables.RegisterUIListener(function()

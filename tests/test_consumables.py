@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS = REPO_ROOT / "tests" / "lua" / "consumables_tests.lua"
 RUNTIME = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesRuntime.lua"
 WORKFLOW = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesWorkflow.lua"
+SYNC_TRANSPORT = REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "19_Consumables.lua"
 
 
 def _lua51() -> str:
@@ -39,20 +40,29 @@ def test_consumables_production_lua():
     assert re.search(r"(?m)^\d+ passed, 0 failed$", result.stdout), result.stdout
 
 
-def test_consumables_trade_never_auto_accepts():
+def test_consumables_runtime_is_guild_bank_deposit_only():
     root = REPO_ROOT / "SpectrumFederation" / "modules"
-    sources = []
-    for path in root.rglob("Consumables*.lua"):
-        sources.append(path.read_text(encoding="utf-8"))
-    combined = "\n".join(sources)
-    assert "AcceptTrade" not in combined
-    assert "SetScript(\"OnUpdate\"" not in combined
-    assert "EventsFromUnsupportedInventoryDecrease" in WORKFLOW.read_text(encoding="utf-8")
-    if RUNTIME.exists():
-        runtime = RUNTIME.read_text(encoding="utf-8")
-        assert "AcceptTrade" not in runtime
-        assert "OnUpdate" not in runtime
-        assert 'TryRegister(frame, "TRADE_REQUEST_CANCEL")' in runtime
+    paths = list(root.rglob("Consumables*.lua")) + [SYNC_TRANSPORT]
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in paths)
+    for removed in (
+        "AcceptTrade",
+        "InitiateTrade",
+        "ClickTradeButton",
+        "TRADE_",
+        "OnUpdate",
+        "NewTicker",
+        "AddCrafter",
+        "BeginTrade",
+        "NoteGuildBankPickup",
+        "TradeEvents",
+        "WithdrawEvents",
+    ):
+        assert removed not in combined, removed
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    assert "function W.DepositEvents" in workflow
+    runtime = RUNTIME.read_text(encoding="utf-8")
+    assert 'TryRegister(frame, "GUILDBANKBAGSLOTS_CHANGED")' in runtime
+    assert "PickupGuildBankItem(work.tab" in runtime
 
 
 def test_consumables_snapshot_merge_is_inside_import():

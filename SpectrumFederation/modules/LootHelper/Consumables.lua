@@ -7,21 +7,15 @@ local C = SF.Consumables
 
 C.EVENT = {
     DONATION = "CONSUMABLE_DONATION",
+    RESET = "CONSUMABLE_CONFIG_RESET",
+    -- Legacy event type strings may still appear in archived development data.
     RECEIPT = "CONSUMABLE_CRAFTER_RECEIPT",
     CUSTODY = "CONSUMABLE_CUSTODY",
     RESOLVE = "CONSUMABLE_CUSTODY_RESOLVE",
-    RESET = "CONSUMABLE_CONFIG_RESET",
 }
 
-C.ACTION = {
-    WITHDRAW = "withdraw",
-    TRANSFER = "transfer",
-    RETURN = "return",
-    DELIVER = "deliver",
-}
-
-C.MAX_ASSIGNMENT_PAIRS = 256
-C.MAX_ASSIGNMENT_HISTORY = 8
+C.MAX_REQUESTED_ITEMS = 256
+C.MAX_ASSIGNMENT_PAIRS = C.MAX_REQUESTED_ITEMS -- alias for older callers/tests
 C.MAX_LEDGER_EVENTS = 4096
 C.MAX_ARCHIVED_EVENTS = 4096
 C.MAX_VISIBLE_HISTORY = 200
@@ -29,15 +23,6 @@ C.MAX_EVENTS_PER_ACTOR = 512
 C.MAX_EVENT_SEQ = 2147483647
 C.MAX_EVENT_ID = 192
 C.MAX_EVENT_NAME = 64
-C.MAX_EVENT_REASON = 128
-
-C.RESOLVE_REASONS = {
-    "Used",
-    "Lost/Destroyed",
-    "Transferred outside Spectrum",
-    "Correction",
-    "Other",
-}
 
 local projectionCache = setmetatable({}, { __mode = "k" })
 local listeners = {}
@@ -121,19 +106,6 @@ local function Without(list, name)
         if not Same(list[i], name) then
             out[#out + 1] = list[i]
         end
-    end
-    return out
-end
-
-local function CopyCrafterRoster(list)
-    local sorted = SortedCopy(list)
-    local out = {}
-    for i = 1, #sorted do
-        local name = sorted[i]
-        if #name <= C.MAX_EVENT_NAME and not Contains(out, name) then
-            out[#out + 1] = name
-        end
-        if #out >= C.MAX_ASSIGNMENT_PAIRS then break end
     end
     return out
 end
@@ -449,6 +421,62 @@ local function RebuildIndex(profile)
     end
 end
 
+local function CopyRequestedMap(source)
+    local out = {}
+    if type(source) ~= "table" then return out end
+    local count = 0
+    local keys = {}
+    for key, row in pairs(source) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for i = 1, #keys do
+        if count >= C.MAX_REQUESTED_ITEMS then break end
+        local key = keys[i]
+        local row = source[key]
+        local itemId = nil
+        if type(row) == "table" then
+            itemId = tonumber(row.itemId) or tonumber(key)
+        else
+            itemId = tonumber(key) or tonumber(row)
+        end
+        if IsItemId(itemId) then
+            out[ItemKey(itemId)] = { itemId = itemId }
+            count = count + 1
+        end
+    end
+    return out
+end
+
+local function NormalizeRequestedItems(cfg)
+    if type(cfg.requestedItems) == "table" then
+        cfg.requestedItems = CopyRequestedMap(cfg.requestedItems)
+    else
+        local migrated = {}
+        -- Development-era Crafter assignments: union of assigned exact items.
+        if type(cfg.assignments) == "table" then
+            for key, row in pairs(cfg.assignments) do
+                if type(row) == "table" then
+                    local crafters = row.crafters
+                    local itemId = tonumber(row.itemId) or tonumber(key)
+                    if IsItemId(itemId) and type(crafters) == "table" and #crafters > 0 then
+                        migrated[ItemKey(itemId)] = { itemId = itemId }
+                    elseif IsItemId(itemId) and crafters == nil and row.itemId then
+                        -- Already a flat requested row under the old key name.
+                        migrated[ItemKey(itemId)] = { itemId = itemId }
+                    end
+                end
+            end
+        end
+        cfg.requestedItems = CopyRequestedMap(migrated)
+    end
+    -- Discard obsolete Crafter-era persisted fields.
+    cfg.crafters = nil
+    cfg.assignments = nil
+    cfg.itemEpochs = nil
+    -- Also drop development-era freeze grants persisted beside the profile.
+end
+
 function C.Ensure(profile)
     if type(profile) ~= "table" then return nil end
     if type(profile._consumables) ~= "table" then
@@ -458,8 +486,7 @@ function C.Ensure(profile)
             eventSeq = 0,
             guild = nil,
             bankTab = nil,
-            crafters = {},
-            assignments = {},
+            requestedItems = {},
         }
     end
     local cfg = profile._consumables
@@ -481,8 +508,10 @@ function C.Ensure(profile)
         cfg.eventSeq = C.MAX_EVENT_SEQ
     end
     if type(cfg.ledgerSeq) ~= "number" or cfg.ledgerSeq < 0 then cfg.ledgerSeq = 0 end
-    if type(cfg.crafters) ~= "table" then cfg.crafters = {} end
-    if type(cfg.assignments) ~= "table" then cfg.assignments = {} end
+    NormalizeRequestedItems(cfg)
+    if type(profile._consumablesPendingFreezes) == "table" then
+        profile._consumablesPendingFreezes = nil
+    end
     if cfg.guild ~= nil and type(cfg.guild) ~= "table" then cfg.guild = nil end
     if type(profile._consumableEvents) ~= "table" then
         profile._consumableEvents = {}
@@ -645,25 +674,6 @@ local function MixConfigText(hash, text)
     return Xor32(hash, IdHash(text))
 end
 
-local function ItemEpochRows(cfg)
-    local rows = {}
-    if type(cfg) ~= "table" or type(cfg.itemEpochs) ~= "table" then return rows end
-    local visits = 0
-    local cap = C.MAX_ASSIGNMENT_PAIRS * 4
-    for key, epoch in pairs(cfg.itemEpochs) do
-        visits = visits + 1
-        if visits > cap then break end
-        local itemId = tonumber(key)
-        epoch = tonumber(epoch)
-        if itemId and itemId >= 1 and itemId == math.floor(itemId) and itemId <= C.MAX_EVENT_SEQ
-            and epoch and epoch >= 1 and epoch == math.floor(epoch) and epoch <= C.MAX_EVENT_SEQ then
-            rows[#rows + 1] = { itemId = itemId, epoch = epoch }
-        end
-    end
-    table.sort(rows, function(a, b) return a.itemId < b.itemId end)
-    return rows
-end
-
 local function ConfigFingerprint(cfg)
     local guid = ""
     if type(cfg.guild) == "table" and type(cfg.guild.guid) == "string" then
@@ -671,63 +681,19 @@ local function ConfigFingerprint(cfg)
     end
     local hash = MixConfigText(0, "g:" .. guid)
     hash = MixConfigText(hash, "t:" .. tostring(tonumber(cfg.bankTab) or 0))
-    local crafters = SortedCopy(cfg.crafters)
-    local crafterCount = #crafters
-    if crafterCount > C.MAX_ASSIGNMENT_PAIRS then
-        crafterCount = C.MAX_ASSIGNMENT_PAIRS
-    end
-    hash = MixConfigText(hash, "c:" .. tostring(#crafters))
-    for i = 1, crafterCount do
-        hash = MixConfigText(hash, tostring(i) .. ":" .. crafters[i])
-    end
-    local keys = {}
-    for key, row in pairs(cfg.assignments or {}) do
-        if type(row) == "table" and type(row.crafters) == "table" and #row.crafters > 0 then
-            keys[#keys + 1] = key
+    local ids = {}
+    for key, row in pairs(cfg.requestedItems or {}) do
+        local itemId = type(row) == "table" and tonumber(row.itemId) or tonumber(key)
+        if IsItemId(itemId) then
+            ids[#ids + 1] = itemId
         end
     end
-    table.sort(keys)
-    local keyCount = #keys
-    if keyCount > C.MAX_ASSIGNMENT_PAIRS then
-        keyCount = C.MAX_ASSIGNMENT_PAIRS
-    end
-    hash = MixConfigText(hash, "a:" .. tostring(#keys))
-    local mixed = 0
-    local assignedEpoch = {}
-    for i = 1, keyCount do
-        local row = cfg.assignments[keys[i]]
-        local itemId = tonumber(row.itemId)
-        local epoch = tonumber(row.epoch) or 0
-        hash = MixConfigText(hash, "ae:" .. tostring(row.itemId) .. ":" .. tostring(epoch))
-        if itemId then
-            assignedEpoch[itemId] = epoch
-        end
-        local names = SortedCopy(row.crafters)
-        for n = 1, #names do
-            if mixed >= C.MAX_ASSIGNMENT_PAIRS then break end
-            hash = MixConfigText(hash, tostring(row.itemId) .. ":" .. tostring(n) .. ":" .. names[n])
-            mixed = mixed + 1
-        end
-        if mixed >= C.MAX_ASSIGNMENT_PAIRS then break end
-    end
-    -- Active assignment epochs already mixed above. itemEpochs for those same
-    -- values would XOR-cancel under MixConfigText even with distinct prefixes,
-    -- because the weak hash keeps a near-constant XOR across matching suffixes.
-    -- Keep only watermarks that are not already represented by an active row.
-    local epochs = ItemEpochRows(cfg)
-    local extra = {}
-    for i = 1, #epochs do
-        local itemId = epochs[i].itemId
-        local epoch = epochs[i].epoch
-        if assignedEpoch[itemId] ~= epoch then
-            extra[#extra + 1] = epochs[i]
-        end
-    end
-    if #extra > 0 then
-        hash = MixConfigText(hash, "e:" .. tostring(#extra))
-        for i = 1, #extra do
-            hash = MixConfigText(hash, "ie:" .. tostring(extra[i].itemId) .. ":" .. tostring(extra[i].epoch))
-        end
+    table.sort(ids)
+    local limit = #ids
+    if limit > C.MAX_REQUESTED_ITEMS then limit = C.MAX_REQUESTED_ITEMS end
+    hash = MixConfigText(hash, "r:" .. tostring(#ids))
+    for i = 1, limit do
+        hash = MixConfigText(hash, "i:" .. tostring(ids[i]))
     end
     return hash
 end
@@ -765,69 +731,20 @@ local function AllowAdmin(profile, actor, opts)
     return C.IsCanonicalAdmin(profile, actor)
 end
 
-function C.IsCrafter(profile, actor)
-    actor = Norm(actor)
-    if not actor then return false end
-    local cfg = C.Ensure(profile)
-    return Contains(cfg.crafters, actor)
-end
-
-function C.CanEditAssignment(profile, actor, crafterName, opts)
-    actor = Norm(actor)
-    crafterName = Norm(crafterName)
-    if not actor or not crafterName then return false end
-    if AllowAdmin(profile, actor, opts) then return true end
-    return Same(actor, crafterName) and C.IsCrafter(profile, actor)
-end
-
-local function Assignment(cfg, itemId)
-    return cfg.assignments[ItemKey(itemId)]
-end
-
 function C.IsRequested(profile, itemId)
     itemId = tonumber(itemId)
     if not IsItemId(itemId) then return false end
-    local row = Assignment(C.Ensure(profile), itemId)
-    return row and type(row.crafters) == "table" and #row.crafters > 0 or false
-end
-
-function C.AssignedCrafters(profile, itemId)
-    local row = Assignment(C.Ensure(profile), tonumber(itemId))
-    if not row then return {} end
-    return SortedCopy(row.crafters)
-end
-
-function C.CrafterHasItem(profile, crafterName, itemId)
-    return Contains(C.AssignedCrafters(profile, itemId), Norm(crafterName))
-end
-
-function C.CrafterAssignedAtEpoch(profile, crafterName, itemId, epoch)
-    crafterName = Norm(crafterName)
-    epoch = tonumber(epoch)
-    itemId = tonumber(itemId)
-    if not crafterName or not epoch or not IsItemId(itemId) then return false end
-    local row = Assignment(C.Ensure(profile), itemId)
-    if not row then return false end
-    if epoch == (tonumber(row.epoch) or 0) then
-        return Contains(row.crafters or {}, crafterName)
-    end
-    local history = row.history
-    if type(history) ~= "table" then return false end
-    for i = 1, #history do
-        local prior = history[i]
-        if type(prior) == "table" and tonumber(prior.epoch) == epoch then
-            return Contains(prior.crafters or {}, crafterName)
-        end
-    end
-    return false
+    local row = C.Ensure(profile).requestedItems[ItemKey(itemId)]
+    return type(row) == "table" and IsItemId(tonumber(row.itemId))
 end
 
 function C.RequestedItemIds(profile)
     local cfg = C.Ensure(profile)
     local ids = {}
-    for _, row in pairs(cfg.assignments) do
-        if type(row) == "table" and type(row.crafters) == "table" and #row.crafters > 0 and IsItemId(tonumber(row.itemId)) then
-            ids[#ids + 1] = tonumber(row.itemId)
+    for _, row in pairs(cfg.requestedItems or {}) do
+        local itemId = type(row) == "table" and tonumber(row.itemId) or nil
+        if IsItemId(itemId) then
+            ids[#ids + 1] = itemId
         end
     end
     table.sort(ids)
@@ -840,245 +757,57 @@ local function BumpConfig(profile)
     Invalidate(profile)
 end
 
-local function CopyHistory(history, nameBudget)
-    if type(history) ~= "table" then return nil end
-    local out = {}
-    local count = #history
-    local startAt = 1
-    if count > C.MAX_ASSIGNMENT_HISTORY then
-        startAt = count - C.MAX_ASSIGNMENT_HISTORY + 1
-    end
-    for i = startAt, count do
-        local row = history[i]
-        if type(row) == "table" then
-            local epoch = tonumber(row.epoch)
-            if epoch and epoch >= 1 and epoch == math.floor(epoch) then
-                local crafters = {}
-                local names = row.crafters
-                if type(names) == "table" then
-                    local limit = #names
-                    if limit > 64 then limit = 64 end
-                    for n = 1, limit do
-                        local name = Norm(names[n])
-                        if name and #name <= C.MAX_EVENT_NAME then
-                            if nameBudget then
-                                if nameBudget.left <= 0 then break end
-                                nameBudget.left = nameBudget.left - 1
-                            end
-                            crafters[#crafters + 1] = name
-                        end
-                    end
-                    table.sort(crafters)
-                end
-                out[#out + 1] = { epoch = epoch, crafters = crafters }
-            end
-        end
-    end
-    if #out == 0 then return nil end
-    return out
-end
-
-local MAX_ITEM_EPOCHS = C.MAX_ASSIGNMENT_PAIRS * 4
-
-local function NoteItemEpoch(cfg, itemId, epoch)
-    epoch = tonumber(epoch)
-    itemId = tonumber(itemId)
-    if type(cfg) ~= "table" or not epoch or epoch < 1 or epoch ~= math.floor(epoch) or not itemId then
-        return
-    end
-    if type(cfg.itemEpochs) ~= "table" then cfg.itemEpochs = {} end
-    local key = ItemKey(itemId)
-    local current = tonumber(cfg.itemEpochs[key]) or 0
-    if epoch > C.MAX_EVENT_SEQ then return end
-    if epoch <= current then return end
-    if current == 0 then
-        local count = 0
-        for _ in pairs(cfg.itemEpochs) do
-            count = count + 1
-            if count >= MAX_ITEM_EPOCHS then return end
-        end
-    end
-    cfg.itemEpochs[key] = epoch
-end
-
-local function PruneRetiredAssignments(cfg)
-    local retired = {}
-    for key, row in pairs(cfg.assignments) do
-        local crafters = type(row) == "table" and row.crafters or nil
-        if type(crafters) ~= "table" or #crafters == 0 then
-            retired[#retired + 1] = {
-                key = key,
-                epoch = type(row) == "table" and tonumber(row.epoch) or 0,
-            }
-        end
-    end
-    if #retired <= C.MAX_ASSIGNMENT_HISTORY then return end
-    table.sort(retired, function(a, b)
-        if a.epoch ~= b.epoch then return a.epoch < b.epoch end
-        return tostring(a.key) < tostring(b.key)
-    end)
-    local extra = #retired - C.MAX_ASSIGNMENT_HISTORY
-    for i = 1, extra do
-        local key = retired[i].key
-        local row = cfg.assignments[key]
-        if type(row) == "table" then
-            NoteItemEpoch(cfg, row.itemId or tonumber(key), row.epoch)
-        end
-        cfg.assignments[key] = nil
-    end
-end
-
-local function CommitSet(cfg, itemId, nextCrafters)
-    local key = ItemKey(itemId)
-    local current = cfg.assignments[key]
-    local before = current and SortedCopy(current.crafters) or {}
-    local after = SortedCopy(nextCrafters)
-    if SameSet(before, after) then
-        return false
-    end
-    local epoch = current and tonumber(current.epoch) or 0
-    if not current and type(cfg.itemEpochs) == "table" then
-        local noted = tonumber(cfg.itemEpochs[key]) or 0
-        if noted > epoch then epoch = noted end
-    end
-    local history = CopyHistory(current and current.history) or {}
-    if current and epoch >= 1 then
-        history[#history + 1] = { epoch = epoch, crafters = before }
-        while #history > C.MAX_ASSIGNMENT_HISTORY do
-            table.remove(history, 1)
-        end
-    end
-    cfg.assignments[key] = {
-        itemId = itemId,
-        epoch = epoch + 1,
-        crafters = after,
-        history = #history > 0 and history or nil,
-    }
-    NoteItemEpoch(cfg, itemId, epoch + 1)
-    PruneRetiredAssignments(cfg)
-    return true
-end
-
-function C.AddCrafter(profile, actor, crafterName, opts)
-    actor = Norm(actor)
-    crafterName = Norm(crafterName)
-    if not actor or not crafterName then
-        return false, "Enter a character name."
-    end
-    if not AllowAdmin(profile, actor, opts) then
-        return false, "Only a profile admin can add a Crafter."
-    end
-    if #crafterName > C.MAX_EVENT_NAME then
-        return false, "That character name is too long."
-    end
-    if C.IsCrafter(profile, crafterName) then
-        return false, "That character is already a Crafter."
-    end
-    local cfg = C.Ensure(profile)
-    if #cfg.crafters >= C.MAX_ASSIGNMENT_PAIRS then
-        return false, "The Crafter list is full."
-    end
-    cfg.crafters[#cfg.crafters + 1] = crafterName
-    table.sort(cfg.crafters)
-    BumpConfig(profile)
-    Debug("Info", "Added Crafter %s", crafterName)
-    Notify()
-    return true
-end
-
-function C.RemoveCrafter(profile, actor, crafterName, opts)
-    actor = Norm(actor)
-    crafterName = Norm(crafterName)
-    if not actor or not crafterName then
-        return false, "Enter a character name."
-    end
-    if not AllowAdmin(profile, actor, opts) then
-        return false, "Only a profile admin can remove a Crafter."
-    end
-    if not C.IsCrafter(profile, crafterName) then
-        return false, "That character is not a Crafter."
-    end
-    local cfg = C.Ensure(profile)
-    cfg.crafters = Without(cfg.crafters, crafterName)
-    local pending = {}
-    for _, row in pairs(cfg.assignments) do
-        if type(row) == "table" and Contains(row.crafters or {}, crafterName) then
-            pending[#pending + 1] = tonumber(row.itemId)
-        end
-    end
-    for i = 1, #pending do
-        local itemId = pending[i]
-        local row = cfg.assignments[ItemKey(itemId)]
-        if type(row) == "table" then
-            CommitSet(cfg, itemId, Without(row.crafters, crafterName))
-        end
-    end
-    BumpConfig(profile)
-    Debug("Info", "Removed Crafter %s", crafterName)
-    Notify()
-    return true
-end
-
-function C.AddAssignment(profile, actor, itemId, crafterName, opts)
+function C.AddRequestedItem(profile, actor, itemId, opts)
     opts = opts or {}
     itemId = tonumber(itemId)
     actor = Norm(actor)
-    crafterName = Norm(crafterName)
     if not IsItemId(itemId) then
         return false, "Enter a valid item ID."
     end
-    if not actor or not crafterName then
-        return false, "Choose a Crafter."
+    if not actor then
+        return false, "Only a profile admin can add requested items."
     end
-    if not C.IsCrafter(profile, crafterName) then
-        return false, "That character is not a Crafter."
-    end
-    if not C.CanEditAssignment(profile, actor, crafterName, opts) then
-        return false, "You can only edit your own requested materials."
+    if not AllowAdmin(profile, actor, opts) then
+        return false, "Only a profile admin can add requested items."
     end
     if opts.transferable == false or (opts.requireTransferable and opts.transferable ~= true) then
-        return false, "That item cannot be traded."
-    end
-    if C.CrafterHasItem(profile, crafterName, itemId) then
-        return false, "That Crafter already requests this exact item."
+        return false, "That item cannot be deposited into the guild bank."
     end
     local cfg = C.Ensure(profile)
-    local pairCount = 0
-    for _, row in pairs(cfg.assignments) do
-        if type(row) == "table" and type(row.crafters) == "table" then
-            pairCount = pairCount + #row.crafters
+    if C.IsRequested(profile, itemId) then
+        return false, "That exact item is already requested."
+    end
+    local count = 0
+    for _ in pairs(cfg.requestedItems) do
+        count = count + 1
+        if count >= C.MAX_REQUESTED_ITEMS then
+            return false, "Raid Consumables already has the maximum number of requested items."
         end
     end
-    if pairCount >= C.MAX_ASSIGNMENT_PAIRS then
-        return false, "Raid Consumables already has the maximum number of assignments."
-    end
-    local nextCrafters = C.AssignedCrafters(profile, itemId)
-    nextCrafters[#nextCrafters + 1] = crafterName
-    CommitSet(cfg, itemId, nextCrafters)
+    cfg.requestedItems[ItemKey(itemId)] = { itemId = itemId }
     BumpConfig(profile)
-    Debug("Info", "Assigned item %s to %s", tostring(itemId), crafterName)
+    Debug("Info", "Requested item %s", tostring(itemId))
     Notify()
     return true
 end
 
-function C.RemoveAssignment(profile, actor, itemId, crafterName, opts)
+function C.RemoveRequestedItem(profile, actor, itemId, opts)
     opts = opts or {}
     itemId = tonumber(itemId)
     actor = Norm(actor)
-    crafterName = Norm(crafterName)
-    if not IsItemId(itemId) or not actor or not crafterName then
+    if not IsItemId(itemId) or not actor then
         return false, "Choose a requested material."
     end
-    if not C.CanEditAssignment(profile, actor, crafterName, opts) then
-        return false, "You can only edit your own requested materials."
+    if not AllowAdmin(profile, actor, opts) then
+        return false, "Only a profile admin can remove requested items."
     end
-    if not C.CrafterHasItem(profile, crafterName, itemId) then
-        return false, "That material is not assigned to that Crafter."
+    if not C.IsRequested(profile, itemId) then
+        return false, "That material is not currently requested."
     end
     local cfg = C.Ensure(profile)
-    CommitSet(cfg, itemId, Without(C.AssignedCrafters(profile, itemId), crafterName))
+    cfg.requestedItems[ItemKey(itemId)] = nil
     BumpConfig(profile)
-    Debug("Info", "Removed item %s from %s", tostring(itemId), crafterName)
+    Debug("Info", "Removed requested item %s", tostring(itemId))
     Notify()
     return true
 end
@@ -1140,23 +869,13 @@ local function BoundedName(value)
     return value
 end
 
-local function BoundedReason(value)
-    if type(value) ~= "string" or value == "" then return nil end
-    if #value > C.MAX_EVENT_REASON then
-        return value:sub(1, C.MAX_EVENT_REASON)
-    end
-    return value
-end
-
 function CopyEvent(event)
     local source = event.source
-    if source ~= "trade" and source ~= "guildbank" then
-        source = nil
-    end
-    local action = event.action
-    if action ~= C.ACTION.WITHDRAW and action ~= C.ACTION.TRANSFER
-        and action ~= C.ACTION.RETURN and action ~= C.ACTION.DELIVER then
-        action = nil
+    if source ~= "guildbank" then
+        -- Preserve archived development-era trade donations without new writers.
+        if source ~= "trade" then
+            source = nil
+        end
     end
     return {
         id = event.id,
@@ -1167,16 +886,7 @@ function CopyEvent(event)
         itemId = tonumber(event.itemId),
         quantity = tonumber(event.quantity),
         source = source,
-        crafter = BoundedName(event.crafter),
-        epoch = tonumber(event.epoch),
-        action = action,
-        holder = BoundedName(event.holder),
-        fromHolder = BoundedName(event.fromHolder),
-        toHolder = BoundedName(event.toHolder),
-        reason = BoundedReason(event.reason),
         order = tonumber(event.order),
-        tradeToken = type(event.tradeToken) == "string" and #event.tradeToken <= 128 and event.tradeToken or nil,
-        withdrawToken = type(event.withdrawToken) == "string" and #event.withdrawToken <= 128 and event.withdrawToken or nil,
         writer = type(event.writer) == "string" and event.writer ~= "" and #event.writer <= C.MAX_EVENT_NAME and event.writer or nil,
     }
 end
@@ -1424,10 +1134,6 @@ function C.AppendEvent(profile, event, opts)
     event.timestamp = tonumber(event.timestamp) or Now()
     event.generation = tonumber(event.generation) or C.Ensure(profile).generation
     if event.actor then event.actor = Norm(event.actor) or event.actor end
-    if event.crafter then event.crafter = Norm(event.crafter) or event.crafter end
-    if event.holder then event.holder = Norm(event.holder) or event.holder end
-    if event.fromHolder then event.fromHolder = Norm(event.fromHolder) or event.fromHolder end
-    if event.toHolder then event.toHolder = Norm(event.toHolder) or event.toHolder end
     local record = CopyEvent(event)
     profile._consumableEvents[#profile._consumableEvents + 1] = record
     bound.ids[event.id] = record
@@ -1482,8 +1188,7 @@ function C.Clear(profile, actor, opts)
     end
     cfg.guild = nil
     cfg.bankTab = nil
-    cfg.crafters = {}
-    cfg.assignments = {}
+    cfg.requestedItems = {}
     BumpConfig(profile)
     Debug("Info", "%s cleared Raid Consumables", actor)
     Notify()
@@ -1504,10 +1209,6 @@ local function EventLess(a, b)
     return tostring(a.id) < tostring(b.id)
 end
 
-local function CustodyKey(holder, itemId)
-    return tostring(holder) .. "|" .. tostring(itemId)
-end
-
 local function BuildProjection(profile, cfg)
     local ordered = {}
     for i = 1, #profile._consumableEvents do
@@ -1515,25 +1216,7 @@ local function BuildProjection(profile, cfg)
     end
     table.sort(ordered, EventLess)
 
-    local receipts = {}
     local contributions = {}
-    local bags = {}
-
-    local function addBag(holder, itemId, qty)
-        if not holder or not itemId or qty <= 0 then return end
-        local key = CustodyKey(holder, itemId)
-        bags[key] = (bags[key] or 0) + qty
-    end
-
-    local function takeBag(holder, itemId, qty)
-        if not holder or not itemId or qty <= 0 then return 0 end
-        local key = CustodyKey(holder, itemId)
-        local have = bags[key] or 0
-        local moved = math.min(have, qty)
-        bags[key] = have - moved
-        return moved
-    end
-
     for i = 1, #ordered do
         local event = ordered[i]
         if tonumber(event.generation) == cfg.generation then
@@ -1542,51 +1225,12 @@ local function BuildProjection(profile, cfg)
             if event.type == C.EVENT.DONATION and event.actor and itemId and qty > 0 then
                 contributions[event.actor] = contributions[event.actor] or {}
                 contributions[event.actor][itemId] = (contributions[event.actor][itemId] or 0) + qty
-            elseif event.type == C.EVENT.RECEIPT and event.crafter and itemId and qty > 0 then
-                local row = Assignment(cfg, itemId)
-                if row and #(row.crafters or {}) > 0 and tonumber(event.epoch) == tonumber(row.epoch) and Contains(row.crafters, event.crafter) then
-                    receipts[itemId] = receipts[itemId] or {}
-                    receipts[itemId][event.crafter] = (receipts[itemId][event.crafter] or 0) + qty
-                end
-            elseif event.type == C.EVENT.CUSTODY and itemId and qty > 0 then
-                if event.action == C.ACTION.WITHDRAW then
-                    addBag(event.holder, itemId, qty)
-                elseif event.action == C.ACTION.TRANSFER then
-                    local moved = takeBag(event.fromHolder, itemId, qty)
-                    addBag(event.toHolder, itemId, moved)
-                elseif event.action == C.ACTION.RETURN or event.action == C.ACTION.DELIVER then
-                    takeBag(event.holder or event.fromHolder, itemId, qty)
-                end
-            elseif event.type == C.EVENT.RESOLVE and event.holder and itemId then
-                bags[CustodyKey(event.holder, itemId)] = 0
             end
         end
     end
-
-    local custody = {}
-    for key, qty in pairs(bags) do
-        if qty > 0 then
-            local holder, itemText = key:match("^(.-)|(%d+)$")
-            local itemId = tonumber(itemText)
-            if holder and itemId then
-                custody[#custody + 1] = {
-                    holder = holder,
-                    itemId = itemId,
-                    quantity = qty,
-                    retired = not C.IsRequested(profile, itemId),
-                }
-            end
-        end
-    end
-    table.sort(custody, function(a, b)
-        if a.holder ~= b.holder then return a.holder < b.holder end
-        return a.itemId < b.itemId
-    end)
 
     return {
-        receipts = receipts,
         contributions = contributions,
-        custody = custody,
     }
 end
 
@@ -1600,21 +1244,6 @@ function C.Project(profile)
     local value = BuildProjection(profile, cfg)
     projectionCache[profile] = { key = key, value = value }
     return value
-end
-
-function C.ReceiptTotal(profile, itemId, crafterName)
-    itemId = tonumber(itemId)
-    crafterName = Norm(crafterName)
-    local receipts = C.Project(profile).receipts
-    local byItem = receipts[itemId]
-    if not byItem or not crafterName then return 0 end
-    local total = 0
-    for key, qty in pairs(byItem) do
-        if Same(key, crafterName) then
-            total = total + (tonumber(qty) or 0)
-        end
-    end
-    return total
 end
 
 function C.ContributionTotal(profile, memberId, itemId)
@@ -1646,55 +1275,6 @@ function C.ContributionTotal(profile, memberId, itemId)
     return total
 end
 
-function C.CustodyFor(profile, holder, itemId)
-    holder = Norm(holder)
-    itemId = tonumber(itemId)
-    local custody = C.Project(profile).custody
-    for i = 1, #custody do
-        local entry = custody[i]
-        if entry.itemId == itemId and Same(entry.holder, holder) then
-            return entry
-        end
-    end
-    return nil
-end
-
-local function ReasonOk(reason)
-    for i = 1, #C.RESOLVE_REASONS do
-        if C.RESOLVE_REASONS[i] == reason then return true end
-    end
-    return false
-end
-
-function C.ResolveCustody(profile, actor, holder, itemId, reason, opts)
-    actor = Norm(actor)
-    holder = Norm(holder)
-    itemId = tonumber(itemId)
-    if not AllowAdmin(profile, actor, opts) then
-        return false, "Only a profile admin can resolve custody."
-    end
-    local entry = C.CustodyFor(profile, holder, itemId)
-    if not entry then
-        return false, "That custody entry is not outstanding."
-    end
-    if not ReasonOk(reason) then
-        reason = "Other"
-    end
-    local ok, err = C.AppendEvent(profile, {
-        type = C.EVENT.RESOLVE,
-        actor = actor,
-        holder = holder,
-        itemId = itemId,
-        quantity = entry.quantity,
-        reason = reason,
-        generation = C.Ensure(profile).generation,
-        timestamp = Now(),
-    })
-    if not ok then return false, err end
-    Debug("Info", "%s resolved custody for %s item %s", actor, holder, tostring(itemId))
-    return true
-end
-
 function C.ItemName(itemId, itemName)
     if type(itemName) == "string" and itemName ~= "" then return itemName end
     return "item " .. tostring(itemId or "")
@@ -1705,22 +1285,10 @@ function C.FormatEvent(event, itemName)
     local name = C.ItemName(event.itemId, itemName)
     local qty = tonumber(event.quantity) or 0
     if event.type == C.EVENT.DONATION then
-        local where = event.source == "guildbank" and "the guild bank" or (event.crafter or "a Crafter")
-        return string.format("%s donated %d %s to %s.", tostring(event.actor or "Someone"), qty, name, tostring(where))
-    elseif event.type == C.EVENT.RECEIPT then
-        return string.format("%s received %d %s.", tostring(event.crafter or "A Crafter"), qty, name)
-    elseif event.type == C.EVENT.CUSTODY then
-        if event.action == C.ACTION.WITHDRAW then
-            return string.format("%s withdrew %d %s into custody.", tostring(event.holder), qty, name)
-        elseif event.action == C.ACTION.TRANSFER then
-            return string.format("%s transferred custody of %d %s to %s.", tostring(event.fromHolder), qty, name, tostring(event.toHolder))
-        elseif event.action == C.ACTION.RETURN then
-            return string.format("%s returned %d %s from custody to the guild bank.", tostring(event.holder or event.fromHolder), qty, name)
-        elseif event.action == C.ACTION.DELIVER then
-            return string.format("%s delivered %d %s from custody to %s.", tostring(event.fromHolder or event.holder), qty, name, tostring(event.crafter or event.toHolder))
+        if event.source ~= "guildbank" then
+            return ""
         end
-    elseif event.type == C.EVENT.RESOLVE then
-        return string.format("%s resolved %s's custody of %d %s (%s).", tostring(event.actor), tostring(event.holder), qty, name, tostring(event.reason or "Other"))
+        return string.format("%s donated %d %s to the guild bank.", tostring(event.actor or "Someone"), qty, name)
     elseif event.type == C.EVENT.RESET then
         return string.format("%s cleared the Raid Consumables configuration.", tostring(event.actor or "An admin"))
     end
@@ -1770,11 +1338,7 @@ function C.HistoryRows(profile, nameForItem, limit, offset)
 end
 
 function C.ClearConfirmation(profile)
-    local custody = C.Project(profile).custody
-    if #custody > 0 then
-        return "Clear Raid Consumables configuration? Outstanding custody (" .. tostring(#custody) .. " entries) will be removed from current tracking. Historical Raid Consumable Logs are kept."
-    end
-    return "Clear Raid Consumables configuration? Guild, Crafters, assignments, and current tracking will be removed. Historical Raid Consumable Logs are kept."
+    return "Clear Raid Consumables configuration? Guild, Guild Bank tab, and requested items will be removed. Historical Raid Consumable Logs are kept."
 end
 
 local function CopyGuild(guild)
@@ -1791,17 +1355,7 @@ end
 function C.ExportSnapshot(profile, opts)
     local cfg = C.Ensure(profile)
     opts = opts or {}
-    local assignments = {}
-    for key, row in pairs(cfg.assignments) do
-        if type(row) == "table" then
-            assignments[key] = {
-                itemId = tonumber(row.itemId),
-                epoch = tonumber(row.epoch) or 1,
-                crafters = SortedCopy(row.crafters),
-                history = CopyHistory(row.history),
-            }
-        end
-    end
+    local requestedItems = CopyRequestedMap(cfg.requestedItems)
     local events = nil
     if not opts.omitEvents then
         events = {}
@@ -1822,10 +1376,8 @@ function C.ExportSnapshot(profile, opts)
         ledgerSeq = tonumber(cfg.ledgerSeq) or 0,
         guild = CopyGuild(cfg.guild),
         bankTab = cfg.bankTab,
-        crafters = CopyCrafterRoster(cfg.crafters),
-        assignments = assignments,
+        requestedItems = requestedItems,
         events = events,
-        itemEpochs = ItemEpochRows(cfg),
     }
 end
 
@@ -1840,6 +1392,10 @@ function C.ValidateSnapshot(data)
     if data.configSeq ~= nil and type(data.configSeq) ~= "number" then
         return false, "snapshot.consumables.configSeq must be a number"
     end
+    if data.requestedItems ~= nil and type(data.requestedItems) ~= "table" then
+        return false, "snapshot.consumables.requestedItems must be a table"
+    end
+    -- Legacy development snapshots may still carry crafters/assignments.
     if data.crafters ~= nil and type(data.crafters) ~= "table" then
         return false, "snapshot.consumables.crafters must be a table"
     end
@@ -1879,6 +1435,27 @@ function C.ValidConfigSeq(value)
     return seq
 end
 
+local function RequestedFromPayload(payload)
+    if type(payload) ~= "table" then return {} end
+    if type(payload.requestedItems) == "table" then
+        return CopyRequestedMap(payload.requestedItems)
+    end
+    -- Migrate legacy assignment snapshots into a flat requested-item list.
+    local migrated = {}
+    if type(payload.assignments) == "table" then
+        for key, row in pairs(payload.assignments) do
+            if type(row) == "table" then
+                local itemId = tonumber(row.itemId) or tonumber(key)
+                local crafters = row.crafters
+                if IsItemId(itemId) and (crafters == nil or (type(crafters) == "table" and #crafters > 0)) then
+                    migrated[ItemKey(itemId)] = { itemId = itemId }
+                end
+            end
+        end
+    end
+    return CopyRequestedMap(migrated)
+end
+
 function C.ReplaceConfig(profile, payload)
     local cfg = C.Ensure(profile)
     local generation = C.ValidGeneration(payload.generation)
@@ -1898,71 +1475,10 @@ function C.ReplaceConfig(profile, payload)
     cfg.guild = CopyGuild(payload.guild)
     cfg.bankTab = tonumber(payload.bankTab)
     if not IsBankTab(cfg.bankTab) then cfg.bankTab = nil end
-    cfg.crafters = CopyCrafterRoster(payload.crafters)
-    cfg.assignments = {}
-    local historyNames = { left = C.MAX_ASSIGNMENT_PAIRS * C.MAX_ASSIGNMENT_HISTORY }
-    if type(payload.assignments) == "table" then
-        local visits = 0
-        local pairsLeft = C.MAX_ASSIGNMENT_PAIRS
-        local maxVisits = C.MAX_ASSIGNMENT_PAIRS + C.MAX_ASSIGNMENT_HISTORY
-        for key, row in pairs(payload.assignments) do
-            visits = visits + 1
-            if visits > maxVisits or pairsLeft <= 0 then break end
-            if type(row) == "table" then
-                local itemId = tonumber(row.itemId) or tonumber(key)
-                if IsItemId(itemId) then
-                    local names = SortedCopy(row.crafters)
-                    local crafters = {}
-                    for n = 1, #names do
-                        if pairsLeft <= 0 then break end
-                        if #names[n] <= C.MAX_EVENT_NAME then
-                            crafters[#crafters + 1] = names[n]
-                            pairsLeft = pairsLeft - 1
-                        end
-                    end
-                    local epoch = tonumber(row.epoch)
-                    if row.epoch == nil then
-                        epoch = 1
-                    elseif not epoch or epoch < 1 or epoch ~= math.floor(epoch) or epoch > C.MAX_EVENT_SEQ then
-                        epoch = nil
-                    end
-                    if epoch then
-                        cfg.assignments[ItemKey(itemId)] = {
-                            itemId = itemId,
-                            epoch = epoch,
-                            crafters = crafters,
-                            history = CopyHistory(row.history, historyNames),
-                        }
-                    end
-                end
-            end
-        end
-    end
-    PruneRetiredAssignments(cfg)
-    if type(payload.itemEpochs) == "table" then
-        local cap = C.MAX_ASSIGNMENT_PAIRS * 4
-        local count = 0
-        local array = true
-        for key in pairs(payload.itemEpochs) do
-            count = count + 1
-            if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then
-                array = false
-                break
-            end
-            if count > cap then break end
-        end
-        if array and (count > cap or count == #payload.itemEpochs) then
-            cfg.itemEpochs = {}
-            local limit = count
-            if limit > cap then limit = cap end
-            for i = 1, limit do
-                local row = payload.itemEpochs[i]
-                if type(row) == "table" then
-                    NoteItemEpoch(cfg, row.itemId, row.epoch)
-                end
-            end
-        end
-    end
+    cfg.requestedItems = RequestedFromPayload(payload)
+    cfg.crafters = nil
+    cfg.assignments = nil
+    cfg.itemEpochs = nil
     Invalidate(profile)
     RestoreAdoptedGeneration(profile)
     C.RetainCurrentGeneration(profile)
@@ -2212,17 +1728,8 @@ function C.CopyConfiguration(source, dest)
     dest._consumableEventArchive = {}
     dest._consumableEventIds = nil
     dest._consumableIndexCount = nil
+    dest._consumablesPendingFreezes = nil
     C.InvalidateEventIndex(dest)
-    local assignments = {}
-    for key, row in pairs(src.assignments) do
-        if type(row) == "table" and type(row.crafters) == "table" and #row.crafters > 0 then
-            assignments[key] = {
-                itemId = tonumber(row.itemId),
-                epoch = 1,
-                crafters = SortedCopy(row.crafters),
-            }
-        end
-    end
     dest._consumables = {
         generation = 1,
         configSeq = 0,
@@ -2230,8 +1737,7 @@ function C.CopyConfiguration(source, dest)
         ledgerSeq = 0,
         guild = CopyGuild(src.guild),
         bankTab = src.bankTab,
-        crafters = SortedCopy(src.crafters),
-        assignments = assignments,
+        requestedItems = CopyRequestedMap(src.requestedItems),
     }
     Invalidate(dest)
     Invalidate(source)
@@ -2242,14 +1748,10 @@ function C.ApplyOp(profile, op, actor, opts)
     if type(op) ~= "table" or type(op.name) ~= "string" then
         return false, "Unknown configuration change."
     end
-    if op.name == "add_crafter" then
-        return C.AddCrafter(profile, actor, op.crafter, opts)
-    elseif op.name == "remove_crafter" then
-        return C.RemoveCrafter(profile, actor, op.crafter, opts)
-    elseif op.name == "add_assignment" then
-        return C.AddAssignment(profile, actor, op.itemId, op.crafter, opts)
-    elseif op.name == "remove_assignment" then
-        return C.RemoveAssignment(profile, actor, op.itemId, op.crafter, opts)
+    if op.name == "add_item" then
+        return C.AddRequestedItem(profile, actor, op.itemId, opts)
+    elseif op.name == "remove_item" then
+        return C.RemoveRequestedItem(profile, actor, op.itemId, opts)
     elseif op.name == "set_guild" then
         return C.SetGuild(profile, actor, op.guild, op.bankTab, opts)
     elseif op.name == "set_bank_tab" then
@@ -2312,9 +1814,6 @@ function C.CommitEvents(profile, token, events, opts)
         end
         profile._consumableEvents = keepRows(profile._consumableEvents)
         profile._consumableEventArchive = keepRows(profile._consumableEventArchive)
-        -- AppendArchivedEvent may have evicted unrelated oldest rows before a
-        -- later event failed. Restore those rows so a rejected batch leaves
-        -- historical accounting intact.
         for i = #evicted, 1, -1 do
             RestoreArchivedFront(profile, evicted[i])
         end
@@ -2340,74 +1839,36 @@ end
 
 function C.SettingsModel(profile, actor, asAdmin)
     local cfg = C.Ensure(profile)
-    local crafter = C.IsCrafter(profile, actor)
     local rows = {}
-    for _, row in pairs(cfg.assignments) do
-        if type(row) == "table" and type(row.crafters) == "table" then
-            for i = 1, #row.crafters do
-                local name = row.crafters[i]
-                if asAdmin or Same(name, actor) then
-                    rows[#rows + 1] = {
-                        itemId = tonumber(row.itemId),
-                        crafter = name,
-                        epoch = tonumber(row.epoch) or 0,
-                        text = string.format("%s → %s", tostring(row.itemId), name),
-                        canRemove = asAdmin or Same(name, actor),
-                    }
-                end
-            end
-        end
-    end
-    table.sort(rows, function(a, b)
-        if a.itemId ~= b.itemId then return a.itemId < b.itemId end
-        return tostring(a.crafter) < tostring(b.crafter)
-    end)
-    local crafterRows = {}
-    for i = 1, #cfg.crafters do
-        crafterRows[i] = {
-            crafter = cfg.crafters[i],
-            text = cfg.crafters[i],
-            canRemove = asAdmin and true or false,
-        }
-    end
-    local custody = {}
-    if asAdmin then
-        local projected = C.Project(profile).custody
-        for i = 1, #projected do
-            local entry = projected[i]
-            custody[i] = {
-                holder = entry.holder,
-                itemId = entry.itemId,
-                quantity = entry.quantity,
-                retired = entry.retired,
-                text = string.format("%s · item %s · %d%s", entry.holder, tostring(entry.itemId), entry.quantity, entry.retired and " · retired" or ""),
-                canRemove = false,
+    for _, row in pairs(cfg.requestedItems or {}) do
+        local itemId = type(row) == "table" and tonumber(row.itemId) or nil
+        if IsItemId(itemId) then
+            rows[#rows + 1] = {
+                itemId = itemId,
+                text = tostring(itemId),
+                canRemove = asAdmin and true or false,
             }
         end
     end
+    table.sort(rows, function(a, b) return a.itemId < b.itemId end)
     local guildText = "No guild configured."
     if cfg.guild and cfg.guild.guid then
         guildText = string.format("%s (%s) · tab %s", cfg.guild.name ~= "" and cfg.guild.name or cfg.guild.guid, cfg.guild.guid, tostring(cfg.bankTab or ""))
     end
     return {
         isAdmin = asAdmin and true or false,
-        isCrafter = crafter,
         canEditGuild = asAdmin and true or false,
         guildLocked = cfg.guild ~= nil and cfg.guild.guid ~= nil,
         canClear = asAdmin and true or false,
-        canManageCrafters = asAdmin and true or false,
+        canManageItems = asAdmin and true or false,
         guildText = guildText,
         bankTab = cfg.bankTab,
-        crafters = crafterRows,
-        assignments = rows,
-        custody = custody,
+        requestedItems = rows,
         clearWarning = C.ClearConfirmation(profile),
-        selfCrafter = crafter and Norm(actor) or nil,
     }
 end
 
 function C.BuildDonationPlan(profile, carried, ctx)
-    local Routing = SF.ConsumablesRouting
     ctx = ctx or {}
     local cfg = C.Ensure(profile)
     local lines = {}
@@ -2415,48 +1876,19 @@ function C.BuildDonationPlan(profile, carried, ctx)
         local row = carried[i]
         local itemId = tonumber(row.itemId)
         local quantity = math.floor(tonumber(row.quantity) or 0)
-        if C.IsRequested(profile, itemId) and quantity > 0 then
-            local crafters = C.AssignedCrafters(profile, itemId)
-            local totals = {}
-            for c = 1, #crafters do
-                totals[crafters[c]] = C.ReceiptTotal(profile, itemId, crafters[c])
-            end
-            local recipient = Routing.RouteItem(crafters, totals, ctx.inGroup or {}, ctx.compatible or {})
-            local assignment = cfg.assignments[tostring(itemId)]
+        if C.IsRequested(profile, itemId) and quantity > 0 and ctx.guildBankUsable then
             lines[#lines + 1] = {
                 itemId = itemId,
                 quantity = quantity,
                 quality = row.quality,
                 name = row.name,
-                recipient = recipient,
-                inRange = recipient and Routing.Flag(ctx.inRange, recipient) or false,
-                epoch = assignment and tonumber(assignment.epoch) or 0,
                 generation = cfg.generation,
-                guildBank = ctx.guildBankUsable and true or false,
+                guildBank = true,
             }
         end
     end
-    local groups = {}
-    local order = {}
-    for i = 1, #lines do
-        local line = lines[i]
-        local key = line.recipient
-        if not key and line.guildBank then
-            key = "Guild Bank"
-        end
-        if key then
-            if not groups[key] then
-                groups[key] = { key = key, lines = {} }
-                order[#order + 1] = key
-            end
-            groups[key].lines[#groups[key].lines + 1] = line
-        end
-    end
-    local grouped = {}
-    for i = 1, #order do
-        grouped[i] = groups[order[i]]
-    end
-    return { lines = lines, groups = grouped }
+    table.sort(lines, function(a, b) return a.itemId < b.itemId end)
+    return { lines = lines, groups = { { key = "Guild Bank", lines = lines } } }
 end
 
 function C.RevalidateDonation(profile, line, ctx, inventoryQty)
@@ -2470,33 +1902,12 @@ function C.RevalidateDonation(profile, line, ctx, inventoryQty)
     if not C.IsRequested(profile, line.itemId) then
         return false, "That item is no longer requested."
     end
-    local assignment = cfg.assignments[tostring(line.itemId)]
-    if not assignment or tonumber(assignment.epoch) ~= tonumber(line.epoch) then
-        return false, "Routing changed. Review the donation again."
-    end
     inventoryQty = math.floor(tonumber(inventoryQty) or 0)
     if inventoryQty < math.floor(tonumber(line.quantity) or 0) then
         return false, "You no longer have that many."
     end
-    if line.recipient then
-        local Routing = SF.ConsumablesRouting
-        local totals = {}
-        local crafters = C.AssignedCrafters(profile, line.itemId)
-        for i = 1, #crafters do
-            totals[crafters[i]] = C.ReceiptTotal(profile, line.itemId, crafters[i])
-        end
-        local recipient = Routing.RouteItem(crafters, totals, (ctx and ctx.inGroup) or {}, (ctx and ctx.compatible) or {})
-        if recipient ~= line.recipient then
-            return false, "The recipient changed. Review the donation again."
-        end
-        if not (ctx and Routing and Routing.Flag(ctx.inRange, line.recipient)) then
-            return false, "That Crafter is out of trade range."
-        end
-        if not (ctx and Routing and Routing.Flag(ctx.compatible, line.recipient)) then
-            return false, "That Crafter is not running a compatible client."
-        end
-    elseif not (ctx and ctx.guildBankUsable) then
-        return false, "No donation path is available."
+    if not (ctx and ctx.guildBankUsable) then
+        return false, "No Guild Bank donation path is available."
     end
     return true
 end
@@ -2513,64 +1924,6 @@ function C.ItemIdFromText(text)
     end
     if not IsItemId(id) then return nil end
     return id
-end
-
-function C.FreezeTrade(profile, donor, receiver, lines, token)
-    donor = Norm(donor)
-    receiver = Norm(receiver)
-    local cfg = C.Ensure(profile)
-    local custody = C.Project(profile).custody
-    local wanted = {}
-    local function mark(itemId)
-        itemId = tonumber(itemId)
-        if IsItemId(itemId) then
-            wanted[itemId] = true
-        end
-    end
-    local requested = C.RequestedItemIds(profile)
-    for i = 1, #requested do
-        mark(requested[i])
-    end
-    for c = 1, #custody do
-        local entry = custody[c]
-        if Same(entry.holder, donor) then
-            mark(entry.itemId)
-        end
-    end
-    for i = 1, #(lines or {}) do
-        local line = lines[i]
-        if type(line) == "table" then
-            mark(line.itemId)
-        end
-    end
-    local items = {}
-    for itemId in pairs(wanted) do
-        local custodyQty = 0
-        for c = 1, #custody do
-            local entry = custody[c]
-            if entry.itemId == itemId and Same(entry.holder, donor) then
-                custodyQty = entry.quantity
-            end
-        end
-        local assignment = cfg.assignments[tostring(itemId)]
-        items[itemId] = {
-            assignedToReceiver = C.CrafterHasItem(profile, receiver, itemId),
-            donorAssigned = C.CrafterHasItem(profile, donor, itemId),
-            epoch = assignment and tonumber(assignment.epoch) or 0,
-            custodyQty = custodyQty,
-        }
-    end
-    return {
-        profileId = profile._profileId,
-        generation = cfg.generation,
-        donor = donor,
-        receiver = receiver,
-        donorIsAdmin = C.IsCanonicalAdmin(profile, donor),
-        receiverIsAdmin = C.IsCanonicalAdmin(profile, receiver),
-        items = items,
-        token = token,
-        timestamp = Now(),
-    }
 end
 
 if SF.LootProfile then

@@ -6,7 +6,7 @@ local Page = {
 	parentId = "lootHelper",
 	name = "Raid Consumable Logs",
 	navLabel = "Consumable Logs",
-	description = "Review raid-supply donations, receipts, custody, and configuration clears.",
+	description = "Review raid-supply Guild Bank donations and configuration clears.",
 	order = 23.7,
 }
 
@@ -96,7 +96,7 @@ end
 local function HistoryHelp()
 	local limit = PageSize()
 	return string.format(
-		"Newest entries are first. Each page shows up to %d entries, including custody and configuration clears from every generation. Older pages stay available.",
+		"Newest entries are first. Each page shows up to %d entries, including Guild Bank donations and configuration clears from every generation. Older pages stay available.",
 		limit
 	)
 end
