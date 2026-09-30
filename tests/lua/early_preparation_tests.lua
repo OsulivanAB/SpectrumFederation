@@ -1162,10 +1162,15 @@ local claimPersist = {
 	sessionId = "session-a",
 	profileId = "profile-a",
 }
+local wallClock = 1700000000
+GetServerTime = function()
+	return wallClock
+end
 EarlyPrep:WritePersisted(claimPersist)
 assertTrue(type(claimPersist.prepClaims) == "table", "in-flight claims are written to the session record")
 assertEq(claimPersist.prepClaims[1].memberId, "Ivy-Realm", "persisted claims keep the member")
 assertTrue(claimPersist.prepClaims[1].remaining > 0, "persisted claims keep remaining TTL")
+assertTrue(type(claimPersist.prepClaims[1].expiresAtWall) == "number", "persisted claims keep absolute wall expiry")
 
 local hb = EarlyPrep:HeartbeatPayload()
 assertTrue(type(hb) == "table" and type(hb.claims) == "table", "coordinator heartbeat carries in-flight claims")
@@ -1190,6 +1195,55 @@ SF.LootHelperSync.state.isCoordinator = true
 SF.LootHelperSync.state.coordEpoch = 7
 assertTrue(EarlyPrep:RestorePersistedClaims(claimPersist.prepClaims), "restore reinstalls persisted claims for a coordinator")
 assertTrue(EarlyPrep:_FindClaim("Ivy-Realm") ~= nil, "restored claims remain reserved")
+
+-- Absolute wall expiry prevents resurrecting a failsafe-elapsed lease on reload.
+local stalePersist = {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	prepClaims = {
+		{
+			memberId = "Jules-Realm",
+			claimer = "Admin-Realm",
+			requestId = "stale",
+			coordEpoch = 7,
+			source = "pre",
+			remaining = EarlyPrep.CLAIM_FAILSAFE_SECONDS,
+			expiresAtWall = wallClock - 1,
+		},
+	},
+}
+EarlyPrep._claims = nil
+EarlyPrep._remoteClaimSnapshot = nil
+assertTrue(not EarlyPrep:RestorePersistedClaims(stalePersist.prepClaims), "a wall-expired claim is not restored")
+assertTrue(EarlyPrep:_FindClaim("Jules-Realm") == nil, "a wall-expired claim stays closed after reload")
+
+-- Adopting under the old epoch then bumping must not drop transferred leases.
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+EarlyPrep._claims = nil
+EarlyPrep._remoteClaimSnapshot = {
+	{
+		memberId = "Kate-Realm",
+		claimer = "Admin-Realm",
+		requestId = "takeover-lease",
+		source = "pre",
+		remaining = 90,
+	},
+}
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordEpoch = 8
+assertTrue(EarlyPrep:AdoptRemoteClaims("takeover"), "takeover adopts under the new epoch")
+local _, kate = EarlyPrep:_FindClaim("Kate-Realm")
+assertTrue(kate ~= nil, "takeover keeps the adopted lease")
+assertEq(kate.coordEpoch, 8, "takeover stamps the new coordinator epoch")
+local afterTakeover = {
+	sessionId = "session-a",
+	profileId = "profile-a",
+}
+EarlyPrep:WritePersisted(afterTakeover)
+assertTrue(type(afterTakeover.prepClaims) == "table", "takeover persist keeps adopted claims")
+assertEq(afterTakeover.prepClaims[1].memberId, "Kate-Realm", "takeover persist names the reserved member")
 
 IsInRaid = function()
 	return false

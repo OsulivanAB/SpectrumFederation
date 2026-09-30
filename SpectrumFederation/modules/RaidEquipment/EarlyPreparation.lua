@@ -13,7 +13,7 @@
 -- stored on the session record so a reload or coordinator change does not send a
 -- second missing-requirements whisper. It is not profile history.
 --
--- luacheck: globals SpectrumFederationDB IsInRaid GetTime
+-- luacheck: globals SpectrumFederationDB IsInRaid GetTime GetServerTime time
 
 local _, SF = ...
 
@@ -1228,6 +1228,18 @@ function EarlyPrep:_Now()
 	return 0
 end
 
+-- Wall-clock time for persisted claim expiry across reload. GetTime alone is
+-- not reliable once SavedVariables outlive the runtime lease table.
+function EarlyPrep:_WallNow()
+	if GetServerTime then
+		return GetServerTime()
+	end
+	if time then
+		return time()
+	end
+	return nil
+end
+
 function EarlyPrep:_CurrentCoordEpoch()
 	local sync = SF.LootHelperSync
 	if sync and sync.state then
@@ -1256,12 +1268,15 @@ function EarlyPrep:_ClaimCount()
 end
 
 -- Remaining-TTL snapshot for persistence and coordinator heartbeat transfer.
+-- Persistence also carries absolute wall-clock expiry so a reload cannot
+-- resurrect a lease after its failsafe has already elapsed.
 function EarlyPrep:ClaimsSnapshot()
 	self:ExpireWarningClaims()
 	if type(self._claims) ~= "table" then
 		return nil
 	end
 	local now = self:_Now()
+	local wallNow = self:_WallNow()
 	local out = {}
 	local count = 0
 	for memberId, claim in pairs(self._claims) do
@@ -1282,7 +1297,7 @@ function EarlyPrep:ClaimsSnapshot()
 				if remaining > EarlyPrep.CLAIM_FAILSAFE_SECONDS then
 					remaining = EarlyPrep.CLAIM_FAILSAFE_SECONDS
 				end
-				out[#out + 1] = {
+				local entry = {
 					memberId = memberId,
 					claimer = claim.claimer,
 					requestId = claim.requestId,
@@ -1290,6 +1305,10 @@ function EarlyPrep:ClaimsSnapshot()
 					source = claim.source,
 					remaining = remaining,
 				}
+				if type(wallNow) == "number" then
+					entry.expiresAtWall = wallNow + remaining
+				end
+				out[#out + 1] = entry
 			end
 		end
 	end
@@ -1306,6 +1325,7 @@ function EarlyPrep:_NormalizeClaimEntries(claims)
 	if type(claims) ~= "table" then
 		return nil
 	end
+	local wallNow = self:_WallNow()
 	local out = {}
 	local function consider(entry)
 		if #out >= EarlyPrep.MAX_CLAIMS then
@@ -1317,7 +1337,13 @@ function EarlyPrep:_NormalizeClaimEntries(claims)
 		if type(entry.claimer) ~= "string" or entry.claimer == "" then
 			return
 		end
-		local remaining = tonumber(entry.remaining)
+		local remaining = nil
+		local expiresAtWall = tonumber(entry.expiresAtWall)
+		if type(expiresAtWall) == "number" and type(wallNow) == "number" then
+			remaining = expiresAtWall - wallNow
+		else
+			remaining = tonumber(entry.remaining)
+		end
 		if type(remaining) ~= "number" or remaining <= 0 then
 			return
 		end
@@ -1331,6 +1357,7 @@ function EarlyPrep:_NormalizeClaimEntries(claims)
 			coordEpoch = tonumber(entry.coordEpoch),
 			source = entry.source,
 			remaining = remaining,
+			expiresAtWall = expiresAtWall,
 		}
 	end
 	if #claims > 0 then
@@ -1467,6 +1494,13 @@ function EarlyPrep:ExpireWarningClaims(now)
 		if next(self._pendingWhispers) == nil then
 			self._pendingWhispers = nil
 		end
+	end
+	-- Keep SavedVariables aligned when runtime expiry drops leases, without
+	-- re-entering through ClaimsSnapshot → ExpireWarningClaims.
+	if changed and not self._persistingClaims then
+		self._persistingClaims = true
+		self:PersistActive()
+		self._persistingClaims = false
 	end
 	return changed
 end

@@ -1161,17 +1161,20 @@ function Sync:TakeoverSession(sessionId, profileId, reason, opts)
     self.state.coordinator = me
     self.state.isCoordinator = true
 
-    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
-    if earlyPrep and earlyPrep.Notify then
-        earlyPrep:Notify("takeover")
-    end
-
-    -- Ensure strictly increasing epoch
+    -- Ensure a strictly increasing epoch before Early Preparation adopts
+    -- transferred warning claims. Adopting under the predecessor epoch lets the
+    -- following persist path expire those leases immediately.
     local newEpoch = self:_Now()
     if newEpoch <= oldEpoch then
         newEpoch = oldEpoch + 1
     end
     self.state.coordEpoch = newEpoch
+
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("takeover")
+    end
+
     -- Adopt this client's last accepted RC seq so the first post-takeover
     -- SET continues from local accepted state. Peers compare (coordEpoch, seq),
     -- so a colliding seq after a missed SET is still accepted under the new epoch.

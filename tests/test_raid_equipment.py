@@ -287,8 +287,15 @@ def test_early_preparation_whispers_production_lua():
     assert "function EarlyPrep:AbandonWarningClaim" in source
     assert "function EarlyPrep:AdoptRemoteClaims" in source
     assert "function EarlyPrep:ClaimsSnapshot" in source
+    assert "expiresAtWall" in source
+    assert "function EarlyPrep:_WallNow" in source
     assert 'RC.CallEarlyPrep("Notify", "world")' in raid_check
     assert "reannounceExhausted" in raid_check
+    public_api = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "18_PublicAPI.lua"
+    ).read_text(encoding="utf-8")
+    takeover = public_api.split("function Sync:TakeoverSession", 1)[1].split("\nfunction ", 1)[0]
+    assert takeover.index("self.state.coordEpoch = newEpoch") < takeover.index('earlyPrep:Notify("takeover")')
 
 
 def test_parent_toc_loads_raid_equipment_modules():
