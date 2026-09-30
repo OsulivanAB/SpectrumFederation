@@ -251,15 +251,28 @@ def test_early_preparation_whispers_production_lua():
     stamp_fn = raid_check.split("function RC:GetPreparationObservationStamp", 1)[1]
     stamp_fn = stamp_fn.split("\nfunction RC:", 1)[0]
     assert "GetItemDataGeneration()" in stamp_fn
+    assert "GetLocalEquipmentGeneration()" in stamp_fn
     assert "GetTroubleshootingVersion()" not in stamp_fn
     assert 'RC.CallEarlyPrep("InvalidateObservationSkips"' in raid_check
     assert "_InvalidateLocalTroubleshootingSnapshot()" in raid_check.split(
         "function RC:_ApplyTooltipDataRefresh", 1
     )[1].split("\nfunction ", 1)[0]
     assert "_BumpItemDataGeneration()" in raid_check
+    assert "localEquipmentGeneration" in raid_check
     assert "function EarlyPrep:RestoreOutboundPending" in source
     assert "function EarlyPrep:InvalidateObservationSkips" in source
     assert "function EarlyPrep:BeginMissingWhisper" in source
+    assert "CLAIM_FAILSAFE_SECONDS" in source
+    assert "ReleaseClaimsForWarned" in source
+    assert "IsEffectiveAdmin" in source.split("function EarlyPrep:CompleteClaimedWhisper", 1)[1].split(
+        "\nfunction ", 1
+    )[0]
+    assert "PROTO_CURRENT = 5" in (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "SyncProtocol.lua"
+    ).read_text(encoding="utf-8")
+    assert "PROTO_VERSION = 5" in (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
+    ).read_text(encoding="utf-8")
     assert "PREP_WARN_CLAIM_REQ" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
     ).read_text(encoding="utf-8")

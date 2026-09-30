@@ -1078,6 +1078,7 @@ function RC:_GetInspectState()
 		localSnapshot = nil,
 		snapshotVersion = 0,
 		itemDataGeneration = 0,
+		localEquipmentGeneration = 0,
 		lastNotifiedVersion = -1,
 		backgroundInspectEnabled = false,
 		backgroundInspectConsumers = {},
@@ -1373,8 +1374,14 @@ function RC:GetItemDataGeneration()
 	return state.itemDataGeneration or 0
 end
 
+function RC:GetLocalEquipmentGeneration()
+	local state = self:_GetInspectState()
+	return state.localEquipmentGeneration or 0
+end
+
 function RC:_InvalidateLocalTroubleshootingSnapshot()
 	local state = self:_GetInspectState()
+	state.localEquipmentGeneration = (state.localEquipmentGeneration or 0) + 1
 	state.localSnapshot = nil
 end
 
@@ -2107,8 +2114,12 @@ function RC:GetPreparationObservationStamp(memberId, cfg)
 	end
 	local configStamp = PreparationConfigStamp(cfg)
 	if IsSelfMemberId(memberId) then
+		-- Local equipment generation changes when PLAYER_EQUIPMENT_CHANGED (or
+		-- another path) invalidates the local snapshot, so a memoized prepared
+		-- self result cannot skip recapture after a real gear change.
 		return table.concat({
 			"self",
+			tostring(self:GetLocalEquipmentGeneration()),
 			tostring(self:GetItemDataGeneration()),
 			configStamp,
 		}, "|")

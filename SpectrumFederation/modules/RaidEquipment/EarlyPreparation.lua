@@ -32,8 +32,11 @@ local EarlyPrep = {
 	MAX_OUTBOUND_BURST = 12,
 	OUTBOUND_BACKOFF_HEARTBEATS = 4,
 	-- Coordinator-serialized exclusive claims before a missing-requirements whisper.
-	-- Claims are session-scoped, coordinator-epoch-aware, and expire if unused.
+	-- Claims are session-scoped and coordinator-epoch-aware. Pending ACK waits use
+	-- CLAIM_TTL_SECONDS; granted coordinator leases use CLAIM_FAILSAFE_SECONDS and
+	-- are released when the warning is recorded (or the epoch/session ends).
 	CLAIM_TTL_SECONDS = 20,
+	CLAIM_FAILSAFE_SECONDS = 300,
 	MAX_CLAIMS = 40,
 	MAX_PENDING_WHISPERS = 40,
 }
@@ -1096,6 +1099,9 @@ function EarlyPrep:ApplyHeartbeat(sessionId, profileId, prepNotice)
 		warned = prepNotice.warned,
 		raidCheckBegun = prepNotice.raidCheckBegun == true,
 	})
+	if accepted then
+		self:ReleaseClaimsForWarned()
+	end
 	if accepted and changed then
 		self:PersistActive()
 	end
@@ -1165,6 +1171,7 @@ function EarlyPrep:HandlePrepNotice(sender, payload)
 	if not accepted then
 		return
 	end
+	self:ReleaseClaimsForWarned()
 	self:ObserveRemoteCoverage(payload, sender)
 	if changed then
 		self:PersistActive()
@@ -1229,9 +1236,13 @@ function EarlyPrep:ExpireWarningClaims(now)
 	local changed = false
 	if type(self._claims) == "table" then
 		for memberId, claim in pairs(self._claims) do
+			-- Granted leases stay reserved until the warning is recorded, the
+			-- coordinator epoch changes, or a long failsafe elapses. A short
+			-- wall-clock TTL would reopen the member before PREP_NOTICE retries.
 			local expired = type(claim) ~= "table"
-				or (type(claim.expiresAt) == "number" and claim.expiresAt <= now)
 				or (epoch ~= nil and claim.coordEpoch ~= nil and claim.coordEpoch ~= epoch)
+				or (type(claim.expiresAt) == "number" and claim.expiresAt <= now)
+				or EarlyPrep.IsWarned(self.notice, memberId)
 			if expired then
 				self._claims[memberId] = nil
 				changed = true
@@ -1266,6 +1277,22 @@ function EarlyPrep:ReleaseWarningClaim(memberId, reason)
 	end
 	DebugVerbose("Released warning claim for %s (%s)", tostring(memberId), tostring(reason or "release"))
 	return true
+end
+
+-- Drop coordinator leases once the warned set covers those members.
+function EarlyPrep:ReleaseClaimsForWarned()
+	if type(self._claims) ~= "table" then
+		return false
+	end
+	local changed = false
+	for memberId in pairs(self._claims) do
+		if EarlyPrep.IsWarned(self.notice, memberId) then
+			if self:ReleaseWarningClaim(memberId, "warned") then
+				changed = true
+			end
+		end
+	end
+	return changed
 end
 
 function EarlyPrep:_NewClaimRequestId()
@@ -1351,7 +1378,7 @@ function EarlyPrep:_GrantLocalClaim(memberId, claimer, requestId, source)
 		claimer = claimer,
 		requestId = requestId,
 		coordEpoch = epoch,
-		expiresAt = self:_Now() + EarlyPrep.CLAIM_TTL_SECONDS,
+		expiresAt = self:_Now() + EarlyPrep.CLAIM_FAILSAFE_SECONDS,
 		source = source,
 	}
 	return true, why
@@ -1482,13 +1509,17 @@ function EarlyPrep:CompleteClaimedWhisper(memberId, source, missing)
 		self:ReleaseWarningClaim(memberId, "already_warned")
 		return false
 	end
+	local profile = self:GetSessionProfile()
+	if not profile or not self:IsEffectiveAdmin(profile) then
+		self:ReleaseWarningClaim(memberId, "not_admin")
+		return false
+	end
 	local raidCheck = SF.RaidCheck
 	if not raidCheck or type(raidCheck.DeliverMissingRequirementsWhisper) ~= "function" then
 		self:ReleaseWarningClaim(memberId, "no_sender")
 		return false
 	end
-	local profile = self:GetSessionProfile()
-	local cfg = profile and type(profile.GetRaidCheckConfig) == "function" and profile:GetRaidCheckConfig() or nil
+	local cfg = type(profile.GetRaidCheckConfig) == "function" and profile:GetRaidCheckConfig() or nil
 	local mode = source
 	if mode ~= "pre" and mode ~= "raid" then
 		mode = "pre"

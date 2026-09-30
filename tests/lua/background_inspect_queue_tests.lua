@@ -302,6 +302,10 @@ local afterItemData = RC:GetPreparationObservationStamp("A-Realm", {
 	slots = { head = true },
 })
 assertTrue(afterItemData ~= beforeDirty, "item-data generation changes the remote observation stamp")
+local genBefore = RC:GetLocalEquipmentGeneration()
+RC:_InvalidateLocalTroubleshootingSnapshot()
+local genAfter = RC:GetLocalEquipmentGeneration()
+assertTrue(genAfter > genBefore, "invalidating the local snapshot bumps local equipment generation")
 local EarlyPrep = SF.RaidEquipment.EarlyPreparation
 EarlyPrep._skipStamp = { ["A-Realm"] = stamp }
 RC:_ApplyTooltipDataRefresh()

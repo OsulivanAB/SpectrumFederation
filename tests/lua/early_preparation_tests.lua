@@ -1006,6 +1006,72 @@ SF.LootHelperSync.state.coordEpoch = 7
 EarlyPrep:ExpireWarningClaims(0)
 assertTrue(EarlyPrep:_FindClaim("Eve-Realm") == nil, "claims from an older coordinator epoch expire")
 
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+SF.LootHelperSync.state.coordEpoch = 7
+local grantNow = EarlyPrep:_Now()
+EarlyPrep._claims = {
+	["Frank-Realm"] = {
+		claimer = "Admin-Realm",
+		requestId = "live",
+		coordEpoch = 7,
+		expiresAt = grantNow + EarlyPrep.CLAIM_FAILSAFE_SECONDS,
+		source = "pre",
+	},
+}
+EarlyPrep:ExpireWarningClaims(grantNow + 30)
+assertTrue(EarlyPrep:_FindClaim("Frank-Realm") ~= nil, "a short wall-clock wait does not drop an unconverged grant")
+EarlyPrep:ExpireWarningClaims(grantNow + EarlyPrep.CLAIM_FAILSAFE_SECONDS + 1)
+assertTrue(EarlyPrep:_FindClaim("Frank-Realm") == nil, "the failsafe eventually releases an unconverged grant")
+EarlyPrep._claims = {
+	["Frank-Realm"] = {
+		claimer = "Admin-Realm",
+		requestId = "live2",
+		coordEpoch = 7,
+		expiresAt = grantNow + EarlyPrep.CLAIM_FAILSAFE_SECONDS,
+		source = "pre",
+	},
+}
+EarlyPrep.MarkWarned(EarlyPrep.notice, "Frank-Realm")
+EarlyPrep:ReleaseClaimsForWarned()
+assertTrue(EarlyPrep:_FindClaim("Frank-Realm") == nil, "recording the warning releases the coordinator claim")
+
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+claimWhispers = 0
+EarlyPrep._pendingWhispers = {
+	["Admin-Realm:prepclaim:admin-lost"] = {
+		memberId = "Gina-Realm",
+		source = "pre",
+		missing = { "gem" },
+		expiresAt = 1e9,
+	},
+}
+SF.LootHelperSync.FindLocalProfileById = function()
+	return {
+		id = "profile-a",
+		IsCurrentUserAdmin = function()
+			return false
+		end,
+		GetRaidCheckConfig = function()
+			return { checkGemsInSockets = true, slots = { head = true } }
+		end,
+	}
+end
+EarlyPrep:HandlePrepWarnClaimAck("Helper-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Gina-Realm",
+	requestId = "Admin-Realm:prepclaim:admin-lost",
+	granted = true,
+	coordinator = "Helper-Realm",
+	coordEpoch = 7,
+})
+assertEq(claimWhispers, 0, "a granted claim does not whisper after admin authority is lost")
+assertTrue(not EarlyPrep:WasWarned("Gina-Realm"), "a lost-admin completion does not record a warning")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
 	os.exit(1)
