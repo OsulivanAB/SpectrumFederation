@@ -647,6 +647,7 @@ SF.LootHelperSync.IsSenderAuthorized = function(_, profileId, sender)
 	return profileId == "profile-a" and (sender == "Admin-Realm" or sender == "Helper-Realm")
 end
 SF.LootHelperSync.state.isCoordinator = false
+SF.LootHelperSync.state.coordinator = "Admin-Realm"
 EarlyPrep.notice = EarlyPrep.NewNotice()
 EarlyPrep.notice.sessionId = "session-a"
 EarlyPrep.notice.profileId = "profile-a"
@@ -660,20 +661,44 @@ assertEq(sentKinds[1].kind, "snapshot", "the outbound retry publishes a snapshot
 EarlyPrep:ObserveRemoteCoverage({
 	warned = { "Cara-Realm" },
 	raidCheckBegun = false,
-})
+}, "Admin-Realm")
 assertTrue(EarlyPrep._outboundPending == true, "a coordinator heartbeat missing Bob keeps outbound pending")
 assertTrue(EarlyPrep:NoteRaidCheckBegun("session-a", "profile-a"), "a non-coordinator can note raid check begun")
 assertTrue(EarlyPrep._outboundPending == true, "raid check begun stays pending until covered")
 EarlyPrep:ObserveRemoteCoverage({
 	warned = { "Bob-Realm" },
+	raidCheckBegun = true,
+}, "Helper-Realm")
+assertTrue(EarlyPrep._outboundPending == true, "a covering peer-admin notice does not clear outbound pending")
+EarlyPrep:ObserveRemoteCoverage({
+	warned = { "Bob-Realm" },
 	raidCheckBegun = false,
-})
+}, "Admin-Realm")
 assertTrue(EarlyPrep._outboundPending == true, "a partial coordinator heartbeat keeps the outbound pending")
 EarlyPrep:ObserveRemoteCoverage({
 	warned = { "Bob-Realm" },
 	raidCheckBegun = true,
-})
+}, "Admin-Realm")
 assertTrue(not EarlyPrep._outboundPending, "a covering coordinator snapshot clears outbound pending")
+
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+EarlyPrep:ClearOutboundPending()
+assertTrue(EarlyPrep:CommitWarned("Bob-Realm", "burst"), "a burst warning records Bob")
+sentKinds = {}
+for _ = 1, EarlyPrep.MAX_OUTBOUND_BURST do
+	EarlyPrep:RetryOutboundNotice("heartbeat")
+end
+assertEq(#sentKinds, EarlyPrep.MAX_OUTBOUND_BURST, "the initial burst retries every heartbeat")
+sentKinds = {}
+for _ = 1, EarlyPrep.OUTBOUND_BACKOFF_HEARTBEATS - 1 do
+	EarlyPrep:RetryOutboundNotice("heartbeat")
+end
+assertEq(#sentKinds, 0, "backoff skips heartbeats after the burst")
+EarlyPrep:RetryOutboundNotice("heartbeat")
+assertEq(#sentKinds, 1, "backoff still publishes after the interval")
+assertTrue(EarlyPrep._outboundPending == true, "backoff keeps the publish obligation until covered")
 
 SF.LootHelperSync.state.isCoordinator = false
 EarlyPrep:ClearOutboundPending()

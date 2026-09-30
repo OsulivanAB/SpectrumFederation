@@ -27,8 +27,10 @@ local EarlyPrep = {
 	-- character cannot fill the map by forging other names.
 	MAX_DEFERRED_SENDERS = 40,
 	-- Non-coordinator admins retry PREP_NOTICE until a coordinator heartbeat
-	-- covers their local warned / raid-check state.
-	MAX_OUTBOUND_RETRIES = 12,
+	-- covers their local warned / raid-check state. The first burst is every
+	-- heartbeat; later attempts back off to limit chat spam without giving up.
+	MAX_OUTBOUND_BURST = 12,
+	OUTBOUND_BACKOFF_HEARTBEATS = 4,
 }
 SF.RaidEquipment.EarlyPreparation = EarlyPrep
 
@@ -751,6 +753,7 @@ function EarlyPrep:OnSessionReset(reason)
 	self._deferredNotices = nil
 	self._outboundPending = false
 	self._outboundAttempts = 0
+	self._outboundHeartbeatSkip = 0
 	self._skipStamp = nil
 	self._evaluating = false
 	self._refreshing = false
@@ -868,19 +871,38 @@ end
 function EarlyPrep:ClearOutboundPending()
 	self._outboundPending = false
 	self._outboundAttempts = 0
+	self._outboundHeartbeatSkip = 0
 end
 
 function EarlyPrep:MarkOutboundPending()
 	self._outboundPending = true
 	self._outboundAttempts = 0
+	self._outboundHeartbeatSkip = 0
 end
 
-function EarlyPrep:ObserveRemoteCoverage(prepNotice)
+function EarlyPrep:SenderIsCoordinator(sender)
+	local sync = SF.LootHelperSync
+	if not sync or not sync.state or type(sender) ~= "string" or sender == "" then
+		return false
+	end
+	local coordinator = sync.state.coordinator
+	if type(coordinator) ~= "string" or coordinator == "" then
+		return false
+	end
+	return EarlyPrep.SameMember(sender, coordinator)
+end
+
+-- Only coordinator-authored coverage clears the publish obligation. A peer
+-- admin snapshot can match local state without the coordinator having it.
+function EarlyPrep:ObserveRemoteCoverage(prepNotice, sender)
 	if not self._outboundPending then
 		return
 	end
 	if not self:HasShareableNotice() then
 		self:ClearOutboundPending()
+		return
+	end
+	if not self:SenderIsCoordinator(sender) then
 		return
 	end
 	if EarlyPrep.RemoteCoversLocal(self.notice, prepNotice) then
@@ -899,9 +921,17 @@ function EarlyPrep:RetryOutboundNotice(reason)
 		return false
 	end
 	local attempts = tonumber(self._outboundAttempts) or 0
-	if attempts >= EarlyPrep.MAX_OUTBOUND_RETRIES then
+	local interval = 1
+	if attempts >= EarlyPrep.MAX_OUTBOUND_BURST then
+		interval = EarlyPrep.OUTBOUND_BACKOFF_HEARTBEATS
+	end
+	local skip = tonumber(self._outboundHeartbeatSkip) or 0
+	skip = skip + 1
+	if skip < interval then
+		self._outboundHeartbeatSkip = skip
 		return false
 	end
+	self._outboundHeartbeatSkip = 0
 	self._outboundAttempts = attempts + 1
 	DebugVerbose("Retrying preparation notice publish (%s, attempt=%s)", tostring(reason or "retry"), tostring(self._outboundAttempts))
 	return self:BroadcastNotice("snapshot")
@@ -1021,7 +1051,7 @@ function EarlyPrep:AcceptRemotePrepNotice(sender, sessionId, profileId, prepNoti
 		return false
 	end
 	local changed = self:ApplyHeartbeat(sessionId, profileId, prepNotice)
-	self:ObserveRemoteCoverage(prepNotice)
+	self:ObserveRemoteCoverage(prepNotice, sender)
 	return changed
 end
 
@@ -1108,7 +1138,7 @@ function EarlyPrep:HandlePrepNotice(sender, payload)
 	if not accepted then
 		return
 	end
-	self:ObserveRemoteCoverage(payload)
+	self:ObserveRemoteCoverage(payload, sender)
 	if changed then
 		self:PersistActive()
 		DebugVerbose("Applied preparation notice from %s (kind=%s)", tostring(sender), tostring(payload.kind))

@@ -312,6 +312,10 @@ local unblended = { blended = false, slotsByInventory = { [1] = { link = "item" 
 assertEq(RC.InspectFallbackEntry(unblended), unblended, "an unblended entry remains a fallback")
 local unmarked = { slotsByInventory = { [1] = { link = "item" } } }
 assertEq(RC.InspectFallbackEntry(unmarked), unmarked, "an unmarked entry remains a fallback source")
+local blendedPrior = { blended = true, slotsByInventory = { [1] = { link = "item" } }, overallEquippedItemLevel = 700 }
+assertEq(RC.InspectUnresolvedEntry(nil), nil, "a missing cache entry is not unresolved evidence")
+assertEq(RC.InspectUnresolvedEntry(unblended), nil, "an unblended entry is not unresolved evidence")
+assertEq(RC.InspectUnresolvedEntry(blendedPrior), blendedPrior, "a blended entry remains unresolved evidence")
 
 local handlerErrors = {}
 geterrorhandler = function()

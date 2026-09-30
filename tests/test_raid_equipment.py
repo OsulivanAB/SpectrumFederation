@@ -238,8 +238,13 @@ def test_early_preparation_whispers_production_lua():
     inspect_ready_fn = raid_check.split("function RC:_HandleInspectReady", 1)[1]
     inspect_ready_fn = inspect_ready_fn.split("\nfunction RC:", 1)[0]
     assert "RC.InspectFallbackEntry(entry)" in inspect_ready_fn
+    assert "RC.InspectUnresolvedEntry(entry)" in inspect_ready_fn
     assert "entry and entry.slotsByInventory" not in inspect_ready_fn
     assert "entry and entry.overallEquippedItemLevel" not in inspect_ready_fn
+    assert "SenderIsCoordinator" in source
+    assert "OUTBOUND_BACKOFF_HEARTBEATS" in source
+    assert "MAX_OUTBOUND_BURST" in source
+    assert "MAX_OUTBOUND_RETRIES" not in source
     stamp_fn = raid_check.split("function RC:GetPreparationObservationStamp", 1)[1]
     stamp_fn = stamp_fn.split("\nfunction RC:", 1)[0]
     assert "GetTroubleshootingVersion()" in stamp_fn

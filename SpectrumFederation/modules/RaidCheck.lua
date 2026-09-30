@@ -1556,10 +1556,18 @@ function RC:_InvalidateInspectUnit(unit)
 	self:_NotifyTroubleshootingListeners()
 end
 
--- A blended cache entry already reused older slots or item level. Copying from
--- it again can keep the next inspect incomplete forever.
+-- A blended cache entry already reused older slots or item level. It is not a
+-- source of authoritative empty-slot conclusions, but it may still supply
+-- unresolved equipped-slot evidence for the next partial inspect.
 function RC.InspectFallbackEntry(entry)
 	if type(entry) ~= "table" or entry.blended == true then
+		return nil
+	end
+	return entry
+end
+
+function RC.InspectUnresolvedEntry(entry)
+	if type(entry) ~= "table" or entry.blended ~= true then
 		return nil
 	end
 	return entry
@@ -2170,7 +2178,9 @@ function RC:_HandleInspectReady(guid)
 		-- completely blank result.
 		local blended = false
 		local fallbackEntry = RC.InspectFallbackEntry(entry)
-		local fallbackSlots = fallbackEntry and fallbackEntry.slotsByInventory or nil
+		local unresolvedEntry = RC.InspectUnresolvedEntry(entry)
+		local sourceEntry = fallbackEntry or unresolvedEntry
+		local fallbackSlots = sourceEntry and sourceEntry.slotsByInventory or nil
 		if type(fallbackSlots) == "table" then
 			for inventorySlot, fallbackSlot in pairs(fallbackSlots) do
 				if type(inventorySlot) == "number" and type(fallbackSlot) == "table" then
@@ -2178,6 +2188,9 @@ function RC:_HandleInspectReady(guid)
 					local hasNext = SlotHasAnyItemData(nextSlot) or (type(nextSlot) == "table" and nextSlot.texture) or false
 					local hasFallback = SlotHasAnyItemData(fallbackSlot) or fallbackSlot.texture or false
 					if (not hasNext) and hasFallback then
+						-- Copying prior equipped evidence, including from a blended
+						-- entry, keeps the observation non-authoritative until a
+						-- later inspect independently confirms the slot is empty.
 						blended = true
 						local copy = {}
 						for key, value in pairs(fallbackSlot) do
@@ -2198,7 +2211,7 @@ function RC:_HandleInspectReady(guid)
 		local freshItemLevel = CanonicalOverallItemLevel(captured.overallEquippedItemLevel)
 		captured.overallEquippedItemLevel = KeepKnownOverallItemLevel(
 			captured.overallEquippedItemLevel,
-			fallbackEntry and fallbackEntry.overallEquippedItemLevel
+			sourceEntry and sourceEntry.overallEquippedItemLevel
 		)
 		if not freshItemLevel and CanonicalOverallItemLevel(captured.overallEquippedItemLevel) then
 			blended = true
