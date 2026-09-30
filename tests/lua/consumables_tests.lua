@@ -821,6 +821,12 @@ local function checkAccounting()
     assertEq(pageTotal, 2, "paginated history totals only displayable rows")
     assertEq(#page, 1, "paginated history returns the requested page size")
     assertTrue(contains(page[1].text, "DonorAlt-Realm"), "the first page shows the newest displayable row")
+    local nameCalls = 0
+    C.HistoryRows(p, function()
+        nameCalls = nameCalls + 1
+        return "Aqirite"
+    end, 1, 0)
+    assertEq(nameCalls, 1, "history formats names only for the selected page")
 
     local fullP = configured("accounting-full")
     local cap = C.MAX_LEDGER_EVENTS
@@ -1374,6 +1380,25 @@ local function checkRuntimeDeposit()
     assertEq(fireTimers(), 0, "no timers remain after the deposit")
     local ok, bad = onlyDonationAndReset(p)
     assertTrue(ok, "runtime deposits create no receipt or custody events (" .. tostring(bad) .. ")")
+
+    p = runtimeFixture("rt-deposit-race")
+    world.bankOpen = true
+    startDeposit()
+    assertEq(#world.places, 1, "the first place still lands before a race")
+    -- Another member fills the next precomputed empty targets before continuation.
+    world.bank[2][2] = { itemId = flask, count = 1 }
+    world.bank[2][3] = { itemId = flask, count = 1 }
+    world.bank[2][4] = { itemId = flask, count = 1 }
+    local placesBefore = #world.places
+    drainAfter(32)
+    assertEq(#world.places, placesBefore, "a raced target does not continue placements")
+    assertEq(world.withdrawAttempts, 0, "a raced target never withdraws the foreign bank item")
+    RT:CancelDepositWork()
+    RT.depositIntent = nil
+    if RT.depositTimer and RT.depositTimer.Cancel then RT.depositTimer:Cancel() end
+    RT.depositTimer = nil
+    world.after = {}
+    world.places = {}
 end
 
 local function checkRuntimeDepositPartialAndFailure()

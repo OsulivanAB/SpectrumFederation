@@ -358,6 +358,22 @@ function Sync:RequestProfileSnapshot(reason, opts)
             self:_NoteMissingRoute("_noProfileTargetWarnedFor", "Cannot request profile: no targets available", reason)
             return false
         end
+        -- Same authority rule as helper routing: once the profile is local,
+        -- do not whisper NEED_PROFILE to a coordinator who is no longer an
+        -- authorized route target.
+        local authorized = self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets()
+        if type(authorized) == "table" then
+            local allowed = false
+            for i = 1, #authorized do
+                if self:_SamePlayer(authorized[i], coordinator) then
+                    allowed = true
+                    break
+                end
+            end
+            if not allowed then
+                return false
+            end
+        end
         targets = { coordinator }
     else
         targets = (self._CurrentAuthorizedRoutingTargets and self:_CurrentAuthorizedRoutingTargets())

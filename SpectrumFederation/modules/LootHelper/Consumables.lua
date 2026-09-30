@@ -1311,22 +1311,14 @@ function C.HistoryRows(profile, nameForItem, limit, offset)
         ordered[#ordered + 1] = profile._consumableEvents[i]
     end
     table.sort(ordered, function(a, b) return EventLess(b, a) end)
-    -- Paginate only displayable rows so legacy receipt/custody/trade events do
-    -- not consume page slots or inflate the Logs total.
+    -- Cheap displayability filter first so pagination does not format the full
+    -- ledger. Format and name lookup run only for the selected page.
     local displayable = {}
     for i = 1, #ordered do
         local event = ordered[i]
-        local itemName = nil
-        if type(nameForItem) == "function" then
-            itemName = nameForItem(event.itemId)
-        end
-        local text = C.FormatEvent(event, itemName)
-        if text ~= "" then
-            displayable[#displayable + 1] = {
-                text = text,
-                timestamp = event.timestamp,
-                generation = event.generation,
-            }
+        if type(event) == "table" and (event.type == C.EVENT.RESET
+            or (event.type == C.EVENT.DONATION and event.source == "guildbank")) then
+            displayable[#displayable + 1] = event
         end
     end
     local total = #displayable
@@ -1341,7 +1333,16 @@ function C.HistoryRows(profile, nameForItem, limit, offset)
     end
     local rows = {}
     for i = offset + 1, last do
-        rows[#rows + 1] = displayable[i]
+        local event = displayable[i]
+        local itemName = nil
+        if type(nameForItem) == "function" then
+            itemName = nameForItem(event.itemId)
+        end
+        rows[#rows + 1] = {
+            text = C.FormatEvent(event, itemName),
+            timestamp = event.timestamp,
+            generation = event.generation,
+        }
     end
     return rows, total
 end

@@ -1046,6 +1046,34 @@ function Runtime:PlaceNextDeposit()
                 return
             end
             work.lockWaits = 0
+            -- Continuations (and any later place) can race other bank activity or
+            -- a tab change. Recheck before touching the bag stack so a failed
+            -- target cannot swap a foreign bank item onto the cursor.
+            do
+                local ready = self:ConfiguredBankTabReady({ bankTab = work.tab })
+                local link = GetGuildBankItemLink and GetGuildBankItemLink(work.tab, target.slot)
+                local C = SF.Consumables
+                local slotItem = link and C and C.ItemIdFromText and C.ItemIdFromText(link) or nil
+                local itemId = tonumber(work.line.itemId)
+                local maxStack = self:ItemStackLimit(itemId)
+                local current = self:SlotItemCount(work.tab, target.slot, itemId)
+                local empty = link == nil
+                local sameRoom = slotItem == itemId and maxStack and (maxStack - current) >= take
+                if not ready or (not empty and not sameRoom) then
+                    self:FinalizeDepositWork()
+                    return
+                end
+                if type(target.room) == "number" and not empty then
+                    local liveRoom = maxStack - current
+                    if liveRoom < take then
+                        take = liveRoom
+                    end
+                    if take <= 0 then
+                        self:FinalizeDepositWork()
+                        return
+                    end
+                end
+            end
             if take < stackLeft and container.SplitContainerItem then
                 container.SplitContainerItem(stack.bag, stack.slot, take)
             elseif container.PickupContainerItem then
