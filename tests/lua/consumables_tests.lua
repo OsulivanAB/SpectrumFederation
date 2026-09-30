@@ -1284,6 +1284,12 @@ local function checkRuntimeInventory()
     assertFalse(RT:Transferable(flask), "a soulbound item is not transferable")
     world.bindTypes[flask] = 0
     assertTrue(RT:Transferable(flask), "an unbound item is transferable")
+    world.bindTypes[aqirite] = 2
+    world.boundSlots["0:1"] = true
+    assertTrue(RT:Transferable(aqirite),
+        "Add Item admission uses BindType even when the first bag stack is bound")
+    world.boundSlots["0:1"] = nil
+    world.bindTypes[aqirite] = nil
     world.unknownItems[junk] = true
     local unknown, unknownErr = RT:Transferable(junk)
     assertEq(unknown, nil, "uncached item data is not yet known")

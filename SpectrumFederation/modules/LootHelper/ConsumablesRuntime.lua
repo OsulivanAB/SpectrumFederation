@@ -151,20 +151,15 @@ function Runtime:BindType(itemId)
     return nil
 end
 
+-- Configuration admission for Add Item: item-template BindType only.
+-- Instance binding (soulbound stacks / BoE that later bound) is enforced at
+-- deposit time by PlaceNextDeposit, which skips each bound source stack.
 function Runtime:Transferable(itemId)
     self.pendingItemLoads = self.pendingItemLoads or {}
     local C = SF.Consumables
     itemId = C and C.ItemIdFromText and C.ItemIdFromText(itemId) or tonumber(itemId)
     if not itemId then
         return false, "Enter an item ID or item link."
-    end
-    self:ScanBags()
-    local stacks = self.bagStacks and self.bagStacks[itemId]
-    if stacks and stacks[1] and C_Item and C_Item.IsBound and ItemLocation and ItemLocation.CreateFromBagAndSlot then
-        local loc = ItemLocation:CreateFromBagAndSlot(stacks[1].bag, stacks[1].slot)
-        if loc and C_Item.IsBound(loc) then
-            return false, "That item is not transferable."
-        end
     end
     local bindType = self:BindType(itemId)
     if bindType == nil then
