@@ -55,6 +55,8 @@ Report:
 - validations still recommended but not run
 - release/version concerns, if any
 - remaining blockers or residual risk
-- when code work is done and only human Retail QA remains: state
-  "Implementation and automated validation complete; awaiting human Retail QA"
-  without treating that gate as a code defect or weakening the human checkbox
+- when implementation and applicable automated validation are actually complete
+  and only human Retail QA remains: state "Implementation and automated
+  validation complete; awaiting human Retail QA" without treating that gate as
+  a code defect or weakening the human checkbox. If other blockers remain,
+  report the Retail QA gap alongside them instead of implying completion

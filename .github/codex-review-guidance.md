@@ -514,10 +514,20 @@ A missing live-client test is a **verification gap**, not automatically a defect
 
 Likewise, do not claim a feature is fully verified solely because automated tests pass when meaningful Retail-only behavior remains untested.
 
-If required Retail QA remains, state that clearly as the legitimate handoff
-**"Implementation and automated validation complete; awaiting human Retail QA."**
-That QA-only gate is not another code defect. Do not describe the PR as fully
-merge-ready until that QA is completed. Never fabricate Retail evidence.
+When required Retail QA remains:
+
+- Use the handoff **"Implementation and automated validation complete; awaiting
+  human Retail QA"** only when implementation and applicable automated
+  validation are actually complete and human Retail QA is the remaining gate.
+- Otherwise, report the Retail QA gap alongside other unresolved findings,
+  incomplete work, failed checks, or validation gaps. Do not imply completion.
+- Distinguish successful checks from checks that are legitimately not
+  applicable.
+- Do not claim a code trace or instruction walkthrough is an executed test.
+
+That QA-only gate, when correctly used, is not another code defect. Do not
+describe the PR as fully merge-ready until that QA is completed. Never
+fabricate Retail evidence.
 
 ---
 
