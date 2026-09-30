@@ -57,6 +57,6 @@ Do not treat `nil` as `0`.
 - Do not poll, scan, or query TSM from `OnUpdate`, login, or a timer. Call the adapter when a feature actually needs a value, and reuse that result.
 - Expected misses stay quiet. Unexpected TSM failures are caught, returned as `api_error`, and logged with `SF.Debug:Error` under category `TSM` when debug logging is enabled.
 - Extend `tests/lua/tsm_integration_tests.lua` for adapter behavior. Stub `TSM_API`; do not require TradeSkillMaster.
-- Run `python -m pytest tests/test_tsm_integration.py`.
+- Run `python -m pytest tests/test_tsm_integration.py` (focused suite from the canonical map in root `AGENTS.md`).
 
 Write access to TSM needs its own ticket. Do not add it here.

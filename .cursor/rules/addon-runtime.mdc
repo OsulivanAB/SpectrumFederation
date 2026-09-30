@@ -16,6 +16,7 @@ alwaysApply: false
 - Check `locale/enUS.lua` before introducing new user-facing strings.
 - TradeSkillMaster reads go through `SF.TSM` (`modules/Integrations/TSM.lua`). Follow `.cursor/skills/tsm-integration/SKILL.md` and do not call `TSM_API` from feature code.
 - Inspect existing architecture, callers, and lifecycle before assuming a runtime change is local or safe.
+- Technically risky shared/persisted/cache/queue/sync/retry work needs a brief change contract (authority, guarantee, dependencies, lifecycle, evidence) before implementation. Ordinary local fixes do not. See root `AGENTS.md` and `SpectrumFederation/AGENTS.md`.
 
 ## Client Stability
 
@@ -27,12 +28,16 @@ Idle means idle: a visible page with no state change, user interaction, or inten
 
 Repeated open/close, enable/disable, page switches, and resizes must not accumulate listeners, callbacks, timers, frames, textures, deferred work, inspect requests, or sync work. Resource counts should converge.
 
-Queues, retries, debounces, and deferred work should drain to empty and become idle after the producer stops. Investigate work that generates more work.
+Queues, retries, debounces, and deferred work should drain to empty and become idle after the producer stops. Investigate work that generates more work. Bound retry cadence and lifecycle; do not silently discard a required unfinished obligation to impose a fixed retry count, and do not retry forever without a remaining obligation. Timeout is not proof that an external side effect did not happen.
+
+Caches need authoritative inputs, scoped invalidation, incomplete/stale-data handling, ownership/reset behavior, and tests for both reuse and reevaluation. Incomplete data must not become authoritative solely via fallback, retry, or timeout.
+
+Support performance claims with mechanism, proportionate cost analysis, or focused measurement. Obvious runaway paths need no benchmark; ordinary repeated work is not automatically a freeze. Prefer justified batching/coalescing/caching/incremental work over complex optimization machinery without demonstrated need.
 
 Shared Settings/UI infrastructure (`Section`, `PageBuilder`, Controls, ScrollFrames, sizing/layout helpers, shared refresh) can affect many pages. Look for re-entrancy and inspect major consumers before declaring those changes safe.
 
-For layout, sizing, callbacks, events, timers, listeners, queues, inspection, or sync changes, prefer tests that assert bounded execution and convergence (refresh count settles, listener count does not grow, same-size resize does no extra work, queue reaches zero, disable leaves no ticker). Use existing Lua 5.1 suites; do not invent counters everywhere.
+For layout, sizing, callbacks, events, timers, listeners, queues, inspection, sync, cache, or retry changes, prefer tests that assert bounded execution, convergence, and relevant lifecycle sequences (not merely that no Lua error occurred, and not merely that a helper name exists). Use existing Lua 5.1 suites; do not invent counters everywhere.
 
-Unexpected programming errors should remain visible through WoW's error handler / BugGrabber where practical. `pcall` is fine for cleanup; do not turn expected conditions into fatal errors, and do not hide crashes behind protected calls.
+Unexpected programming errors should remain visible through WoW's error handler / BugGrabber where practical. Protect cleanup and re-entrancy while preserving visibility: neither swallowing errors nor rethrowing before required cleanup is complete recovery.
 
 Full guidance: `SpectrumFederation/AGENTS.md`.
