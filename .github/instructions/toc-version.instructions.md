@@ -2,11 +2,32 @@
 applyTo: "SpectrumFederation/**/*,.github/**/*"
 ---
 
-# TOC Version Bump — Required on Every Change
+# TOC Version Policy
 
-**Any change to files under `SpectrumFederation/` or a packaged child addon MUST be accompanied by a version bump in `SpectrumFederation/SpectrumFederation.toc`, and packaged child TOC Version/Interface values must stay in lockstep.**
+Version bumps follow deterministic `release_required` classification in
+`.github/scripts/classify_promotion_scope.py`, enforced by
+`.github/scripts/check_version_bump.py` when a PR changes packaged addon or
+release-packaging paths.
 
-**Even if your PR only touches `.github/` files** (e.g. workflows, scripts, instruction files), you must still verify that the TOC version is valid for the current branch — and fix it if it is not.
+## When a bump is required
+
+Bump `## Version:` in `SpectrumFederation/SpectrumFederation.toc` (and keep
+packaged child TOC Version/Interface values in lockstep) when the PR changes
+**packaged** addon contents or release packaging metadata, including:
+
+- Lua/XML source that ships in the release zip
+- Media or other assets bundled with the addon
+- TOC metadata that affects the packaged addon
+- `pkgmeta.yaml` when it can change installed layout
+
+Instruction-only, docs-only, workflow/script, and other infra changes —
+including zip-excluded files such as `*/AGENTS.md` — do **not** require a
+version bump when the current TOC version is already valid for the target
+branch. A repair iteration does not automatically require another increment
+when the PR version is already valid and ahead of the base for delivery.
+
+Even when no bump is required, verify that the TOC version format is valid for
+the branch you are targeting, and correct it if it is not.
 
 ## How to bump
 
@@ -18,18 +39,10 @@ applyTo: "SpectrumFederation/**/*,.github/**/*"
    - **main branch** → bump SemVer (patch for bug fixes, minor for new features, major for breaking changes) and drop the `-beta.N` suffix.
      - Example (patch): `0.5.0-beta.4` → `0.5.1`
      - Example (minor): `0.5.0-beta.4` → `0.6.0`
-3. Commit the TOC change alongside your other changes.
+3. Commit the TOC change alongside your other changes when a bump is required.
 
-## When is this required?
+## Do this early when required
 
-This applies whenever you modify **any** file inside `SpectrumFederation/`, including:
-- Lua source files (`.lua`)
-- The TOC file itself (adding new files, changing metadata)
-- Media or other assets bundled with the addon
-
-Additionally, even for PRs that **only** change `.github/` files (workflows, scripts, instruction files, etc.), you must **verify** that the TOC version format is valid for the branch you are on (see rules above), and correct it if not.
-
-## Do this early
-
-Read the current `## Version:` line at the **start** of every task so you know what to increment.  
-Omitting the version bump is a **PR blocker** — do not submit without it.
+When `release_required` applies, read the current `## Version:` line at the
+start of the task so you know what to increment. Omitting a required bump is a
+PR blocker. Full packaging policy: root `AGENTS.md`.

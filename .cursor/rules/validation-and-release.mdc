@@ -5,31 +5,24 @@ alwaysApply: true
 
 # Validation And Release
 
-- Choose validation by changed area instead of guessing:
-  - addon Lua, TOC, workflows, or CI scripts -> `python3 .github/scripts/lint_all.py`
-  - packaging or release behavior -> `python3 .github/scripts/validate_packaging.py`
-  - docs, `README.md`, or `mkdocs.yml` -> `python3 .github/scripts/validate_docs.py`
-  - `wow_interface_sync.py` or parser fixtures/tests -> `python -m pytest tests/test_wow_interface_sync.py`
-  - README Interface badge formatting or `blizzard_api.py` display conversion -> `python -m pytest tests/test_interface_badge.py`
-  - Cursed Surge schedule/map helpers -> `python -m pytest tests/test_cursed_surge_tracker.py`
-  - Settings navigation model or Registry helpers -> `python -m pytest tests/test_settings_navigation.py` (requires `lua5.1`)
-  - Mouse Tracer constants or trail engine -> `python -m pytest tests/test_mouse_tracer.py` (requires `lua5.1`)
-  - TradeSkillMaster adapter -> `python -m pytest tests/test_tsm_integration.py` (requires `lua5.1`)
-  - Loot Helper window minimize/positioning -> `python -m pytest tests/test_loot_helper_window.py` (requires `lua5.1`)
-  - Sync protocol NACK/warning throttling -> `python -m pytest tests/test_sync_protocol.py` (requires `lua5.1`)
-  - RC Loot Council Integration child addon -> `python -m pytest tests/test_rc_loot_council_integration.py`
-  - Loot Logs RC category grouping or BiS outcome display author -> `python -m pytest tests/test_loot_logs_view.py` (requires `lua5.1`)
-  - Settings window impersonation-banner layout -> `python -m pytest tests/test_settings_window_layout.py` (requires `lua5.1`)
-  - Loot Helper impersonation / Preview as Non-Admin -> `python -m pytest tests/test_impersonation.py` (requires `lua5.1`)
-  - Linked character identities -> `python -m pytest tests/test_linked_identity.py` (requires `lua5.1`)
-  - Item-aware BiS reconstruction -> `python -m pytest tests/test_bis_reconstruction.py` (requires `lua5.1`)
-  - Raid Equipment policy or CheckRun -> `python -m pytest tests/test_raid_equipment.py` (requires `lua5.1`)
-  - PR template or `validate_pr_template.py` -> `python -m pytest tests/test_pr_template.py`
-  - Promotion-scope classification or `classify_promotion_scope.py` -> `python -m pytest tests/test_promotion_scope.py`
-  - Version bump comparison or `check_version_bump.py` -> `python -m pytest tests/test_check_version_bump.py`
-- Release classification or Wago publishing -> `python -m pytest tests/test_publish_release.py`
+- Canonical change-area → validation map, validation modes, and packaging/
+  versioning policy: root `AGENTS.md` (Validation Modes, Validation By Change
+  Area, Packaging And Versioning). Do not maintain a second full map here.
+- Choose validation from that map by changed area. Domain skills may name their
+  focused suite without copying the whole repository list.
+- Validation modes: automatic subscription triage is non-executing inspection;
+  authorized implementation/repair/finalization runs required affected checks;
+  readiness assessment reports evidence/gaps and executes only when authorized.
 - Normal development targets `beta`; `main` is for promotion and release workflows.
 - Do not weaken CI to make checks pass.
 - Keep the job name in `.github/workflows/copilot-setup-steps.yml` exactly `copilot-setup-steps`.
 - Treat `SpectrumFederation/SpectrumFederation.toc` as the authoritative source for addon version, interface value, and load order whenever a task touches addon packaging or release/version logic. Packaged child TOC files must stay on the same Version and Interface values.
-- For UI layout, sizing, callbacks, events, timers, listeners, queues, inspection, or sync changes, prefer existing Lua 5.1 tests that assert bounded execution and convergence, not only that no Lua error occurred. See `SpectrumFederation/AGENTS.md` Client Stability.
+- Version bumps follow deterministic `release_required` classification for
+  packaged addon/release-packaging changes. Instruction/docs/infra-only changes
+  do not require a bump when the TOC format is already valid for the branch. A
+  repair iteration does not automatically require another increment when the PR
+  version is already valid for delivery.
+- For UI layout, sizing, callbacks, events, timers, listeners, queues,
+  inspection, sync, cache, or retry changes, prefer existing Lua 5.1 tests that
+  assert bounded execution, convergence, and relevant behavioral sequences. See
+  `SpectrumFederation/AGENTS.md` Client Stability.
