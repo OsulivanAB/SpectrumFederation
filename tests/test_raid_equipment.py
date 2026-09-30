@@ -204,8 +204,9 @@ def test_early_preparation_whispers_production_lua():
     assert evaluate.count(":GetAuthoritativePreparation") == 1
     assert evaluate.index("GetPreparationObservationStamp") < evaluate.index(":GetAuthoritativePreparation")
     record_at = evaluate.index("WarningRecordable")
+    claim_at = evaluate.index("BeginMissingWhisper")
     deliver_at = evaluate.index(":DeliverMissingRequirementsWhisper")
-    assert record_at < deliver_at
+    assert record_at < claim_at < deliver_at
     deliver = raid_check.split("function RC:DeliverMissingRequirementsWhisper", 1)[1]
     deliver = deliver.split("\nfunction ", 1)[0]
     assert deliver.index("InChatMessagingLockdown") < deliver.index("WhisperMissing")
@@ -234,6 +235,7 @@ def test_early_preparation_whispers_production_lua():
     assert "function RC.InspectFallbackEntry" in raid_check
     tick = raid_check.split("local function BackgroundInspectTick()", 1)[1]
     tick = tick.split("\n\tend", 1)[0]
+    assert "pcall" in tick
     assert tick.index('RC.CallEarlyPrep("OnBackgroundPass")') < tick.index("C_Timer.After")
     inspect_ready_fn = raid_check.split("function RC:_HandleInspectReady", 1)[1]
     inspect_ready_fn = inspect_ready_fn.split("\nfunction RC:", 1)[0]
@@ -241,16 +243,31 @@ def test_early_preparation_whispers_production_lua():
     assert "RC.InspectUnresolvedEntry(entry)" in inspect_ready_fn
     assert "entry and entry.slotsByInventory" not in inspect_ready_fn
     assert "entry and entry.overallEquippedItemLevel" not in inspect_ready_fn
+    assert "First capture has no prior evidence" in inspect_ready_fn
     assert "SenderIsCoordinator" in source
     assert "OUTBOUND_BACKOFF_HEARTBEATS" in source
     assert "MAX_OUTBOUND_BURST" in source
     assert "MAX_OUTBOUND_RETRIES" not in source
     stamp_fn = raid_check.split("function RC:GetPreparationObservationStamp", 1)[1]
     stamp_fn = stamp_fn.split("\nfunction RC:", 1)[0]
-    assert "GetTroubleshootingVersion()" in stamp_fn
+    assert "GetItemDataGeneration()" in stamp_fn
+    assert "GetTroubleshootingVersion()" not in stamp_fn
     assert 'RC.CallEarlyPrep("InvalidateObservationSkips"' in raid_check
+    assert "_InvalidateLocalTroubleshootingSnapshot()" in raid_check.split(
+        "function RC:_ApplyTooltipDataRefresh", 1
+    )[1].split("\nfunction ", 1)[0]
+    assert "_BumpItemDataGeneration()" in raid_check
     assert "function EarlyPrep:RestoreOutboundPending" in source
     assert "function EarlyPrep:InvalidateObservationSkips" in source
+    assert "function EarlyPrep:BeginMissingWhisper" in source
+    assert "PREP_WARN_CLAIM_REQ" in (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
+    ).read_text(encoding="utf-8")
+    routing = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "13_Routing.lua"
+    ).read_text(encoding="utf-8")
+    assert "HandlePrepWarnClaimRequest" in routing
+    assert "HandlePrepWarnClaimAck" in routing
 
 
 def test_parent_toc_loads_raid_equipment_modules():

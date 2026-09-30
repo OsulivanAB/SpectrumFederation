@@ -50,4 +50,7 @@ Sync.MSG = {
 
     -- Session-scoped missing-requirements warning dedupe. Not profile history.
     PREP_NOTICE = "PREP_NOTICE",
+    -- Coordinator-serialized exclusive claim before a missing-requirements whisper.
+    PREP_WARN_CLAIM_REQ = "PREP_WARN_CLAIM_REQ",
+    PREP_WARN_CLAIM_ACK = "PREP_WARN_CLAIM_ACK",
 }

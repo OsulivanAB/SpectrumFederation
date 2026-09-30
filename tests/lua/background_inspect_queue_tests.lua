@@ -294,7 +294,14 @@ local afterDirty = RC:GetPreparationObservationStamp("A-Realm", {
 	requireMetaGem = false,
 	slots = { head = true },
 })
-assertTrue(afterDirty ~= beforeDirty, "troubleshooting dirty changes the remote observation stamp")
+assertEq(afterDirty, beforeDirty, "a UI snapshot dirty does not invalidate remote preparation stamps")
+RC:_BumpItemDataGeneration()
+local afterItemData = RC:GetPreparationObservationStamp("A-Realm", {
+	checkGemsInSockets = true,
+	requireMetaGem = false,
+	slots = { head = true },
+})
+assertTrue(afterItemData ~= beforeDirty, "item-data generation changes the remote observation stamp")
 local EarlyPrep = SF.RaidEquipment.EarlyPreparation
 EarlyPrep._skipStamp = { ["A-Realm"] = stamp }
 RC:_ApplyTooltipDataRefresh()
@@ -304,7 +311,7 @@ local afterTooltip = RC:GetPreparationObservationStamp("A-Realm", {
 	requireMetaGem = false,
 	slots = { head = true },
 })
-assertTrue(afterTooltip ~= afterDirty, "tooltip data refresh also bumps the remote stamp generation")
+assertTrue(afterTooltip ~= afterItemData, "tooltip data refresh also bumps the remote stamp generation")
 
 assertEq(RC.InspectFallbackEntry(nil), nil, "a missing cache entry is not a fallback")
 assertEq(RC.InspectFallbackEntry({ blended = true, slotsByInventory = {} }), nil, "a blended entry is not a fallback")

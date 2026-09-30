@@ -1077,6 +1077,7 @@ function RC:_GetInspectState()
 		manualInspectPauseUntil = nil,
 		localSnapshot = nil,
 		snapshotVersion = 0,
+		itemDataGeneration = 0,
 		lastNotifiedVersion = -1,
 		backgroundInspectEnabled = false,
 		backgroundInspectConsumers = {},
@@ -1358,6 +1359,20 @@ function RC:GetTroubleshootingVersion()
 	return state.snapshotVersion or 0
 end
 
+-- Bumped only when asynchronous item/tooltip data may change observation
+-- content without a new inspect capture. Distinct from the UI snapshot version
+-- so one member's INSPECT_READY does not invalidate every Early Preparation skip.
+function RC:_BumpItemDataGeneration()
+	local state = self:_GetInspectState()
+	state.itemDataGeneration = (state.itemDataGeneration or 0) + 1
+	return state.itemDataGeneration
+end
+
+function RC:GetItemDataGeneration()
+	local state = self:_GetInspectState()
+	return state.itemDataGeneration or 0
+end
+
 function RC:_InvalidateLocalTroubleshootingSnapshot()
 	local state = self:_GetInspectState()
 	state.localSnapshot = nil
@@ -1469,6 +1484,10 @@ end
 
 function RC:_ApplyTooltipDataRefresh()
 	self:_ClearPreparedSlotCaches()
+	-- Recapture local gear after item data resolves; a stale incomplete link
+	-- must not be reused indefinitely.
+	self:_InvalidateLocalTroubleshootingSnapshot()
+	self:_BumpItemDataGeneration()
 	self:_MarkTroubleshootingDirty()
 	-- Early Preparation memoizes non-warning observations by stamp. Item and
 	-- tooltip resolution can make the same cache entry evaluable later, so
@@ -1669,9 +1688,23 @@ function RC:_StartBackgroundInspectMonitor()
 			return
 		end
 
-		self:_RunBackgroundInspectPass()
-		RC.CallEarlyPrep("OnBackgroundPass")
+		-- Keep the bounded monitor alive even when a queue or evaluation pass
+		-- raises. Surface the error after the next tick is scheduled.
+		local ok, err = pcall(function()
+			self:_RunBackgroundInspectPass()
+			RC.CallEarlyPrep("OnBackgroundPass")
+		end)
+		if not self:_GetInspectState().backgroundInspectEnabled then
+			self:_GetInspectState().backgroundMonitorStarted = false
+			if not ok then
+				error(err, 0)
+			end
+			return
+		end
 		C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, BackgroundInspectTick)
+		if not ok then
+			error(err, 0)
+		end
 	end
 
 	C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, BackgroundInspectTick)
@@ -2076,7 +2109,7 @@ function RC:GetPreparationObservationStamp(memberId, cfg)
 	if IsSelfMemberId(memberId) then
 		return table.concat({
 			"self",
-			tostring(self:GetTroubleshootingVersion()),
+			tostring(self:GetItemDataGeneration()),
 			configStamp,
 		}, "|")
 	end
@@ -2091,15 +2124,16 @@ function RC:GetPreparationObservationStamp(memberId, cfg)
 	local fresh = updatedAt and (now - updatedAt) <= INSPECT_CACHE_TTL_SECONDS
 	local status = type(entry) == "table" and entry.status or ""
 	local blended = type(entry) == "table" and entry.blended == true
-	-- Include troubleshooting generation so TOOLTIP_DATA_UPDATE / item-data
-	-- resolution invalidates Early Preparation non-warning memoization.
+	-- Item-data generation invalidates memoization when tooltip/item identity
+	-- resolves without a new inspect. Do not use the global UI snapshot version;
+	-- that bumps on every INSPECT_READY and would reevaluate the whole roster.
 	return table.concat({
 		"remote",
 		tostring(updatedAt or ""),
 		tostring(status),
 		fresh and "1" or "0",
 		blended and "1" or "0",
-		tostring(self:GetTroubleshootingVersion()),
+		tostring(self:GetItemDataGeneration()),
 		configStamp,
 	}, "|")
 end
@@ -2206,6 +2240,19 @@ function RC:_HandleInspectReady(guid)
 		else
 			for _, slotData in pairs(captured.slotsByInventory) do
 				NormalizeSlotData(slotData)
+			end
+			-- First capture has no prior evidence. A blank tracked slot may still
+			-- be an unequipped item whose inspect data has not arrived, so keep
+			-- the observation non-authoritative until a later inspect confirms it.
+			for _, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+				local slotData = captured.slotsByInventory[column.inventorySlot]
+				local hasSlot = SlotHasAnyItemData(slotData)
+					or (type(slotData) == "table" and slotData.texture)
+					or false
+				if not hasSlot then
+					blended = true
+					break
+				end
 			end
 		end
 		local freshItemLevel = CanonicalOverallItemLevel(captured.overallEquippedItemLevel)
@@ -3579,13 +3626,29 @@ function RC:_ApplyCheckConsequences(run)
 					end
 				end
 				if action == "send" then
-					-- Use the lockdown-aware sender. A blocked whisper must not
-					-- mark daily/session dedupe as delivered.
-					local sent = self:DeliverMissingRequirementsWhisper(memberId, cfg, missing, profile, mode)
-					if sent then
-						entry.whisperedMissing = true
-						if sessionDedupe and earlyPrep and earlyPrep.CommitWarned then
-							earlyPrep:CommitWarned(memberId, mode)
+					-- Session dedupe serializes claims through the coordinator
+					-- before any missing-requirements whisper is delivered.
+					local claim = "granted"
+					if sessionDedupe and earlyPrep and earlyPrep.BeginMissingWhisper then
+						claim = earlyPrep:BeginMissingWhisper(memberId, mode, missing)
+					end
+					if claim == "pending" then
+						-- Whisper completes when the coordinator grants the claim.
+					elseif claim == "denied" then
+						entry.alreadyContacted = true
+					else
+						-- Use the lockdown-aware sender. A blocked whisper must not
+						-- mark daily/session dedupe as delivered.
+						local sent = self:DeliverMissingRequirementsWhisper(memberId, cfg, missing, profile, mode)
+						if sent then
+							entry.whisperedMissing = true
+							if sessionDedupe and earlyPrep and earlyPrep.CommitWarned then
+								earlyPrep:CommitWarned(memberId, mode)
+							else
+								-- Non-session path has no claim to release.
+							end
+						elseif sessionDedupe and earlyPrep and earlyPrep.ReleaseWarningClaim then
+							earlyPrep:ReleaseWarningClaim(memberId, "send_failed")
 						end
 					end
 				elseif action == "session_contacted" then

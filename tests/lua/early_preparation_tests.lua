@@ -862,6 +862,150 @@ end)
 assertTrue(not refreshOk, "Refresh surfaces evaluation errors")
 assertTrue(not EarlyPrep._refreshing, "Refresh clears refreshing after an error")
 
+assertEq(EarlyPrep.ClaimGrantDecision({ alreadyWarned = true }), "deny", "an already-warned member cannot be claimed")
+assertEq(EarlyPrep.ClaimGrantDecision({
+	alreadyWarned = false,
+	claimActive = true,
+	claimerIsSender = false,
+	epochMatch = true,
+	atCap = false,
+}), "deny", "a claim held by another sender is denied")
+assertEq(EarlyPrep.ClaimGrantDecision({
+	alreadyWarned = false,
+	claimActive = true,
+	claimerIsSender = true,
+	epochMatch = true,
+	atCap = false,
+}), "grant", "the current claimer can refresh its claim")
+assertEq(EarlyPrep.ClaimGrantDecision({
+	alreadyWarned = false,
+	claimActive = false,
+	epochMatch = true,
+	atCap = false,
+}), "grant", "an open member can be claimed")
+
+SF.LootHelperSync.MSG.PREP_WARN_CLAIM_REQ = "PREP_WARN_CLAIM_REQ"
+SF.LootHelperSync.MSG.PREP_WARN_CLAIM_ACK = "PREP_WARN_CLAIM_ACK"
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordinator = "Helper-Realm"
+SF.LootHelperSync.state.coordEpoch = 7
+SF.LootHelperSync._SelfId = function()
+	return "Helper-Realm"
+end
+EarlyPrep:OnSessionReset("claim-reset")
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+assertEq(EarlyPrep:BeginMissingWhisper("Bob-Realm", "early", { "gem" }), "granted", "the coordinator grants a local claim")
+assertTrue(EarlyPrep:_FindClaim("Bob-Realm") ~= nil, "a granted claim is tracked")
+assertEq(EarlyPrep:BeginMissingWhisper("Bob-Realm", "early", { "gem" }), "granted", "the claimer can refresh the same claim")
+assertTrue(EarlyPrep:CommitWarned("Bob-Realm", "early"), "commit records the warning after delivery")
+assertTrue(EarlyPrep:_FindClaim("Bob-Realm") == nil, "commit releases the claim")
+assertEq(EarlyPrep:BeginMissingWhisper("Bob-Realm", "early", { "gem" }), "denied", "a warned member cannot be claimed again")
+
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+EarlyPrep._claims = nil
+local claimWhispers = 0
+local claimMsgs = {}
+SF.RaidCheck.DeliverMissingRequirementsWhisper = function()
+	claimWhispers = claimWhispers + 1
+	return true
+end
+SF.LootHelperComm.Send = function(_, _, msgType, payload, dist, target)
+	claimMsgs[#claimMsgs + 1] = {
+		msgType = msgType,
+		granted = payload and payload.granted,
+		dist = dist,
+		target = target,
+		memberId = payload and payload.memberId,
+		requestId = payload and payload.requestId,
+	}
+	return true
+end
+SF.LootHelperSync.state.isCoordinator = false
+SF.LootHelperSync.state.coordinator = "Admin-Realm"
+assertEq(EarlyPrep:BeginMissingWhisper("Cara-Realm", "pre", { "enchant" }), "pending", "a non-coordinator claim request is pending")
+assertEq(#claimMsgs, 1, "a non-coordinator sends one claim request")
+assertEq(claimMsgs[1].msgType, "PREP_WARN_CLAIM_REQ", "the claim request uses PREP_WARN_CLAIM_REQ")
+assertEq(claimMsgs[1].dist, "WHISPER", "the claim request is whispered to the coordinator")
+assertEq(claimMsgs[1].target, "Admin-Realm", "the claim request targets the coordinator")
+
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordinator = "Helper-Realm"
+SF.LootHelperSync._SelfId = function()
+	return "Helper-Realm"
+end
+EarlyPrep:HandlePrepWarnClaimRequest("Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Cara-Realm",
+	requestId = "Admin-Realm:prepclaim:1",
+	source = "pre",
+})
+local ack
+for i = 1, #claimMsgs do
+	if claimMsgs[i].msgType == "PREP_WARN_CLAIM_ACK" then
+		ack = claimMsgs[i]
+	end
+end
+assertTrue(ack ~= nil, "the coordinator answers with a claim ack")
+assertTrue(ack.granted == true, "the coordinator grants an open claim")
+
+SF.LootHelperSync.state.isCoordinator = false
+SF.LootHelperSync.state.coordinator = "Helper-Realm"
+claimWhispers = 0
+EarlyPrep._pendingWhispers = {
+	["Admin-Realm:prepclaim:9"] = {
+		memberId = "Dan-Realm",
+		source = "raid",
+		missing = { "ilvl" },
+		expiresAt = 1e9,
+	},
+}
+SF.LootHelperSync.FindLocalProfileById = function()
+	return {
+		id = "profile-a",
+		IsCurrentUserAdmin = function()
+			return true
+		end,
+		GetMemberByID = function(_, memberId)
+			return { id = memberId }
+		end,
+		GetRaidCheckConfig = function()
+			return { checkGemsInSockets = true, slots = { head = true } }
+		end,
+	}
+end
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+EarlyPrep:HandlePrepWarnClaimAck("Helper-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Dan-Realm",
+	requestId = "Admin-Realm:prepclaim:9",
+	granted = true,
+	coordinator = "Helper-Realm",
+	coordEpoch = 7,
+})
+assertEq(claimWhispers, 1, "a granted claim delivers the deferred whisper")
+assertTrue(EarlyPrep:WasWarned("Dan-Realm"), "a granted claim records the warning after delivery")
+
+EarlyPrep._claims = {
+	["Eve-Realm"] = {
+		claimer = "Admin-Realm",
+		requestId = "old",
+		coordEpoch = 6,
+		expiresAt = 1e9,
+		source = "pre",
+	},
+}
+SF.LootHelperSync.state.coordEpoch = 7
+EarlyPrep:ExpireWarningClaims(0)
+assertTrue(EarlyPrep:_FindClaim("Eve-Realm") == nil, "claims from an older coordinator epoch expire")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
 	os.exit(1)
