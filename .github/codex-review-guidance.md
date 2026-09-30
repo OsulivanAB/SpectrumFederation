@@ -10,8 +10,14 @@ automatic re-review.
 Review completeness and authorization to initiate more work are separate. A
 real defect stays actionable when it is found late, when a previous repair
 introduced it, when the PR has already been reviewed, or when fixing it is
-inconvenient. Its discovery does not itself authorize a repair, another review,
-or paid continuation. Those operations require a current owner request under
+inconvenient. Discovery of a finding does not itself authorize a repair,
+another review, or paid continuation.
+
+An intentionally subscribed Cursor agent may assess a delivered finding and
+post a disposition reply under `.cursor/skills/ai-review-loop/SKILL.md` and
+`.cursor/skills/pr-review-comments/SKILL.md`. That subscription triage is not
+repair authorization. Repair batches, additional reviews, and other paid
+continuation still require a current owner request under
 `.cursor/skills/ai-review-loop/SKILL.md`.
 
 Prioritize correctness, regressions, integration risk, runtime behavior, persistence, synchronization, performance, security, release safety, and meaningful verification over cosmetic preferences.
@@ -138,9 +144,11 @@ the final integration checkpoint while the latest applicable incremental
 coverage has unresolved findings.
 
 A finding from the final integration review does not authorize or schedule a
-repair or another review. Follow
+repair or another review. An intentionally subscribed Cursor agent may still
+assess and reply to the finding under the review skills; that reply is not
+repair authorization. Follow
 [When the Final Integration Review Finds an Issue](#when-the-final-integration-review-finds-an-issue)
-only when the owner authorizes the applicable operation.
+only when the owner authorizes the applicable repair or re-review operation.
 
 ### Final Full Integration Review
 
@@ -180,7 +188,8 @@ Require another full review of the PR against its merge base only when the new f
 
 There is no numeric cap on legitimate findings within an authorized review, and
 a late defect remains actionable. That quality rule does not authorize another
-review or repair batch. Stop when the current authorized operation is
+review or repair batch. Subscription triage may assess and reply; it must still
+stop without implementing. Stop when the current authorized operation is
 delivered; report unresolved coverage and defects for an owner decision.
 
 ### Fall Back to a Full Review When Review History Is Unreliable
@@ -530,7 +539,9 @@ Lead with **actionable findings**, ordered by severity. Those must be resolved
 or explicitly accepted by the owner before readiness. Submit the distinct
 high-confidence findings from the completed review scope together. Do not
 withhold an in-scope defect because another finding has already been written.
-Reporting them does not authorize repairs or another review. See
+Reporting them does not authorize repairs or another review. A subscribed
+Cursor agent may triage and reply to delivered findings; that is still not
+repair authorization. See
 [Exhaust the Current Review Scope](#exhaust-the-current-review-scope).
 
 For each actionable finding include:
