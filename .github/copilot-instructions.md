@@ -3,17 +3,18 @@
 These instructions guide GitHub Copilot coding agent and VS Code Agent Mode for this repo.
 
 ## Non‑negotiables
-- **Version bump is mandatory — do this FIRST, every time:**
-  - Any PR that changes addon behavior, code, UI, settings, packaging, or SavedVariables **MUST** bump `## Version:` in `SpectrumFederation/SpectrumFederation.toc` **before finalizing**.
-  - **Every PR on the beta branch** (including documentation or `.github/` only changes) must ensure the TOC version has a valid `-beta.N` suffix. If it does not, fix it as part of your PR.
-  - **beta branch:** the version **MUST** always end in `-beta.N`. Increment N by 1 (e.g., `0.4.0-beta.7` → `0.4.0-beta.8`). A plain SemVer like `0.4.0` is **never** valid on the beta branch.
-  - **main branch:** bump SemVer (patch/minor/major as appropriate); drop the `-beta.N` suffix.
-  - **Check the TOC file early** — read `SpectrumFederation/SpectrumFederation.toc` at the start of every task, note the current version, and include the bumped version in your first commit.
-  - Forgetting the version bump is a blocker; do not submit a PR without it.
+- **Versioning follows deterministic release classification — not a blanket bump on every PR:**
+  - Packaged addon behavior, UI, settings, runtime Lua/XML/assets, or `pkgmeta.yaml` changes (`release_required` from `.github/scripts/classify_promotion_scope.py`) **MUST** bump `## Version:` in `SpectrumFederation/SpectrumFederation.toc` and keep packaged child TOC Version/Interface values in lockstep.
+  - **beta target:** version must be `X.Y.Z-beta.N` and ahead of the PR base (and ahead of `main` when that comparison applies). Example: `0.4.0-beta.7` → `0.4.0-beta.8`. A plain SemVer like `0.4.0` is **never** valid on beta.
+  - **main target:** bump SemVer (patch/minor/major as appropriate); drop the `-beta.N` suffix.
+  - Instruction-only, docs-only, workflow/script, or other infra changes that do **not** alter packaged addon contents do **not** require a version bump when the TOC version is already valid for the target branch. Zip-excluded files such as `*/AGENTS.md` are not packaged releases.
+  - A repair iteration does not automatically require another version increment when the PR's version is already valid and ahead of the base for delivery.
+  - When a bump is required, check the TOC early and include it before finalizing. Trust `.github/scripts/check_version_bump.py` and `classify_promotion_scope.py` over outdated prose.
 - **Do not bypass CI:** never change workflows/checks to “make it green.”
 - **WoW Lua only:** Lua 5.1 sandbox (no `io`, `os`, Lua 5.2+ features).
 - **Inspect before assuming:** read existing architecture, callers, lifecycle, and persisted data before treating a change as local or safe.
-- **Client stability is a top runtime priority:** preventing WoW client crashes, freezes, severe UI hangs, runaway execution, and long-session degradation is an engineering requirement whenever reviewing, auditing, designing, or modifying addon runtime code. Addon Lua runs on the UI thread; work does not need to be infinite to freeze the client. Idle features should become idle. Repeated lifecycle operations and queues must converge. Shared Settings/UI infrastructure needs extra re-entrancy review. Prefer bounded-execution tests for layout/timer/listener/queue/sync changes. Unexpected errors should remain visible via the normal error handler / BugGrabber. Full guidance: `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`. This does not replace compatibility, functionality preservation, or minimal targeted changes.
+- **Change contract for risky work:** shared/persisted state, caches, queues, retries, async side effects, sync/protocol, shared UI, or recurring runtime work needs a brief authority/guarantee/dependencies/lifecycle/evidence check before implementation. Ordinary local fixes do not. See root `AGENTS.md`.
+- **Client stability is a top runtime priority:** preventing WoW client crashes, freezes, severe UI hangs, runaway execution, and long-session degradation is an engineering requirement whenever reviewing, auditing, designing, or modifying addon runtime code. Addon Lua runs on the UI thread; work does not need to be infinite to freeze the client. Idle features should become idle. Repeated lifecycle operations and queues must converge. Caches need scoped invalidation and reuse/reevaluation tests. Retries must not silently abandon required unfinished obligations. Shared Settings/UI infrastructure needs extra re-entrancy review. Prefer behavioral lifecycle tests for layout/timer/listener/queue/sync/cache/retry changes. Unexpected errors should remain visible via the normal error handler / BugGrabber; protect cleanup without swallowing defects. Full guidance: `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc`. This does not replace compatibility, functionality preservation, or minimal targeted changes.
 
 ## Branch policy (Copilot + agents)
 - **All Copilot coding agent work MUST start from `beta` and open a PR targeting `beta`.**
@@ -36,10 +37,11 @@ These instructions guide GitHub Copilot coding agent and VS Code Agent Mode for 
 - Prefer reusing existing settings controls and renderers; don’t introduce a second settings framework.
 
 ## Validation (always do before finalizing)
-Run the unified linter:
+Select checks from the canonical map in root `AGENTS.md` (Validation By Change Area). At minimum for addon/workflow/CI script changes:
 ```sh
 python3 .github/scripts/lint_all.py
 ```
+Prefer behavioral sequence evidence for stateful fixes over source-string-only assertions. Prefer fail-then-pass regression demonstration when practical. Do not fabricate Retail QA. "Awaiting human Retail QA" is a legitimate handoff state.
 
 ## Pull request descriptions
 - **Always use the repository PR template** at `.github/pull_request_template.md` when creating or updating a PR description.

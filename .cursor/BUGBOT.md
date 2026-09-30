@@ -32,13 +32,24 @@ For each finding:
 4. Point to the changed code responsible.
 5. Prefer the root cause over multiple comments describing symptoms of the same
    defect.
+6. Separate defect validity from whether any suggested patch is complete:
+   confirm the defect when credible, and prefer a repair direction that covers
+   relevant lifecycle counterparts rather than assuming the first suggested
+   patch is sufficient.
 
 Do not assume that recurring code, a timer, an event handler, a callback, or an
 allocation is inherently a performance bug. Establish frequency, lifecycle,
-termination, cleanup, and practical impact.
+termination, cleanup, and practical impact. Support performance findings with a
+clear mechanism or proportionate cost analysis; ordinary repeated work is not
+automatically a freeze.
 
 Do not repeat another reviewer's finding unless it remains unresolved or the
 current code introduces materially new evidence.
+
+Treat source-string presence as structural evidence only. Prefer behavioral
+lifecycle evidence for stateful or cross-component defects. Passing tests do
+not prove Retail correctness; never claim in-game testing occurred without
+human evidence.
 
 ## World of Warcraft runtime
 
@@ -75,6 +86,12 @@ Look for credible cases of:
 Idle features should become genuinely idle. Repeated lifecycle operations such
 as opening, closing, enabling, disabling, refreshing, joining, leaving, or
 changing profiles should converge rather than accumulate work.
+
+For caches, establish authoritative inputs, scoped invalidation,
+incomplete/stale handling, and ownership/reset behavior. For retries and
+deferred work, bound cadence and lifecycle; do not silently abandon a required
+unfinished obligation solely to impose a fixed retry count, and do not treat a
+timeout alone as proof that an external side effect did not happen.
 
 ## Asynchronous game data
 
@@ -168,7 +185,8 @@ When TOCs, workflows, packaging, promotion, rollback, or release scripts change,
 check:
 
 - beta-first branch behavior;
-- version consistency;
+- version consistency using deterministic `release_required` classification
+  (instruction/docs/infra-only changes are not automatic version bumps);
 - parent/child addon version synchronization where required;
 - artifact contents;
 - release conditions;
@@ -177,4 +195,8 @@ check:
 - rollback behavior.
 
 Do not claim that WoW Retail testing occurred unless the PR contains evidence
-that a human performed it.
+that a human performed it. "Awaiting human Retail QA" after automated
+validation is a legitimate handoff, not a fabricated pass.
+
+Bugbot Autofix and automatic triggering remain external settings this file
+cannot enforce; keep them off at the service level.
