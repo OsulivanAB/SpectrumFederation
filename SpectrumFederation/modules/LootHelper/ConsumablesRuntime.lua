@@ -1074,39 +1074,56 @@ function Runtime:PlaceNextDeposit()
                     end
                 end
             end
-            if take < stackLeft and container.SplitContainerItem then
-                container.SplitContainerItem(stack.bag, stack.slot, take)
-            elseif container.PickupContainerItem then
-                container.PickupContainerItem(stack.bag, stack.slot)
+            -- Skip soulbound stacks (or BoE that later bound) without advancing
+            -- remaining or touching the cursor.
+            local skipBound = false
+            if C_Item and C_Item.IsBound and ItemLocation and ItemLocation.CreateFromBagAndSlot then
+                local loc = ItemLocation:CreateFromBagAndSlot(stack.bag, stack.slot)
+                if loc and C_Item.IsBound(loc) then
+                    skipBound = true
+                end
             end
-            if self:CursorItemId() ~= tonumber(work.line.itemId) then
-                -- Nothing on the cursor: picking the bank slot would withdraw it.
+            if skipBound then
+                stackIndex = stackIndex + 1
+                stackLeft = nil
+                work.stackIndex = stackIndex
+                work.stackLeft = nil
+            else
+                if take < stackLeft and container.SplitContainerItem then
+                    container.SplitContainerItem(stack.bag, stack.slot, take)
+                elseif container.PickupContainerItem then
+                    container.PickupContainerItem(stack.bag, stack.slot)
+                end
+                if self:CursorItemId() ~= tonumber(work.line.itemId) then
+                    -- Nothing on the cursor: picking the bank slot would withdraw it.
+                    self:FinalizeDepositWork()
+                    return
+                end
+                work.places[#work.places + 1] = {
+                    slot = target.slot,
+                    before = self:SlotItemCount(work.tab, target.slot, work.line.itemId),
+                }
+                PickupGuildBankItem(work.tab, target.slot)
+                remaining = remaining - take
+                stackLeft = stackLeft - take
+                placed = placed + 1
+                work.remaining = remaining
+                work.placed = placed
+                work.stackIndex = stackIndex
+                work.stackLeft = stackLeft
+                if remaining > 0 and placed < MAX_DEPOSIT_PLACES and (stackLeft > 0 or stackIndex < #stacks) then
+                    self:ScheduleDepositContinue(0)
+                    return
+                end
                 self:FinalizeDepositWork()
                 return
             end
-            work.places[#work.places + 1] = {
-                slot = target.slot,
-                before = self:SlotItemCount(work.tab, target.slot, work.line.itemId),
-            }
-            PickupGuildBankItem(work.tab, target.slot)
-            remaining = remaining - take
-            stackLeft = stackLeft - take
-            placed = placed + 1
-            work.remaining = remaining
-            work.placed = placed
+        else
+            stackIndex = stackIndex + 1
+            stackLeft = nil
             work.stackIndex = stackIndex
-            work.stackLeft = stackLeft
-            if remaining > 0 and placed < MAX_DEPOSIT_PLACES and (stackLeft > 0 or stackIndex < #stacks) then
-                self:ScheduleDepositContinue(0)
-                return
-            end
-            self:FinalizeDepositWork()
-            return
+            work.stackLeft = nil
         end
-        stackIndex = stackIndex + 1
-        stackLeft = nil
-        work.stackIndex = stackIndex
-        work.stackLeft = nil
     end
     self:FinalizeDepositWork()
 end

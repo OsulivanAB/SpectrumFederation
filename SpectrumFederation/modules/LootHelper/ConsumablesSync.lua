@@ -196,6 +196,23 @@ local function PositiveQuantity(event)
     return true
 end
 
+-- Semantic body checks for coordinator snapshot rows (no sender binding).
+function S.AuthoritativeEventBodyOk(event)
+    if type(event) ~= "table" or type(event.id) ~= "string" or event.id == "" then
+        return false
+    end
+    if type(event.type) ~= "string" then return false end
+    if event.type == C.EVENT.DONATION then
+        if event.source ~= "guildbank" then return false end
+        if type(event.actor) ~= "string" or event.actor == "" then return false end
+        return PositiveQuantity(event)
+    end
+    if event.type == C.EVENT.RESET then
+        return type(event.actor) == "string" and event.actor ~= ""
+    end
+    return false
+end
+
 function S.RelayWriter(event)
     if type(event) ~= "table" then return nil end
     if type(event.writer) == "string" and event.writer ~= "" and S.RemoteEventIdOk(event.id, event.writer) then

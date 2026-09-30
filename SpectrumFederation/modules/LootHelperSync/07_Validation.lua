@@ -1039,6 +1039,37 @@ function Sync:_NoteProfileSnapshotServe(sender)
     self.state._profileSnapshotServe[sender] = self:_Now()
 end
 
+-- Reuse one built profile snapshot body across concurrent NEED_PROFILE serves
+-- in the same timeout window so a multi-member join does not rebuild the
+-- full consumables ledger on every distinct requester.
+-- @param profileId string
+-- @return table|nil
+function Sync:_CachedProfileSnapshot(profileId)
+    if type(profileId) ~= "string" or profileId == "" then return nil end
+    if not self.state then
+        return self.BuildProfileSnapshot and self:BuildProfileSnapshot(profileId) or nil
+    end
+    local now = self:_Now()
+    local window = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    local cache = self.state._profileSnapshotBodyCache
+    if type(cache) == "table"
+        and cache.profileId == profileId
+        and type(cache.payload) == "table"
+        and tonumber(cache.at)
+        and cache.at <= now
+        and (now - cache.at) < window then
+        return cache.payload
+    end
+    local payload = self.BuildProfileSnapshot and self:BuildProfileSnapshot(profileId) or nil
+    if type(payload) ~= "table" then return nil end
+    self.state._profileSnapshotBodyCache = {
+        profileId = profileId,
+        at = now,
+        payload = payload,
+    }
+    return payload
+end
+
 function Sync:_NoteAdminGrantMiss(sender, member)
     if not self.state or type(sender) ~= "string" or sender == "" then return end
     if type(member) ~= "string" or member == "" then return end

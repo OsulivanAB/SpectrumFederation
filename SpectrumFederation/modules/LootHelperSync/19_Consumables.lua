@@ -598,6 +598,12 @@ function Sync:CommitConsumablesOp(profile, op, actor, opts)
     if not self:_ConsumablesCoordinatorAccepts() then
         return false, "The session coordinator does not support raid supplies yet."
     end
+    -- Preview as Non-Admin must block local user-triggered config sends. The
+    -- coordinator authorizes the canonical sender, so the follower has to enforce
+    -- the effective-admin overlay before whispering the op.
+    if opts.asAdmin == false then
+        return false, "Raid Consumables settings are in Preview as Non-Admin mode."
+    end
     local sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_OP, {
         sessionId = self.state.sessionId,
         profileId = ProfileIdOf(profile),

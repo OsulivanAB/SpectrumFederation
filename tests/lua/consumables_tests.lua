@@ -65,6 +65,7 @@ local function resetWorld()
         mobileKnown = false,
         mobileCooldown = false,
         bindTypes = {},
+        boundSlots = {},
         unknownItems = {},
         loadRequests = {},
         after = {},
@@ -167,6 +168,14 @@ C_Item = {
     GetItemMaxStackSizeByID = function() return world.maxStack end,
     RequestLoadItemDataByID = function(itemId)
         world.loadRequests[#world.loadRequests + 1] = itemId
+    end,
+    IsBound = function(loc)
+        return type(loc) == "table" and world.boundSlots[loc.key] == true
+    end,
+}
+ItemLocation = {
+    CreateFromBagAndSlot = function(_, bag, slot)
+        return { key = tostring(bag) .. ":" .. tostring(slot) }
     end,
 }
 function InCombatLockdown() return world.inCombat end
@@ -281,6 +290,7 @@ load("SpectrumFederation/modules/LootHelper/ConsumablesRouting.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesWorkflow.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesSync.lua")
 load("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
+load("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
 
 local C = SF.Consumables
@@ -587,6 +597,27 @@ local function checkMigration()
     assertEq(cleaned.configSeq, 0, "an invalid config sequence resets to 0")
     assertTrue(C.IsRequested(messy, aqirite) and C.IsRequested(messy, flask), "valid requested rows survive normalization")
     assertEq(#C.RequestedItemIds(messy), 2, "invalid requested rows are dropped")
+
+    local badLedger = { _profileId = "ledger-bad", _consumables = { ledgerSeq = 0 / 0 } }
+    assertEq(C.Ensure(badLedger).ledgerSeq, 0, "a NaN ledgerSeq resets to 0")
+    badLedger._consumables.ledgerSeq = -3
+    assertEq(C.Ensure(badLedger).ledgerSeq, 0, "a negative ledgerSeq resets to 0")
+    badLedger._consumables.ledgerSeq = math.huge
+    assertEq(C.Ensure(badLedger).ledgerSeq, 0, "an infinite ledgerSeq resets to 0")
+    local ledgerImport = profile("ledger-import", admin)
+    ledgerImport._consumables.ledgerSeq = 3
+    C.ReplaceConfig(ledgerImport, {
+        generation = 1, configSeq = 1, ledgerSeq = 0 / 0, guild = GUILD, bankTab = 2,
+    })
+    assertEq(ledgerImport._consumables.ledgerSeq, 3, "an invalid remote ledgerSeq does not advance")
+    C.ReplaceConfig(ledgerImport, {
+        generation = 1, configSeq = 2, ledgerSeq = 9, guild = GUILD, bankTab = 2,
+    })
+    assertEq(ledgerImport._consumables.ledgerSeq, 9, "a valid remote ledgerSeq advances")
+    C.ReplaceConfig(ledgerImport, {
+        generation = 1, configSeq = 3, ledgerSeq = -1, guild = GUILD, bankTab = 2,
+    })
+    assertEq(ledgerImport._consumables.ledgerSeq, 9, "a negative remote ledgerSeq is ignored")
 
     local legacyPayload = C.ReplaceConfig(profile("legacy-payload", admin), {
         generation = 1,
@@ -973,6 +1004,29 @@ local function checkRemoteEvents()
     end
     assertEq(allowed, S.MAX_REMOTE_OPS, "remote traffic from one sender is rate limited")
     assertTrue(S.AllowRemoteOp(bucket, donor, 5 + S.REMOTE_OP_WINDOW), "the rate limit resets after its window")
+
+    assertFalse(S.AuthoritativeEventBodyOk(donation("ce:body:Donor-Realm:1", donor, 5, { source = "trade" })),
+        "a trade donation body is not authoritative")
+    assertFalse(S.AuthoritativeEventBodyOk({ id = "ce:body:Admin-Realm:2", type = C.EVENT.CUSTODY, actor = admin,
+        itemId = aqirite, quantity = 1, generation = 1 }), "a custody body is not authoritative")
+    assertTrue(S.AuthoritativeEventBodyOk(donation("ce:body:Donor-Realm:3", donor, 5)),
+        "a guild bank donation body is authoritative")
+    local snapFollower = profile("snap-body", admin)
+    C.MergeSnapshot(snapFollower, {
+        generation = 1,
+        configSeq = 1,
+        guild = GUILD,
+        bankTab = 2,
+        requestedItems = { [tostring(aqirite)] = { itemId = aqirite } },
+        events = {
+            donation("ce:snap:Donor-Realm:1", donor, 5),
+            donation("ce:snap:Donor-Realm:2", donor, 5, { source = "trade" }),
+            { id = "ce:snap:Donor-Realm:3", type = C.EVENT.CUSTODY, actor = donor, itemId = aqirite,
+              quantity = 1, generation = 1 },
+        },
+    }, { consumablesFromCoordinator = true })
+    assertEq(C.ContributionTotal(snapFollower, donor, aqirite), 5, "only valid guild bank snapshot bodies count")
+    assertEq(#snapFollower._consumableEvents, 1, "invalid authoritative snapshot bodies are skipped")
 end
 
 local function sessionStubs(state, profiles, sent)
@@ -1094,6 +1148,36 @@ local function checkSessionTransport()
     assertEq(C.ContributionTotal(followerP, donor, aqirite), 6, "the follower sees the donation after catch-up")
     heartbeat()
     assertEq(#requests, 1, "a converged follower does not request again")
+
+    local previewSent = #fsent
+    local previewOk, previewErr = Sync:CommitConsumablesOp(followerP, { name = "add_item", itemId = flask }, admin,
+        { asAdmin = false })
+    assertFalse(previewOk, "Preview as Non-Admin blocks follower config sends")
+    assertTrue(contains(previewErr, "Preview as Non-Admin"), "the preview block explains why")
+    assertEq(#fsent, previewSent, "Preview as Non-Admin does not whisper a config op")
+
+    local builds = 0
+    local payload = { meta = { _profileId = coordP._profileId }, marker = "shared" }
+    Sync.BuildProfileSnapshot = function()
+        builds = builds + 1
+        return payload
+    end
+    Sync.cfg = { requestTimeoutSec = 5 }
+    Sync.state._profileSnapshotBodyCache = nil
+    local first = Sync:_CachedProfileSnapshot(coordP._profileId)
+    local second = Sync:_CachedProfileSnapshot(coordP._profileId)
+    assertEq(builds, 1, "concurrent snapshot serves reuse one built body")
+    assertTrue(first == second, "the cached snapshot body is reused")
+    local envelope = {}
+    for k, v in pairs(first) do
+        envelope[k] = v
+    end
+    envelope.requestId = "sender-a"
+    assertEq(first.requestId, nil, "copying the envelope protects the shared cache body")
+    Sync._Now = function() return clock + 100 end
+    Sync:_CachedProfileSnapshot(coordP._profileId)
+    assertEq(builds, 2, "the snapshot cache expires after the request timeout window")
+
     resetSync()
 end
 
@@ -1490,6 +1574,27 @@ local function checkRuntimeDepositPartialAndFailure()
     assertEq(#world.places, 0, "a locked source stack places nothing")
     assertEq(RT.depositWork, nil, "a locked source stack ends the deposit work")
     assertEq(#p._consumableEvents, 0, "a locked source stack records nothing")
+
+    p = runtimeFixture("rt-bound-source")
+    world.bankOpen = true
+    world.boundSlots["0:1"] = true
+    world.boundSlots["0:2"] = true
+    startDeposit()
+    drainAfter(32)
+    assertEq(#world.places, 0, "bound source stacks are never picked up")
+    assertEq(RT.depositWork, nil, "skipping bound stacks ends the deposit work")
+    assertEq(#p._consumableEvents, 0, "bound source stacks record nothing")
+    assertEq(world.bags[0][1].count + world.bags[0][2].count, 25, "bound stacks stay in the bags")
+
+    p = runtimeFixture("rt-bound-later")
+    world.bankOpen = true
+    startDeposit()
+    assertEq(#world.places, 1, "an unbound first stack still places")
+    world.boundSlots["0:2"] = true
+    drainAfter(32)
+    local placedAfterBound = #world.places
+    assertTrue(placedAfterBound >= 1, "placing continues after the first stack")
+    assertEq(world.bags[0][2].count, 10, "a later-bound residual stack is left in the bags")
 end
 
 local function checkRuntimeCancelAndDeferredDelete()

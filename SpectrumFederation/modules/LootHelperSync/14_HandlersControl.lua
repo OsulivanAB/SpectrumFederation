@@ -882,13 +882,18 @@ function Sync:HandleNeedProfile(sender, payload)
         SF.Debug:Info("SYNC", "Serving profile snapshot as %s to %s", serveRole, tostring(sender))
     end
 
-    local snapPayload = self:BuildProfileSnapshot(self.state.profileId)
-    if not snapPayload then
+    local built = self:_CachedProfileSnapshot(self.state.profileId)
+    if not built then
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Cannot send PROFILE_SNAPSHOT to %s: no local profile %s.",
                 tostring(sender), tostring(self.state.profileId))
         end
         return
+    end
+    -- Copy the top-level envelope so per-sender requestId does not mutate the cache.
+    local snapPayload = {}
+    for k, v in pairs(built) do
+        snapPayload[k] = v
     end
 
     if type(payload.requestId) == "string" and payload.requestId ~= "" then

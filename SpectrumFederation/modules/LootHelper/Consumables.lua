@@ -507,7 +507,14 @@ function C.Ensure(profile)
     elseif cfg.eventSeq >= 9007199254740992 then
         cfg.eventSeq = C.MAX_EVENT_SEQ
     end
-    if type(cfg.ledgerSeq) ~= "number" or cfg.ledgerSeq < 0 then cfg.ledgerSeq = 0 end
+    do
+        local ledger = C.ValidLedgerSeq(cfg.ledgerSeq)
+        if not ledger then
+            cfg.ledgerSeq = 0
+        else
+            cfg.ledgerSeq = ledger
+        end
+    end
     -- Saved data is normalized once per bind. Later writers store normalized rows.
     if not indexBound[profile] then
         NormalizeRequestedItems(cfg)
@@ -1445,6 +1452,17 @@ function C.ValidConfigSeq(value)
     return seq
 end
 
+function C.ValidLedgerSeq(value)
+    local seq = tonumber(value)
+    if not seq or seq ~= seq or seq == math.huge or seq == -math.huge then
+        return nil
+    end
+    if seq ~= math.floor(seq) or seq < 0 or seq > C.MAX_EVENT_SEQ then
+        return nil
+    end
+    return seq
+end
+
 local function RequestedFromPayload(payload)
     if type(payload) ~= "table" then return {} end
     if type(payload.requestedItems) == "table" then
@@ -1481,7 +1499,10 @@ function C.ReplaceConfig(profile, payload)
         and remoteEventSeq > (tonumber(cfg.eventSeq) or 0) and remoteEventSeq <= C.MAX_EVENT_SEQ then
         cfg.eventSeq = remoteEventSeq
     end
-    cfg.ledgerSeq = math.max(tonumber(cfg.ledgerSeq) or 0, tonumber(payload.ledgerSeq) or 0)
+    local remoteLedger = C.ValidLedgerSeq(payload.ledgerSeq)
+    if remoteLedger then
+        cfg.ledgerSeq = math.max(tonumber(cfg.ledgerSeq) or 0, remoteLedger)
+    end
     cfg.guild = CopyGuild(payload.guild)
     cfg.bankTab = tonumber(payload.bankTab)
     if not IsBankTab(cfg.bankTab) then cfg.bankTab = nil end
@@ -1684,17 +1705,24 @@ function C.MergeSnapshot(profile, data, opts)
         local limit = #data.events
         local maxEvents = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
         if limit > maxEvents then limit = maxEvents end
+        local Rules = SF.ConsumablesSync
         for i = 1, limit do
-            local _, status = C.AppendEvent(profile, data.events[i], {
-                silent = true,
-                replaceBody = fromCoordinator and replace,
-            })
-            if status == "replaced" then replacedBody = true end
-            if fromCoordinator and replace and (status == "full" or status == "quota") then
-                deferred = deferred or {}
-                local deferredCap = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
-                if #deferred < deferredCap then
-                    deferred[#deferred + 1] = data.events[i]
+            local event = data.events[i]
+            if fromCoordinator and replace and Rules and Rules.AuthoritativeEventBodyOk
+                and not Rules.AuthoritativeEventBodyOk(event) then
+                -- Skip invalid donation/reset bodies that live ApplyRemoteEvent would reject.
+            else
+                local _, status = C.AppendEvent(profile, event, {
+                    silent = true,
+                    replaceBody = fromCoordinator and replace,
+                })
+                if status == "replaced" then replacedBody = true end
+                if fromCoordinator and replace and (status == "full" or status == "quota") then
+                    deferred = deferred or {}
+                    local deferredCap = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
+                    if #deferred < deferredCap then
+                        deferred[#deferred + 1] = event
+                    end
                 end
             end
         end
@@ -1711,11 +1739,17 @@ function C.MergeSnapshot(profile, data, opts)
             local deferredCap = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
             if retryLimit > deferredCap then retryLimit = deferredCap end
             for i = 1, retryLimit do
-                local _, status = C.AppendEvent(profile, deferred[i], {
-                    silent = true,
-                    replaceBody = true,
-                })
-                if status == "replaced" then replacedBody = true end
+                local event = deferred[i]
+                local Rules = SF.ConsumablesSync
+                if Rules and Rules.AuthoritativeEventBodyOk and not Rules.AuthoritativeEventBodyOk(event) then
+                    -- Skip invalid deferred bodies.
+                else
+                    local _, status = C.AppendEvent(profile, event, {
+                        silent = true,
+                        replaceBody = true,
+                    })
+                    if status == "replaced" then replacedBody = true end
+                end
             end
             if replacedBody then RebuildIndex(profile) end
         end
