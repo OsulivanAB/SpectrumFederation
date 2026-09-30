@@ -25,6 +25,9 @@ function R.GuildBankAccess(opts)
         return { visible = false, enabled = false, reason = "wrong_guild" }
     end
     if opts.bankOpen then
+        if opts.wrongTab then
+            return { visible = true, enabled = false, action = "deposit", reason = "wrong_tab" }
+        end
         if not opts.canDeposit then
             return { visible = true, enabled = false, action = "deposit", reason = "no_permission" }
         end

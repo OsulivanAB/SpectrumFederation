@@ -203,6 +203,30 @@ function Sync:_ConsiderConsumablesCatchUp(payload, opts)
         or (remoteArchiveFingerprint and localArchiveFingerprint and remoteArchiveFingerprint ~= localArchiveFingerprint)
     local archiveDescriptor = tostring(remoteArchiveCount) .. ":" .. tostring(remoteArchiveFingerprint)
     self:_QueueAuthoredArchivedConsumablesEvents(profile, archiveDiffers and true or false, archiveDescriptor)
+    -- Finish ordered/unsequenced resend scans in this pass so catch-up is not
+    -- deferred across heartbeats. Queue before the final flush; do not enqueue
+    -- more IDs after that flush before requesting the snapshot.
+    do
+        local events = profile._consumableEvents
+        local orderedKey = tostring(self.state.sessionId) .. ":" .. tostring(self.state.coordinator)
+        local maxDrain = math.floor(((C.MAX_LEDGER_EVENTS or 4096) / MAX_EVENT_SCAN) + 4)
+        for _ = 1, maxDrain do
+            local pending = false
+            if profile._consumablesOrderedResendKey == orderedKey then
+                local cursor = tonumber(profile._consumablesOrderedResendCursor)
+                if type(events) == "table" and cursor and cursor <= #events then
+                    pending = true
+                    self:_QueueAuthoredOrderedConsumablesEvents(profile, remote.eventCount, fingerprintsDiffer)
+                end
+            end
+            if type(profile._consumablesResendCursor) == "number" and type(events) == "table"
+                and profile._consumablesResendCursor <= #events then
+                pending = true
+                self:_QueueUnsequencedConsumablesEvents(profile)
+            end
+            if not pending then break end
+        end
+    end
     self:_FlushUnsentConsumablesEvents(profile)
     local authority = table.concat({
         tostring(self.state.sessionId),
@@ -245,9 +269,8 @@ function Sync:_ConsiderConsumablesCatchUp(payload, opts)
     if configDiffers and LedgerMatches(localDesc, remote) and not graceOver then
         return
     end
-    -- Do not request an authoritative snapshot while this client's ordered or
-    -- unsequenced resend cursor still has authored rows to queue. Reconciliation
-    -- would drop ordered local rows that are not yet on _consumablesUnsent.
+    -- Resend cursors were drained above before the flush. Keep a safety gate if
+    -- a drain bound left work unfinished; otherwise proceed to snapshot.
     local events = profile._consumableEvents
     local orderedKey = tostring(self.state.sessionId) .. ":" .. tostring(self.state.coordinator)
     if profile._consumablesOrderedResendKey == orderedKey then
@@ -645,21 +668,13 @@ function Sync:HandleConsumablesConfig(sender, payload)
     end
     local profile = self.FindLocalProfileById and self:FindLocalProfileById(payload.profileId) or nil
     if not profile then
-        if self.RequestProfileSnapshot then
-            self:RequestProfileSnapshot("consumables-gap")
-        end
+        -- Profile bootstrap is owned by SendJoinStatus and the cooldown-gated heartbeat.
         return
     end
     local ok, status = S.ApplyRemoteConfig(profile, payload, sender, {
         coordinatorAuthoritative = true,
         coordEpoch = self.state and self.state.coordEpoch,
     })
-    if (not ok) and status == "gap" then
-        if self.RequestProfileSnapshot then
-            self:RequestProfileSnapshot("consumables-gap")
-        end
-        return
-    end
     if not ok then
         Debug("Verbose", "Ignored consumables config from %s (%s)", tostring(sender), tostring(status))
     end

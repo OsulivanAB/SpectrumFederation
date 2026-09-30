@@ -508,7 +508,10 @@ function C.Ensure(profile)
         cfg.eventSeq = C.MAX_EVENT_SEQ
     end
     if type(cfg.ledgerSeq) ~= "number" or cfg.ledgerSeq < 0 then cfg.ledgerSeq = 0 end
-    NormalizeRequestedItems(cfg)
+    -- Saved data is normalized once per bind. Later writers store normalized rows.
+    if not indexBound[profile] then
+        NormalizeRequestedItems(cfg)
+    end
     if type(profile._consumablesPendingFreezes) == "table" then
         profile._consumablesPendingFreezes = nil
     end
@@ -1308,7 +1311,25 @@ function C.HistoryRows(profile, nameForItem, limit, offset)
         ordered[#ordered + 1] = profile._consumableEvents[i]
     end
     table.sort(ordered, function(a, b) return EventLess(b, a) end)
-    local total = #ordered
+    -- Paginate only displayable rows so legacy receipt/custody/trade events do
+    -- not consume page slots or inflate the Logs total.
+    local displayable = {}
+    for i = 1, #ordered do
+        local event = ordered[i]
+        local itemName = nil
+        if type(nameForItem) == "function" then
+            itemName = nameForItem(event.itemId)
+        end
+        local text = C.FormatEvent(event, itemName)
+        if text ~= "" then
+            displayable[#displayable + 1] = {
+                text = text,
+                timestamp = event.timestamp,
+                generation = event.generation,
+            }
+        end
+    end
+    local total = #displayable
     offset = math.floor(tonumber(offset) or 0)
     if offset < 0 then offset = 0 end
     if offset > total then offset = total end
@@ -1320,19 +1341,7 @@ function C.HistoryRows(profile, nameForItem, limit, offset)
     end
     local rows = {}
     for i = offset + 1, last do
-        local event = ordered[i]
-        local itemName = nil
-        if type(nameForItem) == "function" then
-            itemName = nameForItem(event.itemId)
-        end
-        local text = C.FormatEvent(event, itemName)
-        if text ~= "" then
-            rows[#rows + 1] = {
-                text = text,
-                timestamp = event.timestamp,
-                generation = event.generation,
-            }
-        end
+        rows[#rows + 1] = displayable[i]
     end
     return rows, total
 end

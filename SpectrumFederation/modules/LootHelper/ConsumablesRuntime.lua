@@ -511,6 +511,7 @@ function Runtime:BankAccess(profile)
         configured = cfg.guild ~= nil and cfg.bankTab ~= nil,
         sameGuild = same and true or false,
         bankOpen = bankOpen,
+        wrongTab = bankOpen and cfg.bankTab ~= nil and not tabReady or false,
         canDeposit = canDeposit,
         freeSlots = freeSlots,
         mergeRoom = mergeRoom,
@@ -753,6 +754,9 @@ local function StatusText(access)
     if access.reason == "no_permission" then
         return "You cannot deposit to the configured guild bank tab."
     end
+    if access.reason == "wrong_tab" then
+        return "Open the configured guild bank tab to deposit."
+    end
     if access.reason == "tab_full" then
         return "The configured guild bank tab is full."
     end
@@ -876,7 +880,22 @@ function Runtime:RebuildReview()
                 button:Disable()
             end
             button:SetScript("OnClick", function()
-                self:BeginDeposit(line, collected)
+                local Workflow = SF.ConsumablesWorkflow
+                local have = (self.bagCounts and self.bagCounts[line.itemId]) or line.quantity
+                local qty = tonumber(row.Edit:GetText()) or line.quantity
+                if Workflow and Workflow.ClampDonationQuantity then
+                    qty = Workflow.ClampDonationQuantity(qty, have)
+                end
+                self.qtyOverrides[line.itemId] = qty
+                local depositLine = {
+                    itemId = line.itemId,
+                    quantity = qty,
+                    name = line.name,
+                    generation = line.generation,
+                    quality = line.quality,
+                    guildBank = line.guildBank,
+                }
+                self:BeginDeposit(depositLine, collected)
             end)
             y = y + 26
         end
@@ -1066,10 +1085,28 @@ end
 
 function Runtime:BeginDeposit(line, collected)
     local C = SF.Consumables
+    local Routing = SF.ConsumablesRouting
     local profile = collected.profile
+    -- Recompute live bank access at click time; the review model can be stale.
+    local access = self:BankAccess(profile)
+    local usable = Routing and Routing.GuildBankUsable(access) or false
+    if not usable then
+        if access and access.reason == "wrong_tab" then
+            Warn("Open the configured guild bank tab to deposit.")
+        elseif access and access.reason == "no_permission" then
+            Warn("You cannot deposit to the configured guild bank tab.")
+        elseif access and access.reason == "tab_full" then
+            Warn("The configured guild bank tab is full.")
+        elseif access and access.reason == "wrong_guild" then
+            Warn("Open the configured guild bank to deposit.")
+        else
+            Warn("No Guild Bank donation path is available.")
+        end
+        return
+    end
     local have = (self.bagCounts and self.bagCounts[line.itemId]) or 0
     local ok, err = C.RevalidateDonation(profile, line, {
-        guildBankUsable = collected.usable,
+        guildBankUsable = usable,
     }, have)
     if not ok then
         Warn(err or "Review the donation again.")
@@ -1246,13 +1283,13 @@ function Runtime:MaybeAutoReview()
     if not SF.Consumables or not Routing then return end
     local collected = self:Collect()
     if not collected then return end
-    self.autoReviewedThisOpen = true
     local carries = false
     for i = 1, #collected.plan.lines do
         if collected.plan.lines[i].quantity > 0 then carries = true end
     end
     if not carries then return end
     if not Routing.HasActionablePath(collected.usable) then return end
+    self.autoReviewedThisOpen = true
     self:ShowReview()
 end
 
@@ -1330,6 +1367,14 @@ function Runtime:OnEvent(event, arg1)
             -- Multi-place deposit still moving source stacks.
         elseif self.depositIntent then
             self:FinishDeposit(false)
+        else
+            self:RefreshReminder()
+            if self.bankOpen then
+                self:MaybeAutoReview()
+            end
+            if self.review and self.review:IsShown() then
+                self:RebuildReview()
+            end
         end
     end
 end

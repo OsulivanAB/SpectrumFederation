@@ -628,6 +628,9 @@ local function checkAccessRules()
     local noPerm = R.GuildBankAccess({ configured = true, sameGuild = true, bankOpen = true, canDeposit = false, freeSlots = 4 })
     assertEq(noPerm.reason, "no_permission", "missing deposit permission is reported")
     assertFalse(R.GuildBankUsable(noPerm), "missing deposit permission is not usable")
+    local wrongTab = R.GuildBankAccess({ configured = true, sameGuild = true, bankOpen = true, wrongTab = true, canDeposit = false, freeSlots = 4 })
+    assertEq(wrongTab.reason, "wrong_tab", "viewing another tab is reported distinctly from no permission")
+    assertFalse(R.GuildBankUsable(wrongTab), "a wrong-tab bank path is not usable")
     local full = R.GuildBankAccess({ configured = true, sameGuild = true, bankOpen = true, canDeposit = true, freeSlots = 0 })
     assertEq(full.reason, "tab_full", "a full tab is reported")
     assertFalse(R.GuildBankUsable(full), "a full tab is not usable")
@@ -811,9 +814,13 @@ local function checkAccounting()
     C.AppendEvent(p, { id = "ce:accounting:Vann-Realm:9", type = C.EVENT.RECEIPT, actor = vann, itemId = aqirite,
         quantity = 3, generation = 1 }, { silent = true })
     local rows, total = C.HistoryRows(p, function() return "Aqirite" end)
-    assertEq(total, 3, "history counts every stored event")
+    assertEq(total, 2, "history totals only displayable guild bank donations and resets")
     assertEq(#rows, 2, "history shows only guild bank donations and resets")
     assertTrue(contains(rows[1].text, "DonorAlt-Realm"), "history is newest first")
+    local page, pageTotal = C.HistoryRows(p, function() return "Aqirite" end, 1, 0)
+    assertEq(pageTotal, 2, "paginated history totals only displayable rows")
+    assertEq(#page, 1, "paginated history returns the requested page size")
+    assertTrue(contains(page[1].text, "DonorAlt-Realm"), "the first page shows the newest displayable row")
 
     local fullP = configured("accounting-full")
     local cap = C.MAX_LEDGER_EVENTS
@@ -880,6 +887,13 @@ local function checkAuthorizeAndConfigSync()
     assertEq(select(2, S.ApplyRemoteConfig(follower, gap, admin, { coordinatorAuthoritative = true, coordEpoch = 1 })), "applied",
         "the coordinator's authoritative config applies across a gap")
     assertEq(select(2, S.ApplyRemoteConfig(follower, nil, admin)), "invalid", "a missing config payload is invalid")
+    local badSeq = C.ExportSnapshot(source, { omitEvents = true })
+    badSeq.configSeq = 0 / 0
+    assertEq(select(2, S.ApplyRemoteConfig(follower, badSeq, admin, { coordinatorAuthoritative = true, coordEpoch = 2 })), "invalid",
+        "a NaN config sequence is rejected before watermarking")
+    badSeq.configSeq = math.huge
+    assertEq(select(2, S.ApplyRemoteConfig(follower, badSeq, admin, { coordinatorAuthoritative = true, coordEpoch = 2 })), "invalid",
+        "an infinite config sequence is rejected before watermarking")
 end
 
 local function checkRemoteEvents()
@@ -1042,6 +1056,13 @@ local function checkSessionTransport()
         requests[#requests + 1] = { reason = reason, opts = opts }
         return true
     end
+    Sync:HandleConsumablesConfig(admin, {
+        sessionId = "s1",
+        profileId = "missing-profile-id",
+        generation = 1,
+        configSeq = 1,
+    })
+    assertEq(#requests, 0, "config for a missing profile does not request a gap snapshot")
     local function heartbeat()
         local hb = { profileId = coordP._profileId, sessionId = "s1", coordinator = admin }
         local desc = C.Descriptor(coordP)
@@ -1157,6 +1178,7 @@ local function checkRuntimeInventory()
     world.clubId = "club-1"
     world.currentTab = 1
     assertFalse(RT:Collect().usable, "viewing another tab is not a usable deposit path")
+    assertEq(RT:Collect().access.reason, "wrong_tab", "viewing another tab reports wrong_tab rather than no_permission")
     world.currentTab = 2
     world.canDeposit[2] = false
     assertEq(RT:Collect().access.reason, "no_permission", "a tab without deposit permission is reported")
@@ -1260,12 +1282,34 @@ local function checkRuntimeReview()
     RT:OnBankOpened()
     assertTrue(review:IsShown(), "a new bank visit can auto-open the review again")
 
+    RT:OnBankClosed()
+    review:Hide()
+    world.currentTab = 1
+    RT:OnBankOpened()
+    assertFalse(review:IsShown(), "opening on the wrong tab does not auto-open the review")
+    assertFalse(RT.autoReviewedThisOpen, "a non-actionable open does not latch auto-review")
+    world.currentTab = 2
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(review:IsShown(), "switching to the configured tab can auto-open the review")
+    row = review.Rows[2]
+    assertTrue(row ~= nil, "the review still has the deposit row after a tab switch")
+
     row.Edit:SetText("999")
     row.Edit.scripts.OnEnterPressed(row.Edit)
     assertEq(RT.qtyOverrides[aqirite], 25, "an edited review quantity clamps to the carried count")
     row.Edit:SetText("3")
     row.Edit.scripts.OnEnterPressed(row.Edit)
     assertEq(review.Rows[2].Text.text, "Item190000 x3", "the review shows the edited quantity")
+
+    row.Edit:SetText("7")
+    row.Button.scripts.OnClick(row.Button)
+    assertEq(RT.qtyOverrides[aqirite], 7, "Deposit commits the edit-box quantity without Enter")
+    assertTrue(RT.depositWork ~= nil or RT.depositIntent ~= nil or #world.places > 0,
+        "Deposit starts after committing the unentered edit")
+    RT:CancelDepositWork()
+    RT.depositIntent = nil
+    world.places = {}
+    world.after = {}
 
     local rows = #review.Rows
     for _ = 1, 20 do RT:RebuildReview() end

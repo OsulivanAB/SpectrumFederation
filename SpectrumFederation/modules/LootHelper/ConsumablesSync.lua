@@ -132,7 +132,12 @@ function S.ApplyRemoteConfig(profile, payload, sender, opts)
     elseif not remoteGen then
         return false, "invalid"
     end
-    local remoteSeq = tonumber(payload.configSeq) or 0
+    local remoteSeq = C.ValidConfigSeq(payload.configSeq)
+    if payload.configSeq == nil then
+        remoteSeq = 0
+    elseif not remoteSeq then
+        return false, "invalid"
+    end
     local epoch = opts.coordEpoch
     if opts.coordinatorAuthoritative then
         if not WatermarkIsNewer(remoteGen, remoteSeq, coordinatorWatermark[profile], epoch) then
