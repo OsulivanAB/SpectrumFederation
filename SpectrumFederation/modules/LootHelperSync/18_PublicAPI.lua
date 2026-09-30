@@ -47,6 +47,7 @@ function Sync:_PersistSessionState(reason)
         persisted.helpers = nil
         persisted.prepNotice = nil
         persisted.deferredPrepNotices = nil
+        persisted.prepClaims = nil
         return
     end
 

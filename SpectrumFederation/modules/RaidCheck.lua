@@ -1833,6 +1833,9 @@ function RC:EnsureInspectSupport()
 				pcall(ClearInspectPlayer)
 			end
 			self:_NotifyTroubleshootingListeners()
+			-- Close raid-only Early Preparation before priming background scans so
+			-- a post-load party does not inherit a pre-zone Early Preparation queue.
+			RC.CallEarlyPrep("Notify", "world")
 			self:_RunBackgroundInspectPass()
 		elseif event == "GROUP_ROSTER_UPDATE" then
 			self:_ReconcileFrozenTargets()
@@ -3429,11 +3432,16 @@ local function CurrentSessionSnapshot()
 		end
 		local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
 		if earlyPrep and earlyPrep.SessionAnnouncedForDedupe then
+			local reannounceExhausted = false
+			if sync.state and type(sessionId) == "string" then
+				reannounceExhausted = sync.state._reannounceExhaustedFor == sessionId
+			end
 			announced = earlyPrep.SessionAnnouncedForDedupe(
 				true,
 				sendAccepted,
 				sync.state and sync.state.isCoordinator,
-				sessionId
+				sessionId,
+				reannounceExhausted
 			)
 		else
 			announced = sendAccepted
@@ -3658,6 +3666,8 @@ function RC:_ApplyCheckConsequences(run)
 							else
 								-- Non-session path has no claim to release.
 							end
+						elseif sessionDedupe and earlyPrep and earlyPrep.AbandonWarningClaim then
+							earlyPrep:AbandonWarningClaim(memberId, "send_failed")
 						elseif sessionDedupe and earlyPrep and earlyPrep.ReleaseWarningClaim then
 							earlyPrep:ReleaseWarningClaim(memberId, "send_failed")
 						end

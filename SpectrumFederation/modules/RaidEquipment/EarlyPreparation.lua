@@ -13,7 +13,7 @@
 -- stored on the session record so a reload or coordinator change does not send a
 -- second missing-requirements whisper. It is not profile history.
 --
--- luacheck: globals SpectrumFederationDB
+-- luacheck: globals SpectrumFederationDB IsInRaid GetTime
 
 local _, SF = ...
 
@@ -301,8 +301,10 @@ end
 -- The coordinator's send-accepted flag is not set on clients that joined
 -- through SES_START or SES_REANNOUNCE. Their active session descriptor is
 -- still the session that shares missing-whisper dedupe. A coordinator who has
--- not successfully announced yet does not.
-function EarlyPrep.SessionAnnouncedForDedupe(sessionActive, sendAccepted, isCoordinator, sessionId)
+-- not successfully announced yet does not, unless reannounce retries exhausted
+-- while heartbeats continue — that exhausted-but-heartbeating state still
+-- shares session warning dedupe without opening Early Preparation.
+function EarlyPrep.SessionAnnouncedForDedupe(sessionActive, sendAccepted, isCoordinator, sessionId, reannounceExhausted)
 	if sessionActive ~= true then
 		return false
 	end
@@ -310,6 +312,9 @@ function EarlyPrep.SessionAnnouncedForDedupe(sessionActive, sendAccepted, isCoor
 		return false
 	end
 	if sendAccepted == true then
+		return true
+	end
+	if reannounceExhausted == true then
 		return true
 	end
 	return isCoordinator ~= true
@@ -412,6 +417,11 @@ function EarlyPrep.ConsumerWantsUnit(consumers, info)
 end
 
 function EarlyPrep.EligibleFilter(info)
+	-- World-entry background passes can run before a roster refresh closes the
+	-- consumer. Reject party groups here so NotifyInspect never leaves raid.
+	if not (IsInRaid and IsInRaid()) then
+		return false
+	end
 	local ep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
 	if not ep or not ep.IsEligibleTarget then
 		return false
@@ -540,6 +550,9 @@ function EarlyPrep:IsEligibleTarget(memberId)
 	if not EarlyPrep.ValidMemberId(memberId) then
 		return false
 	end
+	if not (IsInRaid and IsInRaid()) then
+		return false
+	end
 	local profile = self:GetSessionProfile()
 	if not self:IsProfileMember(profile, memberId) then
 		return false
@@ -653,31 +666,44 @@ function EarlyPrep:WritePersisted(persisted)
 		or type(deferred.bySender) ~= "table"
 	then
 		persisted.deferredPrepNotices = nil
-		return
-	end
-	local bySender = {}
-	local count = 0
-	for sender, senderNotice in pairs(deferred.bySender) do
-		if type(sender) == "string" and sender ~= "" and type(senderNotice) == "table" then
-			count = count + 1
-			if count > EarlyPrep.MAX_DEFERRED_SENDERS then
-				break
+	else
+		local bySender = {}
+		local count = 0
+		for sender, senderNotice in pairs(deferred.bySender) do
+			if type(sender) == "string" and sender ~= "" and type(senderNotice) == "table" then
+				count = count + 1
+				if count > EarlyPrep.MAX_DEFERRED_SENDERS then
+					break
+				end
+				bySender[sender] = {
+					raidCheckBegun = senderNotice.raidCheckBegun and true or false,
+					warned = EarlyPrep.WarnedArray(senderNotice),
+				}
 			end
-			bySender[sender] = {
-				raidCheckBegun = senderNotice.raidCheckBegun and true or false,
-				warned = EarlyPrep.WarnedArray(senderNotice),
+		end
+		if next(bySender) == nil then
+			persisted.deferredPrepNotices = nil
+		else
+			persisted.deferredPrepNotices = {
+				sessionId = deferred.sessionId,
+				profileId = deferred.profileId,
+				bySender = bySender,
 			}
 		end
 	end
-	if next(bySender) == nil then
-		persisted.deferredPrepNotices = nil
-		return
+
+	-- In-flight warning claims survive reload / transfer so a successor cannot
+	-- reopen the same member while a granted whisper is still delivering.
+	local claims = self:ClaimsSnapshot()
+	if type(claims) == "table"
+		and type(self.notice) == "table"
+		and self.notice.sessionId == persisted.sessionId
+		and self.notice.profileId == persisted.profileId
+	then
+		persisted.prepClaims = claims
+	else
+		persisted.prepClaims = nil
 	end
-	persisted.deferredPrepNotices = {
-		sessionId = deferred.sessionId,
-		profileId = deferred.profileId,
-		bySender = bySender,
-	}
 end
 
 function EarlyPrep:PersistActive()
@@ -768,6 +794,7 @@ function EarlyPrep:RestorePersisted(persisted)
 		end
 	end
 
+	self:RestorePersistedClaims(persisted.prepClaims)
 	self:RestoreOutboundPending()
 end
 
@@ -785,6 +812,7 @@ function EarlyPrep:OnSessionReset(reason)
 	self._evaluating = false
 	self._refreshing = false
 	self._claims = nil
+	self._remoteClaimSnapshot = nil
 	self._pendingWhispers = nil
 	self._claimSeq = 0
 	local raidCheck = SF.RaidCheck
@@ -826,13 +854,23 @@ function EarlyPrep:HeartbeatPayload()
 	if not sync or not sync.state or sync.state.sessionId ~= (self.notice and self.notice.sessionId) then
 		return nil
 	end
-	if not self:HasShareableNotice() then
-		return nil
+	local payload = nil
+	if self:HasShareableNotice() then
+		payload = {
+			raidCheckBegun = self.notice.raidCheckBegun and true or false,
+			warned = EarlyPrep.WarnedArray(self.notice),
+		}
 	end
-	return {
-		raidCheckBegun = self.notice.raidCheckBegun and true or false,
-		warned = EarlyPrep.WarnedArray(self.notice),
-	}
+	-- Coordinator heartbeats carry outstanding leases so a successor can adopt
+	-- them before Early Preparation reopens the same member.
+	if sync.state.isCoordinator == true then
+		local claims = self:ClaimsSnapshot()
+		if type(claims) == "table" then
+			payload = payload or {}
+			payload.claims = claims
+		end
+	end
+	return payload
 end
 
 -- A missing local profile is not the same as a known unauthorized sender.
@@ -1093,6 +1131,9 @@ function EarlyPrep:ApplyHeartbeat(sessionId, profileId, prepNotice)
 	if not self.notice or self.notice.sessionId ~= sessionId or self.notice.profileId ~= profileId then
 		return false
 	end
+	if type(prepNotice.claims) == "table" then
+		self:StoreRemoteClaims(prepNotice.claims)
+	end
 	local accepted, changed = EarlyPrep.ApplyNotice(self.notice, sessionId, profileId, {
 		sessionId = sessionId,
 		profileId = profileId,
@@ -1214,6 +1255,170 @@ function EarlyPrep:_ClaimCount()
 	return count
 end
 
+-- Remaining-TTL snapshot for persistence and coordinator heartbeat transfer.
+function EarlyPrep:ClaimsSnapshot()
+	self:ExpireWarningClaims()
+	if type(self._claims) ~= "table" then
+		return nil
+	end
+	local now = self:_Now()
+	local out = {}
+	local count = 0
+	for memberId, claim in pairs(self._claims) do
+		if EarlyPrep.ValidMemberId(memberId)
+			and type(claim) == "table"
+			and type(claim.claimer) == "string"
+			and claim.claimer ~= ""
+		then
+			local remaining = EarlyPrep.CLAIM_FAILSAFE_SECONDS
+			if type(claim.expiresAt) == "number" then
+				remaining = claim.expiresAt - now
+			end
+			if remaining > 0 then
+				count = count + 1
+				if count > EarlyPrep.MAX_CLAIMS then
+					break
+				end
+				if remaining > EarlyPrep.CLAIM_FAILSAFE_SECONDS then
+					remaining = EarlyPrep.CLAIM_FAILSAFE_SECONDS
+				end
+				out[#out + 1] = {
+					memberId = memberId,
+					claimer = claim.claimer,
+					requestId = claim.requestId,
+					coordEpoch = claim.coordEpoch,
+					source = claim.source,
+					remaining = remaining,
+				}
+			end
+		end
+	end
+	if #out == 0 then
+		return nil
+	end
+	table.sort(out, function(a, b)
+		return a.memberId < b.memberId
+	end)
+	return out
+end
+
+function EarlyPrep:_NormalizeClaimEntries(claims)
+	if type(claims) ~= "table" then
+		return nil
+	end
+	local out = {}
+	local function consider(entry)
+		if #out >= EarlyPrep.MAX_CLAIMS then
+			return
+		end
+		if type(entry) ~= "table" or not EarlyPrep.ValidMemberId(entry.memberId) then
+			return
+		end
+		if type(entry.claimer) ~= "string" or entry.claimer == "" then
+			return
+		end
+		local remaining = tonumber(entry.remaining)
+		if type(remaining) ~= "number" or remaining <= 0 then
+			return
+		end
+		if remaining > EarlyPrep.CLAIM_FAILSAFE_SECONDS then
+			remaining = EarlyPrep.CLAIM_FAILSAFE_SECONDS
+		end
+		out[#out + 1] = {
+			memberId = entry.memberId,
+			claimer = entry.claimer,
+			requestId = type(entry.requestId) == "string" and entry.requestId or nil,
+			coordEpoch = tonumber(entry.coordEpoch),
+			source = entry.source,
+			remaining = remaining,
+		}
+	end
+	if #claims > 0 then
+		for i = 1, #claims do
+			consider(claims[i])
+		end
+	else
+		for _, entry in pairs(claims) do
+			consider(entry)
+		end
+	end
+	if #out == 0 then
+		return nil
+	end
+	table.sort(out, function(a, b)
+		return a.memberId < b.memberId
+	end)
+	return out
+end
+
+function EarlyPrep:StoreRemoteClaims(claims)
+	local normalized = self:_NormalizeClaimEntries(claims)
+	self._remoteClaimSnapshot = normalized
+	return normalized ~= nil
+end
+
+function EarlyPrep:RestorePersistedClaims(claims)
+	self._claims = nil
+	local normalized = self:_NormalizeClaimEntries(claims)
+	self._remoteClaimSnapshot = normalized
+	local sync = SF.LootHelperSync
+	if not normalized then
+		return false
+	end
+	if not (sync and sync.state and sync.state.isCoordinator == true) then
+		return true
+	end
+	return self:AdoptRemoteClaims("restore")
+end
+
+-- Stamp transferred leases into the live coordinator map with the current epoch
+-- so ExpireWarningClaims does not drop them immediately after takeover.
+function EarlyPrep:AdoptRemoteClaims(reason)
+	local snap = self._remoteClaimSnapshot
+	if type(snap) ~= "table" then
+		return false
+	end
+	self:SyncNoticeToSession()
+	self:ExpireWarningClaims()
+	local now = self:_Now()
+	local epoch = self:_CurrentCoordEpoch()
+	local adopted = false
+	self._claims = self._claims or {}
+	for i = 1, #snap do
+		local entry = snap[i]
+		if EarlyPrep.ValidMemberId(entry.memberId)
+			and not EarlyPrep.IsWarned(self.notice, entry.memberId)
+			and type(entry.remaining) == "number"
+			and entry.remaining > 0
+			and self:_ClaimCount() < EarlyPrep.MAX_CLAIMS
+		then
+			local key, existing = self:_FindClaim(entry.memberId)
+			if not existing then
+				local remaining = entry.remaining
+				if remaining > EarlyPrep.CLAIM_FAILSAFE_SECONDS then
+					remaining = EarlyPrep.CLAIM_FAILSAFE_SECONDS
+				end
+				self._claims[key or entry.memberId] = {
+					claimer = entry.claimer,
+					requestId = entry.requestId,
+					coordEpoch = epoch,
+					expiresAt = now + remaining,
+					source = entry.source,
+				}
+				adopted = true
+			end
+		end
+	end
+	if next(self._claims) == nil then
+		self._claims = nil
+	end
+	if adopted then
+		self:PersistActive()
+		DebugVerbose("Adopted transferred warning claims (%s)", tostring(reason or "adopt"))
+	end
+	return adopted
+end
+
 function EarlyPrep:_FindClaim(memberId)
 	if type(self._claims) ~= "table" or not EarlyPrep.ValidMemberId(memberId) then
 		return nil, nil
@@ -1277,6 +1482,50 @@ function EarlyPrep:ReleaseWarningClaim(memberId, reason)
 	end
 	DebugVerbose("Released warning claim for %s (%s)", tostring(memberId), tostring(reason or "release"))
 	return true
+end
+
+-- Drop a failed delivery's lease locally and tell the coordinator when the
+-- grant lived there. Coordinators only need the local clear + persist.
+function EarlyPrep:AbandonWarningClaim(memberId, reason)
+	if not EarlyPrep.ValidMemberId(memberId) then
+		return false
+	end
+	local _, claim = self:_FindClaim(memberId)
+	local requestId = claim and claim.requestId or nil
+	local released = self:ReleaseWarningClaim(memberId, reason)
+	local sync = SF.LootHelperSync
+	if sync and sync.state and sync.state.isCoordinator == true then
+		if released then
+			self:PersistActive()
+		end
+		return released
+	end
+	return self:_SendClaimRelease(memberId, requestId, reason) or released
+end
+
+function EarlyPrep:_SendClaimRelease(memberId, requestId, reason)
+	local sync = SF.LootHelperSync
+	local comm = SF.LootHelperComm
+	if not sync or not sync.state or sync.state.active ~= true or not sync.state.coordinator then
+		return false
+	end
+	if sync.state.isCoordinator == true then
+		return false
+	end
+	if not comm or type(comm.Send) ~= "function" or not sync.MSG or not sync.MSG.PREP_WARN_CLAIM_RELEASE then
+		return false
+	end
+	if not EarlyPrep.ValidMemberId(memberId) then
+		return false
+	end
+	local payload = {
+		sessionId = sync.state.sessionId,
+		profileId = sync.state.profileId,
+		memberId = memberId,
+		requestId = requestId,
+		reason = reason,
+	}
+	return comm:Send("CONTROL", sync.MSG.PREP_WARN_CLAIM_RELEASE, payload, "WHISPER", sync.state.coordinator, "NORMAL") and true or false
 end
 
 -- Drop coordinator leases once the warned set covers those members.
@@ -1381,6 +1630,7 @@ function EarlyPrep:_GrantLocalClaim(memberId, claimer, requestId, source)
 		expiresAt = self:_Now() + EarlyPrep.CLAIM_FAILSAFE_SECONDS,
 		source = source,
 	}
+	self:PersistActive()
 	return true, why
 end
 
@@ -1461,6 +1711,47 @@ function EarlyPrep:HandlePrepWarnClaimRequest(sender, payload)
 	self:_SendClaimAck(sender, memberId, requestId, granted, why)
 end
 
+function EarlyPrep:HandlePrepWarnClaimRelease(sender, payload)
+	local sync = SF.LootHelperSync
+	if not sync or not sync.state or sync.state.active ~= true or sync.state.isCoordinator ~= true then
+		return
+	end
+	if type(payload) ~= "table" then
+		return
+	end
+	if payload.sessionId ~= sync.state.sessionId or payload.profileId ~= sync.state.profileId then
+		return
+	end
+	if not self:SenderInGroup(sender) then
+		return
+	end
+	if type(sync.IsSenderAuthorized) == "function" and not sync:IsSenderAuthorized(payload.profileId, sender) then
+		return
+	end
+	local memberId = payload.memberId
+	if not EarlyPrep.ValidMemberId(memberId) then
+		return
+	end
+	local _, claim = self:_FindClaim(memberId)
+	if type(claim) ~= "table" then
+		return
+	end
+	if not EarlyPrep.SameMember(claim.claimer, sender) then
+		return
+	end
+	if type(payload.requestId) == "string"
+		and payload.requestId ~= ""
+		and type(claim.requestId) == "string"
+		and claim.requestId ~= ""
+		and payload.requestId ~= claim.requestId
+	then
+		return
+	end
+	if self:ReleaseWarningClaim(memberId, payload.reason or "released") then
+		self:PersistActive()
+	end
+end
+
 function EarlyPrep:HandlePrepWarnClaimAck(sender, payload)
 	local sync = SF.LootHelperSync
 	if not sync or not sync.state or sync.state.active ~= true or type(payload) ~= "table" then
@@ -1506,17 +1797,17 @@ function EarlyPrep:CompleteClaimedWhisper(memberId, source, missing)
 	end
 	self:SyncNoticeToSession()
 	if EarlyPrep.IsWarned(self.notice, memberId) then
-		self:ReleaseWarningClaim(memberId, "already_warned")
+		self:AbandonWarningClaim(memberId, "already_warned")
 		return false
 	end
 	local profile = self:GetSessionProfile()
 	if not profile or not self:IsEffectiveAdmin(profile) then
-		self:ReleaseWarningClaim(memberId, "not_admin")
+		self:AbandonWarningClaim(memberId, "not_admin")
 		return false
 	end
 	local raidCheck = SF.RaidCheck
 	if not raidCheck or type(raidCheck.DeliverMissingRequirementsWhisper) ~= "function" then
-		self:ReleaseWarningClaim(memberId, "no_sender")
+		self:AbandonWarningClaim(memberId, "no_sender")
 		return false
 	end
 	local cfg = type(profile.GetRaidCheckConfig) == "function" and profile:GetRaidCheckConfig() or nil
@@ -1526,7 +1817,7 @@ function EarlyPrep:CompleteClaimedWhisper(memberId, source, missing)
 	end
 	local sent = raidCheck:DeliverMissingRequirementsWhisper(memberId, cfg, missing, profile, mode)
 	if not sent then
-		self:ReleaseWarningClaim(memberId, "send_failed")
+		self:AbandonWarningClaim(memberId, "send_failed")
 		return false
 	end
 	return self:CommitWarned(memberId, source or mode)
@@ -1689,7 +1980,7 @@ function EarlyPrep:EvaluateMember(memberId)
 	end
 	local sent = raidCheck:DeliverMissingRequirementsWhisper(memberId, cfg, result.missing, profile, "pre")
 	if not sent then
-		self:ReleaseWarningClaim(memberId, "send_failed")
+		self:AbandonWarningClaim(memberId, "send_failed")
 		return false
 	end
 	self:CommitWarned(memberId, "early")
@@ -1783,6 +2074,10 @@ function EarlyPrep:Refresh(reason)
 			DebugInfo("Coordinator responsibility %s (%s)", isCoordinator and "gained" or "lost", tostring(reason or "refresh"))
 		end
 
+		if isCoordinator and not wasCoordinator then
+			self:AdoptRemoteClaims(reason or "coordinator")
+		end
+
 		local raidCheck = SF.RaidCheck
 		if raidCheck and type(raidCheck.SetBackgroundInspectEnabled) == "function" then
 			local opts = nil
@@ -1836,6 +2131,13 @@ if SF.LootHelperSync then
 		local ep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
 		if ep and ep.HandlePrepWarnClaimAck then
 			return ep:HandlePrepWarnClaimAck(sender, payload)
+		end
+	end
+
+	function SF.LootHelperSync:HandlePrepWarnClaimRelease(sender, payload)
+		local ep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+		if ep and ep.HandlePrepWarnClaimRelease then
+			return ep:HandlePrepWarnClaimRelease(sender, payload)
 		end
 	end
 end

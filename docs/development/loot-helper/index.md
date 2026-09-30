@@ -110,7 +110,7 @@ Feature updates should fire or reuse `LootHelperEvents` so views refresh without
 
 Control messages use the small `SF_LH` traffic class; snapshots and log batches use `SF_LHB`. `modules/LootHelper/Comm.lua` is the current AceComm/ChatThrottleLib transport adapter.
 
-The current protocol version is **5**. Clients on protocol 4 cannot participate in a session that requires coordinator-serialized missing-requirements warning claims; mixed protocol 4 and protocol 5 interpretation of the same session is unsafe. `PROTO_MIN`, `PROTO_MAX`, `PROTO_CURRENT`, and `Sync.PROTO_VERSION` must stay aligned. Incoming `PROTO_NACK` and local unsupported-protocol chat warnings print once per peer and incompatibility signature until reload; repeats stay in debug logs.
+The current protocol version is **6**. Clients on protocol 5 cannot participate in a session that requires coordinator-serialized missing-requirements warning claims and claim release; mixed protocol 5 and protocol 6 interpretation of the same session is unsafe. `PROTO_MIN`, `PROTO_MAX`, `PROTO_CURRENT`, and `Sync.PROTO_VERSION` must stay aligned. Incoming `PROTO_NACK` and local unsupported-protocol chat warnings print once per peer and incompatibility signature until reload; repeats stay in debug logs.
 
 ### Session lifecycle
 

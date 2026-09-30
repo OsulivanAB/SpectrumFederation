@@ -737,11 +737,11 @@ local fallback = makeProfile("Fallback")
 addMember(fallback, ALT_A)
 assertFalse(fallback:IsItemAwareEquipmentPopup(), "no BiS config or events keeps manual popup")
 
--- Protocol 4 rejected, 5 accepted. Warning-claim serialization is not safe to
--- mix with protocol 4 clients.
-assertEq(SF.SyncProtocol.PROTO_CURRENT, 5, "protocol is 5")
-assertFalse(select(1, SF.SyncProtocol.ValidateProtocolVersion(4)), "protocol 4 is rejected")
-assertTrue(SF.SyncProtocol.ValidateProtocolVersion(5), "protocol 5 is accepted")
+-- Protocol 5 rejected, 6 accepted. Claim release and claim transfer are not
+-- safe to mix with protocol 5 clients.
+assertEq(SF.SyncProtocol.PROTO_CURRENT, 6, "protocol is 6")
+assertFalse(select(1, SF.SyncProtocol.ValidateProtocolVersion(5)), "protocol 5 is rejected")
+assertTrue(SF.SyncProtocol.ValidateProtocolVersion(6), "protocol 6 is accepted")
 
 -- Back icon is distinct from Chest
 local eqSource = io.open("SpectrumFederation/modules/UI/LootHelper/EquipmentWindow.lua"):read("*a")

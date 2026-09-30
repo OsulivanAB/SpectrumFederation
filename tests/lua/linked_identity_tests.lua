@@ -7648,12 +7648,12 @@ local function runProtocolAndSourceIdTests()
 -- ---------------------------------------------------------------------------
 -- Protocol
 -- ---------------------------------------------------------------------------
-assertEq(SF.SyncProtocol.PROTO_CURRENT, 5, "protocol current is 5")
-assertEq(SF.LootHelperSync.PROTO_VERSION, 5, "sync PROTO_VERSION is 5")
-local protoOk, _, protoCode = SF.SyncProtocol.ValidateProtocolVersion(4)
-assertFalse(protoOk, "protocol 4 cannot participate")
+assertEq(SF.SyncProtocol.PROTO_CURRENT, 6, "protocol current is 6")
+assertEq(SF.LootHelperSync.PROTO_VERSION, 6, "sync PROTO_VERSION is 6")
+local protoOk, _, protoCode = SF.SyncProtocol.ValidateProtocolVersion(5)
+assertFalse(protoOk, "protocol 5 cannot participate")
 assertEq(protoCode, "TOO_OLD", "old clients are TOO_OLD")
-assertTrue(SF.SyncProtocol.ValidateProtocolVersion(5), "protocol 5 is accepted")
+assertTrue(SF.SyncProtocol.ValidateProtocolVersion(6), "protocol 6 is accepted")
 
 resetEnv()
 local histA = makeProfile("HistA")

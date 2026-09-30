@@ -6,7 +6,7 @@ local Sync = SF.LootHelperSync
 -- Constants / Message Types
 -- ============================================================================
 
-Sync.PROTO_VERSION = 5
+Sync.PROTO_VERSION = 6
 
 Sync.PREFIX = {
     CONTROL = "SF_LH",
@@ -53,4 +53,5 @@ Sync.MSG = {
     -- Coordinator-serialized exclusive claim before a missing-requirements whisper.
     PREP_WARN_CLAIM_REQ = "PREP_WARN_CLAIM_REQ",
     PREP_WARN_CLAIM_ACK = "PREP_WARN_CLAIM_ACK",
+    PREP_WARN_CLAIM_RELEASE = "PREP_WARN_CLAIM_RELEASE",
 }

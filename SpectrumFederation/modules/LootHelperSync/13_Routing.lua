@@ -60,6 +60,7 @@ function Sync:OnControlMessage(sender, msgType, payload, distribution)
         if msgType == self.MSG.PREP_NOTICE then return self:HandlePrepNotice(sender, payload) end
         if msgType == self.MSG.PREP_WARN_CLAIM_REQ then return self:HandlePrepWarnClaimRequest(sender, payload) end
         if msgType == self.MSG.PREP_WARN_CLAIM_ACK then return self:HandlePrepWarnClaimAck(sender, payload) end
+        if msgType == self.MSG.PREP_WARN_CLAIM_RELEASE then return self:HandlePrepWarnClaimRelease(sender, payload) end
 
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Unknown CONTROL message type (msgType=%s, sender=%s, dist=%s)",

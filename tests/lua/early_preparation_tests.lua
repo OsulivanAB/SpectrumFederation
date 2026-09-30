@@ -369,6 +369,14 @@ assertTrue(not EarlyPrep.SessionAnnouncedForDedupe(true, false, true, "session-a
 assertTrue(EarlyPrep.SessionAnnouncedForDedupe(true, false, false, "session-a"), "a joined client uses session dedupe")
 assertTrue(EarlyPrep.SessionAnnouncedForDedupe(true, true, true, "session-a"), "an announced coordinator uses session dedupe")
 assertTrue(not EarlyPrep.SessionAnnouncedForDedupe(false, false, false, "session-a"), "an inactive session does not use session dedupe")
+assertTrue(
+	EarlyPrep.SessionAnnouncedForDedupe(true, false, true, "session-a", true),
+	"an exhausted-but-heartbeating coordinator still uses session dedupe"
+)
+assertTrue(
+	not EarlyPrep.SessionAnnouncedForDedupe(true, false, true, "session-a", false),
+	"a non-exhausted unannounced coordinator still skips session dedupe"
+)
 
 EarlyPrep.notice = EarlyPrep.NewNotice()
 EarlyPrep.notice.sessionId = "session-a"
@@ -886,6 +894,7 @@ assertEq(EarlyPrep.ClaimGrantDecision({
 
 SF.LootHelperSync.MSG.PREP_WARN_CLAIM_REQ = "PREP_WARN_CLAIM_REQ"
 SF.LootHelperSync.MSG.PREP_WARN_CLAIM_ACK = "PREP_WARN_CLAIM_ACK"
+SF.LootHelperSync.MSG.PREP_WARN_CLAIM_RELEASE = "PREP_WARN_CLAIM_RELEASE"
 SF.LootHelperSync.state.isCoordinator = true
 SF.LootHelperSync.state.coordinator = "Helper-Realm"
 SF.LootHelperSync.state.coordEpoch = 7
@@ -1071,6 +1080,122 @@ EarlyPrep:HandlePrepWarnClaimAck("Helper-Realm", {
 })
 assertEq(claimWhispers, 0, "a granted claim does not whisper after admin authority is lost")
 assertTrue(not EarlyPrep:WasWarned("Gina-Realm"), "a lost-admin completion does not record a warning")
+
+-- Failed delivery notifies the coordinator so the lease does not sit for the failsafe.
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordinator = "Helper-Realm"
+SF.LootHelperSync.state.coordEpoch = 7
+SF.LootHelperSync._SelfId = function()
+	return "Helper-Realm"
+end
+EarlyPrep._claims = {
+	["Hank-Realm"] = {
+		claimer = "Admin-Realm",
+		requestId = "Admin-Realm:prepclaim:release",
+		coordEpoch = 7,
+		expiresAt = EarlyPrep:_Now() + EarlyPrep.CLAIM_FAILSAFE_SECONDS,
+		source = "pre",
+	},
+}
+claimMsgs = {}
+SF.LootHelperComm.Send = function(_, _, msgType, payload, dist, target)
+	claimMsgs[#claimMsgs + 1] = {
+		msgType = msgType,
+		memberId = payload and payload.memberId,
+		requestId = payload and payload.requestId,
+		reason = payload and payload.reason,
+		dist = dist,
+		target = target,
+	}
+	return true
+end
+SF.LootHelperSync.state.isCoordinator = false
+SF.LootHelperSync.state.coordinator = "Helper-Realm"
+assertTrue(EarlyPrep:AbandonWarningClaim("Hank-Realm", "send_failed"), "abandon sends a coordinator release")
+assertEq(#claimMsgs, 1, "abandon emits one release message")
+assertEq(claimMsgs[1].msgType, "PREP_WARN_CLAIM_RELEASE", "abandon uses PREP_WARN_CLAIM_RELEASE")
+assertEq(claimMsgs[1].target, "Helper-Realm", "abandon whispers the coordinator")
+assertEq(claimMsgs[1].memberId, "Hank-Realm", "abandon names the claimed member")
+
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordinator = "Helper-Realm"
+SF.LootHelperSync._SelfId = function()
+	return "Helper-Realm"
+end
+EarlyPrep._claims = {
+	["Hank-Realm"] = {
+		claimer = "Admin-Realm",
+		requestId = "Admin-Realm:prepclaim:release",
+		coordEpoch = 7,
+		expiresAt = EarlyPrep:_Now() + EarlyPrep.CLAIM_FAILSAFE_SECONDS,
+		source = "pre",
+	},
+}
+EarlyPrep:HandlePrepWarnClaimRelease("Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Hank-Realm",
+	requestId = "Admin-Realm:prepclaim:release",
+	reason = "send_failed",
+})
+assertTrue(EarlyPrep:_FindClaim("Hank-Realm") == nil, "coordinator release clears the granted lease")
+
+-- In-flight claims persist and transfer across coordinator takeover.
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordEpoch = 7
+EarlyPrep._claims = {
+	["Ivy-Realm"] = {
+		claimer = "Admin-Realm",
+		requestId = "live-transfer",
+		coordEpoch = 7,
+		expiresAt = EarlyPrep:_Now() + 120,
+		source = "early",
+	},
+}
+local claimPersist = {
+	sessionId = "session-a",
+	profileId = "profile-a",
+}
+EarlyPrep:WritePersisted(claimPersist)
+assertTrue(type(claimPersist.prepClaims) == "table", "in-flight claims are written to the session record")
+assertEq(claimPersist.prepClaims[1].memberId, "Ivy-Realm", "persisted claims keep the member")
+assertTrue(claimPersist.prepClaims[1].remaining > 0, "persisted claims keep remaining TTL")
+
+local hb = EarlyPrep:HeartbeatPayload()
+assertTrue(type(hb) == "table" and type(hb.claims) == "table", "coordinator heartbeat carries in-flight claims")
+assertEq(hb.claims[1].memberId, "Ivy-Realm", "heartbeat claims name the reserved member")
+
+SF.LootHelperSync.state.isCoordinator = false
+EarlyPrep._claims = nil
+EarlyPrep._remoteClaimSnapshot = nil
+EarlyPrep:StoreRemoteClaims(hb.claims)
+assertTrue(type(EarlyPrep._remoteClaimSnapshot) == "table", "peers retain transferred claim snapshots")
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordEpoch = 8
+assertTrue(EarlyPrep:AdoptRemoteClaims("takeover"), "a successor adopts transferred claims")
+local _, adopted = EarlyPrep:_FindClaim("Ivy-Realm")
+assertTrue(adopted ~= nil, "adopted claims reserve the member")
+assertEq(adopted.coordEpoch, 8, "adopted claims use the successor coordinator epoch")
+assertEq(adopted.claimer, "Admin-Realm", "adopted claims keep the original claimer")
+
+EarlyPrep._claims = nil
+EarlyPrep._remoteClaimSnapshot = nil
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordEpoch = 7
+assertTrue(EarlyPrep:RestorePersistedClaims(claimPersist.prepClaims), "restore reinstalls persisted claims for a coordinator")
+assertTrue(EarlyPrep:_FindClaim("Ivy-Realm") ~= nil, "restored claims remain reserved")
+
+IsInRaid = function()
+	return false
+end
+assertTrue(not EarlyPrep.EligibleFilter({ id = "Bob-Realm" }), "EligibleFilter rejects party groups")
+assertTrue(not EarlyPrep:IsEligibleTarget("Bob-Realm"), "IsEligibleTarget rejects party groups")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
