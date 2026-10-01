@@ -1051,9 +1051,13 @@ function Sync:_CachedProfileSnapshot(profileId)
     end
     local now = self:_Now()
     local window = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    local sessionId = self.state.sessionId
+    local revision = self:_ProfileSnapshotCacheRevision(profileId)
     local cache = self.state._profileSnapshotBodyCache
     if type(cache) == "table"
         and cache.profileId == profileId
+        and cache.sessionId == sessionId
+        and cache.revision == revision
         and type(cache.payload) == "table"
         and tonumber(cache.at)
         and cache.at <= now
@@ -1064,10 +1068,39 @@ function Sync:_CachedProfileSnapshot(profileId)
     if type(payload) ~= "table" then return nil end
     self.state._profileSnapshotBodyCache = {
         profileId = profileId,
+        sessionId = sessionId,
+        revision = revision,
         at = now,
         payload = payload,
     }
     return payload
+end
+
+function Sync:_ProfileSnapshotCacheRevision(profileId)
+    local parts = { tostring(self.state and self.state.sessionId or "") }
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if type(profile) == "table" then
+        local logs = profile._lootLogs
+        parts[#parts + 1] = tostring(type(logs) == "table" and #logs or 0)
+        local admins = profile._adminUsers
+        parts[#parts + 1] = tostring(type(admins) == "table" and #admins or 0)
+        if SF.Consumables and SF.Consumables.Descriptor then
+            local desc = SF.Consumables.Descriptor(profile)
+            parts[#parts + 1] = tostring(desc.generation or 0)
+            parts[#parts + 1] = tostring(desc.configSeq or 0)
+            parts[#parts + 1] = tostring(desc.eventCount or 0)
+            parts[#parts + 1] = tostring(desc.eventFingerprint or 0)
+            parts[#parts + 1] = tostring(desc.archiveCount or 0)
+            parts[#parts + 1] = tostring(desc.archiveFingerprint or 0)
+        end
+    end
+    return table.concat(parts, ":")
+end
+
+function Sync:_ClearProfileSnapshotBodyCache()
+    if self.state then
+        self.state._profileSnapshotBodyCache = nil
+    end
 end
 
 function Sync:_NoteAdminGrantMiss(sender, member)

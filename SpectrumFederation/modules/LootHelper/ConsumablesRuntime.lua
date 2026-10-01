@@ -319,10 +319,25 @@ function Runtime:BankIsOpen()
     return false
 end
 
+function Runtime:GuildBankSlotCount(tab)
+    -- Retail guild-bank tabs are fixed-size; Blizzard UI iterates a constant.
+    -- Prefer a live API when a shim/test provides one, otherwise use the cap.
+    local slots = MAX_GUILD_BANK_SLOTS
+    if type(GetGuildBankNumSlots) == "function" then
+        local live = tonumber(GetGuildBankNumSlots(tab))
+        if live and live > 0 then
+            slots = live
+        end
+    end
+    if slots > MAX_GUILD_BANK_SLOTS then slots = MAX_GUILD_BANK_SLOTS end
+    if slots < 0 then slots = 0 end
+    return slots
+end
+
 function Runtime:TabItemCounts(tab)
     local counts = {}
-    if not tab or not GetGuildBankNumSlots or not GetGuildBankItemLink then return counts end
-    local slots = GetGuildBankNumSlots(tab) or 0
+    if not tab or not GetGuildBankItemLink then return counts end
+    local slots = self:GuildBankSlotCount(tab)
     local C = SF.Consumables
     for slot = 1, slots do
         local link = GetGuildBankItemLink(tab, slot)
@@ -381,14 +396,12 @@ function Runtime:DepositTargets(tab, itemId, limit)
     limit = tonumber(limit) or MAX_DEPOSIT_PLACES
     if limit < 1 then limit = 1 end
     if limit > MAX_DEPOSIT_PLACES then limit = MAX_DEPOSIT_PLACES end
-    if not tab or not itemId or not GetGuildBankNumSlots or not GetGuildBankItemLink then
+    if not tab or not itemId or not GetGuildBankItemLink then
         return targets
     end
     local C = SF.Consumables
     local maxStack = self:ItemStackLimit(itemId)
-    local slotCount = GetGuildBankNumSlots(tab) or 0
-    if slotCount > MAX_GUILD_BANK_SLOTS then slotCount = MAX_GUILD_BANK_SLOTS end
-    if slotCount < 0 then slotCount = 0 end
+    local slotCount = self:GuildBankSlotCount(tab)
     if maxStack then
         for slot = 1, slotCount do
             if #targets >= limit then break end
@@ -414,8 +427,8 @@ function Runtime:DepositTargets(tab, itemId, limit)
 end
 
 function Runtime:FreeSlots(tab)
-    if not tab or not GetGuildBankNumSlots or not GetGuildBankItemLink then return 0 end
-    local slots = GetGuildBankNumSlots(tab) or 0
+    if not tab or not GetGuildBankItemLink then return 0 end
+    local slots = self:GuildBankSlotCount(tab)
     local free = 0
     for slot = 1, slots do
         if not GetGuildBankItemLink(tab, slot) then
@@ -426,8 +439,8 @@ function Runtime:FreeSlots(tab)
 end
 
 function Runtime:FirstEmptySlot(tab)
-    if not tab or not GetGuildBankNumSlots or not GetGuildBankItemLink then return nil end
-    local slots = GetGuildBankNumSlots(tab) or 0
+    if not tab or not GetGuildBankItemLink then return nil end
+    local slots = self:GuildBankSlotCount(tab)
     for slot = 1, slots do
         if not GetGuildBankItemLink(tab, slot) then
             return slot
@@ -469,7 +482,7 @@ function Runtime:BankAccess(profile)
     end
     local mergeRoom = false
     if bankOpen and tabReady and cfg.bankTab and freeSlots <= 0 and type(self.bagCounts) == "table"
-        and GetGuildBankNumSlots and GetGuildBankItemLink then
+        and GetGuildBankItemLink then
         local carried = {}
         local carriedCount = 0
         local ids = C.RequestedItemIds(profile)
@@ -482,9 +495,7 @@ function Runtime:BankAccess(profile)
             end
         end
         if carriedCount > 0 then
-            local slotCount = GetGuildBankNumSlots(cfg.bankTab) or 0
-            if slotCount > MAX_GUILD_BANK_SLOTS then slotCount = MAX_GUILD_BANK_SLOTS end
-            if slotCount < 0 then slotCount = 0 end
+            local slotCount = self:GuildBankSlotCount(cfg.bankTab)
             for slot = 1, slotCount do
                 local link = GetGuildBankItemLink(cfg.bankTab, slot)
                 local slotItem = link and C.ItemIdFromText and C.ItemIdFromText(link) or nil
@@ -956,11 +967,38 @@ function Runtime:ScheduleDepositContinue(delay)
     self:PlaceNextDeposit()
 end
 
+function Runtime:DepositConfigStillValid(work)
+    if type(work) ~= "table" then return false end
+    local C = SF.Consumables
+    local profile = work.profile
+    if type(profile) ~= "table" then
+        profile = self:ProfileById(work.profileId)
+    end
+    if not profile or not C then return false end
+    local cfg = C.Ensure(profile)
+    if (tonumber(cfg.configSeq) or 0) ~= (tonumber(work.configSeq) or 0) then
+        return false
+    end
+    if tonumber(cfg.bankTab) ~= tonumber(work.tab) then
+        return false
+    end
+    local itemId = work.line and tonumber(work.line.itemId) or tonumber(work.itemId)
+    if work.requested == true and itemId and not C.IsRequested(profile, itemId) then
+        return false
+    end
+    return true
+end
+
 function Runtime:FinalizeDepositWork()
     local work = self.depositWork
     self.depositWork = nil
     if type(work) ~= "table" or (tonumber(work.placed) or 0) <= 0 then
         Warn("Could not deposit into the configured guild bank tab.")
+        self:CompleteDeferredProfileDeletes()
+        return
+    end
+    if not self:DepositConfigStillValid(work) then
+        Warn("Raid supplies configuration changed during the deposit.")
         self:CompleteDeferredProfileDeletes()
         return
     end
@@ -971,6 +1009,7 @@ function Runtime:FinalizeDepositWork()
         observedTab = work.observedTab or work.tab,
         guildGuid = work.guildGuid,
         generation = work.generation,
+        configSeq = work.configSeq,
         requested = work.requested == true,
         intended = work.intended - (tonumber(work.remaining) or 0),
         beforeTab = work.beforeTab,
@@ -979,6 +1018,7 @@ function Runtime:FinalizeDepositWork()
         bestActual = 0,
         token = self:NextToken("deposit"),
         profileId = work.profileId,
+        profile = work.profile,
     }
     if self.depositTimer and self.depositTimer.Cancel then
         self.depositTimer:Cancel()
@@ -996,6 +1036,14 @@ local MAX_DEPOSIT_LOCK_WAITS = 20
 function Runtime:PlaceNextDeposit()
     local work = self.depositWork
     if type(work) ~= "table" then return end
+    if not self:DepositConfigStillValid(work) then
+        -- Do not credit placements made under a config that no longer matches.
+        self.depositContinueGen = (self.depositContinueGen or 0) + 1
+        self.depositWork = nil
+        Warn("Raid supplies configuration changed during the deposit.")
+        self:CompleteDeferredProfileDeletes()
+        return
+    end
     local container = C_Container
     if not container or not PickupGuildBankItem then
         self:FinalizeDepositWork()
@@ -1186,6 +1234,7 @@ function Runtime:BeginDeposit(line, collected)
         observedTab = observedTab or tab,
         guildGuid = cfg.guild and cfg.guild.guid or nil,
         generation = cfg.generation,
+        configSeq = tonumber(cfg.configSeq) or 0,
         requested = C.IsRequested(profile, line.itemId) == true,
         intended = line.quantity,
         remaining = line.quantity,
@@ -1215,6 +1264,16 @@ function Runtime:FinishDeposit(fromTimer)
             self.depositTimer = nil
         end
         Debug("Warn", "Skipped deposit commit because profile %s is gone", tostring(intent.profileId))
+        self:CompleteDeferredProfileDeletes()
+        return
+    end
+    if not self:DepositConfigStillValid(intent) then
+        self.depositIntent = nil
+        if self.depositTimer and self.depositTimer.Cancel then
+            self.depositTimer:Cancel()
+            self.depositTimer = nil
+        end
+        Warn("Raid supplies configuration changed during the deposit.")
         self:CompleteDeferredProfileDeletes()
         return
     end

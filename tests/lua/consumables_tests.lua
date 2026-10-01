@@ -291,6 +291,7 @@ load("SpectrumFederation/modules/LootHelper/ConsumablesWorkflow.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesSync.lua")
 load("SpectrumFederation/modules/LootHelperSync/19_Consumables.lua")
 load("SpectrumFederation/modules/LootHelperSync/07_Validation.lua")
+load("SpectrumFederation/modules/LootHelperSync/08_Requests.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesRuntime.lua")
 
 local C = SF.Consumables
@@ -1174,9 +1175,44 @@ local function checkSessionTransport()
     end
     envelope.requestId = "sender-a"
     assertEq(first.requestId, nil, "copying the envelope protects the shared cache body")
+    Sync.state.sessionId = "s2"
+    Sync:_CachedProfileSnapshot(coordP._profileId)
+    assertEq(builds, 2, "a new session id rebuilds the snapshot cache")
+    Sync.state.sessionId = "s1"
+    Sync.state._profileSnapshotBodyCache = {
+        profileId = coordP._profileId,
+        sessionId = "s1",
+        revision = "stale",
+        at = clock,
+        payload = payload,
+    }
+    Sync:_CachedProfileSnapshot(coordP._profileId)
+    assertEq(builds, 3, "a changed profile revision rebuilds the snapshot cache")
     Sync._Now = function() return clock + 100 end
     Sync:_CachedProfileSnapshot(coordP._profileId)
-    assertEq(builds, 2, "the snapshot cache expires after the request timeout window")
+    assertEq(builds, 4, "the snapshot cache expires after the request timeout window")
+
+    -- Re-diverge after the earlier successful catch-up so a failed NEED_PROFILE
+    -- can clear the sticky descriptor key and allow another identical heartbeat.
+    C.CommitEvents(coordP, "catch-fail",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 3),
+        { writer = donor })
+    assertTrue(S.NeedsCatchUp(C.Descriptor(followerP), C.Descriptor(coordP)),
+        "a second coordinator donation leaves the follower behind again")
+    local pending = #requests
+    heartbeat()
+    assertEq(#requests, pending + 1, "a divergent heartbeat requests another snapshot")
+    assertTrue(Sync._consumablesCatchUpKey ~= nil, "catch-up stores its descriptor key after a request")
+    local suppressed = #requests
+    heartbeat()
+    assertEq(#requests, suppressed, "a pending catch-up key still suppresses identical heartbeats")
+    Sync._MInc = function() end
+    Sync._MetricsUpdateRequestQueueGauges = function() end
+    Sync.RunAfter = function() end
+    Sync:_FailRequest({ id = "catch-fail", kind = "NEED_PROFILE", attempt = 3, maxRetries = 2 }, "max attempts reached")
+    assertEq(Sync._consumablesCatchUpKey, nil, "a failed NEED_PROFILE clears the catch-up dedupe key")
+    heartbeat()
+    assertEq(#requests, suppressed + 1, "after a failed catch-up the next heartbeat requests again")
 
     resetSync()
 end
@@ -1601,6 +1637,43 @@ local function checkRuntimeDepositPartialAndFailure()
     local placedAfterBound = #world.places
     assertTrue(placedAfterBound >= 1, "placing continues after the first stack")
     assertEq(world.bags[0][2].count, 10, "a later-bound residual stack is left in the bags")
+
+    p = runtimeFixture("rt-no-numslots-api")
+    world.bankOpen = true
+    local savedNumSlots = GetGuildBankNumSlots
+    GetGuildBankNumSlots = nil
+    assertEq(RT:GuildBankSlotCount(2), 98, "without GetGuildBankNumSlots the retail tab size is used")
+    assertTrue(RT:FreeSlots(2) >= 1, "free-slot scans work without GetGuildBankNumSlots")
+    assertTrue(#RT:DepositTargets(2, aqirite, 3) >= 1, "deposit targets work without GetGuildBankNumSlots")
+    local collectedNoApi = RT:Collect()
+    assertTrue(collectedNoApi.usable, "an open configured tab is usable without GetGuildBankNumSlots")
+    GetGuildBankNumSlots = savedNumSlots
+
+    p = runtimeFixture("rt-config-mid-place")
+    world.bankOpen = true
+    startDeposit()
+    assertEq(#world.places, 1, "the first place lands before a mid-deposit config change")
+    local placesBeforeConfig = #world.places
+    assertTrue(select(1, C.RemoveRequestedItem(p, admin, aqirite)), "removing the requested item bumps configSeq")
+    drainAfter(32)
+    assertEq(#world.places, placesBeforeConfig, "a mid-deposit config change stops further placements")
+    assertEq(RT.depositWork, nil, "a mid-deposit config change clears deposit work")
+    assertEq(RT.depositIntent, nil, "a mid-deposit config change does not open a deposit intent")
+    assertEq(#p._consumableEvents, 0, "a mid-deposit config change records no donation")
+    assertTrue(contains(world.warnings[#world.warnings], "configuration changed"),
+        "a mid-deposit config change warns the player")
+
+    p = runtimeFixture("rt-config-mid-confirm")
+    world.bankOpen = true
+    startDeposit()
+    drainAfter(32)
+    assertTrue(type(RT.depositIntent) == "table", "placements finish into a confirmation intent")
+    assertTrue(select(1, C.SetBankTab(p, admin, 3)), "changing the bank tab bumps configSeq during confirmation")
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(RT.depositIntent, nil, "a config change during confirmation clears the intent")
+    assertEq(#p._consumableEvents, 0, "a config change during confirmation records no donation")
+    assertTrue(contains(world.warnings[#world.warnings], "configuration changed"),
+        "a config change during confirmation warns the player")
 end
 
 local function checkRuntimeCancelAndDeferredDelete()

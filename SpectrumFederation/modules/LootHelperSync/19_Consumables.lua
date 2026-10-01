@@ -348,6 +348,10 @@ function Sync:_NoteConsumablesSnapshot(profile, fromCoordinator)
     profile._consumablesCatchUpWantCoordinator = true
 end
 
+function Sync:_ClearConsumablesCatchUpDedupe()
+    self._consumablesCatchUpKey = nil
+end
+
 local function SessionPayloadOk(payload, sender)
     local S = Rules()
     if not S or not S.SessionEnvelopeOk(Sync.state, payload) then return false end
