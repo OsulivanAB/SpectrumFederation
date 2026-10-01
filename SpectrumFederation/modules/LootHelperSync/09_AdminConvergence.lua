@@ -642,6 +642,9 @@ function Sync:BroadcastSessionStart()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
+    end
 
     if SF.Debug then
         local helpersCount = type(chosenHelpers) == "table" and #chosenHelpers or 0
@@ -679,6 +682,15 @@ function Sync:BroadcastSessionStart()
         return
     end
     self:_MarkRosterAnnounced(self.state.sessionId)
+    if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
+        local announcedProfile = self:FindLocalProfileById(profileId)
+        if announcedProfile then
+            if self.BroadcastConsumablesConfig then
+                self:BroadcastConsumablesConfig(announcedProfile)
+            end
+            self:_FlushUnsentConsumablesEvents(announcedProfile)
+        end
+    end
 
     -- Start coordinator heartbeat sender (ticker)
     self:EnsureHeartbeatSender("BroadcastSessionStart")

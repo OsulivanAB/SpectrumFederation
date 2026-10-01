@@ -69,6 +69,9 @@ function Sync:BroadcastSessionHeartbeat(opts)
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
+    end
 
     -- Session end uses ALERT so this heartbeat stays ahead of SES_END.
     -- Different AceComm priorities can be delivered out of send order.

@@ -725,10 +725,40 @@ function Window:Create()
     content:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -C.CONTENT_PADDING, C.CONTENT_PADDING)
     frame.Content = content
 
+    local reminder = CreateFrame("Frame", nil, content)
+    reminder:SetHeight(0)
+    reminder:Hide()
+    reminder:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+    reminder:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, 0)
+    content.SupplyReminder = reminder
+
+    local reminderText = reminder:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    reminderText:SetPoint("LEFT", reminder, "LEFT", 4, 0)
+    reminderText:SetJustifyH("LEFT")
+    reminderText:SetText("Raid supplies available")
+    reminder.Text = reminderText
+
+    local dismissButton = CreateFrame("Button", nil, reminder, "UIPanelButtonTemplate")
+    dismissButton:SetSize(70, 18)
+    dismissButton:SetPoint("RIGHT", reminder, "RIGHT", -4, 0)
+    dismissButton:SetText("Dismiss")
+    dismissButton:SetScript("OnClick", function()
+        if reminder.OnDismiss then reminder.OnDismiss() end
+    end)
+
+    local reviewButton = CreateFrame("Button", nil, reminder, "UIPanelButtonTemplate")
+    reviewButton:SetSize(70, 18)
+    reviewButton:SetPoint("RIGHT", dismissButton, "LEFT", -4, 0)
+    reviewButton:SetText("Review")
+    reviewButton:SetScript("OnClick", function()
+        if reminder.OnReview then reminder.OnReview() end
+    end)
+    reminderText:SetPoint("RIGHT", reviewButton, "LEFT", -6, 0)
+
     local potHeader = CreateFrame("Frame", nil, content)
     potHeader:SetHeight(C.POT_HEADER_HEIGHT or 22)
-    potHeader:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
-    potHeader:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, 0)
+    potHeader:SetPoint("TOPLEFT", reminder, "BOTTOMLEFT", 0, 0)
+    potHeader:SetPoint("TOPRIGHT", reminder, "BOTTOMRIGHT", 0, 0)
     potHeader:Hide()
     content.PotHeader = potHeader
 
@@ -859,6 +889,18 @@ function Window:SetPointName(name)
     end
 end
 
+function Window:SetSupplyReminder(isVisible, onReview, onDismiss)
+    local f = self._frame
+    if not f or not f.Content or not f.Content.SupplyReminder then return end
+    local reminder = f.Content.SupplyReminder
+    isVisible = isVisible and true or false
+    reminder.OnReview = onReview
+    reminder.OnDismiss = onDismiss
+    reminder:SetShown(isVisible)
+    reminder:SetHeight(isVisible and (C.POT_HEADER_HEIGHT or 22) or 0)
+    self:RequestScrollInsetsUpdate()
+end
+
 function Window:SetRewardPotHeader(isVisible, text)
     local f = self._frame
     if not f or not f.Content or not f.Content.PotHeader then return end
@@ -981,11 +1023,15 @@ function Window:UpdateScrollInsets()
 		bottomInset = h + (C.RESIZE_HANDLE_GAP or 6)
 	end
 
-	-- Reserve top inset if the Reward Pot header is shown
+	-- Reserve top inset for the supply reminder and Reward Pot header when shown.
 	local topInset = 0
+	local reminder = content.SupplyReminder
+	if reminder and reminder:IsShown() then
+		topInset = topInset + (reminder:GetHeight() or 0)
+	end
 	local potHeader = content.PotHeader
 	if potHeader and potHeader:IsShown() then
-		topInset = potHeader:GetHeight() or (C.POT_HEADER_HEIGHT or 22)
+		topInset = topInset + (potHeader:GetHeight() or (C.POT_HEADER_HEIGHT or 22))
 	end
 
 	-- Apply anchors

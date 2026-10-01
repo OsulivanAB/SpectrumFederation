@@ -69,6 +69,13 @@ f:SetScript("OnEvent", function(_, _, loadedAddonName)
         SF.RaidCheck:EnsureInspectSupport()
     end
 
+    if SF.ConsumablesRuntime and SF.ConsumablesRuntime.Init then
+        if SF.Debug then
+            SF.Debug:Verbose("INIT", "Initializing Raid Consumables")
+        end
+        SF.ConsumablesRuntime:Init()
+    end
+
     if SF.VersionCheck and SF.VersionCheck.EnsureSupport then
         if SF.Debug then
             SF.Debug:Verbose("INIT", "Initializing addon version check")

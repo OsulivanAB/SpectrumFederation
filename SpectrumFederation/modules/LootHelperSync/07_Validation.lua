@@ -1001,6 +1001,108 @@ end
 -- @param sender string "Name-Realm"
 -- @param member string "Name-Realm"
 -- @return nil
+-- Function True when this sender may receive another full profile snapshot.
+-- The build copies the consumables ledger, so one member cannot request it
+-- again until a request timeout has elapsed. The book stays bounded by
+-- dropping timestamps that are already outside that window.
+-- @param sender string "Name-Realm"
+-- @return boolean
+function Sync:_ProfileSnapshotServeAllowed(sender)
+    if type(sender) ~= "string" or sender == "" then return false end
+    if not self.state then return false end
+    local book = self.state._profileSnapshotServe
+    if type(book) ~= "table" then return true end
+    local window = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    local now = self:_Now()
+    local at = tonumber(book[sender])
+    if at and at <= now and (now - at) < window then return false end
+    if book[sender] ~= nil then return true end
+    local count = 0
+    for name, stamped in pairs(book) do
+        local stampedAt = tonumber(stamped)
+        if not stampedAt or stampedAt > now or (now - stampedAt) >= window then
+            book[name] = nil
+        else
+            count = count + 1
+            if count >= 64 then return false end
+        end
+    end
+    return true
+end
+
+-- Function Remember that this sender was given a profile snapshot.
+-- @param sender string "Name-Realm"
+-- @return nil
+function Sync:_NoteProfileSnapshotServe(sender)
+    if not self.state or type(sender) ~= "string" or sender == "" then return end
+    self.state._profileSnapshotServe = self.state._profileSnapshotServe or {}
+    self.state._profileSnapshotServe[sender] = self:_Now()
+end
+
+-- Reuse one built profile snapshot body across concurrent NEED_PROFILE serves
+-- in the same timeout window so a multi-member join does not rebuild the
+-- full consumables ledger on every distinct requester.
+-- @param profileId string
+-- @return table|nil
+function Sync:_CachedProfileSnapshot(profileId)
+    if type(profileId) ~= "string" or profileId == "" then return nil end
+    if not self.state then
+        return self.BuildProfileSnapshot and self:BuildProfileSnapshot(profileId) or nil
+    end
+    local now = self:_Now()
+    local window = tonumber(self.cfg and self.cfg.requestTimeoutSec) or 5
+    local sessionId = self.state.sessionId
+    local revision = self:_ProfileSnapshotCacheRevision(profileId)
+    local cache = self.state._profileSnapshotBodyCache
+    if type(cache) == "table"
+        and cache.profileId == profileId
+        and cache.sessionId == sessionId
+        and cache.revision == revision
+        and type(cache.payload) == "table"
+        and tonumber(cache.at)
+        and cache.at <= now
+        and (now - cache.at) < window then
+        return cache.payload
+    end
+    local payload = self.BuildProfileSnapshot and self:BuildProfileSnapshot(profileId) or nil
+    if type(payload) ~= "table" then return nil end
+    self.state._profileSnapshotBodyCache = {
+        profileId = profileId,
+        sessionId = sessionId,
+        revision = revision,
+        at = now,
+        payload = payload,
+    }
+    return payload
+end
+
+function Sync:_ProfileSnapshotCacheRevision(profileId)
+    local parts = { tostring(self.state and self.state.sessionId or "") }
+    local profile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if type(profile) == "table" then
+        local logs = profile._lootLogs
+        parts[#parts + 1] = tostring(type(logs) == "table" and #logs or 0)
+        local admins = profile._adminUsers
+        parts[#parts + 1] = tostring(type(admins) == "table" and #admins or 0)
+        if SF.Consumables and SF.Consumables.Descriptor then
+            local desc = SF.Consumables.Descriptor(profile)
+            parts[#parts + 1] = tostring(desc.generation or 0)
+            parts[#parts + 1] = tostring(desc.configSeq or 0)
+            parts[#parts + 1] = tostring(desc.eventCount or 0)
+            parts[#parts + 1] = tostring(desc.eventFingerprint or 0)
+            parts[#parts + 1] = tostring(desc.archiveCount or 0)
+            parts[#parts + 1] = tostring(desc.archiveFingerprint or 0)
+        end
+    end
+    return table.concat(parts, ":")
+end
+
+function Sync:_ClearProfileSnapshotBodyCache()
+    if self.state then
+        self.state._profileSnapshotBodyCache = nil
+    end
+end
+
 function Sync:_NoteAdminGrantMiss(sender, member)
     if not self.state or type(sender) ~= "string" or sender == "" then return end
     if type(member) ~= "string" or member == "" then return end
