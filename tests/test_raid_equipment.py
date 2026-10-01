@@ -267,10 +267,10 @@ def test_early_preparation_whispers_production_lua():
     assert "IsEffectiveAdmin" in source.split("function EarlyPrep:CompleteClaimedWhisper", 1)[1].split(
         "\nfunction ", 1
     )[0]
-    assert "PROTO_CURRENT = 6" in (
+    assert "PROTO_CURRENT = 7" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "SyncProtocol.lua"
     ).read_text(encoding="utf-8")
-    assert "PROTO_VERSION = 6" in (
+    assert "PROTO_VERSION = 7" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "01_Constants.lua"
     ).read_text(encoding="utf-8")
     constants = (
@@ -278,15 +278,19 @@ def test_early_preparation_whispers_production_lua():
     ).read_text(encoding="utf-8")
     assert "PREP_WARN_CLAIM_REQ" in constants
     assert "PREP_WARN_CLAIM_RELEASE" in constants
+    assert "PREP_WARN_CLAIM_GRANT" in constants
     routing = (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelperSync" / "13_Routing.lua"
     ).read_text(encoding="utf-8")
     assert "HandlePrepWarnClaimRequest" in routing
     assert "HandlePrepWarnClaimAck" in routing
     assert "HandlePrepWarnClaimRelease" in routing
+    assert "HandlePrepWarnClaimGrant" in routing
     assert "function EarlyPrep:AbandonWarningClaim" in source
     assert "function EarlyPrep:AdoptRemoteClaims" in source
     assert "function EarlyPrep:ClaimsSnapshot" in source
+    assert "function EarlyPrep:MergeRemoteClaims" in source
+    assert "function EarlyPrep:_FinalizeGrantedClaim" in source
     assert "expiresAtWall" in source
     assert "function EarlyPrep:_WallNow" in source
     assert 'RC.CallEarlyPrep("Notify", "world")' in raid_check

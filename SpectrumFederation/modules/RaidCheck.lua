@@ -2246,6 +2246,11 @@ function RC:_HandleInspectReady(guid)
 						end
 						NormalizeSlotData(copy)
 						captured.slotsByInventory[inventorySlot] = copy
+					elseif (not hasNext) and unresolvedEntry then
+						-- A prior blended blank followed by another blank is not
+						-- proof the slot is empty; keep the observation unresolved.
+						blended = true
+						NormalizeSlotData(nextSlot)
 					else
 						NormalizeSlotData(nextSlot)
 					end

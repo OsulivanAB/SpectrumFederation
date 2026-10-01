@@ -644,7 +644,13 @@ SF.LootHelperComm = {
 		return true
 	end,
 }
-SF.LootHelperSync.MSG = { PREP_NOTICE = "PREP_NOTICE" }
+SF.LootHelperSync.MSG = {
+	PREP_NOTICE = "PREP_NOTICE",
+	PREP_WARN_CLAIM_REQ = "PREP_WARN_CLAIM_REQ",
+	PREP_WARN_CLAIM_ACK = "PREP_WARN_CLAIM_ACK",
+	PREP_WARN_CLAIM_RELEASE = "PREP_WARN_CLAIM_RELEASE",
+	PREP_WARN_CLAIM_GRANT = "PREP_WARN_CLAIM_GRANT",
+}
 SF.LootHelperSync.GetGroupDistribution = function()
 	return "RAID"
 end
@@ -895,11 +901,29 @@ assertEq(EarlyPrep.ClaimGrantDecision({
 SF.LootHelperSync.MSG.PREP_WARN_CLAIM_REQ = "PREP_WARN_CLAIM_REQ"
 SF.LootHelperSync.MSG.PREP_WARN_CLAIM_ACK = "PREP_WARN_CLAIM_ACK"
 SF.LootHelperSync.MSG.PREP_WARN_CLAIM_RELEASE = "PREP_WARN_CLAIM_RELEASE"
+SF.LootHelperSync.MSG.PREP_WARN_CLAIM_GRANT = "PREP_WARN_CLAIM_GRANT"
+SF.LootHelperSync.GetGroupDistribution = function()
+	return "RAID"
+end
 SF.LootHelperSync.state.isCoordinator = true
 SF.LootHelperSync.state.coordinator = "Helper-Realm"
 SF.LootHelperSync.state.coordEpoch = 7
 SF.LootHelperSync._SelfId = function()
 	return "Helper-Realm"
+end
+local grantMsgs = {}
+SF.LootHelperComm = SF.LootHelperComm or {}
+SF.LootHelperComm.Send = function(_, _, msgType, payload, dist, target)
+	grantMsgs[#grantMsgs + 1] = {
+		msgType = msgType,
+		dist = dist,
+		target = target,
+		memberId = payload and payload.memberId,
+		requestId = payload and payload.requestId,
+		granted = payload and payload.granted,
+		claims = payload and payload.claims,
+	}
+	return true
 end
 EarlyPrep:OnSessionReset("claim-reset")
 EarlyPrep.notice = EarlyPrep.NewNotice()
@@ -907,6 +931,14 @@ EarlyPrep.notice.sessionId = "session-a"
 EarlyPrep.notice.profileId = "profile-a"
 assertEq(EarlyPrep:BeginMissingWhisper("Bob-Realm", "early", { "gem" }), "granted", "the coordinator grants a local claim")
 assertTrue(EarlyPrep:_FindClaim("Bob-Realm") ~= nil, "a granted claim is tracked")
+local sawGrant = false
+for i = 1, #grantMsgs do
+	if grantMsgs[i].msgType == "PREP_WARN_CLAIM_GRANT" then
+		sawGrant = true
+		assertEq(grantMsgs[i].dist, "RAID", "claim grants replicate on the group channel")
+	end
+end
+assertTrue(sawGrant, "a local coordinator grant replicates before delivery")
 assertEq(EarlyPrep:BeginMissingWhisper("Bob-Realm", "early", { "gem" }), "granted", "the claimer can refresh the same claim")
 assertTrue(EarlyPrep:CommitWarned("Bob-Realm", "early"), "commit records the warning after delivery")
 assertTrue(EarlyPrep:_FindClaim("Bob-Realm") == nil, "commit releases the claim")
@@ -954,11 +986,18 @@ EarlyPrep:HandlePrepWarnClaimRequest("Admin-Realm", {
 	source = "pre",
 })
 local ack
+local grantBeforeAck = false
+local sawAck = false
 for i = 1, #claimMsgs do
+	if claimMsgs[i].msgType == "PREP_WARN_CLAIM_GRANT" and not sawAck then
+		grantBeforeAck = true
+	end
 	if claimMsgs[i].msgType == "PREP_WARN_CLAIM_ACK" then
 		ack = claimMsgs[i]
+		sawAck = true
 	end
 end
+assertTrue(grantBeforeAck, "the coordinator replicates the grant before ACK")
 assertTrue(ack ~= nil, "the coordinator answers with a claim ack")
 assertTrue(ack.granted == true, "the coordinator grants an open claim")
 
@@ -1229,6 +1268,7 @@ EarlyPrep._remoteClaimSnapshot = {
 		requestId = "takeover-lease",
 		source = "pre",
 		remaining = 90,
+		expiresAtWall = wallClock + 90,
 	},
 }
 SF.LootHelperSync.state.isCoordinator = true
@@ -1244,6 +1284,224 @@ local afterTakeover = {
 EarlyPrep:WritePersisted(afterTakeover)
 assertTrue(type(afterTakeover.prepClaims) == "table", "takeover persist keeps adopted claims")
 assertEq(afterTakeover.prepClaims[1].memberId, "Kate-Realm", "takeover persist names the reserved member")
+
+-- Waiting for takeover consumes wall-clock TTL instead of freezing remaining.
+EarlyPrep._claims = nil
+EarlyPrep._remoteClaimSnapshot = {
+	{
+		memberId = "Lara-Realm",
+		claimer = "Admin-Realm",
+		requestId = "aged",
+		source = "pre",
+		remaining = 120,
+		expiresAtWall = wallClock + 30,
+	},
+}
+wallClock = wallClock + 20
+assertTrue(EarlyPrep:AdoptRemoteClaims("aged-takeover"), "adoption recomputes remaining from wall expiry")
+local _, lara = EarlyPrep:_FindClaim("Lara-Realm")
+assertTrue(lara ~= nil, "a still-valid aged claim is adopted")
+assertTrue(lara.expiresAt - EarlyPrep:_Now() <= 30 + 1, "adoption does not restore the frozen remaining TTL")
+wallClock = wallClock + 40
+EarlyPrep._claims = nil
+EarlyPrep._remoteClaimSnapshot = {
+	{
+		memberId = "Lara-Realm",
+		claimer = "Admin-Realm",
+		requestId = "aged-expired",
+		source = "pre",
+		remaining = 120,
+		expiresAtWall = wallClock - 5,
+	},
+}
+assertTrue(not EarlyPrep:AdoptRemoteClaims("aged-expired"), "an elapsed transferred claim is discarded at adoption")
+
+-- Incremental grants merge into the remote snapshot instead of replacing it.
+EarlyPrep._remoteClaimSnapshot = {
+	{
+		memberId = "Mia-Realm",
+		claimer = "Admin-Realm",
+		requestId = "stale-remote",
+		source = "pre",
+		remaining = 50,
+		expiresAtWall = wallClock + 50,
+	},
+}
+SF.LootHelperSync.state.isCoordinator = false
+assertTrue(EarlyPrep:MergeRemoteClaims({
+	{
+		memberId = "Ned-Realm",
+		claimer = "Helper-Realm",
+		requestId = "grant-ned",
+		source = "early",
+		remaining = 80,
+		expiresAtWall = wallClock + 80,
+	},
+}), "a grant merges into the existing remote snapshot")
+assertEq(#EarlyPrep._remoteClaimSnapshot, 2, "grant merge keeps the prior transferred claim")
+assertEq(EarlyPrep._remoteClaimSnapshot[1].memberId, "Mia-Realm", "grant merge keeps the earlier member")
+assertEq(EarlyPrep._remoteClaimSnapshot[2].memberId, "Ned-Realm", "grant merge adds the granted member")
+
+-- Empty coordinator claims clear a stale remote snapshot.
+assertTrue(EarlyPrep:StoreRemoteClaims({}), "an empty claims table clears the remote snapshot")
+assertEq(EarlyPrep._remoteClaimSnapshot, nil, "cleared remote claims stay cleared")
+EarlyPrep._remoteClaimSnapshot = {
+	{
+		memberId = "Mia-Realm",
+		claimer = "Admin-Realm",
+		requestId = "stale-remote",
+		source = "pre",
+		remaining = 50,
+		expiresAtWall = wallClock + 50,
+	},
+}
+EarlyPrep._remoteClaimSnapshot = {
+	{
+		memberId = "Mia-Realm",
+		claimer = "Admin-Realm",
+		requestId = "stale-remote",
+		source = "pre",
+		remaining = 50,
+		expiresAtWall = wallClock + 50,
+	},
+}
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+assertTrue(EarlyPrep:ApplyHeartbeat("session-a", "profile-a", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	claims = {},
+}), "a heartbeat with empty claims clears transferred leases")
+assertEq(EarlyPrep._remoteClaimSnapshot, nil, "heartbeat empty claims clear the peer snapshot")
+
+-- Release after admin loss still works for the original claimer; request id must match.
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordinator = "Helper-Realm"
+SF.LootHelperSync.IsSenderAuthorized = function()
+	return false
+end
+EarlyPrep._claims = {
+	["Nina-Realm"] = {
+		claimer = "Admin-Realm",
+		requestId = "Admin-Realm:prepclaim:live",
+		coordEpoch = 8,
+		expiresAt = EarlyPrep:_Now() + 100,
+		source = "pre",
+	},
+}
+EarlyPrep:HandlePrepWarnClaimRelease("Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Nina-Realm",
+	requestId = "Admin-Realm:prepclaim:old",
+	reason = "not_admin",
+})
+assertTrue(EarlyPrep:_FindClaim("Nina-Realm") ~= nil, "a mismatched request id does not release the live lease")
+EarlyPrep:HandlePrepWarnClaimRelease("Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Nina-Realm",
+	requestId = "Admin-Realm:prepclaim:live",
+	reason = "not_admin",
+})
+assertTrue(EarlyPrep:_FindClaim("Nina-Realm") == nil, "the original claimer can release after authority loss")
+
+-- Failed ACK releases the just-created coordinator lease.
+SF.LootHelperSync.IsSenderAuthorized = function(_, profileId, sender)
+	return profileId == "profile-a" and (sender == "Admin-Realm" or sender == "Helper-Realm")
+end
+EarlyPrep._claims = nil
+local ackFailMsgs = {}
+local ackFailPhase = 0
+SF.LootHelperComm.Send = function(_, _, msgType, payload, dist, target)
+	ackFailMsgs[#ackFailMsgs + 1] = msgType
+	if msgType == "PREP_WARN_CLAIM_GRANT" then
+		return true
+	end
+	if msgType == "PREP_WARN_CLAIM_ACK" then
+		ackFailPhase = ackFailPhase + 1
+		return false
+	end
+	return true
+end
+EarlyPrep:HandlePrepWarnClaimRequest("Admin-Realm", {
+	sessionId = "session-a",
+	profileId = "profile-a",
+	memberId = "Owen-Realm",
+	requestId = "Admin-Realm:prepclaim:ackfail",
+	source = "pre",
+})
+assertTrue(EarlyPrep:_FindClaim("Owen-Realm") == nil, "a failed ACK releases the coordinator lease")
+
+-- Early completion abandons when the Early Preparation window has closed.
+SF.LootHelperComm.Send = function()
+	return true
+end
+IsInRaid = function()
+	return true
+end
+SF.LootHelperSync.state.isCoordinator = true
+SF.LootHelperSync.state.coordinator = "Helper-Realm"
+SF.LootHelperSync.IsSessionActive = function()
+	return true
+end
+SF.LootHelperSync.HasAnnouncedCurrentSession = function()
+	return true
+end
+SF.LootHelperSync._SelfId = function()
+	return "Helper-Realm"
+end
+EarlyPrep.ReadSetting = function()
+	return true
+end
+EarlyPrep.notice = EarlyPrep.NewNotice()
+EarlyPrep.notice.sessionId = "session-a"
+EarlyPrep.notice.profileId = "profile-a"
+EarlyPrep.notice.raidCheckBegun = true
+SF.LootHelperSync.FindLocalProfileById = function()
+	return {
+		id = "profile-a",
+		IsCurrentUserAdmin = function()
+			return true
+		end,
+		GetMemberByID = function(_, memberId)
+			return { id = memberId }
+		end,
+		GetRaidCheckConfig = function()
+			return { checkGemsInSockets = true, slots = { head = true } }
+		end,
+	}
+end
+claimMsgs = {}
+SF.LootHelperComm.Send = function(_, _, msgType, payload, dist, target)
+	claimMsgs[#claimMsgs + 1] = {
+		msgType = msgType,
+		memberId = payload and payload.memberId,
+		requestId = payload and payload.requestId,
+	}
+	return true
+end
+claimWhispers = 0
+EarlyPrep._claims = {
+	["Pat-Realm"] = {
+		claimer = "Helper-Realm",
+		requestId = "Helper-Realm:prepclaim:window",
+		coordEpoch = 7,
+		expiresAt = EarlyPrep:_Now() + 100,
+		source = "early",
+	},
+}
+assertTrue(not EarlyPrep:CompleteClaimedWhisper("Pat-Realm", "early", { "gem" }, "Helper-Realm:prepclaim:window"), "early completion stops when the window is closed")
+assertEq(claimWhispers, 0, "a closed early window does not whisper")
+assertTrue(EarlyPrep:_FindClaim("Pat-Realm") == nil, "a closed early window releases the local claim")
+
+-- Non-coordinator abandon still carries the ACK request id when no local lease exists.
+SF.LootHelperSync.state.isCoordinator = false
+claimMsgs = {}
+assertTrue(not EarlyPrep:CompleteClaimedWhisper("Pat-Realm", "early", { "gem" }, "Admin-Realm:prepclaim:window"), "early completion still stops for a non-coordinator")
+assertEq(claimMsgs[1] and claimMsgs[1].msgType, "PREP_WARN_CLAIM_RELEASE", "a closed early window abandons the claim")
+assertEq(claimMsgs[1] and claimMsgs[1].requestId, "Admin-Realm:prepclaim:window", "abandon carries the ACK request id")
 
 IsInRaid = function()
 	return false

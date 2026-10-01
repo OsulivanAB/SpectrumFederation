@@ -6,7 +6,7 @@ local Sync = SF.LootHelperSync
 -- Constants / Message Types
 -- ============================================================================
 
-Sync.PROTO_VERSION = 6
+Sync.PROTO_VERSION = 7
 
 Sync.PREFIX = {
     CONTROL = "SF_LH",
@@ -54,4 +54,6 @@ Sync.MSG = {
     PREP_WARN_CLAIM_REQ = "PREP_WARN_CLAIM_REQ",
     PREP_WARN_CLAIM_ACK = "PREP_WARN_CLAIM_ACK",
     PREP_WARN_CLAIM_RELEASE = "PREP_WARN_CLAIM_RELEASE",
+    -- Group-visible grant replication before ACK/delivery.
+    PREP_WARN_CLAIM_GRANT = "PREP_WARN_CLAIM_GRANT",
 }
