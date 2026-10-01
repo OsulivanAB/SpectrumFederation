@@ -2152,6 +2152,10 @@ function Sync:RelinquishUnauthorizedCoordination(reason, opts)
     -- Leave the session id in place so the existing heartbeat-timeout and
     -- explicit takeover paths can move coordination to an eligible admin.
     self.state.isCoordinator = false
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("coordinator_lost")
+    end
     if self.EnsureHeartbeatSender then
         self:EnsureHeartbeatSender("coordinator_lost_admin")
     end

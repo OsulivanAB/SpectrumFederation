@@ -7,9 +7,9 @@ local addonName, SF = ...
 -- luacheck: globals GetInventoryItemID C_TooltipInfo TooltipUtil Enum
 -- luacheck: globals EMPTY_SOCKET_PRISMATIC EMPTY_SOCKET_META EMPTY_SOCKET_RED EMPTY_SOCKET_YELLOW EMPTY_SOCKET_BLUE
 -- luacheck: globals EMPTY_SOCKET_HYDRAULIC EMPTY_SOCKET_COGWHEEL EMPTY_SOCKET_DOMINATION EMPTY_SOCKET_TINKER EMPTY_SOCKET_PRIMORDIAL
--- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
+-- luacheck: globals GetNumGroupMembers IsInRaid IsInGroup SendChatMessage C_ChatInfo UnitFullName UnitClass GetRealmName UnitGUID UnitExists UnitIsUnit
 -- luacheck: globals CreateFrame C_Timer NotifyInspect ClearInspectPlayer CanInspect CheckInteractDistance GetTime GetServerTime InCombatLockdown
--- luacheck: globals InspectFrame InspectUnit hooksecurefunc canaccessvalue
+-- luacheck: globals InspectFrame InspectUnit hooksecurefunc canaccessvalue geterrorhandler
 
 SF.RaidCheck = SF.RaidCheck or {}
 local RC = SF.RaidCheck
@@ -1077,8 +1077,11 @@ function RC:_GetInspectState()
 		manualInspectPauseUntil = nil,
 		localSnapshot = nil,
 		snapshotVersion = 0,
+		itemDataGeneration = 0,
+		localEquipmentGeneration = 0,
 		lastNotifiedVersion = -1,
 		backgroundInspectEnabled = false,
+		backgroundInspectConsumers = {},
 		backgroundMonitorStarted = false,
 		adhocRun = nil,
 		preflightOpen = false,
@@ -1086,28 +1089,139 @@ function RC:_GetInspectState()
 	}
 	self._inspectState.lastGood = self._inspectState.lastGood or {}
 	self._inspectState.lastIssuedGeneration = self._inspectState.lastIssuedGeneration or 0
+	self._inspectState.backgroundInspectConsumers = self._inspectState.backgroundInspectConsumers or {}
 	return self._inspectState
 end
 
-function RC:SetBackgroundInspectEnabled(enabled, reason)
+-- Multiple features can require the shared scanner at once. `opts.consumerId`
+-- is the stable consumer id; `reason` is only the diagnostic label. One
+-- consumer turning off does not stop inspection still required by another.
+-- `opts.filter` limits which units that consumer needs; a consumer without a
+-- filter requests the whole group.
+function RC:SetBackgroundInspectEnabled(enabled, reason, opts)
 	self:EnsureInspectSupport()
 
 	local state = self:_GetInspectState()
+	state.backgroundInspectConsumers = state.backgroundInspectConsumers or {}
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	local consumerId
+	if earlyPrep and earlyPrep.ConsumerId then
+		consumerId = earlyPrep.ConsumerId(reason, opts)
+	else
+		consumerId = (type(reason) == "string" and reason ~= "") and reason or "default"
+		if type(opts) == "table" and type(opts.consumerId) == "string" and opts.consumerId ~= "" then
+			consumerId = opts.consumerId
+		end
+	end
+	reason = (type(reason) == "string" and reason ~= "") and reason or consumerId
 	enabled = enabled and true or false
-	if state.backgroundInspectEnabled == enabled then
+	local filter = nil
+	if enabled and type(opts) == "table" then
+		filter = opts.filter
+	end
+
+	local prev = state.backgroundInspectConsumers[consumerId]
+	if enabled and prev and prev.filter == filter and state.backgroundInspectEnabled then
+		return
+	end
+	if not enabled and not prev then
 		return
 	end
 
-	state.backgroundInspectEnabled = enabled
+	local consumers, any
+	if earlyPrep and earlyPrep.MutateConsumers then
+		local spec = nil
+		if enabled then
+			spec = { filter = filter }
+		end
+		consumers, any = earlyPrep.MutateConsumers(state.backgroundInspectConsumers, consumerId, enabled, spec)
+		state.backgroundInspectConsumers = consumers
+	else
+		if enabled then
+			state.backgroundInspectConsumers[consumerId] = { filter = filter }
+		else
+			state.backgroundInspectConsumers[consumerId] = nil
+		end
+		any = next(state.backgroundInspectConsumers) ~= nil
+	end
+
+	if state.backgroundInspectEnabled == any then
+		-- A removed unfiltered consumer can leave a whole-raid queue behind a
+		-- filtered one. Drop entries that consumer no longer wants.
+		self:_PruneQueuedBackgroundInspects(false)
+		if enabled then
+			self:_RunBackgroundInspectPass()
+		end
+		return
+	end
+
+	state.backgroundInspectEnabled = any and true or false
 
 	if SF.Debug then
-		SF.Debug:Info("RAID_CHECK", "Background inspect %s (%s)", enabled and "enabled" or "disabled", tostring(reason or "unknown"))
+		SF.Debug:Info("RAID_CHECK", "Background inspect %s (%s)", state.backgroundInspectEnabled and "enabled" or "disabled", tostring(reason))
 	end
 
-	if enabled then
+	if state.backgroundInspectEnabled then
 		self:_StartBackgroundInspectMonitor()
 		self:_RunBackgroundInspectPass()
+	else
+		self:_DiscardQueuedBackgroundInspects()
 	end
+end
+
+function RC:_QueuedBackgroundInspectWanted(item)
+	if type(item) ~= "table" or item.source ~= "background" then
+		return true
+	end
+	local state = self:_GetInspectState()
+	if not state.backgroundInspectEnabled then
+		return false
+	end
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	if not earlyPrep or type(earlyPrep.ConsumerWantsUnit) ~= "function" then
+		return true
+	end
+	return earlyPrep.ConsumerWantsUnit(state.backgroundInspectConsumers, { id = item.id }) and true or false
+end
+
+-- Pending background scans belong to the shared consumer flag. Once the last
+-- consumer is gone, those queue entries must not keep calling NotifyInspect.
+-- While a consumer remains, drop only the entries its filter no longer wants.
+function RC:_PruneQueuedBackgroundInspects(dropAll)
+	local state = self:_GetInspectState()
+	local queue = state.queue
+	if type(queue) ~= "table" then
+		return 0
+	end
+	local head = state.queueHead or 1
+	if head < 1 then
+		head = 1
+	end
+	local kept = {}
+	local removed = 0
+	for i = head, #queue do
+		local item = queue[i]
+		if type(item) == "table" and item.key then
+			local drop = item.source == "background" and (dropAll or not self:_QueuedBackgroundInspectWanted(item))
+			if drop then
+				if type(state.queued) == "table" then
+					state.queued[item.key] = nil
+				end
+				removed = removed + 1
+			else
+				kept[#kept + 1] = item
+			end
+		end
+	end
+	if removed > 0 then
+		state.queue = kept
+		state.queueHead = 1
+	end
+	return removed
+end
+
+function RC:_DiscardQueuedBackgroundInspects()
+	return self:_PruneQueuedBackgroundInspects(true)
 end
 
 function RC:_IsInspectPausedForManual(now)
@@ -1246,8 +1360,28 @@ function RC:GetTroubleshootingVersion()
 	return state.snapshotVersion or 0
 end
 
+-- Bumped only when asynchronous item/tooltip data may change observation
+-- content without a new inspect capture. Distinct from the UI snapshot version
+-- so one member's INSPECT_READY does not invalidate every Early Preparation skip.
+function RC:_BumpItemDataGeneration()
+	local state = self:_GetInspectState()
+	state.itemDataGeneration = (state.itemDataGeneration or 0) + 1
+	return state.itemDataGeneration
+end
+
+function RC:GetItemDataGeneration()
+	local state = self:_GetInspectState()
+	return state.itemDataGeneration or 0
+end
+
+function RC:GetLocalEquipmentGeneration()
+	local state = self:_GetInspectState()
+	return state.localEquipmentGeneration or 0
+end
+
 function RC:_InvalidateLocalTroubleshootingSnapshot()
 	local state = self:_GetInspectState()
+	state.localEquipmentGeneration = (state.localEquipmentGeneration or 0) + 1
 	state.localSnapshot = nil
 end
 
@@ -1355,18 +1489,30 @@ function RC:_ClearPreparedSlotCaches()
 
 end
 
+function RC:_ApplyTooltipDataRefresh()
+	self:_ClearPreparedSlotCaches()
+	-- Recapture local gear after item data resolves; a stale incomplete link
+	-- must not be reused indefinitely.
+	self:_InvalidateLocalTroubleshootingSnapshot()
+	self:_BumpItemDataGeneration()
+	self:_MarkTroubleshootingDirty()
+	-- Early Preparation memoizes non-warning observations by stamp. Item and
+	-- tooltip resolution can make the same cache entry evaluable later, so
+	-- drop those skips even when no Equipment-page listener is registered.
+	RC.CallEarlyPrep("InvalidateObservationSkips", "tooltip")
+	local state = self:_GetInspectState()
+	if next(state.listeners) then
+		self:_NotifyTroubleshootingListeners(false, "tooltip")
+	end
+end
+
 function RC:_ScheduleTooltipDataRefresh()
 	local state = self:_GetInspectState()
-	if not next(state.listeners) then
-		return
-	end
 	if state.tooltipRefreshScheduled then
 		return
 	end
 	if not (C_Timer and C_Timer.After) then
-		self:_ClearPreparedSlotCaches()
-		self:_MarkTroubleshootingDirty()
-		self:_NotifyTroubleshootingListeners(false, "tooltip")
+		self:_ApplyTooltipDataRefresh()
 		return
 	end
 
@@ -1374,12 +1520,7 @@ function RC:_ScheduleTooltipDataRefresh()
 	C_Timer.After(0.25, function()
 		local current = self:_GetInspectState()
 		current.tooltipRefreshScheduled = false
-		if not next(current.listeners) then
-			return
-		end
-		self:_ClearPreparedSlotCaches()
-		self:_MarkTroubleshootingDirty()
-		self:_NotifyTroubleshootingListeners(false, "tooltip")
+		self:_ApplyTooltipDataRefresh()
 	end)
 end
 
@@ -1441,6 +1582,44 @@ function RC:_InvalidateInspectUnit(unit)
 	self:_NotifyTroubleshootingListeners()
 end
 
+-- A blended cache entry already reused older slots or item level. It is not a
+-- source of authoritative empty-slot conclusions, but it may still supply
+-- unresolved equipped-slot evidence for the next partial inspect.
+function RC.InspectFallbackEntry(entry)
+	if type(entry) ~= "table" or entry.blended == true then
+		return nil
+	end
+	return entry
+end
+
+function RC.InspectUnresolvedEntry(entry)
+	if type(entry) ~= "table" or entry.blended ~= true then
+		return nil
+	end
+	return entry
+end
+
+-- Early Preparation evaluation must not stop the shared inspect monitor or
+-- skip remaining roster/combat work. Keep unexpected errors observable.
+function RC.CallEarlyPrep(method, ...)
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	if not (earlyPrep and type(earlyPrep[method]) == "function") then
+		return
+	end
+	local ok, err = pcall(earlyPrep[method], earlyPrep, ...)
+	if ok then
+		return
+	end
+	local handler = geterrorhandler and geterrorhandler()
+	if type(handler) == "function" then
+		handler(err)
+		return
+	end
+	if SF.Debug then
+		SF.Debug:Error("RAID_CHECK", "Early preparation %s failed: %s", tostring(method), tostring(err))
+	end
+end
+
 function RC:_PrimeBackgroundInspectQueue()
 	local state = self:_GetInspectState()
 	if not state.backgroundInspectEnabled then
@@ -1455,22 +1634,41 @@ function RC:_PrimeBackgroundInspectQueue()
 	end
 
 	local now = GetTime and GetTime() or 0
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	local openedPass = false
+	if earlyPrep and type(earlyPrep.BeginMembershipPass) == "function" then
+		earlyPrep:BeginMembershipPass()
+		openedPass = true
+	end
 
-	for _, unit in ipairs(CollectUnits()) do
-		if not IsSelfUnit(unit) then
-			local info = BuildUnitInfo(unit)
-			if info.id then
-				local aliases = self:_GetInspectAliases(unit, info)
-				local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
-				local hasFreshData = cacheEntry
-					and cacheEntry.updatedAt
-					and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
+	-- End the membership pass even when queueing throws, then surface the error.
+	local ok, err = pcall(function()
+		for _, unit in ipairs(CollectUnits()) do
+			if not IsSelfUnit(unit) then
+				local info = BuildUnitInfo(unit)
+				local wanted = true
+				if earlyPrep and earlyPrep.ConsumerWantsUnit then
+					wanted = earlyPrep.ConsumerWantsUnit(state.backgroundInspectConsumers, info)
+				end
+				if info.id and wanted then
+					local aliases = self:_GetInspectAliases(unit, info)
+					local cacheEntry = self:_GetInspectCacheEntryByAliases(aliases)
+					local hasFreshData = cacheEntry
+						and cacheEntry.updatedAt
+						and (now - cacheEntry.updatedAt) <= INSPECT_CACHE_TTL_SECONDS
 
-				if not hasFreshData then
-					self:_QueueInspectForUnit(unit, info, cacheEntry)
+					if not hasFreshData then
+						self:_QueueInspectForUnit(unit, info, cacheEntry)
+					end
 				end
 			end
 		end
+	end)
+	if openedPass and type(earlyPrep.EndMembershipPass) == "function" then
+		earlyPrep:EndMembershipPass()
+	end
+	if not ok then
+		error(err, 0)
 	end
 end
 
@@ -1497,8 +1695,23 @@ function RC:_StartBackgroundInspectMonitor()
 			return
 		end
 
-		self:_RunBackgroundInspectPass()
+		-- Keep the bounded monitor alive even when a queue or evaluation pass
+		-- raises. Surface the error after the next tick is scheduled.
+		local ok, err = pcall(function()
+			self:_RunBackgroundInspectPass()
+			RC.CallEarlyPrep("OnBackgroundPass")
+		end)
+		if not self:_GetInspectState().backgroundInspectEnabled then
+			self:_GetInspectState().backgroundMonitorStarted = false
+			if not ok then
+				error(err, 0)
+			end
+			return
+		end
 		C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, BackgroundInspectTick)
+		if not ok then
+			error(err, 0)
+		end
 	end
 
 	C_Timer.After(BACKGROUND_INSPECT_POLL_SECONDS, BackgroundInspectTick)
@@ -1533,6 +1746,7 @@ function RC:_PauseInspectForCombat()
 				guid = active.guid,
 				id = active.id,
 				aliases = active.aliases,
+				source = active.source,
 			})
 		end
 
@@ -1562,6 +1776,7 @@ function RC:_ResumeInspectAfterCombat()
 	end
 	self:_ProcessInspectQueue()
 	self:_RunBackgroundInspectPass()
+	RC.CallEarlyPrep("OnBackgroundPass")
 	self:_MarkTroubleshootingDirty()
 	self:_NotifyTroubleshootingListeners()
 end
@@ -1618,11 +1833,17 @@ function RC:EnsureInspectSupport()
 				pcall(ClearInspectPlayer)
 			end
 			self:_NotifyTroubleshootingListeners()
+			-- Close raid-only Early Preparation before priming background scans so
+			-- a post-load party does not inherit a pre-zone Early Preparation queue.
+			RC.CallEarlyPrep("Notify", "world")
 			self:_RunBackgroundInspectPass()
 		elseif event == "GROUP_ROSTER_UPDATE" then
 			self:_ReconcileFrozenTargets()
 			self:_MarkTroubleshootingDirty()
 			self:_NotifyTroubleshootingListeners()
+			-- Close or reopen the raid-only Early Preparation window before any
+			-- retained queue work or background pass can inspect a party member.
+			RC.CallEarlyPrep("Notify", "roster")
 			self:_ProcessInspectQueue()
 			self:_RunBackgroundInspectPass()
 		end
@@ -1829,6 +2050,146 @@ local function BuildPolicyObservation(captured)
 	}
 end
 
+local function PreparationFromCaptured(captured, cfg)
+	if type(captured) ~= "table" or type(captured.slotsByInventory) ~= "table" then
+		return nil, "incomplete"
+	end
+	local Policy = SF.RaidEquipment and SF.RaidEquipment.Policy
+	if not Policy or type(Policy.EvaluateObservation) ~= "function" then
+		return nil, "policy"
+	end
+	local result = Policy.EvaluateObservation(BuildPolicyObservation(captured), cfg)
+	if type(result) ~= "table" or result.complete ~= true then
+		return nil, "incomplete"
+	end
+	return result, "fresh"
+end
+
+local PREPARATION_STAMP_SLOT_LIMIT = 32
+
+local function PreparationConfigStamp(cfg)
+	if type(cfg) ~= "table" then
+		return "-"
+	end
+	local slotParts = {}
+	if type(cfg.slots) == "table" then
+		local keys = {}
+		local count = 0
+		for key in pairs(cfg.slots) do
+			count = count + 1
+			if count > PREPARATION_STAMP_SLOT_LIMIT then
+				break
+			end
+			keys[count] = tostring(key)
+		end
+		table.sort(keys)
+		for i = 1, #keys do
+			local key = keys[i]
+			slotParts[i] = key .. (cfg.slots[key] and "1" or "0")
+		end
+	end
+	return table.concat({
+		cfg.checkGemsInSockets ~= false and "1" or "0",
+		cfg.requireMetaGem and "1" or "0",
+		cfg.requireMinimumItemLevel and "1" or "0",
+		tostring(tonumber(cfg.minimumItemLevel) or 0),
+		table.concat(slotParts, ","),
+	}, "|")
+end
+
+local function IsSelfMemberId(memberId)
+	local selfId = SF.GetPlayerFullIdentifier and SF:GetPlayerFullIdentifier() or nil
+	if selfId == memberId then
+		return true
+	end
+	if selfId and SF.NameUtil and SF.NameUtil.SamePlayer then
+		return SF.NameUtil.SamePlayer(selfId, memberId) and true or false
+	end
+	return false
+end
+
+-- Cheap identity of the observation GetAuthoritativePreparation would read.
+-- It does not build a policy result or read item tooltips. Callers use it to
+-- skip that work when an unchanged observation already produced no warning.
+function RC:GetPreparationObservationStamp(memberId, cfg)
+	if type(memberId) ~= "string" or memberId == "" then
+		return nil
+	end
+	local configStamp = PreparationConfigStamp(cfg)
+	if IsSelfMemberId(memberId) then
+		-- Local equipment generation changes when PLAYER_EQUIPMENT_CHANGED (or
+		-- another path) invalidates the local snapshot, so a memoized prepared
+		-- self result cannot skip recapture after a real gear change.
+		return table.concat({
+			"self",
+			tostring(self:GetLocalEquipmentGeneration()),
+			tostring(self:GetItemDataGeneration()),
+			configStamp,
+		}, "|")
+	end
+
+	local state = self:_GetInspectState()
+	local entry = state.cache and state.cache[memberId] or nil
+	if not entry then
+		entry = self:_GetInspectCacheEntryByAliases({ memberId })
+	end
+	local now = GetTime and GetTime() or 0
+	local updatedAt = type(entry) == "table" and tonumber(entry.updatedAt) or nil
+	local fresh = updatedAt and (now - updatedAt) <= INSPECT_CACHE_TTL_SECONDS
+	local status = type(entry) == "table" and entry.status or ""
+	local blended = type(entry) == "table" and entry.blended == true
+	-- Item-data generation invalidates memoization when tooltip/item identity
+	-- resolves without a new inspect. Do not use the global UI snapshot version;
+	-- that bumps on every INSPECT_READY and would reevaluate the whole roster.
+	return table.concat({
+		"remote",
+		tostring(updatedAt or ""),
+		tostring(status),
+		fresh and "1" or "0",
+		blended and "1" or "0",
+		tostring(self:GetItemDataGeneration()),
+		configStamp,
+	}, "|")
+end
+
+-- Newest cache entry only. An older complete last-good result is not a whisper
+-- source when the latest observation is incomplete, failed, or outside the
+-- shared inspect freshness window.
+function RC:GetAuthoritativePreparation(memberId, cfg)
+	if type(memberId) ~= "string" or memberId == "" then
+		return nil, "missing"
+	end
+
+	if IsSelfMemberId(memberId) then
+		local captured = self:_GetLocalTroubleshootingSnapshot()
+		if type(captured) ~= "table" or not captured.sawAnyData then
+			return nil, "incomplete"
+		end
+		return PreparationFromCaptured(captured, cfg)
+	end
+
+	local state = self:_GetInspectState()
+	local entry = state.cache and state.cache[memberId] or nil
+	if not entry then
+		entry = self:_GetInspectCacheEntryByAliases({ memberId })
+	end
+	local now = GetTime and GetTime() or 0
+	if type(entry) ~= "table" or not entry.updatedAt or (now - entry.updatedAt) > INSPECT_CACHE_TTL_SECONDS then
+		return nil, "stale"
+	end
+	if entry.status ~= "ready" then
+		return nil, "incomplete"
+	end
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	if earlyPrep and earlyPrep.ObservationAuthoritative and not earlyPrep.ObservationAuthoritative(entry) then
+		return nil, "incomplete"
+	end
+	if entry.blended == true then
+		return nil, "incomplete"
+	end
+	return PreparationFromCaptured(entry, cfg)
+end
+
 function RC:_HandleInspectReady(guid)
 	local state = self:_GetInspectState()
 	local CheckRun = SF.RaidEquipment and SF.RaidEquipment.CheckRun
@@ -1863,7 +2224,11 @@ function RC:_HandleInspectReady(guid)
 		-- slots missing link/texture temporarily). Prefer the new snapshot where
 		-- it has real data, but do not overwrite a previously-known slot with a
 		-- completely blank result.
-		local fallbackSlots = entry and entry.slotsByInventory or nil
+		local blended = false
+		local fallbackEntry = RC.InspectFallbackEntry(entry)
+		local unresolvedEntry = RC.InspectUnresolvedEntry(entry)
+		local sourceEntry = fallbackEntry or unresolvedEntry
+		local fallbackSlots = sourceEntry and sourceEntry.slotsByInventory or nil
 		if type(fallbackSlots) == "table" then
 			for inventorySlot, fallbackSlot in pairs(fallbackSlots) do
 				if type(inventorySlot) == "number" and type(fallbackSlot) == "table" then
@@ -1871,12 +2236,21 @@ function RC:_HandleInspectReady(guid)
 					local hasNext = SlotHasAnyItemData(nextSlot) or (type(nextSlot) == "table" and nextSlot.texture) or false
 					local hasFallback = SlotHasAnyItemData(fallbackSlot) or fallbackSlot.texture or false
 					if (not hasNext) and hasFallback then
+						-- Copying prior equipped evidence, including from a blended
+						-- entry, keeps the observation non-authoritative until a
+						-- later inspect independently confirms the slot is empty.
+						blended = true
 						local copy = {}
 						for key, value in pairs(fallbackSlot) do
 							copy[key] = value
 						end
 						NormalizeSlotData(copy)
 						captured.slotsByInventory[inventorySlot] = copy
+					elseif (not hasNext) and unresolvedEntry then
+						-- A prior blended blank followed by another blank is not
+						-- proof the slot is empty; keep the observation unresolved.
+						blended = true
+						NormalizeSlotData(nextSlot)
 					else
 						NormalizeSlotData(nextSlot)
 					end
@@ -1886,11 +2260,29 @@ function RC:_HandleInspectReady(guid)
 			for _, slotData in pairs(captured.slotsByInventory) do
 				NormalizeSlotData(slotData)
 			end
+			-- First capture has no prior evidence. A blank tracked slot may still
+			-- be an unequipped item whose inspect data has not arrived, so keep
+			-- the observation non-authoritative until a later inspect confirms it.
+			for _, column in ipairs(TROUBLESHOOTING_COLUMNS) do
+				local slotData = captured.slotsByInventory[column.inventorySlot]
+				local hasSlot = SlotHasAnyItemData(slotData)
+					or (type(slotData) == "table" and slotData.texture)
+					or false
+				if not hasSlot then
+					blended = true
+					break
+				end
+			end
 		end
+		local freshItemLevel = CanonicalOverallItemLevel(captured.overallEquippedItemLevel)
 		captured.overallEquippedItemLevel = KeepKnownOverallItemLevel(
 			captured.overallEquippedItemLevel,
-			entry and entry.overallEquippedItemLevel
+			sourceEntry and sourceEntry.overallEquippedItemLevel
 		)
+		if not freshItemLevel and CanonicalOverallItemLevel(captured.overallEquippedItemLevel) then
+			blended = true
+		end
+		captured.blended = blended
 		RecalculateCapturedSummary(captured)
 	end
 
@@ -1906,6 +2298,7 @@ function RC:_HandleInspectReady(guid)
 		entry.overallEquippedItemLevel = captured.overallEquippedItemLevel
 		entry.averageItemLevel = captured.overallEquippedItemLevel
 		entry.slotsByInventory = captured.slotsByInventory
+		entry.blended = captured.blended == true
 		PersistProfileEquipmentSnapshot(active.id, captured)
 
 		local policyObs = BuildPolicyObservation(captured)
@@ -1981,9 +2374,14 @@ function RC:_HandleInspectReady(guid)
 		pcall(ClearInspectPlayer)
 	end
 
+	local observedId = active.id
 	self:_MarkTroubleshootingDirty()
 	self:_NotifyTroubleshootingListeners()
 	self:_ProcessInspectQueue()
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	if earlyPrep and earlyPrep.OnMemberObserved and observedId then
+		earlyPrep:OnMemberObserved(observedId)
+	end
 end
 
 function RC:_ProcessInspectQueue()
@@ -2002,8 +2400,10 @@ function RC:_ProcessInspectQueue()
 			state.queued[item.key] = nil
 		end
 
-		if state.adhocRun and item and item.source ~= "adhoc" then
-			-- Drop background work while an ad-hoc check owns the inspect pipeline.
+		local backgroundUnwanted = item and item.source == "background" and not self:_QueuedBackgroundInspectWanted(item)
+		if backgroundUnwanted or (state.adhocRun and item and item.source ~= "adhoc") then
+			-- Drop background work no remaining consumer wants, and drop
+			-- non-adhoc work while an ad-hoc check owns the inspect pipeline.
 		else
 			local unit = item and FindUnitByGuidOrId(item.guid, item.id) or nil
 			if CanInspectUnitNow(unit) then
@@ -2894,6 +3294,31 @@ local function HasBeenWhisperedToday(member, mode)
 	return whisperDay == currentDay
 end
 
+function RC:DeliverMissingRequirementsWhisper(target, cfg, missingList, profile, mode)
+	if type(target) ~= "string" or target == "" or type(SendChatMessage) ~= "function" then
+		return false
+	end
+	-- A lockdown send does not arrive. Leave the warning unrecorded so a later pass can retry.
+	if C_ChatInfo and type(C_ChatInfo.InChatMessagingLockdown) == "function" and C_ChatInfo.InChatMessagingLockdown() then
+		return false
+	end
+	mode = (mode == "raid") and "raid" or "pre"
+	local pointName = GetPointName(profile)
+	if profile and type(profile.IsRewardPotMode) == "function" and profile:IsRewardPotMode() then
+		pointName = ATTENDANCE_POINT_NAME
+	end
+	local list = "Unprepared"
+	if type(missingList) == "table" and #missingList > 0 then
+		list = FormatMissingList(missingList)
+	end
+	WhisperMissing(target, cfg, ShortName(target), pointName, list, mode)
+	local member = FindMember(profile, target)
+	if member then
+		MarkWhisperSent(member, mode, time())
+	end
+	return true
+end
+
 local function EmitAdminMessage(message)
 	if type(message) ~= "string" or message == "" then
 		return
@@ -2915,6 +3340,8 @@ local function EmitAdminMissingSummary(modeLabel, summaryMissing)
 		local suffix = ""
 		if entry.whisperedMissing then
 			suffix = " (whispered)"
+		elseif entry.alreadyContacted then
+			suffix = " (already contacted)"
 		elseif entry.alreadyWhispered then
 			suffix = " (already whispered today)"
 		end
@@ -2970,6 +3397,27 @@ local function CollectGroupMemberIds()
 	return ids
 end
 
+function RC:CollectGroupMemberIds()
+	return CollectGroupMemberIds()
+end
+
+function RC:IsGroupMember(memberId)
+	if type(memberId) ~= "string" or memberId == "" then
+		return false
+	end
+	local ids = CollectGroupMemberIds()
+	for i = 1, #ids do
+		local id = ids[i]
+		if id == memberId then
+			return true
+		end
+		if SF.NameUtil and SF.NameUtil.SamePlayer and SF.NameUtil.SamePlayer(id, memberId) then
+			return true
+		end
+	end
+	return false
+end
+
 local function CurrentSessionSnapshot()
 	local sync = SF.LootHelperSync
 	local active = sync and sync.IsSessionActive and sync:IsSessionActive() and true or false
@@ -2983,8 +3431,25 @@ local function CurrentSessionSnapshot()
 		if sync.GetSessionProfileId then
 			profileId = sync:GetSessionProfileId()
 		end
+		local sendAccepted = false
 		if sync.HasAnnouncedCurrentSession then
-			announced = sync:HasAnnouncedCurrentSession(sessionId) and true or false
+			sendAccepted = sync:HasAnnouncedCurrentSession(sessionId) and true or false
+		end
+		local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+		if earlyPrep and earlyPrep.SessionAnnouncedForDedupe then
+			local reannounceExhausted = false
+			if sync.state and type(sessionId) == "string" then
+				reannounceExhausted = sync.state._reannounceExhaustedFor == sessionId
+			end
+			announced = earlyPrep.SessionAnnouncedForDedupe(
+				true,
+				sendAccepted,
+				sync.state and sync.state.isCoordinator,
+				sessionId,
+				reannounceExhausted
+			)
+		else
+			announced = sendAccepted
 		end
 	end
 	return {
@@ -3156,13 +3621,66 @@ function RC:_ApplyCheckConsequences(run)
 				missing = list,
 				whisperedMissing = false,
 				alreadyWhispered = false,
+				alreadyContacted = false,
 			}
 			if whisper and member and classId == CheckRun.CLASS.UNPREPARED then
-				local alreadyWhispered = HasBeenWhisperedToday(member, mode)
-				if not alreadyWhispered then
-					WhisperMissing(memberId, cfg, info.short or ShortName(memberId), whisperPointName, list, mode)
-					entry.whisperedMissing = true
-					MarkWhisperSent(member, mode, time())
+				local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+				local sessionDedupe = earlyPrep and earlyPrep.UsesSessionDedupe and earlyPrep:UsesSessionDedupe(run, session) and true or false
+				local action = "send"
+				if earlyPrep and earlyPrep.MissingWhisperAction then
+					local alreadyWarned = false
+					if sessionDedupe and earlyPrep.WasWarned then
+						alreadyWarned = earlyPrep:WasWarned(memberId) and true or false
+					end
+					action = earlyPrep.MissingWhisperAction({
+						whispersEnabled = true,
+						sessionDedupe = sessionDedupe,
+						alreadyWarned = alreadyWarned,
+						alreadyToday = (not sessionDedupe) and HasBeenWhisperedToday(member, mode) or false,
+					})
+				elseif HasBeenWhisperedToday(member, mode) then
+					action = "today"
+				end
+				if action == "send" and sessionDedupe and earlyPrep and earlyPrep.WarningRecordable then
+					if earlyPrep.SyncNoticeToSession then
+						earlyPrep:SyncNoticeToSession()
+					end
+					if not earlyPrep.WarningRecordable(earlyPrep.notice, memberId) then
+						action = "cap"
+					end
+				end
+				if action == "send" then
+					-- Session dedupe serializes claims through the coordinator
+					-- before any missing-requirements whisper is delivered.
+					local claim = "granted"
+					if sessionDedupe and earlyPrep and earlyPrep.BeginMissingWhisper then
+						claim = earlyPrep:BeginMissingWhisper(memberId, mode, missing)
+					end
+					if claim == "pending" then
+						-- Whisper completes when the coordinator grants the claim.
+					elseif claim == "denied" then
+						entry.alreadyContacted = true
+					else
+						-- Use the lockdown-aware sender. A blocked whisper must not
+						-- mark daily/session dedupe as delivered.
+						local sent = self:DeliverMissingRequirementsWhisper(memberId, cfg, missing, profile, mode)
+						if sent then
+							entry.whisperedMissing = true
+							if sessionDedupe and earlyPrep and earlyPrep.CommitWarned then
+								earlyPrep:CommitWarned(memberId, mode)
+							else
+								-- Non-session path has no claim to release.
+							end
+						elseif sessionDedupe and earlyPrep and earlyPrep.AbandonWarningClaim then
+							earlyPrep:AbandonWarningClaim(memberId, "send_failed")
+						elseif sessionDedupe and earlyPrep and earlyPrep.ReleaseWarningClaim then
+							earlyPrep:ReleaseWarningClaim(memberId, "send_failed")
+						end
+					end
+				elseif action == "session_contacted" then
+					entry.alreadyContacted = true
+				elseif action == "cap" then
+					-- The session warning list is full, so this whisper cannot be recorded.
 				else
 					entry.alreadyWhispered = true
 				end
@@ -3473,6 +3991,11 @@ function RC:_StartAdhocRun(mode, profile, cfg, opts)
 	local state = self:_GetInspectState()
 	state.adhocRun = run
 	state.preflightOpen = false
+
+	local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+	if earlyPrep and earlyPrep.ShouldNoteRaidCheckBegun and earlyPrep.NoteRaidCheckBegun and earlyPrep.ShouldNoteRaidCheckBegun(mode, opts) then
+		earlyPrep:NoteRaidCheckBegun(opts.expectedSessionId, opts.expectedSessionProfileId)
+	end
 
 	local label = ModeLabel(mode)
 	if SF.SystemMessage then

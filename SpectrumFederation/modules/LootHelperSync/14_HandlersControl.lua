@@ -328,6 +328,14 @@ function Sync:HandleSessionReannounce(sender, payload)
         self:_ApplyAdvertisedRCConfig(payload)
     end
 
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if type(payload.prepNotice) == "table" and earlyPrep and earlyPrep.AcceptRemotePrepNotice then
+        earlyPrep:AcceptRemotePrepNotice(sender, payload.sessionId, payload.profileId, payload.prepNotice)
+    end
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("session_reannounce")
+    end
+
     self.state.heartbeat = self.state.heartbeat or {}
     local hb = self.state.heartbeat
     if self._RememberCoordinatorKeepalive then
@@ -532,6 +540,14 @@ function Sync:HandleSessionHeartbeat(sender, payload)
         self:_ApplyAdvertisedRCConfig(payload)
     end
 
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.AcceptRemotePrepNotice then
+        earlyPrep:AcceptRemotePrepNotice(sender, payload.sessionId, payload.profileId, payload.prepNotice)
+    end
+    if earlyPrep and earlyPrep.Notify then
+        earlyPrep:Notify("heartbeat")
+    end
+
     -- Heartbeat bookkeeping. An unproven catch-up coordinator does not extend
     -- the takeover clock after the descriptor that adopted them.
     self.state.heartbeat = self.state.heartbeat or {}
@@ -724,6 +740,10 @@ function Sync:HandleCoordinatorTakeover(sender, payload)
 
     if wasCoordinator and not self.state.isCoordinator then
         self:StopHeartbeatSender("lost coordinator via COORD_TAKEOVER")
+        local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+        if earlyPrep and earlyPrep.Notify then
+            earlyPrep:Notify("coordinator_lost")
+        end
     elseif self.BackfillAutomaticBisOnPromotion then
         self:BackfillAutomaticBisOnPromotion(wasCoordinator, "HandleCoordinatorTakeover")
     end
