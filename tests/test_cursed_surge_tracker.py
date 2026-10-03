@@ -42,8 +42,8 @@ def parents(mapping):
 def test_lua_constants_match_python_contract():
     assert cst.parse_lua_number("COILED_ISLE_MAP_ID") == 2512
     assert cst.parse_lua_string("FALLBACK_ATLAS") == "UI-EventPoi-venomoustides"
-    assert cst.parse_lua_number("LOCATION_STEP_SECONDS") == 2700
-    assert cst.parse_lua_number("SAME_LOCATION_RECURRENCE_SECONDS") == 13500
+    assert cst.parse_lua_number("LOCATION_STEP_SECONDS") == 1800
+    assert cst.parse_lua_number("SAME_LOCATION_RECURRENCE_SECONDS") == 9000
     lua = cst.lua_constants_text()
     for loc in cst.LOCATIONS:
         assert str(loc["areaPoiID"]) in lua
@@ -116,11 +116,11 @@ def test_selects_active_occurrence():
 
 
 def test_allows_multiple_locations_active_simultaneously():
-    now = 1000
+    now = 1810
     rows = [
-        row(8939, 900, 1100),
-        row(8937, 980, 1200),
-        row(8940, 2000, 2300),
+        row(8939, 0, 1828),
+        row(8937, 1800, 3628),
+        row(8940, 3600, 5428),
     ]
     states = [
         cst.resolve_location_state(location(8939), rows, now, "ready"),
@@ -144,10 +144,10 @@ def test_selects_latest_completed_occurrence():
 
 
 def test_uses_end_minus_start_instead_of_duration_field():
-    payload = row(8938, 1000, 3728, duration=2700)
-    assert cst.event_duration(payload) == 2728
+    payload = row(8938, 1000, 2828, duration=1800)
+    assert cst.event_duration(payload) == 1828
     state = cst.resolve_location_state(location(8938), [payload], 1000, "ready")
-    assert state["countdownSeconds"] == 2728
+    assert state["countdownSeconds"] == 1828
 
 
 def test_inactive_ring_progress_formula_and_boundaries():
@@ -174,7 +174,7 @@ def test_keeps_active_ring_full():
 
 
 def test_missing_previous_event_uses_guarded_fallback_or_hides_ring():
-    nxt = row(8936, 10_000, 12_728)
+    nxt = row(8936, 10_000, 11_828)
     state = cst.resolve_location_state(location(8936), [nxt], 100, "ready")
     assert state["status"] == "inactive"
     assert state["previousEndSource"] == "recurrence"
@@ -186,23 +186,23 @@ def test_missing_previous_event_uses_guarded_fallback_or_hides_ring():
 
 def test_inferred_previous_end_from_consecutive_rows():
     rows = [
-        row(8939, 0, 2728),
-        row(8939, 13500, 16228),
+        row(8939, 0, 1828),
+        row(8939, 9000, 10828),
     ]
     previous_end, source = cst.resolve_previous_end_time(rows, rows[1], 3000)
     assert source == "scheduler"
-    assert previous_end == 2728
+    assert previous_end == 1828
     previous_end, source = cst.resolve_previous_end_time([rows[1]], rows[1], 3000)
     assert source == "recurrence"
-    assert previous_end == 2728
+    assert previous_end == 1828
 
     future_rows = [
-        row(8939, 20000, 22728),
-        row(8939, 33500, 36228),
+        row(8939, 20000, 21828),
+        row(8939, 29000, 30828),
     ]
     previous_end, source = cst.resolve_previous_end_time(future_rows, future_rows[0], 1000)
     assert source == "inferred"
-    assert previous_end == 9228
+    assert previous_end == 12828
 
 
 def test_missing_next_event_marks_unavailable_when_not_active():
