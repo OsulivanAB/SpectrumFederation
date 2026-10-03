@@ -23,8 +23,11 @@ Use this skill for work in `SpectrumFederation/modules/Settings/` or `SpectrumFe
 
 ## Validation
 
+Select checks from the canonical map in root `AGENTS.md` (Validation By Change
+Area). For this skill's focused area:
+
 - Run `python3 .github/scripts/lint_all.py`
 - If navigation, categories, tabs, search, or `ShowPage` changed: `python -m pytest tests/test_settings_navigation.py`
 - If Settings window chrome, content host, Section/PageBuilder layout, or the impersonation banner changed: `python -m pytest tests/test_settings_window_layout.py`. Prefer assertions that layout/refresh work converges rather than only that no Lua error occurred.
 - If Mouse Tracer settings or page chrome changed, also run `python -m pytest tests/test_mouse_tracer.py` when the engine or constants were touched
-- Recommend in-game verification with `/reload` and a quick settings UI smoke test
+- Recommend in-game verification with `/reload` and a quick settings UI smoke test; do not fabricate Retail evidence

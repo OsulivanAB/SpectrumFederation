@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.7-beta.1] - 2026-10-03
+
+### Changed
+- Update Cursed Surge cadence to 30 minutes
+
 ## [1.5.6] - 2026-09-27
 
 ### Added

@@ -59,9 +59,15 @@ reviews:
         behavior when needed to substantiate a finding. Do not stop after the
         first defect; finish the affected review scope.
 
+        Separate defect validity from suggested-repair suitability. Confirm a
+        credible defect without assuming the reviewer's proposed patch is the
+        complete or correct remedy.
+
         For each finding, establish a concrete triggering condition, resulting
         failure or user impact, and affected code. Consolidate symptoms that
-        share one root cause.
+        share one root cause. Prefer behavioral lifecycle evidence for stateful
+        or cross-component defects; source-string presence alone is not runtime
+        proof.
 
         Do not report formatting preferences, naming preferences, cosmetic
         changes, speculative refactors, or unrelated cleanup as defects.
@@ -76,6 +82,9 @@ reviews:
 
         Require credible reachability. A theoretically possible problem is not
         actionable unless the changed code can realistically trigger it.
+
+        Support performance findings with mechanism or proportionate cost
+        analysis; ordinary repeated work is not automatically a freeze.
 
         Passing tests do not prove runtime correctness. Never claim that
         World of Warcraft in-game testing occurred unless the PR contains
@@ -95,13 +104,16 @@ reviews:
         concerns.
 
         Trace event handlers, timers, tickers, OnUpdate handlers, callbacks,
-        layout refreshes, inspection queues, retries, and addon-message
+        layout refreshes, inspection queues, retries, caches, and addon-message
         processing for credible feedback loops, duplicate registration,
-        unbounded work, amplification, or failure to become idle.
+        unbounded work, amplification, failure to become idle, incomplete cache
+        invalidation, or retry obligations abandoned or retained incorrectly.
+        A timeout alone does not prove an external side effect did not happen.
 
         Recurring code is not inherently defective. Establish its triggering
         path, frequency, lifecycle, termination conditions, and cleanup before
-        reporting a problem.
+        reporting a problem. Support performance findings with mechanism or
+        proportionate cost analysis.
 
         Check asynchronous game data for delayed availability, stale callbacks,
         identity changes, invalidated state, retries, and cancellation where
@@ -129,10 +141,12 @@ reviews:
 
     - path: "**/*.toc"
       instructions: |
-        Check addon metadata and release compatibility. When shipped behavior,
-        UI, settings, or other user-visible addon functionality changes, verify
-        the repository's versioning requirements are satisfied and related
-        parent/child TOC versions remain consistent where required.
+        Check addon metadata and release compatibility. When packaged behavior,
+        UI, settings, or other shipped addon functionality changes
+        (`release_required`), verify versioning requirements and related
+        parent/child TOC versions remain consistent. Instruction/docs/infra-only
+        changes are not automatic version bumps when the TOC format is already
+        valid for the target branch.
 
     - path: ".github/workflows/**"
       instructions: |
@@ -155,15 +169,20 @@ reviews:
         bounded/convergent execution. Prefer tests that load production Lua and
         assert lifecycle, state-transition, persistence, synchronization, and
         termination behavior over tests that merely duplicate implementation
-        logic.
+        logic or assert source-string presence. For stateful fixes, prefer
+        event-sequence evidence and, when practical, fail-then-pass regression
+        demonstration.
 
   auto_review:
+    # Reviews are owner-requested. Keep every automatic or opt-in shortcut off.
     enabled: false
     auto_incremental_review: false
+    description_keyword: ""
     auto_pause_after_reviewed_commits: 2
     drafts: false
     base_branches:
       - "^beta$"
+    # Positive labels trigger reviews even when enabled is false.
     labels: []
     ignore_title_keywords: []
     ignore_usernames: []
