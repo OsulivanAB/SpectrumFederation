@@ -228,8 +228,8 @@ function S.RemoteEventAdmission(isCoordinator, fromCoordinator, event)
         event.writer = nil
         return true, false
     end
-    local order = tonumber(event.order)
-    if fromCoordinator == true and order and order > 0 then
+    local order = C.ValidOrder and C.ValidOrder(event.order) or nil
+    if fromCoordinator == true and order then
         return true, true
     end
     return false, false

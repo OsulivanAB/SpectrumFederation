@@ -25,10 +25,10 @@ CST.RING_TEXTURE = "Interface\\AddOns\\SpectrumFederation_CursedSurgeTracker\\me
 
 -- Documented cadence from live observation. Live scheduler timestamps remain
 -- the timing authority whenever valid rows exist.
--- A new location starts every 2,700 seconds (45 minutes).
-CST.LOCATION_STEP_SECONDS = 2700
--- The same location repeats every 13,500 seconds (3 hours 45 minutes).
-CST.SAME_LOCATION_RECURRENCE_SECONDS = 13500
+-- A new location starts every 1,800 seconds (30 minutes).
+CST.LOCATION_STEP_SECONDS = 1800
+-- The same location repeats every 9,000 seconds (2 hours 30 minutes).
+CST.SAME_LOCATION_RECURRENCE_SECONDS = 9000
 -- Verified rotation of Area POI IDs:
 -- 8939 -> 8937 -> 8940 -> 8938 -> 8936 -> repeat
 CST.ROTATION_AREA_POI_IDS = { 8939, 8937, 8940, 8938, 8936 }

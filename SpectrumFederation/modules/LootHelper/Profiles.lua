@@ -587,10 +587,15 @@ function LootProfile:_MarkIntegritySummaryDirty()
     self._authorWindowSummaryDirty = true
 end
 
+function LootProfile:_NoteSnapshotMutation()
+    self._snapshotRevision = (tonumber(self._snapshotRevision) or 0) + 1
+end
+
 -- Bump when log contents change so sync can drop a cached history scan.
 -- Index rebuilds do not call this. A replaced row and an appended row do.
 function LootProfile:_NoteLootLogMutation()
     self._lootLogRevision = (tonumber(self._lootLogRevision) or 0) + 1
+    self:_NoteSnapshotMutation()
 end
 
 function LootProfile:_RefreshLogPositionIndex()
@@ -1770,6 +1775,7 @@ function LootProfile:SetRaidCheckEquipmentSnapshot(memberId, snapshot)
 
 	snapshotCopy.preparedSlotsByConfig = {}
 	self._raidCheckEquipmentSnapshots[memberId] = snapshotCopy
+	self:_NoteSnapshotMutation()
 	return true
 end
 
@@ -1804,6 +1810,7 @@ function LootProfile:SetRaidCheckSlotEnabled(slotKey, enabled)
 	end
 
 	self._raidCheckConfig.slots[slotKey] = enabled and true or false
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1826,6 +1833,7 @@ function LootProfile:SetRaidCheckWhispers(mode, enabled)
 		return false, "Invalid whisper mode."
 	end
 
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1840,6 +1848,7 @@ function LootProfile:SetRaidCheckWhisperPrepared(enabled)
 	end
 
 	self._raidCheckConfig.enableWhispersRaidPrepared = enabled and true or false
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1866,6 +1875,7 @@ function LootProfile:SetRaidCheckWhisperTemplate(key, template)
 		self._raidCheckConfig[field] = template
 	end
 
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1881,6 +1891,7 @@ function LootProfile:ResetRaidCheckWhisperTemplate(key)
 	end
 
 	self._raidCheckConfig[field] = RAID_CHECK_DEFAULTS[field]
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1895,6 +1906,7 @@ function LootProfile:SetRaidCheckPointsAwardPerCheck(amount)
 	end
 
 	self._raidCheckConfig.pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(amount)
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1909,6 +1921,7 @@ function LootProfile:SetRaidCheckGemSocketsEnabled(enabled)
     end
 
     self._raidCheckConfig.checkGemsInSockets = enabled and true or false
+    self:_NoteSnapshotMutation()
     return true, nil
 end
 
@@ -1923,6 +1936,7 @@ function LootProfile:SetRaidCheckMetaGemRequired(enabled)
     end
 
     self._raidCheckConfig.requireMetaGem = enabled and true or false
+    self:_NoteSnapshotMutation()
     return true, nil
 end
 
@@ -1943,6 +1957,7 @@ function LootProfile:SetRaidCheckMinimumItemLevelRequired(enabled)
 	end
 	NoteItemLevelPolicyChanged()
 	PublishRaidCheckItemLevelPolicy(self)
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1963,6 +1978,7 @@ function LootProfile:SetRaidCheckMinimumItemLevel(amount)
 	end
 	NoteItemLevelPolicyChanged()
 	PublishRaidCheckItemLevelPolicy(self)
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1985,6 +2001,7 @@ function LootProfile:ApplyRaidCheckItemLevelPolicy(enabled, minimum, options)
 	self._raidCheckConfig.requireMinimumItemLevel = nextEnabled
 	self._raidCheckConfig.minimumItemLevel = nextMinimum
 	NoteItemLevelPolicyChanged()
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -2256,6 +2273,7 @@ function LootProfile:ApplyRCLootCouncilIntegrationConfig(config, options)
 		target = GetMutableRCLootCouncilIntegration(self)
 	end
 	ApplyRCLootCouncilIntegrationFields(target, config)
+	self:_NoteSnapshotMutation()
 	if not options.skipSync then
 		return PushRCIntegrationConfig(self)
 	end
@@ -4048,6 +4066,7 @@ function LootProfile:SetProfileName(newName)
             SF.Debug:Warn("LootProfile", "Attempted to set invalid profile name: %s", tostring(newName))
         end
     end
+    self:_NoteSnapshotMutation()
 end
 
 -- Function to set a new owner for this profile
@@ -4069,6 +4088,7 @@ function LootProfile:SetOwner(newOwner)
             SF.Debug:Warn("LootProfile", "Attempted to set invalid owner: %s", tostring(newOwner))
         end
     end
+    self:_NoteSnapshotMutation()
 end
 
 -- Runtime-only notice latch. Kept off the profile table so it is not saved.
@@ -4241,6 +4261,7 @@ function LootProfile:AddMember(member)
         self._members = self._members or {}
         table.insert(self._members, member)
         self._memberById = nil
+        self:_NoteSnapshotMutation()
         return true
     else
         if SF.Debug then
@@ -4275,6 +4296,7 @@ function LootProfile:RemoveMemberById(memberId)
         self._memberById = nil
     end
 
+    self:_NoteSnapshotMutation()
     return removed
 end
 
@@ -5199,6 +5221,7 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	if self.NormalizePersistedLegacyBonusRolls then
 		self:NormalizePersistedLegacyBonusRolls()
 	end
+	self:_NoteSnapshotMutation()
 
 	return true, inserted, nil
 end

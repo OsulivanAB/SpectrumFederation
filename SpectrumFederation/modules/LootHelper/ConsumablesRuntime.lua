@@ -946,7 +946,14 @@ end
 function Runtime:CancelDepositWork()
     local hadWork = self.depositWork ~= nil
     self.depositContinueGen = (self.depositContinueGen or 0) + 1
-    self.depositWork = nil
+    if hadWork then
+        self:FinalizeDepositWork()
+        -- Cancellation stops future cursor work, but still settles any slot
+        -- increases already observed under the captured transaction context.
+        if self.depositIntent and (tonumber(self.depositIntent.bestActual) or 0) > 0 then
+            self:FinishDeposit(true)
+        end
+    end
     if hadWork then
         self:CompleteDeferredProfileDeletes()
     end
@@ -997,11 +1004,6 @@ function Runtime:FinalizeDepositWork()
         self:CompleteDeferredProfileDeletes()
         return
     end
-    if not self:DepositConfigStillValid(work) then
-        Warn("Raid supplies configuration changed during the deposit.")
-        self:CompleteDeferredProfileDeletes()
-        return
-    end
     local line = work.line
     self.depositIntent = {
         itemId = line.itemId,
@@ -1015,11 +1017,12 @@ function Runtime:FinalizeDepositWork()
         beforeTab = work.beforeTab,
         beforeBags = work.beforeBags,
         places = work.places,
-        bestActual = 0,
+        bestActual = tonumber(work.bestActual) or 0,
         token = self:NextToken("deposit"),
         profileId = work.profileId,
         profile = work.profile,
     }
+    self:ObserveDepositIntent(self.depositIntent)
     if self.depositTimer and self.depositTimer.Cancel then
         self.depositTimer:Cancel()
     end
@@ -1031,17 +1034,44 @@ function Runtime:FinalizeDepositWork()
     end
 end
 
+function Runtime:ObserveDepositIntent(intent)
+    if type(intent) ~= "table" then return 0 end
+    local guild = self:CurrentGuild()
+    if not (guild and intent.guildGuid and guild.guid == intent.guildGuid) then
+        return tonumber(intent.bestActual) or 0
+    end
+    local placedSlots = intent.places
+    if type(placedSlots) ~= "table" then return tonumber(intent.bestActual) or 0 end
+    local actual = 0
+    for i = 1, #placedSlots do
+        local row = placedSlots[i]
+        if type(row) == "table" then
+            local after = self:SlotItemCount(intent.tab, row.slot, intent.itemId)
+            row.after = after
+            local increase = after - (tonumber(row.before) or 0)
+            if increase > 0 then actual = actual + increase end
+        end
+    end
+    if actual > (tonumber(intent.bestActual) or 0) then
+        intent.bestActual = math.min(actual, tonumber(intent.intended) or actual)
+    end
+    return tonumber(intent.bestActual) or 0
+end
+
 local MAX_DEPOSIT_LOCK_WAITS = 20
 
 function Runtime:PlaceNextDeposit()
     local work = self.depositWork
     if type(work) ~= "table" then return end
     if not self:DepositConfigStillValid(work) then
-        -- Do not credit placements made under a config that no longer matches.
+        -- Stop future movement, then settle confirmed placements against the
+        -- immutable profile/guild/tab/generation captured at start.
         self.depositContinueGen = (self.depositContinueGen or 0) + 1
-        self.depositWork = nil
+        self:FinalizeDepositWork()
         Warn("Raid supplies configuration changed during the deposit.")
-        self:CompleteDeferredProfileDeletes()
+        if self.depositIntent and (tonumber(self.depositIntent.bestActual) or 0) > 0 then
+            self:FinishDeposit(true)
+        end
         return
     end
     local container = C_Container
@@ -1267,29 +1297,12 @@ function Runtime:FinishDeposit(fromTimer)
         self:CompleteDeferredProfileDeletes()
         return
     end
-    if not self:DepositConfigStillValid(intent) then
-        self.depositIntent = nil
-        if self.depositTimer and self.depositTimer.Cancel then
-            self.depositTimer:Cancel()
-            self.depositTimer = nil
-        end
-        Warn("Raid supplies configuration changed during the deposit.")
-        self:CompleteDeferredProfileDeletes()
-        return
-    end
     self:ScanBags()
     local guild = self:CurrentGuild()
     local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
     local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
+    self:ObserveDepositIntent(intent)
     local placedSlots = intent.places
-    if type(placedSlots) == "table" then
-        for i = 1, #placedSlots do
-            local row = placedSlots[i]
-            if type(row) == "table" then
-                row.after = self:SlotItemCount(intent.tab, row.slot, intent.itemId)
-            end
-        end
-    end
     local actual, reason = Workflow.InterpretDeposit({
         guildOk = guild and intent.guildGuid and guild.guid == intent.guildGuid,
         configuredTab = intent.tab,
@@ -1364,11 +1377,16 @@ function Runtime:OnBankOpened()
 end
 
 function Runtime:OnBankClosed()
-    self.bankOpen = false
     self.autoReviewedThisOpen = false
     if self.depositWork then
         self:CancelDepositWork()
+    elseif self.depositIntent then
+        self:ObserveDepositIntent(self.depositIntent)
+        if (tonumber(self.depositIntent.bestActual) or 0) > 0 then
+            self:FinishDeposit(true)
+        end
     end
+    self.bankOpen = false
     self:RefreshReminder()
 end
 
@@ -1463,7 +1481,15 @@ function Runtime:OnEvent(event, arg1)
         end
     elseif event == "GUILDBANKBAGSLOTS_CHANGED" then
         if self.depositWork then
-            -- Multi-place deposit still moving source stacks.
+            -- Capture confirmed slot increases even while more cursor work is
+            -- pending; cancellation must not erase those observations.
+            local work = self.depositWork
+            local shadow = {
+                guildGuid = work.guildGuid, tab = work.tab,
+                itemId = work.line and work.line.itemId, places = work.places,
+                intended = work.intended, bestActual = work.bestActual or 0,
+            }
+            work.bestActual = self:ObserveDepositIntent(shadow)
         elseif self.depositIntent then
             self:FinishDeposit(false)
         else
