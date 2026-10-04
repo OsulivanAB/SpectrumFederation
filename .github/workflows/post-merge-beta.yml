@@ -92,7 +92,7 @@ jobs:
     if: needs.detect-release-scope.outputs.release_required == 'true'
     outputs:
       version: ${{ steps.version.outputs.version }}
-      interface: ${{ steps.blizzard.outputs.interface }}
+      interface: ${{ steps.interface.outputs.interface }}
 
     steps:
       - name: Checkout captured release source
@@ -112,12 +112,16 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Detected version: $VERSION"
 
-      - name: Query Blizzard API for beta Interface version
-        id: blizzard
+      - name: Extract Interface from captured TOC
+        id: interface
         run: |
-          INTERFACE=$(python3 .github/scripts/blizzard_api.py --environment beta --output interface)
+          INTERFACE=$(grep -E '^## Interface:' SpectrumFederation/SpectrumFederation.toc | head -n1 | sed 's/^## Interface://i' | xargs)
+          if [[ ! "$INTERFACE" =~ ^[0-9]{6}$ ]]; then
+            echo "::error::Captured parent TOC has invalid Interface value: $INTERFACE"
+            exit 1
+          fi
           echo "interface=$INTERFACE" >> $GITHUB_OUTPUT
-          echo "Beta Interface version: $INTERFACE"
+          echo "Packaged Interface version: $INTERFACE"
 
   check-version-bump:
     name: Check Version Bump

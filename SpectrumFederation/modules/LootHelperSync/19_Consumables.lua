@@ -415,9 +415,10 @@ function Sync:_QueueAuthoredOrderedConsumablesEvents(profile, remoteEventCount, 
     local events = profile and profile._consumableEvents
     if type(events) ~= "table" then return end
     if #events <= (tonumber(remoteEventCount) or 0) and not fingerprintsDiffer then return end
+    local C = Consumables()
     local S = Rules()
     local who = self._SelfId and self:_SelfId() or nil
-    if not S or type(who) ~= "string" or who == "" then return end
+    if not C or not S or type(who) ~= "string" or who == "" then return end
     local key = tostring(self.state and self.state.sessionId) .. ":" .. tostring(self.state and self.state.coordinator)
     if profile._consumablesOrderedResendKey ~= key then
         profile._consumablesOrderedResendKey = key
@@ -431,7 +432,7 @@ function Sync:_QueueAuthoredOrderedConsumablesEvents(profile, remoteEventCount, 
     while index <= #events and queued < MAX_EVENT_FLUSH and scanned < MAX_EVENT_SCAN do
         local event = events[index]
         if type(event) == "table" and type(event.id) == "string"
-            and tonumber(event.order) and S.RemoteEventIdOk(event.id, who) then
+            and C.ValidOrder(event.order) and S.RemoteEventIdOk(event.id, who) then
             self:_QueueUnsentConsumablesEvent(profile, event.id)
             queued = queued + 1
         end
@@ -462,7 +463,7 @@ function Sync:_QueueAuthoredArchivedConsumablesEvents(profile, archiveDiffers, a
         if queued >= cap then break end
         local event = archive[i]
         if type(event) == "table" and type(event.id) == "string"
-            and tonumber(event.order) and S.RemoteEventIdOk(event.id, who) then
+            and C.ValidOrder(event.order) and S.RemoteEventIdOk(event.id, who) then
             self:_QueueUnsentConsumablesEvent(profile, event.id)
             queued = queued + 1
         end
@@ -722,7 +723,7 @@ function Sync:BroadcastConsumablesEvent(profile, event)
         local C = Consumables()
         local S = Rules()
         if C and C.StampOrder then
-            C.StampOrder(profile, event)
+            if not C.StampOrder(profile, event) then return false end
         end
         if S and type(event.writer) ~= "string" then
             local who = self._SelfId and self:_SelfId() or nil
@@ -811,17 +812,17 @@ function Sync:HandleConsumablesEvent(sender, payload)
     end
     local ids = C.EventIndex and C.EventIndex(profile)
     local stored = ids and event.id and ids[event.id]
-    local hadOrder = type(stored) == "table" and tonumber(stored.order) ~= nil
+    local hadOrder = type(stored) == "table" and C.ValidOrder(stored.order) ~= nil
     local ok, status = S.ApplyRemoteEvent(profile, event, sender, relay and { coordinatorRelay = true } or nil)
     if isCoordinator and ok and not hadOrder and C.StampOrder then
-        C.StampOrder(profile, event)
+        if not C.StampOrder(profile, event) then return end
         self:BroadcastConsumablesEvent(profile, event)
         return
     end
     if isCoordinator and ok and hadOrder and status == "duplicate" and not fromCoordinator
         and S.RemoteEventIdOk and S.RemoteEventIdOk(event.id, sender) then
         local stamped = type(stored) == "table" and stored or nil
-        if type(stamped) == "table" and tonumber(stamped.order) ~= nil then
+        if type(stamped) == "table" and C.ValidOrder(stamped.order) ~= nil then
             self:BroadcastConsumablesEvent(profile, stamped)
         end
         return
