@@ -54,6 +54,7 @@ local function resetWorld()
         bagSlots = 4,
         bags = {},
         bank = {},
+        bankReadable = true,
         cursor = nil,
         cursorBroken = false,
         maxStack = 20,
@@ -139,11 +140,13 @@ end
 
 function GetGuildBankNumSlots() return world.numSlots end
 function GetGuildBankItemLink(tab, slot)
+    if not world.bankReadable then return nil end
     local row = bankSlot(tab, slot)
     if not row or row.count <= 0 then return nil end
     return "|Hitem:" .. tostring(row.itemId) .. "::|h[Item]|h"
 end
 function GetGuildBankItemInfo(tab, slot)
+    if not world.bankReadable then return nil, 0 end
     local row = bankSlot(tab, slot)
     return nil, row and row.count or 0
 end
@@ -1566,6 +1569,41 @@ local function checkRuntimeDepositPartialAndFailure()
     assertEq(p._consumableEvents[1].quantity, 2, "a partial deposit records only what landed")
     assertTrue(contains(world.infos[#world.infos], "The rest is still in your bags"), "a partial deposit explains the remainder")
 
+    p = runtimeFixture("rt-bank-only")
+    world.bankOpen = true
+    startDeposit()
+    drainAfter(32)
+    world.bags[0][1].count = 15
+    world.bags[0][2].count = 10
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    fireTimers()
+    assertEq(#p._consumableEvents, 0, "slot increases without bag movement never receive credit")
+
+    p = runtimeFixture("rt-bank-over-bags")
+    world.bankOpen = true
+    startDeposit()
+    drainAfter(32)
+    world.bags[0][1].count = 13
+    world.bags[0][2].count = 10
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    fireTimers()
+    assertEq(#p._consumableEvents, 1, "joint slot and bag evidence records a partial deposit")
+    assertEq(p._consumableEvents[1].quantity, 2, "slot evidence cannot credit more than the corresponding bag decrease")
+
+    p = runtimeFixture("rt-split-observation")
+    world.bankOpen = true
+    startDeposit()
+    drainAfter(32)
+    world.bags[0][1].count = 15
+    world.bags[0][2].count = 10
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(#p._consumableEvents, 0, "a bank update waits while matching bag movement is pending")
+    world.bags[0][1].count = 13
+    RT:OnEvent("BAG_UPDATE_DELAYED")
+    assertTrue(RT.depositIntent ~= nil, "separate bag evidence verifies the partial transfer without committing early")
+    fireTimers()
+    assertEq(p._consumableEvents[1].quantity, 2, "separately arriving slot and bag evidence converges on valid credit")
+
     p = runtimeFixture("rt-failed")
     world.bankOpen = true
     world.acceptPlaces = 0
@@ -1677,6 +1715,7 @@ local function checkRuntimeDepositPartialAndFailure()
     world.bankOpen = true
     startDeposit()
     assertEq(#world.places, 1, "the first place lands before a mid-deposit config change")
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
     local placesBeforeConfig = #world.places
     assertTrue(select(1, C.RemoveRequestedItem(p, admin, aqirite)), "removing the requested item bumps configSeq")
     drainAfter(32)
@@ -1740,6 +1779,9 @@ local function checkRuntimeCancelAndDeferredDelete()
     world.bankOpen = true
     startDeposit()
     assertEq(#world.places, 1, "one placement can succeed before the bank closes")
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(RT.depositWork and RT.depositWork.bestActual, 2, "partial credit is verified before closure")
+    world.bankReadable = false
     RT:OnBankClosed()
     assertEq(#p._consumableEvents, 1, "bank closure preserves confirmed partial credit")
     assertEq(p._consumableEvents[1].quantity, 2, "bank closure credits exactly the confirmed slot increase")

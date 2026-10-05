@@ -1047,15 +1047,38 @@ function Runtime:ObserveDepositIntent(intent)
         local row = placedSlots[i]
         if type(row) == "table" then
             local after = self:SlotItemCount(intent.tab, row.slot, intent.itemId)
-            row.after = after
             local increase = after - (tonumber(row.before) or 0)
-            if increase > 0 then actual = actual + increase end
+            if increase > (tonumber(row.observedIncrease) or 0) then
+                row.observedIncrease = increase
+                row.after = (tonumber(row.before) or 0) + increase
+            end
+            actual = actual + math.max(0, tonumber(row.observedIncrease) or 0)
         end
     end
-    if actual > (tonumber(intent.bestActual) or 0) then
-        intent.bestActual = math.min(actual, tonumber(intent.intended) or actual)
-    end
-    return tonumber(intent.bestActual) or 0
+    intent.bestObservedSlots = math.min(actual, tonumber(intent.intended) or actual)
+    return intent.bestObservedSlots
+end
+
+function Runtime:VerifyDepositIntent(intent)
+    if type(intent) ~= "table" then return 0, nil end
+    self:ScanBags()
+    self:ObserveDepositIntent(intent)
+    local Workflow = SF.ConsumablesWorkflow
+    if not Workflow then return 0, nil end
+    local guild = self:CurrentGuild()
+    local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
+    local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
+    return Workflow.InterpretDeposit({
+        guildOk = guild and intent.guildGuid and guild.guid == intent.guildGuid,
+        configuredTab = intent.tab,
+        observedTab = intent.observedTab or intent.tab,
+        intendedQty = intent.intended,
+        beforeTab = intent.beforeTab,
+        afterTab = afterTab,
+        beforeBags = intent.beforeBags,
+        afterBags = afterBags,
+        placedSlots = intent.places,
+    })
 end
 
 local MAX_DEPOSIT_LOCK_WAITS = 20
@@ -1297,23 +1320,7 @@ function Runtime:FinishDeposit(fromTimer)
         self:CompleteDeferredProfileDeletes()
         return
     end
-    self:ScanBags()
-    local guild = self:CurrentGuild()
-    local afterTab = (self:TabItemCounts(intent.tab)[intent.itemId]) or 0
-    local afterBags = (self.bagCounts and self.bagCounts[intent.itemId]) or 0
-    self:ObserveDepositIntent(intent)
-    local placedSlots = intent.places
-    local actual, reason = Workflow.InterpretDeposit({
-        guildOk = guild and intent.guildGuid and guild.guid == intent.guildGuid,
-        configuredTab = intent.tab,
-        observedTab = intent.observedTab or intent.tab,
-        intendedQty = intent.intended,
-        beforeTab = intent.beforeTab,
-        afterTab = afterTab,
-        beforeBags = intent.beforeBags,
-        afterBags = afterBags,
-        placedSlots = placedSlots,
-    })
+    local actual, reason = self:VerifyDepositIntent(intent)
     if reason == "wrong_guild" or reason == "wrong_tab" then
         self.depositIntent = nil
         if self.depositTimer and self.depositTimer.Cancel then
@@ -1450,7 +1457,14 @@ function Runtime:OnEvent(event, arg1)
     end
     if event == "BAG_UPDATE_DELAYED" or event == "GROUP_ROSTER_UPDATE" then
         if event == "BAG_UPDATE_DELAYED" and self.depositWork then
-            -- Multi-place deposit still moving source stacks.
+            local work = self.depositWork
+            local attempted = (tonumber(work.intended) or 0) - (tonumber(work.remaining) or 0)
+            local verified = self:VerifyDepositIntent({
+                guildGuid = work.guildGuid, tab = work.tab, observedTab = work.observedTab,
+                itemId = work.line and work.line.itemId, places = work.places,
+                intended = attempted, beforeTab = work.beforeTab, beforeBags = work.beforeBags,
+            })
+            if verified > (tonumber(work.bestActual) or 0) then work.bestActual = verified end
         elseif event == "BAG_UPDATE_DELAYED" and self.depositIntent then
             self:FinishDeposit(false)
         end
@@ -1485,11 +1499,13 @@ function Runtime:OnEvent(event, arg1)
             -- pending; cancellation must not erase those observations.
             local work = self.depositWork
             local shadow = {
-                guildGuid = work.guildGuid, tab = work.tab,
+                guildGuid = work.guildGuid, tab = work.tab, observedTab = work.observedTab,
                 itemId = work.line and work.line.itemId, places = work.places,
-                intended = work.intended, bestActual = work.bestActual or 0,
+                intended = (tonumber(work.intended) or 0) - (tonumber(work.remaining) or 0),
+                beforeTab = work.beforeTab, beforeBags = work.beforeBags,
             }
-            work.bestActual = self:ObserveDepositIntent(shadow)
+            local verified = self:VerifyDepositIntent(shadow)
+            if verified > (tonumber(work.bestActual) or 0) then work.bestActual = verified end
         elseif self.depositIntent then
             self:FinishDeposit(false)
         else

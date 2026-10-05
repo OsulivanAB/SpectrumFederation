@@ -2248,6 +2248,12 @@ local function ApplyRCLootCouncilIntegrationFields(target, config)
 	end
 end
 
+local function NoteAcceptedRCConfigMutation(self, target)
+	if target == self._rcLootCouncilIntegration then
+		self:_NoteSnapshotMutation()
+	end
+end
+
 function LootProfile:ApplyRCLootCouncilIntegrationConfig(config, options)
 	options = options or {}
 	if type(config) ~= "table" then
@@ -2273,7 +2279,7 @@ function LootProfile:ApplyRCLootCouncilIntegrationConfig(config, options)
 		target = GetMutableRCLootCouncilIntegration(self)
 	end
 	ApplyRCLootCouncilIntegrationFields(target, config)
-	self:_NoteSnapshotMutation()
+	NoteAcceptedRCConfigMutation(self, target)
 	if not options.skipSync then
 		return PushRCIntegrationConfig(self)
 	end
@@ -2286,6 +2292,7 @@ function LootProfile:SetRCLootCouncilRecordAwards(enabled)
 	end
 	local cfg = GetMutableRCLootCouncilIntegration(self)
 	cfg.recordAwards = enabled and true or false
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2295,6 +2302,7 @@ function LootProfile:SetRCLootCouncilRecordAllAwardTypes(enabled)
 	end
 	local cfg = GetMutableRCLootCouncilIntegration(self)
 	cfg.recordAllAwardTypes = enabled and true or false
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2314,6 +2322,7 @@ function LootProfile:AddRCLootCouncilAllowedResponse(value)
 		end
 	end
 	cfg.allowedResponses[#cfg.allowedResponses + 1] = trimmed
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2343,6 +2352,7 @@ function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
 		return false, "That award type is not in the list."
 	end
 	cfg.allowedResponses = filtered
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2381,6 +2391,7 @@ function LootProfile:AddRCLootCouncilBisResponse(value)
 		end
 	end
 	cfg.bisResponses[#cfg.bisResponses + 1] = entry
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2412,6 +2423,7 @@ function LootProfile:RemoveRCLootCouncilBisResponse(value)
 		return false, "That BiS response is not in the list."
 	end
 	cfg.bisResponses = filtered
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 

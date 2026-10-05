@@ -1082,6 +1082,8 @@ function Sync:_ProfileSnapshotCacheRevision(profileId)
     if type(profile) == "table" then
         parts[#parts + 1] = tostring(tonumber(profile._snapshotRevision) or 0)
         parts[#parts + 1] = tostring(tonumber(profile._lootLogRevision) or 0)
+        parts[#parts + 1] = tostring(tonumber(profile._rcConfigSeq) or 0)
+        parts[#parts + 1] = tostring(tonumber(profile._rcConfigEpoch) or 0)
         local logs = profile._lootLogs
         parts[#parts + 1] = tostring(type(logs) == "table" and #logs or 0)
         local admins = profile._adminUsers
