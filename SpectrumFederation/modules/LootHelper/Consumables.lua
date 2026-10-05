@@ -985,8 +985,8 @@ end
 function C.StampOrder(profile, event)
     if type(event) ~= "table" then return nil end
     local cfg = C.Ensure(profile)
-    local existing = tonumber(event.order)
-    if existing and existing > 0 then
+    local existing = C.ValidOrder(event.order)
+    if existing then
         if existing > (tonumber(cfg.ledgerSeq) or 0) then
             cfg.ledgerSeq = existing
         end
@@ -994,15 +994,17 @@ function C.StampOrder(profile, event)
     end
     local bound = EventIds(profile)
     local stored = type(event.id) == "string" and bound.ids[event.id] or nil
-    local previous = type(stored) == "table" and tonumber(stored.order) or nil
-    if previous and previous > 0 then
+    local previous = type(stored) == "table" and C.ValidOrder(stored.order) or nil
+    if previous then
         event.order = previous
         if previous > (tonumber(cfg.ledgerSeq) or 0) then
             cfg.ledgerSeq = previous
         end
         return previous
     end
-    cfg.ledgerSeq = (tonumber(cfg.ledgerSeq) or 0) + 1
+    local nextOrder = (tonumber(cfg.ledgerSeq) or 0) + 1
+    if not C.ValidOrder(nextOrder) then return nil end
+    cfg.ledgerSeq = nextOrder
     event.order = cfg.ledgerSeq
     if type(stored) == "table" and stored ~= event then
         stored.order = event.order
@@ -1087,6 +1089,9 @@ function C.AppendEvent(profile, event, opts)
         return false, "Invalid accounting event."
     end
     C.Ensure(profile)
+    if event.order ~= nil and not C.ValidOrder(event.order) then
+        return false, "invalid"
+    end
     if type(event.id) == "string" and #event.id > C.MAX_EVENT_ID then
         return false, "invalid"
     end
@@ -1096,8 +1101,8 @@ function C.AppendEvent(profile, event, opts)
     local bound = EventIds(profile)
     local stored = bound.ids[event.id]
     if stored then
-        local incoming = tonumber(event.order)
-        local storedOrder = type(stored) == "table" and tonumber(stored.order) or nil
+        local incoming = C.ValidOrder(event.order)
+        local storedOrder = type(stored) == "table" and C.ValidOrder(stored.order) or nil
         local replaceOrder = opts.replaceOrder and incoming and storedOrder and storedOrder ~= incoming
         if incoming and type(stored) == "table" and (storedOrder == nil or replaceOrder) then
             if IsLiveRecord(profile, stored) then
@@ -1428,6 +1433,9 @@ function C.ValidateSnapshot(data)
             if type(event) ~= "table" or type(event.id) ~= "string" or type(event.type) ~= "string" then
                 return false, "snapshot.consumables.events contains an invalid event"
             end
+            if event.order ~= nil and not C.ValidOrder(event.order) then
+                return false, "snapshot.consumables.events contains an invalid order"
+            end
         end
     end
     return true
@@ -1450,6 +1458,17 @@ function C.ValidConfigSeq(value)
         return nil
     end
     return seq
+end
+
+function C.ValidOrder(value)
+    local order = tonumber(value)
+    if not order or order ~= order or order == math.huge or order == -math.huge then
+        return nil
+    end
+    if order ~= math.floor(order) or order < 1 or order > C.MAX_EVENT_SEQ then
+        return nil
+    end
+    return order
 end
 
 function C.ValidLedgerSeq(value)
@@ -1654,8 +1673,8 @@ function C.MergeSnapshot(profile, data, opts)
             if limit > maxEvents then limit = maxEvents end
             for i = 1, limit do
                 local event = data.events[i]
-                local order = type(event) == "table" and tonumber(event.order) or nil
-                if order and order > 0 and order == math.floor(order) and Rules.RelayWriter(event) then
+                local order = type(event) == "table" and C.ValidOrder(event.order) or nil
+                if order and Rules.RelayWriter(event) then
                     Rules.ApplyRemoteEvent(profile, event, nil, {
                         coordinatorRelay = true,
                         silent = true,

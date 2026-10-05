@@ -788,6 +788,10 @@ def test_post_merge_beta_classifies_push_range_and_keeps_housekeeping():
     assert "ref: beta" not in extract_block
     assert "needs.detect-release-scope.outputs.promotion_target_sha" in publish_if
     assert "needs.detect-release-scope.outputs.promotion_target_sha" in extract_block
+    assert "interface: ${{ steps.interface.outputs.interface }}" in extract_block
+    assert "Extract Interface from captured TOC" in extract_block
+    assert "SpectrumFederation/SpectrumFederation.toc" in extract_block
+    assert "blizzard_api.py --environment beta" not in extract_block
     assert "git checkout origin/beta -- CHANGELOG.md README.md" in publish_if
     for root in scope_mod.ADDON_ROOTS:
         assert f"- '{root}/**'" in text

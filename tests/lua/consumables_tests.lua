@@ -54,6 +54,7 @@ local function resetWorld()
         bagSlots = 4,
         bags = {},
         bank = {},
+        bankReadable = true,
         cursor = nil,
         cursorBroken = false,
         maxStack = 20,
@@ -139,11 +140,13 @@ end
 
 function GetGuildBankNumSlots() return world.numSlots end
 function GetGuildBankItemLink(tab, slot)
+    if not world.bankReadable then return nil end
     local row = bankSlot(tab, slot)
     if not row or row.count <= 0 then return nil end
     return "|Hitem:" .. tostring(row.itemId) .. "::|h[Item]|h"
 end
 function GetGuildBankItemInfo(tab, slot)
+    if not world.bankReadable then return nil, 0 end
     local row = bankSlot(tab, slot)
     return nil, row and row.count or 0
 end
@@ -997,6 +1000,23 @@ local function checkRemoteEvents()
         "a follower ignores unstamped coordinator events")
     local stampedOk, stampedRelay = S.RemoteEventAdmission(false, true, donation("ce:x:Donor-Realm:43", donor, 1, { order = 2 }))
     assertTrue(stampedOk and stampedRelay, "a follower accepts stamped coordinator relays")
+    for _, badOrder in ipairs({ 0, -1, 1.5, math.huge, C.MAX_EVENT_SEQ + 1 }) do
+        local bad = donation("ce:x:Donor-Realm:bad-" .. tostring(badOrder), donor, 1,
+            { order = badOrder, writer = donor })
+        assertFalse(select(1, S.RemoteEventAdmission(false, true, bad)),
+            "a follower rejects malformed coordinator order " .. tostring(badOrder))
+    end
+    local nanOrder = donation("ce:x:Donor-Realm:bad-nan", donor, 1, { order = 0 / 0, writer = donor })
+    assertFalse(select(1, S.RemoteEventAdmission(false, true, nanOrder)), "a follower rejects NaN coordinator order")
+    local boundary = donation("ce:x:Donor-Realm:boundary", donor, 1,
+        { order = C.MAX_EVENT_SEQ, writer = donor })
+    assertTrue(select(1, S.RemoteEventAdmission(false, true, boundary)), "the maximum sequence order is accepted")
+    local beforeRelayOrder = C.EventIndex(p)[relay.id].order
+    local malformedReplacement = donation(relay.id, donor, 3, { order = 2.5, writer = donor })
+    assertFalse(select(1, S.ApplyRemoteEvent(p, malformedReplacement, admin, { coordinatorRelay = true })),
+        "an invalid replacement order is rejected")
+    assertEq(C.EventIndex(p)[relay.id].order, beforeRelayOrder,
+        "a rejected replacement does not corrupt stored ordering")
 
     local bucket = {}
     local allowed = 0
@@ -1188,9 +1208,16 @@ local function checkSessionTransport()
     }
     Sync:_CachedProfileSnapshot(coordP._profileId)
     assertEq(builds, 3, "a changed profile revision rebuilds the snapshot cache")
+    local reused = Sync:_CachedProfileSnapshot(coordP._profileId)
+    assertEq(builds, 3, "unchanged authoritative state continues to reuse the cache")
+    assertTrue(reused == payload, "cache reuse remains profile-local")
+    local cachedProfile = Sync:FindLocalProfileById(coordP._profileId)
+    cachedProfile._snapshotRevision = (cachedProfile._snapshotRevision or 0) + 1
+    Sync:_CachedProfileSnapshot(coordP._profileId)
+    assertEq(builds, 4, "an equal-count exported-state mutation invalidates the cache")
     Sync._Now = function() return clock + 100 end
     Sync:_CachedProfileSnapshot(coordP._profileId)
-    assertEq(builds, 4, "the snapshot cache expires after the request timeout window")
+    assertEq(builds, 5, "the snapshot cache expires after the request timeout window")
 
     -- Re-diverge after the earlier successful catch-up so a failed NEED_PROFILE
     -- can clear the sticky descriptor key and allow another identical heartbeat.
@@ -1542,6 +1569,41 @@ local function checkRuntimeDepositPartialAndFailure()
     assertEq(p._consumableEvents[1].quantity, 2, "a partial deposit records only what landed")
     assertTrue(contains(world.infos[#world.infos], "The rest is still in your bags"), "a partial deposit explains the remainder")
 
+    p = runtimeFixture("rt-bank-only")
+    world.bankOpen = true
+    startDeposit()
+    drainAfter(32)
+    world.bags[0][1].count = 15
+    world.bags[0][2].count = 10
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    fireTimers()
+    assertEq(#p._consumableEvents, 0, "slot increases without bag movement never receive credit")
+
+    p = runtimeFixture("rt-bank-over-bags")
+    world.bankOpen = true
+    startDeposit()
+    drainAfter(32)
+    world.bags[0][1].count = 13
+    world.bags[0][2].count = 10
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    fireTimers()
+    assertEq(#p._consumableEvents, 1, "joint slot and bag evidence records a partial deposit")
+    assertEq(p._consumableEvents[1].quantity, 2, "slot evidence cannot credit more than the corresponding bag decrease")
+
+    p = runtimeFixture("rt-split-observation")
+    world.bankOpen = true
+    startDeposit()
+    drainAfter(32)
+    world.bags[0][1].count = 15
+    world.bags[0][2].count = 10
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(#p._consumableEvents, 0, "a bank update waits while matching bag movement is pending")
+    world.bags[0][1].count = 13
+    RT:OnEvent("BAG_UPDATE_DELAYED")
+    assertTrue(RT.depositIntent ~= nil, "separate bag evidence verifies the partial transfer without committing early")
+    fireTimers()
+    assertEq(p._consumableEvents[1].quantity, 2, "separately arriving slot and bag evidence converges on valid credit")
+
     p = runtimeFixture("rt-failed")
     world.bankOpen = true
     world.acceptPlaces = 0
@@ -1653,13 +1715,15 @@ local function checkRuntimeDepositPartialAndFailure()
     world.bankOpen = true
     startDeposit()
     assertEq(#world.places, 1, "the first place lands before a mid-deposit config change")
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
     local placesBeforeConfig = #world.places
     assertTrue(select(1, C.RemoveRequestedItem(p, admin, aqirite)), "removing the requested item bumps configSeq")
     drainAfter(32)
     assertEq(#world.places, placesBeforeConfig, "a mid-deposit config change stops further placements")
     assertEq(RT.depositWork, nil, "a mid-deposit config change clears deposit work")
     assertEq(RT.depositIntent, nil, "a mid-deposit config change does not open a deposit intent")
-    assertEq(#p._consumableEvents, 0, "a mid-deposit config change records no donation")
+    assertEq(#p._consumableEvents, 1, "a mid-deposit config change preserves confirmed donation credit")
+    assertEq(p._consumableEvents[1].quantity, 2, "only the placement confirmed before the config change is credited")
     assertTrue(contains(world.warnings[#world.warnings], "configuration changed"),
         "a mid-deposit config change warns the player")
 
@@ -1671,9 +1735,8 @@ local function checkRuntimeDepositPartialAndFailure()
     assertTrue(select(1, C.SetBankTab(p, admin, 3)), "changing the bank tab bumps configSeq during confirmation")
     RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
     assertEq(RT.depositIntent, nil, "a config change during confirmation clears the intent")
-    assertEq(#p._consumableEvents, 0, "a config change during confirmation records no donation")
-    assertTrue(contains(world.warnings[#world.warnings], "configuration changed"),
-        "a config change during confirmation warns the player")
+    assertEq(#p._consumableEvents, 1, "a config change during confirmation preserves the captured deposit")
+    assertEq(p._consumableEvents[1].quantity, 25, "the captured tab observations determine confirmation credit")
 end
 
 local function checkRuntimeCancelAndDeferredDelete()
@@ -1710,6 +1773,21 @@ local function checkRuntimeCancelAndDeferredDelete()
     assertEq(deleted[1], p._profileId, "closing the guild bank completes the deferred delete")
     drainAfter(32)
     assertEq(#world.places, 0, "nothing is placed after the bank closes")
+
+    deleted = {}
+    p = runtimeFixture("rt-close-after-place")
+    world.bankOpen = true
+    startDeposit()
+    assertEq(#world.places, 1, "one placement can succeed before the bank closes")
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(RT.depositWork and RT.depositWork.bestActual, 2, "partial credit is verified before closure")
+    world.bankReadable = false
+    RT:OnBankClosed()
+    assertEq(#p._consumableEvents, 1, "bank closure preserves confirmed partial credit")
+    assertEq(p._consumableEvents[1].quantity, 2, "bank closure credits exactly the confirmed slot increase")
+    drainAfter(32)
+    fireTimers()
+    assertEq(#p._consumableEvents, 1, "delayed continuations and timers cannot duplicate closed-bank credit")
     SF.DeleteLootHelperProfile = nil
 end
 

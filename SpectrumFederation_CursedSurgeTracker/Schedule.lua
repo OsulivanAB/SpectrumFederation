@@ -389,7 +389,7 @@ end
 -- Previous-end priority for inactive ring progress:
 -- 1. A prior scheduler row for the same Area POI
 -- 2. Consecutive same-location rows plus a schedule-derived event length
--- 3. Verified same-location recurrence (13,500s) as a guarded fallback
+-- 3. Verified same-location recurrence (9,000s) as a guarded fallback
 -- 4. nil when a trustworthy inactive interval cannot be determined
 function CST.ResolvePreviousEndTime(rows, nextOccurrence, now)
     local previous = CST.SelectPreviousOccurrence(rows, now)
