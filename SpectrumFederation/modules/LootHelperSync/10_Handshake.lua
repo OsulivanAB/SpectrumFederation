@@ -69,6 +69,12 @@ function Sync:BroadcastSessionHeartbeat(opts)
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+    if earlyPrep and earlyPrep.HeartbeatPayload then
+        local prepNotice = earlyPrep:HeartbeatPayload()
+        if type(prepNotice) == "table" then
+            payload.prepNotice = prepNotice
+        end
     if self._AttachConsumablesDescriptor then
         self:_AttachConsumablesDescriptor(payload, profileId)
     end
@@ -118,8 +124,11 @@ function Sync:_ShouldRunHeartbeatSender()
         return false
     end
 
-    -- Gate: don't heartbeat during admin convergence before the session is announced
-    if self.state._sessionAnnounced ~= sid then return false end
+    -- Gate: don't heartbeat during admin convergence before the session is announced.
+    -- An exhausted reannounce retry keeps the session alive without claiming send acceptance.
+    if self.state._sessionAnnounced ~= sid and self.state._reannounceExhaustedFor ~= sid then
+        return false
+    end
 
     -- Must still be in PARTY/RAID
     if not self:_EnforceGroupedSessionActive("ShouldRunHeartbeatSender") then return false end

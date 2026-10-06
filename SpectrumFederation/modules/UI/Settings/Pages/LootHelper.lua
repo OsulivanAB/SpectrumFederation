@@ -1336,6 +1336,18 @@ local function BuildLootHelperDefinition(panel, sectionIds)
 					indent = "label",
 					text = "Syncing between addons only happens during a session.",
 				},
+				{
+					type = "checkbox",
+					label = "Enable Early Preparation Whispers",
+					tooltip = "While you are the Loot Helper session coordinator, automatically inspect raid members and whisper profile members who are confirmed to be missing required preparation before Raid Check begins. Each player is contacted at most once per session.",
+					path = "lootHelper.earlyPreparationWhispers",
+					onValueChanged = function()
+						local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
+						if earlyPrep and earlyPrep.Notify then
+							earlyPrep:Notify("setting")
+						end
+					end,
+				},
 				{ type = "button", label = "Session Control", adminOnly = true, buttonText = function() if IsSessionActive() then return "End Session" end return "Start Session" end, width = 120, tooltip = "Start a Loot Helper session for the active profile, or end the current one if a session is already running.", enabled = function() return ProfileActionsEnabled() end, onClick = function(ctx) ctx.section:ClearMessage() if not (SF.LootHelperSync and SF.LootHelperSync.StartSession and SF.LootHelperSync.EndSession) then ctx.section:SetMessage("Loot Helper Sync system not available", "error") return end if IsSessionActive() then local ok = SF.LootHelperSync:EndSession("manual") if ok then ctx.section:SetMessage("Session ended successfully", "success") else ctx.section:SetMessage("Failed to end session", "error") end else local profileId = GetActiveProfileId(ctx.store) if not profileId then ctx.section:SetMessage("No active profile selected", "error") return end local sessionId = SF.LootHelperSync:StartSession(profileId) if sessionId then ctx.section:SetMessage("Session started successfully", "success") else ctx.section:SetMessage("Failed to start session (not in a group/raid?)", "error") end end ctx.pageBuilder:Refresh() end },
 				{ type = "text", text = "Enable Raid Wide Safe Mode" },
 				{ type = "checkboxGrid", adminOnly = true, enabled = function() return ProfileActionsEnabled() end, items = { { label = "Only in-combat", tooltip = "Automatically enable raid-wide safemode during combat. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeModeOnCombat", false) end return false end, set = function(value) if IsAdmin() and store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeModeOnCombat", value and true or false) end end }, { label = "All the Time", tooltip = "Keep raid-wide safemode enabled for the full session. While active, everyone in the session pauses bulk sync and profile transfer operations.", get = function() if store.GetActiveProfileSetting then return store:GetActiveProfileSetting("raidWideSafeMode", false) end return false end, set = function(value) if IsAdmin() and store.SetActiveProfileSetting then store:SetActiveProfileSetting("raidWideSafeMode", value and true or false) end end } } },

@@ -85,6 +85,7 @@ This page includes:
 - Pre-Raid Check and Raid Check actions;
 - admin system-message summaries of missing players and Inspection Failed, independent of whisper settings;
 - optional whispers for missing and prepared players;
+- **Enable Early Preparation Whispers**, a local coordinator preference that defaults to on and is not part of the profile;
 - editable whisper templates.
 
 The two raid-wide safe-mode preferences are not currently connected to the runtime session safe-mode API. They persist on the profile but do not pause session transfers.
