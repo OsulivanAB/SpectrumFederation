@@ -75,6 +75,8 @@ function Sync:BroadcastSessionHeartbeat(opts)
         if type(prepNotice) == "table" then
             payload.prepNotice = prepNotice
         end
+    end
+    
     if self._AttachConsumablesDescriptor then
         self:_AttachConsumablesDescriptor(payload, profileId)
     end

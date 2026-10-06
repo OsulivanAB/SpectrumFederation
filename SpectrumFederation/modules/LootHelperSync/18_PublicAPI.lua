@@ -1379,6 +1379,8 @@ function Sync:ReannounceSession()
     local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
         earlyPrepAttach:AttachToPayload(payload)
+    end
+
     local announcedProfile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
     if announcedProfile and self.BroadcastConsumablesConfig then
         self:BroadcastConsumablesConfig(announcedProfile)
@@ -1442,6 +1444,8 @@ function Sync:ReannounceSession()
     local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrep and earlyPrep.Notify then
         earlyPrep:Notify("session_reannounced")
+    end
+    
     if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
         local announcedProfile = self:FindLocalProfileById(profileId)
         if announcedProfile then

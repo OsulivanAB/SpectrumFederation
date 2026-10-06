@@ -680,6 +680,8 @@ function Sync:BroadcastSessionStart()
     local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
         earlyPrepAttach:AttachToPayload(payload)
+    end
+
     if self._AttachConsumablesDescriptor then
         self:_AttachConsumablesDescriptor(payload, profileId)
     end
@@ -723,6 +725,8 @@ function Sync:BroadcastSessionStart()
     local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrep and earlyPrep.Notify then
         earlyPrep:Notify("session_announced")
+    end
+    
     if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
         local announcedProfile = self:FindLocalProfileById(profileId)
         if announcedProfile then
