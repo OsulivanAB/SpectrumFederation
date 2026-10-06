@@ -1297,6 +1297,9 @@ Sync:ReconcileSessionAuthorization(PROFILE, "remove-coordinator")
 Sync:_NoteAdvertisedCoordinator(COORD)
 assertNil(Sync.state._coordinatorCatchUp, "revoked coordinator is not marked for catch-up")
 assertTrue(not listHas(Sync:_CurrentAuthorizedRoutingTargets(), COORD), "revoked coordinator is not routed")
+assertEq(Sync:RequestProfileSnapshot("consumables-config", { coordinatorOnly = true }), false,
+    "coordinatorOnly profile requests reject a revoked coordinator")
+assertEq(Sync.state._profileReqInFlight, nil, "a rejected coordinatorOnly request does not latch in-flight")
 
 -- Repeated NEW_LOG from a revoked coordinator warns once.
 reset(MEMBER)

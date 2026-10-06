@@ -148,6 +148,8 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
+    self.state._profileSnapshotServe = nil
+    self.state._profileSnapshotBodyCache = nil
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
@@ -678,6 +680,9 @@ function Sync:OnGroupRosterUpdate()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
+    end
 
     -- Find targets who are in-group but haven't been announced to for this sessionId
     local targets = {}
@@ -868,6 +873,9 @@ function Sync:StartSession(profileId, opts)
 
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
+    if self._ClearConsumablesCapability then
+        self:_ClearConsumablesCapability()
+    end
 
     if SF.Debug then
         SF.Debug:Info("SYNC_SESSION", "Session start (role=coordinator sessionId=%s profileId=%s coordinator=%s pointsSource=derived_logs)",
@@ -935,6 +943,10 @@ function Sync:_ResetSessionState(reason)
     self.state.adminStatuses = {}
     self.state.handshake = nil
 
+    if self._ClearConsumablesCapability then
+        self:_ClearConsumablesCapability()
+    end
+
     -- Clear session identity
     self.state.active = false
     self.state.sessionId = nil
@@ -972,6 +984,8 @@ function Sync:_ResetSessionState(reason)
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
+    self.state._profileSnapshotServe = nil
+    self.state._profileSnapshotBodyCache = nil
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
@@ -1365,6 +1379,12 @@ function Sync:ReannounceSession()
     local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
         earlyPrepAttach:AttachToPayload(payload)
+    local announcedProfile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if announcedProfile and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(announcedProfile)
+    end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
     end
 
     if SF.Debug then
@@ -1422,6 +1442,11 @@ function Sync:ReannounceSession()
     local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrep and earlyPrep.Notify then
         earlyPrep:Notify("session_reannounced")
+    if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
+        local announcedProfile = self:FindLocalProfileById(profileId)
+        if announcedProfile then
+            self:_FlushUnsentConsumablesEvents(announcedProfile)
+        end
     end
 
     -- Start/re-ensure coordinator heartbeat sender (ticker)

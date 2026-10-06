@@ -79,6 +79,20 @@ Fingerprint repair may normalize a sequential log only when a batch/import/snaps
 
 Profiles are keyed by stable ID and `activeProfileId` stores the local selection. Snapshot import/export on `LootProfile` is the boundary used by sync; it validates metadata, logs, Raid Check config, and equipment snapshots before applying data.
 
+## Raid Consumables
+
+Configure needed raid materials, help members deposit them into the configured Guild Bank tab, and record successful contributions.
+
+`modules/LootHelper/Consumables.lua` owns profile configuration, the append-only ledger, and contribution projections. State lives on the profile as `_consumables` (guild, bank tab, `requestedItems`, generation/configSeq) plus `_consumableEvents` / archive. Contribution totals are derived from `CONSUMABLE_DONATION` events. They are not saved as separate counters.
+
+New accounting uses `CONSUMABLE_DONATION` (Guild Bank deposits only, `source=guildbank`) and `CONSUMABLE_CONFIG_RESET`. The depositor client is the authoritative writer for a successful observed deposit. Replay is idempotent by event id. Snapshot import merges `snapshot.consumables` from `ImportSnapshot`. Clearing configuration advances the generation, archives the previous generation including the reset, and preserves historical logs. Copying configuration creates a new profile with guild, tab, and requested items only — no donation history.
+
+Development-era Crafter assignments migrate once into `requestedItems` on `Ensure`. Obsolete crafters, assignments, item epochs, custody/receipt events, and pending trade freezes are discarded from live configuration. Legacy event types may remain archived but are not shown in user-facing logs and are rejected from remote writers.
+
+`ConsumablesRouting.lua` and `ConsumablesWorkflow.lua` are pure helpers for Guild Bank access, reminder visibility, deposit quantity clamping, and deposit verification. `ConsumablesSync.lua` authorizes remote config ops (`add_item`, `remove_item`, `set_guild`, `set_bank_tab`, `clear`) and donation/reset events. `modules/LootHelperSync/19_Consumables.lua` carries `CONSUMABLES_OP`, `CONSUMABLES_CONFIG`, and `CONSUMABLES_EVENT` on the existing bulk channel. Older `CONSUMABLES_TRADE_FREEZE` messages are ignored. Protocol version stays 4. Snapshots gain an optional `consumables` field; the snapshot version stays 1.
+
+`ConsumablesRuntime.lua` listens for bag, group, and guild bank events. It does not scan bags from a frame update and does not run a trade-range ticker. The reminder is local (`lootHelper.showRaidSupplyReminders`). Dismissing it suppresses later reminders until reload. The deposit assistant shows requested carried items with editable quantities and Deposit actions only. Deposits enforce the configured guild and tab, merge into partial stacks, place across multiple slots, and credit only observed successful quantity. Mobile Banking uses spell id 83958 on a UIParent holder positioned from screen coordinates out of combat. Profile deletion waits for an in-flight deposit to finish, then completes.
+
 ## UI flow
 
 `UI/LootHelper/Controller.lua` is the authority for roster-window visibility. It combines automatic eligibility (`lootHelper.enabled`, active profile, raid / `showWindowOutsideRaid`) with a runtime-only manual-hidden override. `ShowWindow` / `HideWindow` / `ToggleWindow` / `IsWindowShown` are the public visibility API. Closing the window (title-bar X or Settings **Loot Window**) sets that override and hides `EquipmentWindow`; it does not disable Loot Helper or stop sessions, sync, or heartbeat. `EvaluateVisibility` must not reopen a manually hidden window. `/sf loot` and Settings **Show Loot Window** call `ShowWindow`, which clears the override and then reapplies eligibility. The override is not persisted; `/reload` returns to automatic visibility. Minimize/expanded state is independent of close.

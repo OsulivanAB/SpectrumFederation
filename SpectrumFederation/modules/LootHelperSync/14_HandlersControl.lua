@@ -327,6 +327,9 @@ function Sync:HandleSessionReannounce(sender, payload)
     if self._ApplyAdvertisedRCConfig then
         self:_ApplyAdvertisedRCConfig(payload)
     end
+    if self._ConsiderConsumablesCatchUp then
+        self:_ConsiderConsumablesCatchUp(payload, { deferLedgerCatchUp = true })
+    end
 
     local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if type(payload.prepNotice) == "table" and earlyPrep and earlyPrep.AcceptRemotePrepNotice then
@@ -538,6 +541,9 @@ function Sync:HandleSessionHeartbeat(sender, payload)
     end
     if self._ApplyAdvertisedRCConfig then
         self:_ApplyAdvertisedRCConfig(payload)
+    end
+    if self._ConsiderConsumablesCatchUp then
+        self:_ConsiderConsumablesCatchUp(payload)
     end
 
     local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
@@ -888,17 +894,26 @@ function Sync:HandleNeedProfile(sender, payload)
     end
 
     local serveRole = self.state.isCoordinator and "coordinator" or "helper"
+    if not self:_ProfileSnapshotServeAllowed(sender) then
+        return
+    end
+    self:_NoteProfileSnapshotServe(sender)
     if SF.Debug then
         SF.Debug:Info("SYNC", "Serving profile snapshot as %s to %s", serveRole, tostring(sender))
     end
 
-    local snapPayload = self:BuildProfileSnapshot(self.state.profileId)
-    if not snapPayload then
+    local built = self:_CachedProfileSnapshot(self.state.profileId)
+    if not built then
         if SF.Debug then
             SF.Debug:Warn("SYNC", "Cannot send PROFILE_SNAPSHOT to %s: no local profile %s.",
                 tostring(sender), tostring(self.state.profileId))
         end
         return
+    end
+    -- Copy the top-level envelope so per-sender requestId does not mutate the cache.
+    local snapPayload = {}
+    for k, v in pairs(built) do
+        snapPayload[k] = v
     end
 
     if type(payload.requestId) == "string" and payload.requestId ~= "" then
@@ -1330,6 +1345,9 @@ function Sync:_RecordHandshakeReply(sender, payload, status)
         peer.addonVersion = payload.addonVersion
         peer.localAuthorMax = payload.localAuthorMax
         peer.missing = payload.missing
+        if self._NoteConsumablesCapability then
+            self:_NoteConsumablesCapability(sender, payload)
+        end
     end
 
     -- Track in handshake table too

@@ -328,6 +328,70 @@ local function startSessionOn(profile)
     Sync.state.profileId = profile and profile.GetProfileId and profile:GetProfileId() or profile
 end
 
+function testSnapshotCacheTracksProductionMutations()
+    resetEnv()
+    local profile = makeProfile("Snapshot Revision")
+    setActive(profile)
+    startSessionOn(profile)
+    local now = 42
+    local previousNow = Sync._Now
+    local previousCfg = Sync.cfg
+    function Sync:_Now() return now end
+    Sync.cfg = { requestTimeoutSec = 5 }
+    SF.LootHelperComm = { Send = function() return true end }
+
+    local builds = 0
+    local build = Sync.BuildProfileSnapshot
+    Sync.BuildProfileSnapshot = function(self, profileId)
+        builds = builds + 1
+        return build(self, profileId)
+    end
+
+    local first = Sync:_CachedProfileSnapshot(profile:GetProfileId())
+    local reused = Sync:_CachedProfileSnapshot(profile:GetProfileId())
+    assertEq(builds, 1, "unchanged production snapshots reuse the cached body")
+    assertTrue(first == reused, "cache reuse returns the same immutable body")
+    assertEq(first.snapshot.rcLootCouncilIntegration.recordAwards, true, "initial snapshot records the accepted RC setting")
+    assertEq(first.snapshot.rcConfigSeq, 0, "initial snapshot records the initial RC sequence")
+
+    assertTrue(profile:SetRCLootCouncilRecordAwards(false), "coordinator changes accepted recordAwards")
+    local second = Sync:_CachedProfileSnapshot(profile:GetProfileId())
+    assertEq(builds, 2, "recordAwards invalidates the full-profile snapshot cache")
+    assertEq(second.snapshot.rcLootCouncilIntegration.recordAwards, false, "rebuilt snapshot contains recordAwards edit")
+    assertEq(second.snapshot.rcConfigSeq, 1, "rebuilt snapshot contains the published RC sequence")
+    assertEq(first.snapshot.rcLootCouncilIntegration.recordAwards, true, "earlier cached snapshots remain immutable")
+    assertEq(first.snapshot.rcConfigSeq, 0, "earlier cached RC sequence is not retroactively changed")
+
+    assertTrue(profile:SetRCLootCouncilRecordAllAwardTypes(false), "coordinator changes sibling recordAll setting")
+    local third = Sync:_CachedProfileSnapshot(profile:GetProfileId())
+    assertEq(builds, 3, "recordAll mutation invalidates the cache")
+    assertEq(third.snapshot.rcLootCouncilIntegration.recordAllAwardTypes, false, "recordAll edit reaches the rebuilt snapshot")
+    assertTrue(profile:AddRCLootCouncilAllowedResponse("Need"), "coordinator changes sibling response settings")
+    local fourth = Sync:_CachedProfileSnapshot(profile:GetProfileId())
+    assertEq(builds, 4, "allowed-response mutation invalidates the cache")
+    assertEq(fourth.snapshot.rcLootCouncilIntegration.allowedResponses[1], "Need", "response edit reaches the rebuilt snapshot")
+
+    profile:SetProfileName("Snapshot Revision Renamed")
+    local fifth = Sync:_CachedProfileSnapshot(profile:GetProfileId())
+    assertEq(builds, 5, "same-count profile metadata mutation invalidates the cache")
+    assertEq(fifth.snapshot.meta._profileName, "Snapshot Revision Renamed", "rebuilt snapshot contains metadata edit")
+    assertEq(fourth.snapshot.meta._profileName, "Snapshot Revision", "prior metadata snapshot remains immutable")
+
+    assertTrue(profile:SetRaidCheckGemSocketsEnabled(false), "coordinator changes an exported Raid Check setting")
+    local sixth = Sync:_CachedProfileSnapshot(profile:GetProfileId())
+    assertEq(builds, 6, "same-count Raid Check mutation invalidates the cache")
+    assertEq(sixth.snapshot.raidCheck.checkGemsInSockets, false, "rebuilt snapshot contains Raid Check edit")
+    assertEq(fifth.snapshot.raidCheck.checkGemsInSockets, true, "prior Raid Check snapshot remains immutable")
+
+    Sync.BuildProfileSnapshot = build
+    SF.LootHelperComm = nil
+    Sync._Now = previousNow
+    Sync.cfg = previousCfg
+end
+
+testSnapshotCacheTracksProductionMutations()
+testSnapshotCacheTracksProductionMutations = nil
+
 local function makeProfileOwnedBy(name, ownerId)
     local previous = PLAYER
     PLAYER = ownerId

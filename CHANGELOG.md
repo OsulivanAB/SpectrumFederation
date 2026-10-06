@@ -2,6 +2,20 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.1] - 2026-10-06
+
+### Added
+- Add Loot Helper Raid Consumables
+
+### Changed
+- Consumables: validate event ordering and preserve deposit evidence; snapshot cache, CI, and version bumps
+- Stabilize Guild-Bank consumables: preserve confirmed deposits, snapshot cache revisions, and bounded order validation
+
+## [1.5.7] - 2026-10-03
+
+### Changed
+- Update Cursed Surge cadence to 30 minutes
+
 ## [1.5.6] - 2026-09-27
 
 ### Added

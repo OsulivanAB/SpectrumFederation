@@ -618,9 +618,11 @@ function Sync:HandleProfileSnapshot(sender, payload)
     if self:_ProfileAuthorizationKnown() and not self:IsSenderAuthorized(profileId, sender) then
         replaceExisting = false
     end
+    local fromCoordinator = self.state.coordinator and self:_SamePlayer(sender, self.state.coordinator) and true or false
     local okImport, inserted, importErr = profile:ImportSnapshot(payload.snapshot, {
         allowUnknownEventType = true,
         allowReplaceExisting = replaceExisting,
+        consumablesFromCoordinator = fromCoordinator,
     })
     if t0 then
         self:_MObserve("sync.merge.profile_snapshot.import_ms", debugprofilestop() - t0)
@@ -631,6 +633,9 @@ function Sync:HandleProfileSnapshot(sender, payload)
             SF.Debug:Warn("SYNC", "PROFILE_SNAPSHOT import failed: %s", tostring(importErr or "unknown"))
         end
         return
+    end
+    if self._NoteConsumablesSnapshot then
+        self:_NoteConsumablesSnapshot(profile, fromCoordinator)
     end
 
     self.state.rcConfigSeq = tonumber(profile._rcConfigSeq) or 0

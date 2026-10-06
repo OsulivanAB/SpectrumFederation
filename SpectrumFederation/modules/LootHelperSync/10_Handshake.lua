@@ -75,6 +75,8 @@ function Sync:BroadcastSessionHeartbeat(opts)
         if type(prepNotice) == "table" then
             payload.prepNotice = prepNotice
         end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
     end
 
     -- Session end uses ALERT so this heartbeat stays ahead of SES_END.

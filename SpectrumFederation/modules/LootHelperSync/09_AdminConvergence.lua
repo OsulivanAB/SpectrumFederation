@@ -680,6 +680,8 @@ function Sync:BroadcastSessionStart()
     local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
         earlyPrepAttach:AttachToPayload(payload)
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
     end
 
     if SF.Debug then
@@ -721,6 +723,14 @@ function Sync:BroadcastSessionStart()
     local earlyPrep = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrep and earlyPrep.Notify then
         earlyPrep:Notify("session_announced")
+    if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
+        local announcedProfile = self:FindLocalProfileById(profileId)
+        if announcedProfile then
+            if self.BroadcastConsumablesConfig then
+                self:BroadcastConsumablesConfig(announcedProfile)
+            end
+            self:_FlushUnsentConsumablesEvents(announcedProfile)
+        end
     end
 
     -- Start coordinator heartbeat sender (ticker)

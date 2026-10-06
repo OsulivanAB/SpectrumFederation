@@ -56,4 +56,9 @@ Sync.MSG = {
     PREP_WARN_CLAIM_RELEASE = "PREP_WARN_CLAIM_RELEASE",
     -- Group-visible grant replication before ACK/delivery.
     PREP_WARN_CLAIM_GRANT = "PREP_WARN_CLAIM_GRANT",
+    -- Raid Consumables config and append-only accounting
+    CONSUMABLES_OP = "CONSUMABLES_OP",
+    CONSUMABLES_CONFIG = "CONSUMABLES_CONFIG",
+    CONSUMABLES_EVENT = "CONSUMABLES_EVENT",
+    CONSUMABLES_TRADE_FREEZE = "CONSUMABLES_TRADE_FREEZE",
 }
