@@ -680,6 +680,8 @@ function Sync:BroadcastSessionStart()
     local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
         earlyPrepAttach:AttachToPayload(payload)
+    end
+    
     if self._AttachConsumablesDescriptor then
         self:_AttachConsumablesDescriptor(payload, profileId)
     end

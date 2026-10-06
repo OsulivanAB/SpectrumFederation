@@ -1379,6 +1379,8 @@ function Sync:ReannounceSession()
     local earlyPrepAttach = SF.RaidEquipment and SF.RaidEquipment.EarlyPreparation
     if earlyPrepAttach and earlyPrepAttach.AttachToPayload then
         earlyPrepAttach:AttachToPayload(payload)
+    end
+    
     local announcedProfile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
     if announcedProfile and self.BroadcastConsumablesConfig then
         self:BroadcastConsumablesConfig(announcedProfile)
