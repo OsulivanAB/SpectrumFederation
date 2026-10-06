@@ -1185,6 +1185,13 @@ function Runtime:PlaceNextDeposit()
                 work.stackIndex = stackIndex
                 work.stackLeft = nil
             else
+                -- Recheck on every continuation immediately before source pickup.
+                -- Never clear or move a cursor payload supplied by the player.
+                if not self:DepositCursorEmpty() then
+                    Warn("Put down the cursor item before depositing raid supplies.")
+                    self:CancelDepositWork()
+                    return
+                end
                 if take < stackLeft and container.SplitContainerItem then
                     container.SplitContainerItem(stack.bag, stack.slot, take)
                 elseif container.PickupContainerItem then
@@ -1227,7 +1234,19 @@ end
 function Runtime:BeginDeposit(line, collected)
     local C = SF.Consumables
     local Routing = SF.ConsumablesRouting
-    local profile = collected.profile
+    local profile = collected and collected.profile
+    local current = self:AccountingProfile()
+    local profileId = profile and (profile.GetProfileId and profile:GetProfileId() or profile._profileId)
+    local currentId = current and (current.GetProfileId and current:GetProfileId() or current._profileId)
+    if not profileId or profileId ~= currentId then
+        Warn("Raid supplies profile changed. Review the donation again.")
+        self:RebuildReview()
+        return
+    end
+    if not self:DepositCursorEmpty() then
+        Warn("Put down the cursor item before depositing raid supplies.")
+        return
+    end
     -- Recompute live bank access at click time; the review model can be stale.
     local access = self:BankAccess(profile)
     local usable = Routing and Routing.GuildBankUsable(access) or false
@@ -1277,7 +1296,6 @@ function Runtime:BeginDeposit(line, collected)
     local beforeBags = have
     local stacks = (self.bagStacks and self.bagStacks[line.itemId]) or {}
     local targets = self:DepositTargets(tab, line.itemId, MAX_DEPOSIT_PLACES)
-    local profileId = profile.GetProfileId and profile:GetProfileId() or profile._profileId
     self:CancelDepositWork()
     self.depositWork = {
         line = line,
@@ -1360,6 +1378,12 @@ function Runtime:FinishDeposit(fromTimer)
         Info(string.format("Deposited %d. The rest is still in your bags.", actual))
     end
     self:CompleteDeferredProfileDeletes()
+end
+
+function Runtime:DepositCursorEmpty()
+    -- A nil item ID is not proof of emptiness: spell/money payloads and item
+    -- payloads with unresolved IDs must not reach the item-moving APIs either.
+    return type(GetCursorInfo) == "function" and GetCursorInfo() == nil
 end
 
 function Runtime:CursorItemId()

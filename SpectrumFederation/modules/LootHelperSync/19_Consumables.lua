@@ -514,7 +514,8 @@ function Sync:_FlushUnsentConsumablesEvents(profile)
     self._consumablesFlushing = true
     local sent = 0
     local ids = C and C.EventIndex and C.EventIndex(profile)
-    while sent < MAX_EVENT_FLUSH and #queue > 0 do
+    local limit = math.min(MAX_EVENT_FLUSH, #queue)
+    while sent < limit and #queue > 0 do
         local eventId = queue[1]
         local stored = ids and ids[eventId]
         if type(stored) ~= "table" then
@@ -525,6 +526,11 @@ function Sync:_FlushUnsentConsumablesEvents(profile)
                 break
             end
             table.remove(queue, 1)
+            if not (self.state and self.state.isCoordinator) then
+                -- Accepted into BULK is not accepted by the coordinator. Rotate
+                -- pending IDs so later batches progress without losing protection.
+                queue[#queue + 1] = eventId
+            end
         end
         sent = sent + 1
     end
@@ -718,6 +724,9 @@ function Sync:BroadcastConsumablesEvent(profile, event)
             self:_QueueUnsentConsumablesEvent(profile, event.id)
             return false
         end
+        -- Protect even a successful initial send until a stamped relay or
+        -- authoritative snapshot confirms coordinator acceptance.
+        self:_QueueUnsentConsumablesEvent(profile, event.id)
         sent = SF.LootHelperComm:Send("BULK", self.MSG.CONSUMABLES_EVENT, payload, "WHISPER", coordinator, "NORMAL")
     else
         local C = Consumables()
@@ -814,6 +823,14 @@ function Sync:HandleConsumablesEvent(sender, payload)
     local stored = ids and event.id and ids[event.id]
     local hadOrder = type(stored) == "table" and C.ValidOrder(stored.order) ~= nil
     local ok, status = S.ApplyRemoteEvent(profile, event, sender, relay and { coordinatorRelay = true } or nil)
+    if ok and relay then
+        local queue = profile._consumablesUnsent
+        if type(queue) == "table" then
+            for i = #queue, 1, -1 do
+                if queue[i] == event.id then table.remove(queue, i) end
+            end
+        end
+    end
     if isCoordinator and ok and not hadOrder and C.StampOrder then
         if not C.StampOrder(profile, event) then return end
         self:BroadcastConsumablesEvent(profile, event)

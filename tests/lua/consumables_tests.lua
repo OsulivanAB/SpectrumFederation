@@ -60,6 +60,7 @@ local function resetWorld()
         maxStack = 20,
         places = {},
         splits = {},
+        pickups = {},
         withdrawAttempts = 0,
         acceptPlaces = nil,
         inCombat = false,
@@ -103,6 +104,7 @@ C_Container = {
         world.cursor = { itemId = row.itemId, count = count, bag = bag, slot = slot }
     end,
     PickupContainerItem = function(bag, slot)
+        world.pickups[#world.pickups + 1] = { bag = bag, slot = slot }
         local row = bagSlot(bag, slot)
         if not row or row.count <= 0 then return end
         world.cursor = { itemId = row.itemId, count = row.count, bag = bag, slot = slot }
@@ -112,7 +114,7 @@ C_Container = {
 
 function GetCursorInfo()
     if world.cursorBroken or not world.cursor then return nil end
-    return "item", world.cursor.itemId
+    return world.cursor.kind or "item", world.cursor.itemId
 end
 
 function PickupGuildBankItem(tab, slot)
@@ -1074,6 +1076,118 @@ local function countMsg(sent, msg)
     return n
 end
 
+
+local function checkQueuedResendProtection()
+    resetWorld()
+    resetSync()
+    local follower = configured("queue-race")
+    local coordinator = configured("queue-race")
+    local event = donation("ce:queue-race:Donor-Realm:1", donor, 7, { order = 17, writer = donor })
+    assertTrue(C.AppendEvent(follower, event), "the follower retains an authored ordered event")
+    local sent = {}
+    local followerState = { active = true, isCoordinator = false, coordinator = admin, sessionId = "queue-session",
+        profileId = follower._profileId, peers = { [admin] = { consumablesCapable = true } } }
+    sessionStubs(followerState, { [follower._profileId] = follower }, sent)
+    Sync._SelfId = function() return donor end
+    Sync.MSG.NEED_PROFILE = "NP"
+    Sync._GetAddonVersion = function() return "test" end
+    -- Real Comm.Send and its paced queue; only wire encoding and delivery are mocked.
+    load("SpectrumFederation/modules/LootHelper/Comm.lua")
+    local comm = SF.LootHelperComm
+    comm._ready = true
+    comm.cfg.perTargetMinIntervalSec = 0
+    local wire = {}
+    local function wireCopy(value)
+        if type(value) ~= "table" then return value end
+        local copy = {}
+        for key, child in pairs(value) do copy[key] = wireCopy(child) end
+        return copy
+    end
+    local sequence = 0
+    local oldProtocol = SF.SyncProtocol
+    SF.SyncProtocol = {
+        PROTO_CURRENT = 4, ENC_B64CBOR = "B", ENC_NONE = "N",
+        EncodePayloadTable = function(payload)
+            sequence = sequence + 1
+            wire[tostring(sequence)] = wireCopy(payload)
+            return tostring(sequence)
+        end,
+        PackEnvelope = function(msg, _, _, encoded) return msg .. ":" .. encoded end,
+    }
+    local bulk = {}
+    local snapshots = 0
+    comm.SendCommMessage = function(_, prefix, message)
+        local msg, encoded = message:match("^(%w+):(%d+)$")
+        local payload = wire[encoded]
+        if prefix == comm.PREFIX.BULK then
+            bulk[#bulk + 1] = payload
+        elseif msg == "NP" then
+            snapshots = snapshots + 1
+            C.MergeSnapshot(follower, C.ExportSnapshot(coordinator), { consumablesFromCoordinator = true })
+        end
+    end
+    Sync.RequestProfileSnapshot = function()
+        return Sync:_SendNeedProfileReq({ id = "queue-request" }, admin)
+    end
+    local desc = C.Descriptor(coordinator)
+    local hb = { profileId = follower._profileId, sessionId = "queue-session", coordinator = admin,
+        consumablesGeneration = desc.generation, consumablesConfigSeq = desc.configSeq,
+        consumablesConfigFingerprint = desc.configFingerprint, consumablesEventCount = desc.eventCount,
+        consumablesEventFingerprint = desc.eventFingerprint, consumablesArchiveCount = desc.archiveCount,
+        consumablesArchiveFingerprint = desc.archiveFingerprint }
+    -- Initial live sends need the same protection as catch-up resends.
+    assertTrue(Sync:BroadcastConsumablesEvent(follower, event), "a follower's initial BULK send is accepted")
+    assertEq(#follower._consumablesUnsent, 1, "initial send retains pending protection")
+    Sync:_QueueAuthoredOrderedConsumablesEvents(follower, desc.eventCount, true)
+    assertEq(#follower._consumablesUnsent, 1, "authored ordered event is queued for resend")
+    Sync:_ConsiderConsumablesCatchUp(hb)
+    assertEq(#bulk, 0, "BULK acceptance has not transmitted the event")
+    assertTrue(comm.state.total > 0, "the actual paced Comm queue holds the resend")
+    assertEq(snapshots, 1, "CONTROL NEED_PROFILE overtakes the queued BULK resend")
+    assertEq(C.ContributionTotal(follower, donor, aqirite), 7, "the early authoritative snapshot preserves the follower's only copy")
+    assertEq(#follower._consumablesUnsent, 1, "queue acceptance retains durable pending protection")
+    for _ = 1, 10 do Sync:_ConsiderConsumablesCatchUp(hb) end
+    assertEq(#follower._consumablesUnsent, 1, "repeated catch-up retains one pending ID")
+    for _ = 1, 60 do comm:_PumpQueue() end
+    assertTrue(#bulk > 0, "pumping the actual queue transmits the pending event")
+    local relay = {}
+    sessionStubs({ active = true, isCoordinator = true, coordinator = admin, sessionId = "queue-session",
+        profileId = coordinator._profileId, peers = {} }, { [coordinator._profileId] = coordinator }, relay)
+    Sync._SelfId = function() return admin end
+    for i = 1, #bulk do Sync:HandleConsumablesEvent(donor, bulk[i]) end
+    assertEq(#coordinator._consumableEvents, 1, "repeated resends are idempotent at the coordinator")
+    assertEq(C.ContributionTotal(coordinator, donor, aqirite), 7, "the coordinator credits the donation once")
+    sessionStubs(followerState, { [follower._profileId] = follower }, {})
+    Sync._SelfId = function() return donor end
+    local bogus = donation(event.id, donor, 7, { order = 1, writer = donor, source = "trade" })
+    Sync:HandleConsumablesEvent(admin, { sessionId = "queue-session", profileId = follower._profileId, event = bogus })
+    assertEq(#follower._consumablesUnsent, 1, "a rejected stamped relay cannot acknowledge the pending event")
+    for i = 1, #relay do Sync:HandleConsumablesEvent(admin, relay[i].payload) end
+    assertEq(#follower._consumablesUnsent, 0, "accepted coordinator-stamped echo clears pending protection")
+    assertEq(#follower._consumableEvents, 1, "repeated stamped echoes remain idempotent")
+    Sync:_QueueUnsentConsumablesEvent(follower, event.id)
+    C.MergeSnapshot(follower, C.ExportSnapshot(coordinator), { consumablesFromCoordinator = true })
+    assertEq(#follower._consumablesUnsent, 0, "authoritative snapshot acceptance also clears pending protection")
+    -- More than one flush batch must progress rather than resend only its head.
+    local rotated = {}
+    SF.LootHelperComm.Send = function(_, _, _, payload)
+        rotated[payload.event.id] = true
+        return true
+    end
+    for i = 2, 18 do
+        local row = donation("ce:queue-race:Donor-Realm:" .. tostring(i), donor, 1)
+        assert(C.AppendEvent(follower, row))
+        Sync:_QueueUnsentConsumablesEvent(follower, row.id)
+    end
+    for _ = 1, 3 do Sync:_FlushUnsentConsumablesEvents(follower) end
+    local count = 0
+    for _ in pairs(rotated) do count = count + 1 end
+    assertEq(count, 17, "bounded flush rotation reaches IDs beyond the first batch")
+    assertEq(#follower._consumablesUnsent, 17, "rotation preserves exactly one pending ID per event")
+    SF.SyncProtocol = oldProtocol
+    resetSync()
+end
+
 local function checkSessionTransport()
     resetSync()
     local coordP = configured("session")
@@ -1554,6 +1668,76 @@ local function checkRuntimeDeposit()
     world.places = {}
 end
 
+
+local function checkStaleDepositReview()
+    local a = runtimeFixture("stale-A")
+    local b = configured("stale-B")
+    -- Stable IDs can be provided by the profile method rather than the storage field.
+    function a:GetProfileId() return "stale-A" end
+    function b:GetProfileId() return "stale-B" end
+    SF.lootHelperDB.profiles[b:GetProfileId()] = b
+    world.bankOpen = true
+    RT:OnBankOpened()
+    local oldClick = RT.review.Rows[2].Button.scripts.OnClick
+    Sync.state = { active = true, profileId = b:GetProfileId(), sessionId = "profile-transition" }
+    oldClick()
+    assertEq(#world.places, 0, "a stale profile-A button performs no deposit")
+    assertEq(RT.depositWork, nil, "a stale review does not begin deposit work")
+    assertEq(#a._consumableEvents, 0, "a stale button records no contribution on A")
+    assertEq(#(a._consumablesUnsent or {}), 0, "a stale button queues no contribution on A")
+    assertTrue(RT.review.Rows[2].Button.scripts.OnClick ~= oldClick, "the stale review is rebuilt for the current profile")
+    RT.review.Rows[2].Button.scripts.OnClick()
+    drainAfter(32)
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(#b._consumableEvents, 1, "the refreshed unchanged-profile button deposits against B")
+    assertEq(#a._consumableEvents, 0, "the completed B deposit leaves A unchanged")
+end
+
+local function checkOccupiedDepositCursor()
+    for case, itemId in ipairs({ junk, aqirite, aqirite }) do
+        local p = runtimeFixture("occupied-" .. tostring(itemId))
+        world.bankOpen = true
+        RT:OnBankOpened()
+        if case == 3 then world.bank[2] = {} end -- Exercise full-stack pickup, too.
+        local held = { itemId = itemId, count = 99 }
+        world.cursor = held
+        RT.review.Rows[2].Button.scripts.OnClick()
+        assertEq(#world.pickups, 0, "occupied cursor prevents bag pickup for " .. tostring(itemId))
+        assertEq(#world.splits, 0, "occupied cursor prevents bag split for " .. tostring(itemId))
+        assertEq(#world.places, 0, "occupied cursor prevents bank pickup for " .. tostring(itemId))
+        assertTrue(world.cursor == held, "the player's occupied cursor is untouched")
+        assertEq(RT.depositWork, nil, "occupied cursor prevents new deposit work")
+        assertEq(#p._consumableEvents, 0, "occupied cursor records no contribution")
+        assertEq(#(p._consumablesUnsent or {}), 0, "occupied cursor queues no contribution")
+    end
+    local p = runtimeFixture("occupied-between")
+    world.bankOpen = true
+    startDeposit()
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertEq(RT.depositWork.bestActual, 2, "the first placement has verified credit")
+    local splits, pickups = #world.splits, #world.pickups
+    local held = { itemId = aqirite, count = 99 }
+    world.cursor = held
+    drainAfter(32)
+    fireTimers()
+    assertEq(#world.pickups, pickups, "an occupied deferred cursor stops further bag pickups")
+    assertEq(#world.splits, splits, "an occupied deferred cursor stops further splits")
+    assertEq(#world.places, 1, "an occupied deferred cursor stops further bank placements")
+    assertTrue(world.cursor == held, "cancellation leaves the manual cursor item untouched")
+    assertEq(RT.depositWork, nil, "cursor interruption cancels future placement work")
+    assertEq(#p._consumableEvents, 1, "cursor interruption retains the verified contribution")
+    assertEq(p._consumableEvents[1].quantity, 2, "only the completed placement is credited")
+    assertEq(#world.after, 0, "cursor interruption leaves no continuations")
+    assertEq(#liveTimers(), 0, "cursor interruption leaves no deadline")
+    -- A non-item payload must not be confused with the requested item, either.
+    p = runtimeFixture("occupied-spell")
+    world.bankOpen = true
+    world.cursor = { kind = "spell" }
+    startDeposit()
+    assertEq(#world.places, 0, "a non-item cursor payload performs no item movement")
+    assertEq(#p._consumableEvents, 0, "a non-item cursor payload records no donation")
+end
+
 local function checkRuntimeDepositPartialAndFailure()
     local p = runtimeFixture("rt-partial")
     world.bankOpen = true
@@ -1869,10 +2053,13 @@ checkAuthorizeAndConfigSync()
 checkRemoteEvents()
 checkCatchUpRules()
 checkSessionTransport()
+checkQueuedResendProtection()
 checkRuntimeInventory()
 checkRuntimeReminder()
 checkRuntimeReview()
 checkRuntimeDeposit()
+checkStaleDepositReview()
+checkOccupiedDepositCursor()
 checkRuntimeDepositPartialAndFailure()
 checkRuntimeCancelAndDeferredDelete()
 checkClear()

@@ -1538,6 +1538,8 @@ end
 
 local function ReconcileAuthoritativeEvents(profile, events)
     local keep = {}
+    local accepted = {}
+    local Rules = SF.ConsumablesSync
     local limit = #events
     local maxEvents = C.MAX_LEDGER_EVENTS + C.MAX_ARCHIVED_EVENTS
     if limit > maxEvents then limit = maxEvents end
@@ -1545,10 +1547,23 @@ local function ReconcileAuthoritativeEvents(profile, events)
         local event = events[i]
         if type(event) == "table" and type(event.id) == "string" and event.id ~= "" then
             keep[event.id] = true
+            if C.ValidOrder(event.order) and Rules and Rules.AuthoritativeEventBodyOk
+                and Rules.AuthoritativeEventBodyOk(event) then
+                accepted[event.id] = true
+            end
         end
     end
-    local unsent = {}
+    -- Only coordinator-stamped valid snapshot rows acknowledge pending sends.
     local queue = profile._consumablesUnsent
+    if type(queue) == "table" then
+        local pending = {}
+        for i = 1, math.min(#queue, maxEvents) do
+            if not accepted[queue[i]] then pending[#pending + 1] = queue[i] end
+        end
+        profile._consumablesUnsent = pending
+        queue = pending
+    end
+    local unsent = {}
     if type(queue) == "table" then
         local queued = #queue
         if queued > maxEvents then queued = maxEvents end
@@ -1559,7 +1574,6 @@ local function ReconcileAuthoritativeEvents(profile, events)
         end
     end
     local selfId = SF.NameUtil and SF.NameUtil.GetSelfId and SF.NameUtil.GetSelfId() or nil
-    local Rules = SF.ConsumablesSync
     local function authoredUnacked(event)
         if type(event) ~= "table" or type(event.id) ~= "string" then return false end
         if tonumber(event.order) ~= nil then return false end
