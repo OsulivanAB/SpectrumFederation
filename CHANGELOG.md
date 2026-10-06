@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.3] - 2026-10-06
+
+### Fixed
+- Fixes
+
 ## [1.5.8-beta.1] - 2026-10-06
 
 ### Added
