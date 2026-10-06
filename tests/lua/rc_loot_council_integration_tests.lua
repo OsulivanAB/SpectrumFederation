@@ -334,6 +334,8 @@ function testSnapshotCacheTracksProductionMutations()
     setActive(profile)
     startSessionOn(profile)
     local now = 42
+    local previousNow = Sync._Now
+    local previousCfg = Sync.cfg
     function Sync:_Now() return now end
     Sync.cfg = { requestTimeoutSec = 5 }
     SF.LootHelperComm = { Send = function() return true end }
@@ -383,6 +385,8 @@ function testSnapshotCacheTracksProductionMutations()
 
     Sync.BuildProfileSnapshot = build
     SF.LootHelperComm = nil
+    Sync._Now = previousNow
+    Sync.cfg = previousCfg
 end
 
 testSnapshotCacheTracksProductionMutations()
