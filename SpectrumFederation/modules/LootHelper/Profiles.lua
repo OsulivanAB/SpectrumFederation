@@ -587,10 +587,15 @@ function LootProfile:_MarkIntegritySummaryDirty()
     self._authorWindowSummaryDirty = true
 end
 
+function LootProfile:_NoteSnapshotMutation()
+    self._snapshotRevision = (tonumber(self._snapshotRevision) or 0) + 1
+end
+
 -- Bump when log contents change so sync can drop a cached history scan.
 -- Index rebuilds do not call this. A replaced row and an appended row do.
 function LootProfile:_NoteLootLogMutation()
     self._lootLogRevision = (tonumber(self._lootLogRevision) or 0) + 1
+    self:_NoteSnapshotMutation()
 end
 
 function LootProfile:_RefreshLogPositionIndex()
@@ -829,6 +834,10 @@ function LootProfile.new(profileName)
     table.insert(instance._lootLogs, logEntry)
 
     instance:_EnsureOwnerIsAdmin()
+
+    if instance.EnsureConsumables then
+        instance:EnsureConsumables()
+    end
 
     return instance
 end
@@ -1766,6 +1775,7 @@ function LootProfile:SetRaidCheckEquipmentSnapshot(memberId, snapshot)
 
 	snapshotCopy.preparedSlotsByConfig = {}
 	self._raidCheckEquipmentSnapshots[memberId] = snapshotCopy
+	self:_NoteSnapshotMutation()
 	return true
 end
 
@@ -1800,6 +1810,7 @@ function LootProfile:SetRaidCheckSlotEnabled(slotKey, enabled)
 	end
 
 	self._raidCheckConfig.slots[slotKey] = enabled and true or false
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1822,6 +1833,7 @@ function LootProfile:SetRaidCheckWhispers(mode, enabled)
 		return false, "Invalid whisper mode."
 	end
 
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1836,6 +1848,7 @@ function LootProfile:SetRaidCheckWhisperPrepared(enabled)
 	end
 
 	self._raidCheckConfig.enableWhispersRaidPrepared = enabled and true or false
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1862,6 +1875,7 @@ function LootProfile:SetRaidCheckWhisperTemplate(key, template)
 		self._raidCheckConfig[field] = template
 	end
 
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1877,6 +1891,7 @@ function LootProfile:ResetRaidCheckWhisperTemplate(key)
 	end
 
 	self._raidCheckConfig[field] = RAID_CHECK_DEFAULTS[field]
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1891,6 +1906,7 @@ function LootProfile:SetRaidCheckPointsAwardPerCheck(amount)
 	end
 
 	self._raidCheckConfig.pointsAwardPerRaidCheck = NormalizeRaidCheckPointsAward(amount)
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1905,6 +1921,7 @@ function LootProfile:SetRaidCheckGemSocketsEnabled(enabled)
     end
 
     self._raidCheckConfig.checkGemsInSockets = enabled and true or false
+    self:_NoteSnapshotMutation()
     return true, nil
 end
 
@@ -1919,6 +1936,7 @@ function LootProfile:SetRaidCheckMetaGemRequired(enabled)
     end
 
     self._raidCheckConfig.requireMetaGem = enabled and true or false
+    self:_NoteSnapshotMutation()
     return true, nil
 end
 
@@ -1939,6 +1957,7 @@ function LootProfile:SetRaidCheckMinimumItemLevelRequired(enabled)
 	end
 	NoteItemLevelPolicyChanged()
 	PublishRaidCheckItemLevelPolicy(self)
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1959,6 +1978,7 @@ function LootProfile:SetRaidCheckMinimumItemLevel(amount)
 	end
 	NoteItemLevelPolicyChanged()
 	PublishRaidCheckItemLevelPolicy(self)
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -1981,6 +2001,7 @@ function LootProfile:ApplyRaidCheckItemLevelPolicy(enabled, minimum, options)
 	self._raidCheckConfig.requireMinimumItemLevel = nextEnabled
 	self._raidCheckConfig.minimumItemLevel = nextMinimum
 	NoteItemLevelPolicyChanged()
+	self:_NoteSnapshotMutation()
 	return true, nil
 end
 
@@ -2227,6 +2248,12 @@ local function ApplyRCLootCouncilIntegrationFields(target, config)
 	end
 end
 
+local function NoteAcceptedRCConfigMutation(self, target)
+	if target == self._rcLootCouncilIntegration then
+		self:_NoteSnapshotMutation()
+	end
+end
+
 function LootProfile:ApplyRCLootCouncilIntegrationConfig(config, options)
 	options = options or {}
 	if type(config) ~= "table" then
@@ -2252,6 +2279,7 @@ function LootProfile:ApplyRCLootCouncilIntegrationConfig(config, options)
 		target = GetMutableRCLootCouncilIntegration(self)
 	end
 	ApplyRCLootCouncilIntegrationFields(target, config)
+	NoteAcceptedRCConfigMutation(self, target)
 	if not options.skipSync then
 		return PushRCIntegrationConfig(self)
 	end
@@ -2264,6 +2292,7 @@ function LootProfile:SetRCLootCouncilRecordAwards(enabled)
 	end
 	local cfg = GetMutableRCLootCouncilIntegration(self)
 	cfg.recordAwards = enabled and true or false
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2273,6 +2302,7 @@ function LootProfile:SetRCLootCouncilRecordAllAwardTypes(enabled)
 	end
 	local cfg = GetMutableRCLootCouncilIntegration(self)
 	cfg.recordAllAwardTypes = enabled and true or false
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2292,6 +2322,7 @@ function LootProfile:AddRCLootCouncilAllowedResponse(value)
 		end
 	end
 	cfg.allowedResponses[#cfg.allowedResponses + 1] = trimmed
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2321,6 +2352,7 @@ function LootProfile:RemoveRCLootCouncilAllowedResponse(value)
 		return false, "That award type is not in the list."
 	end
 	cfg.allowedResponses = filtered
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2359,6 +2391,7 @@ function LootProfile:AddRCLootCouncilBisResponse(value)
 		end
 	end
 	cfg.bisResponses[#cfg.bisResponses + 1] = entry
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -2390,6 +2423,7 @@ function LootProfile:RemoveRCLootCouncilBisResponse(value)
 		return false, "That BiS response is not in the list."
 	end
 	cfg.bisResponses = filtered
+	NoteAcceptedRCConfigMutation(self, cfg)
 	return PushRCIntegrationConfig(self)
 end
 
@@ -4044,6 +4078,7 @@ function LootProfile:SetProfileName(newName)
             SF.Debug:Warn("LootProfile", "Attempted to set invalid profile name: %s", tostring(newName))
         end
     end
+    self:_NoteSnapshotMutation()
 end
 
 -- Function to set a new owner for this profile
@@ -4065,6 +4100,7 @@ function LootProfile:SetOwner(newOwner)
             SF.Debug:Warn("LootProfile", "Attempted to set invalid owner: %s", tostring(newOwner))
         end
     end
+    self:_NoteSnapshotMutation()
 end
 
 -- Runtime-only notice latch. Kept off the profile table so it is not saved.
@@ -4237,6 +4273,7 @@ function LootProfile:AddMember(member)
         self._members = self._members or {}
         table.insert(self._members, member)
         self._memberById = nil
+        self:_NoteSnapshotMutation()
         return true
     else
         if SF.Debug then
@@ -4271,6 +4308,7 @@ function LootProfile:RemoveMemberById(memberId)
         self._memberById = nil
     end
 
+    self:_NoteSnapshotMutation()
     return removed
 end
 
@@ -4802,6 +4840,7 @@ function LootProfile:ExportSnapshot()
 		rcLootCouncilIntegration = self:GetRCLootCouncilIntegrationConfig(),
 		rcConfigSeq     = tonumber(self._rcConfigSeq) or 0,
 		rcConfigEpoch   = tonumber(self._rcConfigEpoch) or 0,
+		consumables     = (SF.Consumables and SF.Consumables.ExportSnapshot and SF.Consumables.ExportSnapshot(self)) or nil,
 	}
 end
 
@@ -4948,6 +4987,18 @@ function LootProfile.ValidateSnapshot(snapshot)
 
 	if snapshot.rcConfigSeq ~= nil and type(snapshot.rcConfigSeq) ~= "number" then
 		return false, "snapshot.rcConfigSeq must be a number when provided"
+	end
+
+	if snapshot.consumables ~= nil then
+		if type(snapshot.consumables) ~= "table" then
+			return false, "snapshot.consumables must be a table or nil"
+		end
+		if SF.Consumables and SF.Consumables.ValidateSnapshot then
+			local consumablesOk, consumablesErr = SF.Consumables.ValidateSnapshot(snapshot.consumables)
+			if not consumablesOk then
+				return false, consumablesErr
+			end
+		end
 	end
 
 	return true, nil
@@ -5168,6 +5219,10 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	end
 	self:_EnsureRewardPotConfig()
 
+	if SF.Consumables and SF.Consumables.MergeSnapshot and snapshot.consumables ~= nil then
+		SF.Consumables.MergeSnapshot(self, snapshot.consumables, opts)
+	end
+
 	-- Merge Logs
 	opts = opts or {}
 	if opts.allowMainSwapFingerprintNormalize == nil then
@@ -5178,6 +5233,7 @@ function LootProfile:ImportSnapshot(snapshot, opts)
 	if self.NormalizePersistedLegacyBonusRolls then
 		self:NormalizePersistedLegacyBonusRolls()
 	end
+	self:_NoteSnapshotMutation()
 
 	return true, inserted, nil
 end

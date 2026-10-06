@@ -209,16 +209,20 @@ before authorizing a repair batch.
 
 ## Reply and resolve
 
-- Reply with `ManagePullRequest` `post_comment` and `in_reply_to` set to the
-  review comment id. Do not use `gh` to write comments. Clearly identify
-  automated dispositions as recommendations. Retain useful returned comment IDs
-  in task context when available.
-- Resolve with `ManagePullRequest` `resolve_comment` only after the reply, only
-  when step 6 applies, and only when resolution was authorized.
+- Prefer `ManagePullRequest` `post_comment` with `in_reply_to` set to the
+  review comment id. If unavailable, use the equivalent GitHub connector
+  `reply_to_review_comment` tool with the top-level inline review comment ID.
+  Do not use `gh` to write comments. Clearly identify automated dispositions as
+  recommendations. Retain useful returned comment IDs in task context when available.
+- Prefer `ManagePullRequest` `resolve_comment`; if unavailable, use the GitHub
+  connector `resolve_review_thread` tool with the GraphQL thread ID. Resolve only
+  after the reply, only when step 6 applies, and only when resolution was authorized.
 - Do not resolve a thread just because you replied, and do not resolve merely
   because subscription triage classified the finding.
-- If `ManagePullRequest` is unavailable, do not switch to another writer.
-  Report that the reply was not posted and leave the thread unresolved.
+- The equivalent GitHub connector fallback is permitted for the same authorized
+  action; it does not expand authorization. If neither `ManagePullRequest` nor
+  the equivalent connector tool is available, report that the reply was not
+  posted and leave the thread unresolved. Do not switch to another writer.
 - Account name or words such as "IMPLEMENT" alone do not prove approval origin.
   When provenance is ambiguous, ask through the owner's direct channel.
 

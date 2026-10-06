@@ -20,9 +20,11 @@ need to invoke a slash command.
 `.cursor/skills/pr-review-comments/SKILL.md`. Loading that skill is part of the
 same authorized operation, not a second review or a second authorization.
 Review scope and coverage rules stay in `.github/codex-review-guidance.md`.
-Preserve repository tool permissions: use `ManagePullRequest` for authorized
-GitHub writes, never use `gh` for writes, and never merge unless separately and
-explicitly authorized.
+Preserve repository tool permissions: prefer `ManagePullRequest` for authorized
+GitHub writes. If it is unavailable, use the equivalent GitHub connector tool
+for the same authorized action (for example, `reply_to_review_comment` or
+`resolve_review_thread`). Never use `gh` for writes, and never merge unless
+separately and explicitly authorized.
 
 ## Governing policy source
 
@@ -171,9 +173,10 @@ continuation into another event, or investigation of unrelated findings.
 Maintaining the existing PR-scoped subscription for the PR under work remains
 required policy and is not a new authorization.
 
-Continue using `ManagePullRequest` for the reply. Do not weaken tool or
-permission restrictions. If the authorized writer is unavailable, report that
-the reply could not be posted. Do not silently switch to an unauthorized writer.
+Prefer `ManagePullRequest` for the reply; when unavailable, use the equivalent
+GitHub connector `reply_to_review_comment` tool. This fallback changes only the
+writer, not the authorization scope. If neither writer is available, report
+that the reply could not be posted. Do not use `gh` or another unauthorized writer.
 
 ### Resolution after subscription triage
 

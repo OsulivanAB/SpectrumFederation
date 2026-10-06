@@ -368,6 +368,13 @@ function Sync:_FailRequest(req, reason)
         if self.state._profileReqInFlight == self.state.sessionId then
             self.state._profileReqInFlight = nil
         end
+        -- A failed consumables catch-up must not keep the descriptor dedupe key,
+        -- or later identical heartbeats never request again.
+        if self._ClearConsumablesCatchUpDedupe then
+            self:_ClearConsumablesCatchUpDedupe()
+        else
+            self._consumablesCatchUpKey = nil
+        end
         -- Also allow SendJoinStatus to re-attempt bootstrap later
         if not self:FindLocalProfileById(self.state.profileId) then
             self.state._sentJoinStatusForSessionId = nil

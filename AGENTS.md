@@ -168,6 +168,7 @@ their focused suite without re-listing the whole repository map.
 - Raid Equipment policy, CheckRun, or Raid Check lifecycle: also run `python -m pytest tests/test_raid_equipment.py`
 - Raid Check item-link helpers: also run `python -m pytest tests/test_raid_check_item_links.py`
 - Loot Helper sync authorization: also run `python -m pytest tests/test_loot_helper_sync_authorization.py`
+- Raid Consumables runtime and synchronization: also run `python -m pytest tests/test_consumables.py`
 - Changelog update automation: also run `python -m pytest tests/test_update_changelog.py`
 - UI layout, timers, listeners, queues, inspection, or sync: prefer the existing Lua 5.1 suite for that area, with assertions that execution stays bounded and converges. See Client Stability in `SpectrumFederation/AGENTS.md`.
 - PR template or `validate_pr_template.py`: also run `python -m pytest tests/test_pr_template.py`

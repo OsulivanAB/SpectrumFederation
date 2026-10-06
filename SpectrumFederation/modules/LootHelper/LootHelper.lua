@@ -330,6 +330,13 @@ function SF:RehydrateLootHelperDB()
 			if profile._EnsureRewardPotConfig then
 				profile:_EnsureRewardPotConfig()
 			end
+			if id == db.activeProfileId and profile.EnsureConsumables then
+				profile:EnsureConsumables()
+			else
+				-- Inactive profiles are indexed the first time they are used.
+				profile._consumableEventIds = nil
+				profile._consumableIndexCount = nil
+			end
 		end
 	end
 
@@ -365,6 +372,9 @@ function SF:SetActiveProfileById(profileId)
             SF.Debug:Warn("DATABASE", "No loot profile found with ID '%s' to set as active", profileId)
         end
         SF.lootHelperDB.activeProfile = nil
+        if SF.ConsumablesRuntime and SF.ConsumablesRuntime.OnProfileChanged then
+            SF.ConsumablesRuntime:OnProfileChanged(nil)
+        end
         return false
     end
 
@@ -390,6 +400,10 @@ function SF:SetActiveProfileById(profileId)
             profile:GetProfileName() or "Unknown", profileId)
     end
 
+    if SF.ConsumablesRuntime and SF.ConsumablesRuntime.OnProfileChanged then
+        SF.ConsumablesRuntime:OnProfileChanged(profile)
+    end
+
     return true
 end
 
@@ -406,6 +420,10 @@ function SF:ClearActiveProfile()
     -- Clear both fields
     SF.lootHelperDB.activeProfileId = nil
     SF.lootHelperDB.activeProfile = nil
+
+    if SF.ConsumablesRuntime and SF.ConsumablesRuntime.OnProfileChanged then
+        SF.ConsumablesRuntime:OnProfileChanged(nil)
+    end
     
     if SF.Debug then
         SF.Debug:Info("DATABASE", "Cleared active profile")
@@ -488,15 +506,17 @@ function SF:GetLootHelperProfileOptions()
 	if not db or type(db.profiles) ~= "table" then return out end
 
 	for id, profile in pairs(db.profiles) do
-		local name = id
-		if type(profile) == "table" then
-			if profile.GetProfileName then
-				name = profile:GetProfileName()
-			elseif profile._profileName then
-				name = profile._profileName
+		if type(profile) ~= "table" or not profile._sfConsumablesDeleteAfter then
+			local name = id
+			if type(profile) == "table" then
+				if profile.GetProfileName then
+					name = profile:GetProfileName()
+				elseif profile._profileName then
+					name = profile._profileName
+				end
 			end
+			table.insert(out, { value = id, label = tostring(name) })
 		end
-		table.insert(out, { value = id, label = tostring(name) })
 	end
 
 	table.sort(out, function(a, b)
@@ -555,6 +575,54 @@ function SF:CreateLootHelperProfile(profileName)
 	return true
 end
 
+-- Copy the active profile's Raid Consumables configuration onto a new profile.
+-- Members, loot logs, points, and other profile history stay on the source.
+-- @param newName string Name for the new profile
+-- @return boolean success
+-- @return string|nil errMsg
+function SF:DuplicateLootHelperProfile(newName)
+	local source = self:GetActiveProfile()
+	if not source then
+		return false, "No active profile."
+	end
+
+	local Imp = SF.LootHelperImpersonation
+	local allowed = false
+	if Imp and Imp.IsEffectiveLocalAdmin then
+		allowed = Imp:IsEffectiveLocalAdmin(source) and true or false
+	elseif source.IsCurrentUserAdmin then
+		allowed = source:IsCurrentUserAdmin() and true or false
+	end
+	if not allowed then
+		return false, "Only a profile admin can copy Raid Consumables configuration."
+	end
+
+	local trimmed = tostring(newName or ""):match("^%s*(.-)%s*$")
+	local ok, err = self:CreateLootHelperProfile(trimmed)
+	if not ok then
+		return false, err
+	end
+
+	local created = nil
+	for _, prof in pairs(self.lootHelperDB.profiles or {}) do
+		local name = prof.GetProfileName and prof:GetProfileName()
+		if name == trimmed then
+			created = prof
+		end
+	end
+	if not created then
+		return false, "Failed to find the new profile."
+	end
+
+	if SF.Consumables and SF.Consumables.CopyConfiguration then
+		SF.Consumables.CopyConfiguration(source, created)
+	end
+	if created.GetProfileId then
+		self:SetActiveProfileById(created:GetProfileId())
+	end
+	return true
+end
+
 -- Delete a loot helper profile by ID
 -- @param profileId (string) - Profile ID to delete
 -- @return (boolean, string|nil) - Success status and optional error message
@@ -574,7 +642,23 @@ function SF:DeleteLootHelperProfile(profileId)
 		return false, "Profile not found."
 	end
 
-	local profileName = db.profiles[profileId]:GetProfileName()
+	local profile = db.profiles[profileId]
+	local runtime = SF.ConsumablesRuntime
+	if runtime and runtime.DeferProfileDelete and runtime:DeferProfileDelete(profile) then
+		if db.activeProfileId == profileId then
+			self:ClearActiveProfile()
+			local opts = self:GetLootHelperProfileOptions()
+			if #opts > 0 then
+				self:SetActiveProfileById(opts[1].value)
+			end
+		end
+		if SF.Debug then
+			SF.Debug:Info("DATABASE", "Deferred profile delete until raid supplies finish: %s", profileId)
+		end
+		return true
+	end
+
+	local profileName = profile:GetProfileName()
 	db.profiles[profileId] = nil
 
 	if SF.Debug then

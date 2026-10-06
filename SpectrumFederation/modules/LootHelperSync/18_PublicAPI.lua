@@ -137,6 +137,8 @@ function Sync:TryRestorePersistedSession(reason)
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
+    self.state._profileSnapshotServe = nil
+    self.state._profileSnapshotBodyCache = nil
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
@@ -665,6 +667,9 @@ function Sync:OnGroupRosterUpdate()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
+    end
 
     -- Find targets who are in-group but haven't been announced to for this sessionId
     local targets = {}
@@ -848,6 +853,9 @@ function Sync:StartSession(profileId, opts)
 
     self:UpdatePeersFromRoster()
     self:TouchPeer(me, { inGroup = true, isAdmin = true })
+    if self._ClearConsumablesCapability then
+        self:_ClearConsumablesCapability()
+    end
 
     if SF.Debug then
         SF.Debug:Info("SYNC_SESSION", "Session start (role=coordinator sessionId=%s profileId=%s coordinator=%s pointsSource=derived_logs)",
@@ -910,6 +918,10 @@ function Sync:_ResetSessionState(reason)
     self.state.adminStatuses = {}
     self.state.handshake = nil
 
+    if self._ClearConsumablesCapability then
+        self:_ClearConsumablesCapability()
+    end
+
     -- Clear session identity
     self.state.active = false
     self.state.sessionId = nil
@@ -947,6 +959,8 @@ function Sync:_ResetSessionState(reason)
     self.state._coordinatorCatchUp = nil
     self.state.revokedRoutes = nil
     self.state._adminGrantServe = nil
+    self.state._profileSnapshotServe = nil
+    self.state._profileSnapshotBodyCache = nil
     self.state._newLogUnauthorizedWarned = nil
     self.state._unprovenCatchUpWarned = nil
     self.state._sameProfileRevokeScan = nil
@@ -1220,6 +1234,13 @@ function Sync:ReannounceSession()
     if self._AttachRCConfigGeneration then
         self:_AttachRCConfigGeneration(payload, profileId)
     end
+    local announcedProfile = self.FindLocalProfileById and self:FindLocalProfileById(profileId) or nil
+    if announcedProfile and self.BroadcastConsumablesConfig then
+        self:BroadcastConsumablesConfig(announcedProfile)
+    end
+    if self._AttachConsumablesDescriptor then
+        self:_AttachConsumablesDescriptor(payload, profileId)
+    end
 
     if SF.Debug then
         local helpersCount = type(self.state.helpers) == "table" and #self.state.helpers or 0
@@ -1248,6 +1269,12 @@ function Sync:ReannounceSession()
     -- Mark that we've announced this session at least once (used by OnGroupRosterUpdate)
     self.state._sessionAnnounced = self.state.sessionId
     self:_MarkRosterAnnounced(self.state.sessionId)
+    if self._FlushUnsentConsumablesEvents and self.FindLocalProfileById then
+        local announcedProfile = self:FindLocalProfileById(profileId)
+        if announcedProfile then
+            self:_FlushUnsentConsumablesEvents(announcedProfile)
+        end
+    end
 
     -- Start/re-ensure coordinator heartbeat sender (ticker)
     self:EnsureHeartbeatSender("ReannounceSession")

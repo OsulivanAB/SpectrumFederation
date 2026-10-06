@@ -746,6 +746,9 @@ function Sync:PublishRCIntegrationConfig(profileId, opts)
             profile._rcConfigEpoch = tonumber(self.state.coordEpoch) or 0
             profile._pendingRCLootCouncilIntegration = nil
             profile._rcConfigDirty = nil
+            if profile._NoteSnapshotMutation then
+                profile:_NoteSnapshotMutation()
+            end
             epoch = tonumber(profile._rcConfigEpoch) or 0
         end
         local payload = {
