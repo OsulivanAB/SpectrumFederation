@@ -112,7 +112,14 @@ end
 function Runtime:WindowShown()
     local window = SF.LootHelperWindow
     local frame = window and window._frame
-    return frame and frame.IsShown and frame:IsShown() and true or false
+    if not (frame and frame.IsShown and frame:IsShown()) then
+        return false
+    end
+    -- Minimized keeps the outer frame shown while hiding Content; treat that as not shown.
+    if window.IsMinimized and window:IsMinimized() then
+        return false
+    end
+    return true
 end
 
 function Runtime:ItemName(itemId)
@@ -309,13 +316,88 @@ end
 function Runtime:MobileOnCooldown(spell)
     if not spell or not C_Spell or not C_Spell.GetSpellCooldown then return false end
     local first, second = C_Spell.GetSpellCooldown(spell)
-    local duration = nil
     if type(first) == "table" then
-        duration = first.duration
-    else
-        duration = second
+        -- Prefer NeverSecret isActive under SecretWhenCooldownsRestricted.
+        if first.isActive ~= nil then
+            return first.isActive and true or false
+        end
+        local duration = tonumber(first.duration)
+        return duration ~= nil and duration > 0
     end
-    return (tonumber(duration) or 0) > 0
+    local duration = tonumber(second)
+    return duration ~= nil and duration > 0
+end
+
+-- Remaining cooldown seconds when start/duration are safely readable.
+-- Returns nil when values are unavailable or secret-restricted.
+function Runtime:MobileCooldownRemaining(spell)
+    if not spell or not C_Spell or not C_Spell.GetSpellCooldown then return nil end
+    local first, second = C_Spell.GetSpellCooldown(spell)
+    local startTime, duration, modRate
+    if type(first) == "table" then
+        if first.isActive == false then return 0 end
+        startTime = tonumber(first.startTime)
+        duration = tonumber(first.duration)
+        modRate = tonumber(first.modRate) or 1
+    else
+        startTime = tonumber(first)
+        duration = tonumber(second)
+        modRate = 1
+    end
+    if not startTime or not duration or duration <= 0 then return nil end
+    if modRate <= 0 then modRate = 1 end
+    local now = (GetTime and GetTime()) or 0
+    local remaining = (startTime + duration - now) / modRate
+    if remaining < 0 then remaining = 0 end
+    return remaining
+end
+
+function Runtime:CancelMobileCooldownWatch()
+    if self.mobileCooldownTimer then
+        if self.mobileCooldownTimer.Cancel then
+            self.mobileCooldownTimer:Cancel()
+        end
+        self.mobileCooldownTimer = nil
+    end
+    self.mobileCooldownWatchGen = (self.mobileCooldownWatchGen or 0) + 1
+end
+
+function Runtime:ScheduleMobileCooldownWatch(spell)
+    self:CancelMobileCooldownWatch()
+    if not spell or not self:MobileOnCooldown(spell) then return end
+    local remaining = self:MobileCooldownRemaining(spell)
+    if remaining == nil or remaining <= 0 then return end
+    -- Mobile Banking is a 1-hour cooldown; bound runaway values.
+    if remaining > 3700 then remaining = 3700 end
+    if not (C_Timer and C_Timer.NewTimer) then return end
+    local gen = self.mobileCooldownWatchGen or 0
+    self.mobileCooldownTimer = C_Timer.NewTimer(remaining + 0.05, function()
+        if (self.mobileCooldownWatchGen or 0) ~= gen then return end
+        self.mobileCooldownTimer = nil
+        if InCombat() then
+            self.reviewRefreshPending = true
+            return
+        end
+        self:RefreshReminder()
+    end)
+end
+
+function Runtime:UpdateMobileCooldownWatch(collected)
+    local access = collected and collected.access
+    local spell = self:MobileSpell()
+    local need = spell
+        and access
+        and access.reason == "cooldown"
+        and self:RemindersEnabled()
+        and self:WindowShown()
+        and not self.dismissed
+        and collected.profile
+        and self:CarriedRequestedCount(collected.profile) > 0
+    if not need then
+        self:CancelMobileCooldownWatch()
+        return
+    end
+    self:ScheduleMobileCooldownWatch(spell)
 end
 
 function Runtime:BankIsOpen()
@@ -687,6 +769,7 @@ function Runtime:RefreshReminder()
         end, mobileState)
     end
     self:SyncBannerMobileButton(mobileState)
+    self:UpdateMobileCooldownWatch(collected)
 end
 
 function Runtime:WatchWindow()
@@ -699,7 +782,17 @@ function Runtime:WatchWindow()
     end)
     frame:HookScript("OnHide", function()
         self.reminderShown = false
+        self:CancelMobileCooldownWatch()
         self:SyncBannerMobileButton(nil)
+    end)
+    frame:HookScript("OnSizeChanged", function()
+        if InCombat() then
+            self.bannerMobilePending = true
+            return
+        end
+        if self.bannerMobileHolder and self.bannerMobileHolder.IsShown and self.bannerMobileHolder:IsShown() then
+            self:PlaceBannerMobileHolder()
+        end
     end)
     local title = frame.Title
     if title and title.HookScript then
@@ -757,13 +850,15 @@ end
 
 function Runtime:SyncBannerMobileButton(mobileState)
     local show = mobileState and mobileState.visible and mobileState.spell ~= nil
+    -- SecureActionButton show/hide/attributes are protected; defer the whole sync in combat.
+    if InCombat() then
+        self.bannerMobilePending = true
+        return
+    end
     if not show then
         if self.bannerMobileHolder then self.bannerMobileHolder:Hide() end
         if self.bannerMobileButton then self.bannerMobileButton:Hide() end
-        return
-    end
-    if InCombat() then
-        self.bannerMobilePending = true
+        self.bannerMobilePending = nil
         return
     end
     if not self:EnsureBannerMobileButton() then
@@ -1668,6 +1763,17 @@ function Runtime:OnEvent(event, arg1)
         if self.review and self.review:IsShown() then
             self:RebuildReview()
         end
+    elseif event == "SPELL_UPDATE_COOLDOWN" then
+        -- Does not fire when a cooldown ends; use it to (re)arm the one-shot expiry watch.
+        local spellId = tonumber(arg1)
+        if spellId ~= nil and spellId ~= MOBILE_BANKING_SPELL_ID then
+            return
+        end
+        if InCombat() then
+            self.reviewRefreshPending = true
+            return
+        end
+        self:RefreshReminder()
     elseif event == "ITEM_DATA_LOAD_RESULT" then
         local itemId = tonumber(arg1)
         if itemId then
@@ -1726,6 +1832,7 @@ function Runtime:Init()
     end)
     TryRegister(frame, "BAG_UPDATE_DELAYED")
     TryRegister(frame, "GROUP_ROSTER_UPDATE")
+    TryRegister(frame, "SPELL_UPDATE_COOLDOWN")
     TryRegister(frame, "ITEM_DATA_LOAD_RESULT")
     TryRegister(frame, "GUILDBANKFRAME_OPENED")
     TryRegister(frame, "GUILDBANKFRAME_CLOSED")

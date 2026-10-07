@@ -65,6 +65,9 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "PickupGuildBankItem(work.tab" in runtime
     assert "C_SpellBook.IsSpellKnown" in runtime
     assert "SecureActionButtonTemplate" in runtime
+    assert 'TryRegister(frame, "SPELL_UPDATE_COOLDOWN")' in runtime
+    assert "isActive" in runtime
+    assert "ScheduleMobileCooldownWatch" in runtime
     # Prefer known-spell detection for guild perks; IsSpellInSpellBook is only a fallback.
     known_at = runtime.find("C_SpellBook.IsSpellKnown")
     in_book_at = runtime.find("C_SpellBook.IsSpellInSpellBook")

@@ -171,7 +171,24 @@ C_SpellBook = {
 function IsPlayerSpell() return world.mobileKnown end
 C_Spell = {
     GetSpellInfo = function() return { name = "Mobile Banking" } end,
-    GetSpellCooldown = function() return { duration = world.mobileCooldown and 30 or 0 } end,
+    GetSpellCooldown = function()
+        if world.mobileCooldown then
+            return {
+                startTime = world.mobileCooldownStart or GetTime(),
+                duration = world.mobileCooldownDuration or 30,
+                isEnabled = true,
+                isActive = true,
+                modRate = 1,
+            }
+        end
+        return {
+            startTime = 0,
+            duration = 0,
+            isEnabled = true,
+            isActive = false,
+            modRate = 1,
+        }
+    end,
 }
 C_Item = {
     GetItemInfo = function(itemId)
@@ -242,14 +259,20 @@ local function FrameMock(kind, parent)
 end
 local function noop() end
 for _, name in ipairs({
-    "SetSize", "SetPoint", "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
+    "SetSize", "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
     "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH", "SetWidth",
     "SetHeight", "SetAutoFocus", "SetNumeric", "ClearFocus", "SetScrollChild", "RegisterEvent",
 }) do
     FrameMethods[name] = noop
 end
-function FrameMethods:GetLeft() return 100 end
-function FrameMethods:GetBottom() return 200 end
+function FrameMethods:GetLeft() return self.pointLeft or 100 end
+function FrameMethods:GetBottom() return self.pointBottom or 200 end
+function FrameMethods:SetPoint(point, relative, relativePoint, x, y)
+    if point == "BOTTOMLEFT" and relativePoint == "BOTTOMLEFT" then
+        self.pointLeft = x
+        self.pointBottom = y
+    end
+end
 function FrameMethods:SetScript(name, fn) self.scripts[name] = fn end
 function FrameMethods:HookScript(name, fn)
     self.hooks[name] = self.hooks[name] or {}
@@ -299,6 +322,9 @@ function SF.SettingsStore:Get(key) return self.values[key] end
 
 local reminderCalls = {}
 SF.LootHelperWindow = { _frame = FrameMock("Frame") }
+function SF.LootHelperWindow:IsMinimized()
+    return self._frame and self._frame.__sfMinimized and true or false
+end
 function SF.LootHelperWindow:SetSupplyReminder(visible, onOpen, onDismiss, mobile)
     reminderCalls[#reminderCalls + 1] = {
         visible = visible,
@@ -415,6 +441,8 @@ local function resetRuntime()
     RT.review = nil
     RT.mobileHolder = nil
     RT.mobileButtonPending = nil
+    if RT.CancelMobileCooldownWatch then RT:CancelMobileCooldownWatch() end
+    RT.mobileCooldownTimer = nil
     RT.bannerMobileHolder = nil
     RT.bannerMobileButton = nil
     RT.bannerMobilePending = nil
@@ -1550,9 +1578,26 @@ local function checkRuntimeReminder()
     assertTrue(lastReminder(), "re-enabling the setting restores the reminder")
 
     world.mobileCooldown = true
+    world.mobileCooldownStart = GetTime()
+    world.mobileCooldownDuration = 30
     RT:RefreshReminder()
     assertFalse(lastReminder(), "Mobile Banking on cooldown hides the reminder when the bank is closed")
+    assertEq(#liveTimers(), 1, "cooldown arms one bounded expiry refresh")
     world.mobileCooldown = false
+    assertEq(fireTimers(), 1, "the expiry timer fires once")
+    assertTrue(lastReminder(), "the expiry refresh shows the reminder when Mobile Banking becomes ready")
+    assertEq(#liveTimers(), 0, "the expiry timer does not reschedule when Mobile Banking is ready")
+
+    world.mobileCooldown = true
+    world.mobileCooldownStart = GetTime()
+    RT:RefreshReminder()
+    assertFalse(lastReminder(), "cooldown again hides the reminder")
+    assertEq(#liveTimers(), 1, "SPELL_UPDATE_COOLDOWN path can re-arm an expiry watch")
+    RT:OnEvent("SPELL_UPDATE_COOLDOWN", 83958)
+    assertEq(#liveTimers(), 1, "SPELL_UPDATE_COOLDOWN replaces rather than stacks expiry watches")
+    world.mobileCooldown = false
+    fireTimers()
+    assertTrue(lastReminder(), "SPELL_UPDATE_COOLDOWN-armed expiry still restores the reminder")
 
     world.mobileKnown = false
     RT:RefreshReminder()
@@ -1580,6 +1625,37 @@ local function checkRuntimeReminder()
 
     RT:RefreshReminder()
     assertTrue(lastReminder(), "the reminder is visible before dismissal")
+    assertTrue(RT.bannerMobileButton:IsShown(), "the banner Mobile Banking button is shown before dismissal")
+
+    window.__sfMinimized = true
+    RT:RefreshReminder()
+    assertFalse(lastReminder(), "a minimized Loot Helper window hides the reminder")
+    assertFalse(RT.bannerMobileButton:IsShown(), "minimizing hides the detached Mobile Banking button")
+    window.__sfMinimized = false
+    RT:RefreshReminder()
+    assertTrue(lastReminder(), "restoring the window shows the reminder again")
+    assertTrue(RT.bannerMobileButton:IsShown(), "restoring shows the detached Mobile Banking button again")
+
+    local leftBefore = RT.bannerMobileHolder.pointLeft
+    window.hooks.OnSizeChanged[1]()
+    assertEq(RT.bannerMobileHolder.pointLeft, leftBefore or 100,
+        "resize repositions the detached holder from the MobileAnchor")
+
+    world.inCombat = true
+    window.hooks.OnHide[1]()
+    assertTrue(RT.bannerMobilePending, "hiding in combat defers secure banner button sync")
+    assertTrue(RT.bannerMobileButton:IsShown(), "combat does not hide the secure banner button immediately")
+    world.inCombat = false
+    window:Show()
+    RT:OnEvent("PLAYER_REGEN_ENABLED")
+    assertFalse(RT.bannerMobilePending, "leaving combat clears the deferred banner sync")
+    -- Window was shown again above; hide out of combat to verify immediate hide.
+    window.hooks.OnHide[1]()
+    assertFalse(RT.bannerMobileButton:IsShown(), "out of combat, hiding the window hides the banner button")
+    window:Show()
+    RT:RefreshReminder()
+
+    assertTrue(lastReminder(), "the reminder is visible before dismissal")
     reminderCalls[#reminderCalls].onDismiss()
     assertTrue(RT.dismissed, "dismissing marks the reminder dismissed for the session")
     assertFalse(lastReminder(), "dismissing hides the reminder immediately")
@@ -1589,6 +1665,7 @@ local function checkRuntimeReminder()
     assertEq(SF.SettingsStore.values["lootHelper.showRaidSupplyReminders"], true, "dismissal does not change the saved setting")
 
     RT.dismissed = false
+    world.timers = {}
     local frames = frameCount
     local calls = #reminderCalls
     for _ = 1, 100 do RT:RefreshReminder() end
@@ -1597,7 +1674,7 @@ local function checkRuntimeReminder()
     assertEq(#(window.hooks.OnHide or {}), 1, "repeated refreshes do not add hide hooks")
     assertEq(frameCount, frames, "repeated refreshes allocate no frames")
     assertEq(#world.after, 0, "repeated refreshes schedule no deferred work")
-    assertEq(#world.timers, 0, "repeated refreshes create no timers")
+    assertEq(#liveTimers(), 0, "repeated refreshes create no live timers")
 
     window.hooks.OnHide[1]()
     assertFalse(RT.reminderShown, "hiding the window clears the reminder state")
@@ -1616,6 +1693,13 @@ local function checkRuntimeMobileSpellDetection()
     assertTrue(RT:Collect().usable, "the closed bank is usable through IsSpellKnown Mobile Banking")
     RT:RefreshReminder()
     assertTrue(lastReminder(), "the reminder appears through the modern C_SpellBook.IsSpellKnown path")
+
+    -- Prefer NeverSecret isActive for cooldown decisions.
+    world.mobileCooldown = true
+    assertTrue(RT:MobileOnCooldown("Mobile Banking"), "isActive true means Mobile Banking is on cooldown")
+    assertEq(RT:MobileCooldownRemaining("Mobile Banking"), 30, "readable remaining cooldown is available for expiry scheduling")
+    world.mobileCooldown = false
+    assertFalse(RT:MobileOnCooldown("Mobile Banking"), "isActive false means Mobile Banking is ready")
 
     -- Legacy fallback when C_SpellBook.IsSpellKnown is unavailable.
     local savedKnown = C_SpellBook.IsSpellKnown

@@ -372,6 +372,11 @@ function Window:SetMinimized(minimized)
     if LH.Controller and LH.Controller.OnMinimizedStateChanged then
         LH.Controller:OnMinimizedStateChanged(minimized)
     end
+    -- Consumables banner Mobile Banking uses a UIParent secure holder that must
+    -- hide/reposition with Content visibility, not only with the outer frame.
+    if SF.ConsumablesRuntime and SF.ConsumablesRuntime.RefreshReminder then
+        SF.ConsumablesRuntime:RefreshReminder()
+    end
 end
 
 function Window:ToggleMinimized()
