@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.7] - 2026-10-07
+
+### Changed
+- Simplify Raid Supplies banner to compact Mobile Banking flow (#354)
+
 ## [1.5.8-beta.6] - 2026-10-07
 
 ### Fixed
