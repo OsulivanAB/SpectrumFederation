@@ -72,6 +72,10 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     known_at = runtime.find("C_SpellBook.IsSpellKnown")
     in_book_at = runtime.find("C_SpellBook.IsSpellInSpellBook")
     assert known_at != -1 and in_book_at != -1 and known_at < in_book_at
+    # Reminder UI must target SF.LootHelperWindow.Window, not the parent namespace.
+    assert "function Runtime:LootHelperWindow" in runtime
+    assert "return lh and lh.Window or nil" in runtime
+    assert "local window = SF.LootHelperWindow\n" not in runtime
 
 
 def test_consumables_snapshot_merge_is_inside_import():

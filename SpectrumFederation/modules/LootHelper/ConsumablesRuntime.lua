@@ -109,8 +109,15 @@ function Runtime:RemindersEnabled()
     return true
 end
 
+-- Production Loot Helper UI owns the frame and reminder API on the Window child
+-- (`SF.LootHelperWindow.Window`), not on the parent namespace table.
+function Runtime:LootHelperWindow()
+    local lh = SF.LootHelperWindow
+    return lh and lh.Window or nil
+end
+
 function Runtime:WindowShown()
-    local window = SF.LootHelperWindow
+    local window = self:LootHelperWindow()
     local frame = window and window._frame
     if not (frame and frame.IsShown and frame:IsShown()) then
         return false
@@ -759,7 +766,7 @@ function Runtime:RefreshReminder()
             onCooldown = self:MobileOnCooldown(spell) and true or false,
         }
     end
-    local window = SF.LootHelperWindow
+    local window = self:LootHelperWindow()
     if window and window.SetSupplyReminder then
         window:SetSupplyReminder(visible, function()
             self:ShowReview()
@@ -773,7 +780,7 @@ function Runtime:RefreshReminder()
 end
 
 function Runtime:WatchWindow()
-    local window = SF.LootHelperWindow
+    local window = self:LootHelperWindow()
     local frame = window and window._frame
     if not frame or frame.__sfConsumablesHook then return end
     frame.__sfConsumablesHook = true
@@ -807,7 +814,7 @@ function Runtime:WatchWindow()
 end
 
 function Runtime:BannerMobileAnchor()
-    local window = SF.LootHelperWindow
+    local window = self:LootHelperWindow()
     local reminder = window and window._frame and window._frame.Content and window._frame.Content.SupplyReminder
     return reminder and reminder.MobileAnchor or nil
 end

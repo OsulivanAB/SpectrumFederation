@@ -859,6 +859,12 @@ function Window:Create()
         LH.Style:Apply(frame)
     end
 
+    -- ConsumablesRuntime may have initialized before this frame existed. Attach
+    -- reminder hooks now so a later Show reevaluates without polling.
+    if SF.ConsumablesRuntime and SF.ConsumablesRuntime.RefreshReminder then
+        SF.ConsumablesRuntime:RefreshReminder()
+    end
+
     return frame
 end
 
