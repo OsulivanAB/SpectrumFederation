@@ -159,6 +159,15 @@ function GetCurrentGuildBankTab() return world.currentTab end
 GuildBankFrame = { IsShown = function() return world.bankOpen end }
 C_Club = { GetGuildClubId = function() return world.clubId end }
 function GetGuildInfo() return world.guildName, nil, nil, world.guildRealm end
+-- Retail exposes C_SpellBook. Legacy IsPlayerSpell remains as a fallback only.
+Enum = { SpellBookSpellBank = { Player = 0, Pet = 1 } }
+C_SpellBook = {
+    -- Guild perks like Mobile Banking are known but not always listed in the
+    -- spellbook UI. Returning false here proves production does not treat
+    -- IsSpellInSpellBook as the authority for Mobile Banking.
+    IsSpellInSpellBook = function() return false end,
+    IsSpellKnown = function() return world.mobileKnown end,
+}
 function IsPlayerSpell() return world.mobileKnown end
 C_Spell = {
     GetSpellInfo = function() return { name = "Mobile Banking" } end,
@@ -235,7 +244,7 @@ local function noop() end
 for _, name in ipairs({
     "SetSize", "SetPoint", "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
     "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH", "SetWidth",
-    "SetHeight", "SetAutoFocus", "SetNumeric", "ClearFocus", "SetScrollChild", "SetAttribute", "RegisterEvent",
+    "SetHeight", "SetAutoFocus", "SetNumeric", "ClearFocus", "SetScrollChild", "RegisterEvent",
 }) do
     FrameMethods[name] = noop
 end
@@ -245,6 +254,10 @@ function FrameMethods:SetScript(name, fn) self.scripts[name] = fn end
 function FrameMethods:HookScript(name, fn)
     self.hooks[name] = self.hooks[name] or {}
     table.insert(self.hooks[name], fn)
+end
+function FrameMethods:SetAttribute(key, value)
+    self.attributes = self.attributes or {}
+    self.attributes[key] = value
 end
 function FrameMethods:SetText(text) self.text = text end
 function FrameMethods:GetText() return self.text end
@@ -256,7 +269,12 @@ function FrameMethods:Enable() self.enabled = true end
 function FrameMethods:Disable() self.enabled = false end
 function FrameMethods:IsEnabled() return self.enabled end
 function FrameMethods:CreateFontString() return FrameMock("FontString", self) end
-function CreateFrame(kind, _, parent) return FrameMock(kind, parent) end
+function CreateFrame(kind, name, parent, template)
+    local frame = FrameMock(kind, parent)
+    frame.name = name
+    frame.template = template
+    return frame
+end
 UIParent = FrameMock("Frame")
 
 -- ---------------------------------------------------------------------------
@@ -281,8 +299,17 @@ function SF.SettingsStore:Get(key) return self.values[key] end
 
 local reminderCalls = {}
 SF.LootHelperWindow = { _frame = FrameMock("Frame") }
-function SF.LootHelperWindow:SetSupplyReminder(visible, onOpen, onDismiss)
-    reminderCalls[#reminderCalls + 1] = { visible = visible, onOpen = onOpen, onDismiss = onDismiss }
+function SF.LootHelperWindow:SetSupplyReminder(visible, onOpen, onDismiss, mobile)
+    reminderCalls[#reminderCalls + 1] = {
+        visible = visible,
+        onOpen = onOpen,
+        onDismiss = onDismiss,
+        mobile = mobile,
+    }
+    local reminder = self._frame and self._frame.Content and self._frame.Content.SupplyReminder
+    if reminder and reminder.MobileAnchor then
+        reminder.MobileAnchor:SetShown(visible and mobile and mobile.visible and true or false)
+    end
 end
 
 local clock = 1000
@@ -388,6 +415,10 @@ local function resetRuntime()
     RT.review = nil
     RT.mobileHolder = nil
     RT.mobileButtonPending = nil
+    RT.bannerMobileHolder = nil
+    RT.bannerMobileButton = nil
+    RT.bannerMobilePending = nil
+    RT._reminderDebugFingerprint = nil
     RT.dismissed = false
     RT.qtyOverrides = {}
     RT.pendingItemLoads = {}
@@ -1389,7 +1420,12 @@ local function runtimeFixture(id)
     resetSync()
     reminderCalls = {}
     SF.SettingsStore.values = {}
-    SF.LootHelperWindow._frame = FrameMock("Frame")
+    local frame = FrameMock("Frame")
+    frame.Content = FrameMock("Frame", frame)
+    frame.Content.SupplyReminder = FrameMock("Frame", frame.Content)
+    frame.Content.SupplyReminder.MobileAnchor = FrameMock("Frame", frame.Content.SupplyReminder)
+    frame.Content.SupplyReminder.MobileAnchor.shown = false
+    SF.LootHelperWindow._frame = frame
     local p = configured(id)
     world.activeProfile = p
     SF.lootHelperDB.profiles = { [p._profileId] = p }
@@ -1407,6 +1443,11 @@ end
 local function lastReminder()
     local call = reminderCalls[#reminderCalls]
     return call and call.visible
+end
+
+local function lastReminderMobile()
+    local call = reminderCalls[#reminderCalls]
+    return call and call.mobile
 end
 
 local function checkRuntimeInventory()
@@ -1481,20 +1522,42 @@ local function checkRuntimeReminder()
     local p = runtimeFixture("rt-reminder")
     world.mobileKnown = true
     local window = SF.LootHelperWindow._frame
+    assertFalse(C_SpellBook.IsSpellInSpellBook(83958), "the Retail fixture keeps IsSpellInSpellBook false for guild perks")
+    assertTrue(C_SpellBook.IsSpellKnown(83958), "the Retail fixture exposes Mobile Banking through IsSpellKnown")
+    assertEq(RT:MobileSpell(), "Mobile Banking", "MobileSpell uses C_SpellBook.IsSpellKnown on Retail")
+
     RT:RefreshReminder()
-    assertTrue(lastReminder(), "the reminder shows by default when carrying requested items with a usable path")
+    assertTrue(lastReminder(), "outside raid with no session, closed bank, and known Mobile Banking shows the reminder")
+    local mobile = lastReminderMobile()
+    assertTrue(mobile ~= nil and mobile.visible, "the reminder exposes a Mobile Banking action")
+    assertEq(mobile.spell, "Mobile Banking", "the banner Mobile Banking action uses the spell name")
+    assertFalse(mobile.onCooldown, "the banner Mobile Banking action is off cooldown")
+    assertTrue(window.Content.SupplyReminder.MobileAnchor:IsShown(), "the banner reserves layout space for Mobile Banking")
+    assertTrue(RT.bannerMobileButton ~= nil, "the banner creates a secure Mobile Banking button")
+    assertTrue(contains(RT.bannerMobileButton.template or "", "SecureActionButtonTemplate"),
+        "the banner Mobile Banking button uses SecureActionButtonTemplate")
+    assertEq(RT.bannerMobileButton.attributes.type, "spell", "the banner button is a secure spell action")
+    assertEq(RT.bannerMobileButton.attributes.spell, "Mobile Banking", "the banner button casts Mobile Banking")
+    assertTrue(RT.bannerMobileButton.enabled, "the banner Mobile Banking button is enabled when ready")
     assertEq(#(window.hooks.OnShow or {}), 1, "the reminder hooks the window OnShow once")
 
     SF.SettingsStore.values["lootHelper.showRaidSupplyReminders"] = false
     RT:RefreshReminder()
     assertFalse(lastReminder(), "the personal setting disables the reminder")
+    assertFalse(window.Content.SupplyReminder.MobileAnchor:IsShown(), "disabling reminders hides the Mobile Banking layout reserve")
     SF.SettingsStore.values["lootHelper.showRaidSupplyReminders"] = true
     RT:RefreshReminder()
     assertTrue(lastReminder(), "re-enabling the setting restores the reminder")
 
+    world.mobileCooldown = true
+    RT:RefreshReminder()
+    assertFalse(lastReminder(), "Mobile Banking on cooldown hides the reminder when the bank is closed")
+    world.mobileCooldown = false
+
     world.mobileKnown = false
     RT:RefreshReminder()
     assertFalse(lastReminder(), "without a usable guild bank path the reminder is hidden")
+    assertEq(lastReminderMobile(), nil, "without Mobile Banking the banner omits the Mobile Banking action")
     world.mobileKnown = true
 
     world.bags[0][1].count = 0
@@ -1508,6 +1571,12 @@ local function checkRuntimeReminder()
     RT:RefreshReminder()
     assertFalse(lastReminder(), "a hidden Loot Helper window hides the reminder")
     window:Show()
+
+    world.bankOpen = true
+    RT:RefreshReminder()
+    assertTrue(lastReminder(), "an open configured guild bank still shows the reminder")
+    assertEq(lastReminderMobile(), nil, "an open deposit path does not show the banner Mobile Banking action")
+    world.bankOpen = false
 
     RT:RefreshReminder()
     assertTrue(lastReminder(), "the reminder is visible before dismissal")
@@ -1532,6 +1601,32 @@ local function checkRuntimeReminder()
 
     window.hooks.OnHide[1]()
     assertFalse(RT.reminderShown, "hiding the window clears the reminder state")
+    assertFalse(RT.bannerMobileButton:IsShown(), "hiding the window hides the banner Mobile Banking button")
+end
+
+local function checkRuntimeMobileSpellDetection()
+    local p = runtimeFixture("rt-mobile-api")
+    world.mobileKnown = true
+    world.bankOpen = false
+
+    -- Regression: IsSpellInSpellBook false must not hide a known guild perk.
+    assertFalse(C_SpellBook.IsSpellInSpellBook(83958, Enum.SpellBookSpellBank.Player),
+        "IsSpellInSpellBook stays false for the Mobile Banking guild perk")
+    assertTrue(RT:MobileSpellKnown(), "IsSpellKnown reports Mobile Banking as known")
+    assertTrue(RT:Collect().usable, "the closed bank is usable through IsSpellKnown Mobile Banking")
+    RT:RefreshReminder()
+    assertTrue(lastReminder(), "the reminder appears through the modern C_SpellBook.IsSpellKnown path")
+
+    -- Legacy fallback when C_SpellBook.IsSpellKnown is unavailable.
+    local savedKnown = C_SpellBook.IsSpellKnown
+    C_SpellBook.IsSpellKnown = nil
+    assertTrue(RT:MobileSpellKnown(), "IsPlayerSpell remains a fallback when IsSpellKnown is absent")
+    C_SpellBook.IsSpellKnown = savedKnown
+
+    world.mobileKnown = false
+    assertFalse(RT:MobileSpellKnown(), "IsSpellKnown false means Mobile Banking is unavailable")
+    assertEq(RT:MobileSpell(), nil, "an unknown Mobile Banking spell resolves to nil")
+    unchanged(p, "runtime mobile spell detection")
 end
 
 local function checkRuntimeReview()
@@ -2082,6 +2177,7 @@ checkSessionTransport()
 checkQueuedResendProtection()
 checkRuntimeInventory()
 checkRuntimeReminder()
+checkRuntimeMobileSpellDetection()
 checkRuntimeReview()
 checkRuntimeDeposit()
 checkStaleDepositReview()

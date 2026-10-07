@@ -745,6 +745,7 @@ function Window:Create()
     dismissButton:SetScript("OnClick", function()
         if reminder.OnDismiss then reminder.OnDismiss() end
     end)
+    reminder.DismissButton = dismissButton
 
     local reviewButton = CreateFrame("Button", nil, reminder, "UIPanelButtonTemplate")
     reviewButton:SetSize(70, 18)
@@ -753,6 +754,15 @@ function Window:Create()
     reviewButton:SetScript("OnClick", function()
         if reminder.OnReview then reminder.OnReview() end
     end)
+    reminder.ReviewButton = reviewButton
+
+    -- Layout reserve for the secure Mobile Banking overlay owned by ConsumablesRuntime.
+    local mobileAnchor = CreateFrame("Frame", nil, reminder)
+    mobileAnchor:SetSize(110, 18)
+    mobileAnchor:SetPoint("RIGHT", reviewButton, "LEFT", -4, 0)
+    mobileAnchor:Hide()
+    reminder.MobileAnchor = mobileAnchor
+
     reminderText:SetPoint("RIGHT", reviewButton, "LEFT", -6, 0)
 
     local potHeader = CreateFrame("Frame", nil, content)
@@ -889,7 +899,7 @@ function Window:SetPointName(name)
     end
 end
 
-function Window:SetSupplyReminder(isVisible, onReview, onDismiss)
+function Window:SetSupplyReminder(isVisible, onReview, onDismiss, mobileState)
     local f = self._frame
     if not f or not f.Content or not f.Content.SupplyReminder then return end
     local reminder = f.Content.SupplyReminder
@@ -898,6 +908,20 @@ function Window:SetSupplyReminder(isVisible, onReview, onDismiss)
     reminder.OnDismiss = onDismiss
     reminder:SetShown(isVisible)
     reminder:SetHeight(isVisible and (C.POT_HEADER_HEIGHT or 22) or 0)
+
+    local showMobile = isVisible and mobileState and mobileState.visible and true or false
+    local mobileAnchor = reminder.MobileAnchor
+    if mobileAnchor then
+        mobileAnchor:SetShown(showMobile)
+    end
+    if reminder.Text then
+        if showMobile and mobileAnchor then
+            reminder.Text:SetPoint("RIGHT", mobileAnchor, "LEFT", -6, 0)
+        elseif reminder.ReviewButton then
+            reminder.Text:SetPoint("RIGHT", reminder.ReviewButton, "LEFT", -6, 0)
+        end
+    end
+
     self:RequestScrollInsetsUpdate()
 end
 
