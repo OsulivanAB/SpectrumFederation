@@ -714,6 +714,243 @@ capturedAccept()
 assertTrue(Sync._playStartCalled, "play-button Start works again after impersonation ends")
 
 -- ---------------------------------------------------------------------------
+-- Chat noise classifications (#331): session start/end success + Raid Check summaries
+-- ---------------------------------------------------------------------------
+printed = {}
+function Sync:IsSessionActive()
+    return false
+end
+function Sync:StartSession()
+    return "SES-CHAT-NOISE"
+end
+function Sync:EndSession()
+    return true
+end
+capturedAccept = nil
+Controller:OnPlayClicked()
+capturedAccept()
+local startSuccessPrinted = false
+for i = 1, #printed do
+    if printed[i][2]:find("Session started successfully", 1, true) then
+        startSuccessPrinted = true
+    end
+end
+assertFalse(startSuccessPrinted, "session start success is debug-only (no chat PrintSuccess)")
+
+function Sync:IsSessionActive()
+    return true
+end
+printed = {}
+capturedAccept = nil
+Controller:OnPlayClicked()
+capturedAccept()
+local endSuccessPrinted = false
+for i = 1, #printed do
+    if printed[i][2]:find("Session ended successfully", 1, true) then
+        endSuccessPrinted = true
+    end
+end
+assertFalse(endSuccessPrinted, "session end success chat PrintSuccess is removed")
+
+printed = {}
+SF.SlashCommands.loot.handler("session start")
+startSuccessPrinted = false
+for i = 1, #printed do
+    if printed[i][2]:find("Session started successfully", 1, true) then
+        startSuccessPrinted = true
+    end
+end
+assertFalse(startSuccessPrinted, "slash session start success is debug-only")
+
+printed = {}
+SF.SlashCommands.loot.handler("session end")
+endSuccessPrinted = false
+for i = 1, #printed do
+    if printed[i][2]:find("Session ended successfully", 1, true) then
+        endSuccessPrinted = true
+    end
+end
+assertFalse(endSuccessPrinted, "slash session end success chat is removed")
+
+local systemMessages = {}
+local debugInfos = {}
+function SF:SystemMessage(message)
+    systemMessages[#systemMessages + 1] = tostring(message)
+end
+SF.Debug = SF.Debug or {}
+function SF.Debug:Info(category, fmt, ...)
+    debugInfos[#debugInfos + 1] = {
+        category = tostring(category),
+        message = string.format(tostring(fmt or ""), ...),
+    }
+end
+function SF.Debug:Warn() end
+function SF.Debug:Error() end
+function SF.Debug:Verbose() end
+
+local missingId = "Missing-Garona"
+local failedId = "Failed-Garona"
+local recentId = "Recent-Garona"
+local membersById = {
+    [missingId] = {
+        GetFullIdentifier = function() return missingId end,
+        GetMostRecentWhisperTimestamp = function() return nil end,
+        MarkWhisperSent = function() end,
+        DecrementPoints = function() return true end,
+        DecrementAttendance = function() return true end,
+    },
+    [failedId] = {
+        GetFullIdentifier = function() return failedId end,
+    },
+    [recentId] = {
+        GetFullIdentifier = function() return recentId end,
+    },
+}
+function p1.GetRaidCheckConfig()
+    return {
+        enableWhispersRaid = false,
+        enableWhispersRaidPrepared = false,
+        pointsAwardPerRaidCheck = 0,
+        slots = {},
+    }
+end
+function p1.IsRewardPotMode()
+    return false
+end
+function p1.GetMemberByID(self, id)
+    return membersById[id]
+end
+function p1.getMemberByID(self, id)
+    return membersById[id]
+end
+
+printed = {}
+systemMessages = {}
+debugInfos = {}
+function IsInRaid()
+    return false
+end
+function IsInGroup()
+    return false
+end
+function GetNumGroupMembers()
+    return 0
+end
+if type(UnitExists) ~= "function" then
+    function UnitExists()
+        return false
+    end
+end
+if type(UnitGUID) ~= "function" then
+    function UnitGUID()
+        return nil
+    end
+end
+if type(UnitIsUnit) ~= "function" then
+    function UnitIsUnit()
+        return false
+    end
+end
+local summaryRun = {
+    profileId = p1:GetProfileId(),
+    consequencesApplied = false,
+    classified = true,
+    classifiedResults = {
+        [missingId] = {
+            class = CheckRun.CLASS.UNPREPARED,
+            missing = { "Flask" },
+        },
+        [failedId] = {
+            class = CheckRun.CLASS.INSPECTION_FAILED,
+        },
+        [recentId] = {
+            class = CheckRun.CLASS.PREPARED,
+            verified = CheckRun.VERIFIED.RECENT,
+        },
+    },
+    targetIds = { missingId, failedId, recentId },
+    players = {
+        [missingId] = { guid = "Player-missing" },
+        [failedId] = { guid = "Player-failed" },
+        [recentId] = { guid = "Player-recent" },
+    },
+    mode = "pre",
+    cfg = p1:GetRaidCheckConfig(),
+}
+SF.RaidCheck:_ApplyCheckConsequences(summaryRun)
+assertTrue(summaryRun.consequencesApplied, "admin summary run applies consequences")
+
+local function chatHas(needle)
+    for i = 1, #systemMessages do
+        if systemMessages[i]:find(needle, 1, true) then
+            return true
+        end
+    end
+    for i = 1, #printed do
+        if printed[i][2]:find(needle, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+local function debugHas(needle)
+    for i = 1, #debugInfos do
+        if debugInfos[i].message:find(needle, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+assertTrue(chatHas("Players missing requirements"), "missing-requirements summary stays in chat")
+assertTrue(chatHas("Missing"), "missing player line stays in chat")
+assertFalse(chatHas("Inspection Failed"), "inspection-failed summary is not chat")
+assertFalse(chatHas("Recently Verified"), "recently-verified summary is not chat")
+assertFalse(chatHas("Complete."), "raid-check Complete is not chat")
+assertTrue(debugHas("Inspection Failed"), "inspection-failed summary is debug-only")
+assertTrue(debugHas("Recently Verified"), "recently-verified summary is debug-only")
+assertTrue(debugHas("Complete."), "raid-check Complete is debug-only")
+
+-- Waiting-on-announce message is debug-only and does not reach chat.
+printed = {}
+systemMessages = {}
+debugInfos = {}
+function Sync:IsSessionActive()
+	return true
+end
+function Sync:GetSessionId()
+	return "SES-WAIT"
+end
+function Sync:GetSessionProfileId()
+	return p1:GetProfileId()
+end
+function Sync:HasAnnouncedCurrentSession()
+	return false
+end
+local state = SF.RaidCheck:_GetInspectState()
+state.adhocRun = {
+	mode = "raid",
+	classified = false,
+	consequencesApplied = false,
+	startedSessionForCheck = true,
+	expectedSessionId = "SES-WAIT",
+	profileId = p1:GetProfileId(),
+	targetIds = {},
+	players = {},
+	cfg = p1:GetRaidCheckConfig(),
+}
+SF.RaidCheck:_SettleAdhocRun("test_hold")
+assertTrue(state.adhocRun ~= nil, "held run remains until session announce")
+assertTrue(state.adhocRun.classified, "held run is classified while waiting")
+assertFalse(state.adhocRun.consequencesApplied, "held run has not applied consequences")
+assertFalse(chatHas("Waiting for session announcement"), "session-announce wait is not chat")
+assertTrue(debugHas("Waiting for session announcement"), "session-announce wait is debug-only")
+state.adhocRun = nil
+function Sync:IsSessionActive()
+	return false
+end
+
+-- ---------------------------------------------------------------------------
 -- Reset Current Profile: grey for non-admin / impersonation, stale confirm denied
 -- ---------------------------------------------------------------------------
 local registeredPages = {}
