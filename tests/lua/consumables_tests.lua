@@ -321,11 +321,14 @@ SF.SettingsStore = { values = {} }
 function SF.SettingsStore:Get(key) return self.values[key] end
 
 local reminderCalls = {}
-SF.LootHelperWindow = { _frame = FrameMock("Frame") }
-function SF.LootHelperWindow:IsMinimized()
+-- Match production: SF.LootHelperWindow.Window owns the frame and reminder API.
+SF.LootHelperWindow = { Window = {} }
+local LHWindow = SF.LootHelperWindow.Window
+LHWindow._frame = FrameMock("Frame")
+function LHWindow:IsMinimized()
     return self._frame and self._frame.__sfMinimized and true or false
 end
-function SF.LootHelperWindow:SetSupplyReminder(visible, onOpen, onDismiss, mobile)
+function LHWindow:SetSupplyReminder(visible, onOpen, onDismiss, mobile)
     reminderCalls[#reminderCalls + 1] = {
         visible = visible,
         onOpen = onOpen,
@@ -1442,18 +1445,23 @@ end
 -- Runtime: inventory, reminders, review, and guild bank deposits
 -- ---------------------------------------------------------------------------
 
+local function makeLootHelperFrame()
+    local frame = FrameMock("Frame")
+    frame.Content = FrameMock("Frame", frame)
+    frame.Content.SupplyReminder = FrameMock("Frame", frame.Content)
+    frame.Content.SupplyReminder.MobileAnchor = FrameMock("Frame", frame.Content.SupplyReminder)
+    frame.Content.SupplyReminder.MobileAnchor.shown = false
+    return frame
+end
+
 local function runtimeFixture(id)
     resetWorld()
     resetRuntime()
     resetSync()
     reminderCalls = {}
     SF.SettingsStore.values = {}
-    local frame = FrameMock("Frame")
-    frame.Content = FrameMock("Frame", frame)
-    frame.Content.SupplyReminder = FrameMock("Frame", frame.Content)
-    frame.Content.SupplyReminder.MobileAnchor = FrameMock("Frame", frame.Content.SupplyReminder)
-    frame.Content.SupplyReminder.MobileAnchor.shown = false
-    SF.LootHelperWindow._frame = frame
+    local frame = makeLootHelperFrame()
+    SF.LootHelperWindow.Window._frame = frame
     local p = configured(id)
     world.activeProfile = p
     SF.lootHelperDB.profiles = { [p._profileId] = p }
@@ -1549,7 +1557,9 @@ end
 local function checkRuntimeReminder()
     local p = runtimeFixture("rt-reminder")
     world.mobileKnown = true
-    local window = SF.LootHelperWindow._frame
+    local window = SF.LootHelperWindow.Window._frame
+    assertEq(RT:LootHelperWindow(), SF.LootHelperWindow.Window,
+        "runtime resolves the production Loot Helper Window child object")
     assertFalse(C_SpellBook.IsSpellInSpellBook(83958), "the Retail fixture keeps IsSpellInSpellBook false for guild perks")
     assertTrue(C_SpellBook.IsSpellKnown(83958), "the Retail fixture exposes Mobile Banking through IsSpellKnown")
     assertEq(RT:MobileSpell(), "Mobile Banking", "MobileSpell uses C_SpellBook.IsSpellKnown on Retail")
@@ -1679,6 +1689,67 @@ local function checkRuntimeReminder()
     window.hooks.OnHide[1]()
     assertFalse(RT.reminderShown, "hiding the window clears the reminder state")
     assertFalse(RT.bannerMobileButton:IsShown(), "hiding the window hides the banner Mobile Banking button")
+end
+
+-- Regression (#350): ConsumablesRuntime may initialize before Loot Helper creates
+-- its frame. Attachment must succeed after the production Window._frame exists.
+local function checkRuntimeReminderLifecycleAttach()
+    resetWorld()
+    resetRuntime()
+    resetSync()
+    reminderCalls = {}
+    SF.SettingsStore.values = {}
+    local p = configured("rt-lifecycle-attach")
+    world.activeProfile = p
+    SF.lootHelperDB.profiles = { [p._profileId] = p }
+    world.mobileKnown = true
+    world.bags[0] = {
+        [1] = { itemId = aqirite, count = 15 },
+        [2] = { itemId = aqirite, count = 10 },
+    }
+
+    -- 1) ConsumablesRuntime starts before the Loot Helper frame exists.
+    SF.LootHelperWindow.Window._frame = nil
+    local earlyCalls = #reminderCalls
+    RT:WatchWindow()
+    RT:RefreshReminder()
+    assertEq(SF.LootHelperWindow.Window._frame, nil, "the Loot Helper frame is still missing during early init")
+    assertEq(#reminderCalls, earlyCalls + 1, "early refresh still updates reminder state once")
+    assertFalse(lastReminder(), "without a Loot Helper frame the reminder stays hidden")
+    assertEq(SF.LootHelperWindow._frame, nil, "the parent namespace never owns the production frame")
+
+    -- 2) Window:Create establishes the frame and notifies ConsumablesRuntime.
+    local frame = makeLootHelperFrame()
+    frame.shown = false
+    SF.LootHelperWindow.Window._frame = frame
+    RT:RefreshReminder()
+    assertEq(#(frame.hooks.OnShow or {}), 1, "create-time refresh hooks OnShow once")
+    assertEq(#(frame.hooks.OnHide or {}), 1, "create-time refresh hooks OnHide once")
+    assertFalse(lastReminder(), "a created but still-hidden window keeps the reminder hidden")
+
+    -- 3) Window becomes eligible/visible; OnShow reevaluates reminder state.
+    frame:Show()
+    frame.hooks.OnShow[1]()
+    assertTrue(lastReminder(),
+        "after the production Window becomes visible, carried items + Mobile Banking show the reminder")
+    local mobile = lastReminderMobile()
+    assertTrue(mobile ~= nil and mobile.visible, "lifecycle attach exposes Mobile Banking on the banner")
+
+    -- Bag changes continue to drive the real Window object.
+    world.bags[0][1].count = 0
+    world.bags[0][2].count = 0
+    RT:RefreshReminder()
+    assertFalse(lastReminder(), "removing carried requested items hides the reminder after attach")
+    world.bags[0][1].count = 15
+    world.bags[0][2].count = 10
+    RT:RefreshReminder()
+    assertTrue(lastReminder(), "returning requested items shows the reminder on the attached Window")
+
+    local hooksBefore = #(frame.hooks.OnShow or {})
+    for _ = 1, 20 do RT:RefreshReminder() end
+    assertEq(#(frame.hooks.OnShow or {}), hooksBefore, "post-attach refreshes do not accumulate OnShow hooks")
+    assertEq(#(frame.hooks.OnHide or {}), 1, "post-attach refreshes do not accumulate OnHide hooks")
+    unchanged(p, "runtime reminder lifecycle attach")
 end
 
 local function checkRuntimeMobileSpellDetection()
@@ -2261,6 +2332,7 @@ checkSessionTransport()
 checkQueuedResendProtection()
 checkRuntimeInventory()
 checkRuntimeReminder()
+checkRuntimeReminderLifecycleAttach()
 checkRuntimeMobileSpellDetection()
 checkRuntimeReview()
 checkRuntimeDeposit()
