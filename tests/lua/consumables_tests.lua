@@ -2234,6 +2234,56 @@ local function placedTabs()
     return tabs
 end
 
+local function checkRuntimeReviewDepositTabSwitch()
+    local p = runtimeFixture("rt-review-deposit-tab")
+    world.bankOpen = true
+    world.currentTab = 2
+    RT:OnBankOpened()
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(),
+        "deposit tab-switch fixture starts with a visible Raid Supplies window")
+
+    -- Active depositWork: GUILDBANKBAGSLOTS_CHANGED must still lifecycle-sync.
+    startDeposit()
+    assertTrue(RT.depositWork ~= nil, "deposit work is active before the mid-deposit tab change")
+    world.currentTab = 1
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertFalse(review:IsShown(),
+        "leaving the configured tab during depositWork hides the Raid Supplies window")
+    assertFalse(RT.autoReviewedThisOpen,
+        "leaving the configured tab during depositWork clears the auto-review latch")
+
+    RT:CancelDepositWork()
+    RT.depositIntent = nil
+    world.after = {}
+    world.places = {}
+    world.currentTab = 2
+    world.bags[0][1] = { itemId = aqirite, count = 20 }
+    world.bags[0][2] = { itemId = aqirite, count = 5 }
+    world.bank[2] = { [1] = { itemId = aqirite, count = 18 } }
+    RT.autoReviewedThisOpen = false
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(review:IsShown(),
+        "returning to the configured tab after a mid-deposit leave can show the window again")
+
+    -- Confirmation intent: FinishDeposit bookkeeping must still be followed by sync.
+    startDeposit()
+    drainAfter(32)
+    assertTrue(RT.depositIntent ~= nil, "deposit settles into a confirmation intent")
+    assertEq(RT.depositWork, nil, "deposit work is cleared before confirmation")
+    assertTrue(review:IsShown(), "confirmation intent keeps the review visible on the configured tab")
+    world.currentTab = 1
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertFalse(review:IsShown(),
+        "leaving the configured tab while awaiting deposit confirmation hides the Raid Supplies window")
+    assertFalse(RT.autoReviewedThisOpen,
+        "leaving the configured tab during depositIntent clears the auto-review latch")
+
+    RT:OnBankClosed()
+    world.bankOpen = false
+    unchanged(p, "runtime review deposit tab switch")
+end
+
 local function checkRuntimeDeposit()
     local p = runtimeFixture("rt-deposit")
     world.bankOpen = true
@@ -2714,6 +2764,7 @@ checkRuntimeReminderLifecycleAttach()
 checkRuntimeMobileSpellDetection()
 checkRuntimeReview()
 checkRuntimeReviewGuildBankLifecycle()
+checkRuntimeReviewDepositTabSwitch()
 checkRuntimeDeposit()
 checkStaleDepositReview()
 checkOccupiedDepositCursor()

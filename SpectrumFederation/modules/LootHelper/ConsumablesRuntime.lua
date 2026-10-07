@@ -2056,13 +2056,19 @@ function Runtime:OnEvent(event, arg1)
             if verified > (tonumber(work.bestActual) or 0) then work.bestActual = verified end
         elseif self.depositIntent then
             self:FinishDeposit(false)
-        else
-            self:RefreshReminder()
-            if self.bankOpen then
-                self:SyncReviewWithGuildBank()
-            elseif self.review and self.review:IsShown() then
-                self:RebuildReview()
-            end
+        end
+        -- Always resync after deposit bookkeeping. Tab changes during an
+        -- in-flight deposit or confirmation intent still take this event, and
+        -- skipping lifecycle sync can leave the review visible on the wrong tab.
+        if InCombat() then
+            self.reviewRefreshPending = true
+            return
+        end
+        self:RefreshReminder()
+        if self.bankOpen then
+            self:SyncReviewWithGuildBank()
+        elseif self.review and self.review:IsShown() then
+            self:RebuildReview()
         end
     end
 end
