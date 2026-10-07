@@ -40,8 +40,11 @@ Use this skill when a task is close to done and you need a repo-specific merge-r
    check **I have tested these changes in-game**; check **In-game testing is not
    applicable** only when there are no packaged addon/runtime changes except
    allowlisted TOC metadata or proven non-shipped files; always check **WoW
-   Client Type → Retail**; never check linked issues unless the user provided
-   the link. Do not claim in-game testing was performed when it was not.
+   Client Type → Retail**. For issue-backed implementation PRs, confirm the
+   formal GitHub Issue ↔ PR Development link per root `AGENTS.md`
+   (**Issue-backed PR Development linking**) before checking the linked-issues
+   box; do not invent unrelated issue links. Do not claim in-game testing was
+   performed when it was not.
 7. For workflow changes, verify checks were not weakened and
    `copilot-setup-steps` still uses the required job name.
 8. For docs changes, compare commands and workflow names against the actual

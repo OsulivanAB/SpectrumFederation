@@ -4,7 +4,7 @@
 
 ## Related Ticket
 
-<!-- Optional. If this PR has a related ticket, provide both its Ticket ID and a link to the ticket (for example, [ABC-123](https://example.com/tickets/ABC-123)). Leave this section blank when there is no related ticket. -->
+<!-- Optional. External ticket trackers: provide Ticket ID and link (for example, [ABC-123](https://example.com/tickets/ABC-123)). For GitHub issues being implemented, you may also note the issue here, but the formal Issue ↔ PR relationship must still be created in the issue's Development section — see root AGENTS.md "Issue-backed PR Development linking". Leave blank when there is no related ticket. -->
 
 **Ticket ID:**
 
@@ -37,7 +37,7 @@
 - [ ] I have added/updated localization strings in `locale/enUS.lua` if applicable <!-- Check when strings were updated, or when no user-facing addon strings changed. -->
 - [ ] My changes generate no new warnings or errors
 - [ ] Any dependent changes have been merged and published
-- [ ] I've linked this PR to any related issues in the [repo project](https://github.com/users/OsulivanAB/projects/1). <!-- Agents: leave unchecked unless the user provided issue links. -->
+- [ ] I've linked this PR to any related issues in the [repo project](https://github.com/users/OsulivanAB/projects/1). <!-- Agents: check only after the formal GitHub Issue ↔ PR Development link exists for an owner-supplied/authoritative issue. See root AGENTS.md "Issue-backed PR Development linking". -->
 
 ## Testing
 

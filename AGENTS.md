@@ -141,8 +141,43 @@ Change Area** below rather than maintaining a second full inventory here.
 - Loot Helper or sync work: inspect `SpectrumFederation/modules/LootHelper/`, `SpectrumFederation/modules/LootHelperSync/`, and the related docs under `docs/development/loot-helper/`.
 - Workflow or CI script work: inspect the matching file under `.github/workflows/` or `.github/scripts/` first, then use `.github/instructions/` as supplemental guidance.
 - Docs work: start with `mkdocs.yml` for nav/build behavior, then edit files in `docs/`.
-- PR descriptions: follow `.cursor/rules/pr-template.mdc`. Never check **I have tested these changes in-game**. You may check **In-game testing is not applicable** only when there are no packaged addon/runtime changes, except allowlisted TOC metadata or files proven not to ship. Always check **WoW Client Type → Retail**. Leave linked issues to the human unless they provided the link.
+- PR descriptions: follow `.cursor/rules/pr-template.mdc`. Never check **I have tested these changes in-game**. You may check **In-game testing is not applicable** only when there are no packaged addon/runtime changes, except allowlisted TOC metadata or files proven not to ship. Always check **WoW Client Type → Retail**. For issue-backed implementation PRs, formally link the owner-supplied GitHub issue per **Issue-backed PR Development linking** below; do not invent unrelated issue links.
 - Pull request reviews: use **Pull request review instructions** below.
+
+## Issue-backed PR Development linking
+
+Canonical policy for formally linking an implementation PR to a GitHub issue
+in that issue's **Development** section. Other instruction files should
+reference this section rather than restating the full rule.
+
+When the owner explicitly asks to implement a GitHub issue (for example,
+"Implement issue #350"), or the task already names that issue as the
+authoritative work item, that authorizes linking the resulting PR to that
+issue only. Do not invent or auto-link unrelated issues discovered during
+implementation.
+
+While creating or maintaining that PR (still targeting `beta`):
+
+1. Prefer normal GitHub / MCP / `ManagePullRequest` tooling when it can create
+   the formal Issue ↔ PR Development relationship shown on the issue.
+2. If those tools cannot perform that specific mutation, but an owner-provided
+   `GH_TOKEN` is available to the Cloud Agent, a narrowly scoped `gh` or GitHub
+   API/GraphQL call is allowed **only** to create that Development relationship.
+   This exception does not authorize reviews, merges, subscriptions, unrelated
+   issue edits, or other GitHub writes. General `gh` write restrictions elsewhere
+   remain in force outside this fallback.
+3. Do not retarget the PR to `main` merely to obtain GitHub's automatic
+   closing-link behavior.
+4. PR-body text such as `Fixes #N`, Related Ticket fields, timeline mentions, or
+   issue comments are useful context but are **not** substitutes for the formal
+   Development relationship.
+5. When the formal link succeeds, check **I've linked this PR to any related
+   issues** on the PR template. If linking fails because the required tool,
+   token, or permission is unavailable, leave that box unchecked and report
+   clearly in the final handoff that the owner must link it manually. Do not
+   claim the issue is linked when the Development relationship was not created.
+
+PR template checkbox details: `.cursor/rules/pr-template.mdc`.
 
 ## Validation By Change Area
 
@@ -307,6 +342,7 @@ Humans retain final review, required in-game verification, repair-batch authoriz
 | Concern | Canonical owner |
 | --- | --- |
 | Repo orientation, validation map, validation modes, packaging policy summary | Root `AGENTS.md` |
+| Issue-backed implementation PR ↔ GitHub issue Development linking | Root `AGENTS.md` (**Issue-backed PR Development linking**) |
 | Addon runtime engineering (stability, caches, retries, messaging, behavioral tests) | `SpectrumFederation/AGENTS.md` (+ `.cursor/rules/addon-runtime.mdc` summary) |
 | Operation authorization, governing policy source, batching, escalation, delivery | `.cursor/skills/ai-review-loop/SKILL.md` |
 | Per-finding dedupe, investigation, classification, validity vs suitability, recommendation | `.cursor/skills/pr-review-comments/SKILL.md` |
