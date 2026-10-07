@@ -49,13 +49,21 @@ function R.GuildBankUsable(access)
     return access and access.enabled and (access.action == "deposit" or access.action == "mobile") and true or false
 end
 
+-- Reminder eligibility may include known Mobile Banking on cooldown. That path
+-- is intentionally not GuildBankUsable, so donation plans stay empty until a
+-- real deposit or ready-mobile path exists.
+function R.HasReminderPath(access)
+    if R.GuildBankUsable(access) then return true end
+    if access and access.action == "cooldown" then return true end
+    return false
+end
+
 function R.ReminderVisible(opts)
     opts = opts or {}
     if not opts.remindersEnabled then return false end
     if not opts.windowAllowed then return false end
-    if opts.dismissed then return false end
     if not opts.carriesRequested then return false end
-    if not opts.hasActionablePath then return false end
+    if not opts.hasReminderPath then return false end
     return true
 end
 

@@ -7,7 +7,11 @@ local Runtime = SF.ConsumablesRuntime
 
 local MAX_DEPOSIT_PLACES = 6
 local MAX_GUILD_BANK_SLOTS = 98
-local REMINDER_TEXT = "Raid supplies available"
+-- Compact Loot Helper scale (roster Equipment is 20; title icons are 18).
+local BANNER_MOBILE_SIZE = 22
+-- Mobile Banking is a 3s cast; bound pending navigation so a cancelled cast
+-- cannot leak into a later manual Guild Bank visit.
+local BANNER_BANK_NAV_TTL = 12
 
 local function Debug(level, fmt, ...)
     if not SF.Debug then return end
@@ -397,7 +401,6 @@ function Runtime:UpdateMobileCooldownWatch(collected)
         and access.reason == "cooldown"
         and self:RemindersEnabled()
         and self:WindowShown()
-        and not self.dismissed
         and collected.profile
         and self:CarriedRequestedCount(collected.profile) > 0
     if not need then
@@ -405,6 +408,34 @@ function Runtime:UpdateMobileCooldownWatch(collected)
         return
     end
     self:ScheduleMobileCooldownWatch(spell)
+end
+
+function Runtime:MobileSpellIcon()
+    if C_Spell and C_Spell.GetSpellTexture then
+        local texture = C_Spell.GetSpellTexture(MOBILE_BANKING_SPELL_ID)
+        if texture then return texture end
+    end
+    if type(GetSpellTexture) == "function" then
+        local texture = GetSpellTexture(MOBILE_BANKING_SPELL_ID)
+        if texture then return texture end
+    end
+    return "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+function Runtime:MobileCooldownTiming(spell)
+    if not spell or not C_Spell or not C_Spell.GetSpellCooldown then return nil, nil end
+    local first, second = C_Spell.GetSpellCooldown(spell)
+    if type(first) == "table" then
+        if first.isActive == false then return 0, 0 end
+        local startTime = tonumber(first.startTime)
+        local duration = tonumber(first.duration)
+        if startTime and duration then return startTime, duration end
+        return nil, nil
+    end
+    local startTime = tonumber(first)
+    local duration = tonumber(second)
+    if startTime and duration then return startTime, duration end
+    return nil, nil
 end
 
 function Runtime:BankIsOpen()
@@ -690,13 +721,12 @@ function Runtime:ReminderState()
     end
     local carriedCount = self:CarriedRequestedCount(collected.profile)
     local carries = carriedCount > 0
-    local path = Routing.HasActionablePath(collected.usable)
+    local path = Routing.HasReminderPath(collected.access)
     local visible = Routing.ReminderVisible({
         remindersEnabled = self:RemindersEnabled(),
         windowAllowed = self:WindowShown(),
-        dismissed = self.dismissed and true or false,
         carriesRequested = carries,
-        hasActionablePath = path,
+        hasReminderPath = path,
     })
     self:LogReminderDecision(collected, visible, nil, carriedCount)
     return visible, collected
@@ -719,7 +749,6 @@ function Runtime:LogReminderDecision(collected, visible, earlyReason, carriedCou
         tostring(profileId or ""),
         tostring(self:RemindersEnabled()),
         tostring(self:WindowShown()),
-        tostring(self.dismissed and true or false),
         tostring(carriedCount or 0),
         tostring(cfg and cfg.guild and cfg.guild.guid or ""),
         tostring(cfg and cfg.bankTab or ""),
@@ -736,11 +765,10 @@ function Runtime:LogReminderDecision(collected, visible, earlyReason, carriedCou
     end
     self._reminderDebugFingerprint = fingerprint
     Debug("Info",
-        "reminder decision profile=%s enabled=%s window=%s dismissed=%s carried=%s guildTab=%s access=%s/%s mobile=%s cooldown=%s visible=%s%s",
+        "reminder decision profile=%s enabled=%s window=%s carried=%s guildTab=%s access=%s/%s mobile=%s cooldown=%s visible=%s%s",
         tostring(profileId or ""),
         tostring(self:RemindersEnabled()),
         tostring(self:WindowShown()),
-        tostring(self.dismissed and true or false),
         tostring(carriedCount or 0),
         tostring(cfg and cfg.bankTab or ""),
         tostring(access and access.action or "none"),
@@ -759,21 +787,24 @@ function Runtime:RefreshReminder()
     local access = self.lastAccess
     local spell = self:MobileSpell()
     local mobileState = nil
-    if visible and access and access.action == "mobile" and spell then
+    if visible and spell and access and (access.action == "mobile" or access.action == "cooldown") then
+        local onCooldown = access.action == "cooldown" or self:MobileOnCooldown(spell)
+        local startTime, duration = nil, nil
+        if onCooldown then
+            startTime, duration = self:MobileCooldownTiming(spell)
+        end
         mobileState = {
             visible = true,
             spell = spell,
-            onCooldown = self:MobileOnCooldown(spell) and true or false,
+            spellId = MOBILE_BANKING_SPELL_ID,
+            onCooldown = onCooldown and true or false,
+            cooldownStart = startTime,
+            cooldownDuration = duration,
         }
     end
     local window = self:LootHelperWindow()
     if window and window.SetSupplyReminder then
-        window:SetSupplyReminder(visible, function()
-            self:ShowReview()
-        end, function()
-            self.dismissed = true
-            self:RefreshReminder()
-        end, mobileState)
+        window:SetSupplyReminder(visible, mobileState)
     end
     self:SyncBannerMobileButton(mobileState)
     self:UpdateMobileCooldownWatch(collected)
@@ -831,6 +862,124 @@ function Runtime:PlaceBannerMobileHolder()
     holder:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", left, bottom)
 end
 
+function Runtime:CancelBannerBankNavigation(reason)
+    if self.bannerBankNavTimer then
+        if self.bannerBankNavTimer.Cancel then
+            self.bannerBankNavTimer:Cancel()
+        end
+        self.bannerBankNavTimer = nil
+    end
+    self.bannerBankNavGen = (self.bannerBankNavGen or 0) + 1
+    if self.bannerBankNav then
+        Debug("Info", "banner bank navigation cleared reason=%s", tostring(reason or "cancel"))
+    end
+    self.bannerBankNav = nil
+end
+
+function Runtime:BannerBankNavigationIdentity(profile)
+    local C = SF.Consumables
+    if not C or not profile then return nil end
+    local cfg = C.Ensure(profile)
+    if not (cfg and cfg.guild and cfg.guild.guid and cfg.bankTab) then return nil end
+    local profileId = nil
+    if profile.GetProfileId then
+        profileId = profile:GetProfileId()
+    else
+        profileId = profile._profileId
+    end
+    if type(profileId) ~= "string" or profileId == "" then return nil end
+    return {
+        profileId = profileId,
+        guildGuid = tostring(cfg.guild.guid),
+        bankTab = tonumber(cfg.bankTab),
+        configSeq = tonumber(cfg.configSeq) or 0,
+    }
+end
+
+function Runtime:BeginBannerBankNavigation()
+    local profile = self:AccountingProfile()
+    local identity = self:BannerBankNavigationIdentity(profile)
+    if not identity then
+        self:CancelBannerBankNavigation("no_identity")
+        return
+    end
+    self:CancelBannerBankNavigation("replace")
+    local gen = self.bannerBankNavGen or 0
+    self.bannerBankNav = identity
+    Debug("Info",
+        "banner bank navigation pending profile=%s guild=%s tab=%s configSeq=%s",
+        tostring(identity.profileId),
+        tostring(identity.guildGuid),
+        tostring(identity.bankTab),
+        tostring(identity.configSeq))
+    if C_Timer and C_Timer.NewTimer then
+        self.bannerBankNavTimer = C_Timer.NewTimer(BANNER_BANK_NAV_TTL, function()
+            if (self.bannerBankNavGen or 0) ~= gen then return end
+            self.bannerBankNavTimer = nil
+            self:CancelBannerBankNavigation("expired")
+        end)
+    end
+end
+
+function Runtime:ConfiguredTabViewable(tab)
+    tab = tonumber(tab)
+    if not tab or type(GetGuildBankTabInfo) ~= "function" then return false end
+    local name, _, isViewable = GetGuildBankTabInfo(tab)
+    if type(name) ~= "string" or name == "" then return false end
+    if isViewable == false then return false end
+    return true
+end
+
+function Runtime:SelectConfiguredBankTab(tab)
+    tab = tonumber(tab)
+    if not tab or type(SetCurrentGuildBankTab) ~= "function" then return false end
+    if not self:ConfiguredTabViewable(tab) then return false end
+    SetCurrentGuildBankTab(tab)
+    if type(QueryGuildBankTab) == "function" then
+        QueryGuildBankTab(tab)
+    end
+    if type(GuildBankFrame_UpdateTabs) == "function" then
+        pcall(GuildBankFrame_UpdateTabs)
+    end
+    if type(GuildBankFrame_Update) == "function" then
+        pcall(GuildBankFrame_Update)
+    end
+    return true
+end
+
+-- Consume a banner-initiated navigation intent once for this Guild Bank opening.
+-- Returns true only when the configured tab was selected. Always clears pending
+-- state so duplicate open events and later manual visits cannot reuse it.
+function Runtime:ConsumeBannerBankNavigation()
+    local pending = self.bannerBankNav
+    if not pending then return false end
+    self:CancelBannerBankNavigation("consume")
+    local profile = self:AccountingProfile()
+    local identity = self:BannerBankNavigationIdentity(profile)
+    if not identity then
+        Debug("Warn", "banner bank navigation aborted: configuration no longer valid")
+        return false
+    end
+    if identity.profileId ~= pending.profileId
+        or identity.guildGuid ~= pending.guildGuid
+        or identity.bankTab ~= pending.bankTab
+        or identity.configSeq ~= pending.configSeq then
+        Debug("Warn", "banner bank navigation aborted: destination identity changed")
+        return false
+    end
+    local guild = self:CurrentGuild()
+    if not (guild and guild.guid and guild.guid == pending.guildGuid) then
+        Debug("Warn", "banner bank navigation aborted: guild mismatch")
+        return false
+    end
+    if not self:SelectConfiguredBankTab(pending.bankTab) then
+        Debug("Warn", "banner bank navigation aborted: tab %s not selectable", tostring(pending.bankTab))
+        return false
+    end
+    Debug("Info", "banner bank navigation selected tab=%s", tostring(pending.bankTab))
+    return true
+end
+
 function Runtime:EnsureBannerMobileButton()
     if self.bannerMobileButton then return self.bannerMobileButton end
     if InCombat() then
@@ -841,15 +990,46 @@ function Runtime:EnsureBannerMobileButton()
     local holder = self.bannerMobileHolder
     if not holder then
         holder = CreateFrame("Frame", "SpectrumFederationRaidSuppliesBannerMobile", UIParent)
-        holder:SetSize(110, 18)
+        holder:SetSize(BANNER_MOBILE_SIZE, BANNER_MOBILE_SIZE)
         if holder.SetFrameStrata then holder:SetFrameStrata("DIALOG") end
         holder:Hide()
         self.bannerMobileHolder = holder
     end
-    local button = CreateFrame("Button", nil, holder, "SecureActionButtonTemplate,UIPanelButtonTemplate")
-    button:SetSize(110, 18)
+    -- Detached SecureActionButton only. Do not protect the movable Loot Helper window.
+    local button = CreateFrame("Button", nil, holder, "SecureActionButtonTemplate")
+    button:SetSize(BANNER_MOBILE_SIZE, BANNER_MOBILE_SIZE)
     if button.SetAllPoints then button:SetAllPoints(holder) end
-    button:SetText("Mobile Banking")
+    if button.RegisterForClicks then
+        button:RegisterForClicks("AnyUp", "AnyDown")
+    end
+    local icon = button:CreateTexture(nil, "ARTWORK")
+    if icon.SetAllPoints then icon:SetAllPoints(button) end
+    button.Icon = icon
+    local highlight = button:CreateTexture(nil, "HIGHLIGHT")
+    if highlight.SetAllPoints then highlight:SetAllPoints(button) end
+    if highlight.SetColorTexture then
+        highlight:SetColorTexture(1, 1, 1, 0.15)
+    end
+    local cooldown = CreateFrame("Cooldown", nil, button, "CooldownFrameTemplate")
+    if cooldown.SetAllPoints then cooldown:SetAllPoints(button) end
+    button.Cooldown = cooldown
+    button:SetScript("PreClick", function()
+        if button.sfOnCooldown then return end
+        self:BeginBannerBankNavigation()
+    end)
+    button:SetScript("OnEnter", function(selfBtn)
+        if not GameTooltip then return end
+        GameTooltip:SetOwner(selfBtn, "ANCHOR_RIGHT")
+        if GameTooltip.SetSpellByID then
+            GameTooltip:SetSpellByID(MOBILE_BANKING_SPELL_ID)
+        else
+            GameTooltip:SetText(selfBtn.sfSpellName or "Mobile Banking")
+        end
+        GameTooltip:Show()
+    end)
+    button:SetScript("OnLeave", function()
+        if GameTooltip then GameTooltip:Hide() end
+    end)
     button:Hide()
     self.bannerMobileButton = button
     return button
@@ -877,14 +1057,36 @@ function Runtime:SyncBannerMobileButton(mobileState)
     local holder = self.bannerMobileHolder
     if holder then holder:Show() end
     button:SetShown(true)
+    button.sfSpellName = mobileState.spell
     button:SetAttribute("type", "spell")
     button:SetAttribute("spell", mobileState.spell)
+    if button.Icon then
+        if button.Icon.SetTexture then
+            button.Icon:SetTexture(self:MobileSpellIcon())
+        end
+        if button.Icon.SetDesaturated then
+            button.Icon:SetDesaturated(mobileState.onCooldown and true or false)
+        end
+    end
+    local cooldown = button.Cooldown
+    if cooldown then
+        if mobileState.onCooldown
+            and type(mobileState.cooldownStart) == "number"
+            and type(mobileState.cooldownDuration) == "number"
+            and mobileState.cooldownDuration > 0
+            and cooldown.SetCooldown then
+            cooldown:SetCooldown(mobileState.cooldownStart, mobileState.cooldownDuration)
+        elseif cooldown.Clear then
+            cooldown:Clear()
+        elseif cooldown.SetCooldown then
+            cooldown:SetCooldown(0, 0)
+        end
+    end
+    button.sfOnCooldown = mobileState.onCooldown and true or false
     if mobileState.onCooldown then
         button:Disable()
-        button:SetText("On cooldown")
     else
         button:Enable()
-        button:SetText("Mobile Banking")
     end
 end
 
@@ -1667,7 +1869,13 @@ function Runtime:OnBankOpened()
     self.bankOpen = true
     if first then
         self.autoReviewedThisOpen = false
+        -- Banner-initiated tab selection must run before MaybeAutoReview so
+        -- BankAccess can see the configured tab as usable when appropriate.
+        self:ConsumeBannerBankNavigation()
         self:MaybeAutoReview()
+    elseif self.bannerBankNav then
+        -- Duplicate open signal while already open: never select twice.
+        self:CancelBannerBankNavigation("duplicate_open")
     end
     self:RefreshReminder()
     if self.review and self.review:IsShown() then
@@ -1677,6 +1885,9 @@ end
 
 function Runtime:OnBankClosed()
     self.autoReviewedThisOpen = false
+    if self.bannerBankNav then
+        self:CancelBannerBankNavigation("bank_closed")
+    end
     if self.depositWork then
         self:CancelDepositWork()
     elseif self.depositIntent then
@@ -1723,6 +1934,7 @@ function Runtime:OnProfileChanged(profile)
         return
     end
     self._seenProfileId = id
+    self:CancelBannerBankNavigation("profile_changed")
     if self.review then
         self.review:Hide()
     end
@@ -1831,7 +2043,7 @@ function Runtime:Init()
     self.pendingItemLoads = {}
     self.bagCounts = {}
     self.bagStacks = {}
-    self.dismissed = false
+    self.bannerBankNav = nil
     local frame = CreateFrame("Frame")
     self.frame = frame
     frame:SetScript("OnEvent", function(_, event, ...)
