@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.6] - 2026-10-07
+
+### Fixed
+- Fix Raid Supply reminder not attaching to Loot Helper window (#350)
+
 ## [1.5.8-beta.5] - 2026-10-07
 
 ### Changed
