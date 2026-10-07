@@ -209,8 +209,8 @@ described as an executed test.
 
 Choose representative, risk-based event sequences. Do not demand exhaustive
 permutations, a new simulator for every feature, or every suite after every
-edit. This execution guidance applies to authorized implementation/validation.
-Automatic subscription triage remains non-executing inspection.
+edit. This execution guidance applies to authorized implementation/validation
+and to owner-requested assessment only when that request includes execution.
 
 ### Reviews and audits
 

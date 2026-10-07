@@ -10,9 +10,10 @@ alwaysApply: true
   Area, Packaging And Versioning). Do not maintain a second full map here.
 - Choose validation from that map by changed area. Domain skills may name their
   focused suite without copying the whole repository list.
-- Validation modes: automatic subscription triage is non-executing inspection;
-  authorized implementation/repair/finalization runs required affected checks;
-  readiness assessment reports evidence/gaps and executes only when authorized.
+- Validation modes: authorized implementation/repair/finalization runs required
+  affected checks; owner-requested review/assessment/readiness reports
+  evidence/gaps and executes checks only when that authorization includes
+  execution. Review events alone do not authorize work.
 - Normal development targets `beta`; `main` is for promotion and release workflows.
 - Do not weaken CI to make checks pass.
 - Keep the job name in `.github/workflows/copilot-setup-steps.yml` exactly `copilot-setup-steps`.
