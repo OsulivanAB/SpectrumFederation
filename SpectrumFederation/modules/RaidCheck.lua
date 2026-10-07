@@ -3330,6 +3330,15 @@ local function EmitAdminMessage(message)
 	end
 end
 
+local function EmitAdminDebug(message)
+	if type(message) ~= "string" or message == "" then
+		return
+	end
+	if SF.Debug and SF.Debug.Info then
+		SF.Debug:Info("RAID_CHECK", "%s", message)
+	end
+end
+
 local function EmitAdminMissingSummary(modeLabel, summaryMissing)
 	if type(summaryMissing) ~= "table" or #summaryMissing == 0 then
 		return
@@ -3354,9 +3363,9 @@ local function EmitAdminPendingSummary(modeLabel, summaryPending)
 		return
 	end
 
-	SF:PrintInfo(string.format("[%s] Players still waiting on inspect data:", modeLabel))
+	EmitAdminDebug(string.format("[%s] Players still waiting on inspect data:", modeLabel))
 	for _, entry in ipairs(summaryPending) do
-		SF:PrintInfo(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectPending))
+		EmitAdminDebug(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectPending))
 	end
 end
 
@@ -3364,9 +3373,9 @@ local function EmitAdminInspectionFailedSummary(modeLabel, summaryFailed)
 	if type(summaryFailed) ~= "table" or #summaryFailed == 0 then
 		return
 	end
-	EmitAdminMessage(string.format("[%s] Inspection Failed (not awarded, not counted as Unprepared):", modeLabel))
+	EmitAdminDebug(string.format("[%s] Inspection Failed (not awarded, not counted as Unprepared):", modeLabel))
 	for _, entry in ipairs(summaryFailed) do
-		EmitAdminMessage(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectFailed or "Inspect could not be completed"))
+		EmitAdminDebug(string.format("  %s - %s", entry.displayName or entry.name, entry.inspectFailed or "Inspect could not be completed"))
 	end
 end
 
@@ -3777,9 +3786,9 @@ function RC:_ApplyCheckConsequences(run)
 				}
 			)
 			if ok then
-				EmitAdminMessage(("[Raid Check] Reward Pot deducted %s."):format(SF.FormatMoney and SF.FormatMoney(amount) or tostring(amount)))
+				EmitAdminDebug(("[Raid Check] Reward Pot deducted %s."):format(SF.FormatMoney and SF.FormatMoney(amount) or tostring(amount)))
 			elseif err then
-				SF:PrintWarning(err)
+				EmitAdminDebug(tostring(err))
 			end
 		end
 	end
@@ -3788,9 +3797,9 @@ function RC:_ApplyCheckConsequences(run)
 	EmitAdminMissingSummary(label, summaryMissing)
 	EmitAdminInspectionFailedSummary(label, summaryFailed)
 	if #summaryRecent > 0 then
-		SF:PrintInfo(string.format("[%s] Recently Verified (range-only, last-good within 120s):", label))
+		EmitAdminDebug(string.format("[%s] Recently Verified (range-only, last-good within 120s):", label))
 		for _, entry in ipairs(summaryRecent) do
-			SF:PrintInfo(string.format("  %s", entry.displayName or entry.name))
+			EmitAdminDebug(string.format("  %s", entry.displayName or entry.name))
 		end
 	end
 
@@ -3798,8 +3807,8 @@ function RC:_ApplyCheckConsequences(run)
 	if SF.Debug then
 		SF.Debug:Info("RAID_CHECK", "%s consequences applied (missing=%d failed=%d skipBroadcast=%s reason=%s)",
 			label, #summaryMissing, #summaryFailed, tostring(skipBroadcast), tostring(reason))
+		SF.Debug:Info("RAID_CHECK", "%s Complete.", label)
 	end
-	SF:PrintSuccess(string.format("[%s] Complete.", label))
 end
 
 function RC:_TryReleaseCheckConsequences()
@@ -3892,7 +3901,13 @@ function RC:_SettleAdhocRun(reason)
 	end
 	self:_TryReleaseCheckConsequences()
 	if state.adhocRun and state.adhocRun.classified and not state.adhocRun.consequencesApplied then
-		SF:PrintInfo(string.format("[%s] Equipment results are ready. Waiting for session announcement before applying synchronized consequences.", ModeLabel(run.mode)))
+		if SF.Debug and SF.Debug.Info then
+			SF.Debug:Info(
+				"RAID_CHECK",
+				"%s Equipment results are ready. Waiting for session announcement before applying synchronized consequences.",
+				ModeLabel(run.mode)
+			)
+		end
 	end
 end
 

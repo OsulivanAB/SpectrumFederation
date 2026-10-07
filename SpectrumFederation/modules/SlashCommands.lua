@@ -356,11 +356,9 @@ function SF:RegisterLootHelperSlashCommands()
                 return
             end
             
-            -- Start the session
+            -- Start the session (success is recorded by StartSession via SF.Debug)
             local sessionId = SF.LootHelperSync:StartSession(profileId)
-            if sessionId then
-                SF:PrintSuccess("Session started successfully")
-            else
+            if not sessionId then
                 SF:PrintError("Failed to start session (not in a group/raid?)")
             end
             return
@@ -378,11 +376,9 @@ function SF:RegisterLootHelperSlashCommands()
                 return
             end
             
-            -- End the session
+            -- End the session (EndSession already announces via chat when kept)
             local ok = SF.LootHelperSync:EndSession("manual")
-            if ok then
-                SF:PrintSuccess("Session ended successfully")
-            else
+            if not ok then
                 SF:PrintError("Failed to end session (no active session?)")
             end
             return
