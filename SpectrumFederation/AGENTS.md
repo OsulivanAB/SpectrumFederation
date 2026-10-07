@@ -275,8 +275,16 @@ When you need a new toggle/option:
 - Do not log in hot paths (tight loops, per-frame handlers).
 
 ## User-visible messaging
-- Prefer `modules/MessageHelpers.lua` helpers (`SF:PrintSuccess/Error/Warning/Info`) when you need to tell the user something.
-- Do not spam chat for debugging (use `SF.Debug` instead).
+
+User-facing chat output is opt-in.
+Do not add new output to normal WoW chat unless:
+1. The task/issue explicitly asks for that message or behavior to be shown in chat; or
+2. The user has explicitly approved adding it.
+Do not infer permission because a message seems useful, actionable, important, or error-related.
+If an implementation would benefit from new chat output but the request does not authorize it, ask the user before adding it. If interactive clarification is not possible, do not add the chat output; note the proposed message for the user instead.
+If the information is useful for diagnostics, troubleshooting, or development, use `SF.Debug` rather than normal chat. If it has no diagnostic value, it does not need replacement output at all.
+
+When chat output *is* authorized, prefer `modules/MessageHelpers.lua` helpers (`SF:PrintSuccess/Error/Warning/Info`, `SF:SystemMessage`) over ad-hoc `print` / `DEFAULT_CHAT_FRAME:AddMessage`. Do not spam chat for debugging.
 
 ### Anti-spam and repetition (proactive requirement)
 
