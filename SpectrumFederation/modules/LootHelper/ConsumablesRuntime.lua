@@ -112,7 +112,14 @@ end
 function Runtime:WindowShown()
     local window = SF.LootHelperWindow
     local frame = window and window._frame
-    return frame and frame.IsShown and frame:IsShown() and true or false
+    if not (frame and frame.IsShown and frame:IsShown()) then
+        return false
+    end
+    -- Minimized keeps the outer frame shown while hiding Content; treat that as not shown.
+    if window.IsMinimized and window:IsMinimized() then
+        return false
+    end
+    return true
 end
 
 function Runtime:ItemName(itemId)
@@ -263,16 +270,29 @@ end
 
 local MOBILE_BANKING_SPELL_ID = 83958
 
-function Runtime:MobileSpell()
-    local known = nil
-    if C_SpellBook and C_SpellBook.IsSpellInSpellBook and Enum and Enum.SpellBookSpellBank
-        and Enum.SpellBookSpellBank.Player ~= nil then
-        known = C_SpellBook.IsSpellInSpellBook(MOBILE_BANKING_SPELL_ID, Enum.SpellBookSpellBank.Player) and true or false
-    elseif type(IsPlayerSpell) == "function" then
-        known = IsPlayerSpell(MOBILE_BANKING_SPELL_ID) and true or false
-    elseif type(IsSpellKnown) == "function" then
-        known = IsSpellKnown(MOBILE_BANKING_SPELL_ID) and true or false
+-- Mobile Banking is a guild perk. Prefer "does the player know this spell"
+-- (`C_SpellBook.IsSpellKnown` / `IsPlayerSpell`) over "is it listed in the
+-- spellbook UI" (`IsSpellInSpellBook`), which can return false for perks the
+-- player can still cast.
+function Runtime:MobileSpellKnown()
+    local spellBank = Enum and Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player
+    if C_SpellBook and C_SpellBook.IsSpellKnown and spellBank ~= nil then
+        return C_SpellBook.IsSpellKnown(MOBILE_BANKING_SPELL_ID, spellBank) and true or false
     end
+    if type(IsPlayerSpell) == "function" then
+        return IsPlayerSpell(MOBILE_BANKING_SPELL_ID) and true or false
+    end
+    if C_SpellBook and C_SpellBook.IsSpellInSpellBook and spellBank ~= nil then
+        return C_SpellBook.IsSpellInSpellBook(MOBILE_BANKING_SPELL_ID, spellBank) and true or false
+    end
+    if type(IsSpellKnown) == "function" then
+        return IsSpellKnown(MOBILE_BANKING_SPELL_ID) and true or false
+    end
+    return nil
+end
+
+function Runtime:MobileSpell()
+    local known = self:MobileSpellKnown()
     if known == false then return nil end
     if C_Spell and C_Spell.GetSpellInfo then
         local info = C_Spell.GetSpellInfo(MOBILE_BANKING_SPELL_ID)
@@ -286,6 +306,9 @@ function Runtime:MobileSpell()
         if type(spellName) == "string" and spellName ~= "" then
             return spellName
         end
+        if type(spellName) == "table" and type(spellName.name) == "string" and spellName.name ~= "" then
+            return spellName.name
+        end
     end
     return nil
 end
@@ -293,13 +316,88 @@ end
 function Runtime:MobileOnCooldown(spell)
     if not spell or not C_Spell or not C_Spell.GetSpellCooldown then return false end
     local first, second = C_Spell.GetSpellCooldown(spell)
-    local duration = nil
     if type(first) == "table" then
-        duration = first.duration
-    else
-        duration = second
+        -- Prefer NeverSecret isActive under SecretWhenCooldownsRestricted.
+        if first.isActive ~= nil then
+            return first.isActive and true or false
+        end
+        local duration = tonumber(first.duration)
+        return duration ~= nil and duration > 0
     end
-    return (tonumber(duration) or 0) > 0
+    local duration = tonumber(second)
+    return duration ~= nil and duration > 0
+end
+
+-- Remaining cooldown seconds when start/duration are safely readable.
+-- Returns nil when values are unavailable or secret-restricted.
+function Runtime:MobileCooldownRemaining(spell)
+    if not spell or not C_Spell or not C_Spell.GetSpellCooldown then return nil end
+    local first, second = C_Spell.GetSpellCooldown(spell)
+    local startTime, duration, modRate
+    if type(first) == "table" then
+        if first.isActive == false then return 0 end
+        startTime = tonumber(first.startTime)
+        duration = tonumber(first.duration)
+        modRate = tonumber(first.modRate) or 1
+    else
+        startTime = tonumber(first)
+        duration = tonumber(second)
+        modRate = 1
+    end
+    if not startTime or not duration or duration <= 0 then return nil end
+    if modRate <= 0 then modRate = 1 end
+    local now = (GetTime and GetTime()) or 0
+    local remaining = (startTime + duration - now) / modRate
+    if remaining < 0 then remaining = 0 end
+    return remaining
+end
+
+function Runtime:CancelMobileCooldownWatch()
+    if self.mobileCooldownTimer then
+        if self.mobileCooldownTimer.Cancel then
+            self.mobileCooldownTimer:Cancel()
+        end
+        self.mobileCooldownTimer = nil
+    end
+    self.mobileCooldownWatchGen = (self.mobileCooldownWatchGen or 0) + 1
+end
+
+function Runtime:ScheduleMobileCooldownWatch(spell)
+    self:CancelMobileCooldownWatch()
+    if not spell or not self:MobileOnCooldown(spell) then return end
+    local remaining = self:MobileCooldownRemaining(spell)
+    if remaining == nil or remaining <= 0 then return end
+    -- Mobile Banking is a 1-hour cooldown; bound runaway values.
+    if remaining > 3700 then remaining = 3700 end
+    if not (C_Timer and C_Timer.NewTimer) then return end
+    local gen = self.mobileCooldownWatchGen or 0
+    self.mobileCooldownTimer = C_Timer.NewTimer(remaining + 0.05, function()
+        if (self.mobileCooldownWatchGen or 0) ~= gen then return end
+        self.mobileCooldownTimer = nil
+        if InCombat() then
+            self.reviewRefreshPending = true
+            return
+        end
+        self:RefreshReminder()
+    end)
+end
+
+function Runtime:UpdateMobileCooldownWatch(collected)
+    local access = collected and collected.access
+    local spell = self:MobileSpell()
+    local need = spell
+        and access
+        and access.reason == "cooldown"
+        and self:RemindersEnabled()
+        and self:WindowShown()
+        and not self.dismissed
+        and collected.profile
+        and self:CarriedRequestedCount(collected.profile) > 0
+    if not need then
+        self:CancelMobileCooldownWatch()
+        return
+    end
+    self:ScheduleMobileCooldownWatch(spell)
 end
 
 function Runtime:BankIsOpen()
@@ -560,20 +658,31 @@ function Runtime:Collect()
     }
 end
 
+function Runtime:CarriedRequestedCount(profile)
+    local C = SF.Consumables
+    if not C or not profile or type(self.bagCounts) ~= "table" then return 0 end
+    local ids = C.RequestedItemIds(profile)
+    local total = 0
+    for i = 1, #ids do
+        total = total + (tonumber(self.bagCounts[ids[i]]) or 0)
+    end
+    return total
+end
+
 function Runtime:ReminderState()
     local reviewShown = self.review and self.review.IsShown and self.review:IsShown()
     if not self:WindowShown() and not reviewShown then
+        self:LogReminderDecision(nil, false, "window_hidden")
         return false
     end
     local Routing = SF.ConsumablesRouting
     local collected = self:Collect()
-    if not collected then return false end
-    local carries = false
-    for i = 1, #collected.plan.lines do
-        if collected.plan.lines[i].quantity > 0 then
-            carries = true
-        end
+    if not collected then
+        self:LogReminderDecision(nil, false, "no_profile")
+        return false
     end
+    local carriedCount = self:CarriedRequestedCount(collected.profile)
+    local carries = carriedCount > 0
     local path = Routing.HasActionablePath(collected.usable)
     local visible = Routing.ReminderVisible({
         remindersEnabled = self:RemindersEnabled(),
@@ -582,13 +691,74 @@ function Runtime:ReminderState()
         carriesRequested = carries,
         hasActionablePath = path,
     })
-    return visible
+    self:LogReminderDecision(collected, visible, nil, carriedCount)
+    return visible, collected
+end
+
+function Runtime:LogReminderDecision(collected, visible, earlyReason, carriedCount)
+    local access = collected and collected.access or nil
+    local profile = collected and collected.profile or nil
+    local profileId = nil
+    if type(profile) == "table" then
+        if profile.GetProfileId then
+            profileId = profile:GetProfileId()
+        else
+            profileId = profile._profileId
+        end
+    end
+    local cfg = profile and SF.Consumables and SF.Consumables.Ensure and SF.Consumables.Ensure(profile) or nil
+    local spell = self:MobileSpell()
+    local fingerprint = table.concat({
+        tostring(profileId or ""),
+        tostring(self:RemindersEnabled()),
+        tostring(self:WindowShown()),
+        tostring(self.dismissed and true or false),
+        tostring(carriedCount or 0),
+        tostring(cfg and cfg.guild and cfg.guild.guid or ""),
+        tostring(cfg and cfg.bankTab or ""),
+        tostring(access and access.action or ""),
+        tostring(access and access.reason or ""),
+        tostring(access and access.enabled or false),
+        tostring(spell ~= nil),
+        tostring(spell ~= nil and self:MobileOnCooldown(spell) or false),
+        tostring(visible and true or false),
+        tostring(earlyReason or ""),
+    }, "|")
+    if fingerprint == self._reminderDebugFingerprint then
+        return
+    end
+    self._reminderDebugFingerprint = fingerprint
+    Debug("Info",
+        "reminder decision profile=%s enabled=%s window=%s dismissed=%s carried=%s guildTab=%s access=%s/%s mobile=%s cooldown=%s visible=%s%s",
+        tostring(profileId or ""),
+        tostring(self:RemindersEnabled()),
+        tostring(self:WindowShown()),
+        tostring(self.dismissed and true or false),
+        tostring(carriedCount or 0),
+        tostring(cfg and cfg.bankTab or ""),
+        tostring(access and access.action or "none"),
+        tostring(access and (access.reason or (access.enabled and "ok" or "disabled")) or earlyReason or "n/a"),
+        tostring(spell ~= nil),
+        tostring(spell ~= nil and self:MobileOnCooldown(spell) or false),
+        tostring(visible and true or false),
+        earlyReason and (" early=" .. earlyReason) or "")
 end
 
 function Runtime:RefreshReminder()
     self:WatchWindow()
-    local visible = self:ReminderState()
+    local visible, collected = self:ReminderState()
     self.reminderShown = visible and true or false
+    self.lastAccess = collected and collected.access or nil
+    local access = self.lastAccess
+    local spell = self:MobileSpell()
+    local mobileState = nil
+    if visible and access and access.action == "mobile" and spell then
+        mobileState = {
+            visible = true,
+            spell = spell,
+            onCooldown = self:MobileOnCooldown(spell) and true or false,
+        }
+    end
     local window = SF.LootHelperWindow
     if window and window.SetSupplyReminder then
         window:SetSupplyReminder(visible, function()
@@ -596,8 +766,10 @@ function Runtime:RefreshReminder()
         end, function()
             self.dismissed = true
             self:RefreshReminder()
-        end)
+        end, mobileState)
     end
+    self:SyncBannerMobileButton(mobileState)
+    self:UpdateMobileCooldownWatch(collected)
 end
 
 function Runtime:WatchWindow()
@@ -610,7 +782,103 @@ function Runtime:WatchWindow()
     end)
     frame:HookScript("OnHide", function()
         self.reminderShown = false
+        self:CancelMobileCooldownWatch()
+        self:SyncBannerMobileButton(nil)
     end)
+    frame:HookScript("OnSizeChanged", function()
+        if InCombat() then
+            self.bannerMobilePending = true
+            return
+        end
+        if self.bannerMobileHolder and self.bannerMobileHolder.IsShown and self.bannerMobileHolder:IsShown() then
+            self:PlaceBannerMobileHolder()
+        end
+    end)
+    local title = frame.Title
+    if title and title.HookScript then
+        title:HookScript("OnDragStop", function()
+            if InCombat() then
+                self.bannerMobilePending = true
+                return
+            end
+            self:PlaceBannerMobileHolder()
+        end)
+    end
+end
+
+function Runtime:BannerMobileAnchor()
+    local window = SF.LootHelperWindow
+    local reminder = window and window._frame and window._frame.Content and window._frame.Content.SupplyReminder
+    return reminder and reminder.MobileAnchor or nil
+end
+
+function Runtime:PlaceBannerMobileHolder()
+    local holder = self.bannerMobileHolder
+    local anchor = self:BannerMobileAnchor()
+    if not holder or not anchor or InCombat() then return end
+    local left = anchor.GetLeft and anchor:GetLeft()
+    local bottom = anchor.GetBottom and anchor:GetBottom()
+    if not left or not bottom then return end
+    if holder.ClearAllPoints then holder:ClearAllPoints() end
+    -- Screen coordinates only. Anchoring to the Loot Helper window would protect it in combat.
+    holder:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", left, bottom)
+end
+
+function Runtime:EnsureBannerMobileButton()
+    if self.bannerMobileButton then return self.bannerMobileButton end
+    if InCombat() then
+        self.bannerMobilePending = true
+        return nil
+    end
+    self.bannerMobilePending = nil
+    local holder = self.bannerMobileHolder
+    if not holder then
+        holder = CreateFrame("Frame", "SpectrumFederationRaidSuppliesBannerMobile", UIParent)
+        holder:SetSize(110, 18)
+        if holder.SetFrameStrata then holder:SetFrameStrata("DIALOG") end
+        holder:Hide()
+        self.bannerMobileHolder = holder
+    end
+    local button = CreateFrame("Button", nil, holder, "SecureActionButtonTemplate,UIPanelButtonTemplate")
+    button:SetSize(110, 18)
+    if button.SetAllPoints then button:SetAllPoints(holder) end
+    button:SetText("Mobile Banking")
+    button:Hide()
+    self.bannerMobileButton = button
+    return button
+end
+
+function Runtime:SyncBannerMobileButton(mobileState)
+    local show = mobileState and mobileState.visible and mobileState.spell ~= nil
+    -- SecureActionButton show/hide/attributes are protected; defer the whole sync in combat.
+    if InCombat() then
+        self.bannerMobilePending = true
+        return
+    end
+    if not show then
+        if self.bannerMobileHolder then self.bannerMobileHolder:Hide() end
+        if self.bannerMobileButton then self.bannerMobileButton:Hide() end
+        self.bannerMobilePending = nil
+        return
+    end
+    if not self:EnsureBannerMobileButton() then
+        return
+    end
+    self.bannerMobilePending = nil
+    self:PlaceBannerMobileHolder()
+    local button = self.bannerMobileButton
+    local holder = self.bannerMobileHolder
+    if holder then holder:Show() end
+    button:SetShown(true)
+    button:SetAttribute("type", "spell")
+    button:SetAttribute("spell", mobileState.spell)
+    if mobileState.onCooldown then
+        button:Disable()
+        button:SetText("On cooldown")
+    else
+        button:Enable()
+        button:SetText("Mobile Banking")
+    end
 end
 
 function Runtime:EnsureReview()
@@ -1469,6 +1737,8 @@ function Runtime:OnEvent(event, arg1)
             if self.review and self.review:IsShown() then
                 self:RebuildReview()
             end
+        elseif self.bannerMobilePending or self.reminderShown then
+            self:RefreshReminder()
         end
         return
     end
@@ -1493,6 +1763,17 @@ function Runtime:OnEvent(event, arg1)
         if self.review and self.review:IsShown() then
             self:RebuildReview()
         end
+    elseif event == "SPELL_UPDATE_COOLDOWN" then
+        -- Does not fire when a cooldown ends; use it to (re)arm the one-shot expiry watch.
+        local spellId = tonumber(arg1)
+        if spellId ~= nil and spellId ~= MOBILE_BANKING_SPELL_ID then
+            return
+        end
+        if InCombat() then
+            self.reviewRefreshPending = true
+            return
+        end
+        self:RefreshReminder()
     elseif event == "ITEM_DATA_LOAD_RESULT" then
         local itemId = tonumber(arg1)
         if itemId then
@@ -1551,6 +1832,7 @@ function Runtime:Init()
     end)
     TryRegister(frame, "BAG_UPDATE_DELAYED")
     TryRegister(frame, "GROUP_ROSTER_UPDATE")
+    TryRegister(frame, "SPELL_UPDATE_COOLDOWN")
     TryRegister(frame, "ITEM_DATA_LOAD_RESULT")
     TryRegister(frame, "GUILDBANKFRAME_OPENED")
     TryRegister(frame, "GUILDBANKFRAME_CLOSED")
