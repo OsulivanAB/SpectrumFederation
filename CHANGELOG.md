@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.5] - 2026-10-07
+
+### Changed
+- Restore Raid Supply reminder for Mobile Banking (#341)
+
 ## [1.5.8-beta.4] - 2026-10-07
 
 ### Changed
