@@ -144,7 +144,7 @@ Loot Helper → Consumables is shared profile configuration for raid supplies. A
 
 Loot Helper → General → Show Raid Supply Reminders is personal. It only controls the reminder and the automatic deposit review when the configured Guild Bank opens. Turning it off does not stop accounting.
 
-Members who carry a requested item and have a usable Guild Bank path (open configured tab, or Mobile Banking when available) can open the deposit assistant, adjust quantities, and deposit into the configured tab. Spectrum records contribution credit only for quantities observed successfully entering that tab. What happens to the materials afterward is not tracked. Historical Raid Consumable Logs remain when an admin clears the current configuration.
+Members who carry a requested item can see a compact Raid Supplies reminder with a secure Mobile Banking icon when that path is relevant (including while Mobile Banking is on cooldown). Opening Mobile Banking from that banner selects the configured Guild Bank tab once; the existing deposit assistant then handles quantities and deposits when the tab is usable. Spectrum records contribution credit only for quantities observed successfully entering that tab. What happens to the materials afterward is not tracked. Historical Raid Consumable Logs remain when an admin clears the current configuration.
 
 ## Related pages
 

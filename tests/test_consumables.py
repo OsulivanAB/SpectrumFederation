@@ -68,6 +68,13 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert 'TryRegister(frame, "SPELL_UPDATE_COOLDOWN")' in runtime
     assert "isActive" in runtime
     assert "ScheduleMobileCooldownWatch" in runtime
+    assert "ConsumeBannerBankNavigation" in runtime
+    assert "BeginBannerBankNavigation" in runtime
+    assert "HasReminderPath" in (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesRouting.lua"
+    ).read_text(encoding="utf-8")
+    assert "self.dismissed" not in runtime
+    assert "OnDismiss" not in runtime
     # Prefer known-spell detection for guild perks; IsSpellInSpellBook is only a fallback.
     known_at = runtime.find("C_SpellBook.IsSpellKnown")
     in_book_at = runtime.find("C_SpellBook.IsSpellInSpellBook")

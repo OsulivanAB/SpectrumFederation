@@ -66,6 +66,11 @@ local function resetWorld()
         inCombat = false,
         mobileKnown = false,
         mobileCooldown = false,
+        mobileCooldownStart = nil,
+        mobileCooldownDuration = nil,
+        tabViewable = {},
+        tabSelects = {},
+        tabQueries = {},
         bindTypes = {},
         boundSlots = {},
         unknownItems = {},
@@ -153,14 +158,29 @@ function GetGuildBankItemInfo(tab, slot)
     return nil, row and row.count or 0
 end
 function GetGuildBankTabInfo(tab)
-    return "Tab " .. tostring(tab), "icon", true, world.canDeposit[tab]
+    local viewable = world.tabViewable[tab]
+    if viewable == nil then viewable = true end
+    if world.tabMissing and world.tabMissing[tab] then
+        return nil, nil, false, false
+    end
+    return "Tab " .. tostring(tab), "icon", viewable, world.canDeposit[tab]
 end
 function GetCurrentGuildBankTab() return world.currentTab end
+function SetCurrentGuildBankTab(tab)
+    world.currentTab = tab
+    world.tabSelects[#world.tabSelects + 1] = tab
+end
+function QueryGuildBankTab(tab)
+    world.tabQueries[#world.tabQueries + 1] = tab
+end
 GuildBankFrame = { IsShown = function() return world.bankOpen end }
 C_Club = { GetGuildClubId = function() return world.clubId end }
 function GetGuildInfo() return world.guildName, nil, nil, world.guildRealm end
 -- Retail exposes C_SpellBook. Legacy IsPlayerSpell remains as a fallback only.
-Enum = { SpellBookSpellBank = { Player = 0, Pet = 1 } }
+Enum = {
+    SpellBookSpellBank = { Player = 0, Pet = 1 },
+    PlayerInteractionType = { GuildBanker = 10 },
+}
 C_SpellBook = {
     -- Guild perks like Mobile Banking are known but not always listed in the
     -- spellbook UI. Returning false here proves production does not treat
@@ -171,6 +191,7 @@ C_SpellBook = {
 function IsPlayerSpell() return world.mobileKnown end
 C_Spell = {
     GetSpellInfo = function() return { name = "Mobile Banking" } end,
+    GetSpellTexture = function() return "Interface\\Icons\\INV_Misc_BagCoin_07" end,
     GetSpellCooldown = function()
         if world.mobileCooldown then
             return {
@@ -190,6 +211,28 @@ C_Spell = {
         }
     end,
 }
+GameTooltip = {
+    owner = nil,
+    text = nil,
+    spellId = nil,
+    shown = false,
+}
+function GameTooltip:SetOwner(owner)
+    self.owner = owner
+end
+function GameTooltip:SetSpellByID(spellId)
+    self.spellId = spellId
+    self.text = "Mobile Banking"
+end
+function GameTooltip:SetText(text)
+    self.text = text
+end
+function GameTooltip:Show()
+    self.shown = true
+end
+function GameTooltip:Hide()
+    self.shown = false
+end
 C_Item = {
     GetItemInfo = function(itemId)
         if world.unknownItems[itemId] then return nil end
@@ -292,6 +335,25 @@ function FrameMethods:Enable() self.enabled = true end
 function FrameMethods:Disable() self.enabled = false end
 function FrameMethods:IsEnabled() return self.enabled end
 function FrameMethods:CreateFontString() return FrameMock("FontString", self) end
+function FrameMethods:CreateTexture()
+    local tex = FrameMock("Texture", self)
+    tex.texture = nil
+    tex.desaturated = false
+    function tex:SetTexture(value) self.texture = value end
+    function tex:SetDesaturated(value) self.desaturated = value and true or false end
+    function tex:SetTexCoord() end
+    function tex:SetColorTexture() end
+    return tex
+end
+function FrameMethods:RegisterForClicks() end
+function FrameMethods:SetCooldown(startTime, duration)
+    self.cooldownStart = startTime
+    self.cooldownDuration = duration
+end
+function FrameMethods:Clear()
+    self.cooldownStart = nil
+    self.cooldownDuration = nil
+end
 function CreateFrame(kind, name, parent, template)
     local frame = FrameMock(kind, parent)
     frame.name = name
@@ -328,11 +390,9 @@ LHWindow._frame = FrameMock("Frame")
 function LHWindow:IsMinimized()
     return self._frame and self._frame.__sfMinimized and true or false
 end
-function LHWindow:SetSupplyReminder(visible, onOpen, onDismiss, mobile)
+function LHWindow:SetSupplyReminder(visible, mobile)
     reminderCalls[#reminderCalls + 1] = {
         visible = visible,
-        onOpen = onOpen,
-        onDismiss = onDismiss,
         mobile = mobile,
     }
     local reminder = self._frame and self._frame.Content and self._frame.Content.SupplyReminder
@@ -446,11 +506,14 @@ local function resetRuntime()
     RT.mobileButtonPending = nil
     if RT.CancelMobileCooldownWatch then RT:CancelMobileCooldownWatch() end
     RT.mobileCooldownTimer = nil
+    if RT.CancelBannerBankNavigation then RT:CancelBannerBankNavigation("reset") end
     RT.bannerMobileHolder = nil
     RT.bannerMobileButton = nil
     RT.bannerMobilePending = nil
+    RT.bannerBankNav = nil
+    RT.bannerBankNavTimer = nil
+    RT.bannerBankNavGen = 0
     RT._reminderDebugFingerprint = nil
-    RT.dismissed = false
     RT.qtyOverrides = {}
     RT.pendingItemLoads = {}
     RT.bagCounts = {}
@@ -750,27 +813,31 @@ local function checkAccessRules()
     assertFalse(R.GuildBankUsable(nil), "no access is not usable")
     assertTrue(R.HasActionablePath(true), "a usable guild bank is an actionable path")
     assertFalse(R.HasActionablePath(false), "without a usable guild bank there is no path")
+    assertTrue(R.HasReminderPath(mobile), "ready Mobile Banking is a reminder path")
+    assertTrue(R.HasReminderPath(cooldown), "Mobile Banking on cooldown remains a reminder path")
+    assertFalse(R.HasReminderPath(closed), "a closed bank without Mobile Banking is not a reminder path")
+    assertFalse(R.HasReminderPath(nil), "missing access is not a reminder path")
 end
 
 local function checkReminderRules()
-    local base = { remindersEnabled = true, windowAllowed = true, carriesRequested = true, hasActionablePath = true }
+    local base = { remindersEnabled = true, windowAllowed = true, carriesRequested = true, hasReminderPath = true }
     local function with(key, value)
         local copy = {}
         for k, v in pairs(base) do copy[k] = v end
         copy[key] = value
         return copy
     end
-    assertTrue(R.ReminderVisible(base), "the reminder shows for a carried requested item with a usable path")
+    assertTrue(R.ReminderVisible(base), "the reminder shows for a carried requested item with a reminder path")
     assertFalse(R.ReminderVisible(with("remindersEnabled", false)), "the personal setting hides the reminder")
     assertFalse(R.ReminderVisible(with("windowAllowed", false)), "a hidden Loot Helper window hides the reminder")
-    assertFalse(R.ReminderVisible(with("dismissed", true)), "a session dismissal hides the reminder")
     assertFalse(R.ReminderVisible(with("carriesRequested", false)), "carrying nothing requested hides the reminder")
-    assertFalse(R.ReminderVisible(with("hasActionablePath", false)), "no usable guild bank path hides the reminder")
+    assertFalse(R.ReminderVisible(with("hasReminderPath", false)), "no reminder path hides the reminder")
     assertFalse(R.ReminderVisible(nil), "missing reminder input hides the reminder")
     assertTrue(R.ReminderVisible(with("isCrafter", true)), "a legacy crafter flag has no effect on reminders")
-    local snapshot = with("dismissed", false)
+    assertEq(base.dismissed, nil, "reminder rules no longer carry a dismissed field")
+    local snapshot = with("hasReminderPath", true)
     for _ = 1, 100 do R.ReminderVisible(snapshot) end
-    assertEq(snapshot.dismissed, false, "evaluating the reminder does not mutate its input")
+    assertEq(snapshot.hasReminderPath, true, "evaluating the reminder does not mutate its input")
 end
 
 -- ---------------------------------------------------------------------------
@@ -1565,7 +1632,7 @@ local function checkRuntimeReminder()
     assertEq(RT:MobileSpell(), "Mobile Banking", "MobileSpell uses C_SpellBook.IsSpellKnown on Retail")
 
     RT:RefreshReminder()
-    assertTrue(lastReminder(), "outside raid with no session, closed bank, and known Mobile Banking shows the reminder")
+    assertTrue(lastReminder(), "eligible reminder + ready Mobile Banking shows the banner")
     local mobile = lastReminderMobile()
     assertTrue(mobile ~= nil and mobile.visible, "the reminder exposes a Mobile Banking action")
     assertEq(mobile.spell, "Mobile Banking", "the banner Mobile Banking action uses the spell name")
@@ -1574,10 +1641,24 @@ local function checkRuntimeReminder()
     assertTrue(RT.bannerMobileButton ~= nil, "the banner creates a secure Mobile Banking button")
     assertTrue(contains(RT.bannerMobileButton.template or "", "SecureActionButtonTemplate"),
         "the banner Mobile Banking button uses SecureActionButtonTemplate")
+    assertFalse(contains(RT.bannerMobileButton.template or "", "UIPanelButtonTemplate"),
+        "the banner Mobile Banking control is a compact icon, not a full panel button")
     assertEq(RT.bannerMobileButton.attributes.type, "spell", "the banner button is a secure spell action")
     assertEq(RT.bannerMobileButton.attributes.spell, "Mobile Banking", "the banner button casts Mobile Banking")
     assertTrue(RT.bannerMobileButton.enabled, "the banner Mobile Banking button is enabled when ready")
+    assertTrue(RT.bannerMobileButton.Icon ~= nil, "the banner button uses the spell icon texture")
+    assertEq(RT.bannerMobileButton.Icon.texture, "Interface\\Icons\\INV_Misc_BagCoin_07",
+        "the banner icon uses the Mobile Banking spell texture")
+    assertTrue(RT.bannerMobileButton.Cooldown ~= nil, "the banner button has a cooldown frame")
+    assertEq(reminderCalls[#reminderCalls].onDismiss, nil, "the banner no longer exposes a Dismiss callback")
+    assertEq(reminderCalls[#reminderCalls].onOpen, nil, "the banner no longer exposes a Review callback")
+    assertEq(RT.dismissed, nil, "session dismissal state is removed from the runtime")
     assertEq(#(window.hooks.OnShow or {}), 1, "the reminder hooks the window OnShow once")
+
+    RT.bannerMobileButton.scripts.OnEnter(RT.bannerMobileButton)
+    assertTrue(GameTooltip.shown, "hovering the icon shows a tooltip")
+    assertEq(GameTooltip.spellId, 83958, "the tooltip identifies Mobile Banking by spell id")
+    RT.bannerMobileButton.scripts.OnLeave()
 
     SF.SettingsStore.values["lootHelper.showRaidSupplyReminders"] = false
     RT:RefreshReminder()
@@ -1591,27 +1672,35 @@ local function checkRuntimeReminder()
     world.mobileCooldownStart = GetTime()
     world.mobileCooldownDuration = 30
     RT:RefreshReminder()
-    assertFalse(lastReminder(), "Mobile Banking on cooldown hides the reminder when the bank is closed")
+    assertTrue(lastReminder(), "Mobile Banking on cooldown keeps an otherwise-eligible reminder visible")
+    mobile = lastReminderMobile()
+    assertTrue(mobile ~= nil and mobile.onCooldown, "cooldown leaves the banner icon in the cooldown state")
+    assertFalse(RT:Collect().usable, "Mobile Banking on cooldown is still not a usable deposit path")
+    assertEq(#RT:Collect().plan.lines, 0, "cooldown does not populate a donation plan")
+    assertFalse(RT.bannerMobileButton.enabled, "the cooldown icon is not clickable as a ready spell")
+    assertTrue(RT.bannerMobileButton.Icon.desaturated, "the cooldown icon is desaturated")
+    assertEq(RT.bannerMobileButton.Cooldown.cooldownDuration, 30, "readable cooldown timing drives the swipe")
     assertEq(#liveTimers(), 1, "cooldown arms one bounded expiry refresh")
     world.mobileCooldown = false
     assertEq(fireTimers(), 1, "the expiry timer fires once")
-    assertTrue(lastReminder(), "the expiry refresh shows the reminder when Mobile Banking becomes ready")
+    assertTrue(lastReminder(), "the expiry refresh keeps the reminder when Mobile Banking becomes ready")
+    assertFalse(lastReminderMobile().onCooldown, "the expiry refresh restores the ready icon")
     assertEq(#liveTimers(), 0, "the expiry timer does not reschedule when Mobile Banking is ready")
 
     world.mobileCooldown = true
     world.mobileCooldownStart = GetTime()
     RT:RefreshReminder()
-    assertFalse(lastReminder(), "cooldown again hides the reminder")
+    assertTrue(lastReminder(), "cooldown again keeps the reminder visible")
     assertEq(#liveTimers(), 1, "SPELL_UPDATE_COOLDOWN path can re-arm an expiry watch")
     RT:OnEvent("SPELL_UPDATE_COOLDOWN", 83958)
     assertEq(#liveTimers(), 1, "SPELL_UPDATE_COOLDOWN replaces rather than stacks expiry watches")
     world.mobileCooldown = false
     fireTimers()
-    assertTrue(lastReminder(), "SPELL_UPDATE_COOLDOWN-armed expiry still restores the reminder")
+    assertTrue(lastReminder(), "SPELL_UPDATE_COOLDOWN-armed expiry still restores the ready icon")
 
     world.mobileKnown = false
     RT:RefreshReminder()
-    assertFalse(lastReminder(), "without a usable guild bank path the reminder is hidden")
+    assertFalse(lastReminder(), "without Mobile Banking and with the bank closed the reminder is hidden")
     assertEq(lastReminderMobile(), nil, "without Mobile Banking the banner omits the Mobile Banking action")
     world.mobileKnown = true
 
@@ -1634,8 +1723,8 @@ local function checkRuntimeReminder()
     world.bankOpen = false
 
     RT:RefreshReminder()
-    assertTrue(lastReminder(), "the reminder is visible before dismissal")
-    assertTrue(RT.bannerMobileButton:IsShown(), "the banner Mobile Banking button is shown before dismissal")
+    assertTrue(lastReminder(), "the reminder is visible with ready Mobile Banking")
+    assertTrue(RT.bannerMobileButton:IsShown(), "the banner Mobile Banking button is shown")
 
     window.__sfMinimized = true
     RT:RefreshReminder()
@@ -1665,16 +1754,6 @@ local function checkRuntimeReminder()
     window:Show()
     RT:RefreshReminder()
 
-    assertTrue(lastReminder(), "the reminder is visible before dismissal")
-    reminderCalls[#reminderCalls].onDismiss()
-    assertTrue(RT.dismissed, "dismissing marks the reminder dismissed for the session")
-    assertFalse(lastReminder(), "dismissing hides the reminder immediately")
-    RT:OnProfileChanged(p)
-    RT:RefreshReminder()
-    assertFalse(lastReminder(), "the dismissal lasts for the session")
-    assertEq(SF.SettingsStore.values["lootHelper.showRaidSupplyReminders"], true, "dismissal does not change the saved setting")
-
-    RT.dismissed = false
     world.timers = {}
     local frames = frameCount
     local calls = #reminderCalls
@@ -1685,10 +1764,172 @@ local function checkRuntimeReminder()
     assertEq(frameCount, frames, "repeated refreshes allocate no frames")
     assertEq(#world.after, 0, "repeated refreshes schedule no deferred work")
     assertEq(#liveTimers(), 0, "repeated refreshes create no live timers")
+    assertEq(RT.bannerBankNav, nil, "repeated refreshes do not accumulate pending navigation")
 
     window.hooks.OnHide[1]()
     assertFalse(RT.reminderShown, "hiding the window clears the reminder state")
     assertFalse(RT.bannerMobileButton:IsShown(), "hiding the window hides the banner Mobile Banking button")
+    unchanged(p, "runtime reminder")
+end
+
+local function checkRuntimeBannerBankNavigation()
+    local p = runtimeFixture("rt-banner-nav")
+    world.mobileKnown = true
+    world.currentTab = 1
+    RT:RefreshReminder()
+    assertTrue(lastReminder(), "banner navigation fixture starts with a visible reminder")
+    assertTrue(RT.bannerMobileButton ~= nil, "banner navigation fixture has a secure button")
+
+    -- Ready icon click records a short-lived navigation intent.
+    RT.bannerMobileButton.scripts.PreClick()
+    assertTrue(RT.bannerBankNav ~= nil, "clicking the banner Mobile Banking action records pending navigation")
+    assertEq(RT.bannerBankNav.profileId, p._profileId, "pending navigation captures the profile id")
+    assertEq(RT.bannerBankNav.guildGuid, "club-1", "pending navigation captures the configured guild")
+    assertEq(RT.bannerBankNav.bankTab, 2, "pending navigation captures the configured tab")
+    assertEq(RT.bannerBankNav.configSeq, p._consumables.configSeq, "pending navigation captures configSeq")
+    assertEq(#liveTimers(), 1, "pending navigation arms one bounded expiry timer")
+
+    world.bankOpen = true
+    world.tabSelects = {}
+    world.tabQueries = {}
+    RT:OnBankOpened()
+    assertEq(#world.tabSelects, 1, "banner-initiated Guild Bank open selects the configured tab once")
+    assertEq(world.tabSelects[1], 2, "banner-initiated open selects the configured Raid Consumables tab")
+    assertEq(#world.tabQueries, 1, "selecting the configured tab queries that tab")
+    assertEq(world.currentTab, 2, "GetCurrentGuildBankTab reflects the configured tab")
+    assertEq(RT.bannerBankNav, nil, "successful navigation consumes the pending intent")
+    assertTrue(RT.review ~= nil and RT.review:IsShown(),
+        "existing auto-review can open after banner navigation lands on the configured tab")
+
+    -- Duplicate open signals must remain idempotent.
+    local selectsAfterFirst = #world.tabSelects
+    RT:OnEvent("GUILDBANKFRAME_OPENED")
+    RT:OnEvent("PLAYER_INTERACTION_MANAGER_FRAME_SHOW", Enum.PlayerInteractionType.GuildBanker)
+    assertEq(#world.tabSelects, selectsAfterFirst, "duplicate Guild Bank open signals do not select again")
+    assertEq(RT.bannerBankNav, nil, "duplicate opens do not recreate pending navigation")
+
+    RT:OnBankClosed()
+    world.bankOpen = false
+    if RT.review then RT.review:Hide() end
+    RT.autoReviewedThisOpen = false
+    world.currentTab = 1
+    world.tabSelects = {}
+    world.timers = {}
+
+    -- Manual Guild Bank opening never auto-selects the Consumables tab.
+    world.bankOpen = true
+    RT:OnBankOpened()
+    assertEq(#world.tabSelects, 0, "a normal/manual Guild Bank opening does not force the configured tab")
+    assertEq(world.currentTab, 1, "manual open leaves the player's current tab alone")
+    RT:OnBankClosed()
+    world.bankOpen = false
+    if RT.review then RT.review:Hide() end
+
+    -- Failed/no bank opening must not leak pending navigation into a later visit.
+    world.currentTab = 1
+    world.tabSelects = {}
+    world.timers = {}
+    RT:RefreshReminder()
+    RT.bannerMobileButton.scripts.PreClick()
+    assertTrue(RT.bannerBankNav ~= nil, "a second banner click recreates pending navigation")
+    assertEq(fireTimers(), 1, "pending navigation expires when the bank never opens")
+    assertEq(RT.bannerBankNav, nil, "expired navigation clears the pending intent")
+    world.bankOpen = true
+    RT:OnBankOpened()
+    assertEq(#world.tabSelects, 0, "a later manual open after expiry does not select the configured tab")
+    RT:OnBankClosed()
+    world.bankOpen = false
+    if RT.review then RT.review:Hide() end
+
+    -- Profile/config/tab/guild changing between click and open cancels navigation.
+    world.currentTab = 1
+    world.tabSelects = {}
+    world.timers = {}
+    RT:RefreshReminder()
+    RT.bannerMobileButton.scripts.PreClick()
+    assertTrue(RT.bannerBankNav ~= nil, "navigation pending before a configuration change")
+    assertTrue(select(1, C.SetBankTab(p, admin, 3)), "admin can change the configured tab after the click")
+    world.bankOpen = true
+    RT:OnBankOpened()
+    assertEq(#world.tabSelects, 0, "a changed bank tab cancels banner navigation")
+    assertEq(RT.bannerBankNav, nil, "identity mismatch consumes/clears pending navigation")
+    RT:OnBankClosed()
+    world.bankOpen = false
+    if RT.review then RT.review:Hide() end
+    assertTrue(select(1, C.SetBankTab(p, admin, 2)), "restore the configured tab for later cases")
+
+    world.currentTab = 1
+    world.tabSelects = {}
+    world.timers = {}
+    RT:RefreshReminder()
+    RT.bannerMobileButton.scripts.PreClick()
+    world.clubId = "club-other"
+    world.bankOpen = true
+    RT:OnBankOpened()
+    assertEq(#world.tabSelects, 0, "a guild mismatch cancels banner navigation")
+    assertEq(RT.bannerBankNav, nil, "wrong-guild open clears pending navigation")
+    world.clubId = "club-1"
+    RT:OnBankClosed()
+    world.bankOpen = false
+    if RT.review then RT.review:Hide() end
+
+    -- Invalid/non-viewable configured tab fails safely.
+    world.currentTab = 1
+    world.tabSelects = {}
+    world.timers = {}
+    world.tabViewable[2] = false
+    RT:RefreshReminder()
+    RT.bannerMobileButton.scripts.PreClick()
+    world.bankOpen = true
+    RT:OnBankOpened()
+    assertEq(#world.tabSelects, 0, "a non-viewable configured tab is not selected")
+    assertEq(RT.bannerBankNav, nil, "non-viewable tab still clears pending navigation")
+    world.tabViewable[2] = nil
+    RT:OnBankClosed()
+    world.bankOpen = false
+    if RT.review then RT.review:Hide() end
+
+    -- Profile change cancels pending navigation immediately.
+    world.timers = {}
+    RT:RefreshReminder()
+    RT.bannerMobileButton.scripts.PreClick()
+    assertTrue(RT.bannerBankNav ~= nil, "navigation pending before profile change")
+    local other = configured("rt-banner-nav-other")
+    SF.lootHelperDB.profiles[other._profileId] = other
+    RT:OnProfileChanged(other)
+    assertEq(RT.bannerBankNav, nil, "profile change cancels pending banner navigation")
+
+    -- Cooldown PreClick must not create navigation.
+    world.activeProfile = p
+    RT:OnProfileChanged(p)
+    world.mobileCooldown = true
+    world.mobileCooldownStart = GetTime()
+    world.mobileCooldownDuration = 30
+    world.timers = {}
+    RT:RefreshReminder()
+    assertTrue(lastReminderMobile().onCooldown, "cooldown icon is present for PreClick guard")
+    RT.bannerMobileButton.scripts.PreClick()
+    assertEq(RT.bannerBankNav, nil, "cooldown PreClick does not create pending navigation")
+    world.mobileCooldown = false
+
+    -- Repeated open/close cycles converge without growing pending state or frames.
+    world.timers = {}
+    world.tabSelects = {}
+    local frames = frameCount
+    for _ = 1, 20 do
+        RT:RefreshReminder()
+        RT.bannerMobileButton.scripts.PreClick()
+        world.currentTab = 1
+        world.bankOpen = true
+        RT:OnBankOpened()
+        RT:OnBankClosed()
+        world.bankOpen = false
+        if RT.review then RT.review:Hide() end
+    end
+    assertEq(RT.bannerBankNav, nil, "repeated banner open cycles leave no pending navigation")
+    assertEq(frameCount, frames, "repeated banner navigation cycles allocate no frames")
+    assertEq(#liveTimers(), 0, "repeated banner navigation cycles leave no live timers")
+    unchanged(p, "runtime banner bank navigation")
 end
 
 -- Regression (#350): ConsumablesRuntime may initialize before Loot Helper creates
@@ -2332,6 +2573,7 @@ checkSessionTransport()
 checkQueuedResendProtection()
 checkRuntimeInventory()
 checkRuntimeReminder()
+checkRuntimeBannerBankNavigation()
 checkRuntimeReminderLifecycleAttach()
 checkRuntimeMobileSpellDetection()
 checkRuntimeReview()
