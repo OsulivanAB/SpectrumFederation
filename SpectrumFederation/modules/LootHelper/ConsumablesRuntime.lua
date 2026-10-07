@@ -701,6 +701,16 @@ function Runtime:WatchWindow()
         self.reminderShown = false
         self:SyncBannerMobileButton(nil)
     end)
+    local title = frame.Title
+    if title and title.HookScript then
+        title:HookScript("OnDragStop", function()
+            if InCombat() then
+                self.bannerMobilePending = true
+                return
+            end
+            self:PlaceBannerMobileHolder()
+        end)
+    end
 end
 
 function Runtime:BannerMobileAnchor()
