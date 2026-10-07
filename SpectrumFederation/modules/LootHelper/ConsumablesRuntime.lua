@@ -1125,8 +1125,7 @@ function Runtime:EnsureReview()
     local title = frame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
     title:SetPoint("TOP", frame, "TOP", 0, -16)
     title:SetText("Raid supplies")
-    local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
-    close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -4, -4)
+    -- No X/close control: visibility follows Guild Bank + configured-tab lifecycle.
     local status = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     status:SetPoint("TOPLEFT", frame, "TOPLEFT", 18, -42)
     status:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -18, -42)
@@ -1864,23 +1863,53 @@ function Runtime:CursorItemId()
     return tonumber(itemId) or (C and C.ItemIdFromText(link))
 end
 
+function Runtime:HideReviewForBankLifecycle()
+    if self.review and self.review.IsShown and self.review:IsShown() then
+        self.review:Hide()
+    end
+end
+
+function Runtime:IsConfiguredBankTabActive()
+    local C = SF.Consumables
+    local profile = self:AccountingProfile()
+    if not C or not profile then return false end
+    local cfg = C.Ensure(profile)
+    return self:ConfiguredBankTabReady(cfg) and true or false
+end
+
+-- Keep the standalone Raid Supplies window aligned with Guild Bank open/close
+-- and the configured deposit tab. Leaving the configured tab is lifecycle hide,
+-- not user dismissal, so auto-review may run again when that tab returns.
+function Runtime:SyncReviewWithGuildBank()
+    if not self.bankOpen then
+        self:HideReviewForBankLifecycle()
+        return
+    end
+    if not self:IsConfiguredBankTabActive() then
+        self:HideReviewForBankLifecycle()
+        self.autoReviewedThisOpen = false
+        return
+    end
+    self:MaybeAutoReview()
+    if self.review and self.review.IsShown and self.review:IsShown() then
+        self:RebuildReview()
+    end
+end
+
 function Runtime:OnBankOpened()
     local first = not self.bankOpen
     self.bankOpen = true
     if first then
         self.autoReviewedThisOpen = false
-        -- Banner-initiated tab selection must run before MaybeAutoReview so
-        -- BankAccess can see the configured tab as usable when appropriate.
+        -- Banner-initiated tab selection must run before SyncReviewWithGuildBank
+        -- so BankAccess can see the configured tab as usable when appropriate.
         self:ConsumeBannerBankNavigation()
-        self:MaybeAutoReview()
     elseif self.bannerBankNav then
         -- Duplicate open signal while already open: never select twice.
         self:CancelBannerBankNavigation("duplicate_open")
     end
     self:RefreshReminder()
-    if self.review and self.review:IsShown() then
-        self:RebuildReview()
-    end
+    self:SyncReviewWithGuildBank()
 end
 
 function Runtime:OnBankClosed()
@@ -1897,6 +1926,7 @@ function Runtime:OnBankClosed()
         end
     end
     self.bankOpen = false
+    self:HideReviewForBankLifecycle()
     self:RefreshReminder()
 end
 
@@ -1951,9 +1981,8 @@ function Runtime:OnEvent(event, arg1)
             self.reviewRefreshPending = nil
             self:RefreshReminder()
             if self.bankOpen then
-                self:MaybeAutoReview()
-            end
-            if self.review and self.review:IsShown() then
+                self:SyncReviewWithGuildBank()
+            elseif self.review and self.review:IsShown() then
                 self:RebuildReview()
             end
         elseif self.bannerMobilePending or self.reminderShown then
@@ -1979,7 +2008,9 @@ function Runtime:OnEvent(event, arg1)
             return
         end
         self:RefreshReminder()
-        if self.review and self.review:IsShown() then
+        if self.bankOpen then
+            self:SyncReviewWithGuildBank()
+        elseif self.review and self.review:IsShown() then
             self:RebuildReview()
         end
     elseif event == "SPELL_UPDATE_COOLDOWN" then
@@ -2025,14 +2056,19 @@ function Runtime:OnEvent(event, arg1)
             if verified > (tonumber(work.bestActual) or 0) then work.bestActual = verified end
         elseif self.depositIntent then
             self:FinishDeposit(false)
-        else
-            self:RefreshReminder()
-            if self.bankOpen then
-                self:MaybeAutoReview()
-            end
-            if self.review and self.review:IsShown() then
-                self:RebuildReview()
-            end
+        end
+        -- Always resync after deposit bookkeeping. Tab changes during an
+        -- in-flight deposit or confirmation intent still take this event, and
+        -- skipping lifecycle sync can leave the review visible on the wrong tab.
+        if InCombat() then
+            self.reviewRefreshPending = true
+            return
+        end
+        self:RefreshReminder()
+        if self.bankOpen then
+            self:SyncReviewWithGuildBank()
+        elseif self.review and self.review:IsShown() then
+            self:RebuildReview()
         end
     end
 end
@@ -2076,9 +2112,8 @@ function Runtime:Init()
                 end
                 self:RefreshReminder()
                 if self.bankOpen then
-                    self:MaybeAutoReview()
-                end
-                if self.review and self.review.IsShown and self.review:IsShown() then
+                    self:SyncReviewWithGuildBank()
+                elseif self.review and self.review.IsShown and self.review:IsShown() then
                     self:RebuildReview()
                 end
             end

@@ -294,6 +294,7 @@ local function fireTimers()
 end
 
 local frameCount = 0
+local createdFrames = {}
 local FrameMethods = {}
 local function FrameMock(kind, parent)
     frameCount = frameCount + 1
@@ -358,6 +359,7 @@ function CreateFrame(kind, name, parent, template)
     local frame = FrameMock(kind, parent)
     frame.name = name
     frame.template = template
+    createdFrames[#createdFrames + 1] = frame
     return frame
 end
 UIParent = FrameMock("Frame")
@@ -2086,6 +2088,140 @@ local function checkRuntimeReview()
     unchanged(p, "runtime review")
 end
 
+local function countCloseButtons(parent)
+    local count = 0
+    for i = 1, #createdFrames do
+        local frame = createdFrames[i]
+        if frame.parent == parent and type(frame.template) == "string"
+            and frame.template:find("UIPanelCloseButton", 1, true) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function checkRuntimeReviewGuildBankLifecycle()
+    local p = runtimeFixture("rt-review-lifecycle")
+    world.bankOpen = true
+    world.currentTab = 2
+    RT:OnBankOpened()
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(),
+        "configured-tab open shows the Raid Supplies window when eligible")
+    assertEq(countCloseButtons(review), 0,
+        "the standalone Raid Supplies window has no X/close control")
+
+    -- Configured tab → other tab → hide (lifecycle, not dismissal).
+    world.currentTab = 1
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertFalse(review:IsShown(),
+        "leaving the configured tab hides the Raid Supplies window")
+    assertFalse(RT.autoReviewedThisOpen,
+        "leaving the configured tab clears the auto-review latch")
+
+    -- Other tab → configured tab → show again when eligible.
+    world.currentTab = 2
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(review:IsShown(),
+        "returning to the configured tab shows the window again when eligible")
+    assertTrue(RT.autoReviewedThisOpen,
+        "returning to the configured tab re-latches auto-review for this visit")
+
+    -- Final supplies deposited while staying on the configured tab → empty state stays.
+    world.bags[0][1].count = 0
+    world.bags[0][2].count = 0
+    RT:OnEvent("BAG_UPDATE_DELAYED")
+    assertTrue(review:IsShown(),
+        "depositing the final supplies while on the configured tab keeps the window open")
+    assertEq(review.Rows[1].Text.text, "No raid supplies to deposit.",
+        "the already-open window keeps the empty deposit state")
+
+    -- Empty window must not auto-appear when it was not already open.
+    review:Hide()
+    RT.autoReviewedThisOpen = false
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertFalse(review:IsShown(),
+        "an empty review does not auto-open when nothing is eligible to deposit")
+
+    -- Restore carried supplies for remaining lifecycle checks.
+    world.bags[0][1] = { itemId = aqirite, count = 20 }
+    world.bags[0][2] = { itemId = aqirite, count = 5 }
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(review:IsShown(),
+        "eligible supplies on the configured tab can open the window again")
+
+    -- Guild Bank close → window hidden.
+    RT:OnBankClosed()
+    world.bankOpen = false
+    assertFalse(review:IsShown(),
+        "closing the Guild Bank hides the Raid Supplies window")
+
+    -- Reopen → behavior works again.
+    world.bankOpen = true
+    world.currentTab = 2
+    RT:OnBankOpened()
+    assertTrue(review:IsShown(),
+        "reopening the Guild Bank on the configured tab can show the window again")
+
+    -- Open on a non-configured tab does not show the window.
+    RT:OnBankClosed()
+    world.bankOpen = false
+    world.currentTab = 1
+    world.bankOpen = true
+    RT:OnBankOpened()
+    assertFalse(review:IsShown(),
+        "opening on a non-configured tab does not show the Raid Supplies window")
+
+    -- Repeated open/close and tab-switch cycles remain bounded.
+    local frames = frameCount
+    local afterN = #world.after
+    local timersN = #liveTimers()
+    local reviewRef = RT.review
+    for _ = 1, 40 do
+        world.currentTab = 2
+        world.bankOpen = true
+        RT:OnBankOpened()
+        world.currentTab = 1
+        RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+        RT:OnBankClosed()
+        world.bankOpen = false
+    end
+    assertEq(frameCount, frames,
+        "repeated Guild Bank open/close and tab cycles allocate no new frames")
+    assertEq(#world.after, afterN,
+        "repeated Guild Bank lifecycle cycles schedule no deferred work")
+    assertEq(#liveTimers(), timersN,
+        "repeated Guild Bank lifecycle cycles create no live timers")
+    assertTrue(RT.review == reviewRef,
+        "repeated Guild Bank lifecycle cycles reuse the same review frame")
+    assertEq(RT.bannerBankNav, nil,
+        "repeated Guild Bank lifecycle cycles do not accumulate pending navigation")
+
+    -- #354 banner → Mobile Banking → configured tab → existing auto-review remains intact.
+    world.mobileKnown = true
+    world.currentTab = 1
+    world.tabSelects = {}
+    world.tabQueries = {}
+    world.timers = {}
+    world.bags[0][1] = { itemId = aqirite, count = 20 }
+    world.bags[0][2] = { itemId = aqirite, count = 5 }
+    RT:RefreshReminder()
+    assertTrue(RT.bannerMobileButton ~= nil, "lifecycle fixture exposes the banner Mobile Banking button")
+    RT.bannerMobileButton.scripts.PreClick()
+    assertTrue(RT.bannerBankNav ~= nil, "banner Mobile Banking records pending navigation")
+    world.bankOpen = true
+    RT:OnBankOpened()
+    assertEq(#world.tabSelects, 1, "banner-initiated open still selects the configured tab once")
+    assertEq(world.tabSelects[1], 2, "banner-initiated open still selects the Raid Consumables tab")
+    assertEq(world.currentTab, 2, "banner navigation still lands on the configured tab")
+    assertEq(RT.bannerBankNav, nil, "banner navigation is still consumed before auto-review")
+    assertTrue(review:IsShown(),
+        "banner → Mobile Banking → configured tab still triggers the existing Raid Supplies window")
+    RT:OnBankClosed()
+    world.bankOpen = false
+    unchanged(p, "runtime review guild bank lifecycle")
+end
+
 local function startDeposit(line)
     local collected = RT:Collect()
     RT:BeginDeposit(line or collected.plan.lines[1], collected)
@@ -2096,6 +2232,56 @@ local function placedTabs()
     local tabs = {}
     for i = 1, #world.places do tabs[world.places[i].tab] = true end
     return tabs
+end
+
+local function checkRuntimeReviewDepositTabSwitch()
+    local p = runtimeFixture("rt-review-deposit-tab")
+    world.bankOpen = true
+    world.currentTab = 2
+    RT:OnBankOpened()
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(),
+        "deposit tab-switch fixture starts with a visible Raid Supplies window")
+
+    -- Active depositWork: GUILDBANKBAGSLOTS_CHANGED must still lifecycle-sync.
+    startDeposit()
+    assertTrue(RT.depositWork ~= nil, "deposit work is active before the mid-deposit tab change")
+    world.currentTab = 1
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertFalse(review:IsShown(),
+        "leaving the configured tab during depositWork hides the Raid Supplies window")
+    assertFalse(RT.autoReviewedThisOpen,
+        "leaving the configured tab during depositWork clears the auto-review latch")
+
+    RT:CancelDepositWork()
+    RT.depositIntent = nil
+    world.after = {}
+    world.places = {}
+    world.currentTab = 2
+    world.bags[0][1] = { itemId = aqirite, count = 20 }
+    world.bags[0][2] = { itemId = aqirite, count = 5 }
+    world.bank[2] = { [1] = { itemId = aqirite, count = 18 } }
+    RT.autoReviewedThisOpen = false
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(review:IsShown(),
+        "returning to the configured tab after a mid-deposit leave can show the window again")
+
+    -- Confirmation intent: FinishDeposit bookkeeping must still be followed by sync.
+    startDeposit()
+    drainAfter(32)
+    assertTrue(RT.depositIntent ~= nil, "deposit settles into a confirmation intent")
+    assertEq(RT.depositWork, nil, "deposit work is cleared before confirmation")
+    assertTrue(review:IsShown(), "confirmation intent keeps the review visible on the configured tab")
+    world.currentTab = 1
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertFalse(review:IsShown(),
+        "leaving the configured tab while awaiting deposit confirmation hides the Raid Supplies window")
+    assertFalse(RT.autoReviewedThisOpen,
+        "leaving the configured tab during depositIntent clears the auto-review latch")
+
+    RT:OnBankClosed()
+    world.bankOpen = false
+    unchanged(p, "runtime review deposit tab switch")
 end
 
 local function checkRuntimeDeposit()
@@ -2577,6 +2763,8 @@ checkRuntimeBannerBankNavigation()
 checkRuntimeReminderLifecycleAttach()
 checkRuntimeMobileSpellDetection()
 checkRuntimeReview()
+checkRuntimeReviewGuildBankLifecycle()
+checkRuntimeReviewDepositTabSwitch()
 checkRuntimeDeposit()
 checkStaleDepositReview()
 checkOccupiedDepositCursor()
