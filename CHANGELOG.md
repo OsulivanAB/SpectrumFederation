@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.8] - 2026-10-07
+
+### Fixed
+- Fix Raid Supplies Guild Bank window lifecycle (#344)
+
 ## [1.5.8-beta.7] - 2026-10-07
 
 ### Changed
