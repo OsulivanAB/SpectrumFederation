@@ -28,8 +28,11 @@ Review scope and coverage rules stay in `.github/codex-review-guidance.md`.
 Preserve repository tool permissions: prefer `ManagePullRequest` for authorized
 GitHub writes. If it is unavailable, use the equivalent GitHub connector tool
 for the same authorized action (for example, `reply_to_review_comment` or
-`resolve_review_thread`). Never use `gh` for writes, and never merge unless
-separately and explicitly authorized.
+`resolve_review_thread`). Never use `gh` for writes except the narrowly scoped
+Issue ↔ PR Development-linking fallback in root `AGENTS.md` (**Issue-backed PR
+Development linking**) when normal tooling cannot create that relationship and
+an owner-provided `GH_TOKEN` is available. Never merge unless separately and
+explicitly authorized.
 
 ## Governing policy source
 
