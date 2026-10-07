@@ -70,6 +70,9 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "ScheduleMobileCooldownWatch" in runtime
     assert "ConsumeBannerBankNavigation" in runtime
     assert "BeginBannerBankNavigation" in runtime
+    assert "SyncReviewWithGuildBank" in runtime
+    assert "HideReviewForBankLifecycle" in runtime
+    assert "UIPanelCloseButton" not in runtime
     assert "HasReminderPath" in (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "ConsumablesRouting.lua"
     ).read_text(encoding="utf-8")
