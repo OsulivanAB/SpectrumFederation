@@ -76,13 +76,6 @@ function Runtime:AccountingProfile()
             activeId = active._profileId
         end
     end
-    if activeId ~= state.profileId then
-        local key = tostring(state.sessionId or "") .. ":" .. state.profileId
-        if self._sessionProfileNotice ~= key then
-            self._sessionProfileNotice = key
-            Info("Raid supplies in this session are recorded on the session profile.")
-        end
-    end
     return sessionProfile
 end
 

@@ -540,12 +540,8 @@ function Controller:OnPlayClicked()
                 return
             end
             local ok = SF.LootHelperSync:EndSession("manual")
-            if SF.PrintSuccess and SF.PrintError then
-                if ok then
-                    SF:PrintSuccess("Session ended successfully")
-                else
-                    SF:PrintError("Failed to end session (no active session?)")
-                end
+            if not ok and SF.PrintError then
+                SF:PrintError("Failed to end session (no active session?)")
             end
             self:RequestRefresh("PlayButtonEndSession")
         end)
@@ -578,12 +574,8 @@ function Controller:OnPlayClicked()
             return
         end
         local sessionId = SF.LootHelperSync:StartSession(profileId)
-        if SF.PrintSuccess and SF.PrintError then
-            if sessionId then
-                SF:PrintSuccess("Session started successfully")
-            else
-                SF:PrintError("Failed to start session (not in a group/raid?)")
-            end
+        if not sessionId and SF.PrintError then
+            SF:PrintError("Failed to start session (not in a group/raid?)")
         end
         self:RequestRefresh("PlayButtonStartSession")
     end)

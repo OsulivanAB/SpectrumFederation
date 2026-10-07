@@ -129,17 +129,6 @@ local function GetAddonVersion()
     return "unknown"
 end
 
--- Function to print a warning message
--- @param msg string Message to print
--- @return none
-local function PrintWarning(msg)
-    if SF.PrintWarning then
-        SF:PrintWarning(msg)
-    else
-        print(addonName .. ": WARNING: " .. msg)
-    end
-end
-
 -- Function to log a Debug warning message
 -- @param fmt string Format string
 -- @param ... any Format arguments
@@ -369,7 +358,7 @@ function P.BuildProtoNackPayload(seenProto, msgType)
     }
 end
 
--- Function Handle an unsupported protocol version event (local warn + return an optional NACK envelope)
+-- Function Handle an unsupported protocol version event (debug + return an optional NACK envelope)
 -- IMPORTANT: This does not send anything; it just returns the envelope string so transport can whisper it.
 -- @param sender string Sender name
 -- @param seenProto number Protocol version seen
@@ -379,8 +368,8 @@ function P.OnUnsupportedProto(sender, seenProto, seenType)
     DebugWarn("Unsupported proto from %s: type=%s proto=%s", tostring(sender), tostring(seenType), tostring(seenProto))
 
     if P.ShouldWarn(sender, WarningSignature("unsupported", seenProto)) then
-        PrintWarning(("Sync: %s is using unsupported protocol %s (this client supports %d..%d). Ask them to update."):
-            format(tostring(sender), tostring(seenProto), P.PROTO_MIN, P.PROTO_MAX))
+        DebugWarn("Sync: %s is using unsupported protocol %s (this client supports %d..%d). Ask them to update.",
+            tostring(sender), tostring(seenProto), P.PROTO_MIN, P.PROTO_MAX)
     end
 
     if not P.ShouldNack(sender) then
@@ -397,8 +386,8 @@ function P.OnUnsupportedProto(sender, seenProto, seenType)
     return P.PackEnvelope(P.MSG_PROTO_NACK, P.PROTO_CURRENT, P.ENC_B64CBOR, b64)
 end
 
--- Function Handle receiving a PROTO_NACK (print once per sender + incompatibility).
--- Repeat NACKs from mixed-version raid traffic stay in debug logs.
+-- Function Handle receiving a PROTO_NACK (debug once per sender + incompatibility).
+-- Repeat NACKs from mixed-version raid traffic stay suppressed in debug logs.
 -- @param sender string Sender name
 -- @param payload table|nil Decoded payload table
 -- @return nil
@@ -415,6 +404,6 @@ function P.OnProtoNack(sender, payload)
         return
     end
 
-    PrintWarning(("Sync: %s says our protocol/version is incompatible (they saw proto=%s; they support %s..%s; addon ver=%s)."):
-        format(tostring(sender), tostring(theirs), tostring(minV), tostring(maxV), tostring(ver)))
+    DebugWarn("Sync: %s says our protocol/version is incompatible (they saw proto=%s; they support %s..%s; addon ver=%s).",
+        tostring(sender), tostring(theirs), tostring(minV), tostring(maxV), tostring(ver))
 end

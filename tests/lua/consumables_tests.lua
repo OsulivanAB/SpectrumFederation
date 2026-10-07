@@ -2041,6 +2041,32 @@ local function checkCopyConfiguration()
     assertEq(C.ContributionTotal(source, donor, aqirite), 4, "the source keeps its contributions")
 end
 
+local function checkSessionProfileNoticeRemoved()
+    resetWorld()
+    local active = profile("active-profile", admin)
+    local session = profile("session-profile", admin)
+    world.activeProfile = active
+    SF.lootHelperDB.profiles[active._profileId] = active
+    SF.lootHelperDB.profiles[session._profileId] = session
+    Sync.state = {
+        active = true,
+        sessionId = "SES-NOTICE",
+        profileId = session._profileId,
+    }
+    world.infos = {}
+    world.warnings = {}
+    local resolved = RT:AccountingProfile()
+    assertEq(resolved, session, "accounting uses the session profile when it differs from active")
+    for i = 1, #world.infos do
+        assertFalse(
+            contains(world.infos[i], "recorded on the session profile"),
+            "session-profile notice is not printed to chat"
+        )
+    end
+    -- Feature still resolves the session profile on a second call.
+    assertEq(RT:AccountingProfile(), session, "accounting still resolves the session profile without chat notice")
+end
+
 checkGuildConfiguration()
 checkRequestedItems()
 checkApplyOpAndSettingsModel()
@@ -2064,6 +2090,7 @@ checkRuntimeDepositPartialAndFailure()
 checkRuntimeCancelAndDeferredDelete()
 checkClear()
 checkCopyConfiguration()
+checkSessionProfileNoticeRemoved()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))

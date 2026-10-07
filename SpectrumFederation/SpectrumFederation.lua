@@ -51,9 +51,6 @@ EventFrame:SetScript("OnEvent", function(self, event, ...)
             SF.VersionCheck:Enable()
         end
 
-        -- Send a quick message saying that Addon is Initialized
-        SF:PrintSuccess("Online. Type /sf to open settings.")
-
         -- Initialize Slash Commands
         if SF.InitializeSlashCommands then
             SF:InitializeSlashCommands()
