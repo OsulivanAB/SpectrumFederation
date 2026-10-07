@@ -6,13 +6,12 @@ stability and bounded execution are first-class correctness requirements.
 Bugbot is an owner-selected review checkpoint, not a repair agent or automatic
 continuation signal. Run only when explicitly requested through Bugbot's
 manual trigger. Do not apply fixes, invoke another reviewer, or request a
-rerun. Findings and check completion are not repair authorization. When
-findings arrive through an intentionally active Cursor review subscription,
-the Cursor agent may assess and reply under
-`.cursor/skills/pr-review-comments/SKILL.md`; that is subscription triage, not
-Bugbot Autofix. Bugbot Autofix and automatic triggering are external settings
-and should remain off; this file supplies review guidance but cannot enforce
-those settings.
+rerun. Findings and check completion are not repair authorization. Cursor may
+assess Bugbot findings only when the owner explicitly asks for that assessment
+or repair under `.cursor/skills/pr-review-comments/SKILL.md` and
+`.cursor/skills/ai-review-loop/SKILL.md`. That is not Bugbot Autofix. Bugbot
+Autofix and automatic triggering are external settings and should remain off;
+this file supplies review guidance but cannot enforce those settings.
 
 Prioritize real production defects. Do not spend findings on style, naming,
 formatting, cosmetic cleanup, speculative refactors, or unrelated unchanged
