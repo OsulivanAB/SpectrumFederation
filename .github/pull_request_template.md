@@ -34,7 +34,7 @@
 - [ ] My code follows the project's style guidelines
 - [ ] I have added/updated documentation as needed
 - [ ] I have added appropriate Debug Logging if necessary
-- [ ] I have added/updated localization strings in `locale/enUS.lua` if applicable <!-- Check when strings were updated, or when no user-facing addon strings changed. -->
+- [ ] I have added/updated localization strings in `locale/enUS.lua` if applicable <!-- Check only after auditing the diff per SpectrumFederation/AGENTS.md Localization: keys added/updated for new/modified user-facing strings, or no such strings changed. Do not assume. -->
 - [ ] My changes generate no new warnings or errors
 - [ ] Any dependent changes have been merged and published
 - [ ] I've linked this PR to any related issues in the [repo project](https://github.com/users/OsulivanAB/projects/1). <!-- Agents: check only after the formal GitHub Issue ↔ PR Development link exists for an owner-supplied/authoritative issue. See root AGENTS.md "Issue-backed PR Development linking". -->

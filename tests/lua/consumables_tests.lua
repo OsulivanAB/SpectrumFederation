@@ -441,6 +441,8 @@ local function load(path)
     local chunk = assert(loadfile(path))
     chunk("SpectrumFederation", SF)
 end
+-- Locale must load before modules that render localized user-facing text.
+load("SpectrumFederation/locale/enUS.lua")
 load("SpectrumFederation/modules/LootHelper/Consumables.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesRouting.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesWorkflow.lua")
@@ -3067,6 +3069,55 @@ local function checkSessionProfileNoticeRemoved()
     assertEq(RT:AccountingProfile(), session, "accounting still resolves the session profile without chat notice")
 end
 
+local function checkFocusedEditRowReuse()
+    local p = runtimeFixture("rt-focused-row-reuse")
+    assertTrue(select(1, C.AddRequestedItem(p, admin, flask)), "fixture requests a second item")
+    world.bags[0] = {
+        [1] = { itemId = aqirite, count = 10 },
+        [2] = { itemId = flask, count = 8 },
+    }
+    world.bags[5] = {}
+    world.bankOpen = true
+    RT:OnBankOpened()
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(), "helper opens with two requested items")
+    local aqRow = review.Rows[2]
+    assertEq(aqRow.boundItemId, aqirite, "first data row binds aqirite")
+    assertEq(aqRow.Edit.text, "10", "aqirite starts with its suggested quantity")
+    aqRow.Edit:SetText("9")
+    aqRow.Edit:SetFocus()
+    assertTrue(aqRow.Edit:HasFocus(), "quantity edit is focused before the list changes")
+
+    -- Same item rebuild preserves the in-progress edit.
+    RT:RebuildReview()
+    aqRow = review.Rows[2]
+    assertEq(aqRow.boundItemId, aqirite, "same-item rebuild keeps the row binding")
+    assertEq(aqRow.Edit.text, "9", "focused same-item edits survive RebuildReview")
+    assertTrue(aqRow.Edit:HasFocus(), "same-item rebuild leaves focus intact")
+
+    -- Removing the focused item rebinds the pooled row to flask.
+    assertTrue(select(1, C.RemoveRequestedItem(p, admin, aqirite)), "removing aqirite changes the donation list")
+    RT:RebuildReview()
+    local flaskRow = review.Rows[2]
+    assertEq(flaskRow.boundItemId, flask, "pooled row rebinds to the remaining requested item")
+    assertFalse(flaskRow.Edit:HasFocus(), "stale focus is cleared when the row changes items")
+    assertEq(flaskRow.Edit.text, "8", "rebound row shows the new item's suggested quantity")
+
+    flaskRow.Button.scripts.OnClick(flaskRow.Button)
+    assertEq(RT.qtyOverrides[flask], 8, "Deposit uses the rebound item's quantity, not the stale edit")
+    assertEq(RT.qtyOverrides[aqirite], nil, "stale aqirite override is not applied after rebinding")
+    assertTrue(RT.depositWork ~= nil or RT.depositIntent ~= nil or #world.places > 0,
+        "Deposit starts for the rebound item")
+    if RT.depositWork then
+        assertEq(RT.depositWork.line.itemId, flask, "deposit work targets the rebound item")
+        assertEq(RT.depositWork.intended, 8, "deposit work uses the new suggestion, not the stale 9")
+    end
+    RT:CancelDepositWork()
+    RT.depositIntent = nil
+    world.places = {}
+    unchanged(p, "focused edit row reuse")
+end
+
 local function checkSmartDonationHelper()
     local p = runtimeFixture("rt-smart-donation")
     C.AddRequestedItem(p, admin, flask)
@@ -3304,6 +3355,7 @@ checkCopyConfiguration()
 checkGoalsAndProgress()
 checkGoalCommitGate()
 checkSessionProfileNoticeRemoved()
+checkFocusedEditRowReuse()
 checkSmartDonationHelper()
 
 if failures > 0 then

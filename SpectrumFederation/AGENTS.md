@@ -317,9 +317,32 @@ Recurring processing (heartbeats, sync ticks, retries) should continue as needed
 
 For sync/comm warning deduplication patterns, see `tests/test_sync_protocol.py` and existing Loot Helper sync code.
 
-## Localization
-- If the repo has `locale/enUS.lua` and `ns.L`, use it for new user-facing strings.
-- If existing code is not fully localized yet, keep your additions consistent with the existing direction (don’t introduce a third pattern).
+## Localization (mandatory pre-delivery check)
+
+Canonical policy for packaged addon user-facing text. Other instruction files
+should reference this section rather than restating a weaker version.
+
+Before declaring packaged addon work complete, explicitly audit every **new or
+modified** user-facing string introduced by the change—not only Settings pages:
+
+- Labels, button text, status/empty states, tooltips, warnings, errors, and
+  other player-visible copy in Lua/UI modules
+- Route those strings through the established localization system:
+  `locale/enUS.lua` + `ns.L` / `SF.L`, typically via `SF.LocaleText(key, default)`
+- Verify `locale/enUS.lua` (and any new locale file) is listed in the owning
+  addon's TOC **before** modules that render those strings
+- Prefer stable locale keys; keep English defaults as fallbacks so tests and
+  incomplete locale tables remain usable
+- Internal identifiers, protocol field names, debug/diagnostic output, and
+  other non-user-facing strings do **not** require localization
+- Do **not** expand a task into a wholesale migration of unrelated legacy
+  hardcoded strings unless the owner explicitly asks for that migration
+- The PR checklist item for `locale/enUS.lua` may be checked only after this
+  audit against the actual diff. Do not check it automatically, assume it is
+  satisfied, or treat localization as optional follow-up for automated review
+
+Localization compliance is part of implementation completion for packaged
+addon changes.
 
 ## Packaging + versioning
 - **Any new Lua file must be listed in** the TOC of the addon that owns it (`SpectrumFederation.toc` or the owning child-addon TOC).
@@ -344,5 +367,7 @@ work, at minimum:
 - for layout, sizing, callback, event, timer, listener, queue, inspect, sync,
   cache, or retry changes: prefer tests that assert bounded execution,
   convergence, and the relevant behavioral sequences above
+- complete the **Localization** audit above for any new or modified
+  user-facing strings (locale keys, TOC load order, PR checkbox honesty)
 - recommend human Retail checks such as `/reload`, settings smoke tests, and
   any contract-specific in-game scenarios — do not fabricate Retail evidence

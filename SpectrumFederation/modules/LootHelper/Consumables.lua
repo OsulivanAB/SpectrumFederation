@@ -5,6 +5,13 @@ local _, SF = ...
 SF.Consumables = SF.Consumables or {}
 local C = SF.Consumables
 
+local function Loc(key, default)
+    if SF.LocaleText then
+        return SF.LocaleText(key, default)
+    end
+    return default or key
+end
+
 C.EVENT = {
     DONATION = "CONSUMABLE_DONATION",
     RESET = "CONSUMABLE_CONFIG_RESET",
@@ -1435,7 +1442,7 @@ function C.GoalProgress(profile)
         items = items,
         hasPositiveGoal = hasPositiveGoal,
         overallPercent = overallPercent,
-        overallEmptyText = "No goals configured.",
+        overallEmptyText = Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."),
         sumCapped = sumCapped,
         sumGoal = sumGoal,
     }
@@ -2206,7 +2213,7 @@ function C.RevalidateDonation(profile, line, ctx, inventoryQty)
         local entry = progress.items[i]
         if entry and entry.itemId == tonumber(line.itemId) and not entry.noGoal then
             if (tonumber(entry.donated) or 0) >= (tonumber(entry.goal) or 0) then
-                return false, "That item's donation goal is already met."
+                return false, Loc("RAID_SUPPLIES_GOAL_ALREADY_MET", "That item's donation goal is already met.")
             end
             break
         end

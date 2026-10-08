@@ -13,6 +13,13 @@ local BANNER_MOBILE_SIZE = 22
 -- cannot leak into a later manual Guild Bank visit.
 local BANNER_BANK_NAV_TTL = 12
 
+local function Loc(key, default)
+    if SF.LocaleText then
+        return SF.LocaleText(key, default)
+    end
+    return default or key
+end
+
 local function Debug(level, fmt, ...)
     if not SF.Debug then return end
     local fn = SF.Debug[level]
@@ -1197,13 +1204,13 @@ function Runtime:EnsureReview()
 
     local progressLabel = frame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
     progressLabel:SetPoint("TOPLEFT", status, "BOTTOMLEFT", 0, -8)
-    progressLabel:SetText("Overall progress")
+    progressLabel:SetText(Loc("RAID_SUPPLIES_OVERALL_PROGRESS", "Overall progress"))
     frame.ProgressLabel = progressLabel
     local progressEmpty = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     progressEmpty:SetPoint("TOPLEFT", progressLabel, "BOTTOMLEFT", 0, -4)
     progressEmpty:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -18, 0)
     progressEmpty:SetJustifyH("LEFT")
-    progressEmpty:SetText("No goals configured.")
+    progressEmpty:SetText(Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."))
     frame.ProgressEmpty = progressEmpty
     local progressBar = CreateFrame("StatusBar", nil, frame)
     progressBar:SetHeight(16)
@@ -1395,7 +1402,7 @@ end
 
 local function ProgressLabelText(line)
     if not line or line.noGoal then
-        return "No Goal"
+        return Loc("RAID_SUPPLIES_NO_GOAL", "No Goal")
     end
     return string.format("%d%%", tonumber(line.percent) or 0)
 end
@@ -1433,7 +1440,7 @@ function Runtime:UpdateOverallProgress(progress)
     progress = progress or {}
     if frame.ProgressLabel then
         frame.ProgressLabel:Show()
-        frame.ProgressLabel:SetText("Overall progress")
+        frame.ProgressLabel:SetText(Loc("RAID_SUPPLIES_OVERALL_PROGRESS", "Overall progress"))
     end
     if progress.hasPositiveGoal then
         if frame.ProgressEmpty then frame.ProgressEmpty:Hide() end
@@ -1451,7 +1458,10 @@ function Runtime:UpdateOverallProgress(progress)
         if frame.ProgressBar then frame.ProgressBar:Hide() end
         if frame.ProgressEmpty then
             frame.ProgressEmpty:Show()
-            frame.ProgressEmpty:SetText(progress.overallEmptyText or "No goals configured.")
+            frame.ProgressEmpty:SetText(
+                progress.overallEmptyText
+                    or Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured.")
+            )
         end
     end
 end
@@ -1505,6 +1515,7 @@ function Runtime:RebuildReview()
         header:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 0, -y)
         header.Text:SetText(tostring(group.key))
         header.Text:Show()
+        header.boundItemId = nil
         if header.IconButton then header.IconButton:Hide() end
         if header.Progress then header.Progress:Hide() end
         header.Edit:Hide()
@@ -1535,9 +1546,19 @@ function Runtime:RebuildReview()
             if depositable then
                 row.Edit:Show()
                 local editing = row.Edit.HasFocus and row.Edit:HasFocus()
-                if not editing then
+                local sameItem = row.boundItemId == line.itemId
+                -- Preserve focused text only while the pooled row still binds the
+                -- same item. After list changes, clear stale edits and show the
+                -- new item's suggestion so Deposit cannot apply the wrong qty.
+                if editing and sameItem then
+                    -- keep in-progress text
+                else
+                    if editing and not sameItem and row.Edit.ClearFocus then
+                        row.Edit:ClearFocus()
+                    end
                     row.Edit:SetText(tostring(line.quantity))
                 end
+                row.boundItemId = line.itemId
                 row.Edit:SetScript("OnEnterPressed", function(edit)
                     local Workflow = SF.ConsumablesWorkflow
                     local have = (self.bagCounts and self.bagCounts[line.itemId]) or line.available or line.quantity
@@ -1576,6 +1597,7 @@ function Runtime:RebuildReview()
                     self:BeginDeposit(depositLine, collected)
                 end)
             else
+                row.boundItemId = line.itemId
                 row.Edit:Hide()
                 row.Edit:SetScript("OnEnterPressed", nil)
                 row.Button:Hide()
@@ -1591,6 +1613,7 @@ function Runtime:RebuildReview()
         empty:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 0, 0)
         empty.Text:SetText("No raid supplies to deposit.")
         empty.Text:Show()
+        empty.boundItemId = nil
         if empty.IconButton then empty.IconButton:Hide() end
         if empty.Progress then empty.Progress:Hide() end
         empty.Edit:Hide()

@@ -13,6 +13,9 @@
 
 # --- Core files ---
 
+# --- Localization (load before modules that render user-facing text) ---
+locale/enUS.lua
+
 # --- Libs ---
 Libs/LibStub/LibStub.lua
 Libs/CallbackHandler/CallbackHandler-1.0.lua

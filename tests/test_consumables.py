@@ -159,3 +159,34 @@ def test_consumables_snapshot_merge_is_inside_import():
     merge_body = profiles[merge_at:]
     assert "snapshot.consumables" in import_body
     assert "snapshot.consumables" not in merge_body
+
+
+def test_consumables_donation_helper_locale_keys_and_toc_order():
+    toc = (REPO_ROOT / "SpectrumFederation" / "SpectrumFederation.toc").read_text(encoding="utf-8")
+    locale = (REPO_ROOT / "SpectrumFederation" / "locale" / "enUS.lua").read_text(encoding="utf-8")
+    domain = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "Consumables.lua"
+    ).read_text(encoding="utf-8")
+    runtime = RUNTIME.read_text(encoding="utf-8")
+
+    locale_at = toc.find("locale/enUS.lua")
+    runtime_at = toc.find("modules/LootHelper/ConsumablesRuntime.lua")
+    domain_at = toc.find("modules/LootHelper/Consumables.lua")
+    assert locale_at != -1, "locale/enUS.lua must be listed in the parent TOC"
+    assert locale_at < domain_at < runtime_at
+
+    for key in (
+        "RAID_SUPPLIES_OVERALL_PROGRESS",
+        "RAID_SUPPLIES_NO_GOALS_CONFIGURED",
+        "RAID_SUPPLIES_NO_GOAL",
+        "RAID_SUPPLIES_GOAL_ALREADY_MET",
+    ):
+        assert f'L["{key}"]' in locale, key
+        assert key in domain or key in runtime, key
+
+    assert "function ns.LocaleText" in locale
+    assert 'Loc("RAID_SUPPLIES_OVERALL_PROGRESS"' in runtime
+    assert 'Loc("RAID_SUPPLIES_NO_GOAL"' in runtime
+    assert 'Loc("RAID_SUPPLIES_GOAL_ALREADY_MET"' in domain
+    assert "row.boundItemId" in runtime
+    assert "sameItem" in runtime
