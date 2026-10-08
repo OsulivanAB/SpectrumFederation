@@ -1757,15 +1757,15 @@ function Controls:AddConsumableRequestedList(section, opts)
 					if not allowed then
 						return
 					end
-					-- Record before the callback so Enter→ClearFocus→FocusLost
-					-- cannot send a second CONSUMABLES_OP for the same edit.
+					-- Record before invoking onGoalCommit so a successful focus-loss
+					-- submit is not repeated for the same text. Enter only clears
+					-- focus and relies on this path, so a rejected submit can retry.
 					r.__sfLastCommittedText = text
 					if opts.onGoalCommit then
 						opts.onGoalCommit(commitItem, text)
 					end
 				end
 				r.GoalEdit:SetScript("OnEnterPressed", function(selfEdit)
-					CommitGoal()
 					selfEdit:ClearFocus()
 				end)
 				r.GoalEdit:SetScript("OnEditFocusLost", function()
