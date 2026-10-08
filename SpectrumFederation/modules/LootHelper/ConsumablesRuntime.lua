@@ -671,23 +671,34 @@ function Runtime:Collect()
         local itemId = ids[i]
         local have = self.bagCounts[itemId] or 0
         if have > 0 then
-            local qty = have
-            local edited = self.qtyOverrides[itemId]
-            if edited and Workflow and Workflow.ClampDonationQuantity then
-                qty = Workflow.ClampDonationQuantity(edited, have)
-            end
-            if qty > 0 then
-                carried[#carried + 1] = {
-                    itemId = itemId,
-                    quantity = qty,
-                    name = self:ItemName(itemId),
-                }
-            end
+            carried[#carried + 1] = {
+                itemId = itemId,
+                available = have,
+                quantity = have,
+                name = self:ItemName(itemId),
+            }
         end
     end
     local plan = C.BuildDonationPlan(profile, carried, {
         guildBankUsable = usable,
     })
+    -- Visit-scoped manual overrides adjust the deposit quantity without a
+    -- goal-based hard cap. Completed finite goals drop their override and stay
+    -- non-depositable.
+    for i = 1, #(plan.lines or {}) do
+        local line = plan.lines[i]
+        if line.goalComplete then
+            if self.qtyOverrides[line.itemId] ~= nil then
+                self.qtyOverrides[line.itemId] = nil
+            end
+            line.quantity = 0
+        else
+            local edited = self.qtyOverrides[line.itemId]
+            if edited and Workflow and Workflow.ClampDonationQuantity then
+                line.quantity = Workflow.ClampDonationQuantity(edited, line.available or 0)
+            end
+        end
+    end
     return {
         profile = profile,
         access = access,
@@ -1090,6 +1101,57 @@ function Runtime:SyncBannerMobileButton(mobileState)
     end
 end
 
+function Runtime:ItemIcon(itemId)
+    if GetItemIcon and itemId then
+        local ok, tex = pcall(GetItemIcon, itemId)
+        if ok and tex then return tex end
+    end
+    return "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+function Runtime:WatchGuildBankFrame()
+    local gb = GuildBankFrame
+    if not gb or gb.__sfConsumablesSizeHook then return end
+    if type(gb.HookScript) ~= "function" then return end
+    gb.__sfConsumablesSizeHook = true
+    gb:HookScript("OnSizeChanged", function()
+        if not (self.review and self.review.IsShown and self.review:IsShown()) then
+            return
+        end
+        self:MatchReviewHeightToGuildBank()
+    end)
+end
+
+function Runtime:MatchReviewHeightToGuildBank()
+    local frame = self.review
+    local gb = GuildBankFrame
+    if not frame or not gb or type(gb.GetHeight) ~= "function" then return end
+    local height = tonumber(gb:GetHeight())
+    if not height or height <= 0 then return end
+    local current = type(frame.GetHeight) == "function" and tonumber(frame:GetHeight()) or nil
+    if current and math.abs(current - height) < 0.5 then return end
+    frame:SetHeight(height)
+    if not InCombat() then
+        self:PlaceMobileHolder()
+    else
+        self.mobileButtonPending = true
+    end
+end
+
+-- Align beside the Guild Bank on opening. Height keeps following afterward;
+-- manual drag is preserved until the next ShowReview opening.
+function Runtime:AlignReviewToGuildBank(forcePosition)
+    local frame = self.review
+    local gb = GuildBankFrame
+    if not frame or not gb then return end
+    self:MatchReviewHeightToGuildBank()
+    if not forcePosition then return end
+    if type(frame.ClearAllPoints) == "function" then
+        frame:ClearAllPoints()
+    end
+    frame:SetPoint("TOPLEFT", gb, "TOPRIGHT", 4, 0)
+end
+
 function Runtime:EnsureReview()
     if self.review then return self.review end
     local frame = CreateFrame("Frame", "SpectrumFederationRaidSupplies", UIParent, "BackdropTemplate")
@@ -1132,16 +1194,51 @@ function Runtime:EnsureReview()
     status:SetJustifyH("LEFT")
     status:SetText("")
     frame.Status = status
+
+    local progressLabel = frame:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+    progressLabel:SetPoint("TOPLEFT", status, "BOTTOMLEFT", 0, -8)
+    progressLabel:SetText("Overall progress")
+    frame.ProgressLabel = progressLabel
+    local progressEmpty = frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    progressEmpty:SetPoint("TOPLEFT", progressLabel, "BOTTOMLEFT", 0, -4)
+    progressEmpty:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -18, 0)
+    progressEmpty:SetJustifyH("LEFT")
+    progressEmpty:SetText("No goals configured.")
+    frame.ProgressEmpty = progressEmpty
+    local progressBar = CreateFrame("StatusBar", nil, frame)
+    progressBar:SetHeight(16)
+    progressBar:SetPoint("TOPLEFT", progressLabel, "BOTTOMLEFT", 0, -4)
+    progressBar:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -18, 0)
+    if progressBar.SetMinMaxValues then progressBar:SetMinMaxValues(0, 100) end
+    if progressBar.SetValue then progressBar:SetValue(0) end
+    if progressBar.SetStatusBarTexture then
+        progressBar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+    end
+    if progressBar.SetStatusBarColor then
+        progressBar:SetStatusBarColor(0.2, 0.7, 0.3, 1)
+    end
+    local barBg = progressBar:CreateTexture(nil, "BACKGROUND")
+    if barBg.SetAllPoints then barBg:SetAllPoints(progressBar) end
+    if barBg.SetTexture then barBg:SetTexture("Interface\\Buttons\\WHITE8x8") end
+    if barBg.SetVertexColor then barBg:SetVertexColor(0.15, 0.15, 0.15, 0.8) end
+    local barText = progressBar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    barText:SetPoint("CENTER", progressBar, "CENTER", 0, 0)
+    progressBar.Text = barText
+    frame.ProgressBar = progressBar
+
     local scroll = CreateFrame("ScrollFrame", nil, frame, "UIPanelScrollFrameTemplate")
-    scroll:SetPoint("TOPLEFT", frame, "TOPLEFT", 16, -64)
+    scroll:SetPoint("TOPLEFT", frame, "TOPLEFT", 16, -108)
     scroll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -32, 48)
     local child = CreateFrame("Frame", nil, scroll)
     child:SetSize(420, 1)
     scroll:SetScrollChild(child)
     frame.Child = child
     frame.Rows = {}
+    -- Start hidden so the first ShowReview counts as an opening (alignment).
+    frame:Hide()
     self.review = frame
     self:EnsureMobileButton()
+    self:WatchGuildBankFrame()
     return frame
 end
 
@@ -1263,7 +1360,20 @@ function Runtime:AcquireRow(index)
         return row
     end
     row = CreateFrame("Frame", nil, frame.Child)
-    row:SetSize(400, 24)
+    row:SetSize(400, 26)
+    local iconBtn = CreateFrame("Button", nil, row)
+    iconBtn:SetSize(20, 20)
+    iconBtn:SetPoint("LEFT", row, "LEFT", 0, 0)
+    local icon = iconBtn:CreateTexture(nil, "ARTWORK")
+    if icon.SetAllPoints then icon:SetAllPoints(iconBtn) end
+    iconBtn.Icon = icon
+    row.IconButton = iconBtn
+    row.Icon = icon
+    local progress = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    progress:SetPoint("LEFT", iconBtn, "RIGHT", 6, 0)
+    progress:SetWidth(70)
+    progress:SetJustifyH("LEFT")
+    row.Progress = progress
     local text = row:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
     text:SetPoint("LEFT", row, "LEFT", 0, 0)
     text:SetWidth(230)
@@ -1271,7 +1381,7 @@ function Runtime:AcquireRow(index)
     row.Text = text
     local edit = CreateFrame("EditBox", nil, row, "InputBoxTemplate")
     edit:SetSize(40, 20)
-    edit:SetPoint("LEFT", text, "RIGHT", 8, 0)
+    edit:SetPoint("LEFT", progress, "RIGHT", 8, 0)
     edit:SetAutoFocus(false)
     edit:SetNumeric(true)
     row.Edit = edit
@@ -1283,9 +1393,76 @@ function Runtime:AcquireRow(index)
     return row
 end
 
+local function ProgressLabelText(line)
+    if not line or line.noGoal then
+        return "No Goal"
+    end
+    return string.format("%d%%", tonumber(line.percent) or 0)
+end
+
+function Runtime:BindItemTooltip(iconBtn, itemId)
+    if not iconBtn then return end
+    iconBtn:SetScript("OnEnter", function(owner)
+        if not GameTooltip or not itemId then return end
+        GameTooltip:SetOwner(owner, "ANCHOR_RIGHT")
+        local shown = false
+        if GameTooltip.SetItemByID then
+            local ok = pcall(GameTooltip.SetItemByID, GameTooltip, itemId)
+            shown = ok and true or false
+        end
+        if not shown and GameTooltip.SetHyperlink then
+            local link = string.format("item:%d", itemId)
+            local ok = pcall(GameTooltip.SetHyperlink, GameTooltip, link)
+            shown = ok and true or false
+        end
+        if not shown and GameTooltip.SetText then
+            GameTooltip:SetText(self:ItemName(itemId))
+        end
+        GameTooltip:Show()
+    end)
+    iconBtn:SetScript("OnLeave", function()
+        if GameTooltip and GameTooltip.Hide then
+            GameTooltip:Hide()
+        end
+    end)
+end
+
+function Runtime:UpdateOverallProgress(progress)
+    local frame = self.review
+    if not frame then return end
+    progress = progress or {}
+    if frame.ProgressLabel then
+        frame.ProgressLabel:Show()
+        frame.ProgressLabel:SetText("Overall progress")
+    end
+    if progress.hasPositiveGoal then
+        if frame.ProgressEmpty then frame.ProgressEmpty:Hide() end
+        if frame.ProgressBar then
+            frame.ProgressBar:Show()
+            local pct = tonumber(progress.overallPercent) or 0
+            if frame.ProgressBar.SetValue then
+                frame.ProgressBar:SetValue(math.max(0, math.min(100, pct)))
+            end
+            if frame.ProgressBar.Text then
+                frame.ProgressBar.Text:SetText(string.format("%d%%", pct))
+            end
+        end
+    else
+        if frame.ProgressBar then frame.ProgressBar:Hide() end
+        if frame.ProgressEmpty then
+            frame.ProgressEmpty:Show()
+            frame.ProgressEmpty:SetText(progress.overallEmptyText or "No goals configured.")
+        end
+    end
+end
+
 function Runtime:ShowReview()
     local frame = self:EnsureReview()
+    self:WatchGuildBankFrame()
+    local wasShown = frame.IsShown and frame:IsShown()
     frame:Show()
+    -- Realign only when the helper opens again; keep manual drag while visible.
+    self:AlignReviewToGuildBank(not wasShown)
     self:RebuildReview()
 end
 
@@ -1297,6 +1474,13 @@ function Runtime:RebuildReview()
     if not collected then return end
     self.lastAccess = collected.access
     frame.Status:SetText(StatusText(collected.access))
+    local progress = collected.plan and collected.plan.progress
+    if not progress and SF.Consumables and SF.Consumables.GoalProgress then
+        progress = SF.Consumables.GoalProgress(collected.profile)
+    end
+    self:UpdateOverallProgress(progress)
+    -- Height can change with Guild Bank while the helper stays open.
+    self:MatchReviewHeightToGuildBank()
     local y = 0
     local index = 0
     local groups = {}
@@ -1320,6 +1504,9 @@ function Runtime:RebuildReview()
         local header = self:AcquireRow(index)
         header:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 0, -y)
         header.Text:SetText(tostring(group.key))
+        header.Text:Show()
+        if header.IconButton then header.IconButton:Hide() end
+        if header.Progress then header.Progress:Hide() end
         header.Edit:Hide()
         header.Button:Hide()
         y = y + 22
@@ -1332,46 +1519,68 @@ function Runtime:RebuildReview()
             index = index + 1
             local row = self:AcquireRow(index)
             row:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 8, -y)
-            row.Text:SetText(string.format("%s x%d", line.name or self:ItemName(line.itemId), line.quantity))
-            row.Edit:Show()
-            row.Edit:SetText(tostring(line.quantity))
-            row.Edit:SetScript("OnEnterPressed", function(edit)
-                local Workflow = SF.ConsumablesWorkflow
-                local have = (self.bagCounts and self.bagCounts[line.itemId]) or line.quantity
-                local qty = tonumber(edit:GetText()) or line.quantity
-                if Workflow and Workflow.ClampDonationQuantity then
-                    qty = Workflow.ClampDonationQuantity(qty, have)
+            row.Text:Hide()
+            if row.IconButton then
+                row.IconButton:Show()
+                if row.Icon then
+                    row.Icon:SetTexture(self:ItemIcon(line.itemId))
                 end
-                self.qtyOverrides[line.itemId] = qty
-                edit:ClearFocus()
-                self:RebuildReview()
-            end)
-            local button = row.Button
-            button:Show()
-            button:SetText("Deposit")
-            if collected.access and collected.access.action == "deposit" and collected.access.enabled then
-                button:Enable()
-            else
-                button:Disable()
+                self:BindItemTooltip(row.IconButton, line.itemId)
             end
-            button:SetScript("OnClick", function()
-                local Workflow = SF.ConsumablesWorkflow
-                local have = (self.bagCounts and self.bagCounts[line.itemId]) or line.quantity
-                local qty = tonumber(row.Edit:GetText()) or line.quantity
-                if Workflow and Workflow.ClampDonationQuantity then
-                    qty = Workflow.ClampDonationQuantity(qty, have)
+            if row.Progress then
+                row.Progress:Show()
+                row.Progress:SetText(ProgressLabelText(line))
+            end
+            local depositable = not line.goalComplete
+            if depositable then
+                row.Edit:Show()
+                local editing = row.Edit.HasFocus and row.Edit:HasFocus()
+                if not editing then
+                    row.Edit:SetText(tostring(line.quantity))
                 end
-                self.qtyOverrides[line.itemId] = qty
-                local depositLine = {
-                    itemId = line.itemId,
-                    quantity = qty,
-                    name = line.name,
-                    generation = line.generation,
-                    quality = line.quality,
-                    guildBank = line.guildBank,
-                }
-                self:BeginDeposit(depositLine, collected)
-            end)
+                row.Edit:SetScript("OnEnterPressed", function(edit)
+                    local Workflow = SF.ConsumablesWorkflow
+                    local have = (self.bagCounts and self.bagCounts[line.itemId]) or line.available or line.quantity
+                    local qty = tonumber(edit:GetText()) or line.quantity
+                    if Workflow and Workflow.ClampDonationQuantity then
+                        qty = Workflow.ClampDonationQuantity(qty, have)
+                    end
+                    self.qtyOverrides[line.itemId] = qty
+                    edit:ClearFocus()
+                    self:RebuildReview()
+                end)
+                local button = row.Button
+                button:Show()
+                button:SetText("Deposit")
+                if collected.access and collected.access.action == "deposit" and collected.access.enabled then
+                    button:Enable()
+                else
+                    button:Disable()
+                end
+                button:SetScript("OnClick", function()
+                    local Workflow = SF.ConsumablesWorkflow
+                    local have = (self.bagCounts and self.bagCounts[line.itemId]) or line.available or line.quantity
+                    local qty = tonumber(row.Edit:GetText()) or line.quantity
+                    if Workflow and Workflow.ClampDonationQuantity then
+                        qty = Workflow.ClampDonationQuantity(qty, have)
+                    end
+                    self.qtyOverrides[line.itemId] = qty
+                    local depositLine = {
+                        itemId = line.itemId,
+                        quantity = qty,
+                        name = line.name,
+                        generation = line.generation,
+                        quality = line.quality,
+                        guildBank = line.guildBank,
+                    }
+                    self:BeginDeposit(depositLine, collected)
+                end)
+            else
+                row.Edit:Hide()
+                row.Edit:SetScript("OnEnterPressed", nil)
+                row.Button:Hide()
+                row.Button:SetScript("OnClick", nil)
+            end
             y = y + 26
         end
         if stop then break end
@@ -1381,6 +1590,9 @@ function Runtime:RebuildReview()
         local empty = self:AcquireRow(index)
         empty:SetPoint("TOPLEFT", frame.Child, "TOPLEFT", 0, 0)
         empty.Text:SetText("No raid supplies to deposit.")
+        empty.Text:Show()
+        if empty.IconButton then empty.IconButton:Hide() end
+        if empty.Progress then empty.Progress:Hide() end
         empty.Edit:Hide()
         empty.Button:Hide()
         y = 24
@@ -1901,6 +2113,8 @@ function Runtime:OnBankOpened()
     self.bankOpen = true
     if first then
         self.autoReviewedThisOpen = false
+        -- Fresh visit: do not reuse prior manual quantity overrides.
+        self.qtyOverrides = {}
         -- Banner-initiated tab selection must run before SyncReviewWithGuildBank
         -- so BankAccess can see the configured tab as usable when appropriate.
         self:ConsumeBannerBankNavigation()
@@ -1908,6 +2122,7 @@ function Runtime:OnBankOpened()
         -- Duplicate open signal while already open: never select twice.
         self:CancelBannerBankNavigation("duplicate_open")
     end
+    self:WatchGuildBankFrame()
     self:RefreshReminder()
     self:SyncReviewWithGuildBank()
 end
@@ -1926,6 +2141,9 @@ function Runtime:OnBankClosed()
         end
     end
     self.bankOpen = false
+    -- Bank-close is the visit boundary for local quantity overrides. Tab
+    -- switches alone must not clear them.
+    self.qtyOverrides = {}
     self:HideReviewForBankLifecycle()
     self:RefreshReminder()
 end
@@ -1940,10 +2158,9 @@ function Runtime:MaybeAutoReview()
     if not SF.Consumables or not Routing then return end
     local collected = self:Collect()
     if not collected then return end
-    local carries = false
-    for i = 1, #collected.plan.lines do
-        if collected.plan.lines[i].quantity > 0 then carries = true end
-    end
+    -- Carried requested items remain eligible even when every finite goal is
+    -- already complete (display-only rows, no deposit controls).
+    local carries = collected.plan and collected.plan.lines and #collected.plan.lines > 0
     if not carries then return end
     if not Routing.HasActionablePath(collected.usable) then return end
     self.autoReviewedThisOpen = true

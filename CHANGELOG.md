@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.12] - 2026-10-08
+
+### Added
+- Enhance Raid Supplies Guild Bank donation helper with goal progress, smart suggestions, and bank alignment (#352)
+
 ## [1.5.8-beta.11] - 2026-10-08
 
 ### Added
