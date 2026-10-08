@@ -6,7 +6,7 @@ local Sync = SF.LootHelperSync
 -- Constants / Message Types
 -- ============================================================================
 
-Sync.PROTO_VERSION = 7
+Sync.PROTO_VERSION = 8
 
 Sync.PREFIX = {
     CONTROL = "SF_LH",

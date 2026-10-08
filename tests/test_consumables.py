@@ -88,6 +88,29 @@ def test_consumables_runtime_is_guild_bank_deposit_only():
     assert "local window = SF.LootHelperWindow\n" not in runtime
 
 
+def test_consumables_goal_editor_guards_are_present():
+    controls = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Control" / "Controls.lua"
+    ).read_text(encoding="utf-8")
+    page = (
+        REPO_ROOT / "SpectrumFederation" / "modules" / "UI" / "Settings" / "Pages" / "Consumables.lua"
+    ).read_text(encoding="utf-8")
+    assert "function Controls.ShouldCommitConsumableGoal" in controls
+    assert "__sfLastCommittedText" in controls
+    assert "__sfBoundItemId" in controls
+    assert "__sfCancelCommit" in controls
+    assert "textMaxWidth" in controls
+    assert "C.ValidGoal" in page
+    # Enter must clear focus only; focus-loss is the sole goal-commit path.
+    enter_at = controls.find('r.GoalEdit:SetScript("OnEnterPressed"')
+    lost_at = controls.find('r.GoalEdit:SetScript("OnEditFocusLost"')
+    assert 0 <= enter_at < lost_at
+    enter_body = controls[enter_at:lost_at]
+    assert "ClearFocus()" in enter_body
+    assert "CommitGoal()" not in enter_body
+    assert "CommitGoal()" in controls[lost_at : lost_at + 120]
+
+
 def test_consumables_snapshot_merge_is_inside_import():
     profiles = (
         REPO_ROOT / "SpectrumFederation" / "modules" / "LootHelper" / "Profiles.lua"

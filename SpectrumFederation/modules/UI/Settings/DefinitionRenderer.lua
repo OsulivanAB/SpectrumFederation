@@ -221,6 +221,28 @@ function R:Build(panel, pageDef)
 				end
 				controls:AddScrollList(sec, opts)
 
+			elseif t == "consumableRequestedList" then
+				local opts = item
+				if type(opts.onRemove) == "function" or type(opts.onGoalCommit) == "function" then
+					opts = CopyTable(opts)
+					if type(opts.onRemove) == "function" then
+						local fn = opts.onRemove
+						opts.onRemove = function(listItem)
+							return fn(MakeCtx(panel, sec), listItem)
+						end
+					end
+					if type(opts.onGoalCommit) == "function" then
+						local fn = opts.onGoalCommit
+						opts.onGoalCommit = function(listItem, text)
+							return fn(MakeCtx(panel, sec), listItem, text)
+						end
+					end
+				end
+				controls:AddConsumableRequestedList(sec, opts)
+
+			elseif t == "consumableGoalSummary" then
+				controls:AddConsumableGoalSummary(sec, item)
+
 			elseif t == "button" then
 				local opts = item
 				if type(opts.onClick) == "function" then

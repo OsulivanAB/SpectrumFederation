@@ -588,6 +588,7 @@ local function checkRequestedItems()
     assertTrue(select(1, C.AddRequestedItem(p, admin, aqirite)), "an admin can add a requested item")
     assertEq(notifyCount, before + 1, "adding an item notifies the UI once")
     assertTrue(C.IsRequested(p, aqirite), "the exact item id is requested")
+    assertEq(p._consumables.requestedItems[tostring(aqirite)].goal, 0, "a newly added item defaults to goal 0")
     assertFalse(C.IsRequested(p, aqiriteRank2), "a different quality item id is not requested")
     assertFalse(C.IsRequested(p, "not-an-id"), "a non-numeric id is never requested")
 
@@ -654,7 +655,9 @@ local function checkApplyOpAndSettingsModel()
     assertEq(adminModel.bankTab, 6, "the settings model shows the bank tab")
     assertEq(#adminModel.requestedItems, 1, "the settings model lists requested items")
     assertEq(adminModel.requestedItems[1].itemId, aqirite, "the settings model lists the requested item id")
+    assertEq(adminModel.requestedItems[1].goal, 0, "the settings model defaults goal to 0")
     assertTrue(adminModel.requestedItems[1].canRemove, "admins can remove requested rows")
+    assertTrue(adminModel.requestedItems[1].canEditGoal, "admins can edit goals")
     assertTrue(contains(adminModel.guildText, "Spectrum") and contains(adminModel.guildText, "tab 6"),
         "the guild text names the guild and tab")
     assertTrue(contains(adminModel.clearWarning, "Logs are kept"), "the clear warning says history is kept")
@@ -662,6 +665,7 @@ local function checkApplyOpAndSettingsModel()
     assertFalse(memberModel.canEditGuild or memberModel.canManageItems or memberModel.canClear,
         "members get a read-only settings model")
     assertFalse(memberModel.requestedItems[1].canRemove, "members cannot remove requested rows")
+    assertFalse(memberModel.requestedItems[1].canEditGoal, "members cannot edit goals")
     assertEq(C.SettingsModel(profile("cfg-empty"), admin, true).guildText, "No guild configured.",
         "an unconfigured profile says no guild is configured")
 end
@@ -703,6 +707,8 @@ local function checkMigration()
     assertTrue(C.IsRequested(old, aqirite), "an assigned item migrates to a requested item")
     assertTrue(C.IsRequested(old, flask), "a flat legacy requested row migrates")
     assertFalse(C.IsRequested(old, aqiriteRank2), "an assignment with no crafters is not migrated")
+    assertEq(migrated.requestedItems[tostring(aqirite)].goal, 0, "legacy requested items migrate to goal 0")
+    assertEq(migrated.requestedItems[tostring(flask)].goal, 0, "flat legacy rows migrate to goal 0")
     assertEq(migrated.crafters, nil, "legacy crafters are cleared")
     assertEq(migrated.assignments, nil, "legacy assignments are cleared")
     assertEq(migrated.itemEpochs, nil, "legacy item epochs are cleared")
@@ -1019,7 +1025,7 @@ end
 
 local function checkAuthorizeAndConfigSync()
     local p = configured("authz")
-    for _, name in ipairs({ "add_item", "remove_item", "set_guild", "set_bank_tab", "clear" }) do
+    for _, name in ipairs({ "add_item", "remove_item", "set_goal", "set_guild", "set_bank_tab", "clear" }) do
         assertTrue(S.AuthorizeOp(p, { name = name }, admin), "an admin may send " .. name)
         assertFalse(S.AuthorizeOp(p, { name = name }, donor), "a member may not send " .. name)
     end
@@ -2718,6 +2724,218 @@ local function checkCopyConfiguration()
     assertEq(C.ContributionTotal(source, donor, aqirite), 4, "the source keeps its contributions")
 end
 
+local function checkGoalsAndProgress()
+    local p = configured("goals")
+    assertEq(p._consumables.requestedItems[tostring(aqirite)].goal, 0, "configured fixture starts at goal 0")
+    assertTrue(select(1, C.SetRequestedGoal(p, admin, aqirite, 200)), "an admin can set a positive goal")
+    assertEq(p._consumables.requestedItems[tostring(aqirite)].goal, 200, "the goal is stored on the requested row")
+    assertFalse(select(1, C.SetRequestedGoal(p, donor, aqirite, 50)), "a non-admin cannot change goals")
+    assertEq(p._consumables.requestedItems[tostring(aqirite)].goal, 200, "a denied goal change leaves the goal")
+    assertFalse(select(1, C.SetRequestedGoal(p, admin, aqirite, -1)), "a negative goal is rejected")
+    assertFalse(select(1, C.SetRequestedGoal(p, admin, aqirite, 1.5)), "a fractional goal is rejected")
+    assertFalse(select(1, C.SetRequestedGoal(p, admin, aqirite, "nope")), "a non-numeric goal is rejected")
+    assertFalse(select(1, C.SetRequestedGoal(p, admin, aqirite, math.huge)), "an infinite goal is rejected")
+    assertEq(C.ValidGoal(999999), nil, "values above MAX_GOAL fail domain validation")
+    assertFalse(select(1, C.SetRequestedGoal(p, admin, aqirite, C.MAX_GOAL + 1)),
+        "out-of-range goals are rejected before sync")
+    assertEq(C.ValidGoal(C.MAX_GOAL), C.MAX_GOAL, "MAX_GOAL itself is accepted")
+    assertTrue(select(1, C.ApplyOp(p, { name = "set_goal", itemId = aqirite, goal = 100 }, admin)),
+        "ApplyOp set_goal works for an admin")
+    assertEq(p._consumables.requestedItems[tostring(aqirite)].goal, 100, "ApplyOp stores the goal")
+    assertFalse(select(1, C.ApplyOp(p, { name = "set_goal", itemId = aqirite, goal = 10 }, donor)),
+        "ApplyOp set_goal denies a non-admin")
+
+    local beforeFp = C.Descriptor(p).configFingerprint
+    assertTrue(select(1, C.SetRequestedGoal(p, admin, aqirite, 200)), "changing the goal bumps config")
+    assertTrue(C.Descriptor(p).configFingerprint ~= beforeFp, "goal changes participate in config fingerprints")
+
+    C.AddRequestedItem(p, admin, flask)
+    C.AddRequestedItem(p, admin, aqiriteRank2)
+    C.AddRequestedItem(p, admin, junk)
+    C.SetRequestedGoal(p, admin, flask, 50)
+    C.SetRequestedGoal(p, admin, aqiriteRank2, 100)
+    C.SetRequestedGoal(p, admin, junk, 0)
+
+    C.CommitEvents(p, "goal-a", W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 100))
+    -- flask stays at 0 donations.
+    C.CommitEvents(p, "goal-c", W.DepositEvents({ generation = 1, itemId = aqiriteRank2, donor = donor, requested = true }, 110))
+    C.CommitEvents(p, "goal-d", W.DepositEvents({ generation = 1, itemId = junk, donor = donor, requested = true }, 300))
+
+    assertEq(C.ItemDonatedTotal(p, aqirite), 100, "item totals use raw donation quantities")
+    assertEq(C.ItemDonatedTotal(p, flask), 0, "an item with no donations has total 0")
+    assertEq(C.ItemDonatedTotal(p, aqiriteRank2), 110, "over-complete donations stay in the raw total")
+    assertEq(C.ItemDonatedTotal(p, junk), 300, "goal-0 items still accumulate raw totals")
+
+    local progress = C.GoalProgress(p)
+    assertTrue(progress.hasPositiveGoal, "positive goals enable overall progress")
+    assertEq(progress.overallPercent, 57, "overall progress caps over-donations and excludes goal 0")
+    local byId = {}
+    for i = 1, #progress.items do
+        byId[progress.items[i].itemId] = progress.items[i]
+    end
+    assertEq(byId[aqirite].percent, 50, "item A is 50%")
+    assertEq(byId[flask].percent, 0, "item B is 0%")
+    assertEq(byId[aqiriteRank2].percent, 110, "item C may exceed 100%")
+    assertTrue(byId[junk].noGoal, "item D reports No Goal")
+    assertEq(byId[junk].percent, nil, "No Goal items have no percentage")
+
+    local onlyZero = configured("goals-zero")
+    C.AddRequestedItem(onlyZero, admin, flask)
+    C.SetRequestedGoal(onlyZero, admin, aqirite, 0)
+    C.SetRequestedGoal(onlyZero, admin, flask, 0)
+    C.CommitEvents(onlyZero, "zero-donations",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 40))
+    local emptyOverall = C.GoalProgress(onlyZero)
+    assertFalse(emptyOverall.hasPositiveGoal, "all goal-0 items produce no overall bar")
+    assertEq(emptyOverall.overallPercent, nil, "no overall percent when no positive goals exist")
+    assertEq(emptyOverall.overallEmptyText, "No goals configured.", "empty overall uses the No goals text")
+    assertEq(#emptyOverall.items, 2, "goal-0 items still appear in the per-item summary")
+
+    -- Changing 0 -> positive immediately uses existing current-generation donations.
+    assertTrue(select(1, C.SetRequestedGoal(onlyZero, admin, aqirite, 80)), "goal 0 can become positive")
+    local afterGoal = C.GoalProgress(onlyZero)
+    assertEq(afterGoal.items[1].percent or afterGoal.items[2].percent, 50,
+        "existing donations count immediately toward a newly set positive goal")
+    local aqRow = nil
+    for i = 1, #afterGoal.items do
+        if afterGoal.items[i].itemId == aqirite then aqRow = afterGoal.items[i] end
+    end
+    assertEq(aqRow.percent, 50, "40 of 80 is 50%")
+
+    -- Remove / re-add within the same generation restores counting.
+    local rr = configured("goals-readd")
+    C.SetRequestedGoal(rr, admin, aqirite, 40)
+    C.CommitEvents(rr, "readd-1",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 25))
+    assertEq(C.GoalProgress(rr).items[1].percent, 62, "25 of 40 floors to 62%")
+    C.RemoveRequestedItem(rr, admin, aqirite)
+    assertEq(#C.GoalProgress(rr).items, 0, "removed items leave the progress display")
+    assertEq(C.ItemDonatedTotal(rr, aqirite), 25, "removing an item does not delete donation events")
+    C.AddRequestedItem(rr, admin, aqirite)
+    C.SetRequestedGoal(rr, admin, aqirite, 40)
+    assertEq(C.GoalProgress(rr).items[1].percent, 62, "re-adding in the same generation restores progress")
+
+    -- Clear / new generation resets progress while keeping history.
+    C.Clear(rr, admin)
+    assertEq(C.ItemDonatedTotal(rr, aqirite), 0, "a new generation resets item totals")
+    assertEq(#C.GoalProgress(rr).items, 0, "clear removes requested items from progress")
+    local historyAfterClear = C.HistoryRows(rr)
+    local preservedDonation = false
+    for i = 1, #historyAfterClear do
+        if contains(historyAfterClear[i].text, "donated 25") then
+            preservedDonation = true
+            break
+        end
+    end
+    assertTrue(preservedDonation, "clear preserves the prior donation in historical ledger")
+
+    -- Linked characters: two donations each count once toward item totals.
+    local linked = configured("goals-linked")
+    local alt = "Alt-Realm"
+    linked.GetIdentityMembers = function(_, memberId)
+        if memberId == donor or memberId == alt then
+            return { donor, alt }
+        end
+        return { memberId }
+    end
+    C.SetRequestedGoal(linked, admin, aqirite, 100)
+    C.CommitEvents(linked, "link-donor",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 25))
+    C.CommitEvents(linked, "link-alt",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = alt, requested = true }, 25))
+    assertEq(C.ItemDonatedTotal(linked, aqirite), 50, "linked characters each contribute fully to item totals")
+    assertEq(C.ContributionTotal(linked, donor, aqirite), 50, "identity-aware member totals still group")
+    assertEq(C.GoalProgress(linked).items[1].percent, 50, "goal progress uses raw item totals, not member totals")
+    local beforeLinkFp = C.ItemDonatedTotal(linked, aqirite)
+    linked.GetIdentityMembers = function(_, memberId) return { memberId } end
+    assertEq(C.ItemDonatedTotal(linked, aqirite), beforeLinkFp, "unlinking does not change item totals")
+    assertEq(C.GoalProgress(linked).items[1].percent, 50, "unlinking does not change goal progress")
+    linked.GetIdentityMembers = function(_, memberId)
+        if memberId == donor or memberId == alt then return { donor, alt } end
+        return { memberId }
+    end
+    assertEq(C.ItemDonatedTotal(linked, aqirite), 50, "relinking does not change item totals")
+
+    -- Snapshot / config / profile-copy round trips preserve goals.
+    local source = configured("goals-snap-src")
+    C.SetRequestedGoal(source, admin, aqirite, 75)
+    C.AddRequestedItem(source, admin, flask)
+    C.SetRequestedGoal(source, admin, flask, 0)
+    local snap = C.ExportSnapshot(source, { omitEvents = true })
+    assertEq(snap.requestedItems[tostring(aqirite)].goal, 75, "snapshots export goals")
+    assertEq(snap.requestedItems[tostring(flask)].goal, 0, "snapshots export goal 0")
+    assertTrue(select(1, C.ValidateSnapshot(snap)), "goal-bearing snapshots validate")
+    local badSnap = {
+        generation = 1, configSeq = 1, requestedItems = {
+            [tostring(aqirite)] = { itemId = aqirite, goal = -3 },
+        },
+    }
+    assertFalse(select(1, C.ValidateSnapshot(badSnap)), "explicit malformed goals fail validation")
+    local dest = profile("goals-snap-dst", admin)
+    assertTrue(select(1, C.ReplaceConfig(dest, snap)), "ReplaceConfig accepts goal-bearing config")
+    assertEq(dest._consumables.requestedItems[tostring(aqirite)].goal, 75, "ReplaceConfig restores goals")
+    assertFalse(select(1, C.ReplaceConfig(dest, badSnap)), "ReplaceConfig rejects malformed goals")
+    assertEq(dest._consumables.requestedItems[tostring(aqirite)].goal, 75, "rejected replace leaves prior goals")
+
+    local follower = profile("goals-follow", admin)
+    assertEq(select(2, S.ApplyRemoteConfig(follower, snap, admin, { coordinatorAuthoritative = true })),
+        "applied", "remote config applies goals")
+    assertEq(follower._consumables.requestedItems[tostring(aqirite)].goal, 75, "follower receives goals")
+    assertEq(C.Descriptor(follower).configFingerprint, C.Descriptor(source).configFingerprint,
+        "goal-aware fingerprints converge")
+
+    -- Sequential non-authoritative catch-up for a goal mutation.
+    local stepSrc = profile("goals-step-src", admin)
+    local stepDst = profile("goals-step-dst", admin)
+    C.SetGuild(stepSrc, admin, GUILD, 2)
+    assertEq(select(2, S.ApplyRemoteConfig(stepDst, C.ExportSnapshot(stepSrc, { omitEvents = true }), admin)),
+        "applied", "follower applies guild configuration")
+    C.AddRequestedItem(stepSrc, admin, aqirite)
+    assertEq(select(2, S.ApplyRemoteConfig(stepDst, C.ExportSnapshot(stepSrc, { omitEvents = true }), admin)),
+        "applied", "follower applies the add_item step")
+    C.SetRequestedGoal(stepSrc, admin, aqirite, 33)
+    assertEq(select(2, S.ApplyRemoteConfig(stepDst, C.ExportSnapshot(stepSrc, { omitEvents = true }), admin)),
+        "applied", "follower applies a goal change as the next config step")
+    assertEq(stepDst._consumables.requestedItems[tostring(aqirite)].goal, 33, "stepped sync delivers the goal")
+    assertEq(C.Descriptor(stepDst).configFingerprint, C.Descriptor(stepSrc).configFingerprint,
+        "stepped goal sync fingerprints converge")
+
+    local copyDest = profile("goals-copy-dst", admin)
+    C.CopyConfiguration(source, copyDest)
+    assertEq(copyDest._consumables.requestedItems[tostring(aqirite)].goal, 75, "profile copy preserves goals")
+    assertEq(copyDest._consumables.requestedItems[tostring(flask)].goal, 0, "profile copy preserves goal 0")
+    assertEq(C.ItemDonatedTotal(copyDest, aqirite), 0, "profile copy starts with zero progress")
+
+    -- Multiple raw actors to the same item.
+    local multi = configured("goals-multi")
+    C.SetRequestedGoal(multi, admin, aqirite, 60)
+    C.CommitEvents(multi, "multi-1",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = donor, requested = true }, 10))
+    C.CommitEvents(multi, "multi-2",
+        W.DepositEvents({ generation = 1, itemId = aqirite, donor = vann, requested = true }, 15))
+    assertEq(C.ItemDonatedTotal(multi, aqirite), 25, "multiple actors each add once to item totals")
+    assertEq(C.Project(multi).contributions[donor][aqirite], 10, "raw actor contributions stay separate")
+    assertEq(C.Project(multi).contributions[vann][aqirite], 15, "raw actor contributions stay separate for each actor")
+end
+
+local function checkGoalCommitGate()
+    load("SpectrumFederation/modules/UI/Settings/Control/Controls.lua")
+    local should = SF.SettingsUI.Controls.ShouldCommitConsumableGoal
+    assertTrue(type(should) == "function", "goal commit gate is exported for regression coverage")
+    assertTrue(should({ boundItemId = aqirite, lastCommittedText = "0" }, "10", aqirite),
+        "a changed goal text is eligible to commit")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "10" }, "10", aqirite),
+        "an unchanged goal text does not commit again")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0", ignore = true }, "10", aqirite),
+        "ignored refresh updates do not commit")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0", cancel = true }, "10", aqirite),
+        "cancelled rebound edits do not commit")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0" }, "10", flask),
+        "text bound to a different item id does not commit")
+    assertFalse(should({ boundItemId = aqirite, lastCommittedText = "0" }, "10", nil),
+        "a missing commit item id does not commit")
+end
+
 local function checkSessionProfileNoticeRemoved()
     resetWorld()
     local active = profile("active-profile", admin)
@@ -2772,6 +2990,8 @@ checkRuntimeDepositPartialAndFailure()
 checkRuntimeCancelAndDeferredDelete()
 checkClear()
 checkCopyConfiguration()
+checkGoalsAndProgress()
+checkGoalCommitGate()
 checkSessionProfileNoticeRemoved()
 
 if failures > 0 then

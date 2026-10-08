@@ -2,7 +2,7 @@
 
 A Loot Helper sync session keeps one profile consistent across addon users in the same party or raid. Profiles are synchronized from their append-only change logs, so clients transfer only missing history when possible.
 
-Linked Character identity, admin implication, item-aware BiS, and progression are derived from that same history. All clients in a session must speak protocol version 7; protocol 6 and older clients are incompatible.
+Linked Character identity, admin implication, item-aware BiS, and progression are derived from that same history. All clients in a session must speak protocol version 8; protocol 7 and older clients are incompatible. Protocol incompatibility is debug-only and does not print to normal WoW chat.
 
 ## Start and end a session
 

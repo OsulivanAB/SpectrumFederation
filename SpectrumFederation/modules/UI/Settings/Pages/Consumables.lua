@@ -121,7 +121,9 @@ local function RequestedItems()
 		items[i] = {
 			text = ItemLabel(row.itemId),
 			canRemove = row.canRemove,
+			canEditGoal = row.canEditGoal,
 			itemId = row.itemId,
+			goal = row.goal or 0,
 		}
 	end
 	return items
@@ -318,7 +320,7 @@ local function Definition(panel)
 						end,
 					},
 					{
-						type = "scrollList",
+						type = "consumableRequestedList",
 						label = "Requested Items",
 						adminOnly = false,
 						height = 180,
@@ -330,6 +332,26 @@ local function Definition(panel)
 								return
 							end
 							Commit(ctx, { name = "remove_item", itemId = item.itemId })
+						end,
+						onGoalCommit = function(ctx, item, text)
+							local model = Model()
+							if not (model and model.canManageItems) then
+								ctx.section:SetMessage("Only a profile admin can change requested-item goals.", "error")
+								return
+							end
+							local C = SF.Consumables
+							local goal = C and C.ValidGoal and C.ValidGoal(text) or nil
+							if goal == nil then
+								ctx.section:SetMessage("Enter a non-negative whole-number goal.", "error")
+								if ctx.pageBuilder and ctx.pageBuilder.Refresh then
+									ctx.pageBuilder:Refresh()
+								end
+								return
+							end
+							if item and tonumber(item.goal) == goal then
+								return
+							end
+							Commit(ctx, { name = "set_goal", itemId = item.itemId, goal = goal })
 						end,
 					},
 					{

@@ -85,6 +85,12 @@ chunk("SpectrumFederation", SF)
 
 local P = SF.SyncProtocol
 
+assertEq(P.PROTO_CURRENT, 8, "protocol current is 8")
+assertEq(P.PROTO_MIN, 8, "protocol min is 8")
+assertEq(P.PROTO_MAX, 8, "protocol max is 8")
+assertTrue(not select(1, P.ValidateProtocolVersion(7)), "protocol 7 is rejected")
+assertTrue(select(1, P.ValidateProtocolVersion(8)), "protocol 8 is accepted")
+
 local function nackPayload(overrides)
     local payload = {
         seenProto = 2,
