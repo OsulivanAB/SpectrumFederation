@@ -74,6 +74,7 @@ local function makeFrame(width, height)
         relativePoint = "CENTER",
         x = 0,
         y = 0,
+        alpha = 1,
         __sfMinimized = false,
         __sfLocked = false,
     }
@@ -101,6 +102,12 @@ local function makeFrame(width, height)
     end
     function frame:GetPoint()
         return self.point, self.relativeTo, self.relativePoint, self.x, self.y
+    end
+    function frame:SetAlpha(alpha)
+        self.alpha = alpha
+    end
+    function frame:GetAlpha()
+        return self.alpha
     end
     function frame:ClearAllPoints()
         self.point = nil
@@ -181,6 +188,12 @@ local function resetWindowState()
         height = 520,
         expandedHeight = 520,
     }
+    SpectrumFederationDB.lootHelper.minimizedHeaderOpacity = nil
+    SF.SettingsStore = nil
+end
+
+local function setMinimizedOpacitySetting(value)
+    SpectrumFederationDB.lootHelper.minimizedHeaderOpacity = value
 end
 
 -- Sanity-check the mock: a CENTER-anchored SetSize grows from the middle.
@@ -274,6 +287,92 @@ local saved = SpectrumFederationDB.lootHelper.window
 assertTrue(saved.hidden == nil, "SaveState does not persist a hidden flag")
 assertTrue(saved.manuallyHidden == nil, "SaveState does not persist manuallyHidden")
 assertEq(saved.minimized, false, "SaveState keeps minimized=false for an expanded frame")
+
+-- Minimized opacity: defaults, lifecycle, live updates, invalid values.
+resetWindowState()
+Window._frame = makeFrame(480, 520)
+assertEq(Window:_NormalizeMinimizedOpacity(nil), 100, "missing opacity normalizes to 100")
+assertEq(Window:_NormalizeMinimizedOpacity("nope"), 100, "nonnumeric opacity normalizes to 100")
+assertEq(Window:_NormalizeMinimizedOpacity(0), 5, "opacity below 5 clamps to 5")
+assertEq(Window:_NormalizeMinimizedOpacity(150), 100, "opacity above 100 clamps to 100")
+assertEq(Window:_NormalizeMinimizedOpacity(55), 55, "in-range opacity is preserved")
+assertEq(Window:_ReadMinimizedOpacitySetting(), 100, "missing saved opacity reads as 100")
+
+Window:_ApplyMinimizedState()
+assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "expanded window keeps overall alpha at 100%")
+
+setMinimizedOpacitySetting(50)
+Window:ApplyMinimizedOpacity()
+assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "slider change while expanded does not alter frame alpha")
+
+Window._frame.__sfMinimized = true
+Window:_ApplyMinimizedState()
+assertAlmost(Window._frame:GetAlpha(), 0.5, 1e-6, "minimize applies configured opacity to the main frame")
+assertEq(Window._frame:GetHeight(), C.MINIMIZED_HEIGHT, "opacity apply does not change minimized height")
+
+setMinimizedOpacitySetting(5)
+Window:ApplyMinimizedOpacity()
+assertAlmost(Window._frame:GetAlpha(), 0.05, 1e-6, "live setting change updates a minimized window immediately")
+
+setMinimizedOpacitySetting(100)
+Window:ApplyMinimizedOpacity()
+assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "100% minimized opacity preserves full overall alpha")
+
+Window._frame.__sfMinimized = false
+Window:_ApplyMinimizedState()
+assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "restore always returns overall frame alpha to 100%")
+
+resetWindowState()
+setMinimizedOpacitySetting(25)
+SpectrumFederationDB.lootHelper.window = {
+    width = 480,
+    height = 520,
+    expandedHeight = 520,
+    minimized = true,
+    point = "CENTER",
+    relativePoint = "CENTER",
+    x = 0,
+    y = 0,
+}
+Window._frame = makeFrame(480, 520)
+Window:LoadState()
+assertAlmost(Window._frame:GetAlpha(), 0.25, 1e-6, "LoadState applies opacity for a saved minimized window")
+assertEq(Window._frame:GetHeight(), C.MINIMIZED_HEIGHT, "LoadState minimized height is unchanged by opacity")
+
+Window._frame.__sfMinimized = false
+Window:_ApplyMinimizedState()
+assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "expand after load restores overall alpha to 100%")
+
+resetWindowState()
+setMinimizedOpacitySetting("bad")
+Window._frame = makeFrame(480, 520)
+Window._frame.__sfMinimized = true
+Window:ApplyMinimizedOpacity()
+assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "invalid saved opacity falls back to 100% while minimized")
+
+setMinimizedOpacitySetting(1)
+Window:ApplyMinimizedOpacity()
+assertAlmost(Window._frame:GetAlpha(), 0.05, 1e-6, "out-of-range low opacity clamps to 5% while minimized")
+
+setMinimizedOpacitySetting(250)
+Window:ApplyMinimizedOpacity()
+assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "out-of-range high opacity clamps to 100% while minimized")
+
+-- SettingsStore path is preferred when present.
+resetWindowState()
+setMinimizedOpacitySetting(40)
+SF.SettingsStore = {
+    Get = function(_, path)
+        if path == "lootHelper.minimizedHeaderOpacity" then
+            return 70
+        end
+        return nil
+    end,
+}
+Window._frame = makeFrame(480, 520)
+Window._frame.__sfMinimized = true
+Window:ApplyMinimizedOpacity()
+assertAlmost(Window._frame:GetAlpha(), 0.7, 1e-6, "SettingsStore opacity is used when available")
 
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then

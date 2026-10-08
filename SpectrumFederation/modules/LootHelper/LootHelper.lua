@@ -11,6 +11,7 @@ function SF:InitializeLootHelperDatabase()
 			showWindowOutsideRaid = false,
 			lockLootWindow = false,
 			showMembersNotInRaid = false,
+			minimizedHeaderOpacity = 100,
 
 			window = {},
             syncSession = {}, -- Active session snapshot persisted across /reload
@@ -30,6 +31,7 @@ function SF:InitializeLootHelperDatabase()
 		if lh.showWindowOutsideRaid == nil then lh.showWindowOutsideRaid = false end
 		if lh.lockLootWindow == nil then lh.lockLootWindow = false end
 		if lh.showMembersNotInRaid == nil then lh.showMembersNotInRaid = false end
+		if lh.minimizedHeaderOpacity == nil then lh.minimizedHeaderOpacity = 100 end
 
 		if type(lh.window) ~= "table" then
 			lh.window = {}
