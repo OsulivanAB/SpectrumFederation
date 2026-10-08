@@ -2,6 +2,11 @@
 
 All notable changes to SpectrumFederation will be documented in this file.
 
+## [1.5.8-beta.9] - 2026-10-08
+
+### Added
+- Add per-item Raid Consumables donation goals (protocol 8)
+
 ## [1.5.8-beta.8] - 2026-10-07
 
 ### Fixed
