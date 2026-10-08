@@ -134,6 +134,7 @@ Change Area** below rather than maintaining a second full inventory here.
 ## Where To Start
 
 - Addon feature or bug fix: start in `SpectrumFederation/AGENTS.md`, then inspect the relevant module under `SpectrumFederation/modules/`.
+- New or modified user-facing addon strings: follow **Localization** in `SpectrumFederation/AGENTS.md` before delivery (locale keys, TOC load order, honest PR checkbox).
 - Runtime freeze, hang, callback, layout, timer, queue, inspect, or sync work: read the Client Stability section in `SpectrumFederation/AGENTS.md` and `.cursor/rules/addon-runtime.mdc` before changing the code.
 - Settings work: start with `SpectrumFederation/modules/Settings/` and `SpectrumFederation/modules/UI/Settings/`, then read `docs/development/settings-ui/`. Shared Settings/UI infrastructure (`Section`, `PageBuilder`, Controls, ScrollFrames, layout helpers, shared refresh) needs extra re-entrancy and consumer review.
 - Mouse Tracer work: start with `SpectrumFederation/modules/MouseTracer/` and `docs/development/mouse-tracer.md`.
@@ -344,6 +345,7 @@ Humans retain final review, required in-game verification, repair-batch authoriz
 | Repo orientation, validation map, validation modes, packaging policy summary | Root `AGENTS.md` |
 | Issue-backed implementation PR ↔ GitHub issue Development linking | Root `AGENTS.md` (**Issue-backed PR Development linking**) |
 | Addon runtime engineering (stability, caches, retries, messaging, behavioral tests) | `SpectrumFederation/AGENTS.md` (+ `.cursor/rules/addon-runtime.mdc` summary) |
+| Packaged addon user-facing string localization | `SpectrumFederation/AGENTS.md` (**Localization**) |
 | Operation authorization, governing policy source, batching, escalation, delivery | `.cursor/skills/ai-review-loop/SKILL.md` |
 | Per-finding dedupe, investigation, classification, validity vs suitability, recommendation | `.cursor/skills/pr-review-comments/SKILL.md` |
 | Codex review scope and coverage | `.github/codex-review-guidance.md` |

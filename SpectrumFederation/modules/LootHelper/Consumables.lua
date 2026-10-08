@@ -5,6 +5,13 @@ local _, SF = ...
 SF.Consumables = SF.Consumables or {}
 local C = SF.Consumables
 
+local function Loc(key, default)
+    if SF.LocaleText then
+        return SF.LocaleText(key, default)
+    end
+    return default or key
+end
+
 C.EVENT = {
     DONATION = "CONSUMABLE_DONATION",
     RESET = "CONSUMABLE_CONFIG_RESET",
@@ -1435,7 +1442,7 @@ function C.GoalProgress(profile)
         items = items,
         hasPositiveGoal = hasPositiveGoal,
         overallPercent = overallPercent,
-        overallEmptyText = "No goals configured.",
+        overallEmptyText = Loc("RAID_SUPPLIES_NO_GOALS_CONFIGURED", "No goals configured."),
         sumCapped = sumCapped,
         sumGoal = sumGoal,
     }
@@ -2113,18 +2120,59 @@ function C.SettingsModel(profile, actor, asAdmin)
     }
 end
 
+-- Suggested donation quantity for the Guild Bank helper. Finite goals guide the
+-- default amount; goal 0 stays unlimited. A completed finite goal suggests 0 and
+-- is reported as goalComplete so the UI can hide deposit controls.
+function C.SuggestedDonationQuantity(available, goal, donated)
+    available = math.floor(tonumber(available) or 0)
+    if available < 0 then available = 0 end
+    goal = C.ValidGoal(goal)
+    if goal == nil then goal = 0 end
+    donated = math.floor(tonumber(donated) or 0)
+    if donated < 0 then donated = 0 end
+    if goal == 0 then
+        return available, false
+    end
+    if donated >= goal then
+        return 0, true
+    end
+    local remaining = goal - donated
+    if remaining > available then remaining = available end
+    return remaining, false
+end
+
 function C.BuildDonationPlan(profile, carried, ctx)
     ctx = ctx or {}
     local cfg = C.Ensure(profile)
+    local progress = C.GoalProgress(profile)
+    local byItem = {}
+    for i = 1, #(progress.items or {}) do
+        local entry = progress.items[i]
+        if entry and entry.itemId then
+            byItem[entry.itemId] = entry
+        end
+    end
     local lines = {}
     for i = 1, #(carried or {}) do
         local row = carried[i]
         local itemId = tonumber(row.itemId)
-        local quantity = math.floor(tonumber(row.quantity) or 0)
-        if C.IsRequested(profile, itemId) and quantity > 0 and ctx.guildBankUsable then
+        local available = math.floor(tonumber(row.available ~= nil and row.available or row.quantity) or 0)
+        if C.IsRequested(profile, itemId) and available > 0 and ctx.guildBankUsable then
+            local entry = byItem[itemId]
+            local goal = entry and entry.goal or 0
+            local donated = entry and entry.donated or 0
+            local suggested, goalComplete = C.SuggestedDonationQuantity(available, goal, donated)
+            local noGoal = goal == 0
             lines[#lines + 1] = {
                 itemId = itemId,
-                quantity = quantity,
+                available = available,
+                quantity = suggested,
+                suggested = suggested,
+                goal = goal,
+                donated = donated,
+                percent = entry and entry.percent or nil,
+                noGoal = noGoal,
+                goalComplete = goalComplete and true or false,
                 quality = row.quality,
                 name = row.name,
                 generation = cfg.generation,
@@ -2133,7 +2181,11 @@ function C.BuildDonationPlan(profile, carried, ctx)
         end
     end
     table.sort(lines, function(a, b) return a.itemId < b.itemId end)
-    return { lines = lines, groups = { { key = "Guild Bank", lines = lines } } }
+    return {
+        lines = lines,
+        groups = { { key = "Guild Bank", lines = lines } },
+        progress = progress,
+    }
 end
 
 function C.RevalidateDonation(profile, line, ctx, inventoryQty)
@@ -2153,6 +2205,18 @@ function C.RevalidateDonation(profile, line, ctx, inventoryQty)
     end
     if not (ctx and ctx.guildBankUsable) then
         return false, "No Guild Bank donation path is available."
+    end
+    -- Completed finite goals must not start a new deposit, including stale clicks.
+    -- Incomplete goals may still intentionally over-donate within inventory limits.
+    local progress = C.GoalProgress(profile)
+    for i = 1, #(progress.items or {}) do
+        local entry = progress.items[i]
+        if entry and entry.itemId == tonumber(line.itemId) and not entry.noGoal then
+            if (tonumber(entry.donated) or 0) >= (tonumber(entry.goal) or 0) then
+                return false, Loc("RAID_SUPPLIES_GOAL_ALREADY_MET", "That item's donation goal is already met.")
+            end
+            break
+        end
     end
     return true
 end

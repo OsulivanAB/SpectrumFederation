@@ -173,7 +173,6 @@ end
 function QueryGuildBankTab(tab)
     world.tabQueries[#world.tabQueries + 1] = tab
 end
-GuildBankFrame = { IsShown = function() return world.bankOpen end }
 C_Club = { GetGuildClubId = function() return world.clubId end }
 function GetGuildInfo() return world.guildName, nil, nil, world.guildRealm end
 -- Retail exposes C_SpellBook. Legacy IsPlayerSpell remains as a fallback only.
@@ -215,6 +214,8 @@ GameTooltip = {
     owner = nil,
     text = nil,
     spellId = nil,
+    itemId = nil,
+    hyperlink = nil,
     shown = false,
 }
 function GameTooltip:SetOwner(owner)
@@ -224,6 +225,14 @@ function GameTooltip:SetSpellByID(spellId)
     self.spellId = spellId
     self.text = "Mobile Banking"
 end
+function GameTooltip:SetItemByID(itemId)
+    self.itemId = itemId
+    self.text = "Item" .. tostring(itemId)
+end
+function GameTooltip:SetHyperlink(link)
+    self.hyperlink = link
+    self.text = tostring(link)
+end
 function GameTooltip:SetText(text)
     self.text = text
 end
@@ -232,6 +241,9 @@ function GameTooltip:Show()
 end
 function GameTooltip:Hide()
     self.shown = false
+end
+function GetItemIcon(itemId)
+    return "Interface\\Icons\\Item" .. tostring(itemId)
 end
 C_Item = {
     GetItemInfo = function(itemId)
@@ -298,24 +310,60 @@ local createdFrames = {}
 local FrameMethods = {}
 local function FrameMock(kind, parent)
     frameCount = frameCount + 1
-    return setmetatable({ kind = kind, parent = parent, scripts = {}, hooks = {}, shown = true, enabled = true, text = "" },
-        { __index = FrameMethods })
+    return setmetatable({
+        kind = kind,
+        parent = parent,
+        scripts = {},
+        hooks = {},
+        shown = true,
+        enabled = true,
+        text = "",
+        width = 0,
+        height = 0,
+    }, { __index = FrameMethods })
 end
 local function noop() end
 for _, name in ipairs({
-    "SetSize", "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
-    "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH", "SetWidth",
-    "SetHeight", "SetAutoFocus", "SetNumeric", "ClearFocus", "SetScrollChild", "RegisterEvent",
+    "ClearAllPoints", "SetAllPoints", "SetFrameStrata", "EnableMouse", "SetMovable",
+    "RegisterForDrag", "StartMoving", "StopMovingOrSizing", "SetBackdrop", "SetJustifyH",
+    "SetAutoFocus", "SetNumeric", "SetScrollChild", "RegisterEvent",
+    "SetMinMaxValues", "SetStatusBarTexture", "SetStatusBarColor", "SetWordWrap",
 }) do
     FrameMethods[name] = noop
+end
+function FrameMethods:SetWidth(w)
+    self.width = tonumber(w) or 0
+end
+function FrameMethods:GetWidth()
+    return self.width or 0
+end
+function FrameMethods:SetHeight(h)
+    self.height = tonumber(h) or 0
+end
+function FrameMethods:GetHeight()
+    return self.height or 380
+end
+function FrameMethods:SetSize(w, h)
+    self:SetWidth(w)
+    self:SetHeight(h)
 end
 function FrameMethods:GetLeft() return self.pointLeft or 100 end
 function FrameMethods:GetBottom() return self.pointBottom or 200 end
 function FrameMethods:SetPoint(point, relative, relativePoint, x, y)
+    self.anchor = {
+        point = point,
+        relative = relative,
+        relativePoint = relativePoint,
+        x = x,
+        y = y,
+    }
     if point == "BOTTOMLEFT" and relativePoint == "BOTTOMLEFT" then
         self.pointLeft = x
         self.pointBottom = y
     end
+end
+function FrameMethods:ClearAllPoints()
+    self.anchor = nil
 end
 function FrameMethods:SetScript(name, fn) self.scripts[name] = fn end
 function FrameMethods:HookScript(name, fn)
@@ -335,6 +383,10 @@ function FrameMethods:SetShown(shown) self.shown = shown and true or false end
 function FrameMethods:Enable() self.enabled = true end
 function FrameMethods:Disable() self.enabled = false end
 function FrameMethods:IsEnabled() return self.enabled end
+function FrameMethods:HasFocus() return self.focused == true end
+function FrameMethods:SetFocus() self.focused = true end
+function FrameMethods:ClearFocus() self.focused = false end
+function FrameMethods:SetValue(value) self.value = value end
 function FrameMethods:CreateFontString() return FrameMock("FontString", self) end
 function FrameMethods:CreateTexture()
     local tex = FrameMock("Texture", self)
@@ -344,6 +396,7 @@ function FrameMethods:CreateTexture()
     function tex:SetDesaturated(value) self.desaturated = value and true or false end
     function tex:SetTexCoord() end
     function tex:SetColorTexture() end
+    function tex:SetVertexColor() end
     return tex
 end
 function FrameMethods:RegisterForClicks() end
@@ -363,6 +416,20 @@ function CreateFrame(kind, name, parent, template)
     return frame
 end
 UIParent = FrameMock("Frame")
+GuildBankFrame = FrameMock("Frame")
+GuildBankFrame.height = 420
+function GuildBankFrame:IsShown() return world.bankOpen end
+-- Blizzard GuildBankTabTemplate geometry used for alignment clearance tests.
+-- Clickable frame is 42 wide; BACKGROUND texture is 64 wide and overhangs.
+local GUILD_BANK_SIDE_TAB_FRAME_WIDTH = 42
+local GUILD_BANK_SIDE_TAB_TEXTURE_WIDTH = 64
+local GUILD_BANK_SIDE_TAB_ANCHOR_X = -1
+local GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT =
+    GUILD_BANK_SIDE_TAB_ANCHOR_X + GUILD_BANK_SIDE_TAB_TEXTURE_WIDTH
+-- Visible art ends ~63 past GuildBankFrame TOPRIGHT; helper must clear that.
+-- Compact donation helper target (~half of the previous 480 width).
+local REVIEW_COMPACT_WIDTH_MIN = 230
+local REVIEW_COMPACT_WIDTH_MAX = 280
 
 -- ---------------------------------------------------------------------------
 -- SF namespace and production modules
@@ -408,6 +475,8 @@ local function load(path)
     local chunk = assert(loadfile(path))
     chunk("SpectrumFederation", SF)
 end
+-- Locale must load before modules that render localized user-facing text.
+load("SpectrumFederation/locale/enUS.lua")
 load("SpectrumFederation/modules/LootHelper/Consumables.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesRouting.lua")
 load("SpectrumFederation/modules/LootHelper/ConsumablesWorkflow.lua")
@@ -526,6 +595,12 @@ local function resetRuntime()
     RT._seenProfileId = nil
     RT.lastAccess = nil
     RT.tokenSeq = 0
+    if GuildBankFrame then
+        GuildBankFrame.__sfConsumablesSizeHook = nil
+        GuildBankFrame.height = 420
+        GuildBankFrame.hooks = {}
+        GuildBankFrame.anchor = nil
+    end
 end
 
 local function resetSync()
@@ -866,12 +941,44 @@ local function checkPlanAndWorkflow()
     assertEq(#plan.lines, 2, "the plan lists only requested carried items")
     assertEq(plan.lines[1].itemId, aqirite, "plan lines are sorted by item id")
     assertEq(plan.lines[1].quantity, 40, "plan quantities are whole items")
+    assertEq(plan.lines[1].available, 40, "plan lines retain the carried available count")
+    assertTrue(plan.lines[1].noGoal, "default requested items are No Goal")
+    assertFalse(plan.lines[1].goalComplete, "No Goal items are never goal-complete")
     assertTrue(plan.lines[1].guildBank, "plan lines target the guild bank")
     assertEq(plan.lines[1].generation, 1, "plan lines carry the configuration generation")
     assertEq(#plan.groups, 1, "the plan has one destination group")
     assertEq(plan.groups[1].key, "Guild Bank", "the destination group is the Guild Bank")
+    assertTrue(plan.progress ~= nil, "the plan exposes authoritative GoalProgress")
     assertEq(#C.BuildDonationPlan(p, carried, { guildBankUsable = false }).lines, 0, "without a usable guild bank the plan is empty")
     assertEq(#C.BuildDonationPlan(p, nil, { guildBankUsable = true }).lines, 0, "no carried items means an empty plan")
+
+    assertEq(C.SuggestedDonationQuantity(50, 200, 175), 25, "suggested quantity is min(available, remaining)")
+    assertEq(C.SuggestedDonationQuantity(50, 0, 999), 50, "goal-0 suggestions use the full available count")
+    local completeSuggested, completeFlag = C.SuggestedDonationQuantity(50, 100, 110)
+    assertEq(completeSuggested, 0, "completed goals suggest zero")
+    assertTrue(completeFlag, "completed goals report goalComplete")
+    C.SetRequestedGoal(p, admin, aqirite, 200)
+    C.CommitEvents(p, "plan-goal-donation", W.DepositEvents({
+        generation = 1, itemId = aqirite, donor = donor, requested = true,
+    }, 175))
+    local limited = C.BuildDonationPlan(p, { { itemId = aqirite, available = 50, quantity = 50 } }, { guildBankUsable = true })
+    assertEq(limited.lines[1].suggested, 25, "finite incomplete goals suggest the remaining need")
+    assertEq(limited.lines[1].quantity, 25, "plan quantity defaults to the suggestion")
+    assertEq(limited.lines[1].percent, 87, "plan lines carry the floor percent from GoalProgress")
+    assertFalse(limited.lines[1].goalComplete, "incomplete goals remain depositable")
+    C.CommitEvents(p, "plan-goal-complete", W.DepositEvents({
+        generation = 1, itemId = aqirite, donor = donor, requested = true,
+    }, 30))
+    local done = C.BuildDonationPlan(p, { { itemId = aqirite, available = 50, quantity = 50 } }, { guildBankUsable = true })
+    assertTrue(done.lines[1].goalComplete, "met goals stay in the plan when carried")
+    assertEq(done.lines[1].percent, 102, "completed plan lines keep over-100 percents")
+    assertEq(done.lines[1].quantity, 0, "completed goals suggest no deposit quantity")
+    local blocked, blockedErr = C.RevalidateDonation(p, {
+        itemId = aqirite, quantity = 5, generation = done.lines[1].generation,
+    }, { guildBankUsable = true }, 50)
+    assertFalse(blocked, "completed goals fail deposit revalidation")
+    assertTrue(contains(blockedErr, "already met"), "completed-goal revalidation explains the block")
+    C.SetRequestedGoal(p, admin, aqirite, 0)
 
     local line = plan.lines[1]
     assertTrue(select(1, C.RevalidateDonation(p, line, { guildBankUsable = true }, 40)), "a current plan line revalidates")
@@ -2041,11 +2148,22 @@ local function checkRuntimeReview()
     assertTrue(review ~= nil and review:IsShown(), "opening the guild bank auto-opens the review when carrying requested items")
     assertEq(review.Rows[1].Text.text, "Guild Bank", "the review groups lines under the Guild Bank")
     local row = review.Rows[2]
-    assertEq(row.Text.text, "Item190000 x25", "the review shows the requested item and quantity")
+    assertTrue(row.IconButton and row.IconButton:IsShown(), "donation rows show the item icon")
+    assertEq(row.Icon.texture, "Interface\\Icons\\Item190000", "the icon matches the requested item")
+    assertEq(row.Progress.text, "No Goal", "goal-0 items display No Goal")
+    assertEq(row.Edit.text, "25", "goal-0 suggested quantity uses the carried count")
     assertEq(row.Button.text, "Deposit", "the review action is Deposit")
     assertTrue(row.Button.enabled, "the Deposit action is enabled when the configured tab can take deposits")
     assertTrue(review.Rows[3] == nil or not review.Rows[3]:IsShown(), "non-requested items are not listed")
     assertEq(review.Status.text, "The configured guild bank tab can take deposits.", "the review explains the deposit path")
+    assertEq(review.ProgressEmpty.text, "No goals configured.", "no positive goals shows the empty overall state")
+    assertFalse(review.ProgressBar:IsShown(), "no positive goals hides the overall progress bar")
+
+    GameTooltip.shown = false
+    GameTooltip.itemId = nil
+    row.IconButton.scripts.OnEnter(row.IconButton)
+    assertTrue(GameTooltip.shown, "hovering the item icon shows a tooltip")
+    assertEq(GameTooltip.itemId, aqirite, "the tooltip identifies the requested item")
 
     review:Hide()
     RT:OnBankOpened()
@@ -2071,7 +2189,7 @@ local function checkRuntimeReview()
     assertEq(RT.qtyOverrides[aqirite], 25, "an edited review quantity clamps to the carried count")
     row.Edit:SetText("3")
     row.Edit.scripts.OnEnterPressed(row.Edit)
-    assertEq(review.Rows[2].Text.text, "Item190000 x3", "the review shows the edited quantity")
+    assertEq(review.Rows[2].Edit.text, "3", "the review shows the edited quantity")
 
     row.Edit:SetText("7")
     row.Button.scripts.OnClick(row.Button)
@@ -2985,6 +3103,287 @@ local function checkSessionProfileNoticeRemoved()
     assertEq(RT:AccountingProfile(), session, "accounting still resolves the session profile without chat notice")
 end
 
+local function checkFocusedEditRowReuse()
+    local p = runtimeFixture("rt-focused-row-reuse")
+    assertTrue(select(1, C.AddRequestedItem(p, admin, flask)), "fixture requests a second item")
+    world.bags[0] = {
+        [1] = { itemId = aqirite, count = 10 },
+        [2] = { itemId = flask, count = 8 },
+    }
+    world.bags[5] = {}
+    world.bankOpen = true
+    RT:OnBankOpened()
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(), "helper opens with two requested items")
+    local aqRow = review.Rows[2]
+    assertEq(aqRow.boundItemId, aqirite, "first data row binds aqirite")
+    assertEq(aqRow.Edit.text, "10", "aqirite starts with its suggested quantity")
+    aqRow.Edit:SetText("9")
+    aqRow.Edit:SetFocus()
+    assertTrue(aqRow.Edit:HasFocus(), "quantity edit is focused before the list changes")
+
+    -- Same item rebuild preserves the in-progress edit.
+    RT:RebuildReview()
+    aqRow = review.Rows[2]
+    assertEq(aqRow.boundItemId, aqirite, "same-item rebuild keeps the row binding")
+    assertEq(aqRow.Edit.text, "9", "focused same-item edits survive RebuildReview")
+    assertTrue(aqRow.Edit:HasFocus(), "same-item rebuild leaves focus intact")
+
+    -- Removing the focused item rebinds the pooled row to flask.
+    assertTrue(select(1, C.RemoveRequestedItem(p, admin, aqirite)), "removing aqirite changes the donation list")
+    RT:RebuildReview()
+    local flaskRow = review.Rows[2]
+    assertEq(flaskRow.boundItemId, flask, "pooled row rebinds to the remaining requested item")
+    assertFalse(flaskRow.Edit:HasFocus(), "stale focus is cleared when the row changes items")
+    assertEq(flaskRow.Edit.text, "8", "rebound row shows the new item's suggested quantity")
+
+    flaskRow.Button.scripts.OnClick(flaskRow.Button)
+    assertEq(RT.qtyOverrides[flask], 8, "Deposit uses the rebound item's quantity, not the stale edit")
+    assertEq(RT.qtyOverrides[aqirite], nil, "stale aqirite override is not applied after rebinding")
+    assertTrue(RT.depositWork ~= nil or RT.depositIntent ~= nil or #world.places > 0,
+        "Deposit starts for the rebound item")
+    if RT.depositWork then
+        assertEq(RT.depositWork.line.itemId, flask, "deposit work targets the rebound item")
+        assertEq(RT.depositWork.intended, 8, "deposit work uses the new suggestion, not the stale 9")
+    end
+    RT:CancelDepositWork()
+    RT.depositIntent = nil
+    world.places = {}
+    unchanged(p, "focused edit row reuse")
+end
+
+local function checkSmartDonationHelper()
+    local p = runtimeFixture("rt-smart-donation")
+    C.AddRequestedItem(p, admin, flask)
+    C.SetRequestedGoal(p, admin, aqirite, 200)
+    C.SetRequestedGoal(p, admin, flask, 0)
+    C.CommitEvents(p, "smart-donated", W.DepositEvents({
+        generation = 1, itemId = aqirite, donor = donor, requested = true,
+    }, 175))
+    world.bags[0][1] = { itemId = aqirite, count = 40 }
+    world.bags[0][2] = { itemId = aqirite, count = 10 }
+    world.bags[0][3] = { itemId = flask, count = 12 }
+    world.bags[5] = {}
+    world.bankOpen = true
+    GuildBankFrame.height = 450
+    RT:OnBankOpened()
+    local review = RT.review
+    assertTrue(review ~= nil and review:IsShown(), "smart helper auto-opens with mixed goals")
+    local reviewWidth = review:GetWidth()
+    assertTrue(reviewWidth >= REVIEW_COMPACT_WIDTH_MIN and reviewWidth <= REVIEW_COMPACT_WIDTH_MAX,
+        "donation helper uses a compact width near half of 480")
+    assertTrue(reviewWidth < 480, "donation helper is narrower than the previous 480 width")
+    assertTrue(review.Child ~= nil and review.Child:GetWidth() > 0
+            and review.Child:GetWidth() < reviewWidth,
+        "scroll child is narrower than the compact helper frame")
+    assertTrue(review.anchor and review.anchor.relative == GuildBankFrame,
+        "opening aligns the helper to the Guild Bank")
+    assertEq(review.anchor.point, "TOPLEFT", "helper top aligns beside the Guild Bank")
+    assertEq(review.anchor.relativePoint, "TOPRIGHT", "helper sits alongside the Guild Bank")
+    assertEq(review.anchor.y, 0, "helper top edge stays level with the Guild Bank")
+    assertTrue(review.anchor.x ~= nil and review.anchor.x > GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT,
+        "helper clears the Guild Bank side-tab decorative overhang")
+    assertTrue(review.anchor.x >= GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT + 8
+            and review.anchor.x <= GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT + 12,
+        "helper leaves about 8-10 UI units after the visible side-tab art")
+    assertTrue(GUILD_BANK_SIDE_TAB_TEXTURE_WIDTH > GUILD_BANK_SIDE_TAB_FRAME_WIDTH,
+        "side-tab mock reflects decorative texture wider than the clickable frame")
+    assertEq(review:GetHeight(), 450, "helper height matches the Guild Bank")
+    assertTrue(review.ProgressBar:IsShown(), "positive goals show the overall progress bar")
+    assertEq(review.ProgressBar.Text.text, "87%", "overall progress uses GoalProgress (175/200)")
+    assertFalse(review.ProgressEmpty:IsShown(), "positive goals hide the empty overall state")
+
+    local aqRow, flaskRow
+    for i = 1, #review.Rows do
+        local row = review.Rows[i]
+        if row:IsShown() and row.IconButton and row.IconButton:IsShown() then
+            if row.Icon.texture == "Interface\\Icons\\Item190000" then aqRow = row end
+            if row.Icon.texture == "Interface\\Icons\\Item" .. tostring(flask) then flaskRow = row end
+        end
+    end
+    assertTrue(aqRow ~= nil, "finite-goal item row is shown")
+    assertTrue(flaskRow ~= nil, "goal-0 item row is shown")
+    assertTrue(aqRow:GetWidth() > 0 and aqRow:GetWidth() <= review.Child:GetWidth(),
+        "item rows fit inside the compact scroll child")
+    local rowControlsWidth = (aqRow.IconButton and aqRow.IconButton:GetWidth() or 0)
+        + (aqRow.Progress and aqRow.Progress:GetWidth() or 0)
+        + (aqRow.Edit and aqRow.Edit:GetWidth() or 0)
+        + (aqRow.Button and aqRow.Button:GetWidth() or 0)
+    assertTrue(rowControlsWidth > 0 and rowControlsWidth <= aqRow:GetWidth(),
+        "icon, progress, qty, and Deposit fit inside the compact row width")
+    assertEq(aqRow.Progress.text, "87%", "finite-goal row shows the floor percent")
+    assertEq(aqRow.Edit.text, "25", "finite-goal suggestion is min(available, remaining)")
+    assertTrue(aqRow.Button:IsShown(), "incomplete finite goals keep Deposit")
+    assertEq(flaskRow.Progress.text, "No Goal", "goal-0 row shows No Goal")
+    assertEq(flaskRow.Edit.text, "12", "goal-0 suggestion uses carried quantity")
+    assertTrue(flaskRow.Button:IsShown(), "goal-0 items remain depositable")
+
+    -- Manual over-donation while incomplete is allowed; inventory still clamps.
+    aqRow.Edit:SetText("40")
+    aqRow.Edit.scripts.OnEnterPressed(aqRow.Edit)
+    assertEq(RT.qtyOverrides[aqirite], 40, "manual quantity above remaining goal is kept")
+    aqRow = nil
+    for i = 1, #review.Rows do
+        local row = review.Rows[i]
+        if row:IsShown() and row.Icon and row.Icon.texture == "Interface\\Icons\\Item190000" then
+            aqRow = row
+        end
+    end
+    assertEq(aqRow.Edit.text, "40", "rebuild preserves the visit override")
+    aqRow.Edit:SetText("999")
+    aqRow.Edit.scripts.OnEnterPressed(aqRow.Edit)
+    assertEq(RT.qtyOverrides[aqirite], 50, "manual quantity above inventory clamps to available")
+
+    -- Active edit is not overwritten by ordinary rebuilds.
+    aqRow.Edit:SetText("33")
+    aqRow.Edit:SetFocus()
+    RT:RebuildReview()
+    for i = 1, #review.Rows do
+        local row = review.Rows[i]
+        if row:IsShown() and row.Icon and row.Icon.texture == "Interface\\Icons\\Item190000" then
+            aqRow = row
+        end
+    end
+    assertEq(aqRow.Edit.text, "33", "focused quantity edits survive RebuildReview")
+    aqRow.Edit:ClearFocus()
+    aqRow.Edit.scripts.OnEnterPressed(aqRow.Edit)
+    assertEq(RT.qtyOverrides[aqirite], 33, "leaving the edit commits the visit override")
+
+    -- Tab switch must not clear overrides; bank close must.
+    local kept = RT.qtyOverrides[aqirite]
+    world.currentTab = 1
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertFalse(review:IsShown(), "leaving the configured tab hides the helper")
+    assertEq(RT.qtyOverrides[aqirite], kept, "tab switch does not clear quantity overrides")
+    world.currentTab = 2
+    RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+    assertTrue(review:IsShown(), "returning to the configured tab reopens the helper")
+    assertEq(RT.qtyOverrides[aqirite], kept, "overrides survive configured-tab return")
+
+    -- Successful deposit does not specially reset overrides.
+    for i = 1, #review.Rows do
+        local row = review.Rows[i]
+        if row:IsShown() and row.Icon and row.Icon.texture == "Interface\\Icons\\Item190000" then
+            aqRow = row
+        end
+    end
+    aqRow.Button.scripts.OnClick(aqRow.Button)
+    assertEq(RT.qtyOverrides[aqirite], 33, "starting a deposit does not clear the visit override")
+    RT:CancelDepositWork()
+    RT.depositIntent = nil
+    world.places = {}
+
+    -- Duplicate open while already open must not wipe overrides.
+    RT:OnBankOpened()
+    assertEq(RT.qtyOverrides[aqirite], 33, "duplicate Guild Bank open keeps visit overrides")
+
+    -- Manual drag is preserved while visible; height still follows the bank.
+    review:ClearAllPoints()
+    review:SetPoint("CENTER", UIParent, "CENTER", 10, 20)
+    GuildBankFrame.height = 500
+    if GuildBankFrame.hooks.OnSizeChanged then
+        for i = 1, #GuildBankFrame.hooks.OnSizeChanged do
+            GuildBankFrame.hooks.OnSizeChanged[i]()
+        end
+    end
+    assertEq(review:GetHeight(), 500, "Guild Bank height changes update the helper height")
+    assertEq(review.anchor.point, "CENTER", "height updates do not snap a dragged helper")
+
+    RT:OnBankClosed()
+    assertEq(RT.qtyOverrides[aqirite], nil, "closing the Guild Bank clears quantity overrides")
+    assertFalse(review:IsShown(), "closing the Guild Bank hides the helper")
+
+    -- Reopen: fresh suggestions from current progress/inventory; realign.
+    world.bags[0][1] = { itemId = aqirite, count = 40 }
+    world.bags[0][2] = { itemId = aqirite, count = 10 }
+    world.bankOpen = true
+    GuildBankFrame.height = 430
+    RT:OnBankOpened()
+    assertTrue(review:IsShown(), "reopening can show the helper again")
+    assertEq(RT.qtyOverrides[aqirite], nil, "a new visit starts without prior overrides")
+    assertEq(review.anchor.point, "TOPLEFT", "reopening restores Guild Bank alignment")
+    assertEq(review.anchor.relativePoint, "TOPRIGHT", "reopening restores side-of-bank anchoring")
+    assertTrue(review.anchor.x ~= nil and review.anchor.x > GUILD_BANK_SIDE_TAB_VISIBLE_EXTENT,
+        "reopening still clears the Guild Bank side-tab decorative overhang")
+    assertEq(review:GetHeight(), 430, "reopening matches the current Guild Bank height")
+    for i = 1, #review.Rows do
+        local row = review.Rows[i]
+        if row:IsShown() and row.Icon and row.Icon.texture == "Interface\\Icons\\Item190000" then
+            aqRow = row
+        end
+    end
+    assertEq(aqRow.Edit.text, "25", "reopen suggests remaining need from current progress")
+
+    -- Completed finite goal: visible percent, no deposit controls; helper still auto-opens.
+    C.CommitEvents(p, "smart-complete", W.DepositEvents({
+        generation = 1, itemId = aqirite, donor = donor, requested = true,
+    }, 30))
+    world.bags[0][3] = nil
+    RT:OnBankClosed()
+    world.bankOpen = false
+    world.bags[0][1] = { itemId = aqirite, count = 8 }
+    world.bags[0][2] = nil
+    world.bankOpen = true
+    RT:OnBankOpened()
+    assertTrue(review:IsShown(), "helper still auto-opens when only completed goals are carried")
+    aqRow = nil
+    for i = 1, #review.Rows do
+        local row = review.Rows[i]
+        if row:IsShown() and row.Icon and row.Icon.texture == "Interface\\Icons\\Item190000" then
+            aqRow = row
+        end
+    end
+    assertTrue(aqRow ~= nil, "completed-goal items remain listed when carried")
+    assertEq(aqRow.Progress.text, "102%", "completed goals show percents above 100")
+    assertFalse(aqRow.Edit:IsShown(), "completed goals hide the quantity field")
+    assertFalse(aqRow.Button:IsShown(), "completed goals hide Deposit")
+    assertEq(review.ProgressBar.Text.text, "100%", "overall progress caps the completed item at its goal")
+
+    -- Stale completed-goal deposit callback must not start work.
+    local staleLine = {
+        itemId = aqirite,
+        quantity = 5,
+        generation = p._consumables.generation,
+        guildBank = true,
+    }
+    local collected = RT:Collect()
+    RT:BeginDeposit(staleLine, collected)
+    assertEq(RT.depositWork, nil, "completed goals reject BeginDeposit")
+    assertEq(RT.depositIntent, nil, "completed goals create no deposit intent")
+    assertTrue(#world.warnings > 0, "completed-goal deposit warns the player")
+
+    -- Progress update while open: incomplete → complete hides controls.
+    C.SetRequestedGoal(p, admin, aqirite, 300)
+    RT:RebuildReview()
+    for i = 1, #review.Rows do
+        local row = review.Rows[i]
+        if row:IsShown() and row.Icon and row.Icon.texture == "Interface\\Icons\\Item190000" then
+            aqRow = row
+        end
+    end
+    assertTrue(aqRow.Edit:IsShown(), "raising the goal restores deposit controls")
+    assertEq(aqRow.Edit.text, "8", "updated suggestion uses remaining need and bags")
+    assertEq(aqRow.Progress.text, "68%", "progress updates while the helper is open")
+
+    -- Bounded lifecycle with the new Guild Bank size hook.
+    local frames = frameCount
+    local afterN = #world.after
+    local timersN = #liveTimers()
+    for _ = 1, 30 do
+        world.currentTab = 2
+        world.bankOpen = true
+        RT:OnBankOpened()
+        world.currentTab = 1
+        RT:OnEvent("GUILDBANKBAGSLOTS_CHANGED")
+        RT:OnBankClosed()
+        world.bankOpen = false
+    end
+    assertEq(frameCount, frames, "smart helper lifecycle allocates no new frames")
+    assertEq(#world.after, afterN, "smart helper lifecycle schedules no deferred work")
+    assertEq(#liveTimers(), timersN, "smart helper lifecycle creates no live timers")
+    unchanged(p, "smart donation helper")
+end
+
 checkGuildConfiguration()
 checkRequestedItems()
 checkApplyOpAndSettingsModel()
@@ -3016,6 +3415,8 @@ checkCopyConfiguration()
 checkGoalsAndProgress()
 checkGoalCommitGate()
 checkSessionProfileNoticeRemoved()
+checkFocusedEditRowReuse()
+checkSmartDonationHelper()
 
 if failures > 0 then
     io.stderr:write(string.format("%d failed, %d passed\n", failures, passes))
