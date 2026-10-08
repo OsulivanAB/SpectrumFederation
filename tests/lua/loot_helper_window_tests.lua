@@ -374,6 +374,61 @@ Window._frame.__sfMinimized = true
 Window:ApplyMinimizedOpacity()
 assertAlmost(Window._frame:GetAlpha(), 0.7, 1e-6, "SettingsStore opacity is used when available")
 
+-- Reset All restores opacity default and refreshes a live minimized window.
+local lootHelperChunk = assert(loadfile("SpectrumFederation/modules/LootHelper/LootHelper.lua"))
+lootHelperChunk("SpectrumFederation", SF)
+
+resetWindowState()
+setMinimizedOpacitySetting(25)
+SpectrumFederationDB.lootHelper.profiles = { ["p1"] = { id = "p1", name = "Test" } }
+SpectrumFederationDB.lootHelper.activeProfileId = "p1"
+SF.lootHelperDB = SpectrumFederationDB.lootHelper
+SF.SettingsStore = nil
+SF.SettingsSchema = {
+    DEFAULTS = {
+        lootHelper = {
+            minimizedHeaderOpacity = 100,
+        },
+    },
+}
+Window._frame = makeFrame(480, 520)
+Window._frame.__sfMinimized = true
+Window:ApplyMinimizedOpacity()
+assertAlmost(Window._frame:GetAlpha(), 0.25, 1e-6, "precondition: non-default minimized opacity applied")
+
+local resetOk = SF:ResetAllLootHelperSettings()
+assertTrue(resetOk, "ResetAllLootHelperSettings succeeds")
+assertEq(SpectrumFederationDB.lootHelper.minimizedHeaderOpacity, 100, "Reset All restores minimizedHeaderOpacity default")
+assertEq(SpectrumFederationDB.lootHelper.activeProfileId, nil, "Reset All still clears activeProfileId")
+assertTrue(next(SpectrumFederationDB.lootHelper.profiles) == nil, "Reset All still clears profiles")
+assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "Reset All reapplies default opacity to a minimized window")
+
+-- SettingsStore:Set path also restores opacity and notifies listeners.
+resetWindowState()
+setMinimizedOpacitySetting(40)
+SF.lootHelperDB = SpectrumFederationDB.lootHelper
+local setCalls = {}
+SF.SettingsStore = {
+    Set = function(_, path, value)
+        table.insert(setCalls, { path = path, value = value })
+        if path == "lootHelper.minimizedHeaderOpacity" then
+            SpectrumFederationDB.lootHelper.minimizedHeaderOpacity = value
+            Window:ApplyMinimizedOpacity()
+        end
+    end,
+}
+Window._frame = makeFrame(480, 520)
+Window._frame.__sfMinimized = true
+Window:ApplyMinimizedOpacity()
+assertAlmost(Window._frame:GetAlpha(), 0.4, 1e-6, "precondition: SettingsStore reset path starts at 40%")
+
+resetOk = SF:ResetAllLootHelperSettings()
+assertTrue(resetOk, "ResetAllLootHelperSettings succeeds with SettingsStore")
+assertEq(#setCalls, 1, "Reset All writes opacity once through SettingsStore:Set")
+assertEq(setCalls[1].path, "lootHelper.minimizedHeaderOpacity", "Reset All Sets the opacity path")
+assertEq(setCalls[1].value, 100, "Reset All Sets opacity to the schema default")
+assertAlmost(Window._frame:GetAlpha(), 1, 1e-6, "SettingsStore reset path restores full overall alpha")
+
 io.stdout:write(string.format("%d passed, %d failed\n", passes, failures))
 if failures > 0 then
     os.exit(1)

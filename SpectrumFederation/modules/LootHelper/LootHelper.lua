@@ -831,6 +831,26 @@ function SF:ResetAllLootHelperSettings()
 	db.activeProfileId = nil
 	db.activeProfile = nil
 
+	-- Account-local window opacity is not profile data; restore the schema default
+	-- and refresh a live minimized window through the SettingsStore path when available.
+	local defaultOpacity = 100
+	if SF.SettingsSchema
+		and SF.SettingsSchema.DEFAULTS
+		and SF.SettingsSchema.DEFAULTS.lootHelper
+		and SF.SettingsSchema.DEFAULTS.lootHelper.minimizedHeaderOpacity ~= nil
+	then
+		defaultOpacity = SF.SettingsSchema.DEFAULTS.lootHelper.minimizedHeaderOpacity
+	end
+	if SF.SettingsStore and type(SF.SettingsStore.Set) == "function" then
+		SF.SettingsStore:Set("lootHelper.minimizedHeaderOpacity", defaultOpacity)
+	else
+		db.minimizedHeaderOpacity = defaultOpacity
+		local window = SF.LootHelperWindow and SF.LootHelperWindow.Window
+		if window and window.ApplyMinimizedOpacity then
+			window:ApplyMinimizedOpacity()
+		end
+	end
+
 	if SF.Debug then
 		SF.Debug:Info("DATABASE", "Reset all loot helper settings - cleared %d profiles", profileCount)
 	end
