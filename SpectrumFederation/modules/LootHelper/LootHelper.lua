@@ -841,8 +841,14 @@ function SF:ResetAllLootHelperSettings()
 	then
 		defaultOpacity = SF.SettingsSchema.DEFAULTS.lootHelper.minimizedHeaderOpacity
 	end
-	if SF.SettingsStore and type(SF.SettingsStore.Set) == "function" then
-		SF.SettingsStore:Set("lootHelper.minimizedHeaderOpacity", defaultOpacity)
+	-- Require an initialized store (Store.db). A loaded-but-uninitialized SettingsStore
+	-- must not crash Reset All in tests or early-init paths.
+	local store = SF.SettingsStore
+	local storeReady = store
+		and type(store.Set) == "function"
+		and type(store.db) == "table"
+	if storeReady then
+		store:Set("lootHelper.minimizedHeaderOpacity", defaultOpacity)
 	else
 		db.minimizedHeaderOpacity = defaultOpacity
 		local window = SF.LootHelperWindow and SF.LootHelperWindow.Window

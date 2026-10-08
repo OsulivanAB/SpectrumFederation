@@ -409,6 +409,7 @@ setMinimizedOpacitySetting(40)
 SF.lootHelperDB = SpectrumFederationDB.lootHelper
 local setCalls = {}
 SF.SettingsStore = {
+    db = SpectrumFederationDB,
     Set = function(_, path, value)
         table.insert(setCalls, { path = path, value = value })
         if path == "lootHelper.minimizedHeaderOpacity" then
